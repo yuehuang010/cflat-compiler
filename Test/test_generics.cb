@@ -4602,6 +4602,48 @@ bool testGnPointerDepthSubstitution()
     return result;
 }
 
+// `T*` with T bound to a view argument ('int[]') DECAYS to the element pointer 'int*': the
+// star consumes the view's thin-pointer repr, so indexing strides by the ELEMENT (before:
+// the field stored a ptr but indexed with pointer stride and read back garbage).
+struct GvwBox<T> { T* p = default; };
+struct GvwDeep<T> { T** pp = default; };
+struct GvwFoo { int a = default; };
+int gvwSum<T>(T* q, int n) { int s = 0; for (int i = 0; i < n; i++) s += q[i]; return s; }
+int gvwFirst<T>(T* q) { T* r = q; return r[0]; }
+
+bool testGnViewArgIntoPointerDeclarator()
+{
+    bool result = true;
+
+    int[] data = new int[4];
+    data[0] = 1; data[1] = 2; data[2] = 7; data[3] = 4;
+
+    GvwBox<int[]> holder = default;
+    holder.p = data;
+    result &= Test("gvw_field_elem_read", holder.p[2], 7);
+    holder.p[1] = 42;
+    result &= Test("gvw_field_elem_write_through", data[1], 42);
+
+    // A generic FUNCTION parameter and a local of the same substituted type.
+    result &= Test("gvw_generic_fn_param_sum", gvwSum<int[]>(data, 4), 54);
+    result &= Test("gvw_generic_fn_local", gvwFirst<int[]>(data), 1);
+
+    // A struct element type strides by the struct, not by a pointer.
+    GvwFoo[] foos = new GvwFoo[3];
+    foos[2].a = 9;
+    GvwBox<GvwFoo[]> fbox = default;
+    fbox.p = foos;
+    result &= Test("gvw_struct_elem_read", fbox.p[2].a, 9);
+
+    // 'T**' over the same view argument keeps the second level.
+    int* head = data;
+    GvwDeep<int[]> deep = default;
+    deep.pp = &head;
+    result &= Test("gvw_ptrptr_deref", (*deep.pp)[2], 7);
+
+    return result;
+}
+
 struct GenericCellForTests { int value = 6; };
 
 namespace TupleChecks
@@ -4893,6 +4935,7 @@ extern int main()
     total++; passed += testGnCanonicalPrimitiveTypeArg()          ? 1 : 0;
     total++; passed += testGnUnresolvedGenericShellGate()          ? 1 : 0;
     total++; passed += testGnPointerDepthSubstitution()            ? 1 : 0;
+    total++; passed += testGnViewArgIntoPointerDeclarator()        ? 1 : 0;
     total++; passed += testNamespaceTupleAndGenericAlias()           ? 1 : 0;
     total++; passed += testGenericFunctions()                      ? 1 : 0;
     total++; passed += testGenericSizeof()                          ? 1 : 0;

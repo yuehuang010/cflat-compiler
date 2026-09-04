@@ -6290,6 +6290,11 @@ public:
     // srcIsUnsigned steers the widening step so an unsigned source zero-extends into a wider lane.
     llvm::Value* SplatToSimd(llvm::Value* scalar, const TypeAndValue& tv, bool srcIsUnsigned = false);
 
+    // The one place a scalar becomes a vector: convert to the lane type, then splat. Every
+    // scalar-into-simd rule (declaration, assignment, return, mixed operand) routes through here.
+    llvm::Value* SplatScalarToVectorType(llvm::Value* scalar, llvm::FixedVectorType* vecTy,
+                                         bool srcIsUnsigned = false);
+
     /*
      * Convert a scalar to an exact target scalar type, handling both widening (Upconvert)
      * and narrowing (e.g. a double literal into a float lane), which Upconvert alone won't do.

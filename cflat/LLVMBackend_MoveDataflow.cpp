@@ -1551,6 +1551,14 @@ void LLVMBackend::CreateReturnCall(llvm::Value* value, llvm::Value* returnedLoca
                 }
                 LogErrorMessage("cannot lower extern return value for the active C ABI recipe");
             }
+            // `return x` initializes the return object under the ASSIGNMENT rules, so a scalar
+            // returned from a simd<T,N> function splats across the lanes just like a store does.
+            if (auto* rvt = llvm::dyn_cast<llvm::FixedVectorType>(retTy);
+                rvt != nullptr && !value->getType()->isVectorTy()
+                && (value->getType()->isIntegerTy() || value->getType()->isFloatingPointTy()))
+            {
+                value = SplatScalarToVectorType(value, rvt, srcIsUnsigned);
+            }
             value = Upconvert(value, retTy, srcIsUnsigned);
             // Upconvert only widens; handle narrowing int -> bool explicitly (same as CreateAssignment).
             // Warn: CFlat requires explicit narrowing - write "return expr != 0;" instead.

@@ -487,6 +487,8 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                 // Star count contributed by an active type SUBSTITUTION (T bound to "C**" -> 2).
                 // Real depth, not a flag, so the declarator combination below can prove a total.
                 int substArgPtrDepth = 0;
+                // T bound to a '...[]' array-view ARGUMENT (P<int[]> -> T = "int[]").
+                bool substArgIsArrayView = false;
                 // Set when the spec names a generic interface instantiation, whose interfaceTable
                 // entry is only built by the next ProcessPendingInstantiations.
                 bool genericSpecIsInterface = false;
@@ -809,7 +811,7 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                     if (typeName == "long") typeName = LongSpellingTypeName(longSpecCount);
                     // Apply active type parameter substitutions (e.g. T -> int inside a template body)
                     int& substPointerDepth = substArgPtrDepth;
-                    bool substArrayView = false;
+                    bool& substArrayView = substArgIsArrayView;
                     auto substIt = activeTypeSubstitutions.find(typeName);
                     // A substituted name is ALREADY resolved in the caller's scope; re-resolving it
                     // here rebinds it to the template's declaring namespace (layer 3).
@@ -877,6 +879,14 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                 bool hasExplicitPointer = declSpec->pointer() != nullptr;
                 bool hasDblPointer = hasExplicitPointer && declSpec->pointer()->Star().size() >= 2;
                 bool substPointer = declType.Pointer; // T was already a pointer (e.g. T=IMessage*)
+                // `T*` with T bound to a view arg ('int[]') DECAYS to the ELEMENT pointer 'int*':
+                // the star consumes the view's own thin-pointer repr and drops the noalias trait.
+                if (substArgIsArrayView && hasExplicitPointer)
+                {
+                    declType.IsArrayView = false;
+                    declType.Pointer = false;      // the star arithmetic below re-adds the levels
+                    declType.ElemPointer = false;
+                }
                 if (aliasPtrDepth > 0)
                 {
                     // A pointer alias is in play: combine its depth with the declarator's stars and

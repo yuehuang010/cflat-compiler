@@ -123,6 +123,38 @@ int testFloatArithmetic(int seed)
     return passed;
 }
 
+// `return x` initializes the return object under the ASSIGNMENT rules, so a scalar returned
+// from a simd<T,N> function splats across every lane (before: a hard "cannot return this value").
+simd<float, 4> retFloatLocal(int seed) { float x = (float)seed + 0.5f; return x; }
+simd<i32, 8> retIntLiteral() { return 3; }
+simd<double, 4> retDoubleFromInt(int seed) { int y = seed + 1; return y; }
+simd<i32, 4> retIntFromDouble() { double d = 2.5; return d; }   // narrows like assignment: 2
+simd<i32, 4> retTwoSites(int k) { if (k > 0) { return 5; } return 6; }
+simd<T, 4> retGeneric<T>(T v) { return v; }
+
+int testSimdScalarReturn(int seed)
+{
+    int passed = 0;
+    simd<float, 4> a = retFloatLocal(seed);
+    simd<i32, 8> b = retIntLiteral();
+    simd<double, 4> c = retDoubleFromInt(seed);
+    simd<i32, 4> d = retIntFromDouble();
+    simd<i32, 4> e1 = retTwoSites(1);
+    simd<i32, 4> e0 = retTwoSites(0);
+    simd<float, 4> g = retGeneric<float>(7.0f);
+
+    passed += Test("simd return splat float lane0", a[0], 1.5f);
+    passed += Test("simd return splat float lane3", a[3], 1.5f);
+    passed += Test("simd return splat literal lane0", b[0], 3);
+    passed += Test("simd return splat literal lane7", b[7], 3);
+    passed += Test("simd return splat int-to-double", (float)c[2], 2.0f);
+    passed += Test("simd return splat double-to-int", d[3], 2);
+    passed += Test("simd return splat two sites then", e1[1], 5);
+    passed += Test("simd return splat two sites else", e0[2], 6);
+    passed += Test("simd return splat in generic", g[2], 7.0f);
+    return passed;
+}
+
 int testMixedScalarVector(int seed)
 {
     int passed = 0;
@@ -2328,6 +2360,7 @@ extern int main(int argc, char** argv)
 
     passed += testFloatArithmetic(seed);   total += 4;
     passed += testMixedScalarVector(seed); total += 4;
+    passed += testSimdScalarReturn(seed);  total += 9;
     passed += testIntegerSimd(seed);       total += 4;
     passed += testUnsignedSimd(seed);      total += 1;
     passed += testLaneCounts(seed);        total += 5;

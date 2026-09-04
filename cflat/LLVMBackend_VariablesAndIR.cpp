@@ -605,8 +605,7 @@ llvm::StoreInst* LLVMBackend::CreateAssignment(llvm::Value* value, llvm::Value* 
                 // Scalar into simd<T,N> storage: splat across the lanes, the same rule the
                 // declaration initializer uses. The else arm below casts scalar-to-vector, a
                 // bitcast that wrote the value into every EVEN lane and left the odd ones zero.
-                value = ConvertScalarToType(value, dvt->getElementType(), srcIsUnsigned);
-                value = builder->CreateVectorSplat(dvt->getElementCount(), value);
+                value = SplatScalarToVectorType(value, dvt, srcIsUnsigned);
             }
             else
             {
@@ -1670,8 +1669,7 @@ llvm::Value* LLVMBackend::CreateVectorOperation(Operation op, llvm::Value* left,
 
         auto splat = [&](llvm::Value* scalar, bool srcIsUnsigned) -> llvm::Value*
         {
-            scalar = ConvertScalarToType(scalar, vt->getElementType(), srcIsUnsigned);
-            return builder->CreateVectorSplat(vt->getElementCount(), scalar);
+            return SplatScalarToVectorType(scalar, vt, srcIsUnsigned);
         };
         if (!lvt) left = splat(left, leftIsUnsigned);
         if (!rvt) right = splat(right, rightIsUnsigned);
@@ -1739,6 +1737,12 @@ llvm::Value* LLVMBackend::SplatToSimd(llvm::Value* scalar, const TypeAndValue& t
                 "cannot splat a scalar into '{}' - it does not name simd vector storage", decl));
             return scalar;
         }
+        return SplatScalarToVectorType(scalar, vecTy, srcIsUnsigned);
+    }
+
+llvm::Value* LLVMBackend::SplatScalarToVectorType(llvm::Value* scalar, llvm::FixedVectorType* vecTy,
+                                                  bool srcIsUnsigned)
+{
         scalar = ConvertScalarToType(scalar, vecTy->getElementType(), srcIsUnsigned);
         return builder->CreateVectorSplat(vecTy->getElementCount(), scalar);
     }
