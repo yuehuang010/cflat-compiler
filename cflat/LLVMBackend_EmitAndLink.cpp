@@ -3867,6 +3867,33 @@ bool LLVMBackend::JitRun(int& runExitCode)
         for (const auto& cObj : cObjectFiles_)
             llvm::sys::fs::remove(cObj);
 
+        // Drop every module/context-bound debug-info handle BEFORE the JIT takes ownership.
+        // With -g (which --sanitize=ownership implies) the DIBuilder holds tracking MDRefs into
+        // this context's metadata; the JIT destroys module and context when it is torn down at
+        // the end of this function, so a surviving DIBuilder would untrack freed metadata in
+        // ~LLVMBackend - a use-after-free that showed up as a nondeterministic hang or SIGSEGV
+        // after main returned. Debug info is already finalized by this point (FinalizeDebugInfo
+        // runs before any output path), so nothing further needs the builder. Same invariant
+        // ResetForReanalysis maintains.
+        diBuilder.reset();
+        diFile = nullptr;
+        compileUnit = nullptr;
+        currentSubprogram = nullptr;
+        diTypeCache.clear();
+        diFileCache_.clear();
+        pendingGlobalDI_.clear();
+
+        // Same hazard, non-debug flavour: a live WeakVH unregisters itself from its Value's
+        // tracking list when destroyed, so these must not outlive the module either.
+        pendingNullIfaceGlobal_.clear();
+
+        // The optimized-view cache holds a CloneModule of `module`, which CloneModule builds in
+        // the SAME context - destroying it after the JIT freed that context is the same crash
+        // class. No CLI path reaches --run with the cache populated today (the --symbol-dump*
+        // queries return before the run path in main), but the handoff invariant is "nothing
+        // module-bound survives", so drop it here rather than rely on that.
+        optimizedViewCache_ = OptimizedViewCache{};
+
         // Hand the module (and its context) to the JIT. After this the backend's module is
         // consumed - fine, since --run executes and the process exits.
         llvm::orc::ThreadSafeContext tsc(std::move(context));
