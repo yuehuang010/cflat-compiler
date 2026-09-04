@@ -7254,6 +7254,25 @@ bool MainListener::RejectLocalAllocAlignMismatch(
                                         rightNV.TypeAndValue.AllocAlignValue);
         if (localAlign <= LLVMBackend::kDefaultNewAlign)
         {
+            bool rhsIsKnownOrdinary = rightNV.AllocAlignment <= LLVMBackend::kDefaultNewAlign
+                && rightNV.TypeAndValue.AllocAlignValue <= LLVMBackend::kDefaultNewAlign
+                && rightNV.AllocatedByRawNewArray;
+            if (namedVar.AllocAlignment > LLVMBackend::kDefaultNewAlign
+                && rhsIsKnownOrdinary && right != nullptr
+                && !llvm::isa<llvm::ConstantPointerNull>(right)
+                && right->getType()->isPointerTy()
+                && !ElementTypeIsOverAligned(namedVar.TypeAndValue))
+            {
+                const std::string& name = namedVar.CallerName;
+                const uint64_t trackedAlign = namedVar.AllocAlignment;
+                LogErrorContext(ctx, std::format(
+                    "alignment mismatch assigning to '{}': the local's inferred allocation alignment "
+                    "is {}, but the value was allocated without a matching allocation-alignment clause "
+                    "(ordinary alignment). Declare the local 'alignas(0, {})' to make the rule explicit, "
+                    "or allocate the source with 'new T[n] alignas(0, {})'.",
+                    name, trackedAlign, trackedAlign, trackedAlign));
+                return true;
+            }
             if (sourceAlign <= LLVMBackend::kDefaultNewAlign) return false;
             // The binding already TRACKS this exact block alignment (declaration-time inference,
             // or the inbound channel that makes a direct `new` inherit it), so its free agrees.

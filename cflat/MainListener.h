@@ -4003,10 +4003,11 @@ public:
      * carries `alignas(0, N)` promises every block it ever holds is N-aligned; the declaration path
      * already verifies the initializer, but a later `local = rhs` re-derived the tracked alignment
      * from the RHS with no check, so the clause became a lie. Gated on the DECLARED clause
-     * (TypeAndValue.AllocAlignValue), never the mutable tracked NamedVariable.AllocAlignment: a
-     * clause-free local records whatever the RHS carried and frees correctly, so it needs no
-     * diagnostic. Null stores and an over-aligned pointee TYPE are exempt for the field path's
-     * reasons. Returns true when an error was logged.
+     * (TypeAndValue.AllocAlignValue) for the clause-bearing arm; the clause-free arms use positive
+     * provenance only: an over-aligned RHS into an unclaused local, or a known ordinary RHS into a
+     * local with an INFERRED alignment (tracked NamedVariable.AllocAlignment), whose max-merge would
+     * keep the stale aligned free site. Null stores and an over-aligned pointee TYPE
+     * are exempt for the field path's reasons. Returns true when an error was logged.
      */
     bool RejectLocalAllocAlignMismatch(
         const LLVMBackend::NamedVariable& namedVar,

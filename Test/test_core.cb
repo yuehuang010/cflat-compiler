@@ -3447,6 +3447,19 @@ int runLocalAlignTernaryAccept(int choose)
     return g_raw_count_dtors;
 }
 
+int runRawCountInferredAlignPlainNew()
+{
+    resetRawCountState();
+    {
+        RawCountElem* p = new RawCountElem[2] alignas(0, 64);
+        delete p;
+        p = nullptr;
+        p = new RawCountElem[3];
+        delete p;
+    }
+    return g_raw_count_dtors;
+}
+
 int testRawArrayRuntimeCount()
 {
     int passed = 0;
@@ -3737,6 +3750,8 @@ int testRawArrayRuntimeCount()
         runLocalAlignGlobalAccept(), 1);
     passed += Test("local alignas reassignment from a same-clause ternary join",
         runLocalAlignTernaryAccept(1), 4);
+    passed += Test("raw count inferred alignment plain new",
+        runRawCountInferredAlignPlainNew(), 5);
 
     return passed;
 }
@@ -3845,7 +3860,7 @@ extern int main()
     r = testDiscard();          passed += r; total += 6;
     r = testDirectReturnOwnership(); passed += r; total += 6;
     r = testCLongWidth();       passed += r; total += 15;
-    r = testRawArrayRuntimeCount(); passed += r; total += 74;
+    r = testRawArrayRuntimeCount(); passed += r; total += 75;
     r = testDictEnumeration();  passed += r; total += 12;
     r = testLiteralReceiverAndNullChain(); passed += r; total += 9;
     r = testDefaultAsExpression(); passed += r; total += 82;

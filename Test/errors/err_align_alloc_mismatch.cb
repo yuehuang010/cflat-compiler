@@ -70,3 +70,22 @@ expect_error("cannot assign an over-aligned block (block alignment 64) to unclau
         p = move q;
     }
 }
+
+expect_error("alignment mismatch assigning to 'p': the local's inferred allocation alignment is 64, but the value was allocated without a matching allocation-alignment clause (ordinary alignment). Declare the local 'alignas(0, 64)' to make the rule explicit, or allocate the source with 'new T[n] alignas(0, 64)'.") {
+    void rejectInferredMoveOrdinary(int choose)
+    {
+        AlignElem* p = new AlignElem[2] alignas(0, 64);
+        AlignElem* q = new AlignElem[3];
+        if (choose != 0)
+            p = move q;
+    }
+}
+
+expect_error("alignment mismatch assigning to 'p': the local's inferred allocation alignment is 64, but the value was allocated without a matching allocation-alignment clause (ordinary alignment). Declare the local 'alignas(0, 64)' to make the rule explicit, or allocate the source with 'new T[n] alignas(0, 64)'.") {
+    void rejectInferredCopyOrdinary()
+    {
+        AlignElem* p = new AlignElem[2] alignas(0, 64);
+        AlignElem* q = new AlignElem[3];
+        p = q;
+    }
+}
