@@ -109,6 +109,25 @@ void LLVMBackend::DiscardNullDerefEvents(llvm::Function* F)
         if (F) nullEventLog_.erase(F);
     }
 
+/*
+ * An expect_error block swallows the diagnostic and compilation CONTINUES, so a function body
+ * abandoned mid-emission stays in the module with unterminated blocks. Every later CFG walk
+ * (movedf/nulldf ComputeRpoIndex calls llvm::succ_begin, which dereferences the terminator) and
+ * the module verifier then see malformed IR. Close each open block with `unreachable` and drop
+ * the function's pending analysis logs - the swallowed diagnostic already answered them.
+ */
+void LLVMBackend::SealAbandonedFunction(llvm::Function* F)
+{
+        if (F == nullptr || F->isDeclaration()) return;
+        for (auto& BB : *F)
+            if (cflat_llvm::GetTerminatorOrNull(&BB) == nullptr)
+                new llvm::UnreachableInst(*context, &BB);
+        moveEventLog_.erase(F);
+        nullEventLog_.erase(F);
+        pendingReturnDangleChecks_.erase(F);
+        pendingNullIfaceDispatch_.erase(F);
+    }
+
 // Sizes of the three per-function pending logs, so an abandoned region can rewind to them.
 LLVMBackend::PendingAnalysisMark LLVMBackend::MarkPendingAnalyses(llvm::Function* F) const
 {

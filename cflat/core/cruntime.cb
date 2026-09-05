@@ -187,7 +187,8 @@ int __vfscanf_stream(void* stream, const char* fmt, va_list ap) {
 }
 
 // printf - formatted write to stdout (hook-aware, VT-correct); fast-paths literal text.
-extern void printf(const char* fmt, ...) {
+// Returns the byte count written, like C - both write paths know their own length.
+extern int printf(const char* fmt, ...) {
     va_list ap;
     va_start(ap);
     // Fast path: no '%' in fmt - fmt is the literal output, skip vsprintf entirely.
@@ -197,13 +198,16 @@ extern void printf(const char* fmt, ...) {
         if (fmt[len] == '%') { has_format = true; break; }
         len++;
     }
+    int written = len;
     if (!has_format) {
         __stdout_write(fmt, len);
     } else {
         int needed = __format_to_tls(fmt, ap);
         __stdout_write(__prog_tls.stdout_tls_buf, needed);
+        written = needed;
     }
     va_end(ap);
+    return written;
 }
 
 // sprintf - format into `buf` with no size limit; returns the byte count written.

@@ -1,5 +1,5 @@
 
-extern void printf(const char* argv, ...);
+extern int printf(const char* argv, ...);
 extern void* malloc(i64 size);
 extern void free(void* ptr);
 // Repeat extern declarations that AGREE with core's stay a no-op and still bind the core
@@ -884,6 +884,14 @@ extern int main(int argc, char** argv)
     // Widening a u8 into an extern's declared 'int' parameter stays legal (ruling 2026-09-04).
     u8 lowerB = 'b';
     result &= Test("extern_widen_u8_to_int", toupper(lowerB), 66);
+
+    // printf returns the byte count it wrote, like C - the literal fast path and the
+    // formatted path each report their own length. (The prototype above is C's exact one.)
+    int printfLiteralBytes = printf("abc\n");
+    result &= Test("printf_returns_literal_len", printfLiteralBytes, 4);
+    int printfFormatBytes = printf("%d-%s|\n", 42, "xy");
+    result &= Test("printf_returns_format_len", printfFormatBytes, 7);
+    result &= Test("putchar_returns_char", putchar('\n'), 10);
 
     if (result)
     {

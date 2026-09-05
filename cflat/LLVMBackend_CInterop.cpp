@@ -104,6 +104,19 @@ bool LLVMBackend::VerifyModule()
 llvm::TargetLibraryInfoImpl LLVMBackend::MakeStdioSafeTLII(const llvm::Triple& triple) const
 {
         llvm::TargetLibraryInfoImpl tlii{ triple };
+        /*
+         * core/cruntime.cb DEFINES these with cflat semantics, not the C library's: every write
+         * goes through __stdout_write, which honors a `program`'s stdout hook and keeps VT escape
+         * sequences intact. Once printf carries C's exact `int printf(const char*, ...)` signature,
+         * SimplifyLibCalls recognizes it and rewrites printf("l1\n") into puts("l1") - two hook
+         * chunks instead of one, and a no-newline literal into fwrite(), which bypasses the hook
+         * entirely. Tell the optimizer these names are not the C library functions.
+         */
+        for (llvm::LibFunc fn : { llvm::LibFunc_printf, llvm::LibFunc_vprintf, llvm::LibFunc_puts,
+                                  llvm::LibFunc_putchar, llvm::LibFunc_fputs, llvm::LibFunc_fputc,
+                                  llvm::LibFunc_fprintf, llvm::LibFunc_sprintf,
+                                  llvm::LibFunc_snprintf, llvm::LibFunc_vsprintf })
+            tlii.setUnavailable(fn);
         if (!targetWindows_)
         {
             tlii.setUnavailable(llvm::LibFunc_vsnprintf);

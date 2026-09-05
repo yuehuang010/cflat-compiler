@@ -56,7 +56,7 @@ import "string.cb";
 extern int c_add(int a, int b);
 extern int c_square(int x);
 
-extern void printf(const char* fmt, ...);
+extern int printf(const char* fmt, ...);
 extern int  strcmp(const char* a, const char* b);
 
 // CFlat function used as a callback into the C library through the function-pointer

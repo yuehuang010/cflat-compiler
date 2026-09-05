@@ -369,13 +369,40 @@ std::string MainListener::InstantiateGenericFunction(const std::string& baseName
         // and "Instruction does not dominate all uses" verifier error).
         auto savedStack = std::move(instCompiler->stackNamedVariable);
         instCompiler->stackNamedVariable.clear();
-        if (!ownerStruct.empty())
+        // Tail of the module's function list before the body walk: anything appended below is
+        // this instantiation's, and must be sealed if the walk throws (expect_error resumes).
+        auto& functionList = instCompiler->module->getFunctionList();
+        llvm::Function* lastBefore = functionList.empty() ? nullptr : &functionList.back();
+        try
         {
-            LLVMBackend::AliasScopeGuard aggregateAliasScope(instCompiler, ownerStruct);
-            ParseFunctionDefinition(tmplCtx, ownerStruct, {}, mangledName, DeclaringNamespaceOf(compilerLLVM, baseName));
+            if (!ownerStruct.empty())
+            {
+                LLVMBackend::AliasScopeGuard aggregateAliasScope(instCompiler, ownerStruct);
+                ParseFunctionDefinition(tmplCtx, ownerStruct, {}, mangledName, DeclaringNamespaceOf(compilerLLVM, baseName));
+            }
+            else
+                ParseFunctionDefinition(tmplCtx, ownerStruct, {}, mangledName, DeclaringNamespaceOf(compilerLLVM, baseName));
         }
-        else
-            ParseFunctionDefinition(tmplCtx, ownerStruct, {}, mangledName, DeclaringNamespaceOf(compilerLLVM, baseName));
+        catch (...)
+        {
+            /*
+             * The body walk was abandoned (an expect_error match, or a real diagnostic in batch
+             * mode). Nothing below unwinds on its own: the outer function's locals were MOVED out
+             * of stackNamedVariable, and the half-built instantiation is still in the module.
+             * mangledName stays in instantiatedGenericFunctions - re-emitting under the same
+             * symbol would collide - so a later instantiation reuses the sealed body.
+             */
+            auto it = lastBefore != nullptr
+                ? std::next(llvm::Module::iterator(lastBefore)) : functionList.begin();
+            for (; it != functionList.end(); ++it)
+                instCompiler->SealAbandonedFunction(&*it);
+            instCompiler->stackNamedVariable = std::move(savedStack);
+            activeTypeSubstitutions = savedSubst;
+            activeValueSubstitutions = savedValueSubst;
+            activePackSubstitutions = savedPackSubst;
+            valueMacros.Restore();
+            throw;   // BuilderStateGuard's destructor restores the caller's insert point.
+        }
         instCompiler->stackNamedVariable = std::move(savedStack);
         savedState.restore();
 

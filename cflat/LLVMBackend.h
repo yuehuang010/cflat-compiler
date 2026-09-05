@@ -7210,6 +7210,9 @@ public:
     // Drop a function's null-state log without analyzing it (an aborted body has a partial CFG).
     void DiscardNullDerefEvents(llvm::Function* F);
 
+    // Close an abandoned body's open blocks and drop its pending logs (expect_error recovery).
+    void SealAbandonedFunction(llvm::Function* F);
+
     /*
      * A scoped `expect_error` block abandons only its own body, not the whole function, so the
      * per-function pending logs must rewind to exactly what was recorded before the block. The

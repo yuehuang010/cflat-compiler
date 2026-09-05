@@ -72,7 +72,17 @@ expect_error("'int[]' cannot be a type argument of 'gavGenericFn': instantiating
     }
 }
 
+// A diagnostic raised while EMITTING an instantiated body, swallowed by a STATEMENT-scope
+// expect_error. The abandoned body used to stay in the module with unterminated blocks, and the
+// end-of-module move-dataflow segfaulted on it (succ_begin dereferences a null terminator).
+int gavBadBody<T>(T x) { return gavUndefinedName; }
+
 extern int main()
 {
-    return 0;
+    int gavLocal = 7;
+    expect_error("Undefined variable gavUndefinedName") {
+        int n = gavBadBody<int>(1);
+    }
+    // The instantiation moved this function's locals aside; recovery must put them back.
+    return gavLocal - 7;
 }
