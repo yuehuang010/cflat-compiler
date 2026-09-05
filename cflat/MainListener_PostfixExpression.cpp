@@ -2009,10 +2009,12 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                         {
                             std::string idName = prevPrimary->genericIdentifier()->Identifier()->getText();
                             // A VARIABLE of the same name shadows a namespace; without this the
-                            // primary yielded an EMPTY NamedVariable with no diagnostic.
+                            // primary yielded an EMPTY NamedVariable with no diagnostic. A FIELD of
+                            // the enclosing struct, read bare through the implicit 'this', counts.
                             const bool nameIsVariable =
                                 Compiler(ctx)->GetLocalVariable(idName).Storage != nullptr
                                 || Compiler(ctx)->GetFunctionArgument(idName).GetValue() != nullptr
+                                || Compiler(ctx)->HasMemberVariable(idName)
                                 || Compiler(ctx)->GetGlobalVariableNV(idName).Storage != nullptr;
                             if (Compiler(ctx)->IsNamespace(idName) && !nameIsVariable)
                             {
@@ -2023,7 +2025,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             else if (Compiler(ctx)->IsDataStructure(
                                          Compiler(ctx)->ResolveQualifiedName(prevPrimary->getText()))
                                      && Compiler(ctx)->GetLocalVariable(idName).Storage == nullptr
-                                     && Compiler(ctx)->GetFunctionArgument(idName).GetValue() == nullptr)
+                                     && Compiler(ctx)->GetFunctionArgument(idName).GetValue() == nullptr
+                                     && !Compiler(ctx)->HasMemberVariable(idName))
                             {
                                 // Type name used as qualifier for static method access: ClassName.Method()
                                 // Constructor calls (ClassName()) still work because functionName = "ClassName".

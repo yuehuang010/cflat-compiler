@@ -7063,6 +7063,17 @@ public:
     /// </summary>
     NamedVariable GetMemberVariable(const std::string& name);
 
+    // IR-free half of GetMemberVariable: locates `name` among the fields of the enclosing
+    // method's implicit 'this' struct. Returns the 'this' argument, or nullptr when there is
+    // no member context or no such field; outStruct/outIndex may be null.
+    const NamedVariable* FindImplicitThisField(const std::string& name,
+                                               const StructData** outStruct, int* outIndex);
+
+    /// True when a bare `name` inside the current method body resolves to a field of the
+    /// enclosing struct. Shares FindImplicitThisField with GetMemberVariable, so the predicate
+    /// and the read can never disagree on the member set.
+    bool HasMemberVariable(const std::string& name);
+
     /// Returns the implicit 'this' NamedVariable when calling a bare member function
     /// from within a member function body of the same struct. Returns a default
     /// NamedVariable (Storage == nullptr) if not in a member context or not a method.

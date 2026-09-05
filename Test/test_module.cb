@@ -81,6 +81,29 @@ int shadowNsStructMember()
     return ModuleMath.Sum();
 }
 
+// Fields spelled like the names the postfix primary's qualifier branches claim: 'os' and
+// 'ModuleMath' are namespaces, 'ModulePoint' is an imported struct type. PRE-FIX each bare
+// self-field use below took the qualifier branch, yielded an EMPTY NamedVariable with no
+// diagnostic, and the malformed function failed module verification.
+struct ShadowNsField
+{
+    int  os = 4;
+    int* ModuleMath = nullptr;
+    int  ModulePoint = 5;
+
+    int BareRead()       { return os; }
+    int Ternary(bool c)  { return c ? os : 9; }
+    int PtrField(int* q) { ModuleMath = q; return *ModuleMath; }
+    int TypeNamedField() { return ModulePoint; }
+    int Write()          { os = 7; return os; }
+};
+
+struct ShadowNsBox<T>
+{
+    T os = default;
+    int Set(T v) { os = v; return (int)os; }
+};
+
 bool testVariableShadowsNamespace()
 {
     bool result = true;
@@ -108,6 +131,23 @@ bool testVariableShadowsNamespace()
     result &= Test("shadow_ns_view_ternary_elem1", joined[1], 9);
 
     result &= Test("shadow_ns_struct_member", shadowNsStructMember(), 30);
+
+    // A FIELD spelled like a namespace or a type, read bare through the implicit 'this'.
+    // PRE-FIX reasons, each measured on its own: bare read / ternary / type-named field ->
+    // "Module verification failed" (empty NamedVariable reached the return); the pointer
+    // field and the write -> "Left side of assignment is not an addressable lvalue".
+    // Write() mutates 'os', so it runs after every leg that reads it.
+    ShadowNsField sf = default;
+    int nine = 9;
+    result &= Test("shadow_ns_field_bare",     sf.BareRead(),       4);
+    result &= Test("shadow_ns_field_ternary",  sf.Ternary(true),    4);
+    result &= Test("shadow_ns_field_ptr",      sf.PtrField(&nine),  9);
+    result &= Test("shadow_ns_field_typename", sf.TypeNamedField(), 5);
+    result &= Test("shadow_ns_field_write",    sf.Write(),          7);
+
+    // Same field name inside a generic struct - the instantiation walks the same primary.
+    ShadowNsBox<int> sb = default;
+    result &= Test("shadow_ns_field_generic",  sb.Set(6), 6);
     return result;
 }
 

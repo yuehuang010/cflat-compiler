@@ -2253,76 +2253,96 @@ auto LLVMBackend::FindThisArgIt(const std::map<std::string, NamedVariable>& args
         return args.end();
     }
 
-LLVMBackend::NamedVariable LLVMBackend::GetMemberVariable(const std::string& name)
+const LLVMBackend::NamedVariable* LLVMBackend::FindImplicitThisField(
+    const std::string& name, const StructData** outStruct, int* outIndex)
 {
         for (const auto& stackFrame : std::ranges::reverse_view(stackNamedVariable))
         {
             const auto& functionArguments = stackFrame.functionArgument;
+            if (functionArguments.empty())
+                continue;
 
-            if (functionArguments.size() > 0)
+            auto thisIt = FindThisArgIt(functionArguments);
+            if (thisIt == functionArguments.end())
+                return nullptr;
+
+            const auto& memberStructName = thisIt->first;
+            auto truncName = memberStructName.substr(0, memberStructName.size() - 2);
+            auto findResult = dataStructures.find(truncName);
+            if (findResult == dataStructures.end())
+                return nullptr;
+
+            int count = 0;
+            for (const auto& structField : findResult->second.StructFields)
             {
-                auto thisIt = FindThisArgIt(functionArguments);
-                if (thisIt == functionArguments.end())
-                    return {};
-
-                const auto& memberStructName = thisIt->first;
-                // Storage is either an alloca-of-struct (constructor) or an alloca-of-ptr (method param).
-                // For the latter, load through it to get the actual struct pointer before GEP.
-                llvm::Value* memberStructInstance = thisIt->second.Storage;
-                if (auto* alloca = llvm::dyn_cast<llvm::AllocaInst>(memberStructInstance))
+                if (structField.VariableName == name)
                 {
-                    if (alloca->getAllocatedType()->isPointerTy())
-                        memberStructInstance = CreateLoad(alloca);
+                    if (outStruct != nullptr) *outStruct = &findResult->second;
+                    if (outIndex != nullptr)  *outIndex = count;
+                    return &thisIt->second;
                 }
-                auto truncName = memberStructName.substr(0, memberStructName.size() - 2);
-                auto findResult = dataStructures.find(truncName);
-                if (findResult != dataStructures.end())
-                {
-                    int count = 0;
-                    const auto& sd = findResult->second;
-                    for (const auto& structField : sd.StructFields)
-                    {
-                        if (structField.VariableName == name)
-                        {
-                            NamedVariable namedVar;
-                            auto* fieldLLVMType = GetType(structField);
-                            if (sd.IsUnion)
-                            {
-                                // Union: all fields alias at offset 0; load with explicit field type.
-                                namedVar.Storage = memberStructInstance;
-                                namedVar.UnionFieldType = fieldLLVMType;
-                                namedVar.Primary = CreateLoad(fieldLLVMType, memberStructInstance);
-                            }
-                            else
-                            {
-                                namedVar.Storage = CreateStructGEP(sd.StructType, memberStructInstance, count);
-                                namedVar.Primary = CreateLoad(namedVar.Storage);
-                            }
-                            namedVar.BaseType = namedVar.Primary->getType();
-                            namedVar.TypeAndValue = structField;
-                            // Preserve unique-field provenance across a later cast so a bare
-                            // self-field read (`(Res*)p` inside a method) stays a tracked alias.
-                            bool isUniqueField = (structField.IsUnique && structField.Pointer)
-                                || (IsCoreUniqueType(structField.TypeName) && !structField.Pointer);
-                            if (isUniqueField)
-                            {
-                                namedVar.IsUniqueFieldAlias = true;
-                                RegisterUniqueFieldRead(namedVar.Primary, namedVar.Storage);
-                            }
-                            // Field declared `alignas(_, N)`: stamp the block alignment so a bare
-                            // `delete field` inside a member (e.g. the destructor) frees via
-                            // __delete_aligned. GetMemberVariable purposely omits OwningStructName.
-                            namedVar.AllocAlignment = structField.AllocAlignValue;
-                            return namedVar;
-                        }
-                        count++;
-                    }
-                }
-                return {};
+                count++;
             }
+            return nullptr;
         }
 
-        return {};
+        return nullptr;
+    }
+
+bool LLVMBackend::HasMemberVariable(const std::string& name)
+{
+        return FindImplicitThisField(name, nullptr, nullptr) != nullptr;
+    }
+
+LLVMBackend::NamedVariable LLVMBackend::GetMemberVariable(const std::string& name)
+{
+        const StructData* structData = nullptr;
+        int count = 0;
+        const NamedVariable* thisArg = FindImplicitThisField(name, &structData, &count);
+        if (thisArg == nullptr)
+            return {};
+
+        // Storage is either an alloca-of-struct (constructor) or an alloca-of-ptr (method param).
+        // For the latter, load through it to get the actual struct pointer before GEP.
+        llvm::Value* memberStructInstance = thisArg->Storage;
+        if (auto* alloca = llvm::dyn_cast<llvm::AllocaInst>(memberStructInstance))
+        {
+            if (alloca->getAllocatedType()->isPointerTy())
+                memberStructInstance = CreateLoad(alloca);
+        }
+
+        const auto& sd = *structData;
+        const auto& structField = sd.StructFields[count];
+        NamedVariable namedVar;
+        auto* fieldLLVMType = GetType(structField);
+        if (sd.IsUnion)
+        {
+            // Union: all fields alias at offset 0; load with explicit field type.
+            namedVar.Storage = memberStructInstance;
+            namedVar.UnionFieldType = fieldLLVMType;
+            namedVar.Primary = CreateLoad(fieldLLVMType, memberStructInstance);
+        }
+        else
+        {
+            namedVar.Storage = CreateStructGEP(sd.StructType, memberStructInstance, count);
+            namedVar.Primary = CreateLoad(namedVar.Storage);
+        }
+        namedVar.BaseType = namedVar.Primary->getType();
+        namedVar.TypeAndValue = structField;
+        // Preserve unique-field provenance across a later cast so a bare
+        // self-field read (`(Res*)p` inside a method) stays a tracked alias.
+        bool isUniqueField = (structField.IsUnique && structField.Pointer)
+            || (IsCoreUniqueType(structField.TypeName) && !structField.Pointer);
+        if (isUniqueField)
+        {
+            namedVar.IsUniqueFieldAlias = true;
+            RegisterUniqueFieldRead(namedVar.Primary, namedVar.Storage);
+        }
+        // Field declared `alignas(_, N)`: stamp the block alignment so a bare
+        // `delete field` inside a member (e.g. the destructor) frees via
+        // __delete_aligned. GetMemberVariable purposely omits OwningStructName.
+        namedVar.AllocAlignment = structField.AllocAlignValue;
+        return namedVar;
     }
 
 LLVMBackend::NamedVariable LLVMBackend::GetCurrentMemberThis(const std::string& functionName)
