@@ -4806,7 +4806,7 @@ bool MainListener::TernaryArmViewType(llvm::Value* value, llvm::Value* storage,
 void MainListener::PropagateTernaryViewElement(antlr4::ParserRuleContext* ctx,
                                                llvm::Value* trueValue, llvm::Value* trueStorage,
                                                llvm::Value* falseValue, llvm::Value* falseStorage,
-                                               llvm::Value* join) {
+                                               llvm::Value* join, bool nullCoalesce) {
         LLVMBackend::TypeAndValue trueType;
         LLVMBackend::TypeAndValue falseType;
         if (!TernaryArmViewType(trueValue, trueStorage, trueType)) return;
@@ -4815,10 +4815,16 @@ void MainListener::PropagateTernaryViewElement(antlr4::ParserRuleContext* ctx,
         std::string falseElement;
         if (compilerLLVM->ArrayViewElementMismatch(trueType, falseType, trueElement, falseElement))
         {
-            LogErrorContext(ctx, std::format(
-                "cannot join an array view of '{}' with an array view of '{}' in a '?:' - a view "
-                "indexes by its own element, so both arms must share it",
-                trueElement, falseElement));
+            if (nullCoalesce)
+                LogErrorContext(ctx, std::format(
+                    "cannot join an array view of '{}' with an array view of '{}' in a '??' - a "
+                    "view indexes by its own element, so both arms must share it",
+                    trueElement, falseElement));
+            else
+                LogErrorContext(ctx, std::format(
+                    "cannot join an array view of '{}' with an array view of '{}' in a '?:' - a "
+                    "view indexes by its own element, so both arms must share it",
+                    trueElement, falseElement));
             return;
         }
         LLVMBackend::TypeAndValue joinType;
@@ -5960,6 +5966,9 @@ LLVMBackend::TypedValue MainListener::ParseConditionalExpression(
             auto* joined = compiler->CreateLoad(resultAlloca);
             if (lhsAlias || rhsAlias) compiler->RegisterAliasValue(joined);
             if (lhsTempField || rhsTempField) compiler->RegisterTempFieldValue(joined);
+            // A '??' joins two views exactly as '?:' does, and the join is a plain load off a
+            // slot - so name its element here or every binding door takes the unnamed escape.
+            PropagateTernaryViewElement(ctx, lhs, lhsStorage, rhs, rhsStorage, joined, true);
             // Ledger the arms for the interface-boxing path: this joins through a SLOT, so the
             // result is a plain load and the arms are unrecoverable from the IR afterwards.
             if (joined != nullptr && lhsBr != nullptr && rhsBr != nullptr

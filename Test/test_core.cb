@@ -3105,6 +3105,81 @@ int runViewTernaryFieldArmJoin(int choose)
         + fromNullSafeNested[0] + fromNullReceiver[1];
 }
 
+// Same accept-set again, but joined with '??' instead of '?:'. '??' is a separate lowering that
+// named neither arm, so nothing was stamped and every door took the element gate's unnamed
+// escape. Each leg is read on BOTH the non-null left path (choose != 0) and the null one.
+struct ViewQqHolder
+{
+    int[] v = default;
+    int pickThis(int[] other) { int[] j = this.v ?? other; return j[0]; }
+    int pickBare(int[] other) { int[] j = v ?? other; return j[1]; }
+};
+struct ViewQqOuter { ViewQqHolder inner = default; };
+namespace ViewQqNS { struct NsHolder { int[] v = default; }; }
+struct ViewQqBox<T> { T[] v = default; };
+int[] viewQqGive(int[] q) { return q; }
+ViewQqHolder viewQqMake(int[] q) { ViewQqHolder h = default; h.v = q; return h; }
+ViewQqOuter viewQqMakeOuter(int[] q) { ViewQqOuter o = default; o.inner.v = q; return o; }
+int viewQqTake(int[] d) { return d[0]; }
+int[] viewQqReturn(int[] a, int[] b) { return a ?? b; }
+struct ViewQqDest { int[] v = default; };
+
+int runViewNullCoalesceJoin(int choose)
+{
+    int[3] store; store[0] = 7; store[1] = 8; store[2] = 9;
+    int[] other = store;
+    // `left` is the arm under test: a live view when choose != 0, null otherwise. Both paths
+    // read the SAME values out of `store`, so a leg cannot pass by picking the wrong arm.
+    int[] left = choose != 0 ? other : default;
+
+    ViewQqHolder h = default; h.v = left;
+    ViewQqHolder* hp = &h;
+    ViewQqOuter o = default; o.inner.v = left;
+    ViewQqOuter* op = &o;
+    ViewQqHolder* hnull = default;
+    ViewQqNS.NsHolder ns = default; ns.v = left;
+    ViewQqBox<int> box = default; box.v = left;
+    // Right-arm holders always carry a live view, so a leg whose LEFT arm is the null one still
+    // reads `store` on both paths.
+    ViewQqHolder hFull = default; hFull.v = other;
+    ViewQqOuter oFull = default; oFull.inner.v = other;
+
+    int[] fromLocal = left ?? other;
+    int[] fromValueField = h.v ?? other;
+    int[] fromPointerField = hp.v ?? other;
+    int[] fromNestedField = o.inner.v ?? other;
+    int[] fromNsField = ns.v ?? other;
+    int[] fromGenericField = box.v ?? other;
+    int[] bothFields = h.v ?? oFull.inner.v;
+    int[] fieldAndCall = h.v ?? viewQqGive(other);
+    int[] callAndField = viewQqGive(left) ?? hFull.v;
+    int[] fromCallValueField = viewQqMake(left).v ?? other;
+    int[] fromCallNestedField = viewQqMakeOuter(left).inner.v ?? other;
+    int[] fromNullSafeField = hp?.v ?? other;
+    int[] fromNullSafeNested = op?.inner.v ?? other;
+    // A null receiver yields a null '?.' value, so the right arm supplies the result.
+    int[] fromNullReceiver = hnull?.v ?? other;
+    int[] fromInnerTernary = (choose != 0 ? left : left) ?? other;
+    int[] fromInnerCoalesce = (left ?? other) ?? other;
+    int[] outerOfCoalesce = left ?? (left ?? other);
+    // An unnamed right arm leaves the join unnamed, exactly as the '?:' null arm does.
+    int[] nullJoin = other ?? nullptr;
+    int[] defaultJoin = other ?? default;
+    int[] assigned = default;
+    assigned = h.v ?? other;
+    ViewQqDest dest = default;
+    dest.v = h.v ?? other;
+
+    return fromLocal[0] + fromValueField[1] + fromPointerField[2] + fromNestedField[0]
+        + fromNsField[1] + fromGenericField[2] + bothFields[0] + fieldAndCall[1]
+        + callAndField[2] + fromCallValueField[0] + fromCallNestedField[1]
+        + fromNullSafeField[2] + fromNullSafeNested[0] + fromNullReceiver[1]
+        + fromInnerTernary[2] + fromInnerCoalesce[0] + outerOfCoalesce[1]
+        + nullJoin[2] + defaultJoin[0] + assigned[1] + dest.v[2]
+        + h.pickThis(other) + h.pickBare(other)
+        + viewQqTake(h.v ?? other) + viewQqReturn(left, other)[1];
+}
+
 void rawCountSink(move RawCountElem* values) {}
 void rawCountForward(move RawCountElem* values) { rawCountSink(move values); }
 void rawCountGenericSink<T>(move T* values) {}
@@ -3993,6 +4068,9 @@ int testRawArrayRuntimeCount()
         runViewTernaryElementJoin(1), 61);
     passed += Test("view ternary field-read arm keeps its element at every door",
         runViewTernaryFieldArmJoin(1), 148);
+    // Both '??' paths read the same values: the left arm is live on one and null on the other.
+    passed += Test("view null-coalesce join keeps its arms' element at every door",
+        runViewNullCoalesceJoin(1) * 1000 + runViewNullCoalesceJoin(0), 198198);
     passed += Test("raw count move parameter direct zero and counts",
         runRawCountMoveDirect(0) * 100 + runRawCountMoveDirect(2) * 10
             + runRawCountMoveDirect(4), 24);
@@ -4208,7 +4286,7 @@ extern int main()
     r = testDiscard();          passed += r; total += 6;
     r = testDirectReturnOwnership(); passed += r; total += 6;
     r = testCLongWidth();       passed += r; total += 15;
-    r = testRawArrayRuntimeCount(); passed += r; total += 90;
+    r = testRawArrayRuntimeCount(); passed += r; total += 91;
     r = testDictEnumeration();  passed += r; total += 12;
     r = testLiteralReceiverAndNullChain(); passed += r; total += 9;
     r = testDefaultAsExpression(); passed += r; total += 82;

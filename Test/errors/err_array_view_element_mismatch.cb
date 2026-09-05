@@ -66,6 +66,11 @@ expect_error("cannot return an array view of 'u8' from a function whose return e
     int[] avmReturnFieldArm(AvmU8Holder h, u8[] b, bool c) { return c ? h.v : b; }
 }
 
+// Return door, both '??' arms agreeing on 'u8': the named join is what the return gate judges.
+expect_error("cannot return an array view of 'u8' from a function whose return element is 'int'") {
+    int[] avmReturnQqArm(AvmU8Holder h, u8[] b) { return h.v ?? b; }
+}
+
 // A field read off a CALL RESULT never reaches memory - it is an aggregate extract, not a GEP -
 // and a '?.' merge drops the field GEP before the arm is judged. Both used to escape.
 AvmU8Holder avmMakeU8Holder(u8[] b) { AvmU8Holder h = default; h.v = b; return h; }
@@ -275,6 +280,74 @@ extern int main()
         avmFieldDisagree.v = avmFieldSrc;
         int[] avmFieldOther = iview;
         int[] avmFieldJoin = avmFieldPick ? avmFieldDisagree.v : avmFieldOther;
+    }
+
+    // Same join over the '??' operator, which is a SEPARATE lowering: it never named its arms,
+    // so nothing was stamped and every door below took the element gate's unnamed escape.
+    // All the legs from here down compiled clean before the '??' arms were named.
+
+    // Join site, both arms plain local slots - pins the '??' wording, not a door's.
+    expect_error("cannot join an array view of 'u8' with an array view of 'int' in a '??'") {
+        u8[] avmQqLeft = avmFieldSrc;
+        int[] avmQqRight = iview;
+        int[] avmQqJoin = avmQqLeft ?? avmQqRight;
+    }
+
+    // Join site, left arm read through a struct FIELD.
+    expect_error("cannot join an array view of 'u8' with an array view of 'int' in a '??'") {
+        AvmU8Holder avmQqHolder = default;
+        avmQqHolder.v = avmFieldSrc;
+        int[] avmQqFieldJoin = avmQqHolder.v ?? iview;
+    }
+
+    // Join site, left arm read through a NULL-SAFE '?.' access, whose merge drops the field GEP.
+    expect_error("cannot join an array view of 'u8' with an array view of 'int' in a '??'") {
+        AvmU8Holder avmQqNcHolder = default;
+        avmQqNcHolder.v = avmFieldSrc;
+        AvmU8Holder* avmQqNcPtr = &avmQqNcHolder;
+        int[] avmQqNcJoin = avmQqNcPtr?.v ?? iview;
+    }
+
+    // Join site, left arm an aggregate extract out of a by-VALUE call result.
+    expect_error("cannot join an array view of 'u8' with an array view of 'int' in a '??'") {
+        int[] avmQqCallJoin = avmMakeU8Outer(avmFieldSrc).inner.v ?? iview;
+    }
+
+    // Join site, DEPTH axis: an 'int[]' arm against an 'int*[]' arm.
+    expect_error("cannot join an array view of 'int' with an array view of 'int*' in a '??'") {
+        int[] avmQqDepthJoin = iview ?? pview;
+    }
+
+    // Join site, interface elements: no rebox is emitted per view element.
+    expect_error("cannot join an array view of 'AvmIface' with an array view of 'AvmIfaceB' in a '??'") {
+        AvmIfaceB[] avmQqIfaceRight = new AvmIfaceB[1];
+        AvmIfaceB[] avmQqIfaceJoin = avmIfaceView ?? avmQqIfaceRight;
+    }
+
+    // Doors below: the two '??' arms AGREE on 'u8', so the join is named and the DESTINATION is
+    // what disagrees - each leg pins its own door's wording.
+    expect_error("cannot bind an array view of 'u8' to a destination of 'int'") {
+        u8[] avmQqDeclLeft = avmFieldSrc;
+        u8[] avmQqDeclRight = avmFieldSrc;
+        int[] avmQqDecl = avmQqDeclLeft ?? avmQqDeclRight;
+    }
+
+    expect_error("cannot bind an array view of 'u8' to a destination of 'int'") {
+        u8[] avmQqAssignLeft = avmFieldSrc;
+        u8[] avmQqAssignRight = avmFieldSrc;
+        int[] avmQqAssigned = default;
+        avmQqAssigned = avmQqAssignLeft ?? avmQqAssignRight;
+    }
+
+    expect_error("cannot bind an array view of 'u8' to a destination of 'int'") {
+        u8[] avmQqStoreLeft = avmFieldSrc;
+        AvmIfaceHolder avmQqStore = default;
+        avmQqStore.view = avmQqStoreLeft ?? avmFieldSrc;
+    }
+
+    expect_error("cannot pass an array view of 'u8' as parameter 'd' of 'avmTakeInt'") {
+        u8[] avmQqArgLeft = avmFieldSrc;
+        int avmQqArgResult = avmTakeInt(avmQqArgLeft ?? avmFieldSrc);
     }
 
     return 0;
