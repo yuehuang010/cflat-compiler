@@ -89,10 +89,20 @@ void MainListener::InstantiateGenericInterface(const std::string& baseName, cons
         auto savedValueSubst = activeValueSubstitutions;
         auto savedPackSubst = activePackSubstitutions;
         GenericValueMacroScope valueMacros(compilerLLVM);
+        // Same shadow rule as the struct/function paths: a name this interface binds must not
+        // keep an enclosing instantiation's binding of the OTHER kind.
         for (const auto& [k, v] : substitutions)
+        {
+            activePackSubstitutions.erase(k);
+            activeValueSubstitutions.erase(k);
             activeTypeSubstitutions[k] = v;
+        }
         for (const auto& [k, v] : packSubstitutions)
+        {
+            activeTypeSubstitutions.erase(k);
+            activeValueSubstitutions.erase(k);
             activePackSubstitutions[k] = v;
+        }
         for (const auto& [k, v] : valueSubstitutions)
         {
             activeValueSubstitutions[k] = v;
@@ -303,6 +313,13 @@ std::string MainListener::InstantiateGenericFunction(const std::string& baseName
         const auto& valueParams = genericFunctionValueParams[baseName];
         if (!ValidateGenericArgumentKinds(baseName, typeParams, valueParams, typeArgs))
             return {};
+        // Same shadow rule as the struct drain: this instantiation OWNS its parameter names.
+        for (const auto& tp : typeParams)
+        {
+            activeTypeSubstitutions.erase(tp);
+            activeValueSubstitutions.erase(tp);
+            activePackSubstitutions.erase(tp);
+        }
         if (packIdx == std::string::npos)
         {
             for (size_t i = 0; i < typeParams.size(); i++)
@@ -421,29 +438,93 @@ std::string MainListener::TryInferAndInstantiateFromArgs(const std::string& func
         auto paramDecls = paramTypeList->parameterList()->parameterDeclaration();
 
         std::unordered_map<std::string, std::string> inferred;
+        // A binding read off the argument's DECLARED spelling outranks the LLVM-type fallback,
+        // and two declared bindings that disagree infer nothing (the overload error stands).
+        std::unordered_map<std::string, bool> declaredBinding;
         for (size_t i = 0; i < paramDecls.size() && i < args.size(); i++)
         {
             std::string paramTypeName;
+            int paramStars = 0;
+            bool paramView = false;
             for (auto* ds : paramDecls[i]->declarationSpecifiers()->declarationSpecifier())
             {
                 auto* ts = ds->typeSpecifier();
                 if (!ts || !ts->genericIdentifier()) continue;
                 auto* gid = ts->genericIdentifier();
-                if (gid->Identifier()) { paramTypeName = gid->Identifier()->getText(); break; }
+                if (gid->Identifier())
+                {
+                    paramTypeName = gid->Identifier()->getText();
+                    // The parameter's OWN decoration ('T[] v', 'T*[] v', 'T* p') is not part of
+                    // the binding: it is stripped off the argument's spelling below.
+                    paramStars = PointerDepthOf(ds->pointer());
+                    paramView = IsArrayViewArg(ds);
+                    break;
+                }
             }
             for (const auto& tp : typeParams)
             {
-                if (paramTypeName == tp)
+                if (paramTypeName != tp)
+                    continue;
+                const auto& tv = args[i].TypeAndValue;
+                // The call site drops TypeName for primitives, so the declared name arrives on
+                // the side channel; the reference-kind flags are propagated either way.
+                std::string base = tv.TypeName.empty() ? args[i].InferSourceTypeName : tv.TypeName;
+                bool declared = false;
+                std::string argType;
+                if (!base.empty())
                 {
-                    std::string argType = args[i].TypeAndValue.TypeName;
-                    // Free-function calls drop TypeName for signed-int args (call site only
-                    // preserves it for unsigned ints). Fall back to the LLVM BaseType so
-                    // numeric literals like 3 and (i64)10 still infer cleanly.
-                    if (argType.empty() && args[i].BaseType != nullptr)
-                        argType = Compiler()->LlvmTypeToTypeName(args[i].BaseType);
-                    if (!argType.empty()) inferred[tp] = argType;
-                    break;
+                    // Rebuild the argument's written spelling from its flags: a view carries its
+                    // ELEMENT's stars ('int*[]'), a plain pointer its own depth.
+                    int argStars = tv.IsArrayView
+                        ? (tv.ElemPointer ? std::max(tv.PointerDepth, 1) : 0)
+                        : (tv.Pointer ? std::max(tv.PointerDepth, 1) : 0);
+                    bool argView = tv.IsArrayView;
+                    if (paramView)
+                    {
+                        // A view parameter binds from a view argument or from a FIXED array,
+                        // which decays to one at the call (`First(plain)` with `int[3] plain`).
+                        if (!argView && tv.ConstArraySize == 0) break;
+                        argView = false;
+                    }
+                    else if (argView && paramStars > 0)
+                    {
+                        // 'T*' over a view argument decays to the ELEMENT pointer (q09 ruling).
+                        argView = false;
+                        argStars += 1;
+                    }
+                    if (argStars < paramStars) break;
+                    argStars -= paramStars;
+                    argType = base + std::string(argStars, '*') + (argView ? "[]" : "");
+                    declared = true;
                 }
+                // Free-function calls drop TypeName for signed-int args (call site only
+                // preserves it for unsigned ints). Fall back to the LLVM BaseType so
+                // numeric literals like 3 and (i64)10 still infer cleanly.
+                if (argType.empty() && args[i].BaseType != nullptr)
+                    argType = Compiler()->LlvmTypeToTypeName(args[i].BaseType);
+                if (argType.empty()) break;
+                auto prev = inferred.find(tp);
+                if (prev == inferred.end())
+                {
+                    inferred[tp] = argType;
+                    declaredBinding[tp] = declared;
+                }
+                else if (declared && !declaredBinding[tp])
+                {
+                    prev->second = argType;   // a declared spelling replaces the fallback
+                    declaredBinding[tp] = true;
+                }
+                else if (declared && declaredBinding[tp] && prev->second != argType)
+                {
+                    // Two declared arguments disagree. Keep the LAST one (pre-fix behaviour) so
+                    // the call still reports the detailed overload mismatch, not "not known".
+                    prev->second = argType;
+                }
+                else if (!declared && !declaredBinding[tp])
+                {
+                    prev->second = argType;   // fallback only: last one wins, as before
+                }
+                break;
             }
         }
 
@@ -705,6 +786,15 @@ void MainListener::ProcessPendingInstantiations() {
             auto packMapIt = genericStructPackIndex.find(pending.templateName);
             size_t packIdx = (packMapIt != genericStructPackIndex.end()) ? packMapIt->second : std::string::npos;
 
+            // A record drained while ANOTHER instantiation is mid-flight (tuple<T...> imports
+            // tuple.cb and re-enters here) must not inherit that one's binding for a parameter
+            // name it declares itself: a stale pack "T" expands this template's "T v" field.
+            for (const auto& tp : typeParams)
+            {
+                activeTypeSubstitutions.erase(tp);
+                activeValueSubstitutions.erase(tp);
+                activePackSubstitutions.erase(tp);
+            }
             if (packIdx == std::string::npos)
             {
                 // Non-variadic: 1:1 mapping

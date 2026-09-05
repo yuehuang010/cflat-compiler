@@ -1091,6 +1091,10 @@ std::string ForwardRefScanner::ResolveForwardTypeArg(CFlatParser::TypeParameterE
         // bracket forms are rejected in the main pass, so the forward scan just names them.
         // Stars are COUNTED here, exactly as the main pass counts them: a shell named Box$.p$C
         // for a Box<C**> use would not match the instantiation the codegen pass builds.
+        // A POINTER alias folds here exactly as it does in the main pass's ResolveTypeArgEntry,
+        // or the shell name (V$IP) would not be the instantiated one (V$.p$int).
+        int aliasStars = PointerDepthOf(entry->pointer());
+        FoldPointerAliasArg(Compiler(entry), resolved, aliasStars);
         std::string uniqueArgBase = resolved;
         int uniqueArgStars = 0;
         bool uniqueArgView = false;
@@ -1099,11 +1103,11 @@ std::string ForwardRefScanner::ResolveForwardTypeArg(CFlatParser::TypeParameterE
         if (IsArrayViewArg(entry))
         {
             uniqueArgView = true;
-            resolved += std::string(PointerDepthOf(entry->pointer()), '*') + "[]";
+            resolved += std::string(aliasStars, '*') + "[]";
         }
-        else if (entry->pointer() != nullptr)
+        else if (aliasStars > 0)
         {
-            uniqueArgStars = PointerDepthOf(entry->pointer());
+            uniqueArgStars = aliasStars;
             resolved += std::string(uniqueArgStars, '*');
         }
         // Carry the `alias` qualifier into the mangled/instantiation string. Valid `unique`

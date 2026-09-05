@@ -228,6 +228,33 @@ static int PointerDepthOf(CFlatParser::PointerContext* p)
 // `compiler` namespace-resolves the element type the same way a generic type ARGUMENT is
 // resolved, so the `(Item, int)` sugar and an explicit `tuple<Item, int>` keep mangling to one
 // name inside a namespace that declares its own Item.
+// Peel trailing '*' characters off a resolved type-alias string (e.g. "void*" -> "void"),
+// returning the pointer depth removed. A pointer alias keeps its stars in the stored string
+// (no type-descriptor struct); this re-derives the depth at the resolution site so it can be
+// OR'd onto the flat TypeAndValue.Pointer / .ElemPointer flags.
+static int PeelAliasPointerStars(std::string& name)
+{
+    int depth = 0;
+    while (!name.empty() && name.back() == '*') { name.pop_back(); depth++; }
+    return depth;
+}
+
+// Fold a POINTER alias (`using IP = int*;`) into a type-ARGUMENT spelling: rebinds `name` to the
+// alias target's bare base and adds the target's stars to `stars` (the ELEMENT depth for a view).
+// One rule for every type-argument encoder, so `V<IP[]>` and `V<int*[]>` are one instantiation.
+static bool FoldPointerAliasArg(const LLVMBackend* compiler, std::string& name, int& stars)
+{
+    if (compiler == nullptr) return false;
+    if (compiler->FindFunctionTypeAlias(name) != nullptr) return false;
+    std::string aliased = compiler->ResolveTypeAlias(name);
+    if (aliased == name) return false;
+    int aliasStars = PeelAliasPointerStars(aliased);
+    if (aliasStars == 0 || !IsBareTypeName(aliased)) return false;
+    name = compiler->ResolveManglingAlias(compiler->ResolveTypeArgBaseName(aliased));
+    stars += aliasStars;
+    return true;
+}
+
 static std::string TupleEntryArgName(const LLVMBackend* compiler, CFlatParser::TupleTypeEntryContext* entry)
 {
     std::string argName = compiler != nullptr
@@ -235,10 +262,12 @@ static std::string TupleEntryArgName(const LLVMBackend* compiler, CFlatParser::T
         : entry->typeSpecifier()->getText();
     // Stars are counted, not flagged: a `(C**, int)` element must not mangle as `(C*, int)`.
     // On a view they decorate the ELEMENT, so `(int*[], int)` keeps its star: "int*[]".
+    int stars = PointerDepthOf(entry->pointer());
+    FoldPointerAliasArg(compiler, argName, stars);
     if (IsArrayViewArg(entry))
-        argName += std::string(PointerDepthOf(entry->pointer()), '*') + "[]";
-    else if (entry->pointer() != nullptr)
-        argName += std::string(PointerDepthOf(entry->pointer()), '*');
+        argName += std::string(stars, '*') + "[]";
+    else if (stars > 0)
+        argName += std::string(stars, '*');
     return argName;
 }
 
@@ -1153,17 +1182,6 @@ static void PeelTypeArgSuffix(std::string& name, int& pointerDepth, bool& arrayV
     }
     else
         pointerDepth += stars;
-}
-
-// Peel trailing '*' characters off a resolved type-alias string (e.g. "void*" -> "void"),
-// returning the pointer depth removed. A pointer alias keeps its stars in the stored string
-// (no type-descriptor struct); this re-derives the depth at the resolution site so it can be
-// OR'd onto the flat TypeAndValue.Pointer / .ElemPointer flags.
-static int PeelAliasPointerStars(std::string& name)
-{
-    int depth = 0;
-    while (!name.empty() && name.back() == '*') { name.pop_back(); depth++; }
-    return depth;
 }
 
 // Strip a trailing fixed-array suffix ("[3]" / "[3][4]") off a resolved alias string into `dims`

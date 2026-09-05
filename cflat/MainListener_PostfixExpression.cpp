@@ -5227,6 +5227,9 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     // the direct-arg path where they arrive via the side-channel instead).
                                     argVar.LambdaCaptureNames = argNV.LambdaCaptureNames;
 
+                                    // The declared element type, for generic inference only: the
+                                    // TypeName below stays empty for primitives on purpose.
+                                    argVar.InferSourceTypeName = argNV.TypeAndValue.TypeName;
                                     // Preserve unsigned-integer TypeName so Upconvert can choose ZExt over SExt.
                                     if (argNV.TypeAndValue.IsUnsignedInteger() != -1)
                                         argVar.TypeAndValue.TypeName = argNV.TypeAndValue.TypeName;
@@ -7737,12 +7740,11 @@ void MainListener::ScanAndQueueGenericTypeUses(antlr4::RuleContext* ctx, bool to
                         // resolves/queues nested generics (e.g. list<int> inside list<list<int>>).
                         for (auto* entry : genParams->typeParameterList()->typeParameterEntry())
                             typeArgs.push_back(ResolveTypeArgEntry(entry));
-                        std::string mangledName = MangledGenericName(baseName, typeArgs);
-                        if (!instantiatedGenerics.count(mangledName))
-                        {
-                            QueuePendingInstantiation(baseName, typeArgs, mangledName, genParams);
-                            instantiatedGenerics.insert(mangledName);
-                        }
+                        // One queue funnel: it also pre-creates the opaque shell, so a LATER
+                        // instantiation naming this one as a field type finds a type even when
+                        // the forward scan spelled the shell differently (e.g. an alias arg).
+                        QueueGenericInstantiation(baseName, typeArgs,
+                                                  MangledGenericName(baseName, typeArgs), genParams);
                     }
                     break;
                 }
@@ -7758,13 +7760,10 @@ void MainListener::ScanAndQueueGenericTypeUses(antlr4::RuleContext* ctx, bool to
                         std::vector<std::string> typeArgs;
                         for (auto* entry : primaryExpr->genericIdentifier()->genericTypeParameters()->typeParameterList()->typeParameterEntry())
                             typeArgs.push_back(ResolveTypeArgEntry(entry));
-                        std::string mangledName = MangledGenericName(baseName, typeArgs);
-                        if (!instantiatedGenerics.count(mangledName))
-                        {
-                            QueuePendingInstantiation(baseName, typeArgs, mangledName,
-                                primaryExpr->genericIdentifier()->genericTypeParameters());
-                            instantiatedGenerics.insert(mangledName);
-                        }
+                        // Same single funnel as the typeSpecifier arm above.
+                        QueueGenericInstantiation(baseName, typeArgs,
+                            MangledGenericName(baseName, typeArgs),
+                            primaryExpr->genericIdentifier()->genericTypeParameters());
                     }
                     break;
                 }

@@ -159,9 +159,23 @@ std::string MainListener::ResolveTypeArgEntry(CFlatParser::TypeParameterEntryCon
                 resolved = substIt->second;
                 // Stars WRITTEN on a view arg (`T*[]`) are element stars already; the peel adds
                 // any the substituted spelling itself carries (`T[]` with T bound to "int*").
+                bool writtenView = hasArrayView;
+                int writtenStars = pointerDepth;
                 substElemPtrDepth = hasArrayView ? pointerDepth : 0;
                 PeelTypeArgSuffix(resolved, pointerDepth, hasArrayView, &substAlias,
                                   &substElemPtrDepth);
+                // `B<T*>` with T bound to a view DECAYS to the ELEMENT pointer, exactly as the
+                // declarator arm does: the star consumes the view's own thin-pointer repr.
+                if (!writtenView && hasArrayView && writtenStars > 0)
+                {
+                    hasArrayView = false;
+                    pointerDepth = substElemPtrDepth + writtenStars;
+                    substElemPtrDepth = -1;
+                    if (pointerDepth > PointerDepthCap)
+                        LogErrorContext(entry, PointerDepthCapMessage(
+                            std::format("generic type argument '{}'", entry->getText()),
+                            pointerDepth));
+                }
                 hasPointer = pointerDepth > 0;
                 isAlias = isAlias || substAlias;
             }
@@ -214,6 +228,23 @@ std::string MainListener::ResolveTypeArgEntry(CFlatParser::TypeParameterEntryCon
             // is already resolved in the CALLER's scope - re-resolving rebinds it to this one.
             if (!substituted)
                 resolved = Compiler(entry)->ResolveTypeArgBaseName(resolved);
+            // A POINTER alias (`using IP = int*;`) names ONE type, so `V<IP>` and `V<IP[]>` must
+            // key like `V<int*>` / `V<int*[]>`. ResolveManglingAlias above folds pure RENAMES
+            // only, so fold the stars here the way the declarator does (ResolveTypeAlias +
+            // PeelAliasPointerStars) and move them onto the element of a view.
+            if (!substituted)
+            {
+                if (hasArrayView && substElemPtrDepth < 0) substElemPtrDepth = pointerDepth;
+                int& aliasStarSink = hasArrayView ? substElemPtrDepth : pointerDepth;
+                if (FoldPointerAliasArg(Compiler(entry), resolved, aliasStarSink))
+                {
+                    hasPointer = pointerDepth > 0;
+                    if (aliasStarSink > PointerDepthCap)
+                        LogErrorContext(entry, PointerDepthCapMessage(
+                            std::format("generic type argument '{}'", entry->getText()),
+                            aliasStarSink));
+                }
+            }
         }
 
         // The bare base (before the pointer/view suffix) drives the D1 type check below.
@@ -576,9 +607,22 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                                                   &argElemDepth);
                             }
                             else
+                            {
                                 // Same namespace walk as a generic type ARGUMENT (a substituted arg
                                 // is already resolved in the caller's scope - never re-resolve it).
                                 argName = Compiler(entry)->ResolveTypeArgBaseName(argName);
+                                // One key per type: `(IP, int)` folds to `(int*, int)`.
+                                FoldPointerAliasArg(Compiler(entry), argName,
+                                                    argView ? argElemDepth : argDepth);
+                            }
+                            // `T*` on a substituted VIEW decays to the element pointer, exactly as
+                            // the generic type-argument and declarator arms do.
+                            if (argView && !IsArrayViewArg(entry) && PointerDepthOf(entry->pointer()) > 0)
+                            {
+                                argView = false;
+                                argDepth = argElemDepth + PointerDepthOf(entry->pointer());
+                                argElemDepth = 0;
+                            }
                             if (argView) argName += std::string(argElemDepth, '*') + "[]";
                             else if (argDepth > 0) argName += std::string(argDepth, '*');
                             typeArgs.push_back(argName);

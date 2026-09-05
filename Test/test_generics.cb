@@ -4711,26 +4711,100 @@ bool testGnViewOfPointersArg()
     // A raw (non-generic) view of pointers spells its element star as well.
     result &= Test("gvp_raw_view_typeof", typeof(pview), "int*[]");
 
-    return result;
-}
-
-// The tuple sugar encodes an element the same way a generic argument does, so `(int*[], int[])`
-// must key apart from `(int[], int[])`. Own function: a tuple LITERAL and a generic
-// instantiation in one body hit an unrelated pre-existing registration order bug.
-bool testGnViewOfPointersTupleArg()
-{
-    bool result = true;
-
-    int one = 1; int two = 2;
-    int*[2] cells; cells[0] = &one; cells[1] = &two;
-    int*[] pview = cells;
-    int[2] plain; plain[0] = 10; plain[1] = 11;
-    int[] vview = plain;
-
+    // The tuple sugar encodes an element the same way a generic argument does, so
+    // `(int*[], int[])` keys apart from `(int[], int[])`. These legs lived in a function of
+    // their own until a generic instantiation followed by a tuple in ONE body stopped
+    // dropping the generic's fields (a stale pack binding for the name "T").
     (int*[], int[]) pair = (pview, vview);
     result &= Test("gvp_tuple_typeof", typeof(pair), "tuple<int*[], int[]>");
     result &= Test("gvp_tuple_ptr_elem", *pair.item_0[1], 2);
     result &= Test("gvp_tuple_value_elem", pair.item_1[1], 11);
+
+    return result;
+}
+
+// The type-ARGUMENT key space (q12): one type must have one instantiation key, whatever the
+// spelling. A POINTER alias folds into the key, `T*` over a substituted view decays to the
+// element pointer in ARGUMENT position exactly as it does in a declarator, and a generic
+// function infers its parameter from a view/pointer argument's ELEMENT type.
+using TakIntPtr = int*;
+using TakIntPtrPtr = int**;
+struct TakFoo { int a = default; };
+using TakFooPtr = TakFoo*;
+namespace TakNs { using NsIntPtr = int*; }
+struct TakBox<T> { T v = default; };
+struct TakPair<A, B> { A a = default; B b = default; };
+struct TakStarBox<T> { TakBox<T*> inner = default; };
+struct TakPlainBox<T> { TakBox<T> inner = default; };
+struct TakDeepBox<T> { TakBox<T**> inner = default; };
+struct TakTupleBox<T> { (T*, int) inner = default; };
+T takFirst<T>(T[] v) { return v[0]; }
+T takElem<T>(T*[] v) { return *v[0]; }
+T takDeref<T>(T* p) { return *p; }
+T takPick<T>(T a, T b) { return a; }
+
+bool testGnTypeArgKeySpace()
+{
+    bool result = true;
+
+    int one = 300; int two = 2;
+    int*[2] cells; cells[0] = &one; cells[1] = &two;
+    int*[] pview = cells;
+    int[3] plain; plain[0] = 300; plain[1] = 11; plain[2] = 12;
+    int[] vview = plain;
+
+    // A pointer alias keys like the spelled-out pointer, in every argument position.
+    TakBox<TakIntPtr> ab = default; ab.v = &one;
+    TakBox<int*> bb = default; bb.v = &one;
+    result &= Test("tak_alias_ptr_typeof", typeof(ab), "TakBox<int*>");
+    result &= Test("tak_bare_ptr_typeof", typeof(bb), "TakBox<int*>");
+    result &= Test("tak_alias_ptr_value", *ab.v, 300);
+    TakBox<TakIntPtr[]> av = default; av.v = pview;
+    result &= Test("tak_alias_view_typeof", typeof(av), "TakBox<int*[]>");
+    result &= Test("tak_alias_view_value", *av.v[1], 2);
+    TakBox<TakIntPtrPtr> app = default; int* head = &one; app.v = &head;
+    result &= Test("tak_alias_ptrptr_typeof", typeof(app), "TakBox<int**>");
+    TakBox<TakFooPtr> afp = default;
+    result &= Test("tak_alias_struct_ptr_typeof", typeof(afp), "TakBox<TakFoo*>");
+    TakBox<TakNs.NsIntPtr> ans = default; ans.v = &one;
+    result &= Test("tak_alias_namespaced_typeof", typeof(ans), "TakBox<int*>");
+    TakPair<TakIntPtr, int> apr = default; apr.a = &one; apr.b = 4;
+    result &= Test("tak_alias_two_param_typeof", typeof(apr), "TakPair<int*, int>");
+    result &= Test("tak_alias_two_param_value", *apr.a + apr.b, 304);
+    TakBox<TakBox<TakIntPtr>> anb = default; anb.v.v = &one;
+    result &= Test("tak_alias_nested_typeof", typeof(anb), "TakBox<TakBox<int*>>");
+    result &= Test("tak_alias_nested_value", *anb.v.v, 300);
+    (TakIntPtr, int) atup = default; atup.item_0 = &one;
+    result &= Test("tak_alias_tuple_typeof", typeof(atup), "tuple<int*, int>");
+    result &= Test("tak_alias_tuple_value", *atup.item_0, 300);
+
+    // `T*` written on a type ARGUMENT whose T is a view decays to the element pointer.
+    TakStarBox<int[]> sv = default; sv.inner.v = vview;
+    result &= Test("tak_nested_star_on_view", typeof(sv.inner), "TakBox<int*>");
+    result &= Test("tak_nested_star_on_view_value", sv.inner.v[1], 11);
+    TakStarBox<int*[]> spv = default; spv.inner.v = pview;
+    result &= Test("tak_nested_star_on_ptr_view", typeof(spv.inner), "TakBox<int**>");
+    result &= Test("tak_nested_star_on_ptr_view_value", **spv.inner.v, 300);
+    TakPlainBox<int[]> pv2 = default; pv2.inner.v = vview;
+    result &= Test("tak_nested_no_star_on_view", typeof(pv2.inner), "TakBox<int[]>");
+    result &= Test("tak_nested_no_star_value", pv2.inner.v[2], 12);
+    TakStarBox<int*> sp = default;
+    result &= Test("tak_nested_star_on_ptr", typeof(sp.inner), "TakBox<int**>");
+    TakDeepBox<int[]> dv = default;
+    result &= Test("tak_nested_two_stars_on_view", typeof(dv.inner), "TakBox<int**>");
+    TakTupleBox<int[]> tv = default; tv.inner.item_0 = vview;
+    result &= Test("tak_tuple_star_on_view", typeof(tv.inner), "tuple<int*, int>");
+    result &= Test("tak_tuple_star_on_view_value", tv.inner.item_0[1], 11);
+
+    // Inference binds the parameter from the ARGUMENT's element type, not its lowered pointer.
+    result &= Test("tak_infer_from_view", takFirst(vview), 300);
+    result &= Test("tak_infer_from_fixed_array", takFirst(plain), 300);
+    int* fromPtrView = takFirst(pview);
+    result &= Test("tak_infer_from_view_of_pointers", *fromPtrView, 300);
+    result &= Test("tak_infer_elem_star_param", takElem(pview), 300);
+    int* headPtr = &one;
+    result &= Test("tak_infer_from_pointer", takDeref(headPtr), 300);
+    result &= Test("tak_infer_two_params_literal", takPick(two, 4), 2);
 
     return result;
 }
@@ -5028,7 +5102,7 @@ extern int main()
     total++; passed += testGnPointerDepthSubstitution()            ? 1 : 0;
     total++; passed += testGnViewArgIntoPointerDeclarator()        ? 1 : 0;
     total++; passed += testGnViewOfPointersArg()                   ? 1 : 0;
-    total++; passed += testGnViewOfPointersTupleArg()              ? 1 : 0;
+    total++; passed += testGnTypeArgKeySpace()                     ? 1 : 0;
     total++; passed += testNamespaceTupleAndGenericAlias()           ? 1 : 0;
     total++; passed += testGenericFunctions()                      ? 1 : 0;
     total++; passed += testGenericSizeof()                          ? 1 : 0;

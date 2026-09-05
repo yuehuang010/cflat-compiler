@@ -1342,6 +1342,10 @@ public:
         llvm::Function* OwnedStringBorrowFunction = nullptr;
         bool IsOwningStruct = false;     // true for move parameters of struct types with destructors - destructor called on scope exit
         bool IsMoved = false;            // compile-time: true after this variable's ownership was transferred via a move call
+        // compile-time: the DECLARED element type name of this call argument, kept even where the
+        // call site drops TypeName for a primitive so overload matching stays LLVM-type based.
+        // Generic type-argument inference reads it; not part of the --init cache round-trip.
+        std::string InferSourceTypeName;
         // compile-time: this argument was written 'move x' at a call site and is a VALUE type
         // (string/owning struct/closure). Zeroing is deferred to ApplyMoveParamTransfer so the
         // callee's parameter move-ness is known first. Not part of the --init cache round-trip.
