@@ -1358,6 +1358,79 @@ bool testLockGuardedBitfields()
     return result;
 }
 
+// Regression: the guarded-field check must key on the CANONICAL RECEIVER PATH - the same
+// spelling lock(...) records - not on the immediate parent alone. The first six legs below
+// false-errored before the fix ("must hold 'S__.mtx' / 'inner.mtx' / 'arr.mtx'") with the lock
+// held; the seventh (atomic) compiled before and pins the producer side against re-keying.
+struct LockPathCell {
+    mutex mtx = default;
+    lock(mtx) {
+        int value = default;
+        int bits : 4;
+        // Explicit-'this' door from a method declared INSIDE the group: keys on 'this.mtx',
+        // which the group seeding records - it used to key on the mangled 'this' spelling.
+        int GetThis()     { return this.value; }
+        int GetThisBits() { return this.bits; }
+    }
+};
+
+struct LockPathOuter { LockPathCell inner = default; LockPathCell other = default; };
+
+// The atomic release(val, body) lambda seeds the lock set from the RECEIVER PATH of the
+// atomic, so a guard reached through a deeper receiver seeds 'a.flagged.ready', not 'flagged.ready'.
+struct LockPathFlag {
+    atomic__i32 ready = default;
+    lock(ready) {
+        int value = 0;
+    }
+};
+
+struct LockPathFlagOuter { LockPathFlag flagged = default; };
+
+int lockPathNested(LockPathOuter* o) {
+    int v = 0;
+    lock(o.inner.mtx) { v = o.inner.value + o.inner.bits; }
+    return v;
+}
+
+int lockPathElement(LockPathCell[] arr) {
+    int v = 0;
+    lock(arr[1].mtx) { v = arr[1].value + arr[1].bits; }
+    return v;
+}
+
+bool testLockGuardedReceiverPath()
+{
+    bool result = true;
+
+    // Shape 1: explicit 'this' from an in-group method, plain field and bitfield.
+    LockPathCell c;
+    lock(c.mtx) { c.value = 21; c.bits = 5; }
+    lock(c.mtx) {
+        result &= Test("lock_path_this_plain", c.GetThis(), 21);
+        result &= Test("lock_path_this_bits",  c.GetThisBits(), 5);
+    }
+
+    // Shape 2: nested receiver - lock(o.inner.mtx) covers o.inner.value, not o.other.value.
+    LockPathOuter o;
+    lock(o.inner.mtx) { o.inner.value = 30; o.inner.bits = 3; }
+    result &= Test("lock_path_nested", lockPathNested(&o), 33);
+
+    // Shape 3: array-element receiver - the key carries the subscript, so arr[1] is its own path.
+    LockPathCell[2] arr;
+    lock(arr[1].mtx) { arr[1].value = 40; arr[1].bits = 2; }
+    result &= Test("lock_path_element", lockPathElement(arr), 42);
+
+    // Nested atomic guard: the release() lambda's seeded key must match the body's access key.
+    LockPathFlagOuter a;
+    a.flagged.ready.release(1, () => { a.flagged.value = 55; });
+    a.flagged.ready.acquire((i32 v) => {
+        result &= Test("lock_path_atomic_nested", a.flagged.value, 55);
+    });
+
+    return result;
+}
+
 bool testLockAnnotations()
 {
     bool result = true;
@@ -1977,6 +2050,7 @@ extern int main() {
     total++; passed += testAtomicI32ReleaseAcquire()      ? 1 : 0;
     total++; passed += testLockAnnotations()              ? 1 : 0;
     total++; passed += testLockGuardedBitfields()          ? 1 : 0;
+    total++; passed += testLockGuardedReceiverPath()       ? 1 : 0;
     total++; passed += testLockPointerGuard()             ? 1 : 0;
     total++; passed += testLockArrowForm()                ? 1 : 0;
     total++; passed += testGlobalGuardGroup()             ? 1 : 0;

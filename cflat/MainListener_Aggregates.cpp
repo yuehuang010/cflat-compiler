@@ -727,11 +727,53 @@ std::string MainListener::GuardLockKey(const LLVMBackend::TypeAndValue& tv) {
         return parent.empty() ? tv.GuardedBy : parent + "." + tv.GuardedBy;
     }
 
+const LockMode* MainListener::FindHeldGuard(const std::string& receiverPath, const std::string& guard,
+                                            std::string* matchedKey) const {
+        auto probe = [&](const std::string& key) -> const LockMode* {
+            auto it = currentLockSet.find(key);
+            if (it == currentLockSet.end()) return nullptr;
+            if (matchedKey != nullptr) *matchedKey = key;
+            return &it->second;
+        };
+        if (receiverPath.empty() || receiverPath == "this")
+        {
+            if (const LockMode* bare = probe(guard)) return bare;
+            return probe("this." + guard);
+        }
+        return probe(receiverPath + "." + guard);
+    }
+
+void MainListener::CheckGuardedFieldRead(antlr4::ParserRuleContext* ctx, const std::string& fieldName,
+                                        const std::string& guard, const std::string& receiverPath,
+                                        const std::string& receiverName, std::string& heldKey) {
+        if (IsSimpleLockPath(receiverPath))
+        {
+            if (FindHeldGuard(receiverPath, guard, &heldKey) != nullptr) return;
+            LogErrorContext(ctx, std::format(
+                "Field '{}' is guarded by '{}': must hold '{}' before accessing it.",
+                fieldName, guard, GuardKeyForPath(receiverPath, guard)));
+            return;
+        }
+        // Not a plain path (a call result, a computed receiver): keep the legacy key so the
+        // verdict is exactly what it was before the canonical-path keying landed.
+        if (receiverName.empty()) return;
+        std::string requiredLock = receiverName + "." + guard;
+        if (currentLockSet.find(requiredLock) != currentLockSet.end())
+        {
+            heldKey = requiredLock;
+            return;
+        }
+        LogErrorContext(ctx, std::format(
+            "Field '{}' is guarded by '{}': must hold '{}' before accessing it.",
+            fieldName, guard, requiredLock));
+    }
+
 void MainListener::CheckGuardedWrite(antlr4::ParserRuleContext* ctx, const LLVMBackend::NamedVariable& target) {
         const std::string& guard = target.TypeAndValue.GuardedBy;
         if (guard.empty()) return;
 
-        std::string key = GuardLockKey(target.TypeAndValue);
+        std::string key = target.GuardLockKey.empty()
+            ? GuardLockKey(target.TypeAndValue) : target.GuardLockKey;
         auto it = currentLockSet.find(key);
         if (it == currentLockSet.end()) return;
         if (it->second == LockMode::Exclusive) return;

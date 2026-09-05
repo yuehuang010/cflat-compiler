@@ -2074,6 +2074,29 @@ inline std::string NormalizeLockText(const std::string& text)
     return out;
 }
 
+// True when a receiver spelling is a plain lock path: identifiers joined by '.', with optional
+// '[i]' subscripts. A call result or a computed receiver is not, and keeps the legacy key.
+inline bool IsSimpleLockPath(const std::string& text)
+{
+    if (text.empty()) return false;
+    unsigned char first = (unsigned char)text[0];
+    if (!(std::isalpha(first) || first == '_')) return false;
+    for (char c : text)
+    {
+        unsigned char u = (unsigned char)c;
+        if (!(std::isalnum(u) || c == '_' || c == '.' || c == '[' || c == ']')) return false;
+    }
+    return true;
+}
+
+// The lock-set key a guarded field reached through `receiverPath` resolves to. `this` names the
+// receiver's own struct, whose guardian the method-body seeding records bare - see FindHeldGuard.
+inline std::string GuardKeyForPath(const std::string& receiverPath, const std::string& guard)
+{
+    if (receiverPath.empty() || receiverPath == "this") return guard;
+    return receiverPath + "." + guard;
+}
+
 // Returns "read", "write", "optimistic", or "" (exclusive) for a raw lock expression's text.
 inline std::string LockTextMode(const std::string& text)
 {
@@ -6016,6 +6039,21 @@ public:
     // receiver ("n->count") keys on "n.ver"; a self-field or guarded global keys on the bare
     // guardian name. Mirrors the key the read-side guard checks build.
     static std::string GuardLockKey(const LLVMBackend::TypeAndValue& tv);
+
+    // The held mode of the lock guarding `receiverPath`.`guard`, or null when it is not held.
+    // A `this` (or absent) receiver is the enclosing struct: its guardian is seeded bare by a
+    // positional group and as "this.<guard>" by an explicit lock clause, so both spellings match.
+    // *matchedKey receives the key that matched, so the write check keys on the same lock.
+    const LockMode* FindHeldGuard(const std::string& receiverPath, const std::string& guard,
+                                  std::string* matchedKey = nullptr) const;
+
+    // Read-side guarded-field check for a receiver-qualified access ('o.inner.value'). Keys on
+    // the canonical receiver PATH, the same spelling `lock(...)` records, so a held lock on a
+    // deeper receiver matches. A receiver that is not a plain path keeps the legacy
+    // immediate-parent key, leaving those verdicts unchanged. heldKey receives the matched key.
+    void CheckGuardedFieldRead(antlr4::ParserRuleContext* ctx, const std::string& fieldName,
+                               const std::string& guard, const std::string& receiverPath,
+                               const std::string& receiverName, std::string& heldKey);
 
     // Write-side half of the guarded-access check. Reading a guarded field is legal in every
     // held mode; WRITING one is legal only under an exclusive lock - a shared reader may not

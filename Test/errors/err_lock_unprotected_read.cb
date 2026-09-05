@@ -44,8 +44,9 @@ expect_error("Field 'value' is guarded by 'mtx': must hold 'mtx' before accessin
     };
 }
 
-// Explicit-'this' door, write side.
-expect_error("Field 'value' is guarded by 'mtx': must hold 'BitThisWrite__.mtx' before accessing it.") {
+// Explicit-'this' door, write side. Set() is declared OUTSIDE the group, so it holds nothing.
+// The key is the struct's own guardian - 'this' is the receiver's own path, not a mangled name.
+expect_error("Field 'value' is guarded by 'mtx': must hold 'mtx' before accessing it.") {
     struct BitThisWrite {
         mutex mtx = default;
         lock(mtx) {
@@ -53,4 +54,31 @@ expect_error("Field 'value' is guarded by 'mtx': must hold 'BitThisWrite__.mtx' 
         }
         void Set() { this.value = 3; }
     };
+}
+
+// Wrong receiver PATH under a held lock: lock(o.inner.mtx) does not cover o.other.value.
+// The canonical-path key is what makes these two paths distinguishable at all.
+struct PathCell {
+    mutex mtx = default;
+    lock(mtx) {
+        int value = default;
+    }
+};
+struct PathOuter { PathCell inner = default; PathCell other = default; };
+
+expect_error("Field 'value' is guarded by 'mtx': must hold 'o.other.mtx' before accessing it.") {
+    int wrongNestedPath(PathOuter* o) {
+        int v = 0;
+        lock(o.inner.mtx) { v = o.other.value; }
+        return v;
+    }
+}
+
+// Same rule on an array-element receiver: holding arr[0].mtx says nothing about arr[1].
+expect_error("Field 'value' is guarded by 'mtx': must hold 'arr[1].mtx' before accessing it.") {
+    int wrongElementPath(PathCell[] arr) {
+        int v = 0;
+        lock(arr[0].mtx) { v = arr[1].value; }
+        return v;
+    }
 }

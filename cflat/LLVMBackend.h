@@ -1520,6 +1520,10 @@ public:
         std::string OwningStructName;    // when this NamedVariable is a struct-field access, the field's owning struct
         std::string FieldName;           // when this NamedVariable is a struct-field access, the field name
         std::string FieldPathText;       // source spelling of a field path, e.g. "w.inner.b"
+        // The lock-set key the guarded-field READ check matched for this access, keyed on the
+        // canonical receiver path ("o.inner.mtx"). Empty when the field is unguarded or the
+        // receiver was not a plain path - the write check then falls back to GuardLockKey.
+        std::string GuardLockKey;
         // Root VARIABLE of a field path ("w" for `w.a.b`). TypeAndValue.ParentVariableName names
         // only the IMMEDIATE parent, which on a nested path is an intermediate field, not a variable.
         std::string FieldPathRoot;

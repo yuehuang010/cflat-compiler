@@ -736,6 +736,11 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
             };
             // Captured at the member name so the call suffix below can still name the receiver.
             std::string nullIfaceRecvText;
+            // The lock-set key the guarded-field READ check matched for the member being walked,
+            // so the write-side check (CheckGuardedWrite) keys on the same receiver path.
+            std::string guardLockKeyHeld;
+            // Canonical receiver path of the most recent '.'/'->' member name in this chain.
+            std::string lastMemberReceiverPath;
             for (auto parseTree : ctx->children)
             {
                 if (childIndex++ >= childLimit) break;
@@ -1169,7 +1174,12 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                         // owner / method flag, and the tail of this case disarms on a real field.
                         if (prevToken == CFlatParser::Dot || prevToken == CFlatParser::Arrow
                             || prevToken == CFlatParser::QuestionDot)
+                        {
                             danglingMemberName = terminal->getText();
+                            // Canonical source path of the RECEIVER of the member being walked
+                            // ("o.inner.ready" for '.release') - the spelling lock(...) records.
+                            lastMemberReceiverPath = ArrowNormalizeLockText(ReceiverSourceText());
+                        }
 
                         if (!namespaceContext.empty())
                         {
@@ -1418,20 +1428,11 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             }
                             // Lock-set check: same rule the plain-field arm below applies, run
                             // here because the bitfield arm returns before reaching it.
+                            guardLockKeyHeld.clear();
                             if (bfHit && !bfHit->GuardedBy.empty())
-                            {
-                                std::string receiverName = structVar.TypeAndValue.VariableName;
-                                if (!receiverName.empty())
-                                {
-                                    std::string requiredLock = receiverName + "." + bfHit->GuardedBy;
-                                    if (currentLockSet.find(requiredLock) == currentLockSet.end())
-                                    {
-                                        LogErrorContext(ctx, std::format(
-                                            "Field '{}' is guarded by '{}': must hold '{}' before accessing it.",
-                                            primaryIdentifier, bfHit->GuardedBy, requiredLock));
-                                    }
-                                }
-                            }
+                                CheckGuardedFieldRead(ctx, primaryIdentifier, bfHit->GuardedBy,
+                                                      lastMemberReceiverPath,
+                                                      structVar.TypeAndValue.VariableName, guardLockKeyHeld);
                             if (bfHit && structVar.Storage)
                             {
                                 auto* compiler = Compiler(ctx);
@@ -1443,6 +1444,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 namedVar = compiler->EmitBitfieldRead(storagePtr, storageTy, *bfHit,
                                                                      structVar.TypeAndValue.VariableName,
                                                                      structVar.TypeAndValue.TypeName);
+                                namedVar.GuardLockKey = guardLockKeyHeld;
                                 continue;
                             }
 
@@ -1462,20 +1464,11 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 const auto& fieldType = dataStructure.StructFields[fieldIndex];
 
                                 // Lock-set check: if this field is guarded, verify the lock is held.
+                                guardLockKeyHeld.clear();
                                 if (!fieldType.GuardedBy.empty())
-                                {
-                                    std::string receiverName = structVar.TypeAndValue.VariableName;
-                                    if (!receiverName.empty())
-                                    {
-                                        std::string requiredLock = receiverName + "." + fieldType.GuardedBy;
-                                        if (currentLockSet.find(requiredLock) == currentLockSet.end())
-                                        {
-                                            LogErrorContext(ctx, std::format(
-                                                "Field '{}' is guarded by '{}': must hold '{}' before accessing it.",
-                                                primaryIdentifier, fieldType.GuardedBy, requiredLock));
-                                        }
-                                    }
-                                }
+                                    CheckGuardedFieldRead(ctx, primaryIdentifier, fieldType.GuardedBy,
+                                                          lastMemberReceiverPath,
+                                                          structVar.TypeAndValue.VariableName, guardLockKeyHeld);
 
                                 // Cross-thread sharing scan (--xthread-scan N): report when a
                                 // field of a type seen escaping a thread spawn is accessed and is
@@ -1524,6 +1517,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     }
                                     namedVar.TypeAndValue = fieldType;
                                     namedVar.TypeAndValue.ParentVariableName = structVar.TypeAndValue.VariableName;
+                                    namedVar.GuardLockKey = guardLockKeyHeld;
                                     namedVar.ContainsBondedClosure = structVar.ContainsBondedClosure
                                         && IsBondedClosureContainer(Compiler(ctx), fieldType);
                                     if (namedVar.ContainsBondedClosure)
@@ -1647,6 +1641,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     }
                                     namedVar.TypeAndValue = fieldType;
                                     namedVar.TypeAndValue.ParentVariableName = structVar.TypeAndValue.VariableName;
+                                    namedVar.GuardLockKey = guardLockKeyHeld;
                                     namedVar.ContainsBondedClosure = structVar.ContainsBondedClosure
                                         && IsBondedClosureContainer(Compiler(ctx), fieldType);
                                     if (namedVar.ContainsBondedClosure)
@@ -5125,10 +5120,12 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                             // guard name (e.g. "d.ready") to seed currentLockSet in the lambda body.
                                             if (paramTv.LockThis)
                                             {
-                                                const std::string& parent = structVar.TypeAndValue.ParentVariableName;
-                                                const std::string& field  = structVar.TypeAndValue.VariableName;
-                                                if (!parent.empty() && !field.empty())
-                                                    lambdaLockThisReceiver = parent + "." + field;
+                                                // Seed the guard under its CANONICAL path so the
+                                                // body's guarded-field checks key on the same string.
+                                                const std::string& field = structVar.TypeAndValue.VariableName;
+                                                if (IsSimpleLockPath(lastMemberReceiverPath)
+                                                    && lastMemberReceiverPath.ends_with("." + field))
+                                                    lambdaLockThisReceiver = lastMemberReceiverPath;
                                                 else if (!field.empty())
                                                     lambdaLockThisReceiver = field;
                                                 lambdaLockThisMode = paramTv.LockThisMode;
@@ -7328,12 +7325,13 @@ LLVMBackend::NamedVariable MainListener::ParseIdentifier(antlr4::tree::TerminalN
             // Lock-set check: self-access inside a struct method.
             if (!memberVar.TypeAndValue.GuardedBy.empty())
             {
-                if (currentLockSet.find(memberVar.TypeAndValue.GuardedBy) == currentLockSet.end())
-                {
+                const std::string& guard = memberVar.TypeAndValue.GuardedBy;
+                if (const LockMode* held = FindHeldGuard({}, guard, &memberVar.GuardLockKey))
+                    (void)held;
+                else
                     LogErrorContext(node, std::format(
                         "Field '{}' is guarded by '{}': must hold '{}' before accessing it.",
-                        name, memberVar.TypeAndValue.GuardedBy, memberVar.TypeAndValue.GuardedBy));
-                }
+                        name, guard, guard));
             }
             // Cross-thread sharing scan (--xthread-scan N): self-field access inside a method
             // of a type seen escaping a thread spawn (e.g. a program's run-thread). The owning
