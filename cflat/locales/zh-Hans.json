@@ -79,6 +79,8 @@
     "cannotmovearg0intomo...ifthisfunctionownsite3725c6c36e14caf": "无法将 {0} 移动至 '{2}' 的移动参数 '{1}'——调用方可能仍拥有此指针，并将在作用域退出时释放它。请改为从拥有所有权的槽中移出（例如 'move parent->children[i]'），或若此函数拥有该对象，则将 '{3}' 声明为 'move {4}'",
     "cannotmovearg0itwasr...luethereceivercanownecd0567bd50b057c": "无法 'move' '{0}'——它作为 unique 字段 '{1}' 的借用返回，移动别名不会使该字段置空，因此该字段合成的析构函数仍会释放指向对象。请将其传递给普通（非 'move'）参数（即借用），或传递接收方可拥有的值",
     "cannotmovetheoverali...heelementtypeinstead37678af4b62532f7": "无法将过度对齐的缓冲区 '{0}' ('{1}') 移动到 '{3}' 的 '{2}' 参数中：该对齐方式是分配的属性，而非类型的属性，因此被调用方无法恢复它。请声明参数 '{4}' 以记录块对齐方式，或者改为对元素类型进行过度对齐。",
+    "cannotpassaarg0bitin...itexplicitlywitharg3e8b611917d2a59d2": "无法将 {0} 位整数传递给 {1}：不允许在调用参数中隐式缩小整数为 '{2}' - 请使用 '({3})' 显式转换",
+    "cannotpassanarrayvie...theelementsmustmatch70ac68158d8ea37a": "无法将 '{0}' 的数组视图作为 '{2}' 的参数 '{1}' 传递，其元素类型为 '{3}' - 视图通过其自身元素进行索引，因此元素类型必须匹配",
     "cannotpassanowningva...evaluetoanownerfirste67cc584259d5eee": "无法将拥有所有权的值传递给 '{1}' 的可变参数 '{0}' 槽；请先将该值绑定到所有者",
     "cannotpassarawpointe...rg5arg6decayisoneway9309c0c4984312aa": "无法将原始指针 '{0}' 作为数组视图参数 '{1}' ('{2}') 传递——视图必须跨越整个分配（它只能来自 '{3}' 或另一个 '{4}'）；'{5} -> {6}' 的退化是单向的",
     "cannotpassarg0asinte...doesnotimplementarg3abf6e4ddf846baae": "无法将 '{0}' 作为 {2} 的接口参数 '{1}' 传递——它未实现 '{3}'",

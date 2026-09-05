@@ -79,6 +79,8 @@
     "cannotmovearg0intomo...ifthisfunctionownsite3725c6c36e14caf": "無法將 {0} 移動至 '{2}' 的移動參數 '{1}'——呼叫者可能仍擁有此指標，並會在作用域結束時釋放它。請改為從擁有權欄位移動（例如 'move parent->children[i]'），或若此函式擁有該值，請將 '{3}' 宣告為 'move {4}'",
     "cannotmovearg0itwasr...luethereceivercanownecd0567bd50b057c": "無法 'move' '{0}'——它是以借用 unique 欄位 '{1}' 的形式傳回的，移動別名並不會將欄位設為空值，因此欄位的合成解構子仍會釋放所指物件。請將其傳給一般（非 'move'）參數（該參數會借用），或傳入接收者可擁有的值",
     "cannotmovetheoverali...heelementtypeinstead37678af4b62532f7": "無法將過度對齊的緩衝區 '{0}' ('{1}') 移動至 '{3}' 的 '{2}' 參數：該對齊是配置的屬性，而非型別的屬性，因此被呼叫者無法復原它。請宣告參數 '{4}' 以記錄區塊對齊，或改為過度對齊元素型別。",
+    "cannotpassaarg0bitin...itexplicitlywitharg3e8b611917d2a59d2": "無法將 {0} 位元整數傳遞給 {1}：在呼叫引數中不允許隱式整數縮窄為 '{2}'，請使用 '({3})' 明確轉型",
+    "cannotpassanarrayvie...theelementsmustmatch70ac68158d8ea37a": "無法將 '{0}' 的陣列檢視作為 '{2}' 的參數 '{1}' 傳遞，其元素為 '{3}' — 檢視以其自身元素進行索引，因此元素必須相符",
     "cannotpassanowningva...evaluetoanownerfirste67cc584259d5eee": "無法將擁有值傳入 '{1}' 的可變參數 '{0}' 欄位；請先將該值繫結至擁有者",
     "cannotpassarawpointe...rg5arg6decayisoneway9309c0c4984312aa": "無法將原始指標 '{0}' 作為陣列檢視參數 '{1}' ('{2}') 傳遞——檢視必須涵蓋整個配置（僅來自 '{3}' 或其他 '{4}'）；'{5} -> {6}' 的衰變是單向的",
     "cannotpassarg0asinte...doesnotimplementarg3abf6e4ddf846baae": "無法將 '{0}' 作為 {2} 的介面參數 '{1}' 傳遞——它未實作 '{3}'",

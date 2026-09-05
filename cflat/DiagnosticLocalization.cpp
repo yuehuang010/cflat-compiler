@@ -371,9 +371,11 @@ std::string DiagnosticLocalization::Localize(
             auto it = enMessages_.find(key);
             if (it == enMessages_.end() && fullKey != key)
                 it = enMessages_.find(fullKey);
+            // Only a MISSING catalog entry is actionable; a successful lookup is
+            // not a warning and stays silent to keep CI logs meaningful.
             bool present = it != enMessages_.end() && !it->second.empty();
-            std::cerr << std::format("[pseudo] warning: en.json entry {}: {}\n",
-                                     present ? "present" : "missing", key);
+            if (!present)
+                std::cerr << std::format("[pseudo] warning: en.json entry missing: {}\n", key);
         }
         return FormatSourceTemplate(englishTemplate, arguments);
     }
