@@ -4870,6 +4870,9 @@ public:
                                      const LLVMBackend::TypeAndValue& target,
                                      const LLVMBackend::NamedVariable& rhsNV);
 
+    // Primitive name for an unnamed constant source of the guard below; "" when it is not scalar.
+    std::string SpellPrimitiveConstantType(llvm::Type* type);
+
     // Primitive-scalar sibling of the two above: only a folded constant zero is a null view.
     bool RejectPrimitiveValueIntoArrayView(antlr4::ParserRuleContext* ctx,
                                      const LLVMBackend::TypeAndValue& target,

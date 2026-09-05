@@ -1395,9 +1395,25 @@ bool MainListener::RejectRawPointerToArrayView(antlr4::ParserRuleContext* ctx,
     }
 
 /*
+ * Spell a cflat primitive name for an UNNAMED constant source. Only a scalar integer or float is
+ * a "single value" for the array-view gate; anything else returns "" and is left accepted.
+ */
+std::string MainListener::SpellPrimitiveConstantType(llvm::Type* type) {
+        if (type == nullptr) return std::string();
+        // An unnamed literal carries no cflat type - only its materialized width - so an integer
+        // one spells 'int' exactly as the named-arithmetic path does ('4 + 1' reports 'int' into
+        // both 'int[]' and 'char[]'). 'i1' is the one width no integer literal shares with 'bool'.
+        if (type->isIntegerTy())
+            return type->getIntegerBitWidth() == 1 ? "bool" : "int";
+        if (type->isDoubleTy()) return "double";
+        if (type->isFloatingPointTy()) return "float";
+        return std::string();
+    }
+
+/*
  * A primitive VALUE bound to a 'T[]' is reinterpreted as a thin pointer and indexed, so only the
- * NULL-view spelling may bind. '0', 'nullptr', 'default' and a const-zero name all fold to a
- * constant zero here; anything else is a runtime number that reaches v[0] as an address.
+ * NULL-view spelling may bind. '0', 'nullptr', 'default' and any folded zero are that spelling;
+ * anything else is a number that reaches v[0] as an address, named ('int x') or bare ('5').
  */
 bool MainListener::RejectPrimitiveValueIntoArrayView(antlr4::ParserRuleContext* ctx,
                                      const LLVMBackend::TypeAndValue& target,
@@ -1405,25 +1421,42 @@ bool MainListener::RejectPrimitiveValueIntoArrayView(antlr4::ParserRuleContext* 
         const auto& rhs = rhsNV.TypeAndValue;
         if (!target.IsArrayView) return false;
         // Prove it is a bare primitive SCALAR before rejecting: a view, an array, a pointer, a
-        // string literal, a fat value and an unnamed source all keep their own rules. The three
-        // null-view spellings ('0', 'nullptr', 'default') name no type, so they never reach here.
+        // string literal and a fat value all keep their own rules. An unnamed source stays in -
+        // it is judged by its constant below, since the null spellings name no type either.
         if (rhs.IsArrayView || rhs.ConstArraySize != 0 || rhs.Pointer || rhs.IsInterface
-            || rhs.IsFunctionPointer || rhs.IsSimd || rhs.TypeName.empty())
+            || rhs.IsFunctionPointer || rhs.IsSimd)
             return false;
         // Array SHAPE, not element name: a ROW of a fixed 'int[2][3]' also names 'int' with no
         // ConstArraySize, and it is a real element source - its inner dimensions are the proof.
         if (!rhs.ConstInnerDimensions.empty()) return false;
-        if (!LLVMBackend::IsPrimitiveTypeName(Compiler()->ResolveTypeAlias(rhs.TypeName)))
-            return false;
-        // A temp that already folded to a constant zero is the null-view spelling as well; a
-        // NAMED int is not, whatever it holds, since nothing here proves the slot stays zero.
-        if (auto* folded = llvm::dyn_cast_or_null<llvm::Constant>(rhsNV.Primary))
-            if (folded->isNullValue()) return false;
+        // A temp that already folded to a constant zero is the null-view spelling; a NAMED int is
+        // not, whatever it holds, since nothing here proves the slot stays zero.
+        auto* folded = llvm::dyn_cast_or_null<llvm::Constant>(rhsNV.Primary);
+        if (folded != nullptr && folded->isNullValue()) return false;
+        std::string sourceSpelling;
+        if (rhs.TypeName.empty())
+        {
+            /*
+             * An UNNAMED source names no type, so decide it by the constant instead of by the
+             * name: '0', 'nullptr', 'default' and a folded zero took the null exit just above, a
+             * non-constant unnamed value is not proven to be a number and keeps its own rules,
+             * and what is left is a bare non-zero literal that v[0] would index as an address.
+             */
+            if (folded == nullptr) return false;
+            sourceSpelling = SpellPrimitiveConstantType(folded->getType());
+            if (sourceSpelling.empty()) return false;
+        }
+        else
+        {
+            if (!LLVMBackend::IsPrimitiveTypeName(Compiler()->ResolveTypeAlias(rhs.TypeName)))
+                return false;
+            sourceSpelling = SpellType(*Compiler(), rhs);
+        }
         auto* compiler = Compiler(ctx);
         compiler->LogErrorMessage(
             "cannot bind a '{}' value to array view '{}' - a view indexes whole '{}' elements, so "
             "its source must be an array view (or a null one), not a single value",
-            { SpellType(*compiler, rhs), SpellType(*compiler, target), target.TypeName });
+            { sourceSpelling, SpellType(*compiler, target), target.TypeName });
         return true;
     }
 
@@ -9698,6 +9731,11 @@ bool MainListener::RejectValueIntoArrayViewField(
             if (RejectArrayViewElementMismatch(errCtx, fieldType, elemNV))
                 return true;
         }
+        // Primitive axis for an UNNAMED source, ahead of the unnamed early-out below: the null
+        // spellings still bind, a bare non-zero literal is a number the field's elements index.
+        if (src.TypeName.empty() && !src.IsArrayView && src.ConstArraySize == 0 && !src.IsSimd
+            && !rawHeapArray && RejectPrimitiveValueIntoArrayView(errCtx, fieldType, rightNV))
+            return true;
         // A view, a fixed array and a counted `new T[n]` are real element sources; a null or
         // otherwise unnamed source names no type at all and is a null view. None is a single object.
         if (src.IsArrayView || src.ConstArraySize != 0 || src.TypeName.empty() || src.IsSimd)

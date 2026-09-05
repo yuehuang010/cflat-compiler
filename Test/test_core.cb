@@ -3515,6 +3515,21 @@ int runViewPlainNullSpellings()
     if (zr.p[0] == 3) { score = score + 256; }
     if (viewPlainZeroReturn(1) == nullptr) { score = score + 512; }
     if (viewPlainZeroReturn(0) == nullptr) { score = score + 1024; }
+    // Unnamed-source spellings that also fold to a null constant. The guard decides an unnamed
+    // source by that constant now, so each of these must still bind rather than be rejected.
+    int[] vh = 0x0;
+    int[] vc = (int)0;
+    char[] cz = '\0';
+    bool[] bz = false;
+    float[] fz = 0.0;
+    bool runtimeFalse = real[0] > 100;
+    int[] vt = runtimeFalse ? nullptr : nullptr;
+    if (vh == nullptr) { score = score + 2048; }
+    if (vc == nullptr) { score = score + 4096; }
+    if (cz == nullptr) { score = score + 8192; }
+    if (bz == nullptr) { score = score + 16384; }
+    if (fz == nullptr) { score = score + 32768; }
+    if (vt == nullptr) { score = score + 65536; }
     return score;
 }
 
@@ -4438,9 +4453,10 @@ int testRawArrayRuntimeCount()
     // + 7 (return) = 121.
     passed += Test("a fixed array binds a plain array view at every non-brace door",
         runViewFixedArraySources(), 121);
-    // Every null-view spelling plus the two real element reads: 1+2+4+8+16+32+64+128+256+512+1024.
+    // Every null-view spelling plus the two real element reads: 1+2+4+8+16+32+64+128+256+512+1024
+    // = 2047, plus the six unnamed-constant spellings 2048..65536 = 131071.
     passed += Test("a primitive array view still binds every null spelling",
-        runViewPlainNullSpellings(), 2047);
+        runViewPlainNullSpellings(), 131071);
     passed += Test("raw count move parameter direct zero and counts",
         runRawCountMoveDirect(0) * 100 + runRawCountMoveDirect(2) * 10
             + runRawCountMoveDirect(4), 24);

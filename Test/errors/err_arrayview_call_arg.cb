@@ -289,3 +289,39 @@ expect_error("cannot bind an array view of 'BfiImpl' to a destination of 'BfiIfa
     class BfiImpl : BfiIface { int v = default; int val() { return this.v; } };
     int bfiCall() { BfiImpl[2] a; BfiIface[] v = a; return v[1].val(); }
 }
+
+// LITERAL row of the same four doors. A NAMED source ('int x', '4 + 1') was caught above, but a
+// BARE literal names no type at all and took the unnamed early-out, so 'int[] v = 5;' passed
+// '--check' and SIGSEGVd at v[0]. Decided by the constant now: only a null one binds.
+expect_error("cannot bind a 'int' value to array view 'int[]'") {
+    int bplCall() { int[] v = 5; return v[0]; }
+}
+
+// '=' store door, bare literal.
+expect_error("cannot bind a 'int' value to array view 'int[]'") {
+    int bplsCall() { int[] v = 0; v = 5; return v[0]; }
+}
+
+// Brace-init FIELD door, bare literal: the field gate's own unnamed early-out ran BEFORE the
+// primitive guard, so this door needed the guard hoisted above it.
+expect_error("cannot bind a 'int' value to array view 'int[]'") {
+    struct BplfDest { int[] p = default; };
+    int bplfCall() { BplfDest d = { p = 5 }; return d.p[0]; }
+}
+
+// RETURN door, bare literal.
+expect_error("cannot bind a 'int' value to array view 'int[]'") {
+    int[] bplrMake() { return 5; }
+    int bplrCall() { return bplrMake()[0]; }
+}
+
+// Non-int spelling of the literal row: 'true' is an unnamed i1 constant, so it is spelled 'bool'.
+expect_error("cannot bind a 'bool' value to array view 'bool[]'") {
+    int bplbCall() { bool[] v = true; return v[0] ? 1 : 0; }
+}
+
+// An unnamed FLOAT constant reached LLVM as 'bitcast (float to ptr)' and failed module
+// verification instead of reporting; same guard now spells it before any IR is emitted.
+expect_error("cannot bind a 'float' value to array view 'float[]'") {
+    int bplxCall() { float[] v = 1.0 + 0.5; return v[0] > 0.0 ? 1 : 0; }
+}
