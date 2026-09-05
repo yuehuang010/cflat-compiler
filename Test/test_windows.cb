@@ -39,10 +39,6 @@ import "wstring.cb";
 import "windows.h";
 import {"windows.h", "tlhelp32.h"} lib { "user32.lib", "gdi32.lib" };
 
-extern stdcall win_int QueryActCtxSettingsW(void* hActCtx, u32 flags,
-    const u16* settingsNamespace, const u16* settingName, u16* buffer,
-    u64 bufferLength, u64* writtenOrRequired);
-
 manifest ManifestDoc appManifest = { assembly = {
     dependency = { { dependentAssembly = { assemblyIdentity = {
         type = "win32", name = "Microsoft.Windows.Common-Controls", version = "6.0.0.0",

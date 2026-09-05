@@ -159,7 +159,18 @@ int nativeSelfTest(int argc, char** argv)
 
         // The host also PUSHED that icon onto the frame (WM_SETICON at window creation),
         // so the window reports the same handle back.
-        void* frame = FindWindowA("CFlatNativeWindow", nullptr);
+        // Scope the scan to THIS process: every ui_native app registers the same window
+        // class, so a stray window from another run would otherwise be picked up here.
+        u32 self = GetCurrentProcessId();
+        void* frame = nullptr;
+        void* scan = FindWindowExA(nullptr, nullptr, "CFlatNativeWindow", nullptr);
+        while (scan != nullptr)
+        {
+            u32 owner = 0;
+            GetWindowThreadProcessId(scan, &owner);
+            if (owner == self) { frame = scan; break; }
+            scan = FindWindowExA(nullptr, scan, "CFlatNativeWindow", nullptr);
+        }
         t.expectTrue("native frame found", frame != nullptr);
         t.expectTrue("frame icon matches app icon",
             (void*)SendMessageA(frame, (u32)WM_GETICON, (u64)1, (i64)0) == Application.icon());
