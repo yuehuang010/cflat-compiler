@@ -52,3 +52,30 @@ The exact shape needs design, but the important properties are:
 Do this incrementally by migrating one already-paired family first (owned string and owned element
 borrow facts are the closest twins), keeping behavior unchanged and running the full host suite.
 
+
+## Scope additions from the round-2 queue (q01 member 9, recorded 2026-09-04)
+
+This was the last member of the round-2 ownership bucket (q01); every other member landed
+2026-09-03/04: e2c4a1e (delete of a `move T*` param honours the count), 53a176e (slot null
+store before the call), cb3f71b (aligned unique fields/globals desugar), d7af90d (move-return
+temp count), 4223c66 (move-param reassign drops alignment -> rejection, recording was unsound
+under conditional reassignment), e04729c (aligned local after plain move-in), 458c6a9
+(alignment provenance holes), 966e3d3 (alignment doors + pointer ternary join).
+
+Two more ledgers to absorb, both added by later fixes:
+- `globalAssignBorrowOrigin_` and `globalAssignBorrowedAddress_` (global-storage borrow
+  provenance, from the delete-of-proven-borrow rejection 455c7e3).
+- The open launder `T* q = move p;` off an `&stack` borrow (also from 455c7e3) - close it here,
+  not with a one-off door.
+
+Record from the bucket, keep: `move T*` is a COUNTED owning pointer at the ABI level
+(`ParameterCarriesRawArrayCount`, `.raw_array_count` slot, honoured by scope-exit cleanup and
+forwarding). Only explicit `delete` and `unique<T>` adoption ever ignored the slot; both now read
+it. Do not re-open the "downgrade `move T*` to bare `T*`" model - a capability removal needing
+its own ruling. Runtime ownership state (the count) stays out of the compile-time provenance
+record (property 5 above). Alignment provenance (`AllocAlignKnown`/`AllocAlignValue`, set at
+the producing site) is a candidate member of the same value object; the global door fires only
+on PRECISE source provenance (advisor call 2026-09-04) - preserve that when migrating.
+
+Sequencing: refactor last, after the doors above are stable; behaviour unchanged, full host
+suite as the bar.

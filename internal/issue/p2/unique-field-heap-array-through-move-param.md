@@ -130,3 +130,10 @@ internal/plan/delete-form-static-analysis.md: a static reject where array proven
 (option 1 / narrowed option 2 above) plus the runtime trap at the core `unique<T>` ctor / reset
 where it is not (option 4). Ruling still needed on whether the runtime trap is acceptable now
 that the static-only route is closed; the measured false positives above stand.
+
+## ON HOLD 2026-09-04 (maintainer, same day as the ruling above)
+
+No work on the raw-heap-array / delete-form / unique-adoption area until the maintainer reopens
+it. Do not re-raise the runtime-trap question and do not start check 4 of
+internal/plan/delete-form-static-analysis.md. Related held item:
+`p3/new-pointer-array-count-form-unparseable.md` (grammar only, but it borders this area).

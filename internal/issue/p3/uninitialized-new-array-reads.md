@@ -165,3 +165,10 @@ Still open (this issue stays):
 - The zero-fill is an unconditional memset, not the `alloc_zeroed` allocator entry sketched
   above; that optimization is worth doing only once the recycled-block allocators are measured.
 - (done 2026-09-03, see the Landed section above) Debug poison fill for `init_capacity`.
+
+## Status 2026-09-04
+
+Not queued. `T* p = new T[n]` stays uninitialized by the 2026-09-04 C-compatibility ruling
+(raw `new T[n]` into `T*` stays legal; no migration to `array<T>`). The `init` contract,
+`init_capacity` and its poison fill have landed. The only remaining work here is the
+`alloc_zeroed` allocator optimization, pending measurement of the recycled-block allocators.

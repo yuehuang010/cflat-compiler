@@ -3164,7 +3164,7 @@ part of what they recorded.
   `constFoldableGlobals_` (5b4947e), `init_capacity` poison fill gated on
   `__SANITIZE_OWNERSHIP__` with bool excluded (1fa4911). The un-gated IR must stay byte-identical
   to master for a sanitizer-only fill; that was the acceptance check.
-- Spin-offs were re-bucketed as q04-q07 (see queue/README.md); the pre-existing
+- Spin-offs were re-bucketed as q04-q07 (all landed 2026-09-04; see the round-2 retirement record below); the pre-existing
   `--sanitize=ownership --run` teardown flake surfaced there, not from any q03 change.
 
 ## Record 2026-09-04: --run teardown flake was a DIBuilder use-after-free, not the sanitizer
@@ -3181,3 +3181,67 @@ never see the read; catch a hang by backgrounding runs and attaching lldb to one
 its budget. (2) `ResetForReanalysis` already stated the invariant ("nothing module-bound
 survives"); a second site that moves the module out must maintain the same invariant - a shared
 `DropDebugInfoState()` helper is the mechanical follow-up next time DI state is touched.
+
+## Record 2026-09-04: round-2 queue retired (q04-q19), folder deleted
+
+`internal/issue/queue/` is gone; what it recorded lives in the surviving issue files (each
+carries its own ruling, deferral reason and scope additions) and here. Landed 2026-09-04, all
+single-parent on master, each with a green host bar (791/0/8, examples 45/0 at the end):
+
+- q04 e6f3521 (batch: float `!=` NaN, bool cast, lost-count text, symbol-dump sanitize flag);
+  q07 af6814e (--run teardown flake, see the record above); q05 a078e02 (enum as a first-class
+  type: `__int128` -> APInt, aliased backing, redefinition diagnostic); q06 139d415 (alias ->
+  generic base, generic-function origin, `if const` folder leaves; verbatim candidate outranks
+  the alias hop); q01 members 10-12 966e3d3 (alignment doors + pointer ternary join); 897c430
+  (sanitizer-gated legs vacuous in the standard bar); 455c7e3 (delete of a proven borrow).
+- q08 680d9e8a: NO implicit integer narrowing at a call argument; integer -> bool IS allowed
+  (constants and non-constants) via `CoerceToBoolCondition`; one shared scoring point plus a
+  fewest-bool-coercions tie-break in the implicit tier. Observed and accepted: enum -> bool via
+  the backing type; `{f(double), f(bool)}` with an int picks bool (int -> double was never
+  accepted); default `u8 v = 300` truncates like the declaration form.
+- q09 e0afc3b3: `T*` with T an array view DECAYS to the element pointer (C-like, drops the
+  non-alias trait; `&view` stays rejected); `return` converts under the ASSIGNMENT rules, so a
+  scalar splats into `simd<T,N>` through the single `SplatScalarToVectorType`.
+- q10 073f5948 + q12 d6b04e6f: view-of-pointer keys are `.v$.p$int` (view code first, element
+  stars after); pointer aliases fold in every type-argument encoder; inference binds T from the
+  declared argument name (`NamedVariable::InferSourceTypeName`); tuple import re-entry clears
+  and restores the pack binding per drain.
+- q11 d1952097: extern C prototypes follow the CFlat call rules at CFlat call sites (ruling:
+  "CFlat source calling it should enforce the safety that C traditionally not"); a repeat
+  declaration under a core name with a different llvm type is a conflicting-declaration error.
+  Gaps filed: `p3/extern-redeclaration-conflict-gaps`.
+- q13 d77dfdae, q15 5f693b7d, q18 6f5b380d, q19 30263a18: the array-view ELEMENT gate
+  (`LLVMBackend::ArrayViewElementMismatch`, single definition, four doors). Depth axis always;
+  lowered-type name axis for view destinations; plain `T*` destination keeps the byte-reinterpret
+  decay; interface destination exempt only when SCALAR (no per-element rebox exists, multi-parent
+  widening dispatched the wrong parent); a view `?:` join is stamped from its arms. Gaps filed:
+  `p3/view-element-gate-diagnostic-gaps`, `p3/view-ternary-field-read-arm-unnamed`.
+- q14 a09da972 + q17 9c92e66e: an instantiation abandoned under `expect_error` is sealed with
+  `unreachable`, unregistered and renamed `<mangled>.abandoned` (internal, dropped at -O2), so
+  the next request re-emits; core `printf` returns int and `MakeStdioSafeTLII` hides the ten core
+  stdio names from SimplifyLibCalls (the printf -> puts/fwrite rewrite doubled program stdout-hook
+  chunks). Gap filed: `p3/expect-error-does-not-cover-deferred-struct-method-instantiation`.
+- q16 9ab7d502: scanner pre-registers SIMPLE pointer aliases in a mangling-only table
+  (`manglingPointerAliases_`, peer of `manglingAliases_`, `--init` round-trip) so the forward
+  shell name and the main-pass name agree. Gap filed:
+  `p3/forward-template-alias-enum-or-namespaced-target-not-folded`.
+
+Measured and rejected, do not retry: making every refused view-to-view overload pair a perfect
+match so the element gate can speak (steals selection from `f(IS[])` and `f(void*)`; gate on a
+LONE candidate instead); `eraseFromParent()` on a sealed abandoned body (still referenced by
+outer sealed bodies and cached FunctionSymbols - rename + internal linkage); pre-registering a
+pointer alias in the authoritative `typeAliases` table (made pointer aliases order-independent
+for all resolution while pure renames stayed order-dependent); `return {}` on an inference
+conflict (made the template invisible; keep the "no overload" text); recording alignment on a
+reassignable `move T*` binding (unsound under conditional reassignment - reject instead).
+
+Process lessons that changed an outcome: (1) an err leg placed in a file the host suite SKIPS is
+vacuous - check the SKIP list before accepting a leg (q16); (2) accept legs must fail on the PRE
+binary or they prove nothing (q16, five vacuous legs); (3) a "pre-existing false reject" claim in
+a fix report can be the fix's own newly-unblocked door - re-run it on PRE (q19); (4) the
+ff-merge chain never runs after `cd` into a worktree (three no-op traps); (5) batch mode ~25-35
+min spawn-to-merge, full mode ~2 h with 2 fix rounds; (6) a reviewer's PRE must be the
+worktree's base, not the main checkout's HEAD when master has moved (q18 caught itself).
+
+Still unfiled language gap carried since round 1: no syntax for a deleted copy (blocks `Thread`
+RAII and any future non-copyable type; recorded in `p3/thread-cannot-go-raii.md`).
