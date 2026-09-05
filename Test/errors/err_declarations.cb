@@ -127,3 +127,21 @@ expect_error("redefinition of 'dupSigSpelling'") {
     int dupSigSpelling(function<int(int)> f) { return 1000 + f(1); }
     int dupSigSpelling(function<i32(i32)> f) { return 2000 + f(1); }
 }
+
+/*
+ * A REPEAT extern declaration whose signature disagrees with the one already bound to that
+ * linkage name used to return silently as a "repeat declaration under the same lookup name",
+ * so the second spelling was dropped and its calls bound the first. Core declares
+ * `extern void exit(int status);`, so `exit(300)` through this u8 respelling passed i32 and
+ * exited 44 - the declared u8 was never scored and the no-implicit-narrowing ruling was
+ * bypassed by spelling.
+ */
+expect_error("conflicting declaration of extern 'exit'") {
+    extern void exit(u8 c);
+}
+
+// Same hole through a core extern that has a BODY (cruntime's putchar(int)) rather than a
+// bare prototype - a different registration path to the same linkage name.
+expect_error("conflicting declaration of extern 'putchar'") {
+    extern int putchar(u8 c);
+}

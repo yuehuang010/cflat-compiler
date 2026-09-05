@@ -1295,9 +1295,28 @@ void LLVMBackend::CreateFunctionDeclaration(const std::string& functionName, con
             // lookup name for an already-emitted linkage symbol (core's os.windows.Sleep
             // and a header-imported bare Sleep) still registers below, reusing the
             // existing llvm::Function via getOrInsertFunction.
+            // A PROVISIONAL signature is a placeholder either side, so a width comparison
+            // against it means nothing - keep the plain no-op for those.
+            bool existingProvisional = provisional;
+            for (const auto& d : pendingFunctionDeclarations_)
+                if (d.MangledName == mangledName) existingProvisional = true;
+
             for (const auto& sym : functionTable[functionName])
                 if (sym.UniqueName == mangledName)
-                    return;
+                {
+                    /*
+                     * The repeat is a no-op only when it AGREES. A DIFFERENT extern signature
+                     * under the same linkage name used to be dropped here in silence, so
+                     * `extern void exit(u8 c);` next to core's `extern void exit(int status);`
+                     * bound the int one and the declared u8 was never scored - the ruling
+                     * "no implicit integer narrowing at a call argument" was bypassed by
+                     * spelling. Fall through to the conflict diagnostic below instead.
+                     */
+                    if (!external || existingProvisional
+                        || existing->getFunctionType() == functionType)
+                        return;
+                    break;
+                }
 
             // The linkage symbol already exists with a DIFFERENT signature. This happens
             // when a user `extern` collides with a core-library extern of the same name

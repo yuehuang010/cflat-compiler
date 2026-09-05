@@ -2,6 +2,10 @@
 extern void printf(const char* argv, ...);
 extern void* malloc(i64 size);
 extern void free(void* ptr);
+// Repeat extern declarations that AGREE with core's stay a no-op and still bind the core
+// symbol - the accept side of the conflicting-signature rejection (err_extern_collides_with_core).
+extern int toupper(int c);
+extern int abs(int n);
 
 bool printOnPass = false;
 
@@ -875,6 +879,11 @@ extern int main(int argc, char** argv)
     result &= Test("testShortCircuitIf",     testShortCircuitIf(), true);
     result &= Test("testBitfields",          testBitfields(), true);
     result &= Test("testIntToPtrCast",       testIntToPtrCast(), true);
+    result &= Test("extern_repeat_toupper",  toupper('a'), 65);
+    result &= Test("extern_repeat_abs",      abs(-7), 7);
+    // Widening a u8 into an extern's declared 'int' parameter stays legal (ruling 2026-09-04).
+    u8 lowerB = 'b';
+    result &= Test("extern_widen_u8_to_int", toupper(lowerB), 66);
 
     if (result)
     {

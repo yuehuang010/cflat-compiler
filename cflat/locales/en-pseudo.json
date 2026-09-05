@@ -509,6 +509,9 @@
     "conditionmustbeascal...0compareitexplicitly2f08e69bff57b7fb": [
       "string"
     ],
+    "conflictingdeclarati...penfreadfwritefclose8541377e62fbb8dd": [
+      "exit"
+    ],
     "duplicatecaselabelarg0inswitch": [
       "1"
     ],
