@@ -58,6 +58,59 @@ bool testImportAs()
     return result;
 }
 
+// ---- a VARIABLE shadows a same-named namespace ----
+// The postfix primary walk used to take its namespace branch on the name alone, so a variable
+// spelled like a namespace ('os' from the auto-imported core, 'ModuleMath' from the imported
+// test library) resolved to a namespace qualifier and produced an EMPTY value with no
+// diagnostic: a bare read silently gave 0 and any other use crashed the compiler (SIGSEGV).
+// testImportedNamespace/testImportAs above are the unshadowed twins - the same spellings still
+// resolve as namespaces where no variable of that name is in scope.
+
+int os = 5;
+
+int shadowNsParam(int os) { return os + 1; }
+
+// Member access through a struct local spelled like a namespace. Its own function so the name
+// 'ModuleMath' is bound to the struct, not to the int local used by the arithmetic legs.
+// PRE-FIX: "'x' is not a member of namespace 'ModuleMath'".
+int shadowNsStructMember()
+{
+    ModulePoint ModuleMath;
+    ModuleMath.x = 10;
+    ModuleMath.y = 20;
+    return ModuleMath.Sum();
+}
+
+bool testVariableShadowsNamespace()
+{
+    bool result = true;
+    // Global spelled like a namespace. PRE-FIX: compiler SIGSEGV (exit 139).
+    result &= Test("shadow_ns_global_arith", os + 1, 6);
+    // Parameter spelled like a namespace. PRE-FIX: compiler SIGSEGV (exit 139).
+    result &= Test("shadow_ns_param", shadowNsParam(6), 7);
+
+    // Local spelled like an imported namespace. PRE-FIX these read the namespace, not the
+    // local: rejected outright, or (as a plain initializer) a silent 0.
+    int ModuleMath = 12;
+    result &= Test("shadow_ns_local_bare",  ModuleMath,      12);
+    result &= Test("shadow_ns_local_arith", ModuleMath + 30, 42);
+    bool cc = true;
+    result &= Test("shadow_ns_local_ternary", cc ? ModuleMath : 0, 12);
+
+    // The filed repro: a local fixed array decayed into a view whose name is a namespace, then
+    // joined by '?:'. PRE-FIX: compiler SIGSEGV (exit 139).
+    u8 [4] backing;
+    backing[0] = 7;
+    backing[1] = 9;
+    u8[] os = backing;
+    u8[] joined = cc ? os : os;
+    result &= Test("shadow_ns_view_ternary_elem0", joined[0], 7);
+    result &= Test("shadow_ns_view_ternary_elem1", joined[1], 9);
+
+    result &= Test("shadow_ns_struct_member", shadowNsStructMember(), 30);
+    return result;
+}
+
 // ---- program defined in an imported library file ----
 // Regression: CompileImportedFile must run ScanGenericTypeUses before
 // ScanExternalDeclaration so the opaque shell for list$string is present
@@ -108,6 +161,7 @@ extern int main()
     total++; passed += testImportedStruct()    ? 1 : 0;
     total++; passed += testImportedGlobalDefaultFold() ? 1 : 0;
     total++; passed += testImportedNamespace() ? 1 : 0;
+    total++; passed += testVariableShadowsNamespace() ? 1 : 0;
     total++; passed += testImportAs()          ? 1 : 0;
     total++; passed += testProgramImport()     ? 1 : 0;
     printf("%d/%d tests passed.\n", passed, total);

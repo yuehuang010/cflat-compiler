@@ -5403,6 +5403,14 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
 
         if (trueValue == nullptr || falseValue == nullptr)
         {
+            // A valueless arm still opened its block. Close every unterminated arm block, or
+            // the module passes see a malformed function and assert in getTerminator().
+            for (auto* bb : { trueEnd, falseEnd, trueBlock, falseBlock })
+            {
+                if (bb == nullptr || cflat_llvm::GetTerminatorOrNull(bb) != nullptr) continue;
+                compiler->SwitchToBlock(bb);
+                compiler->CreateJump(resumeBlock);
+            }
             compiler->SwitchToBlock(resumeBlock);
             return {};
         }

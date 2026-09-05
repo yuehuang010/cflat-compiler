@@ -2008,7 +2008,13 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                         if (prevPrimary->genericIdentifier() != nullptr && prevPrimary->genericIdentifier()->Identifier() != nullptr)
                         {
                             std::string idName = prevPrimary->genericIdentifier()->Identifier()->getText();
-                            if (Compiler(ctx)->IsNamespace(idName))
+                            // A VARIABLE of the same name shadows a namespace; without this the
+                            // primary yielded an EMPTY NamedVariable with no diagnostic.
+                            const bool nameIsVariable =
+                                Compiler(ctx)->GetLocalVariable(idName).Storage != nullptr
+                                || Compiler(ctx)->GetFunctionArgument(idName).GetValue() != nullptr
+                                || Compiler(ctx)->GetGlobalVariableNV(idName).Storage != nullptr;
+                            if (Compiler(ctx)->IsNamespace(idName) && !nameIsVariable)
                             {
                                 namespaceContext = Compiler(ctx)->ResolveNamespace(idName);
                                 namedVar = {};
