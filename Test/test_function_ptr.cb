@@ -2543,6 +2543,20 @@ namespace SigNs
     int runNs(function<void(SigPt*)> f)      { SigPt q; f(&q); return q.a; }
 }
 
+// The mirror of the leg above: a slot declared INSIDE a namespace whose pointee names the
+// GLOBAL struct, while an unrelated namespace declares a same-named one. The declaring-scope
+// key recorded for `SigGlobPt` inside `SigUserNs` is the global key - the last rung of the same
+// outward walk - so the crossing binds. The reject twin (a `SigOtherNs.SigGlobPt` function into
+// this slot, memory-unsafe: 8 bytes written into a 4-byte object) is in
+// Test/errors/err_data_pointer_to_closure_param.cb.
+struct SigGlobPt { int a = default; };
+void fillSigGlob(SigGlobPt* p)               { p->a = 61; }
+namespace SigOtherNs { struct SigGlobPt { int a = default; int b = default; }; }
+namespace SigUserNs
+{
+    int runGlobSlot(function<void(SigGlobPt*)> f) { SigGlobPt q; f(&q); return q.a; }
+}
+
 // A GENERIC INSTANTIATION as a pointee. A signature records the MANGLED key (`Box$int`), and
 // monomorphization keeps signedness and the target-native widths, so `SigBox<i32>` and
 // `SigBox<u32>` are two instantiations - correct at the source level, since `u32` divides and
@@ -2700,6 +2714,9 @@ bool testFuncPtrArgProvenanceAccepts()
     // Bare vs qualified struct spelling with a same-named global in scope.
     function<void(SigNs.SigPt*)> gns = SigNs.touchNs;
     result &= Test("namespace-ambiguous pointee binds", SigNs.runNs(gns), 5);
+    // Global pointee spelled bare inside a namespace, with a same-named struct in another one.
+    function<void(SigGlobPt*)> ggl = fillSigGlob;
+    result &= Test("global pointee from ns slot binds", SigUserNs.runGlobSlot(ggl), 61);
 
     // Generic-instantiation pointees whose type args are one type spelled two ways, or differ
     // only in signedness / a target-native width. All three are layout-identical, so all three

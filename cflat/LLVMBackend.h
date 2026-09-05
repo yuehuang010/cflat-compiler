@@ -6745,8 +6745,9 @@ public:
         bool Known = false;
         bool VoidPointee = false;   // `void*`: a wildcard over every pointee
         std::string Canon;          // "i32", "f64", "p:v", "s", "p:s", ...
-        // Sorted candidate keys when Canon is "s"/"p:s". The SET is the answer, never one element.
-        std::vector<std::string> StructKeys;
+        // The ONE registered struct key this component names, when Canon is "s"/"p:s". Empty
+        // means the spelling named no registered struct, which is Known == false.
+        std::string StructKey;
         // '*' count, or 0 for "not recorded" - one-sided like Known, so an unrecorded depth on
         // either side proves nothing. Both Canon and this must be known to reject on depth.
         int PointerDepth = 0;
@@ -6784,27 +6785,28 @@ public:
      * `long` folds to the TARGET width, so `Box<long>` and `Box<i64>` are one key on LP64 and
      * two on Windows, which is the truth on each.
      *
-     * STRICTLY RELAXING, which is why this is a MAP over the key set and never a filter: the map
-     * is applied to both sides, so any key the two sets shared before still maps to a shared
-     * value, and a rejection can only be removed, never invented. Filtering keys OUT would be a
-     * tightening - the rule rejects on DISJOINT sets, so removing elements can only make two
-     * sets more disjoint.
+     * STRICTLY RELAXING, which is why this is a MAP over the key and never a filter: the same
+     * map is applied to both sides, so two keys that were equal before still map to one value,
+     * and a rejection can only be removed, never invented.
      */
     std::string FuncPtrAbiCanonKey(const std::string& key) const;
 
     /*
-     * Every registered struct key a SPELLING could name: the key itself, plus any key whose
-     * trailing dotted component is the spelling. A signature records the raw source spelling
-     * (ResolveSigComponentCodegen keeps `ts->getText()` and no namespace resolution runs on that
-     * path), so a bare `Pt` written inside `namespace NS` arrives here as "Pt" and could mean the
-     * global `Pt` or `NS.Pt`.
-     *
-     * The caller compares SETS and never picks an element. Picking one would be a guess; and
-     * treating a multi-candidate spelling as "unknown" would let a single unrelated same-named
-     * struct - anywhere in the program or in anything it imports, referenced or not - silently
-     * disarm the pointee proof. Set DISJOINTNESS guesses nothing and is not defeatable that way.
+     * The ABI-canonical key of the ONE registered struct a name denotes, or "" when it denotes
+     * none. Aliases and enums are hopped first; an interface is deliberately not a struct here.
+     * The lookup is an EXACT registry hit - never a tail-name search - so it either names one
+     * type or answers nothing, and "nothing" is no proof rather than a guess.
      */
-    std::vector<std::string> FuncPtrStructCandidates(const std::string& spelling) const;
+    std::string FuncPtrStructKey(const std::string& name) const;
+
+    /*
+     * The declaring-scope key a signature component's SPELLING resolves to, recorded at
+     * declaration time where the namespace that gives the spelling meaning is still current.
+     * Both ParseDeclarationSpecifiers copies call this, so the two passes record one key space.
+     * "" = the spelling named no registered type here; the comparison then falls back to the
+     * spelling itself, which can only lose a rejection, never invent one.
+     */
+    std::string FuncPtrComponentDeclaringKey(const std::string& name) const;
 
     /*
      * Descriptor of one component. `string` is normalized to `char*` BEFORE the pointer shape is
@@ -7798,8 +7800,8 @@ public:
     /*
      * The three shared operations over a scope-sensitive registry. Every namespace-aware registry
      * goes through these so shadowing policy lives in ONE place: register under the innermost
-     * visible key, then resolve by walking the active namespace outward. A caller that needs a
-     * broader search must name TailMatchCandidates explicitly - it is the only tail-name search.
+     * visible key, then resolve by walking the active namespace outward. There is no tail-name
+     * search: a name is resolved once, in the scope that gives it meaning, and the key recorded.
      */
     template <typename MapT, typename ValueT>
     void RegisterScopedName(MapT& map, const std::string& name, ValueT&& value)
@@ -7839,14 +7841,6 @@ public:
         }
         return nullptr;
     }
-
-    /*
-     * DELIBERATELY BROAD: every registered struct key whose last dotted component equals the
-     * spelling, regardless of what is visible from the active namespace. Interfaces are excluded.
-     * Only for callers that WANT the ambiguity (they compare candidate sets and never pick an
-     * element). Prefer FirstVisibleScopedKey; do not hand-roll a fresh tail search.
-     */
-    std::vector<std::string> TailMatchCandidates(const std::string& spelling) const;
 
     /*
      * Resolve a base-clause / parent-list interface spelling to the name the interface is

@@ -2669,10 +2669,10 @@ public:
     std::string ResolveSigComponentScanner(CFlatParser::TypeSpecifierContext* ts, bool& outPointer);
 
     /*
-     * Scanner counterpart of MainListener::SigComponentResolvedKey, kept identical the way the two
-     * ParseDeclarationSpecifiers copies are. This copy is the load-bearing one: a call site reads
-     * the parameter signature the SCANNER registered into the function table, not the main pass's.
-     * A type not yet scanned resolves to nothing, which records "" - no proof, today's behaviour.
+     * Scanner counterpart of MainListener::SigComponentResolvedKey. Both are one line onto the
+     * shared LLVMBackend::FuncPtrComponentDeclaringKey, so the two ParseDeclarationSpecifiers
+     * copies cannot drift. This copy is the load-bearing one: a call site reads the parameter
+     * signature the SCANNER registered into the function table, not the main pass's.
      */
     std::string SigComponentResolvedKeyScanner(const std::string& name);
 
@@ -3221,10 +3221,8 @@ private:
 
     /*
      * The declaring-scope-resolved key for a signature component, recorded ALONGSIDE the raw
-     * spelling (which still owns the mangled name). Empty = not recorded -> no proof. Inside a
-     * namespace a bare spelling the walk could NOT qualify records nothing: recording the bare
-     * form there would be a false rejection if the namespaced type is not registered yet, while
-     * recording nothing just falls back to the broad candidate set.
+     * spelling (which still owns the mangled name). Empty = the spelling named no registered
+     * type in this scope -> no proof, and the comparison falls back to the spelling itself.
      */
     std::string SigComponentResolvedKey(const std::string& name);
 

@@ -2273,3 +2273,36 @@ expect_error("destination 'UcThinDataDefault.f': only a named function, a 'funct
 expect_error("only a named function, a 'function<>' value or a lambda converts to a closure") {
     union UcFatDataDefault { Lambda<int(int)> f = ucGvp; int i; };
 }
+
+/*
+ * The DECLARING SCOPE of a pointee. A signature component records the source spelling; a bare
+ * `SigScopePt` written inside `SigScopeUse` and one written inside `SigScopeNs` are the same
+ * string at comparison time. Before the declaring-scope key was recorded for a spelling the
+ * outward walk resolved to the GLOBAL struct, that slot kept an ambiguous same-tail candidate
+ * set, the two sets intersected, and this compiled and ran: `fillWide` writes 12 bytes through
+ * a pointer to the 4-byte global `SigScopePt` the slot allocated. Printed 41, exit 0.
+ *
+ * Reaches the ARGUMENT site, not the bind site: the bind is well typed (both sides are
+ * `SigScopeNs.SigScopePt`), and `runNarrow` has two candidates of the SAME arity so the arity
+ * filter leaves the function-pointer overload to be scored. The bind-site wording is
+ * "cannot bind function", which this expectation does not match.
+ */
+expect_error("function-pointer signature mismatch") {
+    struct SigScopePt { int a = default; };
+    namespace SigScopeNs
+    {
+        struct SigScopePt { int a = default; int b = default; int c = default; };
+        void fillWide(SigScopePt* p) { p->a = 41; p->b = 42; p->c = 43; }
+    }
+    namespace SigScopeUse
+    {
+        int runNarrow(function<void(SigScopePt*)> f) { SigScopePt q; f(&q); return q.a; }
+        int runNarrow(double d)                      { return 700 + (int)d; }
+    }
+
+    int passWiderNamespacedPointee()
+    {
+        function<void(SigScopeNs.SigScopePt*)> g = SigScopeNs.fillWide;
+        return SigScopeUse.runNarrow(g);
+    }
+}

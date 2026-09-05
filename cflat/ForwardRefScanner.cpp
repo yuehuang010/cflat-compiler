@@ -1163,11 +1163,7 @@ std::string ForwardRefScanner::ResolveSigComponentScanner(CFlatParser::TypeSpeci
     }
 
 std::string ForwardRefScanner::SigComponentResolvedKeyScanner(const std::string& name) {
-        if (name.empty()) return "";
-        std::string key = compilerLLVM->ResolveTypeArgBaseName(name);
-        if (key != name) return key;                              // qualified by the walk
-        if (name.find('.') != std::string::npos) return name;      // already qualified
-        return compilerLLVM->GetCurrentNamespace().empty() ? name : "";  // global scope is unambiguous
+        return compilerLLVM->FuncPtrComponentDeclaringKey(name);
     }
 
 std::string ForwardRefScanner::EncodeClosureScanner(CFlatParser::FunctionPointerSpecifierContext* fpSpec) {

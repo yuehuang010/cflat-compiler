@@ -567,40 +567,27 @@ std::string LLVMBackend::FuncPtrAbiCanonKey(const std::string& key) const
         return canon(spelling);
 }
 
-std::vector<std::string> LLVMBackend::TailMatchCandidates(const std::string& spelling) const
+// EXACT registry hit only. The name handed in is either the declaring-scope key recorded at
+// declaration time or an already-resolved spelling, so no scope walk runs here - walking the
+// namespace active at COMPARISON time would answer for the wrong scope.
+std::string LLVMBackend::FuncPtrStructKey(const std::string& name) const
 {
-        std::vector<std::string> keys;
-        if (spelling.empty()) return keys;
-        for (const auto& entry : dataStructures)
-        {
-            const std::string& key = entry.first;
-            // The spelling matches a key outright, or matches its trailing dotted component.
-            bool tail = key.size() > spelling.size()
-                && key.compare(key.size() - spelling.size(), spelling.size(), spelling) == 0
-                && key[key.size() - spelling.size() - 1] == '.';
-            if (key != spelling && !tail) continue;
-            if (HasInterface(key)) continue;
-            keys.push_back(key);
-        }
-        return keys;
+        if (name.empty()) return "";
+        std::string resolved = ResolveFuncPtrTypeSpelling(name);
+        if (resolved.empty() || HasInterface(resolved)) return "";
+        if (dataStructures.count(resolved) == 0) return "";
+        return FuncPtrAbiCanonKey(resolved);
     }
 
-// The scoped resolver is deliberately NOT consulted: a signature records the source spelling
-// WITHOUT its declaring scope, so walking the namespace active at COMPARISON time answers for the
-// wrong scope (see the "namespace-ambiguous pointee binds" leg in Test/test_function_ptr.cb). The
-// set below guesses nothing; the recorded declaring-scope key in FuncPtrComponentOf is the only
-// sound narrowing. The SPELLING match is made on the raw key (that is what names the struct); the
-// recorded identity is the ABI-canonical form, so two instantiations that differ only in a scalar
-// spelling or in signedness compare equal.
-std::vector<std::string> LLVMBackend::FuncPtrStructCandidates(const std::string& spelling) const
+std::string LLVMBackend::FuncPtrComponentDeclaringKey(const std::string& name) const
 {
-        std::vector<std::string> keys;
-        if (spelling.empty() || HasInterface(spelling)) return keys;
-        for (const auto& key : TailMatchCandidates(spelling))
-            keys.push_back(FuncPtrAbiCanonKey(key));
-        std::sort(keys.begin(), keys.end());
-        keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
-        return keys;
+        if (name.empty()) return "";
+        std::string key = ResolveTypeArgBaseName(name);
+        if (key != name) return key;                            // qualified by the scoped walk
+        if (name.find('.') != std::string::npos) return name;    // already qualified
+        // The walk did not qualify it. It still names the GLOBAL type when one is registered
+        // under exactly that key - global scope is the last rung of the very same walk.
+        return dataStructures.count(name) != 0 ? name : "";
     }
 
 LLVMBackend::FuncPtrComponent LLVMBackend::FuncPtrComponentOf(const std::string& typeName, bool pointer,
@@ -623,23 +610,15 @@ LLVMBackend::FuncPtrComponent LLVMBackend::FuncPtrComponentOf(const std::string&
             if (scalar == "v") { c.Known = true; c.VoidPointee = true; c.Canon = "p:v"; return c; }
             if (!scalar.empty()) { c.Known = true; c.Canon = "p:" + scalar; return c; }
         }
-        // A spelling that names at least one registered struct carries its whole candidate set.
-        // An interface never does (a struct implementing it converts), nor does an unknown name.
-        std::vector<std::string> keys = FuncPtrStructCandidates(resolved);
-        // A recorded declaring-scope key collapses an ambiguity the compiler ITSELF resolved.
-        // Membership-only: a stale or wrong key can never invent a rejection, only narrow.
-        // The ABI-canon hop is kept, or Box<int> vs Box<i32> would start false-rejecting.
-        if (!resolvedKey.empty() && keys.size() > 1)
-        {
-            std::string canon = FuncPtrAbiCanonKey(resolvedKey);
-            if (std::find(keys.begin(), keys.end(), canon) != keys.end())
-                keys = { canon };
-        }
-        if (!keys.empty())
+        // The declaring-scope key recorded where the spelling still had a scope; with none recorded
+        // the spelling is tried as an exact key (FuncPtrSigOfSymbol, already fully scoped).
+        std::string key = FuncPtrStructKey(resolvedKey);
+        if (key.empty()) key = FuncPtrStructKey(resolved);
+        if (!key.empty())
         {
             c.Known = true;
             c.Canon = pointer ? "p:s" : "s";
-            c.StructKeys = std::move(keys);
+            c.StructKey = std::move(key);
         }
         return c;
     }
@@ -659,15 +638,10 @@ bool LLVMBackend::ComponentsProvablyDiffer(const FuncPtrComponent& a, const Func
         // on either side proves nothing, exactly like an unresolvable Canon.
         if (a.PointerDepth > 0 && b.PointerDepth > 0 && a.PointerDepth != b.PointerDepth)
             return true;
-        // Two struct spellings at the same shape. Proof is that NO registered struct could answer
-        // to BOTH; an intersection means one type satisfies both spellings, so nothing is proven.
-        if (!a.StructKeys.empty() && !b.StructKeys.empty())
-        {
-            std::vector<std::string> shared;
-            std::set_intersection(a.StructKeys.begin(), a.StructKeys.end(),
-                b.StructKeys.begin(), b.StructKeys.end(), std::back_inserter(shared));
-            return shared.empty();
-        }
+        // Two struct components at the same shape. Both sides resolved to exactly one declaring
+        // key, so different keys are different types; an unresolved side proves nothing above.
+        if (!a.StructKey.empty() && !b.StructKey.empty())
+            return a.StructKey != b.StructKey;
         return false;
     }
 

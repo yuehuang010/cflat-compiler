@@ -368,12 +368,7 @@ std::string MainListener::ResolveSigComponentCodegen(CFlatParser::TypeSpecifierC
     }
 
 std::string MainListener::SigComponentResolvedKey(const std::string& name) {
-        if (name.empty()) return "";
-        auto* c = Compiler();
-        std::string key = c->ResolveTypeArgBaseName(name);
-        if (key != name) return key;                              // qualified by the walk
-        if (name.find('.') != std::string::npos) return name;      // already qualified
-        return c->GetCurrentNamespace().empty() ? name : "";       // global scope is unambiguous
+        return Compiler()->FuncPtrComponentDeclaringKey(name);
     }
 
 void MainListener::RejectFatClosurePointerArg(antlr4::ParserRuleContext* ctx, bool isThin,
