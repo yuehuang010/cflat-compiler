@@ -31,3 +31,17 @@ expect_error("type 'Q16IncompleteValue<int*>' is incomplete here (its layout is 
     struct Q16IncompleteHolder { Q16IncompleteValue<Q16IncompleteIP> field = default; };
 }
 struct Q16IncompleteValue<T> { int value = default; };
+
+// Same fold, with an ENUM-pointer and a NAMESPACED-struct-pointer alias target. The scanner had
+// no enum names and keyed namespaced types as "N..T", so neither alias was pre-registered.
+enum FaenEnum : int { FaenA = 0, FaenB = 1 };
+namespace FaenNs { struct FaenTarget { int x = default; }; }
+using FaenEnumPtr = FaenEnum*;
+using FaenNsPtr = FaenNs.FaenTarget*;
+expect_error("type 'FaenIncomplete<FaenEnum*>' is incomplete here (its layout is not available at this point)") {
+    struct FaenEnumHolder { FaenIncomplete<FaenEnumPtr> field = default; };
+}
+expect_error("type 'FaenIncomplete<FaenNs.FaenTarget*>' is incomplete here (its layout is not available at this point)") {
+    struct FaenNsHolder { FaenIncomplete<FaenNsPtr> field = default; };
+}
+struct FaenIncomplete<T> { int value = default; };

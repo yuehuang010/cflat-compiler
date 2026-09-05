@@ -853,7 +853,8 @@ void ForwardRefScanner::RegisterRenameAlias(CFlatParser::UsingDeclarationContext
         int inheritedStars = PeelAliasPointerStars(target);
         if (!IsBareTypeName(target)
             || (!compilerLLVM->IsKnownTypeName(target)
-                && compilerLLVM->gts.scannedTypeNames.count(target) == 0))
+                && compilerLLVM->gts.scannedTypeNames.count(target) == 0
+                && compilerLLVM->gts.scannedEnumNames.count(target) == 0))
             return;
         std::string alias = ctx->Identifier()->getText();
         int stars = inheritedStars + (int)ctx->pointer()->Star().size();
@@ -1269,6 +1270,12 @@ void ForwardRefScanner::CollectGenericTemplateDecls(antlr4::RuleContext* ctx, bo
             if (certain && !unkeyable && !name.empty())
                 compiler->gts.scannedTypeNames.insert(QualifyName(QualifyName(ns, typePath), name));
         };
+        // Enum definitions, gated identically - keys must match scannedTypeNames exactly.
+        auto recordEnumName = [&](const std::string& name)
+        {
+            if (certain && !unkeyable && !name.empty())
+                compiler->gts.scannedEnumNames.insert(QualifyName(QualifyName(ns, typePath), name));
+        };
         // The interface subset, gated identically - keys must match scannedTypeNames exactly.
         auto recordInterfaceName = [&](const std::string& name)
         {
@@ -1303,6 +1310,12 @@ void ForwardRefScanner::CollectGenericTemplateDecls(antlr4::RuleContext* ctx, bo
                 // file containing none (scratch/rev6/g1_expect_error_false_ifconst_hint.cb).
                 CollectGenericTemplateDecls(ruleCtx, false, /*ifConstUnfoldable*/ false, ns, typePath, unkeyable);
                 continue;
+            case CFlatParser::RuleEnumSpecifier:
+            {
+                auto* es = static_cast<CFlatParser::EnumSpecifierContext*>(ruleCtx);
+                if (es->Identifier() != nullptr) recordEnumName(es->Identifier()->getText());
+                continue;
+            }
             case CFlatParser::RuleStructDefinition:
             {
                 auto* sd = static_cast<CFlatParser::StructDefinitionContext*>(ruleCtx);
@@ -1421,7 +1434,11 @@ void ForwardRefScanner::CollectGenericTemplateDecls(antlr4::RuleContext* ctx, bo
     }
 
 std::string ForwardRefScanner::QualifyName(const std::string& ns, const std::string& name) {
-        return ns.empty() ? name : ns + "." + name;
+        // Either side may be empty (a namespace member has no typePath). Joining anyway produced
+        // "N..T", a key no registry ever holds, so every namespaced type missed scannedTypeNames.
+        if (ns.empty()) return name;
+        if (name.empty()) return ns;
+        return ns + "." + name;
     }
 
 std::string ForwardRefScanner::NestedNamespaceName(const std::string& ns, CFlatParser::NamespaceDefinitionContext* ctx) {

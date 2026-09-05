@@ -3565,6 +3565,47 @@ bool testGnNsInnerScopeWins()
     return result;
 }
 
+// Leg 40b: the generic FUNCTION twin of Leg 40. ForwardRefScanner::CollectGenericTemplateDecls
+// keys a generic function as QualifyName(QualifyName(ns, typePath), fn); for a function declared
+// directly inside a namespace typePath is empty, so the key used to come out "N..fn" - a spelling
+// the codegen pass (MainListener_Declarations.cpp) never builds. The scanner's pre-registration
+// was therefore dead and only declarations codegen had already walked were visible. Two verdicts
+// depended on it, both pinned here:
+//   (a) a FORWARD call to a namespaced generic function did not compile at all - the pre-fix
+//       binary reported "unknown generic function 'faenRvIdent'";
+//   (b) a forward BARE call inside the namespace bound OUTWARD to the same-named global template
+//       (100) instead of the namespace-local one (200).
+// Discriminator: the EARLY calls are the only legs whose answer changes. The late, qualified and
+// global calls already answered 8 / 200 / 200 / 100 before the fix, so they are the anti-collapse
+// half - a fix that over-corrected (inner leaking outward, or the global swallowing the qualified
+// call) fails on those instead.
+namespace FaenRvNs
+{
+    int faenRvCallEarly() { return faenRvIdent<int>(7); }   // forward - defined two lines below
+    T faenRvIdent<T>(T v) { return v; }
+    int faenRvCallLate()  { return faenRvIdent<int>(8); }
+}
+
+int faenRvPick<T>(T v) { return 100; }
+namespace FaenRvSh
+{
+    int faenRvEarly() { return faenRvPick<int>(1); }        // bare + forward, inside a namespace
+    int faenRvPick<T>(T v) { return 200; }
+    int faenRvLate()  { return faenRvPick<int>(2); }
+}
+
+bool testFaenNsGenericFunctionForward()
+{
+    bool result = true;
+    result &= Test("faen_ns_genfn_forward_call", FaenRvNs.faenRvCallEarly(), 7);
+    result &= Test("faen_ns_genfn_late_call", FaenRvNs.faenRvCallLate(), 8);
+    result &= Test("faen_ns_genfn_shadow_early", FaenRvSh.faenRvEarly(), 200);
+    result &= Test("faen_ns_genfn_shadow_late", FaenRvSh.faenRvLate(), 200);
+    result &= Test("faen_ns_genfn_shadow_qualified", FaenRvSh.faenRvPick<int>(3), 200);
+    result &= Test("faen_ns_genfn_shadow_global", faenRvPick<int>(4), 100);
+    return result;
+}
+
 // Leg 41: a generic template nested in a STRUCT resolves its body against the LEXICAL scope,
 // not against a same-named NAMESPACE. Its registered key is "GnNest.GnNestBox" - identical in
 // shape to a namespaced template's key - so recovering the declaring scope by splitting the key
@@ -5024,6 +5065,28 @@ struct Q16ForwardAliasAfterDefinition
     Q16ForwardAcceptValue<Q16ForwardPointerAlias>* field = default;
 };
 
+// Pointer-alias targets the scanner could not see at all: an ENUM (never recorded by the scan)
+// and a NAMESPACED struct/enum (recorded under the malformed key "N..T"). Each is a forward
+// template use through a pointer, so all of them are accept-set cells, not diagnostics.
+enum FaenColor : int { FaenRed = 0, FaenGreen = 5 };
+namespace FaenNs { struct FaenPoint { int x = default; }; }
+namespace FaenNs { namespace FaenInner { struct FaenDeep { int y = default; }; } }
+namespace FaenNs { enum FaenMode : int { FaenOff = 0, FaenOn = 9 }; }
+using FaenColorPtr = FaenColor*;
+using FaenColorPtrPtr = FaenColorPtr*;
+using FaenPointPtr = FaenNs.FaenPoint*;
+using FaenDeepPtr = FaenNs.FaenInner.FaenDeep*;
+using FaenModePtr = FaenNs.FaenMode*;
+struct FaenHolder
+{
+    FaenBox<FaenColorPtr>* color = default;
+    FaenBox<FaenColorPtrPtr>* colorPP = default;
+    FaenBox<FaenPointPtr>* point = default;
+    FaenBox<FaenDeepPtr>* deep = default;
+    FaenBox<FaenModePtr>* mode = default;
+};
+struct FaenBox<T> { T value = default; int tag = default; };
+
 // The shape this fix changed: a pointer alias reaching a still-undefined target, used as a
 // forward template argument through a pointer, plus the alias-of-alias form.
 using Q16PointerIP = Q16PointerTarget*;
@@ -5050,6 +5113,35 @@ bool testQ16ForwardAcceptSet()
     Q16PointerHolderChained chainedAlias = default;
     result &= Test("q16_forward_pointer_alias", pointerAlias.field == nullptr, true);
     result &= Test("q16_forward_pointer_alias_chained", chainedAlias.field == nullptr, true);
+
+    // Enum and namespaced alias targets: distinct tags prove the five uses did not collapse onto
+    // one instantiation, and each read goes through the alias-folded pointer element type.
+    FaenColor color = FaenColor.FaenGreen;
+    FaenColor* colorPtr = &color;
+    FaenNs.FaenPoint point = default; point.x = 11;
+    FaenNs.FaenInner.FaenDeep deep = default; deep.y = 13;
+    FaenNs.FaenMode mode = FaenNs.FaenMode.FaenOn;
+    FaenBox<FaenColorPtr> boxColor = default; boxColor.value = &color; boxColor.tag = 1;
+    FaenBox<FaenColorPtrPtr> boxColorPP = default; boxColorPP.value = &colorPtr; boxColorPP.tag = 2;
+    FaenBox<FaenPointPtr> boxPoint = default; boxPoint.value = &point; boxPoint.tag = 3;
+    FaenBox<FaenDeepPtr> boxDeep = default; boxDeep.value = &deep; boxDeep.tag = 4;
+    FaenBox<FaenModePtr> boxMode = default; boxMode.value = &mode; boxMode.tag = 5;
+    FaenHolder holder = default;
+    holder.color = &boxColor;
+    holder.colorPP = &boxColorPP;
+    holder.point = &boxPoint;
+    holder.deep = &boxDeep;
+    holder.mode = &boxMode;
+    result &= Test("faen_enum_alias_value", (int)(*holder.color.value), 5);
+    result &= Test("faen_enum_alias_tag", holder.color.tag, 1);
+    result &= Test("faen_enum_alias_ptr_ptr", (int)(**holder.colorPP.value), 5);
+    result &= Test("faen_enum_alias_ptr_ptr_tag", holder.colorPP.tag, 2);
+    result &= Test("faen_ns_alias_value", holder.point.value.x, 11);
+    result &= Test("faen_ns_alias_tag", holder.point.tag, 3);
+    result &= Test("faen_nested_ns_alias_value", holder.deep.value.y, 13);
+    result &= Test("faen_nested_ns_alias_tag", holder.deep.tag, 4);
+    result &= Test("faen_ns_enum_alias_value", (int)(*holder.mode.value), 9);
+    result &= Test("faen_ns_enum_alias_tag", holder.mode.tag, 5);
     return result;
 }
 
@@ -5211,6 +5303,7 @@ extern int main()
     total++; passed += testGenericAndDunderNameCollision()           ? 1 : 0;
     total++; passed += testPrefixManglingAndPointerCollision()       ? 1 : 0;
     total++; passed += testQ16ForwardAcceptSet()                     ? 1 : 0;
+    total++; passed += testFaenNsGenericFunctionForward()           ? 1 : 0;
 
     printf("%d/%d tests passed.\n", passed, total);
     return passed == total ? 0 : 1;

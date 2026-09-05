@@ -237,6 +237,12 @@ struct GenericTemplateState
     // scan desugars `list<unique IShape>` to the same unique<IShape> name the codegen pass builds.
     // Not cached, for the same reason scannedTypeNames is not: a warm cache restores interfaceTable.
     std::unordered_set<std::string>                                             scannedInterfaceNames;
+    // Qualified names of every ENUM DEFINITION the forward-ref scan saw, same certain/keyable
+    // gating and keys as scannedTypeNames. Kept SEPARATE from it: scannedTypeNames is the
+    // type-argument accept set consulted by ResolveTypeArgBaseName, and admitting enums there
+    // would change which key a bare argument spelling resolves to. Read only by the scanner's
+    // pointer-alias pre-registration, where enumBackingTypes is still empty.
+    std::unordered_set<std::string>                                             scannedEnumNames;
     // Template key -> the NAMESPACE it was declared in, recorded at registration. It CANNOT be
     // derived from the key: struct nesting and namespace nesting share one dotted key space, so a
     // template nested in `struct Outer` is keyed "Outer.Box" exactly like one in `namespace Outer`.
