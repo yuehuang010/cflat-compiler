@@ -199,7 +199,7 @@ CORPUS_FILES = [
 ]
 
 
-def make_corpus_cases(exe: str, root: Path) -> list[Case]:
+def make_corpus_cases(exe: str) -> list[Case]:
     cases: list[Case] = []
     for file_name in CORPUS_FILES:
         path = ROOT / file_name
@@ -259,7 +259,7 @@ def main() -> int:
         return 1
     cases = make_pinned_cases()
     if args.corpus:
-        cases += make_corpus_cases(str(exe), ROOT / "scratch" / "inc-gate")
+        cases += make_corpus_cases(str(exe))
     jobs = args.jobs or min(os.cpu_count() or 1, 8)
     if jobs < 1:
         parser.error("--jobs must be positive")

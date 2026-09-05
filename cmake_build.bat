@@ -53,8 +53,13 @@ if exist "%CACHE%" (
   )
 )
 
+REM Compare with `neq 0`, NOT `if errorlevel 1`. cmd reads `if errorlevel N` as
+REM "errorlevel >= N" with a SIGNED comparison, and cmake/ninja return -1 when a link
+REM step fails (ninja logs it as code=4294967295). `if errorlevel 1` is therefore FALSE
+REM for a link failure, so the script fell through to "=== Done" and exited 0, leaving a
+REM stale exe in place. A compile failure (exit 1) propagated fine, which is what hid it.
 call "%VS_ROOT%\VC\Auxiliary\Build\vcvars64.bat" >nul
-if errorlevel 1 ( echo Failed to initialize VS dev environment & exit /b 1 )
+if !ERRORLEVEL! neq 0 ( echo Failed to initialize VS dev environment & exit /b 1 )
 
 REM `cmake --preset` reads CMakePresets.json from the CWD, so anchor to this
 REM script's own checkout. Without this, running <worktree>\cmake_build.bat from
@@ -64,11 +69,11 @@ pushd "%~dp0"
 REM -D makes CFLAT_VCPKG_INSTALLED actually override the preset's default path.
 echo === Configuring %PRESET% ===
 cmake --preset %PRESET% -D VCPKG_INSTALLED_DIR="!WANT!"
-if errorlevel 1 ( popd & echo Configure failed & exit /b 1 )
+if !ERRORLEVEL! neq 0 ( popd & echo Configure failed & exit /b 1 )
 
 echo === Building %PRESET% ===
 cmake --build --preset %PRESET%
-if errorlevel 1 ( popd & echo Build failed & exit /b 1 )
+if !ERRORLEVEL! neq 0 ( popd & echo Build failed & exit /b 1 )
 
 popd
 echo === Done: x64\%PRESET:win-x64-=% layout ready ===

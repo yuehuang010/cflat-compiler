@@ -821,7 +821,11 @@ void test_sci()
     xs[0]=0.0; xs[1]=1.0; xs[2]=2.0; ys[0]=0.0; ys[1]=1.0; ys[2]=4.0;
     Interp.spline_build_natural(xs, ys, 3, co);
     check_tol("spline binary eval", Interp.spline_eval(xs, 3, co, 1.5), 2.3125, 0.000001);
-    string path = "scratch/sci_data.txt"; File.writeAllText(path, "1.25\r\n2.5\n3.75");
+    // Fixtures land in the working directory, not scratch/ - that directory is gitignored
+    // and absent on a fresh clone, so the writes failed silently and every DataIo check
+    // below reported a parse error at byte 0.
+    string path = "test_hpc_sci_data.txt";
+    check_int("sci fixture written", File.writeAllText(path, "1.25\r\n2.5\n3.75") ? 1 : 0, 1);
     LoadOptions opt = default; opt.chunk_bytes = 16; double[] values = new double[4];
     LoadResult lr = DataIo.load_doubles(path, values, 4, opt);
     opt.mode = ReadMode.Mmap; LoadResult mm = DataIo.load_doubles(path, values, 4, opt); opt.mode = ReadMode.Chunked;
@@ -829,7 +833,8 @@ void test_sci()
     check_int("data load ok", lr.ok ? 1 : 0, 1); check_int("data rows", (int)lr.rows, 3); check_tol("data tail", values[2], 3.75, 0.000001);
     Welford wf = default; LoadResult red = DataIo.reduce_file(path, &wf, opt);
     check_int("data reduce ok", red.ok ? 1 : 0, 1); check_tol("data mean", wf.mean, 2.5, 0.000001);
-    string csv = "scratch/sci_data.csv"; File.writeAllText(csv, "a,b\r\n1,2\n3,4");
+    string csv = "test_hpc_sci_data.csv";
+    check_int("csv fixture written", File.writeAllText(csv, "a,b\r\n1,2\n3,4") ? 1 : 0, 1);
     opt.has_header = true; double[] table = new double[4]; LoadResult cr = DataIo.load_csv(csv, table, 4, 2, opt);
     check_int("csv rows", (int)cr.rows, 2); check_tol("csv order", table[2], 3.0, 0.000001);
     File.remove(path); File.remove(csv); delete[_] xs; delete[_] ys; delete[_] co; delete[_] values; delete[_] table;
@@ -840,7 +845,7 @@ void test_sci()
 // forced on by a small chunk size. Returns -1 when the load fails.
 double dataio_mean(string text, int chunk_bytes, int buffers, int workers, i64* rows)
 {
-    string p = "scratch/sci_pipe.txt";
+    string p = "test_hpc_sci_pipe.txt";
     File.writeAllText(p, text);
     LoadOptions o = default;
     o.chunk_bytes = chunk_bytes;
@@ -889,7 +894,7 @@ void test_dataio_pipeline()
 
     // 128 KB through 3 buffers and 4 parse workers: exercises the buffer pool
     // and the record-aligned parallel split, and must keep file order.
-    string big = "scratch/sci_pipe_big.txt";
+    string big = "test_hpc_sci_pipe_big.txt";
     i8* block = (i8*)malloc((i64)131072);
     char* pat = "1.5 2.5 3.5 4.5 ";
     for (i64 i = (i64)0; i < (i64)131072; i = i + (i64)16) memcpy(block + i, (i8*)pat, (i64)16);
