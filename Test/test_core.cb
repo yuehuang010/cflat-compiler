@@ -3194,6 +3194,13 @@ struct ViewNullArmDest { IViewNullArm[] v = default; };
 int viewNullArmTake(IViewNullArm[] v, int at) { return v == nullptr ? 0 : v[at].vna(); }
 IViewNullArm[] viewNullArmReturn(IViewNullArm[] v) { return v; }
 T[] viewNullArmPass<T>(T[] v) { return v; }
+// Virtual-dispatch door: the same view parameter reached through a vtable slot, which lowers its
+// arguments in CallInterfaceMethod rather than in the direct-call path.
+interface IViewNullArmHost { int vnaHost(IViewNullArm[] v, int miss); };
+class ViewNullArmHostImpl : IViewNullArmHost
+{
+    int vnaHost(IViewNullArm[] v, int miss) { return v == nullptr ? miss : v[0].vna(); }
+};
 
 int runViewJoinNullArmIface(int choose)
 {
@@ -3235,6 +3242,72 @@ int runViewJoinNullArmIface(int choose)
 
     return legQqDefault + legQqNullptr + legTernRight + legTernLeft
         + legFieldQq + legFieldTern + legGeneric + legNullLeft;
+}
+
+/*
+ * A BARE null bound to an interface VIEW. `nullptr` names no element, and a join whose arms are
+ * BOTH unnamed has no arm to inherit one from, so the sibling above cannot reach either shape.
+ * Before the fix the call door boxed a class named '' (GetOrCreateVTable: '') and the assignment
+ * door boxed the null into a fat value ("cannot assign a struct value to a pointer variable").
+ * Every door reads a DISTINCT sentinel through a null-tolerant helper, so a door that binds the
+ * wrong value changes the total instead of collapsing to a shared zero.
+ */
+int viewBareNullTake(IViewNullArm[] v, int miss) { return v == nullptr ? miss : v[0].vna(); }
+
+int runBareNullViewIfaceCall(int choose)
+{
+    ViewNullArmImpl e0; e0.k = 9;
+    IViewNullArm[1] store;
+    store[0] = e0;
+    IViewNullArm[] live = store;
+
+    // Call-argument door: a bare `nullptr`, then a join whose BOTH arms are unnamed.
+    int legCallNull = viewBareNullTake(nullptr, 3);
+    int legCallJoin = viewBareNullTake(choose != 0 ? nullptr : default, 5);
+    // Accept-set leg, not a fix leg: the door must still bind a REAL view. The guard added
+    // beside it rejects only a single VALUE, so this reads 9 on both binaries.
+    int legCallLive = viewBareNullTake(live, 99);
+    // Generic 'T[]' door of the same bare null.
+    IViewNullArm[] gen = viewNullArmPass<IViewNullArm>(nullptr);
+    int legGeneric = viewBareNullTake(gen, 19);
+
+    // Virtual-dispatch door: the vtable slot lowers its own arguments, so the bare null crossed a
+    // SECOND boxing gate - it read `GetOrCreateVTable: ''` here after the direct door was fixed.
+    ViewNullArmHostImpl hostImpl;
+    IViewNullArmHost host = hostImpl;
+    int legVirtNull = host.vnaHost(nullptr, 29);
+    // Accept-set leg at the same door: a REAL view must still bind through the vtable slot.
+    int legVirtLive = host.vnaHost(live, 99);
+
+    return legCallNull + legCallJoin + legCallLive + legGeneric + legVirtNull + legVirtLive;
+}
+
+int runBareNullViewIfaceStore(int choose)
+{
+    ViewNullArmImpl e0; e0.k = 9;
+    IViewNullArm[1] store;
+    store[0] = e0;
+    IViewNullArm[] live = store;
+
+    // Field-store door, one spelling per unnamed form, read back through the helper.
+    ViewNullArmDest destNull = default; destNull.v = nullptr;
+    int legFieldNull = viewBareNullTake(destNull.v, 7);
+    ViewNullArmDest destJoin = default; destJoin.v = choose != 0 ? nullptr : default;
+    int legFieldJoin = viewBareNullTake(destJoin.v, 11);
+    ViewNullArmDest destLive = default; destLive.v = live;
+    int legFieldLive = viewBareNullTake(destLive.v, 99);
+    // Local-SLOT assignment door, which is a different site from the declarator door below.
+    IViewNullArm[] q = live; q = nullptr;
+    int legAssignNull = viewBareNullTake(q, 13);
+    // Round-trip: the call door binds the bare null and the callee returns it as a view.
+    IViewNullArm[] ret = viewNullArmReturn(nullptr);
+    int legReturn = viewBareNullTake(ret, 17);
+    // Declarator door - the REFERENCE the two fixed doors were made to match. It already bound a
+    // bare null before the fix, so this leg is the oracle's own check, not a fix leg.
+    IViewNullArm[] init = nullptr;
+    int legInit = viewBareNullTake(init, 23);
+
+    return legFieldNull + legFieldJoin + legFieldLive + legAssignNull + legReturn + legInit;
 }
 
 void rawCountSink(move RawCountElem* values) {}
@@ -4131,6 +4204,13 @@ int testRawArrayRuntimeCount()
     // Live path sums 1..8 = 36 through eight interface doors; the null path yields 0 at each.
     passed += Test("view join with a null arm names its interface element at every door",
         runViewJoinNullArmIface(1) * 100 + runViewJoinNullArmIface(0), 3600);
+    // 3 + 5 + 9 (live) + 19 + 29 (virtual null) + 9 (virtual live); both `choose` paths of the
+    // all-unnamed join are null.
+    passed += Test("bare null binds an interface view at the call, generic and virtual doors",
+        runBareNullViewIfaceCall(1) * 100 + runBareNullViewIfaceCall(0), 7474);
+    // 7 + 11 + 9 (live) + 13 + 17 + 23.
+    passed += Test("bare null binds an interface view at the store, return and init doors",
+        runBareNullViewIfaceStore(1) * 100 + runBareNullViewIfaceStore(0), 8080);
     passed += Test("raw count move parameter direct zero and counts",
         runRawCountMoveDirect(0) * 100 + runRawCountMoveDirect(2) * 10
             + runRawCountMoveDirect(4), 24);
@@ -4346,7 +4426,7 @@ extern int main()
     r = testDiscard();          passed += r; total += 6;
     r = testDirectReturnOwnership(); passed += r; total += 6;
     r = testCLongWidth();       passed += r; total += 15;
-    r = testRawArrayRuntimeCount(); passed += r; total += 92;
+    r = testRawArrayRuntimeCount(); passed += r; total += 94;
     r = testDictEnumeration();  passed += r; total += 12;
     r = testLiteralReceiverAndNullChain(); passed += r; total += 9;
     r = testDefaultAsExpression(); passed += r; total += 82;

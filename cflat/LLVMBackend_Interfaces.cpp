@@ -902,6 +902,29 @@ bool LLVMBackend::StructImplementsInterface(const std::string& structName, const
         return false;
     }
 
+/*
+ * Value axis of the interface array-view gate. An 'IA[]' indexes fat {vtable,data} elements, so a
+ * single value - an implementor, or even a fat 'IA' - is not one element of it; binding it forged
+ * a call the verifier rejected (a bare class) or a view over a 16-byte temp (a fat value). A null
+ * constant and a '?:' join name no type and are NOT rejected here: they are null views.
+ * Shared by the direct-call door (CreateOverloadedFunctionCall) and the virtual-dispatch door
+ * (CallInterfaceMethod) so both spell the rejection identically.
+ */
+bool LLVMBackend::RejectValueIntoInterfaceViewParam(const TypeAndValue& arg,
+                                                    const TypeAndValue& param)
+{
+        if (!param.IsArrayView || !param.IsInterface) return false;
+        if (arg.Pointer || arg.IsArrayView || arg.ConstArraySize != 0 || arg.TypeName.empty())
+            return false;
+        LogErrorMessage(
+            "cannot pass a '{}' value as array-view parameter '{}' ('{}') - a view of an "
+            "interface indexes fat '{}' elements, so its source must be an array view of "
+            "'{}' (or a null one), not a single value",
+            { SpellType(*this, arg), param.VariableName, SpellType(*this, param),
+              "{vtable,data}", param.TypeName });
+        return true;
+    }
+
 std::string LLVMBackend::DescribePointerShapedInterfaceSource(const TypeAndValue& src) const
 {
         if (src.TypeName.empty()) return "";

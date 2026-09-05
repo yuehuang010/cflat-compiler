@@ -5247,6 +5247,15 @@ public:
      */
     std::string DescribePointerShapedInterfaceSource(const TypeAndValue& src) const;
 
+    // Value axis of the interface array-view gate, shared by the direct-call and virtual-dispatch
+    // doors. Logs and returns true when a single VALUE was bound to an 'IA[]' parameter.
+    bool RejectValueIntoInterfaceViewParam(const TypeAndValue& arg, const TypeAndValue& param);
+
+    // Full array-view parameter gate (raw-pointer, interface-value, element axes) shared by both
+    // call doors. Logs and returns true when any axis rejected the binding.
+    bool RejectArrayViewParamBinding(const NamedVariable& arg, const TypeAndValue& param,
+                                     const std::string& diagnosticFunctionName);
+
     // Message for a rejected pointer-shaped class -> interface upcast. Shared by every site that
     // boxes into an interface so all spellings report the same diagnostic.
     std::string FormatPointerShapedInterfaceUpcastError(const std::string& shape,

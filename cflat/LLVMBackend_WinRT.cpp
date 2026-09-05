@@ -2628,14 +2628,22 @@ llvm::Value* LLVMBackend::CallInterfaceMethod(llvm::Value* ifacePtr, const std::
             if (RejectCodeValueIntoDataParam(nv, param, ifaceName, methodName))
                 return nullptr;
 
+            // Array-view parameter gate, shared with the direct-call door: a vtable slot lowers
+            // by the same ABI, so a forged view is called as one and cannot be lowered here.
+            if (param.IsArrayView
+                && RejectArrayViewParamBinding(nv, param, ifaceName + "." + methodName))
+                return nullptr;
+
             // A blessed unique<IFace> wrapper is not an implementor: borrow the fat value it holds
             // through get(), the same lowering the direct call path applies.
-            if (param.IsInterface && !nv.TypeAndValue.IsInterface
+            if (param.IsInterface && !param.IsArrayView && !nv.TypeAndValue.IsInterface
                 && IsCoreUniqueToRawPointer(nv, param))
             {
                 callArgs.push_back(CreateCoreUniqueRawPointerCall(nv, param));
             }
-            else if (param.IsInterface && !nv.TypeAndValue.IsInterface)
+            // An 'IA[]' parameter is a THIN view over fat elements, never a fat value itself, so
+            // nothing binds to it by boxing - the direct-call door excludes views the same way.
+            else if (param.IsInterface && !param.IsArrayView && !nv.TypeAndValue.IsInterface)
             {
                 // Concrete struct/pointer -> interface fat ptr upconversion.
                 // Reject a pointer-shaped source: it is not an instance of its element class.

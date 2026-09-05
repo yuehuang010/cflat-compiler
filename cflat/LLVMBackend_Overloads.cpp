@@ -791,6 +791,60 @@ void LLVMBackend::LogUniqueCopyError(const std::string& typeName,
                 { displayType, displayType, uniquePath, "copy()", displayType, "move" });
 }
 
+/*
+ * Array-view PARAMETER gate, shared by the direct-call door (CreateOverloadedFunctionCall) and the
+ * virtual-dispatch door (CallInterfaceMethod), which lowers a vtable slot's arguments by the same
+ * ABI and so needs the same rejections. Three axes: a raw 'T*' would forge the whole-allocation
+ * contract a view promises; a single VALUE is not one element of an interface view; a view whose
+ * ELEMENT differs strides and loads with the wrong shape inside the callee.
+ * Returns true when any axis logged.
+ */
+bool LLVMBackend::RejectArrayViewParamBinding(const NamedVariable& arg, const TypeAndValue& param,
+                                              const std::string& diagnosticFunctionName)
+{
+        bool rejected = false;
+        // The reverse ('T[] -> T*' decay) is always safe; a view argument carries IsArrayView.
+        if (param.IsArrayView && arg.TypeAndValue.Pointer && !arg.TypeAndValue.IsArrayView)
+        {
+            LogErrorMessage(
+                "cannot pass a raw pointer '{}' as array-view parameter '{}' ('{}') - a view "
+                "must span a whole allocation (it comes only from '{}' or another '{}'); "
+                "the '{} -> {}' decay is one-way",
+                { "T*", param.VariableName, "T[]", "new T[n]", "T[]", "T[]", "T*" });
+            rejected = true;
+        }
+
+        rejected |= RejectValueIntoInterfaceViewParam(arg.TypeAndValue, param);
+
+        std::string destElement;
+        std::string srcElement;
+        // A view ARGUMENT may reach here as a loaded value whose TypeName is blank; recover
+        // the declared element name from the named variable so the message can spell it.
+        LLVMBackend::TypeAndValue argTV = arg.TypeAndValue;
+        if (argTV.TypeName.empty() && !arg.CallerName.empty())
+            if (const NamedVariable* declared = FindLiveNamedVariable(arg.CallerName))
+            {
+                if (arg.FieldName.empty() && declared->TypeAndValue.IsArrayView)
+                    argTV.TypeName = declared->TypeAndValue.TypeName;
+                // A FIELD read: CallerName names the base struct, so the element name
+                // lives on the field's declaration, not on the base's TypeName.
+                else if (auto base = dataStructures.find(declared->TypeAndValue.TypeName);
+                         !arg.FieldName.empty() && base != dataStructures.end())
+                    for (const auto& f : base->second.StructFields)
+                        if (f.VariableName == arg.FieldName && f.IsArrayView)
+                            argTV.TypeName = f.TypeName;
+            }
+        if (ArrayViewElementMismatch(param, argTV, destElement, srcElement))
+        {
+            LogErrorMessage(
+                "cannot pass an array view of '{}' as parameter '{}' of '{}', whose element "
+                "is '{}' - a view indexes by its own element, so the elements must match",
+                { srcElement, param.VariableName, diagnosticFunctionName, destElement });
+            rejected = true;
+        }
+        return rejected;
+}
+
 llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functionNameIn, const std::vector<LLVMBackend::NamedVariable>& arguments, bool forceRoot,
         const std::string& displayName)
 {
@@ -1218,47 +1272,11 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                 return nullptr;
             }
 
-            // Array-view parameter gate: a raw `T*` must not bind to a `T[]` parameter - that
-            // would forge the noalias contract the view promises (a whole, distinct allocation).
-            // Placed before the binding branches because an array-view param has Pointer=true and
-            // is handled by the pointer-parameter branch below. The reverse (`T[] -> T*` decay)
-            // is always safe; a view argument carries IsArrayView and passes.
-            if (!inVariadicRange && candParamItr->IsArrayView
-                && arg.TypeAndValue.Pointer && !arg.TypeAndValue.IsArrayView)
-                LogErrorMessage(
-                    "cannot pass a raw pointer '{}' as array-view parameter '{}' ('{}') - a view "
-                    "must span a whole allocation (it comes only from '{}' or another '{}'); "
-                    "the '{} -> {}' decay is one-way",
-                    { "T*", candParamItr->VariableName, "T[]", "new T[n]", "T[]", "T[]", "T*" });
-
-            // Element axis of the same gate: a view argument whose ELEMENT differs from the
-            // parameter's strides and loads with the wrong shape inside the callee.
+            // Array-view parameter gate (raw-pointer, interface-value and element axes), shared
+            // with the virtual-dispatch door. Placed before the binding branches because an
+            // array-view param has Pointer=true and is handled by the pointer branch below.
             if (!inVariadicRange)
-            {
-                std::string destElement;
-                std::string srcElement;
-                // A view ARGUMENT may reach here as a loaded value whose TypeName is blank; recover
-                // the declared element name from the named variable so the message can spell it.
-                LLVMBackend::TypeAndValue argTV = arg.TypeAndValue;
-                if (argTV.TypeName.empty() && !arg.CallerName.empty())
-                    if (const NamedVariable* declared = FindLiveNamedVariable(arg.CallerName))
-                    {
-                        if (arg.FieldName.empty() && declared->TypeAndValue.IsArrayView)
-                            argTV.TypeName = declared->TypeAndValue.TypeName;
-                        // A FIELD read: CallerName names the base struct, so the element name
-                        // lives on the field's declaration, not on the base's TypeName.
-                        else if (auto base = dataStructures.find(declared->TypeAndValue.TypeName);
-                                 !arg.FieldName.empty() && base != dataStructures.end())
-                            for (const auto& f : base->second.StructFields)
-                                if (f.VariableName == arg.FieldName && f.IsArrayView)
-                                    argTV.TypeName = f.TypeName;
-                    }
-                if (ArrayViewElementMismatch(*candParamItr, argTV, destElement, srcElement))
-                    LogErrorMessage(
-                        "cannot pass an array view of '{}' as parameter '{}' of '{}', whose element "
-                        "is '{}' - a view indexes by its own element, so the elements must match",
-                        { srcElement, candParamItr->VariableName, diagnosticFunctionName, destElement });
-            }
+                RejectArrayViewParamBinding(arg, *candParamItr, diagnosticFunctionName);
 
             // Closure SHAPE gate (value vs pointer vs view), shared with virtual dispatch.
             // Hoisted above the binding branches: it judges the pair, not one binding arm.
@@ -1280,12 +1298,18 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
 
             // A blessed unique<IFace> wrapper is not an implementor: borrow the fat value it
             // holds through get() rather than boxing the wrapper struct itself.
-            if (!inVariadicRange && candParamItr->IsInterface && !arg.TypeAndValue.IsInterface
+            if (!inVariadicRange && candParamItr->IsInterface && !candParamItr->IsArrayView
+                && !arg.TypeAndValue.IsInterface
                 && IsCoreUniqueToRawPointer(arg, *candParamItr))
             {
                 argList.push_back(CreateCoreUniqueRawPointerCall(arg, *candParamItr));
             }
-            else if (!inVariadicRange && candParamItr->IsInterface && !arg.TypeAndValue.IsInterface)
+            // An 'IA[]' parameter is a THIN view over fat elements, never a fat value itself, so
+            // nothing binds to it by boxing - the declarator door excludes views the same way.
+            // A null constant (or an all-unnamed join) then binds as the null view it is,
+            // instead of boxing a class named ''.
+            else if (!inVariadicRange && candParamItr->IsInterface && !candParamItr->IsArrayView
+                     && !arg.TypeAndValue.IsInterface)
             {
                 // A `unique` interface param takes ownership and frees its boxed object at scope
                 // exit. A struct VALUE source would box a STACK address as the data pointer, so

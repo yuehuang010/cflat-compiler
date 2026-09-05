@@ -2789,7 +2789,10 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
 
             // Interface upcast: struct* -> fat pointer when assigning to an interface variable.
             // Mirrors the same logic in the declaration initializer path (ParseDeclaration).
+            // An 'IA[]' destination is a THIN view over fat elements, not a fat value, so it is
+            // never a boxing target - the declarator door excludes views the same way.
             if (operatorText == "=" && namedVar.TypeAndValue.IsInterface
+                && !namedVar.TypeAndValue.IsArrayView
                 && right && right->getType() != compiler->GetFatPtrType())
             {
                 // nullptr assigned to a non-pointer interface variable - produce null fat pointer {null, null}.

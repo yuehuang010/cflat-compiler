@@ -3,3 +3,29 @@ expect_error("cannot pass a raw pointer 'T*' as array-view parameter") {
     void kernel(int[] a, int n) { a[0] = 1; }
     void f(int* p) { kernel(p, 4); }
 }
+
+// Value axis of the same gate: an 'IA[]' indexes fat {vtable,data} elements, so a single value -
+// an implementor, or even a fat 'IA' - is not one element of it and must not bind.
+expect_error("cannot pass a 'BvcImpl' value as array-view parameter") {
+    interface IBvc { int bvc(); };
+    class BvcImpl : IBvc { int k = default; int bvc() { return k; } };
+    int bvcTake(IBvc[] v) { return v == nullptr ? 0 : v[0].bvc(); }
+    int bvcCall() { BvcImpl b; b.k = 1; return bvcTake(b); }
+}
+
+expect_error("cannot pass a 'IBvf' value as array-view parameter") {
+    interface IBvf { int bvf(); };
+    class BvfImpl : IBvf { int k = default; int bvf() { return k; } };
+    int bvfTake(IBvf[] v) { return v == nullptr ? 0 : v[0].bvf(); }
+    int bvfCall() { BvfImpl b; b.k = 1; IBvf i = b; return bvfTake(i); }
+}
+
+// Same value axis at the VIRTUAL-dispatch door: a vtable slot lowers its own arguments, so the
+// gate must fire there too (before the fix this forged a call the module verifier rejected).
+expect_error("cannot pass a 'BvvImpl' value as array-view parameter") {
+    interface IBvv { int bvv(); };
+    class BvvImpl : IBvv { int k = default; int bvv() { return k; } };
+    interface IBvvHost { int bvvHost(IBvv[] v); };
+    class BvvHostImpl : IBvvHost { int bvvHost(IBvv[] v) { return v == nullptr ? 0 : v[0].bvv(); } };
+    int bvvCall() { BvvHostImpl h; BvvImpl b; b.k = 1; IBvvHost hi = h; return hi.bvvHost(b); }
+}
