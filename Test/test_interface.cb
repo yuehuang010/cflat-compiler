@@ -2500,6 +2500,10 @@ void ifaceViewSetSecond(IShape[] items, IShape v)
     items[1] = v;
 }
 
+IShape[] ifaceViewPassthru(IShape[] items) { return items; }
+
+T[] ifaceViewGenericPassthru<T>(T[] items) { return items; }
+
 // A view of interfaces held as a struct FIELD, and one RETURNED across a call boundary.
 struct IfaceViewHolder
 {
@@ -2533,6 +2537,16 @@ bool testInterfaceArrayViewOfInterfaces()
 
     IShape[] view = new IShape[4];
     for (int i = 0; i < 4; i++) view[i] = sqs[i];
+
+    // Accept-set: same-element view copy, return, generic T[] and void* decay.
+    IShape[] copied = view;
+    result &= Test("iface_view_copy", copied[0].area(), 1);
+    IShape[] passed = ifaceViewPassthru(view);
+    result &= Test("iface_view_returned_view", passed[1].area(), 4);
+    IShape[] generic = ifaceViewGenericPassthru<IShape>(view);
+    result &= Test("iface_view_generic_param", generic[2].area(), 9);
+    void* raw = view;
+    result &= Test("iface_view_void_ptr", raw != nullptr, true);
 
     // Reading an element and dispatching through it, across a call that takes the view.
     result &= Test("iface_view_sum", ifaceViewSum(view, 4), 1 + 4 + 9 + 16);

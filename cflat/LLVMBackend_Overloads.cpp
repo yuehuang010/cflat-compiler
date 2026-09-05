@@ -298,6 +298,13 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                         {
                             result = 1;
                         }
+
+                        // Lone view candidate refused on its element: let the pair through so the
+                        // element gate at the call site spells the real reason (q13 sibling below).
+                        if (result < 0 && candidates.size() == 1
+                            && arg.TypeAndValue.IsArrayView && candidateParamItr->IsArrayView
+                            && !candidateParamItr->IsInterface)
+                            result = 0;
                     }
                 }
                 else
@@ -1230,7 +1237,7 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
             {
                 std::string destElement;
                 std::string srcElement;
-                // A view ARGUMENT reaches here as a loaded value whose TypeName is blank; recover
+                // A view ARGUMENT may reach here as a loaded value whose TypeName is blank; recover
                 // the declared element name from the named variable so the message can spell it.
                 LLVMBackend::TypeAndValue argTV = arg.TypeAndValue;
                 if (argTV.TypeName.empty() && !arg.CallerName.empty())

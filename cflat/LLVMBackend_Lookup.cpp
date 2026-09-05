@@ -126,7 +126,7 @@ bool LLVMBackend::ArrayViewElementMismatch(const LLVMBackend::TypeAndValue& dest
         if (!dest.IsArrayView && !dest.Pointer) return false;
         // An interface destination reboxes through its own gate; a closure carries a signature,
         // not an element. Neither indexes by the view's element.
-        if (dest.IsInterface || src.IsInterface) return false;
+        if (dest.IsInterface) return false;
         if (dest.IsFunctionPointer || src.IsFunctionPointer) return false;
         // 'void*' is the universal address destination - it never indexes by an element.
         if (dest.TypeName == "void") return false;

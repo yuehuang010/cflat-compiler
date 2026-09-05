@@ -8,6 +8,14 @@ struct AvmPtrBox<T> { T* p = default; };
 struct AvmPlain { int[] v = default; };
 struct AvmFoo { int a = default; };
 struct AvmBar { int b = default; };
+interface AvmIface { int area(); };
+struct AvmIfaceHolder { int[] view = default; };
+
+int avmTakeIntIface(int[] d) { return d[0]; }
+
+expect_error("cannot return an array view of 'AvmIface' from a function whose return element is 'int'") {
+    int[] avmReturnIface(AvmIface[] q) { return q; }
+}
 
 // Return leg: the declared element is 'int', the returned view's element is 'int*'.
 expect_error("cannot return an array view of 'int*' from a function whose return element is 'int'") {
@@ -24,6 +32,24 @@ extern int main()
 
     int[3] store; store[0] = 10; store[1] = 20; store[2] = 30;
     int[] iview = store;
+
+    AvmIface[] avmIfaceView = new AvmIface[1];
+
+    // Interface view source: declaration initializer.
+    expect_error("cannot bind an array view of 'AvmIface' to a destination of 'int'") {
+        int[] avmIfaceDecl = avmIfaceView;
+    }
+
+    // Interface view source: field store.
+    expect_error("cannot bind an array view of 'AvmIface' to a destination of 'int'") {
+        AvmIfaceHolder avmIfaceHolder = default;
+        avmIfaceHolder.view = avmIfaceView;
+    }
+
+    // Interface view source: call argument.
+    expect_error("cannot pass an array view of 'AvmIface' as parameter 'd' of 'avmTakeIntIface', whose element is 'int'") {
+        int avmIfaceResult = avmTakeIntIface(avmIfaceView);
+    }
 
     // Declaration initializer: element 'int*' into element 'int'.
     expect_error("cannot bind an array view of 'int*' to a destination of 'int'") {
