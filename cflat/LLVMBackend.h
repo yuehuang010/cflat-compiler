@@ -2784,6 +2784,9 @@ private:
     // alias never lands here: it binds in the alias frame the two pre-scans open (see
     // RegisterPureRenameAlias), so it shadows this map instead of poisoning it for the whole file.
     std::unordered_map<std::string, std::string> manglingAliases_;
+    // FILE-scope simple POINTER `using` aliases (`using IP = int*;`) - alias -> starred target.
+    // Same pre-registration and read-only-by-the-mangler contract as manglingAliases_.
+    std::unordered_map<std::string, std::string> manglingPointerAliases_;
     // `using IReference = Windows.Foundation.IReference;` - alias -> generic BASE name. Separate
     // from typeAliases because a base is not a type until its <...> arguments are supplied.
     std::unordered_map<std::string, std::string> genericBaseAliases_;
@@ -4948,6 +4951,16 @@ public:
     // a body-scope `using` folds to ITS target in both passes. The hop guard bounds a cycle; a
     // cyclic alias is a separate error the authoritative ParseUsingDeclaration owns.
     std::string ResolveManglingAlias(const std::string& name) const;
+
+    // A simple POINTER alias (`using IP = int*;`) pre-registered by the scanner. Kept in its own
+    // mangling-only table: the target keeps its stars, so it is not a name ResolveManglingAlias
+    // may return, and putting it in typeAliases would make the alias resolve for ORDINARY
+    // declarations before the main pass reaches the `using` (order-independent, unlike a rename).
+    void RegisterManglingPointerAlias(const std::string& alias, const std::string& target);
+
+    // The starred target of a pre-registered pointer alias ("int*"), or an empty string. An active
+    // alias frame binding the same name shadows it, matching ResolveManglingAlias.
+    std::string ResolveManglingPointerAlias(const std::string& name) const;
 
     // A `using` alias that names a GENERIC BASE rather than a concrete type - e.g.
     // `using IReference = Windows.Foundation.IReference;`, which then lets a body write the

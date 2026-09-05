@@ -313,6 +313,32 @@ std::string LLVMBackend::ResolveManglingAlias(const std::string& name) const
         return cur;
     }
 
+void LLVMBackend::RegisterManglingPointerAlias(const std::string& alias, const std::string& target)
+{
+        // Body-scope aliases are not pre-registered; a frame open here means the scan is inside a
+        // body, where the alias belongs to that frame exactly as a pure rename does.
+        if (!aliasScopeStack_.empty())
+        {
+            aliasScopeStack_.back().typeAliases[alias] = target;
+            return;
+        }
+        RegisterScopedName(manglingPointerAliases_, alias, target);
+    }
+
+std::string LLVMBackend::ResolveManglingPointerAlias(const std::string& name) const
+{
+        for (const auto& frame : std::ranges::reverse_view(aliasScopeStack_))
+        {
+            if (frame.functionTypeAliases.count(name) != 0) return {};
+            auto it = frame.typeAliases.find(name);
+            if (it != frame.typeAliases.end())
+                return it->second != name ? it->second : std::string{};
+        }
+        if (const std::string* target = FindFirstVisibleScoped(manglingPointerAliases_, name))
+            if (*target != name) return *target;
+        return {};
+    }
+
 void LLVMBackend::RegisterGenericBaseAlias(const std::string& alias, const std::string& target)
 {
         RegisterScopedName(genericBaseAliases_, alias, target);

@@ -5006,6 +5006,53 @@ bool testPrefixManglingAndPointerCollision()
     return result;
 }
 
+// Forward generic uses cover pointer, alias, view, and nested type arguments.
+using Q16ForwardAcceptAlias = int;
+struct Q16ForwardAcceptPointer { Q16ForwardAcceptValue<int*>* field = default; };
+struct Q16ForwardAcceptAliasUse { Q16ForwardAcceptValue<Q16ForwardAcceptAlias>* field = default; };
+struct Q16ForwardAcceptView { Q16ForwardAcceptValue<int[]>* field = default; };
+struct Q16ForwardAcceptNested { Q16ForwardAcceptOuter<Q16ForwardAcceptInner<int>>* field = default; };
+
+struct Q16ForwardAcceptValue<T> { int value = default; };
+struct Q16ForwardAcceptInner<T> { int value = default; };
+struct Q16ForwardAcceptOuter<T> { int value = default; };
+
+// A pointer-alias argument is valid once the template body has been seen.
+using Q16ForwardPointerAlias = int*;
+struct Q16ForwardAliasAfterDefinition
+{
+    Q16ForwardAcceptValue<Q16ForwardPointerAlias>* field = default;
+};
+
+// The shape this fix changed: a pointer alias reaching a still-undefined target, used as a
+// forward template argument through a pointer, plus the alias-of-alias form.
+using Q16PointerIP = Q16PointerTarget*;
+using Q16PointerPP = Q16PointerIP*;
+struct Q16PointerHolder { Q16PointerValue<Q16PointerIP>* field = default; };
+struct Q16PointerHolderChained { Q16PointerValue<Q16PointerPP>* field = default; };
+struct Q16PointerValue<T> { int value = default; };
+struct Q16PointerTarget { int x = default; };
+
+bool testQ16ForwardAcceptSet()
+{
+    bool result = true;
+    Q16ForwardAcceptPointer pointer = default;
+    Q16ForwardAcceptAliasUse alias = default;
+    Q16ForwardAcceptView view = default;
+    Q16ForwardAcceptNested nested = default;
+    Q16ForwardAliasAfterDefinition after = default;
+    result &= Test("q16_forward_pointer", pointer.field == nullptr, true);
+    result &= Test("q16_forward_alias", alias.field == nullptr, true);
+    result &= Test("q16_forward_view", view.field == nullptr, true);
+    result &= Test("q16_forward_nested", nested.field == nullptr, true);
+    result &= Test("q16_forward_alias_after_definition", after.field == nullptr, true);
+    Q16PointerHolder pointerAlias = default;
+    Q16PointerHolderChained chainedAlias = default;
+    result &= Test("q16_forward_pointer_alias", pointerAlias.field == nullptr, true);
+    result &= Test("q16_forward_pointer_alias_chained", chainedAlias.field == nullptr, true);
+    return result;
+}
+
 extern int main()
 {
     int passed = 0;
@@ -5163,6 +5210,7 @@ extern int main()
     total++; passed += testFunctionScopeAliasAsGenericArgument()    ? 1 : 0;
     total++; passed += testGenericAndDunderNameCollision()           ? 1 : 0;
     total++; passed += testPrefixManglingAndPointerCollision()       ? 1 : 0;
+    total++; passed += testQ16ForwardAcceptSet()                     ? 1 : 0;
 
     printf("%d/%d tests passed.\n", passed, total);
     return passed == total ? 0 : 1;

@@ -842,7 +842,23 @@ void ForwardRefScanner::ScanGlobalLockGroup(CFlatParser::LockFieldGroupContext* 
 
 void ForwardRefScanner::RegisterRenameAlias(CFlatParser::UsingDeclarationContext* ctx) {
         RegisterPureRenameAlias(compilerLLVM, ctx);
-    }
+        if (ctx == nullptr || ctx->Identifier() == nullptr || ctx->pointer() == nullptr
+            || ctx->arrayTypeSuffix() != nullptr || ctx->typeSpecifier() == nullptr)
+            return;
+        std::string target = compilerLLVM->ResolveQualifiedName(ctx->typeSpecifier()->getText());
+        target = compilerLLVM->ResolveManglingAlias(target);
+        // An alias-of-alias (`using PP = IP*;`) inherits the earlier alias's stars.
+        std::string chained = compilerLLVM->ResolveManglingPointerAlias(target);
+        target = chained.empty() ? compilerLLVM->ResolveTypeAlias(target) : chained;
+        int inheritedStars = PeelAliasPointerStars(target);
+        if (!IsBareTypeName(target)
+            || (!compilerLLVM->IsKnownTypeName(target)
+                && compilerLLVM->gts.scannedTypeNames.count(target) == 0))
+            return;
+        std::string alias = ctx->Identifier()->getText();
+        int stars = inheritedStars + (int)ctx->pointer()->Star().size();
+        compilerLLVM->RegisterManglingPointerAlias(alias, target + std::string(stars, '*'));
+}
 
 ForwardRefScanner::ForwardRefScanner(LLVMBackend* compiler) : compilerLLVM(compiler) {}
 

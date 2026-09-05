@@ -20,3 +20,14 @@ expect_error("unknown type 'ZzUnknown<int>'") {
 expect_error("unknown type 'ZzUnknown2<int>'") {
     int zzUnused(ZzUnknown2<int> v) { return 1; }
 }
+
+// Forward template with a pointer-ALIAS argument: the scanner's shell name and the main pass
+// must fold the alias to the same spelling, so the truthful incomplete-type message fires.
+using Q16IncompleteIP = int*;
+expect_error("type 'Q16IncompleteValue<int*>' is incomplete here, so it cannot be passed by value") {
+    int q16IncompleteParam(Q16IncompleteValue<Q16IncompleteIP> value) { return 0; }
+}
+expect_error("type 'Q16IncompleteValue<int*>' is incomplete here (its layout is not available at this point)") {
+    struct Q16IncompleteHolder { Q16IncompleteValue<Q16IncompleteIP> field = default; };
+}
+struct Q16IncompleteValue<T> { int value = default; };

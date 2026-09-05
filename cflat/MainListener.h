@@ -247,7 +247,10 @@ static bool FoldPointerAliasArg(const LLVMBackend* compiler, std::string& name, 
     if (compiler == nullptr) return false;
     if (compiler->FindFunctionTypeAlias(name) != nullptr) return false;
     std::string aliased = compiler->ResolveTypeAlias(name);
-    if (aliased == name) return false;
+    // The scanner's pre-registered pointer aliases live in a mangling-only table, so that a
+    // pointer alias stays order-DEPENDENT for ordinary declarations, exactly like a pure rename.
+    if (aliased == name) aliased = compiler->ResolveManglingPointerAlias(name);
+    if (aliased.empty() || aliased == name) return false;
     int aliasStars = PeelAliasPointerStars(aliased);
     if (aliasStars == 0 || !IsBareTypeName(aliased)) return false;
     name = compiler->ResolveManglingAlias(compiler->ResolveTypeArgBaseName(aliased));
@@ -1067,12 +1070,15 @@ static void RegisterPureRenameAlias(LLVMBackend* compiler, CFlatParser::UsingDec
 static std::string ResolveTypeArgSpelling(const LLVMBackend* compiler, const std::string& arg)
 {
     if (compiler == nullptr || arg.empty()) return arg;
-    size_t end = arg.size();
-    while (end > 0 && (arg[end - 1] == '*' || arg[end - 1] == '[' || arg[end - 1] == ']'))
-        end--;
+    bool isView = arg.ends_with("[]");
+    size_t end = isView ? arg.size() - 2 : arg.size();
+    int stars = 0;
+    while (end > 0 && arg[end - 1] == '*') { end--; stars++; }
     if (end == 0) return arg;
     std::string core = arg.substr(0, end);
     std::string resolved = compiler->ResolveTypeArgBaseName(core);
+    if (FoldPointerAliasArg(compiler, resolved, stars))
+        return resolved + std::string(stars, '*') + (isView ? "[]" : "");
     if (resolved == core) return arg;
     return resolved + arg.substr(end);
 }
@@ -2615,10 +2621,8 @@ void ScanInterfaceDefinition(CFlatParser::InterfaceDefinitionContext* ctx,
     // stamps their GuardedBy during codegen.
     void ScanGlobalLockGroup(CFlatParser::LockFieldGroupContext* ctx, const std::string& namespaceName = {});
 
-    // One `using` declaration considered as a mangling-visible pure rename (see
-    // PreRegisterRenameAliases). Registration is name-only: whether the target really names a type
-    // is the authoritative ParseUsingDeclaration's call, and an alias to a non-type still mangles
-    // to a name that fails the same way its target does.
+    // One `using` declaration considered by the pre-scan. Pure renames and simple pointer aliases
+    // are registered before generic uses; other aliases remain authoritative in the main pass.
     void RegisterRenameAlias(CFlatParser::UsingDeclarationContext* ctx);
     void ScanAggregateAliases(const std::vector<CFlatParser::AggregateMemberContext*>& members);
 
@@ -2631,14 +2635,16 @@ public:
     void ValidateIsolatedIntegralPointerCasts(antlr4::tree::ParseTree* tree);
 
     /*
-     * Record every file-scope pure-rename `using` alias BEFORE either pass walks the file, so
-     * MangleTypeArg folds the same alias set in both. It cannot be left to the walk: ScanGenericTypeUses
+     * Record every file-scope pure-rename or simple pointer `using` alias BEFORE either pass walks
+     * the file, so MangleTypeArg folds the same alias set in both. It cannot be left to the walk:
+     * ScanGenericTypeUses
      * mangles every generic use in the file BEFORE ScanExternalDeclaration reaches the first `using`,
      * while codegen sees the alias already registered - the two would build a struct shell under
      * `list$MyInt` and look it up as `list$int`.
      *
-     * Only a bare-name target is a pure rename (IsBareTypeName); `using Handle = void*;` and
-     * `using Vec3 = float[3];` keep their suffix in the alias string and stay opaque here.
+     * Array aliases and aliases whose target is not a scanned type stay opaque here. Both kinds
+     * land in mangling-only tables read by the type-argument encoders, never in typeAliases: an
+     * ordinary declaration still sees an alias only once its pass reaches the `using`.
      * Deliberately does NOT descend into `if const` arms or function bodies: the scan cannot tell
      * which arm is taken, and the two arms legitimately bind one alias to different types
      * (core/os.posix.cb binds `win_size` to i64 or i32). Those aliases stay opaque to the mangler,

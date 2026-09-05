@@ -2255,11 +2255,11 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
             // pre-declared as an opaque struct shell (it is a fat-pointer interface).
             if (auto* tu = computeUnit->translationUnit())
             {
-                // Pure-rename `using` aliases first: MangleTypeArg folds them, and both passes
-                // must see the same set no matter where the `using` sits in the file.
-                scanner.PreRegisterRenameAliases(tu);
                 scanner.SeedConstIntGlobals(tu);
                 scanner.ScanGenericInterfaceTemplateNames(tu);
+                // Type aliases first: MangleTypeArg folds them, and both passes must see the same
+                // set no matter where the `using` sits in the file.
+                scanner.PreRegisterRenameAliases(tu);
                 for (auto* decl : tu->externalDeclaration())
                     scanner.ScanGenericTypeUses(decl);
                 // Second pass: register non-generic struct shells and function signatures.
@@ -3350,10 +3350,10 @@ bool LLVMBackend::CompileImportedFile(const std::string& importingFilePath, cons
         // Generic interface templates first (see the main-file scan for why).
         if (auto* tu = computeUnit->translationUnit())
         {
-            // Pure-rename `using` aliases first (see the main-file scan for why).
-            scanner.PreRegisterRenameAliases(tu);
             scanner.SeedConstIntGlobals(tu);
             scanner.ScanGenericInterfaceTemplateNames(tu);
+            // Type aliases first (see the main-file scan for why).
+            scanner.PreRegisterRenameAliases(tu);
             for (auto* decl : tu->externalDeclaration())
                 scanner.ScanGenericTypeUses(decl);
             for (auto* decl : tu->externalDeclaration())
@@ -4241,11 +4241,11 @@ bool LLVMBackend::Analyze(const std::string& filePath,
             // pre-declared as an opaque struct shell (it is a fat-pointer interface).
             if (auto* tu = computeUnit->translationUnit())
             {
-                // Pure-rename `using` aliases first: MangleTypeArg folds them, and both passes
-                // must see the same set no matter where the `using` sits in the file.
-                scanner.PreRegisterRenameAliases(tu);
                 scanner.SeedConstIntGlobals(tu);
                 scanner.ScanGenericInterfaceTemplateNames(tu);
+                // Type aliases first: MangleTypeArg folds them, and both passes must see the same
+                // set no matter where the `using` sits in the file.
+                scanner.PreRegisterRenameAliases(tu);
                 for (auto* decl : tu->externalDeclaration())
                     scanner.ScanGenericTypeUses(decl);
                 for (auto* decl : tu->externalDeclaration())
@@ -4457,6 +4457,7 @@ void LLVMBackend::ResetForReanalysis()
     aliasScopeStack_.clear();
     aggregateAliasScopes_.clear();
     manglingAliases_.clear();
+    manglingPointerAliases_.clear();
     genericBaseAliases_.clear();
     functionTypeAliases.clear();
     interfaceTable.clear();
@@ -6758,6 +6759,13 @@ bool LLVMBackend::SaveCoreBitcode(const std::string& cacheDir, const std::string
         root["mangling_aliases"] = std::move(obj);
     }
 
+    // manglingPointerAliases_ - simple pointer `using` aliases the mangler folds (same rationale).
+    {
+        llvm::json::Object obj;
+        for (auto& [k, v] : manglingPointerAliases_) obj[k] = v;
+        root["mangling_pointer_aliases"] = std::move(obj);
+    }
+
     // enumBackingTypes
     {
         llvm::json::Object obj;
@@ -7235,6 +7243,7 @@ bool LLVMBackend::LoadCoreBitcodeIfFresh(const std::string& cacheDir, const std:
     namespaceTable.clear();
     typeAliases.clear();
     manglingAliases_.clear();
+    manglingPointerAliases_.clear();
     enumBackingTypes.clear();
     enumDeclSites_.clear();
     // strConcatRegistered / stringDtorRegistered: will be set below after deserialization
@@ -7274,6 +7283,11 @@ bool LLVMBackend::LoadCoreBitcodeIfFresh(const std::string& cacheDir, const std:
     if (auto* obj = root->getObject("mangling_aliases"))
         for (auto& kv : *obj)
             if (auto v = kv.second.getAsString()) manglingAliases_[kv.first.str()] = v->str();
+
+    // manglingPointerAliases_ - pointer aliases the mangler folds (see the write side).
+    if (auto* obj = root->getObject("mangling_pointer_aliases"))
+        for (auto& kv : *obj)
+            if (auto v = kv.second.getAsString()) manglingPointerAliases_[kv.first.str()] = v->str();
 
     // enumBackingTypes
     if (auto* obj = root->getObject("enum_backing_types"))

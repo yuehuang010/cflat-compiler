@@ -1357,7 +1357,20 @@ llvm::StructType* LLVMBackend::CreateStructType(std::string name, std::vector<LL
                 // monomorphization, BEFORE the drain that instantiates this very interface.
                 if (!typeValue.Pointer)
                     RecordInterfaceMaterialization(typeValue.TypeName, "the type of a struct field");
-                types.emplace_back(GetType(typeValue));
+                auto* fieldType = GetType(typeValue);
+                std::string genericBase = std::string(MangledBase(typeValue.TypeName));
+                bool genericShell = genericBase != "unique"
+                    && gts.coreGenericTemplates.count(genericBase) == 0
+                    && IsGenericTemplateKey(genericBase);
+                if (!typeValue.Pointer && fieldType != nullptr && fieldType->isStructTy()
+                    && !fieldType->isSized() && genericShell && !gts.activeInstantiationOrigin.valid)
+                {
+                    LogError(std::format(
+                        "type '{}' is incomplete here (its layout is not available at this point); "
+                        "it can only be used through a pointer", SpellType(*this, typeValue)));
+                    fieldType = builder->getInt8Ty();
+                }
+                types.emplace_back(fieldType);
             }
 
             // alignas(N) on the struct: append a trailing [padBytes x i8] member
