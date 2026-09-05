@@ -234,8 +234,11 @@ static std::string TupleEntryArgName(const LLVMBackend* compiler, CFlatParser::T
         ? compiler->ResolveTypeArgBaseName(entry->typeSpecifier()->getText())
         : entry->typeSpecifier()->getText();
     // Stars are counted, not flagged: a `(C**, int)` element must not mangle as `(C*, int)`.
-    if (entry->pointer() != nullptr) argName += std::string(PointerDepthOf(entry->pointer()), '*');
-    else if (IsArrayViewArg(entry)) argName += "[]";
+    // On a view they decorate the ELEMENT, so `(int*[], int)` keeps its star: "int*[]".
+    if (IsArrayViewArg(entry))
+        argName += std::string(PointerDepthOf(entry->pointer()), '*') + "[]";
+    else if (entry->pointer() != nullptr)
+        argName += std::string(PointerDepthOf(entry->pointer()), '*');
     return argName;
 }
 
@@ -1116,28 +1119,40 @@ static std::string BuildEncodedClosureName(const LLVMBackend* compiler, bool isT
 // `pointerDepth` is ACCUMULATED (one per star), not a flag: `C**` must stay distinguishable from
 // `C*` all the way to MangleTypeArg, which is what makes Box<C**> its own instantiation.
 static void PeelTypeArgSuffix(std::string& name, int& pointerDepth, bool& arrayView,
-    bool* aliasOut = nullptr)
+    bool* aliasOut = nullptr, int* elemPointerDepth = nullptr)
 {
     // The `alias` qualifier is a leading prefix; peel it before the suffix loop so the underlying
     // type remains available to the resolver. It is re-added by callers that mangle alias args.
     bool hadAlias = StripAliasQualifier(name);
     if (aliasOut != nullptr) *aliasOut = hadAlias;
+    int stars = 0;
+    bool view = false;
     for (;;)
     {
         if (name.size() >= 2 && name.compare(name.size() - 2, 2, "[]") == 0)
         {
-            arrayView = true;
-            if (pointerDepth < 1) pointerDepth = 1;
+            view = true;
             name.erase(name.size() - 2);
         }
         else if (!name.empty() && name.back() == '*')
         {
-            pointerDepth++;
+            stars++;
             name.pop_back();
         }
         else
             break;
     }
+    // "[]*" is rejected upstream, so every star sits LEFT of the brackets and decorates the
+    // ELEMENT: `int*[]` is a view of `int*`, not a deeper pointer.
+    // A view written by the CALLER (`T[]` with T bound to "int*") owns the peeled stars too.
+    if (view || arrayView)
+    {
+        arrayView = true;
+        if (pointerDepth < 1) pointerDepth = 1;
+        if (elemPointerDepth != nullptr) *elemPointerDepth += stars;
+    }
+    else
+        pointerDepth += stars;
 }
 
 // Peel trailing '*' characters off a resolved type-alias string (e.g. "void*" -> "void"),

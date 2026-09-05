@@ -1094,15 +1094,17 @@ std::string ForwardRefScanner::ResolveForwardTypeArg(CFlatParser::TypeParameterE
         std::string uniqueArgBase = resolved;
         int uniqueArgStars = 0;
         bool uniqueArgView = false;
-        if (entry->pointer() != nullptr)
+        // A view carries its ELEMENT's stars, exactly as the main pass encodes them: the shell
+        // for `Box<int*[]>` must not be the `Box<int[]>` (or `Box<int*>`) one.
+        if (IsArrayViewArg(entry))
+        {
+            uniqueArgView = true;
+            resolved += std::string(PointerDepthOf(entry->pointer()), '*') + "[]";
+        }
+        else if (entry->pointer() != nullptr)
         {
             uniqueArgStars = PointerDepthOf(entry->pointer());
             resolved += std::string(uniqueArgStars, '*');
-        }
-        else if (IsArrayViewArg(entry))
-        {
-            uniqueArgView = true;
-            resolved += "[]";
         }
         // Carry the `alias` qualifier into the mangled/instantiation string. Valid `unique`
         // arguments become a real unique<X> instantiation; reject the remaining forms in the

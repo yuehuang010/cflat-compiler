@@ -6745,7 +6745,8 @@ LLVMBackend::NamedVariable MainListener::ParseTupleExpression(CFlatParser::Tuple
             // tuple mangles to the same name as its declared `(T[], ...)` / `tuple<T*, ...>` type:
             // "[]" for a noalias array-view, "*" for a plain pointer.
             if (nv.TypeAndValue.IsArrayView && !typeName.empty() && typeName.back() != ']')
-                typeName += "[]";
+                // A view OF pointers carries its element's star: `int*[]`, not `int[]`.
+                typeName += std::string(nv.TypeAndValue.ElemPointer ? 1 : 0, '*') + "[]";
             else if (nv.TypeAndValue.Pointer && !nv.TypeAndValue.IsArrayView
                      && !typeName.empty() && typeName.back() != '*')
                 typeName += "*";

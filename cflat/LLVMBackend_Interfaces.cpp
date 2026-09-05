@@ -889,8 +889,9 @@ std::string LLVMBackend::DescribePointerShapedInterfaceSource(const TypeAndValue
         base.IsArrayView = false;
         std::string elem = SpellType(*this, base);
         if (src.IsSimd) elem = std::format("simd<{},{}>", elem, src.SimdLanes);
+        // A view of pointers is a view FIRST: `IShape*[]`, not `IShape**`.
+        if (src.IsArrayView) return elem + std::string(src.ElemPointer ? 1 : 0, '*') + "[]";
         if (src.ElemPointer) return elem + "**";
-        if (src.IsArrayView) return elem + "[]";
         if (src.ConstArraySize != 0) return std::format("{}[{}]", elem, src.ConstArraySize);
         if (src.IsSimd) return elem + " simd vector";
         return "";

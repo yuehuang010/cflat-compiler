@@ -4606,6 +4606,13 @@ bool testGnPointerDepthSubstitution()
 // star consumes the view's thin-pointer repr, so indexing strides by the ELEMENT (before:
 // the field stored a ptr but indexed with pointer stride and read back garbage).
 struct GvwBox<T> { T* p = default; };
+struct GvpView<T> { T v = default; };
+struct GvpOuter<U> { U u = default; };
+int gvpSecond<T>(T v) { return *v[1]; }
+// Reached through a SUBSTITUTION the element star must survive too: `T*[]` with T bound
+// to int, and `T[]` with T bound to int*, are both the `int*[]` instantiation.
+int gvpWrittenStar<T>(T*[] q) { GvwBox<T*[]> b = default; b.p = q; return *b.p[1]; }
+int gvpSubstStar<T>(T[] q) { GvwBox<T[]> b = default; b.p = q; return *b.p[1]; }
 struct GvwDeep<T> { T** pp = default; };
 struct GvwFoo { int a = default; };
 int gvwSum<T>(T* q, int n) { int s = 0; for (int i = 0; i < n; i++) s += q[i]; return s; }
@@ -4640,6 +4647,90 @@ bool testGnViewArgIntoPointerDeclarator()
     GvwDeep<int[]> deep = default;
     deep.pp = &head;
     result &= Test("gvw_ptrptr_deref", (*deep.pp)[2], 7);
+
+    return result;
+}
+
+// A view OF pointers ('int*[]') is its own type ARGUMENT: the element star must survive into the
+// instantiation key, the substituted 'T' view and the decayed 'T*' pointer. Before: it was
+// dropped, so P<int*[]> shared the P<int[]> instantiation and '*h.p[1]' emitted an invalid load.
+struct GvpFoo { int a = default; };
+
+bool testGnViewOfPointersArg()
+{
+    bool result = true;
+
+    int one = 1; int two = 2; int three = 3;
+    int*[3] cells; cells[0] = &one; cells[1] = &two; cells[2] = &three;
+    int*[] pview = cells;
+
+    int[3] plain; plain[0] = 10; plain[1] = 11; plain[2] = 12;
+    int[] vview = plain;
+
+    // 'T*' over a view of pointers decays to the ELEMENT pointer 'int**'.
+    GvwBox<int*[]> pbox = default;
+    pbox.p = pview;
+    result &= Test("gvp_ptr_field_deref", *pbox.p[2], 3);
+
+    // The substituted view field keeps the element star, so indexing yields an 'int*'.
+    GvpView<int*[]> pview2 = default;
+    pview2.v = pview;
+    result &= Test("gvp_view_field_deref", *pview2.v[1], 2);
+
+    // All four neighbours coexist with distinct keys and unchanged values.
+    GvwBox<int[]> vbox = default;
+    vbox.p = vview;
+    int* head = &one; int** phead = &head;
+    GvwBox<int*> sbox = default; sbox.p = phead;        // 'T*' over 'int*' is an 'int**'
+    GvpView<int**> dbox = default; dbox.v = phead;
+    result &= Test("gvp_coexist_view_value", vbox.p[1], 11);
+    result &= Test("gvp_coexist_ptr_value", *sbox.p[0], 1);
+    result &= Test("gvp_coexist_ptrptr_value", **dbox.v, 1);
+    result &= Test("gvp_typeof_view_of_ptr", typeof(pbox), "GvwBox<int*[]>");
+    result &= Test("gvp_typeof_view_of_value", typeof(vbox), "GvwBox<int[]>");
+    result &= Test("gvp_typeof_ptr", typeof(sbox), "GvwBox<int*>");
+
+    // A struct element keeps its own stride through the pointer element.
+    GvpFoo f1 = default; f1.a = 8; GvpFoo f2 = default; f2.a = 9;
+    GvpFoo*[2] foos; foos[0] = &f1; foos[1] = &f2;
+    GvpFoo*[] fview = foos;
+    GvwBox<GvpFoo*[]> fbox = default;
+    fbox.p = fview;
+    result &= Test("gvp_struct_elem_deref", fbox.p[1].a, 9);
+    result &= Test("gvp_typeof_struct_elem", typeof(fbox), "GvwBox<GvpFoo*[]>");
+
+    // A generic FUNCTION over the same argument, and a nested instantiation.
+    result &= Test("gvp_generic_fn", gvpSecond<int*[]>(pview), 2);
+    result &= Test("gvp_written_star_subst", gvpWrittenStar<int>(pview), 2);
+    result &= Test("gvp_view_subst_star", gvpSubstStar<int*>(pview), 2);
+    GvpOuter<GvpView<int*[]>> nested = default;
+    nested.u.v = pview;
+    result &= Test("gvp_nested_deref", *nested.u.v[2], 3);
+    result &= Test("gvp_nested_typeof", typeof(nested), "GvpOuter<GvpView<int*[]>>");
+
+    // A raw (non-generic) view of pointers spells its element star as well.
+    result &= Test("gvp_raw_view_typeof", typeof(pview), "int*[]");
+
+    return result;
+}
+
+// The tuple sugar encodes an element the same way a generic argument does, so `(int*[], int[])`
+// must key apart from `(int[], int[])`. Own function: a tuple LITERAL and a generic
+// instantiation in one body hit an unrelated pre-existing registration order bug.
+bool testGnViewOfPointersTupleArg()
+{
+    bool result = true;
+
+    int one = 1; int two = 2;
+    int*[2] cells; cells[0] = &one; cells[1] = &two;
+    int*[] pview = cells;
+    int[2] plain; plain[0] = 10; plain[1] = 11;
+    int[] vview = plain;
+
+    (int*[], int[]) pair = (pview, vview);
+    result &= Test("gvp_tuple_typeof", typeof(pair), "tuple<int*[], int[]>");
+    result &= Test("gvp_tuple_ptr_elem", *pair.item_0[1], 2);
+    result &= Test("gvp_tuple_value_elem", pair.item_1[1], 11);
 
     return result;
 }
@@ -4936,6 +5027,8 @@ extern int main()
     total++; passed += testGnUnresolvedGenericShellGate()          ? 1 : 0;
     total++; passed += testGnPointerDepthSubstitution()            ? 1 : 0;
     total++; passed += testGnViewArgIntoPointerDeclarator()        ? 1 : 0;
+    total++; passed += testGnViewOfPointersArg()                   ? 1 : 0;
+    total++; passed += testGnViewOfPointersTupleArg()              ? 1 : 0;
     total++; passed += testNamespaceTupleAndGenericAlias()           ? 1 : 0;
     total++; passed += testGenericFunctions()                      ? 1 : 0;
     total++; passed += testGenericSizeof()                          ? 1 : 0;

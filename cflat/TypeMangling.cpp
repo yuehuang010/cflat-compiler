@@ -176,8 +176,13 @@ static bool ParseTypePrefix(std::string_view text, size_t& position, TypePrefix&
             ? text.substr(position) : text.substr(position, separator - position);
         if (token == ".p")
             ++prefix.pointerDepth;
+        // A view of pointers spells the view FIRST (".v$.p$int" = "int*[]"), so the stars read as
+        // the ELEMENT's. The reverse order is not produced by the encoder and never parses.
         else if (token == ".v")
+        {
+            if (prefix.view || prefix.pointerDepth != 0) return false;
             prefix.view = true;
+        }
         else if (token == ".a")
             prefix.alias = true;
         else
@@ -191,12 +196,14 @@ static bool ParseTypePrefix(std::string_view text, size_t& position, TypePrefix&
 static void ApplyTypePrefix(TypeSpelling& spelling, const TypePrefix& prefix)
 {
     spelling.alias = spelling.alias || prefix.alias;
+    // With `view` set, pointerDepth counts the ELEMENT's stars ("int*[]"); without it, the
+    // type's own stars. The prefix parser rejects any other ordering, so this is a bijection.
     if (prefix.view)
     {
         spelling.view = true;
-        spelling.pointerDepth = 0;
+        spelling.pointerDepth = prefix.pointerDepth;
     }
-    if (prefix.pointerDepth != 0)
+    else if (prefix.pointerDepth != 0)
     {
         spelling.view = false;
         spelling.pointerDepth += prefix.pointerDepth;
@@ -416,19 +423,26 @@ std::string MangleTypeArgument(const LLVMBackend& compiler, std::string_view typ
     size_t baseEnd = start;
     while (baseEnd < typeName.size() && typeName[baseEnd] != '*' && typeName[baseEnd] != '[')
         baseEnd++;
+    // In "int*[]" the stars decorate the ELEMENT, so the view code is emitted FIRST and the
+    // stars follow it - that is the order the prefix parser reads back.
+    int stars = 0;
+    bool view = false;
     for (size_t i = baseEnd; i < typeName.size(); i++)
     {
         if (typeName[i] == '*')
-            decorations += ".p$";
+            stars++;
         else if (typeName[i] == '[' && i + 1 < typeName.size() && typeName[i + 1] == ']')
         {
-            decorations += ".v$";
+            view = true;
             i++;
         }
         else
             decorations += typeName[i];
     }
-    return result + decorations + CanonicalTypeBase(compiler, typeName.substr(start, baseEnd - start));
+    std::string codes = view ? ".v$" : "";
+    for (int i = 0; i < stars; i++) codes += ".p$";
+    return result + codes + decorations
+         + CanonicalTypeBase(compiler, typeName.substr(start, baseEnd - start));
 }
 
 std::string MangleFunctionComponent(const LLVMBackend& compiler, std::string_view name,
@@ -448,7 +462,10 @@ std::string MangleFunctionType(const LLVMBackend& compiler,
 {
     std::string result;
     if (type.IsArrayView)
+    {
         result = ".v$";
+        if (type.ElemPointer) result += ".p$";  // a view OF pointers keeps the element's star
+    }
     else if (type.Pointer)
         for (int i = 0; i < std::max(type.ValuePointerDepth(), 1); i++) result += ".p$";
     result += type.IsThinFnPtr() ? "cfn" : "fatfn";
@@ -489,10 +506,8 @@ std::string PrintTypeSpelling(const LLVMBackend& compiler, const TypeSpelling& s
         }
         else
             result += ")>";
-        if (spelling.view)
-            result += "[]";
-        else
-            result += std::string(std::max(spelling.pointerDepth, 0), '*');
+        result += std::string(std::max(spelling.pointerDepth, 0), '*');
+        if (spelling.view) result += "[]";
         return result;
     }
     if (spelling.encodedName == "__c_fn_ptr") return "<c_fn_ptr>";
@@ -511,10 +526,9 @@ std::string PrintTypeSpelling(const LLVMBackend& compiler, const TypeSpelling& s
         }
         result += ">";
     }
-    if (spelling.view)
-        result += "[]";
-    else
-        result += std::string(std::max(spelling.pointerDepth, 0), '*');
+    // Stars bind to the ELEMENT of a view ("int*[]"), so they print before the brackets.
+    result += std::string(std::max(spelling.pointerDepth, 0), '*');
+    if (spelling.view) result += "[]";
     return result;
 }
 
@@ -523,10 +537,9 @@ std::string RemangleTypeSpelling(const LLVMBackend& compiler, const TypeSpelling
     if (!spelling.encodedName.empty()) return spelling.encodedName;
     std::string result;
     if (spelling.alias) result += ".a$";
-    if (spelling.view)
-        result += ".v$";
-    else
-        for (int i = 0; i < std::max(spelling.pointerDepth, 0); i++) result += ".p$";
+    // The view code comes first, then the ELEMENT's stars: "int*[]" -> ".v$.p$int".
+    if (spelling.view) result += ".v$";
+    for (int i = 0; i < std::max(spelling.pointerDepth, 0); i++) result += ".p$";
     if (spelling.value)
         return IsDecimalInteger(spelling.base) && spelling.base.front() == '-'
             ? result + ".n" + spelling.base.substr(1) : result + "." + spelling.base;
@@ -658,8 +671,9 @@ std::string MangleType(const LLVMBackend& compiler,
     spelling.alias = spelling.alias || type.IsAlias;
     if (type.IsArrayView)
     {
+        // On a view, pointerDepth is the ELEMENT's depth: `int*[]` keys apart from `int[]`.
         spelling.view = true;
-        spelling.pointerDepth = 0;
+        spelling.pointerDepth = type.ElemPointer ? 1 : 0;
     }
     else if (type.Pointer)
         spelling.pointerDepth = type.ValuePointerDepth();
@@ -710,8 +724,9 @@ std::string SpellType(const LLVMBackend& compiler,
         return type.TypeName;
     if (type.IsArrayView)
     {
+        // Element stars print inside the brackets-free part: `int*[]`, not `int[]`.
         spelling.view = true;
-        spelling.pointerDepth = 0;
+        spelling.pointerDepth = type.ElemPointer ? 1 : 0;
     }
     else if (type.Pointer)
         spelling.pointerDepth = type.ValuePointerDepth();

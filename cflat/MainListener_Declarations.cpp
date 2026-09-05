@@ -93,6 +93,9 @@ std::string MainListener::ResolveTypeArgEntry(CFlatParser::TypeParameterEntryCon
         // `T[]` as a generic/tuple type arg is a noalias array-view member; `[N]` and `[]*`
         // are not valid in a type-argument position (reject with one clear message).
         bool hasArrayView = IsArrayViewArg(entry);
+        // On a view the WRITTEN stars decorate the element (`int*[]` is a view of `int*`); a
+        // substituted arg supplies its own element depth below. -1 = no substitution seen.
+        int substElemPtrDepth = -1;
         if (IsBadArrayArg(entry))
             LogErrorContext(entry, "'T[]' is the only bracketed form valid as a generic or tuple "
                 "type argument; a sized 'T[N]', an unsized multi-dimensional 'T[][]' and a "
@@ -154,7 +157,11 @@ std::string MainListener::ResolveTypeArgEntry(CFlatParser::TypeParameterEntryCon
                 // or an "alias " prefix; peel it onto flags so it re-encodes once below.
                 bool substAlias = false;
                 resolved = substIt->second;
-                PeelTypeArgSuffix(resolved, pointerDepth, hasArrayView, &substAlias);
+                // Stars WRITTEN on a view arg (`T*[]`) are element stars already; the peel adds
+                // any the substituted spelling itself carries (`T[]` with T bound to "int*").
+                substElemPtrDepth = hasArrayView ? pointerDepth : 0;
+                PeelTypeArgSuffix(resolved, pointerDepth, hasArrayView, &substAlias,
+                                  &substElemPtrDepth);
                 hasPointer = pointerDepth > 0;
                 isAlias = isAlias || substAlias;
             }
@@ -211,9 +218,11 @@ std::string MainListener::ResolveTypeArgEntry(CFlatParser::TypeParameterEntryCon
 
         // The bare base (before the pointer/view suffix) drives the D1 type check below.
         std::string uniqueBase = resolved;
-        // Array-view wins the suffix encoding ("[]"); pointer and array-view never combine here.
+        // A view carries its ELEMENT's stars ("int*[]"), so a view of pointers keys apart from
+        // a view of values; the view's own thin-pointer repr is never a written star.
         if (hasArrayView)
-            resolved += "[]";
+            resolved += std::string(
+                substElemPtrDepth >= 0 ? substElemPtrDepth : pointerDepth, '*') + "[]";
         else if (hasPointer)
         {
             if (Compiler(entry)->IsInterfaceType(resolved))
@@ -487,6 +496,7 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                 // Star count contributed by an active type SUBSTITUTION (T bound to "C**" -> 2).
                 // Real depth, not a flag, so the declarator combination below can prove a total.
                 int substArgPtrDepth = 0;
+                int substArgElemPtrDepth = 0;  // stars on a view ARG's element ("int*[]")
                 // T bound to a '...[]' array-view ARGUMENT (P<int[]> -> T = "int[]").
                 bool substArgIsArrayView = false;
                 // Set when the spec names a generic interface instantiation, whose interfaceTable
@@ -553,19 +563,23 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                             std::string argName = entry->typeSpecifier()->getText();
                             int argDepth = PointerDepthOf(entry->pointer());
                             bool argView = IsArrayViewArg(entry);
+                            // On a view the written stars decorate the ELEMENT: `(int*[], int)`.
+                            int argElemDepth = argView ? argDepth : 0;
+                            if (argView) argDepth = 0;
                             // Apply active type substitutions (e.g. T -> int inside generic body); a
                             // substituted arg may itself carry "*"/"[]" (e.g. T bound to "int[]").
                             auto substIt = activeTypeSubstitutions.find(argName);
                             if (substIt != activeTypeSubstitutions.end())
                             {
                                 argName = substIt->second;
-                                PeelTypeArgSuffix(argName, argDepth, argView);
+                                PeelTypeArgSuffix(argName, argDepth, argView, nullptr,
+                                                  &argElemDepth);
                             }
                             else
                                 // Same namespace walk as a generic type ARGUMENT (a substituted arg
                                 // is already resolved in the caller's scope - never re-resolve it).
                                 argName = Compiler(entry)->ResolveTypeArgBaseName(argName);
-                            if (argView) argName += "[]";
+                            if (argView) argName += std::string(argElemDepth, '*') + "[]";
                             else if (argDepth > 0) argName += std::string(argDepth, '*');
                             typeArgs.push_back(argName);
                         }
@@ -823,7 +837,8 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                         // the alias marker here; a desugared unique type is already a core value.
                         typeName = substIt->second;
                         bool substAliasArg = false;
-                        PeelTypeArgSuffix(typeName, substPointerDepth, substArrayView, &substAliasArg);
+                        PeelTypeArgSuffix(typeName, substPointerDepth, substArrayView,
+                                          &substAliasArg, &substArgElemPtrDepth);
                         // An `alias` element (list<alias X*>) is a pure borrow whose owner lives
                         // elsewhere, so ANY value of that element type is a borrow - not only the
                         // `alias T get` return but also `take()`'s plain-T return (take removes the
@@ -872,6 +887,9 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                         // pointer repr carrying the contract), exactly like a written `T[]`.
                         declType.IsArrayView = true;
                         declType.Pointer = true;
+                        // T bound to `int*[]` is a view OF pointers - same shape a written
+                        // `int*[]` declarator produces (Pointer + ElemPointer + IsArrayView).
+                        if (substArgElemPtrDepth > 0) declType.ElemPointer = true;
                         // The view's own pointer repr is not a '*' the depth arithmetic may count.
                         substPointerDepth = 0;
                     }
@@ -884,8 +902,11 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                 if (substArgIsArrayView && hasExplicitPointer)
                 {
                     declType.IsArrayView = false;
-                    declType.Pointer = false;      // the star arithmetic below re-adds the levels
+                    // A view OF pointers keeps its element depth, so `T*` over `int*[]` is an
+                    // `int**`; the star arithmetic below re-adds the declarator's own levels.
+                    declType.Pointer = substArgElemPtrDepth > 0;
                     declType.ElemPointer = false;
+                    substArgPtrDepth = substArgElemPtrDepth;
                 }
                 if (aliasPtrDepth > 0)
                 {
