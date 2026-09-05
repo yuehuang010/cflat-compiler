@@ -29,3 +29,63 @@ expect_error("cannot pass a 'BvvImpl' value as array-view parameter") {
     class BvvHostImpl : IBvvHost { int bvvHost(IBvv[] v) { return v == nullptr ? 0 : v[0].bvv(); } };
     int bvvCall() { BvvHostImpl h; BvvImpl b; b.k = 1; IBvvHost hi = h; return hi.bvvHost(b); }
 }
+
+// FIELD door of the same value axis. Brace-init is a separate lowering from the call and the '='
+// store, so the legs above say nothing about it: before the fix `{ v = classValue }` boxed a fat
+// {vtable,data} into the thin 'IA[]' slot, passed '--check' clean and SIGSEGVd at v[0].
+expect_error("cannot brace-initialize array-view field 'BviDest.v' ('IBvi[]') from 'BviImpl'") {
+    interface IBvi { int bvi(); };
+    class BviImpl : IBvi { int k = default; int bvi() { return k; } };
+    struct BviDest { IBvi[] v = default; };
+    int bviCall() { BviImpl b; b.k = 1; BviDest d = { v = b }; return d.v[0].bvi(); }
+}
+
+// Fat sibling: an 'IBvg' value is still ONE element, not a view of them.
+expect_error("cannot brace-initialize array-view field 'BvgDest.v' ('IBvg[]') from 'IBvg'") {
+    interface IBvg { int bvg(); };
+    class BvgImpl : IBvg { int k = default; int bvg() { return k; } };
+    struct BvgDest { IBvg[] v = default; };
+    int bvgCall() { BvgImpl b; b.k = 1; IBvg i = b; BvgDest d = { v = i }; return d.v[0].bvg(); }
+}
+
+// Pointer row, which the '=' twin already rejects ("cannot bind a raw pointer 'T*' to an
+// array-view 'T[]'"): a 'BvpImpl*' points at ONE object, so brace-init must not bind it either.
+expect_error("cannot brace-initialize array-view field 'BvpDest.v' ('IBvp[]') from 'BvpImpl*'") {
+    interface IBvp { int bvp(); };
+    class BvpImpl : IBvp { int k = default; int bvp() { return k; } };
+    struct BvpDest { IBvp[] v = default; };
+    int bvpCall() { BvpImpl* p = new BvpImpl(); p.k = 1; BvpDest d = { v = p }; return d.v[0].bvp(); }
+}
+
+// Bare-brace spelling of the declarator, and a GENERIC 'T[]' field - both reach the same gate.
+expect_error("cannot brace-initialize array-view field 'BvbBox<IBvb>.w' ('IBvb[]') from 'BvbImpl'") {
+    interface IBvb { int bvb(); };
+    class BvbImpl : IBvb { int k = default; int bvb() { return k; } };
+    struct BvbBox<T> { T[] w = default; };
+    int bvbCall() { BvbImpl b; b.k = 1; BvbBox<IBvb> d { w = b }; return d.w[0].bvb(); }
+}
+
+// ELEMENT axis of the same field door. A fixed array, a heap array and a view OF THE CONCRETE
+// IMPLEMENTOR index thin objects, so none of them is an 'IBve[]'. Master rejects these with the
+// identical text from inside BoxConcreteIntoInterface; excluding views from the brace-init boxing
+// arm took that guard away, so these three legs are the tripwire for that hole.
+expect_error("cannot convert 'BveImpl[2]' to interface 'IBve'") {
+    interface IBve { int bve(); };
+    class BveImpl : IBve { int k = default; int bve() { return k; } };
+    struct BveDest { IBve[] v = default; };
+    int bveCall() { BveImpl[2] a; a[0].k = 1; BveDest d = { v = a }; return d.v[0].bve(); }
+}
+
+expect_error("cannot convert 'BvnImpl[]' to interface 'IBvn'") {
+    interface IBvn { int bvn(); };
+    class BvnImpl : IBvn { int k = default; int bvn() { return k; } };
+    struct BvnDest { IBvn[] v = default; };
+    int bvnCall() { BvnDest d = { v = new BvnImpl[2] }; return d.v[0].bvn(); }
+}
+
+expect_error("cannot convert 'BvwImpl[]' to interface 'IBvw'") {
+    interface IBvw { int bvw(); };
+    class BvwImpl : IBvw { int k = default; int bvw() { return k; } };
+    struct BvwDest { IBvw[] v = default; };
+    int bvwCall() { BvwImpl[2] a; a[0].k = 1; BvwImpl[] w = a; BvwDest d = { v = w }; return d.v[0].bvw(); }
+}

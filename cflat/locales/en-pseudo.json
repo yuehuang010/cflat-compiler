@@ -182,6 +182,14 @@
       "function<>",
       "(function<...>)value"
     ],
+    "cannotbraceinitializ...lonenotasingleobjectcd9b64c5f6665b5e": [
+      "BviDest",
+      "v",
+      "IBvi[]",
+      "BviImpl",
+      "{vtable,data}",
+      "IBvi"
+    ],
     "cannotconvertinterfa...ngarg2implementsarg3275f532c2c4f1baa": [
       "IUniqueThing",
       "IUnrelatedThing",
@@ -1536,6 +1544,7 @@
     "cannotarg0onlyanamed...thanexplicitcastarg28d664510c1990514": "cannot {0}: only a named function, a '{1}' value or a lambda converts to a closure - a data pointer would be called as code. If the value really holds a code address, assert it with an explicit cast: '{2}'.",
     "cannotassignarg0toar...thanexplicitcastarg4fac024c4cf80f689": "cannot assign {0} to '{1}' destination {2}: only a named function, a '{3}' value or a non-capturing lambda converts to a function pointer - a data pointer would be called as code. If the value really holds a code address, assert it with an explicit cast: '{4}'.",
     "cannotassignarg0tocl...thanexplicitcastarg3b001825100666242": "cannot assign {0} to closure destination {1}: only a named function, a '{2}' value or a lambda converts to a closure - a data pointer would be called as code. If the value really holds a code address, assert it with an explicit cast: '{3}'.",
+    "cannotbraceinitializ...lonenotasingleobjectcd9b64c5f6665b5e": "cannot brace-initialize array-view field '{0}.{1}' ('{2}') from '{3}' - a view of an interface indexes fat '{4}' elements, so its source must be an array view of '{5}' (or a null one), not a single object",
     "cannotconvertinterfa...ngarg2implementsarg3275f532c2c4f1baa": "cannot convert interface '{0}' to interface '{1}' - no class implementing '{2}' implements '{3}'",
     "cannotconverttointer...0noclassimplementsit1e8c0aedb2889c6b": "cannot convert to interface '{0}' - no class implements it",
     "cannotconverttointer...g2declaredinsidearg380f17f1b4261ff04": "cannot convert to interface '{0}' - all {1} classes implementing it are declared inside 'if const' arms that are not taken in this build (for example '{2}', declared inside {3})",

@@ -3310,6 +3310,53 @@ int runBareNullViewIfaceStore(int choose)
     return legFieldNull + legFieldJoin + legFieldLive + legAssignNull + legReturn + legInit;
 }
 
+struct ViewNullArmNest { ViewNullArmDest inner = default; };
+struct ViewNullArmBox<T> { T[] w = default; };
+
+/*
+ * BRACE-INIT door of the same interface-view field. It is a separate lowering from the '=' store
+ * above (EmitOneFieldInit), and before the fix its bare `IsInterface` gate boxed a single value
+ * into the thin `IA[]` slot - `{ v = classValue }` passed `--check` and SIGSEGVd. These are the
+ * ACCEPT-SET legs: the sources that are real element sources or a null view must still bind, at
+ * every brace spelling (`= {}` and bare `{}`), nested, in a fixed array of structs, and in a
+ * generic `T[]` field. Each door reads a DISTINCT sentinel through the null-tolerant helper.
+ */
+int runBraceInitViewIfaceField(int choose)
+{
+    ViewNullArmImpl e0; e0.k = 9;
+    IViewNullArm[1] store; store[0] = e0;
+    IViewNullArm[] live = store;
+
+    // Null and default sources: no element type, so they bind as a NULL view (helper's miss value).
+    ViewNullArmDest bNull = { v = nullptr };
+    int legNull = viewBareNullTake(bNull.v, 3);
+    ViewNullArmDest bDefault = { v = default };
+    int legDefault = viewBareNullTake(bDefault.v, 5);
+    // Real element sources: a live view and a FIXED array both still bind and read 9.
+    ViewNullArmDest bView = { v = live };
+    int legView = viewBareNullTake(bView.v, 99);
+    ViewNullArmDest bFixed = { v = store };
+    int legFixed = viewBareNullTake(bFixed.v, 98);
+    // Bare-brace spelling of the same declarator - a second grammar spelling of one construct.
+    ViewNullArmDest bBare { v = live };
+    int legBare = viewBareNullTake(bBare.v, 97);
+    // A counted `new T[n]` is a whole allocation, so it binds; only its NULLness is read here
+    // because its elements are uninitialized fat slots.
+    ViewNullArmDest bNew = { v = new IViewNullArm[2] };
+    int legNew = bNew.v == nullptr ? 0 : 7;
+    // Nested brace-init and a fixed array of structs - both reach the same field-init path.
+    ViewNullArmNest bNest = { inner = { v = live } };
+    int legNest = viewBareNullTake(bNest.inner.v, 96);
+    ViewNullArmDest[1] bArr = { { v = choose != 0 ? live : nullptr } };
+    int legArr = viewBareNullTake(bArr[0].v, 95);
+    // Generic `T[]` field: the instantiated field carries the view flag the gate reads.
+    ViewNullArmBox<IViewNullArm> bBox = { w = live };
+    int legBox = viewBareNullTake(bBox.w, 94);
+
+    return legNull + legDefault + legView + legFixed + legBare + legNew
+        + legNest + legArr + legBox;
+}
+
 void rawCountSink(move RawCountElem* values) {}
 void rawCountForward(move RawCountElem* values) { rawCountSink(move values); }
 void rawCountGenericSink<T>(move T* values) {}
@@ -4211,6 +4258,10 @@ int testRawArrayRuntimeCount()
     // 7 + 11 + 9 (live) + 13 + 17 + 23.
     passed += Test("bare null binds an interface view at the store, return and init doors",
         runBareNullViewIfaceStore(1) * 100 + runBareNullViewIfaceStore(0), 8080);
+    // 3 + 5 + 9 (view) + 9 (fixed) + 9 (bare brace) + 7 (new) + 9 (nested) + 9 (array of struct,
+    // live arm) + 9 (generic) = 69; the `choose == 0` run takes the array's NULL arm (95) = 155.
+    passed += Test("brace-init binds an interface view field at every accepted source",
+        runBraceInitViewIfaceField(1) * 1000 + runBraceInitViewIfaceField(0), 69155);
     passed += Test("raw count move parameter direct zero and counts",
         runRawCountMoveDirect(0) * 100 + runRawCountMoveDirect(2) * 10
             + runRawCountMoveDirect(4), 24);
@@ -4426,7 +4477,7 @@ extern int main()
     r = testDiscard();          passed += r; total += 6;
     r = testDirectReturnOwnership(); passed += r; total += 6;
     r = testCLongWidth();       passed += r; total += 15;
-    r = testRawArrayRuntimeCount(); passed += r; total += 94;
+    r = testRawArrayRuntimeCount(); passed += r; total += 95;
     r = testDictEnumeration();  passed += r; total += 12;
     r = testLiteralReceiverAndNullChain(); passed += r; total += 9;
     r = testDefaultAsExpression(); passed += r; total += 82;

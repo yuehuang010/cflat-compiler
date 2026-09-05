@@ -5264,6 +5264,20 @@ public:
         const std::string& ifaceName,
         antlr4::ParserRuleContext* errCtx);
 
+    /*
+     * Field-destination twin of LLVMBackend::RejectValueIntoInterfaceViewParam. An 'IA[]' field
+     * indexes fat {vtable,data} elements, so a single object - an implementor value, a pointer to
+     * one, or even a fat 'IA' - is not one element of it; brace-init boxed it and stored 16 bytes
+     * into the thin view slot. Proves the source implements (or IS) the field interface before
+     * rejecting; a view, a fixed array, a counted 'new T[n]' and a null/unnamed source all pass.
+     */
+    bool RejectValueIntoInterfaceViewField(
+        const LLVMBackend::NamedVariable& rightNV,
+        const LLVMBackend::TypeAndValue& fieldType,
+        const std::string& displayTypeName,
+        const std::string& fieldName,
+        antlr4::ParserRuleContext* errCtx);
+
     bool EmitOneFieldInit(
         llvm::Value* structPtr,
         const LLVMBackend::StructData& sd,

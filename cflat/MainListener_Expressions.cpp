@@ -9622,6 +9622,50 @@ llvm::Value* MainListener::CoerceInitValueToInterface(
                                         ifaceName, &rightNV, false);
     }
 
+bool MainListener::RejectValueIntoInterfaceViewField(
+        const LLVMBackend::NamedVariable& rightNV,
+        const LLVMBackend::TypeAndValue& fieldType,
+        const std::string& displayTypeName,
+        const std::string& fieldName,
+        antlr4::ParserRuleContext* errCtx) {
+        auto* compiler = Compiler(errCtx);
+        if (!fieldType.IsArrayView || !fieldType.IsInterface) return false;
+
+        const LLVMBackend::TypeAndValue& src = rightNV.TypeAndValue;
+        // ELEMENT axis, ahead of the single-object one. A fixed array, a view or a counted
+        // `new T[n]` is a real element source only when its elements ARE the field's interface:
+        // 'CA[2]' indexes thin objects, so binding it forges a fat view over them. Master reached
+        // this same guard inside BoxConcreteIntoInterface; excluding views from the boxing arm
+        // took it away, so spell it here with the identical message.
+        LLVMBackend::TypeAndValue shaped = src;
+        const bool rawHeapArray = compiler->FindRawArrayResult(rightNV.Primary) != nullptr;
+        if (rawHeapArray && !shaped.IsArrayView && shaped.ConstArraySize == 0)
+            shaped.IsArrayView = true;
+        // Elements already OF the field's interface are the ACCEPTED case; only a different
+        // element type is rejected. A raw `new IA[n]` result names the interface without
+        // carrying IsInterface, so match on the resolved NAME rather than on the flag.
+        if (compiler->ResolveTypeAlias(shaped.TypeName) != compiler->ResolveTypeAlias(fieldType.TypeName)
+            && RejectPointerShapedInterfaceUpcast(errCtx, shaped, fieldType.TypeName))
+            return true;
+        // A view, a fixed array and a counted `new T[n]` are real element sources; a null or
+        // otherwise unnamed source names no type at all and is a null view. None is a single object.
+        if (src.IsArrayView || src.ConstArraySize != 0 || src.TypeName.empty()) return false;
+        if (rawHeapArray) return false;
+        // Prove it before rejecting: only a source that IS the interface or implements it can
+        // reach CoerceInitValueToInterface's boxing/rebox arms in the first place.
+        if (!src.IsInterface
+            && !compiler->StructImplementsInterface(src.TypeName, fieldType.TypeName))
+            return false;
+
+        compiler->LogErrorMessage(
+            "cannot brace-initialize array-view field '{}.{}' ('{}') from '{}' - a view of an "
+            "interface indexes fat '{}' elements, so its source must be an array view of "
+            "'{}' (or a null one), not a single object",
+            { displayTypeName, fieldName, SpellType(*compiler, fieldType),
+              SpellType(*compiler, src), "{vtable,data}", fieldType.TypeName });
+        return true;
+    }
+
 bool MainListener::EmitOneFieldInit(
         llvm::Value* structPtr,
         const LLVMBackend::StructData& sd,
@@ -9650,6 +9694,11 @@ bool MainListener::EmitOneFieldInit(
                 SpellType(*compiler, LLVMBackend::TypeAndValue{ .TypeName = typeName }), fieldName));
             return false;
         }
+
+        // Ahead of every store rule: a single object bound to an interface-VIEW field is not one
+        // element of it, and the boxing arm below would forge a fat store into the thin slot.
+        if (RejectValueIntoInterfaceViewField(rightNV, fieldType, displayTypeName, fieldName, errCtx))
+            return false;
 
         RejectRawHeapArrayIntoUniqueField(rightNV, fieldType, fieldName, errCtx);
 
@@ -9925,7 +9974,9 @@ bool MainListener::EmitOneFieldInit(
         // Box a thin concrete source, or re-box an already-fat one to the FIELD's interface exactly
         // as the `=` path does. Without the rebox the field keeps the SOURCE's vtable and its slot 0
         // answers the field interface's method 0 - a silently wrong call, no crash, no error.
-        else if (fieldType.IsInterface)
+        // A VIEW destination is excluded exactly as at the sibling call / assignment doors: an
+        // 'IA[]' slot is thin, so boxing here would store 16 bytes into 8.
+        else if (fieldType.IsInterface && !fieldType.IsArrayView)
         {
             val = CoerceInitValueToInterface(rightNV, val, fieldType.TypeName, errCtx);
         }
