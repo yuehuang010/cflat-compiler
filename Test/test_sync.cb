@@ -1327,6 +1327,37 @@ struct LockAccount {
     }
 };
 
+// Regression: a bitfield declared inside a lock(...) field group is guard-checked like a
+// plain field. These legs are the accept side - held-lock access on the outside door and
+// bare access from an in-group method must still compile and read back correctly.
+struct LockBits {
+    mutex mtx = default;
+    lock(mtx) {
+        int value : 4;
+        u8  flag  : 1;
+        int  Get()       { return value; }
+        void Set(int n)  { value = n; }
+    }
+    int unguarded : 4;
+};
+
+bool testLockGuardedBitfields()
+{
+    bool result = true;
+    LockBits b;
+    lock(b.mtx) { b.value = 5; b.flag = (u8)1; }
+    lock(b.mtx) {
+        result &= Test("lock_bitfield_held_read", b.value, 5);
+        result &= Test("lock_bitfield_held_flag", (int)b.flag, 1);
+        b.Set(3);
+        result &= Test("lock_bitfield_ingroup",   b.Get(), 3);
+    }
+    // An unguarded bitfield sharing the record must stay freely accessible.
+    b.unguarded = 7;
+    result &= Test("lock_bitfield_unguarded", b.unguarded, 7);
+    return result;
+}
+
 bool testLockAnnotations()
 {
     bool result = true;
@@ -1945,6 +1976,7 @@ extern int main() {
     total++; passed += testAtomicFlagReleaseAcquire()     ? 1 : 0;
     total++; passed += testAtomicI32ReleaseAcquire()      ? 1 : 0;
     total++; passed += testLockAnnotations()              ? 1 : 0;
+    total++; passed += testLockGuardedBitfields()          ? 1 : 0;
     total++; passed += testLockPointerGuard()             ? 1 : 0;
     total++; passed += testLockArrowForm()                ? 1 : 0;
     total++; passed += testGlobalGuardGroup()             ? 1 : 0;

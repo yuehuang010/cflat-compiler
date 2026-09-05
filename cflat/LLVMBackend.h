@@ -1634,6 +1634,9 @@ public:
         unsigned StorageFieldIndex = 0;  // index into StructType / StructFields (storage slot)
         unsigned BitOffset = 0;          // LSB-first offset within the storage unit
         unsigned BitWidth = 0;           // bits the user wrote after ':'
+        // Enclosing `lock(g) { ... }` field group's guardian, empty when unguarded. Kept here
+        // because PackBitfields drops the declared field, so this is the only surviving copy.
+        std::string GuardedBy;
         std::vector<AnnotationValue> Annotations;
     };
 

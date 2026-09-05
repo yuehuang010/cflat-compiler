@@ -1416,6 +1416,22 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 LogErrorContext(ctx, std::format(
                                     "bitfield '{}' has no addressable storage in this context", primaryIdentifier));
                             }
+                            // Lock-set check: same rule the plain-field arm below applies, run
+                            // here because the bitfield arm returns before reaching it.
+                            if (bfHit && !bfHit->GuardedBy.empty())
+                            {
+                                std::string receiverName = structVar.TypeAndValue.VariableName;
+                                if (!receiverName.empty())
+                                {
+                                    std::string requiredLock = receiverName + "." + bfHit->GuardedBy;
+                                    if (currentLockSet.find(requiredLock) == currentLockSet.end())
+                                    {
+                                        LogErrorContext(ctx, std::format(
+                                            "Field '{}' is guarded by '{}': must hold '{}' before accessing it.",
+                                            primaryIdentifier, bfHit->GuardedBy, requiredLock));
+                                    }
+                                }
+                            }
                             if (bfHit && structVar.Storage)
                             {
                                 auto* compiler = Compiler(ctx);

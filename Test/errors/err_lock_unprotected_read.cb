@@ -15,3 +15,42 @@ expect_error("Field 'value' is guarded by 'mtx'") {
         int v = c.value;
     }
 }
+
+// A bitfield inside the same lock(...) field group is guard-checked exactly like the plain
+// field above. Pre-fix all three doors compiled clean: PackBitfields dropped GuardedBy.
+struct BitCounter {
+    mutex mtx = default;
+    lock(mtx) {
+        int value : 4;
+    }
+};
+
+// Outside door: receiver-qualified read without holding the lock.
+expect_error("Field 'value' is guarded by 'mtx': must hold 'c.mtx' before accessing it.") {
+    void bitOutsideRead() {
+        BitCounter c;
+        int v = c.value;
+    }
+}
+
+// Bare door: implicit-'this' read inside an ordinary (out-of-group) method.
+expect_error("Field 'value' is guarded by 'mtx': must hold 'mtx' before accessing it.") {
+    struct BitBareRead {
+        mutex mtx = default;
+        lock(mtx) {
+            int value : 4;
+        }
+        int Get() { return value; }
+    };
+}
+
+// Explicit-'this' door, write side.
+expect_error("Field 'value' is guarded by 'mtx': must hold 'BitThisWrite__.mtx' before accessing it.") {
+    struct BitThisWrite {
+        mutex mtx = default;
+        lock(mtx) {
+            int value : 4;
+        }
+        void Set() { this.value = 3; }
+    };
+}

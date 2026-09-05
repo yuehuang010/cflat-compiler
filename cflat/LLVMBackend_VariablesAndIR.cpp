@@ -1046,6 +1046,9 @@ LLVMBackend::NamedVariable LLVMBackend::EmitBitfieldRead(
         bfType.BitWidth = bf.BitWidth;
         bfType.BitOffset = bf.BitOffset;
         bfType.StorageFieldIndex = bf.StorageFieldIndex;
+        // Carry the lock-group guardian so the shared guard predicates see a bitfield
+        // exactly as they see a plain field on both member doors.
+        bfType.GuardedBy = bf.GuardedBy;
 
         NamedVariable nv{};
         nv.Primary = shifted;
@@ -1166,6 +1169,7 @@ std::vector<LLVMBackend::DeclTypeAndValue> LLVMBackend::PackBitfields(
                     info.StorageFieldIndex = storageIdx;
                     info.BitOffset = bitOffset;
                     info.BitWidth = bf.BitWidth;
+                    info.GuardedBy = bf.GuardedBy;
                     info.Annotations = bf.Annotations;
                     outBitfields.push_back(info);
                 }

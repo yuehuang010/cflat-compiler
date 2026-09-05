@@ -6520,6 +6520,7 @@ static llvm::json::Object SerializeBfi(const BFI& b)
     o["bo"] = static_cast<int64_t>(b.BitOffset);
     o["bw"] = static_cast<int64_t>(b.BitWidth);
     if (b.IsUnsigned) o["u"] = true;
+    if (!b.GuardedBy.empty()) o["gb"] = b.GuardedBy;
     if (!b.Annotations.empty()) o["ann"] = SerializeAnnotations(b.Annotations);
     return o;
 }
@@ -6533,6 +6534,7 @@ static BFI DeserializeBfi(const llvm::json::Object& o)
     if (auto v = o.getInteger("bo")) b.BitOffset = static_cast<unsigned>(*v);
     if (auto v = o.getInteger("bw")) b.BitWidth = static_cast<unsigned>(*v);
     if (auto v = o.getBoolean("u"))  b.IsUnsigned = *v;
+    if (auto v = o.getString("gb")) b.GuardedBy = v->str();
     b.Annotations = DeserializeAnnotations(o.getArray("ann"));
     return b;
 }
