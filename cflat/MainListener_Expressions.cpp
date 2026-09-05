@@ -1411,6 +1411,21 @@ std::string MainListener::SpellPrimitiveConstantType(llvm::Type* type) {
     }
 
 /*
+ * Is this array-view source the enumerator of 'enumKey' whose value is zero? A member arrives named
+ * '<enum>.<member>' with no folded constant, so the enum registry is what decides its value.
+ */
+static bool EnumMemberSourceIsZero(const LLVMBackend& compiler, const std::string& enumKey,
+                                   const LLVMBackend::NamedVariable& rhsNV)
+{
+        const std::string prefix = enumKey + ".";
+        const std::string& name = rhsNV.TypeAndValue.VariableName;
+        if (!name.starts_with(prefix)) return false;
+        int64_t value = 0;
+        return compiler.TryGetEnumMemberInt(enumKey, name.substr(prefix.size()), value)
+            && value == 0;
+    }
+
+/*
  * A primitive VALUE bound to a 'T[]' is reinterpreted as a thin pointer and indexed, so only the
  * NULL-view spelling may bind. '0', 'nullptr', 'default' and any folded zero are that spelling;
  * anything else is a number that reaches v[0] as an address, named ('int x') or bare ('5').
@@ -1448,7 +1463,17 @@ bool MainListener::RejectPrimitiveValueIntoArrayView(antlr4::ParserRuleContext* 
         }
         else
         {
-            if (!LLVMBackend::IsPrimitiveTypeName(Compiler()->ResolveTypeAlias(rhs.TypeName)))
+            // An enum member names its ENUM, yet it reaches v[0] as its backing integer does, so
+            // hop the enum to that backing name and judge it exactly like a named primitive.
+            std::string resolved = Compiler()->ResolveTypeAlias(rhs.TypeName);
+            if (std::string enumKey = Compiler()->ResolveEnumTypeName(resolved); !enumKey.empty())
+            {
+                // A member reaches here as a LOAD of its enumerator global, not as a constant, so
+                // ask the enum registry for the value: a zero member is still the null spelling.
+                if (EnumMemberSourceIsZero(*Compiler(), enumKey, rhsNV)) return false;
+                resolved = Compiler()->ResolveTypeAlias(Compiler()->GetEnumBackingType(enumKey));
+            }
+            if (!LLVMBackend::IsPrimitiveTypeName(resolved))
                 return false;
             sourceSpelling = SpellType(*Compiler(), rhs);
         }

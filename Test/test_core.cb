@@ -3485,6 +3485,12 @@ int runViewFixedArraySources()
 
 int[] viewPlainZeroReturn(int c) { if (c != 0) { return 0; } return nullptr; }
 
+// An ENUM member names its enum, not a primitive, so the guard hops it to the backing integer. A
+// ZERO member is still a null-view spelling; an enum ARRAY is a real element source either way.
+enum VpnEnum : int { VPN_ZERO = 0, VPN_ONE = 1 };
+struct VpnDest { int[] p = default; };
+int[] viewPlainEnumZeroReturn() { return VpnEnum.VPN_ZERO; }
+
 /*
  * NULL-VIEW spellings of a PRIMITIVE view. A primitive value bound to a 'T[]' is reinterpreted as
  * an address (rejected in Test/errors/err_arrayview_call_arg.cb), so these are the spellings the
@@ -3530,6 +3536,18 @@ int runViewPlainNullSpellings()
     if (bz == nullptr) { score = score + 16384; }
     if (fz == nullptr) { score = score + 32768; }
     if (vt == nullptr) { score = score + 65536; }
+    // Enum spellings beside them: a zero member at the four doors, and an enum array bound to an
+    // enum view, which is a real element source and never went through the primitive guard.
+    int[] ez = VpnEnum.VPN_ZERO;
+    int[] es = real; es = VpnEnum.VPN_ZERO;
+    VpnDest ef = { p = VpnEnum.VPN_ZERO };
+    VpnEnum[2] earr; earr[0] = VpnEnum.VPN_ZERO; earr[1] = VpnEnum.VPN_ONE;
+    VpnEnum[] ev = earr;
+    if (ez == nullptr) { score = score + 131072; }
+    if (es == nullptr) { score = score + 262144; }
+    if (ef.p == nullptr) { score = score + 524288; }
+    if (viewPlainEnumZeroReturn() == nullptr) { score = score + 1048576; }
+    if (ev[1] == VpnEnum.VPN_ONE) { score = score + 2097152; }
     return score;
 }
 
@@ -4454,9 +4472,10 @@ int testRawArrayRuntimeCount()
     passed += Test("a fixed array binds a plain array view at every non-brace door",
         runViewFixedArraySources(), 121);
     // Every null-view spelling plus the two real element reads: 1+2+4+8+16+32+64+128+256+512+1024
-    // = 2047, plus the six unnamed-constant spellings 2048..65536 = 131071.
+    // = 2047, plus the six unnamed-constant spellings 2048..65536 = 131071, plus the enum zero
+    // member at the four doors and the enum array read, 131072..2097152 = 4194303.
     passed += Test("a primitive array view still binds every null spelling",
-        runViewPlainNullSpellings(), 131071);
+        runViewPlainNullSpellings(), 4194303);
     passed += Test("raw count move parameter direct zero and counts",
         runRawCountMoveDirect(0) * 100 + runRawCountMoveDirect(2) * 10
             + runRawCountMoveDirect(4), 24);

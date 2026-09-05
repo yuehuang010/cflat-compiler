@@ -325,3 +325,43 @@ expect_error("cannot bind a 'bool' value to array view 'bool[]'") {
 expect_error("cannot bind a 'float' value to array view 'float[]'") {
     int bplxCall() { float[] v = 1.0 + 0.5; return v[0] > 0.0 ? 1 : 0; }
 }
+
+// ENUM row of the same four doors. A member names its ENUM, which is not a primitive NAME, so it
+// took the named early-out above and every door passed '--check' and SIGSEGVd at v[0]. The enum
+// hops to its backing integer now; a ZERO member is still the null-view spelling and still binds
+// (asserted by value in Test/test_core.cb).
+enum Bpn : int { BPN_ZERO = 0, BPN_ONE = 1 };
+
+expect_error("cannot bind a 'Bpn' value to array view 'int[]'") {
+    int bpniCall() { int[] v = Bpn.BPN_ONE; return v[0]; }
+}
+
+// '=' store door, enum member.
+expect_error("cannot bind a 'Bpn' value to array view 'int[]'") {
+    int bpnsCall() { int[] v = 0; v = Bpn.BPN_ONE; return v[0]; }
+}
+
+// Brace-init FIELD door, enum member.
+expect_error("cannot bind a 'Bpn' value to array view 'int[]'") {
+    struct BpnfDest { int[] p = default; };
+    int bpnfCall() { BpnfDest d = { p = Bpn.BPN_ONE }; return d.p[0]; }
+}
+
+// RETURN door, enum member.
+expect_error("cannot bind a 'Bpn' value to array view 'int[]'") {
+    int[] bpnrMake() { return Bpn.BPN_ONE; }
+    int bpnrCall() { return bpnrMake()[0]; }
+}
+
+// A NAMED enum LOCAL is not a member, so nothing proves its slot stays zero - same rule as the
+// named 'int x' row, and the enum name is what gets spelled.
+expect_error("cannot bind a 'Bpn' value to array view 'int[]'") {
+    int bpnvCall() { Bpn e = Bpn.BPN_ONE; int[] v = e; return v[0]; }
+}
+
+// A namespaced enum resolves through the scoped walk and is spelled with its qualified name; the
+// destination is an enum view here, so the element type is the enum itself.
+namespace BpnNs { enum Dir : int { D_ZERO = 0, D_ONE = 1 }; }
+expect_error("cannot bind a 'BpnNs.Dir' value to array view 'BpnNs.Dir[]'") {
+    int bpnnCall() { BpnNs.Dir[] v = BpnNs.Dir.D_ONE; return (int)v[0]; }
+}
