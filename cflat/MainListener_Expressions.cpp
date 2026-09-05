@@ -9648,6 +9648,10 @@ bool MainListener::RejectValueIntoArrayViewField(
             && compiler->ResolveTypeAlias(shaped.TypeName) != compiler->ResolveTypeAlias(fieldType.TypeName)
             && RejectPointerShapedInterfaceUpcast(errCtx, shaped, fieldType.TypeName))
             return true;
+        // Element IDENTITY, not element name: no rebox is emitted per view element, so an 'IB[]'
+        // bound here would keep the source's vtables. Same predicate and text as the '=' door.
+        if (fieldType.IsInterface && RejectArrayViewElementMismatch(errCtx, fieldType, rightNV))
+            return true;
         // A view, a fixed array and a counted `new T[n]` are real element sources; a null or
         // otherwise unnamed source names no type at all and is a null view. None is a single object.
         if (src.IsArrayView || src.ConstArraySize != 0 || src.TypeName.empty() || src.IsSimd)

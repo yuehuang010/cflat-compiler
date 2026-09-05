@@ -40,6 +40,28 @@ expect_error("cannot brace-initialize array-view field 'BviDest.v' ('IBvi[]') fr
     int bviCall() { BviImpl b; b.k = 1; BviDest d = { v = b }; return d.v[0].bvi(); }
 }
 
+// ELEMENT-IDENTITY leg of the same field door: a view of a DIFFERENT interface is a view, so it
+// slipped past the single-object guard and kept the source's vtables (dispatched IBxb::xb).
+expect_error("cannot bind an array view of 'IBxb' to a destination of 'IBxa'") {
+    interface IBxa { int xa(); };
+    interface IBxb { int xb(); };
+    class BxbImpl : IBxb { int k = default; int xb() { return k; } };
+    struct BxDest { IBxa[] v = default; };
+    int bxCall() { IBxb[] bv = new IBxb[1]; BxbImpl* c = new BxbImpl(); c->k = 1; bv[0] = c;
+                   BxDest d = { v = bv }; return d.v[0].xa(); }
+}
+
+// Same-name interfaces in two namespaces: the bare NAME matched, so only interface IDENTITY
+// separates them.
+expect_error("cannot bind an array view of 'BxnsB.IBxn' to a destination of 'BxnsA.IBxn'") {
+    namespace BxnsA { interface IBxn { int xa(); }; };
+    namespace BxnsB { interface IBxn { int xb(); }; };
+    class BxnImpl : BxnsB.IBxn { int k = default; int xb() { return k; } };
+    struct BxnDest { BxnsA.IBxn[] v = default; };
+    int bxnCall() { BxnsB.IBxn[] bv = new BxnsB.IBxn[1]; BxnImpl* c = new BxnImpl(); c->k = 1;
+                    bv[0] = c; BxnDest d = { v = bv }; return d.v[0].xa(); }
+}
+
 // Fat sibling: an 'IBvg' value is still ONE element, not a view of them.
 expect_error("cannot brace-initialize array-view field 'BvgDest.v' ('IBvg[]') from 'IBvg'") {
     interface IBvg { int bvg(); };
