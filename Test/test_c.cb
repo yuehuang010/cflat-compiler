@@ -766,6 +766,62 @@ bool testBitfields()
     return result;
 }
 
+// Bare (implicit-'this') bitfield access inside the owning struct's own methods.
+// PRE-FIX every leg below failed to compile with "Undefined variable <name>":
+// FindImplicitThisField scanned StructFields only, and a packed bitfield lives in
+// the Bitfields side-table, so the bare name never resolved. Explicit `this.x` worked.
+struct BfSelf
+{
+    int a : 4;   // -8 .. 7
+    u8  f : 1;
+
+    int Read()     { return a; }               // bare read
+    int Write()    { a = 5; return this.a; }   // bare write, explicit read-back
+    int Compound() { a += 2; return this.a; }  // bare read-modify-write
+    int Ternary()  { return a > 0 ? a : 9; }   // bare read inside '?:'
+    int Negative() { a = -3; return a; }       // signed bare read sign-extends
+    int Flag()     { f = 1; return (int)f; }   // unsigned 1-bit bare read
+};
+
+struct BfSelfBox<T>
+{
+    T   v = default;
+    int tag : 4;
+
+    int Set(int t) { tag = t; return tag; }    // bare access in a generic method
+};
+
+bool testBitfieldsBareSelf()
+{
+    bool result = true;
+
+    BfSelf r = default;
+    r.a = 3;
+    result &= Test("bf_self_read",      r.Read(),      3);
+
+    BfSelf w = default;
+    result &= Test("bf_self_write",     w.Write(),     5);
+
+    BfSelf c = default;
+    c.a = 1;
+    result &= Test("bf_self_compound",  c.Compound(),  3);
+
+    BfSelf t = default;
+    t.a = 6;
+    result &= Test("bf_self_ternary",   t.Ternary(),   6);
+
+    BfSelf n = default;
+    result &= Test("bf_self_negative",  n.Negative(), -3);
+
+    BfSelf u = default;
+    result &= Test("bf_self_flag",      u.Flag(),      1);
+
+    BfSelfBox<int> b = default;
+    result &= Test("bf_self_generic",   b.Set(7),      7);
+
+    return result;
+}
+
 // Regression: int -> pointer casts must widen with the source's sign before
 // inttoptr (which zero-extends), so negative sentinels like RTLD_DEFAULT
 // ((void*)-2) keep their high bits. Unsigned sources stay zero-extended.
@@ -878,6 +934,7 @@ extern int main(int argc, char** argv)
     result &= Test("testUpconvert",          testUpconvert(), true);
     result &= Test("testShortCircuitIf",     testShortCircuitIf(), true);
     result &= Test("testBitfields",          testBitfields(), true);
+    result &= Test("testBitfieldsBareSelf",  testBitfieldsBareSelf(), true);
     result &= Test("testIntToPtrCast",       testIntToPtrCast(), true);
     result &= Test("extern_repeat_toupper",  toupper('a'), 65);
     result &= Test("extern_repeat_abs",      abs(-7), 7);

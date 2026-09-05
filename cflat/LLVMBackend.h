@@ -6235,6 +6235,15 @@ public:
     // _Bool / bool); CFlat mirrors that and adds the sized integer aliases.
     static unsigned BitfieldStorageBits(const std::string& typeName);
 
+    // Emit a bitfield READ from a storage word and return a fully-configured NamedVariable
+    // carrying BitfieldStorage/Offset/Width/Unsigned so the write path can read-modify-write.
+    // Single source of truth for the mask/shift; every bitfield door routes through it.
+    NamedVariable EmitBitfieldRead(llvm::Value* storagePtr,
+                                   llvm::Type* storageTy,
+                                   const BitfieldInfo& bf,
+                                   const std::string& parentVariableName,
+                                   const std::string& owningStructName);
+
     // MSVC LSB-first bitfield packing. Consumes the user's declList; groups
     // consecutive bitfields with the same underlying type into one storage
     // slot each, populates outBitfields, and returns the storage-slot list
@@ -7065,9 +7074,12 @@ public:
 
     // IR-free half of GetMemberVariable: locates `name` among the fields of the enclosing
     // method's implicit 'this' struct. Returns the 'this' argument, or nullptr when there is
-    // no member context or no such field; outStruct/outIndex may be null.
+    // no member context or no such field; outStruct/outIndex/outBitfield may be null.
+    // A bitfield hit reports through outBitfield (outIndex is left untouched), since a
+    // bitfield has no StructFields slot of its own - it lives in the Bitfields side-table.
     const NamedVariable* FindImplicitThisField(const std::string& name,
-                                               const StructData** outStruct, int* outIndex);
+                                               const StructData** outStruct, int* outIndex,
+                                               const BitfieldInfo** outBitfield = nullptr);
 
     /// True when a bare `name` inside the current method body resolves to a field of the
     /// enclosing struct. Shares FindImplicitThisField with GetMemberVariable, so the predicate

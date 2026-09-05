@@ -1422,11 +1422,11 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 const auto& storageField = dataStructure.StructFields[bfHit->StorageFieldIndex];
                                 auto* storageTy = compiler->GetType(storageField);
                                 auto* storagePtr = compiler->CreateStructGEP(structVar.BaseType, structVar.Storage, bfHit->StorageFieldIndex);
-                                // Shared read/write masking lives in EmitBitfieldAccess (single source
+                                // Shared read/write masking lives in EmitBitfieldRead (single source
                                 // of truth; the transparent anonymous-member path uses it too).
-                                namedVar = EmitBitfieldAccess(compiler, storagePtr, storageTy, *bfHit,
-                                                              structVar.TypeAndValue.VariableName,
-                                                              structVar.TypeAndValue.TypeName);
+                                namedVar = compiler->EmitBitfieldRead(storagePtr, storageTy, *bfHit,
+                                                                     structVar.TypeAndValue.VariableName,
+                                                                     structVar.TypeAndValue.TypeName);
                                 continue;
                             }
 
@@ -7305,7 +7305,9 @@ LLVMBackend::NamedVariable MainListener::ParseIdentifier(antlr4::tree::TerminalN
         }
 
         auto memberVar = compiler->GetMemberVariable(name);
-        if (memberVar.Storage != nullptr)
+        // A bitfield member carries no addressable Storage - its lvalue is the packed
+        // storage word plus mask/shift metadata, so admit it by BitfieldStorage too.
+        if (memberVar.Storage != nullptr || memberVar.BitfieldStorage != nullptr)
         {
             // Lock-set check: self-access inside a struct method.
             if (!memberVar.TypeAndValue.GuardedBy.empty())

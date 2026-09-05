@@ -2254,7 +2254,8 @@ auto LLVMBackend::FindThisArgIt(const std::map<std::string, NamedVariable>& args
     }
 
 const LLVMBackend::NamedVariable* LLVMBackend::FindImplicitThisField(
-    const std::string& name, const StructData** outStruct, int* outIndex)
+    const std::string& name, const StructData** outStruct, int* outIndex,
+    const BitfieldInfo** outBitfield)
 {
         for (const auto& stackFrame : std::ranges::reverse_view(stackNamedVariable))
         {
@@ -2283,6 +2284,17 @@ const LLVMBackend::NamedVariable* LLVMBackend::FindImplicitThisField(
                 }
                 count++;
             }
+            // Bitfields are not in StructFields (PackBitfields folds them into synthesized
+            // storage slots), so the declared name only appears in the Bitfields side-table.
+            for (const auto& bf : findResult->second.Bitfields)
+            {
+                if (bf.Name == name)
+                {
+                    if (outStruct != nullptr)   *outStruct = &findResult->second;
+                    if (outBitfield != nullptr) *outBitfield = &bf;
+                    return &thisIt->second;
+                }
+            }
             return nullptr;
         }
 
@@ -2298,7 +2310,8 @@ LLVMBackend::NamedVariable LLVMBackend::GetMemberVariable(const std::string& nam
 {
         const StructData* structData = nullptr;
         int count = 0;
-        const NamedVariable* thisArg = FindImplicitThisField(name, &structData, &count);
+        const BitfieldInfo* bitfield = nullptr;
+        const NamedVariable* thisArg = FindImplicitThisField(name, &structData, &count, &bitfield);
         if (thisArg == nullptr)
             return {};
 
@@ -2312,6 +2325,16 @@ LLVMBackend::NamedVariable LLVMBackend::GetMemberVariable(const std::string& nam
         }
 
         const auto& sd = *structData;
+        // Bare bitfield read through the implicit 'this': GEP to the packed storage word and
+        // reuse the same emitter the explicit `this.f` door uses, so read and write agree.
+        if (bitfield != nullptr)
+        {
+            const auto& storageField = sd.StructFields[bitfield->StorageFieldIndex];
+            auto* storagePtr = CreateStructGEP(sd.StructType, memberStructInstance,
+                                               bitfield->StorageFieldIndex);
+            return EmitBitfieldRead(storagePtr, GetType(storageField), *bitfield, "", "");
+        }
+
         const auto& structField = sd.StructFields[count];
         NamedVariable namedVar;
         auto* fieldLLVMType = GetType(structField);

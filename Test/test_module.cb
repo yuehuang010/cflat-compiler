@@ -98,6 +98,19 @@ struct ShadowNsField
     int Write()          { os = 7; return os; }
 };
 
+// A BITFIELD spelled like a namespace, read and written bare through the implicit 'this'.
+// PRE-FIX both legs compiled clean and produced WRONG VALUES silently: HasMemberVariable said
+// 'os' was not a member, so the namespace branch won - the bare read returned 5 instead of 3,
+// and the bare write stored nowhere (the explicit this.os read back 0 instead of 6). A bitfield
+// lives in the Bitfields side-table, which the implicit-'this' field scan never consulted.
+struct ShadowNsBitfield
+{
+    int os : 4;
+
+    int BareRead()  { return os; }
+    int BareWrite() { os = 6; return this.os; }
+};
+
 struct ShadowNsBox<T>
 {
     T os = default;
@@ -144,6 +157,13 @@ bool testVariableShadowsNamespace()
     result &= Test("shadow_ns_field_ptr",      sf.PtrField(&nine),  9);
     result &= Test("shadow_ns_field_typename", sf.TypeNamedField(), 5);
     result &= Test("shadow_ns_field_write",    sf.Write(),          7);
+
+    // Same shape, but the field is a BITFIELD (side-table, not StructFields).
+    ShadowNsBitfield sbf = default;
+    sbf.os = 3;
+    result &= Test("shadow_ns_bitfield_read",  sbf.BareRead(),      3);
+    ShadowNsBitfield sbw = default;
+    result &= Test("shadow_ns_bitfield_write", sbw.BareWrite(),     6);
 
     // Same field name inside a generic struct - the instantiation walks the same primary.
     ShadowNsBox<int> sb = default;

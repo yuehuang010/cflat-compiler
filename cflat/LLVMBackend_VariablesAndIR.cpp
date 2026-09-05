@@ -1011,6 +1011,58 @@ llvm::Value* LLVMBackend::CreateCast(llvm::Instruction::CastOps op, llvm::Value*
         return builder->CreateCast(op, value, destType);
     }
 
+LLVMBackend::NamedVariable LLVMBackend::EmitBitfieldRead(
+        llvm::Value* storagePtr,
+        llvm::Type* storageTy,
+        const BitfieldInfo& bf,
+        const std::string& parentVariableName,
+        const std::string& owningStructName)
+{
+        auto* word = CreateLoad(storageTy, storagePtr);
+        unsigned w = bf.BitWidth;
+        unsigned off = bf.BitOffset;
+        unsigned storageBits = (unsigned)word->getType()->getIntegerBitWidth();
+        bool isUnsigned = bf.IsUnsigned || bf.TypeName == "bool";
+        // Sign-aware extraction. Unsigned: (word >> off) & ((1<<w)-1). Signed: shift the
+        // bitfield's MSB up to the word MSB, then arithmetic-shift right to sign-extend.
+        llvm::Value* shifted;
+        if (isUnsigned)
+        {
+            auto* shr = builder->CreateLShr(word, llvm::ConstantInt::get(word->getType(), off));
+            uint64_t mask = (w == 64) ? ~uint64_t(0) : ((uint64_t(1) << w) - 1);
+            shifted = builder->CreateAnd(shr, llvm::ConstantInt::get(word->getType(), mask));
+        }
+        else
+        {
+            unsigned leftShift = storageBits - w - off;
+            auto* shl = builder->CreateShl(word, llvm::ConstantInt::get(word->getType(), leftShift));
+            shifted = builder->CreateAShr(shl, llvm::ConstantInt::get(word->getType(), storageBits - w));
+        }
+
+        DeclTypeAndValue bfType{};
+        bfType.TypeName = bf.TypeName;
+        bfType.VariableName = bf.Name;
+        bfType.IsBitfield = true;
+        bfType.BitWidth = bf.BitWidth;
+        bfType.BitOffset = bf.BitOffset;
+        bfType.StorageFieldIndex = bf.StorageFieldIndex;
+
+        NamedVariable nv{};
+        nv.Primary = shifted;
+        nv.BaseType = shifted->getType();
+        nv.Storage = nullptr;  // bitfields have no addressable storage
+        nv.TypeAndValue = bfType;
+        nv.TypeAndValue.ParentVariableName = parentVariableName;
+        nv.OwningStructName = owningStructName;
+        nv.FieldName = bf.Name;
+        nv.BitfieldStorage = storagePtr;
+        nv.BitfieldStorageType = storageTy;
+        nv.BitfieldOffset = bf.BitOffset;
+        nv.BitfieldWidth = bf.BitWidth;
+        nv.BitfieldUnsigned = isUnsigned;
+        return nv;
+    }
+
 unsigned LLVMBackend::BitfieldStorageBits(const std::string& typeName)
 {
         if (typeName == "bool")  return 8;   // CFlat bool is i8 in storage

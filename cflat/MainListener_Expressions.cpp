@@ -13956,58 +13956,6 @@ const MainListener::SimdMathIntrinsic* MainListener::LookupSimdMathIntrinsic(con
         return it == table.end() ? nullptr : &it->second;
     }
 
-LLVMBackend::NamedVariable MainListener::EmitBitfieldAccess(
-        LLVMBackend* compiler,
-        llvm::Value* storagePtr,
-        llvm::Type* storageTy,
-        const LLVMBackend::BitfieldInfo& bf,
-        const std::string& parentVariableName,
-        const std::string& owningStructName) {
-        auto* word = compiler->CreateLoad(storageTy, storagePtr);
-        unsigned w = bf.BitWidth;
-        unsigned off = bf.BitOffset;
-        unsigned storageBits = (unsigned)word->getType()->getIntegerBitWidth();
-        bool isUnsigned = bf.IsUnsigned || bf.TypeName == "bool";
-        // Sign-aware extraction. Unsigned: (word >> off) & ((1<<w)-1). Signed: shift the
-        // bitfield's MSB up to the word MSB, then arithmetic-shift right to sign-extend.
-        llvm::Value* shifted;
-        if (isUnsigned)
-        {
-            auto* shr = compiler->builder->CreateLShr(word, llvm::ConstantInt::get(word->getType(), off));
-            uint64_t mask = (w == 64) ? ~uint64_t(0) : ((uint64_t(1) << w) - 1);
-            shifted = compiler->builder->CreateAnd(shr, llvm::ConstantInt::get(word->getType(), mask));
-        }
-        else
-        {
-            unsigned leftShift = storageBits - w - off;
-            auto* shl = compiler->builder->CreateShl(word, llvm::ConstantInt::get(word->getType(), leftShift));
-            shifted = compiler->builder->CreateAShr(shl, llvm::ConstantInt::get(word->getType(), storageBits - w));
-        }
-
-        LLVMBackend::DeclTypeAndValue bfType{};
-        bfType.TypeName = bf.TypeName;
-        bfType.VariableName = bf.Name;
-        bfType.IsBitfield = true;
-        bfType.BitWidth = bf.BitWidth;
-        bfType.BitOffset = bf.BitOffset;
-        bfType.StorageFieldIndex = bf.StorageFieldIndex;
-
-        LLVMBackend::NamedVariable nv{};
-        nv.Primary = shifted;
-        nv.BaseType = shifted->getType();
-        nv.Storage = nullptr;  // bitfields have no addressable storage
-        nv.TypeAndValue = bfType;
-        nv.TypeAndValue.ParentVariableName = parentVariableName;
-        nv.OwningStructName = owningStructName;
-        nv.FieldName = bf.Name;
-        nv.BitfieldStorage = storagePtr;
-        nv.BitfieldStorageType = storageTy;
-        nv.BitfieldOffset = bf.BitOffset;
-        nv.BitfieldWidth = bf.BitWidth;
-        nv.BitfieldUnsigned = isUnsigned;
-        return nv;
-    }
-
 bool MainListener::ResolveTransparentAnonField(
         antlr4::ParserRuleContext* ctx,
         const LLVMBackend::NamedVariable& structVar,
@@ -14086,9 +14034,9 @@ bool MainListener::ResolveTransparentAnonField(
             llvm::Value* storagePtr = curSd.IsUnion
                 ? ptr
                 : compiler->CreateStructGEP(curType, ptr, (unsigned)chain.back());
-            out = EmitBitfieldAccess(compiler, storagePtr, storageTy, bitfieldHit,
-                                     structVar.TypeAndValue.VariableName,
-                                     structVar.TypeAndValue.TypeName);
+            out = compiler->EmitBitfieldRead(storagePtr, storageTy, bitfieldHit,
+                                             structVar.TypeAndValue.VariableName,
+                                             structVar.TypeAndValue.TypeName);
             out.IsBorrowed = structVar.IsBorrowed;
             out.BorrowedOrigin = structVar.BorrowedOrigin;
             return true;

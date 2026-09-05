@@ -5723,19 +5723,6 @@ public:
     struct SimdMathIntrinsic { llvm::Intrinsic::ID Id; int Arity; };
     const SimdMathIntrinsic* LookupSimdMathIntrinsic(const std::string& name);
 
-    // Emit a bitfield READ from a storage word and return a fully-configured NamedVariable. The
-    // returned variable carries BitfieldStorage/Offset/Width/Unsigned so the assignment codegen
-    // (bitfieldAssign) can do the read-modify-write store on the WRITE path. This is the single
-    // source of truth for bitfield access masking/shift, shared by the normal member-access path
-    // and the transparent anonymous-member path (do not duplicate the mask/shift logic).
-    LLVMBackend::NamedVariable EmitBitfieldAccess(
-        LLVMBackend* compiler,
-        llvm::Value* storagePtr,
-        llvm::Type* storageTy,
-        const LLVMBackend::BitfieldInfo& bf,
-        const std::string& parentVariableName,
-        const std::string& owningStructName);
-
     // C11 transparent anonymous-member access: resolve `base.fieldName` where `fieldName` is not
     // a direct field of `base` but lives inside an anonymous (synthetic "__anonN") struct/union
     // member - possibly nested. The C-interop extractor flattens a C11 anonymous member to a
