@@ -4656,6 +4656,37 @@ bool testGnViewArgIntoPointerDeclarator()
 // dropped, so P<int*[]> shared the P<int[]> instantiation and '*h.p[1]' emitted an invalid load.
 struct GvpFoo { int a = default; };
 
+// Overload selection reads the view's ELEMENT star. Opaque pointers made an 'int*[]' argument
+// score a PERFECT match on an 'int[]' parameter, so the first declared overload won and
+// '*d[1]' read a stack address as an int (11 instead of 2).
+int gvpPickElem(int[] d) { return d[1]; }
+int gvpPickElem(int*[] d) { return *d[1]; }
+
+// 'new T[n]' with T substituted to a POINTER is an 'S*[]' view; the result has to record the
+// element star, or it binds (and is read as) an 'S[]'.
+// The '(T[])' cast target keeps the element star of a substituted pointer 'T', so the round
+// trip through 'T* -> T[]' binds a 'T[]' local (core span<T>::_offset has this exact shape).
+int gvpCastRound<T>(int expect)
+{
+    T[] a = new T[2];
+    T[] b = (T[])(&a[0]);
+    int got = (int)sizeof(T);
+    delete[_] a;
+    return got == expect ? expect : -1;
+}
+
+// A 'T[]' parameter inferred from a view ARGUMENT, at a value and a pointer element.
+int gvpElemSize<T>(T[] v) { return (int)sizeof(T); }
+
+int gvpNewStarRead<T>(T a, T b)
+{
+    T[] v = new T[2];
+    v[0] = a; v[1] = b;
+    T r = v[1];
+    delete[] v;
+    return *r;
+}
+
 bool testGnViewOfPointersArg()
 {
     bool result = true;
@@ -4710,6 +4741,27 @@ bool testGnViewOfPointersArg()
 
     // A raw (non-generic) view of pointers spells its element star as well.
     result &= Test("gvp_raw_view_typeof", typeof(pview), "int*[]");
+
+    // Overload set: each spelling reaches its OWN overload, not the first declared one.
+    result &= Test("gvp_overload_value_elem", gvpPickElem(vview), 11);
+    result &= Test("gvp_overload_ptr_elem", gvpPickElem(pview), 2);
+
+    // 'new T[n]' at T=int* keeps the element star, so the view still binds a 'T[]' local and
+    // reads back the pointer that was stored (not the destination's would-be int element).
+    result &= Test("gvp_new_star_elem", gvpNewStarRead<int*>(&one, &two), 2);
+
+    // The '(T[])' cast is the sanctioned 'T* -> T[]' re-establish (core span<T>::_offset). Its
+    // result must carry the ELEMENT star too, or the gate rejects the core method at T=int*.
+    result &= Test("gvp_cast_elem_int", gvpCastRound<int>(4), 4);
+    result &= Test("gvp_cast_elem_ptr", gvpCastRound<int*>(8), 8);
+    result &= Test("gvp_cast_elem_foo", gvpCastRound<GvpFoo>(4), 4);
+    result &= Test("gvp_cast_elem_string", gvpCastRound<string>(16), 16);
+
+    // Inference over a 'T[]' parameter reads the ARGUMENT's declared element, never the
+    // opaque-pointer recovery (which spelled every view element 'i8').
+    result &= Test("gvp_infer_int_elem", gvpElemSize(vview), 4);
+    result &= Test("gvp_infer_ptr_elem", gvpElemSize(pview), 8);
+    result &= Test("gvp_infer_explicit", gvpElemSize<int>(vview), 4);
 
     // The tuple sugar encodes an element the same way a generic argument does, so
     // `(int*[], int[])` keys apart from `(int[], int[])`. These legs lived in a function of

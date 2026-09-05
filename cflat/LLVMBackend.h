@@ -901,6 +901,11 @@ public:
             if (PointerDepthRefuses(other))
                 return false;
 
+            // View-to-view: the ELEMENT star is part of the type, so 'int*[]' is not 'int[]'.
+            // Both sides record it (a view spells depth about its element), so this is proven.
+            if (IsArrayView && other.IsArrayView && ElemPointer != other.ElemPointer)
+                return false;
+
             if (TypeName == other.TypeName)
                 return true;
 
@@ -6613,6 +6618,12 @@ public:
     bool IsKnownTypeName(const std::string& name) const;
 
     llvm::Type* GetType(const LLVMBackend::TypeAndValue& typeAndValue, llvm::Type* autoType = nullptr, bool allowPointer = true) const;
+
+    // Array-view element gate: true only when a view SOURCE binds to a destination whose
+    // ELEMENT representation is PROVEN different (name/depth). Fills the two spellings.
+    bool ArrayViewElementMismatch(const LLVMBackend::TypeAndValue& dest,
+                                  const LLVMBackend::TypeAndValue& src,
+                                  std::string& destElement, std::string& srcElement) const;
 
     /*
      * Tie-breaker between overloads that differ only in 'move': for each parameter, score +1

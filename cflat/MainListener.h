@@ -4827,6 +4827,11 @@ public:
                                      const LLVMBackend::TypeAndValue& target,
                                      const LLVMBackend::NamedVariable& rhs);
 
+    // Element-axis sibling of RejectRawPointerToArrayView, same two binding doors.
+    bool RejectArrayViewElementMismatch(antlr4::ParserRuleContext* ctx,
+                                     const LLVMBackend::TypeAndValue& target,
+                                     const LLVMBackend::NamedVariable& rhsNV);
+
     llvm::Value* ParseAssignmentExpression(CFlatParser::AssignmentExpressionContext* ctx);
 
     // Box a THIN '?:' arm (`new T()` / `nullptr` / a borrowed pointer) into the interface fat

@@ -110,6 +110,58 @@ static bool DecodeSimdSpelling(const std::string& text, std::string& elemOut, ui
     return true;
 }
 
+/*
+ * A view SOURCE indexes by its ELEMENT, so binding it to a destination whose element differs
+ * strides and loads with the wrong shape (silent garbage, or a raw verifier failure when the
+ * loaded kind changes). Proves the difference before rejecting: the ELEMENT pointer depth, or -
+ * for a view destination only - the element's lowered llvm type. A plain `T*` destination is the
+ * one-way `T[] -> T*` decay, where a differing element NAME is the long-standing byte/scalar
+ * reinterpret idiom (`u8* p = intView;`) and only a depth change is proven broken.
+ */
+bool LLVMBackend::ArrayViewElementMismatch(const LLVMBackend::TypeAndValue& dest,
+                                           const LLVMBackend::TypeAndValue& src,
+                                           std::string& destElement, std::string& srcElement) const
+{
+        if (!src.IsArrayView) return false;
+        if (!dest.IsArrayView && !dest.Pointer) return false;
+        // An interface destination reboxes through its own gate; a closure carries a signature,
+        // not an element. Neither indexes by the view's element.
+        if (dest.IsInterface || src.IsInterface) return false;
+        if (dest.IsFunctionPointer || src.IsFunctionPointer) return false;
+        // 'void*' is the universal address destination - it never indexes by an element.
+        if (dest.TypeName == "void") return false;
+
+        // The DEPTH axis needs no name: an unnamed loaded view value still records its element
+        // star, and a pointer element against a value element is proven either way.
+        bool depthDiffers = dest.ElemPointer != src.ElemPointer;
+        bool nameDiffers = false;
+        if (dest.IsArrayView && !depthDiffers
+            && !dest.TypeName.empty() && !src.TypeName.empty() && dest.TypeName != src.TypeName)
+        {
+            // Compare the LOWERED element type, so 'int'/'i32'/'u32', an alias and an enum all
+            // read as the same representation. GetType does NOT return null on an unknown name -
+            // it reports "unknown type" and hands back void - so gate on the silent lookup first.
+            if (IsKnownTypeName(dest.TypeName) && IsKnownTypeName(src.TypeName))
+            {
+                LLVMBackend::TypeAndValue destBase;
+                destBase.TypeName = dest.TypeName;
+                LLVMBackend::TypeAndValue srcBase;
+                srcBase.TypeName = src.TypeName;
+                llvm::Type* destType = GetType(destBase, nullptr, false);
+                llvm::Type* srcType = GetType(srcBase, nullptr, false);
+                nameDiffers = destType != nullptr && srcType != nullptr && destType != srcType;
+            }
+        }
+        if (!depthDiffers && !nameDiffers) return false;
+
+        // 'T' stands in when a loaded value carries no declared name; the star half is always known.
+        destElement = (dest.TypeName.empty() ? std::string("T") : dest.TypeName)
+            + (dest.ElemPointer ? "*" : "");
+        srcElement = (src.TypeName.empty() ? std::string("T") : src.TypeName)
+            + (src.ElemPointer ? "*" : "");
+        return true;
+    }
+
 llvm::Type* LLVMBackend::GetType(const LLVMBackend::TypeAndValue& typeAndValue, llvm::Type* autoType, bool allowPointer) const
 {
         if (typeAndValue.IsFunctionPointer)

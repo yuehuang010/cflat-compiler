@@ -497,10 +497,11 @@ std::string MainListener::TryInferAndInstantiateFromArgs(const std::string& func
                     argType = base + std::string(argStars, '*') + (argView ? "[]" : "");
                     declared = true;
                 }
-                // Free-function calls drop TypeName for signed-int args (call site only
-                // preserves it for unsigned ints). Fall back to the LLVM BaseType so
-                // numeric literals like 3 and (i64)10 still infer cleanly.
-                if (argType.empty() && args[i].BaseType != nullptr)
+                // Free-function calls drop TypeName for signed-int args. Fall back to the LLVM
+                // BaseType so literals infer; NOT for a view, whose opaque pointer recovers as
+                // a bogus 'i8' ELEMENT name that then fails the element-match gate.
+                if (argType.empty() && args[i].BaseType != nullptr
+                    && !args[i].TypeAndValue.IsArrayView)
                     argType = Compiler()->LlvmTypeToTypeName(args[i].BaseType);
                 if (argType.empty()) break;
                 auto prev = inferred.find(tp);

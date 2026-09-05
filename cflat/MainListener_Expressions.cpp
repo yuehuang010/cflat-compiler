@@ -1382,6 +1382,19 @@ bool MainListener::RejectRawPointerToArrayView(antlr4::ParserRuleContext* ctx,
         return false;
     }
 
+bool MainListener::RejectArrayViewElementMismatch(antlr4::ParserRuleContext* ctx,
+                                     const LLVMBackend::TypeAndValue& target,
+                                     const LLVMBackend::NamedVariable& rhsNV) {
+        std::string destElement;
+        std::string srcElement;
+        if (!Compiler()->ArrayViewElementMismatch(target, rhsNV.TypeAndValue, destElement, srcElement))
+            return false;
+        LogErrorContext(ctx, std::format(
+            "cannot bind an array view of '{}' to a destination of '{}' - a view indexes by its "
+            "own element, so the element types must match", srcElement, destElement));
+        return true;
+    }
+
 llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpressionContext* ctx) {
         auto* compiler = Compiler(ctx);
         auto condCtx = ctx->conditionalExpression();
@@ -1845,6 +1858,8 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
             if (operatorText == "=")
             {
                 RejectRawPointerToArrayView(ctx, namedVar.TypeAndValue, rightNV);
+                // Same door, element axis: `s.view = otherElemView;` strides by the wrong element.
+                RejectArrayViewElementMismatch(ctx, namedVar.TypeAndValue, rightNV);
                 // Permanently clear the declaration-time provenance flag on ANY reassignment,
                 // regardless of what this RHS is. Recomputing it from THIS RHS would be
                 // WALK-ORDER over the AST, not control flow: a reassignment inside one branch
@@ -8670,8 +8685,12 @@ LLVMBackend::TypeAndValue MainListener::ParseTypeName(CFlatParser::TypeNameConte
                         "use '(T[])' for the noalias array-view");
                 if (dimSpec->assignmentExpression().empty())
                 {
+                    // Mirror the declaration path: a star already on the specifier (written, or
+                    // folded in from a substitution/alias) is the ELEMENT star of `(T*[])`.
+                    bool elementPointer = typeValue.Pointer;
                     typeValue.IsArrayView = true;
                     typeValue.Pointer = true;
+                    typeValue.ElemPointer = elementPointer || typeValue.ElemPointer;
                 }
             }
         }
@@ -11888,6 +11907,9 @@ LLVMBackend::NamedVariable MainListener::ParseNewExpression(CFlatParser::NewExpr
         // `new T[n]` yields a thin array-view: a fresh, whole, distinct allocation - the blessed
         // way to obtain an `int[]`. Decays implicitly to `T*` when stored into a pointer lvalue.
         result.TypeAndValue.IsArrayView = isArray;
+        // A substituted POINTER element ('new T[n]' with T=S*) is an 'S*[]' view; without the
+        // star the result read as an 'S[]' and bound anything an 'S[]' binds.
+        result.TypeAndValue.ElemPointer = isArray && typeIsPtr;
         result.Primary = typedPtr;
         result.BaseType = ptrTy;
         result.RawArrayLength = isArray ? count : nullptr;

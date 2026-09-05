@@ -720,6 +720,18 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
             LogErrorContext(errCtx, "cannot return a raw pointer 'T*' as an array-view 'T[]' - "
                 "a view must span a whole allocation (from 'new T[n]' or another 'T[]'); "
                 "the 'T[] -> T*' decay is one-way");
+        // Element axis of the same gate: the returned view must index by the declared element.
+        {
+            std::string retDestElement;
+            std::string retSrcElement;
+            if (compiler->ArrayViewElementMismatch(compiler->currentFunctionReturnTV,
+                                                  returnNV.TypeAndValue,
+                                                  retDestElement, retSrcElement))
+                LogErrorContext(errCtx, std::format(
+                    "cannot return an array view of '{}' from a function whose return element is "
+                    "'{}' - a view indexes by its own element, so the elements must match",
+                    retSrcElement, retDestElement));
+        }
         // Return leg of the code-value store gate: `return w;` from a `Rec*`
         // function handed the caller a code address to write through.
         if (compiler->CodeValueIntoDataDestination(

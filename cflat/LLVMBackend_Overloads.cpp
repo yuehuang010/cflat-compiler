@@ -327,6 +327,15 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                     if (result >= 0 && candidateParamItr->Pointer && argIsCodeValue)
                         result = -1;
 
+                    // Opaque pointers make every view look alike to CompareUpconvert; both sides
+                    // record the ELEMENT star, so refusing 'int*[]' against 'int[]' is proven.
+                    // With a lone candidate there is nothing to disambiguate, so let the pair
+                    // through and let the element gate at the call site speak the real reason.
+                    if (result >= 0 && candidates.size() > 1
+                        && arg.TypeAndValue.IsArrayView && candidateParamItr->IsArrayView
+                        && arg.TypeAndValue.ElemPointer != candidateParamItr->ElemPointer)
+                        result = -1;
+
                     // Opaque pointers make every pointer pair look identical to CompareUpconvert.
                     // An argument whose CFlat type is unknown (empty TypeName - primitive pointers
                     // like '&boolVar') binding to a pointer-to-struct parameter is only an IMPLICIT
@@ -1214,6 +1223,35 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                     "must span a whole allocation (it comes only from '{}' or another '{}'); "
                     "the '{} -> {}' decay is one-way",
                     { "T*", candParamItr->VariableName, "T[]", "new T[n]", "T[]", "T[]", "T*" });
+
+            // Element axis of the same gate: a view argument whose ELEMENT differs from the
+            // parameter's strides and loads with the wrong shape inside the callee.
+            if (!inVariadicRange)
+            {
+                std::string destElement;
+                std::string srcElement;
+                // A view ARGUMENT reaches here as a loaded value whose TypeName is blank; recover
+                // the declared element name from the named variable so the message can spell it.
+                LLVMBackend::TypeAndValue argTV = arg.TypeAndValue;
+                if (argTV.TypeName.empty() && !arg.CallerName.empty())
+                    if (const NamedVariable* declared = FindLiveNamedVariable(arg.CallerName))
+                    {
+                        if (arg.FieldName.empty() && declared->TypeAndValue.IsArrayView)
+                            argTV.TypeName = declared->TypeAndValue.TypeName;
+                        // A FIELD read: CallerName names the base struct, so the element name
+                        // lives on the field's declaration, not on the base's TypeName.
+                        else if (auto base = dataStructures.find(declared->TypeAndValue.TypeName);
+                                 !arg.FieldName.empty() && base != dataStructures.end())
+                            for (const auto& f : base->second.StructFields)
+                                if (f.VariableName == arg.FieldName && f.IsArrayView)
+                                    argTV.TypeName = f.TypeName;
+                    }
+                if (ArrayViewElementMismatch(*candParamItr, argTV, destElement, srcElement))
+                    LogErrorMessage(
+                        "cannot pass an array view of '{}' as parameter '{}' of '{}', whose element "
+                        "is '{}' - a view indexes by its own element, so the elements must match",
+                        { srcElement, candParamItr->VariableName, diagnosticFunctionName, destElement });
+            }
 
             // Closure SHAPE gate (value vs pointer vs view), shared with virtual dispatch.
             // Hoisted above the binding branches: it judges the pair, not one binding arm.

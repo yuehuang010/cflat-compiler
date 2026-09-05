@@ -1,0 +1,80 @@
+// A view indexes by its own ELEMENT, so binding one to a destination whose element differs
+// strides and loads with the wrong shape. Before: the binding doors checked view-ness only,
+// so 'B<int*[]> b; b.p = intView;' compiled silently (element stride 4 over an array of
+// pointers) and the generic 'W<T[]>.v = T*[]' spelling died as a raw module-verifier dump.
+
+struct AvmBox<T> { T v = default; };
+struct AvmPtrBox<T> { T* p = default; };
+struct AvmPlain { int[] v = default; };
+struct AvmFoo { int a = default; };
+struct AvmBar { int b = default; };
+
+// Return leg: the declared element is 'int', the returned view's element is 'int*'.
+expect_error("cannot return an array view of 'int*' from a function whose return element is 'int'") {
+    int[] avmReturnStar(int*[] q) { return q; }
+}
+
+int avmTakeInt(int[] d) { return d[1]; }
+
+extern int main()
+{
+    int one = 1; int two = 2;
+    int*[2] cells; cells[0] = &one; cells[1] = &two;
+    int*[] pview = cells;
+
+    int[3] store; store[0] = 10; store[1] = 20; store[2] = 30;
+    int[] iview = store;
+
+    // Declaration initializer: element 'int*' into element 'int'.
+    expect_error("cannot bind an array view of 'int*' to a destination of 'int'") {
+        int[] avmDeclInit = pview;
+    }
+
+    // Reassignment of an existing view local.
+    expect_error("cannot bind an array view of 'int*' to a destination of 'int'") {
+        int[] avmAssign = iview;
+        avmAssign = pview;
+    }
+
+    // Field store into a non-generic 'int[]' field.
+    expect_error("cannot bind an array view of 'int*' to a destination of 'int'") {
+        AvmPlain avmPlain = default;
+        avmPlain.v = pview;
+    }
+
+    // Field store into a generic view field 'AvmBox<int[]>.v'.
+    expect_error("cannot bind an array view of 'int*' to a destination of 'int'") {
+        AvmBox<int[]> avmBox = default;
+        avmBox.v = pview;
+    }
+
+    // Repro A: 'T*' with T bound to 'int*[]' decays to the element pointer 'int**', so an
+    // 'int[]' view (element 'int') is one pointer level short of the destination element.
+    expect_error("cannot bind an array view of 'int' to a destination of 'int*'") {
+        AvmPtrBox<int*[]> avmPtrBox = default;
+        avmPtrBox.p = iview;
+    }
+
+    // A struct element is its own type: 'AvmFoo[]' is not an 'AvmBar[]' even at equal layout.
+    expect_error("cannot bind an array view of 'AvmFoo' to a destination of 'AvmBar'") {
+        AvmFoo[2] avmFoos; avmFoos[0].a = 1; avmFoos[1].a = 2;
+        AvmFoo[] avmFooView = avmFoos;
+        AvmBar[] avmBarView = avmFooView;
+    }
+
+    // Differing element WIDTH: a 'u8[]' view read as 'int[]' strides by 4 over bytes.
+    expect_error("cannot bind an array view of 'u8' to a destination of 'int'") {
+        u8[4] avmBytes; avmBytes[0] = 1; avmBytes[1] = 2; avmBytes[2] = 3; avmBytes[3] = 4;
+        u8[] avmByteView = avmBytes;
+        int[] avmWide = avmByteView;
+    }
+
+    // Call-argument leg, element name axis: the message names the FUNCTION, then its element.
+    expect_error("cannot pass an array view of 'u8' as parameter 'd' of 'avmTakeInt', whose element is 'int'") {
+        u8[4] avmArgBytes; avmArgBytes[0] = 9;
+        u8[] avmArgView = avmArgBytes;
+        int avmArgResult = avmTakeInt(avmArgView);
+    }
+
+    return 0;
+}
