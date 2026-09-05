@@ -743,6 +743,37 @@ const LockMode* MainListener::FindHeldGuard(const std::string& receiverPath, con
         return probe(receiverPath + "." + guard);
     }
 
+// The leading component of a lock key: 'inner.mtx' / 'inner[0].mtx' -> 'inner'.
+static std::string LockKeyRoot(const std::string& path)
+{
+    size_t end = path.find_first_of(".[");
+    return end == std::string::npos ? path : path.substr(0, end);
+}
+
+bool MainListener::LockRootIsImplicitThisField(const std::string& name) const {
+        if (name.empty()) return false;
+        // A local or a parameter of that name shadows the field, so the bare spelling names
+        // something else entirely - same order the postfix implicit-this door uses.
+        if (compilerLLVM->GetLocalVariable(name).Storage != nullptr) return false;
+        if (compilerLLVM->GetFunctionArgument(name).GetValue() != nullptr) return false;
+        return compilerLLVM->HasMemberVariable(name);
+    }
+
+bool MainListener::LockSetHoldsPath(const std::string& key) const {
+        if (key.empty()) return false;
+        if (currentLockSet.find(key) != currentLockSet.end()) return true;
+        // Bridge the bare and 'this.'-qualified spellings only when the bare root really IS a
+        // field of the enclosing struct; a shadowing local or parameter names a different object.
+        if (key.starts_with("this."))
+        {
+            std::string bare = key.substr(5);
+            if (!LockRootIsImplicitThisField(LockKeyRoot(bare))) return false;
+            return currentLockSet.find(bare) != currentLockSet.end();
+        }
+        if (!LockRootIsImplicitThisField(LockKeyRoot(key))) return false;
+        return currentLockSet.find("this." + key) != currentLockSet.end();
+    }
+
 void MainListener::CheckGuardedFieldRead(antlr4::ParserRuleContext* ctx, const std::string& fieldName,
                                         const std::string& guard, const std::string& receiverPath,
                                         const std::string& receiverName, std::string& heldKey) {
@@ -792,7 +823,8 @@ void MainListener::CheckGuardedWrite(antlr4::ParserRuleContext* ctx, const LLVMB
 
 void MainListener::CheckCallSiteLocks(antlr4::ParserRuleContext* ctx,
                             const std::string& receiverText,
-                            const std::vector<LLVMBackend::NamedVariable>& arguments) {
+                            const std::vector<LLVMBackend::NamedVariable>& arguments,
+                            const std::string& receiverPath) {
         const auto& requiredLocks = compilerLLVM->lastCallRequiredLocks;
         if (requiredLocks.empty()) return;
 
@@ -810,9 +842,11 @@ void MainListener::CheckCallSiteLocks(antlr4::ParserRuleContext* ctx,
             std::string canonical;
             if (head == "this")
             {
-                // this-relative lock: substitute with the receiver variable name.
-                if (receiverText.empty()) continue; // no known receiver - skip
-                canonical = rest.empty() ? receiverText : receiverText + "." + rest;
+                // this-relative lock: substitute with the receiver's canonical source path, which
+                // is the spelling lock(...) records; fall back to its root name when not a path.
+                std::string base = IsSimpleLockPath(receiverPath) ? receiverPath : receiverText;
+                if (base.empty()) continue; // no known receiver - skip
+                canonical = rest.empty() ? base : base + "." + rest;
             }
             else
             {
@@ -824,10 +858,14 @@ void MainListener::CheckCallSiteLocks(antlr4::ParserRuleContext* ctx,
                     // arguments[pi] corresponds to paramNames[pi] (both include implicit this at index 0).
                     if (pi < arguments.size())
                     {
+                        // The argument's canonical path ('&o.inner' -> 'o.inner') is the spelling
+                        // lock(...) records; a non-path argument keeps the legacy root-name key.
+                        const std::string& argPath = arguments[pi].CallerLockPath;
                         const std::string& argName = arguments[pi].CallerName;
-                        if (argName.empty()) found = true; // complex expression - can't check
+                        const std::string& base = argPath.empty() ? argName : argPath;
+                        if (base.empty()) found = true; // complex expression - can't check
                         else
-                            canonical = rest.empty() ? argName : argName + "." + rest;
+                            canonical = rest.empty() ? base : base + "." + rest;
                     }
                     found = true;
                     break;
@@ -836,7 +874,7 @@ void MainListener::CheckCallSiteLocks(antlr4::ParserRuleContext* ctx,
                     canonical = lock; // global lock - no substitution
             }
 
-            if (!canonical.empty() && currentLockSet.find(canonical) == currentLockSet.end())
+            if (!canonical.empty() && !LockSetHoldsPath(canonical))
             {
                 LogErrorContext(ctx, std::format(
                     "must hold '{}' before calling this function.", canonical));

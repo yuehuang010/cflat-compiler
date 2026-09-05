@@ -1371,10 +1371,22 @@ struct LockPathCell {
         // which the group seeding records - it used to key on the mangled 'this' spelling.
         int GetThis()     { return this.value; }
         int GetThisBits() { return this.bits; }
+        void AddValue(int n) { value = value + n; }
     }
 };
 
 struct LockPathOuter { LockPathCell inner = default; LockPathCell other = default; };
+
+// Implicit-'this' row of the call door. Inside a method `inner` and `this.inner` name ONE
+// object, so a lock(...) written in either spelling must cover a call argument or a UFCS
+// receiver written in the other; keying each side on its literal spelling false-rejected all
+// three shapes below with the lock held.
+struct LockPathThisOuter {
+    LockPathCell inner = default;
+    void mThisLockBareArg(int n) { lock(this.inner.mtx) { lockPathBump(&inner, n); } }
+    void mBareLockThisUfcs(int n) { lock(inner.mtx) { this.inner.AddValue(n); } }
+    void mBareLockThisArg(int n) { lock(inner.mtx) { lockPathBump(&this.inner, n); } }
+};
 
 // The atomic release(val, body) lambda seeds the lock set from the RECEIVER PATH of the
 // atomic, so a guard reached through a deeper receiver seeds 'a.flagged.ready', not 'flagged.ready'.
@@ -1392,6 +1404,10 @@ int lockPathNested(LockPathOuter* o) {
     lock(o.inner.mtx) { v = o.inner.value + o.inner.bits; }
     return v;
 }
+
+// Call door: the clause parameter 'a' resolves to the ARGUMENT's canonical path, so
+// lock(o.inner.mtx) covers lockPathBump(&o.inner, ...) - it used to key on the root 'o'.
+void lockPathBump(LockPathCell* a, int n) lock(a.mtx) { a.value = a.value + n; }
 
 int lockPathElement(LockPathCell[] arr) {
     int v = 0;
@@ -1420,6 +1436,36 @@ bool testLockGuardedReceiverPath()
     LockPathCell[2] arr;
     lock(arr[1].mtx) { arr[1].value = 40; arr[1].bits = 2; }
     result &= Test("lock_path_element", lockPathElement(arr), 42);
+
+    // Shape 4: call door, nested argument. Pre-fix this reported "must hold 'n2.mtx'".
+    LockPathOuter n2;
+    lock(n2.inner.mtx) { lockPathBump(&n2.inner, 7); }
+    lock(n2.inner.mtx) { result &= Test("lock_call_nested_path", n2.inner.value, 7); }
+
+    // Shape 5: call door, array-element argument (pre-fix key was 'arr2.mtx').
+    LockPathCell[2] arr2;
+    lock(arr2[1].mtx) { lockPathBump(&arr2[1], 9); }
+    lock(arr2[1].mtx) { result &= Test("lock_call_element_path", arr2[1].value, 9); }
+
+    // Shape 6: call door, arrow-spelled argument (pre-fix key was 'pn3.mtx').
+    LockPathOuter n3;
+    LockPathOuter* pn3 = &n3;
+    lock(pn3->inner.mtx) { lockPathBump(&pn3->inner, 11); }
+    lock(pn3->inner.mtx) { result &= Test("lock_call_arrow_path", pn3->inner.value, 11); }
+
+    // Shape 7: receiver door, in-group method through a nested receiver (pre-fix key 'inner.mtx').
+    lock(n2.inner.mtx) { n2.inner.AddValue(5); }
+    lock(n2.inner.mtx) { result &= Test("lock_call_method_path", n2.inner.value, 12); }
+
+    // Shape 8: the two implicit-'this' spellings crossed. Each of these reported
+    // "must hold '...'" with the lock actually held before the key was normalized.
+    LockPathThisOuter t;
+    t.mThisLockBareArg(13);
+    lock(t.inner.mtx) { result &= Test("lock_call_this_lock_bare_arg", t.inner.value, 13); }
+    t.mBareLockThisUfcs(4);
+    lock(t.inner.mtx) { result &= Test("lock_call_bare_lock_this_ufcs", t.inner.value, 17); }
+    t.mBareLockThisArg(6);
+    lock(t.inner.mtx) { result &= Test("lock_call_bare_lock_this_arg", t.inner.value, 23); }
 
     // Nested atomic guard: the release() lambda's seeded key must match the body's access key.
     LockPathFlagOuter a;

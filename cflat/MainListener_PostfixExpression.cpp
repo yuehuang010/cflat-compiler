@@ -4953,6 +4953,9 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 argumentNamedVar.TypeAndValue.VariableName = "";
                                 // An owning-value rvalue temp receiver is dropped after the call - destruct it.
                                 RegisterOwningTempReceiver(ctx, structVar, argumentNamedVar, functionName);
+                                // A UFCS receiver is the callee's first parameter, so give it the same
+                                // canonical lock path the explicit-argument door records.
+                                argumentNamedVar.CallerLockPath = LockPathForOperandText(lastMemberReceiverPath);
                                 arguments.push_back(argumentNamedVar);
                             }
                             else if (!globalScopeCall)
@@ -5342,6 +5345,10 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                         Compiler(ctx)->RegisterOwnedStringTemp(argValue);
 
                                     argVar.CastOccurrenceId = thisCastOcc;
+                                    // Canonical lock path of the argument as written, so a lock(a.mtx)
+                                    // clause keys on 'o.inner.mtx' for bump(&o.inner, ...).
+                                    argVar.CallerLockPath = LockPathForOperandText(
+                                        namedArgument->assignmentExpression()->getText());
                                     Compiler(ctx)->EndCastOccurrence(savedCastOcc);
                                     arguments.emplace_back(argVar);
                                 }
@@ -5507,7 +5514,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                         if (fp.ends_with("__"))
                                             rcvr = "this";
                                     }
-                                    CheckCallSiteLocks(ctx, rcvr, arguments);
+                                    CheckCallSiteLocks(ctx, rcvr, arguments, lastMemberReceiverPath);
                                 }
                                 namedVar.Storage = nullptr;
                                 namedVar.BaseType = namedVar.Primary ? namedVar.Primary->getType() : nullptr;
@@ -5569,7 +5576,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                         if (fp.ends_with("__"))
                                             rcvr = "this";
                                     }
-                                    CheckCallSiteLocks(primaryCtx, rcvr, arguments);
+                                    CheckCallSiteLocks(primaryCtx, rcvr, arguments, lastMemberReceiverPath);
                                 }
                                 namedVar.Storage = nullptr;
                                 namedVar.BaseType = namedVar.Primary ? namedVar.Primary->getType() : nullptr;

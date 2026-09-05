@@ -1517,6 +1517,9 @@ public:
         llvm::Value* OwningLocalStorage = nullptr;
         llvm::Value* RefCountStorage = nullptr; // lazy i32 alloca at function entry; non-null only when pointer escaped to a field
         std::string CallerName;          // the variable's name at the call site, for move tracking
+        // Canonical lock path of the argument spelling ('&o.inner' -> 'o.inner'), empty when the
+        // spelling is not a plain path. Read only by CheckCallSiteLocks; not cached by --init.
+        std::string CallerLockPath;
         std::string OwningStructName;    // when this NamedVariable is a struct-field access, the field's owning struct
         std::string FieldName;           // when this NamedVariable is a struct-field access, the field name
         std::string FieldPathText;       // source spelling of a field path, e.g. "w.inner.b"

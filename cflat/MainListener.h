@@ -2089,6 +2089,17 @@ inline bool IsSimpleLockPath(const std::string& text)
     return true;
 }
 
+// The canonical lock path an ARGUMENT (or receiver) spelling names: '&o.inner' -> 'o.inner',
+// 'p->inner' -> 'p.inner', 'arr[0]' -> 'arr[0]'. Empty when the spelling is not a plain path
+// (a call result, an arithmetic index) - the caller then keeps its legacy root key.
+inline std::string LockPathForOperandText(const std::string& operandText)
+{
+    std::string text = operandText;
+    if (!text.empty() && text.front() == '&') text.erase(0, 1);
+    text = ArrowNormalizeLockText(text);
+    return IsSimpleLockPath(text) ? text : std::string();
+}
+
 // The lock-set key a guarded field reached through `receiverPath` resolves to. `this` names the
 // receiver's own struct, whose guardian the method-body seeding records bare - see FindHeldGuard.
 inline std::string GuardKeyForPath(const std::string& receiverPath, const std::string& guard)
@@ -6061,6 +6072,14 @@ public:
     const LockMode* FindHeldGuard(const std::string& receiverPath, const std::string& guard,
                                   std::string* matchedKey = nullptr) const;
 
+    // True when the lock set holds `key` under EITHER implicit-this spelling. Inside a method
+    // `inner.mtx` and `this.inner.mtx` name one lock, and a `lock(...)` statement records only
+    // the spelling the user wrote - so both are probed, exactly as FindHeldGuard does.
+    // True when a bare `name` in the current method body resolves to a FIELD of the enclosing
+    // struct - false when a local or a parameter of that name shadows it.
+    bool LockRootIsImplicitThisField(const std::string& name) const;
+    bool LockSetHoldsPath(const std::string& key) const;
+
     // Read-side guarded-field check for a receiver-qualified access ('o.inner.value'). Keys on
     // the canonical receiver PATH, the same spelling `lock(...)` records, so a held lock on a
     // deeper receiver matches. A receiver that is not a plain path keeps the legacy
@@ -6080,10 +6099,12 @@ public:
     // Called immediately after CreateOverloadedFunctionCall; reads lastCallRequiredLocks and
     // lastCallParameterNames from the side-channel populated by that call.
     // receiverText: the name of the receiver object ("acct"), "this" for bare method calls, or "".
+    // receiverPath: the receiver's canonical source path ("o.inner" for o.inner.m()), or "".
     // arguments: the NamedVariable vector passed to the call (includes implicit this at index 0 when present).
     void CheckCallSiteLocks(antlr4::ParserRuleContext* ctx,
                             const std::string& receiverText,
-                            const std::vector<LLVMBackend::NamedVariable>& arguments);
+                            const std::vector<LLVMBackend::NamedVariable>& arguments,
+                            const std::string& receiverPath = {});
 
     // Find the first registered overload of `methodName` whose first parameter type is `firstParamType`.
     llvm::Function* FindMethodOf(const std::string& methodName, const std::string& firstParamType);

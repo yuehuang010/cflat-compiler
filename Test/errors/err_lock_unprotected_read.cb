@@ -64,7 +64,10 @@ struct PathCell {
         int value = default;
     }
 };
-struct PathOuter { PathCell inner = default; PathCell other = default; };
+struct PathOuter { mutex mtx = default; PathCell inner = default; PathCell other = default; };
+
+// The call door keys on the ARGUMENT's canonical path, the same spelling lock(...) records.
+void bumpPath(PathCell* a, int n) lock(a.mtx) { a.value = a.value + n; }
 
 expect_error("Field 'value' is guarded by 'mtx': must hold 'o.other.mtx' before accessing it.") {
     int wrongNestedPath(PathOuter* o) {
@@ -81,4 +84,43 @@ expect_error("Field 'value' is guarded by 'mtx': must hold 'arr[1].mtx' before a
         lock(arr[0].mtx) { v = arr[1].value; }
         return v;
     }
+}
+
+// Call door, wrong receiver PATH: holding o.inner.mtx does not cover an argument spelled
+// &o.other. Pre-fix the key was the argument's ROOT ('o.mtx'), so this named a third path.
+expect_error("must hold 'o.other.mtx' before calling this function.") {
+    void wrongCallPath(PathOuter* o) {
+        lock(o.inner.mtx) { bumpPath(&o.other, 1); }
+    }
+}
+
+// Root-only: the OUTER object's own mutex is not the nested object's guard. Pre-fix the root
+// key made this compile clean - the lock held was not the one the clause names.
+expect_error("must hold 'o.inner.mtx' before calling this function.") {
+    void rootOnlyCallPath(PathOuter* o) {
+        lock(o.mtx) { bumpPath(&o.inner, 1); }
+    }
+}
+
+// Shadowing LOCAL: the bare-vs-'this.' bridge must not equate a local named 'inner' with the
+// field of the same name. Holding this.inner.mtx says nothing about the local object.
+expect_error("must hold 'inner.mtx' before calling this function.") {
+    struct ShadowLocalHost {
+        PathCell inner = default;
+        void m(int n) {
+            PathCell inner;
+            lock(this.inner.mtx) { bumpPath(&inner, n); }
+        }
+    };
+}
+
+// Same rule for a shadowing PARAMETER: the parameter 'inner' is a different object from the
+// field 'inner', so the field's guard does not cover the call.
+expect_error("must hold 'inner.mtx' before calling this function.") {
+    struct ShadowParamHost {
+        PathCell inner = default;
+        void m(PathCell* inner, int n) {
+            lock(this.inner.mtx) { bumpPath(inner, n); }
+        }
+    };
 }
