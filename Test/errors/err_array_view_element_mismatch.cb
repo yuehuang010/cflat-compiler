@@ -350,5 +350,44 @@ extern int main()
         int avmQqArgResult = avmTakeInt(avmQqArgLeft ?? avmFieldSrc);
     }
 
+    // A 'nullptr' / 'default' arm names no element of its own, so it is a NULL VIEW of what the
+    // other arm indexes - the join stays NAMED and the doors below judge it. It used to escape.
+    expect_error("cannot bind an array view of 'u8' to a destination of 'int'") {
+        u8[] avmNullArmDeclLeft = avmFieldSrc;
+        int[] avmNullArmDecl = avmNullArmDeclLeft ?? nullptr;
+    }
+
+    expect_error("cannot bind an array view of 'u8' to a destination of 'int'") {
+        u8[] avmNullArmDefaultLeft = avmFieldSrc;
+        int[] avmNullArmDefault = avmNullArmDefaultLeft ?? default;
+    }
+
+    // Same shape on the '?:' spelling, with the null arm on each side in turn.
+    expect_error("cannot bind an array view of 'u8' to a destination of 'int'") {
+        u8[] avmNullArmTernLeft = avmFieldSrc;
+        int[] avmNullArmTern = true ? avmNullArmTernLeft : nullptr;
+    }
+
+    expect_error("cannot bind an array view of 'u8' to a destination of 'int'") {
+        u8[] avmNullArmTernRight = avmFieldSrc;
+        int[] avmNullArmTernFlip = false ? nullptr : avmNullArmTernRight;
+    }
+
+    expect_error("cannot pass an array view of 'u8' as parameter 'd' of 'avmTakeInt'") {
+        u8[] avmNullArmArgLeft = avmFieldSrc;
+        int avmNullArmArgResult = avmTakeInt(avmNullArmArgLeft ?? nullptr);
+    }
+
+    expect_error("cannot bind an array view of 'u8' to a destination of 'int'") {
+        u8[] avmNullArmStoreLeft = avmFieldSrc;
+        AvmIfaceHolder avmNullArmStore = default;
+        avmNullArmStore.view = avmNullArmStoreLeft ?? nullptr;
+    }
+
+    // Interface elements: a null arm must not launder 'AvmIface[]' into an 'AvmIfaceB[]' slot.
+    expect_error("cannot bind an array view of 'AvmIface' to a destination of 'AvmIfaceB'") {
+        AvmIfaceB[] avmNullArmCrossIface = avmIfaceView ?? nullptr;
+    }
+
     return 0;
 }

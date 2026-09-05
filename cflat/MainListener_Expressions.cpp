@@ -4788,16 +4788,38 @@ bool MainListener::TernaryArmViewType(llvm::Value* value, llvm::Value* storage,
         return false;
     }
 
-// Both arms named: agreeing arms hand their element to the join so every binding door judges it;
-// disagreeing arms are rejected here, where the two elements are still both in view.
+// A `nullptr` / `default` arm carries no element of its own, so it is a NULL VIEW of whatever the
+// other arm indexes - it never makes the join unnameable.
+static bool TernaryArmIsNullView(llvm::Value* value) {
+        auto* constant = llvm::dyn_cast_or_null<llvm::Constant>(value);
+        return constant != nullptr && constant->getType()->isPointerTy() && constant->isNullValue();
+    }
+
+/*
+ * Agreeing arms hand their element to the join so every binding door judges it; disagreeing arms
+ * are rejected here, where the two elements are still both in view. One named arm plus a null
+ * constant is still named: the null arm inherits the named element. Only a join where NEITHER arm
+ * names an element stays unnamed (status quo: the element gate takes its unnamed escape).
+ */
 void MainListener::PropagateTernaryViewElement(antlr4::ParserRuleContext* ctx,
                                                llvm::Value* trueValue, llvm::Value* trueStorage,
                                                llvm::Value* falseValue, llvm::Value* falseStorage,
                                                llvm::Value* join, bool nullCoalesce) {
         LLVMBackend::TypeAndValue trueType;
         LLVMBackend::TypeAndValue falseType;
-        if (!TernaryArmViewType(trueValue, trueStorage, trueType)) return;
-        if (!TernaryArmViewType(falseValue, falseStorage, falseType)) return;
+        bool trueNamed = TernaryArmViewType(trueValue, trueStorage, trueType);
+        bool falseNamed = TernaryArmViewType(falseValue, falseStorage, falseType);
+        if (!trueNamed && !falseNamed) return;
+        if (!trueNamed)
+        {
+            if (!TernaryArmIsNullView(trueValue)) return;
+            trueType = falseType;
+        }
+        else if (!falseNamed)
+        {
+            if (!TernaryArmIsNullView(falseValue)) return;
+            falseType = trueType;
+        }
         std::string trueElement;
         std::string falseElement;
         if (compilerLLVM->ArrayViewElementMismatch(trueType, falseType, trueElement, falseElement))

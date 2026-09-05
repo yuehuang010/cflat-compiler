@@ -3162,7 +3162,7 @@ int runViewNullCoalesceJoin(int choose)
     int[] fromInnerTernary = (choose != 0 ? left : left) ?? other;
     int[] fromInnerCoalesce = (left ?? other) ?? other;
     int[] outerOfCoalesce = left ?? (left ?? other);
-    // An unnamed right arm leaves the join unnamed, exactly as the '?:' null arm does.
+    // A null right arm is a null view of the LEFT arm's element, so the join stays named 'int'.
     int[] nullJoin = other ?? nullptr;
     int[] defaultJoin = other ?? default;
     int[] assigned = default;
@@ -3178,6 +3178,63 @@ int runViewNullCoalesceJoin(int choose)
         + nullJoin[2] + defaultJoin[0] + assigned[1] + dest.v[2]
         + h.pickThis(other) + h.pickBare(other)
         + viewQqTake(h.v ?? other) + viewQqReturn(left, other)[1];
+}
+
+/*
+ * A view join with a `nullptr` / `default` arm and an INTERFACE element. The null arm names no
+ * element, so before the fix the join reached every boxing door unnamed and the door tried to box
+ * a class named '' - `GetOrCreateVTable: '' does not implement 'IViewNullArm::vna'`. The null arm
+ * is a null view of the other arm's element, so the join is named and no boxing is attempted.
+ */
+interface IViewNullArm { int vna(); };
+class ViewNullArmImpl : IViewNullArm { int k = default; int vna() { return k; } };
+struct ViewNullArmDest { IViewNullArm[] v = default; };
+// Every door reads through this null-tolerant helper, so the choose == 0 path (a null join) is a
+// value leg too instead of a null dereference.
+int viewNullArmTake(IViewNullArm[] v, int at) { return v == nullptr ? 0 : v[at].vna(); }
+IViewNullArm[] viewNullArmReturn(IViewNullArm[] v) { return v; }
+T[] viewNullArmPass<T>(T[] v) { return v; }
+
+int runViewJoinNullArmIface(int choose)
+{
+    ViewNullArmImpl e0; e0.k = 1;
+    ViewNullArmImpl e1; e1.k = 2;
+    ViewNullArmImpl e2; e2.k = 3;
+    ViewNullArmImpl e3; e3.k = 4;
+    ViewNullArmImpl e4; e4.k = 5;
+    ViewNullArmImpl e5; e5.k = 6;
+    ViewNullArmImpl e6; e6.k = 7;
+    ViewNullArmImpl e7; e7.k = 8;
+    IViewNullArm[8] store;
+    store[0] = e0; store[1] = e1; store[2] = e2; store[3] = e3;
+    store[4] = e4; store[5] = e5; store[6] = e6; store[7] = e7;
+    IViewNullArm[] all = store;
+    // The arm under test: a live view when choose != 0, a null one otherwise. Each element's
+    // `k` is its own index + 1, so a leg reading the wrong slot changes the total.
+    IViewNullArm[] left = choose != 0 ? all : default;
+
+    // Call-argument door, '??', both unnamed spellings.
+    int legQqDefault = viewNullArmTake(left ?? default, 0);
+    int legQqNullptr = viewNullArmTake(left ?? nullptr, 1);
+    // Return door, '?:', null arm on each side in turn.
+    IViewNullArm[] retTern = viewNullArmReturn(choose != 0 ? left : nullptr);
+    int legTernRight = retTern == nullptr ? 0 : retTern[2].vna();
+    IViewNullArm[] retTernFlip = viewNullArmReturn(choose == 0 ? nullptr : left);
+    int legTernLeft = retTernFlip == nullptr ? 0 : retTernFlip[3].vna();
+    // Field-store door, one spelling per operator.
+    ViewNullArmDest destQq = default; destQq.v = left ?? default;
+    int legFieldQq = destQq.v == nullptr ? 0 : destQq.v[4].vna();
+    ViewNullArmDest destTern = default; destTern.v = choose != 0 ? left : default;
+    int legFieldTern = destTern.v == nullptr ? 0 : destTern.v[5].vna();
+    // Generic 'T[]' parameter door.
+    IViewNullArm[] generic = viewNullArmPass<IViewNullArm>(left ?? nullptr);
+    int legGeneric = generic == nullptr ? 0 : generic[6].vna();
+    // Null arm on the LEFT of '??': the right arm supplies the element and the value. Read
+    // through the call door - the local-declaration door already named this join before the fix.
+    int legNullLeft = viewNullArmTake(nullptr ?? left, 7);
+
+    return legQqDefault + legQqNullptr + legTernRight + legTernLeft
+        + legFieldQq + legFieldTern + legGeneric + legNullLeft;
 }
 
 void rawCountSink(move RawCountElem* values) {}
@@ -4071,6 +4128,9 @@ int testRawArrayRuntimeCount()
     // Both '??' paths read the same values: the left arm is live on one and null on the other.
     passed += Test("view null-coalesce join keeps its arms' element at every door",
         runViewNullCoalesceJoin(1) * 1000 + runViewNullCoalesceJoin(0), 198198);
+    // Live path sums 1..8 = 36 through eight interface doors; the null path yields 0 at each.
+    passed += Test("view join with a null arm names its interface element at every door",
+        runViewJoinNullArmIface(1) * 100 + runViewJoinNullArmIface(0), 3600);
     passed += Test("raw count move parameter direct zero and counts",
         runRawCountMoveDirect(0) * 100 + runRawCountMoveDirect(2) * 10
             + runRawCountMoveDirect(4), 24);
@@ -4286,7 +4346,7 @@ extern int main()
     r = testDiscard();          passed += r; total += 6;
     r = testDirectReturnOwnership(); passed += r; total += 6;
     r = testCLongWidth();       passed += r; total += 15;
-    r = testRawArrayRuntimeCount(); passed += r; total += 91;
+    r = testRawArrayRuntimeCount(); passed += r; total += 92;
     r = testDictEnumeration();  passed += r; total += 12;
     r = testLiteralReceiverAndNullChain(); passed += r; total += 9;
     r = testDefaultAsExpression(); passed += r; total += 82;
