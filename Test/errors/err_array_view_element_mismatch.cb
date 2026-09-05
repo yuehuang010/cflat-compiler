@@ -22,6 +22,23 @@ expect_error("cannot return an array view of 'int*' from a function whose return
     int[] avmReturnStar(int*[] q) { return q; }
 }
 
+// An interface view element carries ONE interface's fat pointer, and no rebox is emitted per
+// element, so any other interface (parent or child) dispatches through the wrong vtable.
+interface AvmIfaceB { int perimeter(); };
+interface AvmIfaceChild : AvmIface { int extra(); };
+class AvmImpl : AvmIface { int s = default; int area() { return s * s; } };
+struct AvmIfaceBHolder { AvmIfaceB[] v = default; };
+
+expect_error("cannot return an array view of 'AvmIface' from a function whose return element is 'AvmIfaceB'") {
+    AvmIfaceB[] avmReturnCrossIface(AvmIface[] q) { return q; }
+}
+
+// Widening a CHILD interface view to its parent is the same hole: the elements hold the child
+// vtable, which only accidentally shares a prefix with the parent's (and not for a 2nd parent).
+expect_error("cannot return an array view of 'AvmIfaceChild' from a function whose return element is 'AvmIface'") {
+    AvmIface[] avmReturnChildIface(AvmIfaceChild[] q) { return q; }
+}
+
 int avmTakeInt(int[] d) { return d[1]; }
 
 extern int main()
@@ -49,6 +66,29 @@ extern int main()
     // Interface view source: call argument.
     expect_error("cannot pass an array view of 'AvmIface' as parameter 'd' of 'avmTakeIntIface', whose element is 'int'") {
         int avmIfaceResult = avmTakeIntIface(avmIfaceView);
+    }
+
+    // Cross-interface view: declaration initializer.
+    expect_error("cannot bind an array view of 'AvmIface' to a destination of 'AvmIfaceB'") {
+        AvmIfaceB[] avmCrossDecl = avmIfaceView;
+    }
+
+    // Cross-interface view: field store.
+    expect_error("cannot bind an array view of 'AvmIface' to a destination of 'AvmIfaceB'") {
+        AvmIfaceBHolder avmCrossHolder = default;
+        avmCrossHolder.v = avmIfaceView;
+    }
+
+    // Narrowing a PARENT interface view to a child: the parent vtable has no child slot.
+    expect_error("cannot bind an array view of 'AvmIface' to a destination of 'AvmIfaceChild'") {
+        AvmIfaceChild[] avmNarrowed = avmIfaceView;
+    }
+
+    // A CLASS view is a run of objects, not of fat pointers - dispatching through it faults.
+    expect_error("cannot bind an array view of 'AvmImpl' to a destination of 'AvmIface'") {
+        AvmImpl[2] avmImpls; avmImpls[0].s = 3;
+        AvmImpl[] avmImplView = avmImpls;
+        AvmIface[] avmBoxedView = avmImplView;
     }
 
     // Declaration initializer: element 'int*' into element 'int'.

@@ -124,9 +124,19 @@ bool LLVMBackend::ArrayViewElementMismatch(const LLVMBackend::TypeAndValue& dest
 {
         if (!src.IsArrayView) return false;
         if (!dest.IsArrayView && !dest.Pointer) return false;
-        // An interface destination reboxes through its own gate; a closure carries a signature,
-        // not an element. Neither indexes by the view's element.
-        if (dest.IsInterface) return false;
+        // An interface destination reboxes a SCALAR through its own gate, so it does not index by
+        // the view's element. A view destination is not reboxed per element - see below.
+        if (dest.IsInterface && !dest.IsArrayView) return false;
+        if (dest.IsInterface)
+        {
+            // No rebox is emitted per view element, so every element must ALREADY carry this
+            // interface's fat pointer. Unproven (unnamed) elements are accepted, not rejected.
+            if (dest.TypeName.empty() || src.TypeName.empty()) return false;
+            if (dest.ElemPointer == src.ElemPointer && dest.TypeName == src.TypeName) return false;
+            destElement = dest.TypeName + (dest.ElemPointer ? "*" : "");
+            srcElement = src.TypeName + (src.ElemPointer ? "*" : "");
+            return true;
+        }
         if (dest.IsFunctionPointer || src.IsFunctionPointer) return false;
         // 'void*' is the universal address destination - it never indexes by an element.
         if (dest.TypeName == "void") return false;

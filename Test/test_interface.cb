@@ -2504,6 +2504,11 @@ IShape[] ifaceViewPassthru(IShape[] items) { return items; }
 
 T[] ifaceViewGenericPassthru<T>(T[] items) { return items; }
 
+// The element guard compares RESOLVED element names, so an alias spelling and a generic
+// struct's `T[]` field both still accept a view of the same interface.
+using IShapeAlias = IShape;
+struct IfaceViewGenericHolder<T> { T[] items = default; };
+
 // A view of interfaces held as a struct FIELD, and one RETURNED across a call boundary.
 struct IfaceViewHolder
 {
@@ -2547,6 +2552,11 @@ bool testInterfaceArrayViewOfInterfaces()
     result &= Test("iface_view_generic_param", generic[2].area(), 9);
     void* raw = view;
     result &= Test("iface_view_void_ptr", raw != nullptr, true);
+    IShapeAlias[] aliased = view;
+    result &= Test("iface_view_alias_elem", aliased[3].area(), 16);
+    IfaceViewGenericHolder<IShape> genericHolder = default;
+    genericHolder.items = view;
+    result &= Test("iface_view_generic_field", genericHolder.items[2].area(), 9);
 
     // Reading an element and dispatching through it, across a call that takes the view.
     result &= Test("iface_view_sum", ifaceViewSum(view, 4), 1 + 4 + 9 + 16);
