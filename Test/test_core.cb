@@ -3424,6 +3424,33 @@ int runViewPlainBraceField(int choose)
         + legNest + legArr + legBox;
 }
 
+namespace VpsNs { struct VpsElem { int k = default; }; };
+using VpsAlias = VpsNs.VpsElem;
+struct VpsNsDest { VpsNs.VpsElem[] v = default; };
+struct VpsAliasDest { VpsAlias[] v = default; };
+struct VpsBoxElem<T> { T t = default; };
+struct VpsBoxDest { VpsBoxElem<int>[] v = default; };
+struct VpsCharDest { char[] c = default; };
+
+/*
+ * SPELLING axis of the accepted brace-init source: the mismatched-element gate compares RESOLVED
+ * element names, so a namespaced, an aliased and a generic element must still read as the field's
+ * own element. A 'char[]' from a string literal is the primitive-element row of the same accept.
+ */
+int runViewPlainBraceSpelling()
+{
+    VpsNs.VpsElem[2] nsArr; nsArr[1].k = 4;
+    VpsNsDest bNs = { v = nsArr };
+    VpsAlias[2] aliasArr; aliasArr[1].k = 5;
+    VpsAliasDest bAlias = { v = aliasArr };
+    VpsBoxElem<int>[2] boxArr; boxArr[1].t = 6;
+    VpsBoxDest bBox = { v = boxArr };
+    VpsCharDest bLit = { c = "hey" };
+    char[4] cbuf; cbuf[0] = 65;
+    VpsCharDest bBuf = { c = cbuf };
+    return bNs.v[1].k + bAlias.v[1].k + bBox.v[1].t + bLit.c[1] + bBuf.c[0];
+}
+
 void rawCountSink(move RawCountElem* values) {}
 void rawCountForward(move RawCountElem* values) { rawCountSink(move values); }
 void rawCountGenericSink<T>(move T* values) {}
@@ -4337,6 +4364,9 @@ int testRawArrayRuntimeCount()
     // live arm) + 9 (generic) = 69; the `choose == 0` run takes the array's NULL arm (95) = 155.
     passed += Test("brace-init binds a plain array-view field at every accepted source",
         runViewPlainBraceField(1) * 1000 + runViewPlainBraceField(0), 69155);
+    // 4 (namespaced) + 5 (aliased) + 6 (generic element) + 'e' (101) + 'A' (65) = 181.
+    passed += Test("brace-init binds a plain array-view field under every element spelling",
+        runViewPlainBraceSpelling(), 181);
     passed += Test("raw count move parameter direct zero and counts",
         runRawCountMoveDirect(0) * 100 + runRawCountMoveDirect(2) * 10
             + runRawCountMoveDirect(4), 24);
@@ -4552,7 +4582,7 @@ extern int main()
     r = testDiscard();          passed += r; total += 6;
     r = testDirectReturnOwnership(); passed += r; total += 6;
     r = testCLongWidth();       passed += r; total += 15;
-    r = testRawArrayRuntimeCount(); passed += r; total += 97;
+    r = testRawArrayRuntimeCount(); passed += r; total += 98;
     r = testDictEnumeration();  passed += r; total += 12;
     r = testLiteralReceiverAndNullChain(); passed += r; total += 9;
     r = testDefaultAsExpression(); passed += r; total += 82;

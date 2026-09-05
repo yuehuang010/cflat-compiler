@@ -158,3 +158,47 @@ expect_error("cannot brace-initialize array-view field 'BnpDest.v' ('Bnp[]') fro
     struct BnpDest { Bnp[] v = default; };
     int bnpCall() { Bnp* p = new Bnp(); p.k = 1; BnpDest d = { v = p }; return d.v[0].k; }
 }
+
+// MISMATCHED-ELEMENT rows of the same non-interface field door. The single-object guard compared
+// the source type to the element and returned false when they DIFFERED, so a whole other struct
+// bound silently: the value row SIGSEGVd at v[0], the three element rows strided 'BnrOther' data
+// as 'Bnr' (a 2-int source read as 1-int elements returned the source's second field).
+expect_error("cannot brace-initialize array-view field 'BnqDest.v' ('Bnq[]') from 'BnqOther'") {
+    struct Bnq { int k = default; };
+    struct BnqOther { int a = default; };
+    struct BnqDest { Bnq[] v = default; };
+    int bnqCall() { BnqOther o; o.a = 5; BnqDest d = { v = o }; return d.v[0].k; }
+}
+
+// Pointer spelling of the same mismatch: a 'BnqpOther*' points at ONE object of the wrong type.
+expect_error("cannot brace-initialize array-view field 'BnqpDest.v' ('Bnqp[]') from 'BnqpOther*'") {
+    struct Bnqp { int k = default; };
+    struct BnqpOther { int a = default; };
+    struct BnqpDest { Bnqp[] v = default; };
+    int bnqpCall() { BnqpOther* p = new BnqpOther(); p.a = 5; BnqpDest d = { v = p }; return d.v[0].k; }
+}
+
+// Fixed-array element row - the '=' door does not see this one (a fixed array is not yet a view),
+// so this leg is the only guard on it.
+expect_error("cannot bind an array view of 'BnrOther' to a destination of 'Bnr'") {
+    struct Bnr { int k = default; };
+    struct BnrOther { int a = default; int b = default; };
+    struct BnrDest { Bnr[] v = default; };
+    int bnrCall() { BnrOther[2] a; a[0].a = 1; a[0].b = 2; BnrDest d = { v = a }; return d.v[1].k; }
+}
+
+// View element row: same text as the '=' door emits for 'd.v = view'.
+expect_error("cannot bind an array view of 'BnsOther' to a destination of 'Bns'") {
+    struct Bns { int k = default; };
+    struct BnsOther { int a = default; int b = default; };
+    struct BnsDest { Bns[] v = default; };
+    int bnsCall() { BnsOther[2] a; BnsOther[] w = a; BnsDest d = { v = w }; return d.v[1].k; }
+}
+
+// Heap element row: a counted 'new T[n]' of the wrong element is a view source too.
+expect_error("cannot bind an array view of 'BntOther' to a destination of 'Bnt'") {
+    struct Bnt { int k = default; };
+    struct BntOther { int a = default; int b = default; };
+    struct BntDest { Bnt[] v = default; };
+    int bntCall() { BntDest d = { v = new BntOther[2] }; return d.v[1].k; }
+}

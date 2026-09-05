@@ -9652,6 +9652,17 @@ bool MainListener::RejectValueIntoArrayViewField(
         // bound here would keep the source's vtables. Same predicate and text as the '=' door.
         if (fieldType.IsInterface && RejectArrayViewElementMismatch(errCtx, fieldType, rightNV))
             return true;
+        // ELEMENT axis for a plain 'T[]' field: an array, a view or a counted `new T[n]` whose
+        // element differs strides and loads with the wrong shape, exactly as at the '=' door.
+        if (!fieldType.IsInterface && !src.IsSimd && !src.TypeName.empty()
+            && (shaped.IsArrayView || src.ConstArraySize != 0))
+        {
+            LLVMBackend::NamedVariable elemNV = rightNV;
+            elemNV.TypeAndValue = shaped;
+            elemNV.TypeAndValue.IsArrayView = true;
+            if (RejectArrayViewElementMismatch(errCtx, fieldType, elemNV))
+                return true;
+        }
         // A view, a fixed array and a counted `new T[n]` are real element sources; a null or
         // otherwise unnamed source names no type at all and is a null view. None is a single object.
         if (src.IsArrayView || src.ConstArraySize != 0 || src.TypeName.empty() || src.IsSimd)
@@ -9669,8 +9680,12 @@ bool MainListener::RejectValueIntoArrayViewField(
         else
         {
             const std::string srcType = compiler->ResolveTypeAlias(src.TypeName);
-            if (LLVMBackend::IsPrimitiveTypeName(srcType)) return false;
-            if (srcType != compiler->ResolveTypeAlias(fieldType.TypeName)) return false;
+            if (LLVMBackend::IsPrimitiveTypeName(srcType) || src.IsFunctionPointer) return false;
+            // A DIFFERENT struct or interface value is one object of the wrong shape - proven
+            // wrong twice over - so it takes the same message, which already names both types.
+            if (srcType != compiler->ResolveTypeAlias(fieldType.TypeName)
+                && !src.IsInterface && !compiler->IsDataStructure(srcType))
+                return false;
         }
 
         compiler->LogErrorMessage(
