@@ -787,6 +787,77 @@ bool testGlobalDefaultSeeding()
     return result;
 }
 
+/*
+ * Regression: a field whose declared type is a VALUE STRUCT with an implicit conversion from a
+ * char pointer ('string') had its declared initializer silently dropped. The initializer's value
+ * is an i8*, so the aggregate assembler's type-mismatch arm (MainListener_Aggregates.cpp, struct
+ * :342-369 / class :3055-3070 / user no-arg ctor :3706-3720) saw destType->isStructTy() and
+ * DEFAULT-CONSTRUCTED the field type instead of converting it - the field read empty in every
+ * construction form, while the identical LOCAL declaration converted correctly. The conversion
+ * now happens once in ParseFieldDefaultInitializer, the single path all those loops share.
+ * Discriminator: each leg reads a field whose type is 'string' (not char*) and whose default is a
+ * char pointer; the neighbouring 'sfdCharPtr' / 'sfdExpr' legs take the arms that already worked
+ * and must not move. Every '_lit' leg reads "" on the pre-fix binary.
+ */
+struct SfdBox      { string s = "sfd_bare"; int n = 3; };
+struct SfdUser     { string s = "sfd_user"; int n = 4; SfdUser() { } };
+struct SfdOuter    { SfdBox inner; int k = 5; };
+struct SfdGeneric<T> { T v = default; string tag = "sfd_generic"; int n = 6; };
+class  SfdClass    { string s = "sfd_class"; int n = 7; };
+struct SfdArrHolder { SfdBox[2] items; int n = 8; };
+struct SfdCharPtr  { const char* s = "sfd_charptr"; int n = 9; };
+struct SfdExpr     { string s = sfdMakeString(); int n = 10; };
+struct SfdDefault  { string s = default; int n = 11; };
+namespace SfdNS { struct SfdNsBox { string s = "sfd_ns"; int n = 12; }; }
+
+string sfdMakeString() { return "sfd_expr"; }
+const char* gSfdRawPtr = "sfd_runtime";
+struct SfdRuntime  { string s = gSfdRawPtr; int n = 13; };
+
+SfdBox gSfdBox = default;
+SfdOuter gSfdOuter = default;
+SfdNS.SfdNsBox gSfdNs = default;
+SfdClass gSfdClass = default;
+
+bool testStringFieldDefault()
+{
+    bool result = true;
+    // Every construction form of the same struct: all of them read "" before the fix.
+    SfdBox bare;                    result &= Test("sfd_bare_lit", bare.s.data(), "sfd_bare");
+    result &= Test("sfd_bare_len", bare.s.length(), 8);
+    SfdBox eq = default;            result &= Test("sfd_eqdefault_lit", eq.s.data(), "sfd_bare");
+    SfdBox empty = { };             result &= Test("sfd_emptybrace_lit", empty.s.data(), "sfd_bare");
+    SfdBox call = SfdBox();         result &= Test("sfd_ctorcall_lit", call.s.data(), "sfd_bare");
+    SfdBox partial = { n = 99 };    result &= Test("sfd_partial_lit", partial.s.data(), "sfd_bare");
+    result &= Test("sfd_partial_other", partial.n, 99);
+    // Accept-set pin: an explicit override already worked and must keep winning.
+    SfdBox over = { s = "sfd_over" }; result &= Test("sfd_override_pin", over.s.data(), "sfd_over");
+
+    SfdUser user;                   result &= Test("sfd_userctor_lit", user.s.data(), "sfd_user");
+    SfdOuter outer;                 result &= Test("sfd_nested_lit", outer.inner.s.data(), "sfd_bare");
+    SfdGeneric<int> gen;            result &= Test("sfd_generic_lit", gen.tag.data(), "sfd_generic");
+    SfdClass cls;                   result &= Test("sfd_class_lit", cls.s.data(), "sfd_class");
+    SfdArrHolder arr;               result &= Test("sfd_arrayfield_lit", arr.items[1].s.data(), "sfd_bare");
+    SfdBox[2] locals;               result &= Test("sfd_localarray_lit", locals[1].s.data(), "sfd_bare");
+    // A RUNTIME char pointer takes the operator string(const char*) arm of the same conversion.
+    SfdRuntime rt;                  result &= Test("sfd_runtimeptr_lit", rt.s.data(), "sfd_runtime");
+    result &= Test("sfd_runtimeptr_len", rt.s.length(), 11);
+
+    // Globals: the default construction folds to a real constant, literal included.
+    result &= Test("sfd_global_lit", gSfdBox.s.data(), "sfd_bare");
+    result &= Test("sfd_global_other", gSfdBox.n, 3);
+    result &= Test("sfd_global_nested_lit", gSfdOuter.inner.s.data(), "sfd_bare");
+    result &= Test("sfd_global_ns_lit", gSfdNs.s.data(), "sfd_ns");
+    result &= Test("sfd_global_class_lit", gSfdClass.s.data(), "sfd_class");
+
+    // Accept-set pins: the arms that already converted (or deliberately do not) must not move.
+    SfdCharPtr cp;                  result &= Test("sfd_charptr_pin", cp.s, "sfd_charptr");
+    SfdExpr expr;                   result &= Test("sfd_expr_pin", expr.s.data(), "sfd_expr");
+    SfdDefault dflt;                result &= Test("sfd_default_pin", dflt.s.length(), 0);
+    string local = "sfd_local";     result &= Test("sfd_local_oracle", local.data(), "sfd_local");
+    return result;
+}
+
 extern int strcmp(const char* a, const char* b);
 
 bool Test(const char* testName, const char* actual, const char* expected)
@@ -4282,6 +4353,7 @@ extern int main()
     total++; passed += testNoArgCtorFieldSeeding()       ? 1 : 0;
     total++; passed += testNoArgCtorFieldSeedingCasts()  ? 1 : 0;
     total++; passed += testGlobalDefaultSeeding()        ? 1 : 0;
+    total++; passed += testStringFieldDefault()          ? 1 : 0;
     total++; passed += testGlobalFoldOrderBudget()       ? 1 : 0;
     total++; passed += testDestructor()                  ? 1 : 0;
     total++; passed += testBuiltinIdentifiers()          ? 1 : 0;

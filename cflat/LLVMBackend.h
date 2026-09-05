@@ -5823,6 +5823,12 @@ public:
     // result is a non-owning borrow over the caller's buffer.
     llvm::Value* WrapStringLiteralAsString(llvm::Value* strLitPtr);
 
+    // The one implicit char* -> string value conversion, shared by every site that performs it
+    // (declaration initializer, assignment, aggregate field default): a compile-time literal is
+    // wrapped into a constant { _ptr, _len }, a runtime pointer goes through
+    // `operator string(const char*)`. Both results are non-owning borrows.
+    llvm::Value* CoerceCharPointerToString(llvm::Value* rawPtr);
+
     llvm::Function* GetOrDeclareStrlen();
 
     // Deep-copy a string VALUE into a freshly heap-allocated, NUL-terminated owned buffer

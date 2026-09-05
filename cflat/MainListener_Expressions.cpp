@@ -2576,20 +2576,7 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                 && !namedVar.TypeAndValue.Pointer
                 && right->getType() == cflat_llvm::PointerTo(compiler->builder->getInt8Ty()))
             {
-                auto* c = llvm::dyn_cast<llvm::Constant>(right);
-                if (c && compiler->IsStringLiteralConstant(c))
-                    right = compiler->WrapStringLiteralAsString(right);
-                else if (compiler->GetFunction("operator string"))
-                {
-                    LLVMBackend::NamedVariable argNV;
-                    argNV.Primary = right;
-                    argNV.BaseType = right->getType();
-                    argNV.TypeAndValue.TypeName = "char";
-                    argNV.TypeAndValue.Pointer = true;
-                    right = compiler->CreateOverloadedFunctionCall("operator string", { argNV });
-                }
-                else
-                    right = compiler->WrapStringLiteralAsString(right);
+                right = compiler->CoerceCharPointerToString(right);
             }
 
             // Wrap named function in closure fat struct when assigning to a function<T> variable.
@@ -10189,6 +10176,19 @@ llvm::Value* MainListener::ParseFieldDefaultInitializer(
                 compiler->CheckFatClosureAssignProvenance(val, nv, destDesc);
                 val = compiler->WidenBareOrThinToClosureFat(val);
             }
+        }
+        // A field whose declared type is a VALUE struct with an implicit conversion from a raw
+        // char pointer converts HERE, the way the declarator converts a local of the same type.
+        // Without it the aggregate assembler sees a type mismatch on a struct-typed field and
+        // default-constructs the field type, silently dropping the declared initializer.
+        if (val != nullptr && !field.Pointer && field.ConstArraySize == 0 && !field.IsArrayView
+            && !field.IsFunctionPointer && !field.IsFatInterfaceValue()
+            && !compiler->IsCoreUniqueType(field.TypeName)
+            && val->getType() == cflat_llvm::PointerTo(compiler->builder->getInt8Ty())
+            && compiler->GetDataStructure(field.TypeName).StructType != nullptr
+            && compiler->GetFunction("operator " + field.TypeName) != nullptr)
+        {
+            val = compiler->CoerceCharPointerToString(val);
         }
         return val;
     }

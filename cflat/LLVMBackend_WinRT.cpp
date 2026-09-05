@@ -1497,6 +1497,24 @@ llvm::Value* LLVMBackend::WrapStringLiteralAsString(llvm::Value* strLitPtr)
         return strVal;
     }
 
+llvm::Value* LLVMBackend::CoerceCharPointerToString(llvm::Value* rawPtr)
+{
+        if (rawPtr == nullptr) return rawPtr;
+        auto* c = llvm::dyn_cast<llvm::Constant>(rawPtr);
+        if (c != nullptr && IsStringLiteralConstant(c))
+            return WrapStringLiteralAsString(rawPtr);
+        if (GetFunction("operator string") != nullptr)
+        {
+            NamedVariable argNV;
+            argNV.Primary = rawPtr;
+            argNV.BaseType = rawPtr->getType();
+            argNV.TypeAndValue.TypeName = "char";
+            argNV.TypeAndValue.Pointer = true;
+            return CreateOverloadedFunctionCall("operator string", { argNV });
+        }
+        return WrapStringLiteralAsString(rawPtr);
+    }
+
 llvm::Function* LLVMBackend::GetOrDeclareStrlen()
 {
         if (auto* fn = module->getFunction("strlen"))

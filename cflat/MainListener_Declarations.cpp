@@ -4560,24 +4560,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                     // If it is a compile-time string literal constant (length known at
                                     // compile time), wrap it directly in a string struct on the caller's stack.
                                     // Otherwise call user-defined operator string(char*) for runtime values.
-                                    auto* c = llvm::dyn_cast<llvm::Constant>(right);
-                                    if (c && compiler->IsStringLiteralConstant(c))
-                                    {
-                                        right = compiler->WrapStringLiteralAsString(right);
-                                    }
-                                    else if (compiler->GetFunction("operator string"))
-                                    {
-                                        LLVMBackend::NamedVariable argNV;
-                                        argNV.Primary = right;
-                                        argNV.BaseType = right->getType();
-                                        argNV.TypeAndValue.TypeName = "char";
-                                        argNV.TypeAndValue.Pointer = true;
-                                        right = compiler->CreateOverloadedFunctionCall("operator string", { argNV });
-                                    }
-                                    else
-                                    {
-                                        right = compiler->WrapStringLiteralAsString(right);
-                                    }
+                                    right = compiler->CoerceCharPointerToString(right);
                                 }
                             }
                             // nullptr constant assigned to an interface variable - produce null fat pointer {null, null}
@@ -5097,20 +5080,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                             if (right && typeAndValue.TypeName == "string" && !typeAndValue.Pointer
                                 && right->getType() == cflat_llvm::PointerTo(compiler->builder->getInt8Ty()))
                             {
-                                auto* c = llvm::dyn_cast<llvm::Constant>(right);
-                                if (c && compiler->IsStringLiteralConstant(c))
-                                    right = compiler->WrapStringLiteralAsString(right);
-                                else if (compiler->GetFunction("operator string"))
-                                {
-                                    LLVMBackend::NamedVariable argNV;
-                                    argNV.Primary = right;
-                                    argNV.BaseType = right->getType();
-                                    argNV.TypeAndValue.TypeName = "char";
-                                    argNV.TypeAndValue.Pointer = true;
-                                    right = compiler->CreateOverloadedFunctionCall("operator string", { argNV });
-                                }
-                                else
-                                    right = compiler->WrapStringLiteralAsString(right);
+                                right = compiler->CoerceCharPointerToString(right);
                             }
                             // A primitive assigned to a string is no longer an implicit conversion
                             // (it mirrors the rejected `(string)primitive` cast). Direct the user to
