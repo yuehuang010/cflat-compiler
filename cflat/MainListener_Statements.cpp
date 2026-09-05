@@ -720,6 +720,9 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
             LogErrorContext(errCtx, "cannot return a raw pointer 'T*' as an array-view 'T[]' - "
                 "a view must span a whole allocation (from 'new T[n]' or another 'T[]'); "
                 "the 'T[] -> T*' decay is one-way");
+        // Primitive axis of the same gate: `return runtimeInt;` from a 'T[]' function hands the
+        // caller a number to index as an address; only a folded zero is the null view.
+        RejectPrimitiveValueIntoArrayView(errCtx, compiler->currentFunctionReturnTV, returnNV);
         // Element axis of the same gate: the returned view must index by the declared element.
         {
             std::string retDestElement;

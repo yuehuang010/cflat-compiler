@@ -202,3 +202,39 @@ expect_error("cannot bind an array view of 'BntOther' to a destination of 'Bnt'"
     struct BntDest { Bnt[] v = default; };
     int bntCall() { BntDest d = { v = new BntOther[2] }; return d.v[1].k; }
 }
+
+// PRIMITIVE axis of the same family, four doors. A runtime 'int' was converted to a thin pointer
+// and indexed: all four passed '--check' and SIGSEGVd at v[0]. Only a folded constant zero is the
+// null-view spelling ('int[] v = 0;' and '{ p = 0 }' still bind - see Test/test_core.cb).
+expect_error("cannot bind a 'int' value to array view 'int[]'") {
+    int bpiCall() { int x = 4; int[] v = x; return v[0]; }
+}
+
+// '=' store door, which is a separate lowering from the declarator init above.
+expect_error("cannot bind a 'int' value to array view 'int[]'") {
+    int bpsCall() { int x = 4; int[] v = 0; v = x; return v[0]; }
+}
+
+// Brace-init FIELD door: the primitive early-out of the view-field gate let every non-zero
+// primitive through, which is why the class-value fix could not close this one.
+expect_error("cannot bind a 'int' value to array view 'int[]'") {
+    struct BpfDest { int[] p = default; };
+    int bpfCall() { int x = 4; BpfDest d = { p = x }; return d.p[0]; }
+}
+
+// RETURN door: the callee hands back a number for the caller to index.
+expect_error("cannot bind a 'int' value to array view 'int[]'") {
+    int[] bprMake(int x) { return x; }
+    int bprCall() { return bprMake(4)[0]; }
+}
+
+// An ELEMENT read of a fixed array is a scalar too - the row bind 'int[] r = md[1]' of an
+// 'int[2][3]' stays legal (asserted by value in Test/test_basic.cb), a scalar element does not.
+expect_error("cannot bind a 'int' value to array view 'int[]'") {
+    int bpeCall() { int[2] f; f[0] = 7; int[] e = f[0]; return e[0]; }
+}
+
+// A 'float' view takes the same rule: the guard keys on the primitive SHAPE, not on 'int'.
+expect_error("cannot bind a 'float' value to array view 'float[]'") {
+    int bpxCall() { float f = 1.0; float[] v = f; return v[0] > 0.0 ? 1 : 0; }
+}

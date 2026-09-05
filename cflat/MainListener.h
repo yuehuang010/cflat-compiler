@@ -4870,6 +4870,11 @@ public:
                                      const LLVMBackend::TypeAndValue& target,
                                      const LLVMBackend::NamedVariable& rhsNV);
 
+    // Primitive-scalar sibling of the two above: only a folded constant zero is a null view.
+    bool RejectPrimitiveValueIntoArrayView(antlr4::ParserRuleContext* ctx,
+                                     const LLVMBackend::TypeAndValue& target,
+                                     const LLVMBackend::NamedVariable& rhsNV);
+
     // Element identity of a view read out of a struct FIELD, however the field was addressed.
     bool ViewFieldElementForRead(llvm::Value* value, llvm::Value* storage,
                                  LLVMBackend::TypeAndValue& out) const;

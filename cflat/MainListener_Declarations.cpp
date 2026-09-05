@@ -5067,6 +5067,8 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                 RejectRawPointerToArrayView(assignmentExpression, typeAndValue, rightNV);
                                 // int[] v = ptrView; binds a view whose ELEMENT differs - reject.
                                 RejectArrayViewElementMismatch(assignmentExpression, typeAndValue, rightNV);
+                                // int[] v = runtimeInt; reinterprets a number as an address.
+                                RejectPrimitiveValueIntoArrayView(assignmentExpression, typeAndValue, rightNV);
                                 // Declarator-init leg of the code-value store gate: `Rec* r = w;`
                                 // stored a code address in a data pointer and wrote through it.
                                 if (compiler->CodeValueIntoDataDestination(rightNV, typeAndValue))

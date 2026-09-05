@@ -1394,6 +1394,39 @@ bool MainListener::RejectRawPointerToArrayView(antlr4::ParserRuleContext* ctx,
         return false;
     }
 
+/*
+ * A primitive VALUE bound to a 'T[]' is reinterpreted as a thin pointer and indexed, so only the
+ * NULL-view spelling may bind. '0', 'nullptr', 'default' and a const-zero name all fold to a
+ * constant zero here; anything else is a runtime number that reaches v[0] as an address.
+ */
+bool MainListener::RejectPrimitiveValueIntoArrayView(antlr4::ParserRuleContext* ctx,
+                                     const LLVMBackend::TypeAndValue& target,
+                                     const LLVMBackend::NamedVariable& rhsNV) {
+        const auto& rhs = rhsNV.TypeAndValue;
+        if (!target.IsArrayView) return false;
+        // Prove it is a bare primitive SCALAR before rejecting: a view, an array, a pointer, a
+        // string literal, a fat value and an unnamed source all keep their own rules. The three
+        // null-view spellings ('0', 'nullptr', 'default') name no type, so they never reach here.
+        if (rhs.IsArrayView || rhs.ConstArraySize != 0 || rhs.Pointer || rhs.IsInterface
+            || rhs.IsFunctionPointer || rhs.IsSimd || rhs.TypeName.empty())
+            return false;
+        // Array SHAPE, not element name: a ROW of a fixed 'int[2][3]' also names 'int' with no
+        // ConstArraySize, and it is a real element source - its inner dimensions are the proof.
+        if (!rhs.ConstInnerDimensions.empty()) return false;
+        if (!LLVMBackend::IsPrimitiveTypeName(Compiler()->ResolveTypeAlias(rhs.TypeName)))
+            return false;
+        // A temp that already folded to a constant zero is the null-view spelling as well; a
+        // NAMED int is not, whatever it holds, since nothing here proves the slot stays zero.
+        if (auto* folded = llvm::dyn_cast_or_null<llvm::Constant>(rhsNV.Primary))
+            if (folded->isNullValue()) return false;
+        auto* compiler = Compiler(ctx);
+        compiler->LogErrorMessage(
+            "cannot bind a '{}' value to array view '{}' - a view indexes whole '{}' elements, so "
+            "its source must be an array view (or a null one), not a single value",
+            { SpellType(*compiler, rhs), SpellType(*compiler, target), target.TypeName });
+        return true;
+    }
+
 bool MainListener::RejectArrayViewElementMismatch(antlr4::ParserRuleContext* ctx,
                                      const LLVMBackend::TypeAndValue& target,
                                      const LLVMBackend::NamedVariable& rhsNV) {
@@ -1879,6 +1912,8 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                 RejectRawPointerToArrayView(ctx, namedVar.TypeAndValue, rightNV);
                 // Same door, element axis: `s.view = otherElemView;` strides by the wrong element.
                 RejectArrayViewElementMismatch(ctx, namedVar.TypeAndValue, rightNV);
+                // Same door, primitive axis: `v = runtimeInt;` reinterprets a number as an address.
+                RejectPrimitiveValueIntoArrayView(ctx, namedVar.TypeAndValue, rightNV);
                 // Permanently clear the declaration-time provenance flag on ANY reassignment,
                 // regardless of what this RHS is. Recomputing it from THIS RHS would be
                 // WALK-ORDER over the AST, not control flow: a reassignment inside one branch
@@ -9668,6 +9703,9 @@ bool MainListener::RejectValueIntoArrayViewField(
         if (src.IsArrayView || src.ConstArraySize != 0 || src.TypeName.empty() || src.IsSimd)
             return false;
         if (rawHeapArray) return false;
+        // Primitive axis of the same door, both field kinds: '{ v = 0 }' is a legal null view,
+        // any other primitive value is a number the field's elements would be indexed through.
+        if (RejectPrimitiveValueIntoArrayView(errCtx, fieldType, rightNV)) return true;
         // Prove it before rejecting: an INTERFACE field takes only a source that IS the interface
         // or implements it, and a plain 'T[]' field only a class/struct of its own element type -
         // a primitive source keeps its own rules ('{ p = 0 }' is a legal null view).

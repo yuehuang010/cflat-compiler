@@ -3431,6 +3431,7 @@ struct VpsAliasDest { VpsAlias[] v = default; };
 struct VpsBoxElem<T> { T t = default; };
 struct VpsBoxDest { VpsBoxElem<int>[] v = default; };
 struct VpsCharDest { char[] c = default; };
+struct VpsIntDest { int[] p = default; };
 
 /*
  * SPELLING axis of the accepted brace-init source: the mismatched-element gate compares RESOLVED
@@ -3449,6 +3450,41 @@ int runViewPlainBraceSpelling()
     char[4] cbuf; cbuf[0] = 65;
     VpsCharDest bBuf = { c = cbuf };
     return bNs.v[1].k + bAlias.v[1].k + bBox.v[1].t + bLit.c[1] + bBuf.c[0];
+}
+
+int[] viewPlainZeroReturn(int c) { if (c != 0) { return 0; } return nullptr; }
+
+/*
+ * NULL-VIEW spellings of a PRIMITIVE view. A primitive value bound to a 'T[]' is reinterpreted as
+ * an address (rejected in Test/errors/err_arrayview_call_arg.cb), so these are the spellings the
+ * guard must keep: a literal zero, 'nullptr' and 'default' at the declarator, '=' store, brace
+ * field and return doors, plus the real element sources beside them.
+ */
+int runViewPlainNullSpellings()
+{
+    int[] v0 = 0;
+    int[] vn = nullptr;
+    int[] vd = default;
+    int[2] real; real[0] = 3; real[1] = 4;
+    int[] vq = real;
+    VpsIntDest z0 = { p = 0 };
+    VpsIntDest zn = { p = nullptr };
+    VpsIntDest zd = { p = default };
+    VpsIntDest zr = { p = real };
+    int score = 0;
+    if (v0 == nullptr) { score = score + 1; }
+    if (vn == nullptr) { score = score + 2; }
+    if (vd == nullptr) { score = score + 4; }
+    if (vq[1] == 4) { score = score + 8; }
+    vq = 0;
+    if (vq == nullptr) { score = score + 16; }
+    if (z0.p == nullptr) { score = score + 32; }
+    if (zn.p == nullptr) { score = score + 64; }
+    if (zd.p == nullptr) { score = score + 128; }
+    if (zr.p[0] == 3) { score = score + 256; }
+    if (viewPlainZeroReturn(1) == nullptr) { score = score + 512; }
+    if (viewPlainZeroReturn(0) == nullptr) { score = score + 1024; }
+    return score;
 }
 
 void rawCountSink(move RawCountElem* values) {}
@@ -4367,6 +4403,9 @@ int testRawArrayRuntimeCount()
     // 4 (namespaced) + 5 (aliased) + 6 (generic element) + 'e' (101) + 'A' (65) = 181.
     passed += Test("brace-init binds a plain array-view field under every element spelling",
         runViewPlainBraceSpelling(), 181);
+    // Every null-view spelling plus the two real element reads: 1+2+4+8+16+32+64+128+256+512+1024.
+    passed += Test("a primitive array view still binds every null spelling",
+        runViewPlainNullSpellings(), 2047);
     passed += Test("raw count move parameter direct zero and counts",
         runRawCountMoveDirect(0) * 100 + runRawCountMoveDirect(2) * 10
             + runRawCountMoveDirect(4), 24);
@@ -4582,7 +4621,7 @@ extern int main()
     r = testDiscard();          passed += r; total += 6;
     r = testDirectReturnOwnership(); passed += r; total += 6;
     r = testCLongWidth();       passed += r; total += 15;
-    r = testRawArrayRuntimeCount(); passed += r; total += 98;
+    r = testRawArrayRuntimeCount(); passed += r; total += 99;
     r = testDictEnumeration();  passed += r; total += 12;
     r = testLiteralReceiverAndNullChain(); passed += r; total += 9;
     r = testDefaultAsExpression(); passed += r; total += 82;
