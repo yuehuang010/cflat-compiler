@@ -9622,14 +9622,14 @@ llvm::Value* MainListener::CoerceInitValueToInterface(
                                         ifaceName, &rightNV, false);
     }
 
-bool MainListener::RejectValueIntoInterfaceViewField(
+bool MainListener::RejectValueIntoArrayViewField(
         const LLVMBackend::NamedVariable& rightNV,
         const LLVMBackend::TypeAndValue& fieldType,
         const std::string& displayTypeName,
         const std::string& fieldName,
         antlr4::ParserRuleContext* errCtx) {
         auto* compiler = Compiler(errCtx);
-        if (!fieldType.IsArrayView || !fieldType.IsInterface) return false;
+        if (!fieldType.IsArrayView) return false;
 
         const LLVMBackend::TypeAndValue& src = rightNV.TypeAndValue;
         // ELEMENT axis, ahead of the single-object one. A fixed array, a view or a counted
@@ -9644,25 +9644,37 @@ bool MainListener::RejectValueIntoInterfaceViewField(
         // Elements already OF the field's interface are the ACCEPTED case; only a different
         // element type is rejected. A raw `new IA[n]` result names the interface without
         // carrying IsInterface, so match on the resolved NAME rather than on the flag.
-        if (compiler->ResolveTypeAlias(shaped.TypeName) != compiler->ResolveTypeAlias(fieldType.TypeName)
+        if (fieldType.IsInterface
+            && compiler->ResolveTypeAlias(shaped.TypeName) != compiler->ResolveTypeAlias(fieldType.TypeName)
             && RejectPointerShapedInterfaceUpcast(errCtx, shaped, fieldType.TypeName))
             return true;
         // A view, a fixed array and a counted `new T[n]` are real element sources; a null or
         // otherwise unnamed source names no type at all and is a null view. None is a single object.
-        if (src.IsArrayView || src.ConstArraySize != 0 || src.TypeName.empty()) return false;
-        if (rawHeapArray) return false;
-        // Prove it before rejecting: only a source that IS the interface or implements it can
-        // reach CoerceInitValueToInterface's boxing/rebox arms in the first place.
-        if (!src.IsInterface
-            && !compiler->StructImplementsInterface(src.TypeName, fieldType.TypeName))
+        if (src.IsArrayView || src.ConstArraySize != 0 || src.TypeName.empty() || src.IsSimd)
             return false;
+        if (rawHeapArray) return false;
+        // Prove it before rejecting: an INTERFACE field takes only a source that IS the interface
+        // or implements it, and a plain 'T[]' field only a class/struct of its own element type -
+        // a primitive source keeps its own rules ('{ p = 0 }' is a legal null view).
+        if (fieldType.IsInterface)
+        {
+            if (!src.IsInterface
+                && !compiler->StructImplementsInterface(src.TypeName, fieldType.TypeName))
+                return false;
+        }
+        else
+        {
+            const std::string srcType = compiler->ResolveTypeAlias(src.TypeName);
+            if (LLVMBackend::IsPrimitiveTypeName(srcType)) return false;
+            if (srcType != compiler->ResolveTypeAlias(fieldType.TypeName)) return false;
+        }
 
         compiler->LogErrorMessage(
-            "cannot brace-initialize array-view field '{}.{}' ('{}') from '{}' - a view of an "
-            "interface indexes fat '{}' elements, so its source must be an array view of "
-            "'{}' (or a null one), not a single object",
+            "cannot brace-initialize array-view field '{}.{}' ('{}') from '{}' - a view indexes "
+            "whole '{}' elements, so its source must be an array view of '{}' (or a null one), "
+            "not a single object",
             { displayTypeName, fieldName, SpellType(*compiler, fieldType),
-              SpellType(*compiler, src), "{vtable,data}", fieldType.TypeName });
+              SpellType(*compiler, src), fieldType.TypeName, fieldType.TypeName });
         return true;
     }
 
@@ -9695,9 +9707,9 @@ bool MainListener::EmitOneFieldInit(
             return false;
         }
 
-        // Ahead of every store rule: a single object bound to an interface-VIEW field is not one
-        // element of it, and the boxing arm below would forge a fat store into the thin slot.
-        if (RejectValueIntoInterfaceViewField(rightNV, fieldType, displayTypeName, fieldName, errCtx))
+        // Ahead of every store rule: a single object bound to a VIEW field is not one element of
+        // it, and the store below would leave the slot pointing at something that is not an array.
+        if (RejectValueIntoArrayViewField(rightNV, fieldType, displayTypeName, fieldName, errCtx))
             return false;
 
         RejectRawHeapArrayIntoUniqueField(rightNV, fieldType, fieldName, errCtx);

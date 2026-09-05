@@ -903,25 +903,36 @@ bool LLVMBackend::StructImplementsInterface(const std::string& structName, const
     }
 
 /*
- * Value axis of the interface array-view gate. An 'IA[]' indexes fat {vtable,data} elements, so a
- * single value - an implementor, or even a fat 'IA' - is not one element of it; binding it forged
- * a call the verifier rejected (a bare class) or a view over a 16-byte temp (a fat value). A null
- * constant and a '?:' join name no type and are NOT rejected here: they are null views.
+ * Value axis of the array-view parameter gate. A 'T[]' indexes whole elements, so a single value -
+ * a class value, an implementor of an interface element, or even a fat 'IA' - is not one element
+ * of it; binding it forged a call the verifier rejected (a bare class) or a view over a stack temp
+ * that then indexes memory which is not an array. A null constant and a '?:' join name no type and
+ * are NOT rejected here: they are null views. A PRIMITIVE source keeps its own rules ('int[] v = 0'
+ * is a legal null view), so a non-interface element must be a class/struct of the view's own type.
  * Shared by the direct-call door (CreateOverloadedFunctionCall) and the virtual-dispatch door
  * (CallInterfaceMethod) so both spell the rejection identically.
  */
-bool LLVMBackend::RejectValueIntoInterfaceViewParam(const TypeAndValue& arg,
-                                                    const TypeAndValue& param)
+bool LLVMBackend::RejectValueIntoArrayViewParam(const TypeAndValue& arg,
+                                                const TypeAndValue& param)
 {
-        if (!param.IsArrayView || !param.IsInterface) return false;
-        if (arg.Pointer || arg.IsArrayView || arg.ConstArraySize != 0 || arg.TypeName.empty())
+        if (!param.IsArrayView) return false;
+        if (arg.Pointer || arg.IsArrayView || arg.ConstArraySize != 0 || arg.TypeName.empty()
+            || arg.IsSimd)
             return false;
+        // Prove it before rejecting: a plain 'T[]' only sees a class value of its OWN element type
+        // here (anything else fails overload resolution before this gate).
+        if (!param.IsInterface)
+        {
+            const std::string argType = ResolveTypeAlias(arg.TypeName);
+            if (IsPrimitiveTypeName(argType)) return false;
+            if (argType != ResolveTypeAlias(param.TypeName)) return false;
+        }
         LogErrorMessage(
-            "cannot pass a '{}' value as array-view parameter '{}' ('{}') - a view of an "
-            "interface indexes fat '{}' elements, so its source must be an array view of "
-            "'{}' (or a null one), not a single value",
+            "cannot pass a '{}' value as array-view parameter '{}' ('{}') - a view indexes whole "
+            "'{}' elements, so its source must be an array view of '{}' (or a null one), not a "
+            "single value",
             { SpellType(*this, arg), param.VariableName, SpellType(*this, param),
-              "{vtable,data}", param.TypeName });
+              param.TypeName, param.TypeName });
         return true;
     }
 

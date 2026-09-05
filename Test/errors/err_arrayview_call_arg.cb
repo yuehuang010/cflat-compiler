@@ -89,3 +89,50 @@ expect_error("cannot convert 'BvwImpl[]' to interface 'IBvw'") {
     struct BvwDest { IBvw[] v = default; };
     int bvwCall() { BvwImpl[2] a; a[0].k = 1; BvwImpl[] w = a; BvwDest d = { v = w }; return d.v[0].bvw(); }
 }
+
+// NON-interface element, call door: a 'Bnc' value is one object, not a view of them. Before the
+// widening this bound silently and the callee indexed a stack temp as if it were an array.
+expect_error("cannot pass a 'Bnc' value as array-view parameter 'v' ('Bnc[]')") {
+    struct Bnc { int k = default; };
+    int bncTake(Bnc[] v) { return v == nullptr ? 0 : v[0].k; }
+    int bncCall() { Bnc b; b.k = 1; return bncTake(b); }
+}
+
+// Element read 'a[0]' is a value too, and a METHOD lowers its arguments by the same ABI.
+expect_error("cannot pass a 'Bnm' value as array-view parameter 'v' ('Bnm[]')") {
+    struct Bnm { int k = default; };
+    class BnmHost { int put(Bnm[] v) { return v == nullptr ? 0 : v[0].k; } };
+    int bnmCall() { Bnm[2] a; BnmHost h; return h.put(a[0]); }
+}
+
+// Virtual-dispatch door with a non-interface view parameter: before the widening this forged a
+// call the module verifier rejected ("module verification failed"), not a diagnostic.
+expect_error("cannot pass a 'Bnv' value as array-view parameter 'v' ('Bnv[]')") {
+    struct Bnv { int k = default; };
+    interface IBnvHost { int host(Bnv[] v); };
+    class BnvHost : IBnvHost { int host(Bnv[] v) { return v == nullptr ? 0 : v[0].k; } };
+    int bnvCall() { BnvHost h; Bnv b; b.k = 1; IBnvHost hi = &h; return hi.host(b); }
+}
+
+// Generic 'T[]' parameter instantiated at a plain struct reaches the same gate.
+expect_error("cannot pass a 'Bng' value as array-view parameter 'v' ('Bng[]')") {
+    struct Bng { int k = default; };
+    int bngTake<T>(T[] v) { return v == nullptr ? 0 : 1; }
+    int bngCall() { Bng b; b.k = 1; return bngTake<Bng>(b); }
+}
+
+// FIELD door, non-interface element: brace-init stored the 4-byte value into the thin view slot,
+// passed '--check' and SIGSEGVd at v[0].
+expect_error("cannot brace-initialize array-view field 'BnfDest.v' ('Bnf[]') from 'Bnf'") {
+    struct Bnf { int k = default; };
+    struct BnfDest { Bnf[] v = default; };
+    int bnfCall() { Bnf b; b.k = 1; BnfDest d = { v = b }; return d.v[0].k; }
+}
+
+// Pointer row of the same field door: a 'Bnp*' points at ONE object. The '=' store twin already
+// rejects it ("cannot bind a raw pointer 'T*' to an array-view 'T[]'"); brace-init did not.
+expect_error("cannot brace-initialize array-view field 'BnpDest.v' ('Bnp[]') from 'Bnp*'") {
+    struct Bnp { int k = default; };
+    struct BnpDest { Bnp[] v = default; };
+    int bnpCall() { Bnp* p = new Bnp(); p.k = 1; BnpDest d = { v = p }; return d.v[0].k; }
+}

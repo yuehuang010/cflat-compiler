@@ -795,7 +795,7 @@ void LLVMBackend::LogUniqueCopyError(const std::string& typeName,
  * Array-view PARAMETER gate, shared by the direct-call door (CreateOverloadedFunctionCall) and the
  * virtual-dispatch door (CallInterfaceMethod), which lowers a vtable slot's arguments by the same
  * ABI and so needs the same rejections. Three axes: a raw 'T*' would forge the whole-allocation
- * contract a view promises; a single VALUE is not one element of an interface view; a view whose
+ * contract a view promises; a single VALUE is not one element of a view; a view whose
  * ELEMENT differs strides and loads with the wrong shape inside the callee.
  * Returns true when any axis logged.
  */
@@ -814,7 +814,7 @@ bool LLVMBackend::RejectArrayViewParamBinding(const NamedVariable& arg, const Ty
             rejected = true;
         }
 
-        rejected |= RejectValueIntoInterfaceViewParam(arg.TypeAndValue, param);
+        rejected |= RejectValueIntoArrayViewParam(arg.TypeAndValue, param);
 
         std::string destElement;
         std::string srcElement;

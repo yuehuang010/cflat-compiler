@@ -3357,6 +3357,73 @@ int runBraceInitViewIfaceField(int choose)
         + legNest + legArr + legBox;
 }
 
+/*
+ * Same value axis on a NON-interface view ('ViewPlainElem[]'). A single class value bound to it
+ * used to bind silently at the call, method, generic and virtual doors and to SIGSEGV at the
+ * brace door; the reject legs live in Test/errors/err_arrayview_call_arg.cb. These are the
+ * ACCEPT-SET legs the widened gate must keep binding, one distinct sentinel per door.
+ */
+struct ViewPlainElem { int k = default; };
+struct ViewPlainDest { ViewPlainElem[] v = default; };
+struct ViewPlainNest { ViewPlainDest inner = default; };
+struct ViewPlainBox<T> { T[] w = default; };
+interface IViewPlainHost { int hostPut(ViewPlainElem[] v, int miss); };
+class ViewPlainHost : IViewPlainHost
+{
+    int hostPut(ViewPlainElem[] v, int miss) { return v == nullptr ? miss : v[0].k; }
+};
+int viewPlainTake(ViewPlainElem[] v, int miss) { return v == nullptr ? miss : v[0].k; }
+int viewPlainGeneric<T>(T[] v, int miss) { return v == nullptr ? miss : 1; }
+
+int runViewPlainCallDoors(int choose)
+{
+    ViewPlainElem[2] store; store[0].k = 9;
+    ViewPlainElem[] live = store;
+    // Fixed array, view, bare null and a '?:' join: every source a view may legally come from.
+    int legFixed = viewPlainTake(store, 3);
+    int legView = viewPlainTake(live, 5);
+    int legNull = viewPlainTake(nullptr, 4);
+    int legJoin = viewPlainTake(choose != 0 ? live : nullptr, 6);
+    ViewPlainElem[] fresh = new ViewPlainElem[2];
+    int legNew = fresh == nullptr ? 0 : 7;
+    // Method, virtual-dispatch and generic 'T[]' doors lower their arguments separately.
+    ViewPlainHost h;
+    int legMethod = h.hostPut(live, 8);
+    IViewPlainHost hi = &h;
+    int legVirt = hi.hostPut(live, 2);
+    int legGeneric = viewPlainGeneric<ViewPlainElem>(live, 3);
+    return legFixed + legView + legNull + legJoin + legNew + legMethod + legVirt + legGeneric;
+}
+
+int runViewPlainBraceField(int choose)
+{
+    ViewPlainElem[2] store; store[0].k = 9;
+    ViewPlainElem[] live = store;
+    // Null and default sources name no element type, so they bind as a NULL view.
+    ViewPlainDest bNull = { v = nullptr };
+    int legNull = viewPlainTake(bNull.v, 3);
+    ViewPlainDest bDefault = { v = default };
+    int legDefault = viewPlainTake(bDefault.v, 5);
+    ViewPlainDest bView = { v = live };
+    int legView = viewPlainTake(bView.v, 99);
+    ViewPlainDest bFixed = { v = store };
+    int legFixed = viewPlainTake(bFixed.v, 98);
+    // Bare-brace spelling of the same declarator - a second grammar spelling of one construct.
+    ViewPlainDest bBare { v = live };
+    int legBare = viewPlainTake(bBare.v, 97);
+    // A counted `new T[n]` is a whole allocation, so only its NULLness is read here.
+    ViewPlainDest bNew = { v = new ViewPlainElem[2] };
+    int legNew = bNew.v == nullptr ? 0 : 7;
+    ViewPlainNest bNest = { inner = { v = live } };
+    int legNest = viewPlainTake(bNest.inner.v, 96);
+    ViewPlainDest[1] bArr = { { v = choose != 0 ? live : nullptr } };
+    int legArr = viewPlainTake(bArr[0].v, 95);
+    ViewPlainBox<ViewPlainElem> bBox = { w = live };
+    int legBox = viewPlainTake(bBox.w, 94);
+    return legNull + legDefault + legView + legFixed + legBare + legNew
+        + legNest + legArr + legBox;
+}
+
 void rawCountSink(move RawCountElem* values) {}
 void rawCountForward(move RawCountElem* values) { rawCountSink(move values); }
 void rawCountGenericSink<T>(move T* values) {}
@@ -4262,6 +4329,14 @@ int testRawArrayRuntimeCount()
     // live arm) + 9 (generic) = 69; the `choose == 0` run takes the array's NULL arm (95) = 155.
     passed += Test("brace-init binds an interface view field at every accepted source",
         runBraceInitViewIfaceField(1) * 1000 + runBraceInitViewIfaceField(0), 69155);
+    // 9 (fixed) + 9 (view) + 4 (null) + 9/6 (join) + 7 (new) + 9 (method) + 9 (virtual)
+    // + 1 (generic) = 57; the `choose == 0` run takes the join's null arm (6) = 54.
+    passed += Test("a plain array view still binds every accepted source at the call doors",
+        runViewPlainCallDoors(1) * 100 + runViewPlainCallDoors(0), 5754);
+    // 3 + 5 + 9 (view) + 9 (fixed) + 9 (bare brace) + 7 (new) + 9 (nested) + 9 (array of struct,
+    // live arm) + 9 (generic) = 69; the `choose == 0` run takes the array's NULL arm (95) = 155.
+    passed += Test("brace-init binds a plain array-view field at every accepted source",
+        runViewPlainBraceField(1) * 1000 + runViewPlainBraceField(0), 69155);
     passed += Test("raw count move parameter direct zero and counts",
         runRawCountMoveDirect(0) * 100 + runRawCountMoveDirect(2) * 10
             + runRawCountMoveDirect(4), 24);
@@ -4477,7 +4552,7 @@ extern int main()
     r = testDiscard();          passed += r; total += 6;
     r = testDirectReturnOwnership(); passed += r; total += 6;
     r = testCLongWidth();       passed += r; total += 15;
-    r = testRawArrayRuntimeCount(); passed += r; total += 95;
+    r = testRawArrayRuntimeCount(); passed += r; total += 97;
     r = testDictEnumeration();  passed += r; total += 12;
     r = testLiteralReceiverAndNullChain(); passed += r; total += 9;
     r = testDefaultAsExpression(); passed += r; total += 82;

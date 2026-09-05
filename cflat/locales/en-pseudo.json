@@ -190,6 +190,14 @@
       "{vtable,data}",
       "IBvi"
     ],
+    "cannotbraceinitializ...lonenotasingleobjectec2caca65ac1fee1": [
+      "BviDest",
+      "v",
+      "IBvi[]",
+      "BviImpl",
+      "IBvi",
+      "IBvi"
+    ],
     "cannotconvertinterfa...ngarg2implementsarg3275f532c2c4f1baa": [
       "IUniqueThing",
       "IUnrelatedThing",
@@ -250,6 +258,13 @@
       "v",
       "IBvc[]",
       "{vtable,data}",
+      "IBvc"
+    ],
+    "cannotpassaarg0value...llonenotasinglevaluee93521a582289c53": [
+      "BvcImpl",
+      "v",
+      "IBvc[]",
+      "IBvc",
       "IBvc"
     ],
     "cannotpassanarrayvie...theelementsmustmatch70ac68158d8ea37a": [
@@ -1545,6 +1560,7 @@
     "cannotassignarg0toar...thanexplicitcastarg4fac024c4cf80f689": "cannot assign {0} to '{1}' destination {2}: only a named function, a '{3}' value or a non-capturing lambda converts to a function pointer - a data pointer would be called as code. If the value really holds a code address, assert it with an explicit cast: '{4}'.",
     "cannotassignarg0tocl...thanexplicitcastarg3b001825100666242": "cannot assign {0} to closure destination {1}: only a named function, a '{2}' value or a lambda converts to a closure - a data pointer would be called as code. If the value really holds a code address, assert it with an explicit cast: '{3}'.",
     "cannotbraceinitializ...lonenotasingleobjectcd9b64c5f6665b5e": "cannot brace-initialize array-view field '{0}.{1}' ('{2}') from '{3}' - a view of an interface indexes fat '{4}' elements, so its source must be an array view of '{5}' (or a null one), not a single object",
+    "cannotbraceinitializ...lonenotasingleobjectec2caca65ac1fee1": "cannot brace-initialize array-view field '{0}.{1}' ('{2}') from '{3}' - a view indexes whole '{4}' elements, so its source must be an array view of '{5}' (or a null one), not a single object",
     "cannotconvertinterfa...ngarg2implementsarg3275f532c2c4f1baa": "cannot convert interface '{0}' to interface '{1}' - no class implementing '{2}' implements '{3}'",
     "cannotconverttointer...0noclassimplementsit1e8c0aedb2889c6b": "cannot convert to interface '{0}' - no class implements it",
     "cannotconverttointer...g2declaredinsidearg380f17f1b4261ff04": "cannot convert to interface '{0}' - all {1} classes implementing it are declared inside 'if const' arms that are not taken in this build (for example '{2}', declared inside {3})",
@@ -1564,6 +1580,7 @@
     "cannotmovetheoverali...heelementtypeinstead37678af4b62532f7": "cannot move the over-aligned buffer '{0}' ('{1}') into the '{2}' parameter of '{3}': that alignment is a property of the allocation, not of the type, so the callee cannot recover it. Declare the parameter '{4}' so the block alignment is recorded, or over-align the ELEMENT TYPE instead.",
     "cannotpassaarg0bitin...itexplicitlywitharg3e8b611917d2a59d2": "cannot pass a {0}-bit integer to {1}: implicit integer narrowing to '{2}' is not allowed at a call argument - cast it explicitly with '({3})'",
     "cannotpassaarg0value...llonenotasinglevalue11699d4fd5b13cc2": "cannot pass a '{0}' value as array-view parameter '{1}' ('{2}') - a view of an interface indexes fat '{3}' elements, so its source must be an array view of '{4}' (or a null one), not a single value",
+    "cannotpassaarg0value...llonenotasinglevaluee93521a582289c53": "cannot pass a '{0}' value as array-view parameter '{1}' ('{2}') - a view indexes whole '{3}' elements, so its source must be an array view of '{4}' (or a null one), not a single value",
     "cannotpassanarrayvie...theelementsmustmatch70ac68158d8ea37a": "cannot pass an array view of '{0}' as parameter '{1}' of '{2}', whose element is '{3}' - a view indexes by its own element, so the elements must match",
     "cannotpassanowningva...evaluetoanownerfirste67cc584259d5eee": "cannot pass an owning value to the variadic '{0}' slot of '{1}'; bind the value to an owner first",
     "cannotpassarawpointe...rg5arg6decayisoneway9309c0c4984312aa": "cannot pass a raw pointer '{0}' as array-view parameter '{1}' ('{2}') - a view must span a whole allocation (it comes only from '{3}' or another '{4}'); the '{5} -> {6}' decay is one-way",
