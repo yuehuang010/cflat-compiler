@@ -3044,6 +3044,67 @@ int runViewTernaryElementJoin(int choose)
         + viewJoinPick(left, right, c)[1] + *starJoin[0] + nullJoin[0] + defaultJoin[0];
 }
 
+// Same accept-set, but each '?:' arm is a struct FIELD read. A field names no local slot, so the
+// arm used to stay unnamed and the join escaped every door; it now carries the field's element.
+struct ViewJoinFieldHolder
+{
+    int[] v = default;
+    int pickThis(int[] other, bool c) { int[] j = c ? this.v : other; return j[0]; }
+    int pickBare(int[] other, bool c) { int[] j = c ? v : other; return j[1]; }
+};
+struct ViewJoinFieldOuter { ViewJoinFieldHolder inner = default; };
+namespace ViewJoinFieldNS { struct NsHolder { int[] v = default; }; }
+struct ViewJoinFieldBox<T> { T[] v = default; };
+int[] viewJoinFieldGive(int[] q) { return q; }
+ViewJoinFieldHolder viewJoinFieldMake(int[] q) { ViewJoinFieldHolder h = default; h.v = q; return h; }
+ViewJoinFieldOuter viewJoinFieldMakeOuter(int[] q)
+{
+    ViewJoinFieldOuter o = default; o.inner.v = q; return o;
+}
+int runViewTernaryFieldArmJoin(int choose)
+{
+    int[3] store; store[0] = 7; store[1] = 8; store[2] = 9;
+    int[] other = store;
+    bool c = choose != 0;
+
+    ViewJoinFieldHolder h = default; h.v = store;
+    ViewJoinFieldHolder* hp = &h;
+    ViewJoinFieldOuter o = default; o.inner.v = store;
+    ViewJoinFieldOuter* op = &o;
+    ViewJoinFieldHolder* hnull = default;
+    ViewJoinFieldNS.NsHolder ns = default; ns.v = store;
+    ViewJoinFieldBox<int> box = default; box.v = store;
+
+    int[] fromValueField = c ? h.v : other;
+    int[] fromPointerField = c ? hp.v : other;
+    int[] fromNestedField = c ? o.inner.v : other;
+    int[] fromNsField = c ? ns.v : other;
+    int[] fromGenericField = c ? box.v : other;
+    int[] bothFields = c ? h.v : o.inner.v;
+    int[] fieldAndCall = c ? h.v : viewJoinFieldGive(other);
+    int[] fieldAndInner = c ? h.v : (c ? other : other);
+    int[] fieldAssigned = default;
+    fieldAssigned = c ? h.v : other;
+    // A field of a by-VALUE call result is an aggregate extract, and a '?.' merge drops the field
+    // GEP - both still have to reach the join with the field's declared element.
+    int[] fromCallValueField = c ? viewJoinFieldMake(store).v : other;
+    int[] fromCallNestedField = c ? viewJoinFieldMakeOuter(store).inner.v : other;
+    int[] fromNullSafeField = c ? hp?.v : other;
+    int[] fromNullSafeNested = c ? op?.inner.v : other;
+    // Null receiver: the '?.' arm is still named at compile time, and the untaken arm must not
+    // be evaluated - the value comes from the other arm.
+    int[] fromNullReceiver = !c ? hnull?.v : other;
+    ViewJoinFieldHolder dest = default;
+    dest.v = c ? h.v : other;
+    return fromValueField[0] + fromPointerField[1] + fromNestedField[2]
+        + fromNsField[0] + fromGenericField[1] + bothFields[2]
+        + fieldAndCall[0] + fieldAndInner[1] + fieldAssigned[2] + dest.v[0]
+        + viewJoinTake(c ? h.v : other) + viewJoinPick(h.v, other, c)[1]
+        + h.pickThis(other, c) + h.pickBare(other, c)
+        + fromCallValueField[0] + fromCallNestedField[1] + fromNullSafeField[2]
+        + fromNullSafeNested[0] + fromNullReceiver[1];
+}
+
 void rawCountSink(move RawCountElem* values) {}
 void rawCountForward(move RawCountElem* values) { rawCountSink(move values); }
 void rawCountGenericSink<T>(move T* values) {}
@@ -3930,6 +3991,8 @@ int testRawArrayRuntimeCount()
         runRawCountJoinView(1) * 10 + runRawCountJoinView(0), 24);
     passed += Test("view ternary keeps its arms' element at every door",
         runViewTernaryElementJoin(1), 61);
+    passed += Test("view ternary field-read arm keeps its element at every door",
+        runViewTernaryFieldArmJoin(1), 148);
     passed += Test("raw count move parameter direct zero and counts",
         runRawCountMoveDirect(0) * 100 + runRawCountMoveDirect(2) * 10
             + runRawCountMoveDirect(4), 24);
@@ -4145,7 +4208,7 @@ extern int main()
     r = testDiscard();          passed += r; total += 6;
     r = testDirectReturnOwnership(); passed += r; total += 6;
     r = testCLongWidth();       passed += r; total += 15;
-    r = testRawArrayRuntimeCount(); passed += r; total += 89;
+    r = testRawArrayRuntimeCount(); passed += r; total += 90;
     r = testDictEnumeration();  passed += r; total += 12;
     r = testLiteralReceiverAndNullChain(); passed += r; total += 9;
     r = testDefaultAsExpression(); passed += r; total += 82;

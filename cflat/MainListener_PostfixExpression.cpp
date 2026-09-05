@@ -5671,6 +5671,11 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                         compiler->SwitchToBlock(resumeBlock);
                         auto* result = compiler->CreateLoad(resultAlloca);
                         compiler->PropagateNullConditionalOwnership(namedVar.Primary, result);
+                        // The merge drops the field GEP, so a view field's declared element would
+                        // be lost here; carry it onto the merged value while it is still in view.
+                        LLVMBackend::TypeAndValue fieldView;
+                        if (ViewFieldElementForRead(namedVar.Primary, namedVar.Storage, fieldView))
+                            compiler->RegisterViewJoinType(result, fieldView);
                         namedVar.Storage = nullptr;
                         namedVar.Primary = result;
                         namedVar.BaseType = result->getType();

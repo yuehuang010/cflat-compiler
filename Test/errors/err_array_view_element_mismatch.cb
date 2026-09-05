@@ -55,6 +55,22 @@ expect_error("cannot join an array view of 'int' with an array view of 'u8' in a
     int[] avmJoinDisagree(int[] a, u8[] b, bool c) { int[] r = c ? a : b; return r; }
 }
 
+// A '?:' ARM that reads a struct FIELD names no local slot, so it used to stay unnamed, nothing
+// was stamped on the join and every door took its unnamed escape. A field's element lives on the
+// field's own declaration; these legs all compiled clean before that recovery existed.
+struct AvmU8Holder { u8[] v = default; };
+struct AvmU8Outer { AvmU8Holder inner = default; };
+struct AvmIfaceViewHolder { AvmIface[] v = default; };
+
+expect_error("cannot return an array view of 'u8' from a function whose return element is 'int'") {
+    int[] avmReturnFieldArm(AvmU8Holder h, u8[] b, bool c) { return c ? h.v : b; }
+}
+
+// A field read off a CALL RESULT never reaches memory - it is an aggregate extract, not a GEP -
+// and a '?.' merge drops the field GEP before the arm is judged. Both used to escape.
+AvmU8Holder avmMakeU8Holder(u8[] b) { AvmU8Holder h = default; h.v = b; return h; }
+AvmU8Outer avmMakeU8Outer(u8[] b) { AvmU8Outer o = default; o.inner.v = b; return o; }
+
 int avmTakeInt(int[] d) { return d[1]; }
 
 extern int main()
@@ -172,6 +188,86 @@ extern int main()
         u8[4] avmArgBytes; avmArgBytes[0] = 9;
         u8[] avmArgView = avmArgBytes;
         int avmArgResult = avmTakeInt(avmArgView);
+    }
+
+    // Same joins, but the ARM is a struct FIELD read rather than a local slot.
+    u8[4] avmFieldBytes; avmFieldBytes[0] = 1;
+    u8[] avmFieldSrc = avmFieldBytes;
+    bool avmFieldPick = avmFieldBytes[0] == 1;
+
+    // Declaration door, arm read through a struct VALUE.
+    expect_error("cannot bind an array view of 'u8' to a destination of 'int'") {
+        AvmU8Holder avmFieldHolder = default;
+        avmFieldHolder.v = avmFieldSrc;
+        int[] avmFieldDecl = avmFieldPick ? avmFieldHolder.v : avmFieldSrc;
+    }
+
+    // Assignment door, arm read through a POINTER to the struct.
+    expect_error("cannot bind an array view of 'u8' to a destination of 'int'") {
+        AvmU8Holder avmFieldPtrHolder = default;
+        avmFieldPtrHolder.v = avmFieldSrc;
+        AvmU8Holder* avmFieldPtr = &avmFieldPtrHolder;
+        int[] avmFieldAssigned = default;
+        avmFieldAssigned = avmFieldPick ? avmFieldPtr.v : avmFieldSrc;
+    }
+
+    // Field-store door, arm read through a NESTED field path.
+    expect_error("cannot bind an array view of 'u8' to a destination of 'int'") {
+        AvmU8Outer avmFieldOuter = default;
+        avmFieldOuter.inner.v = avmFieldSrc;
+        AvmIfaceHolder avmFieldStore = default;
+        avmFieldStore.view = avmFieldPick ? avmFieldOuter.inner.v : avmFieldSrc;
+    }
+
+    // Call-argument door, arm read through a generic INSTANTIATION's field.
+    expect_error("cannot pass an array view of 'u8' as parameter 'd' of 'avmTakeInt'") {
+        AvmBox<u8[]> avmFieldBox = default;
+        avmFieldBox.v = avmFieldSrc;
+        int avmFieldCall = avmTakeInt(avmFieldPick ? avmFieldBox.v : avmFieldSrc);
+    }
+
+    // Interface elements: the field arm names 'AvmIface', the destination wants 'AvmIfaceB'.
+    expect_error("cannot bind an array view of 'AvmIface' to a destination of 'AvmIfaceB'") {
+        AvmIfaceViewHolder avmFieldIface = default;
+        avmFieldIface.v = avmIfaceView;
+        AvmIfaceB[] avmFieldIfaceDecl = avmFieldPick ? avmFieldIface.v : avmIfaceView;
+    }
+
+    // Declaration door, arm read off a by-VALUE call result.
+    expect_error("cannot bind an array view of 'u8' to a destination of 'int'") {
+        int[] avmFieldCallValue = avmFieldPick ? avmMakeU8Holder(avmFieldSrc).v : avmFieldSrc;
+    }
+
+    // Assignment door, arm read off a NESTED field of a by-value call result.
+    expect_error("cannot bind an array view of 'u8' to a destination of 'int'") {
+        int[] avmFieldCallNested = default;
+        avmFieldCallNested = avmFieldPick ? avmMakeU8Outer(avmFieldSrc).inner.v : avmFieldSrc;
+    }
+
+    // Declaration door, arm read through a NULL-SAFE '?.' access.
+    expect_error("cannot bind an array view of 'u8' to a destination of 'int'") {
+        AvmU8Holder avmFieldNcHolder = default;
+        avmFieldNcHolder.v = avmFieldSrc;
+        AvmU8Holder* avmFieldNcPtr = &avmFieldNcHolder;
+        int[] avmFieldNcDecl = avmFieldPick ? avmFieldNcPtr?.v : avmFieldSrc;
+    }
+
+    // Call-argument door, arm read through a NULL-SAFE access into a nested field.
+    expect_error("cannot pass an array view of 'u8' as parameter 'd' of 'avmTakeInt'") {
+        AvmU8Outer avmFieldNcOuter = default;
+        avmFieldNcOuter.inner.v = avmFieldSrc;
+        AvmU8Outer* avmFieldNcOuterPtr = &avmFieldNcOuter;
+        int avmFieldNcCall = avmTakeInt(
+            avmFieldPick ? avmFieldNcOuterPtr?.inner.v : avmFieldSrc);
+    }
+
+    // The two arms themselves disagree once the field arm is named, so the JOIN is the error
+    // site - this pins that site's own wording, not a door's.
+    expect_error("cannot join an array view of 'u8' with an array view of 'int' in a '?:'") {
+        AvmU8Holder avmFieldDisagree = default;
+        avmFieldDisagree.v = avmFieldSrc;
+        int[] avmFieldOther = iview;
+        int[] avmFieldJoin = avmFieldPick ? avmFieldDisagree.v : avmFieldOther;
     }
 
     return 0;

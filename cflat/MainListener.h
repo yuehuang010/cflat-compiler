@@ -4838,6 +4838,10 @@ public:
                                      const LLVMBackend::TypeAndValue& target,
                                      const LLVMBackend::NamedVariable& rhsNV);
 
+    // Element identity of a view read out of a struct FIELD, however the field was addressed.
+    bool ViewFieldElementForRead(llvm::Value* value, llvm::Value* storage,
+                                 LLVMBackend::TypeAndValue& out) const;
+
     // Element identity of a '?:' arm that is an array view, and its propagation onto the join.
     bool TernaryArmViewType(llvm::Value* value, llvm::Value* storage,
                             LLVMBackend::TypeAndValue& out) const;

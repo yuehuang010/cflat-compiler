@@ -4732,10 +4732,38 @@ bool MainListener::IsDefaultOnlyExpression(antlr4::ParserRuleContext* ctx) const
     }
 
 /*
+ * A view read out of a struct FIELD names no declared slot, so recover the element from the
+ * field's own declaration. Three addressings, one question: the field GEP handed in as storage,
+ * a load off that GEP, or an `extractvalue` out of a by-value struct that never reached memory
+ * (a call result). Anything unresolvable stays unnamed - the caller then leaves the join alone.
+ */
+bool MainListener::ViewFieldElementForRead(llvm::Value* value, llvm::Value* storage,
+                                           LLVMBackend::TypeAndValue& out) const {
+        auto* compiler = compilerLLVM;
+        if (storage == nullptr)
+            if (auto* load = llvm::dyn_cast_or_null<llvm::LoadInst>(value))
+                storage = load->getPointerOperand();
+        if (const auto* field = compiler->FindDeclaredFieldTypeAndValueForStorage(storage);
+            field != nullptr && field->IsArrayView)
+        {
+            out = *field;
+            return true;
+        }
+        if (const auto* field = compiler->FindDeclaredFieldTypeAndValueForValue(value);
+            field != nullptr && field->IsArrayView)
+        {
+            out = *field;
+            return true;
+        }
+        return false;
+    }
+
+/*
  * A `T[]` view is a thin pointer, so a '?:' arm names its element only where the front end knew
- * it: the declared slot the arm was loaded from, the callee's declared return type, or an inner
- * join already stamped in the ledger. An arm that resolves to none of those stays unnamed and the
- * join is left alone (status quo: the element gate then takes its unnamed escape).
+ * it: the declared slot the arm was loaded from, the struct field it was read out of, the callee's
+ * declared return type, or an inner join already stamped in the ledger. An arm that resolves to
+ * none of those stays unnamed and the join is left alone (status quo: the element gate then takes
+ * its unnamed escape).
  */
 bool MainListener::TernaryArmViewType(llvm::Value* value, llvm::Value* storage,
                                       LLVMBackend::TypeAndValue& out) const {
@@ -4746,12 +4774,16 @@ bool MainListener::TernaryArmViewType(llvm::Value* value, llvm::Value* storage,
             if (auto* load = llvm::dyn_cast<llvm::LoadInst>(value))
                 storage = load->getPointerOperand();
         if (storage != nullptr)
+        {
             if (const auto* declared = compiler->FindDeclaredTypeAndValueForStorage(storage);
                 declared != nullptr && declared->IsArrayView)
             {
                 out = *declared;
                 return true;
             }
+        }
+        // A FIELD read names no local slot; its element lives on the field's declaration.
+        if (ViewFieldElementForRead(value, storage, out)) return true;
         if (auto* call = llvm::dyn_cast<llvm::CallInst>(value))
             if (const auto* symbol = compiler->FindSymbolForFunction(call->getCalledFunction());
                 symbol != nullptr && symbol->ReturnType.IsArrayView)

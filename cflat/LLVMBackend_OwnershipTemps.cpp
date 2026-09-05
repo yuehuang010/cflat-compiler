@@ -3194,6 +3194,56 @@ const LLVMBackend::TypeAndValue* LLVMBackend::FindDeclaredTypeAndValueForStorage
         return nullptr;
     }
 
+/*
+ * The declared field at LLVM element `index` of a registered named struct, or nullptr.
+ * Answers only what it can PROVE: the declared StructFields list and the LLVM element list must
+ * be the same list, else the index would blame the wrong field (union, padded layout).
+ */
+const LLVMBackend::TypeAndValue* LLVMBackend::FindDeclaredFieldOfStructType(
+        const llvm::StructType* structType, uint64_t index) const
+{
+        if (structType == nullptr || !structType->hasName()) return nullptr;
+        auto entry = dataStructures.find(structType->getName().str());
+        if (entry == dataStructures.end()) return nullptr;
+        const auto& fields = entry->second.StructFields;
+        if (entry->second.IsUnion || fields.size() != structType->getNumElements()) return nullptr;
+        if (index >= fields.size()) return nullptr;
+        return &fields[index];
+}
+
+/*
+ * A struct-FIELD read has no declared local slot: its storage is a struct GEP, so the sibling
+ * FindDeclaredTypeAndValueForStorage finds nothing. Recover the field's declared type from the
+ * GEP's own source struct type, the same recovery the call door does from a name.
+ * Requires a constant two-index GEP over a registered named struct; anything else stays unnamed.
+ */
+const LLVMBackend::TypeAndValue* LLVMBackend::FindDeclaredFieldTypeAndValueForStorage(
+        const llvm::Value* storage) const
+{
+        const auto* gep = llvm::dyn_cast_or_null<llvm::GetElementPtrInst>(storage);
+        if (gep == nullptr || gep->getNumIndices() != 2) return nullptr;
+        auto* first = llvm::dyn_cast<llvm::ConstantInt>(gep->getOperand(1));
+        auto* second = llvm::dyn_cast<llvm::ConstantInt>(gep->getOperand(2));
+        if (first == nullptr || second == nullptr || !first->isZero()) return nullptr;
+        return FindDeclaredFieldOfStructType(
+            llvm::dyn_cast<llvm::StructType>(gep->getSourceElementType()), second->getZExtValue());
+}
+
+/*
+ * Same question for a field read off a by-VALUE struct that never reached memory - a call result
+ * addressed by `extractvalue` rather than by a GEP. One index only: the aggregate operand names
+ * the struct the field is declared on.
+ */
+const LLVMBackend::TypeAndValue* LLVMBackend::FindDeclaredFieldTypeAndValueForValue(
+        const llvm::Value* value) const
+{
+        const auto* extract = llvm::dyn_cast_or_null<llvm::ExtractValueInst>(value);
+        if (extract == nullptr || extract->getNumIndices() != 1) return nullptr;
+        return FindDeclaredFieldOfStructType(
+            llvm::dyn_cast<llvm::StructType>(extract->getAggregateOperand()->getType()),
+            extract->getIndices()[0]);
+}
+
 std::string LLVMBackend::ResolvePointerElementTypeName(llvm::Value* value) const
 {
         std::string name = FindValueElementTypeName(value);

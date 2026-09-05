@@ -2520,6 +2520,10 @@ struct IfaceViewHolder
     int n = 0;
     int sum() { int s = 0; for (int i = 0; i < n; i++) s += items[i].area(); return s; }
 };
+IfaceViewHolder ifaceViewMakeHolder(IShape[] v)
+{
+    IfaceViewHolder h = default; h.items = v; h.n = 4; return h;
+}
 
 // A fresh heap array crosses a call boundary as `array<IShape>`: `new IShape[n]` desugars to
 // the owning array (a bare `IShape[]` return would drop the element count).
@@ -2607,6 +2611,22 @@ bool testInterfaceArrayViewOfInterfaces()
     hj.n = 4;
     result &= Test("iface_view_ternary_field", hj.sum(), 48 + 27 + 9 + 16);
     result &= Test("iface_view_ternary_call", ifaceViewSum(pick ? view : empty, 4), 48 + 27 + 9 + 16);
+
+    // A '?:' ARM that is itself a struct FIELD read: it names no local slot, so it used to stay
+    // unnamed and the join escaped the element gate. Same-element field arms stay legal.
+    IShape[] fieldArmChosen = pick ? h.items : view;
+    result &= Test("iface_view_ternary_field_arm", fieldArmChosen[1].area(), 27);
+    IShape[] genericFieldArm = pick ? genericHolder.items : h.items;
+    result &= Test("iface_view_ternary_generic_field_arm", genericFieldArm[0].area(), 48);
+    result &= Test("iface_view_ternary_field_arm_call",
+        ifaceViewSum(pick ? h.items : view, 4), 48 + 27 + 9 + 16);
+    // Same field, addressed two ways the GEP recovery cannot see: an aggregate extract out of a
+    // by-value call result, and a '?.' merge that has already dropped the field GEP.
+    IShape[] callFieldArm = pick ? ifaceViewMakeHolder(view).items : view;
+    result &= Test("iface_view_ternary_call_field_arm", callFieldArm[1].area(), 27);
+    IfaceViewHolder* hptr = &h;
+    IShape[] ncFieldArm = pick ? hptr?.items : view;
+    result &= Test("iface_view_ternary_nullsafe_field_arm", ncFieldArm[3].area(), 16);
 
     // A view RETURNED from a function. Its unwritten elements must read as null interfaces.
     // NOTE: this pins the SEMANTICS, not the buffer-zeroing that implements them - macOS's

@@ -4012,6 +4012,14 @@ private:
      */
     const TypeAndValue* FindDeclaredTypeAndValueForStorage(const llvm::Value* storage) const;
 
+    // Same question for a struct-FIELD read, whose storage is a GEP (or, for a by-value struct
+    // that never reached memory, an `extractvalue`) and names no local slot.
+    // Callers must COPY the result: it aliases dataStructures storage.
+    const TypeAndValue* FindDeclaredFieldOfStructType(const llvm::StructType* structType,
+                                                      uint64_t index) const;
+    const TypeAndValue* FindDeclaredFieldTypeAndValueForStorage(const llvm::Value* storage) const;
+    const TypeAndValue* FindDeclaredFieldTypeAndValueForValue(const llvm::Value* value) const;
+
     /*
      * Resolve the concrete class a pointer VALUE points at. The `new`-site ledger answers an
      * owning temp, a direct call uses its registered pointer return type, and a BORROWED value is
