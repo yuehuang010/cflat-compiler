@@ -12,6 +12,14 @@ class Impl : ITaker { int take(Circle c) { return 1000 + c.r; } };
 interface ICounter { int bump(int n); };
 class Counter : ICounter { int bump(int n) { return 100 + n; } };
 
+// Same family, integer widths: implicit integer NARROWING at a call argument is not legal
+// (ruling 2026-09-04). The sub-int cases used to score an implicit match and lower an i16 into
+// an i8 slot - another module-verifier dump with no location.
+int takeU8(u8 v) { return (int)v; }
+int sumU8(u8 v, ...) { return (int)v; }
+interface INarrow { int n(u8 v); };
+class NarrowImpl : INarrow { int n(u8 v) { return (int)v; } };
+
 extern int main()
 {
     // Direct call: no candidate remains, so the located "no overload" diagnostic stands.
@@ -59,6 +67,42 @@ extern int main()
         function<int(Circle)> f = (Circle c) => { return 1000 + c.r; };
         Circle* a = new Circle();
         int r = f(a);
+    }
+
+    // A narrow-result binary expression ('u8 * int' is 16 bits wide) is the shape that used to
+    // pass scoring; an 'int' argument to the same parameter was already rejected here.
+    expect_error("no overload of 'takeU8' matches the given arguments") {
+        u8 a = 200;
+        int r = takeU8(a * 1000);
+    }
+
+    // Plain named-type narrowing, no expression involved.
+    expect_error("no overload of 'takeU8' matches the given arguments") {
+        u16 w = 300;
+        int r = takeU8(w);
+    }
+
+    // A variadic candidate is taken WITHOUT per-argument scoring, so its declared parameter
+    // needs its own proof.
+    expect_error("no overload of 'sumU8' matches the given arguments") {
+        u16 w = 300;
+        int r = sumU8(w, 1);
+    }
+
+    // Virtual dispatch picks its slot by arity, so the width is judged at argument lowering
+    // and gets the specific wording.
+    expect_error("implicit integer narrowing to 'u8' is not allowed at a call argument") {
+        NarrowImpl* ni = new NarrowImpl();
+        INarrow inf = ni;
+        u16 w = 300;
+        int r = inf.n(w);
+    }
+
+    // Indirect call: neither the scorer nor the vtable resolver runs, same as the pointer leg.
+    expect_error("cannot pass a 16-bit integer to parameter 1 of a call through a function value") {
+        function<int(u8)> g = takeU8;
+        u16 w = 300;
+        int r = g(w);
     }
 
     return 0;

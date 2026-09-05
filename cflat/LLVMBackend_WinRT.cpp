@@ -2164,9 +2164,16 @@ llvm::Value* LLVMBackend::LowerByValueArg(llvm::Value* value, const TypeAndValue
         }
         else
         {
-            // Upconvert to match the declared parameter type (e.g. i16 -> i32; struct identity).
+            // Convert to match the declared parameter type (e.g. i16 -> i32; struct identity).
+            // Integer -> bool converts, narrowing is refused - the paths that bind without
+            // per-argument scoring (interface dispatch, a variadic candidate's declared
+            // parameters) reach the check only here.
             bool argIsUnsigned = arg.TypeAndValue.IsUnsignedInteger() != -1;
-            value = Upconvert(value, GetType(param), argIsUnsigned);
+            std::string what = param.VariableName.empty()
+                ? std::string("a by-value parameter")
+                : std::format("parameter '{}'", param.VariableName);
+            value = ConvertIntegerCallArgument(value, GetType(param), argIsUnsigned,
+                SpellType(*this, param), what);
         }
 
         // A string not statically known to own its buffer, passed to a move parameter.

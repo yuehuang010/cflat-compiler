@@ -6404,6 +6404,23 @@ public:
     /// </summary>
     llvm::Value* CoerceToBoolCondition(llvm::Value* cond);
 
+    /*
+     * Integer conversion at a call-argument slot. Widening upconverts, integer -> bool routes
+     * through CoerceToBoolCondition, and NARROWING is rejected (ruling 2026-09-04: implicit
+     * integer narrowing at a call argument is not legal). Backstop for the call paths that bind
+     * an argument without per-argument overload scoring - interface dispatch, a variadic
+     * candidate's declared parameters, and a call through a function value.
+     */
+    llvm::Value* ConvertIntegerCallArgument(llvm::Value* value, llvm::Type* destType,
+        bool srcIsUnsigned, const std::string& paramSpelling, const std::string& what);
+
+    // True when binding this argument to that parameter would truncate an integer.
+    bool ArgumentNarrowsParameter(const NamedVariable& arg, const TypeAndValue& param) const;
+
+    // True when this argument is an integer bound to a 'bool' parameter - legal, and lowered
+    // by ConvertIntegerCallArgument.
+    bool ArgumentConvertsToBoolParameter(const NamedVariable& arg, const TypeAndValue& param) const;
+
     // Short type name for a rejected condition operand.
     std::string DescribeConditionType(llvm::Type* t) const;
 

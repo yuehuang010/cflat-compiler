@@ -525,7 +525,10 @@ llvm::Value* LLVMBackend::CreateIndirectCall(const TypeAndValue& funcPtrType, ll
                 if (strTy && destTy == strTy && args[i]->getType()->isPointerTy())
                     args[i] = WrapStringLiteralAsString(args[i]);
                 else
-                    args[i] = Upconvert(args[i], destTy, IndirectArgIsUnsigned(argNVs, i));
+                    args[i] = ConvertIntegerCallArgument(args[i], destTy,
+                        IndirectArgIsUnsigned(argNVs, i),
+                        SpellType(*this, TypeAndValue{ .TypeName = funcPtrType.FuncPtrParams[i].TypeName }),
+                        std::format("parameter {} of a call through a function value", i + 1));
                 CheckIndirectCallArgShape(args[i], destTy, i, funcPtrType.FuncPtrParams[i].TypeName);
                 abiArgs.push_back(args[i]);
                 TypeAndValue pTV;
@@ -601,7 +604,10 @@ llvm::Value* LLVMBackend::CreateIndirectCall(const TypeAndValue& funcPtrType, ll
             if (strTy && destTy == strTy && args[i]->getType()->isPointerTy())
                 args[i] = WrapStringLiteralAsString(args[i]);
             else
-                args[i] = Upconvert(args[i], destTy, IndirectArgIsUnsigned(argNVs, i));
+                args[i] = ConvertIntegerCallArgument(args[i], destTy,
+                        IndirectArgIsUnsigned(argNVs, i),
+                        SpellType(*this, TypeAndValue{ .TypeName = funcPtrType.FuncPtrParams[i].TypeName }),
+                        std::format("parameter {} of a call through a function value", i + 1));
             CheckIndirectCallArgShape(args[i], destTy, i, funcPtrType.FuncPtrParams[i].TypeName);
             userArgs.push_back(args[i]);
             TypeAndValue pTV;
@@ -720,6 +726,37 @@ llvm::Value* LLVMBackend::CoerceToBoolCondition(llvm::Value* cond)
             " - compare it explicitly",
             { DescribeConditionType(cond->getType()) });
         return builder->getFalse();
+    }
+
+llvm::Value* LLVMBackend::ConvertIntegerCallArgument(llvm::Value* value, llvm::Type* destType,
+        bool srcIsUnsigned, const std::string& paramSpelling, const std::string& what)
+{
+        if (value == nullptr || destType == nullptr)
+            return value;
+
+        auto* srcType = value->getType();
+        if (!srcType->isIntegerTy() || !destType->isIntegerTy())
+            return Upconvert(value, destType, srcIsUnsigned);
+
+        // Integer -> bool is legal at a call for constants and non-constants alike, and takes
+        // the same door a cast / assignment / brace-init takes.
+        if (destType->isIntegerTy(1) && !srcType->isIntegerTy(1))
+            return CoerceToBoolCondition(value);
+
+        // Narrowing has no implicit conversion at a call argument. Without this the mistyped
+        // value reached the LLVM verifier as "Call parameter type does not match function
+        // signature!" with no diagnostic of our own.
+        if (srcType->getIntegerBitWidth() > destType->getIntegerBitWidth())
+        {
+            const std::string shown = paramSpelling.empty() ? std::string("a narrower integer")
+                                                            : paramSpelling;
+            LogErrorMessage(
+                "cannot pass a {}-bit integer to {}: implicit integer narrowing to '{}' is not "
+                "allowed at a call argument - cast it explicitly with '({})'",
+                { std::to_string(srcType->getIntegerBitWidth()), what, shown, shown });
+        }
+
+        return Upconvert(value, destType, srcIsUnsigned);
     }
 
 std::string LLVMBackend::DescribeConditionType(llvm::Type* t) const

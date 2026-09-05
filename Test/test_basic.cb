@@ -323,6 +323,53 @@ bool testDefaultMultipleParams()
     return result;
 }
 
+// Integer -> bool at a CALL ARGUMENT (ruling 2026-09-04): legal for constants and
+// non-constants alike, positional and default, and lowered through CoerceToBoolCondition.
+// Before the fix a positional integer was rejected as "no overload" while a default was
+// pushed unconverted into the i1 slot and failed module verification with no diagnostic.
+int boolPick(bool b) { return b ? 7 : 3; }
+int boolDefaultTwo(bool b = 2) { return b ? 7 : 3; }
+int boolDefaultZero(bool b = 0) { return b ? 7 : 3; }
+int boolVariadic(bool b, ...) { return b ? 7 : 3; }
+
+class BoolDefaultHolder { int pick(bool b = 2) { return b ? 7 : 3; } };
+
+// Declaration order matters here: the 'bool' overload is LAST, the position that used to win
+// the implicit tie and made 'sb.append(42)' print 'true'.
+int boolOverloadPick(int v) { return v; }
+int boolOverloadPick(bool b) { return -1; }
+
+bool testIntToBoolCallArgument()
+{
+    bool result = true;
+    result &= Test("i2b_literal_two", boolPick(2), 7);
+    result &= Test("i2b_literal_one", boolPick(1), 7);
+    result &= Test("i2b_literal_zero", boolPick(0), 3);
+
+    int n = 5;
+    result &= Test("i2b_int_variable", boolPick(n), 7);
+    int z = 0;
+    result &= Test("i2b_int_variable_zero", boolPick(z), 3);
+    u8 u = 200;
+    result &= Test("i2b_u8_variable", boolPick(u), 7);
+
+    result &= Test("i2b_default_two", boolDefaultTwo(), 7);
+    result &= Test("i2b_default_zero", boolDefaultZero(), 3);
+
+    BoolDefaultHolder h = default;
+    result &= Test("i2b_method_default", h.pick(), 7);
+
+    result &= Test("i2b_variadic_declared_param", boolVariadic(2, 1), 7);
+
+    function<int(bool)> fp = boolPick;
+    result &= Test("i2b_function_value", fp(2), 7);
+
+    // The coercion must stay the LAST resort: an exactly-typed overload still wins.
+    result &= Test("i2b_prefers_int_overload", boolOverloadPick(42), 42);
+    result &= Test("i2b_bool_overload_still_reached", boolOverloadPick(true), -1);
+    return result;
+}
+
 int multiplyWithDefault(int x, int factor = 2)
 {
     return x * factor;
@@ -4228,6 +4275,7 @@ extern int main()
     total++; passed += Test("struct2.ReadExt", struct2.ReadExt(), 2);
     total++; passed += testDefaultSingleParam()          ? 1 : 0;
     total++; passed += testDefaultMultipleParams()       ? 1 : 0;
+    total++; passed += testIntToBoolCallArgument()       ? 1 : 0;
     total++; passed += testDefaultExpression()           ? 1 : 0;
     total++; passed += testDefaultParamNameCollision()   ? 1 : 0;
     total++; passed += testAllDefaultedConstructor()     ? 1 : 0;

@@ -3403,6 +3403,26 @@ void MainListener::GenerateDefaultParamOverloads(
                         "initializer form is not supported; use '= default' or an explicit expression",
                         params[i].VariableName, SpellType(*compiler, params[i])));
 
+                // A default value is a declaration initializer, so convert it into the
+                // parameter's own slot exactly as an initializer does - the forwarding call
+                // below claims the parameter's type, and an unconverted value (an i8 '2' for a
+                // 'bool', an i16 '300' for a 'u8') reached the module verifier instead.
+                if (defaultVal != nullptr && !params[i].Pointer && defaultVal->getType()->isIntegerTy())
+                {
+                    auto* slotType = compiler->GetType(params[i]);
+                    if (slotType != nullptr && slotType->isIntegerTy() && slotType != defaultVal->getType())
+                    {
+                        unsigned slotBits = slotType->getIntegerBitWidth();
+                        unsigned valueBits = defaultVal->getType()->getIntegerBitWidth();
+                        if (slotBits == 1)
+                            defaultVal = compiler->CoerceToBoolCondition(defaultVal);
+                        else if (slotBits < valueBits)
+                            defaultVal = compiler->builder->CreateTrunc(defaultVal, slotType);
+                        else
+                            defaultVal = compiler->Upconvert(defaultVal, slotType, defaultIsUnsigned);
+                    }
+                }
+
                 LLVMBackend::NamedVariable namedVar;
                 namedVar.Primary = defaultVal;
                 namedVar.BaseType = defaultVal ? defaultVal->getType() : nullptr;

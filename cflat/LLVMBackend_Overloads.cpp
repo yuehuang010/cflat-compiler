@@ -61,6 +61,51 @@ static std::string PointerStars(const LLVMBackend::TypeAndValue& tv)
     return (deep && tv.DepthIsAboutThisValue()) ? "**" : "*";
 }
 
+bool LLVMBackend::ArgumentNarrowsParameter(const NamedVariable& arg, const TypeAndValue& param) const
+{
+        if (arg.TypeAndValue.Pointer || param.Pointer) return false;
+
+        auto resolve = [&](const std::string& tn) -> std::string {
+            auto it = enumBackingTypes.find(tn);
+            return (it != enumBackingTypes.end()) ? it->second : tn;
+        };
+        TypeAndValue argType = arg.TypeAndValue;
+        TypeAndValue paramType = param;
+        argType.TypeName = resolve(argType.TypeName);
+        paramType.TypeName = resolve(paramType.TypeName);
+
+        // A 'bool' parameter converts rather than narrows - see ArgumentConvertsToBoolParameter.
+        if (paramType.TypeName == "bool") return false;
+
+        int paramBits = paramType.IsInteger();
+        if (paramBits == -1) return false;
+
+        int argBits = argType.IsInteger();
+        // An unnamed primitive argument carries its width only in the lowered type.
+        if (argBits == -1 && argType.TypeName.empty() && arg.BaseType && arg.BaseType->isIntegerTy()
+            && !arg.BaseType->isIntegerTy(1))
+            argBits = (int)arg.BaseType->getIntegerBitWidth();
+        if (argBits == -1) return false;
+
+        return argBits > paramBits;
+}
+
+bool LLVMBackend::ArgumentConvertsToBoolParameter(const NamedVariable& arg, const TypeAndValue& param) const
+{
+        if (param.Pointer || param.TypeName != "bool") return false;
+        if (arg.TypeAndValue.Pointer) return false;
+
+        TypeAndValue argType = arg.TypeAndValue;
+        auto it = enumBackingTypes.find(argType.TypeName);
+        if (it != enumBackingTypes.end()) argType.TypeName = it->second;
+        if (argType.IsInteger() != -1) return true;
+
+        // An unnamed integer argument (a literal, a plain 'int' local) is proved by its lowered
+        // type. A pointer or a floating point value is NOT accepted here.
+        return argType.TypeName.empty() && arg.BaseType && arg.BaseType->isIntegerTy()
+            && !arg.BaseType->isIntegerTy(1);
+}
+
 std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> LLVMBackend::ComputeOverloadFunction(const std::vector<std::pair<std::vector<NamedVariable>, FunctionSymbol>>& candidates) const
 {
         std::pair<std::vector<NamedVariable>, FunctionSymbol> possibleResult;
@@ -69,6 +114,10 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
         int bestPossibleScore = -1; // same, for the promotion/implicit tier
         // Fewest function-pointer shape mismatches seen in the promotion/implicit tier so far.
         int bestPossibleShapeMismatches = std::numeric_limits<int>::max();
+        // Fewest integer -> bool argument coercions seen in that tier so far. This tier ignores
+        // per-argument quality, so without it `sb.append(42)` picked append(bool) over append(int)
+        // purely by declaration order.
+        int bestPossibleBoolCoercions = std::numeric_limits<int>::max();
         // int score = 0; // 2 for promotionMatch, 1 for implicitMatch
 
         for (const auto& pair : candidates)
@@ -90,16 +139,20 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                  * match function signature!". The non-variadic twin `lam(int n)` already rejects
                  * cleanly, so only this arm needs the wider question.
                  */
-                bool codeIntoDataParam = false;
+                bool declaredParamRefuses = false;
                 auto varParamItr = candidate.Parameters.begin();
                 for (const auto& arg : arguments)
                 {
                     if (varParamItr == candidate.Parameters.end()) break;
                     if (ArgumentIsCodeValue(arg, arg.CastOccurrenceId) && !ParameterAcceptsCodeValue(*varParamItr))
-                        codeIntoDataParam = true;
+                        declaredParamRefuses = true;
+                    // A DECLARED parameter of a variadic candidate is judged like any other:
+                    // narrowing into it has no conversion and reached the module verifier.
+                    if (ArgumentNarrowsParameter(arg, *varParamItr))
+                        declaredParamRefuses = true;
                     ++varParamItr;
                 }
-                if (codeIntoDataParam)
+                if (declaredParamRefuses)
                     continue;
 
                 // Variadic is a fallback: prefer any exact non-variadic match over it.
@@ -107,6 +160,7 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                 possibleResult = pair;
                 bestPossibleScore = -1;
                 bestPossibleShapeMismatches = std::numeric_limits<int>::max();
+                bestPossibleBoolCoercions = std::numeric_limits<int>::max();
                 continue;
             }
 
@@ -115,6 +169,8 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
             bool implicitMatch = true;
             // Function-pointer arguments whose indirection shape disagrees with the parameter.
             int shapeMismatches = 0;
+            // Arguments bound to a 'bool' parameter through the integer -> bool coercion.
+            int boolCoercions = 0;
 
             auto candidateParamItr = candidate.Parameters.begin();
             for (const auto& arg : arguments)
@@ -311,6 +367,20 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                 if (result >= 0 && arg.TypeAndValue.PointerDepthRefuses(*candidateParamItr))
                     result = -1;
 
+                // Implicit integer NARROWING at a call argument is not legal (ruling 2026-09-04):
+                // reject it here so the caller reports "no overload ... matches", the same answer
+                // an 'int' argument to the same parameter already got.
+                if (result >= 0 && ArgumentNarrowsParameter(arg, *candidateParamItr))
+                    result = -1;
+
+                // Integer -> bool IS legal, and lowers through CoerceToBoolCondition. Implicit
+                // (1), never perfect, so an exactly-typed overload still wins.
+                if (result < 0 && ArgumentConvertsToBoolParameter(arg, *candidateParamItr))
+                {
+                    result = 1;
+                    boolCoercions++;
+                }
+
                 if (result != 0)
                 {
                     perfectMatch = false;
@@ -353,9 +423,12 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                 // position. Prefer agreeing shapes; equal counts fall through to the old rule.
                 if (shapeMismatches < bestPossibleShapeMismatches
                     || (shapeMismatches == bestPossibleShapeMismatches
-                        && moveScore >= bestPossibleScore))   // >= keeps the pre-existing last-wins tie
+                        && (boolCoercions < bestPossibleBoolCoercions
+                            || (boolCoercions == bestPossibleBoolCoercions
+                                && moveScore >= bestPossibleScore))))   // >= keeps the pre-existing last-wins tie
                 {
                     bestPossibleShapeMismatches = shapeMismatches;
+                    bestPossibleBoolCoercions = boolCoercions;
                     bestPossibleScore = moveScore;
                     possibleResult = pair;
                 }

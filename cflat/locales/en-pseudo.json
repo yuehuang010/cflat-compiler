@@ -231,6 +231,12 @@
       "add",
       "alignas(0, 64)"
     ],
+    "cannotpassaarg0bitin...itexplicitlywitharg3e8b611917d2a59d2": [
+      "16",
+      "parameter 'v'",
+      "u8",
+      "u8"
+    ],
     "cannotpassanowningva...evaluetoanownerfirste67cc584259d5eee": [
       "...",
       "printf"
@@ -1531,6 +1537,7 @@
     "cannotmovearg0intomo...ifthisfunctionownsite3725c6c36e14caf": "cannot move {0} into move parameter '{1}' of '{2}' - the caller may still own this pointer and will free it on scope exit. Move it out of the owning slot instead (e.g. 'move parent->children[i]'), or declare '{3}' as 'move {4}' if this function owns it.",
     "cannotmovearg0itwasr...luethereceivercanownecd0567bd50b057c": "cannot 'move' '{0}' - it was returned as a borrow of unique field '{1}', and moving the alias does not null the field, so the field's synthesized destructor still frees the pointee. Pass it to a plain (non-'move') parameter, which borrows, or pass a value the receiver can own.",
     "cannotmovetheoverali...heelementtypeinstead37678af4b62532f7": "cannot move the over-aligned buffer '{0}' ('{1}') into the '{2}' parameter of '{3}': that alignment is a property of the allocation, not of the type, so the callee cannot recover it. Declare the parameter '{4}' so the block alignment is recorded, or over-align the ELEMENT TYPE instead.",
+    "cannotpassaarg0bitin...itexplicitlywitharg3e8b611917d2a59d2": "cannot pass a {0}-bit integer to {1}: implicit integer narrowing to '{2}' is not allowed at a call argument - cast it explicitly with '({3})'",
     "cannotpassanowningva...evaluetoanownerfirste67cc584259d5eee": "cannot pass an owning value to the variadic '{0}' slot of '{1}'; bind the value to an owner first",
     "cannotpassarawpointe...rg5arg6decayisoneway9309c0c4984312aa": "cannot pass a raw pointer '{0}' as array-view parameter '{1}' ('{2}') - a view must span a whole allocation (it comes only from '{3}' or another '{4}'); the '{5} -> {6}' decay is one-way",
     "cannotpassarg0asinte...doesnotimplementarg3abf6e4ddf846baae": "cannot pass '{0}' as interface parameter '{1}' of {2} - it does not implement '{3}'",

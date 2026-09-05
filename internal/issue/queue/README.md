@@ -30,7 +30,11 @@ bucket runs the whole procedure. Six worktrees close 13 issues.
 | q07 | investigation: `--sanitize=ownership --run` teardown flake p2 | full | LANDED af6814e (root cause: DIBuilder outlived the JIT-owned context under `-g`; sanitizer was incidental) - RETIRED | - |
 | q01 member 9, `p3/funcptr-signature-component-lacks-declaring-scope` (ex-q06) | `NamedVariable` provenance consolidation; funcptr declaring scope - scoped-first-at-comparison-time was measured and false-rejects two legs, do not retry | full, refactors | 2 | after everything above |
 
-Rulings block 4 more (table below). Two agents at a time (concurrency cap).
+All three pending rulings landed 2026-09-04 (table below). Next shipping units:
+q08 (full): LANDED 680d9e8a (narrowing veto + int->bool accept at the one shared scoring point, variadic declared params, materialisation LogErrors on unscored paths, default-arg wrapper converts; needed a fewest-bool-coercions tie-break in the implicit tier; 1 review round, no amendments) - RETIRED. Review filed `p3/extern-c-narrow-param-not-enforced` (extern `u8` params lower as i32, ruling bypassed).
+Maintainer notes from the q08 review: enum -> bool is accepted via the enum backing type (widens the letter of the ruling; values correct); `{f(double), f(bool)}` with an int now picks bool since int->double was never accepted; default `u8 v = 300` truncates to 44 like the declaration form (advisor accepted: the default is the parameter's declaration initializer); five new inline comments exceed 2 lines (style nit, not amended);
+q09 BATCH: LANDED e0afc3b3 (view-arg `T*` -> element pointer via one decay arm; scalar return splats through the new shared `SplatScalarToVectorType`, replacing all three CreateVectorSplat sites; 1 review round, no amendments) - RETIRED. Review filed `p3/generic-view-of-pointer-arg-drops-element-star` (P<int*[]> keys as P<int[]>; full mode, moves instantiation keys).
+Two agents at a time (concurrency cap).
 
 ## Suggested order
 
@@ -45,9 +49,9 @@ Rulings block 4 more (table below). Two agents at a time (concurrency cap).
 |------|----------|----------------------------|
 | q01 `p2/unique-field-heap-array-through-move-param` | how to stop `new T[n]` adopting into `unique<T>` through a `move T*` param | RULED 2026-09-04: raw `T* p = new T[n]` STAYS legal (C compatibility), blocking is OFF. Item moves under internal/plan/delete-form-static-analysis.md (check 4): static reject where provenance is precise + runtime trap at the core ctor/reset where it is not. ON HOLD by the maintainer the same day - no work on this area until reopened. |
 | q01 members 10-12 (fix/align-doors) | may a store of UNKNOWN-provenance pointer (nullptr local, `&static`, call result, borrow) into a clause-bearing `alignas` GLOBAL be rejected | advisor call 2026-09-04, applied in the commit: reject only when RHS provenance is precise and mismatched (fresh `new`, or a local with a known AllocAlignValue); unknown provenance keeps compiling. Field twin unchanged (clause-bearing fields must be `unique`). Maintainer may tighten later. |
-| (ex-q06) `p3/generic-pointer-to-view-field-collapses-to-raw-pointer` |  is `T*` with `T` an array view an error at instantiation, or a decay to the element pointer by design | error, consistent with LANGUAGE.md "pointer-to-array-view is not a valid type"; reuse the member-3 attribution |
-| (unbucketed) `p2/narrow-param-call-arg-skips-truncation-verifier-failure` | is implicit integer narrowing at a call legal | either answer is fine; the file leans to "legal, truncate like assignment" so `takeU8(-w)` compiles again. Verifier dump must go either way. |
-| (unbucketed) `p3/simd-scalar-return-does-not-splat` | should `return` splat a scalar into `simd<T,N>` as assignment does | yes, route through the assignment splat helper |
+| (ex-q06) `p3/generic-pointer-to-view-field-collapses-to-raw-pointer` | is `T*` with `T` an array view an error at instantiation, or a decay to the element pointer by design | RULED 2026-09-04: DECAY by design (`T[]` allowed in generics, `T*` -> element pointer, C-like). Probe found the real bug: `holder.p = data; holder.p[2]` reads garbage because the field indexes with pointer stride. Now a batchable codegen fix, no new diagnostic. |
+| (unbucketed) `p2/narrow-param-call-arg-skips-truncation-verifier-failure` + `p3/bool-default-argument-skips-conversion-verifier-failure` | is implicit integer narrowing at a call legal | RULED 2026-09-04: NOT allowed - overload resolution rejects sub-int-to-narrower with the existing "no overload" text. Exception: integer -> `bool` at a call IS allowed (constants and non-constants), through `CoerceToBoolCondition`. Ships as one batch unit. |
+| (unbucketed) `p3/simd-scalar-return-does-not-splat` | should `return` splat a scalar into `simd<T,N>` as assignment does | RULED 2026-09-04: yes - return initializes under the assignment rules (C/C++ model, each return converts independently to the declared type). Route through the assignment splat helper. Batchable. |
 
 ## Deferred - filed, not queued
 
