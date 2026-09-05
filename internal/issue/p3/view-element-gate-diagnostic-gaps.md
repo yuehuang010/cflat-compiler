@@ -9,9 +9,13 @@ from the q13/q15 reviews (d77dfdae, 5f693b7d).
    'int'") fires only for a lone candidate (deliberate: the scorer's lone-candidate gates in
    cflat/LLVMBackend_Overloads.cpp ~302 and ~330). Consider a post-resolution hint naming the
    element when every candidate failed on the element axis alone.
-2. `u8* raw = intPtrView;` (an `int*[]` decayed to a plain pointer) is rejected on the depth axis
-   with "cannot bind an array view of 'int*' to a destination of 'u8'", which reads as if the
-   destination were a view. Reword for a plain-pointer destination.
+   ATTEMPTED 2026-09-05 and reverted from the wording batch: a post-resolution block that
+   re-modelled the scorer's per-position accept (IsTypeMatch / IsTypePromotion /
+   CompareUpconvert) emitted a FALSE hint when another position was refused by a gate it did
+   not model (raw `int*` into a `T[]` parameter at position 1, element mismatch at position 0:
+   "refused solely on that axis" while fixing the element still does not compile). Do not
+   re-model the scorer. Record a per-candidate "sole disqualifier = view element axis" flag at
+   the scorer's own gates (~302, ~338) and print it at the no-match site; true by construction.
 3. Two of the three gate strings go through `LogErrorContext(ctx, std::format(...))` and never
    enter the localization catalog (same as the sibling raw-pointer-to-view gate); only the call
    door's `LogErrorMessage` is catalogued. Decide whether these belong in the catalog.

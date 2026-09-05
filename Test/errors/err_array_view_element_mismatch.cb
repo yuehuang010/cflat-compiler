@@ -148,9 +148,16 @@ extern int main()
 
     // Repro A: 'T*' with T bound to 'int*[]' decays to the element pointer 'int**', so an
     // 'int[]' view (element 'int') is one pointer level short of the destination element.
-    expect_error("cannot bind an array view of 'int' to a destination of 'int*'") {
+    // The destination here is a PLAIN POINTER (decayed from T*), not a view - role-specific wording.
+    expect_error("cannot bind an array view of 'int' to a plain pointer whose pointee is 'int*'") {
         AvmPtrBox<int*[]> avmPtrBox = default;
         avmPtrBox.p = iview;
+    }
+
+    // Filed spelling: a plain-pointer declaration initializer bound from a view whose element
+    // is a pointer type - the destination must not read as if it were itself a view.
+    expect_error("cannot bind an array view of 'int*' to a plain pointer whose pointee is 'u8'") {
+        u8* avmRawFromPtrView = pview;
     }
 
     // A struct element is its own type: 'AvmFoo[]' is not an 'AvmBar[]' even at equal layout.

@@ -1401,9 +1401,16 @@ bool MainListener::RejectArrayViewElementMismatch(antlr4::ParserRuleContext* ctx
         std::string srcElement;
         if (!Compiler()->ArrayViewElementMismatch(target, rhsNV.TypeAndValue, destElement, srcElement))
             return false;
-        LogErrorContext(ctx, std::format(
-            "cannot bind an array view of '{}' to a destination of '{}' - a view indexes by its "
-            "own element, so the element types must match", srcElement, destElement));
+        if (target.IsArrayView)
+            LogErrorContext(ctx, std::format(
+                "cannot bind an array view of '{}' to a destination of '{}' - a view indexes by its "
+                "own element, so the element types must match", srcElement, destElement));
+        else
+            // Destination is a plain pointer (the one-way 'T[] -> T*' decay), not a view - a
+            // depth change is proven broken, but wording must not imply the destination is one.
+            LogErrorContext(ctx, std::format(
+                "cannot bind an array view of '{}' to a plain pointer whose pointee is '{}' - only "
+                "a view whose element matches the pointee may decay to a pointer", srcElement, destElement));
         return true;
     }
 
