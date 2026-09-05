@@ -180,6 +180,7 @@ LLVMBackend::BuilderState LLVMBackend::SaveBuilderState()
         s.nullConditionalTempResults = std::move(nullConditionalTempResults_);
         s.valueElementTypeNames = std::move(valueElementTypeNames_);
         s.fatInterfaceValueTypeNames = std::move(fatInterfaceValueTypeNames_);
+        s.viewJoinTypes = std::move(viewJoinTypes_);
         s.interfaceBoxRecords = std::move(interfaceBoxRecords_);
         s.nullCoalesceJoins   = std::move(nullCoalesceJoins_);
         s.joinArmOccurrences  = std::move(joinArmOccurrences_);
@@ -214,6 +215,7 @@ LLVMBackend::BuilderState LLVMBackend::SaveBuilderState()
         nullConditionalTempResults_.clear();
         valueElementTypeNames_.clear();
         fatInterfaceValueTypeNames_.clear();
+        viewJoinTypes_.clear();
         interfaceBoxRecords_.clear();
         nullCoalesceJoins_.clear();
         joinArmOccurrences_.clear();
@@ -263,6 +265,7 @@ void LLVMBackend::RestoreBuilderState(const BuilderState& state)
         nullConditionalTempResults_ = state.nullConditionalTempResults;
         valueElementTypeNames_   = state.valueElementTypeNames;
         fatInterfaceValueTypeNames_ = state.fatInterfaceValueTypeNames;
+        viewJoinTypes_ = state.viewJoinTypes;
         interfaceBoxRecords_    = state.interfaceBoxRecords;
         nullCoalesceJoins_      = state.nullCoalesceJoins;
         joinArmOccurrences_     = state.joinArmOccurrences;

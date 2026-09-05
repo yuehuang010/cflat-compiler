@@ -4838,6 +4838,14 @@ public:
                                      const LLVMBackend::TypeAndValue& target,
                                      const LLVMBackend::NamedVariable& rhsNV);
 
+    // Element identity of a '?:' arm that is an array view, and its propagation onto the join.
+    bool TernaryArmViewType(llvm::Value* value, llvm::Value* storage,
+                            LLVMBackend::TypeAndValue& out) const;
+    void PropagateTernaryViewElement(antlr4::ParserRuleContext* ctx,
+                                     llvm::Value* trueValue, llvm::Value* trueStorage,
+                                     llvm::Value* falseValue, llvm::Value* falseStorage,
+                                     llvm::Value* join);
+
     llvm::Value* ParseAssignmentExpression(CFlatParser::AssignmentExpressionContext* ctx);
 
     // Box a THIN '?:' arm (`new T()` / `nullptr` / a borrowed pointer) into the interface fat

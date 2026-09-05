@@ -378,12 +378,24 @@ LLVMBackend::NamedVariable MainListener::ParseAssignmentExpressionNamed(CFlatPar
                 && condCtx != nullptr
                 && (condCtx->Question() != nullptr || condCtx->QuestionQuestion() != nullptr))
             {
-                auto inferred = InferTernaryArmType(result.Primary);
-                if (!inferred.TypeName.empty())
+                // A view join names its element only through the ledger the join stamped.
+                if (const auto* viewJoin = compilerLLVM->FindViewJoinType(result.Primary))
                 {
-                    result.TypeAndValue.TypeName = inferred.TypeName;
-                    result.TypeAndValue.Pointer = inferred.Pointer;
-                    result.TypeAndValue.IsInterface = inferred.IsInterface;
+                    result.TypeAndValue.TypeName = viewJoin->TypeName;
+                    result.TypeAndValue.Pointer = true;
+                    result.TypeAndValue.ElemPointer = viewJoin->ElemPointer;
+                    result.TypeAndValue.IsArrayView = true;
+                    result.TypeAndValue.IsInterface = viewJoin->IsInterface;
+                }
+                else
+                {
+                    auto inferred = InferTernaryArmType(result.Primary);
+                    if (!inferred.TypeName.empty())
+                    {
+                        result.TypeAndValue.TypeName = inferred.TypeName;
+                        result.TypeAndValue.Pointer = inferred.Pointer;
+                        result.TypeAndValue.IsInterface = inferred.IsInterface;
+                    }
                 }
             }
             if (result.Primary != nullptr && compilerLLVM->IsTempFieldValue(result.Primary))
@@ -4719,6 +4731,66 @@ bool MainListener::IsDefaultOnlyExpression(antlr4::ParserRuleContext* ctx) const
         return text == "default";
     }
 
+/*
+ * A `T[]` view is a thin pointer, so a '?:' arm names its element only where the front end knew
+ * it: the declared slot the arm was loaded from, the callee's declared return type, or an inner
+ * join already stamped in the ledger. An arm that resolves to none of those stays unnamed and the
+ * join is left alone (status quo: the element gate then takes its unnamed escape).
+ */
+bool MainListener::TernaryArmViewType(llvm::Value* value, llvm::Value* storage,
+                                      LLVMBackend::TypeAndValue& out) const {
+        if (value == nullptr || !value->getType()->isPointerTy()) return false;
+        auto* compiler = compilerLLVM;
+        if (const auto* join = compiler->FindViewJoinType(value)) { out = *join; return true; }
+        if (storage == nullptr)
+            if (auto* load = llvm::dyn_cast<llvm::LoadInst>(value))
+                storage = load->getPointerOperand();
+        if (storage != nullptr)
+            if (const auto* declared = compiler->FindDeclaredTypeAndValueForStorage(storage);
+                declared != nullptr && declared->IsArrayView)
+            {
+                out = *declared;
+                return true;
+            }
+        if (auto* call = llvm::dyn_cast<llvm::CallInst>(value))
+            if (const auto* symbol = compiler->FindSymbolForFunction(call->getCalledFunction());
+                symbol != nullptr && symbol->ReturnType.IsArrayView)
+            {
+                out = symbol->ReturnType;
+                return true;
+            }
+        return false;
+    }
+
+// Both arms named: agreeing arms hand their element to the join so every binding door judges it;
+// disagreeing arms are rejected here, where the two elements are still both in view.
+void MainListener::PropagateTernaryViewElement(antlr4::ParserRuleContext* ctx,
+                                               llvm::Value* trueValue, llvm::Value* trueStorage,
+                                               llvm::Value* falseValue, llvm::Value* falseStorage,
+                                               llvm::Value* join) {
+        LLVMBackend::TypeAndValue trueType;
+        LLVMBackend::TypeAndValue falseType;
+        if (!TernaryArmViewType(trueValue, trueStorage, trueType)) return;
+        if (!TernaryArmViewType(falseValue, falseStorage, falseType)) return;
+        std::string trueElement;
+        std::string falseElement;
+        if (compilerLLVM->ArrayViewElementMismatch(trueType, falseType, trueElement, falseElement))
+        {
+            LogErrorContext(ctx, std::format(
+                "cannot join an array view of '{}' with an array view of '{}' in a '?:' - a view "
+                "indexes by its own element, so both arms must share it",
+                trueElement, falseElement));
+            return;
+        }
+        LLVMBackend::TypeAndValue joinType;
+        joinType.TypeName = trueType.TypeName;
+        joinType.Pointer = true;
+        joinType.ElemPointer = trueType.ElemPointer;
+        joinType.IsArrayView = true;
+        joinType.IsInterface = trueType.IsInterface;
+        compilerLLVM->RegisterViewJoinType(join, joinType);
+    }
+
 LLVMBackend::TypeAndValue MainListener::InferTernaryArmType(llvm::Value* value) {
         LLVMBackend::TypeAndValue result;
         if (value == nullptr) return result;
@@ -5621,6 +5693,7 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
         if (trueTempField || falseTempField) compiler->RegisterTempFieldValue(phi);
         compiler->PropagateUniqueFieldRead(trueValue, falseValue, phi);
         compiler->PropagateFatInterfaceJoin(trueValue, falseValue, phi);
+        PropagateTernaryViewElement(ctx, trueValue, trueStorage, falseValue, falseStorage, phi);
         llvm::Value* resultValue = CloneTernaryClosureValue(phi, ctx);
         LLVMBackend::TypedValue result{ resultValue, joinUnsigned };
         result.isAlias = trueAlias || falseAlias;
@@ -6043,6 +6116,7 @@ LLVMBackend::TypedValue MainListener::ParseConditionalExpression(
                 compiler->PropagateAliasValue(trueValue, falseValue, selectValue);
                 compiler->PropagateBondedValue(trueValue, falseValue, selectValue);
                 compiler->PropagateFatInterfaceJoin(trueValue, falseValue, selectValue);
+                PropagateTernaryViewElement(ctx, trueValue, nullptr, falseValue, nullptr, selectValue);
                 selectValue = CloneTernaryClosureValue(selectValue, ctx);
                 LLVMBackend::TypedValue result{ selectValue, joinUnsigned };
                 result.isAlias = compiler->IsAliasValue(selectValue);

@@ -2488,6 +2488,10 @@ bool testInterfaceArrayField()
 // An `IShape[]` array VIEW - element type an INTERFACE - used to lower as one bare fat struct
 // instead of a pointer to a run of them, so every element GEP and the view's `noalias` parameter
 // attribute were built against the struct type and the module failed LLVM verification.
+// A '?:' whose arms are two views of the SAME element: the join keeps that element, so the
+// return door judges it exactly as it judges either arm.
+IShape[] ifaceViewPick(IShape[] a, IShape[] b, bool c) { return c ? a : b; }
+
 int ifaceViewSum(IShape[] items, int n)
 {
     int sum = 0;
@@ -2590,6 +2594,19 @@ bool testInterfaceArrayViewOfInterfaces()
     bool pick = h.n == 4;
     IShape[] chosen = pick ? view : empty;
     result &= Test("iface_view_ternary", chosen[2].area(), 9);
+
+    // Accept-set for the element gate on a view join: same-element arms stay legal at the
+    // declaration, nested-join and return doors.
+    IShape[] nestedChosen = pick ? (pick ? view : empty) : empty;
+    result &= Test("iface_view_ternary_nested", nestedChosen[0].area(), 48);
+    result &= Test("iface_view_ternary_return", ifaceViewPick(view, empty, pick)[3].area(), 16);
+    // The join also feeds a struct FIELD store and a call argument (both were rejected before
+    // the join carried its element).
+    IfaceViewHolder hj = default;
+    hj.items = pick ? view : empty;
+    hj.n = 4;
+    result &= Test("iface_view_ternary_field", hj.sum(), 48 + 27 + 9 + 16);
+    result &= Test("iface_view_ternary_call", ifaceViewSum(pick ? view : empty, 4), 48 + 27 + 9 + 16);
 
     // A view RETURNED from a function. Its unwritten elements must read as null interfaces.
     // NOTE: this pins the SEMANTICS, not the buffer-zeroing that implements them - macOS's

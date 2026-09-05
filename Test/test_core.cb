@@ -3014,6 +3014,36 @@ int runRawCountJoinView(int choose)
     return count;
 }
 
+// Accept-set for the element gate on a '?:' view join: both arms name the SAME element, so
+// every door judges the join exactly as it judges either arm.
+struct ViewJoinHolder { int[] v = default; };
+int viewJoinTake(int[] d) { return d[0]; }
+int[] viewJoinPick(int[] a, int[] b, bool c) { return c ? a : b; }
+int runViewTernaryElementJoin(int choose)
+{
+    int[3] store; store[0] = 7; store[1] = 8; store[2] = 9;
+    int[] left = store;
+    int[] right = store;
+    bool c = choose != 0;
+    int[] declared = c ? left : right;
+    int[] assigned = default;
+    assigned = c ? left : right;
+    ViewJoinHolder holder = default;
+    holder.v = c ? left : right;
+    int[] nested = c ? (c ? left : right) : right;
+    int one = 1;
+    int two = 2;
+    int*[2] cells;
+    cells[0] = &one;
+    cells[1] = &two;
+    int*[] starView = cells;
+    int*[] starJoin = c ? starView : starView;
+    int[] nullJoin = c ? left : nullptr;
+    int[] defaultJoin = c ? left : default;
+    return declared[0] + assigned[1] + holder.v[2] + nested[0] + viewJoinTake(c ? left : right)
+        + viewJoinPick(left, right, c)[1] + *starJoin[0] + nullJoin[0] + defaultJoin[0];
+}
+
 void rawCountSink(move RawCountElem* values) {}
 void rawCountForward(move RawCountElem* values) { rawCountSink(move values); }
 void rawCountGenericSink<T>(move T* values) {}
@@ -3898,6 +3928,8 @@ int testRawArrayRuntimeCount()
         runAlignedGlobalUnknownSource(), 13157);
     passed += Test("raw count ternary array view ranges",
         runRawCountJoinView(1) * 10 + runRawCountJoinView(0), 24);
+    passed += Test("view ternary keeps its arms' element at every door",
+        runViewTernaryElementJoin(1), 61);
     passed += Test("raw count move parameter direct zero and counts",
         runRawCountMoveDirect(0) * 100 + runRawCountMoveDirect(2) * 10
             + runRawCountMoveDirect(4), 24);
@@ -4113,7 +4145,7 @@ extern int main()
     r = testDiscard();          passed += r; total += 6;
     r = testDirectReturnOwnership(); passed += r; total += 6;
     r = testCLongWidth();       passed += r; total += 15;
-    r = testRawArrayRuntimeCount(); passed += r; total += 88;
+    r = testRawArrayRuntimeCount(); passed += r; total += 89;
     r = testDictEnumeration();  passed += r; total += 12;
     r = testLiteralReceiverAndNullChain(); passed += r; total += 9;
     r = testDefaultAsExpression(); passed += r; total += 82;

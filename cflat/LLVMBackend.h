@@ -1902,6 +1902,10 @@ public:
     // identity (see RegisterFatInterfaceValueTypeName). Retired with valueElementTypeNames_.
     std::vector<std::pair<llvm::Value*, std::string>> fatInterfaceValueTypeNames_;
 
+    // Element type a '?:' join of two array VIEWS carries, keyed by the join value. A view is a
+    // thin pointer, so the phi/select alone names no element. Retired with valueElementTypeNames_.
+    std::vector<std::pair<llvm::Value*, TypeAndValue>> viewJoinTypes_;
+
     /*
      * What each class->interface boxing site actually boxed, recorded BY the boxing site instead
      * of recovered afterwards by walking emitted IR (which is how the return-path lifetime check
@@ -4009,6 +4013,10 @@ private:
      */
     std::string ResolvePointerElementTypeName(llvm::Value* value) const;
 
+    // Element identity of a '?:' join of two array views (see viewJoinTypes_).
+    void RegisterViewJoinType(llvm::Value* value, const TypeAndValue& elementType);
+    const TypeAndValue* FindViewJoinType(llvm::Value* value) const;
+
     // Ledger a value a `move` expression detached (see movedOutPtrValues_). An INTERFACE fat
     // pointer is accepted too - it is a struct, but it is detached by the same move contract.
     void RegisterMovedOutPtrValue(llvm::Value* value);
@@ -4850,6 +4858,7 @@ public:
         std::vector<llvm::Value*> nullConditionalTempResults;
         std::vector<std::pair<llvm::Value*, std::string>> valueElementTypeNames;
         std::vector<std::pair<llvm::Value*, std::string>> fatInterfaceValueTypeNames;
+        std::vector<std::pair<llvm::Value*, TypeAndValue>> viewJoinTypes;
         std::vector<InterfaceBoxRecord> interfaceBoxRecords;
         std::vector<NullCoalesceJoin> nullCoalesceJoins;
         std::vector<JoinArmOccurrence> joinArmOccurrences;

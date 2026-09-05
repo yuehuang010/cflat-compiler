@@ -4528,6 +4528,7 @@ void LLVMBackend::ResetForReanalysis()
     nullConditionalTempResults_.clear();
     valueElementTypeNames_.clear();
     fatInterfaceValueTypeNames_.clear();
+    viewJoinTypes_.clear();
     interfaceBoxRecords_.clear();
     nullCoalesceJoins_.clear();
     joinArmOccurrences_.clear();

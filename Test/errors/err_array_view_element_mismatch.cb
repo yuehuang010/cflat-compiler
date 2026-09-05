@@ -39,6 +39,22 @@ expect_error("cannot return an array view of 'AvmIfaceChild' from a function who
     AvmIface[] avmReturnChildIface(AvmIfaceChild[] q) { return q; }
 }
 
+// A '?:' join of two views is a bare thin pointer, so the join must carry its arms' element or
+// every binding door below judges an unnamed value and accepts silently.
+expect_error("cannot return an array view of 'u8' from a function whose return element is 'int'") {
+    int[] avmReturnTernary(u8[] a, u8[] b, bool c) { return c ? a : b; }
+}
+
+expect_error("cannot return an array view of 'AvmIface' from a function whose return element is 'AvmIfaceB'") {
+    AvmIfaceB[] avmReturnTernaryIface(AvmIface[] a, AvmIface[] b, bool c) { return c ? a : b; }
+}
+
+// Arms that disagree on the element have no common element to hand a door, so the join itself
+// is the error - there is no destination whose element could make both arms right.
+expect_error("cannot join an array view of 'int' with an array view of 'u8' in a '?:'") {
+    int[] avmJoinDisagree(int[] a, u8[] b, bool c) { int[] r = c ? a : b; return r; }
+}
+
 int avmTakeInt(int[] d) { return d[1]; }
 
 extern int main()
@@ -133,6 +149,22 @@ extern int main()
         u8[4] avmBytes; avmBytes[0] = 1; avmBytes[1] = 2; avmBytes[2] = 3; avmBytes[3] = 4;
         u8[] avmByteView = avmBytes;
         int[] avmWide = avmByteView;
+    }
+
+    // Declaration leg fed by a '?:' join of two same-element views.
+    expect_error("cannot bind an array view of 'u8' to a destination of 'int'") {
+        u8[4] avmJoinBytes; avmJoinBytes[0] = 1;
+        u8[] avmJoinLeft = avmJoinBytes;
+        u8[] avmJoinRight = avmJoinBytes;
+        bool avmJoinPick = avmJoinBytes[0] == 1;
+        int[] avmJoinDecl = avmJoinPick ? avmJoinLeft : avmJoinRight;
+    }
+
+    // Same join, interface elements: the arms agree on 'AvmIface', the destination does not.
+    expect_error("cannot bind an array view of 'AvmIface' to a destination of 'AvmIfaceB'") {
+        AvmIface[] avmJoinIfaceRight = new AvmIface[1];
+        bool avmJoinIfacePick = avmJoinIfaceRight != nullptr;
+        AvmIfaceB[] avmJoinIfaceDecl = avmJoinIfacePick ? avmIfaceView : avmJoinIfaceRight;
     }
 
     // Call-argument leg, element name axis: the message names the FUNCTION, then its element.

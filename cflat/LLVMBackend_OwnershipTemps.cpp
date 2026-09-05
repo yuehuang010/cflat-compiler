@@ -3135,6 +3135,22 @@ std::string LLVMBackend::FindValueElementTypeName(llvm::Value* value) const
         return {};
     }
 
+void LLVMBackend::RegisterViewJoinType(llvm::Value* value, const LLVMBackend::TypeAndValue& elementType)
+{
+        if (value == nullptr || !value->getType()->isPointerTy() || !elementType.IsArrayView) return;
+        for (auto& entry : viewJoinTypes_)
+            if (entry.first == value) { entry.second = elementType; return; }
+        viewJoinTypes_.push_back({ value, elementType });
+    }
+
+const LLVMBackend::TypeAndValue* LLVMBackend::FindViewJoinType(llvm::Value* value) const
+{
+        if (value == nullptr) return nullptr;
+        for (const auto& entry : viewJoinTypes_)
+            if (entry.first == value) return &entry.second;
+        return nullptr;
+    }
+
 std::string LLVMBackend::FindDeclaredElementTypeNameForStorage(const llvm::Value* storage) const
 {
         if (storage == nullptr) return {};
@@ -3737,6 +3753,7 @@ void LLVMBackend::DiscardOwnedTempsSince(const OwnedTempMark& mark)
         rawArrayResults_.clear();
         valueElementTypeNames_.clear();
         fatInterfaceValueTypeNames_.clear();
+        viewJoinTypes_.clear();
         movedOutPtrValues_.clear();
         movedBorrowedPtrValues_.clear();
         movedBorrowedThroughFieldValues_.clear();
@@ -3760,6 +3777,7 @@ void LLVMBackend::FlushOwnedTemps()
         rawArrayResults_.clear();
         valueElementTypeNames_.clear();
         fatInterfaceValueTypeNames_.clear();
+        viewJoinTypes_.clear();
         // A named function is one shared llvm::Function constant, so a cast's launder must not
         // outlive its statement (see codeValueDataCasts_). codeValues_ deliberately survives.
         codeValueDataCasts_.clear();
