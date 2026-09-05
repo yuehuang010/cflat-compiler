@@ -3452,6 +3452,37 @@ int runViewPlainBraceSpelling()
     return bNs.v[1].k + bAlias.v[1].k + bBox.v[1].t + bLit.c[1] + bBuf.c[0];
 }
 
+interface VfaIface { int val(); };
+class VfaImpl : VfaIface { int v = default; int val() { return this.v; } };
+VpsNs.VpsElem[3] vfaGlobal;
+VpsNs.VpsElem[] vfaReturnRow() { return vfaGlobal; }
+
+/*
+ * A FIXED array is a real element source at the declarator, '=' store, field store and return
+ * doors, exactly as a view is - the mismatched-element rows live in
+ * Test/errors/err_arrayview_call_arg.cb. Covers a namespaced, aliased, generic, char and
+ * interface element so the element compare reads the same on all of them.
+ */
+int runViewFixedArraySources()
+{
+    VpsNs.VpsElem[2] nsArr; nsArr[1].k = 4;
+    VpsNs.VpsElem[] vDecl = nsArr;
+    VpsAlias[2] aliasArr; aliasArr[1].k = 5;
+    VpsNs.VpsElem[] vAlias = aliasArr;
+    VpsBoxElem<int>[2] boxArr; boxArr[1].t = 6;
+    VpsBoxElem<int>[] vBox = default; vBox = boxArr;
+    VpsNsDest dField = default; dField.v = nsArr;
+    char[4] cbuf; cbuf[0] = 65;
+    char[] vChar = cbuf;
+    VfaImpl one; one.v = 30;
+    VfaIface[2] ifArr; ifArr[1] = one;
+    VfaIface[] vIface = ifArr;
+    vfaGlobal[2].k = 7;
+    VpsNs.VpsElem[] vRet = vfaReturnRow();
+    return vDecl[1].k + vAlias[1].k + vBox[1].t + dField.v[1].k + (int)vChar[0]
+        + vIface[1].val() + vRet[2].k;
+}
+
 int[] viewPlainZeroReturn(int c) { if (c != 0) { return 0; } return nullptr; }
 
 /*
@@ -4403,6 +4434,10 @@ int testRawArrayRuntimeCount()
     // 4 (namespaced) + 5 (aliased) + 6 (generic element) + 'e' (101) + 'A' (65) = 181.
     passed += Test("brace-init binds a plain array-view field under every element spelling",
         runViewPlainBraceSpelling(), 181);
+    // 4 (decl) + 5 (alias) + 6 (generic store) + 4 (field store) + 'A' (65) + 30 (interface)
+    // + 7 (return) = 121.
+    passed += Test("a fixed array binds a plain array view at every non-brace door",
+        runViewFixedArraySources(), 121);
     // Every null-view spelling plus the two real element reads: 1+2+4+8+16+32+64+128+256+512+1024.
     passed += Test("a primitive array view still binds every null spelling",
         runViewPlainNullSpellings(), 2047);
@@ -4621,7 +4656,7 @@ extern int main()
     r = testDiscard();          passed += r; total += 6;
     r = testDirectReturnOwnership(); passed += r; total += 6;
     r = testCLongWidth();       passed += r; total += 15;
-    r = testRawArrayRuntimeCount(); passed += r; total += 99;
+    r = testRawArrayRuntimeCount(); passed += r; total += 100;
     r = testDictEnumeration();  passed += r; total += 12;
     r = testLiteralReceiverAndNullChain(); passed += r; total += 9;
     r = testDefaultAsExpression(); passed += r; total += 82;

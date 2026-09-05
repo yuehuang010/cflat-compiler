@@ -119,9 +119,23 @@ static bool DecodeSimdSpelling(const std::string& text, std::string& elemOut, ui
  * reinterpret idiom (`u8* p = intView;`) and only a depth change is proven broken.
  */
 bool LLVMBackend::ArrayViewElementMismatch(const LLVMBackend::TypeAndValue& dest,
-                                           const LLVMBackend::TypeAndValue& src,
+                                           const LLVMBackend::TypeAndValue& rawSrc,
                                            std::string& destElement, std::string& srcElement) const
 {
+        // A FIXED array binds to a VIEW destination by decaying to its own view, so it indexes by
+        // its own element too. Scoped to a view destination: the one-way 'T[] -> T*' decay keeps
+        // its own byte/scalar reinterpret rules, and a simd value is not an element source.
+        LLVMBackend::TypeAndValue shapedSrc = rawSrc;
+        if (!shapedSrc.IsArrayView && shapedSrc.ConstArraySize != 0 && dest.IsArrayView
+            && !shapedSrc.IsSimd)
+        {
+            // A fixed array spells its element's star in 'Pointer' ('int*[2]'); a view spells the
+            // same depth in 'ElemPointer'. Carry it over or every 'T*[N]' reads as a 'T' element.
+            shapedSrc.ElemPointer = shapedSrc.ElemPointer || shapedSrc.Pointer;
+            shapedSrc.Pointer = false;
+            shapedSrc.IsArrayView = true;
+        }
+        const LLVMBackend::TypeAndValue& src = shapedSrc;
         if (!src.IsArrayView) return false;
         if (!dest.IsArrayView && !dest.Pointer) return false;
         // An interface destination reboxes a SCALAR through its own gate, so it does not index by

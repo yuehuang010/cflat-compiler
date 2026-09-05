@@ -238,3 +238,54 @@ expect_error("cannot bind a 'int' value to array view 'int[]'") {
 expect_error("cannot bind a 'float' value to array view 'float[]'") {
     int bpxCall() { float f = 1.0; float[] v = f; return v[0] > 0.0 ? 1 : 0; }
 }
+
+// FIXED-ARRAY element axis, the three non-brace doors. A fixed array is not a view, so the
+// element compare was skipped and the store decayed it to a thin pointer of the DESTINATION's
+// element: 'd.v[1].k' read 'qArr[0].b' (22 where 33 was stored). Same text as the view row.
+expect_error("cannot bind an array view of 'BfsOther' to a destination of 'Bfs'") {
+    struct Bfs { int k = default; };
+    struct BfsOther { int a = default; int b = default; };
+    struct BfsDest { Bfs[] v = default; };
+    int bfsCall() { BfsOther[2] a; BfsDest d = default; d.v = a; return d.v[1].k; }
+}
+
+// Same door, a plain local view destination rather than a field.
+expect_error("cannot bind an array view of 'BflOther' to a destination of 'Bfl'") {
+    struct Bfl { int k = default; };
+    struct BflOther { int a = default; int b = default; };
+    int bflCall() { BflOther[2] a; Bfl[] v = default; v = a; return v[1].k; }
+}
+
+// Declarator-init door, a separate lowering from the '=' store above.
+expect_error("cannot bind an array view of 'BfdOther' to a destination of 'Bfd'") {
+    struct Bfd { int k = default; };
+    struct BfdOther { int a = default; int b = default; };
+    int bfdCall() { BfdOther[2] a; Bfd[] v = a; return v[1].k; }
+}
+
+// RETURN door: the callee hands the caller a view strided by the wrong element.
+expect_error("cannot return an array view of 'BfrOther' from a function whose return element is 'Bfr'") {
+    struct Bfr { int k = default; };
+    struct BfrOther { int a = default; int b = default; };
+    Bfr[] bfrMake() { BfrOther[2] a; return a; }
+    int bfrCall() { return bfrMake()[1].k; }
+}
+
+// PRIMITIVE twin of the same reshape: the element sizes differ, so the view strides wrong.
+expect_error("cannot bind an array view of 'int' to a destination of 'long'") {
+    int bfpCall() { int[3] a; long[] v = a; return (int)v[0]; }
+}
+
+// Primitive twin at the return door.
+expect_error("cannot return an array view of 'int' from a function whose return element is 'long'") {
+    long[] bfqMake() { int[3] a; return a; }
+    int bfqCall() { return (int)bfqMake()[0]; }
+}
+
+// INTERFACE twin: a fixed array of an IMPLEMENTOR indexes thin objects, so binding it to an
+// 'IA[]' forges a fat view over them - it SIGSEGVd at fv[1].val() before this reshape.
+expect_error("cannot bind an array view of 'BfiImpl' to a destination of 'BfiIface'") {
+    interface BfiIface { int val(); };
+    class BfiImpl : BfiIface { int v = default; int val() { return this.v; } };
+    int bfiCall() { BfiImpl[2] a; BfiIface[] v = a; return v[1].val(); }
+}
