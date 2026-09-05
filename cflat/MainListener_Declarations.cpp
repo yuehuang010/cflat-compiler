@@ -1263,6 +1263,24 @@ LLVMBackend::DeclTypeAndValue MainListener::getFunctionReturnType(CFlatParser::F
     }
 
 /*
+ * A core function loaded from the `--init` bitcode cache arrives LAZY: its body is on disk, not
+ * in the module, so isMaterializable() is true and every guard below would read it as an opaque
+ * call. Pull the body in so the fold sees exactly the IR the cold (parsed) path sees. Returns
+ * false only when the callee is absent or its body cannot be read back.
+ */
+static bool MaterializeFoldCalleeIfLazy(llvm::Function* callee)
+{
+    if (callee == nullptr) return false;
+    if (!callee->isMaterializable()) return true;
+    if (auto error = callee->materialize())
+    {
+        llvm::consumeError(std::move(error));
+        return false;
+    }
+    return true;
+}
+
+/*
  * Reduce a just-emitted default-construction value to a compile-time Constant by replaying
  * the constructor's own body. A synthesized (or constant-bodied user) no-arg constructor is a
  * single block that builds its result out of `insertvalue` over constants and calls to the
@@ -1282,6 +1300,7 @@ static bool CalleeHasSideEffectsSafe(
     llvm::DenseSet<llvm::Function*>& visiting,
     llvm::DenseMap<llvm::Function*, bool>& memo)
 {
+    if (!MaterializeFoldCalleeIfLazy(callee)) return true;
     if (callee == nullptr || callee->isDeclaration() || callee->isMaterializable()
         || callee->isVarArg()) return true;
     auto memoIt = memo.find(callee);
@@ -1397,6 +1416,7 @@ static llvm::Constant* FoldConstructedValueToConstantImpl(
     if (auto* call = llvm::dyn_cast<llvm::CallBase>(value))
     {
         llvm::Function* callee = call->getCalledFunction();
+        if (!MaterializeFoldCalleeIfLazy(callee)) return nullptr;
         if (callee == nullptr || callee->isDeclaration() || callee->isMaterializable()
             || callee->isVarArg()) return nullptr;
         if (callee->size() != 1) return nullptr;

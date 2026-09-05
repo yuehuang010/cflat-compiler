@@ -335,6 +335,37 @@ if [ "$RUN_MODE" -eq 0 ]; then
   fi
 fi
 
+# Warm/cold parity of global default-construction folding. A core constructor arrives LAZY from
+# the bitcode cache, so a fold that reads its body must materialize it; when it does not, a global
+# silently drops to zero-init and warns only under a warm cache. Compare the warning count of the
+# same file compiled cold (an empty CFLAT_CACHE_DIR) and warm (the --init-local cache above).
+if [ "$RUN_MODE" -eq 0 ]; then
+  fold_name="global_default_fold_warm_parity"
+  fold_log="$RES/$fold_name.log"
+  fold_cold_cache="$RES/$fold_name.coldcache"
+  fold_t0=$(now_ms)
+  rm -rf "$fold_cold_cache"
+  mkdir -p "$fold_cold_cache"
+  CFLAT_CACHE_DIR="$fold_cold_cache" $TIMEOUT "$CFLAT" "$SRC/test_move.cb" -i "$LIB" \
+    --check -v --locale en --locale-dir "$LOCALE_DIR" >"$fold_log" 2>&1
+  fold_cold=$(grep -c "zero-initialized" "$fold_log")
+  fold_warm_log="$RES/$fold_name.warm.log"
+  CFLAT_CACHE_DIR="$(dirname "$CFLAT")/.cflat" $TIMEOUT "$CFLAT" "$SRC/test_move.cb" -i "$LIB" \
+    --check -v --locale en --locale-dir "$LOCALE_DIR" >"$fold_warm_log" 2>&1
+  fold_warm=$(grep -c "zero-initialized" "$fold_warm_log")
+  rm -rf "$fold_cold_cache"
+  if ! grep -q "core bitcode cache: miss" "$fold_log"; then
+    write_result "$fold_name" "FAIL: cold leg reused a bitcode cache" "$fold_t0"
+  elif ! grep -q "core bitcode cache: hit" "$fold_warm_log"; then
+    write_result "$fold_name" "FAIL: warm leg did not hit the bitcode cache" "$fold_t0"
+  elif [ "$fold_cold" = "$fold_warm" ]; then
+    write_result "$fold_name" "PASS" "$fold_t0"
+  else
+    write_result "$fold_name" \
+      "FAIL: zero-init warnings cold=$fold_cold warm=$fold_warm" "$fold_t0"
+  fi
+fi
+
 # Tooling regression: compile the existing function-pointer fixture with the ownership
 # sanitizer, then verify a static-local move keeps both its runtime origin and DI record.
 if [ "$RUN_MODE" -eq 0 ]; then

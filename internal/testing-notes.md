@@ -43,6 +43,17 @@ serializer is silently dropped on a warm cache and the `expect_error` stops firi
 analysis reads MUST be added to the `LLVMBackend.cpp` cache round-trip in the same
 change. (This rule is important enough that a short form stays in CLAUDE.md.)
 
+**Lazy core bodies are the second warm-cache trap.** Cached core bitcode is loaded with
+`getLazyBitcodeModule`, so a core function is present but body-free (`isMaterializable()`)
+until something materializes it. Any analysis that READS a callee's body - the global
+default-construction fold in `MainListener_Declarations.cpp` is the worked example - must
+materialize a lazy callee first, or it silently draws the opposite conclusion on a warm cache.
+Output compiles (`-o` / `-l`) hide this: they eagerly `MaterializeCoreIfLazy()` after loading
+the cache, so only `--check` and LSP `Analyze` see the lazy module. The `test.sh` probe
+`global_default_fold_warm_parity` pins it: `Test/test_move.cb` is compiled `--check` twice,
+cold (empty `CFLAT_CACHE_DIR`) and warm, and the two `zero-initialized` warning counts must
+match. Reproduce by hand the same way - never with `-o`, which is vacuous here.
+
 ## Incremental O2 view gate
 
 `Test/tools/incremental_o2_gate.py` compares the CLI incremental view with the
