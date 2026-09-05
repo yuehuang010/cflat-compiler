@@ -389,13 +389,28 @@ std::string MainListener::InstantiateGenericFunction(const std::string& baseName
              * The body walk was abandoned (an expect_error match, or a real diagnostic in batch
              * mode). Nothing below unwinds on its own: the outer function's locals were MOVED out
              * of stackNamedVariable, and the half-built instantiation is still in the module.
-             * mangledName stays in instantiatedGenericFunctions - re-emitting under the same
-             * symbol would collide - so a later instantiation reuses the sealed body.
+             * Every body sealed here is also unregistered and renamed out of the way, and
+             * mangledName leaves instantiatedGenericFunctions, so a later good request re-emits
+             * this instantiation instead of binding to the sealed body (which traps at runtime).
              */
             auto it = lastBefore != nullptr
                 ? std::next(llvm::Module::iterator(lastBefore)) : functionList.begin();
+            bool sealedAny = false;
+            bool completeAny = false;
             for (; it != functionList.end(); ++it)
-                instCompiler->SealAbandonedFunction(&*it);
+            {
+                if (it->isDeclaration()) continue;
+                if (instCompiler->SealAbandonedFunction(&*it))
+                {
+                    sealedAny = true;
+                    instCompiler->DiscardAbandonedFunction(&*it);
+                }
+                // A nested instantiation that COMPLETED before this body threw is appended here
+                // too, and keeps its registration.
+                else completeAny = true;
+            }
+            // Only give up the name when this body was really abandoned.
+            if (sealedAny || !completeAny) instantiatedGenericFunctions.erase(mangledName);
             instCompiler->stackNamedVariable = std::move(savedStack);
             activeTypeSubstitutions = savedSubst;
             activeValueSubstitutions = savedValueSubst;

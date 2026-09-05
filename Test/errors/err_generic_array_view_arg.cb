@@ -77,11 +77,27 @@ expect_error("'int[]' cannot be a type argument of 'gavGenericFn': instantiating
 // end-of-module move-dataflow segfaulted on it (succ_begin dereferences a null terminator).
 int gavBadBody<T>(T x) { return gavUndefinedName; }
 
+// An outer template that instantiates the failing one: the inner abandon unwinds through the
+// outer's own emission, so BOTH instantiations have to give their registrations back.
+int gavOuterBadBody<T>(T x) { return gavBadBody<T>(x) + 1; }
+
 extern int main()
 {
     int gavLocal = 7;
     expect_error("Undefined variable gavUndefinedName") {
         int n = gavBadBody<int>(1);
+    }
+    // A second request for the SAME instantiation must RE-EMIT the body, so the diagnostic fires
+    // again. Binding to the body the first failure sealed with 'unreachable' compiled clean here
+    // and trapped at runtime instead.
+    expect_error("Undefined variable gavUndefinedName") {
+        int n2 = gavBadBody<int>(2);
+    }
+    expect_error("Undefined variable gavUndefinedName") {
+        int m = gavOuterBadBody<int>(3);
+    }
+    expect_error("Undefined variable gavUndefinedName") {
+        int m2 = gavOuterBadBody<int>(4);
     }
     // The instantiation moved this function's locals aside; recovery must put them back.
     return gavLocal - 7;

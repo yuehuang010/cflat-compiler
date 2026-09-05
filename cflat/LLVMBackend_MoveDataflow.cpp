@@ -116,16 +116,42 @@ void LLVMBackend::DiscardNullDerefEvents(llvm::Function* F)
  * the module verifier then see malformed IR. Close each open block with `unreachable` and drop
  * the function's pending analysis logs - the swallowed diagnostic already answered them.
  */
-void LLVMBackend::SealAbandonedFunction(llvm::Function* F)
+bool LLVMBackend::SealAbandonedFunction(llvm::Function* F)
 {
-        if (F == nullptr || F->isDeclaration()) return;
+        if (F == nullptr || F->isDeclaration()) return false;
+        bool sealed = false;
         for (auto& BB : *F)
             if (cflat_llvm::GetTerminatorOrNull(&BB) == nullptr)
+            {
                 new llvm::UnreachableInst(*context, &BB);
+                sealed = true;
+            }
         moveEventLog_.erase(F);
         nullEventLog_.erase(F);
         pendingReturnDangleChecks_.erase(F);
         pendingNullIfaceDispatch_.erase(F);
+        return sealed;
+    }
+
+/*
+ * A sealed body is dead but not removable: an outer abandoned body may already call it, and a
+ * FunctionSymbol elsewhere may hold the pointer, so erasing it would dangle. Rename it out of the
+ * way and drop its registrations instead - the symbol is then free for a later good emission, and
+ * the renamed remnant is unreachable internal code the optimizer drops.
+ */
+void LLVMBackend::DiscardAbandonedFunction(llvm::Function* F)
+{
+        if (F == nullptr || F->isDeclaration()) return;
+        std::string mangled = F->getName().str();
+        for (auto& entry : functionTable)
+        {
+            auto& syms = entry.second;
+            syms.erase(std::remove_if(syms.begin(), syms.end(),
+                [F](const FunctionSymbol& sym) { return sym.Function == F; }), syms.end());
+        }
+        functionBodyOrigin_.erase(mangled);
+        F->setName(mangled + ".abandoned");
+        F->setLinkage(llvm::Function::InternalLinkage);
     }
 
 // Sizes of the three per-function pending logs, so an abandoned region can rewind to them.

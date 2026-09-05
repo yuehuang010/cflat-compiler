@@ -7211,7 +7211,11 @@ public:
     void DiscardNullDerefEvents(llvm::Function* F);
 
     // Close an abandoned body's open blocks and drop its pending logs (expect_error recovery).
-    void SealAbandonedFunction(llvm::Function* F);
+    // Returns true when the body was actually incomplete (an `unreachable` had to be added).
+    bool SealAbandonedFunction(llvm::Function* F);
+
+    // Free every registration a sealed body claimed, so a later good emission can reuse the name.
+    void DiscardAbandonedFunction(llvm::Function* F);
 
     /*
      * A scoped `expect_error` block abandons only its own body, not the whole function, so the
