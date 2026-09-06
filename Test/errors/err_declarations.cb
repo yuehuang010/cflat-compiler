@@ -154,8 +154,12 @@ expect_error("conflicting declaration of extern 'putchar': the linkage name is a
 // linkage name is the bare WriteFile). The core symbol lives under its namespace in the
 // function table, so the existing signature has to be found by linkage name, not by lookup
 // name - this leg is what proves that search reaches a namespaced owner.
+// Windows-only: os.windows.cb is imported by os.cb only under __WIN64__/__WIN32__, so off
+// Windows there is no existing WriteFile to collide with and the expectation never fires.
+if const (__WINDOWS__) {
 expect_error("conflicting declaration of extern 'WriteFile': the linkage name is already declared as 'int(void*, char*, int, int*, void*)'") {
     extern u32 WriteFile(void* h, void* buf, u64 n, void* written, void* ov);
+}
 }
 
 // The file-I/O remedy is a separate message, emitted only for the stdio names os.windows
