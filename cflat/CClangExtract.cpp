@@ -743,6 +743,11 @@ namespace cflat_cinterop
                 // the FunctionDecl + signature are still produced.
                 if (req.skipFunctionBodies)
                     invocationUP->getFrontendOpts().SkipFunctionBodies = true;
+                // The driver puts -disable-free on every cc1 job, so EndSourceFile BURIES the
+                // ASTContext / Preprocessor / Sema instead of deleting them: ~60 MB leaked per
+                // windows.h parse. The CLI batch and the LSP re-extract on every signature-cache
+                // eviction, so this must free (clangd resets the same flag).
+                invocationUP->getFrontendOpts().DisableFree = false;
                 invocation.reset(invocationUP.release());
             }
 

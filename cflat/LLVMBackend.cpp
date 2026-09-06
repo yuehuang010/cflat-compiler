@@ -1647,6 +1647,7 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
     auto rootCanonical = std::filesystem::weakly_canonical(filename).string();
     currentSourceFilePath_ = rootCanonical;
     analyzedRootPath_ = rootCanonical;
+    BeginActiveRoot(rootCanonical);
     currentSourceIsCore_ = false;
     // See rootCoreDir_: a core library source compiled directly imports its siblings from ITS
     // checkout, which is not runtimeDir/core.
@@ -2694,27 +2695,98 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
     return true;
 }
 
-LLVMBackend::CachedParseTree* LLVMBackend::GetOrParseFile(const std::string& canonicalPath, const std::string& displayName)
+void LLVMBackend::BeginActiveRoot(const std::string& rootPath)
 {
-    // Reuse an imported tree when the file on disk is unchanged.
+    std::lock_guard<std::mutex> lock(cFileSigCacheMutex_);
+    activeRootKey_ = rootPath;
+    activeRoots_[rootPath].lastUse = ++cFileSigCacheClock_;
+    while (activeRoots_.size() > kMaxActiveRoots)
+    {
+        auto oldest = activeRoots_.end();
+        for (auto it = activeRoots_.begin(); it != activeRoots_.end(); ++it)
+            if (oldest == activeRoots_.end() || it->second.lastUse < oldest->second.lastUse)
+                oldest = it;
+        for (const auto& key : oldest->second.headerKeys)
+        {
+            auto pin = pinnedHeaderRefs_.find(key);
+            if (pin == pinnedHeaderRefs_.end()) continue;
+            if (--pin->second == 0) pinnedHeaderRefs_.erase(pin);
+        }
+        if (verbose) std::cout << std::format("[verbose] active root aged out: {}\n", oldest->first);
+        activeRoots_.erase(oldest);
+    }
+    EvictUnpinnedOverBudget(std::string(), verbose);
+}
+
+bool LLVMBackend::IsParseTreeFresh(const CachedParseTree& tree)
+{
+    std::error_code tec;
+    std::error_code sec;
+    auto wt = std::filesystem::last_write_time(tree.canonicalPath, tec);
+    auto fileSize = std::filesystem::file_size(tree.canonicalPath, sec);
+    return !tec && !sec && wt == tree.writeTime && fileSize == tree.fileSize;
+}
+
+LLVMBackend::CachedParseTree* LLVMBackend::GetOrParseFile(const std::string& canonicalPath,
+                                                          const std::string& displayName, bool isCore)
+{
+    // Reuse a tree this backend already holds when the file on disk is unchanged.
     auto it = parseTreeCache_.find(canonicalPath);
     if (it != parseTreeCache_.end())
     {
-        std::error_code tec;
-        std::error_code sec;
-        auto wt = std::filesystem::last_write_time(canonicalPath, tec);
-        auto fileSize = std::filesystem::file_size(canonicalPath, sec);
-        if (!tec && !sec && wt == it->second->writeTime && fileSize == it->second->fileSize)
+        if (IsParseTreeFresh(*it->second))
         {
             llvm::TimeTraceScope cacheScope("Parse", "cached:" + displayName);
             if (verbose) std::cout << std::format("[verbose]   parse cache hit: {}\n", displayName);
-            it->second->lastUse = parseTreeClock_;
+            // A shared tree is read by other backends concurrently, so nothing on it is written.
+            if (!it->second->shared) it->second->lastUse = parseTreeClock_;
             return it->second.get();
         }
-        parseTreeCache_.erase(it);  // stale or unstatable - re-parse below
+        parseTreeCache_.erase(it);  // stale or unstatable - refresh below
     }
 
-    auto entry = std::make_unique<CachedParseTree>();
+    std::shared_ptr<CachedParseTree> entry;
+    if (isCore)
+    {
+        std::lock_guard<std::mutex> lock(sharedCoreTreeMutex_);
+        auto shared = sharedCoreTrees_.find(canonicalPath);
+        if (shared != sharedCoreTrees_.end() && !IsParseTreeFresh(*shared->second))
+        {
+            // Backends still pinning the old tree keep it alive through their own shared_ptr.
+            sharedCoreTrees_.erase(shared);
+            shared = sharedCoreTrees_.end();
+        }
+        if (shared != sharedCoreTrees_.end())
+        {
+            llvm::TimeTraceScope cacheScope("Parse", "shared:" + displayName);
+            if (verbose) std::cout << std::format("[verbose]   shared parse cache hit: {}\n", displayName);
+            entry = shared->second;
+        }
+        else
+        {
+            entry = ParseFileForCache(canonicalPath, displayName);
+            if (!entry) return nullptr;
+            entry->shared = true;
+            sharedCoreTrees_[canonicalPath] = entry;
+        }
+    }
+    else
+    {
+        entry = ParseFileForCache(canonicalPath, displayName);
+        if (!entry) return nullptr;
+        entry->lastUse = parseTreeClock_;
+    }
+    CachedParseTree* raw = entry.get();
+    parseTreeCache_[canonicalPath] = std::move(entry);
+    return raw;
+}
+
+// Parses one file into a fresh cache entry. Returns null (and reports) on a parse error, which
+// is never cached.
+std::shared_ptr<LLVMBackend::CachedParseTree> LLVMBackend::ParseFileForCache(const std::string& canonicalPath,
+                                                                            const std::string& displayName)
+{
+    auto entry = std::make_shared<CachedParseTree>();
     entry->canonicalPath = canonicalPath;
 
     std::ifstream stream(canonicalPath);
@@ -2748,7 +2820,7 @@ LLVMBackend::CachedParseTree* LLVMBackend::GetOrParseFile(const std::string& can
     if (errorListener.hasErrors())
     {
         ReportParseErrors(errorListener.getDiagnostics(), sourceLines);
-        return nullptr;  // never cache a failed parse
+        return nullptr;
     }
 
     // errorListener is a stack object about to be destroyed; the parser never parses
@@ -2756,14 +2828,11 @@ LLVMBackend::CachedParseTree* LLVMBackend::GetOrParseFile(const std::string& can
     entry->lexer->removeErrorListeners();
     entry->parser->removeErrorListeners();
 
-    CachedParseTree* raw = entry.get();
     std::error_code tec;
     std::error_code sec;
     entry->writeTime = std::filesystem::last_write_time(canonicalPath, tec);
     entry->fileSize = std::filesystem::file_size(canonicalPath, sec);
-    entry->lastUse = parseTreeClock_;
-    parseTreeCache_[canonicalPath] = std::move(entry);
-    return raw;
+    return entry;
 }
 
 // Detect the Windows SDK "um"/"shared"/"ucrt"/"winrt" include dirs (latest installed version) so a
@@ -3224,9 +3293,9 @@ bool LLVMBackend::CompileImportedFile(const std::string& importingFilePath, cons
     if (!isCoreImport && !rootCoreDir_.empty())
         isCoreImport = IsPathUnderDirectory(canonicalStr, rootCoreDir_);
 
-    // All imported trees are mtime-and-size validated and retained for the process lifetime.
-    // Generic-template ctx pointers therefore remain valid across re-analysis.
-    CachedParseTree* tree = GetOrParseFile(canonicalStr, importFilename);
+    // Imported trees are mtime-and-size validated and pinned by this backend, so
+    // generic-template ctx pointers remain valid across re-analysis.
+    CachedParseTree* tree = GetOrParseFile(canonicalStr, importFilename, isCoreImport);
     if (!tree)
         return false;
 
@@ -3992,28 +4061,15 @@ bool LLVMBackend::RootFileNameIsCore(const std::string& fileName) const
     return coreFileNames_.count(fileName) != 0;
 }
 
-// Drop cached parse trees for USER imports that no recent analysis touched. Core trees
-// (runtimeDir/core) are parsed once and reused by every file, so they are always kept.
+// Drop cached parse trees for USER imports that no recent analysis touched. Shared core trees
+// are parsed once for the process and reused by every file, so they are always kept.
 void LLVMBackend::AgeOutNonCoreParseTrees()
 {
     ++parseTreeClock_;
-    if (parseTreeCache_.empty()) return;
-    // Latch only once runtimeDir is known; resolving early would leave the core dir empty
-    // and age out core trees for the rest of the process.
-    if (!canonicalCoreDirResolved_ && !runtimeDir.empty())
-    {
-        std::error_code ec;
-        auto dir = std::filesystem::weakly_canonical(std::filesystem::path(runtimeDir) / "core", ec);
-        if (!ec) { canonicalCoreDir_ = dir; canonicalCoreDirResolved_ = true; }
-    }
-    const std::string coreDir = canonicalCoreDir_.empty() ? std::string() : canonicalCoreDir_.string();
     for (auto it = parseTreeCache_.begin(); it != parseTreeCache_.end();)
     {
-        const std::string& path = it->second->canonicalPath;
-        bool isCore = !coreDir.empty() && path.size() > coreDir.size()
-                   && path.compare(0, coreDir.size(), coreDir) == 0
-                   && (path[coreDir.size()] == '/' || path[coreDir.size()] == '\\');
-        if (!isCore && parseTreeClock_ - it->second->lastUse > kParseTreeMaxAge)
+        const CachedParseTree& tree = *it->second;
+        if (!tree.shared && parseTreeClock_ - tree.lastUse > kParseTreeMaxAge)
         {
             if (verbose) std::cout << std::format("[verbose] parse cache aged out: {}\n", it->first);
             it = parseTreeCache_.erase(it);
@@ -4038,6 +4094,11 @@ bool LLVMBackend::Analyze(const std::string& filePath,
     auto rootCanonical = std::filesystem::weakly_canonical(filePath).string();
     currentSourceFilePath_ = rootCanonical;
     analyzedRootPath_ = rootCanonical;
+    // The LSP analyses a temp copy; key the root on the real document so a re-analysis of the
+    // same document keeps pinning the same header bindings.
+    BeginActiveRoot(sourceDisplayName_.empty() || sourceFileDir_.empty()
+        ? rootCanonical
+        : (std::filesystem::path(sourceFileDir_) / sourceDisplayName_).string());
     currentSourceIsCore_ = false;   // the analyzed root file is treated as user code
     importedFiles.insert(rootCanonical);
     importStack.push_back(rootCanonical);
@@ -4642,7 +4703,6 @@ void LLVMBackend::ResetForReanalysis()
     // Only now that gts holds no ctx pointers into them: drop user-import parse trees that
     // no recent analysis touched. Core trees are kept, and a survivor is revalidated on use.
     AgeOutNonCoreParseTrees();
-
     // Re-register the built-in string type that was wiped by the clears above.
     // string.cb references 'string' as a return type before the struct is parsed,
     // so it must exist before any core file is compiled.

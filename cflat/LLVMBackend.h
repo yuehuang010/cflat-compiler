@@ -3206,8 +3206,8 @@ private:
     // LRU bookkeeping for the map above. Both mutate only under cFileSigCacheMutex_.
     static inline uint64_t cFileSigCacheClock_ = 0;
     static inline size_t cFileSigCacheRows_ = 0;
-    // Row budget. One windows.h binding is ~54k rows / ~105 MB, so this holds roughly two
-    // large headers plus the small entries; the cache is pure, rebuildable state.
+    // Row budget for entries no active root references. One windows.h binding is ~54k rows /
+    // ~105 MB, so this keeps roughly two cold large headers; the cache is rebuildable state.
     static constexpr size_t kCFileSigCacheRowBudget = 120000;
 
     static size_t CFileSigEntryRows(const CFileSigCacheEntry& entry)
@@ -3216,15 +3216,65 @@ private:
              + entry.macros.size() + entry.funcMacros.size() + entry.globals.size()
              + entry.recordAliases.size() + entry.typeAliases.size() + entry.deps.size();
     }
-    // Caller must hold cFileSigCacheMutex_. Marks an entry as most recently used.
-    static void TouchCFileSigEntry(CFileSigCacheEntry& entry)
+    // Retention follows the SOURCE (maintainer ruling 2026-09-05): every
+    // analysed root .cb records the header keys its analysis touched (its own imports and its
+    // transitive .cb imports bind inside the same analysis), the process keeps the last
+    // kMaxActiveRoots roots, and a key referenced by any active root is never evicted. Only
+    // unreferenced keys fall under the row budget. All of it mutates under cFileSigCacheMutex_.
+    struct ActiveRoot
+    {
+        std::unordered_set<std::string> headerKeys;
+        uint64_t lastUse = 0;
+    };
+    static constexpr size_t kMaxActiveRoots = 16;
+    static inline std::unordered_map<std::string, ActiveRoot> activeRoots_;
+    static inline std::unordered_map<std::string, size_t> pinnedHeaderRefs_;  // key -> active roots
+    std::string activeRootKey_;  // root of the analysis in progress on this backend
+    // Locks the mutex itself. Registers `rootPath` as the current root (most recently used),
+    // drops the least recently used roots over the cap, then re-applies the row budget.
+    void BeginActiveRoot(const std::string& rootPath);
+    // Caller must hold cFileSigCacheMutex_. Records `key` on the current root.
+    void PinHeaderForActiveRoot(const std::string& key)
+    {
+        if (activeRootKey_.empty()) return;
+        auto root = activeRoots_.find(activeRootKey_);
+        if (root == activeRoots_.end()) return;  // aged out mid-analysis; nothing to pin to
+        if (root->second.headerKeys.insert(key).second) ++pinnedHeaderRefs_[key];
+    }
+    // Caller must hold cFileSigCacheMutex_. Evicts the least recently used UNPINNED entries
+    // until the row budget is met; `keep` (the entry just inserted) is never a victim.
+    static void EvictUnpinnedOverBudget(const std::string& keep, bool verbose)
+    {
+        while (cFileSigCacheRows_ > kCFileSigCacheRowBudget)
+        {
+            auto victim = cFileSigCache_.end();
+            for (auto it = cFileSigCache_.begin(); it != cFileSigCache_.end(); ++it)
+            {
+                if (it->first == keep) continue;
+                if (auto pin = pinnedHeaderRefs_.find(it->first);
+                    pin != pinnedHeaderRefs_.end() && pin->second > 0)
+                    continue;
+                if (victim == cFileSigCache_.end() || it->second.lastUse < victim->second.lastUse)
+                    victim = it;
+            }
+            if (victim == cFileSigCache_.end()) break;  // everything left is pinned or new
+            if (verbose)
+                std::cout << std::format("[verbose] C signatures cache evicted {} ({} rows)\n",
+                                         victim->first, victim->second.rows);
+            cFileSigCacheRows_ -= victim->second.rows;
+            cFileSigCache_.erase(victim);
+        }
+    }
+    // Caller must hold cFileSigCacheMutex_. Marks a hit entry most recently used and pins it
+    // for the current root.
+    void TouchCFileSigEntry(const std::string& key, CFileSigCacheEntry& entry)
     {
         entry.lastUse = ++cFileSigCacheClock_;
+        PinHeaderForActiveRoot(key);
     }
-    // Caller must hold cFileSigCacheMutex_. Inserts (or replaces) an entry, then evicts the
-    // least recently used entries until the row budget is met. The new entry is never evicted.
-    static void InsertCFileSigEntry(const std::string& key, CFileSigCacheEntry&& entry,
-                                    bool verbose)
+    // Caller must hold cFileSigCacheMutex_. Inserts (or replaces) an entry, pins it for the
+    // current root, then evicts unpinned entries until the row budget is met.
+    void InsertCFileSigEntry(const std::string& key, CFileSigCacheEntry&& entry, bool verbose)
     {
         entry.rows = CFileSigEntryRows(entry);
         entry.lastUse = ++cFileSigCacheClock_;
@@ -3233,22 +3283,8 @@ private:
         if (existing != cFileSigCache_.end()) cFileSigCacheRows_ -= existing->second.rows;
         cFileSigCache_[key] = std::move(entry);
         cFileSigCacheRows_ += addedRows;
-        while (cFileSigCacheRows_ > kCFileSigCacheRowBudget)
-        {
-            auto victim = cFileSigCache_.end();
-            for (auto it = cFileSigCache_.begin(); it != cFileSigCache_.end(); ++it)
-            {
-                if (it->first == key) continue;
-                if (victim == cFileSigCache_.end() || it->second.lastUse < victim->second.lastUse)
-                    victim = it;
-            }
-            if (victim == cFileSigCache_.end()) break;  // only the new entry left - keep it
-            if (verbose)
-                std::cout << std::format("[verbose] C signatures cache evicted {} ({} rows)\n",
-                                         victim->first, victim->second.rows);
-            cFileSigCacheRows_ -= victim->second.rows;
-            cFileSigCache_.erase(victim);
-        }
+        PinHeaderForActiveRoot(key);
+        EvictUnpinnedOverBudget(key, verbose);
     }
     int lambdaCounter = 0;
     int pipeStreamCounter = 0;   // uniquifies synthesized hidden `stream` locals for `producer >> consumer` piping
@@ -3293,6 +3329,7 @@ private:
     std::vector<UserDefine> userDefines_;
     // ANTLR ecosystem kept alive so generic-template ctx pointers remain valid. Imported
     // entries are reused across compiles and deliberately survive ResetForReanalysis.
+    // A tree is never mutated after its parse, so concurrent readers need no lock.
     struct CachedParseTree
     {
         std::string canonicalPath;                 // absolute canonical path
@@ -3303,19 +3340,26 @@ private:
         std::unique_ptr<antlr4::CommonTokenStream> tokens;
         std::unique_ptr<CFlatParser> parser;
         CFlatParser::CompilationUnitContext* unit = nullptr;  // owned by `parser`
-        uint64_t lastUse = 0;   // parseTreeClock_ stamp of the last hit or insert
+        bool shared = false;    // lives in sharedCoreTrees_; read by every backend, never aged
+        uint64_t lastUse = 0;   // parseTreeClock_ stamp of the last hit or insert (unshared only)
     };
-    // All imported parse trees are cached for the process lifetime and validated by mtime
-    // and size before reuse.
-    std::unordered_map<std::string, std::unique_ptr<CachedParseTree>> parseTreeCache_;
-    // Bumped once per ResetForReanalysis; non-core trees unused for this many resets are
-    // dropped. Core trees are parsed once and reused by every file, so they are never aged out.
+    // Every tree this backend has imported, validated by mtime and size before reuse. A user
+    // import is owned here alone; a core import is a pin on the process-wide entry below, so
+    // its ctx pointers stay valid for this backend however the shared map turns over.
+    std::unordered_map<std::string, std::shared_ptr<CachedParseTree>> parseTreeCache_;
+    // Core trees are identical for every backend, so an LSP pool of N holds each ONCE here
+    // instead of N times (the whole core set is ~500 MB of tree per copy). A parse happens
+    // under the mutex so a cold pool never builds duplicate copies.
+    static inline std::mutex sharedCoreTreeMutex_;
+    static inline std::unordered_map<std::string, std::shared_ptr<CachedParseTree>> sharedCoreTrees_;
+    // Bumped once per ResetForReanalysis; user trees unused for this many resets are dropped.
+    // Shared core trees are parsed once and reused by every file, so they are never aged out.
     uint64_t parseTreeClock_ = 0;
     static constexpr uint64_t kParseTreeMaxAge = 2;
-    // weakly_canonical(runtimeDir/core), built lazily alongside coreFileNames_.
-    mutable std::filesystem::path canonicalCoreDir_;
-    mutable bool canonicalCoreDirResolved_ = false;
     void AgeOutNonCoreParseTrees();
+    static bool IsParseTreeFresh(const CachedParseTree& tree);
+    std::shared_ptr<CachedParseTree> ParseFileForCache(const std::string& canonicalPath,
+                                                       const std::string& displayName);
     struct CoreHashCacheEntry
     {
         std::filesystem::path canonicalRuntimeDir;
@@ -3337,7 +3381,9 @@ private:
     // survive ResetForReanalysis like parseTreeCache_.
     std::unordered_map<std::string, CoreJsonCacheEntry> coreMetaJsonCache_;
     std::unordered_map<std::string, CoreJsonCacheEntry> coreSymbolsJsonCache_;
-    CachedParseTree* GetOrParseFile(const std::string& canonicalPath, const std::string& displayName);
+    // isCore selects the process-wide shared cache; a user import is cached per backend.
+    CachedParseTree* GetOrParseFile(const std::string& canonicalPath, const std::string& displayName,
+                                    bool isCore);
     // Parser ecosystem must outlive instantiation: genericFunctionTemplates holds raw
     // FunctionDefinitionContext pointers into these trees.
     struct SyntheticParseState

@@ -1553,7 +1553,7 @@ bool LLVMBackend::ExtractCSignatures(const std::string& cSourcePath, const std::
                 if (entry.mtime == currentMtime)
                 {
                     if (verbose) std::cout << std::format("[verbose] C signatures cache hit (mtime) for {}\n", fileForLsp);
-                    TouchCFileSigEntry(entry);
+                    TouchCFileSigEntry(cacheKey, entry);
                     hitSigs = entry.sigs;
                     hitRecords = entry.records;
                     hitGlobals = entry.globals;
@@ -1564,7 +1564,7 @@ bool LLVMBackend::ExtractCSignatures(const std::string& cSourcePath, const std::
                 {
                     if (verbose) std::cout << std::format("[verbose] C signatures cache hit (hash) for {}\n", fileForLsp);
                     entry.mtime = currentMtime; // refresh so the next check short-circuits on mtime
-                    TouchCFileSigEntry(entry);
+                    TouchCFileSigEntry(cacheKey, entry);
                     hitSigs = entry.sigs;
                     hitRecords = entry.records;
                     hitGlobals = entry.globals;
@@ -2567,7 +2567,7 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
                 if (entry.mtime == currentMtime)
                 {
                     if (verbose) std::cout << std::format("[verbose] C header cache hit (mtime) for {}\n", fileForLsp);
-                    TouchCFileSigEntry(entry);
+                    TouchCFileSigEntry(cacheKey, entry);
                     hitSigs = entry.sigs; hitEnums = entry.enums; hitRecords = entry.records;
                     hitMacros = entry.macros; hitFuncMacros = entry.funcMacros; hitGlobals = entry.globals;
                     hitAliases = entry.recordAliases; hit = true;
@@ -2577,7 +2577,7 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
                 {
                     if (verbose) std::cout << std::format("[verbose] C header cache hit (hash) for {}\n", fileForLsp);
                     entry.mtime = currentMtime;
-                    TouchCFileSigEntry(entry);
+                    TouchCFileSigEntry(cacheKey, entry);
                     hitSigs = entry.sigs; hitEnums = entry.enums; hitRecords = entry.records;
                     hitMacros = entry.macros; hitFuncMacros = entry.funcMacros; hitGlobals = entry.globals;
                     hitAliases = entry.recordAliases; hit = true;

@@ -520,10 +520,12 @@ copies** (the `ForwardRefScanner` one and the `MainListener` one).
 - `returnBlockTable`: inlined return-block function bodies
 - `builder / module / context`: IR generation state
 - `diBuilder`: DWARF builder (active with `-g`)
-- `parseTreeCache_`: timestamp-validated cache of parsed ANTLR trees for **implicit core-library
-  imports only** (`runtimeDir/core`). Reused across compiles and LSP re-analyses since core content
-  is stable; deliberately NOT cleared by `ResetForReanalysis`. User imports parse fresh into
-  `importedParseStates` (per-compile, cleared on reset). `ResetForReanalysis` must clear ALL
+- `parseTreeCache_`: mtime+size-validated cache of parsed ANTLR trees for EVERY import
+  (`GetOrParseFile` is the only import parse path). Core trees (`runtimeDir/core`) live ONCE per
+  process in static `sharedCoreTrees_` (mutex-guarded, never mutated after parse, so LSP pool
+  slots read them concurrently) and each backend pins a `shared_ptr` so generic-template ctx
+  pointers stay valid; user trees are per-backend and aged out `kParseTreeMaxAge` resets after
+  last use. Deliberately NOT cleared by `ResetForReanalysis`. `ResetForReanalysis` must clear ALL
   transient per-call state (e.g. `lastCallIsBonded`) or a value left by an aborted compile leaks
   into the next file's analysis.
 
