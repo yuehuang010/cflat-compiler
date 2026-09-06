@@ -16,6 +16,16 @@ from the q13/q15 reviews (d77dfdae, 5f693b7d).
    "refused solely on that axis" while fixing the element still does not compile). Do not
    re-model the scorer. Record a per-candidate "sole disqualifier = view element axis" flag at
    the scorer's own gates (~302, ~338) and print it at the no-match site; true by construction.
+   ATTEMPTED AGAIN 2026-09-05 (per-candidate flag at the scorer gates, reverted by review): the
+   flag is true by construction only for SCORER refusals. The call door refuses positions the
+   scorer accepts (RejectValueIntoInterfaceViewParam: a class value into an `IA[]` parameter is
+   accepted by the named branch via StructImplementsInterface), so `rvF(pv, s)` with `int*[] pv`
+   at position 0 and a class value `s` at position 1 printed "refused on the element alone" while
+   fixing the element still does not compile. Modelling one door gate (raw pointer into view)
+   was needed to pass the earlier false-hint shape and is not enough; modelling all of them IS
+   the re-modelling this item forbids. Direction now: the hint is sound only if the door gates
+   run per candidate BEFORE the no-match dump (i.e. move the three view axes into the scorer
+   as real refusals, which changes resolution and needs its own accept-set), or drop the hint.
 3. Two of the three gate strings go through `LogErrorContext(ctx, std::format(...))` and never
    enter the localization catalog (same as the sibling raw-pointer-to-view gate); only the call
    door's `LogErrorMessage` is catalogued. Decide whether these belong in the catalog.
