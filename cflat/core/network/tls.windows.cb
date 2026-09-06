@@ -1,0 +1,99 @@
+// Schannel SSPI bindings for the Windows TLS client.
+
+extern stdcall void* LoadLibraryA(const char* name);
+extern stdcall void* GetProcAddress(void* module, const char* name);
+
+struct _TlsSecHandle {
+    void* dwLower = nullptr;
+    void* dwUpper = nullptr;
+};
+
+struct _TlsSecBuffer {
+    u32 cbBuffer = 0;
+    u32 BufferType = 0;
+    void* pvBuffer = nullptr;
+};
+
+struct _TlsSecBufferDesc {
+    u32 ulVersion = 0;
+    u32 cBuffers = 0;
+    _TlsSecBuffer* pBuffers = nullptr;
+};
+
+struct _TlsStreamSizes {
+    u32 cbHeader = 0;
+    u32 cbTrailer = 0;
+    u32 cbMaximumMessage = 0;
+    u32 cBuffers = 0;
+    u32 cbBlockSize = 0;
+};
+
+struct _TlsSchannelCred {
+    u32 dwVersion = 0;
+    u32 cCreds = 0;
+    void* paCred = nullptr;
+    void* hRootStore = nullptr;
+    u32 cMappers = 0;
+    void* aphMappers = nullptr;
+    u32 cSupportedAlgs = 0;
+    void* palgSupportedAlgs = nullptr;
+    u32 grbitEnabledProtocols = 0;
+    u32 dwMinimumCipherStrength = 0;
+    u32 dwMaximumCipherStrength = 0;
+    u32 dwSessionLifespan = 0;
+    u32 dwFlags = 0;
+    u32 dwCredFormat = 0;
+};
+
+struct _TlsTimeStamp {
+    i64 value = 0;
+};
+
+void* __tlsSecur32 = nullptr;
+bool __tlsWindowsLoaded = false;
+bool __tlsWindowsLoadFailed = false;
+
+function<i32(char*, char*, u32, void*, void*, void*, void*, _TlsSecHandle*, _TlsTimeStamp*)> __tlsAcquireCredentials = default;
+function<i32(_TlsSecHandle*)> __tlsFreeCredentials = default;
+function<i32(_TlsSecHandle*, _TlsSecHandle*, char*, u32, u32, u32, _TlsSecBufferDesc*, u32, _TlsSecHandle*, _TlsSecBufferDesc*, u32*, _TlsTimeStamp*)> __tlsInitializeSecurity = default;
+function<i32(_TlsSecHandle*)> __tlsDeleteSecurityContext = default;
+function<i32(void*)> __tlsFreeContextBuffer = default;
+function<i32(_TlsSecHandle*, u32, void*)> __tlsQueryContextAttributes = default;
+function<i32(_TlsSecHandle*, u32, _TlsSecBufferDesc*, u32)> __tlsEncryptMessage = default;
+function<i32(_TlsSecHandle*, _TlsSecBufferDesc*, u32, u32*)> __tlsDecryptMessage = default;
+
+bool __tlsWindowsLoadSymbols()
+{
+    if (__tlsWindowsLoaded) return true;
+    if (__tlsWindowsLoadFailed) return false;
+    __tlsSecur32 = LoadLibraryA("secur32.dll");
+    if (__tlsSecur32 == nullptr) { __tlsWindowsLoadFailed = true; return false; }
+
+    __tlsAcquireCredentials = (function<i32(char*, char*, u32, void*, void*, void*, void*, _TlsSecHandle*, _TlsTimeStamp*)>)GetProcAddress(__tlsSecur32, "AcquireCredentialsHandleA");
+    __tlsFreeCredentials = (function<i32(_TlsSecHandle*)>)GetProcAddress(__tlsSecur32, "FreeCredentialsHandle");
+    __tlsInitializeSecurity = (function<i32(_TlsSecHandle*, _TlsSecHandle*, char*, u32, u32, u32, _TlsSecBufferDesc*, u32, _TlsSecHandle*, _TlsSecBufferDesc*, u32*, _TlsTimeStamp*)>)GetProcAddress(__tlsSecur32, "InitializeSecurityContextA");
+    __tlsDeleteSecurityContext = (function<i32(_TlsSecHandle*)>)GetProcAddress(__tlsSecur32, "DeleteSecurityContext");
+    __tlsFreeContextBuffer = (function<i32(void*)>)GetProcAddress(__tlsSecur32, "FreeContextBuffer");
+    __tlsQueryContextAttributes = (function<i32(_TlsSecHandle*, u32, void*)>)GetProcAddress(__tlsSecur32, "QueryContextAttributesA");
+    __tlsEncryptMessage = (function<i32(_TlsSecHandle*, u32, _TlsSecBufferDesc*, u32)>)GetProcAddress(__tlsSecur32, "EncryptMessage");
+    __tlsDecryptMessage = (function<i32(_TlsSecHandle*, _TlsSecBufferDesc*, u32, u32*)>)GetProcAddress(__tlsSecur32, "DecryptMessage");
+
+    __tlsWindowsLoaded = __tlsAcquireCredentials != nullptr && __tlsFreeCredentials != nullptr
+        && __tlsInitializeSecurity != nullptr && __tlsDeleteSecurityContext != nullptr
+        && __tlsFreeContextBuffer != nullptr && __tlsQueryContextAttributes != nullptr
+        && __tlsEncryptMessage != nullptr && __tlsDecryptMessage != nullptr;
+    if (!__tlsWindowsLoaded) __tlsWindowsLoadFailed = true;
+    return __tlsWindowsLoaded;
+}
+
+bool __tlsWindowsSendAll(Socket* socket, i8* data, int length)
+{
+    int offset = 0;
+    while (offset < length)
+    {
+        int sent = send(socket->nativeHandle(), (const char*)&data[offset], length - offset, 0);
+        if (sent <= 0) return false;
+        offset = offset + sent;
+    }
+    return true;
+}

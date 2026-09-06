@@ -88,7 +88,7 @@ Method-level API discovery is via the LSP (hover / completion / `--symbol`); thi
 | `os.cb` | Platform dispatcher (imports `os.windows.cb` on Windows) |
 | `os.windows.cb` | Windows platform externs: Win32 API and MSVC CRT |
 | `network/socket.cb` | Platform-agnostic TCP/UDP socket API |
-| `network/tls.cb` | Synchronous TLS client: SecureTransport on macOS, with a clear unsupported-platform diagnostic elsewhere |
+| `network/tls.cb` | Synchronous TLS client: SecureTransport on macOS and Schannel on Windows; Linux reports TLS unsupported |
 | `network/socket.windows.cb` | Winsock2 raw bindings (pulled in by `socket.cb` on Windows) |
 
 ### Serialization & text

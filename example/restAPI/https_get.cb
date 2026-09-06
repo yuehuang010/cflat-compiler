@@ -1,7 +1,6 @@
 // HTTPS smoke test for the core TLS client.
-// On macOS this uses SecureTransport with certificate verification enabled.
-// Other platforms report a clear unsupported message; REST callers can use
-// process/curl there until their native TLS backend is added.
+// macOS uses SecureTransport and Windows uses Schannel, both with certificate
+// and hostname verification enabled.
 
 import "network/tls.cb";
 
@@ -41,6 +40,6 @@ extern int main()
     bool rejected = !wrongName.connect("example.com", 443, "wrong.invalid");
     printf("certificate hostname validation: %s\n", rejected ? "PASS" : "FAIL");
     if (!rejected) return 1;
-    printf("PASS: HTTPS SecureTransport smoke test\n");
+    printf("PASS: HTTPS TLS smoke test\n");
     return 0;
 }

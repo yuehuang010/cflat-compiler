@@ -2,11 +2,15 @@
 //
 // macOS uses SecureTransport through dynamically loaded Security.framework
 // symbols. Certificate and hostname verification stay enabled by default.
-// Windows and Linux expose the same surface but report that TLS is not yet
-// implemented on those platforms.
+// Windows uses Schannel through dynamically loaded secur32.dll symbols.
+// Linux exposes the same surface but reports that TLS is not implemented.
 
 import "string.cb";
 import "network/socket.cb";
+
+if const (__WINDOWS__) {
+    import "network/tls.windows.cb";
+}
 
 if const (__MACOS__) {
     extern void* dlopen(const char* path, int mode);
@@ -94,11 +98,46 @@ class TlsSocket
     Socket* _socket = nullptr;
     void* _context = nullptr;
     string _error = default;
+    void* _windowsCredentials = nullptr;
+    bool _windowsContextAllocated = false;
+    bool _windowsContextReady = false;
+    bool _windowsCleanClose = false;
+    i8* _windowsReceive = nullptr;
+    int _windowsReceiveCapacity = 0;
+    int _windowsReceiveLength = 0;
+    i8* _windowsPlain = nullptr;
+    int _windowsPlainLength = 0;
+    int _windowsPlainOffset = 0;
+    int _windowsHeader = 0;
+    int _windowsTrailer = 0;
+    int _windowsMaximumMessage = 0;
+    i8* _windowsTargetName = nullptr;
 
     void fail(string message)
     {
         _error = message;
         close();
+    }
+
+    // Append more ciphertext at the end of the receive buffer, growing it when full.
+    // Returns 1 when bytes were read, 0 on a peer close, -1 on error (_error is set).
+    int windowsReceiveMore()
+    {
+        if (_windowsReceiveLength == _windowsReceiveCapacity)
+        {
+            int newCapacity = _windowsReceiveCapacity * 2;
+            if (newCapacity <= _windowsReceiveCapacity || newCapacity > 1048576) { _error = "TLS receive buffer limit reached"; return -1; }
+            i8* expanded = new i8[newCapacity];
+            memcpy(expanded, _windowsReceive, (i64)_windowsReceiveLength);
+            delete _windowsReceive;
+            _windowsReceive = expanded;
+            _windowsReceiveCapacity = newCapacity;
+        }
+        int received = _socket->recv(&_windowsReceive[_windowsReceiveLength], _windowsReceiveCapacity - _windowsReceiveLength);
+        if (received == 0) return 0;
+        if (received < 0) { _error = "TLS socket receive failed"; return -1; }
+        _windowsReceiveLength = _windowsReceiveLength + received;
+        return 1;
     }
 
     // Connect to host:port and verify the certificate for host.
@@ -114,9 +153,121 @@ class TlsSocket
     {
         close();
         _error = "";
+        _windowsCleanClose = false;
         if const (__WINDOWS__) {
-            _error = "TLS is not implemented on this platform yet";
-            return false;
+            if (!__tlsWindowsLoadSymbols()) { _error = "TLS is unavailable: Schannel symbols could not be loaded"; return false; }
+            if (!Socket.initNetwork()) { _error = "network initialization failed"; return false; }
+            _socket = new Socket;
+            if (!_socket->createTcp()) { fail("TCP socket creation failed"); return false; }
+            if (!_socket->connect(host, port)) { fail("TCP connection failed"); return false; }
+
+            _windowsReceiveCapacity = 16384;
+            _windowsReceive = new i8[_windowsReceiveCapacity];
+            _windowsTargetName = new i8[peerName.length() + 1];
+            memcpy(_windowsTargetName, peerName.data(), (i64)peerName.length());
+            _windowsTargetName[peerName.length()] = 0;
+            _TlsSecHandle* credentials = new _TlsSecHandle;
+            _TlsTimeStamp* expiry = new _TlsTimeStamp;
+            _TlsSchannelCred credentialData = default;
+            credentialData.dwVersion = 4;
+            credentialData.grbitEnabledProtocols = 0;
+            credentialData.dwFlags = 0x00400030;
+            i32 status = __tlsAcquireCredentials(nullptr,
+                (char*)"Microsoft Unified Security Protocol Provider", 2, nullptr,
+                &credentialData, nullptr, nullptr, credentials, expiry);
+            delete expiry;
+            if (status != 0) { delete credentials; fail("TLS credentials setup failed: " + status.toString()); return false; }
+            _windowsCredentials = credentials;
+
+            _TlsSecHandle* context = new _TlsSecHandle;
+            _context = context;
+            u32 requestFlags = 0x00000004 | 0x00000008 | 0x00000010
+                | 0x00000100 | 0x00008000 | 0x00004000;
+            bool firstCall = true;
+            bool needMoreInput = false;
+            while (true)
+            {
+                _TlsSecBuffer outputBuffer = default;
+                outputBuffer.BufferType = 2;
+                _TlsSecBufferDesc outputDesc = default;
+                outputDesc.ulVersion = 0;
+                outputDesc.cBuffers = 1;
+                outputDesc.pBuffers = &outputBuffer;
+                _TlsSecBuffer[2] inputBuffers = default;
+                _TlsSecBufferDesc inputDesc = default;
+                _TlsSecBufferDesc* input = nullptr;
+                if (!firstCall)
+                {
+                    while (_windowsReceiveLength == 0 || needMoreInput)
+                    {
+                        int received = windowsReceiveMore();
+                        if (received == 0) { fail("TLS handshake failed: peer closed"); return false; }
+                        // windowsReceiveMore() already set the specific cause; close()
+                        // rather than fail() so that message is not overwritten here.
+                        if (received < 0) { close(); return false; }
+                        needMoreInput = false;
+                    }
+                    inputBuffers[0].cbBuffer = (u32)_windowsReceiveLength;
+                    inputBuffers[0].BufferType = 2;
+                    inputBuffers[0].pvBuffer = &_windowsReceive[0];
+                    inputBuffers[1].BufferType = 0;
+                    inputDesc.ulVersion = 0;
+                    inputDesc.cBuffers = 2;
+                    inputDesc.pBuffers = &inputBuffers[0];
+                    input = &inputDesc;
+                }
+
+                u32 contextAttributes = 0;
+                _TlsTimeStamp* contextExpiry = new _TlsTimeStamp;
+                status = __tlsInitializeSecurity((_TlsSecHandle*)_windowsCredentials,
+                    firstCall ? nullptr : context, (char*)_windowsTargetName, requestFlags, 0, 0x10,
+                    input, 0, context, &outputDesc, &contextAttributes, contextExpiry);
+                delete contextExpiry;
+                // Once Schannel has populated the handle it must be released with
+                // DeleteSecurityContext, on the failure paths below just as much as on success.
+                if (context->dwLower != nullptr || context->dwUpper != nullptr) _windowsContextAllocated = true;
+                if (outputBuffer.pvBuffer != nullptr)
+                {
+                    bool sent = __tlsWindowsSendAll(_socket, (i8*)outputBuffer.pvBuffer, (int)outputBuffer.cbBuffer);
+                    __tlsFreeContextBuffer(outputBuffer.pvBuffer);
+                    outputBuffer.pvBuffer = nullptr;
+                    if (!sent) { fail("TLS handshake write failed"); return false; }
+                }
+                if (status == -2146893032)
+                {
+                    firstCall = false;
+                    needMoreInput = true;
+                    continue;
+                }
+                if (status == 590624) { fail("TLS client certificates are not supported"); return false; }
+                if (status != 0 && status != 590610)
+                {
+                    fail("TLS handshake failed (certificate or connection rejected): " + status.toString()); return false;
+                }
+                _windowsContextReady = true;
+                if (!firstCall)
+                {
+                    int extra = 0;
+                    for (int i = 0; i < 2; i++)
+                    {
+                        if (inputBuffers[i].BufferType == 5) extra = (int)inputBuffers[i].cbBuffer;
+                    }
+                    // SECBUFFER_EXTRA from InitializeSecurityContext carries only a length; its
+                    // pvBuffer is left untouched, so the unread bytes are the input tail.
+                    if (extra > 0 && extra <= _windowsReceiveLength) memmove(&_windowsReceive[0], &_windowsReceive[_windowsReceiveLength - extra], (i64)extra);
+                    _windowsReceiveLength = extra;
+                }
+                if (status == 0) break;
+                firstCall = false;
+            }
+
+            _TlsStreamSizes streamSizes = default;
+            status = __tlsQueryContextAttributes(context, 4, &streamSizes);
+            if (status != 0) { fail("TLS stream-size query failed: " + status.toString()); return false; }
+            _windowsHeader = (int)streamSizes.cbHeader;
+            _windowsTrailer = (int)streamSizes.cbTrailer;
+            _windowsMaximumMessage = (int)streamSizes.cbMaximumMessage;
+            return true;
         } else if const (__LINUX__) {
             _error = "TLS is not implemented on this platform yet";
             return false;
@@ -148,6 +299,48 @@ class TlsSocket
 
     int write(const char* data, int length)
     {
+        if const (__WINDOWS__) {
+            if (_context == nullptr || !_windowsContextReady) { _error = "TLS write: no context"; return -1; }
+            if (length < 0) { _error = "TLS write: negative length"; return -1; }
+            if (length == 0) return 0;
+            if (_windowsMaximumMessage <= 0) { _error = "TLS write: stream sizes are unknown"; return -1; }
+            // A payload longer than one TLS record is split across records. The scratch
+            // buffer is sized for the largest chunk this call will actually encrypt.
+            int chunkCapacity = length < _windowsMaximumMessage ? length : _windowsMaximumMessage;
+            int recordLength = _windowsHeader + chunkCapacity + _windowsTrailer;
+            // No memset: EncryptMessage writes the header and trailer regions itself and
+            // the plaintext region is fully overwritten by the memcpy below.
+            i8* record = new i8[recordLength];
+            int offset = 0;
+            while (offset < length)
+            {
+                int chunk = length - offset;
+                if (chunk > chunkCapacity) chunk = chunkCapacity;
+                memcpy(&record[_windowsHeader], &data[offset], (i64)chunk);
+                _TlsSecBuffer[4] buffers = default;
+                buffers[0].cbBuffer = (u32)_windowsHeader;
+                buffers[0].BufferType = 7;
+                buffers[0].pvBuffer = &record[0];
+                buffers[1].cbBuffer = (u32)chunk;
+                buffers[1].BufferType = 1;
+                buffers[1].pvBuffer = &record[_windowsHeader];
+                buffers[2].cbBuffer = (u32)_windowsTrailer;
+                buffers[2].BufferType = 6;
+                buffers[2].pvBuffer = &record[_windowsHeader + chunk];
+                _TlsSecBufferDesc desc = default;
+                desc.ulVersion = 0;
+                desc.cBuffers = 4;
+                desc.pBuffers = &buffers[0];
+                i32 status = __tlsEncryptMessage((_TlsSecHandle*)_context, 0, &desc, 0);
+                if (status != 0) { _error = "TLS EncryptMessage failed: " + status.toString() + " sizes=" + _windowsHeader.toString() + "," + _windowsTrailer.toString() + "," + _windowsMaximumMessage.toString(); delete record; return -1; }
+                int encryptedLength = (int)buffers[0].cbBuffer + (int)buffers[1].cbBuffer + (int)buffers[2].cbBuffer;
+                bool sent = __tlsWindowsSendAll(_socket, record, encryptedLength);
+                if (!sent) { _error = "TLS encrypted write failed"; delete record; return -1; }
+                offset = offset + chunk;
+            }
+            delete record;
+            return length;
+        }
         if const (__MACOS__) {
             if (_context == nullptr) return -1;
             u64 written = 0;
@@ -161,6 +354,85 @@ class TlsSocket
 
     int read(i8* data, int length)
     {
+        if const (__WINDOWS__) {
+            if (length <= 0) return 0;
+            if (_windowsPlain != nullptr && _windowsPlainOffset < _windowsPlainLength)
+            {
+                int available = _windowsPlainLength - _windowsPlainOffset;
+                int count = available < length ? available : length;
+                memcpy(data, &_windowsPlain[_windowsPlainOffset], (i64)count);
+                _windowsPlainOffset = _windowsPlainOffset + count;
+                if (_windowsPlainOffset == _windowsPlainLength)
+                {
+                    delete _windowsPlain;
+                    _windowsPlain = nullptr;
+                    _windowsPlainLength = 0;
+                    _windowsPlainOffset = 0;
+                }
+                return count;
+            }
+            if (_windowsCleanClose) return 0;
+            if (_context == nullptr || !_windowsContextReady) return -1;
+            while (true)
+            {
+                if (_windowsReceiveLength == 0)
+                {
+                    int received = windowsReceiveMore();
+                    if (received == 0) { _error = "TLS peer TCP close before data"; close(); _windowsCleanClose = true; return 0; }
+                    if (received < 0) { close(); return -1; }
+                }
+                _TlsSecBuffer[4] buffers = default;
+                buffers[0].cbBuffer = (u32)_windowsReceiveLength;
+                buffers[0].BufferType = 1;
+                buffers[0].pvBuffer = &_windowsReceive[0];
+                _TlsSecBufferDesc desc = default;
+                desc.ulVersion = 0;
+                desc.cBuffers = 4;
+                desc.pBuffers = &buffers[0];
+                i32 status = __tlsDecryptMessage((_TlsSecHandle*)_context, &desc, 0, nullptr);
+                if (status == -2146893032)
+                {
+                    int received = windowsReceiveMore();
+                    if (received == 0) { _error = "TLS peer TCP close before data"; close(); _windowsCleanClose = true; return 0; }
+                    if (received < 0) { close(); return -1; }
+                    continue;
+                }
+                if (status == 590615) { close(); _windowsCleanClose = true; return 0; }
+                if (status != 0) { _error = "TLS DecryptMessage failed: " + status.toString(); close(); return -1; }
+                int plainLength = 0;
+                i8* plainData = nullptr;
+                int extra = 0;
+                for (int i = 0; i < 4; i++)
+                {
+                    if (buffers[i].BufferType == 1) { plainLength = (int)buffers[i].cbBuffer; plainData = (i8*)buffers[i].pvBuffer; }
+                    if (buffers[i].BufferType == 5) extra = (int)buffers[i].cbBuffer;
+                }
+                if (plainLength > 0)
+                {
+                    _windowsPlain = new i8[plainLength];
+                    memcpy(_windowsPlain, plainData, (i64)plainLength);
+                    _windowsPlainLength = plainLength;
+                    _windowsPlainOffset = 0;
+                }
+                // The unconsumed bytes are the tail of the ciphertext we handed to DecryptMessage.
+                if (extra > 0 && extra <= _windowsReceiveLength) memmove(&_windowsReceive[0], &_windowsReceive[_windowsReceiveLength - extra], (i64)extra);
+                _windowsReceiveLength = extra;
+                if (plainLength > 0)
+                {
+                    int count = plainLength < length ? plainLength : length;
+                    memcpy(data, _windowsPlain, (i64)count);
+                    _windowsPlainOffset = count;
+                    if (_windowsPlainOffset == _windowsPlainLength)
+                    {
+                        delete _windowsPlain;
+                        _windowsPlain = nullptr;
+                        _windowsPlainLength = 0;
+                        _windowsPlainOffset = 0;
+                    }
+                    return count;
+                }
+            }
+        }
         if const (__MACOS__) {
             if (_context == nullptr) return -1;
             u64 received = 0;
@@ -177,6 +449,34 @@ class TlsSocket
 
     void close()
     {
+        if const (__WINDOWS__) {
+            if (_windowsPlain != nullptr) { delete _windowsPlain; _windowsPlain = nullptr; }
+            if (_windowsReceive != nullptr) { delete _windowsReceive; _windowsReceive = nullptr; }
+            if (_windowsTargetName != nullptr) { delete _windowsTargetName; _windowsTargetName = nullptr; }
+            _windowsPlainLength = 0;
+            _windowsPlainOffset = 0;
+            _windowsReceiveCapacity = 0;
+            _windowsReceiveLength = 0;
+            _windowsHeader = 0;
+            _windowsTrailer = 0;
+            _windowsMaximumMessage = 0;
+            // No close_notify alert is sent: this synchronous client always reads until the
+            // peer's own close, so it drops the connection with a TCP FIN instead.
+            if (_context != nullptr)
+            {
+                if (_windowsContextAllocated) __tlsDeleteSecurityContext((_TlsSecHandle*)_context);
+                delete (_TlsSecHandle*)_context;
+                _context = nullptr;
+            }
+            _windowsContextAllocated = false;
+            _windowsContextReady = false;
+            if (_windowsCredentials != nullptr)
+            {
+                __tlsFreeCredentials((_TlsSecHandle*)_windowsCredentials);
+                delete (_TlsSecHandle*)_windowsCredentials;
+                _windowsCredentials = nullptr;
+            }
+        }
         if const (__MACOS__) {
             if (_context != nullptr) { __tlsClose(_context); __tlsRelease(_context); _context = nullptr; }
         }

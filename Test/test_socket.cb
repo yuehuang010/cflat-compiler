@@ -1,6 +1,7 @@
 import "network/socket.cb";
 import "thread.cb";
 import "time.cb";
+if const (__WINDOWS__) { import "network/tls.cb"; }
 
 int g_port = 19876;
 
@@ -36,10 +37,52 @@ int serverThread(void* arg)
 
 extern int main()
 {
+    int tlsOfflineFailures = 0;
     if (!Socket.initNetwork())
     {
         printf("FAIL: initNetwork\n");
         return 1;
+    }
+
+    if const (__WINDOWS__) {
+        // A TlsSocket with no handshake must refuse I/O through the Schannel guard,
+        // not fall through to the platform-unsupported stub.
+        TlsSocket fresh;
+        bool invalidBeforeConnect = !fresh.isValid();
+        bool writeRefused = fresh.write("x", 1) == -1 && fresh.error() == "TLS write: no context";
+        // A multi-record payload must still be refused for the missing context, not for
+        // its size: the context check has to run before any stream-size check.
+        i8* bigPayload = new i8[65536];
+        memset(bigPayload, 'x', 65536);
+        bool bigWriteRefused = fresh.write((const char*)bigPayload, 65536) == -1
+            && fresh.error() == "TLS write: no context";
+        delete bigPayload;
+        printf("%s: tls isValid false before connect\n", invalidBeforeConnect ? "PASS" : "FAIL");
+        printf("%s: tls write without handshake reports no context\n", writeRefused ? "PASS" : "FAIL");
+        printf("%s: tls oversized write without handshake reports no context\n", bigWriteRefused ? "PASS" : "FAIL");
+        if (!invalidBeforeConnect || !writeRefused || !bigWriteRefused) tlsOfflineFailures++;
+
+        TlsSocket closedPort;
+        bool connectFailed = !closedPort.connect("127.0.0.1", 1);
+        bool tcpError = closedPort.error() == "TCP connection failed";
+        bool noUnsupportedError = strstr(closedPort.error().data(), "not implemented") == nullptr;
+        bool invalidAfterFailure = !closedPort.isValid();
+        printf("%s: tls closed port rejects with TCP error\n", connectFailed && tcpError ? "PASS" : "FAIL");
+        printf("%s: tls Windows error is not unsupported\n", noUnsupportedError ? "PASS" : "FAIL");
+        printf("%s: tls closed port leaves socket invalid\n", invalidAfterFailure ? "PASS" : "FAIL");
+        if (!connectFailed || !tcpError || !noUnsupportedError) tlsOfflineFailures++;
+        if (!invalidAfterFailure) tlsOfflineFailures++;
+
+        // Two closes must leave the object reusable: a repeat connect has to reach the
+        // TCP layer again rather than a stale-state or unsupported-platform error.
+        closedPort.close();
+        closedPort.close();
+        bool doubleCloseSafe = !closedPort.isValid();
+        bool reconnectFailed = !closedPort.connect("127.0.0.1", 1);
+        bool reconnectTcpError = closedPort.error() == "TCP connection failed";
+        printf("%s: tls double close is safe\n", doubleCloseSafe ? "PASS" : "FAIL");
+        printf("%s: tls reconnect after double close still reaches TCP\n", reconnectFailed && reconnectTcpError ? "PASS" : "FAIL");
+        if (!doubleCloseSafe || !reconnectFailed || !reconnectTcpError) tlsOfflineFailures++;
     }
 
     Thread* srv = new Thread;
@@ -83,7 +126,8 @@ extern int main()
 
     Socket.shutdownNetwork();
 
-    if (ok) { printf("PASS: socket echo test\n"); }
-    else    { printf("FAIL: echo mismatch\n"); }
-    return ok ? 0 : 1;
+    if (ok && tlsOfflineFailures == 0) { printf("PASS: socket echo test\n"); }
+    else if (!ok)                      { printf("FAIL: echo mismatch\n"); }
+    else                               { printf("FAIL: %d tls offline check(s)\n", tlsOfflineFailures); }
+    return ok && tlsOfflineFailures == 0 ? 0 : 1;
 }
