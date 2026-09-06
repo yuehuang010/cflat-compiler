@@ -85,20 +85,43 @@ so its share is not reclaimable through the runtime.
   no imports): perfectly flat at 51 MB / 673k blocks. Retention scales with analysed volume
   (imports, bound headers), not with file or symbol count.
 
-## Fix direction (NOT ratified - needs a maintainer ruling)
+## Fix direction
 
-- Bound `cFileSigCache_`. It is the biggest win and the easiest to reason about: it is pure
-  cache, rebuildable, and one windows.h entry costs ~100 MB. Options: an LRU cap, an entry
-  budget, or dropping it to the on-disk C header cache after first use. Also dedupe the
-  key so one header is not stored twice under two include-dir sets.
-- Bound `parseTreeCache_`. Core trees are worth keeping (parsed once, reused every file);
-  user-import trees are not, and they are what grows over a large tree. An LRU over the
-  non-core half is the minimal change.
-- Clear the ANTLR parser+lexer DFA on a threshold (state count or files-since-last-clear),
+Items 1 and 2 LANDED 2026-09-05 (branch `fix/lsp-cache-bounds`). Item 3 is the sole open item.
+
+- **DONE - `cFileSigCache_` row-budget LRU.** Entries carry `lastUse` + `rows`;
+  `InsertCFileSigEntry` / `TouchCFileSigEntry` (`LLVMBackend.h`) maintain a running row total
+  under `cFileSigCacheMutex_` and evict the least recently used entry while the total exceeds
+  `kCFileSigCacheRowBudget` = 120000 rows (about two windows.h bindings). The entry just
+  inserted is never the victim, so a single over-budget entry stays. Disk-cache writes still
+  happen before the insert, so an evicted `cache`-clause header reloads from disk, not clang.
+- **DONE - `parseTreeCache_` ageing.** `CachedParseTree::lastUse` + per-backend
+  `parseTreeClock_`; `AgeOutNonCoreParseTrees` runs at the end of `ResetForReanalysis` (after
+  `gts.Clear()` drops the ctx pointers) and erases every entry older than
+  `kParseTreeMaxAge` = 2 resets whose canonical path is not under `weakly_canonical(runtimeDir/core)`.
+  Core trees are kept unconditionally. Measured after the fix: macOS Release bulk sweep
+  (`lsp_bulk_test.py`, 181 files, `--lsp-pool-size 4`) peaks at 1.31 GB max RSS.
+
+### Still open
+
+- **Item 3 - ANTLR DFA clearing.** ON HOLD by maintainer ruling 2026-09-05; do not touch the
+  parser statics. Clear the parser+lexer DFA on a threshold (state count or files-since-clear),
   not every reset (-102 MB, +10% time if done every time). Capped by the unclearable
   `PredictionContextCache`.
-
-None of this is a correctness bug, so it is sizing/policy work, not a fix - hence p2.
+- **Sub-defect: `cFileSigCache_` key dedupe.** Still unfixed and deliberately out of scope of
+  the two commits above. The key is `"<canonical .h>|<include dirs>"`, so the same header
+  reached under a different include-dir set (or via the `cache` clause) is stored a second
+  time - `test_windows_cache.cb` adds a second ~54k-row copy of windows.h. The LRU bounds the
+  cost but does not dedupe it.
+- **Low: disk-cache write can miss under concurrent eviction.** In
+  `LLVMBackend_StateAndImports.cpp` (~2183) the package-header path re-looks up the entry after
+  `CompileCHeader` to feed `WriteCHeaderDiskCache`. Another pool thread inserting a large header
+  in between can evict it, so the disk write is silently skipped and the NEXT process pays
+  clang again. Correctness unaffected. Fix when touched: have `CompileCHeader` hand back the
+  entry instead of re-looking it up.
+- **macOS measurement 2026-09-05** (181-file sweep, no windows.h bindings, so item 1 never
+  fires): peak RSS pool 4 1.29 GB -> 1.25 GB, pool 1 646 MB -> 572 MB. The remaining growth on
+  this host is core trees x pool plus the ANTLR statics (item 3).
 
 ## Side finding (separate defect, should be its own issue)
 

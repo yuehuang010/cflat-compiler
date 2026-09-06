@@ -3303,10 +3303,19 @@ private:
         std::unique_ptr<antlr4::CommonTokenStream> tokens;
         std::unique_ptr<CFlatParser> parser;
         CFlatParser::CompilationUnitContext* unit = nullptr;  // owned by `parser`
+        uint64_t lastUse = 0;   // parseTreeClock_ stamp of the last hit or insert
     };
     // All imported parse trees are cached for the process lifetime and validated by mtime
     // and size before reuse.
     std::unordered_map<std::string, std::unique_ptr<CachedParseTree>> parseTreeCache_;
+    // Bumped once per ResetForReanalysis; non-core trees unused for this many resets are
+    // dropped. Core trees are parsed once and reused by every file, so they are never aged out.
+    uint64_t parseTreeClock_ = 0;
+    static constexpr uint64_t kParseTreeMaxAge = 2;
+    // weakly_canonical(runtimeDir/core), built lazily alongside coreFileNames_.
+    mutable std::filesystem::path canonicalCoreDir_;
+    mutable bool canonicalCoreDirResolved_ = false;
+    void AgeOutNonCoreParseTrees();
     struct CoreHashCacheEntry
     {
         std::filesystem::path canonicalRuntimeDir;

@@ -2708,6 +2708,7 @@ LLVMBackend::CachedParseTree* LLVMBackend::GetOrParseFile(const std::string& can
         {
             llvm::TimeTraceScope cacheScope("Parse", "cached:" + displayName);
             if (verbose) std::cout << std::format("[verbose]   parse cache hit: {}\n", displayName);
+            it->second->lastUse = parseTreeClock_;
             return it->second.get();
         }
         parseTreeCache_.erase(it);  // stale or unstatable - re-parse below
@@ -2760,6 +2761,7 @@ LLVMBackend::CachedParseTree* LLVMBackend::GetOrParseFile(const std::string& can
     std::error_code sec;
     entry->writeTime = std::filesystem::last_write_time(canonicalPath, tec);
     entry->fileSize = std::filesystem::file_size(canonicalPath, sec);
+    entry->lastUse = parseTreeClock_;
     parseTreeCache_[canonicalPath] = std::move(entry);
     return raw;
 }
@@ -3990,6 +3992,36 @@ bool LLVMBackend::RootFileNameIsCore(const std::string& fileName) const
     return coreFileNames_.count(fileName) != 0;
 }
 
+// Drop cached parse trees for USER imports that no recent analysis touched. Core trees
+// (runtimeDir/core) are parsed once and reused by every file, so they are always kept.
+void LLVMBackend::AgeOutNonCoreParseTrees()
+{
+    ++parseTreeClock_;
+    if (parseTreeCache_.empty()) return;
+    // Latch only once runtimeDir is known; resolving early would leave the core dir empty
+    // and age out core trees for the rest of the process.
+    if (!canonicalCoreDirResolved_ && !runtimeDir.empty())
+    {
+        std::error_code ec;
+        auto dir = std::filesystem::weakly_canonical(std::filesystem::path(runtimeDir) / "core", ec);
+        if (!ec) { canonicalCoreDir_ = dir; canonicalCoreDirResolved_ = true; }
+    }
+    const std::string coreDir = canonicalCoreDir_.empty() ? std::string() : canonicalCoreDir_.string();
+    for (auto it = parseTreeCache_.begin(); it != parseTreeCache_.end();)
+    {
+        const std::string& path = it->second->canonicalPath;
+        bool isCore = !coreDir.empty() && path.size() > coreDir.size()
+                   && path.compare(0, coreDir.size(), coreDir) == 0
+                   && (path[coreDir.size()] == '/' || path[coreDir.size()] == '\\');
+        if (!isCore && parseTreeClock_ - it->second->lastUse > kParseTreeMaxAge)
+        {
+            if (verbose) std::cout << std::format("[verbose] parse cache aged out: {}\n", it->first);
+            it = parseTreeCache_.erase(it);
+        }
+        else ++it;
+    }
+}
+
 bool LLVMBackend::Analyze(const std::string& filePath,
                               const std::vector<std::string>& importDirs,
                               const std::string& runtimeDirPath)
@@ -4606,6 +4638,10 @@ void LLVMBackend::ResetForReanalysis()
     // Generic-template state must also be cleared so prior-analysis ANTLR contexts
     // (which point into a discarded parse tree) don't survive into the next run.
     gts.Clear();
+
+    // Only now that gts holds no ctx pointers into them: drop user-import parse trees that
+    // no recent analysis touched. Core trees are kept, and a survivor is revalidated on use.
+    AgeOutNonCoreParseTrees();
 
     // Re-register the built-in string type that was wiped by the clears above.
     // string.cb references 'string' as a return type before the struct is parsed,
