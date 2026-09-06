@@ -111,6 +111,22 @@ static bool DecodeSimdSpelling(const std::string& text, std::string& elemOut, ui
 }
 
 /*
+ * A FIXED array indexes by its OWN element, so every door that judges an element must see it as
+ * the view it decays to. A fixed array spells the element's star in `Pointer` ('int*[2]') where a
+ * view spells the same depth in `ElemPointer`, so the depth is carried over - without that carry
+ * every 'T*[N]' reads as a 'T' element. A simd value is not an element source.
+ */
+bool LLVMBackend::ReshapeFixedArrayAsView(LLVMBackend::TypeAndValue& typeAndValue) const
+{
+        if (typeAndValue.IsArrayView || typeAndValue.ConstArraySize == 0 || typeAndValue.IsSimd)
+            return false;
+        typeAndValue.ElemPointer = typeAndValue.ElemPointer || typeAndValue.Pointer;
+        typeAndValue.Pointer = false;
+        typeAndValue.IsArrayView = true;
+        return true;
+}
+
+/*
  * A view SOURCE indexes by its ELEMENT, so binding it to a destination whose element differs
  * strides and loads with the wrong shape (silent garbage, or a raw verifier failure when the
  * loaded kind changes). Proves the difference before rejecting: the ELEMENT pointer depth, or -
@@ -126,15 +142,7 @@ bool LLVMBackend::ArrayViewElementMismatch(const LLVMBackend::TypeAndValue& dest
         // its own element too. Scoped to a view destination: the one-way 'T[] -> T*' decay keeps
         // its own byte/scalar reinterpret rules, and a simd value is not an element source.
         LLVMBackend::TypeAndValue shapedSrc = rawSrc;
-        if (!shapedSrc.IsArrayView && shapedSrc.ConstArraySize != 0 && dest.IsArrayView
-            && !shapedSrc.IsSimd)
-        {
-            // A fixed array spells its element's star in 'Pointer' ('int*[2]'); a view spells the
-            // same depth in 'ElemPointer'. Carry it over or every 'T*[N]' reads as a 'T' element.
-            shapedSrc.ElemPointer = shapedSrc.ElemPointer || shapedSrc.Pointer;
-            shapedSrc.Pointer = false;
-            shapedSrc.IsArrayView = true;
-        }
+        if (dest.IsArrayView) ReshapeFixedArrayAsView(shapedSrc);
         const LLVMBackend::TypeAndValue& src = shapedSrc;
         if (!src.IsArrayView) return false;
         if (!dest.IsArrayView && !dest.Pointer) return false;

@@ -4037,6 +4037,14 @@ private:
      */
     std::string ResolvePointerElementTypeName(llvm::Value* value) const;
 
+    /*
+     * Reshape a FIXED array into the array VIEW it decays to, so it is compared by its OWN
+     * element. A fixed array spells the element's star in `Pointer`; a view spells the same
+     * depth in `ElemPointer`, so the depth is carried over. Returns false (untouched) for a
+     * view, a simd value and a non-array.
+     */
+    bool ReshapeFixedArrayAsView(TypeAndValue& typeAndValue) const;
+
     // Element identity of a '?:' join of two array views (see viewJoinTypes_).
     void RegisterViewJoinType(llvm::Value* value, const TypeAndValue& elementType);
     const TypeAndValue* FindViewJoinType(llvm::Value* value) const;

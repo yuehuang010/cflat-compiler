@@ -822,17 +822,48 @@ bool LLVMBackend::RejectArrayViewParamBinding(const NamedVariable& arg, const Ty
         // the declared element name from the named variable so the message can spell it.
         LLVMBackend::TypeAndValue argTV = arg.TypeAndValue;
         if (argTV.TypeName.empty() && !arg.CallerName.empty())
-            if (const NamedVariable* declared = FindLiveNamedVariable(arg.CallerName))
+        {
+            if (const NamedVariable* live = FindLiveNamedVariable(arg.CallerName))
             {
-                if (arg.FieldName.empty() && declared->TypeAndValue.IsArrayView)
-                    argTV.TypeName = declared->TypeAndValue.TypeName;
+                const TypeAndValue* declared = &live->TypeAndValue;
+                if (arg.FieldName.empty() && declared->IsArrayView)
+                    argTV.TypeName = declared->TypeName;
+                // A FIXED array argument decays to a thin pointer whose element name was dropped
+                // (only ConstArraySize survives), so recover the name and the element's star from
+                // the declaration - a decayed ELEMENT or row carries no ConstArraySize and is left
+                // unnamed, so this never renames a sub-object of the array.
+                else if (arg.FieldName.empty() && argTV.ConstArraySize != 0 && !argTV.IsArrayView
+                         && !argTV.IsSimd && declared->ConstArraySize != 0
+                         && !declared->IsArrayView && !declared->IsSimd)
+                {
+                    argTV.TypeName = declared->TypeName;
+                    argTV.Pointer = argTV.Pointer || declared->Pointer;
+                }
                 // A FIELD read: CallerName names the base struct, so the element name
                 // lives on the field's declaration, not on the base's TypeName.
-                else if (auto base = dataStructures.find(declared->TypeAndValue.TypeName);
+                else if (auto base = dataStructures.find(declared->TypeName);
                          !arg.FieldName.empty() && base != dataStructures.end())
                     for (const auto& f : base->second.StructFields)
-                        if (f.VariableName == arg.FieldName && f.IsArrayView)
+                        if (f.VariableName == arg.FieldName
+                            && (f.IsArrayView
+                                || (argTV.ConstArraySize != 0 && !argTV.IsArrayView
+                                    && !argTV.IsSimd && f.ConstArraySize != 0 && !f.IsSimd)))
+                        {
                             argTV.TypeName = f.TypeName;
+                            if (!f.IsArrayView) argTV.Pointer = argTV.Pointer || f.Pointer;
+                        }
+            }
+        }
+        // A GLOBAL fixed array carries no CallerName at all, so reach its declaration through the
+        // storage it was addressed from - the only handle on a global at this door.
+        if (argTV.TypeName.empty() && argTV.ConstArraySize != 0 && !argTV.IsArrayView
+            && !argTV.IsSimd)
+            if (const TypeAndValue* declared = FindDeclaredTypeAndValueForStorage(arg.Storage);
+                declared != nullptr && declared->ConstArraySize != 0 && !declared->IsArrayView
+                && !declared->IsSimd)
+            {
+                argTV.TypeName = declared->TypeName;
+                argTV.Pointer = argTV.Pointer || declared->Pointer;
             }
         if (ArrayViewElementMismatch(param, argTV, destElement, srcElement))
         {

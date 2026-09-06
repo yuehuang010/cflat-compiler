@@ -4872,6 +4872,25 @@ bool MainListener::TernaryArmViewType(llvm::Value* value, llvm::Value* storage,
                 return true;
             }
         }
+        // A FIXED array arm never loads: it decays to an all-zero GEP off its own storage, so
+        // recover that storage. It indexes by its OWN element, so name it and reshape it into
+        // the view it decays to.
+        const llvm::Value* arrayStorage = storage;
+        if (arrayStorage == nullptr)
+            if (auto* gep = llvm::dyn_cast<llvm::GEPOperator>(value);
+                gep != nullptr && gep->getSourceElementType()->isArrayTy()
+                && gep->hasAllZeroIndices())
+                arrayStorage = gep->getPointerOperand();
+        const llvm::Value* fixedSlot = arrayStorage != nullptr ? arrayStorage : value;
+        const auto* fixed = compiler->FindDeclaredTypeAndValueForStorage(fixedSlot);
+        // A fixed-array FIELD names no local slot; its element lives on the field's declaration.
+        if (fixed == nullptr && arrayStorage != nullptr)
+            fixed = compiler->FindDeclaredFieldTypeAndValueForStorage(arrayStorage);
+        if (fixed != nullptr && !fixed->IsArrayView && fixed->ConstArraySize != 0)
+        {
+            LLVMBackend::TypeAndValue shaped = *fixed;
+            if (compiler->ReshapeFixedArrayAsView(shaped)) { out = shaped; return true; }
+        }
         // A FIELD read names no local slot; its element lives on the field's declaration.
         if (ViewFieldElementForRead(value, storage, out)) return true;
         if (auto* call = llvm::dyn_cast<llvm::CallInst>(value))

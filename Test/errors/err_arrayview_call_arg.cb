@@ -365,3 +365,88 @@ namespace BpnNs { enum Dir : int { D_ZERO = 0, D_ONE = 1 }; }
 expect_error("cannot bind a 'BpnNs.Dir' value to array view 'BpnNs.Dir[]'") {
     int bpnnCall() { BpnNs.Dir[] v = BpnNs.Dir.D_ONE; return (int)v[0]; }
 }
+
+// FIXED-ARRAY element axis at the CALL-ARGUMENT door. A fixed array decays to a thin pointer
+// whose element name is dropped, so the element compare took its unnamed escape and the callee
+// strode 'Cfp' slots over 'CfqOther' storage: 'v[1].k' read 'a[0].b' (22 where 33 was stored).
+expect_error("cannot pass an array view of 'CfqOther' as parameter 'v' of 'cfqTake'") {
+    struct Cfp { int k = default; };
+    struct CfqOther { int a = default; int b = default; };
+    int cfqTake(Cfp[] v) { return v[1].k; }
+    int cfqCall() { CfqOther[2] a; return cfqTake(a); }
+}
+
+// PRIMITIVE twin of the same door: the element widths differ, so the callee strides wrong.
+expect_error("cannot pass an array view of 'int' as parameter 'v' of 'cfnTake'") {
+    long cfnTake(long[] v) { return v[1]; }
+    int cfnCall() { int[3] a; return (int)cfnTake(a); }
+}
+
+// INTERFACE twin of the same door: a fixed array of an IMPLEMENTOR indexes thin objects, so the
+// callee's 'IA[]' forged a fat view over them and the call exited 139 at v[1].val().
+expect_error("cannot pass an array view of 'CfiImpl' as parameter 'v' of 'cfiTake'") {
+    interface CfiIface { int val(); };
+    class CfiImpl : CfiIface { int v = default; int val() { return this.v; } };
+    int cfiTake(CfiIface[] v) { return v[1].val(); }
+    int cfiCall() { CfiImpl[2] a; return cfiTake(a); }
+}
+
+// Same door reached through a METHOD receiver rather than a free call.
+expect_error("cannot pass an array view of 'CfmOther' as parameter 'v' of 'cfmTake'") {
+    struct Cfm { int k = default; };
+    struct CfmOther { int a = default; int b = default; };
+    class CfmHost { int cfmTake(Cfm[] v) { return v[1].k; } };
+    int cfmCall() { CfmOther[2] a; CfmHost h; return h.cfmTake(a); }
+}
+
+// Same door reached through VIRTUAL dispatch: a vtable slot lowers its own arguments.
+expect_error("cannot pass an array view of 'CfvOther' as parameter 'v' of 'ICfv.cfvTake'") {
+    struct Cfv { int k = default; };
+    struct CfvOther { int a = default; int b = default; };
+    interface ICfv { int cfvTake(Cfv[] v); };
+    class CfvHost : ICfv { int cfvTake(Cfv[] v) { return v[1].k; } };
+    int cfvCall() { CfvOther[2] a; CfvHost h; ICfv i = h; return i.cfvTake(a); }
+}
+
+// '?:' JOIN door. A fixed-array arm never loads - it decays to an all-zero GEP off its own
+// storage - so the arm named no element and the join handed the destination a 'CfjOther'-strided
+// view spelled 'Cfj[]': 'j[1].k' read 'a[0].b'.
+expect_error("cannot join an array view of 'Cfj' with an array view of 'CfjOther' in a '?:'") {
+    struct Cfj { int k = default; };
+    struct CfjOther { int a = default; int b = default; };
+    int cfjCall(int c) { Cfj[2] p; Cfj[] pv = p; CfjOther[2] a; Cfj[] j = c != 0 ? pv : a; return j[1].k; }
+}
+
+// The '??' spelling of the same join.
+expect_error("cannot join an array view of 'Cfc' with an array view of 'CfcOther' in a '??'") {
+    struct Cfc { int k = default; };
+    struct CfcOther { int a = default; int b = default; };
+    int cfcCall() { Cfc[] pv = nullptr; CfcOther[2] a; Cfc[] j = pv ?? a; return j[1].k; }
+}
+
+// A GLOBAL fixed array reaches the call door with no caller NAME at all, so its element is
+// recovered from its storage; without that it took the unnamed escape like the local row.
+expect_error("cannot pass an array view of 'CfgOther' as parameter 'v' of 'cfgTake'") {
+    struct Cfg { int k = default; };
+    struct CfgOther { int a = default; int b = default; };
+    CfgOther[2] cfgGlobal;
+    int cfgTake(Cfg[] v) { return v[1].k; }
+    int cfgCall() { return cfgTake(cfgGlobal); }
+}
+
+// The same '?:' join arm read out of a struct FIELD, which names no local slot: its element
+// lives on the field's declaration, so without that recovery the join stayed unnamed.
+expect_error("cannot join an array view of 'Cfk' with an array view of 'CfkOther' in a '?:'") {
+    struct Cfk { int k = default; };
+    struct CfkOther { int a = default; int b = default; };
+    struct CfkHost { CfkOther[2] arr = default; };
+    int cfkCall(int c) { Cfk[2] p; Cfk[] pv = p; CfkHost h = default; Cfk[] j = c != 0 ? pv : h.arr; return j[1].k; }
+}
+
+// A GLOBAL fixed array as the other join arm.
+expect_error("cannot join an array view of 'Cfh' with an array view of 'CfhOther' in a '?:'") {
+    struct Cfh { int k = default; };
+    struct CfhOther { int a = default; int b = default; };
+    CfhOther[2] cfhGlobal;
+    int cfhCall(int c) { Cfh[2] p; Cfh[] pv = p; Cfh[] j = c != 0 ? pv : cfhGlobal; return j[1].k; }
+}

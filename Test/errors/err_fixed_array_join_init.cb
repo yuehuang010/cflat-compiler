@@ -11,9 +11,11 @@ extern int main(int argc, char** argv)
         char[8] b = argc > 1 ? "hello" : "world";
     }
 
-    // '?:' whose arms are both fixed arrays: they decay to pointers before the join,
-    // so the result still carries no array length to size a copy from.
-    expect_error("cannot initialize fixed array 'char[8]' from a pointer-valued expression") {
+    // '?:' whose arms are both fixed arrays: they decay before the join, so the result still
+    // carries no array length to size a copy from. Both arms name the same ELEMENT, so the join
+    // is a 'char[]' view and the view-shaped half of the same guard names it - one rejection
+    // either way; the element identity is what the call/join element gate needs.
+    expect_error("cannot initialize fixed array 'char[8]' from array-view 'char[]'") {
         char[8] x = default;
         char[8] y = default;
         char[8] c = argc > 1 ? x : y;
