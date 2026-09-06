@@ -1553,6 +1553,7 @@ bool LLVMBackend::ExtractCSignatures(const std::string& cSourcePath, const std::
                 if (entry.mtime == currentMtime)
                 {
                     if (verbose) std::cout << std::format("[verbose] C signatures cache hit (mtime) for {}\n", fileForLsp);
+                    TouchCFileSigEntry(entry);
                     hitSigs = entry.sigs;
                     hitRecords = entry.records;
                     hitGlobals = entry.globals;
@@ -1563,6 +1564,7 @@ bool LLVMBackend::ExtractCSignatures(const std::string& cSourcePath, const std::
                 {
                     if (verbose) std::cout << std::format("[verbose] C signatures cache hit (hash) for {}\n", fileForLsp);
                     entry.mtime = currentMtime; // refresh so the next check short-circuits on mtime
+                    TouchCFileSigEntry(entry);
                     hitSigs = entry.sigs;
                     hitRecords = entry.records;
                     hitGlobals = entry.globals;
@@ -1597,7 +1599,7 @@ bool LLVMBackend::ExtractCSignatures(const std::string& cSourcePath, const std::
             entry.records = records;
             entry.globals = globals;
             std::lock_guard<std::mutex> lock(cFileSigCacheMutex_);
-            cFileSigCache_[cacheKey] = std::move(entry);
+            InsertCFileSigEntry(cacheKey, std::move(entry), verbose);
         }
 
         // Records were already registered inside ExtractCFileClang (so it could map
@@ -2565,6 +2567,7 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
                 if (entry.mtime == currentMtime)
                 {
                     if (verbose) std::cout << std::format("[verbose] C header cache hit (mtime) for {}\n", fileForLsp);
+                    TouchCFileSigEntry(entry);
                     hitSigs = entry.sigs; hitEnums = entry.enums; hitRecords = entry.records;
                     hitMacros = entry.macros; hitFuncMacros = entry.funcMacros; hitGlobals = entry.globals;
                     hitAliases = entry.recordAliases; hit = true;
@@ -2574,6 +2577,7 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
                 {
                     if (verbose) std::cout << std::format("[verbose] C header cache hit (hash) for {}\n", fileForLsp);
                     entry.mtime = currentMtime;
+                    TouchCFileSigEntry(entry);
                     hitSigs = entry.sigs; hitEnums = entry.enums; hitRecords = entry.records;
                     hitMacros = entry.macros; hitFuncMacros = entry.funcMacros; hitGlobals = entry.globals;
                     hitAliases = entry.recordAliases; hit = true;
@@ -2628,7 +2632,7 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
                 if (verbose) std::cout << std::format("[verbose] C header disk cache hit for {}\n", fileForLsp);
                 {
                     std::lock_guard<std::mutex> lock(cFileSigCacheMutex_);
-                    cFileSigCache_[cacheKey] = diskEntry;
+                    InsertCFileSigEntry(cacheKey, CFileSigCacheEntry(diskEntry), verbose);
                 }
                 llvm::TimeTraceScope registerScope("CHeaderRegister", fileForLsp);
                 RegisterCRecords(diskEntry.records, fileForLsp);
@@ -2722,7 +2726,7 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
             if (diskCache && !runMode_ && !cHeaderCacheDir.empty())
                 WriteCHeaderDiskCache(cHeaderCacheDir, diskKey, currentMtime, hashNow(), entry);
             std::lock_guard<std::mutex> lock(cFileSigCacheMutex_);
-            cFileSigCache_[cacheKey] = std::move(entry);
+            InsertCFileSigEntry(cacheKey, std::move(entry), verbose);
         }
 
         // Records were already registered inside ExtractCHeaderClang.

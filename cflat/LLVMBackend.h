@@ -3193,6 +3193,8 @@ private:
         std::vector<std::pair<std::string, std::string>> recordAliases;
         std::vector<CTypeAliasEntry> typeAliases;
         std::vector<CHeaderDep> deps;
+        uint64_t lastUse = 0;  // cFileSigCacheClock_ stamp of the last hit or insert
+        size_t rows = 0;       // summed size of every vector above, for the row budget
     };
     // Unresolved object-like aliases are retried after later C imports. Unknown aliases stay
     // here until the compile ends and are intentionally never diagnosed.
@@ -3201,6 +3203,53 @@ private:
     // Key: canonical .c path, or for bound headers "<canonical .h>|<include dirs>" so the
     // same header under different --c-include roots does not collide.
     static inline std::unordered_map<std::string, CFileSigCacheEntry> cFileSigCache_;
+    // LRU bookkeeping for the map above. Both mutate only under cFileSigCacheMutex_.
+    static inline uint64_t cFileSigCacheClock_ = 0;
+    static inline size_t cFileSigCacheRows_ = 0;
+    // Row budget. One windows.h binding is ~54k rows / ~105 MB, so this holds roughly two
+    // large headers plus the small entries; the cache is pure, rebuildable state.
+    static constexpr size_t kCFileSigCacheRowBudget = 120000;
+
+    static size_t CFileSigEntryRows(const CFileSigCacheEntry& entry)
+    {
+        return entry.sigs.size() + entry.enums.size() + entry.records.size()
+             + entry.macros.size() + entry.funcMacros.size() + entry.globals.size()
+             + entry.recordAliases.size() + entry.typeAliases.size() + entry.deps.size();
+    }
+    // Caller must hold cFileSigCacheMutex_. Marks an entry as most recently used.
+    static void TouchCFileSigEntry(CFileSigCacheEntry& entry)
+    {
+        entry.lastUse = ++cFileSigCacheClock_;
+    }
+    // Caller must hold cFileSigCacheMutex_. Inserts (or replaces) an entry, then evicts the
+    // least recently used entries until the row budget is met. The new entry is never evicted.
+    static void InsertCFileSigEntry(const std::string& key, CFileSigCacheEntry&& entry,
+                                    bool verbose)
+    {
+        entry.rows = CFileSigEntryRows(entry);
+        entry.lastUse = ++cFileSigCacheClock_;
+        const size_t addedRows = entry.rows;
+        auto existing = cFileSigCache_.find(key);
+        if (existing != cFileSigCache_.end()) cFileSigCacheRows_ -= existing->second.rows;
+        cFileSigCache_[key] = std::move(entry);
+        cFileSigCacheRows_ += addedRows;
+        while (cFileSigCacheRows_ > kCFileSigCacheRowBudget)
+        {
+            auto victim = cFileSigCache_.end();
+            for (auto it = cFileSigCache_.begin(); it != cFileSigCache_.end(); ++it)
+            {
+                if (it->first == key) continue;
+                if (victim == cFileSigCache_.end() || it->second.lastUse < victim->second.lastUse)
+                    victim = it;
+            }
+            if (victim == cFileSigCache_.end()) break;  // only the new entry left - keep it
+            if (verbose)
+                std::cout << std::format("[verbose] C signatures cache evicted {} ({} rows)\n",
+                                         victim->first, victim->second.rows);
+            cFileSigCacheRows_ -= victim->second.rows;
+            cFileSigCache_.erase(victim);
+        }
+    }
     int lambdaCounter = 0;
     int pipeStreamCounter = 0;   // uniquifies synthesized hidden `stream` locals for `producer >> consumer` piping
     std::string expectedError;

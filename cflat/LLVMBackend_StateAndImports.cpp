@@ -2164,7 +2164,7 @@ bool LLVMBackend::BindCanonicalCHeader(const std::filesystem::path& headerCanon,
             if (TryLoadCHeaderDiskCache(pkgCacheDir, diskKey, headerMtime, contentHash, diskEntry))
             {
                 std::lock_guard<std::mutex> lock(cFileSigCacheMutex_);
-                cFileSigCache_[inMemKey] = std::move(diskEntry);
+                InsertCFileSigEntry(inMemKey, std::move(diskEntry), verbose);
                 diskHit = true;
                 if (verbose)
                     std::cout << std::format("[verbose] package header disk cache hit: {}\n", fileForLsp);
