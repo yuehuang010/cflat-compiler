@@ -1,12 +1,18 @@
-// A user `extern` whose bare name collides with a namespaced core-library extern
-// (os.windows.WriteFile, materialized in every program) must be rejected with a clear
-// diagnostic. The core symbol lives under its namespace in the function table, so a
-// bare user extern does not match it there; without this check getOrInsertFunction would
-// hand back the existing function while the call coerces args to the user's differing
-// types, tripping an LLVM "bad signature" assert at codegen.
-expect_error("conflicting declaration of extern 'WriteFile'") {
-    extern u32 WriteFile(void* h, void* buf, u64 n, void* written, void* ov);
-}
+// A C prototype that reaches a linkage name already owned by a core-library extern, at a
+// DIFFERENT llvm FunctionType, must be diagnosed and name the header it came from. Core
+// declares `extern void putn(const char* buf, int len)`; library/extern_conflict_core.h
+// declares `int putn(long long)`. "First writer wins" would bind core's and drop the C one,
+// so the call site would coerce to the C spelling and dispatch to the core callee.
+//
+// This is an IMPORT-TIME diagnostic (raised during ProcessImports, before the listener walk),
+// so it needs the bare-semicolon expect_error at file scope - a scoped block closes before
+// imports run. That expectation covers the rest of this file, so a second (scoped) leg here
+// would never be reached: the hand-written repeat-extern legs live in err_declarations.cb.
+//
+// The AGREEING case is the common one and must stay silent - `import "windows.h"` re-declares
+// core names such as Sleep and WriteFile at identical types (Test/test_windows.cb).
+expect_error("conflicting declaration of extern 'putn' from C import");
+import "extern_conflict_core.h";
 
 extern int main()
 {

@@ -365,6 +365,42 @@ std::string LLVMBackend::ShortenDefSiteForDisplay(const std::string& site, bool 
         return p.filename().string() + suffix;
     }
 
+std::string LLVMBackend::ShortenImportPathForDisplay(const std::string& path) const
+{
+        std::filesystem::path p(path);
+        std::error_code ec;
+        auto rel = std::filesystem::relative(p, ec);
+        if (!ec && !rel.empty() && !RelativePathEscapesUp(rel))
+            return rel.string();
+        return p.filename().string();
+    }
+
+std::string LLVMBackend::SpellExistingLinkageSignature(const std::string& mangledName,
+                                                       llvm::Function* existing) const
+{
+        for (const auto& [key, syms] : functionTable)
+            for (const auto& sym : syms)
+                if (sym.External && sym.UniqueName == mangledName)
+                    return SpellDeclaredSignature(sym.ReturnType, sym.Parameters, sym.Variadic);
+
+        // No CFlat declaration owns the symbol (a compiler-emitted runtime helper). Print the
+        // lowered type rather than invent a spelling - it is a type, not a user-facing name.
+        std::string lowered;
+        llvm::raw_string_ostream stream(lowered);
+        if (existing != nullptr) existing->getFunctionType()->print(stream);
+        return lowered.empty() ? std::string("<unknown>") : lowered;
+    }
+
+bool LLVMBackend::IsCoreFileIoLinkageName(const std::string& linkageName)
+{
+        static constexpr std::string_view names[] = {
+            "fopen", "fclose", "fread", "fwrite", "fgets", "feof", "fseek", "ftell"
+        };
+        for (std::string_view name : names)
+            if (name == linkageName) return true;
+        return false;
+    }
+
 llvm::BasicBlock* LLVMBackend::CreateBasicBlock(std::string name, llvm::Function* fn)
 {
         if (fn == nullptr)
@@ -1329,12 +1365,41 @@ void LLVMBackend::CreateFunctionDeclaration(const std::string& functionName, con
             // signature" assert at codegen. Reject with a clear diagnostic instead.
             if (external && existing->getFunctionType() != functionType)
             {
+                const std::string shownName = SpellFunctionSymbol(*this, functionName);
+                const std::string declared  = SpellDeclaredSignature(returnType, arguments, varargs);
+                const std::string existingSignature = SpellExistingLinkageSignature(mangledName, existing);
+
+                // A prototype the user did not write: naming the .c/header is the only way to
+                // point at it, and "rename your extern" is not a remedy the C route has.
+                if (!cInteropDeclarationFile_.empty())
+                {
+                    LogErrorMessage(
+                        "conflicting declaration of extern '{}' from C import '{}': the linkage "
+                        "name is already declared as '{}', but the C prototype is '{}'. Remove or "
+                        "correct one of them - a linkage name binds one signature.",
+                        { shownName, ShortenImportPathForDisplay(cInteropDeclarationFile_),
+                          existingSignature, declared });
+                    return;
+                }
+
+                // The file-I/O remedy is only true for the stdio names os.windows actually
+                // republishes, so it lives in its own message rather than in every conflict.
+                if (IsCoreFileIoLinkageName(mangledName))
+                {
+                    LogErrorMessage(
+                        "conflicting declaration of extern '{}': the linkage name is already "
+                        "declared as '{}', but this declaration is '{}'. Rename your extern, or "
+                        "call the existing one - for file I/O use "
+                        "os.windows.fopen/fread/fwrite/fclose.",
+                        { shownName, existingSignature, declared });
+                    return;
+                }
+
                 LogErrorMessage(
-                    "conflicting declaration of extern '{}': a function with this linkage "
-                    "name already exists with a different signature (e.g. in a core library "
-                    "such as os.windows). Rename your extern, or call the existing one "
-                    "(for file I/O use os.windows.fopen/fread/fwrite/fclose).",
-                    { SpellFunctionSymbol(*this, functionName) });
+                    "conflicting declaration of extern '{}': the linkage name is already declared "
+                    "as '{}', but this declaration is '{}'. Rename your extern, or call the "
+                    "existing one.",
+                    { shownName, existingSignature, declared });
                 return;
             }
         }

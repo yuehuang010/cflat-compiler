@@ -61,6 +61,30 @@ static std::string PointerStars(const LLVMBackend::TypeAndValue& tv)
     return (deep && tv.DepthIsAboutThisValue()) ? "**" : "*";
 }
 
+// A declared signature in CFlat spelling, e.g. "int(char*, ...)". Spells each type the way the
+// "no overload matches" candidate list does (SpellType, PointerStars as the fallback), so `const`
+// and the calling convention are not shown - neither can be why two signatures conflict.
+std::string LLVMBackend::SpellDeclaredSignature(const TypeAndValue& returnType,
+                                               const std::vector<TypeAndValue>& parameters,
+                                               bool varargs) const
+{
+        auto spell = [&](const TypeAndValue& tv) {
+            std::string result = SpellType(*this, tv);
+            if (result.empty()) result = tv.TypeName + PointerStars(tv);
+            return result;
+        };
+
+        std::string signature = spell(returnType) + "(";
+        for (size_t i = 0; i < parameters.size(); i++)
+        {
+            if (i > 0) signature += ", ";
+            if (parameters[i].IsMove) signature += "move ";
+            signature += spell(parameters[i]);
+        }
+        if (varargs) signature += parameters.empty() ? "..." : ", ...";
+        return signature + ")";
+    }
+
 bool LLVMBackend::ArgumentNarrowsParameter(const NamedVariable& arg, const TypeAndValue& param) const
 {
         if (arg.TypeAndValue.Pointer || param.Pointer) return false;

@@ -827,9 +827,13 @@ void LLVMBackend::RegisterCSignatures(const std::vector<CSigEntry>& sigs, const 
                 regName = "__imported_main_" + programAlias;
 
             // external=true: unmangled name + C-compatible types; cdecl on the call.
-            CreateFunctionDeclaration(regName, e.ret, e.params, /*external=*/true, e.variadic,
-                                      /*returnsOwned=*/false, /*isMethod=*/false,
-                                      CallingConv::Cdecl);
+            // Declaring .c/header published for the call (RAII: LogError throws).
+            {
+                CInteropDeclarationScope declaringFile(*this, e.file.empty() ? fileForLsp : e.file);
+                CreateFunctionDeclaration(regName, e.ret, e.params, /*external=*/true, e.variadic,
+                                          /*returnsOwned=*/false, /*isMethod=*/false,
+                                          CallingConv::Cdecl);
+            }
             if (auto fit = functionTable.find(regName); fit != functionTable.end())
                 for (FunctionSymbol& sym : fit->second)
                     if (sym.External)

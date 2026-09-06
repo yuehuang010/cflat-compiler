@@ -2678,6 +2678,27 @@ private:
     // stamps it onto the global's TypeAndValue.GuardedBy. Empty outside such a group.
     std::string pendingGlobalGuardedBy;
 
+    // The .c / header a C prototype is being registered from, set only around the
+    // CreateFunctionDeclaration calls in RegisterCSignatures. Empty for a hand-written extern,
+    // which is how the conflict diagnostic tells the two routes apart. Transient: not part of
+    // the --init cache round-trip, cleared by ResetForReanalysis.
+    std::string cInteropDeclarationFile_;
+
+    // RAII publisher for the above. LogError throws, so the restore cannot be a plain
+    // assignment at the end of the block.
+    struct CInteropDeclarationScope
+    {
+        LLVMBackend& Backend;
+        std::string  Previous;
+
+        CInteropDeclarationScope(LLVMBackend& backend, std::string file)
+            : Backend(backend), Previous(std::move(backend.cInteropDeclarationFile_))
+        {
+            Backend.cInteropDeclarationFile_ = std::move(file);
+        }
+        ~CInteropDeclarationScope() { Backend.cInteropDeclarationFile_ = std::move(Previous); }
+    };
+
     private:
 
     void SetSourceLocation(size_t line, size_t column);
@@ -5064,6 +5085,20 @@ public:
 
     std::string ShortenDefSiteForDisplay(const std::string& site, bool isCore) const;
 
+    // Same shortening for a plain path with no "(line,col)" suffix - a .c or header a C
+    // prototype was extracted from.
+    std::string ShortenImportPathForDisplay(const std::string& path) const;
+
+    // The CFlat spelling of whatever already owns this linkage symbol. The declaration may be
+    // registered under a NAMESPACED key (core's os.windows.WriteFile binds the bare WriteFile),
+    // so the lookup is by UniqueName across the whole table.
+    std::string SpellExistingLinkageSignature(const std::string& mangledName,
+                                              llvm::Function* existing) const;
+
+    // The stdio names os.windows republishes, i.e. the ones the "use os.windows.fopen/..."
+    // remedy is actually true for.
+    static bool IsCoreFileIoLinkageName(const std::string& linkageName);
+
     void CreateInterfaceDefinition(const std::string& name, const std::vector<std::string>& parentNames,
                                    std::vector<InterfaceMethod> methods, std::vector<TypeAndValue> fields = {},
                                    const std::string& definitionSite = {});
@@ -6604,6 +6639,12 @@ public:
      */
     llvm::Value* ConvertIntegerCallArgument(llvm::Value* value, llvm::Type* destType,
         bool srcIsUnsigned, const std::string& paramSpelling, const std::string& what);
+
+    // A declared signature in CFlat spelling, e.g. "int(char*, ...)", for diagnostics that
+    // have to show two signatures side by side.
+    std::string SpellDeclaredSignature(const TypeAndValue& returnType,
+                                       const std::vector<TypeAndValue>& parameters,
+                                       bool varargs) const;
 
     // True when binding this argument to that parameter would truncate an integer.
     bool ArgumentNarrowsParameter(const NamedVariable& arg, const TypeAndValue& param) const;

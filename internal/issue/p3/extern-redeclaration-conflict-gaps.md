@@ -1,26 +1,47 @@
-# Extern redeclaration conflicts: two silent drops and a weak message
+# Extern redeclaration: a same-lowering respelling is still silently dropped
 
-Bucket: batch mode (diagnostics; one adds a rejection). Filed 2026-09-04 from the q11 review
-(d1952097), which made a repeat `extern` declaration under a core name with a DIFFERENT llvm
-function type a hard "conflicting declaration" error at the extern line.
+Bucket: batch mode (diagnostics). Filed 2026-09-04 from the q11 review (d1952097), which made a
+repeat `extern` declaration under a core name with a DIFFERENT llvm function type a hard
+"conflicting declaration" error. Narrowed 2026-09-05: the other two gaps that file carried are
+landed, this one needs a maintainer ruling before anything is built.
 
-## Remaining gaps
+## The gap
 
-1. The `.c` / header-binding route (`import "util.c"` auto-extern, `import package "x.h"`) still
-   silently drops a prototype that collides with a hand-written or core declaration. Documented as
-   "hand-written wins"; a colliding C prototype should at least be diagnosed when the llvm type
-   differs.
-2. A same-lowering respelling (`extern int f(u32)` vs core `f(int)`) is still silently dropped:
-   the repeat-declaration check compares llvm `FunctionType`, so CFlat-level type differences
-   that lower identically are invisible. Decide whether the CFlat signature must match too.
-3. The conflicting-declaration message never states the EXISTING signature, and its file-I/O
-   tail is baked into a live locale key (the same `LogError` string serves the file-import
-   conflict), so a wording fix touches a translated entry.
+A same-lowering respelling is silently dropped. `extern int f(u32)` next to core's `f(int)` is
+accepted as a repeat declaration and the core one binds, because the repeat-declaration check in
+`CreateFunctionDeclaration` (cflat/LLVMBackend_ControlFlowAndFunctions.cpp, the
+`existing->getFunctionType() == functionType` arm) compares the llvm `FunctionType`. CFlat-level
+type differences that lower identically - signedness, a type alias, `u32` vs `int` - are
+invisible to it, so the declared spelling is never scored at a call site.
 
-## Fix direction
+This is the same class of hole the q11 change closed for DIFFERING lowerings: there, `extern void
+exit(u8 c)` bypassed the no-implicit-narrowing ruling by spelling. Here the bypass survives
+whenever the two spellings happen to share a lowering.
 
-Route the header/`.c` auto-extern registration through the same `CreateFunctionDeclaration`
-repeat check (cflat/LLVMBackend_ControlFlowAndFunctions.cpp ~1295); compare the recorded CFlat
-parameter spellings, not only the llvm type, for hand-written repeats; split the message so the
-existing signature is printed. Accept-set: every `extern` in cflat/core/*.cb and Test/test_c*.cb,
-plus the header-binding tests (Windows-only skips on macOS - say what you could not run).
+## Needs a ruling before any fix
+
+Does the CFlat signature have to match, or only the lowered one? Both answers are defensible and
+the choice decides the size of the change:
+
+- **Only the lowering matters** (today's behaviour): close as working-as-intended. Signedness and
+  aliases are then explicitly not part of a linkage name's identity.
+- **The CFlat spelling must match too**: the check has to compare recorded parameter spellings,
+  not just the llvm type. That is a REJECTION being widened, so it needs its own accept-set
+  first. The known hazard is C interop, where the header route legitimately respells core types
+  (`DWORD` for `i32`, `unsigned long` for `u32`, `size_t` for `u64`) - `import "windows.h"` and
+  the grouped `import { "windows.h", "tlhelp32.h" };` currently compile precisely because those
+  respellings lower identically, and a spelling comparison would reject them wholesale. Any fix
+  has to exempt the C-import route or normalise its spellings first.
+
+## What is already landed (do not re-file)
+
+- The `.c` / header route does NOT silently drop a colliding prototype: `RegisterCSignatures`
+  goes through `CreateFunctionDeclaration`, so a differing llvm type is rejected on every route
+  and order. As of the 2026-09-05 change the message also names the `.c`/header the prototype
+  came from.
+- The conflict message prints BOTH signatures in CFlat spelling, and the file-I/O tail is its own
+  format string, emitted only for the stdio names `os.windows` republishes.
+
+Coverage: `Test/errors/err_declarations.cb` (hand-written repeats, incl. the namespaced-core and
+file-I/O arms), `Test/errors/err_extern_collides_with_core.cb` (the C-import route),
+`Test/test_c_interop.cb` Section B (agreeing prototypes stay a silent no-op).

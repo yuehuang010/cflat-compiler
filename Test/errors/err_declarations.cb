@@ -136,12 +136,30 @@ expect_error("redefinition of 'dupSigSpelling'") {
  * exited 44 - the declared u8 was never scored and the no-implicit-narrowing ruling was
  * bypassed by spelling.
  */
-expect_error("conflicting declaration of extern 'exit'") {
+// The expectation also pins the EXISTING signature: without it the message could not tell the
+// user which declaration it is disagreeing with.
+// The tail is pinned too: it is what separates the generic arm from the file-I/O arm below,
+// which must NOT ride along on an unrelated collision.
+expect_error("conflicting declaration of extern 'exit': the linkage name is already declared as 'void(int)', but this declaration is 'void(u8)'. Rename your extern, or call the existing one.") {
     extern void exit(u8 c);
 }
 
 // Same hole through a core extern that has a BODY (cruntime's putchar(int)) rather than a
 // bare prototype - a different registration path to the same linkage name.
-expect_error("conflicting declaration of extern 'putchar'") {
+expect_error("conflicting declaration of extern 'putchar': the linkage name is already declared as 'int(int)', but this declaration is 'int(u8)'") {
     extern int putchar(u8 c);
+}
+
+// A bare user extern colliding with a NAMESPACED core extern (os.windows.WriteFile, whose
+// linkage name is the bare WriteFile). The core symbol lives under its namespace in the
+// function table, so the existing signature has to be found by linkage name, not by lookup
+// name - this leg is what proves that search reaches a namespaced owner.
+expect_error("conflicting declaration of extern 'WriteFile': the linkage name is already declared as 'int(void*, char*, int, int*, void*)'") {
+    extern u32 WriteFile(void* h, void* buf, u64 n, void* written, void* ov);
+}
+
+// The file-I/O remedy is a separate message, emitted only for the stdio names os.windows
+// republishes. Every other collision above must NOT carry it.
+expect_error("conflicting declaration of extern 'fopen': the linkage name is already declared as 'void*(char*, char*)', but this declaration is 'int(int)'. Rename your extern, or call the existing one - for file I/O use os.windows.fopen/fread/fwrite/fclose.") {
+    extern int fopen(int x);
 }

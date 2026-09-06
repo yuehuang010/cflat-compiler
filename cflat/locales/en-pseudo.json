@@ -550,8 +550,24 @@
     "conditionmustbeascal...0compareitexplicitly2f08e69bff57b7fb": [
       "string"
     ],
+    "conflictingdeclarati...amebindsonesignature5cc1d51c1609eaad": [
+      "putn",
+      "Test\\library\\extern_conflict_core.h",
+      "void(char*, int)",
+      "int(i64)"
+    ],
+    "conflictingdeclarati...orcalltheexistingone48bd3125877b9b29": [
+      "exit",
+      "void(int)",
+      "void(u8)"
+    ],
     "conflictingdeclarati...penfreadfwritefclose8541377e62fbb8dd": [
       "exit"
+    ],
+    "conflictingdeclarati...penfreadfwritefclosec74614431b9da0db": [
+      "fopen",
+      "void*(char*, char*)",
+      "int(int)"
     ],
     "duplicatecaselabelarg0inswitch": [
       "1"
@@ -593,6 +609,11 @@
     ],
     "importpackagenugetar...mdimportonitsownlinece2e623666d2dd94": [
       "Bar.winmd"
+    ],
+    "interfacearg0collide...facecannotshareanamedce86607c550ad90": [
+      "IStringable",
+      "IStringable",
+      "Windows.Foundation.IStringable"
     ],
     "mismatchedinputarg0expectingarg1": [
       "'='",
@@ -1633,7 +1654,10 @@
     "classarg0methodarg1t...rg8frominterfacearg9a2c5150ebb3cca45": "class '{0}' method '{1}': the return type is not declared '{2}' but interface '{3}' declares it '{4}' - a call through the interface treats the result as a borrow and suppresses its destructor, while class '{5}' returns a value the caller must destroy (the result leaks). Declare the return '{6}' on class '{7}', or drop '{8}' from interface '{9}'.",
     "classarg0methodarg1t...twodeclarationsagree1cbfbd8143256040": "class '{0}' method '{1}': the return type is declared '{2}' but interface '{3}' declares it '{4}' - '{5}' is part of the return contract, and a call through the interface reads the contract from the interface, so the borrow the two disagree about would go untracked. Make the two declarations agree.",
     "conditionmustbeascal...0compareitexplicitly2f08e69bff57b7fb": "condition must be a scalar (bool, integer, pointer or floating point), not '{0}' - compare it explicitly",
+    "conflictingdeclarati...amebindsonesignature5cc1d51c1609eaad": "conflicting declaration of extern '{0}' from C import '{1}': the linkage name is already declared as '{2}', but the C prototype is '{3}'. Remove or correct one of them - a linkage name binds one signature.",
+    "conflictingdeclarati...orcalltheexistingone48bd3125877b9b29": "conflicting declaration of extern '{0}': the linkage name is already declared as '{1}', but this declaration is '{2}'. Rename your extern, or call the existing one.",
     "conflictingdeclarati...penfreadfwritefclose8541377e62fbb8dd": "conflicting declaration of extern '{0}': a function with this linkage name already exists with a different signature (e.g. in a core library such as os.windows). Rename your extern, or call the existing one (for file I/O use os.windows.fopen/fread/fwrite/fclose).",
+    "conflictingdeclarati...penfreadfwritefclosec74614431b9da0db": "conflicting declaration of extern '{0}': the linkage name is already declared as '{1}', but this declaration is '{2}'. Rename your extern, or call the existing one - for file I/O use os.windows.fopen/fread/fwrite/fclose.",
     "crashhandlersourcenotfoundarg0": "crash handler source not found: '{0}'.",
     "duplicatecaselabelarg0inswitch": "duplicate case label '{0}' in switch",
     "duplicatenamedargumentarg0": "duplicate named argument '{0}'",

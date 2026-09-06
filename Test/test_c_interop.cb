@@ -49,6 +49,9 @@ import "library/struct_byval_util.c";
 import package "cinterop/mathlib.h" lib "cinterop/mathlib.lib" define "ML_EXTRA";
 import "library/c_macro_helpers.h";
 import "library/float_macros.h";
+// Accept side of the conflicting-declaration check: prototypes identical to ones already
+// bound (core putn/printf, and c_add from cinterop.c above) must be a silent no-op.
+import "library/extern_agree_core.h";
 import "string.cb";
 
 // Section B: hand-written extern alongside auto-extern. Same signatures the auto-
@@ -155,6 +158,13 @@ extern int main()
     function<AbiPair(int)> abiFpPair = abiExternPairOf;
     AbiPair abiViaPtrPair = abiFpPair(4);
     if (abiViaPtrPair.x != 7 || abiViaPtrPair.y != 4) return 16;
+
+    // library/extern_agree_core.h re-declares core's putn/printf and cinterop.c's c_add at
+    // IDENTICAL types. Reaching these lines at all is the accept assertion - a differing type
+    // is an import-time error (err_extern_collides_with_core.cb) and this file would not
+    // compile. The values then prove the agreeing redeclaration did not REBIND the name.
+    if (c_add(20, 22) != 42)            return 17;   // header agreeing with an earlier .c auto-extern
+    if (printf("") != 0)                return 18;   // header agreeing with a core VARIADIC extern
 
     // ---- Section C: import package (header + .lib + enum constants) ----------
     if (ml_add(40, 2) != 42)            return 20;       // plain function
