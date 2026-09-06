@@ -6,7 +6,7 @@
 import "span.cb";
 import "view.cb";
 
-expect_error("cannot pass a raw pointer 'T*' as array-view parameter") {
+expect_error("cannot pass a raw pointer 'double*' as array-view parameter 'ptr' ('double[]')") {
     void f(view<double> v)
     {
         span<double> s;

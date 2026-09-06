@@ -803,19 +803,6 @@ bool LLVMBackend::RejectArrayViewParamBinding(const NamedVariable& arg, const Ty
                                               const std::string& diagnosticFunctionName)
 {
         bool rejected = false;
-        // The reverse ('T[] -> T*' decay) is always safe; a view argument carries IsArrayView.
-        if (param.IsArrayView && arg.TypeAndValue.Pointer && !arg.TypeAndValue.IsArrayView)
-        {
-            LogErrorMessage(
-                "cannot pass a raw pointer '{}' as array-view parameter '{}' ('{}') - a view "
-                "must span a whole allocation (it comes only from '{}' or another '{}'); "
-                "the '{} -> {}' decay is one-way",
-                { "T*", param.VariableName, "T[]", "new T[n]", "T[]", "T[]", "T*" });
-            rejected = true;
-        }
-
-        rejected |= RejectValueIntoArrayViewParam(arg.TypeAndValue, param);
-
         std::string destElement;
         std::string srcElement;
         // A view ARGUMENT may reach here as a loaded value whose TypeName is blank; recover
@@ -826,19 +813,13 @@ bool LLVMBackend::RejectArrayViewParamBinding(const NamedVariable& arg, const Ty
             if (const NamedVariable* live = FindLiveNamedVariable(arg.CallerName))
             {
                 const TypeAndValue* declared = &live->TypeAndValue;
-                if (arg.FieldName.empty() && declared->IsArrayView)
-                    argTV.TypeName = declared->TypeName;
-                // A FIXED array argument decays to a thin pointer whose element name was dropped
-                // (only ConstArraySize survives), so recover the name and the element's star from
-                // the declaration - a decayed ELEMENT or row carries no ConstArraySize and is left
-                // unnamed, so this never renames a sub-object of the array.
-                else if (arg.FieldName.empty() && argTV.ConstArraySize != 0 && !argTV.IsArrayView
-                         && !argTV.IsSimd && declared->ConstArraySize != 0
-                         && !declared->IsArrayView && !declared->IsSimd)
+                if (arg.FieldName.empty() && !argTV.IsArrayView && !argTV.IsSimd)
                 {
                     argTV.TypeName = declared->TypeName;
                     argTV.Pointer = argTV.Pointer || declared->Pointer;
                 }
+                else if (arg.FieldName.empty() && declared->IsArrayView)
+                    argTV.TypeName = declared->TypeName;
                 // A FIELD read: CallerName names the base struct, so the element name
                 // lives on the field's declaration, not on the base's TypeName.
                 else if (auto base = dataStructures.find(declared->TypeName);
@@ -865,6 +846,36 @@ bool LLVMBackend::RejectArrayViewParamBinding(const NamedVariable& arg, const Ty
                 argTV.TypeName = declared->TypeName;
                 argTV.Pointer = argTV.Pointer || declared->Pointer;
             }
+        // The reverse ('T[] -> T*' decay) is always safe; a view argument carries IsArrayView.
+        // A fixed pointer-element array is an array source too; let the element gate reshape it.
+        if (param.IsArrayView && argTV.Pointer && !argTV.IsArrayView
+            && !(argTV.ConstArraySize != 0 && argTV.Pointer))
+        {
+            // The ARGUMENT's own recorded name wins: a cast ('(int*)q') leaves TypeName empty, so
+            // the declaration recovery above would spell 'q' - the type BEFORE the cast.
+            std::string sourceSpelling;
+            if (!arg.InferSourceTypeName.empty())
+            {
+                TypeAndValue inferred;
+                inferred.TypeName = arg.InferSourceTypeName;
+                inferred.Pointer = argTV.Pointer;
+                inferred.ElemPointer = argTV.ElemPointer;
+                inferred.PointerDepth = argTV.PointerDepth;
+                sourceSpelling = SpellType(*this, inferred);
+            }
+            if (sourceSpelling.empty()) sourceSpelling = SpellType(*this, argTV);
+            if (sourceSpelling.empty()) sourceSpelling = "<unknown>";
+            LogErrorMessage(
+                "cannot pass a raw pointer '{}' as array-view parameter '{}' ('{}') - a view "
+                "must span a whole allocation (it comes only from '{}' or another '{}'); "
+                "the '{} -> {}' decay is one-way",
+                { sourceSpelling, param.VariableName, SpellType(*this, param),
+                  "new T[n]", "T[]", "T[]", "T*" });
+            rejected = true;
+        }
+
+        rejected |= RejectValueIntoArrayViewParam(argTV, param);
+
         if (ArrayViewElementMismatch(param, argTV, destElement, srcElement))
         {
             LogErrorMessage(

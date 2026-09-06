@@ -3461,6 +3461,17 @@ int vfaTakeElem(VpsNs.VpsElem[] v) { return v[1].k; }
 int vfaTakeChar(char[] v) { return (int)v[0]; }
 int vfaTakeIface(VfaIface[] v) { return v[1].val(); }
 T vfaPick<T>(T[] v) { return v[1]; }
+int vfaTakePtr(int*[] v) { return *v[1]; }
+int vfaTakeConstChar(const char*[] v) { return *v[1]; }
+int vfaTakeVoid(void*[] v) { return v[1] == nullptr ? 0 : 1; }
+T vfaTakePtrGeneric<T>(T*[] v) { return *v[1]; }
+struct VfaPtrElem { int value = default; };
+int vfaTakePtrElem(VfaPtrElem*[] v) { return v[1]->value; }
+class VfaPtrMethodHost { int take(int*[] v) { return *v[1]; } };
+interface VfaPtrIface { int take(int*[] v); };
+class VfaPtrIfaceImpl : VfaPtrIface { int take(int*[] v) { return *v[1]; } };
+int vfaPickPtr(int*[] v) { return *v[1]; }
+int vfaPickPtr(void* p) { return 99; }
 
 /*
  * A FIXED array is a real element source at the declarator, '=' store, field store and return
@@ -3492,6 +3503,18 @@ int runViewFixedArraySources()
         + vfaPick<int>(intArr) + vfaTakeElem(vfaGlobal);
     VfaFixedHost host = default; host.arr[1].k = 3;
     argSum = argSum + vfaTakeElem(host.arr);
+    int ptrOne = 1; int ptrTwo = 2;
+    int*[2] ptrArr; ptrArr[0] = &ptrOne; ptrArr[1] = &ptrTwo;
+    char ca = 65; char cb = 66;
+    const char*[2] constCharArr; constCharArr[0] = &ca; constCharArr[1] = &cb;
+    void*[2] voidArr; voidArr[0] = &ptrOne; voidArr[1] = &ptrTwo;
+    VfaPtrElem pe0 = default; VfaPtrElem pe1 = default; pe1.value = 2;
+    VfaPtrElem*[2] elemArr; elemArr[0] = &pe0; elemArr[1] = &pe1;
+    VfaPtrMethodHost methodHost = default;
+    VfaPtrIfaceImpl ifaceImpl = default; VfaPtrIface ifaceHost = ifaceImpl;
+    argSum = argSum + vfaTakePtr(ptrArr) + vfaTakeConstChar(constCharArr)
+        + vfaTakeVoid(voidArr) + vfaTakePtrGeneric<int>(ptrArr) + vfaTakePtrElem(elemArr)
+        + methodHost.take(ptrArr) + ifaceHost.take(ptrArr) + vfaPickPtr(ptrArr);
     int c = 1;
     VpsNs.VpsElem[] jView = c != 0 ? vDecl : nsArr;
     VpsNs.VpsElem[] jNull = c != 0 ? nsArr : nullptr;
@@ -4489,9 +4512,9 @@ int testRawArrayRuntimeCount()
         runViewPlainBraceSpelling(), 181);
     // 4 (decl) + 5 (alias) + 6 (generic store) + 4 (field store) + 'A' (65) + 30 (interface)
     // + 7 (return) = 121, plus the call-argument row 4 + 65 + 30 + 9 + 8 (global) + 3 (field)
-    // = 119, and the five '?:' join arms 4 + 4 + 4 + 3 (field) + 8 (global) = 23, so 263.
+    // = 119, the five '?:' join arms = 23, and pointer-element call rows = 79, so 342.
     passed += Test("a fixed array binds a plain array view at every non-brace door",
-        runViewFixedArraySources(), 263);
+        runViewFixedArraySources(), 342);
     // Every null-view spelling plus the two real element reads: 1+2+4+8+16+32+64+128+256+512+1024
     // = 2047, plus the six unnamed-constant spellings 2048..65536 = 131071, plus the enum zero
     // member at the four doors and the enum array read, 131072..2097152 = 4194303.

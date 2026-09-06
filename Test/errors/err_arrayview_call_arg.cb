@@ -1,5 +1,5 @@
 // Passing a raw `int*` to an `int[]` parameter forges the noalias contract at the call site.
-expect_error("cannot pass a raw pointer 'T*' as array-view parameter") {
+expect_error("cannot pass a raw pointer 'int*' as array-view parameter 'a' ('int[]')") {
     void kernel(int[] a, int n) { a[0] = 1; }
     void f(int* p) { kernel(p, 4); }
 }
@@ -376,6 +376,35 @@ expect_error("cannot pass an array view of 'CfqOther' as parameter 'v' of 'cfqTa
     struct CfqOther { int a = default; int b = default; };
     int cfqTake(Cfp[] v) { return v[1].k; }
     int cfqCall() { CfqOther[2] a; return cfqTake(a); }
+}
+
+// Pointer-element fixed arrays are reshaped before the element gate; these rows keep mismatches
+// rejected after the call door stops labeling a fixed array as a raw pointer.
+expect_error("cannot pass an array view of 'int*' as parameter 'v' of 'pvI64Take'") {
+    i64 pvI64Take(i64*[] v) { return *v[1]; }
+    int pvI64Call() { int a = 1; int b = 2; int*[2] cells; cells[0] = &a; cells[1] = &b; return (int)pvI64Take(cells); }
+}
+
+expect_error("cannot pass an array view of 'int*' as parameter 'v' of 'pvIntTake'") {
+    int pvIntTake(int[] v) { return v[1]; }
+    int pvIntCall() { int a = 1; int b = 2; int*[2] cells; cells[0] = &a; cells[1] = &b; return pvIntTake(cells); }
+}
+
+expect_error("cannot pass an array view of 'int' as parameter 'v' of 'pvPtrTake'") {
+    int pvPtrTake(int*[] v) { return *v[1]; }
+    int pvPtrCall() { int[2] cells; cells[0] = 1; cells[1] = 2; return pvPtrTake(cells); }
+}
+
+expect_error("cannot pass a raw pointer 'int**' as array-view parameter 'v' ('int*[]')") {
+    int pvRawPtrTake(int*[] v) { return *v[1]; }
+    int pvRawCall() { int x = 1; int* p = &x; int** pp = &p; return pvRawPtrTake(pp); }
+}
+
+// A CAST names the argument's type at the call site, so the message must spell THAT, not the
+// pre-cast declaration of the variable the cast was applied to.
+expect_error("cannot pass a raw pointer 'int*' as array-view parameter 'v' ('int[]')") {
+    int pvCastTake(int[] v) { return v[1]; }
+    int pvCastCall() { int x = 1; void* q = &x; return pvCastTake((int*)q); }
 }
 
 // PRIMITIVE twin of the same door: the element widths differ, so the callee strides wrong
