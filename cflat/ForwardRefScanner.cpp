@@ -521,7 +521,7 @@ void ForwardRefScanner::ScanFunctionDefinition(CFlatParser::FunctionDefinitionCo
         if (func->genericTypeParameters() != nullptr)
             return;
 
-        const std::string rawFuncName = getFunctionName(func);
+        const std::string rawFuncName = getFunctionName(func, compiler);
         std::string name = namespaceName.empty() ? rawFuncName : namespaceName + "." + rawFuncName;
 
         auto returnType = ParseDeclarationSpecifiers(func->declarationSpecifiers());

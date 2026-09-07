@@ -8728,8 +8728,12 @@ LLVMBackend::NamedVariable MainListener::ParseCastExpression(CFlatParser::CastEx
             // asserted the compiler downstream (e.g. an invalid bitcast in
             // 'delete[_] (string*)expr', or a 'no overload' error when no value
             // conversion matched the pointer operand).
-            std::string opName = "operator " + destTypeName.TypeName;
-            if (!destTypeName.Pointer && !destTypeName.IsArrayView
+            std::string operatorTargetSpelling = SpellType(*compiler, destTypeName);
+            if (operatorTargetSpelling.empty()) operatorTargetSpelling = destTypeName.TypeName;
+            std::string opName = "operator " + operatorTargetSpelling;
+            bool isSpecialConversion = destTypeName.TypeName == "string"
+                || destTypeName.TypeName == "bool";
+            if (isSpecialConversion && !destTypeName.Pointer && !destTypeName.IsArrayView
                 && compiler->GetFunction(opName) != nullptr)
             {
                 auto argNV = namedVar;
@@ -8761,6 +8765,81 @@ LLVMBackend::NamedVariable MainListener::ParseCastExpression(CFlatParser::CastEx
             }
 
             materialize(namedVar);
+
+            // User-defined conversion operators are explicit-only. Built-in casts keep their
+            // meaning, and only an otherwise invalid cast from a struct value may reach this
+            // lookup. The declaration must be a free function with one by-value source parameter
+            // and a return type matching the target; malformed declarations do not participate.
+            auto isBuiltinCast = [](llvm::Type* source, llvm::Type* target) {
+                if (source == nullptr || target == nullptr) return false;
+                if (source == target) return true;
+                if (target->isIntegerTy(1)) return true;
+                if (source->isIntegerTy() && target->isIntegerTy()) return true;
+                if (source->isFloatingPointTy() && target->isFloatingPointTy()) return true;
+                if (source->isIntegerTy() && target->isFloatingPointTy()) return true;
+                if (source->isFloatingPointTy() && target->isIntegerTy()) return true;
+                if (source->isPointerTy() && target->isIntegerTy()) return true;
+                if (source->isIntegerTy() && target->isPointerTy()) return true;
+                if (source->isPointerTy() && target->isPointerTy()) return true;
+                return false;
+            };
+            auto* sourceLLVMType = namedVar.Primary != nullptr ? namedVar.Primary->getType() : nullptr;
+            if (!isSpecialConversion && !destTypeName.IsArrayView
+                && sourceLLVMType != nullptr && sourceLLVMType->isStructTy()
+                && !compiler->IsCoreUniqueType(namedVar.TypeAndValue.TypeName)
+                && !isBuiltinCast(sourceLLVMType, type))
+            {
+                auto* sourceStruct = llvm::dyn_cast<llvm::StructType>(sourceLLVMType);
+                std::string sourceTypeName = namedVar.TypeAndValue.TypeName;
+                if (sourceTypeName.empty() && sourceStruct != nullptr && sourceStruct->hasName())
+                    sourceTypeName = sourceStruct->getName().str();
+
+                bool hasMatchingConversion = false;
+                if (sourceStruct != nullptr && sourceStruct->hasName())
+                {
+                    auto fnIt = compiler->functionTable.find(opName);
+                    if (fnIt != compiler->functionTable.end())
+                    {
+                        for (const auto& candidate : fnIt->second)
+                        {
+                            if (candidate.Parameters.size() != 1) continue;
+                            const auto& sourceParam = candidate.Parameters[0];
+                            if (sourceParam.Pointer || sourceParam.ElemPointer
+                                || sourceParam.TypeName != sourceTypeName)
+                                continue;
+                            const auto& candidateReturn = candidate.ReturnType;
+                            if (candidateReturn.TypeName != destTypeName.TypeName
+                                || candidateReturn.Pointer != destTypeName.Pointer
+                                || candidateReturn.ElemPointer != destTypeName.ElemPointer
+                                || candidateReturn.IsArrayView != destTypeName.IsArrayView)
+                                continue;
+                            hasMatchingConversion = true;
+                            break;
+                        }
+                    }
+                }
+
+                if (hasMatchingConversion)
+                {
+                    auto argNV = namedVar;
+                    argNV.TypeAndValue.VariableName.clear();
+                    auto result = compiler->CreateOverloadedFunctionCall(opName, { argNV });
+                    namedVar.Primary = result;
+                    namedVar.Storage = nullptr;
+                    namedVar.TypeAndValue = destTypeName;
+                    return namedVar;
+                }
+
+                LLVMBackend::TypeAndValue sourceType;
+                sourceType.TypeName = sourceTypeName;
+                std::string sourceDisplay = SpellType(*compiler, sourceType);
+                if (sourceDisplay.empty()) sourceDisplay = sourceTypeName;
+                std::string targetDisplay = SpellType(*compiler, destTypeName);
+                if (targetDisplay.empty()) targetDisplay = destTypeName.TypeName;
+                LogErrorContext(ctx, std::format(
+                    "cannot cast '{}' to '{}'; no '{}' defined for '{}'",
+                    sourceDisplay, targetDisplay, opName, sourceDisplay));
+            }
 
             // A fat `Lambda<...>` closure is a 16-byte {code, env} struct; it must be
             // CONSTRUCTED from a lambda/named function, never reinterpreted from a scalar.

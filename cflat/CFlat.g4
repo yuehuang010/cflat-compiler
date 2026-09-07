@@ -928,8 +928,10 @@ operatorFunctionId
                | Equal | NotEqual | Less | LessEqual | Greater | GreaterEqual
                | LeftShift | Greater Greater
                | LeftBracket RightBracket
+               | LeftParen RightParen
                | Arrow
-               | Not | Tilde)
+               | Not | Tilde
+               | typeName)
     ;
 
 interfaceDefinition

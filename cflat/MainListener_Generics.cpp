@@ -898,7 +898,7 @@ void MainListener::PreDeclareInstantiationMembers(
             if (IsReturnBlockFunction(func)) continue;
             if (func->genericTypeParameters() != nullptr) continue;
 
-            std::string funcName = getFunctionName(func);
+            std::string funcName = getFunctionName(func, compiler);
 
             // Constructor overload - pre-declare without this* parameter.
             // A zero-arg ctor has a null parameterTypeList; ParseParameterTypeList

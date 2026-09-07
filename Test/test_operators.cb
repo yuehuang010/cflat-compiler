@@ -23,12 +23,53 @@ struct BoolBox
     bool operator!() { return !value; }
 };
 
+// Callable uses the CFlat call-operator spelling. Overloads are selected by arity and type,
+// and direct calls through a pointer or type alias keep the same member dispatch.
+struct Callable
+{
+    int operator()() { return 40; }
+    int operator()(int value) { return value + 10; }
+    int operator()(float value) { return (int)value + 100; }
+};
+
+using CallableAlias = Callable;
+
+struct CallableHolder
+{
+    Callable value = default;
+};
+
+int callFieldTarget(int value) { return value + 20; }
+struct CallableField { function<int(int)> fn = callFieldTarget; };
+
 struct TruthinessBox
 {
     int value = 0;
 };
 
 bool operator bool(TruthinessBox b) { return b.value != 0; }
+
+struct Celsius
+{
+    int degrees = 0;
+};
+
+struct Fahrenheit
+{
+    int degrees = 0;
+};
+
+int operator int(Celsius value) { return value.degrees; }
+int operator int(int value) { return value + 1000; }
+Fahrenheit operator Fahrenheit(Celsius value)
+{
+    Fahrenheit result = default;
+    result.degrees = value.degrees + 32;
+    return result;
+}
+int operator int(Fahrenheit value) { return value.degrees + 1000; }
+
+using CelsiusAlias = Celsius;
 
 struct GenericTruthinessBox<T>
 {
@@ -462,6 +503,22 @@ extern int main()
     Test("BoolBox !true",  !bt, false);
     Test("BoolBox !false", !bf, true);
 
+    // -- operator(): callable struct values, pointers, aliases, and overloads --
+    int callPassed = 0;
+    Callable callable;
+    Callable* callablePtr = &callable;
+    CallableAlias callableAlias = callable;
+    callPassed += Test("Callable operator() no args", callable(), 40);
+    callPassed += Test("Callable operator() int overload", callable(2), 12);
+    callPassed += Test("Callable operator() float overload", callable(2.5f), 102);
+    callPassed += Test("Callable pointer operator()", callablePtr(3), 13);
+    callPassed += Test("Callable alias operator()", callableAlias(4), 14);
+    CallableHolder callableHolder = default;
+    callableHolder.value = callable;
+    callPassed += Test("Callable struct field operator()", callableHolder.value(5), 15);
+    CallableField callableField;
+    callPassed += Test("function-pointer field call remains indirect", callableField.fn(5), 25);
+
     TruthinessBox truth = default;
     truth.value = 1;
     Test("operator bool in if", truth ? true : false, true);
@@ -479,6 +536,15 @@ extern int main()
     GenericTruthinessBox<int> genericTruth = default;
     genericTruth.value = 1;
     Test("operator bool generic struct", genericTruth ? true : false, true);
+
+    // Conversion operators are explicit-only, and can target primitives or structs.
+    CelsiusAlias celsius = default;
+    celsius.degrees = 20;
+    Test("built-in cast keeps its meaning", (int)7, 7);
+    Test("operator int primitive target", (int)celsius, 20);
+    Fahrenheit fahrenheit = (Fahrenheit)celsius;
+    Test("operator Fahrenheit struct target", fahrenheit.degrees, 52);
+    Test("chained conversion operators", (int)(Fahrenheit)celsius, 1052);
 
     // operator~(): bitwise NOT on Bits
     Bits bits; bits.value = 0xFF;
@@ -578,11 +644,19 @@ extern int main()
     Test("Box?. forwards field (non-null)",  w?.value,    9);
     Test("Box?. forwards method (non-null)", w?.triple(), 27);
 
+    Box? nullableBox = &w;
+    callPassed += Test("nullable Box?. forwards field", nullableBox?.value, 9);
+    callPassed += Test("nullable Box?. forwards method", nullableBox?.triple(), 27);
+    callPassed += Test("OuterBox?. forwards through arrow chain", ob?.value, 9);
+
     // When the wrapped pointer is null, the forwarded `?.` short-circuits to the
     // default instead of dereferencing.
     Box wn; wn.p = nullptr;
     Test("Box?. null field short-circuits", wn?.value,       0);
     Test("Box?. null with coalesce",        wn?.value ?? -1, -1);
+    Box? nullBox = nullptr;
+    callPassed += Test("nullable Box?. null field", nullBox?.value, 0);
+    callPassed += Test("nullable Box?. null method", nullBox?.triple(), 0);
 
     // A `string?` slot holds a real `string*`, so `?.` through it must reach the pointee's
     // method, and a null one must short-circuit to 0. Accept-set for the 2026-08-21 p2 SIGSEGV,
@@ -820,7 +894,7 @@ extern int main()
     int narrowPromoPassed = narrowUnaryAndTernaryPromotionLegs();
     int i128Passed = i128FeatureLegs();
 
-    return (terPassed == 19 && ptrOpPassed == 8 && uPassed == 3
+    return (callPassed == 12 && terPassed == 19 && ptrOpPassed == 8 && uPassed == 3
         && unsignedLiteralPassed == 8 && unsignedAcceptPassed == 7
         && chainPassed == 11 && softPassed == 1 && promoPassed == 11
         && signednessPassed == 38 && autoNarrowPassed == 4 && joinAcceptPassed == 5

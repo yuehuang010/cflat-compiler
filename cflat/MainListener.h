@@ -310,10 +310,36 @@ inline std::string getOperatorName(CFlatParser::OperatorFunctionIdContext* opId)
     if (opId->Greater().size() == 2) return "operator>>";
     if (opId->Greater().size() == 1) return "operator>";
     if (opId->LeftBracket())  return "operator[]";
+    if (opId->LeftParen())    return "operator()";
     if (opId->Arrow())        return "operator->";
     if (opId->Not())          return "operator!";
     if (opId->Tilde())        return "operator~";
+    if (auto* target = opId->typeName())
+        return "operator " + target->getText();
     return "";
+}
+
+inline std::string getOperatorName(CFlatParser::OperatorFunctionIdContext* opId,
+                                  const LLVMBackend* compiler)
+{
+    std::string name = getOperatorName(opId);
+    auto* target = opId->typeName();
+    if (target == nullptr || compiler == nullptr) return name;
+
+    LLVMBackend::TypeAndValue targetType;
+    targetType.TypeName = compiler->ResolveTypeAlias(target->getText());
+    if (targetType.TypeName == target->getText())
+        targetType.TypeName = compiler->ResolveManglingPointerAlias(target->getText());
+    if (targetType.TypeName.empty()) targetType.TypeName = target->getText();
+    if (auto* abstractDecl = target->abstractDeclarator(); abstractDecl != nullptr
+        && abstractDecl->pointer() != nullptr)
+    {
+        targetType.Pointer = true;
+        targetType.PointerDepth = PointerDepthOf(abstractDecl->pointer());
+        targetType.ElemPointer = targetType.PointerDepth >= 2;
+    }
+    std::string spelling = SpellType(*compiler, targetType);
+    return "operator " + (spelling.empty() ? target->getText() : spelling);
 }
 
 inline std::string getInterfaceMethodName(CFlatParser::InterfaceMethodContext* m)
@@ -1549,6 +1575,14 @@ static std::string getFunctionName(CFlatParser::FunctionDefinitionContext* ctx)
         return ::getOperatorName(opId);
     auto directDecl = ctx->directDeclarator();
     return directDecl->getText();
+}
+
+static std::string getFunctionName(CFlatParser::FunctionDefinitionContext* ctx,
+                                   const LLVMBackend* compiler)
+{
+    if (auto* opId = ctx->operatorFunctionId())
+        return ::getOperatorName(opId, compiler);
+    return getFunctionName(ctx);
 }
 
 // Build a readable one-line signature for a function definition by slicing the source

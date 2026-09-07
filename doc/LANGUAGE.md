@@ -2954,7 +2954,13 @@ cursor += 3;           // advance 3 more bytes
 
 ### Operator Overloading
 
-Define `operator+`, `operator-`, `operator*`, `operator/`, `operator==`, `operator!=`, `operator<`, `operator>`, `operator<<`, `operator>>`, `operator[]`, `operator++`, `operator--`, `operator->`, `operator new`, `operator delete`, `operator string`, and `operator bool` on structs:
+Struct member overloads support `operator+`, `operator-`, `operator*`, `operator/`, `operator%`,
+`operator&`, `operator|`, `operator^`, `operator<<`, `operator>>`, `operator==`, `operator!=`,
+`operator<`, `operator<=`, `operator>`, `operator>=`, `operator+=`, `operator-=`, `operator*=`,
+`operator/=`, `operator%=`, `operator<<=`, `operator>>=`, `operator&=`, `operator|=`, `operator^=`,
+`operator++`, `operator--`, `operator[]`, `operator()`, `operator->`, `operator!`, and `operator~`.
+The allocator hooks `operator new` and `operator delete` and the string conversion hook are separate
+runtime hooks; `operator bool` is a free function as described below:
 
 ```c
 struct Vec2
@@ -2980,6 +2986,28 @@ condition of `?:`, operands of `&&` and `||`, unary `!`, and an explicit `(bool)
 It is never an implicit conversion for arithmetic, assignment, or call arguments. A pointer to a
 struct keeps the ordinary pointer null test and does not dispatch through `operator bool`.
 
+Conversion operators use the declaration shape `T operator T(Source value) { ... }`, where the
+function is free, has exactly one by-value source parameter, and returns the target type. They are
+used only by an explicit cast when the built-in cast is otherwise invalid; for example:
+
+```c
+struct Celsius { int degrees = 0; };
+struct Fahrenheit { int degrees = 0; };
+
+int operator int(Celsius value) { return value.degrees; }
+Fahrenheit operator Fahrenheit(Celsius value)
+{
+    Fahrenheit result; result.degrees = value.degrees * 9 / 5 + 32; return result;
+}
+
+Celsius c; c.degrees = 20;
+int degrees = (int)c;
+Fahrenheit f = (Fahrenheit)c;
+```
+
+These operators never provide implicit conversion: assignment, return, and call arguments do not
+invoke them. A cast whose target already has a built-in conversion keeps its built-in meaning.
+
 #### Increment, dereference and member forwarding
 
 Struct member overloads use these shapes:
@@ -2993,10 +3021,31 @@ Thing* operator*() { return raw; }
 
 `++` and `--` are postfix-only in CFlat. They update the struct in place, and the expression value
 is the object after the call; assigning `y = x++` therefore copies the updated object. Unary
-`operator*` has no explicit parameters, while binary multiplication has one. `operator.` is not
-overloadable. On a struct value, `.` first resolves the struct's own member, then forwards a miss
-through `operator->`; forwarding may chain through struct results until a pointer is reached. Own
-members always win, and pointer/null-safe receiver behavior remains unchanged.
+`operator*` has no explicit parameters, while binary multiplication has one. Unary `operator+`,
+`operator-`, `operator!`, and `operator~` also have no explicit parameters. The call operator uses
+the ordinary function form with an empty or typed parameter list:
+
+```c
+struct Multiplier
+{
+    int factor = 3;
+    int operator()(int value) { return factor * value; }
+};
+
+Multiplier times;
+int result = times(4); // 12
+```
+
+`operator.` is not overloadable. On a struct value, `.` first resolves the struct's own member, then
+forwards a miss through `operator->`; forwarding may chain through struct results until a pointer is
+reached. Own members always win, and pointer/null-safe receiver behavior remains unchanged. The
+null-conditional form applies the same forwarding after its null check:
+
+```c
+struct Box { Item* item = nullptr; Item* operator->() { return item; } };
+Box? box = getBox();
+int value = box?.field; // null stays nullable; non-null forwards to Item
+```
 
 `operator<<` and `operator>>` are overloadable too. The core `channel<T>` uses `operator>>` as a pipe - `src >> dst` forwards every value from one channel into another (see [Threading](THREADING.md)).
 

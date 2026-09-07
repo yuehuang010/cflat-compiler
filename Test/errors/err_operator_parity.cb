@@ -1,0 +1,8 @@
+// A call operator must use the `operator()` spelling; `operator` followed by an
+// ordinary parameter list is not a valid operator function id.
+expect_error("'operator()' cannot be static") {
+    struct BadCallableParity
+    {
+        static int operator()() { return 1; }
+    };
+}

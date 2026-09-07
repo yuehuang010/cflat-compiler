@@ -2618,9 +2618,19 @@ void MainListener::ParseFunctionDefinition(CFlatParser::FunctionDefinitionContex
             return;
         }
         // Create Function Definition
-        auto name = nameOverride.empty() ? ::getFunctionName(func) : nameOverride;
+        auto name = nameOverride.empty() ? ::getFunctionName(func, compiler) : nameOverride;
         if (!namespaceName.empty())
             name = namespaceName + "." + name;
+        if (name == "operator()" && structName.empty())
+        {
+            LogErrorContext(func, "'operator()' must be declared as a struct member");
+            return;
+        }
+        if (name.ends_with(".operator()"))
+        {
+            LogErrorContext(func, "'operator()' cannot be static; declare it as a non-static struct member");
+            return;
+        }
         auto returnType = this->getFunctionReturnType(func);
         CFlatParser::ParameterTypeListContext* paramTypeList = func->parameterTypeList();
         auto params = this->ParseParameterTypeList(paramTypeList);

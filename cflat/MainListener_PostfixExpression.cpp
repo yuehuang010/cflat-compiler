@@ -1063,6 +1063,15 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 && Compiler(ctx)->HasArrowOverloadFor(structVar.TypeAndValue.TypeName);
                             if (pointerReceiverMiss)
                             {
+                                // A nullable pointer must be tested before loading the wrapper
+                                // that supplies operator->. Re-arm the pending state afterward so
+                                // the pointer returned by operator-> gets the same null guard.
+                                if (tokenType == CFlatParser::QuestionDot
+                                    && structVar.Storage != nullptr)
+                                {
+                                    ncEnterGuard(structVar.Storage);
+                                    nullConditionalPending = true;
+                                }
                                 namedVar = structVar;
                                 structVar = {};
                                 ForwardOperatorArrow(namedVar, parseTree);
@@ -2761,6 +2770,27 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                     {
                         // Create Function Call
                         std::string functionName = primaryIdentifier;
+
+                        // A call on a struct value or pointer is the CFlat spelling for operator().
+                        // Member methods keep their ordinary name because their lookup leaves
+                        // namedVar empty. A resolved struct field may be callable too; function-
+                        // pointer fields remain on the indirect-call path below.
+                        bool resolvedStructValue = structVar.BaseType != nullptr
+                            && (namedVar.Primary != nullptr || namedVar.Storage != nullptr)
+                            && !namedVar.TypeAndValue.IsFunctionPointer;
+                        if ((childLimit > 1 && ctx->children[1]->getText() == "(" || resolvedStructValue)
+                            && structVar.BaseType != nullptr
+                            && !structVar.TypeAndValue.IsInterface)
+                        {
+                            std::string receiverType = structVar.TypeAndValue.TypeName;
+                            if (receiverType.empty())
+                                if (auto* st = llvm::dyn_cast<llvm::StructType>(structVar.BaseType))
+                                    receiverType = st->getName().str();
+                            if (!receiverType.empty()
+                                && HasOperatorOverloadForFirstParam(
+                                    "operator()", receiverType))
+                                functionName = "operator()";
+                        }
 
                         auto argumentList = ctx->argumentExpressionList();
 

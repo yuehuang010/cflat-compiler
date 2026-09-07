@@ -1,0 +1,36 @@
+struct CelsiusConversionError
+{
+    int degrees = 0;
+};
+
+struct FahrenheitConversionError
+{
+    int degrees = 0;
+};
+
+struct WrongShapeConversionError
+{
+    int degrees = 0;
+};
+
+int operator int(CelsiusConversionError value) { return value.degrees; }
+int operator int(WrongShapeConversionError* value) { return value->degrees; }
+
+extern int main()
+{
+    expect_error("cannot cast an aggregate value") {
+        CelsiusConversionError c = default;
+        int x = c;
+    }
+
+    expect_error("cannot cast 'CelsiusConversionError' to 'FahrenheitConversionError'; no 'operator FahrenheitConversionError' defined for 'CelsiusConversionError'") {
+        CelsiusConversionError c = default;
+        FahrenheitConversionError f = (FahrenheitConversionError)c;
+    }
+
+    expect_error("cannot cast 'WrongShapeConversionError' to 'int'; no 'operator int' defined for 'WrongShapeConversionError'") {
+        WrongShapeConversionError c = default;
+        int x = (int)c;
+    }
+    return 0;
+}
