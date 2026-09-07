@@ -1,0 +1,12 @@
+// A private field of an imported C++ class is laid out (the record's size depends on it) but must
+// not be nameable from CFlat. The diagnostic says "is private", not "has no field named".
+import cpp "cpp_interop_basic.h";
+
+extern int main()
+{
+    expect_error("field 'hidden_' of C++ class 'cppi.Point' is private") {
+        cppi.Point p = default;
+        int leak = p.hidden_;
+    }
+    return 0;
+}

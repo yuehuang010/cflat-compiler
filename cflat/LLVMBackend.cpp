@@ -442,6 +442,14 @@ static bool IsFrameworkImport(CFlatParser::ImportDeclarationContext* imp)
     return imp->children.size() >= 2 && imp->children[1]->getText() == "framework";
 }
 
+// True when this import line is `import cpp "..." ...;` or `import cpp { ... };`. `cpp` is an
+// ordinary Identifier (the same soft-keyword mechanism `program` uses), and it is the ONLY
+// thing that selects C++ mode - the file extension never does.
+static bool IsCppImport(CFlatParser::ImportDeclarationContext* imp)
+{
+    return imp->children.size() >= 2 && imp->children[1]->getText() == "cpp";
+}
+
 static bool IsIsolatedNativeImport(CFlatParser::ImportDeclarationContext* imp)
 {
     return IsPackageVcpkgImport(imp) || IsPackageNugetImport(imp) || IsFrameworkImport(imp)
@@ -2175,7 +2183,8 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
                         {
                             if (verbose) std::cout << std::format("[verbose] import requested (group of {})\n", groupedImports.size());
                             if (!CompileImportGroup(filename, groupedImports, DequoteLibClauses(imp),
-                                                    DequoteDefineClauses(imp), HasCacheClause(imp)))
+                                                    DequoteDefineClauses(imp), HasCacheClause(imp),
+                                                    IsCppImport(imp)))
                                 return false;
                             continue;
                         }
@@ -2204,11 +2213,12 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
                         std::string alias = isProgram ? ImportProgramAlias(imp) : "";
                         std::string impExt = LowerExtension(importFilename);
                         bool isCProgram = isProgram && impExt == ".c";
+                        bool isCppImport = IsCppImport(imp);
                         std::vector<std::string> explicitLibs = DequoteLibClauses(imp);
                         std::vector<std::string> extraDefines = DequoteDefineClauses(imp);
                         bool cacheHeader = HasCacheClause(imp);
                         if (verbose) std::cout << std::format("[verbose] import requested: {}{}{}\n", importFilename, ns.empty() ? "" : " as " + ns, cacheHeader ? " (cache)" : "");
-                        if (!CompileImportedFile(filename, importFilename, ns, isCProgram ? alias : "", explicitLibs, extraDefines, cacheHeader))
+                        if (!CompileImportedFile(filename, importFilename, ns, isCProgram ? alias : "", explicitLibs, extraDefines, cacheHeader, isCppImport))
                             return false;
 
                         if (isProgram)
@@ -3047,21 +3057,25 @@ bool LLVMBackend::CompileImportGroup(const std::string& importingFilePath,
                                      const std::vector<std::string>& entries,
                                      const std::vector<std::string>& groupLibs,
                                      const std::vector<std::string>& groupDefines,
-                                     bool cacheGroup)
+                                     bool cacheGroup, bool cppMode)
 {
     std::vector<std::string> headerCanonicals;
     bool anyNewHeader = false;
     for (const auto& entry : entries)
     {
         std::string ext = LowerExtension(entry);
-        const bool isHeader = (ext == ".h" || ext == ".hpp" || ext == ".hh");
+        // `import cpp { ... }`: every entry that is not a C/C++ source file is a header,
+        // whatever its extension.
+        const bool isSource = (ext == ".c" || ext == ".cpp" || ext == ".cc" || ext == ".cxx");
+        const bool isHeader = cppMode ? !isSource
+                                      : (ext == ".h" || ext == ".hpp" || ext == ".hh");
         // Same objc runtime auto-link as the single-import path in CompileImportedFile.
         if (isHeader && targetMacOS_ && entry.starts_with("objc/"))
             cLinkObjC_ = true;
         if (!isHeader)
         {
             // .cb / .c entries are independent - route each like a plain `import "x";`.
-            if (!CompileImportedFile(importingFilePath, entry))
+            if (!CompileImportedFile(importingFilePath, entry, {}, {}, {}, {}, false, cppMode))
                 return false;
             continue;
         }
@@ -3100,17 +3114,18 @@ bool LLVMBackend::CompileImportGroup(const std::string& importingFilePath,
         if (!lib.empty())
             cLinkLibs_.push_back(ResolveCLinkLib(lib, importingFilePath));
 
-    bool ok = CompileCHeaderGroup(headerCanonicals, groupDefines, cacheGroup);
+    bool ok = CompileCHeaderGroup(headerCanonicals, groupDefines, cacheGroup, cppMode);
     if (ok) ProcessPendingMacroSources();
     return ok;
 }
 
-bool LLVMBackend::CompileImportedFile(const std::string& importingFilePath, const std::string& importFilename, const std::string& namespaceName, const std::string& programAlias, const std::vector<std::string>& explicitLibs, const std::vector<std::string>& extraDefines, bool cacheHeader)
+bool LLVMBackend::CompileImportedFile(const std::string& importingFilePath, const std::string& importFilename, const std::string& namespaceName, const std::string& programAlias, const std::vector<std::string>& explicitLibs, const std::vector<std::string>& extraDefines, bool cacheHeader, bool cppMode)
 {
     if (isolatedPolicy_)
     {
         auto ext = LowerExtension(importFilename);
-        if (ext == ".c" || ext == ".h" || ext == ".hpp" || ext == ".hh" || ext == ".winmd")
+        if (cppMode || ext == ".c" || ext == ".h" || ext == ".hpp" || ext == ".hh"
+            || ext == ".winmd")
         {
             LogError(std::format("policy-restricted-language: native interop import '{}' is not "
                                  "allowed in isolated mode (policy '{}')",
@@ -3220,8 +3235,10 @@ bool LLVMBackend::CompileImportedFile(const std::string& importingFilePath, cons
     // object is linked by EmitExecutable; the importing .cb supplies the declarations.
     {
         auto ext = LowerExtension(canonicalStr);
-        if (ext == ".c")
-            return CompileCFile(canonicalStr, programAlias);
+        // A C++ source only ever arrives through `import cpp "impl.cpp"` - a plain
+        // `import "impl.cpp"` keeps its pre-C++-interop behaviour (parsed as CFlat).
+        if (ext == ".c" || (cppMode && (ext == ".cpp" || ext == ".cc" || ext == ".cxx")))
+            return CompileCFile(canonicalStr, programAlias, cppMode);
         // WinRT metadata: read the .winmd and register its interfaces/structs/enums as CFlat
         // types (consume side). Not parsed by the CFlat parser; no object is linked. An inline
         // `lib { "RuntimeObject.lib", "ole32.lib" }` clause names the import libs the projected
@@ -3248,7 +3265,9 @@ bool LLVMBackend::CompileImportedFile(const std::string& importingFilePath, cons
         }
         // A C header (real C, not CFlat): extract declarations + enums via clang's
         // AST dump; the prebuilt library is linked via --c-lib in EmitExecutable.
-        if (ext == ".h" || ext == ".hpp" || ext == ".hh")
+        // `import cpp "widgets.anything"` binds as a C++ header: the keyword decides, not
+        // the extension. Plain imports keep the C header extension set.
+        if (cppMode || ext == ".h" || ext == ".hpp" || ext == ".hh")
         {
             // The objc runtime lives in libobjc, carried as a tbd by both the harvested stub
             // root and the real SDK.
@@ -3263,7 +3282,7 @@ bool LLVMBackend::CompileImportedFile(const std::string& importingFilePath, cons
                 if (explicitLib.empty()) continue;
                 cLinkLibs_.push_back(ResolveCLinkLib(explicitLib, importingFilePath));
             }
-            bool ok = CompileCHeader(canonicalStr, extraDefines, cacheHeader);
+            bool ok = CompileCHeader(canonicalStr, extraDefines, cacheHeader, cppMode);
             // Translate any queued function-like-macro source into generic templates so
             // they are visible to the importing file's ForwardRefScanner.
             if (ok) ProcessPendingMacroSources();
@@ -3353,7 +3372,8 @@ bool LLVMBackend::CompileImportedFile(const std::string& importingFilePath, cons
                 {
                     if (verbose) std::cout << std::format("[verbose]   nested import (group of {})\n", groupedImports.size());
                     if (!CompileImportGroup(canonicalStr, groupedImports, DequoteLibClauses(imp),
-                                            DequoteDefineClauses(imp), HasCacheClause(imp)))
+                                            DequoteDefineClauses(imp), HasCacheClause(imp),
+                                            IsCppImport(imp)))
                         return false;
                     continue;
                 }
@@ -3377,7 +3397,8 @@ bool LLVMBackend::CompileImportedFile(const std::string& importingFilePath, cons
                 std::vector<std::string> nestedLibs = DequoteLibClauses(imp);
                 std::vector<std::string> nestedDefines = DequoteDefineClauses(imp);
                 if (verbose) std::cout << std::format("[verbose]   nested import: {}{}\n", nested, nestedNs.empty() ? "" : " as " + nestedNs);
-                if (!CompileImportedFile(canonicalStr, nested, nestedNs, "", nestedLibs, nestedDefines))
+                if (!CompileImportedFile(canonicalStr, nested, nestedNs, "", nestedLibs, nestedDefines,
+                                         HasCacheClause(imp), IsCppImport(imp)))
                     return false;
             }
         }
@@ -4278,7 +4299,8 @@ bool LLVMBackend::Analyze(const std::string& filePath,
                     if (groupedImports.size() > 1)
                     {
                         if (!CompileImportGroup(filePath, groupedImports, DequoteLibClauses(imp),
-                                                DequoteDefineClauses(imp), HasCacheClause(imp)))
+                                                DequoteDefineClauses(imp), HasCacheClause(imp),
+                                                IsCppImport(imp)))
                             return false;
                         continue;
                     }
@@ -4302,9 +4324,10 @@ bool LLVMBackend::Analyze(const std::string& filePath,
                     std::string alias = isProgram ? ImportProgramAlias(imp) : "";
                     std::string impExt = LowerExtension(importFilename);
                     bool isCProgram = isProgram && impExt == ".c";
+                    bool isCppImport = IsCppImport(imp);
                     std::vector<std::string> explicitLibs = DequoteLibClauses(imp);
                     std::vector<std::string> extraDefines = DequoteDefineClauses(imp);
-                    if (!CompileImportedFile(filePath, importFilename, ns, isCProgram ? alias : "", explicitLibs, extraDefines))
+                    if (!CompileImportedFile(filePath, importFilename, ns, isCProgram ? alias : "", explicitLibs, extraDefines, HasCacheClause(imp), isCppImport))
                         return false;
 
                     // Mirror Compile()'s 'import program "file.cb" as Name' handling:
@@ -4389,6 +4412,9 @@ void LLVMBackend::ResetForReanalysis()
     // Core hashes are per-analysis so LSP notices edits; batch mode keeps one process-wide hash.
     if (!batchMode_) coreHashCache_.clear();
     dependencyPathMemo_.clear();
+    for (const auto& obj : cObjectFiles_) llvm::sys::fs::remove(obj);
+    cObjectFiles_.clear();
+    cppInteropUsed_ = false;
     dependencyFileSet_.clear();
     embeddedAssets_.clear();
     embedFileCache_.clear();
@@ -4492,6 +4518,17 @@ void LLVMBackend::ResetForReanalysis()
     pendingCInteropAliases_.clear();
     cAbiFunctionThunkCache_.clear();
     dataStructures.clear();
+    // C++ record identity/triviality follows dataStructures: a survivor would let the next file
+    // pass a record by value on the strength of a registration that no longer exists.
+    cxxRecords_.clear();
+    cxxTriviallyCopyableRecords_.clear();
+    cxxNontrivialRecords_.clear();
+    cxxClasses_.clear();
+    pendingCxxAbi_ = nullptr;   // an aborted registration must not leak clang's plan forward
+    // An aborted declaration could leave a slot armed; the next file's first call of that type
+    // would then construct into storage from a discarded module.
+    pendingCxxSretDest_ = nullptr;
+    pendingCxxSretTypeName_.clear();
     // RegisterEncodedClosureType memoizes on this map but writes the encoded closure's backing
     // entries into dataStructures/functionTable, both just cleared. A survivor makes the next
     // file's registration early-return, leaving `Lambda<int(int)>` resolvable as an encoded name
@@ -6638,6 +6675,71 @@ static BFI DeserializeBfi(const llvm::json::Object& o)
     return b;
 }
 
+// Clang's C++ ABI arrangement, in the llvm::json encoding the --init core cache uses. Field
+// names match the simdjson header-cache encoding so the two stay readable side by side.
+static llvm::json::Object SerializeCxxAbiSlot(const cflat_cinterop::RawAbiSlot& sl)
+{
+    llvm::json::Object o;
+    o["k"] = sl.kind;
+    if (!sl.coerceType.empty())  o["ct"] = sl.coerceType;
+    if (!sl.paddingType.empty()) o["pt"] = sl.paddingType;
+    if (sl.signExt)         o["se"] = true;
+    if (sl.zeroExt)         o["ze"] = true;
+    if (sl.inReg)           o["ir"] = true;
+    if (sl.canBeFlattened)  o["fl"] = true;
+    if (sl.indirectByVal)   o["bv"] = true;
+    if (sl.indirectRealign) o["rl"] = true;
+    if (sl.indirectAlign)   o["ia"] = (int64_t)sl.indirectAlign;
+    if (sl.directOffset)    o["do"] = (int64_t)sl.directOffset;
+    if (sl.llvmArgIndex)    o["ai"] = (int64_t)sl.llvmArgIndex;
+    if (sl.llvmArgCount != 1) o["ac"] = (int64_t)sl.llvmArgCount;
+    return o;
+}
+
+static cflat_cinterop::RawAbiSlot DeserializeCxxAbiSlot(const llvm::json::Object& o)
+{
+    cflat_cinterop::RawAbiSlot sl;
+    if (auto v = o.getInteger("k"))  sl.kind = (int)*v;
+    if (auto v = o.getString("ct"))  sl.coerceType = v->str();
+    if (auto v = o.getString("pt"))  sl.paddingType = v->str();
+    if (auto v = o.getBoolean("se")) sl.signExt = *v;
+    if (auto v = o.getBoolean("ze")) sl.zeroExt = *v;
+    if (auto v = o.getBoolean("ir")) sl.inReg = *v;
+    if (auto v = o.getBoolean("fl")) sl.canBeFlattened = *v;
+    if (auto v = o.getBoolean("bv")) sl.indirectByVal = *v;
+    if (auto v = o.getBoolean("rl")) sl.indirectRealign = *v;
+    if (auto v = o.getInteger("ia")) sl.indirectAlign = (uint64_t)*v;
+    if (auto v = o.getInteger("do")) sl.directOffset = (uint64_t)*v;
+    if (auto v = o.getInteger("ai")) sl.llvmArgIndex = (unsigned)*v;
+    if (auto v = o.getInteger("ac")) sl.llvmArgCount = (unsigned)*v;
+    return sl;
+}
+
+static llvm::json::Object SerializeCxxAbi(const cflat_cinterop::RawAbi& a)
+{
+    llvm::json::Object o;
+    o["r"] = SerializeCxxAbiSlot(a.ret);
+    llvm::json::Array ps;
+    for (const auto& p : a.params) ps.push_back(SerializeCxxAbiSlot(p));
+    o["ps"] = std::move(ps);
+    o["cc"] = (int64_t)a.callingConv;
+    o["ft"] = a.fnTypeText;
+    return o;
+}
+
+static cflat_cinterop::RawAbi DeserializeCxxAbi(const llvm::json::Object& o)
+{
+    cflat_cinterop::RawAbi a;
+    a.valid = true;
+    if (auto* r = o.getObject("r")) a.ret = DeserializeCxxAbiSlot(*r);
+    if (auto* ps = o.getArray("ps"))
+        for (auto& pe : *ps)
+            if (auto* po = pe.getAsObject()) a.params.push_back(DeserializeCxxAbiSlot(*po));
+    if (auto v = o.getInteger("cc")) a.callingConv = (unsigned)*v;
+    if (auto v = o.getString("ft"))  a.fnTypeText = v->str();
+    return a;
+}
+
 static llvm::json::Object SerializeFuncSym(const std::string& key, const FS& s)
 {
     llvm::json::Object o;
@@ -6650,6 +6752,11 @@ static llvm::json::Object SerializeFuncSym(const std::string& key, const FS& s)
     if (s.Variadic)     o["va"] = true;
     if (s.External)     o["ext"] = true;
     if (s.ReturnsOwned) o["ro"] = true;
+    // Clang's C++ arrangement behind Recipe. LLVM types are rebuilt from it after restore;
+    // dropping it would fall the declaration back onto the C size heuristic.
+    if (s.CxxAbi.valid)  o["cxxabi"] = SerializeCxxAbi(s.CxxAbi);
+    if (s.IsCxx)        o["cxx"] = true;
+    if (!s.IsNoexcept)  o["nx"] = true;
     if (s.ReturnsAlias) o["ra"] = true;
     if (s.IsMethod)     o["m"]  = true;
     if (!s.RequiredLocks.empty())
@@ -7438,6 +7545,9 @@ bool LLVMBackend::LoadCoreBitcodeIfFresh(const std::string& cacheDir, const std:
             if (auto v = fo->getBoolean("va")) sym.Variadic = *v;
             if (auto v = fo->getBoolean("ext")) sym.External = *v;
             if (auto v = fo->getBoolean("ro")) sym.ReturnsOwned = *v;
+            if (auto v = fo->getBoolean("cxx")) sym.IsCxx = *v;
+            if (auto v = fo->getBoolean("nx")) sym.IsNoexcept = !*v;
+            if (auto* ab = fo->getObject("cxxabi")) sym.CxxAbi = DeserializeCxxAbi(*ab);
             if (auto v = fo->getBoolean("ra")) sym.ReturnsAlias = *v;
             if (auto v = fo->getBoolean("m"))  sym.IsMethod = *v;
             if (auto* rl = fo->getArray("rl"))
@@ -7496,10 +7606,20 @@ bool LLVMBackend::LoadCoreBitcodeIfFresh(const std::string& cacheDir, const std:
     } // end CoreDes:Structs
 
     // AbiRecipe contains LLVM type pointers and is recomputed after struct metadata is restored.
+    // A C++ declaration's recipe is clang's, not a heuristic: rebuild it from the serialized
+    // arrangement, never from ComputeAbiRecipe, or a warm cache would silently re-classify it.
     for (auto& entry : functionTable)
         for (auto& sym : entry.second)
             if (sym.External)
             {
+                if (sym.CxxAbi.valid)
+                {
+                    AbiRecipe recipe;
+                    if (BuildAbiRecipeFromClangPlan(sym.SourceName, sym.CxxAbi, sym.ReturnType,
+                                                    sym.Parameters, recipe))
+                        sym.Recipe = std::move(recipe);
+                    continue;
+                }
                 auto recipe = ComputeAbiRecipe(sym.ReturnType, sym.Parameters);
                 if (recipe.hasLowering) sym.Recipe = std::move(recipe);
             }

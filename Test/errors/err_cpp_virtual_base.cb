@@ -1,0 +1,14 @@
+// VIRTUAL inheritance is refused: the Itanium ABI reaches a virtual base through a VTT and a
+// vbase offset in the vtable, neither of which cflat models. The class stays an opaque shell -
+// legal to hold through a pointer, illegal to lay out, construct or name a member of.
+// Non-virtual inheritance and virtual DISPATCH are supported; see Test/test_c_interop.cb M6.
+import cpp "cpp_interop_poly.h";
+
+extern int main()
+{
+    expect_error("uses virtual inheritance, which is not supported yet") {
+        cpppoly.VBaseMid* m = nullptr;
+        int v = m.mv;
+    }
+    return 0;
+}

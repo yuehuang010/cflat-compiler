@@ -1,0 +1,15 @@
+// An ABSTRACT C++ class has an unoverridden pure virtual member, so no complete object of it can
+// exist. Creating one - on the stack or with 'new' - must be refused before any constructor call
+// is emitted; a pointer to it stays legal so a derived object can be used through it.
+import cpp "cpp_interop_poly.h";
+
+extern int main()
+{
+    expect_error("it is abstract (it has an unoverridden pure virtual member)") {
+        cpppoly.Abstract a = default;
+    }
+    expect_error("it is abstract (it has an unoverridden pure virtual member)") {
+        cpppoly.Abstract* p = new cpppoly.Abstract();
+    }
+    return 0;
+}

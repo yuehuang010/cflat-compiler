@@ -1142,24 +1142,37 @@ void LLVMBackend::ApplyAbiCallAttributes(llvm::CallInst* ci, const AbiRecipe& re
             const AbiSlot& s = recipe.paramSlots[i];
             if (s.kind == AbiSlot::ByVal)
             {
-                ci->addParamAttr(attrIdx, llvm::Attribute::getWithByValType(*context, s.structTy));
+                if (s.indirectByVal)
+                    ci->addParamAttr(attrIdx, llvm::Attribute::getWithByValType(*context, s.structTy));
                 if (s.align > 0)
                     ci->addParamAttr(attrIdx, llvm::Attribute::getWithAlignment(*context, llvm::Align(s.align)));
+            }
+            else if (s.kind == AbiSlot::Direct)
+            {
+                if (s.signExt) ci->addParamAttr(attrIdx, llvm::Attribute::SExt);
+                if (s.zeroExt) ci->addParamAttr(attrIdx, llvm::Attribute::ZExt);
             }
             attrIdx += SlotLLVMParamCount(s); // CoercePair expands to two LLVM params
         }
     }
 
-llvm::Value* LLVMBackend::EmitAbiLoweredCall(const FunctionSymbol& candidate, std::vector<llvm::Value*>& argList)
+llvm::Value* LLVMBackend::EmitAbiLoweredCall(const FunctionSymbol& candidate, std::vector<llvm::Value*>& argList,
+                                            llvm::Value* sretDest,
+                                            const std::vector<llvm::Value*>* indirectArgAddrs,
+                                            llvm::Value* calleeOverride)
 {
         const AbiRecipe& recipe = candidate.Recipe;
         std::vector<llvm::Value*> loweredArgs;
         loweredArgs.reserve(argList.size() + (recipe.retSlot.kind == AbiSlot::SRetReturn ? 1 : 0));
 
-        llvm::AllocaInst* sretSlot = nullptr;
+        llvm::Value* sretSlot = nullptr;
+        const bool sretIntoCallerSlot = sretDest != nullptr
+            && recipe.retSlot.kind == AbiSlot::SRetReturn;
         if (recipe.retSlot.kind == AbiSlot::SRetReturn)
         {
-            sretSlot = AllocaAtEntry(recipe.retSlot.structTy, nullptr, "sret", recipe.retSlot.align);
+            sretSlot = sretIntoCallerSlot
+                ? sretDest
+                : AllocaAtEntry(recipe.retSlot.structTy, nullptr, "sret", recipe.retSlot.align);
             loweredArgs.push_back(sretSlot);
         }
 
@@ -1171,14 +1184,29 @@ llvm::Value* LLVMBackend::EmitAbiLoweredCall(const FunctionSymbol& candidate, st
             {
                 loweredArgs.push_back(v);
             }
+            else if (s.kind == AbiSlot::Ignore)
+            {
+                // Clang passes nothing for this argument.
+            }
             else if (s.kind == AbiSlot::CoerceToInt)
             {
                 // v is a struct value. Place in an alloca, then load the eightbyte through a
                 // bitcast - portable across all element layouts and lets LLVM coalesce. The
                 // coerce type may be integer or SSE (float/double/<2 x float>) under SysV.
-                auto* slot = AllocaAtEntry(s.structTy, nullptr, "abi.coerce", s.align);
+                auto* slot = AllocaForCoerce(s.structTy, s.coerceTy, s.align, "abi.coerce");
                 builder->CreateStore(v, slot);
                 loweredArgs.push_back(LoadCoerceAt(slot, s.coerceTy, 0));
+            }
+            else if (s.kind == AbiSlot::CoerceFlat)
+            {
+                // Clang's general direct coercion: store the record, then hand over one argument
+                // per element of the coerce struct, read at THAT struct's own field offsets.
+                auto* slot = AllocaForCoerce(s.structTy, s.coerceStructTy, s.align, "abi.coerce");
+                builder->CreateStore(v, slot);
+                const llvm::StructLayout* sl = module->getDataLayout().getStructLayout(s.coerceStructTy);
+                for (unsigned e = 0; e < s.coerceStructTy->getNumElements(); ++e)
+                    loweredArgs.push_back(LoadCoerceAt(slot, s.coerceStructTy->getElementType(e),
+                                                       sl->getElementOffset(e)));
             }
             else if (s.kind == AbiSlot::CoercePair)
             {
@@ -1191,23 +1219,53 @@ llvm::Value* LLVMBackend::EmitAbiLoweredCall(const FunctionSymbol& candidate, st
             }
             else // ByVal
             {
-                auto* slot = AllocaAtEntry(s.structTy, nullptr, "abi.byval", s.align);
-                builder->CreateStore(v, slot);
-                loweredArgs.push_back(slot);
+                // A caller-prepared address (a nontrivial C++ temp that was copy- or
+                // move-CONSTRUCTED) is handed over as is: storing a loaded struct over it would
+                // be exactly the byte copy the C++ type forbids.
+                llvm::Value* ready = indirectArgAddrs != nullptr && i < indirectArgAddrs->size()
+                    ? (*indirectArgAddrs)[i] : nullptr;
+                if (ready != nullptr)
+                {
+                    loweredArgs.push_back(ready);
+                }
+                else
+                {
+                    auto* slot = AllocaAtEntry(s.structTy, nullptr, "abi.byval", s.align);
+                    builder->CreateStore(v, slot);
+                    loweredArgs.push_back(slot);
+                }
             }
         }
 
-        auto* ci = builder->CreateCall(candidate.Function, loweredArgs);
+        // A virtual member is reached through the pointer loaded out of the receiver's vptr; the
+        // SIGNATURE still comes from the declaration, which carries clang's own arrangement.
+        auto* ci = calleeOverride != nullptr
+            ? builder->CreateCall(candidate.Function->getFunctionType(), calleeOverride, loweredArgs)
+            : builder->CreateCall(candidate.Function, loweredArgs);
         ci->setCallingConv(candidate.Function->getCallingConv());
         ApplyAbiCallAttributes(ci, recipe);
 
         if (recipe.retSlot.kind == AbiSlot::SRetReturn)
+        {
+            // Constructed straight into the caller's storage: the slot IS the result.
+            if (sretIntoCallerSlot) return sretSlot;
             return builder->CreateLoad(recipe.retSlot.structTy, sretSlot);
+        }
         if (recipe.retSlot.kind == AbiSlot::CoerceToInt)
         {
-            auto* slot = AllocaAtEntry(recipe.retSlot.structTy, nullptr, "abi.ret", recipe.retSlot.align);
+            auto* slot = AllocaForCoerce(recipe.retSlot.structTy, recipe.retSlot.coerceTy,
+                                         recipe.retSlot.align, "abi.ret");
             StoreCoerceAt(slot, ci, 0);
             return builder->CreateLoad(recipe.retSlot.structTy, slot);
+        }
+        if (recipe.retSlot.kind == AbiSlot::CoerceFlat)
+        {
+            const AbiSlot& rs = recipe.retSlot;
+            auto* slot = AllocaForCoerce(rs.structTy, rs.coerceStructTy, rs.align, "abi.ret");
+            const llvm::StructLayout* sl = module->getDataLayout().getStructLayout(rs.coerceStructTy);
+            for (unsigned e = 0; e < rs.coerceStructTy->getNumElements(); ++e)
+                StoreCoerceAt(slot, builder->CreateExtractValue(ci, e), sl->getElementOffset(e));
+            return builder->CreateLoad(rs.structTy, slot);
         }
         if (recipe.retSlot.kind == AbiSlot::CoercePair)
         {
@@ -1219,6 +1277,24 @@ llvm::Value* LLVMBackend::EmitAbiLoweredCall(const FunctionSymbol& candidate, st
             return builder->CreateLoad(recipe.retSlot.structTy, slot);
         }
         return ci; // Direct return
+    }
+
+/*
+ * Scratch slot for a coercion. Clang may coerce a record to a type WIDER than the record itself
+ * (a 12-byte aggregate to [2 x i64] on AArch64), so a plain alloca of the record would be read
+ * past its end. Allocate whichever of the two is larger, and at the stricter alignment.
+ */
+llvm::AllocaInst* LLVMBackend::AllocaForCoerce(llvm::StructType* structTy, llvm::Type* coerceTy,
+                                               uint64_t align, const char* name)
+{
+        const llvm::DataLayout& dl = module->getDataLayout();
+        llvm::Type* holder = structTy;
+        if (coerceTy != nullptr
+            && (uint64_t)dl.getTypeAllocSize(coerceTy) > (uint64_t)dl.getTypeAllocSize(structTy))
+            holder = coerceTy;
+        uint64_t want = std::max<uint64_t>(align, dl.getABITypeAlign(structTy).value());
+        if (coerceTy != nullptr) want = std::max<uint64_t>(want, dl.getABITypeAlign(coerceTy).value());
+        return AllocaAtEntry(holder, nullptr, name, want);
     }
 
 llvm::Value* LLVMBackend::LoadCoerceAt(llvm::Value* structSlot, llvm::Type* coerceTy, uint64_t byteOff)

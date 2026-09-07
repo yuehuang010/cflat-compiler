@@ -2482,8 +2482,11 @@ void MainListener::ParseIfConstDeclaration(CFlatParser::IfConstDeclarationContex
                                 std::string dr = dc->StringLiteral()->getText();
                                 if (dr.size() >= 2) grpDefines.push_back(DequoteStringLiteral(dr));
                             }
+                        bool grpIsCpp = imp->children.size() >= 2
+                                     && imp->children[1]->getText() == "cpp";
                         Compiler()->CompileImportGroup(Compiler()->currentSourceFilePath_, entries,
-                                                       grpLibs, grpDefines, imp->cacheClause() != nullptr);
+                                                       grpLibs, grpDefines, imp->cacheClause() != nullptr,
+                                                       grpIsCpp);
                         continue;
                     }
                 }
@@ -2527,7 +2530,11 @@ void MainListener::ParseIfConstDeclaration(CFlatParser::IfConstDeclarationContex
                         std::string dr = dc->StringLiteral()->getText();
                         if (dr.size() >= 2) extraDefines.push_back(DequoteStringLiteral(dr));
                     }
-                Compiler()->CompileImportedFile(Compiler()->currentSourceFilePath_, importFilename, ns, "", explicitLibs, extraDefines);
+                // `import cpp "..."` inside an if-const branch selects C++ mode, same as at file scope.
+                bool isCppImport = imp->children.size() >= 2 && imp->children[1]->getText() == "cpp";
+                Compiler()->CompileImportedFile(Compiler()->currentSourceFilePath_, importFilename, ns, "",
+                                                explicitLibs, extraDefines,
+                                                imp->cacheClause() != nullptr, isCppImport);
             }
         }
 
@@ -3439,6 +3446,229 @@ bool MainListener::IsBareIdentifierText(const std::string& text) {
         return true;
     }
 
+/*
+ * Descend a single-child expression chain (and parentheses) to the sole postfix expression, or
+ * null when any operator sits above it. Shape probe only - nothing is evaluated here.
+ */
+static CFlatParser::PostfixExpressionContext* SolePostfixExpression(antlr4::tree::ParseTree* node)
+{
+        if (node == nullptr) return nullptr;
+        if (auto* pf = dynamic_cast<CFlatParser::PostfixExpressionContext*>(node)) return pf;
+        auto* ctx = dynamic_cast<antlr4::ParserRuleContext*>(node);
+        if (ctx == nullptr) return nullptr;
+        if (ctx->children.size() == 1) return SolePostfixExpression(ctx->children[0]);
+        if (auto* primary = dynamic_cast<CFlatParser::PrimaryExpressionContext*>(ctx);
+            primary != nullptr && primary->expression() != nullptr)
+            return SolePostfixExpression(primary->expression());
+        return nullptr;
+    }
+
+CFlatParser::ArgumentExpressionListContext* MainListener::ForeignCxxConstructArgs(
+        antlr4::tree::ParseTree* node, const std::string& typeName)
+{
+        auto* pf = SolePostfixExpression(node);
+        if (pf == nullptr) return nullptr;
+        auto args = pf->argumentExpressionList();
+        if (args.size() != 1) return nullptr;
+        const std::string full = pf->getText();
+        const std::string suffix = "(" + args[0]->getText() + ")";
+        if (full.size() <= suffix.size()) return nullptr;
+        if (full.compare(full.size() - suffix.size(), suffix.size(), suffix) != 0) return nullptr;
+        const std::string callee = full.substr(0, full.size() - suffix.size());
+        if (callee == typeName) return args[0];
+        // `using ns;` lets the class be named without its namespace, so the trailing component
+        // of the registered dotted name is an equally valid spelling of the same type.
+        auto dot = typeName.rfind('.');
+        if (dot != std::string::npos && callee == typeName.substr(dot + 1)) return args[0];
+        return nullptr;
+    }
+
+bool MainListener::TryDeclareForeignCxxLocal(CFlatParser::InitDeclaratorContext* initDeclarator,
+                                             CFlatParser::DirectDeclaratorContext* direct,
+                                             const LLVMBackend::DeclTypeAndValue& declType,
+                                             const std::string& name, size_t line,
+                                             std::vector<std::pair<std::string, llvm::AllocaInst*>>& allocList)
+{
+        auto* compiler = Compiler(direct);
+        const std::string typeName = declType.TypeName;
+        if (!compiler->IsForeignNontrivialCxxClass(typeName)) return false;
+        if (declType.Pointer || declType.ConstArraySize > 0 || !declType.ConstInnerDimensions.empty()
+            || declType.IsArrayView || declType.IsInterface || declType.ArraySize != nullptr)
+            return false;   // pointers and arrays of the class keep the ordinary path
+        if (compiler->RejectUnsupportedCxxLayout(typeName)) return true;
+        if (compiler->RejectAbstractCxxClass(typeName, "declare a local of")) return true;
+
+        auto* initializer = initDeclarator->initializer();
+        auto* assign = initializer != nullptr ? initializer->assignmentExpression() : nullptr;
+        const bool isDefaultForm = initializer != nullptr && initializer->Default() != nullptr;
+        auto* ctorArgs = assign != nullptr ? ForeignCxxConstructArgs(assign, typeName) : nullptr;
+        auto* moveExpr = assign != nullptr ? TopLevelMoveExpression(assign) : nullptr;
+
+        auto badInit = [&](antlr4::ParserRuleContext* where) {
+            LogErrorContext(where, std::format(
+                "cannot initialize C++ class '{}' from this expression; use '{}(args)', "
+                "'= default', a '{}' lvalue, or 'move <{}> lvalue'",
+                typeName, typeName, typeName, typeName));
+        };
+        if (initializer != nullptr && assign == nullptr && !isDefaultForm)
+        {
+            badInit(initializer);
+            return true;
+        }
+
+        // The slot is allocated BEFORE anything is evaluated: every form below constructs into it.
+        LLVMBackend::DeclTypeAndValue slotType = declType;
+        slotType.VariableName = name;
+        if (compiler->stackNamedVariable.back().namedVariable.count(name))
+            LogErrorContext(direct, std::format(
+                "redeclaration of '{}' in the same scope; use a different name or assign to the "
+                "existing variable", name));
+        llvm::Value* slotValue = compiler->CreateLocalVariable(slotType, nullptr, nullptr, line,
+                                                               slotType.UserAlignValue);
+        auto* slot = llvm::dyn_cast_or_null<llvm::AllocaInst>(slotValue);
+        allocList.push_back(std::pair(name, slot));
+        if (slotValue == nullptr) return true;
+
+        // The class must be destructible from CFlat code, or the local could never be released.
+        if (compiler->GetOrCreateCxxClassDestructor(typeName) == nullptr)
+        {
+            LogErrorContext(direct, std::format(
+                "cannot declare a local of C++ class '{}': it has no destructor cflat can call "
+                "(the destructor is implicit or defined inline in the header) - hold it through a "
+                "pointer instead", typeName));
+            return true;
+        }
+
+        // ---- `= default`, or no initializer at all: the default constructor ----------------
+        if (initializer == nullptr || isDefaultForm)
+        {
+            const auto* ctor = compiler->FindCxxDefaultCtor(typeName);
+            if (ctor == nullptr)
+            {
+                const auto* info = compiler->GetCxxClassInfo(typeName);
+                LogErrorContext(direct, std::format(
+                    "C++ class '{}' has no default constructor cflat can call{} - initialize it "
+                    "with '{}(args)'", typeName,
+                    info != nullptr && info->hasDeletedDefaultCtor ? " (it is deleted)" : "",
+                    typeName));
+                return true;
+            }
+            compiler->SetCurrentDebugLocation(line);
+            compiler->EmitCxxStructorCall(typeName, *ctor, slot, {});
+            return true;
+        }
+
+        // ---- `T(args)`: pick the constructor overload from the argument types ---------------
+        if (ctorArgs != nullptr)
+        {
+            std::vector<llvm::Value*> argValues;
+            std::vector<LLVMBackend::TypeAndValue> argTypes;
+            for (auto* named : ctorArgs->argumentNamedExpression())
+            {
+                auto* argAssign = named->assignmentExpression();
+                if (argAssign == nullptr)
+                {
+                    LogErrorContext(named, std::format(
+                        "a constructor argument for C++ class '{}' must be a plain expression",
+                        typeName));
+                    return true;
+                }
+                auto nv = ParseAssignmentExpressionNamed(argAssign);
+                // A bare lvalue comes back unloaded (Storage set, Primary null); LoadNamedVariable
+                // is the one path that materializes every binding shape.
+                argValues.push_back(LoadNamedVariable(nv));
+                argTypes.push_back(nv.TypeAndValue);
+            }
+            std::string why;
+            const auto* ctor = compiler->SelectCxxConstructor(typeName, argTypes, why);
+            if (ctor == nullptr)
+            {
+                LogErrorContext(direct, std::format("C++ class '{}' {}", typeName, why));
+                return true;
+            }
+            compiler->SetCurrentDebugLocation(line);
+            compiler->EmitCxxStructorCall(typeName, *ctor, slot, argValues);
+            return true;
+        }
+
+        // ---- `move <lvalue>`: move construction, source consumed ---------------------------
+        if (moveExpr != nullptr)
+        {
+            auto* inner = moveExpr->unaryExpression();
+            const std::string srcName = inner != nullptr ? inner->getText() : std::string();
+            if (!IsBareIdentifierText(srcName))
+            {
+                LogErrorContext(moveExpr, std::format(
+                    "'move' into C++ class '{}' needs a plain variable as its source", typeName));
+                return true;
+            }
+            auto* srcNV = compiler->FindLiveNamedVariable(srcName);
+            if (srcNV == nullptr || srcNV->Storage == nullptr
+                || srcNV->TypeAndValue.TypeName != typeName || srcNV->TypeAndValue.Pointer)
+            {
+                LogErrorContext(moveExpr, std::format(
+                    "'{}' is not a '{}' value that can be moved into '{}'", srcName, typeName, name));
+                return true;
+            }
+            if (srcNV->IsMoved || srcNV->ExplicitlyMovedNull)
+            {
+                LogErrorContext(moveExpr, std::format("use of moved variable '{}'", srcName));
+                return true;
+            }
+            compiler->SetCurrentDebugLocation(line);
+            compiler->EmitCxxCopyOrMoveConstruct(typeName, slot, srcNV->Storage, /*useMove*/ true,
+                                                 std::format("into local '{}'", name).c_str());
+            // RULING: the moved-from object is compile-time consumed but STILL destroyed at scope
+            // exit - C++ has no null state to leave behind, so its destructor must run.
+            compiler->MarkVariableMoved(srcName);
+            return true;
+        }
+
+        // ---- a `T` lvalue: copy construction ------------------------------------------------
+        {
+            const std::string srcText = assign->getText();
+            if (IsBareIdentifierText(srcText))
+            {
+                auto* srcNV = compiler->FindLiveNamedVariable(srcText);
+                if (srcNV != nullptr && srcNV->Storage != nullptr && !srcNV->TypeAndValue.Pointer
+                    && srcNV->TypeAndValue.TypeName == typeName)
+                {
+                    if (srcNV->IsMoved || srcNV->ExplicitlyMovedNull)
+                    {
+                        LogErrorContext(assign, std::format("use of moved variable '{}'", srcText));
+                        return true;
+                    }
+                    compiler->SetCurrentDebugLocation(line);
+                    compiler->EmitCxxCopyOrMoveConstruct(typeName, slot, srcNV->Storage,
+                                                         /*useMove*/ false,
+                                                         std::format("into local '{}'", name).c_str());
+                    return true;
+                }
+            }
+        }
+
+        // ---- a call returning T by value: construct straight into the slot ------------------
+        // Only a SINGLE call with no nested call is accepted, so the armed destination cannot be
+        // consumed by an inner call of the same type before the outer one reaches the emitter.
+        if (auto* pf = SolePostfixExpression(assign);
+            pf != nullptr && pf->argumentExpressionList().size() == 1
+            && pf->argumentExpressionList()[0]->getText().find('(') == std::string::npos)
+        {
+            compiler->SetCurrentDebugLocation(line);
+            compiler->pendingCxxSretDest_ = slot;
+            compiler->pendingCxxSretTypeName_ = typeName;
+            ParseAssignmentExpressionNamed(assign);
+            const bool consumed = compiler->pendingCxxSretDest_ == nullptr;
+            compiler->pendingCxxSretDest_ = nullptr;
+            compiler->pendingCxxSretTypeName_.clear();
+            if (!consumed) badInit(assign);
+            return true;
+        }
+
+        badInit(assign);
+        return true;
+    }
+
 void MainListener::ReleaseOwningLocalNow(antlr4::ParserRuleContext* ctx, LLVMBackend::NamedVariable* nv,
                                const std::string& name) {
         auto* compiler = Compiler(ctx);
@@ -3458,7 +3688,8 @@ void MainListener::ReleaseOwningLocalNow(antlr4::ParserRuleContext* ctx, LLVMBac
         nv->IsOwning = false;
         nv->RefCountStorage = nullptr;
         compiler->MarkVariableMoved(name);
-        if (compiler->IsCoreUniqueType(nv->TypeAndValue.TypeName))
+        if (compiler->IsCoreUniqueType(nv->TypeAndValue.TypeName)
+            || compiler->IsForeignNontrivialCxxClass(nv->TypeAndValue.TypeName))
             compiler->MarkVariableExplicitlyMovedNull(name);
     }
 
@@ -4001,6 +4232,15 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
             // A declarator with parens but no paramTypeList is a zero-parameter function:
             // matches grammar alternative `directDeclarator '(' identifierList? ')'`
             bool hasParens = declarator->children.size() > 1;
+
+            // A local of a foreign NONTRIVIAL C++ class is constructed into its slot rather than
+            // assigned a materialized value; that path owns the whole declaration.
+            if (paramTypeList == nullptr && !hasParens && !global_scope
+                && !typeAndValue.staticStorage && direct != nullptr
+                && direct->assignmentExpression() == nullptr
+                && TryDeclareForeignCxxLocal(initDecl, direct, typeAndValue, declaratorName,
+                                             line, allocList))
+                continue;
 
             if (paramTypeList != nullptr || hasParens)
             {
@@ -5424,6 +5664,13 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                     assignmentExpression, typeAndValue, right,
                                     std::format("variable '{}'", name)))
                                 right = nullptr;
+
+                            // M6 - `Base* b = derivedPtr;` shifts to the base subobject, which is
+                            // a no-op for a primary base and a byte offset for any other.
+                            if (right != nullptr)
+                                right = compiler->AdjustCxxPointerForStore(
+                                    typeAndValue, initializerSourceNV.TypeAndValue, right,
+                                    std::format("variable '{}'", name));
 
                             // Pointer variable assigned a struct value: catch the mismatch here
                             // with a clear message rather than letting LLVM assert inside CreateCast.

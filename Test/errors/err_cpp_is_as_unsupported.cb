@@ -1,0 +1,17 @@
+// 'is' and 'as' on an imported C++ class would be a dynamic_cast, which needs the Itanium RTTI ABI
+// (__dynamic_cast plus a typeinfo reference). CFlat's own is/as reads its interface type
+// descriptors, which a C++ object does not carry, so answering from them would be silently wrong.
+import cpp "cpp_interop_poly.h";
+
+extern int main()
+{
+    expect_error("a C++ runtime type test is a dynamic_cast, which needs the C++ RTTI ABI") {
+        cpppoly.Shape* s = nullptr;
+        bool b = s is cpppoly.Circle;
+    }
+    expect_error("a C++ runtime type test is a dynamic_cast, which needs the C++ RTTI ABI") {
+        cpppoly.Shape* s2 = nullptr;
+        cpppoly.Circle* c = s2 as cpppoly.Circle;
+    }
+    return 0;
+}

@@ -1,0 +1,13 @@
+// A move-only imported C++ class: its copy constructor is deleted, so copy-initializing a local
+// from a lvalue of it must be refused. Silently move-constructing instead would consume a source
+// the user never wrote 'move' on.
+import cpp "cpp_interop_basic.h";
+
+extern int main()
+{
+    expect_error("its copy constructor is deleted") {
+        cppi.NoCopy a = cppi.NoCopy(1);
+        cppi.NoCopy b = a;
+    }
+    return 0;
+}

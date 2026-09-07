@@ -1159,6 +1159,217 @@ LLVMBackend::AbiRecipe LLVMBackend::ComputeAbiRecipe(const TypeAndValue& retType
         return recipe;
     }
 
+namespace
+{
+    // Recursive-descent reader for the LLVM IR type text clang serialized. Deliberately narrow:
+    // it accepts exactly the forms an ABIArgInfo coerce type can take, and returns nullptr on
+    // anything else so the caller reports it instead of inventing a layout.
+    struct LlvmTypeTextReader
+    {
+        const std::string& s;
+        size_t i = 0;
+        llvm::LLVMContext& ctx;
+        LlvmTypeTextReader(const std::string& text, llvm::LLVMContext& c) : s(text), ctx(c) {}
+
+        void Skip() { while (i < s.size() && (s[i] == ' ' || s[i] == '\t')) ++i; }
+        bool Eat(char c) { Skip(); if (i < s.size() && s[i] == c) { ++i; return true; } return false; }
+        bool Word(const char* w)
+        {
+            Skip();
+            size_t n = std::strlen(w);
+            if (s.compare(i, n, w) != 0) return false;
+            size_t after = i + n;
+            if (after < s.size() && (std::isalnum((unsigned char)s[after]) || s[after] == '_')) return false;
+            i = after;
+            return true;
+        }
+        bool Number(uint64_t& out)
+        {
+            Skip();
+            size_t start = i;
+            while (i < s.size() && std::isdigit((unsigned char)s[i])) ++i;
+            if (start == i) return false;
+            out = std::strtoull(s.substr(start, i - start).c_str(), nullptr, 10);
+            return true;
+        }
+
+        llvm::Type* Parse()
+        {
+            Skip();
+            if (i >= s.size()) return nullptr;
+            if (s[i] == '[')
+            {
+                ++i;
+                uint64_t n = 0;
+                if (!Number(n) || !Word("x")) return nullptr;
+                llvm::Type* e = Parse();
+                if (e == nullptr || !Eat(']')) return nullptr;
+                return llvm::ArrayType::get(e, n);
+            }
+            if (s[i] == '<')
+            {
+                ++i;
+                Skip();
+                if (i < s.size() && s[i] == '{')      // packed literal struct: <{ ... }>
+                {
+                    llvm::Type* st = ParseStructBody(/*packed*/ true);
+                    if (st == nullptr || !Eat('>')) return nullptr;
+                    return st;
+                }
+                uint64_t n = 0;
+                if (!Number(n) || !Word("x")) return nullptr;
+                llvm::Type* e = Parse();
+                if (e == nullptr || !Eat('>')) return nullptr;
+                return llvm::FixedVectorType::get(e, (unsigned)n);
+            }
+            if (s[i] == '{') return ParseStructBody(/*packed*/ false);
+            if (s[i] == 'i' && i + 1 < s.size() && std::isdigit((unsigned char)s[i + 1]))
+            {
+                ++i;
+                uint64_t bits = 0;
+                if (!Number(bits) || bits == 0 || bits > 1 << 20) return nullptr;
+                return llvm::IntegerType::get(ctx, (unsigned)bits);
+            }
+            if (Word("void"))     return llvm::Type::getVoidTy(ctx);
+            if (Word("ptr"))      return llvm::PointerType::get(ctx, 0);
+            if (Word("float"))    return llvm::Type::getFloatTy(ctx);
+            if (Word("double"))   return llvm::Type::getDoubleTy(ctx);
+            if (Word("half"))     return llvm::Type::getHalfTy(ctx);
+            if (Word("bfloat"))   return llvm::Type::getBFloatTy(ctx);
+            if (Word("fp128"))    return llvm::Type::getFP128Ty(ctx);
+            if (Word("x86_fp80")) return llvm::Type::getX86_FP80Ty(ctx);
+            return nullptr;
+        }
+
+        llvm::Type* ParseStructBody(bool packed)
+        {
+            if (!Eat('{')) return nullptr;
+            std::vector<llvm::Type*> elems;
+            Skip();
+            if (i < s.size() && s[i] == '}') { ++i; return llvm::StructType::get(ctx, elems, packed); }
+            for (;;)
+            {
+                llvm::Type* e = Parse();
+                if (e == nullptr) return nullptr;
+                elems.push_back(e);
+                if (Eat(',')) continue;
+                if (Eat('}')) break;
+                return nullptr;
+            }
+            return llvm::StructType::get(ctx, elems, packed);
+        }
+    };
+}
+
+llvm::Type* LLVMBackend::ParseLlvmTypeText(const std::string& text) const
+{
+        if (text.empty()) return nullptr;
+        LlvmTypeTextReader r(text, *context);
+        llvm::Type* t = r.Parse();
+        r.Skip();
+        return (t != nullptr && r.i == text.size()) ? t : nullptr;
+    }
+
+bool LLVMBackend::BuildAbiRecipeFromClangPlan(const std::string& functionName,
+                                              const cflat_cinterop::RawAbi& plan,
+                                              const TypeAndValue& retType,
+                                              const std::vector<TypeAndValue>& params,
+                                              AbiRecipe& out)
+{
+        using RS = cflat_cinterop::RawAbiSlot;
+        if (!plan.valid || plan.params.size() != params.size()) return false;
+
+        auto refuse = [&](const char* what) {
+            LogError(std::format("C++ function '{}' uses a calling convention cflat cannot express "
+                                 "yet ({}); wrap it in a function that passes the value by pointer",
+                                 functionName, what));
+            return false;
+        };
+
+        auto build = [&](const RS& ps, const TypeAndValue& tv, bool isReturn, AbiSlot& slot) -> bool
+        {
+            switch (ps.kind)
+            {
+            case RS::Ignore:
+                if (!isReturn) { slot.kind = AbiSlot::Ignore; return true; }
+                if (!tv.Pointer && tv.TypeName == "void") { slot.kind = AbiSlot::Direct; return true; }
+                return refuse("an ignored non-void result");
+
+            case RS::Direct:
+            case RS::Extend:
+            {
+                if (!ps.paddingType.empty()) return refuse("a padded direct argument");
+                if (ps.directOffset != 0)    return refuse("a direct argument at a non-zero offset");
+                if (!IsByValueStructTV(tv))
+                {
+                    // Scalar or pointer: the natural CFlat type already IS the ABI type; clang
+                    // only adds the sign/zero extension hint. The whole-signature check below
+                    // catches any case where that assumption does not hold.
+                    slot.kind = AbiSlot::Direct;
+                    slot.signExt = ps.signExt;
+                    slot.zeroExt = ps.zeroExt;
+                    return true;
+                }
+                llvm::Type* ct = ParseLlvmTypeText(ps.coerceType);
+                if (ct == nullptr)
+                    return refuse("an unreadable coercion type");
+                auto sit = dataStructures.find(tv.TypeName);
+                if (sit == dataStructures.end() || sit->second.StructType == nullptr)
+                    return refuse("an unregistered record");
+                slot.structTy = sit->second.StructType;
+                slot.align = module->getDataLayout().getABITypeAlign(slot.structTy).value();
+                if (auto* cst = llvm::dyn_cast<llvm::StructType>(ct);
+                    cst != nullptr && ps.canBeFlattened && !isReturn)
+                {
+                    slot.kind = AbiSlot::CoerceFlat;
+                    slot.coerceStructTy = cst;
+                }
+                else
+                {
+                    slot.kind = AbiSlot::CoerceToInt;
+                    slot.coerceTy = ct;
+                }
+                return true;
+            }
+
+            case RS::Indirect:
+            {
+                if (!IsByValueStructTV(tv)) return refuse("an indirect non-record argument");
+                auto sit = dataStructures.find(tv.TypeName);
+                if (sit == dataStructures.end() || sit->second.StructType == nullptr)
+                    return refuse("an unregistered record");
+                slot.kind = isReturn ? AbiSlot::SRetReturn : AbiSlot::ByVal;
+                slot.structTy = sit->second.StructType;
+                slot.align = ps.indirectAlign;
+                slot.indirectByVal = isReturn ? true : ps.indirectByVal;
+                return true;
+            }
+
+            case RS::Expand:          return refuse("Expand");
+            case RS::CoerceAndExpand: return refuse("CoerceAndExpand");
+            case RS::InAlloca:        return refuse("InAlloca");
+            case RS::IndirectAliased: return refuse("IndirectAliased");
+            case RS::TargetSpecific:  return refuse("a target-specific arrangement");
+            default:                  return refuse("an unknown arrangement");
+            }
+        };
+
+        AbiRecipe recipe;
+        recipe.fromClang = true;
+        if (!build(plan.ret, retType, /*isReturn*/ true, recipe.retSlot)) return false;
+        recipe.paramSlots.resize(params.size());
+        for (size_t i = 0; i < params.size(); ++i)
+            if (!build(plan.params[i], params[i], /*isReturn*/ false, recipe.paramSlots[i]))
+                return false;
+
+        recipe.hasLowering = (recipe.retSlot.kind != AbiSlot::Direct);
+        if (!recipe.hasLowering)
+            for (const auto& sl : recipe.paramSlots)
+                if (sl.kind != AbiSlot::Direct || sl.signExt || sl.zeroExt) { recipe.hasLowering = true; break; }
+        out = std::move(recipe);
+        return true;
+    }
+
 llvm::FunctionType* LLVMBackend::BuildExternFunctionType(const TypeAndValue& retType,
                                                 const std::vector<TypeAndValue>& params,
                                                 bool varargs,
@@ -1178,6 +1389,10 @@ llvm::FunctionType* LLVMBackend::BuildExternFunctionType(const TypeAndValue& ret
             loweredRet = recipe.retSlot.coerceTy;
         else if (recipe.retSlot.kind == AbiSlot::CoercePair)
             loweredRet = llvm::StructType::get(*context, { recipe.retSlot.coerceTy, recipe.retSlot.coerceTy2 });
+        else if (recipe.retSlot.kind == AbiSlot::CoerceFlat)
+            loweredRet = recipe.retSlot.coerceStructTy;
+        else if (recipe.retSlot.kind == AbiSlot::Ignore)
+            loweredRet = builder->getVoidTy();
         else
             loweredRet = GetCCompatibleType(retType);
 
@@ -1190,6 +1405,14 @@ llvm::FunctionType* LLVMBackend::BuildExternFunctionType(const TypeAndValue& ret
             {
                 ptypes.push_back(s.coerceTy);
                 ptypes.push_back(s.coerceTy2);
+            }
+            else if (s.kind == AbiSlot::CoerceFlat)
+            {
+                for (llvm::Type* e : s.coerceStructTy->elements()) ptypes.push_back(e);
+            }
+            else if (s.kind == AbiSlot::Ignore)
+            {
+                // Clang drops the argument entirely (an empty record) - emit no LLVM parameter.
             }
             else if (s.kind == AbiSlot::ByVal)
                 ptypes.push_back(cflat_llvm::PointerTo(s.structTy));
@@ -1215,9 +1438,17 @@ void LLVMBackend::ApplyAbiAttributes(llvm::Function* fn, const AbiRecipe& recipe
             const AbiSlot& s = recipe.paramSlots[i];
             if (s.kind == AbiSlot::ByVal)
             {
-                fn->addParamAttr(attrIdx, llvm::Attribute::getWithByValType(*context, s.structTy));
+                // Clang's Indirect for a caller-owned temp is a BARE pointer: byval would tell
+                // LLVM to copy the object again, and for a nontrivial type that copy is illegal.
+                if (s.indirectByVal)
+                    fn->addParamAttr(attrIdx, llvm::Attribute::getWithByValType(*context, s.structTy));
                 if (s.align > 0)
                     fn->addParamAttr(attrIdx, llvm::Attribute::getWithAlignment(*context, llvm::Align(s.align)));
+            }
+            else if (s.kind == AbiSlot::Direct)
+            {
+                if (s.signExt) fn->addParamAttr(attrIdx, llvm::Attribute::SExt);
+                if (s.zeroExt) fn->addParamAttr(attrIdx, llvm::Attribute::ZExt);
             }
             attrIdx += SlotLLVMParamCount(s); // CoercePair expands to two LLVM params
         }
@@ -1225,7 +1456,10 @@ void LLVMBackend::ApplyAbiAttributes(llvm::Function* fn, const AbiRecipe& recipe
 
 unsigned LLVMBackend::SlotLLVMParamCount(const AbiSlot& s)
 {
-        return s.kind == AbiSlot::CoercePair ? 2u : 1u;
+        if (s.kind == AbiSlot::CoercePair) return 2u;
+        if (s.kind == AbiSlot::Ignore)     return 0u;
+        if (s.kind == AbiSlot::CoerceFlat) return s.coerceStructTy->getNumElements();
+        return 1u;
     }
 
 // A file-scope `main` with an entry-point signature IS the program entry point, so it keeps its
@@ -1334,7 +1568,7 @@ void LLVMBackend::ReportUnresolvedProvisionalDeclarations()
         }
     }
 
-void LLVMBackend::CreateFunctionDeclaration(const std::string& functionName, const LLVMBackend::TypeAndValue& returnType, const std::vector<LLVMBackend::TypeAndValue>& arguments, bool external, bool varargs, bool returnsOwned, bool isMethod, CallingConv callConv, const std::string& linkageName)
+void LLVMBackend::CreateFunctionDeclaration(const std::string& functionName, const LLVMBackend::TypeAndValue& returnType, const std::vector<LLVMBackend::TypeAndValue>& arguments, bool external, bool varargs, bool returnsOwned, bool isMethod, CallingConv callConv, const std::string& linkageName, bool isCxx, bool isNoexcept)
 {
         // ForwardRefScanner registers signatures before any struct BODY exists. An opaque
         // by-value aggregate has no legal FunctionType yet, so the declaration is emitted with a
@@ -1356,7 +1590,18 @@ void LLVMBackend::CreateFunctionDeclaration(const std::string& functionName, con
         // recipe has no lowering (scalar/pointer only) the existing GetFunctionType path is used.
         AbiRecipe recipe;
         bool useRecipe = false;
-        if (external && !provisional)
+        // A C++ declaration carries clang's OWN arrangement; C keeps the size heuristic. A plan
+        // clang could not express is reported by BuildAbiRecipeFromClangPlan and the declaration
+        // is dropped rather than emitted with a guessed lowering.
+        const cflat_cinterop::RawAbi* cxxPlan = pendingCxxAbi_;
+        pendingCxxAbi_ = nullptr;
+        if (external && !provisional && cxxPlan != nullptr && cxxPlan->valid)
+        {
+            if (!BuildAbiRecipeFromClangPlan(functionName, *cxxPlan, returnType, arguments, recipe))
+                return;
+            useRecipe = recipe.hasLowering;
+        }
+        else if (external && !provisional)
         {
             recipe = ComputeAbiRecipe(returnType, arguments);
             useRecipe = recipe.hasLowering;
@@ -1365,6 +1610,21 @@ void LLVMBackend::CreateFunctionDeclaration(const std::string& functionName, con
         llvm::FunctionType* functionType = useRecipe
             ? BuildExternFunctionType(returnType, arguments, varargs, recipe)
             : GetFunctionType(returnType, arguments, varargs, external, provisional);
+
+        // Whole-signature cross-check against clang's own llvm::FunctionType for the callee.
+        // Any difference means the lowering above does not match the real ABI - refuse rather
+        // than emit a call the C++ side will misread.
+        if (recipe.fromClang && !cxxPlan->fnTypeText.empty())
+        {
+            std::string built = cflat_llvm::StructuralTypeText(functionType);
+            if (built != cxxPlan->fnTypeText)
+            {
+                LogError(std::format("C++ function '{}' does not lower to clang's calling "
+                                     "convention (cflat built '{}', clang expects '{}')",
+                                     functionName, built, cxxPlan->fnTypeText));
+                return;
+            }
+        }
         // Only a `main` declared in the root translation unit is the program entry point -
         // an imported library's own `main` must mangle normally or it collides with the app's.
         bool entryMain = !external && currentSourceFilePath_ == analyzedRootPath_
@@ -1473,7 +1733,10 @@ void LLVMBackend::CreateFunctionDeclaration(const std::string& functionName, con
                 .ReturnsOwned = returnsOwned,
                 .ReturnsAlias = returnType.IsAlias, // 'alias' return: caller must not free the interior
                 .IsMethod = isMethod,
+                .IsCxx = isCxx,
+                .IsNoexcept = isNoexcept,
                 .Recipe = recipe,
+                .CxxAbi = (cxxPlan != nullptr && recipe.fromClang) ? *cxxPlan : cflat_cinterop::RawAbi{},
             };
 
             for (const auto& arg : arguments)

@@ -1478,6 +1478,14 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             primaryIdentifier = terminal->getText();
                             auto dataStructure = Compiler(ctx)->GetDataStructure(llvm::dyn_cast<llvm::StructType>(structVar.BaseType));
 
+                            // [PFX-2c] Access control on an imported C++ class. A private or
+                            // protected field is laid out (the record's size depends on it) but
+                            // must not be nameable, and a member cflat refused to bind reports WHY
+                            // rather than surfacing as an unknown identifier.
+                            if (!structVar.TypeAndValue.TypeName.empty())
+                                Compiler(ctx)->RejectInaccessibleCxxMember(
+                                    structVar.TypeAndValue.TypeName, primaryIdentifier);
+
                             // [PFX-2a] Consumed-COM member sugar: on a thin COM interface pointer - a struct
                             // whose SOLE field `lpVtbl` points at a vtable of function-pointer slots - a name
                             // that is not a field but IS a vtable slot routes through the vtable, so

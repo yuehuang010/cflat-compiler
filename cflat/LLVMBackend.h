@@ -1739,16 +1739,29 @@ public:
     // <2 x float> (SSE eightbyte), not only an integer.
     struct AbiSlot
     {
-        enum Kind { Direct, CoerceToInt, ByVal, SRetReturn, CoercePair };
+        // CoerceFlat and Ignore exist only for the Clang-derived C++ recipe (M3): CoerceFlat is
+        // the general "coerce to a literal struct, one LLVM argument per element at that struct's
+        // own field offsets" form that CoercePair hardcodes for two eightbytes, and Ignore is an
+        // argument Clang drops entirely (an empty record).
+        enum Kind { Direct, CoerceToInt, ByVal, SRetReturn, CoercePair, CoerceFlat, Ignore };
         Kind kind = Direct;
         llvm::Type* coerceTy = nullptr;     // eightbyte 0 type for CoerceToInt / CoercePair
         llvm::Type* coerceTy2 = nullptr;    // eightbyte 1 type for CoercePair
+        llvm::StructType* coerceStructTy = nullptr; // element list for CoerceFlat
         llvm::StructType* structTy = nullptr; // pointee for ByVal / SRetReturn / coerce source
         uint64_t align = 0;                  // byval/sret alignment hint
+        // Clang's Indirect arrangement is a bare pointer (no byval) for a type the CALLER owns
+        // and destroys. The heuristic C path always wants byval, so this defaults to true.
+        bool indirectByVal = true;
+        bool signExt = false;                // Direct scalar carrying clang's `signext`
+        bool zeroExt = false;                // ... or `zeroext`
     };
     struct AbiRecipe
     {
         bool hasLowering = false;            // true if at least one slot is non-Direct
+        // True when the recipe came from clang::CodeGen::arrangeFreeFunctionType rather than
+        // CFlat's size heuristic. Such a recipe must never be recomputed (--init restore).
+        bool fromClang = false;
         AbiSlot retSlot;
         std::vector<AbiSlot> paramSlots;
     };
@@ -1766,10 +1779,15 @@ public:
         bool ReturnsOwned = false; // true when the function returns an owned value (heap string or owned pointer) - caller must free
         bool ReturnsAlias = false; // true when the function returns an 'alias' reference - caller must not free the interior
         bool IsMethod = false;     // true when registered as a struct/class method (has implicit self pointer)
+        bool IsCxx = false;        // declaration came from a C++ header
+        bool IsNoexcept = true;    // potentially throwing C++ calls are gated until EH support
         bool IsCInteropAlias = false;
         bool IsCInteropDeclaration = false;
         std::vector<std::string> RequiredLocks; // canonical lock-set that the caller must hold (from lock clause)
         AbiRecipe Recipe;          // populated for extern (cdecl) functions whose signature contains struct-by-value
+        // Clang's serialized arrangement behind Recipe (C++ declarations only). Kept so a warm
+        // --init cache rebuilds the SAME lowering instead of falling back to the C heuristic.
+        cflat_cinterop::RawAbi CxxAbi;
     };
 
     struct InterfaceMethod
@@ -3024,6 +3042,10 @@ private:
     bool targetArm64_ = false;
 #endif
     std::vector<std::string> cObjectFiles_;
+    // Set when a C++ source or header is imported. This selects the C++ driver/runtime at
+    // native compile/link time; ordinary C imports keep the existing C-only path.
+    bool cppInteropUsed_ = false;
+    std::string cppStandard_ = "c++20";
     int cOptLevel_ = 0;        // optimization level applied to clang C compiles
     bool cDebugInfo_ = false;  // emit CodeView for clang C compiles
     // Off by default; when off, codegen/linking is byte-for-byte identical (no overhead).
@@ -3104,10 +3126,19 @@ private:
     // LSP backends run concurrently and a document is not pinned to a slot.
     struct CSigEntry
     {
+        // Canonical C/C++ spelling of each parameter, kept beside the mapped TypeAndValue so a
+        // record-pointer parameter can be retyped from void* once the record is registered.
+        std::vector<std::string> paramSpellings;
         std::string name;
+        std::string linkageName; // C++ ABI symbol; empty for C
         TypeAndValue ret;
         std::vector<TypeAndValue> params;
         bool variadic = false;
+        bool isCxx = false;
+        bool isNoexcept = true;
+        // Clang's own ABI arrangement (C++ mode only). Empty/invalid for C, which keeps the
+        // existing size-heuristic path byte for byte.
+        cflat_cinterop::RawAbi abi;
         std::string file;  // declaring header (presumed loc), for go-to-definition
         int line = 1;
         int col = 0;
@@ -3162,15 +3193,43 @@ private:
     {
         std::string name;
         std::string ctype;
+        // C++ access specifier (cflat_cinterop::RawAccess). Always public for C.
+        int access = 0;
         // CFlat replicates MSVC ABI layout itself; bitOffset is NOT taken from clang's
         // reported offset - RegisterCRecords computes it from MSVC ABI rules.
         bool isBitfield = false;
         unsigned bitWidth = 0;
+        uint64_t offsetBytes = 0;
     };
     struct CRecordEntry
     {
         std::string name;                       // tag name (e.g. "Point")
         bool isUnion = false;                   // tagUsed == "union"
+        bool isCxx = false;
+        bool isPacked = false;
+        uint64_t sizeBytes = 0;
+        uint64_t alignBytes = 0;
+        bool isTrivial = false;
+        bool isTriviallyCopyable = false;
+        // M4 class surface, carried verbatim from the extractor (see CClangExtract.h). Kept as
+        // the raw spellings so the member types are resolved after every record in the batch is
+        // registered, exactly like CRecordFieldEntry::ctype.
+        bool isPolymorphic = false;
+        bool hasBases = false;
+        bool hasVirtualBases = false;
+        bool isAbstract = false;
+        std::vector<cflat_cinterop::RawCxxBase> bases;
+        std::string layoutRefusal;
+        bool hasTrivialDefaultCtor = false;
+        bool hasTrivialCopyCtor = false;
+        bool hasTrivialDtor = true;
+        bool hasDeletedDefaultCtor = false;
+        bool hasDeletedCopyCtor = false;
+        bool hasDefaultCtor = false;
+        bool hasCopyCtor = false;
+        bool isAggregate = false;
+        std::vector<cflat_cinterop::RawCxxMember> members;
+        std::vector<cflat_cinterop::RawCxxStaticVar> staticVars;
         std::vector<CRecordFieldEntry> fields;
         int line = 1;
         int col = 0;
@@ -4676,6 +4735,17 @@ private:
     // declaration of a unique-element list (whose copy() is poisoned) stays legal.
     void CheckPoisonedFunctionCalls();
 
+    // A C++ declaration without a noexcept specification can unwind, and cflat emits no
+    // landing pads or personality routine - the unwinder would run off the top of the CFlat
+    // frame. Refuse to bind such a function, whether by call or by function pointer.
+    void RejectThrowingCxxFunction(const FunctionSymbol& symbol, const std::string& displayName) const;
+
+    // Prototype boundary for the C++ path: primitives and bare pointers only. A record passed
+    // or returned BY VALUE needs the aggregate ABI arrangement, which this prototype does not
+    // carry, so the declaration is refused instead of registered. Returns true when refused.
+    // Pointers to records stay legal (and opaque), exactly as on the C path.
+    bool RejectCxxRecordByValue(const CSigEntry& sig) const;
+
     bool VerifyModule();
     bool InstrumentIsolatedResources();
     bool AuditIsolatedModule();
@@ -4718,10 +4788,12 @@ private:
     // GCC-style C compiler driver for the ELF (non-Windows) target. Prefers clang to
     // match the LLVM the rest of the pipeline links, then falls back to cc/gcc.
     std::string FindCDriver() const;
+    std::string FindCxxDriver() const;
 
     // Compile a .c input to an ELF object with a GCC-style driver and queue it for the
     // ELF link. Mirrors CompileCFile's MSVC path but with POSIX flags (-c/-o/-D/-fPIC).
-    bool CompileCFileElf(const std::string& cSourcePath, const std::string& programAlias);
+    bool CompileCFileElf(const std::string& cSourcePath, const std::string& programAlias,
+                         bool cppMode = false);
 
     // GetCflatCacheDir() / GetUserCacheDir() / SetCacheDirOverride() are declared in the
     // public section below (near RunInit) since main.cpp needs to call them for
@@ -4739,7 +4811,8 @@ private:
     static bool SynthesizeSystemImportLibs(const std::string& arch, const std::string& lldLink);
     static bool SynthesizeX86SystemImportLibs(const LinkerPaths& paths);
 
-    bool CompileCFile(const std::string& cSourcePath, const std::string& programAlias = "");
+    bool CompileCFile(const std::string& cSourcePath, const std::string& programAlias = "",
+                      bool cppMode = false);
 
     // NOT routed through CompileCFile: that path runs ExtractCSignatures and registers the
     // functions as CFlat externs, which we don't want for an internal handler.
@@ -4772,6 +4845,10 @@ private:
     // and the indirection level via outPtr. Returns "" (and leaves outPtr at 0) when the
     // spelling is not a struct/union pointer. Used to keep `Foo*` record fields typed instead
     // of decaying to void* - so COM `lpVtbl` member access resolves.
+    // The CFlat dotted name of the class a C++ pointer spelling points at ("const ns::C *" ->
+    // "ns.C"), or "" when it is not a pointer to a class. See the definition for why
+    // AggregatePointeeTag cannot answer this for C++.
+    static std::string CxxRecordPointeeTag(const std::string& spelling, int& outPtr);
     static std::string AggregatePointeeTag(const std::string& spelling, int& outPtr);
 
     bool MapCTypeToTypeAndValueImpl(std::string ctype, TypeAndValue& out,
@@ -4849,15 +4926,16 @@ private:
                              const std::vector<std::string>& extraDefines = {},
                              std::vector<std::string>* outIncludes = nullptr,
                              bool* outPrereqFailure = nullptr,
-                             std::string* outPrereqMsg = nullptr);
+                             std::string* outPrereqMsg = nullptr,
+                             bool cxxMode = false);
 
     // Extract externally-linkable functions a .c file DEFINES, via the clang C++ API. Records
     // are registered up front (struct-by-value). Used by the .c auto-extern path.
     bool ExtractCFileClang(const std::string& cSourcePath,
                            std::vector<CSigEntry>& outSigs, std::vector<CRecordEntry>& outRecords,
-                           std::vector<CGlobalEntry>& outGlobals);
+                           std::vector<CGlobalEntry>& outGlobals, bool cxxMode = false);
 
-    bool ExtractCSignatures(const std::string& cSourcePath, const std::string& programAlias = "");
+    bool ExtractCSignatures(const std::string& cSourcePath, const std::string& programAlias = "", bool cxxMode = false);
 
     static std::string ConstIntValueSuffix(const std::string& typeName, long long value);
 
@@ -4882,11 +4960,11 @@ private:
 
     // Single-header convenience wrapper - the common case (one `import "x.h";`).
     bool CompileCHeader(const std::string& headerPath, const std::vector<std::string>& extraDefines = {},
-                        bool diskCache = false);
+                        bool diskCache = false, bool cppMode = false);
 
     bool CompileCHeaderGroup(const std::vector<std::string>& headerPaths,
                              const std::vector<std::string>& extraDefines = {},
-                             bool diskCache = false);
+                             bool diskCache = false, bool cppMode = false);
 
     // Build a TargetMachine for the current target so the optimizer's PassBuilder
     // has TargetTransformInfo. Without a TM the loop vectorizer cannot cost vector
@@ -6300,9 +6378,12 @@ public:
 
     llvm::Function* SynthesizeReflectFunction(const std::string& structName);
 
+    // linkageName overrides the emitted symbol name. Needed for an imported C++ static data
+    // member, whose symbol is Clang's mangling, not the last dotted component of the CFlat name.
     llvm::GlobalVariable* CreateGlobalVariable(TypeAndValue typeValue, llvm::Constant* initValue,
                                                bool threadLocal = false, uint64_t userAlign = 0,
-                                               bool externalDecl = false, bool srcIsUnsigned = false);
+                                               bool externalDecl = false, bool srcIsUnsigned = false,
+                                               const std::string& linkageName = {});
 
     // Emit alloca in the function entry block - loop-body allocas would grow the stack unboundedly.
     // VLAs (non-null arraySize) must stay at the current point (dynamic size).
@@ -6495,7 +6576,7 @@ public:
     // side-table delivered via `bitfields`. CreateStructType itself does NOT
     // pack - the default-ctor path needs the packed list before this call to
     // emit one initializer per LLVM struct element.
-    llvm::StructType* CreateStructType(std::string name, std::vector<LLVMBackend::DeclTypeAndValue> typeAndValues, uint64_t userAlign = 0, std::vector<BitfieldInfo>* bitfields = nullptr);
+    llvm::StructType* CreateStructType(std::string name, std::vector<LLVMBackend::DeclTypeAndValue> typeAndValues, uint64_t userAlign = 0, std::vector<BitfieldInfo>* bitfields = nullptr, bool isPacked = false);
 
     // Creates a union type as a struct with a single [N x alignTy] body, where N and alignTy
     // are chosen to match the size and alignment of the largest/most-aligned member.
@@ -6750,6 +6831,283 @@ public:
     AbiRecipe ComputeAbiRecipe(const TypeAndValue& retType,
                                const std::vector<TypeAndValue>& params);
 
+    // Parse the LLVM IR type TEXT clang serialized into a RawAbiSlot ("i64", "[2 x i64]",
+    // "{ i64, i32 }", "<2 x float>", "float", "ptr"). Returns nullptr on anything outside that
+    // grammar - the caller turns that into a LogError rather than guessing.
+    llvm::Type* ParseLlvmTypeText(const std::string& text) const;
+
+    /*
+     * Translate clang's serialized arrangement for a C++ declaration into an AbiRecipe. Returns
+     * false (after LogError naming `functionName`) when the arrangement uses a form the recipe
+     * cannot express - Expand, CoerceAndExpand, InAlloca, IndirectAliased, a non-void Ignore
+     * return, or an Extend whose coerce width does not match the CFlat parameter type.
+     */
+    bool BuildAbiRecipeFromClangPlan(const std::string& functionName,
+                                     const cflat_cinterop::RawAbi& plan,
+                                     const TypeAndValue& retType,
+                                     const std::vector<TypeAndValue>& params,
+                                     AbiRecipe& out);
+
+    // C++ record layout gate: compare the LLVM struct CFlat built against clang's own size,
+    // alignment and field offsets. LogError on any difference - a silent mismatch would corrupt
+    // every by-value exchange of that record.
+    void VerifyCxxRecordLayout(const CRecordEntry& r);
+
+    // Insert unnamed filler fields so the LLVM struct reproduces clang's field offsets.
+    void InsertCxxLayoutPadding(const CRecordEntry& r, std::vector<DeclTypeAndValue>& fields);
+
+    // Trivially-copyable C++ records registered from a `import cpp` header. A record NOT in this
+    // set may still be used through a pointer; only by-value crossings consult it.
+    std::set<std::string> cxxTriviallyCopyableRecords_;
+    std::set<std::string> cxxRecords_;
+
+    /*
+     * Everything the CFlat side needs to know about an imported C++ class beyond its layout:
+     * which operations exist, which are usable, and why one is not. Populated by
+     * RegisterCxxClassMembers and consulted at every use site so the diagnostic lands on the
+     * CFlat expression, not on the header.
+     */
+    struct CxxClassInfo
+    {
+        bool isPolymorphic = false;
+        bool hasBases = false;
+        bool hasVirtualBases = false;
+        bool isAbstract = false;
+        // Non-empty when the C++ layout could not be flattened (virtual inheritance, or a
+        // bitfield / anonymous member inside a hierarchy). The type stays an opaque shell.
+        std::string layoutRefusal;
+        // M6 - DIRECT public/non-public bases with the byte offset of their subobject.
+        struct BaseRef
+        {
+            std::string name;
+            uint64_t offsetBytes = 0;
+            int access = 0;
+        };
+        std::vector<BaseRef> bases;
+        // Every instance method name callable on this class, own and inherited. Used to clone a
+        // base's methods onto a derived class.
+        std::vector<std::string> instanceMethodNames;
+        // Itanium vtable slots of a VIRTUAL destructor: D1 (complete object) and D0 (deleting,
+        // which also releases the storage). Both -1 when the destructor is not virtual.
+        int dtorVtableIndex = -1;
+        int dtorDeletingVtableIndex = -1;
+        bool hasTrivialDefaultCtor = false;
+        bool hasTrivialCopyCtor = false;
+        bool hasTrivialDtor = true;
+        bool hasDeletedDefaultCtor = false;
+        bool hasDeletedCopyCtor = false;
+        bool hasDefaultCtor = false;
+        bool hasCopyCtor = false;
+        bool isAggregate = false;
+        // Field name -> access, for the "is private" diagnostic on member access.
+        std::map<std::string, int> fieldAccess;
+        // Member name -> access of the best (most accessible) overload, for method calls whose
+        // name resolves to nothing because every candidate was filtered out.
+        std::map<std::string, int> memberAccess;
+        // Names of instance/static methods that were refused, with the reason, so a use site can
+        // say WHY instead of "unknown method".
+        std::map<std::string, std::string> refusedMembers;
+        // Constructor overloads and the destructor, keyed by the CFlat-visible parameter list.
+        // Function is null until the declaration is materialized.
+        struct Structor
+        {
+            std::string linkageName;
+            std::vector<TypeAndValue> params;   // includes 'this' as params[0]
+            // Mapped RESULT type of the emitted declaration. On Itanium/Darwin a structor hands
+            // 'this' back, and an assignment operator returns 'T&', so this is a pointer there
+            // and void only on a target whose structors return nothing.
+            TypeAndValue ret;
+            bool isDefaultCtor = false;
+            bool isCopyCtor = false;
+            bool isMoveCtor = false;
+            bool isDeleted = false;
+            bool needsLocalDefinition = false;
+            bool isNoexcept = false;
+            int access = 0;
+            cflat_cinterop::RawAbi abi;
+        };
+        std::vector<Structor> constructors;
+        bool hasDtor = false;
+        Structor destructor;
+        // Copy / move assignment, captured out of the instance-method list so `y = x` and
+        // `y = move x` bind to the C++ operator instead of a bitwise struct store.
+        bool hasCopyAssign = false;
+        bool hasMoveAssign = false;
+        Structor copyAssign;
+        Structor moveAssign;
+    };
+    const CxxClassInfo* GetCxxClassInfo(const std::string& typeName) const
+    {
+        auto it = cxxClasses_.find(typeName);
+        return it == cxxClasses_.end() ? nullptr : &it->second;
+    }
+    bool IsCxxRecord(const std::string& typeName) const { return cxxRecords_.count(typeName) != 0; }
+
+    /*
+     * ========================= M6 - inheritance and virtual dispatch ==========================
+     *
+     * Layout, vtable slots and base offsets all come from Clang (see CClangExtract.cpp): a
+     * polymorphic class is a REAL CFlat type whose flattened field list already contains the vptr
+     * slot and every base subobject at Clang's own offsets. Nothing here maps a C++ vtable onto a
+     * CFlat interface table - dispatch is an explicit vptr load plus an index Clang computed.
+     */
+
+    // Linkage name of a VIRTUAL C++ member -> its Itanium vtable slot. A resolved callee found
+    // here is dispatched through the receiver's vptr instead of called by symbol.
+    std::map<std::string, int> cxxVirtualSlotByLinkage_;
+    // "<receiver CFlat type>#<callee linkage name>" -> bytes to add to `this` before the call,
+    // for a member INHERITED from a base whose subobject is not at offset 0.
+    std::map<std::string, uint64_t> cxxThisAdjust_;
+    static std::string CxxThisAdjustKey(const std::string& recv, const std::string& linkage)
+    {
+        return recv + "#" + linkage;
+    }
+    // Bytes to add to a `derived` pointer to reach its `base` subobject. Walks the transitive
+    // PUBLIC base graph. Returns false when `base` is not a public base of `derived`
+    // (`whyNot` then says whether it was found behind a non-public base at all).
+    bool FindCxxBaseOffset(const std::string& derived, const std::string& base,
+                           uint64_t& offsetOut, bool& foundButInaccessible) const;
+    bool IsCxxBaseOf(const std::string& base, const std::string& derived) const
+    {
+        uint64_t off = 0; bool inacc = false;
+        return FindCxxBaseOffset(derived, base, off, inacc);
+    }
+    // `p + off`, keeping a null pointer null - the C++ derived-to-base conversion is
+    // null-preserving, and Clang emits exactly this select.
+    llvm::Value* EmitCxxBaseAdjust(llvm::Value* ptr, uint64_t offsetBytes);
+    /*
+     * The callee for one virtual call: load the vptr from `thisPtr` (which the caller has already
+     * adjusted to the subobject that declares the member), index it by the member's slot, and
+     * load the function pointer. Returns null when `candidate` is not virtual, i.e. the direct
+     * symbol call stands.
+     */
+    llvm::Value* EmitCxxVirtualCallee(const FunctionSymbol& candidate, llvm::Value* thisPtr);
+    /*
+     * Implicit derived-to-base conversion on a STORE (declaration initializer or `=`): when `src`
+     * is a pointer to a class that publicly derives from `dest`'s class, shift it to that base
+     * subobject so the stored pointer really points at a `dest`. Returns `value` untouched when no
+     * conversion applies, and reports when the base exists but is not public.
+     */
+    llvm::Value* AdjustCxxPointerForStore(const TypeAndValue& dest, const TypeAndValue& src,
+                                          llvm::Value* value, const std::string& destDesc);
+    // A foreign C++ class whose destructor is virtual: `delete` through a pointer to it must go
+    // through the vtable so the DERIVED destructor runs.
+    bool CxxHasVirtualDestructor(const std::string& typeName) const
+    {
+        const CxxClassInfo* info = GetCxxClassInfo(typeName);
+        return info != nullptr && info->dtorDeletingVtableIndex >= 0;
+    }
+    /*
+     * `delete p` on a foreign C++ class with a VIRTUAL destructor: call the DELETING destructor
+     * (Itanium D0) out of the vtable, which runs the derived destructor chain AND releases the
+     * storage through the C++ deallocator. Returns true when it emitted the call, in which case
+     * the caller must NOT also run a destructor or an operator delete.
+     */
+    bool EmitCxxVirtualDelete(const std::string& typeName, llvm::Value* ptr);
+    /*
+     * Refuse an imported C++ class whose LAYOUT cflat did not reproduce - virtual inheritance, or
+     * a bitfield / anonymous member inside a hierarchy. Such a type stays an opaque shell that is
+     * legal to hold through a pointer and illegal to construct, copy or name a member of.
+     */
+    bool RejectUnsupportedCxxLayout(const std::string& typeName);
+    // Refuse creating an ABSTRACT C++ class: it has an unoverridden pure virtual member, so no
+    // complete object of it can exist.
+    bool RejectAbstractCxxClass(const std::string& typeName, const char* what);
+    // Register every public instance method a class INHERITS from its public bases, retyped so
+    // `this` is the derived class, with the base subobject offset recorded in cxxThisAdjust_.
+    void RegisterCxxInheritedMembers(const CRecordEntry& r);
+
+    /*
+     * Access control / bindability gate for one named member of an imported C++ class. Fires on
+     * a private or protected FIELD (which is laid out but must not be nameable) and on any member
+     * RegisterCxxClassMembers refused, so the diagnostic says why instead of "unknown identifier".
+     * Returns true when it reported; a name the class does not have is left alone.
+     */
+    bool RejectInaccessibleCxxMember(const std::string& typeName, const std::string& memberName);
+
+    /*
+     * M4b - foreign NONTRIVIAL C++ class lifetime.
+     *
+     * A record in this set is a non-polymorphic, base-less imported C++ class that is NOT
+     * trivially copyable: its construction, copy, move and destruction must go through the
+     * C++ special members, never through a CFlat bitwise store. Membership is the single gate
+     * every lifetime site consults.
+     */
+    std::set<std::string> cxxNontrivialRecords_;
+    bool IsForeignNontrivialCxxClass(const std::string& typeName) const
+    {
+        return cxxNontrivialRecords_.count(typeName) != 0;
+    }
+    // Materialize (once per module) the llvm::Function for one structor / assignment operator,
+    // typed from clang's own arrangement. Returns null after LogError when the plan is
+    // inexpressible. `recipeOut` receives the recipe the call site must lower with.
+    llvm::Function* GetOrCreateCxxStructor(const std::string& typeName,
+                                           const CxxClassInfo::Structor& st,
+                                           AbiRecipe& recipeOut);
+    // Emit `st(slot, extraArgs...)`. The structor's own result (`this`) is discarded.
+    bool EmitCxxStructorCall(const std::string& typeName, const CxxClassInfo::Structor& st,
+                             llvm::Value* slot, const std::vector<llvm::Value*>& extraArgs);
+    // The complete-object destructor (Dtor_Complete) of a foreign nontrivial class, registered
+    // as the class's CFlat destructor so every existing scope-exit path destroys it.
+    llvm::Function* GetOrCreateCxxClassDestructor(const std::string& typeName);
+    /*
+     * The C++ GLOBAL allocation functions, declared on demand. A foreign nontrivial object on the
+     * heap must be paired with the C++ allocator, never with CFlat's - the two runtimes are free
+     * to use different heaps. Names are the Itanium C++ ABI spellings (the only C++ ABI this
+     * milestone targets); an MSVC host needs its own spellings before this path is enabled there.
+     *   operator new(size_t)                          _Znwm
+     *   operator new(size_t, align_val_t)             _ZnwmSt11align_val_t
+     *   operator delete(void*, size_t)                _ZdlPvm
+     *   operator delete(void*, size_t, align_val_t)   _ZdlPvmSt11align_val_t
+     */
+    llvm::Function* GetCxxOperatorNew(bool overAligned);
+    llvm::Function* GetCxxOperatorDelete(bool overAligned);
+    // Allocate storage for ONE object of a foreign nontrivial class through the C++ allocator.
+    llvm::Value* EmitCxxHeapAllocate(const std::string& typeName);
+    // Release storage obtained from EmitCxxHeapAllocate. The destructor is NOT run here.
+    void EmitCxxHeapFree(const std::string& typeName, llvm::Value* ptr);
+    // sizeof / alignof of a foreign class, as the C++ allocator needs them.
+    bool CxxObjectSizeAndAlign(const std::string& typeName, uint64_t& size, uint64_t& align);
+    // A destructor with a real linkage symbol exists (not implicit / inline-only), so the class
+    // can be destroyed by CFlat-emitted code.
+    bool HasBindableCxxDestructor(const std::string& typeName) const
+    {
+        const CxxClassInfo* info = GetCxxClassInfo(typeName);
+        return info != nullptr && info->hasDtor && !info->destructor.linkageName.empty();
+    }
+    const CxxClassInfo::Structor* FindCxxDefaultCtor(const std::string& typeName) const;
+    const CxxClassInfo::Structor* FindCxxCopyCtor(const std::string& typeName) const;
+    const CxxClassInfo::Structor* FindCxxMoveCtor(const std::string& typeName) const;
+    /*
+     * Pick the constructor overload for `T(args)` from the argument types alone. Reports and
+     * returns null on no match / ambiguity. Copy and move constructors participate only when
+     * the single argument really is a T lvalue / a moved T.
+     */
+    const CxxClassInfo::Structor* SelectCxxConstructor(const std::string& typeName,
+                                                       const std::vector<TypeAndValue>& argTypes,
+                                                       std::string& why) const;
+    // Copy-construct (or move-construct when `useMove`) `dest` from the object at `src`.
+    // Returns false after LogError when the needed constructor is missing or inaccessible.
+    bool EmitCxxCopyOrMoveConstruct(const std::string& typeName, llvm::Value* dest,
+                                    llvm::Value* src, bool useMove, const char* context);
+    /*
+     * Destination slot that a foreign nontrivial C++ result must be constructed INTO, armed by
+     * the declaration site for the duration of one initializer and consumed by the first call
+     * whose return type matches `pendingCxxSretTypeName_`. The declaration site only arms it for
+     * an initializer that is a single call with no nested call, so "first match" is "the call".
+     * Transient per-call state: ResetForReanalysis must clear it.
+     */
+    llvm::Value* pendingCxxSretDest_ = nullptr;
+    std::string pendingCxxSretTypeName_;
+    // Imported C++ classes, keyed by the CFlat dotted type name.
+    std::map<std::string, CxxClassInfo> cxxClasses_;
+    // Register the callable surface of one imported C++ class: instance methods, static methods,
+    // static data members, and the constructor/destructor table used by lifetime codegen.
+    void RegisterCxxClassMembers(const CRecordEntry& r, const std::string& fileForLsp);
+    // Set by RegisterCSignatures around a C++ declaration so CreateFunctionDeclaration adopts
+    // clang's arrangement instead of ComputeAbiRecipe.
+    const cflat_cinterop::RawAbi* pendingCxxAbi_ = nullptr;
+
     // Build the LLVM FunctionType for an extern C function with the given recipe applied.
     // - SRetReturn ret: function returns void, prepend a ptr param for the hidden sret slot.
     // - CoerceToInt ret: function returns iN.
@@ -6773,7 +7131,7 @@ public:
     // linkageName: optional override of the emitted LLVM symbol for externs. A namespaced
     // extern (namespace os.windows { extern ... Sleep(...); }) registers in the function
     // table under the qualified lookup name but must link against the bare C symbol.
-    void CreateFunctionDeclaration(const std::string& functionName, const LLVMBackend::TypeAndValue& returnType, const std::vector<LLVMBackend::TypeAndValue>& arguments, bool external = false, bool varargs = false, bool returnsOwned = false, bool isMethod = false, CallingConv callConv = CallingConv::Default, const std::string& linkageName = {});
+    void CreateFunctionDeclaration(const std::string& functionName, const LLVMBackend::TypeAndValue& returnType, const std::vector<LLVMBackend::TypeAndValue>& arguments, bool external = false, bool varargs = false, bool returnsOwned = false, bool isMethod = false, CallingConv callConv = CallingConv::Default, const std::string& linkageName = {}, bool isCxx = false, bool isNoexcept = true);
 
     // Return the FunctionSymbol whose LLVM function pointer matches fn, or nullptr.
     const FunctionSymbol* GetFunctionSymbol(llvm::Function* fn) const;
@@ -7760,10 +8118,38 @@ public:
     //   - SRet return: alloca a return slot, prepend its pointer as arg 0, after the call
     //     load the struct from the slot.
     //   - CoerceToInt return: receive the iN, store into a temp alloca, reload as struct.
-    llvm::Value* EmitAbiLoweredCall(const FunctionSymbol& candidate, std::vector<llvm::Value*>& argList);
+    //
+    // `sretDest`, when given, IS the hidden return slot: the callee constructs straight into
+    // the caller's storage and the result is that pointer, so no load/copy happens (the only
+    // correct shape for a nontrivial C++ result). `indirectArgAddrs`, when given, supplies a
+    // ready-made address per parameter index; a non-null entry replaces the alloca+store the
+    // ByVal path would otherwise do, which is what lets a caller-owned nontrivial temp be
+    // copy-constructed rather than byte-copied.
+    // `calleeOverride`, when given, is the function POINTER to call instead of candidate.Function
+    // (a virtual member loaded out of the receiver's vptr). The signature still comes from
+    // candidate.Function, which is the declaration carrying clang's arrangement.
+    llvm::Value* EmitAbiLoweredCall(const FunctionSymbol& candidate, std::vector<llvm::Value*>& argList,
+                                    llvm::Value* sretDest = nullptr,
+                                    const std::vector<llvm::Value*>* indirectArgAddrs = nullptr,
+                                    llvm::Value* calleeOverride = nullptr);
+    // A pointer to a C++ class binds to a parameter/slot of a PUBLIC base of that class, with the
+    // base subobject offset added. Non-public bases are refused at the conversion site.
+    bool IsCxxDerivedToBasePointer(const TypeAndValue& from, const TypeAndValue& to) const
+    {
+        if (!from.Pointer || !to.Pointer) return false;
+        if (from.ElemPointer != to.ElemPointer) return false;
+        if (from.TypeName == to.TypeName || from.TypeName.empty() || to.TypeName.empty()) return false;
+        if (!IsCxxRecord(from.TypeName) || !IsCxxRecord(to.TypeName)) return false;
+        return IsCxxBaseOf(to.TypeName, from.TypeName);
+    }
 
     // Load a value of type coerceTy from byte offset byteOff within an alloca'd struct slot,
     // reinterpreting the underlying bytes (used to read SysV eightbytes out of a struct).
+    // Scratch slot for an ABI coercion, sized/aligned for whichever of record and coerce type
+    // is larger - clang may coerce a record to a WIDER type than the record itself.
+    llvm::AllocaInst* AllocaForCoerce(llvm::StructType* structTy, llvm::Type* coerceTy,
+                                      uint64_t align, const char* name);
+
     llvm::Value* LoadCoerceAt(llvm::Value* structSlot, llvm::Type* coerceTy, uint64_t byteOff);
 
     // Store val into byte offset byteOff within an alloca'd struct slot, reinterpreting the
@@ -8189,7 +8575,7 @@ public:
 
     bool CheckGrammar(const std::string& filename);
 
-    bool CompileImportedFile(const std::string& importingFilePath, const std::string& importFilename, const std::string& namespaceName = {}, const std::string& programAlias = {}, const std::vector<std::string>& explicitLibs = {}, const std::vector<std::string>& extraDefines = {}, bool cacheHeader = false);
+    bool CompileImportedFile(const std::string& importingFilePath, const std::string& importFilename, const std::string& namespaceName = {}, const std::string& programAlias = {}, const std::vector<std::string>& explicitLibs = {}, const std::vector<std::string>& extraDefines = {}, bool cacheHeader = false, bool cppMode = false);
 
     bool ResolveImportPath(const std::string& importingFilePath, const std::string& importFilename,
                            std::string& outCanonical, bool quiet = false);
@@ -8198,7 +8584,7 @@ public:
                             const std::vector<std::string>& entries,
                             const std::vector<std::string>& groupLibs,
                             const std::vector<std::string>& groupDefines,
-                            bool cacheGroup);
+                            bool cacheGroup, bool cppMode = false);
 
     static std::string ResolveCLinkLib(const std::string& lib, const std::string& importingFilePath);
 
@@ -8225,7 +8611,8 @@ public:
     static uint64_t CHeaderDiskCacheKey(const std::vector<std::string>& headerPaths,
                                         const std::vector<std::string>& includeDirs,
                                         const std::vector<std::string>& defines,
-                                        const std::vector<std::string>& extraDefines);
+                                        const std::vector<std::string>& extraDefines,
+                                        bool cxxMode = false);
 
     // Read-only adapter exposing the nlohmann subset the *FromJson converters use, backed by a
     // simdjson DOM element. Keeps converter bodies unchanged while parsing with simdjson.
@@ -8335,6 +8722,10 @@ public:
     static nlohmann::json TvToJson(const TypeAndValue& tv);
     static TypeAndValue TvFromJson(const SjVal& j);
 
+    static nlohmann::json AbiSlotToJson(const cflat_cinterop::RawAbiSlot& sl);
+    static cflat_cinterop::RawAbiSlot AbiSlotFromJson(const SjVal& j);
+    static nlohmann::json AbiToJson(const cflat_cinterop::RawAbi& a);
+    static cflat_cinterop::RawAbi AbiFromJson(const SjVal& j);
     static nlohmann::json SigToJson(const CSigEntry& e);
     static CSigEntry SigFromJson(const SjVal& j);
 
@@ -8346,6 +8737,12 @@ public:
 
     static nlohmann::json FieldToJson(const CRecordFieldEntry& f);
     static CRecordFieldEntry FieldFromJson(const SjVal& j);
+
+    static nlohmann::json CxxMemberToJson(const cflat_cinterop::RawCxxMember& m);
+    static cflat_cinterop::RawCxxMember CxxMemberFromJson(const SjVal& j);
+
+    static nlohmann::json CxxStaticVarToJson(const cflat_cinterop::RawCxxStaticVar& v);
+    static cflat_cinterop::RawCxxStaticVar CxxStaticVarFromJson(const SjVal& j);
 
     static nlohmann::json RecordToJson(const CRecordEntry& r);
     static CRecordEntry RecordFromJson(const SjVal& j);

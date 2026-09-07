@@ -1,0 +1,14 @@
+// M4b ruling 3: after 'move x' a nontrivial C++ local is COMPILE-TIME consumed (its destructor
+// still runs at scope exit, but reading it is an error). Same diagnostic text as every other
+// use-after-move site - C++ has no null state to read instead.
+import cpp "cpp_interop_basic.h";
+
+extern int main()
+{
+    expect_error("use of moved variable 'src'") {
+        cppi.Tracked src = cppi.Tracked(1);
+        cppi.Tracked dst = move src;
+        int leak = src.value();
+    }
+    return 0;
+}

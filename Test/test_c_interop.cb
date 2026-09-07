@@ -28,6 +28,32 @@
 //                       `typedef void* HANDLE` (and multi-hop chains like
 //                       SCK -> HANDLE -> void*) must auto-register; previously
 //                       skipped as "unsupported return/parameter type".
+//   Section M3 (290-322): C++ trivially copyable records by value - layout (size, alignment,
+//                       packed, over-aligned) checked against the C++ side's own sizeof/alignof,
+//                       then round trips through every AArch64 arrangement clang picks: coerced
+//                       small integer, two-eightbyte, HFA in float registers, indirect + sret.
+//   Section M4 (330-349): C++ class members - instance methods (const and mutating, with
+//                       arguments), static methods, static data member reads, dispatch through
+//                       a pointer receiver, the const-overload ruling (an lvalue picks the
+//                       non-const leg), and qualified scoped-enum spellings. Access control and
+//                       polymorphism are covered by Test/errors/err_cpp_*.cb.
+//   Section M6 (420-459): C++ inheritance and VIRTUAL dispatch - polymorphic classes laid out
+//                       from clang (vptr slot + base subobjects), virtual calls through the
+//                       vtable slot ItaniumVTableContext assigned, virtual destructor via the
+//                       Itanium deleting-destructor slot, and multiple inheritance with a
+//                       non-primary base whose `this` must be adjusted.
+//   Section M5 (350-399): C++ NONTRIVIAL class lifetime - construction into the declared slot
+//                       (`T(args)`), copy/move construction, copy/move assignment, exactly-once
+//                       destruction on normal exit, nested scopes, early return, break and
+//                       continue, nontrivial by-value arguments (copy and move) and by-value
+//                       returns constructed straight into the local, plus new/delete and
+//                       `unique T*` through the C++ operators. Every assertion is an EXACT
+//                       instrumented count, so an extra copy or a missed destructor fails here.
+//   Section M (270-289): C++ interop via `import cpp` - namespaced/overloaded declarations
+//                       bound by mangled linkage name, reference params and returns
+//                       as pointers, extern "C" bare linkage, nested namespaces,
+//                       widening and narrow-unsigned round trips, scoped-enum params,
+//                       records by pointer. Primitives and bare pointers only.
 
 import "library/c_alias_order_alias.h";
 import "library/c_alias_order_real.h";
@@ -48,6 +74,16 @@ import "library/cinterop.c";
 import "library/struct_byval_util.c";
 import package "cinterop/mathlib.h" lib "cinterop/mathlib.lib" define "ML_EXTRA";
 import "library/c_macro_helpers.h";
+// Section M: C++ interop - `import cpp` selects C++ mode; the extension is irrelevant (the
+// fixture header is a plain .h). The header supplies the declarations, the .cpp is compiled
+// by the host C++ driver and linked in. Both are needed: the header alone has no
+// definitions, and the source alone would not exercise the header-extraction path.
+import cpp "library/cpp_interop_basic.h";
+import cpp "library/cpp_interop_basic.cpp";
+// Section M6: inheritance and virtual dispatch. Definitions are out-of-line on purpose - every
+// virtual function needs a real symbol and the vtable needs a key function.
+import cpp "library/cpp_interop_poly.h";
+import cpp "library/cpp_interop_poly.cpp";
 import "library/float_macros.h";
 // Accept side of the conflicting-declaration check: prototypes identical to ones already
 // bound (core putn/printf, and c_add from cinterop.c above) must be a silent no-op.
@@ -133,6 +169,15 @@ static bool testFloatMacros()
     // K. Negative: int cast of float recovers as int 3
     r &= FM_INT_CAST_OF_FLOAT == 3;
     return r;
+}
+
+// M5 helpers. Each holds a nontrivial C++ local and leaves through a DIFFERENT exit edge, so
+// the counters below prove the existing cleanup paths (not a second mechanism) destroy it.
+int m5_early_return(int k)
+{
+    cppi.Tracked t = cppi.Tracked(k);
+    if (k > 0) return t.value();
+    return -1;
 }
 
 extern int main()
@@ -655,6 +700,434 @@ extern int main()
     if (CAA_GroupLateAlias(7) != 1507)           return 259;
     // The later target uses a different parameter signature and must still be retried.
     if (CAA_DiffAlias(7.5) != 1607)              return 260;
+
+    // ---- Section M: C++ interop (270-289) ------------------------------------
+    // Namespaced call under the dotted CFlat spelling, bound to the Itanium/MSVC
+    // mangled symbol. The double overload adds 1000, so the return value alone
+    // proves WHICH overload was selected.
+    if (cppi.add(40, 2) != 42)                   return 270;
+    if (cppi.add(40.5, 2.0) != 1042)             return 271;
+
+    // Nested namespace: every '::' prefix registers as a CFlat namespace.
+    if (cppi.inner.twice(21) != 42)              return 272;
+
+    // extern "C" inside a C++ translation unit keeps its bare linkage name and is
+    // callable without a namespace qualifier.
+    if (cppi_c_linkage(37) != 42)                return 273;
+
+    // Reference parameter: spelled as a pointer on the CFlat side, so the call site
+    // passes the address of a local explicitly. pick_ref writes 7 and returns the old
+    // value, which makes the MUTATION observable, not just the argument transfer.
+    int cppiRef = 5;
+    if (cppi.pick_ref(&cppiRef) != 5)            return 274;
+    if (cppiRef != 7)                            return 275;
+
+    // const reference read: same pointer shape, no write-back.
+    int cppiCRef = 41;
+    if (cppi.read_cref(&cppiCRef) != 42)         return 276;
+    if (cppiCRef != 41)                          return 277;
+
+    // Reference RETURN arrives as a plain pointer aliasing the C++ side's storage.
+    int* cppiSlot = cppi.ref_slot();
+    if (*cppiSlot != 99)                         return 278;
+    *cppiSlot = 5;
+    int* cppiSlot2 = cppi.ref_slot();
+    if (*cppiSlot2 != 5)                         return 279;
+
+    // Plain pointer parameter and return (no reference decay involved).
+    int cppiVal = 9;
+    int* cppiIdent = cppi.ptr_ident(&cppiVal);
+    if (*cppiIdent != 9)                         return 280;
+
+    // Widening: 'long long' return must keep all 64 bits, not truncate to i32.
+    if (cppi.widen(3) != 3000000000)             return 281;
+    if (cppi.widen(-3) != -3000000000)           return 282;
+
+    // Narrow unsigned round trip: 'unsigned char' maps to u8 on both legs.
+    if ((int)cppi.uc((u8)200) != 201)            return 283;
+    if ((int)cppi.uc((u8)0) != 1)                return 284;
+
+    // A scoped enum ('enum class Mode : int') parameter decays to int like a C enum,
+    // so the declaration is published rather than skipped as an unsupported type.
+    if (cppi.mode_value(1) != 10)                return 285;
+    if (cppi.mode_value(0) != 0)                 return 286;
+
+    // A record is reachable by POINTER. Passing one BY VALUE is legal when the C++ type is
+    // trivially copyable (below); a NONTRIVIAL one is refused - see
+    // Test/errors/err_cpp_record_by_value.cb.
+    cppi.Pair m3pair = default;
+    m3pair.a = 40; m3pair.b = 2;
+    if (cppi.read_pair(&m3pair) != 42)           return 287;
+
+    // ---- Section M3: trivially copyable records by value (290-319) -------------
+    // Layout first. sizeof/alignof come back from the C++ side as functions, so any
+    // disagreement between clang's layout and cflat's is a hard failure here rather than
+    // a silent register mismatch inside the calls below.
+    if (sizeof(cppi.Small)   != cppi.size_of(0))  return 290;
+    if (alignof(cppi.Small)  != cppi.align_of(0)) return 291;
+    if (sizeof(cppi.Mixed)   != cppi.size_of(1))  return 292;
+    if (alignof(cppi.Mixed)  != cppi.align_of(1)) return 293;
+    if (sizeof(cppi.Large)   != cppi.size_of(2))  return 294;
+    if (alignof(cppi.Large)  != cppi.align_of(2)) return 295;
+    if (sizeof(cppi.Hfa)     != cppi.size_of(3))  return 296;
+    if (alignof(cppi.Hfa)    != cppi.align_of(3)) return 297;
+    if (sizeof(cppi.Packed)  != cppi.size_of(4))  return 298;
+    if (alignof(cppi.Packed) != cppi.align_of(4)) return 299;
+    if (sizeof(cppi.Aligned) != cppi.size_of(5))  return 300;
+    if (alignof(cppi.Aligned)!= cppi.align_of(5)) return 301;
+    if (sizeof(cppi.Pair)    != cppi.size_of(6))  return 302;
+    // The packed record is the sharpest layout check: 5 bytes, alignment 1.
+    if (sizeof(cppi.Packed) != 5)                 return 303;
+    if (alignof(cppi.Packed) != 1)                return 304;
+    if (sizeof(cppi.Aligned) != 32)               return 305;
+
+    // Two bytes, coerced into ONE register wider than the record itself.
+    cppi.Small m3small = default;
+    m3small.a = -5; m3small.b = (u8)200;
+    cppi.Small m3smallOut = cppi.small_bump(m3small);
+    if ((int)m3smallOut.a != -4)                  return 306;
+    if ((int)m3smallOut.b != 201)                 return 307;
+
+    // 16 bytes of mixed FP/integer: two 8-byte chunks, NOT an HFA.
+    cppi.Mixed m3mixed = default;
+    m3mixed.d = 2.5; m3mixed.i = 41;
+    cppi.Mixed m3mixedOut = cppi.mixed_bump(m3mixed);
+    if (!near(m3mixedOut.d, 3.5, 1e-12))          return 308;
+    if (m3mixedOut.i != 42)                       return 309;
+
+    // 24 bytes: indirect in, hidden sret out.
+    cppi.Large m3large = default;
+    m3large.x = 10; m3large.y = 20; m3large.z = 30;
+    cppi.Large m3largeOut = cppi.large_bump(m3large);
+    if (m3largeOut.x != 11)                       return 310;
+    if (m3largeOut.y != 21)                       return 311;
+    if (m3largeOut.z != 31)                       return 312;
+
+    // Homogeneous float aggregate: four separate float registers under AAPCS64.
+    cppi.Hfa m3hfa = default;
+    m3hfa.a = 1.0f; m3hfa.b = 2.0f; m3hfa.c = 3.0f; m3hfa.d = 4.0f;
+    cppi.Hfa m3hfaOut = cppi.hfa_bump(m3hfa);
+    if (!near((double)m3hfaOut.a, 2.0, 1e-6))     return 313;
+    if (!near((double)m3hfaOut.b, 3.0, 1e-6))     return 314;
+    if (!near((double)m3hfaOut.c, 4.0, 1e-6))     return 315;
+    if (!near((double)m3hfaOut.d, 5.0, 1e-6))     return 316;
+
+    // Packed: the coercion must read exactly 5 bytes with 'n' at byte offset 1.
+    cppi.Packed m3packed = default;
+    m3packed.c = (u8)7; m3packed.n = 1000;
+    cppi.Packed m3packedOut = cppi.packed_bump(m3packed);
+    if ((int)m3packedOut.c != 8)                  return 317;
+    if (m3packedOut.n != 1001)                    return 318;
+
+    // Over-aligned: indirect both ways, with a 32-byte-aligned temp and sret slot.
+    cppi.Aligned m3aligned = default;
+    m3aligned.x = 100; m3aligned.y = 200;
+    cppi.Aligned m3alignedOut = cppi.aligned_bump(m3aligned);
+    if (m3alignedOut.x != 101)                    return 319;
+    if (m3alignedOut.y != 201)                    return 320;
+
+    // A scalar WEDGED between two aggregates whose slots consume different register counts:
+    // s -> one coerced register, k -> one integer register, l -> one hidden pointer.
+    if (cppi.mixed_args(m3small, 3, m3large) != -2999640) return 321;
+
+    // By-value and by-pointer records in the same signature.
+    if (cppi.pair_and_small(&m3pair, m3small) != 237) return 322;
+
+    // ---- Section M4: C++ class members (330-349) --------------------------------
+    // A trivially copyable class carries no lifetime obligations, so these checks isolate
+    // member binding: 'this' passing, argument marshalling, static members, and the
+    // const-overload ruling.
+    cppi.Point m4p = default;
+    m4p.x = 3; m4p.y = 4;
+
+    // const instance method: 'this' is the receiver's address, result comes back in a register.
+    if (m4p.sum() != 7)                          return 330;
+
+    // Mutating instance method: the write must land in the CALLER's storage, not a copy.
+    m4p.bump(2);
+    if (m4p.x != 5)                              return 331;
+    if (m4p.y != 6)                              return 332;
+    if (m4p.sum() != 11)                         return 333;
+
+    // Two arguments after 'this'.
+    if (m4p.scaled(2, 1) != 23)                  return 334;
+
+    // const/non-const overload pair on an LVALUE receiver: the RULING says the NON-const leg
+    // wins, and it is the leg that returns 1.
+    if (m4p.probe() != 1)                        return 335;
+
+    // Static method: no receiver, called through the dotted type name.
+    if (cppi.Point.origin_sum() != 0)            return 336;
+
+    // Static data member READ. bump() incremented it exactly once above.
+    if (cppi.Point.s_calls != 1)                 return 337;
+    m4p.bump(0);
+    if (cppi.Point.s_calls != 2)                 return 338;
+
+    // Same dispatch through a POINTER receiver.
+    cppi.Point* m4q = &m4p;
+    if (m4q.sum() != 11)                         return 339;
+    m4q.bump(1);
+    if (m4p.x != 6)                              return 340;
+
+    // A public method that reads a PRIVATE field is fine; naming the field is not - see
+    // Test/errors/err_cpp_private_member.cb.
+    if (m4p.hidden() != 0)                       return 341;
+
+    // A scoped enum nested in a namespace is also published under its QUALIFIED C++ spelling,
+    // so the enumerator can be written the way C++ writes it instead of as a bare integer.
+    if (cppi.Mode.On != 1)                       return 342;
+    if (cppi.mode_value(cppi.Mode.On) != 10)     return 343;
+
+    // ---- Section M5: nontrivial C++ class lifetime (350-399) ---------------------
+    // cppi.Tracked increments an exported counter in every special member, so each check below
+    // is an EXACT count: one extra copy, one missed destructor, or a double destruction fails.
+
+    // Simple scope: one construction, one destruction, nothing else.
+    cppi.reset_counts();
+    {
+        cppi.Tracked t = cppi.Tracked(5);
+        if (t.value() != 5)                      return 350;
+        if (cppi.dtor_count() != 0)              return 351;
+    }
+    if (cppi.ctor_count() != 1)                  return 352;
+    if (cppi.copy_count() != 0)                  return 353;
+    if (cppi.move_count() != 0)                  return 354;
+    if (cppi.dtor_count() != 1)                  return 355;
+
+    // Nested scopes: the inner object dies at the inner brace, the outer one at the outer brace.
+    cppi.reset_counts();
+    {
+        cppi.Tracked outer = cppi.Tracked(1);
+        {
+            cppi.Tracked inner = cppi.Tracked(2);
+            if (inner.value() != 2)              return 356;
+            if (cppi.dtor_count() != 0)          return 357;
+        }
+        if (cppi.dtor_count() != 1)              return 358;
+        if (outer.value() != 1)                  return 359;
+    }
+    if (cppi.ctor_count() != 2)                  return 360;
+    if (cppi.dtor_count() != 2)                  return 361;
+
+    // Early return out of a helper that holds one.
+    cppi.reset_counts();
+    if (m5_early_return(4) != 4)                 return 362;
+    if (cppi.ctor_count() != 1)                  return 363;
+    if (cppi.dtor_count() != 1)                  return 364;
+
+    // break: three iterations ran, three objects were destroyed (including the one live at break).
+    cppi.reset_counts();
+    for (int m5i = 0; m5i < 5; m5i++)
+    {
+        cppi.Tracked t = cppi.Tracked(m5i);
+        if (t.value() != m5i)                    return 365;
+        if (m5i == 2) break;
+    }
+    if (cppi.ctor_count() != 3)                  return 366;
+    if (cppi.dtor_count() != 3)                  return 367;
+
+    // continue: the object is destroyed on the continue edge as well as the fall-through edge.
+    cppi.reset_counts();
+    for (int m5j = 0; m5j < 4; m5j++)
+    {
+        cppi.Tracked t = cppi.Tracked(m5j);
+        if (m5j % 2 == 0) continue;
+        if (t.value() != m5j)                    return 368;
+    }
+    if (cppi.ctor_count() != 4)                  return 369;
+    if (cppi.dtor_count() != 4)                  return 370;
+
+    // Copy construction from a T lvalue: exactly one copy, no move, both objects destroyed.
+    cppi.reset_counts();
+    {
+        cppi.Tracked src = cppi.Tracked(11);
+        cppi.Tracked dst = src;
+        if (dst.value() != 11)                   return 371;
+        if (src.value() != 11)                   return 372;
+    }
+    if (cppi.ctor_count() != 1)                  return 373;
+    if (cppi.copy_count() != 1)                  return 374;
+    if (cppi.move_count() != 0)                  return 375;
+    if (cppi.dtor_count() != 2)                  return 376;
+
+    // Move construction: the source is compile-time consumed (reading it is an error - see
+    // Test/errors/err_cpp_use_after_move.cb) but STILL destroyed, so BOTH objects are destroyed.
+    cppi.reset_counts();
+    {
+        cppi.Tracked from = cppi.Tracked(12);
+        cppi.Tracked to = move from;
+        if (to.value() != 12)                    return 377;
+    }
+    if (cppi.move_count() != 1)                  return 378;
+    if (cppi.copy_count() != 0)                  return 379;
+    if (cppi.dtor_count() != 2)                  return 380;
+
+    // Copy assignment over a LIVE object: the C++ operator runs, never a byte store.
+    cppi.reset_counts();
+    {
+        cppi.Tracked a = cppi.Tracked(1);
+        cppi.Tracked b = cppi.Tracked(2);
+        b = a;
+        if (b.value() != 1)                      return 381;
+        if (cppi.copy_assign_count() != 1)       return 382;
+        if (cppi.copy_count() != 0)              return 383;
+    }
+    if (cppi.dtor_count() != 2)                  return 384;
+
+    // Move assignment consumes the source and leaves it destructible.
+    cppi.reset_counts();
+    {
+        cppi.Tracked a = cppi.Tracked(3);
+        cppi.Tracked b = cppi.Tracked(4);
+        b = move a;
+        if (b.value() != 3)                      return 385;
+        if (cppi.move_assign_count() != 1)       return 386;
+    }
+    if (cppi.dtor_count() != 2)                  return 387;
+
+    // By-value ARGUMENT: the caller copy-constructs a temp, the callee reads it, the temp is
+    // destroyed - so one copy and two destructions in total.
+    cppi.reset_counts();
+    {
+        cppi.Tracked a = cppi.Tracked(6);
+        if (cppi.take_tracked(a) != 6)           return 388;
+    }
+    if (cppi.copy_count() != 1)                  return 389;
+    if (cppi.move_count() != 0)                  return 390;
+    if (cppi.dtor_count() != 2)                  return 391;
+
+    // By-value argument written `move x`: move-construction instead of a copy.
+    cppi.reset_counts();
+    {
+        cppi.Tracked a = cppi.Tracked(7);
+        if (cppi.take_moved(move a) != 70)       return 392;
+    }
+    if (cppi.move_count() != 1)                  return 393;
+    if (cppi.copy_count() != 0)                  return 394;
+    if (cppi.dtor_count() != 2)                  return 395;
+
+    // By-value RETURN into a local: constructed straight into the declared slot through the sret
+    // pointer, so there is NO copy and NO move at all - one construction, one destruction.
+    cppi.reset_counts();
+    {
+        cppi.Tracked r = cppi.make_tracked(9);
+        if (r.value() != 9)                      return 396;
+    }
+    if (cppi.ctor_count() != 1)                  return 397;
+    if (cppi.copy_count() != 0)                  return 398;
+    if (cppi.move_count() != 0)                  return 399;
+    if (cppi.dtor_count() != 1)                  return 400;
+
+    // new / delete through the C++ global operators, never CFlat's allocator.
+    cppi.reset_counts();
+    cppi.Tracked* m5p = new cppi.Tracked(13);
+    if (m5p.value() != 13)                       return 401;
+    if (cppi.ctor_count() != 1)                  return 402;
+    if (cppi.dtor_count() != 0)                  return 403;
+    delete m5p;
+    if (cppi.dtor_count() != 1)                  return 404;
+
+    // `unique T*` composes: scope exit destroys AND frees through the same C++ operator pair.
+    cppi.reset_counts();
+    {
+        unique cppi.Tracked* m5q = new cppi.Tracked(14);
+        if (m5q.value() != 14)                   return 405;
+        if (cppi.dtor_count() != 0)              return 406;
+    }
+    if (cppi.ctor_count() != 1)                  return 407;
+    if (cppi.dtor_count() != 1)                  return 408;
+
+    // A nontrivial result nobody declares a slot for is a TEMPORARY: it is still destroyed, once,
+    // at the end of the full expression.
+    cppi.reset_counts();
+    _ = cppi.make_tracked(16);
+    if (cppi.ctor_count() != 1)                  return 411;
+    if (cppi.dtor_count() != 1)                  return 412;
+
+    // `_ = move x` releases NOW and must not destroy a second time at scope exit.
+    cppi.reset_counts();
+    {
+        cppi.Tracked a = cppi.Tracked(15);
+        _ = move a;
+        if (cppi.dtor_count() != 1)              return 409;
+    }
+    if (cppi.dtor_count() != 1)                  return 410;
+
+    // ---- Section M6: C++ inheritance and virtual dispatch (420-459) ---------------
+    // Every offset and vtable slot below is clang's own answer, cross-checked against
+    // `clang++ -S -emit-llvm -O0` for the same calls: Shape::area is vtable slot 2, the deleting
+    // destructor is slot 1, and Right sits at byte 16 of Both.
+
+    // Layout: a polymorphic class is a REAL type whose size matches C++ exactly.
+    if (sizeof(cpppoly.Shape) != 16)             return 420;
+    if (sizeof(cpppoly.Circle) != 16)            return 421;
+    if (sizeof(cpppoly.Right) != 16)             return 422;
+    if (sizeof(cpppoly.Both) != 32)              return 423;
+
+    // Object built in C++: virtual dispatch through a BASE pointer picks the derived override,
+    // the non-virtual method still binds directly, and the inherited field reads through.
+    cpppoly.reset_poly_counts();
+    cpppoly.Shape* m6c = cpppoly.make(0);        // a Circle
+    if (m6c.area() != 50)                        return 424;   // Circle::area, radius 5
+    if (m6c.plain() != 102)                      return 425;   // Shape::plain, non-virtual
+    if (m6c.tag != 2)                            return 426;   // Circle's ctor set tag = 2
+    // `delete` through the base pointer takes the vtable's DELETING destructor, so the DERIVED
+    // destructor chain runs - Circle's, then Shape's - and the storage goes back to C++.
+    delete m6c;
+    if (cpppoly.circle_dtors() != 1)             return 427;
+    if (cpppoly.shape_dtors() != 1)              return 428;
+    if (cpppoly.square_dtors() != 0)             return 429;
+
+    cpppoly.Shape* m6s = cpppoly.make(1);        // a Square
+    if (m6s.area() != 49)                        return 430;   // Square::area, side 7
+    cpppoly.destroy(m6s);                        // released on the C++ side
+    if (cpppoly.square_dtors() != 1)             return 431;
+
+    // Object constructed BY CFLAT on the stack: the C++ constructor writes the vptr, so the same
+    // virtual dispatch works, and scope exit runs the derived destructor.
+    cpppoly.reset_poly_counts();
+    {
+        cpppoly.Circle m6stack = default;
+        if (m6stack.radius != 5)                 return 432;
+        if (m6stack.tag != 2)                    return 433;
+        // Shape::plain is INHERITED: it is registered on Circle too, with `this` retyped.
+        if (m6stack.plain() != 102)              return 452;
+        if (m6stack.area() != 50)                return 453;   // Circle's own override, direct
+        cpppoly.Shape* m6base = &m6stack;
+        if (m6base.area() != 50)                 return 434;
+        if (m6base.tag != 2)                     return 435;
+    }
+    if (cpppoly.circle_dtors() != 1)             return 436;
+    if (cpppoly.shape_dtors() != 1)              return 437;
+
+    // Object constructed BY CFLAT on the heap, then released through a BASE pointer.
+    cpppoly.reset_poly_counts();
+    cpppoly.Square* m6heap = new cpppoly.Square();
+    if (m6heap.area() != 49)                     return 438;
+    cpppoly.Shape* m6heapBase = move m6heap;
+    if (m6heapBase.area() != 49)                 return 439;
+    delete m6heapBase;
+    if (cpppoly.square_dtors() != 1)             return 440;
+    if (cpppoly.shape_dtors() != 1)              return 441;
+
+    // MULTIPLE inheritance. Right is the NON-PRIMARY base of Both, at byte 16, so every
+    // Both -> Right crossing must add 16; reading rv is what proves it happened.
+    cpppoly.Both m6b = default;
+    if (m6b.lv != 33)                            return 442;   // inherited from Left
+    if (m6b.rv != 44)                            return 443;   // inherited from Right
+    if (m6b.both_only() != 77)                   return 444;
+    if (m6b.l() != 1033)                         return 445;   // Both::l overrides Left::l
+    if (m6b.r() != 2044)                         return 446;   // Both::r overrides Right::r
+    // C++ side takes a Right* and reads rv: wrong adjustment would hand it Left's storage.
+    if (cpppoly.read_right(&m6b) != 44)          return 447;
+    // C++ side dispatches virtually on that same adjusted pointer and lands on Both::r.
+    if (cpppoly.call_right(&m6b) != 2044)        return 448;
+    // The adjustment also happens on a STORE, so a saved base pointer is already correct.
+    cpppoly.Right* m6r = &m6b;
+    if (cpppoly.read_right(m6r) != 44)           return 449;
+    if (m6r.rv != 44)                            return 450;
+    if (m6r.r() != 2044)                         return 451;   // virtual, through Right's vtable
 
     return 0;
 }

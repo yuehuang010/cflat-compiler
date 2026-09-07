@@ -262,6 +262,11 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                         result = 0;
                     else if (tmpArg.IsTypeMatch(tmpParam))
                         result = 0;
+                    // M6 - a pointer to a C++ class binds to a parameter typed as a PUBLIC base
+                    // of it, with the base subobject offset added at the call. Scored as an
+                    // implicit conversion so an exact-type overload always wins.
+                    else if (IsCxxDerivedToBasePointer(tmpArg, tmpParam))
+                        result = 1;
                     else if (tmpArg.IsTypePromotion(tmpParam))
                     {
                         // Positive = widening promotion (valid but non-perfect). Integer promotions
@@ -1146,9 +1151,14 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
             if (resolvedCandidate.size() == 1)
             {
                 const auto& [resolvedArgs, resolvedSym] = resolvedCandidate.front();
+                // A C++ candidate's UniqueName is its mangled linkage name (_ZN4cppi8pick_refERi),
+                // which names nothing the user wrote. The registered lookup name is the dotted
+                // spelling (cppi.pick_ref), so prefer it whenever it exists.
+                std::string resolvedShown = !resolvedSym.SourceName.empty()
+                    ? resolvedSym.SourceName
+                    : SpellFunctionSymbol(*this, resolvedSym.UniqueName);
                 msg += std::format("  Argument mismatch detail (single resolved candidate: {}):\n",
-                    displayName.empty() ? SpellFunctionSymbol(*this, resolvedSym.UniqueName)
-                                         : shownFunctionName);
+                    displayName.empty() ? resolvedShown : shownFunctionName);
                 size_t count = std::max(resolvedArgs.size(), resolvedSym.Parameters.size());
                 for (size_t i = 0; i < count; i++)
                 {
@@ -1904,6 +1914,10 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
         // for the caller. Otherwise fall through to the existing call path.
         // Remember where this callee was first called, so an end-of-module diagnostic
         // (CheckPoisonedFunctionCalls) can point at the real call site.
+        // Refuse before any argument is committed: a potentially throwing C++ callee has no
+        // landing pad on the CFlat side.
+        RejectThrowingCxxFunction(candidate, diagnosticFunctionName);
+
         if (candidate.Function != nullptr)
             firstCallLocation_.emplace(candidate.Function->getName().str(),
                 std::make_pair(currentLine, currentColumn));
@@ -1932,9 +1946,120 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
         // Null move sources before the callee can observe or reseat an aliased slot.
         ApplyMoveParamTransfer(functionName, candidate.Parameters, matched, true,
                                candidate.IsMethod, true);
+
+        /*
+         * M4b - foreign nontrivial C++ values crossing this call by value.
+         *
+         * Argument: clang arranges it Indirect-WITHOUT-byval, i.e. a bare pointer to storage the
+         * CALLER owns and destroys after the call. So copy-construct (or move-construct for
+         * `move x`) a temp here and hand over its address; the byte copy the generic ByVal path
+         * would do is illegal for such a type. The temp joins the ordinary end-of-statement
+         * owned-temp list, whose destructor for this class IS the C++ complete-object destructor.
+         *
+         * Result: an armed declaration slot (pendingCxxSretDest_) becomes the sret pointer, so
+         * the callee constructs directly into the local and nothing is copied back out.
+         */
+        std::vector<llvm::Value*> cxxIndirectArgAddrs;
+        llvm::Value* cxxSretDest = nullptr;
+        llvm::Value* cxxRetTemp = nullptr;
+        if (candidate.Recipe.hasLowering && candidate.IsCxx)
+        {
+            for (size_t i = 0; i < candidate.Recipe.paramSlots.size()
+                            && i < candidate.Parameters.size(); ++i)
+            {
+                if (candidate.Recipe.paramSlots[i].kind != AbiSlot::ByVal) continue;
+                const std::string& pn = candidate.Parameters[i].TypeName;
+                if (!IsForeignNontrivialCxxClass(pn)) continue;
+                if (i >= matched.size() || matched[i].Storage == nullptr)
+                {
+                    LogError(std::format(
+                        "cannot pass C++ class '{}' by value to parameter '{}' of '{}': the "
+                        "argument must be a variable, a field or another addressable object so "
+                        "its copy constructor can run", pn,
+                        candidate.Parameters[i].VariableName, diagnosticFunctionName));
+                    continue;
+                }
+                auto* structTy = candidate.Recipe.paramSlots[i].structTy;
+                auto* temp = AllocaAtEntry(structTy, nullptr, "cxx.argtemp",
+                                           candidate.Recipe.paramSlots[i].align);
+                if (!EmitCxxCopyOrMoveConstruct(pn, temp, matched[i].Storage,
+                                                matched[i].IsExplicitMove,
+                                                "into a by-value parameter"))
+                    continue;
+                RegisterOwnedStructTemp(temp, pn);
+                cxxIndirectArgAddrs.resize(candidate.Recipe.paramSlots.size(), nullptr);
+                cxxIndirectArgAddrs[i] = temp;
+            }
+            if (candidate.Recipe.retSlot.kind == AbiSlot::SRetReturn
+                && IsForeignNontrivialCxxClass(candidate.ReturnType.TypeName))
+            {
+                if (pendingCxxSretDest_ != nullptr
+                    && candidate.ReturnType.TypeName == pendingCxxSretTypeName_)
+                {
+                    cxxSretDest = pendingCxxSretDest_;
+                    pendingCxxSretDest_ = nullptr;
+                    pendingCxxSretTypeName_.clear();
+                }
+                else
+                {
+                    // No declaration slot is waiting for this result, so the returned object is a
+                    // TEMPORARY. It must still be destroyed: give it a named slot and hand that
+                    // slot to the ordinary end-of-statement owned-temp list, whose destructor for
+                    // this class is the C++ complete-object destructor.
+                    cxxSretDest = AllocaAtEntry(candidate.Recipe.retSlot.structTy, nullptr,
+                                                "cxx.rettemp", candidate.Recipe.retSlot.align);
+                    cxxRetTemp = cxxSretDest;
+                }
+            }
+        }
+
+        /*
+         * M6 - derived-to-base pointer adjustment, and virtual dispatch.
+         *
+         * Both are pure pointer arithmetic Clang told us the offsets for. An argument typed as a
+         * class that publicly derives from the parameter's class is shifted to that base's
+         * subobject; a member INHERITED from a non-primary base has its `this` shifted the same
+         * way (the offset was recorded when the base's method was cloned onto this class); and a
+         * VIRTUAL member is then reached through the pointer loaded out of the receiver's vptr,
+         * indexed by the slot ItaniumVTableContext assigned it.
+         */
+        llvm::Value* cxxVirtualCallee = nullptr;
+        if (candidate.IsCxx)
+        {
+            for (size_t i = 0; i < candidate.Parameters.size() && i < matched.size()
+                            && i < argList.size(); ++i)
+            {
+                const TypeAndValue& pt = candidate.Parameters[i];
+                const TypeAndValue& at = matched[i].TypeAndValue;
+                if (!IsCxxDerivedToBasePointer(at, pt)) continue;
+                uint64_t off = 0;
+                bool inaccessible = false;
+                if (FindCxxBaseOffset(at.TypeName, pt.TypeName, off, inaccessible))
+                    argList[i] = EmitCxxBaseAdjust(argList[i], off);
+            }
+            if (candidate.IsMethod && !argList.empty() && !candidate.Parameters.empty())
+            {
+                auto adj = cxxThisAdjust_.find(
+                    CxxThisAdjustKey(candidate.Parameters[0].TypeName, candidate.UniqueName));
+                if (adj != cxxThisAdjust_.end())
+                    argList[0] = EmitCxxBaseAdjust(argList[0], adj->second);
+                cxxVirtualCallee = EmitCxxVirtualCallee(candidate, argList[0]);
+            }
+        }
+
         llvm::Value* result = candidate.Recipe.hasLowering
-            ? EmitAbiLoweredCall(candidate, argList)
-            : CreateFunctionCall(candidate.Function, argList);
+            ? EmitAbiLoweredCall(candidate, argList, cxxSretDest,
+                                 cxxIndirectArgAddrs.empty() ? nullptr : &cxxIndirectArgAddrs,
+                                 cxxVirtualCallee)
+            : (cxxVirtualCallee != nullptr
+                ? (llvm::Value*)builder->CreateCall(candidate.Function->getFunctionType(),
+                                                    cxxVirtualCallee, argList)
+                : CreateFunctionCall(candidate.Function, argList));
+        if (cxxRetTemp != nullptr)
+        {
+            RegisterOwnedStructTemp(cxxRetTemp, candidate.ReturnType.TypeName);
+            result = builder->CreateLoad(candidate.Recipe.retSlot.structTy, cxxRetTemp);
+        }
 
         RegisterRawArrayCallResult(result, rawReturnCountSlot,
                                    candidate.ReturnType.AllocAlignValue);
@@ -2247,6 +2372,9 @@ llvm::Function* LLVMBackend::GetFunctionForFuncPtr(std::string functionName, int
             || (destSig != nullptr && !destSig->FuncPtrReturnTypeName.empty());
         auto chosen = [&](const FunctionSymbol* sym) -> llvm::Function* {
             if (bindingFuncPtr) RejectAliasParamFuncPtrBind(functionName, *sym);
+            // Taking the address is as unsafe as calling it - the eventual indirect call has
+            // no landing pad either.
+            if (bindingFuncPtr) RejectThrowingCxxFunction(*sym, functionName);
             return sym->Function;
         };
         if (overloads.size() == 1)

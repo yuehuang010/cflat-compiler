@@ -2702,14 +2702,16 @@ bool LLVMBackend::EmitExecutableElf(const std::string& exePath, bool debugInfo,
         // Link with the system C compiler driver: it pulls in the C runtime
         // startup and libc and resolves cflat's `main`.
         std::string cc;
-        for (const char* cand : { "cc", "gcc", "clang", "clang-18" })
-        {
-            if (auto p = llvm::sys::findProgramByName(cand)) { cc = *p; break; }
-        }
+        if (cppInteropUsed_)
+            cc = FindCxxDriver();
+        else
+            for (const char* cand : { "cc", "gcc", "clang", "clang-18" })
+                if (auto p = llvm::sys::findProgramByName(cand)) { cc = *p; break; }
         if (cc.empty())
         {
             llvm::sys::fs::remove(objPath);
-            std::cout << "Error: no C compiler driver (cc/gcc/clang) found to link the executable\n";
+            std::cout << std::format("Error: no {} compiler driver found to link the executable\n",
+                                     cppInteropUsed_ ? "C++" : "C");
             return false;
         }
 
@@ -2956,7 +2958,10 @@ bool LLVMBackend::EmitExecutableMachO(const std::string& exePath, bool debugInfo
             }
             sdkVer = TwoComponentVersion(sdkVer);
             if (sdkVer.empty()) sdkVer = "11.0";
-            if (!ld64.empty() && !sdk.empty())
+            // C++ interop needs the selected C++ standard library and its startup/runtime
+            // objects. The SDK-free direct ld64 path intentionally links only libSystem, so
+            // route C++ programs through clang++ below where the driver supplies libc++.
+            if (!ld64.empty() && !sdk.empty() && !cppInteropUsed_)
             {
                 std::vector<std::string> argStrs = {
                     ld64, "-arch", "arm64",
@@ -3039,10 +3044,11 @@ bool LLVMBackend::EmitExecutableMachO(const std::string& exePath, bool debugInfo
         // Fallback: host clang driver (bundled ld64.lld/SDK missing, or an osxcross
         // cross-link from a non-Darwin host). Same behavior as before this change.
         std::string cc;
-        for (const char* cand : { "o64-clang", "oa64-clang", "clang" })
-        {
-            if (auto p = llvm::sys::findProgramByName(cand)) { cc = *p; break; }
-        }
+        if (cppInteropUsed_)
+            cc = FindCxxDriver();
+        else
+            for (const char* cand : { "o64-clang", "oa64-clang", "clang" })
+                if (auto p = llvm::sys::findProgramByName(cand)) { cc = *p; break; }
         if (cc.empty() || !darwinHost)
         {
             (void)debugInfo;
@@ -3053,6 +3059,13 @@ bool LLVMBackend::EmitExecutableMachO(const std::string& exePath, bool debugInfo
 
         std::vector<std::string> argStrs = { cc, "-target", "arm64-apple-macosx11.0.0",
                                              objPath, "-o", exePath };
+        if (cppInteropUsed_)
+        {
+            argStrs.push_back("-stdlib=libc++");
+            argStrs.push_back("-std=" + cppStandard_);
+            const std::string sdkPath = MacSdkPathCached();
+            if (!sdkPath.empty()) { argStrs.push_back("-isysroot"); argStrs.push_back(sdkPath); }
+        }
         for (auto& cObj : cObjectFiles_) argStrs.push_back(cObj);
         for (const auto& lib : cLinkLibs_) argStrs.push_back(lib);
         // macOS frameworks (`import framework`); the clang driver accepts -framework.
@@ -3277,7 +3290,10 @@ bool LLVMBackend::EmitExecutable(const std::string& exePath, const std::string& 
         // Otherwise we drop vcruntime entirely: cflat_builtins.c supplies our own CRT entry, the
         // mem*/str* intrinsics and (on x64) a real __C_specific_handler, so even the `program`
         // construct's SEH crash isolation (catchpad personality, MainListener.h) works without it.
-        const bool keepVcRuntime = asan_ || arch == "x86";
+        // C++ objects use the MSVC C++ runtime and exception/initialization support. The
+        // freestanding x64 path deliberately drops vcruntime, so select the stock CRT whenever
+        // a C++ source/header participates in this image.
+        const bool keepVcRuntime = asan_ || arch == "x86" || cppInteropUsed_;
 
         if (!keepVcRuntime)
             CompileBuiltinsObject(arch);
@@ -3411,6 +3427,8 @@ bool LLVMBackend::EmitExecutable(const std::string& exePath, const std::string& 
             // entry) and vcruntime140.dll provides the mem*/EH symbols ASan's runtime expects.
             linkArgStrs.push_back("msvcrt.lib");
             linkArgStrs.push_back("vcruntime.lib");
+            if (cppInteropUsed_)
+                linkArgStrs.push_back("msvcprt.lib");
         }
         else
         {

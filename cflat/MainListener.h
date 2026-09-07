@@ -63,8 +63,9 @@ static std::string ImportNamespace(CFlatParser::ImportDeclarationContext* imp)
 {
     if (imp == nullptr || imp->children.size() < 2) return {};
     std::string first = imp->children[1]->getText();
+    // `cpp` selects C++ binding mode for the named file, whatever its extension.
     if (first == "program" || first == "package" || first == "framework"
-        || first == "package-vcpkg" || first == "package-nuget")
+        || first == "cpp" || first == "package-vcpkg" || first == "package-nuget")
         return {};
     auto ids = imp->Identifier();
     return ids.empty() ? std::string{} : ids.front()->getText();
@@ -107,8 +108,9 @@ static std::string ValidateImportLeadingMarker(CFlatParser::ImportDeclarationCon
     if (imp == nullptr || imp->children.size() < 2) return "malformed import declaration";
     std::string first = imp->children[1]->getText();
     if (!first.empty() && (first.front() == '"' || first.front() == '{')) return {};
+    // `cpp` binds the named file as C++ - the marker, not the extension, selects the mode.
     if (first == "program" || first == "package" || first == "framework"
-        || first == "package-vcpkg" || first == "package-nuget")
+        || first == "cpp" || first == "package-vcpkg" || first == "package-nuget")
         return {};
     return std::format("unknown '{}' in import marker", first);
 }
@@ -3911,6 +3913,29 @@ public:
     // is the entire expression. Returns null when any operator (binary, unary, sizeof, cast) sits
     // above the move, since then the move is not the whole RHS.
     static CFlatParser::MoveExpressionContext* TopLevelMoveExpression(antlr4::tree::ParseTree* node);
+
+    /*
+     * M4b - declare a local of a foreign NONTRIVIAL C++ class by CONSTRUCTING INTO ITS SLOT.
+     *
+     * CFlat's ordinary declaration path materializes an initializer VALUE and stores it, which
+     * for a C++ class with a user copy/move constructor or destructor is exactly the byte copy
+     * the language forbids. This path allocates the local first and then calls a C++ constructor
+     * on that address, so no value of the class ever exists. Returns true when it owned the
+     * declaration (including when it reported an error); false leaves the ordinary path in charge.
+     *
+     * Accepted initializer forms: `T(args)`, `= default`, none at all (default constructor),
+     * a T lvalue (copy constructor), `move <T lvalue>` (move constructor, source consumed), and
+     * a call returning T by value (constructed straight into the slot through the sret pointer).
+     */
+    bool TryDeclareForeignCxxLocal(CFlatParser::InitDeclaratorContext* initDeclarator,
+                                   CFlatParser::DirectDeclaratorContext* direct,
+                                   const LLVMBackend::DeclTypeAndValue& declType,
+                                   const std::string& name, size_t line,
+                                   std::vector<std::pair<std::string, llvm::AllocaInst*>>& allocList);
+    // The `T(args)` construction form: the argument list of a postfix call whose callee spelling
+    // names the declared foreign class itself. Null for every other expression shape.
+    static CFlatParser::ArgumentExpressionListContext* ForeignCxxConstructArgs(
+        antlr4::tree::ParseTree* node, const std::string& typeName);
 
     // True when `text` is a single bare identifier (no `.`, `[`, `(`, `*`, etc.), so a `move <text>`
     // names a variable rather than a field/index/call/deref.

@@ -1589,6 +1589,10 @@ void LLVMBackend::DiagnoseExplicitMoveToBorrowParam(const std::string& functionN
             && !IsCopyableType(param.TypeName);
         bool paramIsSink = param.IsMove
             || (!param.Pointer && !param.IsAlias && IsCoreUniqueType(param.TypeName))
+            // A foreign nontrivial C++ class taken BY VALUE is a real sink: the call site
+            // move-CONSTRUCTS the callee's caller-owned temp from the argument, so `move x`
+            // transfers exactly what C++ transfers.
+            || (!param.Pointer && IsForeignNontrivialCxxClass(param.TypeName))
             || inferredSinkConsumes
             || (OwningSinkConsumesConcrete(param) && IsOwningValueOrClosureType(param.TypeName));
         DiagnoseExplicitMoveToBorrowParam(

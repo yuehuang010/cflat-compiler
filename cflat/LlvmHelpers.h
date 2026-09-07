@@ -11,6 +11,8 @@
 #include <llvm/IR/DerivedTypes.h>
 #include <llvm/IR/Instruction.h>
 #include <llvm/IR/Type.h>
+#include <llvm/Support/raw_ostream.h>
+#include <string>
 
 namespace cflat_llvm
 {
@@ -44,6 +46,67 @@ inline llvm::ConstantInt* GetIntTruncated(llvm::Type* type, uint64_t value)
 inline llvm::PointerType* PointerTo(llvm::Type* type, unsigned addressSpace = 0)
 {
     return llvm::PointerType::get(type->getContext(), addressSpace);
+}
+
+/*
+ * Print a type STRUCTURALLY: identical to llvm::Type::print except that a named struct is
+ * expanded into its element list instead of printed as "%name". Two compilers describe the same
+ * ABI with differently NAMED structs (clang's %"struct.cppi::Hfa" is cflat's %cppi.Hfa), so a
+ * name-carrying spelling cannot be compared across them, and cannot be re-read on the other side
+ * either. This form is both comparable and parseable.
+ */
+inline void PrintStructural(llvm::Type* t, llvm::raw_ostream& os)
+{
+    if (auto* st = llvm::dyn_cast<llvm::StructType>(t))
+    {
+        if (st->isPacked()) os << "<";
+        os << "{ ";
+        for (unsigned i = 0; i < st->getNumElements(); ++i)
+        {
+            if (i != 0) os << ", ";
+            PrintStructural(st->getElementType(i), os);
+        }
+        os << " }";
+        if (st->isPacked()) os << ">";
+        return;
+    }
+    if (auto* at = llvm::dyn_cast<llvm::ArrayType>(t))
+    {
+        os << "[" << at->getNumElements() << " x ";
+        PrintStructural(at->getElementType(), os);
+        os << "]";
+        return;
+    }
+    if (auto* vt = llvm::dyn_cast<llvm::FixedVectorType>(t))
+    {
+        os << "<" << vt->getNumElements() << " x ";
+        PrintStructural(vt->getElementType(), os);
+        os << ">";
+        return;
+    }
+    if (auto* ft = llvm::dyn_cast<llvm::FunctionType>(t))
+    {
+        PrintStructural(ft->getReturnType(), os);
+        os << " (";
+        for (unsigned i = 0; i < ft->getNumParams(); ++i)
+        {
+            if (i != 0) os << ", ";
+            PrintStructural(ft->getParamType(i), os);
+        }
+        if (ft->isVarArg()) os << (ft->getNumParams() != 0 ? ", ..." : "...");
+        os << ")";
+        return;
+    }
+    t->print(os);
+}
+
+inline std::string StructuralTypeText(llvm::Type* t)
+{
+    if (t == nullptr) return {};
+    std::string s;
+    llvm::raw_string_ostream os(s);
+    PrintStructural(t, os);
+    return s;
 }
 
 } // namespace cflat_llvm

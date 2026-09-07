@@ -1601,6 +1601,66 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
             auto namedVar = ParseUnaryExpression(unaryCtx);
             auto destination = namedVar.Storage;
 
+            /*
+             * M4b - assignment to a foreign NONTRIVIAL C++ object runs the C++ assignment
+             * operator. The generic path would store bytes over a live object, which for a class
+             * with a user copy/move assignment (or a destructor that owns something) corrupts it.
+             * `y = move x` prefers move assignment and consumes x; the moved-from object is still
+             * destroyed at scope exit (M4b ruling 3).
+             */
+            if (operatorText == "=" && destination != nullptr
+                && !namedVar.TypeAndValue.Pointer
+                && compiler->IsForeignNontrivialCxxClass(namedVar.TypeAndValue.TypeName))
+            {
+                const std::string tn = namedVar.TypeAndValue.TypeName;
+                auto* mv = TopLevelMoveExpression(assignCtx);
+                const bool useMove = mv != nullptr;
+                auto* srcCtx = useMove ? (antlr4::ParserRuleContext*)mv->unaryExpression()
+                                       : (antlr4::ParserRuleContext*)assignCtx;
+                const std::string srcName = srcCtx != nullptr ? srcCtx->getText() : std::string();
+                if (!IsBareIdentifierText(srcName))
+                {
+                    LogErrorContext(ctx, std::format(
+                        "cannot assign to C++ class '{}' from this expression; the source must be "
+                        "a '{}' variable, optionally written 'move <variable>'", tn, tn));
+                    return nullptr;
+                }
+                auto* srcNV = compiler->FindLiveNamedVariable(srcName);
+                if (srcNV == nullptr || srcNV->Storage == nullptr
+                    || srcNV->TypeAndValue.Pointer || srcNV->TypeAndValue.TypeName != tn)
+                {
+                    LogErrorContext(ctx, std::format(
+                        "'{}' is not a '{}' value that can be assigned to a '{}'", srcName, tn, tn));
+                    return nullptr;
+                }
+                if (srcNV->IsMoved || srcNV->ExplicitlyMovedNull)
+                {
+                    LogErrorContext(ctx, std::format("use of moved variable '{}'", srcName));
+                    return nullptr;
+                }
+                const auto* info = compiler->GetCxxClassInfo(tn);
+                const LLVMBackend::CxxClassInfo::Structor* op = nullptr;
+                if (info != nullptr)
+                {
+                    // C++ picks move assignment for an rvalue and falls back to copy assignment
+                    // when the class declares none; an lvalue always takes the copy leg.
+                    if (useMove && info->hasMoveAssign)  op = &info->moveAssign;
+                    else if (info->hasCopyAssign)        op = &info->copyAssign;
+                    else if (info->hasMoveAssign)        op = &info->moveAssign;
+                }
+                if (op == nullptr)
+                {
+                    LogErrorContext(ctx, std::format(
+                        "C++ class '{}' has no assignment operator cflat can call (it is implicit, "
+                        "deleted, inaccessible, or defined inline in the header) - assign through a "
+                        "pointer, or re-declare the destination instead", tn));
+                    return nullptr;
+                }
+                compiler->EmitCxxStructorCall(tn, *op, destination, { srcNV->Storage });
+                if (useMove) compiler->MarkVariableMoved(srcName);
+                return nullptr;
+            }
+
             // A range-for variable is a borrow of the current element, not an owning local. For
             // addressable arrays/views, route the ordinary assignment machinery to that element
             // slot. Container legs use their write-through `set` operation instead.
@@ -3075,6 +3135,14 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                     : namedVar.IsElementAccess
                         ? std::format("element of '{}'", namedVar.CallerName)
                         : std::format("'{}'", namedVar.CallerName));
+
+            // M6 - `basePtr = derivedPtr;` shifts to the base subobject, matching the declaration
+            // initializer leg above.
+            if (operatorText == "=" && right != nullptr)
+                right = compiler->AdjustCxxPointerForStore(
+                    namedVar.TypeAndValue, rightNV.TypeAndValue, right,
+                    namedVar.CallerName.empty() ? std::string("this location")
+                                                : std::format("'{}'", namedVar.CallerName));
 
             // Pointer variable assigned a struct value: catch the mismatch here
             // with a clear message rather than letting LLVM assert inside CreateCast.
@@ -6847,6 +6915,22 @@ LLVMBackend::TypedValue MainListener::ParseTypeCheckExpression(CFlatParser::Type
                 // interface identity, so the name can only come from here).
                 std::string srcTypeName = srcBinding != nullptr ? srcBinding->TypeAndValue.TypeName
                                                                 : std::string{};
+                /*
+                 * M6 - `is` / `as` on an imported C++ class is a dynamic_cast, which needs the
+                 * Itanium RTTI ABI (__dynamic_cast plus a typeinfo reference). CFlat's own is/as
+                 * is driven by its interface type descriptors, which a C++ object does not carry,
+                 * so answering from them would be silently wrong. Refuse instead.
+                 */
+                auto* cxxCompiler = Compiler(ctx);
+                if (cxxCompiler->IsCxxRecord(srcTypeName) || cxxCompiler->IsCxxRecord(targetTypeName))
+                {
+                    LogErrorContext(ctx, std::format(
+                        "'{}' is not supported on the imported C++ class '{}': a C++ runtime type "
+                        "test is a dynamic_cast, which needs the C++ RTTI ABI (not supported yet). "
+                        "Use a C++-side helper that performs the cast and returns the result",
+                        op, cxxCompiler->IsCxxRecord(srcTypeName) ? srcTypeName : targetTypeName));
+                    return { result, false };
+                }
                 if (op == "is")
                 {
                     result = GenerateIsCheck(result, targetTypeName, ctx, srcElemType, srcTypeName, srcBinding);
@@ -12190,6 +12274,68 @@ LLVMBackend::NamedVariable MainListener::ParseNewExpression(CFlatParser::NewExpr
                 SpellType(*compiler, LLVMBackend::TypeAndValue{ .TypeName = typeName })));
             return {};
         }
+        /*
+         * M4b - `new T(args)` on a foreign NONTRIVIAL C++ class: storage from the C++ GLOBAL
+         * allocator (never CFlat's), then a C++ constructor into it. CFlat's own `new` would
+         * zero-fill and look for a CFlat constructor, leaving the object never constructed.
+         */
+        if (!isArray && !typeIsPtr && compiler->IsForeignNontrivialCxxClass(typeName))
+        {
+            if (compiler->RejectUnsupportedCxxLayout(typeName)) return {};
+            if (compiler->RejectAbstractCxxClass(typeName, "allocate")) return {};
+            if (compiler->GetOrCreateCxxClassDestructor(typeName) == nullptr)
+            {
+                LogErrorContext(ctx, std::format(
+                    "cannot allocate C++ class '{}' with 'new': it has no destructor cflat can "
+                    "call, so the object could never be deleted", typeName));
+                return {};
+            }
+            if (ctx->initializerList() != nullptr)
+            {
+                LogErrorContext(ctx, std::format(
+                    "cannot brace-initialize C++ class '{}'; use 'new {}(args)'", typeName, typeName));
+                return {};
+            }
+            std::vector<llvm::Value*> ctorArgs;
+            std::vector<LLVMBackend::TypeAndValue> ctorArgTypes;
+            if (auto* argList = ctx->argumentExpressionList())
+                for (auto* named : argList->argumentNamedExpression())
+                {
+                    auto* argAssign = named->assignmentExpression();
+                    if (argAssign == nullptr)
+                    {
+                        LogErrorContext(named, std::format(
+                            "a constructor argument for C++ class '{}' must be a plain expression",
+                            typeName));
+                        return {};
+                    }
+                    auto nv = ParseAssignmentExpressionNamed(argAssign);
+                    ctorArgs.push_back(LoadNamedVariable(nv));
+                    ctorArgTypes.push_back(nv.TypeAndValue);
+                }
+            std::string why;
+            const auto* ctor = compiler->SelectCxxConstructor(typeName, ctorArgTypes, why);
+            if (ctor == nullptr)
+            {
+                LogErrorContext(ctx, std::format("C++ class '{}' {}", typeName, why));
+                return {};
+            }
+            llvm::Value* block = compiler->EmitCxxHeapAllocate(typeName);
+            if (block == nullptr)
+            {
+                LogErrorContext(ctx, std::format(
+                    "'new': cannot compute the size of C++ class '{}'", typeName));
+                return {};
+            }
+            compiler->EmitCxxStructorCall(typeName, *ctor, block, ctorArgs);
+            LLVMBackend::NamedVariable result;
+            result.TypeAndValue = LLVMBackend::TypeAndValue{ .TypeName = typeName, .Pointer = true };
+            result.Primary = block;
+            result.BaseType = block->getType();
+            compiler->lastOwningResult = true;
+            return result;
+        }
+
         // Honor struct-level alignas: pad sizeof so arrays stride correctly.
         uint64_t effAlign = typeIsPtr
             ? 0
@@ -12996,6 +13142,41 @@ LLVMBackend::NamedVariable MainListener::ParseDeleteExpression(CFlatParser::Dele
             return {};
         }
 
+        /*
+         * M6 - `delete p` where p's static type is a foreign C++ class with a VIRTUAL destructor.
+         * Itanium puts a DELETING destructor (D0) in the vtable next to the complete-object one;
+         * it runs the derived destructor chain AND releases the storage through the C++
+         * deallocator. So this is the whole operation: no CFlat destructor call, no operator
+         * delete. Getting this wrong through a base pointer would run the base destructor only
+         * and free with the wrong size.
+         */
+        if (!isArray && !isRawFree && !elemIsPtr && !typeName.empty()
+            && compiler->CxxHasVirtualDestructor(typeName))
+        {
+            auto* nullPtr = llvm::ConstantPointerNull::get(
+                llvm::cast<llvm::PointerType>(ptrVal->getType()));
+            auto* isNull  = compiler->builder->CreateICmpEQ(ptrVal, nullPtr, "vdel_isnull");
+            auto* delBB   = compiler->CreateBasicBlock("vdel");
+            auto* contBB  = compiler->CreateBasicBlock("vdel_cont");
+            compiler->builder->CreateCondBr(isNull, contBB, delBB);
+            compiler->builder->SetInsertPoint(delBB);
+            const bool emitted = compiler->EmitCxxVirtualDelete(typeName, ptrVal);
+            compiler->builder->CreateBr(contBB);
+            compiler->builder->SetInsertPoint(contBB);
+            if (emitted)
+            {
+                // Same source-alloca nulling step 4 does, so scope-exit cleanup cannot free twice.
+                if (srcAlloca != nullptr && srcAllocaElemType != nullptr)
+                    if (auto* ptrTy = llvm::dyn_cast<llvm::PointerType>(srcAllocaElemType))
+                    {
+                        compiler->builder->CreateStore(
+                            llvm::ConstantPointerNull::get(ptrTy), srcAlloca);
+                        compiler->StoreRawArrayLength(operandNamedVar, nullptr);
+                    }
+                return {};
+            }
+        }
+
         // 1. Call the full destructor (user dtor + member fields) if needed (non-array only).
         // Guard on null: 'delete nullptr' must be a no-op (operator delete below already
         // null-checks). Without this, the destructor would dereference a null pointer - a
@@ -13055,7 +13236,13 @@ LLVMBackend::NamedVariable MainListener::ParseDeleteExpression(CFlatParser::Dele
         // fold in the alignment carried on the operand; either source routes to __delete_aligned.
         if (operandAllocAlign > deleteEffAlign) deleteEffAlign = operandAllocAlign;
         bool useAlignedDelete = deleteEffAlign > LLVMBackend::kDefaultNewAlign;
-        if (!typeName.empty() && compiler->GetFunction(opDelName))
+        // A foreign nontrivial C++ object came from the C++ global allocator, so it must go back
+        // to the matching C++ operator delete (sized, and over-aligned where the class is).
+        if (!elemIsPtr && compiler->IsForeignNontrivialCxxClass(typeName))
+        {
+            compiler->EmitCxxHeapFree(typeName, voidPtr);
+        }
+        else if (!typeName.empty() && compiler->GetFunction(opDelName))
         {
             compiler->CreateOverloadedFunctionCall(opDelName, { ptrArg });
         }

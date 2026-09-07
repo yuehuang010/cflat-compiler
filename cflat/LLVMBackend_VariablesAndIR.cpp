@@ -54,7 +54,8 @@
 
 llvm::GlobalVariable* LLVMBackend::CreateGlobalVariable(TypeAndValue typeValue, llvm::Constant* initValue,
                                                         bool threadLocal, uint64_t userAlign,
-                                                        bool externalDecl, bool srcIsUnsigned)
+                                                        bool externalDecl, bool srcIsUnsigned,
+                                                        const std::string& linkageName)
 {
         // A file-scope global never passes through CreateLocalVariable.
         if (!typeValue.Pointer)
@@ -152,7 +153,9 @@ llvm::GlobalVariable* LLVMBackend::CreateGlobalVariable(TypeAndValue typeValue, 
         // is the un-namespaced name). The full namespaced name stays the cflat lookup
         // key below. Non-namespaced externs (no '.') and definitions are unaffected.
         std::string symbolName = typeValue.VariableName;
-        if (externalDecl)
+        if (!linkageName.empty())
+            symbolName = linkageName;
+        else if (externalDecl)
         {
             auto dot = symbolName.find_last_of('.');
             if (dot != std::string::npos) symbolName = symbolName.substr(dot + 1);
@@ -1395,7 +1398,7 @@ void LLVMBackend::RejectByValueContainmentCycles(const std::string& name,
         visit(name);
     }
 
-llvm::StructType* LLVMBackend::CreateStructType(std::string name, std::vector<LLVMBackend::DeclTypeAndValue> typeAndValues, uint64_t userAlign, std::vector<BitfieldInfo>* bitfields)
+llvm::StructType* LLVMBackend::CreateStructType(std::string name, std::vector<LLVMBackend::DeclTypeAndValue> typeAndValues, uint64_t userAlign, std::vector<BitfieldInfo>* bitfields, bool isPacked)
 {
 
         if (typeAndValues.size() > 0)
@@ -1439,7 +1442,7 @@ llvm::StructType* LLVMBackend::CreateStructType(std::string name, std::vector<LL
             // structs).
             if (userAlign > 1)
             {
-                auto* tmp = llvm::StructType::get(*context, types);
+                auto* tmp = llvm::StructType::get(*context, types, isPacked);
                 uint64_t natural = module->getDataLayout().getTypeAllocSize(tmp);
                 uint64_t padded = (natural + userAlign - 1) / userAlign * userAlign;
                 if (padded > natural)
@@ -1449,7 +1452,7 @@ llvm::StructType* LLVMBackend::CreateStructType(std::string name, std::vector<LL
             auto mystuct = dataStructures.find(name);
             if (mystuct == dataStructures.end())
             {
-                llvm::StructType* myStruct = llvm::StructType::create(types, name);
+                llvm::StructType* myStruct = llvm::StructType::create(types, name, isPacked);
                 dataStructures[name].StructType = myStruct;
                 dataStructures[name].StructFields = typeAndValues;
                 if (bitfields && !bitfields->empty())
@@ -1473,7 +1476,7 @@ llvm::StructType* LLVMBackend::CreateStructType(std::string name, std::vector<LL
             if (bitfields && !bitfields->empty())
                 structData.Bitfields = *bitfields;
             if (structData.StructType->isOpaque())
-                structData.StructType->setBody(types);
+                structData.StructType->setBody(types, isPacked);
             if (userAlign > 1)
                 structData.UserRequestedAlignment = userAlign;
 

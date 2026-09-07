@@ -1,0 +1,12 @@
+// A foreign nontrivial C++ local is CONSTRUCTED into its slot, so only the construction forms are
+// accepted as initializers. An arbitrary expression has no constructor to bind and must not fall
+// back to a byte-wise store.
+import cpp "cpp_interop_basic.h";
+
+extern int main()
+{
+    expect_error("cannot initialize C++ class 'cppi.Tracked' from this expression") {
+        cppi.Tracked bad = cppi.add(1, 2);
+    }
+    return 0;
+}

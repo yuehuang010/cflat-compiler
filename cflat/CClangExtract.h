@@ -11,21 +11,65 @@
 // feeds the existing Register*/cache machinery - none of which changes.
 #pragma once
 
+#include <cstdint>
 #include <string>
 #include <vector>
 
 namespace cflat_cinterop
 {
+    // One parameter's (or the result's) ABI arrangement as Clang computed it, spelled without a
+    // single clang type so the backend can consume it and the caches can round-trip it. `kind`
+    // mirrors clang::CodeGen::ABIArgInfo::Kind; coerceType/paddingType are LLVM IR type TEXT
+    // (llvm::Type::print output, e.g. "i64", "[2 x i64]", "{ i64, i32 }", "<2 x float>").
+    struct RawAbiSlot
+    {
+        enum Kind { Direct, Extend, Indirect, IndirectAliased, Ignore, Expand,
+                    CoerceAndExpand, InAlloca, TargetSpecific, Unknown };
+        int kind = Direct;
+        std::string coerceType;
+        std::string paddingType;
+        bool signExt = false;
+        bool zeroExt = false;
+        bool inReg = false;
+        bool canBeFlattened = false;   // Direct + struct coerce type -> one LLVM arg per element
+        bool indirectByVal = false;
+        bool indirectRealign = false;
+        uint64_t indirectAlign = 0;
+        uint64_t directOffset = 0;
+        unsigned llvmArgIndex = 0;     // first LLVM argument index this slot occupies
+        unsigned llvmArgCount = 1;     // number of LLVM arguments it consumes (0 for Ignore)
+    };
+
+    // Whole-function arrangement. `fnTypeText` is Clang's own llvm::FunctionType for the callee
+    // (from convertFreeFunctionType); the backend compares the type it built against it and
+    // refuses the declaration on any difference rather than emitting a silent ABI mismatch.
+    struct RawAbi
+    {
+        bool valid = false;
+        RawAbiSlot ret;
+        std::vector<RawAbiSlot> params;
+        unsigned callingConv = 0;
+        std::string fnTypeText;
+    };
+
     // A C function signature. Types are canonical C spellings (e.g. "int", "unsigned long long",
     // "struct Point *", "int (*)(int, int)") so the backend's string-based mapper consumes them
     // exactly as it did the libclang DesugaredSpelling.
     struct RawSig
     {
         std::string name;
+        // CFlat spelling (C++ namespace separators are normalized to '.').
+        std::string qualifiedName;
+        // The target ABI linkage spelling. Empty for C declarations.
+        std::string linkageName;
         std::string retType;
         std::vector<std::string> paramTypes;
         std::vector<std::string> paramNames;   // aligned with paramTypes (may be empty strings)
         bool variadic = false;
+        bool isCxx = false;
+        bool isNoexcept = false;
+        // Clang's ABI arrangement for this declaration. Filled only in cxxMode.
+        RawAbi abi;
         std::string file;
         int line = 1;
         int col = 0;
@@ -40,18 +84,130 @@ namespace cflat_cinterop
         int col = 0;
     };
 
+    // C++ access specifier, spelled without a clang enum. Mirrors clang::AccessSpecifier
+    // order for public/protected/private; C fields are always Public.
+    enum RawAccess { AccessPublic = 0, AccessProtected = 1, AccessPrivate = 2 };
+
     struct RawField
     {
         std::string name;
         std::string ctype;          // canonical C spelling of the field type
         bool isBitfield = false;
         unsigned bitWidth = 0;
+        uint64_t offsetBytes = 0;
+        int access = AccessPublic;  // C++ only; C records are all public
+    };
+
+    // One exported member function of a C++ class: an instance method, a static method, a
+    // constructor, or the destructor. Structors carry Clang's Ctor_Complete / Dtor_Complete
+    // linkage name; on Itanium/Darwin they also RETURN 'this', which `returnsThis` records so
+    // the caller can ignore the result instead of mis-typing the callee.
+    struct RawCxxMember
+    {
+        enum Kind { Instance = 0, StaticMethod = 1, Constructor = 2, Destructor = 3 };
+        int kind = Instance;
+        std::string name;              // simple source name; "__ctor" / "__dtor" for structors
+        std::string linkageName;
+        std::string retType;           // canonical spelling ("void" for structors)
+        std::vector<std::string> paramTypes;
+        std::vector<std::string> paramNames;
+        bool variadic = false;
+        bool isConst = false;          // const-qualified instance method
+        bool isVirtual = false;
+        bool isNoexcept = false;
+        bool isDeleted = false;
+        bool isDefaulted = false;
+        bool isImplicit = false;
+        // No out-of-line definition exists in the bound library: the member is implicit,
+        // defaulted, or inline, so calling it would need Clang to emit the body (M5).
+        bool needsLocalDefinition = false;
+        bool returnsThis = false;      // structor ABI hands 'this' back; the result is ignored
+        // Copy / move constructor and copy / move assignment recognition, so the backend can
+        // bind `T y = x;`, `y = x;` and `T y = move x;` without re-deriving it from the params.
+        bool isCopyCtor = false;
+        bool isMoveCtor = false;
+        bool isDefaultCtor = false;
+        bool isCopyAssign = false;
+        bool isMoveAssign = false;
+        bool isPureVirtual = false;
+        // A virtual override whose COVARIANT return type needs a pointer adjustment relative to
+        // the overridden declaration's return type. Clang answers that with a return-adjusting
+        // thunk it emits itself; cflat cannot synthesize one, so such a member is refused.
+        bool covariantReturnNeedsAdjust = false;
+        /*
+         * M6 - Itanium vtable slot of a VIRTUAL member, from
+         * ItaniumVTableContext::getMethodVTableIndex, relative to the address point of the
+         * vtable of the class that DECLARES it. -1 when the member is not virtual.
+         * A virtual destructor occupies TWO adjacent slots: the complete-object destructor (D1)
+         * at vtableIndex and the DELETING destructor (D0), which also frees the storage, at
+         * vtableIndexDeleting.
+         */
+        int vtableIndex = -1;
+        int vtableIndexDeleting = -1;
+        int access = AccessPublic;
+        RawAbi abi;
+        std::string file;
+        int line = 1;
+        int col = 0;
+    };
+
+    // A static data member with an out-of-line definition (so a real symbol exists).
+    struct RawCxxStaticVar
+    {
+        std::string name;
+        std::string ctype;
+        std::string linkageName;
+        int access = AccessPublic;
+        std::string file;
+        int line = 1;
+        int col = 0;
+    };
+
+    // One DIRECT base class of a C++ record, with the byte offset of its subobject inside the
+    // complete object (ASTRecordLayout::getBaseClassOffset). A non-primary base of a multiply
+    // inheriting class has a NON-ZERO offset, which every pointer crossing must add.
+    struct RawCxxBase
+    {
+        std::string name;           // CFlat dotted spelling of the base class
+        uint64_t offsetBytes = 0;
+        int access = AccessPublic;
+        bool isVirtual = false;
     };
 
     struct RawRecord
     {
         std::string name;           // tag name; empty for anonymous (caller synthesizes)
         bool isUnion = false;
+        bool isCxx = false;
+        bool isPacked = false;
+        uint64_t sizeBytes = 0;
+        uint64_t alignBytes = 0;
+        bool isTrivial = false;
+        // Trivially copyable is the predicate that decides whether a C++ record may cross a
+        // by-value boundary as raw bytes; isTrivial additionally demands trivial default
+        // construction, which the ABI does not care about.
+        bool isTriviallyCopyable = false;
+        // M4 class surface. Every flag is Clang's own answer, never derived from the member list.
+        bool isPolymorphic = false;         // has a virtual function or a virtual base
+        bool hasBases = false;              // any base class
+        bool hasVirtualBases = false;       // virtual inheritance: rejected, the VTT is not modelled
+        bool isAbstract = false;            // has an unoverridden pure virtual: cannot be created
+        std::vector<RawCxxBase> bases;      // DIRECT bases, in declaration order
+        // Non-empty when the C++ layout could not be flattened into a CFlat struct (virtual
+        // inheritance, or a bitfield / anonymous member in a class that has bases). The record
+        // stays an opaque shell and every use site reports this text.
+        std::string layoutRefusal;
+        bool hasTrivialDefaultCtor = false;
+        bool hasTrivialCopyCtor = false;
+        bool hasTrivialDtor = true;
+        bool hasDeletedDefaultCtor = false;
+        bool hasDeletedCopyCtor = false;
+        bool hasDefaultCtor = false;
+        bool hasCopyCtor = false;
+        bool isAggregate = false;
+        std::vector<RawCxxMember> members;
+        std::vector<RawCxxStaticVar> staticVars;
+        std::string qualifiedName;
         // Canonical hyphenated GUID of a header-COM interface's __declspec(uuid)/MIDL_INTERFACE
         // attribute (e.g. "db6f6ddb-ac77-4e88-8253-819df9bbf140"), or empty. Populated only by the
         // C++ uuid-harvest pass (the C parse never sees it - the SDK gates the attr on __cplusplus).
@@ -143,6 +299,8 @@ namespace cflat_cinterop
         // (from __declspec(uuid)/MIDL_INTERFACE). No macros/sigs/enums are produced. The caller
         // stamps the harvested GUIDs onto the C-parse records so iidof() resolves header-COM IIDs.
         bool uuidHarvestCxx = false;
+        // Parse the input as C++ and retain C++ qualified names/linkage identity.
+        bool cxxMode = false;
     };
 
     struct ExtractResult

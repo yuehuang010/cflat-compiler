@@ -1571,7 +1571,8 @@ uint64_t LLVMBackend::CHeaderDiskCacheKey(const std::string& fileForLsp,
 uint64_t LLVMBackend::CHeaderDiskCacheKey(const std::vector<std::string>& headerPaths,
                                         const std::vector<std::string>& includeDirs,
                                         const std::vector<std::string>& defines,
-                                        const std::vector<std::string>& extraDefines)
+                                        const std::vector<std::string>& extraDefines,
+                                        bool cxxMode)
 {
         uint64_t h = 14695981039346656037ULL;
         auto fold = [&h](const std::string& s) {
@@ -1581,6 +1582,8 @@ uint64_t LLVMBackend::CHeaderDiskCacheKey(const std::vector<std::string>& header
         for (const auto& inc : includeDirs)  { fold("|I"); fold(inc); }
         for (const auto& def : defines)      { fold("|D"); fold(def); }
         for (const auto& def : extraDefines) { fold("|d"); fold(def); }
+        // A C++-mode binding of the same header is a different result; keep the keys apart.
+        if (cxxMode) fold("|CXX");
         return h;
     }
 
@@ -1697,6 +1700,62 @@ LLVMBackend::TypeAndValue LLVMBackend::TvFromJson(const SjVal& j)
         return s.ToTypeAndValue();
     }
 
+nlohmann::json LLVMBackend::AbiSlotToJson(const cflat_cinterop::RawAbiSlot& sl)
+{
+        nlohmann::json j = {{"k", sl.kind}};
+        if (!sl.coerceType.empty())  j["ct"] = sl.coerceType;
+        if (!sl.paddingType.empty()) j["pt"] = sl.paddingType;
+        if (sl.signExt)         j["se"] = true;
+        if (sl.zeroExt)         j["ze"] = true;
+        if (sl.inReg)           j["ir"] = true;
+        if (sl.canBeFlattened)  j["fl"] = true;
+        if (sl.indirectByVal)   j["bv"] = true;
+        if (sl.indirectRealign) j["rl"] = true;
+        if (sl.indirectAlign)   j["ia"] = sl.indirectAlign;
+        if (sl.directOffset)    j["do"] = sl.directOffset;
+        if (sl.llvmArgIndex)    j["ai"] = sl.llvmArgIndex;
+        if (sl.llvmArgCount != 1) j["ac"] = sl.llvmArgCount;
+        return j;
+    }
+
+cflat_cinterop::RawAbiSlot LLVMBackend::AbiSlotFromJson(const SjVal& j)
+{
+        cflat_cinterop::RawAbiSlot sl;
+        sl.kind            = j.value("k", (int)cflat_cinterop::RawAbiSlot::Direct);
+        sl.coerceType      = j.value("ct", std::string{});
+        sl.paddingType     = j.value("pt", std::string{});
+        sl.signExt         = j.value("se", false);
+        sl.zeroExt         = j.value("ze", false);
+        sl.inReg           = j.value("ir", false);
+        sl.canBeFlattened  = j.value("fl", false);
+        sl.indirectByVal   = j.value("bv", false);
+        sl.indirectRealign = j.value("rl", false);
+        sl.indirectAlign   = j.value("ia", (uint64_t)0);
+        sl.directOffset    = j.value("do", (uint64_t)0);
+        sl.llvmArgIndex    = (unsigned)j.value("ai", (uint64_t)0);
+        sl.llvmArgCount    = (unsigned)j.value("ac", (uint64_t)1);
+        return sl;
+    }
+
+nlohmann::json LLVMBackend::AbiToJson(const cflat_cinterop::RawAbi& a)
+{
+        nlohmann::json ps = nlohmann::json::array();
+        for (const auto& p : a.params) ps.push_back(AbiSlotToJson(p));
+        return {{"r", AbiSlotToJson(a.ret)}, {"ps", ps},
+                {"cc", a.callingConv}, {"ft", a.fnTypeText}};
+    }
+
+cflat_cinterop::RawAbi LLVMBackend::AbiFromJson(const SjVal& j)
+{
+        cflat_cinterop::RawAbi a;
+        a.valid = true;
+        if (j.contains("r")) a.ret = AbiSlotFromJson(j["r"]);
+        if (j.contains("ps")) for (const auto& p : j["ps"]) a.params.push_back(AbiSlotFromJson(p));
+        a.callingConv = (unsigned)j.value("cc", (uint64_t)0);
+        a.fnTypeText  = j.value("ft", std::string{});
+        return a;
+    }
+
 nlohmann::json LLVMBackend::SigToJson(const CSigEntry& e)
 {
         nlohmann::json ps = nlohmann::json::array();
@@ -1704,6 +1763,18 @@ nlohmann::json LLVMBackend::SigToJson(const CSigEntry& e)
         nlohmann::json j = {{"n", e.name}, {"r", TvToJson(e.ret)}, {"ps", ps},
                             {"va", e.variadic}, {"ln", e.line}, {"co", e.col}};
         if (!e.file.empty()) j["f"] = e.file;
+        // C++ identity must round-trip: without it a warm cache calls the demangled name and
+        // silently drops the throwing-call gate.
+        if (!e.linkageName.empty()) j["lk"] = e.linkageName;
+        if (e.isCxx)      j["cx"] = true;
+        if (!e.isNoexcept) j["nx"] = true;
+        // Clang's arrangement must round-trip: rebuilding it needs the clang session the warm
+        // path deliberately skips, and re-deriving it from CFlat's size heuristic would pass a
+        // by-value record in the wrong registers.
+        if (e.abi.valid) j["abi"] = AbiToJson(e.abi);
+        // Raw parameter spellings: RegisterCSignatures retypes a C++ record-pointer parameter out
+        // of void* using these, and a warm cache never sees a clang session to re-derive them.
+        if (!e.paramSpellings.empty()) j["pspell"] = e.paramSpellings;
         return j;
     }
 
@@ -1713,10 +1784,15 @@ LLVMBackend::CSigEntry LLVMBackend::SigFromJson(const SjVal& j)
         e.name     = j.value("n",  std::string{});
         e.ret      = TvFromJson(j.at("r"));
         e.variadic = j.value("va", false);
+        e.linkageName = j.value("lk", std::string{});
+        e.isCxx    = j.value("cx", false);
+        e.isNoexcept = !j.value("nx", false);
         e.file     = j.value("f",  std::string{});
         e.line     = j.value("ln", 1);
         e.col      = j.value("co", 0);
         if (j.contains("ps")) for (const auto& p : j["ps"]) e.params.push_back(TvFromJson(p));
+        if (j.contains("abi")) e.abi = AbiFromJson(j["abi"]);
+        if (j.contains("pspell")) e.paramSpellings = j["pspell"].to_string_vector();
         return e;
     }
 
@@ -1749,6 +1825,8 @@ nlohmann::json LLVMBackend::FieldToJson(const CRecordFieldEntry& f)
 {
         nlohmann::json j = {{"n", f.name}, {"ct", f.ctype}};
         if (f.isBitfield) { j["bf"] = true; j["bw"] = f.bitWidth; }
+        if (f.offsetBytes != 0) j["ob"] = f.offsetBytes;
+        if (f.access != 0) j["ac"] = f.access;
         return j;
     }
 
@@ -1759,7 +1837,103 @@ LLVMBackend::CRecordFieldEntry LLVMBackend::FieldFromJson(const SjVal& j)
         f.ctype     = j.value("ct", std::string{});
         f.isBitfield = j.value("bf", false);
         f.bitWidth   = j.value("bw", 0u);
+        f.offsetBytes = j.value("ob", (uint64_t)0);
+        f.access    = j.value("ac", 0);
         return f;
+    }
+
+/*
+ * A C++ class member's whole exported description, including clang's ABI arrangement. Every
+ * field here is read by an analysis (access control, triviality, deleted/defaulted status, the
+ * structor tables), so all of it must round-trip or a warm cache silently loses the class.
+ */
+nlohmann::json LLVMBackend::CxxMemberToJson(const cflat_cinterop::RawCxxMember& m)
+{
+        nlohmann::json j = {{"k", m.kind}, {"n", m.name}, {"rt", m.retType},
+                            {"pt", m.paramTypes}, {"pn", m.paramNames},
+                            {"ln", m.line}, {"co", m.col}};
+        if (!m.linkageName.empty()) j["lk"] = m.linkageName;
+        if (!m.file.empty())        j["f"]  = m.file;
+        if (m.variadic)             j["va"] = true;
+        if (m.isConst)              j["cn"] = true;
+        if (m.isVirtual)            j["vi"] = true;
+        if (m.isNoexcept)           j["nx"] = true;
+        if (m.isDeleted)            j["dl"] = true;
+        if (m.isDefaulted)          j["df"] = true;
+        if (m.isImplicit)           j["im"] = true;
+        if (m.needsLocalDefinition) j["nd"] = true;
+        if (m.returnsThis)          j["rth"] = true;
+        if (m.isCopyCtor)           j["cc"] = true;
+        if (m.isMoveCtor)           j["mc"] = true;
+        if (m.isDefaultCtor)        j["dc"] = true;
+        if (m.isCopyAssign)         j["ca"] = true;
+        if (m.isMoveAssign)         j["ma"] = true;
+        if (m.isPureVirtual)        j["pv"] = true;
+        if (m.covariantReturnNeedsAdjust) j["cra"] = true;
+        // M6 - the vtable slots. A warm cache that dropped these would re-register a virtual
+        // member as a DIRECT call, which silently skips every override.
+        if (m.vtableIndex >= 0)         j["vti"] = m.vtableIndex;
+        if (m.vtableIndexDeleting >= 0) j["vtd"] = m.vtableIndexDeleting;
+        if (m.access != 0)          j["ac"] = m.access;
+        if (m.abi.valid)            j["abi"] = AbiToJson(m.abi);
+        return j;
+    }
+
+cflat_cinterop::RawCxxMember LLVMBackend::CxxMemberFromJson(const SjVal& j)
+{
+        cflat_cinterop::RawCxxMember m;
+        m.kind        = j.value("k", 0);
+        m.name        = j.value("n", std::string{});
+        m.retType     = j.value("rt", std::string{});
+        m.linkageName = j.value("lk", std::string{});
+        m.file        = j.value("f", std::string{});
+        m.line        = j.value("ln", 1);
+        m.col         = j.value("co", 0);
+        if (j.contains("pt")) m.paramTypes = j["pt"].to_string_vector();
+        if (j.contains("pn")) m.paramNames = j["pn"].to_string_vector();
+        m.variadic             = j.value("va", false);
+        m.isConst              = j.value("cn", false);
+        m.isVirtual            = j.value("vi", false);
+        m.isNoexcept           = j.value("nx", false);
+        m.isDeleted            = j.value("dl", false);
+        m.isDefaulted          = j.value("df", false);
+        m.isImplicit           = j.value("im", false);
+        m.needsLocalDefinition = j.value("nd", false);
+        m.returnsThis          = j.value("rth", false);
+        m.isCopyCtor           = j.value("cc", false);
+        m.isMoveCtor           = j.value("mc", false);
+        m.isDefaultCtor        = j.value("dc", false);
+        m.isCopyAssign         = j.value("ca", false);
+        m.isMoveAssign         = j.value("ma", false);
+        m.isPureVirtual        = j.value("pv", false);
+        m.covariantReturnNeedsAdjust = j.value("cra", false);
+        m.vtableIndex          = j.value("vti", -1);
+        m.vtableIndexDeleting  = j.value("vtd", -1);
+        m.access               = j.value("ac", 0);
+        if (j.contains("abi")) m.abi = AbiFromJson(j["abi"]);
+        return m;
+    }
+
+nlohmann::json LLVMBackend::CxxStaticVarToJson(const cflat_cinterop::RawCxxStaticVar& v)
+{
+        nlohmann::json j = {{"n", v.name}, {"ct", v.ctype}, {"lk", v.linkageName},
+                            {"ln", v.line}, {"co", v.col}};
+        if (!v.file.empty()) j["f"] = v.file;
+        if (v.access != 0)   j["ac"] = v.access;
+        return j;
+    }
+
+cflat_cinterop::RawCxxStaticVar LLVMBackend::CxxStaticVarFromJson(const SjVal& j)
+{
+        cflat_cinterop::RawCxxStaticVar v;
+        v.name        = j.value("n", std::string{});
+        v.ctype       = j.value("ct", std::string{});
+        v.linkageName = j.value("lk", std::string{});
+        v.file        = j.value("f", std::string{});
+        v.line        = j.value("ln", 1);
+        v.col         = j.value("co", 0);
+        v.access      = j.value("ac", 0);
+        return v;
     }
 
 nlohmann::json LLVMBackend::RecordToJson(const CRecordEntry& r)
@@ -1769,6 +1943,55 @@ nlohmann::json LLVMBackend::RecordToJson(const CRecordEntry& r)
         nlohmann::json j = {{"n", r.name}, {"fs", fs}, {"ln", r.line}, {"co", r.col}};
         if (r.isUnion) j["u"] = true;
         if (!r.uuid.empty()) j["id"] = r.uuid;
+        // C++ layout facts drive CreateStructType's alignment/packing; dropping them on a warm
+        // cache would silently re-lay-out the record.
+        if (r.isCxx)    j["cx"] = true;
+        if (r.isPacked) j["pk"] = true;
+        if (r.isTrivial) j["tv"] = true;
+        if (r.isTriviallyCopyable) j["tc"] = true;
+        if (r.sizeBytes != 0)  j["sz"] = r.sizeBytes;
+        if (r.alignBytes != 0) j["al"] = r.alignBytes;
+        // M4 class surface. Same rule as the ABI arrangement above: the warm path never rebuilds
+        // a clang session, so a dropped triviality bit or member list silently unbinds the class.
+        if (r.isPolymorphic)         j["po"] = true;
+        if (r.hasBases)              j["hb"] = true;
+        if (r.hasTrivialDefaultCtor) j["tdc"] = true;
+        if (r.hasTrivialCopyCtor)    j["tcc"] = true;
+        if (!r.hasTrivialDtor)       j["ntd"] = true;
+        if (r.hasDeletedDefaultCtor) j["ddc"] = true;
+        if (r.hasDeletedCopyCtor)    j["dcc"] = true;
+        if (r.hasDefaultCtor)        j["hdc"] = true;
+        if (r.hasCopyCtor)           j["hcc"] = true;
+        if (r.isAggregate)           j["ag"] = true;
+        // M6 - inheritance surface. Base offsets drive every derived-to-base adjustment and the
+        // abstract/virtual-base gates; a warm cache that lost them would emit unadjusted pointers.
+        if (r.hasVirtualBases)       j["hvb"] = true;
+        if (r.isAbstract)            j["abs"] = true;
+        if (!r.layoutRefusal.empty()) j["lref"] = r.layoutRefusal;
+        if (!r.bases.empty())
+        {
+            nlohmann::json bs = nlohmann::json::array();
+            for (const auto& b : r.bases)
+            {
+                nlohmann::json bj = {{"n", b.name}, {"of", b.offsetBytes}};
+                if (b.access != 0) bj["ac"] = b.access;
+                if (b.isVirtual)   bj["vi"] = true;
+                bs.push_back(std::move(bj));
+            }
+            j["bs"] = bs;
+        }
+        if (!r.members.empty())
+        {
+            nlohmann::json ms = nlohmann::json::array();
+            for (const auto& m : r.members) ms.push_back(CxxMemberToJson(m));
+            j["mb"] = ms;
+        }
+        if (!r.staticVars.empty())
+        {
+            nlohmann::json vs = nlohmann::json::array();
+            for (const auto& v : r.staticVars) vs.push_back(CxxStaticVarToJson(v));
+            j["sv"] = vs;
+        }
         return j;
     }
 
@@ -1780,6 +2003,37 @@ LLVMBackend::CRecordEntry LLVMBackend::RecordFromJson(const SjVal& j)
         r.line    = j.value("ln", 1);
         r.col     = j.value("co", 0);
         r.uuid    = j.value("id", std::string{});
+        r.isCxx    = j.value("cx", false);
+        r.isPacked = j.value("pk", false);
+        r.isTrivial = j.value("tv", false);
+        r.isTriviallyCopyable = j.value("tc", false);
+        r.sizeBytes  = j.value("sz", (uint64_t)0);
+        r.alignBytes = j.value("al", (uint64_t)0);
+        r.isPolymorphic         = j.value("po", false);
+        r.hasBases              = j.value("hb", false);
+        r.hasTrivialDefaultCtor = j.value("tdc", false);
+        r.hasTrivialCopyCtor    = j.value("tcc", false);
+        r.hasTrivialDtor        = !j.value("ntd", false);
+        r.hasDeletedDefaultCtor = j.value("ddc", false);
+        r.hasDeletedCopyCtor    = j.value("dcc", false);
+        r.hasDefaultCtor        = j.value("hdc", false);
+        r.hasCopyCtor           = j.value("hcc", false);
+        r.isAggregate           = j.value("ag", false);
+        r.hasVirtualBases       = j.value("hvb", false);
+        r.isAbstract            = j.value("abs", false);
+        r.layoutRefusal         = j.value("lref", std::string{});
+        if (j.contains("bs"))
+            for (const auto& b : j["bs"])
+            {
+                cflat_cinterop::RawCxxBase rb;
+                rb.name        = b.value("n", std::string{});
+                rb.offsetBytes = b.value("of", (uint64_t)0);
+                rb.access      = b.value("ac", 0);
+                rb.isVirtual   = b.value("vi", false);
+                r.bases.push_back(std::move(rb));
+            }
+        if (j.contains("mb")) for (const auto& m : j["mb"]) r.members.push_back(CxxMemberFromJson(m));
+        if (j.contains("sv")) for (const auto& v : j["sv"]) r.staticVars.push_back(CxxStaticVarFromJson(v));
         if (j.contains("fs")) for (const auto& f : j["fs"]) r.fields.push_back(FieldFromJson(f));
         return r;
     }
@@ -1928,7 +2182,13 @@ bool LLVMBackend::TryLoadCHeaderDiskCache(
         // v12 carries typedef aliases for the LSP symbol sink.
         // v13 records anonymous-struct typedef identity in that alias cache. v14 adopts the
         // canonical SerializedTav field set and key spellings, including the core fpp/as/aid keys.
-        if (version != 14) return false;
+        // v15 carries clang's own ABI arrangement for each C++ declaration and the record's
+        // trivially-copyable flag; a v14 entry has neither, so a warm cache would fall back to
+        // the C size heuristic for a by-value C++ record and pass it in the wrong registers.
+        // v16 carries the M4 class surface: per-record triviality/polymorphism bits, member
+        // access, and the constructor/destructor/method tables with their ABI arrangements. A v15
+        // entry has none of it, so a warm cache would leave every imported class methodless.
+        if (version != 17) return false;
 
         // Accept on mtime match (fast) or content hash match (authoritative on mtime drift).
         auto storedMtime = j.value("mtime", int64_t{-1});
@@ -1993,7 +2253,7 @@ void LLVMBackend::WriteCHeaderDiskCache(
         if (ec) return;
 
         nlohmann::json j;
-        j["version"] = 14;
+        j["version"] = 17;
         j["mtime"]   = (int64_t)mtime.time_since_epoch().count();
         j["hash"]    = contentHash;
 

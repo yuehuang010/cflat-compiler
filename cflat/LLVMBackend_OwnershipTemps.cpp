@@ -1297,6 +1297,18 @@ void LLVMBackend::EmitOwningPtrCleanup(const NamedVariable& namedVar, llvm::Valu
 
         builder->SetInsertPoint(cleanupBB);
 
+        // M6 - a foreign C++ pointee with a VIRTUAL destructor is released through the vtable's
+        // DELETING destructor, which destroys the derived object and frees its storage in one
+        // call. This is the scope-exit leg of the explicit `delete` path and must agree with it.
+        if (!namedVar.TypeAndValue.ElemPointer
+            && CxxHasVirtualDestructor(namedVar.TypeAndValue.TypeName)
+            && EmitCxxVirtualDelete(namedVar.TypeAndValue.TypeName, ptrVal))
+        {
+            builder->CreateBr(afterBB);
+            builder->SetInsertPoint(afterBB);
+            return;
+        }
+
         // Call the full destructor (user dtor + member fields) if the type needs one. Resolve
         // through the delete-site resolver: a pointee still incomplete here (self-referential
         // element) binds the deferred stub instead of silently dropping the call.
@@ -1318,6 +1330,17 @@ void LLVMBackend::EmitOwningPtrCleanup(const NamedVariable& namedVar, llvm::Valu
             llvm::Type* t = GetType(tv);
             if (t != nullptr && t->isSized())
                 effAlign = std::max(effAlign, GetEffectiveAlignmentForType(tv.TypeName, t));
+        }
+        // A foreign nontrivial C++ pointee was allocated by the C++ global operator new, so its
+        // release must use the matching C++ operator delete - this is the `unique T* p = new T(..)`
+        // scope-exit leg, and it has to agree with the explicit `delete p` leg.
+        if (!namedVar.TypeAndValue.ElemPointer
+            && IsForeignNontrivialCxxClass(namedVar.TypeAndValue.TypeName))
+        {
+            EmitCxxHeapFree(namedVar.TypeAndValue.TypeName, voidPtr);
+            builder->CreateBr(afterBB);
+            builder->SetInsertPoint(afterBB);
+            return;
         }
         llvm::Function* alignedDel = effAlign > kDefaultNewAlign
             ? GetFunction("__delete_aligned") : nullptr;
@@ -3907,6 +3930,12 @@ void LLVMBackend::DropValue(const NamedVariable& namedVar)
             // A [unique] value is move-only. Its source is consumed completely, so do not run
             // the user destructor a second time after an explicit or inferred whole-value move.
             if (namedVar.IsMoved && HasTypeAnnotation(namedVar.TypeAndValue.TypeName, "unique")) return;
+            // A foreign nontrivial C++ local released explicitly (`_ = move x;`) already ran its
+            // C++ destructor and had its storage zeroed - running it again is a double destruction.
+            // A plain `move x` (into another slot or a by-value parameter) does NOT set this flag:
+            // per the M4b ruling the moved-from object is still destroyed at scope exit.
+            if (namedVar.ExplicitlyMovedNull
+                && IsForeignNontrivialCxxClass(namedVar.TypeAndValue.TypeName)) return;
             // Skip the struct value being moved out via `return` - the caller now owns it.
             if (namedVar.Storage == returnedStructDtorSkipAlloca) return;
             // A fixed-array local (`T[N] a;`) owns every element - destruct all N.
@@ -3930,6 +3959,8 @@ bool LLVMBackend::OwnsDroppableResource(const NamedVariable& namedVar) const
             return !(namedVar.BorrowsOwnedString || namedVar.IsAliasBorrow);
         if (namedVar.IsAliasBorrow) return false;
         if (namedVar.Storage == returnedStructDtorSkipAlloca) return false;
+        if (namedVar.ExplicitlyMovedNull
+            && IsForeignNontrivialCxxClass(namedVar.TypeAndValue.TypeName)) return false;
         return true;
     }
 

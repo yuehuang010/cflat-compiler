@@ -10,6 +10,7 @@
 //      that single AST. This replaces the old two-full-parse libclang flow (decl+name parse,
 //      then value-fold parse) with prepass + one parse.
 #include "CClangExtract.h"
+#include "LlvmHelpers.h"
 
 #define CFLAT_LLVM_COMPAT_CLANG
 #undef CFLAT_LLVM_COMPAT_CLANG
@@ -18,9 +19,17 @@
 #include "clang/AST/ASTContext.h"
 #include "clang/AST/Attr.h"
 #include "clang/AST/Decl.h"
+#include "clang/AST/DeclCXX.h"
 #include "clang/AST/Expr.h"
+#include "clang/AST/Mangle.h"
 #include "clang/AST/RecursiveASTVisitor.h"
+#include "clang/AST/RecordLayout.h"
+#include "clang/AST/VTableBuilder.h"
+#include "clang/AST/BaseSubobject.h"
 #include "clang/Basic/Diagnostic.h"
+#include "clang/CodeGen/CGFunctionInfo.h"
+#include "clang/CodeGen/CodeGenABITypes.h"
+#include "clang/CodeGen/ModuleBuilder.h"
 #include "clang/Basic/DiagnosticOptions.h"
 #include "clang/Basic/SourceManager.h"
 #include "clang/Frontend/CompilerInstance.h"
@@ -35,7 +44,13 @@
 #include "clang/Lex/PreprocessorOptions.h"
 #include "clang/Lex/Token.h"
 #include "llvm/ADT/IntrusiveRefCntPtr.h"
+#include "llvm/IR/DerivedTypes.h"
+#include "llvm/IR/LLVMContext.h"
+#include "llvm/IR/Type.h"
 #include "llvm/Support/MemoryBuffer.h"
+#include "llvm/Support/raw_ostream.h"
+
+#include "llvm/ADT/SmallString.h"
 
 #include "llvm/Support/TimeProfiler.h"
 
@@ -52,7 +67,98 @@ namespace cflat_cinterop
 
         std::string CanonicalSpelling(const ASTContext& ctx, QualType qt)
         {
-            return qt.getCanonicalType().getAsString(ctx.getPrintingPolicy());
+            QualType canonical = qt.getCanonicalType();
+            std::string s = canonical.getAsString(ctx.getPrintingPolicy());
+            // C++ prints an enum type as a bare name ("cppi::Mode"), where C prints "enum X".
+            // The type mapper keys the int decay on the tag, so restore it.
+            if (canonical->getAs<EnumType>() != nullptr && s.rfind("enum ", 0) != 0
+                && s.rfind("const enum ", 0) != 0)
+                s.insert(s.rfind("const ", 0) == 0 ? 6 : 0, "enum ");
+            return s;
+        }
+
+        std::string CxxQualifiedName(const NamedDecl* d)
+        {
+            std::string n = d->getQualifiedNameAsString();
+            std::replace(n.begin(), n.end(), ':', '.');
+            while (n.find("..") != std::string::npos) n.erase(n.find(".."), 1);
+            return n;
+        }
+
+        // Clang spells an unnamed enclosing scope as "(anonymous namespace)", "(unnamed struct
+        // ...)" or "f()::Local". Those collapse to a dotted name CFlat can neither parse nor
+        // look up, and none of them is externally linkable, so the decl is dropped instead.
+        bool IsValidDottedName(const std::string& n)
+        {
+            if (n.empty()) return false;
+            bool startOfComponent = true;
+            for (char c : n)
+            {
+                if (c == '.')
+                {
+                    if (startOfComponent) return false;
+                    startOfComponent = true;
+                    continue;
+                }
+                bool ok = (c == '_') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+                       || (!startOfComponent && c >= '0' && c <= '9');
+                if (!ok) return false;
+                startOfComponent = false;
+            }
+            return !startOfComponent;
+        }
+
+        std::string CxxLinkageName(ASTContext& ctx, const FunctionDecl* fd)
+        {
+            auto mangle = std::unique_ptr<MangleContext>(ctx.createMangleContext());
+            llvm::SmallString<128> storage;
+            llvm::raw_svector_ostream os(storage);
+            mangle->mangleName(GlobalDecl(fd), os);
+            return os.str().str();
+        }
+
+        // Structor linkage names must name the COMPLETE-object variant; a bare FunctionDecl
+        // GlobalDecl has no variant and MangleContext asserts on it.
+        std::string CxxLinkageName(ASTContext& ctx, GlobalDecl gd)
+        {
+            auto mangle = std::unique_ptr<MangleContext>(ctx.createMangleContext());
+            llvm::SmallString<128> storage;
+            llvm::raw_svector_ostream os(storage);
+            mangle->mangleName(gd, os);
+            return os.str().str();
+        }
+
+        std::string CxxLinkageName(ASTContext& ctx, const VarDecl* vd)
+        {
+            auto mangle = std::unique_ptr<MangleContext>(ctx.createMangleContext());
+            llvm::SmallString<128> storage;
+            llvm::raw_svector_ostream os(storage);
+            mangle->mangleName(GlobalDecl(vd), os);
+            return os.str().str();
+        }
+
+        int MapAccess(AccessSpecifier a)
+        {
+            if (a == AS_private)   return AccessPrivate;
+            if (a == AS_protected) return AccessProtected;
+            return AccessPublic;
+        }
+
+        bool DeclIsNoexcept(const FunctionDecl* fd)
+        {
+            ExceptionSpecificationType est = fd->getExceptionSpecType();
+            return est == EST_BasicNoexcept || est == EST_NoexceptTrue || est == EST_NoThrow;
+        }
+
+        // The complete-object GlobalDecl for a member: structors need their variant, everything
+        // else is the plain decl.
+        GlobalDecl MemberGlobalDecl(const CXXMethodDecl* md)
+        {
+            if (const auto* ctor = llvm::dyn_cast<CXXConstructorDecl>(md))
+                return GlobalDecl(ctor, Ctor_Complete);
+            if (const auto* dtor = llvm::dyn_cast<CXXDestructorDecl>(md))
+                return GlobalDecl(dtor, Dtor_Complete);
+            return GlobalDecl(md);
         }
 
         // APSInt -> long long. Signed values sign-extend (they always fit in int64); unsigned
@@ -116,6 +222,15 @@ namespace cflat_cinterop
             std::unordered_set<std::string> emittedGlobals;  // dedup global var redeclarations by name
             std::unordered_set<std::string> emittedOpaqueForward;  // dedup opaque forward-decl records by tag
             std::vector<std::string> normDirs; // req.inScopeDirs normalized once (NormPath + trailing-/ stripped)
+            // Set in BeginSourceFileAction so the ABI pass can build a CodeGenerator against the
+            // very invocation that produced the AST (same triple, same target features).
+            CompilerInstance* ci = nullptr;
+            // cxxMode only: (index into out.sigs, the decl it came from). Resolved after the
+            // traversal so a single CodeGenerator serves every declaration.
+            std::vector<std::pair<size_t, const FunctionDecl*>> abiWork;
+            // cxxMode only: (index into out.records, index into that record's members, decl).
+            struct MemberAbiWork { size_t recordIdx; size_t memberIdx; const CXXMethodDecl* md; };
+            std::vector<MemberAbiWork> memberAbiWork;
             ExtractState(const ExtractRequest& r, ExtractResult& o) : req(r), out(o)
             {
                 for (const auto& d : r.inScopeDirs)
@@ -269,21 +384,40 @@ namespace cflat_cinterop
             bool VisitFunctionDecl(FunctionDecl* fd)
             {
                 if (!fd->getIdentifier()) return true;
+                // M0-M3 expose free functions. Methods, constructors and operators need the
+                // class ABI/lifetime machinery from M4; keeping them out avoids publishing a
+                // callable declaration with the wrong implicit object parameter.
+                if (fd->getDeclContext()->isRecord()) return true;
                 if (fd->getStorageClass() == SC_Static) return true;  // not externally linkable
                 if (st.req.definitionsOnly && !fd->isThisDeclarationADefinition()) return true;
                 std::string file; int line = 1, col = 0;
                 if (!LocOf(fd, file, line, col)) return true;
 
                 RawSig sig;
-                sig.name = fd->getNameAsString();
+                sig.name = st.req.cxxMode ? CxxQualifiedName(fd) : fd->getNameAsString();
+                if (st.req.cxxMode && (fd->isInAnonymousNamespace() || !IsValidDottedName(sig.name)))
+                    return true;
+                sig.qualifiedName = sig.name;
+                // C declarations link by their own name: leaving this empty keeps
+                // CreateFunctionDeclaration free to rename (import program renames 'main').
+                sig.linkageName = st.req.cxxMode
+                    ? (fd->isExternC() ? fd->getNameAsString() : CxxLinkageName(ctx, fd))
+                    : std::string();
                 sig.retType = CanonicalSpelling(ctx, fd->getReturnType());
                 sig.variadic = fd->isVariadic();
+                sig.isCxx = st.req.cxxMode;
+                sig.isNoexcept = !st.req.cxxMode
+                    || fd->getExceptionSpecType() == EST_BasicNoexcept
+                    || fd->getExceptionSpecType() == EST_NoexceptTrue
+                    || fd->getExceptionSpecType() == EST_NoThrow;
                 sig.file = file; sig.line = line; sig.col = col;
                 for (const ParmVarDecl* p : fd->parameters())
                 {
                     sig.paramTypes.push_back(CanonicalSpelling(ctx, p->getType()));
                     sig.paramNames.push_back(p->getNameAsString());
                 }
+                if (st.req.cxxMode && !fd->isVariadic())
+                    st.abiWork.emplace_back(st.out.sigs.size(), fd);
                 st.out.sigs.push_back(std::move(sig));
                 return true;
             }
@@ -298,6 +432,21 @@ namespace cflat_cinterop
                 e.name = ec->getNameAsString();
                 e.value = ApsIntToLongLong(ec->getInitVal());
                 e.file = file; e.line = line; e.col = col;
+                // C++ mode also publishes the QUALIFIED spelling, so a scoped or class-nested
+                // enumerator is reachable as it is written in C++ ("ns.Cls.Kind.One") rather than
+                // only under a bare name that could collide across namespaces. The unqualified
+                // form stays registered as well - first writer wins downstream.
+                if (st.req.cxxMode)
+                {
+                    std::string qualified = CxxQualifiedName(ec);
+                    if (qualified != e.name && IsValidDottedName(qualified)
+                        && !ec->getDeclContext()->isTranslationUnit())
+                    {
+                        RawEnum q = e;
+                        q.name = qualified;
+                        st.out.enums.push_back(std::move(q));
+                    }
+                }
                 st.out.enums.push_back(std::move(e));
                 return true;
             }
@@ -310,6 +459,8 @@ namespace cflat_cinterop
             void CollectFields(const RecordDecl* rd, const std::string& tag, RawRecord& rec)
             {
                 int anonIdx = 0;
+                const ASTRecordLayout& layout = ctx.getASTRecordLayout(rd);
+                unsigned fieldIndex = 0;
                 for (const FieldDecl* f : rd->fields())
                 {
                     if (f->getDeclName().isEmpty())
@@ -320,7 +471,9 @@ namespace cflat_cinterop
                             rf.isBitfield = true;
                             rf.bitWidth = f->getBitWidthValue();
                             rf.ctype = CanonicalSpelling(ctx, f->getType());
+                            rf.offsetBytes = layout.getFieldOffset(fieldIndex) / 8;
                             rec.fields.push_back(std::move(rf));
+                            ++fieldIndex;
                             continue;
                         }
                         const RecordType* rt = f->getType()->getAs<RecordType>();
@@ -346,13 +499,18 @@ namespace cflat_cinterop
                             RawField fe;
                             fe.name = "__anon" + std::to_string(idx);
                             fe.ctype = (isUnion ? "union " : "struct ") + synTag;
+                            fe.offsetBytes = layout.getFieldOffset(fieldIndex) / 8;
                             rec.fields.push_back(std::move(fe));
+                            ++fieldIndex;
                         }
+                        ++fieldIndex;
                         continue;  // unnamed non-bitfield non-anon: nothing to record
                     }
 
                     RawField rf;
                     rf.name = f->getNameAsString();
+                    rf.access = MapAccess(f->getAccess());
+                    rf.offsetBytes = layout.getFieldOffset(fieldIndex) / 8;
 
                     // Named field whose type is a *truly unnamed* (no tag, no typedef-for-linkage
                     // name) record - the `_LARGE_INTEGER::u` shape: `struct { DWORD LowPart;
@@ -408,7 +566,274 @@ namespace cflat_cinterop
                         rf.bitWidth = f->getBitWidthValue();
                     }
                     rec.fields.push_back(std::move(rf));
+                    ++fieldIndex;
                 }
+            }
+
+            /*
+             * Export a C++ class's callable surface: constructors, the destructor, non-static
+             * methods (const and non-const), static methods and out-of-line static data members,
+             * plus the triviality/access bits the backend needs to decide what it may bind. The
+             * decision to REFUSE a member (virtual, private, deleted, template) is left to the
+             * backend so the diagnostic lands at the CFlat use site; everything is exported with
+             * enough truth attached to say why.
+             * `outDecls` is filled in lockstep with rec.members so the ABI pass can revisit each
+             * declaration once a single CodeGenerator exists.
+             */
+            void CollectCxxMembers(const CXXRecordDecl* cxx, RawRecord& rec,
+                                   std::vector<const CXXMethodDecl*>& outDecls)
+            {
+                rec.isPolymorphic = cxx->isPolymorphic() || cxx->getNumVBases() > 0;
+                rec.hasBases = cxx->getNumBases() > 0 || cxx->getNumVBases() > 0;
+                rec.hasVirtualBases = cxx->getNumVBases() > 0;
+                rec.isAbstract = cxx->isAbstract();
+                rec.hasTrivialDefaultCtor = cxx->hasTrivialDefaultConstructor();
+                rec.hasTrivialCopyCtor = cxx->hasTrivialCopyConstructor();
+                rec.hasTrivialDtor = !cxx->hasNonTrivialDestructor();
+                rec.hasDefaultCtor = cxx->hasDefaultConstructor();
+                rec.hasCopyCtor = cxx->hasCopyConstructorWithConstParam()
+                               || cxx->needsImplicitCopyConstructor()
+                               || cxx->hasUserDeclaredCopyConstructor();
+                rec.isAggregate = cxx->isAggregate();
+
+                for (const CXXMethodDecl* md : cxx->methods())
+                {
+                    // Templates and their specializations need Sema instantiation (M5).
+                    if (md->getDescribedFunctionTemplate() != nullptr) continue;
+                    if (md->getPrimaryTemplate() != nullptr) continue;
+                    const auto* ctor = llvm::dyn_cast<CXXConstructorDecl>(md);
+                    const auto* dtor = llvm::dyn_cast<CXXDestructorDecl>(md);
+                    // Operators and conversion functions are M5; they have no plain identifier.
+                    // Copy and move ASSIGNMENT are the exception: they are special members that
+                    // nontrivial-class lifetime needs (M4b), so they are exported under the name
+                    // "operator=" and consumed by the class's assignment table, never as a
+                    // callable member.
+                    const bool isAssignSpecial = md->isCopyAssignmentOperator()
+                                              || md->isMoveAssignmentOperator();
+                    if (ctor == nullptr && dtor == nullptr && md->getIdentifier() == nullptr
+                        && !isAssignSpecial)
+                        continue;
+
+                    RawCxxMember m;
+                    if (ctor != nullptr)
+                    {
+                        m.kind = RawCxxMember::Constructor;
+                        m.name = "__ctor";
+                        m.isDefaultCtor = ctor->isDefaultConstructor();
+                        m.isCopyCtor = ctor->isCopyConstructor();
+                        m.isMoveCtor = ctor->isMoveConstructor();
+                    }
+                    else if (dtor != nullptr)
+                    {
+                        m.kind = RawCxxMember::Destructor;
+                        m.name = "__dtor";
+                    }
+                    else
+                    {
+                        m.kind = md->isStatic() ? RawCxxMember::StaticMethod
+                                                : RawCxxMember::Instance;
+                        m.name = md->getNameAsString();
+                        m.isCopyAssign = md->isCopyAssignmentOperator();
+                        m.isMoveAssign = md->isMoveAssignmentOperator();
+                        if (m.name.empty()) m.name = "operator=";
+                    }
+                    m.isConst = !md->isStatic() && md->isConst();
+                    m.isVirtual = md->isVirtual();
+                    m.isPureVirtual = md->isPureVirtual();
+                    /*
+                     * Covariant return: the override returns a pointer/reference to a class
+                     * DERIVED from what the overridden declaration returns. When that derived-to-
+                     * base step has a non-zero offset (a non-primary base), the Itanium ABI needs
+                     * a return-adjusting thunk, which is Clang's to emit and cflat's to refuse.
+                     */
+                    if (md->isVirtual())
+                        for (const CXXMethodDecl* over : md->overridden_methods())
+                        {
+                            QualType mine = md->getReturnType().getCanonicalType();
+                            QualType theirs = over->getReturnType().getCanonicalType();
+                            if (mine == theirs) continue;
+                            const auto* mineRd = mine->getPointeeType().isNull()
+                                ? nullptr : mine->getPointeeType()->getAsCXXRecordDecl();
+                            const auto* theirsRd = theirs->getPointeeType().isNull()
+                                ? nullptr : theirs->getPointeeType()->getAsCXXRecordDecl();
+                            if (mineRd == nullptr || theirsRd == nullptr
+                                || mineRd->getDefinition() == nullptr
+                                || theirsRd->getDefinition() == nullptr
+                                || mineRd == theirsRd)
+                            {
+                                m.covariantReturnNeedsAdjust = true;   // cannot prove it is free
+                                continue;
+                            }
+                            const ASTRecordLayout& rl =
+                                ctx.getASTRecordLayout(mineRd->getDefinition());
+                            if (!mineRd->getDefinition()->isDerivedFrom(theirsRd->getDefinition())
+                                || rl.getBaseClassOffset(theirsRd->getDefinition())
+                                       .getQuantity() != 0)
+                                m.covariantReturnNeedsAdjust = true;
+                        }
+                    m.isDeleted = md->isDeleted();
+                    m.isDefaulted = md->isDefaulted();
+                    m.isImplicit = md->isImplicit();
+                    m.isNoexcept = DeclIsNoexcept(md);
+                    m.access = MapAccess(md->getAccess());
+                    m.variadic = md->isVariadic();
+                    // An implicit, defaulted or inline member has no symbol in the separately
+                    // compiled library; emitting its body is Clang-CodeGen work (M5). Trivial
+                    // operations need no call at all, which the backend handles from the
+                    // triviality bits above.
+                    m.needsLocalDefinition = md->isImplicit() || md->isDefaulted()
+                                          || md->isInlined();
+                    // Structors on Itanium/Darwin hand 'this' back; the caller ignores it, so the
+                    // declaration carries a void* result rather than a mistyped void.
+                    if (ctor != nullptr || dtor != nullptr)
+                    {
+                        m.returnsThis = true;
+                        m.retType = "void *";
+                    }
+                    else
+                        m.retType = CanonicalSpelling(ctx, md->getReturnType());
+
+                    if (m.kind == RawCxxMember::Instance || m.kind == RawCxxMember::Constructor
+                        || m.kind == RawCxxMember::Destructor)
+                    {
+                        // 'this' first, spelled as a plain pointer to the record (const is
+                        // dropped by CFlat, so the const overload differs only in `isConst`).
+                        m.paramTypes.push_back(CanonicalSpelling(ctx,
+                            ctx.getPointerType(ctx.getCanonicalTagType(cxx))));
+                        m.paramNames.push_back("this");
+                    }
+                    for (const ParmVarDecl* p : md->parameters())
+                    {
+                        m.paramTypes.push_back(CanonicalSpelling(ctx, p->getType()));
+                        m.paramNames.push_back(p->getNameAsString());
+                    }
+                    if (!m.isDeleted && !m.needsLocalDefinition)
+                        m.linkageName = CxxLinkageName(ctx, MemberGlobalDecl(md));
+                    LocOfRaw(md, m.file, m.line, m.col);
+
+                    if (m.isDeleted && ctor != nullptr && ctor->isDefaultConstructor())
+                        rec.hasDeletedDefaultCtor = true;
+                    if (m.isDeleted && m.isCopyCtor) rec.hasDeletedCopyCtor = true;
+
+                    // Only members with a real symbol get an ABI arrangement; the rest are
+                    // exported for diagnostics only.
+                    outDecls.push_back((!m.isDeleted && !m.needsLocalDefinition) ? md : nullptr);
+                    rec.members.push_back(std::move(m));
+                }
+
+                for (const Decl* d : cxx->decls())
+                {
+                    const auto* vd = llvm::dyn_cast<VarDecl>(d);
+                    if (vd == nullptr || !vd->isStaticDataMember()) continue;
+                    if (vd->getIdentifier() == nullptr) continue;
+                    // An inline / constexpr static member is emitted per-TU on demand, so the
+                    // bound library need not contain it. Only an out-of-line definition is a
+                    // symbol CFlat may read.
+                    if (vd->isConstexpr() || vd->isInline()) continue;
+                    if (vd->hasInit()) continue;
+                    RawCxxStaticVar sv;
+                    sv.name = vd->getNameAsString();
+                    sv.ctype = CanonicalSpelling(ctx, vd->getType());
+                    sv.access = MapAccess(vd->getAccess());
+                    sv.linkageName = CxxLinkageName(ctx, vd);
+                    LocOfRaw(vd, sv.file, sv.line, sv.col);
+                    rec.staticVars.push_back(std::move(sv));
+                }
+            }
+
+            /*
+             * M6 - flatten one C++ subobject's storage into rec.fields at ABSOLUTE offsets.
+             *
+             * A CFlat struct has no notion of a base subobject or a vptr, so a class that has
+             * either is laid out as ONE flat field list built from Clang's own ASTRecordLayout:
+             * a `void *` slot wherever Clang put a vptr, then every base's storage at its base
+             * offset, then the class's own fields. Downstream this is indistinguishable from a
+             * plain C struct - the existing padding insertion and layout verification both work
+             * unchanged - and inherited fields become directly nameable on the derived type.
+             *
+             * A field that must not be nameable (inherited through a non-public base, or shadowed
+             * by a more derived field of the same name) keeps its storage but loses its name; the
+             * backend already treats a nameless field as padding.
+             *
+             * Returns false when the layout cannot be flattened, in which case the caller records
+             * a refusal and leaves the record opaque.
+             */
+            bool FlattenCxxLayout(const CXXRecordDecl* cxx, uint64_t baseOff, bool nameable,
+                                  const std::set<std::string>& ownNames, bool isOutermost,
+                                  std::set<std::string>& taken, int& synth, RawRecord& rec)
+            {
+                if (cxx->getNumVBases() > 0) return false;
+                const ASTRecordLayout& layout = ctx.getASTRecordLayout(cxx);
+                if (layout.hasOwnVFPtr())
+                {
+                    // Every flattened slot keeps a NAME: downstream, a nameless field means
+                    // "padding cflat inserted" and the layout verifier skips it. The vptr is real
+                    // storage, so it gets a reserved name and private access instead.
+                    RawField vp;
+                    vp.name = "__vptr" + std::to_string(synth++);
+                    vp.ctype = "void *";
+                    vp.offsetBytes = baseOff;
+                    vp.access = AccessPrivate;
+                    rec.fields.push_back(std::move(vp));
+                }
+                for (const CXXBaseSpecifier& b : cxx->bases())
+                {
+                    const auto* brd = b.getType()->getAsCXXRecordDecl();
+                    if (brd == nullptr || brd->getDefinition() == nullptr) return false;
+                    brd = brd->getDefinition();
+                    const uint64_t off = baseOff
+                        + (uint64_t)layout.getBaseClassOffset(brd).getQuantity();
+                    const bool basePublic = b.getAccessSpecifier() == AS_public;
+                    if (!FlattenCxxLayout(brd, off, nameable && basePublic, ownNames,
+                                          /*isOutermost*/ false, taken, synth, rec))
+                        return false;
+                }
+                unsigned idx = 0;
+                for (const FieldDecl* f : cxx->fields())
+                {
+                    // A bitfield or a transparent anonymous member inside a hierarchy would need
+                    // the bitfield packer and the synthetic-record path to agree on absolute
+                    // offsets; neither is wired for that, so refuse instead of mislaying it out.
+                    if (f->isBitField() || f->getDeclName().isEmpty()) return false;
+                    RawField rf;
+                    rf.name = f->getNameAsString();
+                    rf.ctype = CanonicalSpelling(ctx, f->getType());
+                    rf.offsetBytes = baseOff + layout.getFieldOffset(idx) / 8;
+                    rf.access = MapAccess(f->getAccess());
+                    // Shadowed by a more derived field of the same name: keep the storage, give it
+                    // a reserved name nobody can write. Inherited through a non-public base: keep
+                    // the real name but mark it private, so naming it says exactly that.
+                    const bool shadowedByDerived = !isOutermost && ownNames.count(rf.name) != 0;
+                    if (shadowedByDerived || !taken.insert(rf.name).second)
+                    {
+                        rf.name = "__hidden" + std::to_string(synth++);
+                        rf.access = AccessPrivate;
+                    }
+                    else if (!nameable)
+                        rf.access = AccessPrivate;
+                    rec.fields.push_back(std::move(rf));
+                    ++idx;
+                }
+                return true;
+            }
+
+            /*
+             * Own fields first, so a derived field wins the name over a base field that shadows
+             * it, then sort the whole flat list by offset - InsertCxxLayoutPadding downstream
+             * requires monotonically increasing offsets.
+             */
+            bool CollectCxxFlatFields(const CXXRecordDecl* cxx, RawRecord& rec)
+            {
+                std::set<std::string> ownNames;
+                for (const FieldDecl* f : cxx->fields())
+                    if (!f->getDeclName().isEmpty()) ownNames.insert(f->getNameAsString());
+                std::set<std::string> taken;
+                int synth = 0;
+                if (!FlattenCxxLayout(cxx, 0, true, ownNames, /*isOutermost*/ true, taken, synth, rec))
+                    return false;
+                std::stable_sort(rec.fields.begin(), rec.fields.end(),
+                    [](const RawField& a, const RawField& b) { return a.offsetBytes < b.offsetBytes; });
+                return true;
             }
 
             bool VisitRecordDecl(RecordDecl* rd)
@@ -451,11 +876,78 @@ namespace cflat_cinterop
 
                 RawRecord rec;
                 rec.name = rd->getNameAsString();
+                // An unnamed record keeps an empty name - the caller synthesizes its tag, and a
+                // qualified spelling would hand it the "(unnamed struct at ...)" placeholder.
+                rec.qualifiedName = rec.name;
+                if (st.req.cxxMode && !rec.name.empty())
+                {
+                    if (rd->isInAnonymousNamespace()) return true;
+                    rec.qualifiedName = CxxQualifiedName(rd);
+                    if (!IsValidDottedName(rec.qualifiedName)) return true;
+                    rec.name = rec.qualifiedName;
+                }
                 rec.isUnion = rd->isUnion();
+                rec.isCxx = st.req.cxxMode;
                 rec.file = file; rec.line = line; rec.col = col;
                 rec.inScope = !st.req.requireInScope || PathInScope(file, st.normDirs);
-                CollectFields(rd, rec.name, rec);
+                const ASTRecordLayout& layout = ctx.getASTRecordLayout(rd);
+                rec.sizeBytes = layout.getSize().getQuantity();
+                rec.alignBytes = layout.getAlignment().getQuantity();
+                rec.isPacked = rd->hasAttr<PackedAttr>();
+                std::vector<const CXXMethodDecl*> memberDecls;
+                bool flattened = false;
+                if (const auto* cxx = llvm::dyn_cast<CXXRecordDecl>(rd))
+                {
+                    rec.isTrivial = cxx->isTrivial();
+                    rec.isTriviallyCopyable = cxx->isTriviallyCopyable()
+                        && !cxx->hasNonTrivialDestructor() && !cxx->isPolymorphic();
+                    if (cxx->hasDefinition())
+                    {
+                        CollectCxxMembers(cxx, rec, memberDecls);
+                        for (const CXXBaseSpecifier& b : cxx->bases())
+                        {
+                            const auto* brd = b.getType()->getAsCXXRecordDecl();
+                            RawCxxBase rb;
+                            rb.name = brd != nullptr ? CxxQualifiedName(brd) : std::string();
+                            rb.access = MapAccess(b.getAccessSpecifier());
+                            rb.isVirtual = b.isVirtual();
+                            if (brd != nullptr && brd->getDefinition() != nullptr)
+                                rb.offsetBytes = (uint64_t)ctx.getASTRecordLayout(cxx)
+                                    .getBaseClassOffset(brd->getDefinition()).getQuantity();
+                            rec.bases.push_back(std::move(rb));
+                        }
+                        // A vptr or a base subobject has no CFlat spelling, so the layout is
+                        // flattened out of Clang's own record layout instead of read field by
+                        // field. Virtual inheritance needs a VTT and is refused outright.
+                        flattened = rec.hasBases || rec.isPolymorphic;
+                        if (flattened)
+                        {
+                            if (rec.hasVirtualBases)
+                                rec.layoutRefusal = "uses virtual inheritance, which is not supported yet";
+                            else if (!CollectCxxFlatFields(cxx, rec))
+                                rec.layoutRefusal = "has a layout cflat cannot flatten (a bitfield or "
+                                                    "an anonymous member inside a class hierarchy)";
+                            // Refused: drop whatever the partial flatten produced and fall back to
+                            // the plain field walk. The record is never laid out (the backend keeps
+                            // an opaque shell), but the field list still drives the access-control
+                            // diagnostic, so naming a member says WHY instead of "unknown".
+                            if (!rec.layoutRefusal.empty())
+                            {
+                                rec.fields.clear();
+                                flattened = false;
+                            }
+                        }
+                    }
+                }
+                if (!flattened) CollectFields(rd, rec.name, rec);
                 st.out.records.push_back(std::move(rec));
+                if (!memberDecls.empty())
+                {
+                    const size_t recIdx = st.out.records.size() - 1;
+                    for (size_t i = 0; i < memberDecls.size(); ++i)
+                        if (memberDecls[i] != nullptr)
+                            st.memberAbiWork.push_back({ recIdx, i, memberDecls[i] });
+                }
                 return true;
             }
 
@@ -595,6 +1087,213 @@ namespace cflat_cinterop
             }
         };
 
+        std::string LlvmTypeText(llvm::Type* t) { return cflat_llvm::StructuralTypeText(t); }
+
+        int AbiKindOf(const clang::CodeGen::ABIArgInfo& ai)
+        {
+            using K = clang::CodeGen::ABIArgInfo;
+            switch (ai.getKind())
+            {
+            case K::Direct:          return RawAbiSlot::Direct;
+            case K::Extend:          return RawAbiSlot::Extend;
+            case K::Indirect:        return RawAbiSlot::Indirect;
+            case K::IndirectAliased: return RawAbiSlot::IndirectAliased;
+            case K::Ignore:          return RawAbiSlot::Ignore;
+            case K::Expand:          return RawAbiSlot::Expand;
+            case K::CoerceAndExpand: return RawAbiSlot::CoerceAndExpand;
+            case K::InAlloca:        return RawAbiSlot::InAlloca;
+            case K::TargetSpecific:  return RawAbiSlot::TargetSpecific;
+            }
+            return RawAbiSlot::Unknown;
+        }
+
+        // Copy one ABIArgInfo into the clang-free slot description. The LLVM argument count
+        // follows clang's own ClangToLLVMArgMapping: Ignore consumes none, a Direct with a
+        // flattenable struct coerce type consumes one argument per element, everything else one.
+        RawAbiSlot DescribeAbiSlot(const clang::CodeGen::ABIArgInfo& ai)
+        {
+            RawAbiSlot s;
+            s.kind = AbiKindOf(ai);
+            s.inReg = ai.getInReg();
+            if (ai.isDirect() || ai.isExtend())
+            {
+                s.coerceType  = LlvmTypeText(ai.getCoerceToType());
+                s.paddingType = LlvmTypeText(ai.getPaddingType());
+                s.directOffset = (uint64_t)ai.getDirectOffset();
+                s.canBeFlattened = ai.getCanBeFlattened();
+                if (ai.isExtend())
+                {
+                    s.signExt = ai.isSignExt();
+                    s.zeroExt = ai.isZeroExt();
+                }
+            }
+            else if (ai.isCoerceAndExpand())
+                s.coerceType = LlvmTypeText(ai.getCoerceToType());
+            else if (ai.isIndirect() || ai.isIndirectAliased())
+            {
+                s.indirectAlign   = (uint64_t)ai.getIndirectAlign().getQuantity();
+                if (ai.isIndirect())
+                {
+                    s.indirectByVal   = ai.getIndirectByVal();
+                    s.indirectRealign = ai.getIndirectRealign();
+                }
+            }
+
+            if (s.kind == RawAbiSlot::Ignore)
+                s.llvmArgCount = 0;
+            else if (s.kind == RawAbiSlot::Direct && s.canBeFlattened)
+            {
+                auto* sty = llvm::dyn_cast_or_null<llvm::StructType>(ai.getCoerceToType());
+                if (sty != nullptr) s.llvmArgCount = sty->getNumElements();
+            }
+            return s;
+        }
+
+        /*
+         * cxxMode: ask Clang for the calling convention of every collected C++ free function and
+         * serialize it onto the RawSig. The CodeGenerator (and its LLVMContext / module) is
+         * transient - everything the backend needs is plain data by the time this returns, which
+         * is what lets the recipe survive the on-disk signature cache.
+         */
+        void ComputeCxxMemberAbi(ExtractState& st, ASTContext& ctx,
+                                 clang::CodeGen::CodeGenModule& cgm, CodeGenerator& cg);
+
+        void ComputeCxxAbi(ExtractState& st, ASTContext& ctx)
+        {
+            if (st.abiWork.empty() || st.ci == nullptr) return;
+            using namespace clang::CodeGen;
+
+            llvm::LLVMContext llvmCtx;
+            std::unique_ptr<CodeGenerator> cg(
+                clang::CreateLLVMCodeGen(*st.ci, "cflat_cxx_abi", llvmCtx));
+            if (!cg) return;
+            cg->Initialize(ctx);
+            CodeGenModule& cgm = cg->CGM();
+
+            for (const auto& [idx, fd] : st.abiWork)
+            {
+                if (idx >= st.out.sigs.size()) continue;
+                CanQualType canon = fd->getType()->getCanonicalTypeUnqualified();
+                if (canon->getAs<FunctionProtoType>() == nullptr) continue;  // K&R / no prototype
+                CanQual<FunctionProtoType> fpt = canon.castAs<FunctionProtoType>();
+                const CGFunctionInfo& fi = arrangeFreeFunctionType(cgm, fpt);
+
+                RawAbi abi;
+                abi.valid = true;
+                abi.callingConv = fi.getEffectiveCallingConvention();
+                abi.fnTypeText = LlvmTypeText(convertFreeFunctionType(cgm, fd));
+                abi.ret = DescribeAbiSlot(fi.getReturnInfo());
+                unsigned next = (abi.ret.kind == RawAbiSlot::Indirect
+                              || abi.ret.kind == RawAbiSlot::IndirectAliased) ? 1u : 0u;
+                for (const auto& a : fi.arguments())
+                {
+                    RawAbiSlot s = DescribeAbiSlot(a.info);
+                    s.llvmArgIndex = next;
+                    next += s.llvmArgCount;
+                    abi.params.push_back(std::move(s));
+                }
+                st.out.sigs[idx].abi = std::move(abi);
+            }
+
+            ComputeCxxMemberAbi(st, ctx, cgm, *cg);
+        }
+
+        // Fill in the per-slot arrangement of every exported class member. The slot info comes
+        // from arrangeCXXMethodType (which prepends 'this') for instance methods and structors,
+        // and from arrangeFreeFunctionType for static ones. The FUNCTION TYPE is always taken
+        // from Clang's own GetAddrOfGlobal declaration - that is the only source that knows a
+        // structor returns 'this' on Itanium/Darwin.
+        void ComputeCxxMemberAbi(ExtractState& st, ASTContext& ctx,
+                                 clang::CodeGen::CodeGenModule& cgm, CodeGenerator& cg)
+        {
+            using namespace clang::CodeGen;
+            for (const auto& w : st.memberAbiWork)
+            {
+                if (w.recordIdx >= st.out.records.size()) continue;
+                RawRecord& rec = st.out.records[w.recordIdx];
+                if (w.memberIdx >= rec.members.size()) continue;
+                RawCxxMember& m = rec.members[w.memberIdx];
+                const CXXMethodDecl* md = w.md;
+                if (md->isVariadic()) continue;
+
+                /*
+                 * M6 - the vtable slot of a virtual member, straight from Clang's Itanium vtable
+                 * layout. The index is relative to the address point of the vtable of the class
+                 * that DECLARES the member, which is exactly the subobject the call site will have
+                 * adjusted `this` to. A virtual destructor gets both of its slots: D1 (complete
+                 * object) and D0 (deleting, which also releases the storage).
+                 */
+                if (md->isVirtual())
+                {
+                    if (auto* itanium = llvm::dyn_cast<clang::ItaniumVTableContext>(
+                            ctx.getVTableContext()))
+                    {
+                        if (const auto* dd = llvm::dyn_cast<CXXDestructorDecl>(md))
+                        {
+                            m.vtableIndex = (int)itanium->getMethodVTableIndex(
+                                GlobalDecl(dd, Dtor_Complete));
+                            m.vtableIndexDeleting = (int)itanium->getMethodVTableIndex(
+                                GlobalDecl(dd, Dtor_Deleting));
+                        }
+                        else
+                            m.vtableIndex = (int)itanium->getMethodVTableIndex(GlobalDecl(md));
+                    }
+                }
+
+                CanQualType canon = md->getType()->getCanonicalTypeUnqualified();
+                if (canon->getAs<FunctionProtoType>() == nullptr) continue;
+                CanQual<FunctionProtoType> fpt = canon.castAs<FunctionProtoType>();
+
+                const CGFunctionInfo* fi = nullptr;
+                if (m.kind == RawCxxMember::StaticMethod)
+                    fi = &arrangeFreeFunctionType(cgm, fpt);
+                else
+                    fi = &arrangeCXXMethodType(cgm, md->getParent(), fpt.getTypePtr(), md);
+                if (fi == nullptr) continue;
+
+                RawAbi abi;
+                abi.valid = true;
+                abi.callingConv = fi->getEffectiveCallingConvention();
+                abi.ret = DescribeAbiSlot(fi->getReturnInfo());
+                unsigned next = (abi.ret.kind == RawAbiSlot::Indirect
+                              || abi.ret.kind == RawAbiSlot::IndirectAliased) ? 1u : 0u;
+                for (const auto& a : fi->arguments())
+                {
+                    RawAbiSlot s = DescribeAbiSlot(a.info);
+                    s.llvmArgIndex = next;
+                    next += s.llvmArgCount;
+                    abi.params.push_back(std::move(s));
+                }
+                // Structors: the arrangement above says the result is Ignore/void, but the
+                // emitted declaration returns 'this'. Take the real thing and mark the return
+                // as one plain pointer register the caller drops.
+                llvm::Constant* addr = cg.GetAddrOfGlobal(MemberGlobalDecl(md), false);
+                auto* fn = addr != nullptr ? llvm::dyn_cast<llvm::Function>(addr->stripPointerCasts())
+                                           : nullptr;
+                if (fn == nullptr) continue;
+                abi.fnTypeText = LlvmTypeText(fn->getFunctionType());
+                if (m.returnsThis)
+                {
+                    llvm::Type* rt = fn->getFunctionType()->getReturnType();
+                    if (rt->isPointerTy())
+                    {
+                        abi.ret = RawAbiSlot{};
+                        abi.ret.kind = RawAbiSlot::Direct;
+                        abi.ret.coerceType = LlvmTypeText(rt);
+                    }
+                    else
+                    {
+                        // A target whose structors return void: keep the declaration honest.
+                        m.returnsThis = false;
+                        m.retType = "void";
+                    }
+                }
+                if (m.paramTypes.size() != abi.params.size())
+                    continue;   // arrangement disagrees with the exported signature: refuse it
+                m.abi = std::move(abi);
+            }
+        }
+
         struct ExtractConsumer : public ASTConsumer
         {
             ExtractState& st;
@@ -603,6 +1302,11 @@ namespace cflat_cinterop
             {
                 DeclVisitor v(ctx, st);
                 v.TraverseDecl(ctx.getTranslationUnitDecl());
+                if (st.req.cxxMode)
+                {
+                    llvm::TimeTraceScope abiScope("CxxAbiArrange");
+                    ComputeCxxAbi(st, ctx);
+                }
             }
         };
 
@@ -653,6 +1357,7 @@ namespace cflat_cinterop
             explicit ExtractAction(ExtractState& s) : st(s) {}
             bool BeginSourceFileAction(CompilerInstance& ci) override
             {
+                st.ci = &ci;
                 if (st.req.wantIncludes)
                     ci.getPreprocessor().addPPCallbacks(
                         std::make_unique<IncludeCollector>(ci.getPreprocessor(), st));
