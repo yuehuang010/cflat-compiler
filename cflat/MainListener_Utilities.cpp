@@ -1,3 +1,4 @@
+#include <algorithm>
 #include "MainListener.h"
 
 /*
@@ -276,10 +277,22 @@ LLVMBackend::ConstantVariant MainListener::ParseNumberConstant(std::string rawNu
                 radix = 8;
                 digits = digits.substr(1);
             }
-            llvm::APInt wide(128, digits.empty() ? "0" : digits, radix);
-            if (negative) wide = -wide;
-            return LLVMBackend::WideIntegerConstant{
-                wide, !negative && wide.ugt(llvm::APInt::getSignedMaxValue(128)) };
+            // Only a well-formed digit string takes the wide path: this parser also sees
+            // non-numeric literal text (a char literal), which the old path treated as 0.
+            const bool validDigits = !digits.empty() && std::all_of(digits.begin(), digits.end(),
+                [radix](unsigned char c) {
+                    if (!std::isalnum(c)) return false;
+                    unsigned d = std::isdigit(c) ? c - '0' : std::tolower(c) - 'a' + 10;
+                    return d < radix;
+                });
+            if (validDigits && digits.size() <= 128)
+            {
+                llvm::APInt wide(128, digits, radix);
+                if (negative) wide = -wide;
+                return LLVMBackend::WideIntegerConstant{
+                    wide, !negative && wide.ugt(llvm::APInt::getSignedMaxValue(128)) };
+            }
+            uval = 0;
         }
 
         // If a long/long long suffix is present, prefer 64-bit result.

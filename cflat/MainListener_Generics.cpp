@@ -920,7 +920,8 @@ void MainListener::PreDeclareInstantiationMembers(
 
             bool isOperatorFunc = (funcName == "operator new"
                                 || funcName == "operator delete"
-                                || funcName == "operator string");
+                                || funcName == "operator string"
+                                || funcName == "operator bool");
             bool isStaticFunc = isFunctionStatic(func);
             bool isStaticLike = isOperatorFunc || isStaticFunc;
             std::string declName = isStaticLike ? (structName + "." + funcName) : funcName;

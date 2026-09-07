@@ -6638,7 +6638,9 @@ public:
     /// Lower an arbitrary scalar condition value to the i1 LLVM demands of a branch or a
     /// select. Shared by the if/while/for path (CreateConditionJump) and by '?:'.
     /// </summary>
-    llvm::Value* CoerceToBoolCondition(llvm::Value* cond);
+    llvm::Value* CoerceToBoolCondition(llvm::Value* cond, bool allowOperatorBool = true);
+    bool HasOperatorBoolForType(llvm::Type* type) const;
+    std::string OperatorBoolFunctionNameForType(llvm::Type* type) const;
 
     /*
      * Integer conversion at a call-argument slot. Widening upconverts, integer -> bool routes

@@ -23,6 +23,19 @@ struct BoolBox
     bool operator!() { return !value; }
 };
 
+struct TruthinessBox
+{
+    int value = 0;
+};
+
+bool operator bool(TruthinessBox b) { return b.value != 0; }
+
+struct GenericTruthinessBox<T>
+{
+    T value = default;
+    bool operator bool(GenericTruthinessBox<T> b) { return b.value != 0; }
+};
+
 // ── Bits: bitwise NOT overload ───────────────────────────────────────────────
 
 struct Bits
@@ -173,6 +186,44 @@ struct OuterBox
 {
     Box inner;
     Box operator->() { return inner; }
+};
+
+// A pointer-like value exercising postfix operators, unary dereference, and forwarding.
+struct ForwardThing
+{
+    int field = 0;
+    int count = 0;
+    int tag = 0;
+    int method() { return field * 2; }
+};
+
+struct ForwardPtr
+{
+    ForwardThing* raw = nullptr;
+    int tag = 0;
+    void operator++() { raw = raw + 1; }
+    void operator--() { raw = raw - 1; }
+    ForwardThing* operator->() { return raw; }
+    ForwardThing* operator*() { return raw; }
+};
+
+struct GenericForwardBox<T>
+{
+    T* raw = nullptr;
+    T* operator->() { return raw; }
+    T* operator*() { return raw; }
+};
+
+struct ValueDerefBox
+{
+    ForwardThing value = default;
+    ForwardThing operator*() { return value; }
+};
+
+struct AliasDerefBox
+{
+    ForwardThing* raw = nullptr;
+    alias ForwardThing operator*() { return *raw; }
 };
 
 // ── PtrNode/PtrKey: free operator with a RAW-POINTER left operand ────────────
@@ -411,6 +462,24 @@ extern int main()
     Test("BoolBox !true",  !bt, false);
     Test("BoolBox !false", !bf, true);
 
+    TruthinessBox truth = default;
+    truth.value = 1;
+    Test("operator bool in if", truth ? true : false, true);
+    Test("operator bool in ternary", truth ? 17 : 23, 17);
+    Test("operator bool in &&", truth && true, true);
+    Test("operator bool in ||", false || truth, true);
+    Test("operator bool explicit cast", (bool)truth, true);
+    Test("operator bool in !", !truth, false);
+    while (truth) truth.value = 0;
+    Test("operator bool terminates while", truth.value, 0);
+    do { truth.value = 1; } while (false && truth);
+    for (; truth; truth.value = 0) { }
+    Test("operator bool in do-for", truth.value, 0);
+
+    GenericTruthinessBox<int> genericTruth = default;
+    genericTruth.value = 1;
+    Test("operator bool generic struct", genericTruth ? true : false, true);
+
     // operator~(): bitwise NOT on Bits
     Bits bits; bits.value = 0xFF;
     int flipped = ~bits;
@@ -438,6 +507,48 @@ extern int main()
     OuterBox ob; ob.inner = w;
     Test("OuterBox-> chained field",  ob->value,    9);
     Test("OuterBox-> chained method", ob->triple(), 27);
+
+    // ── postfix increment/decrement, unary operator*, and forwarding ─────────
+    ForwardThing[2] forwardThings = default;
+    forwardThings[0].field = 4;
+    forwardThings[0].count = 7;
+    forwardThings[0].tag = 1;
+    forwardThings[1].field = 8;
+    ForwardPtr fp; fp.raw = &forwardThings[0]; fp.tag = 2;
+    ForwardPtr updated = fp++;
+    Test("struct postfix ++ mutates in place", fp.raw == &forwardThings[1], true);
+    Test("struct postfix ++ yields updated value", updated.raw == fp.raw, true);
+    ForwardPtr decremented = fp--;
+    Test("struct postfix -- mutates in place", fp.raw == &forwardThings[0], true);
+    Test("struct postfix -- yields updated value", decremented.raw == fp.raw, true);
+    Test("unary operator* returns pointer", (*fp).field, 4);
+    ForwardThing* dereferenced = *fp;
+    Test("unary operator* pointer value", dereferenced->field, 4);
+    Test("dot forwards field", fp.field, 4);
+    fp.field = 5;
+    Test("dot forwards field write", forwardThings[0].field, 5);
+    Test("dot forwards method", fp.method(), 10);
+    fp.count++;
+    Test("dot forwards scalar postfix", forwardThings[0].count, 8);
+    Test("own member wins over forwarding", fp.tag, 2);
+    Test("own raw member wins over forwarding", fp.raw == &forwardThings[0], true);
+    ForwardPtr* fpReceiver = &fp;
+    Test("pointer dot forwards field", fpReceiver.field, 5);
+    fpReceiver.field = 6;
+    Test("pointer dot forwards field write", forwardThings[0].field, 6);
+    Test("pointer dot forwards method", fpReceiver.method(), 12);
+    fpReceiver.field = 5;
+
+    GenericForwardBox<ForwardThing> genericForward;
+    genericForward.raw = &forwardThings[0];
+    Test("generic operator-> forwarding", genericForward->field, 5);
+    Test("generic unary operator*", (*genericForward).field, 5);
+
+    ValueDerefBox valueDeref; valueDeref.value.field = 12;
+    Test("value unary operator*", (*valueDeref).field, 12);
+    AliasDerefBox aliasDeref; aliasDeref.raw = &forwardThings[0];
+    (*aliasDeref).field = 13;
+    Test("alias unary operator*", forwardThings[0].field, 13);
 
     // ── Flexible model: own-member-first, forward only on a miss ──────────────
 

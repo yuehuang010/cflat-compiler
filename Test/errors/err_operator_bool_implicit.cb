@@ -1,0 +1,15 @@
+struct NoOperatorBool { int value = 0; };
+
+extern int main()
+{
+    expect_error("condition must be a scalar") {
+        NoOperatorBool x = default;
+        bool b = x;
+    }
+
+    expect_error("condition must be a scalar") {
+        NoOperatorBool y = default;
+        if (y) { }
+    }
+    return 0;
+}

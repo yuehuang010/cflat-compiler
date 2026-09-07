@@ -1,0 +1,24 @@
+struct ForwardErrorThing { int value = 0; };
+
+struct ForwardErrorPtr
+{
+    ForwardErrorThing* raw = nullptr;
+    ForwardErrorThing* operator->() { return raw; }
+};
+
+struct NoIncrementError { int value = 0; };
+
+extern int main()
+{
+    ForwardErrorPtr p;
+    expect_error("Unknown identifier 'nothere'");
+    int missing = p.nothere;
+
+    NoIncrementError x;
+    expect_error("struct 'NoIncrementError' has no 'operator++'; define 'void operator++()' on it or use a scalar");
+    x++;
+    return missing;
+}
+
+expect_error("found ';' but expected {'move', '(', Identifier}");
+int prefixError() { NoIncrementError x; ++x; return 0; }

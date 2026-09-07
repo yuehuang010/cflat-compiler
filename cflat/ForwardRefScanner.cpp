@@ -543,7 +543,8 @@ void ForwardRefScanner::ScanFunctionDefinition(CFlatParser::FunctionDefinitionCo
         // Operator new/delete/string and static methods are scoped to struct but have no 'this' param
         bool isOperatorFunc = (rawFuncName == "operator new"
                             || rawFuncName == "operator delete"
-                            || rawFuncName == "operator string");
+                            || rawFuncName == "operator string"
+                            || rawFuncName == "operator bool");
         bool isStaticFunc = isFunctionStatic(func);
         if (!structName.empty() && (isOperatorFunc || isStaticFunc))
         {

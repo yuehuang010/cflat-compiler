@@ -587,7 +587,7 @@ llvm::StoreInst* LLVMBackend::CreateAssignment(llvm::Value* value, llvm::Value* 
         {
             // Same truth test as an explicit '(bool)' cast: a float or pointer source needs its
             // own zero, and an integer one tests non-zero rather than keeping bit 0.
-            value = CoerceToBoolCondition(value);
+            value = CoerceToBoolCondition(value, false);
         }
         else
         {

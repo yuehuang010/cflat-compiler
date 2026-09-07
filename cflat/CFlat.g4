@@ -318,7 +318,7 @@ typeSpecifier
     | 'double'
     | 'signed'
     | 'unsigned'
-    | 'bool'
+    | Bool
     | 'string'
     | 'i8'
     | 'i16'
@@ -429,7 +429,7 @@ valueParameterDeclaration
     ;
 
 valueParameterType
-    : 'char' | 'short' | 'int' | 'long' | 'bool'
+    : 'char' | 'short' | 'int' | 'long' | Bool
     | 'i8' | 'i16' | 'i32' | 'i64' | 'i128' | 'u8' | 'u16' | 'u32' | 'u64' | 'u128'
     ;
 
@@ -920,8 +920,9 @@ deleteArraySize
     ;
 
 operatorFunctionId
-    : Operator (New | Delete | String
+    : Operator (New | Delete | String | Bool
                | Plus | Minus | Star | Div | Mod | And | Or | Caret
+               | PlusPlus | MinusMinus
                | PlusAssign | MinusAssign | StarAssign | DivAssign | ModAssign
                | LeftShiftAssign | RightShiftAssign | AndAssign | XorAssign | OrAssign
                | Equal | NotEqual | Less | LessEqual | Greater | GreaterEqual
@@ -1175,7 +1176,7 @@ Atomic
     ;
 
 Bool
-    : '_Bool'
+    : 'bool' | '_Bool'
     ;
 
 Complex

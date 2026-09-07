@@ -734,7 +734,32 @@ llvm::Function* LLVMBackend::GetOrDeclareStrcmp()
         return llvm::Function::Create(fnTy, llvm::Function::ExternalLinkage, "strcmp", module.get());
     }
 
-llvm::Value* LLVMBackend::CoerceToBoolCondition(llvm::Value* cond)
+bool LLVMBackend::HasOperatorBoolForType(llvm::Type* type) const
+{
+        return !OperatorBoolFunctionNameForType(type).empty();
+}
+
+std::string LLVMBackend::OperatorBoolFunctionNameForType(llvm::Type* type) const
+{
+        auto* st = llvm::dyn_cast_or_null<llvm::StructType>(type);
+        if (st == nullptr || st->isLiteral() || !st->hasName()) return {};
+
+        auto matches = [&](const std::string& name) {
+            auto it = functionTable.find(name);
+            if (it == functionTable.end()) return false;
+            for (const auto& candidate : it->second)
+                if (candidate.Parameters.size() == 1
+                    && candidate.Parameters[0].TypeName == st->getName().str()
+                    && !candidate.Parameters[0].Pointer)
+                    return true;
+            return false;
+        };
+        if (matches("operator bool")) return "operator bool";
+        std::string memberName = st->getName().str() + ".operator bool";
+        return matches(memberName) ? memberName : std::string{};
+}
+
+llvm::Value* LLVMBackend::CoerceToBoolCondition(llvm::Value* cond, bool allowOperatorBool)
 {
         if (cond == nullptr || cond->getType()->isIntegerTy(1))
             return cond;
@@ -757,6 +782,26 @@ llvm::Value* LLVMBackend::CoerceToBoolCondition(llvm::Value* cond)
             st != nullptr && st->hasName() && st->getNumElements() == 1
             && st->getElementType(0)->isPointerTy() && IsCoreUniqueType(st->getName().str()))
             return builder->CreateIsNotNull(builder->CreateExtractValue(cond, 0));
+
+        if (allowOperatorBool)
+        {
+            std::string opName = OperatorBoolFunctionNameForType(cond->getType());
+            if (!opName.empty())
+            {
+                NamedVariable arg;
+                arg.Primary = cond;
+                arg.BaseType = cond->getType();
+                arg.TypeAndValue.TypeName = llvm::cast<llvm::StructType>(cond->getType())->getName().str();
+                auto savedReturnType = lastCallReturnType;
+                bool savedReturnsOwned = lastCallReturnsOwned;
+                bool savedOwningResult = lastOwningResult;
+                auto result = CreateOverloadedFunctionCall(opName, { arg });
+                lastCallReturnType = savedReturnType;
+                lastCallReturnsOwned = savedReturnsOwned;
+                lastOwningResult = savedOwningResult;
+                return result;
+            }
+        }
 
         // An aggregate (a `string`, any struct) has no truth value. Diagnose it here rather than
         // handing it to CreateCondBr / CreateSelect, which fails module verification opaquely.

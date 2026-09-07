@@ -279,8 +279,11 @@ inline std::string getOperatorName(CFlatParser::OperatorFunctionIdContext* opId)
     if (opId->New())          return "operator new";
     if (opId->Delete())       return "operator delete";
     if (opId->String())       return "operator string";
+    if (opId->Bool())         return "operator bool";
     if (opId->Plus())         return "operator+";
     if (opId->Minus())        return "operator-";
+    if (opId->PlusPlus())     return "operator++";
+    if (opId->MinusMinus())   return "operator--";
     if (opId->Star())         return "operator*";
     if (opId->Div())          return "operator/";
     if (opId->Mod())          return "operator%";
@@ -4972,6 +4975,8 @@ public:
 
     LLVMBackend::TypedValue ParseLogicalAndExpression(CFlatParser::LogicalAndExpressionContext* ctx,
                                                        ResultUse use = ResultUse::Value);
+
+    void EnsureOperatorBoolForValue(llvm::Value* value);
 
     LLVMBackend::TypedValue ParseInclusiveOrExpression(CFlatParser::InclusiveOrExpressionContext* ctx,
                                                         ResultUse use = ResultUse::Value);

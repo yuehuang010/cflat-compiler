@@ -677,6 +677,68 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                     "yields a value, not an addressable location. Null-check the receiver and use "
                     "a plain '.' access instead.", op);
             };
+            auto ApplyStructPostfixOperator = [&](const char* opName) -> bool
+            {
+                if (namedVar.TypeAndValue.Pointer || namedVar.TypeAndValue.TypeName.empty()) return false;
+                auto* compiler = Compiler(ctx);
+                auto structData = compiler->GetDataStructure(namedVar.TypeAndValue.TypeName);
+                if (structData.StructType == nullptr) return false;
+
+                auto funcs = compiler->functionTable.find(opName);
+                if (funcs == compiler->functionTable.end())
+                {
+                    LogErrorContext(ctx, std::format(
+                        "struct '{}' has no '{}'; define 'void {}()' on it or use a scalar",
+                        namedVar.TypeAndValue.TypeName, opName, opName));
+                    return true;
+                }
+                bool hasReceiver = false;
+                for (const auto& candidate : funcs->second)
+                    if (!candidate.Parameters.empty()
+                        && candidate.Parameters[0].TypeName == namedVar.TypeAndValue.TypeName
+                        && candidate.Parameters[0].Pointer)
+                    {
+                        hasReceiver = true;
+                        break;
+                    }
+                if (!hasReceiver)
+                {
+                    LogErrorContext(ctx, std::format(
+                        "struct '{}' has no '{}'; define 'void {}()' on it or use a scalar",
+                        namedVar.TypeAndValue.TypeName, opName, opName));
+                    return true;
+                }
+
+                if (ncChainNullBlock != nullptr)
+                {
+                    LogErrorContext(ctx, NullConditionalNotWritable(opName + 8));
+                    return true;
+                }
+                CheckGuardedWrite(ctx, namedVar);
+                llvm::Value* storage = namedVar.Storage ? namedVar.Storage : parenthesizedPostfixStorage;
+                if (storage == nullptr && namedVar.Primary != nullptr)
+                {
+                    storage = compiler->CreateAlloca(structData.StructType);
+                    compiler->CreateAssignment(namedVar.Primary, storage);
+                }
+                if (storage == nullptr)
+                {
+                    LogErrorContext(ctx, std::format("'{}' requires an addressable struct value", opName));
+                    return true;
+                }
+
+                LLVMBackend::NamedVariable thisNV = namedVar;
+                thisNV.Primary = nullptr;
+                thisNV.Storage = storage;
+                thisNV.TypeAndValue.VariableName.clear();
+                compiler->CreateOverloadedFunctionCall(opName, { thisNV });
+
+                namedVar.Primary = nullptr;
+                namedVar.Storage = storage;
+                namedVar.BaseType = structData.StructType;
+                namedVar.TypeAndValue.Pointer = false;
+                return true;
+            };
 
             // dropTrailingChildren lets a caller (e.g. the lock statement, for `rw.read`)
             // evaluate only the base of the postfix chain, ignoring a trailing suffix.
@@ -741,6 +803,106 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
             std::string guardLockKeyHeld;
             // Canonical receiver path of the most recent '.'/'->' member name in this chain.
             std::string lastMemberReceiverPath;
+            auto DerefPointerReceiver = [&]()
+            {
+                if (!namedVar.TypeAndValue.Pointer
+                    || namedVar.TypeAndValue.TypeName.empty()
+                    || namedVar.TypeAndValue.IsInterface)
+                    return;
+                auto sd = Compiler(ctx)->GetDataStructure(namedVar.TypeAndValue.TypeName);
+                if (!sd.StructType) return;
+
+                // Deref of an explicitly-moved-null thin pointer local is statically
+                // null - reject it (plain reads stay legal). SKIP `?.`.
+                if (!nullConditionalPending)
+                    Compiler(ctx)->RecordNullDerefFor(namedVar, ctx->getStart()->getLine(),
+                        ctx->getStart()->getCharPositionInLine());
+                if (Compiler(ctx)->IsExplicitlyMovedNullHere(namedVar) && !nullConditionalPending)
+                    LogErrorContext(ctx, std::format(
+                        "dereference of moved variable '{}' (it is null after the move)",
+                        namedVar.CallerName));
+                llvm::Value* ptrVal = LoadNamedVariable(namedVar);
+                // --sanitize=ownership: guard `p->f` / `p.f` deref against a null
+                // (moved/freed) pointer. SKIP `?.` - the null-conditional operator
+                // legitimately tolerates null and short-circuits, so it is not a bug.
+                if (!nullConditionalPending)
+                    Compiler(ctx)->EmitOwnDerefGuard(namedVar.Storage, ptrVal,
+                        ctx->getStart()->getLine(), ctx->getStart()->getCharPositionInLine());
+                structVar.Storage      = ptrVal;
+                structVar.Primary      = nullptr;
+                structVar.BaseType     = sd.StructType;
+                structVar.TypeAndValue = namedVar.TypeAndValue;
+                structVar.TypeAndValue.Pointer = false;
+                // Preserve borrow-origin across the auto-deref so 'move param->field'
+                // can detect that the parent pointer is a borrowed parameter.
+                structVar.IsBorrowed      = namedVar.IsBorrowed;
+                structVar.BorrowedOrigin  = namedVar.BorrowedOrigin;
+                structVar.FieldPathThroughPointer = namedVar.FieldPathThroughPointer;
+                structVar.FieldPathRoot = namedVar.FieldPathRoot;
+                structVar.ContainsBondedClosure = namedVar.ContainsBondedClosure;
+                structVar.BondedSources = namedVar.BondedSources;
+            };
+            auto ForwardOperatorArrow = [&](LLVMBackend::NamedVariable& receiver,
+                                            antlr4::tree::ParseTree* memberToken)
+            {
+                auto* compiler = Compiler(ctx);
+                if (receiver.TypeAndValue.Pointer
+                    || receiver.TypeAndValue.IsInterface
+                    || receiver.TypeAndValue.TypeName.empty()
+                    || compiler->GetDataStructure(receiver.TypeAndValue.TypeName).StructType == nullptr)
+                    return;
+
+                std::string memberName = NextMemberName(ctx, memberToken);
+                int arrowGuard = 0;
+                while (!memberName.empty()
+                       && !receiver.TypeAndValue.Pointer
+                       && !receiver.TypeAndValue.TypeName.empty()
+                       && !compiler->TypeHasMember(receiver.TypeAndValue.TypeName, memberName)
+                       && compiler->HasArrowOverloadFor(receiver.TypeAndValue.TypeName))
+                {
+                    auto sd = compiler->GetDataStructure(receiver.TypeAndValue.TypeName);
+                    if (sd.StructType == nullptr) break;
+
+                    // operator-> takes `this`; materialize a slot if we only hold an rvalue.
+                    LLVMBackend::NamedVariable thisNV = receiver;
+                    thisNV.TypeAndValue.VariableName = "";
+                    if (thisNV.Storage == nullptr && thisNV.Primary != nullptr)
+                    {
+                        auto* temp = compiler->CreateAlloca(sd.StructType);
+                        compiler->CreateAssignment(thisNV.Primary, temp);
+                        thisNV.Storage = temp;
+                    }
+
+                    if (!compiler->IsCoreUniqueType(receiver.TypeAndValue.TypeName))
+                        CheckMovedReceiver(receiver);
+                    auto* arrowResult = compiler->CreateOverloadedFunctionCall("operator->", { thisNV });
+                    if (arrowResult == nullptr) break;
+
+                    // operator-> is an ABI adapter, not an ownership boundary: keep the
+                    // owning-temp-field ledger on the pointer it hands back.
+                    if (compiler->IsLedgeredOwningTempUniqueField(receiver.Primary))
+                        compiler->RegisterOwningTempUniqueField(arrowResult);
+                    bool throughCoreUniqueField =
+                        compiler->IsCoreUniqueType(receiver.TypeAndValue.TypeName)
+                        && (!receiver.FieldName.empty() || receiver.IsUniqueFieldAlias);
+                    bool throughPointer = receiver.FieldPathThroughPointer
+                        || throughCoreUniqueField;
+                    std::string pathRoot = receiver.FieldPathRoot;
+                    receiver = {};
+                    receiver.Primary      = arrowResult;
+                    receiver.BaseType     = arrowResult->getType();
+                    receiver.TypeAndValue = compiler->lastCallReturnType;
+                    receiver.FieldPathThroughPointer = throughPointer;
+                    receiver.FieldPathRoot = pathRoot;
+                    PrepareAliasCallResult(ctx, receiver);
+
+                    if (++arrowGuard > 32)
+                    {
+                        LogErrorContext(ctx, "operator-> chain did not resolve to a pointer (possible cycle)");
+                        break;
+                    }
+                }
+            };
             for (auto parseTree : ctx->children)
             {
                 if (childIndex++ >= childLimit) break;
@@ -864,65 +1026,6 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                         // and `?.`: for `?.` the `?` is recognized first (nullConditionalPending set above),
                         // then operator-> forwards on a miss and the null-conditional guard applies to the
                         // forwarded pointer.
-                        if ((tokenType == CFlatParser::Dot || tokenType == CFlatParser::Arrow
-                             || tokenType == CFlatParser::QuestionDot)
-                            && !namedVar.TypeAndValue.Pointer
-                            && !namedVar.TypeAndValue.IsInterface
-                            && !namedVar.TypeAndValue.TypeName.empty()
-                            && Compiler(ctx)->GetDataStructure(namedVar.TypeAndValue.TypeName).StructType != nullptr)
-                        {
-                            auto* compiler = Compiler(ctx);
-                            std::string memberName = NextMemberName(ctx, parseTree);
-                            int arrowGuard = 0;
-                            while (!memberName.empty()
-                                   && !namedVar.TypeAndValue.Pointer
-                                   && !namedVar.TypeAndValue.TypeName.empty()
-                                   && !compiler->TypeHasMember(namedVar.TypeAndValue.TypeName, memberName)
-                                   && compiler->HasArrowOverloadFor(namedVar.TypeAndValue.TypeName))
-                            {
-                                auto sd = compiler->GetDataStructure(namedVar.TypeAndValue.TypeName);
-                                if (sd.StructType == nullptr) break;
-
-                                // operator-> takes `this`; materialize a slot if we only hold an rvalue.
-                                LLVMBackend::NamedVariable thisNV = namedVar;
-                                thisNV.TypeAndValue.VariableName = "";
-                                if (thisNV.Storage == nullptr && thisNV.Primary != nullptr)
-                                {
-                                    auto* temp = compiler->CreateAlloca(sd.StructType);
-                                    compiler->CreateAssignment(thisNV.Primary, temp);
-                                    thisNV.Storage = temp;
-                                }
-
-                                if (!compiler->IsCoreUniqueType(namedVar.TypeAndValue.TypeName))
-                                    CheckMovedReceiver(namedVar);
-                                auto* arrowResult = compiler->CreateOverloadedFunctionCall("operator->", { thisNV });
-                                if (arrowResult == nullptr) break;
-
-                                // operator-> is an ABI adapter, not an ownership boundary: keep the
-                                // owning-temp-field ledger on the pointer it hands back.
-                                if (compiler->IsLedgeredOwningTempUniqueField(namedVar.Primary))
-                                    compiler->RegisterOwningTempUniqueField(arrowResult);
-                                bool throughCoreUniqueField =
-                                    compiler->IsCoreUniqueType(namedVar.TypeAndValue.TypeName)
-                                    && (!namedVar.FieldName.empty() || namedVar.IsUniqueFieldAlias);
-                                bool throughPointer = namedVar.FieldPathThroughPointer
-                                    || throughCoreUniqueField;
-                                std::string pathRoot = namedVar.FieldPathRoot;
-                                namedVar = {};
-                                namedVar.Primary      = arrowResult;
-                                namedVar.BaseType     = arrowResult->getType();
-                                namedVar.TypeAndValue = compiler->lastCallReturnType;
-                                namedVar.FieldPathThroughPointer = throughPointer;
-                                namedVar.FieldPathRoot = pathRoot;
-                                PrepareAliasCallResult(ctx, namedVar);
-
-                                if (++arrowGuard > 32)
-                                {
-                                    LogErrorContext(ctx, "operator-> chain did not resolve to a pointer (possible cycle)");
-                                    break;
-                                }
-                            }
-                        }
                         // Total .copy() over a bare-pointer BORROW receiver: the following `copy()` is a
                         // pointer-identity copy (shares the pointee), handled by [PFX-copy-ptr]. The
                         // auto-deref below still runs (a harmless load) and leaves namedVar as the pointer,
@@ -949,45 +1052,30 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                         // For any member access on a pointer to a known struct, load the pointer
                         // so subsequent field/method lookups work. '.' auto-deduces the dereference
                         // just like '->'; '?.' does the same but also arms the null-conditional check.
-                        if (namedVar.TypeAndValue.Pointer
-                            && !namedVar.TypeAndValue.TypeName.empty()
-                            && !namedVar.TypeAndValue.IsInterface)
+                        DerefPointerReceiver();
+                        if (tokenType == CFlatParser::Dot || tokenType == CFlatParser::Arrow
+                            || tokenType == CFlatParser::QuestionDot)
                         {
-                            auto sd = Compiler(ctx)->GetDataStructure(namedVar.TypeAndValue.TypeName);
-                            if (sd.StructType)
+                            bool pointerReceiverMiss = structVar.BaseType
+                                && !structVar.TypeAndValue.TypeName.empty()
+                                && !Compiler(ctx)->TypeHasMember(
+                                    structVar.TypeAndValue.TypeName, NextMemberName(ctx, parseTree))
+                                && Compiler(ctx)->HasArrowOverloadFor(structVar.TypeAndValue.TypeName);
+                            if (pointerReceiverMiss)
                             {
-                                // Deref of an explicitly-moved-null thin pointer local is statically
-                                // null - reject it (plain reads stay legal). SKIP `?.`.
-                                if (!nullConditionalPending)
-                                    Compiler(ctx)->RecordNullDerefFor(namedVar, ctx->getStart()->getLine(),
-                                        ctx->getStart()->getCharPositionInLine());
-                                if (Compiler(ctx)->IsExplicitlyMovedNullHere(namedVar) && !nullConditionalPending)
-                                    LogErrorContext(ctx, std::format(
-                                        "dereference of moved variable '{}' (it is null after the move)",
-                                        namedVar.CallerName));
-                                llvm::Value* ptrVal = LoadNamedVariable(namedVar);
-                                // --sanitize=ownership: guard `p->f` / `p.f` deref against a null
-                                // (moved/freed) pointer. SKIP `?.` - the null-conditional operator
-                                // legitimately tolerates null and short-circuits, so it is not a bug.
-                                if (!nullConditionalPending)
-                                    Compiler(ctx)->EmitOwnDerefGuard(namedVar.Storage, ptrVal,
-                                        ctx->getStart()->getLine(), ctx->getStart()->getCharPositionInLine());
-                                structVar.Storage      = ptrVal;
-                                structVar.Primary      = nullptr;
-                                structVar.BaseType     = sd.StructType;
-                                structVar.TypeAndValue = namedVar.TypeAndValue;
-                                structVar.TypeAndValue.Pointer = false;
-                                // Preserve borrow-origin across the auto-deref so 'move param->field'
-                                // can detect that the parent pointer is a borrowed parameter.
-                                structVar.IsBorrowed      = namedVar.IsBorrowed;
-                                structVar.BorrowedOrigin  = namedVar.BorrowedOrigin;
-                                structVar.FieldPathThroughPointer = namedVar.FieldPathThroughPointer;
-                                structVar.FieldPathRoot = namedVar.FieldPathRoot;
-                                structVar.ContainsBondedClosure = namedVar.ContainsBondedClosure;
-                                structVar.BondedSources = namedVar.BondedSources;
+                                namedVar = structVar;
+                                structVar = {};
+                                ForwardOperatorArrow(namedVar, parseTree);
+                                DerefPointerReceiver();
+                            }
+                            else
+                            {
+                                ForwardOperatorArrow(namedVar, parseTree);
+                                if (!structVar.BaseType)
+                                    DerefPointerReceiver();
                             }
                         }
-                        else if (!namedVar.TypeAndValue.Pointer
+                        if (!namedVar.TypeAndValue.Pointer
                                  && !namedVar.TypeAndValue.TypeName.empty()
                                  && !namedVar.TypeAndValue.IsInterface
                                  && namedVar.Storage != nullptr)
@@ -1101,6 +1189,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                     }
                     case CFlatParser::PlusPlus:
                     {
+                        if (ApplyStructPostfixOperator("operator++"))
+                            break;
                         if (namedVar.TypeAndValue.IsArrayView)
                             LogErrorContext(ctx, "'++' is not allowed on an array-view 'T[]' - it has no pointer arithmetic; index it with 'a[i]' instead");
                         if (ncChainNullBlock != nullptr)
@@ -1134,6 +1224,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                     }
                     case CFlatParser::MinusMinus:
                     {
+                        if (ApplyStructPostfixOperator("operator--"))
+                            break;
                         if (namedVar.TypeAndValue.IsArrayView)
                             LogErrorContext(ctx, "'--' is not allowed on an array-view 'T[]' - it has no pointer arithmetic; index it with 'a[i]' instead");
                         if (ncChainNullBlock != nullptr)
@@ -7525,10 +7617,33 @@ std::string MainListener::ProcessRawText(const std::string& rawText, bool foldBr
         return output;
     }
 
+void MainListener::EnsureOperatorBoolForValue(llvm::Value* value) {
+        if (value == nullptr || !value->getType()->isStructTy()) return;
+        auto* st = llvm::dyn_cast<llvm::StructType>(value->getType());
+        if (st == nullptr || st->isLiteral() || !st->hasName()) return;
+
+        LLVMBackend::NamedVariable arg;
+        arg.Primary = value;
+        arg.BaseType = st;
+        arg.TypeAndValue.TypeName = st->getName().str();
+        std::string genericName = Compiler()->ResolveGenericFunctionBase("operator bool");
+        if (genericFunctionTemplates.count(genericName) == 0
+            && genericFunctionTemplates.count("operator bool") != 0)
+            genericName = "operator bool";
+        if (genericFunctionTemplates.count(genericName))
+        {
+            auto instantiated = InferAndInstantiateGenericFunction(genericName, st->getName().str());
+            if (instantiated.empty()) TryInferAndInstantiateFromArgs(genericName, { arg });
+        }
+        else
+            TryInferAndInstantiateFromArgs("operator bool", { arg });
+}
+
 llvm::Value* MainListener::ParseExpression(CFlatParser::ExpressionContext* ctx) {
         auto assignCtxs = ctx->assignmentExpression();
         auto left = this->ParseAssignmentExpression(assignCtxs);
         ProcessPlusPlus();
+        EnsureOperatorBoolForValue(left);
         return left;
 
         /*

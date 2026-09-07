@@ -550,7 +550,8 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
                     Compiler()->gts.genericFunctionValueDefaults[qualifiedName] = valueDefaults;
                     genericFunctionConstraints[qualifiedName] = ParseWhereClause(func->whereClause());
                 }
-                else if (funcName == "operator new" || funcName == "operator delete" || isFunctionStatic(func))
+                else if (funcName == "operator new" || funcName == "operator delete"
+                         || funcName == "operator bool" || isFunctionStatic(func))
                 {
                     ParseFunctionDefinition(func, {}, {}, structName + "." + funcName);
                 }

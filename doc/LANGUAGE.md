@@ -2954,7 +2954,7 @@ cursor += 3;           // advance 3 more bytes
 
 ### Operator Overloading
 
-Define `operator+`, `operator-`, `operator*`, `operator/`, `operator==`, `operator!=`, `operator<`, `operator>`, `operator<<`, `operator>>`, `operator[]`, `operator new`, `operator delete`, and `operator string` on structs:
+Define `operator+`, `operator-`, `operator*`, `operator/`, `operator==`, `operator!=`, `operator<`, `operator>`, `operator<<`, `operator>>`, `operator[]`, `operator++`, `operator--`, `operator->`, `operator new`, `operator delete`, `operator string`, and `operator bool` on structs:
 
 ```c
 struct Vec2
@@ -2973,6 +2973,30 @@ Vec2 c = a + b;          // (4, 6)
 Vec2 d = a * 3.0f;       // (3, 6)
 bool eq = (a == a);      // true
 ```
+
+`operator bool` is a free function with the declaration shape `bool operator bool(T value) { ... }`.
+For a struct VALUE, it is used only in `if`, `while`, `do-while`, and `for` conditions, the
+condition of `?:`, operands of `&&` and `||`, unary `!`, and an explicit `(bool)value` cast.
+It is never an implicit conversion for arithmetic, assignment, or call arguments. A pointer to a
+struct keeps the ordinary pointer null test and does not dispatch through `operator bool`.
+
+#### Increment, dereference and member forwarding
+
+Struct member overloads use these shapes:
+
+```c
+void operator++() { raw = raw + 1; }
+void operator--() { raw = raw - 1; }
+Thing* operator->() { return raw; }
+Thing* operator*() { return raw; }
+```
+
+`++` and `--` are postfix-only in CFlat. They update the struct in place, and the expression value
+is the object after the call; assigning `y = x++` therefore copies the updated object. Unary
+`operator*` has no explicit parameters, while binary multiplication has one. `operator.` is not
+overloadable. On a struct value, `.` first resolves the struct's own member, then forwards a miss
+through `operator->`; forwarding may chain through struct results until a pointer is reached. Own
+members always win, and pointer/null-safe receiver behavior remains unchanged.
 
 `operator<<` and `operator>>` are overloadable too. The core `channel<T>` uses `operator>>` as a pipe - `src >> dst` forwards every value from one channel into another (see [Threading](THREADING.md)).
 

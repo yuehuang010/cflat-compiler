@@ -5334,6 +5334,7 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
         auto* falseBlock  = compiler->CreateBasicBlock("ternary_false");
         auto* resumeBlock = compiler->CreateBasicBlock("ternary_resume");
 
+        EnsureOperatorBoolForValue(condTv.value);
         // Coerces a non-bool condition to i1; leaves the insert point in trueBlock.
         compiler->CreateConditionJump(condTv.value, trueBlock, falseBlock);
         // The block holding the branch dominates both arms AND the resume block - the one place
@@ -6270,6 +6271,7 @@ LLVMBackend::TypedValue MainListener::ParseConditionalExpression(
 
                 // LLVM's select requires an i1 condition; a non-bool CFlat condition
                 // (int, char, pointer, float) must be lowered the same way if/while do.
+                EnsureOperatorBoolForValue(condTv.value);
                 auto* selectCond = compiler->CoerceToBoolCondition(condTv.value);
                 auto* selectValue = compiler->CreateSelect(selectCond, falseValue, trueValue);
 
@@ -6343,6 +6345,8 @@ LLVMBackend::TypedValue MainListener::ParseLogicalOrExpression(CFlatParser::Logi
                 if (left == nullptr)
                 {
                     left = ParseLogicalAndExpression(logicCtx, ResultUse::Value);
+                    EnsureOperatorBoolForValue(left);
+                    left = compiler->CoerceToBoolCondition(left);
                     compiler->CreateAssignment(left, resultStorage);
                 }
                 else
@@ -6353,6 +6357,8 @@ LLVMBackend::TypedValue MainListener::ParseLogicalOrExpression(CFlatParser::Logi
                     compiler->InitializeBlock(falseBlock, false);
                     LLVMBackend::OwnedTempMark rhsMark = compiler->MarkOwnedTemps();
                     llvm::Value* right = ParseLogicalAndExpression(logicCtx, ResultUse::Value);
+                    EnsureOperatorBoolForValue(right);
+                    right = compiler->CoerceToBoolCondition(right);
                     left = compiler->CreateOperation(LLVMBackend::Operation::LogicalOr, left, right);
                     // The short-circuit block does not dominate resumeOR, so the end-of-statement
                     // flush would skip its temps; the operands are already reduced to a bool here.
@@ -6397,6 +6403,8 @@ LLVMBackend::TypedValue MainListener::ParseLogicalAndExpression(CFlatParser::Log
                 if (left == nullptr)
                 {
                     left = ParseInclusiveOrExpression(inclusiveCtx, ResultUse::Value);
+                    EnsureOperatorBoolForValue(left);
+                    left = compiler->CoerceToBoolCondition(left);
                     compiler->CreateAssignment(left, resultStorage);
                 }
                 else
@@ -6407,6 +6415,8 @@ LLVMBackend::TypedValue MainListener::ParseLogicalAndExpression(CFlatParser::Log
                     compiler->InitializeBlock(trueBlock, false);
                     LLVMBackend::OwnedTempMark rhsMark = compiler->MarkOwnedTemps();
                     llvm::Value* right = ParseInclusiveOrExpression(inclusiveCtx, ResultUse::Value);
+                    EnsureOperatorBoolForValue(right);
+                    right = compiler->CoerceToBoolCondition(right);
                     left = compiler->CreateOperation(LLVMBackend::Operation::LogicalAnd, left, right);
                     // The short-circuit block does not dominate resumeAND, so the end-of-statement
                     // flush would skip its temps; the operands are already reduced to a bool here.
@@ -9301,6 +9311,20 @@ LLVMBackend::NamedVariable MainListener::ParseUnaryExpression(CFlatParser::Unary
             else if (opText == "*")
             {
                 if (!namedVar.TypeAndValue.Pointer
+                    && !compiler->IsCoreUniqueType(namedVar.TypeAndValue.TypeName))
+                {
+                    auto* operand = this->LoadNamedVariable(namedVar);
+                    if (auto* overload = TryUnaryOperatorOverload(operand, "*", ctx))
+                    {
+                        namedVar.Primary = overload;
+                        namedVar.Storage = nullptr;
+                        namedVar.BaseType = overload->getType();
+                        namedVar.TypeAndValue = compiler->lastCallReturnType;
+                        PrepareAliasCallResult(ctx, namedVar);
+                        return namedVar;
+                    }
+                }
+                if (!namedVar.TypeAndValue.Pointer
                     && compiler->IsCoreUniqueType(namedVar.TypeAndValue.TypeName))
                 {
                     auto coreUnique = namedVar;
@@ -9373,7 +9397,15 @@ LLVMBackend::NamedVariable MainListener::ParseUnaryExpression(CFlatParser::Unary
             else if (opText == "!")
             {
                 auto newValue = this->LoadNamedVariable(namedVar);
-                if (auto* overload = TryUnaryOperatorOverload(newValue, "!", ctx))
+                EnsureOperatorBoolForValue(newValue);
+                if (newValue != nullptr && compiler->HasOperatorBoolForType(newValue->getType()))
+                {
+                    namedVar.Primary = compiler->CreateLogicalNot(
+                        compiler->CoerceToBoolCondition(newValue));
+                    namedVar.TypeAndValue = {};
+                    namedVar.TypeAndValue.TypeName = "bool";
+                }
+                else if (auto* overload = TryUnaryOperatorOverload(newValue, "!", ctx))
                 {
                     namedVar.Primary = overload;
                     namedVar.TypeAndValue = compiler->lastCallReturnType;
