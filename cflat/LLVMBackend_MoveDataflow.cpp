@@ -745,7 +745,13 @@ void LLVMBackend::RunNullIfaceGlobalCheck()
             if (init == nullptr || !init->isNullValue()) continue;
             auto nw = neverWritten.find(gv);
             if (nw == neverWritten.end())
+            {
+                // Proving a global is never written must see EVERY writer, so a lazily
+                // loaded core module has to be materialized first - a materialized-only
+                // survey could miss a core-body store and report a false positive.
+                MaterializeCoreIfLazy();
                 nw = neverWritten.emplace(gv, InterfaceGlobalNeverWritten(gv)).first;
+            }
             if (!nw->second) continue;
 
             // Fact 2. Witness = entry block, so this asks that the access be reached on every

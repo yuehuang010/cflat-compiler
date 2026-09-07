@@ -147,7 +147,9 @@ llvm::Function* LLVMBackend::FinalizeAutoReturnFunction(
             existing && FunctionHasDefinition(existing))
         {
             // Discard the placeholder; the existing definition wins.
-            if (!oldFn->use_empty())
+            // oldFn is a placeholder this compile just created, so every use of it is
+            // materialized - use_empty() would assert on a lazily loaded core module.
+            if (!oldFn->materialized_use_empty())
                 LogErrorMessage("'{}' return: recursive call in function '{}' is not yet supported",
                                 { "auto", SpellFunctionSymbol(*this, functionName) });
             ForgetFunctionEscapeMemo(oldFn);
@@ -229,7 +231,9 @@ llvm::Function* LLVMBackend::FinalizeAutoReturnFunction(
 
         // Recursion would leave uses behind (call to oldFn from inside its own body).
         // Diagnose explicitly rather than letting LLVM's verifier complain later.
-        if (!oldFn->use_empty())
+        // Materialized-only: oldFn is this compile's placeholder, and a lazy core module
+        // makes the plain use_empty() assert under an assertions-enabled LLVM.
+        if (!oldFn->materialized_use_empty())
             LogErrorMessage("'{}' return: recursive call in function '{}' is not yet supported - declare the return type explicitly",
                             { "auto", SpellFunctionSymbol(*this, functionName) });
 

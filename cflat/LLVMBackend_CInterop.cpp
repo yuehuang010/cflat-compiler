@@ -58,7 +58,9 @@ void LLVMBackend::CheckPoisonedFunctionCalls()
         {
             llvm::Function* f = module->getFunction(name);
             if (f == nullptr) continue;
-            for (auto* u : f->users())
+            // A poisoned function is one this compile emitted, so every call to it is
+            // materialized; users() would assert on a lazily loaded core module (--check).
+            for (auto* u : f->materialized_users())
             {
                 if (llvm::isa<llvm::CallBase>(u))
                 {

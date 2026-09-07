@@ -1282,7 +1282,7 @@ void LLVMBackend::FlushPendingFunctionDeclarations()
             if (provisional == nullptr || wanted == nullptr
                 || provisional->getFunctionType() == wanted)
                 continue;
-            if (FunctionHasDefinition(provisional) || !provisional->use_empty())
+            if (FunctionHasDefinition(provisional) || !provisional->materialized_use_empty())
             {
                 LogError(std::format(
                     "'{}' was used before the by-value type in its signature was complete, so its "
@@ -1322,7 +1322,7 @@ void LLVMBackend::ReportUnresolvedProvisionalDeclarations()
         for (const auto& d : leftovers)
         {
             llvm::Function* fn = module ? module->getFunction(d.MangledName) : nullptr;
-            if (fn == nullptr || (!FunctionHasDefinition(fn) && fn->use_empty())) continue;
+            if (fn == nullptr || (!FunctionHasDefinition(fn) && fn->materialized_use_empty())) continue;
             auto* incomplete = FindIncompleteByValueAggregate(d.Arguments, d.External);
             LogError(std::format(
                 "type '{}' is never completed, so '{}' cannot take it by value. "
@@ -1744,7 +1744,9 @@ llvm::Function* LLVMBackend::CreateFunctionDefinition(const std::string& functio
             // record was completed. Replace that body-less placeholder once the real ABI recipe
             // is available; retaining it would force the definition and every caller onto the
             // wrong C ABI signature.
-            if (!FunctionHasDefinition(fn) && fn->use_empty())
+            // materialized_use_empty: use_empty() asserts while the core bitcode is still lazy
+            // (--check never materializes it); our own protos only ever have materialized uses.
+            if (!FunctionHasDefinition(fn) && fn->materialized_use_empty())
             {
                 fn->setName(mangledName + ".preabi");
                 fn = createFunctionProto(mangledName, functionType);

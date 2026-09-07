@@ -3624,6 +3624,9 @@ bool LLVMBackend::ReachesThreadSpawn()
 
 void LLVMBackend::InjectHeapAuditIntoMain()
 {
+        // Instrumenting main edits the module and surveys uses of the HeapAudit core
+        // functions, both of which need the lazily loaded core bitcode materialized.
+        MaterializeCoreIfLazy();
         llvm::Function* mainFn = module->getFunction("main");
         if (!mainFn || mainFn->isDeclaration())
             return;
