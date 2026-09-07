@@ -145,8 +145,8 @@ std::optional<std::string> MainListener::FoldConstLiteral(
     };
     auto isIntegerType = [](const std::string& name) {
         return name == "char" || name == "short" || name == "int" || name == "long"
-            || name == "i8" || name == "i16" || name == "i32" || name == "i64"
-            || name == "u8" || name == "u16" || name == "u32" || name == "u64"
+            || name == "i8" || name == "i16" || name == "i32" || name == "i64" || name == "i128"
+            || name == "u8" || name == "u16" || name == "u32" || name == "u64" || name == "u128"
             || name == "ulong";
     };
     auto isScalarType = [&](const std::string& name) {
@@ -1782,7 +1782,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             // Integer conversion methods - matched by name so they work on any
                             // integer-typed base (named var, inline literal, call result).
                             static const std::unordered_set<std::string> intConvert = {
-                                "to_i8","to_u8","to_i16","to_u16","to_i32","to_u32","to_i64","to_u64"
+                                "to_i8","to_u8","to_i16","to_u16","to_i32","to_u32","to_i64","to_u64","to_i128","to_u128"
                             };
                             if (intConvert.count(terminal->getText()) > 0) return true;
                             // UFCS: a primitive (integer-like, incl. bool) base calling a free
@@ -3002,8 +3002,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     auto* gep = compiler->builder->CreateStructGEP(sd.StructType, objPtr, (unsigned)i,
                                         field.VariableName + "_ptr");
 
-                                    if ((typeName == "int" || typeName == "i8" || typeName == "i16" || typeName == "i32" || typeName == "i64"
-                                         || typeName == "u8" || typeName == "u16" || typeName == "u32" || typeName == "u64")
+                                        if ((typeName == "int" || typeName == "i8" || typeName == "i16" || typeName == "i32" || typeName == "i64" || typeName == "i128"
+                                         || typeName == "u8" || typeName == "u16" || typeName == "u32" || typeName == "u64" || typeName == "u128")
                                         && !field.Pointer)
                                     {
                                         auto* val = compiler->builder->CreateLoad(compiler->GetType(field), gep);
@@ -3099,8 +3099,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                         auto emptyNV = compiler->MakeStringLiteralNV("");
 
                                         // Dispatch element by type
-                                        if ((elemTypeName == "int" || elemTypeName == "i8" || elemTypeName == "i16" || elemTypeName == "i32" || elemTypeName == "i64"
-                                             || elemTypeName == "u8" || elemTypeName == "u16" || elemTypeName == "u32" || elemTypeName == "u64"))
+                                        if ((elemTypeName == "int" || elemTypeName == "i8" || elemTypeName == "i16" || elemTypeName == "i32" || elemTypeName == "i64" || elemTypeName == "i128"
+                                             || elemTypeName == "u8" || elemTypeName == "u16" || elemTypeName == "u32" || elemTypeName == "u64" || elemTypeName == "u128"))
                                         {
                                             auto* widened = compiler->Upconvert(elemNV, compiler->builder->getInt64Ty(), false);
                                             LLVMBackend::NamedVariable elemIntNV;
@@ -3403,8 +3403,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     auto nameNV = compiler->MakeStringLiteralNV(displayName);
 
                                     // ── int / sized integer ──────────────────────────────────
-                                    if ((typeName == "int" || typeName == "i8" || typeName == "i16" || typeName == "i32" || typeName == "i64"
-                                         || typeName == "u8" || typeName == "u16" || typeName == "u32" || typeName == "u64")
+                                    if ((typeName == "int" || typeName == "i8" || typeName == "i16" || typeName == "i32" || typeName == "i64" || typeName == "i128"
+                                         || typeName == "u8" || typeName == "u16" || typeName == "u32" || typeName == "u64" || typeName == "u128")
                                         && !field.Pointer)
                                     {
                                         auto* intVal = compiler->CallInterfaceMethod(srcA, "IJSON", "getInt", {nameNV});
@@ -3815,8 +3815,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                         {
                             static const std::unordered_set<std::string> kPrimitiveTypes = {
                                 "bool", "void",
-                                "char", "i8", "i16", "i32", "i64",
-                                "u8", "u16", "u32", "u64",
+                                "char", "i8", "i16", "i32", "i64", "i128",
+                                "u8", "u16", "u32", "u64", "u128",
                                 "short", "int", "long", "ulong",
                                 "float", "double",
                             };
@@ -6742,6 +6742,8 @@ std::string MainListener::LLVMTypeToTypeName(llvm::Type* ty, const std::string& 
         if (ty->isIntegerTy(16)) return "i16";
         if (ty->isIntegerTy(32)) return "int";
         if (ty->isIntegerTy(64)) return "i64";
+        if (ty->isIntegerTy(128)) return "i128";
+        if (ty->isIntegerTy(128)) return "i128";
         if (ty->isFloatTy())     return "float";
         if (ty->isDoubleTy())    return "double";
         if (auto* st = llvm::dyn_cast<llvm::StructType>(ty))

@@ -12,7 +12,7 @@ bool ShouldWarnImplicitFieldNarrowing(llvm::Value* value, llvm::Type* destinatio
     unsigned bits = destinationType->getIntegerBitWidth();
     std::string typeName = destinationTypeName;
     bool isUnsigned = typeName == "u8" || typeName == "u16"
-        || typeName == "u32" || typeName == "u64";
+        || typeName == "u32" || typeName == "u64" || typeName == "u128";
     const llvm::APInt& integer = constant->getValue();
     return isUnsigned ? integer.isNegative() || integer.getActiveBits() > bits
                       : !integer.isSignedIntN(bits);
@@ -3438,7 +3438,7 @@ std::vector<std::string> MainListener::ParseGenericTypeParameters(
             {
                 if (ValueParameterTypeSpelling(entry).empty())
                 {
-                    LogErrorContext(entry, "value parameter must use an integral type: char, short, int, long, bool, i8, i16, i32, i64, u8, u16, u32, u64");
+                    LogErrorContext(entry, "value parameter must use an integral type: char, short, int, long, bool, i8, i16, i32, i64, i128, u8, u16, u32, u64, u128");
                     continue;
                 }
                 if (seenPack)

@@ -1073,6 +1073,7 @@ unsigned LLVMBackend::BitfieldStorageBits(const std::string& typeName)
         if (typeName == "short"|| typeName == "i16" || typeName == "u16") return 16;
         if (typeName == "int"  || typeName == "i32" || typeName == "u32") return 32;
         if (typeName == "i64" || typeName == "u64") return 64;
+        if (typeName == "i128" || typeName == "u128") return 128;
         // target-native C `long` / `unsigned long`
         if (typeName == "long" || typeName == "ulong") return longBits_;
         return 0;
@@ -1601,6 +1602,10 @@ llvm::Value* LLVMBackend::CreateConstant(ConstantVariant constantVariant)
         {
             value = builder->getInt64(*v);
         }
+        else if (auto* v = std::get_if<WideIntegerConstant>(&constantVariant))
+        {
+            value = llvm::ConstantInt::get(builder->getInt128Ty(), v->Value);
+        }
         else if (auto* v = std::get_if<float>(&constantVariant))
         {
             value = llvm::ConstantFP::get(builder->getFloatTy(), *v);
@@ -1665,6 +1670,11 @@ llvm::Constant* LLVMBackend::CreateConstant(std::string typeName, std::string in
                 value = builder->getInt32(initValue);
             else
                 value = builder->getInt64(initValue);
+        }
+        else if (typeName == "i128" || typeName == "u128")
+        {
+            llvm::APInt valueBits(128, initialValue.empty() ? "0" : initialValue, 10);
+            value = llvm::ConstantInt::get(builder->getInt128Ty(), valueBits);
         }
         else if (typeName == "float")
         {

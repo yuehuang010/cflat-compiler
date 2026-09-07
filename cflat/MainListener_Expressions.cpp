@@ -315,6 +315,7 @@ LLVMBackend::NamedVariable MainListener::ParseAssignmentExpressionNamed(CFlatPar
                         else if (bits == 16) result.TypeAndValue.TypeName = isUnsigned ? "u16" : "i16";
                         else if (bits == 32) result.TypeAndValue.TypeName = isUnsigned ? "u32" : "int";
                         else if (bits == 64) result.TypeAndValue.TypeName = isUnsigned ? "u64" : "i64";
+                        else if (bits == 128) result.TypeAndValue.TypeName = isUnsigned ? "u128" : "i128";
                     }
                     // A '?:' join of two interface values yields a phi/select with no NamedVariable
                     // of its own to carry IsInterface/TypeName - it is a bare fat {vtable,data}
@@ -2502,6 +2503,13 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                         resetArg.TypeAndValue.IsAlias = false;
                     }
                     if (resetArg.TypeAndValue.TypeName.empty())
+                    {
+                        resetArg.TypeAndValue.TypeName = MangledGenericArgument(
+                            *compiler, namedVar.TypeAndValue.TypeName);
+                        resetArg.TypeAndValue.Pointer = true;
+                        resetArg.TypeAndValue.PointerDepth = 0;
+                    }
+                    if (nullSource)
                     {
                         resetArg.TypeAndValue.TypeName = MangledGenericArgument(
                             *compiler, namedVar.TypeAndValue.TypeName);
@@ -9406,7 +9414,8 @@ LLVMBackend::NamedVariable MainListener::ParseUnaryExpression(CFlatParser::Unary
                     {
                         namedVar.Primary = compiler->CreateNeg(newValue);
                     }
-                    else if (auto* ci = llvm::dyn_cast<llvm::ConstantInt>(newValue))
+                    else if (auto* ci = llvm::dyn_cast<llvm::ConstantInt>(newValue);
+                             ci != nullptr && ci->getBitWidth() <= 64)
                     {
                         int64_t neg = -(int64_t)ci->getSExtValue();
                         if (neg >= std::numeric_limits<int8_t>::min() && neg <= std::numeric_limits<int8_t>::max())

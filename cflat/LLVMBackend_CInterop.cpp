@@ -749,6 +749,7 @@ bool LLVMBackend::MapCTypeToTypeAndValueImpl(std::string ctype, TypeAndValue& ou
                 { "unsigned", "u32" }, { "unsigned int", "u32" },
                 { "long long", "i64" }, { "long long int", "i64" }, { "signed long long", "i64" },
                 { "unsigned long long", "u64" }, { "unsigned long long int", "u64" },
+                { "__int128", "i128" }, { "unsigned __int128", "u128" },
                 { "float", "float" }, { "double", "double" }, { "long double", "double" },
             };
             // C `long` is the one scalar whose width is target-dependent: Windows is LLP64

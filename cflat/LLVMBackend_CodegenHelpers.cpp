@@ -407,10 +407,12 @@ llvm::DIType* LLVMBackend::GetDIType(const TypeAndValue& tv)
         else if (tv.TypeName == "i16")    basic = diBuilder->createBasicType("i16", 16, DW_ATE_signed);
         else if (tv.TypeName == "i32")    basic = diBuilder->createBasicType("i32", 32, DW_ATE_signed);
         else if (tv.TypeName == "i64")    basic = diBuilder->createBasicType("i64", 64, DW_ATE_signed);
+        else if (tv.TypeName == "i128")   basic = diBuilder->createBasicType("i128", 128, DW_ATE_signed);
         else if (tv.TypeName == "u8")     basic = diBuilder->createBasicType("u8", 8, DW_ATE_unsigned);
         else if (tv.TypeName == "u16")    basic = diBuilder->createBasicType("u16", 16, DW_ATE_unsigned);
         else if (tv.TypeName == "u32")    basic = diBuilder->createBasicType("u32", 32, DW_ATE_unsigned);
         else if (tv.TypeName == "u64")    basic = diBuilder->createBasicType("u64", 64, DW_ATE_unsigned);
+        else if (tv.TypeName == "u128")   basic = diBuilder->createBasicType("u128", 128, DW_ATE_unsigned);
         else if (tv.TypeName == "void")   basic = diBuilder->createUnspecifiedType("void");
 
         if (basic)
@@ -1970,6 +1972,7 @@ llvm::Value* LLVMBackend::CreateIntegerConvert(const std::string& methodName, ll
             {"to_i16", {16, true}},  {"to_u16", {16, false}},
             {"to_i32", {32, true}},  {"to_u32", {32, false}},
             {"to_i64", {64, true}},  {"to_u64", {64, false}},
+            {"to_i128", {128, true}}, {"to_u128", {128, false}},
         };
         auto it = table.find(methodName);
         if (it == table.end()) return nullptr;

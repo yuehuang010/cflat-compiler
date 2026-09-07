@@ -980,6 +980,8 @@ public:
                 return 32;
             if (t == "i64" || t == "u64")
                 return 64;
+            if (t == "i128" || t == "u128")
+                return 128;
             // `long`/`ulong` are target-native: 32 bits on Windows/LLP64, 64 on LP64.
             if (t == "long" || t == "ulong")
                 return longBits_;
@@ -996,6 +998,7 @@ public:
             if (t == "u16") return 16;
             if (t == "u32") return 32;
             if (t == "u64") return 64;
+            if (t == "u128") return 128;
             // C's `unsigned long`: target-native width (u32 on Windows/LLP64, u64 on LP64).
             if (t == "ulong") return longBits_;
 
@@ -1776,8 +1779,15 @@ public:
         std::vector<TypeAndValue> Parameters; // excludes the implicit 'this' pointer
     };
 
+    struct WideIntegerConstant
+    {
+        llvm::APInt Value;
+        bool IsUnsigned = false;
+    };
+
     using ConstantVariant = std::variant<bool, char, unsigned char, short, unsigned short,
-                                         int, unsigned int, int64_t, uint64_t, float, double>;
+                                         int, unsigned int, int64_t, uint64_t,
+                                         WideIntegerConstant, float, double>;
 
     struct ReturnBlockEntry
     {

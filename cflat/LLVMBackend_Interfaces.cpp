@@ -185,8 +185,8 @@ bool LLVMBackend::IsPrimitiveTypeName(const std::string& name)
         static const std::unordered_set<std::string> primitives = {
             "int", "char", "short", "long", "ulong", "bool", "void",
             "float", "double",
-            "i8", "i16", "i32", "i64",
-            "u8", "u16", "u32", "u64",
+            "i8", "i16", "i32", "i64", "i128",
+            "u8", "u16", "u32", "u64", "u128",
         };
         return primitives.count(name) > 0;
     }

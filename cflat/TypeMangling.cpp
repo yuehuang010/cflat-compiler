@@ -20,6 +20,7 @@ struct TypeManglingAccess
         if (base == "short" || base == "int" || base == "long"
             || base == "i8" || base == "u8" || base == "i16" || base == "u16"
             || base == "i32" || base == "u32" || base == "i64" || base == "u64"
+            || base == "i128" || base == "u128"
             || base == "float" || base == "double" || base == "bool"
             || base == "char" || base == "string" || base == "void")
             return;

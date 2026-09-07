@@ -104,6 +104,51 @@ move string toString(u64 self)
     return _strOwned(move buf, len);
 }
 
+// Convert a signed 128-bit integer without passing it through a C varargs ABI.
+move string toString(i128 self)
+{
+    i8[130] tmp;
+    i32 pos = 130;
+    bool neg = self < (i128)0;
+    u128 mag = neg ? (u128)(-(self + (i128)1)) + (u128)1 : (u128)self;
+    bool first = true;
+    while (mag > (u128)0 || first)
+    {
+        first = false;
+        pos = pos - 1;
+        tmp[pos] = (i8)((i32)'0' + (i32)(mag % (u128)10));
+        mag = mag / (u128)10;
+    }
+    if (neg) { pos = pos - 1; tmp[pos] = '-'; }
+    i32 len = 130 - pos;
+    i8* buf = new i8[len + 1];
+    i32 i = 0;
+    while (i < len) { buf[i] = tmp[pos + i]; i = i + 1; }
+    buf[len] = (i8)0;
+    return _strOwned(move buf, len);
+}
+
+// Convert an unsigned 128-bit integer without passing it through a C varargs ABI.
+move string toString(u128 self)
+{
+    i8[128] tmp;
+    i32 pos = 128;
+    bool first = true;
+    while (self > (u128)0 || first)
+    {
+        first = false;
+        pos = pos - 1;
+        tmp[pos] = (i8)((i32)'0' + (i32)(self % (u128)10));
+        self = self / (u128)10;
+    }
+    i32 len = 128 - pos;
+    i8* buf = new i8[len + 1];
+    i32 i = 0;
+    while (i < len) { buf[i] = tmp[pos + i]; i = i + 1; }
+    buf[len] = (i8)0;
+    return _strOwned(move buf, len);
+}
+
 // Convert an 8-bit integer to its decimal string. Allocates; caller owns it.
 move string toString(i8 self)
 {
@@ -239,6 +284,16 @@ move string operator string(i64 n)
 
 // u64 -> string; interpolation hook.
 move string operator string(u64 n)
+{
+    return toString(n);
+}
+
+move string operator string(i128 n)
+{
+    return toString(n);
+}
+
+move string operator string(u128 n)
 {
     return toString(n);
 }
@@ -429,6 +484,34 @@ int toInt(string self)
 i64 toLong(string self)
 {
     return atoll(self._ptr);
+}
+
+// Parse a base-10 signed 128-bit integer without a C runtime call.
+i128 parseI128(string self)
+{
+    i32 i = 0;
+    bool neg = false;
+    if (self.charAt(i) == (i8)45) { neg = true; i = i + 1; }
+    i128 result = 0;
+    while (i < self.length())
+    {
+        result = result * (i128)10 + (i128)(self.charAt(i) - (i8)48);
+        i = i + 1;
+    }
+    return neg ? -result : result;
+}
+
+// Parse a base-10 unsigned 128-bit integer without a C runtime call.
+u128 parseU128(string self)
+{
+    i32 i = 0;
+    u128 result = 0;
+    while (i < self.length())
+    {
+        result = result * (u128)10 + (u128)(self.charAt(i) - (i8)48);
+        i = i + 1;
+    }
+    return result;
 }
 
 // Parse a floating-point value.

@@ -3453,6 +3453,7 @@ void MainListener::GenerateDefaultParamOverloads(
                     else if (bits == 16) namedVar.TypeAndValue.TypeName = "u16";
                     else if (bits == 32) namedVar.TypeAndValue.TypeName = "u32";
                     else if (bits == 64) namedVar.TypeAndValue.TypeName = "u64";
+                    else if (bits == 128) namedVar.TypeAndValue.TypeName = "u128";
                 }
                 callArgs.push_back(namedVar);
             }

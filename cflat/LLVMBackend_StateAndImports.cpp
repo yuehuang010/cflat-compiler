@@ -67,6 +67,7 @@ LLVMBackend::TypeAndValue LLVMBackend::LlvmTypeToTypeAndValue(llvm::Type* t) con
         if (t->isIntegerTy(16))         { tv.TypeName = "i16";  return tv; }
         if (t->isIntegerTy(32))         { tv.TypeName = "int";  return tv; }
         if (t->isIntegerTy(64))         { tv.TypeName = "i64";  return tv; }
+        if (t->isIntegerTy(128))        { tv.TypeName = "i128"; return tv; }
         if (t->isFloatTy())             { tv.TypeName = "float";  return tv; }
         if (t->isDoubleTy())            { tv.TypeName = "double"; return tv; }
         if (t->isPointerTy())

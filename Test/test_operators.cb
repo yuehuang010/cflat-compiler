@@ -231,6 +231,53 @@ double addOneDouble(double x) { return x + 1.0; }
 bool flipBool(bool x) { return !x; }
 string charLabel(char x) { return "char"; }
 
+int i128FeatureLegs()
+{
+    int passed = 0;
+    i128 signedValue = 170141183460469231731687303715884105727;
+    u128 unsignedValue = 340282366920938463463374607431768211455;
+    passed += Test("i128 declaration and assignment", signedValue == (i128)170141183460469231731687303715884105727, true);
+    passed += Test("wide integer literal", signedValue > (i128)18446744073709551616, true);
+    i128 nearSigned = (i128)18446744073709551616 + 5;
+    passed += Test("i128 add", nearSigned + 3 == (i128)18446744073709551624, true);
+    passed += Test("i128 sub", nearSigned - 3 == (i128)18446744073709551618, true);
+    passed += Test("i128 mul", nearSigned * 3 == (i128)55340232221128654863, true);
+    passed += Test("i128 div", nearSigned / 3 == (i128)6148914691236517207, true);
+    passed += Test("i128 rem", nearSigned % 3 == (i128)0, true);
+    u128 nearUnsigned = (u128)18446744073709551616 + 5;
+    passed += Test("u128 add", nearUnsigned + 3 == (u128)18446744073709551624, true);
+    passed += Test("u128 sub", nearUnsigned - 3 == (u128)18446744073709551618, true);
+    passed += Test("u128 mul", nearUnsigned * 3 == (u128)55340232221128654863, true);
+    passed += Test("u128 div", nearUnsigned / 3 == (u128)6148914691236517207, true);
+    passed += Test("u128 rem", nearUnsigned % 3 == (u128)0, true);
+    passed += Test("u128 max wraps", unsignedValue + (u128)1 == (u128)0, true);
+    passed += Test("i128 shift by 64", ((i128)1 << 64) == (i128)18446744073709551616, true);
+    passed += Test("u128 shift by 64", ((u128)1 << 64) == (u128)18446744073709551616, true);
+    passed += Test("i128 signed boundary", (i128)-1 < (i128)1, true);
+    passed += Test("u128 unsigned boundary", unsignedValue > (u128)0, true);
+    int narrowInt = 7;
+    i64 narrowI64 = 8;
+    u64 narrowU64 = 9;
+    passed += Test("widen int to i128", (i128)narrowInt == (i128)7, true);
+    passed += Test("widen i64 to i128", (i128)narrowI64 == (i128)8, true);
+    passed += Test("widen u64 to u128", (u128)narrowU64 == (u128)9, true);
+    i64 explicitNarrow = (i64)nearSigned;
+    passed += Test("explicit i128 narrowing", explicitNarrow == (i64)5, true);
+    i128 floatSigned = (i128)(double)123456789012345;
+    u128 floatUnsigned = (u128)(double)123456789012345;
+    passed += Test("i128 float round trip", floatSigned == (i128)123456789012345, true);
+    passed += Test("u128 float round trip", floatUnsigned == (u128)123456789012345, true);
+    passed += Test("i128 toString zero", ((i128)0).toString(), "0");
+    passed += Test("i128 toString negative", ((i128)-1).toString(), "-1");
+    passed += Test("i128 toString min", ((i128)-170141183460469231731687303715884105728).toString(), "-170141183460469231731687303715884105728");
+    passed += Test("u128 toString max", unsignedValue.toString(), "340282366920938463463374607431768211455");
+    passed += Test("sizeof i128", (int)sizeof(i128), 16);
+    list<i128> genericValues = default;
+    genericValues.add((i128)42);
+    passed += Test("generic list<i128> add/get", genericValues.get(0) == (i128)42, true);
+    return passed;
+}
+
 // ── Main ─────────────────────────────────────────────────────────────────────
 
 extern int main()
@@ -660,12 +707,13 @@ extern int main()
     int autoNarrowPassed = autoNarrowMixedSignednessLegs();
     int joinAcceptPassed = stringLiteralJoinAcceptLegs();
     int narrowPromoPassed = narrowUnaryAndTernaryPromotionLegs();
+    int i128Passed = i128FeatureLegs();
 
     return (terPassed == 19 && ptrOpPassed == 8 && uPassed == 3
         && unsignedLiteralPassed == 8 && unsignedAcceptPassed == 7
         && chainPassed == 11 && softPassed == 1 && promoPassed == 11
         && signednessPassed == 38 && autoNarrowPassed == 4 && joinAcceptPassed == 5
-        && narrowPromoPassed == 46) ? 0 : 1;
+        && narrowPromoPassed == 46 && i128Passed == 29) ? 0 : 1;
 }
 
 // C integer promotion for equal-width sub-int operands, plus the two literal-unsignedness

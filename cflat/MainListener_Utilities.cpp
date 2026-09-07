@@ -238,16 +238,49 @@ LLVMBackend::ConstantVariant MainListener::ParseNumberConstant(std::string rawNu
             return dval;
         }
 
-        // Integer handling. Support hex/octal/decimal by using base 0.
+        // Integer handling. Support hex/octal/decimal by using base 0. Values beyond uint64
+        // use APInt so the source spelling is preserved instead of overflowing stoull.
         unsigned long long uval = 0;
+        bool parsedU64 = true;
         try
         {
             if (numberPart.empty())
                 uval = 0;
             else
-                uval = std::stoull(numberPart, nullptr, 0);
+            {
+                size_t consumed = 0;
+                uval = std::stoull(numberPart, &consumed, 0);
+                parsedU64 = consumed == numberPart.size();
+            }
         }
-        catch (...) { uval = 0; }
+        catch (...) { parsedU64 = false; }
+
+        if (!parsedU64)
+        {
+            std::string digits = numberPart;
+            unsigned radix = 10;
+            if (digits.size() >= 2 && digits[0] == '0'
+                && (digits[1] == 'x' || digits[1] == 'X'))
+            {
+                radix = 16;
+                digits = digits.substr(2);
+            }
+            else if (digits.size() >= 2 && digits[0] == '0'
+                     && (digits[1] == 'b' || digits[1] == 'B'))
+            {
+                radix = 2;
+                digits = digits.substr(2);
+            }
+            else if (digits.size() > 1 && digits[0] == '0')
+            {
+                radix = 8;
+                digits = digits.substr(1);
+            }
+            llvm::APInt wide(128, digits.empty() ? "0" : digits, radix);
+            if (negative) wide = -wide;
+            return LLVMBackend::WideIntegerConstant{
+                wide, !negative && wide.ugt(llvm::APInt::getSignedMaxValue(128)) };
+        }
 
         // If a long/long long suffix is present, prefer 64-bit result.
         if (lCount >= 1)
@@ -304,8 +337,12 @@ LLVMBackend::ConstantVariant MainListener::ParseNumberConstant(std::string rawNu
 
 LLVMBackend::TypeAndValue MainListener::ParseLiteralTypeAndValue(const std::string& rawNumber) {
         LLVMBackend::TypeAndValue type;
+        if (rawNumber == "nullptr" || rawNumber == "true" || rawNumber == "false")
+            return type;
         auto constant = ParseNumberConstant(rawNumber);
-        if (std::get_if<unsigned char>(&constant) != nullptr)
+        if (std::get_if<LLVMBackend::WideIntegerConstant>(&constant) != nullptr)
+            type.TypeName = std::get<LLVMBackend::WideIntegerConstant>(constant).IsUnsigned ? "u128" : "i128";
+        else if (std::get_if<unsigned char>(&constant) != nullptr)
             type.TypeName = "u8";
         else if (std::get_if<unsigned short>(&constant) != nullptr)
             type.TypeName = "u16";

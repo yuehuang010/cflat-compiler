@@ -132,7 +132,7 @@ private:
         const std::string& source = sourceLines_[line - 1];
         static constexpr const char* typeWords[] = {
             "auto", "bool", "char", "double", "float", "int", "long", "short", "string",
-            "signed", "unsigned", "void", "i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64"
+            "signed", "unsigned", "void", "i8", "i16", "i32", "i64", "i128", "u8", "u16", "u32", "u64", "u128"
         };
         auto isTypeWord = [&](const std::string& candidate) {
             for (const char* typeWord : typeWords)

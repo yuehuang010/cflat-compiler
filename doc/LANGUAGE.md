@@ -96,7 +96,8 @@ Standard C primitives are all supported: `int`, `char`, `short`, `long`, `float`
 `long` follows the native C ABI of the **target** platform, exactly as a C compiler would:
 32-bit on Windows (LLP64) and on 32-bit targets, 64-bit on macOS/Linux (LP64). `ulong` is its
 unsigned counterpart. `int` is always 32-bit and `long long` is always 64-bit on every target.
-Use `i64`/`u64` when a fixed 64-bit width is wanted regardless of target; use `long`/`ulong`
+Use `i64`/`u64` when a fixed 64-bit width is wanted regardless of target, `i128`/`u128` for a
+fixed 128-bit width (C's `__int128` / `unsigned __int128` bind to them); use `long`/`ulong`
 only to match a C API that is declared with C's `long` (for example `strtol`, `labs`).
 
 ### Explicit-Width Integers
@@ -109,6 +110,7 @@ CFlat provides fixed-width integer types as first-class names:
 | `i16`  | `u16`    | 16-bit |
 | `i32`  | `u32`    | 32-bit |
 | `i64`  | `u64`    | 64-bit |
+| `i128` | `u128`   | 128-bit |
 
 ```c
 i8  s8    = 100;
@@ -117,6 +119,29 @@ i64 bigNum = 200000;
 ```
 
 `i32` and `int` are the same type and are freely interchangeable.
+
+**128-bit integers.** `i128` and `u128` are ordinary fixed-width integers scaled to 128
+bits: the same arithmetic, comparison, bitwise, shift, and compound-assignment operators as
+`i64`/`u64`, the same implicit widening from every narrower integer, and the same rule that
+narrowing back needs an explicit cast. Casts between `i128` and `u128`, to and from `float`
+and `double`, and to and from pointers follow the `i64` rules. `sizeof(i128)` is 16. They are
+legal generic type arguments (`list<i128>`).
+
+```c
+i128 wide  = 170141183460469231731687303715884105727;   // literal above 64 bits
+u128 umax  = 340282366920938463463374607431768211455;
+i128 n     = (i128)18446744073709551616 + 5;             // (2^64 + 5)
+u128 wrap  = umax + (u128)1;                             // 0: wraps like every fixed width
+i128 sh    = (i128)1 << 64;                              // shifts by 64 and more are meaningful
+string s   = wide.toString();                            // decimal, via CFlat division by 10
+i128 back  = s.parseI128();                              // parseU128 for u128
+i64  low   = (i64)n;                                     // explicit narrowing only
+```
+
+Formatting never goes through C varargs: a 128-bit value has no portable `printf`
+conversion, so `toString()` and the `string` conversion operator do the decimal
+conversion in CFlat. Pass an `i128` to a variadic C function only after converting it
+yourself.
 
 **Mixed-signedness arithmetic follows C's usual arithmetic conversions, with one deliberate
 difference in the RESULT width.** An `i8`/`i16`/`u8`/`u16` operand is promoted to a signed
@@ -792,7 +817,7 @@ Value arguments are constant expressions that must fold at compile time. The clo
 generic argument list, so comparisons must be parenthesized, as in `Buf<int, (A > B)>`. The folded
 value determines the specialization identity: `Buf<int, CAP * 2>` and `Buf<int, 16>` are the same
 instantiation when `CAP` is `8`. Value parameters use integral primitives only: `char`, `short`,
-`int`, `long`, `bool`, `i8`, `i16`, `i32`, `i64`, `u8`, `u16`, `u32`, `u64`.
+`int`, `long`, `bool`, `i8`, `i16`, `i32`, `i64`, `i128`, `u8`, `u16`, `u32`, `u64`, `u128`.
 
 A value argument may name a `-D` define or a file-scope `const` integer global as well as a
 literal, so `Buf<int, CAP>` and `Buf<int, LANES * 2>` both work. A `const` integer declared inside
@@ -3007,8 +3032,9 @@ double d   = 1e3;    // 1000.0
 holds its value exactly - the literal carries no width of its own, so context (the
 target type, an overload, an enclosing expression) can still widen it:
 
-- **Integers**: `5` is `i8`, `300` is `i16`, `100000` is `i32`, and a value past `i32`
-  is `i64`. Widening to a larger type is implicit; narrowing is not.
+- **Integers**: `5` is `i8`, `300` is `i16`, `100000` is `i32`, a value past `i32`
+  is `i64`, and a value past `i64` (decimal, hex, or binary) is `i128`. Widening to a
+  larger type is implicit; narrowing is not.
 - **Overload resolution sees the inferred type.** In a set that overloads on integer
   width, `f(5)` picks `f(i8)` over `f(i32)` because `5` is typed `i8` - unlike C, where
   an unsuffixed literal is always `int`. This is by design; use a suffix (`5u`, `123L`)

@@ -1,0 +1,7 @@
+int takeI64(i64 value) { return (int)value; }
+function<int(i64)> takeI64Function = takeI64;
+
+expect_error("cannot pass a 128-bit integer to parameter 1 of a call through a function value") {
+    i128 wide = 170141183460469231731687303715884105727;
+    int result = takeI64Function(wide);
+}

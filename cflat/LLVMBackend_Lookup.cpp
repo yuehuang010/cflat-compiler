@@ -57,7 +57,7 @@ bool LLVMBackend::IsKnownTypeName(const std::string& name) const
 {
         static const std::unordered_set<std::string> scalars = {
             "void", "char", "i8", "u8", "short", "i16", "u16", "int", "i32", "u32",
-            "long", "ulong", "i64", "u64", "float", "double", "bool", "va_list", "auto" };
+            "long", "ulong", "i64", "u64", "i128", "u128", "float", "double", "bool", "va_list", "auto" };
         if (scalars.count(name)) return true;
         std::string resolved = ResolveTypeAlias(name);
         return enumBackingTypes.count(resolved) > 0 || resolved != name
@@ -297,6 +297,7 @@ llvm::Type* LLVMBackend::GetType(const LLVMBackend::TypeAndValue& typeAndValue, 
         else if (resolvedTypeName == "short" || resolvedTypeName == "i16" || resolvedTypeName == "u16") { type = builder->getInt16Ty(); }
         else if (resolvedTypeName == "int" || resolvedTypeName == "i32" || resolvedTypeName == "u32") { type = builder->getInt32Ty(); }
         else if (resolvedTypeName == "i64" || resolvedTypeName == "u64") { type = builder->getInt64Ty(); }
+        else if (resolvedTypeName == "i128" || resolvedTypeName == "u128") { type = builder->getInt128Ty(); }
         // `long`/`ulong` are the target's native C long: i32 on Windows (LLP64), i64 on LP64.
         else if (resolvedTypeName == "long" || resolvedTypeName == "ulong")
             { type = (longBits_ == 32) ? builder->getInt32Ty() : builder->getInt64Ty(); }
@@ -410,7 +411,7 @@ llvm::Type* LLVMBackend::GetType(const LLVMBackend::TypeAndValue& typeAndValue, 
             {
                 LogErrorMessage("simd element type must be a numeric scalar "
                     "({}, {}, {}, {}) or {} for a mask, got '{}'",
-                    { "i8..i64", "u8..u64", "float", "double", "bool",
+                    { "i8..i128", "u8..u128", "float", "double", "bool",
                       SpellType(*this, TypeAndValue{ .TypeName = resolvedTypeName }) });
                 return type;
             }
