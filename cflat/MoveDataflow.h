@@ -307,14 +307,8 @@ namespace nulldf
     // A control-dependence edge is the (branch block, chosen successor) pair.
     using CdEdge = std::pair<llvm::BasicBlock*, llvm::BasicBlock*>;
 
-    struct CdEdgeHash
-    {
-        size_t operator()(const CdEdge& e) const noexcept
-        {
-            return std::hash<const void*>{}(e.first) * 31u + std::hash<const void*>{}(e.second);
-        }
-    };
-    using CdSet = std::unordered_set<CdEdge, CdEdgeHash>;
+    // Kept sorted and unique by SortUnique so containment is a linear merge (see IsSubset).
+    using CdSet = std::vector<CdEdge>;
 
     // Blocks still pending as move witnesses for one name, keyed by the move's block.
     using WitnessSet = std::unordered_set<llvm::BasicBlock*>;
@@ -372,10 +366,11 @@ namespace nulldf
 
     // Post-dominator sets over the reachable sub-CFG, by iterative intersection.
     //
-    // Complexity is O(B^2) in blocks (a block set per block, plus the control-dependence
-    // closure that consumes it). That is fine here only because AnalyzeFunction bails on the
-    // 'haveSet' fast path first, so a function containing no explicit 'move' costs nothing at
-    // all; a generated function with thousands of blocks AND a move would be measurable.
+    // Complexity is O(B^2) in blocks worst case (a block set per block), but the sets are only
+    // as large as the nesting depth in practice and start from an implicit TOP (absent entry)
+    // rather than a materialized all-blocks set. That is fine here only because AnalyzeFunction
+    // bails on the 'haveSet' fast path first, so a function containing no explicit 'move' costs
+    // nothing at all.
     //
     // Three shapes are treated as ends of the program rather than fall-throughs, so that
     // nothing spuriously post-dominates code they guard: a terminator with no successors, a
@@ -411,12 +406,10 @@ namespace nulldf
             }
         }
 
-        std::unordered_set<llvm::BasicBlock*> all(blocks.begin(), blocks.end());
+        // Seed only the fixed points; every other block starts at TOP (no entry) and a TOP
+        // successor is skipped in the meet, which is the standard iterative-dataflow shortcut.
         for (llvm::BasicBlock* bb : blocks)
-        {
             if (terminal.count(bb) || !reachesExit.count(bb)) pd[bb] = { bb };
-            else pd[bb] = all;
-        }
 
         bool changed = true;
         while (changed)
@@ -431,73 +424,119 @@ namespace nulldf
                 for (llvm::BasicBlock* s : llvm::successors(bb))
                 {
                     if (!rpo.count(s)) continue;
-                    if (first) { meet = pd[s]; first = false; continue; }
+                    auto sit = pd.find(s);
+                    if (sit == pd.end()) continue; // TOP
+                    if (first) { meet = sit->second; first = false; continue; }
                     for (auto mit = meet.begin(); mit != meet.end(); )
-                        mit = pd[s].count(*mit) ? std::next(mit) : meet.erase(mit);
+                        mit = sit->second.count(*mit) ? std::next(mit) : meet.erase(mit);
                 }
+                if (first) continue; // every successor still TOP
                 meet.insert(bb);
-                if (meet != pd[bb]) { pd[bb] = std::move(meet); changed = true; }
+                auto cur = pd.find(bb);
+                if (cur == pd.end() || meet != cur->second) { pd[bb] = std::move(meet); changed = true; }
             }
         }
         return pd;
     }
 
-    // Transitive control-dependence set of every reachable block. CD(X) holds edge (B -> S)
-    // when X post-dominates S but not B; the closure then folds in CD*(B) for each such B, so a
-    // block nested two levels deep carries both enclosing decisions (this is what makes the
-    // loop-carried case work - the loop body is control-dependent on the loop condition).
-    inline std::unordered_map<llvm::BasicBlock*, CdSet>
-    ComputeControlDependence(const std::vector<llvm::BasicBlock*>& blocks,
-                             const std::unordered_map<llvm::BasicBlock*, int>& rpo,
-                             const NoReturnSet* proven)
+    inline void SortUnique(CdSet& s)
     {
-        auto pd = ComputePostDominators(blocks, rpo, proven);
-        auto postDominates = [&](llvm::BasicBlock* p, llvm::BasicBlock* b)
-            { auto it = pd.find(b); return it != pd.end() && it->second.count(p) > 0; };
-
-        std::vector<CdEdge> branchEdges;
-        for (llvm::BasicBlock* bb : blocks)
-        {
-            size_t n = 0;
-            for (llvm::BasicBlock* s : llvm::successors(bb)) { (void)s; n++; }
-            if (n < 2) continue;
-            std::unordered_set<llvm::BasicBlock*> seen;
-            for (llvm::BasicBlock* s : llvm::successors(bb))
-                if (rpo.count(s) && seen.insert(s).second) branchEdges.push_back({ bb, s });
-        }
-
-        std::unordered_map<llvm::BasicBlock*, CdSet> direct;
-        for (llvm::BasicBlock* x : blocks)
-        {
-            CdSet cd;
-            for (const CdEdge& e : branchEdges)
-                if (postDominates(x, e.second) && !postDominates(x, e.first))
-                    cd.insert(e);
-            direct[x] = std::move(cd);
-        }
-
-        // Closure: an edge's own branch block carries its enclosing decisions too.
-        std::unordered_map<llvm::BasicBlock*, CdSet> closure = direct;
-        bool changed = true;
-        while (changed)
-        {
-            changed = false;
-            for (llvm::BasicBlock* x : blocks)
-            {
-                std::vector<llvm::BasicBlock*> branches;
-                for (const CdEdge& e : closure[x]) branches.push_back(e.first);
-                for (llvm::BasicBlock* b : branches)
-                    for (const CdEdge& e : closure[b])
-                        if (closure[x].insert(e).second) changed = true;
-            }
-        }
-        return closure;
+        std::sort(s.begin(), s.end());
+        s.erase(std::unique(s.begin(), s.end()), s.end());
     }
 
+    // Control dependence of every reachable block, with the transitive closure computed LAZILY.
+    //
+    // Direct(X) holds edge (B -> S) when X post-dominates S but not B. Closure(X) folds in
+    // Closure(B) for each such B, so a block nested two levels deep carries both enclosing
+    // decisions (this is what makes the loop-carried case work - the loop body is
+    // control-dependent on the loop condition).
+    //
+    // Only event blocks are ever compared, but a long chain of `if (c) return;` guards makes
+    // block i transitively dependent on all i preceding guard edges; materializing and
+    // fixpointing that for every block was O(B^3) (2000 guards = minutes). Closure(X) instead
+    // walks the "block -> branch block of each direct edge" graph once with a visited set,
+    // concatenates the direct sets it meets, and memoizes the finished result; a cycle (a loop
+    // header depends on its own back-edge branch) is absorbed by the visited set, and a memoized
+    // block on the walk is taken whole because its closure is already complete.
+    class ControlDependence
+    {
+    public:
+        ControlDependence() = default;
+
+        ControlDependence(const std::vector<llvm::BasicBlock*>& blocks,
+                          const std::unordered_map<llvm::BasicBlock*, int>& rpo,
+                          const NoReturnSet* proven)
+        {
+            auto pd = ComputePostDominators(blocks, rpo, proven);
+            for (llvm::BasicBlock* bb : blocks)
+            {
+                size_t n = 0;
+                for (llvm::BasicBlock* s : llvm::successors(bb)) { (void)s; n++; }
+                if (n < 2) continue;
+                std::unordered_set<llvm::BasicBlock*> seen;
+                for (llvm::BasicBlock* s : llvm::successors(bb))
+                {
+                    if (!rpo.count(s) || !seen.insert(s).second) continue;
+                    // Every X with X pdom S and not X pdom B is exactly pd[S] minus pd[B].
+                    auto sit = pd.find(s);
+                    if (sit == pd.end()) continue;
+                    auto bit = pd.find(bb);
+                    for (llvm::BasicBlock* x : sit->second)
+                        if (bit == pd.end() || !bit->second.count(x))
+                            direct_[x].push_back({ bb, s });
+                }
+            }
+            for (auto& [x, set] : direct_) SortUnique(set);
+        }
+
+        const CdSet& Direct(llvm::BasicBlock* x) const
+        {
+            auto it = direct_.find(x);
+            return it == direct_.end() ? empty_ : it->second;
+        }
+
+        const CdSet& Closure(llvm::BasicBlock* x)
+        {
+            if (auto it = closure_.find(x); it != closure_.end()) return it->second;
+            CdSet out;
+            std::unordered_set<llvm::BasicBlock*> visited{ x };
+            std::vector<llvm::BasicBlock*> work{ x };
+            while (!work.empty())
+            {
+                llvm::BasicBlock* cur = work.back();
+                work.pop_back();
+                if (cur != x)
+                    if (auto it = closure_.find(cur); it != closure_.end())
+                    {
+                        out.insert(out.end(), it->second.begin(), it->second.end());
+                        continue;
+                    }
+                const CdSet& d = Direct(cur);
+                out.insert(out.end(), d.begin(), d.end());
+                for (const CdEdge& e : d)
+                    if (visited.insert(e.first).second) work.push_back(e.first);
+            }
+            SortUnique(out);
+            return closure_[x] = std::move(out);
+        }
+
+    private:
+        std::unordered_map<llvm::BasicBlock*, CdSet> direct_;
+        std::unordered_map<llvm::BasicBlock*, CdSet> closure_;
+        static inline const CdSet empty_{};
+    };
+
+    // Both sides sorted and unique (SortUnique), so containment is one linear merge.
     inline bool IsSubset(const CdSet& small, const CdSet& big)
     {
         if (small.size() > big.size()) return false;
-        for (const CdEdge& e : small) if (!big.count(e)) return false;
+        auto b = big.begin();
+        for (const CdEdge& e : small)
+        {
+            while (b != big.end() && *b < e) ++b;
+            if (b == big.end() || *b != e) return false;
+        }
         return true;
     }
 
@@ -554,7 +593,7 @@ namespace nulldf
         std::sort(blocks.begin(), blocks.end(),
                   [&](llvm::BasicBlock* a, llvm::BasicBlock* b) { return rpo[a] < rpo[b]; });
 
-        auto cd = ComputeControlDependence(blocks, rpo, proven);
+        ControlDependence cd(blocks, rpo, proven);
 
         std::unordered_map<llvm::BasicBlock*, NullState> blockOut;
         for (llvm::BasicBlock* bb : blocks) blockOut[bb];
@@ -594,7 +633,7 @@ namespace nulldf
                 if (wit == running.end()) continue;
                 bool guarded = true;
                 for (llvm::BasicBlock* m : wit->second)
-                    if (IsSubset(cd[bb], cd[m])) { guarded = false; break; }
+                    if (IsSubset(cd.Closure(bb), cd.Closure(m))) { guarded = false; break; }
                 if (guarded) continue;
                 if (seen.insert(e->name + ":" + std::to_string(e->line) + ":" +
                                 std::to_string(e->col)).second)

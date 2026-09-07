@@ -119,6 +119,36 @@ expect_error("dereference of moved variable 'cb1'") {
     }
 }
 
+// Guard chain: every block after a run of `if (c) return;` guards is transitively
+// control-dependent on ALL the guard edges before it. The move and the deref sit behind the same
+// chain, so the deref's control-dependence set is contained in the move's and it is reported.
+// (This shape made the eager closure cubic in block count; the lazy closure must still see it.)
+// A guard BETWEEN the move and the deref would suppress by design - it can skip the deref.
+expect_error("dereference of moved variable 'gc1'") {
+    int guardChainThenDeref(int n)
+    {
+        unique UniqueThing* gc1 = new UniqueThing();
+        int acc = 0;
+        if (n == 1) return 1;
+        acc = acc + 1;
+        if (n == 2) return 2;
+        acc = acc + 1;
+        if (n == 3) return 3;
+        acc = acc + 1;
+        if (n == 4) return 4;
+        acc = acc + 1;
+        if (n == 5) return 5;
+        acc = acc + 1;
+        if (n == 6) return 6;
+        acc = acc + 1;
+        if (n == 7) return 7;
+        acc = acc + 1;
+        if (n == 8) return 8;
+        unique UniqueThing* gc2 = move gc1;
+        return gc1->v + acc;
+    }
+}
+
 // Loop-carried: iteration 1 dereferences what iteration 0 moved out (via the back-edge).
 expect_error("dereference of moved variable 'lc1'") {
     int loopCarriedMoveThenDeref()

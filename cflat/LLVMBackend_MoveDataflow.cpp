@@ -522,12 +522,12 @@ bool LLVMBackend::CrossBlockProvesNullIface(llvm::Function* F, const PendingNull
 
         if (!cfg.HaveCd)
         {
-            cfg.Cd = nulldf::ComputeControlDependence(cfg.Blocks, cfg.Rpo, &provenNoReturn_);
+            cfg.Cd = nulldf::ControlDependence(cfg.Blocks, cfg.Rpo, &provenNoReturn_);
             cfg.HaveCd = true;
         }
-        const nulldf::CdSet& cdAccess = cfg.Cd[anchorBB];
+        const nulldf::CdSet& cdAccess = cfg.Cd.Closure(anchorBB);
         for (llvm::BasicBlock* m : witnesses)
-            if (!nulldf::IsSubset(cdAccess, cfg.Cd[m])) return false;
+            if (!nulldf::IsSubset(cdAccess, cfg.Cd.Closure(m))) return false;
         return true;
     }
 
@@ -664,10 +664,10 @@ void LLVMBackend::RunNullIfaceDispatchCheck(llvm::Function* F)
                 if (!cfg.Rpo.count(ab)) continue;
                 if (!cfg.HaveCd)
                 {
-                    cfg.Cd = nulldf::ComputeControlDependence(cfg.Blocks, cfg.Rpo, &provenNoReturn_);
+                    cfg.Cd = nulldf::ControlDependence(cfg.Blocks, cfg.Rpo, &provenNoReturn_);
                     cfg.HaveCd = true;
                 }
-                if (cfg.Cd[ab].empty()) ReportNullIfaceUninitAccess(rec);
+                if (cfg.Cd.Closure(ab).empty()) ReportNullIfaceUninitAccess(rec);
             }
         }
     }
@@ -762,10 +762,10 @@ void LLVMBackend::RunNullIfaceGlobalCheck()
             if (!cfg.Rpo.count(bb) || !cfg.Rpo.count(entry)) continue;
             if (!cfg.HaveCd)
             {
-                cfg.Cd = nulldf::ComputeControlDependence(cfg.Blocks, cfg.Rpo, &provenNoReturn_);
+                cfg.Cd = nulldf::ControlDependence(cfg.Blocks, cfg.Rpo, &provenNoReturn_);
                 cfg.HaveCd = true;
             }
-            if (!nulldf::IsSubset(cfg.Cd[bb], cfg.Cd[entry])) continue;
+            if (!nulldf::IsSubset(cfg.Cd.Closure(bb), cfg.Cd.Closure(entry))) continue;
 
             PendingNullIfaceDispatch out;
             out.Anchor = anchor;

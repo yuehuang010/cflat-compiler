@@ -219,6 +219,28 @@ bool RuntimeFalse() { return gGuardFlag != 0; }
 // guard to suppress. Never actually called - the guard below is behind RuntimeFalse().
 void dieNow() { printf("unreachable handoff\n"); exit(1); }
 
+// Guard chain before the move, then a NULL-GUARDED deref: the deref's control-dependence set
+// carries every guard edge above it plus its own, so it is not contained in the move's and must
+// not be reported. Returns the guarded read (0 for the moved-out null) plus the chain count.
+int guardChainGuardedDeref(int n)
+{
+    unique Resource* gc = new Resource();
+    gc->id = 5;
+    int acc = 0;
+    if (n == 1) return -1;
+    acc = acc + 1;
+    if (n == 2) return -2;
+    acc = acc + 1;
+    if (n == 3) return -3;
+    acc = acc + 1;
+    if (n == 4) return -4;
+    acc = acc + 1;
+    unique Resource* gc2 = move gc;
+    int seen = 0;
+    if (gc != nullptr) seen = gc->id;
+    return seen * 100 + acc + gc2->id;
+}
+
 // Two INTERFACE PARAMETER receivers of the implicit move. This shape ABORTED (rc 134) before the
 // 2026-08-10 ruling: neither parameter resolves to a box, so the store aliased one pointee.
 // Returns the moved-in id, or -1 when the source was not nulled.
@@ -12616,6 +12638,12 @@ extern int main()
 
     passed += testAddressOfBorrowDeleteAccepts();
     total += 6;
+
+    dtorCount = 0;
+    passed += Test("guard_chain_guarded_deref_runs", guardChainGuardedDeref(0), 9);
+    passed += Test("guard_chain_guarded_deref_early_return", guardChainGuardedDeref(3), -3);
+    passed += Test("guard_chain_guarded_deref_freed", dtorCount, 2);
+    total += 3;
 
     printf("\n%d / %d tests passed.\n", passed, total);
     return passed == total ? 0 : 1;

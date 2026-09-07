@@ -7571,16 +7571,17 @@ public:
     };
 
     // Per-function CFG data shared by every record in one function, built lazily. The block
-    // order costs O(B); the control-dependence closure costs O(B^2) and is built only once a
-    // record has actually been proven definitely-null at its access, which correct code never
-    // reaches - that is this analysis's counterpart of nulldf's 'haveSet' fast path.
+    // order costs O(B); the control dependence (direct sets eager, closures lazy per queried
+    // block) is built only once a record has actually been proven definitely-null at its
+    // access, which correct code never reaches - that is this analysis's counterpart of
+    // nulldf's 'haveSet' fast path.
     struct NullIfaceCfgInfo
     {
         llvm::Function* Fn = nullptr;
         std::unordered_map<llvm::BasicBlock*, int> Rpo;
         std::vector<llvm::BasicBlock*> Blocks;
         bool HaveCd = false;
-        std::unordered_map<llvm::BasicBlock*, nulldf::CdSet> Cd;
+        nulldf::ControlDependence Cd;
     };
 
     /*

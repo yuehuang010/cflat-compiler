@@ -2841,6 +2841,25 @@ void MainListener::ParseFunctionDefinition(CFlatParser::FunctionDefinitionContex
         // would steer the next file's generic-template resolution.
         LLVMBackend::NamespaceScope nsScope(compiler, bodyNamespace.empty() ? namespaceName : bodyNamespace);
 
+        // A body abandoned by a FILE-SCOPE scoped expect_error unwinds past the function-depth
+        // catch below (that one only handles the bare-semicolon form), so its partial null-state
+        // log would reach the end-of-module sweep and re-report the swallowed diagnostic. Drop
+        // the three pending logs on any exit that did not complete the body - the same guard the
+        // lambda body installs.
+        struct FunctionDeferredCheckGuard
+        {
+            LLVMBackend* Compiler;
+            llvm::Function* Function;
+            bool Completed = false;
+            ~FunctionDeferredCheckGuard()
+            {
+                if (Completed) return;
+                Compiler->DiscardNullDerefEvents(Function);
+                Compiler->DiscardPendingReturnDangleChecks(Function);
+                Compiler->DiscardPendingNullIfaceDispatch(Function);
+            }
+        } deferredCheckGuard{ compiler, fn };
+
         currentFunctionIsVariadic = varargs;
 
         if (isAutoReturn)
@@ -2946,6 +2965,7 @@ void MainListener::ParseFunctionDefinition(CFlatParser::FunctionDefinitionContex
             // The body's CFG is complete - solve the MAY-null fixpoint here so the error still
             // lands inside an enclosing scoped expect_error rather than at end-of-module.
             compiler->RunDeferredEndOfBodyChecks(fn);
+            deferredCheckGuard.Completed = true;
 
             // Same reasoning, for the deferred interface-return-dangle existential check: the
             // slot's use-list is only complete once the body is fully lowered.
