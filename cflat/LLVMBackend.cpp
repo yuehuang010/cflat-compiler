@@ -4425,6 +4425,7 @@ void LLVMBackend::ResetForReanalysis()
     cxxImportDefines_.clear();
     cxxForeignNamespaces_.clear();
     cxxForeignTypeSpellings_.clear();
+    cxxFunctionPointerAbiPlans_.clear();
     cxxCflatToCxxSpelling_.clear();
     cxxForeignRequests_.clear();
     // Per-analysis emitted IR: the next analysis re-adopts whatever its own imports produce (from
@@ -4537,6 +4538,7 @@ void LLVMBackend::ResetForReanalysis()
     // C++ record identity/triviality follows dataStructures: a survivor would let the next file
     // pass a record by value on the strength of a registration that no longer exists.
     cxxRecords_.clear();
+    cxxBindingRefusals_.clear();
     cxxTriviallyCopyableRecords_.clear();
     cxxNontrivialRecords_.clear();
     cxxClasses_.clear();
@@ -6469,6 +6471,8 @@ static llvm::json::Object SerializeTav(const TAV& t)
     if (s.IsMove)                 o["mv"]  = true;
     if (s.IsAdopt)                o["ad"]  = true;
     if (s.IsAlias)                o["al"]  = true;
+    if (s.IsRvalueRef)             o["rr"]  = true;
+    if (s.IsCxxRefToPointer)      o["crp"] = true;
     if (s.IsOwningSink)           o["osk"] = true;
     if (s.IsConsumeInferredSink)  o["cis"] = true;
     if (s.IsBorrowOfAliasElement) o["bae"] = true;
@@ -6498,6 +6502,7 @@ static llvm::json::Object SerializeTav(const TAV& t)
             if (p.IsMove)  po["mv"] = true;
             if (p.IsOwningSink) po["osk"] = true;
             if (p.IsConsumeInferredSink) po["cis"] = true;
+            if (p.IsRvalueRef) po["rr"] = true;
             if (p.PointerDepth > 1) po["pd"] = static_cast<int64_t>(p.PointerDepth);
             if (!p.ResolvedTypeKey.empty()) po["rk"] = p.ResolvedTypeKey;
             fps.push_back(std::move(po));
@@ -6539,6 +6544,8 @@ static TAV DeserializeTav(const llvm::json::Object& o)
     if (auto v = o.getBoolean("mv")) s.IsMove = *v;
     if (auto v = o.getBoolean("ad")) s.IsAdopt = *v;
     if (auto v = o.getBoolean("al")) s.IsAlias = *v;
+    if (auto v = o.getBoolean("rr")) s.IsRvalueRef = *v;
+    if (auto v = o.getBoolean("crp")) s.IsCxxRefToPointer = *v;
     if (auto v = o.getBoolean("osk")) s.IsOwningSink = *v;
     if (auto v = o.getBoolean("cis")) s.IsConsumeInferredSink = *v;
     if (auto v = o.getBoolean("bae")) s.IsBorrowOfAliasElement = *v;
@@ -6569,6 +6576,7 @@ static TAV DeserializeTav(const llvm::json::Object& o)
                     if (auto v = po->getBoolean("mv"))p.IsMove = *v;
                     if (auto v = po->getBoolean("osk")) p.IsOwningSink = *v;
                     if (auto v = po->getBoolean("cis")) p.IsConsumeInferredSink = *v;
+                    if (auto v = po->getBoolean("rr")) p.IsRvalueRef = *v;
                     if (p.Pointer) p.PointerDepth = 1;
                     if (auto v = po->getInteger("pd")) p.PointerDepth = static_cast<int>(*v);
                     if (auto v = po->getString("rk")) p.ResolvedTypeKey = v->str();
@@ -6771,6 +6779,13 @@ static llvm::json::Object SerializeFuncSym(const std::string& key, const FS& s)
     llvm::json::Array ps;
     for (auto& p : s.Parameters) ps.push_back(SerializeTav(p));
     o["ps"] = std::move(ps);
+    if (!s.DefaultArguments.empty())
+    {
+        llvm::json::Array da;
+        for (const auto& d : s.DefaultArguments)
+            da.push_back(llvm::json::Object{{"k", d.kind}, {"v", d.value}});
+        o["defaults"] = std::move(da);
+    }
     if (s.Variadic)     o["va"] = true;
     if (s.External)     o["ext"] = true;
     if (s.ReturnsOwned) o["ro"] = true;
@@ -7564,6 +7579,15 @@ bool LLVMBackend::LoadCoreBitcodeIfFresh(const std::string& cacheDir, const std:
             if (auto* ps = fo->getArray("ps"))
                 for (auto& pe : *ps)
                     if (auto* po = pe.getAsObject()) sym.Parameters.push_back(DeserializeTav(*po));
+            if (auto* da = fo->getArray("defaults"))
+                for (auto& de : *da)
+                    if (auto* d = de.getAsObject())
+                    {
+                        cflat_cinterop::RawDefaultArg arg;
+                        if (auto v = d->getString("k")) arg.kind = v->str();
+                        if (auto v = d->getString("v")) arg.value = v->str();
+                        sym.DefaultArguments.push_back(std::move(arg));
+                    }
             if (auto v = fo->getBoolean("va")) sym.Variadic = *v;
             if (auto v = fo->getBoolean("ext")) sym.External = *v;
             if (auto v = fo->getBoolean("ro")) sym.ReturnsOwned = *v;

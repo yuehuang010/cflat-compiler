@@ -1588,6 +1588,7 @@ void LLVMBackend::DiagnoseExplicitMoveToBorrowParam(const std::string& functionN
         bool inferredSinkConsumes = param.IsConsumeInferredSink
             && !IsCopyableType(param.TypeName);
         bool paramIsSink = param.IsMove
+            || param.IsRvalueRef
             || (!param.Pointer && !param.IsAlias && IsCoreUniqueType(param.TypeName))
             // A foreign nontrivial C++ class taken BY VALUE is a real sink: the call site
             // move-CONSTRUCTS the callee's caller-owned temp from the argument, so `move x`
@@ -1664,6 +1665,20 @@ void LLVMBackend::ApplyMoveParamTransfer(const std::string& functionName,
             std::string sourceName = args[i].CallerName;
             if (sourceName.empty() && args[i].FieldName.empty())
                 sourceName = args[i].TypeAndValue.VariableName;
+            if (params[i].IsRvalueRef && args[i].IsExplicitMove)
+            {
+                // C++ move construction consumes the source only at compile time. The moved-from
+                // object remains alive, so do not zero its storage or retire its destructor.
+                if (!beforeCall)
+                {
+                    if (!sourceName.empty() && args[i].FieldName.empty()
+                        && !args[i].IsElementAccess)
+                        MarkVariableMoved(sourceName);
+                    else if (!sourceName.empty() && !args[i].FieldName.empty())
+                        MarkVariableFieldMoved(sourceName, args[i].FieldName);
+                }
+                continue;
+            }
             if (!beforeCall)
                 RejectOwningTempUniqueFieldIntoSinkParam(functionName, params[i], args[i]);
             // A plain by-value parameter the callee body unconditionally moves is a synthesized
@@ -2103,6 +2118,20 @@ llvm::Value* LLVMBackend::LowerClosureFatToThinFnPtr(llvm::Value* val, llvm::Typ
 llvm::Value* LLVMBackend::LowerAliasByPointerArg(const NamedVariable& arg, const TypeAndValue& param)
 {
         auto* paramTy = GetType(param);
+        if (param.IsCxxRefToPointer)
+        {
+            // C++ T*& borrows the caller's T* slot. A plain pointer local already
+            // has exactly that slot; expressions and call results need a temporary.
+            if (arg.Storage != nullptr && arg.TypeAndValue.Pointer && arg.BaseType == paramTy)
+                return arg.Storage;
+            llvm::Value* value = arg.Primary != nullptr ? arg.Primary : LoadArgStorage(arg);
+            value = LowerByValueArg(value, param, arg);
+            if (value == nullptr)
+                return llvm::ConstantPointerNull::get(cflat_llvm::PointerTo(paramTy));
+            auto* temp = AllocaAtEntry(paramTy, nullptr, "cxx.refptr.arg");
+            CreateAssignment(value, temp, arg.TypeAndValue.IsUnsignedInteger() != -1);
+            return temp;
+        }
         // The caller's own slot is the borrow. Only an exact type match may be handed over -
         // anything else (a coercion, a literal, a call result) is materialized into a temp,
         // which is a copy, exactly as binding a C++ const-reference to a converted value is.
@@ -2124,6 +2153,26 @@ llvm::Value* LLVMBackend::LowerAliasByPointerArg(const NamedVariable& arg, const
             && !arg.TernaryTempAlreadyRegistered;
         RegisterBorrowedOwningStructTempAt(arg, temp, ternaryJoinNeedsRegistration);
         return temp;
+    }
+
+llvm::Value* LLVMBackend::LowerRvalueRefArg(const NamedVariable& arg, const TypeAndValue& param)
+{
+        // A pointer argument (`move p` on a T*) already IS the object's address: pass its value,
+        // never the slot holding it. Pointers are opaque, so no type test can tell the two apart.
+        if (arg.TypeAndValue.Pointer)
+            return arg.Primary != nullptr ? arg.Primary : LoadArgStorage(arg);
+
+        auto aliasParam = param;
+        aliasParam.Pointer = false;
+        aliasParam.ElemPointer = false;
+        aliasParam.IsAlias = false;
+
+        // A loaded value from an addressable object still borrows that object's slot.
+        if (auto* load = llvm::dyn_cast_or_null<llvm::LoadInst>(arg.Primary))
+            if (load->getType() == GetType(aliasParam))
+                return load->getPointerOperand();
+
+        return LowerAliasByPointerArg(arg, aliasParam);
     }
 
 llvm::Value* LLVMBackend::LowerByValueArg(llvm::Value* value, const TypeAndValue& param, const NamedVariable& arg)

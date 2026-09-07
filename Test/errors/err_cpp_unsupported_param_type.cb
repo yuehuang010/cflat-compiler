@@ -1,0 +1,9 @@
+import cpp "cpp_interop_basic.h";
+
+extern int main()
+{
+    expect_error("'cppi.unsupported_param' was not bound: parameter 'value' has unsupported C++ type '_Float16'") {
+        cppi.unsupported_param(1);
+    }
+    return 0;
+}

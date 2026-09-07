@@ -128,6 +128,10 @@
       "new",
       "new"
     ],
+    "calltoarg0omitsparam...sionpassitexplicitly13c4f1d3258e50d5": [
+      "cppi.with_call_default",
+      "k"
+    ],
     "calltoarg0parametera...theparameterarg5arg6cdcea6fb1f430195": [
       "sinkHolder",
       "value",
@@ -644,6 +648,10 @@
     "parameterarg0cannotp...toftheirsourcesscope0c92f2fcfe931fdb": [
       "p",
       "move"
+    ],
+    "parameterarg0ofarg1i...smoveargoratemporarydf5863f826e239c2": [
+      "t",
+      "cppi.take_rvalue"
     ],
     "redefinitionofarg0th...areoneoverloadnottwod3edf872df7d2d1d": [
       "dupExact",
@@ -1576,6 +1584,7 @@
     "calltoarg0cannotpass...evaluenotastackvalueade9718dd6fc01f3": "call to '{0}': cannot pass a stack value to {1} interface parameter '{2}' - it takes ownership and frees the object at scope exit, so the source must be a heap '{3}' (or a '{4}' of an owned interface value), not a stack value",
     "calltoarg0cannotpass...thecalleeonlyborrows7fecc6bc7d235122": "call to '{0}': cannot pass the address of a stack or global value to {1} parameter '{2}' - it takes ownership and frees the pointee at scope exit, but neither is heap-allocated and freeing it is undefined. Use '{3}' to allocate on the heap, or drop '{4}' if the callee only borrows.",
     "calltoarg0moveargume...eclearedafterthemovecb9e409370205fa4": "call to '{0}': 'move' argument {1} has no resolved type, so its source storage cannot be cleared after the move",
+    "calltoarg0omitsparam...sionpassitexplicitly13c4f1d3258e50d5": "call to '{0}' omits parameter '{1}' whose default argument is not a constant expression; pass it explicitly",
     "calltoarg0parametera...theparameterarg5arg6cdcea6fb1f430195": "call to '{0}': parameter '{1}' BORROWS its argument, so '{2} {3}' transfers nothing - the callee never takes ownership and the value would be orphaned. Drop the '{4}', or declare the parameter '{5} {6}'.",
     "calltoarg0parametera...yorpassacopywitharg4f93457f5afd53b01": "call to '{0}': parameter '{1}' takes ownership of a value this function only borrows ('{2}' is a by-value parameter, so the caller keeps ownership). Accept the parameter as a sink ({3} it in the body), or pass a copy with '{4}'.",
     "cannotarg0arg1arg2fr...oramovereturningcall24368f2be24c7fe1": "cannot {0} {1} '{2}' from a borrowed value - the source still owns it; use 'new', a 'move' expression, or a move-returning call",
@@ -1709,6 +1718,7 @@
     "nooverloadofinterfac...rgumentsexpectedarg3d19ec88ba7eb04a1": "no overload of interface method '{0}.{1}' takes {2} argument(s); expected {3}",
     "noviablealternativeatinputarg0": "no viable alternative at input {0}",
     "parameterarg0cannotp...toftheirsourcesscope0c92f2fcfe931fdb": "parameter '{0}': cannot pass bonded value to '{1}' parameter - bonded values cannot be transferred out of their source's scope",
+    "parameterarg0ofarg1i...smoveargoratemporarydf5863f826e239c2": "parameter '{0}' of '{1}' is an rvalue reference; pass 'move <arg>' or a temporary",
     "programdefinitionsrequireatrailing": "program definitions require a trailing ';'",
     "redefinitionofarg0th...areoneoverloadnottwod3edf872df7d2d1d": "redefinition of '{0}' - the same overload is already defined at {1}({2}). Two parameter lists that differ only in a SPELLING of one type ('int' and 'i32' name the same type) are one overload, not two.",
     "reflectfailedtocreatefunctionforarg0": "reflect: failed to create function for '{0}'",

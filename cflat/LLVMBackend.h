@@ -753,6 +753,8 @@ public:
         bool IsMove = false;     // parameter declared with 'move' - function takes ownership
         bool IsAdopt = false;    // parameter declared with 'adopt' - retires an owned interface box at the call site
         bool IsAlias = false;    // return/decl declared with 'alias' - borrowed reference; caller must not free the interior
+        bool IsRvalueRef = false; // C++ T&& parameter: borrowed address, but only rvalues bind
+        bool IsCxxRefToPointer = false; // C++ T*&: the value is the address of a T* slot
         // Set by the ForwardRefScanner body-scan on a plain by-value parameter the callee body
         // UNCONDITIONALLY moves (top-level `move <param>`): a synthesized move-sink whose caller
         // source is nulled at the call site. Consumers still gate on the concrete type owning a
@@ -828,6 +830,7 @@ public:
             // ApplyMoveParamTransfer. OwningSinkConsumesConcrete filters the structural half.
             bool IsOwningSink = false;
             bool IsConsumeInferredSink = false;
+            bool IsRvalueRef = false;
             int PointerDepth = 0;   // 0 = not recorded; see FuncPtrReturnPointerDepth
             std::string ResolvedTypeKey;  // "" = not recorded; see FuncPtrReturnResolvedKey
         };
@@ -1129,6 +1132,8 @@ public:
         bool IsMove = false;
         bool IsAdopt = false;
         bool IsAlias = false;
+        bool IsRvalueRef = false;
+        bool IsCxxRefToPointer = false;
         bool IsOwningSink = false;
         bool IsConsumeInferredSink = false;
         bool IsBorrowOfAliasElement = false;
@@ -1153,6 +1158,7 @@ public:
             bool IsMove = false;
             bool IsOwningSink = false;
             bool IsConsumeInferredSink = false;
+            bool IsRvalueRef = false;
             int PointerDepth = 0;
             std::string ResolvedTypeKey;
         };
@@ -1180,6 +1186,8 @@ public:
             s.IsMove = t.IsMove;
             s.IsAdopt = t.IsAdopt;
             s.IsAlias = t.IsAlias;
+            s.IsRvalueRef = t.IsRvalueRef;
+            s.IsCxxRefToPointer = t.IsCxxRefToPointer;
             s.IsOwningSink = t.IsOwningSink;
             s.IsConsumeInferredSink = t.IsConsumeInferredSink;
             s.IsBorrowOfAliasElement = t.IsBorrowOfAliasElement;
@@ -1205,6 +1213,7 @@ public:
                 q.IsMove = p.IsMove;
                 q.IsOwningSink = p.IsOwningSink;
                 q.IsConsumeInferredSink = p.IsConsumeInferredSink;
+                q.IsRvalueRef = p.IsRvalueRef;
                 q.PointerDepth = p.PointerDepth;
                 q.ResolvedTypeKey = p.ResolvedTypeKey;
                 s.FuncPtrParams.push_back(std::move(q));
@@ -1233,6 +1242,8 @@ public:
             t.IsMove = IsMove;
             t.IsAdopt = IsAdopt;
             t.IsAlias = IsAlias;
+            t.IsRvalueRef = IsRvalueRef;
+            t.IsCxxRefToPointer = IsCxxRefToPointer;
             t.IsOwningSink = IsOwningSink;
             t.IsConsumeInferredSink = IsConsumeInferredSink;
             t.IsBorrowOfAliasElement = IsBorrowOfAliasElement;
@@ -1258,6 +1269,7 @@ public:
                 q.IsMove = p.IsMove;
                 q.IsOwningSink = p.IsOwningSink;
                 q.IsConsumeInferredSink = p.IsConsumeInferredSink;
+                q.IsRvalueRef = p.IsRvalueRef;
                 q.PointerDepth = p.PointerDepth;
                 q.ResolvedTypeKey = p.ResolvedTypeKey;
                 t.FuncPtrParams.push_back(std::move(q));
@@ -1364,6 +1376,9 @@ public:
         // (string/owning struct/closure). Zeroing is deferred to ApplyMoveParamTransfer so the
         // callee's parameter move-ness is known first. Not part of the --init cache round-trip.
         bool IsExplicitMove = false;
+        // True only for a value-producing expression. Named variables, fields, elements, aliases,
+        // and dereferences remain lvalues even when their LLVM value has no storage of its own.
+        bool IsRvalue = false;
         // compile-time: this POINTER binding was declared or assigned from an ADDRESS-OF value, so
         // it provably borrows - `&x` never yields an owner. Positive provenance recorded where the
         // binding is produced (never re-derived from IR); not part of the --init cache round-trip.
@@ -1774,6 +1789,7 @@ public:
         llvm::Function* Function;
         TypeAndValue ReturnType;
         std::vector<TypeAndValue> Parameters;
+        std::vector<cflat_cinterop::RawDefaultArg> DefaultArguments;
         bool Variadic = false;
         bool External = false;
         bool ReturnsOwned = false; // true when the function returns an owned value (heap string or owned pointer) - caller must free
@@ -2901,6 +2917,13 @@ private:
     // Fallback typedef map (HANDLE->void*, etc.) for the type mapper when canonical spellings
     // don't resolve. Process-wide, first-writer-wins.
     std::unordered_map<std::string, std::string> cTypedefMap_;
+    struct CxxFunctionPointerAbiPlan
+    {
+        TypeAndValue ret;
+        std::vector<TypeAndValue> params;
+        AbiRecipe recipe;
+    };
+    std::unordered_map<std::string, CxxFunctionPointerAbiPlan> cxxFunctionPointerAbiPlans_;
     std::unordered_map<std::string, std::vector<FunctionSymbol>> functionTable;
     std::unordered_map<std::string, std::vector<InterfaceMethod>> interfaceTable;
     // Interface fields (parents' fields first, then own), parallel to interfaceTable. Each entry's
@@ -3067,6 +3090,9 @@ private:
     bool targetMacOS_ = false;
     bool targetArm64_ = false;
 #endif
+    uint64_t cInteropLongDoubleWidth_ = 0;
+    bool cInteropLongDoubleIsIEEEDouble_ = false;
+    std::string cInteropTargetTriple_;
     std::vector<std::string> cObjectFiles_;
     // Set when a C++ source or header is imported. This selects the C++ driver/runtime at
     // native compile/link time; ordinary C imports keep the existing C-only path.
@@ -3206,13 +3232,16 @@ private:
         // Canonical C/C++ spelling of each parameter, kept beside the mapped TypeAndValue so a
         // record-pointer parameter can be retyped from void* once the record is registered.
         std::vector<std::string> paramSpellings;
+        std::string retSpelling;  // canonical C++ return spelling, replays specialization requests on a cache hit
         std::string name;
         std::string linkageName; // C++ ABI symbol; empty for C
         TypeAndValue ret;
         std::vector<TypeAndValue> params;
+        std::vector<cflat_cinterop::RawDefaultArg> defaultArgs;
         bool variadic = false;
         bool isCxx = false;
         bool isNoexcept = true;
+        std::string bindRefusal;
         // Clang's own ABI arrangement (C++ mode only). Empty/invalid for C, which keeps the
         // existing size-heuristic path byte for byte.
         cflat_cinterop::RawAbi abi;
@@ -3223,6 +3252,8 @@ private:
     struct CEnumEntry
     {
         std::string name;
+        std::string enumType;
+        std::string underlyingType;
         long long value = 0;
         int line = 1;
         int col = 0;
@@ -3332,7 +3363,12 @@ private:
     struct CTypeAliasEntry
     {
         std::string name;
+        std::string qualifiedName;
         std::string target;
+        std::string cxxSpecialization;
+        bool isCxxAliasTemplate = false;
+        std::string cxxAliasPattern;
+        std::vector<std::string> cxxAliasParams;
         std::string file;
         int line = 1;
         int col = 0;
@@ -3354,7 +3390,11 @@ private:
     {
         std::filesystem::file_time_type mtime{};
         uint64_t hash = 0;
+        uint64_t longDoubleWidth = 0;
+        bool longDoubleIsIEEEDouble = false;
+        std::string targetTriple;
         std::vector<CSigEntry> sigs;
+        std::vector<cflat_cinterop::RawFunctionPointerAbi> functionPointerAbis;
         std::vector<CEnumEntry> enums;
         std::vector<CRecordEntry> records;
         std::vector<CMacroEntry> macros;
@@ -3398,7 +3438,8 @@ private:
     {
         return entry.sigs.size() + entry.enums.size() + entry.records.size()
              + entry.macros.size() + entry.funcMacros.size() + entry.globals.size()
-             + entry.recordAliases.size() + entry.typeAliases.size() + entry.deps.size()
+             + entry.recordAliases.size() + entry.typeAliases.size()
+             + entry.functionPointerAbis.size() + entry.deps.size()
              + entry.cxxBitcode.size() / kCFileSigBitcodeBytesPerRow;
     }
     // Retention follows the SOURCE (maintainer ruling 2026-09-05): every
@@ -4400,6 +4441,10 @@ private:
     // Used to gate the implicit non-capturing-lambda -> thin function<T> coercion: a stored
     // Lambda<T> value is NOT a temp, so it cannot implicitly narrow (must use .toFunction()).
     bool IsOwnedClosureTemp(llvm::Value* value) const;
+    // True when the argument's value or slot is a pending owned temporary (string, closure,
+    // struct): it dies at the end of the full expression, so it is an rvalue for overloads.
+    bool IsOwnedTempValue(const NamedVariable& arg) const;
+    bool IsConsumableTemporary(const NamedVariable& arg) const;
 
     // Free one owned closure temp at the current insert point. Caller owns dominance safety.
     void EmitOwnedClosureTempFree(llvm::Value* value);
@@ -4845,6 +4890,8 @@ private:
 
     bool RequestCxxForeignType(const std::string& cflatName, const std::string& cxxSpelling,
                                std::string& error);
+    bool RequestCxxSignatureTypes(const cflat_cinterop::RawSig& sig);
+    void RequestCxxSignatureTypes(const std::vector<CSigEntry>& sigs);
     bool RequestCxxType(const std::string& baseName, const std::vector<std::string>& typeArgs,
                         const std::string& cflatName, std::string& error);
     bool CxxSpellingForCflatType(const std::string& cflatType, std::string& out) const;
@@ -4858,6 +4905,11 @@ private:
     bool TryRequestCxxType(const std::string& baseName, const std::vector<std::string>& typeArgs,
                            const std::string& cflatName, std::string& error);
     bool IsCxxForeignTypeRegistered(const std::string& cflatName) const;
+    bool IsStdFunctionSpecialization(const std::string& name) const
+    {
+        return name == "std.function" || name.ends_with(".function")
+            || name.starts_with("std.function$");
+    }
     // True once any `import cpp` header has been bound in this analysis: the only situation in
     // which an unknown dotted type name is worth resolving as a C++ type.
     bool HasCxxImportGroup() const { return !cxxImportHeaders_.empty(); }
@@ -4957,6 +5009,13 @@ private:
 
 
     bool MapCTypeToTypeAndValue(std::string ctype, TypeAndValue& out);
+    void SetCInteropTargetFacts(const cflat_cinterop::ExtractResult& raw);
+    void SetCInteropTargetFacts(uint64_t longDoubleWidth, bool longDoubleIsIEEEDouble,
+                                const std::string& targetTriple);
+    bool IsCInteropLongDoubleSupported() const;
+    std::string CInteropLongDoubleRefusal() const;
+    static bool IsLongDoubleSpelling(const std::string& spelling);
+    std::string GetCxxBindingRefusal(const std::string& name) const;
 
     // Foreign C++ specialization lookup on the INTACT spelling; see the definition for why the
     // general '*'/qualifier stripping must not run first.
@@ -4996,6 +5055,11 @@ private:
                                                bool errorRecovery, bool asCxx = false) const;
 
     bool MapRawSig(const cflat_cinterop::RawSig& r, CSigEntry& e);
+
+    static std::string FunctionPointerAbiKey(const TypeAndValue& ret,
+                                             const std::vector<TypeAndValue>& params);
+    void RegisterCxxFunctionPointerAbis(
+        const std::vector<cflat_cinterop::RawFunctionPointerAbi>& plans);
 
     bool MapRawGlobal(const cflat_cinterop::RawGlobalVar& r, CGlobalEntry& e);
 
@@ -5058,13 +5122,20 @@ private:
                              bool* outPrereqFailure = nullptr,
                              std::string* outPrereqMsg = nullptr,
                              bool cxxMode = false,
-                             std::string* outCxxBitcode = nullptr);
+                             std::string* outCxxBitcode = nullptr,
+                             std::vector<cflat_cinterop::RawFunctionPointerAbi>* outFunctionPointerAbis = nullptr,
+                             uint64_t* outLongDoubleWidth = nullptr,
+                             bool* outLongDoubleIsIEEEDouble = nullptr,
+                             std::string* outTargetTriple = nullptr);
 
     // Extract externally-linkable functions a .c file DEFINES, via the clang C++ API. Records
     // are registered up front (struct-by-value). Used by the .c auto-extern path.
     bool ExtractCFileClang(const std::string& cSourcePath,
                            std::vector<CSigEntry>& outSigs, std::vector<CRecordEntry>& outRecords,
-                           std::vector<CGlobalEntry>& outGlobals, bool cxxMode = false);
+                           std::vector<CGlobalEntry>& outGlobals, bool cxxMode = false,
+                           uint64_t* outLongDoubleWidth = nullptr,
+                           bool* outLongDoubleIsIEEEDouble = nullptr,
+                           std::string* outTargetTriple = nullptr);
 
     bool ExtractCSignatures(const std::string& cSourcePath, const std::string& programAlias = "", bool cxxMode = false);
 
@@ -5074,7 +5145,7 @@ private:
 
     void RegisterCGlobals(const std::vector<CGlobalEntry>& globals, const std::string& fileForLsp);
 
-    void RegisterCRecords(const std::vector<CRecordEntry>& records, const std::string& fileForLsp);
+    void RegisterCRecords(std::vector<CRecordEntry>& records, const std::string& fileForLsp);
 
     void RegisterCMacros(const std::vector<CMacroEntry>& macros);
     void RegisterCMacroAliases(const std::vector<CMacroEntry>& macros,
@@ -5548,6 +5619,8 @@ public:
     // Adapt an extern function's lowered C ABI to the natural CFlat function-pointer ABI.
     llvm::Function* GetOrCreateCAbiFunctionThunk(const FunctionSymbol& symbol,
                                                   const TypeAndValue& fpTV);
+    llvm::Function* GetOrCreateReverseAbiFunctionThunk(llvm::Function* original,
+                                                       const CxxFunctionPointerAbiPlan& plan);
 
     llvm::Value* WrapCFuncPtrAsFatStruct(llvm::Value* cFnPtrValue, const TypeAndValue& fpTV);
 
@@ -6392,6 +6465,7 @@ public:
     // Address handed to a non-pointer `alias T` parameter: the caller's own slot when the
     // shapes match exactly, otherwise a materialized temp (a converted value has no slot).
     llvm::Value* LowerAliasByPointerArg(const NamedVariable& arg, const TypeAndValue& param);
+    llvm::Value* LowerRvalueRefArg(const NamedVariable& arg, const TypeAndValue& param);
 
     /*
      * Is this argument PROVABLY unusable for this parameter? Deliberately one-sided, and NOT
@@ -6991,6 +7065,7 @@ public:
     // set may still be used through a pointer; only by-value crossings consult it.
     std::set<std::string> cxxTriviallyCopyableRecords_;
     std::set<std::string> cxxRecords_;
+    std::map<std::string, std::string> cxxBindingRefusals_;
 
     /*
      * Everything the CFlat side needs to know about an imported C++ class beyond its layout:
@@ -7168,6 +7243,15 @@ public:
     bool IsForeignNontrivialCxxClass(const std::string& typeName) const
     {
         return cxxNontrivialRecords_.count(typeName) != 0;
+    }
+    bool IsForeignCxxClassWithConstructors(const std::string& typeName) const
+    {
+        if (typeName.starts_with("std.pair$") || typeName.starts_with("std.optional$"))
+            return false;
+        auto it = cxxClasses_.find(typeName);
+        return cxxNontrivialRecords_.count(typeName) != 0
+            || (cxxRecords_.count(typeName) != 0 && it != cxxClasses_.end()
+                && !it->second.constructors.empty());
     }
     // Materialize (once per module) the llvm::Function for one structor / assignment operator,
     // typed from clang's own arrangement. Returns null after LogError when the plan is
@@ -7358,6 +7442,7 @@ public:
      * (so the move-typed start() wins for a move-typed fn).
      */
     int ScoreMoveAgreement(const std::vector<NamedVariable>& arguments, const FunctionSymbol& candidate) const;
+    bool IsRvalueReferenceArgument(const NamedVariable& arg) const;
 
     /*
      * Indirection shape of a function-pointer/closure parameter or argument:
@@ -7529,6 +7614,10 @@ public:
     // The function-pointer signature of ONE registered overload.
     TypeAndValue FuncPtrSigOfSymbol(const FunctionSymbol& sym) const;
 
+    // Expand a function-pointer signature into its return and ordinary parameter descriptors.
+    void UnpackFuncPtrSignature(const TypeAndValue& fpTV, TypeAndValue& ret,
+                                std::vector<TypeAndValue>& params) const;
+
     // The signature of the overload GetFunctionForFuncPtr actually BOUND. A by-NAME re-lookup
     // returns the first non-method entry, which is declaration-order dependent - use this instead
     // whenever per-parameter facts are read off a named-function initializer.
@@ -7684,11 +7773,12 @@ public:
      * type seeding), which is why it is separate from MatchFunction.
      */
     static ArgumentBinding ComputeArgumentPositions(const std::vector<std::string>& argNames,
-        const std::vector<TypeAndValue>& targetArguments, bool isVariadic, size_t firstTarget = 0);
+        const std::vector<TypeAndValue>& targetArguments, bool isVariadic, size_t firstTarget = 0,
+        const std::vector<cflat_cinterop::RawDefaultArg>* defaults = nullptr);
 
     // `probe` = scoring one candidate of an overload set: a mismatch only disqualifies THIS
     // candidate, so it returns {} instead of reporting - a losing candidate must never error.
-    std::vector<LLVMBackend::NamedVariable> MatchFunction(const std::vector<LLVMBackend::NamedVariable>& inputArguments, const std::vector<LLVMBackend::TypeAndValue>& targetArguments, bool isVariadic = false, bool probe = false);
+    std::vector<LLVMBackend::NamedVariable> MatchFunction(const std::vector<LLVMBackend::NamedVariable>& inputArguments, const std::vector<LLVMBackend::TypeAndValue>& targetArguments, bool isVariadic = false, bool probe = false, const std::vector<cflat_cinterop::RawDefaultArg>* defaults = nullptr);
 
     // Emit LLVM atomic IR for __atomic_* builtins called from atomic.cb.
     // Returns nullptr when name is not an atomic builtin (caller falls through to normal call).

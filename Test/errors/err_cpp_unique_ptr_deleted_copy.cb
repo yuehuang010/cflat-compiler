@@ -1,0 +1,11 @@
+// std::unique_ptr has a deleted copy constructor and must not silently copy an owner.
+import cpp "cpp_interop_basic.h";
+
+extern int main()
+{
+    expect_error("its copy constructor is deleted") {
+        std.unique_ptr<cppi.Tracked> a = cppi.make_tracked_ptr(1);
+        std.unique_ptr<cppi.Tracked> b = a;
+    }
+    return 0;
+}

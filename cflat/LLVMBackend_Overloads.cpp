@@ -201,6 +201,17 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
             {
                 int result = -1;
 
+                // A C++ rvalue-reference parameter is address-passed like an alias, but an
+                // lvalue cannot bind it. Keep the candidate visible for the move diagnostic.
+                if (candidateParamItr->IsRvalueRef
+                    && !IsRvalueReferenceArgument(arg))
+                {
+                    perfectMatch = false;
+                    promotionMatch = false;
+                    implicitMatch = false;
+                    break;
+                }
+
                 // function<T> parameter: accept any function-compatible argument (named function,
                 // lambda fat struct, or stored function<T> variable). Type fidelity is checked at codegen.
                 // An encoded closure param (list<Lambda<...>>::add's `T value`, gap a) accepts the same
@@ -238,6 +249,13 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
 
                     LLVMBackend::TypeAndValue tmpArg = arg.TypeAndValue;
                     LLVMBackend::TypeAndValue tmpParam = *candidateParamItr;
+                    if (tmpParam.IsCxxRefToPointer)
+                    {
+                        // Match T*& by its CFlat-facing alias T* shape; the natural
+                        // ABI remains T** and is restored only by argument lowering.
+                        tmpParam.ElemPointer = false;
+                        tmpParam.PointerDepth = tmpParam.Pointer ? 1 : 0;
+                    }
 
                     tmpArg.TypeName = resolveName(tmpArg.TypeName);
                     tmpParam.TypeName = resolveName(tmpParam.TypeName);
@@ -259,6 +277,8 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                     if (coreUniqueValueReceiver || rawPointerToCoreUnique || coreUniqueToRawPointer
                         || coreUniqueOutParam
                         || IsStackValueToCoreUniqueInterface(arg, tmpParam))
+                        result = 0;
+                    else if (tmpParam.IsCxxRefToPointer && tmpArg.Pointer)
                         result = 0;
                     else if (tmpArg.IsTypeMatch(tmpParam))
                         result = 0;
@@ -339,7 +359,8 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                 else
                 {
                     auto candidateParam = GetType(*candidateParamItr);
-                    result = CompareUpconvert(arg.BaseType, candidateParam);
+                    result = candidateParamItr->IsCxxRefToPointer && arg.TypeAndValue.Pointer
+                        ? 0 : CompareUpconvert(arg.BaseType, candidateParam);
                     if (IsRawPointerToCoreUnique(arg, *candidateParamItr))
                         result = 0;
 
@@ -409,7 +430,8 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                  * as one 32-bit "int", and the empty-TypeName branch sees only opaque pointers.
                  * Same predicate IsTypeMatch uses, so it refuses exactly what that refuses.
                  */
-                if (result >= 0 && arg.TypeAndValue.PointerDepthRefuses(*candidateParamItr))
+                if (result >= 0 && !candidateParamItr->IsCxxRefToPointer
+                    && arg.TypeAndValue.PointerDepthRefuses(*candidateParamItr))
                     result = -1;
 
                 // Implicit integer NARROWING at a call argument is not legal (ruling 2026-09-04):
@@ -487,7 +509,8 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
     }
 
 LLVMBackend::ArgumentBinding LLVMBackend::ComputeArgumentPositions(const std::vector<std::string>& argNames,
-        const std::vector<TypeAndValue>& targetArguments, bool isVariadic, size_t firstTarget)
+        const std::vector<TypeAndValue>& targetArguments, bool isVariadic, size_t firstTarget,
+        const std::vector<cflat_cinterop::RawDefaultArg>* defaults)
 {
         ArgumentBinding binding;
 
@@ -497,7 +520,7 @@ LLVMBackend::ArgumentBinding LLVMBackend::ComputeArgumentPositions(const std::ve
         const size_t inputSize = argNames.size();
         const size_t paramSize = targetArguments.size() - firstTarget;
 
-        if (isVariadic ? inputSize < paramSize : inputSize != paramSize)
+        if (isVariadic ? inputSize < paramSize : inputSize > paramSize)
             return binding;
 
         binding.PosMap.assign(inputSize, -1);
@@ -566,19 +589,27 @@ LLVMBackend::ArgumentBinding LLVMBackend::ComputeArgumentPositions(const std::ve
 
         if (std::find(binding.PosMap.begin(), binding.PosMap.end(), -1) != binding.PosMap.end())
             return binding;
+        if (!isVariadic && inputSize < paramSize)
+        {
+            if (defaults == nullptr || defaults->size() < targetArguments.size())
+                return binding;
+            for (size_t i = firstTarget; i < targetArguments.size(); ++i)
+                if (!usedTargetMap[i - firstTarget] && (*defaults)[i].kind.empty())
+                    return binding;
+        }
 
         binding.Ok = true;
         return binding;
     }
 
-std::vector<LLVMBackend::NamedVariable> LLVMBackend::MatchFunction(const std::vector<LLVMBackend::NamedVariable>& inputArguments, const std::vector<LLVMBackend::TypeAndValue>& targetArguments, bool isVariadic, bool probe)
+std::vector<LLVMBackend::NamedVariable> LLVMBackend::MatchFunction(const std::vector<LLVMBackend::NamedVariable>& inputArguments, const std::vector<LLVMBackend::TypeAndValue>& targetArguments, bool isVariadic, bool probe, const std::vector<cflat_cinterop::RawDefaultArg>* defaults)
 {
         std::vector<std::string> argNames;
         argNames.reserve(inputArguments.size());
         for (const auto& input : inputArguments)
             argNames.push_back(input.TypeAndValue.VariableName);
 
-        auto binding = ComputeArgumentPositions(argNames, targetArguments, isVariadic);
+        auto binding = ComputeArgumentPositions(argNames, targetArguments, isVariadic, 0, defaults);
         if (!binding.Ok)
         {
             // LogError does not return, so a reported failure never falls through to the
@@ -592,9 +623,19 @@ std::vector<LLVMBackend::NamedVariable> LLVMBackend::MatchFunction(const std::ve
 
         // Reconstruct arguments in matched order. firstTarget is 0 here, so every PosMap entry
         // indexes the result directly.
-        std::vector<LLVMBackend::NamedVariable> result(inputArguments.size());
-        for (size_t i = 0; i < inputArguments.size(); i++)
-            result[binding.PosMap[i]] = inputArguments[i];
+        std::vector<LLVMBackend::NamedVariable> result;
+        result.reserve(inputArguments.size());
+        for (size_t target = 0; target < targetArguments.size(); ++target)
+            for (size_t input = 0; input < inputArguments.size(); ++input)
+                if (binding.PosMap[input] == (int64_t)target)
+                {
+                    result.push_back(inputArguments[input]);
+                    break;
+                }
+        if (isVariadic)
+            for (size_t input = 0; input < inputArguments.size(); ++input)
+                if ((size_t)binding.PosMap[input] >= targetArguments.size())
+                    result.push_back(inputArguments[input]);
         return result;
     }
 
@@ -1014,7 +1055,9 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
         auto funcSym = functionTable.find(functionName);
         if (funcSym == functionTable.end())
         {
-            if (displayName.empty())
+            if (std::string refusal = GetCxxBindingRefusal(functionName); !refusal.empty())
+                LogErrorMessage(refusal);
+            else if (displayName.empty())
                 LogErrorMessage("unknown function '{}'", { shownFunctionName });
             else
                 LogErrorMessage("unknown generic function '{}'", { displayName });
@@ -1034,21 +1077,28 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                 // out of this loop while a later candidate might still match - see the
                 // non-probed re-run below for how the diagnostic is recovered when nothing
                 // scores at all.
-                auto matched = MatchFunction(arguments, candidate.Parameters, true, true);
+                auto matched = MatchFunction(arguments, candidate.Parameters, true, true,
+                                              &candidate.DefaultArguments);
                 if (matched.size() > 0)
                 {
                     resolvedCandidate.emplace_back(std::move(matched), candidate);
                     break;
                 }
             }
-            else if (arguments.size() == 0 && candidate.Parameters.size() == 0)
+            else if (arguments.size() == 0)
             {
-                resolvedCandidate.emplace_back(arguments, candidate);
-                break;
+                auto binding = ComputeArgumentPositions({}, candidate.Parameters, false, 0,
+                                                        &candidate.DefaultArguments);
+                if (binding.Ok)
+                {
+                    resolvedCandidate.emplace_back(arguments, candidate);
+                    break;
+                }
             }
             else
             {
-                auto matched = MatchFunction(arguments, candidate.Parameters, false, true);
+                auto matched = MatchFunction(arguments, candidate.Parameters, false, true,
+                                              &candidate.DefaultArguments);
                 if (matched.size() > 0)
                 {
                     resolvedCandidate.emplace_back(std::move(matched), candidate);
@@ -1056,7 +1106,7 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
             }
         }
 
-        const auto& [matched, candidate] = ComputeOverloadFunction(resolvedCandidate);
+        auto [matched, candidate] = ComputeOverloadFunction(resolvedCandidate);
 
         if (candidate.Function == nullptr)
         {
@@ -1303,6 +1353,20 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                 }
             }
 
+            if (resolvedCandidate.size() == 1)
+            {
+                const auto& [rvalueArgs, rvalueSym] = resolvedCandidate.front();
+                for (size_t i = 0; i < rvalueArgs.size() && i < rvalueSym.Parameters.size(); ++i)
+                {
+                    if (!rvalueSym.Parameters[i].IsRvalueRef
+                        || IsRvalueReferenceArgument(rvalueArgs[i]))
+                        continue;
+                    LogErrorMessage(
+                        "parameter '{}' of '{}' is an rvalue reference; pass 'move <arg>' or a temporary",
+                        { rvalueSym.Parameters[i].VariableName, shownFunctionName });
+                }
+            }
+
             LogRawError(msg);
             return nullptr;
         }
@@ -1311,6 +1375,48 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
             ? SpellFunctionSymbol(*this, functionName) : displayName;
         if (displayName.empty() && diagnosticFunctionName == functionName)
             diagnosticFunctionName = SpellType(*this, TypeAndValue{ .TypeName = functionName });
+
+        if (!candidate.Variadic && matched.size() < candidate.Parameters.size())
+        {
+            for (size_t i = matched.size(); i < candidate.Parameters.size(); ++i)
+            {
+                const auto& def = i < candidate.DefaultArguments.size()
+                    ? candidate.DefaultArguments[i] : cflat_cinterop::RawDefaultArg{};
+                if (def.kind == "nonconst" || def.kind.empty())
+                    LogErrorMessage(
+                        "call to '{}' omits parameter '{}' whose default argument is not a constant expression; pass it explicitly",
+                        { diagnosticFunctionName, candidate.Parameters[i].VariableName });
+                NamedVariable value;
+                value.TypeAndValue = candidate.Parameters[i];
+                value.TypeAndValue.VariableName = candidate.Parameters[i].VariableName;
+                value.BaseType = GetType(candidate.Parameters[i]);
+                if (value.BaseType == nullptr)
+                    LogErrorMessage("cannot lower default argument for parameter '{}' of '{}'",
+                                    { candidate.Parameters[i].VariableName, diagnosticFunctionName });
+                if (def.kind == "nullptr")
+                {
+                    if (!value.BaseType->isPointerTy())
+                        LogErrorMessage("default nullptr for parameter '{}' of '{}' is not a pointer",
+                                        { candidate.Parameters[i].VariableName, diagnosticFunctionName });
+                    value.Primary = llvm::ConstantPointerNull::get(
+                        llvm::cast<llvm::PointerType>(value.BaseType));
+                }
+                else if (value.BaseType->isIntegerTy())
+                {
+                    llvm::APInt folded(value.BaseType->getIntegerBitWidth(), def.value, 10);
+                    value.Primary = llvm::ConstantInt::get(*context, folded);
+                }
+                else if (value.BaseType->isFloatingPointTy())
+                {
+                    value.Primary = llvm::ConstantFP::get(value.BaseType, std::stod(def.value));
+                }
+                else
+                    LogErrorMessage("default argument for parameter '{}' of '{}' has an unsupported type",
+                                    { candidate.Parameters[i].VariableName, diagnosticFunctionName });
+                value.IsRvalue = true;
+                matched.push_back(std::move(value));
+            }
+        }
 
         // convert parameter to vector of llvm::value*
         std::vector<llvm::Value*> argList;
@@ -1372,9 +1478,13 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                 return nullptr;
             }
 
+            if (!inVariadicRange && candParamItr->IsRvalueRef)
+            {
+                argList.push_back(LowerRvalueRefArg(arg, *candParamItr));
+            }
             // A blessed unique<IFace> wrapper is not an implementor: borrow the fat value it
             // holds through get() rather than boxing the wrapper struct itself.
-            if (!inVariadicRange && candParamItr->IsInterface && !candParamItr->IsArrayView
+            else if (!inVariadicRange && candParamItr->IsInterface && !candParamItr->IsArrayView
                 && !arg.TypeAndValue.IsInterface
                 && IsCoreUniqueToRawPointer(arg, *candParamItr))
             {
@@ -1456,6 +1566,10 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                 // Interface -> interface: pass fat struct by value, re-boxing on an upcast
                 llvm::Value* val = arg.Primary ? arg.Primary : LoadArgStorage(arg);
                 argList.push_back(ReboxInterfaceIfNeeded(val, arg.TypeAndValue.TypeName, candParamItr->TypeName));
+            }
+            else if (!inVariadicRange && candParamItr->IsCxxRefToPointer)
+            {
+                argList.push_back(LowerAliasByPointerArg(arg, *candParamItr));
             }
             else if (!inVariadicRange && candParamItr->Pointer)
             {
@@ -1583,9 +1697,17 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                     // that may store and later call it by pointer, so restore external linkage
                     // (CreateFunctionDefinition defaults non-extern functions to internal) to
                     // keep the symbol's identity across the lld-link boundary.
+                    bool madeCxxCallback = false;
                     if (auto* escFn = llvm::dyn_cast<llvm::Function>(val))
+                    {
                         if (escFn->getLinkage() == llvm::Function::InternalLinkage)
                             escFn->setLinkage(llvm::Function::ExternalLinkage);
+                        if (candidate.IsCxx)
+                        {
+                            val = MakeThinFnPtrValue(escFn, *candParamItr);
+                            madeCxxCallback = true;
+                        }
+                    }
                     if (val && val->getType()->isStructTy())
                     {
                         // The argument is a CFlat closure fat struct {code, env} - a lambda or a
@@ -1600,7 +1722,7 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                     {
                         val = builder->CreateBitCast(val, llvmParamTy, "fn_for_extern");
                     }
-                    else if (val)
+                    else if (val && !madeCxxCallback)
                     {
                         // Same provenance gate virtual dispatch applies (LowerByValueArg): the
                         // bitcast below would otherwise make a data pointer callable as code.

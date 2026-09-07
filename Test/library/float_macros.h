@@ -26,7 +26,7 @@
 /* ---- A. Plain literals ------------------------------------------------ */
 #define FM_DOUBLE_PLAIN   1.5            /* default double */
 #define FM_FLOAT_SUFFIX   2.5f           /* float -> still routes to double */
-#define FM_LONG_DOUBLE    3.5L           /* long double -> routes to double */
+#define FM_LONG_DOUBLE    3.5L           /* routes to double for IEEE-double long double targets */
 
 /* ---- B. Sign / parens ------------------------------------------------- */
 #define FM_NEG            -1.25

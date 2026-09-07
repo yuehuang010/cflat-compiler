@@ -1618,6 +1618,42 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                 auto* srcCtx = useMove ? (antlr4::ParserRuleContext*)mv->unaryExpression()
                                        : (antlr4::ParserRuleContext*)assignCtx;
                 const std::string srcName = srcCtx != nullptr ? srcCtx->getText() : std::string();
+                auto* rhsUnary = assignCtx != nullptr ? tryGetUnaryExpression(assignCtx) : nullptr;
+                auto* rhsPostfix = rhsUnary != nullptr ? rhsUnary->postfixExpression() : nullptr;
+                const bool rhsTemporary = rhsPostfix != nullptr
+                    && !rhsPostfix->argumentExpressionList().empty();
+                const auto* info = compiler->GetCxxClassInfo(tn);
+                const LLVMBackend::CxxClassInfo::Structor* op = nullptr;
+                if (info != nullptr)
+                {
+                    if ((useMove || rhsTemporary) && info->hasMoveAssign) op = &info->moveAssign;
+                    else if (info->hasCopyAssign)        op = &info->copyAssign;
+                    else if (info->hasMoveAssign)        op = &info->moveAssign;
+                }
+
+                // A C++ return temporary is constructed in a scratch slot, then assigned into
+                // the live destination so the old value is released by the assignment operator.
+                if (rhsTemporary && op != nullptr)
+                {
+                    LLVMBackend::TypeAndValue tempType;
+                    tempType.TypeName = tn;
+                    auto* temp = compiler->AllocaAtEntry(compiler->GetType(tempType), nullptr,
+                                                          "cxx.assign.temp",
+                                                          namedVar.TypeAndValue.AllocAlignValue);
+                    compiler->pendingCxxSretDest_ = temp;
+                    compiler->pendingCxxSretTypeName_ = tn;
+                    auto rhsNV = ParseAssignmentExpressionNamed(assignCtx);
+                    const bool consumed = compiler->pendingCxxSretDest_ == nullptr;
+                    compiler->pendingCxxSretDest_ = nullptr;
+                    compiler->pendingCxxSretTypeName_.clear();
+                    if (consumed && rhsNV.TypeAndValue.TypeName == tn && !rhsNV.TypeAndValue.Pointer)
+                    {
+                        compiler->EmitCxxStructorCall(tn, *op, destination, { temp });
+                        compiler->RegisterOwnedStructTemp(temp, tn);
+                        compiler->MarkVariableUnmoved(namedVar.CallerName);
+                        return nullptr;
+                    }
+                }
                 if (!IsBareIdentifierText(srcName))
                 {
                     LogErrorContext(ctx, std::format(
@@ -1637,16 +1673,6 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                 {
                     LogErrorContext(ctx, std::format("use of moved variable '{}'", srcName));
                     return nullptr;
-                }
-                const auto* info = compiler->GetCxxClassInfo(tn);
-                const LLVMBackend::CxxClassInfo::Structor* op = nullptr;
-                if (info != nullptr)
-                {
-                    // C++ picks move assignment for an rvalue and falls back to copy assignment
-                    // when the class declares none; an lvalue always takes the copy leg.
-                    if (useMove && info->hasMoveAssign)  op = &info->moveAssign;
-                    else if (info->hasCopyAssign)        op = &info->copyAssign;
-                    else if (info->hasMoveAssign)        op = &info->moveAssign;
                 }
                 if (op == nullptr)
                 {
@@ -8275,16 +8301,17 @@ llvm::Value* MainListener::TryUnaryOperatorOverload(
         std::string opName = "operator" + op;
         if (!compiler->GetFunction(opName)) return nullptr;
 
+        bool receiverFound = false;
         bool receiverConsumes = false;
         if (auto it = compiler->functionTable.find(opName); it != compiler->functionTable.end())
             for (const auto& candidate : it->second)
-                if (!candidate.Parameters.empty()
-                    && candidate.Parameters[0].TypeName == typeName
-                    && !candidate.Parameters[0].Pointer && candidate.Parameters[0].IsMove)
+                if (!candidate.Parameters.empty() && candidate.Parameters[0].TypeName == typeName)
                 {
-                    receiverConsumes = true;
-                    break;
+                    receiverFound = true;
+                    if (!candidate.Parameters[0].Pointer && candidate.Parameters[0].IsMove)
+                        receiverConsumes = true;
                 }
+        if (!receiverFound) return nullptr;
         // Determine whether to pass the operand by pointer or by value.
         bool usePointer = false;
         {
@@ -8454,16 +8481,17 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
         std::string opName = "operator" + op;
         if (!compiler->GetFunction(opName)) return nullptr;
 
+        bool receiverFound = false;
         bool receiverConsumes = false;
         if (auto it = compiler->functionTable.find(opName); it != compiler->functionTable.end())
             for (const auto& candidate : it->second)
-                if (!candidate.Parameters.empty()
-                    && candidate.Parameters[0].TypeName == typeName
-                    && !candidate.Parameters[0].Pointer && candidate.Parameters[0].IsMove)
+                if (!candidate.Parameters.empty() && candidate.Parameters[0].TypeName == typeName)
                 {
-                    receiverConsumes = true;
-                    break;
+                    receiverFound = true;
+                    if (!candidate.Parameters[0].Pointer && candidate.Parameters[0].IsMove)
+                        receiverConsumes = true;
                 }
+        if (!receiverFound) return nullptr;
         // A ternary PHI inside a call argument is either covered per arm or by this operator;
         // keep the receiver's cleanup identity single-source.
         bool receiverArmsAlreadyRegistered = inCallArgument_ && llvm::isa<llvm::PHINode>(lvalue)
@@ -8888,7 +8916,13 @@ LLVMBackend::NamedVariable MainListener::ParseCastExpression(CFlatParser::CastEx
                         {
                             if (candidate.Parameters.size() != 1) continue;
                             const auto& sourceParam = candidate.Parameters[0];
-                            if (sourceParam.Pointer || sourceParam.ElemPointer
+                            // A CFlat conversion is a free function taking its source BY VALUE. A
+                            // C++ member conversion operator is the same conversion spelled with a
+                            // 'this' receiver, so for a registered C++ record the pointer shape is
+                            // accepted too - the overload call path does the receiver adjustment
+                            // (the same relaxation round 8 made for 'operator bool').
+                            if ((sourceParam.Pointer && !compiler->IsCxxRecord(sourceTypeName))
+                                || sourceParam.ElemPointer
                                 || sourceParam.TypeName != sourceTypeName)
                                 continue;
                             const auto& candidateReturn = candidate.ReturnType;
@@ -8910,6 +8944,16 @@ LLVMBackend::NamedVariable MainListener::ParseCastExpression(CFlatParser::CastEx
                     auto result = compiler->CreateOverloadedFunctionCall(opName, { argNV });
                     namedVar.Primary = result;
                     namedVar.Storage = nullptr;
+                    namedVar.TypeAndValue = destTypeName;
+                    return namedVar;
+                }
+
+                // A C++ conversion operator that exists but could not be bound (private, deleted,
+                // no reachable definition, ...) is recorded per member under this same name, so
+                // the cast reports WHY instead of claiming the conversion was never declared.
+                if (compiler->IsCxxRecord(sourceTypeName)
+                    && compiler->RejectInaccessibleCxxMember(sourceTypeName, opName))
+                {
                     namedVar.TypeAndValue = destTypeName;
                     return namedVar;
                 }
@@ -13531,6 +13575,7 @@ void MainListener::AdoptWrapperProvenance(LLVMBackend::NamedVariable& dst,
         dst.IsClosureValueCapture  = src.IsClosureValueCapture;
         dst.IsClosureRefCapture    = src.IsClosureRefCapture;
         dst.IsMoved                = src.IsMoved;
+        dst.IsRvalue               = src.IsRvalue;
         // OWNERSHIP state. These travel together with the borrow facts above: a guard that reads
         // one and not the other reports the opposite of the truth - `delete (n)` on a `move`
         // parameter was rejected as "borrowed" when only CallerName came across.
@@ -14131,7 +14176,7 @@ LLVMBackend::NamedVariable MainListener::ParseSimdStaticMethod(
         LLVMBackend::NamedVariable result;
 
         // Method name is the identifier after the dot; the call args are the one argument list.
-        auto identifiers = ctx->Identifier();
+        auto identifiers = ctx->memberNameToken();
         auto argLists = ctx->argumentExpressionList();
         if (identifiers.empty())
         {
@@ -14649,8 +14694,11 @@ void MainListener::ClassifyPostfixCallResult(
 
 void MainListener::PrepareAliasCallResult(
         antlr4::ParserRuleContext* ctx,
-        LLVMBackend::NamedVariable& result) {
-        if (!result.TypeAndValue.IsAlias || result.TypeAndValue.Pointer
+        LLVMBackend::NamedVariable& result, bool markRvalue) {
+        if (markRvalue && result.Primary != nullptr && !result.TypeAndValue.IsAlias)
+            result.IsRvalue = true;
+        if (!result.TypeAndValue.IsAlias
+            || (result.TypeAndValue.Pointer && !result.TypeAndValue.IsCxxRefToPointer)
             || result.Primary == nullptr)
             return;
 
@@ -14675,6 +14723,10 @@ std::string MainListener::NextMemberName(CFlatParser::PostfixExpressionContext* 
         {
             if (children[i] != opNode) continue;
             auto* next = children[i + 1];
+            auto* nextRule = dynamic_cast<antlr4::RuleContext*>(next);
+            if (nextRule != nullptr
+                && nextRule->getRuleIndex() == CFlatParser::RuleMemberNameToken)
+                return next->getText();
             if (next->getTreeType() != antlr4::tree::ParseTreeType::TERMINAL) return "";
             auto* term = dynamic_cast<antlr4::tree::TerminalNode*>(next);
             auto tok = term->getSymbol()->getType();

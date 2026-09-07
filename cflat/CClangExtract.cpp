@@ -20,6 +20,7 @@
 #include "clang/AST/Attr.h"
 #include "clang/AST/Decl.h"
 #include "clang/AST/DeclCXX.h"
+#include "clang/AST/CXXInheritance.h"
 #include "clang/AST/Expr.h"
 #include "clang/AST/Mangle.h"
 #include "clang/AST/RecursiveASTVisitor.h"
@@ -27,6 +28,7 @@
 #include "clang/AST/VTableBuilder.h"
 #include "clang/AST/BaseSubobject.h"
 #include "clang/Basic/Diagnostic.h"
+#include "clang/Basic/TargetInfo.h"
 #include "clang/CodeGen/CGFunctionInfo.h"
 #include "clang/CodeGen/CodeGenABITypes.h"
 #include "clang/CodeGen/ModuleBuilder.h"
@@ -59,11 +61,92 @@
 
 #include <set>
 #include <algorithm>
+#include <cctype>
+#include <string_view>
 #include <unordered_set>
+#include <format>
 
 namespace cflat_cinterop
 {
     using namespace clang;
+
+    bool SplitStdFunctionSpelling(const std::string& spelling, std::string& ret,
+                                  std::string& params)
+    {
+        ret.clear();
+        params.clear();
+        constexpr std::string_view prefix = "std::function<";
+        const size_t prefixPos = spelling.find(prefix);
+        if (prefixPos == std::string::npos) return false;
+        const size_t bodyStart = prefixPos + prefix.size();
+
+        size_t outerClose = std::string::npos;
+        int outerAngleDepth = 1;
+        for (size_t i = bodyStart; i < spelling.size(); ++i)
+        {
+            if (spelling[i] == '<')
+                ++outerAngleDepth;
+            else if (spelling[i] == '>')
+            {
+                if (--outerAngleDepth == 0)
+                {
+                    outerClose = i;
+                    break;
+                }
+                if (outerAngleDepth < 0) return false;
+            }
+        }
+        if (outerClose == std::string::npos) return false;
+
+        size_t openParen = std::string::npos;
+        size_t closeParen = std::string::npos;
+        int angleDepth = 0;
+        int parenDepth = 0;
+        for (size_t i = bodyStart; i < outerClose; ++i)
+        {
+            const char c = spelling[i];
+            if (c == '<')
+            {
+                ++angleDepth;
+                continue;
+            }
+            if (c == '>')
+            {
+                if (angleDepth == 0) return false;
+                --angleDepth;
+                continue;
+            }
+            if (c == '(')
+            {
+                if (angleDepth == 0 && parenDepth == 0 && openParen == std::string::npos)
+                    openParen = i;
+                ++parenDepth;
+                continue;
+            }
+            if (c == ')')
+            {
+                if (parenDepth == 0) return false;
+                --parenDepth;
+                if (parenDepth == 0) closeParen = i;
+            }
+        }
+        if (angleDepth != 0 || openParen == std::string::npos
+            || closeParen == std::string::npos || parenDepth != 0)
+            return false;
+        for (size_t i = closeParen + 1; i < outerClose; ++i)
+            if (!std::isspace((unsigned char)spelling[i])) return false;
+
+        const auto trim = [](std::string value) {
+            size_t first = 0;
+            while (first < value.size() && std::isspace((unsigned char)value[first])) ++first;
+            size_t last = value.size();
+            while (last > first && std::isspace((unsigned char)value[last - 1])) --last;
+            return value.substr(first, last - first);
+        };
+        ret = trim(spelling.substr(bodyStart, openParen - bodyStart));
+        params = trim(spelling.substr(openParen + 1, closeParen - openParen - 1));
+        return !ret.empty();
+    }
 
     namespace
     {
@@ -79,6 +162,14 @@ namespace cflat_cinterop
                 && s.rfind("const enum ", 0) != 0)
                 s.insert(s.rfind("const ", 0) == 0 ? 6 : 0, "enum ");
             return s;
+        }
+
+        std::string CxxBridgeSuffix(const std::string& spelling)
+        {
+            std::string out;
+            for (char c : spelling)
+                out += std::isalnum((unsigned char)c) ? c : '_';
+            return out.empty() ? "type" : out;
         }
 
         std::string CxxQualifiedName(const NamedDecl* d)
@@ -110,6 +201,56 @@ namespace cflat_cinterop
                 startOfComponent = false;
             }
             return !startOfComponent;
+        }
+
+        RawDefaultArg DefaultArgumentOf(const ParmVarDecl* p, ASTContext& ctx)
+        {
+            RawDefaultArg result;
+            if (p == nullptr || !p->hasDefaultArg()) return result;
+            // A template member default is not instantiated until used: never a constant here.
+            if (p->hasUninstantiatedDefaultArg()) { result.kind = "nonconst"; return result; }
+            const Expr* init = p->getDefaultArg();
+            if (init == nullptr || init->containsErrors() || init->isValueDependent())
+            {
+                result.kind = "nonconst";
+                return result;
+            }
+            init = init->IgnoreParenImpCasts();
+            if (llvm::isa<CXXNullPtrLiteralExpr>(init))
+            {
+                result.kind = "nullptr";
+                result.value = "nullptr";
+                return result;
+            }
+            Expr::EvalResult ev;
+            if (!init->EvaluateAsRValue(ev, ctx))
+            {
+                result.kind = "nonconst";
+                return result;
+            }
+            if (ev.Val.isInt())
+            {
+                const bool isSigned = p->getType()->isSignedIntegerOrEnumerationType();
+                llvm::SmallString<64> text;
+                ev.Val.getInt().toString(text, 10, isSigned);
+                result.value = text.str().str();
+                result.kind = p->getType()->isBooleanType() ? "bool"
+                    : p->getType()->isEnumeralType() ? "enum" : "int";
+                return result;
+            }
+            if (ev.Val.isFloat())
+            {
+                llvm::APFloat f = ev.Val.getFloat();
+                bool losesInfo = false;
+                f.convert(llvm::APFloat::IEEEdouble(), llvm::APFloat::rmNearestTiesToEven,
+                          &losesInfo);
+                result.kind = p->getType()->isSpecificBuiltinType(BuiltinType::Float)
+                    ? "float" : "double";
+                result.value = std::format("{:.17g}", f.convertToDouble());
+                return result;
+            }
+            result.kind = "nonconst";
+            return result;
         }
 
         std::string CxxLinkageName(ASTContext& ctx, const FunctionDecl* fd)
@@ -225,6 +366,7 @@ namespace cflat_cinterop
             std::unordered_set<unsigned> emittedProbes;  // probe slots that produced a RawMacro
             std::unordered_set<std::string> emittedGlobals;  // dedup global var redeclarations by name
             std::unordered_set<std::string> emittedOpaqueForward;  // dedup opaque forward-decl records by tag
+            std::unordered_set<const RecordDecl*> emittedDefinedRecords;
             std::vector<std::string> normDirs; // req.inScopeDirs normalized once (NormPath + trailing-/ stripped)
             // Set in BeginSourceFileAction so the ABI pass can build a CodeGenerator against the
             // very invocation that produced the AST (same triple, same target features).
@@ -232,6 +374,8 @@ namespace cflat_cinterop
             // cxxMode only: (index into out.sigs, the decl it came from). Resolved after the
             // traversal so a single CodeGenerator serves every declaration.
             std::vector<std::pair<size_t, const FunctionDecl*>> abiWork;
+            std::vector<QualType> functionPointerAbiWork;
+            std::unordered_set<std::string> functionPointerAbiSeen;
             // cxxMode only: (index into out.records, index into that record's members, decl).
             struct MemberAbiWork { size_t recordIdx; size_t memberIdx; const CXXMethodDecl* md; };
             std::vector<MemberAbiWork> memberAbiWork;
@@ -248,6 +392,7 @@ namespace cflat_cinterop
             // inline / constexpr static data members whose storage lives in the companion module.
             std::vector<const CXXRecordDecl*> vtableWork;
             std::vector<const VarDecl*> varEmitWork;
+            std::vector<std::string> incompleteCxxTypes;
             ExtractState(const ExtractRequest& r, ExtractResult& o) : req(r), out(o)
             {
                 for (const auto& d : r.inScopeDirs)
@@ -258,6 +403,30 @@ namespace cflat_cinterop
                 }
             }
         };
+
+        void QueueIncompleteCxxType(ExtractState& st, ASTContext& ctx, QualType qt)
+        {
+            if (!st.req.cxxMode) return;
+            qt = qt.getCanonicalType();
+            if (!qt->isRecordType() || !qt->isIncompleteType()) return;
+            const auto* cxx = qt->getAsCXXRecordDecl();
+            if (cxx == nullptr || !llvm::isa<ClassTemplateSpecializationDecl>(cxx)) return;
+            std::string spelling = CanonicalSpelling(ctx, qt);
+            if (std::find(st.incompleteCxxTypes.begin(), st.incompleteCxxTypes.end(), spelling)
+                    == st.incompleteCxxTypes.end())
+                st.incompleteCxxTypes.push_back(std::move(spelling));
+        }
+
+        void QueueFunctionPointerAbi(ExtractState& st, ASTContext& ctx, QualType qt)
+        {
+            if (!st.req.cxxMode) return;
+            QualType t = qt.getCanonicalType();
+            if (t->isPointerType()) t = t->getPointeeType().getCanonicalType();
+            if (t->getAs<FunctionProtoType>() == nullptr) return;
+            std::string key = CanonicalSpelling(ctx, t);
+            if (st.functionPointerAbiSeen.insert(key).second)
+                st.functionPointerAbiWork.push_back(t);
+        }
 
         // Prepass PPCallbacks: collect object-like macro names (-> probe list) and reconstruct
         // function-like macros directly. Empty object-like macros (include guards) are skipped.
@@ -446,11 +615,16 @@ namespace cflat_cinterop
                     || fd->getExceptionSpecType() == EST_NoexceptTrue
                     || fd->getExceptionSpecType() == EST_NoThrow;
                 sig.file = file; sig.line = line; sig.col = col;
+                QueueIncompleteCxxType(st, ctx, fd->getReturnType());
                 for (const ParmVarDecl* p : fd->parameters())
                 {
                     sig.paramTypes.push_back(CanonicalSpelling(ctx, p->getType()));
                     sig.paramNames.push_back(p->getNameAsString());
+                    sig.defaultArgs.push_back(DefaultArgumentOf(p, ctx));
+                    QueueIncompleteCxxType(st, ctx, p->getType());
+                    QueueFunctionPointerAbi(st, ctx, p->getType());
                 }
+                QueueFunctionPointerAbi(st, ctx, fd->getReturnType());
                 if (st.req.cxxMode && !fd->isVariadic())
                     st.abiWork.emplace_back(st.out.sigs.size(), fd);
                 st.out.sigs.push_back(std::move(sig));
@@ -465,6 +639,15 @@ namespace cflat_cinterop
 
                 RawEnum e;
                 e.name = ec->getNameAsString();
+                const auto* ed = llvm::dyn_cast<EnumDecl>(ec->getDeclContext());
+                if (st.req.cxxMode)
+                {
+                    if (ed != nullptr)
+                    {
+                        e.enumType = CxxQualifiedName(ed);
+                        e.underlyingType = CanonicalSpelling(ctx, ed->getIntegerType());
+                    }
+                }
                 e.value = ApsIntToLongLong(ec->getInitVal());
                 e.file = file; e.line = line; e.col = col;
                 // C++ mode also publishes the QUALIFIED spelling, so a scoped or class-nested
@@ -481,6 +664,32 @@ namespace cflat_cinterop
                         q.name = qualified;
                         st.out.enums.push_back(std::move(q));
                     }
+                    if (ed != nullptr && !ed->isScoped())
+                    {
+                        const std::string enumQualified = CxxQualifiedName(ed);
+                        const size_t dot = enumQualified.rfind('.');
+                        const std::string parent = dot == std::string::npos
+                            ? std::string{} : enumQualified.substr(0, dot);
+                        const std::string injected = parent.empty()
+                            ? e.name : parent + "." + e.name;
+                        if (injected != e.name && injected != qualified && IsValidDottedName(injected))
+                        {
+                            RawEnum q = e;
+                            q.name = injected;
+                            st.out.enums.push_back(std::move(q));
+                        }
+                    }
+                    if (ed != nullptr)
+                    {
+                        const std::string enumMember = CxxQualifiedName(ed) + "." + e.name;
+                        if (enumMember != e.name && enumMember != qualified
+                            && IsValidDottedName(enumMember))
+                        {
+                            RawEnum q = e;
+                            q.name = enumMember;
+                            st.out.enums.push_back(std::move(q));
+                        }
+                    }
                 }
                 st.out.enums.push_back(std::move(e));
                 return true;
@@ -495,7 +704,6 @@ namespace cflat_cinterop
             {
                 int anonIdx = 0;
                 const ASTRecordLayout& layout = ctx.getASTRecordLayout(rd);
-                unsigned fieldIndex = 0;
                 for (const FieldDecl* f : rd->fields())
                 {
                     if (f->getDeclName().isEmpty())
@@ -506,9 +714,8 @@ namespace cflat_cinterop
                             rf.isBitfield = true;
                             rf.bitWidth = f->getBitWidthValue();
                             rf.ctype = CanonicalSpelling(ctx, f->getType());
-                            rf.offsetBytes = layout.getFieldOffset(fieldIndex) / 8;
+                            rf.offsetBytes = layout.getFieldOffset(f->getFieldIndex()) / 8;
                             rec.fields.push_back(std::move(rf));
-                            ++fieldIndex;
                             continue;
                         }
                         const RecordType* rt = f->getType()->getAs<RecordType>();
@@ -534,18 +741,22 @@ namespace cflat_cinterop
                             RawField fe;
                             fe.name = "__anon" + std::to_string(idx);
                             fe.ctype = (isUnion ? "union " : "struct ") + synTag;
-                            fe.offsetBytes = layout.getFieldOffset(fieldIndex) / 8;
+                            fe.offsetBytes = layout.getFieldOffset(f->getFieldIndex()) / 8;
                             rec.fields.push_back(std::move(fe));
-                            ++fieldIndex;
                         }
-                        ++fieldIndex;
                         continue;  // unnamed non-bitfield non-anon: nothing to record
                     }
 
                     RawField rf;
                     rf.name = f->getNameAsString();
                     rf.access = MapAccess(f->getAccess());
-                    rf.offsetBytes = layout.getFieldOffset(fieldIndex) / 8;
+                    rf.offsetBytes = layout.getFieldOffset(f->getFieldIndex()) / 8;
+                    if (st.req.cxxMode && f->getType()->isReferenceType())
+                    {
+                        rec.layoutRefusal = std::format(
+                            "field '{}' of '{}' is a C++ reference; reference members are not supported",
+                            rf.name, tag);
+                    }
 
                     // Named field whose type is a *truly unnamed* (no tag, no typedef-for-linkage
                     // name) record - the `_LARGE_INTEGER::u` shape: `struct { DWORD LowPart;
@@ -601,7 +812,6 @@ namespace cflat_cinterop
                         rf.bitWidth = f->getBitWidthValue();
                     }
                     rec.fields.push_back(std::move(rf));
-                    ++fieldIndex;
                 }
             }
 
@@ -616,8 +826,15 @@ namespace cflat_cinterop
              * declaration once a single CodeGenerator exists.
              */
             void CollectCxxMembers(const CXXRecordDecl* cxx, RawRecord& rec,
-                                   std::vector<const CXXMethodDecl*>& outDecls)
+                                   std::vector<const CXXMethodDecl*>& outDecls,
+                                   bool requestedRecord)
             {
+                const auto* spec = llvm::dyn_cast<ClassTemplateSpecializationDecl>(cxx);
+                const bool isVector = requestedRecord && cxx->getQualifiedNameAsString() == "std::vector"
+                                   && spec != nullptr && spec->getTemplateArgs().size() >= 1
+                                   && spec->getTemplateArgs()[0].getKind() == TemplateArgument::Type;
+                const std::string requestSpelling = st.req.cxxTypeRequests.empty()
+                    ? std::string{} : st.req.cxxTypeRequests.front().cxxSpelling;
                 rec.isPolymorphic = cxx->isPolymorphic() || cxx->getNumVBases() > 0;
                 // A polymorphic class needs a vtable. Clang decides whether this translation unit
                 // owns it (all-inline: linkonce_odr here) or whether a key function anchors it in
@@ -668,7 +885,10 @@ namespace cflat_cinterop
                             else
                                 allDefaulted = false;
                         }
-                        if (!allDefaulted) continue;
+                        // Keep requested constructor templates; general function-template
+                        // deduction remains unsupported.
+                        const bool constructorTemplate = llvm::isa<CXXConstructorDecl>(pattern);
+                        if (!allDefaulted && !constructorTemplate) continue;
                         bool dependent = pattern->getReturnType()->isDependentType();
                         for (const ParmVarDecl* p : pattern->parameters())
                             dependent = dependent || p->getType()->isDependentType();
@@ -692,6 +912,10 @@ namespace cflat_cinterop
 
                 for (const CXXMethodDecl* md : methodList)
                 {
+                    if (isVector && (md->getNameAsString() == "data"
+                                     || md->getNameAsString() == "begin"
+                                     || md->getNameAsString() == "end"))
+                        continue;
                     const bool templateExtra = templateExtras.count(md) != 0;
                     // Templates and their specializations need Sema instantiation (M5), except the
                     // all-defaulted member templates selected above.
@@ -719,10 +943,40 @@ namespace cflat_cinterop
                         case OO_Subscript: case OO_EqualEqual: case OO_ExclaimEqual:
                         case OO_Plus: case OO_Minus: case OO_Star: case OO_Slash:
                         case OO_PlusEqual: case OO_MinusEqual:
-                        case OO_Less: case OO_Greater:
+                        case OO_Less: case OO_Greater: case OO_LessEqual: case OO_GreaterEqual:
+                        case OO_Percent: case OO_PercentEqual: case OO_StarEqual: case OO_SlashEqual:
+                        case OO_LessLess: case OO_GreaterGreater:
+                        case OO_LessLessEqual: case OO_GreaterGreaterEqual:
+                        case OO_Amp: case OO_Pipe: case OO_Caret:
+                        case OO_AmpEqual: case OO_PipeEqual: case OO_CaretEqual:
+                        case OO_Exclaim:
+                            isBindableOperator = true; break;
+                        case OO_PlusPlus: case OO_MinusMinus:
+                            isBindableOperator = md->getNumParams() == 0; break;
+                        case OO_Arrow:
+                            isBindableOperator = true; break;
+                        // CFlat's unary `~` hook is an arity-0 member, so only that form binds;
+                        // a binary `operator~` does not exist in C++, but the guard is free.
+                        case OO_Tilde:
+                            isBindableOperator = md->getNumParams() == 0; break;
+                        // `obj(args)` is CFlat's spelling for a member operator(). Every class
+                        // exports it (not only a type-requested one), and each arity/parameter
+                        // overload registers separately.
+                        case OO_Call:
                             isBindableOperator = true; break;
                         default: break;
                     }
+                    /*
+                     * Every conversion function is exported, explicit or not: CFlat binds them
+                     * ONLY at an explicit cast `(T)obj`, which is what C++ `explicit` already
+                     * means, so the two spellings need no distinction here. The registration side
+                     * renames the member to "operator <CFlat spelling>" and refuses a target the
+                     * type map cannot express.
+                     */
+                    const auto* conversion = llvm::dyn_cast<CXXConversionDecl>(md);
+                    const bool isBindableBoolConversion = conversion != nullptr
+                        && conversion->getConversionType().getCanonicalType()->isBooleanType();
+                    if (conversion != nullptr) isBindableOperator = true;
                     if (ctor == nullptr && dtor == nullptr && md->getIdentifier() == nullptr
                         && !isAssignSpecial && !isBindableOperator)
                         continue;
@@ -745,7 +999,8 @@ namespace cflat_cinterop
                     {
                         m.kind = md->isStatic() ? RawCxxMember::StaticMethod
                                                 : RawCxxMember::Instance;
-                        m.name = md->getNameAsString();
+                        m.isConversion = conversion != nullptr;
+                        m.name = isBindableBoolConversion ? "operator bool" : md->getNameAsString();
                         m.isCopyAssign = md->isCopyAssignmentOperator();
                         m.isMoveAssign = md->isMoveAssignmentOperator();
                         if (m.name.empty()) m.name = "operator=";
@@ -777,12 +1032,28 @@ namespace cflat_cinterop
                                 m.covariantReturnNeedsAdjust = true;   // cannot prove it is free
                                 continue;
                             }
-                            const ASTRecordLayout& rl =
-                                ctx.getASTRecordLayout(mineRd->getDefinition());
-                            if (!mineRd->getDefinition()->isDerivedFrom(theirsRd->getDefinition())
-                                || rl.getBaseClassOffset(theirsRd->getDefinition())
-                                       .getQuantity() != 0)
+                            // getBaseClassOffset knows DIRECT bases only: walk the inheritance path
+                            // so an indirect base neither asserts nor silently reads offset zero.
+                            CXXBasePaths paths;
+                            if (!mineRd->getDefinition()->isDerivedFrom(theirsRd->getDefinition(), paths)
+                                || paths.begin() == paths.end())
                                 m.covariantReturnNeedsAdjust = true;
+                            else
+                            {
+                                int64_t total = 0;
+                                bool unprovable = false;
+                                for (const CXXBasePathElement& el : *paths.begin())
+                                {
+                                    const auto* baseRd = el.Base->getType()->getAsCXXRecordDecl();
+                                    if (el.Base->isVirtual() || baseRd == nullptr
+                                        || baseRd->getDefinition() == nullptr || el.Class == nullptr
+                                        || el.Class->getDefinition() == nullptr)
+                                    { unprovable = true; break; }
+                                    total += ctx.getASTRecordLayout(el.Class->getDefinition())
+                                                 .getBaseClassOffset(baseRd->getDefinition()).getQuantity();
+                                }
+                                if (unprovable || total != 0) m.covariantReturnNeedsAdjust = true;
+                            }
                         }
                     m.isDeleted = md->isDeleted();
                     m.isDefaulted = md->isDefaulted();
@@ -804,7 +1075,8 @@ namespace cflat_cinterop
                         m.retType = "void *";
                     }
                     else
-                        m.retType = CanonicalSpelling(ctx, md->getReturnType());
+                        m.retType = CanonicalSpelling(ctx, isBindableBoolConversion
+                            ? conversion->getConversionType() : md->getReturnType());
 
                     if (m.kind == RawCxxMember::Instance || m.kind == RawCxxMember::Constructor
                         || m.kind == RawCxxMember::Destructor)
@@ -814,11 +1086,13 @@ namespace cflat_cinterop
                         m.paramTypes.push_back(CanonicalSpelling(ctx,
                             ctx.getPointerType(ctx.getCanonicalTagType(cxx))));
                         m.paramNames.push_back("this");
+                        m.defaultArgs.push_back({});
                     }
                     for (const ParmVarDecl* p : md->parameters())
                     {
                         m.paramTypes.push_back(CanonicalSpelling(ctx, p->getType()));
                         m.paramNames.push_back(p->getNameAsString());
+                        m.defaultArgs.push_back(DefaultArgumentOf(p, ctx));
                     }
                     // Refuse before any arrangement: an incomplete by-value type has no layout.
                     for (const ParmVarDecl* p : md->parameters())
@@ -872,11 +1146,107 @@ namespace cflat_cinterop
                     rec.members.push_back(std::move(m));
                 }
 
+                if (isVector)
+                {
+                    const std::string elem = CanonicalSpelling(ctx,
+                        spec->getTemplateArgs()[0].getAsType());
+                    const std::string suffix = CxxBridgeSuffix(requestSpelling);
+                    auto addBridge = [&](const char* name) {
+                        RawCxxMember m;
+                        m.name = name;
+                        m.linkageName = std::string("__cflat_std_vector_") + name + "_" + suffix;
+                        m.retType = elem + " *";
+                        m.paramTypes.push_back(CanonicalSpelling(ctx,
+                            ctx.getPointerType(ctx.getCanonicalTagType(cxx))));
+                        m.paramNames.push_back("this");
+                        m.isNoexcept = true;
+                        m.access = AccessPublic;
+                        m.abi.valid = true;
+                        m.abi.ret.kind = RawAbiSlot::Direct;
+                        m.abi.ret.coerceType = "ptr";
+                        m.abi.params.resize(1);
+                        m.abi.params[0].kind = RawAbiSlot::Direct;
+                        m.abi.params[0].coerceType = "ptr";
+                        m.abi.fnTypeText = "ptr (ptr)";
+                        rec.members.push_back(std::move(m));
+                        outDecls.push_back(nullptr);
+                    };
+                    addBridge("data");
+                    addBridge("begin");
+                    addBridge("end");
+                }
+
+                if (requestedRecord && cxx->getNameAsString() == "optional"
+                    && cxx->getQualifiedNameAsString() == "std::optional")
+                {
+                    RawCxxMember m;
+                    m.name = "has_value";
+                    m.linkageName = "__cflat_optional_has_value";
+                    m.retType = "bool";
+                    m.paramTypes.push_back(CanonicalSpelling(ctx,
+                        ctx.getPointerType(ctx.getCanonicalTagType(cxx))));
+                    m.paramNames.push_back("this");
+                    m.isConst = true;
+                    m.isNoexcept = true;
+                    m.access = AccessPublic;
+                    m.abi.valid = true;
+                    m.abi.ret.kind = RawAbiSlot::Direct;
+                    m.abi.ret.coerceType = "i1";
+                    m.abi.params.resize(1);
+                    m.abi.params[0].kind = RawAbiSlot::Direct;
+                    m.abi.params[0].coerceType = "ptr";
+                    m.abi.fnTypeText = "i1 (ptr)";
+                    rec.members.push_back(std::move(m));
+                    outDecls.push_back(nullptr);
+
+                    const auto* spec = llvm::dyn_cast<ClassTemplateSpecializationDecl>(cxx);
+                    if (spec != nullptr && spec->getTemplateArgs().size() == 1
+                        && spec->getTemplateArgs()[0].getKind() == TemplateArgument::Type
+                        && CanonicalSpelling(ctx, spec->getTemplateArgs()[0].getAsType()) == "int")
+                    {
+                        RawCxxMember value;
+                        value.name = "value";
+                        value.linkageName = "__cflat_optional_value";
+                        value.retType = "int";
+                        value.paramTypes.push_back(CanonicalSpelling(ctx,
+                            ctx.getPointerType(ctx.getCanonicalTagType(cxx))));
+                        value.paramNames.push_back("this");
+                        value.isConst = true;
+                        value.isNoexcept = false;
+                        value.access = AccessPublic;
+                        value.abi.valid = true;
+                        value.abi.ret.kind = RawAbiSlot::Direct;
+                        value.abi.ret.coerceType = "i32";
+                        value.abi.params.resize(1);
+                        value.abi.params[0].kind = RawAbiSlot::Direct;
+                        value.abi.params[0].coerceType = "ptr";
+                        value.abi.fnTypeText = "i32 (ptr)";
+                        rec.members.push_back(std::move(value));
+                        outDecls.push_back(nullptr);
+                    }
+                }
+
                 for (const Decl* d : cxx->decls())
                 {
                     const auto* vd = llvm::dyn_cast<VarDecl>(d);
                     if (vd == nullptr || !vd->isStaticDataMember()) continue;
                     if (vd->getIdentifier() == nullptr) continue;
+                    if (vd->isConstexpr() && vd->getInit() != nullptr)
+                    {
+                        Expr::EvalResult result;
+                        if (vd->getInit()->EvaluateAsInt(result, ctx) && result.Val.isInt())
+                        {
+                            RawCxxStaticVar sv;
+                            sv.name = vd->getNameAsString();
+                            sv.ctype = CanonicalSpelling(ctx, vd->getType());
+                            sv.isCompileTimeConstant = true;
+                            sv.constantValue = result.Val.getInt().getExtValue();
+                            sv.access = MapAccess(vd->getAccess());
+                            LocOfRaw(vd, sv.file, sv.line, sv.col);
+                            rec.staticVars.push_back(std::move(sv));
+                            continue;
+                        }
+                    }
                     // An inline / constexpr static member is emitted per-TU on demand, so the
                     // bound library need not contain it. Only an out-of-line definition is a
                     // symbol CFlat may read.
@@ -941,7 +1311,8 @@ namespace cflat_cinterop
                     if (brd == nullptr || brd->getDefinition() == nullptr) return false;
                     brd = brd->getDefinition();
                     const uint64_t off = baseOff
-                        + (uint64_t)layout.getBaseClassOffset(brd).getQuantity();
+                        + (uint64_t)(b.isVirtual() ? layout.getVBaseClassOffset(brd)
+                                                   : layout.getBaseClassOffset(brd)).getQuantity();
                     const bool basePublic = b.getAccessSpecifier() == AS_public;
                     if (!FlattenCxxLayout(brd, off, nameable && basePublic, ownNames,
                                           /*isOutermost*/ false, taken, synth, rec))
@@ -1037,7 +1408,8 @@ namespace cflat_cinterop
              * a libc++ container's fields are private implementation detail CFlat never names, and
              * several of them have no CFlat spelling at all.
              */
-            void EmitDefinedRecord(RecordDecl* rd, const std::string& nameOverride)
+            void EmitDefinedRecord(RecordDecl* rd, const std::string& nameOverride,
+                                   bool forcedBase = false)
             {
                 // A class-template PATTERN, a partial specialization, or any record nested inside
                 // one is DEPENDENT: it has no record layout, and asking clang for one recurses
@@ -1048,6 +1420,9 @@ namespace cflat_cinterop
                         || llvm::isa<clang::ClassTemplatePartialSpecializationDecl>(dep)
                         || dep->isDependentContext())
                         return;
+                // A specialization that is only NAMED (a declared function's return type) is
+                // never instantiated: it has no definition and no layout. Skip it here.
+                if (!rd->isCompleteDefinition()) return;
                 std::string file; int line = 1, col = 0;
                 // Collect records regardless of scope (LocOfRaw, not LocOf): an in-scope struct
                 // may reference an out-of-scope struct by value (e.g. MSG.pt is a POINT defined
@@ -1055,6 +1430,12 @@ namespace cflat_cinterop
                 // records and drops the rest, so the dependency is available without registering
                 // every unrelated SDK struct.
                 if (!LocOfRaw(rd, file, line, col)) return;
+                // Do not walk standard-library template catalogs as transitive C++ layout.
+                if (st.req.requireInScope && nameOverride.empty() && !forcedBase
+                    && llvm::isa<CXXRecordDecl>(rd) && !PathInScope(file, st.normDirs)) return;
+                if (nameOverride.empty()
+                    && !st.emittedDefinedRecords.insert(rd).second)
+                    return;
 
                 RawRecord rec;
                 rec.name = rd->getNameAsString();
@@ -1076,7 +1457,7 @@ namespace cflat_cinterop
                 rec.isUnion = rd->isUnion();
                 rec.isCxx = st.req.cxxMode;
                 rec.file = file; rec.line = line; rec.col = col;
-                rec.inScope = !nameOverride.empty() || !st.req.requireInScope
+                rec.inScope = forcedBase || !nameOverride.empty() || !st.req.requireInScope
                            || PathInScope(file, st.normDirs);
                 if (st.req.cxxMode && llvm::isa<CXXRecordDecl>(rd))
                     rec.canonicalCtype = CanonicalSpelling(ctx, ctx.getCanonicalTagType(rd));
@@ -1093,7 +1474,8 @@ namespace cflat_cinterop
                         && !cxx->hasNonTrivialDestructor() && !cxx->isPolymorphic();
                     if (cxx->hasDefinition())
                     {
-                        CollectCxxMembers(cxx, rec, memberDecls);
+                        if (rec.inScope || !st.req.requireInScope || !nameOverride.empty())
+                            CollectCxxMembers(cxx, rec, memberDecls, !nameOverride.empty());
                         for (const CXXBaseSpecifier& b : cxx->bases())
                         {
                             const auto* brd = b.getType()->getAsCXXRecordDecl();
@@ -1102,8 +1484,9 @@ namespace cflat_cinterop
                             rb.access = MapAccess(b.getAccessSpecifier());
                             rb.isVirtual = b.isVirtual();
                             if (brd != nullptr && brd->getDefinition() != nullptr)
-                                rb.offsetBytes = (uint64_t)ctx.getASTRecordLayout(cxx)
-                                    .getBaseClassOffset(brd->getDefinition()).getQuantity();
+                                rb.offsetBytes = (uint64_t)(b.isVirtual()
+                                    ? ctx.getASTRecordLayout(cxx).getVBaseClassOffset(brd->getDefinition())
+                                    : ctx.getASTRecordLayout(cxx).getBaseClassOffset(brd->getDefinition())).getQuantity();
                             rec.bases.push_back(std::move(rb));
                         }
                         // A vptr or a base subobject has no CFlat spelling, so the layout is
@@ -1129,7 +1512,8 @@ namespace cflat_cinterop
                         }
                     }
                 }
-                if (!nameOverride.empty())
+                const bool pairValue = nameOverride.starts_with("std.pair$");
+                if (!nameOverride.empty() && !pairValue)
                 {
                     rec.fields.clear();
                     rec.layoutRefusal.clear();
@@ -1144,6 +1528,22 @@ namespace cflat_cinterop
                         if (memberDecls[i] != nullptr)
                             st.memberAbiWork.push_back({ recIdx, i, memberDecls[i] });
                 }
+                if (rec.inScope && nameOverride.empty())
+                    if (const auto* cxx = llvm::dyn_cast<CXXRecordDecl>(rd))
+                    {
+                        std::function<void(const CXXRecordDecl*)> emitBases;
+                        emitBases = [&](const CXXRecordDecl* current) {
+                            for (const CXXBaseSpecifier& b : current->bases())
+                            {
+                                const auto* base = b.getType()->getAsCXXRecordDecl();
+                                if (base == nullptr || base->getDefinition() == nullptr) continue;
+                                CXXRecordDecl* def = base->getDefinition();
+                                EmitDefinedRecord(def, std::string(), true);
+                                emitBases(def);
+                            }
+                        };
+                        emitBases(cxx);
+                    }
             }
 
             /*
@@ -1194,12 +1594,39 @@ namespace cflat_cinterop
                     CXXRecordDecl* def = cxx->getDefinition();
                     if (def == nullptr) continue;
                     EmitDefinedRecord(def, st.req.cxxTypeRequests[i].cflatName);
+                    std::string ret;
+                    std::string params;
+                    const std::string& spelling = st.req.cxxTypeRequests[i].cxxSpelling;
+                    if (SplitStdFunctionSpelling(spelling, ret, params))
+                    {
+                        auto& rec = st.out.records.back();
+                        RawCxxMember ctor;
+                        ctor.kind = RawCxxMember::Constructor;
+                        ctor.name = "__ctor";
+                        ctor.linkageName = "__cflat_std_function_ctor_";
+                        for (char c : spelling)
+                            ctor.linkageName += std::isalnum((unsigned char)c) ? c : '_';
+                        ctor.retType = "void *";
+                        ctor.paramTypes = { spelling + " *", ret + " (*) (" + params + ")" };
+                        ctor.paramNames = { "this", "a1" };
+                        ctor.returnsThis = true;
+                        ctor.access = AccessPublic;
+                        ctor.abi.valid = true;
+                        ctor.abi.ret.kind = RawAbiSlot::Direct;
+                        ctor.abi.params.resize(2);
+                        ctor.abi.params[0].kind = RawAbiSlot::Direct;
+                        ctor.abi.params[1].kind = RawAbiSlot::Direct;
+                        rec.members.push_back(std::move(ctor));
+                    }
                 }
             }
 
             bool VisitTypedefNameDecl(TypedefNameDecl* td)
             {
                 if (!td->getIdentifier()) return true;
+                if (auto* alias = llvm::dyn_cast<TypeAliasDecl>(td);
+                    alias != nullptr && alias->getDescribedAliasTemplate() != nullptr)
+                    return true;
                 std::string name = td->getNameAsString();
                 QualType u = td->getUnderlyingType();
                 std::string sugared = u.getAsString(ctx.getPrintingPolicy());
@@ -1210,7 +1637,9 @@ namespace cflat_cinterop
                 // which the mapper strips to int. Mirrors the old CollectCTypedefsLibclang.
                 RawTypedef t;
                 t.name = name;
+                t.qualifiedName = st.req.cxxMode ? CxxQualifiedName(td) : name;
                 LocOfRaw(td, t.file, t.line, t.col);
+                if (st.req.requireInScope && !PathInScope(t.file, st.normDirs)) return true;
                 if (const RecordType* rt = u->getAs<RecordType>())
                 {
                     const RecordDecl* rd = rt->getDecl();
@@ -1220,6 +1649,34 @@ namespace cflat_cinterop
                 if (!canon.empty() && canon != name) t.underlying = canon;
                 else if (!sugared.empty())           t.underlying = sugared;
                 else                                  t.underlying = canon;
+                if (st.req.cxxMode && u->getAs<TemplateSpecializationType>() != nullptr)
+                {
+                    t.cxxSpecialization = canon.empty() ? sugared : canon;
+                    for (const char* prefix : { "class ", "struct " })
+                        if (t.cxxSpecialization.rfind(prefix, 0) == 0)
+                            t.cxxSpecialization.erase(0, std::strlen(prefix));
+                }
+                st.out.typedefs.push_back(std::move(t));
+                QueueFunctionPointerAbi(st, ctx, u);
+                return true;
+            }
+
+            bool VisitTypeAliasTemplateDecl(TypeAliasTemplateDecl* atd)
+            {
+                if (!st.req.cxxMode) return true;
+                auto* alias = atd != nullptr ? atd->getTemplatedDecl() : nullptr;
+                if (alias == nullptr || !alias->getIdentifier()) return true;
+                RawTypedef t;
+                t.name = alias->getNameAsString();
+                t.qualifiedName = CxxQualifiedName(alias);
+                LocOfRaw(atd, t.file, t.line, t.col);
+                if (st.req.requireInScope && !PathInScope(t.file, st.normDirs)) return true;
+                t.isCxxAliasTemplate = true;
+                t.cxxAliasPattern = alias->getUnderlyingType().getAsString(ctx.getPrintingPolicy());
+                t.underlying = t.cxxAliasPattern;
+                for (const NamedDecl* param : *atd->getTemplateParameters())
+                    if (const auto* typeParam = llvm::dyn_cast<TemplateTypeParmDecl>(param))
+                        t.cxxAliasParams.push_back(typeParam->getNameAsString());
                 st.out.typedefs.push_back(std::move(t));
                 return true;
             }
@@ -1360,13 +1817,14 @@ namespace cflat_cinterop
         {
             RawAbiSlot s;
             s.kind = AbiKindOf(ai);
-            s.inReg = ai.getInReg();
+            if (ai.isDirect() || ai.isExtend() || ai.isIndirect() || ai.isTargetSpecific())
+                s.inReg = ai.getInReg();
             if (ai.isDirect() || ai.isExtend())
             {
                 s.coerceType  = LlvmTypeText(ai.getCoerceToType());
                 s.paddingType = LlvmTypeText(ai.getPaddingType());
                 s.directOffset = (uint64_t)ai.getDirectOffset();
-                s.canBeFlattened = ai.getCanBeFlattened();
+                s.canBeFlattened = ai.isDirect() ? ai.getCanBeFlattened() : false;
                 if (ai.isExtend())
                 {
                     s.signExt = ai.isSignExt();
@@ -1395,6 +1853,38 @@ namespace cflat_cinterop
             return s;
         }
 
+        // A by-value parameter or return whose record was only NAMED (an uninstantiated
+        // specialization) has no layout; clang CodeGen cannot arrange such a prototype.
+        static bool ProtoHasIncompleteRecord(const FunctionProtoType* fpt)
+        {
+            auto incomplete = [](QualType t) {
+                t = t.getCanonicalType();
+                return t->isRecordType() && t->isIncompleteType();
+            };
+            if (incomplete(fpt->getReturnType())) return true;
+            for (QualType p : fpt->getParamTypes())
+                if (incomplete(p)) return true;
+            return false;
+        }
+
+        RawAbi DescribeAbi(const clang::CodeGen::CGFunctionInfo& fi)
+        {
+            RawAbi abi;
+            abi.valid = true;
+            abi.callingConv = fi.getEffectiveCallingConvention();
+            abi.ret = DescribeAbiSlot(fi.getReturnInfo());
+            unsigned next = (abi.ret.kind == RawAbiSlot::Indirect
+                          || abi.ret.kind == RawAbiSlot::IndirectAliased) ? 1u : 0u;
+            for (const auto& a : fi.arguments())
+            {
+                RawAbiSlot s = DescribeAbiSlot(a.info);
+                s.llvmArgIndex = next;
+                next += s.llvmArgCount;
+                abi.params.push_back(std::move(s));
+            }
+            return abi;
+        }
+
         /*
          * cxxMode: ask Clang for the calling convention of every collected C++ free function and
          * serialize it onto the RawSig. The CodeGenerator (and its LLVMContext / module) is
@@ -1408,7 +1898,8 @@ namespace cflat_cinterop
         void ComputeCxxAbi(ExtractState& st, ASTContext& ctx)
         {
             if (st.ci == nullptr) return;
-            if (st.abiWork.empty() && st.memberAbiWork.empty() && !st.req.emitDefinitions) return;
+            if (st.abiWork.empty() && st.functionPointerAbiWork.empty()
+                && st.memberAbiWork.empty() && !st.req.emitDefinitions) return;
             using namespace clang::CodeGen;
 
             llvm::LLVMContext llvmCtx;
@@ -1424,23 +1915,36 @@ namespace cflat_cinterop
                 CanQualType canon = fd->getType()->getCanonicalTypeUnqualified();
                 if (canon->getAs<FunctionProtoType>() == nullptr) continue;  // K&R / no prototype
                 CanQual<FunctionProtoType> fpt = canon.castAs<FunctionProtoType>();
+                if (ProtoHasIncompleteRecord(fpt.getTypePtr()))
+                {
+                    if (st.out.sigs[idx].bindRefusal.empty())
+                        st.out.sigs[idx].bindRefusal =
+                            "uses a C++ class template specialization that the header never instantiates";
+                    continue;
+                }
                 const CGFunctionInfo& fi = arrangeFreeFunctionType(cgm, fpt);
 
-                RawAbi abi;
-                abi.valid = true;
-                abi.callingConv = fi.getEffectiveCallingConvention();
+                RawAbi abi = DescribeAbi(fi);
                 abi.fnTypeText = LlvmTypeText(convertFreeFunctionType(cgm, fd));
-                abi.ret = DescribeAbiSlot(fi.getReturnInfo());
-                unsigned next = (abi.ret.kind == RawAbiSlot::Indirect
-                              || abi.ret.kind == RawAbiSlot::IndirectAliased) ? 1u : 0u;
-                for (const auto& a : fi.arguments())
-                {
-                    RawAbiSlot s = DescribeAbiSlot(a.info);
-                    s.llvmArgIndex = next;
-                    next += s.llvmArgCount;
-                    abi.params.push_back(std::move(s));
-                }
                 st.out.sigs[idx].abi = std::move(abi);
+            }
+
+            for (const QualType& queued : st.functionPointerAbiWork)
+            {
+                QualType t = queued.getCanonicalType();
+                if (t->isPointerType()) t = t->getPointeeType().getCanonicalType();
+                const auto* fptPtr = t->getAs<FunctionProtoType>();
+                if (fptPtr == nullptr || ProtoHasIncompleteRecord(fptPtr)) continue;
+                CanQual<FunctionProtoType> fpt =
+                    CanQual<FunctionProtoType>::CreateUnsafe(t);
+                const CGFunctionInfo& fi = arrangeFreeFunctionType(cgm, fpt);
+                RawFunctionPointerAbi plan;
+                plan.signature = CanonicalSpelling(ctx, t);
+                plan.retType = CanonicalSpelling(ctx, fptPtr->getReturnType());
+                for (QualType p : fptPtr->getParamTypes())
+                    plan.paramTypes.push_back(CanonicalSpelling(ctx, p));
+                plan.abi = DescribeAbi(fi);
+                st.out.functionPointerAbis.push_back(std::move(plan));
             }
 
             ComputeCxxMemberAbi(st, ctx, cgm, *cg);
@@ -1497,6 +2001,7 @@ namespace cflat_cinterop
                 CanQualType canon = md->getType()->getCanonicalTypeUnqualified();
                 if (canon->getAs<FunctionProtoType>() == nullptr) continue;
                 CanQual<FunctionProtoType> fpt = canon.castAs<FunctionProtoType>();
+                if (ProtoHasIncompleteRecord(fpt.getTypePtr())) continue;
 
                 const CGFunctionInfo* fi = nullptr;
                 if (m.kind == RawCxxMember::StaticMethod)
@@ -1505,19 +2010,7 @@ namespace cflat_cinterop
                     fi = &arrangeCXXMethodType(cgm, md->getParent(), fpt.getTypePtr(), md);
                 if (fi == nullptr) continue;
 
-                RawAbi abi;
-                abi.valid = true;
-                abi.callingConv = fi->getEffectiveCallingConvention();
-                abi.ret = DescribeAbiSlot(fi->getReturnInfo());
-                unsigned next = (abi.ret.kind == RawAbiSlot::Indirect
-                              || abi.ret.kind == RawAbiSlot::IndirectAliased) ? 1u : 0u;
-                for (const auto& a : fi->arguments())
-                {
-                    RawAbiSlot s = DescribeAbiSlot(a.info);
-                    s.llvmArgIndex = next;
-                    next += s.llvmArgCount;
-                    abi.params.push_back(std::move(s));
-                }
+                RawAbi abi = DescribeAbi(*fi);
                 // Structors: the arrangement above says the result is Ignore/void, but the
                 // emitted declaration returns 'this'. Take the real thing and mark the return
                 // as one plain pointer register the caller drops.
@@ -1584,12 +2077,18 @@ namespace cflat_cinterop
              */
             st.ci->getDiagnostics().Reset(/*soft*/ true);
 
+            auto inScopeDecl = [&](const Decl* d) {
+                if (!st.req.requireInScope) return true;
+                PresumedLoc pl = st.ci->getSourceManager().getPresumedLoc(d->getLocation());
+                return pl.isValid() && PathInScope(pl.getFilename(), st.normDirs);
+            };
+
             // Phase 1: show Clang the whole translation unit. Inline definitions stay deferred.
             for (Decl* d : ctx.getTranslationUnitDecl()->decls())
-                cg.HandleTopLevelDecl(DeclGroupRef(d));
+                if (inScopeDecl(d)) cg.HandleTopLevelDecl(DeclGroupRef(d));
             // Plus everything Sema announced that decls() does not contain (see announcedDecls).
             for (Decl* d : st.announcedDecls)
-                cg.HandleTopLevelDecl(DeclGroupRef(d));
+                if (inScopeDecl(d)) cg.HandleTopLevelDecl(DeclGroupRef(d));
             /*
              * An inline static data member is not a top-level decl, and unlike a member FUNCTION
              * there is no lexically-in-a-record fallback that finds it later - CodeGen only knows
@@ -1688,13 +2187,9 @@ namespace cflat_cinterop
                     m.abi = RawAbi{};
                 }
             }
-            for (RawRecord& rec : st.out.records)
-                for (RawCxxStaticVar& sv : rec.staticVars)
-                {
-                    if (sv.linkageName.empty()) continue;
-                    const llvm::GlobalVariable* gv = mod->getNamedGlobal(sv.linkageName);
-                    if (gv != nullptr && gv->isDeclaration()) sv.linkageName.clear();
-                }
+            // A static data member can be owned by a separately compiled explicit template
+            // instantiation. The request companion only sees the header, so its declaration is
+            // not evidence that the library symbol is absent; preserve the mangled name.
 
             {
                 llvm::raw_string_ostream os(st.out.bitcode);
@@ -1713,7 +2208,15 @@ namespace cflat_cinterop
             bool HandleTopLevelDecl(DeclGroupRef dg) override
             {
                 if (st.req.emitDefinitions)
-                    for (Decl* d : dg) st.announcedDecls.push_back(d);
+                    for (Decl* d : dg)
+                    {
+                        if (st.req.requireInScope && st.ci != nullptr)
+                        {
+                            PresumedLoc pl = st.ci->getSourceManager().getPresumedLoc(d->getLocation());
+                            if (pl.isInvalid() || !PathInScope(pl.getFilename(), st.normDirs)) continue;
+                        }
+                        st.announcedDecls.push_back(d);
+                    }
                 return true;
             }
             void HandleTranslationUnit(ASTContext& ctx) override
@@ -1834,7 +2337,8 @@ namespace cflat_cinterop
         bool RunAction(const ExtractRequest& req, const std::string& source,
                        FrontendAction& action, std::string& err,
                        unsigned* outPrereqErrors = nullptr,
-                       std::string* outFirstPrereqError = nullptr)
+                       std::string* outFirstPrereqError = nullptr,
+                       ExtractResult* outTargetFacts = nullptr)
         {
             const std::string& inputName = source.empty() ? req.realPath : req.mainFileName;
             if (inputName.empty()) { err = "no input file"; return false; }
@@ -1891,6 +2395,14 @@ namespace cflat_cinterop
             {
                 llvm::TimeTraceScope execScope("ExecuteFrontend", inputName);
                 if (!ci->ExecuteAction(action)) { err = "ExecuteAction failed"; return false; }
+            }
+            if (outTargetFacts)
+            {
+                const clang::TargetInfo& target = ci->getTarget();
+                outTargetFacts->longDoubleWidth = target.getLongDoubleWidth();
+                outTargetFacts->longDoubleIsIEEEDouble =
+                    &target.getLongDoubleFormat() == &llvm::APFloat::IEEEdouble();
+                outTargetFacts->targetTriple = target.getTriple().str();
             }
             if (outPrereqErrors) *outPrereqErrors = prereqConsumer->prereqErrors;
             if (outFirstPrereqError) *outFirstPrereqError = prereqConsumer->firstPrereqError;
@@ -1950,7 +2462,42 @@ namespace cflat_cinterop
         {
             llvm::TimeTraceScope parseScope("FullParse", req.mainFileName.empty() ? req.realPath : req.mainFileName);
             ExtractAction extract(st);
-            bool ok = RunAction(req, fullSource, extract, err, &out.prereqErrors, &out.firstPrereqError);
+            bool ok = RunAction(req, fullSource, extract, err, &out.prereqErrors,
+                                &out.firstPrereqError, &out);
+
+            if (ok && req.cxxMode && req.autoInstantiateCxxTypes
+                && req.cxxTypeRequests.empty() && !st.incompleteCxxTypes.empty())
+            {
+                ExtractRequest retry = req;
+                retry.autoInstantiateCxxTypes = false;
+                retry.source = req.source;
+                for (const std::string& spelling : st.incompleteCxxTypes)
+                    retry.source += "\ntemplate class " + spelling + ";\n";
+                ExtractResult retried;
+                std::string retryError;
+                if (ExtractCInterop(retry, retried, retryError))
+                {
+                    bool recovered = true;
+                    for (const RawSig& original : out.sigs)
+                    {
+                        bool namesIncomplete = false;
+                        for (const std::string& spelling : st.incompleteCxxTypes)
+                            if (original.retType == spelling
+                                || std::find(original.paramTypes.begin(), original.paramTypes.end(), spelling)
+                                       != original.paramTypes.end())
+                            { namesIncomplete = true; break; }
+                        if (!namesIncomplete) continue;
+                        auto found = std::find_if(retried.sigs.begin(), retried.sigs.end(),
+                            [&](const RawSig& candidate) {
+                                return candidate.linkageName == original.linkageName
+                                    && candidate.name == original.name;
+                            });
+                        if (found == retried.sigs.end() || !found->abi.valid)
+                        { recovered = false; break; }
+                    }
+                    if (recovered) out = std::move(retried);
+                }
+            }
 
             // A probe whose injected variable never reached the AST (the body is a type name or
             // an unknown identifier) still reports its alias spelling; the binder decides.

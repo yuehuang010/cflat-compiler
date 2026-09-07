@@ -3482,6 +3482,21 @@ void LLVMBackend::UnregisterOwnedClosureTemp(llvm::Value* value)
             [&](const std::pair<llvm::Value*, llvm::BasicBlock*>& e) { return e.first == value; });
     }
 
+bool LLVMBackend::IsOwnedTempValue(const NamedVariable& arg) const
+{
+        auto* value = arg.Primary;
+        if (value != nullptr)
+        {
+            for (const auto& e : pendingOwnedStringTemps)
+                if (e.first == value) return true;
+            if (IsOwnedClosureTemp(value)) return true;
+        }
+        for (const auto& e : pendingOwnedStructTemps)
+            if ((e.Alloca == arg.Storage && arg.Storage != nullptr) || (value != nullptr && e.Alloca == value))
+                return true;
+        return false;
+    }
+
 bool LLVMBackend::IsOwnedClosureTemp(llvm::Value* value) const
 {
         for (const auto& e : pendingOwnedClosureTemps)

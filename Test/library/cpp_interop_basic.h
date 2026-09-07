@@ -4,6 +4,15 @@
 // solely to arm Test/errors/err_cpp_may_throw.cb.
 #pragma once
 
+#include <functional>
+#include <array>
+#include <memory>
+#include <map>
+#include <optional>
+#include <utility>
+#include <vector>
+
+
 namespace cppi
 {
     // Overload pair. The double leg adds 1000 so the SELECTED overload is observable
@@ -17,6 +26,10 @@ namespace cppi
 
     int* ptr_ident(int* p) noexcept;
 
+    double ld_identity(long double value) noexcept;
+    long double ld_add(long double a, long double b) noexcept;
+    void ld_store(long double value, double* out) noexcept;
+
     // Reference RETURN: must arrive on the CFlat side as a plain pointer.
     int& ref_slot() noexcept;
 
@@ -25,6 +38,210 @@ namespace cppi
 
     enum class Mode : int { Off = 0, On = 1 };
     int mode_value(Mode m) noexcept;
+
+    wchar_t wchar_roundtrip(wchar_t v) noexcept;
+    char16_t char16_roundtrip(char16_t v) noexcept;
+    char32_t char32_roundtrip(char32_t v) noexcept;
+
+    enum class Small8 : unsigned char { Zero = 0, Value = 200 };
+    struct Small8Holder { char c; Small8 e; };
+    Small8 small8_roundtrip(Small8 v) noexcept;
+    int small8_value(Small8 v) noexcept;
+
+    enum Dir { Left = 1, Right = 2 };
+    int dir_value(Dir d) noexcept;
+
+    class Outer
+    {
+    public:
+        typedef int Id;
+        using Name = const char*;
+
+        class Inner
+        {
+        public:
+            int value;
+            int twice() const noexcept;
+        };
+        enum class Kind : unsigned short { A = 3, B = 4 };
+        static int store;
+    };
+
+    template<class T>
+    struct Registry
+    {
+        static int count;
+        static int bump() noexcept { return ++count; }
+    };
+    template<class T> int Registry<T>::count = 0;
+
+    class Limits
+    {
+    public:
+        static constexpr int kLimit = 32;
+    };
+
+    class Variadic
+    {
+    public:
+        int sum(int count, ...) noexcept;
+    };
+    int registry_count(const Registry<int>& value) noexcept;
+
+    union Number { int i; float f; };
+    class AnonymousUnion
+    {
+    public:
+        union { int i; float f; };
+    };
+    struct Bits { unsigned char a : 3; unsigned char b : 5; };
+    struct ArrayHolder { int arr[4]; };
+    int use_number(const Number* n) noexcept;
+    int use_bits(const Bits* b) noexcept;
+    int use_array(const ArrayHolder* a) noexcept;
+    int sum4(const int (&a)[4]) noexcept;
+    int sum4_ptr(int (*a)[4]) noexcept;
+
+    template<class T, int N>
+    struct Buf
+    {
+        T data[N];
+        int cap() const noexcept { return N; }
+    };
+
+    int scaled_default(int v, int k = 3) noexcept;
+    int default_double_ptr(double value = 2.5, int* marker = nullptr) noexcept;
+    int helper() noexcept;
+    int with_call_default(int v, int k = helper()) noexcept;
+
+    class PrivateDefaultArg
+    {
+    private:
+        static int secret() noexcept;
+    public:
+        static int call(int value = secret()) noexcept;
+    };
+
+    __int128 wide_add(__int128 a, __int128 b) noexcept;
+    using IntVec = std::vector<int>;
+    template<class T> using Vec = std::vector<T>;
+    using IntArray4 = std::array<int, 4>;
+    int take_intvec(std::vector<int>& value) noexcept;
+    std::array<int, 4> make_int_array() noexcept;
+    int array_total(const std::array<int, 4>& value) noexcept;
+    int read_outer_store() noexcept;
+    std::map<int, int> make_int_map() noexcept;
+    int map_total(const std::map<int, int>& value) noexcept;
+
+    class Counter
+    {
+    public:
+        Counter() noexcept;
+        explicit Counter(int value) noexcept;
+        Counter operator+=(int value) noexcept;
+        bool operator<=(const Counter& other) const noexcept;
+        bool operator>=(const Counter& other) const noexcept;
+        int operator%(int divisor) const noexcept;
+        int operator<<(int shift) const noexcept;
+        int operator&(int mask) const noexcept;
+        Counter operator-() const noexcept;
+        int get() const noexcept;
+    private:
+        int value_;
+    };
+    int counter_add(int value, int delta) noexcept;
+    int counter_le(int left, int right) noexcept;
+    int counter_ge(int left, int right) noexcept;
+    int counter_mod(int value, int divisor) noexcept;
+    int counter_shift(int value, int shift) noexcept;
+    int counter_bitand(int value, int mask) noexcept;
+    int counter_neg(int value) noexcept;
+
+    class Cursor
+    {
+    public:
+        explicit Cursor(int value) noexcept;
+        Cursor& operator++() noexcept;
+        Cursor operator++(int) noexcept;
+        Cursor& operator--() noexcept;
+        Cursor operator--(int) noexcept;
+        int pos;
+    };
+
+    class Truthy
+    {
+    public:
+        Truthy(int value) noexcept;
+        operator bool() const noexcept;
+        int v;
+    };
+
+    // Round 10 - member operator(), unary ~/-, and conversion operators.
+    class Functor
+    {
+    public:
+        explicit Functor(int base) noexcept;
+        int operator()(int a) const noexcept;            // arity 1
+        int operator()(int a, int b) const noexcept;     // arity 2
+        double operator()(double a) const noexcept;      // same arity, different type
+        int base;
+    };
+
+    class Mask
+    {
+    public:
+        explicit Mask(int bits) noexcept;
+        int operator~() const noexcept;
+        int operator-() const noexcept;
+        int operator+() const noexcept;
+        int bits;
+    };
+
+    class Convertible
+    {
+    public:
+        explicit Convertible(int v) noexcept;
+        operator int() const noexcept;                   // non-explicit
+        explicit operator double() const noexcept;       // explicit
+        operator unsigned char() const noexcept;
+        int v;
+    };
+
+    // Its conversion target is a pointer to member, which cflat has no spelling for: the
+    // member is recorded as refused and no cast can reach it. The class itself still binds.
+    struct ConvHolder { int slot; };
+    class ConvRefused
+    {
+    public:
+        explicit ConvRefused(int v) noexcept;
+        operator int ConvHolder::*() const noexcept;
+        int get() const noexcept;
+        int v;
+    };
+
+    // A conversion that exists but cannot be bound: the cast reports the recorded refusal.
+    class ConvDeleted
+    {
+    public:
+        explicit ConvDeleted(int v) noexcept;
+        operator float() const noexcept = delete;
+        int get() const noexcept;
+        int v;
+    };
+
+    class DefaultCtorCounter
+    {
+    public:
+        DefaultCtorCounter() noexcept;
+        int get() const noexcept;
+    private:
+        int value_;
+    };
+
+    void unsupported_param(_Float16 value) noexcept;
+    struct MemberPointerOwner { int value; };
+    int member_pointer_param(int MemberPointerOwner::* value) noexcept;
+    struct ReferenceField { int& value; };
 
     namespace inner
     {
@@ -86,6 +303,8 @@ namespace cppi
         int sum() const noexcept;            // const instance method
         void bump(int d) noexcept;           // mutating instance method
         int scaled(int f, int off) noexcept;  // two arguments
+        int mode_scaled(Mode mode = Mode::On) noexcept;
+        void set_out(char*& out) noexcept;
         // const/non-const overload pair. CFlat drops const, so the RULING applies: an lvalue
         // picks the NON-const leg. The two legs return different values, so the selection is
         // observable from the result alone.
@@ -119,8 +338,38 @@ namespace cppi
         // Lets a class template over Tracked instantiate an equality member (M5b).
         bool operator==(const Tracked& other) const noexcept;
 
+        int payload;
+
     private:
-        int payload_;
+    };
+
+    typedef int (*IntOp)(int, int);
+    typedef Mixed (*MixedOp)(Mixed);
+    typedef Large (*LargeOp)(Large);
+    typedef Hfa (*HfaOp)(Hfa);
+    typedef int (*TrackedVisitor)(const Tracked& t, void* ctx);
+    typedef int (*TrackedByValueCb)(Tracked t);
+    typedef int (*TrackedRvalueCb)(Tracked&& t);
+    typedef int (*MixedOut)(Mixed, char**);
+
+    int apply_int(IntOp op, int a, int b) noexcept;
+    Mixed apply_mixed(MixedOp op, Mixed v) noexcept;
+    Large apply_large(LargeOp op, Large v) noexcept;
+    Hfa apply_hfa(HfaOp op, Hfa v) noexcept;
+    int visit_tracked(TrackedVisitor cb, void* ctx, int payload) noexcept;
+    int apply_fn(const std::function<int(int)>& f, int v) noexcept;
+    int apply_mixed_out(MixedOut cb, Mixed v, char** out) noexcept;
+    int apply_tracked_by_value(TrackedByValueCb cb) noexcept;
+    int apply_tracked_rvalue(TrackedRvalueCb cb) noexcept;
+
+    class Sink
+    {
+    public:
+        int put(const Tracked& t) noexcept;
+        int put(Tracked&& t) noexcept;
+
+    private:
+        int pad_;
     };
 
     void reset_counts() noexcept;
@@ -149,6 +398,18 @@ namespace cppi
     Tracked make_tracked(int payload) noexcept;
     int take_tracked(Tracked t) noexcept;
     int take_moved(Tracked t) noexcept;
+    int take_rvalue(Tracked&& t) noexcept;
+    int take_ref(const Tracked& t) noexcept;
+    int take_either(const Tracked& t) noexcept;
+    int take_either(Tracked&& t) noexcept;
+    std::unique_ptr<Tracked> make_tracked_ptr(int payload) noexcept;
+    int tracked_ptr_payload(const std::unique_ptr<Tracked>& p) noexcept;
+    int consume_tracked_ptr(std::unique_ptr<Tracked>&& p) noexcept;
+    std::shared_ptr<Tracked> make_tracked_shared(int payload) noexcept;
+    int shared_payload(const std::shared_ptr<Tracked>& p) noexcept;
+    int consume_tracked_shared(std::shared_ptr<Tracked>&& p) noexcept;
+    std::pair<int, double> make_pair_value(int first, double second) noexcept;
+    std::optional<int> make_opt(int value, bool present) noexcept;
 }
 
 extern "C" int cppi_c_linkage(int v) noexcept;

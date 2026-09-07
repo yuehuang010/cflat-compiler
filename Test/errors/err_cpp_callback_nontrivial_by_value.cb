@@ -1,0 +1,10 @@
+import cpp "cpp_interop_basic.h";
+
+expect_error("callback parameter of nontrivial C++ class type by value is not supported") {
+    int bad_callback(cppi.Tracked value) { return value.value(); }
+
+    extern int main()
+    {
+        return cppi.apply_tracked_by_value(bad_callback);
+    }
+}

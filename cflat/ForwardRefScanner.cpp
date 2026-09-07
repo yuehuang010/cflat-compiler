@@ -211,15 +211,17 @@ LLVMBackend::DeclTypeAndValue ForwardRefScanner::ParseDeclarationSpecifiers(CFla
                     for (auto* entry : genParams->typeParameterList()->typeParameterEntry())
                     {
                         // Closure type args (gap a) encode to a symbol-safe name; a `unique`-qualified
-                        // arg routes through ResolveForwardTypeArg so its canonical core unique name
-                        // matches the queueing path; others keep the raw getText() spelling.
+                        // arg or compile-time value routes through ResolveForwardTypeArg so its
+                        // canonical spelling matches the queueing path; plain types keep raw text.
                         // A NESTED generic arg must mangle the same way the main pass mangles it
                         // ("Inner__int"), or the shell is registered under the raw "Inner<int>"
                         // spelling and stays opaque.
                         std::string nestedBase;
                         bool nestedGeneric = entry->typeSpecifier() != nullptr
                             && GenericSpecOf(entry->typeSpecifier(), nestedBase) != nullptr;
-                        if ((entry->typeSpecifier() && entry->typeSpecifier()->functionPointerSpecifier())
+                        if (entry->shiftExpression() != nullptr
+                            || (entry->typeSpecifier() && entry->typeSpecifier()->functionPointerSpecifier())
+                            || entry->functionTypeArgument() != nullptr
                             || TypeArgHasUnique(entry) || nestedGeneric)
                             typeArgs.push_back(ResolveForwardTypeArg(entry));
                         else
@@ -1089,6 +1091,10 @@ std::string ForwardRefScanner::ResolveForwardTypeArg(CFlatParser::TypeParameterE
             // shell name (e.g. list$fatfn$.1$int$int) matches the main pass.
             resolved = EncodeClosureScanner(typeSpec->functionPointerSpecifier());
         }
+        else if (entry->functionTypeArgument())
+        {
+            resolved = EncodePlainFunctionTypeScanner(entry->functionTypeArgument());
+        }
         else
         {
             // Same namespace walk as the main pass's ResolveTypeArgEntry (no active substitutions
@@ -1197,6 +1203,31 @@ std::string ForwardRefScanner::EncodeClosureScanner(CFlatParser::FunctionPointer
                 encParams.push_back({ pName, ReconcilePointerDepth(pPtr, pStars) });
             }
         return BuildEncodedClosureName(compilerLLVM, isThin, retName, ReconcilePointerDepth(retPtr, retStars), encParams);
+    }
+
+std::string ForwardRefScanner::EncodePlainFunctionTypeScanner(
+    CFlatParser::FunctionTypeArgumentContext* fnSpec) {
+        LLVMBackend::TypeAndValue sig;
+        sig.IsFunctionPointer = true;
+        sig.TypeName = "__c_fn_ptr";
+        bool retPtr = fnSpec->pointer() != nullptr;
+        int retStars = PointerDepthOf(fnSpec->pointer());
+        sig.FuncPtrReturnTypeName = ResolveSigComponentScanner(fnSpec->typeSpecifier(), retPtr);
+        sig.FuncPtrReturnPointer = retPtr;
+        sig.FuncPtrReturnPointerDepth = ReconcilePointerDepth(retPtr, retStars);
+        if (fnSpec->functionPointerParamList() != nullptr)
+            for (auto* param : fnSpec->functionPointerParamList()->functionPointerParam())
+            {
+                LLVMBackend::TypeAndValue::FuncPtrParam p;
+                bool pPtr = param->pointer() != nullptr;
+                int pStars = PointerDepthOf(param->pointer());
+                p.TypeName = ResolveSigComponentScanner(param->typeSpecifier(), pPtr);
+                p.Pointer = pPtr;
+                p.PointerDepth = ReconcilePointerDepth(pPtr, pStars);
+                p.IsMove = param->Move() != nullptr;
+                sig.FuncPtrParams.push_back(p);
+            }
+        return MainListener::EncodeClosureFromSig(compilerLLVM, sig);
     }
 
 std::optional<int64_t> ForwardRefScanner::ScannerFoldIfConst(antlr4::tree::ParseTree* node) {
@@ -1703,12 +1734,14 @@ void ForwardRefScanner::ScanUsingDeclaration(CFlatParser::UsingDeclarationContex
             std::vector<std::string> args;
             for (auto* entry : genParams->typeParameterList()->typeParameterEntry())
             {
-                // Closure and `unique`-qualified args encode via ResolveForwardTypeArg so the shell
-                // name matches the authoritative ParseUsingDeclaration; others keep raw getText().
+                // Closure, value, and `unique`-qualified args encode via ResolveForwardTypeArg so
+                // the shell name matches the authoritative ParseUsingDeclaration; plain types keep raw text.
                 std::string nestedBase;
                 bool nestedGeneric = entry->typeSpecifier() != nullptr
                     && GenericSpecOf(entry->typeSpecifier(), nestedBase) != nullptr;
-                if ((entry->typeSpecifier() && entry->typeSpecifier()->functionPointerSpecifier())
+                if (entry->shiftExpression() != nullptr
+                    || (entry->typeSpecifier() && entry->typeSpecifier()->functionPointerSpecifier())
+                    || entry->functionTypeArgument() != nullptr
                     || TypeArgHasUnique(entry) || nestedGeneric)
                     args.push_back(ResolveForwardTypeArg(entry));
                 else

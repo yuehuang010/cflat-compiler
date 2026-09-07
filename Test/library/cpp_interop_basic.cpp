@@ -12,6 +12,10 @@ namespace cppi
 
     int* ptr_ident(int* p) noexcept { return p; }
 
+    double ld_identity(long double value) noexcept { return (double)value; }
+    long double ld_add(long double a, long double b) noexcept { return a + b; }
+    void ld_store(long double value, double* out) noexcept { *out = (double)value; }
+
     static int g_slot = 99;
     int& ref_slot() noexcept { return g_slot; }
 
@@ -19,6 +23,105 @@ namespace cppi
     unsigned char uc(unsigned char v) noexcept { return (unsigned char)(v + 1); }
 
     int mode_value(Mode m) noexcept { return (int)m * 10; }
+
+    wchar_t wchar_roundtrip(wchar_t v) noexcept { return v; }
+    char16_t char16_roundtrip(char16_t v) noexcept { return v; }
+    char32_t char32_roundtrip(char32_t v) noexcept { return v; }
+    Small8 small8_roundtrip(Small8 v) noexcept { return v; }
+    int small8_value(Small8 v) noexcept { return (int)v; }
+    int dir_value(Dir d) noexcept { return (int)d; }
+
+    int Outer::store = 0;
+    int Outer::Inner::twice() const noexcept { return value * 2; }
+    template struct Registry<int>;
+    int registry_count(const Registry<int>& value) noexcept { return value.count; }
+    int Variadic::sum(int count, ...) noexcept { return count; }
+    int use_number(const Number* n) noexcept { return n->i; }
+    int use_bits(const Bits* b) noexcept { return (int)b->a * 10 + (int)b->b; }
+    int use_array(const ArrayHolder* a) noexcept
+    {
+        return a->arr[0] + a->arr[1] + a->arr[2] + a->arr[3];
+    }
+    int sum4(const int (&a)[4]) noexcept { return a[0] + a[1] + a[2] + a[3]; }
+    int sum4_ptr(int (*a)[4]) noexcept { return (*a)[0] + (*a)[1] + (*a)[2] + (*a)[3]; }
+
+    int scaled_default(int v, int k) noexcept { return v * k; }
+    int default_double_ptr(double value, int* marker) noexcept
+    {
+        return (int)(value * 10.0) + (marker == nullptr ? 0 : *marker);
+    }
+    int helper() noexcept { return 9; }
+    int with_call_default(int v, int k) noexcept { return v * k; }
+    int PrivateDefaultArg::secret() noexcept { return 11; }
+    int PrivateDefaultArg::call(int value) noexcept { return value; }
+    __int128 wide_add(__int128 a, __int128 b) noexcept { return a + b; }
+    int take_intvec(std::vector<int>& value) noexcept { return static_cast<int>(value.size()); }
+    std::array<int, 4> make_int_array() noexcept { return std::array<int, 4>{1, 2, 3, 4}; }
+    int array_total(const std::array<int, 4>& value) noexcept
+    {
+        return value[0] + value[1] + value[2] + value[3];
+    }
+    int read_outer_store() noexcept { return Outer::store; }
+    std::map<int, int> make_int_map() noexcept
+    {
+        return std::map<int, int>{{3, 7}, {5, 11}};
+    }
+    int map_total(const std::map<int, int>& value) noexcept
+    {
+        return value.at(3) + value.at(5);
+    }
+
+    Counter::Counter() noexcept : value_(0) {}
+    Counter::Counter(int value) noexcept : value_(value) {}
+    Counter Counter::operator+=(int value) noexcept { value_ += value; return *this; }
+    bool Counter::operator<=(const Counter& other) const noexcept { return value_ <= other.value_; }
+    bool Counter::operator>=(const Counter& other) const noexcept { return value_ >= other.value_; }
+    int Counter::operator%(int divisor) const noexcept { return value_ % divisor; }
+    int Counter::operator<<(int shift) const noexcept { return value_ << shift; }
+    int Counter::operator&(int mask) const noexcept { return value_ & mask; }
+    Counter Counter::operator-() const noexcept { return Counter(-value_); }
+    int Counter::get() const noexcept { return value_; }
+    int counter_add(int value, int delta) noexcept { return (Counter(value) += delta).get(); }
+    int counter_le(int left, int right) noexcept { return Counter(left) <= Counter(right); }
+    int counter_ge(int left, int right) noexcept { return Counter(left) >= Counter(right); }
+    int counter_mod(int value, int divisor) noexcept { return Counter(value) % divisor; }
+    int counter_shift(int value, int shift) noexcept { return Counter(value) << shift; }
+    int counter_bitand(int value, int mask) noexcept { return Counter(value) & mask; }
+    int counter_neg(int value) noexcept { return (-Counter(value)).get(); }
+
+    Cursor::Cursor(int value) noexcept : pos(value) {}
+    Cursor& Cursor::operator++() noexcept { ++pos; return *this; }
+    Cursor Cursor::operator++(int) noexcept { Cursor old(*this); pos += 100; return old; }
+    Cursor& Cursor::operator--() noexcept { --pos; return *this; }
+    Cursor Cursor::operator--(int) noexcept { Cursor old(*this); pos -= 100; return old; }
+
+    Truthy::Truthy(int value) noexcept : v(value) {}
+    Truthy::operator bool() const noexcept { return v != 0; }
+
+    Functor::Functor(int base) noexcept : base(base) {}
+    int Functor::operator()(int a) const noexcept { return base + a; }
+    int Functor::operator()(int a, int b) const noexcept { return base + a + b; }
+    double Functor::operator()(double a) const noexcept { return (double)base + a + 0.5; }
+
+    Mask::Mask(int bits) noexcept : bits(bits) {}
+    int Mask::operator~() const noexcept { return ~bits; }
+    int Mask::operator-() const noexcept { return -bits; }
+    int Mask::operator+() const noexcept { return bits + 100; }
+
+    Convertible::Convertible(int v) noexcept : v(v) {}
+    Convertible::operator int() const noexcept { return v + 1; }
+    Convertible::operator double() const noexcept { return (double)v + 0.25; }
+    Convertible::operator unsigned char() const noexcept { return (unsigned char)(v + 2); }
+
+    ConvRefused::ConvRefused(int v) noexcept : v(v) {}
+    ConvRefused::operator int ConvHolder::*() const noexcept { return &ConvHolder::slot; }
+    int ConvRefused::get() const noexcept { return v + 3; }
+
+    ConvDeleted::ConvDeleted(int v) noexcept : v(v) {}
+    int ConvDeleted::get() const noexcept { return v + 4; }
+
+    DefaultCtorCounter::DefaultCtorCounter() noexcept : value_(37) {}
+    int DefaultCtorCounter::get() const noexcept { return value_; }
 
     namespace inner
     {
@@ -65,6 +168,28 @@ namespace cppi
         return p->a + p->b + s.a + s.b;
     }
 
+    int apply_int(IntOp op, int a, int b) noexcept { return op(a, b); }
+    Mixed apply_mixed(MixedOp op, Mixed v) noexcept { return op(v); }
+    Large apply_large(LargeOp op, Large v) noexcept { return op(v); }
+    Hfa apply_hfa(HfaOp op, Hfa v) noexcept { return op(v); }
+    int visit_tracked(TrackedVisitor cb, void* ctx, int payload) noexcept
+    {
+        Tracked local(payload);
+        return cb(local, ctx) + cb(local, ctx);
+    }
+    int apply_fn(const std::function<int(int)>& f, int v) noexcept { return f(v); }
+    int apply_mixed_out(MixedOut cb, Mixed v, char** out) noexcept { return cb(v, out); }
+    int apply_tracked_by_value(TrackedByValueCb cb) noexcept
+    {
+        Tracked local(1);
+        return cb(local);
+    }
+    int apply_tracked_rvalue(TrackedRvalueCb cb) noexcept
+    {
+        Tracked local(1);
+        return cb(static_cast<Tracked&&>(local));
+    }
+
     unsigned long long size_of(int which) noexcept
     {
         switch (which)
@@ -99,6 +224,8 @@ namespace cppi
     int  Point::sum() const noexcept          { return x + y; }
     void Point::bump(int d) noexcept           { x += d; y += d; ++s_calls; }
     int  Point::scaled(int f, int off) noexcept { return (x + y) * f + off; }
+    int  Point::mode_scaled(Mode mode) noexcept { return (x + y) * (int)mode; }
+    void Point::set_out(char*& out) noexcept    { out = "set-out"; }
     int  Point::probe() noexcept               { return 1; }
     int  Point::probe() const noexcept         { return 2; }
     int  Point::origin_sum() noexcept          { return 0; }
@@ -112,20 +239,23 @@ namespace cppi
     static int g_copy_assign = 0;
     static int g_move_assign = 0;
 
-    Tracked::Tracked(int payload) noexcept : payload_(payload) { ++g_ctor; }
-    Tracked::Tracked(const Tracked& other) noexcept : payload_(other.payload_) { ++g_copy; }
-    Tracked::Tracked(Tracked&& other) noexcept : payload_(other.payload_) { other.payload_ = -1; ++g_move; }
+    Tracked::Tracked(int payload) noexcept : payload(payload) { ++g_ctor; }
+    Tracked::Tracked(const Tracked& other) noexcept : payload(other.payload) { ++g_copy; }
+    Tracked::Tracked(Tracked&& other) noexcept : payload(other.payload) { other.payload = -1; ++g_move; }
     Tracked::~Tracked() noexcept { ++g_dtor; }
     Tracked& Tracked::operator=(const Tracked& other) noexcept
     {
-        payload_ = other.payload_; ++g_copy_assign; return *this;
+        payload = other.payload; ++g_copy_assign; return *this;
     }
     Tracked& Tracked::operator=(Tracked&& other) noexcept
     {
-        payload_ = other.payload_; other.payload_ = -1; ++g_move_assign; return *this;
+        payload = other.payload; other.payload = -1; ++g_move_assign; return *this;
     }
-    int Tracked::value() const noexcept { return payload_; }
-    bool Tracked::operator==(const Tracked& other) const noexcept { return payload_ == other.payload_; }
+    int Tracked::value() const noexcept { return payload; }
+    bool Tracked::operator==(const Tracked& other) const noexcept { return payload == other.payload; }
+
+    int Sink::put(const Tracked&) noexcept { return 1; }
+    int Sink::put(Tracked&&) noexcept { return 2; }
 
     void reset_counts() noexcept
     {
@@ -146,6 +276,50 @@ namespace cppi
     Tracked make_tracked(int payload) noexcept { return Tracked(payload); }
     int take_tracked(Tracked t) noexcept { return t.value(); }
     int take_moved(Tracked t) noexcept { return t.value() * 10; }
+    int take_rvalue(Tracked&& t) noexcept
+    {
+        Tracked local = static_cast<Tracked&&>(t);
+        return local.value();
+    }
+    int take_ref(const Tracked& t) noexcept { return t.value(); }
+    int take_either(const Tracked& t) noexcept { return 1; }
+    int take_either(Tracked&& t) noexcept
+    {
+        Tracked local = static_cast<Tracked&&>(t);
+        return 2;
+    }
+    std::unique_ptr<Tracked> make_tracked_ptr(int payload) noexcept
+    {
+        return std::unique_ptr<Tracked>(new Tracked(payload));
+    }
+    int tracked_ptr_payload(const std::unique_ptr<Tracked>& p) noexcept
+    {
+        return p.get()->value();
+    }
+    int consume_tracked_ptr(std::unique_ptr<Tracked>&& p) noexcept
+    {
+        return p.get()->value();
+    }
+    std::shared_ptr<Tracked> make_tracked_shared(int payload) noexcept
+    {
+        return std::make_shared<Tracked>(payload);
+    }
+    int shared_payload(const std::shared_ptr<Tracked>& p) noexcept
+    {
+        return p.get()->value();
+    }
+    int consume_tracked_shared(std::shared_ptr<Tracked>&& p) noexcept
+    {
+        return p.get()->value();
+    }
+    std::pair<int, double> make_pair_value(int first, double second) noexcept
+    {
+        return { first, second };
+    }
+    std::optional<int> make_opt(int value, bool present) noexcept
+    {
+        return present ? std::optional<int>(value) : std::nullopt;
+    }
 }
 
 extern "C" int cppi_c_linkage(int v) noexcept { return v + 5; }

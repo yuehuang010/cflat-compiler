@@ -744,19 +744,20 @@ std::string LLVMBackend::OperatorBoolFunctionNameForType(llvm::Type* type) const
         auto* st = llvm::dyn_cast_or_null<llvm::StructType>(type);
         if (st == nullptr || st->isLiteral() || !st->hasName()) return {};
 
-        auto matches = [&](const std::string& name) {
+        auto matches = [&](const std::string& name, bool allowCxxReceiver) {
             auto it = functionTable.find(name);
             if (it == functionTable.end()) return false;
             for (const auto& candidate : it->second)
                 if (candidate.Parameters.size() == 1
                     && candidate.Parameters[0].TypeName == st->getName().str()
-                    && !candidate.Parameters[0].Pointer)
+                    && (!candidate.Parameters[0].Pointer
+                        || (allowCxxReceiver && IsCxxRecord(st->getName().str()))))
                     return true;
             return false;
         };
-        if (matches("operator bool")) return "operator bool";
+        if (matches("operator bool", true)) return "operator bool";
         std::string memberName = st->getName().str() + ".operator bool";
-        return matches(memberName) ? memberName : std::string{};
+        return matches(memberName, true) ? memberName : std::string{};
 }
 
 llvm::Value* LLVMBackend::CoerceToBoolCondition(llvm::Value* cond, bool allowOperatorBool)
@@ -1948,6 +1949,10 @@ llvm::Type* LLVMBackend::GetFunctionReturnABIType(const TypeAndValue& returnType
 
 bool LLVMBackend::ParameterIsAliasByPointer(const TypeAndValue& param) const
 {
+        // C++ T*& is represented as an alias T* whose ABI parameter is T**: the
+        // alias is the caller's pointer slot, not the pointer value itself.
+        if (param.IsCxxRefToPointer)
+            return true;
         // `alias` on a POINTER/view/interface/closure param already names a borrow in its own
         // representation; only the by-value shapes need the address to reach the caller's object.
         if (!param.IsAlias || param.Pointer || param.IsArrayView || param.IsInterface

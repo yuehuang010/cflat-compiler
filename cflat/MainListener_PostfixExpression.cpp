@@ -894,7 +894,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                     receiver.TypeAndValue = compiler->lastCallReturnType;
                     receiver.FieldPathThroughPointer = throughPointer;
                     receiver.FieldPathRoot = pathRoot;
-                    PrepareAliasCallResult(ctx, receiver);
+                    PrepareAliasCallResult(ctx, receiver, false);
 
                     if (++arrowGuard > 32)
                     {
@@ -906,6 +906,10 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
             for (auto parseTree : ctx->children)
             {
                 if (childIndex++ >= childLimit) break;
+                if (auto* rule = dynamic_cast<antlr4::RuleContext*>(parseTree);
+                    rule != nullptr && rule->getRuleIndex() == CFlatParser::RuleMemberNameToken
+                    && !rule->children.empty())
+                    parseTree = rule->children.front();
                 if (parseTree->getTreeType() == antlr4::tree::ParseTreeType::TERMINAL)
                 {
                     auto terminal = dynamic_cast<antlr4::tree::TerminalNode*>(parseTree);
@@ -1270,6 +1274,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                     // field (GEP/load), else clear namedVar and defer to the call path [PFX-7] as a
                     // member fn / [winrt] vtable slot / UFCS target. Unresolved -> "Unknown identifier".
                     case CFlatParser::Identifier:
+                    case CFlatParser::Function:
                     {
                         // [PFX-2-dangle] Arm for any member name; the branches below refine the
                         // owner / method flag, and the tail of this case disarms on a real field.
@@ -1300,7 +1305,12 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             {
                                 qualifiedName = namespaceContext + "." + memberName;
                             }
-                            if (Compiler(ctx)->IsNamespace(qualifiedName))
+                            // A foreign class with nested declarations is also registered as a
+                            // namespace. Prefer an actual static member at this exact path.
+                            const bool hasQualifiedMember =
+                                Compiler(ctx)->GetGlobalVariableNV(qualifiedName).Storage != nullptr
+                                || Compiler(ctx)->GetFunction(qualifiedName) != nullptr;
+                            if (Compiler(ctx)->IsNamespace(qualifiedName) && !hasQualifiedMember)
                             {
                                 namespaceContext = Compiler(ctx)->ResolveNamespace(qualifiedName);
                                 primaryIdentifier = namespaceContext;
@@ -1342,18 +1352,45 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 auto globalNV = Compiler(ctx)->GetGlobalVariableNV(primaryIdentifier);
                                 if (globalNV.Storage != nullptr)
                                 {
+                                    int64_t constValue = 0;
+                                    if (Compiler(ctx)->TryGetConstGlobalInt(primaryIdentifier, constValue)
+                                        || (llvm::isa<llvm::GlobalVariable>(globalNV.Storage)
+                                            && Compiler(ctx)->TryGetConstGlobalInt(
+                                                std::string(llvm::cast<llvm::GlobalVariable>(globalNV.Storage)->getName()),
+                                                constValue)))
+                                    {
+                                        constFoldableGlobals_.insert(primaryIdentifier);
+                                        if (auto* intTy = llvm::dyn_cast<llvm::IntegerType>(globalNV.BaseType))
+                                        {
+                                            namedVar = globalNV;
+                                            namedVar.Primary = llvm::ConstantInt::get(intTy,
+                                                (uint64_t)constValue, true);
+                                            namedVar.Storage = nullptr;
+                                        }
+                                        else
+                                            namedVar = globalNV;
+                                    }
+                                    else
+                                        namedVar = globalNV;
                                     // Reaching into a namespace does not bypass its guard group.
                                     CheckGlobalGuard(ctx, primaryIdentifier, globalNV);
-                                    namedVar = globalNV;
                                 }
                                 else if (Compiler(ctx)->GetFunction(primaryIdentifier))
                                 {
                                     namedVar.Primary = Compiler(ctx)->GetFunctionForFuncPtr(primaryIdentifier);
                                     namedVar.CallerName = primaryIdentifier;
                                 }
-                                else
+                            else
+                            {
+                                // A soft-keyword component such as `std.function` is a C++
+                                // namespace-qualified class-template name, not a variable.
+                                if (terminal->getSymbol()->getType() == CFlatParser::Function)
                                 {
+                                    primaryIdentifier = qualifiedName;
                                     namedVar = {};
+                                    break;
+                                }
+                                namedVar = {};
                                     // A member of a real namespace that is not a global, a
                                     // function, a type, a generic template, or a return-block
                                     // cannot resolve later - error now instead of silently
@@ -1365,9 +1402,13 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                         && genericClassTemplates.count(qualifiedName) == 0
                                         && Compiler(ctx)->GetReturnBlock(qualifiedName) == nullptr)
                                     {
-                                        LogErrorContext(ctx, std::format(
-                                            "'{}' is not a member of namespace '{}'.",
-                                            memberName, namespaceName));
+                                        if (std::string refusal = Compiler(ctx)->GetCxxBindingRefusal(qualifiedName);
+                                            !refusal.empty())
+                                            LogErrorContext(ctx, refusal);
+                                        else
+                                            LogErrorContext(ctx, std::format(
+                                                "'{}' is not a member of namespace '{}'.",
+                                                memberName, namespaceName));
                                     }
                                 }
                             }
@@ -2115,6 +2156,23 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 interfaceVar = {};
                                 break;
                             }
+                            if (IsFollowedByDot(ctx, parseTree)
+                                && Compiler(ctx)->HasCxxImportGroup())
+                            {
+                                std::string cxxError;
+                                Compiler(ctx)->TryRequestCxxType(baseName, typeArgs, mangledName,
+                                                                 cxxError);
+                                if (!cxxError.empty()) LogErrorContext(prevPrimary, cxxError);
+                                if (Compiler(ctx)->IsCxxForeignTypeRegistered(mangledName))
+                                {
+                                    namespaceContext = mangledName;
+                                    primaryIdentifier = mangledName;
+                                    namedVar = {};
+                                    structVar = {};
+                                    interfaceVar = {};
+                                    break;
+                                }
+                            }
                             if (!genericClassTemplates.count(baseName) && !genericStructTemplates.count(baseName)
                                 && isFollowedByCall)
                                 LogErrorContext(prevPrimary, std::format("unknown generic function '{}'", baseName));
@@ -2212,7 +2270,10 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 auto literalType = ParseLiteralTypeAndValue(literal->getText());
                                 if (!literalType.TypeName.empty())
                                     namedVar.TypeAndValue = literalType;
+                                namedVar.IsRvalue = true;
                             }
+                            if (!prevPrimary->StringLiteral().empty())
+                                namedVar.IsRvalue = true;
                             // `default` takes the destination's type - publish it so a following
                             // suffix and the caller both see the right type, not an empty one.
                             if (prevPrimary->Default() != nullptr && !declExpectedType.TypeName.empty())
@@ -2748,6 +2809,54 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                     case CFlatParser::RuleGenericTypeParameters:
                     {
                         auto* genParams = dynamic_cast<CFlatParser::GenericTypeParametersContext*>(ruleContext);
+                        // Resolve a qualified C++ class-template constructor before generic dispatch.
+                        if (Compiler(ctx)->IsStdFunctionSpecialization(primaryIdentifier))
+                        {
+                            std::vector<std::string> typeArgs;
+                            for (auto* entry : genParams->typeParameterList()->typeParameterEntry())
+                                typeArgs.push_back(ResolveTypeArgEntry(entry));
+                            std::string mangled = MangleGenericInstance(*Compiler(ctx), primaryIdentifier, typeArgs);
+                            if (!Compiler(ctx)->IsCxxForeignTypeRegistered(mangled))
+                            {
+                                std::string requestError;
+                                Compiler(ctx)->RequestCxxType(primaryIdentifier, typeArgs, mangled,
+                                                              requestError);
+                            }
+                            if (Compiler(ctx)->IsCxxForeignTypeRegistered(mangled))
+                            {
+                                primaryIdentifier = mangled;
+                                namespaceContext.clear();
+                                namedVar = {};
+                                break;
+                            }
+                        }
+                        // A qualified C++ class-template specialization used as a static-member
+                        // qualifier (`cppi.Registry<int>.count`) is parsed as a namespace path
+                        // followed by this generic-parameter rule. Request the foreign record now
+                        // and replace the source path with its CFlat identity.
+                        if (!namespaceContext.empty() && Compiler(ctx)->HasCxxImportGroup()
+                            && !genericClassTemplates.count(namespaceContext)
+                            && !genericStructTemplates.count(namespaceContext))
+                        {
+                            std::vector<std::string> typeArgs;
+                            for (auto* entry : genParams->typeParameterList()->typeParameterEntry())
+                                typeArgs.push_back(ResolveTypeArgEntry(entry));
+                            const std::string baseName = namespaceContext;
+                            const std::string mangled = MangleGenericInstance(*Compiler(), baseName,
+                                                                               typeArgs);
+                            std::string cxxError;
+                            Compiler(ctx)->TryRequestCxxType(baseName, typeArgs, mangled, cxxError);
+                            if (!cxxError.empty()) LogErrorContext(genParams, cxxError);
+                            if (Compiler(ctx)->IsCxxForeignTypeRegistered(mangled))
+                            {
+                                namespaceContext = mangled;
+                                primaryIdentifier = mangled;
+                                namedVar = {};
+                                structVar = {};
+                                interfaceVar = {};
+                                break;
+                            }
+                        }
                         // A generic method called on a receiver (`h.get<int>()`) is keyed by its owner;
                         // that key wins over a same-named free generic function.
                         std::string templateName = GenericMethodTemplateKey(structVar.TypeAndValue.TypeName, primaryIdentifier);
@@ -2782,6 +2891,15 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                     {
                         // Create Function Call
                         std::string functionName = primaryIdentifier;
+                        // A foreign std::function value uses CFlat's natural call spelling. Its
+                        // C++ member is surfaced under operator(), with the value as receiver.
+                        if (structVar.BaseType != nullptr
+                            && Compiler(ctx)->IsStdFunctionSpecialization(
+                                structVar.TypeAndValue.TypeName)
+                            && Compiler(ctx)->IsForeignNontrivialCxxClass(
+                                structVar.TypeAndValue.TypeName)
+                            && Compiler(ctx)->GetFunction("operator()"))
+                            functionName = "operator()";
 
                         // A call on a struct value or pointer is the CFlat spelling for operator().
                         // Member methods keep their ordinary name because their lookup leaves
@@ -4718,6 +4836,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     // Explicit 'move' at the call site: drives move-overload selection
                                     // and the borrow-param diagnostic after overload resolution.
                                     argVar.IsExplicitMove = argNV.IsExplicitMove;
+                                    argVar.IsRvalue = argNV.IsRvalue;
                                     // Propagate over-alignment so a `move` param that would inherit the block
                                     // without its alignment tag is rejected instead of mis-freed.
                                     argVar.AllocAlignment = argNV.AllocAlignment;
@@ -5122,7 +5241,6 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 if (argumentList.size() > 0)
                                 {
                                     auto namedArgCtx = argumentList[functionArgCounter]->argumentNamedExpression();
-
                                 // Look up the function signature to set lambdaExpectedType for lambda arguments.
                                 const LLVMBackend::FunctionSymbol* funcSym = nullptr;
                                 {
@@ -5245,6 +5363,15 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     // The matched PARAMETER is the destination context inside this
                                     // argument, so an enclosing declarator's type cannot leak in.
                                     LLVMBackend::TypeAndValue argExpectedDest;
+                                    if (Compiler(ctx)->IsStdFunctionSpecialization(functionName))
+                                    {
+                                        if (const auto* expected = Compiler(ctx)->GetEncodedClosureType(
+                                                MangledGenericArgument(*Compiler(ctx), functionName, 0)))
+                                        {
+                                            argExpectedDest = *expected;
+                                            lambdaExpectedType = *expected;
+                                        }
+                                    }
                                     if (funcSym && declaredIdx[argIdx] >= 0
                                         && declaredIdx[argIdx] < (int64_t)funcSym->Parameters.size())
                                     {
@@ -5348,6 +5475,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     // Explicit 'move' at the call site: drives move-overload selection
                                     // and the borrow-param diagnostic after overload resolution.
                                     argVar.IsExplicitMove = argNV.IsExplicitMove;
+                                    argVar.IsRvalue = argNV.IsRvalue;
                                     // Propagate over-alignment so a `move` param that would inherit the block
                                     // without its alignment tag is rejected instead of mis-freed.
                                     argVar.AllocAlignment = argNV.AllocAlignment;
@@ -5511,7 +5639,48 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             // (recv->lpVtbl->slot), a null-conditional `?.` guarded call, or the
                             // normal overloaded (member/free/extension) function call.
                             // `winrtSlot` is resolved above at [PFX-7-slot].
-                            if (winrtSlot)
+                            auto* compiler = Compiler(ctx);
+                            bool foreignCxxConstructor = structVar.BaseType == nullptr
+                                && compiler->IsForeignCxxClassWithConstructors(functionName);
+                            if (foreignCxxConstructor)
+                            {
+                                std::vector<llvm::Value*> ctorValues;
+                                std::vector<LLVMBackend::TypeAndValue> ctorTypes;
+                                for (auto& arg : arguments)
+                                {
+                                    llvm::Value* value = LoadNamedVariable(arg);
+                                    ctorValues.push_back(value);
+                                    ctorTypes.push_back(arg.TypeAndValue);
+                                    TypeUntypedCtorArg(ctorTypes.back(), value);
+                                }
+                                std::string why;
+                                const auto* ctor = compiler->SelectCxxConstructor(
+                                    functionName, ctorTypes, why);
+                                if (ctor == nullptr)
+                                {
+                                    LogErrorContext(primaryCtx, std::format(
+                                        "C++ class '{}' {}", functionName, why));
+                                    namedVar = {};
+                                }
+                                else
+                                {
+                                    auto* objectType = compiler->GetType(
+                                        LLVMBackend::TypeAndValue{ .TypeName = functionName });
+                                    auto* slot = compiler->CreateAlloca(objectType);
+                                    compiler->EmitCxxStructorCall(functionName, *ctor, slot, ctorValues);
+                                    if (compiler->IsForeignNontrivialCxxClass(functionName))
+                                        compiler->RegisterOwnedStructTemp(slot, functionName);
+                                    namedVar = {};
+                                    namedVar.Primary = compiler->CreateLoad(slot);
+                                    namedVar.Storage = slot;
+                                    namedVar.BaseType = objectType;
+                                    namedVar.TypeAndValue.TypeName = functionName;
+                                    compiler->lastOwningResult = true;
+                                }
+                                structVar = {};
+                                interfaceVar = {};
+                            }
+                            else if (winrtSlot)
                             {
                                 // [winrt] COM sugar: recv->Slot(args) dispatches through the vtable as
                                 // recv->lpVtbl->Slot(recv, args). `arguments[0]` is the receiver; user
@@ -6813,6 +6982,7 @@ LLVMBackend::NamedVariable MainListener::ParseLambdaExpression(CFlatParser::Lamb
         LLVMBackend::NamedVariable result;
         result.Primary     = fat;
         result.TypeAndValue = tv;
+        result.IsRvalue     = true;
 
         // Register the lambda value as an owned-closure temporary (Option A): if it is not bound
         // to a named owner (e.g. passed directly by value as an argument), its heap env is freed
@@ -7494,6 +7664,20 @@ LLVMBackend::NamedVariable MainListener::ParseIdentifier(antlr4::tree::TerminalN
             auto globalNV = compiler->GetGlobalVariableNV(name);
             if (globalNV.Storage != nullptr)
             {
+                int64_t constValue = 0;
+                if (compiler->TryGetConstGlobalInt(name, constValue)
+                    || (llvm::isa<llvm::GlobalVariable>(globalNV.Storage)
+                        && compiler->TryGetConstGlobalInt(
+                            std::string(llvm::cast<llvm::GlobalVariable>(globalNV.Storage)->getName()),
+                            constValue)))
+                {
+                    constFoldableGlobals_.insert(name);
+                    if (auto* intTy = llvm::dyn_cast<llvm::IntegerType>(globalNV.BaseType))
+                    {
+                        globalNV.Primary = llvm::ConstantInt::get(intTy, (uint64_t)constValue, true);
+                        globalNV.Storage = nullptr;
+                    }
+                }
                 CheckGlobalGuard(node, name, globalNV);
                 globalNV.IdentifierLine = (int)node->getSymbol()->getLine();
                 globalNV.IdentifierColumn = (int)node->getSymbol()->getCharPositionInLine();
@@ -7562,7 +7746,10 @@ LLVMBackend::NamedVariable MainListener::ParseIdentifier(antlr4::tree::TerminalN
                 return {};
         }
 
-        LogErrorContext(node, std::format("Undefined variable {}.", name));
+        if (std::string refusal = compiler->GetCxxBindingRefusal(name); !refusal.empty())
+            LogErrorContext(node, refusal);
+        else
+            LogErrorContext(node, std::format("Undefined variable {}.", name));
         return {};
     }
 

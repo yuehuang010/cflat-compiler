@@ -69,11 +69,12 @@
 //   Section M9 (500-529): libc++ through the same path - std.vector<int>, std.vector<double>,
 //                       std.string, and the nested std.vector<std.string>, plus element
 //                       destruction counted for std.vector<cppi.Tracked>.
-//   Section M10 (530-549): review follow-ups - a specialization whose element type is a POINTER
+//   Section M10 (530-549, 578-585): review follow-ups - a specialization whose element type is a POINTER
 //                       (std.vector<char*>), where every member signature that names the container
 //                       itself carries an inner '*' that the type mapper must not strip, and a
 //                       `move` argument to a libc++ member.
 //   Section M (270-289): C++ interop via `import cpp` - namespaced/overloaded declarations
+//   Section M19 (725-739): C++ operator(), unary ~, and conversion operators
 //                       bound by mangled linkage name, reference params and returns
 //                       as pointers, extern "C" bare linkage, nested namespaces,
 //                       widening and narrow-unsigned round trips, scoped-enum params,
@@ -121,6 +122,7 @@ import cpp "library/cpp_interop_inline_again.h";
 import cpp "library/cpp_interop_tpl.h";
 import cpp "vector";
 import cpp "string";
+import cpp "functional";
 import "library/float_macros.h";
 // Accept side of the conflicting-declaration check: prototypes identical to ones already
 // bound (core putn/printf, and c_add from cinterop.c above) must be a silent no-op.
@@ -140,6 +142,26 @@ extern int  strcmp(const char* a, const char* b);
 int my_add_cb(int a, int b) { return a + b; }
 int my_sub_cb(int a, int b) { return a - b; }
 int my_inc_cb(int x) { return x + 1; }
+
+int m7_cb_add(int a, int b) { return a + b; }
+int m7_cb_twice(int x) { return x * 2; }
+int m7_cb_mixed_out(cppi.Mixed m, char** out) { *out = "callback-out"; return m.i + (int)m.d; }
+cppi.Mixed m7_cb_mixed(cppi.Mixed m) { m.d = m.d + 1.0; m.i = m.i + 1; return m; }
+cppi.Large m7_cb_large(cppi.Large v)
+{
+    v.x = v.x + 1; v.y = v.y + 1; v.z = v.z + 1; return v;
+}
+cppi.Hfa m7_cb_hfa(cppi.Hfa v)
+{
+    v.a = v.a + 1.0f; v.b = v.b + 1.0f; v.c = v.c + 1.0f; v.d = v.d + 1.0f; return v;
+}
+int m7_cb_visit(cppi.Tracked* t, void* ctx)
+{
+    int* state = (int*)ctx;
+    if (cppi.dtor_count() != 0) state[1] = 1;
+    state[0] = state[0] + 1;
+    return t.value();
+}
 
 string abiStringGlobal = default;
 extern string abiExternStringValue() { return abiStringGlobal; }
@@ -231,6 +253,11 @@ int m9_second_use()
 {
     std.string s = std.string("abcd");
     return (int)s.size();
+}
+
+int m17_direct_array_param(std.array<int, 4> value)
+{
+    return cppi.array_total(value);
 }
 
 extern int main()
@@ -586,9 +613,8 @@ extern int main()
     if (o.__anon0.as_int != ref2)                return 134;
 
     // ---- Section O: _Bool and long double round-trip -----------------------
-    // _Bool (C99) maps to CFlat bool; long double on MSVC is an 8-byte alias of
-    // double, so it maps to CFlat double. Both pass-by-value and pointer-out
-    // shapes must round-trip cleanly.
+    // _Bool (C99) maps to CFlat bool; clang's target-derived IEEE-double long
+    // double maps to CFlat double. Both C and C++ shapes must round-trip cleanly.
     if (ml_bool_not(true)  != false)             return 140;
     if (ml_bool_not(false) != true)              return 141;
     if (ml_bool_and(true, false) != false)       return 142;
@@ -602,6 +628,11 @@ extern int main()
     double dout = 0.0;
     ml_ld_store(&dout, 7.125);
     if (dout != 7.125)                           return 147;
+    if (cppi.ld_identity(2.5) != 2.5)            return 148;
+    if (cppi.ld_add(1.25, 2.5) != 3.75)         return 149;
+    dout = 0.0;
+    cppi.ld_store(7.125, &dout);
+    if (dout != 7.125)                           return 150;
 
     // ---- Section P: 3+ levels of pointer indirection -----------------------
     // mathlib.h declares helpers taking `int***`. The C-interop mapper collapses
@@ -780,12 +811,12 @@ extern int main()
     if (cppi.read_cref(&cppiCRef) != 42)         return 276;
     if (cppiCRef != 41)                          return 277;
 
-    // Reference RETURN arrives as a plain pointer aliasing the C++ side's storage.
-    int* cppiSlot = cppi.ref_slot();
-    if (*cppiSlot != 99)                         return 278;
-    *cppiSlot = 5;
-    int* cppiSlot2 = cppi.ref_slot();
-    if (*cppiSlot2 != 5)                         return 279;
+    // Reference RETURN arrives as an alias to the C++ side's storage.
+    alias int cppiSlot = cppi.ref_slot();
+    if (cppiSlot != 99)                          return 278;
+    cppiSlot = 5;
+    alias int cppiSlot2 = cppi.ref_slot();
+    if (cppiSlot2 != 5)                          return 279;
 
     // Plain pointer parameter and return (no reference decay involved).
     int cppiVal = 9;
@@ -804,6 +835,58 @@ extern int main()
     // so the declaration is published rather than skipped as an unsupported type.
     if (cppi.mode_value(1) != 10)                return 285;
     if (cppi.mode_value(0) != 0)                 return 286;
+
+    if (cppi.wchar_roundtrip((i32)0x263a) != 0x263a) return 288;
+    if (cppi.char16_roundtrip((u16)0x263a) != 0x263a) return 289;
+    if (cppi.char32_roundtrip((u32)0x1f642) != 0x1f642) return 323;
+    if (cppi.small8_value(cppi.Small8.Value) != 200) return 324;
+    if (cppi.small8_roundtrip(cppi.Small8.Value) != cppi.Small8.Value) return 325;
+    if (sizeof(cppi.Small8Holder) != 2)       return 326;
+    if (alignof(cppi.Small8Holder) != 1)      return 327;
+    if (cppi.Dir.Left != 1 || cppi.dir_value(cppi.Dir.Left) != 1) return 328;
+
+    cppi.Outer.Inner m1inner = default;
+    m1inner.value = 21;
+    if (m1inner.twice() != 42)                 return 329;
+    cppi.Outer.store = 7;
+    if (cppi.Outer.store != 7)                 return 630;
+    if (cppi.read_outer_store() != 7)          return 631;
+    cppi.Outer.store = 11;
+    if (cppi.read_outer_store() != 11)         return 632;
+    if (cppi.Outer.store != 11)                return 633;
+    if (cppi.Outer.Kind.A != 3)                return 619;
+    cppi.Number m1number = default;
+    m1number.i = 42;
+    if (cppi.use_number(&m1number) != 42)      return 621;
+    cppi.AnonymousUnion m1anon = default;
+    m1anon.__anon0.i = 9;
+    if (m1anon.__anon0.i != 9)                 return 622;
+    cppi.Bits m1bits = default;
+    m1bits.a = 3; m1bits.b = 4;
+    if (cppi.use_bits(&m1bits) != 34)          return 623;
+    cppi.ArrayHolder m1array = default;
+    m1array.arr[0] = 1; m1array.arr[1] = 2; m1array.arr[2] = 3; m1array.arr[3] = 4;
+    if (cppi.use_array(&m1array) != 10)        return 624;
+
+    cppi.Buf<int, 4> m1buf = default;
+    if (m1buf.cap() != 4)                       return 625;
+    cppi.Buf<int, cppi.Dir.Right> m1enumBuf = default;
+    if (m1enumBuf.cap() != 2)                   return 631;
+
+    if (cppi.scaled_default(10) != 30)          return 632;
+    if (cppi.scaled_default(10, 4) != 40)       return 633;
+    if (cppi.default_double_ptr() != 25)        return 634;
+    int m1defaultMarker = 7;
+    if (cppi.default_double_ptr(3.0, &m1defaultMarker) != 37) return 635;
+    cppi.Point m1defaultPoint = default;
+    m1defaultPoint.x = 2; m1defaultPoint.y = 3;
+    if (m1defaultPoint.mode_scaled() != 5)      return 636;
+
+
+
+    cppi.IntArray4 m1arrayTemplate = default;
+    m1arrayTemplate[0] = 8; m1arrayTemplate[1] = 9;
+    if (m1arrayTemplate.size() != 4 || m1arrayTemplate[0] + m1arrayTemplate[1] != 17) return 626;
 
     // A record is reachable by POINTER. Passing one BY VALUE is legal when the C++ type is
     // trivially copyable (below); a NONTRIVIAL one is refused - see
@@ -904,6 +987,9 @@ extern int main()
 
     // Two arguments after 'this'.
     if (m4p.scaled(2, 1) != 23)                  return 334;
+    char* m4out = nullptr;
+    m4p.set_out(m4out);
+    if (m4out == nullptr || strcmp(m4out, "set-out") != 0) return 344;
 
     // const/non-const overload pair on an LVALUE receiver: the RULING says the NON-const leg
     // wins, and it is the leg that returns 1.
@@ -1368,7 +1454,7 @@ extern int main()
         if (cppi.dtor_count() != m9made)         return 520;   // vector destroyed every element
     }
 
-    // ---- Section M10: review follow-ups (530-549) -----------------------------------
+    // ---- Section M10: review follow-ups (530-549, 578-585) --------------------------
     /*
      * A POINTER element type. Clang's canonical spelling of the specialization then carries an
      * inner '*' ("vector<char *, allocator<char *>>"), and every member signature that mentions the
@@ -1379,23 +1465,18 @@ extern int main()
     {
         char* m10p = nullptr;
         std.vector<char*> m10v = default;
-        m10v.push_back(&m10p);                                  // `const char *&` param: pass &p
+        m10v.push_back(m10p);                                   // `char* const&` param binds the value by address
         if ((int)m10v.size() != 1)               return 530;
         std.vector<char*> m10w = default;
         m10v.swap(m10w);                                        // param IS the container type
         if ((int)m10v.size() != 0)               return 531;
         if ((int)m10w.size() != 1)               return 532;
-        // No element READ here: for a POINTER element type `operator[]`'s `char *&` return is not
-        // decayed back to storage the way `int &` is, so `m10w[0]` still yields the reference
-        // itself. That gap is independent of the mapping this section covers.
+        if (m10w[0] != nullptr)                  return 615;   // `char *&` decays to the element
     }
 
     /*
-     * A `move` argument to a libc++ member. Which overload leg binds (`const T&` vs `T&&`) is not
-     * asserted here - the rvalue-reference leg is dropped by the CFlat-signature dedup and
-     * restoring it needs a binding ruling - but the OWNERSHIP invariant must hold either way:
-     * everything ever constructed is destroyed exactly once, and the moved-from local is still
-     * destroyed by C++ (a C++ move does not end the source object's lifetime).
+     * A `move` argument to a libc++ member binds the T&& leg, while an lvalue binds const T&.
+     * The C++ move leaves the source object alive until its normal scope exit.
      */
     cppi.reset_counts();
     {
@@ -1404,13 +1485,403 @@ extern int main()
         m10tv.push_back(move m10t);
         if ((int)m10tv.size() != 1)              return 533;
         if (m10tv[0].value() != 9)               return 534;
+        if (cppi.copy_count() != 0)              return 535;
+        if (cppi.move_count() != 1)              return 536;
     }
     {
-        int m10made = cppi.ctor_count() + cppi.copy_count() + cppi.move_count();
-        if (m10made < 2)                         return 535;   // the local plus the element
-        if (cppi.dtor_count() != m10made)        return 536;   // including the moved-from local
+        if (cppi.dtor_count() != 2)              return 537;   // element plus moved-from local
     }
+    cppi.reset_counts();
+    {
+        cppi.Tracked m10t2 = cppi.make_tracked(9);
+        std.vector<cppi.Tracked> m10tv2 = default;
+        m10tv2.push_back(m10t2);
+        if ((int)m10tv2.size() != 1)             return 538;
+        if (m10tv2[0].value() != 9)              return 539;
+        if (cppi.copy_count() != 1)              return 540;
+        if (cppi.move_count() != 0)              return 541;
+    }
+    if (cppi.dtor_count() != 2)                  return 542;
+    {
+        std.vector<std.string> m10sv = default;
+        std.string m10s = std.string("rvalue");
+        m10sv.push_back(move m10s);
+        if (strcmp(m10sv[0].c_str(), "rvalue") != 0) return 543;
+    }
+
+    // A pointer element's C++ T*& result is an alias to the pointer slot, not the slot address.
+    {
+        char* m10s = "element";
+        char* m10t = "replacement";
+        std.vector<char*> m10pv = default;
+        m10pv.push_back(m10s);
+        if (m10pv[0] != m10s)                         return 578;
+        if (m10pv.back() != m10s)                     return 579;
+        m10pv[0] = m10t;
+        if (m10pv[0] != m10t)                         return 580;
+        if (m10pv.back() != m10t)                     return 581;
+    }
+    cppi.reset_counts();
+    {
+        cppi.Tracked m10a = cppi.make_tracked(14);
+        cppi.Tracked m10b = cppi.make_tracked(15);
+        cppi.Tracked* m10pa = &m10a;
+        cppi.Tracked* m10pb = &m10b;
+        std.vector<cppi.Tracked*> m10ppv = default;
+        m10ppv.push_back(m10pa);
+        if (m10ppv[0].value() != 14)                  return 582;
+        m10ppv[0] = m10pb;
+        if (m10ppv[0].value() != 15)                  return 583;
+        if (cppi.dtor_count() != 0)                   return 584;
+    }
+    if (cppi.dtor_count() != 2)                       return 585;
+
+    // ---- Section M11: C++ rvalue-reference parameters (550-577) -------------------
+    cppi.reset_counts();
+    {
+        cppi.Tracked m11t = cppi.make_tracked(4);
+        if (cppi.take_either(m11t) != 1)         return 550;
+        if (cppi.copy_count() != 0)              return 551;
+        if (cppi.move_count() != 0)              return 552;
+    }
+    if (cppi.dtor_count() != 1)                  return 553;
+
+    cppi.reset_counts();
+    {
+        cppi.Tracked m11t = cppi.make_tracked(5);
+        if (cppi.take_either(move m11t) != 2)    return 554;
+        if (cppi.copy_count() != 0)              return 555;
+        if (cppi.move_count() != 1)              return 556;
+    }
+    if (cppi.dtor_count() != 2)                  return 557;
+
+    cppi.reset_counts();
+    {
+        if (cppi.take_either(cppi.make_tracked(5)) != 2) return 558;
+        if (cppi.move_count() != 1)              return 559;
+        if (cppi.dtor_count() != 2)              return 560;
+    }
+    if (cppi.dtor_count() != 2)                  return 561;
+
+    cppi.reset_counts();
+    {
+        cppi.Tracked m11t = cppi.make_tracked(6);
+        if (cppi.take_rvalue(move m11t) != 6)    return 562;
+        if (cppi.dtor_count() != 1)              return 563;
+    }
+    if (cppi.dtor_count() != 2)                  return 564;
+
+    cppi.reset_counts();
+    {
+        cppi.Tracked m11t = cppi.make_tracked(7);
+        if (cppi.take_rvalue(move m11t) != 7)    return 565;
+        m11t = cppi.make_tracked(8);
+        if (m11t.value() != 8)                   return 566;
+    }
+    if (cppi.dtor_count() != 3)                  return 567;
+
+    cppi.reset_counts();
+    {
+        cppi.Sink m11sink = default;
+        cppi.Tracked m11t = cppi.make_tracked(9);
+        if (m11sink.put(m11t) != 1)              return 568;
+        if (m11sink.put(move m11t) != 2)        return 569;
+        if (cppi.copy_count() != 0)              return 570;
+        if (cppi.move_count() != 0)              return 571;
+    }
+    if (cppi.dtor_count() != 1)                  return 572;
+
+    // `move p` on a T* binds the T&& leg with the POINTEE's address (the pointer value, never
+    // the slot holding it); the heap object is still destroyed and freed at scope exit.
+    cppi.reset_counts();
+    {
+        cppi.Tracked* m11p = new cppi.Tracked(10);
+        if (cppi.take_either(m11p) != 1)         return 573;
+        if (cppi.take_either(move m11p) != 2)    return 574;
+        if (cppi.move_count() != 1)              return 575;
+        if (cppi.dtor_count() != 1)              return 576;   // the callee's moved-to local
+    }
+    if (cppi.dtor_count() != 2)                  return 577;   // plus the heap object
+
+    cppi.reset_counts();
+    {
+        cppi.Tracked* m11raw = new cppi.Tracked(12);
+        if (cppi.take_either(*m11raw) != 1)              return 703;
+        if (cppi.copy_count() != 0)                     return 704;
+        if (cppi.move_count() != 0)                     return 705;
+        delete m11raw;
+    }
+
+    // ---- Section M7: reverse C++ ABI callback entry points (586-609) ---------------
+    if (cppi.apply_int(m7_cb_add, 20, 22) != 42) return 584;
+
+    cppi.Mixed m7m = default;
+    m7m.d = 1.5; m7m.i = 20;
+    cppi.Mixed m7mr = cppi.apply_mixed(m7_cb_mixed, m7m);
+    if (m7mr.d != 2.5 || m7mr.i != 21)        return 585;
+
+    cppi.Large m7l = default;
+    m7l.x = 10; m7l.y = 20; m7l.z = 30;
+    cppi.Large m7lr = cppi.apply_large(m7_cb_large, m7l);
+    if (m7lr.x != 11 || m7lr.y != 21 || m7lr.z != 31) return 588;
+
+    cppi.Hfa m7h = default;
+    m7h.a = 1.0f; m7h.b = 2.0f; m7h.c = 3.0f; m7h.d = 4.0f;
+    cppi.Hfa m7hr = cppi.apply_hfa(m7_cb_hfa, m7h);
+    if (m7hr.a != 2.0f || m7hr.b != 3.0f || m7hr.c != 4.0f || m7hr.d != 5.0f) return 589;
+
+    cppi.reset_counts();
+    int[2] m7state = {0, 0};
+    if (cppi.visit_tracked(m7_cb_visit, (void*)m7state, 7) != 14) return 590;
+    if (m7state[0] != 2)                           return 591;
+    if (m7state[1] != 0)                           return 592;
+    if (cppi.ctor_count() != 1)                    return 593;
+    if (cppi.copy_count() != 0)                    return 594;
+    if (cppi.dtor_count() != 1)                    return 595;
+
+    // ---- Section M7f: std::function from a plain CFlat function (610-614) --------
+    std.function<int(int)> m7f = std.function<int(int)>(m7_cb_twice);
+    if (m7f(21) != 42)                             return 610;
+    if (cppi.apply_fn(m7f, 5) != 10)               return 611;
+    if (cppi.apply_fn(std.function<int(int)>(m7_cb_twice), 5) != 10) return 612;
+    std.function<int(int)> m7fCopy = m7f;
+    if (m7fCopy(4) != 8)                           return 613;
+    std.function<int(int)> m7fCopyCtor = std.function<int(int)>(m7f);
+    if (m7fCopyCtor(6) != 12)                      return 614;
+    using F = std.function<int(int)>;
+    F m7fAlias = std.function<int(int)>(m7_cb_twice);
+    if (m7fAlias(7) != 14)                         return 615;
+    std.vector<char*> m7pv = default;
+    char* m7s = "vector-pointer";
+    m7pv.push_back(m7s);
+    if (m7pv[0] != m7s)                             return 616;
+    cppi.Mixed m7mo = default; m7mo.i = 30; m7mo.d = 2.0;
+    char* m7out = nullptr;
+    if (cppi.apply_mixed_out(m7_cb_mixed_out, m7mo, &m7out) != 32) return 617;
+    if (m7out == nullptr || strcmp(m7out, "callback-out") != 0) return 618;
+
+    cppi.IntVec m2alias = default;
+    m2alias.push_back(1);
+    m2alias.push_back(2);
+    if (m2alias.size() != 2)                       return 645;
+    if (cppi.take_intvec(m2alias) != 2)            return 646;
+    cppi.Vec<double> m3vec = default;
+    m3vec.push_back(1.5);
+    if (m3vec.size() != 1)                         return 657;
+
+    i128 m3wide = cppi.wide_add((i128)18446744073709551616, (i128)7);
+    if (m3wide != (i128)18446744073709551623) return 647;
+
+    cppi.Counter m3counter = cppi.Counter(3);
+    if (m3counter.get() != 3) return 648;
+    cppi.DefaultCtorCounter m3default = default;
+    if (m3default.get() != 37) return 649;
+    cppi.Counter m3left = cppi.Counter(3);
+    cppi.Counter m3right = cppi.Counter(4);
+    if ((m3left <= m3right) != true) return 650;
+    if ((m3right >= m3left) != true) return 651;
+    if (m3right % 3 != 1) return 652;
+    if (m3left << 2 != 12) return 653;
+    if ((m3right & 3) != 0) return 654;
+    if ((-m3left).get() != -3) return 655;
+    m3left += 5;
+    if (m3left.get() != 8) return 656;
+
+    if (cppi.counter_add(15, 3) != 18)             return 638;
+    if (cppi.counter_le(15, 12) != 0)              return 639;
+    if (cppi.counter_ge(15, 12) != 1)              return 640;
+    if (cppi.counter_mod(15, 13) != 2)             return 641;
+    if (cppi.counter_shift(15, 1) != 30)           return 642;
+    if (cppi.counter_bitand(15, 7) != 7)           return 643;
+    if (cppi.counter_neg(15) != -15)               return 644;
+
+    // ---- Section M12: std::unique_ptr specialization named only by signatures (658-665) ----
+    cppi.reset_counts();
+    {
+        std.unique_ptr<cppi.Tracked> m12p = cppi.make_tracked_ptr(5);
+        if (m12p.get() == nullptr)                  return 658;
+        if (cppi.tracked_ptr_payload(m12p) != 5)    return 659;
+        cppi.Tracked* m12raw = m12p.release();
+        if (m12raw == nullptr || m12raw.value() != 5) return 660;
+        delete m12raw;
+        if (cppi.dtor_count() != 1)                 return 661;
+        m12p.reset(nullptr);
+    }
+    if (cppi.dtor_count() != 1)                     return 662;
+
+    cppi.reset_counts();
+    {
+        std.unique_ptr<cppi.Tracked> m12p = cppi.make_tracked_ptr(6);
+        m12p.reset(nullptr);
+        if (cppi.dtor_count() != 1)                 return 663;
+    }
+    cppi.reset_counts();
+    {
+        std.unique_ptr<cppi.Tracked> m12p = cppi.make_tracked_ptr(9);
+        if (cppi.consume_tracked_ptr(move m12p) != 9) return 664;
+    }
+    if (cppi.dtor_count() != 1)                     return 665;
+
+    // ---- Section M15: std::shared_ptr and template statics (673-686) --------------
+    cppi.reset_counts();
+    {
+        std.shared_ptr<cppi.Tracked> m15a = cppi.make_tracked_shared(12);
+        if (m15a.get() == nullptr)                   return 673;
+        if (cppi.shared_payload(m15a) != 12)         return 674;
+        if (m15a.use_count() != 1)                   return 675;
+        std.shared_ptr<cppi.Tracked> m15b = m15a;
+        if (m15a.use_count() != 2)                   return 676;
+        m15b.reset();
+        if (m15a.use_count() != 1)                   return 677;
+        if (cppi.consume_tracked_shared(move m15a) != 12) return 678;
+    }
+    if (cppi.dtor_count() != 1)                     return 679;
+    if (cppi.ctor_count() != 1)                     return 680;
+
+    if (cppi.Registry<int>.count != 0)              return 681;
+    if (cppi.Registry<int>.bump() != 1)             return 682;
+    if (cppi.Registry<int>.bump() != 2)             return 683;
+    if (cppi.Registry<int>.count != 2)              return 684;
+
+    if const (cppi.Limits.kLimit != 32) { return 685; }
+    int m15limit = cppi.Limits.kLimit;
+    if (m15limit != 32)                              return 686;
+
+    cppi.Outer.Id m15id = 7;
+    cppi.Outer.Name m15name = "qualified";
+    if (m15id != 7 || strcmp(m15name, "qualified") != 0) return 687;
+    if (cppi.with_call_default(1) != 9)             return 688;
+
+    // ---- Section M16: std::map<int, int> specialization surface (689-696) --------
+    std.map<int, int> m16map = cppi.make_int_map();
+    if (m16map.size() != 2)                          return 689;
+    if (m16map.count(3) != 1)                        return 690;
+    if (m16map.at(3) != 7)                           return 691;
+    if (m16map[3] != 7)                              return 692;
+    m16map[3] = 9;
+    if (m16map[3] != 9)                              return 693;
+    if (cppi.map_total(m16map) != 20)                return 694;
+    m16map.erase(3);
+    if (m16map.count(3) != 0 || m16map.size() != 1) return 695;
+
+    // ---- Section M13: std::pair and std::optional (666-671) ---------------------
+    std.pair<int, double> m13pair = cppi.make_pair_value(8, 2.5);
+    if (m13pair.first != 8)                         return 666;
+    if (m13pair.second != 2.5)                      return 667;
+    std.optional<int> m13some = cppi.make_opt(17, true);
+    if (!m13some.has_value())                       return 668;
+    if (m13some.value() != 17)                      return 669;
+    std.optional<int> m13none = cppi.make_opt(17, false);
+    if (m13none.has_value())                        return 670;
+
+    int[4] m14array = {1, 2, 3, 4};
+    if (cppi.sum4(m14array) != 10)                  return 671;
+    if (cppi.sum4_ptr(m14array) != 10)              return 672;
+
+    // ---- Section M17: vector contiguous iteration and std.array by value (697-706) ----
+    {
+        std.vector<int> m17v = default;
+        m17v.push_back(2);
+        m17v.push_back(3);
+        int m17sum = 0;
+        for (int* m17it = m17v.begin(); m17it != m17v.end(); m17it++)
+            m17sum += *m17it;
+        if (m17sum != 5)                            return 697;
+        if (m17v.data()[1] != 3)                   return 698;
+    }
+    std.array<int, 4> m17directArray = cppi.make_int_array();
+    m17directArray[0] = 8;
+    if (m17directArray[0] != 8)                return 704;
+    if (cppi.array_total(m17directArray) != 17) return 705;
+    if (m17_direct_array_param(m17directArray) != 17) return 706;
+    cppi.IntArray4 m17array = cppi.make_int_array();
+    if (m17array.size() != 4)                      return 699;
+    if (m17array[0] != 1 || m17array[3] != 4)      return 700;
+    m17array[1] = 9;
+    if (m17array[1] != 9)                          return 701;
+    if (m17array.data()[2] != 3)                   return 702;
+    if (cppi.array_total(m17array) != 17)          return 703;
+
+    // ---- Section M18: C++ ++/--, dereference, arrow forwarding and bool (707-724) ----
+    cppi.Cursor m18cursor = cppi.Cursor(10);
+    m18cursor++;
+    if (m18cursor.pos != 11)                        return 707;
+    m18cursor--;
+    if (m18cursor.pos != 10)                        return 708;
+
+    cppi.reset_counts();
+    {
+        std.unique_ptr<cppi.Tracked> m18u = cppi.make_tracked_ptr(21);
+        if ((*m18u).payload != 21)                  return 709;
+        m18u.payload = 22;
+        if (m18u.payload != 22)                     return 710;
+        cppi.Tracked* m18uraw = m18u.get();
+        if (m18uraw == nullptr || m18uraw.payload != 22) return 711;
+        if (!m18u)                                  return 712;
+        bool m18ub = (bool)m18u;
+        if (!m18ub)                                 return 713;
+    }
+    if (cppi.dtor_count() != 1)                     return 714;
+
+    cppi.reset_counts();
+    {
+        std.shared_ptr<cppi.Tracked> m18s = cppi.make_tracked_shared(31);
+        if ((*m18s).payload != 31)                  return 715;
+        m18s.payload = 32;
+        if (m18s.payload != 32)                     return 716;
+        cppi.Tracked* m18sraw = m18s.get();
+        if (m18sraw == nullptr || m18sraw.payload != 32) return 717;
+        if (!m18s)                                  return 718;
+        bool m18sb = (bool)m18s;
+        if (!m18sb)                                 return 719;
+        m18s.reset();
+        if (cppi.dtor_count() != 1)                 return 720;
+    }
+
+    cppi.Truthy m18false = cppi.Truthy(0);
+    if (m18false)                                   return 721;
+    bool m18neg = !m18false;
+    if (!m18neg)                                    return 722;
+    cppi.Truthy m18true = cppi.Truthy(1);
+    if (!m18true)                                   return 723;
+    bool m18truth = (bool)m18true;
+    if (!m18truth)                                  return 724;
+
+    // ---- Section M19: C++ operator(), unary ~, and conversion operators (725-739) ----
+    // A member operator() is CFlat's call spelling on the value AND on a pointer to it, with
+    // the overload picked by arity and by parameter type.
+    cppi.Functor m19f = cppi.Functor(10);
+    if (m19f(5) != 15)                              return 725;
+    if (m19f(5, 7) != 22)                           return 726;
+    if (m19f(0.5) < 10.99 || m19f(0.5) > 11.01)     return 727;
+    cppi.Functor* m19fp = &m19f;
+    if (m19fp(5) != 15)                             return 728;
+    if (m19fp(5, 7) != 22)                          return 729;
+
+    // Arity-0 member operators bind to CFlat's unary hooks.
+    cppi.Mask m19m = cppi.Mask(12);
+    if (~m19m != -13)                               return 730;
+    if (-m19m != -12)                               return 731;
+    if (+m19m != 112)                               return 732;
+    cppi.Mask* m19mp = &m19m;
+    if (~(*m19mp) != -13)                           return 733;
+
+    // Conversion operators bind at an EXPLICIT cast only; explicit and non-explicit alike.
+    cppi.Convertible m19c = cppi.Convertible(41);
+    if ((int)m19c != 42)                            return 734;
+    double m19d = (double)m19c;
+    if (m19d < 41.24 || m19d > 41.26)               return 735;
+    u8 m19b = (u8)m19c;
+    if ((int)m19b != 43)                            return 736;
+    cppi.Convertible* m19cp = &m19c;
+    if ((int)(*m19cp) != 42)                        return 737;
+
+    // A conversion whose target has no cflat spelling (pointer to member) is refused per
+    // member; the class itself still binds and its ordinary members keep working.
+    cppi.ConvRefused m19r = cppi.ConvRefused(1);
+    if (m19r.get() != 4)                            return 738;
+    cppi.ConvDeleted m19del = cppi.ConvDeleted(1);
+    if (m19del.get() != 5)                          return 739;
 
     return 0;
 }
-

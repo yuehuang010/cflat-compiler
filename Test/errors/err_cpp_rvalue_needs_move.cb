@@ -1,0 +1,9 @@
+import cpp "cpp_interop_basic.h";
+
+extern int main()
+{
+    cppi.Tracked t = cppi.Tracked(1);
+    expect_error("move");
+    cppi.take_rvalue(t);
+    return 0;
+}

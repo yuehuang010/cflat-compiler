@@ -1,0 +1,12 @@
+import cpp "cpp_interop_basic.h";
+import cpp "functional";
+
+extern int main()
+{
+    int base = 1;
+    Lambda<int(int)> captured = (int x) => x + base;
+    expect_error("a capturing closure cannot be passed to C++; pass a plain function") {
+        std.function<int(int)> f = std.function<int(int)>(captured);
+    }
+    return 0;
+}

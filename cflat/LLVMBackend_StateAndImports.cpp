@@ -1610,6 +1610,8 @@ nlohmann::json LLVMBackend::TvToJson(const TypeAndValue& tv)
         if (s.IsMove)         j["mv"]  = true;
         if (s.IsAdopt)        j["ad"]  = true;
         if (s.IsAlias)        j["al"]  = true;
+        if (s.IsRvalueRef)    j["rr"]  = true;
+        if (s.IsCxxRefToPointer) j["crp"] = true;
         if (s.IsOwningSink)   j["osk"] = true;
         if (s.IsConsumeInferredSink) j["cis"] = true;
         if (s.IsBorrowOfAliasElement) j["bae"] = true;
@@ -1638,6 +1640,7 @@ nlohmann::json LLVMBackend::TvToJson(const TypeAndValue& tv)
                 if (p.IsMove)  pj["mv"] = true;
                 if (p.IsOwningSink) pj["osk"] = true;
                 if (p.IsConsumeInferredSink) pj["cis"] = true;
+                if (p.IsRvalueRef) pj["rr"] = true;
                 if (p.PointerDepth > 1) pj["pd"] = p.PointerDepth;
                 if (!p.ResolvedTypeKey.empty()) pj["rk"] = p.ResolvedTypeKey;
                 fps.push_back(pj);
@@ -1666,6 +1669,8 @@ LLVMBackend::TypeAndValue LLVMBackend::TvFromJson(const SjVal& j)
         s.IsMove = j.value("mv", false);
         s.IsAdopt = j.value("ad", false);
         s.IsAlias = j.value("al", false);
+        s.IsRvalueRef = j.value("rr", false);
+        s.IsCxxRefToPointer = j.value("crp", false);
         s.IsOwningSink = j.value("osk", false);
         s.IsConsumeInferredSink = j.value("cis", false);
         s.IsBorrowOfAliasElement = j.value("bae", false);
@@ -1694,6 +1699,7 @@ LLVMBackend::TypeAndValue LLVMBackend::TvFromJson(const SjVal& j)
                     p.IsMove = pj.value("mv", false);
                     p.IsOwningSink = pj.value("osk", false);
                     p.IsConsumeInferredSink = pj.value("cis", false);
+                    p.IsRvalueRef = pj.value("rr", false);
                     p.PointerDepth = pj.value("pd", p.PointerDepth);
                     p.ResolvedTypeKey = pj.value("rk", std::string{});
                     s.FuncPtrParams.push_back(std::move(p));
@@ -1771,6 +1777,7 @@ nlohmann::json LLVMBackend::SigToJson(const CSigEntry& e)
         nlohmann::json j = {{"n", e.name}, {"r", TvToJson(e.ret)}, {"ps", ps},
                             {"va", e.variadic}, {"ln", e.line}, {"co", e.col}};
         if (!e.file.empty()) j["f"] = e.file;
+        if (!e.bindRefusal.empty()) j["br"] = e.bindRefusal;
         // C++ identity must round-trip: without it a warm cache calls the demangled name and
         // silently drops the throwing-call gate.
         if (!e.linkageName.empty()) j["lk"] = e.linkageName;
@@ -1783,6 +1790,13 @@ nlohmann::json LLVMBackend::SigToJson(const CSigEntry& e)
         // Raw parameter spellings: RegisterCSignatures retypes a C++ record-pointer parameter out
         // of void* using these, and a warm cache never sees a clang session to re-derive them.
         if (!e.paramSpellings.empty()) j["pspell"] = e.paramSpellings;
+        if (!e.retSpelling.empty()) j["rspell"] = e.retSpelling;
+        if (!e.defaultArgs.empty())
+        {
+            nlohmann::json da = nlohmann::json::array();
+            for (const auto& d : e.defaultArgs) da.push_back({{"k", d.kind}, {"v", d.value}});
+            j["defaults"] = da;
+        }
         return j;
     }
 
@@ -1796,22 +1810,37 @@ LLVMBackend::CSigEntry LLVMBackend::SigFromJson(const SjVal& j)
         e.isCxx    = j.value("cx", false);
         e.isNoexcept = !j.value("nx", false);
         e.file     = j.value("f",  std::string{});
+        e.bindRefusal = j.value("br", std::string{});
         e.line     = j.value("ln", 1);
         e.col      = j.value("co", 0);
         if (j.contains("ps")) for (const auto& p : j["ps"]) e.params.push_back(TvFromJson(p));
         if (j.contains("abi")) e.abi = AbiFromJson(j["abi"]);
         if (j.contains("pspell")) e.paramSpellings = j["pspell"].to_string_vector();
+        e.retSpelling = j.value("rspell", std::string{});
+        if (j.contains("defaults"))
+            for (const auto& d : j["defaults"])
+                e.defaultArgs.push_back({ d.value("k", std::string{}), d.value("v", std::string{}) });
         return e;
     }
 
 nlohmann::json LLVMBackend::EnumToJson(const CEnumEntry& e)
 {
-        return {{"n", e.name}, {"v", e.value}, {"ln", e.line}, {"co", e.col}};
+        nlohmann::json j = {{"n", e.name}, {"v", e.value}, {"ln", e.line}, {"co", e.col}};
+        if (!e.enumType.empty()) j["et"] = e.enumType;
+        if (!e.underlyingType.empty()) j["ut"] = e.underlyingType;
+        return j;
     }
 
 LLVMBackend::CEnumEntry LLVMBackend::EnumFromJson(const SjVal& j)
 {
-        return {j.value("n", std::string{}), j.value("v", 0LL), j.value("ln", 1), j.value("co", 0)};
+        CEnumEntry e;
+        e.name = j.value("n", std::string{});
+        e.value = j.value("v", 0LL);
+        e.line = j.value("ln", 1);
+        e.col = j.value("co", 0);
+        e.enumType = j.value("et", std::string{});
+        e.underlyingType = j.value("ut", std::string{});
+        return e;
     }
 
 nlohmann::json LLVMBackend::GlobalToJson(const CGlobalEntry& g)
@@ -1878,6 +1907,7 @@ nlohmann::json LLVMBackend::CxxMemberToJson(const cflat_cinterop::RawCxxMember& 
         if (m.isCopyAssign)         j["ca"] = true;
         if (m.isMoveAssign)         j["ma"] = true;
         if (m.isPureVirtual)        j["pv"] = true;
+        if (m.isConversion)         j["cvn"] = true;
         if (m.covariantReturnNeedsAdjust) j["cra"] = true;
         // M6 - the vtable slots. A warm cache that dropped these would re-register a virtual
         // member as a DIRECT call, which silently skips every override.
@@ -1916,6 +1946,7 @@ cflat_cinterop::RawCxxMember LLVMBackend::CxxMemberFromJson(const SjVal& j)
         m.isCopyAssign         = j.value("ca", false);
         m.isMoveAssign         = j.value("ma", false);
         m.isPureVirtual        = j.value("pv", false);
+        m.isConversion         = j.value("cvn", false);
         m.covariantReturnNeedsAdjust = j.value("cra", false);
         m.vtableIndex          = j.value("vti", -1);
         m.vtableIndexDeleting  = j.value("vtd", -1);
@@ -1928,6 +1959,7 @@ nlohmann::json LLVMBackend::CxxStaticVarToJson(const cflat_cinterop::RawCxxStati
 {
         nlohmann::json j = {{"n", v.name}, {"ct", v.ctype}, {"lk", v.linkageName},
                             {"ln", v.line}, {"co", v.col}};
+        if (v.isCompileTimeConstant) { j["cn"] = true; j["cv"] = v.constantValue; }
         if (!v.file.empty()) j["f"] = v.file;
         if (v.access != 0)   j["ac"] = v.access;
         return j;
@@ -1939,6 +1971,8 @@ cflat_cinterop::RawCxxStaticVar LLVMBackend::CxxStaticVarFromJson(const SjVal& j
         v.name        = j.value("n", std::string{});
         v.ctype       = j.value("ct", std::string{});
         v.linkageName = j.value("lk", std::string{});
+        v.isCompileTimeConstant = j.value("cn", false);
+        v.constantValue = j.value("cv", (int64_t)0);
         v.file        = j.value("f", std::string{});
         v.line        = j.value("ln", 1);
         v.col         = j.value("co", 0);
@@ -2118,7 +2152,10 @@ LLVMBackend::CFunctionMacroEntry LLVMBackend::FuncMacroFromJson(const SjVal& j)
 nlohmann::json LLVMBackend::TypeAliasToJson(const CTypeAliasEntry& a)
 {
         return {{"n", a.name}, {"t", a.target}, {"f", a.file},
-                {"ln", a.line}, {"co", a.col}, {"ar", a.isAnonymousRecord}};
+                {"ln", a.line}, {"co", a.col}, {"ar", a.isAnonymousRecord},
+                {"qn", a.qualifiedName}, {"cs", a.cxxSpecialization},
+                {"iat", a.isCxxAliasTemplate}, {"cap", a.cxxAliasPattern},
+                {"can", a.cxxAliasParams}};
     }
 
 LLVMBackend::CTypeAliasEntry LLVMBackend::TypeAliasFromJson(const SjVal& j)
@@ -2130,6 +2167,11 @@ LLVMBackend::CTypeAliasEntry LLVMBackend::TypeAliasFromJson(const SjVal& j)
         a.line = j.value("ln", 1);
         a.col = j.value("co", 0);
         a.isAnonymousRecord = j.value("ar", false);
+        a.qualifiedName = j.value("qn", std::string{});
+        a.cxxSpecialization = j.value("cs", std::string{});
+        a.isCxxAliasTemplate = j.value("iat", false);
+        a.cxxAliasPattern = j.value("cap", std::string{});
+        if (j.contains("can")) a.cxxAliasParams = j["can"].to_string_vector();
         return a;
     }
 
@@ -2205,7 +2247,12 @@ bool LLVMBackend::TryLoadCHeaderDiskCache(
         // v18 carries the M5 companion module: the LLVM bitcode of the C++ definitions Clang
         // emitted for the group (inline bodies, vtables/RTTI, inline static members). A v17 entry
         // has none, so a warm cache would bind inline members whose symbols were never emitted.
-        if (version != 18) return false;
+        // v19 carries ABI plans for C++ function-pointer pointee types. v25 carries constexpr
+        // C++ static data members as folded values, so declaration-only imports need no symbol.
+        // v27 adds the C++ operator++/--, operator*, operator-> and operator bool members to
+        // extraction; older entries must be reparsed because their member lists are incomplete.
+        // v28 carries the long-double width, format, and target triple from the clang invocation.
+        if (version != 29) return false;
 
         // Accept on mtime match (fast) or content hash match (authoritative on mtime drift).
         auto storedMtime = j.value("mtime", int64_t{-1});
@@ -2219,6 +2266,9 @@ bool LLVMBackend::TryLoadCHeaderDiskCache(
         CFileSigCacheEntry entry;
         entry.mtime = mtime;
         entry.hash  = contentHash;
+        entry.longDoubleWidth = j.value("ldw", (uint64_t)0);
+        entry.longDoubleIsIEEEDouble = j.value("ldieee", false);
+        entry.targetTriple = j.value("triple", std::string{});
         // DOM walk -> structs (plus deep-mode deps freshness check). Distinct from the parse
         // span above so the allocation-bound conversion cost can be tracked separately.
         llvm::TimeTraceScope convertScope("CHeaderJsonConvert", cachePath.string());
@@ -2236,6 +2286,16 @@ bool LLVMBackend::TryLoadCHeaderDiskCache(
             if (j.contains("typeAliases"))
                 for (const auto& a : j["typeAliases"])
                     entry.typeAliases.push_back(TypeAliasFromJson(a));
+            if (j.contains("functionPointerAbis"))
+                for (const auto& p : j["functionPointerAbis"])
+                {
+                    cflat_cinterop::RawFunctionPointerAbi plan;
+                    plan.signature = p.value("sig", std::string{});
+                    plan.retType = p.value("rt", std::string{});
+                    if (p.contains("pt")) plan.paramTypes = p["pt"].to_string_vector();
+                    if (p.contains("abi")) plan.abi = AbiFromJson(p["abi"]);
+                    entry.functionPointerAbis.push_back(std::move(plan));
+                }
             // Companion module bitcode, base64 in the JSON entry so one file stays self-contained.
             if (j.contains("cxxbc"))
             {
@@ -2281,9 +2341,12 @@ void LLVMBackend::WriteCHeaderDiskCache(
         if (ec) return;
 
         nlohmann::json j;
-        j["version"] = 18;
+        j["version"] = 29;
         j["mtime"]   = (int64_t)mtime.time_since_epoch().count();
         j["hash"]    = contentHash;
+        j["ldw"]     = entry.longDoubleWidth;
+        j["ldieee"]  = entry.longDoubleIsIEEEDouble;
+        j["triple"]  = entry.targetTriple;
 
         nlohmann::json sigs = nlohmann::json::array();
         for (const auto& s : entry.sigs) sigs.push_back(SigToJson(s));
@@ -2311,6 +2374,11 @@ void LLVMBackend::WriteCHeaderDiskCache(
         for (const auto& a : entry.typeAliases)
             typeAliases.push_back(TypeAliasToJson(a));
         j["typeAliases"] = typeAliases;
+        nlohmann::json functionPointerAbis = nlohmann::json::array();
+        for (const auto& p : entry.functionPointerAbis)
+            functionPointerAbis.push_back({{"sig", p.signature}, {"rt", p.retType},
+                                           {"pt", p.paramTypes}, {"abi", AbiToJson(p.abi)}});
+        j["functionPointerAbis"] = functionPointerAbis;
 
         if (!entry.cxxBitcode.empty())
             j["cxxbc"] = llvm::encodeBase64(llvm::ArrayRef<uint8_t>(

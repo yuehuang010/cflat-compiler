@@ -17,6 +17,10 @@
 
 namespace cflat_cinterop
 {
+    // Split a canonical std::function<R(P...)> spelling into its return and parameter spellings.
+    bool SplitStdFunctionSpelling(const std::string& spelling, std::string& ret,
+                                  std::string& params);
+
     // One parameter's (or the result's) ABI arrangement as Clang computed it, spelled without a
     // single clang type so the backend can consume it and the caches can round-trip it. `kind`
     // mirrors clang::CodeGen::ABIArgInfo::Kind; coerceType/paddingType are LLVM IR type TEXT
@@ -52,6 +56,22 @@ namespace cflat_cinterop
         std::string fnTypeText;
     };
 
+    // ABI arrangement for the function type behind a foreign function pointer. The signature is
+    // Clang's canonical function-prototype spelling, so typedefs of the same pointee share it.
+    struct RawFunctionPointerAbi
+    {
+        std::string signature;
+        std::string retType;
+        std::vector<std::string> paramTypes;
+        RawAbi abi;
+    };
+
+    struct RawDefaultArg
+    {
+        std::string kind;  // int, bool, enum, float, double, nullptr, or nonconst
+        std::string value;
+    };
+
     // A C function signature. Types are canonical C spellings (e.g. "int", "unsigned long long",
     // "struct Point *", "int (*)(int, int)") so the backend's string-based mapper consumes them
     // exactly as it did the libclang DesugaredSpelling.
@@ -65,9 +85,11 @@ namespace cflat_cinterop
         std::string retType;
         std::vector<std::string> paramTypes;
         std::vector<std::string> paramNames;   // aligned with paramTypes (may be empty strings)
+        std::vector<RawDefaultArg> defaultArgs;
         bool variadic = false;
         bool isCxx = false;
         bool isNoexcept = false;
+        std::string bindRefusal;
         // Clang's ABI arrangement for this declaration. Filled only in cxxMode.
         RawAbi abi;
         std::string file;
@@ -78,6 +100,8 @@ namespace cflat_cinterop
     struct RawEnum
     {
         std::string name;
+        std::string enumType;
+        std::string underlyingType;
         long long value = 0;
         std::string file;
         int line = 1;
@@ -111,6 +135,7 @@ namespace cflat_cinterop
         std::string retType;           // canonical spelling ("void" for structors)
         std::vector<std::string> paramTypes;
         std::vector<std::string> paramNames;
+        std::vector<RawDefaultArg> defaultArgs; // aligned with paramTypes; entry 0 is `this`
         bool variadic = false;
         bool isConst = false;          // const-qualified instance method
         bool isVirtual = false;
@@ -141,6 +166,10 @@ namespace cflat_cinterop
         bool isCopyAssign = false;
         bool isMoveAssign = false;
         bool isPureVirtual = false;
+        // A CXXConversionDecl (`operator int`, `explicit operator double`, `operator bool`).
+        // Its CFlat registration name is "operator <CFlat spelling of retType>", which only the
+        // backend's C-to-CFlat type map can produce, so the flag - not the name - travels here.
+        bool isConversion = false;
         // A virtual override whose COVARIANT return type needs a pointer adjustment relative to
         // the overridden declaration's return type. Clang answers that with a return-adjusting
         // thunk it emits itself; cflat cannot synthesize one, so such a member is refused.
@@ -168,6 +197,8 @@ namespace cflat_cinterop
         std::string name;
         std::string ctype;
         std::string linkageName;
+        bool isCompileTimeConstant = false;
+        int64_t constantValue = 0;
         int access = AccessPublic;
         std::string file;
         int line = 1;
@@ -246,7 +277,12 @@ namespace cflat_cinterop
     struct RawTypedef
     {
         std::string name;
+        std::string qualifiedName;
         std::string underlying;
+        std::string cxxSpecialization;
+        bool isCxxAliasTemplate = false;
+        std::string cxxAliasPattern;
+        std::vector<std::string> cxxAliasParams;
         std::string file;
         int line = 1;
         int col = 0;
@@ -349,14 +385,22 @@ namespace cflat_cinterop
             std::string cflatName;     // CFlat identity to register, e.g. the mangled generic name
         };
         std::vector<CxxTypeRequest> cxxTypeRequests;
+        // Header extraction may need one retry after forcing a named specialization complete.
+        bool autoInstantiateCxxTypes = true;
     };
 
     struct ExtractResult
     {
+        // Target facts from the exact clang invocation that produced this AST. The backend uses
+        // these for target-dependent scalar mappings and serializes them with header bindings.
+        uint64_t longDoubleWidth = 0;
+        bool longDoubleIsIEEEDouble = false;
+        std::string targetTriple;
         std::vector<RawSig> sigs;
         std::vector<RawEnum> enums;
         std::vector<RawRecord> records;
         std::vector<RawTypedef> typedefs;
+        std::vector<RawFunctionPointerAbi> functionPointerAbis;
         std::vector<RawGlobalVar> globals;
         std::vector<RawMacro> macros;
         std::vector<RawFuncMacro> funcMacros;

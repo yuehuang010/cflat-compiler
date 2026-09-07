@@ -3493,6 +3493,15 @@ IfConstEvaluator MainListener::SinkIfConstEvaluator() {
 std::optional<int64_t> MainListener::EmitAndFoldIfConstLeaf(antlr4::tree::ParseTree* node, bool forceScratch, bool suppress) {
         if (node == nullptr) return std::nullopt;
         auto* compiler = Compiler();
+        auto admitConstGlobal = [&](llvm::Value* value) {
+            auto* load = llvm::dyn_cast_or_null<llvm::LoadInst>(value);
+            auto* global = load == nullptr ? nullptr
+                : llvm::dyn_cast<llvm::GlobalVariable>(load->getPointerOperand());
+            int64_t ignored = 0;
+            if (global != nullptr
+                && compiler->TryGetConstGlobalInt(std::string(global->getName()), ignored))
+                constFoldableGlobals_.insert(std::string(global->getName()));
+        };
 
         // Statement scope (a LIVE insert block that is the function body currently being emitted):
         // emit into it directly, exactly as the pre-evaluator code did. The dead leaf IR left
@@ -3504,6 +3513,7 @@ std::optional<int64_t> MainListener::EmitAndFoldIfConstLeaf(antlr4::tree::ParseT
         if (!forceScratch && compiler->IsInsertBlockLive())
         {
             llvm::Value* v = EmitIfConstLeafValue(node);
+            admitConstGlobal(v);
             uint64_t folded = 0;
             if (v && TryFoldConstInt(v, folded, &constFoldableGlobals_))
                 return (int64_t)folded;
@@ -3530,6 +3540,7 @@ std::optional<int64_t> MainListener::EmitAndFoldIfConstLeaf(antlr4::tree::ParseT
         try
         {
             llvm::Value* v = EmitIfConstLeafValue(node);
+            admitConstGlobal(v);
             uint64_t folded = 0;
             if (v && TryFoldConstInt(v, folded, &constFoldableGlobals_))
                 result = (int64_t)folded;

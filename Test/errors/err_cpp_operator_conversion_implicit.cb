@@ -1,0 +1,16 @@
+// A C++ conversion operator binds at an EXPLICIT cast only, and a conversion cflat refused
+// to bind reports its recorded refusal at the cast instead of claiming it was never declared.
+import cpp "cpp_interop_basic.h";
+
+extern int main()
+{
+    expect_error("cannot cast an aggregate value") {
+        cppi.Convertible c = cppi.Convertible(41);
+        int x = c;
+    }
+    expect_error("member 'operator float' of C++ class 'cppi.ConvDeleted' is deleted") {
+        cppi.ConvDeleted d = cppi.ConvDeleted(1);
+        float g = (float)d;
+    }
+    return 0;
+}

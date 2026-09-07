@@ -624,7 +624,8 @@ llvm::Function* LLVMBackend::GetOrCreateCFuncPtrThunk(llvm::FunctionType* cFnTy)
 
         auto* thunk = llvm::Function::Create(thunkTy, llvm::Function::InternalLinkage, key, *module);
 
-        llvm::IRBuilder<> b(llvm::BasicBlock::Create(*context, "entry", thunk));
+        auto* entry = llvm::BasicBlock::Create(*context, "entry", thunk);
+        llvm::IRBuilder<> b(entry);
         auto* envArg = thunk->getArg((unsigned)thunk->arg_size() - 1);
         auto* fnPtr  = b.CreateBitCast(envArg, cflat_llvm::PointerTo(cFnTy), "cfn");
         std::vector<llvm::Value*> callArgs;
@@ -641,6 +642,35 @@ llvm::Function* LLVMBackend::GetOrCreateCFuncPtrThunk(llvm::FunctionType* cFnTy)
         return thunk;
     }
 
+void LLVMBackend::UnpackFuncPtrSignature(const TypeAndValue& fpTV, TypeAndValue& ret,
+                                         std::vector<TypeAndValue>& params) const
+{
+        ret = TypeAndValue{};
+        ret.TypeName = fpTV.FuncPtrReturnTypeName;
+        ret.Pointer = fpTV.FuncPtrReturnPointer;
+        ret.PointerDepth = fpTV.FuncPtrReturnPointerDepth;
+        ret.ElemPointer = ret.PointerDepth >= 2;
+        ret.IsMove = fpTV.FuncPtrReturnOwned;
+        ret.IsAlias = fpTV.FuncPtrReturnAlias;
+
+        params.clear();
+        params.reserve(fpTV.FuncPtrParams.size());
+        for (const auto& p : fpTV.FuncPtrParams)
+        {
+            TypeAndValue tv;
+            tv.TypeName = p.TypeName;
+            tv.Pointer = p.Pointer;
+            tv.ElemPointer = p.PointerDepth >= 2;
+            tv.PointerDepth = p.PointerDepth;
+            tv.AllocAlignValue = p.AllocAlignValue;
+            tv.IsMove = p.IsMove;
+            tv.IsOwningSink = p.IsOwningSink;
+            tv.IsConsumeInferredSink = p.IsConsumeInferredSink;
+            tv.IsRvalueRef = p.IsRvalueRef;
+            params.push_back(std::move(tv));
+        }
+    }
+
 llvm::Function* LLVMBackend::GetOrCreateCAbiFunctionThunk(const FunctionSymbol& symbol,
                                                           const TypeAndValue& fpTV)
 {
@@ -650,20 +680,9 @@ llvm::Function* LLVMBackend::GetOrCreateCAbiFunctionThunk(const FunctionSymbol& 
         if (auto it = cAbiFunctionThunkCache_.find(key); it != cAbiFunctionThunkCache_.end())
             return it->second;
 
-        std::vector<TypeAndValue> params;
-        for (const auto& p : fpTV.FuncPtrParams)
-        {
-            TypeAndValue tv;
-            tv.TypeName = p.TypeName;
-            tv.Pointer = p.Pointer;
-            tv.IsMove = p.IsMove;
-            params.push_back(tv);
-        }
         TypeAndValue ret;
-        ret.TypeName = fpTV.FuncPtrReturnTypeName;
-        ret.Pointer = fpTV.FuncPtrReturnPointer;
-        ret.IsMove = fpTV.FuncPtrReturnOwned;
-        ret.IsAlias = fpTV.FuncPtrReturnAlias;
+        std::vector<TypeAndValue> params;
+        UnpackFuncPtrSignature(fpTV, ret, params);
         auto* naturalTy = GetFunctionType(ret, params, false, false);
         auto* thunk = llvm::Function::Create(
             naturalTy, llvm::Function::InternalLinkage, key, *module);
@@ -729,6 +748,123 @@ llvm::Function* LLVMBackend::GetOrCreateCAbiFunctionThunk(const FunctionSymbol& 
         return thunk;
     }
 
+llvm::Function* LLVMBackend::GetOrCreateReverseAbiFunctionThunk(
+    llvm::Function* original, const CxxFunctionPointerAbiPlan& plan)
+{
+        std::string key = "__cflat_reverse_abi_" + original->getName().str() + "_"
+                        + FunctionPointerAbiKey(plan.ret, plan.params);
+        for (char& c : key)
+            if (!std::isalnum((unsigned char)c)) c = '_';
+        if (auto* existing = module->getFunction(key)) return existing;
+
+        auto* loweredTy = BuildExternFunctionType(plan.ret, plan.params, false, plan.recipe);
+        auto* thunk = llvm::Function::Create(loweredTy, llvm::Function::InternalLinkage,
+                                             key, *module);
+        thunk->addFnAttr(llvm::Attribute::NoUnwind);
+        ApplyAbiAttributes(thunk, plan.recipe);
+
+        auto* entry = llvm::BasicBlock::Create(*context, "entry", thunk);
+        auto savedIP = builder->saveIP();
+        builder->SetInsertPoint(entry);
+        auto& b = *builder;
+        std::vector<llvm::Value*> naturalArgs;
+        naturalArgs.reserve(plan.params.size());
+        unsigned loweredIndex = 0;
+        llvm::Value* sret = nullptr;
+        if (plan.recipe.retSlot.kind == AbiSlot::SRetReturn)
+            sret = thunk->getArg(loweredIndex++);
+
+        auto abiPieces = [&](const AbiSlot& slot) {
+            std::vector<std::pair<llvm::Type*, uint64_t>> pieces;
+            if (slot.kind == AbiSlot::CoerceToInt)
+                pieces.emplace_back(slot.coerceTy, 0);
+            else if (slot.kind == AbiSlot::CoercePair)
+            {
+                pieces.emplace_back(slot.coerceTy, 0);
+                pieces.emplace_back(slot.coerceTy2, 8);
+            }
+            else if (slot.kind == AbiSlot::CoerceFlat)
+            {
+                const llvm::StructLayout* layout = module->getDataLayout()
+                    .getStructLayout(slot.coerceStructTy);
+                for (unsigned e = 0; e < slot.coerceStructTy->getNumElements(); ++e)
+                    pieces.emplace_back(slot.coerceStructTy->getElementType(e),
+                                        layout->getElementOffset(e));
+            }
+            return pieces;
+        };
+
+        for (size_t i = 0; i < plan.params.size(); ++i)
+        {
+            const AbiSlot& slot = plan.recipe.paramSlots[i];
+            if (slot.kind == AbiSlot::Ignore)
+            {
+                LogError("callback parameter has an ABI slot omitted by the natural C++ "
+                         "signature; this callback shape is not supported");
+                return nullptr;
+            }
+            llvm::Value* value = nullptr;
+            if (slot.kind == AbiSlot::Direct)
+                value = thunk->getArg(loweredIndex++);
+            else if (slot.kind == AbiSlot::ByVal)
+            {
+                auto* incoming = thunk->getArg(loweredIndex++);
+                value = b.CreateLoad(slot.structTy, incoming, "callback.byval");
+            }
+            else
+            {
+                auto pieces = abiPieces(slot);
+                llvm::Type* holderTy = slot.coerceTy;
+                if (slot.kind == AbiSlot::CoercePair)
+                    holderTy = slot.structTy;
+                else if (slot.kind == AbiSlot::CoerceFlat)
+                    holderTy = slot.coerceStructTy;
+                auto* storage = AllocaForCoerce(slot.structTy, holderTy,
+                                                slot.align, "callback.coerce");
+                for (const auto& piece : pieces)
+                    StoreCoerceAt(storage, thunk->getArg(loweredIndex++), piece.second);
+                value = b.CreateLoad(slot.structTy, storage, "callback.arg");
+            }
+            naturalArgs.push_back(value);
+        }
+
+        auto* naturalTy = GetFunctionType(plan.ret, plan.params, false, false);
+        auto* call = b.CreateCall(naturalTy, original, naturalArgs);
+        if (plan.recipe.retSlot.kind == AbiSlot::SRetReturn)
+        {
+            b.CreateStore(call, sret);
+            b.CreateRetVoid();
+        }
+        else if (plan.recipe.retSlot.kind == AbiSlot::Direct)
+            b.CreateRet(call);
+        else
+        {
+            const auto& slot = plan.recipe.retSlot;
+            auto pieces = abiPieces(slot);
+            llvm::Type* holderTy = slot.coerceTy;
+            if (slot.kind == AbiSlot::CoercePair)
+                holderTy = slot.structTy;
+            else if (slot.kind == AbiSlot::CoerceFlat)
+                holderTy = slot.coerceStructTy;
+            auto* storage = AllocaForCoerce(slot.structTy, holderTy,
+                                             slot.align, "callback.ret");
+            b.CreateStore(call, storage);
+            if (slot.kind == AbiSlot::CoerceToInt)
+                b.CreateRet(LoadCoerceAt(storage, pieces.front().first, pieces.front().second));
+            else
+            {
+                llvm::Value* result = llvm::UndefValue::get(loweredTy->getReturnType());
+                for (size_t i = 0; i < pieces.size(); ++i)
+                    result = b.CreateInsertValue(result,
+                        LoadCoerceAt(storage, pieces[i].first, pieces[i].second),
+                        { static_cast<unsigned>(i) });
+                b.CreateRet(result);
+            }
+        }
+        builder->restoreIP(savedIP);
+        return thunk;
+    }
+
 llvm::Value* LLVMBackend::WrapCFuncPtrAsFatStruct(llvm::Value* cFnPtrValue, const TypeAndValue& fpTV)
 {
         auto* i8PtrTy = cflat_llvm::PointerTo(builder->getInt8Ty());
@@ -757,9 +893,56 @@ llvm::Value* LLVMBackend::WrapCFuncPtrAsFatStruct(llvm::Value* cFnPtrValue, cons
 llvm::Value* LLVMBackend::MakeThinFnPtrValue(llvm::Value* fn, const TypeAndValue& fpTV)
 {
         if (auto* original = llvm::dyn_cast<llvm::Function>(fn))
-            if (const auto* symbol = FindSymbolForFunction(original);
-                symbol != nullptr && symbol->External && symbol->Recipe.hasLowering)
+        {
+            std::vector<TypeAndValue> params;
+            TypeAndValue ret;
+            UnpackFuncPtrSignature(fpTV, ret, params);
+            auto planIt = cxxFunctionPointerAbiPlans_.find(FunctionPointerAbiKey(ret, params));
+            const auto* symbol = FindSymbolForFunction(original);
+            if (planIt != cxxFunctionPointerAbiPlans_.end())
+            {
+                const auto& plan = planIt->second;
+                for (const auto& p : plan.params)
+                    if (p.IsRvalueRef)
+                    {
+                        LogError(std::format(
+                            "callback parameter of C++ rvalue reference type '{}' is not "
+                            "supported; take a pointer or lvalue reference", p.TypeName));
+                        return llvm::UndefValue::get(BuildThinFnPtrType(fpTV));
+                    }
+                if (!plan.ret.Pointer && IsForeignNontrivialCxxClass(plan.ret.TypeName))
+                {
+                    LogError("callback result of nontrivial C++ class type by value is not "
+                             "supported; take a pointer or reference");
+                    return llvm::UndefValue::get(BuildThinFnPtrType(fpTV));
+                }
+                for (const auto& p : plan.params)
+                    if (!p.Pointer && IsForeignNontrivialCxxClass(p.TypeName))
+                    {
+                        LogError("callback parameter of nontrivial C++ class type by value is "
+                                 "not supported; take a pointer or reference");
+                        return llvm::UndefValue::get(BuildThinFnPtrType(fpTV));
+                    }
+                for (const auto& slot : plan.recipe.paramSlots)
+                    if (slot.kind == AbiSlot::Ignore)
+                    {
+                        LogError("callback parameter has an ABI slot omitted by the natural "
+                                 "C++ signature; this callback shape is not supported");
+                        return llvm::UndefValue::get(BuildThinFnPtrType(fpTV));
+                    }
+                if (plan.recipe.hasLowering)
+                {
+                    if (symbol != nullptr && symbol->External && symbol->Recipe.hasLowering)
+                        return builder->CreateBitCast(original, BuildThinFnPtrType(fpTV),
+                                                      "thinfn");
+                    fn = GetOrCreateReverseAbiFunctionThunk(original, plan);
+                    if (fn == nullptr)
+                        return llvm::UndefValue::get(BuildThinFnPtrType(fpTV));
+                }
+            }
+            else if (symbol != nullptr && symbol->External && symbol->Recipe.hasLowering)
                 fn = GetOrCreateCAbiFunctionThunk(*symbol, fpTV);
+        }
         return builder->CreateBitCast(fn, BuildThinFnPtrType(fpTV), "thinfn");
     }
 

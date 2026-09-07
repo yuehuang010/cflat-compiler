@@ -460,6 +460,19 @@ llvm::Type* LLVMBackend::GetType(const LLVMBackend::TypeAndValue& typeAndValue, 
         return type;
     }
 
+// A temporary attributed to a live variable (`k.toString()` keeps `k` as its owner name) is
+// not consumable: the move transfer would mark that variable moved.
+bool LLVMBackend::IsConsumableTemporary(const NamedVariable& arg) const
+{
+        if (!arg.IsRvalue && !IsOwnedTempValue(arg)) return false;
+        return arg.CallerName.empty() || FindVariableStorage(arg.CallerName).Storage == nullptr;
+    }
+
+bool LLVMBackend::IsRvalueReferenceArgument(const NamedVariable& arg) const
+{
+        return arg.IsExplicitMove || IsConsumableTemporary(arg);
+    }
+
 int LLVMBackend::ScoreMoveAgreement(const std::vector<NamedVariable>& arguments, const FunctionSymbol& candidate) const
 {
         int moveScore = 0;
@@ -467,24 +480,15 @@ int LLVMBackend::ScoreMoveAgreement(const std::vector<NamedVariable>& arguments,
         for (const auto& arg : arguments)
         {
             if (pi == candidate.Parameters.end()) break;
-            /*
-             * An explicit 'move' at the call site is a direct request for the move
-             * overload, and the ONLY thing that selects it for a NAMED lvalue: passing an
-             * owning variable plainly (value OR pointer) means "borrow".
-             * An RVALUE prefers the move overload the way C++ binds an rvalue to 'T&&'
-             * over 'const T&' - the temporary dies right after the call, so a borrow
-             * overload would deep-copy for nothing. "Rvalue" = no addressable storage and
-             * a CallerName naming nothing in scope (for a call result CallerName holds the
-             * CALLEE's name). Restricted to aggregates, where the copy actually costs.
-             */
-            bool argIsUnbound = arg.Storage == nullptr
-                && FindVariableStorage(arg.CallerName).Storage == nullptr;
-            bool argIsRValue = argIsUnbound && arg.FieldName.empty()
-                && !arg.TypeAndValue.Pointer
+            // Explicit moves prefer consuming overloads; a temporary does too, but only where
+            // the borrow overload would deep-copy an aggregate for nothing.
+            bool argIsRValue = IsConsumableTemporary(arg) && !arg.TypeAndValue.Pointer
                 && (arg.IsOwningString || arg.IsOwningStruct
                     || IsDataStructure(arg.TypeAndValue.TypeName));
             bool argOwning = arg.IsExplicitMove || argIsRValue;
             if (pi->IsMove == argOwning)
+                moveScore++;
+            if (pi->IsRvalueRef == IsRvalueReferenceArgument(arg))
                 moveScore++;
             if (pi->IsFunctionPointer && !arg.CallerName.empty()
                 && HasFunctionWithMoveFlags(arg.CallerName, pi->FuncPtrParams))

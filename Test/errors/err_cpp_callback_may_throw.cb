@@ -1,0 +1,10 @@
+import cpp "cpp_interop_basic.h";
+
+expect_error("may throw - C++ exceptions are not supported yet") {
+    int bad_callback(int value) { return cppi.may_throw(value); }
+
+    extern int main()
+    {
+        return cppi.apply_int(bad_callback, 1, 2);
+    }
+}

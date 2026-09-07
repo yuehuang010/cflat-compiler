@@ -647,7 +647,7 @@ static std::optional<int64_t> FoldCompileTimeIntLeaf(LLVMBackend* compiler, antl
                 && n->children[1] == n->Dot(0))
             {
                 auto* prim = n->primaryExpression();
-                auto* member = dynamic_cast<antlr4::tree::TerminalNode*>(n->children[2]);
+                auto* member = dynamic_cast<CFlatParser::MemberNameTokenContext*>(n->children[2]);
                 auto* gid = prim != nullptr ? prim->genericIdentifier() : nullptr;
                 if (member != nullptr && gid != nullptr && gid->genericTypeParameters() == nullptr
                     && gid->Identifier() != nullptr)
@@ -1126,11 +1126,12 @@ static CFlatParser::GenericTypeParametersContext* GenericSpecOf(
     if (ts == nullptr) return nullptr;
     if (auto* q = ts->qualifiedGenericIdentifier())
     {
-        for (auto* id : q->Identifier())
-        {
-            if (!base.empty()) base += ".";
-            base += id->getText();
-        }
+        // The lexer token for a soft-keyword component such as `std.function` is Function,
+        // not Identifier, so reconstruct the qualified base from the text rather than dropping
+        // that component from the C++ template identity.
+        std::string text = q->getText();
+        size_t lt = text.find('<');
+        base = text.substr(0, lt == std::string::npos ? text.size() : lt);
         return q->genericTypeParameters();
     }
     if (auto* g = ts->genericIdentifier())
@@ -2752,6 +2753,7 @@ public:
     // Scanner counterpart of EncodeClosureCodegen: builds the encoded name only (the main pass owns
     // registration, so the copy-overload is not lost to RegisterEncodedClosureType's idempotency).
     std::string EncodeClosureScanner(CFlatParser::FunctionPointerSpecifierContext* fpSpec);
+    std::string EncodePlainFunctionTypeScanner(CFlatParser::FunctionTypeArgumentContext* fnSpec);
 
     // ---- Scanner-side `if const` folding -------------------------------------------------------
     // The main pass decides an `if const` with DecideIfConstCondition -> EvalIfConstConstant, whose
@@ -3321,6 +3323,7 @@ private:
     // nested signature position into a symbol-safe name (BuildEncodedClosureName), resolving its
     // signature component types, and register the call descriptor. Returns the encoded name.
     std::string EncodeClosureCodegen(CFlatParser::FunctionPointerSpecifierContext* fpSpec);
+    std::string EncodePlainFunctionTypeCodegen(CFlatParser::FunctionTypeArgumentContext* fnSpec);
 
     // Encode + register a closure type from an already-resolved signature (used when a function-type
     // alias `using IntFn = Lambda<int(int)>` appears as a generic arg, so it unifies with the direct
@@ -5875,7 +5878,7 @@ public:
     // keep their existing borrowed-pointer value semantics.
     void PrepareAliasCallResult(
         antlr4::ParserRuleContext* ctx,
-        LLVMBackend::NamedVariable& result);
+        LLVMBackend::NamedVariable& result, bool markRvalue = true);
 
     // Returns the member-name text immediately following `opNode` (a `.`/`->` token) in the
     // postfix child list, or "" if the next child is not an Identifier/`move` name. Used by

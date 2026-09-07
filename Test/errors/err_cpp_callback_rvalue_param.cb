@@ -1,0 +1,10 @@
+import cpp "cpp_interop_basic.h";
+
+expect_error("rvalue reference") {
+    int bad_callback(cppi.Tracked* value) { return value.value(); }
+
+    extern int main()
+    {
+        return cppi.apply_tracked_rvalue(bad_callback);
+    }
+}

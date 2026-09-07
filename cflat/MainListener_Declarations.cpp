@@ -154,6 +154,15 @@ std::string MainListener::ResolveTypeArgEntry(CFlatParser::TypeParameterEntryCon
             RejectFatClosurePointerArg(entry, fpSpec->Function() != nullptr, typeSpec->getText());
             return encodedArg + "*";
         }
+        else if (entry->functionTypeArgument())
+        {
+            if (isUnique)
+                LogErrorContext(entry, "'unique' on a generic type argument: a function pointer or closure does not own an allocation");
+            std::string encodedArg = EncodePlainFunctionTypeCodegen(entry->functionTypeArgument());
+            if (!hasPointer) return encodedArg;
+            LogErrorContext(entry, "pointer '*' is not supported on a bare function type generic argument");
+            return encodedArg + "*";
+        }
         else
         {
             // Simple type or type parameter: look up in activeTypeSubstitutions
@@ -478,6 +487,33 @@ std::string MainListener::EncodeClosureCodegen(CFlatParser::FunctionPointerSpeci
             sig.FuncPtrReturnPointerDepth, encParams);
         Compiler(fpSpec)->RegisterEncodedClosureType(encoded, sig);
         return encoded;
+    }
+
+std::string MainListener::EncodePlainFunctionTypeCodegen(
+    CFlatParser::FunctionTypeArgumentContext* fnSpec) {
+        LLVMBackend::TypeAndValue sig;
+        sig.IsFunctionPointer = true;
+        sig.TypeName = "__c_fn_ptr";
+        bool retPtr = fnSpec->pointer() != nullptr;
+        int retStars = PointerDepthOf(fnSpec->pointer());
+        sig.FuncPtrReturnTypeName = ResolveSigComponentCodegen(fnSpec->typeSpecifier(), retPtr);
+        sig.FuncPtrReturnPointer = retPtr;
+        sig.FuncPtrReturnPointerDepth = ReconcilePointerDepth(retPtr, retStars);
+        sig.FuncPtrReturnResolvedKey = SigComponentResolvedKey(sig.FuncPtrReturnTypeName);
+        if (fnSpec->functionPointerParamList() != nullptr)
+            for (auto* param : fnSpec->functionPointerParamList()->functionPointerParam())
+            {
+                LLVMBackend::TypeAndValue::FuncPtrParam p;
+                bool pPtr = param->pointer() != nullptr;
+                int pStars = PointerDepthOf(param->pointer());
+                p.TypeName = ResolveSigComponentCodegen(param->typeSpecifier(), pPtr);
+                p.Pointer = pPtr;
+                p.PointerDepth = ReconcilePointerDepth(pPtr, pStars);
+                p.IsMove = param->Move() != nullptr;
+                p.ResolvedTypeKey = SigComponentResolvedKey(p.TypeName);
+                sig.FuncPtrParams.push_back(p);
+            }
+        return EncodeClosureFromSig(Compiler(fnSpec), sig);
     }
 
 std::string MainListener::EncodeClosureFromSig(LLVMBackend* compiler, const LLVMBackend::TypeAndValue& sig) {
@@ -1937,7 +1973,15 @@ void MainListener::ParseUsingDeclaration(CFlatParser::UsingDeclarationContext* c
                 typeArgs.push_back(ResolveTypeArgEntry(entry));
             std::string mangledName = MangledGenericName(baseName, typeArgs);
 
-            if (genericStructTemplates.count(baseName) != 0
+            if (baseName == "std.function")
+            {
+                std::string cxxError;
+                if (!compiler->TryRequestCxxType(baseName, typeArgs, mangledName, cxxError))
+                    compiler->LogError(cxxError.empty()
+                        ? std::format("using alias '{}' = '{}': '{}' is not a generic type",
+                            alias, target, baseName) : cxxError);
+            }
+            else if (genericStructTemplates.count(baseName) != 0
                 || genericClassTemplates.count(baseName) != 0
                 || genericInterfaceTemplates.count(baseName) != 0)
             {
@@ -3515,6 +3559,8 @@ CFlatParser::ArgumentExpressionListContext* MainListener::ForeignCxxConstructArg
             && callee.find('<', lt + 1) == std::string::npos)
         {
             std::string base = callee.substr(0, lt);
+            // Function-type arguments use the registered CFlat specialization identity.
+            if (base == MangledBase(typeName)) return args[0];
             std::string inner = callee.substr(lt + 1, callee.size() - lt - 2);
             std::vector<std::string> targs;
             size_t start = 0;
@@ -3544,7 +3590,7 @@ bool MainListener::TryDeclareForeignCxxLocal(CFlatParser::InitDeclaratorContext*
 {
         auto* compiler = Compiler(direct);
         const std::string typeName = declType.TypeName;
-        if (!compiler->IsForeignNontrivialCxxClass(typeName)) return false;
+        if (!compiler->IsForeignCxxClassWithConstructors(typeName)) return false;
         if (declType.Pointer || declType.ConstArraySize > 0 || !declType.ConstInnerDimensions.empty()
             || declType.IsArrayView || declType.IsInterface || declType.ArraySize != nullptr)
             return false;   // pointers and arrays of the class keep the ordinary path
@@ -3582,8 +3628,9 @@ bool MainListener::TryDeclareForeignCxxLocal(CFlatParser::InitDeclaratorContext*
         allocList.push_back(std::pair(name, slot));
         if (slotValue == nullptr) return true;
 
-        // The class must be destructible from CFlat code, or the local could never be released.
-        if (compiler->GetOrCreateCxxClassDestructor(typeName) == nullptr)
+        // Nontrivial classes must have a callable destructor; trivial classes need no cleanup.
+        if (compiler->IsForeignNontrivialCxxClass(typeName)
+            && compiler->GetOrCreateCxxClassDestructor(typeName) == nullptr)
         {
             LogErrorContext(direct, std::format(
                 "cannot declare a local of C++ class '{}': it has no destructor cflat can call "
@@ -4287,8 +4334,8 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
             // matches grammar alternative `directDeclarator '(' identifierList? ')'`
             bool hasParens = declarator->children.size() > 1;
 
-            // A local of a foreign NONTRIVIAL C++ class is constructed into its slot rather than
-            // assigned a materialized value; that path owns the whole declaration.
+            // A local of a foreign C++ class with declared constructors is constructed into its
+            // slot rather than assigned a materialized value.
             if (paramTypeList == nullptr && !hasParens && !global_scope
                 && !typeAndValue.staticStorage && direct != nullptr
                 && direct->assignmentExpression() == nullptr
@@ -8409,6 +8456,16 @@ LLVMBackend::NamedVariable MainListener::FinishAssignmentExpressionNamed(
 void MainListener::TypeUntypedCtorArg(LLVMBackend::TypeAndValue& argType, llvm::Value* argValue)
 {
     if (!argType.TypeName.empty() || argType.Pointer) return;
+    if (auto* fn = llvm::dyn_cast_or_null<llvm::Function>(argValue))
+    {
+        if (const auto* sym = Compiler()->FindSymbolForFunction(fn))
+        {
+            argType = Compiler()->FuncPtrSigOfSymbol(*sym);
+            argType.TypeName = "__c_fn_ptr";
+            argType.IsFunctionPointer = true;
+            return;
+        }
+    }
     if (argValue != nullptr && argValue->getType()->isFloatingPointTy())
     {
         argType.TypeName = argValue->getType()->isFloatTy() ? "float" : "double";

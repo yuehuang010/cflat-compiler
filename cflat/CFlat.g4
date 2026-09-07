@@ -90,7 +90,7 @@ postfixExpression
     : primaryExpression (
         '[' expression ']'
         | '(' argumentExpressionList ')'
-        | ('.' | '->' | QuestionDot) (Identifier | Move | String) genericTypeParameters?
+        | ('.' | '->' | QuestionDot) memberNameToken genericTypeParameters?
         | '.' Tilde '(' ')'
         | '++'
         | '--'
@@ -413,8 +413,14 @@ typeParameterList
 
 typeParameterEntry
     : valueParameterDeclaration
+    | functionTypeArgument
     | Identifier? typeSpecifier pointer? arrayTypeSuffix? Ellipsis?   // leading Identifier is the `unique` ownership qualifier (soft keyword, validated in the listener); `T[]` arg = a noalias array-view; `[N]`/`[]*` rejected in the listener
     | shiftExpression                                                 // compile-time VALUE argument, e.g. `8`, `CAP*2`, `(A>B)`
+    ;
+
+// Bare C/C++ function type, used as a class-template argument (`std.function<int(int)>`).
+functionTypeArgument
+    : typeSpecifier pointer? '(' functionPointerParamList? ')'
     ;
 
 // A compile-time VALUE generic parameter: `struct Buf<T, int N>`. The primitive type token
@@ -894,7 +900,14 @@ genericIdentifier
 // `String` is a trailing component so `std.string` can be named (no CFlat member can be spelled
 // `string` - it is a lexer keyword); at statement scope `a.string b;` reads as a declaration, like `a.b`.
 qualifiedGenericIdentifier
-    : Identifier ('.' (Identifier | String))+ genericTypeParameters?
+    : Identifier ('.' memberNameToken)+ genericTypeParameters?
+    ;
+
+memberNameToken
+    : Identifier
+    | Function
+    | Move
+    | String
     ;
 
 destructorDefinition

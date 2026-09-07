@@ -1,0 +1,11 @@
+// C++ operator bool participates in conditions and explicit casts, not implicit bool assignment.
+import cpp "cpp_interop_basic.h";
+
+extern int main()
+{
+    expect_error("condition must be a scalar") {
+        std.unique_ptr<cppi.Tracked> p = cppi.make_tracked_ptr(1);
+        bool b = p;
+    }
+    return 0;
+}
