@@ -111,6 +111,15 @@ std::string MainListener::ResolveTypeArgEntry(CFlatParser::TypeParameterEntryCon
             for (auto* innerEntry : innerParams->typeParameterList()->typeParameterEntry())
                 innerArgs.push_back(ResolveTypeArgEntry(innerEntry));
             resolved = MangledGenericName(innerBase, innerArgs);
+            // A foreign C++ specialization used as a type argument (`list<std.vector<int>>`, or
+            // the inner `std.string` of `std.vector<std.string>`) must be registered before the
+            // outer name is mangled around it.
+            {
+                std::string cxxError;
+                if (!Compiler()->TryRequestCxxType(innerBase, innerArgs, resolved, cxxError)
+                    && !cxxError.empty())
+                    LogErrorContext(entry, cxxError);
+            }
             if (IsCoreUniqueArrayViewInstantiation(Compiler(), resolved, innerArgs))
                 LogErrorContext(entry, CoreUniqueArrayViewMessage(innerArgs));
             // A generic used as a type argument to another generic (e.g. list<int>
@@ -188,6 +197,11 @@ std::string MainListener::ResolveTypeArgEntry(CFlatParser::TypeParameterEntryCon
                 if (valueIt != activeValueSubstitutions.end())
                     return valueIt->second;
                 std::string base = Compiler(entry)->ResolveTypeArgBaseName(resolved);
+                {
+                    // A plain dotted name may be a C++ class or a typedef for one (`std.string`).
+                    std::string cxxError;
+                    Compiler(entry)->TryRequestCxxType(base, {}, base, cxxError);
+                }
                 // Fold a pure-rename `using` into the ARGUMENT, not just into the mangled name:
                 // the instantiation is queued and drained after the alias scope is gone, so a
                 // body-scope alias spelling would no longer name anything by then.
@@ -794,6 +808,16 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                     // concrete thin interface + PIID now so the declared type is a real struct.
                     if (baseName.find('.') != std::string::npos)
                         Compiler(declSpecs)->InstantiateWinrtGenericInterface(baseName, typeArgs, mangledName);
+                    // A C++ CLASS TEMPLATE spelled with CFlat's angle syntax
+                    // (`std.vector<int>`): instantiate it now so the declared type is a real
+                    // struct with constructors, a destructor and methods.
+                    {
+                        std::string cxxError;
+                        if (!Compiler(declSpecs)->TryRequestCxxType(baseName, typeArgs, mangledName,
+                                                                    cxxError)
+                            && !cxxError.empty())
+                            LogErrorContext(genParams, cxxError);
+                    }
                     // Queue instantiation of nested generic types discovered during field/param parsing.
                     // Only do this when inside an active instantiation context (substitutions are set),
                     // to avoid treating unresolved type parameters (e.g. "T") as concrete types.
@@ -861,6 +885,13 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                 else
                 {
                     typeName = typeSpec->getText();
+                    {
+                        // A plain dotted name from a C++ import: a class, or a typedef for a
+                        // specialization (`std.string`). A miss is silent - the ordinary
+                        // unknown-type diagnostic below is the right report for a typo.
+                        std::string cxxError;
+                        Compiler(declSpecs)->TryRequestCxxType(typeName, {}, typeName, cxxError);
+                    }
                     if (typeName == "long") typeName = LongSpellingTypeName(longSpecCount);
                     // Apply active type parameter substitutions (e.g. T -> int inside a template body)
                     int& substPointerDepth = substArgPtrDepth;
@@ -3476,6 +3507,28 @@ CFlatParser::ArgumentExpressionListContext* MainListener::ForeignCxxConstructArg
         if (full.compare(full.size() - suffix.size(), suffix.size(), suffix) != 0) return nullptr;
         const std::string callee = full.substr(0, full.size() - suffix.size());
         if (callee == typeName) return args[0];
+        // A C++ CLASS TEMPLATE is REGISTERED under its mangled generic name, while the ctor call
+        // is spelled with CFlat's angle syntax (`cppt.Box<int>(7)`). Re-mangle the spelling to
+        // compare identities. Nested angle arguments are left to the ordinary diagnostic.
+        if (auto lt = callee.find('<');
+            lt != std::string::npos && callee.size() > lt + 1 && callee.back() == '>'
+            && callee.find('<', lt + 1) == std::string::npos)
+        {
+            std::string base = callee.substr(0, lt);
+            std::string inner = callee.substr(lt + 1, callee.size() - lt - 2);
+            std::vector<std::string> targs;
+            size_t start = 0;
+            while (start <= inner.size())
+            {
+                size_t comma = inner.find(',', start);
+                std::string one = inner.substr(start, comma == std::string::npos
+                                                      ? std::string::npos : comma - start);
+                targs.push_back(one);
+                if (comma == std::string::npos) break;
+                start = comma + 1;
+            }
+            if (MangleGenericInstance(*Compiler(pf), base, targs) == typeName) return args[0];
+        }
         // `using ns;` lets the class be named without its namespace, so the trailing component
         // of the registered dotted name is an equally valid spelling of the same type.
         auto dot = typeName.rfind('.');
@@ -3578,6 +3631,7 @@ bool MainListener::TryDeclareForeignCxxLocal(CFlatParser::InitDeclaratorContext*
                 // is the one path that materializes every binding shape.
                 argValues.push_back(LoadNamedVariable(nv));
                 argTypes.push_back(nv.TypeAndValue);
+                TypeUntypedCtorArg(argTypes.back(), argValues.back());
             }
             std::string why;
             const auto* ctor = compiler->SelectCxxConstructor(typeName, argTypes, why);
@@ -8343,3 +8397,24 @@ LLVMBackend::NamedVariable MainListener::FinishAssignmentExpressionNamed(
             ? true : (compilerLLVM->IsProducedTempValue(nv.Primary) ? false : savedOwned);
         return nv;
     }
+
+/*
+ * An untyped literal argument to a C++ constructor. A string literal and an untyped floating
+ * literal both carry no CFlat type of their own - the destination decides - but at a C++
+ * constructor the destination is not known until an overload is chosen, and selection reads every
+ * untyped literal as integral, so a `const char *` or `double` parameter would never match. Take
+ * the shape from the value the callee will actually receive: `char *` is the spelling every
+ * `const char *` parameter maps to (const is dropped at the boundary).
+ */
+void MainListener::TypeUntypedCtorArg(LLVMBackend::TypeAndValue& argType, llvm::Value* argValue)
+{
+    if (!argType.TypeName.empty() || argType.Pointer) return;
+    if (argValue != nullptr && argValue->getType()->isFloatingPointTy())
+    {
+        argType.TypeName = argValue->getType()->isFloatTy() ? "float" : "double";
+        return;
+    }
+    if (auto* c = llvm::dyn_cast_or_null<llvm::Constant>(argValue);
+        c != nullptr && Compiler()->IsStringLiteralConstant(c))
+    { argType.TypeName = "char"; argType.Pointer = true; }
+}

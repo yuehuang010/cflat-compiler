@@ -51,6 +51,15 @@ namespace cpppoly
     int read_right(const Right* p) noexcept { return p->rv; }
     int call_right(const Right* p) noexcept { return p->r(); }
 
+    QualNames::QualNames() noexcept { lv = 55; cv = 66; bv = 77; }
+    QualNames::~QualNames() noexcept {}
+    int QualNames::l() const noexcept { return lv + 3000; }
+
+    int read_constant(const constant* p) noexcept { return p->cv; }
+    int read_class_base(const classBase* p) noexcept { return p->bv; }
+    QualNames* make_qual() noexcept { return new QualNames(); }
+    void destroy_qual(QualNames* p) noexcept { delete p; }
+
     Abstract::~Abstract() noexcept {}
 
     VBaseTop::~VBaseTop() noexcept {}

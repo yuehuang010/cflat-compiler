@@ -116,6 +116,8 @@ namespace cppi
         Tracked& operator=(Tracked&& other) noexcept;
 
         int value() const noexcept;
+        // Lets a class template over Tracked instantiate an equality member (M5b).
+        bool operator==(const Tracked& other) const noexcept;
 
     private:
         int payload_;

@@ -2400,6 +2400,10 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
                 F.addFnAttr("tune-cpu", tuneCpu_);
     }
 
+    // C++ definitions Clang emitted for imported headers join the module BEFORE verification and
+    // optimization, so they are optimized (and inlined) with the rest of the program.
+    if (!LinkCxxCompanionModules()) return false;
+
     {
         llvm::TimeTraceScope verifyScope("VerifyModule");
         if (verbose) std::cout << "[verbose] verifying module\n";
@@ -2897,6 +2901,8 @@ static const std::vector<std::string>& PosixSystemIncludeDirs()
         {
             std::string inc = sdk + "/usr/include";
             if (std::filesystem::exists(inc, ec)) out.push_back(inc);
+            std::string cxx = sdk + "/usr/include/c++/v1";
+            if (std::filesystem::exists(cxx, ec)) out.push_back(cxx);
         }
 #endif
         for (const char* cand : { "/usr/include", "/usr/local/include",
@@ -4415,6 +4421,16 @@ void LLVMBackend::ResetForReanalysis()
     for (const auto& obj : cObjectFiles_) llvm::sys::fs::remove(obj);
     cObjectFiles_.clear();
     cppInteropUsed_ = false;
+    cxxImportHeaders_.clear();
+    cxxImportDefines_.clear();
+    cxxForeignNamespaces_.clear();
+    cxxForeignTypeSpellings_.clear();
+    cxxCflatToCxxSpelling_.clear();
+    cxxForeignRequests_.clear();
+    // Per-analysis emitted IR: the next analysis re-adopts whatever its own imports produce (from
+    // the extractor or the header cache). No Clang pointer is retained, only bitcode bytes.
+    cxxCompanionBitcode_.clear();
+    cxxCompanionSeen_.clear();
     dependencyFileSet_.clear();
     embeddedAssets_.clear();
     embedFileCache_.clear();
@@ -4524,6 +4540,12 @@ void LLVMBackend::ResetForReanalysis()
     cxxTriviallyCopyableRecords_.clear();
     cxxNontrivialRecords_.clear();
     cxxClasses_.clear();
+    // Per-analysis ABI facts, keyed by class name / linkage name. A later analysis can reuse a
+    // name with a different inheritance layout, so a survivor would shift `this` for a receiver
+    // that no longer needs it, or turn a plain call into a vptr load.
+    cxxThisAdjust_.clear();
+    cxxVirtualSlotByLinkage_.clear();
+    cxxAbiMismatchSink_ = nullptr;
     pendingCxxAbi_ = nullptr;   // an aborted registration must not leak clang's plan forward
     // An aborted declaration could leave a slot armed; the next file's first call of that type
     // would then construct into storage from a discarded module.

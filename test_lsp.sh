@@ -61,7 +61,12 @@ echo "=== LSP fixture tests ==="
 
 echo
 echo "=== LSP bulk source sweep ==="
-"$PY" "$T/lsp_bulk_test.py" "$COMPILER" $POOL_ARG || { echo "FAILED: LSP bulk source sweep"; rc=1; }
+# The sweep demands ZERO error diagnostics from every .cb in the repo, and one of them
+# (Test/test_c_interop.cb, sections M8-M9) calls libc++ members that carry no noexcept
+# specification. The server has no per-file flag channel, so the sweep runs with the same
+# --cpp-assume-noexcept the test itself asks for through its `// cflat-args:` first line.
+"$PY" "$T/lsp_bulk_test.py" "$COMPILER" $POOL_ARG --cpp-assume-noexcept \
+    || { echo "FAILED: LSP bulk source sweep"; rc=1; }
 
 echo
 if [ $rc -eq 0 ]; then

@@ -1,0 +1,14 @@
+// libc++ members carry no noexcept specification, so calling one hits the SAME gate every other
+// potentially-throwing C++ function hits: cflat emits no landing pads. `--cpp-assume-noexcept`
+// downgrades the gate for a whole compilation (Test/test_c_interop.cb opts in through its
+// `// cflat-args:` first line); without the flag the call must be refused here.
+import cpp "vector";
+
+expect_error("may throw - C++ exceptions are not supported yet") {
+    extern int main()
+    {
+        std.vector<int> v = default;
+        v.push_back(1);
+        return (int)v.size();
+    }
+}

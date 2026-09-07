@@ -6,6 +6,7 @@
 #include <llvm/IR/Verifier.h>
 #include <llvm/IR/Dominators.h>
 #include <llvm/Bitcode/BitcodeWriter.h>
+#include <llvm/Support/Base64.h>
 #include <llvm/Bitcode/BitcodeReader.h>
 #include <llvm/Linker/Linker.h>
 #include <llvm/Passes/PassBuilder.h>
@@ -1433,6 +1434,9 @@ void LLVMBackend::SetNoCache(bool v)
 void LLVMBackend::SetCHeaderCacheDeep(bool v)
 { cHeaderCacheDeep_ = v; }
 
+void LLVMBackend::SetCppAssumeNoexcept(bool v)
+{ cppAssumeNoexcept_ = v; }
+
 void LLVMBackend::SetWindowsSubsystem(const std::string& v)
 { windowsSubsystem_ = v; }
 
@@ -1572,7 +1576,7 @@ uint64_t LLVMBackend::CHeaderDiskCacheKey(const std::vector<std::string>& header
                                         const std::vector<std::string>& includeDirs,
                                         const std::vector<std::string>& defines,
                                         const std::vector<std::string>& extraDefines,
-                                        bool cxxMode)
+                                        bool cxxMode, bool cxxDefinitionsEmitted)
 {
         uint64_t h = 14695981039346656037ULL;
         auto fold = [&h](const std::string& s) {
@@ -1584,6 +1588,10 @@ uint64_t LLVMBackend::CHeaderDiskCacheKey(const std::vector<std::string>& header
         for (const auto& def : extraDefines) { fold("|d"); fold(def); }
         // A C++-mode binding of the same header is a different result; keep the keys apart.
         if (cxxMode) fold("|CXX");
+        // A declarations-only C++ bind (LSP: no bodies, empty companion module) is a different
+        // result again, and never a substitute for a compile's. Nothing writes such an entry to
+        // disk today; keying it apart means an older entry can never be mistaken for one either.
+        if (cxxMode) fold(cxxDefinitionsEmitted ? "|EDEF" : "|EDECL");
         return h;
     }
 
@@ -1862,6 +1870,7 @@ nlohmann::json LLVMBackend::CxxMemberToJson(const cflat_cinterop::RawCxxMember& 
         if (m.isDefaulted)          j["df"] = true;
         if (m.isImplicit)           j["im"] = true;
         if (m.needsLocalDefinition) j["nd"] = true;
+        if (!m.bindRefusal.empty()) j["br"] = m.bindRefusal;
         if (m.returnsThis)          j["rth"] = true;
         if (m.isCopyCtor)           j["cc"] = true;
         if (m.isMoveCtor)           j["mc"] = true;
@@ -1899,6 +1908,7 @@ cflat_cinterop::RawCxxMember LLVMBackend::CxxMemberFromJson(const SjVal& j)
         m.isDefaulted          = j.value("df", false);
         m.isImplicit           = j.value("im", false);
         m.needsLocalDefinition = j.value("nd", false);
+        m.bindRefusal = j.value("br", std::string());
         m.returnsThis          = j.value("rth", false);
         m.isCopyCtor           = j.value("cc", false);
         m.isMoveCtor           = j.value("mc", false);
@@ -1968,6 +1978,9 @@ nlohmann::json LLVMBackend::RecordToJson(const CRecordEntry& r)
         if (r.hasVirtualBases)       j["hvb"] = true;
         if (r.isAbstract)            j["abs"] = true;
         if (!r.layoutRefusal.empty()) j["lref"] = r.layoutRefusal;
+        // The canonical C++ spelling: a template argument naming this class needs it, so a warm
+        // cache that dropped it would refuse `cppt.Box<cppi.Tracked>` the second time around.
+        if (!r.canonicalCtype.empty()) j["can"] = r.canonicalCtype;
         if (!r.bases.empty())
         {
             nlohmann::json bs = nlohmann::json::array();
@@ -2022,6 +2035,7 @@ LLVMBackend::CRecordEntry LLVMBackend::RecordFromJson(const SjVal& j)
         r.hasVirtualBases       = j.value("hvb", false);
         r.isAbstract            = j.value("abs", false);
         r.layoutRefusal         = j.value("lref", std::string{});
+        r.canonicalCtype        = j.value("can", std::string{});
         if (j.contains("bs"))
             for (const auto& b : j["bs"])
             {
@@ -2188,7 +2202,10 @@ bool LLVMBackend::TryLoadCHeaderDiskCache(
         // v16 carries the M4 class surface: per-record triviality/polymorphism bits, member
         // access, and the constructor/destructor/method tables with their ABI arrangements. A v15
         // entry has none of it, so a warm cache would leave every imported class methodless.
-        if (version != 17) return false;
+        // v18 carries the M5 companion module: the LLVM bitcode of the C++ definitions Clang
+        // emitted for the group (inline bodies, vtables/RTTI, inline static members). A v17 entry
+        // has none, so a warm cache would bind inline members whose symbols were never emitted.
+        if (version != 18) return false;
 
         // Accept on mtime match (fast) or content hash match (authoritative on mtime drift).
         auto storedMtime = j.value("mtime", int64_t{-1});
@@ -2219,6 +2236,17 @@ bool LLVMBackend::TryLoadCHeaderDiskCache(
             if (j.contains("typeAliases"))
                 for (const auto& a : j["typeAliases"])
                     entry.typeAliases.push_back(TypeAliasFromJson(a));
+            // Companion module bitcode, base64 in the JSON entry so one file stays self-contained.
+            if (j.contains("cxxbc"))
+            {
+                std::vector<char> decoded;
+                if (llvm::Error e = llvm::decodeBase64(j.value("cxxbc", std::string{}), decoded))
+                {
+                    llvm::consumeError(std::move(e));
+                    return false;   // corrupt blob: reparse rather than bind undefined symbols
+                }
+                entry.cxxBitcode.assign(decoded.begin(), decoded.end());
+            }
 
             // A deep (transitive) entry is only fresh if every recorded include is unchanged.
             // Shallow entries (no "deps") skip this and rely on the top-header check above.
@@ -2253,7 +2281,7 @@ void LLVMBackend::WriteCHeaderDiskCache(
         if (ec) return;
 
         nlohmann::json j;
-        j["version"] = 17;
+        j["version"] = 18;
         j["mtime"]   = (int64_t)mtime.time_since_epoch().count();
         j["hash"]    = contentHash;
 
@@ -2283,6 +2311,10 @@ void LLVMBackend::WriteCHeaderDiskCache(
         for (const auto& a : entry.typeAliases)
             typeAliases.push_back(TypeAliasToJson(a));
         j["typeAliases"] = typeAliases;
+
+        if (!entry.cxxBitcode.empty())
+            j["cxxbc"] = llvm::encodeBase64(llvm::ArrayRef<uint8_t>(
+                reinterpret_cast<const uint8_t*>(entry.cxxBitcode.data()), entry.cxxBitcode.size()));
 
         // Deep mode only: the transitive include set for strict (transitive) validation.
         if (!entry.deps.empty())

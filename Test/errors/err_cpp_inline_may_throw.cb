@@ -1,0 +1,11 @@
+// Definition emission (M7) makes an INLINE C++ function callable, but it does not make unwinding
+// safe: cflat still emits no landing pads, so an inline function without a noexcept specification
+// must hit the same gate as one that lives in a separately compiled library.
+import cpp "cpp_interop_inline.h";
+
+expect_error("may throw - C++ exceptions are not supported yet") {
+    extern int main()
+    {
+        return cppinl.may_throw(1);
+    }
+}

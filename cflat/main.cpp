@@ -189,6 +189,7 @@ int main(int argc, char* argv[])
     args.addOption("tune", 0, "Tune scheduling for this CPU without changing the instruction set (name or 'native')", "");
     args.addFlag("no-cache", 0, "Bypass the core bitcode cache and reparse core libraries from source");
     args.addFlag("c-header-cache-deep", 0, "For C headers opted in with the 'cache' import clause, validate every transitively included file (mtime/hash), not just the top header");
+    args.addFlag("cpp-assume-noexcept", 0, "Allow potentially throwing C++ calls; a thrown exception terminates the program");
     args.addMultiOption("symbol", 0, "Look up one or more symbols (IDE-style quick search) and exit. An exact name match prints detailed info (kind, signature, location, members); a miss suggests the closest symbols. Indexes the positional source file if given, otherwise the whole core library");
     args.addMultiOption("symbol-dump", 0, "Dump symbol info for source elements, then exit (repeatable). Selector: line:<n>, line:<a>-<b>, or function:<name>. Requires a positional source file");
     args.addMultiOption("symbol-dump-ir", 0, "Dump unoptimized LLVM IR for a selector, then exit (repeatable). Selector: module, line:<n>, or function:<name>. Requires a positional source file");
@@ -573,6 +574,7 @@ int main(int argc, char* argv[])
         compiler.SetBatchMode(true);
         compiler.SetNoCache(args.hasFlag("no-cache") || isolatedPolicy.has_value());
         compiler.SetCHeaderCacheDeep(args.hasFlag("c-header-cache-deep"));
+        compiler.SetCppAssumeNoexcept(args.hasFlag("cpp-assume-noexcept"));
 
         int failures = 0;
         for (size_t i = 0; i < args.positionalCount(); ++i)
@@ -625,6 +627,7 @@ int main(int argc, char* argv[])
     auto isolatedPolicy = ConfigureIsolatedMode(compiler, args);
     compiler.SetNoCache(args.hasFlag("no-cache") || isolatedPolicy.has_value());
     compiler.SetCHeaderCacheDeep(args.hasFlag("c-header-cache-deep"));
+    compiler.SetCppAssumeNoexcept(args.hasFlag("cpp-assume-noexcept"));
     if (auto sub = args.getOption("subsystem"))
     {
         if (*sub != "console" && *sub != "windows")

@@ -1,0 +1,23 @@
+// A C++ class template can only be instantiated over types that have a C++ spelling. A CFlat
+// library type (here `string`) has none, so the request must be refused by NAME - before any
+// clang session runs - instead of failing later with a clang parse error.
+import cpp "vector";
+
+expect_error("has no C++ spelling, so it cannot be a template argument") {
+    extern int main()
+    {
+        std.vector<string> v = default;
+        return (int)v.size();
+    }
+}
+
+// A dotted name no C++ import contributed a namespace for is NOT speculatively resolved as a C++
+// type: `app` belongs to no imported header, so the normal unknown-type error stands and no libc++
+// parse runs for it.
+expect_error("unknown type 'app.Config'") {
+    extern int unknown_dotted_name()
+    {
+        app.Config c = default;
+        return 0;
+    }
+}

@@ -1280,6 +1280,15 @@ bool LLVMBackend::BuildAbiRecipeFromClangPlan(const std::string& functionName,
         if (!plan.valid || plan.params.size() != params.size()) return false;
 
         auto refuse = [&](const char* what) {
+            // Registering a C++ CLASS binds its whole member surface: an arrangement cflat cannot
+            // express must become a refusal on that one member, not an error on the import.
+            if (cxxAbiMismatchSink_ != nullptr)
+            {
+                *cxxAbiMismatchSink_ = std::format(
+                    "uses a calling convention cflat cannot express yet ({}); wrap it in a "
+                    "function that passes the value by pointer", what);
+                return false;
+            }
             LogError(std::format("C++ function '{}' uses a calling convention cflat cannot express "
                                  "yet ({}); wrap it in a function that passes the value by pointer",
                                  functionName, what));
@@ -1300,6 +1309,10 @@ bool LLVMBackend::BuildAbiRecipeFromClangPlan(const std::string& functionName,
             {
                 if (!ps.paddingType.empty()) return refuse("a padded direct argument");
                 if (ps.directOffset != 0)    return refuse("a direct argument at a non-zero offset");
+                // An `alias T` boundary IS clang's reference: pointer-shaped on both sides, so it
+                // passes Direct even when T is a record. Coercing it as a by-value record would
+                // reload the referenced object into a register and lose the address.
+                if (ParameterIsAliasByPointer(tv)) { slot.kind = AbiSlot::Direct; return true; }
                 if (!IsByValueStructTV(tv))
                 {
                     // Scalar or pointer: the natural CFlat type already IS the ABI type; clang
@@ -1366,6 +1379,12 @@ bool LLVMBackend::BuildAbiRecipeFromClangPlan(const std::string& functionName,
         if (!recipe.hasLowering)
             for (const auto& sl : recipe.paramSlots)
                 if (sl.kind != AbiSlot::Direct || sl.signExt || sl.zeroExt) { recipe.hasLowering = true; break; }
+        // An `alias T` boundary (a C++ reference) is a POINTER in the lowered signature, which the
+        // plain external path does not build. Route the signature through BuildExternFunctionType.
+        if (!recipe.hasLowering && ParameterIsAliasByPointer(retType)) recipe.hasLowering = true;
+        if (!recipe.hasLowering)
+            for (const auto& p : params)
+                if (ParameterIsAliasByPointer(p)) { recipe.hasLowering = true; break; }
         out = std::move(recipe);
         return true;
     }
@@ -1393,6 +1412,8 @@ llvm::FunctionType* LLVMBackend::BuildExternFunctionType(const TypeAndValue& ret
             loweredRet = recipe.retSlot.coerceStructTy;
         else if (recipe.retSlot.kind == AbiSlot::Ignore)
             loweredRet = builder->getVoidTy();
+        else if (ParameterIsAliasByPointer(retType))
+            loweredRet = cflat_llvm::PointerTo(GetType(retType));   // `alias T` result: a reference
         else
             loweredRet = GetCCompatibleType(retType);
 
@@ -1416,6 +1437,8 @@ llvm::FunctionType* LLVMBackend::BuildExternFunctionType(const TypeAndValue& ret
             }
             else if (s.kind == AbiSlot::ByVal)
                 ptypes.push_back(cflat_llvm::PointerTo(s.structTy));
+            else if (ParameterIsAliasByPointer(params[i]))
+                ptypes.push_back(cflat_llvm::PointerTo(GetType(params[i])));
             else
                 ptypes.push_back(GetCCompatibleType(params[i]));
         }
@@ -1619,6 +1642,13 @@ void LLVMBackend::CreateFunctionDeclaration(const std::string& functionName, con
             std::string built = cflat_llvm::StructuralTypeText(functionType);
             if (built != cxxPlan->fnTypeText)
             {
+                if (cxxAbiMismatchSink_ != nullptr)
+                {
+                    *cxxAbiMismatchSink_ = std::format(
+                        "does not lower to clang's calling convention (cflat built '{}', "
+                        "clang expects '{}')", built, cxxPlan->fnTypeText);
+                    return;
+                }
                 LogError(std::format("C++ function '{}' does not lower to clang's calling "
                                      "convention (cflat built '{}', clang expects '{}')",
                                      functionName, built, cxxPlan->fnTypeText));

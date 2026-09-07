@@ -44,8 +44,11 @@
 #include "clang/Lex/PreprocessorOptions.h"
 #include "clang/Lex/Token.h"
 #include "llvm/ADT/IntrusiveRefCntPtr.h"
+#include "llvm/Bitcode/BitcodeWriter.h"
 #include "llvm/IR/DerivedTypes.h"
+#include "llvm/IR/GlobalValue.h"
 #include "llvm/IR/LLVMContext.h"
+#include "llvm/IR/Module.h"
 #include "llvm/IR/Type.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/raw_ostream.h"
@@ -54,6 +57,7 @@
 
 #include "llvm/Support/TimeProfiler.h"
 
+#include <set>
 #include <algorithm>
 #include <unordered_set>
 
@@ -231,6 +235,19 @@ namespace cflat_cinterop
             // cxxMode only: (index into out.records, index into that record's members, decl).
             struct MemberAbiWork { size_t recordIdx; size_t memberIdx; const CXXMethodDecl* md; };
             std::vector<MemberAbiWork> memberAbiWork;
+            /*
+             * Every decl Sema ANNOUNCED to the consumer, in order. This is the set a real compile's
+             * CodeGen sees, and it is strictly larger than the translation unit's own decls():
+             * an implicit function-template instantiation (`std::__to_address<int>`, `std::max<T>`)
+             * is announced when Sema instantiates it but is not a child of its namespace. Without
+             * replaying these, a member body emitted into the companion module calls helpers whose
+             * definitions were never emitted and the link fails on them.
+             */
+            std::vector<Decl*> announcedDecls;
+            // emitDefinitions only: polymorphic classes whose vtable/RTTI Clang must emit, and
+            // inline / constexpr static data members whose storage lives in the companion module.
+            std::vector<const CXXRecordDecl*> vtableWork;
+            std::vector<const VarDecl*> varEmitWork;
             ExtractState(const ExtractRequest& r, ExtractResult& o) : req(r), out(o)
             {
                 for (const auto& d : r.inScopeDirs)
@@ -349,6 +366,24 @@ namespace cflat_cinterop
                 if (!fn.empty()) st.out.includedFiles.push_back(fn.str());
             }
         };
+
+        /*
+         * A by-value class type must be COMPLETE for Clang to arrange it: the target's ABI
+         * classifier reads its record layout. An incomplete one has none, and asking for it is a
+         * null dereference in an assertions-off build. References and pointers are always fine -
+         * they are arranged as pointers. Returns the offending spelling, or empty.
+         */
+        std::string IncompleteByValueRecord(const ASTContext& ctx, QualType qt)
+        {
+            QualType t = qt.getCanonicalType();
+            if (t->isReferenceType() || t->isPointerType() || t->isVoidType()) return {};
+            while (const ConstantArrayType* cat = ctx.getAsConstantArrayType(t))
+                t = cat->getElementType().getCanonicalType();
+            const auto* rt = t->getAs<RecordType>();
+            if (rt == nullptr) return {};
+            if (rt->getDecl()->getDefinition() != nullptr) return {};
+            return t.getAsString(ctx.getPrintingPolicy());
+        }
 
         struct DeclVisitor : public RecursiveASTVisitor<DeclVisitor>
         {
@@ -584,6 +619,11 @@ namespace cflat_cinterop
                                    std::vector<const CXXMethodDecl*>& outDecls)
             {
                 rec.isPolymorphic = cxx->isPolymorphic() || cxx->getNumVBases() > 0;
+                // A polymorphic class needs a vtable. Clang decides whether this translation unit
+                // owns it (all-inline: linkonce_odr here) or whether a key function anchors it in
+                // the bound library (external declaration); asking is always safe.
+                if (st.req.emitDefinitions && cxx->isPolymorphic() && cxx->getNumVBases() == 0)
+                    st.vtableWork.push_back(cxx);
                 rec.hasBases = cxx->getNumBases() > 0 || cxx->getNumVBases() > 0;
                 rec.hasVirtualBases = cxx->getNumVBases() > 0;
                 rec.isAbstract = cxx->isAbstract();
@@ -596,11 +636,67 @@ namespace cflat_cinterop
                                || cxx->hasUserDeclaredCopyConstructor();
                 rec.isAggregate = cxx->isAggregate();
 
-                for (const CXXMethodDecl* md : cxx->methods())
+                /*
+                 * M5b - MEMBER TEMPLATES whose own template parameters are ALL DEFAULTED and whose
+                 * signature does not depend on them. libc++ writes several ordinary-looking members
+                 * that way for SFINAE - `basic_string(const char*)` is
+                 * `template <__enable_if_t<...> = 0> basic_string(const _CharT*)` - so refusing every
+                 * template member would refuse `std.string("hello")` itself. The concrete signature
+                 * is already in the pattern, which is what the type request's stage-1 pass reports so
+                 * its stage-2 stub can ODR-USE it; stage 2 (emitDefinitions) then binds the real
+                 * SPECIALIZATION, the only decl that has a linkage name and a body.
+                 * Nothing here helps a template whose parameters must be DEDUCED from the arguments -
+                 * that is still out of scope.
+                 */
+                std::vector<const CXXMethodDecl*> methodList;
+                std::set<const CXXMethodDecl*> templateExtras;
+                for (const CXXMethodDecl* md : cxx->methods()) methodList.push_back(md);
+                if (!st.req.cxxTypeRequests.empty())
+                    for (const Decl* d : cxx->decls())
+                    {
+                        const auto* ftd = llvm::dyn_cast<FunctionTemplateDecl>(d);
+                        if (ftd == nullptr) continue;
+                        const auto* pattern = llvm::dyn_cast<CXXMethodDecl>(ftd->getTemplatedDecl());
+                        if (pattern == nullptr) continue;
+                        bool allDefaulted = true;
+                        for (const NamedDecl* tp : *ftd->getTemplateParameters())
+                        {
+                            if (const auto* tt = llvm::dyn_cast<TemplateTypeParmDecl>(tp))
+                                allDefaulted = allDefaulted && tt->hasDefaultArgument();
+                            else if (const auto* nt = llvm::dyn_cast<NonTypeTemplateParmDecl>(tp))
+                                allDefaulted = allDefaulted && nt->hasDefaultArgument();
+                            else
+                                allDefaulted = false;
+                        }
+                        if (!allDefaulted) continue;
+                        bool dependent = pattern->getReturnType()->isDependentType();
+                        for (const ParmVarDecl* p : pattern->parameters())
+                            dependent = dependent || p->getType()->isDependentType();
+                        if (dependent) continue;
+                        if (st.req.emitDefinitions)
+                        {
+                            for (const FunctionDecl* spec : ftd->specializations())
+                            {
+                                const auto* smd = llvm::dyn_cast<CXXMethodDecl>(spec);
+                                if (smd == nullptr || !smd->hasBody()) continue;
+                                templateExtras.insert(smd);
+                                methodList.push_back(smd);
+                            }
+                        }
+                        else
+                        {
+                            templateExtras.insert(pattern);
+                            methodList.push_back(pattern);
+                        }
+                    }
+
+                for (const CXXMethodDecl* md : methodList)
                 {
-                    // Templates and their specializations need Sema instantiation (M5).
-                    if (md->getDescribedFunctionTemplate() != nullptr) continue;
-                    if (md->getPrimaryTemplate() != nullptr) continue;
+                    const bool templateExtra = templateExtras.count(md) != 0;
+                    // Templates and their specializations need Sema instantiation (M5), except the
+                    // all-defaulted member templates selected above.
+                    if (md->getDescribedFunctionTemplate() != nullptr && !templateExtra) continue;
+                    if (md->getPrimaryTemplate() != nullptr && !templateExtra) continue;
                     const auto* ctor = llvm::dyn_cast<CXXConstructorDecl>(md);
                     const auto* dtor = llvm::dyn_cast<CXXDestructorDecl>(md);
                     // Operators and conversion functions are M5; they have no plain identifier.
@@ -610,8 +706,25 @@ namespace cflat_cinterop
                     // callable member.
                     const bool isAssignSpecial = md->isCopyAssignmentOperator()
                                               || md->isMoveAssignmentOperator();
+                    /*
+                     * M5b - the operators CFlat has a spelling for are exported under their C++
+                     * source name ("operator[]", "operator==", ...). The subscript path and the
+                     * binary-operator overload table both look a member up by exactly that name,
+                     * so no new registration surface is needed. Anything else without an
+                     * identifier (conversion functions, operator new, ...) stays out.
+                     */
+                    bool isBindableOperator = false;
+                    switch (md->getOverloadedOperator())
+                    {
+                        case OO_Subscript: case OO_EqualEqual: case OO_ExclaimEqual:
+                        case OO_Plus: case OO_Minus: case OO_Star: case OO_Slash:
+                        case OO_PlusEqual: case OO_MinusEqual:
+                        case OO_Less: case OO_Greater:
+                            isBindableOperator = true; break;
+                        default: break;
+                    }
                     if (ctor == nullptr && dtor == nullptr && md->getIdentifier() == nullptr
-                        && !isAssignSpecial)
+                        && !isAssignSpecial && !isBindableOperator)
                         continue;
 
                     RawCxxMember m;
@@ -707,7 +820,43 @@ namespace cflat_cinterop
                         m.paramTypes.push_back(CanonicalSpelling(ctx, p->getType()));
                         m.paramNames.push_back(p->getNameAsString());
                     }
-                    if (!m.isDeleted && !m.needsLocalDefinition)
+                    // Refuse before any arrangement: an incomplete by-value type has no layout.
+                    for (const ParmVarDecl* p : md->parameters())
+                    {
+                        std::string bad = IncompleteByValueRecord(ctx, p->getType());
+                        if (bad.empty()) continue;
+                        m.bindRefusal = "takes '" + bad + "' by value, whose definition this "
+                                        "translation unit does not have (include the header that "
+                                        "defines it alongside this one)";
+                        break;
+                    }
+                    if (m.bindRefusal.empty() && ctor == nullptr && dtor == nullptr)
+                    {
+                        std::string bad = IncompleteByValueRecord(ctx, md->getReturnType());
+                        if (!bad.empty())
+                            m.bindRefusal = "returns '" + bad + "' by value, whose definition this "
+                                            "translation unit does not have (include the header "
+                                            "that defines it alongside this one)";
+                    }
+
+                    // With definition emission on, an inline / defaulted / implicit member is a
+                    // CANDIDATE: the linkage name and the ABI arrangement are produced here, and
+                    // the emission pass clears needsLocalDefinition only for the ones Clang really
+                    // emitted. Without it the member stays declaration-only, as before.
+                    const bool emitCandidate = st.req.emitDefinitions
+                                            || st.req.assumeInlineDefinitions;
+                    // LSP: an inline body is a definition a real compile would emit, so it is not
+                    // a reason to refuse the member. Implicit / defaulted members stay refused -
+                    // only Sema can say whether a body exists for them.
+                    if (st.req.assumeInlineDefinitions && !st.req.emitDefinitions
+                        && md->isInlined() && !md->isImplicit() && !md->isDefaulted())
+                        m.needsLocalDefinition = false;
+                    // A template PATTERN is not a symbol: it exists only so the type request's
+                    // stub can name the signature. Leave it with no linkage name (refused at any
+                    // use site) - stage 2 replaces it with the instantiated specialization.
+                    const bool isPattern = md->getDescribedFunctionTemplate() != nullptr;
+                    if (m.bindRefusal.empty() && !m.isDeleted && !isPattern
+                        && (!m.needsLocalDefinition || emitCandidate))
                         m.linkageName = CxxLinkageName(ctx, MemberGlobalDecl(md));
                     LocOfRaw(md, m.file, m.line, m.col);
 
@@ -717,7 +866,9 @@ namespace cflat_cinterop
 
                     // Only members with a real symbol get an ABI arrangement; the rest are
                     // exported for diagnostics only.
-                    outDecls.push_back((!m.isDeleted && !m.needsLocalDefinition) ? md : nullptr);
+                    outDecls.push_back((m.bindRefusal.empty() && !m.isDeleted && !isPattern
+                                        && (!m.needsLocalDefinition || emitCandidate))
+                                       ? md : nullptr);
                     rec.members.push_back(std::move(m));
                 }
 
@@ -729,8 +880,16 @@ namespace cflat_cinterop
                     // An inline / constexpr static member is emitted per-TU on demand, so the
                     // bound library need not contain it. Only an out-of-line definition is a
                     // symbol CFlat may read.
-                    if (vd->isConstexpr() || vd->isInline()) continue;
-                    if (vd->hasInit()) continue;
+                    // With definition emission on the storage is emitted into the companion module
+                    // (linkonce_odr, so several importers merge), which makes it a real symbol.
+                    const bool emitLocal =
+                        (st.req.emitDefinitions || st.req.assumeInlineDefinitions)
+                        && (vd->isConstexpr() || vd->isInline())
+                        && vd->getDefinition() != nullptr;
+                    if (!emitLocal && (vd->isConstexpr() || vd->isInline())) continue;
+                    if (!emitLocal && vd->hasInit()) continue;
+                    if (emitLocal && st.req.emitDefinitions)
+                        st.varEmitWork.push_back(vd->getDefinition());
                     RawCxxStaticVar sv;
                     sv.name = vd->getNameAsString();
                     sv.ctype = CanonicalSpelling(ctx, vd->getType());
@@ -839,7 +998,6 @@ namespace cflat_cinterop
             bool VisitRecordDecl(RecordDecl* rd)
             {
                 if (!rd->getIdentifier()) return true;
-
                 // Opaque forward-declared handle (e.g. `typedef struct SDL_Window SDL_Window;` with
                 // no body anywhere in this TU). Register it as an empty-field shell so the backend
                 // creates an opaque struct: usable through a pointer (the C handle idiom), while a
@@ -866,30 +1024,62 @@ namespace cflat_cinterop
                     return true;
                 }
 
+                EmitDefinedRecord(rd, std::string());
+                return true;
+            }
+
+            /*
+             * Export ONE defined record. `nameOverride` is non-empty only for an M5b foreign type
+             * request (a class template specialization, or a class named through a typedef): the
+             * record is registered under the CFlat spelling the request carries, the in-scope
+             * filter does not apply to it (it lives in a system header), and its storage is
+             * exported as an opaque BLOB of the right size and alignment instead of a field walk -
+             * a libc++ container's fields are private implementation detail CFlat never names, and
+             * several of them have no CFlat spelling at all.
+             */
+            void EmitDefinedRecord(RecordDecl* rd, const std::string& nameOverride)
+            {
+                // A class-template PATTERN, a partial specialization, or any record nested inside
+                // one is DEPENDENT: it has no record layout, and asking clang for one recurses
+                // until the stack dies in an assertions-off build. Only the complete
+                // specializations a request names (nameOverride) carry a layout.
+                if (const auto* dep = llvm::dyn_cast<CXXRecordDecl>(rd))
+                    if (dep->getDescribedClassTemplate() != nullptr
+                        || llvm::isa<clang::ClassTemplatePartialSpecializationDecl>(dep)
+                        || dep->isDependentContext())
+                        return;
                 std::string file; int line = 1, col = 0;
                 // Collect records regardless of scope (LocOfRaw, not LocOf): an in-scope struct
                 // may reference an out-of-scope struct by value (e.g. MSG.pt is a POINT defined
                 // in the SDK shared/ dir). The backend keeps the transitive closure of in-scope
                 // records and drops the rest, so the dependency is available without registering
                 // every unrelated SDK struct.
-                if (!LocOfRaw(rd, file, line, col)) return true;
+                if (!LocOfRaw(rd, file, line, col)) return;
 
                 RawRecord rec;
                 rec.name = rd->getNameAsString();
                 // An unnamed record keeps an empty name - the caller synthesizes its tag, and a
                 // qualified spelling would hand it the "(unnamed struct at ...)" placeholder.
                 rec.qualifiedName = rec.name;
-                if (st.req.cxxMode && !rec.name.empty())
+                if (!nameOverride.empty())
                 {
-                    if (rd->isInAnonymousNamespace()) return true;
+                    rec.name = nameOverride;
+                    rec.qualifiedName = nameOverride;
+                }
+                else if (st.req.cxxMode && !rec.name.empty())
+                {
+                    if (rd->isInAnonymousNamespace()) return;
                     rec.qualifiedName = CxxQualifiedName(rd);
-                    if (!IsValidDottedName(rec.qualifiedName)) return true;
+                    if (!IsValidDottedName(rec.qualifiedName)) return;
                     rec.name = rec.qualifiedName;
                 }
                 rec.isUnion = rd->isUnion();
                 rec.isCxx = st.req.cxxMode;
                 rec.file = file; rec.line = line; rec.col = col;
-                rec.inScope = !st.req.requireInScope || PathInScope(file, st.normDirs);
+                rec.inScope = !nameOverride.empty() || !st.req.requireInScope
+                           || PathInScope(file, st.normDirs);
+                if (st.req.cxxMode && llvm::isa<CXXRecordDecl>(rd))
+                    rec.canonicalCtype = CanonicalSpelling(ctx, ctx.getCanonicalTagType(rd));
                 const ASTRecordLayout& layout = ctx.getASTRecordLayout(rd);
                 rec.sizeBytes = layout.getSize().getQuantity();
                 rec.alignBytes = layout.getAlignment().getQuantity();
@@ -939,7 +1129,13 @@ namespace cflat_cinterop
                         }
                     }
                 }
-                if (!flattened) CollectFields(rd, rec.name, rec);
+                if (!nameOverride.empty())
+                {
+                    rec.fields.clear();
+                    rec.layoutRefusal.clear();
+                    EmitBlobStorage(rec);
+                }
+                else if (!flattened) CollectFields(rd, rec.name, rec);
                 st.out.records.push_back(std::move(rec));
                 if (!memberDecls.empty())
                 {
@@ -948,7 +1144,57 @@ namespace cflat_cinterop
                         if (memberDecls[i] != nullptr)
                             st.memberAbiWork.push_back({ recIdx, i, memberDecls[i] });
                 }
-                return true;
+            }
+
+            /*
+             * Replace a requested record's field list with storage of the same size and alignment:
+             * one array of the widest integer the alignment allows. CFlat then lays out a struct
+             * that is byte-compatible with the C++ object, which is all a foreign class needs -
+             * construction, destruction and every member call go through Clang's own symbols.
+             */
+            void EmitBlobStorage(RawRecord& rec)
+            {
+                uint64_t align = rec.alignBytes == 0 ? 1 : rec.alignBytes;
+                if (align > 8) align = 8;
+                while (align > 1 && rec.sizeBytes % align != 0) align /= 2;
+                const char* elem = align == 8 ? "unsigned long long"
+                                 : align == 4 ? "unsigned int"
+                                 : align == 2 ? "unsigned short" : "unsigned char";
+                const uint64_t count = align == 0 ? rec.sizeBytes : rec.sizeBytes / align;
+                if (count == 0) return;
+                RawField f;
+                f.name = "__cxx_storage";
+                f.ctype = std::string(elem) + "[" + std::to_string(count) + "]";
+                f.access = AccessPrivate;
+                f.offsetBytes = 0;
+                rec.fields.push_back(std::move(f));
+            }
+
+            /*
+             * Resolve every M5b type request through its marker typedef in the stub and export the
+             * record it names. The general traversal is skipped in request mode, so this is the
+             * only producer of records. A ClassTemplateSpecializationDecl is not a child of its
+             * DeclContext, which is why the typedef (a real top-level decl) is the handle.
+             */
+            void ProcessTypeRequests()
+            {
+                for (size_t i = 0; i < st.req.cxxTypeRequests.size(); ++i)
+                {
+                    const std::string marker = "__cflat_req_" + std::to_string(i);
+                    const TypedefNameDecl* td = nullptr;
+                    for (Decl* d : ctx.getTranslationUnitDecl()->decls())
+                    {
+                        auto* cand = llvm::dyn_cast<TypedefNameDecl>(d);
+                        if (cand != nullptr && cand->getNameAsString() == marker) { td = cand; break; }
+                    }
+                    if (td == nullptr) continue;
+                    QualType canon = td->getUnderlyingType().getCanonicalType();
+                    auto* cxx = canon->getAsCXXRecordDecl();
+                    if (cxx == nullptr) continue;
+                    CXXRecordDecl* def = cxx->getDefinition();
+                    if (def == nullptr) continue;
+                    EmitDefinedRecord(def, st.req.cxxTypeRequests[i].cflatName);
+                }
             }
 
             bool VisitTypedefNameDecl(TypedefNameDecl* td)
@@ -1157,10 +1403,12 @@ namespace cflat_cinterop
          */
         void ComputeCxxMemberAbi(ExtractState& st, ASTContext& ctx,
                                  clang::CodeGen::CodeGenModule& cgm, CodeGenerator& cg);
+        void EmitCxxDefinitions(ExtractState& st, ASTContext& ctx, CodeGenerator& cg);
 
         void ComputeCxxAbi(ExtractState& st, ASTContext& ctx)
         {
-            if (st.abiWork.empty() || st.ci == nullptr) return;
+            if (st.ci == nullptr) return;
+            if (st.abiWork.empty() && st.memberAbiWork.empty() && !st.req.emitDefinitions) return;
             using namespace clang::CodeGen;
 
             llvm::LLVMContext llvmCtx;
@@ -1196,6 +1444,12 @@ namespace cflat_cinterop
             }
 
             ComputeCxxMemberAbi(st, ctx, cgm, *cg);
+
+            if (st.req.emitDefinitions)
+            {
+                llvm::TimeTraceScope emitScope("CxxDefinitionEmit");
+                EmitCxxDefinitions(st, ctx, *cg);
+            }
         }
 
         // Fill in the per-slot arrangement of every exported class member. The slot info comes
@@ -1294,14 +1548,179 @@ namespace cflat_cinterop
             }
         }
 
+        /*
+         * M5 - definition emission. Clang's own CodeGenerator is driven over the parsed header
+         * exactly as it would be over a .cpp that consists of that header, so the companion
+         * module ends up holding whatever a real C++ translation unit would contribute:
+         * linkonce_odr inline bodies, vtables and RTTI with their COMDATs, guard variables for
+         * static locals, inline static data members and their initializers.
+         *
+         * Clang DEFERS an inline definition until something references it, which is the whole
+         * point here - the pass references only what cflat binds (free functions, methods,
+         * structors, inline static members, and the vtable of every polymorphic class), then lets
+         * Release() emit those bodies plus everything they reach transitively. A giant header
+         * therefore costs a parse, not a full translation.
+         *
+         * The referencing loop takes plain GlobalDecls, so a later milestone can add template
+         * specializations to it without changing anything else.
+         */
+        void EmitCxxDefinitions(ExtractState& st, ASTContext& ctx, CodeGenerator& cg)
+        {
+            /*
+             * NOT handled here: an IMPLICIT or DEFAULTED special member with no body. Asking Sema
+             * for one at this point (MarkFunctionReferenced, or DefineImplicitDestructor and
+             * friends) does not produce a body - by the time the consumer runs, end-of-translation
+             * -unit processing is over and Sema declines - so such a member stays refused, exactly
+             * as it was before definition emission existed. Defining them belongs with the
+             * template-instantiation milestone, which needs a live Sema of its own anyway.
+             */
+
+            /*
+             * The macro-probe stubs raise intentional errors (that is how a macro's type is
+             * deduced), and ModuleBuilder throws the module away when the DiagnosticsEngine has
+             * seen any error. Clear the tally - the swallowing consumer already made these
+             * diagnostics non-fatal for extraction - so real CodeGen errors are the only thing
+             * that can still discard the companion module.
+             */
+            st.ci->getDiagnostics().Reset(/*soft*/ true);
+
+            // Phase 1: show Clang the whole translation unit. Inline definitions stay deferred.
+            for (Decl* d : ctx.getTranslationUnitDecl()->decls())
+                cg.HandleTopLevelDecl(DeclGroupRef(d));
+            // Plus everything Sema announced that decls() does not contain (see announcedDecls).
+            for (Decl* d : st.announcedDecls)
+                cg.HandleTopLevelDecl(DeclGroupRef(d));
+            /*
+             * An inline static data member is not a top-level decl, and unlike a member FUNCTION
+             * there is no lexically-in-a-record fallback that finds it later - CodeGen only knows
+             * about a variable it was handed. Hand each one over explicitly so the request below
+             * has a deferred definition to promote instead of just a declaration.
+             */
+            for (const VarDecl* vd : st.varEmitWork)
+                if (vd != nullptr)
+                    cg.HandleTopLevelDecl(DeclGroupRef(const_cast<VarDecl*>(vd)));
+
+            // Phase 2: reference what cflat binds so the deferred bodies become emission work.
+            auto request = [&](GlobalDecl gd) { cg.GetAddrOfGlobal(gd, /*isForDefinition*/ false); };
+            // hasBody(), not getDefinition(): a defaulted or deleted member is already "a
+            // definition" in the AST, and only a real body is something CodeGen can emit.
+            for (const auto& [idx, fd] : st.abiWork)
+                if (fd != nullptr && fd->hasBody()) request(GlobalDecl(fd));
+            for (const auto& w : st.memberAbiWork)
+                if (w.md != nullptr && w.md->hasBody()) request(MemberGlobalDecl(w.md));
+            for (const VarDecl* vd : st.varEmitWork)
+                if (vd != nullptr) request(GlobalDecl(vd));
+            /*
+             * A vtable belongs to exactly ONE translation unit: the Itanium ABI anchors it in the
+             * TU that defines the class's KEY function (the first non-pure, non-inline virtual
+             * member). Emitting it here as well would duplicate the strong symbol the bound
+             * library already exports - which is exactly what a blind HandleVTable does, since
+             * Sema normally applies this rule before ever calling it. So ask Clang for the key
+             * function and emit only when there is none, i.e. the all-inline hierarchy this
+             * milestone is about, where the vtable is linkonce_odr and merges by ODR.
+             */
+            for (const CXXRecordDecl* rd : st.vtableWork)
+            {
+                const CXXRecordDecl* def = rd != nullptr ? rd->getDefinition() : nullptr;
+                if (def == nullptr || !def->isDynamicClass()) continue;
+                if (ctx.getCurrentKeyFunction(def) != nullptr) continue;   // anchored elsewhere
+                cg.HandleVTable(const_cast<CXXRecordDecl*>(def));
+            }
+
+            // Phase 3: flush. This emits the deferred definitions and finalizes the module.
+            cg.HandleTranslationUnit(ctx);
+
+            llvm::Module* mod = cg.GetModule();
+            if (mod == nullptr) return;   // CodeGen error: nothing is bound to a local definition
+
+            unsigned defs = 0;
+            for (const llvm::Function& f : mod->functions())
+                if (!f.isDeclaration()) ++defs;
+            for (const llvm::GlobalVariable& g : mod->globals())
+                if (!g.isDeclaration()) ++defs;
+            if (defs == 0) return;
+
+            /*
+             * A member whose body Clang did not emit must stay refused: prove the symbol is a
+             * DEFINITION in this module rather than trusting the request above. Members that came
+             * with an out-of-line definition in the bound library keep needsLocalDefinition=false,
+             * which is why only the candidates are re-checked here.
+             */
+            for (const auto& w : st.memberAbiWork)
+            {
+                if (w.recordIdx >= st.out.records.size()) continue;
+                RawRecord& rec = st.out.records[w.recordIdx];
+                if (w.memberIdx >= rec.members.size()) continue;
+                RawCxxMember& m = rec.members[w.memberIdx];
+                if (!m.needsLocalDefinition || m.linkageName.empty()) continue;
+                /*
+                 * getNamedValue, not getFunction: on Itanium the COMPLETE-object destructor (D1) of
+                 * a class with no virtual bases is emitted as a GlobalAlias onto the base-object
+                 * destructor (D2), and an alias is not an llvm::Function. The symbol is still a
+                 * definition in this module and a legal call target, so resolve through it.
+                 */
+                const llvm::GlobalValue* gv = mod->getNamedValue(m.linkageName);
+                if (const auto* ga = llvm::dyn_cast_or_null<llvm::GlobalAlias>(gv))
+                    gv = llvm::dyn_cast_or_null<llvm::GlobalValue>(ga->getAliasee());
+                const auto* fn = llvm::dyn_cast_or_null<llvm::Function>(gv);
+                if (fn != nullptr && !fn->isDeclaration())
+                    m.needsLocalDefinition = false;   // the companion module carries the body
+                /*
+                 * An EXPLICIT INSTANTIATION DECLARATION (`extern template class basic_string<char>;`
+                 * in libc++) says the bound library owns this specialization's symbols: Clang
+                 * deliberately emits a reference rather than a body, and a real C++ translation unit
+                 * links against the library's copy. Trust it the same way - but only when the
+                 * library really does export it. isExternallyVisible() is about LINKAGE, so a
+                 * _LIBCPP_HIDE_FROM_ABI member (hidden visibility, excluded from the explicit
+                 * instantiation, deliberately absent from libc++.dylib) satisfies it while having no
+                 * symbol anywhere. Trusting that turns a compile-time refusal into a link-time
+                 * "undefined symbol", so require default visibility and no exclusion attribute.
+                 */
+                else if (w.md->getTemplateSpecializationKind()
+                             == clang::TSK_ExplicitInstantiationDeclaration
+                         && w.md->isExternallyVisible()
+                         && w.md->getVisibility() == clang::DefaultVisibility
+                         && !w.md->hasAttr<clang::ExcludeFromExplicitInstantiationAttr>())
+                    m.needsLocalDefinition = false;
+                else
+                {
+                    m.linkageName.clear();            // no symbol anywhere: refuse at the use site
+                    m.abi = RawAbi{};
+                }
+            }
+            for (RawRecord& rec : st.out.records)
+                for (RawCxxStaticVar& sv : rec.staticVars)
+                {
+                    if (sv.linkageName.empty()) continue;
+                    const llvm::GlobalVariable* gv = mod->getNamedGlobal(sv.linkageName);
+                    if (gv != nullptr && gv->isDeclaration()) sv.linkageName.clear();
+                }
+
+            {
+                llvm::raw_string_ostream os(st.out.bitcode);
+                llvm::WriteBitcodeToFile(*mod, os);
+                os.flush();
+            }
+            st.out.emittedDefinitions = defs;
+        }
+
         struct ExtractConsumer : public ASTConsumer
         {
             ExtractState& st;
             explicit ExtractConsumer(ExtractState& s) : st(s) {}
+            // Record what Sema announces; nothing is emitted here (CodeGen runs later, once, over
+            // the finished AST). Only the definition-emission path replays this list.
+            bool HandleTopLevelDecl(DeclGroupRef dg) override
+            {
+                if (st.req.emitDefinitions)
+                    for (Decl* d : dg) st.announcedDecls.push_back(d);
+                return true;
+            }
             void HandleTranslationUnit(ASTContext& ctx) override
             {
                 DeclVisitor v(ctx, st);
-                v.TraverseDecl(ctx.getTranslationUnitDecl());
+                if (st.req.cxxTypeRequests.empty()) v.TraverseDecl(ctx.getTranslationUnitDecl());
+                else v.ProcessTypeRequests();
                 if (st.req.cxxMode)
                 {
                     llvm::TimeTraceScope abiScope("CxxAbiArrange");

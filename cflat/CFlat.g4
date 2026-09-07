@@ -90,7 +90,7 @@ postfixExpression
     : primaryExpression (
         '[' expression ']'
         | '(' argumentExpressionList ')'
-        | ('.' | '->' | QuestionDot) (Identifier | Move) genericTypeParameters?
+        | ('.' | '->' | QuestionDot) (Identifier | Move | String) genericTypeParameters?
         | '.' Tilde '(' ')'
         | '++'
         | '--'
@@ -891,8 +891,10 @@ genericIdentifier
 // A namespace-qualified type name, optionally generic. Type positions only (never an expression -
 // `a.b` there is member access), which is why this is separate from genericIdentifier. WinMD types
 // are always spelled this way (e.g. Windows.Foundation.Collections.IVector<Microsoft.UI.Xaml.UIElement>).
+// `String` is a trailing component so `std.string` can be named (no CFlat member can be spelled
+// `string` - it is a lexer keyword); at statement scope `a.string b;` reads as a declaration, like `a.b`.
 qualifiedGenericIdentifier
-    : Identifier ('.' Identifier)+ genericTypeParameters?
+    : Identifier ('.' (Identifier | String))+ genericTypeParameters?
     ;
 
 destructorDefinition

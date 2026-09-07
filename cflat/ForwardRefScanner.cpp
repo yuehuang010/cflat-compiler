@@ -251,6 +251,15 @@ LLVMBackend::DeclTypeAndValue ForwardRefScanner::ParseDeclarationSpecifiers(CFla
                         LLVMBackend::TypeAndValue returnType{ .TypeName = mangledName };
                         compiler->CreateFunctionDeclaration(mangledName, returnType, {});
                     }
+                    else
+                    {
+                        // Pre-pass copy: request a foreign C++ specialization so a field or
+                        // parameter of that type has a real layout. A failure is SILENT here - the
+                        // pre-pass has not yet seen every CFlat template, so the second pass is
+                        // the only place that can tell a miss from a not-yet-declared generic.
+                        std::string cxxError;
+                        compiler->TryRequestCxxType(baseName, typeArgs, mangledName, cxxError);
+                    }
                     declType.TypeName = mangledName;
                 }
                 else if (auto* fit = compiler->FindFunctionTypeAlias(typeSpec->getText());
@@ -287,6 +296,10 @@ LLVMBackend::DeclTypeAndValue ForwardRefScanner::ParseDeclarationSpecifiers(CFla
                 {
                     std::string specText = typeSpec->getText();
                     if (specText == "long") specText = LongSpellingTypeName(longSpecCount);
+                    {
+                        std::string cxxError;
+                        compiler->TryRequestCxxType(specText, {}, specText, cxxError);
+                    }
                     declType.TypeName = compiler->ResolveQualifiedName(specText);
                     // Resolve type aliases (e.g. user-defined aliases)
                     declType.TypeName = compiler->ResolveTypeAlias(declType.TypeName);

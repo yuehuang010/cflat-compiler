@@ -118,10 +118,21 @@ namespace cflat_cinterop
         bool isDeleted = false;
         bool isDefaulted = false;
         bool isImplicit = false;
-        // No out-of-line definition exists in the bound library: the member is implicit,
-        // defaulted, or inline, so calling it would need Clang to emit the body (M5).
+        // No CALLABLE definition is available: the member is implicit, defaulted, or inline, and
+        // Clang did not emit a body for it into the companion module. When definition emission
+        // (ExtractRequest::emitDefinitions) does produce the body, this is cleared - the symbol
+        // then exists in the companion bitcode the backend links in.
         bool needsLocalDefinition = false;
         bool returnsThis = false;      // structor ABI hands 'this' back; the result is ignored
+        /*
+         * Non-empty when the member cannot be bound for a reason only the extractor can see, and
+         * the text the use site should report. Today: a by-value parameter or return whose class
+         * type is INCOMPLETE in this translation unit (e.g. a libc++ overload taking
+         * `std::initializer_list<T>` when <initializer_list> was never included). Clang's ABI
+         * classifier reads such a type's layout, so the member must be refused before the
+         * arrangement is even attempted.
+         */
+        std::string bindRefusal;
         // Copy / move constructor and copy / move assignment recognition, so the backend can
         // bind `T y = x;`, `y = x;` and `T y = move x;` without re-deriving it from the params.
         bool isCopyCtor = false;
@@ -208,6 +219,13 @@ namespace cflat_cinterop
         std::vector<RawCxxMember> members;
         std::vector<RawCxxStaticVar> staticVars;
         std::string qualifiedName;
+        /*
+         * cxxMode: Clang's CANONICAL spelling of the record's own type
+         * (e.g. "std::__1::vector<int, std::__1::allocator<int>>"). This is the identity two CFlat
+         * spellings of the same specialization agree on, and it is also how member signatures
+         * spell the type, so the backend keys its foreign-spelling -> CFlat-name table on it.
+         */
+        std::string canonicalCtype;
         // Canonical hyphenated GUID of a header-COM interface's __declspec(uuid)/MIDL_INTERFACE
         // attribute (e.g. "db6f6ddb-ac77-4e88-8253-819df9bbf140"), or empty. Populated only by the
         // C++ uuid-harvest pass (the C parse never sees it - the SDK gates the attr on __cplusplus).
@@ -301,6 +319,36 @@ namespace cflat_cinterop
         bool uuidHarvestCxx = false;
         // Parse the input as C++ and retain C++ qualified names/linkage identity.
         bool cxxMode = false;
+        /*
+         * M5 - run Clang CodeGen over the parsed C++ AST and emit the definitions the bound
+         * surface needs (inline functions, inline methods/structors, vtables + RTTI of
+         * polymorphic classes, inline static data members, plus everything they reference
+         * transitively) into a companion LLVM module, returned as bitcode in
+         * ExtractResult::bitcode. Requires cxxMode and function bodies (so the caller must not
+         * set skipFunctionBodies). Never set in LSP analysis - CodeGen is emit-only work.
+         */
+        bool emitDefinitions = false;
+        /*
+         * Bind inline definitions as callable WITHOUT running CodeGen. Set in LSP analysis, which
+         * emits no IR and links nothing: the surface it reports must match what a real compile
+         * (where emitDefinitions is on) can call, or an inline method would look unknown in the
+         * editor. Never set together with emitDefinitions - then the emitted module decides.
+         */
+        bool assumeInlineDefinitions = false;
+        /*
+         * M5b - concrete foreign type requests. Each entry names a C++ type by spelling
+         * (`std::vector<int>`, `std::string`) and the CFlat identity to register it under. The
+         * caller composes the stub source with one explicit instantiation DEFINITION plus one
+         * marker typedef per request; the extractor resolves the typedef, keeps ONLY those
+         * records, and gives each the requested CFlat spelling. The general declaration walk is
+         * skipped in this mode - a libc++ translation unit is a catalog, not a bound surface.
+         */
+        struct CxxTypeRequest
+        {
+            std::string cxxSpelling;   // C++ source spelling, e.g. "std::vector<int>"
+            std::string cflatName;     // CFlat identity to register, e.g. the mangled generic name
+        };
+        std::vector<CxxTypeRequest> cxxTypeRequests;
     };
 
     struct ExtractResult
@@ -313,6 +361,13 @@ namespace cflat_cinterop
         std::vector<RawMacro> macros;
         std::vector<RawFuncMacro> funcMacros;
         std::vector<std::string> includedFiles;  // populated only when req.wantIncludes
+
+        // Companion module produced when req.emitDefinitions is set: raw LLVM bitcode bytes
+        // holding the C++ definitions Clang emitted for the bound surface (linkonce_odr inline
+        // bodies, vtables/RTTI with their COMDATs, guard variables, static initializers). Empty
+        // when nothing needed emitting. Plain bytes, so it round-trips through the disk cache.
+        std::string bitcode;
+        unsigned emittedDefinitions = 0;   // number of definitions in `bitcode`, for -v
 
         // Count of "unknown type name" errors raised inside an #included header (not the
         // in-memory stub itself). This is the signature of a non-self-contained header that

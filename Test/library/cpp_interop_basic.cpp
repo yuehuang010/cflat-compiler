@@ -125,6 +125,7 @@ namespace cppi
         payload_ = other.payload_; other.payload_ = -1; ++g_move_assign; return *this;
     }
     int Tracked::value() const noexcept { return payload_; }
+    bool Tracked::operator==(const Tracked& other) const noexcept { return payload_ == other.payload_; }
 
     void reset_counts() noexcept
     {

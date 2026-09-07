@@ -2512,7 +2512,11 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     structVar = namedVar;
                                     interfaceVar = {};
                                 }
-                                else if (!namedVar.TypeAndValue.TypeName.empty() && namedVar.TypeAndValue.Pointer
+                                // A pointer-shaped result, OR an `alias T` result the call turned
+                                // into addressable storage (a C++ `T&` from operator[]): either way
+                                // the element is a struct the next member access must see.
+                                else if (!namedVar.TypeAndValue.TypeName.empty()
+                                         && (namedVar.TypeAndValue.Pointer || namedVar.Storage != nullptr)
                                          && Compiler(ctx)->GetDataStructure(namedVar.TypeAndValue.TypeName).StructType != nullptr)
                                 {
                                     structVar = namedVar;

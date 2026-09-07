@@ -254,6 +254,12 @@ target_include_directories(cflat PRIVATE
   ${LLVM_INCLUDE_DIRS})
 
 target_compile_definitions(cflat PRIVATE ${LLVM_DEFINITIONS})
+# The in-process clang frontend (CClangExtract.cpp) derives its resource dir from the RUNNING
+# executable, which is cflat - so it finds no compiler-provided headers (stdarg.h, stddef.h, ...)
+# and any bound header that reaches one fails to parse. Bake in the resource dir of the LLVM
+# install cflat was built against; BuildClangDriverArgs passes it as -resource-dir when it exists.
+target_compile_definitions(cflat PRIVATE
+  CFLAT_CLANG_RESOURCE_DIR="${LLVM_LIBRARY_DIR}/clang/${LLVM_VERSION_MAJOR}")
 if(ANTLR4_IS_STATIC)
   target_compile_definitions(cflat PRIVATE ANTLR4CPP_STATIC)
 endif()

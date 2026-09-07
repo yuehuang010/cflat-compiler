@@ -292,6 +292,7 @@ AppKit / Foundation / CoreFoundation / `libobjc` tbd stubs under `~/.cflat/macsd
 | `--init-clear-local` | Recursively delete only the local cache directory (`<exe dir>/.cflat`), then exit; leaves the per-user cache untouched. A missing local cache is reported ("no local cache at \<path\>") and exits 0 - it never falls back to clearing the per-user cache. Cannot be combined with `--init`, `--init-local`, or `--init-clear`. |
 | `--no-cache` | Bypass the core bitcode cache and reparse the core libraries from source. |
 | `--c-header-cache-deep` | For C headers opted in with the `cache` import clause, validate every transitively included file (mtime/hash), not just the top header. |
+| `--cpp-assume-noexcept` | Allow potentially throwing C++ calls; a thrown exception terminates the program. |
 
 Cache design and troubleshooting: [`doc/CACHING.md`](CACHING.md).
 

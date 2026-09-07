@@ -21,6 +21,9 @@
 # instead of only on Windows. See
 # internal/issue/init-cache-state-drop-invisible-on-posix.md.
 #
+# Per-test compiler flags: a first line `// cflat-args: <flags>` in a Test/*.cb is read by
+# cb_extra_args() below and appended to that test's compile command. See test_c_interop.cb.
+#
 # SKIP list: tests that cannot pass on Linux because they exercise Windows-only
 # functionality. These are TEST-CONTENT or unrelated-subsystem limitations, not
 # core-library gaps (every portable core library compiles + runs on Linux).
@@ -140,17 +143,32 @@ write_result() {
   echo "$ms" >"$RES/$1.time"
 }
 
+# Per-test compiler flags: a Test/*.cb whose FIRST line is `// cflat-args: <flags>` is compiled
+# with those extra flags appended. One line in the test itself, so the flag travels with the test
+# instead of becoming a name-matched special case in this script. Used by test_c_interop.cb for
+# --cpp-assume-noexcept (libc++ members carry no noexcept specification).
+cb_extra_args() {
+  local first; first="$(head -n 1 "$1" 2>/dev/null)"
+  case "$first" in
+    '// cflat-args:'*) printf '%s' "${first#'// cflat-args:'}" ;;
+  esac
+}
+
 # Worker: compile (and for .cb run) one test, writing a one-line .result file.
 run_cb() {
   local f="$1" n; n="$(basename "$f" .cb)"
   local log="$RES/$n.log" status t0; t0=$(now_ms)
+  local -a xargs_cb=()
+  read -r -a xargs_cb <<< "$(cb_extra_args "$f")"
   if [ "$RUN_MODE" -eq 1 ]; then
-    if $TIMEOUT "$CFLAT" "$f" -i "$LIB" --locale-dir "$LOCALE_DIR" --run --nologo >"$log" 2>&1; then
+    if $TIMEOUT "$CFLAT" "$f" -i "$LIB" --locale-dir "$LOCALE_DIR" \
+        ${xargs_cb[@]+"${xargs_cb[@]}"} --run --nologo >"$log" 2>&1; then
       status="PASS"
     else
       status="FAIL run"
     fi
-  elif ! $TIMEOUT "$CFLAT" "$f" -i "$LIB" --locale-dir "$LOCALE_DIR" -o "$RES/$n.bin" >"$log" 2>&1; then
+  elif ! $TIMEOUT "$CFLAT" "$f" -i "$LIB" --locale-dir "$LOCALE_DIR" \
+        ${xargs_cb[@]+"${xargs_cb[@]}"} -o "$RES/$n.bin" >"$log" 2>&1; then
     status="FAIL compile"
   elif $TIMEOUT "$RES/$n.bin" </dev/null >>"$log" 2>&1; then
     status="PASS"
@@ -222,7 +240,7 @@ run_err_warm() {
   fi
 }
 
-export -f run_cb load_err_flags check_err_result run_err run_err_warm is_skipped \
+export -f run_cb cb_extra_args load_err_flags check_err_result run_err run_err_warm is_skipped \
   now_ms write_result
 export CFLAT LIB LOCALE_DIR RES TIMEOUT RUN_MODE
 

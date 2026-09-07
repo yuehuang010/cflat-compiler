@@ -8,6 +8,7 @@
 #include <llvm/Bitcode/BitcodeWriter.h>
 #include <llvm/Bitcode/BitcodeReader.h>
 #include <llvm/Linker/Linker.h>
+#include <llvm/Demangle/Demangle.h>
 #include <llvm/Passes/PassBuilder.h>
 #include <llvm/Analysis/TargetLibraryInfo.h>
 #include <llvm/Transforms/Utils/Mem2Reg.h>
@@ -34,6 +35,7 @@
 #include "MainListener.h"
 #include "GrammarTreeListener.h"
 #include <filesystem>
+#include <fstream>
 #include <optional>
 #include <algorithm>
 #include <cctype>
@@ -52,9 +54,66 @@
 
 // ---- Definitions moved out of LLVMBackend.h (CInterop) ----
 
+// Whitespace-insensitive key for a C++ type spelling: Clang and the C type mapper disagree only
+// about spaces inside a template argument list.
+// A libc++ / SDK C++ header is included by NAME (`#include <vector>`), so its own internal
+// includes resolve through the driver's C++ search path; anything else by absolute path.
+static bool IsSystemCxxHeaderPath(const std::string& path)
+{
+        std::string p = path;
+        std::replace(p.begin(), p.end(), '\\', '/');
+        if (p.find("/c++/v1/") != std::string::npos) return true;   // libc++
+        // MSVC STL: <VS>/VC/Tools/MSVC/<version>/include/<header>.
+        if (p.find("/VC/Tools/MSVC/") != std::string::npos) return true;
+        // libstdc++: /usr/include/c++/14/, /usr/include/<triple>/c++/14/. The component after
+        // "/c++/" is the release, so require it to start with a digit - that is what separates a
+        // standard-library header from a user directory that happens to be named "c++".
+        for (size_t pos = 0; (pos = p.find("/c++/", pos)) != std::string::npos; pos += 5)
+        {
+            const size_t comp = pos + 5;
+            if (comp < p.size() && std::isdigit((unsigned char)p[comp])) return true;
+        }
+        return false;
+}
+
+/*
+ * Namespace names a C++ header spells out, collected by a token scan. Over-approximates on purpose
+ * (a name inside a comment or a string counts): the set only ever admits a type REQUEST attempt, and
+ * a namespace that contains nothing but class templates registers no decl the walk could seed it
+ * from. A namespace opened by a macro (libc++'s _LIBCPP_BEGIN_NAMESPACE_STD) is not found here -
+ * "std" is seeded from the system-header spelling instead.
+ */
+static void CollectHeaderNamespaceNames(const std::string& path,
+                                        std::unordered_set<std::string>& out)
+{
+        std::ifstream in(path, std::ios::binary);
+        if (!in) return;
+        std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        auto identChar = [](char c) { return std::isalnum((unsigned char)c) != 0 || c == '_'; };
+        static const std::string kw = "namespace";
+        for (size_t pos = 0; (pos = text.find(kw, pos)) != std::string::npos; pos += kw.size())
+        {
+            if (pos > 0 && identChar(text[pos - 1])) continue;
+            size_t i = pos + kw.size();
+            if (i < text.size() && identChar(text[i])) continue;
+            while (i < text.size() && (text[i] == ' ' || text[i] == '\t')) ++i;
+            const size_t start = i;
+            while (i < text.size() && identChar(text[i])) ++i;
+            if (i > start) out.insert(text.substr(start, i - start));
+        }
+}
+
+std::string LLVMBackend::SqueezeCxxSpelling(const std::string& spelling)
+{
+        std::string out;
+        out.reserve(spelling.size());
+        for (char c : spelling) if (c != ' ' && c != '\t') out += c;
+        return out;
+    }
+
 void LLVMBackend::RejectThrowingCxxFunction(const FunctionSymbol& symbol, const std::string& displayName) const
 {
-        if (!symbol.IsCxx || symbol.IsNoexcept) return;
+        if (!symbol.IsCxx || symbol.IsNoexcept || cppAssumeNoexcept_) return;
         LogError(std::format("call to '{}' may throw - C++ exceptions are not supported yet; "
                              "declare it noexcept or wrap it in an extern \"C\" noexcept function",
                              displayName));
@@ -716,6 +775,29 @@ std::string LLVMBackend::StripFixedArrayDims(const std::string& ctype, std::vect
     }
 
 /*
+ * Erase every occurrence of a declarator keyword, matched as a WHOLE TOKEN. A plain find/erase
+ * loop also eats the keyword out of an identifier - "constant" becomes "ant", "classBase"
+ * becomes "Base" - which loses the type's identity and silently decays the parameter to void*.
+ * A word that does not start/end with an identifier character (e.g. "&") has no boundary to
+ * check on that side, so it is erased wherever it appears.
+ */
+static void EraseDeclaratorToken(std::string& s, const char* word)
+{
+        const size_t n = std::strlen(word);
+        if (n == 0) return;
+        auto ident = [](char c) { return std::isalnum((unsigned char)c) != 0 || c == '_'; };
+        const bool headIdent = ident(word[0]);
+        const bool tailIdent = ident(word[n - 1]);
+        for (size_t pos = 0; (pos = s.find(word, pos)) != std::string::npos; )
+        {
+            const bool okBefore = !headIdent || pos == 0 || !ident(s[pos - 1]);
+            const bool okAfter  = !tailIdent || pos + n >= s.size() || !ident(s[pos + n]);
+            if (okBefore && okAfter) s.erase(pos, n);
+            else                     pos += n;
+        }
+    }
+
+/*
  * The CFlat dotted name of the class a C++ pointer spelling points at, or "" when the spelling is
  * not a pointer to a class. Clang spells a C++ class type as a bare qualified name
  * ("const cpppoly::Right *"), with no "struct"/"union" keyword, so AggregatePointeeTag - which
@@ -729,7 +811,7 @@ std::string LLVMBackend::CxxRecordPointeeTag(const std::string& spelling, int& o
             return std::string();   // function pointer / array: not a plain record pointer
         for (const char* w : { "const", "volatile", "restrict", "__restrict", "__restrict__",
                                "struct", "class", "union", "&" })
-            for (size_t pos; (pos = s.find(w)) != std::string::npos; ) s.erase(pos, std::strlen(w));
+            EraseDeclaratorToken(s, w);
         outPtr = (int)std::count(s.begin(), s.end(), '*');
         if (outPtr == 0) return std::string();
         s.erase(std::remove(s.begin(), s.end(), '*'), s.end());
@@ -749,7 +831,7 @@ std::string LLVMBackend::AggregatePointeeTag(const std::string& spelling, int& o
         std::string s = spelling;
         for (const char* w : { "const", "volatile", "restrict", "__restrict", "__restrict__",
                                "_Nonnull", "_Nullable", "_Null_unspecified" })
-            for (size_t pos; (pos = s.find(w)) != std::string::npos; ) s.erase(pos, std::strlen(w));
+            EraseDeclaratorToken(s, w);
         outPtr = (int)std::count(s.begin(), s.end(), '*');
         if (outPtr == 0) return std::string();
         s.erase(std::remove(s.begin(), s.end(), '*'), s.end());
@@ -762,6 +844,75 @@ std::string LLVMBackend::AggregatePointeeTag(const std::string& spelling, int& o
         return std::string();
     }
 
+/*
+ * A requested foreign C++ type (M5b), looked up on the INTACT spelling. The keys are Clang's
+ * canonical spelling squeezed but otherwise verbatim, so an inner pointer or an inner "const" is
+ * part of the key: only the OUTERMOST declarator may be peeled here. Counting and deleting every
+ * '*' in the whole spelling first - as the general C mapper does - turns
+ * "vector<char *, allocator<char *>>" into "vector<char, allocator<char>>", which matches nothing
+ * and silently decays the parameter to void**.
+ * Returns true when the spelling names a registered foreign type; `mapped` then says whether the
+ * pointer depth is representable.
+ */
+bool LLVMBackend::TryMapCxxForeignSpelling(const std::string& ctype, TypeAndValue& out,
+                                           bool& mapped) const
+{
+        mapped = false;
+        if (cxxForeignTypeSpellings_.empty()) return false;
+        if (ctype.find('(') != std::string::npos) return false;   // function pointer / function type
+        std::string s = ctype;
+        int ptr = 0;
+        // A fixed array decays to a pointer to its element, exactly as the general mapper does.
+        if (auto br = s.find('['); br != std::string::npos) { s.erase(br); ++ptr; }
+
+        auto identChar = [](char c) { return std::isalnum((unsigned char)c) != 0 || c == '_'; };
+        static const char* const cvWords[] = { "const", "volatile", "restrict", "__restrict",
+                                               "__restrict__", "_Nonnull", "_Nullable",
+                                               "_Null_unspecified" };
+        // Peel the outer declarator right to left: '*', '&'/'&&' and trailing cv words only.
+        for (bool peeled = true; peeled; )
+        {
+            peeled = false;
+            while (!s.empty() && (s.back() == ' ' || s.back() == '\t')) s.pop_back();
+            if (s.empty()) return false;
+            if (s.back() == '*') { s.pop_back(); ++ptr; peeled = true; continue; }
+            if (s.back() == '&')
+            {
+                s.pop_back();
+                if (!s.empty() && s.back() == '&') s.pop_back();
+                ++ptr; peeled = true; continue;
+            }
+            for (const char* w : cvWords)
+            {
+                const size_t n = std::strlen(w);
+                if (s.size() < n || s.compare(s.size() - n, n, w) != 0) continue;
+                if (s.size() > n && identChar(s[s.size() - n - 1])) continue;
+                s.erase(s.size() - n);
+                peeled = true;
+                break;
+            }
+        }
+        // Leading whitespace, cv and elaborated-type keywords, outer level only.
+        for (bool peeled = true; peeled; )
+        {
+            peeled = false;
+            size_t a = s.find_first_not_of(" \t");
+            if (a == std::string::npos) return false;
+            if (a > 0) { s.erase(0, a); peeled = true; }
+            for (const char* w : { "const ", "volatile ", "class ", "struct ", "union ", "enum " })
+                if (s.rfind(w, 0) == 0) { s.erase(0, std::strlen(w)); peeled = true; break; }
+        }
+
+        auto it = cxxForeignTypeSpellings_.find(SqueezeCxxSpelling(s));
+        if (it == cxxForeignTypeSpellings_.end()) return false;
+        out = TypeAndValue{};
+        out.TypeName = it->second;
+        if (ptr > 0) out.Pointer = true;
+        if (ptr > 1) out.ElemPointer = true;
+        mapped = ptr <= 2;
+        return true;
+    }
+
 bool LLVMBackend::MapCTypeToTypeAndValueImpl(std::string ctype, TypeAndValue& out,
                                     std::unordered_set<std::string>& visited)
 {
@@ -770,6 +921,13 @@ bool LLVMBackend::MapCTypeToTypeAndValueImpl(std::string ctype, TypeAndValue& ou
         // "(*)" substring as a precondition for the parser.
         if (ParseCFunctionPointerSpelling(ctype, out, visited))
             return true;
+
+        // Before any '*' or qualifier is removed: a requested C++ specialization is keyed on
+        // Clang's canonical spelling, inner pointers and inner const included.
+        {
+            bool mapped = false;
+            if (TryMapCxxForeignSpelling(ctype, out, mapped)) return mapped;
+        }
 
         // Arrays decay to a pointer; drop the '[...]' and bump the pointer level.
         int ptr = 0;
@@ -782,12 +940,7 @@ bool LLVMBackend::MapCTypeToTypeAndValueImpl(std::string ctype, TypeAndValue& ou
         ctype.erase(std::remove(ctype.begin(), ctype.end(), '*'), ctype.end());
 
         // Strip cv / nullability qualifiers - they do not affect the ABI here.
-        auto stripWord = [&](const char* w)
-        {
-            std::string word = w;
-            for (size_t pos; (pos = ctype.find(word)) != std::string::npos; )
-                ctype.erase(pos, word.size());
-        };
+        auto stripWord = [&](const char* w) { EraseDeclaratorToken(ctype, w); };
         for (const char* q : { "const", "volatile", "restrict", "__restrict", "__restrict__",
                                "_Nonnull", "_Nullable", "_Null_unspecified" })
             stripWord(q);
@@ -817,6 +970,8 @@ bool LLVMBackend::MapCTypeToTypeAndValueImpl(std::string ctype, TypeAndValue& ou
             else { base += c; prevSpace = false; }
         }
         while (!base.empty() && base.back() == ' ') base.pop_back();
+        // The foreign-type lookup ran at entry, on the intact spelling (TryMapCxxForeignSpelling).
+        // Repeating it here would search for a spelling whose inner '*' and cv words are gone.
         bool enumTag = false;
         bool structTag = false;
         bool unionTag = false;
@@ -986,6 +1141,7 @@ void LLVMBackend::RegisterCSignatures(const std::vector<CSigEntry>& sigs, const 
                 // A record by value needs the aggregate ABI arrangement, which is not part of
                 // this prototype - refuse at registration so the LSP sees the same answer.
                 if (RejectCxxRecordByValue(e)) continue;
+                NoteCxxForeignNamespace(regName);
                 for (size_t pos = 0; (pos = regName.find('.', pos)) != std::string::npos; ++pos)
                     RegisterNamespace(regName.substr(0, pos));
             }
@@ -1002,11 +1158,11 @@ void LLVMBackend::RegisterCSignatures(const std::vector<CSigEntry>& sigs, const 
                 CInteropDeclarationScope declaringFile(*this, e.file.empty() ? fileForLsp : e.file);
                 // Hand clang's arrangement to the declaration; C leaves it null and keeps the
                 // existing size heuristic. Cleared by CreateFunctionDeclaration on entry.
-                pendingCxxAbi_ = (e.isCxx && e.abi.valid) ? &e.abi : nullptr;
+                CxxAbiPlanScope abiPlan(*this, (e.isCxx && e.abi.valid) ? &e.abi : nullptr,
+                                        /*sink*/ nullptr);
                 CreateFunctionDeclaration(regName, sig.ret, sig.params, /*external=*/true, e.variadic,
                                           /*returnsOwned=*/false, /*isMethod=*/false,
                                           CallingConv::Cdecl, linkageName, e.isCxx, e.isNoexcept);
-                pendingCxxAbi_ = nullptr;
             }
             if (auto fit = functionTable.find(regName); fit != functionTable.end())
                 for (FunctionSymbol& sym : fit->second)
@@ -1047,6 +1203,21 @@ void LLVMBackend::RegisterCSignatures(const std::vector<CSigEntry>& sigs, const 
             std::cout << std::format("[verbose]   registered {} C function(s) from {}\n", sigs.size(), fileForLsp);
     }
 
+/*
+ * The triple every C/C++ extraction parse uses. It is derived from the target this compile has
+ * already CHOSEN, which is also the triple the companion module must agree with - the main
+ * llvm::Module carries no triple until native emission, far after the companion is linked.
+ */
+std::string LLVMBackend::CInteropTargetTriple() const
+{
+        if (targetWindows_)
+            return platformValue == 32 ? "i686-pc-windows-msvc" : "x86_64-pc-windows-msvc";
+        // Matches the codegen triple EmitExecutableMachO sets, so __APPLE__ and the Apple
+        // system-header search are active during extraction.
+        if (targetMacOS_) return "arm64-apple-macosx11.0.0";
+        return platformValue == 32 ? "i686-pc-linux-gnu" : "x86_64-pc-linux-gnu";
+    }
+
 std::vector<std::string> LLVMBackend::BuildClangDriverArgs(const std::string& headerDir,
                                                const std::vector<std::string>& extraDefines,
                                                bool errorRecovery, bool asCxx) const
@@ -1055,15 +1226,11 @@ std::vector<std::string> LLVMBackend::BuildClangDriverArgs(const std::string& he
         // Parse the C against the target OS so predefined macros (_WIN32 vs __linux__)
         // and the system header search behave like the real compile would. On non-Windows
         // the MSVC triple would pull in MSVC predefines and break libc header resolution.
-        if (targetWindows_)
-            args.push_back(platformValue == 32 ? "--target=i686-pc-windows-msvc"
-                                               : "--target=x86_64-pc-windows-msvc");
-        else if (targetMacOS_)
+        args.push_back("--target=" + CInteropTargetTriple());
+        if (targetMacOS_ && !targetWindows_)
         {
-            // Match the codegen triple from EmitExecutableMachO so __APPLE__ and the Apple
-            // system-header search are active. Headers need a REAL SDK (the harvested
-            // ~/.cflat/macsdk carries link stubs only), so isysroot points at $SDKROOT/xcrun.
-            args.push_back("--target=arm64-apple-macosx11.0.0");
+            // Headers need a REAL SDK (the harvested ~/.cflat/macsdk carries link stubs only),
+            // so isysroot points at $SDKROOT/xcrun.
             std::string sdk;
 #if defined(__APPLE__)
             sdk = MacSdkPathCached();
@@ -1083,9 +1250,23 @@ std::vector<std::string> LLVMBackend::BuildClangDriverArgs(const std::string& he
                          "Xcode / Command Line Tools so 'xcrun --show-sdk-path' resolves");
             }
         }
-        else
-            args.push_back(platformValue == 32 ? "--target=i686-pc-linux-gnu"
-                                               : "--target=x86_64-pc-linux-gnu");
+#ifdef CFLAT_CLANG_RESOURCE_DIR
+        // Compiler-provided headers (stdarg.h, stddef.h, immintrin.h, ...). Without this the
+        // in-process frontend looks for them next to the cflat executable and finds nothing, which
+        // breaks any header that includes one - every libc++ header does, through <wchar.h>.
+        {
+            static const std::string resourceDir = [] {
+                std::error_code ec;
+                std::string d = CFLAT_CLANG_RESOURCE_DIR;
+                return std::filesystem::exists(d + "/include", ec) ? d : std::string();
+            }();
+            if (!resourceDir.empty())
+            {
+                args.push_back("-resource-dir");
+                args.push_back(resourceDir);
+            }
+        }
+#endif
         args.push_back("-fsyntax-only");
         args.push_back("-x");
         // C++ is used only by the focused uuid-harvest pass, so the SDK's MIDL_INTERFACE form
@@ -1423,6 +1604,7 @@ void LLVMBackend::MapRawRecords(const cflat_cinterop::ExtractResult& raw, std::v
             rec.isPolymorphic = r.isPolymorphic; rec.hasBases = r.hasBases;
             rec.hasVirtualBases = r.hasVirtualBases; rec.isAbstract = r.isAbstract;
             rec.bases = r.bases; rec.layoutRefusal = r.layoutRefusal;
+            rec.canonicalCtype = r.canonicalCtype;
             rec.hasTrivialDefaultCtor = r.hasTrivialDefaultCtor;
             rec.hasTrivialCopyCtor = r.hasTrivialCopyCtor;
             rec.hasTrivialDtor = r.hasTrivialDtor;
@@ -1506,7 +1688,8 @@ bool LLVMBackend::ExtractCHeaderClang(const std::vector<std::string>& headerPath
                              std::vector<std::string>* outIncludes,
                              bool* outPrereqFailure,
                              std::string* outPrereqMsg,
-                             bool cxxMode)
+                             bool cxxMode,
+                             std::string* outCxxBitcode)
 {
         if (headerPaths.empty()) return false;
 
@@ -1514,6 +1697,17 @@ bool LLVMBackend::ExtractCHeaderClang(const std::vector<std::string>& headerPath
         // and attributes registered decls for LSP go-to-def.
         const std::string& headerPath = headerPaths.front();
         const std::string primaryDir = std::filesystem::path(headerPath).parent_path().string();
+        /*
+         * A system C++ header (libc++) is a TEMPLATE CATALOG, not a bound surface: walking it would
+         * register thousands of implementation details and emit a whole standard library's inline
+         * bodies. Nothing is bound at import time; the concrete types the program names are
+         * requested one at a time (RequestCxxForeignType), which re-parses this same header set.
+         */
+        if (cxxMode && IsSystemCxxHeaderPath(headerPath))
+        {
+            cppInteropUsed_ = true;
+            return true;
+        }
 
         std::string source;
         for (const auto& h : headerPaths)
@@ -1531,7 +1725,16 @@ bool LLVMBackend::ExtractCHeaderClang(const std::vector<std::string>& headerPath
         req.cxxMode        = cxxMode;
         req.wantMacros     = true;
         req.requireInScope = true;
-        req.skipFunctionBodies = true;   // headers: declarations only - skip inline bodies
+        /*
+         * M5 - a C++ header bind needs the inline BODIES: they are the only definition of an
+         * inline function, an all-inline method or the key function of a vtable, and Clang emits
+         * them into the companion module the backend links in. A C header still binds
+         * declarations only (faster, and it avoids parsing system-header inline bodies).
+         * LSP analysis never runs CodeGen: the symbol index wants declarations, not IR.
+         */
+        req.emitDefinitions    = cxxMode && symbolSink_ == nullptr;
+        req.assumeInlineDefinitions = cxxMode && !req.emitDefinitions;
+        req.skipFunctionBodies = !req.emitDefinitions;
         req.wantIncludes   = (outIncludes != nullptr);
 
         // Expand um/<->shared/ siblings: the Windows SDK splits its surface across both and
@@ -1589,6 +1792,17 @@ bool LLVMBackend::ExtractCHeaderClang(const std::vector<std::string>& headerPath
         }
 
         if (outIncludes) *outIncludes = std::move(raw.includedFiles);
+
+        // Companion module: adopt it for this compile and hand it back so the header cache can
+        // replay the identical bitcode on a warm run.
+        if (!raw.bitcode.empty())
+        {
+            if (verbose)
+                std::cout << std::format("[verbose]   C++ companion module: {} definition(s), {} bytes\n",
+                                         raw.emittedDefinitions, raw.bitcode.size());
+            AdoptCxxCompanionBitcode(raw.bitcode);
+            if (outCxxBitcode != nullptr) *outCxxBitcode = std::move(raw.bitcode);
+        }
 
         // Header-COM interfaces (a record carrying an `lpVtbl` field) hide their IID in the C++
         // MIDL_INTERFACE form the C parse above cannot see. When any are present, harvest the GUIDs
@@ -1664,6 +1878,385 @@ bool LLVMBackend::ExtractCHeaderClang(const std::vector<std::string>& headerPath
             std::cout << std::format("[verbose]   header bind: {} sig(s), {} enum(s), {} record(s), {} macro(s), {} func-macro(s), {} global(s)\n",
                 outSigs.size(), outEnums.size(), outRecords.size(), outMacros.size(), outFuncMacros.size(), outGlobals.size());
         return true;
+    }
+
+/*
+ * M5b - concrete C++ TYPE REQUESTS (class template specializations, and classes named through a
+ * typedef such as `std::string`).
+ *
+ * Route: one synthetic "explicit instantiation" translation unit per requested type, made of the
+ * import group's headers plus `template class std::vector<int>;` and a marker typedef. That needs
+ * no long-lived Sema, keeps Clang confined to CClangExtract.cpp, and reuses the whole one-shot
+ * extraction path (RawRecord / RawCxxMember / RawAbi, CodeGen into a companion module).
+ *
+ * The plan's design (internal/plan/cpp-direct-abi-interop.md M5) is a LIVE Sema session per import
+ * group that instantiates through Sema::RequireCompleteType; that remains the eventual home. What
+ * this route does NOT cover: function templates deduced at a call site (there is no type to name),
+ * and a specialization requested from LSP analysis, which never runs CodeGen and therefore only
+ * binds what an inline definition can supply.
+ *
+ * Two stages are needed because libc++ marks nearly every member
+ * `__attribute__((exclude_from_explicit_instantiation))`: the explicit instantiation alone
+ * instantiates the CLASS but no member BODY, and by the time our consumer runs Sema is past
+ * end-of-TU, so nothing can be instantiated on demand. Stage 1 extracts the member list and their
+ * canonical signatures; stage 2 re-parses the same TU with one ODR-USE per member appended (a
+ * pointer-to-member cast for a method, a placement-new wrapper for a constructor, a
+ * pseudo-destructor call for the destructor), which is what makes Sema instantiate the bodies that
+ * CodeGen then emits into the companion module.
+ */
+
+bool LLVMBackend::IsCxxForeignTypeRegistered(const std::string& cflatName) const
+{
+        return cxxCflatToCxxSpelling_.find(cflatName) != cxxCflatToCxxSpelling_.end();
+}
+
+// CFlat type argument -> C++ spelling. Primitives by width, a previously requested foreign type by
+// its own spelling, one trailing pointer level as a pointer. Anything else (a CFlat struct, a CFlat
+// generic instantiation) has no C++ identity and is refused by the caller.
+bool LLVMBackend::CxxSpellingForCflatType(const std::string& cflatType, std::string& out) const
+{
+        std::string base = cflatType;
+        int ptr = 0;
+        while (!base.empty() && base.back() == '*') { base.pop_back(); ++ptr; }
+        static const std::unordered_map<std::string, std::string> prims = {
+            { "bool", "bool" }, { "char", "char" },
+            { "i8", "signed char" }, { "u8", "unsigned char" },
+            { "short", "short" }, { "i16", "short" }, { "u16", "unsigned short" },
+            { "int", "int" }, { "i32", "int" }, { "uint", "unsigned int" }, { "u32", "unsigned int" },
+            { "long", "long long" }, { "i64", "long long" },
+            { "ulong", "unsigned long long" }, { "u64", "unsigned long long" },
+            { "float", "float" }, { "double", "double" }, { "void", "void" },
+        };
+        if (auto it = prims.find(base); it != prims.end()) out = it->second;
+        else if (auto fit = cxxCflatToCxxSpelling_.find(base); fit != cxxCflatToCxxSpelling_.end())
+            out = fit->second;
+        else return false;
+        for (int i = 0; i < ptr; ++i) out += " *";
+        return true;
+    }
+
+// The stub's include prologue plus the marker typedef, shared by both stages.
+std::string LLVMBackend::BuildCxxRequestPrologue(const std::string& cxxSpelling) const
+{
+        std::string src = "#include <new>\n";
+        for (const auto& h : cxxImportHeaders_)
+        {
+            std::string fwd = h;
+            std::replace(fwd.begin(), fwd.end(), '\\', '/');
+            if (IsSystemCxxHeaderPath(fwd))
+                src += "#include <" + std::filesystem::path(fwd).filename().string() + ">\n";
+            else
+                src += "#include \"" + fwd + "\"\n";
+        }
+        src += "typedef " + cxxSpelling + " __cflat_req_0;\n";
+        // Explicit instantiation DEFINITION: instantiates the class and every member that is not
+        // excluded from it. Only meaningful for a template-id spelling.
+        if (cxxSpelling.find('<') != std::string::npos)
+            src += "template class " + cxxSpelling + ";\n";
+        return src;
+    }
+
+/*
+ * One ODR-USE per exported member of the stage-1 record, so Sema instantiates the bodies.
+ * Each use is its own top-level declaration: a member whose signature cannot be re-spelled (a
+ * ref-qualified overload, a default argument that does not survive) errors on its own line, is
+ * error-recovered, and leaves every other member emitted.
+ */
+std::string LLVMBackend::BuildCxxRequestOdrUses(const cflat_cinterop::RawRecord& rec) const
+{
+        using Member = cflat_cinterop::RawCxxMember;
+        std::string src = "static void __cflat_use_dtor(__cflat_req_0* p) { p->~__cflat_req_0(); }\n";
+        unsigned n = 0;
+        for (const auto& m : rec.members)
+        {
+            if (m.access != cflat_cinterop::AccessPublic || m.isDeleted || m.variadic) continue;
+            if (m.kind == Member::Destructor) continue;   // covered above
+            const std::string tag = std::to_string(n++);
+            if (m.kind == Member::Constructor)
+            {
+                // A constructor has no address; construct into raw storage instead. The wrapper's
+                // own parameters carry the canonical spellings, so a reference parameter stays a
+                // reference and an rvalue reference is re-cast on the way in.
+                std::string params, args;
+                for (size_t p = 1; p < m.paramTypes.size(); ++p)
+                {
+                    if (p > 1) { params += ", "; args += ", "; }
+                    params += m.paramTypes[p] + " a" + std::to_string(p);
+                    args += m.paramTypes[p].size() > 2
+                            && m.paramTypes[p].compare(m.paramTypes[p].size() - 2, 2, "&&") == 0
+                        ? "static_cast<" + m.paramTypes[p] + ">(a" + std::to_string(p) + ")"
+                        : "a" + std::to_string(p);
+                }
+                src += "static void __cflat_use_ctor" + tag + "(void* m"
+                     + (params.empty() ? "" : ", " + params) + ") { (void)::new (m) __cflat_req_0("
+                     + args + "); }\n";
+                continue;
+            }
+            std::string params;
+            for (size_t p = (m.kind == Member::StaticMethod ? 0u : 1u); p < m.paramTypes.size(); ++p)
+            {
+                if (!params.empty()) params += ", ";
+                params += m.paramTypes[p];
+            }
+            const std::string ptrTo = m.kind == Member::StaticMethod
+                ? "(*)" : "(__cflat_req_0::*)";
+            src += "static auto __cflat_use" + tag + " = static_cast<" + m.retType + " " + ptrTo
+                 + "(" + params + ")" + (m.isConst ? " const" : "") + ">(&__cflat_req_0::"
+                 + m.name + ");\n";
+        }
+        return src;
+    }
+
+bool LLVMBackend::RunCxxTypeRequest(const std::string& cflatName, const std::string& cxxSpelling,
+                                    const std::string& extraSource, bool emitDefinitions,
+                                    cflat_cinterop::ExtractResult& raw, std::string& error)
+{
+        cflat_cinterop::ExtractRequest req;
+        req.mainFileName = "cflat_cpp_request.cpp";
+        req.cxxMode = true;
+        req.source = BuildCxxRequestPrologue(cxxSpelling) + extraSource;
+        req.emitDefinitions = emitDefinitions;
+        req.assumeInlineDefinitions = !emitDefinitions;
+        req.skipFunctionBodies = false;
+        req.requireInScope = false;
+        req.cxxTypeRequests.push_back({ cxxSpelling, cflatName });
+        std::string primaryDir;
+        for (const auto& h : cxxImportHeaders_)
+            if (!IsSystemCxxHeaderPath(h))
+            { primaryDir = std::filesystem::path(h).parent_path().string(); break; }
+        req.args = BuildClangDriverArgs(primaryDir, cxxImportDefines_, /*errorRecovery*/ true,
+                                        /*asCxx*/ true);
+        return cflat_cinterop::ExtractCInterop(req, raw, error);
+    }
+
+/*
+ * Identity of a C++ type request: the import group's headers and defines, the C++ include dirs, the
+ * instantiation spelling, the emit mode (an LSP bind carries no bodies and an empty companion
+ * module, which a compile must never reuse), and the compiler build stamp. Shares the C header
+ * signature cache, so it shares its row budget and its LRU/root pinning.
+ */
+std::string LLVMBackend::CxxTypeRequestCacheKey(const std::string& cxxSpelling) const
+{
+        std::string key = "|RQ" + cxxSpelling;
+        for (const auto& h : cxxImportHeaders_)   key += "|H" + h;
+        for (const auto& inc : cIncludeDirs_)     key += "|I" + inc;
+        for (const auto& def : cDefines_)         key += "|D" + def;
+        for (const auto& def : cxxImportDefines_) key += "|d" + def;
+        key += symbolSink_ == nullptr ? "|EDEF" : "|EDECL";
+        key += "|C" + CompilerBuildStamp();
+        return key;
+    }
+
+bool LLVMBackend::RequestCxxForeignType(const std::string& cflatName, const std::string& cxxSpelling,
+                                        std::string& error)
+{
+        // One attempt per CFlat identity per analysis; the outcome (including the diagnostic text)
+        // is replayed so a second use site reports the same reason without re-parsing libc++.
+        if (auto it = cxxForeignRequests_.find(cflatName); it != cxxForeignRequests_.end())
+        {
+            error = it->second;
+            return error.empty();
+        }
+        auto fail = [&](std::string why) {
+            error = std::move(why);
+            cxxForeignRequests_[cflatName] = error;
+            return false;
+        };
+        if (cxxImportHeaders_.empty())
+            return fail(std::format("C++ type '{}' needs a C++ header in scope - "
+                                    "import one with 'import cpp \"<header>\";'", cxxSpelling));
+
+        llvm::TimeTraceScope scope("CxxTypeRequest", cxxSpelling);
+
+        /*
+         * A request parses the whole C++ TU TWICE (stage 1 without CodeGen, stage 2 with), which for
+         * a libc++ specialization is the most expensive thing this compiler does. The result is a
+         * pure function of the import group's headers, its defines, the instantiation spelling and
+         * the emit mode, so it is cached process-wide next to the header bindings: a second file in
+         * the same invocation, and every LSP reanalysis of the same file, replay it instead.
+         * Cleared by nothing that ResetForReanalysis touches - the cache is static and validated by
+         * header mtime/content hash, like the header cache.
+         */
+        const std::string requestKey = CxxTypeRequestCacheKey(cxxSpelling);
+        std::filesystem::file_time_type headerMtime{};
+        bool haveMtime = true;
+        for (const auto& h : cxxImportHeaders_)
+        {
+            std::error_code ec;
+            auto mt = std::filesystem::last_write_time(h, ec);
+            if (ec) { haveMtime = false; break; }
+            if (mt > headerMtime) headerMtime = mt;
+        }
+        auto requestHash = [&]() -> uint64_t {
+            uint64_t combined = 14695981039346656037ULL;
+            for (const auto& h : cxxImportHeaders_)
+            {
+                uint64_t one = 0;
+                HashFileContents(h, one);
+                combined ^= one; combined *= 1099511628211ULL;
+            }
+            return combined;
+        };
+
+        std::vector<CRecordEntry> records;
+        std::string requestBitcode;
+        bool cached = false;
+        if (haveMtime)
+        {
+            std::lock_guard<std::mutex> lock(cFileSigCacheMutex_);
+            auto it = cFileSigCache_.find(requestKey);
+            if (it != cFileSigCache_.end()
+                && (it->second.mtime == headerMtime || it->second.hash == requestHash()))
+            {
+                it->second.mtime = headerMtime;
+                TouchCFileSigEntry(requestKey, it->second);
+                records = it->second.records;
+                requestBitcode = it->second.cxxBitcode;
+                cached = true;
+            }
+        }
+        if (cached && verbose)
+            std::cout << std::format("[verbose] C++ type request cache hit for {}\n", cxxSpelling);
+
+        if (!cached)
+        {
+            // Stage 1: the member list and their canonical signatures. No CodeGen.
+            cflat_cinterop::ExtractResult probe;
+            if (!RunCxxTypeRequest(cflatName, cxxSpelling, /*extraSource*/ {},
+                                   /*emitDefinitions*/ false, probe, error))
+                return fail(std::format("C++ type '{}' could not be parsed: {}", cxxSpelling, error));
+            if (probe.records.empty())
+                return fail(std::format("'{}' does not name a C++ class type in the imported headers",
+                                        cxxSpelling));
+
+            /*
+             * Stage 2: same TU, plus an ODR-USE per member, with CodeGen. Stage 1 alone reports
+             * member TEMPLATES only as uninstantiated patterns (no linkage name), so the member
+             * surface it sees is SMALLER - `std::string("literal")` would be missing. LSP analysis
+             * therefore runs this stage too and only throws the module away, so the editor's
+             * diagnostics match the compiler's.
+             */
+            cflat_cinterop::ExtractResult raw;
+            {
+                std::string err2;
+                cflat_cinterop::ExtractResult emitted;
+                if (RunCxxTypeRequest(cflatName, cxxSpelling,
+                                      BuildCxxRequestOdrUses(probe.records.front()),
+                                      /*emitDefinitions*/ true, emitted, err2)
+                    && !emitted.records.empty())
+                    raw = std::move(emitted);
+            }
+            if (raw.records.empty()) raw = std::move(probe);
+            MapRawRecords(raw, records);
+            requestBitcode = raw.bitcode;
+            if (haveMtime && !records.empty())
+            {
+                CFileSigCacheEntry entry;
+                entry.mtime = headerMtime;
+                entry.hash  = requestHash();
+                entry.records = records;
+                entry.cxxBitcode = requestBitcode;
+                std::lock_guard<std::mutex> lock(cFileSigCacheMutex_);
+                InsertCFileSigEntry(requestKey, std::move(entry), verbose);
+            }
+        }
+        if (records.empty())
+            return fail(std::format("'{}' does not name a C++ class type in the imported headers",
+                                    cxxSpelling));
+
+        const std::string canonical = records.front().canonicalCtype;
+        if (!canonical.empty())
+        {
+            // Same canonical specialization under a second CFlat spelling (a typedef, or the same
+            // arguments spelled twice): alias onto the ONE registration instead of a second struct.
+            auto known = cxxForeignTypeSpellings_.find(SqueezeCxxSpelling(canonical));
+            if (known != cxxForeignTypeSpellings_.end() && known->second != cflatName)
+            {
+                RegisterTypeAlias(cflatName, known->second);
+                cxxCflatToCxxSpelling_[cflatName] = cxxSpelling;
+                cxxForeignRequests_[cflatName] = "";
+                return true;
+            }
+            cxxForeignTypeSpellings_[SqueezeCxxSpelling(canonical)] = cflatName;
+        }
+        if (!requestBitcode.empty() && symbolSink_ == nullptr) AdoptCxxCompanionBitcode(requestBitcode);
+        // Registered BEFORE the records so a member signature naming the type itself
+        // (`operator=(const vector<int>&)`, `push_back` on a nested element) maps to the CFlat name.
+        cxxCflatToCxxSpelling_[cflatName] = cxxSpelling;
+        RegisterCRecords(records, cxxImportHeaders_.front());
+        if (dataStructures.find(cflatName) == dataStructures.end())
+        {
+            cxxCflatToCxxSpelling_.erase(cflatName);
+            return fail(std::format("C++ type '{}' could not be laid out for cflat", cxxSpelling));
+        }
+        cxxForeignRequests_[cflatName] = "";
+        return true;
+    }
+
+/*
+ * Entry point for both ParseDeclarationSpecifiers copies: build the C++ spelling from the CFlat
+ * name (`std.vector` + { int } -> `std::vector<int>`) and request it. `typeArgs` empty means a
+ * plain dotted name (`std.string`), which may still be a typedef for a specialization.
+ */
+bool LLVMBackend::TryRequestCxxType(const std::string& baseName,
+                                    const std::vector<std::string>& typeArgs,
+                                    const std::string& cflatName, std::string& error)
+{
+        error.clear();
+        if (!HasCxxImportGroup()) return false;
+        if (baseName.find('.') == std::string::npos) return false;
+        if (IsCxxForeignTypeRegistered(cflatName)) return true;
+        // A CFlat generic or generic interface owns its own instantiation path and its own
+        // mangling; the two identities never mix (`list<std.vector<int>>` is a CFlat instantiation
+        // whose element happens to be foreign).
+        if (AnyGenericTypeTemplateNamed(baseName) || IsGenericInterfaceTemplateName(baseName))
+            return false;
+        if (IsKnownTypeName(typeArgs.empty() ? baseName : cflatName)) return false;
+        /*
+         * An unknown dotted name is only a CANDIDATE foreign type when its leading segment came
+         * from a C++ import. Without this, every forward reference to a CFlat type declared later
+         * in the file (the ForwardRefScanner has not seen it yet) paid two clang parses of the
+         * standard library, and a header that happens to declare the same qualified name would
+         * capture the identity the CFlat definition is about to claim.
+         */
+        {
+            const std::string lead = baseName.substr(0, baseName.find('.'));
+            if (cxxForeignNamespaces_.count(lead) == 0 && !IsCxxForeignTypeRegistered(lead)
+                && cxxCflatToCxxSpelling_.count(lead) == 0)
+                return false;
+        }
+        return RequestCxxType(baseName, typeArgs, cflatName, error);
+    }
+
+bool LLVMBackend::RequestCxxType(const std::string& baseName, const std::vector<std::string>& typeArgs,
+                                 const std::string& cflatName, std::string& error)
+{
+        if (IsCxxForeignTypeRegistered(cflatName)) return true;
+        std::string spelling = baseName;
+        size_t pos = 0;
+        while ((pos = spelling.find('.', pos)) != std::string::npos)
+        { spelling.replace(pos, 1, "::"); pos += 2; }
+        if (!typeArgs.empty())
+        {
+            spelling += "<";
+            for (size_t i = 0; i < typeArgs.size(); ++i)
+            {
+                if (i) spelling += ", ";
+                std::string arg;
+                if (!CxxSpellingForCflatType(typeArgs[i], arg))
+                {
+                    error = std::format("'{}' has no C++ spelling, so it cannot be a template "
+                                        "argument of the C++ template '{}' - use a primitive, a "
+                                        "pointer, or another C++ type", typeArgs[i], baseName);
+                    return false;
+                }
+                spelling += arg;
+            }
+            // `vector<vector<int>>` needs no space in C++11 and later, but keep the closing pair
+            // readable for the diagnostic.
+            spelling += ">";
+        }
+        return RequestCxxForeignType(cflatName, spelling, error);
     }
 
 bool LLVMBackend::ExtractCFileClang(const std::string& cSourcePath,
@@ -1969,6 +2562,9 @@ void LLVMBackend::RegisterCRecords(const std::vector<CRecordEntry>& records, con
         for (const auto& r : records)
         {
             if (r.name.empty()) continue;
+            // The namespace a C++ import declared a class in, so a dotted name under it may be
+            // requested as a specialization later (see cxxForeignNamespaces_).
+            if (r.isCxx) NoteCxxForeignNamespace(r.name);
             if (dataStructures.find(r.name) != dataStructures.end()) continue;
             // Create the opaque shell so later fields/records in the same batch can refer to it.
             CreateStructType(r.name, /*typeAndValues*/{});
@@ -2279,6 +2875,16 @@ bool LLVMBackend::RejectInaccessibleCxxMember(const std::string& typeName,
         }
         if (auto m = info->refusedMembers.find(memberName); m != info->refusedMembers.end())
         {
+            /*
+             * A refusal only speaks when NO overload of that name was bound. A libc++ class
+             * commonly has one bindable overload and one cflat cannot express (`append(const
+             * char*)` next to `append(initializer_list<char>)`); reporting the refused one would
+             * make the callable overload unreachable.
+             */
+            if (std::find(info->instanceMethodNames.begin(), info->instanceMethodNames.end(),
+                          memberName) != info->instanceMethodNames.end())
+                return false;
+            if (functionTable.count(typeName + "." + memberName) != 0) return false;   // static
             LogError(std::format("member '{}' of C++ class '{}' {}", memberName, typeName, m->second));
             return true;
         }
@@ -2299,12 +2905,56 @@ bool LLVMBackend::RejectInaccessibleCxxMember(const std::string& typeName,
  * Nothing is refused silently: a member CFlat cannot bind (virtual, deleted, inaccessible, only
  * inline-defined in the header) is recorded in refusedMembers so the use site can say why.
  */
+/*
+ * M5b - a C++ REFERENCE at a bound boundary is CFlat's `alias T`: the same machine representation
+ * (a pointer) and the same rules (an lvalue passes its address, an rvalue materializes a temporary).
+ * That makes `v.push_back(3)`, `s.append(other)` and `v[0] = 5` work without a spelling for
+ * references in CFlat. Returns the referred-to spelling, or the input unchanged.
+ */
+static std::string CxxSpellingWithoutRef(const std::string& spelling, bool* isRef = nullptr)
+{
+        std::string s = spelling;
+        while (!s.empty() && s.back() == ' ') s.pop_back();
+        int refs = 0;
+        while (!s.empty() && s.back() == '&') { s.pop_back(); ++refs; }
+        if (isRef != nullptr) *isRef = refs > 0;
+        if (refs == 0) return spelling;
+        while (!s.empty() && s.back() == ' ') s.pop_back();
+        // A reference to a pointer (`char *&`) is a pointer-to-pointer at the ABI level, which the
+        // ordinary mapper already handles; leave those to it.
+        if (!s.empty() && s.back() == '*') return spelling;
+        return s;
+    }
+
 void LLVMBackend::RegisterCxxClassMembers(const CRecordEntry& r, const std::string& fileForLsp)
 {
         if (!r.isCxx) return;
         // A class whose layout was REFUSED still needs its CxxClassInfo: that is where the refusal
         // text and the field list the diagnostic reads from live.
-        if (r.members.empty() && r.staticVars.empty() && r.layoutRefusal.empty()) return;
+        // Empty C++ classes still have constructors/destructors and are valid foreign types.
+        // Keep the initial header walk bounded; requested specializations carry a '$' in their
+        // CFlat identity and are retained even when Clang reports no callable members.
+        if (r.members.empty() && r.staticVars.empty() && r.layoutRefusal.empty()
+            && r.name.find('$') == std::string::npos && !IsCxxForeignTypeRegistered(r.name)) return;
+
+        // A class imported from a C++ HEADER group also gets a C++ spelling, so it can be a
+        // template argument (`cppt.Box<cppi.Tracked>`). A request already recorded its own
+        // spelling, which is the one the request TU was built with - never overwrite it.
+        if (!r.canonicalCtype.empty() && cxxCflatToCxxSpelling_.count(r.name) == 0)
+        {
+            std::string spelling = r.canonicalCtype;
+            for (const char* tag : { "class ", "struct ", "union ", "enum " })
+                if (spelling.rfind(tag, 0) == 0) { spelling.erase(0, strlen(tag)); break; }
+            if (!spelling.empty()) cxxCflatToCxxSpelling_[r.name] = spelling;
+            // Reverse direction: clang spells this class canonically in every member signature it
+            // appears in (`push_back(const cppi::Tracked&)` inside a requested specialization), so
+            // the C type mapper needs the spelling -> CFlat identity entry as well. Both the
+            // tagged and untagged forms, since a signature may carry either.
+            if (cxxForeignTypeSpellings_.count(SqueezeCxxSpelling(r.canonicalCtype)) == 0)
+                cxxForeignTypeSpellings_[SqueezeCxxSpelling(r.canonicalCtype)] = r.name;
+            if (!spelling.empty() && cxxForeignTypeSpellings_.count(SqueezeCxxSpelling(spelling)) == 0)
+                cxxForeignTypeSpellings_[SqueezeCxxSpelling(spelling)] = r.name;
+        }
 
         CxxClassInfo info;
         info.isPolymorphic         = r.isPolymorphic;
@@ -2356,16 +3006,45 @@ void LLVMBackend::RegisterCxxClassMembers(const CRecordEntry& r, const std::stri
         // const/non-const overload pair: CFlat drops const, so both spell the same CFlat
         // signature. RULING: an lvalue prefers the non-const overload, and the const one is bound
         // only when it is the sole candidate. Decide that here, once, by signature key.
+        // The key is the signature CFlat SEES: const is dropped, and `const T&` / `T&` / `T&&`
+        // all collapse onto `alias T`, so `push_back(const int&)` and `push_back(int&&)` are one
+        // CFlat overload. Binding both would make every call ambiguous.
+        auto cflatSigKey = [](const Member& m) {
+            std::string key = m.name;
+            for (size_t p = 1; p < m.paramTypes.size(); ++p)
+            {
+                std::string t = CxxSpellingWithoutRef(m.paramTypes[p]);
+                if (t.rfind("const ", 0) == 0) t = t.substr(6);
+                key += "|" + t;
+            }
+            return key;
+        };
         std::map<std::string, size_t> instanceBySig;
         for (size_t i = 0; i < r.members.size(); ++i)
         {
             const Member& m = r.members[i];
-            if (m.kind != Member::Instance) continue;
-            std::string key = m.name;
-            for (size_t p = 1; p < m.paramTypes.size(); ++p) key += "|" + m.paramTypes[p];
+            // Copy and move assignment are captured by FLAG, not by CFlat signature, and they
+            // collapse onto the same key (`const T&` and `T&&` both drop to `T`) - deduping them
+            // here would delete the move leg of every class that has one.
+            if (m.kind != Member::Instance || m.isCopyAssign || m.isMoveAssign) continue;
+            const std::string key = cflatSigKey(m);
             auto it = instanceBySig.find(key);
             if (it == instanceBySig.end()) { instanceBySig[key] = i; continue; }
-            if (r.members[it->second].isConst && !m.isConst) it->second = i;
+            const Member& kept = r.members[it->second];
+            // Prefer a non-const method over its const twin, and an lvalue-reference
+            // parameterization over the rvalue-reference one (a const T& overload accepts both an
+            // lvalue and a materialized temporary; a T&& overload accepts only the temporary).
+            bool keptRvalue = false, mineRvalue = false;
+            for (size_t p = 1; p < kept.paramTypes.size(); ++p)
+                if (kept.paramTypes[p].size() > 1
+                    && kept.paramTypes[p].compare(kept.paramTypes[p].size() - 2, 2, "&&") == 0)
+                    keptRvalue = true;
+            for (size_t p = 1; p < m.paramTypes.size(); ++p)
+                if (m.paramTypes[p].size() > 1
+                    && m.paramTypes[p].compare(m.paramTypes[p].size() - 2, 2, "&&") == 0)
+                    mineRvalue = true;
+            if (kept.isConst && !m.isConst) it->second = i;
+            else if (keptRvalue && !mineRvalue) it->second = i;
         }
 
         for (size_t i = 0; i < r.members.size(); ++i)
@@ -2387,6 +3066,7 @@ void LLVMBackend::RegisterCxxClassMembers(const CRecordEntry& r, const std::stri
             if (m.access == cflat_cinterop::AccessPrivate)    { refuse("is private");   continue; }
             if (m.access == cflat_cinterop::AccessProtected)  { refuse("is protected"); continue; }
             if (m.isDeleted)              { refuse("is deleted");                        continue; }
+            if (!m.bindRefusal.empty())   { refuse(m.bindRefusal);                       continue; }
             if (!r.layoutRefusal.empty()) { refuse("belongs to a class whose layout cflat cannot reproduce"); continue; }
             if (m.variadic)               { refuse("is variadic");                       continue; }
             // A POINTER TO MEMBER has an ABI representation of its own (Itanium: a two-word
@@ -2404,29 +3084,50 @@ void LLVMBackend::RegisterCxxClassMembers(const CRecordEntry& r, const std::stri
                     continue;
                 }
             }
-            // A VIRTUAL member is dispatched through the vtable, so its own symbol is never
-            // called - but cflat does not emit the vtable, and an all-inline hierarchy has no key
-            // function to anchor one in the bound library. Requiring an out-of-line definition
-            // keeps the vtable somebody else's responsibility.
+            // A VIRTUAL member is dispatched through the vtable. An all-inline hierarchy is
+            // supported now (M7): clang emits the bodies AND the vtable into the companion module.
+            // This only fires when no definition exists anywhere - no symbol in the bound library
+            // and no body clang could emit - in which case the vtable slot would be empty.
             if (m.isVirtual && m.needsLocalDefinition)
-                                          { refuse("is virtual and has no out-of-line definition in the bound library, so its vtable has no key function (not supported yet)"); continue; }
+                                          { refuse("is virtual and has no definition cflat can reach: neither an out-of-line symbol in the bound library nor a body clang could emit, so its vtable slot is empty"); continue; }
             if (m.isVirtual && m.covariantReturnNeedsAdjust)
                                           { refuse("has a covariant return type whose base conversion is not at offset zero, which needs a return-adjusting thunk cflat cannot synthesize (not supported yet)"); continue; }
             if (m.isVirtual && m.vtableIndex < 0)
                                           { refuse("is virtual but cflat could not determine its vtable slot"); continue; }
-            if (m.needsLocalDefinition)   { refuse("is defined inline in the header, which needs C++ template/inline emission (not supported yet)"); continue; }
+            // Inline bodies ARE emitted (M7). What is left here is a member with no body at all:
+            // an implicit or defaulted special member Sema declined to define, or a template
+            // member awaiting instantiation support.
+            if (m.needsLocalDefinition)   { refuse("has no definition cflat can reach: clang emitted no body for it (an implicit, defaulted or template member)"); continue; }
             if (!m.abi.valid)             { refuse("has a calling convention cflat cannot reproduce"); continue; }
             if (m.linkageName.empty())    { refuse("has no external linkage");            continue; }
-            if (m.kind == Member::Instance)
+            if (m.kind == Member::Instance && !m.isCopyAssign && !m.isMoveAssign)
             {
-                std::string key = m.name;
-                for (size_t p = 1; p < m.paramTypes.size(); ++p) key += "|" + m.paramTypes[p];
-                auto it = instanceBySig.find(key);
-                if (it != instanceBySig.end() && it->second != i) continue;   // const twin
+                auto it = instanceBySig.find(cflatSigKey(m));
+                if (it != instanceBySig.end() && it->second != i) continue;   // const / ref twin
             }
 
             TypeAndValue ret;
             if (!mapType(m.retType, ret))  { refuse(std::format("returns unsupported type '{}'", m.retType)); continue; }
+            /*
+             * A C++ LVALUE REFERENCE return (`int &`, `std::string &` - what `operator[]` and
+             * `back()` hand out) is a borrowed lvalue, which is exactly CFlat's `alias T`: the
+             * callee returns a pointer (the Itanium representation, so the ABI is unchanged) and
+             * the call site turns it back into storage, so `int x = v[0];` reads and `v[0] = 5;`
+             * stores. Without this the result would be a bare `int *` and every use would need a
+             * manual dereference. Structors and assignment operators keep their own shapes.
+             */
+            // A structor's parameters and an assignment operator's result keep the pointer shape
+            // the construct-into-slot and assignment paths already expect.
+            const bool aliasRefs = !isStructor && !m.isCopyAssign && !m.isMoveAssign;
+            auto asAliasIfRef = [&](const std::string& spelling, TypeAndValue& tv) {
+                bool isRef = false;
+                const std::string bare = CxxSpellingWithoutRef(spelling, &isRef);
+                if (!isRef || bare == spelling) return;
+                if (!tv.Pointer || tv.ElemPointer || tv.IsFunctionPointer || tv.IsArrayView) return;
+                tv.Pointer = false;
+                tv.IsAlias = true;
+            };
+            if (aliasRefs) asAliasIfRef(m.retType, ret);
             std::vector<TypeAndValue> params;
             bool paramsOk = true;
             for (size_t p = 0; p < m.paramTypes.size(); ++p)
@@ -2447,6 +3148,7 @@ void LLVMBackend::RegisterCxxClassMembers(const CRecordEntry& r, const std::stri
                     paramsOk = false;
                     break;
                 }
+                else if (aliasRefs) asAliasIfRef(m.paramTypes[p], tv);
                 tv.VariableName = p < m.paramNames.size() && !m.paramNames[p].empty()
                     ? m.paramNames[p] : std::format("p{}", p);
                 params.push_back(std::move(tv));
@@ -2498,19 +3200,25 @@ void LLVMBackend::RegisterCxxClassMembers(const CRecordEntry& r, const std::stri
                 ? r.name + "." + m.name
                 : m.name;
             if (m.kind == Member::StaticMethod)
+            {
+                NoteCxxForeignNamespace(regName);
                 for (size_t pos = 0; (pos = regName.find('.', pos)) != std::string::npos; ++pos)
                     RegisterNamespace(regName.substr(0, pos));
+            }
 
+            std::string abiMismatch;
             {
                 CInteropDeclarationScope declaringFile(*this, m.file.empty() ? fileForLsp : m.file);
-                pendingCxxAbi_ = &m.abi;
+                CxxAbiPlanScope abiPlan(*this, &m.abi, &abiMismatch);
                 CreateFunctionDeclaration(regName, ret, params, /*external=*/true, /*varargs=*/false,
                                           /*returnsOwned=*/false,
                                           /*isMethod=*/m.kind == Member::Instance,
                                           CallingConv::Cdecl, m.linkageName, /*isCxx=*/true,
                                           m.isNoexcept);
-                pendingCxxAbi_ = nullptr;
             }
+            // A member whose lowering clang disagrees with is refused HERE, at registration: the
+            // use site reports why, and importing the class stays clean.
+            if (!abiMismatch.empty()) { refuse(abiMismatch); continue; }
             if (auto fit = functionTable.find(regName); fit != functionTable.end())
                 for (FunctionSymbol& sym : fit->second)
                     if (sym.External && sym.UniqueName == m.linkageName)
@@ -3163,6 +3871,26 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
         // disk cache hit skips ExtractCHeaderClang entirely, and the flag would stay false.
         if (cppMode) cppInteropUsed_ = true;
 
+        // Same reason the flag above is set here: a concrete C++ type request must see this group's
+        // headers and defines even when no parse ran for it in this analysis.
+        if (cppMode)
+        {
+            for (const auto& h : realPaths)
+                if (std::find(cxxImportHeaders_.begin(), cxxImportHeaders_.end(), h)
+                    == cxxImportHeaders_.end()) cxxImportHeaders_.push_back(h);
+            for (const auto& d : extraDefines)
+                if (std::find(cxxImportDefines_.begin(), cxxImportDefines_.end(), d)
+                    == cxxImportDefines_.end()) cxxImportDefines_.push_back(d);
+            // A standard-library header is a template catalog the walk deliberately skips, so no
+            // record of it is ever registered - seed its namespace here or `std.vector<int>` could
+            // never be requested at all.
+            for (const auto& h : realPaths)
+            {
+                if (IsSystemCxxHeaderPath(h)) cxxForeignNamespaces_.insert("std");
+                else CollectHeaderNamespaceNames(h, cxxForeignNamespaces_);
+            }
+        }
+
         // Best-effort alias retry: a macro that still cannot be resolved is dropped, exactly as
         // the first registration pass drops it. A real header carries many such macros.
         bool aliasRetryFailed = false;
@@ -3342,6 +4070,15 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
         // C and C++ mode bind the same header differently (qualified names, linkage names),
         // so they must never share a cache entry.
         if (cppMode) cacheKey += "|CXX";
+        /*
+         * LSP analysis binds a C++ group with assumeInlineDefinitions instead of emitDefinitions:
+         * every inline member gets a linkage name and a callable surface, but no body is emitted
+         * and the companion bitcode stays EMPTY. Sharing one key with a real compile would let the
+         * compile adopt that empty companion and bind bodies nothing ever emits - a link-time
+         * "undefined symbol" with no diagnostic. The mode is part of the identity of the result.
+         */
+        const bool cxxDefinitionsEmitted = cppMode && symbolSink_ == nullptr;
+        if (cppMode) cacheKey += cxxDefinitionsEmitted ? "|EDEF" : "|EDECL";
         // The cached bindings were produced by THIS compiler's C type mapper, and an upgrade
         // can change it (e.g. the LP64 `long` width). Without the compiler's identity in the
         // key, a stale entry silently outlives the code that wrote it.
@@ -3382,6 +4119,7 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
         std::vector<CGlobalEntry> hitGlobals;
         std::vector<std::pair<std::string, std::string>> hitAliases;
         std::vector<CTypeAliasEntry> hitTypeAliases;
+        std::string hitCxxBitcode;
         bool hit = false;
         {
             std::lock_guard<std::mutex> lock(cFileSigCacheMutex_);
@@ -3397,6 +4135,7 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
                     hitMacros = entry.macros; hitFuncMacros = entry.funcMacros; hitGlobals = entry.globals;
                     hitAliases = entry.recordAliases; hit = true;
                     hitTypeAliases = entry.typeAliases;
+                    hitCxxBitcode = entry.cxxBitcode;
                 }
                 else if (hashNow() == entry.hash)
                 {
@@ -3407,11 +4146,15 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
                     hitMacros = entry.macros; hitFuncMacros = entry.funcMacros; hitGlobals = entry.globals;
                     hitAliases = entry.recordAliases; hit = true;
                     hitTypeAliases = entry.typeAliases;
+                    hitCxxBitcode = entry.cxxBitcode;
                 }
             }
         }
         if (hit)
         {
+            // The C++ definitions this header needed were emitted on the cold run; relink the very
+            // same bitcode instead of running CodeGen again.
+            AdoptCxxCompanionBitcode(hitCxxBitcode);
             // Records before sigs so struct-by-value signatures resolve to the same types.
             RegisterCRecords(hitRecords, fileForLsp);
             RegisterRecordAliases(hitAliases);
@@ -3445,7 +4188,8 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
         uint64_t diskKey = 0;
         if (diskCache && !mtEc && !cHeaderCacheDir.empty())
         {
-            diskKey = CHeaderDiskCacheKey(realPaths, cIncludeDirs_, cDefines_, extraDefines, cppMode);
+            diskKey = CHeaderDiskCacheKey(realPaths, cIncludeDirs_, cDefines_, extraDefines, cppMode,
+                                          cxxDefinitionsEmitted);
             CFileSigCacheEntry diskEntry;
             bool diskHit;
             {
@@ -3460,6 +4204,7 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
                     InsertCFileSigEntry(cacheKey, CFileSigCacheEntry(diskEntry), verbose);
                 }
                 llvm::TimeTraceScope registerScope("CHeaderRegister", fileForLsp);
+                AdoptCxxCompanionBitcode(diskEntry.cxxBitcode);
                 RegisterCRecords(diskEntry.records, fileForLsp);
                 RegisterRecordAliases(diskEntry.recordAliases);
                 RegisterTypeAliasSymbols(diskEntry.typeAliases);
@@ -3498,6 +4243,7 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
         // Deep mode: collect the transitive include set so the disk entry can validate it.
         bool wantDeps = diskCache && cHeaderCacheDeep_ && !cHeaderCacheDir.empty();
         std::vector<std::string> includes;
+        std::string cxxBitcode;   // M5 companion module for this group, empty for C imports
         {
             // All C entities are extracted in one full parse (plus a cheap preprocess-only prepass
             // for macro names). Uses clang C++ API, not clang-cl or libclang.
@@ -3506,7 +4252,7 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
             std::string prereqMsg;
             if (!ExtractCHeaderClang(realPaths, sigs, enums, records, macros, funcMacros, globals,
                                      aliases, typeAliases, extraDefines, wantDeps ? &includes : nullptr,
-                                     &prereqFailure, &prereqMsg, cppMode))
+                                     &prereqFailure, &prereqMsg, cppMode, &cxxBitcode))
             {
                 if (prereqFailure)
                     ReportOrphanHeader(headerPaths, prereqMsg);
@@ -3527,6 +4273,7 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
             entry.globals = globals;
             entry.recordAliases = aliases;
             entry.typeAliases = typeAliases;
+            entry.cxxBitcode = cxxBitcode;
             // Keep only real on-disk paths in the transitive dependency list (deep mode).
             // Non-existent deps would otherwise poison every later cache validation.
             if (wantDeps)
@@ -3548,7 +4295,18 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
             }
             // --run is read-only: never persist header cache to disk even with 'cache' clause.
             // The in-memory entry still serves this compile.
-            if (diskCache && !runMode_ && !cHeaderCacheDir.empty())
+            // Nor does LSP analysis write: its entry carries a bound surface with no bodies
+            // (see the cache-key comment above), which is not a result a compile may reuse.
+            // A huge companion blob is not worth persisting; the whole entry is skipped rather
+            // than written without it, since an entry with a bound surface and no bodies is the
+            // link-time-undefined trap the mode key above exists to prevent.
+            const bool blobTooBigForDisk = entry.cxxBitcode.size() > kMaxDiskCachedCxxBitcode;
+            if (blobTooBigForDisk && verbose)
+                std::cout << std::format("[verbose] C++ companion module for {} is {} bytes - "
+                                         "kept in memory, not written to the header disk cache\n",
+                                         fileForLsp, entry.cxxBitcode.size());
+            if (diskCache && !runMode_ && symbolSink_ == nullptr && !blobTooBigForDisk
+                && !cHeaderCacheDir.empty())
                 WriteCHeaderDiskCache(cHeaderCacheDir, diskKey, currentMtime, hashNow(), entry);
             std::lock_guard<std::mutex> lock(cFileSigCacheMutex_);
             InsertCFileSigEntry(cacheKey, std::move(entry), verbose);
@@ -3608,9 +4366,11 @@ llvm::Function* LLVMBackend::GetOrCreateCxxStructor(const std::string& typeName,
         {
             if (existing->getFunctionType() != fnTy)
             {
+                // Every user-facing name is demangled; the Itanium symbol is not a spelling
+                // the user wrote. llvm::demangle returns the input unchanged if it is not one.
                 LogError(std::format(
                     "internal: C++ special member '{}' of '{}' was already declared with a "
-                    "different signature", st.linkageName, typeName));
+                    "different signature", llvm::demangle(st.linkageName), typeName));
                 return nullptr;
             }
             return existing;
@@ -3746,9 +4506,20 @@ const LLVMBackend::CxxClassInfo::Structor* LLVMBackend::SelectCxxConstructor(
             found = &c;
         }
         if (found != nullptr) return found;
-        why = candidates == 0
-            ? std::format("has no constructor taking {} argument(s)", (uint64_t)argTypes.size())
-            : "has no constructor whose parameter types match these arguments";
+        if (candidates == 0)
+        {
+            why = std::format("has no constructor taking {} argument(s)", (uint64_t)argTypes.size());
+            return nullptr;
+        }
+        // Name the argument types: with several same-arity overloads, "no match" alone does not say
+        // which argument is the problem.
+        std::string args;
+        for (const auto& a : argTypes)
+        {
+            if (!args.empty()) args += ", ";
+            args += "'" + SpellType(*this, a) + "'";
+        }
+        why = std::format("has no constructor whose parameter types match these arguments ({})", args);
         return nullptr;
     }
 

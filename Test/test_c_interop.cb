@@ -1,3 +1,7 @@
+// cflat-args: --cpp-assume-noexcept
+// (the line above is read by test.sh / test.bat: sections M8-M9 call libc++ members, which
+// carry no noexcept specification - Test/errors/err_cpp_template_may_throw.cb proves the
+// gate is still on by default)
 // End-to-end C-interop coverage. Each section exercises one path of the C-interop
 // pipeline; on failure the section's exit code identifies which one regressed.
 //
@@ -49,6 +53,26 @@
 //                       returns constructed straight into the local, plus new/delete and
 //                       `unique T*` through the C++ operators. Every assertion is an EXACT
 //                       instrumented count, so an extra copy or a missed destructor fails here.
+//   Section M7 (460-479): HEADER-ONLY C++ - inline free functions (including one that calls
+//                       another, and one with a static local), an all-inline nontrivial class,
+//                       inline static data members as lifetime counters, and an all-inline
+//                       VIRTUAL hierarchy with no key function. Nothing here has an out-of-line
+//                       symbol, so every assertion also proves clang's definition emission
+//                       landed in the linked image. Two import groups cover the same code, so a
+//                       duplicate definition would fail the link instead of merging by ODR.
+//   Section M8 (480-499): C++ CLASS TEMPLATES instantiated from CFlat - `cppt.Box<int>` and
+//                       `cppt.Box<double>` from one header-only pattern (constructor, get/set,
+//                       operator[] bound to the index expression, operator==), a per-
+//                       specialization static counter, a specialization over a nontrivial C++
+//                       class whose DEFAULTED destructor still has to run, and the same
+//                       specialization named in two functions (one registration, one symbol).
+//   Section M9 (500-529): libc++ through the same path - std.vector<int>, std.vector<double>,
+//                       std.string, and the nested std.vector<std.string>, plus element
+//                       destruction counted for std.vector<cppi.Tracked>.
+//   Section M10 (530-549): review follow-ups - a specialization whose element type is a POINTER
+//                       (std.vector<char*>), where every member signature that names the container
+//                       itself carries an inner '*' that the type mapper must not strip, and a
+//                       `move` argument to a libc++ member.
 //   Section M (270-289): C++ interop via `import cpp` - namespaced/overloaded declarations
 //                       bound by mangled linkage name, reference params and returns
 //                       as pointers, extern "C" bare linkage, nested namespaces,
@@ -84,6 +108,19 @@ import cpp "library/cpp_interop_basic.cpp";
 // virtual function needs a real symbol and the vtable needs a key function.
 import cpp "library/cpp_interop_poly.h";
 import cpp "library/cpp_interop_poly.cpp";
+// Section M7: HEADER-ONLY C++ - no .cpp anywhere. Every definition is inline in the header, so
+// clang CodeGen has to emit the bodies, vtables and inline statics into the companion module.
+// The second header re-includes the first from a DIFFERENT import group, which is the
+// duplicate-definition (ODR merge) check.
+import cpp "library/cpp_interop_inline.h";
+import cpp "library/cpp_interop_inline_again.h";
+// Section M8: one header-only CLASS TEMPLATE pattern. No specialization has a symbol anywhere
+// until a CFlat declaration asks for one, so every M8 assertion also proves the instantiation
+// path emitted the bodies. Section M9 needs no fixture at all - the libc++ headers are the
+// fixture, reached by the SYSTEM header spelling below.
+import cpp "library/cpp_interop_tpl.h";
+import cpp "vector";
+import cpp "string";
 import "library/float_macros.h";
 // Accept side of the conflicting-declaration check: prototypes identical to ones already
 // bound (core putn/printf, and c_add from cinterop.c above) must be a silent no-op.
@@ -178,6 +215,22 @@ int m5_early_return(int k)
     cppi.Tracked t = cppi.Tracked(k);
     if (k > 0) return t.value();
     return -1;
+}
+
+// M8 helper: the SAME specialization `cppt.Box<int>` a second function also declares. One
+// registration and one emitted symbol have to serve both, or the link fails on a duplicate.
+int m8_second_use(int v)
+{
+    cppt.Box<int> b = cppt.Box<int>(v);
+    return b.get() + b[0];
+}
+
+// M9 helper: a std.string built and read in a second function - the specialization is requested
+// once for the whole compilation, not once per use site.
+int m9_second_use()
+{
+    std.string s = std.string("abcd");
+    return (int)s.size();
 }
 
 extern int main()
@@ -1128,6 +1181,236 @@ extern int main()
     if (cpppoly.read_right(m6r) != 44)           return 449;
     if (m6r.rv != 44)                            return 450;
     if (m6r.r() != 2044)                         return 451;   // virtual, through Right's vtable
+    // An override of a NON-PRIMARY base virtual, reached through a DERIVED pointer: the slot
+    // must come from Both's own vtable (unadjusted this), not from Right's.
+    cpppoly.Both* m6bp = &m6b;
+    if (m6bp.r() != 2044)                        return 452;
+    if (m6bp.l() != 1033)                        return 453;
+    if (m6bp.both_only() != 77)                  return 454;
+
+    // ---- Section M6b: class names containing a declarator keyword (452-459) ---------
+    // "constant" contains "const" and "classBase" contains "class". Both are NON-PRIMARY bases
+    // of QualNames, so a lost class identity shows up as a missing base adjustment.
+    cpppoly.QualNames* m6q = cpppoly.make_qual();
+    if (cpppoly.read_constant(m6q) != 66)        return 455;
+    if (cpppoly.read_class_base(m6q) != 77)      return 456;
+    if (m6q.cv != 66)                            return 457;
+    if (m6q.bv != 77)                            return 458;
+    if (m6q.l() != 3055)                         return 459;   // override of Left::l
+    cpppoly.destroy_qual(m6q);
+
+    // ---- Section M7: header-only C++ (definition emission) (460-479) ----------------
+    // Inline free function, and one that calls another inline function: 5*3 + 5*3 = 30.
+    if (cppinl.helper(5) != 15)                  return 460;
+    if (cppinl.twice(5) != 30)                   return 461;
+    // Static local inside an inline body: the guard variable and the slot are emitted too.
+    if (cppinl.next_id() != 101)                 return 462;
+    if (cppinl.next_id() != 102)                 return 463;
+    // Same inline code reached through the SECOND import group: one linked definition, so the
+    // static local above keeps counting rather than starting over.
+    if (cppinl2.twice_plus(5) != 31)             return 464;
+    if (cppinl.next_id() != 103)                 return 465;
+
+    // All-inline nontrivial class. The counters are inline static data members, so reading them
+    // proves the companion module supplied their storage as well as the constructor body.
+    cppinl.Box.reset();
+    {
+        cppinl.Box m7b = cppinl.Box(4);
+        m7b.add(6);
+        if (m7b.get() != 10)                     return 466;
+        if (m7b.scaled() != 30)                  return 467;   // inline method calling an inline fn
+        if (cppinl.Box.ctors != 1)               return 468;
+        if (cppinl.Box.dtors != 0)               return 469;
+    }
+    if (cppinl.Box.dtors != 1)                   return 470;    // destructor ran exactly once
+
+    // All-inline VIRTUAL hierarchy: no key function exists anywhere, so the vtable itself comes
+    // from the companion module. Dispatch through a base pointer is the assertion.
+    cppinl.Base.reset_dtors();
+    {
+        cppinl.Derived m7d = cppinl.Derived(5);
+        if (m7d.area() != 25)                    return 471;    // own override, direct call
+        if (m7d.plain() != 3)                    return 472;    // inherited inline method
+        cppinl.Base* m7base = &m7d;
+        if (m7base.area() != 25)                 return 473;    // virtual, through the vtable
+        if (m7base.tag_ != 2)                    return 474;    // base field set by Base's ctor
+    }
+    if (cppinl.Base.derived_dtors != 1)          return 475;
+    if (cppinl.Base.base_dtors != 1)             return 476;
+
+    // Heap object released through a BASE pointer: the deleting destructor slot of an emitted
+    // vtable, so the derived destructor chain runs.
+    cppinl.Base.reset_dtors();
+    cppinl.Derived* m7heap = new cppinl.Derived(3);
+    cppinl.Base* m7heapBase = move m7heap;
+    if (m7heapBase.area() != 9)                  return 477;
+    delete m7heapBase;
+    if (cppinl.Base.derived_dtors != 1)          return 478;
+    if (cppinl.Base.base_dtors != 1)             return 479;
+
+    // ---- Section M8: C++ class templates instantiated from CFlat (480-499) ----------
+    // One header-only pattern, two specializations. Nothing below exists as a symbol until
+    // these declarations ask for it.
+    cppt.box_int_reset();
+    {
+        cppt.Box<int> m8b = cppt.Box<int>(7);
+        if (m8b.get() != 7)                      return 480;   // constructor taking T
+        if (cppt.box_int_live() != 1)            return 481;   // per-specialization static counter
+        if (cppt.box_int_ctors() != 1)           return 482;
+        m8b.set(9);
+        if (m8b.get() != 9)                      return 483;   // mutating method taking T
+        if (m8b[0] != 9)                         return 484;   // operator[] via the index expression
+        cppt.Box<int> m8b2 = cppt.Box<int>(9);
+        if (!(m8b == m8b2))                      return 485;   // operator== via the overload table
+        cppt.Box<int> m8b3 = cppt.Box<int>(4);
+        if (m8b == m8b3)                         return 486;
+        if (cppt.box_int_live() != 3)            return 487;
+    }
+    if (cppt.box_int_live() != 0)                return 488;   // all three destroyed exactly once
+    if (cppt.box_int_dtors() != 3)               return 489;
+
+    // A SECOND specialization of the same pattern: its own instantiation, its own counter.
+    {
+        cppt.Box<double> m8d = cppt.Box<double>(2.5);
+        if (m8d.get() != 2.5)                    return 490;
+        if (m8d[0] != 2.5)                       return 491;
+        if (cppt.box_double_live() != 1)         return 492;
+        if (cppt.box_int_live() != 0)            return 493;   // counters are per specialization
+    }
+    if (cppt.box_double_live() != 0)             return 494;
+
+    // The same specialization named in another function: one registration, one linked symbol.
+    if (m8_second_use(5) != 10)                  return 495;
+    if (cppt.box_int_live() != 0)                return 496;
+
+    // A specialization over a NONTRIVIAL C++ class whose destructor is DEFAULTED: there is no
+    // body in the header, so the instantiation has to make clang define and emit it, and it has
+    // to destroy the Tracked member.
+    cppi.reset_counts();
+    {
+        cppt.Holder<cppi.Tracked> m8h = cppt.Holder<cppi.Tracked>(4);
+        if (m8h.value() != 4)                    return 497;
+        if (cppi.ctor_count() != 1)              return 498;
+        if (cppi.dtor_count() != 0)              return 499;
+    }
+    if (cppi.dtor_count() != 1)                  return 480 + 20;   // 500 - defaulted dtor ran
+
+    // ---- Section M9: libc++ through the same path (500-529) -------------------------
+    // std.vector<int>: default construction, push_back, size through the size_t mapping,
+    // element read as an rvalue, element write as an lvalue, and clear.
+    {
+        std.vector<int> m9v = default;
+        m9v.push_back(3);
+        m9v.push_back(4);
+        if ((int)m9v.size() != 2)                return 501;
+        int m9x = m9v[0];
+        if (m9x != 3)                            return 502;
+        if (m9v[1] != 4)                         return 503;
+        m9v[0] = 5;
+        if (m9v[0] != 5)                         return 504;
+        m9v.clear();
+        if ((int)m9v.size() != 0)                return 505;
+    }
+
+    // A second element type is a second specialization of the same libc++ template.
+    {
+        std.vector<double> m9d = default;
+        m9d.push_back(2.5);
+        if ((int)m9d.size() != 1)                return 506;
+        if (m9d[0] != 2.5)                       return 507;
+    }
+
+    // std.string: the `const char*` constructor (a member template with an all-defaulted SFINAE
+    // parameter), append, size, c_str and the equality operator.
+    {
+        std.string m9s = std.string("hello");
+        if ((int)m9s.size() != 5)                return 508;
+        m9s.append(" world");
+        if ((int)m9s.size() != 11)               return 509;
+        if (strcmp(m9s.c_str(), "hello world") != 0) return 510;
+        // libc++ spells string equality as a FREE function TEMPLATE, which this path does not
+        // bind (it is deduced at the call site, not a member of the specialization); the member
+        // `compare` is the equality surface that is available.
+        std.string m9s2 = std.string("hello world");
+        if (m9s.compare(m9s2) != 0)              return 511;
+    }
+    if (m9_second_use() != 4)                    return 512;
+
+    // A NESTED template argument: std.vector<std.string> requires std.string to be registered
+    // before the outer name is mangled, and the element access returns a C++ reference.
+    {
+        std.vector<std.string> m9n = default;
+        std.string m9e = std.string("abc");
+        m9n.push_back(m9e);
+        if ((int)m9n.size() != 1)                return 513;
+        if ((int)m9n[0].size() != 3)             return 514;   // member call on the T& element
+        if (strcmp(m9n[0].c_str(), "abc") != 0)  return 515;
+    }
+
+    // Element destruction: every Tracked the vector holds is destroyed exactly once when the
+    // vector is, so the total destruction count matches everything ever constructed.
+    cppi.reset_counts();
+    {
+        cppi.Tracked m9t = cppi.make_tracked(4);
+        std.vector<cppi.Tracked> m9tv = default;
+        m9tv.push_back(m9t);
+        m9tv.push_back(m9t);
+        if ((int)m9tv.size() != 2)               return 516;
+        if (m9tv[0].value() != 4)                return 517;
+        // No exact count inside the scope: growing the buffer moves the existing elements and
+        // destroys the moved-from ones, so libc++ is free to construct and destroy extra objects
+        // here. The invariant below is the assertion - every object ever built is destroyed.
+        if (cppi.ctor_count() != 1)              return 518;
+    }
+    {
+        int m9made = cppi.ctor_count() + cppi.copy_count() + cppi.move_count();
+        if (m9made < 3)                          return 519;   // 1 local + 2 elements at least
+        if (cppi.dtor_count() != m9made)         return 520;   // vector destroyed every element
+    }
+
+    // ---- Section M10: review follow-ups (530-549) -----------------------------------
+    /*
+     * A POINTER element type. Clang's canonical spelling of the specialization then carries an
+     * inner '*' ("vector<char *, allocator<char *>>"), and every member signature that mentions the
+     * container itself is spelled that way. Deleting every '*' before the foreign-type lookup used
+     * to leave `swap` taking void**, which accepts any pointer at all - so this section is as much
+     * a type-safety assertion as a functional one.
+     */
+    {
+        char* m10p = nullptr;
+        std.vector<char*> m10v = default;
+        m10v.push_back(&m10p);                                  // `const char *&` param: pass &p
+        if ((int)m10v.size() != 1)               return 530;
+        std.vector<char*> m10w = default;
+        m10v.swap(m10w);                                        // param IS the container type
+        if ((int)m10v.size() != 0)               return 531;
+        if ((int)m10w.size() != 1)               return 532;
+        // No element READ here: for a POINTER element type `operator[]`'s `char *&` return is not
+        // decayed back to storage the way `int &` is, so `m10w[0]` still yields the reference
+        // itself. That gap is independent of the mapping this section covers.
+    }
+
+    /*
+     * A `move` argument to a libc++ member. Which overload leg binds (`const T&` vs `T&&`) is not
+     * asserted here - the rvalue-reference leg is dropped by the CFlat-signature dedup and
+     * restoring it needs a binding ruling - but the OWNERSHIP invariant must hold either way:
+     * everything ever constructed is destroyed exactly once, and the moved-from local is still
+     * destroyed by C++ (a C++ move does not end the source object's lifetime).
+     */
+    cppi.reset_counts();
+    {
+        cppi.Tracked m10t = cppi.make_tracked(9);
+        std.vector<cppi.Tracked> m10tv = default;
+        m10tv.push_back(move m10t);
+        if ((int)m10tv.size() != 1)              return 533;
+        if (m10tv[0].value() != 9)               return 534;
+    }
+    {
+        int m10made = cppi.ctor_count() + cppi.copy_count() + cppi.move_count();
+        if (m10made < 2)                         return 535;   // the local plus the element
+        if (cppi.dtor_count() != m10made)        return 536;   // including the moved-from local
+    }
 
     return 0;
 }
+

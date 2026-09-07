@@ -3934,7 +3934,8 @@ public:
                                    std::vector<std::pair<std::string, llvm::AllocaInst*>>& allocList);
     // The `T(args)` construction form: the argument list of a postfix call whose callee spelling
     // names the declared foreign class itself. Null for every other expression shape.
-    static CFlatParser::ArgumentExpressionListContext* ForeignCxxConstructArgs(
+    // Not static: the class-template form re-mangles the callee spelling through the backend.
+    CFlatParser::ArgumentExpressionListContext* ForeignCxxConstructArgs(
         antlr4::tree::ParseTree* node, const std::string& typeName);
 
     // True when `text` is a single bare identifier (no `.`, `[`, `(`, `*`, etc.), so a `move <text>`
@@ -5240,6 +5241,9 @@ public:
 
     // Check a receiver use at call sites that do not load the receiver first.
     void CheckMovedReceiver(const LLVMBackend::NamedVariable& receiver);
+
+    // Give an untyped literal argument the shape a C++ constructor overload can match on.
+    void TypeUntypedCtorArg(LLVMBackend::TypeAndValue& argType, llvm::Value* argValue);
 
     llvm::Value* LoadNamedVariableImpl(LLVMBackend::NamedVariable& namedVar);
 

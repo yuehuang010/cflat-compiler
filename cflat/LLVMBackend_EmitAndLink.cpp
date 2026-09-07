@@ -2620,6 +2620,104 @@ bool LLVMBackend::CollectOptimizationInfo(int optLevel,
     return true;
 }
 
+// Take one companion module (M5 C++ definition emission). Identical blobs - the same header bound
+// twice under the same configuration - are dropped here; distinct ones merge by ODR at link time.
+void LLVMBackend::AdoptCxxCompanionBitcode(const std::string& bitcode)
+{
+    if (bitcode.empty()) return;
+    uint64_t hash = 14695981039346656037ULL;
+    for (unsigned char c : bitcode) { hash ^= c; hash *= 1099511628211ULL; }
+    if (!cxxCompanionSeen_.insert(hash).second) return;
+    cxxCompanionBitcode_.push_back(bitcode);
+}
+
+/*
+ * Link every C++ companion module into the main module, before optimization so the inline bodies
+ * can inline into cflat call sites and so --out-lli, the native object, and --run all see the same
+ * definitions. Linkage and COMDATs are preserved exactly as Clang emitted them: a linkonce_odr
+ * inline body or vtable coming from two import groups merges instead of colliding, and Clang's
+ * llvm.global_ctors entries are merged into the main module's list, which is what makes a
+ * header-defined static object initialize under --run as well as in a linked executable.
+ */
+bool LLVMBackend::LinkCxxCompanionModules()
+{
+    if (cxxCompanionBitcode_.empty()) return true;
+    llvm::TimeTraceScope scope("LinkCxxCompanion");
+
+    std::vector<std::string> blobs;
+    blobs.swap(cxxCompanionBitcode_);
+    for (const std::string& blob : blobs)
+    {
+        llvm::MemoryBufferRef buffer(blob, "cflat_cxx_companion");
+        llvm::Expected<std::unique_ptr<llvm::Module>> parsed =
+            llvm::parseBitcodeFile(buffer, *context);
+        if (!parsed)
+        {
+            LogErrorMessage("{}: the C++ definitions emitted for an imported header could not be "
+                            "read back: {}",
+                            { "import cpp", llvm::toString(parsed.takeError()) });
+            return false;
+        }
+        std::unique_ptr<llvm::Module> companion = std::move(*parsed);
+
+        /*
+         * Same target, spelled with more precision on Clang's side (an OS version, extra pointer
+         * specs). Adopting the destination's spelling keeps IRMover from warning about it; a
+         * genuinely different architecture or OS is an error, not something to paper over.
+         * Compared against the triple this compile has CHOSEN, not module->getTargetTriple(): the
+         * main module carries no triple until native emission, which happens long after this link,
+         * so the old comparison never ran on the normal -o path.
+         */
+        const llvm::Triple want(CInteropTargetTriple());
+        const llvm::Triple& have = companion->getTargetTriple();
+        if (have.getArch() != want.getArch() || have.getOS() != want.getOS())
+        {
+            LogErrorMessage("{}: the C++ definitions emitted for an imported header target "
+                            "'{}', but this program targets '{}'.",
+                            { "import cpp", have.str(), want.str() });
+            return false;
+        }
+        if (!module->getTargetTriple().str().empty()) companion->setTargetTriple(module->getTargetTriple());
+        /*
+         * The data layout is a CHECK, not an override. The main module's Darwin layout is a short
+         * hand-written string and Clang's is the full arm64-apple one, so a textual difference is
+         * expected; what must agree is the machine contract the two modules were built against.
+         * Adopting the destination's spelling afterwards keeps IRMover quiet.
+         */
+        if (!module->getDataLayoutStr().empty())
+        {
+            const llvm::DataLayout& mine = module->getDataLayout();
+            const llvm::DataLayout& theirs = companion->getDataLayout();
+            if (mine.isLittleEndian() != theirs.isLittleEndian()
+                || mine.getPointerSizeInBits() != theirs.getPointerSizeInBits()
+                || mine.getIndexSizeInBits(0) != theirs.getIndexSizeInBits(0))
+            {
+                LogErrorMessage("{}: the C++ definitions emitted for an imported header were built "
+                                "for data layout '{}', which does not match this program's '{}'.",
+                                { "import cpp", companion->getDataLayoutStr(),
+                                  module->getDataLayoutStr() });
+                return false;
+            }
+            if (verbose && companion->getDataLayoutStr() != module->getDataLayoutStr())
+                std::cout << std::format("[verbose] C++ companion data layout '{}' adopted as '{}'\n",
+                                         companion->getDataLayoutStr(), module->getDataLayoutStr());
+            companion->setDataLayout(module->getDataLayout());
+        }
+
+        if (verbose)
+            std::cout << std::format("[verbose] linking C++ companion module ({} bytes of bitcode)\n",
+                                     blob.size());
+        if (llvm::Linker::linkModules(*module, std::move(companion), llvm::Linker::Flags::None))
+        {
+            LogErrorMessage("{}: the C++ definitions emitted for an imported header could not be "
+                            "linked into this program (conflicting module flags or symbols).",
+                            { "import cpp" });
+            return false;
+        }
+    }
+    return true;
+}
+
 bool LLVMBackend::EmitExecutableElf(const std::string& exePath, bool debugInfo,
                            const std::optional<std::string>& lliPath)
 {
@@ -2710,8 +2808,8 @@ bool LLVMBackend::EmitExecutableElf(const std::string& exePath, bool debugInfo,
         if (cc.empty())
         {
             llvm::sys::fs::remove(objPath);
-            std::cout << std::format("Error: no {} compiler driver found to link the executable\n",
-                                     cppInteropUsed_ ? "C++" : "C");
+            LogErrorMessage("no {} compiler driver found to link the executable.",
+                            { cppInteropUsed_ ? "C++" : "C" });
             return false;
         }
 

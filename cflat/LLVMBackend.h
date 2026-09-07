@@ -2727,6 +2727,32 @@ private:
         ~CInteropDeclarationScope() { Backend.cInteropDeclarationFile_ = std::move(Previous); }
     };
 
+    /*
+     * RAII publisher for the two per-declaration C++ ABI slots (clang's lowering plan and the
+     * mismatch sink). Both point at CALLER STACK, and LogError throws - a diagnostic raised
+     * anywhere inside CreateFunctionDeclaration would otherwise leave the sink aimed at a dead
+     * frame for the next member, the next file, or an enclosing expect_error to write through.
+     */
+    struct CxxAbiPlanScope
+    {
+        LLVMBackend& Backend;
+        const cflat_cinterop::RawAbi* PreviousPlan;
+        std::string* PreviousSink;
+
+        CxxAbiPlanScope(LLVMBackend& backend, const cflat_cinterop::RawAbi* plan, std::string* sink)
+            : Backend(backend), PreviousPlan(backend.pendingCxxAbi_),
+              PreviousSink(backend.cxxAbiMismatchSink_)
+        {
+            Backend.pendingCxxAbi_ = plan;
+            Backend.cxxAbiMismatchSink_ = sink;
+        }
+        ~CxxAbiPlanScope()
+        {
+            Backend.pendingCxxAbi_ = PreviousPlan;
+            Backend.cxxAbiMismatchSink_ = PreviousSink;
+        }
+    };
+
     private:
 
     void SetSourceLocation(size_t line, size_t column);
@@ -3045,6 +3071,57 @@ private:
     // Set when a C++ source or header is imported. This selects the C++ driver/runtime at
     // native compile/link time; ordinary C imports keep the existing C-only path.
     bool cppInteropUsed_ = false;
+    bool cppAssumeNoexcept_ = false;
+    /*
+     * M5b - the C++ headers (and their -D defines) of every `import cpp` group in this analysis, in
+     * import order. A concrete type request re-parses exactly this set, so a specialization is
+     * instantiated in the same header context the user imported. Recorded at the import site, NOT
+     * inside the extractor: a warm header cache skips extraction entirely.
+     */
+    std::vector<std::string> cxxImportHeaders_;
+    std::vector<std::string> cxxImportDefines_;
+    /*
+     * Leading namespace segments a C++ import group actually brought in ("std" for a standard
+     * header, plus every namespace a walked C++ header declared a class in). A dotted type name
+     * whose first segment is not here cannot be a foreign C++ type, so it must not be speculatively
+     * requested: the request costs two clang parses of the standard library, and a name a CFlat
+     * struct is about to define could otherwise be captured by a same-named foreign record.
+     */
+    std::unordered_set<std::string> cxxForeignNamespaces_;
+    // Leading segment of a dotted name a C++ import registered, noted as a foreign namespace.
+    void NoteCxxForeignNamespace(const std::string& dottedName)
+    {
+        if (auto dot = dottedName.find('.'); dot != std::string::npos && dot > 0)
+            cxxForeignNamespaces_.insert(dottedName.substr(0, dot));
+    }
+    // Clang's CANONICAL spelling of a requested foreign type (spaces squeezed) -> the CFlat name it
+    // is registered under. This is what maps a member signature's types back to CFlat identities,
+    // and what makes two spellings of one specialization resolve to a single registration.
+    std::unordered_map<std::string, std::string> cxxForeignTypeSpellings_;
+    // CFlat name -> the C++ source spelling it was requested with, for nested template arguments.
+    std::unordered_map<std::string, std::string> cxxCflatToCxxSpelling_;
+    /*
+     * While non-null, a C++ external declaration whose lowering does not match clang's own
+     * arrangement is DROPPED and the reason written here instead of raising a compile error. The
+     * class-registration path binds a WHOLE class surface (a libc++ container has dozens of members
+     * cflat has no spelling for); a member the program never names must become a refusal at its own
+     * use site, not a failure of the compile that merely imported the class.
+     */
+    std::string* cxxAbiMismatchSink_ = nullptr;
+    // CFlat name -> outcome of its one type request ("" = registered, else the diagnostic text).
+    std::unordered_map<std::string, std::string> cxxForeignRequests_;
+    /*
+     * M5 companion modules: one LLVM bitcode blob per C++ import group, holding the definitions
+     * Clang emitted for the bound surface (linkonce_odr inline bodies, vtables/RTTI with their
+     * COMDATs, static-local guards, inline static data members). Linked into `module` before
+     * optimization by LinkCxxCompanionModules(), so a header-only C++ library needs no .cpp.
+     * Blobs arrive from the extractor or from the header cache; identical blobs are dropped, and
+     * whatever survives merges by ODR at link time.
+     */
+    std::vector<std::string> cxxCompanionBitcode_;
+    std::unordered_set<uint64_t> cxxCompanionSeen_;   // FNV-1a of an adopted blob, for dedup
+    void AdoptCxxCompanionBitcode(const std::string& bitcode);
+    bool LinkCxxCompanionModules();
     std::string cppStandard_ = "c++20";
     int cOptLevel_ = 0;        // optimization level applied to clang C compiles
     bool cDebugInfo_ = false;  // emit CodeView for clang C compiles
@@ -3220,6 +3297,10 @@ private:
         bool isAbstract = false;
         std::vector<cflat_cinterop::RawCxxBase> bases;
         std::string layoutRefusal;
+        // Clang's canonical C++ spelling of the record (`class cppi::Tracked`), the identity two
+        // CFlat spellings of one specialization agree on. Also the source of the C++ spelling a
+        // template ARGUMENT needs, so it must round-trip through the header cache.
+        std::string canonicalCtype;
         bool hasTrivialDefaultCtor = false;
         bool hasTrivialCopyCtor = false;
         bool hasTrivialDtor = true;
@@ -3283,6 +3364,10 @@ private:
         std::vector<std::pair<std::string, std::string>> recordAliases;
         std::vector<CTypeAliasEntry> typeAliases;
         std::vector<CHeaderDep> deps;
+        // M5 companion module: LLVM bitcode holding the C++ definitions Clang emitted for this
+        // import group (inline bodies, vtables/RTTI, inline static members). Cached with the
+        // bindings so a warm run links the very same definitions instead of re-running CodeGen.
+        std::string cxxBitcode;
         uint64_t lastUse = 0;  // cFileSigCacheClock_ stamp of the last hit or insert
         size_t rows = 0;       // summed size of every vector above, for the row budget
     };
@@ -3300,11 +3385,21 @@ private:
     // ~105 MB, so this keeps roughly two cold large headers; the cache is rebuildable state.
     static constexpr size_t kCFileSigCacheRowBudget = 120000;
 
+    // Bytes of companion bitcode counted as one row. The budget above is calibrated at ~2 KB per
+    // row (105 MB / 54k rows for windows.h), so a multi-megabyte C++ blob has to weigh the same as
+    // the rows it displaces - otherwise the eviction loop is blind to it and an LSP process holding
+    // several C++ groups grows with no brake.
+    static constexpr size_t kCFileSigBitcodeBytesPerRow = 2048;
+    // A companion blob larger than this is kept in memory but never written to the disk cache: the
+    // JSON entry stores it base64 (+33%), is rewritten whole, and is parsed whole on every check.
+    static constexpr size_t kMaxDiskCachedCxxBitcode = 16u * 1024u * 1024u;
+
     static size_t CFileSigEntryRows(const CFileSigCacheEntry& entry)
     {
         return entry.sigs.size() + entry.enums.size() + entry.records.size()
              + entry.macros.size() + entry.funcMacros.size() + entry.globals.size()
-             + entry.recordAliases.size() + entry.typeAliases.size() + entry.deps.size();
+             + entry.recordAliases.size() + entry.typeAliases.size() + entry.deps.size()
+             + entry.cxxBitcode.size() / kCFileSigBitcodeBytesPerRow;
     }
     // Retention follows the SOURCE (maintainer ruling 2026-09-05): every
     // analysed root .cb records the header keys its analysis touched (its own imports and its
@@ -4739,6 +4834,33 @@ private:
     // landing pads or personality routine - the unwinder would run off the top of the CFlat
     // frame. Refuse to bind such a function, whether by call or by function pointer.
     void RejectThrowingCxxFunction(const FunctionSymbol& symbol, const std::string& displayName) const;
+    static std::string SqueezeCxxSpelling(const std::string& spelling);
+    std::string BuildCxxRequestPrologue(const std::string& cxxSpelling) const;
+    std::string BuildCxxRequestOdrUses(const cflat_cinterop::RawRecord& rec) const;
+    bool RunCxxTypeRequest(const std::string& cflatName, const std::string& cxxSpelling,
+                           const std::string& extraSource, bool emitDefinitions,
+                           cflat_cinterop::ExtractResult& raw, std::string& error);
+    // Cache identity of one C++ type request; see the definition for what it folds in.
+    std::string CxxTypeRequestCacheKey(const std::string& cxxSpelling) const;
+
+    bool RequestCxxForeignType(const std::string& cflatName, const std::string& cxxSpelling,
+                               std::string& error);
+    bool RequestCxxType(const std::string& baseName, const std::vector<std::string>& typeArgs,
+                        const std::string& cflatName, std::string& error);
+    bool CxxSpellingForCflatType(const std::string& cflatType, std::string& out) const;
+    /*
+     * Gate + request in one call, for both ParseDeclarationSpecifiers copies. Returns true when the
+     * CFlat name now denotes a registered foreign C++ type. Returns false with `error` EMPTY when
+     * there was nothing to try (no C++ import group, not a dotted name, a CFlat generic or
+     * interface template, an already-known type); false with `error` set when the request itself
+     * failed and the caller should report it.
+     */
+    bool TryRequestCxxType(const std::string& baseName, const std::vector<std::string>& typeArgs,
+                           const std::string& cflatName, std::string& error);
+    bool IsCxxForeignTypeRegistered(const std::string& cflatName) const;
+    // True once any `import cpp` header has been bound in this analysis: the only situation in
+    // which an unknown dotted type name is worth resolving as a C++ type.
+    bool HasCxxImportGroup() const { return !cxxImportHeaders_.empty(); }
 
     // Prototype boundary for the C++ path: primitives and bare pointers only. A record passed
     // or returned BY VALUE needs the aggregate ABI arrangement, which this prototype does not
@@ -4836,6 +4958,10 @@ private:
 
     bool MapCTypeToTypeAndValue(std::string ctype, TypeAndValue& out);
 
+    // Foreign C++ specialization lookup on the INTACT spelling; see the definition for why the
+    // general '*'/qualifier stripping must not run first.
+    bool TryMapCxxForeignSpelling(const std::string& ctype, TypeAndValue& out, bool& mapped) const;
+
     bool ParseCFunctionPointerSpelling(const std::string& s, TypeAndValue& out,
                                        std::unordered_set<std::string>& visited);
 
@@ -4860,6 +4986,10 @@ private:
 
     void RegisterCSignatures(const std::vector<CSigEntry>& sigs, const std::string& fileForLsp,
                              const std::string& programAlias = "");
+
+    // Triple of the target this compile has chosen; the extraction parse and the companion
+    // module must both agree with it.
+    std::string CInteropTargetTriple() const;
 
     std::vector<std::string> BuildClangDriverArgs(const std::string& headerDir,
                                                const std::vector<std::string>& extraDefines,
@@ -4927,7 +5057,8 @@ private:
                              std::vector<std::string>* outIncludes = nullptr,
                              bool* outPrereqFailure = nullptr,
                              std::string* outPrereqMsg = nullptr,
-                             bool cxxMode = false);
+                             bool cxxMode = false,
+                             std::string* outCxxBitcode = nullptr);
 
     // Extract externally-linkable functions a .c file DEFINES, via the clang C++ API. Records
     // are registered up front (struct-by-value). Used by the .c auto-extern path.
@@ -8516,6 +8647,7 @@ public:
     // When true, headers opted into the disk cache (via the `cache` import clause) record and
     // validate every transitively-included file's mtime/hash rather than just the top header.
     void SetCHeaderCacheDeep(bool v);
+    void SetCppAssumeNoexcept(bool v);
     void SetWindowsSubsystem(const std::string& v);
 
     const std::vector<std::string>& GetDependencyFiles() const { return dependencyFiles_; }
@@ -8612,7 +8744,8 @@ public:
                                         const std::vector<std::string>& includeDirs,
                                         const std::vector<std::string>& defines,
                                         const std::vector<std::string>& extraDefines,
-                                        bool cxxMode = false);
+                                        bool cxxMode = false,
+                                        bool cxxDefinitionsEmitted = false);
 
     // Read-only adapter exposing the nlohmann subset the *FromJson converters use, backed by a
     // simdjson DOM element. Keeps converter bodies unchanged while parsing with simdjson.

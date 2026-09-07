@@ -1,0 +1,12 @@
+// A specialization binds the member surface clang reported for it and nothing else: a name that
+// is not one of them is an ordinary unknown-member error, not a silent no-op.
+import cpp "vector";
+
+expect_error("Unknown identifier 'no_such_member'") {
+    extern int main()
+    {
+        std.vector<int> v = default;
+        v.no_such_member();
+        return 0;
+    }
+}

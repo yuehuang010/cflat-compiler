@@ -80,6 +80,25 @@ namespace cpppoly
     int read_right(const Right* p) noexcept;
     int call_right(const Right* p) noexcept;
 
+    // M6b - class names that CONTAIN a declarator keyword as a substring ("const" inside
+    // "constant", "class" inside "classBase"). Stripping the keyword as a substring loses the
+    // class identity, the parameter decays to void*, and the base adjustment silently vanishes.
+    // Both are NON-PRIMARY bases of QualNames, so reading their fields proves it happened.
+    struct constant { int cv; };
+    struct classBase { int bv; };
+
+    struct QualNames : Left, constant, classBase
+    {
+        QualNames() noexcept;
+        ~QualNames() noexcept override;
+        int l() const noexcept override;
+    };
+
+    int read_constant(const constant* p) noexcept;
+    int read_class_base(const classBase* p) noexcept;
+    QualNames* make_qual() noexcept;
+    void destroy_qual(QualNames* p) noexcept;
+
     class Abstract
     {
     public:

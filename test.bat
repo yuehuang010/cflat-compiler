@@ -51,8 +51,15 @@ if "%~1"=="--worker-cb" (
     if not defined CFLAT_OUT set CFLAT_OUT=out
     set OUT=%CFLAT_OUT%
     if not defined CFLAT_PLATFORM_FLAG set CFLAT_PLATFORM_FLAG=
+    REM Per-test compiler flags: a test whose FIRST line is `// cflat-args: <flags>` is
+    REM compiled with those flags appended (test.sh has the same convention). Used by
+    REM test_c_interop.cb for --cpp-assume-noexcept.
+    set CB_ARGS=
+    REM /n numbers the matches; the ":1:" filter keeps LINE 1 only, so a mid-file mention of the
+    REM marker cannot add flags on Windows that test.sh (head -n 1) would never see.
+    for /f "usebackq tokens=1,2,* delims=:" %%A in (`findstr /n /b /c:"// cflat-args:" !SRC!\!NAME!.cb ^| findstr /b /c:"1:"`) do set CB_ARGS=%%C
     set T0=!TIME!
-    !COMPILER! !SRC!\!NAME!.cb -i !LIB! --locale-dir "!CFLAT_LOCALE_DIR!" -o !OUT!\!NAME!.exe --nologo --out-lli !OUT!\!NAME!.ll !CFLAT_PLATFORM_FLAG! !CFLAT_EXTRA! > "!OUT!\results\!NAME!.log" 2>&1
+    !COMPILER! !SRC!\!NAME!.cb -i !LIB! --locale-dir "!CFLAT_LOCALE_DIR!" -o !OUT!\!NAME!.exe --nologo --out-lli !OUT!\!NAME!.ll !CFLAT_PLATFORM_FLAG! !CB_ARGS! !CFLAT_EXTRA! > "!OUT!\results\!NAME!.log" 2>&1
     if !ERRORLEVEL! neq 0 (
         echo FAILED: !NAME! - compiler error>"!OUT!\results\!NAME!.result"
         exit /b

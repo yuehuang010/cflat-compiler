@@ -12312,6 +12312,7 @@ LLVMBackend::NamedVariable MainListener::ParseNewExpression(CFlatParser::NewExpr
                     auto nv = ParseAssignmentExpressionNamed(argAssign);
                     ctorArgs.push_back(LoadNamedVariable(nv));
                     ctorArgTypes.push_back(nv.TypeAndValue);
+                    TypeUntypedCtorArg(ctorArgTypes.back(), ctorArgs.back());
                 }
             std::string why;
             const auto* ctor = compiler->SelectCxxConstructor(typeName, ctorArgTypes, why);
@@ -14677,7 +14678,8 @@ std::string MainListener::NextMemberName(CFlatParser::PostfixExpressionContext* 
             if (next->getTreeType() != antlr4::tree::ParseTreeType::TERMINAL) return "";
             auto* term = dynamic_cast<antlr4::tree::TerminalNode*>(next);
             auto tok = term->getSymbol()->getType();
-            if (tok == CFlatParser::Identifier || tok == CFlatParser::Move)
+            if (tok == CFlatParser::Identifier || tok == CFlatParser::Move
+                || tok == CFlatParser::String)
                 return term->getText();
             return "";
         }
