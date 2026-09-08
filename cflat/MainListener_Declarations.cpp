@@ -8507,5 +8507,26 @@ void MainListener::TypeUntypedCtorArg(LLVMBackend::TypeAndValue& argType, llvm::
     }
     if (auto* c = llvm::dyn_cast_or_null<llvm::Constant>(argValue);
         c != nullptr && Compiler()->IsStringLiteralConstant(c))
-    { argType.TypeName = "char"; argType.Pointer = true; }
+    { argType.TypeName = "char"; argType.Pointer = true; return; }
+    // An integer literal: name it by width so overload selection can prefer the exact
+    // constructor (`format_int(42)` picks int over unsigned and long long).
+    if (argValue != nullptr && argValue->getType()->isIntegerTy())
+    {
+        // An untyped literal is carried at its narrowest width (42 is an i8) and widened at
+        // the use; it means `int` like in C, or i64 when it does not fit.
+        if (llvm::isa<llvm::ConstantInt>(argValue))
+        {
+            argType.TypeName = argValue->getType()->getIntegerBitWidth() > 32 ? "i64" : "int";
+            return;
+        }
+        switch (argValue->getType()->getIntegerBitWidth())
+        {
+            case 1:  argType.TypeName = "bool";  break;
+            case 8:  argType.TypeName = "char";  break;
+            case 16: argType.TypeName = "short"; break;
+            case 32: argType.TypeName = "int";   break;
+            case 64: argType.TypeName = "i64";   break;
+            default: break;
+        }
+    }
 }

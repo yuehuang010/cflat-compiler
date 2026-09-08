@@ -2262,7 +2262,8 @@ bool LLVMBackend::TryLoadCHeaderDiskCache(
         // v28 carries the long-double width, format, and target triple from the clang invocation.
         // v34 records a failed generated default wrapper as an unsupported default argument, so
         // a warm cache cannot re-declare a wrapper whose definition CodeGen dropped.
-        if (version != 34) return false;
+        // v35 stops recording an unnamed enum's placeholder spelling as an enumerator type.
+        if (version != 35) return false;
 
         // Accept on mtime match (fast) or content hash match (authoritative on mtime drift).
         auto storedMtime = j.value("mtime", int64_t{-1});
@@ -2351,7 +2352,7 @@ void LLVMBackend::WriteCHeaderDiskCache(
         if (ec) return;
 
         nlohmann::json j;
-        j["version"] = 34;
+        j["version"] = 35;
         j["mtime"]   = (int64_t)mtime.time_since_epoch().count();
         j["hash"]    = contentHash;
         j["ldw"]     = entry.longDoubleWidth;

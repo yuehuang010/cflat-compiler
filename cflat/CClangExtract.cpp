@@ -683,7 +683,9 @@ namespace cflat_cinterop
                 const auto* ed = llvm::dyn_cast<EnumDecl>(ec->getDeclContext());
                 if (st.req.cxxMode)
                 {
-                    if (ed != nullptr)
+                    // An unnamed enum ("enum { value = 1 };" inside a class) has no spellable
+                    // type; its enumerators publish as plain integer constants instead.
+                    if (ed != nullptr && IsValidDottedName(CxxQualifiedName(ed)))
                     {
                         e.enumType = CxxQualifiedName(ed);
                         e.underlyingType = CanonicalSpelling(ctx, ed->getIntegerType());

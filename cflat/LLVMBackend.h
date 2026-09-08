@@ -3152,6 +3152,9 @@ private:
     std::unordered_map<std::string, std::string> cxxForeignTypeSpellings_;
     // CFlat name -> the C++ source spelling it was requested with, for nested template arguments.
     std::unordered_map<std::string, std::string> cxxCflatToCxxSpelling_;
+    // A C++ alias of a specialization CFlat cannot spell itself (`using json = basic_json<>;`):
+    // alias name -> the C++ spelling, requested under the alias's own name on first use.
+    std::unordered_map<std::string, std::string> cxxLazyAliasSpecializations_;
     /*
      * While non-null, a C++ external declaration whose lowering does not match clang's own
      * arrangement is DROPPED and the reason written here instead of raising a compile error. The

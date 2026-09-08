@@ -4429,6 +4429,7 @@ void LLVMBackend::ResetForReanalysis()
     cxxForeignTypeSpellings_.clear();
     cxxFunctionPointerAbiPlans_.clear();
     cxxCflatToCxxSpelling_.clear();
+    cxxLazyAliasSpecializations_.clear();
     cxxForeignRequests_.clear();
     cxxForeignDefinitions_.clear();
     // Per-analysis emitted IR: the next analysis re-adopts whatever its own imports produce (from

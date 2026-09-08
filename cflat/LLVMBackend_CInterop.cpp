@@ -1129,7 +1129,7 @@ bool LLVMBackend::MapCTypeToTypeAndValueImpl(std::string ctype, TypeAndValue& ou
             auto it = scalarMap.find(base);
             if (it != scalarMap.end())
                 mapped = it->second;
-            else if (base == "std::nullptr_t" || base == "std::__1::nullptr_t" || base == "nullptr_t")
+            else if (base == "std.nullptr_t" || base == "std.__1.nullptr_t" || base == "nullptr_t")
             {
                 mapped = "void";
                 if (ptr == 0) ptr = 1;
@@ -2153,6 +2153,21 @@ void LLVMBackend::RegisterTypeAliasSymbols(const std::vector<CTypeAliasEntry>& a
         };
         for (const auto& a : aliases)
         {
+            // An alias of a specialization whose arguments have no CFlat spelling (defaulted or
+            // library-internal) is requested lazily by its C++ spelling, under the alias's name.
+            if (!a.cxxSpecialization.empty() && !a.qualifiedName.empty() && !a.isCxxAliasTemplate)
+            {
+                std::string base, identity;
+                std::vector<std::string> args;
+                if (!cxxIdentity(a, base, args, identity))
+                {
+                    cxxLazyAliasSpecializations_.emplace(a.qualifiedName, a.cxxSpecialization);
+                    if (a.name != a.qualifiedName)
+                        cxxLazyAliasSpecializations_.emplace(a.name, a.cxxSpecialization);
+                    RegisterTypeAliasSymbol(a.qualifiedName, a.cxxSpecialization, a.file, a.line, a.col);
+                    continue;
+                }
+            }
             if (!a.target.empty() && a.target != a.name)
             {
                 cTypedefMap_.emplace(a.name, a.target);
@@ -3661,6 +3676,17 @@ bool LLVMBackend::TryRequestCxxType(const std::string& baseName,
         if (!HasCxxImportGroup()) return false;
         if (baseName.find('.') == std::string::npos) return false;
         if (IsCxxForeignTypeRegistered(cflatName)) return true;
+        if (typeArgs.empty())
+            if (auto lazy = cxxLazyAliasSpecializations_.find(baseName);
+                lazy != cxxLazyAliasSpecializations_.end())
+            {
+                const std::string& spelling = lazy->second;
+                if (activeCxxRequestGroup_ != nullptr)
+                    return RequestCxxForeignType(baseName, spelling, error);
+                std::string cxxBase = spelling.substr(0, spelling.find('<'));
+                while (!cxxBase.empty() && std::isspace((unsigned char)cxxBase.back())) cxxBase.pop_back();
+                return RequestCxxTypeInOwningGroup(cxxBase, baseName, spelling, {}, error);
+            }
         // A CFlat generic or generic interface owns its own instantiation path and its own
         // mangling; the two identities never mix (`list<std.vector<int>>` is a CFlat instantiation
         // whose element happens to be foreign).
@@ -4792,6 +4818,9 @@ void LLVMBackend::RegisterCxxClassMembers(const CRecordEntry& r, const std::stri
             }
 
             auto refuse = [&](const std::string& why) {
+                if (verbose)
+                    std::cout << std::format("[verbose]   C++ member {}.{} not bound: {}\n",
+                                             r.name, m.name, why);
                 if (!isStructor && info.refusedMembers.count(cflatName) == 0)
                     info.refusedMembers[cflatName] = why;
             };
@@ -6534,6 +6563,7 @@ const LLVMBackend::CxxClassInfo::Structor* LLVMBackend::SelectCxxConstructor(
                 && a.IsMove == b.IsMove && a.IsRvalueRef == b.IsRvalueRef;
         };
         size_t foundOmitted = 0;
+        size_t foundExact = 0;
         for (const auto& c : info->constructors)
         {
             // Fewer arguments than parameters is fine when every omitted one has a constant
@@ -6543,10 +6573,12 @@ const LLVMBackend::CxxClassInfo::Structor* LLVMBackend::SelectCxxConstructor(
             if (omitted != 0 && !CxxConstantDefaultsFrom(c, argTypes.size() + 1)) continue;
             ++candidates;
             bool ok = true;
+            size_t exact = 0;
             for (size_t i = 0; i < argTypes.size(); ++i)
             {
                 const auto& want = c.params[i + 1];
                 const auto& got = argTypes[i];
+                if (want.TypeName == got.TypeName && want.Pointer == got.Pointer) ++exact;
                 if (got.TypeName == "__closure_fat_ptr" && want.IsFunctionPointer
                     && want.IsThinFnPtr())
                 {
@@ -6563,11 +6595,25 @@ const LLVMBackend::CxxClassInfo::Structor* LLVMBackend::SelectCxxConstructor(
                 if (!copyRef && !compatible(want, got)) { ok = false; break; }
             }
             if (!ok) continue;
+            if (verbose)
+            {
+                std::string shape;
+                for (size_t i = 1; i < c.params.size(); ++i)
+                    shape += (i > 1 ? ", " : "") + c.params[i].TypeName + (c.params[i].Pointer ? "*" : "");
+                std::string got;
+                for (const auto& a : argTypes) got += (got.empty() ? "" : ", ") + a.TypeName + (a.Pointer ? "*" : "");
+                std::cout << std::format("[verbose]   ctor candidate {}({}) for ({}): exact={} omitted={}\n",
+                                         typeName, shape, got, exact, omitted);
+            }
             if (found != nullptr)
             {
-                // An exact-arity overload beats one that fills defaults in, like C++ does.
+                // An exact-arity overload beats one that fills defaults in, like C++ does, and
+                // more exactly-typed parameters beat same-family conversions (`format_int(42)`
+                // picks the int constructor over unsigned and long long).
                 if (omitted > foundOmitted) continue;
-                if (omitted < foundOmitted) { found = &c; foundOmitted = omitted; continue; }
+                if (omitted < foundOmitted) { found = &c; foundOmitted = omitted; foundExact = exact; continue; }
+                if (exact < foundExact) continue;
+                if (exact > foundExact) { found = &c; foundExact = exact; continue; }
                 bool sameShape = c.params.size() == found->params.size();
                 for (size_t i = 0; sameShape && i < c.params.size(); ++i)
                     sameShape = sameBoundaryType(c.params[i], found->params[i]);
@@ -6577,6 +6623,7 @@ const LLVMBackend::CxxClassInfo::Structor* LLVMBackend::SelectCxxConstructor(
             }
             found = &c;
             foundOmitted = omitted;
+            foundExact = exact;
         }
         if (found != nullptr) return found;
         if (candidates == 0)

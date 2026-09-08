@@ -1328,6 +1328,16 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             }
                             else
                             {
+                                // A C++ alias not yet requested (`nlohmann.json.parse(...)`):
+                                // bring the specialization in under its alias name first.
+                                if (!isFileAlias && !Compiler(ctx)->IsDataStructure(qualifiedName)
+                                    && Compiler(ctx)->HasCxxImportGroup()
+                                    && IsFollowedByDot(ctx, terminal))
+                                {
+                                    std::string cxxError;
+                                    Compiler(ctx)->TryRequestCxxType(qualifiedName, {}, qualifiedName, cxxError);
+                                    if (!cxxError.empty()) LogErrorContext(ctx, cxxError);
+                                }
                                 if (!isFileAlias && Compiler(ctx)->IsDataStructure(qualifiedName)
                                     && Compiler(ctx)->GetLocalVariable(memberName).Storage == nullptr
                                     && Compiler(ctx)->GetFunctionArgument(memberName).GetValue() == nullptr)
