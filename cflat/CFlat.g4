@@ -103,8 +103,8 @@ argumentExpressionList
 
 argumentNamedExpression
     : (Identifier ':')? assignmentExpression
-    | Identifier ':' '{' initializerList ','? '}'
-    | '{' initializerList ','? '}'
+    | Identifier ':' '{' initializerList? ','? '}'
+    | '{' initializerList? ','? '}'
     | '...'
     ;
 

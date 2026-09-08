@@ -1202,6 +1202,17 @@ void LLVMBackend::RegisterCSignatures(const std::vector<CSigEntry>& sigs, const 
         std::unordered_map<std::string, std::string> stdFunctionClasses;
         for (const CSigEntry& e : sigs)
         {
+            if (e.isCxx)
+            {
+                auto& rawEntries = cxxFunctionSignatures_[e.name];
+                const bool duplicate = std::any_of(rawEntries.begin(), rawEntries.end(), [&](const auto& old) {
+                    return old.linkageName == e.linkageName && old.paramSpellings == e.paramSpellings
+                        && old.retSpelling == e.retSpelling;
+                });
+                if (!duplicate) rawEntries.push_back(e);
+                if (activeCxxRequestGroup_ != nullptr)
+                    cxxFunctionOwnerGroup_.emplace(e.name, activeCxxRequestGroup_->primary);
+            }
             if (!e.bindRefusal.empty())
             {
                 cxxBindingRefusals_[e.name] = e.bindRefusal;
@@ -3272,10 +3283,314 @@ bool LLVMBackend::HasCxxFunctionTemplateMember(const std::string& owner,
         return !ResolveCxxFunctionTemplateName(owner, memberName).empty();
 }
 
+static std::string FirstCxxErrorLine(const std::string& text)
+{
+        size_t start = 0;
+        while (start < text.size())
+        {
+            size_t end = text.find('\n', start);
+            if (end == std::string::npos) end = text.size();
+            std::string line = text.substr(start, end - start);
+            if (!line.empty() && line.back() == '\r') line.pop_back();
+            if (!line.empty()) return line;
+            start = end == text.size() ? end : end + 1;
+        }
+        return text;
+}
+
+static std::string TrimCxxBraceType(std::string text)
+{
+        while (!text.empty() && std::isspace((unsigned char)text.front())) text.erase(text.begin());
+        while (!text.empty() && std::isspace((unsigned char)text.back())) text.pop_back();
+        for (;;)
+        {
+            bool changed = false;
+            for (const char* prefix : { "const ", "volatile ", "class ", "struct " })
+                if (text.starts_with(prefix))
+                {
+                    text.erase(0, std::strlen(prefix));
+                    changed = true;
+                    break;
+                }
+            if (!changed) break;
+        }
+        return text;
+}
+
+static std::string CxxBraceTargetElementSpelling(const std::string& parameter)
+{
+        std::string type = TrimCxxBraceType(parameter);
+        while (!type.empty() && (type.back() == '&' || type.back() == '*'))
+        {
+            type.pop_back();
+            while (!type.empty() && std::isspace((unsigned char)type.back())) type.pop_back();
+        }
+        const size_t open = type.find('<');
+        if (open == std::string::npos) return {};
+        const std::string base = type.substr(0, open);
+        if (base.find("initializer_list") == std::string::npos
+            && base.find("ArrayRef") == std::string::npos)
+            return {};
+        int depth = 0;
+        size_t close = std::string::npos;
+        for (size_t i = open; i < type.size(); ++i)
+        {
+            if (type[i] == '<') ++depth;
+            else if (type[i] == '>' && --depth == 0) { close = i; break; }
+        }
+        if (close == std::string::npos || close != type.size() - 1) return {};
+        std::string element = TrimCxxBraceType(type.substr(open + 1, close - open - 1));
+        if (element.empty() || element.find('<') != std::string::npos
+            || element.find('>') != std::string::npos)
+            return {};
+        return element;
+}
+
+std::string LLVMBackend::CxxBraceElementSpelling(const CxxBraceArgument& brace,
+                                                 const std::string& targetParameter) const
+{
+        std::string target = CxxBraceTargetElementSpelling(targetParameter);
+        if (!target.empty()) return target;
+        auto cflatTypeOf = [&](const NamedVariable& arg) {
+            std::string type = arg.TypeAndValue.TypeName;
+            bool pointer = arg.TypeAndValue.Pointer;
+            llvm::Type* valueType = arg.Primary != nullptr ? arg.Primary->getType() : arg.BaseType;
+            if (type.empty())
+            {
+                if (auto* constant = llvm::dyn_cast_or_null<llvm::Constant>(arg.Primary);
+                    constant != nullptr && IsStringLiteralConstant(constant))
+                {
+                    type = "char";
+                    pointer = true;
+                }
+                else if (valueType != nullptr && valueType->isFloatTy()) type = "float";
+                else if (valueType != nullptr && valueType->isDoubleTy()) type = "double";
+                else if (valueType != nullptr && valueType->isIntegerTy())
+                {
+                    const unsigned bits = valueType->getIntegerBitWidth();
+                    type = llvm::dyn_cast_or_null<llvm::ConstantInt>(arg.Primary) != nullptr
+                        ? (bits > 32 ? "i64" : "int")
+                        : (bits == 1 ? "bool" : bits <= 8 ? "i8" : bits <= 16 ? "short"
+                           : bits <= 32 ? "int" : "i64");
+                }
+                else if (auto* st = llvm::dyn_cast_or_null<llvm::StructType>(valueType))
+                    type = st->getName().str();
+                if (type.empty()) type = arg.InferSourceTypeName;
+            }
+            if (pointer)
+            {
+                type += "*";
+                if (arg.TypeAndValue.ElemPointer) type += "*";
+            }
+            return type;
+        };
+        std::string spelling;
+        for (const auto& element : brace.elements)
+        {
+            std::string cflatType = cflatTypeOf(element);
+            if (cflatType.empty()) return {};
+            if (!element.TypeAndValue.Pointer
+                && (dataStructures.count(element.TypeAndValue.TypeName) != 0
+                    || element.TypeAndValue.TypeName == "string"))
+                return {};
+            std::string one;
+            const bool stringLiteral = [&] {
+                auto* constant = llvm::dyn_cast_or_null<llvm::Constant>(element.Primary);
+                return constant != nullptr && IsStringLiteralConstant(constant);
+            }();
+            if ((element.TypeAndValue.TypeName == "char"
+                    && element.TypeAndValue.Pointer && element.IsRvalue)
+                || stringLiteral)
+                one = "const char *";
+            else if (brace.allIntegerLiterals && !element.TypeAndValue.Pointer)
+                one = "long";
+            else if (!CxxSpellingForCflatType(cflatType, one))
+                return {};
+            if (spelling.empty()) spelling = one;
+            else if (spelling != one) return {};
+        }
+        return spelling;
+}
+
+void LLVMBackend::ExpandCxxBraceArguments(
+        std::vector<NamedVariable>& arguments,
+        const std::vector<CxxBraceArgument>& braceArguments)
+{
+        std::vector<size_t> order;
+        order.reserve(braceArguments.size());
+        for (size_t i = 0; i < braceArguments.size(); ++i) order.push_back(i);
+        std::sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+            return braceArguments[a].argumentIndex > braceArguments[b].argumentIndex;
+        });
+        for (size_t n : order)
+        {
+            const auto& brace = braceArguments[n];
+            if (brace.argumentIndex >= arguments.size()) continue;
+            auto at = arguments.begin() + brace.argumentIndex;
+            at = arguments.erase(at);
+            arguments.insert(at, brace.elements.begin(), brace.elements.end());
+        }
+}
+
+void LLVMBackend::DiscardCxxBraceArguments(
+        std::vector<NamedVariable>& arguments,
+        const std::vector<CxxBraceArgument>& braceArguments)
+{
+        std::vector<size_t> order;
+        order.reserve(braceArguments.size());
+        for (size_t i = 0; i < braceArguments.size(); ++i) order.push_back(i);
+        std::sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+            return braceArguments[a].argumentIndex > braceArguments[b].argumentIndex;
+        });
+        for (size_t n : order)
+            if (braceArguments[n].argumentIndex < arguments.size())
+                arguments.erase(arguments.begin() + braceArguments[n].argumentIndex);
+}
+
+bool LLVMBackend::RequestGeneratedCxxWrapper(const CxxRequestGroup& group,
+                                             const std::string& wrapperSource,
+                                             const std::string& wrapperName,
+                                             const std::string& cacheTag,
+                                             CSigEntry& signature,
+                                             std::string& error)
+{
+        error.clear();
+        const bool emitDefinitions = symbolSink_ == nullptr;
+        std::vector<CSigEntry> requestSigs;
+        std::string requestBitcode;
+        bool cached = false;
+        std::filesystem::file_time_type headerMtime{};
+        const bool haveMtime = CxxGroupHeaderStamp(group, headerMtime);
+        const std::string requestKey = CxxTypeRequestCacheKey(group, wrapperSource)
+            + "|" + cacheTag + "|FULL";
+        if (haveMtime)
+        {
+            std::lock_guard<std::mutex> lock(cFileSigCacheMutex_);
+            auto it = cFileSigCache_.find(requestKey);
+            if (it != cFileSigCache_.end()
+                && (it->second.mtime == headerMtime || it->second.hash == CxxGroupHeaderHash(group)))
+            {
+                it->second.mtime = headerMtime;
+                TouchCFileSigEntry(requestKey, it->second);
+                requestSigs = it->second.sigs;
+                requestBitcode = it->second.cxxBitcode;
+                SetCInteropTargetFacts(it->second.longDoubleWidth,
+                                       it->second.longDoubleIsIEEEDouble, it->second.targetTriple);
+                cached = true;
+            }
+        }
+        if (!cached)
+        {
+            auto runRequest = [&](bool emit, cflat_cinterop::ExtractResult& out,
+                                  std::string& runError) {
+                cflat_cinterop::ExtractRequest req;
+                req.mainFileName = (std::filesystem::absolute("scratch")
+                                    / (wrapperName + ".cpp")).string();
+                req.source = BuildCxxRequestPrologue(group, {}, false) + wrapperSource;
+                req.cxxMode = true;
+                req.emitDefinitions = emit;
+                req.assumeInlineDefinitions = !emit;
+                req.skipFunctionBodies = false;
+                req.requireInScope = false;
+                req.cxxFunctionWrapperNames = { wrapperName };
+                std::string primaryDir;
+                for (const auto& h : group.headers)
+                    if (!IsSystemCxxHeaderPath(h))
+                    { primaryDir = std::filesystem::path(h).parent_path().string(); break; }
+                req.args = BuildClangDriverArgs(primaryDir, group.defines, true, true);
+                return cflat_cinterop::ExtractCInterop(req, out, runError);
+            };
+            cflat_cinterop::ExtractResult probe;
+            std::string probeError;
+            if (!runRequest(false, probe, probeError))
+            {
+                error = FirstCxxErrorLine(probeError);
+                return false;
+            }
+            auto findWrapper = [&](const cflat_cinterop::ExtractResult& raw)
+                -> const cflat_cinterop::RawSig* {
+                for (const auto& sig : raw.sigs)
+                    if (sig.name == wrapperName || sig.linkageName == wrapperName) return &sig;
+                return nullptr;
+            };
+            const auto* probeSig = findWrapper(probe);
+            if (probeSig == nullptr || !probeSig->abi.valid || !probeSig->bindRefusal.empty()
+                || !probe.firstError.empty())
+            {
+                error = FirstCxxErrorLine(probe.firstError.empty() ? probeError : probe.firstError);
+                return false;
+            }
+            if (!RequestCxxSignatureTypes(*probeSig))
+            {
+                error = "the generated wrapper's return or parameter type is not supported by C++ interop";
+                return false;
+            }
+
+            cflat_cinterop::ExtractResult raw = std::move(probe);
+            if (emitDefinitions)
+            {
+                cflat_cinterop::ExtractResult emitted;
+                std::string emittedError;
+                if (!runRequest(true, emitted, emittedError))
+                {
+                    error = FirstCxxErrorLine(emittedError);
+                    return false;
+                }
+                const auto* emittedSig = findWrapper(emitted);
+                if (emittedSig == nullptr || emitted.bitcode.empty())
+                {
+                    error = FirstCxxErrorLine(emitted.firstError.empty()
+                        ? emittedError : emitted.firstError);
+                    return false;
+                }
+                raw = std::move(emitted);
+            }
+            const auto* finalSig = findWrapper(raw);
+            if (finalSig == nullptr || !finalSig->abi.valid)
+            {
+                error = FirstCxxErrorLine(raw.firstError);
+                return false;
+            }
+            CSigEntry mapped;
+            if (!MapRawSig(*finalSig, mapped) || !mapped.bindRefusal.empty())
+            {
+                error = FirstCxxErrorLine(raw.firstError.empty() ? mapped.bindRefusal : raw.firstError);
+                return false;
+            }
+            requestSigs.push_back(std::move(mapped));
+            requestBitcode = raw.bitcode;
+            SetCInteropTargetFacts(raw);
+            if (haveMtime)
+            {
+                CFileSigCacheEntry entry;
+                entry.mtime = headerMtime;
+                entry.hash = CxxGroupHeaderHash(group);
+                entry.longDoubleWidth = raw.longDoubleWidth;
+                entry.longDoubleIsIEEEDouble = raw.longDoubleIsIEEEDouble;
+                entry.targetTriple = raw.targetTriple;
+                entry.sigs = requestSigs;
+                entry.cxxBitcode = requestBitcode;
+                std::lock_guard<std::mutex> lock(cFileSigCacheMutex_);
+                InsertCFileSigEntry(requestKey, std::move(entry), verbose);
+            }
+        }
+        if (requestSigs.size() != 1 || !requestSigs.front().isCxx)
+        {
+            error = "the generated wrapper was not extracted";
+            return false;
+        }
+        if (!emitDefinitions) requestBitcode.clear();
+        RequestCxxSignatureTypes(requestSigs);
+        if (emitDefinitions) AdoptCxxCompanionBitcode(requestBitcode);
+        signature = std::move(requestSigs.front());
+        return true;
+}
+
 bool LLVMBackend::RequestCxxFunctionTemplate(const std::string& functionName,
                                              const std::string& ownerType,
                                              const std::vector<std::string>& explicitArgs,
-                                             const std::vector<NamedVariable>& arguments,
+                                             std::vector<NamedVariable>& arguments,
+                                             const std::vector<CxxBraceArgument>& braceArguments,
                                              std::string& error)
 {
         error.clear();
@@ -3325,6 +3640,42 @@ bool LLVMBackend::RequestCxxFunctionTemplate(const std::string& functionName,
         auto displayTypeOf = [&](const NamedVariable& arg) {
             std::string type = cflatTypeOf(arg);
             return type.empty() ? std::string("<unknown>") : type;
+        };
+        auto braceForArgument = [&](size_t index) -> const CxxBraceArgument* {
+            for (const auto& brace : braceArguments)
+                if (brace.argumentIndex == index) return &brace;
+            return nullptr;
+        };
+        auto braceElementSpelling = [&](const CxxBraceArgument& brace,
+                                        const std::string& targetParameter) {
+            std::string target = CxxBraceTargetElementSpelling(targetParameter);
+            if (!target.empty()) return target;
+            std::string spelling;
+            for (const auto& element : brace.elements)
+            {
+                std::string cflatType = cflatTypeOf(element);
+                if (cflatType.empty()) return std::string();
+                if (!element.TypeAndValue.Pointer
+                    && (dataStructures.count(element.TypeAndValue.TypeName) != 0
+                        || element.TypeAndValue.TypeName == "string"))
+                    return std::string();
+                std::string one;
+                const bool stringLiteral = [&] {
+                    auto* constant = llvm::dyn_cast_or_null<llvm::Constant>(element.Primary);
+                    return constant != nullptr && IsStringLiteralConstant(constant);
+                }();
+                if ((element.TypeAndValue.TypeName == "char"
+                        && element.TypeAndValue.Pointer && element.IsRvalue)
+                    || stringLiteral)
+                    one = "const char *";
+                else if (brace.allIntegerLiterals && !element.TypeAndValue.Pointer)
+                    one = "long";
+                else if (!CxxSpellingForCflatType(cflatType, one))
+                    return std::string();
+                if (spelling.empty()) spelling = one;
+                else if (spelling != one) return std::string();
+            }
+            return spelling;
         };
         std::string argumentDisplay;
         for (size_t i = 0; i < arguments.size(); ++i)
@@ -3382,10 +3733,32 @@ bool LLVMBackend::RequestCxxFunctionTemplate(const std::string& functionName,
             }
             parameterSpellings.push_back(std::move(receiverSpelling));
         }
+        size_t flatParameterIndex = parameterSpellings.size();
         for (size_t i = selected->kind == cflat_cinterop::RawFunctionTemplate::InstanceMember ? 1u : 0u;
              i < arguments.size(); ++i)
         {
             const NamedVariable& arg = arguments[i];
+            if (const auto* brace = braceForArgument(i))
+            {
+                std::string braceType = braceElementSpelling(*brace, {});
+                if (brace->elements.empty())
+                {
+                    callArguments.push_back("{}");
+                    continue;
+                }
+                if (braceType.empty()) return noMatch("brace arguments must contain scalar values of one type");
+                std::string braceCall = "{";
+                for (size_t element = 0; element < brace->elements.size(); ++element)
+                {
+                    if (element != 0) braceCall += ", ";
+                    const std::string parameter = "p" + std::to_string(flatParameterIndex++);
+                    parameterSpellings.push_back(braceType);
+                    braceCall += parameter;
+                }
+                braceCall += "}";
+                callArguments.push_back(std::move(braceCall));
+                continue;
+            }
             std::string cflatType = cflatTypeOf(arg);
             if (cflatType.empty()) return noMatch("an argument type cannot be spelled in C++");
             std::string spelling;
@@ -3402,7 +3775,7 @@ bool LLVMBackend::RequestCxxFunctionTemplate(const std::string& functionName,
                 && arg.Storage != nullptr && !arg.IsRvalue)
                 spelling += " &";
             parameterSpellings.push_back(std::move(spelling));
-            callArguments.push_back("p" + std::to_string(i));
+            callArguments.push_back("p" + std::to_string(flatParameterIndex++));
         }
 
         std::vector<std::string> cxxExplicitArgs;
@@ -3451,6 +3824,13 @@ bool LLVMBackend::RequestCxxFunctionTemplate(const std::string& functionName,
         hashText(std::to_string(selected->kind));
         for (const auto& p : parameterSpellings) hashText(p);
         for (const auto& a : cxxExplicitArgs) hashText(a);
+        for (const auto& brace : braceArguments)
+        {
+            hashText("|brace|");
+            hashText(std::to_string(brace.parameterIndex));
+            hashText(std::to_string(brace.elements.size()));
+            hashText(braceElementSpelling(brace, {}));
+        }
         const std::string wrapperName = std::format("__cflat_tpl_{:016x}", hash);
         std::string wrapperSource = "extern \"C\" auto " + wrapperName + "(";
         for (size_t i = 0; i < parameterSpellings.size(); ++i)
@@ -3469,111 +3849,14 @@ bool LLVMBackend::RequestCxxFunctionTemplate(const std::string& functionName,
         if (group.headers.empty()) return noMatch("the template's import group is unavailable");
         CxxRequestGroupScope groupScope(*this, &group);
 
-        const std::string requestKey = CxxTypeRequestCacheKey(group, wrapperSource) + "|TPL|FULL";
-        const bool emitDefinitions = symbolSink_ == nullptr;
-        std::vector<CSigEntry> requestSigs;
-        std::string requestBitcode;
-        bool cached = false;
-        std::filesystem::file_time_type headerMtime{};
-        const bool haveMtime = CxxGroupHeaderStamp(group, headerMtime);
-        if (haveMtime)
-        {
-            std::lock_guard<std::mutex> lock(cFileSigCacheMutex_);
-            auto it = cFileSigCache_.find(requestKey);
-            if (it != cFileSigCache_.end()
-                && (it->second.mtime == headerMtime || it->second.hash == CxxGroupHeaderHash(group)))
-            {
-                it->second.mtime = headerMtime;
-                TouchCFileSigEntry(requestKey, it->second);
-                requestSigs = it->second.sigs;
-                requestBitcode = it->second.cxxBitcode;
-                SetCInteropTargetFacts(it->second.longDoubleWidth,
-                                       it->second.longDoubleIsIEEEDouble, it->second.targetTriple);
-                cached = true;
-            }
-        }
-        if (!cached)
-        {
-            auto runRequest = [&](bool emit, cflat_cinterop::ExtractResult& out,
-                                  std::string& runError) {
-                cflat_cinterop::ExtractRequest req;
-                req.mainFileName = (std::filesystem::absolute("scratch")
-                                    / (wrapperName + ".cpp")).string();
-                req.source = BuildCxxRequestPrologue(group, {}, false) + wrapperSource;
-                req.cxxMode = true;
-                req.emitDefinitions = emit;
-                req.assumeInlineDefinitions = !emit;
-                req.skipFunctionBodies = false;
-                req.requireInScope = false;
-                req.cxxFunctionWrapperNames = { wrapperName };
-                std::string primaryDir;
-                for (const auto& h : group.headers)
-                    if (!IsSystemCxxHeaderPath(h))
-                    { primaryDir = std::filesystem::path(h).parent_path().string(); break; }
-                req.args = BuildClangDriverArgs(primaryDir, group.defines, true, true);
-                return cflat_cinterop::ExtractCInterop(req, out, runError);
-            };
-            cflat_cinterop::ExtractResult probe;
-            std::string probeError;
-            if (!runRequest(false, probe, probeError))
-                return noMatch(probeError);
-            auto findWrapper = [&](const cflat_cinterop::ExtractResult& raw)
-                -> const cflat_cinterop::RawSig* {
-                for (const auto& sig : raw.sigs)
-                    if (sig.name == wrapperName || sig.linkageName == wrapperName) return &sig;
-                return nullptr;
-            };
-            const auto* probeSig = findWrapper(probe);
-            if (probeSig == nullptr || !probeSig->abi.valid || !probeSig->bindRefusal.empty()
-                || !probe.firstError.empty())
-                return noMatch(probe.firstError.empty() ? probeError : probe.firstError);
-            if (!RequestCxxSignatureTypes(*probeSig))
-                return noMatch("the deduced return type is not supported by C++ interop");
-
-            cflat_cinterop::ExtractResult raw = std::move(probe);
-            if (emitDefinitions)
-            {
-                cflat_cinterop::ExtractResult emitted;
-                std::string emittedError;
-                if (!runRequest(true, emitted, emittedError))
-                    return noMatch(emittedError);
-                const auto* emittedSig = findWrapper(emitted);
-                if (emittedSig == nullptr || emitted.bitcode.empty())
-                    return noMatch(emitted.firstError.empty() ? emittedError : emitted.firstError);
-                raw = std::move(emitted);
-            }
-            const auto* finalSig = findWrapper(raw);
-            if (finalSig == nullptr || !finalSig->abi.valid)
-                return noMatch(raw.firstError);
-            CSigEntry mapped;
-            if (!MapRawSig(*finalSig, mapped) || !mapped.bindRefusal.empty())
-                return noMatch(raw.firstError.empty() ? mapped.bindRefusal : raw.firstError);
-            requestSigs.push_back(std::move(mapped));
-            requestBitcode = raw.bitcode;
-            SetCInteropTargetFacts(raw);
-            if (haveMtime)
-            {
-                CFileSigCacheEntry entry;
-                entry.mtime = headerMtime;
-                entry.hash = CxxGroupHeaderHash(group);
-                entry.longDoubleWidth = raw.longDoubleWidth;
-                entry.longDoubleIsIEEEDouble = raw.longDoubleIsIEEEDouble;
-                entry.targetTriple = raw.targetTriple;
-                entry.sigs = requestSigs;
-                entry.cxxBitcode = requestBitcode;
-                std::lock_guard<std::mutex> lock(cFileSigCacheMutex_);
-                InsertCFileSigEntry(requestKey, std::move(entry), verbose);
-            }
-        }
-        if (requestSigs.empty()) return noMatch("the generated wrapper was not extracted");
-        if (!emitDefinitions) requestBitcode.clear();
-        if (!requestSigs.front().isCxx) return noMatch("the generated wrapper was not extracted");
-        RequestCxxSignatureTypes(requestSigs);
-        if (emitDefinitions) AdoptCxxCompanionBitcode(requestBitcode);
+        CSigEntry bound;
+        std::string wrapperError;
+        if (!RequestGeneratedCxxWrapper(group, wrapperSource, wrapperName, "TPL",
+                                         bound, wrapperError))
+            return noMatch(wrapperError);
 
         const bool instanceWrapper = selected->kind == cflat_cinterop::RawFunctionTemplate::InstanceMember;
         const std::string registeredName = instanceWrapper ? functionName : lookupName;
-        CSigEntry bound = requestSigs.front();
         bound.name = registeredName;
         RegisterCSignatures({ bound }, selected->file.empty() ? group.headers.front() : selected->file);
         bool registered = false;
@@ -3587,6 +3870,411 @@ bool LLVMBackend::RequestCxxFunctionTemplate(const std::string& functionName,
                            selected->file.empty() ? group.headers.front() : selected->file,
                            selected->line, selected->col < 0 ? 0 : selected->col,
                            "template <...> " + selected->name + "(...)");
+        ExpandCxxBraceArguments(arguments, braceArguments);
+        return true;
+}
+
+bool LLVMBackend::RequestCxxBraceFunction(const std::string& functionName,
+                                          const std::string& ownerType,
+                                          const std::string& memberName,
+                                          std::vector<NamedVariable>& arguments,
+                                          const std::vector<CxxBraceArgument>& braceArguments,
+                                          std::string& error)
+{
+        error.clear();
+        if (braceArguments.empty()) return false;
+
+        struct Candidate
+        {
+            std::vector<std::string> paramTypes;
+            std::string retType;
+            std::string target;
+            std::string file;
+            int line = 1;
+            int col = 0;
+            bool isNoexcept = false;
+            bool instance = false;
+            bool isConst = false;
+            bool found = false;
+        } selected;
+
+        auto fitsBraces = [&](const std::vector<std::string>& params) {
+            for (const auto& brace : braceArguments)
+                if (brace.parameterIndex >= params.size()) return false;
+            return true;
+        };
+        if (ownerType.empty())
+        {
+            auto it = cxxFunctionSignatures_.find(functionName);
+            if (it == cxxFunctionSignatures_.end()) return false;
+            for (const auto& sig : it->second)
+            {
+                if (sig.paramSpellings.size() < arguments.size()
+                    || !fitsBraces(sig.paramSpellings)) continue;
+                const bool exact = sig.paramSpellings.size() == arguments.size();
+                if (!selected.found || exact)
+                {
+                    selected.paramTypes = sig.paramSpellings;
+                    selected.retType = sig.retSpelling;
+                    selected.target = CxxNameFromCflat(functionName);
+                    selected.file = sig.file;
+                    selected.line = sig.line;
+                    selected.col = sig.col;
+                    selected.isNoexcept = sig.isNoexcept;
+                    selected.found = true;
+                    if (exact) break;
+                }
+            }
+            if (!selected.found) return false;
+        }
+        else
+        {
+            auto record = cxxRecordEntries_.find(ownerType);
+            if (record == cxxRecordEntries_.end()) return false;
+            const cflat_cinterop::RawCxxMember* fallback = nullptr;
+            for (const auto& member : record->second.members)
+            {
+                if (member.name != memberName
+                    || (member.kind != cflat_cinterop::RawCxxMember::Instance
+                        && member.kind != cflat_cinterop::RawCxxMember::StaticMethod))
+                    continue;
+                const bool instance = member.kind == cflat_cinterop::RawCxxMember::Instance;
+                if (member.paramTypes.size() < arguments.size()
+                    || !fitsBraces(member.paramTypes)) continue;
+                const bool receiverLooksPresent = !arguments.empty()
+                    && arguments.front().TypeAndValue.TypeName == ownerType;
+                if (instance != receiverLooksPresent) continue;
+                if (fallback == nullptr) fallback = &member;
+                if (member.paramTypes.size() == arguments.size())
+                {
+                    fallback = &member;
+                    break;
+                }
+            }
+            if (fallback == nullptr) return false;
+            selected.paramTypes = fallback->paramTypes;
+            selected.retType = fallback->retType;
+            selected.file = fallback->file;
+            selected.line = fallback->line;
+            selected.col = fallback->col;
+            selected.isNoexcept = fallback->isNoexcept;
+            selected.instance = fallback->kind == cflat_cinterop::RawCxxMember::Instance;
+            selected.isConst = fallback->isConst;
+            selected.found = true;
+        }
+
+        std::string ownerSpelling;
+        if (selected.instance || !ownerType.empty())
+            if (!CxxSpellingForCflatType(ownerType, ownerSpelling))
+            {
+                error = "the C++ receiver type is not registered";
+                return false;
+            }
+
+        auto braceForArgument = [&](size_t index) -> const CxxBraceArgument* {
+            for (const auto& brace : braceArguments)
+                if (brace.argumentIndex == index) return &brace;
+            return nullptr;
+        };
+        std::vector<std::string> parameterSpellings;
+        std::vector<std::string> callArguments;
+        size_t flatParameterIndex = 0;
+        if (selected.instance)
+        {
+            const NamedVariable& receiver = arguments.front();
+            std::string receiverSpelling = selected.isConst ? "const " : "";
+            receiverSpelling += ownerSpelling;
+            if (receiver.TypeAndValue.Pointer)
+            {
+                receiverSpelling += " *";
+                callArguments.push_back("p0->" + memberName);
+            }
+            else
+            {
+                receiverSpelling += " &";
+                callArguments.push_back("p0." + memberName);
+            }
+            parameterSpellings.push_back(std::move(receiverSpelling));
+            flatParameterIndex = 1;
+        }
+        for (size_t i = selected.instance ? 1u : 0u; i < arguments.size(); ++i)
+        {
+            const auto* brace = braceForArgument(i);
+            if (brace != nullptr)
+            {
+                std::string braceType = CxxBraceElementSpelling(
+                    *brace, i < selected.paramTypes.size() ? selected.paramTypes[i] : std::string());
+                if (!brace->elements.empty() && braceType.empty())
+                {
+                    error = "brace arguments must contain scalar values of one type";
+                    return false;
+                }
+                std::string braceCall = "{";
+                for (size_t element = 0; element < brace->elements.size(); ++element)
+                {
+                    if (element != 0) braceCall += ", ";
+                    parameterSpellings.push_back(braceType);
+                    braceCall += "p" + std::to_string(flatParameterIndex++);
+                }
+                braceCall += "}";
+                callArguments.push_back(std::move(braceCall));
+            }
+            else
+            {
+                if (i >= selected.paramTypes.size())
+                {
+                    error = "the C++ declaration has too few parameters for this call";
+                    return false;
+                }
+                parameterSpellings.push_back(selected.paramTypes[i]);
+                callArguments.push_back("p" + std::to_string(flatParameterIndex++));
+            }
+        }
+
+        std::string targetCall = selected.instance
+            ? callArguments.front() + "("
+            : (ownerType.empty() ? selected.target : ownerSpelling + "::" + memberName) + "(";
+        const size_t firstUserArgument = selected.instance ? 1u : 0u;
+        for (size_t i = firstUserArgument; i < callArguments.size(); ++i)
+        {
+            if (i != firstUserArgument) targetCall += ", ";
+            targetCall += callArguments[i];
+        }
+        targetCall += ")";
+
+        uint64_t hash = 14695981039346656037ULL;
+        auto hashText = [&](const std::string& text) {
+            for (unsigned char c : text) { hash ^= c; hash *= 1099511628211ULL; }
+        };
+        hashText(functionName);
+        hashText(ownerType);
+        hashText(targetCall);
+        for (const auto& param : parameterSpellings) hashText(param);
+        for (const auto& brace : braceArguments)
+        {
+            hashText("|brace|");
+            hashText(std::to_string(brace.parameterIndex));
+            hashText(std::to_string(brace.elements.size()));
+            hashText(CxxBraceElementSpelling(brace, brace.parameterIndex < selected.paramTypes.size()
+                                                        ? selected.paramTypes[brace.parameterIndex] : std::string()));
+        }
+        const std::string wrapperName = std::format("__cflat_tpl_{:016x}", hash);
+        std::string wrapperSource;
+        const bool returnsVoid = TrimCxxBraceType(selected.retType) == "void";
+        wrapperSource += "extern \"C\" " + std::string(returnsVoid ? "void" : "auto")
+            + " " + wrapperName + "(";
+        for (size_t i = 0; i < parameterSpellings.size(); ++i)
+        {
+            if (i != 0) wrapperSource += ", ";
+            wrapperSource += parameterSpellings[i] + " p" + std::to_string(i);
+        }
+        wrapperSource += ")";
+        if (selected.isNoexcept) wrapperSource += " noexcept";
+        wrapperSource += " { ";
+        if (!returnsVoid) wrapperSource += "return ";
+        wrapperSource += targetCall + "; }\n";
+
+        size_t groupIndex = static_cast<size_t>(-1);
+        if (ownerType.empty())
+        {
+            auto it = cxxFunctionOwnerGroup_.find(functionName);
+            if (it != cxxFunctionOwnerGroup_.end()) groupIndex = it->second;
+        }
+        else
+        {
+            auto it = cxxTypeOwnerGroup_.find(ownerType);
+            if (it != cxxTypeOwnerGroup_.end()) groupIndex = it->second;
+        }
+        if (groupIndex == static_cast<size_t>(-1))
+        {
+            error = "the C++ declaration's import group is unavailable";
+            return false;
+        }
+        CxxRequestGroup group = MakeCxxRequestGroup(groupIndex, {});
+        if (group.headers.empty())
+        {
+            error = "the C++ declaration's import group is unavailable";
+            return false;
+        }
+        CxxRequestGroupScope groupScope(*this, &group);
+        CSigEntry bound;
+        std::string wrapperError;
+        if (!RequestGeneratedCxxWrapper(group, wrapperSource, wrapperName, "BRACE",
+                                         bound, wrapperError))
+        {
+            error = std::format("C++ brace argument call '{}' does not match (clang: {})",
+                                ownerType.empty() ? functionName : ownerType + "." + memberName,
+                                FirstCxxErrorLine(wrapperError));
+            return false;
+        }
+        const std::string registeredName = ownerType.empty()
+            ? functionName : (selected.instance ? memberName : functionName);
+        bound.name = registeredName;
+        RegisterCSignatures({ bound }, selected.file.empty() ? group.headers.front() : selected.file);
+        bool registered = false;
+        if (auto it = functionTable.find(registeredName); it != functionTable.end())
+            for (const auto& symbol : it->second)
+                if (symbol.External && symbol.UniqueName == wrapperName)
+                { registered = true; break; }
+        if (!registered)
+        {
+            error = "the generated C++ brace wrapper could not be registered";
+            return false;
+        }
+        ExpandCxxBraceArguments(arguments, braceArguments);
+        return true;
+}
+
+bool LLVMBackend::RequestCxxBraceConstructor(
+        const std::string& typeName, std::vector<NamedVariable>& arguments,
+        const std::vector<CxxBraceArgument>& braceArguments, std::string& wrapperName,
+        std::string& error)
+{
+        error.clear();
+        wrapperName.clear();
+        if (braceArguments.empty()) return false;
+        auto record = cxxRecordEntries_.find(typeName);
+        if (record == cxxRecordEntries_.end()) return false;
+
+        const cflat_cinterop::RawCxxMember* selected = nullptr;
+        for (const auto& member : record->second.members)
+        {
+            if (member.kind != cflat_cinterop::RawCxxMember::Constructor
+                || member.paramTypes.size() < arguments.size() + 1)
+                continue;
+            bool fits = true;
+            for (const auto& brace : braceArguments)
+                if (brace.parameterIndex + 1 >= member.paramTypes.size()) { fits = false; break; }
+            if (!fits) continue;
+            if (selected == nullptr || member.paramTypes.size() == arguments.size() + 1)
+            {
+                selected = &member;
+                if (member.paramTypes.size() == arguments.size() + 1) break;
+            }
+        }
+        if (selected == nullptr) return false;
+
+        std::string ownerSpelling;
+        if (!CxxSpellingForCflatType(typeName, ownerSpelling))
+        {
+            error = "the C++ class type is not registered";
+            return false;
+        }
+        auto braceForArgument = [&](size_t index) -> const CxxBraceArgument* {
+            for (const auto& brace : braceArguments)
+                if (brace.argumentIndex == index) return &brace;
+            return nullptr;
+        };
+        std::vector<std::string> parameterSpellings{ ownerSpelling + " *" };
+        std::vector<std::string> callArguments;
+        size_t flatParameterIndex = 1;
+        for (size_t i = 0; i < arguments.size(); ++i)
+        {
+            const auto* brace = braceForArgument(i);
+            if (brace != nullptr)
+            {
+                const size_t rawIndex = i + 1;
+                std::string braceType = CxxBraceElementSpelling(
+                    *brace, rawIndex < selected->paramTypes.size() ? selected->paramTypes[rawIndex]
+                                                                      : std::string());
+                if (!brace->elements.empty() && braceType.empty())
+                {
+                    error = "brace arguments must contain scalar values of one type";
+                    return false;
+                }
+                std::string braceCall = "{";
+                for (size_t element = 0; element < brace->elements.size(); ++element)
+                {
+                    if (element != 0) braceCall += ", ";
+                    parameterSpellings.push_back(braceType);
+                    braceCall += "p" + std::to_string(flatParameterIndex++);
+                }
+                braceCall += "}";
+                callArguments.push_back(std::move(braceCall));
+            }
+            else
+            {
+                const size_t rawIndex = i + 1;
+                if (rawIndex >= selected->paramTypes.size())
+                {
+                    error = "the C++ constructor has too few parameters for this call";
+                    return false;
+                }
+                parameterSpellings.push_back(selected->paramTypes[rawIndex]);
+                callArguments.push_back("p" + std::to_string(flatParameterIndex++));
+            }
+        }
+
+        std::string targetCall = ownerSpelling + "(";
+        for (size_t i = 0; i < callArguments.size(); ++i)
+        {
+            if (i != 0) targetCall += ", ";
+            targetCall += callArguments[i];
+        }
+        targetCall += ")";
+        uint64_t hash = 14695981039346656037ULL;
+        auto hashText = [&](const std::string& text) {
+            for (unsigned char c : text) { hash ^= c; hash *= 1099511628211ULL; }
+        };
+        hashText("ctor");
+        hashText(typeName);
+        hashText(targetCall);
+        for (const auto& param : parameterSpellings) hashText(param);
+        for (const auto& brace : braceArguments)
+        {
+            hashText("|brace|");
+            hashText(std::to_string(brace.parameterIndex));
+            hashText(std::to_string(brace.elements.size()));
+            hashText(CxxBraceElementSpelling(brace,
+                brace.parameterIndex + 1 < selected->paramTypes.size()
+                    ? selected->paramTypes[brace.parameterIndex + 1] : std::string()));
+        }
+        wrapperName = std::format("__cflat_tpl_{:016x}", hash);
+        std::string wrapperSource = "extern \"C\" void " + wrapperName + "(";
+        for (size_t i = 0; i < parameterSpellings.size(); ++i)
+        {
+            if (i != 0) wrapperSource += ", ";
+            wrapperSource += parameterSpellings[i] + " p" + std::to_string(i);
+        }
+        wrapperSource += ")";
+        if (selected->isNoexcept) wrapperSource += " noexcept";
+        wrapperSource += " { new (p0) " + targetCall + "; }\n";
+
+        auto groupIt = cxxTypeOwnerGroup_.find(typeName);
+        if (groupIt == cxxTypeOwnerGroup_.end())
+        {
+            error = "the C++ class's import group is unavailable";
+            return false;
+        }
+        CxxRequestGroup group = MakeCxxRequestGroup(groupIt->second, {});
+        if (group.headers.empty())
+        {
+            error = "the C++ class's import group is unavailable";
+            return false;
+        }
+        CxxRequestGroupScope groupScope(*this, &group);
+        CSigEntry bound;
+        std::string wrapperError;
+        if (!RequestGeneratedCxxWrapper(group, wrapperSource, wrapperName, "BRACE_CTOR",
+                                         bound, wrapperError))
+        {
+            error = std::format("C++ brace constructor call '{}' does not match (clang: {})",
+                                typeName, FirstCxxErrorLine(wrapperError));
+            return false;
+        }
+        bound.name = wrapperName;
+        RegisterCSignatures({ bound }, selected->file.empty() ? group.headers.front() : selected->file);
+        bool registered = false;
+        if (auto it = functionTable.find(wrapperName); it != functionTable.end())
+            for (const auto& symbol : it->second)
+                if (symbol.External && symbol.UniqueName == wrapperName)
+                { registered = true; break; }
+        if (!registered)
+        {
+            error = "the generated C++ brace constructor wrapper could not be registered";
+            return false;
+        }
+        ExpandCxxBraceArguments(arguments, braceArguments);
         return true;
 }
 
@@ -4621,6 +5309,8 @@ void LLVMBackend::RegisterCRecords(std::vector<CRecordEntry>& records, const std
             if (r.isCxx)
             {
                 NoteCxxForeignNamespace(r.name);
+                if (activeCxxRequestGroup_ != nullptr)
+                    cxxTypeOwnerGroup_.emplace(r.name, activeCxxRequestGroup_->primary);
                 for (size_t pos = 0; (pos = r.name.find('.', pos)) != std::string::npos; ++pos)
                     RegisterNamespace(r.name.substr(0, pos));
             }

@@ -85,6 +85,9 @@
 //   Section M22 (774-781): C++ function-template deduction wrappers for free functions,
 //                       static and instance members, class returns, string literals, and
 //                       explicit type arguments.
+//   Section M23 (782-786): C++ brace-list arguments through initializer_list, a class
+//                       constructor from a brace list, a class parameter, and an explicit
+//                       function-template specialization.
 
 import "library/c_alias_order_alias.h";
 import "library/c_alias_order_real.h";
@@ -1982,6 +1985,13 @@ extern int main()
     if (m22sc.scaled(7) != 21)                     return 779;
     if (m22sc.scaled(1.5) != 4.5)                  return 780;
     if (cppt.Scaler.from(4) != 40)                 return 781;
+
+    // ---- Section M23: C++ brace-list arguments (782-786) -------------------------------
+    if (cppt.sum_il({1, 2, 3}) != 6)              return 782;
+    if (cppt.sum_ild({1.5, 2.5}) != 4.0)          return 783;
+    if (cppt.span_size({7, 8, 9}) != 3)            return 784;
+    if (cppt.span_count<long>({1, 2}) != 2)        return 785;
+    if (cppt.shape_rank({4, 5, 6}) != 3)           return 786;
 
     return 0;
 }

@@ -3672,9 +3672,70 @@ bool MainListener::TryDeclareForeignCxxLocal(CFlatParser::InitDeclaratorContext*
         {
             std::vector<llvm::Value*> argValues;
             std::vector<LLVMBackend::TypeAndValue> argTypes;
+            std::vector<LLVMBackend::NamedVariable> ctorArguments;
+            std::vector<LLVMBackend::CxxBraceArgument> braceArguments;
+            auto isIntegerLiteral = [](const std::string& text) {
+                if (text.empty()) return false;
+                size_t i = text[0] == '-' ? 1 : 0;
+                if (i == text.size()) return false;
+                for (; i < text.size(); ++i)
+                    if (!std::isdigit((unsigned char)text[i])) return false;
+                return true;
+            };
             for (auto* named : ctorArgs->argumentNamedExpression())
             {
                 auto* argAssign = named->assignmentExpression();
+                const std::string braceText = named->getText();
+                const bool emptyBrace = braceText == "{}"
+                    || (named->Identifier() != nullptr
+                        && braceText == named->Identifier()->getText() + ":{}");
+                if (named->initializerList() != nullptr || emptyBrace)
+                {
+                    LLVMBackend::CxxBraceArgument brace;
+                    brace.argumentIndex = ctorArguments.size();
+                    brace.parameterIndex = brace.argumentIndex;
+                    brace.allIntegerLiterals = true;
+                    auto* list = named->initializerList();
+                    bool valid = true;
+                    if (list != nullptr)
+                        for (auto* element : list->fieldInit())
+                        {
+                            if (element->initializerList() != nullptr
+                                || element->Identifier() != nullptr
+                                || element->Colon() != nullptr
+                                || element->assignmentExpression().size() != 1)
+                            {
+                                LogErrorContext(element,
+                                    "nested brace lists cannot be passed to C++ yet");
+                                valid = false;
+                                break;
+                            }
+                            auto* expression = element->assignmentExpression(0);
+                            brace.allIntegerLiterals = brace.allIntegerLiterals
+                                && isIntegerLiteral(expression->getText());
+                            auto elementNV = ParseAssignmentExpressionNamed(expression);
+                            llvm::Value* elementValue = elementNV.Primary
+                                ? elementNV.Primary : LoadNamedVariable(elementNV);
+                            if (elementValue == nullptr)
+                            {
+                                valid = false;
+                                break;
+                            }
+                            LLVMBackend::NamedVariable elementVar = elementNV;
+                            elementVar.Primary = elementValue;
+                            elementVar.Storage = nullptr;
+                            elementVar.BaseType = elementValue->getType();
+                            elementVar.TypeAndValue.VariableName.clear();
+                            elementVar.IsRvalue = true;
+                            brace.elements.push_back(std::move(elementVar));
+                        }
+                    if (!valid) return true;
+                    LLVMBackend::NamedVariable placeholder;
+                    placeholder.TypeAndValue.TypeName = "__cflat_brace_arg";
+                    ctorArguments.push_back(std::move(placeholder));
+                    braceArguments.push_back(std::move(brace));
+                    continue;
+                }
                 if (argAssign == nullptr)
                 {
                     LogErrorContext(named, std::format(
@@ -3685,9 +3746,44 @@ bool MainListener::TryDeclareForeignCxxLocal(CFlatParser::InitDeclaratorContext*
                 auto nv = ParseAssignmentExpressionNamed(argAssign);
                 // A bare lvalue comes back unloaded (Storage set, Primary null); LoadNamedVariable
                 // is the one path that materializes every binding shape.
-                argValues.push_back(LoadNamedVariable(nv));
+                llvm::Value* argValue = LoadNamedVariable(nv);
+                argValues.push_back(argValue);
                 argTypes.push_back(nv.TypeAndValue);
-                TypeUntypedCtorArg(argTypes.back(), argValues.back());
+                TypeUntypedCtorArg(argTypes.back(), argValue);
+                LLVMBackend::NamedVariable argVar = nv;
+                argVar.Primary = argValue;
+                argVar.Storage = nullptr;
+                argVar.BaseType = argValue ? argValue->getType() : nullptr;
+                argVar.IsRvalue = true;
+                ctorArguments.push_back(std::move(argVar));
+            }
+            if (!braceArguments.empty())
+            {
+                std::string wrapperName;
+                std::string constructorError;
+                if (!compiler->RequestCxxBraceConstructor(
+                        typeName, ctorArguments, braceArguments,
+                        wrapperName, constructorError))
+                {
+                    if (constructorError.empty())
+                        constructorError = std::format(
+                            "C++ class '{}' has no constructor accepting this brace list",
+                            typeName);
+                    LogErrorContext(direct, constructorError);
+                }
+                LLVMBackend::NamedVariable self;
+                self.Primary = slot;
+                self.BaseType = slot->getType();
+                self.TypeAndValue.TypeName = typeName;
+                self.TypeAndValue.Pointer = true;
+                self.IsRvalue = true;
+                std::vector<LLVMBackend::NamedVariable> wrapperArguments;
+                wrapperArguments.reserve(ctorArguments.size() + 1);
+                wrapperArguments.push_back(self);
+                wrapperArguments.insert(wrapperArguments.end(), ctorArguments.begin(), ctorArguments.end());
+                compiler->SetCurrentDebugLocation(line);
+                compiler->CreateOverloadedFunctionCall(wrapperName, wrapperArguments);
+                return true;
             }
             std::string why;
             const auto* ctor = compiler->SelectCxxConstructor(typeName, argTypes, why);

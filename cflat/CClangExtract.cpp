@@ -683,8 +683,13 @@ namespace cflat_cinterop
 
             bool VisitFunctionDecl(FunctionDecl* fd)
             {
+                // A generated `auto` wrapper whose body failed template deduction keeps an
+                // undeduced return type in the recovered AST. It is useful for the diagnostic,
+                // but CodeGen's ABI arranger cannot inspect it safely.
+                if (fd == nullptr || fd->isInvalidDecl() || fd->getReturnType()->isUndeducedType())
+                    return true;
                 if (!st.req.cxxFunctionWrapperNames.empty()
-                    && (fd == nullptr || !fd->getIdentifier()
+                    && (!fd->getIdentifier()
                         || std::find(st.req.cxxFunctionWrapperNames.begin(),
                                      st.req.cxxFunctionWrapperNames.end(),
                                      fd->getNameAsString())

@@ -5284,6 +5284,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 ncCallGuarded = true;
                             }
 
+                            std::vector<LLVMBackend::CxxBraceArgument> cxxBraceArguments;
                             auto evaluateCallArguments = [&]()
                             {
                                 if (argumentList.size() > 0)
@@ -5370,15 +5371,30 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     }
 
                                     // Field initializer argument: { field=val, ... } or paramName: { field=val, ... }
-                                    if (namedArgument->initializerList())
+                                    // Empty braces have no initializerList() child, so inspect the
+                                    // source text as well. Imported C++ records use the same grammar
+                                    // spelling but must be forwarded through a generated C++ wrapper.
+                                    auto* argNameToken = namedArgument->Identifier();
+                                    const std::string braceText = namedArgument->getText();
+                                    const bool emptyBrace = braceText == "{}"
+                                        || (argNameToken != nullptr
+                                            && braceText == argNameToken->getText() + ":{}");
+                                    if (namedArgument->initializerList() != nullptr || emptyBrace)
                                     {
-                                        auto* argNameToken = namedArgument->Identifier();
                                         std::string namedParam = argNameToken ? argNameToken->getText() : "";
                                         // Positional brace-init: use the bound slot, not the call-site
                                         // index, so an earlier named argument cannot shift it.
                                         int effectiveIdx = namedParam.empty() ? (int)declaredIdx[argIdx] : -1;
-                                        std::string structType = ResolveInitializerArgType(ctx, functionName, effectiveIdx, namedParam);
-                                        if (!structType.empty())
+                                        // C++ declarations whose parameter cannot be mapped to a CFlat
+                                        // value are intentionally absent from functionTable. Do not ask
+                                        // the CFlat field-initializer resolver to diagnose those braces.
+                                        std::string structType;
+                                        if (funcSym != nullptr)
+                                            structType = ResolveInitializerArgType(
+                                                ctx, functionName, effectiveIdx, namedParam);
+                                        const bool foreignCxxRecord = !structType.empty()
+                                            && Compiler(ctx)->IsCxxRecord(structType);
+                                        if (!structType.empty() && !foreignCxxRecord)
                                         {
                                             LLVMBackend::DeclTypeAndValue paramType;
                                             paramType.TypeName = structType;
@@ -5397,6 +5413,56 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                                 argVar.TypeAndValue.TypeName = structType;
                                                 argVar.TypeAndValue.VariableName = namedParam;
                                                 arguments.emplace_back(argVar);
+                                            }
+                                        }
+                                        else
+                                        {
+                                            LLVMBackend::CxxBraceArgument brace;
+                                            brace.argumentIndex = arguments.size();
+                                            brace.parameterIndex = declaredIdx[argIdx] < 0
+                                                ? (size_t)(argIdx + paramOffset)
+                                                : (size_t)declaredIdx[argIdx];
+                                            brace.allIntegerLiterals = true;
+                                            auto* list = namedArgument->initializerList();
+                                            bool valid = true;
+                                            if (list != nullptr)
+                                                for (auto* element : list->fieldInit())
+                                                {
+                                                    if (element->initializerList() != nullptr
+                                                        || element->Identifier() != nullptr
+                                                        || element->Colon() != nullptr
+                                                        || element->assignmentExpression().size() != 1)
+                                                    {
+                                                        LogErrorContext(element,
+                                                            "nested brace lists cannot be passed to C++ yet");
+                                                        valid = false;
+                                                        break;
+                                                    }
+                                                    auto* expression = element->assignmentExpression(0);
+                                                    brace.allIntegerLiterals = brace.allIntegerLiterals
+                                                        && JsonConstIntegerToken(expression->getText());
+                                                    auto elementNV = ParseAssignmentExpressionNamed(expression);
+                                                    llvm::Value* elementValue = elementNV.Primary
+                                                        ? elementNV.Primary : LoadNamedVariable(elementNV);
+                                                    if (elementValue == nullptr)
+                                                    {
+                                                        valid = false;
+                                                        break;
+                                                    }
+                                                    LLVMBackend::NamedVariable elementVar = elementNV;
+                                                    elementVar.Primary = elementValue;
+                                                    elementVar.Storage = nullptr;
+                                                    elementVar.BaseType = elementValue->getType();
+                                                    elementVar.TypeAndValue.VariableName.clear();
+                                                    elementVar.IsRvalue = true;
+                                                    brace.elements.push_back(std::move(elementVar));
+                                                }
+                                            if (valid)
+                                            {
+                                                LLVMBackend::NamedVariable placeholder;
+                                                placeholder.TypeAndValue.TypeName = "__cflat_brace_arg";
+                                                arguments.emplace_back(std::move(placeholder));
+                                                cxxBraceArguments.push_back(std::move(brace));
                                             }
                                         }
                                         continue;
@@ -5697,9 +5763,13 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                         receiverType = st->getName().str();
                                 if (receiverType.empty() && !arguments.empty())
                                     receiverType = arguments.front().TypeAndValue.TypeName;
+                                bool isTemplate = false;
                                 if (!receiverType.empty()
                                     && compiler->HasCxxFunctionTemplateMember(receiverType, functionName))
+                                {
                                     owner = receiverType;
+                                    isTemplate = true;
+                                }
                                 else
                                 {
                                     const size_t dot = functionName.rfind('.');
@@ -5712,11 +5782,29 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                         // has no receiver value in the expression state.
                                         owner = functionName.substr(0, dot);
                                         memberName = functionName.substr(dot + 1);
+                                        isTemplate = true;
                                     }
-                                    else if (!compiler->HasCxxFunctionTemplate(functionName)) return;
+                                    else if (compiler->HasCxxFunctionTemplate(functionName))
+                                        isTemplate = true;
                                 }
+                                if (!isTemplate && !cxxBraceArguments.empty())
+                                {
+                                    if (!receiverType.empty() && compiler->IsCxxRecord(receiverType))
+                                        owner = receiverType;
+                                    else
+                                    {
+                                        const size_t dot = functionName.rfind('.');
+                                        if (dot != std::string::npos
+                                            && compiler->IsCxxRecord(functionName.substr(0, dot)))
+                                        {
+                                            owner = functionName.substr(0, dot);
+                                            memberName = functionName.substr(dot + 1);
+                                        }
+                                    }
+                                }
+                                if (!isTemplate && owner.empty() && cxxBraceArguments.empty()) return;
                                 if (auto existing = compiler->functionTable.find(resolvedName);
-                                    existing != compiler->functionTable.end())
+                                    existing != compiler->functionTable.end() && cxxBraceArguments.empty())
                                 {
                                     bool hasNonWrapper = false;
                                     for (const auto& symbol : existing->second)
@@ -5727,20 +5815,69 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     if (hasNonWrapper) return;
                                 }
                                 std::string templateError;
-                                if (!compiler->RequestCxxFunctionTemplate(
+                                bool requested = isTemplate
+                                    ? compiler->RequestCxxFunctionTemplate(
                                         memberName, owner, cxxExplicitTemplateArgs,
-                                        arguments, templateError))
+                                        arguments, cxxBraceArguments, templateError)
+                                    : compiler->RequestCxxBraceFunction(
+                                        functionName, owner, memberName, arguments,
+                                        cxxBraceArguments, templateError);
+                                if (!requested)
                                 {
                                     if (!templateError.empty()) LogErrorContext(primaryCtx, templateError);
+                                    compiler->DiscardCxxBraceArguments(arguments, cxxBraceArguments);
+                                    cxxBraceArguments.clear();
                                     return;
                                 }
-                                if (!owner.empty() && !structVar.TypeAndValue.TypeName.empty())
+                                if (isTemplate && !owner.empty() && !structVar.TypeAndValue.TypeName.empty())
                                     resolvedName = memberName;
+                                cxxBraceArguments.clear();
                                 cxxExplicitTemplateArgs.clear();
                             };
                             bool foreignCxxConstructor = structVar.BaseType == nullptr
                                 && compiler->IsForeignCxxClassWithConstructors(functionName);
-                            if (foreignCxxConstructor)
+                            if (foreignCxxConstructor && !cxxBraceArguments.empty())
+                            {
+                                std::string wrapperName;
+                                std::string constructorError;
+                                if (!compiler->RequestCxxBraceConstructor(
+                                        functionName, arguments, cxxBraceArguments,
+                                        wrapperName, constructorError))
+                                {
+                                    if (constructorError.empty())
+                                        constructorError = std::format(
+                                            "C++ class '{}' has no constructor accepting this brace list",
+                                            functionName);
+                                    LogErrorContext(primaryCtx, constructorError);
+                                }
+                                auto* objectType = compiler->GetType(
+                                    LLVMBackend::TypeAndValue{ .TypeName = functionName });
+                                auto* slot = compiler->CreateAlloca(objectType);
+                                LLVMBackend::NamedVariable self;
+                                self.Primary = slot;
+                                self.BaseType = slot->getType();
+                                self.TypeAndValue.TypeName = functionName;
+                                self.TypeAndValue.Pointer = true;
+                                self.IsRvalue = true;
+                                std::vector<LLVMBackend::NamedVariable> wrapperArguments;
+                                wrapperArguments.reserve(arguments.size() + 1);
+                                wrapperArguments.push_back(self);
+                                wrapperArguments.insert(wrapperArguments.end(), arguments.begin(), arguments.end());
+                                compiler->SetCurrentDebugLocation(primaryCtx->getStart()->getLine());
+                                compiler->CreateOverloadedFunctionCall(wrapperName, wrapperArguments);
+                                cxxBraceArguments.clear();
+                                if (compiler->IsForeignNontrivialCxxClass(functionName))
+                                    compiler->RegisterOwnedStructTemp(slot, functionName);
+                                namedVar = {};
+                                namedVar.Primary = compiler->CreateLoad(slot);
+                                namedVar.Storage = slot;
+                                namedVar.BaseType = objectType;
+                                namedVar.TypeAndValue.TypeName = functionName;
+                                compiler->lastOwningResult = true;
+                                structVar = {};
+                                interfaceVar = {};
+                            }
+                            else if (foreignCxxConstructor)
                             {
                                 std::vector<llvm::Value*> ctorValues;
                                 std::vector<LLVMBackend::TypeAndValue> ctorTypes;

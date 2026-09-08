@@ -9,6 +9,8 @@
 #pragma once
 
 #include "cpp_interop_basic.h"
+#include <initializer_list>
+#include <vector>
 
 namespace cppt
 {
@@ -161,4 +163,43 @@ namespace cppt
     private:
         T t_;
     };
+
+    inline long sum_il(std::initializer_list<long> xs) noexcept
+    {
+        long s = 0;
+        for (long x : xs) s += x;
+        return s;
+    }
+
+    inline double sum_ild(std::initializer_list<double> xs) noexcept
+    {
+        double s = 0;
+        for (double x : xs) s += x;
+        return s;
+    }
+
+    template <typename T>
+    class Span
+    {
+    public:
+        Span(std::initializer_list<T> il) noexcept : n_(il.size()) {}
+        Span(const T* p, unsigned long n) noexcept : n_(n) {}
+        unsigned long size() const noexcept { return n_; }
+
+    private:
+        unsigned long n_;
+    };
+
+    inline unsigned long span_size(Span<long> s) noexcept { return s.size(); }
+    template <typename T> unsigned long span_count(Span<T> s) noexcept { return s.size(); }
+
+    struct Shape
+    {
+        std::vector<long> dims;
+        Shape(std::initializer_list<long> d) : dims(d) {}
+        long rank() const noexcept { return (long)dims.size(); }
+        long dim(long i) const noexcept { return dims[(unsigned long)i]; }
+    };
+
+    inline long shape_rank(const Shape& s) noexcept { return s.rank(); }
 }

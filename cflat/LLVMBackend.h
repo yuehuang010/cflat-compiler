@@ -1624,6 +1624,16 @@ public:
         }
     };
 
+    // One C++ call argument written as a brace list. The argument index includes an implicit
+    // receiver when the call is an instance member; parameterIndex is the matching C++ slot.
+    struct CxxBraceArgument
+    {
+        size_t argumentIndex = 0;
+        size_t parameterIndex = 0;
+        bool allIntegerLiterals = false;
+        std::vector<NamedVariable> elements;
+    };
+
     // Lightweight expression result: pairs an LLVM value with its signedness.
     // operator llvm::Value*() lets it substitute for Value* transparently at call sites.
     struct TypedValue
@@ -3133,6 +3143,7 @@ private:
     std::unordered_map<std::string, std::vector<cflat_cinterop::RawFunctionTemplate>>
         cxxFunctionTemplates_;
     std::unordered_map<std::string, size_t> cxxFunctionTemplateOwnerGroup_;
+    std::unordered_map<std::string, size_t> cxxFunctionOwnerGroup_;
     // CFlat foreign type name -> the import group index whose request registered it.
     std::unordered_map<std::string, size_t> cxxTypeOwnerGroup_;
     /*
@@ -3283,6 +3294,9 @@ private:
         int line = 1;
         int col = 0;
     };
+    // Raw C++ free-function signatures are retained because a brace-capable wrapper may be
+    // needed even when the ordinary CFlat signature was refused as unmappable.
+    std::map<std::string, std::vector<CSigEntry>> cxxFunctionSignatures_;
     struct CEnumEntry
     {
         std::string name;
@@ -4956,7 +4970,19 @@ private:
     bool RequestCxxFunctionTemplate(const std::string& functionName,
                                     const std::string& ownerType,
                                     const std::vector<std::string>& explicitArgs,
-                                    const std::vector<NamedVariable>& arguments,
+                                    std::vector<NamedVariable>& arguments,
+                                    const std::vector<CxxBraceArgument>& braceArguments,
+                                    std::string& error);
+    bool RequestCxxBraceFunction(const std::string& functionName,
+                                 const std::string& ownerType,
+                                 const std::string& memberName,
+                                 std::vector<NamedVariable>& arguments,
+                                 const std::vector<CxxBraceArgument>& braceArguments,
+                                 std::string& error);
+    bool RequestCxxBraceConstructor(const std::string& typeName,
+                                    std::vector<NamedVariable>& arguments,
+                                    const std::vector<CxxBraceArgument>& braceArguments,
+                                    std::string& wrapperName,
                                     std::string& error);
     std::vector<size_t> CandidateCxxGroupsFor(const std::string& cxxBase) const;
     bool RequestCxxTypeInOwningGroup(const std::string& cxxBase, const std::string& cflatName,
@@ -4982,6 +5008,18 @@ private:
     bool CxxGroupHeaderStamp(const CxxRequestGroup& group,
                              std::filesystem::file_time_type& newest) const;
     uint64_t CxxGroupHeaderHash(const CxxRequestGroup& group) const;
+    bool RequestGeneratedCxxWrapper(const CxxRequestGroup& group,
+                                    const std::string& wrapperSource,
+                                    const std::string& wrapperName,
+                                    const std::string& cacheTag,
+                                    CSigEntry& signature,
+                                    std::string& error);
+    std::string CxxBraceElementSpelling(const CxxBraceArgument& brace,
+                                        const std::string& targetParameter) const;
+    static void ExpandCxxBraceArguments(std::vector<NamedVariable>& arguments,
+                                        const std::vector<CxxBraceArgument>& braceArguments);
+    static void DiscardCxxBraceArguments(std::vector<NamedVariable>& arguments,
+                                         const std::vector<CxxBraceArgument>& braceArguments);
     int ClassifyCxxSignatureSpelling(const std::string& spelling,
                                      const std::unordered_set<std::string>* localEnums,
                                      std::string& identity, std::string& named);
