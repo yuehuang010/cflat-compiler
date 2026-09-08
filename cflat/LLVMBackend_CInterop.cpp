@@ -132,7 +132,7 @@ std::string LLVMBackend::SqueezeCxxSpelling(const std::string& spelling)
 
 void LLVMBackend::RejectThrowingCxxFunction(const FunctionSymbol& symbol, const std::string& displayName) const
 {
-        if (!symbol.IsCxx || symbol.IsNoexcept || cppAssumeNoexcept_) return;
+        if (!symbol.IsCxx || symbol.IsNoexcept || !cppStrictNoexcept_) return;
         LogError(std::format("call to '{}' may throw - C++ exceptions are not supported yet; "
                              "declare it noexcept or wrap it in an extern \"C\" noexcept function",
                              displayName));

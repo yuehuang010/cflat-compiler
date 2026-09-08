@@ -22,7 +22,8 @@
 # internal/issue/init-cache-state-drop-invisible-on-posix.md.
 #
 # Per-test compiler flags: a first line `// cflat-args: <flags>` in a Test/*.cb is read by
-# cb_extra_args() below and appended to that test's compile command. See test_c_interop.cb.
+# cb_extra_args() below and appended to that test's compile command. Error fixtures use a
+# `<name>.cb.flags` sidecar instead (flags=..., see run_err).
 #
 # SKIP list: tests that cannot pass on Linux because they exercise Windows-only
 # functionality. These are TEST-CONTENT or unrelated-subsystem limitations, not
@@ -145,8 +146,7 @@ write_result() {
 
 # Per-test compiler flags: a Test/*.cb whose FIRST line is `// cflat-args: <flags>` is compiled
 # with those extra flags appended. One line in the test itself, so the flag travels with the test
-# instead of becoming a name-matched special case in this script. Used by test_c_interop.cb for
-# --cpp-assume-noexcept (libc++ members carry no noexcept specification).
+# instead of becoming a name-matched special case in this script.
 cb_extra_args() {
   local first; first="$(head -n 1 "$1" 2>/dev/null)"
   case "$first" in
@@ -272,13 +272,15 @@ fi
 err_list=""
 err_files=()
 err_discovery_files=()
+err_sidecar_files=()
 if [ -d "$SRC/errors" ]; then
   for f in "$SRC"/errors/err_*.cb; do
     n="$(basename "$f" .cb)"
     is_err_skipped "$n" && continue
     err_list="$err_list$f"$'\n'
     err_files+=("$f")
-    err_discovery_files+=("$f")
+    # A fixture with a `.cb.flags` sidecar is discovered one at a time below, with its flags.
+    if [ -f "$f.flags" ]; then err_sidecar_files+=("$f"); else err_discovery_files+=("$f"); fi
   done
   if [ -d "$SRC/errors/policy" ]; then
     for f in "$SRC"/errors/policy/err_*.cb; do
@@ -303,10 +305,11 @@ if [ "$RUN_MODE" -eq 0 ] && [ "${#err_discovery_files[@]}" -gt 0 ]; then
   fi
 fi
 
-# Policy fixtures carry their own --isolated sidecars, so discover their diagnostic
-# templates one file at a time; expected failures are data, not discovery errors.
-if [ "$RUN_MODE" -eq 0 ] && [ -d "$SRC/errors/policy" ]; then
-  for f in "$SRC"/errors/policy/err_*.cb; do
+# Sidecar fixtures (every policy fixture, plus any top-level err_*.cb with a `.cb.flags`) carry
+# their own flags, so discover their diagnostic templates one file at a time; expected failures
+# are data, not discovery errors.
+if [ "$RUN_MODE" -eq 0 ]; then
+  for f in "${err_sidecar_files[@]}" "$SRC"/errors/policy/err_*.cb; do
     [ -f "$f" ] || continue
     load_err_flags "$f.flags"
     "$CFLAT" --locale pseudo --update-locale en-pseudo --locale-dir "$LOCALE_DIR" \

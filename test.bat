@@ -52,8 +52,7 @@ if "%~1"=="--worker-cb" (
     set OUT=%CFLAT_OUT%
     if not defined CFLAT_PLATFORM_FLAG set CFLAT_PLATFORM_FLAG=
     REM Per-test compiler flags: a test whose FIRST line is `// cflat-args: <flags>` is
-    REM compiled with those flags appended (test.sh has the same convention). Used by
-    REM test_c_interop.cb for --cpp-assume-noexcept.
+    REM compiled with those flags appended (test.sh has the same convention).
     set CB_ARGS=
     REM /n numbers the matches; the ":1:" filter keeps LINE 1 only, so a mid-file mention of the
     REM marker cannot add flags on Windows that test.sh (head -n 1) would never see.

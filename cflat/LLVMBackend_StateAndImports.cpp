@@ -1434,8 +1434,8 @@ void LLVMBackend::SetNoCache(bool v)
 void LLVMBackend::SetCHeaderCacheDeep(bool v)
 { cHeaderCacheDeep_ = v; }
 
-void LLVMBackend::SetCppAssumeNoexcept(bool v)
-{ cppAssumeNoexcept_ = v; }
+void LLVMBackend::SetCppStrictNoexcept(bool v)
+{ cppStrictNoexcept_ = v; }
 
 void LLVMBackend::SetWindowsSubsystem(const std::string& v)
 { windowsSubsystem_ = v; }

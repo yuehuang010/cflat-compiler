@@ -1,7 +1,7 @@
-// cflat-args: --cpp-assume-noexcept
-// (the line above is read by test.sh / test.bat: sections M8-M9 call libc++ members, which
-// carry no noexcept specification - Test/errors/err_cpp_template_may_throw.cb proves the
-// gate is still on by default)
+// Sections M8-M9 call libc++ members that carry no noexcept specification. Following clang,
+// such calls are allowed by default (an escaping exception terminates the program);
+// Test/errors/err_cpp_template_may_throw.cb proves the opt-in --cpp-strict-noexcept gate.
+//
 // End-to-end C-interop coverage. Each section exercises one path of the C-interop
 // pipeline; on failure the section's exit code identifies which one regressed.
 //

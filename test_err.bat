@@ -65,9 +65,12 @@ set /a MOD_DIV=%~2
 set /a CTR=0
 set "GROUPFILES="
 for %%F in (%SRC%\errors\err_*.cb) do (
-    set /a MOD=CTR %% MOD_DIV
-    if !MOD!==!MOD_REM! set "GROUPFILES=!GROUPFILES! %SRC%\errors\%%~nxF"
-    set /a CTR+=1
+    REM A file with a `.cb.flags` sidecar needs its own flags, so it runs alone (see below).
+    if not exist "%%F.flags" (
+        set /a MOD=CTR %% MOD_DIV
+        if !MOD!==!MOD_REM! set "GROUPFILES=!GROUPFILES! %SRC%\errors\%%~nxF"
+        set /a CTR+=1
+    )
 )
 if defined GROUPFILES (
     echo === error group %~1 of %~2 ===
@@ -80,13 +83,14 @@ if defined GROUPFILES (
 exit /b
 
 :RunPolicyModuloGroup
-REM Policy files carry sidecars, so each matching file gets its own compiler invocation.
+REM Sidecar files (`<name>.cb.flags`, every policy fixture plus any top-level err_*.cb that
+REM carries one) need their own flags, so each gets its own compiler invocation.
 set /a POLICY_REM=%~1
 set /a POLICY_DIV=%~2
 set /a POLICY_CTR=0
 set POLICY_FILES_FOUND=0
-for %%F in (%SRC%\errors\policy\err_*.cb) do (
-    if exist "%%F" (
+for %%F in (%SRC%\errors\policy\err_*.cb %SRC%\errors\err_*.cb) do (
+    if exist "%%F.flags" (
         set /a POLICY_MOD=POLICY_CTR %% POLICY_DIV
         if !POLICY_MOD!==!POLICY_REM! (
             set POLICY_FILES_FOUND=1
@@ -191,9 +195,15 @@ exit /b
 
 :Discover
 set "DISCOVERY_FILES="
-for %%F in (%SRC%\errors\err_*.cb) do set "DISCOVERY_FILES=!DISCOVERY_FILES! "%SRC%\errors\%%~nxF""
+for %%F in (%SRC%\errors\err_*.cb) do if not exist "%%F.flags" set "DISCOVERY_FILES=!DISCOVERY_FILES! "%SRC%\errors\%%~nxF""
 %COMPILER% --locale pseudo --update-locale en-pseudo --locale-dir "%CFLAT_LOCALE_DIR%" --check -i %LIB% --nologo !DISCOVERY_FILES!
 if errorlevel 1 exit /b 1
+REM Top-level fixtures with a `.cb.flags` sidecar are discovered one at a time, with their flags.
+for %%F in (%SRC%\errors\err_*.cb) do if exist "%%F.flags" (
+    call :LoadPolicyFlags "%%F"
+    %COMPILER% --locale pseudo --update-locale en-pseudo --locale-dir "%CFLAT_LOCALE_DIR%" --check -i %LIB% --nologo !POLICY_FLAGS! "%%F"
+    if errorlevel 1 exit /b 1
+)
 if /I "!CFLAT_POLICY_SUPPORTED!"=="0" (
     for %%F in (%SRC%\errors\policy\err_*.cb) do if exist "%%F" echo SKIP: policy\%%~nF.cb - --isolated is not supported on this host
     exit /b 0

@@ -1,5 +1,6 @@
 // A C++ declaration without a noexcept specification can unwind, and cflat emits no
-// landing pads. Binding it - by call or by function pointer - must be refused.
+// landing pads. Under --cpp-strict-noexcept (this file's .flags sidecar) binding it - by call or
+// by function pointer - must be refused; by default the call is allowed, as in clang.
 import cpp "cpp_interop_basic.h";
 
 expect_error("may throw - C++ exceptions are not supported yet") {

@@ -3097,7 +3097,7 @@ private:
     // Set when a C++ source or header is imported. This selects the C++ driver/runtime at
     // native compile/link time; ordinary C imports keep the existing C-only path.
     bool cppInteropUsed_ = false;
-    bool cppAssumeNoexcept_ = false;
+    bool cppStrictNoexcept_ = false;
     /*
      * M5b - ONE `import cpp` statement: its headers in the order the statement spells them, its
      * -D defines, the namespaces it seeded and the qualified C++ names it published. A type
@@ -8846,7 +8846,7 @@ public:
     // When true, headers opted into the disk cache (via the `cache` import clause) record and
     // validate every transitively-included file's mtime/hash rather than just the top header.
     void SetCHeaderCacheDeep(bool v);
-    void SetCppAssumeNoexcept(bool v);
+    void SetCppStrictNoexcept(bool v);
     void SetWindowsSubsystem(const std::string& v);
 
     const std::vector<std::string>& GetDependencyFiles() const { return dependencyFiles_; }

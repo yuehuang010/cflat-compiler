@@ -470,12 +470,12 @@ class LspServer
 public:
     LspServer(int protocolFd, const std::string& runtimeDir, const std::vector<std::string>& importDirs, bool verbose,
               unsigned int poolSizeOverride = 0, bool ftimeTrace = false,
-              bool cppAssumeNoexcept = false)
+              bool cppStrictNoexcept = false)
         : loop_(protocolFd, verbose)
         , runtimeDir_(runtimeDir)
         , importSearchDirs_(importDirs)
         , verbose_(verbose)
-        , cppAssumeNoexcept_(cppAssumeNoexcept)
+        , cppStrictNoexcept_(cppStrictNoexcept)
         , timeTraceEnabled_(ftimeTrace)
         , currentIndex_(std::make_shared<LspSymbolIndex>())
     {
@@ -2230,7 +2230,7 @@ private:
                 diagnostics.push_back(diag);
             });
             backend->SetSymbolSink(newIndex.get());
-            backend->SetCppAssumeNoexcept(cppAssumeNoexcept_);
+            backend->SetCppStrictNoexcept(cppStrictNoexcept_);
             backend->SetAnalyzeDebugInfo(job.analyzeDebugInfo);
 
             bool ok = false;
@@ -2918,9 +2918,9 @@ private:
     std::string diagnosticLocale_ = "en";
     bool localeFromEnvironment_ = false;
     std::vector<std::string> importSearchDirs_;
-    // Mirrors the compiler's --cpp-assume-noexcept: a workspace built with it must not see the
-    // throw gate reported as an editor error on every C++ call.
-    bool cppAssumeNoexcept_ = false;
+    // Mirrors the compiler's --cpp-strict-noexcept: a workspace built with it must see the
+    // throw gate as an editor error on every potentially-throwing C++ call.
+    bool cppStrictNoexcept_ = false;
 
     std::mutex docsMutex_;
     std::unordered_map<std::string, OpenDocument> docs_;
@@ -3019,7 +3019,7 @@ int RunLspServer(int argc, char* argv[])
     std::vector<std::string> importDirs;
     unsigned int poolSizeOverride = 0;
     bool ftimeTrace = false;
-    bool cppAssumeNoexcept = false;
+    bool cppStrictNoexcept = false;
     for (int i = 0; i < argc; ++i)
     {
         std::string_view arg(argv[i]);
@@ -3034,13 +3034,13 @@ int RunLspServer(int argc, char* argv[])
         }
         else if (arg == "-ftime-trace" || arg == "--ftime-trace")
             ftimeTrace = true;
-        else if (arg == "--cpp-assume-noexcept")
-            cppAssumeNoexcept = true;
+        else if (arg == "--cpp-strict-noexcept")
+            cppStrictNoexcept = true;
     }
 
     if (verbose) std::cerr << "[lsp] server starting\n";
     LspServer server(protocolFd, runtimeDir, importDirs, verbose, poolSizeOverride, ftimeTrace,
-                     cppAssumeNoexcept);
+                     cppStrictNoexcept);
     if (verbose) std::cerr << "[lsp] entering Run()\n";
     server.Run();
     if (verbose) std::cerr << "[lsp] Run() returned\n";

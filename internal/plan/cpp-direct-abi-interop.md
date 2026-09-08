@@ -183,10 +183,12 @@ boundaries" rule; nothing new is tracked.
 
 - Every unsupported construct is a `LogError` at the CFlat use site, carrying Clang's
   diagnostic text after a `-` separator. Every user-facing name is demangled.
-- Potentially-throwing calls are an error until M8: "call to 'ns.f' may throw - C++
-  exceptions are not supported yet". Detection is Clang's `noexcept` analysis. The CLI
-  flag `--cpp-assume-noexcept` downgrades the gate (a thrown exception terminates); it
-  exists so libc++ containers are usable before M8 and is off by default.
+- Potentially-throwing calls follow clang's default (ruling 2026-09-08): the call is
+  allowed and an exception escaping into a CFlat frame terminates the program, exactly as
+  it would through a C frame. The opt-in `--cpp-strict-noexcept` refuses such calls with
+  "call to 'ns.f' may throw - C++ exceptions are not supported yet"; detection is Clang's
+  `noexcept` analysis. (Until 2026-09-08 the gate was on by default with
+  `--cpp-assume-noexcept` as the escape hatch; every real header needed it.)
 - `--check`, `--out-lli`, `-o`, and `--run` all work; companion-module static initializers
   run under `--run`.
 
@@ -256,9 +258,9 @@ defaulted/implicit special members are defined by Clang; `operator[]` binds to t
 expression and `operator==` to the overload table. Acceptance met on libc++:
 `std.vector<int>`, `std.vector<double>`, `std.string` (ctor from literal, append, size,
 c_str, compare), `std.vector<std.string>`, `std.vector<cppi.Tracked>` with every element
-destroyed exactly once. `--cpp-assume-noexcept` (off by default, honoured by the LSP)
-makes non-noexcept libc++ members callable until M8; tests opt in through a first-line
-`// cflat-args:` comment read by `test.sh`/`test.bat`. The `String` token is now legal
+destroyed exactly once. Non-noexcept libc++ members are callable by default (clang's
+stance, see "Errors, diagnostics, and modes"); the four err_cpp_*_may_throw fixtures opt
+into `--cpp-strict-noexcept` through a `.cb.flags` sidecar. The `String` token is now legal
 after a dot in the grammar so `std.string` parses.
 
 Not covered, refused with precise errors: nontrivial class parameters at C++
@@ -312,8 +314,7 @@ lowering paths.
 
 Exit: C++ throws across a CFlat frame and is caught in C++, with every live CFlat and C++
 owned object cleaned up correctly; a CFlat-side catch and noexcept termination verified in
-a subprocess. Only then lift the potentially-throwing-call restriction and retire
-`--cpp-assume-noexcept`.
+a subprocess. Only then decide whether `--cpp-strict-noexcept` stays as a lint or goes.
 
 ### M9 - Production imports, runtime support, cache, and tooling - OPEN
 
@@ -355,8 +356,8 @@ overrides, and destroys it correctly, including multiple inheritance if advertis
 Ruled 2026-09-06: import spelling (`import cpp` before the path); prototype order
 (primitives and pointers, then trivial records, classes, polymorphism, templates);
 move-from (consumed, dtor still runs); const overloads (prefer non-const, revisit);
-construction spelling (`T(args)`, `= default`); `--cpp-assume-noexcept` as the interim
-exception stance.
+construction spelling (`T(args)`, `= default`); clang's default exception stance with
+`--cpp-strict-noexcept` opt-in.
 
 Ruled 2026-09-06, rvalue-reference parameters (`T&&`). Root cause of the M5 finding: the type
 mapper folds `&` and `&&` onto the same `alias T` (LLVMBackend_CInterop.cpp, reference
