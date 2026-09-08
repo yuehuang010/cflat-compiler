@@ -1632,19 +1632,47 @@ bool LLVMBackend::MapRawSig(const cflat_cinterop::RawSig& r, CSigEntry& e)
 
 static std::string AutoCxxForeignIdentity(const std::string& spelling)
 {
-        std::string out;
-        for (size_t i = 0; i < spelling.size(); ++i)
+        // Keep multi-word primitive template arguments aligned with the CFlat spellings emitted
+        // by CxxSpellingForCflatType (for example vector<unsigned char> -> vector$u8).
+        std::string normalized = spelling;
+        for (const auto& [from, to] : std::array<std::pair<std::string_view, std::string_view>, 6>{
+                 std::pair{ "signed char", "i8" },
+                 std::pair{ "unsigned char", "u8" },
+                 std::pair{ "unsigned short", "u16" },
+                 std::pair{ "unsigned int", "u32" },
+                 std::pair{ "unsigned long long", "u64" },
+                 std::pair{ "long long", "i64" } })
         {
-            if (spelling[i] == ':' && i + 1 < spelling.size() && spelling[i + 1] == ':')
+            for (size_t pos = 0; (pos = normalized.find(from, pos)) != std::string::npos; )
+            {
+                const bool leftOk = pos == 0
+                    || (!std::isalnum((unsigned char)normalized[pos - 1])
+                        && normalized[pos - 1] != '_');
+                const size_t end = pos + from.size();
+                const bool rightOk = end == normalized.size()
+                    || (!std::isalnum((unsigned char)normalized[end]) && normalized[end] != '_');
+                if (leftOk && rightOk)
+                {
+                    normalized.replace(pos, from.size(), to);
+                    pos += to.size();
+                }
+                else
+                    pos = end;
+            }
+        }
+        std::string out;
+        for (size_t i = 0; i < normalized.size(); ++i)
+        {
+            if (normalized[i] == ':' && i + 1 < normalized.size() && normalized[i + 1] == ':')
             { out += '.'; ++i; continue; }
-            if (spelling[i] == '<' || spelling[i] == ',') { out += '$'; continue; }
-            if (spelling[i] == '>') continue;
-            if (std::isspace((unsigned char)spelling[i])) continue;
-            if (spelling[i] == '*') { out += "ptr"; continue; }
-            if (spelling[i] == '&') { out += "ref"; continue; }
-            if (std::isalnum((unsigned char)spelling[i]) || spelling[i] == '_'
-                || spelling[i] == '.' || spelling[i] == '$')
-                out += spelling[i];
+            if (normalized[i] == '<' || normalized[i] == ',') { out += '$'; continue; }
+            if (normalized[i] == '>') continue;
+            if (std::isspace((unsigned char)normalized[i])) continue;
+            if (normalized[i] == '*') { out += "ptr"; continue; }
+            if (normalized[i] == '&') { out += "ref"; continue; }
+            if (std::isalnum((unsigned char)normalized[i]) || normalized[i] == '_'
+                || normalized[i] == '.' || normalized[i] == '$')
+                out += normalized[i];
             else
                 out += '_';
         }
@@ -4879,6 +4907,17 @@ void LLVMBackend::RegisterCxxClassMembers(const CRecordEntry& r, const std::stri
                     : std::format("returns unsupported type '{}'", m.retType));
                 continue;
             }
+            CxxReferenceKind returnRefKind = CxxReferenceKind::None;
+            CxxSpellingWithoutRef(m.retType, &returnRefKind);
+            if (returnRefKind == CxxReferenceKind::Lvalue && ret.Pointer
+                && ret.TypeName == "void")
+            {
+                // An unknown T& is represented as void* by the scalar mapper. Do not turn it
+                // into an alias void result: that would declare a different LLVM return type
+                // from clang and report a misleading ABI mismatch.
+                refuse(std::format("returns a reference to unsupported type '{}'", m.retType));
+                continue;
+            }
             /*
              * A C++ LVALUE REFERENCE return (`int &`, `std::string &` - what `operator[]` and
              * `back()` hand out) is a borrowed lvalue, which is exactly CFlat's `alias T`: the
@@ -5115,6 +5154,7 @@ bool LLVMBackend::TryBindRefusedCxxMember(const std::string& typeName,
             return false;
 
         std::map<std::string, std::string> requests;
+        std::set<std::string> successfulSpellings;
         for (const auto& member : recordIt->second.members)
         {
             if (member.name != memberName
@@ -5123,7 +5163,15 @@ bool LLVMBackend::TryBindRefusedCxxMember(const std::string& typeName,
                 continue;
             auto addSpelling = [&](const std::string& raw) {
                 const std::string spelling = CxxMemberValueSpelling(raw);
-                if (spelling.find('<') == std::string::npos) return;
+                if (spelling.find("::") == std::string::npos) return;
+                TypeAndValue mapped;
+                bool mappedForeign = false;
+                const bool mapFound = TryMapCxxForeignSpelling(spelling, mapped, mappedForeign);
+                if (mapFound && mappedForeign)
+                {
+                    successfulSpellings.insert(spelling);
+                    return;
+                }
                 const std::string identity = AutoCxxForeignIdentity(spelling);
                 if (!identity.empty()) requests.emplace(identity, spelling);
             };
@@ -5131,19 +5179,18 @@ bool LLVMBackend::TryBindRefusedCxxMember(const std::string& typeName,
             if (unsupportedParameter || incompleteParameter)
                 for (const auto& spelling : member.paramTypes) addSpelling(spelling);
         }
-        if (requests.empty()) return false;
+        if (requests.empty() && successfulSpellings.empty()) return false;
 
         auto ownerIt = cxxTypeOwnerGroup_.find(typeName);
         if (ownerIt == cxxTypeOwnerGroup_.end()) return false;
         CxxRequestGroup group = MakeCxxRequestGroup(ownerIt->second, {});
         if (group.headers.empty()) return false;
         CxxRequestGroupScope groupScope(*this, &group);
-        std::set<std::string> successfulSpellings;
         for (const auto& [identity, spelling] : requests)
         {
             std::string error;
             if (RequestCxxForeignType(identity, spelling, error, /*needDefinitions*/ true,
-                                       /*explicitInstantiation*/ true))
+                                      /*explicitInstantiation*/ true))
                 successfulSpellings.insert(spelling);
         }
         if (successfulSpellings.empty()) return false;
@@ -5193,9 +5240,10 @@ bool LLVMBackend::TryBindRefusedCxxMember(const std::string& typeName,
                 const std::string spelling = CxxMemberValueSpelling(raw);
                 return successfulSpellings.count(spelling) != 0;
             };
-            if ((incompleteReturn && wasRequested(member.retType))
-                || (incompleteParameter && std::any_of(member.paramTypes.begin(),
-                                                        member.paramTypes.end(), wasRequested)))
+            if (((unsupportedReturn || incompleteReturn) && wasRequested(member.retType))
+                || ((unsupportedParameter || incompleteParameter)
+                    && std::any_of(member.paramTypes.begin(),
+                                   member.paramTypes.end(), wasRequested)))
                 member.bindRefusal.clear();
         }
         RegisterCxxClassMembers(reboundRecord, fileForLsp, memberName);

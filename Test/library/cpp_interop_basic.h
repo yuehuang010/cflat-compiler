@@ -6,6 +6,7 @@
 
 #include <functional>
 #include <array>
+#include <cstddef>
 #include <memory>
 #include <map>
 #include <optional>
@@ -80,6 +81,31 @@ namespace cppi
     {
     public:
         static constexpr int kLimit = 32;
+    };
+
+    struct AnonEnumHolder
+    {
+        enum { kAnon = 5, kOther = 9 };
+        int v;
+        AnonEnumHolder() noexcept : v(kAnon) {}
+        int get() const noexcept { return v; }
+    };
+
+    struct NullDefaulted
+    {
+        long v;
+        NullDefaulted(std::nullptr_t = nullptr) noexcept : v(7) {}
+        long get() const noexcept { return v; }
+    };
+
+    struct IntPick
+    {
+        long which;
+        explicit IntPick(int) noexcept : which(1) {}
+        explicit IntPick(long) noexcept : which(2) {}
+        explicit IntPick(unsigned) noexcept : which(3) {}
+        explicit IntPick(long long) noexcept : which(4) {}
+        explicit IntPick(double) noexcept : which(5) {}
     };
 
     class Variadic

@@ -1328,9 +1328,14 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             }
                             else
                             {
+                                const std::string resolvedQualifiedName =
+                                    Compiler(ctx)->ResolveTypeAlias(qualifiedName);
+                                const bool qualifiedDataStructure =
+                                    Compiler(ctx)->IsDataStructure(qualifiedName)
+                                    || Compiler(ctx)->IsDataStructure(resolvedQualifiedName);
                                 // A C++ alias not yet requested (`nlohmann.json.parse(...)`):
                                 // bring the specialization in under its alias name first.
-                                if (!isFileAlias && !Compiler(ctx)->IsDataStructure(qualifiedName)
+                                if (!isFileAlias && !qualifiedDataStructure
                                     && Compiler(ctx)->HasCxxImportGroup()
                                     && IsFollowedByDot(ctx, terminal))
                                 {
@@ -1338,14 +1343,15 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     Compiler(ctx)->TryRequestCxxType(qualifiedName, {}, qualifiedName, cxxError);
                                     if (!cxxError.empty()) LogErrorContext(ctx, cxxError);
                                 }
-                                if (!isFileAlias && Compiler(ctx)->IsDataStructure(qualifiedName)
+                                if (!isFileAlias && qualifiedDataStructure
                                     && Compiler(ctx)->GetLocalVariable(memberName).Storage == nullptr
                                     && Compiler(ctx)->GetFunctionArgument(memberName).GetValue() == nullptr)
                                 {
                                     // A namespace-qualified aggregate is a type qualifier for a
                                     // following static member call (N.S.f()), not a namespace value.
-                                    namespaceContext = qualifiedName;
-                                    primaryIdentifier = qualifiedName;
+                                    namespaceContext = Compiler(ctx)->IsDataStructure(qualifiedName)
+                                        ? qualifiedName : resolvedQualifiedName;
+                                    primaryIdentifier = namespaceContext;
                                     namedVar = {};
                                     structVar = {};
                                     interfaceVar = {};

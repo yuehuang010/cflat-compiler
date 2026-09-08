@@ -3556,6 +3556,7 @@ CFlatParser::ArgumentExpressionListContext* MainListener::ForeignCxxConstructArg
         if (full.compare(full.size() - suffix.size(), suffix.size(), suffix) != 0) return nullptr;
         const std::string callee = full.substr(0, full.size() - suffix.size());
         if (callee == typeName) return args[0];
+        if (Compiler(pf)->ResolveTypeAlias(callee) == typeName) return args[0];
         // A C++ CLASS TEMPLATE is REGISTERED under its mangled generic name, while the ctor call
         // is spelled with CFlat's angle syntax (`cppt.Box<int>(7)`). Re-mangle the spelling to
         // compare identities. Nested angle arguments are left to the ordinary diagnostic.

@@ -76,6 +76,22 @@ namespace cppt
         T v_;
     };
 
+    template <typename T, typename Tag = void>
+    class Tagged
+    {
+    public:
+        Tagged() noexcept : v_() {}
+        explicit Tagged(T v) noexcept : v_(v) {}
+        T get() const noexcept { return v_; }
+        std::string name() const { return "tagged"; }
+
+    private:
+        T v_;
+    };
+
+    using TaggedInt = Tagged<int>;
+    namespace deep { using TaggedLong = Tagged<long>; }
+
     // Trivially copyable for calls (returned in registers), yet a C++ class with constructors.
     class Slot
     {

@@ -79,6 +79,9 @@
 //                       as pointers, extern "C" bare linkage, nested namespaces,
 //                       widening and narrow-unsigned round trips, scoped-enum params,
 //                       records by pointer. Primitives and bare pointers only.
+//   Section M21 (766-773): C++ lazy aliases, unnamed nested enums, nullptr defaults,
+//                       exact constructor ranking, and member signatures that request
+//                       nested std::string specializations.
 
 import "library/c_alias_order_alias.h";
 import "library/c_alias_order_real.h";
@@ -1943,6 +1946,25 @@ extern int main()
     if ((int)cppi.return_string_view(cppi.take_string_view(m20sv.substr(1, 3))).size() != 3
         || cppi.return_string_view(cppi.take_string_view(m20sv.substr(1, 3)))[2] != 'l') return 745;
     if (cppi.sum_varargs(4, 1, 2, 3, 4) != 10)     return 746;
+
+    // ---- Section M21: lazy aliases and exact C++ interop surfaces (766-773) ----
+    cppi.AnonEnumHolder m21anon = default;
+    if (m21anon.get() != 5)                          return 766;
+    cppi.NullDefaulted m21null = default;
+    if (m21null.get() != 7)                         return 767;
+    cppi.IntPick m21int = cppi.IntPick(42);
+    if (m21int.which != 1)                          return 768;
+    i64 m21longArg = 42;
+    cppi.IntPick m21long = cppi.IntPick(m21longArg);
+    if (m21long.which != 2)                         return 769;
+    cppi.IntPick m21double = cppi.IntPick(2.5);
+    if (m21double.which != 5)                       return 770;
+    cppt.TaggedInt m21tagged = cppt.TaggedInt(11);
+    if (m21tagged.get() != 11)                      return 771;
+    std.string m21taggedName = m21tagged.name();
+    if (strcmp(m21taggedName.c_str(), "tagged") != 0) return 772;
+    cppt.deep.TaggedLong m21taggedLong = default;
+    if (m21taggedLong.get() != 0)                   return 773;
 
     return 0;
 }

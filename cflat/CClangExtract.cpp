@@ -2217,6 +2217,37 @@ namespace cflat_cinterop
              * about a variable it was handed. Hand each one over explicitly so the request below
              * has a deferred definition to promote instead of just a declaration.
             */
+            // A requested template can instantiate an inline or constexpr static data member
+            // transitively (nlohmann::detail::static_const<T>::value is one example). Those
+            // specializations are not top-level declarations and are not members of the
+            // requested record, but an emitted body can still odr-use them. Queue the used
+            // definitions explicitly so CodeGen emits their linkonce_odr storage.
+            struct UsedStaticVarVisitor : RecursiveASTVisitor<UsedStaticVarVisitor>
+            {
+                ExtractState& state;
+                std::unordered_set<const VarDecl*> seen;
+
+                explicit UsedStaticVarVisitor(ExtractState& s) : state(s)
+                {
+                    for (const VarDecl* vd : state.varEmitWork) seen.insert(vd);
+                }
+
+                bool shouldVisitTemplateInstantiations() const { return true; }
+
+                bool VisitVarDecl(VarDecl* vd)
+                {
+                    if (!vd->isStaticDataMember() || !vd->isUsed()
+                        || (!vd->isConstexpr() && !vd->isInline()))
+                        return true;
+                    const VarDecl* definition = vd->getDefinition();
+                    if (definition == nullptr) definition = vd;
+                    if (seen.insert(definition).second)
+                        state.varEmitWork.push_back(definition);
+                    return true;
+                }
+            } usedStaticVars(st);
+            usedStaticVars.TraverseDecl(ctx.getTranslationUnitDecl());
+
             for (const VarDecl* vd : st.varEmitWork)
                 if (vd != nullptr && !declHasErrors(vd))
                     cg.HandleTopLevelDecl(DeclGroupRef(const_cast<VarDecl*>(vd)));
