@@ -3336,6 +3336,9 @@ private:
         bool isBitfield = false;
         unsigned bitWidth = 0;
         uint64_t offsetBytes = 0;
+        uint64_t sizeBytes = 0;    // clang's size/alignment of the field type (0 for a bitfield)
+        uint64_t alignBytes = 0;
+        uint64_t bitOffset = 0;    // bitfield only: clang's absolute bit offset in the record
     };
     struct CRecordEntry
     {
@@ -5221,6 +5224,7 @@ private:
     static std::string ConstIntValueSuffix(const std::string& typeName, long long value);
 
     void RegisterCEnums(const std::vector<CEnumEntry>& enums, const std::string& fileForLsp);
+    bool MakeOpaqueFieldBlob(const CRecordFieldEntry& f, DeclTypeAndValue& out) const;
 
     void RegisterCGlobals(const std::vector<CGlobalEntry>& globals, const std::string& fileForLsp);
 
@@ -7135,7 +7139,8 @@ public:
     // C++ record layout gate: compare the LLVM struct CFlat built against clang's own size,
     // alignment and field offsets. LogError on any difference - a silent mismatch would corrupt
     // every by-value exchange of that record.
-    void VerifyCxxRecordLayout(const CRecordEntry& r);
+    // Empty when cflat reproduced clang's layout; otherwise the mismatch, for a per-record refusal.
+    std::string VerifyCxxRecordLayout(const CRecordEntry& r);
 
     // Insert unnamed filler fields so the LLVM struct reproduces clang's field offsets.
     void InsertCxxLayoutPadding(const CRecordEntry& r, std::vector<DeclTypeAndValue>& fields);

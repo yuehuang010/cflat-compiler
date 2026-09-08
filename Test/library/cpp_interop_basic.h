@@ -114,6 +114,12 @@ namespace cppi
     int default_double_ptr(double value = 2.5, int* marker = nullptr) noexcept;
     int helper() noexcept;
     int with_call_default(int v, int k = helper()) noexcept;
+    int default_extra() noexcept;
+    int default_callback(int value) noexcept;
+    int default_fn_arg(int value, int (*fn)(int) = default_callback,
+                       int extra = default_extra()) noexcept;
+    int default_array_arg(int bias, const int (&a)[3] = {1, 2, 3},
+                          int extra = default_extra()) noexcept;
 
     class PrivateDefaultArg
     {

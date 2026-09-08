@@ -119,6 +119,11 @@ namespace cflat_cinterop
         bool isBitfield = false;
         unsigned bitWidth = 0;
         uint64_t offsetBytes = 0;
+        // Clang's size and alignment of the field type in bytes (0 for a bitfield). Lets the
+        // registrar embed a field whose TYPE it cannot map as an opaque, correctly sized blob.
+        uint64_t sizeBytes = 0;
+        uint64_t alignBytes = 0;
+        uint64_t bitOffset = 0;     // bitfield only: Clang's absolute bit offset in the record
         int access = AccessPublic;  // C++ only; C records are all public
     };
 
@@ -406,6 +411,9 @@ namespace cflat_cinterop
         std::vector<RawMacro> macros;
         std::vector<RawFuncMacro> funcMacros;
         std::vector<std::string> includedFiles;  // populated only when req.wantIncludes
+        // Names of generated default-argument wrappers whose declarations or bodies carried
+        // parse/Sema errors and were therefore withheld from CodeGen.
+        std::vector<std::string> droppedCxxDefaultWrappers;
 
         // Companion module produced when req.emitDefinitions is set: raw LLVM bitcode bytes
         // holding the C++ definitions Clang emitted for the bound surface (linkonce_odr inline

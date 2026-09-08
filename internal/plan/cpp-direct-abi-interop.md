@@ -703,6 +703,33 @@ requests on first CFlat use. Not started; needs a brief.
 Remaining from the gap matrix: none open by design; not attempted: unordered_map, set,
 tuple, variant, span, initializer_list (coverage rounds on the same funnel).
 
+Real-world round: Dear ImGui headless, 2026-09-07 (main checkout, uncommitted; on master
+a5b6a952). Goal per the maintainer: "keep looping until imgui is imported". Spike in
+scratch/imgui_spike (not example/): `import cpp "imgui.h"` plus the four ImGui .cpp files,
+CreateContext, GetIO by alias, two NewFrame/Begin/Text/Button/End/Render frames, GetDrawData.
+Result: compiles, links, runs; frame 2 reports 1 command list, 80 vertices, 246 indices
+(frame 1 is empty by ImGui's own first-frame auto-fit rule). Findings, all fixed in the
+working tree and filed under internal/issue/cppinterop/ with their status:
+- ImVector<T> fields dropped the record (12 records) -> opaque field blob of clang's
+  size/alignment (`sz`/`al`/`bo` in the cache, v33); typed access to such a field is still open.
+- `*` inside a template argument list counted as an outer pointer (ImGuiPlatformIO 112 vs
+  120 bytes) -> only `*` after the last `>` is outer; a by-value spelling keeps resolving.
+- Unrepresentable layout was an import-line LogError -> per-record `layoutRefusal`, replayed
+  at the use site; bitfield check compares absolute bit positions; named-bitfield extraction
+  site now fills `bitOffset`.
+- Default-argument wrapper spelled `float (*)(void*, int) a1`; swallowed Sema errors reached
+  CodeGen (placeholder-type unreachable) -> identity-template parameter spelling, error-carrying
+  decls never reach CodeGen, dropped wrapper -> "unsupported" default (Codex; cache v34).
+- `= NULL` on a pointer parameter is `__null` -> classified as nullptr.
+- `alias T x = ref()` for a C++ class hit the local-slot path and demanded a destructor ->
+  alias declarations bypass `TryDeclareForeignCxxLocal`.
+- Overload tie between `Button(a, b = ImVec2(0,0))` and its exact-arity wrapper went to
+  declaration order -> fewer default-filled parameters wins the tie in both tiers.
+Filed, not fixed: mixed-type bitfields pack by MSVC rules on an Itanium target
+(ImFontAtlasRectEntry, per-record refusal only). Verification on the working tree: Release
+suite 862/0/8, LSP green, examples 45/0, err_cpp fixtures via test.sh, warm-cache second
+pass, Debug interop compile (see session log).
+
 Open: per-import `std` clause or CLI-only; exceptions option at M8 start; MSVC ABI pass.
 Open from the M5 review (2026-09-06):
 - LSP and template CodeGen: type requests still run stage-2 CodeGen under the LSP so the
@@ -732,6 +759,7 @@ Open from the M5 review (2026-09-06):
 | 9424d6b1 | collapsed headline: inline definitions, templates, std::vector/std::string, review rounds (M5) | 856 |
 | 86c9befb | collapsed headline: rvalue refs, M7 callbacks, types rounds 1-11, C++ operators, extractor fixes, header cache v29 | 856 |
 | (round 12) | iterators as classes, std::string_view, std::optional completion, variadic free fn, request filters; header cache v30 | 858 |
+| (imgui round) | Dear ImGui headless spike runs: opaque field blobs, template-arg pointer peeling, per-record layout refusal, default wrapper declarators, null defaults, alias of class refs, exact-arity overload tie-break; header cache v34 | 862 |
 
 ## Verification and repository constraints
 

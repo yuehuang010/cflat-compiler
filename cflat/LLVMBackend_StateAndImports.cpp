@@ -1863,6 +1863,9 @@ nlohmann::json LLVMBackend::FieldToJson(const CRecordFieldEntry& f)
         nlohmann::json j = {{"n", f.name}, {"ct", f.ctype}};
         if (f.isBitfield) { j["bf"] = true; j["bw"] = f.bitWidth; }
         if (f.offsetBytes != 0) j["ob"] = f.offsetBytes;
+        if (f.sizeBytes != 0) j["sz"] = f.sizeBytes;
+        if (f.alignBytes != 0) j["al"] = f.alignBytes;
+        if (f.bitOffset != 0) j["bo"] = f.bitOffset;
         if (f.access != 0) j["ac"] = f.access;
         return j;
     }
@@ -1875,6 +1878,9 @@ LLVMBackend::CRecordFieldEntry LLVMBackend::FieldFromJson(const SjVal& j)
         f.isBitfield = j.value("bf", false);
         f.bitWidth   = j.value("bw", 0u);
         f.offsetBytes = j.value("ob", (uint64_t)0);
+        f.sizeBytes = j.value("sz", (uint64_t)0);
+        f.alignBytes = j.value("al", (uint64_t)0);
+        f.bitOffset = j.value("bo", (uint64_t)0);
         f.access    = j.value("ac", 0);
         return f;
     }
@@ -2254,7 +2260,9 @@ bool LLVMBackend::TryLoadCHeaderDiskCache(
         // v27 adds the C++ operator++/--, operator*, operator-> and operator bool members to
         // extraction; older entries must be reparsed because their member lists are incomplete.
         // v28 carries the long-double width, format, and target triple from the clang invocation.
-        if (version != 31) return false;
+        // v34 records a failed generated default wrapper as an unsupported default argument, so
+        // a warm cache cannot re-declare a wrapper whose definition CodeGen dropped.
+        if (version != 34) return false;
 
         // Accept on mtime match (fast) or content hash match (authoritative on mtime drift).
         auto storedMtime = j.value("mtime", int64_t{-1});
@@ -2343,7 +2351,7 @@ void LLVMBackend::WriteCHeaderDiskCache(
         if (ec) return;
 
         nlohmann::json j;
-        j["version"] = 31;
+        j["version"] = 34;
         j["mtime"]   = (int64_t)mtime.time_since_epoch().count();
         j["hash"]    = contentHash;
         j["ldw"]     = entry.longDoubleWidth;

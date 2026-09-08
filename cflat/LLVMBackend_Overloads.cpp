@@ -142,6 +142,10 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
         // per-argument quality, so without it `sb.append(42)` picked append(bool) over append(int)
         // purely by declaration order.
         int bestPossibleBoolCoercions = std::numeric_limits<int>::max();
+        // Parameters the call left to their defaults. An exact-arity overload (the C++ default
+        // wrapper `f(a)` next to `f(a, b = expr)`) beats one that would fill defaults in.
+        int bestPerfectOmitted = std::numeric_limits<int>::max();
+        int bestPossibleOmitted = std::numeric_limits<int>::max();
         // int score = 0; // 2 for promotionMatch, 1 for implicitMatch
 
         for (const auto& pair : candidates)
@@ -479,12 +483,16 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                 ++candidateParamItr;
             }
 
+            const int omitted = candidate.Parameters.size() > arguments.size()
+                ? (int)(candidate.Parameters.size() - arguments.size()) : 0;
             if (perfectMatch)
             {
                 int moveScore = ScoreMoveAgreement(arguments, candidate);
-                if (moveScore > bestPerfectScore)
+                if (moveScore > bestPerfectScore
+                    || (moveScore == bestPerfectScore && omitted < bestPerfectOmitted))
                 {
                     bestPerfectScore = moveScore;
+                    bestPerfectOmitted = omitted;
                     bestPerfect = pair;
                 }
                 continue;
@@ -503,10 +511,13 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                     || (shapeMismatches == bestPossibleShapeMismatches
                         && (boolCoercions < bestPossibleBoolCoercions
                             || (boolCoercions == bestPossibleBoolCoercions
-                                && moveScore >= bestPossibleScore))))   // >= keeps the pre-existing last-wins tie
+                                && (omitted < bestPossibleOmitted
+                                    || (omitted == bestPossibleOmitted
+                                        && moveScore >= bestPossibleScore))))))   // >= keeps the pre-existing last-wins tie
                 {
                     bestPossibleShapeMismatches = shapeMismatches;
                     bestPossibleBoolCoercions = boolCoercions;
+                    bestPossibleOmitted = omitted;
                     bestPossibleScore = moveScore;
                     possibleResult = pair;
                 }

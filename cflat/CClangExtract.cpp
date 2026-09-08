@@ -230,10 +230,20 @@ namespace cflat_cinterop
                 return result;
             }
             init = init->IgnoreParenImpCasts();
-            if (llvm::isa<CXXNullPtrLiteralExpr>(init))
+            // `= nullptr`, `= NULL` (clang's `__null`), `= 0` on a pointer parameter all mean the
+            // null pointer; a pointer default that is anything else is not a constant here.
+            if (llvm::isa<CXXNullPtrLiteralExpr>(init)
+                || (p->getType()->isAnyPointerType()
+                    && init->isNullPointerConstant(ctx, Expr::NPC_ValueDependentIsNotNull)
+                           != Expr::NPCK_NotNull))
             {
                 result.kind = "nullptr";
                 result.value = "nullptr";
+                return result;
+            }
+            if (p->getType()->isAnyPointerType() || p->getType()->isMemberPointerType())
+            {
+                result.kind = "nonconst";
                 return result;
             }
             Expr::EvalResult ev;
@@ -619,6 +629,7 @@ namespace cflat_cinterop
                 // they are free functions despite being declared inside the class.
                 if (fd->getStorageClass() == SC_Static) return true;  // not externally linkable
                 if (st.req.definitionsOnly && !fd->isThisDeclarationADefinition()) return true;
+                if (st.req.cxxMode && fd->getType()->isDependentType()) return true;
                 std::string file; int line = 1, col = 0;
                 if (!LocOf(fd, file, line, col)) return true;
 
@@ -741,6 +752,7 @@ namespace cflat_cinterop
                             rf.bitWidth = f->getBitWidthValue();
                             rf.ctype = CanonicalSpelling(ctx, f->getType());
                             rf.offsetBytes = layout.getFieldOffset(f->getFieldIndex()) / 8;
+                            rf.bitOffset = layout.getFieldOffset(f->getFieldIndex());
                             rec.fields.push_back(std::move(rf));
                             continue;
                         }
@@ -768,6 +780,8 @@ namespace cflat_cinterop
                             fe.name = "__anon" + std::to_string(idx);
                             fe.ctype = (isUnion ? "union " : "struct ") + synTag;
                             fe.offsetBytes = layout.getFieldOffset(f->getFieldIndex()) / 8;
+                            fe.sizeBytes = ctx.getTypeSizeInChars(f->getType()).getQuantity();
+                            fe.alignBytes = ctx.getTypeAlignInChars(f->getType()).getQuantity();
                             rec.fields.push_back(std::move(fe));
                         }
                         continue;  // unnamed non-bitfield non-anon: nothing to record
@@ -777,6 +791,8 @@ namespace cflat_cinterop
                     rf.name = f->getNameAsString();
                     rf.access = MapAccess(f->getAccess());
                     rf.offsetBytes = layout.getFieldOffset(f->getFieldIndex()) / 8;
+                    rf.sizeBytes = ctx.getTypeSizeInChars(f->getType()).getQuantity();
+                    rf.alignBytes = ctx.getTypeAlignInChars(f->getType()).getQuantity();
                     if (st.req.cxxMode && f->getType()->isReferenceType())
                     {
                         rec.layoutRefusal = std::format(
@@ -836,6 +852,7 @@ namespace cflat_cinterop
                     {
                         rf.isBitfield = true;
                         rf.bitWidth = f->getBitWidthValue();
+                        rf.bitOffset = layout.getFieldOffset(f->getFieldIndex());
                     }
                     rec.fields.push_back(std::move(rf));
                 }
@@ -1276,6 +1293,8 @@ namespace cflat_cinterop
                     rf.name = f->getNameAsString();
                     rf.ctype = CanonicalSpelling(ctx, f->getType());
                     rf.offsetBytes = baseOff + layout.getFieldOffset(idx) / 8;
+                    rf.sizeBytes = ctx.getTypeSizeInChars(f->getType()).getQuantity();
+                    rf.alignBytes = ctx.getTypeAlignInChars(f->getType()).getQuantity();
                     rf.access = MapAccess(f->getAccess());
                     // Shadowed by a more derived field of the same name: keep the storage, give it
                     // a reserved name nobody can write. Inherited through a non-public base: keep
@@ -1986,7 +2005,7 @@ namespace cflat_cinterop
                 if (w.memberIdx >= rec.members.size()) continue;
                 RawCxxMember& m = rec.members[w.memberIdx];
                 const CXXMethodDecl* md = w.md;
-                if (md->isVariadic()) continue;
+                if (md->isInvalidDecl() || md->getType()->isDependentType() || md->isVariadic()) continue;
 
                 /*
                  * M6 - the vtable slot of a virtual member, straight from Clang's Itanium vtable
@@ -2097,20 +2116,65 @@ namespace cflat_cinterop
                 return pl.isValid() && PathInScope(pl.getFilename(), st.normDirs);
             };
 
+            auto rememberDroppedWrapper = [&](const FunctionDecl* fd) {
+                if (fd == nullptr) return;
+                std::string name = fd->getNameAsString();
+                if (!name.starts_with("__cflat_dflt_")) return;
+                if (name.ends_with("_cpp")) name.resize(name.size() - 4);
+                if (std::find(st.out.droppedCxxDefaultWrappers.begin(),
+                              st.out.droppedCxxDefaultWrappers.end(), name)
+                    == st.out.droppedCxxDefaultWrappers.end())
+                    st.out.droppedCxxDefaultWrappers.push_back(std::move(name));
+            };
+            auto declHasErrors = [&](const Decl* d) {
+                if (d == nullptr || d->isInvalidDecl()) return true;
+                if (const auto* fd = llvm::dyn_cast<FunctionDecl>(d))
+                {
+                    struct ErrorExprVisitor : RecursiveASTVisitor<ErrorExprVisitor>
+                    {
+                        bool found = false;
+                        bool VisitExpr(Expr* expr)
+                        {
+                            found = found || expr->containsErrors();
+                            return !found;
+                        }
+                    } visitor;
+                    if (fd->getBody() != nullptr) visitor.TraverseStmt(fd->getBody());
+                    return visitor.found;
+                }
+                if (const auto* vd = llvm::dyn_cast<VarDecl>(d))
+                    return vd->getInit() != nullptr && vd->getInit()->containsErrors();
+                return false;
+            };
+            auto emitDecl = [&](Decl* d, auto&& emitDeclRef) -> void {
+                if (d == nullptr || !inScopeDecl(d)) return;
+                if (const auto* linkage = llvm::dyn_cast<LinkageSpecDecl>(d))
+                {
+                    for (Decl* member : linkage->decls()) emitDeclRef(member, emitDeclRef);
+                    return;
+                }
+                if (declHasErrors(d))
+                {
+                    rememberDroppedWrapper(llvm::dyn_cast<FunctionDecl>(d));
+                    return;
+                }
+                cg.HandleTopLevelDecl(DeclGroupRef(d));
+            };
+
             // Phase 1: show Clang the whole translation unit. Inline definitions stay deferred.
             for (Decl* d : ctx.getTranslationUnitDecl()->decls())
-                if (inScopeDecl(d)) cg.HandleTopLevelDecl(DeclGroupRef(d));
+                emitDecl(d, emitDecl);
             // Plus everything Sema announced that decls() does not contain (see announcedDecls).
             for (Decl* d : st.announcedDecls)
-                if (inScopeDecl(d)) cg.HandleTopLevelDecl(DeclGroupRef(d));
+                emitDecl(d, emitDecl);
             /*
              * An inline static data member is not a top-level decl, and unlike a member FUNCTION
              * there is no lexically-in-a-record fallback that finds it later - CodeGen only knows
              * about a variable it was handed. Hand each one over explicitly so the request below
              * has a deferred definition to promote instead of just a declaration.
-             */
+            */
             for (const VarDecl* vd : st.varEmitWork)
-                if (vd != nullptr)
+                if (vd != nullptr && !declHasErrors(vd))
                     cg.HandleTopLevelDecl(DeclGroupRef(const_cast<VarDecl*>(vd)));
 
             // Phase 2: reference what cflat binds so the deferred bodies become emission work.
@@ -2118,11 +2182,14 @@ namespace cflat_cinterop
             // hasBody(), not getDefinition(): a defaulted or deleted member is already "a
             // definition" in the AST, and only a real body is something CodeGen can emit.
             for (const auto& [idx, fd] : st.abiWork)
-                if (fd != nullptr && fd->hasBody()) request(GlobalDecl(fd));
+                if (fd != nullptr && !declHasErrors(fd) && !fd->getType()->isDependentType()
+                    && fd->hasBody())
+                    request(GlobalDecl(fd));
             for (const auto& w : st.memberAbiWork)
-                if (w.md != nullptr && w.md->hasBody()) request(MemberGlobalDecl(w.md));
+                if (w.md != nullptr && !declHasErrors(w.md) && w.md->hasBody())
+                    request(MemberGlobalDecl(w.md));
             for (const VarDecl* vd : st.varEmitWork)
-                if (vd != nullptr) request(GlobalDecl(vd));
+                if (vd != nullptr && !declHasErrors(vd)) request(GlobalDecl(vd));
             /*
              * A vtable belongs to exactly ONE translation unit: the Itanium ABI anchors it in the
              * TU that defines the class's KEY function (the first non-pure, non-inline virtual

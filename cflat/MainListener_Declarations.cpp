@@ -3591,6 +3591,8 @@ bool MainListener::TryDeclareForeignCxxLocal(CFlatParser::InitDeclaratorContext*
         auto* compiler = Compiler(direct);
         const std::string typeName = declType.TypeName;
         if (!compiler->IsForeignCxxClassWithConstructors(typeName)) return false;
+        // `alias T x = ref()` borrows the callee's object: no slot, no constructor, no destructor.
+        if (declType.IsAlias) return false;
         if (declType.Pointer || declType.ConstArraySize > 0 || !declType.ConstInnerDimensions.empty()
             || declType.IsArrayView || declType.IsInterface || declType.ArraySize != nullptr)
             return false;   // pointers and arrays of the class keep the ordinary path

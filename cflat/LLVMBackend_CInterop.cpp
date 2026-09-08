@@ -148,6 +148,8 @@ void LLVMBackend::RejectThrowingCxxFunction(const FunctionSymbol& symbol, const 
 bool LLVMBackend::RejectCxxRecordByValue(const CSigEntry& sig) const
 {
         auto refuse = [&](const TypeAndValue& tv, bool isReturn) {
+            // A `T&` return or parameter is `alias T`: it crosses by address, never by value.
+            if (tv.IsAlias) return false;
             if (!IsByValueStructTV(tv)) return false;
             if (cxxTriviallyCopyableRecords_.count(tv.TypeName) != 0) return false;
             if (cxxRecords_.count(tv.TypeName) == 0) return false;  // not a C++ record: C rules apply
@@ -996,8 +998,22 @@ bool LLVMBackend::MapCTypeToTypeAndValueImpl(std::string ctype, TypeAndValue& ou
             ptr++;
             ctype = ctype.substr(0, br);
         }
-        ptr += (int)std::count(ctype.begin(), ctype.end(), '*');
-        ctype.erase(std::remove(ctype.begin(), ctype.end(), '*'), ctype.end());
+        // A '*' inside a template argument list (`ImVector<T *>`) belongs to the argument, not
+        // to this declarator: only the '*'s after the closing '>' make the type a pointer. A
+        // by-value spelling keeps going: a published specialization resolves below, an
+        // unpublished one fails there and the caller falls back to an opaque blob.
+        if (ctype.find('<') != std::string::npos && ctype.rfind('>') != std::string::npos)
+        {
+            const size_t tplEnd = ctype.rfind('>');
+            const int outer = (int)std::count(ctype.begin() + tplEnd, ctype.end(), '*');
+            ptr += outer;
+            ctype.erase(std::remove(ctype.begin() + tplEnd, ctype.end(), '*'), ctype.end());
+        }
+        else
+        {
+            ptr += (int)std::count(ctype.begin(), ctype.end(), '*');
+            ctype.erase(std::remove(ctype.begin(), ctype.end(), '*'), ctype.end());
+        }
 
         // Strip cv / nullability qualifiers - they do not affect the ABI here.
         auto stripWord = [&](const char* w) { EraseDeclaratorToken(ctype, w); };
@@ -1374,6 +1390,8 @@ void LLVMBackend::RegisterCSignatures(const std::vector<CSigEntry>& sigs, const 
                 if (canWrap(e.ret))
                     for (size_t n = 0; n < e.params.size(); ++n)
                     {
+                        if (n < e.defaultArgs.size() && e.defaultArgs[n].kind == "unsupported")
+                            continue;
                         if (!HasNonConstDefaultSuffix(e.defaultArgs, n)) continue;
                         bool supported = true;
                         for (size_t i = 0; i < n; ++i)
@@ -1670,6 +1688,7 @@ static bool HasNonConstDefaultSuffix(const std::vector<cflat_cinterop::RawDefaul
         for (size_t i = first; i < defaults.size(); ++i)
         {
             if (defaults[i].kind.empty()) return false;
+            if (defaults[i].kind == "unsupported") continue;
             if (defaults[i].kind == "nonconst") return true;
         }
         return false;
@@ -1686,6 +1705,7 @@ static std::string CxxNameFromCflat(const std::string& name)
 static std::string BuildCxxDefaultWrappers(const std::vector<cflat_cinterop::RawSig>& sigs)
 {
         std::string source;
+        bool emitted = false;
         for (const auto& sig : sigs)
         {
             if (!sig.isCxx || sig.variadic || sig.linkageName.empty()
@@ -1696,6 +1716,11 @@ static std::string BuildCxxDefaultWrappers(const std::vector<cflat_cinterop::Raw
             for (size_t n = 0; n < sig.paramTypes.size(); ++n)
             {
                 if (!HasNonConstDefaultSuffix(sig.defaultArgs, n)) continue;
+                if (!emitted)
+                {
+                    source += "template <class T> struct __cflat_pid { typedef T type; };\n";
+                    emitted = true;
+                }
                 const std::string base = CxxDefaultWrapperName(sig.linkageName, n);
                 const std::string cppName = base + "_cpp";
                 std::string params;
@@ -1703,8 +1728,8 @@ static std::string BuildCxxDefaultWrappers(const std::vector<cflat_cinterop::Raw
                 for (size_t i = 0; i < n; ++i)
                 {
                     if (!params.empty()) { params += ", "; args += ", "; }
-                    params += sig.paramTypes[i] + " a" + std::to_string(i);
                     const std::string& type = sig.paramTypes[i];
+                    params += "typename __cflat_pid<" + type + ">::type a" + std::to_string(i);
                     args += type.ends_with("&&")
                         ? "static_cast<" + type + ">(a" + std::to_string(i) + ")"
                         : "a" + std::to_string(i);
@@ -2332,6 +2357,8 @@ void LLVMBackend::MapRawRecords(const cflat_cinterop::ExtractResult& raw, std::v
                 fe.access = f.access;
                 fe.isBitfield = f.isBitfield; fe.bitWidth = f.bitWidth;
                 fe.offsetBytes = f.offsetBytes;
+                fe.sizeBytes = f.sizeBytes; fe.alignBytes = f.alignBytes;
+                fe.bitOffset = f.bitOffset;
                 rec.fields.push_back(std::move(fe));
             }
             out.push_back(std::move(rec));
@@ -2526,6 +2553,26 @@ bool LLVMBackend::ExtractCHeaderClang(const std::vector<std::string>& headerPath
                         std::cout << std::format("[verbose]   default wrapper extraction failed: {}\n",
                                                  wrappedError);
                     return false;
+                }
+                for (const std::string& dropped : wrapped.droppedCxxDefaultWrappers)
+                {
+                    bool matched = false;
+                    for (auto& sig : raw.sigs)
+                    {
+                        for (size_t n = 0; n < sig.defaultArgs.size(); ++n)
+                        {
+                            if (CxxDefaultWrapperName(sig.linkageName, n) != dropped) continue;
+                            sig.defaultArgs[n].kind = "unsupported";
+                            sig.defaultArgs[n].value.clear();
+                            matched = true;
+                            if (verbose)
+                                std::cout << std::format(
+                                    "[verbose]   dropped C++ default wrapper for '{}' ({})\n",
+                                    sig.qualifiedName.empty() ? sig.name : sig.qualifiedName, dropped);
+                        }
+                    }
+                    if (!matched && verbose)
+                        std::cout << std::format("[verbose]   dropped C++ default wrapper '{}'\n", dropped);
                 }
                 std::string merged;
                 if (raw.bitcode.empty())
@@ -4014,26 +4061,28 @@ void LLVMBackend::InsertCxxLayoutPadding(const CRecordEntry& r, std::vector<Decl
         fields.swap(out);
     }
 
-void LLVMBackend::VerifyCxxRecordLayout(const CRecordEntry& r)
+std::string LLVMBackend::VerifyCxxRecordLayout(const CRecordEntry& r)
 {
+        std::string mismatch;
         auto it = dataStructures.find(r.name);
-        if (it == dataStructures.end() || it->second.StructType == nullptr) return;
+        if (it == dataStructures.end() || it->second.StructType == nullptr) return mismatch;
         llvm::StructType* st = it->second.StructType;
-        if (st->isOpaque() || !st->isSized()) return;
-        if (r.sizeBytes == 0) return;   // clang reported no layout (opaque forward declaration)
+        if (st->isOpaque() || !st->isSized()) return mismatch;
+        if (r.sizeBytes == 0) return mismatch;   // clang reported no layout (opaque forward declaration)
 
         const llvm::DataLayout& dl = module->getDataLayout();
         uint64_t size = (uint64_t)dl.getTypeAllocSize(st);
         uint64_t align = std::max<uint64_t>(dl.getABITypeAlign(st).value(),
                                             it->second.UserRequestedAlignment);
         auto refuse = [&](const std::string& detail) {
-            LogError(std::format("C++ record '{}' layout is not representable: {}", r.name, detail));
+            mismatch = "layout is not representable: " + detail;
+            return mismatch;
         };
         if (size != r.sizeBytes)
             return refuse(std::format("cflat lays it out as {} bytes, clang as {}", size, r.sizeBytes));
         if (align != r.alignBytes)
             return refuse(std::format("cflat aligns it to {}, clang to {}", align, r.alignBytes));
-        if (r.isUnion) return;          // a union has every member at offset 0 on both sides
+        if (r.isUnion) return mismatch;  // a union has every member at offset 0 on both sides
 
         const llvm::StructLayout* sl = dl.getStructLayout(st);
         const auto& decl = it->second.StructFields;
@@ -4048,23 +4097,41 @@ void LLVMBackend::VerifyCxxRecordLayout(const CRecordEntry& r)
                     std::format("bitfield '{}' was not recorded in cflat", cf.name));
                 if (bit->StorageFieldIndex >= st->getNumElements()) return refuse(
                     std::format("bitfield '{}' has an invalid storage slot", cf.name));
-                uint64_t off = sl->getElementOffset(bit->StorageFieldIndex);
-                if (off != cf.offsetBytes)
-                    return refuse(std::format("bitfield '{}' sits at byte {} in cflat and byte {} in clang",
-                                              cf.name, off, cf.offsetBytes));
+                // Compare absolute BIT positions: clang's byte offset of a bitfield is its bit
+                // offset / 8, which lands inside the storage unit for any bit past the first byte.
+                const uint64_t bitAt = sl->getElementOffset(bit->StorageFieldIndex) * 8 + bit->BitOffset;
+                if (bitAt != cf.bitOffset)
+                    return refuse(std::format("bitfield '{}' sits at bit {} in cflat and bit {} in clang",
+                                              cf.name, bitAt, cf.bitOffset));
                 elem = std::max<size_t>(elem, bit->StorageFieldIndex + 1);
                 continue;
             }
             // Skip the synthetic padding slots InsertCxxLayoutPadding added.
             while (elem < decl.size() && decl[elem].VariableName.empty()) ++elem;
-            if (elem >= decl.size() || elem >= st->getNumElements()) return;
+            if (elem >= decl.size() || elem >= st->getNumElements()) return mismatch;
             uint64_t off = sl->getElementOffset((unsigned)elem);
             if (off != cf.offsetBytes)
                 return refuse(std::format("field '{}' sits at byte {} in cflat and byte {} in clang",
                                           cf.name, off, cf.offsetBytes));
             ++elem;
         }
+        return mismatch;
     }
+
+// An opaque, correctly sized and aligned stand-in for a C++ field whose type cflat cannot map:
+// an array of the widest unsigned integer that matches the field's alignment. Alignment above 8
+// has no such integer, so the caller keeps its refusal path for that case.
+bool LLVMBackend::MakeOpaqueFieldBlob(const CRecordFieldEntry& f, DeclTypeAndValue& out) const
+{
+        if (f.sizeBytes == 0 || f.alignBytes == 0 || f.alignBytes > 8) return false;
+        uint64_t unit = f.alignBytes;
+        while (unit > 1 && f.sizeBytes % unit != 0) unit /= 2;
+        out = DeclTypeAndValue{};
+        out.TypeName = unit == 8 ? "u64" : unit == 4 ? "u32" : unit == 2 ? "u16" : "u8";
+        out.ConstArraySize = f.sizeBytes / unit;
+        out.VariableName = f.name;
+        return true;
+}
 
 void LLVMBackend::RegisterCRecords(std::vector<CRecordEntry>& records, const std::string& fileForLsp)
 {
@@ -4145,6 +4212,19 @@ void LLVMBackend::RegisterCRecords(std::vector<CRecordEntry>& records, const std
                 std::string elemSpelling = StripFixedArrayDims(f.ctype, arrDims);
                 if (!MapCTypeToTypeAndValue(elemSpelling, tv))
                 {
+                    // A C++ field whose TYPE has no CFlat mapping yet (a class-template
+                    // specialization such as `ImVector<T>`) still has a size and alignment
+                    // from Clang: embed it as an opaque blob so the record and its other
+                    // fields stay usable. Typed access to the blob is the request layer's
+                    // follow-up (internal/issue/cppinterop/template-typed-field-drops-record.md).
+                    DeclTypeAndValue blob;
+                    if (r.isCxx && !f.isBitfield && arrDims.empty() && MakeOpaqueFieldBlob(f, blob))
+                    {
+                        if (verbose) std::cout << std::format("[verbose]   C++ struct '{}': field '{}' of type '{}' embedded as {} opaque bytes\n",
+                            r.name, f.name, f.ctype, f.sizeBytes);
+                        fields.push_back(std::move(blob));
+                        continue;
+                    }
                     badFieldName = f.name;
                     badFieldType = f.ctype;
                     if (verbose) std::cout << std::format("[verbose]   skipping C {} '{}': unsupported field '{}' of type '{}'\n",
@@ -4210,12 +4290,24 @@ void LLVMBackend::RegisterCRecords(std::vector<CRecordEntry>& records, const std
             }
             // An opaque-shell by-value aggregate field has no size; CreateStructType would
             // assert "Cannot getTypeInfo() on unsized". Abandon and leave the shell.
-            for (const auto& d : fields)
+            for (size_t fi = 0; fi < fields.size(); ++fi)
             {
+                auto& d = fields[fi];
                 if (d.Pointer) continue;            // pointers are always sized
                 auto* ft = GetType(d);
                 if (ft && !ft->isSized())
                 {
+                    // Same blob fallback: the field's record was itself refused or dropped,
+                    // but Clang still told us how big the field is.
+                    DeclTypeAndValue blob;
+                    if (r.isCxx && fi < r.fields.size() && !r.fields[fi].isBitfield
+                        && MakeOpaqueFieldBlob(r.fields[fi], blob))
+                    {
+                        if (verbose) std::cout << std::format("[verbose]   C++ struct '{}': field '{}' of unsized type '{}' embedded as {} opaque bytes\n",
+                            r.name, d.VariableName, d.TypeName, r.fields[fi].sizeBytes);
+                        d = std::move(blob);
+                        continue;
+                    }
                     if (verbose) std::cout << std::format("[verbose]   skipping C {} '{}': field '{}' has incomplete (unsized) type '{}'\n",
                         r.isUnion ? "union" : "struct", r.name, d.VariableName, d.TypeName);
                     ok = false;
@@ -4259,7 +4351,14 @@ void LLVMBackend::RegisterCRecords(std::vector<CRecordEntry>& records, const std
                 // the vptr, so a CFlat bitwise store could never produce a valid object.
                 else if (!r.isUnion)
                     cxxNontrivialRecords_.insert(r.name);
-                VerifyCxxRecordLayout(r);
+                // A layout cflat could not reproduce is a per-record refusal, not an import
+                // failure: pointers to the record stay usable, every by-value or field use is
+                // rejected at its own site with this reason (RejectUnsupportedCxxLayout).
+                if (std::string mismatch = VerifyCxxRecordLayout(r); !mismatch.empty())
+                {
+                    r.layoutRefusal = std::move(mismatch);
+                    if (verbose) std::cout << std::format("[verbose]   C++ struct '{}': {}\n", r.name, r.layoutRefusal);
+                }
                 RegisterCxxClassMembers(r, fileForLsp);
                 RegisterCxxInheritedMembers(r);
                 // Hook the C++ complete-object destructor into the SAME destructor slot CFlat

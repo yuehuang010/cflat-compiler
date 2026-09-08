@@ -53,6 +53,16 @@ namespace cppi
     }
     int helper() noexcept { return 9; }
     int with_call_default(int v, int k) noexcept { return v * k; }
+    int default_extra() noexcept { return 9; }
+    int default_callback(int value) noexcept { return value + 100; }
+    int default_fn_arg(int value, int (*fn)(int), int extra) noexcept
+    {
+        return fn(value) + extra;
+    }
+    int default_array_arg(int bias, const int (&a)[3], int extra) noexcept
+    {
+        return bias + a[0] + a[1] + a[2] + extra;
+    }
     int PrivateDefaultArg::secret() noexcept { return 11; }
     int PrivateDefaultArg::call(int value) noexcept { return value; }
     __int128 wide_add(__int128 a, __int128 b) noexcept { return a + b; }

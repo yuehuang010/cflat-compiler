@@ -878,6 +878,13 @@ extern int main()
     if (cppi.default_double_ptr() != 25)        return 634;
     int m1defaultMarker = 7;
     if (cppi.default_double_ptr(3.0, &m1defaultMarker) != 37) return 635;
+    if (cppi.default_fn_arg(10) != 119)         return 750;
+    if (cppi.default_fn_arg(10, my_inc_cb) != 20) return 751;
+    if (cppi.default_fn_arg(10, my_inc_cb, 4) != 15) return 752;
+    int[3] m1defaultArray = {4, 5, 6};
+    if (cppi.default_array_arg(1) != 16)         return 753;
+    if (cppi.default_array_arg(1, m1defaultArray) != 25) return 754;
+    if (cppi.default_array_arg(1, m1defaultArray, 4) != 20) return 755;
     cppi.Point m1defaultPoint = default;
     m1defaultPoint.x = 2; m1defaultPoint.y = 3;
     if (m1defaultPoint.mode_scaled() != 5)      return 636;
