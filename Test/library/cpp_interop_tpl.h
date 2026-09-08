@@ -12,6 +12,19 @@
 
 namespace cppt
 {
+    // A NAMESPACE ALIAS (simdjson's `namespace ondemand = arm64::ondemand`): CFlat spells the
+    // alias, clang resolves it, and the canonical name aliases onto the one registration.
+    namespace impl_detail
+    {
+        struct Payload
+        {
+            int v;
+            Payload() noexcept : v(3) {}
+            int get() const noexcept { return v; }
+        };
+    }
+    namespace via_alias = impl_detail;
+
     template <typename T>
     class Box
     {

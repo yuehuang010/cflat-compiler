@@ -2173,6 +2173,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 Compiler(ctx)->TryRequestCxxType(baseName, typeArgs, mangledName,
                                                                  cxxError);
                                 if (!cxxError.empty()) LogErrorContext(prevPrimary, cxxError);
+                                mangledName = Compiler(ctx)->ResolveTypeAlias(mangledName);
                                 if (Compiler(ctx)->IsCxxForeignTypeRegistered(mangledName))
                                 {
                                     namespaceContext = mangledName;

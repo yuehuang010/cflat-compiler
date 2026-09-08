@@ -767,6 +767,28 @@ order the loop hit them:
 Result: `dom::parser` -> `parse` -> `at(2)` -> `get_int64()` compiles, links against
 libsimdjson.a and prints 42 (scratch/simdjson_spike/s1.cb, s3.cb). Suite 864.
 
+Real-world round 3: simdjson On Demand, 2026-09-08 (main checkout, on top of e0e5a563).
+`ondemand::parser` -> `padded_string` -> `(padded_string_view)` cast -> `iterate` ->
+`find_field("k").at(2).get_int64()` (scratch/simdjson_spike/o8.cb). Findings:
+- Member registration was ORDER-DEPENDENT inside a header batch: `padded_string::operator
+  padded_string_view()` computed its ABI recipe while the view (defined later in the header)
+  was still the opaque pass-1 shell, so the member was refused for good ("an indirect
+  non-record argument"). Pass 2 now lays out every body first; members, inherited members
+  and the destructor hook register in a pass 3 (fixture: `cppi.Earlier` / `cppi.Later`).
+- A NAMESPACE ALIAS (`namespace ondemand = arm64::ondemand`) resolved as a declared type
+  (clang reads the qualified name) but not as a TEMPLATE ARGUMENT: the spelling map only
+  held registered names. `CxxSpellingForCflatType` now spells an unregistered dotted name
+  under an imported namespace as `::`-joined text and lets the request TU resolve it.
+- The alias-spelled specialization registers as an ALIAS of the canonical one (that path
+  existed) but the declaration kept the alias name, so no member overload matched the
+  receiver. The three declaration sites resolve the alias after the request (fixture:
+  `cppt.Box<cppt.impl_detail.Payload>` then `cppt.Box<cppt.via_alias.Payload>`).
+- A C++ class local initialized by a CAST invoking a conversion operator (`(T)expr`) took
+  the refusal path; it now uses the same return-temp / register-value construction as a
+  call initializer (fixture: `cppi.Later m8later2 = (cppi.Later)m8early`).
+- Not a bug, worth knowing: a JSON literal's braces are CFlat interpolation; write `{{`.
+Result: prints 42; DOM spikes and the ImGui spike unchanged. Suite 864.
+
 Open: per-import `std` clause or CLI-only; exceptions option at M8 start; MSVC ABI pass.
 Open from the M5 review (2026-09-06):
 - LSP and template CodeGen: type requests still run stage-2 CodeGen under the LSP so the
@@ -796,6 +818,7 @@ Open from the M5 review (2026-09-06):
 | 9424d6b1 | collapsed headline: inline definitions, templates, std::vector/std::string, review rounds (M5) | 856 |
 | 86c9befb | collapsed headline: rvalue refs, M7 callbacks, types rounds 1-11, C++ operators, extractor fixes, header cache v29 | 856 |
 | (round 12) | iterators as classes, std::string_view, std::optional completion, variadic free fn, request filters; header cache v30 | 858 |
+| (simdjson ondemand round) | simdjson On Demand spike runs: batch-wide record layout before member registration, namespace alias as template argument, alias-spelled specialization resolves to its registration, cast-expression initializer for C++ locals | 864 |
 | (simdjson round) | simdjson DOM spike runs: deferred by-value refusals, defaulted special members defined through Sema, trivial-dtor locals, constructor default args, lazy member binding, init from chained/register-returned calls, internal-linkage harvest skip | 864 |
 | (imgui round) | Dear ImGui headless spike runs: opaque field blobs, template-arg pointer peeling, per-record layout refusal, default wrapper declarators, null defaults, alias of class refs, exact-arity overload tie-break; header cache v34 | 862 |
 

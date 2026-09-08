@@ -137,6 +137,26 @@ namespace cppi
         int sum() const noexcept;
     };
 
+    // simdjson's shape: a member returning a class defined LATER in the header by value
+    // (`padded_string::operator padded_string_view()`). The member's ABI recipe needs the
+    // later body, so a batch lays out every record before it registers any member.
+    struct Later;
+    struct Earlier
+    {
+        long a;
+        Later to_later() const noexcept;
+        operator Later() const noexcept;
+    };
+    struct Later
+    {
+        long x;
+        long y;
+        long z;
+        long sum() const noexcept { return x + y + z; }
+    };
+    inline Later Earlier::to_later() const noexcept { return Later{a, a + 1, a + 2}; }
+    inline Earlier::operator Later() const noexcept { return Later{a, a, a}; }
+
     class PrivateDefaultArg
     {
     private:

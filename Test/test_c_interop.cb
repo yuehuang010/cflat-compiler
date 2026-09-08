@@ -1393,6 +1393,18 @@ extern int main()
         if (m8slot2.get() != 7)                   return 760;
         cppi.Grid m8grid = default;
         if (m8grid.sum() != 10)                   return 761;
+        cppi.Earlier m8early = default;
+        m8early.a = 5;
+        cppi.Later m8later = m8early.to_later();
+        if (m8later.sum() != 18)                  return 762;
+        cppi.Later m8later2 = (cppi.Later)m8early;
+        if (m8later2.sum() != 15)                 return 763;
+        cppt.via_alias.Payload m8payload = default;
+        // The canonical spelling first, so the alias spelling below must alias onto it.
+        cppt.Box<cppt.impl_detail.Payload> m8pb0 = cppt.Box<cppt.impl_detail.Payload>(m8payload);
+        if (m8pb0.get().get() != 3)               return 765;
+        cppt.Box<cppt.via_alias.Payload> m8pb = cppt.Box<cppt.via_alias.Payload>(m8payload);
+        if (m8pb.get().get() != 3)                return 764;
     }
 
     // A specialization over a NONTRIVIAL C++ class whose destructor is DEFAULTED: there is no

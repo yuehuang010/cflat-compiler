@@ -119,6 +119,7 @@ std::string MainListener::ResolveTypeArgEntry(CFlatParser::TypeParameterEntryCon
                 if (!Compiler()->TryRequestCxxType(innerBase, innerArgs, resolved, cxxError)
                     && !cxxError.empty())
                     LogErrorContext(entry, cxxError);
+                resolved = Compiler()->ResolveTypeAlias(resolved);   // alias-spelled specialization
             }
             if (IsCoreUniqueArrayViewInstantiation(Compiler(), resolved, innerArgs))
                 LogErrorContext(entry, CoreUniqueArrayViewMessage(innerArgs));
@@ -853,6 +854,10 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                                                                     cxxError)
                             && !cxxError.empty())
                             LogErrorContext(genParams, cxxError);
+                        // A second CFlat spelling of one specialization (a namespace alias in
+                        // a type argument) is registered as an alias of the first: declare the
+                        // local with the registration's own name so its members resolve.
+                        declType.TypeName = Compiler(declSpecs)->ResolveTypeAlias(mangledName);
                     }
                     // Queue instantiation of nested generic types discovered during field/param parsing.
                     // Only do this when inside an active instantiation context (substitutions are set),
@@ -3758,9 +3763,11 @@ bool MainListener::TryDeclareForeignCxxLocal(CFlatParser::InitDeclaratorContext*
         // or move-constructed from the outermost call's return temporary.
         auto* pf = SolePostfixExpression(assign);
         const std::string pfText = pf != nullptr ? pf->getText() : std::string();
-        if (!pfText.empty() && pfText.back() == ')')
+        // `(T)expr` invoking a C++ conversion operator produces T exactly like a call does.
+        const bool castInit = pf == nullptr && assign->getText().starts_with("(" + typeName + ")");
+        if ((!pfText.empty() && pfText.back() == ')') || castInit)
         {
-            const bool armed = std::count(pfText.begin(), pfText.end(), '(') == 1;
+            const bool armed = !castInit && std::count(pfText.begin(), pfText.end(), '(') == 1;
             compiler->SetCurrentDebugLocation(line);
             compiler->lastCxxRetTemp_ = nullptr;
             compiler->lastCxxRetValue_ = nullptr;

@@ -2827,6 +2827,18 @@ bool LLVMBackend::CxxSpellingForCflatType(const std::string& cflatType, std::str
         else if (auto it = prims.find(base); it != prims.end()) out = it->second;
         else if (auto fit = cxxCflatToCxxSpelling_.find(base); fit != cxxCflatToCxxSpelling_.end())
             out = fit->second;
+        else if (auto dot = base.find('.'); dot != std::string::npos
+                 && cxxForeignNamespaces_.count(base.substr(0, dot)) != 0
+                 && dataStructures.count(base) == 0)
+        {
+            // A dotted name under an imported C++ namespace that no request has registered yet:
+            // spell it as clang would read it and let the request's TU resolve it. This is how a
+            // NAMESPACE ALIAS (`simdjson::ondemand` for `simdjson::arm64::ondemand`) works as a
+            // template argument; the canonical result aliases onto the registration.
+            out = base;
+            for (size_t pos = 0; (pos = out.find('.', pos)) != std::string::npos; pos += 2)
+                out.replace(pos, 1, "::");
+        }
         else return false;
         for (int i = 0; i < ptr; ++i) out += " *";
         return true;
@@ -4174,6 +4186,10 @@ void LLVMBackend::RegisterCRecords(std::vector<CRecordEntry>& records, const std
 
         // Pass 2: bodies. On unmappable fields leave the opaque shell in place so a later
         // reference surfaces a clear error rather than crashing on a partial struct.
+        // Member registration is DEFERRED to pass 3: a member's ABI recipe needs the layout of
+        // every class it takes or returns by value, and that class may be laid out later in this
+        // same batch (`padded_string::operator padded_string_view()` precedes the view's body).
+        std::vector<std::pair<CRecordEntry*, bool>> deferredMembers;   // (record, laid out)
         for (CRecordEntry* rp : ours)
         {
             CRecordEntry& r = *rp;
@@ -4186,7 +4202,7 @@ void LLVMBackend::RegisterCRecords(std::vector<CRecordEntry>& records, const std
             if (r.isCxx && !r.layoutRefusal.empty())
             {
                 cxxRecords_.insert(r.name);
-                RegisterCxxClassMembers(r, fileForLsp);
+                deferredMembers.emplace_back(&r, false);
                 if (auto* s = GetSymbolSink())
                     s->Register(SymbolKind::Struct, r.name, fileForLsp, r.line,
                                 r.col < 0 ? 0 : r.col, "class " + r.name);
@@ -4272,7 +4288,7 @@ void LLVMBackend::RegisterCRecords(std::vector<CRecordEntry>& records, const std
             if (fields.empty() && r.isCxx && r.fields.empty())
             {
                 cxxRecords_.insert(r.name);
-                RegisterCxxClassMembers(r, fileForLsp);
+                deferredMembers.emplace_back(&r, false);
                 continue;
             }
             if (!ok || fields.empty())
@@ -4288,7 +4304,7 @@ void LLVMBackend::RegisterCRecords(std::vector<CRecordEntry>& records, const std
                 if (r.isCxx && !r.layoutRefusal.empty())
                 {
                     cxxRecords_.insert(r.name);
-                    RegisterCxxClassMembers(r, fileForLsp);
+                    deferredMembers.emplace_back(&r, false);
                 }
                 continue;
             }
@@ -4363,13 +4379,7 @@ void LLVMBackend::RegisterCRecords(std::vector<CRecordEntry>& records, const std
                     r.layoutRefusal = std::move(mismatch);
                     if (verbose) std::cout << std::format("[verbose]   C++ struct '{}': {}\n", r.name, r.layoutRefusal);
                 }
-                RegisterCxxClassMembers(r, fileForLsp);
-                RegisterCxxInheritedMembers(r);
-                // Hook the C++ complete-object destructor into the SAME destructor slot CFlat
-                // uses for its own owning struct locals, so every existing scope-exit,
-                // early-return, break and continue cleanup path destroys it exactly once.
-                if (cxxNontrivialRecords_.count(r.name) != 0)
-                    GetOrCreateCxxClassDestructor(r.name);
+                deferredMembers.emplace_back(&r, true);
             }
             if (auto* s = GetSymbolSink())
             {
@@ -4393,6 +4403,20 @@ void LLVMBackend::RegisterCRecords(std::vector<CRecordEntry>& records, const std
                                 fileForLsp, r.line, 0, fieldSig);
                 }
             }
+        }
+
+        // Pass 3: members, now that every body in the batch exists.
+        for (const auto& [rp, laidOut] : deferredMembers)
+        {
+            const CRecordEntry& r = *rp;
+            RegisterCxxClassMembers(r, fileForLsp);
+            if (!laidOut) continue;
+            RegisterCxxInheritedMembers(r);
+            // Hook the C++ complete-object destructor into the SAME destructor slot CFlat uses for
+            // its own owning struct locals, so every existing scope-exit, early-return, break and
+            // continue cleanup path destroys it exactly once.
+            if (cxxNontrivialRecords_.count(r.name) != 0)
+                GetOrCreateCxxClassDestructor(r.name);
         }
 
         // Register each header-COM interface's IID as its "uuid" type annotation (over ALL records,
