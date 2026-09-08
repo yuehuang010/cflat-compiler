@@ -1,0 +1,9 @@
+import cpp "../library/cpp_interop_tpl.h" cache;
+
+extern int main()
+{
+    expect_error("no instantiation of C++ function template 'cppt.twice' accepts these argument types") {
+        cppt.twice("hello");
+    }
+    return 0;
+}

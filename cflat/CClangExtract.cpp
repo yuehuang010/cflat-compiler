@@ -403,6 +403,7 @@ namespace cflat_cinterop
             std::vector<std::pair<size_t, const FunctionDecl*>> abiWork;
             std::vector<QualType> functionPointerAbiWork;
             std::unordered_set<std::string> functionPointerAbiSeen;
+            std::unordered_set<const FunctionTemplateDecl*> emittedFunctionTemplates;
             // cxxMode only: (index into out.records, index into that record's members, decl).
             struct MemberAbiWork { size_t recordIdx; size_t memberIdx; const CXXMethodDecl* md; };
             std::vector<MemberAbiWork> memberAbiWork;
@@ -615,8 +616,80 @@ namespace cflat_cinterop
                 return true;
             }
 
+            bool VisitFunctionTemplateDecl(FunctionTemplateDecl* ftd)
+            {
+                if (!st.req.cxxMode || ftd == nullptr
+                    || !st.emittedFunctionTemplates.insert(ftd).second)
+                    return true;
+                const auto* fd = ftd->getTemplatedDecl();
+                if (fd == nullptr || !fd->getIdentifier() || fd->isVariadic()
+                    || !fd->hasExternalFormalLinkage())
+                    return true;
+                const auto* md = llvm::dyn_cast<CXXMethodDecl>(fd);
+                if (md != nullptr && md->getAccess() != AS_public) return true;
+                if (md == nullptr && fd->getStorageClass() == SC_Static) return true;
+
+                unsigned typeParameterCount = 0;
+                for (const NamedDecl* tp : *ftd->getTemplateParameters())
+                {
+                    const auto* typeParam = llvm::dyn_cast<TemplateTypeParmDecl>(tp);
+                    if (typeParam != nullptr)
+                    {
+                        if (typeParam->isParameterPack()) return true;
+                        ++typeParameterCount;
+                        continue;
+                    }
+                    // SFINAE helpers such as fmt::to_string's enable_if are non-type
+                    // parameters with a default value. They need no explicit CFlat argument.
+                    const auto* nonTypeParam = llvm::dyn_cast<NonTypeTemplateParmDecl>(tp);
+                    if (nonTypeParam == nullptr || !nonTypeParam->hasDefaultArgument()) return true;
+                }
+
+                std::string file;
+                int line = 1, col = 0;
+                if (!LocOf(fd, file, line, col)) return true;
+                RawFunctionTemplate result;
+                result.kind = md == nullptr ? RawFunctionTemplate::Free
+                    : md->isStatic() ? RawFunctionTemplate::StaticMember
+                                     : RawFunctionTemplate::InstanceMember;
+                result.name = CxxQualifiedName(fd);
+                if (!IsValidDottedName(result.name)) return true;
+                if (md != nullptr)
+                {
+                    result.owner = CxxQualifiedName(md->getParent());
+                    result.memberName = fd->getNameAsString();
+                }
+                result.cxxSpelling = "::" + result.name;
+                for (size_t pos = 0; (pos = result.cxxSpelling.find('.', pos)) != std::string::npos; )
+                {
+                    result.cxxSpelling.replace(pos, 1, "::");
+                    pos += 2;
+                }
+                result.minArity = (unsigned)fd->getNumParams();
+                result.maxArity = result.minArity;
+                while (result.minArity > 0
+                       && fd->getParamDecl(result.minArity - 1)->hasDefaultArg())
+                    --result.minArity;
+                result.typeParameterCount = typeParameterCount;
+                result.isConst = md != nullptr && !md->isStatic() && md->isConst();
+                result.isNoexcept = DeclIsNoexcept(fd);
+                result.access = md == nullptr ? AccessPublic : MapAccess(md->getAccess());
+                result.file = file;
+                result.line = line;
+                result.col = col;
+                st.out.functionTemplates.push_back(std::move(result));
+                return true;
+            }
+
             bool VisitFunctionDecl(FunctionDecl* fd)
             {
+                if (!st.req.cxxFunctionWrapperNames.empty()
+                    && (fd == nullptr || !fd->getIdentifier()
+                        || std::find(st.req.cxxFunctionWrapperNames.begin(),
+                                     st.req.cxxFunctionWrapperNames.end(),
+                                     fd->getNameAsString())
+                               == st.req.cxxFunctionWrapperNames.end()))
+                    return true;
                 if (!fd->getIdentifier()
                     && !(st.req.cxxMode && !st.req.cxxTypeRequests.empty()
                          && fd->getOverloadedOperator() != OO_None))
@@ -1660,6 +1733,21 @@ namespace cflat_cinterop
                 }
             }
 
+            void ProcessFunctionRequests()
+            {
+                std::function<void(Decl*)> walk = [&](Decl* decl) {
+                    if (decl == nullptr) return;
+                    if (llvm::isa<FunctionDecl>(decl))
+                    {
+                        VisitFunctionDecl(llvm::cast<FunctionDecl>(decl));
+                        return;
+                    }
+                    if (auto* dc = llvm::dyn_cast<DeclContext>(decl))
+                        for (Decl* child : dc->decls()) walk(child);
+                };
+                walk(ctx.getTranslationUnitDecl());
+            }
+
             bool VisitTypedefNameDecl(TypedefNameDecl* td)
             {
                 if (!td->getIdentifier()) return true;
@@ -2378,8 +2466,10 @@ namespace cflat_cinterop
             void HandleTranslationUnit(ASTContext& ctx) override
             {
                 DeclVisitor v(ctx, st);
-                if (st.req.cxxTypeRequests.empty()) v.TraverseDecl(ctx.getTranslationUnitDecl());
-                else v.ProcessTypeRequests();
+                if (st.req.cxxTypeRequests.empty() && st.req.cxxFunctionWrapperNames.empty())
+                    v.TraverseDecl(ctx.getTranslationUnitDecl());
+                else if (!st.req.cxxTypeRequests.empty()) v.ProcessTypeRequests();
+                else v.ProcessFunctionRequests();
                 if (st.req.cxxMode)
                 {
                     llvm::TimeTraceScope abiScope("CxxAbiArrange");
@@ -2458,6 +2548,7 @@ namespace cflat_cinterop
         public:
             unsigned prereqErrors = 0;
             std::string firstPrereqError;
+            std::string firstError;
 
             void HandleDiagnostic(DiagnosticsEngine::Level level, const Diagnostic& info) override
             {
@@ -2470,6 +2561,7 @@ namespace cflat_cinterop
 
                 llvm::SmallString<256> msg;
                 info.FormatDiagnostic(msg);
+                if (firstError.empty()) firstError = msg.str().str();
                 if (msg.str().find("unknown type name") == llvm::StringRef::npos) return;
 
                 // Errors in the in-memory stub (the macro probes) are not header prerequisites.
@@ -2562,6 +2654,7 @@ namespace cflat_cinterop
             }
             if (outPrereqErrors) *outPrereqErrors = prereqConsumer->prereqErrors;
             if (outFirstPrereqError) *outFirstPrereqError = prereqConsumer->firstPrereqError;
+            if (outTargetFacts) outTargetFacts->firstError = prereqConsumer->firstError;
             return true;
         }
     } // namespace

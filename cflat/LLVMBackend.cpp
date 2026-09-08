@@ -4424,6 +4424,8 @@ void LLVMBackend::ResetForReanalysis()
     cxxImportGroups_.clear();
     activeCxxRequestGroup_ = nullptr;
     cxxTemplateOwnerGroup_.clear();
+    cxxFunctionTemplates_.clear();
+    cxxFunctionTemplateOwnerGroup_.clear();
     cxxTypeOwnerGroup_.clear();
     cxxForeignNamespaces_.clear();
     cxxForeignTypeSpellings_.clear();

@@ -53,6 +53,23 @@ namespace cppt
         inline static int dtors_ = 0;
     };
 
+    template <typename T> T twice(T v) noexcept { return v + v; }
+    template <typename T> Box<T> make_box(T v) noexcept { return Box<T>(v); }
+    template <typename T> long count_chars(const T* s) noexcept
+    {
+        long n = 0;
+        while (s[n]) ++n;
+        return n;
+    }
+
+    struct Scaler
+    {
+        long factor;
+        explicit Scaler(long f) noexcept : factor(f) {}
+        template <typename T> T scaled(T v) const noexcept { return v * (T)factor; }
+        template <typename T> static long from(T v) noexcept { return (long)v * 10; }
+    };
+
     // Counter readers as FREE inline functions. A specialization's static member can only be
     // named in a DECLARATION today (`cppt.Box<int> b`), which is what drives instantiation, so a
     // test cannot write `cppt.Box<int>.live()` in expression position.

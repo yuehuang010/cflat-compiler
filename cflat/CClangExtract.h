@@ -97,6 +97,28 @@ namespace cflat_cinterop
         int col = 0;
     };
 
+    // A callable C++ function template that can be instantiated from CFlat argument types.
+    // Non-type parameters are allowed only when they have defaults; template-template parameters
+    // and non-defaulted non-type parameters are intentionally not published.
+    struct RawFunctionTemplate
+    {
+        enum Kind { Free = 0, StaticMember = 1, InstanceMember = 2 };
+        std::string name;          // full CFlat dotted name
+        std::string owner;         // CFlat record identity for a member, empty for a free function
+        std::string memberName;    // simple member name, empty for a free function
+        std::string cxxSpelling;   // qualified C++ spelling, e.g. ::cppt::twice
+        int kind = Free;
+        unsigned minArity = 0;
+        unsigned maxArity = 0;
+        unsigned typeParameterCount = 0;
+        bool isConst = false;
+        bool isNoexcept = false;
+        int access = 0; // AccessPublic
+        std::string file;
+        int line = 1;
+        int col = 0;
+    };
+
     struct RawEnum
     {
         std::string name;
@@ -391,6 +413,9 @@ namespace cflat_cinterop
             std::string cflatName;     // CFlat identity to register, e.g. the mangled generic name
         };
         std::vector<CxxTypeRequest> cxxTypeRequests;
+        // Request mode for a generated deduction wrapper. Only these ordinary free wrapper
+        // declarations are exported; the included header remains available to CodeGen.
+        std::vector<std::string> cxxFunctionWrapperNames;
         // Header extraction may need one retry after forcing a named specialization complete.
         bool autoInstantiateCxxTypes = true;
     };
@@ -403,6 +428,7 @@ namespace cflat_cinterop
         bool longDoubleIsIEEEDouble = false;
         std::string targetTriple;
         std::vector<RawSig> sigs;
+        std::vector<RawFunctionTemplate> functionTemplates;
         std::vector<RawEnum> enums;
         std::vector<RawRecord> records;
         std::vector<RawTypedef> typedefs;
@@ -432,6 +458,7 @@ namespace cflat_cinterop
         // expected" diagnostics) are excluded by source location, so they do not inflate it.
         unsigned prereqErrors = 0;
         std::string firstPrereqError;            // formatted text of the first such error
+        std::string firstError;                  // first clang error, including wrapper requests
     };
 
     // Parse the TU once and fill `out`. Returns false only on a hard failure to build a TU;

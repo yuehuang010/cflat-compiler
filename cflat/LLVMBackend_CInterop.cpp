@@ -2478,7 +2478,8 @@ bool LLVMBackend::ExtractCHeaderClang(const std::vector<std::string>& headerPath
                              std::vector<cflat_cinterop::RawFunctionPointerAbi>* outFunctionPointerAbis,
                              uint64_t* outLongDoubleWidth,
                              bool* outLongDoubleIsIEEEDouble,
-                             std::string* outTargetTriple)
+                             std::string* outTargetTriple,
+                             std::vector<cflat_cinterop::RawFunctionTemplate>* outFunctionTemplates)
 {
         if (headerPaths.empty()) return false;
 
@@ -2573,6 +2574,7 @@ bool LLVMBackend::ExtractCHeaderClang(const std::vector<std::string>& headerPath
         if (outLongDoubleIsIEEEDouble)
             *outLongDoubleIsIEEEDouble = raw.longDoubleIsIEEEDouble;
         if (outTargetTriple) *outTargetTriple = raw.targetTriple;
+        if (outFunctionTemplates) *outFunctionTemplates = raw.functionTemplates;
 
         // A definitions-enabled pass gives us the defaults without entering the extractor's
         // declaration-only path. Re-run only when wrappers are needed, adding their bodies to the
@@ -3185,8 +3187,408 @@ void LLVMBackend::PublishCxxGroupNames(size_t group, const std::vector<CRecordEn
             { cxxName.replace(pos, 1, "::"); pos += 2; }
             g.publishedNames.insert(cxxName);
             cxxTypeOwnerGroup_.emplace(record.name, group);
-        }
     }
+}
+
+void LLVMBackend::RegisterCxxFunctionTemplates(
+        const std::vector<cflat_cinterop::RawFunctionTemplate>& templates, size_t group,
+        const std::string& fileForLsp)
+{
+        for (const auto& t : templates)
+        {
+            if (t.name.empty() || t.cxxSpelling.empty()) continue;
+            auto& entries = cxxFunctionTemplates_[t.name];
+            const bool duplicate = std::any_of(entries.begin(), entries.end(), [&](const auto& old) {
+                return old.kind == t.kind && old.cxxSpelling == t.cxxSpelling
+                    && old.minArity == t.minArity && old.maxArity == t.maxArity
+                    && old.typeParameterCount == t.typeParameterCount;
+            });
+            if (duplicate) continue;
+            entries.push_back(t);
+            if (group < cxxImportGroups_.size())
+                cxxFunctionTemplateOwnerGroup_.emplace(t.name, group);
+            if (!t.owner.empty())
+            {
+                std::string ownerCxx = "::" + t.owner;
+                for (size_t pos = 0; (pos = ownerCxx.find('.', pos)) != std::string::npos; )
+                {
+                    ownerCxx.replace(pos, 1, "::");
+                    pos += 2;
+                }
+                cxxCflatToCxxSpelling_.emplace(t.owner, ownerCxx);
+                cxxForeignTypeSpellings_.emplace(SqueezeCxxSpelling(ownerCxx), t.owner);
+            }
+            NoteCxxForeignNamespace(t.name);
+            if (auto* sink = GetSymbolSink())
+            {
+                const std::string& declFile = t.file.empty() ? fileForLsp : t.file;
+                sink->Register(SymbolKind::Function, t.name, declFile,
+                               t.line, t.col < 0 ? 0 : t.col,
+                               "template <...> " + t.name + "(...)");
+            }
+        }
+}
+
+bool LLVMBackend::HasCxxFunctionTemplate(const std::string& qualifiedName) const
+{
+        auto it = cxxFunctionTemplates_.find(qualifiedName);
+        if (it != cxxFunctionTemplates_.end() && !it->second.empty()) return true;
+        const size_t dot = qualifiedName.rfind('.');
+        return dot != std::string::npos
+            && !ResolveCxxFunctionTemplateName(qualifiedName.substr(0, dot),
+                                               qualifiedName.substr(dot + 1)).empty();
+}
+
+std::string LLVMBackend::ResolveCxxFunctionTemplateName(const std::string& owner,
+                                                        const std::string& memberName) const
+{
+        const std::string exact = owner + "." + memberName;
+        auto exactIt = cxxFunctionTemplates_.find(exact);
+        if (exactIt != cxxFunctionTemplates_.end() && !exactIt->second.empty()) return exact;
+
+        std::string ownerSpelling;
+        if (!CxxSpellingForCflatType(owner, ownerSpelling))
+            if (auto lazy = cxxLazyAliasSpecializations_.find(owner);
+                lazy != cxxLazyAliasSpecializations_.end())
+                ownerSpelling = lazy->second;
+        if (ownerSpelling.empty()) return {};
+        const size_t templateStart = ownerSpelling.find('<');
+        if (templateStart != std::string::npos) ownerSpelling.resize(templateStart);
+        while (ownerSpelling.starts_with("::")) ownerSpelling.erase(0, 2);
+        for (size_t pos = 0; (pos = ownerSpelling.find("::", pos)) != std::string::npos; )
+        {
+            ownerSpelling.replace(pos, 2, ".");
+            ++pos;
+        }
+        const std::string resolved = ownerSpelling + "." + memberName;
+        auto resolvedIt = cxxFunctionTemplates_.find(resolved);
+        return resolvedIt != cxxFunctionTemplates_.end() && !resolvedIt->second.empty()
+            ? resolved : std::string{};
+}
+
+bool LLVMBackend::HasCxxFunctionTemplateMember(const std::string& owner,
+                                               const std::string& memberName) const
+{
+        return !ResolveCxxFunctionTemplateName(owner, memberName).empty();
+}
+
+bool LLVMBackend::RequestCxxFunctionTemplate(const std::string& functionName,
+                                             const std::string& ownerType,
+                                             const std::vector<std::string>& explicitArgs,
+                                             const std::vector<NamedVariable>& arguments,
+                                             std::string& error)
+{
+        error.clear();
+        const std::string lookupName = ownerType.empty()
+            ? functionName : ownerType + "." + functionName;
+        std::string templateName = lookupName;
+        if (!ownerType.empty())
+            if (std::string resolved = ResolveCxxFunctionTemplateName(ownerType, functionName);
+                !resolved.empty())
+                templateName = std::move(resolved);
+        auto templatesIt = cxxFunctionTemplates_.find(templateName);
+        if (templatesIt == cxxFunctionTemplates_.end()) return false;
+
+        auto cflatTypeOf = [&](const NamedVariable& arg) {
+            std::string type = arg.TypeAndValue.TypeName;
+            bool pointer = arg.TypeAndValue.Pointer;
+            llvm::Type* valueType = arg.Primary != nullptr ? arg.Primary->getType() : arg.BaseType;
+            if (type.empty())
+            {
+                if (auto* constant = llvm::dyn_cast_or_null<llvm::Constant>(arg.Primary);
+                    constant != nullptr && IsStringLiteralConstant(constant))
+                {
+                    type = "char";
+                    pointer = true;
+                }
+                else if (valueType != nullptr && valueType->isFloatTy()) type = "float";
+                else if (valueType != nullptr && valueType->isDoubleTy()) type = "double";
+                else if (valueType != nullptr && valueType->isIntegerTy())
+                {
+                    const unsigned bits = valueType->getIntegerBitWidth();
+                    type = llvm::dyn_cast_or_null<llvm::ConstantInt>(arg.Primary) != nullptr
+                        ? (bits > 32 ? "i64" : "int")
+                        : (bits == 1 ? "bool" : bits <= 8 ? "i8" : bits <= 16 ? "short"
+                           : bits <= 32 ? "int" : "i64");
+                }
+                else if (auto* st = llvm::dyn_cast_or_null<llvm::StructType>(valueType))
+                    type = st->getName().str();
+                if (type.empty()) type = arg.InferSourceTypeName;
+            }
+            if (pointer)
+            {
+                type += "*";
+                if (arg.TypeAndValue.ElemPointer) type += "*";
+            }
+            return type;
+        };
+        auto displayTypeOf = [&](const NamedVariable& arg) {
+            std::string type = cflatTypeOf(arg);
+            return type.empty() ? std::string("<unknown>") : type;
+        };
+        std::string argumentDisplay;
+        for (size_t i = 0; i < arguments.size(); ++i)
+        {
+            if (i != 0) argumentDisplay += ", ";
+            argumentDisplay += displayTypeOf(arguments[i]);
+        }
+        auto noMatch = [&](const std::string& extra = std::string()) {
+            error = std::format("no instantiation of C++ function template '{}' accepts these "
+                                "argument types ({})", lookupName, argumentDisplay);
+            if (!extra.empty()) error += " (clang: " + extra + ")";
+            return false;
+        };
+
+        const cflat_cinterop::RawFunctionTemplate* selected = nullptr;
+        for (const auto& candidate : templatesIt->second)
+        {
+            const bool instance = candidate.kind == cflat_cinterop::RawFunctionTemplate::InstanceMember;
+            const bool kindMatches = ownerType.empty()
+                ? candidate.kind == cflat_cinterop::RawFunctionTemplate::Free
+                    || candidate.kind == cflat_cinterop::RawFunctionTemplate::StaticMember
+                : candidate.kind == cflat_cinterop::RawFunctionTemplate::InstanceMember
+                    || candidate.kind == cflat_cinterop::RawFunctionTemplate::StaticMember;
+            if (!kindMatches || explicitArgs.size() > candidate.typeParameterCount) continue;
+            if (instance && arguments.empty()) continue;
+            const unsigned arity = (unsigned)arguments.size() - (instance ? 1u : 0u);
+            if (arity < candidate.minArity || arity > candidate.maxArity) continue;
+            selected = &candidate;
+            break;
+        }
+        if (selected == nullptr) return noMatch();
+
+        std::string ownerSpelling;
+        if (selected->kind != cflat_cinterop::RawFunctionTemplate::Free)
+        {
+            if (!CxxSpellingForCflatType(ownerType, ownerSpelling)
+                && !CxxSpellingForCflatType(selected->owner, ownerSpelling))
+                return noMatch("the C++ receiver type is not registered");
+        }
+        std::vector<std::string> parameterSpellings;
+        std::vector<std::string> callArguments;
+        if (selected->kind == cflat_cinterop::RawFunctionTemplate::InstanceMember)
+        {
+            const NamedVariable& receiver = arguments.front();
+            std::string receiverSpelling = ownerSpelling;
+            if (receiver.TypeAndValue.Pointer)
+            {
+                receiverSpelling = (selected->isConst ? "const " : "") + receiverSpelling + " *";
+                callArguments.push_back("p0->" + selected->memberName);
+            }
+            else
+            {
+                receiverSpelling = (selected->isConst ? "const " : "") + receiverSpelling + " &";
+                callArguments.push_back("p0." + selected->memberName);
+            }
+            parameterSpellings.push_back(std::move(receiverSpelling));
+        }
+        for (size_t i = selected->kind == cflat_cinterop::RawFunctionTemplate::InstanceMember ? 1u : 0u;
+             i < arguments.size(); ++i)
+        {
+            const NamedVariable& arg = arguments[i];
+            std::string cflatType = cflatTypeOf(arg);
+            if (cflatType.empty()) return noMatch("an argument type cannot be spelled in C++");
+            std::string spelling;
+            const bool stringLiteral = [&] {
+                auto* constant = llvm::dyn_cast_or_null<llvm::Constant>(arg.Primary);
+                return constant != nullptr && IsStringLiteralConstant(constant);
+            }();
+            if ((arg.TypeAndValue.TypeName == "char" && arg.TypeAndValue.Pointer && arg.IsRvalue)
+                || stringLiteral)
+                spelling = "const char *";
+            else if (!CxxSpellingForCflatType(cflatType, spelling))
+                return noMatch("an argument type cannot be spelled in C++");
+            if (!arg.TypeAndValue.Pointer && dataStructures.count(arg.TypeAndValue.TypeName) != 0
+                && arg.Storage != nullptr && !arg.IsRvalue)
+                spelling += " &";
+            parameterSpellings.push_back(std::move(spelling));
+            callArguments.push_back("p" + std::to_string(i));
+        }
+
+        std::vector<std::string> cxxExplicitArgs;
+        for (const std::string& typeArg : explicitArgs)
+        {
+            std::string spelling;
+            if (!CxxSpellingForCflatType(typeArg, spelling))
+                return noMatch("an explicit type argument cannot be spelled in C++");
+            cxxExplicitArgs.push_back(std::move(spelling));
+        }
+
+        std::string explicitSuffix;
+        if (!cxxExplicitArgs.empty())
+        {
+            explicitSuffix = "<";
+            for (size_t i = 0; i < cxxExplicitArgs.size(); ++i)
+            {
+                if (i != 0) explicitSuffix += ", ";
+                explicitSuffix += cxxExplicitArgs[i];
+            }
+            explicitSuffix += ">";
+        }
+        const bool instance = selected->kind == cflat_cinterop::RawFunctionTemplate::InstanceMember;
+        std::string targetCall;
+        if (instance)
+            targetCall = callArguments.front() + explicitSuffix + "(";
+        else
+        {
+            const std::string staticTarget = selected->kind
+                == cflat_cinterop::RawFunctionTemplate::StaticMember
+                ? ownerSpelling + "::" + selected->memberName : selected->cxxSpelling;
+            targetCall = staticTarget + explicitSuffix + "(";
+        }
+        for (size_t i = instance ? 1u : 0u; i < callArguments.size(); ++i)
+        {
+            if (i != (instance ? 1u : 0u)) targetCall += ", ";
+            targetCall += callArguments[i];
+        }
+        targetCall += ")";
+
+        uint64_t hash = 14695981039346656037ULL;
+        auto hashText = [&](const std::string& text) {
+            for (unsigned char c : text) { hash ^= c; hash *= 1099511628211ULL; }
+        };
+        hashText(lookupName);
+        hashText(std::to_string(selected->kind));
+        for (const auto& p : parameterSpellings) hashText(p);
+        for (const auto& a : cxxExplicitArgs) hashText(a);
+        const std::string wrapperName = std::format("__cflat_tpl_{:016x}", hash);
+        std::string wrapperSource = "extern \"C\" auto " + wrapperName + "(";
+        for (size_t i = 0; i < parameterSpellings.size(); ++i)
+        {
+            if (i != 0) wrapperSource += ", ";
+            wrapperSource += parameterSpellings[i] + " p" + std::to_string(i);
+        }
+        wrapperSource += ")";
+        if (selected->isNoexcept) wrapperSource += " noexcept";
+        wrapperSource += " { return " + targetCall + "; }\n";
+
+        auto groupIt = cxxFunctionTemplateOwnerGroup_.find(selected->name);
+        if (groupIt == cxxFunctionTemplateOwnerGroup_.end())
+            return noMatch("the template's import group is unavailable");
+        CxxRequestGroup group = MakeCxxRequestGroup(groupIt->second, {});
+        if (group.headers.empty()) return noMatch("the template's import group is unavailable");
+        CxxRequestGroupScope groupScope(*this, &group);
+
+        const std::string requestKey = CxxTypeRequestCacheKey(group, wrapperSource) + "|TPL|FULL";
+        const bool emitDefinitions = symbolSink_ == nullptr;
+        std::vector<CSigEntry> requestSigs;
+        std::string requestBitcode;
+        bool cached = false;
+        std::filesystem::file_time_type headerMtime{};
+        const bool haveMtime = CxxGroupHeaderStamp(group, headerMtime);
+        if (haveMtime)
+        {
+            std::lock_guard<std::mutex> lock(cFileSigCacheMutex_);
+            auto it = cFileSigCache_.find(requestKey);
+            if (it != cFileSigCache_.end()
+                && (it->second.mtime == headerMtime || it->second.hash == CxxGroupHeaderHash(group)))
+            {
+                it->second.mtime = headerMtime;
+                TouchCFileSigEntry(requestKey, it->second);
+                requestSigs = it->second.sigs;
+                requestBitcode = it->second.cxxBitcode;
+                SetCInteropTargetFacts(it->second.longDoubleWidth,
+                                       it->second.longDoubleIsIEEEDouble, it->second.targetTriple);
+                cached = true;
+            }
+        }
+        if (!cached)
+        {
+            auto runRequest = [&](bool emit, cflat_cinterop::ExtractResult& out,
+                                  std::string& runError) {
+                cflat_cinterop::ExtractRequest req;
+                req.mainFileName = (std::filesystem::absolute("scratch")
+                                    / (wrapperName + ".cpp")).string();
+                req.source = BuildCxxRequestPrologue(group, {}, false) + wrapperSource;
+                req.cxxMode = true;
+                req.emitDefinitions = emit;
+                req.assumeInlineDefinitions = !emit;
+                req.skipFunctionBodies = false;
+                req.requireInScope = false;
+                req.cxxFunctionWrapperNames = { wrapperName };
+                std::string primaryDir;
+                for (const auto& h : group.headers)
+                    if (!IsSystemCxxHeaderPath(h))
+                    { primaryDir = std::filesystem::path(h).parent_path().string(); break; }
+                req.args = BuildClangDriverArgs(primaryDir, group.defines, true, true);
+                return cflat_cinterop::ExtractCInterop(req, out, runError);
+            };
+            cflat_cinterop::ExtractResult probe;
+            std::string probeError;
+            if (!runRequest(false, probe, probeError))
+                return noMatch(probeError);
+            auto findWrapper = [&](const cflat_cinterop::ExtractResult& raw)
+                -> const cflat_cinterop::RawSig* {
+                for (const auto& sig : raw.sigs)
+                    if (sig.name == wrapperName || sig.linkageName == wrapperName) return &sig;
+                return nullptr;
+            };
+            const auto* probeSig = findWrapper(probe);
+            if (probeSig == nullptr || !probeSig->abi.valid || !probeSig->bindRefusal.empty()
+                || !probe.firstError.empty())
+                return noMatch(probe.firstError.empty() ? probeError : probe.firstError);
+            if (!RequestCxxSignatureTypes(*probeSig))
+                return noMatch("the deduced return type is not supported by C++ interop");
+
+            cflat_cinterop::ExtractResult raw = std::move(probe);
+            if (emitDefinitions)
+            {
+                cflat_cinterop::ExtractResult emitted;
+                std::string emittedError;
+                if (!runRequest(true, emitted, emittedError))
+                    return noMatch(emittedError);
+                const auto* emittedSig = findWrapper(emitted);
+                if (emittedSig == nullptr || emitted.bitcode.empty())
+                    return noMatch(emitted.firstError.empty() ? emittedError : emitted.firstError);
+                raw = std::move(emitted);
+            }
+            const auto* finalSig = findWrapper(raw);
+            if (finalSig == nullptr || !finalSig->abi.valid)
+                return noMatch(raw.firstError);
+            CSigEntry mapped;
+            if (!MapRawSig(*finalSig, mapped) || !mapped.bindRefusal.empty())
+                return noMatch(raw.firstError.empty() ? mapped.bindRefusal : raw.firstError);
+            requestSigs.push_back(std::move(mapped));
+            requestBitcode = raw.bitcode;
+            SetCInteropTargetFacts(raw);
+            if (haveMtime)
+            {
+                CFileSigCacheEntry entry;
+                entry.mtime = headerMtime;
+                entry.hash = CxxGroupHeaderHash(group);
+                entry.longDoubleWidth = raw.longDoubleWidth;
+                entry.longDoubleIsIEEEDouble = raw.longDoubleIsIEEEDouble;
+                entry.targetTriple = raw.targetTriple;
+                entry.sigs = requestSigs;
+                entry.cxxBitcode = requestBitcode;
+                std::lock_guard<std::mutex> lock(cFileSigCacheMutex_);
+                InsertCFileSigEntry(requestKey, std::move(entry), verbose);
+            }
+        }
+        if (requestSigs.empty()) return noMatch("the generated wrapper was not extracted");
+        if (!emitDefinitions) requestBitcode.clear();
+        if (!requestSigs.front().isCxx) return noMatch("the generated wrapper was not extracted");
+        RequestCxxSignatureTypes(requestSigs);
+        if (emitDefinitions) AdoptCxxCompanionBitcode(requestBitcode);
+
+        const bool instanceWrapper = selected->kind == cflat_cinterop::RawFunctionTemplate::InstanceMember;
+        const std::string registeredName = instanceWrapper ? functionName : lookupName;
+        CSigEntry bound = requestSigs.front();
+        bound.name = registeredName;
+        RegisterCSignatures({ bound }, selected->file.empty() ? group.headers.front() : selected->file);
+        bool registered = false;
+        if (auto it = functionTable.find(registeredName); it != functionTable.end())
+            for (const auto& symbol : it->second)
+                if (symbol.External && symbol.UniqueName == wrapperName)
+                { registered = true; break; }
+        if (!registered) return noMatch("the generated wrapper could not be registered");
+        if (auto* sink = GetSymbolSink())
+            sink->Register(SymbolKind::Function, selected->name,
+                           selected->file.empty() ? group.headers.front() : selected->file,
+                           selected->line, selected->col < 0 ? 0 : selected->col,
+                           "template <...> " + selected->name + "(...)");
+        return true;
+}
 
 /*
  * Import groups that could own a C++ base name, best first: the group that already answered for it,
@@ -6140,6 +6542,7 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
         std::vector<CGlobalEntry> hitGlobals;
         std::vector<std::pair<std::string, std::string>> hitAliases;
         std::vector<CTypeAliasEntry> hitTypeAliases;
+        std::vector<cflat_cinterop::RawFunctionTemplate> hitFunctionTemplates;
         std::vector<cflat_cinterop::RawFunctionPointerAbi> hitFunctionPointerAbis;
         std::string hitCxxBitcode;
         bool hit = false;
@@ -6159,6 +6562,7 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
                     hitMacros = entry.macros; hitFuncMacros = entry.funcMacros; hitGlobals = entry.globals;
                     hitAliases = entry.recordAliases; hit = true;
                     hitTypeAliases = entry.typeAliases;
+                    hitFunctionTemplates = entry.functionTemplates;
                     hitFunctionPointerAbis = entry.functionPointerAbis;
                     hitCxxBitcode = entry.cxxBitcode;
                 }
@@ -6173,6 +6577,7 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
                     hitMacros = entry.macros; hitFuncMacros = entry.funcMacros; hitGlobals = entry.globals;
                     hitAliases = entry.recordAliases; hit = true;
                     hitTypeAliases = entry.typeAliases;
+                    hitFunctionTemplates = entry.functionTemplates;
                     hitFunctionPointerAbis = entry.functionPointerAbis;
                     hitCxxBitcode = entry.cxxBitcode;
                 }
@@ -6188,6 +6593,8 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
             RegisterCRecords(hitRecords, fileForLsp);
             RegisterRecordAliases(hitAliases);
             RegisterTypeAliasSymbols(hitTypeAliases);
+            if (cppMode)
+                RegisterCxxFunctionTemplates(hitFunctionTemplates, cxxGroupIndex, fileForLsp);
             RegisterCxxFunctionPointerAbis(hitFunctionPointerAbis);
             if (cppMode && activeCxxRequestGroup_ != nullptr)
             {
@@ -6252,6 +6659,8 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
                 RegisterCRecords(diskEntry.records, fileForLsp);
                 RegisterRecordAliases(diskEntry.recordAliases);
                 RegisterTypeAliasSymbols(diskEntry.typeAliases);
+                if (cppMode)
+                    RegisterCxxFunctionTemplates(diskEntry.functionTemplates, cxxGroupIndex, fileForLsp);
                 RegisterCxxFunctionPointerAbis(diskEntry.functionPointerAbis);
                 if (cppMode && activeCxxRequestGroup_ != nullptr)
                 {
@@ -6293,6 +6702,7 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
         std::vector<CGlobalEntry> globals;
         std::vector<std::pair<std::string, std::string>> aliases;
         std::vector<CTypeAliasEntry> typeAliases;
+        std::vector<cflat_cinterop::RawFunctionTemplate> functionTemplates;
         std::vector<cflat_cinterop::RawFunctionPointerAbi> functionPointerAbis;
         uint64_t longDoubleWidth = 0;
         bool longDoubleIsIEEEDouble = false;
@@ -6311,7 +6721,7 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
                                      aliases, typeAliases, extraDefines, wantDeps ? &includes : nullptr,
                                      &prereqFailure, &prereqMsg, cppMode, &cxxBitcode,
                                      &functionPointerAbis, &longDoubleWidth,
-                                     &longDoubleIsIEEEDouble, &targetTriple))
+                                     &longDoubleIsIEEEDouble, &targetTriple, &functionTemplates))
             {
                 if (prereqFailure)
                     ReportOrphanHeader(headerPaths, prereqMsg);
@@ -6328,6 +6738,7 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
             entry.longDoubleIsIEEEDouble = longDoubleIsIEEEDouble;
             entry.targetTriple = targetTriple;
             entry.sigs  = sigs;
+            entry.functionTemplates = functionTemplates;
             entry.enums = enums;
             entry.records = records;
             entry.macros = macros;
@@ -6378,6 +6789,8 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
         // Records were already registered inside ExtractCHeaderClang.
         {
             llvm::TimeTraceScope registerScope("CHeaderRegister", fileForLsp);
+            if (cppMode)
+                RegisterCxxFunctionTemplates(functionTemplates, cxxGroupIndex, fileForLsp);
             RegisterCSignatures(sigs, fileForLsp);
             if (!cppMode) RegisterTypeAliasSymbols(typeAliases);
             RegisterCEnums(enums, fileForLsp);

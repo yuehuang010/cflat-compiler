@@ -82,6 +82,9 @@
 //   Section M21 (766-773): C++ lazy aliases, unnamed nested enums, nullptr defaults,
 //                       exact constructor ranking, and member signatures that request
 //                       nested std::string specializations.
+//   Section M22 (774-781): C++ function-template deduction wrappers for free functions,
+//                       static and instance members, class returns, string literals, and
+//                       explicit type arguments.
 
 import "library/c_alias_order_alias.h";
 import "library/c_alias_order_real.h";
@@ -1965,6 +1968,20 @@ extern int main()
     if (strcmp(m21taggedName.c_str(), "tagged") != 0) return 772;
     cppt.deep.TaggedLong m21taggedLong = default;
     if (m21taggedLong.get() != 0)                   return 773;
+    // ---- Section M22: C++ function-template deduction wrappers (774-781) -----
+    if (cppt.twice(21) != 42)                       return 774;
+    if (cppt.twice(1.25) != 2.5)                   return 775;
+    if (cppt.twice<double>(2) != 4.0)              return 776;
+    if (cppt.count_chars("hello") != 5)            return 777;
+    cppt.box_int_reset();
+    {
+        cppt.Box<int> m22box = cppt.make_box(5);
+        if (m22box.get() != 5)                     return 778;
+    }
+    cppt.Scaler m22sc = cppt.Scaler(3);
+    if (m22sc.scaled(7) != 21)                     return 779;
+    if (m22sc.scaled(1.5) != 4.5)                  return 780;
+    if (cppt.Scaler.from(4) != 40)                 return 781;
 
     return 0;
 }

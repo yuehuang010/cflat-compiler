@@ -593,6 +593,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
             std::string primaryIdentifier;
             std::string callDisplayName;
             std::string namespaceContext;
+            std::vector<std::string> cxxExplicitTemplateArgs;
 
             int functionArgCounter = 0;
             bool nullConditionalPending = false;
@@ -1319,7 +1320,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             // namespace. Prefer an actual static member at this exact path.
                             const bool hasQualifiedMember =
                                 Compiler(ctx)->GetGlobalVariableNV(qualifiedName).Storage != nullptr
-                                || Compiler(ctx)->GetFunction(qualifiedName) != nullptr;
+                                || Compiler(ctx)->GetFunction(qualifiedName) != nullptr
+                                || Compiler(ctx)->HasCxxFunctionTemplate(qualifiedName);
                             if (Compiler(ctx)->IsNamespace(qualifiedName) && !hasQualifiedMember)
                             {
                                 namespaceContext = Compiler(ctx)->ResolveNamespace(qualifiedName);
@@ -1426,6 +1428,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                         && genericFunctionTemplates.count(qualifiedName) == 0
                                         && genericStructTemplates.count(qualifiedName) == 0
                                         && genericClassTemplates.count(qualifiedName) == 0
+                                        && !Compiler(ctx)->HasCxxFunctionTemplate(qualifiedName)
                                         && Compiler(ctx)->GetReturnBlock(qualifiedName) == nullptr)
                                     {
                                         if (std::string refusal = Compiler(ctx)->GetCxxBindingRefusal(qualifiedName);
@@ -1920,6 +1923,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             else if (Compiler(ctx)->GetFunction(primaryIdentifier)
                                      || genericFunctionTemplates.count(Compiler(ctx)->ResolveGenericFunctionBase(primaryIdentifier))
                                      || !GenericMethodTemplateKey(structVar.TypeAndValue.TypeName, primaryIdentifier).empty()
+                                     || Compiler(ctx)->HasCxxFunctionTemplateMember(
+                                            structVar.TypeAndValue.TypeName, primaryIdentifier)
                                      || (primaryIdentifier == "toFunction" && structVar.TypeAndValue.TypeName == "__closure_fat_ptr")
                                      || Compiler(ctx)->GetWinrtSlot(structVar.TypeAndValue.TypeName, primaryIdentifier))
                             {
@@ -2910,6 +2915,20 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             {
                                 primaryIdentifier = mangled;
                                 namedVar.CallerName = mangled;  // expose mangled name for function<T> assignment
+                            }
+                        }
+                        std::string cxxTemplateName = primaryIdentifier;
+                        if (!Compiler(ctx)->HasCxxFunctionTemplate(cxxTemplateName)
+                            && !structVar.TypeAndValue.TypeName.empty())
+                            cxxTemplateName = structVar.TypeAndValue.TypeName + "." + primaryIdentifier;
+                        if (Compiler(ctx)->HasCxxFunctionTemplate(cxxTemplateName))
+                        {
+                            cxxExplicitTemplateArgs.clear();
+                            for (auto* entry : genParams->typeParameterList()->typeParameterEntry())
+                            {
+                                if (TypeArgHasUnique(entry))
+                                    LogErrorContext(entry, "unique is not supported as an explicit C++ function template type argument");
+                                cxxExplicitTemplateArgs.push_back(ResolveTypeArgEntry(entry));
                             }
                         }
                         break;
@@ -5669,6 +5688,56 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             // normal overloaded (member/free/extension) function call.
                             // `winrtSlot` is resolved above at [PFX-7-slot].
                             auto* compiler = Compiler(ctx);
+                            auto requestCxxTemplate = [&](std::string& resolvedName) {
+                                std::string owner;
+                                std::string memberName = functionName;
+                                std::string receiverType = structVar.TypeAndValue.TypeName;
+                                if (receiverType.empty() && structVar.BaseType != nullptr)
+                                    if (auto* st = llvm::dyn_cast<llvm::StructType>(structVar.BaseType))
+                                        receiverType = st->getName().str();
+                                if (receiverType.empty() && !arguments.empty())
+                                    receiverType = arguments.front().TypeAndValue.TypeName;
+                                if (!receiverType.empty()
+                                    && compiler->HasCxxFunctionTemplateMember(receiverType, functionName))
+                                    owner = receiverType;
+                                else
+                                {
+                                    const size_t dot = functionName.rfind('.');
+                                    if (dot != std::string::npos
+                                        && compiler->IsDataStructure(functionName.substr(0, dot))
+                                        && compiler->HasCxxFunctionTemplateMember(
+                                            functionName.substr(0, dot), functionName.substr(dot + 1)))
+                                    {
+                                        // A static member reached through a dotted type spelling
+                                        // has no receiver value in the expression state.
+                                        owner = functionName.substr(0, dot);
+                                        memberName = functionName.substr(dot + 1);
+                                    }
+                                    else if (!compiler->HasCxxFunctionTemplate(functionName)) return;
+                                }
+                                if (auto existing = compiler->functionTable.find(resolvedName);
+                                    existing != compiler->functionTable.end())
+                                {
+                                    bool hasNonWrapper = false;
+                                    for (const auto& symbol : existing->second)
+                                        if (!symbol.UniqueName.starts_with("__cflat_tpl_")
+                                            && (owner.empty() || symbol.Parameters.empty()
+                                                || symbol.Parameters[0].TypeName == owner))
+                                        { hasNonWrapper = true; break; }
+                                    if (hasNonWrapper) return;
+                                }
+                                std::string templateError;
+                                if (!compiler->RequestCxxFunctionTemplate(
+                                        memberName, owner, cxxExplicitTemplateArgs,
+                                        arguments, templateError))
+                                {
+                                    if (!templateError.empty()) LogErrorContext(primaryCtx, templateError);
+                                    return;
+                                }
+                                if (!owner.empty() && !structVar.TypeAndValue.TypeName.empty())
+                                    resolvedName = memberName;
+                                cxxExplicitTemplateArgs.clear();
+                            };
                             bool foreignCxxConstructor = structVar.BaseType == nullptr
                                 && compiler->IsForeignCxxClassWithConstructors(functionName);
                             if (foreignCxxConstructor)
@@ -5835,6 +5904,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     }
                                 }
 
+                                requestCxxTemplate(resolvedFuncName);
+
                                 namedVar.Primary = Compiler(ctx)->CreateOverloadedFunctionCall(
                                     resolvedFuncName, arguments, globalScopeCall, callDisplayName);
                                 globalScopeCall = false;
@@ -5897,6 +5968,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                         if (!inst.empty()) resolvedFuncName = inst;
                                     }
                                 }
+                                requestCxxTemplate(resolvedFuncName);
                                 namedVar.Primary = Compiler(primaryCtx)->CreateOverloadedFunctionCall(
                                     resolvedFuncName, arguments, globalScopeCall, callDisplayName);
                                 globalScopeCall = false;

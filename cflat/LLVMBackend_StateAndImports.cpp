@@ -1823,6 +1823,36 @@ LLVMBackend::CSigEntry LLVMBackend::SigFromJson(const SjVal& j)
         return e;
     }
 
+nlohmann::json LLVMBackend::FunctionTemplateToJson(
+        const cflat_cinterop::RawFunctionTemplate& t)
+{
+        return { {"n", t.name}, {"o", t.owner}, {"m", t.memberName},
+                 {"c", t.cxxSpelling}, {"k", t.kind}, {"mi", t.minArity},
+                 {"ma", t.maxArity}, {"tp", t.typeParameterCount}, {"cn", t.isConst},
+                 {"nx", t.isNoexcept}, {"a", t.access}, {"f", t.file},
+                 {"ln", t.line}, {"co", t.col} };
+    }
+
+cflat_cinterop::RawFunctionTemplate LLVMBackend::FunctionTemplateFromJson(const SjVal& j)
+{
+        cflat_cinterop::RawFunctionTemplate t;
+        t.name = j.value("n", std::string{});
+        t.owner = j.value("o", std::string{});
+        t.memberName = j.value("m", std::string{});
+        t.cxxSpelling = j.value("c", std::string{});
+        t.kind = j.value("k", 0);
+        t.minArity = (unsigned)j.value("mi", (uint64_t)0);
+        t.maxArity = (unsigned)j.value("ma", (uint64_t)0);
+        t.typeParameterCount = (unsigned)j.value("tp", (uint64_t)0);
+        t.isConst = j.value("cn", false);
+        t.isNoexcept = j.value("nx", false);
+        t.access = j.value("a", 0);
+        t.file = j.value("f", std::string{});
+        t.line = j.value("ln", 1);
+        t.col = j.value("co", 0);
+        return t;
+    }
+
 nlohmann::json LLVMBackend::EnumToJson(const CEnumEntry& e)
 {
         nlohmann::json j = {{"n", e.name}, {"v", e.value}, {"ln", e.line}, {"co", e.col}};
@@ -2263,7 +2293,8 @@ bool LLVMBackend::TryLoadCHeaderDiskCache(
         // v34 records a failed generated default wrapper as an unsupported default argument, so
         // a warm cache cannot re-declare a wrapper whose definition CodeGen dropped.
         // v35 stops recording an unnamed enum's placeholder spelling as an enumerator type.
-        if (version != 35) return false;
+        // v36 carries published C++ function-template declarations for deduction wrappers.
+        if (version != 36) return false;
 
         // Accept on mtime match (fast) or content hash match (authoritative on mtime drift).
         auto storedMtime = j.value("mtime", int64_t{-1});
@@ -2286,6 +2317,9 @@ bool LLVMBackend::TryLoadCHeaderDiskCache(
         try
         {
             if (j.contains("sigs"))       for (const auto& s : j["sigs"])       entry.sigs.push_back(SigFromJson(s));
+            if (j.contains("functionTemplates"))
+                for (const auto& t : j["functionTemplates"])
+                    entry.functionTemplates.push_back(FunctionTemplateFromJson(t));
             if (j.contains("enums"))      for (const auto& e : j["enums"])      entry.enums.push_back(EnumFromJson(e));
             if (j.contains("records"))    for (const auto& r : j["records"])    entry.records.push_back(RecordFromJson(r));
             if (j.contains("macros"))     for (const auto& m : j["macros"])     entry.macros.push_back(MacroFromJson(m));
@@ -2352,7 +2386,7 @@ void LLVMBackend::WriteCHeaderDiskCache(
         if (ec) return;
 
         nlohmann::json j;
-        j["version"] = 35;
+        j["version"] = 36;
         j["mtime"]   = (int64_t)mtime.time_since_epoch().count();
         j["hash"]    = contentHash;
         j["ldw"]     = entry.longDoubleWidth;
@@ -2362,6 +2396,10 @@ void LLVMBackend::WriteCHeaderDiskCache(
         nlohmann::json sigs = nlohmann::json::array();
         for (const auto& s : entry.sigs) sigs.push_back(SigToJson(s));
         j["sigs"] = sigs;
+        nlohmann::json functionTemplates = nlohmann::json::array();
+        for (const auto& t : entry.functionTemplates)
+            functionTemplates.push_back(FunctionTemplateToJson(t));
+        j["functionTemplates"] = functionTemplates;
         nlohmann::json enums = nlohmann::json::array();
         for (const auto& e : entry.enums) enums.push_back(EnumToJson(e));
         j["enums"] = enums;

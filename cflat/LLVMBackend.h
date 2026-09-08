@@ -3130,6 +3130,9 @@ private:
     const CxxRequestGroup* activeCxxRequestGroup_ = nullptr;
     // Base C++ spelling ("std::vector") -> the import group index that answered for it.
     std::unordered_map<std::string, size_t> cxxTemplateOwnerGroup_;
+    std::unordered_map<std::string, std::vector<cflat_cinterop::RawFunctionTemplate>>
+        cxxFunctionTemplates_;
+    std::unordered_map<std::string, size_t> cxxFunctionTemplateOwnerGroup_;
     // CFlat foreign type name -> the import group index whose request registered it.
     std::unordered_map<std::string, size_t> cxxTypeOwnerGroup_;
     /*
@@ -3428,6 +3431,7 @@ private:
         bool longDoubleIsIEEEDouble = false;
         std::string targetTriple;
         std::vector<CSigEntry> sigs;
+        std::vector<cflat_cinterop::RawFunctionTemplate> functionTemplates;
         std::vector<cflat_cinterop::RawFunctionPointerAbi> functionPointerAbis;
         std::vector<CEnumEntry> enums;
         std::vector<CRecordEntry> records;
@@ -3470,7 +3474,7 @@ private:
 
     static size_t CFileSigEntryRows(const CFileSigCacheEntry& entry)
     {
-        return entry.sigs.size() + entry.enums.size() + entry.records.size()
+        return entry.sigs.size() + entry.functionTemplates.size() + entry.enums.size() + entry.records.size()
              + entry.macros.size() + entry.funcMacros.size() + entry.globals.size()
              + entry.recordAliases.size() + entry.typeAliases.size()
              + entry.functionPointerAbis.size() + entry.deps.size()
@@ -4941,6 +4945,19 @@ private:
                                    const std::vector<std::string>& defines);
     CxxRequestGroup MakeCxxRequestGroup(size_t primary, const std::vector<size_t>& deps) const;
     void PublishCxxGroupNames(size_t group, const std::vector<CRecordEntry>& records);
+    void RegisterCxxFunctionTemplates(
+        const std::vector<cflat_cinterop::RawFunctionTemplate>& templates, size_t group,
+        const std::string& fileForLsp);
+    bool HasCxxFunctionTemplate(const std::string& qualifiedName) const;
+    bool HasCxxFunctionTemplateMember(const std::string& owner,
+                                      const std::string& memberName) const;
+    std::string ResolveCxxFunctionTemplateName(const std::string& owner,
+                                               const std::string& memberName) const;
+    bool RequestCxxFunctionTemplate(const std::string& functionName,
+                                    const std::string& ownerType,
+                                    const std::vector<std::string>& explicitArgs,
+                                    const std::vector<NamedVariable>& arguments,
+                                    std::string& error);
     std::vector<size_t> CandidateCxxGroupsFor(const std::string& cxxBase) const;
     bool RequestCxxTypeInOwningGroup(const std::string& cxxBase, const std::string& cflatName,
                                      const std::string& spelling,
@@ -5211,7 +5228,8 @@ private:
                              std::vector<cflat_cinterop::RawFunctionPointerAbi>* outFunctionPointerAbis = nullptr,
                              uint64_t* outLongDoubleWidth = nullptr,
                              bool* outLongDoubleIsIEEEDouble = nullptr,
-                             std::string* outTargetTriple = nullptr);
+                             std::string* outTargetTriple = nullptr,
+                             std::vector<cflat_cinterop::RawFunctionTemplate>* outFunctionTemplates = nullptr);
 
     // Extract externally-linkable functions a .c file DEFINES, via the clang C++ API. Records
     // are registered up front (struct-by-value). Used by the .c auto-extern path.
@@ -9063,6 +9081,9 @@ public:
     static cflat_cinterop::RawAbi AbiFromJson(const SjVal& j);
     static nlohmann::json SigToJson(const CSigEntry& e);
     static CSigEntry SigFromJson(const SjVal& j);
+    static nlohmann::json FunctionTemplateToJson(
+        const cflat_cinterop::RawFunctionTemplate& t);
+    static cflat_cinterop::RawFunctionTemplate FunctionTemplateFromJson(const SjVal& j);
 
     static nlohmann::json EnumToJson(const CEnumEntry& e);
     static CEnumEntry EnumFromJson(const SjVal& j);
