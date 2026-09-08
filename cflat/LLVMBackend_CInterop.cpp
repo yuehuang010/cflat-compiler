@@ -1367,15 +1367,24 @@ void LLVMBackend::RegisterCSignatures(const std::vector<CSigEntry>& sigs, const 
 
             // external=true: unmangled name + C-compatible types; cdecl on the call.
             // Declaring .c/header published for the call (RAII: LogError throws).
+            std::string abiMismatch;
             {
                 CInteropDeclarationScope declaringFile(*this, e.file.empty() ? fileForLsp : e.file);
                 // Hand clang's arrangement to the declaration; C leaves it null and keeps the
                 // existing size heuristic. Cleared by CreateFunctionDeclaration on entry.
                 CxxAbiPlanScope abiPlan(*this, (e.isCxx && e.abi.valid) ? &e.abi : nullptr,
-                                        /*sink*/ nullptr);
+                                        e.isCxx ? &abiMismatch : nullptr);
                 CreateFunctionDeclaration(regName, sig.ret, sig.params, /*external=*/true, e.variadic,
                                           /*returnsOwned=*/false, /*isMethod=*/false,
                                           CallingConv::Cdecl, linkageName, e.isCxx, e.isNoexcept);
+            }
+            if (!abiMismatch.empty())
+            {
+                cxxBindingRefusals_[e.name] = abiMismatch;
+                if (verbose)
+                    std::cout << std::format("[verbose]   C++ function {} not bound: {}\n",
+                                             e.name, abiMismatch);
+                continue;
             }
             if (auto fit = functionTable.find(regName); fit != functionTable.end())
             {
@@ -1674,6 +1683,31 @@ static std::string AutoCxxForeignIdentity(const std::string& spelling)
         std::string out;
         for (size_t i = 0; i < normalized.size(); ++i)
         {
+            const bool negativeValue = normalized[i] == '-' && i + 1 < normalized.size()
+                                    && std::isdigit((unsigned char)normalized[i + 1]);
+            const bool positiveValue = std::isdigit((unsigned char)normalized[i]);
+            if (negativeValue || positiveValue)
+            {
+                const size_t valueStart = negativeValue ? i + 1 : i;
+                size_t valueEnd = valueStart;
+                while (valueEnd < normalized.size()
+                       && std::isdigit((unsigned char)normalized[valueEnd]))
+                    ++valueEnd;
+                size_t before = valueStart;
+                while (before > 0 && std::isspace((unsigned char)normalized[before - 1])) --before;
+                size_t after = valueEnd;
+                while (after < normalized.size() && std::isspace((unsigned char)normalized[after])) ++after;
+                const bool isValueArgument = before > 0
+                    && (normalized[before - 1] == '<' || normalized[before - 1] == ',')
+                    && (after == normalized.size() || normalized[after] == ',' || normalized[after] == '>');
+                if (isValueArgument)
+                {
+                    out += negativeValue ? ".n" : ".";
+                    out.append(normalized, valueStart, valueEnd - valueStart);
+                    i = valueEnd - 1;
+                    continue;
+                }
+            }
             if (normalized[i] == ':' && i + 1 < normalized.size() && normalized[i + 1] == ':')
             { out += '.'; ++i; continue; }
             if (normalized[i] == '<' || normalized[i] == ',') { out += '$'; continue; }
@@ -2153,6 +2187,7 @@ void LLVMBackend::RegisterTypeAliasSymbols(const std::vector<CTypeAliasEntry>& a
             for (size_t p = 0; (p = base.find("::", p)) != std::string::npos; p += 1)
                 base.replace(p, 2, ".");
             std::vector<std::string> args;
+            bool hasNonTypeArgument = false;
             int depth = 0;
             size_t start = open + 1;
             for (size_t p = start; p <= s.size(); ++p)
@@ -2169,7 +2204,10 @@ void LLVMBackend::RegisterTypeAliasSymbols(const std::vector<CTypeAliasEntry>& a
                     if (arg == "int") args.push_back("int");
                     else if (!arg.empty() && std::all_of(arg.begin(), arg.end(),
                                                            [](char c) { return std::isdigit((unsigned char)c); }))
+                    {
                         args.push_back(arg);
+                        hasNonTypeArgument = true;
+                    }
                     else if (arg == "unsigned int") args.push_back("u32");
                     else if (arg == "long long") args.push_back("i64");
                     else if (arg == "unsigned long long") args.push_back("u64");
@@ -2188,7 +2226,7 @@ void LLVMBackend::RegisterTypeAliasSymbols(const std::vector<CTypeAliasEntry>& a
             baseOut = base;
             argsOut = args;
             out = MangleGenericInstance(*this, base, args);
-            return !out.empty();
+            return !hasNonTypeArgument && !out.empty();
         };
         for (const auto& a : aliases)
         {
@@ -2449,6 +2487,7 @@ void LLVMBackend::HarvestComUuids(const std::vector<std::string>& headerPaths, c
         req.args              = BuildClangDriverArgs(primaryDir, extraDefines, /*errorRecovery*/ true, /*asCxx*/ true);
         req.uuidHarvestCxx    = true;
         req.skipFunctionBodies = true;
+        req.verbose            = verbose;
 
         cflat_cinterop::ExtractResult uuidRaw;
         std::string err;
@@ -2537,6 +2576,7 @@ bool LLVMBackend::ExtractCHeaderClang(const std::vector<std::string>& headerPath
         req.assumeInlineDefinitions = cxxMode && !req.emitDefinitions;
         req.skipFunctionBodies = !req.emitDefinitions;
         req.wantIncludes   = (outIncludes != nullptr);
+        req.verbose        = verbose;
 
         // Expand um/<->shared/ siblings: the Windows SDK splits its surface across both and
         // code from MSDN fails without the sibling (ERROR_SUCCESS, MAX_PATH, etc.).
@@ -3057,6 +3097,7 @@ bool LLVMBackend::RunCxxTypeRequests(const CxxRequestGroup& group,
         req.assumeInlineDefinitions = !emitDefinitions;
         req.skipFunctionBodies = false;
         req.requireInScope = false;
+        req.verbose = verbose;
         for (const CxxRequestItem& item : items)
             req.cxxTypeRequests.push_back({ item.cxxSpelling, item.cflatName });
         std::string primaryDir;
@@ -4505,6 +4546,11 @@ bool LLVMBackend::RequestCxxForeignType(const std::string& cflatName, const std:
         if (group.primary != static_cast<size_t>(-1))
             cxxTypeOwnerGroup_[cflatName] = group.primary;
         if (needDefinitions) cxxForeignDefinitions_.insert(cflatName);
+        // Nested member-type requests can refer back to the requested specialization (for
+        // example an iterator's value type). Publish an opaque shell before those requests so
+        // their signatures can map the self-reference; RegisterCRecords fills this shell below.
+        if (dataStructures.find(cflatName) == dataStructures.end())
+            CreateStructType(cflatName, {});
         RequestCxxMemberTypes(records);
         if (!requestBitcode.empty() && symbolSink_ == nullptr) AdoptCxxCompanionBitcode(requestBitcode);
         // Registered BEFORE the records so a member signature naming the type itself
@@ -4948,6 +4994,7 @@ bool LLVMBackend::ExtractCFileClang(const std::string& cSourcePath,
         req.requireInScope  = true;
         req.inScopeDirs.push_back(std::filesystem::path(cSourcePath).parent_path().string());
         req.definitionsOnly = true;
+        req.verbose         = verbose;
 
         if (verbose)
             std::cout << std::format("[verbose] extracting {} signatures: {} (clang C++ API)\n",
@@ -5125,6 +5172,13 @@ void LLVMBackend::RegisterCEnums(const std::vector<CEnumEntry>& enums, const std
                 TypeAndValue backing;
                 if (MapCTypeToTypeAndValue(e.underlyingType, backing))
                     RegisterEnumBackingType(e.enumType, backing.TypeName);
+            }
+            if (!e.enumType.empty() && GetEnumBackingType(e.enumType).empty())
+            {
+                if (verbose)
+                    std::cout << std::format("[verbose]   skipping enum constant '{}': enum type '{}' has no supported backing\n",
+                                             e.name, e.enumType);
+                continue;
             }
             // First writer wins: a hand-written declaration or an earlier header takes
             // precedence over a duplicate constant name.
@@ -6202,7 +6256,10 @@ void LLVMBackend::RegisterCxxClassMembers(const CRecordEntry& r, const std::stri
             {
                 llvm::Type* valueType = GetType(tv);
                 if (!valueType->isIntegerTy()) continue;
-                init = llvm::ConstantInt::get(valueType, (uint64_t)sv.constantValue, true);
+                init = llvm::ConstantInt::get(
+                    valueType,
+                    llvm::APInt(valueType->getIntegerBitWidth(), (uint64_t)sv.constantValue,
+                                /*isSigned=*/true, /*implicitTrunc=*/true));
             }
             auto* staticGlobal = CreateGlobalVariable(tv, init, /*threadLocal*/ false, /*userAlign*/ 0,
                                  /*externalDecl*/ !sv.isCompileTimeConstant,
@@ -7568,7 +7625,9 @@ llvm::Value* LLVMBackend::MaterializeCxxDefaultArgument(const cflat_cinterop::Ra
         if (def.kind == "nullptr")
             return ty->isPointerTy() ? llvm::ConstantPointerNull::get(llvm::cast<llvm::PointerType>(ty))
                                      : nullptr;
-        if ((def.kind == "int" || def.kind == "bool" || def.kind == "enum") && ty->isIntegerTy())
+        if (def.kind == "bool" && ty->isIntegerTy(1))
+            return llvm::ConstantInt::get(ty, def.value != "0");
+        if ((def.kind == "int" || def.kind == "enum") && ty->isIntegerTy())
             return llvm::ConstantInt::get(*context, llvm::APInt(ty->getIntegerBitWidth(), def.value, 10));
         if ((def.kind == "float" || def.kind == "double") && ty->isFloatingPointTy())
             return llvm::ConstantFP::get(ty, std::stod(def.value));

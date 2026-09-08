@@ -377,6 +377,7 @@ namespace cflat_cinterop
         bool definitionsOnly = false;       // .c auto-extern: only functions defined in this TU
         bool wantIncludes = false;          // deep header-cache: record every transitively included file
         bool skipFunctionBodies = false;    // header bind: parse declarations only, skip function bodies
+        bool verbose = false;               // emit extractor diagnostics and skip traces
         // C++ uuid-harvest pass: parse the header(s) as C++ and collect only record name -> uuid
         // (from __declspec(uuid)/MIDL_INTERFACE). No macros/sigs/enums are produced. The caller
         // stamps the harvested GUIDs onto the C-parse records so iidof() resolves header-COM IIDs.

@@ -454,6 +454,13 @@ namespace cflat_cinterop
             QualType t = qt.getCanonicalType();
             if (t->isPointerType()) t = t->getPointeeType().getCanonicalType();
             if (t->getAs<FunctionProtoType>() == nullptr) return;
+            if (t->isDependentType())
+            {
+                if (st.req.verbose)
+                    std::cout << "[verbose]   skipped dependent function-pointer ABI type '"
+                              << t.getAsString(ctx.getPrintingPolicy()) << "'\n";
+                return;
+            }
             std::string key = CanonicalSpelling(ctx, t);
             if (st.functionPointerAbiSeen.insert(key).second)
                 st.functionPointerAbiWork.push_back(t);
@@ -2104,7 +2111,15 @@ namespace cflat_cinterop
                 QualType t = queued.getCanonicalType();
                 if (t->isPointerType()) t = t->getPointeeType().getCanonicalType();
                 const auto* fptPtr = t->getAs<FunctionProtoType>();
-                if (fptPtr == nullptr || ProtoHasIncompleteRecord(fptPtr)) continue;
+                if (fptPtr == nullptr) continue;
+                if (t->isDependentType())
+                {
+                    if (st.req.verbose)
+                        std::cout << "[verbose]   skipped dependent function-pointer ABI type '"
+                                  << t.getAsString(ctx.getPrintingPolicy()) << "'\n";
+                    continue;
+                }
+                if (ProtoHasIncompleteRecord(fptPtr)) continue;
                 CanQual<FunctionProtoType> fpt =
                     CanQual<FunctionProtoType>::CreateUnsafe(t);
                 const CGFunctionInfo& fi = arrangeFreeFunctionType(cgm, fpt);
@@ -2283,6 +2298,12 @@ namespace cflat_cinterop
                     return vd->getInit() != nullptr && vd->getInit()->containsErrors();
                 return false;
             };
+            auto isDependentCodeGenDecl = [](const Decl* d) {
+                if (d == nullptr || d->getDeclContext()->isDependentContext()) return true;
+                if (d->isTemplated()) return true;
+                const auto* value = llvm::dyn_cast<ValueDecl>(d);
+                return value != nullptr && value->getType()->isDependentType();
+            };
             auto emitDecl = [&](Decl* d, auto&& emitDeclRef) -> void {
                 if (d == nullptr || !inScopeDecl(d)) return;
                 if (const auto* linkage = llvm::dyn_cast<LinkageSpecDecl>(d))
@@ -2293,6 +2314,17 @@ namespace cflat_cinterop
                 if (declHasErrors(d))
                 {
                     rememberDroppedWrapper(llvm::dyn_cast<FunctionDecl>(d));
+                    return;
+                }
+                if (st.req.emitDefinitions && isDependentCodeGenDecl(d))
+                {
+                    if (st.req.verbose)
+                    {
+                        const auto* named = llvm::dyn_cast<NamedDecl>(d);
+                        std::cout << "[verbose]   skipped dependent C++ CodeGen declaration "
+                                  << (named != nullptr ? named->getQualifiedNameAsString() : "<unnamed>")
+                                  << "\n";
+                    }
                     return;
                 }
                 cg.HandleTopLevelDecl(DeclGroupRef(d));
@@ -2343,7 +2375,16 @@ namespace cflat_cinterop
 
             for (const VarDecl* vd : st.varEmitWork)
                 if (vd != nullptr && !declHasErrors(vd))
+                {
+                    if (st.req.emitDefinitions && isDependentCodeGenDecl(vd))
+                    {
+                        if (st.req.verbose)
+                            std::cout << "[verbose]   skipped dependent C++ static variable "
+                                      << vd->getQualifiedNameAsString() << "\n";
+                        continue;
+                    }
                     cg.HandleTopLevelDecl(DeclGroupRef(const_cast<VarDecl*>(vd)));
+                }
 
             // Phase 2: reference what cflat binds so the deferred bodies become emission work.
             auto request = [&](GlobalDecl gd) { cg.GetAddrOfGlobal(gd, /*isForDefinition*/ false); };
@@ -2354,10 +2395,45 @@ namespace cflat_cinterop
                     && fd->hasBody())
                     request(GlobalDecl(fd));
             for (const auto& w : st.memberAbiWork)
-                if (w.md != nullptr && !declHasErrors(w.md) && w.md->hasBody())
+                if (w.md != nullptr && !declHasErrors(w.md) && w.md->hasBody()
+                    && !isDependentCodeGenDecl(w.md))
                     request(MemberGlobalDecl(w.md));
             for (const VarDecl* vd : st.varEmitWork)
-                if (vd != nullptr && !declHasErrors(vd)) request(GlobalDecl(vd));
+                if (vd != nullptr && !declHasErrors(vd) && !isDependentCodeGenDecl(vd))
+                    request(GlobalDecl(vd));
+            // Promote concrete free-function helpers that a requested inline body uses. Clang
+            // defers these internal inline definitions independently of their caller.
+            std::vector<const FunctionDecl*> usedFunctionWork;
+            struct UsedFunctionVisitor : RecursiveASTVisitor<UsedFunctionVisitor>
+            {
+                std::vector<const FunctionDecl*>& work;
+                std::unordered_set<const FunctionDecl*> seen;
+
+                explicit UsedFunctionVisitor(std::vector<const FunctionDecl*>& w) : work(w) {}
+                bool shouldVisitTemplateInstantiations() const { return true; }
+                bool VisitFunctionDecl(FunctionDecl* fd)
+                {
+                    if (fd == nullptr || llvm::isa<CXXMethodDecl>(fd) || !fd->hasBody()
+                        || !fd->isUsed() || !fd->hasAttr<AlwaysInlineAttr>()
+                        || fd->getType()->isDependentType()
+                        || fd->getDeclContext()->isDependentContext())
+                        return true;
+                    const FunctionDecl* definition = fd->getDefinition();
+                    if (definition == nullptr) definition = fd;
+                    if (!definition->getType()->isDependentType()
+                        && !definition->getDeclContext()->isDependentContext()
+                        && seen.insert(definition).second)
+                        work.push_back(definition);
+                    return true;
+                }
+            } usedFunctions(usedFunctionWork);
+            usedFunctions.TraverseDecl(ctx.getTranslationUnitDecl());
+            for (const FunctionDecl* fd : usedFunctionWork)
+            {
+                cg.HandleTopLevelDecl(DeclGroupRef(const_cast<FunctionDecl*>(fd)));
+                cg.GetAddrOfGlobal(GlobalDecl(const_cast<FunctionDecl*>(fd)),
+                                   /*isForDefinition*/ true);
+            }
             /*
              * A vtable belongs to exactly ONE translation unit: the Itanium ABI anchors it in the
              * TU that defines the class's KEY function (the first non-pure, non-inline virtual
@@ -2370,7 +2446,7 @@ namespace cflat_cinterop
             for (const CXXRecordDecl* rd : st.vtableWork)
             {
                 const CXXRecordDecl* def = rd != nullptr ? rd->getDefinition() : nullptr;
-                if (def == nullptr || !def->isDynamicClass()) continue;
+                if (def == nullptr || !def->isDynamicClass() || def->isDependentContext()) continue;
                 if (ctx.getCurrentKeyFunction(def) != nullptr) continue;   // anchored elsewhere
                 cg.HandleVTable(const_cast<CXXRecordDecl*>(def));
             }

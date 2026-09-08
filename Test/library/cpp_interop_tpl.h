@@ -12,8 +12,19 @@
 #include <initializer_list>
 #include <vector>
 
+// This dependent callback alias is intentionally never instantiated. Its canonical function
+// prototype is dependent and must not be handed to Clang CodeGen for ABI arrangement.
+
 namespace cppt
 {
+    template <typename T>
+    struct DependentAbiShape
+    {
+        typedef T (*Callback)(T, int);
+    };
+
+    inline int dependent_abi_neighbor() noexcept { return 6; }
+
     // A NAMESPACE ALIAS (simdjson's `namespace ondemand = arm64::ondemand`): CFlat spells the
     // alias, clang resolves it, and the canonical name aliases onto the one registration.
     namespace impl_detail

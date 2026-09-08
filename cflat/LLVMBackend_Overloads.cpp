@@ -1423,6 +1423,10 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                     value.Primary = llvm::ConstantPointerNull::get(
                         llvm::cast<llvm::PointerType>(value.BaseType));
                 }
+                else if (value.BaseType->isIntegerTy(1) && def.kind == "bool")
+                {
+                    value.Primary = llvm::ConstantInt::get(value.BaseType, def.value != "0");
+                }
                 else if (value.BaseType->isIntegerTy())
                 {
                     llvm::APInt folded(value.BaseType->getIntegerBitWidth(), def.value, 10);
