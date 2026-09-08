@@ -2204,6 +2204,14 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
             RegisterOwnedStructTemp(cxxRetTemp, candidate.ReturnType.TypeName);
             result = builder->CreateLoad(candidate.Recipe.retSlot.structTy, cxxRetTemp);
         }
+        if (candidate.Recipe.hasLowering && candidate.IsCxx
+            && !candidate.ReturnType.Pointer && result != nullptr && result->getType()->isStructTy())
+        {
+            // Remembered for a declaration initialized by this call: the temp (sret) or null
+            // when the ABI returned the object in registers (trivial for calls, a plain store).
+            lastCxxRetTemp_ = cxxRetTemp;
+            lastCxxRetValue_ = result;
+        }
 
         RegisterRawArrayCallResult(result, rawReturnCountSlot,
                                    candidate.ReturnType.AllocAlignValue);

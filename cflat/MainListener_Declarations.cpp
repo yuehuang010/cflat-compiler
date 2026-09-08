@@ -3632,6 +3632,7 @@ bool MainListener::TryDeclareForeignCxxLocal(CFlatParser::InitDeclaratorContext*
 
         // Nontrivial classes must have a callable destructor; trivial classes need no cleanup.
         if (compiler->IsForeignNontrivialCxxClass(typeName)
+            && !compiler->HasTrivialCxxDtor(typeName)
             && compiler->GetOrCreateCxxClassDestructor(typeName) == nullptr)
         {
             LogErrorContext(direct, std::format(
@@ -3750,23 +3751,45 @@ bool MainListener::TryDeclareForeignCxxLocal(CFlatParser::InitDeclaratorContext*
             }
         }
 
-        // ---- a call returning T by value: construct straight into the slot ------------------
-        // Only a SINGLE call with no nested call is accepted, so the armed destination cannot be
-        // consumed by an inner call of the same type before the outer one reaches the emitter.
-        if (auto* pf = SolePostfixExpression(assign);
-            pf != nullptr && !pf->argumentExpressionList().empty()
-            && std::ranges::all_of(pf->argumentExpressionList(), [](auto* args) {
-                   return args != nullptr && args->getText().find('(') == std::string::npos;
-               }))
+        // ---- a call returning T by value ---------------------------------------------------
+        // A single call with no nested call constructs straight into the slot (the armed
+        // destination cannot be consumed by an inner call of the same type). Otherwise, or when
+        // the class is returned in registers, the returned value is stored (trivially copyable)
+        // or move-constructed from the outermost call's return temporary.
+        auto* pf = SolePostfixExpression(assign);
+        const std::string pfText = pf != nullptr ? pf->getText() : std::string();
+        if (!pfText.empty() && pfText.back() == ')')
         {
+            const bool armed = std::count(pfText.begin(), pfText.end(), '(') == 1;
             compiler->SetCurrentDebugLocation(line);
-            compiler->pendingCxxSretDest_ = slot;
-            compiler->pendingCxxSretTypeName_ = typeName;
-            ParseAssignmentExpressionNamed(assign);
-            const bool consumed = compiler->pendingCxxSretDest_ == nullptr;
+            compiler->lastCxxRetTemp_ = nullptr;
+            compiler->lastCxxRetValue_ = nullptr;
+            if (armed)
+            {
+                compiler->pendingCxxSretDest_ = slot;
+                compiler->pendingCxxSretTypeName_ = typeName;
+            }
+            auto rightNV = ParseAssignmentExpressionNamed(assign);
+            const bool consumed = armed && compiler->pendingCxxSretDest_ == nullptr;
             compiler->pendingCxxSretDest_ = nullptr;
             compiler->pendingCxxSretTypeName_.clear();
-            if (!consumed) badInit(assign);
+            if (consumed) return true;
+            const bool sameType = rightNV.TypeAndValue.TypeName == typeName
+                               && !rightNV.TypeAndValue.Pointer && rightNV.Primary != nullptr
+                               && rightNV.Primary == compiler->lastCxxRetValue_;
+            if (sameType && compiler->lastCxxRetTemp_ != nullptr)
+            {
+                compiler->EmitCxxCopyOrMoveConstruct(typeName, slot, compiler->lastCxxRetTemp_,
+                                                     /*useMove*/ true,
+                                                     std::format("into local '{}'", name).c_str());
+                return true;
+            }
+            if (sameType)
+            {
+                compiler->builder->CreateStore(rightNV.Primary, slot);   // returned in registers
+                return true;
+            }
+            badInit(assign);
             return true;
         }
 

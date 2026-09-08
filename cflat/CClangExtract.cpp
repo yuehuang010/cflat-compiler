@@ -35,6 +35,8 @@
 #include "clang/Basic/DiagnosticOptions.h"
 #include "clang/Basic/SourceManager.h"
 #include "clang/Frontend/CompilerInstance.h"
+#include "clang/Sema/Sema.h"
+#include "clang/Sema/Scope.h"
 #include "clang/Frontend/CompilerInvocation.h"
 #include "clang/Driver/CreateInvocationFromArgs.h"
 #include "clang/Frontend/FrontendAction.h"
@@ -627,7 +629,9 @@ namespace cflat_cinterop
                 // M0-M3 expose free functions. Methods, constructors and operators need the
                 // class ABI/lifetime machinery from M4; friend operators are the exception because
                 // they are free functions despite being declared inside the class.
-                if (fd->getStorageClass() == SC_Static) return true;  // not externally linkable
+                // Not externally linkable. The linkage test also catches the out-of-line
+                // `inline` REDECLARATION of a `static inline` header function (simdjson's logger).
+                if (fd->getStorageClass() == SC_Static || !fd->hasExternalFormalLinkage()) return true;
                 if (st.req.definitionsOnly && !fd->isThisDeclarationADefinition()) return true;
                 if (st.req.cxxMode && fd->getType()->isDependentType()) return true;
                 std::string file; int line = 1, col = 0;
@@ -1928,9 +1932,47 @@ namespace cflat_cinterop
                                  clang::CodeGen::CodeGenModule& cgm, CodeGenerator& cg);
         void EmitCxxDefinitions(ExtractState& st, ASTContext& ctx, CodeGenerator& cg);
 
+        /*
+         * A DEFAULTED special member (`~parser() = default`, an implicit copy constructor) has no
+         * body until something odr-uses it. Sema is still alive here (ParseAST runs the consumer
+         * before tearing it down), so odr-use each one now: Sema synthesizes the body at once,
+         * with the transitive members it needs. This MUST run before anything asks CodeGen for
+         * the member's address (the ABI loop below does, for every member): CodeGen decides
+         * whether to queue a body the first time it creates the symbol, and a bodiless
+         * declaration created then is returned as is by every later request. A member Sema
+         * cannot define (deleted, ill-formed) simply stays bodiless and is refused at the use site.
+         */
+        void DefineDefaultedSpecialMembers(ExtractState& st)
+        {
+            if (!st.ci->hasSema()) return;
+            Sema& sema = st.ci->getSema();
+            // Parsing is over, so the parser's translation-unit scope is gone. Defining a
+            // defaulted copy assignment looks up __builtin_memcpy through Sema::TUScope
+            // (LookupBuiltin pushes the lazily created builtin onto it); give it a scope.
+            clang::Scope tuScope(nullptr, clang::Scope::DeclScope, st.ci->getDiagnostics());
+            const bool lendScope = sema.TUScope == nullptr;
+            if (lendScope) sema.TUScope = &tuScope;
+            struct ScopeReset
+            {
+                Sema& sema; bool active;
+                ~ScopeReset() { if (active) sema.TUScope = nullptr; }
+            } scopeReset{sema, lendScope};
+            for (const auto& w : st.memberAbiWork)
+            {
+                const CXXMethodDecl* md = w.md;
+                if (md == nullptr || md->hasBody() || !md->isDefaulted() || md->isDeleted()
+                    || md->isInvalidDecl() || md->getType()->isDependentType())
+                    continue;
+                sema.MarkFunctionReferenced(md->getLocation(), const_cast<CXXMethodDecl*>(md),
+                                            /*MightBeOdrUse*/ true);
+            }
+            sema.PerformPendingInstantiations();
+        }
+
         void ComputeCxxAbi(ExtractState& st, ASTContext& ctx)
         {
             if (st.ci == nullptr) return;
+            DefineDefaultedSpecialMembers(st);
             if (st.abiWork.empty() && st.functionPointerAbiWork.empty()
                 && st.memberAbiWork.empty() && !st.req.emitDefinitions) return;
             using namespace clang::CodeGen;

@@ -5000,7 +5000,7 @@ private:
     // or returned BY VALUE needs the aggregate ABI arrangement, which this prototype does not
     // carry, so the declaration is refused instead of registered. Returns true when refused.
     // Pointers to records stay legal (and opaque), exactly as on the C path.
-    bool RejectCxxRecordByValue(const CSigEntry& sig) const;
+    bool RejectCxxRecordByValue(const CSigEntry& sig);
 
     bool VerifyModule();
     bool InstrumentIsolatedResources();
@@ -7215,6 +7215,8 @@ public:
             bool isNoexcept = false;
             int access = 0;
             cflat_cinterop::RawAbi abi;
+            // Aligned with params (entry 0 is 'this'); a constant default lets the call omit it.
+            std::vector<cflat_cinterop::RawDefaultArg> defaultArgs;
         };
         std::vector<Structor> constructors;
         bool hasDtor = false;
@@ -7346,6 +7348,12 @@ public:
     // Emit `st(slot, extraArgs...)`. The structor's own result (`this`) is discarded.
     bool EmitCxxStructorCall(const std::string& typeName, const CxxClassInfo::Structor& st,
                              llvm::Value* slot, const std::vector<llvm::Value*>& extraArgs);
+    // A constant C++ default argument as an LLVM value of the parameter's type; nullptr when
+    // the default is not a constant this call can reproduce.
+    llvm::Value* MaterializeCxxDefaultArgument(const cflat_cinterop::RawDefaultArg& def,
+                                               const TypeAndValue& param);
+    // True when every parameter from 'first' on has a constant default the call can omit.
+    static bool CxxConstantDefaultsFrom(const CxxClassInfo::Structor& st, size_t first);
     // The complete-object destructor (Dtor_Complete) of a foreign nontrivial class, registered
     // as the class's CFlat destructor so every existing scope-exit path destroys it.
     llvm::Function* GetOrCreateCxxClassDestructor(const std::string& typeName);
@@ -7369,6 +7377,13 @@ public:
     bool CxxObjectSizeAndAlign(const std::string& typeName, uint64_t& size, uint64_t& align);
     // A destructor with a real linkage symbol exists (not implicit / inline-only), so the class
     // can be destroyed by CFlat-emitted code.
+    // A class whose destructor is trivial needs no destructor CALL at all, however nontrivial
+    // its constructors are (`simdjson_result<element>`: user constructors, trivial members).
+    bool HasTrivialCxxDtor(const std::string& typeName) const
+    {
+        const CxxClassInfo* info = GetCxxClassInfo(typeName);
+        return info != nullptr && info->hasTrivialDtor;
+    }
     bool HasBindableCxxDestructor(const std::string& typeName) const
     {
         const CxxClassInfo* info = GetCxxClassInfo(typeName);
@@ -7398,11 +7413,21 @@ public:
      */
     llvm::Value* pendingCxxSretDest_ = nullptr;
     std::string pendingCxxSretTypeName_;
+    // The most recent C++ call result of class type and, for an sret return, its TEMPORARY
+    // (already on the owned-temp list). A declaration whose initializer produced exactly that
+    // value (a chained call, `r.at(2).get_int64()`) move-constructs its local from the temp, or
+    // stores the value when the ABI returned the object in registers.
+    llvm::Value* lastCxxRetTemp_ = nullptr;
+    llvm::Value* lastCxxRetValue_ = nullptr;
     // Imported C++ classes, keyed by the CFlat dotted type name.
     std::map<std::string, CxxClassInfo> cxxClasses_;
+    // Retained extractor records let a refused member be rebound when its specialization is used.
+    std::map<std::string, CRecordEntry> cxxRecordEntries_;
     // Register the callable surface of one imported C++ class: instance methods, static methods,
     // static data members, and the constructor/destructor table used by lifetime codegen.
-    void RegisterCxxClassMembers(const CRecordEntry& r, const std::string& fileForLsp);
+    void RegisterCxxClassMembers(const CRecordEntry& r, const std::string& fileForLsp,
+                                 const std::string& memberFilter = {});
+    bool TryBindRefusedCxxMember(const std::string& typeName, const std::string& memberName);
     // Set by RegisterCSignatures around a C++ declaration so CreateFunctionDeclaration adopts
     // clang's arrangement instead of ComputeAbiRecipe.
     const cflat_cinterop::RawAbi* pendingCxxAbi_ = nullptr;

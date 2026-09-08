@@ -121,6 +121,22 @@ namespace cppi
     int default_array_arg(int bias, const int (&a)[3] = {1, 2, 3},
                           int extra = default_extra()) noexcept;
 
+    // simdjson's logger pattern: a `static inline` declaration with a non-constant default,
+    // defined later by a plain `inline` redeclaration. Internal linkage - never bound, and no
+    // default-argument wrapper may reference it.
+    static inline int internal_default(int v, int k = default_extra()) noexcept;
+    inline int internal_default(int v, int k) noexcept { return v * 10 + k; }
+
+    // ImGui's pattern: a DEFAULTED copy assignment over an array member. Defining it after
+    // parsing makes clang look up __builtin_memcpy, which needs a translation-unit scope.
+    struct Grid
+    {
+        int cells[4];
+        Grid() noexcept;
+        Grid& operator=(const Grid&) = default;
+        int sum() const noexcept;
+    };
+
     class PrivateDefaultArg
     {
     private:

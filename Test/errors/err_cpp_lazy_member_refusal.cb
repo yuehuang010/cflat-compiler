@@ -1,0 +1,10 @@
+import cpp "cpp_interop_tpl.h";
+
+extern int main()
+{
+    expect_error("member 'missing' of C++ class 'cppt.LazyRefused' returns 'cppt::NeverDefined<int>' by value, whose definition this translation unit does not have") {
+        cppt.LazyRefused value = default;
+        value.missing();
+    }
+    return 0;
+}

@@ -145,7 +145,7 @@ void LLVMBackend::RejectThrowingCxxFunction(const FunctionSymbol& symbol, const 
  * at the call site - that is M4 - so it is refused here, at registration, and the LSP sees the
  * same answer as codegen.
  */
-bool LLVMBackend::RejectCxxRecordByValue(const CSigEntry& sig) const
+bool LLVMBackend::RejectCxxRecordByValue(const CSigEntry& sig)
 {
         auto refuse = [&](const TypeAndValue& tv, bool isReturn) {
             // A `T&` return or parameter is `alias T`: it crosses by address, never by value.
@@ -167,11 +167,15 @@ bool LLVMBackend::RejectCxxRecordByValue(const CSigEntry& sig) const
                 && (isReturn || FindCxxCopyCtor(tv.TypeName) != nullptr
                     || FindCxxMoveCtor(tv.TypeName) != nullptr))
                 return false;
-            LogError(std::format("C++ function '{}' takes or returns nontrivial type '{}' by "
-                                 "value; a record passed by value must be trivially copyable "
-                                 "(no user copy/move constructor, destructor, or virtuals) - "
-                                 "pass it by pointer or reference instead",
-                                 sig.name, tv.TypeName));
+            // Refuse THIS signature only, with the reason replayed if CFlat ever calls it. A
+            // library header carries many such helpers the program never names.
+            std::string reason = std::format(
+                "C++ function '{}' takes or returns nontrivial type '{}' by value; a record "
+                "passed by value must be trivially copyable (no user copy/move constructor, "
+                "destructor, or virtuals) - pass it by pointer or reference instead",
+                sig.name, tv.TypeName);
+            if (verbose) std::cout << "[verbose]   refused: " << reason << "\n";
+            cxxBindingRefusals_.emplace(sig.name, std::move(reason));
             return true;
         };
         if (refuse(sig.ret, true)) return true;
@@ -4540,17 +4544,22 @@ bool LLVMBackend::RejectInaccessibleCxxMember(const std::string& typeName,
         }
         if (auto m = info->refusedMembers.find(memberName); m != info->refusedMembers.end())
         {
+            const std::string refusal = m->second;
+            if (TryBindRefusedCxxMember(typeName, memberName)) return false;
             /*
              * A refusal only speaks when NO overload of that name was bound. A libc++ class
              * commonly has one bindable overload and one cflat cannot express (`append(const
              * char*)` next to `append(initializer_list<char>)`); reporting the refused one would
              * make the callable overload unreachable.
              */
-            if (std::find(info->instanceMethodNames.begin(), info->instanceMethodNames.end(),
-                          memberName) != info->instanceMethodNames.end())
+            const CxxClassInfo* currentInfo = GetCxxClassInfo(typeName);
+            if (currentInfo != nullptr
+                && std::find(currentInfo->instanceMethodNames.begin(),
+                             currentInfo->instanceMethodNames.end(), memberName)
+                       != currentInfo->instanceMethodNames.end())
                 return false;
             if (functionTable.count(typeName + "." + memberName) != 0) return false;   // static
-            LogError(std::format("member '{}' of C++ class '{}' {}", memberName, typeName, m->second));
+            LogError(std::format("member '{}' of C++ class '{}' {}", memberName, typeName, refusal));
             return true;
         }
         return false;
@@ -4595,9 +4604,11 @@ static std::string CxxSpellingWithoutRef(const std::string& spelling,
         return s;
     }
 
-void LLVMBackend::RegisterCxxClassMembers(const CRecordEntry& r, const std::string& fileForLsp)
+void LLVMBackend::RegisterCxxClassMembers(const CRecordEntry& r, const std::string& fileForLsp,
+                                          const std::string& memberFilter)
 {
         if (!r.isCxx) return;
+        cxxRecordEntries_[r.name] = r;
         // A class whose layout was REFUSED still needs its CxxClassInfo: that is where the refusal
         // text and the field list the diagnostic reads from live.
         // Empty C++ classes still have constructors/destructors and are valid foreign types.
@@ -4625,27 +4636,36 @@ void LLVMBackend::RegisterCxxClassMembers(const CRecordEntry& r, const std::stri
         }
 
         CxxClassInfo info;
-        info.isPolymorphic         = r.isPolymorphic;
-        info.hasBases              = r.hasBases;
-        info.hasVirtualBases       = r.hasVirtualBases;
-        info.isAbstract            = r.isAbstract;
-        info.layoutRefusal         = r.layoutRefusal;
-        for (const auto& b : r.bases)
+        if (!memberFilter.empty())
         {
-            CxxClassInfo::BaseRef br;
-            br.name = b.name; br.offsetBytes = b.offsetBytes; br.access = b.access;
-            info.bases.push_back(std::move(br));
+            auto existing = cxxClasses_.find(r.name);
+            if (existing == cxxClasses_.end()) return;
+            info = existing->second;
         }
-        info.hasTrivialDefaultCtor = r.hasTrivialDefaultCtor;
-        info.hasTrivialCopyCtor    = r.hasTrivialCopyCtor;
-        info.hasTrivialDtor        = r.hasTrivialDtor;
-        info.hasDeletedDefaultCtor = r.hasDeletedDefaultCtor;
-        info.hasDeletedCopyCtor    = r.hasDeletedCopyCtor;
-        info.hasDefaultCtor        = r.hasDefaultCtor;
-        info.hasCopyCtor           = r.hasCopyCtor;
-        info.isAggregate           = r.isAggregate;
-        for (const auto& f : r.fields)
-            if (!f.name.empty()) info.fieldAccess[f.name] = f.access;
+        else
+        {
+            info.isPolymorphic         = r.isPolymorphic;
+            info.hasBases              = r.hasBases;
+            info.hasVirtualBases       = r.hasVirtualBases;
+            info.isAbstract            = r.isAbstract;
+            info.layoutRefusal         = r.layoutRefusal;
+            for (const auto& b : r.bases)
+            {
+                CxxClassInfo::BaseRef br;
+                br.name = b.name; br.offsetBytes = b.offsetBytes; br.access = b.access;
+                info.bases.push_back(std::move(br));
+            }
+            info.hasTrivialDefaultCtor = r.hasTrivialDefaultCtor;
+            info.hasTrivialCopyCtor    = r.hasTrivialCopyCtor;
+            info.hasTrivialDtor        = r.hasTrivialDtor;
+            info.hasDeletedDefaultCtor = r.hasDeletedDefaultCtor;
+            info.hasDeletedCopyCtor    = r.hasDeletedCopyCtor;
+            info.hasDefaultCtor        = r.hasDefaultCtor;
+            info.hasCopyCtor           = r.hasCopyCtor;
+            info.isAggregate           = r.isAggregate;
+            for (const auto& f : r.fields)
+                if (!f.name.empty()) info.fieldAccess[f.name] = f.access;
+        }
 
         // A member's declared type, mapped through the shared C spelling mapper. A pointer to a
         // KNOWN aggregate keeps its pointee (the mapper decays struct pointers to void*), which is
@@ -4738,6 +4758,7 @@ void LLVMBackend::RegisterCxxClassMembers(const CRecordEntry& r, const std::stri
             // Settled BEFORE the refusal checks so a private, deleted or otherwise unbindable
             // conversion is recorded under the same key the cast site will ask for.
             const std::string cflatName = memberRegName(m);
+            if (!memberFilter.empty() && cflatName != memberFilter) continue;
 
             if (m.kind == Member::Instance || m.kind == Member::StaticMethod)
             {
@@ -4911,6 +4932,7 @@ void LLVMBackend::RegisterCxxClassMembers(const CRecordEntry& r, const std::stri
                 st.isNoexcept = m.isNoexcept;
                 st.access = m.access;
                 st.abi = m.abi;
+                st.defaultArgs = m.defaultArgs;
                 if (m.kind == Member::Constructor) info.constructors.push_back(std::move(st));
                 else if (m.kind == Member::Destructor)
                 {
@@ -4981,7 +5003,7 @@ void LLVMBackend::RegisterCxxClassMembers(const CRecordEntry& r, const std::stri
             }
         }
 
-        for (const auto& sv : r.staticVars)
+        if (memberFilter.empty()) for (const auto& sv : r.staticVars)
         {
             if (sv.access != cflat_cinterop::AccessPublic) continue;
             TypeAndValue tv;
@@ -5015,6 +5037,144 @@ void LLVMBackend::RegisterCxxClassMembers(const CRecordEntry& r, const std::stri
         }
 
         cxxClasses_[r.name] = std::move(info);
+    }
+
+bool LLVMBackend::TryBindRefusedCxxMember(const std::string& typeName,
+                                          const std::string& memberName)
+{
+        auto infoIt = cxxClasses_.find(typeName);
+        auto recordIt = cxxRecordEntries_.find(typeName);
+        if (infoIt == cxxClasses_.end() || recordIt == cxxRecordEntries_.end()) return false;
+        auto refusalIt = infoIt->second.refusedMembers.find(memberName);
+        if (refusalIt == infoIt->second.refusedMembers.end()) return false;
+
+        const std::string& refusal = refusalIt->second;
+        const bool unsupportedReturn = refusal.starts_with("returns unsupported type '");
+        const bool unsupportedParameter = refusal.starts_with("takes unsupported type '");
+        const bool incompleteReturn = refusal.starts_with("returns '")
+            && refusal.find("' by value, whose definition this translation unit does not have")
+                   != std::string::npos;
+        const bool incompleteParameter = refusal.starts_with("takes '")
+            && refusal.find("' by value, whose definition this translation unit does not have")
+                   != std::string::npos;
+        if (!unsupportedReturn && !unsupportedParameter
+            && !incompleteReturn && !incompleteParameter)
+            return false;
+
+        std::map<std::string, std::string> requests;
+        for (const auto& member : recordIt->second.members)
+        {
+            if (member.name != memberName
+                || (member.kind != cflat_cinterop::RawCxxMember::Instance
+                    && member.kind != cflat_cinterop::RawCxxMember::StaticMethod))
+                continue;
+            auto addSpelling = [&](const std::string& raw) {
+                const std::string spelling = CxxMemberValueSpelling(raw);
+                if (spelling.find('<') == std::string::npos) return;
+                const std::string identity = AutoCxxForeignIdentity(spelling);
+                if (!identity.empty()) requests.emplace(identity, spelling);
+            };
+            if (unsupportedReturn || incompleteReturn) addSpelling(member.retType);
+            if (unsupportedParameter || incompleteParameter)
+                for (const auto& spelling : member.paramTypes) addSpelling(spelling);
+        }
+        if (requests.empty()) return false;
+
+        auto ownerIt = cxxTypeOwnerGroup_.find(typeName);
+        if (ownerIt == cxxTypeOwnerGroup_.end()) return false;
+        CxxRequestGroup group = MakeCxxRequestGroup(ownerIt->second, {});
+        if (group.headers.empty()) return false;
+        CxxRequestGroupScope groupScope(*this, &group);
+        std::set<std::string> successfulSpellings;
+        for (const auto& [identity, spelling] : requests)
+        {
+            std::string error;
+            if (RequestCxxForeignType(identity, spelling, error, /*needDefinitions*/ true,
+                                       /*explicitInstantiation*/ true))
+                successfulSpellings.insert(spelling);
+        }
+        if (successfulSpellings.empty()) return false;
+
+        const std::string fileForLsp = recordIt->second.members.empty()
+            ? std::string() : recordIt->second.members.front().file;
+        const CxxClassInfo previousInfo = infoIt->second;
+        const CRecordEntry previousRecord = recordIt->second;
+        CRecordEntry reboundRecord = recordIt->second;
+        if (incompleteReturn || incompleteParameter)
+        {
+            std::string ownerSpelling;
+            if (auto spelling = cxxCflatToCxxSpelling_.find(typeName);
+                spelling != cxxCflatToCxxSpelling_.end())
+                ownerSpelling = spelling->second;
+            if (ownerSpelling.empty())
+            {
+                ownerSpelling = typeName;
+                const size_t templateSep = ownerSpelling.find('$');
+                if (templateSep != std::string::npos) ownerSpelling.erase(templateSep);
+                for (size_t pos = 0; (pos = ownerSpelling.find('.', pos)) != std::string::npos; )
+                { ownerSpelling.replace(pos, 1, "::"); pos += 2; }
+            }
+            std::vector<CxxRequestItem> refreshItems;
+            for (const auto& [identity, spelling] : requests)
+                refreshItems.push_back({ identity, spelling, true, true });
+            refreshItems.push_back({ typeName, ownerSpelling, true, true });
+            cflat_cinterop::ExtractResult refreshed;
+            std::string refreshError;
+            if (RunCxxTypeRequests(group, refreshItems, {}, /*emitDefinitions*/ true,
+                                    refreshed, refreshError))
+            {
+                std::vector<CRecordEntry> mapped;
+                MapRawRecords(refreshed, mapped);
+                for (const CRecordEntry& candidate : mapped)
+                    if (candidate.name == typeName)
+                    { reboundRecord = candidate; break; }
+            }
+        }
+        for (auto& member : reboundRecord.members)
+        {
+            if (member.name != memberName
+                || (member.kind != cflat_cinterop::RawCxxMember::Instance
+                    && member.kind != cflat_cinterop::RawCxxMember::StaticMethod))
+                continue;
+            auto wasRequested = [&](const std::string& raw) {
+                const std::string spelling = CxxMemberValueSpelling(raw);
+                return successfulSpellings.count(spelling) != 0;
+            };
+            if ((incompleteReturn && wasRequested(member.retType))
+                || (incompleteParameter && std::any_of(member.paramTypes.begin(),
+                                                        member.paramTypes.end(), wasRequested)))
+                member.bindRefusal.clear();
+        }
+        RegisterCxxClassMembers(reboundRecord, fileForLsp, memberName);
+
+        auto updated = cxxClasses_.find(typeName);
+        if (updated == cxxClasses_.end()) return false;
+        const bool instanceBound = std::find(updated->second.instanceMethodNames.begin(),
+                                             updated->second.instanceMethodNames.end(),
+                                             memberName)
+                                != updated->second.instanceMethodNames.end();
+        bool staticBound = false;
+        if (!instanceBound)
+        {
+            auto functions = functionTable.find(typeName + "." + memberName);
+            if (functions != functionTable.end())
+                for (const auto& function : functions->second)
+                    if (function.IsCxx && function.External) { staticBound = true; break; }
+        }
+        if (!instanceBound && !staticBound)
+        {
+            cxxClasses_[typeName] = previousInfo;
+            cxxRecordEntries_[typeName] = previousRecord;
+            return false;
+        }
+
+        updated->second.refusedMembers.erase(memberName);
+        if (instanceBound
+            && std::find(updated->second.instanceMethodNames.begin(),
+                         updated->second.instanceMethodNames.end(), memberName)
+                   == updated->second.instanceMethodNames.end())
+            updated->second.instanceMethodNames.push_back(memberName);
+        return true;
     }
 
 /*
@@ -6183,6 +6343,34 @@ llvm::Function* LLVMBackend::GetOrCreateCxxStructor(const std::string& typeName,
         return fn;
     }
 
+bool LLVMBackend::CxxConstantDefaultsFrom(const CxxClassInfo::Structor& st, size_t first)
+{
+        if (st.defaultArgs.size() != st.params.size()) return false;
+        for (size_t i = first; i < st.defaultArgs.size(); ++i)
+        {
+            const std::string& k = st.defaultArgs[i].kind;
+            if (k != "int" && k != "bool" && k != "enum" && k != "float" && k != "double"
+                && k != "nullptr")
+                return false;
+        }
+        return first < st.params.size();
+}
+
+llvm::Value* LLVMBackend::MaterializeCxxDefaultArgument(const cflat_cinterop::RawDefaultArg& def,
+                                                        const TypeAndValue& param)
+{
+        llvm::Type* ty = GetType(param);
+        if (ty == nullptr) return nullptr;
+        if (def.kind == "nullptr")
+            return ty->isPointerTy() ? llvm::ConstantPointerNull::get(llvm::cast<llvm::PointerType>(ty))
+                                     : nullptr;
+        if ((def.kind == "int" || def.kind == "bool" || def.kind == "enum") && ty->isIntegerTy())
+            return llvm::ConstantInt::get(*context, llvm::APInt(ty->getIntegerBitWidth(), def.value, 10));
+        if ((def.kind == "float" || def.kind == "double") && ty->isFloatingPointTy())
+            return llvm::ConstantFP::get(ty, std::stod(def.value));
+        return nullptr;
+}
+
 bool LLVMBackend::EmitCxxStructorCall(const std::string& typeName,
                                       const CxxClassInfo::Structor& st,
                                       llvm::Value* slot,
@@ -6207,6 +6395,13 @@ bool LLVMBackend::EmitCxxStructorCall(const std::string& typeName,
                 a = temp;
             }
             args.push_back(a);
+        }
+        // Omitted trailing parameters take their constant C++ defaults.
+        for (size_t i = args.size(); i < st.params.size() && i < st.defaultArgs.size(); ++i)
+        {
+            llvm::Value* v = MaterializeCxxDefaultArgument(st.defaultArgs[i], st.params[i]);
+            if (v == nullptr) break;
+            args.push_back(v);
         }
         if (args.size() != st.params.size())
         {
@@ -6255,7 +6450,8 @@ const LLVMBackend::CxxClassInfo::Structor* LLVMBackend::FindCxxDefaultCtor(const
         const CxxClassInfo* info = GetCxxClassInfo(typeName);
         if (info == nullptr) return nullptr;
         for (const auto& c : info->constructors)
-            if (c.isDefaultCtor && c.params.size() == 1) return &c;
+            if (c.isDefaultCtor && (c.params.size() == 1 || CxxConstantDefaultsFrom(c, 1)))
+                return &c;
         return nullptr;
     }
 
@@ -6313,9 +6509,14 @@ const LLVMBackend::CxxClassInfo::Structor* LLVMBackend::SelectCxxConstructor(
                 && a.IsFunctionPointer == b.IsFunctionPointer && a.IsAlias == b.IsAlias
                 && a.IsMove == b.IsMove && a.IsRvalueRef == b.IsRvalueRef;
         };
+        size_t foundOmitted = 0;
         for (const auto& c : info->constructors)
         {
-            if (c.params.size() != argTypes.size() + 1) continue;
+            // Fewer arguments than parameters is fine when every omitted one has a constant
+            // default (`parser(size_t max_capacity = DEFAULT_MAX_CAPACITY)` called as `parser()`).
+            if (c.params.size() < argTypes.size() + 1) continue;
+            const size_t omitted = c.params.size() - argTypes.size() - 1;
+            if (omitted != 0 && !CxxConstantDefaultsFrom(c, argTypes.size() + 1)) continue;
             ++candidates;
             bool ok = true;
             for (size_t i = 0; i < argTypes.size(); ++i)
@@ -6340,6 +6541,9 @@ const LLVMBackend::CxxClassInfo::Structor* LLVMBackend::SelectCxxConstructor(
             if (!ok) continue;
             if (found != nullptr)
             {
+                // An exact-arity overload beats one that fills defaults in, like C++ does.
+                if (omitted > foundOmitted) continue;
+                if (omitted < foundOmitted) { found = &c; foundOmitted = omitted; continue; }
                 bool sameShape = c.params.size() == found->params.size();
                 for (size_t i = 0; sameShape && i < c.params.size(); ++i)
                     sameShape = sameBoundaryType(c.params[i], found->params[i]);
@@ -6348,6 +6552,7 @@ const LLVMBackend::CxxClassInfo::Structor* LLVMBackend::SelectCxxConstructor(
                 return nullptr;
             }
             found = &c;
+            foundOmitted = omitted;
         }
         if (found != nullptr) return found;
         if (candidates == 0)

@@ -49,6 +49,56 @@ namespace cppt
     inline void box_int_reset() noexcept { Box<int>::reset(); }
     inline int box_double_live() noexcept { return Box<double>::live(); }
 
+    // This pair deliberately exposes LazyBox<int> only through member signatures. The CFlat
+    // spelling of LazyBox<int> must request the specialization before those members are bound.
+    template <typename T>
+    class LazyBox
+    {
+    public:
+        explicit LazyBox(T v) noexcept : v_(v) {}
+        ~LazyBox() noexcept {}
+        T get() const noexcept { return v_; }
+
+    private:
+        T v_;
+    };
+
+    // Trivially copyable for calls (returned in registers), yet a C++ class with constructors.
+    class Slot
+    {
+    public:
+        Slot() noexcept : v_(0) {}
+        explicit Slot(int v) noexcept : v_(v) {}
+        int get() const noexcept { return v_; }
+
+    private:
+        int v_;
+    };
+
+    class LazyBoxFactory
+    {
+    public:
+        LazyBox<int> make_box(int v) const noexcept { return LazyBox<int>(v); }
+        int take_box(const LazyBox<int>& box) const noexcept { return box.get(); }
+        const LazyBoxFactory& self() const noexcept { return *this; }
+        Slot make_slot(int v) const noexcept { return Slot(v); }
+
+    private:
+        int marker_;
+    };
+
+    // A declaration-only specialization keeps the original refusal available when the lazy
+    // request cannot find a complete C++ class definition.
+    template <typename T> class NeverDefined;
+    class LazyRefused
+    {
+    public:
+        NeverDefined<int> missing() const noexcept;
+
+    private:
+        int marker_;
+    };
+
     // The destructor is DEFAULTED, so there is no body in the header at all - but the member has
     // one, which makes the implicit destructor nontrivial and REQUIRED. As a template, the
     // specialization request forces Sema to define it and CodeGen to emit it.

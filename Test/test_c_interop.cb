@@ -119,7 +119,7 @@ import cpp "library/cpp_interop_inline_again.h";
 // until a CFlat declaration asks for one, so every M8 assertion also proves the instantiation
 // path emitted the bodies. Section M9 needs no fixture at all - the libc++ headers are the
 // fixture, reached by the SYSTEM header spelling below.
-import cpp "library/cpp_interop_tpl.h";
+import cpp "library/cpp_interop_tpl.h" cache;
 import cpp "vector";
 import cpp "string";
 import cpp "functional";
@@ -1375,6 +1375,25 @@ extern int main()
     // The same specialization named in another function: one registration, one linked symbol.
     if (m8_second_use(5) != 10)                  return 495;
     if (cppt.box_int_live() != 0)                return 496;
+
+    // A member can return a specialization that was not requested while its class was bound. The
+    // first chained call must request LazyBox<int>, bind make_box, and then resolve get normally.
+    {
+        cppt.LazyBoxFactory m8lazy = default;
+        if (m8lazy.make_box(3).get() != 3)        return 756;
+        cppt.LazyBox<int> m8lazyBox = m8lazy.make_box(4);
+        if (m8lazy.take_box(m8lazyBox) != 4)      return 757;
+        // A local initialized from a CHAINED call (sret result move-constructed from the
+        // statement temporary) and from a class the ABI returns in registers.
+        cppt.LazyBox<int> m8chained = m8lazy.self().make_box(5);
+        if (m8lazy.take_box(m8chained) != 5)      return 758;
+        cppt.Slot m8slot = m8lazy.make_slot(6);
+        if (m8slot.get() != 6)                    return 759;
+        cppt.Slot m8slot2 = m8lazy.self().make_slot(7);
+        if (m8slot2.get() != 7)                   return 760;
+        cppi.Grid m8grid = default;
+        if (m8grid.sum() != 10)                   return 761;
+    }
 
     // A specialization over a NONTRIVIAL C++ class whose destructor is DEFAULTED: there is no
     // body in the header, so the instantiation has to make clang define and emit it, and it has

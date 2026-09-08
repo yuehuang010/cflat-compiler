@@ -52,6 +52,8 @@ namespace cppi
         return (int)(value * 10.0) + (marker == nullptr ? 0 : *marker);
     }
     int helper() noexcept { return 9; }
+    Grid::Grid() noexcept : cells{1, 2, 3, 4} {}
+    int Grid::sum() const noexcept { return cells[0] + cells[1] + cells[2] + cells[3]; }
     int with_call_default(int v, int k) noexcept { return v * k; }
     int default_extra() noexcept { return 9; }
     int default_callback(int value) noexcept { return value + 100; }

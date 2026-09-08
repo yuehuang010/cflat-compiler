@@ -1060,11 +1060,21 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                         if (tokenType == CFlatParser::Dot || tokenType == CFlatParser::Arrow
                             || tokenType == CFlatParser::QuestionDot)
                         {
+                            auto* compiler = Compiler(ctx);
+                            const std::string nextMember = NextMemberName(ctx, parseTree);
+                            bool hasMember = structVar.BaseType
+                                && !structVar.TypeAndValue.TypeName.empty()
+                                && compiler->TypeHasMember(structVar.TypeAndValue.TypeName, nextMember);
+                            if (!hasMember && structVar.BaseType
+                                && !structVar.TypeAndValue.TypeName.empty()
+                                && compiler->TryBindRefusedCxxMember(
+                                    structVar.TypeAndValue.TypeName, nextMember))
+                                hasMember = compiler->TypeHasMember(
+                                    structVar.TypeAndValue.TypeName, nextMember);
                             bool pointerReceiverMiss = structVar.BaseType
                                 && !structVar.TypeAndValue.TypeName.empty()
-                                && !Compiler(ctx)->TypeHasMember(
-                                    structVar.TypeAndValue.TypeName, NextMemberName(ctx, parseTree))
-                                && Compiler(ctx)->HasArrowOverloadFor(structVar.TypeAndValue.TypeName);
+                                && !hasMember
+                                && compiler->HasArrowOverloadFor(structVar.TypeAndValue.TypeName);
                             if (pointerReceiverMiss)
                             {
                                 // A nullable pointer must be tested before loading the wrapper

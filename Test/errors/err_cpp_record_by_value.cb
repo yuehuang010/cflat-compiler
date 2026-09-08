@@ -1,12 +1,12 @@
 // M3 boundary: a trivially copyable C++ record crosses by value under clang's own arrangement,
 // but a NONTRIVIAL one (here: a user destructor) needs construction and destruction at the call
 // site, which is not supported yet. The refusal happens when the declaration is registered, so
-// the error is raised at import time - before the enclosing scope closes - and the expectation
-// is armed first.
-expect_error("takes or returns nontrivial type 'cppbv.Owner' by value");
 import cpp "cpp_interop_by_value.h";
 
 extern int main()
 {
+    expect_error("takes or returns nontrivial type 'cppbv.Owner' by value") {
+        cppbv.sum_owner(default);
+    }
     return 0;
 }

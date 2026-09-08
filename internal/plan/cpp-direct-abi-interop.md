@@ -730,6 +730,42 @@ Filed, not fixed: mixed-type bitfields pack by MSVC rules on an Itanium target
 suite 862/0/8, LSP green, examples 45/0, err_cpp fixtures via test.sh, warm-cache second
 pass, Debug interop compile (see session log).
 
+Real-world round 2: simdjson 4.2.3, 2026-09-08 (main checkout, on top of 099b17e8).
+Header is the vcpkg amalgamation (154k lines) from the compiler's own dependency tree, static
+libsimdjson.a; spike in scratch/simdjson_spike. Import-only costs 12 s Release. Findings, in the
+order the loop hit them:
+- A free function taking/returning a nontrivial class by value was an import-line LogError ->
+  recorded in `cxxBindingRefusals_` per signature, replayed at the call site.
+- `~parser() = default` (and every defaulted / implicit special member) never got a body:
+  `DefineDefaultedSpecialMembers` odr-uses them through the live Sema at the start of
+  ComputeCxxAbi. It MUST precede the member ABI loop: that loop asks CodeGen for every
+  member's address, and a symbol created while bodiless is never queued for emission later.
+- A class with user constructors but a trivial destructor (`simdjson_result<element>`) was
+  refused as a local for lacking a callable destructor -> `HasTrivialCxxDtor` exemption.
+- `parser(size_t max_capacity = DEFAULT)` was not a default constructor and `parser()` found
+  no 0-argument overload -> constructors carry `defaultArgs`; SelectCxxConstructor and
+  FindCxxDefaultCtor accept omitted constant defaults, EmitCxxStructorCall materializes them,
+  exact arity beats default fill.
+- `parser.parse(...)` returns `simdjson_result<dom::element>`, refused at registration
+  because the specialization was not requested yet, never revisited -> lazy member binding on
+  first use (Codex, brief scratch/CPP_LAZY_MEMBER_BRIEF.md): retained record entries, request
+  the spelling in the class's owning group, re-register the overload, retry the lookup.
+- A local initialized from a CHAINED call (`r.at(2).get_int64()`) or from a class the ABI
+  returns in registers (`simdjson_result<int64_t>` is trivial for calls) hit the "cannot
+  initialize C++ class" refusal: the sret-direct path only armed a single un-nested call, and
+  a register return never consumes the armed slot. The call emitter now records its last
+  class-typed result (`lastCxxRetValue_`, plus the sret temp when there is one); the
+  declaration site move-constructs from that temp or stores the register value.
+- simdjson's ondemand logger is `static inline` with non-constant defaults and defined by a
+  plain `inline` redeclaration; the harvest only skipped `SC_Static`, so the redeclaration
+  produced default-argument wrappers calling internal-linkage symbols (link failure). The
+  harvest now also skips any declaration without external formal linkage.
+- ImGui regression from `DefineDefaultedSpecialMembers`: defining a defaulted copy assignment
+  over an array member looks up __builtin_memcpy through `Sema::TUScope`, null once parsing
+  is over -> a TU scope is lent for the duration (fixture: `cppi.Grid`).
+Result: `dom::parser` -> `parse` -> `at(2)` -> `get_int64()` compiles, links against
+libsimdjson.a and prints 42 (scratch/simdjson_spike/s1.cb, s3.cb). Suite 864.
+
 Open: per-import `std` clause or CLI-only; exceptions option at M8 start; MSVC ABI pass.
 Open from the M5 review (2026-09-06):
 - LSP and template CodeGen: type requests still run stage-2 CodeGen under the LSP so the
@@ -759,6 +795,7 @@ Open from the M5 review (2026-09-06):
 | 9424d6b1 | collapsed headline: inline definitions, templates, std::vector/std::string, review rounds (M5) | 856 |
 | 86c9befb | collapsed headline: rvalue refs, M7 callbacks, types rounds 1-11, C++ operators, extractor fixes, header cache v29 | 856 |
 | (round 12) | iterators as classes, std::string_view, std::optional completion, variadic free fn, request filters; header cache v30 | 858 |
+| (simdjson round) | simdjson DOM spike runs: deferred by-value refusals, defaulted special members defined through Sema, trivial-dtor locals, constructor default args, lazy member binding, init from chained/register-returned calls, internal-linkage harvest skip | 864 |
 | (imgui round) | Dear ImGui headless spike runs: opaque field blobs, template-arg pointer peeling, per-record layout refusal, default wrapper declarators, null defaults, alias of class refs, exact-arity overload tie-break; header cache v34 | 862 |
 
 ## Verification and repository constraints

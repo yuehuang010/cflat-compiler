@@ -4545,6 +4545,7 @@ void LLVMBackend::ResetForReanalysis()
     cxxTriviallyCopyableRecords_.clear();
     cxxNontrivialRecords_.clear();
     cxxClasses_.clear();
+    cxxRecordEntries_.clear();
     // Per-analysis ABI facts, keyed by class name / linkage name. A later analysis can reuse a
     // name with a different inheritance layout, so a survivor would shift `this` for a receiver
     // that no longer needs it, or turn a plain call into a vptr load.
@@ -4556,6 +4557,8 @@ void LLVMBackend::ResetForReanalysis()
     // would then construct into storage from a discarded module.
     pendingCxxSretDest_ = nullptr;
     pendingCxxSretTypeName_.clear();
+    lastCxxRetTemp_ = nullptr;
+    lastCxxRetValue_ = nullptr;
     // RegisterEncodedClosureType memoizes on this map but writes the encoded closure's backing
     // entries into dataStructures/functionTable, both just cleared. A survivor makes the next
     // file's registration early-return, leaving `Lambda<int(int)>` resolvable as an encoded name

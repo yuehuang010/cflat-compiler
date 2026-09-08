@@ -8906,38 +8906,35 @@ LLVMBackend::NamedVariable MainListener::ParseCastExpression(CFlatParser::CastEx
                 if (sourceTypeName.empty() && sourceStruct != nullptr && sourceStruct->hasName())
                     sourceTypeName = sourceStruct->getName().str();
 
-                bool hasMatchingConversion = false;
-                if (sourceStruct != nullptr && sourceStruct->hasName())
-                {
+                auto hasMatchingConversion = [&]() {
+                    if (sourceStruct == nullptr || !sourceStruct->hasName()) return false;
                     auto fnIt = compiler->functionTable.find(opName);
-                    if (fnIt != compiler->functionTable.end())
+                    if (fnIt == compiler->functionTable.end()) return false;
+                    for (const auto& candidate : fnIt->second)
                     {
-                        for (const auto& candidate : fnIt->second)
-                        {
-                            if (candidate.Parameters.size() != 1) continue;
-                            const auto& sourceParam = candidate.Parameters[0];
-                            // A CFlat conversion is a free function taking its source BY VALUE. A
-                            // C++ member conversion operator is the same conversion spelled with a
-                            // 'this' receiver, so for a registered C++ record the pointer shape is
-                            // accepted too - the overload call path does the receiver adjustment
-                            // (the same relaxation round 8 made for 'operator bool').
-                            if ((sourceParam.Pointer && !compiler->IsCxxRecord(sourceTypeName))
-                                || sourceParam.ElemPointer
-                                || sourceParam.TypeName != sourceTypeName)
-                                continue;
-                            const auto& candidateReturn = candidate.ReturnType;
-                            if (candidateReturn.TypeName != destTypeName.TypeName
-                                || candidateReturn.Pointer != destTypeName.Pointer
-                                || candidateReturn.ElemPointer != destTypeName.ElemPointer
-                                || candidateReturn.IsArrayView != destTypeName.IsArrayView)
-                                continue;
-                            hasMatchingConversion = true;
-                            break;
-                        }
+                        if (candidate.Parameters.size() != 1) continue;
+                        const auto& sourceParam = candidate.Parameters[0];
+                        // A CFlat conversion is a free function taking its source BY VALUE. A
+                        // C++ member conversion operator is the same conversion spelled with a
+                        // 'this' receiver, so for a registered C++ record the pointer shape is
+                        // accepted too - the overload call path does the receiver adjustment
+                        // (the same relaxation round 8 made for 'operator bool').
+                        if ((sourceParam.Pointer && !compiler->IsCxxRecord(sourceTypeName))
+                            || sourceParam.ElemPointer
+                            || sourceParam.TypeName != sourceTypeName)
+                            continue;
+                        const auto& candidateReturn = candidate.ReturnType;
+                        if (candidateReturn.TypeName != destTypeName.TypeName
+                            || candidateReturn.Pointer != destTypeName.Pointer
+                            || candidateReturn.ElemPointer != destTypeName.ElemPointer
+                            || candidateReturn.IsArrayView != destTypeName.IsArrayView)
+                            continue;
+                        return true;
                     }
-                }
+                    return false;
+                };
 
-                if (hasMatchingConversion)
+                if (hasMatchingConversion())
                 {
                     auto argNV = namedVar;
                     argNV.TypeAndValue.VariableName.clear();
@@ -8954,6 +8951,19 @@ LLVMBackend::NamedVariable MainListener::ParseCastExpression(CFlatParser::CastEx
                 if (compiler->IsCxxRecord(sourceTypeName)
                     && compiler->RejectInaccessibleCxxMember(sourceTypeName, opName))
                 {
+                    namedVar.TypeAndValue = destTypeName;
+                    return namedVar;
+                }
+
+                // RejectInaccessibleCxxMember may have requested a specialization and registered
+                // the conversion. Re-run the ordinary function-table lookup after that bind.
+                if (hasMatchingConversion())
+                {
+                    auto argNV = namedVar;
+                    argNV.TypeAndValue.VariableName.clear();
+                    auto result = compiler->CreateOverloadedFunctionCall(opName, { argNV });
+                    namedVar.Primary = result;
+                    namedVar.Storage = nullptr;
                     namedVar.TypeAndValue = destTypeName;
                     return namedVar;
                 }
