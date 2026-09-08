@@ -1,5 +1,6 @@
 // Definitions for cpp_interop_basic.h. Compiled by the host C++ driver and linked into
 // the final image; the CFlat side never parses this file.
+#include <cstdarg>
 #include "cpp_interop_basic.h"
 
 namespace cppi
@@ -69,6 +70,17 @@ namespace cppi
     int map_total(const std::map<int, int>& value) noexcept
     {
         return value.at(3) + value.at(5);
+    }
+    std::string_view take_string_view(std::string_view value) noexcept { return value; }
+    std::string_view return_string_view(std::string_view value) noexcept { return value; }
+    int sum_varargs(int count, ...) noexcept
+    {
+        va_list args;
+        va_start(args, count);
+        int total = 0;
+        for (int i = 0; i < count; ++i) total += va_arg(args, int);
+        va_end(args);
+        return total;
     }
 
     Counter::Counter() noexcept : value_(0) {}

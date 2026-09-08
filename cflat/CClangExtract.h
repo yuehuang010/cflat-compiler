@@ -211,6 +211,7 @@ namespace cflat_cinterop
     struct RawCxxBase
     {
         std::string name;           // CFlat dotted spelling of the base class
+        std::string canonicalType;  // canonical C++ spelling, including specialization arguments
         uint64_t offsetBytes = 0;
         int access = AccessPublic;
         bool isVirtual = false;

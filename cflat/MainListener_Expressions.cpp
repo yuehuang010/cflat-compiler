@@ -14006,6 +14006,10 @@ LLVMBackend::NamedVariable MainListener::ParseMoveExpression(CFlatParser::MoveEx
                         || (!argNV.CallerName.empty() && compiler->IsVariableOwningString(argNV.CallerName));
                 return result;
             }
+            // A scalar has no ownership state to detach, but an explicit move still carries the
+            // C++ value category needed by a foreign rvalue-reference parameter.
+            if (IsDirectCallArgument(ctx) && !argNV.IsElementAccess)
+                argNV.IsExplicitMove = true;
             return argNV;
         }
 

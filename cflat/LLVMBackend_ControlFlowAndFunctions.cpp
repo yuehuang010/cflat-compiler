@@ -1676,6 +1676,12 @@ void LLVMBackend::CreateFunctionDeclaration(const std::string& functionName, con
             for (const auto& d : pendingFunctionDeclarations_)
                 if (d.MangledName == mangledName) existingProvisional = true;
 
+            auto sameTypeAndValue = [](const TypeAndValue& a, const TypeAndValue& b) {
+                return a.TypeName == b.TypeName && a.Pointer == b.Pointer
+                    && a.ElemPointer == b.ElemPointer && a.PointerDepth == b.PointerDepth
+                    && a.IsFunctionPointer == b.IsFunctionPointer && a.IsAlias == b.IsAlias
+                    && a.IsMove == b.IsMove && a.IsRvalueRef == b.IsRvalueRef;
+            };
             for (const auto& sym : functionTable[functionName])
                 if (sym.UniqueName == mangledName)
                 {
@@ -1687,8 +1693,12 @@ void LLVMBackend::CreateFunctionDeclaration(const std::string& functionName, con
                      * "no implicit integer narrowing at a call argument" was bypassed by
                      * spelling. Fall through to the conflict diagnostic below instead.
                      */
+                    bool sameSignature = sym.Parameters.size() == arguments.size()
+                        && sameTypeAndValue(sym.ReturnType, returnType);
+                    for (size_t i = 0; sameSignature && i < arguments.size(); ++i)
+                        sameSignature = sameTypeAndValue(sym.Parameters[i], arguments[i]);
                     if (!external || existingProvisional
-                        || existing->getFunctionType() == functionType)
+                        || (existing->getFunctionType() == functionType && sameSignature))
                         return;
                     break;
                 }

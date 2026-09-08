@@ -1,0 +1,10 @@
+import cpp "cpp_interop_basic.h";
+
+extern int main()
+{
+    string text = "abc";
+    expect_error("arg=string  param=std.string_view") {
+        cppi.take_string_view(text);
+    }
+    return 0;
+}

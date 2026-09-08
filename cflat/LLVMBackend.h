@@ -3136,6 +3136,8 @@ private:
     std::string* cxxAbiMismatchSink_ = nullptr;
     // CFlat name -> outcome of its one type request ("" = registered, else the diagnostic text).
     std::unordered_map<std::string, std::string> cxxForeignRequests_;
+    // A layout-only nested type may be upgraded later when CFlat calls one of its methods.
+    std::unordered_set<std::string> cxxForeignDefinitions_;
     /*
      * M5 companion modules: one LLVM bitcode blob per C++ import group, holding the definitions
      * Clang emitted for the bound surface (linkonce_odr inline bodies, vtables/RTTI with their
@@ -4880,17 +4882,22 @@ private:
     // frame. Refuse to bind such a function, whether by call or by function pointer.
     void RejectThrowingCxxFunction(const FunctionSymbol& symbol, const std::string& displayName) const;
     static std::string SqueezeCxxSpelling(const std::string& spelling);
-    std::string BuildCxxRequestPrologue(const std::string& cxxSpelling) const;
+    std::string BuildCxxRequestPrologue(const std::string& cxxSpelling,
+                                        bool explicitInstantiation) const;
     std::string BuildCxxRequestOdrUses(const cflat_cinterop::RawRecord& rec) const;
     bool RunCxxTypeRequest(const std::string& cflatName, const std::string& cxxSpelling,
                            const std::string& extraSource, bool emitDefinitions,
-                           cflat_cinterop::ExtractResult& raw, std::string& error);
+                           cflat_cinterop::ExtractResult& raw, std::string& error,
+                           bool explicitInstantiation = true);
     // Cache identity of one C++ type request; see the definition for what it folds in.
     std::string CxxTypeRequestCacheKey(const std::string& cxxSpelling) const;
 
     bool RequestCxxForeignType(const std::string& cflatName, const std::string& cxxSpelling,
-                               std::string& error);
-    bool RequestCxxSignatureTypes(const cflat_cinterop::RawSig& sig);
+                               std::string& error, bool needDefinitions = true,
+                               bool explicitInstantiation = true);
+    void RequestCxxMemberTypes(const std::vector<CRecordEntry>& records);
+    bool RequestCxxSignatureTypes(const cflat_cinterop::RawSig& sig,
+                                  const std::unordered_set<std::string>* localEnums = nullptr);
     void RequestCxxSignatureTypes(const std::vector<CSigEntry>& sigs);
     bool RequestCxxType(const std::string& baseName, const std::vector<std::string>& typeArgs,
                         const std::string& cflatName, std::string& error);

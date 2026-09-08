@@ -2557,7 +2557,9 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 namedVar.Storage  = nullptr;
                                 namedVar.BaseType = result->getType();
                                 namedVar.TypeAndValue = Compiler(ctx)->lastCallReturnType;
-                                PrepareAliasCallResult(ctx, namedVar);
+                                // A direct call produces a fresh temporary; preserve that value
+                                // category for a foreign C++ rvalue-reference parameter.
+                                PrepareAliasCallResult(ctx, namedVar, true);
                                 if (namedVar.TypeAndValue.IsInterface)
                                 {
                                     // operator[] returned an interface fat-ptr - expose as interfaceVar
@@ -5887,7 +5889,9 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 // so that subsequent member access (->field) can resolve the struct.
                                 if (namedVar.Primary)
                                     namedVar.TypeAndValue = Compiler(primaryCtx)->lastCallReturnType;
-                                PrepareAliasCallResult(primaryCtx, namedVar);
+                                // A direct call produces a fresh temporary; preserve that value
+                                // category for a foreign C++ rvalue-reference parameter.
+                                PrepareAliasCallResult(primaryCtx, namedVar, true);
                                 if (namedVar.Primary != nullptr && structVar.ContainsBondedClosure
                                     && (namedVar.TypeAndValue.IsFunctionPointer
                                         || Compiler(primaryCtx)->GetEncodedClosureType(

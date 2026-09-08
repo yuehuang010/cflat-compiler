@@ -9,6 +9,7 @@
 #include <memory>
 #include <map>
 #include <optional>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -132,6 +133,9 @@ namespace cppi
     int read_outer_store() noexcept;
     std::map<int, int> make_int_map() noexcept;
     int map_total(const std::map<int, int>& value) noexcept;
+    std::string_view take_string_view(std::string_view value) noexcept;
+    std::string_view return_string_view(std::string_view value) noexcept;
+    int sum_varargs(int count, ...) noexcept;
 
     class Counter
     {

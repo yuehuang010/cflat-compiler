@@ -1761,6 +1761,10 @@ extern int main()
     m16map[3] = 9;
     if (m16map[3] != 9)                              return 693;
     if (cppi.map_total(m16map) != 20)                return 694;
+    int m16iterTotal = 0;
+    for (auto m16it = m16map.begin(); m16it != m16map.end(); m16it++)
+        m16iterTotal += m16it.second;
+    if (m16iterTotal != 20)                         return 696;
     m16map.erase(3);
     if (m16map.count(3) != 0 || m16map.size() != 1) return 695;
 
@@ -1773,6 +1777,11 @@ extern int main()
     if (m13some.value() != 17)                      return 669;
     std.optional<int> m13none = cppi.make_opt(17, false);
     if (m13none.has_value())                        return 670;
+    if (m13none.value_or(cppi.helper()) != 9)       return 747;
+    m13none.emplace(cppi.helper());
+    if (!m13none || m13none.value() != 9)           return 748;
+    m13none.reset();
+    if (m13none)                                    return 749;
 
     int[4] m14array = {1, 2, 3, 4};
     if (cppi.sum4(m14array) != 10)                  return 671;
@@ -1784,7 +1793,7 @@ extern int main()
         m17v.push_back(2);
         m17v.push_back(3);
         int m17sum = 0;
-        for (int* m17it = m17v.begin(); m17it != m17v.end(); m17it++)
+        for (auto m17it = m17v.begin(); m17it != m17v.end(); m17it++)
             m17sum += *m17it;
         if (m17sum != 5)                            return 697;
         if (m17v.data()[1] != 3)                   return 698;
@@ -1882,6 +1891,20 @@ extern int main()
     if (m19r.get() != 4)                            return 738;
     cppi.ConvDeleted m19del = cppi.ConvDeleted(1);
     if (m19del.get() != 5)                          return 739;
+
+    // ---- Section M20: std::string_view and a free variadic function (740-746) ----
+    char* m20cstr = "hello";
+    std.string_view m20sv = std.string_view(m20cstr);
+    if ((int)m20sv.size() != 5)                      return 740;
+    if (m20sv.data()[1] != 'e')                     return 741;
+    if (m20sv[1] != 'e')                            return 742;
+    std.string_view m20short = std.string_view(m20cstr, 3);
+    if ((int)m20short.size() != 3)                  return 743;
+    if ((int)m20sv.substr(1, 3).size() != 3
+        || m20sv.substr(1, 3)[0] != 'e')                  return 744;
+    if ((int)cppi.return_string_view(cppi.take_string_view(m20sv.substr(1, 3))).size() != 3
+        || cppi.return_string_view(cppi.take_string_view(m20sv.substr(1, 3)))[2] != 'l') return 745;
+    if (cppi.sum_varargs(4, 1, 2, 3, 4) != 10)     return 746;
 
     return 0;
 }

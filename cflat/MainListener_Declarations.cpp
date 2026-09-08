@@ -3752,8 +3752,10 @@ bool MainListener::TryDeclareForeignCxxLocal(CFlatParser::InitDeclaratorContext*
         // Only a SINGLE call with no nested call is accepted, so the armed destination cannot be
         // consumed by an inner call of the same type before the outer one reaches the emitter.
         if (auto* pf = SolePostfixExpression(assign);
-            pf != nullptr && pf->argumentExpressionList().size() == 1
-            && pf->argumentExpressionList()[0]->getText().find('(') == std::string::npos)
+            pf != nullptr && !pf->argumentExpressionList().empty()
+            && std::ranges::all_of(pf->argumentExpressionList(), [](auto* args) {
+                   return args != nullptr && args->getText().find('(') == std::string::npos;
+               }))
         {
             compiler->SetCurrentDebugLocation(line);
             compiler->pendingCxxSretDest_ = slot;

@@ -116,7 +116,7 @@ enums are `Color.Red`. Overload sets are foreign overload sets ranked by Clang.
 | `class C` / `struct C` | `C` (a foreign class) | Layout from Clang |
 | `template<class T> class V` | `V<T>` | CFlat generic angle syntax |
 | `template<int N>` | `V<T, N>` | Existing value generic parameters |
-| `std::string` | `std.string` | Distinct from CFlat `string`; no conversion surface (ruling 2026-09-06), sugar maybe later |
+| `std::string`, any `std::` type | `std.string`, `std.T` | Just foreign types, no CFlat sugar (rulings 2026-09-06, 2026-09-07); `string_view` from `char*`; iterators are bound classes |
 | `enum class E` | `E` | Scoped; `E.A` |
 | `void(*)(int)` | existing function pointer type | |
 | member pointers | not supported | Precise error |
@@ -649,6 +649,60 @@ RULING 2026-09-06 (strings): `std.string` and CFlat `string` stay separate types
 conversion surface; users go through `c_str()` / a `std.string` constructor from `char*`.
 Sugar may be considered later. The Types table row "explicit conversions" is superseded.
 
+RULING 2026-09-07 (std types are just types): every `std::` type is a foreign C++ type
+imported through the same funnel as any user class, with no CFlat-language surface built
+around it. No `string` <-> `std.string` sugar, no `string` borrow into `string_view` (a
+`std.string_view` is constructed from `char*` like in C++), no bespoke iteration surface
+for containers: `begin()`/`end()` return the container's iterator TYPE as a foreign class
+and the bound `++`, `*`, `->`, `==`/`!=` hooks drive the loop. The round-7 shortcut that
+binds vector `begin`/`end` as `T*` is superseded (kept for `data()`); iterator classes
+bind like any nested class-template specialization. Closes the string_view ruling and the
+map-iteration question; remaining std work is coverage, not design.
+
+Types round 12, 2026-09-07 (worktree ../cflat-cpp-interop on master 86c9befb, uncommitted;
+verified on the host by the main session: Release test.sh 858/0/8, LSP green, examples 45/0,
+28 err_cpp fixtures, two-file cache repro clean, Debug interop compile+run exit 0 in 82 s;
+header cache v30, new field `ct` canonical base type). First round under the "std types are
+just types" ruling. Iterators: `begin()`/`end()` publish the real iterator class
+specialization (vector `__wrap_iter`, map `__map_iterator`) instead of the round-7 `T*`
+bridge; `data()` stays `T*`. Generic funnel changes that made this work: iterator-returning
+members request full nested foreign definitions; ADL free operator templates (vector
+iterator `==`/`!=`) are ODR-used by the class request and registered by the free-function
+extractor; a friend operator instantiated inside a class carries namespace semantic context
+in Clang, so the collector accepts concrete non-member operators whose parameters name the
+requested class; the class spelling is published before request signatures are mapped
+(parameters otherwise decayed to `void*`). `std::string_view` bound as an ordinary class
+(ctor from `char*` and `char*, len`, size/data/[]/substr, by-value pass/return); a CFlat
+`string` argument is a plain overload error (`err_cpp_string_view_from_string.cb`).
+`std::optional` `value_or`/`emplace`/`reset` bind through the member-template
+materialization; libc++ exposes `has_value`/`reset`/`value` via public `using` from a
+private base, so using-selected methods join the class surface and one linkage symbol may
+carry several receiver types (CreateFunctionDeclaration dedups on full CFlat signature,
+not just the LLVM type). Primitive `T&&` parameters: `move n` on a scalar direct call
+argument carries the rvalue category and a direct call result is marked rvalue. Variadic
+free function `sum_varargs` covered (section M20). Debug-only finds: `string_view::npos`
+overflowed the signed APSInt getter (routed through the unsigned helper); the ODR-use probe
+now forces only members needing a local definition, keeping user inline constructors.
+Master-side probes (move on scalar, extern redeclaration, alias extern) behave the same as
+the master binary. Report scratch/TYPES12_REPORT.md. Cost: 4h50m Codex at xhigh, 75 percent
+model time. Perf follow-up by the main session the same evening (traces old vs new binary
+on the same test): the Debug interop compile had grown 35 s -> 82 s and the Release check
+9.7 s -> 22.8 s because type requests went 20 -> 52. Two filters landed in the same commit:
+a signature no longer requests a plain qualified name the header itself registered (record
+or enum; each such request was two Clang parses for nothing - 10 records and 3 enums here),
+and `begin`/`end`/`operator*`/`operator->` request only the non-const overload's type
+(registration keeps the non-const twin anyway, so `const_iterator` was requested and never
+bound). Result: 52 s Debug, 15 s Release, 30 requests. Tried and reverted: implicit
+(sizeof-based) instead of explicit instantiation in stage 1 - no measurable change in
+either config, the cost is the libc++ parse itself, not member instantiation. Residual
+structure: ~0.5 s Release / ~1.4 s Debug per request for two Clang frontends over the
+import prologue. Next levers, largest first: (1) batch all requests of one header into a
+single stage-1 and stage-2 TU (`__cflat_req_0..N`), turning ~60 frontends into ~4; (2) a
+PCH of the import prologue per process, halving each frontend; (3) lazy iterator/pointee
+requests on first CFlat use. Not started; needs a brief.
+Remaining from the gap matrix: none open by design; not attempted: unordered_map, set,
+tuple, variant, span, initializer_list (coverage rounds on the same funnel).
+
 Open: per-import `std` clause or CLI-only; exceptions option at M8 start; MSVC ABI pass.
 Open from the M5 review (2026-09-06):
 - LSP and template CodeGen: type requests still run stage-2 CodeGen under the LSP so the
@@ -674,6 +728,10 @@ Open from the M5 review (2026-09-06):
 | 76c3962c | resource-dir bake-in and LSP sweep flag (M5b follow-up) | 818 |
 | 52d8537c | first review round resolved (reset leaks, token stripping, demangle) | 818 |
 | 952cbe32 | second review round: cache mode keys, ABI sink RAII, template arg pointers, request cache, namespace gating, blob budget, data-layout check | 818 |
+| 3a3a8509 | collapsed headline: direct ABI import M0-M4, M6 (supersedes the rows above) | 856 |
+| 9424d6b1 | collapsed headline: inline definitions, templates, std::vector/std::string, review rounds (M5) | 856 |
+| 86c9befb | collapsed headline: rvalue refs, M7 callbacks, types rounds 1-11, C++ operators, extractor fixes, header cache v29 | 856 |
+| (round 12) | iterators as classes, std::string_view, std::optional completion, variadic free fn, request filters; header cache v30 | 858 |
 
 ## Verification and repository constraints
 

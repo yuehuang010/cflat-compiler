@@ -359,8 +359,19 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                 else
                 {
                     auto candidateParam = GetType(*candidateParamItr);
-                    result = candidateParamItr->IsCxxRefToPointer && arg.TypeAndValue.Pointer
-                        ? 0 : CompareUpconvert(arg.BaseType, candidateParam);
+                    if (candidateParamItr->IsRvalueRef && !arg.TypeAndValue.Pointer)
+                    {
+                        // A primitive foreign rvalue reference is represented as T* at the ABI
+                        // boundary, but a call result may carry only its lowered scalar type.
+                        auto valueParam = *candidateParamItr;
+                        valueParam.Pointer = false;
+                        valueParam.ElemPointer = false;
+                        valueParam.PointerDepth = 0;
+                        result = CompareUpconvert(arg.BaseType, GetType(valueParam));
+                    }
+                    else
+                        result = candidateParamItr->IsCxxRefToPointer && arg.TypeAndValue.Pointer
+                            ? 0 : CompareUpconvert(arg.BaseType, candidateParam);
                     if (IsRawPointerToCoreUnique(arg, *candidateParamItr))
                         result = 0;
 

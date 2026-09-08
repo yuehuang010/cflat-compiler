@@ -4428,6 +4428,7 @@ void LLVMBackend::ResetForReanalysis()
     cxxFunctionPointerAbiPlans_.clear();
     cxxCflatToCxxSpelling_.clear();
     cxxForeignRequests_.clear();
+    cxxForeignDefinitions_.clear();
     // Per-analysis emitted IR: the next analysis re-adopts whatever its own imports produce (from
     // the extractor or the header cache). No Clang pointer is retained, only bitcode bytes.
     cxxCompanionBitcode_.clear();

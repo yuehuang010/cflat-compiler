@@ -2021,6 +2021,7 @@ nlohmann::json LLVMBackend::RecordToJson(const CRecordEntry& r)
             for (const auto& b : r.bases)
             {
                 nlohmann::json bj = {{"n", b.name}, {"of", b.offsetBytes}};
+                if (!b.canonicalType.empty()) bj["ct"] = b.canonicalType;
                 if (b.access != 0) bj["ac"] = b.access;
                 if (b.isVirtual)   bj["vi"] = true;
                 bs.push_back(std::move(bj));
@@ -2075,6 +2076,7 @@ LLVMBackend::CRecordEntry LLVMBackend::RecordFromJson(const SjVal& j)
             {
                 cflat_cinterop::RawCxxBase rb;
                 rb.name        = b.value("n", std::string{});
+                rb.canonicalType = b.value("ct", std::string{});
                 rb.offsetBytes = b.value("of", (uint64_t)0);
                 rb.access      = b.value("ac", 0);
                 rb.isVirtual   = b.value("vi", false);
@@ -2252,7 +2254,7 @@ bool LLVMBackend::TryLoadCHeaderDiskCache(
         // v27 adds the C++ operator++/--, operator*, operator-> and operator bool members to
         // extraction; older entries must be reparsed because their member lists are incomplete.
         // v28 carries the long-double width, format, and target triple from the clang invocation.
-        if (version != 29) return false;
+        if (version != 30) return false;
 
         // Accept on mtime match (fast) or content hash match (authoritative on mtime drift).
         auto storedMtime = j.value("mtime", int64_t{-1});
@@ -2341,7 +2343,7 @@ void LLVMBackend::WriteCHeaderDiskCache(
         if (ec) return;
 
         nlohmann::json j;
-        j["version"] = 29;
+        j["version"] = 30;
         j["mtime"]   = (int64_t)mtime.time_since_epoch().count();
         j["hash"]    = contentHash;
         j["ldw"]     = entry.longDoubleWidth;
