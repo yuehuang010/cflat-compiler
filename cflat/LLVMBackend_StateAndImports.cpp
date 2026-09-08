@@ -2254,7 +2254,7 @@ bool LLVMBackend::TryLoadCHeaderDiskCache(
         // v27 adds the C++ operator++/--, operator*, operator-> and operator bool members to
         // extraction; older entries must be reparsed because their member lists are incomplete.
         // v28 carries the long-double width, format, and target triple from the clang invocation.
-        if (version != 30) return false;
+        if (version != 31) return false;
 
         // Accept on mtime match (fast) or content hash match (authoritative on mtime drift).
         auto storedMtime = j.value("mtime", int64_t{-1});
@@ -2343,7 +2343,7 @@ void LLVMBackend::WriteCHeaderDiskCache(
         if (ec) return;
 
         nlohmann::json j;
-        j["version"] = 30;
+        j["version"] = 31;
         j["mtime"]   = (int64_t)mtime.time_since_epoch().count();
         j["hash"]    = contentHash;
         j["ldw"]     = entry.longDoubleWidth;

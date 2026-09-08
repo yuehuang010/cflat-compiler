@@ -1,0 +1,23 @@
+// Requests are scoped to ONE import statement: the macro cpp_interop_reqscope_a.h defines must not
+// reach the type request made for cpp_interop_reqscope_b.h, so BHolder has no `leaked` member.
+// The mirror fixture err_cpp_reqscope_macro_leak_reversed.cb imports the same two headers in the
+// opposite order and gets the same answer.
+import cpp "cpp_interop_reqscope_a.h";
+import cpp "cpp_interop_reqscope_b.h";
+
+expect_error("Unknown identifier 'leaked'") {
+    int reqscope_leak_probe()
+    {
+        reqb.BHolder<int> b = default;
+        return b.leaked();
+    }
+}
+
+extern int main()
+{
+    reqa.AHolder<int> a = default;
+    a.set(4);
+    reqb.BHolder<int> b = default;
+    b.set(38);
+    return a.get() + b.get() == 42 ? 0 : 1;
+}

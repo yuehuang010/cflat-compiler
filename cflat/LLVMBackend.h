@@ -3099,13 +3099,39 @@ private:
     bool cppInteropUsed_ = false;
     bool cppAssumeNoexcept_ = false;
     /*
-     * M5b - the C++ headers (and their -D defines) of every `import cpp` group in this analysis, in
-     * import order. A concrete type request re-parses exactly this set, so a specialization is
-     * instantiated in the same header context the user imported. Recorded at the import site, NOT
+     * M5b - ONE `import cpp` statement: its headers in the order the statement spells them, its
+     * -D defines, the namespaces it seeded and the qualified C++ names it published. A type
+     * request re-parses exactly one group, so an import never changes the translation unit or the
+     * cache identity of a request made for a different import. Recorded at the import site, NOT
      * inside the extractor: a warm header cache skips extraction entirely.
      */
-    std::vector<std::string> cxxImportHeaders_;
-    std::vector<std::string> cxxImportDefines_;
+    struct CxxImportGroup
+    {
+        std::vector<std::string> headers;
+        std::vector<std::string> defines;
+        std::unordered_set<std::string> namespaces;
+        std::unordered_set<std::string> publishedNames;
+    };
+    std::vector<CxxImportGroup> cxxImportGroups_;
+    /*
+     * The header/define set ONE request compiles against: the owning import group, plus the groups
+     * that own the template arguments of the requested spelling (`std::vector<std::string>` from
+     * `import cpp "vector"` needs the group that brought in `<string>`). Dependency groups are
+     * appended in a canonical order so two files importing the same headers in opposite order
+     * build the same prologue and the same cache key.
+     */
+    struct CxxRequestGroup
+    {
+        std::vector<std::string> headers;
+        std::vector<std::string> defines;
+        std::string label;
+        size_t primary = static_cast<size_t>(-1);   // index into cxxImportGroups_
+    };
+    const CxxRequestGroup* activeCxxRequestGroup_ = nullptr;
+    // Base C++ spelling ("std::vector") -> the import group index that answered for it.
+    std::unordered_map<std::string, size_t> cxxTemplateOwnerGroup_;
+    // CFlat foreign type name -> the import group index whose request registered it.
+    std::unordered_map<std::string, size_t> cxxTypeOwnerGroup_;
     /*
      * Leading namespace segments a C++ import group actually brought in ("std" for a standard
      * header, plus every namespace a walked C++ header declared a class in). A dotted type name
@@ -4882,20 +4908,66 @@ private:
     // frame. Refuse to bind such a function, whether by call or by function pointer.
     void RejectThrowingCxxFunction(const FunctionSymbol& symbol, const std::string& displayName) const;
     static std::string SqueezeCxxSpelling(const std::string& spelling);
-    std::string BuildCxxRequestPrologue(const std::string& cxxSpelling,
-                                        bool explicitInstantiation) const;
-    std::string BuildCxxRequestOdrUses(const cflat_cinterop::RawRecord& rec) const;
-    bool RunCxxTypeRequest(const std::string& cflatName, const std::string& cxxSpelling,
-                           const std::string& extraSource, bool emitDefinitions,
-                           cflat_cinterop::ExtractResult& raw, std::string& error,
-                           bool explicitInstantiation = true);
+    // One spelling a request (or a batch of requests) instantiates in an import group's TU.
+    struct CxxRequestItem
+    {
+        std::string cflatName;
+        std::string cxxSpelling;
+        bool needDefinitions = true;
+        bool explicitInstantiation = true;
+    };
+    std::string BuildCxxRequestPrologue(const CxxRequestGroup& group,
+                                        const std::vector<CxxRequestItem>& items,
+                                        bool instantiateAll) const;
+    std::string BuildCxxRequestOdrUses(const cflat_cinterop::RawRecord& rec,
+                                       const std::string& marker, const std::string& tagPrefix) const;
+    bool RunCxxTypeRequests(const CxxRequestGroup& group,
+                            const std::vector<CxxRequestItem>& items,
+                            const std::string& extraSource, bool emitDefinitions,
+                            cflat_cinterop::ExtractResult& raw, std::string& error);
     // Cache identity of one C++ type request; see the definition for what it folds in.
-    std::string CxxTypeRequestCacheKey(const std::string& cxxSpelling) const;
+    std::string CxxTypeRequestCacheKey(const CxxRequestGroup& group,
+                                       const std::string& cxxSpelling) const;
+    std::string CxxTypeRequestCacheKey(const CxxRequestGroup& group, const CxxRequestItem& item) const;
+
+    // Import-group plumbing for the request layer.
+    size_t FindOrAddCxxImportGroup(const std::vector<std::string>& headers,
+                                   const std::vector<std::string>& defines);
+    CxxRequestGroup MakeCxxRequestGroup(size_t primary, const std::vector<size_t>& deps) const;
+    void PublishCxxGroupNames(size_t group, const std::vector<CRecordEntry>& records);
+    std::vector<size_t> CandidateCxxGroupsFor(const std::string& cxxBase) const;
+    bool RequestCxxTypeInOwningGroup(const std::string& cxxBase, const std::string& cflatName,
+                                     const std::string& spelling,
+                                     const std::vector<size_t>& deps, std::string& error);
+    // RAII: the group every request made while it is alive compiles against.
+    struct CxxRequestGroupScope
+    {
+        LLVMBackend& backend;
+        const CxxRequestGroup* previous;
+        CxxRequestGroupScope(LLVMBackend& b, const CxxRequestGroup* group)
+            : backend(b), previous(b.activeCxxRequestGroup_)
+        { backend.activeCxxRequestGroup_ = group; }
+        ~CxxRequestGroupScope() { backend.activeCxxRequestGroup_ = previous; }
+    };
 
     bool RequestCxxForeignType(const std::string& cflatName, const std::string& cxxSpelling,
                                std::string& error, bool needDefinitions = true,
-                               bool explicitInstantiation = true);
+                               bool explicitInstantiation = true, bool tentative = false);
     void RequestCxxMemberTypes(const std::vector<CRecordEntry>& records);
+    void CollectCxxMemberRequestItems(const std::vector<CRecordEntry>& records,
+                                      std::vector<CxxRequestItem>& out);
+    bool CxxGroupHeaderStamp(const CxxRequestGroup& group,
+                             std::filesystem::file_time_type& newest) const;
+    uint64_t CxxGroupHeaderHash(const CxxRequestGroup& group) const;
+    int ClassifyCxxSignatureSpelling(const std::string& spelling,
+                                     const std::unordered_set<std::string>* localEnums,
+                                     std::string& identity, std::string& named);
+    void CollectCxxSignatureRequestItems(const std::vector<CSigEntry>& sigs,
+                                         std::vector<CxxRequestItem>& out);
+    void CollectCxxSignatureRequestItems(const cflat_cinterop::RawSig& sig,
+                                         const std::unordered_set<std::string>* localEnums,
+                                         std::vector<CxxRequestItem>& out);
+    void PrewarmCxxRequestBatch(std::vector<CxxRequestItem> items);
     bool RequestCxxSignatureTypes(const cflat_cinterop::RawSig& sig,
                                   const std::unordered_set<std::string>* localEnums = nullptr);
     void RequestCxxSignatureTypes(const std::vector<CSigEntry>& sigs);
@@ -4919,7 +4991,7 @@ private:
     }
     // True once any `import cpp` header has been bound in this analysis: the only situation in
     // which an unknown dotted type name is worth resolving as a C++ type.
-    bool HasCxxImportGroup() const { return !cxxImportHeaders_.empty(); }
+    bool HasCxxImportGroup() const { return !cxxImportGroups_.empty(); }
 
     // Prototype boundary for the C++ path: primitives and bare pointers only. A record passed
     // or returned BY VALUE needs the aggregate ABI arrangement, which this prototype does not

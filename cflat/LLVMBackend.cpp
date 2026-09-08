@@ -4421,8 +4421,10 @@ void LLVMBackend::ResetForReanalysis()
     for (const auto& obj : cObjectFiles_) llvm::sys::fs::remove(obj);
     cObjectFiles_.clear();
     cppInteropUsed_ = false;
-    cxxImportHeaders_.clear();
-    cxxImportDefines_.clear();
+    cxxImportGroups_.clear();
+    activeCxxRequestGroup_ = nullptr;
+    cxxTemplateOwnerGroup_.clear();
+    cxxTypeOwnerGroup_.clear();
     cxxForeignNamespaces_.clear();
     cxxForeignTypeSpellings_.clear();
     cxxFunctionPointerAbiPlans_.clear();
