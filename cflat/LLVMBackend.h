@@ -495,20 +495,24 @@ inline std::string TwoComponentVersion(const std::string& v)
     return v.substr(0, second);
 }
 
+#endif
+
 // Cached real SDK path for macOS C-header binding ($SDKROOT, else `xcrun --show-sdk-path`).
 // The harvested ~/.cflat/macsdk carries link stubs but no headers, so it is never used here.
-// Empty when no SDK is available (no Xcode / Command Line Tools and no $SDKROOT).
+// Empty when no SDK is available (no Xcode / Command Line Tools and no $SDKROOT). Defined on
+// every host because cross-targeting macOS is allowed; off Darwin only $SDKROOT can answer.
 inline const std::string& MacSdkPathCached()
 {
     static const std::string sdk = [] {
         std::string s;
         if (const char* env = std::getenv("SDKROOT")) if (env[0]) s = env;
+#if defined(__APPLE__)
         if (s.empty()) s = CaptureToolLine("xcrun --show-sdk-path 2>/dev/null");
+#endif
         return s;
     }();
     return sdk;
 }
-#endif
 
 // How a lock is held at a guarded-field access. Exclusive is `lock (m)` / `lock (rw.write)`;
 // Shared is `lock (rw.read)`; Optimistic is a version-validated speculative read - it holds
@@ -1773,11 +1777,14 @@ public:
         llvm::Type* coerceTy = nullptr;     // eightbyte 0 type for CoerceToInt / CoercePair
         llvm::Type* coerceTy2 = nullptr;    // eightbyte 1 type for CoercePair
         llvm::StructType* coerceStructTy = nullptr; // element list for CoerceFlat
-        llvm::StructType* structTy = nullptr; // pointee for ByVal / SRetReturn / coerce source
+        llvm::Type* structTy = nullptr;      // pointee for ByVal / SRetReturn / coerce source (a record, or a scalar MS x64 passes indirectly)
         uint64_t align = 0;                  // byval/sret alignment hint
         // Clang's Indirect arrangement is a bare pointer (no byval) for a type the CALLER owns
         // and destroys. The heuristic C path always wants byval, so this defaults to true.
         bool indirectByVal = true;
+        // SRetReturn only: the hidden slot follows the first (`this`) parameter instead of
+        // leading the argument list (MS ABI instance methods).
+        bool sretAfterThis = false;
         bool signExt = false;                // Direct scalar carrying clang's `signext`
         bool zeroExt = false;                // ... or `zeroext`
     };
@@ -3394,6 +3401,7 @@ private:
         bool hasTrivialDefaultCtor = false;
         bool hasTrivialCopyCtor = false;
         bool hasTrivialDtor = true;
+        bool paramDestroyedInCallee = false;   // MS ABI: the callee destroys a by-value param
         bool hasDeletedDefaultCtor = false;
         bool hasDeletedCopyCtor = false;
         bool hasDefaultCtor = false;
@@ -4948,11 +4956,25 @@ private:
         bool needDefinitions = true;
         bool explicitInstantiation = true;
     };
+    std::string BuildCxxRequestIncludes(const CxxRequestGroup& group) const;
+    std::string BuildCxxRequestMarkers(const std::vector<CxxRequestItem>& items,
+                                       bool instantiateAll) const;
     std::string BuildCxxRequestPrologue(const CxxRequestGroup& group,
                                         const std::vector<CxxRequestItem>& items,
                                         bool instantiateAll) const;
+    // Precompiled include prologue shared by every request TU of one import group.
+    std::string EnsureCxxRequestPch(const CxxRequestGroup& group,
+                                    const std::vector<std::string>& args);
+    static void DropCxxRequestPch(const std::string& path);
+    static void PruneCxxRequestPchDir(const std::string& dir);
+    static inline std::unordered_map<std::string, std::string> cxxRequestPchCache_;
+    static inline std::mutex cxxRequestPchMutex_;
     std::string BuildCxxRequestOdrUses(const cflat_cinterop::RawRecord& rec,
                                        const std::string& marker, const std::string& tagPrefix) const;
+    std::string BuildCxxRequestInheritedOdrUses(const std::vector<cflat_cinterop::RawRecord>& records,
+                                                const cflat_cinterop::RawRecord& rec,
+                                                const std::string& marker,
+                                                const std::string& tagPrefix) const;
     bool RunCxxTypeRequests(const CxxRequestGroup& group,
                             const std::vector<CxxRequestItem>& items,
                             const std::string& extraSource, bool emitDefinitions,
@@ -5316,7 +5338,13 @@ private:
                                  const std::string& fileForLsp,
                                  std::vector<CFunctionMacroEntry>* retryMacros = nullptr);
 
-    void ReportOrphanHeader(const std::vector<std::string>& headerPaths, const std::string& clangErr);
+    void ReportOrphanHeader(const std::vector<std::string>& headerPaths,
+                            const std::string& clangErr, bool cxxMode);
+
+    // A header the user asked to bind that clang itself rejected. Reported with the diagnostic
+    // that broke it, instead of binding the error-recovered remnants.
+    void ReportUncompilableHeader(const std::vector<std::string>& headerPaths,
+                                  const std::string& clangErr, bool cxxMode);
 
     // Single-header convenience wrapper - the common case (one `import "x.h";`).
     bool CompileCHeader(const std::string& headerPath, const std::vector<std::string>& extraDefines = {},
@@ -7259,6 +7287,7 @@ public:
         bool hasTrivialDefaultCtor = false;
         bool hasTrivialCopyCtor = false;
         bool hasTrivialDtor = true;
+        bool paramDestroyedInCallee = false;   // MS ABI: the callee destroys a by-value param
         bool hasDeletedDefaultCtor = false;
         bool hasDeletedCopyCtor = false;
         bool hasDefaultCtor = false;
@@ -7453,12 +7482,11 @@ public:
     /*
      * The C++ GLOBAL allocation functions, declared on demand. A foreign nontrivial object on the
      * heap must be paired with the C++ allocator, never with CFlat's - the two runtimes are free
-     * to use different heaps. Names are the Itanium C++ ABI spellings (the only C++ ABI this
-     * milestone targets); an MSVC host needs its own spellings before this path is enabled there.
-     *   operator new(size_t)                          _Znwm
-     *   operator new(size_t, align_val_t)             _ZnwmSt11align_val_t
-     *   operator delete(void*, size_t)                _ZdlPvm
-     *   operator delete(void*, size_t, align_val_t)   _ZdlPvmSt11align_val_t
+     * to use different heaps. Itanium spellings, with the MS ABI ones on a Windows target:
+     *   operator new(size_t)                          _Znwm                   ??2@YAPEAX_K@Z
+     *   operator new(size_t, align_val_t)             _ZnwmSt11align_val_t    ??2@YAPEAX_KW4align_val_t@std@@@Z
+     *   operator delete(void*, size_t)                _ZdlPvm                 ??3@YAXPEAX_K@Z
+     *   operator delete(void*, size_t, align_val_t)   _ZdlPvmSt11align_val_t  ??3@YAXPEAX_KW4align_val_t@std@@@Z
      */
     llvm::Function* GetCxxOperatorNew(bool overAligned);
     llvm::Function* GetCxxOperatorDelete(bool overAligned);
@@ -7476,6 +7504,12 @@ public:
     {
         const CxxClassInfo* info = GetCxxClassInfo(typeName);
         return info != nullptr && info->hasTrivialDtor;
+    }
+    // The copy handed to a by-value parameter of this class is destroyed by the callee (MS ABI).
+    bool IsCxxParamDestroyedInCallee(const std::string& typeName) const
+    {
+        const CxxClassInfo* info = GetCxxClassInfo(typeName);
+        return info != nullptr && info->paramDestroyedInCallee;
     }
     bool HasBindableCxxDestructor(const std::string& typeName) const
     {
@@ -7545,6 +7579,11 @@ public:
 
     // Number of LLVM params a param slot lowers to (CoercePair -> 2, everything else -> 1).
     static unsigned SlotLLVMParamCount(const AbiSlot& s);
+    // LLVM argument index of the hidden sret slot (0, or 1 when it follows `this`).
+    static unsigned SRetArgIndex(const AbiRecipe& recipe)
+    {
+        return recipe.retSlot.kind == AbiSlot::SRetReturn && recipe.retSlot.sretAfterThis ? 1 : 0;
+    }
 
     // linkageName: optional override of the emitted LLVM symbol for externs. A namespaced
     // extern (namespace os.windows { extern ... Sleep(...); }) registers in the function
@@ -8558,6 +8597,8 @@ public:
                                     llvm::Value* calleeOverride = nullptr);
     // A pointer to a C++ class binds to a parameter/slot of a PUBLIC base of that class, with the
     // base subobject offset added. Non-public bases are refused at the conversion site.
+    // A C++ class VALUE slices to a by-value/by-reference parameter of a PUBLIC base of it.
+    bool IsCxxDerivedToBaseValue(const TypeAndValue& from, const TypeAndValue& to) const;
     bool IsCxxDerivedToBasePointer(const TypeAndValue& from, const TypeAndValue& to) const
     {
         if (!from.Pointer || !to.Pointer) return false;
@@ -8571,7 +8612,7 @@ public:
     // reinterpreting the underlying bytes (used to read SysV eightbytes out of a struct).
     // Scratch slot for an ABI coercion, sized/aligned for whichever of record and coerce type
     // is larger - clang may coerce a record to a WIDER type than the record itself.
-    llvm::AllocaInst* AllocaForCoerce(llvm::StructType* structTy, llvm::Type* coerceTy,
+    llvm::AllocaInst* AllocaForCoerce(llvm::Type* structTy, llvm::Type* coerceTy,
                                       uint64_t align, const char* name);
 
     llvm::Value* LoadCoerceAt(llvm::Value* structSlot, llvm::Type* coerceTy, uint64_t byteOff);

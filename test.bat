@@ -17,16 +17,17 @@ if "%~1"=="--worker-c" (
     if not defined CFLAT_OUT set CFLAT_OUT=out
     set OUT=%CFLAT_OUT%
     if not defined CFLAT_PLATFORM_FLAG set CFLAT_PLATFORM_FLAG=
+    set DONEFILE=!OUT!\results\done\!NAME!.done
     set T0=!TIME!
     !COMPILER! !SRC!\!NAME!.c -o !OUT!\!NAME!.exe --nologo --out-lli !OUT!\!NAME!.ll --locale-dir "!CFLAT_LOCALE_DIR!" !CFLAT_PLATFORM_FLAG! !CFLAT_EXTRA! > "!OUT!\results\!NAME!.log" 2>&1
     if !ERRORLEVEL! neq 0 (
         echo FAILED: !NAME! - compiler error>"!OUT!\results\!NAME!.result"
-        exit /b
+        goto :WorkerDone
     )
     !OUT!\!NAME!.exe >> "!OUT!\results\!NAME!.log" 2>&1
     if !ERRORLEVEL! neq 0 (
         echo FAILED: !NAME! - run error>"!OUT!\results\!NAME!.result"
-        exit /b
+        goto :WorkerDone
     )
     set T1=!TIME!
     for /f "tokens=1-4 delims=:." %%a in ("!T0: =0!") do set /a CS0=1%%a*360000+1%%b*6000+1%%c*100+1%%d-36610100
@@ -37,7 +38,7 @@ if "%~1"=="--worker-c" (
     set /a EF=ECS-ES*100
     if !EF! lss 10 set EF=0!EF!
     echo PASS !ES!.!EF!s>"!OUT!\results\!NAME!.result"
-    exit /b
+    goto :WorkerDone
 )
 
 REM ===========================================================================
@@ -51,6 +52,7 @@ if "%~1"=="--worker-cb" (
     if not defined CFLAT_OUT set CFLAT_OUT=out
     set OUT=%CFLAT_OUT%
     if not defined CFLAT_PLATFORM_FLAG set CFLAT_PLATFORM_FLAG=
+    set DONEFILE=!OUT!\results\done\!NAME!.done
     REM Per-test compiler flags: a test whose FIRST line is `// cflat-args: <flags>` is
     REM compiled with those flags appended (test.sh has the same convention).
     set CB_ARGS=
@@ -61,12 +63,12 @@ if "%~1"=="--worker-cb" (
     !COMPILER! !SRC!\!NAME!.cb -i !LIB! --locale-dir "!CFLAT_LOCALE_DIR!" -o !OUT!\!NAME!.exe --nologo --out-lli !OUT!\!NAME!.ll !CFLAT_PLATFORM_FLAG! !CB_ARGS! !CFLAT_EXTRA! > "!OUT!\results\!NAME!.log" 2>&1
     if !ERRORLEVEL! neq 0 (
         echo FAILED: !NAME! - compiler error>"!OUT!\results\!NAME!.result"
-        exit /b
+        goto :WorkerDone
     )
     !OUT!\!NAME!.exe >> "!OUT!\results\!NAME!.log" 2>&1
     if !ERRORLEVEL! neq 0 (
         echo FAILED: !NAME! - run error>"!OUT!\results\!NAME!.result"
-        exit /b
+        goto :WorkerDone
     )
     set T1=!TIME!
     for /f "tokens=1-4 delims=:." %%a in ("!T0: =0!") do set /a CS0=1%%a*360000+1%%b*6000+1%%c*100+1%%d-36610100
@@ -77,7 +79,7 @@ if "%~1"=="--worker-cb" (
     set /a EF=ECS-ES*100
     if !EF! lss 10 set EF=0!EF!
     echo PASS !ES!.!EF!s>"!OUT!\results\!NAME!.result"
-    exit /b
+    goto :WorkerDone
 )
 
 REM ===========================================================================
@@ -87,6 +89,7 @@ if "%~1"=="--worker-err" (
     set GRP=%~2
     if not defined CFLAT_OUT set CFLAT_OUT=out
     set OUT=%CFLAT_OUT%
+    set DONEFILE=!OUT!\results\done\test_err_!GRP!.done
     set T0=!TIME!
     call "%~dp0test_err.bat" --group !GRP! > "!OUT!\results\test_err_!GRP!.log" 2>&1
     set ERR_GROUP_RC=!ERRORLEVEL!
@@ -97,7 +100,7 @@ if "%~1"=="--worker-err" (
     )
     if !ERR_GROUP_RC! neq 0 if !ERR_POLICY_ONLY! equ 0 (
         echo FAILED: test_err_!GRP!>"!OUT!\results\test_err_!GRP!.result"
-        exit /b
+        goto :WorkerDone
     )
     set T1=!TIME!
     for /f "tokens=1-4 delims=:." %%a in ("!T0: =0!") do set /a CS0=1%%a*360000+1%%b*6000+1%%c*100+1%%d-36610100
@@ -108,7 +111,7 @@ if "%~1"=="--worker-err" (
     set /a EF=ECS-ES*100
     if !EF! lss 10 set EF=0!EF!
     echo PASS !ES!.!EF!s>"!OUT!\results\test_err_!GRP!.result"
-    exit /b
+    goto :WorkerDone
 )
 
 REM ===========================================================================
@@ -117,11 +120,12 @@ REM ===========================================================================
 if "%~1"=="--worker-hpc" (
     if not defined CFLAT_OUT set CFLAT_OUT=out
     set OUT=%CFLAT_OUT%
+    set DONEFILE=!OUT!\results\done\hpc_o2_checks.done
     set T0=!TIME!
     call "%~dp0test_hpc.bat" %CFLAT_CONFIG% > "!OUT!\results\hpc_o2_checks.log" 2>&1
     if !ERRORLEVEL! neq 0 (
         echo FAILED: hpc_o2_checks>"!OUT!\results\hpc_o2_checks.result"
-        exit /b
+        goto :WorkerDone
     )
     set T1=!TIME!
     for /f "tokens=1-4 delims=:." %%a in ("!T0: =0!") do set /a CS0=1%%a*360000+1%%b*6000+1%%c*100+1%%d-36610100
@@ -132,7 +136,7 @@ if "%~1"=="--worker-hpc" (
     set /a EF=ECS-ES*100
     if !EF! lss 10 set EF=0!EF!
     echo PASS !ES!.!EF!s>"!OUT!\results\hpc_o2_checks.result"
-    exit /b
+    goto :WorkerDone
 )
 
 REM ===========================================================================
@@ -161,8 +165,10 @@ set START_TIME=%TIME%
 
 if not exist "%OUT%" mkdir "%OUT%"
 if not exist "%OUT%\results" mkdir "%OUT%\results"
+if not exist "%OUT%\results\done" mkdir "%OUT%\results\done"
 del /q "%OUT%\results\*.result" 2>nul
 del /q "%OUT%\results\*.log" 2>nul
+del /q "%OUT%\results\done\*.done" 2>nul
 
 REM Warm the compiler cache (linker paths + core-library bitcode) once up front so the
 REM parallel worker compiles load bitcode instead of re-parsing the stdlib closure each time.
@@ -233,14 +239,17 @@ for %%F in (%SRC%\test_*.cb) do (
     )
 )
 
-REM Wait for all workers to finish (up to 120 seconds)
+REM Wait for all workers to finish, up to TIMEOUT_SECS.
+REM Count the per-worker sentinels in results\done, NOT the .result files: one error-group
+REM worker writes a .result per policy test, so counting results overshoots LAUNCHED and the
+REM loop falls through while slow workers are still compiling - a false green.
 set /a WAITED=0
 :WaitLoop
 set /a DONE=0
-for %%R in (%OUT%\results\*.result) do set /a DONE+=1
+for %%R in (%OUT%\results\done\*.done) do set /a DONE+=1
 if !DONE! lss !LAUNCHED! (
     if !WAITED! geq !TIMEOUT_SECS! (
-        echo TIMEOUT: only !DONE! of !LAUNCHED! tests completed after !TIMEOUT_SECS!s
+        echo TIMEOUT: only !DONE! of !LAUNCHED! workers completed after !TIMEOUT_SECS!s
         taskkill /f /im cflat.exe >nul 2>&1
         for %%F in (%OUT%\test_*.exe) do taskkill /f /im "%%~nxF" >nul 2>&1
         goto :Collect
@@ -458,6 +467,12 @@ if !SECS! lss 0 set /a SECS+=86400
 echo Elapsed: !SECS!s
 endlocal
 exit /b 0
+
+REM Every worker mode ends here. The sentinel is what the wait loop counts, so it must be
+REM written on every path out of a worker, pass or fail.
+:WorkerDone
+if defined DONEFILE echo done>"!DONEFILE!"
+exit /b
 
 :IsExcluded
 for %%E in (%EXCLUDE%) do (

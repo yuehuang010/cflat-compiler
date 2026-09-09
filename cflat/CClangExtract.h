@@ -38,6 +38,7 @@ namespace cflat_cinterop
         bool canBeFlattened = false;   // Direct + struct coerce type -> one LLVM arg per element
         bool indirectByVal = false;
         bool indirectRealign = false;
+        bool sretAfterThis = false;    // MS ABI: an instance method's sret slot follows `this`
         uint64_t indirectAlign = 0;
         uint64_t directOffset = 0;
         unsigned llvmArgIndex = 0;     // first LLVM argument index this slot occupies
@@ -174,6 +175,7 @@ namespace cflat_cinterop
         bool isDeleted = false;
         bool isDefaulted = false;
         bool isImplicit = false;
+        bool isTemplateSpecialization = false;
         // No CALLABLE definition is available: the member is implicit, defaulted, or inline, and
         // Clang did not emit a body for it into the companion module. When definition emission
         // (ExtractRequest::emitDefinitions) does produce the body, this is cleared - the symbol
@@ -274,6 +276,9 @@ namespace cflat_cinterop
         bool hasTrivialDefaultCtor = false;
         bool hasTrivialCopyCtor = false;
         bool hasTrivialDtor = true;
+        // MS ABI: a by-value parameter of this class is destroyed by the CALLEE, so the caller
+        // must not destroy the copy it passed (Itanium: caller-destroyed).
+        bool paramDestroyedInCallee = false;
         bool hasDeletedDefaultCtor = false;
         bool hasDeletedCopyCtor = false;
         bool hasDefaultCtor = false;
@@ -423,6 +428,15 @@ namespace cflat_cinterop
         std::vector<std::string> cxxFunctionWrapperNames;
         // Header extraction may need one retry after forcing a named specialization complete.
         bool autoInstantiateCxxTypes = true;
+        /*
+         * Destination for a PCH built from `source` (an include-only prologue) instead of an
+         * extraction. The caller supplies driver args selecting `-x c++-header`; the output path
+         * and the precompile action are set on the invocation directly, because createInvocation
+         * reduces the driver job to a parse and keeps neither. Every later request TU for the
+         * same group passes `-include-pch <path>` and drops the includes from its own source, so
+         * the group's headers are parsed once rather than once per request.
+         */
+        std::string pchOutputPath;
     };
 
     struct ExtractResult
@@ -464,6 +478,15 @@ namespace cflat_cinterop
         unsigned prereqErrors = 0;
         std::string firstPrereqError;            // formatted text of the first such error
         std::string firstError;                  // first clang error, including wrapper requests
+
+        // Errors clang raised INSIDE one of the headers the caller asked to bind (in-scope
+        // dirs only, so neither the in-memory stub's intentional macro-probe/wrapper errors nor
+        // a collateral system-header instantiation failure counts). Such an error poisons the
+        // whole bind: Sema marks the declarations invalid and companion CodeGen would then walk
+        // an AST clang's own driver would never have handed it. The header-bind path reports the
+        // diagnostic and refuses. Counted from a capped error list, so this is a lower bound.
+        unsigned headerErrors = 0;
+        std::string firstHeaderError;            // "message at file:line" for the first such error
     };
 
     // Parse the TU once and fill `out`. Returns false only on a hard failure to build a TU;

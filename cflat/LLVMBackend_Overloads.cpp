@@ -2168,10 +2168,12 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
          * M4b - foreign nontrivial C++ values crossing this call by value.
          *
          * Argument: clang arranges it Indirect-WITHOUT-byval, i.e. a bare pointer to storage the
-         * CALLER owns and destroys after the call. So copy-construct (or move-construct for
-         * `move x`) a temp here and hand over its address; the byte copy the generic ByVal path
-         * would do is illegal for such a type. The temp joins the ordinary end-of-statement
-         * owned-temp list, whose destructor for this class IS the C++ complete-object destructor.
+         * CALLER owns. So copy-construct (or move-construct for `move x`) a temp here and hand
+         * over its address; the byte copy the generic ByVal path would do is illegal for such a
+         * type. Under Itanium the caller destroys that temp after the call, so it joins the
+         * ordinary end-of-statement owned-temp list (whose destructor for this class IS the C++
+         * complete-object destructor); under the MS ABI the CALLEE destroys its by-value
+         * parameter, so the temp is handed over and never destroyed here.
          *
          * Result: an armed declaration slot (pendingCxxSretDest_) becomes the sret pointer, so
          * the callee constructs directly into the local and nothing is copied back out.
@@ -2203,7 +2205,7 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                                                 matched[i].IsExplicitMove,
                                                 "into a by-value parameter"))
                     continue;
-                RegisterOwnedStructTemp(temp, pn);
+                if (!IsCxxParamDestroyedInCallee(pn)) RegisterOwnedStructTemp(temp, pn);
                 cxxIndirectArgAddrs.resize(candidate.Recipe.paramSlots.size(), nullptr);
                 cxxIndirectArgAddrs[i] = temp;
             }

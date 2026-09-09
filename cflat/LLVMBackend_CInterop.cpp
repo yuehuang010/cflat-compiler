@@ -38,6 +38,7 @@
 #include <optional>
 #include <algorithm>
 #include <cctype>
+#include <atomic>
 #include <chrono>
 #include <fstream>
 #include <map>
@@ -1639,12 +1640,7 @@ std::vector<std::string> LLVMBackend::BuildClangDriverArgs(const std::string& he
         {
             // Headers need a REAL SDK (the harvested ~/.cflat/macsdk carries link stubs only),
             // so isysroot points at $SDKROOT/xcrun.
-            std::string sdk;
-#if defined(__APPLE__)
-            sdk = MacSdkPathCached();
-#else
-            if (const char* env = std::getenv("SDKROOT")) if (env[0]) sdk = env;
-#endif
+            const std::string& sdk = MacSdkPathCached();
             if (!sdk.empty())
             {
                 args.push_back("-isysroot");
@@ -1683,6 +1679,9 @@ std::vector<std::string> LLVMBackend::BuildClangDriverArgs(const std::string& he
         // Header extraction must see the same language level the companion module and the
         // request TUs are compiled with (C++20 requires-clauses in libtorch).
         if (asCxx) args.push_back("-std=" + cppStandard_);
+        // The companion module must agree with the /MD objects CompileCFile builds from imported
+        // .cpp files: clang-cl's /MT default embeds a RuntimeLibrary FAILIFMISMATCH against them.
+        if (asCxx && targetWindows_) args.push_back("-fms-runtime-lib=dll");
         if (errorRecovery)
         {
             args.push_back("-ferror-limit=0");
@@ -2665,6 +2664,7 @@ void LLVMBackend::MapRawRecords(const cflat_cinterop::ExtractResult& raw, std::v
             rec.hasTrivialDefaultCtor = r.hasTrivialDefaultCtor;
             rec.hasTrivialCopyCtor = r.hasTrivialCopyCtor;
             rec.hasTrivialDtor = r.hasTrivialDtor;
+            rec.paramDestroyedInCallee = r.paramDestroyedInCallee;
             rec.hasDeletedDefaultCtor = r.hasDeletedDefaultCtor;
             rec.hasDeletedCopyCtor = r.hasDeletedCopyCtor;
             rec.hasDefaultCtor = r.hasDefaultCtor; rec.hasCopyCtor = r.hasCopyCtor;
@@ -2988,6 +2988,18 @@ bool LLVMBackend::ExtractCHeaderClang(const std::vector<std::string>& headerPath
             return false;
         }
 
+        // Any other error inside a bound header leaves invalid declarations behind, and in
+        // cxxMode no companion module at all (the harvest and CodeGen passes refuse to run over
+        // them). Report the clang diagnostic rather than binding the error-recovered remnants.
+        if (raw.headerErrors > 0)
+        {
+            if (verbose)
+                std::cout << std::format("[verbose]   header does not compile: {}\n",
+                                         raw.firstHeaderError);
+            ReportUncompilableHeader(headerPaths, raw.firstHeaderError, cxxMode);
+            return false;
+        }
+
         if (outIncludes) *outIncludes = std::move(raw.includedFiles);
         if (outFunctionPointerAbis) *outFunctionPointerAbis = raw.functionPointerAbis;
 
@@ -3232,14 +3244,11 @@ bool LLVMBackend::CxxSpellingForCflatType(const std::string& cflatType, std::str
     }
 
 /*
- * The stub's include prologue plus one marker typedef per requested spelling, shared by both
- * stages. The prologue includes ONE import group's headers, never every C++ header imported so
- * far: an import that comes earlier in the file must not change the translation unit a later
- * import's request is instantiated in.
+ * The stub's include prologue, shared by both stages and by the group's PCH. It includes ONE
+ * import group's headers, never every C++ header imported so far: an import that comes earlier
+ * in the file must not change the translation unit a later import's request is instantiated in.
  */
-std::string LLVMBackend::BuildCxxRequestPrologue(const CxxRequestGroup& group,
-                                                 const std::vector<CxxRequestItem>& items,
-                                                 bool instantiateAll) const
+std::string LLVMBackend::BuildCxxRequestIncludes(const CxxRequestGroup& group) const
 {
         std::string src = "#include <new>\n";
         for (const auto& h : group.headers)
@@ -3251,6 +3260,15 @@ std::string LLVMBackend::BuildCxxRequestPrologue(const CxxRequestGroup& group,
             else
                 src += "#include \"" + fwd + "\"\n";
         }
+        return src;
+    }
+
+// The marker typedefs and explicit instantiations alone - everything the include prologue does
+// not cover. This is the whole source of a request TU whose prologue rides in a PCH.
+std::string LLVMBackend::BuildCxxRequestMarkers(const std::vector<CxxRequestItem>& items,
+                                                bool instantiateAll) const
+{
+        std::string src;
         for (size_t i = 0; i < items.size(); ++i)
         {
             src += "typedef " + items[i].cxxSpelling + " __cflat_req_" + std::to_string(i) + ";\n";
@@ -3259,6 +3277,13 @@ std::string LLVMBackend::BuildCxxRequestPrologue(const CxxRequestGroup& group,
                 src += "template class " + items[i].cxxSpelling + ";\n";
         }
         return src;
+    }
+
+std::string LLVMBackend::BuildCxxRequestPrologue(const CxxRequestGroup& group,
+                                                 const std::vector<CxxRequestItem>& items,
+                                                 bool instantiateAll) const
+{
+        return BuildCxxRequestIncludes(group) + BuildCxxRequestMarkers(items, instantiateAll);
     }
 
 /*
@@ -3315,7 +3340,7 @@ std::string LLVMBackend::BuildCxxRequestOdrUses(const cflat_cinterop::RawRecord&
                 ? "(*)" : "(" + marker + "::*)";
             src += "static auto __cflat_use" + tag + " = static_cast<" + m.retType + " " + ptrTo
                  + "(" + params + ")" + (m.isConst ? " const" : "") + ">(&" + marker + "::"
-                 + m.name + ");\n";
+                 + m.name + (m.isTemplateSpecialization ? "<>" : "") + ");\n";
         }
         bool iteratorLike = false;
         for (const auto& m : rec.members)
@@ -3337,6 +3362,45 @@ std::string LLVMBackend::BuildCxxRequestOdrUses(const cflat_cinterop::RawRecord&
                "__cflat_use_value_members_impl(p, 0); }\n";
         src += "static void __cflat_use_inherited_members" + tagPrefix + "(" + marker + "* p) { "
                "__cflat_use_optional_members_impl(p, 0); }\n";
+        return src;
+}
+
+/*
+ * ODR-uses for the PUBLIC members a requested class INHERITS. A library may keep part of the
+ * member surface on a base template - the MSVC STL's std::function has its operator() on
+ * _Func_class - so the request's own record carries nothing to instantiate, and inherited-member
+ * registration then finds nothing bound on the base. Each base gets a marker typedef of its own,
+ * spelled from the canonical base type the stage-1 walk recorded.
+ */
+std::string LLVMBackend::BuildCxxRequestInheritedOdrUses(
+    const std::vector<cflat_cinterop::RawRecord>& records,
+    const cflat_cinterop::RawRecord& rec, const std::string& marker,
+    const std::string& tagPrefix) const
+{
+        std::string src;
+        std::set<std::string> visited{ rec.name };
+        std::vector<const cflat_cinterop::RawRecord*> work{ &rec };
+        unsigned n = 0;
+        while (!work.empty())
+        {
+            const cflat_cinterop::RawRecord* current = work.back();
+            work.pop_back();
+            for (const auto& b : current->bases)
+            {
+                if (b.access != cflat_cinterop::AccessPublic || b.isVirtual) continue;
+                if (b.canonicalType.empty() || !visited.insert(b.name).second) continue;
+                const cflat_cinterop::RawRecord* base = nullptr;
+                for (const auto& r : records)
+                    if (r.name == b.name) { base = &r; break; }
+                if (base == nullptr) continue;
+                const std::string baseMarker = marker + "_base" + std::to_string(n);
+                src += "typedef " + b.canonicalType + " " + baseMarker + ";\n";
+                src += BuildCxxRequestOdrUses(*base, baseMarker,
+                                              tagPrefix + "i" + std::to_string(n) + "_");
+                ++n;
+                work.push_back(base);
+            }
+        }
         return src;
 }
 
@@ -3374,6 +3438,140 @@ static std::string BuildStdFunctionCtorUse(const std::string& cxxSpelling,
              + " (*a1)(" + params + ")) { (void)::new (m) " + marker + "(a1); }\n";
 }
 
+/*
+ * Keep the PCH directory bounded. Each file is tens of MB and every cflat rebuild orphans the
+ * whole set, because the build stamp is part of the key - a day of compiler work would otherwise
+ * leave gigabytes behind. Pruning is by age, not count: every process stamps the files it uses,
+ * so anything untouched for an hour is genuinely unreferenced, while a project needing twenty
+ * live groups keeps all twenty instead of rebuilding them in a loop. The newest few always
+ * survive, so a first build on a slow day cannot delete what it just made. Deleting one still in
+ * use costs nothing but a reparse: the load fails and the caller falls back to the real includes.
+ */
+void LLVMBackend::PruneCxxRequestPchDir(const std::string& dir)
+{
+        constexpr size_t kAlwaysKeep = 8;
+        constexpr auto kMaxAge = std::chrono::hours(1);
+        std::error_code ec;
+        std::vector<std::pair<std::filesystem::file_time_type, std::filesystem::path>> files;
+        for (const auto& entry : std::filesystem::directory_iterator(dir, ec))
+        {
+            if (ec) return;
+            if (entry.path().extension() != ".pch") continue;
+            auto when = entry.last_write_time(ec);
+            if (!ec) files.emplace_back(when, entry.path());
+        }
+        if (files.size() <= kAlwaysKeep) return;
+        std::sort(files.begin(), files.end(),
+                  [](const auto& a, const auto& b) { return a.first > b.first; });
+        const auto cutoff = std::filesystem::file_time_type::clock::now() - kMaxAge;
+        for (size_t i = kAlwaysKeep; i < files.size(); ++i)
+            if (files[i].first < cutoff) std::filesystem::remove(files[i].second, ec);
+    }
+
+// Forget a PCH that failed to load and delete it, so the next request rebuilds it.
+void LLVMBackend::DropCxxRequestPch(const std::string& path)
+{
+        std::error_code ec;
+        std::filesystem::remove(path, ec);
+        std::lock_guard<std::mutex> lock(cxxRequestPchMutex_);
+        for (auto it = cxxRequestPchCache_.begin(); it != cxxRequestPchCache_.end(); )
+            it = it->second == path ? cxxRequestPchCache_.erase(it) : std::next(it);
+    }
+
+/*
+ * A precompiled header for one import group's include prologue, shared by every request TU that
+ * compiles against that group with the same driver args. Without it each of the dozens of type
+ * requests in a file re-parses <vector>/<string>/<map>, which is where the wall clock goes.
+ * The PCH lives in the compiler cache next to the C header cache, so it survives the process and
+ * the LSP pool's slots share one copy. Returns the PCH path, or empty when it cannot be built.
+ */
+std::string LLVMBackend::EnsureCxxRequestPch(const CxxRequestGroup& group,
+                                             const std::vector<std::string>& args)
+{
+        const std::string includes = BuildCxxRequestIncludes(group);
+        uint64_t h = 14695981039346656037ULL;
+        auto fold = [&h](const std::string& text) {
+            for (unsigned char c : text) { h ^= c; h *= 1099511628211ULL; }
+            h ^= '|'; h *= 1099511628211ULL;
+        };
+        fold(includes);
+        for (const auto& a : args) fold(a);
+        fold(CompilerBuildStamp());
+        // Header edits are not folded in: clang records each input file's size and mtime in the
+        // PCH and refuses to load a stale one, which the caller's fallback turns into a rebuild.
+        const std::string key = std::to_string(h);
+
+        {
+            std::lock_guard<std::mutex> lock(cxxRequestPchMutex_);
+            auto it = cxxRequestPchCache_.find(key);
+            if (it != cxxRequestPchCache_.end()) return it->second;
+        }
+
+        std::string resolved;
+        const std::string dir = GetCHeaderCacheDir();
+        if (!dir.empty())
+        {
+            const std::string pchDir = dir + "/pch";
+            const std::string path = pchDir + "/" + key + ".pch";
+            std::error_code ec;
+            std::filesystem::create_directories(pchDir, ec);
+            if (std::filesystem::exists(path, ec))
+            {
+                // Stamp the hit so the age-based prune reads it as live, not abandoned.
+                resolved = path;
+                std::filesystem::last_write_time(
+                    path, std::filesystem::file_time_type::clock::now(), ec);
+            }
+            else if (std::filesystem::is_directory(pchDir, ec))
+            {
+                // Build to a process-unique name and rename, so a concurrent compile never reads
+                // a half-written PCH (rename over an existing file is fine - same contents).
+                static std::atomic<unsigned> tempCounter{ 0 };
+                const std::string temp = path + "." + std::to_string(_getpid()) + "."
+                                       + std::to_string(tempCounter.fetch_add(1)) + ".tmp";
+                std::vector<std::string> pchArgs;
+                pchArgs.reserve(args.size() + 2);
+                for (size_t i = 0; i < args.size(); ++i)
+                {
+                    // -fsyntax-only would suppress the PCH; -x c++ is replaced by -x c++-header.
+                    if (args[i] == "-fsyntax-only") continue;
+                    if (args[i] == "-x" && i + 1 < args.size()) { ++i; continue; }
+                    pchArgs.push_back(args[i]);
+                }
+                pchArgs.push_back("-x");
+                pchArgs.push_back("c++-header");
+
+                cflat_cinterop::ExtractRequest req;
+                req.mainFileName = "cflat_cpp_prologue.h";
+                req.source = includes;
+                req.cxxMode = true;
+                req.pchOutputPath = temp;
+                req.verbose = verbose;
+                req.args = pchArgs;
+                cflat_cinterop::ExtractResult ignored;
+                std::string pchError;
+                const bool built = cflat_cinterop::ExtractCInterop(req, ignored, pchError);
+                if (verbose && (!built || !std::filesystem::exists(temp, ec)))
+                    std::cout << std::format("[verbose]   C++ prologue PCH not built: {} {}\n",
+                                             pchError, ignored.firstError);
+                if (built && std::filesystem::exists(temp, ec))
+                {
+                    std::filesystem::rename(temp, path, ec);
+                    if (ec) std::filesystem::remove(temp, ec);
+                    if (std::filesystem::exists(path, ec))
+                    {
+                        resolved = path;
+                        PruneCxxRequestPchDir(pchDir);
+                    }
+                }
+                else std::filesystem::remove(temp, ec);
+            }
+        }
+        std::lock_guard<std::mutex> lock(cxxRequestPchMutex_);
+        cxxRequestPchCache_[key] = resolved;
+        return resolved;
+    }
+
 bool LLVMBackend::RunCxxTypeRequests(const CxxRequestGroup& group,
                                      const std::vector<CxxRequestItem>& items,
                                      const std::string& extraSource, bool emitDefinitions,
@@ -3397,7 +3595,30 @@ bool LLVMBackend::RunCxxTypeRequests(const CxxRequestGroup& group,
             { primaryDir = std::filesystem::path(h).parent_path().string(); break; }
         req.args = BuildClangDriverArgs(primaryDir, group.defines, /*errorRecovery*/ true,
                                         /*asCxx*/ true);
-        return cflat_cinterop::ExtractCInterop(req, raw, error);
+        const std::string pch = EnsureCxxRequestPch(group, req.args);
+        if (!pch.empty())
+        {
+            req.source = BuildCxxRequestMarkers(items, /*instantiateAll*/ !emitDefinitions)
+                       + extraSource;
+            req.args.push_back("-include-pch");
+            req.args.push_back(pch);
+        }
+        bool ok = cflat_cinterop::ExtractCInterop(req, raw, error);
+        // The PCH must only ever change the speed, never the answer. A stale or truncated one can
+        // fail the frontend outright, but it can also be error-recovered into an AST where the
+        // requested spellings resolve to nothing - the extractor swallows diagnostics, so that
+        // reads as success. Treat an empty harvest the same as a hard failure and parse for real.
+        const bool emptyHarvest = ok && !items.empty() && raw.records.empty();
+        if ((!ok || emptyHarvest) && !pch.empty())
+        {
+            DropCxxRequestPch(pch);
+            req.source = BuildCxxRequestPrologue(group, items, /*instantiateAll*/ !emitDefinitions)
+                       + extraSource;
+            req.args.resize(req.args.size() - 2);
+            raw = cflat_cinterop::ExtractResult();
+            ok = cflat_cinterop::ExtractCInterop(req, raw, error);
+        }
+        return ok;
     }
 
 /*
@@ -3839,6 +4060,27 @@ bool LLVMBackend::RequestGeneratedCxxWrapper(const CxxRequestGroup& group,
                     if (!IsSystemCxxHeaderPath(h))
                     { primaryDir = std::filesystem::path(h).parent_path().string(); break; }
                 req.args = BuildClangDriverArgs(primaryDir, group.defines, true, true);
+                const std::string pch = EnsureCxxRequestPch(group, req.args);
+                if (!pch.empty())
+                {
+                    req.source = wrapperSource;
+                    req.args.push_back("-include-pch");
+                    req.args.push_back(pch);
+                }
+                auto wrapperFound = [&]() {
+                    for (const auto& sig : out.sigs)
+                        if (sig.name == wrapperName || sig.linkageName == wrapperName) return true;
+                    return false;
+                };
+                const bool ran = cflat_cinterop::ExtractCInterop(req, out, runError);
+                if (ran && (pch.empty() || wrapperFound())) return ran;
+                if (pch.empty()) return false;
+                // See RunCxxTypeRequests: a PCH may be recovered into an AST that harvests
+                // nothing, so a missing wrapper is retried against the real includes.
+                DropCxxRequestPch(pch);
+                req.source = BuildCxxRequestPrologue(group, {}, false) + wrapperSource;
+                req.args.resize(req.args.size() - 2);
+                out = cflat_cinterop::ExtractResult();
                 return cflat_cinterop::ExtractCInterop(req, out, runError);
             };
             cflat_cinterop::ExtractResult probe;
@@ -5118,6 +5360,8 @@ bool LLVMBackend::RequestCxxForeignType(const std::string& cflatName, const std:
                 const bool emittedOk = RunCxxTypeRequests(group, single,
                                       CxxRequestOdrUsePreamble()
                                       + BuildCxxRequestOdrUses(probeTarget, "__cflat_req_0", "")
+                                      + BuildCxxRequestInheritedOdrUses(probe.records, probeTarget,
+                                                                        "__cflat_req_0", "")
                                       + BuildStdFunctionCtorUse(cxxSpelling, "__cflat_req_0")
                                       + memberDefaultWrappers,
                                       /*emitDefinitions*/ true, emitted, err2);
@@ -5407,6 +5651,8 @@ void LLVMBackend::PrewarmCxxRequestBatch(std::vector<CxxRequestItem> items)
                     if (r.name == pending[i].cflatName) { target = &r; break; }
                 if (target == nullptr) continue;
                 extra += BuildCxxRequestOdrUses(*target, marker, "b" + std::to_string(i) + "_");
+                extra += BuildCxxRequestInheritedOdrUses(probe.records, *target, marker,
+                                                         "b" + std::to_string(i) + "_");
                 extra += BuildStdFunctionCtorUse(pending[i].cxxSpelling, marker);
             }
             llvm::TimeTraceScope stage2("CxxRequestStage2", group.label);
@@ -6501,10 +6747,18 @@ bool LLVMBackend::EmitCxxVirtualDelete(const std::string& typeName, llvm::Value*
                                                builder->getInt64(info->dtorDeletingVtableIndex),
                                                "vdel.slot");
         llvm::Value* fn = builder->CreateLoad(ptrTy, slot, "vdel");
-        // The deleting destructor has the same signature as the complete-object one; it destroys
-        // the object AND releases its storage through the C++ deallocator, so no separate
-        // destructor call and no operator delete may follow.
-        builder->CreateCall(proto->getFunctionType(), fn, { ptr });
+        // The deleting destructor destroys the object AND releases its storage through the C++
+        // deallocator, so no separate destructor call and no operator delete may follow. On
+        // Itanium it has the complete-object destructor's signature; the Microsoft scalar
+        // deleting destructor takes a flags word (bit 0 = release the storage) and returns this.
+        if (targetWindows_)
+        {
+            auto* deletingTy = llvm::FunctionType::get(
+                ptrTy, { ptrTy, builder->getInt32Ty() }, /*isVarArg*/ false);
+            builder->CreateCall(deletingTy, fn, { ptr, builder->getInt32(1) });
+        }
+        else
+            builder->CreateCall(proto->getFunctionType(), fn, { ptr });
         return true;
     }
 
@@ -6645,6 +6899,7 @@ void LLVMBackend::RegisterCxxClassMembers(const CRecordEntry& r, const std::stri
             info.hasTrivialDefaultCtor = r.hasTrivialDefaultCtor;
             info.hasTrivialCopyCtor    = r.hasTrivialCopyCtor;
             info.hasTrivialDtor        = r.hasTrivialDtor;
+            info.paramDestroyedInCallee = r.paramDestroyedInCallee;
             info.hasDeletedDefaultCtor = r.hasDeletedDefaultCtor;
             info.hasDeletedCopyCtor    = r.hasDeletedCopyCtor;
             info.hasDefaultCtor        = r.hasDefaultCtor;
@@ -6800,7 +7055,7 @@ void LLVMBackend::RegisterCxxClassMembers(const CRecordEntry& r, const std::stri
             // an implicit or defaulted special member Sema declined to define, or a template
             // member awaiting instantiation support.
             if (m.needsLocalDefinition)   { refuse("has no definition cflat can reach: clang emitted no body for it (an implicit, defaulted or template member)"); continue; }
-            if (!m.abi.valid)             { refuse("has a calling convention cflat cannot reproduce"); continue; }
+            if (!m.abi.valid)             { refuse("has a signature clang could not arrange for this target"); continue; }
             if (m.linkageName.empty())    { refuse("has no external linkage");            continue; }
             if (m.kind == Member::Instance && !m.isCopyAssign && !m.isMoveAssign)
             {
@@ -7907,26 +8162,53 @@ void LLVMBackend::RegisterCFunctionMacros(const std::vector<CFunctionMacroEntry>
             pendingMacroSources_.push_back({ fileForLsp + "@cmacros", std::move(generated) });
     }
 
-void LLVMBackend::ReportOrphanHeader(const std::vector<std::string>& headerPaths, const std::string& clangErr)
+/*
+ * Text quoted from the front end is prefixed with its source, so the clause reads as relayed
+ * from another compiler rather than as a cflat diagnostic. Deliberately NOT an executable name:
+ * a header bind drives clang's front end in-process (CompilerInstance::ExecuteAction), so no
+ * clang binary is spawned here - unlike the .c and link paths, which really do run clang-cl and
+ * lld-link and name those. Clang carries no message catalog (its diagnostics are English format
+ * strings baked into clang/include/clang/Basic/Diagnostic*Kinds.td), so this clause stays
+ * English in every locale - naming the source says why.
+ */
+static constexpr const char* kClangDiagPrefix = "clang";
+
+void LLVMBackend::ReportOrphanHeader(const std::vector<std::string>& headerPaths,
+                                     const std::string& clangErr, bool cxxMode)
 {
         std::string name = std::filesystem::path(headerPaths.front()).filename().string();
-        std::string detail = clangErr.empty() ? "a required type is undefined" : clangErr;
+        const char* lang = cxxMode ? "C++" : "C";
+        std::string detail = clangErr.empty()
+            ? std::string("a required type is undefined")
+            : std::format("{}: {}", kClangDiagPrefix, clangErr);
         if (headerPaths.size() > 1)
         {
             std::string grp;
             for (size_t i = 0; i < headerPaths.size(); ++i)
                 grp += (i ? ", \"" : "\"") + std::filesystem::path(headerPaths[i]).filename().string() + "\"";
             LogRawError(std::format(
-                "C header '{}' did not compile in this group ({}). Reorder the group so the "
+                "{} header '{}' did not compile in this group ({}). Reorder the group so the "
                 "prerequisite header comes first, or add the missing one: import {{ {} }};",
-                name, detail, grp));
+                lang, name, detail, grp));
             return;
         }
         LogRawError(std::format(
-            "C header '{}' does not compile on its own ({}). It likely needs a prerequisite "
+            "{} header '{}' does not compile on its own ({}). It likely needs a prerequisite "
             "header included first. Import them together as one group so they share a single "
             "translation unit, e.g. import {{ \"prerequisite.h\", \"{}\" }};",
-            name, detail, name));
+            lang, name, detail, name));
+    }
+
+void LLVMBackend::ReportUncompilableHeader(const std::vector<std::string>& headerPaths,
+                                           const std::string& clangErr, bool cxxMode)
+{
+        std::string name = std::filesystem::path(headerPaths.front()).filename().string();
+        std::string detail = clangErr.empty()
+            ? std::format("{} reported an error in it", kClangDiagPrefix)
+            : std::format("{}: {}", kClangDiagPrefix, clangErr);
+        LogRawError(std::format(
+            "{} header '{}' does not compile ({}). Nothing in it can be bound until that "
+            "error is fixed.", cxxMode ? "C++" : "C", name, detail));
     }
 
 bool LLVMBackend::CompileCHeader(const std::string& headerPath, const std::vector<std::string>& extraDefines,
@@ -8392,7 +8674,7 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
                                      &longDoubleIsIEEEDouble, &targetTriple, &functionTemplates))
             {
                 if (prereqFailure)
-                    ReportOrphanHeader(headerPaths, prereqMsg);
+                    ReportOrphanHeader(headerPaths, prereqMsg, cppMode);
                 return false;
             }
         }
@@ -8670,6 +8952,7 @@ const LLVMBackend::CxxClassInfo::Structor* LLVMBackend::SelectCxxConstructor(
 {
         const CxxClassInfo* info = GetCxxClassInfo(typeName);
         if (info == nullptr) { why = "has no imported constructors"; return nullptr; }
+        if (!info->layoutRefusal.empty()) { why = info->layoutRefusal; return nullptr; }
         auto scalarFamily = [](const TypeAndValue& tv) -> int {
             if (tv.Pointer) return 3;
             if (tv.TypeName == "float" || tv.TypeName == "double") return 2;
@@ -8726,6 +9009,8 @@ const LLVMBackend::CxxClassInfo::Structor* LLVMBackend::SelectCxxConstructor(
         };
         size_t foundOmitted = 0;
         size_t foundExact = 0;
+        // A tie is only final once every candidate has been seen: a later exact match wins.
+        bool ambiguous = false;
         for (const auto& c : info->constructors)
         {
             // Fewer arguments than parameters is fine when every omitted one has a constant
@@ -8776,19 +9061,27 @@ const LLVMBackend::CxxClassInfo::Structor* LLVMBackend::SelectCxxConstructor(
                 // more exactly-typed parameters beat same-family conversions (`format_int(42)`
                 // picks the int constructor over unsigned and long long).
                 if (omitted > foundOmitted) continue;
-                if (omitted < foundOmitted) { found = &c; foundOmitted = omitted; foundExact = exact; continue; }
+                if (omitted < foundOmitted)
+                {
+                    found = &c; foundOmitted = omitted; foundExact = exact; ambiguous = false;
+                    continue;
+                }
                 if (exact < foundExact) continue;
-                if (exact > foundExact) { found = &c; foundExact = exact; continue; }
+                if (exact > foundExact) { found = &c; foundExact = exact; ambiguous = false; continue; }
                 bool sameShape = c.params.size() == found->params.size();
                 for (size_t i = 0; sameShape && i < c.params.size(); ++i)
                     sameShape = sameBoundaryType(c.params[i], found->params[i]);
-                if (sameShape) continue;
-                why = "matches more than one constructor overload";
-                return nullptr;
+                if (!sameShape) ambiguous = true;
+                continue;
             }
             found = &c;
             foundOmitted = omitted;
             foundExact = exact;
+        }
+        if (ambiguous)
+        {
+            why = "matches more than one constructor overload";
+            return nullptr;
         }
         if (found != nullptr) return found;
         if (candidates == 0)
@@ -8861,15 +9154,31 @@ bool LLVMBackend::CanImplicitlyConstructCxxClass(const NamedVariable& arg,
 
         TypeAndValue argType = InferImplicitCxxArgumentType(arg, *this);
         if (argType.TypeName.empty()) return false;
+        // A derived-class value slices to a PUBLIC base parameter through the base's copy ctor.
+        if (IsCxxDerivedToBaseValue(argType, param)) argType.TypeName = param.TypeName;
         std::string why;
         return SelectCxxConstructor(param.TypeName, { argType }, why,
                                     /*allowNumericConversions*/ true) != nullptr;
+}
+
+bool LLVMBackend::IsCxxDerivedToBaseValue(const TypeAndValue& from, const TypeAndValue& to) const
+{
+        if (from.Pointer || from.TypeName.empty() || to.TypeName.empty()) return false;
+        if (from.TypeName == to.TypeName) return false;
+        if (!IsCxxRecord(from.TypeName) || !IsCxxRecord(to.TypeName)) return false;
+        return IsCxxBaseOf(to.TypeName, from.TypeName);
 }
 
 bool LLVMBackend::MaterializeImplicitCxxClassArgument(NamedVariable& arg,
                                                        const TypeAndValue& param)
 {
         TypeAndValue argType = InferImplicitCxxArgumentType(arg, *this);
+        uint64_t baseOffset = 0;
+        bool baseInaccessible = false;
+        const bool slicesToBase = IsCxxDerivedToBaseValue(argType, param)
+            && FindCxxBaseOffset(argType.TypeName, param.TypeName, baseOffset, baseInaccessible)
+            && !baseInaccessible;
+        if (slicesToBase) argType.TypeName = param.TypeName;
         std::string why;
         const auto* ctor = SelectCxxConstructor(param.TypeName, { argType }, why,
                                                 /*allowNumericConversions*/ true);
@@ -8884,7 +9193,20 @@ bool LLVMBackend::MaterializeImplicitCxxClassArgument(NamedVariable& arg,
 
         llvm::Type* constructorType = GetType(ctor->params[1]);
         if (constructorType == nullptr) return false;
-        if (value->getType() != constructorType)
+        if (slicesToBase)
+        {
+            // The base copy ctor takes a reference: point it at the base subobject of the
+            // derived value (stored to a temp when the value is not already addressable).
+            if (!constructorType->isPointerTy()) return false;
+            llvm::Value* address = arg.Storage;
+            if (address == nullptr)
+            {
+                address = AllocaAtEntry(value->getType(), nullptr, "cxx.slice.arg");
+                builder->CreateStore(value, address);
+            }
+            value = EmitCxxBaseAdjust(address, baseOffset);
+        }
+        else if (value->getType() != constructorType)
         {
             if (constructorType->isPointerTy() && !value->getType()->isPointerTy())
             {
@@ -8953,7 +9275,10 @@ bool LLVMBackend::CxxObjectSizeAndAlign(const std::string& typeName, uint64_t& s
 
 llvm::Function* LLVMBackend::GetCxxOperatorNew(bool overAligned)
 {
-        const char* name = overAligned ? "_ZnwmSt11align_val_t" : "_Znwm";
+        // Itanium `_Znwm` / MS `??2@YAPEAX_K@Z`: operator new(size_t[, std::align_val_t]).
+        const char* name = targetWindows_
+            ? (overAligned ? "??2@YAPEAX_KW4align_val_t@std@@@Z" : "??2@YAPEAX_K@Z")
+            : (overAligned ? "_ZnwmSt11align_val_t" : "_Znwm");
         if (llvm::Function* existing = module->getFunction(name)) return existing;
         auto* i64 = builder->getInt64Ty();
         auto* ptr = cflat_llvm::PointerTo(builder->getInt8Ty());
@@ -8965,7 +9290,10 @@ llvm::Function* LLVMBackend::GetCxxOperatorNew(bool overAligned)
 
 llvm::Function* LLVMBackend::GetCxxOperatorDelete(bool overAligned)
 {
-        const char* name = overAligned ? "_ZdlPvmSt11align_val_t" : "_ZdlPvm";
+        // Itanium `_ZdlPvm` / MS `??3@YAXPEAX_K@Z`: operator delete(void*, size_t[, align_val_t]).
+        const char* name = targetWindows_
+            ? (overAligned ? "??3@YAXPEAX_KW4align_val_t@std@@@Z" : "??3@YAXPEAX_K@Z")
+            : (overAligned ? "_ZdlPvmSt11align_val_t" : "_ZdlPvm");
         if (llvm::Function* existing = module->getFunction(name)) return existing;
         auto* i64 = builder->getInt64Ty();
         auto* ptr = cflat_llvm::PointerTo(builder->getInt8Ty());

@@ -10,6 +10,7 @@
 
 #include "cpp_interop_basic.h"
 #include <initializer_list>
+#include <string>
 #include <vector>
 
 // This dependent callback alias is intentionally never instantiated. Its canonical function

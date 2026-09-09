@@ -98,11 +98,14 @@ void LLVMBackend::createFunctionBlock(llvm::Function* fn, const std::string& fri
         auto itr_nameArg = arguments.begin();
         auto llvmArgIt = fn->arg_begin();
         if (abiRecipe != nullptr && abiRecipe->retSlot.kind == AbiSlot::SRetReturn
-            && llvmArgIt != fn->arg_end())
+            && SRetArgIndex(*abiRecipe) == 0 && llvmArgIt != fn->arg_end())
             ++llvmArgIt;
         size_t abiParamIndex = 0;
         for (; itr_nameArg != arguments.end() && llvmArgIt != fn->arg_end(); ++itr_nameArg)
         {
+            if (abiRecipe != nullptr && abiParamIndex == 1 && SRetArgIndex(*abiRecipe) == 1)
+                ++llvmArgIt;   // the hidden sret slot sits behind `this`
+            if (llvmArgIt == fn->arg_end()) break;
             auto* incomingArg = &*llvmArgIt++;
             incomingArg->setName(itr_nameArg->VariableName);
 

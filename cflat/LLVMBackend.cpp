@@ -2863,6 +2863,15 @@ std::shared_ptr<LLVMBackend::CachedParseTree> LLVMBackend::ParseFileForCache(con
 // bare `import "windows.h"` (and other system headers) resolves without the user passing
 // --c-include. Used only as a last-resort resolution fallback in CompileImportedFile; the parse
 // itself relies on clang's in-process MSVC toolchain auto-detection. Scanned once and cached.
+// Located Visual Studio install (see VsInstallCached below, defined next to the registry
+// fallback it uses). Both fields are empty when no install was found.
+struct VsInstall
+{
+    std::string path;
+    const char* source = "";
+};
+const VsInstall& VsInstallCached();
+
 static const std::vector<std::string>& WindowsSdkIncludeDirs()
 {
     static const std::vector<std::string> dirs = [] {
@@ -2887,6 +2896,51 @@ static const std::vector<std::string>& WindowsSdkIncludeDirs()
                 if (std::filesystem::exists(p, ec)) out.push_back(p.string());
             }
         }
+        return out;
+    }();
+    return dirs;
+}
+
+// The MSVC toolset's own include dir - where the C++ standard library headers live. The
+// Windows SDK scan above does not cover them, so without this a bare `import cpp "vector";`
+// cannot resolve on Windows the way it resolves against libc++ on macOS. Prefers
+// %VCToolsInstallDir% (set by vcvars64); otherwise takes the highest-versioned toolset under
+// the install VsInstallCached() reports. Scanned once and cached.
+static const std::vector<std::string>& MsvcToolsetIncludeDirs()
+{
+    static const std::vector<std::string> dirs = [] {
+        std::vector<std::string> out;
+        std::error_code ec;
+
+        auto add = [&](const std::filesystem::path& p) {
+            if (std::filesystem::exists(p, ec)) out.push_back(p.lexically_normal().string());
+        };
+
+        char buf[512] = {};
+        size_t len = 0;
+        if (getenv_s(&len, buf, sizeof(buf), "VCToolsInstallDir") == 0 && len > 1)
+        {
+            add(std::filesystem::path(buf) / "include");
+            if (!out.empty()) return out;
+        }
+
+        const std::string& vsPath = VsInstallCached().path;
+        if (vsPath.empty()) return out;
+
+        // <VS install>/VC/Tools/MSVC/<toolset>/include - keep the highest toolset present,
+        // which is the one a freshly-initialized cl.exe would use.
+        std::filesystem::path msvcRoot = std::filesystem::path(vsPath) / "VC" / "Tools" / "MSVC";
+        std::string bestToolset;
+        std::filesystem::path bestInclude;
+        for (auto it = std::filesystem::directory_iterator(msvcRoot, ec);
+             !ec && it != std::filesystem::directory_iterator(); it.increment(ec))
+        {
+            auto name = it->path().filename().string();
+            auto inc = it->path() / "include";
+            if (name > bestToolset && std::filesystem::exists(inc, ec))
+                bestToolset = name, bestInclude = inc;
+        }
+        if (!bestInclude.empty()) add(bestInclude);
         return out;
     }();
     return dirs;
@@ -2992,6 +3046,9 @@ bool LLVMBackend::ResolveImportPath(const std::string& importingFilePath, const 
         // detected SDK include dirs so `import "windows.h"` resolves with no --c-include flag; the
         // header's own dir then becomes an in-scope root automatically (see ExtractCHeaderClang).
         for (const auto& inc : WindowsSdkIncludeDirs()) tryDir(inc);
+        // C++ standard library headers (e.g. `import cpp "vector";`) live in the MSVC toolset
+        // include dir, which the SDK dirs above do not cover.
+        for (const auto& inc : MsvcToolsetIncludeDirs()) tryDir(inc);
         // POSIX system headers (e.g. math.h) live under /usr/include et al. Fall back to them
         // so `import "math.h";` resolves with no --c-include flag on Linux/macOS.
         for (const auto& inc : PosixSystemIncludeDirs()) tryDir(inc);
@@ -5364,6 +5421,41 @@ static std::string ReadVsInstallPathFromRegistry()
 }
 #endif // _WIN32
 
+// Visual Studio install root, located once per process. vswhere is authoritative; the legacy
+// SxS\VS7 registry key only covers a missing or silent vswhere. `source` names whichever
+// answered, for -v. Both fields are empty when no install was found.
+const VsInstall& VsInstallCached()
+{
+    static const VsInstall info = [] {
+        VsInstall found;
+        const char* vswhere = "C:\\Program Files (x86)\\Microsoft Visual Studio\\Installer\\vswhere.exe";
+        if (llvm::sys::fs::exists(vswhere))
+        {
+            llvm::SmallString<256> outFile;
+            llvm::sys::path::system_temp_directory(true, outFile);
+            int outFD;
+            if (!llvm::sys::fs::createTemporaryFile("cflat_vswhere", "txt", outFD, outFile))
+            {
+                _close(outFD);
+                std::string outFileStr = outFile.str().str();
+                std::vector<llvm::StringRef> args = { vswhere, "-latest", "-property", "installationPath" };
+                std::optional<llvm::StringRef> redirects[3] = { std::nullopt, llvm::StringRef(outFileStr), std::nullopt };
+                llvm::sys::ExecuteAndWait(vswhere, args, std::nullopt, redirects);
+                if (auto buf = llvm::MemoryBuffer::getFile(outFileStr))
+                    found.path = buf.get()->getBuffer().trim().str();
+                llvm::sys::fs::remove(outFile);
+            }
+        }
+        if (!found.path.empty()) { found.source = "vswhere"; return found; }
+#if defined(_WIN32)
+        found.path = ReadVsInstallPathFromRegistry();
+        if (!found.path.empty()) found.source = "SxS\\VS7 registry";
+#endif
+        return found;
+    }();
+    return info;
+}
+
 LinkerPaths LLVMBackend::DiscoverLinkerPaths(const std::string& arch, const std::string& runtimeDir, bool verbose)
 {
     LinkerPaths result;
@@ -5397,45 +5489,14 @@ LinkerPaths LLVMBackend::DiscoverLinkerPaths(const std::string& arch, const std:
         }
     }
 
-    // Find VS install path via vswhere.
-    std::string vsPath;
-    {
-        const char* vswhereFixed = "C:\\Program Files (x86)\\Microsoft Visual Studio\\Installer\\vswhere.exe";
-        if (llvm::sys::fs::exists(vswhereFixed))
-        {
-            llvm::SmallString<256> outFile;
-            llvm::sys::path::system_temp_directory(true, outFile);
-            int outFD;
-            if (!llvm::sys::fs::createTemporaryFile("cflat_vswhere", "txt", outFD, outFile))
-            {
-                _close(outFD);
-                std::string outFileStr = outFile.str().str();
-                std::vector<llvm::StringRef> vsArgs = { vswhereFixed, "-latest", "-property", "installationPath" };
-                std::optional<llvm::StringRef> vsRedirects[3] = { std::nullopt, llvm::StringRef(outFileStr), std::nullopt };
-                llvm::sys::ExecuteAndWait(vswhereFixed, vsArgs, std::nullopt, vsRedirects);
-                if (auto buf = llvm::MemoryBuffer::getFile(outFileStr))
-                    vsPath = buf.get()->getBuffer().trim().str();
-                llvm::sys::fs::remove(outFile);
-            }
-        }
-    }
-
-    // Fallback when vswhere is absent or returned nothing: the legacy SxS\VS7 registry key.
-    bool vsFromRegistry = false;
-#if defined(_WIN32)
-    if (vsPath.empty())
-    {
-        vsPath = ReadVsInstallPathFromRegistry();
-        vsFromRegistry = !vsPath.empty();
-    }
-#endif
+    const std::string& vsPath = VsInstallCached().path;
     if (verbose)
     {
         if (vsPath.empty())
             std::cout << "[verbose] linker paths: Visual Studio install not found (vswhere + SxS\\VS7 registry)\n";
         else
             std::cout << std::format("[verbose] linker paths: Visual Studio via {} -> {}\n",
-                                     vsFromRegistry ? "SxS\\VS7 registry" : "vswhere", vsPath);
+                                     VsInstallCached().source, vsPath);
     }
 
     // Find the latest MSVC lib directory.
@@ -6743,6 +6804,7 @@ static llvm::json::Object SerializeCxxAbiSlot(const cflat_cinterop::RawAbiSlot& 
     if (sl.canBeFlattened)  o["fl"] = true;
     if (sl.indirectByVal)   o["bv"] = true;
     if (sl.indirectRealign) o["rl"] = true;
+    if (sl.sretAfterThis)   o["sa"] = true;
     if (sl.indirectAlign)   o["ia"] = (int64_t)sl.indirectAlign;
     if (sl.directOffset)    o["do"] = (int64_t)sl.directOffset;
     if (sl.llvmArgIndex)    o["ai"] = (int64_t)sl.llvmArgIndex;
@@ -6762,6 +6824,7 @@ static cflat_cinterop::RawAbiSlot DeserializeCxxAbiSlot(const llvm::json::Object
     if (auto v = o.getBoolean("fl")) sl.canBeFlattened = *v;
     if (auto v = o.getBoolean("bv")) sl.indirectByVal = *v;
     if (auto v = o.getBoolean("rl")) sl.indirectRealign = *v;
+    if (auto v = o.getBoolean("sa")) sl.sretAfterThis = *v;
     if (auto v = o.getInteger("ia")) sl.indirectAlign = (uint64_t)*v;
     if (auto v = o.getInteger("do")) sl.directOffset = (uint64_t)*v;
     if (auto v = o.getInteger("ai")) sl.llvmArgIndex = (unsigned)*v;

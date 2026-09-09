@@ -382,9 +382,11 @@ llvm::Value* LLVMBackend::CreateLocalVariable(const TypeAndValue& typeValue, llv
         // error, so this site must describe the mechanism rather than guess at its provenance.
         if (!typeValue.Pointer && type != nullptr && type->isStructTy() && !type->isSized())
         {
-            LogError(std::format(
-                "type '{}' is incomplete here (its layout is not available at this point); "
-                "it can only be used through a pointer", SpellType(*this, typeValue)));
+            // A C++ class left as a shell on purpose names its own reason first.
+            if (!RejectUnsupportedCxxLayout(typeValue.TypeName))
+                LogError(std::format(
+                    "type '{}' is incomplete here (its layout is not available at this point); "
+                    "it can only be used through a pointer", SpellType(*this, typeValue)));
             type = builder->getInt8Ty();  // sized placeholder; the error already aborts the compile
         }
         // GetType returns [N x T] for fixed-size arrays; passing N again as element-count

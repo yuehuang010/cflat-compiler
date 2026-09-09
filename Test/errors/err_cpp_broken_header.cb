@@ -1,0 +1,10 @@
+// A bound C++ header that clang itself rejects must report the clang diagnostic and refuse the
+// bind, not press on into the harvest and companion CodeGen. The fixture includes <vector> and
+// declares a class with a std::string field without including <string>: the invalid record
+// cascades into every STL template that touches it, and walking that wreckage used to end in an
+// access violation instead of an error message.
+//
+// Import-time diagnostic (raised during ProcessImports, before the listener walk), so the bare
+// semicolon form at file scope arms the expectation before imports run.
+expect_error("Nothing in it can be bound until that error is fixed");
+import cpp "cpp_interop_broken.h";

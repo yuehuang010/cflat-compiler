@@ -36,11 +36,13 @@
 #include "clang/Basic/SourceManager.h"
 #include "clang/Frontend/CompilerInstance.h"
 #include "clang/Sema/Sema.h"
+#include "clang/Sema/TemplateDeduction.h"
 #include "clang/Sema/Scope.h"
 #include "clang/Frontend/CompilerInvocation.h"
 #include "clang/Driver/CreateInvocationFromArgs.h"
 #include "clang/Frontend/FrontendAction.h"
 #include "clang/Frontend/FrontendActions.h"
+#include "clang/Frontend/FrontendOptions.h"
 #include "clang/Frontend/Utils.h"
 #include "clang/Lex/MacroInfo.h"
 #include "clang/Lex/PPCallbacks.h"
@@ -340,14 +342,24 @@ namespace cflat_cinterop
             return est == EST_BasicNoexcept || est == EST_NoexceptTrue || est == EST_NoThrow;
         }
 
-        // The complete-object GlobalDecl for a member: structors need their variant, everything
-        // else is the plain decl.
+        /*
+         * The complete-object GlobalDecl for a member: structors need their variant, everything
+         * else is the plain decl. Under the Microsoft ABI Dtor_Complete mangles to the "vbase
+         * destructor" (`??_D`), which clang emits ONLY for a class with virtual bases; every
+         * other class has just the base destructor (`??1`), and that is the symbol a complete
+         * destruction calls. Naming Dtor_Complete there yields a linkage name no module ever
+         * defines, so stage 2 finds no body and the whole class is refused as a local.
+         */
         GlobalDecl MemberGlobalDecl(const CXXMethodDecl* md)
         {
             if (const auto* ctor = llvm::dyn_cast<CXXConstructorDecl>(md))
                 return GlobalDecl(ctor, Ctor_Complete);
             if (const auto* dtor = llvm::dyn_cast<CXXDestructorDecl>(md))
-                return GlobalDecl(dtor, Dtor_Complete);
+            {
+                const bool microsoft = md->getASTContext().getTargetInfo().getCXXABI().isMicrosoft();
+                const bool baseIsComplete = microsoft && md->getParent()->getNumVBases() == 0;
+                return GlobalDecl(dtor, baseIsComplete ? Dtor_Base : Dtor_Complete);
+            }
             return GlobalDecl(md);
         }
 
@@ -401,6 +413,64 @@ namespace cflat_cinterop
             std::string aliasTarget;   // body is exactly one identifier token (`#define A B`)
             int line = 1;
             int col = 0;
+        };
+
+        class PrereqDiagConsumer : public DiagnosticConsumer
+        {
+        public:
+            unsigned prereqErrors = 0;
+            std::string firstPrereqError;
+            std::string firstError;
+            // Every error with its presumed location, so a record whose definition failed to
+            // compile can name the clang diagnostic that broke it (capped: a broken TU cascades).
+            struct ErrorNote { std::string message; std::string file; unsigned line = 0; };
+            std::vector<ErrorNote> errors;
+
+            void HandleDiagnostic(DiagnosticsEngine::Level level, const Diagnostic& info) override
+            {
+                // Deliberately do NOT chain to DiagnosticConsumer::HandleDiagnostic: the base
+                // increments NumErrors, and CompilerInstance::ExecuteAction returns false when
+                // the client reports errors - which would turn the intentional macro-probe
+                // errors into a whole-extraction failure. Like IgnoringDiagConsumer, we swallow
+                // the diagnostic and only keep our own prerequisite tally.
+                if (level < DiagnosticsEngine::Error) return;
+
+                llvm::SmallString<256> msg;
+                info.FormatDiagnostic(msg);
+                if (firstError.empty()) firstError = msg.str().str();
+                if (errors.size() < 64)
+                {
+                    ErrorNote note{ msg.str().str(), std::string(), 0 };
+                    if (info.hasSourceManager() && info.getLocation().isValid())
+                    {
+                        PresumedLoc pl = info.getSourceManager().getPresumedLoc(info.getLocation());
+                        if (pl.isValid()) { note.file = pl.getFilename(); note.line = pl.getLine(); }
+                    }
+                    errors.push_back(std::move(note));
+                }
+                if (msg.str().find("unknown type name") == llvm::StringRef::npos) return;
+
+                // Errors in the in-memory stub (the macro probes) are not header prerequisites.
+                if (info.hasSourceManager())
+                {
+                    const SourceManager& sm = info.getSourceManager();
+                    if (info.getLocation().isValid() && sm.isInMainFile(info.getLocation()))
+                        return;
+                }
+
+                ++prereqErrors;
+                if (firstPrereqError.empty())
+                {
+                    firstPrereqError = msg.str().str();
+                    // Name the header line so a failure deep in a library is locatable.
+                    if (info.hasSourceManager() && info.getLocation().isValid())
+                    {
+                        PresumedLoc pl = info.getSourceManager().getPresumedLoc(info.getLocation());
+                        if (pl.isValid())
+                            firstPrereqError += std::format(" at {}:{}", pl.getFilename(), pl.getLine());
+                    }
+                }
+            }
         };
 
         struct ExtractState
@@ -634,6 +704,7 @@ namespace cflat_cinterop
             DeclVisitor(ASTContext& c, ExtractState& s) : ctx(c), sm(c.getSourceManager()), st(s) {}
 
             void PrepareHeaderSpecialMembers(const CXXRecordDecl* cxx);
+            std::string InvalidDefinitionRefusal(const CXXRecordDecl* def) const;
 
             // Resolve a decl's presumed location WITHOUT applying the in-scope filter. Returns
             // false only on an invalid/unknown location.
@@ -1030,6 +1101,7 @@ namespace cflat_cinterop
                 rec.hasTrivialDefaultCtor = cxx->hasTrivialDefaultConstructor();
                 rec.hasTrivialCopyCtor = cxx->hasTrivialCopyConstructor();
                 rec.hasTrivialDtor = !cxx->hasNonTrivialDestructor();
+                rec.paramDestroyedInCallee = cxx->isParamDestroyedInCallee();
                 rec.hasDefaultCtor = cxx->hasDefaultConstructor();
                 rec.hasCopyCtor = cxx->hasCopyConstructorWithConstParam()
                                || cxx->needsImplicitCopyConstructor()
@@ -1052,13 +1124,18 @@ namespace cflat_cinterop
                 std::set<const CXXMethodDecl*> templateExtras;
                 for (const CXXMethodDecl* md : cxx->methods()) methodList.push_back(md);
                 std::set<const CXXMethodDecl*> listedMethods(methodList.begin(), methodList.end());
+                // A using-declaration re-exposes a base member under ITS OWN access: the MSVC
+                // STL keeps _Ptr_base::get protected and publishes it with `using _Mybase::get;`
+                // in shared_ptr, so the shadow's access is the one this class grants.
+                std::map<const CXXMethodDecl*, AccessSpecifier> usingAccess;
                 for (const Decl* d : cxx->decls())
                 {
                     const auto* shadow = llvm::dyn_cast<UsingShadowDecl>(d);
                     const auto* target = shadow != nullptr
                         ? llvm::dyn_cast<CXXMethodDecl>(shadow->getTargetDecl()) : nullptr;
-                    if (target != nullptr && listedMethods.insert(target).second)
-                        methodList.push_back(target);
+                    if (target == nullptr) continue;
+                    usingAccess.emplace(target, shadow->getAccess());
+                    if (listedMethods.insert(target).second) methodList.push_back(target);
                 }
                 if (!st.req.cxxTypeRequests.empty())
                     for (const Decl* d : cxx->decls())
@@ -1095,7 +1172,27 @@ namespace cflat_cinterop
                         }
                         if (!st.req.emitDefinitions && (!allDefaulted && !constructorTemplate))
                             continue;
-                        if (!st.req.emitDefinitions && dependent) continue;
+                        if (!st.req.emitDefinitions && dependent)
+                        {
+                            if (!allDefaulted || st.ci == nullptr || !st.ci->hasSema()) continue;
+                            Sema& sema = st.ci->getSema();
+                            clang::Scope tuScope(nullptr, clang::Scope::DeclScope,
+                                                 st.ci->getDiagnostics());
+                            const bool lendScope = sema.TUScope == nullptr;
+                            if (lendScope) sema.TUScope = &tuScope;
+                            FunctionDecl* specialization = nullptr;
+                            sema::TemplateDeductionInfo info(pattern->getLocation());
+                            const TemplateDeductionResult result = sema.DeduceTemplateArguments(
+                                const_cast<FunctionTemplateDecl*>(ftd), nullptr, specialization,
+                                info, /*IsAddressOfFunction*/ true);
+                            if (lendScope) sema.TUScope = nullptr;
+                            const auto* smd = result == TemplateDeductionResult::Success
+                                ? llvm::dyn_cast_or_null<CXXMethodDecl>(specialization) : nullptr;
+                            if (smd == nullptr) continue;
+                            templateExtras.insert(smd);
+                            if (listedMethods.insert(smd).second) methodList.push_back(smd);
+                            continue;
+                        }
                         if (!st.req.emitDefinitions)
                         {
                             templateExtras.insert(pattern);
@@ -1253,8 +1350,10 @@ namespace cflat_cinterop
                     m.isDeleted = md->isDeleted();
                     m.isDefaulted = md->isDefaulted();
                     m.isImplicit = md->isImplicit();
+                    m.isTemplateSpecialization = md->getPrimaryTemplate() != nullptr;
                     m.isNoexcept = DeclIsNoexcept(md);
-                    m.access = MapAccess(md->getAccess());
+                    m.access = MapAccess(usingAccess.count(md) != 0 ? usingAccess.at(md)
+                                                                    : md->getAccess());
                     m.variadic = md->isVariadic();
                     if (ctor != nullptr)
                     {
@@ -1308,6 +1407,9 @@ namespace cflat_cinterop
                                         "defines it alongside this one)";
                         break;
                     }
+                    if (m.bindRefusal.empty() && md->getReturnType()->isUndeducedType())
+                        m.bindRefusal = "has a deduced return type ('auto') that this translation "
+                                        "unit never deduced (its body was not instantiated)";
                     if (m.bindRefusal.empty() && ctor == nullptr && dtor == nullptr)
                     {
                         std::string bad = IncompleteByValueRecord(ctx, md->getReturnType());
@@ -1611,6 +1713,8 @@ namespace cflat_cinterop
                         && !cxx->hasNonTrivialDestructor() && !cxx->isPolymorphic();
                     if (cxx->hasDefinition())
                     {
+                        if (cxx->getDefinition()->isInvalidDecl())
+                            rec.layoutRefusal = InvalidDefinitionRefusal(cxx->getDefinition());
                         if (rec.inScope && nameOverride.empty())
                             PrepareHeaderSpecialMembers(cxx);
                         if (rec.inScope || !st.req.requireInScope || !nameOverride.empty())
@@ -2058,6 +2162,7 @@ namespace cflat_cinterop
                 {
                     s.indirectByVal   = ai.getIndirectByVal();
                     s.indirectRealign = ai.getIndirectRealign();
+                    s.sretAfterThis   = ai.isSRetAfterThis();
                 }
             }
 
@@ -2082,6 +2187,42 @@ namespace cflat_cinterop
             if (incomplete(fpt->getReturnType())) return true;
             for (QualType p : fpt->getParamTypes())
                 if (incomplete(p)) return true;
+            return false;
+        }
+
+        // A return type that is still an undeduced `auto` (the MSVC STL writes
+        // `auto insert(node_type&&)`): an explicit class instantiation never instantiates that
+        // body, so there is no return type to arrange and CodeGen dereferences the placeholder.
+        static bool ProtoHasUndeducedReturn(const FunctionProtoType* fpt)
+        {
+            return fpt->getReturnType()->isUndeducedType();
+        }
+
+        /*
+         * Under the Microsoft ABI a pointer-to-member type has no representation until Sema has
+         * locked in its class's inheritance model, which a real translation unit does the first
+         * time such a type must be complete (a definition, a call, a sizeof). A declaration-only
+         * header never gets there, and CodeGen then dereferences the missing MSInheritanceAttr
+         * while converting the prototype. Lock the model in the way RequireCompleteType does;
+         * a prototype whose model still cannot be settled is left unarranged (the backend refuses
+         * every member-pointer parameter or return by its spelling anyway).
+         */
+        static bool ProtoHasUnmodeledMemberPointer(ExtractState& st, ASTContext& ctx,
+                                                   const FunctionProtoType* fpt)
+        {
+            if (!ctx.getTargetInfo().getCXXABI().isMicrosoft()) return false;
+            auto unmodeled = [&](QualType t) {
+                const auto* mpt = llvm::dyn_cast<MemberPointerType>(t.getCanonicalType());
+                if (mpt == nullptr) return false;
+                CXXRecordDecl* rd = mpt->getMostRecentCXXRecordDecl();
+                if (rd == nullptr || rd->isDependentType()) return true;
+                if (st.ci != nullptr && st.ci->hasSema())
+                    (void)st.ci->getSema().isCompleteType(rd->getLocation(), t);
+                return !rd->getMostRecentDecl()->hasAttr<MSInheritanceAttr>();
+            };
+            if (unmodeled(fpt->getReturnType())) return true;
+            for (QualType p : fpt->getParamTypes())
+                if (unmodeled(p)) return true;
             return false;
         }
 
@@ -2118,6 +2259,32 @@ namespace cflat_cinterop
          * Sema to declare their lazy special members. Declare the non-trivial ones before the
          * record's method list is exported; definition and ODR-use happen after parsing below.
          */
+        /*
+         * A class whose definition clang rejected (a header that names std::string without
+         * including <string>, say) has no members cflat could bind: Sema marks the whole
+         * definition invalid and CodeGen never arranges its methods. Refusing the record with the
+         * diagnostic that broke it says so at the use site, instead of "no constructor takes N
+         * arguments". The first error located inside the definition is the one quoted.
+         */
+        std::string DeclVisitor::InvalidDefinitionRefusal(const CXXRecordDecl* def) const
+        {
+            const auto* diags = st.ci != nullptr
+                ? dynamic_cast<const PrereqDiagConsumer*>(st.ci->getDiagnostics().getClient())
+                : nullptr;
+            std::string file; int first = 0, last = 0, col = 0;
+            const bool located = diags != nullptr && LocOfRaw(def, file, first, col);
+            if (located)
+            {
+                PresumedLoc endLoc = sm.getPresumedLoc(def->getEndLoc());
+                last = endLoc.isValid() && endLoc.getFilename() == file ? (int)endLoc.getLine() : first;
+                for (const auto& e : diags->errors)
+                    if (e.file == file && (int)e.line >= first && (int)e.line <= last)
+                        return std::format("does not compile as C++: {} ({}:{})",
+                                           e.message, e.file, e.line);
+            }
+            return "does not compile as C++ (clang reported an error inside its definition)";
+        }
+
         void DeclVisitor::PrepareHeaderSpecialMembers(const CXXRecordDecl* cxx)
         {
             const CXXRecordDecl* def = CompleteNonDependentCxxRecord(cxx);
@@ -2273,6 +2440,36 @@ namespace cflat_cinterop
             sema.PerformPendingInstantiations();
         }
 
+        /*
+         * An error clang raised inside a header the caller asked to bind poisons everything
+         * downstream: Sema marks the offending declarations invalid, every instantiation that
+         * touches them comes out holding error expressions, and companion CodeGen would then walk
+         * an AST clang's own driver would never have handed it (that walk is what crashes on an
+         * STL-using header). Record the first such diagnostic so the bind can be refused with it.
+         * Errors in the in-memory stub - the intentional macro probes and default-argument
+         * wrapper requests - and in system headers - an ill-formed STL instantiation, which the
+         * error-body sweep already contains - are not this case and stay tolerated.
+         */
+        void RecordInScopeHeaderErrors(ExtractState& st)
+        {
+            st.out.headerErrors = 0;
+            st.out.firstHeaderError.clear();
+            if (!st.req.cxxMode || !st.req.requireInScope || st.normDirs.empty()
+                || st.ci == nullptr)
+                return;
+            const auto* diags =
+                dynamic_cast<const PrereqDiagConsumer*>(st.ci->getDiagnostics().getClient());
+            if (diags == nullptr) return;
+            for (const auto& e : diags->errors)
+            {
+                if (e.file.empty() || !PathInScope(e.file, st.normDirs)) continue;
+                ++st.out.headerErrors;
+                if (st.out.firstHeaderError.empty())
+                    st.out.firstHeaderError =
+                        std::format("{} at {}:{}", e.message, e.file, e.line);
+            }
+        }
+
         void ComputeCxxAbi(ExtractState& st, ASTContext& ctx)
         {
             if (st.ci == nullptr) return;
@@ -2302,6 +2499,8 @@ namespace cflat_cinterop
                             "uses a C++ class template specialization that the header never instantiates";
                     continue;
                 }
+                if (ProtoHasUnmodeledMemberPointer(st, ctx, fpt.getTypePtr())) continue;
+                if (ProtoHasUndeducedReturn(fpt.getTypePtr())) continue;
                 const CGFunctionInfo& fi = arrangeFreeFunctionType(cgm, fpt);
 
                 RawAbi abi = DescribeAbi(fi);
@@ -2323,6 +2522,8 @@ namespace cflat_cinterop
                     continue;
                 }
                 if (ProtoHasIncompleteRecord(fptPtr)) continue;
+                if (ProtoHasUnmodeledMemberPointer(st, ctx, fptPtr)) continue;
+                if (ProtoHasUndeducedReturn(fptPtr)) continue;
                 CanQual<FunctionProtoType> fpt =
                     CanQual<FunctionProtoType>::CreateUnsafe(t);
                 const CGFunctionInfo& fi = arrangeFreeFunctionType(cgm, fpt);
@@ -2365,18 +2566,22 @@ namespace cflat_cinterop
                     continue;
 
                 /*
-                 * M6 - the vtable slot of a virtual member, straight from Clang's Itanium vtable
-                 * layout. The index is relative to the address point of the vtable of the class
-                 * that DECLARES the member, which is exactly the subobject the call site will have
-                 * adjusted `this` to. A virtual destructor gets both of its slots: D1 (complete
-                 * object) and D0 (deleting, which also releases the storage).
+                 * M6 - the vtable slot of a virtual member, straight from Clang's vtable layout.
+                 * The index is relative to the address point of the vtable of the class that
+                 * DECLARES the member, which is exactly the subobject the call site will have
+                 * adjusted `this` to. Itanium: a virtual destructor gets both of its slots, D1
+                 * (complete object) and D0 (deleting, which also releases the storage).
+                 * Microsoft: the vftable holds ONE destructor slot, the deleting destructor
+                 * (`this`, flags; bit 0 = release the storage), so both indices name it. A slot in a vfptr that is not at offset zero of the declaring class, or one
+                 * reached through a virtual base, is left unknown and the member is refused.
                  */
                 if (md->isVirtual())
                 {
+                    const auto* dd = llvm::dyn_cast<CXXDestructorDecl>(md);
                     if (auto* itanium = llvm::dyn_cast<clang::ItaniumVTableContext>(
                             ctx.getVTableContext()))
                     {
-                        if (const auto* dd = llvm::dyn_cast<CXXDestructorDecl>(md))
+                        if (dd != nullptr)
                         {
                             m.vtableIndex = (int)itanium->getMethodVTableIndex(
                                 GlobalDecl(dd, Dtor_Complete));
@@ -2386,12 +2591,32 @@ namespace cflat_cinterop
                         else
                             m.vtableIndex = (int)itanium->getMethodVTableIndex(GlobalDecl(md));
                     }
+                    else if (auto* microsoft = llvm::dyn_cast<clang::MicrosoftVTableContext>(
+                                 ctx.getVTableContext()))
+                    {
+                        // The slot is keyed by the deleting variant this target's vftable
+                        // references (vector deleting on current targets); asking for the
+                        // other variant misses the map, which asserts only in a Debug LLVM.
+                        const CXXDtorType deleting =
+                            ctx.getTargetInfo().emitVectorDeletingDtors(ctx.getLangOpts())
+                                ? Dtor_VectorDeleting : Dtor_Deleting;
+                        const clang::MethodVFTableLocation loc =
+                            microsoft->getMethodVFTableLocation(
+                                dd != nullptr ? GlobalDecl(dd, deleting) : GlobalDecl(md));
+                        if (loc.VBase == nullptr && loc.VFPtrOffset.isZero())
+                        {
+                            m.vtableIndex = (int)loc.Index;
+                            if (dd != nullptr) m.vtableIndexDeleting = (int)loc.Index;
+                        }
+                    }
                 }
 
                 CanQualType canon = md->getType()->getCanonicalTypeUnqualified();
                 if (canon->getAs<FunctionProtoType>() == nullptr) continue;
                 CanQual<FunctionProtoType> fpt = canon.castAs<FunctionProtoType>();
                 if (ProtoHasIncompleteRecord(fpt.getTypePtr())) continue;
+                if (ProtoHasUnmodeledMemberPointer(st, ctx, fpt.getTypePtr())) continue;
+                if (ProtoHasUndeducedReturn(fpt.getTypePtr())) continue;
 
                 const CGFunctionInfo* fi = nullptr;
                 if (m.kind == RawCxxMember::StaticMethod)
@@ -2912,6 +3137,19 @@ namespace cflat_cinterop
             }
             void HandleTranslationUnit(ASTContext& ctx) override
             {
+                // A bound header clang rejected leaves invalid declarations behind, and neither
+                // the harvest nor the ABI/CodeGen pass below is safe to run over them - both walk
+                // into Clang machinery a real driver would never reach after an error. The caller
+                // refuses the bind with the diagnostic instead.
+                RecordInScopeHeaderErrors(st);
+                if (st.out.headerErrors > 0)
+                {
+                    if (st.req.verbose)
+                        std::cout << std::format(
+                            "[verbose]   bound header does not compile: {}\n",
+                            st.out.firstHeaderError);
+                    return;
+                }
                 DeclVisitor v(ctx, st);
                 {
                     CxxExtractionStageTimer harvest(st.req.verbose && st.req.cxxMode,
@@ -2996,49 +3234,6 @@ namespace cflat_cinterop
         // header missing a prerequisite include; the header-bind path turns it into a helpful
         // "import them as one group" diagnostic. The intentional macro-probe errors all sit in
         // the main stub file, so isInMainFile() filters them out.
-        class PrereqDiagConsumer : public DiagnosticConsumer
-        {
-        public:
-            unsigned prereqErrors = 0;
-            std::string firstPrereqError;
-            std::string firstError;
-
-            void HandleDiagnostic(DiagnosticsEngine::Level level, const Diagnostic& info) override
-            {
-                // Deliberately do NOT chain to DiagnosticConsumer::HandleDiagnostic: the base
-                // increments NumErrors, and CompilerInstance::ExecuteAction returns false when
-                // the client reports errors - which would turn the intentional macro-probe
-                // errors into a whole-extraction failure. Like IgnoringDiagConsumer, we swallow
-                // the diagnostic and only keep our own prerequisite tally.
-                if (level < DiagnosticsEngine::Error) return;
-
-                llvm::SmallString<256> msg;
-                info.FormatDiagnostic(msg);
-                if (firstError.empty()) firstError = msg.str().str();
-                if (msg.str().find("unknown type name") == llvm::StringRef::npos) return;
-
-                // Errors in the in-memory stub (the macro probes) are not header prerequisites.
-                if (info.hasSourceManager())
-                {
-                    const SourceManager& sm = info.getSourceManager();
-                    if (info.getLocation().isValid() && sm.isInMainFile(info.getLocation()))
-                        return;
-                }
-
-                ++prereqErrors;
-                if (firstPrereqError.empty())
-                {
-                    firstPrereqError = msg.str().str();
-                    // Name the header line so a failure deep in a library is locatable.
-                    if (info.hasSourceManager() && info.getLocation().isValid())
-                    {
-                        PresumedLoc pl = info.getSourceManager().getPresumedLoc(info.getLocation());
-                        if (pl.isValid())
-                            firstPrereqError += std::format(" at {}:{}", pl.getFilename(), pl.getLine());
-                    }
-                }
-            }
-        };
 
         // Build a CompilerInstance from driver args + an optional in-memory main file, then run
         // `action`. When `source` is non-empty it is remapped onto req.mainFileName; otherwise
@@ -3082,6 +3277,13 @@ namespace cflat_cinterop
                 // the FunctionDecl + signature are still produced.
                 if (req.skipFunctionBodies)
                     invocationUP->getFrontendOpts().SkipFunctionBodies = true;
+                // createInvocation reduces the driver job to a parse, so neither the precompile
+                // action nor -o survives. Name both outright rather than through the args.
+                if (!req.pchOutputPath.empty())
+                {
+                    invocationUP->getFrontendOpts().ProgramAction = clang::frontend::GeneratePCH;
+                    invocationUP->getFrontendOpts().OutputFile = req.pchOutputPath;
+                }
                 // The driver puts -disable-free on every cc1 job, so EndSourceFile BURIES the
                 // ASTContext / Preprocessor / Sema instead of deleting them: ~60 MB leaked per
                 // windows.h parse. The CLI batch and the LSP re-extract on every signature-cache
@@ -3125,6 +3327,15 @@ namespace cflat_cinterop
     bool ExtractCInterop(const ExtractRequest& req, ExtractResult& out, std::string& err)
     {
         ExtractState st(req, out);
+
+        // Precompile the group's include prologue. One parse now, `-include-pch` later.
+        if (!req.pchOutputPath.empty())
+        {
+            llvm::TimeTraceScope pchScope("GeneratePch", req.mainFileName);
+            CxxExtractionStageTimer pchStage(req.verbose && req.cxxMode, "clang precompile header");
+            clang::GeneratePCHAction generate;
+            return RunAction(req, req.source, generate, err, nullptr, nullptr, &out);
+        }
 
         // C++ uuid harvest: a single full parse that only collects record __declspec(uuid) GUIDs.
         if (req.uuidHarvestCxx)

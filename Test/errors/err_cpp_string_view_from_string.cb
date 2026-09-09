@@ -3,8 +3,16 @@ import cpp "cpp_interop_basic.h";
 extern int main()
 {
     string text = "abc";
-    expect_error("arg=string  param=std.string_view") {
-        cppi.take_string_view(text);
+    // The parameter renders from clang's spelling of the STL's own type, and the MSVC STL and
+    // libc++ do not agree on it. Pin each host's form rather than a common prefix.
+    if const (__WINDOWS__) {
+        expect_error("arg=string  param=std.basic_string_view<char>") {
+            cppi.take_string_view(text);
+        }
+    } else {
+        expect_error("arg=string  param=std.string_view") {
+            cppi.take_string_view(text);
+        }
     }
     return 0;
 }

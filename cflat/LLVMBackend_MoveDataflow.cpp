@@ -1131,15 +1131,17 @@ void LLVMBackend::ApplyAbiCallAttributes(llvm::CallInst* ci, const AbiRecipe& re
         unsigned attrIdx = 0;
         if (recipe.retSlot.kind == AbiSlot::SRetReturn)
         {
-            ci->addParamAttr(attrIdx, llvm::Attribute::getWithStructRetType(*context, recipe.retSlot.structTy));
-            ci->addParamAttr(attrIdx, llvm::Attribute::NoAlias);
+            const unsigned sretIdx = SRetArgIndex(recipe);
+            ci->addParamAttr(sretIdx, llvm::Attribute::getWithStructRetType(*context, recipe.retSlot.structTy));
+            ci->addParamAttr(sretIdx, llvm::Attribute::NoAlias);
             if (recipe.retSlot.align > 0)
-                ci->addParamAttr(attrIdx, llvm::Attribute::getWithAlignment(*context, llvm::Align(recipe.retSlot.align)));
-            ++attrIdx;
+                ci->addParamAttr(sretIdx, llvm::Attribute::getWithAlignment(*context, llvm::Align(recipe.retSlot.align)));
+            if (sretIdx == 0) ++attrIdx;
         }
         for (size_t i = 0; i < recipe.paramSlots.size(); ++i)
         {
             const AbiSlot& s = recipe.paramSlots[i];
+            if (i == 1 && SRetArgIndex(recipe) == 1) ++attrIdx;   // skip the sret slot behind `this`
             if (s.kind == AbiSlot::ByVal)
             {
                 if (s.indirectByVal)
@@ -1237,6 +1239,10 @@ llvm::Value* LLVMBackend::EmitAbiLoweredCall(const FunctionSymbol& candidate, st
             }
         }
 
+        // MS ABI instance method: the hidden slot was pushed first, the ABI wants it after `this`.
+        if (SRetArgIndex(recipe) == 1 && loweredArgs.size() > 1)
+            std::swap(loweredArgs[0], loweredArgs[1]);
+
         // A virtual member is reached through the pointer loaded out of the receiver's vptr; the
         // SIGNATURE still comes from the declaration, which carries clang's own arrangement.
         auto* ci = calleeOverride != nullptr
@@ -1284,7 +1290,7 @@ llvm::Value* LLVMBackend::EmitAbiLoweredCall(const FunctionSymbol& candidate, st
  * (a 12-byte aggregate to [2 x i64] on AArch64), so a plain alloca of the record would be read
  * past its end. Allocate whichever of the two is larger, and at the stricter alignment.
  */
-llvm::AllocaInst* LLVMBackend::AllocaForCoerce(llvm::StructType* structTy, llvm::Type* coerceTy,
+llvm::AllocaInst* LLVMBackend::AllocaForCoerce(llvm::Type* structTy, llvm::Type* coerceTy,
                                                uint64_t align, const char* name)
 {
         const llvm::DataLayout& dl = module->getDataLayout();
@@ -1625,7 +1631,7 @@ void LLVMBackend::CreateReturnCall(llvm::Value* value, llvm::Value* returnedLoca
             auto* retTy = currentFunction->getReturnType();
             // Wrap raw i8* string literals into string struct when returning string
             auto* strTy = llvm::StructType::getTypeByName(*context, "string");
-            llvm::StructType* abiRetStructTy = currentFunctionAbiRecipe.hasLowering
+            llvm::Type* abiRetStructTy = currentFunctionAbiRecipe.hasLowering
                 ? currentFunctionAbiRecipe.retSlot.structTy : nullptr;
             if (strTy && (retTy == strTy || abiRetStructTy == strTy) && value->getType() != strTy)
             {
@@ -1655,9 +1661,10 @@ void LLVMBackend::CreateReturnCall(llvm::Value* value, llvm::Value* returnedLoca
                     LogErrorMessage("cannot return this value from extern function: it does not match the C ABI return aggregate");
                 if (s.kind == AbiSlot::SRetReturn)
                 {
-                    if (currentFunction->arg_empty())
+                    const unsigned sretIdx = SRetArgIndex(currentFunctionAbiRecipe);
+                    if (currentFunction->arg_size() <= sretIdx)
                         LogErrorMessage("cannot lower extern sret return: missing hidden return slot");
-                    builder->CreateStore(value, &*currentFunction->arg_begin());
+                    builder->CreateStore(value, currentFunction->getArg(sretIdx));
                     builder->CreateRetVoid();
                     return;
                 }

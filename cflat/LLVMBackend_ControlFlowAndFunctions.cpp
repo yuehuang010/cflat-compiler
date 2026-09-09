@@ -1316,6 +1316,21 @@ bool LLVMBackend::BuildAbiRecipeFromClangPlan(const std::string& functionName,
                 if (ParameterIsAliasByPointer(tv)) { slot.kind = AbiSlot::Direct; return true; }
                 if (!IsByValueStructTV(tv))
                 {
+                    // MS x64 moves a 128-bit integer through XMM0 as <2 x i64>; clang says so
+                    // with a coercion type, and the record coerce path (spill, reload as the
+                    // coerce type) is exactly the conversion needed.
+                    llvm::Type* natural = tv.Pointer || tv.IsAlias ? nullptr : GetType(tv);
+                    llvm::Type* wideCoerce = targetWindows_ && natural != nullptr
+                        && natural->isIntegerTy(128) && !ps.coerceType.empty()
+                        ? ParseLlvmTypeText(ps.coerceType) : nullptr;
+                    if (wideCoerce != nullptr && wideCoerce != natural)
+                    {
+                        slot.kind = AbiSlot::CoerceToInt;
+                        slot.coerceTy = wideCoerce;
+                        slot.structTy = natural;
+                        slot.align = module->getDataLayout().getABITypeAlign(natural).value();
+                        return true;
+                    }
                     // Scalar or pointer: the natural CFlat type already IS the ABI type; clang
                     // only adds the sign/zero extension hint. The whole-signature check below
                     // catches any case where that assumption does not hold.
@@ -1348,7 +1363,22 @@ bool LLVMBackend::BuildAbiRecipeFromClangPlan(const std::string& functionName,
 
             case RS::Indirect:
             {
-                if (!IsByValueStructTV(tv)) return refuse("an indirect non-record argument");
+                if (!IsByValueStructTV(tv))
+                {
+                    // MS x64 hands a non-record wider than eight bytes (__int128) over by pointer
+                    // to a caller-owned copy and returns it through sret: the same spill and
+                    // reload the record slots below perform, for any sized LLVM type.
+                    llvm::Type* scalarTy = targetWindows_ && !tv.Pointer && !tv.IsAlias
+                        ? GetType(tv) : nullptr;
+                    if (scalarTy == nullptr || !scalarTy->isSized())
+                        return refuse("an indirect non-record argument");
+                    slot.kind = isReturn ? AbiSlot::SRetReturn : AbiSlot::ByVal;
+                    slot.structTy = scalarTy;
+                    slot.align = ps.indirectAlign;
+                    slot.indirectByVal = isReturn ? true : ps.indirectByVal;
+                    slot.sretAfterThis = isReturn && ps.sretAfterThis;
+                    return true;
+                }
                 auto sit = dataStructures.find(tv.TypeName);
                 if (sit == dataStructures.end() || sit->second.StructType == nullptr)
                     return refuse("an unregistered record");
@@ -1356,6 +1386,7 @@ bool LLVMBackend::BuildAbiRecipeFromClangPlan(const std::string& functionName,
                 slot.structTy = sit->second.StructType;
                 slot.align = ps.indirectAlign;
                 slot.indirectByVal = isReturn ? true : ps.indirectByVal;
+                slot.sretAfterThis = isReturn && ps.sretAfterThis;
                 return true;
             }
 
@@ -1402,7 +1433,7 @@ llvm::FunctionType* LLVMBackend::BuildExternFunctionType(const TypeAndValue& ret
         if (recipe.retSlot.kind == AbiSlot::SRetReturn)
         {
             loweredRet = builder->getVoidTy();
-            // Hidden sret pointer goes first.
+            // Hidden sret pointer goes first (moved behind `this` below when the ABI says so).
             ptypes.push_back(cflat_llvm::PointerTo(recipe.retSlot.structTy));
         }
         else if (recipe.retSlot.kind == AbiSlot::CoerceToInt)
@@ -1443,6 +1474,7 @@ llvm::FunctionType* LLVMBackend::BuildExternFunctionType(const TypeAndValue& ret
             else
                 ptypes.push_back(GetCCompatibleType(params[i]));
         }
+        if (SRetArgIndex(recipe) == 1 && ptypes.size() > 1) std::swap(ptypes[0], ptypes[1]);
         return llvm::FunctionType::get(loweredRet, ptypes, varargs);
     }
 
@@ -1451,15 +1483,17 @@ void LLVMBackend::ApplyAbiAttributes(llvm::Function* fn, const AbiRecipe& recipe
         unsigned attrIdx = 0; // LLVM param attribute indices are 0-based on the function's actual param list
         if (recipe.retSlot.kind == AbiSlot::SRetReturn)
         {
-            fn->addParamAttr(attrIdx, llvm::Attribute::getWithStructRetType(*context, recipe.retSlot.structTy));
-            fn->addParamAttr(attrIdx, llvm::Attribute::NoAlias);
+            const unsigned sretIdx = SRetArgIndex(recipe);
+            fn->addParamAttr(sretIdx, llvm::Attribute::getWithStructRetType(*context, recipe.retSlot.structTy));
+            fn->addParamAttr(sretIdx, llvm::Attribute::NoAlias);
             if (recipe.retSlot.align > 0)
-                fn->addParamAttr(attrIdx, llvm::Attribute::getWithAlignment(*context, llvm::Align(recipe.retSlot.align)));
-            ++attrIdx;
+                fn->addParamAttr(sretIdx, llvm::Attribute::getWithAlignment(*context, llvm::Align(recipe.retSlot.align)));
+            if (sretIdx == 0) ++attrIdx;
         }
         for (size_t i = 0; i < recipe.paramSlots.size(); ++i)
         {
             const AbiSlot& s = recipe.paramSlots[i];
+            if (i == 1 && SRetArgIndex(recipe) == 1) ++attrIdx;   // skip the sret slot behind `this`
             if (s.kind == AbiSlot::ByVal)
             {
                 // Clang's Indirect for a caller-owned temp is a BARE pointer: byval would tell

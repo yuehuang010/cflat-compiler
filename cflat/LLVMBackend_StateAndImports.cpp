@@ -1725,6 +1725,7 @@ nlohmann::json LLVMBackend::AbiSlotToJson(const cflat_cinterop::RawAbiSlot& sl)
         if (sl.canBeFlattened)  j["fl"] = true;
         if (sl.indirectByVal)   j["bv"] = true;
         if (sl.indirectRealign) j["rl"] = true;
+        if (sl.sretAfterThis)   j["sa"] = true;
         if (sl.indirectAlign)   j["ia"] = sl.indirectAlign;
         if (sl.directOffset)    j["do"] = sl.directOffset;
         if (sl.llvmArgIndex)    j["ai"] = sl.llvmArgIndex;
@@ -1744,6 +1745,7 @@ cflat_cinterop::RawAbiSlot LLVMBackend::AbiSlotFromJson(const SjVal& j)
         sl.canBeFlattened  = j.value("fl", false);
         sl.indirectByVal   = j.value("bv", false);
         sl.indirectRealign = j.value("rl", false);
+        sl.sretAfterThis   = j.value("sa", false);
         sl.indirectAlign   = j.value("ia", (uint64_t)0);
         sl.directOffset    = j.value("do", (uint64_t)0);
         sl.llvmArgIndex    = (unsigned)j.value("ai", (uint64_t)0);
@@ -1935,6 +1937,7 @@ nlohmann::json LLVMBackend::CxxMemberToJson(const cflat_cinterop::RawCxxMember& 
         if (m.isDeleted)            j["dl"] = true;
         if (m.isDefaulted)          j["df"] = true;
         if (m.isImplicit)           j["im"] = true;
+        if (m.isTemplateSpecialization) j["ts"] = true;
         if (m.needsLocalDefinition) j["nd"] = true;
         if (!m.bindRefusal.empty()) j["br"] = m.bindRefusal;
         if (m.returnsThis)          j["rth"] = true;
@@ -1981,6 +1984,7 @@ cflat_cinterop::RawCxxMember LLVMBackend::CxxMemberFromJson(const SjVal& j)
         m.isDeleted            = j.value("dl", false);
         m.isDefaulted          = j.value("df", false);
         m.isImplicit           = j.value("im", false);
+        m.isTemplateSpecialization = j.value("ts", false);
         m.needsLocalDefinition = j.value("nd", false);
         m.bindRefusal = j.value("br", std::string());
         m.returnsThis          = j.value("rth", false);
@@ -2049,6 +2053,7 @@ nlohmann::json LLVMBackend::RecordToJson(const CRecordEntry& r)
         if (r.hasTrivialDefaultCtor) j["tdc"] = true;
         if (r.hasTrivialCopyCtor)    j["tcc"] = true;
         if (!r.hasTrivialDtor)       j["ntd"] = true;
+        if (r.paramDestroyedInCallee) j["pdc"] = true;
         if (r.hasDeletedDefaultCtor) j["ddc"] = true;
         if (r.hasDeletedCopyCtor)    j["dcc"] = true;
         if (r.hasDefaultCtor)        j["hdc"] = true;
@@ -2109,6 +2114,7 @@ LLVMBackend::CRecordEntry LLVMBackend::RecordFromJson(const SjVal& j)
         r.hasTrivialDefaultCtor = j.value("tdc", false);
         r.hasTrivialCopyCtor    = j.value("tcc", false);
         r.hasTrivialDtor        = !j.value("ntd", false);
+        r.paramDestroyedInCallee = j.value("pdc", false);
         r.hasDeletedDefaultCtor = j.value("ddc", false);
         r.hasDeletedCopyCtor    = j.value("dcc", false);
         r.hasDefaultCtor        = j.value("hdc", false);

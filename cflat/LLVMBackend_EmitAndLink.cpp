@@ -2744,15 +2744,27 @@ bool LLVMBackend::LinkCxxCompanionModules()
      * most the code is duplicated, never the state.
      */
     size_t internalized = 0;
+    std::set<const llvm::Function*> demoted;
     auto demote = [&](llvm::Function& gv) {
         if (gv.isDeclaration() || !gv.hasName()) return;
         if (programOrigin.count(gv.getName().str()) != 0) return;
         if (!gv.hasLinkOnceLinkage() && !gv.hasWeakLinkage()) return;
         gv.setComdat(nullptr);
         gv.setLinkage(llvm::GlobalValue::InternalLinkage);
+        demoted.insert(&gv);
         ++internalized;
     };
     for (llvm::Function& f : module->functions())       demote(f);
+    // A weak FUNCTION alias (MS ABI `??_E` vector deleting dtor -> `??_G`) follows its aliasee:
+    // left weak without a comdat it would be a strong COFF definition of an internal body.
+    for (llvm::GlobalAlias& alias : module->aliases())
+    {
+        if (!alias.hasLinkOnceLinkage() && !alias.hasWeakLinkage()) continue;
+        const auto* target = llvm::dyn_cast<llvm::Function>(alias.getAliaseeObject());
+        if (target == nullptr || demoted.count(target) == 0) continue;
+        alias.setLinkage(llvm::GlobalValue::InternalLinkage);
+        ++internalized;
+    }
     if (verbose)
         std::cout << std::format("[verbose] C++ companion: {} definition(s) internalized for "
                                  "dead-code elimination\n", internalized);
