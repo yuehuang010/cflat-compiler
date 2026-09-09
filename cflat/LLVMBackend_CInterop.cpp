@@ -1550,6 +1550,9 @@ std::vector<std::string> LLVMBackend::BuildClangDriverArgs(const std::string& he
         // C++ is used only by the focused uuid-harvest pass, so the SDK's MIDL_INTERFACE form
         // (which carries the __declspec(uuid) the C form omits) is parsed. The normal bind is C.
         args.push_back(asCxx ? "c++" : "c");
+        // Header extraction must see the same language level the companion module and the
+        // request TUs are compiled with (C++20 requires-clauses in libtorch).
+        if (asCxx) args.push_back("-std=" + cppStandard_);
         if (errorRecovery)
         {
             args.push_back("-ferror-limit=0");

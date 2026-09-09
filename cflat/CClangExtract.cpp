@@ -2654,7 +2654,17 @@ namespace cflat_cinterop
                 }
 
                 ++prereqErrors;
-                if (firstPrereqError.empty()) firstPrereqError = msg.str().str();
+                if (firstPrereqError.empty())
+                {
+                    firstPrereqError = msg.str().str();
+                    // Name the header line so a failure deep in a library is locatable.
+                    if (info.hasSourceManager() && info.getLocation().isValid())
+                    {
+                        PresumedLoc pl = info.getSourceManager().getPresumedLoc(info.getLocation());
+                        if (pl.isValid())
+                            firstPrereqError += std::format(" at {}:{}", pl.getFilename(), pl.getLine());
+                    }
+                }
             }
         };
 
