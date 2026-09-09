@@ -2644,6 +2644,13 @@ bool LLVMBackend::LinkCxxCompanionModules()
     if (cxxCompanionBitcode_.empty()) return true;
     llvm::TimeTraceScope scope("LinkCxxCompanion");
 
+    // Everything defined right now is PROGRAM-origin: cflat's own code plus whatever earlier
+    // companions contributed. What the link below adds on top is companion-origin, and only
+    // those get the internalize treatment (see the loop after the link).
+    std::unordered_set<std::string> programOrigin;
+    for (const llvm::GlobalValue& gv : module->global_values())
+        if (!gv.isDeclaration() && gv.hasName()) programOrigin.insert(gv.getName().str());
+
     std::vector<std::string> blobs;
     blobs.swap(cxxCompanionBitcode_);
     for (const std::string& blob : blobs)
@@ -2715,6 +2722,32 @@ bool LLVMBackend::LinkCxxCompanionModules()
             return false;
         }
     }
+
+    /*
+     * Clang emits every inline body the bound surface mentions, not only the ones cflat calls, and
+     * an unreferenced one can name a symbol that exists in no library (a member of a specialization
+     * whose out-of-line half lives in some other TU). Those references only matter because the
+     * definition is still ODR-linkage, hence a linker-visible root. Demote every companion-origin
+     * ODR/weak definition to internal: one that program code (directly or transitively) uses is
+     * kept by GlobalDCE exactly as before, and one nothing reaches is deleted along with its
+     * undefined references. COMDATs go with it - inside one module there is nothing left to merge.
+     */
+    size_t internalized = 0;
+    auto demote = [&](llvm::GlobalValue& gv) {
+        if (gv.isDeclaration() || !gv.hasName()) return;
+        if (programOrigin.count(gv.getName().str()) != 0) return;
+        if (!gv.hasLinkOnceLinkage() && !gv.hasWeakLinkage() && !gv.hasCommonLinkage()) return;
+        if (auto* go = llvm::dyn_cast<llvm::GlobalObject>(&gv)) go->setComdat(nullptr);
+        gv.setLinkage(llvm::GlobalValue::InternalLinkage);
+        ++internalized;
+    };
+    for (llvm::Function& f : module->functions())       demote(f);
+    for (llvm::GlobalVariable& g : module->globals())   demote(g);
+    for (llvm::GlobalAlias& a : module->aliases())      demote(a);
+    if (verbose)
+        std::cout << std::format("[verbose] C++ companion: {} definition(s) internalized for "
+                                 "dead-code elimination\n", internalized);
+    cxxCompanionLinked_ = internalized != 0;
     return true;
 }
 

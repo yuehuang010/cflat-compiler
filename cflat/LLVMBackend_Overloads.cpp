@@ -1074,6 +1074,8 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                     : LoadArgStorage(arg);
         }
 
+        // Deferred C++ binding: complete this name's overload set before resolving against it.
+        if (TryBindCxxFunction(functionName)) { /* bound now, or already was */ }
         auto funcSym = functionTable.find(functionName);
         if (funcSym == functionTable.end())
         {
@@ -2440,6 +2442,8 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
 
 llvm::Function* LLVMBackend::GetFunction(const std::string& functionName)
 {
+        // A C++ free function whose signature binding was deferred to first use.
+        TryBindCxxFunction(functionName);
         auto functionSym = functionTable.find(functionName);
 
         if (functionSym != functionTable.end())

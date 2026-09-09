@@ -39,6 +39,10 @@ std::string MangleGenericInstance(const LLVMBackend& compiler, std::string_view 
 bool DemangleType(const LLVMBackend& compiler, std::string_view mangled, TypeSpelling& out);
 std::string MangledGenericArgument(const LLVMBackend& compiler, std::string_view mangled,
                                    size_t index = 0);
+// Argument count for a mangled generic instance the mangler itself never produced (a C++
+// foreign identity built from a clang spelling), so DemangleType can split it.
+void RememberMangledArity(const LLVMBackend& compiler, std::string_view mangled, size_t arity);
+
 std::string SpellType(const LLVMBackend& compiler,
                       const LLVMBackend::TypeAndValue& type);
 std::string_view MangledBase(std::string_view mangled);

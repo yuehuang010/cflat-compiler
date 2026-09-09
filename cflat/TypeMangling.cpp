@@ -717,6 +717,11 @@ std::string MangledGenericArgument(const LLVMBackend& compiler, std::string_view
     return MangleTypeFromSpelling(compiler, spelling.args[index]);
 }
 
+void RememberMangledArity(const LLVMBackend& compiler, std::string_view mangled, size_t arity)
+{
+    TypeManglingAccess::RememberArity(compiler, mangled, arity);
+}
+
 std::string SpellType(const LLVMBackend& compiler,
                       const LLVMBackend::TypeAndValue& type)
 {

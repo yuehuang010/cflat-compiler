@@ -64,6 +64,7 @@
 #include <set>
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <string_view>
 #include <unordered_set>
 #include <format>
@@ -71,6 +72,24 @@
 namespace cflat_cinterop
 {
     using namespace clang;
+
+    struct CxxExtractionStageTimer
+    {
+        bool enabled;
+        std::string name;
+        std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+
+        CxxExtractionStageTimer(bool isEnabled, std::string stage)
+            : enabled(isEnabled), name(std::move(stage)) {}
+
+        ~CxxExtractionStageTimer()
+        {
+            if (!enabled) return;
+            const double ms = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - start).count();
+            std::cout << std::format("[verbose]   extraction stage {}: {:.3f} ms\n", name, ms);
+        }
+    };
 
     bool SplitStdFunctionSpelling(const std::string& spelling, std::string& ret,
                                   std::string& params)
@@ -1326,8 +1345,18 @@ namespace cflat_cinterop
                         (st.req.emitDefinitions || st.req.assumeInlineDefinitions)
                         && (vd->isConstexpr() || vd->isInline())
                         && vd->getDefinition() != nullptr;
-                    if (!emitLocal && (vd->isConstexpr() || vd->isInline())) continue;
-                    if (!emitLocal && vd->hasInit()) continue;
+                    // Why a static data member was left out is invisible at the use site
+                    // ("'count' does not name a value"), so name the reason under -v.
+                    auto skipStaticVar = [&](const char* why) {
+                        if (st.req.verbose)
+                            std::cout << "[verbose]   C++ static member "
+                                      << vd->getQualifiedNameAsString()
+                                      << " not bound: " << why << "\n";
+                    };
+                    if (!emitLocal && (vd->isConstexpr() || vd->isInline()))
+                    { skipStaticVar("inline or constexpr storage is emitted per TU"); continue; }
+                    if (!emitLocal && vd->hasInit())
+                    { skipStaticVar("its initializer lives in the header, so it has no library symbol"); continue; }
                     if (emitLocal && st.req.emitDefinitions)
                         st.varEmitWork.push_back(vd->getDefinition());
                     RawCxxStaticVar sv;
@@ -2400,6 +2429,9 @@ namespace cflat_cinterop
              * diagnostics non-fatal for extraction - so real CodeGen errors are the only thing
              * that can still discard the companion module.
              */
+            // An error expression can only exist in a body when this parse actually reported an
+            // error, so the whole error-containment walk below is skipped for a clean TU.
+            const bool sawParseErrors = st.ci->getDiagnostics().getNumErrors() > 0;
             st.ci->getDiagnostics().Reset(/*soft*/ true);
 
             auto inScopeDecl = [&](const Decl* d) {
@@ -2418,11 +2450,30 @@ namespace cflat_cinterop
                     == st.out.droppedCxxDefaultWrappers.end())
                     st.out.droppedCxxDefaultWrappers.push_back(std::move(name));
             };
-            auto declHasErrors = [&](const Decl* d) {
-                if (d == nullptr || d->isInvalidDecl()) return true;
-                if (const auto* fd = llvm::dyn_cast<FunctionDecl>(d))
+            /*
+             * An instantiated body can carry an ERROR EXPRESSION: libc++'s vector(size_type)
+             * value-initializes its element, so instantiating it for a class with no default
+             * constructor leaves a RecoveryExpr inside the body. CodeGen cannot lower that
+             * ("cannot compile this l-value expression yet"), and ModuleBuilder throws the WHOLE
+             * companion module away once the diagnostic engine has seen an error - which refuses
+             * every member of the requested class, not just the ill-formed one. So a body that
+             * REACHES such an expression through its call graph must stay unrequested. The walk
+             * is memoized per definition and shared by all the request loops below.
+             */
+            struct ErrorReachScan
+            {
+                std::unordered_map<const FunctionDecl*, bool> memo;
+                // Off for a translation unit that reported no error at all: no body can hold an
+                // error expression then, so the whole walk is skipped.
+                bool active = true;
+
+                // The body of THIS function contains an error expression (as opposed to
+                // reaching one through a call).
+                bool HasOwnError(const FunctionDecl* fd)
                 {
-                    struct ErrorExprVisitor : RecursiveASTVisitor<ErrorExprVisitor>
+                    if (fd == nullptr) return false;
+                    if (fd->isInvalidDecl()) return true;
+                    struct OwnErrorVisitor : RecursiveASTVisitor<OwnErrorVisitor>
                     {
                         bool found = false;
                         bool VisitExpr(Expr* expr)
@@ -2434,6 +2485,62 @@ namespace cflat_cinterop
                     if (fd->getBody() != nullptr) visitor.TraverseStmt(fd->getBody());
                     return visitor.found;
                 }
+
+                bool Reaches(const FunctionDecl* fd, unsigned depth = 0)
+                {
+                    if (fd == nullptr || depth > 64 || !active) return false;
+                    const FunctionDecl* def = nullptr;
+                    if (!fd->hasBody(def) || def == nullptr) def = fd;
+                    auto it = memo.find(def);
+                    if (it != memo.end()) return it->second;
+                    memo[def] = false;   // cycles: a body being walked counts as clean
+
+                    struct BodyVisitor : RecursiveASTVisitor<BodyVisitor>
+                    {
+                        bool found = false;
+                        std::vector<const FunctionDecl*> callees;
+
+                        bool VisitExpr(Expr* expr)
+                        {
+                            found = found || expr->containsErrors();
+                            return !found;
+                        }
+                        bool VisitCallExpr(CallExpr* call)
+                        {
+                            callees.push_back(call->getDirectCallee());
+                            return true;
+                        }
+                        bool VisitCXXConstructExpr(CXXConstructExpr* ctor)
+                        {
+                            callees.push_back(ctor->getConstructor());
+                            return true;
+                        }
+                        bool VisitDeclRefExpr(DeclRefExpr* ref)
+                        {
+                            callees.push_back(llvm::dyn_cast<FunctionDecl>(ref->getDecl()));
+                            return true;
+                        }
+                    } visitor;
+                    if (def->isInvalidDecl()) { memo[def] = true; return true; }
+                    if (def->getBody() != nullptr) visitor.TraverseStmt(def->getBody());
+                    bool bad = visitor.found;
+                    for (const FunctionDecl* callee : visitor.callees)
+                    {
+                        if (bad) break;
+                        if (callee == nullptr || callee == def) continue;
+                        bad = Reaches(callee, depth + 1);
+                    }
+                    memo[def] = bad;
+                    return bad;
+                }
+            };
+            auto errorReach = std::make_shared<ErrorReachScan>();
+            errorReach->active = sawParseErrors;
+            auto declHasErrors = [errorReach](const Decl* d) {
+                if (d == nullptr || d->isInvalidDecl()) return true;
+                if (const auto* fd = llvm::dyn_cast<FunctionDecl>(d))
+                    return errorReach->active ? errorReach->Reaches(fd)
+                                              : errorReach->HasOwnError(fd);
                 if (const auto* vd = llvm::dyn_cast<VarDecl>(d))
                     return vd->getInit() != nullptr && vd->getInit()->containsErrors();
                 return false;
@@ -2456,6 +2563,21 @@ namespace cflat_cinterop
                     rememberDroppedWrapper(llvm::dyn_cast<FunctionDecl>(d));
                     return;
                 }
+                // The extern "C" half of a default wrapper only forwards to the C++ half. If that
+                // half was dropped (its forwarded call did not compile), emitting the forwarder
+                // leaves a call to a symbol nothing defines, and the final link fails on it.
+                if (const auto* fd = llvm::dyn_cast<FunctionDecl>(d))
+                {
+                    std::string name = fd->getNameAsString();
+                    if (name.starts_with("__cflat_dflt_"))
+                    {
+                        if (name.ends_with("_cpp")) name.resize(name.size() - 4);
+                        if (std::find(st.out.droppedCxxDefaultWrappers.begin(),
+                                      st.out.droppedCxxDefaultWrappers.end(), name)
+                            != st.out.droppedCxxDefaultWrappers.end())
+                            return;
+                    }
+                }
                 if (st.req.emitDefinitions && isDependentCodeGenDecl(d))
                 {
                     if (st.req.verbose)
@@ -2469,6 +2591,44 @@ namespace cflat_cinterop
                 }
                 cg.HandleTopLevelDecl(DeclGroupRef(d));
             };
+
+            /*
+             * Phase 0. An instantiated body that came out with an error expression in it (libc++
+             * value-initializing an element type that has no default constructor, say) cannot be
+             * lowered: CodeGen raises "cannot compile this l-value expression yet" and
+             * ModuleBuilder then throws the WHOLE companion module away, which refuses every
+             * member of the requested class instead of the ill-formed one. Skipping the request
+             * is not enough - Clang emits a deferred body whenever another emitted body
+             * references it. So give those bodies an EMPTY one: the module survives, and no
+             * correct copy of such a specialization can exist anywhere to be displaced by ODR
+             * merging, since the instantiation is ill-formed in every translation unit. Every
+             * member that REACHES one is refused below, so cflat never calls into the empty body.
+             */
+            struct ErrorBodySweep : RecursiveASTVisitor<ErrorBodySweep>
+            {
+                ErrorReachScan& scan;
+                std::vector<FunctionDecl*> direct;
+
+                explicit ErrorBodySweep(ErrorReachScan& s) : scan(s) {}
+                bool shouldVisitTemplateInstantiations() const { return true; }
+                bool VisitFunctionDecl(FunctionDecl* fd)
+                {
+                    if (fd == nullptr || !fd->doesThisDeclarationHaveABody()) return true;
+                    // Memoize the whole call graph BEFORE any body is emptied, so a later query
+                    // cannot mistake an emptied body for a clean one.
+                    if (scan.Reaches(fd) && scan.HasOwnError(fd)) direct.push_back(fd);
+                    return true;
+                }
+            } errorBodies(*errorReach);
+            errorBodies.TraverseDecl(ctx.getTranslationUnitDecl());
+            for (Decl* d : st.announcedDecls) errorBodies.TraverseDecl(d);
+            for (FunctionDecl* fd : errorBodies.direct)
+            {
+                if (st.req.verbose)
+                    std::cout << "[verbose]   C++ body emptied, its instantiation reported an "
+                                 "error: " << fd->getQualifiedNameAsString() << "\n";
+                fd->setBody(CompoundStmt::CreateEmpty(ctx, /*NumStmts*/ 0, /*HasFPFeatures*/ false));
+            }
 
             // Phase 1: show Clang the whole translation unit. Inline definitions stay deferred.
             for (Decl* d : ctx.getTranslationUnitDecl()->decls())
@@ -2553,8 +2713,17 @@ namespace cflat_cinterop
                 bool shouldVisitTemplateInstantiations() const { return true; }
                 bool VisitFunctionDecl(FunctionDecl* fd)
                 {
+                    // Anything whose definition this module would have to provide itself: an
+                    // internal-linkage helper (libc++'s _LIBCPP_HIDE_FROM_ABI), an inline body, or
+                    // a template instantiation. A plain external non-inline function is NOT
+                    // promoted - the bound library exports that strong symbol already.
+                    const bool ownDefinitionNeeded = fd != nullptr
+                        && (fd->hasAttr<AlwaysInlineAttr>() || fd->hasAttr<InternalLinkageAttr>()
+                            || fd->isInlined()
+                            || fd->getTemplateSpecializationKind() == TSK_ImplicitInstantiation
+                            || fd->getFormalLinkage() == Linkage::Internal);
                     if (fd == nullptr || llvm::isa<CXXMethodDecl>(fd) || !fd->hasBody()
-                        || !fd->isUsed() || !fd->hasAttr<AlwaysInlineAttr>()
+                        || !fd->isUsed() || !ownDefinitionNeeded
                         || fd->getType()->isDependentType()
                         || fd->getDeclContext()->isDependentContext())
                         return true;
@@ -2592,6 +2761,10 @@ namespace cflat_cinterop
             }
 
             // Phase 3: flush. This emits the deferred definitions and finalizes the module.
+            if (st.req.verbose)
+                std::cout << std::format(
+                    "[verbose]   extraction codegen flush: {} clang error(s) so far\n",
+                    ctx.getDiagnostics().getClient()->getNumErrors());
             cg.HandleTranslationUnit(ctx);
 
             llvm::Module* mod = cg.GetModule();
@@ -2616,6 +2789,20 @@ namespace cflat_cinterop
                 RawRecord& rec = st.out.records[w.recordIdx];
                 if (w.memberIdx >= rec.members.size()) continue;
                 RawCxxMember& m = rec.members[w.memberIdx];
+                /*
+                 * Refuse a member whose instantiation, or anything it calls, Clang reported an
+                 * error in (Phase 0 above). Its body is gone or empty, so binding it would call
+                 * into nothing; the rest of the class stays usable.
+                 */
+                if (w.md != nullptr && errorReach->Reaches(w.md))
+                {
+                    if (m.bindRefusal.empty())
+                        m.bindRefusal = "cannot be instantiated for these template arguments "
+                                        "(clang reported an error inside the body it generated)";
+                    m.linkageName.clear();
+                    m.abi = RawAbi{};
+                    continue;
+                }
                 if (!m.needsLocalDefinition || m.linkageName.empty()) continue;
                 /*
                  * getNamedValue, not getFunction: on Itanium the COMPLETE-object destructor (D1) of
@@ -2658,6 +2845,8 @@ namespace cflat_cinterop
 
             {
                 llvm::raw_string_ostream os(st.out.bitcode);
+                CxxExtractionStageTimer serialize(st.req.verbose && st.req.cxxMode,
+                                                  "bitcode serialization");
                 llvm::WriteBitcodeToFile(*mod, os);
                 os.flush();
             }
@@ -2687,13 +2876,19 @@ namespace cflat_cinterop
             void HandleTranslationUnit(ASTContext& ctx) override
             {
                 DeclVisitor v(ctx, st);
-                if (st.req.cxxTypeRequests.empty() && st.req.cxxFunctionWrapperNames.empty())
-                    v.TraverseDecl(ctx.getTranslationUnitDecl());
-                else if (!st.req.cxxTypeRequests.empty()) v.ProcessTypeRequests();
-                else v.ProcessFunctionRequests();
+                {
+                    CxxExtractionStageTimer harvest(st.req.verbose && st.req.cxxMode,
+                                                     "record/sig harvest");
+                    if (st.req.cxxTypeRequests.empty() && st.req.cxxFunctionWrapperNames.empty())
+                        v.TraverseDecl(ctx.getTranslationUnitDecl());
+                    else if (!st.req.cxxTypeRequests.empty()) v.ProcessTypeRequests();
+                    else v.ProcessFunctionRequests();
+                }
                 if (st.req.cxxMode)
                 {
                     llvm::TimeTraceScope abiScope("CxxAbiArrange");
+                    CxxExtractionStageTimer codegen(st.req.verbose,
+                                                     "stage-2 CodeGen/companion emission");
                     ComputeCxxAbi(st, ctx);
                 }
             }
@@ -2908,6 +3103,8 @@ namespace cflat_cinterop
         {
             {
                 llvm::TimeTraceScope prepassScope("MacroPrepass", req.mainFileName);
+                CxxExtractionStageTimer parseStage(req.verbose && req.cxxMode,
+                                                   "clang parse stage 1");
                 PrepassAction prepass(st);
                 if (!RunAction(req, req.source, prepass, err)) return false;
             }
@@ -2915,6 +3112,8 @@ namespace cflat_cinterop
             // Append a value/type probe per discovered object-like macro to the main stub.
             {
                 llvm::TimeTraceScope probeScope("BuildMacroProbes", req.mainFileName);
+                CxxExtractionStageTimer probeStage(req.verbose && req.cxxMode,
+                                                   "macro probes");
                 std::string probes;
                 probes.reserve(st.probes.size() * 48);
                 for (size_t i = 0; i < st.probes.size(); ++i)
@@ -2941,6 +3140,8 @@ namespace cflat_cinterop
         // Stage 2: the single full parse - harvests decls and reads the probe VarDecls.
         {
             llvm::TimeTraceScope parseScope("FullParse", req.mainFileName.empty() ? req.realPath : req.mainFileName);
+            CxxExtractionStageTimer parseStage(req.verbose && req.cxxMode,
+                                               "clang parse stage 2");
             ExtractAction extract(st);
             bool ok = RunAction(req, fullSource, extract, err, &out.prereqErrors,
                                 &out.firstPrereqError, &out);

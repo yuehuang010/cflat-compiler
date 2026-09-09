@@ -789,6 +789,37 @@ Real-world round 3: simdjson On Demand, 2026-09-08 (main checkout, on top of e0e
 - Not a bug, worth knowing: a JSON literal's braces are CFlat interpolation; write `{{`.
 Result: prints 42; DOM spikes and the ImGui spike unchanged. Suite 864.
 
+Real-world round 4: package ladder toward libtorch, 2026-09-08 (fmt -> nlohmann-json ->
+Eigen -> libtorch; spikes under scratch/ladder/). Landed on master, in order:
+- 50b89148: unnamed nested enums bind as plain int constants; alias specializations bind
+  lazily by C++ spelling; ctor selection ranks exact matches; std::nullptr_t params refused.
+- cd72465a: lazily requested alias types bind fully (`nlohmann::json` parse/dump spike).
+- a0fd0709: function templates called through deduction wrappers `__cflat_tpl_<k>`
+  (free/static/instance, explicit type args). fmt spikes format_int / to_string pass.
+- ca566c26: brace-list arguments expand to N scalar wrapper params re-braced in the body.
+- 91c31385: dependent declarations filtered before CodeGen (Eigen Vector3d spike passes).
+- 19607efe: extraction passes `-std=<cppStandard_>` (default c++20; libtorch needs
+  `requires`); prerequisite errors name file:line.
+- f5e8fa38: implicit and defaulted special members of in-scope header records are declared
+  and defined through Sema before ABI/CodeGen (cache v37; fixture M25).
+- ac1f9605: at C++20 an ill-formed instantiated member (vector<T>(size_type) for a T without
+  default ctor) made ModuleBuilder drop the whole companion module; error-reaching bodies are
+  now emptied and refused individually. `a != b` binds `operator==` negated when no `!=`
+  exists (C++20 rewritten candidate; applies to cflat structs too - flag for a ruling).
+- 6cbb7455: callback ABI plans refused per symbol (local sink), linkage collisions refused per
+  symbol, `-v` extraction stage timings, alias-of-specialization and free-function signatures
+  bound lazily on first use (torch extraction 1225 s -> 50 s), ctor primitive-pointer synonyms,
+  record-returning default wrappers. Fixtures M26-M28.
+- dca147e0: companion-origin linkonce/weak definitions internalized after the companion link
+  plus GlobalDCE at every -O (dead inline bodies dragged 244 undefined symbols); used libc++
+  helpers promoted into the companion; lazily requested specializations rebind members an
+  earlier plain-name registration refused. Fixture M29.
+State: scratch/ladder/torch/t1.cb (`torch.ones(shape).numel()`) compiles in 54 s, links and
+prints numel=3. Next gaps (t2.cb sum spike): free C++ operators (`operator+` on Tensor) are not
+bound and fall into invalid struct arithmetic; member calls get no default-argument wrappers
+(`t.sum()` omitting dtype); `c10::Scalar` has no layout because a union field of an unrequested
+specialization (`c10::complex<double>`) records no size/align for the opaque-blob fallback.
+
 Open: per-import `std` clause or CLI-only; exceptions option at M8 start; MSVC ABI pass.
 Open from the M5 review (2026-09-06):
 - LSP and template CodeGen: type requests still run stage-2 CodeGen under the LSP so the

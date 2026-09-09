@@ -156,6 +156,16 @@ namespace cppi
 
     int read_pair(const Pair* p) noexcept { return p->a + p->b; }
 
+    int abi_takes_refused_callback(AbiRefusedCallback cb) noexcept { return cb == nullptr ? -1 : 0; }
+    int abi_neighbour(int value) noexcept { return value + 100; }
+
+    DefaultPair default_pair(int a, int extra) noexcept { return DefaultPair{ a, extra }; }
+
+    PointerCount::PointerCount(const long long* values, unsigned long count) noexcept
+        : values_(values), count_(count) {}
+    PointerCount::~PointerCount() noexcept {}
+    long long PointerCount::first() const noexcept { return count_ == 0 ? 0 : values_[0]; }
+
     Small small_bump(Small v) noexcept
     {
         Small r; r.a = (signed char)(v.a + 1); r.b = (unsigned char)(v.b + 1); return r;

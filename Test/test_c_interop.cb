@@ -91,6 +91,11 @@
 //   Section M24 (787)    : dependent function-pointer ABI types in an uninstantiated template.
 //   Section M25 (788-791): C++ header-walk implicit and defaulted special members - local
 //                       destruction, copy/move construction, and a defaulted destructor.
+//   Section M26 (792)    : a refused callback ABI plan does not abort the header import.
+//   Section M27 (793)    : a constructor binds a primitive pointer spelled as a CFlat synonym.
+//   Section M28 (794)    : a default-argument wrapper for a function returning a record.
+//   Section M29 (795)    : an unreferenced inline body calling an undefined symbol is dropped
+//                       before the link; its inline neighbour still binds and runs.
 
 import "library/c_alias_order_alias.h";
 import "library/c_alias_order_real.h";
@@ -2009,6 +2014,28 @@ extern int main()
     if (m25c.id != 3 || strcmp(m25c.cname(), "abc") != 0) return 790;
     cppt.Defaulted m25d = default;
     if (m25d.n() != 0)                              return 791;
+
+    // Section M26. cppi.AbiRefusedCallback returns a class whose layout CFlat cannot reproduce,
+    // so its ABI plan is refused. The refusal is per callback type: the neighbour declared right
+    // after it in the same header is still bound and callable.
+    if (cppi.abi_neighbour(7) != 107)               return 792;
+
+    // Section M27. 'long*' binds the 'const long long*' constructor parameter: same width, same
+    // signedness, same pointer ABI. c10::IntArrayRef is constructed exactly this way.
+    long m26value = 17;
+    cppi.PointerCount* m26 = new cppi.PointerCount(&m26value, 1);
+    if (m26.first() != 17)                          return 793;
+    delete m26;
+
+    // Section M28. The omitted default is not a constant, so the call goes through the generated
+    // wrapper - and the wrapper returns a record by value.
+    cppi.DefaultPair m27 = cppi.default_pair(4);
+    if (m27.a != 4 || m27.b != cppi.default_extra()) return 794;
+
+    // Section M29. cppi.calls_missing_symbol is an inline body whose callee is declared and
+    // never defined; nothing here calls it, so it must not reach the linker. Its neighbour,
+    // an ordinary inline function, is called and must run.
+    if (cppi.missing_symbol_neighbour(5) != 16)     return 795;
 
     return 0;
 }

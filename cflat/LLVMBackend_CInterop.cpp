@@ -38,6 +38,7 @@
 #include <optional>
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <fstream>
 #include <map>
 #include <set>
@@ -53,6 +54,33 @@
 #endif
 
 // ---- Definitions moved out of LLVMBackend.h (CInterop) ----
+
+// Scoped wall-clock timer for one stage of a C++ header import. Prints under -v only.
+struct CxxExtractionStageTimer
+{
+        bool enabled;
+        std::string name;
+        std::optional<size_t> count;
+        std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+
+        CxxExtractionStageTimer(bool isEnabled, std::string stage,
+                                std::optional<size_t> itemCount = std::nullopt)
+            : enabled(isEnabled), name(std::move(stage)), count(itemCount) {}
+
+        ~CxxExtractionStageTimer()
+        {
+            if (!enabled) return;
+            const double ms = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - start).count();
+            if (count.has_value())
+                std::cout << std::format(
+                    "[verbose]   extraction stage {}: {:.3f} ms (count: {})\n",
+                    name, ms, *count);
+            else
+                std::cout << std::format("[verbose]   extraction stage {}: {:.3f} ms\n",
+                                         name, ms);
+        }
+};
 
 // Whitespace-insensitive key for a C++ type spelling: Clang and the C type mapper disagree only
 // about spaces inside a template argument list.
@@ -1196,6 +1224,27 @@ bool LLVMBackend::HashFileContents(const std::string& path, uint64_t& outHash) c
         return HashFileFnv1a(path, outHash);
     }
 
+/*
+ * Deferred binding gate. A C++ import declares every free function its umbrella header reaches, so
+ * the types those signatures name are no longer instantiated eagerly (each instantiation is a pair
+ * of full re-parses). A signature is declared here only when every class it names is already
+ * registered; otherwise it stays in cxxFunctionSignatures_ and TryBindCxxFunction requests the
+ * missing types the first time CFlat code names the function.
+ */
+bool LLVMBackend::CxxSignatureTypesRegistered(const CSigEntry& e)
+{
+        auto known = [&](const std::string& spelling) {
+            std::string identity, named;
+            const int kind = ClassifyCxxSignatureSpelling(spelling, nullptr, identity, named);
+            if (kind != 1 && kind != 2) return true;   // 0 = nothing to request, 3 = unmappable
+            return IsCxxForeignTypeRegistered(identity) || IsDataStructure(identity);
+        };
+        if (!known(e.retSpelling)) return false;
+        for (const std::string& spelling : e.paramSpellings)
+            if (!known(spelling)) return false;
+        return true;
+}
+
 void LLVMBackend::RegisterCSignatures(const std::vector<CSigEntry>& sigs, const std::string& fileForLsp,
                              const std::string& programAlias)
 {
@@ -1218,6 +1267,8 @@ void LLVMBackend::RegisterCSignatures(const std::vector<CSigEntry>& sigs, const 
                 cxxBindingRefusals_[e.name] = e.bindRefusal;
                 continue;
             }
+            // Deferred binding: declare this signature once its C++ types exist, not before.
+            if (e.isCxx && !CxxSignatureTypesRegistered(e)) continue;
             std::string regName  = e.name;
             if (e.isCxx)
             {
@@ -1408,8 +1459,13 @@ void LLVMBackend::RegisterCSignatures(const std::vector<CSigEntry>& sigs, const 
             // refusal path because a wrapper cannot safely reproduce private member access.
             if (e.isCxx && e.defaultArgs.size() == e.params.size())
             {
+                // With clang's own arrangement in hand a record is fine on either side: the
+                // wrapper has the SAME return type and a PREFIX of the parameter types, and every
+                // ABI cflat targets classifies each argument independently, so the plan's slots
+                // truncate exactly. Without a plan, keep the old scalar/pointer-only rule.
+                const bool havePlan = e.abi.valid && e.abi.params.size() == e.params.size();
                 const auto canWrap = [&](const TypeAndValue& t) {
-                    return t.Pointer || !dataStructures.count(t.TypeName);
+                    return havePlan || t.Pointer || !dataStructures.count(t.TypeName);
                 };
                 if (canWrap(e.ret))
                     for (size_t n = 0; n < e.params.size(); ++n)
@@ -1423,11 +1479,33 @@ void LLVMBackend::RegisterCSignatures(const std::vector<CSigEntry>& sigs, const 
                         if (!supported) continue;
                         std::vector<TypeAndValue> prefix(e.params.begin(), e.params.begin() + n);
                         const std::string wrapper = CxxDefaultWrapperName(e.linkageName, n);
+                        cflat_cinterop::RawAbi wrapperPlan;
+                        if (havePlan)
+                        {
+                            wrapperPlan = e.abi;
+                            wrapperPlan.params.resize(n);
+                            // The cross-check text describes the FULL arity; the truncated plan
+                            // has no matching text, so the slot-by-slot build stands on its own.
+                            wrapperPlan.fnTypeText.clear();
+                        }
+                        std::string wrapperMismatch;
                         CInteropDeclarationScope declaringFile(*this,
                             e.file.empty() ? fileForLsp : e.file);
-                        CreateFunctionDeclaration(regName, e.ret, prefix, /*external=*/true,
-                            /*varargs=*/false, /*returnsOwned=*/false, /*isMethod=*/false,
-                            CallingConv::Cdecl, wrapper, /*isCxx=*/true, e.isNoexcept);
+                        {
+                            CxxAbiPlanScope wrapperAbi(*this, havePlan ? &wrapperPlan : nullptr,
+                                                       &wrapperMismatch);
+                            CreateFunctionDeclaration(regName, e.ret, prefix, /*external=*/true,
+                                /*varargs=*/false, /*returnsOwned=*/false, /*isMethod=*/false,
+                                CallingConv::Cdecl, wrapper, /*isCxx=*/true, e.isNoexcept);
+                        }
+                        if (!wrapperMismatch.empty())
+                        {
+                            if (verbose)
+                                std::cout << std::format(
+                                    "[verbose]   C++ default wrapper {} not bound: {}\n",
+                                    wrapper, wrapperMismatch);
+                            continue;
+                        }
                         if (auto wit = functionTable.find(regName); wit != functionTable.end())
                             for (FunctionSymbol& sym : wit->second)
                                 if (sym.External && sym.UniqueName == wrapper)
@@ -2006,9 +2084,20 @@ void LLVMBackend::RegisterCxxFunctionPointerAbis(
                 plan.params.push_back(std::move(p));
             }
             if (plan.params.size() != raw.paramTypes.size()) continue;
+            // A callback ABI plan describes a function POINTER type, not a declaration a CFlat
+            // call site can name, so there is nothing to attach a refusal to. Route the refusal
+            // into a local sink: the unsupported plan stays out of the registry and the import
+            // survives instead of failing the whole header.
+            std::string abiMismatch;
+            CxxAbiPlanScope abiPlan(*this, &raw.abi, &abiMismatch);
             if (!BuildAbiRecipeFromClangPlan(raw.signature, raw.abi, plan.ret, plan.params,
                                              plan.recipe))
+            {
+                if (verbose && !abiMismatch.empty())
+                    std::cout << std::format("[verbose]   C++ callback {} not bound: {}\n",
+                                             raw.signature, abiMismatch);
                 continue;
+            }
             cxxFunctionPointerAbiPlans_.emplace(
                 FunctionPointerAbiKey(plan.ret, plan.params), std::move(plan));
         }
@@ -2233,20 +2322,19 @@ void LLVMBackend::RegisterTypeAliasSymbols(const std::vector<CTypeAliasEntry>& a
         };
         for (const auto& a : aliases)
         {
-            // An alias of a specialization whose arguments have no CFlat spelling (defaulted or
-            // library-internal) is requested lazily by its C++ spelling, under the alias's name.
+            // A C++ alias of a specialization is a DECLARATION, not a reason to instantiate the
+            // class while importing an umbrella header: an umbrella like torch/torch.h names
+            // hundreds of them and each instantiation is a pair of full re-parses. Record the
+            // spelling and request it on first use of the CFlat name instead.
             if (!a.cxxSpecialization.empty() && !a.qualifiedName.empty() && !a.isCxxAliasTemplate)
             {
-                std::string base, identity;
-                std::vector<std::string> args;
-                if (!cxxIdentity(a, base, args, identity))
-                {
-                    cxxLazyAliasSpecializations_.emplace(a.qualifiedName, a.cxxSpecialization);
-                    if (a.name != a.qualifiedName)
-                        cxxLazyAliasSpecializations_.emplace(a.name, a.cxxSpecialization);
-                    RegisterTypeAliasSymbol(a.qualifiedName, a.cxxSpecialization, a.file, a.line, a.col);
-                    continue;
-                }
+                cxxLazyAliasSpecializations_.emplace(a.qualifiedName, a.cxxSpecialization);
+                if (a.name != a.qualifiedName)
+                    cxxLazyAliasSpecializations_.emplace(a.name, a.cxxSpecialization);
+                RegisterTypeAliasSymbol(a.qualifiedName, a.cxxSpecialization, a.file, a.line, a.col);
+                if (a.name != a.qualifiedName)
+                    RegisterTypeAliasSymbol(a.name, a.cxxSpecialization, a.file, a.line, a.col);
+                continue;
             }
             if (!a.target.empty() && a.target != a.name)
             {
@@ -2578,7 +2666,7 @@ bool LLVMBackend::ExtractCHeaderClang(const std::vector<std::string>& headerPath
         req.emitDefinitions    = cxxMode && symbolSink_ == nullptr;
         req.assumeInlineDefinitions = cxxMode && !req.emitDefinitions;
         req.skipFunctionBodies = !req.emitDefinitions;
-        req.wantIncludes   = (outIncludes != nullptr);
+        req.wantIncludes   = (outIncludes != nullptr) || cxxMode;
         req.verbose        = verbose;
 
         // Expand um/<->shared/ siblings: the Windows SDK splits its surface across both and
@@ -2624,6 +2712,36 @@ bool LLVMBackend::ExtractCHeaderClang(const std::vector<std::string>& headerPath
             return false;
         }
         SetCInteropTargetFacts(raw);
+        if (cxxMode && activeCxxRequestGroup_ != nullptr)
+        {
+            // Signature types are bound on first lookup now, so a namespace that only appears in
+            // a signature spelling (c10 behind torch::ones) has no walked record to seed it. Seed
+            // from the spellings and from the included headers, or a later on-demand request
+            // cannot resolve the namespace.
+            auto seedNamespace = [&](const std::string& spelling) {
+                size_t end = spelling.find("::");
+                if (end == std::string::npos || end == 0) return;
+                std::string lead = spelling.substr(0, end);
+                while (!lead.empty() && (lead.front() == ' ' || lead.front() == '*'))
+                    lead.erase(lead.begin());
+                if (lead.empty()) return;
+                cxxForeignNamespaces_.insert(lead);
+                if (activeCxxRequestGroup_->primary < cxxImportGroups_.size())
+                    cxxImportGroups_[activeCxxRequestGroup_->primary].namespaces.insert(lead);
+            };
+            for (const auto& sig : raw.sigs)
+            {
+                seedNamespace(sig.retType);
+                for (const auto& param : sig.paramTypes) seedNamespace(param);
+            }
+            for (const auto& included : raw.includedFiles)
+            {
+                CollectHeaderNamespaceNames(included, cxxForeignNamespaces_);
+                if (activeCxxRequestGroup_->primary < cxxImportGroups_.size())
+                    CollectHeaderNamespaceNames(
+                        included, cxxImportGroups_[activeCxxRequestGroup_->primary].namespaces);
+            }
+        }
         if (outLongDoubleWidth) *outLongDoubleWidth = raw.longDoubleWidth;
         if (outLongDoubleIsIEEEDouble)
             *outLongDoubleIsIEEEDouble = raw.longDoubleIsIEEEDouble;
@@ -2636,7 +2754,11 @@ bool LLVMBackend::ExtractCHeaderClang(const std::vector<std::string>& headerPath
         // definitions.
         if (cxxMode && req.emitDefinitions)
         {
-            const std::string wrappers = BuildCxxDefaultWrappers(raw.sigs);
+            std::string wrappers;
+            {
+                CxxExtractionStageTimer wrapperStage(verbose, "default-wrapper generation");
+                wrappers = BuildCxxDefaultWrappers(raw.sigs);
+            }
             if (!wrappers.empty())
             {
                 cflat_cinterop::ExtractRequest wrappedReq = req;
@@ -2650,7 +2772,12 @@ bool LLVMBackend::ExtractCHeaderClang(const std::vector<std::string>& headerPath
                 wrappedReq.wantIncludes = false;
                 cflat_cinterop::ExtractResult wrapped;
                 std::string wrappedError;
-                if (!cflat_cinterop::ExtractCInterop(wrappedReq, wrapped, wrappedError))
+                bool wrapperOk = false;
+                {
+                    CxxExtractionStageTimer wrapperParse(verbose, "default-wrapper second parse");
+                    wrapperOk = cflat_cinterop::ExtractCInterop(wrappedReq, wrapped, wrappedError);
+                }
+                if (!wrapperOk)
                 {
                     if (verbose)
                         std::cout << std::format("[verbose]   default wrapper extraction failed: {}\n",
@@ -2742,6 +2869,8 @@ bool LLVMBackend::ExtractCHeaderClang(const std::vector<std::string>& headerPath
         // closure so dependency structs (e.g. POINT for MSG) are included but unrelated ones aren't.
         {
             llvm::TimeTraceScope recordScope("RegisterCRecords", headerPath);
+            CxxExtractionStageTimer recordStage(verbose && cxxMode,
+                                                "backend record/member registration");
             PruneRecordsToNeededClosure(raw);
             MapRawRecords(raw, outRecords);
             RegisterCRecords(outRecords, headerPath);
@@ -2756,6 +2885,8 @@ bool LLVMBackend::ExtractCHeaderClang(const std::vector<std::string>& headerPath
 
         {
             llvm::TimeTraceScope sigScope("MapSignatures", headerPath);
+            CxxExtractionStageTimer sigStage(verbose && cxxMode,
+                                             "backend signature registration");
             // Enums register after signatures; name them so a signature never requests one.
             std::unordered_set<std::string> localEnums;
             for (const auto& re : raw.enums)
@@ -2766,19 +2897,18 @@ bool LLVMBackend::ExtractCHeaderClang(const std::vector<std::string>& headerPath
                 // Clang frontends instead of two per spelling. The loop below then replays each
                 // request off the cache the batch filled.
                 PublishCxxGroupNames(activeCxxRequestGroup_->primary, outRecords);
-                std::vector<CxxRequestItem> batch;
-                for (const auto& rs : raw.sigs)
-                {
-                    if (rs.name.starts_with("__cflat_dflt_")) continue;
-                    CollectCxxSignatureRequestItems(rs, &localEnums, batch);
-                }
-                PrewarmCxxRequestBatch(std::move(batch));
             }
             for (const auto& rs : raw.sigs)
             {
                 if (cxxMode && rs.name.starts_with("__cflat_dflt_")) continue;
                 cflat_cinterop::RawSig mappedRaw = rs;
-                const bool requested = RequestCxxSignatureTypes(rs, &localEnums);
+                // A C++ import declares every free function the umbrella header reaches. Asking
+                // for the types they name instantiates hundreds of specializations no CFlat line
+                // ever mentions, each one a pair of full re-parses. Bind those signatures on
+                // first LOOKUP instead (TryBindCxxFunction); the C path stays eager.
+                bool requested = false;
+                if (!cxxMode || activeCxxRequestGroup_ == nullptr)
+                    requested = RequestCxxSignatureTypes(rs, &localEnums);
                 if (requested && rs.isCxx && rs.abi.valid)
                     mappedRaw.bindRefusal.clear();
                 CSigEntry e;
@@ -4357,10 +4487,87 @@ std::vector<size_t> LLVMBackend::CandidateCxxGroupsFor(const std::string& cxxBas
         return order;
     }
 
+/*
+ * On-demand counterpart of the deferred signature binding above: a C++ free function is bound the
+ * first time CFlat code looks its name up, requesting only the types ITS signature names. One
+ * attempt per name - a signature that cannot be mapped stays unbound and the caller falls back to
+ * the ordinary "undefined function" path.
+ */
+bool LLVMBackend::TryBindCxxFunction(const std::string& functionName)
+{
+        // Not gated on the name being unbound: one overload may have bound eagerly (its types
+        // were already registered) while a sibling still needs its type requested, and an
+        // incomplete overload set turns a precise diagnostic into "no overload matches".
+        auto sigIt = cxxFunctionSignatures_.find(functionName);
+        if (sigIt == cxxFunctionSignatures_.end()) return false;
+        if (!cxxFunctionBindAttempts_.insert(functionName).second) return false;
+
+        auto groupIt = cxxFunctionOwnerGroup_.find(functionName);
+        if (groupIt == cxxFunctionOwnerGroup_.end()) return false;
+        CxxRequestGroup group = MakeCxxRequestGroup(groupIt->second, {});
+        if (group.headers.empty()) return false;
+        CxxRequestGroupScope groupScope(*this, &group);
+
+        std::vector<CSigEntry> bound;
+        for (const CSigEntry& stored : sigIt->second)
+        {
+            cflat_cinterop::RawSig raw;
+            raw.name = stored.name;
+            raw.linkageName = stored.linkageName;
+            raw.retType = stored.retSpelling;
+            raw.paramTypes = stored.paramSpellings;
+            for (const TypeAndValue& param : stored.params)
+                raw.paramNames.push_back(param.VariableName);
+            raw.defaultArgs = stored.defaultArgs;
+            raw.variadic = stored.variadic;
+            raw.isCxx = stored.isCxx;
+            raw.isNoexcept = stored.isNoexcept;
+            raw.abi = stored.abi;
+            raw.file = stored.file;
+            raw.line = stored.line;
+            raw.col = stored.col;
+            RequestCxxSignatureTypes(raw);
+            CSigEntry mapped;
+            if (!MapRawSig(raw, mapped)) continue;
+            // A signature that is still unmappable keeps the wording of the refusal recorded at
+            // import time: that one was built from the extractor's own parameter names, which a
+            // remap from the stored spellings cannot reproduce.
+            if (!mapped.bindRefusal.empty() && !stored.bindRefusal.empty())
+                mapped.bindRefusal = stored.bindRefusal;
+            bound.push_back(std::move(mapped));
+        }
+        if (!bound.empty())
+            RegisterCSignatures(bound, group.headers.front());
+        return functionTable.find(functionName) != functionTable.end();
+}
+
+/*
+ * A foreign identity is assembled directly from a C++ spelling (AutoCxxForeignIdentity), not
+ * through MangleGenericInstance, so the demangler has no argument count for it and every
+ * diagnostic would print the raw mangled name (`std.array$int$.4`). Record the count here.
+ */
+void LLVMBackend::RememberCxxMangledArity(const std::string& cflatName,
+                                          const std::string& cxxSpelling) const
+{
+        const size_t open = cxxSpelling.find('<');
+        if (open == std::string::npos || cflatName.find('$') == std::string::npos) return;
+        size_t depth = 0;
+        size_t args = 1;
+        for (size_t i = open; i < cxxSpelling.size(); ++i)
+        {
+            const char c = cxxSpelling[i];
+            if (c == '<' || c == '(') ++depth;
+            else if (c == '>' || c == ')') { if (--depth == 0) break; }
+            else if (c == ',' && depth == 1) ++args;
+        }
+        RememberMangledArity(*this, cflatName, args);
+}
+
 bool LLVMBackend::RequestCxxForeignType(const std::string& cflatName, const std::string& cxxSpelling,
                                         std::string& error, bool needDefinitions,
                                         bool explicitInstantiation, bool tentative)
 {
+        RememberCxxMangledArity(cflatName, cxxSpelling);
         // One attempt per CFlat identity per analysis; the outcome (including the diagnostic text)
         // is replayed so a second use site reports the same reason without re-parsing libc++.
         if (auto it = cxxForeignRequests_.find(cflatName); it != cxxForeignRequests_.end()
@@ -4536,6 +4743,34 @@ bool LLVMBackend::RequestCxxForeignType(const std::string& cflatName, const std:
                 if (group.primary != static_cast<size_t>(-1))
                     cxxTypeOwnerGroup_[cflatName] = group.primary;
                 if (needDefinitions) cxxForeignDefinitions_.insert(cflatName);
+                /*
+                 * The identity this aliases onto may have been registered from a translation unit
+                 * that had no body for a member (a .cpp importing an explicit instantiation
+                 * registers the specialization before any CFlat line asks for it, and clang
+                 * instantiates member bodies lazily). THIS request did instantiate them, so bind
+                 * exactly the members that were refused - one filtered registration each, the same
+                 * mechanism TryBindRefusedCxxMember uses.
+                 */
+                if (auto infoIt = cxxClasses_.find(known->second); infoIt != cxxClasses_.end()
+                    && !infoIt->second.refusedMembers.empty())
+                {
+                    CRecordEntry rebound = registeredTarget;
+                    rebound.name = known->second;
+                    std::vector<std::string> rebindable;
+                    for (const auto& m : rebound.members)
+                        if (m.bindRefusal.empty() && !m.isDeleted && !m.linkageName.empty()
+                            && infoIt->second.refusedMembers.count(m.name) != 0)
+                            rebindable.push_back(m.name);
+                    if (!rebindable.empty() && !requestBitcode.empty() && symbolSink_ == nullptr)
+                        AdoptCxxCompanionBitcode(requestBitcode);
+                    for (const auto& memberName : rebindable)
+                    {
+                        RegisterCxxClassMembers(rebound, group.headers.front(), memberName);
+                        if (auto updated = cxxClasses_.find(known->second);
+                            updated != cxxClasses_.end())
+                            updated->second.refusedMembers.erase(memberName);
+                    }
+                }
                 return true;
             }
 
@@ -4658,6 +4893,10 @@ void LLVMBackend::PrewarmCxxRequestBatch(std::vector<CxxRequestItem> items)
                 extra += BuildStdFunctionCtorUse(pending[i].cxxSpelling, marker);
             }
             llvm::TimeTraceScope stage2("CxxRequestStage2", group.label);
+            if (verbose)
+                for (size_t i : fullItems)
+                    std::cout << std::format("[verbose]   C++ type request batch member: {}\n",
+                                             pending[i].cxxSpelling);
             std::string error;
             haveEmitted = RunCxxTypeRequests(group, pending, extra, /*emitDefinitions*/ true,
                                              emitted, error)
@@ -4822,6 +5061,7 @@ void LLVMBackend::RequestCxxMemberTypes(const std::vector<CRecordEntry>& records
 {
         std::vector<CxxRequestItem> items;
         CollectCxxMemberRequestItems(records, items);
+        CxxExtractionStageTimer requestStage(verbose, "member-signature type requests", items.size());
         for (const CxxRequestItem& item : items)
         {
             std::string error;
@@ -7348,14 +7588,12 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
             RegisterCxxFunctionPointerAbis(hitFunctionPointerAbis);
             if (cppMode && activeCxxRequestGroup_ != nullptr)
             {
-                // Cache-hit replay: the group still owns these names, and the requests the cold
-                // path made are replayed through the same batch.
+                // Cache-hit replay: the group still owns these names. Signature types are bound
+                // on first lookup here too, so the warm path matches the cold one.
                 PublishCxxGroupNames(activeCxxRequestGroup_->primary, hitRecords);
-                std::vector<CxxRequestItem> batch;
-                CollectCxxSignatureRequestItems(hitSigs, batch);
-                PrewarmCxxRequestBatch(std::move(batch));
             }
-            RequestCxxSignatureTypes(hitSigs);
+            else
+                RequestCxxSignatureTypes(hitSigs);
             RegisterCSignatures(hitSigs, fileForLsp);
             RegisterCEnums(hitEnums, fileForLsp);
             RegisterCMacros(hitMacros);
@@ -7415,11 +7653,9 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
                 if (cppMode && activeCxxRequestGroup_ != nullptr)
                 {
                     PublishCxxGroupNames(activeCxxRequestGroup_->primary, diskEntry.records);
-                    std::vector<CxxRequestItem> batch;
-                    CollectCxxSignatureRequestItems(diskEntry.sigs, batch);
-                    PrewarmCxxRequestBatch(std::move(batch));
                 }
-                RequestCxxSignatureTypes(diskEntry.sigs);
+                else
+                    RequestCxxSignatureTypes(diskEntry.sigs);
                 RegisterCSignatures(diskEntry.sigs, fileForLsp);
                 RegisterCEnums(diskEntry.enums, fileForLsp);
                 RegisterCMacros(diskEntry.macros);
@@ -7758,10 +7994,29 @@ const LLVMBackend::CxxClassInfo::Structor* LLVMBackend::SelectCxxConstructor(
             if (tv.TypeName == "bool") return 1;
             return 1;   // every remaining primitive is integral for selection purposes
         };
+        auto scalarEquivalent = [](const TypeAndValue& a, const TypeAndValue& b) {
+            if (a.TypeName == b.TypeName) return true;
+            const int aBits = a.IsInteger();
+            if (aBits != -1 && aBits == b.IsInteger())
+                return a.IsUnsignedInteger() == b.IsUnsignedInteger();
+            const int aFloat = a.IsFloatingPoint();
+            return aFloat != -1 && aFloat == b.IsFloatingPoint();
+        };
         auto compatible = [&](const TypeAndValue& want, const TypeAndValue& got) {
             if (want.TypeName == got.TypeName && want.Pointer == got.Pointer) return true;
             if (want.Pointer != got.Pointer) return false;
-            if (want.Pointer) return false;   // unrelated pointee types never convert here
+            if (want.Pointer)
+            {
+                // A pointer to a PRIMITIVE may be spelled with a CFlat synonym (`long`) while the
+                // C++ declaration uses another name for the same width (`long long`, i.e. int64_t
+                // in c10::IntArrayRef). Same width and signedness means the same pointer ABI.
+                // Record pointers stay exact-only so unrelated classes cannot bind.
+                if (want.ElemPointer != got.ElemPointer || want.TypeName == "void"
+                    || got.TypeName == "void" || dataStructures.count(want.TypeName) != 0
+                    || dataStructures.count(got.TypeName) != 0)
+                    return false;
+                return scalarEquivalent(want, got);
+            }
             if (dataStructures.count(want.TypeName) != 0 || dataStructures.count(got.TypeName) != 0)
                 return false;                 // record types must match exactly
             return scalarFamily(want) == scalarFamily(got);

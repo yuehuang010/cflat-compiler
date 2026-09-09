@@ -1719,6 +1719,17 @@ void LLVMBackend::CreateFunctionDeclaration(const std::string& functionName, con
                 // point at it, and "rename your extern" is not a remedy the C route has.
                 if (!cInteropDeclarationFile_.empty())
                 {
+                    // A C++ import declares a whole header's surface at once. One name whose
+                    // linkage symbol is already bound to a different signature must be refused
+                    // per symbol - reported when CFlat code calls it - not abort the import.
+                    if (cxxAbiMismatchSink_ != nullptr)
+                    {
+                        *cxxAbiMismatchSink_ = std::format(
+                            "collides with an existing linkage name declared as '{}' - this "
+                            "declaration is '{}'. A linkage name binds one signature.",
+                            existingSignature, declared);
+                        return;
+                    }
                     LogErrorMessage(
                         "conflicting declaration of extern '{}' from C import '{}': the linkage "
                         "name is already declared as '{}', but the C prototype is '{}'. Remove or "

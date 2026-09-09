@@ -2876,11 +2876,16 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             for (auto* entry : genParams->typeParameterList()->typeParameterEntry())
                                 typeArgs.push_back(ResolveTypeArgEntry(entry));
                             const std::string baseName = namespaceContext;
-                            const std::string mangled = MangleGenericInstance(*Compiler(), baseName,
-                                                                               typeArgs);
+                            std::string mangled = MangleGenericInstance(*Compiler(), baseName,
+                                                                        typeArgs);
                             std::string cxxError;
                             Compiler(ctx)->TryRequestCxxType(baseName, typeArgs, mangled, cxxError);
                             if (!cxxError.empty()) LogErrorContext(genParams, cxxError);
+                            // The request may alias this spelling onto an already-registered
+                            // identity for the SAME specialization (a header import registered it
+                            // under its plain name first); statics and static methods live under
+                            // that identity, so follow the alias before naming members.
+                            mangled = Compiler(ctx)->ResolveTypeAlias(mangled);
                             if (Compiler(ctx)->IsCxxForeignTypeRegistered(mangled))
                             {
                                 namespaceContext = mangled;

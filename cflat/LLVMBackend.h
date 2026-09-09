@@ -3191,6 +3191,9 @@ private:
      */
     std::vector<std::string> cxxCompanionBitcode_;
     std::unordered_set<uint64_t> cxxCompanionSeen_;   // FNV-1a of an adopted blob, for dedup
+    // Set when a companion link internalized definitions, so the DCE that removes the dead
+    // ones runs whatever -O level the program is built at.
+    bool cxxCompanionLinked_ = false;
     void AdoptCxxCompanionBitcode(const std::string& bitcode);
     bool LinkCxxCompanionModules();
     std::string cppStandard_ = "c++20";
@@ -3297,6 +3300,8 @@ private:
     // Raw C++ free-function signatures are retained because a brace-capable wrapper may be
     // needed even when the ordinary CFlat signature was refused as unmappable.
     std::map<std::string, std::vector<CSigEntry>> cxxFunctionSignatures_;
+    // One deferred bind attempt per C++ free function name; see TryBindCxxFunction.
+    std::set<std::string> cxxFunctionBindAttempts_;
     struct CEnumEntry
     {
         std::string name;
@@ -4985,6 +4990,9 @@ private:
                                     std::string& wrapperName,
                                     std::string& error);
     std::vector<size_t> CandidateCxxGroupsFor(const std::string& cxxBase) const;
+    bool TryBindCxxFunction(const std::string& functionName);
+    void RememberCxxMangledArity(const std::string& cflatName, const std::string& cxxSpelling) const;
+    bool CxxSignatureTypesRegistered(const CSigEntry& entry);
     bool RequestCxxTypeInOwningGroup(const std::string& cxxBase, const std::string& cflatName,
                                      const std::string& spelling,
                                      const std::vector<size_t>& deps, std::string& error);

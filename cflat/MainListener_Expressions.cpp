@@ -8468,8 +8468,28 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
 
         auto* ty = lvalue->getType();
 
+        /*
+         * C++20 REWRITES 'a != b' as '!(a == b)', so a class compiled at that standard (every
+         * libc++ iterator, for one) declares only operator==. Bind the equality and negate it
+         * when the type has no operator!= of its own; a bound '==' that does not yield an
+         * integer is left alone.
+         */
+        auto negateEquality = [&]() -> llvm::Value* {
+            if (op != "!=") return nullptr;
+            llvm::Value* eq = TryBinaryOperatorOverload(lvalue, "==", rvalue, ctx, lhsElemType,
+                                                        rhsPointerDepth, rhsElemPointer);
+            if (eq == nullptr || !eq->getType()->isIntegerTy()) return nullptr;
+            if (eq->getType()->isIntegerTy(1)) return compiler->builder->CreateNot(eq);
+            return compiler->builder->CreateICmpEQ(eq,
+                       llvm::ConstantInt::get(eq->getType(), 0));
+        };
+
         if (ty->isPointerTy())
-            return TryPointerLhsOperatorOverload(lvalue, op, rvalue, ctx, lhsElemType);
+        {
+            if (auto* bound = TryPointerLhsOperatorOverload(lvalue, op, rvalue, ctx, lhsElemType))
+                return bound;
+            return negateEquality();
+        }
 
         if (!ty->isStructTy()) return nullptr;
         auto* structTy = llvm::cast<llvm::StructType>(ty);
@@ -8479,7 +8499,7 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
         if (typeName == "__iface_fat_ptr" || typeName == "__closure_fat_ptr") return nullptr;
 
         std::string opName = "operator" + op;
-        if (!compiler->GetFunction(opName)) return nullptr;
+        if (!compiler->GetFunction(opName)) return negateEquality();
 
         bool receiverFound = false;
         bool receiverConsumes = false;
@@ -8491,7 +8511,7 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
                     if (!candidate.Parameters[0].Pointer && candidate.Parameters[0].IsMove)
                         receiverConsumes = true;
                 }
-        if (!receiverFound) return nullptr;
+        if (!receiverFound) return negateEquality();
         // A ternary PHI inside a call argument is either covered per arm or by this operator;
         // keep the receiver's cleanup identity single-source.
         bool receiverArmsAlreadyRegistered = inCallArgument_ && llvm::isa<llvm::PHINode>(lvalue)

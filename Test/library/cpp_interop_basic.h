@@ -147,6 +147,12 @@ namespace cppi
     int default_array_arg(int bias, const int (&a)[3] = {1, 2, 3},
                           int extra = default_extra()) noexcept;
 
+    // M27: a default-argument wrapper for a function that RETURNS A RECORD BY VALUE. The wrapper
+    // reuses clang's arrangement for the full call, truncated to the parameters it keeps, so the
+    // record result travels the same way it would in a direct call.
+    struct DefaultPair { int a; int b; };
+    DefaultPair default_pair(int a, int extra = default_extra()) noexcept;
+
     // simdjson's logger pattern: a `static inline` declaration with a non-constant default,
     // defined later by a plain `inline` redeclaration. Internal linkage - never bound, and no
     // default-argument wrapper may reference it.
@@ -326,6 +332,39 @@ namespace cppi
     // A record reached by POINTER is always legal.
     struct Pair { int a; int b; };
     int read_pair(const Pair* p) noexcept;
+
+    // M26: the constructor takes 'const long long*'; a CFlat 'long*' argument is the same
+    // pointer ABI under a different spelling, which is how c10::IntArrayRef is constructed.
+    class PointerCount
+    {
+    public:
+        PointerCount(const long long* values, unsigned long count) noexcept;
+        ~PointerCount() noexcept;
+        long long first() const noexcept;
+    private:
+        const long long* values_;
+        unsigned long count_;
+    };
+
+    // ---- M25: a refused callback ABI plan is per callback type -----------------
+    // A virtual base makes this class's layout unreproducible in CFlat, so a callback that
+    // returns it by value has an arrangement cflat cannot express. That one plan must be
+    // dropped from the callback ABI registry, and the rest of the header - including the
+    // neighbour below - must still bind.
+    struct AbiRefusedBase { int base; };
+    struct AbiRefused : virtual AbiRefusedBase { int value; };
+    typedef AbiRefused (*AbiRefusedCallback)(int);
+    int abi_takes_refused_callback(AbiRefusedCallback cb) noexcept;
+    int abi_neighbour(int value) noexcept;
+
+    // M29. This function is DECLARED here and defined nowhere - no .cpp, no library. The inline
+    // body below calls it, so the companion module clang emits for this header carries a
+    // definition with an unresolvable reference. Nothing in CFlat calls that body, so it must be
+    // dropped before the link; its inline neighbour, which CFlat does call, must still work.
+    int missing_symbol_never_defined(int value) noexcept;
+    inline int calls_missing_symbol(int value) noexcept
+    { return missing_symbol_never_defined(value) + 1; }
+    inline int missing_symbol_neighbour(int value) noexcept { return value * 3 + 1; }
 
     // ---- M3: trivially copyable records by value -------------------------------
     // Each shape lands on a DIFFERENT AArch64 arrangement, and every round trip adds 1 to
