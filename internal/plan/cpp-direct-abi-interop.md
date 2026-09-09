@@ -814,11 +814,15 @@ Eigen -> libtorch; spikes under scratch/ladder/). Landed on master, in order:
   plus GlobalDCE at every -O (dead inline bodies dragged 244 undefined symbols); used libc++
   helpers promoted into the companion; lazily requested specializations rebind members an
   earlier plain-name registration refused. Fixture M29.
-State: scratch/ladder/torch/t1.cb (`torch.ones(shape).numel()`) compiles in 54 s, links and
-prints numel=3. Next gaps (t2.cb sum spike): free C++ operators (`operator+` on Tensor) are not
-bound and fall into invalid struct arithmetic; member calls get no default-argument wrappers
-(`t.sum()` omitting dtype); `c10::Scalar` has no layout because a union field of an unrequested
-specialization (`c10::complex<double>`) records no size/align for the opaque-blob fallback.
+- 06dd0533: default-argument wrappers for instance/static members (receiver-first wrapper,
+  cache v38); field size/align recorded through getTypeInfo so a union holding an unrequested
+  specialization (`c10::Scalar::v_t`) becomes an opaque blob. Fixtures M30-M31.
+- c87675bb: free C++ operators bound through the operand namespace (left, then right), class
+  results construct into declaration slots, `a += b` falls back to `a = a + b`; an unbound
+  struct operator is a LogError instead of verifier-failing IR (cache v39). Fixture M32.
+State: scratch/ladder/torch/ t1 (numel=3, 54 s), t2 (`at.sum(t).item().toDouble()` and the
+member `t.sum()` form, sum=6.000000), t3 (`t + t`, numel=3) all compile, link and run.
+In flight: t4 matmul/autograd/index (feature/cpp-torch4), t6 from_blob/TensorOptions/nn::Linear.
 
 Open: per-import `std` clause or CLI-only; exceptions option at M8 start; MSVC ABI pass.
 Open from the M5 review (2026-09-06):

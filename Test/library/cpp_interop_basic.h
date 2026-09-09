@@ -153,6 +153,21 @@ namespace cppi
     struct DefaultPair { int a; int b; };
     DefaultPair default_pair(int a, int extra = default_extra()) noexcept;
 
+    class DefaultArgs
+    {
+    public:
+        int state;
+        int scaled(int value, int extra = default_extra()) const noexcept;
+        static int static_scaled(int value, int extra = default_extra()) noexcept;
+    };
+
+    // The LayoutPair specialization is deliberately not requested as a CFlat type. Its field
+    // still needs Clang's size/alignment so the enclosing union can cross the boundary.
+    template<class T> struct alignas(16) LayoutPair { T first; T second; };
+    union LayoutUnion { int marker; LayoutPair<double> pair; };
+    struct LayoutHolder { int sibling; LayoutUnion payload; };
+    LayoutHolder make_layout_holder(int value) noexcept;
+
     // simdjson's logger pattern: a `static inline` declaration with a non-constant default,
     // defined later by a plain `inline` redeclaration. Internal linkage - never bound, and no
     // default-argument wrapper may reference it.
@@ -521,6 +536,26 @@ namespace cppi
     int consume_tracked_shared(std::shared_ptr<Tracked>&& p) noexcept;
     std::pair<int, double> make_pair_value(int first, double second) noexcept;
     std::optional<int> make_opt(int value, bool present) noexcept;
+
+    // M30: non-member operators are found by argument-dependent lookup in the class namespace.
+    struct FreeArithmetic { int value; };
+    inline FreeArithmetic operator+(const FreeArithmetic& a,
+                                    const FreeArithmetic& b) noexcept
+    { return FreeArithmetic{a.value + b.value}; }
+    inline bool operator==(const FreeArithmetic& a,
+                           const FreeArithmetic& b) noexcept
+    { return a.value == b.value; }
+
+    namespace freeops
+    {
+        struct FreeArithmetic { int value; };
+        inline FreeArithmetic operator+(const FreeArithmetic& a,
+                                        const FreeArithmetic& b) noexcept
+        { return FreeArithmetic{a.value + b.value}; }
+        inline bool operator==(const FreeArithmetic& a,
+                               const FreeArithmetic& b) noexcept
+        { return a.value == b.value; }
+    }
 }
 
 extern "C" int cppi_c_linkage(int v) noexcept;

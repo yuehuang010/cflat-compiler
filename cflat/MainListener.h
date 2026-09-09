@@ -5302,7 +5302,9 @@ public:
     llvm::Value* TryBinaryOperatorOverload(
         llvm::Value* lvalue, const std::string& op, llvm::Value* rvalue,
         antlr4::ParserRuleContext* ctx, llvm::Type* lhsElemType = nullptr,
-        int rhsPointerDepth = 0, bool rhsElemPointer = false);
+        int rhsPointerDepth = 0, bool rhsElemPointer = false,
+        llvm::Value* lhsStorage = nullptr, llvm::Value* rhsStorage = nullptr,
+        bool reportMissing = true);
 
     LLVMBackend::TypedValue ParseMultiplicativeExpression(CFlatParser::MultiplicativeExpressionContext* ctx,
                                                            ResultUse use = ResultUse::Value);

@@ -3897,6 +3897,29 @@ bool MainListener::TryDeclareForeignCxxLocal(CFlatParser::InitDeclaratorContext*
             return true;
         }
 
+        // A non-member C++ operator can also return this class by value. Let its normal call
+        // path construct directly into the declared slot, just as a direct function call does.
+        compiler->lastCxxRetTemp_ = nullptr;
+        compiler->lastCxxRetValue_ = nullptr;
+        compiler->pendingCxxSretDest_ = slot;
+        compiler->pendingCxxSretTypeName_ = typeName;
+        auto rightNV = ParseAssignmentExpressionNamed(assign);
+        const bool consumed = compiler->pendingCxxSretDest_ == nullptr;
+        compiler->pendingCxxSretDest_ = nullptr;
+        compiler->pendingCxxSretTypeName_.clear();
+        if (consumed) return true;
+        if (rightNV.TypeAndValue.TypeName == typeName && !rightNV.TypeAndValue.Pointer
+            && rightNV.Primary != nullptr)
+        {
+            if (compiler->lastCxxRetTemp_ != nullptr)
+                compiler->EmitCxxCopyOrMoveConstruct(typeName, slot, compiler->lastCxxRetTemp_,
+                                                     /*useMove*/ true,
+                                                     std::format("into local '{}'", name).c_str());
+            else
+                compiler->builder->CreateStore(rightNV.Primary, slot);
+            return true;
+        }
+
         badInit(assign);
         return true;
     }

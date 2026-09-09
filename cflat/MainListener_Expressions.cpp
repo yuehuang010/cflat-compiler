@@ -3234,14 +3234,16 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                                 left, operatorText, right, ctx, namedVar.BaseType,
                                 rightNV.TypeAndValue.DepthIsAboutThisValue()
                                     ? rightNV.TypeAndValue.PointerDepth : 0,
-                                rightNV.TypeAndValue.ElemPointer);
+                                rightNV.TypeAndValue.ElemPointer, namedVar.Storage,
+                                rightNV.Storage, false);
                     }
                     if (overload == nullptr && !compoundOverloadExists && !binaryOp.empty())
                         overload = TryBinaryOperatorOverload(
                             left, std::string(binaryOp), right, ctx, namedVar.BaseType,
                             rightNV.TypeAndValue.DepthIsAboutThisValue()
                                 ? rightNV.TypeAndValue.PointerDepth : 0,
-                            rightNV.TypeAndValue.ElemPointer);
+                            rightNV.TypeAndValue.ElemPointer, namedVar.Storage,
+                            rightNV.Storage, false);
                     if (overload != nullptr)
                     {
                         right = overload;
@@ -6804,7 +6806,8 @@ LLVMBackend::TypedValue MainListener::ParseEqualityExpression(CFlatParser::Equal
             lowerCoreUniqueValue(rv);
 
             auto* overload = TryBinaryOperatorOverload(lv, op, rv, ctx, lv.elemType,
-                                                       rv.pointerDepth, rv.elemPointer);
+                                                       rv.pointerDepth, rv.elemPointer,
+                                                       lv.receiverStorage, rv.receiverStorage);
             if (overload)
             {
                 LLVMBackend::NamedVariable resultNV;
@@ -7499,7 +7502,8 @@ LLVMBackend::TypedValue MainListener::ParseRelationalExpression(CFlatParser::Rel
             std::string op = ctx->children[1]->getText();
 
             auto* overload = TryBinaryOperatorOverload(lv, op, rv, ctx, lv.elemType,
-                                                       rv.pointerDepth, rv.elemPointer);
+                                                       rv.pointerDepth, rv.elemPointer,
+                                                       lv.receiverStorage, rv.receiverStorage);
             if (overload)
             {
                 LLVMBackend::NamedVariable resultNV;
@@ -7964,6 +7968,7 @@ LLVMBackend::TypedValue MainListener::ParseAdditiveExpression(CFlatParser::Addit
             Compiler(ctx)->lastCallReturnsOwned = false;
             auto lv = ParseMultiplicativeExpression(nextCtxs[0], ResultUse::Value);
             llvm::Value* lvalue = lv.value;
+            llvm::Value* lhsStorage = lv.receiverStorage;
             bool lu = lv.isUnsigned;
             llvm::Type* elemType = lv.elemType;
             bool unsignedStorage = false;
@@ -8020,7 +8025,8 @@ LLVMBackend::TypedValue MainListener::ParseAdditiveExpression(CFlatParser::Addit
                     unsigned leftBits = BinaryOperandBits(lvalue);
                     unsigned rightBits = BinaryOperandBits(rvalue);
                     auto* overload = TryBinaryOperatorOverload(lvalue, op, rvalue, ctx, nullptr,
-                                                              rv.pointerDepth, rv.elemPointer);
+                                                              rv.pointerDepth, rv.elemPointer,
+                                                              lhsStorage, rv.receiverStorage);
 
                 // char* + char* concatenation: TryBinaryOperatorOverload dispatches off a struct lvalue
                     // and can't reach raw i8*; both must qualify as c-strings so int* + int* still errors.
@@ -8059,6 +8065,9 @@ LLVMBackend::TypedValue MainListener::ParseAdditiveExpression(CFlatParser::Addit
                         DiagnoseVoidResultConsumed(ctx, resultNV, use, std::format("'operator{}'", op));
                     }
                     lvalue = overload ? overload : Compiler(ctx)->CreateOperation(op, lvalue, rvalue, lu, ru);
+                    lhsStorage = overload && overload->getType()->isStructTy()
+                        && Compiler(ctx)->lastCxxRetValue_ == overload
+                        ? Compiler(ctx)->lastCxxRetTemp_ : nullptr;
                     unsignedStorage = !overload && lvalue != nullptr && lvalue->getType()->isIntegerTy()
                         && lvalue->getType()->getIntegerBitWidth() < 32 && (lu || ru);
                     // An overload's signedness is its RETURN type, not the operands' flags.
@@ -8451,9 +8460,10 @@ llvm::Value* MainListener::TryPointerLhsOperatorOverload(
 llvm::Value* MainListener::TryBinaryOperatorOverload(
         llvm::Value* lvalue, const std::string& op, llvm::Value* rvalue,
         antlr4::ParserRuleContext* ctx, llvm::Type* lhsElemType,
-        int rhsPointerDepth, bool rhsElemPointer) {
-        if (!lvalue) return nullptr;
+        int rhsPointerDepth, bool rhsElemPointer, llvm::Value* lhsStorage,
+        llvm::Value* rhsStorage, bool reportMissing) {
         auto* compiler = Compiler(ctx);
+        if (!lvalue) return nullptr;
 
         // If the LHS is a string literal (ptr to global constant), wrap it
         // as a %string struct so operator+(string, ...) can match.
@@ -8477,11 +8487,143 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
         auto negateEquality = [&]() -> llvm::Value* {
             if (op != "!=") return nullptr;
             llvm::Value* eq = TryBinaryOperatorOverload(lvalue, "==", rvalue, ctx, lhsElemType,
-                                                        rhsPointerDepth, rhsElemPointer);
+                                                        rhsPointerDepth, rhsElemPointer, lhsStorage,
+                                                        rhsStorage, false);
             if (eq == nullptr || !eq->getType()->isIntegerTy()) return nullptr;
             if (eq->getType()->isIntegerTy(1)) return compiler->builder->CreateNot(eq);
             return compiler->builder->CreateICmpEQ(eq,
                        llvm::ConstantInt::get(eq->getType(), 0));
+        };
+
+        // C++ free operators are registered under a private namespace-qualified alias. Trigger
+        // deferred binding for the namespaces of both class operands, then call the matching free
+        // function through the normal overload/ABI path. The raw spelling is consulted only to
+        // distinguish `const T&` from an actual `T*`; both have the same mapped pointer shape.
+        auto tryFreeOperator = [&]() -> llvm::Value* {
+            auto structInfo = [](llvm::Value* value) {
+                std::pair<llvm::StructType*, std::string> result;
+                if (value == nullptr || !value->getType()->isStructTy()) return result;
+                auto* st = llvm::cast<llvm::StructType>(value->getType());
+                if (st->isLiteral() || !st->hasName()) return result;
+                result.first = st;
+                result.second = st->getName().str();
+                return result;
+            };
+            auto leftInfo = structInfo(lvalue);
+            auto rightInfo = structInfo(rvalue);
+            auto isFat = [](const std::string& typeName) {
+                return typeName == "__iface_fat_ptr" || typeName == "__closure_fat_ptr";
+            };
+            if (leftInfo.second.empty() && rightInfo.second.empty()) return nullptr;
+            if (isFat(leftInfo.second) || isFat(rightInfo.second)) return nullptr;
+
+            std::vector<std::string> namespaces;
+            auto addNamespace = [&](const std::string& typeName) {
+                if (typeName.empty()) return;
+                const size_t dot = typeName.rfind('.');
+                const std::string ns = dot == std::string::npos
+                    ? std::string() : typeName.substr(0, dot);
+                if (std::find(namespaces.begin(), namespaces.end(), ns) == namespaces.end())
+                    namespaces.push_back(ns);
+            };
+            addNamespace(leftInfo.second);
+            addNamespace(rightInfo.second);
+
+            const std::string opName = "operator" + op;
+            for (const std::string& ns : namespaces)
+            {
+                const std::string sourceName = ns.empty() ? opName : ns + "." + opName;
+                compiler->TryBindCxxFunction(sourceName);
+                const std::string lookupName = ns.empty()
+                    ? "__cxx_free." + opName : sourceName;
+                auto fit = compiler->functionTable.find(lookupName);
+                if (fit == compiler->functionTable.end()) continue;
+
+                auto isReferenceParam = [&](const LLVMBackend::FunctionSymbol& candidate,
+                                            size_t index) {
+                    auto rawIt = compiler->cxxFunctionSignatures_.find(candidate.SourceName);
+                    if (rawIt == compiler->cxxFunctionSignatures_.end()) return false;
+                    for (const auto& raw : rawIt->second)
+                        if (raw.linkageName == candidate.UniqueName
+                            && index < raw.paramSpellings.size())
+                            return raw.paramSpellings[index].find('&') != std::string::npos;
+                    return false;
+                };
+
+                bool candidateFound = false;
+                bool leftReference = false;
+                bool rightReference = false;
+                for (const auto& candidate : fit->second)
+                {
+                    if (candidate.IsMethod || candidate.Parameters.size() < 2) continue;
+                    if (!leftInfo.second.empty()
+                        && candidate.Parameters[0].TypeName != leftInfo.second)
+                        continue;
+                    if (!rightInfo.second.empty()
+                        && candidate.Parameters[1].TypeName != rightInfo.second)
+                        continue;
+                    candidateFound = true;
+                    if (!leftInfo.second.empty())
+                        leftReference = leftReference || isReferenceParam(candidate, 0);
+                    if (!rightInfo.second.empty())
+                        rightReference = rightReference || isReferenceParam(candidate, 1);
+                }
+                if (!candidateFound) continue;
+
+                auto makeArgument = [&](llvm::Value* value, llvm::Value* storage,
+                                        llvm::StructType* structType, const std::string& typeName,
+                                        bool reference) {
+                    LLVMBackend::NamedVariable result;
+                    result.Primary = value;
+                    result.Storage = storage;
+                    result.BaseType = value != nullptr ? value->getType() : nullptr;
+                    result.TypeAndValue.TypeName = typeName;
+                    result.TypeAndValue.Pointer = reference;
+                    if (reference)
+                    {
+                        if (storage == nullptr && structType != nullptr)
+                        {
+                            auto* temp = compiler->CreateAlloca(structType);
+                            compiler->CreateAssignment(value, temp);
+                            result.Primary = temp;
+                            result.Storage = temp;
+                        }
+                        result.BaseType = structType;
+                    }
+                    return result;
+                };
+
+                auto leftArg = makeArgument(lvalue, lhsStorage, leftInfo.first,
+                                             leftInfo.second, leftReference);
+                auto rightArg = makeArgument(rvalue, rhsStorage, rightInfo.first,
+                                              rightInfo.second, rightReference);
+                if (auto* result = compiler->CreateOverloadedFunctionCall(
+                        lookupName, { leftArg, rightArg }, true))
+                {
+                    TrackOwnedStringOperatorResult(compiler, result);
+                    return result;
+                }
+            }
+            return nullptr;
+        };
+
+        auto reportNoOperator = [&](const std::string& typeName) -> llvm::Value* {
+            if (!reportMissing || typeName.empty()
+                || typeName == "__iface_fat_ptr" || typeName == "__closure_fat_ptr")
+                return nullptr;
+            if (op == "&" || op == "|" || op == "^")
+            {
+                LogErrorContext(ctx, std::format(
+                    "no overload of 'operator{}' matches the given arguments.", op));
+                return nullptr;
+            }
+            {
+                std::string shown = SpellType(*compiler,
+                    LLVMBackend::TypeAndValue{ .TypeName = typeName });
+                if (shown.empty()) shown = typeName;
+                LogErrorContext(ctx, std::format("no operator '{}' for type '{}'", op, shown));
+            }
+            return nullptr;
         };
 
         if (ty->isPointerTy())
@@ -8491,7 +8633,18 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
             return negateEquality();
         }
 
-        if (!ty->isStructTy()) return nullptr;
+        if (!ty->isStructTy())
+        {
+            llvm::Value* freeResult = tryFreeOperator();
+            if (freeResult != nullptr) return freeResult;
+            if (rvalue != nullptr && rvalue->getType()->isStructTy())
+            {
+                auto* rhsStruct = llvm::cast<llvm::StructType>(rvalue->getType());
+                if (!rhsStruct->isLiteral() && rhsStruct->hasName())
+                    return reportNoOperator(rhsStruct->getName().str());
+            }
+            return nullptr;
+        }
         auto* structTy = llvm::cast<llvm::StructType>(ty);
         if (structTy->isLiteral() || !structTy->hasName()) return nullptr;
         std::string typeName = structTy->getName().str();
@@ -8499,7 +8652,13 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
         if (typeName == "__iface_fat_ptr" || typeName == "__closure_fat_ptr") return nullptr;
 
         std::string opName = "operator" + op;
-        if (!compiler->GetFunction(opName)) return negateEquality();
+        if (!compiler->GetFunction(opName))
+        {
+            llvm::Value* freeResult = tryFreeOperator();
+            if (freeResult != nullptr) return freeResult;
+            if (llvm::Value* equality = negateEquality()) return equality;
+            return reportNoOperator(typeName);
+        }
 
         bool receiverFound = false;
         bool receiverConsumes = false;
@@ -8511,7 +8670,13 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
                     if (!candidate.Parameters[0].Pointer && candidate.Parameters[0].IsMove)
                         receiverConsumes = true;
                 }
-        if (!receiverFound) return negateEquality();
+        if (!receiverFound)
+        {
+            llvm::Value* freeResult = tryFreeOperator();
+            if (freeResult != nullptr) return freeResult;
+            if (llvm::Value* equality = negateEquality()) return equality;
+            return reportNoOperator(typeName);
+        }
         // A ternary PHI inside a call argument is either covered per arm or by this operator;
         // keep the receiver's cleanup identity single-source.
         bool receiverArmsAlreadyRegistered = inCallArgument_ && llvm::isa<llvm::PHINode>(lvalue)
@@ -8677,7 +8842,8 @@ LLVMBackend::TypedValue MainListener::ParseMultiplicativeExpression(CFlatParser:
                 auto* overload = TryBinaryOperatorOverload(lvalue, op, rvalue, ctx, nullptr,
                                                           rightNV.TypeAndValue.DepthIsAboutThisValue()
                                                               ? rightNV.TypeAndValue.PointerDepth : 0,
-                                                          rightNV.TypeAndValue.ElemPointer);
+                                                          rightNV.TypeAndValue.ElemPointer,
+                                                          firstNV.Storage, rightNV.Storage);
                 if (overload)
                 {
                     LLVMBackend::NamedVariable resultNV;

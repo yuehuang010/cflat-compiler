@@ -96,6 +96,12 @@
 //   Section M28 (794)    : a default-argument wrapper for a function returning a record.
 //   Section M29 (795)    : an unreferenced inline body calling an undefined symbol is dropped
 //                       before the link; its inline neighbour still binds and runs.
+//   Section M30 (796-799): member default-argument wrappers for const instance and static
+//                       methods, including full-argument and omitted-default calls.
+//   Section M31 (800)    : an opaque union field preserves the size/alignment of an unrequested
+//                       class-template specialization when the enclosing record is returned.
+//   Section M32 (801-806): free C++ operator overloads are found through the operand namespace,
+//                       including a nested namespace, and compound assignment falls back to '+'.
 
 import "library/c_alias_order_alias.h";
 import "library/c_alias_order_real.h";
@@ -2036,6 +2042,39 @@ extern int main()
     // never defined; nothing here calls it, so it must not reach the linker. Its neighbour,
     // an ordinary inline function, is called and must run.
     if (cppi.missing_symbol_neighbour(5) != 16)     return 795;
+
+    // Section M30. Both member forms omit a non-constant default through a generated wrapper;
+    // the full calls prove the original member remains selected for the complete arity.
+    cppi.DefaultArgs m30args = default;
+    if (m30args.scaled(3, 4) != 34)                 return 796;
+    if (m30args.scaled(3) != 39)                    return 797;
+    if (cppi.DefaultArgs.static_scaled(3, 4) != 304) return 798;
+    if (cppi.DefaultArgs.static_scaled(3) != 309)   return 799;
+
+    // Section M31. The sibling field must remain readable after a by-value return whose union
+    // contains an opaque, over-aligned template specialization.
+    cppi.LayoutHolder m31layout = cppi.make_layout_holder(37);
+    if (m31layout.sibling != 37)                    return 800;
+
+    // Section M32. Free operators are ordinary C++ functions, so lookup must use the namespace
+    // of the class operand rather than the member-operator table.
+    cppi.FreeArithmetic m32a = default;
+    cppi.FreeArithmetic m32b = default;
+    m32a.value = 2;
+    m32b.value = 3;
+    cppi.FreeArithmetic m32sum = m32a + m32b;
+    if (m32sum.value != 5)                           return 801;
+    if (!(m32a == m32a))                             return 802;
+    if (m32a == m32b)                               return 803;
+    m32a += m32b;
+    if (m32a.value != 5)                             return 804;
+    cppi.freeops.FreeArithmetic m32nestedA = default;
+    cppi.freeops.FreeArithmetic m32nestedB = default;
+    m32nestedA.value = 4;
+    m32nestedB.value = 6;
+    cppi.freeops.FreeArithmetic m32nestedSum = m32nestedA + m32nestedB;
+    if (m32nestedSum.value != 10)                   return 805;
+    if (!(m32nestedA == m32nestedA))                 return 806;
 
     return 0;
 }

@@ -1,0 +1,11 @@
+import cpp "cpp_interop_basic.h";
+
+extern int main()
+{
+    expect_error("no operator '+'") {
+        cppi.Pair a = default;
+        cppi.Pair b = default;
+        cppi.Pair c = a + b;
+    }
+    return 0;
+}

@@ -160,6 +160,16 @@ namespace cppi
     int abi_neighbour(int value) noexcept { return value + 100; }
 
     DefaultPair default_pair(int a, int extra) noexcept { return DefaultPair{ a, extra }; }
+    int DefaultArgs::scaled(int value, int extra) const noexcept { return value * 10 + extra; }
+    int DefaultArgs::static_scaled(int value, int extra) noexcept { return value * 100 + extra; }
+
+    LayoutHolder make_layout_holder(int value) noexcept
+    {
+        LayoutHolder result{};
+        result.sibling = value;
+        result.payload.marker = 0;
+        return result;
+    }
 
     PointerCount::PointerCount(const long long* values, unsigned long count) noexcept
         : values_(values), count_(count) {}

@@ -641,6 +641,9 @@ namespace cflat_cinterop
             {
                 SourceLocation loc = d->getLocation();
                 if (loc.isInvalid()) return false;
+                // Macro-generated declarations (for example ATen's Tensor operators) have an
+                // expansion location in the including stub; bind their spelling header instead.
+                if (loc.isMacroID()) loc = sm.getSpellingLoc(loc);
                 PresumedLoc pl = sm.getPresumedLoc(loc);
                 if (pl.isInvalid()) return false;
                 file = pl.getFilename() ? pl.getFilename() : "";
@@ -656,6 +659,24 @@ namespace cflat_cinterop
                 if (!LocOfRaw(d, file, line, col)) return false;
                 if (st.req.requireInScope && !PathInScope(file, st.normDirs)) return false;
                 return true;
+            }
+
+            void RecordRawFieldLayout(QualType type, RawField& field) const
+            {
+                // Use Clang's complete-type query directly. This preserves the size and
+                // alignment of an unregistered class-template specialization for opaque blobs.
+                if (type.isNull() || type->isIncompleteType() || type->isDependentType()
+                    || type->isUndeducedType() || type->isSizelessType())
+                    return;
+                const TypeInfo info = ctx.getTypeInfo(type);
+                const uint64_t charWidth = ctx.getCharWidth();
+                field.sizeBytes = (info.Width + charWidth - 1) / charWidth;
+                field.alignBytes = (info.Align + charWidth - 1) / charWidth;
+                if (st.req.verbose && type->isRecordType()
+                    && type.getAsString().find('<') != std::string::npos)
+                    std::cout << std::format(
+                        "[verbose]   raw C++ field layout '{}' size={} align={}\n",
+                        type.getAsString(), field.sizeBytes, field.alignBytes);
             }
 
             bool VisitFunctionTemplateDecl(FunctionTemplateDecl* ftd)
@@ -737,12 +758,14 @@ namespace cflat_cinterop
                                      fd->getNameAsString())
                                == st.req.cxxFunctionWrapperNames.end()))
                     return true;
+                // Non-member overloaded operators participate in ADL and must be published even
+                // during the ordinary header walk; unlike a member they have no identifier.
                 if (!fd->getIdentifier()
-                    && !(st.req.cxxMode && !st.req.cxxTypeRequests.empty()
-                         && fd->getOverloadedOperator() != OO_None))
+                    && !(st.req.cxxMode && fd->getOverloadedOperator() != OO_None
+                         && !llvm::isa<CXXMethodDecl>(fd)))
                     return true;
                 if (fd->getDeclContext()->isRecord()
-                    && !(st.req.cxxMode && !st.req.cxxTypeRequests.empty()
+                    && !(st.req.cxxMode
                          && fd->getOverloadedOperator() != OO_None
                          && !llvm::isa<CXXMethodDecl>(fd)))
                     return true;
@@ -906,8 +929,7 @@ namespace cflat_cinterop
                             fe.name = "__anon" + std::to_string(idx);
                             fe.ctype = (isUnion ? "union " : "struct ") + synTag;
                             fe.offsetBytes = layout.getFieldOffset(f->getFieldIndex()) / 8;
-                            fe.sizeBytes = ctx.getTypeSizeInChars(f->getType()).getQuantity();
-                            fe.alignBytes = ctx.getTypeAlignInChars(f->getType()).getQuantity();
+                            RecordRawFieldLayout(f->getType(), fe);
                             rec.fields.push_back(std::move(fe));
                         }
                         continue;  // unnamed non-bitfield non-anon: nothing to record
@@ -917,8 +939,7 @@ namespace cflat_cinterop
                     rf.name = f->getNameAsString();
                     rf.access = MapAccess(f->getAccess());
                     rf.offsetBytes = layout.getFieldOffset(f->getFieldIndex()) / 8;
-                    rf.sizeBytes = ctx.getTypeSizeInChars(f->getType()).getQuantity();
-                    rf.alignBytes = ctx.getTypeAlignInChars(f->getType()).getQuantity();
+                    RecordRawFieldLayout(f->getType(), rf);
                     if (st.req.cxxMode && f->getType()->isReferenceType())
                     {
                         rec.layoutRefusal = std::format(
@@ -1428,8 +1449,7 @@ namespace cflat_cinterop
                     rf.name = f->getNameAsString();
                     rf.ctype = CanonicalSpelling(ctx, f->getType());
                     rf.offsetBytes = baseOff + layout.getFieldOffset(idx) / 8;
-                    rf.sizeBytes = ctx.getTypeSizeInChars(f->getType()).getQuantity();
-                    rf.alignBytes = ctx.getTypeAlignInChars(f->getType()).getQuantity();
+                    RecordRawFieldLayout(f->getType(), rf);
                     rf.access = MapAccess(f->getAccess());
                     // Shadowed by a more derived field of the same name: keep the storage, give it
                     // a reserved name nobody can write. Inherited through a non-public base: keep

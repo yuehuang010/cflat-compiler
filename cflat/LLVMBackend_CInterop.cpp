@@ -889,8 +889,8 @@ static void EraseDeclaratorToken(std::string& s, const char* word)
     }
 
 /*
- * The CFlat dotted name of the class a C++ pointer spelling points at, or "" when the spelling is
- * not a pointer to a class. Clang spells a C++ class type as a bare qualified name
+ * The CFlat dotted name of the class a C++ pointer or reference spelling points at, or "" when
+ * the spelling is not a pointer/reference to a class. Clang spells a C++ class type as a bare qualified name
  * ("const cpppoly::Right *"), with no "struct"/"union" keyword, so AggregatePointeeTag - which
  * keys on that keyword - never recognizes one.
  */
@@ -900,10 +900,11 @@ std::string LLVMBackend::CxxRecordPointeeTag(const std::string& spelling, int& o
         std::string s = spelling;
         if (s.find('(') != std::string::npos || s.find('[') != std::string::npos)
             return std::string();   // function pointer / array: not a plain record pointer
+        const bool isReference = s.find('&') != std::string::npos;
         for (const char* w : { "const", "volatile", "restrict", "__restrict", "__restrict__",
                                "struct", "class", "union", "&" })
             EraseDeclaratorToken(s, w);
-        outPtr = (int)std::count(s.begin(), s.end(), '*');
+        outPtr = (int)std::count(s.begin(), s.end(), '*') + (isReference ? 1 : 0);
         if (outPtr == 0) return std::string();
         s.erase(std::remove(s.begin(), s.end(), '*'), s.end());
         size_t a = s.find_first_not_of(" \t");
@@ -1275,6 +1276,14 @@ void LLVMBackend::RegisterCSignatures(const std::vector<CSigEntry>& sigs, const 
                 const size_t op = regName.rfind(".operator");
                 if (op != std::string::npos) regName.erase(0, op + 1);
             }
+            // Member operators are registered by RegisterCxxClassMembers. A non-member C++
+            // operator is registered under the bare spelling above for compatibility, and also
+            // gets a private qualified alias so ADL can select only its namespace's free overloads.
+            const bool isCxxFreeOperator = e.isCxx
+                && (e.name.starts_with("operator") || e.name.rfind(".operator") != std::string::npos);
+            const std::string freeOperatorLookupName = isCxxFreeOperator
+                ? (e.name.find('.') == std::string::npos ? "__cxx_free." + e.name : e.name)
+                : std::string();
             /*
              * M6 - a C++ pointer parameter to a KNOWN class keeps its pointee type instead of
              * decaying to void* (the string mapper's default for a record pointer). Typing it is
@@ -1452,6 +1461,30 @@ void LLVMBackend::RegisterCSignatures(const std::vector<CSigEntry>& sigs, const 
                     }
                 if (!assignedDefaults && fit->second.size() == 1)
                     fit->second.front().DefaultArguments = e.defaultArgs;
+            }
+
+            if (!freeOperatorLookupName.empty())
+            {
+                NoteCxxForeignNamespace(freeOperatorLookupName);
+                for (size_t pos = 0; (pos = freeOperatorLookupName.find('.', pos)) != std::string::npos; ++pos)
+                    RegisterNamespace(freeOperatorLookupName.substr(0, pos));
+                auto source = functionTable.find(regName);
+                if (source != functionTable.end())
+                {
+                    auto& aliases = functionTable[freeOperatorLookupName];
+                    for (const FunctionSymbol& sym : source->second)
+                    {
+                        if (!sym.IsCInteropDeclaration || sym.UniqueName != linkageName) continue;
+                        bool already = std::any_of(aliases.begin(), aliases.end(), [&](const auto& old) {
+                            return old.UniqueName == sym.UniqueName;
+                        });
+                        if (already) continue;
+                        FunctionSymbol alias = sym;
+                        alias.SourceName = e.name;
+                        alias.IsCInteropAlias = true;
+                        aliases.push_back(std::move(alias));
+                    }
+                }
             }
 
             // A free C++ function whose omitted suffix contains a non-constant default gets an
@@ -1860,10 +1893,63 @@ static std::string CxxNameFromCflat(const std::string& name)
         return "::" + out;
 }
 
-static std::string BuildCxxDefaultWrappers(const std::vector<cflat_cinterop::RawSig>& sigs)
+static std::string BuildCxxDefaultWrappers(
+    const std::vector<cflat_cinterop::RawSig>& sigs,
+    const std::vector<cflat_cinterop::RawRecord>& records)
 {
         std::string source;
         bool emitted = false;
+        auto appendWrapper = [&](const std::string& base,
+                                 const std::string& retType,
+                                 const std::vector<std::string>& paramTypes,
+                                 size_t keptCount,
+                                 const std::string& target,
+                                 bool instance,
+                                 const std::string& memberName,
+                                 bool isConst,
+                                 bool isNoexcept) {
+            if (!emitted)
+            {
+                source += "template <class T> struct __cflat_pid { typedef T type; };\n";
+                emitted = true;
+            }
+            const std::string cppName = base + "_cpp";
+            std::string params;
+            std::string args;
+            if (instance)
+            {
+                const std::string receiver = (isConst ? "const " : "") + target + " *";
+                params = "typename __cflat_pid<" + receiver + ">::type a0";
+            }
+            const size_t firstUser = instance ? 1u : 0u;
+            for (size_t i = firstUser; i < keptCount; ++i)
+            {
+                if (!params.empty()) params += ", ";
+                if (!args.empty()) args += ", ";
+                const std::string& type = paramTypes[i];
+                params += "typename __cflat_pid<" + type + ">::type a" + std::to_string(i);
+                args += type.ends_with("&&")
+                    ? "static_cast<" + type + ">(a" + std::to_string(i) + ")"
+                    : "a" + std::to_string(i);
+            }
+            const std::string call = instance
+                ? "a0->" + memberName + "(" + args + ")"
+                : target + "(" + args + ")";
+            const std::string weakArgs = instance
+                ? (std::string("a0") + (args.empty() ? std::string{} : ", " + args))
+                : args;
+            const std::string suffix = isNoexcept ? " noexcept" : "";
+            source += "extern \"C++\" { static " + retType + " " + cppName + "("
+                + params + ")" + suffix + " { ";
+            if (retType == "void") source += call + ";";
+            else source += "return " + call + ";";
+            source += " } }\n";
+            source += "extern \"C\" __attribute__((weak)) " + retType + " " + base + "("
+                + params + ")" + suffix + " { ";
+            if (retType == "void") source += cppName + "(" + weakArgs + ");";
+            else source += "return " + cppName + "(" + weakArgs + ");";
+            source += " }\n";
+        };
         for (const auto& sig : sigs)
         {
             if (!sig.isCxx || sig.variadic || sig.linkageName.empty()
@@ -1874,35 +1960,35 @@ static std::string BuildCxxDefaultWrappers(const std::vector<cflat_cinterop::Raw
             for (size_t n = 0; n < sig.paramTypes.size(); ++n)
             {
                 if (!HasNonConstDefaultSuffix(sig.defaultArgs, n)) continue;
-                if (!emitted)
-                {
-                    source += "template <class T> struct __cflat_pid { typedef T type; };\n";
-                    emitted = true;
-                }
                 const std::string base = CxxDefaultWrapperName(sig.linkageName, n);
-                const std::string cppName = base + "_cpp";
-                std::string params;
-                std::string args;
-                for (size_t i = 0; i < n; ++i)
+                appendWrapper(base, sig.retType, sig.paramTypes, n, target,
+                              /*instance*/ false, {}, false, sig.isNoexcept);
+            }
+        }
+        for (const auto& record : records)
+        {
+            const std::string owner = record.canonicalCtype.empty()
+                ? CxxNameFromCflat(record.name) : "::" + record.canonicalCtype;
+            if (owner == "::" || record.name.empty()) continue;
+            for (const auto& member : record.members)
+            {
+                if ((member.kind != cflat_cinterop::RawCxxMember::Instance
+                        && member.kind != cflat_cinterop::RawCxxMember::StaticMethod)
+                    || member.access != cflat_cinterop::AccessPublic
+                    || member.linkageName.empty()
+                    || member.defaultArgs.size() != member.paramTypes.size())
+                    continue;
+                const bool instance = member.kind == cflat_cinterop::RawCxxMember::Instance;
+                const std::string target = instance ? owner : owner + "::" + member.name;
+                for (size_t n = 0; n < member.paramTypes.size(); ++n)
                 {
-                    if (!params.empty()) { params += ", "; args += ", "; }
-                    const std::string& type = sig.paramTypes[i];
-                    params += "typename __cflat_pid<" + type + ">::type a" + std::to_string(i);
-                    args += type.ends_with("&&")
-                        ? "static_cast<" + type + ">(a" + std::to_string(i) + ")"
-                        : "a" + std::to_string(i);
+                    if (member.defaultArgs[n].kind == "unsupported"
+                        || !HasNonConstDefaultSuffix(member.defaultArgs, n))
+                        continue;
+                    appendWrapper(CxxDefaultWrapperName(member.linkageName, n), member.retType,
+                                  member.paramTypes, n, target, instance, member.name,
+                                  member.isConst, member.isNoexcept);
                 }
-                const std::string suffix = sig.isNoexcept ? " noexcept" : "";
-                source += "extern \"C++\" { static " + sig.retType + " " + cppName + "("
-                    + params + ")" + suffix + " { ";
-                if (sig.retType == "void") source += target + "(" + args + ");";
-                else source += "return " + target + "(" + args + ");";
-                source += " } }\n";
-                source += "extern \"C\" __attribute__((weak)) " + sig.retType + " " + base + "("
-                    + params + ")" + suffix + " { ";
-                if (sig.retType == "void") source += cppName + "(" + args + ");";
-                else source += "return " + cppName + "(" + args + ");";
-                source += " }\n";
             }
         }
         return source;
@@ -2757,7 +2843,7 @@ bool LLVMBackend::ExtractCHeaderClang(const std::vector<std::string>& headerPath
             std::string wrappers;
             {
                 CxxExtractionStageTimer wrapperStage(verbose, "default-wrapper generation");
-                wrappers = BuildCxxDefaultWrappers(raw.sigs);
+                wrappers = BuildCxxDefaultWrappers(raw.sigs, raw.records);
             }
             if (!wrappers.empty())
             {
@@ -2801,6 +2887,19 @@ bool LLVMBackend::ExtractCHeaderClang(const std::vector<std::string>& headerPath
                                     sig.qualifiedName.empty() ? sig.name : sig.qualifiedName, dropped);
                         }
                     }
+                    for (auto& record : raw.records)
+                        for (auto& member : record.members)
+                            for (size_t n = 0; n < member.defaultArgs.size(); ++n)
+                                if (CxxDefaultWrapperName(member.linkageName, n) == dropped)
+                                {
+                                    member.defaultArgs[n].kind = "unsupported";
+                                    member.defaultArgs[n].value.clear();
+                                    matched = true;
+                                    if (verbose)
+                                        std::cout << std::format(
+                                            "[verbose]   dropped C++ default wrapper for '{}.{}' ({})\n",
+                                            record.name, member.name, dropped);
+                                }
                     if (!matched && verbose)
                         std::cout << std::format("[verbose]   dropped C++ default wrapper '{}'\n", dropped);
                 }
@@ -4674,10 +4773,13 @@ bool LLVMBackend::RequestCxxForeignType(const std::string& cflatName, const std:
                 llvm::TimeTraceScope stage2("CxxRequestStage2", cxxSpelling);
                 std::string err2;
                 cflat_cinterop::ExtractResult emitted;
+                const std::string memberDefaultWrappers =
+                    BuildCxxDefaultWrappers({}, probe.records);
                 const bool emittedOk = RunCxxTypeRequests(group, single,
                                       CxxRequestOdrUsePreamble()
                                       + BuildCxxRequestOdrUses(probeTarget, "__cflat_req_0", "")
-                                      + BuildStdFunctionCtorUse(cxxSpelling, "__cflat_req_0"),
+                                      + BuildStdFunctionCtorUse(cxxSpelling, "__cflat_req_0")
+                                      + memberDefaultWrappers,
                                       /*emitDefinitions*/ true, emitted, err2);
                 if (emittedOk && !emitted.records.empty())
                     raw = std::move(emitted);
@@ -4685,6 +4787,15 @@ bool LLVMBackend::RequestCxxForeignType(const std::string& cflatName, const std:
             }
             else
                 raw = std::move(probe);
+            for (const std::string& dropped : raw.droppedCxxDefaultWrappers)
+                for (auto& record : raw.records)
+                    for (auto& member : record.members)
+                        for (size_t n = 0; n < member.defaultArgs.size(); ++n)
+                            if (CxxDefaultWrapperName(member.linkageName, n) == dropped)
+                            {
+                                member.defaultArgs[n].kind = "unsupported";
+                                member.defaultArgs[n].value.clear();
+                            }
             if (!raw.records.empty())
             {
                 const auto& rawTarget = findRequestedRecord(raw.records);
@@ -5575,17 +5686,17 @@ std::string LLVMBackend::VerifyCxxRecordLayout(const CRecordEntry& r)
         return mismatch;
     }
 
-// An opaque, correctly sized and aligned stand-in for a C++ field whose type cflat cannot map:
-// an array of the widest unsigned integer that matches the field's alignment. Alignment above 8
-// has no such integer, so the caller keeps its refusal path for that case.
+// An opaque, correctly sized and aligned stand-in for a C++ field whose type cflat cannot map.
+// Use an integer array for the bytes and carry over-alignment separately.
 bool LLVMBackend::MakeOpaqueFieldBlob(const CRecordFieldEntry& f, DeclTypeAndValue& out) const
 {
-        if (f.sizeBytes == 0 || f.alignBytes == 0 || f.alignBytes > 8) return false;
-        uint64_t unit = f.alignBytes;
+        if (f.sizeBytes == 0 || f.alignBytes == 0) return false;
+        uint64_t unit = std::min<uint64_t>(f.alignBytes, 8);
         while (unit > 1 && f.sizeBytes % unit != 0) unit /= 2;
         out = DeclTypeAndValue{};
         out.TypeName = unit == 8 ? "u64" : unit == 4 ? "u32" : unit == 2 ? "u16" : "u8";
         out.ConstArraySize = f.sizeBytes / unit;
+        if (f.alignBytes > 8) out.UserAlignValue = f.alignBytes;
         out.VariableName = f.name;
         return true;
 }
@@ -6459,6 +6570,65 @@ void LLVMBackend::RegisterCxxClassMembers(const CRecordEntry& r, const std::stri
                         sym.IsCInteropDeclaration = true;
                         sym.DefaultArguments = m.defaultArgs;
                     }
+            // A member whose omitted suffix contains a non-constant default gets an exact-arity
+            // receiver-prefixed overload backed by a C++ forwarding body. The generated body is
+            // outside the class, so only public members are eligible and const receivers retain
+            // their declared constness in the wrapper's C++ parameter.
+            if (m.defaultArgs.size() == m.paramTypes.size()
+                && m.linkageName.size() != 0
+                && (m.kind == Member::Instance || m.kind == Member::StaticMethod))
+            {
+                const bool havePlan = m.abi.valid && m.abi.params.size() == m.paramTypes.size();
+                const auto canWrap = [&](const TypeAndValue& t) {
+                    return havePlan || t.Pointer || !dataStructures.count(t.TypeName);
+                };
+                if (canWrap(ret))
+                    for (size_t n = 0; n < m.paramTypes.size(); ++n)
+                    {
+                        if (m.defaultArgs[n].kind == "unsupported"
+                            || !HasNonConstDefaultSuffix(m.defaultArgs, n))
+                            continue;
+                        bool supported = true;
+                        for (size_t i = 0; i < n; ++i)
+                            if (!canWrap(params[i])) { supported = false; break; }
+                        if (!supported) continue;
+                        std::vector<TypeAndValue> prefix(params.begin(), params.begin() + n);
+                        const std::string wrapper = CxxDefaultWrapperName(m.linkageName, n);
+                        cflat_cinterop::RawAbi wrapperPlan;
+                        if (havePlan)
+                        {
+                            wrapperPlan = m.abi;
+                            wrapperPlan.params.resize(n);
+                            wrapperPlan.fnTypeText.clear();
+                        }
+                        std::string wrapperMismatch;
+                        CInteropDeclarationScope declaringFile(*this,
+                            m.file.empty() ? fileForLsp : m.file);
+                        {
+                            CxxAbiPlanScope wrapperAbi(*this, havePlan ? &wrapperPlan : nullptr,
+                                                       &wrapperMismatch);
+                            CreateFunctionDeclaration(regName, ret, prefix, /*external=*/true,
+                                /*varargs=*/false, /*returnsOwned=*/false,
+                                /*isMethod=*/m.kind == Member::Instance,
+                                CallingConv::Cdecl, wrapper, /*isCxx=*/true, m.isNoexcept);
+                        }
+                        if (!wrapperMismatch.empty())
+                        {
+                            if (verbose)
+                                std::cout << std::format(
+                                    "[verbose]   C++ default wrapper {} not bound: {}\n",
+                                    wrapper, wrapperMismatch);
+                            continue;
+                        }
+                        if (auto wit = functionTable.find(regName); wit != functionTable.end())
+                            for (FunctionSymbol& sym : wit->second)
+                                if (sym.External && sym.UniqueName == wrapper)
+                                {
+                                    sym.IsCInteropDeclaration = true;
+                                    sym.DefaultArguments.clear();
+                                }
+                    }
+            }
             if (m.kind == Member::Instance)
             {
                 info.instanceMethodNames.push_back(cflatName);

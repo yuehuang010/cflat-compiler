@@ -1951,6 +1951,12 @@ nlohmann::json LLVMBackend::CxxMemberToJson(const cflat_cinterop::RawCxxMember& 
         if (m.vtableIndexDeleting >= 0) j["vtd"] = m.vtableIndexDeleting;
         if (m.access != 0)          j["ac"] = m.access;
         if (m.abi.valid)            j["abi"] = AbiToJson(m.abi);
+        if (!m.defaultArgs.empty())
+        {
+            nlohmann::json da = nlohmann::json::array();
+            for (const auto& d : m.defaultArgs) da.push_back({{"k", d.kind}, {"v", d.value}});
+            j["defaults"] = da;
+        }
         return j;
     }
 
@@ -1988,6 +1994,9 @@ cflat_cinterop::RawCxxMember LLVMBackend::CxxMemberFromJson(const SjVal& j)
         m.vtableIndexDeleting  = j.value("vtd", -1);
         m.access               = j.value("ac", 0);
         if (j.contains("abi")) m.abi = AbiFromJson(j["abi"]);
+        if (j.contains("defaults"))
+            for (const auto& d : j["defaults"])
+                m.defaultArgs.push_back({ d.value("k", std::string{}), d.value("v", std::string{}) });
         return m;
     }
 
@@ -2295,7 +2304,9 @@ bool LLVMBackend::TryLoadCHeaderDiskCache(
         // v35 stops recording an unnamed enum's placeholder spelling as an enumerator type.
         // v36 carries published C++ function-template declarations for deduction wrappers.
         // v37 invalidates cached C++ member lists after plain-header special-member emission.
-        if (version != 37) return false;
+        // v38 carries member default arguments and opaque field size/alignment metadata.
+        // v39 includes non-member C++ overloaded operators from the header walk.
+        if (version != 39) return false;
 
         // Accept on mtime match (fast) or content hash match (authoritative on mtime drift).
         auto storedMtime = j.value("mtime", int64_t{-1});
@@ -2387,7 +2398,7 @@ void LLVMBackend::WriteCHeaderDiskCache(
         if (ec) return;
 
         nlohmann::json j;
-        j["version"] = 37;
+        j["version"] = 39;
         j["mtime"]   = (int64_t)mtime.time_since_epoch().count();
         j["hash"]    = contentHash;
         j["ldw"]     = entry.longDoubleWidth;
