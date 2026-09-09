@@ -3658,12 +3658,16 @@ bool MainListener::TryDeclareForeignCxxLocal(CFlatParser::InitDeclaratorContext*
             && !compiler->HasTrivialCxxDtor(typeName)
             && compiler->GetOrCreateCxxClassDestructor(typeName) == nullptr)
         {
+            compiler->TryBindRefusedCxxMember(typeName, "__dtor");
+            if (compiler->GetOrCreateCxxClassDestructor(typeName) != nullptr)
+                goto cxx_dtor_ready;
             LogErrorContext(direct, std::format(
                 "cannot declare a local of C++ class '{}': it has no destructor cflat can call "
                 "(the destructor is implicit or defined inline in the header) - hold it through a "
                 "pointer instead", typeName));
             return true;
         }
+cxx_dtor_ready:
 
         // ---- `= default`, or no initializer at all: the default constructor ----------------
         if (initializer == nullptr || isDefaultForm)
@@ -3806,6 +3810,32 @@ bool MainListener::TryDeclareForeignCxxLocal(CFlatParser::InitDeclaratorContext*
             const auto* ctor = compiler->SelectCxxConstructor(typeName, argTypes, why);
             if (ctor == nullptr)
             {
+                compiler->TryBindRefusedCxxMember(typeName, "__ctor");
+                ctor = compiler->SelectCxxConstructor(typeName, argTypes, why);
+            }
+            if (ctor == nullptr)
+            {
+                std::string wrapperName;
+                std::string wrapperError;
+                if (compiler->RequestCxxVariadicConstructor(
+                        typeName, ctorArguments, wrapperName, wrapperError))
+                {
+                    LLVMBackend::NamedVariable self;
+                    self.Primary = slot;
+                    self.BaseType = slot->getType();
+                    self.TypeAndValue.TypeName = typeName;
+                    self.TypeAndValue.Pointer = true;
+                    self.IsRvalue = true;
+                    std::vector<LLVMBackend::NamedVariable> wrapperArguments;
+                    wrapperArguments.reserve(ctorArguments.size() + 1);
+                    wrapperArguments.push_back(self);
+                    wrapperArguments.insert(wrapperArguments.end(), ctorArguments.begin(),
+                                            ctorArguments.end());
+                    compiler->SetCurrentDebugLocation(line);
+                    compiler->CreateOverloadedFunctionCall(wrapperName, wrapperArguments);
+                    return true;
+                }
+                if (!wrapperError.empty()) why = wrapperError;
                 LogErrorContext(direct, std::format("C++ class '{}' {}", typeName, why));
                 return true;
             }

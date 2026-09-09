@@ -164,6 +164,10 @@ namespace cflat_cinterop
         std::vector<std::string> paramNames;
         std::vector<RawDefaultArg> defaultArgs; // aligned with paramTypes; entry 0 is `this`
         bool variadic = false;
+        // The constructor is inherited from a base through a using-declaration, or has a
+        // template parameter pack. Its concrete call shape is materialized by an on-demand
+        // placement-new wrapper instead of a direct constructor symbol.
+        bool requiresConstructorWrapper = false;
         bool isConst = false;          // const-qualified instance method
         bool isVirtual = false;
         bool isNoexcept = false;

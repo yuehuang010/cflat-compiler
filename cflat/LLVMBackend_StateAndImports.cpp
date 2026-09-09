@@ -1928,6 +1928,7 @@ nlohmann::json LLVMBackend::CxxMemberToJson(const cflat_cinterop::RawCxxMember& 
         if (!m.linkageName.empty()) j["lk"] = m.linkageName;
         if (!m.file.empty())        j["f"]  = m.file;
         if (m.variadic)             j["va"] = true;
+        if (m.requiresConstructorWrapper) j["cw"] = true;
         if (m.isConst)              j["cn"] = true;
         if (m.isVirtual)            j["vi"] = true;
         if (m.isNoexcept)           j["nx"] = true;
@@ -1973,6 +1974,7 @@ cflat_cinterop::RawCxxMember LLVMBackend::CxxMemberFromJson(const SjVal& j)
         if (j.contains("pt")) m.paramTypes = j["pt"].to_string_vector();
         if (j.contains("pn")) m.paramNames = j["pn"].to_string_vector();
         m.variadic             = j.value("va", false);
+        m.requiresConstructorWrapper = j.value("cw", false);
         m.isConst              = j.value("cn", false);
         m.isVirtual            = j.value("vi", false);
         m.isNoexcept           = j.value("nx", false);
@@ -2308,7 +2310,8 @@ bool LLVMBackend::TryLoadCHeaderDiskCache(
         // v39 includes non-member C++ overloaded operators from the header walk.
         // v40 adds the member operators <=>, && and || to the bindable set, so a v39 member
         // list is missing them (and with them the rewritten relational operators).
-        if (version != 40) return false;
+        // v41 carries constructor-wrapper metadata for inherited and parameter-pack constructors.
+        if (version != 41) return false;
 
         // Accept on mtime match (fast) or content hash match (authoritative on mtime drift).
         auto storedMtime = j.value("mtime", int64_t{-1});
@@ -2400,7 +2403,7 @@ void LLVMBackend::WriteCHeaderDiskCache(
         if (ec) return;
 
         nlohmann::json j;
-        j["version"] = 40;
+        j["version"] = 41;
         j["mtime"]   = (int64_t)mtime.time_since_epoch().count();
         j["hash"]    = contentHash;
         j["ldw"]     = entry.longDoubleWidth;

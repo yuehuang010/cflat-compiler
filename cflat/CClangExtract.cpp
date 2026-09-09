@@ -1256,6 +1256,13 @@ namespace cflat_cinterop
                     m.isNoexcept = DeclIsNoexcept(md);
                     m.access = MapAccess(md->getAccess());
                     m.variadic = md->isVariadic();
+                    if (ctor != nullptr)
+                    {
+                        m.requiresConstructorWrapper = ctor->isInheritingConstructor();
+                        for (const ParmVarDecl* p : md->parameters())
+                            m.requiresConstructorWrapper = m.requiresConstructorWrapper
+                                || llvm::isa<PackExpansionType>(p->getType());
+                    }
                     // An implicit, defaulted or inline member has no symbol in the separately
                     // compiled library; emitting its body is Clang-CodeGen work (M5). Trivial
                     // operations need no call at all, which the backend handles from the

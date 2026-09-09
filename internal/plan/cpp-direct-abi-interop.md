@@ -835,6 +835,11 @@ Eigen -> libtorch; spikes under scratch/ladder/). Landed on master, in order:
   `f({})` null-deref guarded, reversed candidates limited to ==/<=> on C++ records, companion
   internalization demotes functions only (inline variables, guards, vtables keep ODR identity),
   callback ABI refusals reported at the call site, namespace seeding and PHI-operand storage fixed.
+- 4890b344: inherited and parameter-pack constructors get placement-new wrappers
+  (torch::nn::Linear(3, 1) through ModuleHolder), lazy operator-> wrappers so `lin.forward(x)`
+  forwards, chained nontrivial rvalue sret temporaries preserved, C++ bool bitfields packed
+  (cache v41). Fixture M36. t6: from_blob over a CFlat float array, TensorOptions(Double),
+  nn::Linear forward -> total=21.000000 zdtype=7 ysize0=2 ysize1=1 (130 s).
 State: scratch/ladder/torch/ t1 (numel=3, 54 s), t2 (`at.sum(t).item().toDouble()` and the
 member `t.sum()` form, sum=6.000000), t3 (`t + t`, numel=3) all compile, link and run.
 In flight: t4 matmul/autograd/index (feature/cpp-torch4), t6 from_blob/TensorOptions/nn::Linear.

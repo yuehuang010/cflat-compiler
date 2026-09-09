@@ -4614,6 +4614,259 @@ bool LLVMBackend::RequestCxxBraceConstructor(
         return true;
 }
 
+bool LLVMBackend::RequestCxxVariadicConstructor(
+        const std::string& typeName, const std::vector<NamedVariable>& arguments,
+        std::string& wrapperName, std::string& error)
+{
+        error.clear();
+        wrapperName.clear();
+
+        // A using-declaration can inherit a constructor template without putting a concrete
+        // constructor in the derived record's member list. Look through public bases for the
+        // variadic constructor that can accept the concrete call we are about to wrap.
+        std::function<bool(const std::string&, std::set<std::string>&)> hasVariadicCtor;
+        hasVariadicCtor = [&](const std::string& name, std::set<std::string>& seen) {
+            if (!seen.insert(name).second) return false;
+            auto record = cxxRecordEntries_.find(name);
+            if (record == cxxRecordEntries_.end())
+            {
+                const size_t specialization = name.find('$');
+                if (specialization != std::string::npos)
+                    record = cxxRecordEntries_.find(name.substr(0, specialization));
+            }
+            if (record != cxxRecordEntries_.end())
+                for (const auto& member : record->second.members)
+                    if (member.kind == cflat_cinterop::RawCxxMember::Constructor
+                        && (member.variadic || member.requiresConstructorWrapper)
+                        && member.access == cflat_cinterop::AccessPublic)
+                        return true;
+            auto info = cxxClasses_.find(name);
+            if (info == cxxClasses_.end()) return false;
+            for (const auto& base : info->second.bases)
+                if (base.access == cflat_cinterop::AccessPublic
+                    && hasVariadicCtor(base.name, seen))
+                    return true;
+            return false;
+        };
+        std::set<std::string> seen;
+        if (!hasVariadicCtor(typeName, seen)) return false;
+
+        std::string ownerSpelling;
+        if (!CxxSpellingForCflatType(typeName, ownerSpelling))
+        {
+            error = "the C++ class type is not registered";
+            return false;
+        }
+
+        auto cflatTypeOf = [&](const NamedVariable& arg) {
+            std::string type = arg.TypeAndValue.TypeName;
+            bool pointer = arg.TypeAndValue.Pointer;
+            llvm::Type* valueType = arg.Primary != nullptr ? arg.Primary->getType() : arg.BaseType;
+            if (type.empty())
+            {
+                if (auto* constant = llvm::dyn_cast_or_null<llvm::Constant>(arg.Primary);
+                    constant != nullptr && IsStringLiteralConstant(constant))
+                {
+                    type = "char";
+                    pointer = true;
+                }
+                else if (valueType != nullptr && valueType->isFloatTy()) type = "float";
+                else if (valueType != nullptr && valueType->isDoubleTy()) type = "double";
+                else if (valueType != nullptr && valueType->isIntegerTy())
+                {
+                    const unsigned bits = valueType->getIntegerBitWidth();
+                    type = bits == 1 ? "bool" : bits <= 8 ? "i8" : bits <= 16 ? "short"
+                         : bits <= 32 ? "int" : "i64";
+                }
+                else if (auto* st = llvm::dyn_cast_or_null<llvm::StructType>(valueType))
+                    type = st->getName().str();
+                if (type.empty()) type = arg.InferSourceTypeName;
+            }
+            if (pointer)
+            {
+                type += "*";
+                if (arg.TypeAndValue.ElemPointer) type += "*";
+            }
+            return type;
+        };
+
+        std::vector<std::string> parameterSpellings;
+        std::vector<std::string> callArguments;
+        parameterSpellings.push_back(ownerSpelling + " *");
+        for (size_t i = 0; i < arguments.size(); ++i)
+        {
+            const NamedVariable& arg = arguments[i];
+            const bool stringLiteral = [&] {
+                auto* constant = llvm::dyn_cast_or_null<llvm::Constant>(arg.Primary);
+                return constant != nullptr && IsStringLiteralConstant(constant);
+            }();
+            std::string cflatType = cflatTypeOf(arg);
+            if (cflatType.empty())
+            {
+                error = "a constructor argument type cannot be spelled in C++";
+                return false;
+            }
+            std::string spelling;
+            if ((arg.TypeAndValue.TypeName == "char" && arg.TypeAndValue.Pointer
+                    && arg.IsRvalue) || stringLiteral)
+                spelling = "const char *";
+            else if (!CxxSpellingForCflatType(cflatType, spelling))
+            {
+                error = std::format("constructor argument type '{}' has no C++ spelling",
+                                    cflatType);
+                return false;
+            }
+            parameterSpellings.push_back(std::move(spelling));
+            callArguments.push_back("p" + std::to_string(i + 1));
+        }
+
+        std::string targetCall = ownerSpelling + "(";
+        for (size_t i = 0; i < callArguments.size(); ++i)
+        {
+            if (i != 0) targetCall += ", ";
+            targetCall += callArguments[i];
+        }
+        targetCall += ")";
+
+        uint64_t hash = 14695981039346656037ULL;
+        auto hashText = [&](const std::string& text) {
+            for (unsigned char c : text) { hash ^= c; hash *= 1099511628211ULL; }
+        };
+        hashText("variadic_ctor");
+        hashText(typeName);
+        hashText(targetCall);
+        for (const auto& param : parameterSpellings) hashText(param);
+        wrapperName = std::format("__cflat_ctor_{:016x}", hash);
+
+        std::string wrapperSource = "extern \"C\" void " + wrapperName + "(";
+        for (size_t i = 0; i < parameterSpellings.size(); ++i)
+        {
+            if (i != 0) wrapperSource += ", ";
+            wrapperSource += parameterSpellings[i] + " p" + std::to_string(i);
+        }
+        wrapperSource += ") { new (p0) " + targetCall + "; }\n";
+
+        auto groupIt = cxxTypeOwnerGroup_.find(typeName);
+        if (groupIt == cxxTypeOwnerGroup_.end())
+        {
+            error = "the C++ class's import group is unavailable";
+            return false;
+        }
+        CxxRequestGroup group = MakeCxxRequestGroup(groupIt->second, {});
+        if (group.headers.empty())
+        {
+            error = "the C++ class's import group is unavailable";
+            return false;
+        }
+        CxxRequestGroupScope groupScope(*this, &group);
+        CSigEntry bound;
+        std::string wrapperError;
+        if (!RequestGeneratedCxxWrapper(group, wrapperSource, wrapperName, "VARIADIC_CTOR",
+                                         bound, wrapperError))
+        {
+            error = std::format("C++ variadic constructor call '{}' does not match (clang: {})",
+                                typeName, FirstCxxErrorLine(wrapperError));
+            return false;
+        }
+        bound.name = wrapperName;
+        RegisterCSignatures({ bound }, group.headers.front());
+        if (auto it = functionTable.find(wrapperName); it != functionTable.end())
+            for (const auto& symbol : it->second)
+                if (symbol.External && symbol.UniqueName == wrapperName)
+                    return true;
+        error = "the generated C++ variadic constructor wrapper could not be registered";
+        return false;
+}
+
+bool LLVMBackend::RequestCxxOperatorArrow(const std::string& typeName, std::string& error)
+{
+        error.clear();
+        if (HasArrowOverloadFor(typeName)) return true;
+
+        std::function<const cflat_cinterop::RawCxxMember*(
+            const std::string&, std::set<std::string>&)> findArrow;
+        findArrow = [&](const std::string& name, std::set<std::string>& seen)
+            -> const cflat_cinterop::RawCxxMember* {
+            if (!seen.insert(name).second) return nullptr;
+            auto record = cxxRecordEntries_.find(name);
+            auto findMember = [&](const auto& candidate)
+                -> const cflat_cinterop::RawCxxMember* {
+                if (candidate == cxxRecordEntries_.end()) return nullptr;
+                for (const auto& member : candidate->second.members)
+                    if (member.kind == cflat_cinterop::RawCxxMember::Instance
+                        && member.name == "operator->"
+                        && member.access == cflat_cinterop::AccessPublic)
+                        return &member;
+                return nullptr;
+            };
+            if (const auto* member = findMember(record)) return member;
+            if (record == cxxRecordEntries_.end()
+                || findMember(record) == nullptr)
+            {
+                const size_t specialization = name.find('$');
+                if (specialization != std::string::npos)
+                    if (const auto* member = findMember(
+                            cxxRecordEntries_.find(name.substr(0, specialization))))
+                        return member;
+            }
+            auto info = cxxClasses_.find(name);
+            if (info == cxxClasses_.end()) return nullptr;
+            for (const auto& base : info->second.bases)
+                if (base.access == cflat_cinterop::AccessPublic)
+                    if (const auto* member = findArrow(base.name, seen)) return member;
+            return nullptr;
+        };
+
+        std::set<std::string> seen;
+        if (findArrow(typeName, seen) == nullptr)
+            return false;
+        std::string ownerSpelling;
+        if (!CxxSpellingForCflatType(typeName, ownerSpelling))
+        {
+            error = "the C++ class type is not registered";
+            return false;
+        }
+
+        uint64_t hash = 14695981039346656037ULL;
+        for (unsigned char c : typeName + "|operator->")
+        { hash ^= c; hash *= 1099511628211ULL; }
+        const std::string wrapperName = std::format("__cflat_arrow_{:016x}", hash);
+        const std::string wrapperSource =
+            "extern \"C\" auto " + wrapperName + "(" + ownerSpelling
+            + " * p0) { return p0->operator->(); }\n";
+
+        auto groupIt = cxxTypeOwnerGroup_.find(typeName);
+        if (groupIt == cxxTypeOwnerGroup_.end())
+        {
+            error = "the C++ class's import group is unavailable";
+            return false;
+        }
+        CxxRequestGroup group = MakeCxxRequestGroup(groupIt->second, {});
+        if (group.headers.empty())
+        {
+            error = "the C++ class's import group is unavailable";
+            return false;
+        }
+        CxxRequestGroupScope groupScope(*this, &group);
+        CSigEntry bound;
+        std::string wrapperError;
+        if (!RequestGeneratedCxxWrapper(group, wrapperSource, wrapperName, "OPERATOR_ARROW",
+                                         bound, wrapperError))
+        {
+            error = std::format("C++ operator-> wrapper for '{}' could not be generated: {}",
+                                typeName, FirstCxxErrorLine(wrapperError));
+            return false;
+        }
+        bound.name = "operator->";
+        RegisterCSignatures({ bound }, group.headers.front());
+        if (auto it = functionTable.find("operator->"); it != functionTable.end())
+            for (const auto& symbol : it->second)
+                if (symbol.External && symbol.UniqueName == wrapperName)
+                    return true;
+        error = "the generated C++ operator-> wrapper could not be registered";
+        return false;
+}
+
 /*
  * Import groups that could own a C++ base name, best first: the group that already answered for it,
  * then groups that published the name, then a system group whose header IS the name
@@ -4968,6 +5221,72 @@ bool LLVMBackend::RequestCxxForeignType(const std::string& cflatName, const std:
         // Registered BEFORE the records so a member signature naming the type itself
         // (`operator=(const vector<int>&)`, `push_back` on a nested element) maps to the CFlat name.
         RegisterCRecords(records, group.headers.front());
+        // A header import may already have laid out this class while refusing an inline or
+        // template member whose body was absent from that extraction. The request above has
+        // definitions enabled, but RegisterCRecords intentionally does not replace a non-opaque
+        // existing layout. Rebind only those previously refused members from the fresh record;
+        // this keeps overload registration idempotent while making the on-demand definition
+        // request visible to the original CFlat type.
+        if (auto existing = cxxClasses_.find(cflatName); existing != cxxClasses_.end())
+        {
+            const CRecordEntry* refreshed = nullptr;
+            for (const auto& candidate : records)
+                if (candidate.name == cflatName) { refreshed = &candidate; break; }
+            if (refreshed != nullptr)
+            {
+                std::vector<std::string> rebind;
+                for (const auto& [name, refusal] : existing->second.refusedMembers)
+                {
+                    if (!refusal.starts_with("has no definition cflat can reach:")) continue;
+                    auto member = std::find_if(refreshed->members.begin(), refreshed->members.end(),
+                        [&](const auto& candidate) {
+                            return candidate.name == name && candidate.bindRefusal.empty()
+                                && !candidate.needsLocalDefinition && !candidate.linkageName.empty();
+                    });
+                    if (member != refreshed->members.end()) rebind.push_back(name);
+                }
+                const auto oldRecord = cxxRecordEntries_.find(cflatName);
+                const bool hadMissingCtor = oldRecord != cxxRecordEntries_.end()
+                    && std::any_of(oldRecord->second.members.begin(), oldRecord->second.members.end(),
+                        [](const auto& member) {
+                            return member.kind == cflat_cinterop::RawCxxMember::Constructor
+                                && member.needsLocalDefinition;
+                        });
+                if (hadMissingCtor)
+                {
+                    auto ctor = std::find_if(refreshed->members.begin(), refreshed->members.end(),
+                        [](const auto& member) {
+                            return member.kind == cflat_cinterop::RawCxxMember::Constructor
+                                && member.bindRefusal.empty() && !member.needsLocalDefinition
+                                && !member.linkageName.empty();
+                        });
+                    if (ctor != refreshed->members.end()) rebind.push_back(ctor->name);
+                }
+                const bool hadMissingDtor = oldRecord != cxxRecordEntries_.end()
+                    && std::any_of(oldRecord->second.members.begin(), oldRecord->second.members.end(),
+                        [](const auto& member) {
+                            return member.kind == cflat_cinterop::RawCxxMember::Destructor
+                                && member.needsLocalDefinition;
+                        });
+                if (hadMissingDtor)
+                {
+                    auto dtor = std::find_if(refreshed->members.begin(), refreshed->members.end(),
+                        [](const auto& member) {
+                            return member.kind == cflat_cinterop::RawCxxMember::Destructor
+                                && member.bindRefusal.empty() && !member.needsLocalDefinition
+                                && !member.linkageName.empty();
+                        });
+                    if (dtor != refreshed->members.end()) rebind.push_back(dtor->name);
+                }
+                for (const std::string& name : rebind)
+                {
+                    RegisterCxxClassMembers(*refreshed, group.headers.front(), name);
+                    if (auto updated = cxxClasses_.find(cflatName);
+                        updated != cxxClasses_.end())
+                        updated->second.refusedMembers.erase(name);
+                }
+            }
+        }
         RegisterCSignatures(requestSigs, group.headers.front());
         if (dataStructures.find(cflatName) == dataStructures.end())
         {
@@ -6766,9 +7085,77 @@ bool LLVMBackend::TryBindRefusedCxxMember(const std::string& typeName,
         auto recordIt = cxxRecordEntries_.find(typeName);
         if (infoIt == cxxClasses_.end() || recordIt == cxxRecordEntries_.end()) return false;
         auto refusalIt = infoIt->second.refusedMembers.find(memberName);
-        if (refusalIt == infoIt->second.refusedMembers.end()) return false;
+        const bool missingSpecialMember = (memberName == "__ctor"
+                                           || memberName == "__dtor")
+            && std::any_of(recordIt->second.members.begin(), recordIt->second.members.end(),
+                [&](const auto& member) {
+                    const bool wanted = memberName == "__ctor"
+                        ? member.kind == cflat_cinterop::RawCxxMember::Constructor
+                        : member.kind == cflat_cinterop::RawCxxMember::Destructor;
+                    return wanted
+                        && member.needsLocalDefinition;
+                });
+        if (refusalIt == infoIt->second.refusedMembers.end() && !missingSpecialMember) return false;
 
-        const std::string& refusal = refusalIt->second;
+        const std::string refusal = refusalIt == infoIt->second.refusedMembers.end()
+            ? std::string() : refusalIt->second;
+        if (missingSpecialMember || refusal.starts_with("has no definition cflat can reach:"))
+        {
+            auto spellingIt = cxxCflatToCxxSpelling_.find(typeName);
+            auto ownerIt = cxxTypeOwnerGroup_.find(typeName);
+            if (spellingIt == cxxCflatToCxxSpelling_.end()
+                || ownerIt == cxxTypeOwnerGroup_.end())
+                return false;
+            CxxRequestGroup group = MakeCxxRequestGroup(ownerIt->second, {});
+            if (group.headers.empty()) return false;
+            CxxRequestGroupScope groupScope(*this, &group);
+            // The missing body may return or take a class-template specialization that the
+            // initial header walk never needed to lay out. Request those member types first so
+            // the definition-enabled owner extraction can map the now-complete signature.
+            if (auto record = cxxRecordEntries_.find(typeName);
+                record != cxxRecordEntries_.end())
+            {
+                for (const auto& member : record->second.members)
+                {
+                    if (member.name != memberName) continue;
+                    std::vector<std::string> spellings = member.paramTypes;
+                    spellings.push_back(member.retType);
+                    for (const std::string& raw : spellings)
+                    {
+                        const std::string spelling = CxxMemberValueSpelling(raw);
+                        if (spelling.find("::") == std::string::npos
+                            || spelling.find('<') == std::string::npos)
+                            continue;
+                        TypeAndValue mapped;
+                        bool mappedForeign = false;
+                        if (TryMapCxxForeignSpelling(spelling, mapped, mappedForeign)
+                            && mappedForeign)
+                            continue;
+                        const std::string identity = AutoCxxForeignIdentity(spelling);
+                        if (identity.empty() || identity == typeName) continue;
+                        std::string nestedError;
+                        RequestCxxForeignType(identity, spelling, nestedError,
+                                              /*needDefinitions*/ true,
+                                              /*explicitInstantiation*/ true);
+                    }
+                }
+            }
+            std::string error;
+            const bool requested = RequestCxxForeignType(typeName, spellingIt->second, error,
+                                                         /*needDefinitions*/ true,
+                                                         /*explicitInstantiation*/ true);
+            if (!requested)
+                return false;
+            auto updated = cxxClasses_.find(typeName);
+            const bool rebound = updated != cxxClasses_.end()
+                && std::find(updated->second.instanceMethodNames.begin(),
+                             updated->second.instanceMethodNames.end(), memberName)
+                       != updated->second.instanceMethodNames.end();
+            if (rebound) return true;
+            if (updated == cxxClasses_.end()) return false;
+            if (memberName == "__ctor") return !updated->second.constructors.empty();
+            return memberName == "__dtor" && updated->second.hasDtor;
+        }
         const bool unsupportedReturn = refusal.starts_with("returns unsupported type '");
         const bool unsupportedParameter = refusal.starts_with("takes unsupported type '");
         const bool incompleteReturn = refusal.starts_with("returns '")

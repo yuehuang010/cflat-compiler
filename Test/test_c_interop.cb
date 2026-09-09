@@ -111,6 +111,8 @@
 //                       cppi.opsfree.FreeOps the same list as FREE functions, plus the reversed
 //                       candidates (`int == Ops`, `RevOther == Rev`), `*`/`->` forwarding, and
 //                       `OpsSink << FreeOps`, whose left operand lives in another namespace.
+//   Section M36 (820-823): C++ rvalue receiver lifetime handoff, bool bitfield packing, and
+//                       inherited constructors forwarded through operator->.
 
 import "library/c_alias_order_alias.h";
 import "library/c_alias_order_real.h";
@@ -2289,6 +2291,17 @@ extern int main()
     m40sink.total = 1;
     m40sink << m40fa;
     if (m40sink.total != 13)                         return 983;
+
+    // ---- Section M36: C++ rvalue receivers, bool bitfields, and inherited variadic constructors
+    // (820-823) -------------------------------------------------------------------------------
+    if (cppt.make_box(9).get() != 9)                  return 820;
+    cppt.BoolBits m36bits = default;
+    m36bits.ready = true;
+    if (!m36bits.ready)                                return 821;
+    m36bits.mode = true;
+    if (!m36bits.mode)                                 return 822;
+    cppt.InheritedCtorHolder m36holder = cppt.InheritedCtorHolder(5, 7);
+    if (m36holder.get() != 12)                         return 823;
 
     return 0;
 }

@@ -855,23 +855,32 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                 structVar.BondedSources = namedVar.BondedSources;
             };
             auto ForwardOperatorArrow = [&](LLVMBackend::NamedVariable& receiver,
-                                            antlr4::tree::ParseTree* memberToken)
+                                            antlr4::tree::ParseTree* memberToken) -> bool
             {
                 auto* compiler = Compiler(ctx);
                 if (receiver.TypeAndValue.Pointer
                     || receiver.TypeAndValue.IsInterface
                     || receiver.TypeAndValue.TypeName.empty()
                     || compiler->GetDataStructure(receiver.TypeAndValue.TypeName).StructType == nullptr)
-                    return;
+                    return false;
 
                 std::string memberName = NextMemberName(ctx, memberToken);
                 int arrowGuard = 0;
+                bool forwarded = false;
                 while (!memberName.empty()
                        && !receiver.TypeAndValue.Pointer
                        && !receiver.TypeAndValue.TypeName.empty()
-                       && !compiler->TypeHasMember(receiver.TypeAndValue.TypeName, memberName)
-                       && compiler->HasArrowOverloadFor(receiver.TypeAndValue.TypeName))
+                       && !compiler->TypeHasMember(receiver.TypeAndValue.TypeName, memberName))
                 {
+                    if (!compiler->HasArrowOverloadFor(receiver.TypeAndValue.TypeName)
+                        && compiler->IsCxxRecord(receiver.TypeAndValue.TypeName))
+                    {
+                        std::string arrowError;
+                        compiler->RequestCxxOperatorArrow(
+                            receiver.TypeAndValue.TypeName, arrowError);
+                        if (!arrowError.empty()) LogErrorContext(ctx, arrowError);
+                    }
+                    if (!compiler->HasArrowOverloadFor(receiver.TypeAndValue.TypeName)) break;
                     auto sd = compiler->GetDataStructure(receiver.TypeAndValue.TypeName);
                     if (sd.StructType == nullptr) break;
 
@@ -889,6 +898,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                         CheckMovedReceiver(receiver);
                     auto* arrowResult = compiler->CreateOverloadedFunctionCall("operator->", { thisNV });
                     if (arrowResult == nullptr) break;
+                    forwarded = true;
 
                     // operator-> is an ABI adapter, not an ownership boundary: keep the
                     // owning-temp-field ledger on the pointer it hands back.
@@ -914,6 +924,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                         break;
                     }
                 }
+                return forwarded;
             };
             for (auto parseTree : ctx->children)
             {
@@ -1105,8 +1116,14 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             }
                             else
                             {
-                                ForwardOperatorArrow(namedVar, parseTree);
-                                if (!structVar.BaseType)
+                                const bool forwarded = ForwardOperatorArrow(namedVar, parseTree);
+                                if (forwarded && namedVar.TypeAndValue.Pointer
+                                    && !namedVar.TypeAndValue.IsInterface)
+                                {
+                                    structVar = {};
+                                    DerefPointerReceiver();
+                                }
+                                else if (!structVar.BaseType)
                                     DerefPointerReceiver();
                             }
                         }
@@ -5870,8 +5887,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 cxxBraceArguments.clear();
                                 cxxExplicitTemplateArgs.clear();
                             };
-                            bool foreignCxxConstructor = structVar.BaseType == nullptr
-                                && compiler->IsForeignCxxClassWithConstructors(functionName);
+                            bool foreignCxxConstructor =
+                                compiler->IsForeignCxxClassWithConstructors(functionName);
                             if (foreignCxxConstructor && !cxxBraceArguments.empty())
                             {
                                 std::string wrapperName;
@@ -5927,6 +5944,12 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 std::string why;
                                 const auto* ctor = compiler->SelectCxxConstructor(
                                     functionName, ctorTypes, why);
+                                if (ctor == nullptr)
+                                {
+                                    compiler->TryBindRefusedCxxMember(functionName, "__ctor");
+                                    ctor = compiler->SelectCxxConstructor(
+                                        functionName, ctorTypes, why);
+                                }
                                 if (ctor == nullptr)
                                 {
                                     LogErrorContext(primaryCtx, std::format(
@@ -8255,6 +8278,17 @@ void MainListener::RegisterOwningTempReceiver(antlr4::ParserRuleContext* ctx,
         }
         if (!compiler->IsOwningValueType(typeName)) return;
         if (MethodConsumesReceiver(functionName, typeName)) return;
+
+        // A nontrivial C++ value returned through sret already lives in the tracked temporary
+        // slot. Reuse that slot for a chained member call; a raw aggregate store would duplicate
+        // the handle without running its copy constructor, so both slots would later destruct it.
+        if (compiler->IsForeignNontrivialCxxClass(typeName)
+            && receiver.Primary == compiler->lastCxxRetValue_
+            && compiler->lastCxxRetTemp_ != nullptr)
+        {
+            thisArg.Storage = compiler->lastCxxRetTemp_;
+            return;
+        }
 
         if (parenthesizedSpill && receiver.Storage != nullptr)
         {

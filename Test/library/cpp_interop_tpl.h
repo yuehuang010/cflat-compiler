@@ -229,4 +229,22 @@ namespace cppt
     };
 
     inline long shape_rank(const Shape& s) noexcept { return s.rank(); }
+
+    struct BoolBits { bool ready : 1; bool mode : 1; };
+
+    struct InheritedBase
+    {
+        explicit InheritedBase(int first, int second) noexcept
+            : value_(first + second) {}
+        int get() const noexcept { return value_; }
+
+    private:
+        int value_;
+    };
+
+    struct InheritedCtorHolder : InheritedBase
+    {
+        using InheritedBase::InheritedBase;
+        const InheritedBase* operator->() const noexcept { return this; }
+    };
 }

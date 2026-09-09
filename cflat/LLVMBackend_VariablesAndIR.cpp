@@ -1130,6 +1130,11 @@ std::vector<LLVMBackend::DeclTypeAndValue> LLVMBackend::PackBitfields(
             unsigned storageIdx = (unsigned)out.size();
             unsigned bitOffset = 0;
             DeclTypeAndValue storage = cur;
+            // C++ bool bitfields share a byte-sized allocation unit. Keep the semantic
+            // bitfield type as bool in BitfieldInfo, but make the synthetic ABI slot a byte so
+            // by-value aggregate coercion preserves flags above bit 0.
+            if (storage.TypeName == "bool")
+                storage.TypeName = "u8";
             storage.VariableName = "__bf" + std::to_string(synthIdx++);
             storage.IsBitfield = false;     // the storage slot itself isn't a bitfield
             storage.IsBitfieldStorage = true;

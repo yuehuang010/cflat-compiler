@@ -4992,6 +4992,11 @@ private:
                                     const std::vector<CxxBraceArgument>& braceArguments,
                                     std::string& wrapperName,
                                     std::string& error);
+    bool RequestCxxVariadicConstructor(const std::string& typeName,
+                                       const std::vector<NamedVariable>& arguments,
+                                       std::string& wrapperName,
+                                       std::string& error);
+    bool RequestCxxOperatorArrow(const std::string& typeName, std::string& error);
     std::vector<size_t> CandidateCxxGroupsFor(const std::string& cxxBase) const;
     bool TryBindCxxFunction(const std::string& functionName);
     void RememberCxxMangledArity(const std::string& cflatName, const std::string& cxxSpelling) const;
@@ -7405,9 +7410,19 @@ public:
         if (typeName.starts_with("std.pair$") || typeName.starts_with("std.optional$"))
             return false;
         auto it = cxxClasses_.find(typeName);
-        return cxxNontrivialRecords_.count(typeName) != 0
+        auto record = cxxRecordEntries_.find(typeName);
+        const bool missingCtor = record != cxxRecordEntries_.end()
+            && std::any_of(record->second.members.begin(), record->second.members.end(),
+                [](const auto& member) {
+                    return member.kind == cflat_cinterop::RawCxxMember::Constructor
+                        && member.needsLocalDefinition;
+                });
+        const bool result = cxxNontrivialRecords_.count(typeName) != 0
             || (cxxRecords_.count(typeName) != 0 && it != cxxClasses_.end()
-                && !it->second.constructors.empty());
+                && (!it->second.constructors.empty()
+                    || it->second.refusedMembers.count("__ctor") != 0))
+            || missingCtor;
+        return result;
     }
     // Materialize (once per module) the llvm::Function for one structor / assignment operator,
     // typed from clang's own arrangement. Returns null after LogError when the plan is
