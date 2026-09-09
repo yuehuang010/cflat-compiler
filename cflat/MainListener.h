@@ -5299,12 +5299,21 @@ public:
     // rhsPointerDepth/rhsElemPointer carry the right OPERAND's recorded depth (0 = not
     // recorded); only the receiver reaches the scorer with a type, so without them a
     // 'T**' operand binds a 'T*' operator parameter under opaque pointers.
+    // C++ classes may overload && and ||; both operands are evaluated (C++ drops short-circuit
+    // for an overloaded operator too) and the chain folds left to right. Null when the first
+    // operand is not a C++ class carrying that operator.
+    llvm::Value* TryClassLogicalOperatorChain(
+        const std::string& op, antlr4::ParserRuleContext* ctx,
+        const LLVMBackend::TypedValue& first,
+        const std::function<LLVMBackend::TypedValue(size_t)>& parseOperand,
+        size_t operandCount);
+
     llvm::Value* TryBinaryOperatorOverload(
         llvm::Value* lvalue, const std::string& op, llvm::Value* rvalue,
         antlr4::ParserRuleContext* ctx, llvm::Type* lhsElemType = nullptr,
         int rhsPointerDepth = 0, bool rhsElemPointer = false,
         llvm::Value* lhsStorage = nullptr, llvm::Value* rhsStorage = nullptr,
-        bool reportMissing = true);
+        bool reportMissing = true, bool allowReversed = true);
 
     LLVMBackend::TypedValue ParseMultiplicativeExpression(CFlatParser::MultiplicativeExpressionContext* ctx,
                                                            ResultUse use = ResultUse::Value);

@@ -105,6 +105,12 @@
 //   Section M33 (807-812): fixed-array pointer ABI, bool and class-typed member defaults,
 //                       record conversion through an initializer_list wrapper, and a class
 //                       const-reference return copied into a local.
+//   Section M40 (900-982): the full C++ operator grid. cppi.Ops carries every MEMBER form
+//                       (binary, compound, unary, subscript, call, conversion, <=> and the
+//                       relational operators C++20 rewrites from it, && and ||), and
+//                       cppi.opsfree.FreeOps the same list as FREE functions, plus the reversed
+//                       candidates (`int == Ops`, `RevOther == Rev`), `*`/`->` forwarding, and
+//                       `OpsSink << FreeOps`, whose left operand lives in another namespace.
 
 import "library/c_alias_order_alias.h";
 import "library/c_alias_order_real.h";
@@ -2094,6 +2100,195 @@ extern int main()
 
     cppi.Tracked m33tracked = cppi.tracked_ref();
     if (m33tracked.value() != 812)                  return 812;
+
+    // Section M40. The C++ operator grid: every form C++ allows, once. Ops declares the member
+    // spellings, cppi.opsfree.FreeOps the free ones. `<` `>` `<=` `>=` exist on neither class as
+    // themselves - C++20 REWRITES them from operator<=>, which is what these check.
+    cppi.Ops m40a = default;
+    cppi.Ops m40b = default;
+    m40a.value = 12;
+    m40b.value = 5;
+    cppi.Ops m40r = m40a + m40b;
+    if (m40r.value != 17)                            return 900;
+    m40r = m40a - m40b;
+    if (m40r.value != 7)                             return 901;
+    m40r = m40a * m40b;
+    if (m40r.value != 60)                            return 902;
+    m40r = m40a / m40b;
+    if (m40r.value != 2)                             return 903;
+    m40r = m40a % m40b;
+    if (m40r.value != 2)                             return 904;
+    m40r = m40a & m40b;
+    if (m40r.value != 4)                             return 905;
+    m40r = m40a | m40b;
+    if (m40r.value != 13)                            return 906;
+    m40r = m40a ^ m40b;
+    if (m40r.value != 9)                             return 907;
+    m40r = m40a << m40b;
+    if (m40r.value != 384)                           return 908;
+    m40r = m40a >> m40b;
+    if (m40r.value != 0)                             return 909;
+
+    if (!(m40a == m40a))                             return 910;
+    if (!(m40a != m40b))                             return 911;
+    if (!(m40b < m40a))                              return 912;
+    if (!(m40a > m40b))                              return 913;
+    if (!(m40b <= m40a))                             return 914;
+    if (!(m40a >= m40b))                             return 915;
+    if (m40a < m40b)                                 return 916;
+    if (!(m40a <= m40a))                             return 917;
+
+    cppi.Ops m40c = default;
+    m40c.value = 12;
+    m40c += m40b;
+    if (m40c.value != 17)                            return 918;
+    m40c -= m40b;
+    if (m40c.value != 12)                            return 919;
+    m40c *= m40b;
+    if (m40c.value != 60)                            return 920;
+    m40c /= m40b;
+    if (m40c.value != 12)                            return 921;
+    m40c %= m40b;
+    if (m40c.value != 2)                             return 922;
+    m40c.value = 12;
+    m40c &= m40b;
+    if (m40c.value != 4)                             return 923;
+    m40c |= m40b;
+    if (m40c.value != 5)                             return 924;
+    m40c ^= m40b;
+    if (m40c.value != 0)                             return 925;
+    m40c.value = 12;
+    m40c <<= m40b;
+    if (m40c.value != 384)                           return 926;
+    m40c >>= m40b;
+    if (m40c.value != 12)                            return 927;
+
+    // An overloaded && / || is an ordinary call in C++ too: both operands are evaluated.
+    if (!(m40a && m40b))                             return 928;
+    if (!(m40a || m40b))                             return 929;
+
+    m40r = -m40a;
+    if (m40r.value != -12)                           return 930;
+    m40r = +m40a;
+    if (m40r.value != 12)                            return 931;
+    if (!m40a)                                       return 932;
+    m40r = ~m40a;
+    if (m40r.value != -13)                           return 933;
+    // CFlat spells only the postfix form; it binds C++'s PREFIX operator++ (the standing ruling).
+    m40c.value = 12;
+    m40c++;
+    if (m40c.value != 13)                            return 934;
+    m40c--;
+    if (m40c.value != 12)                            return 935;
+
+    m40a[1] = 7;
+    if (m40a[1] != 7)                                return 936;
+    if (m40a(  ) != 12)                              return 937;
+    if (m40a(3) != 15)                               return 938;
+    if (m40a(3, 4) != 24)                            return 939;
+
+    if (!(bool)m40a)                                 return 940;
+    if ((int)m40a != 12)                             return 941;
+    if ((double)m40a != 12.5)                        return 942;
+
+    // Scalar comparisons: the member takes the int on the right, the free function on the left.
+    // The free one adds 1 to the class operand, so only the chosen overload can produce these.
+    if (!(m40a == 12))                               return 943;
+    if (!(13 == m40a))                               return 944;
+    if (13 != m40a)                                  return 945;
+
+    // Reversed MEMBER ==: only cppi.Rev declares one, against cppi.RevOther.
+    cppi.Rev m40rev = default;
+    cppi.RevOther m40other = default;
+    m40rev.value = 3;
+    m40other.value = 3;
+    if (!(m40other == m40rev))                       return 946;
+
+    // Unary * and -> both forward to the pointed-at object.
+    cppi.OpsBox m40box = default;
+    m40box.target = &m40a;
+    cppi.Ops m40deref = *m40box;
+    if (m40deref.value != 12)                        return 947;
+    if (m40box.value != 12)                          return 948;
+
+    cppi.opsfree.FreeOps m40fa = default;
+    cppi.opsfree.FreeOps m40fb = default;
+    m40fa.value = 12;
+    m40fb.value = 5;
+    cppi.opsfree.FreeOps m40fr = m40fa + m40fb;
+    if (m40fr.value != 17)                           return 949;
+    m40fr = m40fa - m40fb;
+    if (m40fr.value != 7)                            return 950;
+    m40fr = m40fa * m40fb;
+    if (m40fr.value != 60)                           return 951;
+    m40fr = m40fa / m40fb;
+    if (m40fr.value != 2)                            return 952;
+    m40fr = m40fa % m40fb;
+    if (m40fr.value != 2)                            return 953;
+    m40fr = m40fa & m40fb;
+    if (m40fr.value != 4)                            return 954;
+    m40fr = m40fa | m40fb;
+    if (m40fr.value != 13)                           return 955;
+    m40fr = m40fa ^ m40fb;
+    if (m40fr.value != 9)                            return 956;
+    m40fr = m40fa << m40fb;
+    if (m40fr.value != 384)                          return 957;
+    m40fr = m40fa >> m40fb;
+    if (m40fr.value != 0)                            return 958;
+    if (!(m40fa && m40fb))                           return 959;
+    if (!(m40fa || m40fb))                           return 960;
+
+    if (!(m40fa == m40fa))                           return 961;
+    if (!(m40fa != m40fb))                           return 962;
+    if (!(m40fb < m40fa))                            return 963;
+    if (!(m40fa > m40fb))                            return 964;
+    if (!(m40fb <= m40fa))                           return 965;
+    if (!(m40fa >= m40fb))                           return 966;
+
+    cppi.opsfree.FreeOps m40fc = default;
+    m40fc.value = 12;
+    m40fc += m40fb;
+    if (m40fc.value != 17)                           return 967;
+    m40fc -= m40fb;
+    if (m40fc.value != 12)                           return 968;
+    m40fc *= m40fb;
+    if (m40fc.value != 60)                           return 969;
+    m40fc /= m40fb;
+    if (m40fc.value != 12)                           return 970;
+    m40fc %= m40fb;
+    if (m40fc.value != 2)                            return 971;
+    m40fc.value = 12;
+    m40fc &= m40fb;
+    if (m40fc.value != 4)                            return 972;
+    m40fc |= m40fb;
+    if (m40fc.value != 5)                            return 973;
+    m40fc ^= m40fb;
+    if (m40fc.value != 0)                            return 974;
+    m40fc.value = 12;
+    m40fc <<= m40fb;
+    if (m40fc.value != 384)                          return 975;
+    m40fc >>= m40fb;
+    if (m40fc.value != 12)                           return 976;
+
+    m40fr = -m40fa;
+    if (m40fr.value != -12)                          return 977;
+    m40fr = +m40fa;
+    if (m40fr.value != 12)                           return 978;
+    if (!m40fa)                                      return 979;
+    m40fr = ~m40fa;
+    if (m40fr.value != -13)                          return 980;
+    m40fc.value = 12;
+    m40fc++;
+    if (m40fc.value != 13)                           return 981;
+    m40fc--;
+    if (m40fc.value != 12)                           return 982;
+
+    // The left operand is cppi.OpsSink, a class from the ENCLOSING namespace: the free
+    // operator<< is reachable only through the RIGHT operand's namespace.
+    cppi.OpsSink m40sink = default;
+    m40sink.total = 1;
+    m40sink << m40fa;
+    if (m40sink.total != 13)                         return 983;
 
     return 0;
 }

@@ -2934,6 +2934,9 @@ private:
         AbiRecipe recipe;
     };
     std::unordered_map<std::string, CxxFunctionPointerAbiPlan> cxxFunctionPointerAbiPlans_;
+    // Callback shapes whose clang ABI plan could not be rebuilt, keyed the same way as the
+    // plans above. Consulted where the heuristic lowering would otherwise be used silently.
+    std::unordered_map<std::string, std::string> cxxFunctionPointerAbiRefusals_;
     std::unordered_map<std::string, std::vector<FunctionSymbol>> functionTable;
     std::unordered_map<std::string, std::vector<InterfaceMethod>> interfaceTable;
     // Interface fields (parents' fields first, then own), parallel to interfaceTable. Each entry's
@@ -3193,7 +3196,7 @@ private:
     std::unordered_set<uint64_t> cxxCompanionSeen_;   // FNV-1a of an adopted blob, for dedup
     // Set when a companion link internalized definitions, so the DCE that removes the dead
     // ones runs whatever -O level the program is built at.
-    bool cxxCompanionLinked_ = false;
+    bool cxxCompanionInternalized_ = false;
     void AdoptCxxCompanionBitcode(const std::string& bitcode);
     bool LinkCxxCompanionModules();
     std::string cppStandard_ = "c++20";

@@ -1132,6 +1132,13 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                         if (!hasClassDefault) continue;
                     }
                     resolvedCandidate.emplace_back(arguments, candidate);
+                    // Native CFlat semantics: the first zero-argument-bindable candidate in
+                    // registration order wins outright. Only C++ declarations and the generated
+                    // default-argument wrappers need every candidate scored, because a class-typed
+                    // default has to compete with its own zero-parameter wrapper.
+                    if (!candidate.IsCxx
+                        && !candidate.UniqueName.starts_with("__cflat_dflt_"))
+                        break;
                 }
             }
             else

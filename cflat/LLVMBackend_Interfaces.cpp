@@ -940,8 +940,33 @@ llvm::Value* LLVMBackend::MakeThinFnPtrValue(llvm::Value* fn, const TypeAndValue
                         return llvm::UndefValue::get(BuildThinFnPtrType(fpTV));
                 }
             }
-            else if (symbol != nullptr && symbol->External && symbol->Recipe.hasLowering)
-                fn = GetOrCreateCAbiFunctionThunk(*symbol, fpTV);
+            else
+            {
+                // No plan for this shape. If the C++ import REFUSED it, say so here rather than
+                // lowering it with the C heuristic and hoping the ABI agrees. Only shapes that
+                // name an imported C++ record can collide with a refusal, so a purely native
+                // function pointer is unaffected.
+                if (!cxxFunctionPointerAbiRefusals_.empty())
+                {
+                    bool namesCxxRecord = IsCxxRecord(ret.TypeName);
+                    for (const auto& p : params)
+                        if (IsCxxRecord(p.TypeName)) namesCxxRecord = true;
+                    if (namesCxxRecord)
+                    {
+                        auto refusal = cxxFunctionPointerAbiRefusals_.find(
+                            FunctionPointerAbiKey(ret, params));
+                        if (refusal != cxxFunctionPointerAbiRefusals_.end())
+                        {
+                            LogError(std::format(
+                                "this callback shape is not supported by the C++ binding: {}",
+                                refusal->second));
+                            return llvm::UndefValue::get(BuildThinFnPtrType(fpTV));
+                        }
+                    }
+                }
+                if (symbol != nullptr && symbol->External && symbol->Recipe.hasLowering)
+                    fn = GetOrCreateCAbiFunctionThunk(*symbol, fpTV);
+            }
         }
         return builder->CreateBitCast(fn, BuildThinFnPtrType(fpTV), "thinfn");
     }

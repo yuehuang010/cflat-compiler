@@ -1139,6 +1139,12 @@ namespace cflat_cinterop
                         case OO_Amp: case OO_Pipe: case OO_Caret:
                         case OO_AmpEqual: case OO_PipeEqual: case OO_CaretEqual:
                         case OO_Exclaim:
+                        // C++20 three-way comparison. CFlat has no `<=>` spelling, but the
+                        // relational operators are REWRITTEN from it, so it must be bindable.
+                        case OO_Spaceship:
+                        // A class that overloads && / || loses short-circuiting in C++ too:
+                        // both operands are evaluated and the operator is an ordinary call.
+                        case OO_AmpAmp: case OO_PipePipe:
                             isBindableOperator = true; break;
                         case OO_PlusPlus: case OO_MinusMinus:
                             isBindableOperator = md->getNumParams() == 0; break;
@@ -2508,7 +2514,11 @@ namespace cflat_cinterop
 
                 bool Reaches(const FunctionDecl* fd, unsigned depth = 0)
                 {
-                    if (fd == nullptr || depth > 64 || !active) return false;
+                    if (fd == nullptr || !active) return false;
+                    // Past the depth cap the answer is a conservative REFUSAL, not "clean": a
+                    // body that reaches an error expression through a longer chain would
+                    // otherwise be emitted and take the whole companion module down with it.
+                    if (depth > 64) return true;
                     const FunctionDecl* def = nullptr;
                     if (!fd->hasBody(def) || def == nullptr) def = fd;
                     auto it = memo.find(def);

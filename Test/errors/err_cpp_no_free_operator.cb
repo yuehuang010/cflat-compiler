@@ -7,5 +7,22 @@ extern int main()
         cppi.Pair b = default;
         cppi.Pair c = a + b;
     }
+    // A class with neither operator< nor operator<=> has no rewritten relational candidate.
+    expect_error("no operator '<'") {
+        cppi.Pair d = default;
+        cppi.Pair e = default;
+        bool less = d < e;
+    }
+    // No compound operator and no binary fallback either.
+    expect_error("no overload for compound assignment '+='") {
+        cppi.Pair f = default;
+        cppi.Pair g = default;
+        f += g;
+    }
+    // Neither a member nor a free operator++ exists for this class.
+    expect_error("has no 'operator++'") {
+        cppi.Pair h = default;
+        h++;
+    }
     return 0;
 }

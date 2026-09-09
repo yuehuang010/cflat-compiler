@@ -1,5 +1,45 @@
 #include "MainListener.h"
 
+/*
+ * The compound assignment operators, each paired with the binary operator it falls back to when
+ * no compound overload exists. One table drives the assignment path's fallback, the C++
+ * "this operator writes through its receiver" test, and the operator-form diagnostics.
+ */
+static constexpr std::array<std::pair<std::string_view, std::string_view>, 10> kCompoundOperators = {{
+    { "+=", "+" }, { "-=", "-" }, { "*=", "*" }, { "/=", "/" }, { "%=", "%" },
+    { "&=", "&" }, { "|=", "|" }, { "^=", "^" }, { "<<=", "<<" }, { ">>=", ">>" }
+}};
+
+// The CFlat spelling of a machine type, for an operand that reaches operator lookup as a bare
+// llvm::Value (a literal or a temporary). Empty when the type is not a plain scalar.
+static std::string ScalarTypeNameForValue(llvm::Type* type)
+{
+    if (type == nullptr) return std::string();
+    if (type->isDoubleTy()) return "double";
+    if (type->isFloatTy())  return "float";
+    if (!type->isIntegerTy()) return std::string();
+    switch (type->getIntegerBitWidth())
+    {
+        case 1:  return "bool";
+        case 8:  return "char";
+        case 16: return "short";
+        case 32: return "int";
+        case 64: return "long long";
+        default: return std::string();
+    }
+}
+
+/*
+ * The four relational operators C++20 REWRITES from operator<=>, each with the ordering values
+ * that make it true. Every comparison category encodes less = -1, equivalent = 0, greater = 1;
+ * anything else is partial_ordering::unordered (libc++ spells it -127, libstdc++ 2), for which
+ * all four relations are false - which is why these are closed value ranges and not sign tests.
+ */
+struct SpaceshipRelation { std::string_view spelling; int low; int high; };
+static constexpr std::array<SpaceshipRelation, 4> kSpaceshipRelations = {{
+    { "<", -1, -1 }, { ">", 1, 1 }, { "<=", -1, 0 }, { ">=", 0, 1 }
+}};
+
 static bool IsBinaryExpressionRuleWithOperator(antlr4::tree::ParseTree* node)
 {
     if (auto* p = dynamic_cast<CFlatParser::MultiplicativeExpressionContext*>(node))
@@ -3186,6 +3226,10 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
 
             bool rhsUnsigned = rightNV.TypeAndValue.IsUnsignedInteger() != -1;
             bool usedCompoundOverload = false;
+            // A C++ compound operator IS the whole statement: `a += b` calls operator+=(a, b),
+            // which mutates the receiver and hands back `T&`. Nothing is assigned back, unlike a
+            // native CFlat operator+= whose returned value replaces the destination.
+            bool cxxCompoundInPlace = false;
             if (operatorText != "=")
             {
                 auto left = derefLoad();
@@ -3208,17 +3252,9 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                 }
                 else
                 {
-                    static const std::array<std::pair<std::string_view, std::string_view>, 9> compoundOperators = {{
-                        { "+=", "+" }, { "-=", "-" }, { "*=", "*" }, { "/=", "/" },
-                        { "%=", "%" }, { "&=", "&" }, { "|=", "|" }, { "^=", "^" },
-                        { "<<=", "<<" }
-                    }};
-                    static const std::pair<std::string_view, std::string_view> rightShift = { ">>=", ">>" };
                     std::string_view binaryOp;
-                    for (const auto& [compoundOp, op] : compoundOperators)
+                    for (const auto& [compoundOp, op] : kCompoundOperators)
                         if (operatorText == compoundOp) { binaryOp = op; break; }
-                    if (binaryOp.empty() && operatorText == rightShift.first)
-                        binaryOp = rightShift.second;
 
                     llvm::Value* overload = nullptr;
                     bool compoundOverloadExists = false;
@@ -3229,6 +3265,8 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                             leftType = llvm::cast<llvm::StructType>(left->getType())->getName().str();
                         compoundOverloadExists = HasOperatorOverloadForFirstParam(
                             "operator" + operatorText, leftType);
+                        cxxCompoundInPlace = compoundOverloadExists
+                            && compiler->IsCxxRecord(leftType);
                         if (compoundOverloadExists)
                             overload = TryBinaryOperatorOverload(
                                 left, operatorText, right, ctx, namedVar.BaseType,
@@ -3261,6 +3299,10 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                     }
                 }
             }
+
+            // The C++ operator mutated the receiver through its own reference parameter;
+            // re-read the slot and stop - storing its `T&` result would clobber the object.
+            if (cxxCompoundInPlace && usedCompoundOverload) return finishStore(derefLoad());
 
             // An overloaded compound assignment replaces the live LHS with its returned value.
             // Release the old owner first; this covers locals, fields, arrays and dereferences.
@@ -6416,6 +6458,57 @@ LLVMBackend::TypedValue MainListener::ParseConditionalExpression(
         return {};
     }
 
+
+/*
+ * C++ lets a class overload && and ||. Such an overload is an ORDINARY call: C++ itself drops
+ * short-circuit evaluation there, so both operands are evaluated and folded left to right. Returns
+ * null when the first operand is not a class with that operator, which keeps every other
+ * expression on the short-circuiting path below.
+ */
+llvm::Value* MainListener::TryClassLogicalOperatorChain(
+        const std::string& op, antlr4::ParserRuleContext* ctx,
+        const LLVMBackend::TypedValue& first,
+        const std::function<LLVMBackend::TypedValue(size_t)>& parseOperand,
+        size_t operandCount) {
+        auto* compiler = Compiler(ctx);
+        if (first.value == nullptr || !first.value->getType()->isStructTy()) return nullptr;
+        auto* structTy = llvm::cast<llvm::StructType>(first.value->getType());
+        if (structTy->isLiteral() || !structTy->hasName()) return nullptr;
+        const std::string typeName = structTy->getName().str();
+        if (!compiler->IsCxxRecord(typeName)
+            || !HasOperatorOverloadForFirstParam("operator" + op, typeName))
+            return nullptr;
+
+        llvm::Value* accumulator = first.value;
+        llvm::Value* accumulatorStorage = first.receiverStorage;
+        for (size_t i = 1; i < operandCount; ++i)
+        {
+            auto rv = parseOperand(i);
+            llvm::Value* folded = accumulator != nullptr && accumulator->getType()->isStructTy()
+                ? TryBinaryOperatorOverload(accumulator, op, rv.value, ctx, first.elemType,
+                                            rv.pointerDepth, rv.elemPointer, accumulatorStorage,
+                                            rv.receiverStorage, false)
+                : nullptr;
+            if (folded == nullptr)
+            {
+                // Past the first call the accumulator is the operator's own result (a bool for
+                // the usual C++ spelling), so the rest of the chain is the ordinary reduction.
+                EnsureOperatorBoolForValue(accumulator);
+                accumulator = compiler->CoerceToBoolCondition(accumulator);
+                llvm::Value* right = rv.value;
+                EnsureOperatorBoolForValue(right);
+                right = compiler->CoerceToBoolCondition(right);
+                accumulator = compiler->CreateOperation(
+                    op == "&&" ? LLVMBackend::Operation::LogicalAnd
+                               : LLVMBackend::Operation::LogicalOr, accumulator, right);
+            }
+            else
+                accumulator = folded;
+            accumulatorStorage = nullptr;
+        }
+        return accumulator;
+    }
+
 LLVMBackend::TypedValue MainListener::ParseLogicalOrExpression(CFlatParser::LogicalOrExpressionContext* ctx, ResultUse use) {
         DeclExpectedTypeGate declExpectedGate(&declExpectedType, ctx->children.size() == 1);
         auto* compiler = Compiler(ctx);
@@ -6432,6 +6525,13 @@ LLVMBackend::TypedValue MainListener::ParseLogicalOrExpression(CFlatParser::Logi
             // Always use resultStorage path. The elseBlock optimization was broken:
             // when the first || operand is true it jumped to blockFalse instead of blockTrue,
             // because only the false-destination is stored in the block context.
+            auto firstOperand = ParseLogicalAndExpression(logicCtxs[0], ResultUse::Value);
+            if (llvm::Value* classChain = TryClassLogicalOperatorChain(
+                    "||", ctx, firstOperand,
+                    [&](size_t i) { return ParseLogicalAndExpression(logicCtxs[i], ResultUse::Value); },
+                    logicCtxs.size()))
+                return { classChain, false };
+
             LLVMBackend::TypeAndValue boolValue = { .TypeName = "bool",.VariableName = "", .Pointer = false };
             auto resultStorage = compiler->CreateAlloca(compiler->GetType(boolValue));
             auto resumeBlock = compiler->CreateBasicBlock("resumeOR");
@@ -6440,7 +6540,7 @@ LLVMBackend::TypedValue MainListener::ParseLogicalOrExpression(CFlatParser::Logi
             {
                 if (left == nullptr)
                 {
-                    left = ParseLogicalAndExpression(logicCtx, ResultUse::Value);
+                    left = firstOperand.value;
                     EnsureOperatorBoolForValue(left);
                     left = compiler->CoerceToBoolCondition(left);
                     compiler->CreateAssignment(left, resultStorage);
@@ -6490,6 +6590,13 @@ LLVMBackend::TypedValue MainListener::ParseLogicalAndExpression(CFlatParser::Log
             // in non-condition contexts (e.g. bool x = a && b inside a loop body) the
             // elseBlock from an enclosing scope (loop exit) was incorrectly used as the
             // false-branch target, causing the loop to exit instead of continuing.
+            auto firstOperand = ParseInclusiveOrExpression(inclusiveCtxs[0], ResultUse::Value);
+            if (llvm::Value* classChain = TryClassLogicalOperatorChain(
+                    "&&", ctx, firstOperand,
+                    [&](size_t i) { return ParseInclusiveOrExpression(inclusiveCtxs[i], ResultUse::Value); },
+                    inclusiveCtxs.size()))
+                return { classChain, false };
+
             LLVMBackend::TypeAndValue boolValue = { .TypeName = "bool",.VariableName = "", .Pointer = false };
             auto resultStorage = compiler->CreateAlloca(compiler->GetType(boolValue));
             auto resumeBlock = compiler->CreateBasicBlock("resumeAND");
@@ -6498,7 +6605,7 @@ LLVMBackend::TypedValue MainListener::ParseLogicalAndExpression(CFlatParser::Log
             {
                 if (left == nullptr)
                 {
-                    left = ParseInclusiveOrExpression(inclusiveCtx, ResultUse::Value);
+                    left = firstOperand.value;
                     EnsureOperatorBoolForValue(left);
                     left = compiler->CoerceToBoolCondition(left);
                     compiler->CreateAssignment(left, resultStorage);
@@ -7919,6 +8026,31 @@ LLVMBackend::TypedValue MainListener::ParseShiftExpression(CFlatParser::ShiftExp
             // overload, so primitive integer bit-shifts fall through to CreateOperation.
             if (op == ">>" || op == "<<")
             {
+                /*
+                 * A C++ `operator<<` / `operator>>` (member or free, and typically taking its left
+                 * operand by NON-CONST reference - the stream idiom) goes through the shared
+                 * operator path: that is what hands the callee the caller's own storage instead of
+                 * a copy, and what finds a free operator through the right operand's namespace.
+                 */
+                if ((!lhsType.empty() && compiler->IsCxxRecord(lhsType))
+                    || (!rhsType.empty() && compiler->IsCxxRecord(rhsType)))
+                {
+                    llvm::Value* lhsStorage = lhsNV.Storage != nullptr ? lhsNV.Storage
+                                                                      : lv.receiverStorage;
+                    llvm::Value* rhsStorage = rhsNV.Storage != nullptr ? rhsNV.Storage
+                                                                      : rv.receiverStorage;
+                    if (auto* overload = TryBinaryOperatorOverload(
+                            lv.value, op, rv.value, ctx, lv.elemType, rv.pointerDepth,
+                            rv.elemPointer, lhsStorage, rhsStorage, false))
+                    {
+                        LLVMBackend::NamedVariable resultNV;
+                        resultNV.Primary = overload;
+                        resultNV.TypeAndValue = compiler->lastCallReturnType;
+                        DiagnoseVoidResultConsumed(ctx, resultNV, use,
+                                                   std::format("'operator{}'", op));
+                        return { overload, resultNV.TypeAndValue.IsUnsignedInteger() != -1 };
+                    }
+                }
                 std::string opName = "operator" + op;
                 if (!lhsType.empty() && compiler->IsDataStructure(lhsType)
                     && HasOperatorOverloadForFirstParam(opName, lhsType))
@@ -8461,9 +8593,16 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
         llvm::Value* lvalue, const std::string& op, llvm::Value* rvalue,
         antlr4::ParserRuleContext* ctx, llvm::Type* lhsElemType,
         int rhsPointerDepth, bool rhsElemPointer, llvm::Value* lhsStorage,
-        llvm::Value* rhsStorage, bool reportMissing) {
+        llvm::Value* rhsStorage, bool reportMissing, bool allowReversed) {
         auto* compiler = Compiler(ctx);
         if (!lvalue) return nullptr;
+
+        // The caller's storage is only usable as the receiver when it describes the SAME object
+        // as the value. A PHI ((c ? a : b) == d, a re-materialized temporary) is fed by several
+        // slots, so handing one arm's storage to a C++ operator that mutates its receiver would
+        // write to the wrong object. Drop it and take the copy path instead.
+        if (llvm::isa<llvm::PHINode>(lvalue)) lhsStorage = nullptr;
+        if (rvalue != nullptr && llvm::isa<llvm::PHINode>(rvalue)) rhsStorage = nullptr;
 
         // If the LHS is a string literal (ptr to global constant), wrap it
         // as a %string struct so operator+(string, ...) can match.
@@ -8563,10 +8702,16 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
                         && candidate.Parameters[1].TypeName != rightInfo.second)
                         continue;
                     candidateFound = true;
+                    // Both operands reach this path as struct VALUES, so a parameter of pointer
+                    // shape - `const T&` or `T&` - is passed as the address of that value. The
+                    // raw spelling is the first source; the mapped shape is the fallback for a
+                    // signature whose spelling was not recorded.
                     if (!leftInfo.second.empty())
-                        leftReference = leftReference || isReferenceParam(candidate, 0);
+                        leftReference = leftReference || isReferenceParam(candidate, 0)
+                                     || candidate.Parameters[0].Pointer;
                     if (!rightInfo.second.empty())
-                        rightReference = rightReference || isReferenceParam(candidate, 1);
+                        rightReference = rightReference || isReferenceParam(candidate, 1)
+                                      || candidate.Parameters[1].Pointer;
                 }
                 if (!candidateFound) continue;
 
@@ -8579,9 +8724,18 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
                     result.BaseType = value != nullptr ? value->getType() : nullptr;
                     result.TypeAndValue.TypeName = typeName;
                     result.TypeAndValue.Pointer = reference;
+                    // A SCALAR operand (`5 == ops`, `sink << ops`) reaches here with no type
+                    // name, and overload resolution cannot score an unnamed argument against a
+                    // candidate parameter. Name it from its machine type.
+                    if (typeName.empty() && value != nullptr)
+                        result.TypeAndValue.TypeName = ScalarTypeNameForValue(value->getType());
                     if (reference)
                     {
-                        if (storage == nullptr && structType != nullptr)
+                        // The argument IS the address for a reference parameter: the operand's
+                        // own storage when it has any, otherwise a materialized temporary.
+                        if (storage != nullptr)
+                            result.Primary = storage;
+                        else if (structType != nullptr)
                         {
                             auto* temp = compiler->CreateAlloca(structType);
                             compiler->CreateAssignment(value, temp);
@@ -8604,6 +8758,73 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
                     return result;
                 }
             }
+            return nullptr;
+        };
+
+        /*
+         * C++20 REWRITTEN relational candidate: a class that declares only `operator<=>` still
+         * answers `a < b`, as `(a <=> b) < 0`. Every ordering category is a class holding one
+         * signed member (libc++: `signed char __value_`, -1 / 0 / 1, plus -127 for
+         * partial_ordering's `unordered`), so the ordering is lowered by reading that single
+         * member and comparing it against zero. That is ABI-safe because the member is the
+         * object's whole representation - the alternative, calling the ordering's own comparison
+         * operators, is impossible: they are constexpr friends with no emitted symbol to bind.
+         */
+        auto rewriteFromSpaceship = [&]() -> llvm::Value* {
+            const SpaceshipRelation* relation = nullptr;
+            for (const auto& candidate : kSpaceshipRelations)
+                if (op == candidate.spelling) { relation = &candidate; break; }
+            if (relation == nullptr) return nullptr;
+            llvm::Value* ordering = TryBinaryOperatorOverload(
+                lvalue, "<=>", rvalue, ctx, lhsElemType, rhsPointerDepth, rhsElemPointer,
+                lhsStorage, rhsStorage, false, allowReversed);
+            if (ordering == nullptr) return nullptr;
+            // The type mapper lowers every comparison category to that single signed byte; a
+            // one-field wrapper is unwrapped here for a `<=>` that returns something else.
+            while (ordering->getType()->isStructTy())
+            {
+                auto* st = llvm::cast<llvm::StructType>(ordering->getType());
+                if (st->getNumElements() != 1) return nullptr;
+                ordering = compiler->builder->CreateExtractValue(ordering, { 0 }, "ordval");
+            }
+            if (!ordering->getType()->isIntegerTy()) return nullptr;
+            // `low <= value <= high` as one unsigned range test, so an `unordered` value falls
+            // outside every relation instead of being read as "less" by a sign test.
+            llvm::Type* orderingType = ordering->getType();
+            llvm::Value* shifted = compiler->builder->CreateSub(
+                ordering, llvm::ConstantInt::get(orderingType, relation->low, /*IsSigned=*/true),
+                "ordbase");
+            return compiler->builder->CreateICmpULT(
+                shifted, llvm::ConstantInt::get(orderingType, relation->high - relation->low + 1),
+                "ordcmp");
+        };
+
+        // C++20 REVERSED candidate: `b == a` is considered when only `a == b` is declared, which
+        // is how a member `operator==(const Other&)` answers `other == self`. C++20 reverses
+        // `==` and `<=>` ONLY - `!=` is REWRITTEN from `==` (negateEquality above) and has no
+        // reversed form, so reversing it would answer an asymmetric `operator!=(A, B)` for
+        // `b != a` with the operands swapped, silently returning the wrong result. The rewrite
+        // is also limited to imported C++ operands: a native CFlat overload set keeps its
+        // stricter "no operator" diagnostic.
+        auto reversedCandidate = [&]() -> llvm::Value* {
+            if (!allowReversed || rvalue == nullptr) return nullptr;
+            if (op != "==" && op != "<=>") return nullptr;
+            auto isCxxOperand = [&](llvm::Value* value) {
+                if (value == nullptr || !value->getType()->isStructTy()) return false;
+                auto* st = llvm::cast<llvm::StructType>(value->getType());
+                if (st->isLiteral() || !st->hasName()) return false;
+                return compiler->IsCxxRecord(st->getName().str());
+            };
+            if (!isCxxOperand(lvalue) && !isCxxOperand(rvalue)) return nullptr;
+            return TryBinaryOperatorOverload(rvalue, op, lvalue, ctx, nullptr, 0, false,
+                                             rhsStorage, lhsStorage, false, false);
+        };
+
+        // Every C++20 rewrite, in the order the standard considers them.
+        auto tryRewrites = [&]() -> llvm::Value* {
+            if (llvm::Value* rewritten = negateEquality())      return rewritten;
+            if (llvm::Value* rewritten = rewriteFromSpaceship()) return rewritten;
+            if (llvm::Value* rewritten = reversedCandidate())    return rewritten;
             return nullptr;
         };
 
@@ -8630,13 +8851,17 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
         {
             if (auto* bound = TryPointerLhsOperatorOverload(lvalue, op, rvalue, ctx, lhsElemType))
                 return bound;
-            return negateEquality();
+            if (llvm::Value* rewritten = tryRewrites()) return rewritten;
+            return nullptr;
         }
 
         if (!ty->isStructTy())
         {
             llvm::Value* freeResult = tryFreeOperator();
             if (freeResult != nullptr) return freeResult;
+            // A scalar left operand still reaches a class operator through the C++20 reversed
+            // candidate: `5 == ops` selects the member `operator==(int)` with swapped operands.
+            if (llvm::Value* rewritten = tryRewrites()) return rewritten;
             if (rvalue != nullptr && rvalue->getType()->isStructTy())
             {
                 auto* rhsStruct = llvm::cast<llvm::StructType>(rvalue->getType());
@@ -8656,7 +8881,7 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
         {
             llvm::Value* freeResult = tryFreeOperator();
             if (freeResult != nullptr) return freeResult;
-            if (llvm::Value* equality = negateEquality()) return equality;
+            if (llvm::Value* rewritten = tryRewrites()) return rewritten;
             return reportNoOperator(typeName);
         }
 
@@ -8674,7 +8899,7 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
         {
             llvm::Value* freeResult = tryFreeOperator();
             if (freeResult != nullptr) return freeResult;
-            if (llvm::Value* equality = negateEquality()) return equality;
+            if (llvm::Value* rewritten = tryRewrites()) return rewritten;
             return reportNoOperator(typeName);
         }
         // A ternary PHI inside a call argument is either covered per arm or by this operator;
@@ -8782,8 +9007,21 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
         if (usePointer)
         {
             // By-pointer dispatch: conventional user-defined struct operators (T* this).
-            auto* tempAlloca = compiler->CreateAlloca(structTy);
-            compiler->CreateAssignment(lvalue, tempAlloca);
+            /*
+             * A C++ operator selected by pointer takes its left operand as `this` or as a
+             * reference, and C++ NEVER copies for either: it binds the caller's object. Hand over
+             * the real storage when there is any, or a mutating operator (`a += b`,
+             * `sink << value`) would update a temporary. A by-VALUE C++ parameter is not a
+             * pointer, so it never reaches this branch and still gets its copy.
+             */
+            llvm::Value* tempAlloca = nullptr;
+            if (lhsStorage != nullptr && compiler->IsCxxRecord(typeName))
+                tempAlloca = lhsStorage;
+            else
+            {
+                tempAlloca = compiler->CreateAlloca(structTy);
+                compiler->CreateAssignment(lvalue, tempAlloca);
+            }
 
             LLVMBackend::NamedVariable thisNV;
             thisNV.TypeAndValue.TypeName = typeName;

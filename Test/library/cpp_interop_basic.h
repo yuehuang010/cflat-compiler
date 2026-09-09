@@ -6,6 +6,7 @@
 
 #include <functional>
 #include <array>
+#include <compare>
 #include <cstddef>
 #include <initializer_list>
 #include <memory>
@@ -569,6 +570,136 @@ namespace cppi
                                const FreeArithmetic& b) noexcept
         { return a.value == b.value; }
     }
+
+    // M40: the full C++ operator grid. Member forms live on Ops, free forms on
+    // opsfree::FreeOps, so both lookup paths are covered by the same set of spellings.
+    struct Ops
+    {
+        int value;
+        int slots[2];
+
+        Ops operator+(const Ops& o) const noexcept { return Ops{value + o.value, {0, 0}}; }
+        Ops operator-(const Ops& o) const noexcept { return Ops{value - o.value, {0, 0}}; }
+        Ops operator*(const Ops& o) const noexcept { return Ops{value * o.value, {0, 0}}; }
+        Ops operator/(const Ops& o) const noexcept { return Ops{value / o.value, {0, 0}}; }
+        Ops operator%(const Ops& o) const noexcept { return Ops{value % o.value, {0, 0}}; }
+        Ops operator&(const Ops& o) const noexcept { return Ops{value & o.value, {0, 0}}; }
+        Ops operator|(const Ops& o) const noexcept { return Ops{value | o.value, {0, 0}}; }
+        Ops operator^(const Ops& o) const noexcept { return Ops{value ^ o.value, {0, 0}}; }
+        Ops operator<<(const Ops& o) const noexcept { return Ops{value << o.value, {0, 0}}; }
+        Ops operator>>(const Ops& o) const noexcept { return Ops{value >> o.value, {0, 0}}; }
+        bool operator&&(const Ops& o) const noexcept { return value != 0 && o.value != 0; }
+        bool operator||(const Ops& o) const noexcept { return value != 0 || o.value != 0; }
+
+        Ops& operator+=(const Ops& o) noexcept { value += o.value; return *this; }
+        Ops& operator-=(const Ops& o) noexcept { value -= o.value; return *this; }
+        Ops& operator*=(const Ops& o) noexcept { value *= o.value; return *this; }
+        Ops& operator/=(const Ops& o) noexcept { value /= o.value; return *this; }
+        Ops& operator%=(const Ops& o) noexcept { value %= o.value; return *this; }
+        Ops& operator&=(const Ops& o) noexcept { value &= o.value; return *this; }
+        Ops& operator|=(const Ops& o) noexcept { value |= o.value; return *this; }
+        Ops& operator^=(const Ops& o) noexcept { value ^= o.value; return *this; }
+        Ops& operator<<=(const Ops& o) noexcept { value <<= o.value; return *this; }
+        Ops& operator>>=(const Ops& o) noexcept { value >>= o.value; return *this; }
+
+        // C++20: != < > <= >= are REWRITTEN from these two.
+        bool operator==(const Ops& o) const noexcept { return value == o.value; }
+        std::strong_ordering operator<=>(const Ops& o) const noexcept { return value <=> o.value; }
+        bool operator==(int rhs) const noexcept { return value == rhs; }
+
+        Ops operator-() const noexcept { return Ops{-value, {0, 0}}; }
+        Ops operator+() const noexcept { return Ops{value, {0, 0}}; }
+        bool operator!() const noexcept { return value == 0; }
+        Ops operator~() const noexcept { return Ops{~value, {0, 0}}; }
+        Ops& operator++() noexcept { value += 1; return *this; }
+        Ops operator++(int) noexcept { Ops old{value, {0, 0}}; value += 1; return old; }
+        Ops& operator--() noexcept { value -= 1; return *this; }
+        Ops operator--(int) noexcept { Ops old{value, {0, 0}}; value -= 1; return old; }
+
+        int& operator[](int index) noexcept { return slots[index]; }
+        int operator[](int index) const noexcept { return slots[index] + 100; }
+
+        int operator()() const noexcept { return value; }
+        int operator()(int a) const noexcept { return value + a; }
+        int operator()(int a, int b) const noexcept { return value + a * b; }
+
+        explicit operator bool() const noexcept { return value != 0; }
+        operator int() const noexcept { return value; }
+        operator double() const noexcept { return (double)value + 0.5; }
+    };
+
+    // Reversed scalar comparison: only `int == Ops` exists as a free function.
+    inline bool operator==(int lhs, const Ops& rhs) noexcept { return lhs == rhs.value + 1; }
+
+    // Unary * and -> forwarding.
+    struct OpsBox
+    {
+        Ops* target;
+        Ops& operator*() const noexcept { return *target; }
+        Ops* operator->() const noexcept { return target; }
+    };
+
+    // Reversed member ==: only Rev declares it, so `other == rev` needs the C++20 rewrite.
+    struct RevOther { int value; };
+    struct Rev
+    {
+        int value;
+        bool operator==(const RevOther& o) const noexcept { return value == o.value; }
+    };
+
+    // A foreign left operand in another namespace, for the `OpsSink << FreeOps` case.
+    struct OpsSink { int total; };
+
+    namespace opsfree
+    {
+        struct FreeOps { int value; };
+
+        inline FreeOps operator+(const FreeOps& a, const FreeOps& b) noexcept { return FreeOps{a.value + b.value}; }
+        inline FreeOps operator-(const FreeOps& a, const FreeOps& b) noexcept { return FreeOps{a.value - b.value}; }
+        inline FreeOps operator*(const FreeOps& a, const FreeOps& b) noexcept { return FreeOps{a.value * b.value}; }
+        inline FreeOps operator/(const FreeOps& a, const FreeOps& b) noexcept { return FreeOps{a.value / b.value}; }
+        inline FreeOps operator%(const FreeOps& a, const FreeOps& b) noexcept { return FreeOps{a.value % b.value}; }
+        inline FreeOps operator&(const FreeOps& a, const FreeOps& b) noexcept { return FreeOps{a.value & b.value}; }
+        inline FreeOps operator|(const FreeOps& a, const FreeOps& b) noexcept { return FreeOps{a.value | b.value}; }
+        inline FreeOps operator^(const FreeOps& a, const FreeOps& b) noexcept { return FreeOps{a.value ^ b.value}; }
+        inline FreeOps operator<<(const FreeOps& a, const FreeOps& b) noexcept { return FreeOps{a.value << b.value}; }
+        inline FreeOps operator>>(const FreeOps& a, const FreeOps& b) noexcept { return FreeOps{a.value >> b.value}; }
+        inline bool operator&&(const FreeOps& a, const FreeOps& b) noexcept { return a.value != 0 && b.value != 0; }
+        inline bool operator||(const FreeOps& a, const FreeOps& b) noexcept { return a.value != 0 || b.value != 0; }
+
+        inline FreeOps& operator+=(FreeOps& a, const FreeOps& b) noexcept { a.value += b.value; return a; }
+        inline FreeOps& operator-=(FreeOps& a, const FreeOps& b) noexcept { a.value -= b.value; return a; }
+        inline FreeOps& operator*=(FreeOps& a, const FreeOps& b) noexcept { a.value *= b.value; return a; }
+        inline FreeOps& operator/=(FreeOps& a, const FreeOps& b) noexcept { a.value /= b.value; return a; }
+        inline FreeOps& operator%=(FreeOps& a, const FreeOps& b) noexcept { a.value %= b.value; return a; }
+        inline FreeOps& operator&=(FreeOps& a, const FreeOps& b) noexcept { a.value &= b.value; return a; }
+        inline FreeOps& operator|=(FreeOps& a, const FreeOps& b) noexcept { a.value |= b.value; return a; }
+        inline FreeOps& operator^=(FreeOps& a, const FreeOps& b) noexcept { a.value ^= b.value; return a; }
+        inline FreeOps& operator<<=(FreeOps& a, const FreeOps& b) noexcept { a.value <<= b.value; return a; }
+        inline FreeOps& operator>>=(FreeOps& a, const FreeOps& b) noexcept { a.value >>= b.value; return a; }
+
+        // All six spelled out: no rewriting needed on this class.
+        inline bool operator==(const FreeOps& a, const FreeOps& b) noexcept { return a.value == b.value; }
+        inline bool operator!=(const FreeOps& a, const FreeOps& b) noexcept { return a.value != b.value; }
+        inline bool operator<(const FreeOps& a, const FreeOps& b) noexcept { return a.value < b.value; }
+        inline bool operator>(const FreeOps& a, const FreeOps& b) noexcept { return a.value > b.value; }
+        inline bool operator<=(const FreeOps& a, const FreeOps& b) noexcept { return a.value <= b.value; }
+        inline bool operator>=(const FreeOps& a, const FreeOps& b) noexcept { return a.value >= b.value; }
+
+        inline FreeOps operator-(const FreeOps& a) noexcept { return FreeOps{-a.value}; }
+        inline FreeOps operator+(const FreeOps& a) noexcept { return FreeOps{a.value}; }
+        inline bool operator!(const FreeOps& a) noexcept { return a.value == 0; }
+        inline FreeOps operator~(const FreeOps& a) noexcept { return FreeOps{~a.value}; }
+        inline FreeOps& operator++(FreeOps& a) noexcept { a.value += 1; return a; }
+        inline FreeOps operator++(FreeOps& a, int) noexcept { FreeOps old{a.value}; a.value += 1; return old; }
+        inline FreeOps& operator--(FreeOps& a) noexcept { a.value -= 1; return a; }
+        inline FreeOps operator--(FreeOps& a, int) noexcept { FreeOps old{a.value}; a.value -= 1; return old; }
+
+        // Left operand is a class from the ENCLOSING namespace: found through the right operand.
+        inline cppi::OpsSink& operator<<(cppi::OpsSink& sink, const FreeOps& v) noexcept
+        { sink.total += v.value; return sink; }
+    }
+
 }
 
 extern "C" int cppi_c_linkage(int v) noexcept;

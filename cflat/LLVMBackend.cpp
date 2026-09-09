@@ -2417,7 +2417,7 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
     // A companion link internalized the inline definitions nothing in the program reaches; delete
     // them here so their undefined references never reach the linker, at any -O level and with
     // --no-opt too. What the program does reach is referenced, so GlobalDCE keeps it.
-    if (cxxCompanionLinked_ && !checkOnly)
+    if (cxxCompanionInternalized_ && !checkOnly)
     {
         llvm::TimeTraceScope dceScope("GlobalDCE", "cxx-companion");
         if (verbose) std::cout << "[verbose] dropping unreached C++ companion definitions\n";
@@ -4443,6 +4443,8 @@ void LLVMBackend::ResetForReanalysis()
     cxxForeignNamespaces_.clear();
     cxxForeignTypeSpellings_.clear();
     cxxFunctionPointerAbiPlans_.clear();
+    cxxFunctionPointerAbiRefusals_.clear();
+    cxxCompanionInternalized_ = false;
     cxxCflatToCxxSpelling_.clear();
     cxxLazyAliasSpecializations_.clear();
     cxxForeignRequests_.clear();

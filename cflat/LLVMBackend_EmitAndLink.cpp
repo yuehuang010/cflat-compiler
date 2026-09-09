@@ -2732,22 +2732,31 @@ bool LLVMBackend::LinkCxxCompanionModules()
      * kept by GlobalDCE exactly as before, and one nothing reaches is deleted along with its
      * undefined references. COMDATs go with it - inside one module there is nothing left to merge.
      */
+    /*
+     * ONLY functions are demoted. A weak DATA definition can carry an identity that the rest of
+     * the image shares - a C++17 `inline` variable, a function-local `static` in an inline body
+     * together with its `__cxa_guard` variable, a `vtable`/`typeinfo` for a class with no key
+     * function - and privatizing it hands cflat code a second copy while a linked `.c`/`.cpp`
+     * object keeps the shared one: two counters, two singletons, two vtables that compare
+     * unequal. Aliases are skipped for the same reason (an alias names the aliasee's identity).
+     * Internalizing a FUNCTION is safe for those cases: the static local, its guard and any
+     * inline variable it touches keep their ODR linkage and still merge across the image, so at
+     * most the code is duplicated, never the state.
+     */
     size_t internalized = 0;
-    auto demote = [&](llvm::GlobalValue& gv) {
+    auto demote = [&](llvm::Function& gv) {
         if (gv.isDeclaration() || !gv.hasName()) return;
         if (programOrigin.count(gv.getName().str()) != 0) return;
-        if (!gv.hasLinkOnceLinkage() && !gv.hasWeakLinkage() && !gv.hasCommonLinkage()) return;
-        if (auto* go = llvm::dyn_cast<llvm::GlobalObject>(&gv)) go->setComdat(nullptr);
+        if (!gv.hasLinkOnceLinkage() && !gv.hasWeakLinkage()) return;
+        gv.setComdat(nullptr);
         gv.setLinkage(llvm::GlobalValue::InternalLinkage);
         ++internalized;
     };
     for (llvm::Function& f : module->functions())       demote(f);
-    for (llvm::GlobalVariable& g : module->globals())   demote(g);
-    for (llvm::GlobalAlias& a : module->aliases())      demote(a);
     if (verbose)
         std::cout << std::format("[verbose] C++ companion: {} definition(s) internalized for "
                                  "dead-code elimination\n", internalized);
-    cxxCompanionLinked_ = internalized != 0;
+    cxxCompanionInternalized_ = internalized != 0;
     return true;
 }
 

@@ -1106,6 +1106,25 @@ bool LLVMBackend::MapCTypeToTypeAndValueImpl(std::string ctype, TypeAndValue& ou
             return true;
         }
 
+        /*
+         * The C++20 comparison categories are ONE signed byte of representation (libc++ holds a
+         * `signed char __value_`), and the standard defines their meaning as that value's
+         * relation to literal 0. Map them to CFlat's i8: clang returns a one-byte trivially
+         * copyable class in exactly the register a `signed char` uses, so the ABI is unchanged,
+         * and the relational operators rewritten from `operator<=>` compare the result directly.
+         */
+        // Anchored to namespace std (plus libc++'s inline `std.__1.`): a user type that merely
+        // ends in `weak_ordering` is a different class with a different layout and must not be
+        // lowered to one byte.
+        if (ptr == 0 && base.starts_with("std."))
+            for (const char* ordering : { ".strong_ordering", ".weak_ordering",
+                                          ".partial_ordering" })
+                if (base.size() > std::strlen(ordering) && base.ends_with(ordering))
+                {
+                    out.TypeName = "i8";
+                    return true;
+                }
+
         // enum decays to int. struct/union by-value: look up in dataStructures for ABI lowering.
         // struct/union pointers become opaque void* (only a pointer-sized slot is needed).
         std::string mapped;
@@ -2182,6 +2201,11 @@ void LLVMBackend::RegisterCxxFunctionPointerAbis(
                 if (verbose && !abiMismatch.empty())
                     std::cout << std::format("[verbose]   C++ callback {} not bound: {}\n",
                                              raw.signature, abiMismatch);
+                // Record the refusal so a call site that lowers a function pointer of this shape
+                // reports it instead of falling back to the heuristic ABI silently.
+                cxxFunctionPointerAbiRefusals_.emplace(
+                    FunctionPointerAbiKey(plan.ret, plan.params),
+                    abiMismatch.empty() ? raw.signature : abiMismatch);
                 continue;
             }
             cxxFunctionPointerAbiPlans_.emplace(
@@ -2806,11 +2830,22 @@ bool LLVMBackend::ExtractCHeaderClang(const std::vector<std::string>& headerPath
             // cannot resolve the namespace.
             auto seedNamespace = [&](const std::string& spelling) {
                 size_t end = spelling.find("::");
+                // A leading '::' is the global scope qualifier; the namespace follows it.
+                if (end == 0) end = spelling.find("::", 2);
                 if (end == std::string::npos || end == 0) return;
-                std::string lead = spelling.substr(0, end);
-                while (!lead.empty() && (lead.front() == ' ' || lead.front() == '*'))
-                    lead.erase(lead.begin());
-                if (lead.empty()) return;
+                // Take the identifier immediately before the '::'. Clang's canonical spelling
+                // carries cv-qualifiers and elaborated keywords ("const c10::Scalar &"), so a
+                // plain prefix would yield "const c10" and never seed the real namespace.
+                size_t begin = end;
+                while (begin > 0
+                       && (std::isalnum((unsigned char)spelling[begin - 1]) != 0
+                           || spelling[begin - 1] == '_'))
+                    --begin;
+                std::string lead = spelling.substr(begin, end - begin);
+                if (lead.empty() || std::isdigit((unsigned char)lead.front()) != 0) return;
+                for (const char* keyword : { "const", "volatile", "struct", "class",
+                                             "enum", "union" })
+                    if (lead == keyword) return;
                 cxxForeignNamespaces_.insert(lead);
                 if (activeCxxRequestGroup_->primary < cxxImportGroups_.size())
                     cxxImportGroups_[activeCxxRequestGroup_->primary].namespaces.insert(lead);
@@ -6220,8 +6255,9 @@ void LLVMBackend::RegisterCxxClassMembers(const CRecordEntry& r, const std::stri
         // Empty C++ classes still have constructors/destructors and are valid foreign types.
         // Keep the initial header walk bounded; requested specializations carry a '$' in their
         // CFlat identity and are retained even when Clang reports no callable members.
-        if (r.members.empty() && r.staticVars.empty() && r.layoutRefusal.empty()
-            && r.name.find('$') == std::string::npos && !IsCxxForeignTypeRegistered(r.name)) return;
+        // Registered BEFORE the memberless early-out below: a plain aggregate with no members
+        // of its own is still named by other signatures (`const cppi::RevOther&`), and without
+        // this entry the type mapper cannot resolve that spelling and refuses the member.
         // A class imported from a C++ HEADER group also gets a C++ spelling, so it can be a
         // template argument (`cppt.Box<cppi.Tracked>`). A request already recorded its own
         // spelling, which is the one the request TU was built with - never overwrite it.
@@ -6240,6 +6276,8 @@ void LLVMBackend::RegisterCxxClassMembers(const CRecordEntry& r, const std::stri
             if (!spelling.empty() && cxxForeignTypeSpellings_.count(SqueezeCxxSpelling(spelling)) == 0)
                 cxxForeignTypeSpellings_[SqueezeCxxSpelling(spelling)] = r.name;
         }
+        if (r.members.empty() && r.staticVars.empty() && r.layoutRefusal.empty()
+            && r.name.find('$') == std::string::npos && !IsCxxForeignTypeRegistered(r.name)) return;
 
         CxxClassInfo info;
         if (!memberFilter.empty())

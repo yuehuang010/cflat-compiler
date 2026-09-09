@@ -2306,7 +2306,9 @@ bool LLVMBackend::TryLoadCHeaderDiskCache(
         // v37 invalidates cached C++ member lists after plain-header special-member emission.
         // v38 carries member default arguments and opaque field size/alignment metadata.
         // v39 includes non-member C++ overloaded operators from the header walk.
-        if (version != 39) return false;
+        // v40 adds the member operators <=>, && and || to the bindable set, so a v39 member
+        // list is missing them (and with them the rewritten relational operators).
+        if (version != 40) return false;
 
         // Accept on mtime match (fast) or content hash match (authoritative on mtime drift).
         auto storedMtime = j.value("mtime", int64_t{-1});
@@ -2398,7 +2400,7 @@ void LLVMBackend::WriteCHeaderDiskCache(
         if (ec) return;
 
         nlohmann::json j;
-        j["version"] = 39;
+        j["version"] = 40;
         j["mtime"]   = (int64_t)mtime.time_since_epoch().count();
         j["hash"]    = contentHash;
         j["ldw"]     = entry.longDoubleWidth;

@@ -685,29 +685,40 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                 auto structData = compiler->GetDataStructure(namedVar.TypeAndValue.TypeName);
                 if (structData.StructType == nullptr) return false;
 
-                auto funcs = compiler->functionTable.find(opName);
-                if (funcs == compiler->functionTable.end())
+                const std::string& receiverType = namedVar.TypeAndValue.TypeName;
+                auto receiverMatches = [&](const std::string& tableName) {
+                    auto funcs = compiler->functionTable.find(tableName);
+                    if (funcs == compiler->functionTable.end()) return false;
+                    for (const auto& candidate : funcs->second)
+                        if (!candidate.Parameters.empty()
+                            && candidate.Parameters[0].TypeName == receiverType
+                            && candidate.Parameters[0].Pointer)
+                            return true;
+                    return false;
+                };
+                // A C++ FREE operator++ / operator-- lives under its namespace's private alias,
+                // exactly like the free binary operators: look it up through the operand's own
+                // namespace when no member declares one. The prefix form `operator@(T&)` is the
+                // one bound, matching the ruling that CFlat's only ++ spelling is postfix.
+                std::string callName = opName;
+                if (!receiverMatches(callName))
                 {
-                    LogErrorContext(ctx, std::format(
-                        "struct '{}' has no '{}'; define 'void {}()' on it or use a scalar",
-                        namedVar.TypeAndValue.TypeName, opName, opName));
-                    return true;
-                }
-                bool hasReceiver = false;
-                for (const auto& candidate : funcs->second)
-                    if (!candidate.Parameters.empty()
-                        && candidate.Parameters[0].TypeName == namedVar.TypeAndValue.TypeName
-                        && candidate.Parameters[0].Pointer)
+                    const size_t dot = receiverType.rfind('.');
+                    const std::string ns = dot == std::string::npos
+                        ? std::string() : receiverType.substr(0, dot);
+                    const std::string sourceName = ns.empty() ? std::string(opName)
+                                                              : ns + "." + opName;
+                    compiler->TryBindCxxFunction(sourceName);
+                    const std::string freeName = ns.empty()
+                        ? "__cxx_free." + std::string(opName) : sourceName;
+                    if (!receiverMatches(freeName))
                     {
-                        hasReceiver = true;
-                        break;
+                        LogErrorContext(ctx, std::format(
+                            "struct '{}' has no '{}'; define 'void {}()' on it or use a scalar",
+                            receiverType, opName, opName));
+                        return true;
                     }
-                if (!hasReceiver)
-                {
-                    LogErrorContext(ctx, std::format(
-                        "struct '{}' has no '{}'; define 'void {}()' on it or use a scalar",
-                        namedVar.TypeAndValue.TypeName, opName, opName));
-                    return true;
+                    callName = freeName;
                 }
 
                 if (ncChainNullBlock != nullptr)
@@ -732,7 +743,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                 thisNV.Primary = nullptr;
                 thisNV.Storage = storage;
                 thisNV.TypeAndValue.VariableName.clear();
-                compiler->CreateOverloadedFunctionCall(opName, { thisNV });
+                compiler->CreateOverloadedFunctionCall(callName, { thisNV });
 
                 namedVar.Primary = nullptr;
                 namedVar.Storage = storage;
@@ -1316,8 +1327,6 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             {
                                 qualifiedName = namespaceContext + "." + memberName;
                             }
-                            const std::string resolvedQualifiedName =
-                                Compiler(ctx)->ResolveTypeAlias(qualifiedName);
                             // A foreign class with nested declarations is also registered as a
                             // namespace. Prefer an actual static member at this exact path.
                             bool hasQualifiedMember =
@@ -1341,6 +1350,12 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             }
                             else
                             {
+                                // Resolved only on this path: an alias lookup can request a lazy
+                                // C++ specialization, and a name that turned out to be a plain
+                                // namespace must not pay for a clang re-parse (or record a
+                                // refusal) for a specialization nobody asked for.
+                                const std::string resolvedQualifiedName =
+                                    Compiler(ctx)->ResolveTypeAlias(qualifiedName);
                                 const bool qualifiedDataStructure =
                                     Compiler(ctx)->IsDataStructure(qualifiedName)
                                     || Compiler(ctx)->IsDataStructure(resolvedQualifiedName);
@@ -5421,7 +5436,12 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                                 Compiler(ctx)->CreateAssignment(defaultVal, alloca);
                                                 CallArgumentScope braceTernaryScope(
                                                     inCallArgument_, ternaryCallArgumentDepth_);
-                                                EmitFieldInitializer(alloca, structType, namedArgument->initializerList());
+                                                // An empty brace has no initializerList() child. It means
+                                                // "the default-initialized value", which GenerateDefaultValue
+                                                // already produced, so there is nothing more to emit. Same
+                                                // null guard the declaration site uses.
+                                                if (namedArgument->initializerList() != nullptr)
+                                                    EmitFieldInitializer(alloca, structType, namedArgument->initializerList());
                                                 llvm::Value* loaded = Compiler(ctx)->CreateLoad(alloca);
                                                 LLVMBackend::NamedVariable argVar;
                                                 argVar.Primary = loaded;

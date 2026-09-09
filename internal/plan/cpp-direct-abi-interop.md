@@ -820,6 +820,21 @@ Eigen -> libtorch; spikes under scratch/ladder/). Landed on master, in order:
 - c87675bb: free C++ operators bound through the operand namespace (left, then right), class
   results construct into declaration slots, `a += b` falls back to `a = a + b`; an unbound
   struct operator is a LogError instead of verifier-failing IR (cache v39). Fixture M32.
+- c3a73957: matmul/autograd rung - brace arguments go to generated initializer-list wrappers
+  (index({0, 0}) with TensorIndex), class-typed member defaults bound lazily on first use
+  (an import-time prewarm was tried and reverted: 13 min + SIGSEGV on libtorch), const& class
+  returns copied into locals, fixed-array element pointers. Fixture M33. t4 prints
+  loss=6.000000 g0=2.000000 dim=2 (188 s; t1 74 s).
+- b0e9448f: operator parity for imported classes (maintainer ruling 2026-09-09: "cflat should
+  be operator compatible with cpp"): <=>/&&/|| extracted, std::*_ordering as i8, relationals
+  rewritten from <=> as one range test each, reversed candidates and != from == in one
+  tryRewrites(), compound operators mutate the operand's own storage, free ++/--, unary *,
+  &&/|| without short-circuit. Cache v40, fixture M40 (900-983). Postfix operator++(int) stays
+  unextracted (no-prefix-increment ruling); operator[] const selection follows const-unenforced.
+- 056ddcc9: batch review of the day's commits (scratch/ladder/REVIEW_2026-09-09.md): native
+  `f({})` null-deref guarded, reversed candidates limited to ==/<=> on C++ records, companion
+  internalization demotes functions only (inline variables, guards, vtables keep ODR identity),
+  callback ABI refusals reported at the call site, namespace seeding and PHI-operand storage fixed.
 State: scratch/ladder/torch/ t1 (numel=3, 54 s), t2 (`at.sum(t).item().toDouble()` and the
 member `t.sum()` form, sum=6.000000), t3 (`t + t`, numel=3) all compile, link and run.
 In flight: t4 matmul/autograd/index (feature/cpp-torch4), t6 from_blob/TensorOptions/nn::Linear.

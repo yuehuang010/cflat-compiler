@@ -893,12 +893,14 @@ extern int main()
     int joinAcceptPassed = stringLiteralJoinAcceptLegs();
     int narrowPromoPassed = narrowUnaryAndTernaryPromotionLegs();
     int i128Passed = i128FeatureLegs();
+    int reversedPassed = reversedAndZeroArgOverloadLegs();
 
     return (callPassed == 12 && terPassed == 19 && ptrOpPassed == 8 && uPassed == 3
         && unsignedLiteralPassed == 8 && unsignedAcceptPassed == 7
         && chainPassed == 11 && softPassed == 1 && promoPassed == 11
         && signednessPassed == 38 && autoNarrowPassed == 4 && joinAcceptPassed == 5
-        && narrowPromoPassed == 46 && i128Passed == 29) ? 0 : 1;
+        && narrowPromoPassed == 46 && i128Passed == 29
+        && reversedPassed == 3) ? 0 : 1;
 }
 
 // C integer promotion for equal-width sub-int operands, plus the two literal-unsignedness
@@ -1234,6 +1236,45 @@ int autoNarrowMixedSignednessLegs()
     passed += Test("auto narrow mixed-sign *", narrowMultiply, -1);
     auto narrowXor = (u16)0 ^ (i16)-1;
     passed += Test("auto narrow mixed-sign ^", narrowXor, -1);
+    return passed;
+}
+
+// REVERSED-CANDIDATE scope. C++20 reverses '==' and '<=>' only, and cflat applies the rewrite
+// only when an operand is an imported C++ class. '!=' has NO reversed form (it is rewritten from
+// '=='), so an asymmetric native 'operator!=(RvA, RvB)' must not answer 'b != a' with the
+// operands swapped - that would silently return the wrong result.
+struct RvA { int x = 0; };
+struct RvB { int y = 0; };
+bool operator!=(RvA a, RvB b) { return a.x < b.y; }
+
+// ZERO-ARGUMENT overload scope. A zero-argument call takes the first zero-argument-bindable
+// candidate in registration order; two candidates that both bind with no arguments are refused
+// at DECLARATION time, which is what keeps that rule unambiguous.
+int zaPick() { return 1; }
+int zaPick(int x, int y) { return x + y; }
+
+expect_error("matches an overload that is already defined")
+{
+    int zaOverlap() { return 1; }
+    int zaOverlap(int x = 3) { return x; }
+}
+
+int reversedAndZeroArgOverloadLegs()
+{
+    int passed = 0;
+    RvA rvLeft = default;
+    rvLeft.x = 1;
+    RvB rvRight = default;
+    rvRight.y = 5;
+    passed += Test("asymmetric native operator!= in its declared order", rvLeft != rvRight, true);
+    expect_error("no operator '!=' for type 'RvB'")
+    {
+        RvB swappedLeft = default;
+        RvA swappedRight = default;
+        bool swapped = swappedLeft != swappedRight;
+    }
+    passed += Test("zero-argument call takes the zero-parameter overload", zaPick(), 1);
+    passed += Test("the same name still resolves with arguments", zaPick(2, 3), 5);
     return passed;
 }
 

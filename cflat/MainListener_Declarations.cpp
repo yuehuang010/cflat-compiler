@@ -3611,6 +3611,23 @@ bool MainListener::TryDeclareForeignCxxLocal(CFlatParser::InitDeclaratorContext*
         auto* ctorArgs = assign != nullptr ? ForeignCxxConstructArgs(assign, typeName) : nullptr;
         auto* moveExpr = assign != nullptr ? TopLevelMoveExpression(assign) : nullptr;
 
+        /*
+         * A record that is trivial on every axis (default construction, copy, destruction) is a
+         * plain value type. Clang still DECLARES an implicit copy constructor for such an
+         * aggregate as soon as anything returns it by value - a postfix `operator++(T&, int)` is
+         * enough - and that lone implicit entry must not turn `T x = default;` or
+         * `T x = <expression>;` into a constructor call. Only the explicit `T(args)` and
+         * `move <T>` spellings still need the C++ construction path here.
+         */
+        if (ctorArgs == nullptr && moveExpr == nullptr)
+        {
+            const auto* trivial = compiler->GetCxxClassInfo(typeName);
+            if (trivial != nullptr && trivial->hasTrivialDefaultCtor && trivial->hasTrivialCopyCtor
+                && trivial->hasTrivialDtor && !trivial->hasDeletedDefaultCtor
+                && !compiler->IsForeignNontrivialCxxClass(typeName))
+                return false;
+        }
+
         auto badInit = [&](antlr4::ParserRuleContext* where) {
             LogErrorContext(where, std::format(
                 "cannot initialize C++ class '{}' from this expression; use '{}(args)', "

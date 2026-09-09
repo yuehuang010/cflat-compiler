@@ -196,6 +196,13 @@ expect_error("at global scope")
 int cNoCtorSum(CNoCtor v) { return v.a + v.b + v.c + v.d; }      // pass by value
 CNoCtor cNoCtorMake()     { CNoCtor t; return t; }               // return by value
 
+// An EMPTY brace argument '{}' at a call site is the default-initialized value of the
+// parameter's struct type - there are no field initializers to apply. The declaration site
+// already accepted a null initializer list; the call site must too.
+struct EbaPoint { int x = default; int y = default; };
+int ebaTake(EbaPoint p) { return p.x * 10 + p.y; }
+int ebaTakeNamed(EbaPoint p, int scale) { return (p.x * 10 + p.y) + scale; }
+
 extern int main()
 {
     int passed = 0;
@@ -841,6 +848,11 @@ extern int main()
     total++; passed += Test("fixed-array element method receiver", methodValues[0].length(), 1);
     char[4] methodChars = { 'a', 'b', 'c', 0 };
     total++; passed += Test("fixed-array char toString conversion", methodChars.toString().length(), 3);
+    total++; passed += Test("empty brace argument is the default-initialized struct", ebaTake({}), 0);
+    EbaPoint ebaFilled = { x = 3, y = 4 };
+    total++; passed += Test("a filled brace argument still applies its fields", ebaTake(ebaFilled), 34);
+    total++; passed += Test("named empty brace argument is default-initialized",
+                            ebaTakeNamed(p: {}, scale: 7), 7);
     if (passed == total)
     {
         printf("ALL %d initializer-list tests passed.\n", total);
