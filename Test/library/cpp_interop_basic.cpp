@@ -161,7 +161,15 @@ namespace cppi
 
     DefaultPair default_pair(int a, int extra) noexcept { return DefaultPair{ a, extra }; }
     int DefaultArgs::scaled(int value, int extra) const noexcept { return value * 10 + extra; }
+    int DefaultArgs::bool_scaled(bool enabled) const noexcept { return enabled ? 1 : -1; }
     int DefaultArgs::static_scaled(int value, int extra) noexcept { return value * 100 + extra; }
+
+    int DefaultArgs::multi_defaults(const std::optional<int>& value, bool create_graph,
+                                    bool retain_graph,
+                                    const std::optional<std::vector<int>>& values) noexcept
+    {
+        return value.has_value() ? *value : 0;
+    }
 
     LayoutHolder make_layout_holder(int value) noexcept
     {
@@ -175,6 +183,13 @@ namespace cppi
         : values_(values), count_(count) {}
     PointerCount::~PointerCount() noexcept {}
     long long PointerCount::first() const noexcept { return count_ == 0 ? 0 : values_[0]; }
+
+    int DefaultArgs::brace_sum(std::initializer_list<IndexLike> values) const noexcept
+    {
+        int result = 0;
+        for (const IndexLike& value : values) result += value.value;
+        return result;
+    }
 
     Small small_bump(Small v) noexcept
     {
@@ -326,6 +341,11 @@ namespace cppi
         return local.value();
     }
     int take_ref(const Tracked& t) noexcept { return t.value(); }
+    const Tracked& tracked_ref() noexcept
+    {
+        static Tracked value(812);
+        return value;
+    }
     int take_either(const Tracked& t) noexcept { return 1; }
     int take_either(Tracked&& t) noexcept
     {

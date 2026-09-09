@@ -3623,7 +3623,16 @@ std::string LLVMBackend::CxxBraceElementSpelling(const CxxBraceArgument& brace,
                                                  const std::string& targetParameter) const
 {
         std::string target = CxxBraceTargetElementSpelling(targetParameter);
-        if (!target.empty()) return target;
+        bool targetIsCxxRecord = false;
+        if (!target.empty())
+            for (const auto& [cflatName, cxxSpelling] : cxxCflatToCxxSpelling_)
+                if (cxxSpelling == target && IsCxxRecord(cflatName))
+                {
+                    targetIsCxxRecord = true;
+                    break;
+                }
+        // Keep scalar brace arguments matchable when C++ converts them into a record element.
+        if (!target.empty() && !(targetIsCxxRecord && brace.allIntegerLiterals)) return target;
         auto cflatTypeOf = [&](const NamedVariable& arg) {
             std::string type = arg.TypeAndValue.TypeName;
             bool pointer = arg.TypeAndValue.Pointer;
@@ -3676,7 +3685,7 @@ std::string LLVMBackend::CxxBraceElementSpelling(const CxxBraceArgument& brace,
                 || stringLiteral)
                 one = "const char *";
             else if (brace.allIntegerLiterals && !element.TypeAndValue.Pointer)
-                one = "long";
+                one = targetIsCxxRecord ? "int" : "long";
             else if (!CxxSpellingForCflatType(cflatType, one))
                 return {};
             if (spelling.empty()) spelling = one;
@@ -3922,7 +3931,15 @@ bool LLVMBackend::RequestCxxFunctionTemplate(const std::string& functionName,
         auto braceElementSpelling = [&](const CxxBraceArgument& brace,
                                         const std::string& targetParameter) {
             std::string target = CxxBraceTargetElementSpelling(targetParameter);
-            if (!target.empty()) return target;
+            bool targetIsCxxRecord = false;
+            if (!target.empty())
+                for (const auto& [cflatName, cxxSpelling] : cxxCflatToCxxSpelling_)
+                    if (cxxSpelling == target && IsCxxRecord(cflatName))
+                    {
+                        targetIsCxxRecord = true;
+                        break;
+                    }
+            if (!target.empty() && !(targetIsCxxRecord && brace.allIntegerLiterals)) return target;
             std::string spelling;
             for (const auto& element : brace.elements)
             {
@@ -3942,7 +3959,7 @@ bool LLVMBackend::RequestCxxFunctionTemplate(const std::string& functionName,
                     || stringLiteral)
                     one = "const char *";
                 else if (brace.allIntegerLiterals && !element.TypeAndValue.Pointer)
-                    one = "long";
+                    one = targetIsCxxRecord ? "int" : "long";
                 else if (!CxxSpellingForCflatType(cflatType, one))
                     return std::string();
                 if (spelling.empty()) spelling = one;
@@ -4282,7 +4299,18 @@ bool LLVMBackend::RequestCxxBraceFunction(const std::string& functionName,
                     error = "brace arguments must contain scalar values of one type";
                     return false;
                 }
-                std::string braceCall = "{";
+                std::string braceContainer = i < selected.paramTypes.size()
+                    ? TrimCxxBraceType(selected.paramTypes[i]) : std::string();
+                while (!braceContainer.empty()
+                       && (braceContainer.back() == '&' || braceContainer.back() == '*'))
+                {
+                    braceContainer.pop_back();
+                    while (!braceContainer.empty()
+                           && std::isspace((unsigned char)braceContainer.back()))
+                        braceContainer.pop_back();
+                }
+                std::string braceCall = CxxBraceTargetElementSpelling(braceContainer).empty()
+                    ? "{" : braceContainer + "{";
                 for (size_t element = 0; element < brace->elements.size(); ++element)
                 {
                     if (element != 0) braceCall += ", ";
@@ -5151,12 +5179,12 @@ void LLVMBackend::CollectCxxMemberRequestItems(const std::vector<CRecordEntry>& 
                     if (named.find('<') == std::string::npos
                         || named.find('(') != std::string::npos)
                         continue;
-                    if (!seen.insert(SqueezeCxxSpelling(named)).second) continue;
                     TypeAndValue mapped;
                     bool mappedForeign = false;
                     if (TryMapCxxForeignSpelling(named, mapped, mappedForeign) && mappedForeign) continue;
                     const std::string identity = AutoCxxForeignIdentity(named);
                     if (identity.empty()) continue;
+                    if (!seen.insert(SqueezeCxxSpelling(named)).second) continue;
                     CxxRequestItem item;
                     item.cflatName = identity;
                     item.cxxSpelling = named;
@@ -6830,6 +6858,41 @@ bool LLVMBackend::TryBindRefusedCxxMember(const std::string& typeName,
             cxxRecordEntries_[typeName] = previousRecord;
             return false;
         }
+
+        bool classTypedDefault = false;
+        for (const auto& member : reboundRecord.members)
+        {
+            if (member.name != memberName
+                || (member.kind != cflat_cinterop::RawCxxMember::Instance
+                    && member.kind != cflat_cinterop::RawCxxMember::StaticMethod))
+                continue;
+            for (size_t n = 0; n < member.paramTypes.size()
+                              && n < member.defaultArgs.size(); ++n)
+            {
+                if (member.defaultArgs[n].kind != "nonconst"
+                    || !HasNonConstDefaultSuffix(member.defaultArgs, n))
+                    continue;
+                TypeAndValue param;
+                if (MapCTypeToTypeAndValue(member.paramTypes[n], param)
+                    && dataStructures.count(param.TypeName) != 0)
+                    classTypedDefault = true;
+            }
+        }
+        bool defaultWrapperBound = false;
+        const std::string functionName = instanceBound ? memberName : typeName + "." + memberName;
+        if (auto functions = functionTable.find(functionName); functions != functionTable.end())
+            for (const auto& function : functions->second)
+                if (function.UniqueName.starts_with("__cflat_dflt_")
+                    && (!instanceBound || (!function.Parameters.empty()
+                        && function.Parameters[0].TypeName == typeName)))
+                {
+                    defaultWrapperBound = true;
+                    break;
+                }
+        if (classTypedDefault && defaultWrapperBound && verbose)
+            std::cout << std::format(
+                "[verbose]   C++ member {}.{} default wrapper bound on first use\n",
+                typeName, memberName);
 
         updated->second.refusedMembers.erase(memberName);
         if (instanceBound

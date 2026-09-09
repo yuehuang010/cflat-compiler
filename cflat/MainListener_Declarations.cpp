@@ -3879,8 +3879,19 @@ bool MainListener::TryDeclareForeignCxxLocal(CFlatParser::InitDeclaratorContext*
             compiler->pendingCxxSretTypeName_.clear();
             if (consumed) return true;
             const bool sameType = rightNV.TypeAndValue.TypeName == typeName
-                               && !rightNV.TypeAndValue.Pointer && rightNV.Primary != nullptr
-                               && rightNV.Primary == compiler->lastCxxRetValue_;
+                               && !rightNV.TypeAndValue.Pointer
+                               && ((rightNV.Primary != nullptr
+                                    && rightNV.Primary == compiler->lastCxxRetValue_)
+                                   || rightNV.Storage != nullptr);
+            // A C++ reference-return call is an alias lvalue: its address is in Storage and Primary
+            // is cleared by PrepareAliasCallResult, so copy it into the declared slot as a class lvalue.
+            if (sameType && rightNV.Storage != nullptr)
+            {
+                compiler->EmitCxxCopyOrMoveConstruct(typeName, slot, rightNV.Storage,
+                                                     /*useMove*/ false,
+                                                     std::format("into local '{}'", name).c_str());
+                return true;
+            }
             if (sameType && compiler->lastCxxRetTemp_ != nullptr)
             {
                 compiler->EmitCxxCopyOrMoveConstruct(typeName, slot, compiler->lastCxxRetTemp_,

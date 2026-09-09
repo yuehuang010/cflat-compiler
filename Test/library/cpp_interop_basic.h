@@ -7,6 +7,7 @@
 #include <functional>
 #include <array>
 #include <cstddef>
+#include <initializer_list>
 #include <memory>
 #include <map>
 #include <optional>
@@ -153,12 +154,23 @@ namespace cppi
     struct DefaultPair { int a; int b; };
     DefaultPair default_pair(int a, int extra = default_extra()) noexcept;
 
+    struct IndexLike
+    {
+        IndexLike(int value) noexcept : value(value) {}
+        int value;
+    };
+
     class DefaultArgs
     {
     public:
         int state;
         int scaled(int value, int extra = default_extra()) const noexcept;
+        int bool_scaled(bool enabled = true) const noexcept;
         static int static_scaled(int value, int extra = default_extra()) noexcept;
+        static int multi_defaults(const std::optional<int>& value = std::nullopt,
+                                  bool create_graph = false, bool retain_graph = false,
+                                  const std::optional<std::vector<int>>& values = std::nullopt) noexcept;
+        int brace_sum(std::initializer_list<IndexLike> values) const noexcept;
     };
 
     // The LayoutPair specialization is deliberately not requested as a CFlat type. Its field
@@ -526,6 +538,7 @@ namespace cppi
     int take_moved(Tracked t) noexcept;
     int take_rvalue(Tracked&& t) noexcept;
     int take_ref(const Tracked& t) noexcept;
+    const Tracked& tracked_ref() noexcept;
     int take_either(const Tracked& t) noexcept;
     int take_either(Tracked&& t) noexcept;
     std::unique_ptr<Tracked> make_tracked_ptr(int payload) noexcept;

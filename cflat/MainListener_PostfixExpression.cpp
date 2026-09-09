@@ -1316,12 +1316,23 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             {
                                 qualifiedName = namespaceContext + "." + memberName;
                             }
+                            const std::string resolvedQualifiedName =
+                                Compiler(ctx)->ResolveTypeAlias(qualifiedName);
                             // A foreign class with nested declarations is also registered as a
                             // namespace. Prefer an actual static member at this exact path.
-                            const bool hasQualifiedMember =
+                            bool hasQualifiedMember =
                                 Compiler(ctx)->GetGlobalVariableNV(qualifiedName).Storage != nullptr
                                 || Compiler(ctx)->GetFunction(qualifiedName) != nullptr
                                 || Compiler(ctx)->HasCxxFunctionTemplate(qualifiedName);
+                            if (!hasQualifiedMember)
+                            {
+                                const std::string owner = Compiler(ctx)->IsDataStructure(namespaceContext)
+                                    ? namespaceContext : Compiler(ctx)->ResolveTypeAlias(namespaceContext);
+                                if (Compiler(ctx)->IsDataStructure(owner)
+                                    && Compiler(ctx)->TryBindRefusedCxxMember(owner, memberName))
+                                    hasQualifiedMember = Compiler(ctx)->GetFunction(
+                                        owner + "." + memberName) != nullptr;
+                            }
                             if (Compiler(ctx)->IsNamespace(qualifiedName) && !hasQualifiedMember)
                             {
                                 namespaceContext = Compiler(ctx)->ResolveNamespace(qualifiedName);
@@ -1330,8 +1341,6 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             }
                             else
                             {
-                                const std::string resolvedQualifiedName =
-                                    Compiler(ctx)->ResolveTypeAlias(qualifiedName);
                                 const bool qualifiedDataStructure =
                                     Compiler(ctx)->IsDataStructure(qualifiedName)
                                     || Compiler(ctx)->IsDataStructure(resolvedQualifiedName);
@@ -5394,7 +5403,9 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                         // value are intentionally absent from functionTable. Do not ask
                                         // the CFlat field-initializer resolver to diagnose those braces.
                                         std::string structType;
-                                        if (funcSym != nullptr)
+                                        // C++ brace arguments are resolved by the generated wrapper; keep them out of
+                                        // CFlat's field-initializer resolver, whose record-overload scan can be ambiguous.
+                                        if (funcSym != nullptr && !funcSym->IsCxx)
                                             structType = ResolveInitializerArgType(
                                                 ctx, functionName, effectiveIdx, namedParam);
                                         const bool foreignCxxRecord = !structType.empty()

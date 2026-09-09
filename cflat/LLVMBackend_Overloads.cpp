@@ -1115,8 +1115,23 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                                                         &candidate.DefaultArguments);
                 if (binding.Ok)
                 {
+                    // An exact wrapper for a class-typed default is needed for calls such as
+                    // static methods with several C++ object defaults. Keep primitive-only
+                    // nonconstant defaults on the diagnostic path.
+                    if (candidate.Parameters.empty()
+                        && candidate.UniqueName.starts_with("__cflat_dflt_"))
+                    {
+                        bool hasClassDefault = false;
+                        for (const auto& other : candidates)
+                            if (!other.UniqueName.starts_with("__cflat_dflt_"))
+                                for (size_t i = 0; i < other.DefaultArguments.size()
+                                     && i < other.Parameters.size(); ++i)
+                                    if (other.DefaultArguments[i].kind == "nonconst"
+                                        && dataStructures.count(other.Parameters[i].TypeName) != 0)
+                                        hasClassDefault = true;
+                        if (!hasClassDefault) continue;
+                    }
                     resolvedCandidate.emplace_back(arguments, candidate);
-                    break;
                 }
             }
             else

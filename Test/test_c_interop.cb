@@ -102,6 +102,9 @@
 //                       class-template specialization when the enclosing record is returned.
 //   Section M32 (801-806): free C++ operator overloads are found through the operand namespace,
 //                       including a nested namespace, and compound assignment falls back to '+'.
+//   Section M33 (807-812): fixed-array pointer ABI, bool and class-typed member defaults,
+//                       record conversion through an initializer_list wrapper, and a class
+//                       const-reference return copied into a local.
 
 import "library/c_alias_order_alias.h";
 import "library/c_alias_order_real.h";
@@ -2075,6 +2078,22 @@ extern int main()
     cppi.freeops.FreeArithmetic m32nestedSum = m32nestedA + m32nestedB;
     if (m32nestedSum.value != 10)                   return 805;
     if (!(m32nestedA == m32nestedA))                 return 806;
+    // ---- Section M33: C++ interop ladder rung 4 mechanisms (807-812) -------------------
+    long[2] m33dims = {17, 18};
+    cppi.PointerCount* m33pointer = new cppi.PointerCount(&m33dims[0], 2);
+    if (m33pointer.first() != 17)                   return 807;
+    delete m33pointer;
+
+    cppi.DefaultArgs m33args = default;
+    if (m33args.bool_scaled() != 1)                 return 808;
+    if (m33args.bool_scaled(false) != -1)           return 809;
+
+    if (cppi.DefaultArgs.multi_defaults() != 0)    return 810;
+
+    if (m33args.brace_sum({1, 2, 3}) != 6)        return 811;
+
+    cppi.Tracked m33tracked = cppi.tracked_ref();
+    if (m33tracked.value() != 812)                  return 812;
 
     return 0;
 }
