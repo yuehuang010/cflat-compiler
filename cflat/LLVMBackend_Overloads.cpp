@@ -278,7 +278,18 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                     bool coreUniqueOutParam = tmpParam.Pointer && !tmpParam.ElemPointer
                         && tmpArg.Pointer && IsCoreUniqueType(tmpParam.TypeName)
                         && MangledGenericArgument(*this, tmpParam.TypeName) == tmpArg.TypeName;
-                    if (coreUniqueValueReceiver || rawPointerToCoreUnique || coreUniqueToRawPointer
+                    const size_t paramIndex = std::distance(candidate.Parameters.begin(), candidateParamItr);
+                    const bool cxxByValueParam = candidate.IsCxx
+                        && paramIndex < candidate.Recipe.paramSlots.size()
+                        && candidate.Recipe.paramSlots[paramIndex].kind == AbiSlot::ByVal;
+                    const bool cxxIndirectValueParam = candidate.IsCxx
+                        && candidate.CxxAbi.valid
+                        && paramIndex < candidate.CxxAbi.params.size()
+                        && candidate.CxxAbi.params[paramIndex].kind == cflat_cinterop::RawAbiSlot::Indirect;
+                    if (CanImplicitlyConstructCxxClass(arg, *candidateParamItr,
+                                                        cxxByValueParam || cxxIndirectValueParam))
+                        result = 1;
+                    else if (coreUniqueValueReceiver || rawPointerToCoreUnique || coreUniqueToRawPointer
                         || coreUniqueOutParam
                         || IsStackValueToCoreUniqueInterface(arg, tmpParam))
                         result = 0;
@@ -378,6 +389,17 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                             ? 0 : CompareUpconvert(arg.BaseType, candidateParam);
                     if (IsRawPointerToCoreUnique(arg, *candidateParamItr))
                         result = 0;
+                    const size_t paramIndex = std::distance(candidate.Parameters.begin(), candidateParamItr);
+                    const bool cxxByValueParam = candidate.IsCxx
+                        && paramIndex < candidate.Recipe.paramSlots.size()
+                        && candidate.Recipe.paramSlots[paramIndex].kind == AbiSlot::ByVal;
+                    const bool cxxIndirectValueParam = candidate.IsCxx
+                        && candidate.CxxAbi.valid
+                        && paramIndex < candidate.CxxAbi.params.size()
+                        && candidate.CxxAbi.params[paramIndex].kind == cflat_cinterop::RawAbiSlot::Indirect;
+                    if (CanImplicitlyConstructCxxClass(arg, *candidateParamItr,
+                                                        cxxByValueParam || cxxIndirectValueParam))
+                        result = 1;
 
                     /*
                      * A function pointer or closure VALUE does not implicitly convert to a DATA
@@ -982,6 +1004,10 @@ bool LLVMBackend::RejectArrayViewParamBinding(const NamedVariable& arg, const Ty
 llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functionNameIn, const std::vector<LLVMBackend::NamedVariable>& arguments, bool forceRoot,
         const std::string& displayName)
 {
+        // These describe only the call being lowered. Clear them before overload probing so a
+        // later non-C++ call cannot make a chained result reuse an earlier sret temporary.
+        lastCxxRetTemp_ = nullptr;
+        lastCxxRetValue_ = nullptr;
         std::string functionName = ResolveQualifiedName(functionNameIn, forceRoot);
         std::string shownFunctionName = displayName;
         if (shownFunctionName.empty())
@@ -1466,6 +1492,25 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                 value.IsRvalue = true;
                 matched.push_back(std::move(value));
             }
+        }
+
+        // A scalar can bind to a C++ class reference through an implicit converting constructor.
+        // Materialize those temporaries only after overload selection so the selected constructor
+        // and the selected function agree on the same C++ conversion.
+        for (size_t i = 0; i < matched.size() && i < candidate.Parameters.size(); ++i)
+        {
+            const bool cxxByValueParam = candidate.IsCxx
+                && i < candidate.Recipe.paramSlots.size()
+                && candidate.Recipe.paramSlots[i].kind == AbiSlot::ByVal;
+            const bool cxxIndirectValueParam = candidate.IsCxx
+                && candidate.CxxAbi.valid
+                && i < candidate.CxxAbi.params.size()
+                && candidate.CxxAbi.params[i].kind == cflat_cinterop::RawAbiSlot::Indirect;
+            if (!CanImplicitlyConstructCxxClass(matched[i], candidate.Parameters[i],
+                                                cxxByValueParam || cxxIndirectValueParam)) continue;
+            if (!MaterializeImplicitCxxClassArgument(matched[i], candidate.Parameters[i]))
+                LogErrorMessage("cannot materialize implicit C++ class argument for '{}'",
+                                { diagnosticFunctionName });
         }
 
         // convert parameter to vector of llvm::value*

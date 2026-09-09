@@ -313,6 +313,16 @@ namespace cppi
     int Tracked::value() const noexcept { return payload; }
     bool Tracked::operator==(const Tracked& other) const noexcept { return payload == other.payload; }
 
+    ScalarBox::ScalarBox(double value) noexcept : value_(value) {}
+    ScalarBox::~ScalarBox() noexcept {}
+    double ScalarBox::value() const noexcept { return value_; }
+    double scalar_ref(const ScalarBox& value) noexcept { return value.value(); }
+    ScalarBox make_scalar_box(double value) noexcept { return ScalarBox(value); }
+    double ScalarOps::add(const ScalarBox& value, double extra) const noexcept
+    {
+        return value.value() + extra;
+    }
+
     int Sink::put(const Tracked&) noexcept { return 1; }
     int Sink::put(Tracked&&) noexcept { return 2; }
 

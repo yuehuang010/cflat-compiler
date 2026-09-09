@@ -15135,12 +15135,24 @@ void MainListener::PrepareAliasCallResult(
         LLVMBackend::NamedVariable& result, bool markRvalue) {
         if (markRvalue && result.Primary != nullptr && !result.TypeAndValue.IsAlias)
             result.IsRvalue = true;
+        // A nontrivial foreign C++ class returned by value lives in the sret temporary until the
+        // end of the full expression. Keep that storage for a chained member call; reloading the
+        // backend's placeholder value would copy only its first ABI word.
+        auto* compiler = Compiler(ctx);
+        if (!result.TypeAndValue.Pointer && !result.TypeAndValue.IsAlias
+            && result.TypeAndValue.TypeName.size() > 0
+            && compiler->lastCxxRetTemp_ != nullptr
+            && compiler->IsForeignNontrivialCxxClass(result.TypeAndValue.TypeName))
+        {
+            result.Storage = compiler->lastCxxRetTemp_;
+            result.BaseType = compiler->GetType(result.TypeAndValue);
+            result.Primary = nullptr;
+        }
         if (!result.TypeAndValue.IsAlias
             || (result.TypeAndValue.Pointer && !result.TypeAndValue.IsCxxRefToPointer)
             || result.Primary == nullptr)
             return;
 
-        auto* compiler = Compiler(ctx);
         if (result.TypeAndValue.IsFunctionPointer
             || compiler->GetEncodedClosureType(result.TypeAndValue.TypeName) != nullptr)
             return;

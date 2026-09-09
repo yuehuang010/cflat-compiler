@@ -113,6 +113,8 @@
 //                       `OpsSink << FreeOps`, whose left operand lives in another namespace.
 //   Section M36 (820-823): C++ rvalue receiver lifetime handoff, bool bitfield packing, and
 //                       inherited constructors forwarded through operator->.
+//   Section M34 (813-819): implicit scalar-to-class reference conversion, chained nontrivial
+//                       class return receivers, member reference arguments/defaults, and RAII.
 
 import "library/c_alias_order_alias.h";
 import "library/c_alias_order_real.h";
@@ -2302,6 +2304,25 @@ extern int main()
     if (!m36bits.mode)                                 return 822;
     cppt.InheritedCtorHolder m36holder = cppt.InheritedCtorHolder(5, 7);
     if (m36holder.get() != 12)                         return 823;
+    // ---- Section M34: C++ interop ladder rung 5 mechanisms (813-819) -------------------
+    double m34scalar = 2.5;
+    int m34integer = 3;
+    double m34boxValue = 3.5;
+    double m34extra = 1.5;
+    if (cppi.scalar_ref(m34scalar) != 2.5)         return 813;
+    if (cppi.scalar_ref(m34integer) != 3.0)        return 814;
+    if (cppi.make_scalar_box(m34boxValue).value() != 3.5) return 815;
+    cppi.ScalarOps m34ops = default;
+    if (m34ops.add(m34scalar) != 3.5)              return 816;
+    if (m34ops.add(m34integer, m34extra) != 4.5)   return 817;
+    cppi.reset_counts();
+    int m34value = 0;
+    {
+        cppi.Tracked m34tracked = cppi.make_tracked(4);
+        m34value = m34tracked.value();
+    }
+    if (m34value != 4)                             return 818;
+    if (cppi.ctor_count() != 1 || cppi.dtor_count() != 1) return 819;
 
     return 0;
 }

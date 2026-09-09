@@ -482,6 +482,31 @@ namespace cppi
     private:
     };
 
+    // M34: a non-explicit converting constructor makes scalar arguments legal for const-reference
+    // parameters. The destructor keeps chained-return lifetime on the same nontrivial path.
+    class ScalarBox
+    {
+    public:
+        ScalarBox(double value) noexcept;
+        ~ScalarBox() noexcept;
+        double value() const noexcept;
+
+    private:
+        double value_;
+    };
+
+    double scalar_ref(const ScalarBox& value) noexcept;
+    ScalarBox make_scalar_box(double value) noexcept;
+
+    class ScalarOps
+    {
+    public:
+        double add(const ScalarBox& value, double extra = 1.0) const noexcept;
+
+    private:
+        int marker_;
+    };
+
     typedef int (*IntOp)(int, int);
     typedef Mixed (*MixedOp)(Mixed);
     typedef Large (*LargeOp)(Large);

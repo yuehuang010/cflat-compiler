@@ -7424,6 +7424,14 @@ public:
             || missingCtor;
         return result;
     }
+    // C++ permits a scalar argument to initialize a class temporary for a reference or
+    // by-value parameter. The call resolver uses this predicate; the lowering side materializes
+    // the temporary with the selected imported constructor.
+    bool CanImplicitlyConstructCxxClass(const NamedVariable& arg,
+                                         const TypeAndValue& param,
+                                         bool cxxByValueParam = false) const;
+    bool MaterializeImplicitCxxClassArgument(NamedVariable& arg,
+                                             const TypeAndValue& param);
     // Materialize (once per module) the llvm::Function for one structor / assignment operator,
     // typed from clang's own arrangement. Returns null after LogError when the plan is
     // inexpressible. `recipeOut` receives the recipe the call site must lower with.
@@ -7484,7 +7492,8 @@ public:
      */
     const CxxClassInfo::Structor* SelectCxxConstructor(const std::string& typeName,
                                                        const std::vector<TypeAndValue>& argTypes,
-                                                       std::string& why) const;
+                                                       std::string& why,
+                                                       bool allowNumericConversions = false) const;
     // Copy-construct (or move-construct when `useMove`) `dest` from the object at `src`.
     // Returns false after LogError when the needed constructor is missing or inaccessible.
     bool EmitCxxCopyOrMoveConstruct(const std::string& typeName, llvm::Value* dest,

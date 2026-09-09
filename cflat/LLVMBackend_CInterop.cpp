@@ -1763,18 +1763,42 @@ bool LLVMBackend::MapRawSig(const cflat_cinterop::RawSig& r, CSigEntry& e)
                 }
                 else
                 {
-                const std::string pname = i < r.paramNames.size() && !r.paramNames[i].empty()
-                    ? r.paramNames[i] : std::format("p{}", i);
-                if (r.isCxx)
-                    e.bindRefusal = IsLongDoubleSpelling(r.paramTypes[i])
+                    const std::string pname = i < r.paramNames.size() && !r.paramNames[i].empty()
+                        ? r.paramNames[i] : std::format("p{}", i);
+                    if (r.isCxx)
+                        e.bindRefusal = IsLongDoubleSpelling(r.paramTypes[i])
                             && !IsCInteropLongDoubleSupported()
                         ? std::format("'{}' was not bound: parameter '{}': {}",
                                       r.name, pname, CInteropLongDoubleRefusal())
                         : std::format(
                             "'{}' was not bound: parameter '{}' has unsupported C++ type '{}'",
                             r.name, pname, r.paramTypes[i]);
-                if (verbose) std::cout << std::format("[verbose]   skipping '{}': unsupported parameter type '{}'\n", r.name, r.paramTypes[i]);
-                return r.isCxx;
+                    if (verbose) std::cout << std::format("[verbose]   skipping '{}': unsupported parameter type '{}'\n", r.name, r.paramTypes[i]);
+                    return r.isCxx;
+                }
+            }
+            // C++ lvalue references are aliases at the CFlat surface. Keep the pointer ABI in
+            // the declaration machinery, but mark the parameter so call lowering can distinguish
+            // `const T&` from a raw `T*` and materialize a temporary for an implicit conversion.
+            std::string arrayElement;
+            uint64_t arrayExtent = 0;
+            const bool cxxArrayReference = r.isCxx
+                && ParseCxxArrayParameter(r.paramTypes[i], arrayElement, arrayExtent);
+            if (cxxArrayReference)
+            {
+                ptv.IsAlias = false;
+                ptv.IsCxxRefToPointer = false;
+            }
+            if (r.isCxx && !cxxArrayReference
+                && r.paramTypes[i].find('&') != std::string::npos
+                && r.paramTypes[i].find("&&") == std::string::npos
+                && !ptv.IsFunctionPointer && ptv.Pointer)
+            {
+                ptv.IsAlias = true;
+                if (ptv.ElemPointer)
+                {
+                    ptv.ElemPointer = false;
+                    ptv.IsCxxRefToPointer = true;
                 }
             }
             if (i < r.paramNames.size()) ptv.VariableName = r.paramNames[i];
@@ -8642,7 +8666,7 @@ const LLVMBackend::CxxClassInfo::Structor* LLVMBackend::FindCxxMoveCtor(const st
  */
 const LLVMBackend::CxxClassInfo::Structor* LLVMBackend::SelectCxxConstructor(
         const std::string& typeName, const std::vector<TypeAndValue>& argTypes,
-        std::string& why) const
+        std::string& why, bool allowNumericConversions) const
 {
         const CxxClassInfo* info = GetCxxClassInfo(typeName);
         if (info == nullptr) { why = "has no imported constructors"; return nullptr; }
@@ -8662,6 +8686,11 @@ const LLVMBackend::CxxClassInfo::Structor* LLVMBackend::SelectCxxConstructor(
         };
         auto compatible = [&](const TypeAndValue& want, const TypeAndValue& got) {
             if (want.TypeName == got.TypeName && want.Pointer == got.Pointer) return true;
+            if (allowNumericConversions && want.Pointer != got.Pointer
+                && !want.ElemPointer && !got.ElemPointer
+                && ((want.IsFloatingPoint() != -1 || want.IsInteger() != -1)
+                    && (got.IsFloatingPoint() != -1 || got.IsInteger() != -1)))
+                return true;                  // scalar references use an indirect pointer shape
             if (want.Pointer != got.Pointer) return false;
             if (want.Pointer)
             {
@@ -8677,6 +8706,13 @@ const LLVMBackend::CxxClassInfo::Structor* LLVMBackend::SelectCxxConstructor(
             }
             if (dataStructures.count(want.TypeName) != 0 || dataStructures.count(got.TypeName) != 0)
                 return false;                 // record types must match exactly
+            // Ordinary C++ scalar conversions are allowed when selecting a converting
+            // constructor. Exact same-family matches still win through the exact counter.
+            if (allowNumericConversions
+                && ((want.IsFloatingPoint() != -1 && got.IsInteger() != -1)
+                || (want.IsInteger() != -1 && got.IsFloatingPoint() != -1))
+                )
+                return true;
             return scalarFamily(want) == scalarFamily(got);
         };
 
@@ -8704,7 +8740,10 @@ const LLVMBackend::CxxClassInfo::Structor* LLVMBackend::SelectCxxConstructor(
             {
                 const auto& want = c.params[i + 1];
                 const auto& got = argTypes[i];
-                if (want.TypeName == got.TypeName && want.Pointer == got.Pointer) ++exact;
+                if (want.TypeName == got.TypeName
+                    && (want.Pointer == got.Pointer
+                        || (allowNumericConversions && want.Pointer && !got.Pointer)))
+                    ++exact;
                 if (got.TypeName == "__closure_fat_ptr" && want.IsFunctionPointer
                     && want.IsThinFnPtr())
                 {
@@ -8768,6 +8807,115 @@ const LLVMBackend::CxxClassInfo::Structor* LLVMBackend::SelectCxxConstructor(
         why = std::format("has no constructor whose parameter types match these arguments ({})", args);
         return nullptr;
     }
+
+static LLVMBackend::TypeAndValue InferImplicitCxxArgumentType(
+        const LLVMBackend::NamedVariable& arg, const LLVMBackend& backend)
+{
+        LLVMBackend::TypeAndValue type = arg.TypeAndValue;
+        if (!type.TypeName.empty() || type.Pointer || arg.BaseType == nullptr) return type;
+
+        if (arg.BaseType->isFloatingPointTy())
+        {
+            type.TypeName = arg.BaseType->isFloatTy() ? "float" : "double";
+            return type;
+        }
+        if (arg.BaseType->isIntegerTy())
+        {
+            if (llvm::isa<llvm::ConstantInt>(arg.Primary))
+            {
+                type.TypeName = arg.BaseType->getIntegerBitWidth() > 32 ? "i64" : "int";
+                return type;
+            }
+            switch (arg.BaseType->getIntegerBitWidth())
+            {
+                case 1:  type.TypeName = "bool";  break;
+                case 8:  type.TypeName = "char";  break;
+                case 16: type.TypeName = "short"; break;
+                case 32: type.TypeName = "int";   break;
+                case 64: type.TypeName = "i64";   break;
+                default: break;
+            }
+            return type;
+        }
+        if (arg.BaseType->isPointerTy())
+            if (auto* constant = llvm::dyn_cast_or_null<llvm::Constant>(arg.Primary);
+                constant != nullptr && backend.IsStringLiteralConstant(constant))
+            {
+                type.TypeName = "char";
+                type.Pointer = true;
+            }
+        return type;
+}
+
+bool LLVMBackend::CanImplicitlyConstructCxxClass(const NamedVariable& arg,
+                                                  const TypeAndValue& param,
+                                                  bool cxxByValueParam) const
+{
+        if (param.TypeName.empty() || param.IsInterface || arg.TypeAndValue.Pointer
+            || (param.Pointer && !cxxByValueParam
+                && (!param.IsAlias || param.IsCxxRefToPointer)
+                && !IsForeignCxxClassWithConstructors(param.TypeName))
+            || !IsForeignCxxClassWithConstructors(param.TypeName)
+            || arg.TypeAndValue.TypeName == param.TypeName)
+            return false;
+
+        TypeAndValue argType = InferImplicitCxxArgumentType(arg, *this);
+        if (argType.TypeName.empty()) return false;
+        std::string why;
+        return SelectCxxConstructor(param.TypeName, { argType }, why,
+                                    /*allowNumericConversions*/ true) != nullptr;
+}
+
+bool LLVMBackend::MaterializeImplicitCxxClassArgument(NamedVariable& arg,
+                                                       const TypeAndValue& param)
+{
+        TypeAndValue argType = InferImplicitCxxArgumentType(arg, *this);
+        std::string why;
+        const auto* ctor = SelectCxxConstructor(param.TypeName, { argType }, why,
+                                                /*allowNumericConversions*/ true);
+        if (ctor == nullptr || ctor->params.size() < 2) return false;
+
+        TypeAndValue classType;
+        classType.TypeName = param.TypeName;
+        llvm::Type* objectType = GetType(classType);
+        if (objectType == nullptr || !objectType->isSized()) return false;
+        llvm::Value* value = arg.Primary != nullptr ? arg.Primary : LoadArgStorage(arg);
+        if (value == nullptr) return false;
+
+        llvm::Type* constructorType = GetType(ctor->params[1]);
+        if (constructorType == nullptr) return false;
+        if (value->getType() != constructorType)
+        {
+            if (constructorType->isPointerTy() && !value->getType()->isPointerTy())
+            {
+                auto* temp = AllocaAtEntry(value->getType(), nullptr, "cxx.conv.refarg");
+                builder->CreateStore(value, temp);
+                value = temp;
+            }
+            else
+            {
+                value = Upconvert(value, constructorType,
+                                  arg.TypeAndValue.IsUnsignedInteger() != -1);
+                if (value->getType() != constructorType)
+                    value = CreateCast(value, constructorType);
+            }
+        }
+
+        auto* slot = CreateAlloca(objectType);
+        if (!EmitCxxStructorCall(param.TypeName, *ctor, slot, { value })) return false;
+        if (IsForeignNontrivialCxxClass(param.TypeName))
+            RegisterOwnedStructTemp(slot, param.TypeName);
+
+        NamedVariable converted;
+        converted.Primary = CreateLoad(objectType, slot);
+        converted.Storage = slot;
+        converted.BaseType = objectType;
+        converted.TypeAndValue.TypeName = param.TypeName;
+        converted.TypeAndValue.VariableName = arg.TypeAndValue.VariableName;
+        converted.IsRvalue = true;
+        arg = std::move(converted);
+        return true;
+}
 
 bool LLVMBackend::EmitCxxCopyOrMoveConstruct(const std::string& typeName, llvm::Value* dest,
                                              llvm::Value* src, bool useMove, const char* context)

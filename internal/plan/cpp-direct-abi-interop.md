@@ -802,47 +802,54 @@ Eigen -> libtorch; spikes under scratch/ladder/). Landed on master, in order:
   `requires`); prerequisite errors name file:line.
 - f5e8fa38: implicit and defaulted special members of in-scope header records are declared
   and defined through Sema before ABI/CodeGen (cache v37; fixture M25).
-- ac1f9605: at C++20 an ill-formed instantiated member (vector<T>(size_type) for a T without
-  default ctor) made ModuleBuilder drop the whole companion module; error-reaching bodies are
-  now emptied and refused individually. `a != b` binds `operator==` negated when no `!=`
-  exists (C++20 rewritten candidate; applies to cflat structs too - flag for a ruling).
-- 6cbb7455: callback ABI plans refused per symbol (local sink), linkage collisions refused per
-  symbol, `-v` extraction stage timings, alias-of-specialization and free-function signatures
-  bound lazily on first use (torch extraction 1225 s -> 50 s), ctor primitive-pointer synonyms,
-  record-returning default wrappers. Fixtures M26-M28.
-- dca147e0: companion-origin linkonce/weak definitions internalized after the companion link
+- 6943d380: libtorch hello world links and runs (t1 ones/numel). At C++20 an ill-formed
+  instantiated member (vector<T>(size_type) for a T without default ctor) made ModuleBuilder
+  drop the whole companion module; error-reaching bodies are now emptied and refused
+  individually. `a != b` binds `operator==` negated when no `!=` exists (C++20 rewritten
+  candidate; applies to cflat structs too - flag for a ruling). Callback ABI plans refused per
+  symbol (local sink), linkage collisions refused per symbol, `-v` extraction stage timings,
+  alias-of-specialization and free-function signatures bound lazily on first use (torch
+  extraction 1225 s -> 50 s), ctor primitive-pointer synonyms, record-returning default
+  wrappers. Companion-origin linkonce/weak definitions internalized after the companion link
   plus GlobalDCE at every -O (dead inline bodies dragged 244 undefined symbols); used libc++
   helpers promoted into the companion; lazily requested specializations rebind members an
-  earlier plain-name registration refused. Fixture M29.
-- 06dd0533: default-argument wrappers for instance/static members (receiver-first wrapper,
+  earlier plain-name registration refused. Fixtures M26-M29.
+- 90e121a3: default-argument wrappers for instance/static members (receiver-first wrapper,
   cache v38); field size/align recorded through getTypeInfo so a union holding an unrequested
-  specialization (`c10::Scalar::v_t`) becomes an opaque blob. Fixtures M30-M31.
-- c87675bb: free C++ operators bound through the operand namespace (left, then right), class
-  results construct into declaration slots, `a += b` falls back to `a = a + b`; an unbound
-  struct operator is a LogError instead of verifier-failing IR (cache v39). Fixture M32.
-- c3a73957: matmul/autograd rung - brace arguments go to generated initializer-list wrappers
+  specialization (`c10::Scalar::v_t`) becomes an opaque blob. Free C++ operators bound through
+  the operand namespace (left, then right), class results construct into declaration slots,
+  `a += b` falls back to `a = a + b`; an unbound struct operator is a LogError instead of
+  verifier-failing IR (cache v39). Fixtures M30-M32. t2 sum/item, t3 t + t.
+- 69eb3d18: matmul/autograd rung - brace arguments go to generated initializer-list wrappers
   (index({0, 0}) with TensorIndex), class-typed member defaults bound lazily on first use
   (an import-time prewarm was tried and reverted: 13 min + SIGSEGV on libtorch), const& class
   returns copied into locals, fixed-array element pointers. Fixture M33. t4 prints
   loss=6.000000 g0=2.000000 dim=2 (188 s; t1 74 s).
-- b0e9448f: operator parity for imported classes (maintainer ruling 2026-09-09: "cflat should
+- 0d501a77: operator parity for imported classes (maintainer ruling 2026-09-09: "cflat should
   be operator compatible with cpp"): <=>/&&/|| extracted, std::*_ordering as i8, relationals
   rewritten from <=> as one range test each, reversed candidates and != from == in one
   tryRewrites(), compound operators mutate the operand's own storage, free ++/--, unary *,
   &&/|| without short-circuit. Cache v40, fixture M40 (900-983). Postfix operator++(int) stays
   unextracted (no-prefix-increment ruling); operator[] const selection follows const-unenforced.
-- 056ddcc9: batch review of the day's commits (scratch/ladder/REVIEW_2026-09-09.md): native
-  `f({})` null-deref guarded, reversed candidates limited to ==/<=> on C++ records, companion
+  Includes the batch review fixes (scratch/ladder/REVIEW_2026-09-09.md): native `f({})`
+  null-deref guarded, reversed candidates limited to ==/<=> on C++ records, companion
   internalization demotes functions only (inline variables, guards, vtables keep ODR identity),
   callback ABI refusals reported at the call site, namespace seeding and PHI-operand storage fixed.
-- 4890b344: inherited and parameter-pack constructors get placement-new wrappers
+- b6a1a9c2: inherited and parameter-pack constructors get placement-new wrappers
   (torch::nn::Linear(3, 1) through ModuleHolder), lazy operator-> wrappers so `lin.forward(x)`
   forwards, chained nontrivial rvalue sret temporaries preserved, C++ bool bitfields packed
   (cache v41). Fixture M36. t6: from_blob over a CFlat float array, TensorOptions(Double),
   nn::Linear forward -> total=21.000000 zdtype=7 ysize0=2 ysize1=1 (130 s).
-State: scratch/ladder/torch/ t1 (numel=3, 54 s), t2 (`at.sum(t).item().toDouble()` and the
-member `t.sum()` form, sum=6.000000), t3 (`t + t`, numel=3) all compile, link and run.
-In flight: t4 matmul/autograd/index (feature/cpp-torch4), t6 from_blob/TensorOptions/nn::Linear.
+- SGD rung (this commit): C++ lvalue-reference parameters map as aliases; a scalar argument for
+  a class reference parameter selects the numeric converting constructor and materializes a
+  temporary; implicit class arguments scored after overload selection. Fixture M34. t5: two SGD
+  steps with torch::NoGradGuard, at.mul, sub_, mutable_grad().zero_() -> loss 6.0 then 4.8 (114 s).
+State (master, 2026-09-09): scratch/ladder/torch/ t1 ones/numel (67 s), t2 sum/item and member
+default wrapper, t3 t + t, t4 matmul/backward/grad/index (170-190 s), t5 SGD loop, t6
+from_blob/TensorOptions/nn::Linear forward - all compile, link against libtorch and print the
+expected values. Open: `at.mul(g, lr)` with a bare double needs the explicit c10.Scalar(lr)
+spelling; t4-class compiles spend ~150 s in stage-2 parses for member-signature type requests
+(batching per class is the next perf item); postfix operator++(int) unextracted by ruling.
 
 Open: per-import `std` clause or CLI-only; exceptions option at M8 start; MSVC ABI pass.
 Open from the M5 review (2026-09-06):
