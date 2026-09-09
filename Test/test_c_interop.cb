@@ -89,6 +89,8 @@
 //                       constructor from a brace list, a class parameter, and an explicit
 //                       function-template specialization.
 //   Section M24 (787)    : dependent function-pointer ABI types in an uninstantiated template.
+//   Section M25 (788-791): C++ header-walk implicit and defaulted special members - local
+//                       destruction, copy/move construction, and a defaulted destructor.
 
 import "library/c_alias_order_alias.h";
 import "library/c_alias_order_real.h";
@@ -1997,6 +1999,16 @@ extern int main()
     // The header also contains an uninstantiated template whose callback alias has a dependent
     // function prototype. The non-template neighbour proves extraction completed successfully.
     if (cppt.dependent_abi_neighbor() != 6)         return 787;
+    // ---- Section M25: implicit and defaulted C++ special members (788-791) ---------------
+    cppt.Shape m25shape = cppt.Shape({2, 3});
+    if (m25shape.dim(1) != 3)                      return 788;
+    cppt.Named m25a = cppt.Named("abc", 3);
+    cppt.Named m25b = m25a;
+    if (m25b.id != 3 || strcmp(m25b.cname(), "abc") != 0) return 789;
+    cppt.Named m25c = move m25a;
+    if (m25c.id != 3 || strcmp(m25c.cname(), "abc") != 0) return 790;
+    cppt.Defaulted m25d = default;
+    if (m25d.n() != 0)                              return 791;
 
     return 0;
 }

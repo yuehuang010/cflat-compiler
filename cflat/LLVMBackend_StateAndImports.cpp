@@ -2294,7 +2294,8 @@ bool LLVMBackend::TryLoadCHeaderDiskCache(
         // a warm cache cannot re-declare a wrapper whose definition CodeGen dropped.
         // v35 stops recording an unnamed enum's placeholder spelling as an enumerator type.
         // v36 carries published C++ function-template declarations for deduction wrappers.
-        if (version != 36) return false;
+        // v37 invalidates cached C++ member lists after plain-header special-member emission.
+        if (version != 37) return false;
 
         // Accept on mtime match (fast) or content hash match (authoritative on mtime drift).
         auto storedMtime = j.value("mtime", int64_t{-1});
@@ -2386,7 +2387,7 @@ void LLVMBackend::WriteCHeaderDiskCache(
         if (ec) return;
 
         nlohmann::json j;
-        j["version"] = 36;
+        j["version"] = 37;
         j["mtime"]   = (int64_t)mtime.time_since_epoch().count();
         j["hash"]    = contentHash;
         j["ldw"]     = entry.longDoubleWidth;

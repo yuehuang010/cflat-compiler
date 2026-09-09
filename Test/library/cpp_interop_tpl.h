@@ -212,5 +212,21 @@ namespace cppt
         long dim(long i) const noexcept { return dims[(unsigned long)i]; }
     };
 
+    struct Named
+    {
+        std::string name;
+        long id;
+        Named(const char* n, long i) : name(n), id(i) {}
+        const char* cname() const noexcept { return name.c_str(); }
+    };
+
+    struct Defaulted
+    {
+        std::vector<int> v;
+        Defaulted() = default;
+        ~Defaulted() = default;
+        long n() const noexcept { return (long)v.size(); }
+    };
+
     inline long shape_rank(const Shape& s) noexcept { return s.rank(); }
 }

@@ -407,6 +407,10 @@ namespace cflat_cinterop
             // cxxMode only: (index into out.records, index into that record's members, decl).
             struct MemberAbiWork { size_t recordIdx; size_t memberIdx; const CXXMethodDecl* md; };
             std::vector<MemberAbiWork> memberAbiWork;
+            // Plain C++ header records whose implicit special members must be materialized before
+            // CollectCxxMembers walks the record's methods.
+            std::vector<const CXXRecordDecl*> headerSpecialMemberWork;
+            std::unordered_set<const CXXRecordDecl*> headerSpecialMemberSeen;
             /*
              * Every decl Sema ANNOUNCED to the consumer, in order. This is the set a real compile's
              * CodeGen sees, and it is strictly larger than the translation unit's own decls():
@@ -592,6 +596,16 @@ namespace cflat_cinterop
             return t.getAsString(ctx.getPrintingPolicy());
         }
 
+        const CXXRecordDecl* CompleteNonDependentCxxRecord(const CXXRecordDecl* rd)
+        {
+            if (rd == nullptr || rd->isInvalidDecl() || rd->isDependentType()) return nullptr;
+            const CXXRecordDecl* def = rd->getDefinition();
+            if (def == nullptr || def->isInvalidDecl() || def->isDependentType()
+                || !def->isCompleteDefinition())
+                return nullptr;
+            return def;
+        }
+
         struct DeclVisitor : public RecursiveASTVisitor<DeclVisitor>
         {
             ASTContext& ctx;
@@ -599,6 +613,8 @@ namespace cflat_cinterop
             ExtractState& st;
 
             DeclVisitor(ASTContext& c, ExtractState& s) : ctx(c), sm(c.getSourceManager()), st(s) {}
+
+            void PrepareHeaderSpecialMembers(const CXXRecordDecl* cxx);
 
             // Resolve a decl's presumed location WITHOUT applying the in-scope filter. Returns
             // false only on an invalid/unknown location.
@@ -1254,11 +1270,10 @@ namespace cflat_cinterop
                     // emitted. Without it the member stays declaration-only, as before.
                     const bool emitCandidate = st.req.emitDefinitions
                                             || st.req.assumeInlineDefinitions;
-                    // LSP: an inline body is a definition a real compile would emit, so it is not
-                    // a reason to refuse the member. Implicit / defaulted members stay refused -
-                    // only Sema can say whether a body exists for them.
+                    // LSP has no CodeGen module, so assume every header-defined member has a
+                    // callable declaration. A real compile still proves the body below.
                     if (st.req.assumeInlineDefinitions && !st.req.emitDefinitions
-                        && md->isInlined() && !md->isImplicit() && !md->isDefaulted())
+                        && (md->isInlined() || md->isImplicit() || md->isDefaulted()))
                         m.needsLocalDefinition = false;
                     // A template PATTERN is not a symbol: it exists only so the type request's
                     // stub can name the signature. Leave it with no linkage name (refused at any
@@ -1534,6 +1549,8 @@ namespace cflat_cinterop
                         && !cxx->hasNonTrivialDestructor() && !cxx->isPolymorphic();
                     if (cxx->hasDefinition())
                     {
+                        if (rec.inScope && nameOverride.empty())
+                            PrepareHeaderSpecialMembers(cxx);
                         if (rec.inScope || !st.req.requireInScope || !nameOverride.empty())
                             CollectCxxMembers(cxx, rec, memberDecls);
                         for (const CXXBaseSpecifier& b : cxx->bases())
@@ -2035,6 +2052,128 @@ namespace cflat_cinterop
         void EmitCxxDefinitions(ExtractState& st, ASTContext& ctx, CodeGenerator& cg);
 
         /*
+         * Plain header records are not template requests, so no later instantiation pass asks
+         * Sema to declare their lazy special members. Declare the non-trivial ones before the
+         * record's method list is exported; definition and ODR-use happen after parsing below.
+         */
+        void DeclVisitor::PrepareHeaderSpecialMembers(const CXXRecordDecl* cxx)
+        {
+            const CXXRecordDecl* def = CompleteNonDependentCxxRecord(cxx);
+            if ((!st.req.emitDefinitions && !st.req.assumeInlineDefinitions)
+                || !st.req.requireInScope
+                || def == nullptr
+                || !st.headerSpecialMemberSeen.insert(def).second)
+                return;
+            if (!st.ci->hasSema()) return;
+            Sema& sema = st.ci->getSema();
+            CXXRecordDecl* rd = const_cast<CXXRecordDecl*>(def);
+
+            if (rd->needsImplicitDestructor() && rd->hasNonTrivialDestructor())
+            {
+                CXXDestructorDecl* dtor = sema.LookupDestructor(rd);
+                if (dtor == nullptr) dtor = sema.DeclareImplicitDestructor(rd);
+            }
+            if (rd->needsImplicitCopyConstructor() && rd->hasNonTrivialCopyConstructor())
+            {
+                CXXConstructorDecl* ctor = sema.LookupCopyingConstructor(rd, Qualifiers::Const);
+                if (ctor == nullptr) ctor = sema.DeclareImplicitCopyConstructor(rd);
+            }
+            if (rd->needsImplicitMoveConstructor() && rd->hasNonTrivialMoveConstructor())
+            {
+                CXXConstructorDecl* ctor = sema.LookupMovingConstructor(rd, 0);
+                if (ctor == nullptr) ctor = sema.DeclareImplicitMoveConstructor(rd);
+            }
+            if (rd->needsImplicitCopyAssignment() && rd->hasNonTrivialCopyAssignment())
+            {
+                CXXMethodDecl* op = sema.LookupCopyingAssignment(rd, Qualifiers::Const, false, 0);
+                if (op == nullptr) op = sema.DeclareImplicitCopyAssignment(rd);
+            }
+            if (rd->needsImplicitMoveAssignment() && rd->hasNonTrivialMoveAssignment())
+            {
+                CXXMethodDecl* op = sema.LookupMovingAssignment(rd, 0, false, 0);
+                if (op == nullptr) op = sema.DeclareImplicitMoveAssignment(rd);
+            }
+            st.headerSpecialMemberWork.push_back(def);
+        }
+
+        void DefineHeaderImplicitSpecialMembers(ExtractState& st)
+        {
+            if (!st.req.emitDefinitions || !st.ci->hasSema()
+                || st.headerSpecialMemberWork.empty())
+                return;
+            Sema& sema = st.ci->getSema();
+            clang::Scope tuScope(nullptr, clang::Scope::DeclScope, st.ci->getDiagnostics());
+            const bool lendScope = sema.TUScope == nullptr;
+            if (lendScope) sema.TUScope = &tuScope;
+            struct ScopeReset
+            {
+                Sema& sema; bool active;
+                ~ScopeReset() { if (active) sema.TUScope = nullptr; }
+            } scopeReset{sema, lendScope};
+
+            for (const CXXRecordDecl* queued : st.headerSpecialMemberWork)
+            {
+                const CXXRecordDecl* rd = CompleteNonDependentCxxRecord(queued);
+                if (rd == nullptr) continue;
+                CXXRecordDecl* mutableRd = const_cast<CXXRecordDecl*>(rd);
+                auto mark = [&](CXXMethodDecl* md) {
+                    if (md == nullptr || !md->isImplicit() || md->hasBody() || md->isDeleted()
+                        || md->isInvalidDecl()
+                        || md->getType()->isDependentType()
+                        || CompleteNonDependentCxxRecord(md->getParent()) == nullptr)
+                        return;
+                    sema.MarkFunctionReferenced(md->getLocation(), md,
+                                                /*MightBeOdrUse*/ true);
+                };
+
+                if (mutableRd->hasNonTrivialDestructor())
+                {
+                    CXXDestructorDecl* dtor = sema.LookupDestructor(mutableRd);
+                    if (dtor != nullptr && dtor->isImplicit() && !dtor->hasBody() && !dtor->isDeleted()
+                        && !dtor->isInvalidDecl())
+                        sema.DefineImplicitDestructor(dtor->getLocation(), dtor);
+                    mark(dtor);
+                }
+                if (mutableRd->hasNonTrivialCopyConstructor())
+                {
+                    CXXConstructorDecl* ctor =
+                        sema.LookupCopyingConstructor(mutableRd, Qualifiers::Const);
+                    if (ctor != nullptr && ctor->isImplicit() && !ctor->hasBody() && !ctor->isDeleted()
+                        && !ctor->isInvalidDecl())
+                        sema.DefineImplicitCopyConstructor(ctor->getLocation(), ctor);
+                    mark(ctor);
+                }
+                if (mutableRd->hasNonTrivialMoveConstructor())
+                {
+                    CXXConstructorDecl* ctor = sema.LookupMovingConstructor(mutableRd, 0);
+                    if (ctor != nullptr && ctor->isImplicit() && !ctor->hasBody() && !ctor->isDeleted()
+                        && !ctor->isInvalidDecl())
+                        sema.DefineImplicitMoveConstructor(ctor->getLocation(), ctor);
+                    mark(ctor);
+                }
+                if (mutableRd->hasNonTrivialCopyAssignment())
+                {
+                    CXXMethodDecl* op =
+                        sema.LookupCopyingAssignment(mutableRd, Qualifiers::Const, false, 0);
+                    if (op != nullptr && op->isImplicit() && !op->hasBody() && !op->isDeleted()
+                        && !op->isInvalidDecl())
+                        sema.DefineImplicitCopyAssignment(op->getLocation(), op);
+                    mark(op);
+                }
+                if (mutableRd->hasNonTrivialMoveAssignment())
+                {
+                    CXXMethodDecl* op =
+                        sema.LookupMovingAssignment(mutableRd, 0, false, 0);
+                    if (op != nullptr && op->isImplicit() && !op->hasBody() && !op->isDeleted()
+                        && !op->isInvalidDecl())
+                        sema.DefineImplicitMoveAssignment(op->getLocation(), op);
+                    mark(op);
+                }
+            }
+            sema.PerformPendingInstantiations();
+        }
+
+        /*
          * A DEFAULTED special member (`~parser() = default`, an implicit copy constructor) has no
          * body until something odr-uses it. Sema is still alive here (ParseAST runs the consumer
          * before tearing it down), so odr-use each one now: Sema synthesizes the body at once,
@@ -2063,7 +2202,8 @@ namespace cflat_cinterop
             {
                 const CXXMethodDecl* md = w.md;
                 if (md == nullptr || md->hasBody() || !md->isDefaulted() || md->isDeleted()
-                    || md->isInvalidDecl() || md->getType()->isDependentType())
+                    || md->isInvalidDecl() || md->getType()->isDependentType()
+                    || CompleteNonDependentCxxRecord(md->getParent()) == nullptr)
                     continue;
                 sema.MarkFunctionReferenced(md->getLocation(), const_cast<CXXMethodDecl*>(md),
                                             /*MightBeOdrUse*/ true);
@@ -2074,6 +2214,7 @@ namespace cflat_cinterop
         void ComputeCxxAbi(ExtractState& st, ASTContext& ctx)
         {
             if (st.ci == nullptr) return;
+            DefineHeaderImplicitSpecialMembers(st);
             DefineDefaultedSpecialMembers(st);
             if (st.abiWork.empty() && st.functionPointerAbiWork.empty()
                 && st.memberAbiWork.empty() && !st.req.emitDefinitions) return;
@@ -2157,7 +2298,9 @@ namespace cflat_cinterop
                 if (w.memberIdx >= rec.members.size()) continue;
                 RawCxxMember& m = rec.members[w.memberIdx];
                 const CXXMethodDecl* md = w.md;
-                if (md->isInvalidDecl() || md->getType()->isDependentType() || md->isVariadic()) continue;
+                if (md == nullptr || md->isInvalidDecl() || md->getType()->isDependentType()
+                    || md->isVariadic() || CompleteNonDependentCxxRecord(md->getParent()) == nullptr)
+                    continue;
 
                 /*
                  * M6 - the vtable slot of a virtual member, straight from Clang's Itanium vtable
@@ -2245,12 +2388,9 @@ namespace cflat_cinterop
         void EmitCxxDefinitions(ExtractState& st, ASTContext& ctx, CodeGenerator& cg)
         {
             /*
-             * NOT handled here: an IMPLICIT or DEFAULTED special member with no body. Asking Sema
-             * for one at this point (MarkFunctionReferenced, or DefineImplicitDestructor and
-             * friends) does not produce a body - by the time the consumer runs, end-of-translation
-             * -unit processing is over and Sema declines - so such a member stays refused, exactly
-             * as it was before definition emission existed. Defining them belongs with the
-             * template-instantiation milestone, which needs a live Sema of its own anyway.
+             * Plain-header implicit special members are defined and marked while Sema is still
+             * alive, before this CodeGen pass. Explicitly defaulted members use the companion
+             * path in DefineDefaultedSpecialMembers for the same reason.
              */
 
             /*
