@@ -167,7 +167,7 @@ std::string MainListener::ResolveTypeArgEntry(CFlatParser::TypeParameterEntryCon
         else
         {
             // Simple type or type parameter: look up in activeTypeSubstitutions
-            resolved = typeSpec ? typeSpec->getText() : entry->getText();
+            resolved = CanonicalTemplateTypeArgument(entry);
             auto substIt = activeTypeSubstitutions.find(resolved);
             bool substituted = substIt != activeTypeSubstitutions.end();
             if (substIt != activeTypeSubstitutions.end())

@@ -93,12 +93,32 @@
 
 Standard C primitives are all supported: `int`, `char`, `short`, `long`, `float`, `double`, `bool`, `void`.
 
-`long` follows the native C ABI of the **target** platform, exactly as a C compiler would:
-32-bit on Windows (LLP64) and on 32-bit targets, 64-bit on macOS/Linux (LP64). `ulong` is its
-unsigned counterpart. `int` is always 32-bit and `long long` is always 64-bit on every target.
+**C spellings are aliases.** C's multi-word spellings are accepted and mean exactly the CFlat
+type in the table - the same type, not a look-alike, so `f(long long)` and `f(i64)` declare the
+same function. The trailing `int` is optional where C allows it (`unsigned long int`,
+`long long int`).
+
+| C spelling | CFlat |
+|------------|-------|
+| `signed char` | `i8` |
+| `unsigned char` | `u8` |
+| `unsigned short` | `u16` |
+| `signed`, `signed int` | `int` |
+| `unsigned`, `unsigned int` | `u32` (or `uint`) |
+| `unsigned long` | `ulong` |
+| `long long` | `i64` |
+| `unsigned long long` | `u64` |
+| `long double` | `longdouble` |
+
+`int` and `long` follow the native C ABI of the **target** platform, exactly as a C compiler
+would - the target is the one selected by `--platform`, not the host you compile on. `long` is
+32-bit on Windows (LLP64) and on 32-bit targets, 64-bit on macOS/Linux (LP64); `ulong` is its
+unsigned counterpart. `int` is 32-bit on every target CFlat supports, since all of them are
+LLP64, LP64 or ILP32. `i64`/`u64` are always 64-bit regardless of target.
 Use `i64`/`u64` when a fixed 64-bit width is wanted regardless of target, `i128`/`u128` for a
 fixed 128-bit width (C's `__int128` / `unsigned __int128` bind to them); use `long`/`ulong`
-only to match a C API that is declared with C's `long` (for example `strtol`, `labs`).
+only to match a C or C++ API that is declared with C's `long` (for example `strtol`, `labs`,
+`std::vector<unsigned long>`).
 
 ### Explicit-Width Integers
 

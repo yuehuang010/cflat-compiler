@@ -175,6 +175,34 @@ static const char* LongSpellingTypeName(int longSpecifierCount)
 {
     return longSpecifierCount >= 2 ? "i64" : "long";
 }
+// Return the complete primitive spelling of a generic type argument, including
+// any words accepted by multiWordTypeSuffix.
+static std::string TemplateTypeArgumentSpelling(CFlatParser::TypeParameterEntryContext* entry)
+{
+    if (entry == nullptr) return {};
+    auto* typeSpec = entry->typeSpecifier();
+    std::string spelling = typeSpec != nullptr ? typeSpec->getText() : entry->getText();
+    if (auto* suffix = entry->multiWordTypeSuffix(); suffix != nullptr)
+        for (auto* part : suffix->typeSpecifier())
+            spelling += " " + part->getText();
+    return spelling;
+}
+// Keep C and C++ spellings of the same primitive on one specialization key.
+static std::string CanonicalTemplateTypeArgument(CFlatParser::TypeParameterEntryContext* entry)
+{
+    static const std::unordered_map<std::string, std::string> aliases = {
+        { "signed char", "i8" }, { "unsigned char", "u8" },
+        { "short int", "short" }, { "unsigned short", "u16" },
+        { "unsigned short int", "u16" }, { "signed int", "int" },
+        { "long long", "i64" }, { "long long int", "i64" },
+        { "signed long long", "i64" }, { "signed long long int", "i64" },
+        { "unsigned int", "u32" }, { "unsigned long long", "u64" },
+        { "unsigned long long int", "u64" }, { "long double", "longdouble" },
+    };
+    std::string spelling = TemplateTypeArgumentSpelling(entry);
+    auto it = aliases.find(spelling);
+    return it == aliases.end() ? spelling : it->second;
+}
 // An empty `[]` is representable ONLY as the sole dimension: the `T[]` array-view is a thin
 // `ptr` and carries no row stride, so `T[][]`, `T[][M]` and `T[N][]` have no lowering. The
 // grammar folds every bracket pair into one arrayDimSpec and drops the empty ones from

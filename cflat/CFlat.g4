@@ -414,10 +414,14 @@ typeParameterList
 typeParameterEntry
     : valueParameterDeclaration
     | functionTypeArgument
-    | Identifier? typeSpecifier pointer? arrayTypeSuffix? Ellipsis?   // leading Identifier is the `unique` ownership qualifier (soft keyword, validated in the listener); `T[]` arg = a noalias array-view; `[N]`/`[]*` rejected in the listener
+    | Identifier? typeSpecifier multiWordTypeSuffix? pointer? arrayTypeSuffix? Ellipsis?   // leading Identifier is the `unique` ownership qualifier (soft keyword, validated in the listener); `T[]` arg = a noalias array-view; `[N]`/`[]*` rejected in the listener
     | shiftExpression                                                 // compile-time VALUE argument, e.g. `8`, `CAP*2`, `(A>B)`
     ;
-
+// C and C++ permit several primitive type spellings in one type argument, such as
+// unsigned int and unsigned long long. The listener canonicalizes these spellings.
+multiWordTypeSuffix
+    : typeSpecifier+
+    ;
 // Bare C/C++ function type, used as a class-template argument (`std.function<int(int)>`).
 functionTypeArgument
     : typeSpecifier pointer? '(' functionPointerParamList? ')'
@@ -905,9 +909,85 @@ qualifiedGenericIdentifier
 
 memberNameToken
     : Identifier
+    | Auto
+    | Break
+    | Case
+    | Char
+    | Const
+    | Continue
+    | Default
+    | Do
+    | Double
+    | Else
+    | Enum
+    | Extern
+    | Float
+    | For
     | Function
+    | Lambda
+    | Goto
+    | If
+    | Inline
+    | Int
+    | Long
+    | Register
+    | Restrict
+    | Return
+    | Short
+    | Signed
+    | Sizeof
+    | Static
+    | Struct
+    | Class
+    | NameOf
+    | TypeOf
+    | IidOf
+    | WinrtDelegate
+    | Is
+    | As
+    | Interface
+    | Where
+    | Namespace
+    | Using
+    | Import
+    | Annotation
+    | In
+    | Switch
+    | Typedef
+    | Union
+    | Unsigned
+    | Void
+    | Volatile
+    | While
+    | Bool
+    | Complex
+    | Generic
+    | Imaginary
+    | Noreturn
+    | ThreadLocal
+    | New
+    | Delete
     | Move
+    | Operator
     | String
+    | 'lock'
+    | 'vectorize'
+    | 'expect_error'
+    | 'asm'
+    | 'stdcall'
+    | 'cdecl'
+    | 'i8'
+    | 'i16'
+    | 'i32'
+    | 'i64'
+    | 'i128'
+    | 'u8'
+    | 'u16'
+    | 'u32'
+    | 'u64'
+    | 'u128'
+    | 'va_list'
+    | 'simd'
     ;
 
 destructorDefinition

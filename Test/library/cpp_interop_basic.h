@@ -66,6 +66,7 @@ namespace cppi
         public:
             int value;
             int twice() const noexcept;
+            int i64() const noexcept;
         };
         enum class Kind : unsigned short { A = 3, B = 4 };
         static int store;

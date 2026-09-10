@@ -3245,3 +3245,62 @@ worktree's base, not the main checkout's HEAD when master has moved (q18 caught 
 
 Still unfiled language gap carried since round 1: no syntax for a deleted copy (blocks `Thread`
 RAII and any future non-copyable type; recorded in `p3/thread-cannot-go-raii.md`).
+
+## Ruling 2026-09-10 (revised same day): C spellings are ALIASES; primitive identity matches C++
+
+CFlat ACCEPTS every multi-word C spelling (`long long`, `unsigned int`, `unsigned long`,
+`signed char`, `long double`, ...) and adds `c8`/`c16`/`c32`/`wchar` with the C++ names
+`char8_t`/`char16_t`/`char32_t`/`wchar_t` as aliases. Work, identity table and acceptance:
+[`cxx-primitive-typing.md`](issue/cppinterop/cxx-primitive-typing.md).
+
+This REVERSES the morning ruling ("one primitive, one word", multi-word spellings as errors). Do not
+revive it. What survives from it:
+
+- **An alias canonicalizes to one CFlat word and adds no identity.** `long long` IS `i64`;
+  `f(long long)` + `f(i64)` is a redefinition. Only the character types add new identities.
+- **Identity follows C++, not width.** `long` vs `i64` (LP64) and `int` vs `long` / `wchar` vs
+  `c16` (Windows) are equal-width pairs that C++ mangles differently. Folding either pair loses a
+  C++ type CFlat can then never name.
+- **The real defect was position disagreement, not the spellings.** The alias table ran only in a
+  template-argument position (`multiWordTypeSuffix` is reachable from `typeParameterEntry` alone),
+  so `std.vector<long long>` canonicalized to `i64` while `unsigned int x;` reported
+  `cannot find the type 'unsigned'`. Any alias mechanism must run in EVERY type position through
+  one canonicalizer.
+
+### The bug under `unsigned long`
+
+`unsigned long` is the spelling a real header hits first, and no spelling reaches it today,
+because the outbound primitive map at `LLVMBackend_CInterop.cpp:3195-3196` is wrong:
+
+    { "long", "long long" }, { "ulong", "unsigned long long" }
+
+CFlat `long` is `longBits_` wide (32 on Windows) but spells as an 8-byte C++ type. Measured:
+`std.vector<long>` on Windows instantiates `?$vector@_J...` - `_J` is `long long`. So C++ `long`
+(`J`) and `unsigned long` (`K`) have NO CFlat spelling at all, and `std::vector<DWORD>` on Windows
+/ `std::vector<size_t>` on LP64 are exactly those types. The inbound map
+(`LLVMBackend_CInterop.cpp:1174-1176`) compounds it from the other side: it lands C `unsigned long`
+on `u32`/`u64`, never on `ulong`, so a member returning `unsigned long` reads back as `u32` and
+re-spells outbound as `unsigned int` - a different specialization than it came from.
+
+Correcting those two rows to `{ "long", "long" }, { "ulong", "unsigned long" }` makes `ulong`
+(and its alias `unsigned long`) name C++ `unsigned long` at its real target width on both ABIs,
+while `u64` keeps naming `unsigned long long`. Filed as
+[`c-long-has-no-cflat-cxx-spelling.md`](issue/cppinterop/c-long-has-no-cflat-cxx-spelling.md) -
+a correctness bug in its own right, and the first slice of `cxx-primitive-typing.md`.
+
+### Addendum: `int` follows the target by coincidence, not by construction (2026-09-10)
+
+Checked while ruling on primitives. `long`/`ulong` follow the target correctly - `SetTargetLongWidth`
+(`LLVMBackend_OwnershipTemps.cpp:57`) is driven from the resolved `--platform`, so cross-targeting
+`linux`/`macos` from a Windows host measures `sizeof(long) == 8` while `win64` measures 4. Verified
+by constant-folded `sizeof` in the IR on all three targets.
+
+`int` has no such seam. There is no `intBits_`; 32 is hardcoded at ~40 sites (`LLVMBackend.h:986`,
+`BitfieldStorageBits`, the scalar maps in `LLVMBackend_CInterop.cpp`). That yields the CORRECT
+target-native answer today only because every supported target is LLP64, LP64 or ILP32, and C `int`
+is 32-bit in all three. Adding an ILP64 or 16-bit target would need the seam built first - do not
+assume `int` is parameterized the way `long` is.
+
+Unrelated gap found in the same check: `--platform win32` cannot compile even a printf-only program
+(`os.cb:475`, `VirtualAllocExNuma` overload assumes 64-bit arguments). The win32 target is not
+exercised by any suite.

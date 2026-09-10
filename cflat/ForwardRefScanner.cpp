@@ -210,22 +210,9 @@ LLVMBackend::DeclTypeAndValue ForwardRefScanner::ParseDeclarationSpecifiers(CFla
                         std::vector<std::string> typeArgs;
                     for (auto* entry : genParams->typeParameterList()->typeParameterEntry())
                     {
-                        // Closure type args (gap a) encode to a symbol-safe name; a `unique`-qualified
-                        // arg or compile-time value routes through ResolveForwardTypeArg so its
-                        // canonical spelling matches the queueing path; plain types keep raw text.
-                        // A NESTED generic arg must mangle the same way the main pass mangles it
-                        // ("Inner__int"), or the shell is registered under the raw "Inner<int>"
-                        // spelling and stays opaque.
-                        std::string nestedBase;
-                        bool nestedGeneric = entry->typeSpecifier() != nullptr
-                            && GenericSpecOf(entry->typeSpecifier(), nestedBase) != nullptr;
-                        if (entry->shiftExpression() != nullptr
-                            || (entry->typeSpecifier() && entry->typeSpecifier()->functionPointerSpecifier())
-                            || entry->functionTypeArgument() != nullptr
-                            || TypeArgHasUnique(entry) || nestedGeneric)
-                            typeArgs.push_back(ResolveForwardTypeArg(entry));
-                        else
-                            typeArgs.push_back(ResolveTypeArgSpelling(compiler, entry->getText()));
+                        // Route every arg through ResolveForwardTypeArg so scanner and codegen share canonical
+                        // spellings for closures, nested generics, values, qualifiers, and plain types.
+                        typeArgs.push_back(ResolveForwardTypeArg(entry));
                     }
                     std::string mangledName = MangleGenericInstance(*compiler, baseName, typeArgs);
                     // A generic INTERFACE instantiation is a fat pointer, not a struct: no shell,
@@ -1099,8 +1086,7 @@ std::string ForwardRefScanner::ResolveForwardTypeArg(CFlatParser::TypeParameterE
         {
             // Same namespace walk as the main pass's ResolveTypeArgEntry (no active substitutions
             // during the scan), so a bare 'Item' inside 'namespace A' names A.Item in both passes.
-            resolved = Compiler(entry)->ResolveTypeArgBaseName(
-                typeSpec ? typeSpec->getText() : entry->getText());
+            resolved = Compiler(entry)->ResolveTypeArgBaseName(CanonicalTemplateTypeArgument(entry));
             if (entry->pointer() == nullptr && entry->arrayTypeSuffix() == nullptr
                 && entry->Identifier() == nullptr && typeSpec != nullptr
                 && typeSpec->genericIdentifier() != nullptr
@@ -1734,18 +1720,8 @@ void ForwardRefScanner::ScanUsingDeclaration(CFlatParser::UsingDeclarationContex
             std::vector<std::string> args;
             for (auto* entry : genParams->typeParameterList()->typeParameterEntry())
             {
-                // Closure, value, and `unique`-qualified args encode via ResolveForwardTypeArg so
-                // the shell name matches the authoritative ParseUsingDeclaration; plain types keep raw text.
-                std::string nestedBase;
-                bool nestedGeneric = entry->typeSpecifier() != nullptr
-                    && GenericSpecOf(entry->typeSpecifier(), nestedBase) != nullptr;
-                if (entry->shiftExpression() != nullptr
-                    || (entry->typeSpecifier() && entry->typeSpecifier()->functionPointerSpecifier())
-                    || entry->functionTypeArgument() != nullptr
-                    || TypeArgHasUnique(entry) || nestedGeneric)
-                    args.push_back(ResolveForwardTypeArg(entry));
-                else
-                    args.push_back(ResolveTypeArgSpelling(compiler, entry->getText()));
+                // Route every arg through ResolveForwardTypeArg so this shell matches ParseUsingDeclaration.
+                args.push_back(ResolveForwardTypeArg(entry));
             }
             std::string mangledName = MangleGenericInstance(*compiler, resolvedBaseName, args);
             // A generic interface instantiation gets no struct shell / default ctor (see

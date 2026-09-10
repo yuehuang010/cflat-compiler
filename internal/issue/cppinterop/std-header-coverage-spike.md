@@ -32,10 +32,14 @@ when declared `= default`; their constructor-call spelling does not (gap 4).
 | 2 | [`cpp-alias-template-types-unresolvable.md`](cpp-alias-template-types-unresolvable.md) | `std.ofstream`, `std.ostringstream` |
 | 3 | [`stream-classes-no-callable-destructor.md`](stream-classes-no-callable-destructor.md) (destructor half FIXED 2026-09-10; blocked now by [`cpp-virtual-base-constructor-unreachable.md`](cpp-virtual-base-constructor-unreachable.md) and [`stream-open-instantiation-error.md`](stream-open-instantiation-error.md)) | streams as locals; with 1+2, the whole iostream family |
 | 4 | [`constrained-template-constructor-overload-resolution.md`](constrained-template-constructor-overload-resolution.md) | `complex`, `chrono`, `filesystem`, `tuple`, `optional`, `pair`, `regex`, `random` construction |
-| 5 | [`lock-keyword-blocks-member-call.md`](lock-keyword-blocks-member-call.md) | `std.mutex.lock`, `std.shared_mutex.lock` |
-| 6 | [`range-for-over-cpp-container.md`](range-for-over-cpp-container.md) | `for (T x in c)` over every C++ container |
+| 5 | `lock` as a member name - LANDED `6f1981c` | was: `std.mutex.lock`, `std.shared_mutex.lock` |
+| 6 | [`range-for-over-cpp-container.md`](range-for-over-cpp-container.md) | `for (T x in c)` over every C++ container - PARKED 2026-09-09 by maintainer ruling, awaiting a protocol decision (size/`[]` vs begin/end vs both) |
 | 7 | [`no-cpp-standard-selection-flag.md`](no-cpp-standard-selection-flag.md) | `expected`, `flat_map`, `flat_set`, `generator`, `mdspan`, `print`, `stacktrace`, `stdfloat` |
-| 8 | [`multi-word-template-arguments-unparseable.md`](multi-word-template-arguments-unparseable.md) | any specialization over `long long`, `unsigned int`, ... |
+| 8 | multi-word template arguments - LANDED `6f1981c` in template-argument position only; gap 10 extends the spellings to every type position | was: any specialization over `long long`, `unsigned int`, ... |
+| 9 | [`std-globals-unreachable.md`](std-globals-unreachable.md) | `std` GLOBALS (`std.cout`); the narrowed remainder of gap 1 |
+| 10 | [`cxx-primitive-typing.md`](cxx-primitive-typing.md) | C multi-word spellings as aliases in every type position, plus `c8`/`c16`/`c32`/`wchar` (`std::u16string`, `std::wstring`, `char8_t` specializations) - maintainer ruling 2026-09-10 |
+| 11 | [`alias-of-class-template-specialization-loses-fields.md`](alias-of-class-template-specialization-loses-fields.md) | an alias of a specialization declares a local but loses its fields |
+| 12 | [`c-long-has-no-cflat-cxx-spelling.md`](c-long-has-no-cflat-cxx-spelling.md) | C++ `long`/`unsigned long` unreachable (`std::vector<DWORD>`, `std::vector<size_t>`); first slice of gap 10 |
 
 ## Not spiked
 

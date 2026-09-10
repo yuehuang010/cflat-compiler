@@ -929,17 +929,21 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
             for (auto parseTree : ctx->children)
             {
                 if (childIndex++ >= childLimit) break;
+                bool memberNameToken = false;
                 if (auto* rule = dynamic_cast<antlr4::RuleContext*>(parseTree);
                     rule != nullptr && rule->getRuleIndex() == CFlatParser::RuleMemberNameToken
                     && !rule->children.empty())
+                {
+                    memberNameToken = true;
                     parseTree = rule->children.front();
+                }
                 if (parseTree->getTreeType() == antlr4::tree::ParseTreeType::TERMINAL)
                 {
                     auto terminal = dynamic_cast<antlr4::tree::TerminalNode*>(parseTree);
                     auto tokenType = terminal->getSymbol()->getType();
                     // 'move' is now a keyword token; remap it to Identifier handling
                     // so it works as a member name (e.g. File.move(...)).
-                    if (tokenType == CFlatParser::Move)
+                    if (memberNameToken || tokenType == CFlatParser::Move)
                         tokenType = CFlatParser::Identifier;
                     // Any suffix other than the member name itself consumes the pending member
                     // access ('(' calls it, '[' / '++' / '--' / '.' start a new link).

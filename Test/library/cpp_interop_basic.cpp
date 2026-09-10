@@ -34,6 +34,7 @@ namespace cppi
 
     int Outer::store = 0;
     int Outer::Inner::twice() const noexcept { return value * 2; }
+    int Outer::Inner::i64() const noexcept { return value * 2; }
     template struct Registry<int>;
     int registry_count(const Registry<int>& value) noexcept { return value.count; }
     int Variadic::sum(int count, ...) noexcept { return count; }

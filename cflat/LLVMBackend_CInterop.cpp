@@ -3195,6 +3195,7 @@ bool LLVMBackend::CxxSpellingForCflatType(const std::string& cflatType, std::str
             { "long", "long long" }, { "i64", "long long" },
             { "ulong", "unsigned long long" }, { "u64", "unsigned long long" },
             { "float", "float" }, { "double", "double" }, { "void", "void" },
+            { "longdouble", "long double" },
         };
         auto enumKey = ResolveEnumTypeName(base);
         if (!enumKey.empty()) base = GetEnumBackingType(enumKey);

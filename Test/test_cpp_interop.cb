@@ -115,6 +115,8 @@ import cpp "library/cpp_interop_inline_again.h";
 // fixture, reached by the SYSTEM header spelling below.
 import cpp "library/cpp_interop_tpl.h" cache;
 import cpp "vector";
+import cpp "mutex";
+import cpp "chrono";
 import cpp "string";
 import cpp "functional";
 
@@ -1804,5 +1806,34 @@ extern int main()
     if (m34value != 4)                             return 818;
     if (cppi.ctor_count() != 1 || cppi.dtor_count() != 1) return 819;
 
+    // Batch cpp-interop regressions: keyword member access, multi-word primitive
+    // template arguments, and a value that exercises unsigned specialization.
+    std.mutex batchMutex = default;
+    // Parse-fix leg: compiling proves lock()/try_lock() parse; values only prove the
+    // released mutex can be reacquired, not broader mutex semantics.
+    int batchCounter = 0;
+    batchMutex.lock();
+    batchCounter = batchCounter + 1;
+    batchMutex.unlock();
+    if (batchCounter != 1) return 989;
+    if (!batchMutex.try_lock()) return 990;
+    batchMutex.unlock();
+
+    std.vector<unsigned int> batchUnsigned = default;
+    u32 batchUnsignedValue = 4000000000;
+    batchUnsigned.push_back(batchUnsignedValue);
+    if (batchUnsigned[0] != batchUnsignedValue) return 985;
+    // Element type must be UNSIGNED: read back as 'int' this is negative. The equality
+    // above passes either way, so this is the leg that discriminates the specialization.
+    if (batchUnsigned[0] < 2000000000) return 988;
+
+    // Compile/link assertion only: default count() is zero for every specialization; nonzero
+    // construction remains open in cppinterop/constrained-template-constructor-overload-resolution.md.
+    std.chrono.duration<long long> batchDuration = default;
+    if (batchDuration.count() != 0) return 986;
+
+    cppi.Outer.Inner batchKeyword = default;
+    batchKeyword.value = 21;
+    if (batchKeyword.i64() != 42) return 987;
     return 0;
 }
