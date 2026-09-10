@@ -86,6 +86,10 @@
 //                       `OpsSink << FreeOps`, whose left operand lives in another namespace.
 //   Section M36 (820-823): C++ rvalue receiver lifetime handoff, bool bitfield packing, and
 //                       inherited constructors forwarded through operator->.
+//   Section M41 (1000-1025): virtual members whose vtable SLOT cflat cannot name. The fixed
+//                       covariant return and virtual-base destructor use clang-synthesized thunks;
+//                       adjacent guards pin the existing base-record fallback and exact by-value
+//                       resource counts.
 //   Section M34 (813-819): implicit scalar-to-class reference conversion, chained nontrivial
 //                       class return receivers, member reference arguments/defaults, and RAII.
 
@@ -695,6 +699,91 @@ extern int main()
     if (m6q.bv != 77)                            return 458;
     if (m6q.l() != 3055)                         return 459;   // override of Left::l
     cpppoly.destroy_qual(m6q);
+
+    // ---- Section M41: virtual members reached through a clang thunk (1000-1025) -----
+    /*
+     * Under the MS ABI a member introduced by a NON-PRIMARY base sits in a vfptr at a non-zero
+     * offset and one reached through a VIRTUAL base sits in a vfptr found through the vbtable;
+     * MicrosoftVTableContext reports both as locations cflat cannot index. Most such members are
+     * still reachable through the record of the base that DECLARES them, with `this` adjusted -
+     * the guard legs below pin that path down, including its exact resource cost, because the
+     * fix must not displace it. Two cases have no such fallback and are what the thunk exists
+     * for: a DESTRUCTOR (only ever looked up on the class itself) and a COVARIANT return (whose
+     * fallback hands back an unadjusted pointer, so it is wrong rather than merely slower).
+     *
+     * The shapes are TEMPLATE specializations on purpose: a directly named class with virtual
+     * bases is refused at layout, so a specialization - held as a sized blob - is the only
+     * spelling whose members reach the vtable-slot gate at all.
+     */
+    // Built on the C++ side: cflat cannot construct a class with virtual bases, and what is
+    // under test here is the dispatch into one, not the construction of one.
+    cpppoly.TwoSlots<int>* m41 = cpppoly.make_two_slots();
+    // GUARD legs: these bind through the declaring base's record and already worked. They are
+    // here so a wider thunk trigger, which would displace that path, fails loudly.
+    if (cpppoly.read_slot(m41) != 33)            return 1000;
+    if (cpppoly.read_second(m41) != 44)          return 1001;
+    if (m41.primary() != 1033)                   return 1002;   // primary vfptr, direct slot call
+    if (m41.second() != 2044)                    return 1003;   // non-primary vfptr
+    if (m41.second_add(3, 4) != 78)              return 1004;   // 44 + 3*10 + 4
+    if (m41.second_pure() != 3044)               return 1005;   // pure virtual, overridden
+
+    // GUARD: a by-value class argument costs exactly one copy on BOTH vfptrs. A thunk in this
+    // position would add a forwarding move and its destruction, and these counts would change.
+    {
+        cpppoly.SlotVal m41v = cpppoly.SlotVal(5);
+        cpppoly.reset_slot_counts();
+        if (m41.primary_val(m41v) != 48)         return 1006;   // 33 + 5*3, primary vfptr
+        if (cpppoly.slot_copies() != 1)          return 1007;
+        if (cpppoly.slot_moves() != 0)           return 1008;
+        if (cpppoly.slot_dtors() != 1)           return 1009;
+        cpppoly.reset_slot_counts();
+        if (m41.second_val(m41v) != 54)          return 1010;   // 44 + 5*2, non-primary vfptr
+        if (cpppoly.slot_copies() != 1)          return 1011;
+        if (cpppoly.slot_moves() != 0)           return 1012;
+        if (cpppoly.slot_dtors() != 1)           return 1013;
+    }
+
+    // GUARD: a class RETURN by value is elided straight into the caller's local, on either path.
+    cpppoly.reset_slot_counts();
+    {
+        cpppoly.SlotVal m41r = m41.second_ret();
+        if (m41r.v != 49)                        return 1014;   // 44 + 5
+        if (cpppoly.slot_ctors() != 1)           return 1015;
+        if (cpppoly.slot_copies() != 0)          return 1016;
+        if (cpppoly.slot_moves() != 0)           return 1017;
+        if (cpppoly.slot_dtors() != 0)           return 1018;
+    }
+    if (cpppoly.slot_dtors() != 1)               return 1019;
+    cpppoly.destroy_two_slots(m41);
+
+    /*
+     * COVARIANT return. The source read is a guard; the clone return and Slot read are independent
+     * PRE discriminators for the unadjusted covariant result.
+     */
+    cpppoly.CloneDer<int>* m41c = cpppoly.make_clone_der();
+    // GUARD: PRE probe passed (exit 0); proves the source CloneDer value is valid.
+    if (cpppoly.read_clone(m41c) != 77)          return 1020;
+    cpppoly.CloneDer<int>* m41c2 = m41c.clone();
+    // DISCRIMINATOR: PRE probe exits 1021 at this read; the covariant result is unadjusted.
+    if (cpppoly.read_clone(m41c2) != 78)         return 1021;
+    // DISCRIMINATOR: PRE probe exits 1022 at this read; the same result misses the Slot subobject.
+    if (cpppoly.read_slot(m41c2) != 66)          return 1022;
+    cpppoly.destroy_clone(m41c2);
+    cpppoly.destroy_clone(m41c);
+
+    /*
+     * VIRTUAL base. The t() and u() arms are independent PRE guards for existing fallback paths.
+     * delete is a PRE discriminator: it leaves vbase_dtors at 0 without the destructor thunk.
+     */
+    cpppoly.VBaseUse<int>* m41v2 = cpppoly.make_vbase_use();
+    // GUARD: PRE probe passed (exit 0); protects the virtual-base method fallback.
+    if (m41v2.t() != 107)                        return 1023;
+    // GUARD: PRE probe passed (exit 0); protects the derived-class virtual call.
+    if (m41v2.u() != 9)                          return 1024;
+    cpppoly.reset_vbase_dtors();
+    delete m41v2;
+    // DISCRIMINATOR: PRE probe exits 1025; delete leaves vbase_dtors at 0 without the thunk.
+    if (cpppoly.vbase_dtors() != 1)              return 1025;
 
     // ---- Section M7: header-only C++ (definition emission) (460-479) ----------------
     // Inline free function, and one that calls another inline function: 5*3 + 5*3 = 30.

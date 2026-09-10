@@ -10,5 +10,13 @@ extern int main()
         cpppoly.VBaseMid* m = nullptr;
         int v = m.mv;
     }
+    // A TEMPLATE spelling is held as a sized blob, so the layout refusal above never fires and
+    // its members reach the binder. Its CONSTRUCTOR still cannot be called: every ABI passes an
+    // implicit most-derived argument (the MS is-most-derived flag, the Itanium VTT) that cflat
+    // does not, so a direct call would initialize the vbtable from a garbage register. The
+    // destructor stays callable through a thunk - see Section M41 of Test/test_cpp_interop.cb.
+    expect_error("has no default constructor cflat can call") {
+        cpppoly.VBaseUse<int> u = default;
+    }
     return 0;
 }

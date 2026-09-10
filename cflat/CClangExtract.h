@@ -21,6 +21,26 @@ namespace cflat_cinterop
     bool SplitStdFunctionSpelling(const std::string& spelling, std::string& ret,
                                   std::string& params);
 
+    // True for a virtual member that cflat can only reach through a clang-emitted thunk. The
+    // definition in CClangExtract.cpp carries the reasoning for exactly which members those are.
+    struct RawCxxMember;
+    bool CxxMemberNeedsVirtualThunk(const RawCxxMember& m);
+
+    /*
+     * Name of the extern "C" THUNK that stands in for such a member. Its body is an ordinary C++
+     * virtual call, so Clang emits the vftable load, the vbtable adjustment and the return
+     * adjustment; cflat only calls the symbol. Keyed on the member's mangled name so the
+     * request-source builder and the extractor derive the same name independently.
+     */
+    inline std::string CxxVirtualThunkName(const std::string& linkageName)
+    {
+        std::string out = "__cflat_vthk_";
+        for (char c : linkageName)
+            out += (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+                       || c == '_' ? c : '_';
+        return out;
+    }
+
     // One parameter's (or the result's) ABI arrangement as Clang computed it, spelled without a
     // single clang type so the backend can consume it and the caches can round-trip it. `kind`
     // mirrors clang::CodeGen::ABIArgInfo::Kind; coerceType/paddingType are LLVM IR type TEXT

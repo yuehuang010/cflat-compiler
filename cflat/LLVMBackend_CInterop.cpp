@@ -3366,6 +3366,75 @@ std::string LLVMBackend::BuildCxxRequestOdrUses(const cflat_cinterop::RawRecord&
 }
 
 /*
+ * One extern "C" THUNK per virtual member cflat cannot reach any other way - see
+ * cflat_cinterop::CxxMemberNeedsVirtualThunk for exactly which those are. Under the MS ABI
+ * MicrosoftVTableContext::getMethodVFTableLocation reports a vfptr at a non-zero offset (a
+ * non-primary base) or one reached through a VIRTUAL base, and cflat models neither the vbtable
+ * lookup nor a secondary vfptr; a covariant return needs an adjustment cflat cannot emit either.
+ * Instead of reimplementing the ABI, let Clang do it: the thunk body is an ordinary C++ virtual
+ * call, so Clang emits the vftable load, the vbtable adjustment and the return adjustment, and
+ * cflat binds the resulting symbol like any other function.
+ *
+ * A member whose slot IS directly usable, or that is reachable through the record of the base
+ * that declares it, keeps that path - a thunk is a real non-inlined call and an extra forwarding
+ * move on a by-value class argument, and must not be paid where nothing was broken.
+ */
+std::string LLVMBackend::BuildCxxVirtualThunks(
+    const std::vector<cflat_cinterop::RawRecord>& records) const
+{
+        using Member = cflat_cinterop::RawCxxMember;
+        std::string src;
+        std::set<std::string> emitted;
+        unsigned recv = 0;
+        for (const auto& rec : records)
+        {
+            // A record whose layout is refused keeps every instance member refused before the
+            // vtable slot is ever consulted, so a thunk for it would never be reached.
+            if (rec.canonicalCtype.empty() || !rec.layoutRefusal.empty()) continue;
+            std::string recordSrc;
+            const std::string marker = "__cflat_vthk_recv" + std::to_string(recv);
+            for (const auto& m : rec.members)
+            {
+                if (!m.isVirtual || m.linkageName.empty()) continue;
+                if (!CxxMemberNeedsVirtualThunk(m)) continue;
+                if (m.access != cflat_cinterop::AccessPublic || m.isDeleted || m.variadic) continue;
+                if (m.isTemplateSpecialization || !m.bindRefusal.empty()) continue;
+                if (m.kind != Member::Instance && m.kind != Member::Destructor) continue;
+                if (m.paramTypes.empty()) continue;   // no `this` slot: not an instance member
+                const std::string name = cflat_cinterop::CxxVirtualThunkName(m.linkageName);
+                if (!emitted.insert(name).second) continue;
+                if (m.kind == Member::Destructor)
+                {
+                    recordSrc += "extern \"C\" void " + name + "(" + marker + "* p) { p->~"
+                               + marker + "(); }\n";
+                    continue;
+                }
+                std::string params, args;
+                for (size_t p = 1; p < m.paramTypes.size(); ++p)
+                {
+                    if (p > 1) { params += ", "; args += ", "; }
+                    const std::string& t = m.paramTypes[p];
+                    const std::string a = "a" + std::to_string(p);
+                    params += t + " " + a;
+                    // A BY-VALUE parameter is forwarded as an rvalue, the way any forwarding
+                    // wrapper does: one move instead of one copy, and a move-only type still binds.
+                    args += t.ends_with("&&") ? "static_cast<" + t + ">(" + a + ")"
+                          : t.ends_with("&")  ? a
+                                              : "static_cast<" + t + "&&>(" + a + ")";
+                }
+                const std::string call = "p->" + m.name + "(" + args + ")";
+                recordSrc += "extern \"C\" " + m.retType + " " + name + "(" + marker + "* p"
+                           + (params.empty() ? "" : ", " + params) + ") { "
+                           + (m.retType == "void" ? call : "return " + call) + "; }\n";
+            }
+            if (recordSrc.empty()) continue;
+            src += "typedef " + rec.canonicalCtype + " " + marker + ";\n" + recordSrc;
+            ++recv;
+        }
+        return src;
+}
+
+/*
  * ODR-uses for the PUBLIC members a requested class INHERITS. A library may keep part of the
  * member surface on a base template - the MSVC STL's std::function has its operator() on
  * _Func_class - so the request's own record carries nothing to instantiate, and inherited-member
@@ -5363,7 +5432,8 @@ bool LLVMBackend::RequestCxxForeignType(const std::string& cflatName, const std:
                                       + BuildCxxRequestInheritedOdrUses(probe.records, probeTarget,
                                                                         "__cflat_req_0", "")
                                       + BuildStdFunctionCtorUse(cxxSpelling, "__cflat_req_0")
-                                      + memberDefaultWrappers,
+                                      + memberDefaultWrappers
+                                      + BuildCxxVirtualThunks(probe.records),
                                       /*emitDefinitions*/ true, emitted, err2);
                 if (emittedOk && !emitted.records.empty())
                     raw = std::move(emitted);
@@ -7026,6 +7096,20 @@ void LLVMBackend::RegisterCxxClassMembers(const CRecordEntry& r, const std::stri
                 continue;
             }
             if (m.variadic)               { refuse("is variadic");                       continue; }
+            /*
+             * A class with VIRTUAL BASES has an implicit extra CONSTRUCTOR argument in every ABI
+             * cflat targets - the MS is-most-derived flag, the Itanium VTT - and cflat passes
+             * neither, so a direct call would initialize the vbtable from whatever happened to be
+             * in that register. Refuse the constructor rather than emit a call that crashes; the
+             * destructor is reached through a synthesized thunk and stays callable, so such an
+             * object can still be built on the C++ side and released by cflat.
+             */
+            if (m.kind == Member::Constructor && r.hasVirtualBases)
+            {
+                refuse("belongs to a class with virtual bases, whose constructor takes an implicit "
+                       "most-derived argument cflat does not pass");
+                continue;
+            }
             // A POINTER TO MEMBER has an ABI representation of its own (Itanium: a two-word
             // {ptr, adj} pair for a member function, a byte offset for a data member) and its own
             // invocation sequence; an ordinary function pointer is not a substitute. Name it

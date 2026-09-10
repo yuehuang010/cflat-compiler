@@ -93,6 +93,25 @@ namespace cflat_cinterop
         }
     };
 
+    /*
+     * A virtual member cflat cannot reach any other way, and must therefore route through a
+     * clang-emitted thunk. Deliberately NARROW: a plain virtual method whose slot is unnameable
+     * is still reachable through the record of the base that DECLARES it, with `this` adjusted -
+     * that path works and costs nothing, so a thunk must not displace it. What has no such
+     * fallback is:
+     *   - a DESTRUCTOR, which is only ever looked up on the class itself. Under the MS ABI its
+     *     slot is unnameable whenever the vfptr sits inside a virtual base (every iostream).
+     *   - a COVARIANT return whose base conversion is not at offset zero. The derived member is
+     *     refused and the base member hands back an UNADJUSTED pointer, so the fallback is not
+     *     merely slower, it is wrong.
+     */
+    bool CxxMemberNeedsVirtualThunk(const RawCxxMember& m)
+    {
+        if (!m.isVirtual) return false;
+        if (m.covariantReturnNeedsAdjust) return true;
+        return m.kind == RawCxxMember::Destructor && m.vtableIndex < 0;
+    }
+
     bool SplitStdFunctionSpelling(const std::string& spelling, std::string& ret,
                                   std::string& params)
     {
@@ -2545,6 +2564,45 @@ namespace cflat_cinterop
             }
         }
 
+        /*
+         * Point a virtual member at the extern "C" thunk the request source synthesized for it
+         * (LLVMBackend::BuildCxxVirtualThunks). The thunk body is a plain C++ virtual call, so
+         * Clang owns the vftable load, the vbtable adjustment and the covariant return
+         * adjustment; the member stops being virtual TO CFLAT and binds down the ordinary
+         * direct-call path. Leaves the member untouched - and therefore refused - when no thunk
+         * was emitted, so nothing here can turn an unbindable member into a wrong call.
+         */
+        void BindCxxVirtualThunk(ExtractState& st, ASTContext& ctx,
+                                 clang::CodeGen::CodeGenModule& cgm, RawCxxMember& m)
+        {
+            using namespace clang::CodeGen;
+            const std::string name = CxxVirtualThunkName(m.linkageName);
+            const FunctionDecl* thunk = nullptr;
+            for (NamedDecl* nd : ctx.getTranslationUnitDecl()->lookup(
+                     DeclarationName(&ctx.Idents.get(name))))
+                if (const auto* fd = llvm::dyn_cast<FunctionDecl>(nd))
+                    if (fd->doesThisDeclarationHaveABody()) { thunk = fd; break; }
+            if (thunk == nullptr || thunk->isInvalidDecl()) return;
+            CanQualType canon = thunk->getType()->getCanonicalTypeUnqualified();
+            if (canon->getAs<FunctionProtoType>() == nullptr) return;
+            CanQual<FunctionProtoType> fpt = canon.castAs<FunctionProtoType>();
+            RawAbi abi = DescribeAbi(arrangeFreeFunctionType(cgm, fpt));
+            abi.fnTypeText = LlvmTypeText(convertFreeFunctionType(cgm, thunk));
+            if (m.paramTypes.size() != abi.params.size()) return;
+            m.abi = std::move(abi);
+            m.linkageName = name;
+            m.isVirtual = false;
+            m.covariantReturnNeedsAdjust = false;
+            m.vtableIndex = -1;
+            m.vtableIndexDeleting = -1;
+            // The thunk destroys the complete object and never releases storage, whatever the
+            // structor ABI would have done with a returned 'this'.
+            if (m.kind == RawCxxMember::Destructor) { m.retType = "void"; m.returnsThis = false; }
+            // Prove the thunk is a DEFINITION in the companion module the way every other
+            // synthesized helper is proved, instead of trusting that the request source compiled.
+            m.needsLocalDefinition = true;
+        }
+
         // Fill in the per-slot arrangement of every exported class member. The slot info comes
         // from arrangeCXXMethodType (which prepends 'this') for instance methods and structors,
         // and from arrangeFreeFunctionType for static ones. The FUNCTION TYPE is always taken
@@ -2653,6 +2711,10 @@ namespace cflat_cinterop
                 if (m.paramTypes.size() != abi.params.size())
                     continue;   // arrangement disagrees with the exported signature: refuse it
                 m.abi = std::move(abi);
+
+                // Slot unusable and no fallback path to the member: hand the dispatch to the
+                // thunk Clang generated for it.
+                if (CxxMemberNeedsVirtualThunk(m)) BindCxxVirtualThunk(st, ctx, cgm, m);
             }
         }
 

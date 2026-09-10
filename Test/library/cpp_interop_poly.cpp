@@ -64,4 +64,49 @@ namespace cpppoly
 
     VBaseTop::~VBaseTop() noexcept {}
     int VBaseTop::t() const noexcept { return tv; }
+
+    // ---- M41 ----
+    static int g_slot_ctors = 0, g_slot_copies = 0, g_slot_moves = 0, g_slot_dtors = 0;
+    void reset_slot_counts() noexcept
+    { g_slot_ctors = g_slot_copies = g_slot_moves = g_slot_dtors = 0; }
+    int slot_ctors() noexcept { return g_slot_ctors; }
+    int slot_copies() noexcept { return g_slot_copies; }
+    int slot_moves() noexcept { return g_slot_moves; }
+    int slot_dtors() noexcept { return g_slot_dtors; }
+
+    SlotVal::SlotVal(int value) noexcept : v(value) { ++g_slot_ctors; }
+    SlotVal::SlotVal(const SlotVal& o) noexcept : v(o.v) { ++g_slot_copies; }
+    SlotVal::SlotVal(SlotVal&& o) noexcept : v(o.v) { ++g_slot_moves; }
+    SlotVal::~SlotVal() noexcept { ++g_slot_dtors; }
+
+    Slot::Slot() noexcept { sv = 11; }
+    Slot::~Slot() noexcept {}
+    int Slot::primary() const noexcept { return sv; }
+    int Slot::primary_val(SlotVal t) const noexcept { return sv + t.v; }
+
+    Second::Second() noexcept { cv2 = 22; }
+    Second::~Second() noexcept {}
+    int Second::second() const noexcept { return cv2; }
+    int Second::second_add(int x, int y) const noexcept { return cv2 + x + y; }
+    int Second::second_val(SlotVal t) const noexcept { return cv2 + t.v; }
+    SlotVal Second::second_ret() const noexcept { return SlotVal(cv2); }
+
+    int read_second(const Second* p) noexcept { return p->cv2; }
+    int read_slot(const Slot* p) noexcept { return p->sv; }
+    TwoSlots<int>* make_two_slots() noexcept { return new TwoSlots<int>(); }
+    void destroy_two_slots(TwoSlots<int>* p) noexcept { delete p; }
+
+    CloneBase::CloneBase() noexcept { bvv = 55; }
+    CloneBase::~CloneBase() noexcept {}
+    CloneBase* CloneBase::clone() const noexcept { return new CloneBase(); }
+    int read_clone(const CloneBase* p) noexcept { return p->bvv; }
+    CloneDer<int>* make_clone_der() noexcept { return new CloneDer<int>(); }
+    void destroy_clone(CloneBase* p) noexcept { delete p; }
+
+    static int g_vbase_dtors = 0;
+    void note_vbase_dtor() noexcept { ++g_vbase_dtors; }
+    void reset_vbase_dtors() noexcept { g_vbase_dtors = 0; }
+    int vbase_dtors() noexcept { return g_vbase_dtors; }
+    VBaseUse<int>* make_vbase_use() noexcept { return new VBaseUse<int>(); }
+    void destroy_vbase_use(VBaseUse<int>* p) noexcept { delete p; }
 }

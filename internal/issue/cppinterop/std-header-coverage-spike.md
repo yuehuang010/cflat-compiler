@@ -30,7 +30,7 @@ when declared `= default`; their constructor-call spelling does not (gap 4).
 |---|-------|--------|
 | 1 | [`std-free-functions-and-globals-unreachable.md`](std-free-functions-and-globals-unreachable.md) | all 21 `c*` headers, `algorithm`, `numeric`, `bit`, `limits`, `format`, `iostream` globals |
 | 2 | [`cpp-alias-template-types-unresolvable.md`](cpp-alias-template-types-unresolvable.md) | `std.ofstream`, `std.ostringstream` |
-| 3 | [`stream-classes-no-callable-destructor.md`](stream-classes-no-callable-destructor.md) | streams as locals; with 1+2, the whole iostream family |
+| 3 | [`stream-classes-no-callable-destructor.md`](stream-classes-no-callable-destructor.md) (destructor half FIXED 2026-09-10; blocked now by [`cpp-virtual-base-constructor-unreachable.md`](cpp-virtual-base-constructor-unreachable.md) and [`stream-open-instantiation-error.md`](stream-open-instantiation-error.md)) | streams as locals; with 1+2, the whole iostream family |
 | 4 | [`constrained-template-constructor-overload-resolution.md`](constrained-template-constructor-overload-resolution.md) | `complex`, `chrono`, `filesystem`, `tuple`, `optional`, `pair`, `regex`, `random` construction |
 | 5 | [`lock-keyword-blocks-member-call.md`](lock-keyword-blocks-member-call.md) | `std.mutex.lock`, `std.shared_mutex.lock` |
 | 6 | [`range-for-over-cpp-container.md`](range-for-over-cpp-container.md) | `for (T x in c)` over every C++ container |
@@ -53,5 +53,9 @@ should go first. Gaps 2 and 3 are one story - neither alone makes a stream usabl
 deepest: constructor overload ranking over constrained member templates, the same machinery the
 working `const char*` constructor of `std.string` already exercises. Gap 7 needs a maintainer
 ruling on the target standard before it is a flag.
+
+Gap 3 split on 2026-09-10: the virtual destructor is fixed (a clang-emitted thunk carries the
+dispatch for a vfptr inside a virtual base); the constructor and `open` rungs behind it are filed
+separately and must be closed before a stream can be a local.
 
 Delete this file when all eight are closed.

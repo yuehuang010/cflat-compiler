@@ -4975,6 +4975,7 @@ private:
                                                 const cflat_cinterop::RawRecord& rec,
                                                 const std::string& marker,
                                                 const std::string& tagPrefix) const;
+    std::string BuildCxxVirtualThunks(const std::vector<cflat_cinterop::RawRecord>& records) const;
     bool RunCxxTypeRequests(const CxxRequestGroup& group,
                             const std::vector<CxxRequestItem>& items,
                             const std::string& extraSource, bool emitDefinitions,
