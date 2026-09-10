@@ -1,0 +1,57 @@
+# C++ standard library header coverage: spike survey and gap index
+
+Spiked 2026-09-09 on Windows (`x64/Release/cflat.exe`, MSVC STL via `import cpp`, clang pinned to
+`-std=c++20`). Two levels: L0 = `import cpp "<header>";` + empty `main` under `--check`; L1 = a
+minimal real use of the header's primary facility, compiled with `-o` and run.
+
+This file is the survey and the index. Each gap has its own issue file with repro, root-cause
+notes and acceptance.
+
+## L0: all 105 headers bind. Zero failures.
+
+Header discovery, the MSVC toolset include scan and the parse path are not the bottleneck - what
+fails is reaching the declarations inside.
+
+## L1: works today (built and ran, exit 0)
+
+`vector` `array` `deque` `list` `forward_list` `map` `set` `unordered_map` `unordered_set`
+`queue` `stack` `span` `bitset` `valarray` `string` `string_view` `memory` (`unique_ptr`,
+`shared_ptr`) `functional` (`std.function` over a CFlat function) `any` `variant` `atomic`
+`thread` `future` (`promise`) `condition_variable` `latch` `stop_token` `charconv`
+`memory_resource`.
+
+Container construction (`= default`), `push_back` / `push` / `operator[]` / `size` / `find`,
+member calls on a `T&` element, and `auto it = m.find(1)` all work. `optional` and `pair` work
+when declared `= default`; their constructor-call spelling does not (gap 4).
+
+## L1: gaps
+
+| # | Issue | Blocks |
+|---|-------|--------|
+| 1 | [`std-free-functions-and-globals-unreachable.md`](std-free-functions-and-globals-unreachable.md) | all 21 `c*` headers, `algorithm`, `numeric`, `bit`, `limits`, `format`, `iostream` globals |
+| 2 | [`cpp-alias-template-types-unresolvable.md`](cpp-alias-template-types-unresolvable.md) | `std.ofstream`, `std.ostringstream` |
+| 3 | [`stream-classes-no-callable-destructor.md`](stream-classes-no-callable-destructor.md) | streams as locals; with 1+2, the whole iostream family |
+| 4 | [`constrained-template-constructor-overload-resolution.md`](constrained-template-constructor-overload-resolution.md) | `complex`, `chrono`, `filesystem`, `tuple`, `optional`, `pair`, `regex`, `random` construction |
+| 5 | [`lock-keyword-blocks-member-call.md`](lock-keyword-blocks-member-call.md) | `std.mutex.lock`, `std.shared_mutex.lock` |
+| 6 | [`range-for-over-cpp-container.md`](range-for-over-cpp-container.md) | `for (T x in c)` over every C++ container |
+| 7 | [`no-cpp-standard-selection-flag.md`](no-cpp-standard-selection-flag.md) | `expected`, `flat_map`, `flat_set`, `generator`, `mdspan`, `print`, `stacktrace`, `stdfloat` |
+| 8 | [`multi-word-template-arguments-unparseable.md`](multi-word-template-arguments-unparseable.md) | any specialization over `long long`, `unsigned int`, ... |
+
+## Not spiked
+
+`type_traits` `concepts` `compare` `ratio` `iterator` `ranges` `coroutine` `source_location`
+`typeindex` `typeinfo` `initializer_list` `version` `execution` `locale` `codecvt`
+`scoped_allocator` `new` `exception` `stdexcept` `system_error` `cstddef` `cstdint` `climits`
+`cerrno` and friends have no CFlat-reachable runtime surface beyond gap 1, or exist only to be
+consumed by C++ code. They bind at L0; they need a ruling on whether they should have a CFlat
+surface at all before a spike means anything.
+
+## Sequencing
+
+Gaps 1, 5, 6, 8 are independent and small. Gap 1 unlocks the most headers per unit of work and
+should go first. Gaps 2 and 3 are one story - neither alone makes a stream usable. Gap 4 is the
+deepest: constructor overload ranking over constrained member templates, the same machinery the
+working `const char*` constructor of `std.string` already exercises. Gap 7 needs a maintainer
+ruling on the target standard before it is a flag.
+
+Delete this file when all eight are closed.
