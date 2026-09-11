@@ -3093,6 +3093,25 @@ namespace cflat_cinterop
                 const CXXRecordDecl* def = rd != nullptr ? rd->getDefinition() : nullptr;
                 if (def == nullptr || !def->isDynamicClass() || def->isDependentContext()) continue;
                 if (ctx.getCurrentKeyFunction(def) != nullptr) continue;   // anchored elsewhere
+                /*
+                 * `extern template class X<char>;` (libc++ does this for basic_ios, basic_istream,
+                 * basic_ostream, basic_streambuf, ...) is an explicit instantiation DECLARATION: a
+                 * template specialization has no key function, but the vtable is still anchored in
+                 * the translation unit that carries the matching explicit instantiation DEFINITION,
+                 * i.e. inside the library. Clang gives such a vtable plain external linkage, so a
+                 * blind HandleVTable emits a STRONG duplicate of a symbol the library exports - two
+                 * companion modules that both touch the class then collide on the way into the
+                 * program module ("symbol multiply defined"). Leave it to the library.
+                 */
+                if (def->getTemplateSpecializationKind()
+                    == clang::TSK_ExplicitInstantiationDeclaration)
+                {
+                    if (st.req.verbose)
+                        std::cout << "[verbose]   vtable left to the library, '"
+                                  << def->getQualifiedNameAsString()
+                                  << "' is an explicit instantiation declaration\n";
+                    continue;
+                }
                 cg.HandleVTable(const_cast<CXXRecordDecl*>(def));
             }
 

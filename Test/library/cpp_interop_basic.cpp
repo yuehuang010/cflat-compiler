@@ -5,6 +5,17 @@
 
 namespace cppi
 {
+    static int g_nested_inner_dtors = 0;
+    static int g_nested_outer_dtors = 0;
+    NestedInner::~NestedInner() { ++g_nested_inner_dtors; }
+    NestedOuter::~NestedOuter() { ++g_nested_outer_dtors; }
+    void reset_nested_counts() noexcept { g_nested_inner_dtors = 0; g_nested_outer_dtors = 0; }
+    int nested_inner_dtors() noexcept { return g_nested_inner_dtors; }
+    int nested_outer_dtors() noexcept { return g_nested_outer_dtors; }
+
+    // The explicit instantiation DEFINITION that owns ExternPoly<int>'s vtable and members.
+    template struct ExternPoly<int>;
+
     int add(int a, int b) noexcept { return a + b; }
     int add(double a, double b) noexcept { return (int)(a + b) + 1000; }
 

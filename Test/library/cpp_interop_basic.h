@@ -733,6 +733,53 @@ namespace cppi
 
     char16_t char16_value(char16_t value) noexcept;
 
+    /*
+     * A C++ class destroys its own subobjects: ~NestedOuter runs ~NestedInner exactly once.
+     * Both destructors are bound on the CFlat side (the test constructs each class directly),
+     * so a member-teardown pass synthesized around the bound destructor would destroy the
+     * inner subobject a second time - a double release that only shows up as heap corruption
+     * at some later allocation.
+     */
+    struct NestedInner
+    {
+        int tag;
+        explicit NestedInner(int t) noexcept : tag(t) {}
+        ~NestedInner();
+        int get() const noexcept { return tag; }
+    };
+
+    struct NestedOuter
+    {
+        NestedInner inner;
+        explicit NestedOuter(int t) noexcept : inner(t) {}
+        ~NestedOuter();
+        int get() const noexcept { return inner.get(); }
+    };
+
+    void reset_nested_counts() noexcept;
+    int nested_inner_dtors() noexcept;
+    int nested_outer_dtors() noexcept;
+
+    /*
+     * Explicit instantiation DECLARATION of an all-inline polymorphic class template. The
+     * specialization has no key function, but its vtable belongs to the translation unit that
+     * carries the matching explicit instantiation DEFINITION (cpp_interop_basic.cpp), and Clang
+     * gives such a vtable plain external linkage. Every lazily requested member of the class
+     * produces its own companion module, so emitting the vtable here would put a strong
+     * duplicate in two of them and the companion link would fail on it.
+     */
+    template <typename T>
+    struct ExternPoly
+    {
+        T value;
+        explicit ExternPoly(T v) noexcept : value(v) {}
+        virtual ~ExternPoly() {}
+        virtual T get() const noexcept { return value; }
+        virtual T twice() const noexcept { return (T)(value + value); }
+    };
+
+    extern template struct ExternPoly<int>;
+
 }
 
 extern "C" int cppi_c_linkage(int v) noexcept;

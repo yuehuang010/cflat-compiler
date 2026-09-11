@@ -2327,7 +2327,11 @@ bool LLVMBackend::TryLoadCHeaderDiskCache(
         // v41 carries constructor-wrapper metadata for inherited and parameter-pack constructors.
         // v42: C++ imports map `long` / `unsigned long` / `char8_t` / `char16_t` / `char32_t` /
         // `wchar_t` by identity to `long` / `ulong` / `c8` / `c16` / `c32` / `wchar`.
-        if (version != 42) return false;
+        // v43: the companion module no longer emits the vtable of a class whose specialization is
+        // an explicit instantiation DECLARATION (`extern template class basic_ios<char>;`) - that
+        // vtable is a strong symbol owned by the library, and a v42 entry carries a duplicate
+        // definition of it.
+        if (version != 43) return false;
 
         // Accept on mtime match (fast) or content hash match (authoritative on mtime drift).
         auto storedMtime = j.value("mtime", int64_t{-1});
@@ -2419,7 +2423,7 @@ void LLVMBackend::WriteCHeaderDiskCache(
         if (ec) return;
 
         nlohmann::json j;
-        j["version"] = 42;
+        j["version"] = 43;
         j["mtime"]   = (int64_t)mtime.time_since_epoch().count();
         j["hash"]    = contentHash;
         j["ldw"]     = entry.longDoubleWidth;

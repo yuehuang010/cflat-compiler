@@ -1147,6 +1147,17 @@ llvm::Function* LLVMBackend::GetOrCreateFullDestructor(const std::string& typeNa
         if (dsIt == dataStructures.end())
             return nullptr;
 
+        /*
+         * An IMPORTED C++ class destroys its own subobjects: `~OutputArchive` releases the
+         * shared_ptr and the jit::Module member itself. Walking its fields here and destroying
+         * them a second time is a double release - the heap corruption only surfaces at some
+         * later allocation. So full destruction of a C++ record IS its bound destructor, nothing
+         * more. A C++ class with no bound destructor is trivially destructible (a class with a
+         * nontrivial member has a nontrivial destructor), so a null answer is correct too.
+         */
+        if (IsCxxRecord(typeName))
+            return dsIt->second.Destructor;
+
         // C++-style raw union semantics: the union has no hidden active-member tag, so the
         // compiler cannot safely synthesize member destruction. Only an explicitly written
         // union destructor runs; users that need managed alternatives must keep the tag and

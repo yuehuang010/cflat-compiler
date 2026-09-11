@@ -844,12 +844,36 @@ Eigen -> libtorch; spikes under scratch/ladder/). Landed on master, in order:
   a class reference parameter selects the numeric converting constructor and materializes a
   temporary; implicit class arguments scored after overload selection. Fixture M34. t5: two SGD
   steps with torch::NoGradGuard, at.mul, sub_, mutable_grad().zero_() -> loss 6.0 then 4.8 (114 s).
-State (master, 2026-09-09): scratch/ladder/torch/ t1 ones/numel (67 s), t2 sum/item and member
-default wrapper, t3 t + t, t4 matmul/backward/grad/index (170-190 s), t5 SGD loop, t6
-from_blob/TensorOptions/nn::Linear forward - all compile, link against libtorch and print the
-expected values. Open: `at.mul(g, lr)` with a bare double needs the explicit c10.Scalar(lr)
-spelling; t4-class compiles spend ~150 s in stage-2 parses for member-signature type requests
-(batching per class is the next perf item); postfix operator++(int) unextracted by ruling.
+- Round 5 (2026-09-11, working tree, uncommitted): default-wrapper regression from 0027502d fixed
+  (errors in the in-memory stub never count as bound-header errors, the error-body sweep drops
+  the one bad wrapper). Nested C++ alias temporaries as call arguments (`torch.ones(
+  c10.IntArrayRef(p, n))`): lazy alias requested when followed by `(`, lookahead matches through
+  the memberNameToken rule, the data-structure flag is recomputed after the request, and the
+  ctor selector reads the declared pointer element type the call-argument builder had blanked.
+  Fixture M21 774-775. t7 training loop: inherited members through class-template bases
+  (`Cloneable<T>` collapses to one CFlat identity, so lookup falls back to the bare template
+  name), shared shell method list no longer wiped per specialization, base registration
+  iterates to a fixed point, a member whose only unmappable parameter is defaulted binds at the
+  shorter arity through the default wrapper, nontrivial class prvalues into by-value ctor
+  parameters are move-constructed into the caller-owned temp (was a byte copy + double free).
+  Fixture M37 824-829. t8 archives: vtables of explicit-instantiation-declaration specializations
+  (libc++ basic_ios<char>) are left to the owning library instead of a strong copy per
+  companion module; an imported C++ class uses its own destructor as-is (the synthesized full
+  destructor tore fields down a second time). Cache v43. Fixture rows 1010-1016.
+State (working tree, 2026-09-11): scratch/ladder/torch/ t1-t6 as before plus t7 (nn::Linear +
+torch::optim::SGD + at::mse_loss, 200 steps, loss 6.35 -> 0.004) and t8 (OutputArchive write /
+save_to, InputArchive load_from / read) - all compile, link against libtorch and print the
+expected values; test.sh Release 893/0/8. Open: `at.mul(g, lr)` with a bare double needs the
+explicit c10.Scalar(lr) spelling; t4-class compiles spend ~100 s in stage-2 parses for
+member-signature type requests (batching per class is the next perf item); the auto-instantiate
+pass trips a static_assert in ATen/ops/avg_pool2d_meta.h and recovers through the
+autoInstantiateCxxTypes=false retry at the cost of a second ~10 s parse; class-template
+specializations collapsing to one CFlat identity is a design question (distinct `$` identities
+would change the record-name convention); a ctor call mixing a class argument with an int
+literal emits the literal at i8 width; `short` parameters get an i8 argument
+(internal/issue/p2/cpp-short-ctor-arg-lowered-to-i8.md); torch::save/load are variadic function
+templates and stay unbound (t8 uses the archive classes they wrap); postfix operator++(int)
+unextracted by ruling.
 
 Open: per-import `std` clause or CLI-only; exceptions option at M8 start; MSVC ABI pass.
 Open from the M5 review (2026-09-06):

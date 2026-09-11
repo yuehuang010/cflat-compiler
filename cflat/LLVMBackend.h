@@ -7356,6 +7356,11 @@ public:
         return it == cxxClasses_.end() ? nullptr : &it->second;
     }
     bool IsCxxRecord(const std::string& typeName) const { return cxxRecords_.count(typeName) != 0; }
+    // A C++ alias of a specialization that is still unrequested (`c10.IntArrayRef` before any use).
+    bool IsCxxLazyAliasSpecialization(const std::string& name) const
+    {
+        return cxxLazyAliasSpecializations_.count(name) != 0;
+    }
 
     /*
      * ========================= M6 - inheritance and virtual dispatch ==========================
@@ -7429,7 +7434,10 @@ public:
     bool RejectAbstractCxxClass(const std::string& typeName, const char* what);
     // Register every public instance method a class INHERITS from its public bases, retyped so
     // `this` is the derived class, with the base subobject offset recorded in cxxThisAdjust_.
-    void RegisterCxxInheritedMembers(const CRecordEntry& r);
+    // Returns true when it added at least one inherited clone, so the caller can iterate to a
+    // fixed point: records do NOT always arrive base-before-derived (clang emits a class template
+    // specialization used as a base AFTER the class that instantiated it).
+    bool RegisterCxxInheritedMembers(const CRecordEntry& r);
 
     /*
      * Access control / bindability gate for one named member of an imported C++ class. Fires on
@@ -7486,8 +7494,12 @@ public:
                                            const CxxClassInfo::Structor& st,
                                            AbiRecipe& recipeOut);
     // Emit `st(slot, extraArgs...)`. The structor's own result (`this`) is discarded.
+    // `extraArgVars`, when given, parallels `extraArgs` and supplies each argument's ADDRESS.
+    // A nontrivial C++ class parameter passed by value needs it: the argument must be copy- or
+    // move-CONSTRUCTED into the caller-owned temp clang expects, never byte-copied.
     bool EmitCxxStructorCall(const std::string& typeName, const CxxClassInfo::Structor& st,
-                             llvm::Value* slot, const std::vector<llvm::Value*>& extraArgs);
+                             llvm::Value* slot, const std::vector<llvm::Value*>& extraArgs,
+                             const std::vector<NamedVariable>* extraArgVars = nullptr);
     // A constant C++ default argument as an LLVM value of the parameter's type; nullptr when
     // the default is not a constant this call can reproduce.
     llvm::Value* MaterializeCxxDefaultArgument(const cflat_cinterop::RawDefaultArg& def,

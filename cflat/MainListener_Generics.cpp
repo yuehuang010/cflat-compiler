@@ -240,16 +240,31 @@ std::string MainListener::GenericMethodTemplateKey(const std::string& receiverTy
         return genericFunctionTemplates.count(key) ? key : std::string{};
     }
 
-bool MainListener::IsFollowedByDot(CFlatParser::PostfixExpressionContext* ctx, antlr4::tree::ParseTree* child) {
+static bool IsFollowedByToken(CFlatParser::PostfixExpressionContext* ctx, antlr4::tree::ParseTree* child,
+                              size_t tokenType) {
+        // The postfix walk hands over the identifier INSIDE a memberNameToken rule, so a
+        // qualified member (`c10.IntArrayRef`) is matched through its wrapping rule node.
         const auto& children = ctx->children;
         for (size_t i = 0; i + 1 < children.size(); i++)
         {
-            if (children[i] != child)
-                continue;
+            bool match = children[i] == child;
+            if (!match)
+                if (auto* rule = dynamic_cast<antlr4::RuleContext*>(children[i]);
+                    rule != nullptr && !rule->children.empty())
+                    match = rule->children.front() == child;
+            if (!match) continue;
             auto* next = dynamic_cast<antlr4::tree::TerminalNode*>(children[i + 1]);
-            return next != nullptr && next->getSymbol()->getType() == CFlatParser::Dot;
+            return next != nullptr && next->getSymbol()->getType() == tokenType;
         }
         return false;
+    }
+
+bool MainListener::IsFollowedByDot(CFlatParser::PostfixExpressionContext* ctx, antlr4::tree::ParseTree* child) {
+        return IsFollowedByToken(ctx, child, CFlatParser::Dot);
+    }
+
+bool MainListener::IsFollowedByCall(CFlatParser::PostfixExpressionContext* ctx, antlr4::tree::ParseTree* child) {
+        return IsFollowedByToken(ctx, child, CFlatParser::LeftParen);
     }
 
 std::string MainListener::InstantiateGenericFunction(const std::string& baseName,

@@ -1409,15 +1409,24 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                     if (candidate.Parameters.empty()
                         && candidate.UniqueName.starts_with("__cflat_dflt_"))
                     {
+                        // With no declaration of its own in the set, the wrapper is the ONLY way
+                        // to call this member: its full arity names a type cflat cannot spell
+                        // (torch::optim::Optimizer::step takes a std::function), so registration
+                        // bound the shorter arity alone. Keep the diagnostic path only while a
+                        // real declaration is present to serve the call.
                         bool hasClassDefault = false;
+                        bool haveDeclaration = false;
                         for (const auto& other : candidates)
                             if (!other.UniqueName.starts_with("__cflat_dflt_"))
+                            {
+                                haveDeclaration = true;
                                 for (size_t i = 0; i < other.DefaultArguments.size()
                                      && i < other.Parameters.size(); ++i)
                                     if (other.DefaultArguments[i].kind == "nonconst"
                                         && dataStructures.count(other.Parameters[i].TypeName) != 0)
                                         hasClassDefault = true;
-                        if (!hasClassDefault) continue;
+                            }
+                        if (haveDeclaration && !hasClassDefault) continue;
                     }
                     resolvedCandidate.emplace_back(arguments, candidate);
                     // Native CFlat semantics: the first zero-argument-bindable candidate in

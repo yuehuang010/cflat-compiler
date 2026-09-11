@@ -122,6 +122,24 @@ namespace cppt
 
     using TaggedInt = Tagged<int>;
     namespace deep { using TaggedLong = Tagged<long>; }
+    // Used only as a temporary built straight into a call argument (never declared first).
+    using TaggedReal = Tagged<double>;
+    inline double tagged_real_value(TaggedReal t) noexcept { return t.get(); }
+
+    // A borrowed (pointer, count) view, like c10::ArrayRef; alias met first as a temporary.
+    template <typename T>
+    class View
+    {
+    public:
+        View(const T* p, unsigned long n) noexcept : p_(p), n_(n) {}
+        T sum() const noexcept { T s = T(); for (unsigned long i = 0; i < n_; ++i) s += p_[i]; return s; }
+
+    private:
+        const T* p_;
+        unsigned long n_;
+    };
+    using LongView = View<long>;
+    inline long long_view_sum(LongView v) noexcept { return v.sum(); }
 
     // Trivially copyable for calls (returned in registers), yet a C++ class with constructors.
     class Slot
@@ -247,5 +265,60 @@ namespace cppt
     {
         using InheritedBase::InheritedBase;
         const InheritedBase* operator->() const noexcept { return this; }
+    };
+
+    // A CLASS TEMPLATE used as a base, CRTP style. Clang's qualified name for a specialization
+    // decl drops the arguments, so every TplBase<T> shares one CFlat identity - the derived
+    // classes must still inherit base_tag(), and the SECOND specialization must not lose it.
+    template <typename T>
+    struct TplBase
+    {
+        int slot;
+        int base_tag() const noexcept { return 7; }
+    };
+
+    struct TplHolderA : TplBase<TplHolderA>
+    {
+        int own_a() const noexcept { return 5; }
+    };
+
+    struct TplHolderB : TplBase<TplHolderB>
+    {
+        int own_b() const noexcept { return 9; }
+    };
+
+    // A dependent member is only instantiated when it is odr-used, and clang emits no body for
+    // an uninstantiated one. Force both specializations here so the base HAS a bindable member
+    // for the derived classes to inherit.
+    inline int force_tpl_base_instantiation() noexcept
+    {
+        TplHolderA a{};
+        TplHolderB b{};
+        return a.base_tag() + b.base_tag();
+    }
+
+    // A NONTRIVIAL class crossing a CONSTRUCTOR boundary by value, fed straight from a function
+    // that returns one by value: the argument must be move-constructed into the caller-owned
+    // temp, never byte-copied over the returned temp's own buffer.
+    struct ItemBag
+    {
+        cppi::Tracked held;
+        explicit ItemBag(cppi::Tracked t) : held(std::move(t)) {}
+        int value() const noexcept { return held.value(); }
+    };
+
+    // An unmappable parameter that is DEFAULTED must not sink the whole member: the shorter
+    // arity never names the type, so `pick()` binds through the generated default wrapper.
+    struct Picker
+    {
+        int marker;
+        int pick(const std::vector<int>& (*chooser)() = nullptr) const noexcept
+        {
+            return chooser == nullptr ? 42 : 0;
+        }
+        int scale(std::vector<int> weights = {}) const noexcept
+        {
+            return weights.empty() ? 11 : (int)weights.size();
+        }
     };
 }

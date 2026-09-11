@@ -6705,17 +6705,32 @@ void LLVMBackend::RegisterCRecords(std::vector<CRecordEntry>& records, const std
         }
 
         // Pass 3: members, now that every body in the batch exists.
+        std::vector<const CRecordEntry*> inheritDeferred;
         for (const auto& [rp, laidOut] : deferredMembers)
         {
             const CRecordEntry& r = *rp;
             RegisterCxxClassMembers(r, fileForLsp);
             if (!laidOut) continue;
             RegisterCxxInheritedMembers(r);
+            inheritDeferred.push_back(rp);
             // Hook the C++ complete-object destructor into the SAME destructor slot CFlat uses for
             // its own owning struct locals, so every existing scope-exit, early-return, break and
             // continue cleanup path destroys it exactly once.
             if (cxxNontrivialRecords_.count(r.name) != 0)
                 GetOrCreateCxxClassDestructor(r.name);
+        }
+
+        // Pass 3b: base-before-derived does NOT hold for a class template specialization used as
+        // a base - clang emits cppt::TplBase<TplHolderA> AFTER cppt::TplHolderA, so the first
+        // sweep saw no base to clone from. Repeat until nothing new is cloned; the clone step is
+        // idempotent, so the only cost of an extra round is the scan. The cap bounds a pathological
+        // hierarchy rather than a real one (each round resolves at least one more level).
+        for (int round = 0; round < 8; ++round)
+        {
+            bool added = false;
+            for (const CRecordEntry* rp : inheritDeferred)
+                added |= RegisterCxxInheritedMembers(*rp);
+            if (!added) break;
         }
 
         // Register each header-COM interface's IID as its "uuid" type annotation (over ALL records,
@@ -6951,12 +6966,18 @@ void LLVMBackend::RegisterCxxClassMembers(const CRecordEntry& r, const std::stri
         // A class imported from a C++ HEADER group also gets a C++ spelling, so it can be a
         // template argument (`cppt.Box<cppi.Tracked>`). A request already recorded its own
         // spelling, which is the one the request TU was built with - never overwrite it.
-        if (!r.canonicalCtype.empty() && cxxCflatToCxxSpelling_.count(r.name) == 0)
+        // The REVERSE map is keyed by the full canonical spelling, so it is populated for every
+        // record even when several records share one CFlat identity. Class template
+        // specializations do: clang's qualified name for a specialization decl drops the
+        // arguments, so every torch::nn::Cloneable<T> registers as 'torch.nn.Cloneable'. Only
+        // the forward map (identity -> spelling) is first-wins.
+        if (!r.canonicalCtype.empty())
         {
             std::string spelling = r.canonicalCtype;
             for (const char* tag : { "class ", "struct ", "union ", "enum " })
                 if (spelling.rfind(tag, 0) == 0) { spelling.erase(0, strlen(tag)); break; }
-            if (!spelling.empty()) cxxCflatToCxxSpelling_[r.name] = spelling;
+            if (!spelling.empty() && cxxCflatToCxxSpelling_.count(r.name) == 0)
+                cxxCflatToCxxSpelling_[r.name] = spelling;
             // Reverse direction: clang spells this class canonically in every member signature it
             // appears in (`push_back(const cppi::Tracked&)` inside a requested specialization), so
             // the C type mapper needs the spelling -> CFlat identity entry as well. Both the
@@ -7220,6 +7241,7 @@ void LLVMBackend::RegisterCxxClassMembers(const CRecordEntry& r, const std::stri
             if (aliasRefs) asAliasIfRef(m.retType, ret);
             std::vector<TypeAndValue> params;
             bool paramsOk = true;
+            size_t unmappableParam = m.paramTypes.size();
             for (size_t p = 0; p < m.paramTypes.size(); ++p)
             {
                 TypeAndValue tv;
@@ -7242,6 +7264,7 @@ void LLVMBackend::RegisterCxxClassMembers(const CRecordEntry& r, const std::stri
                         ? CInteropLongDoubleRefusal()
                         : std::format("takes unsupported type '{}'", m.paramTypes[p]));
                     paramsOk = false;
+                    unmappableParam = p;
                     break;
                 }
                 else if (aliasRefs) asAliasIfRef(m.paramTypes[p], tv);
@@ -7263,11 +7286,93 @@ void LLVMBackend::RegisterCxxClassMembers(const CRecordEntry& r, const std::stri
                 {
                     refuse(std::format("takes unsupported type '{}'", m.paramTypes[p]));
                     paramsOk = false;
+                    unmappableParam = p;
                     break;
                 }
                 params.push_back(std::move(tv));
             }
-            if (!paramsOk) continue;
+            // A member whose omitted suffix contains a non-constant default gets an exact-arity
+            // receiver-prefixed overload backed by a C++ forwarding body. The generated body is
+            // outside the class, so only public members are eligible and const receivers retain
+            // their declared constness in the wrapper's C++ parameter.
+            const auto registerDefaultArityWrapper = [&](const std::vector<TypeAndValue>& prefix,
+                                                         size_t n) -> bool
+            {
+                if (m.linkageName.empty() || m.defaultArgs.size() != m.paramTypes.size()) return false;
+                if (m.kind != Member::Instance && m.kind != Member::StaticMethod) return false;
+                if (n >= m.defaultArgs.size() || m.defaultArgs[n].kind == "unsupported") return false;
+                if (!HasNonConstDefaultSuffix(m.defaultArgs, n)) return false;
+                const bool havePlan = m.abi.valid && m.abi.params.size() == m.paramTypes.size();
+                const auto canWrap = [&](const TypeAndValue& t) {
+                    return havePlan || t.Pointer || !dataStructures.count(t.TypeName);
+                };
+                if (!canWrap(ret)) return false;
+                for (size_t i = 0; i < n; ++i)
+                    if (!canWrap(prefix[i])) return false;
+                const std::string wrapper = CxxDefaultWrapperName(m.linkageName, n);
+                // Same spelling the full-arity registration below uses; computed here because the
+                // unmappable-parameter path reaches this lambda before that declaration.
+                const std::string wrapperRegName = m.kind == Member::StaticMethod
+                    ? r.name + "." + cflatName : cflatName;
+                if (m.kind == Member::StaticMethod)
+                {
+                    NoteCxxForeignNamespace(wrapperRegName);
+                    for (size_t pos = 0;
+                         (pos = wrapperRegName.find('.', pos)) != std::string::npos; ++pos)
+                        RegisterNamespace(wrapperRegName.substr(0, pos));
+                }
+                cflat_cinterop::RawAbi wrapperPlan;
+                if (havePlan)
+                {
+                    wrapperPlan = m.abi;
+                    wrapperPlan.params.resize(n);
+                    // The cross-check text describes the FULL arity; the truncated plan has no
+                    // matching text, so the slot-by-slot build stands on its own.
+                    wrapperPlan.fnTypeText.clear();
+                }
+                std::string wrapperMismatch;
+                CInteropDeclarationScope declaringFile(*this,
+                    m.file.empty() ? fileForLsp : m.file);
+                {
+                    CxxAbiPlanScope wrapperAbi(*this, havePlan ? &wrapperPlan : nullptr,
+                                               &wrapperMismatch);
+                    CreateFunctionDeclaration(wrapperRegName, ret, prefix, /*external=*/true,
+                        /*varargs=*/false, /*returnsOwned=*/false,
+                        /*isMethod=*/m.kind == Member::Instance,
+                        CallingConv::Cdecl, wrapper, /*isCxx=*/true, m.isNoexcept);
+                }
+                if (!wrapperMismatch.empty())
+                {
+                    if (verbose)
+                        std::cout << std::format(
+                            "[verbose]   C++ default wrapper {} not bound: {}\n",
+                            wrapper, wrapperMismatch);
+                    return false;
+                }
+                if (auto wit = functionTable.find(wrapperRegName); wit != functionTable.end())
+                    for (FunctionSymbol& sym : wit->second)
+                        if (sym.External && sym.UniqueName == wrapper)
+                        {
+                            sym.IsCInteropDeclaration = true;
+                            sym.DefaultArguments.clear();
+                        }
+                return true;
+            };
+            /*
+             * An unmappable parameter that is DEFAULTED does not have to sink the whole member:
+             * the shorter arity never names the type. torch::optim::Optimizer::step takes a
+             * LossClosure (std::function<at::Tensor()>) cflat has no spelling for, but `opt.step()`
+             * passes nothing - the generated wrapper applies the C++ default on the C++ side. Only
+             * the arity that WOULD name the type stays refused, so passing one still says why.
+             */
+            if (!paramsOk)
+            {
+                if (!registerDefaultArityWrapper(params, unmappableParam)) continue;
+                if (m.kind == Member::Instance) info.instanceMethodNames.push_back(cflatName);
+                if (info.memberAccess.find(cflatName) == info.memberAccess.end())
+                    info.memberAccess[cflatName] = m.access;
+                continue;
+            }
 
             if (isStructor || m.isCopyAssign || m.isMoveAssign)
             {
@@ -7345,60 +7450,10 @@ void LLVMBackend::RegisterCxxClassMembers(const CRecordEntry& r, const std::stri
             // receiver-prefixed overload backed by a C++ forwarding body. The generated body is
             // outside the class, so only public members are eligible and const receivers retain
             // their declared constness in the wrapper's C++ parameter.
-            if (m.defaultArgs.size() == m.paramTypes.size()
-                && m.linkageName.size() != 0
-                && (m.kind == Member::Instance || m.kind == Member::StaticMethod))
+            for (size_t n = 0; n < params.size(); ++n)
             {
-                const bool havePlan = m.abi.valid && m.abi.params.size() == m.paramTypes.size();
-                const auto canWrap = [&](const TypeAndValue& t) {
-                    return havePlan || t.Pointer || !dataStructures.count(t.TypeName);
-                };
-                if (canWrap(ret))
-                    for (size_t n = 0; n < m.paramTypes.size(); ++n)
-                    {
-                        if (m.defaultArgs[n].kind == "unsupported"
-                            || !HasNonConstDefaultSuffix(m.defaultArgs, n))
-                            continue;
-                        bool supported = true;
-                        for (size_t i = 0; i < n; ++i)
-                            if (!canWrap(params[i])) { supported = false; break; }
-                        if (!supported) continue;
-                        std::vector<TypeAndValue> prefix(params.begin(), params.begin() + n);
-                        const std::string wrapper = CxxDefaultWrapperName(m.linkageName, n);
-                        cflat_cinterop::RawAbi wrapperPlan;
-                        if (havePlan)
-                        {
-                            wrapperPlan = m.abi;
-                            wrapperPlan.params.resize(n);
-                            wrapperPlan.fnTypeText.clear();
-                        }
-                        std::string wrapperMismatch;
-                        CInteropDeclarationScope declaringFile(*this,
-                            m.file.empty() ? fileForLsp : m.file);
-                        {
-                            CxxAbiPlanScope wrapperAbi(*this, havePlan ? &wrapperPlan : nullptr,
-                                                       &wrapperMismatch);
-                            CreateFunctionDeclaration(regName, ret, prefix, /*external=*/true,
-                                /*varargs=*/false, /*returnsOwned=*/false,
-                                /*isMethod=*/m.kind == Member::Instance,
-                                CallingConv::Cdecl, wrapper, /*isCxx=*/true, m.isNoexcept);
-                        }
-                        if (!wrapperMismatch.empty())
-                        {
-                            if (verbose)
-                                std::cout << std::format(
-                                    "[verbose]   C++ default wrapper {} not bound: {}\n",
-                                    wrapper, wrapperMismatch);
-                            continue;
-                        }
-                        if (auto wit = functionTable.find(regName); wit != functionTable.end())
-                            for (FunctionSymbol& sym : wit->second)
-                                if (sym.External && sym.UniqueName == wrapper)
-                                {
-                                    sym.IsCInteropDeclaration = true;
-                                    sym.DefaultArguments.clear();
-                                }
-                    }
+                std::vector<TypeAndValue> prefix(params.begin(), params.begin() + n);
+                registerDefaultArityWrapper(prefix, n);
             }
             if (m.kind == Member::Instance)
             {
@@ -7730,11 +7785,12 @@ bool LLVMBackend::TryBindRefusedCxxMember(const std::string& typeName,
  * inherited clones are already present when its derived class is processed - which is what makes
  * this work transitively without a second pass.
  */
-void LLVMBackend::RegisterCxxInheritedMembers(const CRecordEntry& r)
+bool LLVMBackend::RegisterCxxInheritedMembers(const CRecordEntry& r)
 {
-        if (!r.isCxx || !r.layoutRefusal.empty() || r.bases.empty()) return;
+        if (!r.isCxx || !r.layoutRefusal.empty() || r.bases.empty()) return false;
         auto self = cxxClasses_.find(r.name);
-        if (self == cxxClasses_.end()) return;
+        if (self == cxxClasses_.end()) return false;
+        bool added = false;
 
         // Signature key of one overload, ignoring `this` - two members with the same key are the
         // same method, so the most derived declaration wins.
@@ -7743,6 +7799,20 @@ void LLVMBackend::RegisterCxxInheritedMembers(const CRecordEntry& r)
             for (size_t i = 1; i < params.size(); ++i)
                 k += "|" + params[i].TypeName + (params[i].Pointer ? "*" : "");
             return k;
+        };
+
+        // Records the name on the derived class's member list. A base member that is ALREADY in
+        // the overload set (cloned by an earlier record that shares this CFlat identity) still
+        // has to be listed here: RegisterCxxClassMembers rebuilds CxxClassInfo from scratch for
+        // every record, so a shell shared by several template specializations loses the list on
+        // each new specialization while functionTable keeps the symbols.
+        std::set<std::string> listed(self->second.instanceMethodNames.begin(),
+                                     self->second.instanceMethodNames.end());
+        auto noteMethodName = [&](const std::string& mn) {
+            if (!listed.insert(mn).second) return;
+            self->second.instanceMethodNames.push_back(mn);
+            if (self->second.memberAccess.find(mn) == self->second.memberAccess.end())
+                self->second.memberAccess[mn] = cflat_cinterop::AccessPublic;
         };
 
         std::set<std::string> present;
@@ -7759,8 +7829,35 @@ void LLVMBackend::RegisterCxxInheritedMembers(const CRecordEntry& r)
         {
             if (b.access != cflat_cinterop::AccessPublic) continue;
             auto bit = cxxClasses_.find(b.name);
-            if (bit == cxxClasses_.end()) continue;
-            for (const std::string& mn : bit->second.instanceMethodNames)
+            // A base that is a class template SPECIALIZATION is referenced by its '$'-mangled
+            // identity (torch.nn.Cloneable$torch.nn.LinearImpl) but, unless the specialization
+            // was explicitly requested, its own record registered under the bare template name
+            // (torch.nn.Cloneable) - clang's qualified name for a specialization decl drops the
+            // arguments. Resolve through the canonical-spelling map, which records the full
+            // spelling against whatever CFlat identity the record actually took.
+            if (bit == cxxClasses_.end() && !b.canonicalType.empty())
+            {
+                auto sp = cxxForeignTypeSpellings_.find(SqueezeCxxSpelling(b.canonicalType));
+                if (sp != cxxForeignTypeSpellings_.end()) bit = cxxClasses_.find(sp->second);
+            }
+            // Second try: the bare template name. The spelling map only helps once the
+            // specialization's own record has been registered, and records do NOT arrive
+            // base-before-derived for a template base (clang emits torch::nn::LinearImpl before
+            // torch::nn::Cloneable<torch::nn::LinearImpl>). Every specialization shares the one
+            // shell anyway, so the shell is the same class the rest of the system resolves
+            // 'torch::nn::Cloneable<T>' to, whichever specialization filled it in.
+            if (bit == cxxClasses_.end())
+            {
+                const size_t sep = b.name.find('$');
+                if (sep != std::string::npos && sep > 0)
+                    bit = cxxClasses_.find(b.name.substr(0, sep));
+            }
+            if (bit == cxxClasses_.end() || bit == self) continue;
+            const std::string baseName = bit->first;
+            // Snapshot: the clone loop appends to self->second.instanceMethodNames, and the
+            // base's list is the same vector when two specializations collapse onto one shell.
+            const std::vector<std::string> baseMethodNames = bit->second.instanceMethodNames;
+            for (const std::string& mn : baseMethodNames)
             {
                 auto fit = functionTable.find(mn);
                 if (fit == functionTable.end()) continue;
@@ -7768,8 +7865,17 @@ void LLVMBackend::RegisterCxxInheritedMembers(const CRecordEntry& r)
                 std::vector<FunctionSymbol> fromBase;
                 for (const FunctionSymbol& sym : fit->second)
                 {
-                    if (sym.IsMethod && sym.IsCxx && !sym.Parameters.empty()
-                        && sym.Parameters[0].TypeName == b.name)
+                    if (!sym.IsMethod || sym.Parameters.empty()) continue;
+                    // Re-seed the dedup set from the overload set itself: a specialization that
+                    // collapsed onto an already-populated shell arrives with a FRESH CxxClassInfo,
+                    // so instanceMethodNames no longer lists clones a sibling already made. Without
+                    // this the same base method is cloned once per specialization.
+                    if (sym.Parameters[0].TypeName == r.name)
+                    {
+                        present.insert(sigKey(mn, sym.Parameters));
+                        noteMethodName(mn);
+                    }
+                    if (sym.IsCxx && sym.Parameters[0].TypeName == baseName)
                         fromBase.push_back(sym);
                 }
                 for (FunctionSymbol sym : fromBase)
@@ -7777,7 +7883,7 @@ void LLVMBackend::RegisterCxxInheritedMembers(const CRecordEntry& r)
                     const std::string key = sigKey(mn, sym.Parameters);
                     if (!present.insert(key).second) continue;
                     const uint64_t inherited = [&] {
-                        auto a = cxxThisAdjust_.find(CxxThisAdjustKey(b.name, sym.UniqueName));
+                        auto a = cxxThisAdjust_.find(CxxThisAdjustKey(baseName, sym.UniqueName));
                         return a == cxxThisAdjust_.end() ? 0ull : a->second;
                     }();
                     sym.Parameters[0].TypeName = r.name;
@@ -7785,13 +7891,12 @@ void LLVMBackend::RegisterCxxInheritedMembers(const CRecordEntry& r)
                     if (adjust != 0)
                         cxxThisAdjust_[CxxThisAdjustKey(r.name, sym.UniqueName)] = adjust;
                     functionTable[mn].push_back(std::move(sym));
-                    self->second.instanceMethodNames.push_back(mn);
-                    auto ma = self->second.memberAccess.find(mn);
-                    if (ma == self->second.memberAccess.end())
-                        self->second.memberAccess[mn] = cflat_cinterop::AccessPublic;
+                    noteMethodName(mn);
+                    added = true;
                 }
             }
         }
+        return added;
     }
 
 void LLVMBackend::RegisterCMacros(const std::vector<CMacroEntry>& macros)
@@ -8947,7 +9052,8 @@ llvm::Value* LLVMBackend::MaterializeCxxDefaultArgument(const cflat_cinterop::Ra
 bool LLVMBackend::EmitCxxStructorCall(const std::string& typeName,
                                       const CxxClassInfo::Structor& st,
                                       llvm::Value* slot,
-                                      const std::vector<llvm::Value*>& extraArgs)
+                                      const std::vector<llvm::Value*>& extraArgs,
+                                      const std::vector<NamedVariable>* extraArgVars)
 {
         if (slot == nullptr) return false;
         AbiRecipe recipe;
@@ -8993,8 +9099,45 @@ bool LLVMBackend::EmitCxxStructorCall(const std::string& typeName,
         sym.IsCxx = true;
         sym.IsNoexcept = st.isNoexcept;
         sym.Recipe = recipe;
+        /*
+         * Same rule the ordinary call path applies (M4b): a foreign NONTRIVIAL C++ class crossing
+         * by value is arranged Indirect-without-byval, so the caller hands over a pointer to
+         * storage it owns and the object must be copy- or move-CONSTRUCTED into it. The generic
+         * ByVal lowering would alloca+store the loaded struct instead, which aliases the source's
+         * heap buffer: `SGD(lin.parameters(), sopt)` then destroys the returned vector while the
+         * optimizer holds the same buffer. Under Itanium the caller destroys the temp after the
+         * call, so it joins the end-of-statement owned-temp list.
+         */
+        std::vector<llvm::Value*> indirectArgAddrs;
+        if (recipe.hasLowering && extraArgVars != nullptr)
+            for (size_t i = 1; i < recipe.paramSlots.size() && i < st.params.size(); ++i)
+            {
+                if (recipe.paramSlots[i].kind != AbiSlot::ByVal) continue;
+                const std::string& pn = st.params[i].TypeName;
+                if (!IsForeignNontrivialCxxClass(pn)) continue;
+                const size_t argIndex = i - 1;
+                if (argIndex >= extraArgVars->size()
+                    || (*extraArgVars)[argIndex].Storage == nullptr)
+                {
+                    LogError(std::format(
+                        "cannot pass C++ class '{}' by value to a constructor of '{}': the "
+                        "argument must be a variable, a field or another addressable object so "
+                        "its copy constructor can run", pn, typeName));
+                    continue;
+                }
+                auto* temp = AllocaAtEntry(recipe.paramSlots[i].structTy, nullptr, "cxx.argtemp",
+                                           recipe.paramSlots[i].align);
+                if (!EmitCxxCopyOrMoveConstruct(pn, temp, (*extraArgVars)[argIndex].Storage,
+                                                (*extraArgVars)[argIndex].IsExplicitMove,
+                                                "into a by-value constructor parameter"))
+                    continue;
+                if (!IsCxxParamDestroyedInCallee(pn)) RegisterOwnedStructTemp(temp, pn);
+                indirectArgAddrs.resize(recipe.paramSlots.size(), nullptr);
+                indirectArgAddrs[i] = temp;
+            }
         if (recipe.hasLowering)
-            EmitAbiLoweredCall(sym, args);
+            EmitAbiLoweredCall(sym, args, /*sretDest*/ nullptr,
+                               indirectArgAddrs.empty() ? nullptr : &indirectArgAddrs);
         else
             CreateFunctionCall(fn, args);
         return true;

@@ -1376,20 +1376,27 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 // C++ specialization, and a name that turned out to be a plain
                                 // namespace must not pay for a clang re-parse (or record a
                                 // refusal) for a specialization nobody asked for.
-                                const std::string resolvedQualifiedName =
+                                std::string resolvedQualifiedName =
                                     Compiler(ctx)->ResolveTypeAlias(qualifiedName);
-                                const bool qualifiedDataStructure =
+                                bool qualifiedDataStructure =
                                     Compiler(ctx)->IsDataStructure(qualifiedName)
                                     || Compiler(ctx)->IsDataStructure(resolvedQualifiedName);
-                                // A C++ alias not yet requested (`nlohmann.json.parse(...)`):
-                                // bring the specialization in under its alias name first.
+                                // A C++ alias not yet requested (`nlohmann.json.parse(...)`, or a
+                                // temporary `c10.IntArrayRef(p, n)` built straight into a call
+                                // argument): bring the specialization in under its alias name first.
                                 if (!isFileAlias && !qualifiedDataStructure
                                     && Compiler(ctx)->HasCxxImportGroup()
-                                    && IsFollowedByDot(ctx, terminal))
+                                    && (IsFollowedByDot(ctx, terminal)
+                                        || (IsFollowedByCall(ctx, terminal)
+                                            && Compiler(ctx)->IsCxxLazyAliasSpecialization(qualifiedName))))
                                 {
                                     std::string cxxError;
                                     Compiler(ctx)->TryRequestCxxType(qualifiedName, {}, qualifiedName, cxxError);
                                     if (!cxxError.empty()) LogErrorContext(ctx, cxxError);
+                                    // The alias now resolves to the specialization it names.
+                                    resolvedQualifiedName = Compiler(ctx)->ResolveTypeAlias(qualifiedName);
+                                    qualifiedDataStructure = Compiler(ctx)->IsDataStructure(qualifiedName)
+                                        || Compiler(ctx)->IsDataStructure(resolvedQualifiedName);
                                 }
                                 if (!isFileAlias && qualifiedDataStructure
                                     && Compiler(ctx)->GetLocalVariable(memberName).Storage == nullptr
@@ -5952,6 +5959,12 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     llvm::Value* value = LoadNamedVariable(arg);
                                     ctorValues.push_back(value);
                                     ctorTypes.push_back(arg.TypeAndValue);
+                                    // The call-argument builder blanks a primitive TypeName on
+                                    // purpose (LLVM-type matching for CFlat overloads) and keeps the
+                                    // declared one aside; a C++ ctor needs `long*` back, not `*`.
+                                    if (ctorTypes.back().TypeName.empty() && ctorTypes.back().Pointer
+                                        && !arg.InferSourceTypeName.empty())
+                                        ctorTypes.back().TypeName = arg.InferSourceTypeName;
                                     TypeUntypedCtorArg(ctorTypes.back(), value);
                                 }
                                 std::string why;

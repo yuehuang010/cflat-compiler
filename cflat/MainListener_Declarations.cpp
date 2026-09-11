@@ -3756,6 +3756,10 @@ cxx_dtor_ready:
             std::vector<llvm::Value*> argValues;
             std::vector<LLVMBackend::TypeAndValue> argTypes;
             std::vector<LLVMBackend::NamedVariable> ctorArguments;
+            // Address-carrying twins of ctorArguments (which deliberately drop Storage). A
+            // nontrivial C++ class parameter passed BY VALUE must be copy- or move-constructed
+            // into the caller-owned temp, so the constructor call needs each argument's address.
+            std::vector<LLVMBackend::NamedVariable> ctorArgumentAddresses;
             std::vector<LLVMBackend::CxxBraceArgument> braceArguments;
             auto isIntegerLiteral = [](const std::string& text) {
                 if (text.empty()) return false;
@@ -3815,6 +3819,7 @@ cxx_dtor_ready:
                     if (!valid) return true;
                     LLVMBackend::NamedVariable placeholder;
                     placeholder.TypeAndValue.TypeName = "__cflat_brace_arg";
+                    ctorArgumentAddresses.push_back(placeholder);
                     ctorArguments.push_back(std::move(placeholder));
                     braceArguments.push_back(std::move(brace));
                     continue;
@@ -3826,13 +3831,26 @@ cxx_dtor_ready:
                         typeName));
                     return true;
                 }
+                compiler->lastCxxRetTemp_ = nullptr;
                 auto nv = ParseAssignmentExpressionNamed(argAssign);
+                // A nontrivial C++ result was constructed into a caller-owned sret temp whose
+                // address only lives here; the NamedVariable itself carries the loaded struct.
+                llvm::Value* cxxRetTemp = compiler->lastCxxRetTemp_;
                 // A bare lvalue comes back unloaded (Storage set, Primary null); LoadNamedVariable
                 // is the one path that materializes every binding shape.
                 llvm::Value* argValue = LoadNamedVariable(nv);
                 argValues.push_back(argValue);
                 argTypes.push_back(nv.TypeAndValue);
                 TypeUntypedCtorArg(argTypes.back(), argValue);
+                LLVMBackend::NamedVariable addressVar = nv;
+                if (addressVar.Storage == nullptr && cxxRetTemp != nullptr)
+                {
+                    // A prvalue temp: MOVE out of it. It stays on the end-of-statement owned-temp
+                    // list and is destroyed once, in its moved-from state.
+                    addressVar.Storage = cxxRetTemp;
+                    addressVar.IsExplicitMove = true;
+                }
+                ctorArgumentAddresses.push_back(std::move(addressVar));
                 LLVMBackend::NamedVariable argVar = nv;
                 argVar.Primary = argValue;
                 argVar.Storage = nullptr;
@@ -3902,7 +3920,8 @@ cxx_dtor_ready:
                 return true;
             }
             compiler->SetCurrentDebugLocation(line);
-            compiler->EmitCxxStructorCall(typeName, *ctor, slot, argValues);
+            compiler->EmitCxxStructorCall(typeName, *ctor, slot, argValues,
+                                          &ctorArgumentAddresses);
             return true;
         }
 

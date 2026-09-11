@@ -3777,6 +3777,8 @@ public:
     // True when the child right after `child` is a '.' - i.e. the primary is used as a member
     // qualifier (`Holder<i64>.sget(...)`) rather than being called or indexed.
     bool IsFollowedByDot(CFlatParser::PostfixExpressionContext* ctx, antlr4::tree::ParseTree* child);
+    // True when the child right after `child` is a '(' - the primary is being called.
+    bool IsFollowedByCall(CFlatParser::PostfixExpressionContext* ctx, antlr4::tree::ParseTree* child);
 
     // Instantiate a generic function template with concrete type arguments.
     // Returns the mangled name of the instantiated function, or empty string on failure.

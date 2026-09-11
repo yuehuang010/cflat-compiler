@@ -52,7 +52,7 @@
 //                       as pointers, extern "C" bare linkage, nested namespaces,
 //                       widening and narrow-unsigned round trips, scoped-enum params,
 //                       records by pointer. Primitives and bare pointers only.
-//   Section M21 (766-773): C++ lazy aliases, unnamed nested enums, nullptr defaults,
+//   Section M21 (766-775): C++ lazy aliases, unnamed nested enums, nullptr defaults,
 //                       exact constructor ranking, and member signatures that request
 //                       nested std::string specializations.
 //   Section M22 (774-781): C++ function-template deduction wrappers for free functions,
@@ -1439,7 +1439,7 @@ extern int main()
         || cppi.return_string_view(cppi.take_string_view(m20sv.substr(1, 3)))[2] != 'l') return 745;
     if (cppi.sum_varargs(4, 1, 2, 3, 4) != 10)     return 746;
 
-    // ---- Section M21: lazy aliases and exact C++ interop surfaces (766-773) ----
+    // ---- Section M21: lazy aliases and exact C++ interop surfaces (766-775) ----
     cppi.AnonEnumHolder m21anon = default;
     if (m21anon.get() != 5)                          return 766;
     cppi.NullDefaulted m21null = default;
@@ -1459,6 +1459,10 @@ extern int main()
     if (strcmp(m21taggedName.c_str(), "tagged") != 0) return 772;
     cppt.deep.TaggedLong m21taggedLong = default;
     if (m21taggedLong.get() != 0)                   return 773;
+    // A lazy alias first met as a temporary inside a call argument, no declaration before it.
+    if (cppt.tagged_real_value(cppt.TaggedReal(7.5)) != 7.5) return 774;
+    long[3] m21xs = {1, 2, 3};
+    if (cppt.long_view_sum(cppt.LongView(&m21xs[0], 3)) != 6) return 775;
 
     // C++ long / unsigned long are their own specializations, distinct from long long / unsigned
     // long long. Each sum takes the C++ vector by reference and walks it with C++'s stride.
@@ -1813,6 +1817,17 @@ extern int main()
     if (!m36bits.mode)                                 return 822;
     cppt.InheritedCtorHolder m36holder = cppt.InheritedCtorHolder(5, 7);
     if (m36holder.get() != 12)                         return 823;
+    // ---- Section M37: class-template bases, nontrivial by-value ctor args, defaulted
+    // parameters cflat cannot spell (824-829) --------------------------------------------
+    cppt.TplHolderA m37a = default;
+    if (m37a.own_a() != 5)                             return 824;
+    if (m37a.base_tag() != 7)                          return 825;
+    cppt.TplHolderB m37b = default;
+    if (m37b.base_tag() != 7)                          return 826;
+    cppt.ItemBag m37bag = cppt.ItemBag(cppi.make_tracked(4));
+    if (m37bag.value() != 4)                           return 827;
+    cppt.Picker m37picker = default;
+    if (m37picker.scale() != 11)                       return 829;
     // ---- Section M34: C++ interop ladder rung 5 mechanisms (813-819) -------------------
     double m34scalar = 2.5;
     int m34integer = 3;
@@ -1890,5 +1905,27 @@ extern int main()
     std.vector<unsigned long> primitiveUnsignedLong = default;
     primitiveUnsignedLong.push_back((ulong)13);
     if (primitiveUnsignedLong[0] != (ulong)13) return 1008;
+
+    // ---- C++ subobject destruction and extern-template vtable ownership (1010-1016) ---------
+    // A bound C++ destructor destroys the class's own members, so CFlat must not add a member
+    // teardown pass around it; and the vtable of an explicit instantiation DECLARATION belongs
+    // to the library, so no companion module may emit a copy of it.
+    cppi.reset_nested_counts();
+    {
+        cppi.NestedInner nestedInner = cppi.NestedInner(3);
+        if (nestedInner.get() != 3) return 1010;
+    }
+    if (cppi.nested_inner_dtors() != 1) return 1011;
+    {
+        cppi.NestedOuter nestedOuter = cppi.NestedOuter(5);
+        if (nestedOuter.get() != 5) return 1012;
+    }
+    // Exactly one more inner destruction: the one ~NestedOuter itself performs.
+    if (cppi.nested_inner_dtors() != 2) return 1013;
+    if (cppi.nested_outer_dtors() != 1) return 1014;
+
+    cppi.ExternPoly<int> externPoly = cppi.ExternPoly<int>(6);
+    if (externPoly.get() != 6) return 1015;
+    if (externPoly.twice() != 12) return 1016;
     return 0;
 }
