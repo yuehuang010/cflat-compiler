@@ -115,3 +115,58 @@ fixture's declaration order reversed before counting that half fixed. Not part o
 - Accept legs extend the overload coverage in `Test/test_basic.cb`, each asserted in both
   declaration orders (the order-independence IS the assertion; a single-order leg proves nothing).
 - `test.bat Release` green, with every moved pre-existing leg triaged per "Blast radius" above.
+
+## Status
+
+2026-09-11: landed on master, all four suites green (`test.bat`, `test_lsp.bat`,
+`test_example.bat` Release). Verified independently: the new legs fail on the pre-fix binary
+(`oi_c16_exact_a`, and the tie error never fires), and `--platform linux --check` over
+`Test/test_*.cb` has no regression against it. Kept open for the gaps under "Left open".
+
+What landed (`cflat/LLVMBackend_Overloads.cpp`):
+
+- `RankIntegerConversion`: 0 identity-exact (`CanonicalPrimitiveTypeName`), then promotion
+  (same signedness narrower to wider, or unsigned into a STRICTLY wider signed), then conversion.
+  Only identity-exact is a perfect integer match. `u32` into an equal-width signed is a conversion.
+- Promotion sub-order: C++ integral promotion into `int` first, then the narrowest destination.
+  Equal-width promotions stay a tie (`u8` into `u16`/`i16`; `int` into `long`/`i64` on LP64).
+- Candidate tier is its WORST integer argument; the lowest tier wins, then per-argument
+  dominance, then the existing omitted/move tie-breaks. So `Test(name, u32v, 5)` picks
+  `Test(i64, i64)` (all promotions) over `Test(int, int)` (one conversion).
+- A remaining tie that only integer identity could decide is `ambiguous call to '<f>': no
+  candidate ranks better than the others: <candidates>`. Ties at any other kind of position
+  keep the legacy pick (perfect tier first, promotion tier last) - out of scope here.
+- Identical parameter lists: the later registration shadows the earlier (a `program`'s own
+  `void WaitForExit(int)` over the synthesized `bool WaitForExit(int)`).
+- An unsuffixed literal ranks as `int` (else `long`/`i64`), via `NamedVariable::LiteralIdentity`
+  stamped at the direct-call argument site. A signed argument's identity is read from
+  `InferSourceTypeName`, since the call site drops its TypeName.
+- View pair with known, different element identity (`int[4]` into `double[]`) scores implicit,
+  not perfect, when there are several candidates.
+
+Tests: `oi_*` legs in `Test/test_basic.cb` `testOverloadResolution`, each set declared in both
+orders; `Test/errors/err_overload_ambiguous_tie.cb` (3 scoped legs, all 3 fire when run alone).
+Cross target: `--platform linux` calls `_f$int$.1$int` / `_f$int$.1$long` / `_f$int$.1$i64`
+for `int` / `long` / `i64` in both orders.
+
+Moved in triage (first-wins flip moved 3 tests; no expectation changed, no `core/*.cb` edit):
+
+- `test_program` "reserved name WaitForExit(int) different return": relied on the literal
+  being a promotion plus last-wins; now decided by the identical-parameter shadowing rule.
+- `test_math` `rng.shuffle(shuffled, 4)`: the literal became exact, which put both views in the
+  perfect tier where first-wins took `double[]`; fixed by the view-element demotion above.
+- `test_cpp_interop`: failed only under the flip (the file was also being edited concurrently);
+  passes under the final rule.
+- Intermediate dominance-only rule tied `Test(name, u32v, literal)` in `test_basic`, `test_c`
+  and `test_generics`; resolved by the candidate-tier rule, no call site changed.
+
+Left open:
+
+- On LP64 the repro's `f(g)` (`u32` into `int`/`long`/`i64`) is now the ambiguity error (C++
+  agrees); the `u32` accept leg is gated `if const (__WINDOWS__)`.
+- Interface-method slot resolution (`ResolveInterfaceMethodSlot`) never reports the ambiguity
+  (keeps the legacy pick), and its argument loop stamps no identity, so signed arguments and
+  literals there rank by width as before. Same for `new T(...)` and operator-overload arguments.
+- Char literals (`'a'`) and hex literals in u32 range past `INT_MAX` (they lower as an i32 bit
+  pattern) have no identity and keep width ranking.
+- The C++ constructor binder is unchanged (see "Related, out of scope here").

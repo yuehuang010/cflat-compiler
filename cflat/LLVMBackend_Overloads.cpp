@@ -39,6 +39,7 @@
 #include <cctype>
 #include <map>
 #include <set>
+#include <charconv>
 
 #if defined(__APPLE__)
 // Step 3 (macOS self-contained link): harvest libSystem's exported symbols from
@@ -130,23 +131,156 @@ bool LLVMBackend::ArgumentConvertsToBoolParameter(const NamedVariable& arg, cons
             && !arg.BaseType->isIntegerTy(1);
 }
 
-std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> LLVMBackend::ComputeOverloadFunction(const std::vector<std::pair<std::vector<NamedVariable>, FunctionSymbol>>& candidates) const
+// An unsuffixed integer literal ranks as `int` (C++); a value past `int` ranks as the first of
+// `long`, `i64` that holds it on the target. Only a bare, optionally negated literal qualifies.
+std::string LLVMBackend::UnsuffixedIntegerLiteralIdentity(std::string_view text)
 {
-        std::pair<std::vector<NamedVariable>, FunctionSymbol> possibleResult;
-        std::pair<std::vector<NamedVariable>, FunctionSymbol> bestPerfect;
-        int bestPerfectScore = -1;  // moveScore is always >= 0; -1 means "no perfect match yet"
-        int bestPossibleScore = -1; // same, for the promotion/implicit tier
-        // Fewest function-pointer shape mismatches seen in the promotion/implicit tier so far.
-        int bestPossibleShapeMismatches = std::numeric_limits<int>::max();
-        // Fewest integer -> bool argument coercions seen in that tier so far. This tier ignores
-        // per-argument quality, so without it `sb.append(42)` picked append(bool) over append(int)
-        // purely by declaration order.
-        int bestPossibleBoolCoercions = std::numeric_limits<int>::max();
-        // Parameters the call left to their defaults. An exact-arity overload (the C++ default
-        // wrapper `f(a)` next to `f(a, b = expr)`) beats one that would fill defaults in.
-        int bestPerfectOmitted = std::numeric_limits<int>::max();
-        int bestPossibleOmitted = std::numeric_limits<int>::max();
-        // int score = 0; // 2 for promotionMatch, 1 for implicitMatch
+        const bool negative = !text.empty() && text.front() == '-';
+        std::string_view digits = negative ? text.substr(1) : text;
+        int base = 10;
+        bool hex = false;
+        if (digits.size() > 2 && digits[0] == '0' && (digits[1] == 'x' || digits[1] == 'X'))
+        {
+            base = 16;
+            hex = true;
+            digits.remove_prefix(2);
+        }
+        else if (digits.size() > 2 && digits[0] == '0' && (digits[1] == 'b' || digits[1] == 'B'))
+        {
+            base = 2;
+            digits.remove_prefix(2);
+        }
+        else if (digits.size() > 1 && digits[0] == '0')
+        {
+            base = 8;
+            digits.remove_prefix(1);
+        }
+        if (digits.empty())
+            return "";
+
+        uint64_t value = 0;
+        auto parsed = std::from_chars(digits.data(), digits.data() + digits.size(), value, base);
+        if (parsed.ec != std::errc() || parsed.ptr != digits.data() + digits.size())
+            return "";   // a suffix, an operator, or out of u64 range
+
+        const uint64_t intMax = (uint64_t)std::numeric_limits<int32_t>::max();
+        if (negative ? value <= intMax + 1 : value <= intMax)
+            return "int";
+        // A hex literal inside u32 range lowers as an i32 bit pattern; a 64-bit identity would
+        // sign-extend that pattern into the wider parameter.
+        if (hex && !negative && value <= 0xFFFFFFFFull)
+            return "";
+        const uint64_t i64Max = (uint64_t)std::numeric_limits<int64_t>::max();
+        if (negative ? value > i64Max + 1 : value > i64Max)
+            return "";
+        return longBits_ == 64 ? "long" : "i64";
+}
+
+std::string LLVMBackend::IntegerParameterIdentity(const TypeAndValue& param) const
+{
+        if (param.Pointer || param.IsArrayView || param.ConstArraySize > 0 || param.IsSimd
+            || param.IsFunctionPointer || param.IsInterface || param.IsAlias
+            || param.IsRvalueRef || param.IsCxxRefToPointer)
+            return "";
+        std::string name = param.TypeName;
+        if (auto it = enumBackingTypes.find(name); it != enumBackingTypes.end())
+            name = it->second;
+        TypeAndValue probe;
+        probe.TypeName = name;
+        if (name == "bool" || probe.IsInteger() == -1)
+            return "";
+        return name;
+}
+
+/*
+ * A call argument keeps its integer identity in one of three places: TypeName (unsigned values and
+ * enums keep it), InferSourceTypeName (the call site drops a signed primitive's TypeName on
+ * purpose), or LiteralIdentity (an unsuffixed literal). A recorded name must agree with the
+ * lowered width - a literal may lower narrower than the identity it ranks as, never wider.
+ */
+std::string LLVMBackend::IntegerArgumentIdentity(const NamedVariable& arg) const
+{
+        const TypeAndValue& tv = arg.TypeAndValue;
+        if (tv.Pointer || tv.IsArrayView || tv.ConstArraySize > 0 || tv.IsSimd
+            || tv.IsFunctionPointer || tv.IsInterface)
+            return "";
+        if (arg.BaseType == nullptr || !arg.BaseType->isIntegerTy() || arg.BaseType->isIntegerTy(1))
+            return "";
+        const int loweredBits = (int)arg.BaseType->getIntegerBitWidth();
+
+        auto resolved = [&](const std::string& name) -> std::string {
+            auto it = enumBackingTypes.find(name);
+            return it != enumBackingTypes.end() ? it->second : name;
+        };
+        auto integerBits = [](const std::string& name) {
+            TypeAndValue probe;
+            probe.TypeName = name;
+            return name == "bool" ? -1 : probe.IsInteger();
+        };
+
+        for (const std::string* recorded : { &tv.TypeName, &arg.InferSourceTypeName })
+        {
+            if (recorded->empty())
+                continue;
+            std::string name = resolved(*recorded);
+            return integerBits(name) == loweredBits ? name : "";
+        }
+        if (!arg.LiteralIdentity.empty() && integerBits(arg.LiteralIdentity) >= loweredBits)
+            return arg.LiteralIdentity;
+        return "";
+}
+
+// Cost of binding an integer argument to an integer parameter: 0 identity-exact, then
+// value-preserving promotion (C++ integral promotion to `int` first, then the narrowest
+// destination), then conversion (same width different identity, sign change, narrowing).
+static constexpr int kIntegerConversionCost = 1000;   // above every promotion cost (1 + bits)
+
+int LLVMBackend::RankIntegerConversion(const std::string& argIdentity, const std::string& paramIdentity)
+{
+        if (CanonicalPrimitiveTypeName(argIdentity) == CanonicalPrimitiveTypeName(paramIdentity))
+            return 0;
+
+        TypeAndValue argType;
+        argType.TypeName = argIdentity;
+        TypeAndValue paramType;
+        paramType.TypeName = paramIdentity;
+        const int argBits = argType.IsInteger();
+        const int paramBits = paramType.IsInteger();
+        const bool argUnsigned = argType.IsUnsignedInteger() != -1;
+        const bool paramUnsigned = paramType.IsUnsignedInteger() != -1;
+
+        // Same signedness, or unsigned into a STRICTLY wider signed type.
+        const bool promotion = argBits < paramBits && (argUnsigned == paramUnsigned || argUnsigned);
+        if (!promotion)
+            return kIntegerConversionCost;
+        if (CanonicalPrimitiveTypeName(paramIdentity) == "int")
+            return 1;
+        return 1 + paramBits;
+}
+
+std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> LLVMBackend::ComputeOverloadFunction(
+        const std::vector<std::pair<std::vector<NamedVariable>, FunctionSymbol>>& candidates,
+        std::vector<FunctionSymbol>* tiedOut) const
+{
+        // One viable candidate and the facts the tie-breaks below read.
+        struct Ranked
+        {
+            const std::pair<std::vector<NamedVariable>, FunctionSymbol>* pair = nullptr;
+            // Function-pointer arguments whose indirection shape disagrees with the parameter.
+            int shapeMismatches = 0;
+            // Integer -> bool coercions. Without it `sb.append(n)` picked append(bool) over
+            // append(int) purely by declaration order.
+            int boolCoercions = 0;
+            // Parameters left to their defaults. An exact-arity overload (the C++ default
+            // wrapper `f(a)` next to `f(a, b = expr)`) beats one that would fill defaults in.
+            int omitted = 0;
+            int moveScore = 0;
+            // Per argument: RankIntegerConversion cost, or -1 where no integer identity judged it.
+            std::vector<int> integerCosts;
+        };
+        std::vector<Ranked> perfect;
+        std::vector<Ranked> possible;   // the promotion/implicit tier
+        const std::pair<std::vector<NamedVariable>, FunctionSymbol>* variadicFallback = nullptr;
 
         for (const auto& pair : candidates)
         {
@@ -183,12 +317,10 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                 if (declaredParamRefuses)
                     continue;
 
-                // Variadic is a fallback: prefer any exact non-variadic match over it.
-                // Reset the score so a later non-variadic candidate always overrides it.
-                possibleResult = pair;
-                bestPossibleScore = -1;
-                bestPossibleShapeMismatches = std::numeric_limits<int>::max();
-                bestPossibleBoolCoercions = std::numeric_limits<int>::max();
+                // Variadic is a fallback: prefer any exact non-variadic match over it. It replaces
+                // the promotion tier seen so far; a later non-variadic candidate overrides it.
+                variadicFallback = &pair;
+                possible.clear();
                 continue;
             }
 
@@ -199,6 +331,8 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
             int shapeMismatches = 0;
             // Arguments bound to a 'bool' parameter through the integer -> bool coercion.
             int boolCoercions = 0;
+            std::vector<int> integerCosts;
+            integerCosts.reserve(arguments.size());
 
             auto candidateParamItr = candidate.Parameters.begin();
             for (const auto& arg : arguments)
@@ -430,6 +564,16 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                         && arg.TypeAndValue.ElemPointer != candidateParamItr->ElemPointer)
                         result = -1;
 
+                    // Same blindness for the ELEMENT identity: an 'int[4]' argument scored perfect
+                    // on 'double[]' too. Implicit only, so the matching-element overload wins.
+                    if (result == 0 && candidates.size() > 1 && candidateParamItr->IsArrayView
+                        && !candidateParamItr->IsInterface
+                        && (arg.TypeAndValue.IsArrayView || arg.TypeAndValue.ConstArraySize > 0)
+                        && !arg.InferSourceTypeName.empty() && !candidateParamItr->TypeName.empty()
+                        && CanonicalPrimitiveTypeName(arg.InferSourceTypeName)
+                            != CanonicalPrimitiveTypeName(candidateParamItr->TypeName))
+                        result = 1;
+
                     // Opaque pointers make every pointer pair look identical to CompareUpconvert.
                     // An argument whose CFlat type is unknown (empty TypeName - primitive pointers
                     // like '&boolVar') binding to a pointer-to-struct parameter is only an IMPLICIT
@@ -485,6 +629,21 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                     boolCoercions++;
                 }
 
+                // Integer identity ranking (ruling 2026-09-10): only an identity-exact integer is a
+                // perfect match. Never widens the viable set - it re-ranks what already binds.
+                int integerCost = -1;
+                if (result >= 0)
+                {
+                    const std::string argIdentity = IntegerArgumentIdentity(arg);
+                    const std::string paramIdentity = IntegerParameterIdentity(*candidateParamItr);
+                    if (!argIdentity.empty() && !paramIdentity.empty())
+                    {
+                        integerCost = RankIntegerConversion(argIdentity, paramIdentity);
+                        result = integerCost == 0 ? 0 : 1;
+                    }
+                }
+                integerCosts.push_back(integerCost);
+
                 if (result != 0)
                 {
                     perfectMatch = false;
@@ -507,49 +666,152 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
 
             const int omitted = candidate.Parameters.size() > arguments.size()
                 ? (int)(candidate.Parameters.size() - arguments.size()) : 0;
-            if (perfectMatch)
+            if (perfectMatch || promotionMatch || implicitMatch)
             {
-                int moveScore = ScoreMoveAgreement(arguments, candidate);
-                if (moveScore > bestPerfectScore
-                    || (moveScore == bestPerfectScore && omitted < bestPerfectOmitted))
-                {
-                    bestPerfectScore = moveScore;
-                    bestPerfectOmitted = omitted;
-                    bestPerfect = pair;
-                }
-                continue;
-            }
-
-            // Promotion/implicit tier needs the SAME move tie-break as the perfect tier: an
-            // int LITERAL key is only a promotion match, so `d.add(1, namedLvalue)` used to
-            // degrade both overloads to this tier and silently keep the last-declared one -
-            // the `move` overload - consuming the caller's variable.
-            if (promotionMatch || implicitMatch)
-            {
-                int moveScore = ScoreMoveAgreement(arguments, candidate);
-                // This tier ignores per-argument quality, so `pick(arr, 3)` picked by declaration
-                // position. Prefer agreeing shapes; equal counts fall through to the old rule.
-                if (shapeMismatches < bestPossibleShapeMismatches
-                    || (shapeMismatches == bestPossibleShapeMismatches
-                        && (boolCoercions < bestPossibleBoolCoercions
-                            || (boolCoercions == bestPossibleBoolCoercions
-                                && (omitted < bestPossibleOmitted
-                                    || (omitted == bestPossibleOmitted
-                                        && moveScore >= bestPossibleScore))))))   // >= keeps the pre-existing last-wins tie
-                {
-                    bestPossibleShapeMismatches = shapeMismatches;
-                    bestPossibleBoolCoercions = boolCoercions;
-                    bestPossibleOmitted = omitted;
-                    bestPossibleScore = moveScore;
-                    possibleResult = pair;
-                }
+                Ranked ranked;
+                ranked.pair = &pair;
+                ranked.shapeMismatches = shapeMismatches;
+                ranked.boolCoercions = boolCoercions;
+                ranked.omitted = omitted;
+                ranked.moveScore = ScoreMoveAgreement(arguments, candidate);
+                ranked.integerCosts = std::move(integerCosts);
+                (perfectMatch ? perfect : possible).push_back(std::move(ranked));
             }
         }
 
-        if (bestPerfectScore >= 0)
-            return bestPerfect;
+        using Result = std::pair<std::vector<NamedVariable>, FunctionSymbol>;
 
-        return possibleResult;
+        // Keeps only the members of `set` whose key is lowest.
+        auto keepLowest = [](std::vector<const Ranked*>& set, auto key) {
+            int best = std::numeric_limits<int>::max();
+            for (const Ranked* r : set)
+                best = std::min(best, key(*r));
+            std::erase_if(set, [&](const Ranked* r) { return key(*r) != best; });
+        };
+
+        // C++'s per-argument comparison: `a` is no worse at every position both sides judged by
+        // integer identity, and strictly better at one.
+        auto dominates = [](const Ranked& a, const Ranked& b) {
+            bool strictlyBetter = false;
+            const size_t count = std::min(a.integerCosts.size(), b.integerCosts.size());
+            for (size_t i = 0; i < count; ++i)
+            {
+                if (a.integerCosts[i] < 0 || b.integerCosts[i] < 0)
+                    continue;
+                if (a.integerCosts[i] > b.integerCosts[i])
+                    return false;
+                if (a.integerCosts[i] < b.integerCosts[i])
+                    strictlyBetter = true;
+            }
+            return strictlyBetter;
+        };
+
+        enum class TieKind { IdenticalParameters, IntegerOnly, Other };
+        auto classifyTie = [&](const Ranked& a, const Ranked& b) {
+            const auto& aParams = a.pair->second.Parameters;
+            const auto& bParams = b.pair->second.Parameters;
+            if (aParams.size() != bParams.size())
+                return TieKind::Other;
+            bool anyDiffers = false;
+            for (size_t i = 0; i < aParams.size(); ++i)
+            {
+                if (aParams[i].IsMove == bParams[i].IsMove
+                    && aParams[i].ToUniqueString(*this) == bParams[i].ToUniqueString(*this))
+                    continue;
+                anyDiffers = true;
+                // An enum parameter ranks as its backing type, so its identity is not judged here.
+                const bool judged = i < a.integerCosts.size() && i < b.integerCosts.size()
+                    && a.integerCosts[i] >= 0 && b.integerCosts[i] >= 0
+                    && enumBackingTypes.count(aParams[i].TypeName) == 0
+                    && enumBackingTypes.count(bParams[i].TypeName) == 0;
+                if (!judged)
+                    return TieKind::Other;
+            }
+            if (!anyDiffers)
+                return (a.pair->second.IsCxx || b.pair->second.IsCxx) ? TieKind::Other
+                                                                      : TieKind::IdenticalParameters;
+            return TieKind::IntegerOnly;
+        };
+
+        /*
+         * Settles candidates every tie-break above left equal. Identical parameter lists: the later
+         * registration shadows the earlier (a program's own `void WaitForExit(int)` over the
+         * synthesized `bool WaitForExit(int)`). A tie that only integer identity could have decided
+         * is a genuine ambiguity, reported through `tiedOut`. A tie at any other kind of position is
+         * outside the integer ranking and keeps the legacy declaration-order pick.
+         */
+        auto settle = [&](const std::vector<const Ranked*>& best, bool legacyLastWins) -> const Ranked* {
+            if (best.size() == 1)
+                return best.front();
+            bool allIdentical = true;
+            bool anyIntegerOnly = false;
+            bool anyOther = false;
+            for (size_t i = 0; i < best.size(); ++i)
+                for (size_t j = i + 1; j < best.size(); ++j)
+                {
+                    TieKind kind = classifyTie(*best[i], *best[j]);
+                    allIdentical &= kind == TieKind::IdenticalParameters;
+                    anyIntegerOnly |= kind == TieKind::IntegerOnly;
+                    anyOther |= kind == TieKind::Other;
+                }
+            if (allIdentical)
+                return best.back();
+            if (anyIntegerOnly && !anyOther && tiedOut != nullptr)
+            {
+                for (const Ranked* r : best)
+                    tiedOut->push_back(r->pair->second);
+                return nullptr;
+            }
+            return legacyLastWins ? best.back() : best.front();
+        };
+
+        if (!perfect.empty())
+        {
+            std::vector<const Ranked*> best;
+            for (const Ranked& r : perfect)
+                best.push_back(&r);
+            keepLowest(best, [](const Ranked& r) { return -r.moveScore; });
+            keepLowest(best, [](const Ranked& r) { return r.omitted; });
+            const Ranked* winner = settle(best, /*legacyLastWins=*/false);
+            return winner != nullptr ? *winner->pair : Result{};
+        }
+
+        if (!possible.empty())
+        {
+            std::vector<const Ranked*> best;
+            for (const Ranked& r : possible)
+                best.push_back(&r);
+            // Prefer agreeing function-pointer shapes, then fewer integer -> bool coercions.
+            keepLowest(best, [](const Ranked& r) { return r.shapeMismatches; });
+            keepLowest(best, [](const Ranked& r) { return r.boolCoercions; });
+            // The candidate's tier is its WORST integer argument (0 identity, 1 promotion,
+            // 2 conversion); the lowest tier wins before per-argument comparison.
+            keepLowest(best, [](const Ranked& r) {
+                int tier = 0;
+                for (int cost : r.integerCosts)
+                    if (cost > 0)
+                        tier = std::max(tier, cost >= kIntegerConversionCost ? 2 : 1);
+                return tier;
+            });
+            std::vector<const Ranked*> undominated;
+            for (const Ranked* r : best)
+                if (std::none_of(best.begin(), best.end(),
+                        [&](const Ranked* other) { return other != r && dominates(*other, *r); }))
+                    undominated.push_back(r);
+            // Dominance only compares positions both sides judged, so it can cycle; keep the set then.
+            if (!undominated.empty())
+                best = std::move(undominated);
+            keepLowest(best, [](const Ranked& r) { return r.omitted; });
+            // Same move tie-break as the perfect tier: `d.add(1, namedLvalue)` must not silently
+            // keep the `move` overload and consume the caller's variable.
+            keepLowest(best, [](const Ranked& r) { return -r.moveScore; });
+            const Ranked* winner = settle(best, /*legacyLastWins=*/true);
+            return winner != nullptr ? *winner->pair : Result{};
+        }
+
+        if (variadicFallback != nullptr)
+            return *variadicFallback;
+        return {};
     }
 
 LLVMBackend::ArgumentBinding LLVMBackend::ComputeArgumentPositions(const std::vector<std::string>& argNames,
@@ -1178,7 +1440,34 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
             }
         }
 
-        auto [matched, candidate] = ComputeOverloadFunction(resolvedCandidate);
+        std::vector<FunctionSymbol> tiedCandidates;
+        auto [matched, candidate] = ComputeOverloadFunction(resolvedCandidate, &tiedCandidates);
+
+        // A tie only integer identity could have decided is ambiguous (ruling 2026-09-10).
+        if (!tiedCandidates.empty())
+        {
+            std::string candidateList;
+            for (const auto& c : tiedCandidates)
+            {
+                std::string paramList;
+                for (size_t i = 0; i < c.Parameters.size(); i++)
+                {
+                    const auto& p = c.Parameters[i];
+                    if (i == 0 && c.IsMethod && p.VariableName.ends_with("__"))
+                        continue;   // the implicit 'this'
+                    std::string spelled = SpellType(*this, p);
+                    if (spelled.empty())
+                        spelled = p.TypeName + PointerStars(p);
+                    paramList += (paramList.empty() ? "" : ", ") + spelled;
+                }
+                const std::string name = c.SourceName.empty() ? shownFunctionName : c.SourceName;
+                candidateList += (candidateList.empty() ? "" : ", ") + std::format("{}({})", name, paramList);
+            }
+            LogErrorMessage("ambiguous call to '{}': no candidate ranks better than the others: {}. "
+                            "Cast the argument to the parameter type you mean.",
+                            { shownFunctionName, candidateList });
+            return nullptr;
+        }
 
         if (candidate.Function == nullptr)
         {

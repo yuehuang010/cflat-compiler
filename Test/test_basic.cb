@@ -2617,6 +2617,24 @@ class PdVec { int k = 0;
               int operator+(PdCircle* o) { return 100 + o->r; }
               int operator+(PdCircle** o) { return 200 + (*o)->r; } };
 
+// Integer overloads rank by IDENTITY (ruling 2026-09-10): identity-exact, then promotion, then
+// conversion; a tie is an error (Test/errors/err_overload_ambiguous_tie.cb). Each set is declared
+// twice in OPPOSITE orders and every leg asserts both - the order-independence IS the assertion.
+// Before the fix six of the seven int/long/i64 picks moved with declaration order.
+int oiPickA(int x)  { return 1; }
+int oiPickA(long x) { return 2; }
+int oiPickA(i64 x)  { return 3; }
+int oiPickB(i64 x)  { return 3; }
+int oiPickB(long x) { return 2; }
+int oiPickB(int x)  { return 1; }
+// 'u16' and 'c16' are equal-width distinct identities.
+int oiCharA(u16 x) { return 1; }
+int oiCharA(c16 x) { return 2; }
+int oiCharB(c16 x) { return 2; }
+int oiCharB(u16 x) { return 1; }
+// A lone 'wchar' parameter still takes a 'c16' (a same-width conversion on Windows).
+int oiWide(wchar x) { return 7; }
+
 bool testOverloadResolution()
 {
     bool result = true;
@@ -2798,6 +2816,43 @@ bool testOverloadResolution()
     PdHold pdH = default;
     pdH.p = pdA;
     result &= Test("pd_addrof_ptr_field_into_ptrptr_param", pdByPtrPtr(&pdH.p), 1003);
+
+    // Integer identity ranking, each leg in both declaration orders (oiPickA / oiPickB).
+    int oiInt = 1;
+    long oiLong = 1;
+    i64 oiI64 = 1;
+    i16 oiShort = 1;
+    u32 oiU32 = 1;
+    result &= Test("oi_int_exact_a", oiPickA(oiInt), 1);
+    result &= Test("oi_int_exact_b", oiPickB(oiInt), 1);
+    result &= Test("oi_long_exact_a", oiPickA(oiLong), 2);
+    result &= Test("oi_long_exact_b", oiPickB(oiLong), 2);
+    result &= Test("oi_i64_exact_a", oiPickA(oiI64), 3);
+    result &= Test("oi_i64_exact_b", oiPickB(oiI64), 3);
+    // 'i16' promotes to 'int' (C++ integral promotion) ahead of the wider promotions.
+    result &= Test("oi_i16_promotes_to_int_a", oiPickA(oiShort), 1);
+    result &= Test("oi_i16_promotes_to_int_b", oiPickB(oiShort), 1);
+    // An unsuffixed literal ranks as 'int', whatever width it lowers at.
+    result &= Test("oi_literal_is_int_a", oiPickA(5), 1);
+    result &= Test("oi_literal_is_int_b", oiPickB(5), 1);
+    // Too big for 'int': the first of 'long', 'i64' that holds it on the target.
+    int oiBigWant = sizeof(long) == 8 ? 2 : 3;
+    result &= Test("oi_big_literal_a", oiPickA(5000000000), oiBigWant);
+    result &= Test("oi_big_literal_b", oiPickB(5000000000), oiBigWant);
+    if const (__WINDOWS__)
+    {
+        // 'u32' into the equal-width 'int' and 'long' is a conversion, into 'i64' a promotion.
+        // LLP64 only: on LP64 'long' and 'i64' are equal promotions, a genuine tie.
+        result &= Test("oi_u32_promotes_to_i64_a", oiPickA(oiU32), 3);
+        result &= Test("oi_u32_promotes_to_i64_b", oiPickB(oiU32), 3);
+    }
+    u16 oiU16 = 1;
+    c16 oiC16 = (c16)1;
+    result &= Test("oi_u16_exact_a", oiCharA(oiU16), 1);
+    result &= Test("oi_u16_exact_b", oiCharB(oiU16), 1);
+    result &= Test("oi_c16_exact_a", oiCharA(oiC16), 2);
+    result &= Test("oi_c16_exact_b", oiCharB(oiC16), 2);
+    result &= Test("oi_c16_into_lone_wchar", oiWide(oiC16), 7);
 
     delete pc;
     delete ps;

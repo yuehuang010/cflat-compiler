@@ -670,6 +670,10 @@
       "std::to_string(params[i].AllocAlignValue)",
       "std::to_string(args[i].AllocAlignment)"
     ],
+    "ambiguouscalltoarg0n...parametertypeyoumean6524b093d1fa9da7": [
+      "shownFunctionName",
+      "candidateList"
+    ],
     "arg0arg1mustbearg2or...obeexecutedinprocess28e30d1abeb98a2b": [
       "--run",
       "main",
@@ -1664,6 +1668,7 @@
     "alignasisnotsupporte...htheplaindeallocator2beff51adb78c9c4": "'alignas' is not supported on a 'new T[n]' stored into 'array<T>': the array frees its buffer through the plain deallocator",
     "alignmentmismatchini...ntthevaluealreadyhas5a4ed9c3ad1bf980": "alignment mismatch initializing '{0}': the declared type allocates at {1}, but the value was allocated {2}. Allocate the value with the matching 'alignas(0, {3})' clause, or declare the receiver with the alignment the value already has.",
     "alignmentmismatchmov...hthecorrectalignmenta5e59547dcfd5ec4": "alignment mismatch moving into the 'move' parameter of '{0}': the parameter is declared 'alignas(0, {1})' but the argument was allocated 'alignas(0, {2})'. The two must agree so the callee frees with the correct alignment.",
+    "ambiguouscalltoarg0n...parametertypeyoumean6524b093d1fa9da7": "ambiguous call to '{0}': no candidate ranks better than the others: {1}. Cast the argument to the parameter type you mean.",
     "arg0arg1mustbearg2or...obeexecutedinprocess28e30d1abeb98a2b": "{0}: '{1}' must be '{2}' or '{3}' to be executed in-process.",
     "arg0asanruntimedllar...sssanitizercomponent4c29a1f95801007b": "{0}: asan runtime DLL '{1}' not found under '{2}\\bin'. The import library was present but the matching runtime DLL is missing; reinstall the 'C++ AddressSanitizer' component.",
     "arg0asanruntimeimpor...ntforthismsvctoolsetc5e9e50ae7d9edfe": "{0}: asan runtime import library '{1}' not found in '{2}'. Install the 'C++ AddressSanitizer' component for this MSVC toolset.",
@@ -1910,6 +1915,9 @@
     "alignmentmismatchmov...hthecorrectalignmenta5e59547dcfd5ec4": [
       "LLVMBackend_WinRT.cpp:1809"
     ],
+    "ambiguouscalltoarg0n...parametertypeyoumean6524b093d1fa9da7": [
+      "LLVMBackend_Overloads.cpp:1466"
+    ],
     "arg0arg1mustbearg2or...obeexecutedinprocess28e30d1abeb98a2b": [
       "LLVMBackend_EmitAndLink.cpp:3889"
     ],
@@ -2030,7 +2038,7 @@
       "LLVMBackend_ControlFlowAndFunctions.cpp:505"
     ],
     "calltoarg0adoptparam...rfacecannotbeadopted40dd336a21320a8f": [
-      "LLVMBackend_Overloads.cpp:2330"
+      "LLVMBackend_Overloads.cpp:2619"
     ],
     "calltoarg0arg1adoptp...rfacecannotbeadoptedc8edc9a7350dcd11": [
       "LLVMBackend_WinRT.cpp:2811"
@@ -2051,27 +2059,27 @@
       "LLVMBackend_WinRT.cpp:2421"
     ],
     "calltoarg0arg1stillo...ainerselementuniquet46a6c947c30c8662": [
-      "LLVMBackend_Overloads.cpp:3272",
+      "LLVMBackend_Overloads.cpp:3561",
       "LLVMBackend_OwnershipTemps.cpp:2858"
     ],
     "calltoarg0arg1stillo...sothecontainerownsit3a125e8aa8e103e7": [
-      "LLVMBackend_Overloads.cpp:3243"
+      "LLVMBackend_Overloads.cpp:3532"
     ],
     "calltoarg0argumentar...rg2hasnoresolvedtype1b9c663e45646797": [
-      "LLVMBackend_Overloads.cpp:1648"
+      "LLVMBackend_Overloads.cpp:1937"
     ],
     "calltoarg0cannotpass...evaluenotastackvalueade9718dd6fc01f3": [
-      "LLVMBackend_Overloads.cpp:1568",
-      "LLVMBackend_Overloads.cpp:1603"
+      "LLVMBackend_Overloads.cpp:1857",
+      "LLVMBackend_Overloads.cpp:1892"
     ],
     "calltoarg0cannotpass...thecalleeonlyborrows7fecc6bc7d235122": [
-      "LLVMBackend_Overloads.cpp:1733"
+      "LLVMBackend_Overloads.cpp:2022"
     ],
     "calltoarg0moveargume...oragecannotbecleared11042b18288de6a4": [
       "LLVMBackend_WinRT.cpp:1907"
     ],
     "calltoarg0omitsparam...sionpassitexplicitly13c4f1d3258e50d5": [
-      "LLVMBackend_Overloads.cpp:1458"
+      "LLVMBackend_Overloads.cpp:1747"
     ],
     "calltoarg0parametera...theparameterarg5arg6cdcea6fb1f430195": [
       "LLVMBackend_WinRT.cpp:1572"
@@ -2080,16 +2088,16 @@
       "LLVMBackend_WinRT.cpp:1723"
     ],
     "cannotarg0arg1arg2fr...oramovereturningcall24368f2be24c7fe1": [
-      "LLVMBackend_Overloads.cpp:1996"
+      "LLVMBackend_Overloads.cpp:2285"
     ],
     "cannotarg0arg1arg2fr...oramovereturningcall3006f824415239a3": [
-      "LLVMBackend_Overloads.cpp:2006"
+      "LLVMBackend_Overloads.cpp:2295"
     ],
     "cannotarg0arg1fromab...oramovereturningcall540141ea59f3ddd7": [
-      "LLVMBackend_Overloads.cpp:1991"
+      "LLVMBackend_Overloads.cpp:2280"
     ],
     "cannotarg0arg1frombo...oramovereturningcall00c40fbac047ce38": [
-      "LLVMBackend_Overloads.cpp:2001"
+      "LLVMBackend_Overloads.cpp:2290"
     ],
     "cannotarg0onlyanamed...thanexplicitcastarg28d664510c1990514": [
       "LLVMBackend_WinRT.cpp:1986"
@@ -2125,16 +2133,16 @@
       "LLVMBackend_Interfaces.cpp:2166"
     ],
     "cannotcopyarg0itisde...rmovethevalueinstead3793b495c6a49924": [
-      "LLVMBackend_Overloads.cpp:872"
+      "LLVMBackend_Overloads.cpp:1134"
     ],
     "cannotcopyarg0itsfie...ipinsteadofcopyingitc211031fc62a57d2": [
-      "LLVMBackend_Overloads.cpp:900"
+      "LLVMBackend_Overloads.cpp:1162"
     ],
     "cannotcopyarg0itsfie...ipinsteadofcopyingitcc0e5e860001f897": [
-      "LLVMBackend_Overloads.cpp:892"
+      "LLVMBackend_Overloads.cpp:1154"
     ],
     "cannotcopyarg0unique...nethepointeeyourselfb6e9ff574f9a1595": [
-      "LLVMBackend_Overloads.cpp:865"
+      "LLVMBackend_Overloads.cpp:1127"
     ],
     "cannotlocatecflatbui...timedirectoryisunsetd6eb6b14f48bb579": [
       "LLVMBackend_CInterop.cpp:610"
@@ -2143,7 +2151,7 @@
       "LLVMBackend_CInterop.cpp:540"
     ],
     "cannotlowerdefaultar...rparameterarg0ofarg18db0b6145a9413b7": [
-      "LLVMBackend_Overloads.cpp:1466"
+      "LLVMBackend_Overloads.cpp:1755"
     ],
     "cannotlowerexternret...rtheactivecabirecipe7d08233bdb7fb8eb": [
       "LLVMBackend_MoveDataflow.cpp:1658",
@@ -2153,13 +2161,13 @@
       "LLVMBackend_MoveDataflow.cpp:1666"
     ],
     "cannotmaterializeimp...classargumentforarg058a97d9c8a4df65b": [
-      "LLVMBackend_Overloads.cpp:1512"
+      "LLVMBackend_Overloads.cpp:1801"
     ],
     "cannotmovearg0intomo...ifthisfunctionownsite3725c6c36e14caf": [
-      "LLVMBackend_Overloads.cpp:2073"
+      "LLVMBackend_Overloads.cpp:2362"
     ],
     "cannotmovearg0itwasr...luethereceivercanownecd0567bd50b057c": [
-      "LLVMBackend_Overloads.cpp:3018"
+      "LLVMBackend_Overloads.cpp:3307"
     ],
     "cannotmovetheoverali...heelementtypeinstead37678af4b62532f7": [
       "LLVMBackend_WinRT.cpp:1784"
@@ -2171,13 +2179,13 @@
       "LLVMBackend_Interfaces.cpp:1138"
     ],
     "cannotpassanarrayvie...theelementsmustmatch70ac68158d8ea37a": [
-      "LLVMBackend_Overloads.cpp:995"
+      "LLVMBackend_Overloads.cpp:1257"
     ],
     "cannotpassanowningva...evaluetoanownerfirste67cc584259d5eee": [
-      "LLVMBackend_Overloads.cpp:1546"
+      "LLVMBackend_Overloads.cpp:1835"
     ],
     "cannotpassarawpointe...rg5arg6decayisoneway9309c0c4984312aa": [
-      "LLVMBackend_Overloads.cpp:982"
+      "LLVMBackend_Overloads.cpp:1244"
     ],
     "cannotpassarg0asinte...doesnotimplementarg3abf6e4ddf846baae": [
       "LLVMBackend_Interfaces.cpp:1667"
@@ -2186,25 +2194,25 @@
       "LLVMBackend_WinRT.cpp:2024"
     ],
     "cannotpassarg0toclos...hexpectsarg2arg3arg40481ee737758a21b": [
-      "LLVMBackend_Overloads.cpp:818"
+      "LLVMBackend_Overloads.cpp:1080"
     ],
     "cannotpassarg0toclos...plytheshapeitexpects1c8eceeed89b1ffd": [
-      "LLVMBackend_Overloads.cpp:826"
+      "LLVMBackend_Overloads.cpp:1088"
     ],
     "cannotpassarg0tothea...binditfirstarg9arg1069e931e3bcfc1bb6": [
-      "LLVMBackend_Overloads.cpp:1687"
+      "LLVMBackend_Overloads.cpp:1976"
     ],
     "cannotpassarg0tothea...erexplicitlywitharg685f9bb80ecf24438": [
       "LLVMBackend_ControlFlowAndFunctions.cpp:490"
     ],
     "cannotpassarg0tothev...icitlywitharg6egarg797ac9bd8fa8f5479": [
-      "LLVMBackend_Overloads.cpp:1912"
+      "LLVMBackend_Overloads.cpp:2201"
     ],
     "cannotpassbondedvalu...toftheirsourcesscope560cc5e8605342a2": [
       "LLVMBackend_WinRT.cpp:2639"
     ],
     "cannotpassowningheap...quetdoesnotownarrays57d0d857da621597": [
-      "LLVMBackend_Overloads.cpp:2104"
+      "LLVMBackend_Overloads.cpp:2393"
     ],
     "cannotpasstocfunctio...mbdaoranamedfunction48dd5fe854279d60": [
       "LLVMBackend_WinRT.cpp:2103"
@@ -2321,16 +2329,16 @@
       "LLVMBackend_CInterop.cpp:548"
     ],
     "defaultargumentforpa...hasanunsupportedtype5d022dd279a3e61f": [
-      "LLVMBackend_Overloads.cpp:1490"
+      "LLVMBackend_Overloads.cpp:1779"
     ],
     "defaultnullptrforpar...0ofarg1isnotapointer87bfc7d94fc952b0": [
-      "LLVMBackend_Overloads.cpp:1471"
+      "LLVMBackend_Overloads.cpp:1760"
     ],
     "duplicatecaselabelarg0inswitch": [
       "MainListener_Statements.cpp:2926"
     ],
     "duplicatenamedargumentarg0": [
-      "LLVMBackend_Overloads.cpp:664"
+      "LLVMBackend_Overloads.cpp:926"
     ],
     "emitwinmdnowinrtinte...orclassesfoundtoemit3093b6c411af1dd1": [
       "LLVMBackend_WinRT.cpp:1326"
@@ -2370,10 +2378,10 @@
       "LLVMBackend_EmitAndLink.cpp:4261"
     ],
     "functionarg0cannotbe...rg3insteadordroparg4a38c64f3d4498882": [
-      "LLVMBackend_Overloads.cpp:2555"
+      "LLVMBackend_Overloads.cpp:2844"
     ],
     "functionarg0hasnoove...efunctionpointertype8d562b0f9fbd458d": [
-      "LLVMBackend_Overloads.cpp:1778"
+      "LLVMBackend_Overloads.cpp:2067"
     ],
     "functionarg0isneverused": [
       "LspServer.cpp:2762"
@@ -2473,7 +2481,7 @@
       "CFlatErrorListener.h:278"
     ],
     "namedargumentarg0doe...notmatchanyparameter54ee4c123914315f": [
-      "LLVMBackend_Overloads.cpp:662"
+      "LLVMBackend_Overloads.cpp:924"
     ],
     "noarg0compilerdriver...dtolinktheexecutable11639c2d0b9f1811": [
       "LLVMBackend_EmitAndLink.cpp:2865"
@@ -2491,11 +2499,11 @@
       "CFlatErrorStrategy.h:100"
     ],
     "parameterarg0cannotp...toftheirsourcesscope0c92f2fcfe931fdb": [
-      "LLVMBackend_Overloads.cpp:2086",
-      "LLVMBackend_Overloads.cpp:2091"
+      "LLVMBackend_Overloads.cpp:2375",
+      "LLVMBackend_Overloads.cpp:2380"
     ],
     "parameterarg0ofarg1i...smoveargoratemporarydf5863f826e239c2": [
-      "LLVMBackend_Overloads.cpp:1436"
+      "LLVMBackend_Overloads.cpp:1725"
     ],
     "programdefinitionsrequireatrailing": [
       "CFlatErrorListener.h:298"
@@ -2540,10 +2548,10 @@
       "CFlatErrorListener.h:70"
     ],
     "unknownfunctionarg0": [
-      "LLVMBackend_Overloads.cpp:1111"
+      "LLVMBackend_Overloads.cpp:1373"
     ],
     "unknowngenericfunctionarg0": [
-      "LLVMBackend_Overloads.cpp:1113"
+      "LLVMBackend_Overloads.cpp:1375"
     ],
     "unknowninterfacearg0": [
       "LLVMBackend_WinRT.cpp:2620"

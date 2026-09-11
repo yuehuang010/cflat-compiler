@@ -5693,6 +5693,10 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     // The declared element type, for generic inference only: the
                                     // TypeName below stays empty for primitives on purpose.
                                     argVar.InferSourceTypeName = argNV.TypeAndValue.TypeName;
+                                    // An unsuffixed integer literal lowers at its smallest width but
+                                    // ranks as 'int' (C++) in overload resolution.
+                                    argVar.LiteralIdentity = LLVMBackend::UnsuffixedIntegerLiteralIdentity(
+                                        namedArgument->assignmentExpression()->getText());
                                     // Preserve unsigned-integer TypeName so Upconvert can choose ZExt over SExt.
                                     if (argNV.TypeAndValue.IsUnsignedInteger() != -1)
                                         argVar.TypeAndValue.TypeName = argNV.TypeAndValue.TypeName;

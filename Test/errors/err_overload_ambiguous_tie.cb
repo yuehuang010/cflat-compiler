@@ -1,0 +1,39 @@
+// A tie within the best overload-resolution tier is an ambiguity error (ruling 2026-09-10), never
+// first-wins or last-wins: before it, each of these calls silently picked by declaration order.
+// Every leg's substring names both tied candidates.
+
+// An unsuffixed literal ranks as 'int'; into 'u8' and into 'u16' are both conversions.
+int tieLit(u8 x)  { return 1; }
+int tieLit(u16 x) { return 2; }
+
+// 'u8' widens into 'u16' (same signedness) and into the strictly wider signed 'i16': two
+// promotions to the same width. The diagnostic spells 'i16' by its canonical name 'short'.
+int tieWide(u16 x) { return 1; }
+int tieWide(i16 x) { return 2; }
+
+// Two arguments, each candidate exact at one position and worse at the other: neither is better
+// at every position.
+int tieCross(int a, long b) { return 1; }
+int tieCross(long a, int b) { return 2; }
+
+extern int main()
+{
+    expect_error("tieLit(u8), tieLit(u16)")
+    {
+        int r = tieLit(5);
+    }
+
+    u8 small = 1;
+    expect_error("tieWide(u16), tieWide(short)")
+    {
+        int r = tieWide(small);
+    }
+
+    int a = 1;
+    int b = 2;
+    expect_error("tieCross(int, long), tieCross(long, int)")
+    {
+        int r = tieCross(a, b);
+    }
+    return 0;
+}

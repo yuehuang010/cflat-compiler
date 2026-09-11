@@ -1387,6 +1387,9 @@ public:
         // call site drops TypeName for a primitive so overload matching stays LLVM-type based.
         // Generic type-argument inference reads it; not part of the --init cache round-trip.
         std::string InferSourceTypeName;
+        // compile-time: the identity an unsuffixed integer literal argument ranks as in overload
+        // resolution ('int', else 'long'/'i64'); empty otherwise. Not part of the --init cache round-trip.
+        std::string LiteralIdentity;
         // compile-time: this argument was written 'move x' at a call site and is a VALUE type
         // (string/owning struct/closure). Zeroing is deferred to ApplyMoveParamTransfer so the
         // callee's parameter move-ness is known first. Not part of the --init cache round-trip.
@@ -8005,7 +8008,18 @@ public:
     std::string DescribeCodeValueAsCompoundOperand(const std::string& spelling, const std::string& op,
                                                    bool destIsPointer) const;
 
-    std::pair<std::vector<NamedVariable>, FunctionSymbol> ComputeOverloadFunction(const std::vector<std::pair<std::vector<NamedVariable>, FunctionSymbol>>& candidates) const;
+    // `tiedOut`, when given, receives the candidates of a genuine integer-ranking tie (and the
+    // result is empty); without it such a tie falls back to the legacy declaration-order pick.
+    std::pair<std::vector<NamedVariable>, FunctionSymbol> ComputeOverloadFunction(
+        const std::vector<std::pair<std::vector<NamedVariable>, FunctionSymbol>>& candidates,
+        std::vector<FunctionSymbol>* tiedOut = nullptr) const;
+
+    // Integer identity ranking for overload resolution (C++ order, ruling 2026-09-10). The two
+    // identity helpers return "" when the side is not a plain integer primitive of known identity.
+    static std::string UnsuffixedIntegerLiteralIdentity(std::string_view text);
+    std::string IntegerArgumentIdentity(const NamedVariable& arg) const;
+    std::string IntegerParameterIdentity(const TypeAndValue& param) const;
+    static int RankIntegerConversion(const std::string& argIdentity, const std::string& paramIdentity);
 
     // How a call site's arguments bind to declared parameter slots (see ComputeArgumentPositions).
     struct ArgumentBinding
