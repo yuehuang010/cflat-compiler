@@ -92,7 +92,81 @@
 //                       resource counts.
 //   Section M34 (813-819): implicit scalar-to-class reference conversion, chained nontrivial
 //                       class return receivers, member reference arguments/defaults, and RAII.
+//   Section M43 (1060-1069): constructors declared over DEPENDENT typedefs (the c10::IListRef
+//                       shape): clang only offers the dependent pattern, which the extractor now
+//                       retains so the class is still constructible.
+//   Section M46 (1080-1089): C++ member default wrappers with a leading long literal, comparing
+//                       optional and plain trailing parameters.
+//   Section M47 (1100-1109): a variadic constructor template called with named LOCALS in the
+//                       `T x = T(a, b)` declaration form (the torch::nn::Sequential shape).
+//   Section M45 (1090-1099): a refused member with a default-argument wrapper retries once its
+//                       class-typed parameter is registered, at full and reduced arity.
+//   Section M48 (1110-1119): public fields of a requested class-template specialization remain
+//                       addressable through a specialization alias, even beside a same-named
+//                       namespace.
+//   Section M49 (1120-1129): an inferred unique_ptr returned from a C++ loader-shaped function
+//                       moves its nontrivial sret result, including a by-value Dataset and a
+//                       defaulted size_t-converting options class.
+//   Section M51 (1140-1149): a namespace-scope C++ alias whose default template argument
+//                       canonicalizes differently still names the vector element identity.
+//   Section M52 (1150-1159): an inherited CRTP member template with a dependent return type and
+//                       a transform that has only an implicit default constructor.
+//   Section M54 (1170-1179): canonical spelling of a dependent CRTP member-template return whose
+//                       template argument is a namespace-local alias, plus retrying a by-value
+//                       transform apply_batch after its vector element is registered.
+//   Section M57 (1200-1209): homogeneous C++ class brace arguments materialized as contiguous
+//                       copies/moves for std::vector and pointer-pair SpanOf parameters.
+//   Section M53 (1160-1169): auto locals move-construct nontrivial C++ sret returns before the
+//                       temporary is nulled, both directly and through operator-> forwarding.
+//   Section M50 (1130-1139): namespace-scope C++ using-directives resolve free functions, types,
+//                       and function templates through a lookup-time namespace fallback.
+//   Section M55 (1180-1189): a nontrivial C++ class built from `call() * s` and `(a + s) * t`
+//                       moves the outermost operator result into the local; temporaries destroyed.
+//   Section M58 (1210-1219): NON-TYPE template arguments on C++ function templates -
+//                       `cppt.nth_of<0>(v)`, `box.slot<3>()`, mixed `cppt.scaled<3, int>(5)`, and
+//                       `std.get<0>/<1>` on a std::tuple returned by value.
+//   Section M59 (1220-1229): members inherited from a class-template-specialization base -
+//                       a CRTP NormBase<D, Derived> whose members only get a body when the
+//                       specialization is ODR-used, reached from plain derived classes and
+//                       through a holder's operator->.
+//   Section M56 (1190-1199): namespace-scope C++ constexpr variables retain their qualified
+//                       names and declared enum/bool/integer types as compile-time constants.
+//   Section M60 (1230-1239): C++ constructor temporaries are receivers for member calls, chained
+//                       member calls, fields, declaration initializers, and const-reference args.
+//   Section M61 (1240-1249): nested std::tuple returns through auto and explicit locals, nested
+//                       std.get calls, a defaulted optional tuple parameter, and RAII cleanup.
+//   Section M62 (1250-1259): C++ string literals and foreign class values use converting
+//                       constructors at by-value call arguments; chained calls preserve references
+//                       and destroy argument temporaries exactly once.
+//   Section M63 (1260-1269): sibling class-template-specialization bases keep their own layout,
+//                       inherited members, operator->, and inherited constructors.
+//   Section M64 (1270-1279): brace overloads at parameter indices 1 and 2, defaulted and explicit
+//                       options, and derived-to-base references/pointers through a two-level public
+//                       hierarchy with a non-primary base and virtual dispatch.
+//   Section M65 (1280-1289): a class-template specialization's nested Item keeps the enclosing
+//                       specialization identity for reference-returning operator[] and front(),
+//                       including two specializations in one function and a nontrivial value type.
+//   Section M66 (1290-1299): heterogeneous C++ brace elements convert into one initializer_list
+//                       element class, including a namespace-level using-directive re-export and
+//                       destruction of the materialized nontrivial elements.
+//   Section M67 (1300-1309): namespace-scope floating constexpr values retain float/double types,
+//                       long double narrows to CFlat double, and all values remain usable in
+//                       arithmetic, comparisons, and C++ function arguments.
 
+//   Section M68 (1310-1319): nontrivial C++ class declaration locals initialized from call/call
+//                       and constructor/constructor ternaries, with both branch outcomes and
+//                       live-count cleanup; a ternary of temporaries as a call argument.
+//   Section M71 (1340-1349): a parenthesized ternary used as the condition of a class-declaration
+//                       ternary, with both outcomes and live-count cleanup.
+//   Section M70 (1330-1339): named lvalues in class brace lists stay intact, brace temporaries
+//                       are destroyed per full expression in a loop, converting constructors
+//                       balance by-value and local materialization, and T(args) works for a
+//                       no-standard-include aggregate with two-argument initialization.
+//   Section M69 (1320-1329): one shared C++ foreign identity for positive/negative non-type
+//                       template bases and unsigned-char ArrayRef-like bases, including inherited
+//                       members and derived-to-base free-function conversions.
+//   Section M72 (1350-1359): canonical C++ primitive identities for unsigned long, size_t,
+//                       unsigned, long double, and a std::vector<size_t>-style round trip.
 // Section M: C++ interop - `import cpp` selects C++ mode; the extension is irrelevant (the
 // fixture header is a plain .h). The header supplies the declarations, the .cpp is compiled
 // by the host C++ driver and linked in. Both are needed: the header alone has no
@@ -114,7 +188,9 @@ import cpp "library/cpp_interop_inline_again.h";
 // path emitted the bodies. Section M9 needs no fixture at all - the libc++ headers are the
 // fixture, reached by the SYSTEM header spelling below.
 import cpp "library/cpp_interop_tpl.h" cache;
+import cpp "library/cpp_interop_by_value.h";
 import cpp "vector";
+import cpp "tuple";
 import cpp "mutex";
 import cpp "chrono";
 import cpp "string";
@@ -1927,5 +2003,564 @@ extern int main()
     cppi.ExternPoly<int> externPoly = cppi.ExternPoly<int>(6);
     if (externPoly.get() != 6) return 1015;
     if (externPoly.twice() != 12) return 1016;
+
+    // ---- Section M42: ladder rungs 9-10 mechanisms (1040-1059) ----
+    // A namespace-scope using-declaration publishes the target under the ALIAS name too; the
+    // symbol it links to is still the target's own.
+    if (cppi.reexport.seeded(2) != 42) return 1040;
+    if (cppi.reexport.linked(2) != 402) return 1041;
+    if (cppi.reexport.twice(21) != 42) return 1042;
+    // The original names keep working - the alias does not replace them.
+    if (cppi.reexport_src.seeded(2) != 42) return 1043;
+    if (cppi.inner.twice(21) != 42) return 1044;
+
+    // An INHERITED member whose return type is an unregistered template specialization: the
+    // refusal lives on the base, so the derived receiver must rebind through it.
+    cppt.SpanDerived m40span = default;
+    if (m40span.get_tag() != 5) return 1045;
+    cppt.RefSpan<long> m40view = m40span.span();
+    if ((int)m40view.size() != 3) return 1046;
+    if (m40view.at((ulong)0) != 7) return 1047;
+    if (m40view.at((ulong)2) != 9) return 1048;
+
+    // ---- Section M43: constructors declared over DEPENDENT typedefs (1060-1069) ----
+    // TypedList's constructor parameter is spelled `const boxed_type&` where boxed_type is a
+    // member typedef of a traits class, so clang only ever offers the dependent PATTERN.
+    std.vector<long> m43values = default;
+    m43values.push_back(41);
+    m43values.push_back(42);
+    cppt.LongList m43list = cppt.LongList(m43values);
+    if (m43list.size() != 2) return 1060;
+    if (m43list.first() != 41) return 1061;
+    if (cppt.long_list_size(m43list) != 2) return 1062;
+
+    // ---- Section M44: std::optional parameters at C++ calls (1070-1079) ----
+    // std::optional's constructors are TEMPLATES, so clang's member list carries none of them.
+    // Construction goes through the generated C++ wrapper instead of a listed constructor.
+    std.optional<int> m44empty = std.optional<int>();
+    if (m44empty.has_value())                       return 1070;
+    std.optional<int> m44five = std.optional<int>(5);
+    if (!m44five.has_value())                       return 1071;
+    if (m44five.value() != 5)                       return 1072;
+    short m44narrow = 7;
+    std.optional<int> m44wide = std.optional<int>((int)m44narrow);
+    if (!m44wide.has_value() || m44wide.value() != 7) return 1073;
+
+    // ---- Section M46: leading long literal through a C++ default wrapper (1080-1089) ----
+    cppt.Meter m46defaults = default;
+    if (m46defaults.f(0, 1, 3) != 131) return 1080;
+    if (m46defaults.f(2, 1, 3) != 2131) return 1081;
+    if (m46defaults.g(0, 1, 3) != 131) return 1082;
+    if (m46defaults.g(7, 1, 3) != 7131) return 1083;
+
+    // ---- Section M47: variadic constructor template with local-variable arguments (1100-1109) --
+    // The declaration form used to hand the wrapper call the argument variables' own names, which
+    // overload matching read as named arguments ("named argument 'm47tag' does not match").
+    long m47tag = 3;
+    long m47x = 9;
+    cppt.LongList m47list = cppt.LongList(m47tag, m47x);
+    if (m47list.size() != 3) return 1100;
+    // A class-typed local through the same wrapper: it is passed by value, so the call needs the
+    // argument's address for the copy constructor (the wrapper call used to drop it).
+    cppt.PackArg m47arg = cppt.PackArg(9);
+    cppt.LongList m47list2 = cppt.LongList(4, m47arg);
+    if (m47list2.size() != 4) return 1101;
+
+    // ---- Section M45: refused member default-wrapper retry (1090-1099) -----------------
+    // LazyBox<int> is initially visible only in member signatures. Its by-value parameter is
+    // refused until the type request registers the specialization, while the defaults create a
+    // wrapper under the same member name.
+    cppt.LazyBox<int> m45box = cppt.LazyBox<int>(5);
+    if (cppt.LazyBoxFactory.take_box_default(m45box, 4) != 9) return 1090;
+    if (cppt.LazyBoxFactory.take_box_default() != 8) return 1091;
+
+    // ---- Section M48: fields of a requested class-template specialization (1110-1119) ----
+    cppt.TEx m48ex = cppt.make_ex(7, 11);
+    if (m48ex.data.value() != 7) return 1110;
+    if (m48ex.target != 11) return 1111;
+
+    // ---- Section M49: inferred move-only C++ return through a loader-shaped template (1120-1129) ----
+    cppt.LoaderDataset m49dataset = default;
+    m49dataset.add(10);
+    m49dataset.add(20);
+    m49dataset.add(30);
+    m49dataset.add(40);
+    if (m49dataset.size() != 4) return 1120;
+    if (m49dataset.first() != 10) return 1121;
+    auto m49loader = cppt.make_loader<cppt.LoaderDataset, cppt.LoaderSampler>(m49dataset, 2);
+    if (m49loader.get() == nullptr) return 1122;
+    if (m49loader->dataset_count != 4) return 1123;
+    if (m49loader->first_value != 10) return 1124;
+    if (m49loader->batch_count != 2) return 1125;
+    if (m49loader->dataset_count + m49loader->batch_count != 6) return 1126;
+    if (m49loader->first_value + m49loader->batch_count != 12) return 1127;
+    if (m49loader->last_value != 40) return 1128;
+    if (m49loader->batch_count != (m49loader->dataset_count + 1) / 2) return 1129;
+
+    // ---- Section M52: inherited CRTP member template and implicit transform ctor (1150-1159) -
+    cppt.M52Dataset m52dataset = cppt.M52Dataset(40);
+    cppt.M52Transform<int> m52transform = cppt.M52Transform<int>();
+    auto m52mapped = m52dataset.map<cppt.M52Transform<int>>(m52transform);
+    if (m52mapped.result() != 41) return 1150;
+
+    // ---- Section M54: canonical dependent wrapper types and by-value retry (1170-1179) ----
+    cppt.lo.Ds2 m54dataset = cppt.lo.Ds2(5);
+    auto m54mapped = m54dataset.map(cppt.lo.TrA());
+    if (m54mapped.r() != 7) return 1170;
+    auto m54mappedExplicit = m54dataset.map<cppt.lo.TrA>(cppt.lo.TrA());
+    if (m54mappedExplicit.r() != 7) return 1171;
+
+    cppt.lo.BatchDs2 m54batchDataset = cppt.lo.BatchDs2(5);
+    auto m54batchMapped = m54batchDataset.map_batch(cppt.lo.BatchTrA());
+    if (m54batchMapped.r() != 8) return 1172;
+    std.vector<cppt.TEx2> m54batch = default;
+    m54batch.emplace_back(19);
+    if (m54batchMapped.apply_batch(move m54batch).data.value() != 19) return 1173;
+
+    // ---- Section M51: C++ alias identity through a canonicalized default argument (1140-1149) -
+    // The vector element is Ex2<Tracked, void>; TEx2 spells Ex2<Tracked, NoT>.
+    std.vector<cppt.TEx2> m51values = cppt.make_ex2_vector();
+    if (m51values.size() != 1) return 1140;
+    if (m51values[0].data.value() != 17) return 1141;
+
+    // ---- Section M53: auto locals from nontrivial C++ sret returns (1160-1169) ---------
+    cppt.m53_reset();
+    {
+        cppt.LoaderDataset m53dataset = default;
+        auto m53values = m53dataset.tracked_values();
+        if ((int)m53values.size() != 2) return 1160;
+        if (m53values.first() != 31) return 1161;
+        if (cppt.m53_dtor_count() != 1) return 1162;
+    }
+    if (cppt.m53_dtor_count() != 2) return 1163;
+
+    cppt.m53_reset();
+    {
+        cppt.LoaderDataset m53dataset = default;
+        cppt.M53Holder m53holder = cppt.M53Holder(&m53dataset);
+        auto m53forwarded = m53holder->tracked_values();
+        if ((int)m53forwarded.size() != 2) return 1164;
+        if (m53forwarded.second() != 47) return 1165;
+        if (cppt.m53_dtor_count() != 1) return 1166;
+    }
+    if (cppt.m53_dtor_count() != 2) return 1167;
+
+    // ---- Section M50: namespace-scope using-directive lookup (1130-1139) ----------------
+    if (cppt.via_directive(4) != 12) return 1130;
+    cppt.DirTag m50tag = default;
+    m50tag.v = 9;
+    if (m50tag.v != 9) return 1131;
+    if (cppt.dir_unit<long>() != 1) return 1132;
+
+    // ---- Section M55: nontrivial C++ operator results from call operands (1180-1189) -------
+    {
+        cppt.OpVec m55a = cppt.make_opvec(1.0);
+        cppt.OpVec m55c = cppt.make_opvec(1.0) * 4.0;
+        if (m55c.sum() != 8.0) return 1180;
+        cppt.OpVec m55n = (m55a + 1.0) * 3.0;
+        if (m55n.sum() != 12.0) return 1181;
+        cppt.OpVec m55e = m55a + 4.0;
+        if (m55e.sum() != 10.0) return 1182;
+        if (cppt.OpVec.live() != 4) return 1183;
+    }
+    if (cppt.OpVec.live() != 0) return 1184;
+
+    // ---- Section M58: non-type template arguments on C++ calls (1210-1219) ----
+    {
+        std.vector<int> m58v = default;
+        m58v.push_back(10);
+        m58v.push_back(11);
+        m58v.push_back(12);
+        if (cppt.nth_of<0>(m58v) != 10) return 1210;
+        if (cppt.nth_of<2>(m58v) != 12) return 1211;
+        cppt.SlotBox m58box = cppt.SlotBox(100);
+        if (m58box.slot<0>() != 100) return 1212;
+        if (m58box.slot<3>() != 103) return 1213;
+        if (cppt.scaled<3, int>(5) != 15) return 1214;
+        if (cppt.scaled<2, double>(1.5) != 3.0) return 1215;
+        {
+            std.tuple<cppi.Tracked, int> m58t = cppt.make_tracked_pair(7);
+            cppi.Tracked m58first = std.get<0>(m58t);
+            if (m58first.value() != 7) return 1216;
+            if (std.get<1>(m58t) != 14) return 1217;
+        }
+    }
+
+    // ---- Section M59: members inherited from a class-template-specialization base (1220-1229) ----
+    {
+        cppt.Norm1 m59a = default;
+        cppt.Norm2 m59b = default;
+        if (m59a.dims() != 1) return 1220;
+        if (m59b.dims() != 2) return 1221;
+        if (m59a.twice(5) != 10) return 1222;
+        if (m59b.twice(5) != 15) return 1223;
+        cppt.NormHolder m59h = default;
+        if (m59h->twice(2) != 4) return 1224;
+        if (m59h->dims() != 1) return 1225;
+    }
+
+    // ---- Section M63: sibling class-template-specialization bases (1260-1269) ---------------
+    {
+        cppt.m63.Holder<cppt.m63.EmbImpl> m63h = cppt.m63.Holder<cppt.m63.EmbImpl>(2);
+        if (m63h.forward(1) != 1021) return 1260;
+        if (m63h->forward(1) != 1021) return 1261;
+        cppt.m63.Holder<cppt.m63.EmbImpl> m63h2 = cppt.m63.Holder<cppt.m63.EmbImpl>(3);
+        if (m63h2.forward(1) != 1031) return 1262;
+        if (m63h2->forward(1) != 1031) return 1263;
+    }
+    {
+        cppt.m63.Embedding m63e = cppt.m63.Embedding(2);
+        cppt.m63.Linear m63l = cppt.m63.Linear(2);
+        if (m63e.forward(1) != 1021) return 1264;
+        if (m63e->forward(1) != 1021) return 1265;
+        if (m63l.forward(1) != 2021) return 1266;
+        if (m63l->forward(1) != 2021) return 1267;
+    }
+    {
+        cppt.m63.Linear m63l = cppt.m63.Linear(3);
+        cppt.m63.Embedding m63e = cppt.m63.Embedding(3);
+        if (m63l.forward(1) != 2031 || m63e.forward(1) != 1031) return 1268;
+    }
+    if (cppt.m63.live_count() != 0) return 1269;
+
+    // ---- Section M65: nested Item returns from class-template specializations (1280-1289) ----
+    {
+        cppt.Dict<std.string, double> m65text = cppt.make_m65_text();
+        if (m65text.size() != 2) return 1280;
+        if (strcmp(m65text[0].key().c_str(), "w") != 0) return 1281;
+        if (strcmp(m65text.front().key().c_str(), "w") != 0) return 1282;
+        if (m65text.front().value() != 1.5) return 1283;
+        m65text[1].value() = 6.5;
+        if (m65text[1].value() != 6.5) return 1284;
+
+        cppt.Dict<int, double> m65ints = cppt.make_m65_int();
+        if (m65ints[0].key() != 7 || m65ints.front().value() != 3.5) return 1285;
+        if (m65ints[1].key() != 9 || m65ints[1].value() != 4.5) return 1286;
+
+        cppt.Dict<int, cppt.M65Value> m65counted = cppt.make_m65_counted();
+        if (cppt.M65Value.live() != 2) return 1287;
+        if (m65counted[1].key() != 8 || m65counted[1].value().get() != 12) return 1288;
+    }
+    if (cppt.M65Value.live() != 0) return 1289;
+
+    // CFlat's type grammar does not currently accept a nested class selector after a
+    // specialization (`cppt.Dict<...>.Item`), so the local-type leg is covered by the returned
+    // aliases above.
+
+    // ---- Section M56: namespace-scope C++ constexpr variables (1190-1199) -----------------
+    if ((int)cppk.kAnswer != 42) return 1190;
+    if (cppk.kind_of(cppk.kB) != cppk.Kind.B) return 1191;
+    if (cppk.kind_of(cppk.kAlias) != cppk.Kind.B) return 1192;
+    if (!cppk.kOn) return 1193;
+    if ((int)cppk.kInlineAnswer != 43) return 1194;
+    if ((int)cppk.kChar != (int)'q') return 1195;
+
+    // ---- Section M57: class-valued C++ brace arguments (1200-1209) -------------------------
+    cppi.reset_counts();
+    {
+        cppi.Tracked a = cppi.Tracked(3);
+        cppi.Tracked b = cppi.Tracked(5);
+        if (cppt.total_tracked({a, b}) != 8) return 1200;
+        if (cppi.copy_count() != 4 || cppi.move_count() != 0) return 1201;
+        if (cppi.dtor_count() != 4) return 1202;
+    }
+    if (cppi.dtor_count() != 6) return 1203;
+
+    cppi.reset_counts();
+    {
+        cppi.Tracked b = cppi.Tracked(7);
+        if (cppt.total_tracked({cppi.make_tracked(1), b}) != 8) return 1204;
+        if (cppi.copy_count() != 3 || cppi.move_count() != 1) return 1205;
+        if (cppi.dtor_count() != 5) return 1206;
+    }
+    if (cppi.dtor_count() != 6) return 1207;
+
+    cppi.reset_counts();
+    {
+        cppi.Tracked a = cppi.Tracked(2);
+        cppi.Tracked b = cppi.Tracked(6);
+        if (cppt.total_span({a, b}) != 8) return 1208;
+        if (cppi.copy_count() != 2) return 1208;
+        if (cppi.move_count() != 0) return 1208;
+        if (cppi.dtor_count() != 2) return 1208;
+    }
+    if (cppi.dtor_count() != 4) return 1209;
+
+    // ---- Section M39: explicit template arguments on C++ calls (1030-1039) ----
+    cppt.Meter m39meter = default;
+    m39meter.factor = 2.5;
+    if (m39meter.reading<double>() != 2.5) return 1030;
+    if (m39meter.reading() != 3) return 1031;
+    if (m39meter.data_ptr<double>()[0] != 2.5) return 1032;
+    if (cppt.unit_of<int>() != 1) return 1033;
+    if (cppt.unit_of<double>() != 1.0) return 1034;
+    if (cppi.add(m39meter.reading<double>(), 0.5) != 1003) return 1035;
+
+    // ---- Section M39b: function templates with parameter packs (1036-1039) ----
+    if (cppt.pack_count(5) != 5) return 1036;
+    if (cppt.pack_count(5, 7, 8) != 7) return 1037;
+    cppt.PackSink m39bsink = default;
+    cppt.PackArg m39barg = cppt.PackArg(9);
+    m39bsink.add_all(3, "ab", m39barg);
+    if (m39bsink.total != 109) return 1038;
+    if (cppt.pack_count(m39barg, 4) != 10) return 1039;
+
+    // ---- Section M38: C++ integer argument widths (1020-1029) ----
+    cppt.TaggedShort m38short = cppt.TaggedShort(7);
+    if (m38short.get() != 7) return 1020;
+    cppt.ItemBagN m38bag = cppt.ItemBagN(cppi.make_tracked(4), 7);
+    if (m38bag.total() != 11) return 1021;
+    cppt.IntPairN m38pair = cppt.IntPairN(3, 7);
+    if (m38pair.total() != 10) return 1022;
+    if (cppt.add_short(3, 7) != 10) return 1023;
+    if (cppt.add_mixed(cppi.make_tracked(4), 7) != 11) return 1024;
+    cppt.IntegerWidths m38widths = cppt.IntegerWidths(1, 2, 3, 4, 5, 6);
+    if (m38widths.total() != 21) return 1025;
+    cppt.deep.TaggedLong m38long = cppt.deep.TaggedLong(7);
+    if (m38long.get() != 7) return 1026;
+    if (cppt.add_short((short)3, 7) != 10) return 1027;
+    if (cppt.add_short((u16)3, 7) != 10) return 1028;
+    if (cppt.add_mixed(cppi.make_tracked(4), (long)7) != 11) return 1029;
+
+    // ---- Section M60: C++ constructor temporaries as member receivers (1230-1239) ---------
+    {
+        cppt.Builder m60b = cppt.Builder(2.0).wd(0.25);
+        if (m60b.value() != 2.0) return 1230;
+        if (m60b.wd() != 0.25) return 1231;
+
+        cppt.Builder m60c = cppt.Builder(2.0).scaled(3.0);
+        if (m60c.value() != 6.0) return 1232;
+        if (cppt.Builder(2.0).scaled(3.0).wd(0.75).value() != 6.0) return 1233;
+        if (cppt.consume(cppt.Builder(1.0).wd(0.5)) != 60) return 1234;
+        if (cppt.Builder(4.0).tag_ != 4) return 1235;
+    }
+    if (cppt.Builder.live() != 0) return 1236;
+
+    // ---- Section M61: nested tuple returns and defaulted optional tuple parameters (1240-1249) -
+    {
+        cppt.Lstmish lstm = default;
+        cppt.LstmishX x = cppt.LstmishX(5);
+        auto m61auto = lstm.forward(x);
+        cppt.LstmishX m61y = std.get<0>(m61auto);
+        if (m61y.value != 6) return 1240;
+        std.tuple<cppt.LstmishX, cppt.LstmishX> m61hc = std.get<1>(m61auto);
+        if (std.get<0>(m61hc).value != 2) return 1241;
+        if (std.get<1>(m61hc).value != 7) return 1242;
+
+        std.tuple<cppt.LstmishX, std.tuple<cppt.LstmishX, cppt.LstmishX>> m61typed =
+            lstm.forward(x);
+        if (std.get<0>(m61typed).value != 6) return 1243;
+        if (std.get<1>(std.get<1>(m61typed)).value != 7) return 1244;
+    }
+    if (cppt.LstmishX.live() != 0) return 1249;
+
+    // ---- Section M62: implicit C++ argument conversions (1250-1259) -----------------------
+    {
+        cppt.SeqLike m62seq = default;
+        cppt.CountedModule m62module = cppt.CountedModule(2);
+        m62seq.push_back("fc1", m62module);
+        if (cppt.CountedModule.live() != 1) return 1250;
+        if (m62seq.total != 2) return 1251;
+        if (m62seq.names != 3) return 1252;
+
+        m62seq.push_back("act", cppt.CountedModule(1))
+            .push_back("fc2", cppt.CountedModule(4));
+        if (m62seq.total != 7) return 1253;
+        if (m62seq.names != 9) return 1254;
+        if (cppt.CountedModule.live() != 1) return 1255;
+
+        m62seq.push_back(m62module);
+        if (m62seq.total != 9) return 1256;
+        if (m62seq.names != 9) return 1257;
+        if (cppt.CountedModule.live() != 1) return 1258;
+    }
+    if (cppt.CountedModule.live() != 0) return 1259;
+
+    // ---- Section M64: brace positions and derived-to-base arguments (1270-1279) -----------
+    {
+        cppt.M64Opts m64options = cppt.M64Opts(7);
+        if (cppt.m64_brace(5, {4}) != 51) return 1270;
+        if (cppt.m64_brace(5, {4, 3}, m64options) != 59) return 1271;
+        if (cppt.m64_brace(2, 5, {4}) != 251) return 1272;
+        if (cppt.m64_brace(4, 5, {4, 3}, m64options) != 459) return 1273;
+
+        cppt.M64Leaf m64leaf = cppt.M64Leaf(3);
+        cppt.M64CtorConsumer m64consumer = cppt.M64CtorConsumer(m64leaf, 7);
+        if (m64consumer.probe() != 3037) return 1274;
+        if (cppt.m64_free(m64leaf) != 6) return 1275;
+        cppt.M64MemberConsumer m64member = default;
+        if (m64member.probe(&m64leaf) != 3030) return 1276;
+        cppt.M64Base* m64base = &m64leaf;
+        if (m64base->kind() != 3) return 1277;
+        if (m64base->value != 3) return 1278;
+        if (cppt.m64_virtual_ref(m64leaf) != 3) return 1279;
+    }
+
+    // ---- Section M66: heterogeneous brace elements and namespace re-export (1290-1299) ----
+    {
+        cppt.m66_reexport.M66Slice m66slice =
+            cppt.m66_reexport.M66Slice(1, 5);
+        if (m66slice.start != 1 || m66slice.stop != 5) return 1290;
+
+        if (cppt.m66_collect({cppt.m66_reexport.M66Slice(0, 2), 1}) != 303) return 1291;
+        if (cppt.M66Index.live() != 0) return 1292;
+
+        if (cppt.m66_collect({cppt.m66_reexport.M66Slice(1, 3), cppt.M66None()}) != 503)
+            return 1293;
+        if (cppt.M66Index.live() != 0) return 1294;
+
+        if (cppt.m66_collect({1, 2}) != 203) return 1295;
+        if (cppt.M66Index.live() != 0) return 1296;
+    }
+    if (cppt.M66Index.live() != 0) return 1297;
+
+    // ---- Section M67: floating and integer C++ constexpr values (1300-1309) ---------------
+    {
+        double m67double = cppc.m67Double;
+        float m67float = cppc.m67Float;
+        double m67longdouble = cppc.m67LongDouble;
+        int m67int = cppc.m67Int;
+        if (m67double != 6.5) return 1300;
+        if (m67float != 0.5f) return 1301;
+        if (m67longdouble != 1.25) return 1302;
+        if (m67int != 4) return 1303;
+        if (m67double + m67float + m67longdouble != 8.25) return 1304;
+        if (cppc.m67_take_float(m67float) != m67float) return 1305;
+        if (m67double <= (double)cppc.m67Int) return 1306;
+        double m67scale = cppc.M67Statics.kScale;
+        float m67half = cppc.M67Statics.kHalf;
+        int m67count = cppc.M67Statics.kCount;
+        if (m67scale != 4.0) return 1307;
+        if (m67half != 0.5f) return 1308;
+        if (m67count != 3) return 1309;
+    }
+
+    // ---- Section M68: C++ class ternaries construct each arm into the declaration slot (1310-1319) -
+    bool m68false = false;
+    bool m68true = true;
+    {
+        cppt.OpVec m68callFalse = m68false
+            ? cppt.make_opvec(2.0) : cppt.make_opvec(3.0);
+        if (m68callFalse.sum() != 6.0) return 1310;
+        if (cppt.OpVec.live() != 1) return 1311;
+        cppt.OpVec m68callTrue = m68true
+            ? cppt.make_opvec(4.0) : cppt.make_opvec(5.0);
+        if (m68callTrue.sum() != 8.0) return 1312;
+        if (cppt.OpVec.live() != 2) return 1313;
+    }
+    if (cppt.OpVec.live() != 0) return 1314;
+
+    {
+        cppt.OpVec m68ctorFalse = m68false
+            ? cppt.OpVec(6.0) : cppt.OpVec(7.0);
+        if (m68ctorFalse.sum() != 14.0) return 1315;
+        cppt.OpVec m68ctorTrue = m68true
+            ? cppt.OpVec(8.0) : cppt.OpVec(9.0);
+        if (m68ctorTrue.sum() != 16.0) return 1316;
+        if (cppt.OpVec.live() != 2) return 1317;
+    }
+    if (cppt.OpVec.live() != 0) return 1318;
+
+    {
+        if (cppt.consume(m68true ? cppt.Builder(2.0) : cppt.Builder(1.0)) != 20) return 1319;
+    }
+    if (cppt.Builder.live() != 0) return 1319;
+
+    // ---- Section M71: parenthesized ternary condition in a class declaration (1340-1349) ----
+    bool m71condFalse = false;
+    bool m71condTrue = true;
+    {
+        cppt.OpVec m71false = (m71condFalse ? true : false)
+            ? cppt.make_opvec(4.0) : cppt.make_opvec(5.0);
+        if (m71false.sum() != 10.0) return 1340;
+        if (cppt.OpVec.live() != 1) return 1341;
+        cppt.OpVec m71true = (m71condTrue ? true : false)
+            ? cppt.make_opvec(4.0) : cppt.make_opvec(5.0);
+        if (m71true.sum() != 8.0) return 1342;
+        if (cppt.OpVec.live() != 2) return 1343;
+    }
+    if (cppt.OpVec.live() != 0) return 1344;
+
+    // ---- Section M70: temporary lifetime follow-ups and constructor hygiene (1330-1339) -----
+    cppi.reset_counts();
+    {
+        cppi.Tracked m70a = cppi.Tracked(1);
+        if (cppt.total_tracked({m70a, cppi.Tracked(2)}) != 3) return 1330;
+        if (m70a.value() != 1) return 1331;
+        int constructed = cppi.ctor_count() + cppi.copy_count() + cppi.move_count();
+        if (cppi.dtor_count() != constructed - 1) return 1332;
+    }
+    int m70constructed = cppi.ctor_count() + cppi.copy_count() + cppi.move_count();
+    if (cppi.dtor_count() != m70constructed) return 1333;
+
+    cppi.reset_counts();
+    for (int i = 0; i < 3; i = i + 1)
+    {
+        if (cppt.total_tracked({cppi.Tracked(i + 1), cppi.Tracked(i + 2)}) != 2 * i + 3)
+            return 1334;
+        int constructed = cppi.ctor_count() + cppi.copy_count() + cppi.move_count();
+        if (cppi.dtor_count() != constructed) return 1335;
+    }
+    int loopConstructed = cppi.ctor_count() + cppi.copy_count() + cppi.move_count();
+    if (cppi.dtor_count() != loopConstructed) return 1336;
+
+    cppt.M70Counted.reset();
+    if (cppt.m70_take(3) != 3) return 1337;
+    if (cppt.M70Counted.live() != 0
+        || cppt.M70Counted.dtors() != cppt.M70Counted.ctors()) return 1338;
+    {
+        cppt.M70Counted m70local = cppt.m70_make(4);
+        if (m70local.value() != 4 || cppt.M70Counted.live() != 1) return 1339;
+    }
+    if (cppt.M70Counted.live() != 0
+        || cppt.M70Counted.dtors() != cppt.M70Counted.ctors()) return 1339;
+
+    cppbv.M70NoStd m70args = cppbv.M70NoStd(1, 2);
+    if (m70args.first != 1 || m70args.second != 2) return 1339;
+
+    // ---- Section M69: unified C++ foreign identities (1320-1329) --------------------------
+    {
+        cppt.m69.M69Pos m69pos = default;
+        cppt.m69.M69Neg m69neg = default;
+        if (m69pos.n() != 1) return 1320;
+        if (m69neg.n() != -1) return 1321;
+        if (cppt.m69.norm_pos(m69pos) != 1) return 1322;
+        if (cppt.m69.norm_neg(m69neg) != -1) return 1323;
+        if (m69pos.n() != 1 || m69neg.n() != -1) return 1324;
+
+        u8[3] m69raw = { 1, 2, 3 };
+        cppt.m69.M69Bytes m69bytes = cppt.m69.M69Bytes(&m69raw[0], 3);
+        if (m69bytes.size() != 3) return 1325;
+        if (cppt.m69.bytes_as_base(m69bytes) != 3) return 1326;
+        if ((int)m69bytes.count != 3) return 1327;
+        if (m69bytes.marker != 33) return 1328;
+        if (m69pos.marker != 11 || m69neg.marker != 22) return 1329;
+    }
+
+    // ---- Section M72: shared C++ primitive identities (1350-1359) -------------------------
+    {
+        cppt.Box<ulong> m72ul = cppt.m72_make_unsigned_long(17);
+        if (m72ul.get() != 17) return 1350;
+        if (cppt.m72_take_unsigned_long(m72ul) != 17) return 1351;
+
+        cppt.Box<ulong> m72size = cppt.m72_make_size_t(18);
+        if (m72size.get() != 18) return 1352;
+        if (cppt.m72_take_unsigned_long(m72size) != 18) return 1353;
+
+        cppt.Box<u32> m72unsigned = cppt.m72_make_unsigned(19);
+        if (m72unsigned.get() != 19) return 1354;
+
+        cppt.Box<longdouble> m72longdouble = cppt.m72_make_long_double(2.5);
+        if (m72longdouble.get() != 2.5) return 1355;
+
+        std.vector<ulong> m72values = default;
+        m72values.push_back(20);
+        std.vector<ulong> m72roundtrip = cppt.m72_size_t_vector_roundtrip(m72values);
+        if ((int)m72values.size() != 1) return 1356;
+        if (m72values[0] != 20) return 1357;
+        if ((int)m72roundtrip.size() != 1) return 1358;
+        if (m72roundtrip[0] != 20) return 1359;
+    }
+
     return 0;
 }

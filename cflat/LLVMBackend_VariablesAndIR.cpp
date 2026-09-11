@@ -161,14 +161,23 @@ llvm::GlobalVariable* LLVMBackend::CreateGlobalVariable(TypeAndValue typeValue, 
             if (dot != std::string::npos) symbolName = symbolName.substr(dot + 1);
         }
 
-        auto gVar = new llvm::GlobalVariable(
-            *module,
-            destinationType,
-            false, // isConstant
-            llvm::GlobalValue::LinkageTypes::ExternalLinkage,
-            initValue, // Initial value
-            symbolName // Name (bare C symbol for externs)
-        );
+        llvm::GlobalVariable* gVar = nullptr;
+        // A C++ companion may already carry the definition of an inline template static. Reuse
+        // that exact symbol instead of creating LLVM's suffixed duplicate (count.3), which would
+        // split CFlat reads from C++ member functions that reference the unsuffixed symbol.
+        if (externalDecl && !linkageName.empty())
+            if (auto* existing = module->getNamedGlobal(symbolName);
+                existing != nullptr && existing->getValueType() == destinationType)
+                gVar = existing;
+        if (gVar == nullptr)
+            gVar = new llvm::GlobalVariable(
+                *module,
+                destinationType,
+                false, // isConstant
+                llvm::GlobalValue::LinkageTypes::ExternalLinkage,
+                initValue, // Initial value
+                symbolName // Name (bare C symbol for externs)
+            );
 
         if (threadLocal)
             gVar->setThreadLocalMode(llvm::GlobalVariable::GeneralDynamicTLSModel);

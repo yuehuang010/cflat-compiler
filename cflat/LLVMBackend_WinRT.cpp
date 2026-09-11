@@ -2135,6 +2135,16 @@ llvm::Value* LLVMBackend::LowerAliasByPointerArg(const NamedVariable& arg, const
         // The caller's own slot is the borrow. Only an exact type match may be handed over -
         // anything else (a coercion, a literal, a call result) is materialized into a temp,
         // which is a copy, exactly as binding a C++ const-reference to a converted value is.
+        if (arg.Storage != nullptr && !arg.TypeAndValue.Pointer
+            && !arg.TypeAndValue.IsInterface
+            && IsCxxDerivedToBaseValue(arg.TypeAndValue, param))
+        {
+            uint64_t offset = 0;
+            bool inaccessible = false;
+            if (FindCxxBaseOffset(arg.TypeAndValue.TypeName, param.TypeName,
+                                  offset, inaccessible))
+                return EmitCxxBaseAdjust(arg.Storage, offset);
+        }
         if (arg.Storage != nullptr && arg.BaseType == paramTy && !arg.TypeAndValue.Pointer
             && !arg.TypeAndValue.IsInterface)
             return arg.Storage;

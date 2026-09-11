@@ -5453,11 +5453,60 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
         const LLVMBackend::TypedValue& condTv,
         CFlatParser::ExpressionContext* expressionTrueCtx,
         CFlatParser::ConditionalExpressionContext* expressionFalseCtx, ResultUse use,
-        const LLVMBackend::TypeAndValue& outerExpected) {
+        const LLVMBackend::TypeAndValue& outerExpected, llvm::Value* cxxTernaryDeclDest,
+        const std::string& cxxTernaryDeclType) {
         auto* compiler = Compiler(ctx);
         const bool moveInterfaceReturn = compiler->currentFunctionReturnsOwned
             && compiler->currentFunctionReturnTV.IsInterface;
-        if (condTv.value == nullptr) return {};
+
+        // A declaration of a nontrivial C++ class owns the destination slot; each ternary arm is
+        // a possible producer, so the caller claims the state before parsing the condition.
+        const bool cxxTernaryDecl = cxxTernaryDeclDest != nullptr
+            && !cxxTernaryDeclType.empty();
+        size_t cxxTernaryDeclArmsMoved = 0;
+        bool cxxTernaryDeclFailed = false;
+        if (condTv.value == nullptr)
+        {
+            if (cxxTernaryDecl) compiler->pendingCxxTernaryDeclFailed_ = true;
+            return {};
+        }
+
+        auto moveCxxTernaryArmIntoDecl = [&](llvm::Value* armValue, llvm::Value* armStorage,
+                                              const LLVMBackend::OwnedTempMark& armMark) {
+            if (!cxxTernaryDecl) return;
+            llvm::Value* temp = compiler->lastCxxRetTemp_;
+            if (temp == nullptr && armStorage != nullptr)
+            {
+                LLVMBackend::NamedVariable tempNV;
+                tempNV.Primary = armValue;
+                tempNV.Storage = armStorage;
+                tempNV.BaseType = armValue != nullptr ? armValue->getType() : nullptr;
+                tempNV.TypeAndValue.TypeName = cxxTernaryDeclType;
+                if (compiler->IsOwnedTempValue(tempNV)) temp = armStorage;
+            }
+            const bool sameValue = armValue != nullptr
+                && (armValue == compiler->lastCxxRetValue_ || armStorage == temp);
+            auto* declSlot = llvm::dyn_cast_or_null<llvm::AllocaInst>(cxxTernaryDeclDest);
+            auto* tempSlot = llvm::dyn_cast_or_null<llvm::AllocaInst>(temp);
+            const bool sameType = tempSlot != nullptr && declSlot != nullptr
+                && tempSlot->getAllocatedType() == declSlot->getAllocatedType();
+            if (!sameValue || !sameType)
+            {
+                cxxTernaryDeclFailed = true;
+                return;
+            }
+            if (!compiler->EmitCxxCopyOrMoveConstruct(cxxTernaryDeclType, cxxTernaryDeclDest,
+                                                       temp, /*useMove*/ true,
+                                                       "into a ternary declaration"))
+            {
+                cxxTernaryDeclFailed = true;
+                return;
+            }
+            // The source temporary is selected by this arm, so destroy it here. Hoisting it to
+            // the join would either destroy an unselected arm or leave the moved source live.
+            compiler->FlushOwnedTempsSince(armMark, nullptr, nullptr);
+            ++cxxTernaryDeclArmsMoved;
+        };
 
         struct TernaryCallArgumentDepthScope
         {
@@ -5513,6 +5562,11 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
         auto parseTrueArm = [&]() {
             compiler->SwitchToBlock(trueBlock);
             trueMark = compiler->MarkOwnedTemps();
+            if (cxxTernaryDecl)
+            {
+                compiler->lastCxxRetTemp_ = nullptr;
+                compiler->lastCxxRetValue_ = nullptr;
+            }
             LLVMBackend::CastOccurrenceScope armScope(compiler);
             trueOcc = armScope.Id;
             std::optional<DeclExpectedTypeScope> expectedScope;
@@ -5545,6 +5599,7 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
                     trueStorage = load->getPointerOperand();
             trueAlias = trueAlias || compiler->IsAliasValue(trueValue);
             trueTempField = compiler->IsTempFieldValue(trueValue);
+            moveCxxTernaryArmIntoDecl(trueValue, trueStorage, trueMark);
             if (ternaryDepth.IsOutermost() && !TernaryIsBinaryOperand(ctx)
                 && trueValue != nullptr && !outerExpected.IsMove
                 && !(outerExpected.IsOwningSink && compiler->OwningSinkConsumesConcrete(outerExpected)))
@@ -5570,6 +5625,11 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
         auto parseFalseArm = [&]() {
             compiler->SwitchToBlock(falseBlock);
             falseMark = compiler->MarkOwnedTemps();
+            if (cxxTernaryDecl)
+            {
+                compiler->lastCxxRetTemp_ = nullptr;
+                compiler->lastCxxRetValue_ = nullptr;
+            }
             LLVMBackend::CastOccurrenceScope armScope(compiler);
             falseOcc = armScope.Id;
             std::optional<DeclExpectedTypeScope> expectedScope;
@@ -5588,6 +5648,7 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
                     falseStorage = load->getPointerOperand();
             falseAlias = falseAlias || compiler->IsAliasValue(falseValue);
             falseTempField = compiler->IsTempFieldValue(falseValue);
+            moveCxxTernaryArmIntoDecl(falseValue, falseStorage, falseMark);
             if (ternaryDepth.IsOutermost() && !TernaryIsBinaryOperand(ctx)
                 && falseValue != nullptr && !outerExpected.IsMove
                 && !(outerExpected.IsOwningSink && compiler->OwningSinkConsumesConcrete(outerExpected)))
@@ -5641,6 +5702,39 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
             if (!trueDefault || trueEnd != nullptr)
                 compiler->DiscardOwnedTempsSince(trueMark);
             throw;
+        }
+
+        if (cxxTernaryDecl && !cxxTernaryDeclFailed && cxxTernaryDeclArmsMoved == 2)
+        {
+            if (trueEnd != nullptr && cflat_llvm::GetTerminatorOrNull(trueEnd) == nullptr)
+            {
+                compiler->builder->SetInsertPoint(trueEnd);
+                compiler->CreateJump(resumeBlock);
+            }
+            if (falseEnd != nullptr && cflat_llvm::GetTerminatorOrNull(falseEnd) == nullptr)
+            {
+                compiler->builder->SetInsertPoint(falseEnd);
+                compiler->CreateJump(resumeBlock);
+            }
+            compiler->SwitchToBlock(resumeBlock);
+            compiler->pendingCxxTernaryDeclConsumed_ = true;
+            return {};
+        }
+        if (cxxTernaryDecl)
+        {
+            if (trueEnd != nullptr && cflat_llvm::GetTerminatorOrNull(trueEnd) == nullptr)
+            {
+                compiler->builder->SetInsertPoint(trueEnd);
+                compiler->CreateJump(resumeBlock);
+            }
+            if (falseEnd != nullptr && cflat_llvm::GetTerminatorOrNull(falseEnd) == nullptr)
+            {
+                compiler->builder->SetInsertPoint(falseEnd);
+                compiler->CreateJump(resumeBlock);
+            }
+            compiler->SwitchToBlock(resumeBlock);
+            compiler->pendingCxxTernaryDeclFailed_ = true;
+            return {};
         }
 
         // A ternary statement evaluates an arm for side effects only. In particular, both arms
@@ -6304,6 +6398,18 @@ LLVMBackend::TypedValue MainListener::ParseConditionalExpression(
             return result;
         }
 
+        // Claim the declaration destination before parsing the condition. A parenthesized
+        // ternary in the condition recursively enters here and must not steal the outer slot.
+        llvm::Value* cxxTernaryDeclDest = compiler->pendingCxxTernaryDeclDest_;
+        const std::string cxxTernaryDeclType = compiler->pendingCxxTernaryDeclTypeName_;
+        const bool cxxTernaryDecl = cxxTernaryDeclDest != nullptr
+            && !cxxTernaryDeclType.empty();
+        compiler->pendingCxxTernaryDeclDest_ = nullptr;
+        compiler->pendingCxxTernaryDeclTypeName_.clear();
+        auto failCxxTernaryDecl = [&] {
+            if (cxxTernaryDecl) compiler->pendingCxxTernaryDeclFailed_ = true;
+        };
+
         // Grammar: logicalOrExpression ('?' expression ':' conditionalExpression)?
         // - so `expression` is the TRUE branch and `conditionalExpression` is the FALSE branch.
         auto expressionTrueCtx = ctx->expression();
@@ -6317,6 +6423,7 @@ LLVMBackend::TypedValue MainListener::ParseConditionalExpression(
             // Both expression should exist or not exist.
             if ((expressionFalseCtx != nullptr) != (expressionTrueCtx != nullptr))
             {
+                failCxxTernaryDecl();
                 LogErrorContext(ctx, "Conditional expression requires both true and false branches.");
                 return {};
             }
@@ -6330,11 +6437,12 @@ LLVMBackend::TypedValue MainListener::ParseConditionalExpression(
                     && insertBB->getParent() == compiler->currentFunction)
                 {
                     return ParseTernaryBranches(ctx, condTv, expressionTrueCtx, expressionFalseCtx,
-                        use, outerExpected);
+                        use, outerExpected, cxxTernaryDeclDest, cxxTernaryDeclType);
                 }
 
                 // Eager fallback: BOTH arms execute unconditionally, so a deref only sound under
                 // one arm's condition is unsafe here - suppress the same-block moved-null guard.
+                failCxxTernaryDecl();
                 llvm::Value* trueValue  = nullptr;
                 llvm::Value* falseValue = nullptr;
                 bool trueUnsigned = false;
@@ -6456,6 +6564,7 @@ LLVMBackend::TypedValue MainListener::ParseConditionalExpression(
             return condTv;
         }
 
+        failCxxTernaryDecl();
         LogErrorContext(ctx, "Conditional expression has no logical-or sub-expression.");
         return {};
     }
@@ -12807,6 +12916,7 @@ LLVMBackend::NamedVariable MainListener::ParseNewExpression(CFlatParser::NewExpr
                 return {};
             }
             std::vector<llvm::Value*> ctorArgs;
+            std::vector<LLVMBackend::NamedVariable> ctorArgVars;
             std::vector<LLVMBackend::TypeAndValue> ctorArgTypes;
             if (auto* argList = ctx->argumentExpressionList())
                 for (auto* named : argList->argumentNamedExpression())
@@ -12823,6 +12933,7 @@ LLVMBackend::NamedVariable MainListener::ParseNewExpression(CFlatParser::NewExpr
                     ctorArgs.push_back(LoadNamedVariable(nv));
                     ctorArgTypes.push_back(nv.TypeAndValue);
                     TypeUntypedCtorArg(ctorArgTypes.back(), ctorArgs.back());
+                    ctorArgVars.push_back(std::move(nv));
                 }
             std::string why;
             const auto* ctor = compiler->SelectCxxConstructor(typeName, ctorArgTypes, why);
@@ -12838,7 +12949,7 @@ LLVMBackend::NamedVariable MainListener::ParseNewExpression(CFlatParser::NewExpr
                     "'new': cannot compute the size of C++ class '{}'", typeName));
                 return {};
             }
-            compiler->EmitCxxStructorCall(typeName, *ctor, block, ctorArgs);
+            compiler->EmitCxxStructorCall(typeName, *ctor, block, ctorArgs, &ctorArgVars);
             LLVMBackend::NamedVariable result;
             result.TypeAndValue = LLVMBackend::TypeAndValue{ .TypeName = typeName, .Pointer = true };
             result.Primary = block;

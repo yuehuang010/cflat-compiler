@@ -13,10 +13,14 @@
 
 #include <cstdint>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace cflat_cinterop
 {
+    // One CFlat identity for every canonical C++ spelling used by extraction and backend lookup.
+    std::string CxxForeignIdentity(const std::string& spelling);
+
     // Split a canonical std::function<R(P...)> spelling into its return and parameter spellings.
     bool SplitStdFunctionSpelling(const std::string& spelling, std::string& ret,
                                   std::string& params);
@@ -119,8 +123,9 @@ namespace cflat_cinterop
     };
 
     // A callable C++ function template that can be instantiated from CFlat argument types.
-    // Non-type parameters are allowed only when they have defaults; template-template parameters
-    // and non-defaulted non-type parameters are intentionally not published.
+    // A non-defaulted non-type parameter is published only when it is integral or an enumeration,
+    // so CFlat can spell it as an integer literal; template-template parameters, non-type packs
+    // and non-integral non-type parameters are intentionally not published.
     struct RawFunctionTemplate
     {
         enum Kind { Free = 0, StaticMember = 1, InstanceMember = 2 };
@@ -132,6 +137,10 @@ namespace cflat_cinterop
         unsigned minArity = 0;
         unsigned maxArity = 0;
         unsigned typeParameterCount = 0;
+        // One char per template parameter, in order: 'T' type, 'P' type pack,
+        // 'N' non-defaulted integral non-type, 'd' defaulted non-type (SFINAE helper).
+        std::string templateParameterKinds;
+        bool hasParameterPack = false;
         bool isConst = false;
         bool isNoexcept = false;
         int access = 0; // AccessPublic
@@ -252,6 +261,8 @@ namespace cflat_cinterop
         std::string linkageName;
         bool isCompileTimeConstant = false;
         int64_t constantValue = 0;
+        bool isFloatConstant = false;
+        double floatValue = 0.0;
         int access = AccessPublic;
         std::string file;
         int line = 1;
@@ -367,13 +378,20 @@ namespace cflat_cinterop
         int col = 0;
     };
 
-    // An externally-linkable global variable a header declares (`extern int x;`) or a .c file
-    // defines (`int x = 5;`). ctype is the canonical C spelling of the variable's type, consumed
-    // by the same string-based mapper as RawSig param/return types. Bound mutable, C-style.
+    // A global variable a header declares (`extern int x;`) or a .c file defines (`int x = 5;`).
+    // ctype is the canonical C spelling of the variable's type, consumed by the same string-based
+    // mapper as RawSig param/return types. C++ namespace constexpr values carry their qualified
+    // lookup name and folded integer so they can bind without a linker symbol.
     struct RawGlobalVar
     {
         std::string name;
+        std::string qualifiedName;
         std::string ctype;
+        bool isCompileTimeConstant = false;
+        int64_t constantValue = 0;
+        bool isFloatConstant = false;
+        double floatValue = 0.0;
+        bool isCxxConstexpr = false;
         std::string file;
         int line = 1;
         int col = 0;
@@ -476,6 +494,9 @@ namespace cflat_cinterop
         std::vector<RawMacro> macros;
         std::vector<RawFuncMacro> funcMacros;
         std::vector<std::string> includedFiles;  // populated only when req.wantIncludes
+        // Namespace-scope C++ using-directives, as CFlat dotted namespace pairs. The backend
+        // resolves these at lookup time instead of duplicating every nominated declaration.
+        std::vector<std::pair<std::string, std::string>> usingDirectives;
         // Names of generated default-argument wrappers whose declarations or bodies carried
         // parse/Sema errors and were therefore withheld from CodeGen.
         std::vector<std::string> droppedCxxDefaultWrappers;

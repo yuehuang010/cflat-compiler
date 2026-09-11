@@ -14,4 +14,12 @@ namespace cppbv
         ~Owner();
     };
     int sum_owner(Owner o) noexcept;
+
+    // M70: no standard header is needed for an aggregate with an implicit default constructor.
+    // C++20's two-argument T(args) initialization must use the ordinary constructor path.
+    struct M70NoStd
+    {
+        int first;
+        int second;
+    };
 }

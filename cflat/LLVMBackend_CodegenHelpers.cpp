@@ -1711,6 +1711,25 @@ bool LLVMBackend::TypeHasMember(const std::string& typeName, const std::string& 
         return GetWinrtSlot(typeName, memberName) != nullptr;
     }
 
+bool LLVMBackend::HasOnlyCxxDefaultWrappers(const std::string& typeName,
+                                            const std::string& memberName,
+                                            bool isStatic) const
+{
+        const std::string key = isStatic ? typeName + "." + memberName : memberName;
+        auto fn = functionTable.find(key);
+        if (fn == functionTable.end()) return false;
+        bool sawWrapper = false;
+        for (const auto& sym : fn->second)
+        {
+            if (!isStatic
+                && (sym.Parameters.empty() || sym.Parameters[0].TypeName != typeName))
+                continue;
+            if (!sym.UniqueName.starts_with("__cflat_dflt_")) return false;
+            sawWrapper = true;
+        }
+        return sawWrapper;
+}
+
 llvm::Function* LLVMBackend::GetOrCreateMemberwiseCopy(const std::string& typeName)
 {
         if (auto it = memberwiseCopyCache_.find(typeName); it != memberwiseCopyCache_.end())

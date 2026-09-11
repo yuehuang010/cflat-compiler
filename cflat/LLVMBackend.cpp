@@ -4498,6 +4498,7 @@ void LLVMBackend::ResetForReanalysis()
     cxxFunctionOwnerGroup_.clear();
     cxxTypeOwnerGroup_.clear();
     cxxForeignNamespaces_.clear();
+    cxxUsingDirectives_.clear();
     cxxForeignTypeSpellings_.clear();
     cxxFunctionPointerAbiPlans_.clear();
     cxxFunctionPointerAbiRefusals_.clear();
@@ -4621,6 +4622,8 @@ void LLVMBackend::ResetForReanalysis()
     cxxNontrivialRecords_.clear();
     cxxClasses_.clear();
     cxxRecordEntries_.clear();
+    cxxRefusedMemberRebindInFlight_.clear();
+    cxxInheritedRebindInFlight_.clear();
     // Per-analysis ABI facts, keyed by class name / linkage name. A later analysis can reuse a
     // name with a different inheritance layout, so a survivor would shift `this` for a receiver
     // that no longer needs it, or turn a plain call into a vptr load.
@@ -4632,6 +4635,10 @@ void LLVMBackend::ResetForReanalysis()
     // would then construct into storage from a discarded module.
     pendingCxxSretDest_ = nullptr;
     pendingCxxSretTypeName_.clear();
+    pendingCxxTernaryDeclDest_ = nullptr;
+    pendingCxxTernaryDeclTypeName_.clear();
+    pendingCxxTernaryDeclConsumed_ = false;
+    pendingCxxTernaryDeclFailed_ = false;
     lastCxxRetTemp_ = nullptr;
     lastCxxRetValue_ = nullptr;
     // RegisterEncodedClosureType memoizes on this map but writes the encoded closure's backing

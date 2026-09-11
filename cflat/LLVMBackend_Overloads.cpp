@@ -260,7 +260,7 @@ int LLVMBackend::RankIntegerConversion(const std::string& argIdentity, const std
 
 std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> LLVMBackend::ComputeOverloadFunction(
         const std::vector<std::pair<std::vector<NamedVariable>, FunctionSymbol>>& candidates,
-        std::vector<FunctionSymbol>* tiedOut) const
+        std::vector<FunctionSymbol>* tiedOut)
 {
         // One viable candidate and the facts the tie-breaks below read.
         struct Ranked
@@ -420,7 +420,13 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                         && candidate.CxxAbi.valid
                         && paramIndex < candidate.CxxAbi.params.size()
                         && candidate.CxxAbi.params[paramIndex].kind == cflat_cinterop::RawAbiSlot::Indirect;
-                    if (CanImplicitlyConstructCxxClass(arg, *candidateParamItr,
+                    // C++ never applies a USER-DEFINED conversion to the implicit object
+                    // argument of a member call ([over.match.funcs]): `x.slice(0)` must not
+                    // convert x into some other class that happens to have a `slice` member.
+                    const bool cxxReceiverParam = candidate.IsCxx && candidate.IsMethod
+                                               && paramIndex == 0;
+                    if (!cxxReceiverParam
+                        && CanImplicitlyConstructCxxClass(arg, *candidateParamItr,
                                                         cxxByValueParam || cxxIndirectValueParam))
                         result = 1;
                     else if (coreUniqueValueReceiver || rawPointerToCoreUnique || coreUniqueToRawPointer
@@ -431,6 +437,12 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                         result = 0;
                     else if (tmpArg.IsTypeMatch(tmpParam))
                         result = 0;
+                    // A C++ lvalue reference is represented as an alias value in CFlat. A
+                    // derived lvalue binds to a public base reference by a standard conversion;
+                    // lower it from the derived object's storage with the base offset.
+                    else if (tmpParam.IsAlias && !tmpParam.Pointer && !tmpParam.ElemPointer
+                             && IsCxxDerivedToBaseValue(tmpArg, tmpParam))
+                        result = 1;
                     // M6 - a pointer to a C++ class binds to a parameter typed as a PUBLIC base
                     // of it, with the base subobject offset added at the call. Scored as an
                     // implicit conversion so an exact-type overload always wins.
@@ -531,7 +543,13 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                         && candidate.CxxAbi.valid
                         && paramIndex < candidate.CxxAbi.params.size()
                         && candidate.CxxAbi.params[paramIndex].kind == cflat_cinterop::RawAbiSlot::Indirect;
-                    if (CanImplicitlyConstructCxxClass(arg, *candidateParamItr,
+                    // C++ never applies a USER-DEFINED conversion to the implicit object
+                    // argument of a member call ([over.match.funcs]): `x.slice(0)` must not
+                    // convert x into some other class that happens to have a `slice` member.
+                    const bool cxxReceiverParam = candidate.IsCxx && candidate.IsMethod
+                                               && paramIndex == 0;
+                    if (!cxxReceiverParam
+                        && CanImplicitlyConstructCxxClass(arg, *candidateParamItr,
                                                         cxxByValueParam || cxxIndirectValueParam))
                         result = 1;
 
@@ -1367,6 +1385,8 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
         auto funcSym = functionTable.find(functionName);
         if (funcSym == functionTable.end())
         {
+            if (TryBindCxxImplicitArgumentConversions(functionName, arguments))
+                return CreateOverloadedFunctionCall(functionName, arguments, forceRoot, displayName);
             if (std::string refusal = GetCxxBindingRefusal(functionName); !refusal.empty())
                 LogErrorMessage(refusal);
             else if (displayName.empty())
@@ -1480,6 +1500,8 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
 
         if (candidate.Function == nullptr)
         {
+            if (TryBindCxxImplicitArgumentConversions(functionName, arguments))
+                return CreateOverloadedFunctionCall(functionName, arguments, forceRoot, displayName);
             std::string msg = std::format("no overload of '{}' matches the given arguments.\n", shownFunctionName);
 
             // Recover a named-argument diagnostic only from candidates whose parameter names
@@ -1804,6 +1826,7 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                 && candidate.CxxAbi.valid
                 && i < candidate.CxxAbi.params.size()
                 && candidate.CxxAbi.params[i].kind == cflat_cinterop::RawAbiSlot::Indirect;
+            if (candidate.IsCxx && candidate.IsMethod && i == 0) continue;  // receiver: no UDC
             if (!CanImplicitlyConstructCxxClass(matched[i], candidate.Parameters[i],
                                                 cxxByValueParam || cxxIndirectValueParam)) continue;
             if (!MaterializeImplicitCxxClassArgument(matched[i], candidate.Parameters[i]))
@@ -1836,6 +1859,22 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                 && (arg.IsOwningStruct || IsOwningValueStructValue(arg.Primary)
                     || (arg.IsOwningString && !argIsStringValue
                         && arg.TypeAndValue.TypeName != "string"));
+
+            std::string argCxxClassName = arg.TypeAndValue.TypeName;
+            if (argCxxClassName.empty())
+                if (auto* argStruct = llvm::dyn_cast_or_null<llvm::StructType>(
+                        arg.Primary != nullptr ? arg.Primary->getType() : arg.BaseType))
+                    argCxxClassName = argStruct->getName().str();
+            if (inVariadicRange && !arg.TypeAndValue.Pointer
+                && !argCxxClassName.empty()
+                && IsForeignNontrivialCxxClass(argCxxClassName))
+            {
+                LogError(std::format(
+                    "cannot pass non-trivial C++ class '{}' to the variadic '{}' slot of '{}'; "
+                    "bind it to an owner before passing it",
+                    argCxxClassName, "...", diagnosticFunctionName));
+                return nullptr;
+            }
 
             if (inVariadicRange
                 && (arg.IsExplicitMove || IsOwningPtrTempValue(arg.Primary)

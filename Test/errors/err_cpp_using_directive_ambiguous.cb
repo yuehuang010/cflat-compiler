@@ -1,0 +1,8 @@
+import cpp "cpp_interop_tpl.h" cache;
+
+extern int main()
+{
+    expect_error("ambiguous qualified name 'cppt_ambig.same'") {
+        cppt_ambig.same(1);
+    }
+}

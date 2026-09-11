@@ -1649,7 +1649,16 @@ public:
         size_t argumentIndex = 0;
         size_t parameterIndex = 0;
         bool allIntegerLiterals = false;
+        // Non-empty only when every element is the same imported C++ class value. Mixed elements
+        // retain the existing scalar-list diagnostic.
+        std::string cxxElementType;
+        bool hasCxxClassElements = false;
+        bool hasNonCxxElements = false;
+        bool hasMixedElements = false;
         std::vector<NamedVariable> elements;
+        // Replacements for a class list: the contiguous data pointer and element count passed to
+        // the generated wrapper. Scalar lists continue to expand to their original elements.
+        std::vector<NamedVariable> wrapperArguments;
     };
 
     // Lightweight expression result: pairs an LLVM value with its signedness.
@@ -3309,6 +3318,7 @@ private:
         std::string linkageName; // C++ ABI symbol; empty for C
         TypeAndValue ret;
         std::vector<TypeAndValue> params;
+        std::vector<std::string> paramNames;
         std::vector<cflat_cinterop::RawDefaultArg> defaultArgs;
         bool variadic = false;
         bool isCxx = false;
@@ -3338,7 +3348,13 @@ private:
     struct CGlobalEntry
     {
         std::string name;
+        std::string qualifiedName;
         TypeAndValue type;
+        bool isCompileTimeConstant = false;
+        int64_t constantValue = 0;
+        bool isFloatConstant = false;
+        double floatValue = 0.0;
+        bool isCxxConstexpr = false;
         int line = 1;
         int col = 0;
     };
@@ -3485,6 +3501,8 @@ private:
         // typedef-name -> tag aliases (MSG -> tagMSG). Cached so disk-cache hits replay them.
         std::vector<std::pair<std::string, std::string>> recordAliases;
         std::vector<CTypeAliasEntry> typeAliases;
+        // C++ namespace-scope using-directives, replayed before qualified lookup on cache hits.
+        std::vector<std::pair<std::string, std::string>> usingDirectives;
         std::vector<CHeaderDep> deps;
         // M5 companion module: LLVM bitcode holding the C++ definitions Clang emitted for this
         // import group (inline bodies, vtables/RTTI, inline static members). Cached with the
@@ -3512,15 +3530,12 @@ private:
     // the rows it displaces - otherwise the eviction loop is blind to it and an LSP process holding
     // several C++ groups grows with no brake.
     static constexpr size_t kCFileSigBitcodeBytesPerRow = 2048;
-    // A companion blob larger than this is kept in memory but never written to the disk cache: the
-    // JSON entry stores it base64 (+33%), is rewritten whole, and is parsed whole on every check.
-    static constexpr size_t kMaxDiskCachedCxxBitcode = 16u * 1024u * 1024u;
-
     static size_t CFileSigEntryRows(const CFileSigCacheEntry& entry)
     {
         return entry.sigs.size() + entry.functionTemplates.size() + entry.enums.size() + entry.records.size()
              + entry.macros.size() + entry.funcMacros.size() + entry.globals.size()
              + entry.recordAliases.size() + entry.typeAliases.size()
+             + entry.usingDirectives.size()
              + entry.functionPointerAbis.size() + entry.deps.size()
              + entry.cxxBitcode.size() / kCFileSigBitcodeBytesPerRow;
     }
@@ -3707,6 +3722,9 @@ private:
     std::vector<PendingMacroSource> pendingMacroSources_;
     void ProcessPendingMacroSources();
     std::unordered_map<std::string, std::string> namespaceAliasTable;
+    // Namespace -> ordered namespaces nominated by C++ using-directives. The declarations remain
+    // registered only under their real namespace; qualified lookup follows this map on a miss.
+    std::unordered_map<std::string, std::vector<std::string>> cxxUsingDirectives_;
     std::unordered_map<std::string, ReturnBlockEntry> returnBlockTable;
     std::optional<std::vector<AutoReturnSite>> autoReturnCapture; // active when emitting an 'auto' generic instantiation
     std::unordered_map<llvm::Constant*, int32_t> stringLiteralLenByPtr;
@@ -4895,6 +4913,9 @@ private:
     // winrt vtable slot. Own members take priority over operator-> forwarding, so this
     // is the miss test that gates forwarding (own member shadows a forwarded one).
     bool TypeHasMember(const std::string& typeName, const std::string& memberName) const;
+    // True when only C++ default-argument wrappers match, so the real member may still be retried.
+    bool HasOnlyCxxDefaultWrappers(const std::string& typeName, const std::string& memberName,
+                                   bool isStatic) const;
 
     llvm::Function* GetOrCreateMemberwiseCopy(const std::string& typeName);
 
@@ -4962,6 +4983,7 @@ private:
     // frame. Refuse to bind such a function, whether by call or by function pointer.
     void RejectThrowingCxxFunction(const FunctionSymbol& symbol, const std::string& displayName) const;
     static std::string SqueezeCxxSpelling(const std::string& spelling);
+    static std::string StripCxxRecordTag(std::string spelling);
     // One spelling a request (or a batch of requests) instantiates in an import group's TU.
     struct CxxRequestItem
     {
@@ -5017,12 +5039,13 @@ private:
                                     const std::vector<std::string>& explicitArgs,
                                     std::vector<NamedVariable>& arguments,
                                     const std::vector<CxxBraceArgument>& braceArguments,
+                                    std::string& registeredName,
                                     std::string& error);
     bool RequestCxxBraceFunction(const std::string& functionName,
                                  const std::string& ownerType,
                                  const std::string& memberName,
                                  std::vector<NamedVariable>& arguments,
-                                 const std::vector<CxxBraceArgument>& braceArguments,
+                                 std::vector<CxxBraceArgument>& braceArguments,
                                  std::string& error);
     bool RequestCxxBraceConstructor(const std::string& typeName,
                                     std::vector<NamedVariable>& arguments,
@@ -5067,8 +5090,31 @@ private:
                                     const std::string& cacheTag,
                                     CSigEntry& signature,
                                     std::string& error);
+    bool TryBindCxxImplicitDefaultCtor(const std::string& typeName, std::string& error);
+    struct CxxImplicitArgumentCandidate
+    {
+        std::string lookupName;
+        std::string ownerType;
+        std::string ownerSpelling;
+        std::string targetName;
+        std::vector<std::string> parameterTypes;
+        bool instanceMember = false;
+        bool staticMember = false;
+        bool constMember = false;
+        bool isNoexcept = true;
+        std::string file;
+        int line = 1;
+    };
+    std::vector<CxxImplicitArgumentCandidate> CollectCxxImplicitArgumentCandidates(
+        const std::string& functionName, const std::vector<NamedVariable>& arguments);
+    bool EmitCxxImplicitArgumentConversions(
+        const std::string& functionName, const std::vector<NamedVariable>& arguments,
+        const std::vector<CxxImplicitArgumentCandidate>& candidates);
+    bool TryBindCxxImplicitArgumentConversions(const std::string& functionName,
+                                               const std::vector<NamedVariable>& arguments);
     std::string CxxBraceElementSpelling(const CxxBraceArgument& brace,
                                         const std::string& targetParameter) const;
+    std::string CxxBraceContainerElementSpelling(const std::string& parameter);
     static void ExpandCxxBraceArguments(std::vector<NamedVariable>& arguments,
                                         const std::vector<CxxBraceArgument>& braceArguments);
     static void DiscardCxxBraceArguments(std::vector<NamedVariable>& arguments,
@@ -5209,6 +5255,8 @@ private:
     std::string CInteropLongDoubleRefusal() const;
     static bool IsLongDoubleSpelling(const std::string& spelling);
     std::string GetCxxBindingRefusal(const std::string& name) const;
+    void RegisterCxxUsingDirectives(
+        const std::vector<std::pair<std::string, std::string>>& directives);
 
     // Foreign C++ specialization lookup on the INTACT spelling; see the definition for why the
     // general '*'/qualifier stripping must not run first.
@@ -5322,7 +5370,8 @@ private:
                              uint64_t* outLongDoubleWidth = nullptr,
                              bool* outLongDoubleIsIEEEDouble = nullptr,
                              std::string* outTargetTriple = nullptr,
-                             std::vector<cflat_cinterop::RawFunctionTemplate>* outFunctionTemplates = nullptr);
+                             std::vector<cflat_cinterop::RawFunctionTemplate>* outFunctionTemplates = nullptr,
+                             std::vector<std::pair<std::string, std::string>>* outUsingDirectives = nullptr);
 
     // Extract externally-linkable functions a .c file DEFINES, via the clang C++ API. Records
     // are registered up front (struct-by-value). Used by the .c auto-extern path.
@@ -7291,8 +7340,10 @@ public:
         struct BaseRef
         {
             std::string name;
+            std::string canonicalType;
             uint64_t offsetBytes = 0;
             int access = 0;
+            bool isVirtual = false;
         };
         std::vector<BaseRef> bases;
         // Every instance method name callable on this class, own and inherited. Used to clone a
@@ -7462,10 +7513,25 @@ public:
     }
     bool IsForeignCxxClassWithConstructors(const std::string& typeName) const
     {
-        if (typeName.starts_with("std.pair$") || typeName.starts_with("std.optional$"))
-            return false;
+        if (typeName.starts_with("std.pair$")) return false;
         auto it = cxxClasses_.find(typeName);
         auto record = cxxRecordEntries_.find(typeName);
+        const bool hasUserDeclaredCtor = record != cxxRecordEntries_.end()
+            && std::any_of(record->second.members.begin(), record->second.members.end(),
+                [](const auto& member) {
+                    return member.kind == cflat_cinterop::RawCxxMember::Constructor
+                        && !member.isImplicit;
+                });
+        const bool hasNonPublicDefaultCtor = record != cxxRecordEntries_.end()
+            && std::any_of(record->second.members.begin(), record->second.members.end(),
+                [](const auto& member) {
+                    return member.kind == cflat_cinterop::RawCxxMember::Constructor
+                        && member.isDefaultCtor
+                        && member.access != cflat_cinterop::AccessPublic;
+                });
+        const bool hasPublicImplicitDefaultCtor = record != cxxRecordEntries_.end()
+            && record->second.hasDefaultCtor && !record->second.hasDeletedDefaultCtor
+            && !hasUserDeclaredCtor && !hasNonPublicDefaultCtor;
         const bool missingCtor = record != cxxRecordEntries_.end()
             && std::any_of(record->second.members.begin(), record->second.members.end(),
                 [](const auto& member) {
@@ -7476,7 +7542,7 @@ public:
             || (cxxRecords_.count(typeName) != 0 && it != cxxClasses_.end()
                 && (!it->second.constructors.empty()
                     || it->second.refusedMembers.count("__ctor") != 0))
-            || missingCtor;
+            || missingCtor || hasPublicImplicitDefaultCtor;
         return result;
     }
     // C++ permits a scalar argument to initialize a class temporary for a reference or
@@ -7484,7 +7550,7 @@ public:
     // the temporary with the selected imported constructor.
     bool CanImplicitlyConstructCxxClass(const NamedVariable& arg,
                                          const TypeAndValue& param,
-                                         bool cxxByValueParam = false) const;
+                                         bool cxxByValueParam = false);
     bool MaterializeImplicitCxxClassArgument(NamedVariable& arg,
                                              const TypeAndValue& param);
     // Materialize (once per module) the llvm::Function for one structor / assignment operator,
@@ -7571,6 +7637,12 @@ public:
      */
     llvm::Value* pendingCxxSretDest_ = nullptr;
     std::string pendingCxxSretTypeName_;
+    // A C++ class declaration whose RHS is a ternary claims this separately: each arm must
+    // move-construct the declaration slot from its own return temporary before the join.
+    llvm::Value* pendingCxxTernaryDeclDest_ = nullptr;
+    std::string pendingCxxTernaryDeclTypeName_;
+    bool pendingCxxTernaryDeclConsumed_ = false;
+    bool pendingCxxTernaryDeclFailed_ = false;
     // The most recent C++ call result of class type and, for an sret return, its TEMPORARY
     // (already on the owned-temp list). A declaration whose initializer produced exactly that
     // value (a chained call, `r.at(2).get_int64()`) move-constructs its local from the temp, or
@@ -7586,6 +7658,15 @@ public:
     void RegisterCxxClassMembers(const CRecordEntry& r, const std::string& fileForLsp,
                                  const std::string& memberFilter = {});
     bool TryBindRefusedCxxMember(const std::string& typeName, const std::string& memberName);
+    void RequestCxxSpecializationBase(const std::string& derivedName,
+                                      const cflat_cinterop::RawCxxBase& b);
+    bool TryBindRefusedCxxBaseMember(const std::string& typeName, const std::string& memberName);
+    std::string ResolveCxxBaseIdentity(const cflat_cinterop::RawCxxBase& base) const;
+    std::string ResolveCxxBaseIdentity(const CxxClassInfo::BaseRef& base) const;
+    // Re-entry guard for retrying a specialization's refused signature after registration.
+    std::set<std::string> cxxRefusedMemberRebindInFlight_;
+    // Re-entry guard for the inherited-member rebind above (a diamond can reach one base twice).
+    std::set<std::string> cxxInheritedRebindInFlight_;
     // Set by RegisterCSignatures around a C++ declaration so CreateFunctionDeclaration adopts
     // clang's arrangement instead of ComputeAbiRecipe.
     const cflat_cinterop::RawAbi* pendingCxxAbi_ = nullptr;
@@ -8024,7 +8105,7 @@ public:
     // result is empty); without it such a tie falls back to the legacy declaration-order pick.
     std::pair<std::vector<NamedVariable>, FunctionSymbol> ComputeOverloadFunction(
         const std::vector<std::pair<std::vector<NamedVariable>, FunctionSymbol>>& candidates,
-        std::vector<FunctionSymbol>* tiedOut = nullptr) const;
+        std::vector<FunctionSymbol>* tiedOut = nullptr);
 
     // Integer identity ranking for overload resolution (C++ order, ruling 2026-09-10). The two
     // identity helpers return "" when the side is not a plain integer primitive of known identity.
@@ -8966,6 +9047,12 @@ public:
     // namespace member that shadows a global (e.g. Math.tan over the CRT tan) can still
     // reach the root symbol.
     std::string ResolveQualifiedName(const std::string& name, bool forceRoot) const;
+
+    // Resolve a qualified name through namespace-scope C++ using-directives after the exact name
+    // misses. The predicate covers the registry being queried; the walk is transitive and cycle-safe.
+    std::string ResolveThroughUsingDirectives(
+        const std::string& qualified,
+        const std::function<bool(const std::string&)>& predicate) const;
 
     std::string GetNameOfCurrentInsertionBlock();
 

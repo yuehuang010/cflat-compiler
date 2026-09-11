@@ -233,6 +233,12 @@ The extracted declarations (functions, enums, records, macros, globals) are seri
 %USERPROFILE%\.cflat\cheaders\<key>.json
 ```
 
+When a C++ import emits a companion module, its bitcode is stored as the raw
+`<key>.bc` sidecar next to the JSON; the JSON records the sidecar name, byte length, and FNV-1a
+hash. A missing, truncated, or hash-mismatched sidecar invalidates the whole entry, so the
+header is reparsed instead of binding declarations without their bodies; invalidated entries and
+rewrites without companion bitcode remove the stale sidecar.
+
 The `<key>` is an FNV-1a hash of the canonical header path plus every `--c-include` dir,
 `--c-define`, and inline `define` - the same inputs as the in-memory cache key - so a header
 exposed differently under different roots/defines never collides on a stale entry.

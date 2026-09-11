@@ -5321,8 +5321,10 @@ public:
         const LLVMBackend::TypedValue& condTv,
         CFlatParser::ExpressionContext* expressionTrueCtx,
         CFlatParser::ConditionalExpressionContext* expressionFalseCtx,
-        ResultUse use = ResultUse::Value,
-        const LLVMBackend::TypeAndValue& outerExpected = {});
+        ResultUse use,
+        const LLVMBackend::TypeAndValue& outerExpected,
+        llvm::Value* cxxTernaryDeclDest,
+        const std::string& cxxTernaryDeclType);
 
     LLVMBackend::TypedValue ParseConditionalExpression(CFlatParser::ConditionalExpressionContext* ctx,
                                                         ResultUse use = ResultUse::Value);

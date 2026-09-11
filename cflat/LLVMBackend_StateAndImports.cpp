@@ -6,7 +6,6 @@
 #include <llvm/IR/Verifier.h>
 #include <llvm/IR/Dominators.h>
 #include <llvm/Bitcode/BitcodeWriter.h>
-#include <llvm/Support/Base64.h>
 #include <llvm/Bitcode/BitcodeReader.h>
 #include <llvm/Linker/Linker.h>
 #include <llvm/Passes/PassBuilder.h>
@@ -1205,7 +1204,8 @@ bool LLVMBackend::IsNamespace(const std::string& name) const
 {
         for (const auto& frame : std::ranges::reverse_view(stackNamedVariable))
             if (frame.namespaceAliases.count(name)) return true;
-        return namespaceTable.count(name) > 0 || namespaceAliasTable.count(name) > 0;
+        return namespaceTable.count(name) > 0 || namespaceAliasTable.count(name) > 0
+            || ResolveNamespace(name) != name;
     }
 
 bool LLVMBackend::IsImportAlias(const std::string& name) const
@@ -1228,7 +1228,37 @@ std::string LLVMBackend::ResolveNamespace(const std::string& name) const
             if (it != frame.namespaceAliases.end()) return it->second;
         }
         auto it = namespaceAliasTable.find(name);
-        return it != namespaceAliasTable.end() ? it->second : name;
+        if (it != namespaceAliasTable.end()) return it->second;
+
+        // A using-directive can expose a nested namespace through a parent namespace, as in
+        // `namespace torch { using namespace at; }` followed by `torch::indexing::Slice`.
+        if (name.find('.') == std::string::npos) return name;
+        std::vector<std::string> pending{ name };
+        std::unordered_set<std::string> visited{ name };
+        for (size_t i = 0; i < pending.size(); ++i)
+        {
+            const std::string current = pending[i];  // by value: push_back below may reallocate pending
+            for (size_t prefixEnd = current.size(); prefixEnd != std::string::npos; )
+            {
+                const std::string prefix = current.substr(0, prefixEnd);
+                auto directive = cxxUsingDirectives_.find(prefix);
+                if (directive != cxxUsingDirectives_.end())
+                    for (const std::string& nominated : directive->second)
+                    {
+                        const std::string candidate = nominated + current.substr(prefixEnd);
+                        if (candidate != current
+                            && (namespaceTable.count(candidate) != 0
+                                || namespaceAliasTable.count(candidate) != 0))
+                            return candidate;
+                        if (visited.insert(candidate).second) pending.push_back(candidate);
+                    }
+                if (prefixEnd == 0) break;
+                const size_t dot = current.rfind('.', prefixEnd - 1);
+                if (dot == std::string::npos) break;
+                prefixEnd = dot;
+            }
+        }
+        return name;
     }
 
 std::vector<std::string> LLVMBackend::ScopedNameCandidates(const std::string& name,
@@ -1292,6 +1322,16 @@ std::string LLVMBackend::ResolveQualifiedName(const std::string& name) const
 
 std::string LLVMBackend::ResolveQualifiedName(const std::string& name, bool forceRoot) const
 {
+        const auto isPublishedCxxName = [this](const std::string& candidate) {
+            std::string cxxName = candidate;
+            for (size_t pos = 0;
+                 (pos = cxxName.find('.', pos)) != std::string::npos; pos += 2)
+                cxxName.replace(pos, 1, "::");
+            return std::any_of(cxxImportGroups_.begin(), cxxImportGroups_.end(),
+                [&](const CxxImportGroup& group) {
+                    return group.publishedNames.count(cxxName) != 0;
+                });
+        };
         // Bare name referenced inside a namespace body: prefer an enclosing-namespace
         // sibling (e.g. inside "N", a bare "helper" resolves to "N.helper") before
         // falling back to a top-level/global symbol. Walk outward through parent
@@ -1299,14 +1339,18 @@ std::string LLVMBackend::ResolveQualifiedName(const std::string& name, bool forc
         // match wins; if no qualified sibling exists the bare name resolves below.
         if (!forceRoot && !currentNamespace_.empty() && name.find('.') == std::string::npos)
         {
-            if (std::string key = FirstVisibleScopedKey(name, [this](const std::string& c) {
+            if (std::string key = FirstVisibleScopedKey(name, [this, &isPublishedCxxName](const std::string& c) {
                     return dataStructures.count(c) || interfaceTable.count(c)
-                        || functionTable.count(c) || globalNamedVariable.count(c); });
+                        || functionTable.count(c) || globalNamedVariable.count(c)
+                        || cxxRecordEntries_.count(c) || cxxClasses_.count(c)
+                        || cxxCflatToCxxSpelling_.count(c) || isPublishedCxxName(c); });
                 !key.empty())
                 return key;
         }
 
-        if (dataStructures.count(name) || interfaceTable.count(name) || functionTable.count(name))
+        if (dataStructures.count(name) || interfaceTable.count(name) || functionTable.count(name)
+            || cxxRecordEntries_.count(name) || cxxClasses_.count(name)
+            || cxxCflatToCxxSpelling_.count(name))
             return name;
 
         auto dotPos = name.rfind('.');
@@ -1344,8 +1388,71 @@ std::string LLVMBackend::ResolveQualifiedName(const std::string& name, bool forc
             return dataStructures.count(c) != 0 || interfaceTable.count(c) != 0
                 || functionTable.count(c) != 0;
         }, ScopedLookupOptions{ .ResolveFirstComponentAlias = false });
-        return key.empty() ? name : key;
-    }
+        if (!key.empty()) return key;
+
+        const std::string qualified = nsPrefix + "." + lastName;
+        const auto isKnownQualified = [this, &isPublishedCxxName](const std::string& candidate) {
+            return dataStructures.count(candidate) != 0
+                || interfaceTable.count(candidate) != 0
+                || functionTable.count(candidate) != 0
+                || cxxRecordEntries_.count(candidate) != 0
+                || cxxClasses_.count(candidate) != 0
+                || cxxCflatToCxxSpelling_.count(candidate) != 0
+                || isPublishedCxxName(candidate)
+                || cxxFunctionSignatures_.count(candidate) != 0
+                || globalNamedVariable.count(candidate) != 0
+                || HasCxxFunctionTemplate(candidate)
+                || ResolveTypeAlias(candidate) != candidate
+                || !ResolveEnumTypeName(candidate).empty();
+        };
+        const std::string through = ResolveThroughUsingDirectives(qualified, isKnownQualified);
+        return through != qualified || isKnownQualified(qualified) ? through : name;
+}
+
+std::string LLVMBackend::ResolveThroughUsingDirectives(
+        const std::string& qualified,
+        const std::function<bool(const std::string&)>& predicate) const
+{
+        if (qualified.empty() || predicate(qualified)) return qualified;
+        const size_t dot = qualified.rfind('.');
+        if (dot == std::string::npos || dot == 0 || dot + 1 >= qualified.size()) return qualified;
+
+        const std::string namespaceName = qualified.substr(0, dot);
+        const std::string memberName = qualified.substr(dot + 1);
+        std::vector<std::string> pending{ namespaceName };
+        std::unordered_set<std::string> visited{ namespaceName };
+        std::vector<std::string> hits;
+        for (size_t i = 0; i < pending.size(); ++i)
+        {
+            const std::string current = pending[i];  // by value: push_back below may reallocate pending
+            for (size_t prefixEnd = current.size(); prefixEnd != std::string::npos; )
+            {
+                const std::string prefix = current.substr(0, prefixEnd);
+                auto it = cxxUsingDirectives_.find(prefix);
+                if (it != cxxUsingDirectives_.end())
+                    for (const std::string& nominated : it->second)
+                    {
+                        const std::string suffix = current.substr(prefixEnd);
+                        const std::string nominatedNamespace = nominated + suffix;
+                        const std::string candidate = nominatedNamespace + "." + memberName;
+                        if (predicate(candidate)
+                            && std::find(hits.begin(), hits.end(), candidate) == hits.end())
+                            hits.push_back(candidate);
+                        if (visited.insert(nominatedNamespace).second)
+                            pending.push_back(nominatedNamespace);
+                    }
+                if (prefixEnd == 0) break;
+                const size_t dot = current.rfind('.', prefixEnd - 1);
+                if (dot == std::string::npos) break;
+                prefixEnd = dot;
+            }
+        }
+        if (hits.size() > 1)
+            LogError(std::format(
+                "ambiguous qualified name '{}' through using-directives: candidates '{}' and '{}'",
+                qualified, hits[0], hits[1]));
+        return hits.empty() ? qualified : hits.front();
+}
 
 std::string LLVMBackend::GetNameOfCurrentInsertionBlock()
 {
@@ -1800,6 +1907,7 @@ nlohmann::json LLVMBackend::SigToJson(const CSigEntry& e)
         // Raw parameter spellings: RegisterCSignatures retypes a C++ record-pointer parameter out
         // of void* using these, and a warm cache never sees a clang session to re-derive them.
         if (!e.paramSpellings.empty()) j["pspell"] = e.paramSpellings;
+        if (!e.paramNames.empty()) j["pnames"] = e.paramNames;
         if (!e.retSpelling.empty()) j["rspell"] = e.retSpelling;
         if (!e.defaultArgs.empty())
         {
@@ -1826,6 +1934,7 @@ LLVMBackend::CSigEntry LLVMBackend::SigFromJson(const SjVal& j)
         if (j.contains("ps")) for (const auto& p : j["ps"]) e.params.push_back(TvFromJson(p));
         if (j.contains("abi")) e.abi = AbiFromJson(j["abi"]);
         if (j.contains("pspell")) e.paramSpellings = j["pspell"].to_string_vector();
+        if (j.contains("pnames")) e.paramNames = j["pnames"].to_string_vector();
         e.retSpelling = j.value("rspell", std::string{});
         if (j.contains("defaults"))
             for (const auto& d : j["defaults"])
@@ -1838,7 +1947,9 @@ nlohmann::json LLVMBackend::FunctionTemplateToJson(
 {
         return { {"n", t.name}, {"o", t.owner}, {"m", t.memberName},
                  {"c", t.cxxSpelling}, {"k", t.kind}, {"mi", t.minArity},
-                 {"ma", t.maxArity}, {"tp", t.typeParameterCount}, {"cn", t.isConst},
+                 {"ma", t.maxArity}, {"tp", t.typeParameterCount}, {"pp", t.hasParameterPack},
+                 {"tk", t.templateParameterKinds},
+                 {"cn", t.isConst},
                  {"nx", t.isNoexcept}, {"a", t.access}, {"f", t.file},
                  {"ln", t.line}, {"co", t.col} };
     }
@@ -1854,6 +1965,8 @@ cflat_cinterop::RawFunctionTemplate LLVMBackend::FunctionTemplateFromJson(const 
         t.minArity = (unsigned)j.value("mi", (uint64_t)0);
         t.maxArity = (unsigned)j.value("ma", (uint64_t)0);
         t.typeParameterCount = (unsigned)j.value("tp", (uint64_t)0);
+        t.hasParameterPack = j.value("pp", false);
+        t.templateParameterKinds = j.value("tk", std::string{});
         t.isConst = j.value("cn", false);
         t.isNoexcept = j.value("nx", false);
         t.access = j.value("a", 0);
@@ -1885,14 +1998,41 @@ LLVMBackend::CEnumEntry LLVMBackend::EnumFromJson(const SjVal& j)
 
 nlohmann::json LLVMBackend::GlobalToJson(const CGlobalEntry& g)
 {
-        return {{"n", g.name}, {"t", TvToJson(g.type)}, {"ln", g.line}, {"co", g.col}};
-    }
+        nlohmann::json j = {{"n", g.name}, {"t", TvToJson(g.type)},
+                            {"ln", g.line}, {"co", g.col}};
+        if (!g.qualifiedName.empty()) j["qn"] = g.qualifiedName;
+        if (g.isCompileTimeConstant)
+        {
+            j["cn"] = true;
+            if (g.isFloatConstant)
+            {
+                uint64_t fvbits = 0;
+                std::memcpy(&fvbits, &g.floatValue, sizeof(double));
+                j["fc"] = true;
+                j["fvb"] = fvbits;
+            }
+            else
+                j["cv"] = g.constantValue;
+        }
+        if (g.isCxxConstexpr) j["cxce"] = true;
+        return j;
+}
 
 LLVMBackend::CGlobalEntry LLVMBackend::GlobalFromJson(const SjVal& j)
 {
         CGlobalEntry g;
         g.name = j.value("n", std::string{});
+        g.qualifiedName = j.value("qn", std::string{});
         g.type = TvFromJson(j.at("t"));
+        g.isCompileTimeConstant = j.value("cn", false);
+        g.isFloatConstant = j.value("fc", false);
+        if (g.isFloatConstant)
+        {
+            uint64_t fvbits = j.value("fvb", uint64_t{0});
+            std::memcpy(&g.floatValue, &fvbits, sizeof(double));
+        }
+        g.constantValue = j.value("cv", (int64_t)0);
+        g.isCxxConstexpr = j.value("cxce", false);
         g.line = j.value("ln", 1);
         g.col  = j.value("co", 0);
         return g;
@@ -2018,7 +2158,19 @@ nlohmann::json LLVMBackend::CxxStaticVarToJson(const cflat_cinterop::RawCxxStati
 {
         nlohmann::json j = {{"n", v.name}, {"ct", v.ctype}, {"lk", v.linkageName},
                             {"ln", v.line}, {"co", v.col}};
-        if (v.isCompileTimeConstant) { j["cn"] = true; j["cv"] = v.constantValue; }
+        if (v.isCompileTimeConstant)
+        {
+            j["cn"] = true;
+            if (v.isFloatConstant)
+            {
+                uint64_t fvbits = 0;
+                std::memcpy(&fvbits, &v.floatValue, sizeof(double));
+                j["fc"] = true;
+                j["fvb"] = fvbits;
+            }
+            else
+                j["cv"] = v.constantValue;
+        }
         if (!v.file.empty()) j["f"] = v.file;
         if (v.access != 0)   j["ac"] = v.access;
         return j;
@@ -2031,6 +2183,12 @@ cflat_cinterop::RawCxxStaticVar LLVMBackend::CxxStaticVarFromJson(const SjVal& j
         v.ctype       = j.value("ct", std::string{});
         v.linkageName = j.value("lk", std::string{});
         v.isCompileTimeConstant = j.value("cn", false);
+        v.isFloatConstant = j.value("fc", false);
+        if (v.isFloatConstant)
+        {
+            uint64_t fvbits = j.value("fvb", uint64_t{0});
+            std::memcpy(&v.floatValue, &fvbits, sizeof(double));
+        }
         v.constantValue = j.value("cv", (int64_t)0);
         v.file        = j.value("f", std::string{});
         v.line        = j.value("ln", 1);
@@ -2258,7 +2416,15 @@ bool LLVMBackend::TryLoadCHeaderDiskCache(
         namespace fs = std::filesystem;
         std::error_code ec;
         auto cachePath = cacheDir / std::format("{:016x}.json", diskKey);
-        if (!fs::exists(cachePath, ec)) return false;
+        auto sidecarPath = cacheDir / std::format("{:016x}.bc", diskKey);
+        auto cacheMiss = [&]() {
+            fs::remove(sidecarPath, ec);
+            ec.clear();
+            fs::remove(cachePath, ec);
+            ec.clear();
+            return false;
+        };
+        if (!fs::exists(cachePath, ec)) return cacheMiss();
 
         // parser + jsonBuf own the storage that doc/SjVal reference; keep them alive for the
         // whole function. Reads run through SjVal (simdjson DOM); writes still use nlohmann.
@@ -2269,9 +2435,9 @@ bool LLVMBackend::TryLoadCHeaderDiskCache(
         {
             llvm::TimeTraceScope parseScope("CHeaderJsonParse", cachePath.string());
             auto loaded = simdjson::padded_string::load(cachePath.string());
-            if (loaded.error()) return false;
+            if (loaded.error()) return cacheMiss();
             jsonBuf = std::move(loaded.value());
-            if (parser.parse(jsonBuf).get(doc) != simdjson::SUCCESS) return false;
+            if (parser.parse(jsonBuf).get(doc) != simdjson::SUCCESS) return cacheMiss();
             j = SjVal{doc};
         }
 
@@ -2331,14 +2497,26 @@ bool LLVMBackend::TryLoadCHeaderDiskCache(
         // an explicit instantiation DECLARATION (`extern template class basic_ios<char>;`) - that
         // vtable is a strong symbol owned by the library, and a v42 entry carries a duplicate
         // definition of it.
-        if (version != 43) return false;
+        // v45: function templates with trailing parameter packs (unbounded arity) and
+        // namespace-scope using-declaration alias signatures.
+        // v46: dependent constructor patterns are retained in the member list.
+        // v47: C++ namespace-scope using-directives are retained for lookup-time re-export.
+        // v48: function templates carry templateParameterKinds (non-type template arguments).
+        // v49: namespace-scope C++ constexpr globals retain qualified names and folded values.
+        // v50: C++ parameter names survive the header cache for brace-list diagnostics.
+        // v51: C++ companion bitcode moves from inline base64 to a validated raw sidecar.
+        // v52: C++ constexpr namespace/static floating values are cached as IEEE-754 bits.
+        // v53: invalidated entries and no-bitcode rewrites remove stale companion sidecars.
+        // v54: extractor and backend share one C++ foreign identity spelling.
+        // v55: all canonical multi-word C++ primitive spellings share their CFlat identity.
+        if (version != 55) return cacheMiss();
 
         // Accept on mtime match (fast) or content hash match (authoritative on mtime drift).
         auto storedMtime = j.value("mtime", int64_t{-1});
         auto storedHash  = j.value("hash",  uint64_t{0});
         bool mtimeOk = (storedMtime == (int64_t)mtime.time_since_epoch().count());
         bool hashOk  = (storedHash  == contentHash);
-        if (!mtimeOk && !hashOk) return false;
+        if (!mtimeOk && !hashOk) return cacheMiss();
 
         // Any malformed/incompatible field must degrade to a cache miss (reparse), never abort
         // the compiler: the nlohmann accessors throw on a type mismatch, so guard the whole build.
@@ -2368,6 +2546,10 @@ bool LLVMBackend::TryLoadCHeaderDiskCache(
             if (j.contains("typeAliases"))
                 for (const auto& a : j["typeAliases"])
                     entry.typeAliases.push_back(TypeAliasFromJson(a));
+            if (j.contains("usingDirectives"))
+                for (const auto& d : j["usingDirectives"])
+                    entry.usingDirectives.emplace_back(
+                        d.value("from", std::string{}), d.value("to", std::string{}));
             if (j.contains("functionPointerAbis"))
                 for (const auto& p : j["functionPointerAbis"])
                 {
@@ -2378,16 +2560,24 @@ bool LLVMBackend::TryLoadCHeaderDiskCache(
                     if (p.contains("abi")) plan.abi = AbiFromJson(p["abi"]);
                     entry.functionPointerAbis.push_back(std::move(plan));
                 }
-            // Companion module bitcode, base64 in the JSON entry so one file stays self-contained.
+            // Companion module bitcode lives in a validated raw sidecar next to the JSON entry.
             if (j.contains("cxxbc"))
             {
-                std::vector<char> decoded;
-                if (llvm::Error e = llvm::decodeBase64(j.value("cxxbc", std::string{}), decoded))
-                {
-                    llvm::consumeError(std::move(e));
-                    return false;   // corrupt blob: reparse rather than bind undefined symbols
-                }
-                entry.cxxBitcode.assign(decoded.begin(), decoded.end());
+                const SjVal blob = j["cxxbc"];
+                if (!blob.contains("file") || !blob.contains("len") || !blob.contains("hash"))
+                    return cacheMiss();
+                const std::string sidecarName = blob.value("file", std::string{});
+                const std::string expectedName = std::format("{:016x}.bc", diskKey);
+                if (sidecarName != expectedName) return cacheMiss();
+                const uint64_t expectedLength = blob.value("len", uint64_t{0});
+                const uint64_t expectedHash = blob.value("hash", uint64_t{0});
+                auto sidecar = llvm::MemoryBuffer::getFile(sidecarPath.string());
+                if (!sidecar || (*sidecar)->getBuffer().size() != expectedLength)
+                    return cacheMiss();   // missing/truncated blob: reparse rather than bind undefined symbols
+                uint64_t actualHash = 0;
+                if (!HashFileFnv1a(sidecarPath.string(), actualHash) || actualHash != expectedHash)
+                    return cacheMiss();   // corrupt blob: reparse rather than bind undefined symbols
+                entry.cxxBitcode.assign((*sidecar)->getBuffer().data(), (*sidecar)->getBuffer().size());
             }
 
             // A deep (transitive) entry is only fresh if every recorded include is unchanged.
@@ -2400,12 +2590,12 @@ bool LLVMBackend::TryLoadCHeaderDiskCache(
                     dep.path  = dj.value("f", std::string{});
                     dep.mtime = dj.value("mt", int64_t{0});
                     dep.hash  = dj.value("h",  uint64_t{0});
-                    if (!CHeaderDepFresh(dep)) return false;
+                    if (!CHeaderDepFresh(dep)) return cacheMiss();
                     entry.deps.push_back(std::move(dep));
                 }
             }
         }
-        catch (...) { return false; }
+        catch (...) { return cacheMiss(); }
         out = std::move(entry);
         return true;
     }
@@ -2423,7 +2613,7 @@ void LLVMBackend::WriteCHeaderDiskCache(
         if (ec) return;
 
         nlohmann::json j;
-        j["version"] = 43;
+        j["version"] = 55;
         j["mtime"]   = (int64_t)mtime.time_since_epoch().count();
         j["hash"]    = contentHash;
         j["ldw"]     = entry.longDoubleWidth;
@@ -2460,15 +2650,56 @@ void LLVMBackend::WriteCHeaderDiskCache(
         for (const auto& a : entry.typeAliases)
             typeAliases.push_back(TypeAliasToJson(a));
         j["typeAliases"] = typeAliases;
+        nlohmann::json usingDirectives = nlohmann::json::array();
+        for (const auto& d : entry.usingDirectives)
+            usingDirectives.push_back({{"from", d.first}, {"to", d.second}});
+        j["usingDirectives"] = usingDirectives;
         nlohmann::json functionPointerAbis = nlohmann::json::array();
         for (const auto& p : entry.functionPointerAbis)
             functionPointerAbis.push_back({{"sig", p.signature}, {"rt", p.retType},
                                            {"pt", p.paramTypes}, {"abi", AbiToJson(p.abi)}});
         j["functionPointerAbis"] = functionPointerAbis;
 
+        auto tmpPath  = cacheDir / std::format("{:016x}.{}.tmp", diskKey, _getpid());
+        auto destPath = cacheDir / std::format("{:016x}.json", diskKey);
+        const auto sidecarPath = cacheDir / std::format("{:016x}.bc", diskKey);
+        bool sidecarWritten = false;
         if (!entry.cxxBitcode.empty())
-            j["cxxbc"] = llvm::encodeBase64(llvm::ArrayRef<uint8_t>(
-                reinterpret_cast<const uint8_t*>(entry.cxxBitcode.data()), entry.cxxBitcode.size()));
+        {
+            const auto sidecarTmpPath = cacheDir / std::format("{:016x}.{}.bc.tmp", diskKey, _getpid());
+            {
+                std::ofstream f(sidecarTmpPath, std::ios::binary | std::ios::trunc);
+                if (!f.is_open()) return;
+                f.write(entry.cxxBitcode.data(), static_cast<std::streamsize>(entry.cxxBitcode.size()));
+                if (!f)
+                {
+                    f.close();
+                    fs::remove(sidecarTmpPath, ec);
+                    return;
+                }
+            }
+            fs::rename(sidecarTmpPath, sidecarPath, ec);
+            if (ec)
+            {
+                fs::remove(sidecarTmpPath, ec);
+                return;
+            }
+            uint64_t sidecarHash = 0;
+            if (!HashFileFnv1a(sidecarPath.string(), sidecarHash))
+            {
+                fs::remove(sidecarPath, ec);
+                return;
+            }
+            sidecarWritten = true;
+            j["cxxbc"] = {{"file", sidecarPath.filename().string()},
+                           {"len", static_cast<uint64_t>(entry.cxxBitcode.size())},
+                           {"hash", sidecarHash}};
+        }
+        else
+        {
+            fs::remove(sidecarPath, ec);
+            ec.clear();
+        }
 
         // Deep mode only: the transitive include set for strict (transitive) validation.
         if (!entry.deps.empty())
@@ -2479,16 +2710,30 @@ void LLVMBackend::WriteCHeaderDiskCache(
             j["deps"] = deps;
         }
 
-        // Atomic write: PID-stamped temp file renamed over the target.
-        auto tmpPath  = cacheDir / std::format("{:016x}.{}.tmp", diskKey, _getpid());
-        auto destPath = cacheDir / std::format("{:016x}.json", diskKey);
+        // Atomic write: PID-stamped temp file renamed over the target. The sidecar above is
+        // committed first, so a JSON entry never names a sidecar that is not present.
         {
             std::ofstream f(tmpPath);
-            if (!f.is_open()) return;
+            if (!f.is_open())
+            {
+                if (sidecarWritten) fs::remove(sidecarPath, ec);
+                return;
+            }
             f << j;
+            if (!f)
+            {
+                f.close();
+                fs::remove(tmpPath, ec);
+                if (sidecarWritten) fs::remove(sidecarPath, ec);
+                return;
+            }
         }
         fs::rename(tmpPath, destPath, ec);
-        if (ec) fs::remove(tmpPath, ec);
+        if (ec)
+        {
+            fs::remove(tmpPath, ec);
+            if (sidecarWritten) fs::remove(sidecarPath, ec);
+        }
     }
 
 bool LLVMBackend::CompileVcpkgImport(const std::string& importingFilePath,

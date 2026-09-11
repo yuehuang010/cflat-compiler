@@ -191,6 +191,11 @@ namespace cppi
         int twice(int v) noexcept { return v * 2; }
     }
 
+    namespace reexport_src
+    {
+        int linked(int v) noexcept { return v + 400; }
+    }
+
     int may_throw(int v) { return v; }
 
     int read_pair(const Pair* p) noexcept { return p->a + p->b; }

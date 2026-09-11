@@ -982,6 +982,9 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                 else
                 {
                     typeName = typeSpec->getText();
+                    // Resolve namespace-scope C++ using-directives before a lazy foreign-type
+                    // request so `using namespace inner; outer.Type` requests the real type.
+                    typeName = Compiler(declSpecs)->ResolveQualifiedName(typeName);
                     {
                         // A plain dotted name from a C++ import: a class, or a typedef for a
                         // specialization (`std.string`). A miss is silent - the ordinary
@@ -3669,24 +3672,28 @@ bool MainListener::TryDeclareForeignCxxLocal(CFlatParser::InitDeclaratorContext*
 
         auto* initializer = initDeclarator->initializer();
         auto* assign = initializer != nullptr ? initializer->assignmentExpression() : nullptr;
-        const bool isDefaultForm = initializer != nullptr && initializer->Default() != nullptr;
+        // Depending on the initializer alternative selected by ANTLR, `default` may be exposed
+        // as the rule token or as a single assignment-expression child.
+        const bool isDefaultForm = initializer != nullptr
+            && (initializer->Default() != nullptr || initializer->getText() == "default");
         auto* ctorArgs = assign != nullptr ? ForeignCxxConstructArgs(assign, typeName) : nullptr;
         auto* moveExpr = assign != nullptr ? TopLevelMoveExpression(assign) : nullptr;
 
         /*
-         * A record that is trivial on every axis (default construction, copy, destruction) is a
-         * plain value type. Clang still DECLARES an implicit copy constructor for such an
-         * aggregate as soon as anything returns it by value - a postfix `operator++(T&, int)` is
-         * enough - and that lone implicit entry must not turn `T x = default;` or
-         * `T x = <expression>;` into a constructor call. Only the explicit `T(args)` and
-         * `move <T>` spellings still need the C++ construction path here.
+         * A trivially-copyable record can be stored from a value or reference result without a
+         * C++ copy-constructor symbol. Preserve the fully-trivial fast path, including `default`
+         * and no-initializer forms. A record with default member initializers can have a nontrivial
+         * default constructor while its copy remains a legal bitwise copy, so its non-default,
+         * non-direct-`T(args)` initializers use the ordinary value path too.
          */
-        if (ctorArgs == nullptr && moveExpr == nullptr)
+        if (ctorArgs == nullptr && moveExpr == nullptr
+            && !compiler->IsForeignNontrivialCxxClass(typeName))
         {
             const auto* trivial = compiler->GetCxxClassInfo(typeName);
-            if (trivial != nullptr && trivial->hasTrivialDefaultCtor && trivial->hasTrivialCopyCtor
-                && trivial->hasTrivialDtor && !trivial->hasDeletedDefaultCtor
-                && !compiler->IsForeignNontrivialCxxClass(typeName))
+            const bool fullyTrivial = trivial != nullptr && trivial->hasTrivialDefaultCtor
+                && trivial->hasTrivialCopyCtor && trivial->hasTrivialDtor
+                && !trivial->hasDeletedDefaultCtor;
+            if (fullyTrivial || (initializer != nullptr && !isDefaultForm))
                 return false;
         }
 
@@ -3734,6 +3741,9 @@ cxx_dtor_ready:
         // ---- `= default`, or no initializer at all: the default constructor ----------------
         if (initializer == nullptr || isDefaultForm)
         {
+            std::string implicitCtorError;
+            compiler->TryBindCxxImplicitDefaultCtor(typeName, implicitCtorError);
+            if (!implicitCtorError.empty()) LogErrorContext(direct, implicitCtorError);
             const auto* ctor = compiler->FindCxxDefaultCtor(typeName);
             if (ctor == nullptr)
             {
@@ -3810,9 +3820,9 @@ cxx_dtor_ready:
                             }
                             LLVMBackend::NamedVariable elementVar = elementNV;
                             elementVar.Primary = elementValue;
+                            elementVar.TypeAndValue.VariableName.clear();  // positional, see below
                             elementVar.Storage = nullptr;
                             elementVar.BaseType = elementValue->getType();
-                            elementVar.TypeAndValue.VariableName.clear();
                             elementVar.IsRvalue = true;
                             brace.elements.push_back(std::move(elementVar));
                         }
@@ -3856,6 +3866,9 @@ cxx_dtor_ready:
                 argVar.Storage = nullptr;
                 argVar.BaseType = argValue ? argValue->getType() : nullptr;
                 argVar.IsRvalue = true;
+                // A positional argument keeps its source variable's name here; the wrapper call
+                // would read it as a named argument (`T(l1, l2)` -> "named argument 'l1'").
+                argVar.TypeAndValue.VariableName.clear();
                 ctorArguments.push_back(std::move(argVar));
             }
             if (!braceArguments.empty())
@@ -3906,11 +3919,22 @@ cxx_dtor_ready:
                     self.TypeAndValue.TypeName = typeName;
                     self.TypeAndValue.Pointer = true;
                     self.IsRvalue = true;
+                    // The wrapper takes class arguments by value, and a by-value C++ class must
+                    // be addressable for its copy/move constructor: restore each argument's
+                    // address (and prvalue move marker) from its twin.
                     std::vector<LLVMBackend::NamedVariable> wrapperArguments;
                     wrapperArguments.reserve(ctorArguments.size() + 1);
                     wrapperArguments.push_back(self);
-                    wrapperArguments.insert(wrapperArguments.end(), ctorArguments.begin(),
-                                            ctorArguments.end());
+                    for (size_t ai = 0; ai < ctorArguments.size(); ++ai)
+                    {
+                        LLVMBackend::NamedVariable argVar = ctorArguments[ai];
+                        if (ai < ctorArgumentAddresses.size())
+                        {
+                            argVar.Storage = ctorArgumentAddresses[ai].Storage;
+                            argVar.IsExplicitMove = ctorArgumentAddresses[ai].IsExplicitMove;
+                        }
+                        wrapperArguments.push_back(std::move(argVar));
+                    }
                     compiler->SetCurrentDebugLocation(line);
                     compiler->CreateOverloadedFunctionCall(wrapperName, wrapperArguments);
                     return true;
@@ -4038,17 +4062,65 @@ cxx_dtor_ready:
 
         // A non-member C++ operator can also return this class by value. Let its normal call
         // path construct directly into the declared slot, just as a direct function call does.
+        // The armed slot is taken by the FIRST call returning T, so it is only safe when no
+        // operand is itself a call (`a * b`, `-a`): in `make_v(1.0) * 4.0` or `(a + b) * c` the
+        // inner call would construct into the slot and the outer result would be lost. Those
+        // spellings take the temporary-then-move path below instead.
+        // A ternary has two independent control-flow arms. Do not arm the ordinary first-call
+        // slot for it: ParseTernaryBranches moves each arm's own return temporary into the slot.
+        const bool ternaryInit = assign->conditionalExpression() != nullptr
+            && assign->conditionalExpression()->Question() != nullptr;
+        const bool armedOperator = !ternaryInit && assign->getText().find('(') == std::string::npos;
         compiler->lastCxxRetTemp_ = nullptr;
         compiler->lastCxxRetValue_ = nullptr;
-        compiler->pendingCxxSretDest_ = slot;
-        compiler->pendingCxxSretTypeName_ = typeName;
+        compiler->pendingCxxTernaryDeclConsumed_ = false;
+        compiler->pendingCxxTernaryDeclFailed_ = false;
+        if (ternaryInit)
+        {
+            compiler->pendingCxxTernaryDeclDest_ = slot;
+            compiler->pendingCxxTernaryDeclTypeName_ = typeName;
+        }
+        else if (armedOperator)
+        {
+            compiler->pendingCxxSretDest_ = slot;
+            compiler->pendingCxxSretTypeName_ = typeName;
+        }
         auto rightNV = ParseAssignmentExpressionNamed(assign);
-        const bool consumed = compiler->pendingCxxSretDest_ == nullptr;
+        const bool consumed = armedOperator && compiler->pendingCxxSretDest_ == nullptr;
+        const bool ternaryConsumed = ternaryInit && compiler->pendingCxxTernaryDeclConsumed_;
+        const bool ternaryFailed = ternaryInit && compiler->pendingCxxTernaryDeclFailed_;
         compiler->pendingCxxSretDest_ = nullptr;
         compiler->pendingCxxSretTypeName_.clear();
-        if (consumed) return true;
-        if (rightNV.TypeAndValue.TypeName == typeName && !rightNV.TypeAndValue.Pointer
-            && rightNV.Primary != nullptr)
+        compiler->pendingCxxTernaryDeclDest_ = nullptr;
+        compiler->pendingCxxTernaryDeclTypeName_.clear();
+        compiler->pendingCxxTernaryDeclConsumed_ = false;
+        compiler->pendingCxxTernaryDeclFailed_ = false;
+        if (ternaryFailed)
+        {
+            compiler->lastCxxRetTemp_ = nullptr;
+            compiler->lastCxxRetValue_ = nullptr;
+            badInit(assign);
+            return true;
+        }
+        if (consumed || ternaryConsumed)
+        {
+            if (ternaryConsumed)
+            {
+                compiler->lastCxxRetTemp_ = nullptr;
+                compiler->lastCxxRetValue_ = nullptr;
+            }
+            return true;
+        }
+        // Only the OUTERMOST call's temporary may be moved into the slot: a value assembled from
+        // several call results (a PHI of two temporaries) is not that temporary.
+        // An operator result reaches here as a bare struct value whose type name may be unset,
+        // so the slot's LLVM type is the identity check for the outermost call's temporary.
+        const bool outermostCxxTemp = compiler->lastCxxRetTemp_ != nullptr
+            && rightNV.Primary != nullptr && rightNV.Primary == compiler->lastCxxRetValue_
+            && slot != nullptr && rightNV.Primary->getType() == slot->getAllocatedType();
+        if (outermostCxxTemp
+            || (rightNV.TypeAndValue.TypeName == typeName && !rightNV.TypeAndValue.Pointer
+                && rightNV.Primary != nullptr && compiler->lastCxxRetTemp_ == nullptr))
         {
             if (compiler->lastCxxRetTemp_ != nullptr)
                 compiler->EmitCxxCopyOrMoveConstruct(typeName, slot, compiler->lastCxxRetTemp_,
@@ -4856,6 +4928,10 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                 // The initializer's RESULT VALUE, before any decl-site coercion. Ownership
                 // adoption is answered from this by value identity, never from a sticky flag.
                 llvm::Value* srcPrimary = nullptr;
+                // A nontrivial C++ class return lives in this sret temporary until the end of
+                // the full expression. Auto declarations must move-construct from it rather
+                // than copy its handle and let the temporary destroy the resource.
+                llvm::Value* srcCxxRetTemp = nullptr;
                 bool srcIsMove = false;
                 bool coreUniqueImplicitDefault = false;
                 bool srcMovedFromSlot = false;
@@ -5253,6 +5329,12 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                             // rightNV scope so the fat->thin narrowing gate below can name them.
                             {
                                 auto rightNV = ParseAssignmentExpressionNamed(assignmentExpression);
+                                if (compiler->lastCxxRetTemp_ != nullptr
+                                    && rightNV.Storage == compiler->lastCxxRetTemp_
+                                    && !rightNV.TypeAndValue.Pointer
+                                    && compiler->IsForeignNontrivialCxxClass(
+                                        rightNV.TypeAndValue.TypeName))
+                                    srcCxxRetTemp = compiler->lastCxxRetTemp_;
                                 ApplyCallResultBorrowProvenance(compiler, rightNV);
                                 initializerSourceNV = rightNV;
                                 haveInitializerSourceNV = true;
@@ -6774,6 +6856,9 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                         if (right->getType()->isStructTy()
                             && (srcIsNamedSlot || srcIsIndirectOwningLvalue)
                             && !srcIsMove
+                            // A foreign C++ sret temp must stay live until its C++ move constructor
+                            // reads it below; its destructor will clean up the moved-from object.
+                            && srcCxxRetTemp == nullptr
                             && !srcIsAlias
                             && srcInferredTypeName == typeAndValue.TypeName
                             && compiler->IsOwningValueType(typeAndValue.TypeName))
@@ -6981,7 +7066,19 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                         }
                         else if (!bindAliasReference)
                         {
-                            auto* initStore = compiler->CreateAssignment(right, alloc, srcIsUnsigned);
+                            bool movedCxxReturn = false;
+                            if (srcCxxRetTemp != nullptr
+                                && !typeAndValue.Pointer
+                                && right->getType()->isStructTy()
+                                && srcInferredTypeName == typeAndValue.TypeName
+                                && compiler->IsForeignNontrivialCxxClass(typeAndValue.TypeName))
+                            {
+                                movedCxxReturn = compiler->EmitCxxCopyOrMoveConstruct(
+                                    typeAndValue.TypeName, alloc, srcCxxRetTemp, true,
+                                    std::format("into local '{}'", name).c_str());
+                            }
+                            auto* initStore = movedCxxReturn
+                                ? nullptr : compiler->CreateAssignment(right, alloc, srcIsUnsigned);
                             if (coreUniqueImplicitDefault && initStore != nullptr)
                                 initStore->setMetadata(
                                     LLVMBackend::kIfaceDeclSplatMD,

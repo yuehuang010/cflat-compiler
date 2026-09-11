@@ -5,5 +5,12 @@ extern int main()
     expect_error("no instantiation of C++ function template 'cppt.twice' accepts these argument types") {
         cppt.twice("hello");
     }
+    expect_error("no instantiation of C++ function template 'cppt.twice<int, double>'") {
+        cppt.twice<int, double>(1);
+    }
+    expect_error("cannot pass non-trivial C++ class 'cppt.Box$int' to the variadic '...' slot") {
+        cppt.Box<int> box = cppt.Box<int>(7);
+        printf("%d", box);
+    }
     return 0;
 }

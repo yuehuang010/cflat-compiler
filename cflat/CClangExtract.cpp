@@ -64,16 +64,109 @@
 #include "llvm/Support/TimeProfiler.h"
 
 #include <set>
+#include <array>
 #include <algorithm>
 #include <cctype>
 #include <chrono>
 #include <string_view>
 #include <unordered_set>
 #include <format>
+#include <limits>
 
 namespace cflat_cinterop
 {
     using namespace clang;
+
+    std::string CxxForeignIdentity(const std::string& spelling)
+    {
+        // Keep multi-word primitive template arguments aligned with the CFlat spellings emitted
+        // by CxxSpellingForCflatType (for example vector<unsigned char> -> vector$u8).
+        std::string normalized = spelling;
+        for (const char* tag : { "class ", "struct ", "union ", "enum " })
+            if (normalized.starts_with(tag))
+            {
+                normalized.erase(0, std::strlen(tag));
+                break;
+            }
+        for (const auto& [from, to] : std::array<std::pair<std::string_view, std::string_view>, 17>{
+                 std::pair{ "unsigned long long", "u64" },
+                 std::pair{ "signed long long", "i64" },
+                 std::pair{ "unsigned long", "ulong" },
+                 std::pair{ "signed long", "long" },
+                 std::pair{ "long double", "longdouble" },
+                 std::pair{ "unsigned short", "u16" },
+                 std::pair{ "signed short", "short" },
+                 std::pair{ "unsigned int", "u32" },
+                 std::pair{ "signed int", "int" },
+                 std::pair{ "unsigned char", "u8" },
+                 std::pair{ "signed char", "i8" },
+                 std::pair{ "unsigned", "u32" },
+                 std::pair{ "long long", "i64" },
+                 std::pair{ "char8_t", "c8" },
+                 std::pair{ "char16_t", "c16" },
+                 std::pair{ "char32_t", "c32" },
+                 std::pair{ "wchar_t", "wchar" } })
+        {
+            for (size_t pos = 0; (pos = normalized.find(from, pos)) != std::string::npos; )
+            {
+                const bool leftOk = pos == 0
+                    || (!std::isalnum((unsigned char)normalized[pos - 1])
+                        && normalized[pos - 1] != '_');
+                const size_t end = pos + from.size();
+                const bool rightOk = end == normalized.size()
+                    || (!std::isalnum((unsigned char)normalized[end]) && normalized[end] != '_');
+                if (leftOk && rightOk)
+                {
+                    normalized.replace(pos, from.size(), to);
+                    pos += to.size();
+                }
+                else
+                    pos = end;
+            }
+        }
+        std::string out;
+        for (size_t i = 0; i < normalized.size(); ++i)
+        {
+            const bool negativeValue = normalized[i] == '-' && i + 1 < normalized.size()
+                                    && std::isdigit((unsigned char)normalized[i + 1]);
+            const bool positiveValue = std::isdigit((unsigned char)normalized[i]);
+            if (negativeValue || positiveValue)
+            {
+                const size_t valueStart = negativeValue ? i + 1 : i;
+                size_t valueEnd = valueStart;
+                while (valueEnd < normalized.size()
+                       && std::isdigit((unsigned char)normalized[valueEnd]))
+                    ++valueEnd;
+                size_t before = negativeValue ? i : valueStart;
+                while (before > 0 && std::isspace((unsigned char)normalized[before - 1])) --before;
+                size_t after = valueEnd;
+                while (after < normalized.size() && std::isspace((unsigned char)normalized[after])) ++after;
+                const bool isValueArgument = before > 0
+                    && (normalized[before - 1] == '<' || normalized[before - 1] == ',')
+                    && (after == normalized.size() || normalized[after] == ',' || normalized[after] == '>');
+                if (isValueArgument)
+                {
+                    out += negativeValue ? ".n" : ".";
+                    out.append(normalized, valueStart, valueEnd - valueStart);
+                    i = valueEnd - 1;
+                    continue;
+                }
+            }
+            if (normalized[i] == ':' && i + 1 < normalized.size() && normalized[i + 1] == ':')
+            { out += '.'; ++i; continue; }
+            if (normalized[i] == '<' || normalized[i] == ',') { out += '$'; continue; }
+            if (normalized[i] == '>') continue;
+            if (std::isspace((unsigned char)normalized[i])) continue;
+            if (normalized[i] == '*') { out += "ptr"; continue; }
+            if (normalized[i] == '&') { out += "ref"; continue; }
+            if (std::isalnum((unsigned char)normalized[i]) || normalized[i] == '_'
+                || normalized[i] == '.' || normalized[i] == '$')
+                out += normalized[i];
+            else
+                out += '_';
+        }
+        return out;
+    }
 
     struct CxxExtractionStageTimer
     {
@@ -197,7 +290,11 @@ namespace cflat_cinterop
         std::string CanonicalSpelling(const ASTContext& ctx, QualType qt)
         {
             QualType canonical = qt.getCanonicalType();
-            std::string s = canonical.getAsString(ctx.getPrintingPolicy());
+            PrintingPolicy policy(ctx.getLangOpts());
+            policy.FullyQualifiedName = true;
+            policy.SuppressScope = false;
+            policy.PrintAsCanonical = true;
+            std::string s = canonical.getAsString(policy);
             // C++ prints an enum type as a bare name ("cppi::Mode"), where C prints "enum X".
             // The type mapper keys the int decay on the tag, so restore it.
             if (canonical->getAs<EnumType>() != nullptr && s.rfind("enum ", 0) != 0
@@ -212,28 +309,6 @@ namespace cflat_cinterop
             std::replace(n.begin(), n.end(), ':', '.');
             while (n.find("..") != std::string::npos) n.erase(n.find(".."), 1);
             return n;
-        }
-
-        std::string CxxForeignIdentity(std::string spelling)
-        {
-            for (const char* tag : { "class ", "struct ", "union ", "enum " })
-                if (spelling.starts_with(tag)) { spelling.erase(0, std::strlen(tag)); break; }
-            std::string out;
-            for (size_t i = 0; i < spelling.size(); ++i)
-            {
-                if (spelling[i] == ':' && i + 1 < spelling.size() && spelling[i + 1] == ':')
-                { out += '.'; ++i; continue; }
-                if (spelling[i] == '<' || spelling[i] == ',') { out += '$'; continue; }
-                if (spelling[i] == '>') continue;
-                if (std::isspace((unsigned char)spelling[i])) continue;
-                if (std::isalnum((unsigned char)spelling[i]) || spelling[i] == '_'
-                    || spelling[i] == '.' || spelling[i] == '$')
-                    out += spelling[i];
-                else if (spelling[i] == '*') out += "ptr";
-                else if (spelling[i] == '&') out += "ref";
-                else out += '_';
-            }
-            return out;
         }
 
         // Clang spells an unnamed enclosing scope as "(anonymous namespace)", "(unnamed struct
@@ -390,6 +465,19 @@ namespace cflat_cinterop
             return v.isSigned() ? v.getSExtValue() : static_cast<long long>(v.getZExtValue());
         }
 
+        double ApFloatToDouble(const llvm::APFloat& value, bool* losesInfo = nullptr)
+        {
+            // convertToDouble() requires IEEEdouble semantics. This also rounds x87 or other
+            // long-double formats instead of asserting when the target uses wider semantics.
+            llvm::APFloat converted = value;
+            bool ignored = false;
+            const llvm::APFloat::opStatus status = converted.convert(
+                llvm::APFloat::IEEEdouble(), llvm::APFloat::rmNearestTiesToEven, &ignored);
+            if (losesInfo != nullptr)
+                *losesInfo = (status & llvm::APFloat::opInexact) != 0;
+            return converted.convertToDouble();
+        }
+
         std::string NormPath(std::string p)
         {
             std::replace(p.begin(), p.end(), '\\', '/');
@@ -507,6 +595,7 @@ namespace cflat_cinterop
             std::vector<MacroProbe> probes;   // index == probe slot
             std::unordered_set<unsigned> emittedProbes;  // probe slots that produced a RawMacro
             std::unordered_set<std::string> emittedGlobals;  // dedup global var redeclarations by name
+            std::unordered_set<const UsingDecl*> emittedUsingDecls;
             std::unordered_set<std::string> emittedOpaqueForward;  // dedup opaque forward-decl records by tag
             std::unordered_set<const RecordDecl*> emittedDefinedRecords;
             std::unordered_set<std::string> emittedRequestedRecords;
@@ -562,6 +651,10 @@ namespace cflat_cinterop
             if (!qt->isRecordType() || !qt->isIncompleteType()) return;
             const auto* cxx = qt->getAsCXXRecordDecl();
             if (cxx == nullptr || !llvm::isa<ClassTemplateSpecializationDecl>(cxx)) return;
+            const auto* specialization = llvm::cast<ClassTemplateSpecializationDecl>(cxx);
+            // Nested helper specializations can contain state-machine members whose explicit
+            // instantiation is not required for the enclosing type's ABI and may be ill-formed.
+            if (specialization->getSpecializedTemplate()->getDeclContext()->isRecord()) return;
             std::string spelling = CanonicalSpelling(ctx, qt);
             if (std::find(st.incompleteCxxTypes.begin(), st.incompleteCxxTypes.end(), spelling)
                     == st.incompleteCxxTypes.end())
@@ -709,7 +802,7 @@ namespace cflat_cinterop
             const auto* rt = t->getAs<RecordType>();
             if (rt == nullptr) return {};
             if (rt->getDecl()->getDefinition() != nullptr) return {};
-            return t.getAsString(ctx.getPrintingPolicy());
+            return CanonicalSpelling(ctx, t);
         }
 
         const CXXRecordDecl* CompleteNonDependentCxxRecord(const CXXRecordDecl* rd)
@@ -739,9 +832,18 @@ namespace cflat_cinterop
             {
                 SourceLocation loc = d->getLocation();
                 if (loc.isInvalid()) return false;
-                // Macro-generated declarations (for example ATen's Tensor operators) have an
-                // expansion location in the including stub; bind their spelling header instead.
-                if (loc.isMacroID()) loc = sm.getSpellingLoc(loc);
+                // Macro-generated declarations (for example ATen's Tensor operators) normally
+                // have a spelling location in the defining header. Macro arguments can instead
+                // resolve to a pseudo-file such as `<scratch space>`; use the expansion header
+                // in that case so the in-scope filter does not drop a real declaration.
+                if (loc.isMacroID())
+                {
+                    SourceLocation spelling = sm.getSpellingLoc(loc);
+                    PresumedLoc spellingPl = sm.getPresumedLoc(spelling);
+                    const char* spellingFile = spellingPl.isValid() ? spellingPl.getFilename() : nullptr;
+                    loc = spellingFile != nullptr && spellingFile[0] != '<'
+                        ? spelling : sm.getExpansionLoc(loc);
+                }
                 PresumedLoc pl = sm.getPresumedLoc(loc);
                 if (pl.isInvalid()) return false;
                 file = pl.getFilename() ? pl.getFilename() : "";
@@ -791,24 +893,43 @@ namespace cflat_cinterop
                 if (md == nullptr && fd->getStorageClass() == SC_Static) return true;
 
                 unsigned typeParameterCount = 0;
+                std::string templateParameterKinds;
                 for (const NamedDecl* tp : *ftd->getTemplateParameters())
                 {
                     const auto* typeParam = llvm::dyn_cast<TemplateTypeParmDecl>(tp);
                     if (typeParam != nullptr)
                     {
-                        if (typeParam->isParameterPack()) return true;
                         ++typeParameterCount;
+                        templateParameterKinds += typeParam->isParameterPack() ? 'P' : 'T';
                         continue;
                     }
                     // SFINAE helpers such as fmt::to_string's enable_if are non-type
                     // parameters with a default value. They need no explicit CFlat argument.
                     const auto* nonTypeParam = llvm::dyn_cast<NonTypeTemplateParmDecl>(tp);
-                    if (nonTypeParam == nullptr || !nonTypeParam->hasDefaultArgument()) return true;
+                    if (nonTypeParam == nullptr || nonTypeParam->isParameterPack()) return true;
+                    if (nonTypeParam->hasDefaultArgument())
+                    {
+                        templateParameterKinds += 'd';
+                        continue;
+                    }
+                    // A non-defaulted non-type parameter must be spellable from CFlat, which
+                    // only writes integer literals (std::get<0>, a fixed slot index, ...).
+                    if (!nonTypeParam->getType()->isIntegralOrEnumerationType()) return true;
+                    templateParameterKinds += 'N';
                 }
 
                 std::string file;
                 int line = 1, col = 0;
-                if (!LocOf(fd, file, line, col)) return true;
+                if (!LocOf(fd, file, line, col))
+                {
+                    // A NAMESPACE-SCOPE function template declared outside the bound header dirs
+                    // is still callable by its qualified CFlat spelling (`std.get<0>(t)` from
+                    // libc++'s <tuple>). Publish it so namespace member lookup can reach it.
+                    // MEMBER templates stay in-scope-only: they arrive with their owning record,
+                    // and an out-of-scope owner is not bound in the first place.
+                    if (md != nullptr) return true;
+                    if (!LocOfRaw(fd, file, line, col)) return true;
+                }
                 RawFunctionTemplate result;
                 result.kind = md == nullptr ? RawFunctionTemplate::Free
                     : md->isStatic() ? RawFunctionTemplate::StaticMember
@@ -826,12 +947,17 @@ namespace cflat_cinterop
                     result.cxxSpelling.replace(pos, 1, "::");
                     pos += 2;
                 }
-                result.minArity = (unsigned)fd->getNumParams();
-                result.maxArity = result.minArity;
+                const unsigned declaredArity = (unsigned)fd->getNumParams();
+                result.hasParameterPack = declaredArity > 0
+                    && llvm::isa<PackExpansionType>(fd->getParamDecl(declaredArity - 1)->getType());
+                result.minArity = declaredArity - (result.hasParameterPack ? 1u : 0u);
+                result.maxArity = result.hasParameterPack
+                    ? std::numeric_limits<unsigned>::max() : result.minArity;
                 while (result.minArity > 0
                        && fd->getParamDecl(result.minArity - 1)->hasDefaultArg())
                     --result.minArity;
                 result.typeParameterCount = typeParameterCount;
+                result.templateParameterKinds = std::move(templateParameterKinds);
                 result.isConst = md != nullptr && !md->isStatic() && md->isConst();
                 result.isNoexcept = DeclIsNoexcept(fd);
                 result.access = md == nullptr ? AccessPublic : MapAccess(md->getAccess());
@@ -849,6 +975,11 @@ namespace cflat_cinterop
                 // but CodeGen's ABI arranger cannot inspect it safely.
                 if (fd == nullptr || fd->isInvalidDecl() || fd->getReturnType()->isUndeducedType())
                     return true;
+                // The PATTERN of a function template is a FunctionDecl too. Its signature can be
+                // entirely non-dependent (`template <int N> int nth_of(const vector<int>&)`), so
+                // the dependent-type gate below misses it. Publishing it as a plain function
+                // produces a call to a symbol that is never instantiated - link error at best.
+                if (fd->getDescribedFunctionTemplate() != nullptr) return true;
                 if (!st.req.cxxFunctionWrapperNames.empty()
                     && (!fd->getIdentifier()
                         || std::find(st.req.cxxFunctionWrapperNames.begin(),
@@ -910,6 +1041,119 @@ namespace cflat_cinterop
                 if (st.req.cxxMode && !fd->isVariadic())
                     st.abiWork.emplace_back(st.out.sigs.size(), fd);
                 st.out.sigs.push_back(std::move(sig));
+                return true;
+            }
+
+            /*
+             * A namespace-scope using-declaration (`namespace torch { using at::manual_seed; }`)
+             * re-exports a function under a SECOND qualified name. Clang keeps one FunctionDecl,
+             * owned by the original namespace, so the ordinary walk only ever publishes
+             * `at.manual_seed`; the alias name the header advertises would not resolve. Publish a
+             * second signature that differs only in `name` - the linkage name stays the target's,
+             * because the alias adds no symbol of its own. Member using-declarations are NOT
+             * handled here: those re-expose a base member and CollectCxxMembers already reads the
+             * shadow's access.
+             */
+            bool VisitUsingShadowDecl(UsingShadowDecl* usd)
+            {
+                if (!st.req.cxxMode || usd == nullptr || usd->isInvalidDecl()) return true;
+                if (usd->getDeclContext()->isRecord()) return true;
+                auto* target = llvm::dyn_cast<FunctionDecl>(usd->getTargetDecl());
+                if (target == nullptr || llvm::isa<CXXMethodDecl>(target)) return true;
+                const std::string aliasName = CxxQualifiedName(usd);
+                if (!IsValidDottedName(aliasName)) return true;
+                auto filteredWhy = [&]() {
+                    if (target->isInvalidDecl()) return std::string("declaration is invalid");
+                    if (target->getReturnType()->isUndeducedType())
+                        return std::string("return type is undeduced");
+                    if (target->getDescribedFunctionTemplate() != nullptr)
+                        return std::string("target is a function-template pattern");
+                    if (!st.req.cxxFunctionWrapperNames.empty()
+                        && (!target->getIdentifier()
+                            || std::find(st.req.cxxFunctionWrapperNames.begin(),
+                                         st.req.cxxFunctionWrapperNames.end(),
+                                         target->getNameAsString())
+                                   == st.req.cxxFunctionWrapperNames.end()))
+                        return std::string("target was not requested by the wrapper filter");
+                    if (!target->getIdentifier())
+                        return std::string("target has no bindable name");
+                    if (target->getDeclContext()->isRecord())
+                        return std::string("target is a member function");
+                    if (target->getStorageClass() == SC_Static
+                        || !target->hasExternalFormalLinkage())
+                        return std::string("target is not externally linkable");
+                    if (st.req.definitionsOnly && !target->isThisDeclarationADefinition())
+                        return std::string("target is not defined in this translation unit");
+                    if (st.req.cxxMode && target->getType()->isDependentType())
+                        return std::string("target has a dependent type");
+                    std::string file;
+                    int line = 1;
+                    int col = 0;
+                    if (!LocOfRaw(target, file, line, col))
+                        return std::string("target has no valid source location");
+                    if (st.req.requireInScope && !PathInScope(file, st.normDirs))
+                        return std::string("target is outside the requested scope");
+                    const std::string targetName = CxxQualifiedName(target);
+                    if (target->isInAnonymousNamespace() || !IsValidDottedName(targetName))
+                        return std::string("target name is not a valid CFlat qualified name");
+                    return std::string("target was filtered by C++ extraction rules");
+                };
+                auto reportFiltered = [&](const std::string& why) {
+                    if (st.req.verbose)
+                        std::cout << "[verbose]   C++ using-declaration " << aliasName
+                                  << " not bound: " << why << "\n";
+                };
+                const size_t before = st.out.sigs.size();
+                VisitFunctionDecl(target);
+                if (st.out.sigs.size() != before + 1)
+                {
+                    if (st.req.verbose) reportFiltered(filteredWhy());
+                    return true;
+                }
+                if (st.out.sigs.back().name == aliasName) return true;
+                // VisitFunctionDecl already queued this slot's ABI work against `target`; renaming
+                // in place publishes the alias without a duplicate of the target's own signature.
+                st.out.sigs.back().name = aliasName;
+                st.out.sigs.back().qualifiedName = aliasName;
+                return true;
+            }
+
+            // The shadows a using-declaration introduces are IMPLICIT decls, which the recursive
+            // visitor skips; reach them from the explicit UsingDecl instead.
+            bool VisitUsingDecl(UsingDecl* ud)
+            {
+                if (ud == nullptr || !st.emittedUsingDecls.insert(ud).second) return true;
+                for (UsingShadowDecl* shadow : ud->shadows()) VisitUsingShadowDecl(shadow);
+                return true;
+            }
+
+            // A namespace-scope using-directive makes the nominated namespace visible without
+            // creating aliases for its declarations. Preserve that relationship for lookup-time
+            // resolution; function-local and anonymous-namespace directives are not exportable.
+            bool VisitUsingDirectiveDecl(UsingDirectiveDecl* ud)
+            {
+                if (!st.req.cxxMode || ud == nullptr || ud->isInvalidDecl()) return true;
+                const auto* owner = llvm::dyn_cast<NamespaceDecl>(ud->getDeclContext());
+                const NamespaceDecl* nominated = ud->getNominatedNamespace();
+                if (owner == nullptr || nominated == nullptr || owner->isAnonymousNamespace()
+                    || nominated->isAnonymousNamespace())
+                    return true;
+                for (const DeclContext* dc = owner; dc != nullptr; dc = dc->getParent())
+                    if (const auto* ns = llvm::dyn_cast<NamespaceDecl>(dc);
+                        ns != nullptr && ns->isAnonymousNamespace())
+                        return true;
+
+                SourceLocation loc = ud->getLocation();
+                if (loc.isInvalid()) return true;
+                if (loc.isMacroID()) loc = sm.getSpellingLoc(loc);
+                if (sm.isInMainFile(loc)) return true;
+                std::string file; int line = 1, col = 0;
+                if (!LocOf(ud, file, line, col)) return true;
+
+                const std::string from = CxxQualifiedName(owner);
+                const std::string to = CxxQualifiedName(nominated);
+                if (IsValidDottedName(from) && IsValidDottedName(to))
+                    st.out.usingDirectives.emplace_back(from, to);
                 return true;
             }
 
@@ -1194,7 +1438,14 @@ namespace cflat_cinterop
                                 const auto* smd = llvm::dyn_cast<CXXMethodDecl>(spec);
                                 if (smd == nullptr || !smd->hasBody()) continue;
                                 templateExtras.insert(smd);
-                                methodList.push_back(smd);
+                                if (listedMethods.insert(smd).second) methodList.push_back(smd);
+                            }
+                            // Keep a dependent constructor pattern visible to the backend. A
+                            // variadic constructor may be served by its generated wrapper.
+                            if (constructorTemplate && dependent)
+                            {
+                                templateExtras.insert(pattern);
+                                if (listedMethods.insert(pattern).second) methodList.push_back(pattern);
                             }
                         }
                         if (!st.req.emitDefinitions && (!allDefaulted && !constructorTemplate))
@@ -1215,7 +1466,17 @@ namespace cflat_cinterop
                             if (lendScope) sema.TUScope = nullptr;
                             const auto* smd = result == TemplateDeductionResult::Success
                                 ? llvm::dyn_cast_or_null<CXXMethodDecl>(specialization) : nullptr;
-                            if (smd == nullptr) continue;
+                            if (smd == nullptr)
+                            {
+                                // Do not silently lose a dependent constructor: the backend can
+                                // report its refusal or defer a variadic wrapper until use.
+                                if (constructorTemplate)
+                                {
+                                    templateExtras.insert(pattern);
+                                    if (listedMethods.insert(pattern).second) methodList.push_back(pattern);
+                                }
+                                continue;
+                            }
                             templateExtras.insert(smd);
                             if (listedMethods.insert(smd).second) methodList.push_back(smd);
                             continue;
@@ -1486,13 +1747,31 @@ namespace cflat_cinterop
                     if (vd->isConstexpr() && vd->getInit() != nullptr)
                     {
                         Expr::EvalResult result;
-                        if (vd->getInit()->EvaluateAsInt(result, ctx) && result.Val.isInt())
+                        if (vd->getInit()->EvaluateAsRValue(result, ctx) && result.Val.isInt())
                         {
                             RawCxxStaticVar sv;
                             sv.name = vd->getNameAsString();
                             sv.ctype = CanonicalSpelling(ctx, vd->getType());
                             sv.isCompileTimeConstant = true;
                             sv.constantValue = ApsIntToLongLong(result.Val.getInt());
+                            sv.access = MapAccess(vd->getAccess());
+                            LocOfRaw(vd, sv.file, sv.line, sv.col);
+                            rec.staticVars.push_back(std::move(sv));
+                            continue;
+                        }
+                        if (result.Val.isFloat())
+                        {
+                            RawCxxStaticVar sv;
+                            sv.name = vd->getNameAsString();
+                            sv.ctype = CanonicalSpelling(ctx, vd->getType());
+                            sv.isCompileTimeConstant = true;
+                            sv.isFloatConstant = true;
+                            bool losesInfo = false;
+                            sv.floatValue = ApFloatToDouble(result.Val.getFloat(), &losesInfo);
+                            if (losesInfo && st.req.verbose)
+                                std::cout << "[verbose]   C++ static member "
+                                          << vd->getQualifiedNameAsString()
+                                          << " rounded long double to double (loss of precision)\n";
                             sv.access = MapAccess(vd->getAccess());
                             LocOfRaw(vd, sv.file, sv.line, sv.col);
                             rec.staticVars.push_back(std::move(sv));
@@ -1786,11 +2065,27 @@ namespace cflat_cinterop
                     }
                 }
                 const bool pairValue = nameOverride.starts_with("std.pair$");
-                if (!nameOverride.empty() && !pairValue)
+                if (!nameOverride.empty() && !pairValue && !flattened)
                 {
-                    rec.fields.clear();
-                    rec.layoutRefusal.clear();
-                    EmitBlobStorage(rec);
+                    bool hasPublicField = false;
+                    const size_t nestedStart = st.out.records.size();
+                    if (rec.layoutRefusal.empty())
+                    {
+                        CollectFields(rd, rec.name, rec);
+                        hasPublicField = std::any_of(rec.fields.begin(), rec.fields.end(),
+                            [](const RawField& field) {
+                                return !field.isBitfield && field.access == AccessPublic
+                                    && !field.name.starts_with("__anon");
+                            });
+                    }
+                    if (!hasPublicField)
+                    {
+                        st.out.records.erase(st.out.records.begin() + nestedStart,
+                                             st.out.records.end());
+                        rec.fields.clear();
+                        rec.layoutRefusal.clear();
+                        EmitBlobStorage(rec);
+                    }
                 }
                 else if (!flattened) CollectFields(rd, rec.name, rec);
                 st.out.records.push_back(std::move(rec));
@@ -1811,7 +2106,10 @@ namespace cflat_cinterop
                                 const auto* base = b.getType()->getAsCXXRecordDecl();
                                 if (base == nullptr || base->getDefinition() == nullptr) continue;
                                 CXXRecordDecl* def = base->getDefinition();
-                                EmitDefinedRecord(def, std::string(), true);
+                                const std::string baseType = CanonicalSpelling(ctx, b.getType());
+                                EmitDefinedRecord(def, baseType.empty()
+                                                       ? std::string()
+                                                       : CxxForeignIdentity(baseType), true);
                                 emitBases(def);
                             }
                         };
@@ -1964,6 +2262,11 @@ namespace cflat_cinterop
                         VisitFunctionDecl(llvm::cast<FunctionDecl>(decl));
                         return;
                     }
+                    if (auto* ud = llvm::dyn_cast<UsingDecl>(decl))
+                    {
+                        VisitUsingDecl(ud);
+                        return;
+                    }
                     if (auto* dc = llvm::dyn_cast<DeclContext>(decl))
                         for (Decl* child : dc->decls()) walk(child);
                 };
@@ -2037,6 +2340,71 @@ namespace cflat_cinterop
             bool HarvestGlobalVar(VarDecl* vd)
             {
                 if (!vd->isFileVarDecl()) return true;            // locals, params, members
+
+                // Namespace-scope C++ constexpr variables have internal linkage by default, so
+                // they are not externally linkable even though their values are usable in a
+                // caller. Bind folded integer and floating-point initializers.
+                const bool cxxConstexpr = st.req.cxxMode
+                    && !vd->isStaticDataMember()
+                    && (vd->isConstexpr()
+                        || (vd->isInline() && vd->getType().isConstQualified()))
+                    && vd->getInit() != nullptr;
+                if (cxxConstexpr)
+                {
+                    std::string file; int line = 1, col = 0;
+                    if (!LocOf(vd, file, line, col)) return true;
+                    const std::string qualified = CxxQualifiedName(vd);
+                    if (!IsValidDottedName(qualified))
+                    {
+                        if (st.req.verbose)
+                            std::cout << "[verbose]   C++ namespace variable " << qualified
+                                      << " not bound: name is not a valid CFlat qualified name\n";
+                        return true;
+                    }
+                    if (!st.emittedGlobals.insert(qualified).second) return true;
+
+                    Expr::EvalResult result;
+                    const Expr* init = vd->getInit();
+                    const bool evaluated = !init->containsErrors() && !init->isValueDependent()
+                        && init->EvaluateAsRValue(result, ctx);
+                    if (evaluated && result.Val.isInt())
+                    {
+                        RawGlobalVar g;
+                        g.name = vd->getNameAsString();
+                        g.qualifiedName = qualified;
+                        g.ctype = CanonicalSpelling(ctx, vd->getType().getUnqualifiedType());
+                        g.isCompileTimeConstant = true;
+                        g.constantValue = ApsIntToLongLong(result.Val.getInt());
+                        g.isCxxConstexpr = true;
+                        g.file = file; g.line = line; g.col = col;
+                        st.out.globals.push_back(std::move(g));
+                    }
+                    else if (evaluated && result.Val.isFloat())
+                    {
+                        RawGlobalVar g;
+                        g.name = vd->getNameAsString();
+                        g.qualifiedName = qualified;
+                        g.ctype = CanonicalSpelling(ctx, vd->getType().getUnqualifiedType());
+                        g.isCompileTimeConstant = true;
+                        g.isFloatConstant = true;
+                        bool losesInfo = false;
+                        g.floatValue = ApFloatToDouble(result.Val.getFloat(), &losesInfo);
+                        if (losesInfo && st.req.verbose)
+                            std::cout << "[verbose]   C++ namespace variable " << qualified
+                                      << " rounded long double to double (loss of precision)\n";
+                        g.isCxxConstexpr = true;
+                        g.file = file; g.line = line; g.col = col;
+                        st.out.globals.push_back(std::move(g));
+                    }
+                    else if (st.req.verbose)
+                    {
+                        const char* why = "initializer is not an integer or floating constant expression";
+                        std::cout << "[verbose]   C++ namespace variable " << qualified
+                                  << " not bound: " << why << "\n";
+                    }
+                    return true;
+                }
+
                 if (vd->getStorageClass() == SC_Static) return true;  // internal linkage
                 if (!vd->hasExternalFormalLinkage()) return true;
                 if (vd->getType()->isFunctionType()) return true; // not a data symbol
@@ -2549,7 +2917,7 @@ namespace cflat_cinterop
                 {
                     if (st.req.verbose)
                         std::cout << "[verbose]   skipped dependent function-pointer ABI type '"
-                                  << t.getAsString(ctx.getPrintingPolicy()) << "'\n";
+                                  << CanonicalSpelling(ctx, t) << "'\n";
                     continue;
                 }
                 if (ProtoHasIncompleteRecord(fptPtr)) continue;

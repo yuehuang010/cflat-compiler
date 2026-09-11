@@ -319,6 +319,9 @@ LLVMBackend::DeclTypeAndValue ForwardRefScanner::ParseDeclarationSpecifiers(CFla
                 {
                     std::string specText = canonicalTypeName.empty()
                         ? typeSpec->getText() : canonicalTypeName;
+                    // Resolve namespace-scope C++ using-directives before a lazy foreign-type
+                    // request so `using namespace inner; outer.Type` requests the real type.
+                    specText = compiler->ResolveQualifiedName(specText);
                     {
                         std::string cxxError;
                         compiler->TryRequestCxxType(specText, {}, specText, cxxError);

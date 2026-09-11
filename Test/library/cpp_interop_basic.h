@@ -760,6 +760,22 @@ namespace cppi
     int nested_inner_dtors() noexcept;
     int nested_outer_dtors() noexcept;
 
+    // M40: a namespace-scope using-declaration re-exports a free function under a SECOND
+    // qualified name. libtorch is built this way - `namespace torch { using at::manual_seed; }` -
+    // and the alias name is the only one the documentation ever spells.
+    namespace reexport_src
+    {
+        inline int seeded(int v) noexcept { return v + 40; }
+        int linked(int v) noexcept;
+    }
+
+    namespace reexport
+    {
+        using reexport_src::seeded;   // inline, defined in this header
+        using reexport_src::linked;   // out-of-line, defined in cpp_interop_basic.cpp
+        using cppi::inner::twice;     // re-export across a sibling namespace
+    }
+
     /*
      * Explicit instantiation DECLARATION of an all-inline polymorphic class template. The
      * specialization has no key function, but its vtable belongs to the translation unit that

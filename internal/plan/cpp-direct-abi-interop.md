@@ -860,20 +860,274 @@ Eigen -> libtorch; spikes under scratch/ladder/). Landed on master, in order:
   (libc++ basic_ios<char>) are left to the owning library instead of a strong copy per
   companion module; an imported C++ class uses its own destructor as-is (the synthesized full
   destructor tore fields down a second time). Cache v43. Fixture rows 1010-1016.
-State (working tree, 2026-09-11): scratch/ladder/torch/ t1-t6 as before plus t7 (nn::Linear +
-torch::optim::SGD + at::mse_loss, 200 steps, loss 6.35 -> 0.004) and t8 (OutputArchive write /
-save_to, InputArchive load_from / read) - all compile, link against libtorch and print the
-expected values; test.sh Release 893/0/8. Open: `at.mul(g, lr)` with a bare double needs the
-explicit c10.Scalar(lr) spelling; t4-class compiles spend ~100 s in stage-2 parses for
-member-signature type requests (batching per class is the next perf item); the auto-instantiate
-pass trips a static_assert in ATen/ops/avg_pool2d_meta.h and recovers through the
-autoInstantiateCxxTypes=false retry at the cost of a second ~10 s parse; class-template
-specializations collapsing to one CFlat identity is a design question (distinct `$` identities
-would change the record-name convention); a ctor call mixing a class argument with an int
-literal emits the literal at i8 width; `short` parameters get an i8 argument
-(internal/issue/p2/cpp-short-ctor-arg-lowered-to-i8.md); torch::save/load are variadic function
-templates and stay unbound (t8 uses the archive classes they wrap); postfix operator++(int)
-unextracted by ruling.
+- Round 6 (2026-09-12, working tree, uncommitted): C++ structor integer arguments coerced to
+  the extracted parameter width (`Tagged<short>(7)` was i8 against i16; mixed class + literal
+  ctor args the same), fixture M38 1020-1029, p2 issue deleted. Explicit template arguments on
+  C++ calls honoured (`t.item<double>()` silently bound the non-template `item()` and splatted a
+  c10::Scalar into printf's varargs); non-trivial C++ class values into C varargs are now a
+  LogError; fixture M39 1030-1035 + err_cpp_template_no_match.cb. Function templates with a
+  trailing parameter pack bind (`torch::save/load`), header cache 43 -> 44 -> 45, M39b 1036-1039;
+  t8 now uses torch.save/torch.load. Namespace-scope using-declarations re-exported
+  (`torch::manual_seed` = `using at::manual_seed`), refused BASE members retried from the derived
+  receiver (`Tensor::sizes()` on TensorBase), fixture M42 1040-1048. New rungs t9 (2-layer MLP,
+  Adam, XOR) and t10 (randn/view/stack/softmax/argmax/narrow/operator[]). `std.optional$` removed
+  from the C++ construction-gate exclusion and template converting constructors bound through the
+  generated placement wrapper, so `x.slice(0, 1, 3, 1)` takes ints for `std::optional<int64_t>`
+  (M44 1070-1073). Stage-1 requests batch the owner with its member-signature types and nested
+  helper specializations stay lazy (avg_pool2d_meta.h static_assert retry gone); measured wall
+  time unchanged within noise (t4 ~112 s, t7 ~90-99 s). NOT landed: the IListRef change
+  (constructor patterns over dependent typedefs retained through both stages, so `at.cat`
+  takes a `c10.IListRef<at.Tensor>`; fixture M43 1060-1062) regressed `x.slice((long)0)` on
+  master ("cannot initialize C++ class 'at.Tensor' from this expression") once combined with
+  the std::optional fix, which only fires for classes with an EMPTY constructor list; the patch
+  is kept as scratch/cxE.patch and in worktree ../cflat-cxB (branch wip/cxB) for a retry.
+- Round 7 (2026-09-12, working tree, uncommitted): dependent-typedef constructor patterns
+  retained (cxE retry): `c10::IListRef<Tensor>` binds both its `const unboxed_type&` (ArrayRef)
+  and deduced variadic (`const std::vector<Tensor>&`) constructors, so `at.cat(tl, 0)` and
+  `at.cat(parts, 0)` run (M43 1060-1062); the earlier `x.slice((long)0)` regression was overload
+  ranking applying a user-defined conversion to the IMPLICIT OBJECT ARGUMENT (`x` converted to
+  `ArrayRef<Tensor>` to reach `ArrayRef::slice` while `Tensor::slice` was still refused) - all
+  three `CanImplicitlyConstructCxxClass` sites now skip parameter 0 of a C++ instance member;
+  header cache 45 -> 46. A refused member whose default-argument wrappers were registered is now
+  retried (`HasOnlyCxxDefaultWrappers`, M45 1090-1091; p3 issue deleted). Int literal into a
+  `std::optional<int64_t>` through the template converting constructor: the literal was stored in
+  its narrow type while the wrapper read the constructor's nominal `long`, so `x.slice(0, 1, 3)`
+  (and, depending on binding order, `x.slice(0, 1, 3, 1)`) returned an empty tensor; the scalar is
+  now cast to the referred type before the temp (M46 1080-1083; p2 issue deleted). Positional
+  arguments in the `T x = T(a, b)` declaration form carried their variable names into the
+  variadic/brace constructor wrapper call and were read as named arguments (`Sequential(l1, l2)`
+  -> "named argument 'l1'"); names are cleared and the wrapper call gets each argument's
+  address twin so a by-value class argument can be copy-constructed (M47 1100-1101), which makes
+  `torch.nn.Sequential(l1, relu, l2)` construct, forward and expose parameters(). New rungs t11
+  (Conv2d with forced weights, max_pool2d, flatten; hand-checked 612/198), t12 (Sequential +
+  ReLU trained on XOR with Adam, loss 0.278 -> 0) and t13 (torch::data TensorDataset, size(),
+  get(), Example<> fields). Requested class-template specializations with a public field keep
+  their fields instead of collapsing to the private `__cxx_storage` blob (`ex.data` on
+  `Example<Tensor, NoTarget>`; M48 1110-1111). The make_data_loader SIGSEGV (rc 139) was an
+  `auto`-declared nontrivial C++ local bit-copying the sret temporary's handle and destroying
+  both; an inferred local now move-constructs from the temporary, and a layout-only nested type
+  request is upgraded when a later explicit use needs definitions (M49 1120-1129); rung t14
+  reads two batches of two through `loader->begin()`/`*it`/`it++`/`it != end`; rung t16 trains
+  Sequential over the loader end to end (manual at::stack per batch, slice into x/y, Adam, 4
+  batches per epoch, loss 0.27 -> 8e-8). Namespace-scope using-DIRECTIVES are now followed at
+  qualified lookup (`namespace torch { using namespace at; }`): the extractor records (from, to)
+  pairs, the backend keeps an ordered per-namespace map and resolves a miss transitively and
+  cycle-safely with direct-hit precedence and an ambiguity LogError; applied at the postfix
+  qualified-member site and before lazy foreign-type requests in both declaration-specifier
+  passes; header cache 46 -> 47; M50 1130-1139 + err_cpp_using_directive_ambiguous.cb; t10 spelled
+  with `torch.cat`/`torch.softmax`/`torch.stack`/`torch.sum` runs (probe/t10_torch.cb). Toward
+  `ds.map(Stack<>)`: a namespace-scope alias whose default template argument canonicalizes
+  differently (`TensorExample` = `Example<Tensor, void>`) resolves to the vector element's
+  identity (M51 1140-1141); a requested specialization with only an implicit default constructor
+  gets a generated placement wrapper (`Stack<TensorExample>()`; M52); C++ member templates are
+  found through public CRTP bases from the derived receiver (M52 1150); an inline template static
+  already defined by the companion is reused instead of a suffixed duplicate; `alias auto x =
+  *it;` already infers, so `auto&` needs no grammar. The header walk registers every
+  specialization of a class template under one unparameterized placeholder (`std.vector`, whose
+  layout and members are the first specialization's, `std::vector<at::Tensor>` for torch.h); a
+  requested `$` specialization aliases onto that placeholder only when the placeholder's own
+  recorded spelling is the same specialization - refusing it outright made `Module::parameters()`
+  return `std.vector` while the local was `std.vector$at.Tensor` (t9/t12/t16 regressed and were
+  fixed the same day). Found on the way and filed, not fixed: `auto p = l1.parameters();` nulls
+  the sret temp before move-constructing from it, so the `auto` local is empty while the typed
+  form is right (fixed in round 8 below).
+  Still open: the generated wrapper for
+  `map` spells its dependent MapDataset return with the namespace-local alias, which is not valid
+  outside `torch::data` (fixed in round 8 below, rung t15). Compile time measured: `cache` did
+  nothing for torch.h - the 37 MB companion blob exceeded the 16 MiB base64 budget and type
+  requests are in-memory only; budget raised to 256 MiB as a stopgap (warm t4 113 s -> 68 s),
+  the sidecar-blob + request disk cache design is filed as
+  internal/issue/p2/cpp-header-cache-blob-budget-and-type-requests.md (brief in
+  scratch/ladder/briefs/cxI.md, partial work in worktree ../cflat-cxI).
+- Round 8 (2026-09-12 evening, working tree on top of 41d09c4b): a nontrivial C++ class local
+  built from an operator whose operand is a call (`torch.ones(s) * 4.0`, `(a + 1.0) * 3.0`)
+  constructed the INNER call straight into the armed declaration slot and lost the operator
+  result (`fmul ptr %x, float 4.0`); the non-member-operator arming now applies only to
+  call-free operator spellings, everything else moves the outermost call's temporary into the
+  slot (M55 1180-1184, live count back to 0). `T x = c ? f() : g();` is now an explicit error
+  instead of wrong code (p3 issue cpp-ternary-of-two-cxx-temporaries-into-local). New rung t17:
+  functional relu/mse_loss, NoGradGuard, manual_seed, `.to(dtype)`, matmul/view/unsqueeze,
+  torch::save/load round trip, toString(), index_select, zeros_like/fill_ - all run. New rung
+  t18: Embedding forward from an int64 from_blob, clone/detach, backward into `weight.grad()`,
+  NoGradGuard-guarded fills, torch::save/load of a Module - runs. Found:
+  namespace-scope constexpr constants (`torch.kFloat64`, `c10.kDouble`) are not extracted
+  (internal linkage; brief cxP) and brace lists of class values (`torch.cat({x, z}, 0)`) are
+  refused (brief cxQ); `bn->forward(x)` on BatchNorm1d fails because `forward` lives in the
+  class-template-specialization base `BatchNormImplBase<1, BatchNorm1dImpl>` whose inline body
+  is never instantiated (brief cxS); `std.get<0>(tuple)` needs integer template arguments
+  (brief cxR). `auto p = l1.parameters();` fixed (cxN): the generic owning-value
+  classifier zeroed the sret temp before the C++ move constructor read it; it is skipped when a
+  foreign sret temporary is the source (M53 1160-1167; the p2 issue is deleted). Integer
+  non-type template arguments landed (cxR): `cppt.nth_of<0>(v)`, `box.slot<3>()`,
+  `cppt.scaled<3, int>(5)`, `std.get<0>(tuple)` - the extractor kept only type-parameter
+  templates and dropped namespace-scope templates outside the bound header dirs (libc++'s
+  <tuple> lives in the SDK), and a template's pattern FunctionDecl was published as a plain
+  function; value arguments are tagged `#` in the explicit-argument list and spelled as literals
+  in the TPL wrapper; header cache 47 -> 48 (`tk` parameter kinds); M58 1210-1217; torch.max ->
+  tuple + std.get runs. Spelling note: CFlat `long` is C++ `long`, `i64` is `long long`, so on
+  Darwin `x.item<i64>()` is the int64_t instantiation libtorch ships (`item<long>` does not link).
+  Namespace-scope constexpr constants landed (cxP): `torch.kFloat64`, `c10.kDouble`, `torch.kCPU`
+  read as compile-time constants of their declared (enum) type - HarvestGlobalVar had required
+  external linkage (namespace const is internal) and macro-generated constants resolved to
+  `<scratch space>`; RawGlobalVar carries qualified name + folded value, header cache -> 49;
+  M56 1190-1195; floating constexpr constants stay unbound (no double slot, reported under -v).
+  Wrapper spelling (cxO): `CanonicalSpelling` prints deduced/dependent types with a fully
+  qualified canonical PrintingPolicy, so `ds.map(Stack<TensorExample>())` no longer spells the
+  namespace-local alias; a refused member whose signature names an unregistered class
+  specialization is retried once that specialization registers (`apply_batch(std::vector<Example>)`
+  by value); M54 1170-1173. Rung t15 (TensorDataset -> map(Stack<TensorExample>()) ->
+  make_data_loader batch 2 -> two 2x2 batches, `it == end`) compiles and runs; the p2 loader
+  issue is deleted (the 139 seen inside the Codex sandbox did not reproduce on master).
+  Members inherited from a class-template-specialization base (cxS): `bn->forward(x)` on
+  BatchNorm1d - the refused-member retry re-requested the first-wins placeholder specialization
+  and never ran on an `operator->` forwarded receiver; the base's own `$` identity (non-type args
+  tagged `.1`) is now requested with definitions per public base, and the forwarded receiver is
+  retried; M59 1220-1225. Two spellings of a non-type argument remain (CxxForeignIdentity vs
+  AutoCxxForeignIdentity) - unify when the mangling plan lands. Rung t19 (BatchNorm1d/Dropout forward, eval()/is_training(),
+  `x.to(torch.kFloat64)`, `torch.max(a, 1)` -> std.get<0>/<1>) runs.
+  Class-valued brace arguments landed (cxQ): `torch.cat({x, z}, 0)`, `torch.stack({x, z})` -
+  brace elements were scalar-only; homogeneous C++ class elements (lvalues and call results)
+  now materialize a contiguous array of copy/move-constructed elements passed as `(const T*,
+  size_t)` to a generated wrapper that builds the ArrayRef/IListRef (first), std::vector
+  (second) or pointer-pair container (third); elements are destroyed at full-expression end;
+  an initializer_list-only overload is refused with a diagnostic
+  (err_cpp_initializer_list_class_brace.cb); parameter names survive the header cache (-> 50);
+  M57 1200-1209. Rung t20 (cat/stack of two tensors, sum 24) runs. Member calls on a
+  constructor temporary landed (cxT): `AdamOptions(0.01).weight_decay(1e-4)`,
+  `LSTMOptions(4, 6).num_layers(1)`, `T(a).m1().m2()`, `T(a).field`, ctor temporaries as
+  const-reference arguments - after a foreign constructor temporary materialized the class
+  qualifier stayed in `namespaceContext`, so `.wd` was looked up as `opr.W.wd`; trivially
+  copyable classes with a nontrivial default constructor use the plain value-copy path in a
+  chained initializer; M60 1230-1239. Rung t21 (Adam with chained AdamOptions, softmax/argmax,
+  item<int>) runs. Found next: nested tuple returns (`std.get<1>` on
+  `std::tuple<T, std::tuple<T,T>>` refuses its wrapper; LSTM `forward` with a defaulted
+  `std::optional<std::tuple<Tensor,Tensor>>` references an unemitted `__cflat_dflt_` thunk;
+  brief cxU) and C++ implicit conversions at call arguments (`seq->push_back("fc1",
+  torch.nn.Linear(2, 4))`: literal -> std::string and Linear -> AnyModule through a converting
+  constructor template; brief cxV). Implicit conversions at call arguments landed (cxV):
+  after normal overload resolution fails, refused member/free candidates whose only mismatches
+  are `char*` -> string-like or foreign class -> different foreign class by value get a
+  generated `decltype(auto)` forwarding wrapper spelled with the actual argument types, so
+  clang performs the conversion and overload selection (ambiguity is clang's error); direct
+  foreign class temporaries in postfix position use the variadic-constructor wrapper; M62
+  1250-1259. Rung t22 (`seq->push_back("fc1", torch.nn.Linear(2, 4))`, named_parameters,
+  forward 3x1) runs. Found (cxW, WRONG CODE): a derived class whose public base is a
+  class-template specialization inherits a SIBLING specialization's members when the header
+  walk saw the sibling first - `torch.nn.Linear l1, l2; l1.forward(x)` emits
+  `EmbeddingImpl::forward` (t9 crashed, rerun of the full ladder after cxQ/cxT); the reduced
+  fixture scratch/opr/mh.h shows `Holder<EmbImpl>::forward` called on a `Holder<LinImpl>`
+  object even with one variable. This is the "specializations collapse to one identity" note
+  turned into a bug. `np[0].key()` on an OrderedDict misresolves (use `np.front().key()`).
+  Nested tuple returns landed (cxU): `std.get<1>` on `std::tuple<T, std::tuple<T,T>>`, typed
+  and `auto` locals of the nested type, and LSTM `forward` with its defaulted
+  `std::optional<std::tuple<Tensor,Tensor>>` parameter - nested foreign template identities
+  were reused as C++ spellings after mangling (split at the wrong `$`), a generated wrapper's
+  template-argument owner groups were not carried, and the `__cflat_dflt_` default-argument
+  thunk was referenced without being emitted; M61 1240-1249. Rung t24 (LSTM forward ->
+  `y=5x2x6 h=1x2x6`) runs; rung t23 (`data_ptr<float>()`, cross_entropy, SGDOptions chained
+  momentum, argmax, `item<i64>`) runs. Passing an explicit `std.make_tuple(a, b)` to an
+  `std::optional<std::tuple<...>>` parameter is still refused (overload conversion). Found next
+  (brief cxX): `torch.randint(0, 5, {4})` - no brace wrapper for a brace list behind TWO
+  leading scalars (the 2-arg form works), and derived-to-base at reference/pointer parameters
+  (`torch.optim.StepLR(sgd, 1, 0.5)` takes `Optimizer&`; the match falls to the by-value path
+  and reports the deleted copy constructor).
+  Sibling specialization bases fixed (cxW): `RegisterCxxClassMembers` kept the canonical
+  reverse map first-wins, so a later exact `$` registration (`mh.Holder$mh.LinImpl`) still
+  resolved to the bare shell whose function table held the sibling's symbols; an exact
+  registration now replaces a shell entry whose recorded spelling is a different
+  specialization (the same-spelling `std.vector` alias is kept); M63 1260-1269 (both use
+  orders); t9 and the two-Linear probe run again.
+  Nested classes of a specialization landed (cxY): `d[0].key()` / `np[0].key()` on an
+  OrderedDict - the exact reverse spelling entry now wins before the `$` identity decode, so
+  `Outer$A$B.Item` no longer turns the nested class into part of `B`; M65 1280-1289. Brace lists
+  behind two scalars and derived-to-base at reference/pointer parameters landed (cxX):
+  `torch.randint(0, 5, {4})`, `torch.optim.StepLR(sgd, 1, 0.5)` with an `Optimizer&` parameter
+  (public non-virtual base offset adjustment, ranked below an exact match); M64 1270-1279.
+  Full-ladder rerun found t14/t16 failing with `cannot find the type
+  'std.vector<torch.data.Example<at.Tensor, void>>'`: the Iterator request published the
+  short spelling of its `operator*` return (identity `std.vector$torch.data.Example$at.Tensor$void`)
+  without ever materializing a struct under it, and `TryRequestCxxType` took the recorded
+  spelling as a complete registration; a spelled-but-structless identity is now requested under
+  its recorded spelling (`-v`: "was spelled but never materialized"). `TryRequestCxxType` also
+  reports its skip reasons under `-v`. Found: `torch.indexing.Slice()` fails with "'torch::indexing'
+  does not name a C++ class type" (the namespace is a `using namespace at::indexing` re-export).
+  Heterogeneous brace lists landed (cxZ): `x.index({torch.indexing.Slice(), 1})` - brace
+  lowering assumed one scalar element type and the class-brace path assumed elements already had
+  the destination class; mixed class/scalar elements now go through a generated wrapper that
+  keeps each element's own C++ type and constructs the destination element class (converting
+  constructors selected by clang) before forming the initializer_list / vector / ArrayRef; and
+  qualified lookup follows using-directives on a parent prefix (`torch` publishes `using
+  namespace at`), so `torch.indexing.Slice` resolves; M66 1290-1299. Rungs t26 (nn::init,
+  clip_grad_norm_, save/load of a Sequential, children()) and t27 (TensorIndex braces) run.
+  Header disk cache sidecar landed (cxI1, 2026-09-13): the companion-module bitcode is written
+  as a raw `<key>.bc` next to the JSON entry (JSON keeps file, length, hash; a missing, truncated
+  or mismatched sidecar is a whole-entry miss), the base64 budget is gone, cache version 51.
+  Measured on t4 with `cache`: cold 214 s, warm 191 s with the header hit (33 MB JSON + 37 MB
+  bitcode). Part 2 of that issue (persisting type requests) is HELD by maintainer ruling because
+  of staleness: a request result depends on the process registration state and the compiler
+  build, not just the header hash, and a stale hit fails at link or run time instead of at
+  compile time. Safe design if ever resumed: key by full stub source + group hash + flags +
+  compiler build id, replay only the clang stages, always re-run in-process registration, never
+  persist tentative or failed requests.
+- Round 9, closure timebox (2026-09-13 02:21-10:21, working tree on top of b088c982): floating
+  constexpr constants landed (cxAB): `constexpr double/float/long double` at namespace scope and
+  as static data members bind as compile-time constants of the declared type via a floating slot
+  on RawGlobalVar / the static-member record, serialized as IEEE-754 bits, header cache 51 -> 52;
+  M67 1300-1309. Ternary of two C++ class prvalues into a declaration landed (cxAD): each arm
+  constructs or moves into the declaration slot inside its own block and the PHI join is skipped;
+  mixed arms and return-position ternaries keep their explicit errors; M68 1310-1319; the p3
+  issue file is deleted. A read-only review of the round 7/8 diff (scratch/review/round78.md,
+  11 findings) drove two tracks: cxAE (implicit default-ctor wrapper includes `<new>` and is only
+  requested for zero-argument constructor calls; non-ambiguous implicit-conversion wrapper
+  failures and filtered using-declarations trace under -v; stale `.bc` sidecars are removed on
+  invalidation, no-bitcode rewrite and post-write failure, cache -> 53; ResetForReanalysis clears
+  the inherited-rebind guard; the three temporary-lifetime risks (brace element move from a named
+  lvalue, brace array in a loop, converting-ctor by-value load) were probed and did NOT
+  reproduce; M70 1330-1339) and cxAC (one `cflat_cinterop::CxxForeignIdentity` shared by extractor
+  and backend - record tag strip, multi-word primitive aliases, `.N`/`.nN` value arguments - the
+  backend copy is deleted, forced base records use the specialization identity, and
+  `FindCxxBaseOffset` walks `ResolveCxxBaseIdentity` like every other base walk; cache -> 54;
+  M69 1320-1329). `register_module` chains on a plain `torch.nn.Module` work as is (rung t28:
+  `std.shared_ptr<LinearImpl>` return, forward through the returned module, parameters n=2).
+  run_all.sh now runs rungs 3 at a time (`-j N`). Simplifications landed (cxAF, behaviour
+  preserving, wrapper-name set and normalized -v trace identical before/after): `StripCxxRefAndCv`
+  replaces six inline strippers, `HashWrapperKey` replaces seven open-coded FNV loops,
+  `TryBindCxxImplicitArgumentConversions` is split into candidate collection and wrapper emission,
+  `ComputeOverloadFunction` is non-const so the clang probe no longer needs a const_cast, and a
+  UsingDecl reached by both walks publishes once. Crash fix (main session): the round-8 parent
+  using-directive lookups in `ResolveNamespace` and the qualified-member variant held a
+  `const std::string&` into a vector they push_back into, an intermittent segfault (about 1 in 4
+  warm `-v` compiles of the interop fixture, backtrace in scratch/crash_v.bt); both sites copy by
+  value now, 8/8 warm compiles clean. Lesson: piping a compile through `grep -c` hides its exit
+  code and a stale `-o` binary makes the run look green; check `rc` of the compile itself.
+  A second read-only review over the round-9 diff (scratch/review/round9.md, 14 items) drove
+  cxAG: the declaration-ternary destination is claimed before the condition is parsed (a
+  parenthesized ternary in the condition was refused; M71 1340-1344), `FindCxxBaseOffset` falls
+  back to the raw base name for record-only bases, an exact `Foo*` parameter is no longer
+  classified as a base-pointer conversion (no needless `__cflat_udc_` wrapper), a header cache
+  miss removes both the JSON entry and its sidecar, the write-only implicit-conversion metadata is
+  gone, and the using-declaration diagnosis runs only under -v. The review's double-destroy claim
+  on the ternary lowering was refuted by a counted probe (scratch/opr/cnt.cb: ctors == dtors in
+  every form, loop included).
+  Primitive identity table completed (cxAH): `unsigned long` and every other multi-word C++
+  integer spelling normalize to the CFlat alias `CxxSpellingForCflatType` emits (`ulong`, `u32`,
+  `longdouble`, ...), longest spelling first, so `std::vector<size_t>` has one identity on both
+  paths; `ApFloatToDouble` reports lossy long-double folds under -v; header cache -> 55; M72
+  1350-1359.
+State (working tree, 2026-09-13 10:04, round 9): scratch/ladder/torch/ t1-t28 all compile, link and run
+on the final build (run_all.sh -j 3, ~30 min); test.sh Release 897/0/8, LSP and examples green, header
+cache v55, interop fixture cold + 4 warm -v compiles rc 0; fixture sections to M72 (row 1359).
+Previous state (round 8): scratch/ladder/torch/ t1-t27 all compile, link and run
+(t7 loss 17.1 -> 0.004, t8 direct=archived=10, t9 XOR loss 0.278 -> 0, t10 incl. at.cat 4x3
+sum 42 and slice13 = 15, t11 conv 612/198, t12 Sequential XOR loss 0.278 -> 0, t13 dataset n=4 ex0=2, t14 loader 2 batches of 2, t15 loader pipeline, t16 loader training loss 0.27 -> 8e-8, t17 functional/save-load, t18 Embedding, t19 BatchNorm/max, t20 cat/stack, t21 chained AdamOptions, t22 named push_back, t23 cross_entropy/SGD, t24 LSTM, t25 named push_back + OrderedDict index, t26 init/clip/save-load, t27 TensorIndex braces); test.sh
+Release 897/0/8, LSP and examples green.
+Open: `register_module` chains untried (`std::shared_ptr<Module>` returns are refused); a CFlat
+struct deriving from a C++ class (custom nn::Module) is a design question; floating constexpr
+constants stay unbound; `T x = c ? f() : g();` of two C++ temporaries is an explicit error (p3
+issue); compile time: 70-200 s per libtorch file, the rest is type requests re-run per process
+(p2 issue above); the sibling-specialization collapse is fixed (cxW) but two spellings of a
+non-type argument remain (CxxForeignIdentity vs AutoCxxForeignIdentity); postfix
+operator++(int) unextracted by ruling.
 
 Open: per-import `std` clause or CLI-only; exceptions option at M8 start; MSVC ABI pass.
 Open from the M5 review (2026-09-06):
