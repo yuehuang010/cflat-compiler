@@ -34,6 +34,11 @@ Six of seven picks move when only the declaration order changes. An exact type m
 orders (`long` -> `f(int)`, then `int` -> `f(long)`). No call is ever diagnosed as ambiguous.
 LP64 shows the same shape between `long` and `i64` (both 64-bit).
 
+The character types (`c8`/`c16`/`c32`/`wchar`, landed 2026-09-10) widen it: a `u16`
+argument reaches `f(c16)`, a `c16` argument reaches `g(wchar)` on Windows, and declaring `f(u16)`
+first flips the `c16` pick. Definition-time identity is right (`f(c16)` + `f(wchar)` are two
+overloads); only the call-site pick ignores it.
+
 ## Root cause
 
 `LLVMBackend::CreateOverloadedFunctionCall` (`cflat/LLVMBackend_Overloads.cpp`) scores integers by
@@ -62,20 +67,21 @@ Rank the way C++ does, in CFlat's own type terms:
 
 1. Identity-exact first: parameter and argument equal after `CanonicalPrimitiveSpelling`
    (`int`==`i32`, `short`==`i16`; `long` distinct from both `int` and `i64` on every target).
-   The full table, including `wchar` vs `c16`, is in `internal/issue/cppinterop/cxx-primitive-typing.md`.
+   The full identity table, including `wchar` vs `c16`, is in the 2026-09-10 primitive-identity
+   ruling at the bottom of `internal/fix-issue-lessons.md`.
 2. Then value-preserving promotion (narrower to wider, same signedness; unsigned into STRICTLY
    wider signed).
 3. Then conversion (same-width different-identity, narrowing, sign change).
 4. A tie within the best tier is an ambiguity `LogError` naming the candidates - never first-wins,
    never last-wins.
 
-Needs a maintainer ruling before building:
+Maintainer rulings (2026-09-10):
 
-- **Unsuffixed integer literal.** `f(5)` today follows the last-wins tie. C++ types the literal
-  `int`, so it picks `f(int)`. Pick the rule for CFlat (literal as `int`, or smallest-fitting with
-  promotion) - it decides which call sites move.
-- **Same-width different-identity** (`long` arg, only `f(int)` declared, LLP64): conversion (step 3,
-  still binds) or refused? C++ binds it as a conversion.
+- **An unsuffixed integer literal is `int`**, as in C++: `f(5)` ranks exactly like an `int`
+  argument, so it picks `f(int)` when one is declared.
+- **Same-width different-identity binds as a conversion** (step 3), as in C++: a `long` argument
+  with only `f(int)` declared (LLP64) still binds, ranked below any identity or promotion match.
+- **A tie within the best tier is an ambiguity error** (step 4), never first-wins or last-wins.
 
 ## Blast radius - expect existing tests to move
 
@@ -94,8 +100,9 @@ edit, not the last.
 The C++ constructor binder (`cflat/LLVMBackend_CInterop.cpp:9087`) has the same shape: it counts
 type-name-exact parameters AFTER the inbound map, which on LP64 collapses `long` and `long long` to
 `i64`, and keeps the first declared on an equal-shape tie. Test leg 769 (`Test/test_cpp_interop.cb`)
-therefore depends on declaration order in `cpp_interop_basic.h`. That half lands with the identity
-table in `internal/issue/cppinterop/cxx-primitive-typing.md` and is not part of this fix.
+therefore depends on declaration order in `cpp_interop_basic.h`. Since 2026-09-10 a C++ import
+maps `long` and `long long` by identity, so the LP64 collapse may be gone; confirm leg 769 with the
+fixture's declaration order reversed before counting that half fixed. Not part of this fix.
 
 ## Acceptance
 

@@ -1448,9 +1448,9 @@ extern int main()
     if (m21int.which != 1)                          return 768;
     i64 m21longArg = 42;
     cppi.IntPick m21long = cppi.IntPick(m21longArg);
-    // LLP64 Windows: a 64-bit argument is an exact match for `long long`, not `long`.
-    if const (__WINDOWS__) { if (m21long.which != 4) return 769; }
-    else                   { if (m21long.which != 2) return 769; }
+    // `i64` IS `long long` on every target (a C++ import maps `long` to the distinct CFlat `long`),
+    // so it binds IntPick(long long) on LP64 too, not the equal-width IntPick(long).
+    if (m21long.which != 4) return 769;
     cppi.IntPick m21double = cppi.IntPick(2.5);
     if (m21double.which != 5)                       return 770;
     cppt.TaggedInt m21tagged = cppt.TaggedInt(11);
@@ -1459,6 +1459,33 @@ extern int main()
     if (strcmp(m21taggedName.c_str(), "tagged") != 0) return 772;
     cppt.deep.TaggedLong m21taggedLong = default;
     if (m21taggedLong.get() != 0)                   return 773;
+
+    // C++ long / unsigned long are their own specializations, distinct from long long / unsigned
+    // long long. Each sum takes the C++ vector by reference and walks it with C++'s stride.
+    {
+        std.vector<long> m21longs = default;
+        m21longs.push_back(-5);
+        m21longs.push_back(7);
+        if (cppi.long_vector_sum(m21longs) != 2)     return 824;
+
+        // A returned unsigned long reads back as ulong, not as the width-mapped u32.
+        auto m21ulongValue = cppi.unsigned_long_value();
+        if (strcmp(typeof(m21ulongValue), "ulong") != 0) return 825;
+        std.vector<ulong> m21ulongs = default;
+        m21ulongs.push_back(m21ulongValue);
+        m21ulongs.push_back(1);
+        if (cppi.ulong_vector_sum(m21ulongs) != 4000000001) return 826;
+
+        std.vector<i64> m21i64s = default;
+        m21i64s.push_back(3000000000);
+        m21i64s.push_back(-1);
+        if (cppi.long_long_vector_sum(m21i64s) != 2999999999) return 827;
+
+        std.vector<u64> m21u64s = default;
+        m21u64s.push_back(3000000000);
+        m21u64s.push_back(5000000000);
+        if (cppi.ulong_long_vector_sum(m21u64s) != 8000000000) return 828;
+    }
     // ---- Section M22: C++ function-template deduction wrappers (774-781) -----
     if (cppt.twice(21) != 42)                       return 774;
     if (cppt.twice(1.25) != 2.5)                   return 775;
@@ -1835,5 +1862,33 @@ extern int main()
     cppi.Outer.Inner batchKeyword = default;
     batchKeyword.value = 21;
     if (batchKeyword.i64() != 42) return 987;
+
+    // Primitive identity coverage: C++ character types keep distinct CFlat names, while
+    // multi-word C++ integer spellings canonicalize to the matching CFlat template key.
+    if (cppi.char16_value((c16)4) != (c16)5) return 1000;
+    if (strcmp(typeof(cppi.char16_value((c16)4)), "c16") != 0) return 1009;
+    std.vector<c8> primitiveC8 = default;
+    primitiveC8.push_back((c8)7);
+    if (primitiveC8[0] != (c8)7) return 1001;
+    std.vector<c16> primitiveC16 = default;
+    primitiveC16.push_back((c16)8);
+    if (primitiveC16[0] != (c16)8) return 1002;
+    std.vector<char16_t> primitiveC16Alias = default;
+    primitiveC16Alias.push_back((char16_t)9);
+    if (primitiveC16Alias[0] != (c16)9) return 1003;
+    std.vector<c32> primitiveC32 = default;
+    primitiveC32.push_back((c32)10);
+    if (primitiveC32[0] != (c32)10) return 1004;
+    std.vector<wchar> primitiveWchar = default;
+    primitiveWchar.push_back((wchar)11);
+    if (primitiveWchar[0] != (wchar)11) return 1005;
+    std.vector<long double> primitiveLongDouble = default;
+    if ((int)primitiveLongDouble.size() != 0) return 1006;
+    std.vector<long long> primitiveLongLong = default;
+    primitiveLongLong.push_back((i64)12);
+    if (primitiveLongLong[0] != (i64)12) return 1007;
+    std.vector<unsigned long> primitiveUnsignedLong = default;
+    primitiveUnsignedLong.push_back((ulong)13);
+    if (primitiveUnsignedLong[0] != (ulong)13) return 1008;
     return 0;
 }

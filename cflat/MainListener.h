@@ -166,43 +166,296 @@ inline std::string SimdPointerTypeMessage(const std::string& spelling, bool fixe
                    : std::format("'{}*'", spelling),
         spelling, spelling, spelling);
 }
-// `long long` reaches the listener as two separate `long` typeSpecifiers (the grammar has no
-// combined rule), and the parse loops stop at the first one. Count them so the spelling can be
-// canonicalized to "i64": `long long` is 64-bit on every target, while bare `long` is the
-// target's native C long (i32 on Windows/LLP64, i64 on LP64) and keeps its own type name.
-// Returns the type name to use for a "long" typeSpecifier given the whole specifier list.
-static const char* LongSpellingTypeName(int longSpecifierCount)
+static std::string JoinTypeSpecifierWords(const std::vector<std::string>& words)
 {
-    return longSpecifierCount >= 2 ? "i64" : "long";
-}
-// Return the complete primitive spelling of a generic type argument, including
-// any words accepted by multiWordTypeSuffix.
-static std::string TemplateTypeArgumentSpelling(CFlatParser::TypeParameterEntryContext* entry)
-{
-    if (entry == nullptr) return {};
-    auto* typeSpec = entry->typeSpecifier();
-    std::string spelling = typeSpec != nullptr ? typeSpec->getText() : entry->getText();
-    if (auto* suffix = entry->multiWordTypeSuffix(); suffix != nullptr)
-        for (auto* part : suffix->typeSpecifier())
-            spelling += " " + part->getText();
+    std::string spelling;
+    for (const auto& word : words)
+    {
+        if (!spelling.empty()) spelling += " ";
+        spelling += word;
+    }
     return spelling;
 }
-// Keep C and C++ spellings of the same primitive on one specialization key.
-static std::string CanonicalTemplateTypeArgument(CFlatParser::TypeParameterEntryContext* entry)
+
+enum class PrimitiveTypeErrorKind
+{
+    None,
+    ExpectedType,
+    InvalidSpelling,
+    InvalidSpellingSuggestion,
+    LongDoubleNative
+};
+
+struct PrimitiveTypeError
+{
+    PrimitiveTypeErrorKind kind = PrimitiveTypeErrorKind::None;
+    std::string spelling;
+    std::string suggestion;
+};
+
+static bool HasPrimitiveTypeError(const PrimitiveTypeError& error)
+{
+    return error.kind != PrimitiveTypeErrorKind::None;
+}
+
+static std::string LocalizePrimitiveTypeError(const LLVMBackend* compiler,
+                                              const PrimitiveTypeError& error)
+{
+    if (compiler == nullptr) return {};
+    switch (error.kind)
+    {
+    case PrimitiveTypeErrorKind::ExpectedType:
+        return compiler->LocalizeMessage("expected a type", {});
+    case PrimitiveTypeErrorKind::InvalidSpelling:
+        return compiler->LocalizeMessage("invalid type spelling '{}'", { error.spelling });
+    case PrimitiveTypeErrorKind::InvalidSpellingSuggestion:
+        return compiler->LocalizeMessage("invalid type spelling '{}': use '{}'",
+            { error.spelling, error.suggestion });
+    case PrimitiveTypeErrorKind::LongDoubleNative:
+        return compiler->LocalizeMessage(
+            "'long double' is only usable as a C++ template argument; use 'double' in CFlat",
+            {});
+    case PrimitiveTypeErrorKind::None:
+        break;
+    }
+    return {};
+}
+
+static PrimitiveTypeError LongDoubleNativeTypeError()
+{
+    return { PrimitiveTypeErrorKind::LongDoubleNative, "long double", "double" };
+}
+
+// True when a resolved type-argument list names `long double` (bare, pointer or view element).
+// Only a C++ template may take it; a CFlat generic has no `longdouble` type to substitute.
+static bool HasLongDoubleTypeArgument(const std::vector<std::string>& typeArgs)
+{
+    for (std::string arg : typeArgs)
+    {
+        while (!arg.empty() && (arg.back() == '*' || arg.back() == '[' || arg.back() == ']'))
+            arg.pop_back();
+        if (arg == "longdouble") return true;
+    }
+    return false;
+}
+
+// Canonicalize one complete C/C++ primitive spelling. A single unknown word is left alone so
+// user-defined and generic names continue through the ordinary name-resolution path.
+static bool CanonicalizePrimitiveTypeWords(const std::vector<std::string>& words,
+                                           std::string& canonical, PrimitiveTypeError& error)
 {
     static const std::unordered_map<std::string, std::string> aliases = {
         { "signed char", "i8" }, { "unsigned char", "u8" },
-        { "short int", "short" }, { "unsigned short", "u16" },
-        { "unsigned short int", "u16" }, { "signed int", "int" },
+        { "short int", "short" }, { "signed short", "short" },
+        { "signed short int", "short" }, { "unsigned short", "u16" },
+        { "unsigned short int", "u16" }, { "signed", "int" },
+        { "signed int", "int" }, { "unsigned", "u32" },
+        { "unsigned int", "u32" }, { "long int", "long" },
+        { "signed long", "long" }, { "signed long int", "long" },
+        { "unsigned long", "ulong" }, { "unsigned long int", "ulong" },
+        { "uint", "u32" },
         { "long long", "i64" }, { "long long int", "i64" },
         { "signed long long", "i64" }, { "signed long long int", "i64" },
-        { "unsigned int", "u32" }, { "unsigned long long", "u64" },
-        { "unsigned long long int", "u64" }, { "long double", "longdouble" },
+        { "unsigned long long", "u64" }, { "unsigned long long int", "u64" },
+        { "long double", "longdouble" },
+        { "char8_t", "c8" }, { "char16_t", "c16" },
+        { "char32_t", "c32" }, { "wchar_t", "wchar" },
     };
-    std::string spelling = TemplateTypeArgumentSpelling(entry);
-    auto it = aliases.find(spelling);
-    return it == aliases.end() ? spelling : it->second;
+    if (words.empty())
+    {
+        error.kind = PrimitiveTypeErrorKind::ExpectedType;
+        return false;
+    }
+    const std::string spelling = JoinTypeSpecifierWords(words);
+    if (auto it = aliases.find(spelling); it != aliases.end())
+    {
+        canonical = it->second;
+        return true;
+    }
+    if (words.size() == 1)
+    {
+        canonical = words[0];
+        return true;
+    }
+
+    // A C sign modifier on a CFlat fixed-width word: name the word that has that signedness.
+    static const std::unordered_map<std::string, std::string> signedWords = {
+        { "i8", "i8" }, { "u8", "i8" }, { "i16", "i16" }, { "u16", "i16" },
+        { "i32", "i32" }, { "u32", "i32" }, { "i64", "i64" }, { "u64", "i64" },
+        { "i128", "i128" }, { "u128", "i128" },
+    };
+    static const std::unordered_map<std::string, std::string> unsignedWords = {
+        { "i8", "u8" }, { "u8", "u8" }, { "i16", "u16" }, { "u16", "u16" },
+        { "i32", "u32" }, { "u32", "u32" }, { "i64", "u64" }, { "u64", "u64" },
+        { "i128", "u128" }, { "u128", "u128" },
+    };
+    if (words.size() == 2 && (words[0] == "signed" || words[0] == "unsigned"))
+    {
+        const auto& table = words[0] == "signed" ? signedWords : unsignedWords;
+        if (auto it = table.find(words[1]); it != table.end())
+        {
+            error = { PrimitiveTypeErrorKind::InvalidSpellingSuggestion, spelling, it->second };
+            return false;
+        }
+    }
+    error = { PrimitiveTypeErrorKind::InvalidSpelling, spelling, {} };
+    return false;
 }
+
+// A soft keyword parsed as a typeSpecifier that qualifies the declaration rather than naming
+// part of its type.
+static bool IsSoftKeywordTypeSpecifier(const std::string& text)
+{
+    return text == "move" || text == "adopt" || text == "alias" || text == "bond"
+        || text == "unique" || text == "manifest" || text == "application";
+}
+
+static std::vector<std::string> CollectDeclarationTypeSpecifierWords(
+    const std::vector<CFlatParser::DeclarationSpecifierContext*>& declSpecs)
+{
+    std::vector<std::string> words;
+    for (auto* declSpec : declSpecs)
+    {
+        auto* typeSpec = declSpec->typeSpecifier();
+        if (typeSpec == nullptr) continue;
+        const std::string text = typeSpec->getText();
+        if (IsSoftKeywordTypeSpecifier(text)) continue;
+        words.push_back(text);
+    }
+    return words;
+}
+
+// A '?', '*' or '[N]' written on a NON-final word of a multi-word type (`unsigned* int p`). Both
+// passes read the suffix only from the last word, so it would be dropped. Returns the offending
+// specifier and its suffix text, or null when every suffix follows the complete type.
+static CFlatParser::DeclarationSpecifierContext* MisplacedMultiWordTypeSuffix(
+    const std::vector<CFlatParser::DeclarationSpecifierContext*>& declSpecs,
+    std::string& suffixText)
+{
+    std::vector<CFlatParser::DeclarationSpecifierContext*> typeWordSpecs;
+    for (auto* declSpec : declSpecs)
+        if (declSpec->typeSpecifier() != nullptr
+            && !IsSoftKeywordTypeSpecifier(declSpec->typeSpecifier()->getText()))
+            typeWordSpecs.push_back(declSpec);
+    for (size_t i = 0; i + 1 < typeWordSpecs.size(); ++i)
+    {
+        auto* declSpec = typeWordSpecs[i];
+        std::string suffix;
+        if (declSpec->Question() != nullptr) suffix += "?";
+        if (declSpec->pointer() != nullptr) suffix += declSpec->pointer()->getText();
+        if (declSpec->arrayTypeSuffix() != nullptr) suffix += declSpec->arrayTypeSuffix()->getText();
+        if (!suffix.empty())
+        {
+            suffixText = suffix;
+            return declSpec;
+        }
+    }
+    return nullptr;
+}
+
+static CFlatParser::DeclarationSpecifierContext* LastDeclarationTypeSpecifier(
+    const std::vector<CFlatParser::DeclarationSpecifierContext*>& declSpecs)
+{
+    for (auto it = declSpecs.rbegin(); it != declSpecs.rend(); ++it)
+        if ((*it)->typeSpecifier() != nullptr)
+            return *it;
+    return nullptr;
+}
+
+// The CFlat word a declaration's type specifiers spell, for diagnostics: `unsigned int` -> `u32`.
+// A spelling that does not canonicalize keeps `fallback`; the type-parsing pass reports it.
+static std::string CanonicalDeclarationTypeName(
+    const std::vector<CFlatParser::DeclarationSpecifierContext*>& declSpecs,
+    const std::string& fallback)
+{
+    std::string canonical;
+    PrimitiveTypeError error;
+    return CanonicalizePrimitiveTypeWords(CollectDeclarationTypeSpecifierWords(declSpecs), canonical, error)
+        ? canonical : fallback;
+}
+
+// True when `name` resolves as a variable the way ParseIdentifier resolves it: a local, parameter
+// or capture (every scope frame), a field through the implicit 'this', a global, or a global of an
+// enclosing namespace (the ResolveQualifiedName sibling fallback).
+static bool NamesVisibleVariable(LLVMBackend* compiler, const std::string& name)
+{
+    if (compiler->FindVariableScopeDepth(name) != SIZE_MAX
+        || compiler->HasMemberVariable(name)
+        || compiler->GetGlobalVariableNV(name).Storage != nullptr)
+        return true;
+    const std::string nsQualified = compiler->ResolveQualifiedName(name);
+    return nsQualified != name && compiler->GetGlobalVariableNV(nsQualified).Storage != nullptr;
+}
+
+// The declared type of the variable NamesVisibleVariable finds, looked up in the same order.
+// Call only after NamesVisibleVariable returned true.
+static LLVMBackend::TypeAndValue VisibleVariableType(LLVMBackend* compiler, const std::string& name)
+{
+    if (compiler->FindVariableScopeDepth(name) != SIZE_MAX)
+        return compiler->GetScopedLocalOrArgument(name).TypeAndValue;
+    if (compiler->HasMemberVariable(name))
+        return compiler->GetMemberVariable(name).TypeAndValue;
+    if (auto global = compiler->GetGlobalVariableNV(name); global.Storage != nullptr)
+        return global.TypeAndValue;
+    return compiler->GetGlobalVariableNV(compiler->ResolveQualifiedName(name)).TypeAndValue;
+}
+
+// The identifier a typeName spells when it is exactly one unqualified, non-generic name with no
+// declarator (`(c16)`, `sizeof(Foo)`); null for any other shape.
+static antlr4::tree::TerminalNode* BareTypeNameIdentifier(CFlatParser::TypeNameContext* typeName)
+{
+    if (typeName == nullptr || typeName->abstractDeclarator() != nullptr) return nullptr;
+    auto* specCtx = typeName->specifierQualifierList();
+    if (specCtx == nullptr) return nullptr;
+    auto typeSpecs = specCtx->typeSpecifier();
+    if (typeSpecs.size() != 1) return nullptr;
+    auto* gid = typeSpecs[0]->genericIdentifier();
+    if (gid == nullptr || gid->genericTypeParameters() != nullptr) return nullptr;
+    return gid->Identifier();
+}
+
+static std::vector<std::string> TypeSpecifierWords(
+    CFlatParser::TypeSpecifierContext* typeSpec,
+    CFlatParser::MultiWordTypeSuffixContext* suffix = nullptr)
+{
+    std::vector<std::string> words;
+    if (typeSpec != nullptr) words.push_back(typeSpec->getText());
+    if (suffix != nullptr)
+        for (auto* part : suffix->multiWordPrimitiveSpecifier())
+            words.push_back(part->getText());
+    return words;
+}
+
+static std::string CanonicalTypeSpecifierText(
+    CFlatParser::TypeSpecifierContext* typeSpec,
+    CFlatParser::MultiWordTypeSuffixContext* suffix = nullptr,
+    bool allowLongDoubleTemplateArgument = false,
+    PrimitiveTypeError* errorOut = nullptr)
+{
+    std::string canonical;
+    PrimitiveTypeError error;
+    if (!CanonicalizePrimitiveTypeWords(TypeSpecifierWords(typeSpec, suffix), canonical, error))
+    {
+        if (errorOut != nullptr) *errorOut = error;
+        return typeSpec != nullptr ? typeSpec->getText() : std::string{};
+    }
+    if (!allowLongDoubleTemplateArgument && canonical == "longdouble")
+    {
+        error = LongDoubleNativeTypeError();
+        if (errorOut != nullptr) *errorOut = error;
+    }
+    return canonical;
+}
+
+// Keep C and C++ spellings of the same primitive on one specialization key.
+static std::string CanonicalTemplateTypeArgument(
+    CFlatParser::TypeParameterEntryContext* entry, PrimitiveTypeError* errorOut = nullptr)
+{
+    if (entry == nullptr) return {};
+    return CanonicalTypeSpecifierText(entry->typeSpecifier(), entry->multiWordTypeSuffix(), true,
+                                      errorOut);
+}
+
 // An empty `[]` is representable ONLY as the sole dimension: the `T[]` array-view is a thin
 // `ptr` and carries no row stride, so `T[][]`, `T[][M]` and `T[N][]` have no lowering. The
 // grammar folds every bracket pair into one arrayDimSpec and drops the empty ones from
@@ -288,11 +541,16 @@ static bool FoldPointerAliasArg(const LLVMBackend* compiler, std::string& name, 
     return true;
 }
 
-static std::string TupleEntryArgName(const LLVMBackend* compiler, CFlatParser::TupleTypeEntryContext* entry)
+static std::string TupleEntryArgName(const LLVMBackend* compiler,
+                                     CFlatParser::TupleTypeEntryContext* entry,
+                                     PrimitiveTypeError* errorOut = nullptr)
 {
+    PrimitiveTypeError error;
+    std::string writtenName = CanonicalTypeSpecifierText(
+        entry->typeSpecifier(), entry->multiWordTypeSuffix(), false, &error);
+    if (errorOut != nullptr) *errorOut = error;
     std::string argName = compiler != nullptr
-        ? compiler->ResolveTypeArgBaseName(entry->typeSpecifier()->getText())
-        : entry->typeSpecifier()->getText();
+        ? compiler->ResolveTypeArgBaseName(writtenName) : writtenName;
     // Stars are counted, not flagged: a `(C**, int)` element must not mangle as `(C*, int)`.
     // On a view they decorate the ELEMENT, so `(int*[], int)` keeps its star: "int*[]".
     int stars = PointerDepthOf(entry->pointer());
@@ -1114,7 +1372,11 @@ static void RegisterPureRenameAlias(LLVMBackend* compiler, CFlatParser::UsingDec
     if (ctx->pointer() != nullptr || ctx->arrayTypeSuffix() != nullptr) return;
     auto* typeSpec = ctx->typeSpecifier();
     if (typeSpec == nullptr) return;
-    std::string target = compiler->ResolveQualifiedName(typeSpec->getText());
+    PrimitiveTypeError targetError;
+    std::string targetSpelling = CanonicalTypeSpecifierText(
+        typeSpec, ctx->multiWordTypeSuffix(), false, &targetError);
+    if (HasPrimitiveTypeError(targetError)) return;
+    std::string target = compiler->ResolveQualifiedName(targetSpelling);
     std::string alias = ctx->Identifier()->getText();
     if (alias == target || !IsBareTypeName(target)) return;
     compiler->RegisterManglingAlias(alias, target);
@@ -2768,7 +3030,8 @@ public:
     // Scanner counterpart of ResolveSigComponentCodegen: resolve a closure signature type. The scan
     // pass has no active substitutions, so a plain type stays getText(); a nested generic mangles to
     // match MangledGenericName; a nested closure encodes recursively. Names only (no queue/register).
-    std::string ResolveSigComponentScanner(CFlatParser::TypeSpecifierContext* ts, bool& outPointer);
+    std::string ResolveSigComponentScanner(CFlatParser::TypeSpecifierContext* ts, bool& outPointer,
+                                           CFlatParser::MultiWordTypeSuffixContext* suffix = nullptr);
 
     /*
      * Scanner counterpart of MainListener::SigComponentResolvedKey. Both are one line onto the
@@ -3320,7 +3583,8 @@ private:
     // (e.g. list<string>) mangle it + queue the instantiation. A nested closure encodes recursively.
     // A trailing '*' from a substitution folds into outPointer. Non-generic scalar types stay
     // byte-identical to the pre-existing raw-getText() behavior (no alias resolution added).
-    std::string ResolveSigComponentCodegen(CFlatParser::TypeSpecifierContext* ts, bool& outPointer);
+    std::string ResolveSigComponentCodegen(CFlatParser::TypeSpecifierContext* ts, bool& outPointer,
+                                           CFlatParser::MultiWordTypeSuffixContext* suffix = nullptr);
 
     /*
      * The declaring-scope-resolved key for a signature component, recorded ALONGSIDE the raw
@@ -5364,7 +5628,8 @@ public:
     LLVMBackend::NamedVariable ParseUnaryExpression(CFlatParser::UnaryExpressionContext* ctx,
                                                     ResultUse use = ResultUse::Value);
 
-    std::string ParseTypeSpecifierName(CFlatParser::TypeSpecifierContext* ctx);
+    std::string ParseTypeSpecifierName(CFlatParser::TypeSpecifierContext* ctx,
+                                       CFlatParser::MultiWordTypeSuffixContext* suffix = nullptr);
 
     // Resolves the struct type expected at a call-site field initializer argument.
     // Pass effectiveParamIdx >= 0 for positional args (already offset by implicit 'this').

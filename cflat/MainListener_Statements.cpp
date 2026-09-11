@@ -247,7 +247,11 @@ void MainListener::CollectCasesFromStatement(CFlatParser::StatementContext* stmt
             // Arm-style type pointer case: case TypeName* optVar => body
             if (labeled->typeSpecifier() && labeled->pointer())
             {
-                std::string typeName = labeled->typeSpecifier()->getText();
+                PrimitiveTypeError typeError;
+                std::string typeName = CanonicalTypeSpecifierText(
+                    labeled->typeSpecifier(), labeled->multiWordTypeSuffix(), false, &typeError);
+                if (HasPrimitiveTypeError(typeError))
+                    LogErrorContext(labeled, LocalizePrimitiveTypeError(compiler, typeError));
                 std::string resolvedTypeName = compiler->ResolveQualifiedName(typeName);
                 if (compiler->HasInterface(typeName))
                     resolvedTypeName = compiler->ResolveInterfaceName(typeName);

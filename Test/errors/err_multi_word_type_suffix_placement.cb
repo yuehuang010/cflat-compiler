@@ -1,0 +1,36 @@
+extern int main() { return 0; }
+
+// A suffix belongs after the COMPLETE multi-word type; on an earlier word it used to be dropped.
+expect_error("'?' must follow the complete type 'unsigned int'") {
+    int test_nullable_on_first_word()
+    {
+        unsigned? int value = 0;
+        return (int)value;
+    }
+}
+
+expect_error("'*' must follow the complete type 'unsigned int'") {
+    int test_pointer_on_first_word()
+    {
+        unsigned int target = 3;
+        unsigned* int pointer = &target;
+        *pointer = 5;
+        return (int)target;
+    }
+}
+
+expect_error("'[4]' must follow the complete type 'unsigned int'") {
+    int test_array_on_first_word()
+    {
+        unsigned[4] int values;
+        values[2] = 7;
+        return 0;
+    }
+}
+
+expect_error("'*' must follow the complete type 'unsigned int'") {
+    int test_pointer_param_on_first_word(unsigned* int pointer)
+    {
+        return 0;
+    }
+}

@@ -46,9 +46,9 @@ primaryExpression
     | '(' expression ')'
     | NameOf '(' expression ')'
     | TypeOf '(' expression ')'
-    | TypeOf '(' typeSpecifier ')'
-    | IidOf '(' typeSpecifier ')'
-    | WinrtDelegate '(' typeSpecifier ',' assignmentExpression ')'
+    | TypeOf '(' typeSpecifier multiWordTypeSuffix? ')'
+    | IidOf '(' typeSpecifier multiWordTypeSuffix? ')'
+    | WinrtDelegate '(' typeSpecifier multiWordTypeSuffix? ',' assignmentExpression ')'
     ;
 
 tupleExpression
@@ -165,8 +165,8 @@ relationalExpression
 
 typeCheckExpression
     : relationalExpression (
-        Is typeSpecifier
-        | As typeSpecifier
+        Is typeSpecifier multiWordTypeSuffix?
+        | As typeSpecifier multiWordTypeSuffix?
     )*
     ;
 
@@ -345,7 +345,7 @@ typeSpecifier
 // (same mechanism as 'function'). N is parsed as an expression and constant-folded in the
 // listener (mirrors arrayDimSpec); it must fold to a power-of-2 integer in [2,64].
 simdTypeSpecifier
-    : 'simd' '<' typeSpecifier ',' assignmentExpression '>'
+    : 'simd' '<' typeSpecifier multiWordTypeSuffix? ',' assignmentExpression '>'
     ;
 
 tupleTypeSpecifier
@@ -354,20 +354,20 @@ tupleTypeSpecifier
     ;
 
 tupleTypePackEntry
-    : typeSpecifier Ellipsis
+    : typeSpecifier multiWordTypeSuffix? Ellipsis
     ;
 
 tupleTypeEntry
-    : typeSpecifier pointer? arrayTypeSuffix?   // `T[]` element = a noalias array-view member; `[N]`/`[]*` rejected in the listener
+    : typeSpecifier multiWordTypeSuffix? pointer? arrayTypeSuffix?   // `T[]` element = a noalias array-view member; `[N]`/`[]*` rejected in the listener
     ;
 
 // `function<...>` is the thin C function pointer; `Lambda<...>` is the fat owning
 // closure (library type). Both share this rule; the listener distinguishes them
 // by which keyword token is present.
 functionPointerSpecifier
-    : Function '<' functionReturnQualifier? typeSpecifier pointer? '(' functionPointerParamList? ')' '>'
+    : Function '<' functionReturnQualifier? typeSpecifier multiWordTypeSuffix? pointer? '(' functionPointerParamList? ')' '>'
     | Function
-    | Lambda '<' functionReturnQualifier? typeSpecifier pointer? '(' functionPointerParamList? ')' '>'
+    | Lambda '<' functionReturnQualifier? typeSpecifier multiWordTypeSuffix? pointer? '(' functionPointerParamList? ')' '>'
     | Lambda
     ;
 
@@ -383,7 +383,7 @@ functionPointerParamList
     ;
 
 functionPointerParam
-    : Move? typeSpecifier pointer?
+    : Move? typeSpecifier multiWordTypeSuffix? pointer?
     ;
 
 lambdaExpression
@@ -395,7 +395,7 @@ lambdaParamList
     ;
 
 lambdaParam
-    : Move? typeSpecifier pointer? Identifier   // leading Move = the parameter is an ownership sink, matching `Lambda<void(move T)>`
+    : Move? typeSpecifier multiWordTypeSuffix? pointer? Identifier   // leading Move = the parameter is an ownership sink, matching `Lambda<void(move T)>`
     ;
 
 lambdaBody
@@ -420,11 +420,22 @@ typeParameterEntry
 // C and C++ permit several primitive type spellings in one type argument, such as
 // unsigned int and unsigned long long. The listener canonicalizes these spellings.
 multiWordTypeSuffix
-    : typeSpecifier+
+    : multiWordPrimitiveSpecifier+
+    ;
+
+// Only primitive words may continue a multi-word primitive spelling. Keeping user-defined
+// identifiers out of this rule is load-bearing: after `new Type(`, the identifiers in the
+// constructor argument list must not be mistaken for a type suffix.
+multiWordPrimitiveSpecifier
+    : 'void' | 'char' | 'short' | 'int' | 'long' | 'float' | 'double'
+    | 'signed' | 'unsigned' | Bool | 'string'
+    | 'i8' | 'i16' | 'i32' | 'i64' | 'i128'
+    | 'u8' | 'u16' | 'u32' | 'u64' | 'u128'
+    | 'va_list'
     ;
 // Bare C/C++ function type, used as a class-template argument (`std.function<int(int)>`).
 functionTypeArgument
-    : typeSpecifier pointer? '(' functionPointerParamList? ')'
+    : typeSpecifier multiWordTypeSuffix? pointer? '(' functionPointerParamList? ')'
     ;
 
 // A compile-time VALUE generic parameter: `struct Buf<T, int N>`. The primitive type token
@@ -488,7 +499,7 @@ structDeclarator
     ;
 
 enumSpecifier
-    : 'enum' Identifier ':' typeSpecifier '{' enumeratorList ','? '}'
+    : 'enum' Identifier ':' typeSpecifier multiWordTypeSuffix? '{' enumeratorList ','? '}'
     ;
 
 enumeratorList
@@ -633,7 +644,7 @@ labeledStatement
     : Identifier ':' statement?
     | 'case' constantExpression ':' statement                          // C-style value case
     | 'default' ':' statement                                          // C-style default
-    | 'case' typeSpecifier pointer Identifier? FatArrow statement      // arm-style type pointer case (e.g. case Quit* q =>)
+    | 'case' typeSpecifier multiWordTypeSuffix? pointer Identifier? FatArrow statement      // arm-style type pointer case (e.g. case Quit* q =>)
     | 'case' constantExpression FatArrow statement                     // arm-style value/type case
     | 'default' FatArrow statement                                     // arm-style wildcard
     ;
@@ -749,7 +760,7 @@ ifConstBlock
     ;
 
 usingDeclaration
-    : Using (Identifier | String) '=' typeSpecifier pointer? arrayTypeSuffix? ';'
+    : Using (Identifier | String) '=' typeSpecifier multiWordTypeSuffix? pointer? arrayTypeSuffix? ';'
     ;
 
 importDeclaration
@@ -995,9 +1006,9 @@ destructorDefinition
     ;
 
 newExpression
-    : New typeSpecifier ('(' argumentExpressionList ')')?
-    | New typeSpecifier '[' assignmentExpression ']' alignmentSpecifier?
-    | New typeSpecifier '{' initializerList ','? '}'
+    : New typeSpecifier multiWordTypeSuffix? ('(' argumentExpressionList ')')?
+    | New typeSpecifier multiWordTypeSuffix? '[' assignmentExpression ']' alignmentSpecifier?
+    | New typeSpecifier multiWordTypeSuffix? '{' initializerList ','? '}'
     ;
 
 moveExpression

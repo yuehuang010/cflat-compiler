@@ -42,7 +42,7 @@ bool MainListener::ValidateGenericArgumentKinds(const std::string& templateName,
         auto* llvmType = Compiler()->GetType(LLVMBackend::TypeAndValue{ .TypeName = valueType });
         unsigned bits = llvmType != nullptr && llvmType->isIntegerTy()
             ? llvmType->getIntegerBitWidth() : 0;
-        bool unsignedType = valueType.starts_with("u");
+        bool unsignedType = LLVMBackend::TypeAndValue{ .TypeName = valueType }.IsUnsignedInteger() != -1;
         bool inRange = bits != 0;
         if (inRange && valueType == "bool") inRange = value == 0 || value == 1;
         else if (inRange && unsignedType)
@@ -254,6 +254,12 @@ bool MainListener::IsFollowedByDot(CFlatParser::PostfixExpressionContext* ctx, a
 
 std::string MainListener::InstantiateGenericFunction(const std::string& baseName,
                                                     const std::vector<std::string>& spelledArgs) {
+        // Same refusal as QueuePendingInstantiation; the location is still the written argument.
+        if (genericFunctionTemplates.count(baseName) != 0 && HasLongDoubleTypeArgument(spelledArgs))
+        {
+            compilerLLVM->LogError(LocalizePrimitiveTypeError(compilerLLVM, LongDoubleNativeTypeError()));
+            return {};
+        }
         std::vector<std::string> typeArgs = spelledArgs;
         std::string mangledName = MangledGenericName(baseName, typeArgs);
         FillGenericValueDefaults(*Compiler(), baseName,
@@ -594,7 +600,8 @@ LLVMBackend::TypeAndValue MainListener::BuildFuncPtrAliasType(CFlatParser::Funct
             // the mangled "list$string" and queues the instantiation.
             bool retPtr = fpSpec->pointer() != nullptr;
             int retStars = PointerDepthOf(fpSpec->pointer());
-            tv.FuncPtrReturnTypeName = ResolveSigComponentCodegen(fpSpec->typeSpecifier(), retPtr);
+            tv.FuncPtrReturnTypeName = ResolveSigComponentCodegen(
+                fpSpec->typeSpecifier(), retPtr, fpSpec->multiWordTypeSuffix());
             tv.FuncPtrReturnPointer  = retPtr;
             if (auto* qualifier = fpSpec->functionReturnQualifier(); qualifier != nullptr)
             {
@@ -612,7 +619,8 @@ LLVMBackend::TypeAndValue MainListener::BuildFuncPtrAliasType(CFlatParser::Funct
                     LLVMBackend::TypeAndValue::FuncPtrParam p;
                     bool pPtr = param->pointer() != nullptr;
                     int pStars = PointerDepthOf(param->pointer());
-                    p.TypeName = ResolveSigComponentCodegen(param->typeSpecifier(), pPtr);
+                    p.TypeName = ResolveSigComponentCodegen(
+                        param->typeSpecifier(), pPtr, param->multiWordTypeSuffix());
                     p.Pointer  = pPtr;
                     p.IsMove   = param->Move() != nullptr;
                     p.PointerDepth = ReconcilePointerDepth(pPtr, pStars);
@@ -640,7 +648,12 @@ void MainListener::QueueInstantiateGenericType(CFlatParser::DeclarationSpecifier
                     break;
                 std::vector<std::string> typeArgs;
                 for (auto* entry : tts->tupleTypeEntry())
-                    typeArgs.push_back(TupleEntryArgName(Compiler(declSpec), entry));
+                {
+                    PrimitiveTypeError argError;
+                    typeArgs.push_back(TupleEntryArgName(Compiler(declSpec), entry, &argError));
+                    if (HasPrimitiveTypeError(argError))
+                        LogErrorContext(entry, LocalizePrimitiveTypeError(Compiler(declSpec), argError));
+                }
                 std::string mangledName = MangledGenericName("tuple", typeArgs);
                 tupleTypeArgs[mangledName] = typeArgs;
                 if (!instantiatedGenerics.count(mangledName))
@@ -686,6 +699,20 @@ void MainListener::QueuePendingInstantiation(const std::string& templateName,
     const std::vector<std::string>& typeArgs, const std::string& mangledName,
     antlr4::ParserRuleContext* site)
 {
+        // `long double` exists only as a C++ template argument. Refuse it for a CFlat template
+        // here, before the body is instantiated and fails deep inside the template's own file.
+        const bool cflatTemplate = genericStructTemplates.count(templateName) != 0
+            || genericClassTemplates.count(templateName) != 0
+            || genericInterfaceTemplates.count(templateName) != 0;
+        if (cflatTemplate && HasLongDoubleTypeArgument(typeArgs))
+        {
+            auto message = LocalizePrimitiveTypeError(compilerLLVM, LongDoubleNativeTypeError());
+            if (site != nullptr)
+                LogErrorContext(site, message);
+            else
+                compilerLLVM->LogError(message);
+            return;
+        }
         PendingInstantiation record{ templateName, typeArgs, mangledName };
         const auto& active = compilerLLVM->gts.activeInstantiationOrigin;
         if (active.valid)

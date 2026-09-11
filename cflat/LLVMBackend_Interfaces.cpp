@@ -186,7 +186,7 @@ bool LLVMBackend::IsPrimitiveTypeName(const std::string& name)
             "int", "char", "short", "long", "ulong", "bool", "void",
             "float", "double",
             "i8", "i16", "i32", "i64", "i128",
-            "u8", "u16", "u32", "u64", "u128",
+            "u8", "u16", "u32", "u64", "u128", "c8", "c16", "c32", "wchar",
         };
         return primitives.count(name) > 0;
     }

@@ -12,7 +12,8 @@ bool ShouldWarnImplicitFieldNarrowing(llvm::Value* value, llvm::Type* destinatio
     unsigned bits = destinationType->getIntegerBitWidth();
     std::string typeName = destinationTypeName;
     bool isUnsigned = typeName == "u8" || typeName == "u16"
-        || typeName == "u32" || typeName == "u64" || typeName == "u128";
+        || typeName == "u32" || typeName == "u64" || typeName == "u128"
+        || typeName == "c8" || typeName == "c16" || typeName == "c32";
     const llvm::APInt& integer = constant->getValue();
     return isUnsigned ? integer.isNegative() || integer.getActiveBits() > bits
                       : !integer.isSignedIntN(bits);
@@ -141,7 +142,8 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
             {
                 if (auto* dims = ArrayDimsOf(spec); dims != nullptr && !dims->assignmentExpression().empty())
                 {
-                    if (spec->typeSpecifier() != nullptr) element = spec->typeSpecifier()->getText();
+                    if (spec->typeSpecifier() != nullptr)
+                        element = CanonicalDeclarationTypeName(specs->declarationSpecifier(), spec->typeSpecifier()->getText());
                     break;
                 }
             }
@@ -2908,7 +2910,8 @@ void MainListener::ParseClassDefinition(CFlatParser::ClassDefinitionContext* ctx
             {
                 if (auto* dims = ArrayDimsOf(spec); dims != nullptr && !dims->assignmentExpression().empty())
                 {
-                    if (spec->typeSpecifier() != nullptr) element = spec->typeSpecifier()->getText();
+                    if (spec->typeSpecifier() != nullptr)
+                        element = CanonicalDeclarationTypeName(specs->declarationSpecifier(), spec->typeSpecifier()->getText());
                     break;
                 }
             }
@@ -3234,7 +3237,8 @@ void MainListener::ParseClassDefinition(CFlatParser::ClassDefinitionContext* ctx
                 {
                     // Pack: expand T... -> [int, float, ...] via the pack substitution (keyed by the
                     // bare parameter name). A non-substituted element keeps its `*`/`unique` suffix.
-                    std::string name = entry->typeSpecifier() ? entry->typeSpecifier()->getText() : entry->getText();
+                    std::string name = entry->typeSpecifier()
+                        ? CanonicalTemplateTypeArgument(entry) : entry->getText();
                     auto packIt = activePackSubstitutions.find(name);
                     if (packIt != activePackSubstitutions.end())
                         for (const auto& t : packIt->second)

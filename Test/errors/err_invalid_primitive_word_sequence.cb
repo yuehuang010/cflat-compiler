@@ -1,0 +1,9 @@
+extern int main() { return 0; }
+
+expect_error("invalid type spelling 'long long long'") {
+    long long long value = 0;
+}
+
+expect_error("invalid type spelling 'short long'") {
+    short long value = 0;
+}

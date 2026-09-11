@@ -447,6 +447,7 @@ static SymbolArgumentFamily SymbolTypeFamily(const std::string& typeName)
     if (lower == "bool") return SymbolArgumentFamily::Boolean;
     if (lower == "int" || lower == "i8" || lower == "i16" || lower == "i32" ||
         lower == "i64" || lower == "i128" || lower == "u8" || lower == "u16" || lower == "u32" ||
+        lower == "c8" || lower == "c16" || lower == "c32" || lower == "wchar" ||
         lower == "u64" || lower == "u128" || lower == "long" || lower == "short")
         return SymbolArgumentFamily::Integer;
     if (lower == "float" || lower == "double") return SymbolArgumentFamily::Floating;

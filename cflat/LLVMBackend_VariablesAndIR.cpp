@@ -1074,13 +1074,14 @@ LLVMBackend::NamedVariable LLVMBackend::EmitBitfieldRead(
 unsigned LLVMBackend::BitfieldStorageBits(const std::string& typeName)
 {
         if (typeName == "bool")  return 8;   // CFlat bool is i8 in storage
-        if (typeName == "char" || typeName == "i8"  || typeName == "u8")  return 8;
-        if (typeName == "short"|| typeName == "i16" || typeName == "u16") return 16;
-        if (typeName == "int"  || typeName == "i32" || typeName == "u32") return 32;
+        if (typeName == "char" || typeName == "i8"  || typeName == "u8" || typeName == "c8")  return 8;
+        if (typeName == "short"|| typeName == "i16" || typeName == "u16" || typeName == "c16") return 16;
+        if (typeName == "int"  || typeName == "i32" || typeName == "u32" || typeName == "c32") return 32;
         if (typeName == "i64" || typeName == "u64") return 64;
         if (typeName == "i128" || typeName == "u128") return 128;
         // target-native C `long` / `unsigned long`
         if (typeName == "long" || typeName == "ulong") return longBits_;
+        if (typeName == "wchar") return wcharBits_;
         return 0;
     }
 
@@ -1637,7 +1638,7 @@ llvm::Constant* LLVMBackend::CreateConstant(std::string typeName, std::string in
 {
         llvm::Constant* value = nullptr;
 
-        if (typeName == "char" || typeName == "i8" || typeName == "u8")
+        if (typeName == "char" || typeName == "i8" || typeName == "u8" || typeName == "c8")
         {
             int initValue = 0;
             if (!initialValue.empty())
@@ -1647,7 +1648,7 @@ llvm::Constant* LLVMBackend::CreateConstant(std::string typeName, std::string in
 
             value = builder->getInt8(initValue);
         }
-        else if (typeName == "short" || typeName == "i16" || typeName == "u16")
+        else if (typeName == "short" || typeName == "i16" || typeName == "u16" || typeName == "c16")
         {
             int initValue = 0;
             if (!initialValue.empty())
@@ -1657,7 +1658,7 @@ llvm::Constant* LLVMBackend::CreateConstant(std::string typeName, std::string in
 
             value = builder->getInt16(initValue);
         }
-        else if (typeName == "int" || typeName == "i32" || typeName == "u32")
+        else if (typeName == "int" || typeName == "i32" || typeName == "u32" || typeName == "c32")
         {
             int initValue = 0;
             if (!initialValue.empty())
@@ -1680,6 +1681,11 @@ llvm::Constant* LLVMBackend::CreateConstant(std::string typeName, std::string in
                 value = builder->getInt32(initValue);
             else
                 value = builder->getInt64(initValue);
+        }
+        else if (typeName == "wchar")
+        {
+            int initValue = initialValue.empty() ? 0 : std::stoi(initialValue);
+            value = wcharBits_ == 16 ? builder->getInt16(initValue) : builder->getInt32(initValue);
         }
         else if (typeName == "i128" || typeName == "u128")
         {

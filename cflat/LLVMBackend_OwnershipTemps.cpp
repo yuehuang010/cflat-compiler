@@ -54,9 +54,14 @@
 
 // ---- Definitions moved out of LLVMBackend.h (OwnershipTemps) ----
 
-void LLVMBackend::SetTargetLongWidth(bool targetWindows, int platformBits)
+void LLVMBackend::SetTargetLongWidth(bool targetWindows, int platformBits,
+                                     bool targetArm64, bool targetMacOS)
 {
         longBits_ = (targetWindows || platformBits == 32) ? 32 : 64;
+        wcharBits_ = targetWindows ? 16 : 32;
+        // Windows wchar_t is unsigned 16-bit; Linux aarch64 wchar_t is unsigned 32-bit;
+        // Linux x86-64 and macOS arm64 use signed 32-bit wchar_t.
+        wcharSigned_ = !targetWindows && (!targetArm64 || targetMacOS);
     }
 
 void LLVMBackend::AddVectorizeLoopInfo(const VectorizeLoopInfo& info)

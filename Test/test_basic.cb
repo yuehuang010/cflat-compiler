@@ -4316,6 +4316,11 @@ using PointerAlias = int*;
 using PointerAliasChain = PointerAlias;
 using PointerAliasDepth = PointerAlias*;
 
+struct UnsignedIntPointerField
+{
+    unsigned int* f = default;
+};
+
 bool testAliasAndStaticResolution()
 {
     PointerAliasChain p = nullptr;
@@ -4325,6 +4330,67 @@ bool testAliasAndStaticResolution()
     result &= Test("qualified_namespace_alias", q, 4);
     result &= Test("namespace_static_qualified", NamespaceStaticChecks.Utility.add(10), 11);
     result &= Test("pointer_alias_chain", (p == nullptr && pp == nullptr) ? 1 : 0, 1);
+    return result;
+}
+
+bool testCSpellingsAndCharTypes()
+{
+    signed char signedCharValue = 1;
+    unsigned char unsignedCharValue = 2;
+    short int shortIntValue = 3;
+    signed short signedShortValue = 4;
+    unsigned short unsignedShortValue = 5;
+    signed int signedIntValue = 6;
+    unsigned int unsignedIntValue = 7;
+    long int longIntValue = 8;
+    signed long signedLongValue = 9;
+    unsigned long unsignedLongValue = 10;
+    long long longLongValue = 11;
+    unsigned long long unsignedLongLongValue = 12;
+    c8 c8Value = signedCharValue;
+    c16 c16Value = unsignedShortValue;
+    c32 c32Value = unsignedIntValue;
+    wchar wcharValue = 13;
+    bool result = c8Value == 1 && c16Value == 5 && c32Value == 7 && wcharValue == 13;
+    result &= signedShortValue == 4 && signedIntValue == 6 && longIntValue == 8;
+    result &= signedLongValue == 9 && longLongValue == 11 && unsignedLongLongValue == 12;
+    result &= sizeof(c8) == 1 && sizeof(c16) == 2 && sizeof(c32) == 4;
+    if const (__WINDOWS__) result &= sizeof(wchar) == 2;
+    else                   result &= sizeof(wchar) == 4;
+    {
+        // A visible variable hides the same-named type, as in C and typeof: measure the i64.
+        i64 c16 = 5;
+        result &= sizeof(c16) == 8 && c16 == 5;
+    }
+
+    unsigned int pointedValue = 17;
+    unsigned int* pointed = &pointedValue;
+    long long longLongPointedValue = 18;
+    long long* longLongPointed = &longLongPointedValue;
+    result &= *pointed == 17 && *longLongPointed == 18;
+    unsigned int[4] fixedUnsigned = default;
+    fixedUnsigned[3] = 19;
+    result &= sizeof(fixedUnsigned) == 16 && fixedUnsigned[3] == 19;
+    UnsignedIntPointerField field = default;
+    field.f = pointed;
+    result &= *field.f == 17;
+    unsigned long castValue = (unsigned long)20;
+    result &= castValue == 20 && sizeof(unsigned short) == 2;
+    list<unsigned int> unsignedList = default;
+    unsignedList.add(21);
+    result &= unsignedList[0] == 21;
+    c16 wrappingChar = (c16)65535;
+    wrappingChar = wrappingChar + 1;
+    result &= wrappingChar == 0;
+    char[8] c16PrintfBuffer = default;
+    snprintf(c16PrintfBuffer, 8, "%d", (c16)65);
+    result &= strcmp(c16PrintfBuffer, "65") == 0;
+    // No variable named c16 is visible here, so `(c16)` is a cast: 65541 wraps to 5.
+    int castSource = 65541;
+    result &= (c16)castSource == 5;
+    uint uintValue = 22;
+    result &= uintValue == 22 && strcmp(typeof(char16_t), "c16") == 0
+        && strcmp(typeof(c32), "c32") == 0;
     return result;
 }
 
@@ -4364,6 +4430,7 @@ extern int main()
     total++; passed += testNestedNamespace()             ? 1 : 0;
     total++; passed += testNestedUsing()                 ? 1 : 0;
     total++; passed += testAliasAndStaticResolution() ? 1 : 0;
+    total++; passed += testCSpellingsAndCharTypes()      ? 1 : 0;
     total++; passed += testLocalUsing()                  ? 1 : 0;
     total++; passed += testLocalUsingScoped()            ? 1 : 0;
     total++; passed += testNamespaceTypeShadowing()      ? 1 : 0;

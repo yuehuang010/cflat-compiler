@@ -17,6 +17,14 @@ expect_error("fixed-size array parameter 'a' of type 'int[3]' is not supported; 
     int sum3(int[3] a) { return a[0]; }
 }
 
+// A multi-word C element spelling is named by its CFlat word, not by its last word ('int').
+expect_error("fixed-size array parameter 'a' of type 'u32[3]' is not supported; declare it as an array view 'u32[]' instead.") {
+    int sumU3(unsigned int[3] a) { return 0; }
+}
+expect_error("fixed-size array parameter 'p' of type 'i64*[2]' is not supported; pass 'i64**' instead (a fixed array decays to a pointer to its first element).") {
+    int firstLL(long long*[2] p) { return 0; }
+}
+
 // The spelling from the original issue: the `function<T>[N]` overload was a VALUE parameter in
 // disguise, so `pick(dbl)` bound to it while `pick(arr)` went to the `function<T>[]` overload.
 expect_error("fixed-size array parameter 'fns' of type 'function<int(int)>[3]' is not supported; declare it as an array view 'function<int(int)>[]' instead.") {

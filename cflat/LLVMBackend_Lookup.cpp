@@ -56,8 +56,8 @@
 bool LLVMBackend::IsKnownTypeName(const std::string& name) const
 {
         static const std::unordered_set<std::string> scalars = {
-            "void", "char", "i8", "u8", "short", "i16", "u16", "int", "i32", "u32",
-            "long", "ulong", "i64", "u64", "i128", "u128", "float", "double", "bool", "va_list", "auto" };
+            "void", "char", "i8", "u8", "c8", "short", "i16", "u16", "c16", "int", "i32", "u32", "uint", "c32",
+            "long", "ulong", "i64", "u64", "i128", "u128", "wchar", "float", "double", "bool", "va_list", "auto" };
         if (scalars.count(name)) return true;
         std::string resolved = ResolveTypeAlias(name);
         return enumBackingTypes.count(resolved) > 0 || resolved != name
@@ -293,14 +293,17 @@ llvm::Type* LLVMBackend::GetType(const LLVMBackend::TypeAndValue& typeAndValue, 
         bool skipPointerWrap = false;
 
         if (resolvedTypeName == "void") { type = builder->getVoidTy(); }
-        else if (resolvedTypeName == "char" || resolvedTypeName == "i8" || resolvedTypeName == "u8") { type = builder->getInt8Ty(); }
-        else if (resolvedTypeName == "short" || resolvedTypeName == "i16" || resolvedTypeName == "u16") { type = builder->getInt16Ty(); }
-        else if (resolvedTypeName == "int" || resolvedTypeName == "i32" || resolvedTypeName == "u32") { type = builder->getInt32Ty(); }
+        else if (resolvedTypeName == "char" || resolvedTypeName == "i8" || resolvedTypeName == "u8" || resolvedTypeName == "c8") { type = builder->getInt8Ty(); }
+        else if (resolvedTypeName == "short" || resolvedTypeName == "i16" || resolvedTypeName == "u16" || resolvedTypeName == "c16") { type = builder->getInt16Ty(); }
+        else if (resolvedTypeName == "int" || resolvedTypeName == "i32" || resolvedTypeName == "u32"
+            || resolvedTypeName == "uint" || resolvedTypeName == "c32") { type = builder->getInt32Ty(); }
         else if (resolvedTypeName == "i64" || resolvedTypeName == "u64") { type = builder->getInt64Ty(); }
         else if (resolvedTypeName == "i128" || resolvedTypeName == "u128") { type = builder->getInt128Ty(); }
         // `long`/`ulong` are the target's native C long: i32 on Windows (LLP64), i64 on LP64.
         else if (resolvedTypeName == "long" || resolvedTypeName == "ulong")
             { type = (longBits_ == 32) ? builder->getInt32Ty() : builder->getInt64Ty(); }
+        else if (resolvedTypeName == "wchar")
+            { type = (wcharBits_ == 16) ? builder->getInt16Ty() : builder->getInt32Ty(); }
         else if (resolvedTypeName == "float") { type = builder->getFloatTy(); }
         else if (resolvedTypeName == "double") { type = builder->getDoubleTy(); }
         else if (resolvedTypeName == "bool") { type = builder->getInt1Ty(); }

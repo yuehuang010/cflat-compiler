@@ -79,6 +79,12 @@ expect_error("interface method 'Q13TypeInterface.get' cannot return a fixed-size
 expect_error("member 'get' cannot return the fixed array 'char[N]' by value") {
     struct Q13TypeStruct { char[8] get(); };
 }
+expect_error("member 'get' cannot return the fixed array 'u16[N]' by value") {
+    struct Q13MultiWordStruct { unsigned short[8] get(); };
+}
+expect_error("member 'get' cannot return the fixed array 'u16[N]' by value") {
+    class Q13MultiWordClass { unsigned short[8] get(); };
+}
 
 interface Q12ArrayViewInterface { int f(); };
 struct Q12UniqueArrayViewBox<T> { T value = default; };

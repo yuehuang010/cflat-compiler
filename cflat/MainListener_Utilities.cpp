@@ -35,7 +35,7 @@ static std::string FixedArrayParamMessage(CFlatParser::ParameterDeclarationConte
             auto* dimSpec = ArrayDimsOf(s);
             if (bracketed && (dimSpec == nullptr || dimSpec->assignmentExpression().empty()))
                 continue;
-            element = s->typeSpecifier()->getText();
+            element = CanonicalDeclarationTypeName(specs->declarationSpecifier(), s->typeSpecifier()->getText());
             stars = s->pointer() != nullptr ? s->pointer()->getText() : "";
             if (bracketed)
                 dims = dimSpec->getText();

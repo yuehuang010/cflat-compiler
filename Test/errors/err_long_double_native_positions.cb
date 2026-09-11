@@ -1,0 +1,57 @@
+import "list.cb";
+
+extern int main() { return 0; }
+
+// Kept apart from err_long_double_native_type.cb: its bare-semicolon tuple leg is armed for the
+// whole compile and ends it at the first match, so scoped legs added there never run.
+expect_error("only usable as a C++ template argument") {
+    long double value = 0;
+}
+
+expect_error("only usable as a C++ template argument") {
+    int test_simd_long_double()
+    {
+        simd<long double,4> value = default;
+        return 0;
+    }
+}
+
+expect_error("only usable as a C++ template argument") {
+    int test_long_double_param(long double value) { return 0; }
+}
+
+expect_error("only usable as a C++ template argument") {
+    long double test_long_double_return() { return 0; }
+}
+
+expect_error("only usable as a C++ template argument") {
+    int test_long_double_fixed_array_param(long double values[4]) { return 0; }
+}
+
+expect_error("only usable as a C++ template argument") {
+    int test_long_double_list()
+    {
+        list<long double> values = default;
+        return 0;
+    }
+}
+
+struct LongDoubleBox<T> { T value = default; };
+
+expect_error("only usable as a C++ template argument") {
+    int test_long_double_generic_struct()
+    {
+        LongDoubleBox<long double> box = default;
+        return 0;
+    }
+}
+
+T longDoubleIdentity<T>(T value) { return value; }
+
+expect_error("only usable as a C++ template argument") {
+    int test_long_double_generic_function()
+    {
+        double value = longDoubleIdentity<long double>(1.0);
+        return 0;
+    }
+}

@@ -416,6 +416,11 @@ llvm::DIType* LLVMBackend::GetDIType(const TypeAndValue& tv)
         else if (tv.TypeName == "u32")    basic = diBuilder->createBasicType("u32", 32, DW_ATE_unsigned);
         else if (tv.TypeName == "u64")    basic = diBuilder->createBasicType("u64", 64, DW_ATE_unsigned);
         else if (tv.TypeName == "u128")   basic = diBuilder->createBasicType("u128", 128, DW_ATE_unsigned);
+        else if (tv.TypeName == "c8")     basic = diBuilder->createBasicType("c8", 8, DW_ATE_unsigned_char);
+        else if (tv.TypeName == "c16")    basic = diBuilder->createBasicType("c16", 16, DW_ATE_unsigned);
+        else if (tv.TypeName == "c32")    basic = diBuilder->createBasicType("c32", 32, DW_ATE_unsigned);
+        else if (tv.TypeName == "wchar")  basic = diBuilder->createBasicType("wchar", wcharBits_,
+            wcharSigned_ ? DW_ATE_signed : DW_ATE_unsigned);
         else if (tv.TypeName == "void")   basic = diBuilder->createUnspecifiedType("void");
 
         if (basic)

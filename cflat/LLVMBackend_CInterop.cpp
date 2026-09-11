@@ -687,10 +687,11 @@ bool LLVMBackend::VcRuntimeInstalled()
         return false;
     }
 
-bool LLVMBackend::MapCTypeToTypeAndValue(std::string ctype, TypeAndValue& out)
+bool LLVMBackend::MapCTypeToTypeAndValue(std::string ctype, TypeAndValue& out,
+                                         bool cxxBoundary)
 {
         std::unordered_set<std::string> visited;
-        return MapCTypeToTypeAndValueImpl(std::move(ctype), out, visited);
+        return MapCTypeToTypeAndValueImpl(std::move(ctype), out, visited, cxxBoundary);
 }
 
 void LLVMBackend::SetCInteropTargetFacts(const cflat_cinterop::ExtractResult& raw)
@@ -726,7 +727,8 @@ bool LLVMBackend::IsLongDoubleSpelling(const std::string& spelling)
 }
 
 bool LLVMBackend::ParseCFunctionPointerSpelling(const std::string& s, TypeAndValue& out,
-                                       std::unordered_set<std::string>& visited)
+                                       std::unordered_set<std::string>& visited,
+                                       bool cxxBoundary)
 {
         // Locate "(*)" possibly with whitespace around the star.
         size_t markerPos = std::string::npos;
@@ -782,7 +784,7 @@ bool LLVMBackend::ParseCFunctionPointerSpelling(const std::string& s, TypeAndVal
 
         // Resolve the return type via the same recursive resolver.
         TypeAndValue retTV;
-        if (!MapCTypeToTypeAndValueImpl(retSpelling, retTV, visited)) return false;
+        if (!MapCTypeToTypeAndValueImpl(retSpelling, retTV, visited, cxxBoundary)) return false;
         // Function pointers returning function pointers are not supported here.
         if (retTV.IsFunctionPointer) return false;
 
@@ -822,7 +824,7 @@ bool LLVMBackend::ParseCFunctionPointerSpelling(const std::string& s, TypeAndVal
         for (auto& p : parts)
         {
             TypeAndValue ptv;
-            if (!MapCTypeToTypeAndValueImpl(trim(p), ptv, visited)) return false;
+            if (!MapCTypeToTypeAndValueImpl(trim(p), ptv, visited, cxxBoundary)) return false;
             if (ptv.IsFunctionPointer) return false; // nested fn-ptr arg not supported
             TypeAndValue::FuncPtrParam fp;
             fp.TypeName = ptv.TypeName;
@@ -1008,14 +1010,15 @@ bool LLVMBackend::TryMapCxxForeignSpelling(const std::string& ctype, TypeAndValu
     }
 
 bool LLVMBackend::MapCTypeToTypeAndValueImpl(std::string ctype, TypeAndValue& out,
-                                    std::unordered_set<std::string>& visited)
+                                    std::unordered_set<std::string>& visited,
+                                    bool cxxBoundary)
 {
         if (ctype.find("::*") != std::string::npos)
             return false;
         // Detect function-pointer spelling before the '*'-strip path mangles it. The declarator
         // may carry cv/nullability words between '*' and ')', so do not rely on the literal
         // "(*)" substring as a precondition for the parser.
-        if (ParseCFunctionPointerSpelling(ctype, out, visited))
+        if (ParseCFunctionPointerSpelling(ctype, out, visited, cxxBoundary))
             return true;
 
         // Before any '*' or qualifier is removed: a requested C++ specialization is keyed on
@@ -1166,7 +1169,7 @@ bool LLVMBackend::MapCTypeToTypeAndValueImpl(std::string ctype, TypeAndValue& ou
                 { "unsigned long long", "u64" }, { "unsigned long long int", "u64" },
                 { "__int128", "i128" }, { "unsigned __int128", "u128" },
                 { "float", "float" }, { "double", "double" },
-                { "char16_t", "u16" }, { "char32_t", "u32" },
+                { "char8_t", "u8" }, { "char16_t", "u16" }, { "char32_t", "u32" },
             };
             // C `long` is the one scalar whose width is target-dependent: Windows is LLP64
             // (32-bit long), Linux/macOS are LP64 (64-bit long). `size_t` desugars to it.
@@ -1175,8 +1178,16 @@ bool LLVMBackend::MapCTypeToTypeAndValueImpl(std::string ctype, TypeAndValue& ou
             static const std::unordered_set<std::string> cLongUnsigned = {
                 "unsigned long", "unsigned long int" };
 
-            auto it = scalarMap.find(base);
-            if (it != scalarMap.end())
+            // C declarations use target width; C++ declarations retain long identity for mangling.
+            if (cxxBoundary && base == "char8_t")
+                mapped = "c8";
+            else if (cxxBoundary && base == "char16_t")
+                mapped = "c16";
+            else if (cxxBoundary && base == "char32_t")
+                mapped = "c32";
+            else if (cxxBoundary && base == "wchar_t")
+                mapped = "wchar";
+            else if (auto it = scalarMap.find(base); it != scalarMap.end())
                 mapped = it->second;
             else if (base == "std.nullptr_t" || base == "std.__1.nullptr_t" || base == "nullptr_t")
             {
@@ -1184,9 +1195,9 @@ bool LLVMBackend::MapCTypeToTypeAndValueImpl(std::string ctype, TypeAndValue& ou
                 if (ptr == 0) ptr = 1;
             }
             else if (cLongSigned.count(base) > 0)
-                mapped = targetWindows_ ? "i32" : "i64";
+                mapped = cxxBoundary ? "long" : (targetWindows_ ? "i32" : "i64");
             else if (cLongUnsigned.count(base) > 0)
-                mapped = targetWindows_ ? "u32" : "u64";
+                mapped = cxxBoundary ? "ulong" : (targetWindows_ ? "u32" : "u64");
             else if (base == "wchar_t")
                 mapped = targetWindows_ ? "u16" : "i32";
             else if (base == "long double")
@@ -1214,7 +1225,8 @@ bool LLVMBackend::MapCTypeToTypeAndValueImpl(std::string ctype, TypeAndValue& ou
                 {
                     std::string substituted = td->second;
                     if (ptr > 0) substituted += std::string(ptr, '*');
-                    return MapCTypeToTypeAndValueImpl(std::move(substituted), out, visited);
+                    return MapCTypeToTypeAndValueImpl(std::move(substituted), out, visited,
+                                                      cxxBoundary);
                 }
                 return false;    // struct/union by value or unknown scalar
             }
@@ -1335,7 +1347,7 @@ void LLVMBackend::RegisterCSignatures(const std::vector<CSigEntry>& sigs, const 
                         else
                         {
                             TypeAndValue ret;
-                            if (MapCTypeToTypeAndValue(retText, ret))
+                            if (MapCTypeToTypeAndValue(retText, ret, e.isCxx))
                             {
                                 TypeAndValue closure;
                                 closure.IsFunctionPointer = true;
@@ -1365,7 +1377,7 @@ void LLVMBackend::RegisterCSignatures(const std::vector<CSigEntry>& sigs, const 
                                     if (!one.empty())
                                     {
                                         TypeAndValue pv;
-                                        if (!MapCTypeToTypeAndValue(one, pv)) { ok = false; break; }
+                                        if (!MapCTypeToTypeAndValue(one, pv, e.isCxx)) { ok = false; break; }
                                         TypeAndValue::FuncPtrParam fp;
                                         fp.TypeName = pv.TypeName;
                                         fp.Pointer = pv.Pointer;
@@ -1713,7 +1725,7 @@ bool LLVMBackend::MapRawSig(const cflat_cinterop::RawSig& r, CSigEntry& e)
         e.file     = r.file;
         e.line     = r.line ? r.line : 1;
         e.col      = r.col < 0 ? 0 : r.col;
-        if (!MapCTypeToTypeAndValue(r.retType, e.ret))
+        if (!MapCTypeToTypeAndValue(r.retType, e.ret, r.isCxx))
         {
             if (r.isCxx)
                 e.bindRefusal = IsLongDoubleSpelling(r.retType) && !IsCInteropLongDoubleSupported()
@@ -1743,12 +1755,12 @@ bool LLVMBackend::MapRawSig(const cflat_cinterop::RawSig& r, CSigEntry& e)
                 return true;
             }
             TypeAndValue ptv;
-            if (!MapCTypeToTypeAndValue(r.paramTypes[i], ptv))
+            if (!MapCTypeToTypeAndValue(r.paramTypes[i], ptv, r.isCxx))
             {
                 std::string arrayElement;
                 uint64_t arrayExtent = 0;
                 if (r.isCxx && ParseCxxArrayParameter(r.paramTypes[i], arrayElement, arrayExtent)
-                    && MapCTypeToTypeAndValue(arrayElement, ptv))
+                    && MapCTypeToTypeAndValue(arrayElement, ptv, r.isCxx))
                 {
                     ptv.Pointer = true;
                     ptv.ElemPointer = false;
@@ -1811,13 +1823,17 @@ static std::string AutoCxxForeignIdentity(const std::string& spelling)
         // Keep multi-word primitive template arguments aligned with the CFlat spellings emitted
         // by CxxSpellingForCflatType (for example vector<unsigned char> -> vector$u8).
         std::string normalized = spelling;
-        for (const auto& [from, to] : std::array<std::pair<std::string_view, std::string_view>, 6>{
+        for (const auto& [from, to] : std::array<std::pair<std::string_view, std::string_view>, 10>{
                  std::pair{ "signed char", "i8" },
                  std::pair{ "unsigned char", "u8" },
                  std::pair{ "unsigned short", "u16" },
                  std::pair{ "unsigned int", "u32" },
                  std::pair{ "unsigned long long", "u64" },
-                 std::pair{ "long long", "i64" } })
+                 std::pair{ "long long", "i64" },
+                 std::pair{ "char8_t", "c8" },
+                 std::pair{ "char16_t", "c16" },
+                 std::pair{ "char32_t", "c32" },
+                 std::pair{ "wchar_t", "wchar" } })
         {
             for (size_t pos = 0; (pos = normalized.find(from, pos)) != std::string::npos; )
             {
@@ -2203,11 +2219,11 @@ void LLVMBackend::RegisterCxxFunctionPointerAbis(
         for (const auto& raw : plans)
         {
             CxxFunctionPointerAbiPlan plan;
-            if (!MapCTypeToTypeAndValue(raw.retType, plan.ret)) continue;
+            if (!MapCTypeToTypeAndValue(raw.retType, plan.ret, true)) continue;
             for (const auto& spelling : raw.paramTypes)
             {
                 TypeAndValue p;
-                if (!MapCTypeToTypeAndValue(spelling, p)) { plan.params.clear(); break; }
+                if (!MapCTypeToTypeAndValue(spelling, p, true)) { plan.params.clear(); break; }
                 // C++ callback references map to CFlat pointers because both are pointer ABI slots.
                 plan.params.push_back(std::move(p));
             }
@@ -2236,7 +2252,8 @@ void LLVMBackend::RegisterCxxFunctionPointerAbis(
         }
     }
 
-bool LLVMBackend::MapRawGlobal(const cflat_cinterop::RawGlobalVar& r, CGlobalEntry& e)
+bool LLVMBackend::MapRawGlobal(const cflat_cinterop::RawGlobalVar& r, CGlobalEntry& e,
+                               bool cxxBoundary)
 {
         if (r.ctype.find('[') != std::string::npos)
         {
@@ -2247,7 +2264,7 @@ bool LLVMBackend::MapRawGlobal(const cflat_cinterop::RawGlobalVar& r, CGlobalEnt
         e.name = r.name;
         e.line = r.line ? r.line : 1;
         e.col  = r.col < 0 ? 0 : r.col;
-        if (!MapCTypeToTypeAndValue(r.ctype, e.type))
+        if (!MapCTypeToTypeAndValue(r.ctype, e.type, cxxBoundary))
         {
             if (verbose) std::cout << std::format("[verbose]   skipping global '{}': unsupported type '{}'\n", r.name, r.ctype);
             return false;
@@ -2256,7 +2273,8 @@ bool LLVMBackend::MapRawGlobal(const cflat_cinterop::RawGlobalVar& r, CGlobalEnt
         return true;
     }
 
-bool LLVMBackend::ClassifyRawMacro(const cflat_cinterop::RawMacro& r, CMacroEntry& e)
+bool LLVMBackend::ClassifyRawMacro(const cflat_cinterop::RawMacro& r, CMacroEntry& e,
+                                   bool cxxBoundary)
 {
         using K = cflat_cinterop::RawMacro;
         if (r.kind == K::Skip && r.aliasTarget.empty()) return false;
@@ -2275,7 +2293,7 @@ bool LLVMBackend::ClassifyRawMacro(const cflat_cinterop::RawMacro& r, CMacroEntr
         if (!r.naturalType.empty())
         {
             TypeAndValue tv;
-            if (MapCTypeToTypeAndValue(r.naturalType, tv))
+            if (MapCTypeToTypeAndValue(r.naturalType, tv, cxxBoundary))
             {
                 if (tv.IsFunctionPointer) { e.isFuncPtr = true; e.funcPtrTV = std::move(tv); }
                 else if (tv.Pointer && !tv.ElemPointer && tv.TypeName == "void") e.isPointer = true;
@@ -2400,7 +2418,8 @@ void LLVMBackend::RegisterTypeAliasSymbol(const std::string& alias, const std::s
                     "typedef " + target + " " + alias);
     }
 
-void LLVMBackend::RegisterTypeAliasSymbols(const std::vector<CTypeAliasEntry>& aliases)
+void LLVMBackend::RegisterTypeAliasSymbols(const std::vector<CTypeAliasEntry>& aliases,
+                                           bool cxxBoundary)
 {
         auto cxxIdentity = [&](const CTypeAliasEntry& a, std::string& baseOut,
                                std::vector<std::string>& argsOut, std::string& out) -> bool {
@@ -2476,7 +2495,7 @@ void LLVMBackend::RegisterTypeAliasSymbols(const std::vector<CTypeAliasEntry>& a
                 {
                     std::string qualifiedTarget = a.target;
                     TypeAndValue mappedTarget;
-                    if (MapCTypeToTypeAndValue(a.target, mappedTarget))
+                    if (MapCTypeToTypeAndValue(a.target, mappedTarget, cxxBoundary))
                     {
                         qualifiedTarget = mappedTarget.TypeName;
                         if (mappedTarget.Pointer) qualifiedTarget += "*";
@@ -3009,7 +3028,7 @@ bool LLVMBackend::ExtractCHeaderClang(const std::vector<std::string>& headerPath
         {
             if (re.enumType.empty() || re.underlyingType.empty()) continue;
             TypeAndValue backing;
-            if (MapCTypeToTypeAndValue(re.underlyingType, backing))
+            if (MapCTypeToTypeAndValue(re.underlyingType, backing, cxxMode))
                 RegisterEnumBackingType(re.enumType, backing.TypeName);
         }
 
@@ -3049,7 +3068,7 @@ bool LLVMBackend::ExtractCHeaderClang(const std::vector<std::string>& headerPath
             CollectRecordTypedefAliases(raw, outAliases);
             RegisterRecordAliases(outAliases);
             CollectTypeAliases(raw, outTypeAliases);
-            if (cxxMode) RegisterTypeAliasSymbols(outTypeAliases);
+            if (cxxMode) RegisterTypeAliasSymbols(outTypeAliases, true);
             RegisterCxxFunctionPointerAbis(raw.functionPointerAbis);
         }
 
@@ -3103,7 +3122,7 @@ bool LLVMBackend::ExtractCHeaderClang(const std::vector<std::string>& headerPath
             for (const auto& rm : raw.macros)
             {
                 CMacroEntry e;
-                if (ClassifyRawMacro(rm, e)) outMacros.push_back(std::move(e));
+                if (ClassifyRawMacro(rm, e, cxxMode)) outMacros.push_back(std::move(e));
             }
             for (const auto& rf : raw.funcMacros)
             {
@@ -3119,7 +3138,7 @@ bool LLVMBackend::ExtractCHeaderClang(const std::vector<std::string>& headerPath
             for (const auto& rg : raw.globals)
             {
                 CGlobalEntry e;
-                if (MapRawGlobal(rg, e)) outGlobals.push_back(std::move(e));
+                if (MapRawGlobal(rg, e, cxxMode)) outGlobals.push_back(std::move(e));
             }
         }
 
@@ -3192,8 +3211,10 @@ bool LLVMBackend::CxxSpellingForCflatType(const std::string& cflatType, std::str
             { "i8", "signed char" }, { "u8", "unsigned char" },
             { "short", "short" }, { "i16", "short" }, { "u16", "unsigned short" },
             { "int", "int" }, { "i32", "int" }, { "uint", "unsigned int" }, { "u32", "unsigned int" },
-            { "long", "long long" }, { "i64", "long long" },
-            { "ulong", "unsigned long long" }, { "u64", "unsigned long long" },
+            { "long", "long" }, { "i64", "long long" },
+            { "ulong", "unsigned long" }, { "u64", "unsigned long long" },
+            { "c8", "char8_t" }, { "c16", "char16_t" },
+            { "c32", "char32_t" }, { "wchar", "wchar_t" },
             { "float", "float" }, { "double", "double" }, { "void", "void" },
             { "longdouble", "long double" },
         };
@@ -6114,7 +6135,7 @@ bool LLVMBackend::ExtractCFileClang(const std::string& cSourcePath,
             for (const auto& rg : raw.globals)
             {
                 CGlobalEntry e;
-                if (MapRawGlobal(rg, e)) outGlobals.push_back(std::move(e));
+                if (MapRawGlobal(rg, e, cxxMode)) outGlobals.push_back(std::move(e));
             }
         }
         return true;
@@ -6239,7 +6260,8 @@ std::string LLVMBackend::ConstIntValueSuffix(const std::string& typeName, long l
         return std::format(" = {}", value);
     }
 
-void LLVMBackend::RegisterCEnums(const std::vector<CEnumEntry>& enums, const std::string& fileForLsp)
+void LLVMBackend::RegisterCEnums(const std::vector<CEnumEntry>& enums, const std::string& fileForLsp,
+                                 bool cxxBoundary)
 {
         for (const CEnumEntry& e : enums)
         {
@@ -6247,7 +6269,7 @@ void LLVMBackend::RegisterCEnums(const std::vector<CEnumEntry>& enums, const std
             if (!e.enumType.empty() && !e.underlyingType.empty())
             {
                 TypeAndValue backing;
-                if (MapCTypeToTypeAndValue(e.underlyingType, backing))
+                if (MapCTypeToTypeAndValue(e.underlyingType, backing, cxxBoundary))
                     RegisterEnumBackingType(e.enumType, backing.TypeName);
             }
             if (!e.enumType.empty() && GetEnumBackingType(e.enumType).empty())
@@ -6507,7 +6529,7 @@ void LLVMBackend::RegisterCRecords(std::vector<CRecordEntry>& records, const std
                 // pointer (right for params, wrong for fields), so peel them here first.
                 std::vector<uint64_t> arrDims;
                 std::string elemSpelling = StripFixedArrayDims(f.ctype, arrDims);
-                if (!MapCTypeToTypeAndValue(elemSpelling, tv))
+                if (!MapCTypeToTypeAndValue(elemSpelling, tv, r.isCxx))
                 {
                     // A C++ field whose TYPE has no CFlat mapping yet (a class-template
                     // specialization such as `ImVector<T>`) still has a size and alignment
@@ -6986,7 +7008,7 @@ void LLVMBackend::RegisterCxxClassMembers(const CRecordEntry& r, const std::stri
         auto mapType = [&](const std::string& spelling, TypeAndValue& tv) -> bool {
             std::vector<uint64_t> dims;
             std::string elem = StripFixedArrayDims(spelling, dims);
-            if (!MapCTypeToTypeAndValue(elem, tv)) return false;
+            if (!MapCTypeToTypeAndValue(elem, tv, true)) return false;
             if (!tv.IsFunctionPointer && tv.Pointer && tv.TypeName == "void")
             {
                 int ptrLevels = 0;
@@ -7662,7 +7684,7 @@ bool LLVMBackend::TryBindRefusedCxxMember(const std::string& typeName,
                     || !HasNonConstDefaultSuffix(member.defaultArgs, n))
                     continue;
                 TypeAndValue param;
-                if (MapCTypeToTypeAndValue(member.paramTypes[n], param)
+                if (MapCTypeToTypeAndValue(member.paramTypes[n], param, true)
                     && dataStructures.count(param.TypeName) != 0)
                     classTypedDefault = true;
             }
@@ -8627,11 +8649,11 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
             // The C++ definitions this header needed were emitted on the cold run; relink the very
             // same bitcode instead of running CodeGen again.
             AdoptCxxCompanionBitcode(hitCxxBitcode);
-            RegisterCEnums(hitEnums, fileForLsp);
+            RegisterCEnums(hitEnums, fileForLsp, cppMode);
             // Records before sigs so struct-by-value signatures resolve to the same types.
             RegisterCRecords(hitRecords, fileForLsp);
             RegisterRecordAliases(hitAliases);
-            RegisterTypeAliasSymbols(hitTypeAliases);
+            RegisterTypeAliasSymbols(hitTypeAliases, cppMode);
             if (cppMode)
                 RegisterCxxFunctionTemplates(hitFunctionTemplates, cxxGroupIndex, fileForLsp);
             RegisterCxxFunctionPointerAbis(hitFunctionPointerAbis);
@@ -8644,7 +8666,7 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
             else
                 RequestCxxSignatureTypes(hitSigs);
             RegisterCSignatures(hitSigs, fileForLsp);
-            RegisterCEnums(hitEnums, fileForLsp);
+            RegisterCEnums(hitEnums, fileForLsp, cppMode);
             RegisterCMacros(hitMacros);
             std::vector<CFunctionMacroEntry> retryMacros;
             RegisterCFunctionMacros(hitFuncMacros, fileForLsp, &retryMacros);
@@ -8692,10 +8714,10 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
                 SetCInteropTargetFacts(diskEntry.longDoubleWidth,
                                        diskEntry.longDoubleIsIEEEDouble,
                                        diskEntry.targetTriple);
-                RegisterCEnums(diskEntry.enums, fileForLsp);
+                RegisterCEnums(diskEntry.enums, fileForLsp, cppMode);
                 RegisterCRecords(diskEntry.records, fileForLsp);
                 RegisterRecordAliases(diskEntry.recordAliases);
-                RegisterTypeAliasSymbols(diskEntry.typeAliases);
+                RegisterTypeAliasSymbols(diskEntry.typeAliases, cppMode);
                 if (cppMode)
                     RegisterCxxFunctionTemplates(diskEntry.functionTemplates, cxxGroupIndex, fileForLsp);
                 RegisterCxxFunctionPointerAbis(diskEntry.functionPointerAbis);
@@ -8706,7 +8728,7 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
                 else
                     RequestCxxSignatureTypes(diskEntry.sigs);
                 RegisterCSignatures(diskEntry.sigs, fileForLsp);
-                RegisterCEnums(diskEntry.enums, fileForLsp);
+                RegisterCEnums(diskEntry.enums, fileForLsp, cppMode);
                 RegisterCMacros(diskEntry.macros);
                 std::vector<CFunctionMacroEntry> retryMacros;
                 RegisterCFunctionMacros(diskEntry.funcMacros, fileForLsp, &retryMacros);
@@ -8827,8 +8849,8 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
             if (cppMode)
                 RegisterCxxFunctionTemplates(functionTemplates, cxxGroupIndex, fileForLsp);
             RegisterCSignatures(sigs, fileForLsp);
-            if (!cppMode) RegisterTypeAliasSymbols(typeAliases);
-            RegisterCEnums(enums, fileForLsp);
+            if (!cppMode) RegisterTypeAliasSymbols(typeAliases, false);
+            RegisterCEnums(enums, fileForLsp, cppMode);
             RegisterCMacros(macros);
             std::vector<CFunctionMacroEntry> retryMacros;
             RegisterCFunctionMacros(funcMacros, fileForLsp, &retryMacros);

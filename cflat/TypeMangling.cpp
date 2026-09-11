@@ -21,6 +21,7 @@ struct TypeManglingAccess
             || base == "i8" || base == "u8" || base == "i16" || base == "u16"
             || base == "i32" || base == "u32" || base == "i64" || base == "u64"
             || base == "i128" || base == "u128"
+            || base == "c8" || base == "c16" || base == "c32" || base == "wchar"
             || base == "float" || base == "double" || base == "bool"
             || base == "char" || base == "string" || base == "void")
             return;
@@ -109,25 +110,10 @@ static std::string MangleGenericInstanceUnchecked(const LLVMBackend& compiler,
 
 namespace
 {
-const std::unordered_map<std::string, std::string>& PrimitiveCanonicalNames()
-{
-    static const std::unordered_map<std::string, std::string> names = {
-        { "i16", "short" },
-        { "i32", "int" },
-    };
-    return names;
-}
-
-std::string CanonicalPrimitiveSpelling(std::string_view base)
-{
-    auto it = PrimitiveCanonicalNames().find(std::string(base));
-    return it == PrimitiveCanonicalNames().end() ? std::string(base) : it->second;
-}
-
 std::string CanonicalTypeBase(const LLVMBackend& compiler, std::string_view base)
 {
     std::string resolved = compiler.ResolveManglingAlias(std::string(base));
-    return CanonicalPrimitiveSpelling(resolved);
+    return CanonicalPrimitiveTypeName(resolved);
 }
 
 bool IsDecimalInteger(std::string_view text)
@@ -365,7 +351,7 @@ TypeParseCandidates ParseMangledCandidates(const LLVMBackend& compiler,
     if (token.front() == '.' || token.find_first_of("*[]") != std::string_view::npos) return out;
 
     TypeSpelling simple;
-    simple.base = CanonicalPrimitiveSpelling(token);
+    simple.base = CanonicalPrimitiveTypeName(token);
     simple.canonicalPrimitive = simple.base;
     auto arity = TypeManglingAccess::KnownMangledArity(compiler, text, basePosition);
     if (!arity)

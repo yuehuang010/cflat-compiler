@@ -147,6 +147,7 @@ std::optional<std::string> MainListener::FoldConstLiteral(
         return name == "char" || name == "short" || name == "int" || name == "long"
             || name == "i8" || name == "i16" || name == "i32" || name == "i64" || name == "i128"
             || name == "u8" || name == "u16" || name == "u32" || name == "u64" || name == "u128"
+            || name == "c8" || name == "c16" || name == "c32" || name == "wchar"
             || name == "ulong";
     };
     auto isScalarType = [&](const std::string& name) {
@@ -3353,7 +3354,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                         field.VariableName + "_ptr");
 
                                         if ((typeName == "int" || typeName == "i8" || typeName == "i16" || typeName == "i32" || typeName == "i64" || typeName == "i128"
-                                         || typeName == "u8" || typeName == "u16" || typeName == "u32" || typeName == "u64" || typeName == "u128")
+                                         || typeName == "u8" || typeName == "u16" || typeName == "u32" || typeName == "u64" || typeName == "u128"
+                                         || typeName == "c8" || typeName == "c16" || typeName == "c32" || typeName == "wchar")
                                         && !field.Pointer)
                                     {
                                         auto* val = compiler->builder->CreateLoad(compiler->GetType(field), gep);
@@ -3450,7 +3452,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
 
                                         // Dispatch element by type
                                         if ((elemTypeName == "int" || elemTypeName == "i8" || elemTypeName == "i16" || elemTypeName == "i32" || elemTypeName == "i64" || elemTypeName == "i128"
-                                             || elemTypeName == "u8" || elemTypeName == "u16" || elemTypeName == "u32" || elemTypeName == "u64" || elemTypeName == "u128"))
+                                             || elemTypeName == "u8" || elemTypeName == "u16" || elemTypeName == "u32" || elemTypeName == "u64" || elemTypeName == "u128"
+                                             || elemTypeName == "c8" || elemTypeName == "c16" || elemTypeName == "c32" || elemTypeName == "wchar"))
                                         {
                                             auto* widened = compiler->Upconvert(elemNV, compiler->builder->getInt64Ty(), false);
                                             LLVMBackend::NamedVariable elemIntNV;
@@ -3754,7 +3757,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
 
                                     // ── int / sized integer ──────────────────────────────────
                                     if ((typeName == "int" || typeName == "i8" || typeName == "i16" || typeName == "i32" || typeName == "i64" || typeName == "i128"
-                                         || typeName == "u8" || typeName == "u16" || typeName == "u32" || typeName == "u64" || typeName == "u128")
+                                         || typeName == "u8" || typeName == "u16" || typeName == "u32" || typeName == "u64" || typeName == "u128"
+                                         || typeName == "c8" || typeName == "c16" || typeName == "c32" || typeName == "wchar")
                                         && !field.Pointer)
                                     {
                                         auto* intVal = compiler->CallInterfaceMethod(srcA, "IJSON", "getInt", {nameNV});
@@ -4167,6 +4171,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 "bool", "void",
                                 "char", "i8", "i16", "i32", "i64", "i128",
                                 "u8", "u16", "u32", "u64", "u128",
+                                "c8", "c16", "c32", "wchar",
                                 "short", "int", "long", "ulong",
                                 "float", "double",
                             };
@@ -6822,7 +6827,12 @@ LLVMBackend::NamedVariable MainListener::ParseLambdaExpression(CFlatParser::Lamb
             for (auto* param : paramList->lambdaParam())
             {
                 LLVMBackend::DeclTypeAndValue p;
-                p.TypeName = compiler->ResolveTypeAlias(param->typeSpecifier()->getText());
+                PrimitiveTypeError canonicalError;
+                p.TypeName = CanonicalTypeSpecifierText(
+                    param->typeSpecifier(), param->multiWordTypeSuffix(), false, &canonicalError);
+                if (HasPrimitiveTypeError(canonicalError))
+                    LogErrorContext(param, LocalizePrimitiveTypeError(compiler, canonicalError));
+                p.TypeName = compiler->ResolveTypeAlias(p.TypeName);
                 p.Pointer = param->pointer() != nullptr;
                 // `(move T p) => ...` - the literal's half of the `Lambda<void(move T)>` spelling.
                 p.IsMove = param->Move() != nullptr;
@@ -7669,7 +7679,7 @@ llvm::Value* MainListener::ParsePrimaryExpression(CFlatParser::PrimaryExpression
             if (auto* ts = ctx->typeSpecifier())
             {
                 LLVMBackend::TypeAndValue type;
-                type.TypeName = ParseTypeSpecifierName(ts);
+                type.TypeName = ParseTypeSpecifierName(ts, ctx->multiWordTypeSuffix());
                 return compiler->CreateGlobalString("typeof", SpellType(*compiler, type));
             }
 
@@ -7678,8 +7688,17 @@ llvm::Value* MainListener::ParsePrimaryExpression(CFlatParser::PrimaryExpression
 
             // ANTLR picks the expression alternative for user-defined type names (Identifier
             // matches both expression and typeSpecifier); catch them here before evaluating.
-            if (compiler->GetDataStructure(expressionCtx->getText()).StructType != nullptr)
-                type.TypeName = expressionCtx->getText();
+            const std::string expressionText = expressionCtx->getText();
+            PrimitiveTypeError primitiveError;
+            std::string primitiveType;
+            CanonicalizePrimitiveTypeWords({ expressionText }, primitiveType, primitiveError);
+            const bool primitiveName = !HasPrimitiveTypeError(primitiveError)
+                && compiler->IsKnownTypeName(primitiveType);
+            if (primitiveName && !NamesVisibleVariable(compiler, expressionText))
+                type.TypeName = compiler->ResolveTypeAlias(
+                    compiler->ResolveQualifiedName(primitiveType));
+            else if (compiler->GetDataStructure(expressionText).StructType != nullptr)
+                type.TypeName = expressionText;
 
             if (type.TypeName.empty())
             {
@@ -8402,7 +8421,8 @@ void MainListener::ScanAndQueueGenericTypeUses(antlr4::RuleContext* ctx, bool to
                             auto* init = initDecl->initializer();
                             auto* ne = init != nullptr ? AsDirectNew(init->assignmentExpression()) : nullptr;
                             if (ne == nullptr || ne->assignmentExpression() == nullptr) continue;
-                            std::string elem = ParseTypeSpecifierName(ne->typeSpecifier());
+                            std::string elem = ParseTypeSpecifierName(ne->typeSpecifier(),
+                                ne->multiWordTypeSuffix());
                             QueueGenericInstantiation("array", { elem }, MangledGenericName("array", { elem }));
                         }
                     }
@@ -8420,7 +8440,12 @@ void MainListener::ScanAndQueueGenericTypeUses(antlr4::RuleContext* ctx, bool to
                         {
                             std::vector<std::string> typeArgs;
                             for (auto* entry : tupleSpec->tupleTypeEntry())
-                                typeArgs.push_back(TupleEntryArgName(Compiler(entry), entry));
+                            {
+                                PrimitiveTypeError argError;
+                                typeArgs.push_back(TupleEntryArgName(Compiler(entry), entry, &argError));
+                                if (HasPrimitiveTypeError(argError))
+                                    LogErrorContext(entry, LocalizePrimitiveTypeError(Compiler(entry), argError));
+                            }
                             std::string mangledName = MangledGenericName("tuple", typeArgs);
                             tupleTypeArgs[mangledName] = typeArgs;
                             QueueGenericInstantiation("tuple", typeArgs, mangledName);

@@ -1,0 +1,7 @@
+// The tuple leg needs the bare-semicolon form (its error fires in a pre-pass a scoped block does
+// not cover), and that form ends the compile at the first match - so this file holds it alone.
+// Every other native position is a scoped leg in err_long_double_native_positions.cb.
+extern int main() { return 0; }
+
+expect_error("only usable as a C++ template argument");
+(long double, int) tupleValue = default;

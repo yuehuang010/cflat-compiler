@@ -397,7 +397,9 @@ LLVMBackend::NamedVariable MainListener::ParseAssignmentExpressionNamed(CFlatPar
                     && typeCheck->children.size() >= 2
                     && typeCheck->children[1]->getText() == "as")
                 {
-                    std::string target = ParseTypeSpecifierName(typeCheck->typeSpecifier()[0]);
+                    std::string target = ParseTypeSpecifierName(typeCheck->typeSpecifier()[0],
+                        typeCheck->multiWordTypeSuffix().empty()
+                            ? nullptr : typeCheck->multiWordTypeSuffix()[0]);
                     result.TypeAndValue.TypeName = compilerLLVM->ResolveTypeAlias(target);
                     result.TypeAndValue.IsInterface = compilerLLVM->HasInterface(result.TypeAndValue.TypeName);
                     result.TypeAndValue.Pointer = !result.TypeAndValue.IsInterface
@@ -7031,7 +7033,8 @@ LLVMBackend::TypedValue MainListener::ParseTypeCheckExpression(CFlatParser::Type
             && ctx->children[1]->getText() == "as")
         {
             LLVMBackend::TypeAndValue asTarget;
-            asTarget.TypeName = ParseTypeSpecifierName(typeSpecs[0]);
+            asTarget.TypeName = ParseTypeSpecifierName(typeSpecs[0],
+                ctx->multiWordTypeSuffix().empty() ? nullptr : ctx->multiWordTypeSuffix()[0]);
             if (IsRedundantCastOfSource(srcNV.TypeAndValue, asTarget))
             {
                 lastRedundantAsCtx_ = ctx;
@@ -7044,7 +7047,8 @@ LLVMBackend::TypedValue MainListener::ParseTypeCheckExpression(CFlatParser::Type
             for (size_t i = 0; i < typeSpecs.size(); i++)
             {
                 std::string op = ctx->children[2 * i + 1]->getText();  // 'is' or 'as' token
-                std::string targetTypeName = ParseTypeSpecifierName(typeSpecs[i]);
+                std::string targetTypeName = ParseTypeSpecifierName(typeSpecs[i],
+                    i < ctx->multiWordTypeSuffix().size() ? ctx->multiWordTypeSuffix()[i] : nullptr);
 
                 // Name the source when a binding survived, so ClassifyCastSource can fill in
                 // shape.TypeName for an interface-valued source (an LLVM fat pointer carries no
@@ -9197,6 +9201,24 @@ LLVMBackend::NamedVariable MainListener::ParseCastExpression(CFlatParser::CastEx
         }
         else if (castExp && typeName)
         {
+            // `(name) rest` where `name` is both a visible variable and a type: ANTLR has already
+            // chosen the cast, and C would read an expression. Refuse rather than guess.
+            if (auto* bareName = BareTypeNameIdentifier(typeName))
+            {
+                const std::string candidate = bareName->getText();
+                PrimitiveTypeError spellingError;
+                std::string typeCandidate;
+                CanonicalizePrimitiveTypeWords({ candidate }, typeCandidate, spellingError);
+                if (!HasPrimitiveTypeError(spellingError)
+                    && compiler->IsKnownTypeName(typeCandidate)
+                    && NamesVisibleVariable(compiler, candidate))
+                {
+                    LogErrorContext(ctx, compiler->LocalizeMessage(
+                        "'({})' is ambiguous: '{}' names both a variable and a type; remove the parentheses or rename the variable",
+                        { candidate, candidate }));
+                    return {};
+                }
+            }
             auto destTypeName = ParseTypeName(typeName);
             // The explicit cast target is the operand's conversion context. Do not let the
             // outer initializer/return destination leak through the cast into its operand.
@@ -9513,7 +9535,6 @@ LLVMBackend::TypeAndValue MainListener::ParseTypeName(CFlatParser::TypeNameConte
 
             if (typeSpecs.size() > 0)
             {
-                // TODO Collect all of them.
                 auto* typeSpec = typeSpecs[0];
                 std::string baseName;
                 auto* genParams = GenericSpecOf(typeSpec, baseName);
@@ -9532,6 +9553,16 @@ LLVMBackend::TypeAndValue MainListener::ParseTypeName(CFlatParser::TypeNameConte
                     for (auto* entry : genParams->typeParameterList()->typeParameterEntry())
                         typeArgs.push_back(ResolveTypeArgEntry(entry));
                     typeValue.TypeName = MangledGenericName(baseName, typeArgs);
+                    std::string cxxError;
+                    const bool cxxType = compilerLLVM->TryRequestCxxType(
+                        baseName, typeArgs, typeValue.TypeName, cxxError);
+                    if (!cxxType && !cxxError.empty()) LogErrorContext(genParams, cxxError);
+                    bool hasLongDouble = false;
+                    for (const auto& arg : typeArgs)
+                        hasLongDouble = hasLongDouble || arg == "longdouble";
+                    if (hasLongDouble && !cxxType)
+                        LogErrorContext(genParams, LocalizePrimitiveTypeError(
+                            compilerLLVM, LongDoubleNativeTypeError()));
                     // A deferred winmd generic interface named directly in a cast (no `using` or
                     // forward-ref scan reached it) is instantiated on demand here. Idempotent/cached,
                     // and a no-op false for CFlat generics (already queued by the scanner).
@@ -9540,15 +9571,14 @@ LLVMBackend::TypeAndValue MainListener::ParseTypeName(CFlatParser::TypeNameConte
                 }
                 else
                 {
-                    typeValue.TypeName = typeSpec->getText();
-                    // `(long long)x` / `sizeof(long long)`: two `long` specifiers, only [0] is read.
-                    if (typeValue.TypeName == "long")
-                    {
-                        int longSpecCount = 0;
-                        for (auto* ts : typeSpecs)
-                            if (ts->getText() == "long") longSpecCount++;
-                        typeValue.TypeName = LongSpellingTypeName(longSpecCount);
-                    }
+                    std::vector<std::string> words;
+                    for (auto* ts : typeSpecs) words.push_back(ts->getText());
+                    PrimitiveTypeError canonicalError;
+                    CanonicalizePrimitiveTypeWords(words, typeValue.TypeName, canonicalError);
+                    if (typeValue.TypeName == "longdouble" && !HasPrimitiveTypeError(canonicalError))
+                        canonicalError = LongDoubleNativeTypeError();
+                    if (HasPrimitiveTypeError(canonicalError))
+                        LogErrorContext(ctx, LocalizePrimitiveTypeError(compilerLLVM, canonicalError));
                     // Apply active type-parameter substitutions (e.g. T -> int inside a generic function body).
                     auto substIt = activeTypeSubstitutions.find(typeValue.TypeName);
                     if (substIt != activeTypeSubstitutions.end())
@@ -9739,24 +9769,17 @@ LLVMBackend::NamedVariable MainListener::ParseUnaryExpression(CFlatParser::Unary
                         }
                     }
 
-                    // sizeof(var) / alignof(var): a bare identifier that names a
-                    // variable (and not a type) measures the variable's declared
-                    // storage - most useful for fixed arrays, where sizeof(buf) on
-                    // 'char[128] buf' is 128. The type meaning wins on a name
-                    // collision, matching C. Adopting the variable's TypeAndValue
-                    // here lets the normal type path below compute the (padded)
-                    // size or alignment.
+                    // sizeof(var) / alignof(var): a bare identifier that names a visible
+                    // variable measures the variable's declared storage - most useful for
+                    // fixed arrays, where sizeof(buf) on 'char[128] buf' is 128. The variable
+                    // wins over a same-named type, as in C, where an ordinary identifier in
+                    // scope hides a type name. Adopting its TypeAndValue here lets the normal
+                    // type path below compute the (padded) size or alignment.
                     if (!typeValue.Pointer
                         && postfixText.find('.') == std::string::npos
                         && postfixText.find('<') == std::string::npos
-                        && !compiler->IsKnownTypeName(typeValue.TypeName))
-                    {
-                        auto varNV = compiler->GetLocalVariable(typeValue.TypeName);
-                        if (varNV.Storage == nullptr && varNV.Primary == nullptr)
-                            varNV = compiler->GetGlobalVariableNV(typeValue.TypeName);
-                        if (varNV.Storage != nullptr || varNV.Primary != nullptr)
-                            typeValue = varNV.TypeAndValue;
-                    }
+                        && NamesVisibleVariable(compiler, postfixText))
+                        typeValue = VisibleVariableType(compiler, postfixText);
 
                     llvm::Type* llvmType = compiler->GetType(typeValue, nullptr, true);
                     for (auto it = rawArrayDims.rbegin();
@@ -10160,8 +10183,12 @@ LLVMBackend::NamedVariable MainListener::ParseUnaryExpression(CFlatParser::Unary
 
             if (isSizeof || isAlignof)
             {
-                // Parse the type name to get its LLVM type
-                auto typeValue = ParseTypeName(typeNameCtx, true);
+                // A bare name that is a visible variable measures the variable, even when it also
+                // names a type: in C an ordinary identifier in scope hides a type name (so typeof).
+                auto* bareName = BareTypeNameIdentifier(typeNameCtx);
+                auto typeValue = bareName != nullptr && NamesVisibleVariable(compiler, bareName->getText())
+                    ? VisibleVariableType(compiler, bareName->getText())
+                    : ParseTypeName(typeNameCtx, true);
                 if (typeValue.TypeName.empty())
                 {
                     LogErrorContext(ctx, "sizeof/alignof: could not determine type");
@@ -10308,7 +10335,9 @@ LLVMBackend::NamedVariable MainListener::ParseUnaryExpression(CFlatParser::Unary
         return {};
     }
 
-std::string MainListener::ParseTypeSpecifierName(CFlatParser::TypeSpecifierContext* ctx) {
+std::string MainListener::ParseTypeSpecifierName(
+    CFlatParser::TypeSpecifierContext* ctx,
+    CFlatParser::MultiWordTypeSuffixContext* suffix) {
         std::string base;
         if (auto* genParams = GenericSpecOf(ctx, base))
         {
@@ -10322,7 +10351,10 @@ std::string MainListener::ParseTypeSpecifierName(CFlatParser::TypeSpecifierConte
                 args.push_back(ResolveTypeArgEntry(entry));
             return MangledGenericName(base, args);
         }
-        std::string name = ctx->getText();
+        PrimitiveTypeError canonicalError;
+        std::string name = CanonicalTypeSpecifierText(ctx, suffix, false, &canonicalError);
+        if (HasPrimitiveTypeError(canonicalError))
+            LogErrorContext(ctx, LocalizePrimitiveTypeError(Compiler(), canonicalError));
         // Apply active type substitutions (for generic templates)
         auto it = activeTypeSubstitutions.find(name);
         // A substituted name is already resolved in the caller's scope - resolve it from the root
@@ -12658,7 +12690,7 @@ void MainListener::ArmArrayNewDesugar(antlr4::tree::ParseTree* rhs, const LLVMBa
         // a hidden count is the escape hatch and has to be spelled `T* p = new T[n];`.
         if (target.TypeName == "auto")
         {
-            std::string elem = ParseTypeSpecifierName(ne->typeSpecifier());
+            std::string elem = ParseTypeSpecifierName(ne->typeSpecifier(), ne->multiWordTypeSuffix());
             std::string mangled = MangledGenericName("array", { elem });
             QueueGenericInstantiation("array", { elem }, mangled);
             arrayNewDesugarCtx = ne;
@@ -12680,7 +12712,7 @@ LLVMBackend::NamedVariable MainListener::ParseNewExpression(CFlatParser::NewExpr
         // constructor arguments. Those child expressions have their own types and must not
         // inherit an enclosing initializer/return destination.
         DeclExpectedTypeScope newExpectedScope(&declExpectedType, {});
-        std::string typeName = ParseTypeSpecifierName(ctx->typeSpecifier());
+        std::string typeName = ParseTypeSpecifierName(ctx->typeSpecifier(), ctx->multiWordTypeSuffix());
         bool isArray = ctx->assignmentExpression() != nullptr;
         const auto spellNewType = [&]() {
             return SpellType(*compiler, LLVMBackend::TypeAndValue{ .TypeName = typeName });
@@ -14594,7 +14626,11 @@ LLVMBackend::NamedVariable MainListener::ParseOperatorStringExpression(CFlatPars
 
 LLVMBackend::TypeAndValue MainListener::ParseSimdTypeSpec(CFlatParser::SimdTypeSpecifierContext* sd) {
         LLVMBackend::TypeAndValue tv;
-        std::string elemType = sd->typeSpecifier()->getText();
+        PrimitiveTypeError elemError;
+        std::string elemType = CanonicalTypeSpecifierText(
+            sd->typeSpecifier(), sd->multiWordTypeSuffix(), false, &elemError);
+        if (HasPrimitiveTypeError(elemError))
+            LogErrorContext(sd, LocalizePrimitiveTypeError(Compiler(), elemError));
         auto substIt = activeTypeSubstitutions.find(elemType);
         if (substIt != activeTypeSubstitutions.end())
             elemType = substIt->second;

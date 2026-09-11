@@ -44,6 +44,22 @@ expect_error("nullable '?' is not allowed on primitive type 'int'") {
     }
 }
 
+expect_error("nullable '?' is not allowed on primitive type 'u32'") {
+    int test_nullable_unsigned_int()
+    {
+        unsigned int? x = 0;
+        return 0;
+    }
+}
+
+expect_error("nullable '?' is not allowed on primitive type 'i64'") {
+    int test_nullable_long_long()
+    {
+        long long? y = 0;
+        return 0;
+    }
+}
+
 extern int main()
 {
     return 0;

@@ -1002,7 +1002,15 @@ void LLVMBackend::RegisterEnumSpecifier(CFlatParser::EnumSpecifierContext* ctx,
         auto* id = ctx->Identifier();
         std::string enumName = id ? id->getText() : "";
         auto* typeSpec = ctx->typeSpecifier();
-        std::string backingType = typeSpec ? typeSpec->getText() : "int";
+        PrimitiveTypeError backingError;
+        std::string backingType = typeSpec ? CanonicalTypeSpecifierText(
+            typeSpec, ctx->multiWordTypeSuffix(), false, &backingError) : "int";
+        if (HasPrimitiveTypeError(backingError))
+        {
+            SetSourceLocation(ctx->getStart()->getLine(), ctx->getStart()->getCharPositionInLine());
+            LogError(LocalizePrimitiveTypeError(this, backingError));
+            return;
+        }
         std::string resolvedBacking = ResolveTypeAlias(backingType);
         std::string ns = namespaceName.empty() ? currentNamespace_ : namespaceName;
         std::string scopedName = (enumName.empty() || ns.empty()) ? enumName : ns + "." + enumName;
@@ -2317,7 +2325,9 @@ bool LLVMBackend::TryLoadCHeaderDiskCache(
         // v40 adds the member operators <=>, && and || to the bindable set, so a v39 member
         // list is missing them (and with them the rewritten relational operators).
         // v41 carries constructor-wrapper metadata for inherited and parameter-pack constructors.
-        if (version != 41) return false;
+        // v42: C++ imports map `long` / `unsigned long` / `char8_t` / `char16_t` / `char32_t` /
+        // `wchar_t` by identity to `long` / `ulong` / `c8` / `c16` / `c32` / `wchar`.
+        if (version != 42) return false;
 
         // Accept on mtime match (fast) or content hash match (authoritative on mtime drift).
         auto storedMtime = j.value("mtime", int64_t{-1});
@@ -2409,7 +2419,7 @@ void LLVMBackend::WriteCHeaderDiskCache(
         if (ec) return;
 
         nlohmann::json j;
-        j["version"] = 41;
+        j["version"] = 42;
         j["mtime"]   = (int64_t)mtime.time_since_epoch().count();
         j["hash"]    = contentHash;
         j["ldw"]     = entry.longDoubleWidth;

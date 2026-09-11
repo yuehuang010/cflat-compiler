@@ -1,0 +1,13 @@
+extern int main() { return 0; }
+
+expect_error("invalid type spelling 'unsigned i32': use 'u32'") {
+    unsigned i32 value = 0;
+}
+
+expect_error("invalid type spelling 'signed u16': use 'i16'") {
+    signed u16 value = 0;
+}
+
+expect_error("invalid type spelling 'long u8'") {
+    long u8 value = 0;
+}

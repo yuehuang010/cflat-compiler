@@ -238,6 +238,13 @@ The recurring failure mode of this whole family, stated once:
 - **Verify a negative test is non-vacuous against the RIGHT baseline.** A test can be vacuous vs
   master yet still be a real tripwire for a defect introduced mid-work. Record which binary it
   discriminates against rather than labelling it vacuous.
+- **`expect_error` is fail-fast by design: a bare leg's error ends the check, and nothing after it
+  in compile order runs.** So a file PASSES with legs that never ran when a bare leg's error comes
+  first - a second bare leg in the same function, or any leg the walk reaches after a bare
+  file-scope leg's parse or pre-pass error. Found 2026-09-10: six dead legs in three err files.
+  Authoring rule, not a harness bug (maintainer: the harness keeps no queue of expectations): put
+  a bare leg alone in its file or last in compile order, use scoped blocks for everything else,
+  and run a changed err file alone, counting `PASS: expected error received` lines against legs.
 - **A test that pins a PATH in `expect_error` breaks on the other platform.**
   `ShortenDefSiteForDisplay` returns native separators, deliberately. Pin the basename +
   (line,col) TAIL only. `expect_error` is a plain `.find()` substring check
@@ -3250,8 +3257,43 @@ RAII and any future non-copyable type; recorded in `p3/thread-cannot-go-raii.md`
 
 CFlat ACCEPTS every multi-word C spelling (`long long`, `unsigned int`, `unsigned long`,
 `signed char`, `long double`, ...) and adds `c8`/`c16`/`c32`/`wchar` with the C++ names
-`char8_t`/`char16_t`/`char32_t`/`wchar_t` as aliases. Work, identity table and acceptance:
-[`cxx-primitive-typing.md`](issue/cppinterop/cxx-primitive-typing.md).
+`char8_t`/`char16_t`/`char32_t`/`wchar_t` as aliases. LANDED 2026-09-10. User-facing alias table:
+`doc/LANGUAGE.md` "Primitives". Identity table (one CFlat identity per C++ primitive):
+
+| CFlat | C++ | MSVC | Itanium |
+|---|---|---|---|
+| `char` | `char` | `D` | `c` |
+| `i8` | `signed char` | `C` | `a` |
+| `u8` | `unsigned char` | `E` | `h` |
+| `short` = `i16` | `short` | `F` | `s` |
+| `u16` | `unsigned short` | `G` | `t` |
+| `int` = `i32` | `int` | `H` | `i` |
+| `uint` = `u32` | `unsigned int` | `I` | `j` |
+| `long` | `long` | `J` | `l` |
+| `ulong` | `unsigned long` | `K` | `m` |
+| `i64` | `long long` | `_J` | `x` |
+| `u64` | `unsigned long long` | `_K` | `y` |
+| `longdouble` | `long double` (C++ template argument only) | `O` | `e` |
+| `c8` | `char8_t` | `_Q` | `Du` |
+| `c16` | `char16_t` | `_S` | `Ds` |
+| `c32` | `char32_t` | `_U` | `Di` |
+| `wchar` | `wchar_t` | `_W` | `w` |
+
+`i128`/`u128` have no C alias; C's `__int128` binds to them inbound only. `wchar` is target-native
+(16-bit unsigned on Windows, 32-bit signed on x86-64 Linux and macOS). The character types follow
+the `u8`/`u16`/`u32` arithmetic rules (no C integer promotion) and differ only in identity.
+
+Decisions taken while landing it:
+
+- **C/C++ boundary is per header.** A C import stays width-mapped (`DWORD*` -> `u32*`,
+  `wchar_t` -> `u16`); a C++ import maps by identity (`unsigned long` -> `ulong`,
+  `char16_t` -> `c16`). `MapCTypeToTypeAndValue*` takes `cxxBoundary` with no default.
+- **`(name)` where `name` is both a visible variable and a type is an ambiguity error**, not a
+  cast and not a parenthesized expression. Rewriting the parsed cast into a binary operation broke
+  precedence, pointer arithmetic, operator overloads and lambda captures - do not retry it.
+- **`__int128` is not a CFlat spelling**; a grammar literal for it violated the soft-keyword rule.
+- **`sizeof(name)` measures a visible variable over a same-named type**, as in C (an ordinary
+  identifier in scope hides a type name) and as `typeof` does. `wchar` is the confirmed spelling.
 
 This REVERSES the morning ruling ("one primitive, one word", multi-word spellings as errors). Do not
 revive it. What survives from it:
@@ -3284,9 +3326,19 @@ re-spells outbound as `unsigned int` - a different specialization than it came f
 
 Correcting those two rows to `{ "long", "long" }, { "ulong", "unsigned long" }` makes `ulong`
 (and its alias `unsigned long`) name C++ `unsigned long` at its real target width on both ABIs,
-while `u64` keeps naming `unsigned long long`. Filed as
-[`c-long-has-no-cflat-cxx-spelling.md`](issue/cppinterop/c-long-has-no-cflat-cxx-spelling.md) -
-a correctness bug in its own right, and the first slice of `cxx-primitive-typing.md`.
+while `u64` keeps naming `unsigned long long`. Fixed 2026-09-10 as the first slice of the ruling
+above.
+
+### Any inbound type-mapping change must bump the C header disk-cache version
+
+Found reviewing the `long`/`ulong` fix (2026-09-10). The C header disk cache key
+(`CHeaderDiskCacheKey`, `LLVMBackend_StateAndImports.cpp`) has NO compiler build stamp, unlike the
+in-memory key, and it stores signatures ALREADY MAPPED (`SigToJson` / `TvToJson`), while records,
+enums and aliases store raw spellings and re-map on load. So a cache written by the old binary
+keeps serving the old mapping for signatures and the new one for everything else: one import, two
+answers. `test_cpp_interop.cb` imports `cpp_interop_tpl.h` with `cache`, so a green suite run can
+load a stale entry and prove nothing. Any change to `MapCTypeToTypeAndValue*` output bumps the
+version at BOTH the check and the write (`version != N`, `j["version"] = N`) with a history line.
 
 ### Addendum: `int` follows the target by coincidence, not by construction (2026-09-10)
 

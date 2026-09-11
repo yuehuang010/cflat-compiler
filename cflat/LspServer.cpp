@@ -1178,7 +1178,7 @@ private:
         std::string prev = lineText.substr(p, e - p);
         static const char* const prims[] = {
             "void", "char", "short", "int", "long", "ulong", "float", "double", "bool", "_Bool", "string",
-            "i8", "i16", "i32", "i64", "i128", "u8", "u16", "u32", "u64", "u128", "signed", "unsigned"
+            "i8", "i16", "i32", "i64", "i128", "u8", "u16", "u32", "u64", "u128", "c8", "c16", "c32", "wchar", "signed", "unsigned"
         };
         for (const char* t : prims)
             if (prev == t) return true;

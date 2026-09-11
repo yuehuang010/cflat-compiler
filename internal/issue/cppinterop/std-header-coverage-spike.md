@@ -37,9 +37,9 @@ when declared `= default`; their constructor-call spelling does not (gap 4).
 | 7 | [`no-cpp-standard-selection-flag.md`](no-cpp-standard-selection-flag.md) | `expected`, `flat_map`, `flat_set`, `generator`, `mdspan`, `print`, `stacktrace`, `stdfloat` |
 | 8 | multi-word template arguments - LANDED `6f1981c` in template-argument position only; gap 10 extends the spellings to every type position | was: any specialization over `long long`, `unsigned int`, ... |
 | 9 | [`std-globals-unreachable.md`](std-globals-unreachable.md) | `std` GLOBALS (`std.cout`); the narrowed remainder of gap 1 |
-| 10 | [`cxx-primitive-typing.md`](cxx-primitive-typing.md) | C multi-word spellings as aliases in every type position, plus `c8`/`c16`/`c32`/`wchar` (`std::u16string`, `std::wstring`, `char8_t` specializations) - maintainer ruling 2026-09-10 |
+| 10 | C++ primitive typing - LANDED 2026-09-10 (ruling + identity table at the bottom of `internal/fix-issue-lessons.md`) | was: C multi-word spellings outside template arguments, and `std::u16string`, `std::wstring`, `char8_t` specializations |
 | 11 | [`alias-of-class-template-specialization-loses-fields.md`](alias-of-class-template-specialization-loses-fields.md) | an alias of a specialization declares a local but loses its fields |
-| 12 | [`c-long-has-no-cflat-cxx-spelling.md`](c-long-has-no-cflat-cxx-spelling.md) | C++ `long`/`unsigned long` unreachable (`std::vector<DWORD>`, `std::vector<size_t>`); first slice of gap 10 |
+| 12 | C++ `long`/`unsigned long` spelling - LANDED 2026-09-10 with gap 10 | was: `std::vector<DWORD>`, `std::vector<size_t>` |
 
 ## Not spiked
 

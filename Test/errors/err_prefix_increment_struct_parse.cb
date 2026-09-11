@@ -1,0 +1,9 @@
+// Prefix '++' on a struct value is a PARSE error. A parse error fails the whole file before the
+// listener walk, so this leg cannot share a file with semantic legs (moved from
+// err_operator_forward.cb, where it silently kept that file's other two legs from ever running).
+struct NoIncrementError { int value = 0; };
+
+expect_error("found ';' but expected {'move', '(', Identifier}");
+int prefixError() { NoIncrementError x; ++x; return 0; }
+
+extern int main() { return 0; }

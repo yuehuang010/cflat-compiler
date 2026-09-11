@@ -91,7 +91,8 @@
 
 ### Primitives
 
-Standard C primitives are all supported: `int`, `char`, `short`, `long`, `float`, `double`, `bool`, `void`.
+The CFlat primitive set includes `int`, `char`, `short`, `long`, `float`, `double`, `bool`, and
+`void`, plus fixed-width and C++ character primitives described below.
 
 **C spellings are aliases.** C's multi-word spellings are accepted and mean exactly the CFlat
 type in the table - the same type, not a look-alike, so `f(long long)` and `f(i64)` declare the
@@ -102,13 +103,23 @@ same function. The trailing `int` is optional where C allows it (`unsigned long 
 |------------|-------|
 | `signed char` | `i8` |
 | `unsigned char` | `u8` |
+| `short int`, `signed short`, `signed short int` | `short` |
 | `unsigned short` | `u16` |
 | `signed`, `signed int` | `int` |
 | `unsigned`, `unsigned int` | `u32` (or `uint`) |
+| `long int`, `signed long`, `signed long int` | `long` |
 | `unsigned long` | `ulong` |
-| `long long` | `i64` |
-| `unsigned long long` | `u64` |
-| `long double` | `longdouble` |
+| `long long`, `long long int`, `signed long long`, `signed long long int` | `i64` |
+| `unsigned long long`, `unsigned long long int` | `u64` |
+
+The C++ character spellings `char8_t`, `char16_t`, `char32_t`, and `wchar_t` are accepted as
+aliases for `c8`, `c16`, `c32`, and `wchar`. These are identity types for C++ template
+specializations, not aliases for `i8`, `u16`, `u32`, or one another. `c8`, `c16`, and `c32` are
+unsigned 8-, 16-, and 32-bit values. `wchar` follows the target ABI: it is unsigned 16-bit on
+Windows and signed 32-bit on the supported LP64 targets.
+
+`long double` is not a native CFlat type. It is accepted only as a C++ template argument (where
+it is represented internally as `longdouble`); use `double` for native CFlat declarations.
 
 `int` and `long` follow the native C ABI of the **target** platform, exactly as a C compiler
 would - the target is the one selected by `--platform`, not the host you compile on. `long` is

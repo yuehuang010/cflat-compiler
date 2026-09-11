@@ -1,0 +1,38 @@
+expect_error("is ambiguous: 'c16' names both a variable and a type") {
+    int test_primitive_name()
+    {
+        int c16 = 5;
+        int result = (c16) - 1;
+        return result;
+    }
+}
+
+expect_error("is ambiguous: 'c16' names both a variable and a type") {
+    int test_pointer_name()
+    {
+        int[2] values = default;
+        int* c16 = &values[1];
+        int* result = (c16) - 1;
+        return *result;
+    }
+}
+
+expect_error("is ambiguous: 'wchar' names both a variable and a type") {
+    int test_lambda_capture()
+    {
+        int wchar = 5;
+        Lambda<int()> get = () => (wchar) - 1;
+        return get();
+    }
+}
+
+// A global of the enclosing namespace is found the way ParseIdentifier finds it.
+expect_error("is ambiguous: 'c16' names both a variable and a type") {
+    namespace paren_shadow_ns
+    {
+        int c16 = 5;
+        int test_namespace_global() { return (c16) - 1; }
+    }
+}
+
+extern int main() { return 0; }

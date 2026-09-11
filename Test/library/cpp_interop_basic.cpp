@@ -21,6 +21,33 @@ namespace cppi
     int& ref_slot() noexcept { return g_slot; }
 
     long long widen(int v) noexcept { return (long long)v * 1000000000LL; }
+    unsigned long unsigned_long_value() noexcept { return 4000000000UL; }
+    // Each sum walks the vector with C++'s own element stride, so a CFlat vector built as a
+    // different specialization cannot bind, and if it did the total would be wrong.
+    long long_vector_sum(std::vector<long>& value) noexcept
+    {
+        long total = 0;
+        for (long element : value) total += element;
+        return total;
+    }
+    unsigned long ulong_vector_sum(std::vector<unsigned long>& value) noexcept
+    {
+        unsigned long total = 0;
+        for (unsigned long element : value) total += element;
+        return total;
+    }
+    long long long_long_vector_sum(std::vector<long long>& value) noexcept
+    {
+        long long total = 0;
+        for (long long element : value) total += element;
+        return total;
+    }
+    unsigned long long ulong_long_vector_sum(std::vector<unsigned long long>& value) noexcept
+    {
+        unsigned long long total = 0;
+        for (unsigned long long element : value) total += element;
+        return total;
+    }
     unsigned char uc(unsigned char v) noexcept { return (unsigned char)(v + 1); }
 
     int mode_value(Mode m) noexcept { return (int)m * 10; }
@@ -395,6 +422,8 @@ namespace cppi
     {
         return present ? std::optional<int>(value) : std::nullopt;
     }
+
+    char16_t char16_value(char16_t value) noexcept { return (char16_t)(value + 1); }
 }
 
 extern "C" int cppi_c_linkage(int v) noexcept { return v + 5; }

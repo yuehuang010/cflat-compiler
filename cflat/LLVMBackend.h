@@ -46,6 +46,16 @@
 #include "platform/PlatformCompat.h"
 #include "DiagnosticLocalization.h"
 
+// The one table of primitive words that name the SAME type (type identity and mangling). `uint`
+// stays: raw fixed-array element spellings reach TypeName without passing the parser canonicalizer.
+inline std::string CanonicalPrimitiveTypeName(std::string_view type)
+{
+    if (type == "i16") return "short";
+    if (type == "i32") return "int";
+    if (type == "uint") return "u32";
+    return std::string(type);
+}
+
 #pragma warning(push)
 #pragma warning(disable: 4244 4267)
 #include <llvm/ADT/DenseSet.h>    // llvm::DenseSet (identity-keyed value ledgers)
@@ -666,11 +676,16 @@ public:
     // i64 (spelled as such by ParseDeclarationSpecifiers), and `int` is always i32.
 #if defined(_WIN32)
     static inline int longBits_ = 32;
+    static inline int wcharBits_ = 16;
+    static inline bool wcharSigned_ = false;
 #else
     static inline int longBits_ = 64;
+    static inline int wcharBits_ = 32;
+    static inline bool wcharSigned_ = true;
 #endif
 
-    static void SetTargetLongWidth(bool targetWindows, int platformBits);
+    static void SetTargetLongWidth(bool targetWindows, int platformBits,
+                                   bool targetArm64, bool targetMacOS);
 
     enum class Operation
     {
@@ -922,16 +937,8 @@ public:
             if (TypeName == other.TypeName)
                 return true;
 
-            // C-equivalent signed integer types: char=i8, short=i16, int=i32, long=i64
-            int myBits = IsInteger();
-            int otherBits = other.IsInteger();
-            if (myBits != -1 && myBits == otherBits)
-            {
-                bool myUnsigned = (IsUnsignedInteger() != -1);
-                bool otherUnsigned = (other.IsUnsignedInteger() != -1);
-                if (myUnsigned == otherUnsigned)
-                    return true;
-            }
+            if (CanonicalPrimitiveTypeName(TypeName) == CanonicalPrimitiveTypeName(other.TypeName))
+                return true;
 
             return false;
         }
@@ -979,11 +986,11 @@ public:
         int IsInteger() const
         {
             const std::string& t = IntegralSpelling();
-            if (t == "char" || t == "i8" || t == "u8")
+            if (t == "char" || t == "i8" || t == "u8" || t == "c8")
                 return 8;
-            if (t == "short" || t == "i16" || t == "u16")
+            if (t == "short" || t == "i16" || t == "u16" || t == "c16")
                 return 16;
-            if (t == "int" || t == "i32" || t == "u32")
+            if (t == "int" || t == "i32" || t == "u32" || t == "c32")
                 return 32;
             if (t == "i64" || t == "u64")
                 return 64;
@@ -992,6 +999,8 @@ public:
             // `long`/`ulong` are target-native: 32 bits on Windows/LLP64, 64 on LP64.
             if (t == "long" || t == "ulong")
                 return longBits_;
+            if (t == "wchar")
+                return wcharBits_;
 
             return -1;
         }
@@ -1001,13 +1010,15 @@ public:
         int IsUnsignedInteger() const
         {
             const std::string& t = IntegralSpelling();
-            if (t == "u8")  return 8;
-            if (t == "u16") return 16;
+            if (t == "u8" || t == "c8")  return 8;
+            if (t == "u16" || t == "c16") return 16;
             if (t == "u32") return 32;
+            if (t == "c32") return 32;
             if (t == "u64") return 64;
             if (t == "u128") return 128;
             // C's `unsigned long`: target-native width (u32 on Windows/LLP64, u64 on LP64).
             if (t == "ulong") return longBits_;
+            if (t == "wchar" && !wcharSigned_) return wcharBits_;
 
             return -1;
         }
@@ -5187,7 +5198,7 @@ private:
     // Map a (preferably desugared) C type spelling onto a CFlat TypeAndValue.
 
 
-    bool MapCTypeToTypeAndValue(std::string ctype, TypeAndValue& out);
+    bool MapCTypeToTypeAndValue(std::string ctype, TypeAndValue& out, bool cxxBoundary);
     void SetCInteropTargetFacts(const cflat_cinterop::ExtractResult& raw);
     void SetCInteropTargetFacts(uint64_t longDoubleWidth, bool longDoubleIsIEEEDouble,
                                 const std::string& targetTriple);
@@ -5201,7 +5212,8 @@ private:
     bool TryMapCxxForeignSpelling(const std::string& ctype, TypeAndValue& out, bool& mapped) const;
 
     bool ParseCFunctionPointerSpelling(const std::string& s, TypeAndValue& out,
-                                       std::unordered_set<std::string>& visited);
+                                       std::unordered_set<std::string>& visited,
+                                       bool cxxBoundary);
 
     static std::string StripFixedArrayDims(const std::string& ctype, std::vector<uint64_t>& dims);
 
@@ -5216,7 +5228,8 @@ private:
     static std::string AggregatePointeeTag(const std::string& spelling, int& outPtr);
 
     bool MapCTypeToTypeAndValueImpl(std::string ctype, TypeAndValue& out,
-                                    std::unordered_set<std::string>& visited);
+                                    std::unordered_set<std::string>& visited,
+                                    bool cxxBoundary);
 
     // FNV-1a 64-bit hash of a file's bytes. Returns false if the file can't be read.
     static bool HashFileFnv1a(const std::string& path, uint64_t& outHash);
@@ -5240,9 +5253,9 @@ private:
     void RegisterCxxFunctionPointerAbis(
         const std::vector<cflat_cinterop::RawFunctionPointerAbi>& plans);
 
-    bool MapRawGlobal(const cflat_cinterop::RawGlobalVar& r, CGlobalEntry& e);
+    bool MapRawGlobal(const cflat_cinterop::RawGlobalVar& r, CGlobalEntry& e, bool cxxBoundary);
 
-    bool ClassifyRawMacro(const cflat_cinterop::RawMacro& r, CMacroEntry& e);
+    bool ClassifyRawMacro(const cflat_cinterop::RawMacro& r, CMacroEntry& e, bool cxxBoundary);
 
     void AdoptRawTypedefs(const cflat_cinterop::ExtractResult& raw);
 
@@ -5265,7 +5278,7 @@ private:
     void RegisterTypeAliasSymbol(const std::string& alias, const std::string& target,
                                  const std::string& file, int line, int col,
                                  bool isAnonymousRecord = false);
-    void RegisterTypeAliasSymbols(const std::vector<CTypeAliasEntry>& aliases);
+    void RegisterTypeAliasSymbols(const std::vector<CTypeAliasEntry>& aliases, bool cxxBoundary);
 
     // Keep the transitive closure of in-scope records over their by-value field deps, plus any
     // record referenced BY VALUE from an in-scope function signature or global variable (e.g.
@@ -5321,7 +5334,8 @@ private:
 
     static std::string ConstIntValueSuffix(const std::string& typeName, long long value);
 
-    void RegisterCEnums(const std::vector<CEnumEntry>& enums, const std::string& fileForLsp);
+    void RegisterCEnums(const std::vector<CEnumEntry>& enums, const std::string& fileForLsp,
+                        bool cxxBoundary);
     bool MakeOpaqueFieldBlob(const CRecordFieldEntry& f, DeclTypeAndValue& out) const;
 
     void RegisterCGlobals(const std::vector<CGlobalEntry>& globals, const std::string& fileForLsp);

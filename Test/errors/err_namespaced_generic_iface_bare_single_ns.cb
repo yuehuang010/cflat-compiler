@@ -15,8 +15,11 @@
 namespace NS { interface IV<T> { int Width(); }; }
 class C<T> : IV<T> { int Width() { return 7; } };
 
-expect_error("unknown type 'IV<int>'");
-int use(IV<int> v) { return v.Width(); }
+// Scoped, not bare: a bare file-scope leg ends the compile at its match, so the two legs below
+// never ran while this one was bare.
+expect_error("unknown type 'IV<int>'") {
+    int use(IV<int> v) { return v.Width(); }
+}
 
 // The generic STRUCT/CLASS twin of the same hole, and the actual q12 bug: pre-fix these two
 // compiled, linked and ran CLEAN with no diagnostic at all, because the bare name collided with

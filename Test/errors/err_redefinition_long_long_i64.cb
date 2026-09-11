@@ -1,0 +1,16 @@
+extern int main() { return 0; }
+
+expect_error("redefinition of 'longIdentity'") {
+    int longIdentity(long long value) { return (int)value; }
+    int longIdentity(i64 value) { return (int)value; }
+}
+
+expect_error("redefinition of 'unsignedIdentity'") {
+    int unsignedIdentity(unsigned value) { return (int)value; }
+    int unsignedIdentity(u32 value) { return (int)value; }
+}
+
+expect_error("redefinition of 'uintIdentity'") {
+    int uintIdentity(uint value) { return (int)value; }
+    int uintIdentity(u32 value) { return (int)value; }
+}

@@ -167,7 +167,10 @@ std::string MainListener::ResolveTypeArgEntry(CFlatParser::TypeParameterEntryCon
         else
         {
             // Simple type or type parameter: look up in activeTypeSubstitutions
-            resolved = CanonicalTemplateTypeArgument(entry);
+            PrimitiveTypeError canonicalError;
+            resolved = CanonicalTemplateTypeArgument(entry, &canonicalError);
+            if (HasPrimitiveTypeError(canonicalError))
+                LogErrorContext(entry, LocalizePrimitiveTypeError(Compiler(), canonicalError));
             auto substIt = activeTypeSubstitutions.find(resolved);
             bool substituted = substIt != activeTypeSubstitutions.end();
             if (substIt != activeTypeSubstitutions.end())
@@ -360,7 +363,9 @@ void MainListener::QueueGenericInstantiation(const std::string& baseName,
         }
     }
 
-std::string MainListener::ResolveSigComponentCodegen(CFlatParser::TypeSpecifierContext* ts, bool& outPointer) {
+std::string MainListener::ResolveSigComponentCodegen(
+    CFlatParser::TypeSpecifierContext* ts, bool& outPointer,
+    CFlatParser::MultiWordTypeSuffixContext* suffix) {
         if (ts == nullptr) return "void";
         if (auto* inner = ts->functionPointerSpecifier(); inner != nullptr)
         {
@@ -380,7 +385,10 @@ std::string MainListener::ResolveSigComponentCodegen(CFlatParser::TypeSpecifierC
             QueueGenericInstantiation(baseName, innerArgs, mangled, ts);
             return mangled;
         }
-        std::string name = ts->getText();
+        PrimitiveTypeError canonicalError;
+        std::string name = CanonicalTypeSpecifierText(ts, suffix, false, &canonicalError);
+        if (HasPrimitiveTypeError(canonicalError))
+            LogErrorContext(ts, LocalizePrimitiveTypeError(Compiler(), canonicalError));
         auto substIt = activeTypeSubstitutions.find(name);
         if (substIt != activeTypeSubstitutions.end())
         {
@@ -448,7 +456,8 @@ std::string MainListener::EncodeClosureCodegen(CFlatParser::FunctionPointerSpeci
         sig.TypeName = isThin ? "__c_fn_ptr" : "__closure_fat_ptr";
         bool retPtr = fpSpec->pointer() != nullptr;
         int retStars = PointerDepthOf(fpSpec->pointer());
-        std::string retName = ResolveSigComponentCodegen(fpSpec->typeSpecifier(), retPtr);
+        std::string retName = ResolveSigComponentCodegen(fpSpec->typeSpecifier(), retPtr,
+                                                         fpSpec->multiWordTypeSuffix());
         // A signature component over the cap can never be matched: no function may declare a
         // 3-star return or parameter, so the closure type would be unpopulatable.
         if (retStars > PointerDepthCap)
@@ -472,7 +481,8 @@ std::string MainListener::EncodeClosureCodegen(CFlatParser::FunctionPointerSpeci
             {
                 bool pPtr = param->pointer() != nullptr;
                 int pStars = PointerDepthOf(param->pointer());
-                std::string pName = ResolveSigComponentCodegen(param->typeSpecifier(), pPtr);
+                std::string pName = ResolveSigComponentCodegen(param->typeSpecifier(), pPtr,
+                                                               param->multiWordTypeSuffix());
                 if (pStars > PointerDepthCap)
                     LogErrorContext(param, PointerDepthCapMessage(
                         std::format("function type parameter '{}'", pName), pStars));
@@ -497,7 +507,8 @@ std::string MainListener::EncodePlainFunctionTypeCodegen(
         sig.TypeName = "__c_fn_ptr";
         bool retPtr = fnSpec->pointer() != nullptr;
         int retStars = PointerDepthOf(fnSpec->pointer());
-        sig.FuncPtrReturnTypeName = ResolveSigComponentCodegen(fnSpec->typeSpecifier(), retPtr);
+        sig.FuncPtrReturnTypeName = ResolveSigComponentCodegen(fnSpec->typeSpecifier(), retPtr,
+                                                               fnSpec->multiWordTypeSuffix());
         sig.FuncPtrReturnPointer = retPtr;
         sig.FuncPtrReturnPointerDepth = ReconcilePointerDepth(retPtr, retStars);
         sig.FuncPtrReturnResolvedKey = SigComponentResolvedKey(sig.FuncPtrReturnTypeName);
@@ -507,7 +518,8 @@ std::string MainListener::EncodePlainFunctionTypeCodegen(
                 LLVMBackend::TypeAndValue::FuncPtrParam p;
                 bool pPtr = param->pointer() != nullptr;
                 int pStars = PointerDepthOf(param->pointer());
-                p.TypeName = ResolveSigComponentCodegen(param->typeSpecifier(), pPtr);
+                p.TypeName = ResolveSigComponentCodegen(param->typeSpecifier(), pPtr,
+                                                        param->multiWordTypeSuffix());
                 p.Pointer = pPtr;
                 p.PointerDepth = ReconcilePointerDepth(pPtr, pStars);
                 p.IsMove = param->Move() != nullptr;
@@ -554,12 +566,32 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                     std::format("declared type '{}'", declSpec->typeSpecifier() != nullptr
                         ? declSpec->typeSpecifier()->getText() : "T"), writtenStars));
         }
-        // `long long` arrives as two `long` typeSpecifiers; count them before the loop breaks
-        // out on the first one, so the pair can canonicalize to i64.
-        int longSpecCount = 0;
-        for (auto declSpec : declSpecList)
-            if (declSpec->typeSpecifier() != nullptr && declSpec->typeSpecifier()->getText() == "long")
-                longSpecCount++;
+        std::vector<std::string> typeWords = CollectDeclarationTypeSpecifierWords(declSpecList);
+        PrimitiveTypeError canonicalTypeError;
+        std::string canonicalTypeName;
+        CanonicalizePrimitiveTypeWords(typeWords, canonicalTypeName, canonicalTypeError);
+        if (canonicalTypeName == "longdouble" && !HasPrimitiveTypeError(canonicalTypeError))
+            canonicalTypeError = LongDoubleNativeTypeError();
+        if (HasPrimitiveTypeError(canonicalTypeError))
+        {
+            auto* errorSpec = LastDeclarationTypeSpecifier(declSpecList);
+            auto message = LocalizePrimitiveTypeError(Compiler(), canonicalTypeError);
+            if (errorSpec != nullptr)
+                LogErrorContext(errorSpec, message);
+            else
+                LogErrorContext(declSpecs, message);
+            // Recover as the CFlat spelling so the unknown 'longdouble' cannot cascade.
+            if (canonicalTypeError.kind == PrimitiveTypeErrorKind::LongDoubleNative)
+                canonicalTypeName = "double";
+        }
+        else if (typeWords.size() > 1)
+        {
+            std::string suffixText;
+            if (auto* misplaced = MisplacedMultiWordTypeSuffix(declSpecList, suffixText))
+                LogErrorContext(misplaced, Compiler()->LocalizeMessage(
+                    "'{}' must follow the complete type '{}'",
+                    { suffixText, JoinTypeSpecifierWords(typeWords) }));
+        }
 
         for (auto declSpec : declSpecList)
         {
@@ -567,6 +599,8 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
             auto storageSpec = declSpec->storageClassSpecifier();
             if (typeSpec != nullptr)
             {
+                auto* declSpecWithSuffix = LastDeclarationTypeSpecifier(declSpecList);
+                if (declSpecWithSuffix == nullptr) declSpecWithSuffix = declSpec;
                 // Pointer depth from a pointer alias (using Handle = void*); peeled off the
                 // resolved alias string below and combined with the declarator's stars.
                 int aliasPtrDepth = 0;
@@ -621,7 +655,12 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                     if (tts->tupleTypePackEntry() != nullptr)
                     {
                         // (T...) - expand pack substitution
-                        std::string packName = tts->tupleTypePackEntry()->typeSpecifier()->getText();
+                        auto* packEntry = tts->tupleTypePackEntry();
+                        PrimitiveTypeError packError;
+                        std::string packName = CanonicalTypeSpecifierText(
+                            packEntry->typeSpecifier(), packEntry->multiWordTypeSuffix(), false, &packError);
+                        if (HasPrimitiveTypeError(packError))
+                            LogErrorContext(packEntry, LocalizePrimitiveTypeError(Compiler(), packError));
                         auto packIt = activePackSubstitutions.find(packName);
                         if (packIt != activePackSubstitutions.end())
                             typeArgs = packIt->second;
@@ -637,7 +676,11 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                                 LogErrorContext(entry, "'T[]' is the only bracketed form valid as a "
                                     "tuple element; a sized 'T[N]', an unsized multi-dimensional "
                                     "'T[][]' and a pointer-to-array 'T[]*' are not");
-                            std::string argName = entry->typeSpecifier()->getText();
+                            PrimitiveTypeError argError;
+                            std::string argName = CanonicalTypeSpecifierText(
+                                entry->typeSpecifier(), entry->multiWordTypeSuffix(), false, &argError);
+                            if (HasPrimitiveTypeError(argError))
+                                LogErrorContext(entry, LocalizePrimitiveTypeError(Compiler(), argError));
                             int argDepth = PointerDepthOf(entry->pointer());
                             bool argView = IsArrayViewArg(entry);
                             // On a view the written stars decorate the ELEMENT: `(int*[], int)`.
@@ -691,8 +734,9 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                             c->CreateFunctionDeclaration(mangledName, rt, {});
                         }
                     }
-                    declType.Pointer = declSpec->pointer() != nullptr;
-                    declType.ArraySize = ArrayDimsOf(declSpec) ? ArrayDimsOf(declSpec)->assignmentExpression(0) : nullptr;
+                    declType.Pointer = declSpecWithSuffix->pointer() != nullptr;
+                    declType.ArraySize = ArrayDimsOf(declSpecWithSuffix) ?
+                        ArrayDimsOf(declSpecWithSuffix)->assignmentExpression(0) : nullptr;
                     break;
                 }
                 // function pointer type: `function<...>` (thin C ptr) or `Lambda<...>` (fat closure)
@@ -709,7 +753,8 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                         // signature (e.g. Lambda<list<string>()>) stores the mangled "list$string".
                         bool retPtr = fpSpec->pointer() != nullptr;
                         int retStars = PointerDepthOf(fpSpec->pointer());
-                        declType.FuncPtrReturnTypeName = ResolveSigComponentCodegen(fpSpec->typeSpecifier(), retPtr);
+                        declType.FuncPtrReturnTypeName = ResolveSigComponentCodegen(
+                            fpSpec->typeSpecifier(), retPtr, fpSpec->multiWordTypeSuffix());
                         if (auto* qualifier = fpSpec->functionReturnQualifier(); qualifier != nullptr)
                         {
                             std::string text = qualifier->getText();
@@ -734,7 +779,8 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                                 LLVMBackend::TypeAndValue::FuncPtrParam p;
                                 bool pPtr = param->pointer() != nullptr;
                                 int pStars = PointerDepthOf(param->pointer());
-                                p.TypeName = ResolveSigComponentCodegen(param->typeSpecifier(), pPtr);
+                                p.TypeName = ResolveSigComponentCodegen(
+                                    param->typeSpecifier(), pPtr, param->multiWordTypeSuffix());
                                 LLVMBackend::TypeAndValue pType;
                                 pType.TypeName = p.TypeName;
                                 pType.Pointer = pPtr;
@@ -756,7 +802,7 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                     // For bare 'function', signature inferred from initializer at declaration site
                     // This branch breaks out of the specifier loop, so nothing else consumes a
                     // trailing '[N]' or '*'; capture both here (as the alias branch below does).
-                    declType.Pointer = declSpec->pointer() != nullptr;
+                    declType.Pointer = declSpecWithSuffix->pointer() != nullptr;
                     // A fat closure is a by-value struct, so a pointer to one loads the struct
                     // as if it were the address itself and the module fails LLVM verification.
                     if (declType.Pointer && !declType.IsThinFnPtr())
@@ -764,10 +810,10 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                             "pointer '*' is not supported on closure type '{}'; "
                             "pass the closure by value or use a fixed size '{}[N]' instead",
                             typeSpec->getText(), typeSpec->getText()));
-                    if (auto* fpDimSpec = ArrayDimsOf(declSpec))
+                    if (auto* fpDimSpec = ArrayDimsOf(declSpecWithSuffix))
                     {
                         auto fpDims = fpDimSpec->assignmentExpression();
-                        if (ArrayPtrOf(declSpec) != nullptr && !fpDims.empty())
+                        if (ArrayPtrOf(declSpecWithSuffix) != nullptr && !fpDims.empty())
                             LogErrorContext(declSpec, FixedArrayPointerTypeMessage(typeSpec->getText()));
                         declType.ArraySize = fpDims.empty() ? nullptr : fpDims[0];
                         for (size_t di = 1; di < fpDims.size(); di++)
@@ -791,7 +837,11 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                 if (typeSpec->simdTypeSpecifier() != nullptr)
                 {
                     auto* sd = typeSpec->simdTypeSpecifier();
-                    std::string elemType = sd->typeSpecifier()->getText();
+                    PrimitiveTypeError elemError;
+                    std::string elemType = CanonicalTypeSpecifierText(
+                        sd->typeSpecifier(), sd->multiWordTypeSuffix(), false, &elemError);
+                    if (HasPrimitiveTypeError(elemError))
+                        LogErrorContext(sd, LocalizePrimitiveTypeError(Compiler(), elemError));
                     // Resolve a generic type parameter (e.g. T -> float inside simd<T,8> in a template body).
                     auto substIt = activeTypeSubstitutions.find(elemType);
                     if (substIt != activeTypeSubstitutions.end())
@@ -804,14 +854,14 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                     declType.IsSimd = true;
                     declType.SimdLanes = lanes;
                     RecordSimdPointerAndDims(declType, declSpec);
-                    if (auto* dims = ArrayDimsOf(declSpec);
+                    if (auto* dims = ArrayDimsOf(declSpecWithSuffix);
                         dims != nullptr && dims->assignmentExpression().empty())
                         LogErrorContext(declSpec,
                             "array-view '[]' is not supported on simd types; use a fixed simd array");
                     // The simd branch leaves the specifier loop before the mainstream
                     // pointer-to-array guard, so state it here rather than fall out of
                     // declaration parsing and be re-read as a multiplication expression.
-                    else if (ArrayPtrOf(declSpec) != nullptr && declType.ArraySize != nullptr)
+                    else if (ArrayPtrOf(declSpecWithSuffix) != nullptr && declType.ArraySize != nullptr)
                         LogErrorContext(declSpec, SimdPointerTypeMessage(
                             std::format("simd<{},{}>", elemType, lanes), true));
                     break;
@@ -850,10 +900,16 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                     // struct with constructors, a destructor and methods.
                     {
                         std::string cxxError;
-                        if (!Compiler(declSpecs)->TryRequestCxxType(baseName, typeArgs, mangledName,
-                                                                    cxxError)
-                            && !cxxError.empty())
+                        const bool cxxType = Compiler(declSpecs)->TryRequestCxxType(
+                            baseName, typeArgs, mangledName, cxxError);
+                        if (!cxxType && !cxxError.empty())
                             LogErrorContext(genParams, cxxError);
+                        bool hasLongDouble = false;
+                        for (const auto& arg : typeArgs)
+                            hasLongDouble = hasLongDouble || arg == "longdouble";
+                        if (hasLongDouble && !cxxType)
+                            LogErrorContext(genParams, LocalizePrimitiveTypeError(
+                                Compiler(), LongDoubleNativeTypeError()));
                         // A second CFlat spelling of one specialization (a namespace alias in
                         // a type argument) is registered as an alias of the first: declare the
                         // local with the registration's own name so its members resolve.
@@ -895,7 +951,7 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                     declType.FuncPtrReturnAlias = fit->FuncPtrReturnAlias;
                     declType.FuncPtrReturnPointerDepth = fit->FuncPtrReturnPointerDepth;
                     declType.FuncPtrParams         = fit->FuncPtrParams;
-                    declType.Pointer               = declSpec->pointer() != nullptr;
+                    declType.Pointer               = declSpecWithSuffix->pointer() != nullptr;
                     // Same fat-closure pointer rejection as the functionPointerSpecifier branch.
                     if (declType.Pointer && !declType.IsThinFnPtr())
                         LogErrorContext(declSpec, std::format(
@@ -904,7 +960,7 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                             typeSpec->getText(), typeSpec->getText()));
                     // Like the functionPointerSpecifier branch, this one breaks out of the
                     // specifier loop, so a trailing '[N]' has to be captured right here.
-                    if (auto* fpDimSpec = ArrayDimsOf(declSpec))
+                    if (auto* fpDimSpec = ArrayDimsOf(declSpecWithSuffix))
                     {
                         auto fpDims = fpDimSpec->assignmentExpression();
                         declType.ArraySize = fpDims.empty() ? nullptr : fpDims[0];
@@ -933,7 +989,7 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                         std::string cxxError;
                         Compiler(declSpecs)->TryRequestCxxType(typeName, {}, typeName, cxxError);
                     }
-                    if (typeName == "long") typeName = LongSpellingTypeName(longSpecCount);
+                    if (!canonicalTypeName.empty()) typeName = canonicalTypeName;
                     // Apply active type parameter substitutions (e.g. T -> int inside a template body)
                     int& substPointerDepth = substArgPtrDepth;
                     bool& substArrayView = substArgIsArrayView;
@@ -1005,8 +1061,8 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                         substPointerDepth = 0;
                     }
                 }
-                bool hasExplicitPointer = declSpec->pointer() != nullptr;
-                bool hasDblPointer = hasExplicitPointer && declSpec->pointer()->Star().size() >= 2;
+                bool hasExplicitPointer = declSpecWithSuffix->pointer() != nullptr;
+                bool hasDblPointer = hasExplicitPointer && declSpecWithSuffix->pointer()->Star().size() >= 2;
                 bool substPointer = declType.Pointer; // T was already a pointer (e.g. T=IMessage*)
                 // `T*` with T bound to a view arg ('int[]') DECAYS to the ELEMENT pointer 'int*':
                 // the star consumes the view's own thin-pointer repr and drops the noalias trait.
@@ -1024,7 +1080,8 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                     // A pointer alias is in play: combine its depth with the declarator's stars and
                     // any base-pointer-ness from a generic substitution. The Pointer + ElemPointer
                     // model caps at 2 levels - 3+ is a hard error (no silent truncation).
-                    int declStars = hasExplicitPointer ? (int)declSpec->pointer()->Star().size() : 0;
+                    int declStars = hasExplicitPointer ?
+                        (int)declSpecWithSuffix->pointer()->Star().size() : 0;
                     int totalPtr = aliasPtrDepth + declStars + substArgPtrDepth;
                     // The cap counts a substitution as ONE level, exactly as it did before real
                     // depth existed: a deeper type ARGUMENT must not turn an instantiation into an
@@ -1044,7 +1101,8 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                     if (hasDblPointer || (declType.Pointer && hasExplicitPointer))
                         declType.ElemPointer = true;
                     declType.Pointer = hasExplicitPointer || declType.Pointer;
-                    int declStars = hasExplicitPointer ? (int)declSpec->pointer()->Star().size() : 0;
+                    int declStars = hasExplicitPointer ?
+                        (int)declSpecWithSuffix->pointer()->Star().size() : 0;
                     // A substituted type argument contributes its REAL star count, so `T x` with
                     // T = C** is a proven C**. Over the 2-level cap the exact depth is LOST, so
                     // claim nothing (0): a clamped 2 stepped down by a '*' would falsely prove 1.
@@ -1052,7 +1110,7 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                     if (substArgPtrDepth >= 2) declType.ElemPointer = true;
                     declType.PointerDepth = totalPtr > 2 ? 0 : totalPtr;
                 }
-                if (auto* dimSpec = ArrayDimsOf(declSpec))
+                if (auto* dimSpec = ArrayDimsOf(declSpecWithSuffix))
                 {
                     auto dims = dimSpec->assignmentExpression();
                     declType.ArraySize = dims.empty() ? nullptr : dims[0];
@@ -1075,7 +1133,7 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                 baseType.PointerDepth = 0;
                 baseType.IsArrayView = false;
                 const std::string baseSpelling = SpellType(*Compiler(declSpecs), baseType);
-                if (ArrayPtrOf(declSpec))
+                if (ArrayPtrOf(declSpecWithSuffix))
                 {
                     if (declType.IsArrayView)
                         LogErrorContext(declSpec, std::format(
@@ -1167,7 +1225,7 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                     if (isParameterDecl)
                         declType.IsMove = true;
                 }
-                if (declSpec->Question())
+                if (declSpecWithSuffix->Question())
                 {
                     if (declType.IsPrimitive())
                         LogErrorContext(declSpec, std::format("nullable '?' is not allowed on primitive type '{}'",
@@ -1896,7 +1954,11 @@ void MainListener::ParseUsingDeclaration(CFlatParser::UsingDeclarationContext* c
             return;
         }
 
-        std::string target = typeSpec->getText();
+        PrimitiveTypeError canonicalError;
+        std::string target = CanonicalTypeSpecifierText(
+            typeSpec, ctx->multiWordTypeSuffix(), false, &canonicalError);
+        if (HasPrimitiveTypeError(canonicalError))
+            LogErrorContext(ctx, LocalizePrimitiveTypeError(compiler, canonicalError));
         if (auto subst = activeTypeSubstitutions.find(target); subst != activeTypeSubstitutions.end())
             target = subst->second;
         // A pointer alias (using Handle = void*) stores its trailing stars in the alias string;

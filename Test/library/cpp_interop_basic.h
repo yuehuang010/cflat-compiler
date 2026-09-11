@@ -38,6 +38,11 @@ namespace cppi
     int& ref_slot() noexcept;
 
     long long widen(int v) noexcept;
+    unsigned long unsigned_long_value() noexcept;
+    long long_vector_sum(std::vector<long>& value) noexcept;
+    unsigned long ulong_vector_sum(std::vector<unsigned long>& value) noexcept;
+    long long long_long_vector_sum(std::vector<long long>& value) noexcept;
+    unsigned long long ulong_long_vector_sum(std::vector<unsigned long long>& value) noexcept;
     unsigned char uc(unsigned char v) noexcept;
 
     enum class Mode : int { Off = 0, On = 1 };
@@ -725,6 +730,8 @@ namespace cppi
         inline cppi::OpsSink& operator<<(cppi::OpsSink& sink, const FreeOps& v) noexcept
         { sink.total += v.value; return sink; }
     }
+
+    char16_t char16_value(char16_t value) noexcept;
 
 }
 

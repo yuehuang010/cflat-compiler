@@ -1815,7 +1815,7 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
     targetMacOS_ = (platformOption == "macos" || platformOption == "macos-arm64");
     targetArm64_ = targetMacOS_;
     // `long` follows the target's C ABI: 32-bit on Windows (LLP64) / win32, 64-bit on LP64.
-    SetTargetLongWidth(targetWindows_, platformValue);
+    SetTargetLongWidth(targetWindows_, platformValue, targetArm64_, targetMacOS_);
     if (verbose) std::cout << std::format("[verbose] __PLATFORM__ = {}, __WINDOWS__ = {}, __MACOS__ = {}, arm64 = {}\n",
                                           platformValue, targetWindows_ ? 1 : 0,
                                           targetMacOS_ ? 1 : 0, targetArm64_ ? 1 : 0);
@@ -4222,7 +4222,7 @@ bool LLVMBackend::Analyze(const std::string& filePath,
     targetMacOS_ = false;
     targetArm64_ = false;
 #endif
-    SetTargetLongWidth(targetWindows_, platformValue);
+    SetTargetLongWidth(targetWindows_, platformValue, targetArm64_, targetMacOS_);
 
     // A core file analyzed as the ROOT document (LSP open / --check on core/*.cb) must
     // not load the cache: the cache already contains this file's own definitions, and
@@ -6951,7 +6951,7 @@ bool LLVMBackend::CompileCoreOnly(const std::string& platform)
     targetMacOS_ = (platform == "macos" || platform == "macos-arm64");
     targetArm64_ = targetMacOS_;
     // Core bitcode is per-platform (core_<platform>.bc), so `long` must use this target's width.
-    SetTargetLongWidth(targetWindows_, platformValue);
+    SetTargetLongWidth(targetWindows_, platformValue, targetArm64_, targetMacOS_);
 
     // Reinitialize the LLVM module with the correct platform data layout BEFORE
     // RegisterBuiltinString creates pointer types, so %string fields have the right size.

@@ -11,14 +11,16 @@ struct NoIncrementError { int value = 0; };
 extern int main()
 {
     ForwardErrorPtr p;
-    expect_error("Unknown identifier 'nothere'");
-    int missing = p.nothere;
+    expect_error("Unknown identifier 'nothere'") {
+        int missing = p.nothere;
+    }
 
     NoIncrementError x;
-    expect_error("struct 'NoIncrementError' has no 'operator++'; define 'void operator++()' on it or use a scalar");
-    x++;
-    return missing;
+    expect_error("struct 'NoIncrementError' has no 'operator++'; define 'void operator++()' on it or use a scalar") {
+        x++;
+    }
+    return 0;
 }
 
-expect_error("found ';' but expected {'move', '(', Identifier}");
-int prefixError() { NoIncrementError x; ++x; return 0; }
+// Prefix '++' on a struct is a PARSE error, which ends the compile before the legs above run;
+// it lives alone in err_prefix_increment_struct_parse.cb.
