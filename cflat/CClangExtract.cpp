@@ -442,7 +442,13 @@ namespace cflat_cinterop
             std::string firstError;
             // Every error with its presumed location, so a record whose definition failed to
             // compile can name the clang diagnostic that broke it (capped: a broken TU cascades).
-            struct ErrorNote { std::string message; std::string file; unsigned line = 0; };
+            struct ErrorNote
+            {
+                std::string message;
+                std::string file;
+                unsigned line = 0;
+                bool inMainFile = false;   // raised in the in-memory stub, not a header
+            };
             std::vector<ErrorNote> errors;
 
             void HandleDiagnostic(DiagnosticsEngine::Level level, const Diagnostic& info) override
@@ -459,11 +465,13 @@ namespace cflat_cinterop
                 if (firstError.empty()) firstError = msg.str().str();
                 if (errors.size() < 64)
                 {
-                    ErrorNote note{ msg.str().str(), std::string(), 0 };
+                    ErrorNote note{ msg.str().str(), std::string(), 0, false };
                     if (info.hasSourceManager() && info.getLocation().isValid())
                     {
-                        PresumedLoc pl = info.getSourceManager().getPresumedLoc(info.getLocation());
+                        const SourceManager& sm = info.getSourceManager();
+                        PresumedLoc pl = sm.getPresumedLoc(info.getLocation());
                         if (pl.isValid()) { note.file = pl.getFilename(); note.line = pl.getLine(); }
+                        note.inMainFile = sm.isInMainFile(info.getLocation());
                     }
                     errors.push_back(std::move(note));
                 }
@@ -2481,6 +2489,10 @@ namespace cflat_cinterop
             if (diags == nullptr) return;
             for (const auto& e : diags->errors)
             {
+                // The stub is remapped onto a path inside the scope dirs for the default-wrapper
+                // parse; a wrapper whose forwarded call fails is dropped by the error-body sweep,
+                // not a reason to refuse the header.
+                if (e.inMainFile) continue;
                 if (e.file.empty() || !PathInScope(e.file, st.normDirs)) continue;
                 ++st.out.headerErrors;
                 if (st.out.firstHeaderError.empty())

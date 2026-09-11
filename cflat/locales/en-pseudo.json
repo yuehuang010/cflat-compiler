@@ -13,11 +13,16 @@
       "T",
       "AliasParameterNameReuse"
     ],
+    "alignasisnotsupporte...htheplaindeallocator2beff51adb78c9c4": [],
     "alignmentmismatchini...ntthevaluealreadyhas5a4ed9c3ad1bf980": [
       "unique<AlignUniquePointee, 64>",
       "64",
       "'alignas(0, 32)'",
       "64"
+    ],
+    "ambiguouscalltoarg0n...parametertypeyoumean6524b093d1fa9da7": [
+      "tieLit",
+      "tieLit(u8), tieLit(u16)"
     ],
     "arg0arg1mustbearg2or...obeexecutedinprocess28e30d1abeb98a2b": [
       "--run",
@@ -36,11 +41,19 @@
       "T",
       "MyClass<int>"
     ],
+    "arg0isambiguousarg1n...sorrenamethevariable10b0bb33b930b563": [
+      "c16",
+      "c16"
+    ],
     "arg0isareservedwordi...beusedasanidentifiera2a00aed272d893f": [
       "class"
     ],
     "arg0msvclibdirectory...componentisinstalled740fffb28d2f2687": [
       "--asan"
+    ],
+    "arg0mustfollowthecompletetypearg1": [
+      "*",
+      "unsigned int"
     ],
     "arg0noarg1functiontoexecute": [
       "--run",
@@ -557,6 +570,7 @@
     "duplicatenamedargumentarg0": [
       "a"
     ],
+    "endoffile": [],
     "enumarg0isalreadydefined": [
       "ErrEnumDupDef"
     ],
@@ -564,6 +578,7 @@
       "70000",
       "u16"
     ],
+    "enumvaluemustbeacons...antintegerexpression27ab0d73ff8c6d18": [],
     "extraneousinputarg0expectingarg1": [
       "'}'",
       "<EOF>"
@@ -595,6 +610,14 @@
       "IStringable",
       "Windows.Foundation.IStringable"
     ],
+    "invalidtypespellingarg0": [
+      "unsigned float"
+    ],
+    "invalidtypespellingarg0usearg1": [
+      "unsigned i32",
+      "u32"
+    ],
+    "longdoubleisonlyusab...mentusedoubleincflat12f0254a32d5afe4": [],
     "mismatchedinputarg0expectingarg1": [
       "'='",
       "{'move', '(', Identifier}"
@@ -603,6 +626,7 @@
       "')'",
       "'{'"
     ],
+    "missingatendofstatement": [],
     "namedargumentarg0doe...notmatchanyparameter54ee4c123914315f": [
       "z"
     ],
@@ -641,6 +665,7 @@
       "bool",
       "Foo"
     ],
+    "switchexpressionmustbeanintegertype": [],
     "unknowntypearg0": [
       "GiDeadOnly__i32"
     ]
