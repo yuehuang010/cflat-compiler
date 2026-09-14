@@ -1,0 +1,10 @@
+import cpp "cpp_interop_poly.h";
+
+expect_error("is marked override but 'cpppoly.Shape.plain' is not virtual") {
+    struct Bad : cpppoly.Shape
+    {
+        override int plain() { return 1; }
+    };
+}
+
+extern int main() { return 0; }

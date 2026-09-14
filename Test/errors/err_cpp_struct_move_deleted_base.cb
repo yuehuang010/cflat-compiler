@@ -1,0 +1,15 @@
+import cpp "cpp_interop_poly.h";
+
+struct P2 : cpppoly.Pinned
+{
+    override int v() { return 23; }
+};
+
+extern int main()
+{
+    expect_error("its move or copy constructor is deleted") {
+        P2 a = default;
+        P2 b = move a;
+    }
+    return 0;
+}

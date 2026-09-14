@@ -1,0 +1,8 @@
+expect_error("[cpp] struct cannot be a union") {
+    [cpp] union Bad
+    {
+        int value = 1;
+    };
+}
+
+extern int main() { return 0; }

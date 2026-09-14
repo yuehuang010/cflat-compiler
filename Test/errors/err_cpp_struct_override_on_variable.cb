@@ -1,0 +1,7 @@
+extern int main()
+{
+    expect_error("'override' is only valid on a member function of a [cpp] struct") {
+        override int value = 1;
+    }
+    return 0;
+}

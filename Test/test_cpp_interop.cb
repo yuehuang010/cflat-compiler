@@ -167,6 +167,16 @@
 //                       members and derived-to-base free-function conversions.
 //   Section M72 (1350-1359): canonical C++ primitive identities for unsigned long, size_t,
 //                       unsigned, long double, and a std::vector<size_t>-style round trip.
+//   Section M73 (1360-1399): CFlat-defined no-base [cpp] structs - fields, layout, structors,
+//                       ownership, move, nesting, methods, static methods, and ctor edges.
+//   Section M74 (1400-1439): CFlat-defined derived [cpp] structs - one C++ base, construction,
+//                       overrides, virtual dispatch, protected access, and diagnostics.
+//   Section M75 (1440-1459): C++ struct return adoption, destructor counts, and closure rows.
+//   Section M76 (1460-1479): C++ class-template specializations as [cpp] struct bases,
+//                       including base initializers, virtual dispatch, move cleanup, and fields.
+//   Section M77 (1480-1499): C++ by-value return temporaries and inherited member-template lookup,
+//                       including constructor and sret returns, nested returns, unrelated temps,
+//                       and implicit/explicit receiver spellings.
 // Section M: C++ interop - `import cpp` selects C++ mode; the extension is irrelevant (the
 // fixture header is a plain .h). The header supplies the declarations, the .cpp is compiled
 // by the host C++ driver and linked in. Both are needed: the header alone has no
@@ -250,6 +260,287 @@ int m9_second_use()
 {
     std.string s = std.string("abcd");
     return (int)s.size();
+}
+
+int g_m73_dtor = 0;
+int g_m73_resource_dtor = 0;
+
+struct M73Resource
+{
+    ~M73Resource() { g_m73_resource_dtor = g_m73_resource_dtor + 1; }
+};
+
+[cpp] struct Plain
+{
+    int a = 1;
+    string name = "seed";
+    unique M73Resource* resource = new M73Resource();
+    int second = 17;
+
+    Plain(int v) { a = v; }
+    ~Plain() { g_m73_dtor = g_m73_dtor + 1; }
+    int total() { return a * 2; }
+    static int make_tag() { return 7; }
+};
+
+[cpp] struct M73Default
+{
+    int v = 3;
+    ~M73Default() { g_m73_dtor = g_m73_dtor + 1; }
+};
+
+struct M73PlainOuter
+{
+    M73Default inner = default;
+};
+
+[cpp] struct M73CppOuter
+{
+    M73Default inner = default;
+};
+
+[cpp] struct M73Offsets
+{
+    int a = 1;
+    i64 b = 2;
+    int offset() { return (int)(((i64)&b) - ((i64)&a)); }
+};
+
+namespace m73
+{
+    [cpp] struct Q
+    {
+        int v = 3;
+    };
+}
+
+int g_m73_early_return = 0;
+
+[cpp] struct M73EarlyReturn
+{
+    unique M73Resource* resource = new M73Resource();
+    ~M73EarlyReturn()
+    {
+        if (g_m73_early_return != 0) return;
+    }
+};
+
+[cpp] struct M73NestedDtor
+{
+    int value = 4;
+    ~M73NestedDtor() { g_m73_dtor = g_m73_dtor + 1; }
+};
+
+[cpp] struct M73MoveNested
+{
+    M73NestedDtor inner = default;
+};
+
+[cpp] struct M73Overloads
+{
+    int value = 0;
+    M73Overloads(int x) { value = x; }
+    M73Overloads(int x, int y) { value = x * 10 + y; }
+};
+
+[cpp] struct M73DefaultParam
+{
+    int value = 0;
+    M73DefaultParam(int x = 7) { value = x; }
+};
+
+[cpp] struct alignas(16) M73Aligned
+{
+    int value = 3;
+};
+
+struct MyCircle : cpppoly.Shape
+{
+    int r = 3;
+    override int area() { return local_area(); }
+    int local_area() { return r * r; }
+    ~MyCircle() { g_m73_dtor = g_m73_dtor + 1; }
+};
+
+struct T2 : cpppoly.Tagged
+{
+    T2(int x) : cpppoly.Tagged(x) { }
+};
+
+struct T2Literal : cpppoly.Tagged
+{
+    T2Literal() : cpppoly.Tagged(42) { }
+};
+
+struct ScaleImpl : cpppoly.Scaler
+{
+    override double scale(double x, int k) { return x * k + 1.0; }
+    override const char* label() { return "cflat"; }
+    override int adjust(int x) { return x + 10; }
+};
+
+struct AbstractImpl : cpppoly.Abstract
+{
+    override int pure() { return 7; }
+};
+
+struct CircleImpl : cpppoly.Circle
+{
+    override int area() { return radius + 1; }
+};
+
+struct TaggedImpl : cpppoly.Tagged
+{
+    TaggedImpl(int x) : cpppoly.Tagged(x) { }
+    int protected_field() { return prot; }
+    int protected_method() { return prot_get(); }
+    int protected_sum() { return prot + prot_get(); }
+};
+
+struct TaggedMethodImpl : cpppoly.Tagged
+{
+    TaggedMethodImpl(int x) : cpppoly.Tagged(x) { }
+    int method_only() { return prot_get(); }
+};
+
+struct P2 : cpppoly.Pinned
+{
+    override int v() { return 23; }
+};
+
+struct G2 : cpppoly.Guarded
+{
+    override int hidden() { return 3; }
+};
+
+namespace m74
+{
+    [cpp] struct NamespacedCircle : cpppoly.Shape
+    {
+        override int area() { return 12; }
+    };
+}
+
+[cpp] struct ExplicitCircle : cpppoly.Shape
+{
+    override int area() { return 13; }
+};
+
+struct M75Return : cpppoly.Shape
+{
+    int r = 4;
+    override int area() { return r * r; }
+    ~M75Return() { g_m73_dtor = g_m73_dtor + 1; }
+};
+
+struct M76IntTripler : cppt.m76.Holder<int>
+{
+    int extra = 1;
+    M76IntTripler(int v) : cppt.m76.Holder<int>(v) { }
+    override int doubled() { return value * 3 + extra; }
+};
+
+struct M76DoubleTripler : cppt.m76.Holder<double>
+{
+    double extra = 0.5;
+    M76DoubleTripler(double v) : cppt.m76.Holder<double>(v) { }
+    override double doubled() { return value * 4.0 + extra; }
+};
+
+struct M76Shape : cppt.m76.Shape2<int>
+{
+    override int area() { return 42; }
+};
+
+struct M76MemberTripler : cppt.m76.Holder<int>
+{
+    cppt.m76.Holder<int> inner = default;
+    M76MemberTripler(int v) : cppt.m76.Holder<int>(v) { inner.value = 9; }
+    override int doubled() { return value * 2 + inner.value; }
+};
+
+cppi.Tracked m77_free_ctor(int value)
+{
+    return cppi.Tracked(value);
+}
+
+cppi.Tracked m77_free_sret(int value)
+{
+    return cppi.make_tracked(value);
+}
+
+cppi.Tracked m77_inner(int value)
+{
+    return cppi.make_tracked(value);
+}
+
+cppi.Tracked m77_outer(int value)
+{
+    return m77_inner(value);
+}
+
+cppi.Tracked m77_free_both(int value)
+{
+    return cppi.make_tracked(cppi.Tracked(value).value());
+}
+
+struct M77PlainReturns
+{
+    cppi.Tracked ctor_return(int value) { return cppi.Tracked(value); }
+    cppi.Tracked sret_return(int value) { return cppi.make_tracked(value); }
+    cppi.Tracked inner(int value) { return cppi.make_tracked(value); }
+    cppi.Tracked outer(int value) { return inner(value); }
+    cppi.Tracked both(int value)
+    {
+        return cppi.make_tracked(cppi.Tracked(value).value());
+    }
+};
+
+[cpp] struct M77CppReturns : cpppoly.Shape
+{
+    cppi.Tracked ctor_return(int value) { return cppi.Tracked(value); }
+    cppi.Tracked sret_return(int value) { return cppi.make_tracked(value); }
+    cppi.Tracked inner(int value) { return cppi.make_tracked(value); }
+    cppi.Tracked outer(int value) { return inner(value); }
+    cppi.Tracked both(int value)
+    {
+        return cppi.make_tracked(cppi.Tracked(value).value());
+    }
+};
+
+[cpp] struct M77Registry : cppt.Registry
+{
+    int ctor_reg = 0;
+    M77Registry() { ctor_reg = reg("x", 3); }
+    int implicit_reg(int value) { return reg("y", value); }
+    int explicit_reg(int value) { return this->reg<int>("z", value); }
+};
+
+Plain m73_make_plain(int value)
+{
+    Plain p = Plain(value);
+    return move p;
+}
+
+Plain m73_make_plain2()
+{
+    return m73_make_plain(7);
+}
+
+M75Return m75_make1()
+{
+    M75Return value = default;
+    return move value;
+}
+
+M75Return m75_make2()
+{
+    return m75_make1();
+}
+
+void m73_bump(Plain* p)
+{
+    p.a = p.a + 1;
 }
 
 int m17_direct_array_param(std.array<int, 4> value)
@@ -2561,6 +2852,448 @@ extern int main()
         if ((int)m72roundtrip.size() != 1) return 1358;
         if (m72roundtrip[0] != 20) return 1359;
     }
+
+    // ---- Section M73: CFlat-defined no-base [cpp] structs (1360-1399) -------------------
+    g_m73_dtor = 0;
+    g_m73_resource_dtor = 0;
+    {
+        Plain m73plain = Plain(5);
+        if (m73plain.a != 5) return 1360;
+        if (length(m73plain.name) != 4 || m73plain.second != 17) return 1361;
+        if (m73plain.total() != 10) return 1362;
+        m73plain.a = 9;
+        if (m73plain.a != 9) return 1364;
+        if (m73plain.total() != 18) return 1363;
+        // int (4) + padding (4) + string (16) + unique pointer (8) + int (4)
+        // + tail padding (4) = 40.
+        if (sizeof(Plain) != 4 + 4 + 16 + 8 + 4 + 4) return 1365;
+        if (alignof(Plain) != 8) return 1366;
+        if (g_m73_dtor != 0) return 1368;
+    }
+    if (g_m73_dtor != 1) return 1367;
+
+    g_m73_dtor = 0;
+    g_m73_resource_dtor = 0;
+    {
+        Plain m73owned = Plain(1);
+        if (g_m73_resource_dtor != 0) return 1369;
+    }
+    if (g_m73_resource_dtor != 1) return 1370;
+
+    g_m73_dtor = 0;
+    g_m73_resource_dtor = 0;
+    {
+        Plain m73from = Plain(5);
+        Plain m73to = move m73from;
+        if (m73to.a != 5) return 1371;
+        if (g_m73_dtor != 0 || g_m73_resource_dtor != 0) return 1372;
+    }
+    if (g_m73_dtor != 2 || g_m73_resource_dtor != 1) return 1373;
+
+    g_m73_dtor = 0;
+    g_m73_resource_dtor = 0;
+    {
+        Plain m73returned = m73_make_plain(6);
+        if (m73returned.a != 6) return 1374;
+    }
+    if (g_m73_dtor != 1 || g_m73_resource_dtor != 1) return 1391;
+
+    {
+        Plain m73pointer = Plain(8);
+        m73_bump(&m73pointer);
+        if (m73pointer.a != 9) return 1375;
+    }
+
+    g_m73_dtor = 0;
+    g_m73_resource_dtor = 0;
+    Plain* m73heap = new Plain(2);
+    if (m73heap->a != 2) return 1376;
+    delete m73heap;
+    if (g_m73_dtor != 1 || g_m73_resource_dtor != 1) return 1377;
+
+    if (Plain.make_tag() != 7) return 1378;
+
+    {
+        m73.Q m73q = m73.Q();
+        if (m73q.v != 3) return 1379;
+    }
+
+    g_m73_dtor = 0;
+    {
+        M73PlainOuter m73outer = default;
+        if (g_m73_dtor != 0) return 1380;
+    }
+    if (g_m73_dtor != 1) return 1381;
+
+    g_m73_dtor = 0;
+    {
+        M73CppOuter m73cppouter = default;
+        if (m73cppouter.inner.v != 3) return 1382;
+    }
+    if (g_m73_dtor != 1) return 1383;
+
+    {
+        M73Offsets m73offsets = default;
+        if (m73offsets.offset() != 8) return 1384;
+    }
+
+    g_m73_resource_dtor = 0;
+    g_m73_early_return = 1;
+    {
+        M73EarlyReturn m73early = default;
+    }
+    if (g_m73_resource_dtor != 1) return 1385;
+    g_m73_early_return = 0;
+
+    g_m73_dtor = 0;
+    {
+        M73MoveNested m73nestedFrom = default;
+        M73MoveNested m73nestedTo = move m73nestedFrom;
+        if (m73nestedTo.inner.value != 4) return 1386;
+    }
+    if (g_m73_dtor != 2) return 1387;
+
+    {
+        M73Aligned m73aligned = default;
+        if (sizeof(M73Aligned) != 16 || m73aligned.value != 3) return 1388;
+    }
+
+    {
+        M73Overloads m73one = M73Overloads(5);
+        M73Overloads m73two = M73Overloads(2, 3);
+        if (m73one.value != 5 || m73two.value != 23) return 1389;
+    }
+
+    {
+        M73DefaultParam m73default = default;
+        if (m73default.value != 7) return 1390;
+    }
+
+    // ---- Section M74: CFlat-defined derived [cpp] structs (1400-1439) ------------------
+    cpppoly.reset_poly_counts();
+    {
+        MyCircle c = default;
+        if (c.area() != 9) return 1400;
+        if (cpppoly.call_area(&c) != 9) return 1401;
+        if (cpppoly.call_area_ref(c) != 9) return 1402;
+        if (c.plain() != 101 || cpppoly.call_plain(&c) != 101) return 1403;
+        c.tag = 5;
+        if (c.tag != 5) return 1404;
+        if (cpppoly.call_plain(&c) != 105) return 1405;
+    }
+
+    g_m73_dtor = 0;
+    cpppoly.reset_poly_counts();
+    cpppoly.Shape* m74deleted = new MyCircle();
+    delete m74deleted;
+    if (g_m73_dtor != 1) return 1406;
+    if (cpppoly.shape_dtors() != 1) return 1407;
+    if (cpppoly.circle_dtors() != 0) return 1408;
+
+    {
+        T2 t = T2(7);
+        if (t.tag != 7) return 1409;
+        if (cpppoly.call_get(&t) != 7) return 1410;
+    }
+    {
+        T2Literal t = default;
+        if (t.tag != 42) return 1411;
+    }
+
+    {
+        MyCircle c = default;
+        if (c.tag != 1) return 1412;
+        if (c.plain() != 101) return 1413;
+    }
+
+    {
+        MyCircle c = default;
+        if (c.local_area() != 9) return 1414;
+        if (c.area() != 9) return 1415;
+    }
+
+    {
+        ScaleImpl sc = default;
+        if (cpppoly.call_scale(&sc, 1.5, 2) != 4.0) return 1416;
+        if (sc.scale(1.5, 2) != 4.0) return 1417;
+        if (strcmp(cpppoly.call_label(&sc), "cflat") != 0) return 1418;
+    }
+
+    {
+        AbstractImpl impl = default;
+        if (cpppoly.call_pure(&impl) != 7) return 1419;
+        if (impl.pure() != 7) return 1420;
+    }
+
+    {
+        CircleImpl c = default;
+        if (c.radius != 5) return 1421;
+        if (c.area() != 6) return 1422;
+        cpppoly.Shape* s = &c;
+        if (s.area() != 6) return 1423;
+    }
+
+    {
+        TaggedImpl t = TaggedImpl(7);
+        if (t.protected_field() != 70) return 1424;
+        if (t.protected_method() != 70) return 1425;
+        if (t.protected_sum() != 140) return 1426;
+    }
+
+    g_m73_dtor = 0;
+    cpppoly.reset_poly_counts();
+    {
+        MyCircle c = default;
+        MyCircle d = move c;
+        if (d.area() != 9) return 1427;
+    }
+    if (g_m73_dtor != 2) return 1428;
+    if (cpppoly.shape_dtors() != 2) return 1429;
+
+    {
+        m74.NamespacedCircle c = default;
+        if (c.area() != 12) return 1430;
+        ExplicitCircle e = default;
+        if (e.area() != 13) return 1431;
+    }
+
+    {
+        MyCircle c = default;
+        if (c.area() != 9) return 1432;
+        ScaleImpl sc = default;
+        if (cpppoly.call_adjust(&sc, 3) != 13) return 1433;
+    }
+
+    // Clang -v probe on macOS arm64 reports sizeof(__cflat_user::MyCircle) == 24.
+    if (sizeof(MyCircle) <= cpppoly.sizeof_shape()) return 1434;
+    if (sizeof(MyCircle) != cpppoly.sizeof_shape() + 8) return 1435;
+
+    {
+        P2 p = default;
+        if (p.v() != 23 || cpppoly.call_v(&p) != 23) return 1436;
+    }
+
+    {
+        G2 g = default;
+        if (g.hidden() != 3 || g.probe() != 3 || cpppoly.call_hidden(&g) != 3) return 1437;
+    }
+
+    {
+        TaggedMethodImpl t = TaggedMethodImpl(8);
+        if (t.method_only() != 80) return 1438;
+    }
+
+    g_m73_dtor = 0;
+    cpppoly.reset_poly_counts();
+    cpppoly.destroy(new MyCircle());
+    if (g_m73_dtor != 1 || cpppoly.shape_dtors() != 1) return 1439;
+
+    // ---- Section M75: C++ struct return adoption and virtual-chain closure (1440-1459) --
+    g_m73_dtor = 0;
+    cpppoly.reset_poly_counts();
+    {
+        M75Return value = m75_make1();
+        if (value.area() != 16) return 1440;
+        if (g_m73_dtor != 0 || cpppoly.shape_dtors() != 0) return 1441;
+    }
+    if (g_m73_dtor != 1) return 1442;
+    if (cpppoly.shape_dtors() != 1) return 1443;
+
+    g_m73_dtor = 0;
+    cpppoly.reset_poly_counts();
+    {
+        M75Return value = m75_make2();
+        if (value.area() != 16) return 1444;
+        if (g_m73_dtor != 0 || cpppoly.shape_dtors() != 0) return 1445;
+    }
+    if (g_m73_dtor != 1) return 1446;
+    if (cpppoly.shape_dtors() != 1) return 1447;
+
+    g_m73_dtor = 0;
+    {
+        Plain value = m73_make_plain2();
+        if (value.a != 7) return 1448;
+        if (g_m73_dtor != 0) return 1449;
+    }
+    if (g_m73_dtor != 1) return 1450;
+
+    g_m73_dtor = 0;
+    cpppoly.reset_poly_counts();
+    {
+        M75Return value = m75_make1();
+        if (cpppoly.call_area(&value) != 16) return 1451;
+        if (cpppoly.call_area_ref(value) != 16) return 1452;
+        if (value.area() != 16) return 1453;
+    }
+    if (g_m73_dtor != 1 || cpppoly.shape_dtors() != 1) return 1454;
+
+    {
+        M75Return value = m75_make2();
+        cpppoly.Shape* base = &value;
+        if (base.area() != 16) return 1455;
+        if (value.r != 4) return 1456;
+    }
+
+    {
+        Plain value = m73_make_plain(8);
+        if (value.total() != 16) return 1457;
+        value.a = 9;
+        if (value.total() != 18) return 1458;
+        if (value.second != 17) return 1459;
+    }
+
+    // ---- Section M76: C++ class-template specialization bases (1460-1479) ----------
+    cppt.m76.reset_holder_int_dtors();
+    {
+        M76IntTripler value = M76IntTripler(5);
+        if (value.value != 5) return 1460;
+        if (value.doubled() != 16) return 1461;
+        if (cppt.m76.call_doubled<int>(&value) != 16) return 1462;
+    }
+    if (cppt.m76.holder_int_dtors() != 1) return 1463;
+
+    cppt.m76.reset_holder_double_dtors();
+    {
+        M76DoubleTripler value = M76DoubleTripler(2.0);
+        if (value.value != 2.0) return 1464;
+        if (value.doubled() != 8.5) return 1465;
+        if (cppt.m76.call_doubled<double>(&value) != 8.5) return 1466;
+    }
+    if (cppt.m76.holder_double_dtors() != 1) return 1467;
+
+    {
+        M76Shape value = default;
+        if (value.area() != 42) return 1468;
+        if (cppt.m76.call_area2<int>(&value) != 42) return 1469;
+    }
+
+    cppt.m76.reset_holder_int_dtors();
+    {
+        M76IntTripler source = M76IntTripler(7);
+        M76IntTripler target = move source;
+        if (target.value != 7 || target.doubled() != 22) return 1470;
+        if (cppt.m76.holder_int_dtors() != 0) return 1471;
+    }
+    if (cppt.m76.holder_int_dtors() != 2) return 1472;
+
+    cppt.m76.reset_holder_int_dtors();
+    {
+        M76MemberTripler value = M76MemberTripler(4);
+        if (value.inner.value != 9) return 1473;
+        if (value.doubled() != 17) return 1474;
+        if (cppt.m76.call_doubled<int>(&value) != 17) return 1475;
+    }
+    if (cppt.m76.holder_int_dtors() != 2) return 1476;
+
+    cppt.m76.reset_holder_int_dtors();
+    {
+        M76MemberTripler source = M76MemberTripler(3);
+        M76MemberTripler target = move source;
+        if (target.value != 3 || target.inner.value != 9) return 1477;
+        if (target.doubled() != 15) return 1478;
+    }
+    if (cppt.m76.holder_int_dtors() != 4) return 1479;
+
+    // ---- Section M77: C++ return temporaries and inherited member templates (1480-1499) --
+    M77PlainReturns m77plain = default;
+    M77CppReturns m77cpp = default;
+    M77Registry m77registry = default;
+
+    cppi.reset_counts();
+    {
+        cppi.Tracked value = m77_free_ctor(11);
+        if (value.value() != 11) return 1480;
+    }
+    if (cppi.ctor_count() != 1 || cppi.copy_count() != 0 || cppi.move_count() != 0
+        || cppi.dtor_count() != 1) return 1481;
+
+    cppi.reset_counts();
+    {
+        cppi.Tracked value = m77_free_sret(12);
+        if (value.value() != 12) return 1482;
+    }
+    if (cppi.ctor_count() != 1 || cppi.copy_count() != 0 || cppi.move_count() != 0
+        || cppi.dtor_count() != 1) return 1483;
+
+    cppi.reset_counts();
+    {
+        cppi.Tracked value = m77plain.ctor_return(13);
+        if (value.value() != 13) return 1484;
+    }
+    if (cppi.ctor_count() != 1 || cppi.copy_count() != 0 || cppi.move_count() != 0
+        || cppi.dtor_count() != 1) return 1485;
+
+    cppi.reset_counts();
+    {
+        cppi.Tracked value = m77plain.sret_return(14);
+        if (value.value() != 14) return 1486;
+    }
+    if (cppi.ctor_count() != 1 || cppi.copy_count() != 0 || cppi.move_count() != 0
+        || cppi.dtor_count() != 1) return 1487;
+
+    cppi.reset_counts();
+    {
+        cppi.Tracked value = m77cpp.ctor_return(15);
+        if (value.value() != 15) return 1488;
+    }
+    if (cppi.ctor_count() != 1 || cppi.copy_count() != 0 || cppi.move_count() != 0
+        || cppi.dtor_count() != 1) return 1489;
+
+    cppi.reset_counts();
+    {
+        cppi.Tracked value = m77cpp.sret_return(16);
+        if (value.value() != 16) return 1490;
+    }
+    if (cppi.ctor_count() != 1 || cppi.copy_count() != 0 || cppi.move_count() != 0
+        || cppi.dtor_count() != 1) return 1491;
+
+    cppi.reset_counts();
+    {
+        cppi.Tracked value = m77_outer(17);
+        if (value.value() != 17) return 1492;
+    }
+    if (cppi.ctor_count() != 1 || cppi.copy_count() != 0 || cppi.move_count() != 0
+        || cppi.dtor_count() != 1) return 1493;
+    cppi.reset_counts();
+    {
+        cppi.Tracked value = m77plain.outer(18);
+        if (value.value() != 18) return 1492;
+    }
+    if (cppi.ctor_count() != 1 || cppi.copy_count() != 0 || cppi.move_count() != 0
+        || cppi.dtor_count() != 1) return 1493;
+    cppi.reset_counts();
+    {
+        cppi.Tracked value = m77cpp.outer(19);
+        if (value.value() != 19) return 1492;
+    }
+    if (cppi.ctor_count() != 1 || cppi.dtor_count() != 1) return 1493;
+
+    cppi.reset_counts();
+    {
+        cppi.Tracked value = m77_free_both(20);
+        if (value.value() != 20) return 1494;
+    }
+    if (cppi.ctor_count() != 2 || cppi.copy_count() != 0 || cppi.move_count() != 0
+        || cppi.dtor_count() != 2) return 1495;
+    cppi.reset_counts();
+    {
+        cppi.Tracked value = m77plain.both(21);
+        if (value.value() != 21) return 1494;
+    }
+    if (cppi.ctor_count() != 2 || cppi.copy_count() != 0 || cppi.move_count() != 0
+        || cppi.dtor_count() != 2) return 1495;
+    cppi.reset_counts();
+    {
+        cppi.Tracked value = m77cpp.both(22);
+        if (value.value() != 22) return 1494;
+    }
+    if (cppi.ctor_count() != 2 || cppi.copy_count() != 0 || cppi.move_count() != 0
+        || cppi.dtor_count() != 2) return 1495;
+
+    if (m77registry.ctor_reg != 4) return 1496;
+    if (m77registry.implicit_reg(5) != 7) return 1497;
+    if (m77registry.explicit_reg(6) != 8) return 1498;
+    if (m77registry.plain() != 7) return 1499;
 
     return 0;
 }

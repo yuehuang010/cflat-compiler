@@ -1,0 +1,10 @@
+import cpp "cpp_interop_poly.h";
+
+expect_error("overrides 'cpppoly.Sealed.f' which is final") {
+    struct Bad : cpppoly.Sealed
+    {
+        override int f() { return 1; }
+    };
+}
+
+extern int main() { return 0; }

@@ -1,0 +1,16 @@
+[cpp] struct CopyBad
+{
+    int value = 1;
+};
+
+// The refusal text comes from the generated class's deleted C++ copy constructor, not CFlat's
+// own copy analysis.
+
+extern int main()
+{
+    expect_error("its copy constructor is deleted") {
+        CopyBad a = default;
+        CopyBad b = a;
+    }
+    return 0;
+}

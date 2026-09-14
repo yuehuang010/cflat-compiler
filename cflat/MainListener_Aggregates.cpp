@@ -18,6 +18,28 @@ bool ShouldWarnImplicitFieldNarrowing(llvm::Value* value, llvm::Type* destinatio
     return isUnsigned ? integer.isNegative() || integer.getActiveBits() > bits
                       : !integer.isSignedIntN(bits);
 }
+
+std::string CppStructCxxName(const std::string& name)
+{
+    std::string out = "__cflat_user::" + name;
+    for (size_t pos = 0; (pos = out.find('.', pos)) != std::string::npos; )
+    {
+        out.replace(pos, 1, "__");
+        pos += 2;
+    }
+    return out;
+}
+
+std::string CppStructThunkStem(const std::string& name)
+{
+    std::string out = name;
+    for (size_t pos = 0; (pos = out.find('.', pos)) != std::string::npos; )
+    {
+        out.replace(pos, 1, "__");
+        pos += 2;
+    }
+    return out;
+}
 }
 
 void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* ctx, const std::string& nameOverride, const std::string& namespaceName) {
@@ -39,6 +61,67 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
         else
         {
             structName = baseName;
+        }
+
+        const auto rawAnnotations = ExtractAnnotations(ctx->annotationList());
+        const auto baseClauses = BaseClauseIdentifiers(ctx);
+        if (baseClauses.size() > 1)
+        {
+            Compiler(ctx)->LogErrorMessage("multiple bases are not supported yet");
+            return;
+        }
+        const bool hasCppBase = !baseClauses.empty();
+        const bool isCppStruct = hasCppBase
+            || std::any_of(rawAnnotations.begin(), rawAnnotations.end(),
+                           [](const auto& ann) { return ann.Name == "cpp"; });
+        if (isCppStruct && nameOverride.empty() && ctx->genericTypeParameters() != nullptr)
+        {
+            Compiler(ctx)->LogErrorMessage("generic [cpp] struct is not supported yet");
+            return;
+        }
+        std::string cppBaseName;
+        std::string cppBaseSpelling;
+        size_t cppBaseOwnerGroup = static_cast<size_t>(-1);
+        if (hasCppBase)
+        {
+            auto* base = baseClauses[0];
+            const std::string baseSpelling = BaseSpecifierName(base);
+            cppBaseName = baseSpelling;
+            std::vector<std::string> typeArgs;
+            if (auto* generic = base->genericTypeParameters())
+            {
+                cppBaseName = compiler->ResolveGenericBaseAlias(cppBaseName);
+                for (auto* entry : generic->typeParameterList()->typeParameterEntry())
+                    typeArgs.push_back(ResolveTypeArgEntry(entry));
+                cppBaseName = MangledGenericName(cppBaseName, typeArgs);
+            }
+            compiler->RecordCppStructBase(structName, cppBaseName);
+            std::string baseError;
+            if (baseSpelling.empty()
+                || !compiler->TryRequestCxxType(baseSpelling, typeArgs, cppBaseName, baseError)
+                || !compiler->IsCxxRecord(cppBaseName))
+            {
+                Compiler(ctx)->LogErrorMessage(
+                    "base '{}' of struct '{}' is not a C++ class", { baseSpelling, structName });
+                return;
+            }
+            const auto* baseInfo = compiler->GetCxxClassInfo(cppBaseName);
+            if (baseInfo == nullptr || !baseInfo->layoutRefusal.empty()
+                || baseInfo->hasVirtualBases)
+            {
+                if (baseInfo != nullptr && !baseInfo->layoutRefusal.empty())
+                    Compiler(ctx)->LogErrorMessage("{}", { baseInfo->layoutRefusal });
+                else
+                    Compiler(ctx)->LogErrorMessage("uses virtual inheritance, which is not supported yet");
+                return;
+            }
+            if (!compiler->CxxSpellingForCflatType(cppBaseName, cppBaseSpelling))
+            {
+                Compiler(ctx)->LogErrorMessage(
+                    "base '{}' of struct '{}' is not a C++ class", { baseSpelling, structName });
+                return;
+            }
+            compiler->GetCxxTypeOwnerGroup(cppBaseName, cppBaseOwnerGroup);
         }
 
         // If this is a generic template definition (not an instantiation), store it and return.
@@ -96,6 +179,9 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
         // Validate type-level annotations against the registry and record them for
         // annotationof(Type,"Ann"). [Capability(...)] is consumed once the members exist.
         auto structAnnotations = ParseAnnotationList(ctx->annotationList());
+        if (hasCppBase && std::none_of(structAnnotations.begin(), structAnnotations.end(),
+                                       [](const auto& ann) { return ann.Name == "cpp"; }))
+            structAnnotations.push_back({ "cpp", {} });
         compiler->SetTypeAnnotations(structName, structAnnotations);
 
         if (compiler->IsVerbose())
@@ -256,6 +342,12 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
         // GetFunctionType can resolve the (sized) return type.  Initializer
         // expressions are evaluated later inside the constructor body.
         bool isUnion = (ctx->Union() != nullptr);
+        if (isCppStruct && isUnion)
+        {
+            Compiler(ctx)->LogErrorMessage("[cpp] struct cannot be a union");
+            structScopeStack.pop_back();
+            return;
+        }
 
         if (compiler->IsVerbose())
             std::cout << "[verbose]     create struct type: " << structName << "\n";
@@ -265,11 +357,68 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
         if (auto* alignSpec = ctx->alignmentSpecifier())
             userAlign = ParseAlignmentSpecifier(alignSpec);
         llvm::StructType* structType;
+        llvm::StructType* literalType = nullptr;
         if (isUnion)
         {
             // A union body is one array: an over-aligned member cannot get a pad slot, it
             // just raises the union's alignment (all members start at offset 0).
             structType = compiler->CreateUnionType(structName, declList, userAlign);
+        }
+        else if (isCppStruct)
+        {
+            bool needsFieldInstantiation = false;
+            for (const auto& field : declList)
+            {
+                auto fieldData = compiler->GetDataStructure(field.TypeName);
+                if (compiler->IsCoreUniqueType(field.TypeName)
+                    && (fieldData.StructType == nullptr || fieldData.StructType->isOpaque()))
+                {
+                    needsFieldInstantiation = true;
+                    break;
+                }
+            }
+            if (needsFieldInstantiation)
+            {
+                auto savedSubst = activeTypeSubstitutions;
+                ProcessPendingInstantiations();
+                activeTypeSubstitutions = savedSubst;
+            }
+            uint64_t fieldAlign = 0;
+            declList = compiler->PadFieldsForAlignment(declList, fieldAlign,
+                anyBitfields ? &packedBitfields : nullptr);
+            if (fieldAlign > userAlign) userAlign = fieldAlign;
+            if (declList.empty())
+            {
+                LLVMBackend::DeclTypeAndValue storage;
+                storage.TypeName = "u8";
+                storage.ConstArraySize = 1;
+                declList.push_back(std::move(storage));
+            }
+            std::vector<llvm::Type*> literalFields;
+            for (const auto& field : declList)
+            {
+                auto* fieldType = compiler->GetType(field);
+                if (fieldType == nullptr || !fieldType->isSized())
+                {
+                    Compiler(ctx)->LogErrorMessage(
+                        "[cpp] struct '{}' has an unsized field '{}'; use a pointer",
+                        { structName, field.VariableName });
+                    structScopeStack.pop_back();
+                    return;
+                }
+                literalFields.push_back(fieldType);
+            }
+            if (userAlign > 1)
+            {
+                auto* natural = llvm::StructType::get(*compiler->context, literalFields);
+                const uint64_t size = compiler->module->getDataLayout().getTypeAllocSize(natural);
+                const uint64_t padded = llvm::alignTo(size, userAlign);
+                if (padded > size)
+                    literalFields.push_back(llvm::ArrayType::get(compiler->builder->getInt8Ty(),
+                                                                   padded - size));
+            }
+            literalType = llvm::StructType::get(*compiler->context, literalFields);
+            structType = compiler->GetDataStructure(structName).StructType;
         }
         else
         {
@@ -324,9 +473,479 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
             return false;
         }();
         bool hasExplicitNoArgCtor = !isUnion && (hasBareNoArgCtor || hasAllDefaultedCtor);
+        bool baseHasDefaultCtor = cppBaseName.empty();
+        if (!cppBaseName.empty())
+        {
+            baseHasDefaultCtor = compiler->FindCxxDefaultCtor(cppBaseName) != nullptr;
+            if (!baseHasDefaultCtor)
+            {
+                const auto* baseInfo = compiler->GetCxxClassInfo(cppBaseName);
+                if (baseInfo != nullptr && !baseInfo->hasDeletedDefaultCtor
+                    && (baseInfo->hasDefaultCtor
+                        || (baseInfo->isAbstract && baseInfo->constructors.empty())))
+                {
+                    baseHasDefaultCtor = true;
+                }
+            }
+        }
+        const bool hasGeneratedNoArgCtor = !hasExplicitNoArgCtor && baseHasDefaultCtor;
+
+        if (isCppStruct)
+        {
+            const std::string cxxName = CppStructCxxName(structName);
+            const std::string shortName = CppStructThunkStem(structName);
+            const uint64_t fieldBytes = compiler->module->getDataLayout().getTypeAllocSize(literalType);
+            const uint64_t fieldAlign = std::max<uint64_t>(
+                userAlign, std::max<uint64_t>(1,
+                    compiler->module->getDataLayout().getABITypeAlign(literalType).value()));
+            const bool hasGeneratedMove = cppBaseName.empty()
+                || compiler->CxxBaseHasAccessibleMoveOrCopy(cppBaseName);
+            uint64_t cxxFieldAlign = fieldAlign;
+            if (!cppBaseName.empty())
+            {
+                LLVMBackend::TypeAndValue baseValue{ .TypeName = cppBaseName };
+                if (auto* baseType = compiler->GetType(baseValue); baseType != nullptr)
+                    cxxFieldAlign = std::max<uint64_t>(cxxFieldAlign,
+                        compiler->module->getDataLayout().getABITypeAlign(baseType).value());
+            }
+            const std::string baseCxxName = cppBaseSpelling.empty() ? std::string()
+                : (cppBaseSpelling.starts_with("::") ? cppBaseSpelling : "::" + cppBaseSpelling);
+            std::string source = "namespace __cflat_user { struct " + shortName + "; }\n";
+            source += "extern \"C\" {\n";
+            auto appendParamSpelling = [&](const LLVMBackend::DeclTypeAndValue& param,
+                                           std::string& out) -> bool {
+                if (!compiler->CxxSpellingForCflatType(param.TypeName, out)) return false;
+                const int depth = param.PointerDepth > 0
+                    ? param.PointerDepth : (param.Pointer ? (param.ElemPointer ? 2 : 1) : 0);
+                for (int i = 0; i < depth; ++i) out += " *";
+                return true;
+            };
+            struct OverrideSourceInfo
+            {
+                CFlatParser::FunctionDefinitionContext* Function = nullptr;
+                std::vector<LLVMBackend::DeclTypeAndValue> Params;
+                LLVMBackend::CxxClassInfo::Method BaseMethod;
+                std::string Name;
+                std::string StableName;
+            };
+            auto sameOverrideType = [](const LLVMBackend::TypeAndValue& left,
+                                       const LLVMBackend::TypeAndValue& right) {
+                return left.TypeName == right.TypeName
+                    && left.Pointer == right.Pointer
+                    && left.ValuePointerDepth() == right.ValuePointerDepth()
+                    && left.IsArrayView == right.IsArrayView
+                    && left.IsRvalueRef == right.IsRvalueRef;
+            };
+            std::vector<OverrideSourceInfo> overrides;
+            std::set<std::string> overrideNames;
+            std::map<std::string, size_t> overrideOrdinals;
+            if (hasCppBase)
+            {
+            for (auto* func : functionList)
+            {
+                if (!FunctionDeclaresReturnType(func)) continue;
+                const std::string methodName = getFunctionName(func);
+                const bool isOverride = HasSoftDeclarationSpecifier(
+                    func->declarationSpecifiers(), "override");
+                auto candidates = compiler->FindCxxBaseMethods(cppBaseName, methodName);
+                if (!isOverride)
+                {
+                    for (const auto& candidate : candidates)
+                        if (candidate.raw.isVirtual)
+                            Compiler(func)->LogErrorMessage(
+                                "hides virtual method '{}.{}'; add override",
+                                { candidate.ownerType, methodName });
+                    continue;
+                }
+                if (candidates.empty())
+                {
+                    Compiler(func)->LogErrorMessage(
+                        "is marked override but base '{}' has no virtual method named {}",
+                        { cppBaseName, methodName });
+                    continue;
+                }
+                std::vector<LLVMBackend::CxxClassInfo::Method> virtuals;
+                const LLVMBackend::CxxClassInfo::Method* unspellable = nullptr;
+                for (const auto& candidate : candidates)
+                    if (candidate.raw.isVirtual)
+                    {
+                        if (candidate.spellable) virtuals.push_back(candidate);
+                        else if (unspellable == nullptr) unspellable = &candidate;
+                    }
+                if (virtuals.empty())
+                {
+                    if (unspellable != nullptr)
+                    {
+                        Compiler(func)->LogErrorMessage(
+                            "does not override '{}.{}' (its C++ signature has no CFlat spelling)",
+                            { unspellable->ownerType, methodName });
+                        continue;
+                    }
+                    Compiler(func)->LogErrorMessage(
+                        "is marked override but '{}.{}' is not virtual",
+                        { candidates.front().ownerType, methodName });
+                    continue;
+                }
+                auto params = ParseParameterTypeList(func->parameterTypeList());
+                auto returnValue = getFunctionReturnType(func);
+                const LLVMBackend::CxxClassInfo::Method* matched = nullptr;
+                for (const auto& candidate : virtuals)
+                {
+                    if (candidate.params.size() != params.size() + 1
+                        || !sameOverrideType(candidate.ret, returnValue)) continue;
+                    bool same = true;
+                    for (size_t i = 0; i < params.size(); ++i)
+                        if (!sameOverrideType(candidate.params[i + 1], params[i])) same = false;
+                    if (same) { matched = &candidate; break; }
+                }
+                if (matched == nullptr)
+                {
+                    if (unspellable != nullptr)
+                    {
+                        Compiler(func)->LogErrorMessage(
+                            "does not override '{}.{}' (its C++ signature has no CFlat spelling)",
+                            { unspellable->ownerType, methodName });
+                        continue;
+                    }
+                    const auto& expected = virtuals.front();
+                    std::vector<LLVMBackend::TypeAndValue> expectedParams(
+                        expected.params.begin() + 1, expected.params.end());
+                    std::string candidatesText;
+                    for (const auto& candidate : virtuals)
+                    {
+                        if (!candidatesText.empty()) candidatesText += "; ";
+                        std::vector<LLVMBackend::TypeAndValue> candidateParams(
+                            candidate.params.begin() + 1, candidate.params.end());
+                        candidatesText += std::format("'{}.{}' expected {}({})",
+                            candidate.ownerType, methodName, SpellType(*compiler, candidate.ret),
+                            DescribeParameterTypes(candidateParams));
+                    }
+                    Compiler(func)->LogErrorMessage(
+                        "does not override '{}.{}' (expected {}({}); candidates: {})",
+                        { expected.ownerType, methodName, SpellType(*compiler, expected.ret),
+                          DescribeParameterTypes(expectedParams), candidatesText });
+                    continue;
+                }
+                if (matched->raw.isFinal)
+                {
+                    Compiler(func)->LogErrorMessage(
+                        "overrides '{}.{}' which is final",
+                        { matched->ownerType, methodName });
+                    continue;
+                }
+                const size_t ordinal = overrideOrdinals[methodName]++;
+                const std::string stable = "__cflat_ovr_" + shortName + "_" + methodName
+                    + "_" + std::to_string(ordinal);
+                std::vector<LLVMBackend::TypeAndValue> overrideParams;
+                overrideParams.reserve(params.size());
+                for (const auto& param : params) overrideParams.push_back(param);
+                compiler->RegisterCppStructOverrideName(structName, methodName,
+                                                         overrideParams, stable);
+                overrideNames.insert(methodName);
+                overrides.push_back({ func, std::move(params), *matched, methodName, stable });
+            }
+            for (const auto& pure : compiler->FindCxxBaseVirtualMethods(cppBaseName))
+            {
+                if (!pure.raw.isPureVirtual) continue;
+                bool implemented = false;
+                for (const auto& overrideInfo : overrides)
+                {
+                    if (overrideInfo.Name != pure.raw.name
+                        || overrideInfo.BaseMethod.params.size() != pure.params.size()
+                        || !sameOverrideType(overrideInfo.BaseMethod.ret, pure.ret))
+                        continue;
+                    bool sameSignature = true;
+                    for (size_t i = 0; i < pure.params.size(); ++i)
+                        if (!sameOverrideType(overrideInfo.BaseMethod.params[i], pure.params[i]))
+                            sameSignature = false;
+                    if (sameSignature)
+                    {
+                        implemented = true;
+                        break;
+                    }
+                }
+                if (!implemented)
+                {
+                    if (!pure.spellable)
+                        Compiler(ctx)->LogErrorMessage(
+                            "does not override pure virtual method '{}.{}' (its C++ signature has no CFlat spelling)",
+                            { pure.ownerType, pure.raw.name });
+                    else
+                        Compiler(ctx)->LogErrorMessage(
+                            "does not override pure virtual method '{}.{}'",
+                            { pure.ownerType, pure.raw.name });
+                }
+            }
+            }
+            struct ConstructorSourceInfo
+            {
+                CFlatParser::FunctionDefinitionContext* Function = nullptr;
+                std::vector<LLVMBackend::DeclTypeAndValue> Params;
+                size_t Index = 0;
+                std::string BaseInitializer;
+            };
+            std::vector<ConstructorSourceInfo> constructors;
+            auto isCppLiteral = [](const std::string& text) {
+                if (text == "true" || text == "false") return true;
+                if (text.size() >= 2
+                    && ((text.front() == '"' && text.back() == '"')
+                        || (text.front() == '\'' && text.back() == '\''))) return true;
+                if (text.empty()) return false;
+                size_t pos = (text[0] == '+' || text[0] == '-') ? 1 : 0;
+                if (pos == text.size()) return false;
+                auto integerSuffix = [](const std::string& suffix) {
+                    return suffix.empty() || suffix == "u" || suffix == "U"
+                        || suffix == "l" || suffix == "L" || suffix == "ll"
+                        || suffix == "LL" || suffix == "ul" || suffix == "uL"
+                        || suffix == "Ul" || suffix == "UL" || suffix == "lu"
+                        || suffix == "lU" || suffix == "Lu" || suffix == "LU"
+                        || suffix == "ull" || suffix == "uLL" || suffix == "Ull"
+                        || suffix == "ULL" || suffix == "llu" || suffix == "llU"
+                        || suffix == "LLu" || suffix == "LLU" || suffix == "z"
+                        || suffix == "Z";
+                };
+                const bool hex = pos + 1 < text.size() && text[pos] == '0'
+                    && (text[pos + 1] == 'x' || text[pos + 1] == 'X');
+                if (hex) pos += 2;
+                const size_t digitsBegin = pos;
+                while (pos < text.size()
+                       && (hex ? std::isxdigit((unsigned char)text[pos])
+                               : std::isdigit((unsigned char)text[pos]))) ++pos;
+                const bool beforeDot = pos != digitsBegin;
+                bool dot = false;
+                if (pos < text.size() && text[pos] == '.')
+                {
+                    dot = true;
+                    ++pos;
+                    const size_t afterDot = pos;
+                    while (pos < text.size()
+                           && (hex ? std::isxdigit((unsigned char)text[pos])
+                                   : std::isdigit((unsigned char)text[pos]))) ++pos;
+                    if (!beforeDot && pos == afterDot) return false;
+                }
+                if (!beforeDot && !dot) return false;
+                bool exponent = false;
+                const char exponentMarker = hex ? 'p' : 'e';
+                if (pos < text.size()
+                    && (text[pos] == exponentMarker
+                        || text[pos] == static_cast<char>(exponentMarker - ('a' - 'A'))))
+                {
+                    exponent = true;
+                    ++pos;
+                    if (pos < text.size() && (text[pos] == '+' || text[pos] == '-')) ++pos;
+                    const size_t exponentBegin = pos;
+                    while (pos < text.size() && std::isdigit((unsigned char)text[pos])) ++pos;
+                    if (pos == exponentBegin) return false;
+                }
+                const std::string suffix = text.substr(pos);
+                if (hex && (dot || exponent))
+                    return exponent && (suffix.empty() || suffix == "f" || suffix == "F"
+                                        || suffix == "l" || suffix == "L");
+                if (dot || exponent)
+                    return suffix.empty() || suffix == "f" || suffix == "F"
+                        || suffix == "l" || suffix == "L";
+                return integerSuffix(suffix);
+            };
+            auto baseInitializerFor = [&](CFlatParser::FunctionDefinitionContext* func,
+                                          const std::vector<LLVMBackend::DeclTypeAndValue>& params,
+                                          std::string& result) {
+                if (func->baseSpecifier() == nullptr) return true;
+                auto* initializerBase = func->baseSpecifier();
+                const std::string initializerSpelling = initializerBase->getText();
+                std::string initializerName = BaseSpecifierName(initializerBase);
+                std::vector<std::string> initializerArgs;
+                if (auto* generic = initializerBase->genericTypeParameters())
+                {
+                    initializerName = compiler->ResolveGenericBaseAlias(initializerName);
+                    for (auto* entry : generic->typeParameterList()->typeParameterEntry())
+                        initializerArgs.push_back(ResolveTypeArgEntry(entry));
+                    initializerName = MangledGenericName(initializerName, initializerArgs);
+                }
+                if (initializerName != cppBaseName)
+                {
+                    Compiler(func)->LogErrorMessage(
+                        "base initializer names '{}' but the base class is '{}'",
+                        { initializerSpelling, baseClauses[0]->getText() });
+                    return false;
+                }
+                std::set<std::string> parameterNames;
+                for (const auto& param : params)
+                    if (!param.VariableName.empty()) parameterNames.insert(param.VariableName);
+                std::vector<std::string> args;
+                if (auto* list = func->argumentExpressionList())
+                    for (auto* arg : list->argumentNamedExpression())
+                    {
+                        auto* assignment = arg->assignmentExpression();
+                        const std::string text = assignment == nullptr ? arg->getText()
+                                                                       : assignment->getText();
+                        if (parameterNames.count(text) == 0 && !isCppLiteral(text))
+                        {
+                            Compiler(func)->LogErrorMessage(
+                                "base initializer arguments must be constructor parameters or literals");
+                            return false;
+                        }
+                        args.push_back(text);
+                    }
+                result = " : " + baseCxxName + "(";
+                for (size_t i = 0; i < args.size(); ++i)
+                    result += (i == 0 ? "" : ", ") + args[i];
+                result += ")";
+                return true;
+            };
+            size_t ctorIndex = 0;
+            if (hasGeneratedNoArgCtor)
+            {
+                source += "void __cflat_ctor_" + shortName + "_0(" + cxxName + "* dst) noexcept;\n";
+                ctorIndex = 1;
+            }
+            for (auto* func : functionList)
+            {
+                if (FunctionDeclaresReturnType(func) || getFunctionName(func) != baseName)
+                    continue;
+                auto params = ParseParameterTypeList(func->parameterTypeList());
+                source += "void __cflat_ctor_" + shortName + "_" + std::to_string(ctorIndex)
+                       + "(" + cxxName + "* dst";
+                bool valid = true;
+                for (size_t i = 0; i < params.size(); ++i)
+                {
+                    std::string spelling;
+                    if (!appendParamSpelling(params[i], spelling))
+                    {
+                        std::string displayType = params[i].TypeName;
+                        if (auto* list = func->parameterTypeList()->parameterList())
+                        {
+                            const auto& declarations = list->parameterDeclaration();
+                            if (i < declarations.size()
+                                && declarations[i]->declarationSpecifiers() != nullptr)
+                                displayType = declarations[i]->declarationSpecifiers()->getText();
+                        }
+                        Compiler(func)->LogErrorMessage(
+                            "[cpp] struct constructor parameter '{}' has no C++ spelling",
+                            { displayType });
+                        valid = false;
+                        break;
+                    }
+                    source += ", " + spelling + " "
+                           + (params[i].VariableName.empty()
+                              ? "p" + std::to_string(i) : params[i].VariableName);
+                }
+                source += ") noexcept;\n";
+                if (!valid) break;
+                std::string baseInitializer;
+                if (!baseInitializerFor(func, params, baseInitializer)) break;
+                constructors.push_back({ func, std::move(params), ctorIndex,
+                                         std::move(baseInitializer) });
+                ++ctorIndex;
+            }
+            if (hasGeneratedMove)
+                source += "void __cflat_move_" + shortName + "(" + cxxName
+                       + "* dst, " + cxxName + "* src) noexcept;\n";
+            source += "void __cflat_dtor_" + shortName + "(" + cxxName + "* dst) noexcept;\n";
+            for (const auto& overrideInfo : overrides)
+            {
+                const auto& raw = overrideInfo.BaseMethod.raw;
+                source += raw.retType + " " + overrideInfo.StableName + "("
+                    + (raw.isConst ? "const " : "") + cxxName + "*";
+                for (size_t i = 1; i < raw.paramTypes.size(); ++i)
+                    source += ", " + raw.paramTypes[i] + " "
+                        + (i - 1 < overrideInfo.Params.size()
+                           && !overrideInfo.Params[i - 1].VariableName.empty()
+                           ? overrideInfo.Params[i - 1].VariableName
+                           : "p" + std::to_string(i - 1));
+                source += ");\n";
+            }
+            source += "}\nnamespace __cflat_user {\nstruct " + shortName + " final";
+            if (!baseCxxName.empty()) source += " : public " + baseCxxName;
+            source += " {\n";
+            source += "    alignas(" + std::to_string(cxxFieldAlign) + ") unsigned char __cflat_fields["
+                   + std::to_string(std::max<uint64_t>(1, fieldBytes)) + "];\n";
+            if (hasGeneratedNoArgCtor)
+                source += "    " + shortName + "() { __cflat_ctor_" + shortName + "_0(this); }\n";
+            for (const auto& ctor : constructors)
+            {
+                source += "    " + shortName + "(";
+                for (size_t i = 0; i < ctor.Params.size(); ++i)
+                {
+                    if (i != 0) source += ", ";
+                    std::string spelling;
+                    appendParamSpelling(ctor.Params[i], spelling);
+                    source += spelling + " "
+                           + (ctor.Params[i].VariableName.empty()
+                              ? "p" + std::to_string(i) : ctor.Params[i].VariableName);
+                    if (ctor.Params[i].DefaultValue != nullptr)
+                        source += " = " + ctor.Params[i].DefaultValue->getText();
+                }
+                source += ")" + ctor.BaseInitializer + " { __cflat_ctor_" + shortName + "_"
+                       + std::to_string(ctor.Index) + "(this";
+                for (size_t i = 0; i < ctor.Params.size(); ++i)
+                    source += ", " + (ctor.Params[i].VariableName.empty()
+                                      ? "p" + std::to_string(i) : ctor.Params[i].VariableName);
+                source += "); }\n";
+            }
+            source += "    " + shortName + "(const " + shortName + "&) = delete;\n";
+            source += "    " + shortName + "& operator=(const " + shortName + "&) = delete;\n";
+            source += "    " + shortName + "(" + shortName + "&& src) noexcept";
+            if (!baseCxxName.empty() && hasGeneratedMove)
+                source += " : " + baseCxxName
+                    + "(static_cast<" + baseCxxName + "&&>(src))";
+            if (!hasGeneratedMove)
+                source += " = delete;";
+            else
+                source += " { __cflat_move_" + shortName + "(this, &src); }";
+            source += "\n";
+            source += "    " + shortName + "& operator=(" + shortName + "&&) = delete;\n";
+            source += "    ~" + shortName + "() { __cflat_dtor_" + shortName + "(this); }\n";
+            for (const auto& overrideInfo : overrides)
+            {
+                const auto& raw = overrideInfo.BaseMethod.raw;
+                source += "    " + raw.retType + " " + overrideInfo.Name + "(";
+                for (size_t i = 1; i < raw.paramTypes.size(); ++i)
+                    source += (i == 1 ? "" : ", ") + raw.paramTypes[i] + " "
+                        + (i - 1 < overrideInfo.Params.size()
+                           && !overrideInfo.Params[i - 1].VariableName.empty()
+                           ? overrideInfo.Params[i - 1].VariableName
+                           : "p" + std::to_string(i - 1));
+                source += ")" + std::string(raw.isConst ? " const" : "")
+                    + (raw.isNoexcept ? " noexcept" : "") + " override { ";
+                if (raw.retType != "void") source += "return ";
+                source += overrideInfo.StableName + "(this";
+                for (size_t i = 0; i < overrideInfo.Params.size(); ++i)
+                    source += ", " + (overrideInfo.Params[i].VariableName.empty()
+                                      ? "p" + std::to_string(i)
+                                      : overrideInfo.Params[i].VariableName);
+                source += "); }\n";
+            }
+            source += "};\n}\n";
+            for (auto& field : declList)
+                field.IsCflatOwned = true;
+            compiler->RegisterGeneratedCxxOverrideNames(structName, overrideNames);
+            std::string requestError;
+            if (!compiler->RequestGeneratedCxxType(structName, cxxName, source, literalType,
+                                                   declList, requestError, cppBaseOwnerGroup,
+                                                   overrideNames))
+            {
+                if (requestError.empty())
+                    Compiler(ctx)->LogErrorMessage("generated [cpp] struct could not be registered");
+                else
+                    Compiler(ctx)->LogErrorMessage("{}", { requestError });
+                structScopeStack.pop_back();
+                return;
+            }
+            compiler->RegisterCppStructProtectedBaseMembers(structName);
+            if (compiler->IsVerbose())
+                std::cout << "[verbose] generated C++ for " << structName << ":\n" << source;
+            if (hasGeneratedMove)
+                EmitCppStructMoveThunk(ctx, structName);
+            if (hasGeneratedNoArgCtor)
+                EmitCppStructConstructorThunk(ctx, nullptr, structName,
+                                              compiler->GetDataStructure(structName).StructFields,
+                                              {}, 0);
+            if (MemberDestructorDefinitions(ctx).empty())
+                EmitCppStructDestructorThunk(ctx, structName);
+        }
 
         // Create default constructor (skipped when user provides an explicit no-arg ctor)
-        if (!hasExplicitNoArgCtor)
+        if (!isCppStruct && !hasExplicitNoArgCtor)
         {
             auto funcDef = compiler->CreateFunctionDefinition(structName, returnType, {});
 
@@ -497,7 +1116,7 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
         // forward-declares the TEMPLATE's `~name`; a concrete instantiation's `~name__T` is not, so
         // declare it here when missing - otherwise .dtorfull bakes a null user-dtor and caches it,
         // leaking everything the hand-written destructor would have freed.
-        if (!MemberDestructorDefinitions(ctx).empty())
+        if (!isCppStruct && !MemberDestructorDefinitions(ctx).empty())
         {
             llvm::Function* dtorFn = compiler->GetFunction("~" + structName);
             if (dtorFn == nullptr)
@@ -516,6 +1135,7 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
 
         {
             GlobalScopeGuard scopeGuard(global_scope);
+            size_t cppCtorIndex = hasGeneratedNoArgCtor ? 1 : 0;
             for (auto func : functionList)
             {
                 global_scope = false;
@@ -529,7 +1149,8 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
                     // no bare 'T()' was written - it must seed fields itself, not self-delegate.
                     bool suppliesNoArgCtor = !isUnion && !hasBareNoArgCtor
                         && AllParametersDefaulted(func->parameterTypeList());
-                    ParseConstructorDefinition(func, structName, suppliesNoArgCtor);
+                    ParseConstructorDefinition(func, structName, suppliesNoArgCtor,
+                        isCppStruct ? cppCtorIndex++ : SIZE_MAX);
                     continue;
                 }
                 // A generic member method - static or instance - is stored as a template keyed by
@@ -3697,9 +4318,228 @@ bool MainListener::CheckConstraints(
         return true;
     }
 
-void MainListener::ParseConstructorDefinition(CFlatParser::FunctionDefinitionContext* func, const std::string& structName, bool suppliesNoArgCtor) {
+void MainListener::EmitCppStructConstructorThunk(
+    antlr4::ParserRuleContext* ctx, CFlatParser::BlockItemListContext* body,
+    const std::string& structName,
+    const std::vector<LLVMBackend::DeclTypeAndValue>& fields,
+    const std::vector<LLVMBackend::DeclTypeAndValue>& params,
+    size_t ctorIndex)
+{
+        auto* compiler = Compiler(ctx);
+        LLVMBackend::DeclTypeAndValue thisParam;
+        thisParam.TypeName = structName;
+        thisParam.VariableName = structName + "__";
+        thisParam.Pointer = true;
+        std::vector<LLVMBackend::TypeAndValue> allParams{ thisParam };
+        allParams.insert(allParams.end(), params.begin(), params.end());
+        LLVMBackend::TypeAndValue voidReturn{ .TypeName = "void" };
+        const std::string thunkName = "__cflat_ctor_" + CppStructThunkStem(structName)
+            + "_" + std::to_string(ctorIndex);
+        auto fn = compiler->CreateFunctionDefinition(thunkName, voidReturn, allParams,
+                                                      true, false, ctx->getStart()->getLine());
+        if (fn->isMaterializable()
+            || (!fn->empty() && cflat_llvm::GetTerminatorOrNull(&fn->getEntryBlock()) != nullptr))
+            return;
+        compiler->InitializeBlock(&fn->front(), false);
+        LLVMBackend::AliasScopeGuard functionAliasScope(compiler);
+        ReturnFlagGuard functionReturnFlagGuard(&straightLineReturned_);
+        straightLineReturned_ = false;
+        GlobalScopeGuard functionScope(global_scope);
+        global_scope = false;
+
+        auto* structType = compiler->GetDataStructure(structName).StructType;
+        auto* dstArg = compiler->FindLiveNamedVariable(structName + "__");
+        llvm::Value* dst = nullptr;
+        if (dstArg != nullptr)
+            dst = dstArg->Storage != nullptr
+                ? compiler->CreateLoad(dstArg->BaseType, dstArg->Storage) : dstArg->Primary;
+        if (structType == nullptr || dst == nullptr)
+        {
+            compiler->LogErrorMessage("C++ struct constructor thunk has no destination storage");
+            compiler->CreateReturnCall(nullptr);
+            compiler->CreateBlockBreak(nullptr, true);
+            compiler->ClearCurrentSubprogram();
+            return;
+        }
+        compiler->RegisterThisPointer(thisParam, dst, structType);
+        uint64_t fieldStart = 0;
+        uint64_t fieldBytes = 0;
+        if (compiler->GetGeneratedCxxFieldBlock(structName, fieldStart, fieldBytes))
+        {
+            auto* bytePtr = compiler->builder->CreateBitCast(
+                dst, llvm::PointerType::get(compiler->builder->getInt8Ty(), 0));
+            auto* blockPtr = compiler->builder->CreateInBoundsGEP(
+                compiler->builder->getInt8Ty(), bytePtr,
+                compiler->builder->getInt64(fieldStart), "cflat_ctor_fields");
+            compiler->builder->CreateMemSet(blockPtr, compiler->builder->getInt8(0),
+                compiler->builder->getInt64(fieldBytes), llvm::Align(1));
+        }
+
+        for (size_t fieldIndex = 0; fieldIndex < fields.size(); ++fieldIndex)
+        {
+            if (fieldIndex >= structType->getNumElements()) break;
+            const auto& field = fields[fieldIndex];
+            if (!field.IsCflatOwned || field.IsPadding) continue;
+            llvm::Value* value = nullptr;
+            bool valueUnsigned = false;
+            bool fromBraceList = false;
+            if (auto* brace = FieldDefaultBraceList(field))
+            {
+                value = ParseFieldDefaultBraceInitializer(structName, field, brace);
+                fromBraceList = true;
+            }
+            else if (field.Initializer != nullptr)
+            {
+                if (auto* assignment = field.Initializer->assignmentExpression())
+                    value = ParseFieldDefaultInitializer(structName, field, assignment,
+                                                         &valueUnsigned);
+                else if (field.Initializer->Default() != nullptr)
+                    value = GenerateDefaultValue(field);
+            }
+            auto* destinationType = structType->getTypeAtIndex((unsigned)fieldIndex);
+            if (value == nullptr && (destinationType->isStructTy() || destinationType->isArrayTy()))
+                value = GenerateDefaultValue(field);
+            if (value == nullptr) continue;
+            if (!fromBraceList)
+                value = compiler->Upconvert(value, destinationType, valueUnsigned);
+            if (value->getType() != destinationType)
+            {
+                if (destinationType->isStructTy())
+                    value = GenerateDefaultValue(field);
+                else
+                    value = compiler->CreateCast(value, destinationType);
+            }
+            if (value != nullptr && value->getType() == destinationType)
+                compiler->builder->CreateStore(value,
+                    compiler->builder->CreateStructGEP(structType, dst,
+                                                        (unsigned)fieldIndex, field.VariableName));
+        }
+
+        if (body != nullptr) ParseBlockItemList(body);
+        compiler->CreateReturnCall(nullptr);
+        compiler->CreateBlockBreak(nullptr, true);
+        compiler->ClearCurrentSubprogram();
+}
+
+void MainListener::EmitCppStructDestructorThunk(
+    antlr4::ParserRuleContext* ctx, const std::string& structName)
+{
+        auto* compiler = Compiler(ctx);
+        LLVMBackend::DeclTypeAndValue thisParam;
+        thisParam.TypeName = structName;
+        thisParam.VariableName = structName + "__";
+        thisParam.Pointer = true;
+        LLVMBackend::TypeAndValue voidReturn{ .TypeName = "void" };
+        const std::string thunkName = "__cflat_dtor_" + CppStructThunkStem(structName);
+        auto fn = compiler->CreateFunctionDefinition(thunkName, voidReturn, { thisParam },
+                                                      true, false, ctx->getStart()->getLine());
+        if (fn->isMaterializable()
+            || (!fn->empty() && cflat_llvm::GetTerminatorOrNull(&fn->getEntryBlock()) != nullptr))
+            return;
+        compiler->InitializeBlock(&fn->front(), false);
+        LLVMBackend::AliasScopeGuard functionAliasScope(compiler);
+        ReturnFlagGuard functionReturnFlagGuard(&straightLineReturned_);
+        straightLineReturned_ = false;
+        GlobalScopeGuard functionScope(global_scope);
+        global_scope = false;
+        auto* dstArg = compiler->FindLiveNamedVariable(structName + "__");
+        llvm::Value* dst = dstArg != nullptr
+            ? (dstArg->Storage != nullptr
+                ? compiler->CreateLoad(dstArg->BaseType, dstArg->Storage) : dstArg->Primary)
+            : nullptr;
+        auto* structType = compiler->GetDataStructure(structName).StructType;
+        if (dst == nullptr || structType == nullptr)
+            compiler->LogErrorMessage("C++ struct destructor thunk has no destination storage");
+        else
+        {
+            compiler->RegisterThisPointer(thisParam, dst, structType);
+            if (auto* userDtor = compiler->GetFunction("~" + structName))
+                compiler->builder->CreateCall(userDtor->getFunctionType(), userDtor, { dst });
+            if (cflat_llvm::GetTerminatorOrNull(compiler->builder->GetInsertBlock()) == nullptr)
+                compiler->EmitCflatOwnedFieldsDestruction(*compiler->builder, structName, dst);
+        }
+        compiler->CreateReturnCall(nullptr);
+        compiler->CreateBlockBreak(nullptr, true);
+        compiler->ClearCurrentSubprogram();
+}
+
+void MainListener::EmitCppStructMoveThunk(antlr4::ParserRuleContext* ctx,
+                                          const std::string& structName)
+{
+        auto* compiler = Compiler(ctx);
+        LLVMBackend::DeclTypeAndValue dstParam;
+        dstParam.TypeName = structName;
+        dstParam.VariableName = "dst";
+        dstParam.Pointer = true;
+        LLVMBackend::DeclTypeAndValue srcParam = dstParam;
+        srcParam.VariableName = "src";
+        LLVMBackend::TypeAndValue voidReturn{ .TypeName = "void" };
+        const std::string thunkName = "__cflat_move_" + CppStructThunkStem(structName);
+        auto fn = compiler->CreateFunctionDefinition(thunkName, voidReturn,
+                                                      { dstParam, srcParam }, true, false,
+                                                      ctx->getStart()->getLine());
+        if (fn->isMaterializable()
+            || (!fn->empty() && cflat_llvm::GetTerminatorOrNull(&fn->getEntryBlock()) != nullptr))
+            return;
+        compiler->InitializeBlock(&fn->front(), false);
+        LLVMBackend::AliasScopeGuard functionAliasScope(compiler);
+        auto getPointer = [&](const char* name) -> llvm::Value* {
+            auto* arg = compiler->FindLiveNamedVariable(name);
+            if (arg == nullptr) return nullptr;
+            return arg->Storage != nullptr
+                ? compiler->CreateLoad(arg->BaseType, arg->Storage) : arg->Primary;
+        };
+        auto* dst = getPointer("dst");
+        auto* src = getPointer("src");
+        auto* structType = compiler->GetDataStructure(structName).StructType;
+        if (dst == nullptr || src == nullptr || structType == nullptr)
+        {
+            compiler->LogErrorMessage("C++ struct move thunk has no source or destination storage");
+        }
+        else
+        {
+            uint64_t fieldStart = 0;
+            uint64_t fieldBytes = 0;
+            if (compiler->GetGeneratedCxxFieldBlock(structName, fieldStart, fieldBytes))
+            {
+                auto* dstBytes = compiler->builder->CreateBitCast(
+                    dst, llvm::PointerType::get(compiler->builder->getInt8Ty(), 0));
+                auto* srcBytes = compiler->builder->CreateBitCast(
+                    src, llvm::PointerType::get(compiler->builder->getInt8Ty(), 0));
+                auto* dstBlock = compiler->builder->CreateInBoundsGEP(
+                    compiler->builder->getInt8Ty(), dstBytes,
+                    compiler->builder->getInt64(fieldStart), "cflat_move_dst");
+                auto* srcBlock = compiler->builder->CreateInBoundsGEP(
+                    compiler->builder->getInt8Ty(), srcBytes,
+                    compiler->builder->getInt64(fieldStart), "cflat_move_src");
+                auto size = llvm::ConstantInt::get(compiler->builder->getInt64Ty(), fieldBytes);
+                compiler->builder->CreateMemCpy(dstBlock, llvm::Align(1), srcBlock,
+                                                 llvm::Align(1), size);
+                compiler->builder->CreateMemSet(srcBlock, compiler->builder->getInt8(0),
+                                                size, llvm::Align(1));
+            }
+        }
+        compiler->CreateReturnCall(nullptr);
+        compiler->CreateBlockBreak(nullptr, true);
+        compiler->ClearCurrentSubprogram();
+}
+
+void MainListener::ParseConstructorDefinition(CFlatParser::FunctionDefinitionContext* func, const std::string& structName, bool suppliesNoArgCtor, size_t cppCtorIndex) {
         auto* compiler = Compiler(func);
+        if (func->baseSpecifier() != nullptr && !compiler->HasTypeAnnotation(structName, "cpp"))
+        {
+            Compiler(func)->LogErrorMessage("base initializer is only valid in a [cpp] struct");
+            return;
+        }
         auto params = ParseParameterTypeList(func->parameterTypeList());
+        if (cppCtorIndex != SIZE_MAX)
+        {
+            LLVMBackend::CppStructAccessScope cppStructAccessScope(compiler, structName);
+            auto fields = compiler->GetDataStructure(structName).StructFields;
+            EmitCppStructConstructorThunk(func, func->compoundStatement()->blockItemList(),
+                                           structName, fields, params, cppCtorIndex);
+            return;
+        }
         size_t line = func->getStart()->getLine();
         bool varargs = func->parameterTypeList() && func->parameterTypeList()->Ellipsis() != nullptr;
 
@@ -3859,6 +4699,30 @@ void MainListener::ParseConstructorDefinition(CFlatParser::FunctionDefinitionCon
 
 void MainListener::ParseDestructorDefinition(CFlatParser::DestructorDefinitionContext* ctx, const std::string& structName) {
         auto* compiler = Compiler(ctx);
+        if (compiler->HasTypeAnnotation(structName, "cpp"))
+        {
+            LLVMBackend::DeclTypeAndValue thisParam;
+            thisParam.TypeName = structName;
+            thisParam.VariableName = structName + "__";
+            thisParam.Pointer = true;
+            LLVMBackend::TypeAndValue returnType{ .TypeName = "void" };
+            const std::string fullName = "~" + structName;
+            auto fn = compiler->CreateFunctionDefinition(fullName, returnType, { thisParam },
+                                                         false, false,
+                                                         static_cast<int>(ctx->getStart()->getLine()));
+            compiler->InitializeBlock(&fn->front(), false);
+            LLVMBackend::AliasScopeGuard functionAliasScope(compiler);
+            LLVMBackend::CppStructAccessScope cppStructAccessScope(compiler, structName);
+            ReturnFlagGuard functionReturnFlagGuard(&straightLineReturned_);
+            straightLineReturned_ = false;
+            if (auto* body = ctx->compoundStatement()->blockItemList())
+                ParseBlockItemList(body);
+            compiler->CreateReturnCall(nullptr);
+            compiler->CreateBlockBreak(nullptr, true);
+            compiler->ClearCurrentSubprogram();
+            EmitCppStructDestructorThunk(ctx, structName);
+            return;
+        }
         LLVMBackend::DeclTypeAndValue thisParam;
         thisParam.TypeName = structName;
         thisParam.VariableName = structName + "__";

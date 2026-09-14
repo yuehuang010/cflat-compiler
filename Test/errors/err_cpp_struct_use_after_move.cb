@@ -1,0 +1,14 @@
+[cpp] struct MoveBad
+{
+    int value = 1;
+};
+
+extern int main()
+{
+    expect_error("use of moved variable 'src'") {
+        MoveBad src = default;
+        MoveBad dst = move src;
+        int value = src.value;
+    }
+    return 0;
+}

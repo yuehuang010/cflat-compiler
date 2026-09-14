@@ -1,0 +1,11 @@
+expect_error("base 'LocalBase' of struct 'Bad' is not a C++ class") {
+    struct LocalBase
+    {
+        int value = 1;
+    };
+    struct Bad : LocalBase
+    {
+    };
+}
+
+extern int main() { return 0; }

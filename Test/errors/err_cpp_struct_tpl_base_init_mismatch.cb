@@ -1,0 +1,10 @@
+import cpp "cpp_interop_tpl.h";
+
+expect_error("base initializer names 'cppt.m76.Holder<double>' but the base class is 'cppt.m76.Holder<int>'") {
+    struct Bad : cppt.m76.Holder<int>
+    {
+        Bad(int value) : cppt.m76.Holder<double>(value) { }
+    };
+}
+
+extern int main() { return 0; }

@@ -1,0 +1,10 @@
+import cpp "cpp_interop_poly.h";
+
+expect_error("[cpp] struct 'Bad' has an unsized field 'value'; use a pointer") {
+    [cpp] struct Bad
+    {
+        cpppoly.VBaseMid value = default;
+    };
+}
+
+extern int main() { return 0; }

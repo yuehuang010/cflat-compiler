@@ -3770,12 +3770,14 @@ std::string LLVMBackend::EnsureCxxRequestPch(const CxxRequestGroup& group,
 bool LLVMBackend::RunCxxTypeRequests(const CxxRequestGroup& group,
                                      const std::vector<CxxRequestItem>& items,
                                      const std::string& extraSource, bool emitDefinitions,
-                                     cflat_cinterop::ExtractResult& raw, std::string& error)
+                                     cflat_cinterop::ExtractResult& raw, std::string& error,
+                                     const std::string& prefixSource)
 {
         cflat_cinterop::ExtractRequest req;
         req.mainFileName = "cflat_cpp_request.cpp";
         req.cxxMode = true;
-        req.source = BuildCxxRequestPrologue(group, items, /*instantiateAll*/ !emitDefinitions)
+        req.source = BuildCxxRequestIncludes(group) + prefixSource
+                   + BuildCxxRequestMarkers(items, /*instantiateAll*/ !emitDefinitions)
                    + extraSource;
         req.emitDefinitions = emitDefinitions;
         req.assumeInlineDefinitions = !emitDefinitions;
@@ -3793,7 +3795,7 @@ bool LLVMBackend::RunCxxTypeRequests(const CxxRequestGroup& group,
         const std::string pch = EnsureCxxRequestPch(group, req.args);
         if (!pch.empty())
         {
-            req.source = BuildCxxRequestMarkers(items, /*instantiateAll*/ !emitDefinitions)
+            req.source = prefixSource + BuildCxxRequestMarkers(items, /*instantiateAll*/ !emitDefinitions)
                        + extraSource;
             req.args.push_back("-include-pch");
             req.args.push_back(pch);
@@ -3807,7 +3809,8 @@ bool LLVMBackend::RunCxxTypeRequests(const CxxRequestGroup& group,
         if ((!ok || emptyHarvest) && !pch.empty())
         {
             DropCxxRequestPch(pch);
-            req.source = BuildCxxRequestPrologue(group, items, /*instantiateAll*/ !emitDefinitions)
+            req.source = BuildCxxRequestIncludes(group) + prefixSource
+                       + BuildCxxRequestMarkers(items, /*instantiateAll*/ !emitDefinitions)
                        + extraSource;
             req.args.resize(req.args.size() - 2);
             raw = cflat_cinterop::ExtractResult();
@@ -3824,7 +3827,8 @@ bool LLVMBackend::RunCxxTypeRequests(const CxxRequestGroup& group,
  * LRU/root pinning.
  */
 std::string LLVMBackend::CxxTypeRequestCacheKey(const CxxRequestGroup& group,
-                                                const std::string& cxxSpelling) const
+                                                const std::string& cxxSpelling,
+                                                const std::string& extraSource) const
 {
         std::string key = "|RQ" + cxxSpelling;
         for (const auto& h : group.headers)     key += "|H" + h;
@@ -3834,13 +3838,24 @@ std::string LLVMBackend::CxxTypeRequestCacheKey(const CxxRequestGroup& group,
         key += symbolSink_ == nullptr ? "|EDEF" : "|EDECL";
         key += "|M13F";
         key += "|C" + CompilerBuildStamp();
+        if (!extraSource.empty())
+        {
+            uint64_t hash = 14695981039346656037ULL;
+            for (unsigned char byte : extraSource)
+            {
+                hash ^= byte;
+                hash *= 1099511628211ULL;
+            }
+            key += std::format("|X{:016x}", hash);
+        }
         return key;
     }
 
 std::string LLVMBackend::CxxTypeRequestCacheKey(const CxxRequestGroup& group,
-                                                const CxxRequestItem& item) const
+                                                const CxxRequestItem& item,
+                                                const std::string& extraSource) const
 {
-        return CxxTypeRequestCacheKey(group, item.cxxSpelling)
+        return CxxTypeRequestCacheKey(group, item.cxxSpelling, extraSource)
              + (item.needDefinitions ? "|FULL" : "|LAYOUT")
              + (item.explicitInstantiation ? "|INST" : "|NOINST");
     }
@@ -5318,6 +5333,22 @@ bool LLVMBackend::RequestCxxFunctionTemplate(const std::string& functionName,
             if (!explicitArg.starts_with("#"))
                 collectTypeDependencies(collectTypeDependencies, explicitArg);
 
+        std::string generatedTypeSource;
+        std::unordered_set<std::string> generatedTypes;
+        auto appendGeneratedTypeSource = [&](const std::string& type) {
+            std::string base = type;
+            while (!base.empty() && base.back() == '*') base.pop_back();
+            auto generated = generatedCxxRecords_.find(base);
+            if (generated == generatedCxxRecords_.end()
+                || !generatedTypes.insert(base).second)
+                return;
+            generatedTypeSource += generated->second.source + "\n";
+        };
+        for (const auto& argument : arguments)
+            appendGeneratedTypeSource(cflatTypeOf(argument));
+        for (const std::string& explicitArg : explicitArgs)
+            if (!explicitArg.starts_with("#")) appendGeneratedTypeSource(explicitArg);
+
         std::string hashKey = lookupName + std::to_string(selected->kind);
         for (const auto& p : parameterSpellings) hashKey += p;
         for (const auto& a : cxxExplicitArgs) hashKey += a;
@@ -5347,6 +5378,7 @@ bool LLVMBackend::RequestCxxFunctionTemplate(const std::string& functionName,
         wrapperSource += ")";
         if (selected->isNoexcept) wrapperSource += " noexcept";
         wrapperSource += " { return " + targetCall + "; }\n";
+        wrapperSource = generatedTypeSource + wrapperSource;
 
         auto groupIt = cxxFunctionTemplateOwnerGroup_.find(selected->name);
         if (groupIt == cxxFunctionTemplateOwnerGroup_.end())
@@ -6554,7 +6586,9 @@ void LLVMBackend::RememberCxxMangledArity(const std::string& cflatName,
 
 bool LLVMBackend::RequestCxxForeignType(const std::string& cflatName, const std::string& cxxSpelling,
                                         std::string& error, bool needDefinitions,
-                                        bool explicitInstantiation, bool tentative)
+                                        bool explicitInstantiation, bool tentative,
+                                        const std::string& extraSource,
+                                        const std::string& prefixSource)
 {
         RememberCxxMangledArity(cflatName, cxxSpelling);
         // One attempt per CFlat identity per analysis; the outcome (including the diagnostic text)
@@ -6573,10 +6607,13 @@ bool LLVMBackend::RequestCxxForeignType(const std::string& cflatName, const std:
         };
         // A request compiles against ONE import group. Callers inside a group's extraction run
         // under that group's scope; a CFlat-spelled type resolves its group first.
-        if (activeCxxRequestGroup_ == nullptr || activeCxxRequestGroup_->headers.empty())
+        if (activeCxxRequestGroup_ == nullptr
+            || (activeCxxRequestGroup_->headers.empty() && prefixSource.empty()))
             return fail(std::format("C++ type '{}' needs a C++ header in scope - "
                                     "import one with 'import cpp \"<header>\";'", cxxSpelling));
         const CxxRequestGroup& group = *activeCxxRequestGroup_;
+        const std::string fileForCxxRequest = group.headers.empty()
+            ? "cflat_cpp_struct.cpp" : group.headers.front();
         // The initial header walk can expose several class-template specializations under the
         // unparameterized C++ record name (clang drops specialization arguments from that name):
         // the reverse spelling map sends every one of them to that placeholder, whose layout and
@@ -6609,7 +6646,7 @@ bool LLVMBackend::RequestCxxForeignType(const std::string& cflatName, const std:
         item.cxxSpelling = cxxSpelling;
         item.needDefinitions = needDefinitions;
         item.explicitInstantiation = explicitInstantiation;
-        const std::string requestKey = CxxTypeRequestCacheKey(group, item);
+        const std::string requestKey = CxxTypeRequestCacheKey(group, item, prefixSource);
         std::filesystem::file_time_type headerMtime{};
         const bool haveMtime = CxxGroupHeaderStamp(group, headerMtime);
 
@@ -6651,7 +6688,7 @@ bool LLVMBackend::RequestCxxForeignType(const std::string& cflatName, const std:
             {
                 llvm::TimeTraceScope stage1("CxxRequestStage1", cxxSpelling);
                 if (!RunCxxTypeRequests(group, single, /*extraSource*/ {},
-                                        /*emitDefinitions*/ false, probe, error))
+                                        /*emitDefinitions*/ false, probe, error, prefixSource))
                     return fail(std::format("C++ type '{}' could not be parsed: {}",
                                             cxxSpelling, error));
             }
@@ -6693,7 +6730,8 @@ bool LLVMBackend::RequestCxxForeignType(const std::string& cflatName, const std:
                 }
                 if (batchComplete)
                     return RequestCxxForeignType(cflatName, cxxSpelling, error,
-                                                 needDefinitions, explicitInstantiation, tentative);
+                                                 needDefinitions, explicitInstantiation, tentative,
+                                                 extraSource, prefixSource);
             }
 
             cflat_cinterop::ExtractResult raw;
@@ -6720,7 +6758,7 @@ bool LLVMBackend::RequestCxxForeignType(const std::string& cflatName, const std:
                                       + BuildStdFunctionCtorUse(cxxSpelling, "__cflat_req_0")
                                       + memberDefaultWrappers
                                       + BuildCxxVirtualThunks(probe.records),
-                                      /*emitDefinitions*/ true, emitted, err2);
+                                      /*emitDefinitions*/ true, emitted, err2, prefixSource);
                 if (emittedOk && !emitted.records.empty())
                     raw = std::move(emitted);
             }
@@ -6818,7 +6856,7 @@ bool LLVMBackend::RequestCxxForeignType(const std::string& cflatName, const std:
                         AdoptCxxCompanionBitcode(requestBitcode);
                     for (const auto& memberName : rebindable)
                     {
-                        RegisterCxxClassMembers(rebound, group.headers.front(), memberName);
+                        RegisterCxxClassMembers(rebound, fileForCxxRequest, memberName);
                         if (auto updated = cxxClasses_.find(known->second);
                             updated != cxxClasses_.end())
                             updated->second.refusedMembers.erase(memberName);
@@ -6846,7 +6884,7 @@ bool LLVMBackend::RequestCxxForeignType(const std::string& cflatName, const std:
         if (!requestBitcode.empty() && symbolSink_ == nullptr) AdoptCxxCompanionBitcode(requestBitcode);
         // Registered BEFORE the records so a member signature naming the type itself
         // (`operator=(const vector<int>&)`, `push_back` on a nested element) maps to the CFlat name.
-        RegisterCRecords(records, group.headers.front());
+        RegisterCRecords(records, fileForCxxRequest);
         // A header import may already have laid out this class while refusing an inline or
         // template member whose body was absent from that extraction. The request above has
         // definitions enabled, but RegisterCRecords intentionally does not replace a non-opaque
@@ -6906,18 +6944,73 @@ bool LLVMBackend::RequestCxxForeignType(const std::string& cflatName, const std:
                 }
                 for (const std::string& name : rebind)
                 {
-                    RegisterCxxClassMembers(*refreshed, group.headers.front(), name);
+                    RegisterCxxClassMembers(*refreshed, fileForCxxRequest, name);
                     if (auto updated = cxxClasses_.find(cflatName);
                         updated != cxxClasses_.end())
                         updated->second.refusedMembers.erase(name);
                 }
             }
         }
-        RegisterCSignatures(requestSigs, group.headers.front());
+        RegisterCSignatures(requestSigs, fileForCxxRequest);
         if (dataStructures.find(cflatName) == dataStructures.end())
         {
             cxxCflatToCxxSpelling_.erase(cflatName);
             return fail(std::format("C++ type '{}' could not be laid out for cflat", cxxSpelling));
+        }
+        return true;
+    }
+
+bool LLVMBackend::RequestGeneratedCxxType(
+    const std::string& cflatName, const std::string& cxxSpelling,
+    const std::string& source, llvm::StructType* literalType,
+    const std::vector<DeclTypeAndValue>& fields, std::string& error, size_t ownerGroup,
+    const std::set<std::string>& overrideNames)
+{
+        if (cflatName.empty() || cxxSpelling.empty() || source.empty() || literalType == nullptr)
+        {
+            error = "generated C++ struct request has incomplete source or layout";
+            return false;
+        }
+        // The generated wrapper has C++ special members and uses the C++ global allocator for
+        // heap objects, so a standalone [cpp] struct still needs the C++ link/runtime path.
+        cppInteropUsed_ = true;
+        generatedCxxRecords_[cflatName] = { literalType, fields, overrideNames, source };
+
+        // A generated class has no header of its own and contains only its CFlat byte block, so
+        // use one synthetic header-free group instead of reparsing an unrelated import group.
+        const size_t groupIndex = ownerGroup == static_cast<size_t>(-1)
+            ? FindOrAddCxxImportGroup({}, {}) : ownerGroup;
+        CxxRequestGroup group = MakeCxxRequestGroup(groupIndex, {});
+        if (group.headers.empty()) group.label = "<generated C++ struct>";
+        CxxRequestGroupScope groupScope(*this, &group);
+        return RequestCxxForeignType(cflatName, cxxSpelling, error,
+                                     /*needDefinitions*/ true,
+                                     /*explicitInstantiation*/ false,
+                                     /*tentative*/ false,
+                                     /*extraSource*/ {}, source);
+    }
+
+bool LLVMBackend::GetGeneratedCxxFieldBlock(const std::string& typeName,
+                                            uint64_t& start, uint64_t& length) const
+{
+        auto generated = generatedCxxRecords_.find(typeName);
+        auto data = dataStructures.find(typeName);
+        if (generated == generatedCxxRecords_.end() || data == dataStructures.end()
+            || generated->second.literalType == nullptr || data->second.StructType == nullptr)
+            return false;
+        const auto& fields = data->second.StructFields;
+        auto first = std::find_if(fields.begin(), fields.end(),
+            [](const DeclTypeAndValue& f) { return f.IsCflatOwned; });
+        if (first == fields.end()) return false;
+        const unsigned index = static_cast<unsigned>(first - fields.begin());
+        const auto& dl = module->getDataLayout();
+        start = dl.getStructLayout(data->second.StructType)->getElementOffset(index);
+        length = dl.getTypeAllocSize(generated->second.literalType);
+        if (start + length > dl.getTypeAllocSize(data->second.StructType))
+        {
+            LogErrorMessage("generated C++ struct '{}' has an invalid CFlat field block",
+                            { typeName });
+            return false;
         }
         return true;
     }
@@ -7830,6 +7923,13 @@ bool LLVMBackend::MakeOpaqueFieldBlob(const CRecordFieldEntry& f, DeclTypeAndVal
         return true;
 }
 
+void LLVMBackend::RegisterGeneratedCxxOverrideNames(const std::string& typeName,
+                                                     const std::set<std::string>& names)
+{
+        auto it = generatedCxxRecords_.find(typeName);
+        if (it != generatedCxxRecords_.end()) it->second.overrideNames = names;
+}
+
 void LLVMBackend::RegisterCRecords(std::vector<CRecordEntry>& records, const std::string& fileForLsp)
 {
         if (records.empty()) return;
@@ -7892,23 +7992,160 @@ void LLVMBackend::RegisterCRecords(std::vector<CRecordEntry>& records, const std
                 continue;
             }
             std::vector<DeclTypeAndValue> fields;
-            fields.reserve(r.fields.size());
             bool ok = true;
             std::string badFieldName;
             std::string badFieldType;
-            for (const auto& f : r.fields)
+            auto generatedIt = generatedCxxRecords_.find(r.name);
+            const bool generated = r.isCxx && generatedIt != generatedCxxRecords_.end();
+            if (generated)
             {
-                if (r.isCxx && f.ctype.find("::*") != std::string::npos)
+                fields = generatedIt->second.fields;
+                auto* literal = generatedIt->second.literalType;
+                const llvm::DataLayout& dl = module->getDataLayout();
+                if (literal == nullptr || literal->isOpaque() || !literal->isSized())
                 {
-                    r.layoutRefusal = std::format(
-                        "field '{}' of '{}' is a pointer to member; member-pointer fields are not supported (an ordinary pointer is not equivalent)",
-                        f.name, r.name);
-                    badFieldName = f.name;
-                    badFieldType = f.ctype;
+                    r.layoutRefusal = "generated CFlat field layout is not sized";
                     ok = false;
-                    break;
                 }
-                TypeAndValue tv;
+                else
+                {
+                    const auto clangFields = r.fields;
+                    auto marker = std::find_if(clangFields.begin(), clangFields.end(),
+                        [](const CRecordFieldEntry& f) { return f.name == "__cflat_fields"; });
+                    if (marker == clangFields.end())
+                    {
+                        r.layoutRefusal = "generated C++ struct has no __cflat_fields descriptor";
+                        ok = false;
+                    }
+                    const uint64_t blockOffset = marker == clangFields.end()
+                        ? 0 : marker->offsetBytes;
+                    auto mapClangField = [&](const CRecordFieldEntry& f,
+                                             std::vector<DeclTypeAndValue>& out) -> bool {
+                        DeclTypeAndValue d;
+                        TypeAndValue tv;
+                        std::vector<uint64_t> arrDims;
+                        std::string elemSpelling = StripFixedArrayDims(f.ctype, arrDims);
+                        if (!MapCTypeToTypeAndValue(elemSpelling, tv, r.isCxx))
+                        {
+                            if (r.isCxx && !f.isBitfield && arrDims.empty()
+                                && MakeOpaqueFieldBlob(f, d))
+                            {
+                                d.VariableName = f.name;
+                                out.push_back(std::move(d));
+                                return true;
+                            }
+                            r.layoutRefusal = std::format(
+                                "generated C++ field '{}' has unsupported type '{}'", f.name, f.ctype);
+                            return false;
+                        }
+                        if (!arrDims.empty())
+                        {
+                            tv.ConstArraySize = arrDims[0];
+                            tv.ConstInnerDimensions.assign(arrDims.begin() + 1, arrDims.end());
+                        }
+                        static_cast<TypeAndValue&>(d) = tv;
+                        d.VariableName = f.name;
+                        if (f.isBitfield)
+                        {
+                            d.IsBitfield = true;
+                            d.BitWidth = f.bitWidth;
+                        }
+                        out.push_back(std::move(d));
+                        return true;
+                    };
+
+                    std::vector<CRecordFieldEntry> prefixRecords;
+                    prefixRecords.reserve(clangFields.size());
+                    for (const auto& f : clangFields)
+                        if (f.name != "__cflat_fields") prefixRecords.push_back(f);
+                    std::vector<DeclTypeAndValue> prefixFields;
+                    for (const auto& f : prefixRecords)
+                        if (!mapClangField(f, prefixFields)) ok = false;
+                    uint64_t prefixEnd = 0;
+                    for (size_t i = 0; i < prefixRecords.size() && i < prefixFields.size(); ++i)
+                    {
+                        auto* type = GetType(prefixFields[i]);
+                        if (type != nullptr && type->isSized())
+                            prefixEnd = std::max<uint64_t>(prefixEnd,
+                                prefixRecords[i].offsetBytes + dl.getTypeAllocSize(type));
+                    }
+                    CRecordEntry prefix = r;
+                    prefix.fields = prefixRecords;
+                    InsertCxxLayoutPadding(prefix, prefixFields);
+
+                    std::vector<DeclTypeAndValue> combined;
+                    combined.reserve(prefixFields.size() + fields.size() + 1);
+                    combined.insert(combined.end(), prefixFields.begin(), prefixFields.end());
+                    std::vector<llvm::Type*> prefixTypes;
+                    for (const auto& f : prefixFields)
+                    {
+                        auto* type = GetType(f);
+                        if (type == nullptr || !type->isSized())
+                        {
+                            prefixTypes.clear();
+                            break;
+                        }
+                        prefixTypes.push_back(type);
+                    }
+                    if (!prefixRecords.empty() && prefixTypes.empty()) ok = false;
+                    if (prefixEnd > blockOffset)
+                    {
+                        r.layoutRefusal = std::format(
+                            "generated C++ base storage ends at byte {}, past __cflat_fields at byte {}",
+                            prefixEnd, blockOffset);
+                        ok = false;
+                    }
+                    if (prefixEnd < blockOffset)
+                    {
+                        DeclTypeAndValue pad;
+                        pad.TypeName = "u8";
+                        pad.ConstArraySize = blockOffset - prefixEnd;
+                        combined.push_back(std::move(pad));
+                    }
+                    combined.insert(combined.end(), fields.begin(), fields.end());
+                    fields.swap(combined);
+
+                    r.fields = prefixRecords;
+                    const auto* layout = dl.getStructLayout(literal);
+                    for (size_t fi = 0; fi < generatedIt->second.fields.size(); ++fi)
+                    {
+                        const auto& field = generatedIt->second.fields[fi];
+                        if (field.IsPadding || field.VariableName.empty()) continue;
+                        CRecordFieldEntry descriptor;
+                        descriptor.name = field.VariableName;
+                        descriptor.ctype = field.TypeName;
+                        descriptor.access = cflat_cinterop::AccessPublic;
+                        descriptor.offsetBytes = blockOffset + layout->getElementOffset((unsigned)fi);
+                        auto* fieldType = GetType(field);
+                        if (fieldType == nullptr || !fieldType->isSized())
+                        {
+                            r.layoutRefusal = std::format(
+                                "generated field '{}' has no sized LLVM type", field.VariableName);
+                            ok = false;
+                            break;
+                        }
+                        descriptor.sizeBytes = dl.getTypeAllocSize(fieldType);
+                        descriptor.alignBytes = dl.getABITypeAlign(fieldType).value();
+                        r.fields.push_back(std::move(descriptor));
+                    }
+                }
+            }
+            else
+            {
+                fields.reserve(r.fields.size());
+                for (const auto& f : r.fields)
+                {
+                    if (r.isCxx && f.ctype.find("::*") != std::string::npos)
+                    {
+                        r.layoutRefusal = std::format(
+                            "field '{}' of '{}' is a pointer to member; member-pointer fields are not supported (an ordinary pointer is not equivalent)",
+                            f.name, r.name);
+                        badFieldName = f.name;
+                        badFieldType = f.ctype;
+                        ok = false;
+                        break;
+                    }
+                    TypeAndValue tv;
                 // Strip fixed-array dims before mapping: the shared mapper decays `[N]` to a
                 // pointer (right for params, wrong for fields), so peel them here first.
                 std::vector<uint64_t> arrDims;
@@ -7966,7 +8203,8 @@ void LLVMBackend::RegisterCRecords(std::vector<CRecordEntry>& records, const std
                     d.IsBitfield = true;
                     d.BitWidth = f.bitWidth;
                 }
-                fields.push_back(std::move(d));
+                    fields.push_back(std::move(d));
+                }
             }
             if (fields.empty() && r.isCxx && r.fields.empty())
             {
@@ -8045,7 +8283,7 @@ void LLVMBackend::RegisterCRecords(std::vector<CRecordEntry>& records, const std
             // A C++ record's layout is clang's, not CFlat's: insert explicit padding wherever
             // clang put a field further along than CFlat's natural packing would (over-aligned
             // members, empty-member slots), so field offsets agree before the type is built.
-            if (r.isCxx && !r.isUnion && !anyBitfields)
+            if (r.isCxx && !generated && !r.isUnion && !anyBitfields)
                 InsertCxxLayoutPadding(r, fields);
             if (r.isUnion)
                 CreateUnionType(r.name, fields, r.isCxx ? r.alignBytes : 0);
@@ -8072,6 +8310,9 @@ void LLVMBackend::RegisterCRecords(std::vector<CRecordEntry>& records, const std
                 if (std::string mismatch = VerifyCxxRecordLayout(r); !mismatch.empty())
                 {
                     r.layoutRefusal = std::move(mismatch);
+                    if (generated)
+                        LogErrorMessage("generated C++ struct '{}' has a layout disagreement: {}",
+                                        { r.name, r.layoutRefusal });
                     if (verbose) std::cout << std::format("[verbose]   C++ struct '{}': {}\n", r.name, r.layoutRefusal);
                 }
                 deferredMembers.emplace_back(&r, true);
@@ -8273,7 +8514,8 @@ bool LLVMBackend::EmitCxxVirtualDelete(const std::string& typeName, llvm::Value*
     }
 
 bool LLVMBackend::RejectInaccessibleCxxMember(const std::string& typeName,
-                                              const std::string& memberName)
+                                              const std::string& memberName,
+                                              bool accessedThroughCurrentObject)
 {
         const CxxClassInfo* info = GetCxxClassInfo(typeName);
         if (info == nullptr) return false;
@@ -8285,9 +8527,19 @@ bool LLVMBackend::RejectInaccessibleCxxMember(const std::string& typeName,
         if (auto f = info->fieldAccess.find(memberName); f != info->fieldAccess.end())
         {
             if (f->second == cflat_cinterop::AccessPublic) return false;
+            if (f->second == cflat_cinterop::AccessProtected
+                && CxxProtectedAccessAllowed(typeName, accessedThroughCurrentObject)) return false;
             LogError(std::format("field '{}' of C++ class '{}' is {}",
                                  memberName, typeName,
                                  f->second == cflat_cinterop::AccessPrivate ? "private" : "protected"));
+            return true;
+        }
+        if (auto ma = info->memberAccess.find(memberName); ma != info->memberAccess.end()
+            && ma->second == cflat_cinterop::AccessProtected)
+        {
+            if (CxxProtectedAccessAllowed(typeName, accessedThroughCurrentObject)) return false;
+            LogErrorMessage("member '{}' of C++ class '{}' is protected",
+                            { memberName, typeName });
             return true;
         }
         if (auto m = info->refusedMembers.find(memberName); m != info->refusedMembers.end())
@@ -8311,6 +8563,16 @@ bool LLVMBackend::RejectInaccessibleCxxMember(const std::string& typeName,
             return true;
         }
         return false;
+    }
+
+bool LLVMBackend::CxxProtectedAccessAllowed(const std::string& typeName,
+                                            bool accessedThroughCurrentObject) const
+{
+        if (!accessedThroughCurrentObject || cppStructAccessContext_.empty()) return false;
+        uint64_t offset = 0;
+        bool inaccessible = false;
+        return FindCxxBaseOffset(cppStructAccessContext_, typeName, offset, inaccessible)
+            && !inaccessible;
     }
 
 /*
@@ -8499,6 +8761,49 @@ void LLVMBackend::RegisterCxxClassMembers(const CRecordEntry& r, const std::stri
             }
             return key;
         };
+        auto directMethodKey = [](const Member& m) {
+            std::string key = m.name + "|" + m.retType + (m.isConst ? "|const" : "|mut");
+            for (const auto& param : m.paramTypes) key += "|" + param;
+            return key;
+        };
+        auto recordDirectMethod = [&](const Member& m) {
+            if (m.kind != Member::Instance || m.isCopyAssign || m.isMoveAssign) return;
+            const std::string key = directMethodKey(m);
+            for (const auto& existing : info.directMethods)
+                if (directMethodKey(existing.raw) == key) return;
+
+            CxxClassInfo::Method method;
+            method.ownerType = r.name;
+            method.raw = m;
+            TypeAndValue ret;
+            if (!mapType(m.retType, ret))
+            {
+                method.spellable = false;
+                info.directMethods.push_back(std::move(method));
+                return;
+            }
+            std::vector<TypeAndValue> params;
+            params.reserve(m.paramTypes.size());
+            for (size_t p = 0; p < m.paramTypes.size(); ++p)
+            {
+                TypeAndValue tv;
+                if (p == 0)
+                {
+                    tv.TypeName = r.name;
+                    tv.Pointer = true;
+                }
+                else if (!mapType(m.paramTypes[p], tv))
+                {
+                    method.spellable = false;
+                    info.directMethods.push_back(std::move(method));
+                    return;
+                }
+                params.push_back(std::move(tv));
+            }
+            method.ret = ret;
+            method.params = std::move(params);
+            info.directMethods.push_back(std::move(method));
+        };
         auto markConstructorReference = [&](const std::string& spelling, TypeAndValue& tv) {
             CxxReferenceKind refKind = CxxReferenceKind::None;
             CxxSpellingWithoutRef(spelling, &refKind);
@@ -8543,6 +8848,11 @@ void LLVMBackend::RegisterCxxClassMembers(const CRecordEntry& r, const std::stri
             // conversion is recorded under the same key the cast site will ask for.
             const std::string cflatName = memberRegName(m);
             if (!memberFilter.empty() && cflatName != memberFilter) continue;
+            if (m.kind == Member::Instance && generatedCxxRecords_.count(r.name) != 0)
+            {
+                const auto generated = generatedCxxRecords_.find(r.name);
+                if (generated->second.overrideNames.count(m.name) != 0) continue;
+            }
 
             if (m.kind == Member::Instance || m.kind == Member::StaticMethod)
             {
@@ -8558,8 +8868,11 @@ void LLVMBackend::RegisterCxxClassMembers(const CRecordEntry& r, const std::stri
                 if (!isStructor && info.refusedMembers.count(cflatName) == 0)
                     info.refusedMembers[cflatName] = why;
             };
+            recordDirectMethod(m);
             if (m.access == cflat_cinterop::AccessPrivate)    { refuse("is private");   continue; }
-            if (m.access == cflat_cinterop::AccessProtected)  { refuse("is protected"); continue; }
+            if (m.access == cflat_cinterop::AccessProtected
+                && (m.kind != Member::Instance || (memberFilter.empty() && !m.isVirtual)))
+            { refuse("is protected"); continue; }
             if (m.isDeleted)              { refuse("is deleted");                        continue; }
             if (!m.bindRefusal.empty())   { refuse(m.bindRefusal);                       continue; }
             if (!r.layoutRefusal.empty() && m.kind != Member::StaticMethod)
@@ -9351,6 +9664,214 @@ std::string LLVMBackend::ResolveCxxBaseIdentity(const CxxClassInfo::BaseRef& b) 
         return ResolveCxxBaseIdentity(raw);
 }
 
+static std::string CxxBaseMethodSignatureKey(
+    const LLVMBackend::CxxClassInfo::Method& method)
+{
+        std::string key = method.raw.name + (method.raw.isConst ? "|const" : "|mut");
+        for (size_t i = 1; i < method.raw.paramTypes.size(); ++i)
+            key += "|" + method.raw.paramTypes[i];
+        return key;
+}
+
+std::vector<LLVMBackend::CxxClassInfo::Method> LLVMBackend::FindCxxBaseMethods(
+    const std::string& baseType, const std::string& methodName) const
+{
+        std::vector<CxxClassInfo::Method> result;
+        std::unordered_set<std::string> visited;
+        std::unordered_set<std::string> methodsSeen;
+        std::function<void(const std::string&)> visit = [&](const std::string& typeName) {
+            if (!visited.insert(typeName).second) return;
+            auto it = cxxClasses_.find(typeName);
+            if (it == cxxClasses_.end()) return;
+            for (const auto& method : it->second.directMethods)
+                if (method.raw.kind == cflat_cinterop::RawCxxMember::Instance
+                    && method.raw.name == methodName
+                    && methodsSeen.insert(CxxBaseMethodSignatureKey(method)).second)
+                    result.push_back(method);
+            for (const auto& base : it->second.bases)
+            {
+                const std::string identity = ResolveCxxBaseIdentity(base);
+                if (!identity.empty()) visit(identity);
+            }
+        };
+        visit(baseType);
+        return result;
+}
+
+std::vector<LLVMBackend::CxxClassInfo::Method> LLVMBackend::FindCxxBaseVirtualMethods(
+    const std::string& baseType) const
+{
+        std::vector<CxxClassInfo::Method> result;
+        std::unordered_set<std::string> visited;
+        std::unordered_set<std::string> methodsSeen;
+        std::function<void(const std::string&)> visit = [&](const std::string& typeName) {
+            if (!visited.insert(typeName).second) return;
+            auto it = cxxClasses_.find(typeName);
+            if (it == cxxClasses_.end()) return;
+            for (const auto& method : it->second.directMethods)
+                if (method.raw.isVirtual
+                    && methodsSeen.insert(CxxBaseMethodSignatureKey(method)).second)
+                    result.push_back(method);
+            for (const auto& base : it->second.bases)
+            {
+                const std::string identity = ResolveCxxBaseIdentity(base);
+                if (!identity.empty()) visit(identity);
+            }
+        };
+        visit(baseType);
+        return result;
+}
+
+bool LLVMBackend::CxxBaseHasAccessibleMoveOrCopy(const std::string& baseType) const
+{
+        const auto* info = GetCxxClassInfo(baseType);
+        if (info == nullptr) return false;
+        for (const auto& ctor : info->constructors)
+            if ((ctor.isMoveCtor || ctor.isCopyCtor) && !ctor.isDeleted
+                && ctor.access != cflat_cinterop::AccessPrivate)
+                return true;
+        return info->hasCopyCtor && !info->hasDeletedCopyCtor;
+}
+
+void LLVMBackend::RecordCppStructBase(const std::string& structName,
+                                      const std::string& baseName)
+{
+        if (!structName.empty() && !baseName.empty()) cppStructBases_[structName] = baseName;
+}
+
+void LLVMBackend::RegisterCppStructProtectedBaseMembers(const std::string& structName)
+{
+        std::string baseName;
+        if (!GetCppStructBase(structName, baseName)) return;
+
+        std::unordered_set<std::string> visited;
+        std::function<void(const std::string&)> visit = [&](const std::string& typeName) {
+            if (!visited.insert(typeName).second) return;
+            auto infoIt = cxxClasses_.find(typeName);
+            auto recordIt = cxxRecordEntries_.find(typeName);
+            if (infoIt == cxxClasses_.end() || recordIt == cxxRecordEntries_.end()) return;
+            for (const auto& base : infoIt->second.bases)
+            {
+                const std::string identity = ResolveCxxBaseIdentity(base);
+                if (!identity.empty()) visit(identity);
+            }
+            for (const auto& member : recordIt->second.members)
+            {
+                if (member.kind != cflat_cinterop::RawCxxMember::Instance
+                    || member.access != cflat_cinterop::AccessProtected)
+                    continue;
+                RegisterCxxClassMembers(recordIt->second, member.file.empty()
+                    ? std::string() : member.file, member.name);
+            }
+            if (auto refreshed = cxxRecordEntries_.find(typeName);
+                refreshed != cxxRecordEntries_.end())
+                RegisterCxxInheritedMembers(refreshed->second);
+        };
+        visit(baseName);
+
+        auto derived = cxxRecordEntries_.find(structName);
+        if (derived == cxxRecordEntries_.end()) return;
+        for (int round = 0; round < 8; ++round)
+            if (!RegisterCxxInheritedMembers(derived->second)) break;
+    }
+
+bool LLVMBackend::GetCppStructBase(const std::string& structName, std::string& baseName) const
+{
+        auto it = cppStructBases_.find(structName);
+        if (it == cppStructBases_.end()) return false;
+        baseName = it->second;
+        return true;
+}
+
+bool LLVMBackend::GetCxxTypeOwnerGroup(const std::string& typeName, size_t& group) const
+{
+        auto it = cxxTypeOwnerGroup_.find(typeName);
+        if (it == cxxTypeOwnerGroup_.end()) return false;
+        group = it->second;
+        return true;
+}
+
+static std::string CppStructOverrideNameKey(const std::string& structName,
+                                            const std::string& methodName,
+                                            const std::vector<LLVMBackend::TypeAndValue>& params)
+{
+        std::string key = structName + "#" + methodName + "#";
+        for (const auto& param : params)
+            key += param.TypeName + ":" + std::to_string(param.Pointer) + ":"
+                + std::to_string(param.ValuePointerDepth()) + ":"
+                + std::to_string(param.IsRvalueRef) + ";";
+        return key;
+}
+
+void LLVMBackend::RegisterCppStructOverrideName(
+    const std::string& structName, const std::string& methodName,
+    const std::vector<TypeAndValue>& params, const std::string& stableName)
+{
+        cppStructOverrideNames_[CppStructOverrideNameKey(structName, methodName, params)] = stableName;
+}
+
+bool LLVMBackend::GetCppStructOverrideName(
+    const std::string& structName, const std::string& methodName,
+    const std::vector<TypeAndValue>& params, std::string& stableName) const
+{
+        auto it = cppStructOverrideNames_.find(
+            CppStructOverrideNameKey(structName, methodName, params));
+        if (it == cppStructOverrideNames_.end()) return false;
+        stableName = it->second;
+        return true;
+}
+
+static bool SameCppMappedType(const LLVMBackend::TypeAndValue& left,
+                              const LLVMBackend::TypeAndValue& right)
+{
+        return left.TypeName == right.TypeName
+            && left.Pointer == right.Pointer
+            && left.ValuePointerDepth() == right.ValuePointerDepth()
+            && left.IsArrayView == right.IsArrayView
+            && left.IsRvalueRef == right.IsRvalueRef;
+}
+
+llvm::Function* LLVMBackend::EmitCppStructOverrideThunk(
+    llvm::Function* original, const std::string& structName,
+    const std::string& methodName, const std::vector<TypeAndValue>& params)
+{
+        if (original == nullptr) return nullptr;
+        std::string baseName;
+        std::string stableName;
+        if (!GetCppStructBase(structName, baseName))
+            return nullptr;
+        if (!GetCppStructOverrideName(structName, methodName, params, stableName))
+            return nullptr;
+        for (const auto& candidate : FindCxxBaseMethods(baseName, methodName))
+        {
+            if (candidate.raw.abi.valid)
+            {
+                if (candidate.params.size() != params.size() + 1) continue;
+                bool same = true;
+                for (size_t i = 0; i < params.size(); ++i)
+                    if (!SameCppMappedType(candidate.params[i + 1], params[i])) same = false;
+                if (!same) continue;
+                CxxFunctionPointerAbiPlan plan;
+                plan.ret = candidate.ret;
+                plan.params = candidate.params;
+                plan.params[0].TypeName = structName;
+                plan.params[0].Pointer = true;
+                std::string mismatch;
+                CxxAbiPlanScope abiScope(*this, &candidate.raw.abi, &mismatch);
+                if (!BuildAbiRecipeFromClangPlan(methodName, candidate.raw.abi,
+                                                  plan.ret, plan.params, plan.recipe))
+                {
+                    LogErrorMessage("override method '{}.{}' has an unsupported C++ ABI: {}",
+                                    { structName, methodName,
+                                      mismatch.empty() ? "unknown ABI mismatch" : mismatch });
+                    return nullptr;
+                }
+                return GetOrCreateReverseAbiFunctionThunk(original, plan, stableName, true);
+            }
+        }
+        return nullptr;
+}
+
 /*
  * A method a class INHERITS is cloned into the derived overload set only when the base bound it.
  * A base member that was REFUSED is therefore invisible from the derived class - the refusal
@@ -9444,11 +9965,12 @@ bool LLVMBackend::RegisterCxxInheritedMembers(const CRecordEntry& r)
         // each new specialization while functionTable keeps the symbols.
         std::set<std::string> listed(self->second.instanceMethodNames.begin(),
                                      self->second.instanceMethodNames.end());
-        auto noteMethodName = [&](const std::string& mn) {
+        auto noteMethodName = [&](const std::string& mn, int access = cflat_cinterop::AccessPublic) {
             if (!listed.insert(mn).second) return;
             self->second.instanceMethodNames.push_back(mn);
-            if (self->second.memberAccess.find(mn) == self->second.memberAccess.end())
-                self->second.memberAccess[mn] = cflat_cinterop::AccessPublic;
+            auto it = self->second.memberAccess.find(mn);
+            if (it == self->second.memberAccess.end() || access < it->second)
+                self->second.memberAccess[mn] = access;
         };
 
         std::set<std::string> present;
@@ -9505,7 +10027,11 @@ bool LLVMBackend::RegisterCxxInheritedMembers(const CRecordEntry& r)
                     if (adjust != 0)
                         cxxThisAdjust_[CxxThisAdjustKey(r.name, sym.UniqueName)] = adjust;
                     functionTable[mn].push_back(std::move(sym));
-                    noteMethodName(mn);
+                    int access = cflat_cinterop::AccessPublic;
+                    if (auto accessIt = bit->second.memberAccess.find(mn);
+                        accessIt != bit->second.memberAccess.end())
+                        access = accessIt->second;
+                    noteMethodName(mn, access);
                     added = true;
                 }
             }
@@ -11091,7 +11617,9 @@ bool LLVMBackend::CanImplicitlyConstructCxxClass(const NamedVariable& arg,
 
 bool LLVMBackend::IsCxxDerivedToBaseValue(const TypeAndValue& from, const TypeAndValue& to) const
 {
-        if (from.Pointer || from.TypeName.empty() || to.TypeName.empty()) return false;
+        const bool cxxReference = to.IsAlias && to.Pointer && !to.ElemPointer;
+        if (from.Pointer || from.TypeName.empty() || to.TypeName.empty()
+            || (to.Pointer && !cxxReference)) return false;
         if (from.TypeName == to.TypeName) return false;
         if (!IsCxxRecord(from.TypeName) || !IsCxxRecord(to.TypeName)) return false;
         return IsCxxBaseOf(to.TypeName, from.TypeName);

@@ -1,0 +1,9 @@
+import cpp "cpp_interop_tpl.h";
+
+expect_error("generic [cpp] struct is not supported yet") {
+    struct Bad<T> : cppt.m76.Holder<T>
+    {
+    };
+}
+
+extern int main() { return 0; }

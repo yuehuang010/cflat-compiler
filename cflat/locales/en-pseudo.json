@@ -24,6 +24,9 @@
       "tieLit",
       "tieLit(u8), tieLit(u16)"
     ],
+    "arg0": [
+      "uses virtual inheritance, which is not supported yet"
+    ],
     "arg0arg1mustbearg2or...obeexecutedinprocess28e30d1abeb98a2b": [
       "--run",
       "main",
@@ -82,6 +85,16 @@
     "armsdifferinownershi...rmakebotharmsborrows499fceef95c57fab": [
       "makeJoinBox()",
       "borrowed"
+    ],
+    "basearg0ofstructarg1isnotacclass": [
+      "LocalIface",
+      "Bad"
+    ],
+    "baseinitializerargum...parametersorliterals4e1fed190568eb69": [],
+    "baseinitializerisonlyvalidinacppstruct": [],
+    "baseinitializernames...utthebaseclassisarg1cd645a82a4640656": [
+      "cpppoly.Shape",
+      "cpppoly.Tagged"
     ],
     "calltoarg0arg1adoptp...rfacecannotbeadoptedc8edc9a7350dcd11": [
       "IAdoptErrorSink",
@@ -564,6 +577,29 @@
       "void*(char*, char*)",
       "int(int)"
     ],
+    "cppstructarg0hasanun...fieldarg1useapointer9576d7fd975b25ee": [
+      "Bad",
+      "value"
+    ],
+    "cppstructcannotbeaunion": [],
+    "cppstructconstructor...erarg0hasnocspelling21dc1cbbde141cfe": [
+      "function<void()>"
+    ],
+    "doesnotoverridearg0a...g2arg3candidatesarg4b305bda17139c1a7": [
+      "cpppoly.Shape",
+      "area",
+      "int",
+      "",
+      "'cpppoly.Shape.area' expected int()"
+    ],
+    "doesnotoverridepurev...rehasnocflatspellingc9186cdbb183e4be": [
+      "cpppoly.Unspellable",
+      "take"
+    ],
+    "doesnotoverridepurevirtualmethodarg0arg1": [
+      "cpppoly.Abstract",
+      "pure"
+    ],
     "duplicatecaselabelarg0inswitch": [
       "1"
     ],
@@ -596,6 +632,11 @@
       "f",
       "move"
     ],
+    "genericcppstructisnotsupportedyet": [],
+    "hidesvirtualmethodarg0arg1addoverride": [
+      "cpppoly.Shape",
+      "area"
+    ],
     "hintarg0": [
       "structs cannot implement interfaces; use 'class' instead"
     ],
@@ -617,7 +658,19 @@
       "unsigned i32",
       "u32"
     ],
+    "ismarkedoverridebutarg0arg1isnotvirtual": [
+      "cpppoly.Shape",
+      "plain"
+    ],
+    "ismarkedoverridebutb...rtualmethodnamedarg1c72e2c34c8bba5bc": [
+      "cpppoly.Shape",
+      "missing"
+    ],
     "longdoubleisonlyusab...mentusedoubleincflat12f0254a32d5afe4": [],
+    "memberarg0ofcclassarg1isprotected": [
+      "prot_get",
+      "cpppoly.Tagged"
+    ],
     "mismatchedinputarg0expectingarg1": [
       "'='",
       "{'move', '(', Identifier}"
@@ -627,6 +680,7 @@
       "'{'"
     ],
     "missingatendofstatement": [],
+    "multiplebasesarenotsupportedyet": [],
     "namedargumentarg0doe...notmatchanyparameter54ee4c123914315f": [
       "z"
     ],
@@ -643,6 +697,11 @@
     ],
     "noviablealternativeatinputarg0": [
       "'int true'"
+    ],
+    "overrideisonlyvalidi...acppstructwithacbasee727ca8dc9a88350": [],
+    "overridesarg0arg1whichisfinal": [
+      "cpppoly.Sealed",
+      "f"
     ],
     "parameterarg0cannotp...toftheirsourcesscope0c92f2fcfe931fdb": [
       "p",
@@ -668,7 +727,8 @@
     "switchexpressionmustbeanintegertype": [],
     "unknowntypearg0": [
       "GiDeadOnly__i32"
-    ]
+    ],
+    "virtualisnotacflatke...sdeducedfromthecbase2687475741f225d0": []
   },
   "argumentNames": {
     "aliasarg0collideswithmemberarg1ofarg2": [
@@ -1694,6 +1754,7 @@
     "alignmentmismatchini...ntthevaluealreadyhas5a4ed9c3ad1bf980": "alignment mismatch initializing '{0}': the declared type allocates at {1}, but the value was allocated {2}. Allocate the value with the matching 'alignas(0, {3})' clause, or declare the receiver with the alignment the value already has.",
     "alignmentmismatchmov...hthecorrectalignmenta5e59547dcfd5ec4": "alignment mismatch moving into the 'move' parameter of '{0}': the parameter is declared 'alignas(0, {1})' but the argument was allocated 'alignas(0, {2})'. The two must agree so the callee frees with the correct alignment.",
     "ambiguouscalltoarg0n...parametertypeyoumean6524b093d1fa9da7": "ambiguous call to '{0}': no candidate ranks better than the others: {1}. Cast the argument to the parameter type you mean.",
+    "arg0": "{0}",
     "arg0arg1mustbearg2or...obeexecutedinprocess28e30d1abeb98a2b": "{0}: '{1}' must be '{2}' or '{3}' to be executed in-process.",
     "arg0asanruntimedllar...sssanitizercomponent4c29a1f95801007b": "{0}: asan runtime DLL '{1}' not found under '{2}\\bin'. The import library was present but the matching runtime DLL is missing; reinstall the 'C++ AddressSanitizer' component.",
     "arg0asanruntimeimpor...ntforthismsvctoolsetc5e9e50ae7d9edfe": "{0}: asan runtime import library '{1}' not found in '{2}'. Install the 'C++ AddressSanitizer' component for this MSVC toolset.",
@@ -1731,6 +1792,10 @@
     "argumentforinterface...hasnoresolvedstorage7ebcdaffd59e5355": "argument for interface parameter '{0}' of {1} has no resolved storage",
     "armsdifferinownershi...dmakebotharmsborrows33877404c72b56a3": "'?:' arms differ in ownership: '{0}' allocates a value the join cannot own and '{1}' is a borrow of an existing value, so the allocating arm leaks whenever it is taken. Either 'move' the borrowed side into a fresh value so both arms own, or allocate into a named owner before the '?:' and make both arms borrows.",
     "armsdifferinownershi...rmakebotharmsborrows499fceef95c57fab": "'?:' arms differ in ownership: '{0}' is an owning value and '{1}' is a borrow of an existing value. Either 'move' the borrowed side into a fresh value so both arms own, or make both arms borrows.",
+    "basearg0ofstructarg1isnotacclass": "base '{0}' of struct '{1}' is not a C++ class",
+    "baseinitializerargum...parametersorliterals4e1fed190568eb69": "base initializer arguments must be constructor parameters or literals",
+    "baseinitializerisonlyvalidinacppstruct": "base initializer is only valid in a [cpp] struct",
+    "baseinitializernames...utthebaseclassisarg1cd645a82a4640656": "base initializer names '{0}' but the base class is '{1}'",
     "builtinssourcenotfoundarg0": "builtins source not found: '{0}'.",
     "callthroughafunction...sitetopassthepointee5550b0e566872e76": "call through a function value: cannot pass a pointer as argument {0} - that parameter is a by-value slot and there is no implicit dereference. Write '*' at the call site to pass the pointee.",
     "calltoarg0adoptparam...rfacecannotbeadopted40dd336a21320a8f": "call to '{0}': adopt parameter '{1}' requires an owned interface local or a move-returning interface result; a unique local or borrowed interface cannot be adopted",
@@ -1828,9 +1893,15 @@
     "conflictingdeclarati...amebindsonesignature5cc1d51c1609eaad": "conflicting declaration of extern '{0}' from C import '{1}': the linkage name is already declared as '{2}', but the C prototype is '{3}'. Remove or correct one of them - a linkage name binds one signature.",
     "conflictingdeclarati...orcalltheexistingone48bd3125877b9b29": "conflicting declaration of extern '{0}': the linkage name is already declared as '{1}', but this declaration is '{2}'. Rename your extern, or call the existing one.",
     "conflictingdeclarati...penfreadfwritefclosec74614431b9da0db": "conflicting declaration of extern '{0}': the linkage name is already declared as '{1}', but this declaration is '{2}'. Rename your extern, or call the existing one - for file I/O use os.windows.fopen/fread/fwrite/fclose.",
+    "cppstructarg0hasanun...fieldarg1useapointer9576d7fd975b25ee": "[cpp] struct '{0}' has an unsized field '{1}'; use a pointer",
+    "cppstructcannotbeaunion": "[cpp] struct cannot be a union",
+    "cppstructconstructor...erarg0hasnocspelling21dc1cbbde141cfe": "[cpp] struct constructor parameter '{0}' has no C++ spelling",
     "crashhandlersourcenotfoundarg0": "crash handler source not found: '{0}'.",
     "defaultargumentforpa...hasanunsupportedtype5d022dd279a3e61f": "default argument for parameter '{0}' of '{1}' has an unsupported type",
     "defaultnullptrforpar...0ofarg1isnotapointer87bfc7d94fc952b0": "default nullptr for parameter '{0}' of '{1}' is not a pointer",
+    "doesnotoverridearg0a...g2arg3candidatesarg4b305bda17139c1a7": "does not override '{0}.{1}' (expected {2}({3}); candidates: {4})",
+    "doesnotoverridepurev...rehasnocflatspellingc9186cdbb183e4be": "does not override pure virtual method '{0}.{1}' (its C++ signature has no CFlat spelling)",
+    "doesnotoverridepurevirtualmethodarg0arg1": "does not override pure virtual method '{0}.{1}'",
     "duplicatecaselabelarg0inswitch": "duplicate case label '{0}' in switch",
     "duplicatenamedargumentarg0": "duplicate named argument '{0}'",
     "emitwinmdnowinrtinte...orclassesfoundtoemit3093b6c411af1dd1": "--emit-winmd: no [winrt] interfaces or classes found to emit",
@@ -1848,6 +1919,7 @@
     "functionarg0cannotbe...rg3insteadordroparg4a38c64f3d4498882": "function '{0}' cannot be used as a function pointer: its parameter '{1}' is '{2}', which is passed as a reference to the caller's object and has no function-pointer spelling. Declare the parameter '{3}' instead, or drop '{4}'",
     "functionarg0hasnoove...efunctionpointertype8d562b0f9fbd458d": "function '{0}' has no overload matching the '{1}' modifiers required by parameter '{2}' - '{3}' is part of the function-pointer type",
     "functionarg0isneverused": "function '{0}' is never used",
+    "genericcppstructisnotsupportedyet": "generic [cpp] struct is not supported yet",
     "getorcreateprogramvt...notimplementarg1arg27eb70aa4fbb83de6": "GetOrCreateProgramVTable: '{0}' does not implement '{1}::{2}'",
     "getorcreateprogramvt...unknowninterfacearg0e4dc00542011e2b1": "GetOrCreateProgramVTable: unknown interface '{0}'",
     "getorcreatevtablearg...notimplementarg1arg280f8d3de313016d6": "GetOrCreateVTable: '{0}' does not implement '{1}::{2}'",
@@ -1855,6 +1927,7 @@
     "gettypealignbytesnulltypepointer": "GetTypeAlignBytes: null type pointer",
     "gettypesizebytesnulltypepointer": "GetTypeSizeBytes: null type pointer",
     "heapauditheapauditen...cannotinstrumentmainfc56369fd43948ec": "--heap-audit: HeapAudit.enable/reportLeaks were not linked - diagnostic/heap_audit.cb failed to import; cannot instrument main.",
+    "hidesvirtualmethodarg0arg1addoverride": "hides virtual method '{0}.{1}'; add override",
     "hintarg0": "hint: {0}",
     "implicitinttoboolcon...akenarrowingexplicite9917fc29c162ecc": "implicit int-to-bool conversion on return - use '!= 0' to make narrowing explicit",
     "importarg0winrtmetad...ifconstwindowsimport89defcf988c01580": "import '{0}': WinRT metadata (.winmd) is only supported when targeting Windows. WinMD/WinRT is a Windows-only feature; guard the import with 'if const (__WINDOWS__) {{ import \"...\"; }}'.",
@@ -1875,16 +1948,22 @@
     "interfacearg0hasnomethodarg1": "interface '{0}' has no method '{1}'",
     "invalidtypespellingarg0": "invalid type spelling '{0}'",
     "invalidtypespellingarg0usearg1": "invalid type spelling '{0}': use '{1}'",
+    "ismarkedoverridebutarg0arg1isnotvirtual": "is marked override but '{0}.{1}' is not virtual",
+    "ismarkedoverridebutb...rtualmethodnamedarg1c72e2c34c8bba5bc": "is marked override but base '{0}' has no virtual method named {1}",
     "longdoubleisonlyusab...mentusedoubleincflat12f0254a32d5afe4": "'long double' is only usable as a C++ template argument; use 'double' in CFlat",
+    "memberarg0ofcclassarg1isprotected": "member '{0}' of C++ class '{1}' is protected",
     "mismatchedinputarg0expectingarg1": "mismatched input {0} expecting {1}",
     "missingarg0atarg1": "missing {0} at {1}",
     "missingatendofstatement": "missing ';' at end of statement",
+    "multiplebasesarenotsupportedyet": "multiple bases are not supported yet",
     "namedargumentarg0doe...notmatchanyparameter54ee4c123914315f": "named argument '{0}' does not match any parameter",
     "noarg0compilerdriver...dtolinktheexecutable11639c2d0b9f1811": "no {0} compiler driver found to link the executable.",
     "noarg0compilerdriver...pilenativesourcearg16740382ea0548b90": "no {0} compiler driver found - cannot compile native source '{1}'.",
     "nomethodofarg0arg1ma...hegivenargumentsarg2a415477190242074": "no method of '{0}.{1}' matches the given arguments{2}",
     "nooverloadofinterfac...rgumentsexpectedarg3d19ec88ba7eb04a1": "no overload of interface method '{0}.{1}' takes {2} argument(s); expected {3}",
     "noviablealternativeatinputarg0": "no viable alternative at input {0}",
+    "overrideisonlyvalidi...acppstructwithacbasee727ca8dc9a88350": "'override' is only valid in a [cpp] struct with a C++ base",
+    "overridesarg0arg1whichisfinal": "overrides '{0}.{1}' which is final",
     "parameterarg0cannotp...toftheirsourcesscope0c92f2fcfe931fdb": "parameter '{0}': cannot pass bonded value to '{1}' parameter - bonded values cannot be transferred out of their source's scope",
     "parameterarg0ofarg1i...smoveargoratemporarydf5863f826e239c2": "parameter '{0}' of '{1}' is an rvalue reference; pass 'move <arg>' or a temporary",
     "programdefinitionsrequireatrailing": "program definitions require a trailing ';'",
@@ -1909,6 +1988,7 @@
     "unknownparentinterfacearg0": "unknown parent interface: '{0}'",
     "unknowntypearg0": "unknown type '{0}'",
     "unusedimportarg0": "unused import '{0}'",
+    "virtualisnotacflatke...sdeducedfromthecbase2687475741f225d0": "'virtual' is not a CFlat keyword; virtual-ness is deduced from the C++ base",
     "windowssdkvisualstud...ationbutwerenotfound94074d79622a7b60": "Windows SDK / Visual Studio build tools are required for this build configuration but were not found.",
     "winrtarg0arg1returns...unkdoesnotsupportyet6980a2c1fe3cfc1f": "[winrt] '{0}::{1}' returns a struct via the sret ABI, which the WinRT thunk does not support yet",
     "winrtarg0arg1sugarne...tantiatedimportcomcb9be3328c7b2b468d": "[winrt] '{0}::{1}' sugar needs HResult<{2}> instantiated (import \"com.cb\")",

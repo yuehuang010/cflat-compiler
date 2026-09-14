@@ -1,0 +1,9 @@
+import cpp "cpp_interop_poly.h";
+
+expect_error("does not override pure virtual method 'cpppoly.Guarded.hidden'") {
+    struct G : cpppoly.Guarded
+    {
+    };
+}
+
+extern int main() { return 0; }

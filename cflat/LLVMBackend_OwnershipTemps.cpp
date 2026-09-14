@@ -3547,6 +3547,13 @@ void LLVMBackend::RegisterOwnedStructTemp(llvm::Value* alloca, const std::string
         pendingOwnedStructTemps.push_back({ alloca, typeName, builder->GetInsertBlock() });
     }
 
+void LLVMBackend::UnregisterOwnedStructTemp(llvm::Value* value)
+{
+        if (value == nullptr) return;
+        std::erase_if(pendingOwnedStructTemps,
+            [&](const PendingOwnedStructTemp& e) { return e.Alloca == value; });
+    }
+
 void LLVMBackend::FlushOwnedStructTemps()
 {
         if (pendingOwnedStructTemps.empty()) return;

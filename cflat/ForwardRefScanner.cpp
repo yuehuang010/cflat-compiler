@@ -93,13 +93,15 @@ LLVMBackend::DeclTypeAndValue ForwardRefScanner::ParseDeclarationSpecifiers(CFla
                     auto* declSpecWithSuffix = LastDeclarationTypeSpecifier(
                         declSpecs->declarationSpecifier());
                     if (declSpecWithSuffix == nullptr) declSpecWithSuffix = declSpec;
-                    // 'move', 'adopt', 'alias', 'bond', 'unique' and 'manifest' are soft keywords parsed as Identifiers
+                    // Soft keywords are parsed as Identifiers in typeSpecifier context.
                     // in typeSpecifier context
                     if (typeSpec->getText() == "move")
                     {
                         declType.IsMove = true;
                         continue;  // not a type; look for the actual type in next specifier
                     }
+                    if (typeSpec->getText() == "virtual" || typeSpec->getText() == "override")
+                        continue;  // validated by the main pass at the member function site
                     if (typeSpec->getText() == "adopt")
                     {
                         declType.IsAdopt = true;

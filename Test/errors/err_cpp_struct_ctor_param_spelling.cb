@@ -1,0 +1,8 @@
+expect_error("constructor parameter 'function<void()>' has no C++ spelling") {
+    [cpp] struct Bad
+    {
+        Bad(function<void()> callback) { }
+    };
+}
+
+extern int main() { return 0; }

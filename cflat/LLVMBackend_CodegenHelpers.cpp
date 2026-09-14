@@ -1156,7 +1156,11 @@ llvm::Function* LLVMBackend::GetOrCreateFullDestructor(const std::string& typeNa
          * nontrivial member has a nontrivial destructor), so a null answer is correct too.
          */
         if (IsCxxRecord(typeName))
+        {
+            if (generatedCxxRecords_.contains(typeName) && dsIt->second.Destructor == nullptr)
+                LogErrorMessage("generated C++ struct '{}' has no bound destructor", { typeName });
             return dsIt->second.Destructor;
+        }
 
         // C++-style raw union semantics: the union has no hidden active-member tag, so the
         // compiler cannot safely synthesize member destruction. Only an explicitly written
@@ -1277,6 +1281,50 @@ llvm::Function* LLVMBackend::GetOrCreateFullDestructor(const std::string& typeNa
         b.CreateRetVoid();
         return fn;
     }
+
+void LLVMBackend::EmitCflatOwnedFieldsDestruction(llvm::IRBuilder<>& b,
+                                                   const std::string& typeName,
+                                                   llvm::Value* self)
+{
+        auto dsIt = dataStructures.find(typeName);
+        if (dsIt == dataStructures.end() || dsIt->second.StructType == nullptr || self == nullptr)
+            return;
+        llvm::StructType* structTy = dsIt->second.StructType;
+        for (unsigned i = 0; i < dsIt->second.StructFields.size(); ++i)
+        {
+            const auto& f = dsIt->second.StructFields[i];
+            if (!f.IsCflatOwned || f.IsAlias || f.IsPadding || f.IsBitfield) continue;
+            auto* fieldPtr = b.CreateStructGEP(structTy, self, i, "cflat_field");
+            auto* fieldTy = structTy->getElementType(i);
+            if (f.IsUnique && f.Pointer && !f.ElemPointer && !f.IsArrayView
+                && f.ConstArraySize == 0)
+            {
+                EmitUniqueFieldDelete(b, fieldPtr, GetFullDestructorForDelete(f.TypeName));
+                continue;
+            }
+            if (f.IsUnique && f.IsFatInterfaceValue() && f.ConstArraySize == 0)
+            {
+                EmitUniqueInterfaceFieldRelease(b, fieldPtr, f.TypeName);
+                continue;
+            }
+            if (f.IsUnique && f.ConstArraySize > 0 && !f.ElemPointer
+                && !f.IsArrayView && f.ConstInnerDimensions.empty())
+            {
+                EmitUniqueArrayFieldRelease(b, fieldPtr, fieldTy, f.TypeName,
+                                            f.IsFatInterfaceValue(), f.AllocAlignValue);
+                continue;
+            }
+            if (f.Pointer || f.ElemPointer || f.IsArrayView || f.IsSimd) continue;
+            if (f.ConstArraySize > 0)
+            {
+                if (auto* dtor = GetOrCreateFullDestructor(f.TypeName))
+                    EmitFullDestructorOverStorage(b, fieldPtr, fieldTy, dtor);
+                continue;
+            }
+            if (auto* dtor = GetOrCreateFullDestructor(f.TypeName))
+                EmitFullDestructorOverStorage(b, fieldPtr, fieldTy, dtor);
+        }
+}
 
 llvm::Function* LLVMBackend::GetFullDestructorForDelete(const std::string& typeName)
 {

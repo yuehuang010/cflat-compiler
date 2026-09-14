@@ -1,0 +1,11 @@
+expect_error("generic [cpp] struct is not supported yet") {
+    [cpp] struct BadCpp<T>
+    {
+        T value = default;
+    };
+}
+
+extern int main()
+{
+    return 0;
+}

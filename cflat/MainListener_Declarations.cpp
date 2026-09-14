@@ -550,6 +550,22 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
         bool hasUniqueSpecifier = false;
         std::string typeName;
         auto declSpecList = declSpecs->declarationSpecifier();
+        const bool isFunctionReturn = dynamic_cast<CFlatParser::FunctionDefinitionContext*>(
+            declSpecs->parent) != nullptr;
+        if (!isFunctionReturn)
+        {
+            for (auto* declSpec : declSpecList)
+            {
+                auto* typeSpec = declSpec->typeSpecifier();
+                if (typeSpec == nullptr) continue;
+                if (typeSpec->getText() == "override")
+                    Compiler(declSpecs)->LogErrorMessage("{}", {
+                        "'override' is only valid on a member function of a [cpp] struct" });
+                else if (typeSpec->getText() == "virtual")
+                    Compiler(declSpecs)->LogErrorMessage("{}", {
+                        "'virtual' is not a CFlat keyword; virtual-ness is deduced from the C++ base" });
+            }
+        }
         // Reject `T[][]` / `T[][M]` / `T[N][]` before any branch consumes the brackets - every
         // branch below drops the empty pairs and would silently parse a narrower type.
         for (auto declSpec : declSpecList)
@@ -613,13 +629,15 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                 // Set when the spec names a generic interface instantiation, whose interfaceTable
                 // entry is only built by the next ProcessPendingInstantiations.
                 bool genericSpecIsInterface = false;
-                // 'move', 'adopt', 'alias', 'bond', 'unique' and 'manifest' are soft keywords parsed as Identifiers
+                // Soft keywords are parsed as Identifiers in typeSpecifier context.
                 // in typeSpecifier context
                 if (typeSpec->getText() == "move")
                 {
                     declType.IsMove = true;
                     continue;  // not a type; look for the actual type in next specifier
                 }
+                if (typeSpec->getText() == "virtual" || typeSpec->getText() == "override")
+                    continue;  // validated by the member function site
                 if (typeSpec->getText() == "adopt")
                 {
                     declType.IsAdopt = true;
@@ -1747,6 +1765,18 @@ llvm::Value* MainListener::GenerateDefaultValue(const LLVMBackend::DeclTypeAndVa
         if (!resolved.Pointer && llvmType->isStructTy())
         {
             auto structData = compiler->GetDataStructure(resolved.TypeName);
+            if (compiler->IsForeignCxxClassWithConstructors(resolved.TypeName) && !global_scope)
+            {
+                std::string ctorError;
+                compiler->TryBindCxxImplicitDefaultCtor(resolved.TypeName, ctorError);
+                const auto* ctor = compiler->FindCxxDefaultCtor(resolved.TypeName);
+                if (ctor != nullptr)
+                {
+                    auto* slot = compiler->AllocaAtEntry(llvmType, nullptr, "cxxfielddefault");
+                    if (compiler->EmitCxxStructorCall(resolved.TypeName, *ctor, slot, {}))
+                        return compiler->CreateLoad(llvmType, slot);
+                }
+            }
             // forceRoot: the guards above are EXACT-key lookups, so the default ctor must be the
             // one of that exact type - a namespace walk here would call a same-named sibling's.
             if (structData.StructType != nullptr && compiler->GetFunction(resolved.TypeName))
@@ -2773,6 +2803,18 @@ void MainListener::ParseFunctionDefinition(CFlatParser::FunctionDefinitionContex
         auto name = nameOverride.empty() ? ::getFunctionName(func, compiler) : nameOverride;
         if (!namespaceName.empty())
             name = namespaceName + "." + name;
+        std::string cppStructBase;
+        const bool cppDerivedContext = !structName.empty()
+            && compiler->HasTypeAnnotation(structName, "cpp")
+            && compiler->GetCppStructBase(structName, cppStructBase);
+        const bool cppOverrideContext = cppDerivedContext;
+        if (HasSoftDeclarationSpecifier(func->declarationSpecifiers(), "virtual"))
+            Compiler(func)->LogErrorMessage(
+                "'virtual' is not a CFlat keyword; virtual-ness is deduced from the C++ base");
+        if (HasSoftDeclarationSpecifier(func->declarationSpecifiers(), "override")
+            && !cppOverrideContext)
+            Compiler(func)->LogErrorMessage(
+                "'override' is only valid in a [cpp] struct with a C++ base");
         if (name == "operator()" && structName.empty())
         {
             LogErrorContext(func, "'operator()' must be declared as a struct member");
@@ -2992,6 +3034,8 @@ void MainListener::ParseFunctionDefinition(CFlatParser::FunctionDefinitionContex
         // RAII: a LogError inside the body throws on the batch/LSP paths, and a skipped restore
         // would steer the next file's generic-template resolution.
         LLVMBackend::NamespaceScope nsScope(compiler, bodyNamespace.empty() ? namespaceName : bodyNamespace);
+        LLVMBackend::CppStructAccessScope cppStructAccessScope(
+            compiler, cppDerivedContext ? structName : std::string());
 
         // A body abandoned by a FILE-SCOPE scoped expect_error unwinds past the function-depth
         // catch below (that one only handles the bare-semicolon form), so its partial null-state
@@ -3140,6 +3184,21 @@ void MainListener::ParseFunctionDefinition(CFlatParser::FunctionDefinitionContex
                     sym.ReturnsAlias = returnType.IsAlias;
                     break;
                 }
+            }
+            if (cppOverrideContext
+                && HasSoftDeclarationSpecifier(func->declarationSpecifiers(), "override"))
+            {
+                std::vector<LLVMBackend::TypeAndValue> overrideParams;
+                const size_t firstUserParam = structName.empty() ? 0 : 1;
+                overrideParams.reserve(params.size() - firstUserParam);
+                for (size_t i = firstUserParam; i < params.size(); ++i)
+                    overrideParams.push_back(params[i]);
+                const std::string overrideMethodName = ::getFunctionName(func);
+                if (compiler->EmitCppStructOverrideThunk(
+                        fn, structName, overrideMethodName, overrideParams) == nullptr)
+                    Compiler(func)->LogErrorMessage(
+                        "could not emit the C++ override thunk for '{}.{}'",
+                        { structName, overrideMethodName });
             }
         }
 
@@ -4049,6 +4108,16 @@ cxx_dtor_ready:
                 compiler->EmitCxxCopyOrMoveConstruct(typeName, slot, compiler->lastCxxRetTemp_,
                                                      /*useMove*/ true,
                                                      std::format("into local '{}'", name).c_str());
+                return true;
+            }
+            const bool sameCflatValue = rightNV.TypeAndValue.TypeName == typeName
+                && !rightNV.TypeAndValue.Pointer && rightNV.Primary != nullptr
+                && rightNV.Primary->getType() == slot->getAllocatedType();
+            if (sameCflatValue)
+            {
+                // A CFlat function returning this value type already returned the complete
+                // CFlat representation; adopt it without asking the generated C++ class to copy.
+                compiler->builder->CreateStore(rightNV.Primary, slot);
                 return true;
             }
             if (sameType)

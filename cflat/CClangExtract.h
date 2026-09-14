@@ -228,6 +228,8 @@ namespace cflat_cinterop
         bool isCopyAssign = false;
         bool isMoveAssign = false;
         bool isPureVirtual = false;
+        bool isOverride = false;
+        bool isFinal = false;
         // A CXXConversionDecl (`operator int`, `explicit operator double`, `operator bool`).
         // Its CFlat registration name is "operator <CFlat spelling of retType>", which only the
         // backend's C-to-CFlat type map can produce, so the flag - not the name - travels here.

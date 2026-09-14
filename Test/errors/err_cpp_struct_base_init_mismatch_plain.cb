@@ -1,0 +1,10 @@
+import cpp "cpp_interop_poly.h";
+
+expect_error("base initializer names 'cpppoly.Shape' but the base class is 'cpppoly.Tagged'") {
+    struct Bad : cpppoly.Tagged
+    {
+        Bad(int value) : cpppoly.Shape() { }
+    };
+}
+
+extern int main() { return 0; }

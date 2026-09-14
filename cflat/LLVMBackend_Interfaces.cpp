@@ -749,17 +749,33 @@ llvm::Function* LLVMBackend::GetOrCreateCAbiFunctionThunk(const FunctionSymbol& 
     }
 
 llvm::Function* LLVMBackend::GetOrCreateReverseAbiFunctionThunk(
-    llvm::Function* original, const CxxFunctionPointerAbiPlan& plan)
+    llvm::Function* original, const CxxFunctionPointerAbiPlan& plan,
+    const std::string& stableName, bool externalLinkage)
 {
-        std::string key = "__cflat_reverse_abi_" + original->getName().str() + "_"
-                        + FunctionPointerAbiKey(plan.ret, plan.params);
+        std::string key = stableName.empty()
+            ? "__cflat_reverse_abi_" + original->getName().str() + "_"
+                + FunctionPointerAbiKey(plan.ret, plan.params)
+            : stableName;
+        auto* loweredTy = BuildExternFunctionType(plan.ret, plan.params, false, plan.recipe);
         for (char& c : key)
             if (!std::isalnum((unsigned char)c)) c = '_';
-        if (auto* existing = module->getFunction(key)) return existing;
-
-        auto* loweredTy = BuildExternFunctionType(plan.ret, plan.params, false, plan.recipe);
-        auto* thunk = llvm::Function::Create(loweredTy, llvm::Function::InternalLinkage,
-                                             key, *module);
+        llvm::Function* thunk = module->getFunction(key);
+        if (thunk != nullptr)
+        {
+            if (!thunk->isDeclaration()) return thunk;
+            if (thunk->getFunctionType() != loweredTy)
+            {
+                LogErrorMessage("reverse ABI thunk declaration has a mismatched function type");
+                return nullptr;
+            }
+        }
+        else
+        {
+            thunk = llvm::Function::Create(loweredTy,
+                                           externalLinkage ? llvm::Function::ExternalLinkage
+                                                           : llvm::Function::InternalLinkage,
+                                           key, *module);
+        }
         thunk->addFnAttr(llvm::Attribute::NoUnwind);
         ApplyAbiAttributes(thunk, plan.recipe);
 

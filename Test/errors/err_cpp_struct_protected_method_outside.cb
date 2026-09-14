@@ -1,0 +1,10 @@
+import cpp "cpp_interop_poly.h";
+
+extern int main()
+{
+    cpppoly.Tagged t = cpppoly.Tagged(3);
+    expect_error("member 'prot_get' of C++ class 'cpppoly.Tagged' is protected") {
+        int value = t.prot_get();
+    }
+    return 0;
+}

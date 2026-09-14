@@ -1590,6 +1590,9 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
         compiler->FlushOwnedClosureTemps();
         // Owning temp whose field was extracted in the return expr (returning an OWNING
         // field is rejected upstream, so this never frees a buffer the caller now owns).
+        compiler->UnregisterOwnedStructTemp(returnNV.Storage);
+        if (returnNV.Primary == compiler->lastCxxRetValue_)
+            compiler->UnregisterOwnedStructTemp(compiler->lastCxxRetTemp_);
         compiler->FlushOwnedStructTemps();
         // Borrow returns: hand the caller a non-owning copy (see the classification
         // above). Done after the temp-flush so the unregister logic above still sees

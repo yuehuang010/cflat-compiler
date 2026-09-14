@@ -1,0 +1,12 @@
+interface LocalIface
+{
+    int value();
+};
+
+expect_error("base 'LocalIface' of struct 'Bad' is not a C++ class") {
+    struct Bad : LocalIface
+    {
+    };
+}
+
+extern int main() { return 0; }

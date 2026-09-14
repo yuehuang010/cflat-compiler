@@ -19,6 +19,11 @@ namespace cpppoly
     int Shape::area() const noexcept { return 0; }
     int Shape::plain() const noexcept { return tag + 100; }
 
+    int call_area(const Shape* s) noexcept { return s->area(); }
+    int call_area_ref(const Shape& s) noexcept { return s.area(); }
+    int call_plain(const Shape* s) noexcept { return s->plain(); }
+    unsigned long long sizeof_shape() noexcept { return sizeof(Shape); }
+
     Circle::Circle() noexcept { tag = 2; radius = 5; }
     Circle::~Circle() noexcept { ++g_circle_dtors; }
     int Circle::area() const noexcept { return radius * 10; }
@@ -61,6 +66,35 @@ namespace cpppoly
     void destroy_qual(QualNames* p) noexcept { delete p; }
 
     Abstract::~Abstract() noexcept {}
+
+    Unspellable::~Unspellable() noexcept {}
+
+    Tagged::Tagged(int t) noexcept { tag = t; prot = t * 10; }
+    Tagged::~Tagged() noexcept {}
+    int Tagged::get() const noexcept { return tag; }
+    int Tagged::prot_get() const noexcept { return prot; }
+    int call_get(const Tagged* t) noexcept { return t->get(); }
+    int call_pure(const Abstract* a) noexcept { return a->pure(); }
+
+    Pinned::Pinned() noexcept {}
+    Pinned::~Pinned() noexcept {}
+    int Pinned::v() const noexcept { return 17; }
+    int call_v(const Pinned* p) noexcept { return p->v(); }
+
+    Guarded::Guarded() noexcept {}
+    Guarded::~Guarded() noexcept {}
+    int call_hidden(const Guarded* g) noexcept { return g->probe(); }
+
+    Sealed::~Sealed() noexcept {}
+    int Sealed::f() const noexcept { return 7; }
+
+    Scaler::~Scaler() noexcept {}
+    double Scaler::scale(double x, int k) const noexcept { return x * k; }
+    const char* Scaler::label() const noexcept { return "base"; }
+    int Scaler::adjust(int x) noexcept { return x; }
+    double call_scale(const Scaler* s, double x, int k) noexcept { return s->scale(x, k); }
+    const char* call_label(const Scaler* s) noexcept { return s->label(); }
+    int call_adjust(Scaler* s, int x) noexcept { return s->adjust(x); }
 
     VBaseTop::~VBaseTop() noexcept {}
     int VBaseTop::t() const noexcept { return tv; }

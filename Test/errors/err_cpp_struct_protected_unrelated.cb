@@ -1,0 +1,17 @@
+import cpp "cpp_interop_poly.h";
+
+expect_error("field 'prot' of C++ class 'cpppoly.Tagged' is protected") {
+    struct Other : cpppoly.Shape
+    {
+        int read(cpppoly.Tagged* tagged) { return tagged.prot; }
+    };
+}
+
+expect_error("field 'prot' of C++ class 'cpppoly.Tagged' is protected") {
+    struct TaggedOther : cpppoly.Tagged
+    {
+        int read_other(cpppoly.Tagged* tagged) { return tagged.prot; }
+    };
+}
+
+extern int main() { return 0; }

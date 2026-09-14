@@ -1,6 +1,7 @@
 // unique<T>: single-owner smart pointer over a heap-allocated T, C++ unique_ptr style.
 // T is the POINTEE type: unique<Resource> owns a Resource*.
 annotation unique { };
+annotation cpp { };
 
 // ALIGN carries the OVER-alignment of the owned block, so `alignas(0, N) unique T*` is
 // `unique<T, N>`: the deallocator that matches the allocation is part of the type. 0 (and any

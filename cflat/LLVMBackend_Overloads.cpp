@@ -440,7 +440,7 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                     // A C++ lvalue reference is represented as an alias value in CFlat. A
                     // derived lvalue binds to a public base reference by a standard conversion;
                     // lower it from the derived object's storage with the base offset.
-                    else if (tmpParam.IsAlias && !tmpParam.Pointer && !tmpParam.ElemPointer
+                    else if (tmpParam.IsAlias && !tmpParam.ElemPointer
                              && IsCxxDerivedToBaseValue(tmpArg, tmpParam))
                         result = 1;
                     // M6 - a pointer to a C++ class binds to a parameter typed as a PUBLIC base
@@ -2587,11 +2587,19 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
             {
                 const TypeAndValue& pt = candidate.Parameters[i];
                 const TypeAndValue& at = matched[i].TypeAndValue;
-                if (!IsCxxDerivedToBasePointer(at, pt)) continue;
                 uint64_t off = 0;
                 bool inaccessible = false;
-                if (FindCxxBaseOffset(at.TypeName, pt.TypeName, off, inaccessible))
+                if (IsCxxDerivedToBasePointer(at, pt))
+                {
+                    if (FindCxxBaseOffset(at.TypeName, pt.TypeName, off, inaccessible))
+                        argList[i] = EmitCxxBaseAdjust(argList[i], off);
+                }
+                else if (!at.Pointer && pt.IsAlias && pt.Pointer && !pt.ElemPointer
+                         && IsCxxDerivedToBaseValue(at, pt)
+                         && FindCxxBaseOffset(at.TypeName, pt.TypeName, off, inaccessible))
+                {
                     argList[i] = EmitCxxBaseAdjust(argList[i], off);
+                }
             }
             if (candidate.IsMethod && !argList.empty() && !candidate.Parameters.empty())
             {

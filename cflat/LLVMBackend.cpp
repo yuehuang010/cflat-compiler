@@ -4506,6 +4506,9 @@ void LLVMBackend::ResetForReanalysis()
     cxxCflatToCxxSpelling_.clear();
     cxxLazyAliasSpecializations_.clear();
     cxxForeignRequests_.clear();
+    generatedCxxRecords_.clear();
+    cppStructBases_.clear();
+    cppStructOverrideNames_.clear();
     cxxForeignDefinitions_.clear();
     // Per-analysis emitted IR: the next analysis re-adopts whatever its own imports produce (from
     // the extractor or the header cache). No Clang pointer is retained, only bitcode bytes.
@@ -6743,6 +6746,7 @@ static llvm::json::Object SerializeDtav(const DTAV& d)
     // written outside the bitfield block or they would not round-trip.
     if (d.IsBitfieldStorage) o["bfs"] = true;
     if (d.IsPadding)         o["pad"] = true;
+    if (d.IsCflatOwned)      o["cfo"] = true;
     if (d.UserAlignValue > 0) o["ua"] = static_cast<int64_t>(d.UserAlignValue);
     if (!d.Annotations.empty()) o["ann"] = SerializeAnnotations(d.Annotations);
     return o;
@@ -6764,6 +6768,7 @@ static DTAV DeserializeDtav(const llvm::json::Object& o)
     }
     if (auto v = o.getBoolean("bfs")) d.IsBitfieldStorage = *v;
     if (auto v = o.getBoolean("pad")) d.IsPadding = *v;
+    if (auto v = o.getBoolean("cfo")) d.IsCflatOwned = *v;
     if (auto v = o.getInteger("ua")) d.UserAlignValue = static_cast<uint64_t>(*v);
     d.Annotations = DeserializeAnnotations(o.getArray("ann"));
     return d;

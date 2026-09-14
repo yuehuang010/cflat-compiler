@@ -1337,6 +1337,9 @@ public:
         // True on the synthesized `__padN` ([N x i8]) slots from PadFieldsForAlignment. Not a
         // user-visible member: skipped by reflection, JSON, DWARF, dtor/copy and LSP field lists.
         bool IsPadding = false;
+        // A field spliced into a generated [cpp] struct's byte block. C++-owned base/vptr
+        // storage must never be visited by CFlat's field lifetime machinery.
+        bool IsCflatOwned = false;
 
         std::vector<AnnotationValue> Annotations;
     };
@@ -3212,6 +3215,16 @@ private:
     std::string* cxxAbiMismatchSink_ = nullptr;
     // CFlat name -> outcome of its one type request ("" = registered, else the diagnostic text).
     std::unordered_map<std::string, std::string> cxxForeignRequests_;
+    struct GeneratedCxxRecord
+    {
+        llvm::StructType* literalType = nullptr;
+        std::vector<DeclTypeAndValue> fields;
+        std::set<std::string> overrideNames;
+        std::string source;
+    };
+    // Temporary layout recipe used while RegisterCRecords replaces __cflat_fields with the
+    // original CFlat fields. It is populated before the generated class request is harvested.
+    std::unordered_map<std::string, GeneratedCxxRecord> generatedCxxRecords_;
     // A layout-only nested type may be upgraded later when CFlat calls one of its methods.
     std::unordered_set<std::string> cxxForeignDefinitions_;
     /*
@@ -4305,6 +4318,18 @@ private:
         NoCurrentFunctionScope& operator=(const NoCurrentFunctionScope&) = delete;
     };
 
+    struct CppStructAccessScope
+    {
+        LLVMBackend* backend_;
+        std::string saved_;
+        explicit CppStructAccessScope(LLVMBackend* backend, const std::string& structName)
+            : backend_(backend), saved_(backend->cppStructAccessContext_)
+        { backend_->cppStructAccessContext_ = structName; }
+        ~CppStructAccessScope() { backend_->cppStructAccessContext_ = saved_; }
+        CppStructAccessScope(const CppStructAccessScope&) = delete;
+        CppStructAccessScope& operator=(const CppStructAccessScope&) = delete;
+    };
+
     /*
      * Declares that every generic instantiation is drained, so an instantiated interface's
      * implementor set is final. RAII for the same reason as above - LogError THROWS out of the
@@ -4555,6 +4580,8 @@ private:
     // the end of the current full expression. The dtor takes a T*, so no spill is needed at flush.
     void RegisterOwnedStructTemp(llvm::Value* alloca, const std::string& typeName);
 
+    void UnregisterOwnedStructTemp(llvm::Value* value);
+
     void FlushOwnedStructTemps();
 
     // Free one unowned owning-pointer temp: null guard, full destructor, then the matching
@@ -4781,6 +4808,8 @@ private:
                                          const std::string& ifaceName);
 
     llvm::Function* GetOrCreateFullDestructor(const std::string& typeName);
+    void EmitCflatOwnedFieldsDestruction(llvm::IRBuilder<>& b, const std::string& typeName,
+                                         llvm::Value* self);
 
 
     // Resolve the destructor to call from a `delete` site. Differs from
@@ -5015,11 +5044,14 @@ private:
     bool RunCxxTypeRequests(const CxxRequestGroup& group,
                             const std::vector<CxxRequestItem>& items,
                             const std::string& extraSource, bool emitDefinitions,
-                            cflat_cinterop::ExtractResult& raw, std::string& error);
+                            cflat_cinterop::ExtractResult& raw, std::string& error,
+                            const std::string& prefixSource = {});
     // Cache identity of one C++ type request; see the definition for what it folds in.
     std::string CxxTypeRequestCacheKey(const CxxRequestGroup& group,
-                                       const std::string& cxxSpelling) const;
-    std::string CxxTypeRequestCacheKey(const CxxRequestGroup& group, const CxxRequestItem& item) const;
+                                       const std::string& cxxSpelling,
+                                       const std::string& extraSource = {}) const;
+    std::string CxxTypeRequestCacheKey(const CxxRequestGroup& group, const CxxRequestItem& item,
+                                       const std::string& extraSource = {}) const;
 
     // Import-group plumbing for the request layer.
     size_t FindOrAddCxxImportGroup(const std::vector<std::string>& headers,
@@ -5077,7 +5109,21 @@ private:
 
     bool RequestCxxForeignType(const std::string& cflatName, const std::string& cxxSpelling,
                                std::string& error, bool needDefinitions = true,
-                               bool explicitInstantiation = true, bool tentative = false);
+                               bool explicitInstantiation = true, bool tentative = false,
+                               const std::string& extraSource = {},
+                               const std::string& prefixSource = {});
+    bool RequestGeneratedCxxType(const std::string& cflatName,
+                                 const std::string& cxxSpelling,
+                                 const std::string& source,
+                                 llvm::StructType* literalType,
+                                 const std::vector<DeclTypeAndValue>& fields,
+                                 std::string& error,
+                                 size_t ownerGroup = static_cast<size_t>(-1),
+                                 const std::set<std::string>& overrideNames = {});
+    bool GetGeneratedCxxFieldBlock(const std::string& typeName, uint64_t& start,
+                                   uint64_t& length) const;
+    void RegisterGeneratedCxxOverrideNames(const std::string& typeName,
+                                           const std::set<std::string>& names);
     void RequestCxxMemberTypes(const std::vector<CRecordEntry>& records);
     void CollectCxxMemberRequestItems(const std::vector<CRecordEntry>& records,
                                       std::vector<CxxRequestItem>& out);
@@ -5873,7 +5919,9 @@ public:
     llvm::Function* GetOrCreateCAbiFunctionThunk(const FunctionSymbol& symbol,
                                                   const TypeAndValue& fpTV);
     llvm::Function* GetOrCreateReverseAbiFunctionThunk(llvm::Function* original,
-                                                       const CxxFunctionPointerAbiPlan& plan);
+                                                       const CxxFunctionPointerAbiPlan& plan,
+                                                       const std::string& stableName = {},
+                                                       bool externalLinkage = false);
 
     llvm::Value* WrapCFuncPtrAsFatStruct(llvm::Value* cFnPtrValue, const TypeAndValue& fpTV);
 
@@ -7320,6 +7368,7 @@ public:
     std::set<std::string> cxxTriviallyCopyableRecords_;
     std::set<std::string> cxxRecords_;
     std::map<std::string, std::string> cxxBindingRefusals_;
+    std::string cppStructAccessContext_;
 
     /*
      * Everything the CFlat side needs to know about an imported C++ class beyond its layout:
@@ -7391,6 +7440,15 @@ public:
             // Aligned with params (entry 0 is 'this'); a constant default lets the call omit it.
             std::vector<cflat_cinterop::RawDefaultArg> defaultArgs;
         };
+        struct Method
+        {
+            std::string ownerType;
+            cflat_cinterop::RawCxxMember raw;
+            bool spellable = true;
+            TypeAndValue ret;
+            std::vector<TypeAndValue> params;
+        };
+        std::vector<Method> directMethods;
         std::vector<Structor> constructors;
         bool hasDtor = false;
         Structor destructor;
@@ -7406,6 +7464,27 @@ public:
         auto it = cxxClasses_.find(typeName);
         return it == cxxClasses_.end() ? nullptr : &it->second;
     }
+    std::vector<CxxClassInfo::Method> FindCxxBaseMethods(const std::string& baseType,
+                                                         const std::string& methodName) const;
+    std::vector<CxxClassInfo::Method> FindCxxBaseVirtualMethods(
+        const std::string& baseType) const;
+    bool CxxBaseHasAccessibleMoveOrCopy(const std::string& baseType) const;
+    void RecordCppStructBase(const std::string& structName, const std::string& baseName);
+    void RegisterCppStructProtectedBaseMembers(const std::string& structName);
+    bool GetCppStructBase(const std::string& structName, std::string& baseName) const;
+    bool GetCxxTypeOwnerGroup(const std::string& typeName, size_t& group) const;
+    void RegisterCppStructOverrideName(const std::string& structName,
+                                       const std::string& methodName,
+                                       const std::vector<TypeAndValue>& params,
+                                       const std::string& stableName);
+    bool GetCppStructOverrideName(const std::string& structName,
+                                  const std::string& methodName,
+                                  const std::vector<TypeAndValue>& params,
+                                  std::string& stableName) const;
+    llvm::Function* EmitCppStructOverrideThunk(llvm::Function* original,
+                                                const std::string& structName,
+                                                const std::string& methodName,
+                                                const std::vector<TypeAndValue>& params);
     bool IsCxxRecord(const std::string& typeName) const { return cxxRecords_.count(typeName) != 0; }
     // A C++ alias of a specialization that is still unrequested (`c10.IntArrayRef` before any use).
     bool IsCxxLazyAliasSpecialization(const std::string& name) const
@@ -7496,7 +7575,10 @@ public:
      * RegisterCxxClassMembers refused, so the diagnostic says why instead of "unknown identifier".
      * Returns true when it reported; a name the class does not have is left alone.
      */
-    bool RejectInaccessibleCxxMember(const std::string& typeName, const std::string& memberName);
+    bool RejectInaccessibleCxxMember(const std::string& typeName, const std::string& memberName,
+                                     bool accessedThroughCurrentObject = false);
+    bool CxxProtectedAccessAllowed(const std::string& typeName,
+                                   bool accessedThroughCurrentObject) const;
 
     /*
      * M4b - foreign NONTRIVIAL C++ class lifetime.
@@ -7651,6 +7733,8 @@ public:
     llvm::Value* lastCxxRetValue_ = nullptr;
     // Imported C++ classes, keyed by the CFlat dotted type name.
     std::map<std::string, CxxClassInfo> cxxClasses_;
+    std::unordered_map<std::string, std::string> cppStructBases_;
+    std::map<std::string, std::string> cppStructOverrideNames_;
     // Retained extractor records let a refused member be rebound when its specialization is used.
     std::map<std::string, CRecordEntry> cxxRecordEntries_;
     // Register the callable surface of one imported C++ class: instance methods, static methods,

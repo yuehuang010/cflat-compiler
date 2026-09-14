@@ -1,0 +1,8 @@
+expect_error("'override' is only valid in a [cpp] struct with a C++ base") {
+    [cpp] struct OverrideBad
+    {
+        override int value() { return 1; }
+    };
+}
+
+extern int main() { return 0; }

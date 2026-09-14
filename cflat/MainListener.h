@@ -307,7 +307,8 @@ static bool CanonicalizePrimitiveTypeWords(const std::vector<std::string>& words
 static bool IsSoftKeywordTypeSpecifier(const std::string& text)
 {
     return text == "move" || text == "adopt" || text == "alias" || text == "bond"
-        || text == "unique" || text == "manifest" || text == "application";
+        || text == "unique" || text == "manifest" || text == "application"
+        || text == "virtual" || text == "override";
 }
 
 static std::vector<std::string> CollectDeclarationTypeSpecifierWords(
@@ -1559,10 +1560,10 @@ static std::vector<Result*> MemberFilter(const std::vector<Member*>& members, Ge
     template <typename TCtx> auto MemberClassDefinitions(TCtx* ctx)    { return MemberFilter<CFlatParser::ClassDefinitionContext>     (ResolveAggregateMembers(ctx), [](auto* m){ return m->classDefinition();      }); } \
     template <typename TCtx> auto MemberLockFieldGroups(TCtx* ctx)     { return MemberFilter<CFlatParser::LockFieldGroupContext>      (ResolveAggregateMembers(ctx), [](auto* m){ return m->lockFieldGroup();       }); }
 
-// Base-clause interface identifiers of a class definition. Only `classDefinition` carries a base
-// clause in the grammar, so the struct overload answers empty and keeps the scan templated.
+// Base-clause identifiers of a class or struct definition. Struct bases are recorded by the scan
+// and consumed by the C++-class path when that feature is enabled.
 inline std::vector<CFlatParser::BaseSpecifierContext*> BaseClauseIdentifiers(CFlatParser::ClassDefinitionContext* ctx) { return ctx->baseSpecifier(); }
-inline std::vector<CFlatParser::BaseSpecifierContext*> BaseClauseIdentifiers(CFlatParser::StructDefinitionContext*)    { return {}; }
+inline std::vector<CFlatParser::BaseSpecifierContext*> BaseClauseIdentifiers(CFlatParser::StructDefinitionContext* ctx) { return ctx->baseSpecifier(); }
 
 // The dotted name a base-clause entry spells, without its generic type arguments:
 // `IS` -> "IS", `shapes.IS` -> "shapes.IS". Empty when the entry has no identifier.
@@ -2834,12 +2835,42 @@ void ScanInterfaceDefinition(CFlatParser::InterfaceDefinitionContext* ctx,
         std::string typeName = baseTypeName;
         if (!namespaceName.empty())
             typeName = namespaceName + "." + typeName;
+        const auto rawAnnotations = ExtractAnnotations(ctx->annotationList());
+        const bool isStructDefinition = dynamic_cast<CFlatParser::StructDefinitionContext*>(ctx) != nullptr;
+        const auto baseClauses = BaseClauseIdentifiers(ctx);
+        const bool isCppStruct = isStructDefinition
+            && std::any_of(rawAnnotations.begin(), rawAnnotations.end(),
+                           [](const auto& ann) { return ann.Name == "cpp"; })
+            || (isStructDefinition && !baseClauses.empty());
+
+        if (isStructDefinition && !baseClauses.empty())
+        {
+            if (baseClauses.size() == 1)
+            {
+                auto* base = baseClauses[0];
+                std::string baseName = BaseSpecifierName(base);
+                std::string baseIdentity = baseName;
+                if (auto* generic = base->genericTypeParameters())
+                {
+                    baseName = compiler->ResolveGenericBaseAlias(baseName);
+                    std::vector<std::string> typeArgs;
+                    for (auto* entry : generic->typeParameterList()->typeParameterEntry())
+                        typeArgs.push_back(ResolveForwardTypeArg(entry));
+                    baseIdentity = MangleGenericInstance(*compiler, baseName, typeArgs);
+                    std::string cxxError;
+                    compiler->TryRequestCxxType(baseName, typeArgs, baseIdentity, cxxError);
+                }
+                compiler->RecordCppStructBase(typeName, baseIdentity);
+            }
+        }
 
         // Record the declared interface list before any codegen, so a conversion site can see
         // implementors declared LATER in the file. Static-check only - see scannedInterfaceImpls.
         {
             std::vector<std::string> scannedIfaces;
-            for (auto* spec : BaseClauseIdentifiers(ctx))
+            for (auto* spec : (isStructDefinition && !baseClauses.empty()
+                               ? std::vector<CFlatParser::BaseSpecifierContext*>{}
+                               : baseClauses))
             {
                 std::string ifaceBaseName = BaseSpecifierName(spec);
                 if (ifaceBaseName.empty()) continue;
@@ -2879,9 +2910,10 @@ void ScanInterfaceDefinition(CFlatParser::InterfaceDefinitionContext* ctx,
                             keyword + " " + displayTypeName, {}, doc, displayTypeName);
         }
 
-        // Pre-declare default constructor
+        // C++ struct constructors are emitted as external thunks after the class request.
         LLVMBackend::TypeAndValue returnType{ .TypeName = typeName };
-        compiler->CreateFunctionDeclaration(typeName, returnType, {});
+        if (!isCppStruct)
+            compiler->CreateFunctionDeclaration(typeName, returnType, {});
 
         LLVMBackend::AliasScopeGuard aliasScope(compiler);
         ScanAggregateAliases(ctx->aggregateMember());
@@ -2919,6 +2951,7 @@ void ScanInterfaceDefinition(CFlatParser::InterfaceDefinitionContext* ctx,
                 }
                 seenCtorSignatures[ctorKey] = func->getStart()->getLine();
 
+                if (isCppStruct) continue;
                 if (func->parameterTypeList() == nullptr) continue; // no-arg already declared above
                 compiler->CreateFunctionDeclaration(typeName, returnType, allCtorParams);
             }
@@ -2931,6 +2964,7 @@ void ScanInterfaceDefinition(CFlatParser::InterfaceDefinitionContext* ctx,
         // Pre-declare destructor
         for (auto dtor : MemberDestructorDefinitions(ctx))
         {
+            if (isCppStruct) continue;
             LLVMBackend::DeclTypeAndValue thisParam;
             thisParam.TypeName = typeName;
             thisParam.VariableName = typeName + "__";
@@ -6551,7 +6585,17 @@ public:
         const std::vector<std::string>& valueParams,
         const std::vector<std::string>& typeArgs);
 
-    void ParseConstructorDefinition(CFlatParser::FunctionDefinitionContext* func, const std::string& structName, bool suppliesNoArgCtor = false);
+    void ParseConstructorDefinition(CFlatParser::FunctionDefinitionContext* func, const std::string& structName,
+                                    bool suppliesNoArgCtor = false, size_t cppCtorIndex = SIZE_MAX);
+    void EmitCppStructConstructorThunk(antlr4::ParserRuleContext* ctx,
+                                       CFlatParser::BlockItemListContext* body,
+                                       const std::string& structName,
+                                       const std::vector<LLVMBackend::DeclTypeAndValue>& fields,
+                                       const std::vector<LLVMBackend::DeclTypeAndValue>& params,
+                                       size_t ctorIndex);
+    void EmitCppStructDestructorThunk(antlr4::ParserRuleContext* ctx,
+                                      const std::string& structName);
+    void EmitCppStructMoveThunk(antlr4::ParserRuleContext* ctx, const std::string& structName);
 
     void ParseDestructorDefinition(CFlatParser::DestructorDefinitionContext* ctx, const std::string& structName);
 

@@ -2095,6 +2095,8 @@ nlohmann::json LLVMBackend::CxxMemberToJson(const cflat_cinterop::RawCxxMember& 
         if (m.isCopyAssign)         j["ca"] = true;
         if (m.isMoveAssign)         j["ma"] = true;
         if (m.isPureVirtual)        j["pv"] = true;
+        if (m.isOverride)           j["ov"] = true;
+        if (m.isFinal)              j["fi"] = true;
         if (m.isConversion)         j["cvn"] = true;
         if (m.covariantReturnNeedsAdjust) j["cra"] = true;
         // M6 - the vtable slots. A warm cache that dropped these would re-register a virtual
@@ -2142,6 +2144,8 @@ cflat_cinterop::RawCxxMember LLVMBackend::CxxMemberFromJson(const SjVal& j)
         m.isCopyAssign         = j.value("ca", false);
         m.isMoveAssign         = j.value("ma", false);
         m.isPureVirtual        = j.value("pv", false);
+        m.isOverride           = j.value("ov", false);
+        m.isFinal              = j.value("fi", false);
         m.isConversion         = j.value("cvn", false);
         m.covariantReturnNeedsAdjust = j.value("cra", false);
         m.vtableIndex          = j.value("vti", -1);
@@ -2509,7 +2513,8 @@ bool LLVMBackend::TryLoadCHeaderDiskCache(
         // v53: invalidated entries and no-bitcode rewrites remove stale companion sidecars.
         // v54: extractor and backend share one C++ foreign identity spelling.
         // v55: all canonical multi-word C++ primitive spellings share their CFlat identity.
-        if (version != 55) return cacheMiss();
+        // v56: C++ members retain explicit override/final attributes for CFlat-derived classes.
+        if (version != 56) return cacheMiss();
 
         // Accept on mtime match (fast) or content hash match (authoritative on mtime drift).
         auto storedMtime = j.value("mtime", int64_t{-1});
@@ -2613,7 +2618,7 @@ void LLVMBackend::WriteCHeaderDiskCache(
         if (ec) return;
 
         nlohmann::json j;
-        j["version"] = 55;
+        j["version"] = 56;
         j["mtime"]   = (int64_t)mtime.time_since_epoch().count();
         j["hash"]    = contentHash;
         j["ldw"]     = entry.longDoubleWidth;

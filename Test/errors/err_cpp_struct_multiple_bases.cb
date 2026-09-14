@@ -1,0 +1,9 @@
+import cpp "cpp_interop_poly.h";
+
+expect_error("multiple bases are not supported yet") {
+    struct Bad : cpppoly.Shape, cpppoly.Tagged
+    {
+    };
+}
+
+extern int main() { return 0; }

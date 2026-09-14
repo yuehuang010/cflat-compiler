@@ -1,0 +1,11 @@
+expect_error("base initializer is only valid in a [cpp] struct") {
+    struct PlainBaseInit
+    {
+        PlainBaseInit() : MissingBase() { }
+    };
+}
+
+extern int main()
+{
+    return 0;
+}

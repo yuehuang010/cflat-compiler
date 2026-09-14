@@ -1,0 +1,5 @@
+expect_error("'virtual' is not a CFlat keyword; virtual-ness is deduced from the C++ base") {
+    virtual int value = 1;
+}
+
+extern int main() { return 0; }

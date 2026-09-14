@@ -1588,6 +1588,8 @@ namespace cflat_cinterop
                     m.isConst = !md->isStatic() && md->isConst();
                     m.isVirtual = md->isVirtual();
                     m.isPureVirtual = md->isPureVirtual();
+                    m.isOverride = md->hasAttr<OverrideAttr>();
+                    m.isFinal = md->hasAttr<FinalAttr>();
                     /*
                      * Covariant return: the override returns a pointer/reference to a class
                      * DERIVED from what the overridden declaration returns. When that derived-to-

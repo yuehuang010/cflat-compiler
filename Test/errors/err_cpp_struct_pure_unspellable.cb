@@ -1,0 +1,9 @@
+import cpp "cpp_interop_poly.h";
+
+expect_error("does not override pure virtual method 'cpppoly.Unspellable.take' (its C++ signature has no CFlat spelling)") {
+    struct Bad : cpppoly.Unspellable
+    {
+    };
+}
+
+extern int main() { return 0; }

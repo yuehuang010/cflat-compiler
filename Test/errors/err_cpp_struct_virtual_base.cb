@@ -1,0 +1,9 @@
+import cpp "cpp_interop_poly.h";
+
+expect_error("uses virtual inheritance, which is not supported yet") {
+    struct Bad : cpppoly.VBaseMid
+    {
+    };
+}
+
+extern int main() { return 0; }

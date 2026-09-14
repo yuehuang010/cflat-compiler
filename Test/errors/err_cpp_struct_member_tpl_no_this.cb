@@ -1,0 +1,10 @@
+import cpp "cpp_interop_tpl.h" cache;
+
+expect_error("Undefined variable reg.") {
+    int bad_member_template_call()
+    {
+        return reg("x", 3);
+    }
+}
+
+extern int main() { return 0; }

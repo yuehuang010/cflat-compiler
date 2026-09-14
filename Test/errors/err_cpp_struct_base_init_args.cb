@@ -1,0 +1,10 @@
+import cpp "cpp_interop_poly.h";
+
+expect_error("base initializer arguments must be constructor parameters or literals") {
+    struct Bad : cpppoly.Tagged
+    {
+        Bad(int value) : cpppoly.Tagged(value + 1) { }
+    };
+}
+
+extern int main() { return 0; }

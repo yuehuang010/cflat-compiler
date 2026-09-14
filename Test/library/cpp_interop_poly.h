@@ -22,6 +22,11 @@ namespace cpppoly
         int tag;
     };
 
+    int call_area(const Shape* s) noexcept;
+    int call_area_ref(const Shape& s) noexcept;
+    int call_plain(const Shape* s) noexcept;
+    unsigned long long sizeof_shape() noexcept;
+
     class Circle : public Shape
     {
     public:
@@ -105,6 +110,71 @@ namespace cpppoly
         virtual ~Abstract() noexcept;
         virtual int pure() const noexcept = 0;
     };
+
+    class Unspellable
+    {
+    public:
+        virtual ~Unspellable() noexcept;
+        virtual int take(int (*fn)(int, int), int Unspellable::*pm) const noexcept = 0;
+    };
+
+    class Tagged
+    {
+    public:
+        explicit Tagged(int t) noexcept;
+        virtual ~Tagged() noexcept;
+        int tag;
+        virtual int get() const noexcept;
+    protected:
+        int prot;
+        int prot_get() const noexcept;
+    };
+
+    int call_get(const Tagged* t) noexcept;
+    int call_pure(const Abstract* a) noexcept;
+
+    class Pinned
+    {
+    public:
+        Pinned() noexcept;
+        virtual ~Pinned() noexcept;
+        virtual int v() const noexcept;
+        Pinned(const Pinned&) = delete;
+        Pinned& operator=(const Pinned&) = delete;
+    };
+
+    int call_v(const Pinned* p) noexcept;
+
+    class Guarded
+    {
+    public:
+        Guarded() noexcept;
+        virtual ~Guarded() noexcept;
+        int probe() const noexcept { return hidden(); }
+    private:
+        virtual int hidden() const noexcept = 0;
+    };
+
+    int call_hidden(const Guarded* g) noexcept;
+
+    struct Sealed
+    {
+        virtual ~Sealed() noexcept;
+        virtual int f() const noexcept final;
+    };
+
+    class Scaler
+    {
+    public:
+        virtual ~Scaler() noexcept;
+        virtual double scale(double x, int k) const noexcept;
+        virtual const char* label() const noexcept;
+        virtual int adjust(int x) noexcept;
+    };
+
+    double call_scale(const Scaler* s, double x, int k) noexcept;
+    const char* call_label(const Scaler* s) noexcept;
+    int call_adjust(Scaler* s, int x) noexcept;
 
     struct VBaseTop { virtual ~VBaseTop() noexcept; virtual int t() const noexcept; int tv; };
     struct VBaseMid : virtual VBaseTop { int mv; };

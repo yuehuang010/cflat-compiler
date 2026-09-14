@@ -1298,4 +1298,57 @@ namespace cppt
     inline std::vector<size_t> m72_size_t_vector_roundtrip(
         const std::vector<size_t>& value) noexcept
     { return value; }
+
+    // M77: inherited member-template lookup from a CFlat-defined receiver.
+    class Registry
+    {
+    public:
+        Registry() noexcept {}
+        template <typename T>
+        int reg(const char* name, T value) noexcept
+        { return (int)value + (name[0] == 'x' ? 1 : 2); }
+        int plain() const noexcept { return 7; }
+    };
+
+    // M76: polymorphic class templates used as CFlat-defined struct bases.
+    namespace m76
+    {
+    template <typename T>
+    class Holder
+    {
+    public:
+        Holder() noexcept : value(T(9)) {}
+        explicit Holder(T v) noexcept : value(v) {}
+        virtual ~Holder() noexcept { ++dtors_; }
+        virtual T doubled() const noexcept { return value + value; }
+        T value;
+
+        static int dtors() noexcept { return dtors_; }
+        static void reset() noexcept { dtors_ = 0; }
+
+    private:
+        inline static int dtors_ = 0;
+    };
+
+    template <typename T>
+    inline T call_doubled(const Holder<T>* h) noexcept
+    { return h->doubled(); }
+
+    inline int holder_int_dtors() noexcept { return Holder<int>::dtors(); }
+    inline int holder_double_dtors() noexcept { return Holder<double>::dtors(); }
+    inline void reset_holder_int_dtors() noexcept { Holder<int>::reset(); }
+    inline void reset_holder_double_dtors() noexcept { Holder<double>::reset(); }
+
+    template <typename T>
+    class Shape2
+    {
+    public:
+        virtual ~Shape2() noexcept = default;
+        virtual T area() const noexcept = 0;
+    };
+
+    template <typename T>
+    inline T call_area2(const Shape2<T>* shape) noexcept
+    { return shape->area(); }
+    }
 }

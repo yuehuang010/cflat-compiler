@@ -638,6 +638,26 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
             std::string danglingMemberOwner;
             bool danglingIsMethod = false;
 
+            auto FindImplicitCxxTemplateThis = [&](const std::string& memberName) {
+                auto* compiler = Compiler(ctx);
+                auto thisVar = compiler->GetCurrentMemberThis(
+                    compiler->GetCurrentFunctionName());
+                if (thisVar.GetValue() == nullptr)
+                    thisVar = compiler->GetFunctionArgument("this");
+                if (thisVar.GetValue() == nullptr
+                    || compiler->GetScopedLocalOrArgument(memberName).GetValue() != nullptr
+                    || compiler->HasMemberVariable(memberName)
+                    || compiler->GetGlobalVariableNV(memberName).GetValue() != nullptr
+                    || compiler->GetFunction(memberName)
+                    || compiler->GetReturnBlock(memberName) != nullptr
+                    || genericFunctionTemplates.count(
+                        compiler->ResolveGenericFunctionBase(memberName))
+                    || !compiler->HasCxxFunctionTemplateMember(
+                        thisVar.TypeAndValue.TypeName, memberName))
+                    return LLVMBackend::NamedVariable{};
+                return thisVar;
+            };
+
             // Whole-chain '?.' short-circuit: links after the first '?.' run in a shared "access"
             // block, so a null anywhere upstream skips the REST of the chain (merged at the end).
             llvm::BasicBlock* ncChainNullBlock = nullptr;
@@ -1467,7 +1487,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                         {
                                             namedVar = globalNV;
                                             namedVar.Primary = llvm::ConstantInt::get(intTy,
-                                                (uint64_t)constValue, true);
+                                                llvm::APInt(intTy->getBitWidth(),
+                                                    static_cast<uint64_t>(constValue), false, true));
                                             namedVar.Storage = nullptr;
                                         }
                                         else
@@ -1629,7 +1650,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             // rather than surfacing as an unknown identifier.
                             if (!structVar.TypeAndValue.TypeName.empty())
                                 Compiler(ctx)->RejectInaccessibleCxxMember(
-                                    structVar.TypeAndValue.TypeName, primaryIdentifier);
+                                    structVar.TypeAndValue.TypeName, primaryIdentifier,
+                                    structVar.TypeAndValue.VariableName == "this");
 
                             // [PFX-2a] Consumed-COM member sugar: on a thin COM interface pointer - a struct
                             // whose SOLE field `lpVtbl` points at a vtable of function-pointer slots - a name
@@ -2077,7 +2099,18 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                         }
                         else
                         {
-                            namedVar = ParseIdentifier(terminal);
+                            const std::string memberName = terminal->getText();
+                            if (auto thisVar = FindImplicitCxxTemplateThis(memberName);
+                                thisVar.GetValue() != nullptr)
+                            {
+                                structVar = thisVar;
+                                danglingMemberOwner = thisVar.TypeAndValue.TypeName;
+                                danglingIsMethod = true;
+                            }
+                            else
+                            {
+                                namedVar = ParseIdentifier(terminal);
+                            }
                         }
 
                         if (namedVar.TypeAndValue.IsInterface)
@@ -2324,7 +2357,20 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 namedVar.Primary = ParsePrimaryExpression(prevPrimary);
                                 namedVar.Storage = nullptr;
                                 if (namedVar.Primary == nullptr)
-                                    namedVar = ParseIdentifier(prevPrimary->genericIdentifier()->Identifier());
+                                {
+                                    const std::string memberName =
+                                        prevPrimary->genericIdentifier()->Identifier()->getText();
+                                    if (auto thisVar = FindImplicitCxxTemplateThis(memberName);
+                                        thisVar.GetValue() != nullptr)
+                                    {
+                                        structVar = thisVar;
+                                        danglingMemberOwner = thisVar.TypeAndValue.TypeName;
+                                        danglingIsMethod = true;
+                                    }
+                                    else
+                                        namedVar = ParseIdentifier(
+                                            prevPrimary->genericIdentifier()->Identifier());
+                                }
                             }
                         }
                         else
@@ -2564,7 +2610,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             structVar = namedVar;
                             interfaceVar = {};
                         }
-                        else if (!namedVar.Storage)
+                        else if (!namedVar.Storage && !danglingIsMethod)
                         {
                             structVar = {};
                             interfaceVar = {};
@@ -3032,6 +3078,12 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                     {
                         // Create Function Call
                         std::string functionName = primaryIdentifier;
+                        if (structVar.BaseType && !structVar.TypeAndValue.TypeName.empty()
+                            && Compiler(ctx)->IsCxxRecord(structVar.TypeAndValue.TypeName)
+                            && Compiler(ctx)->RejectInaccessibleCxxMember(
+                                structVar.TypeAndValue.TypeName, functionName,
+                                structVar.TypeAndValue.VariableName == "this"))
+                            return {};
                         // A foreign std::function value uses CFlat's natural call spelling. Its
                         // C++ member is surfaced under operator(), with the value as receiver.
                         if (structVar.BaseType != nullptr
@@ -8160,7 +8212,9 @@ LLVMBackend::NamedVariable MainListener::ParseIdentifier(antlr4::tree::TerminalN
                     constFoldableGlobals_.insert(name);
                     if (auto* intTy = llvm::dyn_cast<llvm::IntegerType>(globalNV.BaseType))
                     {
-                        globalNV.Primary = llvm::ConstantInt::get(intTy, (uint64_t)constValue, true);
+                        globalNV.Primary = llvm::ConstantInt::get(intTy,
+                            llvm::APInt(intTy->getBitWidth(), static_cast<uint64_t>(constValue),
+                                        false, true));
                         globalNV.Storage = nullptr;
                     }
                 }

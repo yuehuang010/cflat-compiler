@@ -1,0 +1,10 @@
+import cpp "cpp_interop_poly.h";
+
+expect_error("does not override 'cpppoly.Shape.area'") {
+    struct Bad : cpppoly.Shape
+    {
+        override int area(int value) { return value; }
+    };
+}
+
+extern int main() { return 0; }

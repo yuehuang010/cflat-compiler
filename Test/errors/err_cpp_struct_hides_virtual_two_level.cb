@@ -1,0 +1,10 @@
+import cpp "cpp_interop_poly.h";
+
+expect_error("hides virtual method 'cpppoly.Circle.area'; add override") {
+    struct X : cpppoly.Circle
+    {
+        int area() { return 1; }
+    };
+}
+
+extern int main() { return 0; }

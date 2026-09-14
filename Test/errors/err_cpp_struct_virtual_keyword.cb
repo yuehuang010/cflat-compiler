@@ -1,0 +1,11 @@
+expect_error("'virtual' is not a CFlat keyword; virtual-ness is deduced from the C++ base") {
+    [cpp] struct VirtualBad
+    {
+        virtual int value() { return 1; }
+    };
+}
+
+extern int main()
+{
+    return 0;
+}

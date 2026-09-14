@@ -850,11 +850,11 @@ namespaceDefinition
     ;
 
 functionDefinition
-    : declarationSpecifiers? (directDeclarator | operatorFunctionId) genericTypeParameters? '(' parameterTypeList? ')' whereClause? lockClause? compoundStatement
+    : declarationSpecifiers? (directDeclarator | operatorFunctionId) genericTypeParameters? '(' parameterTypeList? ')' (':' baseSpecifier '(' argumentExpressionList? ')')? whereClause? lockClause? compoundStatement
     ;
 
 structDefinition
-    : annotationList? 'struct' alignmentSpecifier? directDeclarator genericTypeParameters? whereClause? '{' aggregateMember* '}' ';'
+    : annotationList? 'struct' alignmentSpecifier? directDeclarator genericTypeParameters? whereClause? (':' baseSpecifier (',' baseSpecifier)*)? '{' aggregateMember* '}' ';'
     | annotationList? 'union' alignmentSpecifier? directDeclarator genericTypeParameters? whereClause? '{' aggregateMember* '}' ';'
     ;
 

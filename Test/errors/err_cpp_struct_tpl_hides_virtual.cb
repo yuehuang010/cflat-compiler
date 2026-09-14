@@ -1,0 +1,11 @@
+import cpp "cpp_interop_tpl.h";
+
+expect_error("hides virtual method 'cppt.m76.Holder$int.doubled'; add override") {
+    struct Bad : cppt.m76.Holder<int>
+    {
+        Bad(int value) : cppt.m76.Holder<int>(value) { }
+        int doubled() { return value; }
+    };
+}
+
+extern int main() { return 0; }

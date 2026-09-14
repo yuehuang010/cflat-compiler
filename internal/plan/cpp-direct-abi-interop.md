@@ -330,7 +330,57 @@ stale declarations, value categories, or cleanup state.
 Exit: representative header-only and separately compiled libraries work from cold and
 warm caches, and header/config changes force correct regeneration.
 
-### M10 - CFlat-defined implementations of C++ classes - OUT OF MVP (ruling 2026-09-06)
+### M10 - CFlat-defined implementations of C++ classes - v1 IMPLEMENTED 2026-09-13 (ae5b12b6); template bases + nn::Module spike fixes in working tree
+
+Design, mechanism, diagnostics table and test matrix: `internal/plan/cpp-struct-m10.md`.
+Landed in one session as five delegated runs (A foundation, B base + override, C/E review
+closures, D localization) with three read-only review rounds: `[cpp] struct` with or without one
+C++ base, generated class in the companion stub (`final`, deleted copy, forwarding move or
+deleted move, override members forwarding to external reverse-ABI thunks), CFlat fields spliced
+at clang's `__cflat_fields` offset with a real layout check, ctor/dtor/move thunks bounded to
+the field block, override / hidden / pure / final / signature / protected diagnostics, header
+cache v56 (`ov`/`fi`), fixture M73-M75 (rows 1360-1450), 30 `err_cpp_struct_*.cb`. Verified
+on macOS: test.sh Release 957/0/8, Debug (assert LLVM) fixture + err files clean, LSP and
+examples green, `--run` probe. Review lesson worth keeping: run A's thunks and splice were
+written against "the CFlat block is the whole object at offset 0", and its layout check
+compared the type against descriptors derived from the same literal layout, so it could not
+see that; the base case made all three live. A layout check must compare against clang's
+numbers, never against its own input.
+
+Follow-ups after the commit (working tree, same day). Run F: a `[cpp] struct` may derive from a
+C++ class-template specialization (`struct T : tb.Holder<int>`, base initializer must name the
+same specialization: `base initializer names '{}' but the base class is '{}'`), both passes
+resolve the generic base to the specialization identity; fixture M76 (1460-1479), 5 more err
+files. Spike of the libtorch `nn::Module` port (scratch/ladder/torch/t29.cb, XOR training with
+`register_module`, `parameters()`, SGD, `train(false)`) found two defects that were NOT
+[cpp]-struct specific, fixed in run G: (B) a nontrivial C++ class temporary returned directly
+by value from ANY CFlat function or method (`return cppi.Tracked(k);`, `return make_tracked(k);`)
+was bitwise-loaded and then destructed before `ret`, so the caller received a dead object
+(double free); the return path now unregisters the returned temp from `pendingOwnedStructTemps`
+like the string and closure legs (`UnregisterOwnedStructTemp`). (A) an implicit-`this` call to
+an inherited C++ MEMBER TEMPLATE (`register_module(...)` without `this->`) reported `Undefined
+variable`; the bare-identifier arm now falls back to `this` when the receiver type has such a
+template member and nothing else matches. Fixture M77 (1480-1499), err file
+`err_cpp_struct_member_tpl_no_this.cb`. t29 is in the ladder list (t1-t29). Suite 969/0/8.
+Not in v1: multiple bases, virtual bases, new virtuals visible to C++, `base.m()` calls to the
+overridden implementation, protected access through a derived-typed pointer other than `this`,
+`std::make_shared<Foo>` / `register_module` (timebox 2), MSVC verification.
+
+Ruling 2026-09-13: `[cpp] struct` makes the struct a C++ class/struct that follows C++ rules.
+CFlat owns as little of the logic as possible and defers to clang: the derived class is
+declared in the companion stub (CFlat fields as an opaque aligned block, overrides forwarding
+to extern "C" thunks), so clang emits vtable, type_info, structor chaining, layout, and the
+make_shared path for Itanium and MSVC alike. CFlat does not re-implement C++ class semantics.
+Ruling 2026-09-13 (spelling): no `virtual` keyword in CFlat. CFlat compiles one module and
+sees the whole program, so virtual-ness is deduced from the C++ base (the stub marks the method
+virtual). `override` IS required on every method that overrides a base virtual, for safety, and
+`override` on a method that overrides nothing is a compile error. Missing `override` on a
+method that would hide a base virtual is also a compile error (no silent hiding).
+Ruling 2026-09-13 (copy): a `[cpp] struct` follows CFlat borrow-by-default. Passing or
+assigning it borrows; transfer needs an explicit `move`, exactly as for a native CFlat struct
+with owning fields. Implicit copy is not offered. Open, to be decided from practical usage
+once M10 has real programs: how `std::unique_ptr<T>` members relate to CFlat `unique<T>`
+(whether one maps onto the other, or they stay two distinct owning kinds side by side).
 
 Subclassing C++ types in CFlat: overrides, layout ownership, base construction, virtual
 destructors, RTTI identity, vtable emission, cross-language `dynamic_cast`/`typeid`.
@@ -341,8 +391,8 @@ overrides, and destroys it correctly, including multiple inheritance if advertis
 ## Sequence and release gates
 
 - M0-M4, M5a, M6, M5b landed in that order; the M6 review fixes and the M5 review are next.
-- MVP scope (ruling 2026-09-06): CFlat is a CONSUMER of C++ code only. M10 (CFlat-defined
-  C++ classes) is out of the MVP. Order after the rvalue-reference work: finish the review
+- MVP scope (ruling 2026-09-06, amended 2026-09-13): CFlat is a CONSUMER of C++ code, plus
+  `[cpp] struct` (M10) as ruled above; M10 is sequenced after the current round-9 tree lands. Order after the rvalue-reference work: finish the review
   debt (M6 fixes, M5 review, `T*&` index result), then M7 callbacks, then M8, then the M9
   cache and tooling items as rulings land.
 - Every milestone ships an explicit capability boundary and rejects unsupported uses. Do
@@ -1114,7 +1164,10 @@ Eigen -> libtorch; spikes under scratch/ladder/). Landed on master, in order:
   `longdouble`, ...), longest spelling first, so `std::vector<size_t>` has one identity on both
   paths; `ApFloatToDouble` reports lossy long-double folds under -v; header cache -> 55; M72
   1350-1359.
-State (working tree, 2026-09-13 10:04, round 9): scratch/ladder/torch/ t1-t28 all compile, link and run
+State (working tree, 2026-09-13 night, M10 v1 + runs F/G): everything below plus `[cpp] struct` v1 with
+template bases and the nn::Module spike fixes (see M10); test.sh Release 969/0/8, header cache v56, fixture
+sections to M77 (row 1499), 36 err_cpp_struct files, ladder t1-t29.
+Previous state (working tree, 2026-09-13 10:04, round 9): scratch/ladder/torch/ t1-t28 all compile, link and run
 on the final build (run_all.sh -j 3, ~30 min); test.sh Release 897/0/8, LSP and examples green, header
 cache v55, interop fixture cold + 4 warm -v compiles rc 0; fixture sections to M72 (row 1359).
 Previous state (round 8): scratch/ladder/torch/ t1-t27 all compile, link and run
