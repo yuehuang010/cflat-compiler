@@ -4507,9 +4507,11 @@ void LLVMBackend::ResetForReanalysis()
     cxxLazyAliasSpecializations_.clear();
     cxxForeignRequests_.clear();
     generatedCxxRecords_.clear();
+    cppStructNames_.clear();
     cppStructBases_.clear();
     cppStructOverrideNames_.clear();
     cxxForeignDefinitions_.clear();
+    cxxTentativeTypes_.clear();
     // Per-analysis emitted IR: the next analysis re-adopts whatever its own imports produce (from
     // the extractor or the header cache). No Clang pointer is retained, only bitcode bytes.
     cxxCompanionBitcode_.clear();

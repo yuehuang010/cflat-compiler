@@ -1,4 +1,5 @@
 #include "MainListener.h"
+#include <llvm/Support/SaveAndRestore.h>
 
 static bool JsonConstIdentifier(const std::string& text)
 {
@@ -596,6 +597,15 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
             std::string namespaceContext;
             std::vector<std::string> cxxExplicitTemplateArgs;
 
+            auto ParseCallArgument = [&](auto&& parse) {
+                auto* backend = Compiler(ctx);
+                llvm::SaveAndRestore<llvm::Value*> savedCxxSretDest(
+                    backend->pendingCxxSretDest_, nullptr);
+                llvm::SaveAndRestore<std::string> savedCxxSretType(
+                    backend->pendingCxxSretTypeName_, std::string{});
+                return parse();
+            };
+
             int functionArgCounter = 0;
             bool nullConditionalPending = false;
             // HResult `?.`/`?->` chaining: armed by [PFX-1] when the receiver is an HResult<T*>.
@@ -648,7 +658,9 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                     || compiler->GetScopedLocalOrArgument(memberName).GetValue() != nullptr
                     || compiler->HasMemberVariable(memberName)
                     || compiler->GetGlobalVariableNV(memberName).GetValue() != nullptr
-                    || compiler->GetFunction(memberName)
+                    || (compiler->GetFunction(memberName)
+                        && !compiler->HasCxxFunctionTemplateMember(
+                            thisVar.TypeAndValue.TypeName, memberName))
                     || compiler->GetReturnBlock(memberName) != nullptr
                     || genericFunctionTemplates.count(
                         compiler->ResolveGenericFunctionBase(memberName))
@@ -1434,7 +1446,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 {
                                     std::string cxxError;
                                     Compiler(ctx)->TryRequestCxxType(qualifiedName, {}, qualifiedName, cxxError);
-                                    if (!cxxError.empty()) LogErrorContext(ctx, cxxError);
+                                    if (!cxxError.empty()) LogCxxErrorContext(ctx, cxxError);
                                     // The alias now resolves to the specialization it names.
                                     resolvedQualifiedName = Compiler(ctx)->ResolveTypeAlias(qualifiedName);
                                     qualifiedDataStructure = Compiler(ctx)->IsDataStructure(qualifiedName)
@@ -2029,6 +2041,14 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 // Lambda<T>.toFunction() builtin, or a [winrt] COM vtable slot (e.g.
                                 // AddRef/Release/QueryInterface). All are lowered at the call dispatch below.
                                 namedVar = {};
+                                if (structVar.TypeAndValue.TypeName.empty())
+                                    if (auto thisVar = FindImplicitCxxTemplateThis(primaryIdentifier);
+                                        thisVar.GetValue() != nullptr)
+                                    {
+                                        structVar = thisVar;
+                                        danglingMemberOwner = thisVar.TypeAndValue.TypeName;
+                                        danglingIsMethod = true;
+                                    }
                                 // Arm [PFX-2-dangle]: without a following '()' this is `obj.method`.
                                 danglingMemberOwner = structVar.TypeAndValue.TypeName;
                                 if (danglingMemberOwner.empty())
@@ -2301,7 +2321,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 std::string cxxError;
                                 Compiler(ctx)->TryRequestCxxType(baseName, typeArgs, mangledName,
                                                                  cxxError);
-                                if (!cxxError.empty()) LogErrorContext(prevPrimary, cxxError);
+                                if (!cxxError.empty()) LogCxxErrorContext(prevPrimary, cxxError);
                                 mangledName = Compiler(ctx)->ResolveTypeAlias(mangledName);
                                 if (Compiler(ctx)->IsCxxForeignTypeRegistered(mangledName))
                                 {
@@ -3008,7 +3028,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                                                         typeArgs);
                             std::string cxxError;
                             Compiler(ctx)->TryRequestCxxType(baseName, typeArgs, mangled, cxxError);
-                            if (!cxxError.empty()) LogErrorContext(genParams, cxxError);
+                            if (!cxxError.empty()) LogCxxErrorContext(genParams, cxxError);
                             // The request may alias this spelling onto an already-registered
                             // identity for the SAME specialization (a header import registered it
                             // under its plain name first); statics and static methods live under
@@ -4974,7 +4994,10 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     ifaceArgExpectedScope.emplace(&declExpectedType, ifaceArgExpectedDest);
                                     CallArgumentScope callArgumentScope(
                                         inCallArgument_, ternaryCallArgumentDepth_);
-                                    auto argNV = this->ParseAssignmentExpressionNamed(namedArgument->assignmentExpression());
+                                    auto argNV = ParseCallArgument([&] {
+                                        return this->ParseAssignmentExpressionNamed(
+                                            namedArgument->assignmentExpression());
+                                    });
                                     ifaceArgExpectedScope.reset();
                                     lambdaExpectedType = {};
                                     // Use-after-move check: a field access carries a populated Primary, so the
@@ -5034,6 +5057,10 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     // and the borrow-param diagnostic after overload resolution.
                                     argVar.IsExplicitMove = argNV.IsExplicitMove;
                                     argVar.IsRvalue = argNV.IsRvalue;
+                                    const std::string argText = namedArgument->assignmentExpression()->getText();
+                                    argVar.IsStringLiteral = argNV.IsStringLiteral
+                                        || (argText.size() >= 2 && argText.front() == '"'
+                                            && argText.back() == '"');
                                     // Propagate over-alignment so a `move` param that would inherit the block
                                     // without its alignment tag is rejected instead of mis-freed.
                                     argVar.AllocAlignment = argNV.AllocAlignment;
@@ -5721,7 +5748,10 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     argExpectedScope.emplace(&declExpectedType, argExpectedDest);
                                     CallArgumentScope callArgumentScope(
                                         inCallArgument_, ternaryCallArgumentDepth_);
-                                    auto argNV = this->ParseAssignmentExpressionNamed(namedArgument->assignmentExpression());
+                                    auto argNV = ParseCallArgument([&] {
+                                        return this->ParseAssignmentExpressionNamed(
+                                            namedArgument->assignmentExpression());
+                                    });
                                     argExpectedScope.reset();
                                     if (argNV.ContainsBondedClosure)
                                         Compiler(ctx)->LogError(
@@ -5785,6 +5815,10 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     // and the borrow-param diagnostic after overload resolution.
                                     argVar.IsExplicitMove = argNV.IsExplicitMove;
                                     argVar.IsRvalue = argNV.IsRvalue;
+                                    const std::string argText = namedArgument->assignmentExpression()->getText();
+                                    argVar.IsStringLiteral = argNV.IsStringLiteral
+                                        || (argText.size() >= 2 && argText.front() == '"'
+                                            && argText.back() == '"');
                                     // Propagate over-alignment so a `move` param that would inherit the block
                                     // without its alignment tag is rejected instead of mis-freed.
                                     argVar.AllocAlignment = argNV.AllocAlignment;

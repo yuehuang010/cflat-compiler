@@ -1,0 +1,16 @@
+import cpp "cpp_interop_tpl.h";
+
+expect_error("'std::vector<__cflat_user::Leaf>' needs the complete definition of [cpp] struct 'Leaf'; define the struct before this use") {
+    struct Holder : cppt.ModuleBase
+    {
+        std.vector<Leaf> values = default;
+        override int forward(int x) { return x; }
+    };
+}
+
+struct Leaf : cppt.ModuleBase
+{
+    override int forward(int x) { return x; }
+};
+
+extern int main() { return 0; }

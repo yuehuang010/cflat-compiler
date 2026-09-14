@@ -15,6 +15,10 @@ int clamp100(int x)       { return x > 100 ? 100 : (x < 0 ? 0 : x); }
 bool isEven(int x)        { return x % 2 == 0; }
 void doNothing()          { }
 
+int i1_global = 42;
+int i1_pick_pointer(int* p) { return 11; }
+int i1_pick_pointer(char* p) { return 22; }
+
 // ── Higher-order named helpers ────────────────────────────────────────────────
 
 int apply(Lambda<int(int, int)> f, int a, int b) { return f(a, b); }
@@ -4746,6 +4750,7 @@ extern int main(int argc, char** argv)
     int total  = 0;
 
     // Function pointer tests
+    total++; passed += Test("global address picks int pointer", i1_pick_pointer(&i1_global), 11) ? 1 : 0;
     total++; passed += testExplicitFunctionPointer()   ? 1 : 0;
     total++; passed += testBareFunctionPointer()       ? 1 : 0;
     total++; passed += testFunctionPointerAsArgument() ? 1 : 0;

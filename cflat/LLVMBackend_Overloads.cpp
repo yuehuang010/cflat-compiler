@@ -281,6 +281,11 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
         std::vector<Ranked> perfect;
         std::vector<Ranked> possible;   // the promotion/implicit tier
         const std::pair<std::vector<NamedVariable>, FunctionSymbol>* variadicFallback = nullptr;
+        auto isStringLiteralValue = [&](llvm::Value* value) {
+            auto* constant = llvm::dyn_cast_or_null<llvm::Constant>(
+                value == nullptr ? nullptr : value->stripPointerCasts());
+            return constant != nullptr && IsStringLiteralConstant(constant);
+        };
 
         for (const auto& pair : candidates)
         {
@@ -435,7 +440,21 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                         result = 0;
                     else if (tmpParam.IsCxxRefToPointer && tmpArg.Pointer)
                         result = 0;
-                    else if (tmpArg.IsTypeMatch(tmpParam))
+                    if (candidate.IsCxx && !tmpArg.Pointer
+                        && !candidateParamItr->IsCxxRefToPointer)
+                    {
+                        std::string argSpelling;
+                        std::string paramSpelling;
+                        const bool sameCxxSpelling =
+                            CxxSpellingForCflatType(tmpArg.TypeName, argSpelling)
+                            && CxxSpellingForCflatType(tmpParam.TypeName, paramSpelling)
+                            && SqueezeCxxSpelling(argSpelling) == SqueezeCxxSpelling(paramSpelling);
+                        if (sameCxxSpelling)
+                            result = candidateParamItr->IsAlias
+                                ? (IsRvalueReferenceArgument(arg) ? 1 : 0)
+                                : (IsRvalueReferenceArgument(arg) ? 0 : 1);
+                    }
+                    if (result < 0 && tmpArg.IsTypeMatch(tmpParam))
                         result = 0;
                     // A C++ lvalue reference is represented as an alias value in CFlat. A
                     // derived lvalue binds to a public base reference by a standard conversion;
@@ -519,8 +538,31 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                 }
                 else
                 {
+                    const std::string inferredTypeName = arg.TypeAndValue.TypeName.empty()
+                        ? arg.InferSourceTypeName : arg.TypeAndValue.TypeName;
+                    std::string inferredSpelling;
+                    std::string parameterSpelling;
+                    const bool sameCxxSpelling = candidate.IsCxx
+                        && !inferredTypeName.empty()
+                        && CxxSpellingForCflatType(inferredTypeName, inferredSpelling)
+                        && CxxSpellingForCflatType(candidateParamItr->TypeName, parameterSpelling)
+                        && SqueezeCxxSpelling(inferredSpelling)
+                            == SqueezeCxxSpelling(parameterSpelling);
+                    const bool sameCxxValue = sameCxxSpelling && !candidateParamItr->IsAlias;
+                    const bool sameCxxReference = sameCxxSpelling && candidateParamItr->IsAlias;
+                    const bool stringLiteralCharPointer = (candidateParamItr->Pointer
+                        || candidateParamItr->PointerDepth > 0)
+                        && candidateParamItr->TypeName == "char"
+                        && arg.BaseType != nullptr && arg.BaseType->isPointerTy()
+                        && (arg.IsRvalue || arg.IsStringLiteral || isStringLiteralValue(arg.Primary));
                     auto candidateParam = GetType(*candidateParamItr);
-                    if (candidateParamItr->IsRvalueRef && !arg.TypeAndValue.Pointer)
+                    if (sameCxxValue)
+                        result = IsRvalueReferenceArgument(arg) ? 0 : 1;
+                    else if (sameCxxReference)
+                        result = IsRvalueReferenceArgument(arg) ? 1 : 0;
+                    else if (stringLiteralCharPointer)
+                        result = 0;
+                    else if (candidateParamItr->IsRvalueRef && !arg.TypeAndValue.Pointer)
                     {
                         // A primitive foreign rvalue reference is represented as T* at the ABI
                         // boundary, but a call result may carry only its lowered scalar type.
@@ -533,6 +575,10 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                     else
                         result = candidateParamItr->IsCxxRefToPointer && arg.TypeAndValue.Pointer
                             ? 0 : CompareUpconvert(arg.BaseType, candidateParam);
+                    if (SpellType(*this, *candidateParamItr) == "char*"
+                        && arg.BaseType != nullptr && arg.BaseType->isPointerTy()
+                        && (arg.IsStringLiteral || isStringLiteralValue(arg.Primary)))
+                        result = 0;
                     if (IsRawPointerToCoreUnique(arg, *candidateParamItr))
                         result = 0;
                     const size_t paramIndex = std::distance(candidate.Parameters.begin(), candidateParamItr);
@@ -570,7 +616,8 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
 
                     // The pointee is never itself a function-pointer type here: the funcptr arm
                     // above claims every such parameter whenever the argument is code.
-                    if (result >= 0 && candidateParamItr->Pointer && argIsCodeValue)
+                    if (result >= 0 && candidateParamItr->Pointer && argIsCodeValue
+                        && !arg.IsStringLiteral && !isStringLiteralValue(arg.Primary))
                         result = -1;
 
                     // Opaque pointers make every view look alike to CompareUpconvert; both sides

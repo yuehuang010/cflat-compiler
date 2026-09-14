@@ -21,6 +21,65 @@
 
 namespace cppt
 {
+    // M78: a header-only polymorphic owner for CFlat-defined C++ structs.
+    inline int module_dtors_counter = 0;
+    template <typename T>
+    class HolderOf
+    {
+    public:
+        explicit HolderOf(std::shared_ptr<T> value) : value_(value) {}
+        std::shared_ptr<T> ptr() const { return value_; }
+        T* operator->() const { return value_.get(); }
+    private:
+        std::shared_ptr<T> value_;
+    };
+
+    template <typename T>
+    HolderOf<T> make_holder(std::shared_ptr<T> value)
+    { return HolderOf<T>(value); }
+
+    class ModuleBase
+    {
+    public:
+        ModuleBase() noexcept {}
+        virtual ~ModuleBase() noexcept { ++module_dtors_counter; }
+        virtual int forward(int x) { return x; }
+
+        template <typename T>
+        std::shared_ptr<T> register_child(const char* name, std::shared_ptr<T> m)
+        {
+            names.push_back(name);
+            children.push_back(m);
+            return m;
+        }
+
+        template <typename T>
+        std::shared_ptr<T> register_child(const char* name, HolderOf<T> h)
+        { return register_child(name, h.ptr()); }
+
+        template <typename T>
+        std::shared_ptr<T> take(std::shared_ptr<T> value)
+        { return value; }
+
+        int child_count() const noexcept { return (int)children.size(); }
+        int call_child(int i, int x) { return children[(size_t)i]->forward(x); }
+
+        std::vector<std::string> names;
+        std::vector<std::shared_ptr<ModuleBase>> children;
+    };
+
+    inline int run_module(const std::shared_ptr<ModuleBase>& m, int x)
+    { return m->forward(x); }
+    template <typename T>
+    inline int module_use_count(const std::shared_ptr<T>& m)
+    { return (int)m.use_count(); }
+    inline int module_dtors() noexcept { return module_dtors_counter; }
+    inline void reset_module_dtors() noexcept { module_dtors_counter = 0; }
+    inline int m78_pick_string(std::string value) noexcept { return (int)value.size() + 10; }
+    inline int m78_pick_string(const std::string& value) noexcept { return (int)value.size() + 20; }
+    inline int m78_pick_pointer(int*) noexcept { return 11; }
+    inline int m78_pick_pointer(char*) noexcept { return 22; }
+
     // M60: constructor temporaries used as C++ member-call and field receivers.
     class Builder
     {

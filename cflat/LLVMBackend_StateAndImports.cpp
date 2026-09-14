@@ -1948,6 +1948,7 @@ nlohmann::json LLVMBackend::FunctionTemplateToJson(
         return { {"n", t.name}, {"o", t.owner}, {"m", t.memberName},
                  {"c", t.cxxSpelling}, {"k", t.kind}, {"mi", t.minArity},
                  {"ma", t.maxArity}, {"tp", t.typeParameterCount}, {"pp", t.hasParameterPack},
+                 {"pt", t.parameterTypes},
                  {"tk", t.templateParameterKinds},
                  {"cn", t.isConst},
                  {"nx", t.isNoexcept}, {"a", t.access}, {"f", t.file},
@@ -1966,6 +1967,7 @@ cflat_cinterop::RawFunctionTemplate LLVMBackend::FunctionTemplateFromJson(const 
         t.maxArity = (unsigned)j.value("ma", (uint64_t)0);
         t.typeParameterCount = (unsigned)j.value("tp", (uint64_t)0);
         t.hasParameterPack = j.value("pp", false);
+        if (j.contains("pt")) t.parameterTypes = j["pt"].to_string_vector();
         t.templateParameterKinds = j.value("tk", std::string{});
         t.isConst = j.value("cn", false);
         t.isNoexcept = j.value("nx", false);
@@ -2514,7 +2516,9 @@ bool LLVMBackend::TryLoadCHeaderDiskCache(
         // v54: extractor and backend share one C++ foreign identity spelling.
         // v55: all canonical multi-word C++ primitive spellings share their CFlat identity.
         // v56: C++ members retain explicit override/final attributes for CFlat-derived classes.
-        if (version != 56) return cacheMiss();
+        // v57: C++ function-template cache entries retain parameter types so same-arity overloads
+        // of one member template are not collapsed into the first declaration.
+        if (version != 57) return cacheMiss();
 
         // Accept on mtime match (fast) or content hash match (authoritative on mtime drift).
         auto storedMtime = j.value("mtime", int64_t{-1});
@@ -2618,7 +2622,7 @@ void LLVMBackend::WriteCHeaderDiskCache(
         if (ec) return;
 
         nlohmann::json j;
-        j["version"] = 56;
+        j["version"] = 57;
         j["mtime"]   = (int64_t)mtime.time_since_epoch().count();
         j["hash"]    = contentHash;
         j["ldw"]     = entry.longDoubleWidth;

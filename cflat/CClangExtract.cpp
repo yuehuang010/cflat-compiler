@@ -953,6 +953,9 @@ namespace cflat_cinterop
                 result.minArity = declaredArity - (result.hasParameterPack ? 1u : 0u);
                 result.maxArity = result.hasParameterPack
                     ? std::numeric_limits<unsigned>::max() : result.minArity;
+                for (unsigned i = 0; i < declaredArity; ++i)
+                    result.parameterTypes.push_back(
+                        fd->getParamDecl(i)->getType().getAsString());
                 while (result.minArity > 0
                        && fd->getParamDecl(result.minArity - 1)->hasDefaultArg())
                     --result.minArity;

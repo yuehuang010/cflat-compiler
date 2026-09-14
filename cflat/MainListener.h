@@ -2785,6 +2785,14 @@ void ScanInterfaceDefinition(CFlatParser::InterfaceDefinitionContext* ctx,
     void ScanStructOrClassDefinition(TCtx* ctx, const std::string& namespaceName = {})
     {
         auto* compiler = Compiler(ctx);
+        std::string scannedTypeName = ctx->directDeclarator()->getText();
+        if (!namespaceName.empty()) scannedTypeName = namespaceName + "." + scannedTypeName;
+        const auto scannedAnnotations = ExtractAnnotations(ctx->annotationList());
+        const bool scannedCppStruct = dynamic_cast<CFlatParser::StructDefinitionContext*>(ctx) != nullptr
+            && (!BaseClauseIdentifiers(ctx).empty()
+                || std::any_of(scannedAnnotations.begin(), scannedAnnotations.end(),
+                               [](const auto& ann) { return ann.Name == "cpp"; }));
+        if (scannedCppStruct) compiler->RegisterCppStructName(scannedTypeName);
         // Generic template definitions are not pre-declared; they are instantiated on demand.
         // However, we still register the template name and its method names in the LSP
         // symbol index so hover / go-to-definition can resolve uses through a variable
@@ -2842,6 +2850,7 @@ void ScanInterfaceDefinition(CFlatParser::InterfaceDefinitionContext* ctx,
             && std::any_of(rawAnnotations.begin(), rawAnnotations.end(),
                            [](const auto& ann) { return ann.Name == "cpp"; })
             || (isStructDefinition && !baseClauses.empty());
+        if (isCppStruct) compiler->RegisterCppStructName(typeName);
 
         if (isStructDefinition && !baseClauses.empty())
         {
@@ -3341,6 +3350,10 @@ private:
     // Struct scope stack: pushed when parsing fields/methods of a struct/class so that
     // unqualified nested type names (e.g. "Inner") resolve to "Outer.Inner".
     std::vector<std::string> structScopeStack;
+
+    // C++ struct definitions parsed early so their generated C++ is available to later member
+    // bodies, while the current struct's fields still observe source-order completeness.
+    std::unordered_set<const CFlatParser::StructDefinitionContext*> preparsedCppStructDefinitions_;
 
     // Set only while ParseDeclarationList parses a field's declarationSpecifiers. Pointer-form
     // `unique` fields desugar to core unique<T>; unique void* remains builtin.
@@ -6449,6 +6462,9 @@ public:
 
     void ParseStructDefinition(CFlatParser::StructDefinitionContext* ctx, const std::string& nameOverride = {}, const std::string& namespaceName = {});
 
+    void PrepareLaterCppStructDefinitions(CFlatParser::StructDefinitionContext* ctx,
+                                          const std::string& namespaceName);
+
     // Extract the canonical lock expression text from a single lock arg expression.
     // Normalizes '->' to '.' and strips a trailing '.read' / '.write' soft-keyword suffix.
     // The mode suffix is handled by the caller via GetLockArgMode().
@@ -6619,6 +6635,18 @@ public:
     void LogErrorContext(antlr4::tree::TerminalNode* ctx, std::string errorMessage);
 
     void LogErrorContext(antlr4::ParserRuleContext* ctx, std::string errorMessage);
+
+    void LogCxxErrorContext(antlr4::ParserRuleContext* ctx, const std::string& errorMessage)
+    {
+        std::string spelling;
+        std::string typeName;
+        if (Compiler(ctx)->DecodeCxxIncompleteTemplateError(errorMessage, spelling, typeName))
+            Compiler(ctx)->LogErrorMessage(
+                "'{}' needs the complete definition of [cpp] struct '{}'; define the struct before this use",
+                { spelling, typeName });
+        else
+            LogErrorContext(ctx, errorMessage);
+    }
 
     void LogWarningContext(antlr4::ParserRuleContext* ctx, std::string warningMessage);
 

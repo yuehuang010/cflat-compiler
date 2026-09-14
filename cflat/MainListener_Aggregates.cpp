@@ -42,6 +42,51 @@ std::string CppStructThunkStem(const std::string& name)
 }
 }
 
+void MainListener::PrepareLaterCppStructDefinitions(
+    CFlatParser::StructDefinitionContext* ctx, const std::string& namespaceName)
+{
+    auto* compiler = Compiler(ctx);
+    auto* external = dynamic_cast<CFlatParser::ExternalDeclarationContext*>(ctx->parent);
+    if (external == nullptr || external->parent == nullptr)
+        return;
+
+    std::vector<CFlatParser::ExternalDeclarationContext*> siblings;
+    if (auto* parent = dynamic_cast<CFlatParser::TranslationUnitContext*>(external->parent))
+        siblings = parent->externalDeclaration();
+    else if (auto* parent = dynamic_cast<CFlatParser::NamespaceDefinitionContext*>(external->parent))
+        siblings = parent->externalDeclaration();
+    else if (auto* parent = dynamic_cast<CFlatParser::IfConstBlockContext*>(external->parent))
+        siblings = parent->externalDeclaration();
+    else if (auto* parent = dynamic_cast<CFlatParser::ExpectErrorDeclarationContext*>(external->parent))
+        siblings = parent->externalDeclaration();
+    if (siblings.empty())
+        return;
+
+    auto current = std::find(siblings.begin(), siblings.end(), external);
+    if (current == siblings.end())
+        return;
+    for (++current; current != siblings.end(); ++current)
+    {
+        auto* future = (*current)->structDefinition();
+        if (future == nullptr)
+            continue;
+        const auto annotations = ExtractAnnotations(future->annotationList());
+        const bool isCppStruct = !BaseClauseIdentifiers(future).empty()
+            || std::any_of(annotations.begin(), annotations.end(),
+                           [](const auto& ann) { return ann.Name == "cpp"; });
+        const std::string futureName = namespaceName.empty()
+            ? future->directDeclarator()->getText()
+            : namespaceName + "." + future->directDeclarator()->getText();
+        if (!isCppStruct)
+            continue;
+        if (!compiler->HasTentativeCxxTypeFor(futureName))
+            continue;
+        if (!preparsedCppStructDefinitions_.insert(future).second)
+            continue;
+        ParseStructDefinition(future, {}, namespaceName);
+    }
+}
+
 void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* ctx, const std::string& nameOverride, const std::string& namespaceName) {
         ResolvedMembersScope memberScope_(resolvedMembers_, (const void*)ctx);
         auto* compiler = Compiler(ctx);
@@ -74,6 +119,7 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
         const bool isCppStruct = hasCppBase
             || std::any_of(rawAnnotations.begin(), rawAnnotations.end(),
                            [](const auto& ann) { return ann.Name == "cpp"; });
+        if (isCppStruct) compiler->RegisterCppStructName(structName);
         if (isCppStruct && nameOverride.empty() && ctx->genericTypeParameters() != nullptr)
         {
             Compiler(ctx)->LogErrorMessage("generic [cpp] struct is not supported yet");
@@ -932,6 +978,9 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
                 return;
             }
             compiler->RegisterCppStructProtectedBaseMembers(structName);
+            for (const auto& [typeName, error] : compiler->RetryTentativeCxxTypesFor(structName))
+                Compiler(ctx)->LogErrorMessage("C++ type '{}' could not be parsed: {}",
+                                               { typeName, error });
             if (compiler->IsVerbose())
                 std::cout << "[verbose] generated C++ for " << structName << ":\n" << source;
             if (hasGeneratedMove)
@@ -942,6 +991,8 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
                                               {}, 0);
             if (MemberDestructorDefinitions(ctx).empty())
                 EmitCppStructDestructorThunk(ctx, structName);
+
+            PrepareLaterCppStructDefinitions(ctx, namespaceName);
         }
 
         // Create default constructor (skipped when user provides an explicit no-arg ctor)

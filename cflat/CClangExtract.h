@@ -137,6 +137,7 @@ namespace cflat_cinterop
         unsigned minArity = 0;
         unsigned maxArity = 0;
         unsigned typeParameterCount = 0;
+        std::vector<std::string> parameterTypes;
         // One char per template parameter, in order: 'T' type, 'P' type pack,
         // 'N' non-defaulted integral non-type, 'd' defaulted non-type (SFINAE helper).
         std::string templateParameterKinds;

@@ -2074,6 +2074,11 @@ expect_error("cannot pass a 'function<>' value to closure parameter 'fp', which 
     {
         return spTakesPtr2(spDbl);
     }
+
+    int shapeGlobalFunctionAddressIntoPointer()
+    {
+        return spTakesPtr2(&spDbl);
+    }
 }
 
 // The VIEW parameter's ADVICE, pinned here rather than the message head (the head is pinned by

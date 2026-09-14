@@ -2108,6 +2108,13 @@ int LLVMBackend::ClassifyCxxSignatureSpelling(const std::string& spelling,
             else if (named[i] == '>' && --depth == 0) { close = i; break; }
         }
         if (close != std::string::npos) named.erase(close + 1);
+        TypeAndValue mapped;
+        bool mappedForeign = false;
+        if (TryMapCxxForeignSpelling(named, mapped, mappedForeign) && mappedForeign)
+        {
+            identity = mapped.TypeName;
+            return 2;
+        }
         identity = cflat_cinterop::CxxForeignIdentity(named);
         return identity.empty() ? 3 : 2;
 }
@@ -3352,6 +3359,12 @@ bool LLVMBackend::CxxSpellingForCflatType(const std::string& cflatType, std::str
         else if (auto lazy = cxxLazyAliasSpecializations_.find(base);
                  lazy != cxxLazyAliasSpecializations_.end())
             out = lazy->second;
+        else if (IsCppStructName(base))
+        {
+            out = "__cflat_user::" + base;
+            for (size_t pos = 0; (pos = out.find('.', pos)) != std::string::npos; pos += 2)
+                out.replace(pos, 1, "__");
+        }
         else if (auto dot = base.find('.'); dot != std::string::npos
                  && cxxForeignNamespaces_.count(base.substr(0, dot)) != 0
                  && dataStructures.count(base) == 0)
@@ -3367,7 +3380,137 @@ bool LLVMBackend::CxxSpellingForCflatType(const std::string& cflatType, std::str
         else return false;
         for (int i = 0; i < ptr; ++i) out += " *";
         return true;
-    }
+}
+
+void LLVMBackend::GeneratedCxxDefinitionsFor(
+        const std::vector<std::string>& cflatTypeNames, std::string& outSource,
+        std::set<size_t>& outDependencyGroups,
+        std::unordered_set<std::string>& outIncompleteTypes) const
+{
+        std::string definitions;
+        std::unordered_set<std::string> seenDefinitions;
+        std::unordered_set<std::string> seenForwardDeclarations;
+        std::unordered_set<std::string> visited;
+        std::function<void(const std::string&)> visit = [&](const std::string& rawType) {
+            std::string type = rawType;
+            while (!type.empty() && type.back() == '*') type.pop_back();
+            if (type.empty() || !visited.insert(type).second) return;
+
+            if (auto generated = generatedCxxRecords_.find(type);
+                generated != generatedCxxRecords_.end())
+            {
+                if (generated->second.ownerGroup != static_cast<size_t>(-1))
+                    outDependencyGroups.insert(generated->second.ownerGroup);
+                if (seenDefinitions.insert(type).second)
+                    definitions += generated->second.source + "\n";
+            }
+            else if (IsCppStructName(type))
+            {
+                outIncompleteTypes.insert(type);
+                if (seenForwardDeclarations.insert(type).second)
+                {
+                    std::string cxxName = "__cflat_user::" + type;
+                    for (size_t pos = 0;
+                         (pos = cxxName.find('.', pos)) != std::string::npos; pos += 2)
+                        cxxName.replace(pos, 1, "__");
+                    const size_t last = cxxName.rfind("::");
+                    const std::string shortName = last == std::string::npos
+                        ? cxxName : cxxName.substr(last + 2);
+                    outSource += "namespace __cflat_user { struct " + shortName + "; }\n";
+                }
+            }
+
+            TypeSpelling parsed;
+            if (!DemangleType(*this, type, parsed)) return;
+            for (const auto& arg : parsed.args) visit(MangleType(*this, arg));
+        };
+        for (const std::string& type : cflatTypeNames) visit(type);
+        outSource += definitions;
+}
+
+std::vector<std::pair<std::string, std::string>> LLVMBackend::RetryTentativeCxxTypesFor(
+    const std::string& generatedTypeName)
+{
+        std::vector<std::pair<std::string, std::string>> failures;
+        std::vector<std::string> pending(cxxTentativeTypes_.begin(), cxxTentativeTypes_.end());
+        for (const std::string& cflatName : pending)
+        {
+            auto spellingIt = cxxCflatToCxxSpelling_.find(cflatName);
+            auto ownerIt = cxxTypeOwnerGroup_.find(cflatName);
+            if (spellingIt == cxxCflatToCxxSpelling_.end()
+                || ownerIt == cxxTypeOwnerGroup_.end())
+                continue;
+
+            TypeSpelling type;
+            if (!DemangleType(*this, cflatName, type)) continue;
+            std::function<bool(const TypeSpelling&)> containsGenerated =
+                [&](const TypeSpelling& current) {
+                    std::string name = MangleType(*this, current);
+                    while (!name.empty() && name.back() == '*') name.pop_back();
+                    if (name == generatedTypeName) return true;
+                    return std::any_of(current.args.begin(), current.args.end(),
+                                       containsGenerated);
+                };
+            if (!containsGenerated(type)) continue;
+
+            std::vector<std::string> arguments;
+            arguments.reserve(type.args.size());
+            for (const auto& argument : type.args)
+                arguments.push_back(MangleType(*this, argument));
+            std::string generatedSource;
+            std::set<size_t> dependencyGroups;
+            std::unordered_set<std::string> incompleteTypes;
+            GeneratedCxxDefinitionsFor(arguments, generatedSource, dependencyGroups,
+                                       incompleteTypes);
+            if (generatedSource.empty()) continue;
+
+            std::vector<size_t> dependencies(dependencyGroups.begin(), dependencyGroups.end());
+            CxxRequestGroup group = MakeCxxRequestGroup(ownerIt->second, dependencies);
+            CxxRequestGroupScope groupScope(*this, &group);
+            std::string error;
+            auto previous = cxxForeignRequests_.find(cflatName);
+            const bool hadPrevious = previous != cxxForeignRequests_.end();
+            const std::string previousValue = hadPrevious ? previous->second : std::string();
+            retryingTentativeCxxType_ = true;
+            const bool ok = RequestCxxForeignType(cflatName, spellingIt->second, error,
+                                                  /*needDefinitions*/ true,
+                                                  /*explicitInstantiation*/ true,
+                                                  /*tentative*/ true,
+                                                  /*extraSource*/ {}, generatedSource);
+            retryingTentativeCxxType_ = false;
+            if (!ok)
+            {
+                if (hadPrevious) cxxForeignRequests_[cflatName] = previousValue;
+                else cxxForeignRequests_.erase(cflatName);
+                failures.emplace_back(cflatName, error);
+            }
+            else
+            {
+                cxxTentativeTypes_.erase(cflatName);
+                cxxForeignDefinitions_.insert(cflatName);
+            }
+        }
+        return failures;
+}
+
+bool LLVMBackend::HasTentativeCxxTypeFor(const std::string& generatedTypeName) const
+{
+        for (const std::string& cflatName : cxxTentativeTypes_)
+        {
+            TypeSpelling type;
+            if (!DemangleType(*this, cflatName, type)) continue;
+            std::function<bool(const TypeSpelling&)> containsGenerated =
+                [&](const TypeSpelling& current) {
+                    std::string name = MangleType(*this, current);
+                    while (!name.empty() && name.back() == '*') name.pop_back();
+                    if (name == generatedTypeName) return true;
+                    return std::any_of(current.args.begin(), current.args.end(),
+                                       containsGenerated);
+                };
+            if (containsGenerated(type)) return true;
+        }
+        return false;
+}
 
 /*
  * The stub's include prologue, shared by both stages and by the group's PCH. It includes ONE
@@ -3976,7 +4119,8 @@ void LLVMBackend::RegisterCxxFunctionTemplates(
                 return old.kind == t.kind && old.cxxSpelling == t.cxxSpelling
                     && old.minArity == t.minArity && old.maxArity == t.maxArity
                     && old.typeParameterCount == t.typeParameterCount
-                    && old.hasParameterPack == t.hasParameterPack;
+                    && old.hasParameterPack == t.hasParameterPack
+                    && old.parameterTypes == t.parameterTypes;
             });
             if (duplicate) continue;
             entries.push_back(t);
@@ -5334,20 +5478,20 @@ bool LLVMBackend::RequestCxxFunctionTemplate(const std::string& functionName,
                 collectTypeDependencies(collectTypeDependencies, explicitArg);
 
         std::string generatedTypeSource;
-        std::unordered_set<std::string> generatedTypes;
-        auto appendGeneratedTypeSource = [&](const std::string& type) {
-            std::string base = type;
-            while (!base.empty() && base.back() == '*') base.pop_back();
-            auto generated = generatedCxxRecords_.find(base);
-            if (generated == generatedCxxRecords_.end()
-                || !generatedTypes.insert(base).second)
-                return;
-            generatedTypeSource += generated->second.source + "\n";
-        };
+        std::set<size_t> generatedDependencyGroups;
+        std::unordered_set<std::string> incompleteTypes;
+        std::vector<std::string> generatedTypeArguments;
+        generatedTypeArguments.reserve(arguments.size() + explicitArgs.size());
+        if (selected->kind == cflat_cinterop::RawFunctionTemplate::InstanceMember)
+            generatedTypeArguments.push_back(ownerType);
         for (const auto& argument : arguments)
-            appendGeneratedTypeSource(cflatTypeOf(argument));
+            generatedTypeArguments.push_back(cflatTypeOf(argument));
         for (const std::string& explicitArg : explicitArgs)
-            if (!explicitArg.starts_with("#")) appendGeneratedTypeSource(explicitArg);
+            if (!explicitArg.starts_with("#")) generatedTypeArguments.push_back(explicitArg);
+        GeneratedCxxDefinitionsFor(generatedTypeArguments, generatedTypeSource,
+                                   generatedDependencyGroups, incompleteTypes);
+        for (size_t groupIndex : generatedDependencyGroups)
+            addDependencyGroup(groupIndex);
 
         std::string hashKey = lookupName + std::to_string(selected->kind);
         for (const auto& p : parameterSpellings) hashKey += p;
@@ -5378,8 +5522,6 @@ bool LLVMBackend::RequestCxxFunctionTemplate(const std::string& functionName,
         wrapperSource += ")";
         if (selected->isNoexcept) wrapperSource += " noexcept";
         wrapperSource += " { return " + targetCall + "; }\n";
-        wrapperSource = generatedTypeSource + wrapperSource;
-
         auto groupIt = cxxFunctionTemplateOwnerGroup_.find(selected->name);
         if (groupIt == cxxFunctionTemplateOwnerGroup_.end())
             return noMatch("the template's import group is unavailable");
@@ -5389,7 +5531,7 @@ bool LLVMBackend::RequestCxxFunctionTemplate(const std::string& functionName,
 
         CSigEntry bound;
         std::string wrapperError;
-        if (!RequestGeneratedCxxWrapper(group, wrapperSource, wrapperName, "TPL",
+        if (!RequestGeneratedCxxWrapper(group, generatedTypeSource + wrapperSource, wrapperName, "TPL",
                                          bound, wrapperError))
             return noMatch(wrapperError);
 
@@ -6356,12 +6498,24 @@ bool LLVMBackend::RequestCxxVariadicConstructor(
         }
         wrapperSource += ") { new (p0) " + targetCall + "; }\n";
 
+        std::vector<std::string> generatedTypeArguments{ typeName };
+        for (const NamedVariable& argument : arguments)
+            generatedTypeArguments.push_back(cflatTypeOf(argument));
+        std::string generatedTypeSource;
+        std::set<size_t> generatedDependencyGroups;
+        std::unordered_set<std::string> incompleteTypes;
+        GeneratedCxxDefinitionsFor(generatedTypeArguments, generatedTypeSource,
+                                   generatedDependencyGroups, incompleteTypes);
+        wrapperSource = generatedTypeSource + wrapperSource;
+
         auto groupIt = cxxTypeOwnerGroup_.find(typeName);
         if (groupIt == cxxTypeOwnerGroup_.end())
         {
             return giveUp("the C++ class's import group is unavailable");
         }
-        CxxRequestGroup group = MakeCxxRequestGroup(groupIt->second, {});
+        std::vector<size_t> dependencyGroups(generatedDependencyGroups.begin(),
+                                             generatedDependencyGroups.end());
+        CxxRequestGroup group = MakeCxxRequestGroup(groupIt->second, dependencyGroups);
         if (group.headers.empty())
         {
             return giveUp("the C++ class's import group is unavailable");
@@ -6591,6 +6745,12 @@ bool LLVMBackend::RequestCxxForeignType(const std::string& cflatName, const std:
                                         const std::string& prefixSource)
 {
         RememberCxxMangledArity(cflatName, cxxSpelling);
+        const bool incompleteTentative = tentative && !prefixSource.empty();
+        const bool upgradingTentative = retryingTentativeCxxType_
+            && cxxTentativeTypes_.count(cflatName) != 0;
+        const bool rejectClangErrors = !prefixSource.empty()
+            && cxxSpelling.find('<') != std::string::npos
+            && !cxxSpelling.starts_with("std::shared_ptr<");
         // One attempt per CFlat identity per analysis; the outcome (including the diagnostic text)
         // is replayed so a second use site reports the same reason without re-parsing libc++.
         if (auto it = cxxForeignRequests_.find(cflatName); it != cxxForeignRequests_.end()
@@ -6692,6 +6852,9 @@ bool LLVMBackend::RequestCxxForeignType(const std::string& cflatName, const std:
                     return fail(std::format("C++ type '{}' could not be parsed: {}",
                                             cxxSpelling, error));
             }
+            if (rejectClangErrors && !probe.firstError.empty())
+                return fail(std::format("C++ type '{}' could not be parsed: {}",
+                                        cxxSpelling, FirstCxxErrorLine(probe.firstError)));
             if (probe.records.empty())
                 return fail(std::format("'{}' does not name a C++ class type in the imported headers",
                                         cxxSpelling));
@@ -6765,6 +6928,9 @@ bool LLVMBackend::RequestCxxForeignType(const std::string& cflatName, const std:
             }
             else
                 raw = std::move(probe);
+            if (rejectClangErrors && !raw.firstError.empty())
+                return fail(std::format("C++ type '{}' could not be parsed: {}",
+                                        cxxSpelling, FirstCxxErrorLine(raw.firstError)));
             for (const std::string& dropped : raw.droppedCxxDefaultWrappers)
                 for (auto& record : raw.records)
                     for (auto& member : record.members)
@@ -6833,7 +6999,13 @@ bool LLVMBackend::RequestCxxForeignType(const std::string& cflatName, const std:
                 cxxForeignRequests_[cflatName] = "";
                 if (group.primary != static_cast<size_t>(-1))
                     cxxTypeOwnerGroup_[cflatName] = group.primary;
-                if (needDefinitions) cxxForeignDefinitions_.insert(cflatName);
+                if (incompleteTentative)
+                    cxxTentativeTypes_.insert(cflatName);
+                else
+                {
+                    cxxTentativeTypes_.erase(cflatName);
+                    if (needDefinitions) cxxForeignDefinitions_.insert(cflatName);
+                }
                 /*
                  * The identity this aliases onto may have been registered from a translation unit
                  * that had no body for a member (a .cpp importing an explicit instantiation
@@ -6874,7 +7046,13 @@ bool LLVMBackend::RequestCxxForeignType(const std::string& cflatName, const std:
         cxxForeignRequests_[cflatName] = "";
         if (group.primary != static_cast<size_t>(-1))
             cxxTypeOwnerGroup_[cflatName] = group.primary;
-        if (needDefinitions) cxxForeignDefinitions_.insert(cflatName);
+        if (incompleteTentative)
+            cxxTentativeTypes_.insert(cflatName);
+        else
+        {
+            cxxTentativeTypes_.erase(cflatName);
+            if (needDefinitions) cxxForeignDefinitions_.insert(cflatName);
+        }
         // Nested member-type requests can refer back to the requested specialization (for
         // example an iterator's value type). Publish an opaque shell before those requests so
         // their signatures can map the self-reference; RegisterCRecords fills this shell below.
@@ -6885,6 +7063,72 @@ bool LLVMBackend::RequestCxxForeignType(const std::string& cflatName, const std:
         // Registered BEFORE the records so a member signature naming the type itself
         // (`operator=(const vector<int>&)`, `push_back` on a nested element) maps to the CFlat name.
         RegisterCRecords(records, fileForCxxRequest);
+        if (upgradingTentative)
+        {
+            const CRecordEntry* refreshed = nullptr;
+            for (const auto& candidate : records)
+                if (candidate.name == cflatName) { refreshed = &candidate; break; }
+            if (refreshed != nullptr)
+            {
+                cxxRecordEntries_[cflatName] = *refreshed;
+                /*
+                 * The tentative pass saw the argument class as a forward declaration only, so
+                 * every member whose signature named it by VALUE or by REFERENCE (shared_ptr's
+                 * operator*, which returns 'T&') could not be mapped and was left unregistered.
+                 * A member that DID bind is no better: `get()` returning `element_type*` mapped
+                 * to a bare `void*` because the pointee was not a known CFlat type, so
+                 * `h.get()->field` finds nothing. Re-register every bindable INSTANCE member
+                 * from the complete record - drop the tentative registration for that one name
+                 * first, so the refresh replaces rather than duplicates. Structors, static
+                 * members and the layout are left alone; only the member signatures that could
+                 * name the once-incomplete argument are rebuilt.
+                 */
+                std::vector<std::string> refreshNames{ "operator->" };
+                {
+                    std::unordered_set<std::string> queued{ "operator->" };
+                    for (const auto& member : refreshed->members)
+                    {
+                        if (member.kind != cflat_cinterop::RawCxxMember::Instance) continue;
+                        if (member.access != cflat_cinterop::AccessPublic) continue;
+                        if (!member.bindRefusal.empty() || member.isDeleted) continue;
+                        if (member.needsLocalDefinition || member.linkageName.empty()) continue;
+                        if (!queued.insert(member.name).second) continue;
+                        refreshNames.push_back(member.name);
+                    }
+                }
+                for (const std::string& memberName : refreshNames)
+                {
+                    if (auto info = cxxClasses_.find(cflatName); info != cxxClasses_.end())
+                    {
+                        info->second.directMethods.erase(
+                            std::remove_if(info->second.directMethods.begin(),
+                                           info->second.directMethods.end(),
+                                           [&](const auto& method) {
+                                               return method.raw.name == memberName;
+                                           }),
+                            info->second.directMethods.end());
+                        info->second.instanceMethodNames.erase(
+                            std::remove(info->second.instanceMethodNames.begin(),
+                                        info->second.instanceMethodNames.end(), memberName),
+                            info->second.instanceMethodNames.end());
+                    }
+                    if (auto functions = functionTable.find(memberName);
+                        functions != functionTable.end())
+                    {
+                        functions->second.erase(
+                            std::remove_if(functions->second.begin(), functions->second.end(),
+                                           [&](const auto& symbol) {
+                                               return !symbol.Parameters.empty()
+                                                   && symbol.Parameters[0].TypeName == cflatName;
+                                           }),
+                            functions->second.end());
+                    }
+                    RegisterCxxClassMembers(*refreshed, fileForCxxRequest, memberName);
+                    if (auto updated = cxxClasses_.find(cflatName); updated != cxxClasses_.end())
+                        updated->second.refusedMembers.erase(memberName);
+                }
+            }
+        }
         // A header import may already have laid out this class while refusing an inline or
         // template member whose body was absent from that extraction. The request above has
         // definitions enabled, but RegisterCRecords intentionally does not replace a non-opaque
@@ -6974,7 +7218,9 @@ bool LLVMBackend::RequestGeneratedCxxType(
         // The generated wrapper has C++ special members and uses the C++ global allocator for
         // heap objects, so a standalone [cpp] struct still needs the C++ link/runtime path.
         cppInteropUsed_ = true;
-        generatedCxxRecords_[cflatName] = { literalType, fields, overrideNames, source };
+        generatedCxxRecords_[cflatName] = {
+            literalType, fields, overrideNames, source, ownerGroup
+        };
 
         // A generated class has no header of its own and contains only its CFlat byte block, so
         // use one synthetic header-free group instead of reparsing an unrelated import group.
@@ -7312,7 +7558,7 @@ bool LLVMBackend::TryRequestCxxType(const std::string& baseName,
         error.clear();
         if (!HasCxxImportGroup()) return false;
         if (baseName.find('.') == std::string::npos) return false;
-        if (IsCxxForeignTypeRegistered(cflatName))
+        if (IsCxxForeignTypeRegistered(cflatName) && !cxxTentativeTypes_.count(cflatName))
         {
             // A spelling recorded without any struct behind it (a member signature published the
             // spelling, but no request ever materialized the class under THIS identity) is not a
@@ -7416,12 +7662,26 @@ bool LLVMBackend::TryRequestCxxType(const std::string& baseName,
                 return skipped("its leading segment is not an imported C++ namespace");
         }
         return RequestCxxType(baseName, typeArgs, cflatName, error);
-    }
+}
+
+bool LLVMBackend::DecodeCxxIncompleteTemplateError(const std::string& error,
+                                                    std::string& spelling,
+                                                    std::string& typeName) const
+{
+        constexpr std::string_view marker = "\x1f" "CFLAT_INCOMPLETE_CPP_TEMPLATE" "\x1f";
+        if (!error.starts_with(marker)) return false;
+        const size_t split = error.find('\n', marker.size());
+        if (split == std::string::npos) return false;
+        spelling = error.substr(marker.size(), split - marker.size());
+        typeName = error.substr(split + 1);
+        return !spelling.empty() && !typeName.empty();
+}
 
 bool LLVMBackend::RequestCxxType(const std::string& baseName, const std::vector<std::string>& typeArgs,
                                  const std::string& cflatName, std::string& error)
 {
-        if (IsCxxForeignTypeRegistered(cflatName)) return true;
+        if (IsCxxForeignTypeRegistered(cflatName) && !cxxTentativeTypes_.count(cflatName))
+            return true;
         std::string spelling = baseName;
         size_t pos = 0;
         while ((pos = spelling.find('.', pos)) != std::string::npos)
@@ -7448,7 +7708,23 @@ bool LLVMBackend::RequestCxxType(const std::string& baseName, const std::vector<
         }
         // Inside an import group's extraction (a signature, a member, a nested type) the group is
         // already fixed and the request must not escape it.
-        if (activeCxxRequestGroup_ != nullptr) return RequestCxxForeignType(cflatName, spelling, error);
+        std::string generatedTypeSource;
+        std::set<size_t> generatedDependencyGroups;
+        std::unordered_set<std::string> incompleteTypes;
+        GeneratedCxxDefinitionsFor(typeArgs, generatedTypeSource, generatedDependencyGroups,
+                                    incompleteTypes);
+        if (activeCxxRequestGroup_ != nullptr)
+        {
+            const bool ok = RequestCxxForeignType(cflatName, spelling, error,
+                                                   /*needDefinitions*/ true,
+                                                   /*explicitInstantiation*/ true,
+                                                   /*tentative*/ !incompleteTypes.empty(),
+                                                   /*extraSource*/ {}, generatedTypeSource);
+            if (!ok && !incompleteTypes.empty() && baseName != "std.shared_ptr")
+                error = std::string("\x1f" "CFLAT_INCOMPLETE_CPP_TEMPLATE" "\x1f") + spelling + "\n"
+                    + *incompleteTypes.begin();
+            return ok;
+        }
 
         // A type spelled by CFlat code: find the import that owns the template, and bring in the
         // groups that own its template arguments so `std.vector<std.string>` still has <string>.
@@ -7464,8 +7740,16 @@ bool LLVMBackend::RequestCxxType(const std::string& baseName, const std::vector<
             if (auto owner = cxxTypeOwnerGroup_.find(elem); owner != cxxTypeOwnerGroup_.end())
                 deps.push_back(owner->second);
         }
-        return RequestCxxTypeInOwningGroup(cxxBase, cflatName, spelling, deps, error);
-    }
+        for (size_t group : generatedDependencyGroups)
+            if (std::find(deps.begin(), deps.end(), group) == deps.end()) deps.push_back(group);
+        const bool ok = RequestCxxTypeInOwningGroup(cxxBase, cflatName, spelling, deps, error,
+                                                     generatedTypeSource,
+                                                     /*retryable*/ !incompleteTypes.empty());
+        if (!ok && !incompleteTypes.empty() && baseName != "std.shared_ptr")
+            error = std::string("\x1f" "CFLAT_INCOMPLETE_CPP_TEMPLATE" "\x1f") + spelling + "\n"
+                + *incompleteTypes.begin();
+        return ok;
+}
 
 /*
  * Group resolution for a type CFlat code spells. Candidates come from what each import published,
@@ -7477,7 +7761,9 @@ bool LLVMBackend::RequestCxxType(const std::string& baseName, const std::vector<
 bool LLVMBackend::RequestCxxTypeInOwningGroup(const std::string& cxxBase,
                                               const std::string& cflatName,
                                               const std::string& spelling,
-                                              const std::vector<size_t>& deps, std::string& error)
+                                              const std::vector<size_t>& deps, std::string& error,
+                                              const std::string& prefixSource,
+                                              bool retryable)
 {
         const std::vector<size_t> order = CandidateCxxGroupsFor(cxxBase);
         if (order.empty())
@@ -7492,7 +7778,9 @@ bool LLVMBackend::RequestCxxTypeInOwningGroup(const std::string& cxxBase,
             CxxRequestGroupScope guard(*this, &group);
             std::string localError;
             if (RequestCxxForeignType(cflatName, spelling, localError, /*needDefinitions*/ true,
-                                      /*explicitInstantiation*/ true, /*tentative*/ !last))
+                                      /*explicitInstantiation*/ true,
+                                      /*tentative*/ !last || retryable,
+                                      /*extraSource*/ {}, prefixSource))
             {
                 cxxTemplateOwnerGroup_[cxxBase] = order[k];
                 cxxTypeOwnerGroup_[cflatName] = order[k];
@@ -9739,6 +10027,16 @@ void LLVMBackend::RecordCppStructBase(const std::string& structName,
         if (!structName.empty() && !baseName.empty()) cppStructBases_[structName] = baseName;
 }
 
+void LLVMBackend::RegisterCppStructName(const std::string& structName)
+{
+        if (!structName.empty()) cppStructNames_.insert(structName);
+}
+
+bool LLVMBackend::IsCppStructName(const std::string& structName) const
+{
+        return cppStructNames_.count(structName) != 0;
+}
+
 void LLVMBackend::RegisterCppStructProtectedBaseMembers(const std::string& structName)
 {
         std::string baseName;
@@ -11543,7 +11841,13 @@ static LLVMBackend::TypeAndValue InferImplicitCxxArgumentType(
         const LLVMBackend::NamedVariable& arg, const LLVMBackend& backend)
 {
         LLVMBackend::TypeAndValue type = arg.TypeAndValue;
-        if (!type.TypeName.empty() || type.Pointer || arg.BaseType == nullptr) return type;
+        if (!type.TypeName.empty() || type.Pointer || arg.BaseType == nullptr)
+            return type;
+        if (!arg.InferSourceTypeName.empty())
+        {
+            type.TypeName = arg.InferSourceTypeName;
+            return type;
+        }
 
         if (arg.BaseType->isFloatingPointTy())
         {
@@ -11592,6 +11896,13 @@ bool LLVMBackend::CanImplicitlyConstructCxxClass(const NamedVariable& arg,
 
         TypeAndValue argType = InferImplicitCxxArgumentType(arg, *this);
         if (argType.TypeName.empty()) return false;
+        std::string argSpelling;
+        std::string paramSpelling;
+        if (CxxSpellingForCflatType(argType.TypeName, argSpelling)
+            && CxxSpellingForCflatType(param.TypeName, paramSpelling)
+            && SqueezeCxxSpelling(argSpelling) == SqueezeCxxSpelling(paramSpelling))
+            return false;
+        if (IsCxxSharedPtrUpcast(argType, param)) return true;
         // A derived lvalue binds directly to a C++ base reference. Do not turn that standard
         // conversion into a user-defined base copy, even when the base has a copy constructor.
         if (param.IsAlias && !param.ElemPointer && IsCxxDerivedToBaseValue(argType, param))
@@ -11625,10 +11936,62 @@ bool LLVMBackend::IsCxxDerivedToBaseValue(const TypeAndValue& from, const TypeAn
         return IsCxxBaseOf(to.TypeName, from.TypeName);
 }
 
+bool LLVMBackend::IsCxxSharedPtrUpcast(const TypeAndValue& from,
+                                       const TypeAndValue& to) const
+{
+        if (from.Pointer || from.TypeName.empty() || to.TypeName.empty()) return false;
+        TypeSpelling fromSpelling;
+        TypeSpelling toSpelling;
+        if (!DemangleType(*this, from.TypeName, fromSpelling)
+            || !DemangleType(*this, to.TypeName, toSpelling)
+            || fromSpelling.base != "std.shared_ptr"
+            || toSpelling.base != "std.shared_ptr"
+            || fromSpelling.args.size() != 1 || toSpelling.args.size() != 1)
+            return false;
+        TypeAndValue sourceElement{ .TypeName = MangleType(*this, fromSpelling.args[0]) };
+        TypeAndValue targetElement{ .TypeName = MangleType(*this, toSpelling.args[0]) };
+        return IsCxxRecord(sourceElement.TypeName) && IsCxxRecord(targetElement.TypeName)
+            && IsCxxBaseOf(targetElement.TypeName, sourceElement.TypeName);
+}
+
 bool LLVMBackend::MaterializeImplicitCxxClassArgument(NamedVariable& arg,
                                                        const TypeAndValue& param)
 {
         TypeAndValue argType = InferImplicitCxxArgumentType(arg, *this);
+        const bool sharedPtrConversion = IsCxxSharedPtrUpcast(argType, param);
+        if (sharedPtrConversion)
+        {
+            TypeAndValue classType{ .TypeName = param.TypeName };
+            llvm::Type* objectType = GetType(classType);
+            if (objectType == nullptr || !objectType->isSized()) return false;
+            NamedVariable source = arg;
+            source.TypeAndValue = argType;
+            source.TypeAndValue.VariableName.clear();
+            std::string wrapperName;
+            std::string wrapperError;
+            if (!RequestCxxVariadicConstructor(param.TypeName, { source }, wrapperName,
+                                               wrapperError))
+                return false;
+            auto* wrapperSlot = CreateAlloca(objectType);
+            NamedVariable self;
+            self.Primary = wrapperSlot;
+            self.BaseType = wrapperSlot->getType();
+            self.TypeAndValue.TypeName = param.TypeName;
+            self.TypeAndValue.Pointer = true;
+            self.IsRvalue = true;
+            CreateOverloadedFunctionCall(wrapperName, { self, source });
+            if (IsForeignNontrivialCxxClass(param.TypeName))
+                RegisterOwnedStructTemp(wrapperSlot, param.TypeName);
+            NamedVariable converted;
+            converted.Primary = CreateLoad(objectType, wrapperSlot);
+            converted.Storage = wrapperSlot;
+            converted.BaseType = objectType;
+            converted.TypeAndValue.TypeName = param.TypeName;
+            converted.TypeAndValue.VariableName = arg.TypeAndValue.VariableName;
+            converted.IsRvalue = true;
+            arg = std::move(converted);
+            return true;
+        }
         uint64_t baseOffset = 0;
         bool baseInaccessible = false;
         const bool slicesToBase = IsCxxDerivedToBaseValue(argType, param)
@@ -11654,6 +12017,7 @@ bool LLVMBackend::MaterializeImplicitCxxClassArgument(NamedVariable& arg,
             if (info == nullptr || !info->constructors.empty()) return false;
             NamedVariable source = arg;
             source.TypeAndValue = argType;
+            source.TypeAndValue.VariableName.clear();
             std::string wrapperName;
             std::string wrapperError;
             if (!RequestCxxVariadicConstructor(param.TypeName, { source }, wrapperName,

@@ -1400,6 +1400,9 @@ public:
         // True only for a value-producing expression. Named variables, fields, elements, aliases,
         // and dereferences remain lvalues even when their LLVM value has no storage of its own.
         bool IsRvalue = false;
+        // True when the source expression is a string literal. The lowered pointer may be wrapped
+        // in a constant expression before overload matching, so LLVM identity alone is insufficient.
+        bool IsStringLiteral = false;
         // compile-time: this POINTER binding was declared or assigned from an ADDRESS-OF value, so
         // it provably borrows - `&x` never yields an owner. Positive provenance recorded where the
         // binding is produced (never re-derived from IR); not part of the --init cache round-trip.
@@ -3221,12 +3224,18 @@ private:
         std::vector<DeclTypeAndValue> fields;
         std::set<std::string> overrideNames;
         std::string source;
+        size_t ownerGroup = static_cast<size_t>(-1);
     };
     // Temporary layout recipe used while RegisterCRecords replaces __cflat_fields with the
     // original CFlat fields. It is populated before the generated class request is harvested.
     std::unordered_map<std::string, GeneratedCxxRecord> generatedCxxRecords_;
+    std::unordered_set<std::string> cppStructNames_;
     // A layout-only nested type may be upgraded later when CFlat calls one of its methods.
     std::unordered_set<std::string> cxxForeignDefinitions_;
+    // Class-template requests made against a generated struct's forward declaration are retried
+    // when that struct's definition becomes available.
+    std::unordered_set<std::string> cxxTentativeTypes_;
+    bool retryingTentativeCxxType_ = false;
     /*
      * M5 companion modules: one LLVM bitcode blob per C++ import group, holding the definitions
      * Clang emitted for the bound surface (linkonce_odr inline bodies, vtables/RTTI with their
@@ -5095,7 +5104,9 @@ private:
     bool CxxSignatureTypesRegistered(const CSigEntry& entry);
     bool RequestCxxTypeInOwningGroup(const std::string& cxxBase, const std::string& cflatName,
                                      const std::string& spelling,
-                                     const std::vector<size_t>& deps, std::string& error);
+                                     const std::vector<size_t>& deps, std::string& error,
+                                     const std::string& prefixSource = {},
+                                     bool retryable = false);
     // RAII: the group every request made while it is alive compiles against.
     struct CxxRequestGroupScope
     {
@@ -5120,6 +5131,13 @@ private:
                                  std::string& error,
                                  size_t ownerGroup = static_cast<size_t>(-1),
                                  const std::set<std::string>& overrideNames = {});
+    void GeneratedCxxDefinitionsFor(const std::vector<std::string>& cflatTypeNames,
+                                    std::string& outSource,
+                                    std::set<size_t>& outDependencyGroups,
+                                    std::unordered_set<std::string>& outIncompleteTypes) const;
+    bool HasTentativeCxxTypeFor(const std::string& generatedTypeName) const;
+    std::vector<std::pair<std::string, std::string>> RetryTentativeCxxTypesFor(
+        const std::string& generatedTypeName);
     bool GetGeneratedCxxFieldBlock(const std::string& typeName, uint64_t& start,
                                    uint64_t& length) const;
     void RegisterGeneratedCxxOverrideNames(const std::string& typeName,
@@ -5189,6 +5207,8 @@ private:
      */
     bool TryRequestCxxType(const std::string& baseName, const std::vector<std::string>& typeArgs,
                            const std::string& cflatName, std::string& error);
+    bool DecodeCxxIncompleteTemplateError(const std::string& error,
+                                          std::string& spelling, std::string& typeName) const;
     bool IsCxxForeignTypeRegistered(const std::string& cflatName) const;
     bool IsStdFunctionSpecialization(const std::string& name) const
     {
@@ -7470,6 +7490,8 @@ public:
         const std::string& baseType) const;
     bool CxxBaseHasAccessibleMoveOrCopy(const std::string& baseType) const;
     void RecordCppStructBase(const std::string& structName, const std::string& baseName);
+    void RegisterCppStructName(const std::string& structName);
+    bool IsCppStructName(const std::string& structName) const;
     void RegisterCppStructProtectedBaseMembers(const std::string& structName);
     bool GetCppStructBase(const std::string& structName, std::string& baseName) const;
     bool GetCxxTypeOwnerGroup(const std::string& typeName, size_t& group) const;
@@ -8805,6 +8827,7 @@ public:
     // base subobject offset added. Non-public bases are refused at the conversion site.
     // A C++ class VALUE slices to a by-value/by-reference parameter of a PUBLIC base of it.
     bool IsCxxDerivedToBaseValue(const TypeAndValue& from, const TypeAndValue& to) const;
+    bool IsCxxSharedPtrUpcast(const TypeAndValue& from, const TypeAndValue& to) const;
     bool IsCxxDerivedToBasePointer(const TypeAndValue& from, const TypeAndValue& to) const
     {
         if (!from.Pointer || !to.Pointer) return false;

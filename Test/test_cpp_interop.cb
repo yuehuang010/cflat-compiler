@@ -177,6 +177,10 @@
 //   Section M77 (1480-1499): C++ by-value return temporaries and inherited member-template lookup,
 //                       including constructor and sret returns, nested returns, unrelated temps,
 //                       and implicit/explicit receiver spellings.
+//   Section M78 (1500-1553): std::make_shared/std::shared_ptr of CFlat-defined [cpp] structs,
+//                       generated constructors/destructors, virtual dispatch, conversions,
+//                       recursive template arguments, incomplete ordering, move ownership,
+//                       promotion, receiver sret, member-template overloads, and ref/value rank.
 // Section M: C++ interop - `import cpp` selects C++ mode; the extension is irrelevant (the
 // fixture header is a plain .h). The header supplies the declarations, the .cpp is compiled
 // by the host C++ driver and linked in. Both are needed: the header alone has no
@@ -206,6 +210,7 @@ import cpp "chrono";
 import cpp "string";
 import cpp "functional";
 
+int m78global = 42;
 extern int strcmp(const char* a, const char* b);
 int my_inc_cb(int x) { return x + 1; }
 
@@ -514,6 +519,63 @@ struct M77PlainReturns
     M77Registry() { ctor_reg = reg("x", 3); }
     int implicit_reg(int value) { return reg("y", value); }
     int explicit_reg(int value) { return this->reg<int>("z", value); }
+};
+
+struct M78Net : cppt.ModuleBase
+{
+    std.shared_ptr<M78Leaf> left = default;
+    std.shared_ptr<M78Leaf> right = default;
+    M78Net() {}
+    override int forward(int x) { return call_child(1, call_child(0, x)); }
+};
+
+struct M78Leaf : cppt.ModuleBase
+{
+    int value = 0;
+    M78Leaf(int v) { value = v; }
+    override int forward(int x) { return x * value; }
+};
+
+void m78_init_net(M78Net* net)
+{
+    net->register_child("left", std.make_shared<M78Leaf>(2));
+    net->register_child("right", std.make_shared<M78Leaf>(3));
+}
+
+// Same registration, but the handles also land in M78Net's own shared_ptr FIELDS. M78Net is
+// declared before M78Leaf, so those fields were requested against a forward declaration only.
+void m78_bind_net(M78Net* net)
+{
+    net->left = net->register_child("left", std.make_shared<M78Leaf>(2));
+    net->right = net->register_child("right", std.make_shared<M78Leaf>(3));
+}
+
+struct M78Self : cppt.ModuleBase
+{
+    std.shared_ptr<M78Self> self = default;
+    override int forward(int x) { return x + 1; }
+};
+
+struct M78HolderBlock : cppt.ModuleBase
+{
+    std.shared_ptr<cppt.ModuleBase> leaf = default;
+    M78HolderBlock(int v)
+    {
+        cppt.HolderOf<cppt.ModuleBase> holder =
+            cppt.HolderOf<cppt.ModuleBase>(std.make_shared<cppt.ModuleBase>());
+        leaf = register_child("leaf", holder);
+    }
+    override int forward(int x) { return leaf->forward(x) + 1; }
+};
+
+struct M78HolderNet : cppt.ModuleBase
+{
+    std.shared_ptr<M78HolderBlock> block = default;
+    M78HolderNet(int v)
+    {
+        block = register_child("block", std.make_shared<M78HolderBlock>(v));
+    }
+    override int forward(int x) { return block->forward(x) + 1; }
 };
 
 Plain m73_make_plain(int value)
@@ -3294,6 +3356,134 @@ extern int main()
     if (m77registry.implicit_reg(5) != 7) return 1497;
     if (m77registry.explicit_reg(6) != 8) return 1498;
     if (m77registry.plain() != 7) return 1499;
+
+    // ---- Section M78: make_shared of CFlat-defined [cpp] structs (1500-1553) --
+    cppt.reset_module_dtors();
+    {
+        std.shared_ptr<M78Leaf> leaf = std.make_shared<M78Leaf>(3);
+        if (leaf->value != 3) return 1500;
+        if (leaf->forward(2) != 6) return 1501;
+        if (cppt.run_module(leaf, 2) != 6) return 1502;
+        if (cppt.module_use_count(leaf) != 1) return 1503;
+    }
+    if (cppt.module_dtors() != 1) return 1504;
+
+    cppt.reset_module_dtors();
+    {
+        std.shared_ptr<M78Leaf> leaf = std.make_shared<M78Leaf>(3);
+        std.shared_ptr<cppt.ModuleBase> base = leaf;
+        if (cppt.run_module(base, 2) != 6) return 1505;
+        if (cppt.run_module(leaf, 5) != 15) return 1506;
+        if (cppt.module_use_count(base) != 2) return 1507;
+        if (cppt.module_use_count(leaf) != 2) return 1508;
+    }
+    if (cppt.module_dtors() != 1) return 1509;
+
+    cppt.reset_module_dtors();
+    {
+        std.shared_ptr<M78Net> net = std.make_shared<M78Net>();
+        m78_init_net(net.get());
+        if (net->child_count() != 2) return 1510;
+        if (net->call_child(1, 2) != 6) return 1511;
+        if (net->forward(1) != 6) return 1512;
+        std.shared_ptr<cppt.ModuleBase> base = net;
+        if (cppt.run_module(base, 1) != 6) return 1513;
+    }
+    if (cppt.module_dtors() != 3) return 1514;
+
+    cppt.reset_module_dtors();
+    {
+        std.shared_ptr<M78Net> net = std.make_shared<M78Net>();
+        m78_init_net(net.get());
+        std.shared_ptr<M78Leaf> local = std.make_shared<M78Leaf>(4);
+        std.shared_ptr<M78Leaf> returned = net->register_child("local", local);
+        if (net->child_count() != 3) return 1515;
+        if (cppt.module_use_count(local) != 3) return 1516;
+        if (returned->forward(2) != 8) return 1517;
+    }
+    if (cppt.module_dtors() != 4) return 1518;
+
+    cppt.reset_module_dtors();
+    {
+        M78Net net = M78Net();
+        m78_init_net(&net);
+        if (net.forward(1) != 6) return 1519;
+        if (net.child_count() != 2) return 1520;
+    }
+    if (cppt.module_dtors() != 3) return 1521;
+
+    {
+        M78Self self = M78Self();
+        if (self.forward(4) != 5) return 1522;
+    }
+
+    {
+        std.vector<std.shared_ptr<M78Leaf>> values = default;
+        values.push_back(std.make_shared<M78Leaf>(2));
+        values.push_back(std.make_shared<M78Leaf>(5));
+        if (values[0]->forward(2) != 4) return 1523;
+        if (values[1]->forward(2) != 10) return 1524;
+        if (cppt.module_use_count(values[0]) != 1) return 1525;
+        if (cppt.module_use_count(values[1]) != 1) return 1526;
+    }
+
+    {
+        std.shared_ptr<M78Leaf> source = std.make_shared<M78Leaf>(7);
+        std.shared_ptr<M78Leaf> target = move source;
+        if (cppt.module_use_count(target) != 1) return 1527;
+        if (target->forward(2) != 14) return 1528;
+    }
+    if (cppt.module_dtors() != 7) return 1529;
+    cppt.reset_module_dtors();
+    if (cppt.module_dtors() != 0) return 1529;
+
+    cppt.reset_module_dtors();
+    {
+        std.shared_ptr<M78Net> net = std.make_shared<M78Net>();
+        std.shared_ptr<M78Leaf> got = net->take(std.make_shared<M78Leaf>(4));
+        if (got->forward(1) != 4) return 1530;
+    }
+    if (cppt.module_dtors() != 2) return 1531;
+
+    cppt.reset_module_dtors();
+    {
+        std.shared_ptr<M78HolderNet> net = std.make_shared<M78HolderNet>(4);
+        if (net->child_count() != 1) return 1535;
+        if (net->call_child(0, 2) != 3) return 1536;
+        if (net->forward(2) != 4) return 1537;
+        if (cppt.module_use_count(net) != 1) return 1538;
+    }
+    if (cppt.module_dtors() != 3) return 1539;
+
+    std.string m78text = std.string("abcd");
+    if (cppt.m78_pick_string(m78text) != 24) return 1540;
+    if (cppt.m78_pick_string(std.string("abc")) != 13) return 1541;
+    if (cppt.m78_pick_pointer(&m78global) != 11) return 1542;
+
+    // A shared_ptr FIELD whose argument class is declared after the owner: the field's type was
+    // registered from a forward declaration and promoted when M78Leaf's definition arrived. Every
+    // member below is one the promotion has to hand back complete - operator*, get() with a real
+    // pointee type (not a bare void*), use_count, copy, and assignment from a temporary.
+    cppt.reset_module_dtors();
+    {
+        std.shared_ptr<M78Net> net = std.make_shared<M78Net>();
+        m78_bind_net(net.get());
+        if ((*net->left).forward(3) != 6) return 1543;
+        if ((*net->right).value != 3) return 1544;
+        if (net->left.get()->value != 2) return 1545;
+        if (net->left.get()->forward(4) != 8) return 1546;
+        if ((int)net->left.use_count() != 2) return 1547;
+        std.shared_ptr<M78Leaf> handle = net->left;
+        std.shared_ptr<M78Leaf> second = handle;
+        if ((int)handle.use_count() != 3) return 1548;
+        if (second.get()->forward(5) != 10) return 1549;
+        if ((*second).value != 2) return 1550;
+        std.shared_ptr<M78Leaf> fresh = std.make_shared<M78Leaf>(7);
+        if (fresh.get()->value != 7) return 1551;
+        fresh = std.make_shared<M78Leaf>(9);
+        if ((*fresh).forward(2) != 18) return 1552;
+    }
+    if (cppt.module_dtors() != 5) return 1553;
 
     return 0;
 }

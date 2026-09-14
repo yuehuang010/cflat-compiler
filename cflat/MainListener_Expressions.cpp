@@ -309,6 +309,9 @@ LLVMBackend::NamedVariable MainListener::ParseAssignmentExpressionNamed(CFlatPar
                                                         // the use unchanged. Any operator/value context
                                                         // takes the fallback below with ResultUse::Value.
                                                         auto passthrough = ParseCastExpression(muls[0], false, use);
+                                                        const std::string text = ctx->getText();
+                                                        passthrough.IsStringLiteral = text.size() >= 2
+                                                            && text.front() == '"' && text.back() == '"';
                                                         return FinishAssignmentExpressionNamed(passthrough, savedOwned);
                                                     }
                                                 }
@@ -447,6 +450,9 @@ LLVMBackend::NamedVariable MainListener::ParseAssignmentExpressionNamed(CFlatPar
                 if (result.TypeAndValue.TypeName.empty())
                     result.TypeAndValue.TypeName = LLVMTypeToTypeName(result.Primary->getType());
             }
+            const std::string text = ctx->getText();
+            result.IsStringLiteral = text.size() >= 2
+                && text.front() == '"' && text.back() == '"';
             result.TernaryTempAlreadyRegistered = inCallArgument_
                 && result.Primary != nullptr && llvm::isa<llvm::PHINode>(result.Primary)
                 && !TernaryIsBinaryOperand(condCtx);
@@ -9665,7 +9671,7 @@ LLVMBackend::TypeAndValue MainListener::ParseTypeName(CFlatParser::TypeNameConte
                     std::string cxxError;
                     const bool cxxType = compilerLLVM->TryRequestCxxType(
                         baseName, typeArgs, typeValue.TypeName, cxxError);
-                    if (!cxxType && !cxxError.empty()) LogErrorContext(genParams, cxxError);
+                    if (!cxxType && !cxxError.empty()) LogCxxErrorContext(genParams, cxxError);
                     bool hasLongDouble = false;
                     for (const auto& arg : typeArgs)
                         hasLongDouble = hasLongDouble || arg == "longdouble";

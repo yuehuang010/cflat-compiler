@@ -191,8 +191,9 @@ and every diagnostic in the table above.
 Multiple bases, virtual bases, new virtuals visible to C++, `base.m()` qualified calls to the
 overridden base implementation, protected base members reached through a derived-typed pointer
 other than `this` (C++ allows it; the gate keys on `this`), generic `[cpp] struct` (per-instantiation
-generated classes; p2 issue internal/issue/p2/cpp-struct-generic-instantiations.md), `std::make_shared<Foo>` (timebox 2),
-`unique_ptr` vs `unique<T>` mapping, MSVC verification.
+generated classes; p2 issue internal/issue/p2/cpp-struct-generic-instantiations.md), `[cpp] struct`
+by value inside a std container (p3 issue), `unique_ptr` vs `unique<T>` mapping,
+MSVC verification.
 
 ## Landed after v1 (same day, working tree)
 
@@ -207,3 +208,25 @@ generated classes; p2 issue internal/issue/p2/cpp-struct-generic-instantiations.
   err_cpp_struct_member_tpl_no_this. `register_module` therefore works in v1 with a
   `std.shared_ptr<torch.nn.LinearImpl>` field; `std::make_shared<Net>` of a `[cpp] struct`
   remains timebox 2.
+- Timebox 2 (2026-09-14, runs H and I, 7 h): `std.shared_ptr<Leaf>` / `std.make_shared<Leaf>(...)`
+  of a `[cpp] struct`. Class-template type requests now inject the generated class text
+  (`GeneratedCxxDefinitionsFor`, through `prefixSource` so the disk-cache key covers it) with
+  the base's header groups; a struct used as a template argument before its definition gets a
+  forward declaration (tentative request) and is promoted when the definition appears, a
+  template needing the complete type (`std.vector<Leaf>`, `std.deque<Leaf>`) before the
+  definition reports `'{}' needs the complete definition of [cpp] struct '{}'; define the
+  struct before this use`. Member templates with several same-arity overloads keep every
+  overload (torch's `register_module(string, shared_ptr<T>)` / `(string, ModuleHolder<T>)`),
+  and instantiations are keyed by owner. Upcast `shared_ptr<Leaf>` -> `shared_ptr<Base>` by
+  declaration and at calls; virtual dispatch from C++ through the base handle reaches the
+  CFlat override; make_shared runs the generated ctor and `~Leaf` runs the CFlat dtor.
+  A forward-declared (tentative) specialization is promoted by re-registering its whole
+  instance member set once the definition exists (`get()` / `operator*` on a handle whose
+  argument class is declared later). Fixture M78 (1500-1553), err files tpl_arg_incomplete (+deque), ladder rung t30 (custom
+  Block sub-module via make_shared, Net via make_shared, upcast to shared_ptr<Module>,
+  children()==2, trains). Known: `std.vector<Leaf>` BY VALUE fails at the request
+  (internal/issue/p3/cpp-struct-by-value-in-std-container.md); copying a nontrivial C++ class
+  value out of a FIELD skips the copy constructor and the copy is later treated as owning
+  (internal/issue/p2/cpp-class-copy-from-field-skips-copy-ctor.md, general interop, needs a
+  ruling); the fixture cold compile is ~120 s
+  (internal/issue/p2/cpp-interop-fixture-near-timeout.md, test.sh timeout 240).

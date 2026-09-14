@@ -58,6 +58,10 @@
       "*",
       "unsigned int"
     ],
+    "arg0needsthecomplete...estructbeforethisuse7711d1ec2f176e02": [
+      "std::vector<__cflat_user::Leaf>",
+      "Leaf"
+    ],
     "arg0noarg1functiontoexecute": [
       "--run",
       "main"
@@ -1775,6 +1779,7 @@
     "arg0isneverused": "'{0}' is never used",
     "arg0msvclibdirectory...componentisinstalled740fffb28d2f2687": "{0}: MSVC lib directory not found, cannot locate the asan runtime (clang_rt.asan_dynamic). Ensure Visual Studio with the C++ AddressSanitizer component is installed.",
     "arg0mustfollowthecompletetypearg1": "'{0}' must follow the complete type '{1}'",
+    "arg0needsthecomplete...estructbeforethisuse7711d1ec2f176e02": "'{0}' needs the complete definition of [cpp] struct '{1}'; define the struct before this use",
     "arg0noarg1functiontoexecute": "{0}: no '{1}' function to execute.",
     "arg0onmacosrequirest...itinstalloneandretrye35e64f15dcf4410": "{0} on macOS requires the AddressSanitizer runtime from Xcode or the Command Line Tools (the SDK-free harvested-stub link cannot supply it); install one and retry.",
     "arg0programarguments...arearg3toreceivetheme5d8489038a4ceae": "{0}: program arguments were supplied after '{1}', but '{2}' takes no parameters. Declare '{3}' to receive them.",

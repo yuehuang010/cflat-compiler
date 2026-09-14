@@ -362,6 +362,14 @@ an inherited C++ MEMBER TEMPLATE (`register_module(...)` without `this->`) repor
 variable`; the bare-identifier arm now falls back to `this` when the receiver type has such a
 template member and nothing else matches. Fixture M77 (1480-1499), err file
 `err_cpp_struct_member_tpl_no_this.cb`. t29 is in the ladder list (t1-t29). Suite 969/0/8.
+Timebox 2 (2026-09-14, runs H/I, details in the M10 plan's "Landed after v1"): make_shared /
+shared_ptr of a `[cpp] struct` - generated class text injected into class-template requests,
+tentative forward-declared requests promoted on definition, same-arity member-template
+overloads retained and keyed by owner, shared_ptr upcasts, M78, rung t30. Overload-ranking
+fixes found by review: address-of-global no longer counts as a string literal; C++ by-value vs
+by-reference candidates distinguished. Open: p3 by-value container issue, p2 fixture-time
+issue (test.sh timeout 240), p2 generic [cpp] struct, p2 copy-from-field skips the C++ copy
+constructor (general interop, needs a ruling). Suite 973/0/8.
 Not in v1: multiple bases, virtual bases, new virtuals visible to C++, `base.m()` calls to the
 overridden implementation, protected access through a derived-typed pointer other than `this`,
 `std::make_shared<Foo>` / `register_module` (timebox 2), MSVC verification.
@@ -1164,9 +1172,9 @@ Eigen -> libtorch; spikes under scratch/ladder/). Landed on master, in order:
   `longdouble`, ...), longest spelling first, so `std::vector<size_t>` has one identity on both
   paths; `ApFloatToDouble` reports lossy long-double folds under -v; header cache -> 55; M72
   1350-1359.
-State (working tree, 2026-09-13 night, M10 v1 + runs F/G): everything below plus `[cpp] struct` v1 with
-template bases and the nn::Module spike fixes (see M10); test.sh Release 969/0/8, header cache v56, fixture
-sections to M77 (row 1499), 36 err_cpp_struct files, ladder t1-t29.
+State (working tree, 2026-09-14 early, M10 v1 + runs F/G committed as 99f4488c, timebox 2 runs H/I uncommitted): everything below plus `[cpp] struct` v1 with
+template bases and the nn::Module spike fixes (see M10); test.sh Release 973/0/8, header cache v56, fixture
+sections to M78 (row 1553), 38 err_cpp_struct files, ladder t1-t30; test.sh timeout 240 s.
 Previous state (working tree, 2026-09-13 10:04, round 9): scratch/ladder/torch/ t1-t28 all compile, link and run
 on the final build (run_all.sh -j 3, ~30 min); test.sh Release 897/0/8, LSP and examples green, header
 cache v55, interop fixture cold + 4 warm -v compiles rc 0; fixture sections to M72 (row 1359).

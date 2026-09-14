@@ -65,7 +65,9 @@ LIB="$ROOT/Test/library"
 LOCALE_DIR="$ROOT/cflat/locales"
 OUT="$ROOT/out-linux"
 RES="$OUT/results"
-TIMEOUT_SECS=120
+# 240: test_cpp_interop cold-compiles in ~117 s standalone (every C++ type request re-runs
+# clang; see internal/issue/p2/cpp-interop-fixture-near-timeout.md). test.bat uses 600.
+TIMEOUT_SECS=240
 
 # GNU coreutils timeout: `timeout` on Linux, `gtimeout` on macOS (brew coreutils).
 # Fall back to no wrapper if neither exists so tests still run (just unbounded).

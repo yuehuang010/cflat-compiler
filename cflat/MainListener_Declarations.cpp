@@ -118,7 +118,7 @@ std::string MainListener::ResolveTypeArgEntry(CFlatParser::TypeParameterEntryCon
                 std::string cxxError;
                 if (!Compiler()->TryRequestCxxType(innerBase, innerArgs, resolved, cxxError)
                     && !cxxError.empty())
-                    LogErrorContext(entry, cxxError);
+                    LogCxxErrorContext(entry, cxxError);
                 resolved = Compiler()->ResolveTypeAlias(resolved);   // alias-spelled specialization
             }
             if (IsCoreUniqueArrayViewInstantiation(Compiler(), resolved, innerArgs))
@@ -921,7 +921,7 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                         const bool cxxType = Compiler(declSpecs)->TryRequestCxxType(
                             baseName, typeArgs, mangledName, cxxError);
                         if (!cxxType && !cxxError.empty())
-                            LogErrorContext(genParams, cxxError);
+                            LogCxxErrorContext(genParams, cxxError);
                         bool hasLongDouble = false;
                         for (const auto& arg : typeArgs)
                             hasLongDouble = hasLongDouble || arg == "longdouble";
@@ -2244,7 +2244,8 @@ void MainListener::ParseExternalDeclaration(CFlatParser::ExternalDeclarationCont
         }
         else if (dataStruct != nullptr)
         {
-            ParseStructDefinition(dataStruct, {}, namespaceName);
+            if (preparsedCppStructDefinitions_.erase(dataStruct) == 0)
+                ParseStructDefinition(dataStruct, {}, namespaceName);
         }
         else if (classDef != nullptr)
         {
@@ -4047,6 +4048,26 @@ cxx_dtor_ready:
             if (IsBareIdentifierText(srcText))
             {
                 auto* srcNV = compiler->FindLiveNamedVariable(srcText);
+                if (srcNV != nullptr && srcNV->Storage != nullptr && !srcNV->TypeAndValue.Pointer
+                    && compiler->CanImplicitlyConstructCxxClass(*srcNV, declType, true))
+                {
+                    std::string wrapperName;
+                    std::string wrapperError;
+                    if (compiler->RequestCxxVariadicConstructor(
+                            typeName, { *srcNV }, wrapperName, wrapperError))
+                    {
+                        LLVMBackend::NamedVariable self;
+                        self.Primary = slot;
+                        self.BaseType = slot->getType();
+                        self.TypeAndValue.TypeName = typeName;
+                        self.TypeAndValue.Pointer = true;
+                        self.IsRvalue = true;
+                        auto source = *srcNV;
+                        source.TypeAndValue.VariableName.clear();
+                        compiler->CreateOverloadedFunctionCall(wrapperName, { self, source });
+                        return true;
+                    }
+                }
                 if (srcNV != nullptr && srcNV->Storage != nullptr && !srcNV->TypeAndValue.Pointer
                     && srcNV->TypeAndValue.TypeName == typeName)
                 {
