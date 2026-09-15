@@ -2841,6 +2841,39 @@ namespace cflat_cinterop
         }
 
         /*
+         * Microsoft ABI only. A constructor stores the vfptr, so emitting one references the
+         * vftable, and MSVC-compatible CodeGen emits that vftable linkonce_odr in every TU - even
+         * for an explicit instantiation DECLARATION (`extern template struct X<int>;`), where
+         * Itanium would leave the vtable to the library. The vftable then pulls in the deleting
+         * destructor and every virtual member, but Sema never instantiated those inline bodies
+         * (the explicit instantiation declaration suppresses it and nothing in the header used
+         * the vtable), and CodeGen crashes generating a structor with no body. Let Sema do what
+         * it does for a real TU that uses the vtable: mark it used and define its members.
+         */
+        void DefineMicrosoftVTableMembers(ExtractState& st, ASTContext& ctx)
+        {
+            if (!st.ci->hasSema() || !ctx.getTargetInfo().getCXXABI().isMicrosoft()) return;
+            Sema& sema = st.ci->getSema();
+            std::unordered_set<const CXXRecordDecl*> seen;
+            bool marked = false;
+            auto markVTable = [&](const CXXRecordDecl* queued) {
+                const CXXRecordDecl* rd = CompleteNonDependentCxxRecord(queued);
+                if (rd == nullptr || !rd->isDynamicClass() || rd->isInvalidDecl()
+                    || !seen.insert(rd).second)
+                    return;
+                sema.MarkVTableUsed(rd->getLocation(), const_cast<CXXRecordDecl*>(rd),
+                                    /*DefinitionRequired*/ true);
+                marked = true;
+            };
+            for (const CXXRecordDecl* rd : st.headerSpecialMemberWork) markVTable(rd);
+            for (const auto& w : st.memberAbiWork)
+                if (w.md != nullptr) markVTable(w.md->getParent());
+            if (!marked) return;
+            sema.DefineUsedVTables();
+            sema.PerformPendingInstantiations();
+        }
+
+        /*
          * An error clang raised inside a header the caller asked to bind poisons everything
          * downstream: Sema marks the offending declarations invalid, every instantiation that
          * touches them comes out holding error expressions, and companion CodeGen would then walk
@@ -2879,6 +2912,7 @@ namespace cflat_cinterop
             if (st.ci == nullptr) return;
             DefineHeaderImplicitSpecialMembers(st);
             DefineDefaultedSpecialMembers(st);
+            DefineMicrosoftVTableMembers(st, ctx);
             if (st.abiWork.empty() && st.functionPointerAbiWork.empty()
                 && st.memberAbiWork.empty() && !st.req.emitDefinitions) return;
             using namespace clang::CodeGen;

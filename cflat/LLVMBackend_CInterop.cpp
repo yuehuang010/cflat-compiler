@@ -5415,6 +5415,55 @@ bool LLVMBackend::TryBindCxxImplicitDefaultCtor(const std::string& typeName, std
         return true;
 }
 
+/*
+ * Move construction for a class whose record lists no move or copy constructor cflat can call.
+ * A constructor TEMPLATE is never listed as one (MSVC STL spells `unique_ptr(unique_ptr&&)` as a
+ * template constrained on the deleter), yet C++ picks it for an rvalue. Let clang do that overload
+ * resolution in a generated wrapper; a class that really cannot be moved fails to compile there,
+ * and the caller keeps its own diagnostic.
+ */
+const LLVMBackend::CxxClassInfo::Structor* LLVMBackend::TryBindCxxGeneratedMoveCtor(
+        const std::string& typeName)
+{
+        auto infoIt = cxxClasses_.find(typeName);
+        if (infoIt == cxxClasses_.end()) return nullptr;
+        std::string ownerSpelling;
+        if (!CxxSpellingForCflatType(typeName, ownerSpelling)) return nullptr;
+        auto groupIt = cxxTypeOwnerGroup_.find(typeName);
+        if (groupIt == cxxTypeOwnerGroup_.end()) return nullptr;
+        CxxRequestGroup group = MakeCxxRequestGroup(groupIt->second, {});
+        if (group.headers.empty()) return nullptr;
+
+        const uint64_t hash = HashWrapperKey(typeName + "|generated-move-ctor|" + ownerSpelling);
+        const std::string wrapperName = std::format("__cflat_move_ctor_{:016x}", hash);
+        const std::string wrapperSource = "#include <new>\nextern \"C\" void " + wrapperName + "("
+            + ownerSpelling + " * p0, " + ownerSpelling + " * p1) { new (p0) " + ownerSpelling
+            + "(static_cast<" + ownerSpelling + " &&>(*p1)); }\n";
+        CxxRequestGroupScope groupScope(*this, &group);
+        CSigEntry signature;
+        std::string error;
+        if (!RequestGeneratedCxxWrapper(group, wrapperSource, wrapperName,
+                                        "GENERATED_MOVE_CTOR", signature, error))
+        {
+            if (verbose)
+                std::cout << std::format("[verbose]   C++ move constructor wrapper for {} not bound: {}\n",
+                                         typeName, FirstCxxErrorLine(error));
+            return nullptr;
+        }
+        if (signature.params.size() != 2) return nullptr;
+
+        CxxClassInfo::Structor ctor;
+        ctor.linkageName = wrapperName;
+        ctor.params = signature.params;
+        ctor.ret = signature.ret;
+        ctor.isMoveCtor = true;
+        ctor.isNoexcept = signature.isNoexcept;
+        ctor.access = cflat_cinterop::AccessPublic;
+        ctor.abi = signature.abi;
+        infoIt->second.constructors.push_back(std::move(ctor));
+        return &infoIt->second.constructors.back();
+}
+
 bool LLVMBackend::RequestCxxFunctionTemplate(const std::string& functionName,
                                              const std::string& ownerType,
                                              const std::vector<std::string>& explicitArgs,
@@ -9719,6 +9768,9 @@ void LLVMBackend::RegisterCxxClassMembers(const CRecordEntry& r, const std::stri
                     // The cross-check text describes the FULL arity; the truncated plan has no
                     // matching text, so the slot-by-slot build stands on its own.
                     wrapperPlan.fnTypeText.clear();
+                    // The wrapper is a free extern "C" function: MS ABI puts its sret slot first,
+                    // not after the receiver as for the member it forwards to.
+                    wrapperPlan.ret.sretAfterThis = false;
                 }
                 std::string wrapperMismatch;
                 CInteropDeclarationScope declaringFile(*this,
@@ -12476,6 +12528,7 @@ bool LLVMBackend::EmitCxxCopyOrMoveConstruct(const std::string& typeName, llvm::
         // written would leave the source consumed behind the user's back.
         const CxxClassInfo::Structor* ctor = useMove ? FindCxxMoveCtor(typeName) : nullptr;
         if (ctor == nullptr) ctor = FindCxxCopyCtor(typeName);
+        if (ctor == nullptr && useMove) ctor = TryBindCxxGeneratedMoveCtor(typeName);
         if (ctor == nullptr)
         {
             const CxxClassInfo* info = GetCxxClassInfo(typeName);

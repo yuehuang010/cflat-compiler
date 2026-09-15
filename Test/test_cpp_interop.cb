@@ -2971,9 +2971,18 @@ extern int main()
         if (m72ul.get() != 17) return 1350;
         if (cppt.m72_take_unsigned_long(m72ul) != 17) return 1351;
 
-        cppt.Box<ulong> m72size = cppt.m72_make_size_t(18);
-        if (m72size.get() != 18) return 1352;
-        if (cppt.m72_take_unsigned_long(m72size) != 18) return 1353;
+        // LLP64: size_t is 'unsigned long long' (u64), a distinct type from 32-bit 'unsigned long'.
+        if const (__WINDOWS__)
+        {
+            cppt.Box<u64> m72size = cppt.m72_make_size_t(18);
+            if (m72size.get() != 18) return 1352;
+        }
+        else
+        {
+            cppt.Box<ulong> m72size = cppt.m72_make_size_t(18);
+            if (m72size.get() != 18) return 1352;
+            if (cppt.m72_take_unsigned_long(m72size) != 18) return 1353;
+        }
 
         cppt.Box<u32> m72unsigned = cppt.m72_make_unsigned(19);
         if (m72unsigned.get() != 19) return 1354;
@@ -2981,13 +2990,26 @@ extern int main()
         cppt.Box<longdouble> m72longdouble = cppt.m72_make_long_double(2.5);
         if (m72longdouble.get() != 2.5) return 1355;
 
-        std.vector<ulong> m72values = default;
-        m72values.push_back(20);
-        std.vector<ulong> m72roundtrip = cppt.m72_size_t_vector_roundtrip(m72values);
-        if ((int)m72values.size() != 1) return 1356;
-        if (m72values[0] != 20) return 1357;
-        if ((int)m72roundtrip.size() != 1) return 1358;
-        if (m72roundtrip[0] != 20) return 1359;
+        if const (__WINDOWS__)
+        {
+            std.vector<u64> m72values = default;
+            m72values.push_back(20);
+            std.vector<u64> m72roundtrip = cppt.m72_size_t_vector_roundtrip(m72values);
+            if ((int)m72values.size() != 1) return 1356;
+            if (m72values[0] != 20) return 1357;
+            if ((int)m72roundtrip.size() != 1) return 1358;
+            if (m72roundtrip[0] != 20) return 1359;
+        }
+        else
+        {
+            std.vector<ulong> m72values = default;
+            m72values.push_back(20);
+            std.vector<ulong> m72roundtrip = cppt.m72_size_t_vector_roundtrip(m72values);
+            if ((int)m72values.size() != 1) return 1356;
+            if (m72values[0] != 20) return 1357;
+            if ((int)m72roundtrip.size() != 1) return 1358;
+            if (m72roundtrip[0] != 20) return 1359;
+        }
     }
 
     // ---- Section M73: CFlat-defined no-base [cpp] structs (1360-1399) -------------------

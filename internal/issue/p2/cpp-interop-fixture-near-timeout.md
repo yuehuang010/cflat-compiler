@@ -35,3 +35,49 @@ Type-request disk cache part 2 implemented (worktree cflat-cxJ, branch wip/cxJ, 
 every `import cpp` in the fixture carries `cache`. Measured there: cold 128 s, warm 46 s, both
 exit 0. The suite's cold pass still pays the cold number, so the 240 s timeout stays; the
 remaining cold lever is batching requests per group in the pre-pass (see the plan discussion).
+
+## Update 2026-09-15 (Windows measurements, after part 2 landed)
+
+Windows Release, this host. buildci total 400 s, of which test.bat is 203 s and
+test_cpp_interop alone is 168 s in-suite (next slowest: the four err groups at 45-54 s each,
+everything else under 16 s). Standalone WARM compile of the fixture is 100 s here, against the
+46 s measured on macOS - so part 2 is not paying off on this host.
+
+Measured with `-v` on a warm cache (counts per compile):
+
+| stage                        | count | total   |
+|------------------------------|-------|---------|
+| clang parse stage 2          | 267   | 63.6 s  |
+| clang precompile header      | 43-66 | 23-39 s |
+| companion emission           | 269   | 20.0 s  |
+| sig harvest                  | 271   | 12.6 s  |
+| member-signature requests    | 253   | 12.0 s  |
+
+Type-request cache on that warm run: 473 HIT, 203 MISS, every miss "missing entry". The misses
+are stable run to run, and instrumenting StoreCxxTypeRequestCache shows why nothing fills them -
+484 stores happen, 178 are refused at the disk step:
+
+- 156 `allowDisk=false`. Every store site passes `!tentative && raw.firstError.empty()`, and these
+  are the TENTATIVE requests (the batch pre-pass at the `!last || retryable` and
+  `!incompleteTypes.empty()` call sites). The request succeeds and its result is used, but the
+  tentative flag keeps it out of the disk cache forever, so it re-parses on every compile.
+- 22 `group has no cache clause`: the synthesized `__cflat_user::*` group for CFlat-defined
+  `[cpp] struct`s (all of section M73). That group has no import statement to carry `cache`.
+
+Second lever, PCH churn: `PruneCxxRequestPchDir` keeps only the 8 newest .pch and deletes anything
+older than 1 hour. The fixture needs ~44, so a run more than an hour after the last one rebuilds
+most of them at ~590 ms each (13 rewritten in a measured run). For a suite that runs a few times a
+day, that hour cutoff means the PCH cache is almost always cold.
+
+## Fix direction (Windows numbers)
+
+1. Make tentative requests cacheable once they are known good - e.g. store on the final
+   non-tentative resolution of the same request key rather than refusing at the tentative
+   attempt. Biggest single lever: 156 of 203 misses.
+2. Give the synthesized `__cflat_user` group the disk cache (it has no header to stale against;
+   key it on the generated source instead).
+3. Raise or drop `kMaxAge` in PruneCxxRequestPchDir, and size the keep count to the group count
+   rather than a flat 8. Disk is 600 MB for this fixture's PCHs - a size budget would be a truer
+   limit than an hour.
+
+All three are maintainer calls (staleness policy + cache size), so nothing here is implemented.

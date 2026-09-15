@@ -9086,6 +9086,19 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
                 auto* rst = llvm::cast<llvm::StructType>(rvalue->getType());
                 if (!rst->isLiteral() && rst->hasName())
                     rightNV.TypeAndValue.TypeName = rst->getName().str();
+                // A C++ derived operand binds to a `const Base&` parameter (an operator==
+                // inherited from a base) from its own storage, adjusted to the base subobject. A
+                // temporary (`it != m.end()`) is materialized first, as C++ does for a reference.
+                if (compiler->IsCxxRecord(rightNV.TypeAndValue.TypeName))
+                {
+                    llvm::Value* storage = rhsStorage;
+                    if (storage == nullptr)
+                    {
+                        storage = compiler->CreateAlloca(rst);
+                        compiler->CreateAssignment(rvalue, storage);
+                    }
+                    rightNV.Storage = storage;
+                }
             }
             else if (rvalue && rvalue->getType()->isPointerTy())
             {

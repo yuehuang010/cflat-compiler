@@ -7745,6 +7745,7 @@ public:
     const CxxClassInfo::Structor* FindCxxDefaultCtor(const std::string& typeName) const;
     const CxxClassInfo::Structor* FindCxxCopyCtor(const std::string& typeName) const;
     const CxxClassInfo::Structor* FindCxxMoveCtor(const std::string& typeName) const;
+    const CxxClassInfo::Structor* TryBindCxxGeneratedMoveCtor(const std::string& typeName);
     /*
      * Pick the constructor overload for `T(args)` from the argument types alone. Reports and
      * returns null on no match / ambiguity. Copy and move constructors participate only when
