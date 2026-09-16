@@ -2119,6 +2119,7 @@ nlohmann::json LLVMBackend::CxxMemberToJson(const cflat_cinterop::RawCxxMember& 
         if (m.variadic)             j["va"] = true;
         if (m.requiresConstructorWrapper) j["cw"] = true;
         if (m.isConst)              j["cn"] = true;
+        if (m.refQualifier != cflat_cinterop::CxxRefQualifierNone) j["rq"] = m.refQualifier;
         if (m.isVirtual)            j["vi"] = true;
         if (m.isNoexcept)           j["nx"] = true;
         if (m.isDeleted)            j["dl"] = true;
@@ -2168,6 +2169,7 @@ cflat_cinterop::RawCxxMember LLVMBackend::CxxMemberFromJson(const SjVal& j)
         m.variadic             = j.value("va", false);
         m.requiresConstructorWrapper = j.value("cw", false);
         m.isConst              = j.value("cn", false);
+        m.refQualifier         = j.value("rq", (int)cflat_cinterop::CxxRefQualifierNone);
         m.isVirtual            = j.value("vi", false);
         m.isNoexcept           = j.value("nx", false);
         m.isDeleted            = j.value("dl", false);
@@ -2582,7 +2584,9 @@ bool LLVMBackend::TryLoadCHeaderDiskCache(
         // v63 carries C++ enum scopedness for conversion ranking.
         // v64 binds the constructor of a class with virtual bases to its placement-new thunk,
         // changing that member's cached linkage name and ABI.
-        if (version != 64) return cacheMiss("cache version");
+        // v65 carries C++ member ref-qualifiers, so a warm cache can distinguish lvalue- and
+        // rvalue-qualified overloads.
+        if (version != 65) return cacheMiss("cache version");
 
         if (!expectedRequestKey.empty()
             && j.value("cxxRequestKey", std::string{}) != expectedRequestKey)
@@ -2806,7 +2810,7 @@ void LLVMBackend::WriteCHeaderDiskCache(
         if (ec) return;
 
         nlohmann::json j;
-        j["version"] = 64;
+        j["version"] = 65;
         j["mtime"]   = (int64_t)mtime.time_since_epoch().count();
         j["hash"]    = contentHash;
         j["ldw"]     = entry.longDoubleWidth;

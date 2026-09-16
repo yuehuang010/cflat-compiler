@@ -6151,6 +6151,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 namedVar.Storage = slot;
                                 namedVar.BaseType = objectType;
                                 namedVar.TypeAndValue.TypeName = functionName;
+                                namedVar.IsRvalue = true;
                                 compiler->lastOwningResult = true;
                                 structVar = {};
                                 interfaceVar = {};
@@ -6224,6 +6225,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                         namedVar.Storage = slot;
                                         namedVar.BaseType = objectType;
                                         namedVar.TypeAndValue.TypeName = functionName;
+                                        namedVar.IsRvalue = true;
                                         compiler->lastOwningResult = true;
                                     }
                                     else
@@ -6248,6 +6250,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     namedVar.Storage = slot;
                                     namedVar.BaseType = objectType;
                                     namedVar.TypeAndValue.TypeName = functionName;
+                                    namedVar.IsRvalue = true;
                                     compiler->lastOwningResult = true;
                                 }
                                 structVar = {};

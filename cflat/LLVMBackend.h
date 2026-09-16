@@ -1861,6 +1861,7 @@ public:
         bool ReturnsAlias = false; // true when the function returns an 'alias' reference - caller must not free the interior
         bool IsMethod = false;     // true when registered as a struct/class method (has implicit self pointer)
         bool IsCxx = false;        // declaration came from a C++ header
+        int CxxRefQualifier = cflat_cinterop::CxxRefQualifierNone;
         bool IsNoexcept = true;    // potentially throwing C++ calls are gated until EH support
         bool IsCInteropAlias = false;
         bool IsCInteropDeclaration = false;
@@ -5235,6 +5236,7 @@ private:
         bool instanceMember = false;
         bool staticMember = false;
         bool constMember = false;
+        int refQualifier = cflat_cinterop::CxxRefQualifierNone;
         bool isNoexcept = true;
         std::string file;
         int line = 1;
@@ -7532,6 +7534,7 @@ public:
             bool isDeleted = false;
             bool needsLocalDefinition = false;
             bool isNoexcept = false;
+            int refQualifier = cflat_cinterop::CxxRefQualifierNone;
             int access = 0;
             cflat_cinterop::RawAbi abi;
             // Aligned with params (entry 0 is 'this'); a constant default lets the call omit it.
@@ -7555,6 +7558,8 @@ public:
         bool hasMoveAssign = false;
         Structor copyAssign;
         Structor moveAssign;
+        std::vector<Structor> copyAssignOverloads;
+        std::vector<Structor> moveAssignOverloads;
     };
     const CxxClassInfo* GetCxxClassInfo(const std::string& typeName) const
     {
@@ -7883,7 +7888,7 @@ public:
     // linkageName: optional override of the emitted LLVM symbol for externs. A namespaced
     // extern (namespace os.windows { extern ... Sleep(...); }) registers in the function
     // table under the qualified lookup name but must link against the bare C symbol.
-    void CreateFunctionDeclaration(const std::string& functionName, const LLVMBackend::TypeAndValue& returnType, const std::vector<LLVMBackend::TypeAndValue>& arguments, bool external = false, bool varargs = false, bool returnsOwned = false, bool isMethod = false, CallingConv callConv = CallingConv::Default, const std::string& linkageName = {}, bool isCxx = false, bool isNoexcept = true);
+    void CreateFunctionDeclaration(const std::string& functionName, const LLVMBackend::TypeAndValue& returnType, const std::vector<LLVMBackend::TypeAndValue>& arguments, bool external = false, bool varargs = false, bool returnsOwned = false, bool isMethod = false, CallingConv callConv = CallingConv::Default, const std::string& linkageName = {}, bool isCxx = false, bool isNoexcept = true, int cxxRefQualifier = cflat_cinterop::CxxRefQualifierNone);
 
     // Return the FunctionSymbol whose LLVM function pointer matches fn, or nullptr.
     const FunctionSymbol* GetFunctionSymbol(llvm::Function* fn) const;

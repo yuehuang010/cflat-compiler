@@ -1626,7 +1626,7 @@ void LLVMBackend::ReportUnresolvedProvisionalDeclarations()
         }
     }
 
-void LLVMBackend::CreateFunctionDeclaration(const std::string& functionName, const LLVMBackend::TypeAndValue& returnType, const std::vector<LLVMBackend::TypeAndValue>& arguments, bool external, bool varargs, bool returnsOwned, bool isMethod, CallingConv callConv, const std::string& linkageName, bool isCxx, bool isNoexcept)
+void LLVMBackend::CreateFunctionDeclaration(const std::string& functionName, const LLVMBackend::TypeAndValue& returnType, const std::vector<LLVMBackend::TypeAndValue>& arguments, bool external, bool varargs, bool returnsOwned, bool isMethod, CallingConv callConv, const std::string& linkageName, bool isCxx, bool isNoexcept, int cxxRefQualifier)
 {
         // ForwardRefScanner registers signatures before any struct BODY exists. An opaque
         // by-value aggregate has no legal FunctionType yet, so the declaration is emitted with a
@@ -1716,9 +1716,11 @@ void LLVMBackend::CreateFunctionDeclaration(const std::string& functionName, con
                     && a.IsFunctionPointer == b.IsFunctionPointer && a.IsAlias == b.IsAlias
                     && a.IsMove == b.IsMove && a.IsRvalueRef == b.IsRvalueRef;
             };
-            for (const auto& sym : functionTable[functionName])
+            for (auto& sym : functionTable[functionName])
                 if (sym.UniqueName == mangledName)
                 {
+                    if (cxxRefQualifier != cflat_cinterop::CxxRefQualifierNone)
+                        sym.CxxRefQualifier = cxxRefQualifier;
                     /*
                      * The repeat is a no-op only when it AGREES. A DIFFERENT extern signature
                      * under the same linkage name used to be dropped here in silence, so
@@ -1824,6 +1826,7 @@ void LLVMBackend::CreateFunctionDeclaration(const std::string& functionName, con
                 .Recipe = recipe,
                 .CxxAbi = (cxxPlan != nullptr && recipe.fromClang) ? *cxxPlan : cflat_cinterop::RawAbi{},
             };
+            funcSym.CxxRefQualifier = cxxRefQualifier;
 
             for (const auto& arg : arguments)
             {

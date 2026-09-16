@@ -286,10 +286,27 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                 value == nullptr ? nullptr : value->stripPointerCasts());
             return constant != nullptr && IsStringLiteralConstant(constant);
         };
+        auto receiverRefQualifierMatches = [&](const FunctionSymbol& candidate,
+                                                const std::vector<NamedVariable>& arguments) {
+            if (!candidate.IsCxx || !candidate.IsMethod
+                || candidate.CxxRefQualifier == cflat_cinterop::CxxRefQualifierNone
+                || candidate.Parameters.empty() || arguments.empty())
+                return true;
+            const bool receiverRvalue = IsRvalueReferenceArgument(arguments.front());
+            if (candidate.CxxRefQualifier == cflat_cinterop::CxxRefQualifierLValue)
+                return !receiverRvalue;
+            if (candidate.CxxRefQualifier == cflat_cinterop::CxxRefQualifierRValue)
+                return receiverRvalue;
+            return true;
+        };
 
         for (const auto& pair : candidates)
         {
             const auto& [arguments, candidate] = pair;
+
+            // Ref-qualified C++ members constrain the value category of the implicit receiver,
+            // independently of the argument categories scored below.
+            if (!receiverRefQualifierMatches(candidate, arguments)) continue;
 
             if (candidate.Variadic)
             {
@@ -1554,6 +1571,47 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
 
         if (candidate.Function == nullptr)
         {
+            // MatchFunction intentionally keeps a ref-qualified candidate visible so the
+            // diagnostic can distinguish a receiver-category error from an argument mismatch.
+            if (!arguments.empty())
+            {
+                std::string receiverType = arguments.front().TypeAndValue.TypeName;
+                if (receiverType.empty() && arguments.front().BaseType)
+                    if (auto* receiverStruct = llvm::dyn_cast<llvm::StructType>(
+                            arguments.front().BaseType))
+                        receiverType = receiverStruct->getName().str();
+                bool hasReceiverRefMismatch = false;
+                bool hasReceiverCompatible = false;
+                int rejectedRefQualifier = cflat_cinterop::CxxRefQualifierNone;
+                for (const auto& c : candidates)
+                {
+                    if (!c.IsCxx || !c.IsMethod || c.Parameters.empty()
+                        || c.Parameters[0].TypeName != receiverType)
+                        continue;
+                    const bool matches = c.CxxRefQualifier == cflat_cinterop::CxxRefQualifierNone
+                        || (c.CxxRefQualifier == cflat_cinterop::CxxRefQualifierLValue
+                            && !IsRvalueReferenceArgument(arguments.front()))
+                        || (c.CxxRefQualifier == cflat_cinterop::CxxRefQualifierRValue
+                            && IsRvalueReferenceArgument(arguments.front()));
+                    if (matches) hasReceiverCompatible = true;
+                    else
+                    {
+                        hasReceiverRefMismatch = true;
+                        rejectedRefQualifier = c.CxxRefQualifier;
+                    }
+                }
+                if (hasReceiverRefMismatch && !hasReceiverCompatible)
+                {
+                    const char* qualifier = rejectedRefQualifier
+                        == cflat_cinterop::CxxRefQualifierLValue ? "&" : "&&";
+                    const char* category = IsRvalueReferenceArgument(arguments.front())
+                        ? "rvalue" : "lvalue";
+                    LogRawError(std::format(
+                        "C++ member '{}' is {}-qualified and cannot be called on an {} receiver",
+                        shownFunctionName, qualifier, category));
+                    return nullptr;
+                }
+            }
             if (TryBindCxxImplicitArgumentConversions(functionName, arguments))
                 return CreateOverloadedFunctionCall(functionName, arguments, forceRoot, displayName);
             std::string msg = std::format("no overload of '{}' matches the given arguments.\n", shownFunctionName);

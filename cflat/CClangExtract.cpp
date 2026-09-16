@@ -1613,6 +1613,12 @@ namespace cflat_cinterop
                         if (m.name.empty()) m.name = "operator=";
                     }
                     m.isConst = !md->isStatic() && md->isConst();
+                    switch (md->getRefQualifier())
+                    {
+                        case RQ_LValue: m.refQualifier = CxxRefQualifierLValue; break;
+                        case RQ_RValue: m.refQualifier = CxxRefQualifierRValue; break;
+                        default:        m.refQualifier = CxxRefQualifierNone; break;
+                    }
                     m.isVirtual = md->isVirtual();
                     m.isPureVirtual = md->isPureVirtual();
                     m.isOverride = md->hasAttr<OverrideAttr>();

@@ -6854,6 +6854,8 @@ static llvm::json::Object SerializeFuncSym(const std::string& key, const FS& s)
     // dropping it would fall the declaration back onto the C size heuristic.
     if (s.CxxAbi.valid)  o["cxxabi"] = SerializeCxxAbi(s.CxxAbi);
     if (s.IsCxx)        o["cxx"] = true;
+    if (s.CxxRefQualifier != cflat_cinterop::CxxRefQualifierNone)
+        o["cxxrq"] = s.CxxRefQualifier;
     if (!s.IsNoexcept)  o["nx"] = true;
     if (s.ReturnsAlias) o["ra"] = true;
     if (s.IsMethod)     o["m"]  = true;
@@ -7654,6 +7656,7 @@ bool LLVMBackend::LoadCoreBitcodeIfFresh(const std::string& cacheDir, const std:
             if (auto v = fo->getBoolean("ext")) sym.External = *v;
             if (auto v = fo->getBoolean("ro")) sym.ReturnsOwned = *v;
             if (auto v = fo->getBoolean("cxx")) sym.IsCxx = *v;
+            if (auto v = fo->getInteger("cxxrq")) sym.CxxRefQualifier = (int)*v;
             if (auto v = fo->getBoolean("nx")) sym.IsNoexcept = !*v;
             if (auto* ab = fo->getObject("cxxabi")) sym.CxxAbi = DeserializeCxxAbi(*ab);
             if (auto v = fo->getBoolean("ra")) sym.ReturnsAlias = *v;

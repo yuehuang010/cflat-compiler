@@ -1673,11 +1673,27 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                     && !rhsPostfix->argumentExpressionList().empty();
                 const auto* info = compiler->GetCxxClassInfo(tn);
                 const LLVMBackend::CxxClassInfo::Structor* op = nullptr;
+                auto lvalueReceiverAssignment = [](const auto& overloads,
+                                                    const auto& fallback)
+                    -> const LLVMBackend::CxxClassInfo::Structor* {
+                    for (const auto& candidate : overloads)
+                        if (candidate.refQualifier == cflat_cinterop::CxxRefQualifierNone
+                            || candidate.refQualifier == cflat_cinterop::CxxRefQualifierLValue)
+                            return &candidate;
+                    if (overloads.empty()
+                        && (fallback.refQualifier == cflat_cinterop::CxxRefQualifierNone
+                            || fallback.refQualifier == cflat_cinterop::CxxRefQualifierLValue))
+                        return &fallback;
+                    return nullptr;
+                };
                 if (info != nullptr)
                 {
-                    if ((useMove || rhsTemporary) && info->hasMoveAssign) op = &info->moveAssign;
-                    else if (info->hasCopyAssign)        op = &info->copyAssign;
-                    else if (info->hasMoveAssign)        op = &info->moveAssign;
+                    if ((useMove || rhsTemporary) && info->hasMoveAssign)
+                        op = lvalueReceiverAssignment(info->moveAssignOverloads, info->moveAssign);
+                    if (op == nullptr && info->hasCopyAssign)
+                        op = lvalueReceiverAssignment(info->copyAssignOverloads, info->copyAssign);
+                    if (op == nullptr && !useMove && !rhsTemporary && info->hasMoveAssign)
+                        op = lvalueReceiverAssignment(info->moveAssignOverloads, info->moveAssign);
                 }
 
                 // A C++ return temporary is constructed in a scratch slot, then assigned into
@@ -1725,6 +1741,32 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                 }
                 if (op == nullptr)
                 {
+                    const char* qualifier = nullptr;
+                    if (info != nullptr)
+                    {
+                        const auto noteRvalueOnly = [&](const auto& overloads,
+                                                        const auto& fallback) {
+                            if (!overloads.empty())
+                                for (const auto& candidate : overloads)
+                                    if (candidate.refQualifier
+                                        == cflat_cinterop::CxxRefQualifierRValue)
+                                        return true;
+                            return overloads.empty()
+                                && fallback.refQualifier == cflat_cinterop::CxxRefQualifierRValue;
+                        };
+                        const bool moveOnly = noteRvalueOnly(info->moveAssignOverloads,
+                                                             info->moveAssign);
+                        const bool copyOnly = noteRvalueOnly(info->copyAssignOverloads,
+                                                             info->copyAssign);
+                        if (moveOnly || copyOnly) qualifier = "&&";
+                    }
+                    if (qualifier != nullptr)
+                    {
+                        LogErrorContext(ctx, std::format(
+                            "C++ class '{}' assignment operator is {}-qualified and cannot be "
+                            "called on an lvalue receiver", tn, qualifier));
+                        return nullptr;
+                    }
                     LogErrorContext(ctx, std::format(
                         "C++ class '{}' has no assignment operator cflat can call (it is implicit, "
                         "deleted, inaccessible, or defined inline in the header) - assign through a "
@@ -14271,6 +14313,7 @@ void MainListener::AdoptWrapperProvenance(LLVMBackend::NamedVariable& dst,
         dst.IsClosureRefCapture    = src.IsClosureRefCapture;
         dst.IsMoved                = src.IsMoved;
         dst.IsRvalue               = src.IsRvalue;
+        dst.IsExplicitMove         = src.IsExplicitMove;
         // OWNERSHIP state. These travel together with the borrow facts above: a guard that reads
         // one and not the other reports the opposite of the truth - `delete (n)` on a `move`
         // parameter was rejected as "borrowed" when only CallerName came across.
@@ -14598,6 +14641,7 @@ LLVMBackend::NamedVariable MainListener::ParseMoveExpression(CFlatParser::MoveEx
             result.Storage      = nullptr;
             result.BaseType     = argNV.BaseType;
             result.TypeAndValue = argNV.TypeAndValue;
+            result.IsExplicitMove = true;
             return result;
         }
 
@@ -14631,6 +14675,7 @@ LLVMBackend::NamedVariable MainListener::ParseMoveExpression(CFlatParser::MoveEx
             result.Storage      = nullptr;
             result.BaseType     = argNV.BaseType;
             result.TypeAndValue = argNV.TypeAndValue;
+            result.IsExplicitMove = true;
             return result;
         }
 
@@ -14689,6 +14734,7 @@ LLVMBackend::NamedVariable MainListener::ParseMoveExpression(CFlatParser::MoveEx
                 result.BaseType     = argNV.BaseType;
                 result.TypeAndValue = argNV.TypeAndValue;
                 result.TypeAndValue.IsMove = true;
+                result.IsExplicitMove = true;
                 result.IsBonded = argNV.IsBonded;
                 result.BondByAddress = argNV.BondByAddress;
                 result.BondedSources = argNV.BondedSources;
@@ -14797,6 +14843,7 @@ LLVMBackend::NamedVariable MainListener::ParseMoveExpression(CFlatParser::MoveEx
         result.Storage        = nullptr;
         result.BaseType       = ptrVal ? ptrVal->getType() : nullptr;
         result.TypeAndValue   = argNV.TypeAndValue;
+        result.IsExplicitMove = true;
         result.AllocAlignment = argNV.AllocAlignment;
         // Provenance: the moved value's allocation alignment is DETERMINATE when the source slot's
         // is. A field / element / deref source is governed by its declared slot type; a whole

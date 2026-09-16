@@ -214,6 +214,9 @@
 //   Section M82 (1615-1638): C++ scoped-enum identity in free/member overload matching,
 //                       converting constructors, references, explicit casts, templates, and
 //                       measured preservation of unscoped enum conversions.
+//   Section M81 (1640-1658): C++ member ref-qualifiers preserve lvalue/rvalue receiver
+//                       selection for assignment, fields, dereferences, elements, calls,
+//                       temporaries, explicit move, and null-conditional forwarding.
 // Section M: C++ interop - `import cpp` selects C++ mode; the extension is irrelevant (the
 // fixture header is a plain .h). The header supplies the declarations, the .cpp is compiled
 // by the host C++ driver and linked in. Both are needed: the header alone has no
@@ -3876,6 +3879,46 @@ extern int main()
     if (cppi_scope.takeUIntMap(m82unscopedMap) != 8) return 1636;
     if (cppi_scope.deduceKind(cppi_scope.U1.u) != 1) return 1637;
     if (m82module.deduceKind(cppi_scope.U1.u) != 3) return 1638;
+    // ---- Section M81: C++ member ref-qualifiers (1640-1658) -----------------------------
+    cppt.M81AssignBox m81a = cppt.M81AssignBox(1);
+    cppt.M81AssignBox m81alias = m81a;
+    cppt.M81AssignBox m81b = cppt.M81AssignBox(2);
+    m81a = m81b;
+    if (m81a.tag != 1 || m81a.value != 2) return 1640;
+    if (m81alias.value != 1) return 1641;
+    m81a = move m81b;
+    if (m81a.tag != 3 || m81a.value != 202) return 1642;
+
+    cppt.M81FieldHolder m81field = default;
+    m81field.box = m81a;
+    if (m81field.box.tag != 1 || m81field.box.value != 202) return 1643;
+    cppt.M81AssignBox* m81ptr = &m81field.box;
+    *m81ptr = m81alias;
+    if (m81field.box.tag != 1 || m81field.box.value != 1) return 1644;
+
+    cppt.M81SlotHolder m81slots = default;
+    m81slots[0] = m81a;
+    if (m81slots[0].tag != 1 || m81slots[0].value != 202) return 1645;
+    std.vector<cppt.M81AssignBox> m81vector = default;
+    m81vector.push_back(m81alias);
+    m81vector[0] = m81a;
+    if (m81vector[0].tag != 1 || m81vector[0].value != 202) return 1652;
+
+    cppt.M81RefqMethods m81method = cppt.M81RefqMethods(1);
+    if (m81method.both() != 11) return 1646;
+    if (m81method.onlyL() != 44) return 1647;
+    if (m81method.plain() != 55) return 1648;
+    if (cppt.m81_make_methods(2).both() != 22) return 1649;
+    if ((move m81method).both() != 22) return 1650;
+    cppt.M81RefqMethods m81nullMethod = cppt.M81RefqMethods(3);
+    cppt.M81RefqMethods* m81methodPtr = &m81nullMethod;
+    if (m81methodPtr?.both() != 11) return 1651;
+    if (cppt.M81RefqMethods(1).with(2).with(3).marker != 206) return 1653;
+    if (cppt.M81RefqMethods(8)[2] != 202) return 1654;
+    if (cppt.M81RefqMethods(4).onlyR() != 33) return 1655;
+    if (cppt.M81RefqMethods(4).plain() != 55) return 1656;
+    if (cppt.M81RefqMethods({4}).with(2).marker != 106) return 1657;
+    if (cppt.M81RefqMethods(4)?.both() != 22) return 1658;
 
     // ---- Section M87: target-aware C++ bitfield packing (1660-1678) ----------------
     cppi.M87Fit m87fit = default;

@@ -120,6 +120,11 @@ namespace cflat_cinterop
         std::string value;
     };
 
+    // Ref-qualifier on a non-static C++ member function. The integer values are kept in the
+    // clang-independent extraction record and in the backend caches.
+    enum CxxRefQualifier { CxxRefQualifierNone = 0, CxxRefQualifierLValue = 1,
+                           CxxRefQualifierRValue = 2 };
+
     // A C function signature. Types are canonical C spellings (e.g. "int", "unsigned long long",
     // "struct Point *", "int (*)(int, int)") so the backend's string-based mapper consumes them
     // exactly as it did the libclang DesugaredSpelling.
@@ -224,6 +229,7 @@ namespace cflat_cinterop
         // placement-new wrapper instead of a direct constructor symbol.
         bool requiresConstructorWrapper = false;
         bool isConst = false;          // const-qualified instance method
+        int refQualifier = CxxRefQualifierNone;
         bool isVirtual = false;
         bool isNoexcept = false;
         bool isDeleted = false;

@@ -1430,3 +1430,66 @@ struct M84Key
     bool operator<(const M84Key& o) const noexcept { return v < o.v; }
 };
 inline int m84_take_key(const M84Key& k) noexcept { return k.v + 1; }
+namespace cppt
+{
+    // M81: ref-qualified member overloads keep the receiver's C++ value category.
+    class M81AssignBox
+    {
+    public:
+        int value;
+        int tag;
+
+        M81AssignBox() noexcept : value(0), tag(0) {}
+        explicit M81AssignBox(int v) noexcept : value(v), tag(0) {}
+        M81AssignBox(const M81AssignBox&) = default;
+        M81AssignBox(M81AssignBox&&) noexcept = default;
+        ~M81AssignBox() noexcept {}
+
+        M81AssignBox& operator=(const M81AssignBox& other) & noexcept
+        { value = other.value; tag = 1; return *this; }
+        M81AssignBox& operator=(const M81AssignBox& other) && noexcept
+        { value = other.value + 100; tag = 2; return *this; }
+        M81AssignBox& operator=(M81AssignBox&& other) & noexcept
+        { value = other.value + 200; tag = 3; return *this; }
+        M81AssignBox& operator=(M81AssignBox&& other) && noexcept
+        { value = other.value + 300; tag = 4; return *this; }
+    };
+
+    struct M81FieldHolder
+    {
+        M81AssignBox box;
+        M81FieldHolder() noexcept : box(0) {}
+    };
+
+    class M81RefqMethods
+    {
+    public:
+        // M81: ref-qualified overload fixture.
+        int marker;
+
+        M81RefqMethods() noexcept : marker(0) {}
+        explicit M81RefqMethods(int v) noexcept : marker(v) {}
+        explicit M81RefqMethods(std::initializer_list<int> values) noexcept
+            : marker(values.size() == 0 ? 0 : *values.begin()) {}
+        int both() & noexcept { return 11; }
+        int both() && noexcept { return 22; }
+        int onlyR() && noexcept { return 33; }
+        int onlyL() & noexcept { return 44; }
+        int plain() const noexcept { return 55; }
+        M81RefqMethods& with(int v) & noexcept { marker += v; return *this; }
+        M81RefqMethods&& with(int v) && noexcept
+        { marker += v + 100; return static_cast<M81RefqMethods&&>(*this); }
+        int operator[](int i) & noexcept { return 100 + i; }
+        int operator[](int i) && noexcept { return 200 + i; }
+    };
+
+    struct M81SlotHolder
+    {
+        M81AssignBox slots[2];
+        M81SlotHolder() noexcept : slots{M81AssignBox(0), M81AssignBox(0)} {}
+        M81AssignBox& operator[](int i) & noexcept { return slots[i]; }
+    };
+
+    inline M81RefqMethods m81_make_methods(int value) noexcept
+    { return M81RefqMethods(value); }
+}

@@ -1,0 +1,18 @@
+import cpp "cpp_interop_tpl.h" cache;
+
+extern int main()
+{
+    expect_error("&&-qualified and cannot be called on an lvalue receiver") {
+        cppt.M81RefqMethods value = default;
+        value.onlyR();
+    }
+
+    expect_error("&-qualified and cannot be called on an rvalue receiver") {
+        cppt.m81_make_methods(1).onlyL();
+    }
+
+    expect_error("&-qualified and cannot be called on an rvalue receiver") {
+        cppt.M81RefqMethods(1).onlyL();
+    }
+    return 0;
+}

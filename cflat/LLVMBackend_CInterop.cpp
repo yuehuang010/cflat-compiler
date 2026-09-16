@@ -2014,7 +2014,8 @@ static std::string BuildCxxDefaultWrappers(
                                  bool instance,
                                  const std::string& memberName,
                                  bool isConst,
-                                 bool isNoexcept) {
+                                 bool isNoexcept,
+                                 int refQualifier) {
             if (!emitted)
             {
                 source += "template <class T> struct __cflat_pid { typedef T type; };\n";
@@ -2039,8 +2040,14 @@ static std::string BuildCxxDefaultWrappers(
                     ? "static_cast<" + type + ">(a" + std::to_string(i) + ")"
                     : "a" + std::to_string(i);
             }
+            const std::string receiver = instance
+                ? (refQualifier == cflat_cinterop::CxxRefQualifierRValue
+                    ? std::string("static_cast<") + (isConst ? "const " : "")
+                        + target + "&&>(*a0)"
+                    : "(*a0)")
+                : std::string{};
             const std::string call = instance
-                ? "a0->" + memberName + "(" + args + ")"
+                ? receiver + "." + memberName + "(" + args + ")"
                 : target + "(" + args + ")";
             const std::string weakArgs = instance
                 ? (std::string("a0") + (args.empty() ? std::string{} : ", " + args))
@@ -2069,7 +2076,8 @@ static std::string BuildCxxDefaultWrappers(
                 if (!HasNonConstDefaultSuffix(sig.defaultArgs, n)) continue;
                 const std::string base = CxxDefaultWrapperName(sig.linkageName, n);
                 appendWrapper(base, sig.retType, sig.paramTypes, n, target,
-                              /*instance*/ false, {}, false, sig.isNoexcept);
+                              /*instance*/ false, {}, false, sig.isNoexcept,
+                              cflat_cinterop::CxxRefQualifierNone);
             }
         }
         for (const auto& record : records)
@@ -2094,7 +2102,7 @@ static std::string BuildCxxDefaultWrappers(
                         continue;
                     appendWrapper(CxxDefaultWrapperName(member.linkageName, n), member.retType,
                                   member.paramTypes, n, target, instance, member.name,
-                                  member.isConst, member.isNoexcept);
+                                  member.isConst, member.isNoexcept, member.refQualifier);
                 }
             }
         }
@@ -5180,6 +5188,16 @@ LLVMBackend::CollectCxxImplicitArgumentCandidates(
         std::vector<CxxImplicitArgumentCandidate> candidates;
         auto candidateFits = [&](CxxImplicitArgumentCandidate& candidate) {
             if (candidate.parameterTypes.size() != arguments.size()) return false;
+            if (candidate.instanceMember && !arguments.empty()
+                && candidate.refQualifier != cflat_cinterop::CxxRefQualifierNone)
+            {
+                const bool receiverRvalue = IsRvalueReferenceArgument(arguments.front());
+                if ((candidate.refQualifier == cflat_cinterop::CxxRefQualifierLValue
+                     && receiverRvalue)
+                    || (candidate.refQualifier == cflat_cinterop::CxxRefQualifierRValue
+                        && !receiverRvalue))
+                    return false;
+            }
             bool hasConversion = false;
             for (size_t i = 0; i < arguments.size(); ++i)
             {
@@ -5229,6 +5247,7 @@ LLVMBackend::CollectCxxImplicitArgumentCandidates(
                     candidate.instanceMember = !staticOnly;
                     candidate.staticMember = staticOnly;
                     candidate.constMember = member.isConst;
+                    candidate.refQualifier = member.refQualifier;
                     candidate.isNoexcept = member.isNoexcept;
                     candidate.file = member.file;
                     candidate.line = member.line;
@@ -5449,9 +5468,13 @@ bool LLVMBackend::EmitCxxImplicitArgumentConversions(
             RegisterCSignatures({ bound }, candidate.file.empty() ? group.headers.front() : candidate.file);
             bool registered = false;
             if (auto fit = functionTable.find(candidate.lookupName); fit != functionTable.end())
-                for (const auto& symbol : fit->second)
+                for (auto& symbol : fit->second)
                     if (symbol.External && symbol.UniqueName == wrapperName)
-                    { registered = true; break; }
+                    {
+                        symbol.CxxRefQualifier = candidate.refQualifier;
+                        registered = true;
+                        break;
+                    }
             newlyBound = newlyBound || registered;
         }
         return newlyBound;
@@ -9663,6 +9686,7 @@ void LLVMBackend::RegisterCxxClassMembers(const CRecordEntry& r, const std::stri
         };
         auto cflatSigKey = [&](const Member& m) {
             std::string key = memberRegName(m);
+            key += "|thisrq=" + std::to_string(m.refQualifier);
             for (size_t p = 1; p < m.paramTypes.size(); ++p)
             {
                 CxxReferenceKind refKind = CxxReferenceKind::None;
@@ -9675,7 +9699,8 @@ void LLVMBackend::RegisterCxxClassMembers(const CRecordEntry& r, const std::stri
             return key;
         };
         auto directMethodKey = [](const Member& m) {
-            std::string key = m.name + "|" + m.retType + (m.isConst ? "|const" : "|mut");
+            std::string key = m.name + "|" + m.retType + (m.isConst ? "|const" : "|mut")
+                + "|rq=" + std::to_string(m.refQualifier);
             for (const auto& param : m.paramTypes) key += "|" + param;
             return key;
         };
@@ -10005,7 +10030,8 @@ void LLVMBackend::RegisterCxxClassMembers(const CRecordEntry& r, const std::stri
                     CreateFunctionDeclaration(wrapperRegName, ret, prefix, /*external=*/true,
                         /*varargs=*/false, /*returnsOwned=*/false,
                         /*isMethod=*/m.kind == Member::Instance,
-                        CallingConv::Cdecl, wrapper, /*isCxx=*/true, m.isNoexcept);
+                        CallingConv::Cdecl, wrapper, /*isCxx=*/true, m.isNoexcept,
+                        m.refQualifier);
                 }
                 if (!wrapperMismatch.empty())
                 {
@@ -10021,6 +10047,7 @@ void LLVMBackend::RegisterCxxClassMembers(const CRecordEntry& r, const std::stri
                         {
                             sym.IsCInteropDeclaration = true;
                             sym.DefaultArguments.clear();
+                            sym.CxxRefQualifier = m.refQualifier;
                         }
                 return true;
             };
@@ -10064,6 +10091,7 @@ void LLVMBackend::RegisterCxxClassMembers(const CRecordEntry& r, const std::stri
                 st.isDeleted = m.isDeleted;
                 st.needsLocalDefinition = m.needsLocalDefinition;
                 st.isNoexcept = m.isNoexcept;
+                st.refQualifier = m.refQualifier;
                 st.access = m.access;
                 st.abi = m.abi;
                 st.defaultArgs = m.defaultArgs;
@@ -10077,8 +10105,18 @@ void LLVMBackend::RegisterCxxClassMembers(const CRecordEntry& r, const std::stri
                         info.dtorDeletingVtableIndex = m.vtableIndexDeleting;
                     }
                 }
-                else if (m.isCopyAssign) { info.copyAssign = std::move(st); info.hasCopyAssign = true; }
-                else { info.moveAssign = std::move(st); info.hasMoveAssign = true; }
+                else if (m.isCopyAssign)
+                {
+                    info.copyAssignOverloads.push_back(std::move(st));
+                    info.copyAssign = info.copyAssignOverloads.back();
+                    info.hasCopyAssign = true;
+                }
+                else
+                {
+                    info.moveAssignOverloads.push_back(std::move(st));
+                    info.moveAssign = info.moveAssignOverloads.back();
+                    info.hasMoveAssign = true;
+                }
                 continue;
             }
 
@@ -10100,7 +10138,7 @@ void LLVMBackend::RegisterCxxClassMembers(const CRecordEntry& r, const std::stri
                                           /*returnsOwned=*/false,
                                           /*isMethod=*/m.kind == Member::Instance,
                                           CallingConv::Cdecl, m.linkageName, /*isCxx=*/true,
-                                          m.isNoexcept);
+                                          m.isNoexcept, m.refQualifier);
             }
             // A member whose lowering clang disagrees with is refused HERE, at registration: the
             // use site reports why, and importing the class stays clean.
@@ -10111,6 +10149,7 @@ void LLVMBackend::RegisterCxxClassMembers(const CRecordEntry& r, const std::stri
                     {
                         sym.IsCInteropDeclaration = true;
                         sym.DefaultArguments = m.defaultArgs;
+                        sym.CxxRefQualifier = m.refQualifier;
                     }
             // A member whose omitted suffix contains a non-constant default gets an exact-arity
             // receiver-prefixed overload backed by a C++ forwarding body. The generated body is
@@ -10610,7 +10649,8 @@ std::string LLVMBackend::ResolveCxxBaseIdentity(const CxxClassInfo::BaseRef& b) 
 static std::string CxxBaseMethodSignatureKey(
     const LLVMBackend::CxxClassInfo::Method& method)
 {
-        std::string key = method.raw.name + (method.raw.isConst ? "|const" : "|mut");
+        std::string key = method.raw.name + (method.raw.isConst ? "|const" : "|mut")
+            + "|thisrq=" + std::to_string(method.raw.refQualifier);
         for (size_t i = 1; i < method.raw.paramTypes.size(); ++i)
             key += "|" + method.raw.paramTypes[i];
         return key;
@@ -10904,8 +10944,10 @@ bool LLVMBackend::RegisterCxxInheritedMembers(const CRecordEntry& r)
 
         // Signature key of one overload, ignoring `this` - two members with the same key are the
         // same method, so the most derived declaration wins.
-        auto sigKey = [](const std::string& name, const std::vector<TypeAndValue>& params) {
+        auto sigKey = [](const std::string& name, const std::vector<TypeAndValue>& params,
+                         int refQualifier) {
             std::string k = name;
+            k += "|thisrq=" + std::to_string(refQualifier);
             for (size_t i = 1; i < params.size(); ++i)
                 k += "|" + params[i].TypeName + (params[i].Pointer ? "*" : "");
             return k;
@@ -10933,7 +10975,7 @@ bool LLVMBackend::RegisterCxxInheritedMembers(const CRecordEntry& r)
             if (fit == functionTable.end()) continue;
             for (const FunctionSymbol& sym : fit->second)
                 if (sym.IsMethod && !sym.Parameters.empty() && sym.Parameters[0].TypeName == r.name)
-                    present.insert(sigKey(mn, sym.Parameters));
+                    present.insert(sigKey(mn, sym.Parameters, sym.CxxRefQualifier));
         }
 
         for (const auto& b : r.bases)
@@ -10961,7 +11003,7 @@ bool LLVMBackend::RegisterCxxInheritedMembers(const CRecordEntry& r)
                     // this the same base method is cloned once per specialization.
                     if (sym.Parameters[0].TypeName == r.name)
                     {
-                        present.insert(sigKey(mn, sym.Parameters));
+                        present.insert(sigKey(mn, sym.Parameters, sym.CxxRefQualifier));
                         noteMethodName(mn);
                     }
                     if (sym.IsCxx && sym.Parameters[0].TypeName == baseName)
@@ -10969,7 +11011,7 @@ bool LLVMBackend::RegisterCxxInheritedMembers(const CRecordEntry& r)
                 }
                 for (FunctionSymbol sym : fromBase)
                 {
-                    const std::string key = sigKey(mn, sym.Parameters);
+                    const std::string key = sigKey(mn, sym.Parameters, sym.CxxRefQualifier);
                     if (!present.insert(key).second) continue;
                     const uint64_t inherited = [&] {
                         auto a = cxxThisAdjust_.find(CxxThisAdjustKey(baseName, sym.UniqueName));
