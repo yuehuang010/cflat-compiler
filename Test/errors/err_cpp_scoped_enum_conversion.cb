@@ -1,0 +1,21 @@
+import cpp "cpp_interop_scoped_enum.h";
+
+extern int main()
+{
+    // Each scoped block arms and checks its own call. The source is A in every leg; only the
+    // target differs, so a matching-target fallback cannot make these expectations vacuous.
+    expect_error("no overload") {
+        cppi_scope.onlyInt(cppi_scope.A.x);
+    }
+    expect_error("no overload") {
+        cppi_scope.onlyB(cppi_scope.A.x);
+    }
+    expect_error("no overload") {
+        cppi_scope.onlyDev(cppi_scope.A.x);
+    }
+    cppi_scope.Module m = default;
+    expect_error("no overload") {
+        m.only(cppi_scope.A.x);
+    }
+    return 0;
+}

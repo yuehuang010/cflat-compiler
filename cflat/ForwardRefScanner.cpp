@@ -338,6 +338,7 @@ LLVMBackend::DeclTypeAndValue ForwardRefScanner::ParseDeclarationSpecifiers(CFla
                     {
                         declType.TypeName = enumKey;
                         declType.EnumBacking = compiler->GetEnumBackingType(enumKey);
+                        declType.IsScopedEnum = compiler->IsScopedEnumTypeName(enumKey);
                     }
                     // Peel an array alias's brackets (using Vec3 = float[3]) BEFORE the stars so
                     // "int*[3]" yields dims {3} over base "int*".

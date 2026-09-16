@@ -1180,6 +1180,7 @@ namespace cflat_cinterop
                     {
                         e.enumType = CxxQualifiedName(ed);
                         e.underlyingType = CanonicalSpelling(ctx, ed->getIntegerType());
+                        e.isScoped = ed->isScoped();
                     }
                 }
                 e.value = ApsIntToLongLong(ec->getInitVal());

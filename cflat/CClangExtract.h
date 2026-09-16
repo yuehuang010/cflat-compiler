@@ -155,6 +155,7 @@ namespace cflat_cinterop
         std::string name;
         std::string enumType;
         std::string underlyingType;
+        bool isScoped = false;
         long long value = 0;
         std::string file;
         int line = 1;

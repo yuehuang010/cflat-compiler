@@ -343,6 +343,10 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
             for (const auto& arg : arguments)
             {
                 int result = -1;
+                const bool scopedEnumMismatch = candidate.IsCxx
+                    && (arg.TypeAndValue.IsScopedEnum
+                        || IsScopedEnumTypeName(arg.TypeAndValue.TypeName))
+                    && !IsScopedEnumMatch(arg.TypeAndValue, *candidateParamItr);
 
                 // A C++ rvalue-reference parameter is address-passed like an alias, but an
                 // lvalue cannot bind it. Keep the candidate visible for the move diagnostic.
@@ -386,6 +390,7 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                     auto resolveName = [&](const std::string& tn) -> std::string
                         {
                             if (tn.empty()) return tn;
+                            if (IsScopedEnumTypeName(tn)) return tn;
                             auto it = enumBackingTypes.find(tn);
                             return (it != enumBackingTypes.end()) ? it->second : tn;
                         };
@@ -688,11 +693,13 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
 
                 // Integer -> bool IS legal, and lowers through CoerceToBoolCondition. Implicit
                 // (1), never perfect, so an exactly-typed overload still wins.
-                if (result < 0 && ArgumentConvertsToBoolParameter(arg, *candidateParamItr))
+                if (!scopedEnumMismatch && result < 0
+                    && ArgumentConvertsToBoolParameter(arg, *candidateParamItr))
                 {
                     result = 1;
                     boolCoercions++;
                 }
+                if (scopedEnumMismatch) result = -1;
 
                 // Integer identity ranking (ruling 2026-09-10): only an identity-exact integer is a
                 // perfect match. Never widens the viable set - it re-ranks what already binds.
@@ -1788,6 +1795,23 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                             SpellFunctionSymbol(*this, c.UniqueName), i, pi->VariableName, shown,
                             argType("", "one fewer level of indirection"), advice);
                     }
+                    break;
+                }
+            }
+
+            for (const auto& c : candidates)
+            {
+                const bool arityFits = c.Variadic ? arguments.size() >= c.Parameters.size()
+                                                  : arguments.size() == c.Parameters.size();
+                if (!c.IsCxx || !arityFits) continue;
+                for (size_t i = 0; i < arguments.size() && i < c.Parameters.size(); ++i)
+                {
+                    const auto& arg = arguments[i].TypeAndValue;
+                    if ((!arg.IsScopedEnum && !IsScopedEnumTypeName(arg.TypeName))
+                        || IsScopedEnumMatch(arg, c.Parameters[i])) continue;
+                    msg += std::format(
+                        "  argument {} is scoped C++ enum '{}' and cannot be implicitly converted to '{}'.\n",
+                        i, SpellType(*this, arg), displayParameterType(c.Parameters[i]));
                     break;
                 }
             }

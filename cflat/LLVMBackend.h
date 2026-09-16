@@ -901,6 +901,7 @@ public:
         // resolution ("u8", "i64", ...). Empty for every other type, and always a primitive
         // spelling so IsInteger/IsUnsignedInteger can read it directly.
         std::string EnumBacking;
+        bool IsScopedEnum = false;
 
         std::string GuardedBy;
         // The VariableName of the struct that contains this field (e.g. "d" when this field was accessed as d->field).
@@ -1200,6 +1201,7 @@ public:
         bool IsArrayView = false;
         uint64_t AllocAlignValue = 0;
         std::string EnumBacking;
+        bool IsScopedEnum = false;
 
         static SerializedTav From(const TypeAndValue& t)
         {
@@ -1207,6 +1209,7 @@ public:
             s.TypeName = t.TypeName;
             s.VariableName = t.VariableName;
             s.EnumBacking = t.EnumBacking;
+            s.IsScopedEnum = t.IsScopedEnum;
             s.Pointer = t.Pointer;
             s.ElemPointer = t.ElemPointer;
             s.PointerDepth = t.PointerDepth;
@@ -1263,6 +1266,7 @@ public:
             t.TypeName = TypeName;
             t.VariableName = VariableName;
             t.EnumBacking = EnumBacking;
+            t.IsScopedEnum = IsScopedEnum;
             t.Pointer = Pointer;
             t.ElemPointer = ElemPointer;
             t.PointerDepth = PointerDepth;
@@ -2944,6 +2948,7 @@ private:
 
     std::unordered_map<std::string, ProgramData> programTable;
     std::unordered_map<std::string, std::string> enumBackingTypes;
+    std::unordered_set<std::string> scopedEnumTypes_;
     // Declaration sites (file:line:col) an enum key was registered from. Both passes and a
     // re-import replay the same site, which is the no-op; a second, different site is a
     // redefinition. Transient per compile, never serialized.
@@ -3394,6 +3399,7 @@ private:
         std::string name;
         std::string enumType;
         std::string underlyingType;
+        bool isScoped = false;
         long long value = 0;
         int line = 1;
         int col = 0;
@@ -9120,6 +9126,9 @@ public:
     void RegisterLocalNamespaceAlias(const std::string& alias, const std::string& target);
     void RegisterEnumBackingType(const std::string& enumName, const std::string& backingType);
     std::string GetEnumBackingType(const std::string& enumName) const;
+    void RegisterScopedEnumType(const std::string& enumName);
+    bool IsScopedEnumTypeName(const std::string& name) const;
+    bool IsScopedEnumMatch(const TypeAndValue& from, const TypeAndValue& to) const;
     /*
      * Register an enum declaration: the type facts (name -> backing type, name as a member
      * scope) and every member's constant global. Called from BOTH passes - ForwardRefScanner so

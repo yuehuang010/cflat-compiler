@@ -198,6 +198,9 @@
 //                       through find/count, a struct field and a dereferenced pointer as
 //                       keys, a user-header C++ class key, and a CFlat-native operator[]
 //                       whose index parameter is a struct.
+//   Section M82 (1615-1638): C++ scoped-enum identity in free/member overload matching,
+//                       converting constructors, references, explicit casts, templates, and
+//                       measured preservation of unscoped enum conversions.
 // Section M: C++ interop - `import cpp` selects C++ mode; the extension is irrelevant (the
 // fixture header is a plain .h). The header supplies the declarations, the .cpp is compiled
 // by the host C++ driver and linked in. Both are needed: the header alone has no
@@ -228,6 +231,7 @@ import cpp "string" cache;
 import cpp "map" cache;
 import cpp "functional" cache;
 import cpp "library/cpp_interop_throw.h" cache;
+import cpp "library/cpp_interop_scoped_enum.h" cache;
 import "list.cb";
 import "thread.cb";
 import "malloc_allocator.cb";
@@ -3734,6 +3738,40 @@ extern int main()
     if (cppi.m85.kOld != 7)                         return 1612;
     if (cppi.m85.kRed.r != 1 || cppi.m85.kRed.b != 3) return 1613;
     if (cppi.m85.kName[0] != 'm')                   return 1614;
+    // ---- Section M82: C++ scoped-enum overload identity (1615-1638) --------------
+    cppi_scope.Module m82module = default;
+    if (cppi_scope.pick(cppi_scope.A.x) != 1007) return 1615;
+    if (m82module.pick(cppi_scope.A.x) != 1107) return 1616;
+    cppi_scope.Module* m82ptr = &m82module;
+    if (m82ptr->pick(cppi_scope.A.x) != 1107) return 1617;
+    cppi_scope.Dev m82dev = cppi_scope.Dev(cppi_scope.B.y);
+    if (cppi_scope.onlyDev(m82dev) != 3107) return 1618;
+    cppi_scope.DevA m82devA = cppi_scope.DevA(cppi_scope.A.x);
+    if (cppi_scope.devA(m82devA) != 6207) return 1619;
+    cppi_scope.A m82a = cppi_scope.A.x;
+    if (cppi_scope.ref(&m82a) != 7007) return 1620;
+    if (cppi_scope.mut(&m82a) != 8007) return 1621;
+    if (m82module.ref(m82a) != 1507) return 1622;
+    if (m82module.mut(m82a) != 1607) return 1623;
+    if (cppi_scope.onlyInt((int)cppi_scope.A.x) != 4007) return 1624;
+    if (cppi_scope.onlyB((cppi_scope.B)cppi_scope.A.x) != 5007) return 1625;
+    if (cppi_scope.unscopedInt(cppi_scope.U1.u) != 9007) return 1626;
+    if (cppi_scope.unscopedOther(cppi_scope.U1.u) != 10007) return 1627;
+    if (cppi_scope.pick(cppi_scope.A.x) != 1007) return 1628;
+    if (cppi_scope.onlyDev(m82dev) != 3107) return 1629;
+    if (cppi_scope.devA(m82devA) != 6207) return 1630;
+    std.vector<cppi_scope.A> m82enumVector = default;
+    if (cppi_scope.takeAVector(m82enumVector) != 8) return 1631;
+    std.map<cppi_scope.A, int> m82enumMap = default;
+    if (cppi_scope.takeAMap(m82enumMap) != 8) return 1632;
+    if (cppi_scope.deduceKind(cppi_scope.A.x) != 2) return 1633;
+    if (m82module.deduceKind(cppi_scope.A.x) != 4) return 1634;
+    std.vector<cppi_scope.U1> m82unscopedVector = default;
+    if (cppi_scope.takeUIntVector(m82unscopedVector) != 8) return 1635;
+    std.map<int, cppi_scope.U1> m82unscopedMap = default;
+    if (cppi_scope.takeUIntMap(m82unscopedMap) != 8) return 1636;
+    if (cppi_scope.deduceKind(cppi_scope.U1.u) != 1) return 1637;
+    if (m82module.deduceKind(cppi_scope.U1.u) != 3) return 1638;
 
     return 0;
 }

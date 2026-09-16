@@ -855,6 +855,33 @@ void LLVMBackend::RegisterEnumBackingType(const std::string& enumName, const std
         enumBackingTypes[enumName] = backingType;
     }
 
+void LLVMBackend::RegisterScopedEnumType(const std::string& enumName)
+{
+        if (!enumName.empty()) scopedEnumTypes_.insert(enumName);
+    }
+
+bool LLVMBackend::IsScopedEnumTypeName(const std::string& name) const
+{
+        const std::string key = ResolveEnumTypeName(name);
+        return !key.empty() && scopedEnumTypes_.count(key) != 0;
+    }
+
+bool LLVMBackend::IsScopedEnumMatch(const TypeAndValue& from, const TypeAndValue& to) const
+{
+        const bool fromScoped = from.IsScopedEnum || IsScopedEnumTypeName(from.TypeName);
+        if (!fromScoped) return true;
+        const bool toScoped = to.IsScopedEnum || IsScopedEnumTypeName(to.TypeName);
+        if (!toScoped) return false;
+        const std::string fromKey = ResolveEnumTypeName(from.TypeName);
+        const std::string toKey = ResolveEnumTypeName(to.TypeName);
+        if ((!fromKey.empty() && !toKey.empty()) ? fromKey != toKey
+                                                 : from.TypeName != to.TypeName)
+            return false;
+        if (from.Pointer == to.Pointer)
+            return from.ElemPointer == to.ElemPointer;
+        return !from.Pointer && to.Pointer && to.IsAlias && !to.ElemPointer;
+}
+
 std::string LLVMBackend::GetEnumBackingType(const std::string& enumName) const
 {
         auto it = enumBackingTypes.find(enumName);
@@ -1717,6 +1744,7 @@ nlohmann::json LLVMBackend::TvToJson(const TypeAndValue& tv)
         j["t"] = s.TypeName;
         if (!s.VariableName.empty()) j["n"] = s.VariableName;
         if (!s.EnumBacking.empty()) j["eb"] = s.EnumBacking;
+        if (s.IsScopedEnum) j["se"] = true;
         if (s.Pointer)        j["p"]   = true;
         if (s.ElemPointer)    j["ep"]  = true;
         if (s.PointerDepth)   j["pd"]  = s.PointerDepth;
@@ -1777,6 +1805,7 @@ LLVMBackend::TypeAndValue LLVMBackend::TvFromJson(const SjVal& j)
         s.TypeName = j.value("t", std::string{});
         s.VariableName = j.value("n", std::string{});
         s.EnumBacking = j.value("eb", std::string{});
+        s.IsScopedEnum = j.value("se", false);
         s.Pointer = j.value("p", false);
         s.ElemPointer = j.value("ep", false);
         s.PointerDepth = j.value("pd", 0);
@@ -1985,6 +2014,7 @@ nlohmann::json LLVMBackend::EnumToJson(const CEnumEntry& e)
         nlohmann::json j = {{"n", e.name}, {"v", e.value}, {"ln", e.line}, {"co", e.col}};
         if (!e.enumType.empty()) j["et"] = e.enumType;
         if (!e.underlyingType.empty()) j["ut"] = e.underlyingType;
+        if (e.isScoped) j["sc"] = true;
         return j;
     }
 
@@ -1997,6 +2027,7 @@ LLVMBackend::CEnumEntry LLVMBackend::EnumFromJson(const SjVal& j)
         e.col = j.value("co", 0);
         e.enumType = j.value("et", std::string{});
         e.underlyingType = j.value("ut", std::string{});
+        e.isScoped = j.value("sc", false);
         return e;
     }
 
@@ -2548,7 +2579,8 @@ bool LLVMBackend::TryLoadCHeaderDiskCache(
         // types in cached signatures, so unsigned narrow enum returns keep their signedness.
         // v62 stores a bound global's mangled linkage name and const-ness, so a namespace-scope
         // C++ object survives a warm cache.
-        if (version != 62) return cacheMiss("cache version");
+        // v63 carries C++ enum scopedness for conversion ranking.
+        if (version != 63) return cacheMiss("cache version");
 
         if (!expectedRequestKey.empty()
             && j.value("cxxRequestKey", std::string{}) != expectedRequestKey)
@@ -2772,7 +2804,7 @@ void LLVMBackend::WriteCHeaderDiskCache(
         if (ec) return;
 
         nlohmann::json j;
-        j["version"] = 62;
+        j["version"] = 63;
         j["mtime"]   = (int64_t)mtime.time_since_epoch().count();
         j["hash"]    = contentHash;
         j["ldw"]     = entry.longDoubleWidth;

@@ -1257,12 +1257,13 @@ bool LLVMBackend::MapCTypeToTypeAndValueImpl(std::string ctype, TypeAndValue& ou
         // enum decays to int. struct/union by-value: look up in dataStructures for ABI lowering.
         // struct/union pointers become opaque void* (only a pointer-sized slot is needed).
         std::string mapped;
-        if (enumTag)
+        if (enumTag || enumBackingTypes.count(base) != 0)
         {
             if (auto it = enumBackingTypes.find(base); it != enumBackingTypes.end())
             {
                 out.TypeName = base;
                 out.EnumBacking = it->second;
+                out.IsScopedEnum = scopedEnumTypes_.count(base) != 0;
                 out.Pointer = ptr >= 1;
                 out.ElemPointer = ptr == 2;
                 return true;
@@ -3107,6 +3108,7 @@ bool LLVMBackend::ExtractCHeaderClang(const std::vector<std::string>& headerPath
         // which are processed before the enum constants are published below.
         for (const auto& re : raw.enums)
         {
+            if (re.isScoped && !re.enumType.empty()) RegisterScopedEnumType(re.enumType);
             if (re.enumType.empty() || re.underlyingType.empty()) continue;
             TypeAndValue backing;
             if (MapCTypeToTypeAndValue(re.underlyingType, backing, cxxMode))
@@ -3192,6 +3194,7 @@ bool LLVMBackend::ExtractCHeaderClang(const std::vector<std::string>& headerPath
         {
                 CEnumEntry e;
                 e.name = re.name; e.enumType = re.enumType; e.underlyingType = re.underlyingType;
+                e.isScoped = re.isScoped;
                 e.value = re.value;
                 e.line = re.line ? re.line : 1; e.col = re.col < 0 ? 0 : re.col;
                 outEnums.push_back(std::move(e));
@@ -3382,7 +3385,20 @@ bool LLVMBackend::CxxSpellingForCflatType(const std::string& cflatType, std::str
             }
         }
         auto enumKey = ResolveEnumTypeName(base);
-        if (!enumKey.empty()) base = GetEnumBackingType(enumKey);
+        if (!enumKey.empty())
+        {
+            if (scopedEnumTypes_.count(enumKey) != 0)
+            {
+                base = enumKey;
+                for (size_t pos = 0; (pos = base.find('.', pos)) != std::string::npos; pos += 2)
+                    base.replace(pos, 1, "::");
+                out = base;
+                for (int i = 0; i < ptr; ++i) out += " *";
+                return true;
+            }
+            else
+                base = GetEnumBackingType(enumKey);
+        }
         auto closureIt = encodedClosureTypes_.find(base);
         if (closureIt != encodedClosureTypes_.end())
         {
@@ -5041,6 +5057,7 @@ LLVMBackend::CollectCxxImplicitArgumentCandidates(
                     type.TypeName = st->getName().str();
                 if (type.TypeName.empty()) type.TypeName = arg.InferSourceTypeName;
             }
+            type.IsScopedEnum = type.IsScopedEnum || IsScopedEnumTypeName(type.TypeName);
             return type;
         };
 
@@ -5074,6 +5091,16 @@ LLVMBackend::CollectCxxImplicitArgumentCandidates(
                     || (source.Pointer && source.TypeName == "char");
             }();
             if (isStringLike(raw) && charPointer) return true;
+            if (source.IsScopedEnum)
+            {
+                TypeAndValue targetType;
+                if (!MapCTypeToTypeAndValue(raw, targetType, true)
+                    || targetType.Pointer || !IsCxxRecord(targetType.TypeName))
+                    return false;
+                std::string why;
+                return SelectCxxConstructor(targetType.TypeName, { source }, why,
+                                            /*allowNumericConversions*/ true) != nullptr;
+            }
             const std::string target = targetClassIdentity(raw);
             const std::string trimmedRaw = trim(raw);
             if (!target.empty() && source.TypeName != target && IsCxxRecord(source.TypeName)
@@ -8549,6 +8576,9 @@ void LLVMBackend::RegisterCEnums(const std::vector<CEnumEntry>& enums, const std
         for (const CEnumEntry& e : enums)
         {
             if (e.name.empty()) continue;
+            if (e.isScoped && !e.enumType.empty()) RegisterScopedEnumType(e.enumType);
+            if (cxxBoundary && activeCxxRequestGroup_ != nullptr && !e.enumType.empty())
+                cxxTypeOwnerGroup_.emplace(e.enumType, activeCxxRequestGroup_->primary);
             if (!e.enumType.empty() && !e.underlyingType.empty())
             {
                 TypeAndValue backing;
@@ -8574,6 +8604,7 @@ void LLVMBackend::RegisterCEnums(const std::vector<CEnumEntry>& enums, const std
             TypeAndValue tv;
             tv.TypeName     = e.enumType.empty() ? (wide ? "i64" : "int") : e.enumType;
             tv.EnumBacking  = e.enumType.empty() ? std::string{} : GetEnumBackingType(e.enumType);
+            tv.IsScopedEnum = e.isScoped;
             tv.VariableName = e.name;
             tv.Pointer      = false;
             llvm::Constant* c = nullptr;
@@ -12285,6 +12316,8 @@ const LLVMBackend::CxxClassInfo::Structor* LLVMBackend::SelectCxxConstructor(
             return aFloat != -1 && aFloat == b.IsFloatingPoint();
         };
         auto compatible = [&](const TypeAndValue& want, const TypeAndValue& got) {
+            if (got.IsScopedEnum)
+                return IsScopedEnumMatch(got, want);
             if (want.TypeName == got.TypeName && want.Pointer == got.Pointer) return true;
             if (want.Pointer && got.Pointer && IsCxxDerivedToBasePointer(got, want))
                 return true;                 // a public derived pointer converts to Base*
@@ -12488,6 +12521,7 @@ bool LLVMBackend::CanImplicitlyConstructCxxClass(const NamedVariable& arg,
             return false;
 
         TypeAndValue argType = InferImplicitCxxArgumentType(arg, *this);
+        argType.IsScopedEnum = argType.IsScopedEnum || IsScopedEnumTypeName(argType.TypeName);
         if (argType.TypeName.empty()) return false;
         std::string argSpelling;
         std::string paramSpelling;

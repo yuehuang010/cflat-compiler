@@ -5873,6 +5873,16 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     // The declared element type, for generic inference only: the
                                     // TypeName below stays empty for primitives on purpose.
                                     argVar.InferSourceTypeName = argNV.TypeAndValue.TypeName;
+                                    // C++ scoped enums keep their identity at the overload boundary;
+                                    // their lowered integer representation is not a CFlat conversion.
+                                    if (argNV.TypeAndValue.IsScopedEnum
+                                        || Compiler(ctx)->IsScopedEnumTypeName(
+                                            argNV.TypeAndValue.TypeName))
+                                    {
+                                        argVar.TypeAndValue.TypeName = argNV.TypeAndValue.TypeName;
+                                        argVar.TypeAndValue.EnumBacking = argNV.TypeAndValue.EnumBacking;
+                                        argVar.TypeAndValue.IsScopedEnum = true;
+                                    }
                                     // An unsuffixed integer literal lowers at its smallest width but
                                     // ranks as 'int' (C++) in overload resolution.
                                     argVar.LiteralIdentity = LLVMBackend::UnsuffixedIntegerLiteralIdentity(

@@ -1066,6 +1066,7 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                     {
                         typeName = enumKey;
                         declType.EnumBacking = Compiler(declSpecs)->GetEnumBackingType(enumKey);
+                        declType.IsScopedEnum = Compiler(declSpecs)->IsScopedEnumTypeName(enumKey);
                     }
                     declType.TypeName = typeName;
                     // A type-arg string carries its REAL star count, so the depth below is a proof:
