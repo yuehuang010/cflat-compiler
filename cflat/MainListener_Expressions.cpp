@@ -1,4 +1,5 @@
 #include "MainListener.h"
+#include <llvm/Analysis/ValueTracking.h>
 
 /*
  * The compound assignment operators, each paired with the binary operator it falls back to when
@@ -1855,6 +1856,21 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                     LogErrorContext(unaryCtx, "simd<T,N> lane write 'v[i] = ...' is not supported; lanes are read-only. Build a new vector value instead.");
                 else
                     LogErrorContext(unaryCtx, "Left side of assignment is not an addressable lvalue.");
+            }
+
+            // A bound C++ const/constexpr namespace object lives in read-only storage, so the
+            // store would trap at run time. Name the LHS as written, not the mangled symbol.
+            auto* constGlobal = destination != nullptr
+                ? llvm::dyn_cast<llvm::GlobalVariable>(llvm::getUnderlyingObject(destination))
+                : nullptr;
+            if (constGlobal != nullptr
+                && compiler->cxxConstGlobalSymbols_.count(constGlobal->getName().str()) != 0)
+            {
+                std::string lhsName = unaryCtx != nullptr && !unaryCtx->getText().empty()
+                    ? unaryCtx->getText() : namedVar.CallerName;
+                LogErrorContext(unaryCtx, std::format(
+                    "cannot assign to '{}': it is a const C++ object, so its storage is read-only. "
+                    "Copy it into a local and assign to that instead.", lhsName));
             }
 
             // For through-pointer dereferences (*p), Storage is a raw loaded ptr (not alloca/gep/global)

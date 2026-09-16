@@ -1,0 +1,22 @@
+// A bound C++ const/constexpr namespace object lives in read-only storage, so a store through
+// it traps at run time. Each leg is a separate scoped block: they are checked independently.
+import cpp "cpp_interop_basic.h" cache;
+import cpp "cpp_interop_basic.cpp" cache;
+
+extern int main()
+{
+    // An out-of-line `extern const int`: the object binds, the write does not.
+    expect_error("cannot assign to 'cppi.m85.kLinked': it is a const C++ object") {
+        cppi.m85.kLinked = 1;
+    }
+
+    // A FIELD of a const class-typed object - the store is a GEP, not the global itself.
+    expect_error("cannot assign to 'cppi.m85.kLinkedColor.r': it is a const C++ object") {
+        cppi.m85.kLinkedColor.r = 1;
+    }
+
+    // A header-only constexpr object whose storage cflat emitted itself.
+    expect_error("cannot assign to 'cppi.m85.kRed.g': it is a const C++ object") {
+        cppi.m85.kRed.g = 1;
+    }
+}

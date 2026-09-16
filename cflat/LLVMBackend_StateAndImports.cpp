@@ -2005,6 +2005,8 @@ nlohmann::json LLVMBackend::GlobalToJson(const CGlobalEntry& g)
         nlohmann::json j = {{"n", g.name}, {"t", TvToJson(g.type)},
                             {"ln", g.line}, {"co", g.col}};
         if (!g.qualifiedName.empty()) j["qn"] = g.qualifiedName;
+        if (!g.linkageName.empty()) j["lk"] = g.linkageName;
+        if (g.isConst) j["cq"] = true;
         if (g.isCompileTimeConstant)
         {
             j["cn"] = true;
@@ -2027,6 +2029,8 @@ LLVMBackend::CGlobalEntry LLVMBackend::GlobalFromJson(const SjVal& j)
         CGlobalEntry g;
         g.name = j.value("n", std::string{});
         g.qualifiedName = j.value("qn", std::string{});
+        g.linkageName = j.value("lk", std::string{});
+        g.isConst = j.value("cq", false);
         g.type = TvFromJson(j.at("t"));
         g.isCompileTimeConstant = j.value("cn", false);
         g.isFloatConstant = j.value("fc", false);
@@ -2542,7 +2546,9 @@ bool LLVMBackend::TryLoadCHeaderDiskCache(
         // separately from the registration state. v59 preserves the full probe record needed to
         // rebuild an identical stage-2 source from a warm stage-1 hit. v60 preserves enum backing
         // types in cached signatures, so unsigned narrow enum returns keep their signedness.
-        if (version != 61) return cacheMiss("cache version");
+        // v62 stores a bound global's mangled linkage name and const-ness, so a namespace-scope
+        // C++ object survives a warm cache.
+        if (version != 62) return cacheMiss("cache version");
 
         if (!expectedRequestKey.empty()
             && j.value("cxxRequestKey", std::string{}) != expectedRequestKey)
@@ -2766,7 +2772,7 @@ void LLVMBackend::WriteCHeaderDiskCache(
         if (ec) return;
 
         nlohmann::json j;
-        j["version"] = 61;
+        j["version"] = 62;
         j["mtime"]   = (int64_t)mtime.time_since_epoch().count();
         j["hash"]    = contentHash;
         j["ldw"]     = entry.longDoubleWidth;

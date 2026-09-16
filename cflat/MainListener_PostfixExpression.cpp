@@ -1438,8 +1438,11 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 // A C++ alias not yet requested (`nlohmann.json.parse(...)`, or a
                                 // temporary `c10.IntArrayRef(p, n)` built straight into a call
                                 // argument): bring the specialization in under its alias name first.
+                                // A name that already resolves to a bound global is an OBJECT
+                                // (`nsv.gTracker.seed`), never an unrequested alias.
                                 if (!isFileAlias && !qualifiedDataStructure
                                     && Compiler(ctx)->HasCxxImportGroup()
+                                    && Compiler(ctx)->GetGlobalVariableNV(qualifiedName).Storage == nullptr
                                     && (IsFollowedByDot(ctx, terminal)
                                         || (IsFollowedByCall(ctx, terminal)
                                             && Compiler(ctx)->IsCxxLazyAliasSpecialization(qualifiedName))))

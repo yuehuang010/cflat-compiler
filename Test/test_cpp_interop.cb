@@ -188,6 +188,11 @@
 //                       destructor counts, move construction, and a no-base field generic.
 //   Section M83 (1576-1580): a class-template specialization named through a GLOBAL-scope C++
 //                       alias or typedef - both spellings reach one record.
+//   Section M85 (1600-1614): namespace-scope C++ OBJECTS - out-of-line extern scalars,
+//                       class-typed objects and const ones, nested and inline namespaces, a
+//                       global-scope object, header-only constants that need their own storage,
+//                       and a write through a mutable one. Test/errors/err_cpp_namespace_const_
+//                       assign.cb covers the rejected writes.
 //   Section M84 (1590-1599): a CLASS-typed subscript index - a named std.string lvalue as a
 //                       std.map key (incremented twice, and not moved from), the same key
 //                       through find/count, a struct field and a dereferenced pointer as
@@ -3698,6 +3703,37 @@ extern int main()
     M83GlobalTypedef m83typedef = default;
     m83typedef.value = 2.5;
     if (m83typedef.value != 2.5)                    return 1580;
+
+    // ---- Section M85: namespace-scope C++ objects (1600-1614) -------------------
+    // Measured on the pre-fix binary: every leg below failed EXCEPT 1610 (global scope, whose
+    // unqualified name already matched the symbol) and 1611 (a folded inline constexpr int) -
+    // those two are accept-set legs that must not regress. The rest failed as "not a member of
+    // namespace 'cppi.m85'", or - for the class-typed ones - as "does not name a C++ class type".
+    // (a) out-of-line definitions in cpp_interop_basic.cpp, reached by MANGLED name.
+    if (cppi.m85.counter != 10)                     return 1600;
+    if (cppi.m85.kLinked != 11)                     return 1601;
+    // A write through a mutable object is observable on the next read.
+    cppi.m85.counter = 88;
+    if (cppi.m85.counter != 88)                     return 1602;
+    cppi.m85.counter = 10;
+    // A CLASS-typed object: fields and a const member call on the library's storage.
+    if (cppi.m85.gTracker.seed != 21)               return 1603;
+    if (cppi.m85.gTracker.doubled() != 42)          return 1604;
+    cppi.m85.gTracker.seed = 4;
+    if (cppi.m85.gTracker.doubled() != 8)           return 1605;
+    cppi.m85.gTracker.seed = 21;
+    if (cppi.m85.kLinkedColor.r != 7)               return 1606;
+    if (cppi.m85.kLinkedColor.b != 9)               return 1607;
+    // Namespace shapes: nested, inline (which the CFlat spelling drops), global scope.
+    if (cppi.m85.inner.deep != 31)                  return 1608;
+    if (cppi.m85.versioned != 41)                   return 1609;
+    if (cppi_m85_global != 3)                       return 1610;
+    // (b) header-only constants. kAnswer and kOld fold; kRed needs emitted storage, since a
+    // non-inline constexpr object has internal linkage and exists in no library.
+    if (cppi.m85.kAnswer != 42)                     return 1611;
+    if (cppi.m85.kOld != 7)                         return 1612;
+    if (cppi.m85.kRed.r != 1 || cppi.m85.kRed.b != 3) return 1613;
+    if (cppi.m85.kName[0] != 'm')                   return 1614;
 
     return 0;
 }

@@ -4454,6 +4454,7 @@ void LLVMBackend::ResetForReanalysis()
     cxxFunctionOwnerGroup_.clear();
     cxxTypeOwnerGroup_.clear();
     cxxForeignNamespaces_.clear();
+    cxxConstGlobalSymbols_.clear();
     cxxUsingDirectives_.clear();
     cxxForeignTypeSpellings_.clear();
     cxxFunctionPointerAbiPlans_.clear();

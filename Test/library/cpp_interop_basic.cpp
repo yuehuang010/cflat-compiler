@@ -443,3 +443,19 @@ namespace cppi
 }
 
 extern "C" int cppi_c_linkage(int v) noexcept { return v + 5; }
+
+// M85 - out-of-line definitions for the namespace-scope objects declared in the header.
+namespace cppi
+{
+    namespace m85
+    {
+        int counter = 10;
+        const int kLinked = 11;
+        Tracker gTracker{21};
+        const Color kLinkedColor{7, 8, 9};
+        namespace inner { int deep = 31; }
+        inline namespace v1 { int versioned = 41; }
+    }
+}
+
+int cppi_m85_global = 3;

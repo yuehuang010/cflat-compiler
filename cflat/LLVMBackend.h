@@ -3221,6 +3221,9 @@ private:
      * struct is about to define could otherwise be captured by a same-named foreign record.
      */
     std::unordered_set<std::string> cxxForeignNamespaces_;
+    // Emitted symbol names of bound C++ const/constexpr namespace-scope objects. Their storage is
+    // read-only, so a store through one traps at run time; the assignment site rejects it instead.
+    std::unordered_set<std::string> cxxConstGlobalSymbols_;
     // Leading segment of a dotted name a C++ import registered, noted as a foreign namespace.
     void NoteCxxForeignNamespace(const std::string& dottedName)
     {
@@ -3399,7 +3402,11 @@ private:
     {
         std::string name;
         std::string qualifiedName;
+        // Emitted symbol name; empty means "use the CFlat name". A C++ namespace-scope object
+        // is only reachable through Clang's mangling.
+        std::string linkageName;
         TypeAndValue type;
+        bool isConst = false;
         bool isCompileTimeConstant = false;
         int64_t constantValue = 0;
         bool isFloatConstant = false;

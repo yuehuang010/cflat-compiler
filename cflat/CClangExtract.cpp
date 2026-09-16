@@ -414,9 +414,12 @@ namespace cflat_cinterop
             return os.str().str();
         }
 
+        // A global-scope C variable keeps its plain name; mangleName would spell it `_Z...`
+        // anyway, so the "should this be mangled at all" question has to be asked first.
         std::string CxxLinkageName(ASTContext& ctx, const VarDecl* vd)
         {
             auto mangle = std::unique_ptr<MangleContext>(ctx.createMangleContext());
+            if (!mangle->shouldMangleDeclName(vd)) return vd->getNameAsString();
             llvm::SmallString<128> storage;
             llvm::raw_svector_ostream os(storage);
             mangle->mangleName(GlobalDecl(vd), os);
@@ -2346,58 +2349,65 @@ namespace cflat_cinterop
                 return true;
             }
 
-            // Harvest an externally-linkable file-scope global variable - a header `extern int x;`
-            // declaration or a .c-defined `int x = 5;`. Skips statics (internal linkage), locals,
-            // and (in definitionsOnly / .c mode) pure declarations with no definition in this TU.
-            // Dedups redeclarations by name. Returns true (continue traversal) unconditionally.
-            bool HarvestGlobalVar(VarDecl* vd)
+            /*
+             * Harvest a C++ namespace-scope (or global-scope) object. Three outcomes:
+             *   - a const/constexpr object whose initializer folds to an integer or a float is
+             *     bound as a compile-time constant, with no symbol at all;
+             *   - an externally-linkable object is bound to Clang's MANGLED name, which is the
+             *     only spelling that finds `nsv::counter` in the library. A header-only inline or
+             *     constexpr definition has no library symbol, so its storage is emitted into the
+             *     companion module first;
+             *   - an internal-linkage const object of class type has no symbol anywhere, so its
+             *     storage is emitted locally and promoted to weak_odr after codegen.
+             * Returns true (continue traversal) unconditionally.
+             */
+            bool HarvestCxxNamespaceVar(VarDecl* vd)
             {
-                if (!vd->isFileVarDecl()) return true;            // locals, params, members
+                if (vd->getIdentifier() == nullptr) return true;
+                if (vd->getType()->isFunctionType()) return true;   // not a data symbol
 
-                // Namespace-scope C++ constexpr variables have internal linkage by default, so
-                // they are not externally linkable even though their values are usable in a
-                // caller. Bind folded integer and floating-point initializers.
-                const bool cxxConstexpr = st.req.cxxMode
-                    && !vd->isStaticDataMember()
-                    && (vd->isConstexpr()
-                        || (vd->isInline() && vd->getType().isConstQualified()))
-                    && vd->getInit() != nullptr;
-                if (cxxConstexpr)
+                std::string file; int line = 1, col = 0;
+                if (!LocOf(vd, file, line, col)) return true;
+                const std::string qualified = CxxQualifiedName(vd);
+                auto skipVar = [&](const char* why) {
+                    if (st.req.verbose)
+                        std::cout << "[verbose]   C++ namespace variable " << qualified
+                                  << " not bound: " << why << "\n";
+                };
+                if (!IsValidDottedName(qualified))
+                { skipVar("name is not a valid CFlat qualified name"); return true; }
+                // A thread_local object is reached through a TLS access sequence, not a plain
+                // load of its symbol, so binding it would link wrong or not at all.
+                if (vd->getTSCSpec() != TSCS_unspecified)
+                { skipVar("it is thread_local, which CFlat cannot address yet"); return true; }
+                if (!st.emittedGlobals.insert(qualified).second) return true;
+
+                const VarDecl* def = vd->getDefinition();
+                const Expr* init = def != nullptr ? def->getInit() : vd->getAnyInitializer();
+                const bool isConst = vd->getType().isConstQualified() || vd->isConstexpr();
+
+                RawGlobalVar g;
+                g.name = vd->getNameAsString();
+                g.qualifiedName = qualified;
+                g.ctype = CanonicalSpelling(ctx, vd->getType().getUnqualifiedType());
+                g.isConst = isConst;
+                g.file = file; g.line = line; g.col = col;
+
+                // A folded scalar needs no storage, so it works whatever the linkage is.
+                if (isConst && init != nullptr && !init->containsErrors() && !init->isValueDependent())
                 {
-                    std::string file; int line = 1, col = 0;
-                    if (!LocOf(vd, file, line, col)) return true;
-                    const std::string qualified = CxxQualifiedName(vd);
-                    if (!IsValidDottedName(qualified))
-                    {
-                        if (st.req.verbose)
-                            std::cout << "[verbose]   C++ namespace variable " << qualified
-                                      << " not bound: name is not a valid CFlat qualified name\n";
-                        return true;
-                    }
-                    if (!st.emittedGlobals.insert(qualified).second) return true;
-
                     Expr::EvalResult result;
-                    const Expr* init = vd->getInit();
-                    const bool evaluated = !init->containsErrors() && !init->isValueDependent()
-                        && init->EvaluateAsRValue(result, ctx);
+                    const bool evaluated = init->EvaluateAsRValue(result, ctx);
                     if (evaluated && result.Val.isInt())
                     {
-                        RawGlobalVar g;
-                        g.name = vd->getNameAsString();
-                        g.qualifiedName = qualified;
-                        g.ctype = CanonicalSpelling(ctx, vd->getType().getUnqualifiedType());
                         g.isCompileTimeConstant = true;
                         g.constantValue = ApsIntToLongLong(result.Val.getInt());
                         g.isCxxConstexpr = true;
-                        g.file = file; g.line = line; g.col = col;
                         st.out.globals.push_back(std::move(g));
+                        return true;
                     }
-                    else if (evaluated && result.Val.isFloat())
+                    if (evaluated && result.Val.isFloat())
                     {
-                        RawGlobalVar g;
-                        g.name = vd->getNameAsString();
-                        g.qualifiedName = qualified;
-                        g.ctype = CanonicalSpelling(ctx, vd->getType().getUnqualifiedType());
                         g.isCompileTimeConstant = true;
                         g.isFloatConstant = true;
                         bool losesInfo = false;
@@ -2406,17 +2416,51 @@ namespace cflat_cinterop
                             std::cout << "[verbose]   C++ namespace variable " << qualified
                                       << " rounded long double to double (loss of precision)\n";
                         g.isCxxConstexpr = true;
-                        g.file = file; g.line = line; g.col = col;
                         st.out.globals.push_back(std::move(g));
+                        return true;
                     }
-                    else if (st.req.verbose)
-                    {
-                        const char* why = "initializer is not an integer or floating constant expression";
-                        std::cout << "[verbose]   C++ namespace variable " << qualified
-                                  << " not bound: " << why << "\n";
-                    }
-                    return true;
                 }
+
+                // Anything else needs a real symbol. Decide who provides it.
+                const bool headerOnly = vd->isInline() || vd->isConstexpr()
+                    || !vd->hasExternalFormalLinkage() || vd->getStorageClass() == SC_Static;
+                const bool canEmit = st.req.emitDefinitions || st.req.assumeInlineDefinitions;
+                if (headerOnly)
+                {
+                    if (def == nullptr || init == nullptr)
+                    { skipVar("no definition to emit and no library symbol to bind"); return true; }
+                    if (!canEmit)
+                    { skipVar("its initializer lives in the header, so it has no library symbol"); return true; }
+                    if (def->getType()->isDependentType()
+                        || def->getDeclContext()->isDependentContext())
+                    { skipVar("its type or initializer is dependent"); return true; }
+                    if (st.req.emitDefinitions) st.varEmitWork.push_back(def);
+                    g.linkageName = CxxLinkageName(ctx, vd);
+                    // An internal-linkage definition is invisible outside the companion module.
+                    if (!vd->hasExternalFormalLinkage() || vd->getStorageClass() == SC_Static)
+                        st.out.weakPromoteSymbols.push_back(g.linkageName);
+                }
+                else
+                {
+                    // .c auto-extern mode never reaches here (that path is C-only), but a C++
+                    // definitions-only request still binds only what this TU defines.
+                    if (st.req.definitionsOnly && def == nullptr) return true;
+                    g.linkageName = CxxLinkageName(ctx, vd);
+                }
+                st.out.globals.push_back(std::move(g));
+                return true;
+            }
+
+            // Harvest an externally-linkable file-scope global variable - a header `extern int x;`
+            // declaration or a .c-defined `int x = 5;`. Skips statics (internal linkage), locals,
+            // and (in definitionsOnly / .c mode) pure declarations with no definition in this TU.
+            // Dedups redeclarations by name. Returns true (continue traversal) unconditionally.
+            bool HarvestGlobalVar(VarDecl* vd)
+            {
+                if (!vd->isFileVarDecl()) return true;            // locals, params, members
+
+                if (st.req.cxxMode && !vd->isStaticDataMember())
+                    return HarvestCxxNamespaceVar(vd);
 
                 if (vd->getStorageClass() == SC_Static) return true;  // internal linkage
                 if (!vd->hasExternalFormalLinkage()) return true;
@@ -3539,6 +3583,18 @@ namespace cflat_cinterop
 
             llvm::Module* mod = cg.GetModule();
             if (mod == nullptr) return;   // CodeGen error: nothing is bound to a local definition
+
+            // An internal-linkage namespace constant (`constexpr Color kRed{1,0,0};`) exists in
+            // no library and is invisible across modules; weak_odr makes the emitted storage
+            // bindable and still merges if two companion modules carry it.
+            for (const std::string& sym : st.out.weakPromoteSymbols)
+            {
+                llvm::GlobalVariable* gv = mod->getGlobalVariable(sym, /*AllowInternal*/ true);
+                if (gv == nullptr || gv->isDeclaration()) continue;
+                if (!gv->hasLocalLinkage()) continue;
+                gv->setLinkage(llvm::GlobalValue::WeakODRLinkage);
+                gv->setVisibility(llvm::GlobalValue::DefaultVisibility);
+            }
 
             unsigned defs = 0;
             for (const llvm::Function& f : mod->functions())

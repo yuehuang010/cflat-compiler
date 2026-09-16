@@ -2321,6 +2321,8 @@ bool LLVMBackend::MapRawGlobal(const cflat_cinterop::RawGlobalVar& r, CGlobalEnt
         e = CGlobalEntry();
         e.name = cxxBoundary && !r.qualifiedName.empty() ? r.qualifiedName : r.name;
         e.qualifiedName = r.qualifiedName;
+        e.linkageName = r.linkageName;
+        e.isConst = r.isConst;
         e.isCompileTimeConstant = r.isCompileTimeConstant;
         e.constantValue = r.constantValue;
         e.isFloatConstant = r.isFloatConstant;
@@ -8631,14 +8633,17 @@ void LLVMBackend::RegisterCGlobals(const std::vector<CGlobalEntry>& globals, con
 
             for (size_t pos = 0; (pos = e.name.find('.', pos)) != std::string::npos; ++pos)
                 RegisterNamespace(e.name.substr(0, pos));
-            if (e.isCxxConstexpr) NoteCxxForeignNamespace(e.name);
+            if (e.isCxxConstexpr || !e.linkageName.empty()) NoteCxxForeignNamespace(e.name);
             auto* global = CreateGlobalVariable(tv, init, /*threadLocal*/ false,
-                /*userAlign*/ 0, /*externalDecl*/ !isConstant);
+                /*userAlign*/ 0, /*externalDecl*/ !isConstant, /*srcIsUnsigned*/ false,
+                e.linkageName);
             if (isConstant)
             {
                 SetConstGlobalInt(e.name, e.constantValue);
                 SetConstGlobalInt(global->getName().str(), e.constantValue);
             }
+            else if (e.isConst)
+                cxxConstGlobalSymbols_.insert(global->getName().str());
 
             if (auto* s = GetSymbolSink())
             {

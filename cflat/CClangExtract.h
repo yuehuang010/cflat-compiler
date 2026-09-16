@@ -389,7 +389,11 @@ namespace cflat_cinterop
     {
         std::string name;
         std::string qualifiedName;
+        // Emitted symbol name. Empty for C; in C++ it is Clang's mangling, which is the only
+        // name that finds a namespace-scope object in the library or companion module.
+        std::string linkageName;
         std::string ctype;
+        bool isConst = false;
         bool isCompileTimeConstant = false;
         int64_t constantValue = 0;
         bool isFloatConstant = false;
@@ -503,6 +507,9 @@ namespace cflat_cinterop
         // Names of generated default-argument wrappers whose declarations or bodies carried
         // parse/Sema errors and were therefore withheld from CodeGen.
         std::vector<std::string> droppedCxxDefaultWrappers;
+        // Mangled names of internal-linkage namespace-scope objects whose storage the companion
+        // module emits; promoted to weak_odr after codegen so the program module can bind them.
+        std::vector<std::string> weakPromoteSymbols;
 
         // Companion module produced when req.emitDefinitions is set: raw LLVM bitcode bytes
         // holding the C++ definitions Clang emitted for the bound surface (linkonce_odr inline

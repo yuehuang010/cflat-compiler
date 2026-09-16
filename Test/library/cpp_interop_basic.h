@@ -796,6 +796,38 @@ namespace cppi
 
     extern template struct ExternPoly<int>;
 
+    /*
+     * M85 - namespace-scope OBJECTS. The `extern` ones are defined out of line in
+     * cpp_interop_basic.cpp and bind to Clang's mangled name; the header-only constants have no
+     * library symbol at all, so cflat either folds them or emits their storage itself.
+     */
+    namespace m85
+    {
+        struct Color { int r; int g; int b; };
+        struct Tracker
+        {
+            int seed;
+            int doubled() const noexcept { return seed * 2; }
+        };
+        enum class Unit { Meter = 1, Mile = 7 };
+
+        extern int counter;                 // mutable scalar, out-of-line
+        extern const int kLinked;           // const scalar, out-of-line
+        extern Tracker gTracker;            // class typed, out-of-line
+        extern const Color kLinkedColor;    // const class typed, out-of-line
+
+        namespace inner { extern int deep; }        // nested namespace
+        inline namespace v1 { extern int versioned; }   // inline namespace
+
+        inline constexpr int kAnswer = 42;      // folds, no storage
+        constexpr Unit kUnit = Unit::Mile;      // scoped-enum constant
+        static const int kOld = 7;              // internal linkage, folds
+        constexpr Color kRed{1, 2, 3};          // internal linkage, needs storage
+        inline const char* kName = "m85";       // header-only pointer object
+    }
+
 }
+
+extern int cppi_m85_global;   // global-scope C++ object: no mangling at all
 
 extern "C" int cppi_c_linkage(int v) noexcept;
