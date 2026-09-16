@@ -12253,6 +12253,37 @@ int testSlotMoveIntoSink()
     return passed;
 }
 
+struct MethodUniqueList
+{
+    list<unique Resource*> kids = default;
+
+    void buildLocal()
+    {
+        list<unique Resource*> l = default;
+        unique Resource* n = createResource(101);
+        l.add(move n);
+    }
+
+    void buildField(MethodUniqueList* p)
+    {
+        unique Resource* n = createResource(102);
+        p->kids.add(move n);
+    }
+};
+
+int testMethodUniqueListMove()
+{
+    int passed = 0;
+    dtorCount = 0;
+    MethodUniqueList* p = new MethodUniqueList();
+    p->buildLocal();
+    passed += Test("method_unique_list_local_dtor", dtorCount, 1);
+    p->buildField(p);
+    delete p;
+    passed += Test("method_unique_list_field_dtor", dtorCount, 2);
+    return passed;
+}
+
 extern int main()
 {
     int passed = 0;
@@ -12635,6 +12666,9 @@ extern int main()
 
     passed += testSlotMoveIntoSink();
     total += 8;
+
+    passed += testMethodUniqueListMove();
+    total += 2;
 
     passed += testAddressOfBorrowDeleteAccepts();
     total += 6;

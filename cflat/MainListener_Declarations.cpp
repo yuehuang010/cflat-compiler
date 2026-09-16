@@ -12,12 +12,13 @@ static bool IsFunctionBodyDeclaration(
         bool insideFunction = false;
         for (auto* parent = declSpecs->parent; parent != nullptr; parent = parent->parent)
         {
-            if (dynamic_cast<CFlatParser::AggregateMemberContext*>(parent) != nullptr)
-                return false;
             if (dynamic_cast<CFlatParser::ParameterDeclarationContext*>(parent) != nullptr)
                 return false;
             if (dynamic_cast<CFlatParser::FunctionDefinitionContext*>(parent) != nullptr)
                 insideFunction = true;
+            else if (!insideFunction
+                     && dynamic_cast<CFlatParser::AggregateMemberContext*>(parent) != nullptr)
+                return false;
         }
         return insideFunction
             && dynamic_cast<CFlatParser::FunctionDefinitionContext*>(declSpecs->parent) == nullptr;

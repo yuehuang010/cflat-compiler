@@ -2485,9 +2485,17 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                     ? (arg.TypeAndValue.VariableName.empty() ? std::string("<expression>")
                                                               : arg.TypeAndValue.VariableName)
                     : arg.CallerName;
+                const auto* source = arg.CallerName.empty()
+                    ? FindLiveNamedVariable(arg.TypeAndValue.VariableName)
+                    : FindLiveNamedVariable(arg.CallerName);
+                const bool isKnownRawArray = arg.IsNewAllocated
+                    || (source != nullptr && source->IsNewAllocated);
                 LogErrorMessage(
-                    "cannot pass owning heap array '{}' to parameter '{}' of '{}': "
-                    "unique<T> does not own arrays",
+                    isKnownRawArray
+                        ? "cannot pass owning heap array '{}' to parameter '{}' of '{}': "
+                          "unique<T> does not own arrays"
+                        : "cannot pass owning pointer '{}' to parameter '{}' of '{}': hold the "
+                          "result in a 'unique T*' local",
                     { sourceName, candidate.Parameters[i].VariableName, diagnosticFunctionName });
             }
             // The element slot of a borrowing container is a legal `move` destination: the
