@@ -5548,6 +5548,26 @@ public:
     // (member or free) instead of a primitive bit-shift.
     bool HasOperatorOverloadForFirstParam(const std::string& opName, const std::string& typeName);
 
+    struct ShiftOperand
+    {
+        LLVMBackend::TypedValue value;
+        LLVMBackend::NamedVariable named;
+        std::string name;
+        bool accumulated = false;
+    };
+
+    struct ShiftPairResult
+    {
+        LLVMBackend::TypedValue value;
+        LLVMBackend::NamedVariable named;
+        std::string name;
+    };
+
+    ShiftPairResult ParseShiftPair(const ShiftOperand& lhs, const ShiftOperand& rhs,
+                                   const std::string& op,
+                                   CFlatParser::ShiftExpressionContext* ctx,
+                                   ResultUse use);
+
     LLVMBackend::TypedValue ParseShiftExpression(CFlatParser::ShiftExpressionContext* ctx,
                                                   ResultUse use = ResultUse::Value);
 

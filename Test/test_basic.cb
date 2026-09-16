@@ -5701,6 +5701,14 @@ bool testConstFold()
     int sh  = 20;
     result &= Test("fold==runtime shift", 1 << 20, one << sh);
 
+    result &= Test("chained left shift", 1 << 2 << 3, 32);
+    result &= Test("chained right shift", 256 >> 2 >> 2, 16);
+    int mixedShift = 8;
+    result &= Test("mixed chained shift", (mixedShift << 1) >> 1, 8);
+    result &= Test("chained u32 shift", (u32)1 << 4 << 4, (u32)256);
+    result &= Test("chained u64 shift", (u64)1 << 32 << 16, (u64)281474976710656);
+    result &= Test("chained i64 right shift", (i64)256 >> 2 >> 2, (i64)16);
+
     int a = 4;
     int k = 1024;
     result &= Test("fold==runtime mul", 4 * 1024 * 1024, a * k * k);

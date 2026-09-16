@@ -8043,165 +8043,226 @@ bool MainListener::HasOperatorOverloadForFirstParam(const std::string& opName, c
         return false;
     }
 
+MainListener::ShiftPairResult MainListener::ParseShiftPair(
+    const ShiftOperand& lhs, const ShiftOperand& rhs, const std::string& op,
+    CFlatParser::ShiftExpressionContext* ctx, ResultUse use) {
+        auto* compiler = Compiler(ctx);
+        const auto& lv = lhs.value;
+        const auto& rv = rhs.value;
+        const auto& lhsNV = lhs.named;
+        const auto& rhsNV = rhs.named;
+        const std::string& lhsName = lhs.name;
+        const std::string& rhsName = rhs.name;
+        const std::string& lhsType = lhsNV.TypeAndValue.TypeName;
+        const std::string& rhsType = rhsNV.TypeAndValue.TypeName;
+
+        auto pipeResult = [&]() {
+            ShiftPairResult result;
+            result.value = rv;
+            result.named = rhsNV;
+            result.name = rhsName;
+            return result;
+        };
+
+        if (op == ">>")
+        {
+            llvm::Value* lhsStorage = lhsNV.Storage != nullptr ? lhsNV.Storage : lv.receiverStorage;
+            llvm::Value* rhsStorage = rhsNV.Storage != nullptr ? rhsNV.Storage : rv.receiverStorage;
+
+            bool lhsIsProgram = !lhsType.empty() && compiler->programTable.count(lhsType) > 0;
+            bool rhsIsProgram = !rhsType.empty() && compiler->programTable.count(rhsType) > 0;
+            bool lhsIsStream  = lhsType == "stream";
+            bool rhsIsStream  = rhsType == "stream";
+
+            if (lhsIsProgram && rhsIsProgram && lhsStorage && rhsStorage)
+            {
+                EmitProgramToProgramStreamWire(lhsType, lhsStorage, rhsType, rhsStorage, ctx);
+
+                auto& lpd = compiler->programTable[lhsType];
+                auto& rpd = compiler->programTable[rhsType];
+                auto* i32Ty = llvm::Type::getInt32Ty(*compiler->context);
+                auto* lUseGEP = compiler->builder->CreateStructGEP(
+                    lpd.StructType, lhsStorage, lpd.UseChannelFieldIndex, "l_usechannel_gep");
+                auto* rUseGEP = compiler->builder->CreateStructGEP(
+                    rpd.StructType, rhsStorage, rpd.UseChannelFieldIndex, "r_usechannel_gep");
+                auto* lOn = compiler->builder->CreateICmpNE(
+                    compiler->builder->CreateLoad(i32Ty, lUseGEP, "l_usechannel"),
+                    llvm::ConstantInt::get(i32Ty, 0), "l_usechannel_on");
+                auto* rOn = compiler->builder->CreateICmpNE(
+                    compiler->builder->CreateLoad(i32Ty, rUseGEP, "r_usechannel"),
+                    llvm::ConstantInt::get(i32Ty, 0), "r_usechannel_on");
+                auto* bothOn = compiler->builder->CreateAnd(lOn, rOn, "usechannel_both");
+
+                auto* curFn   = compiler->builder->GetInsertBlock()->getParent();
+                auto* wireBB  = llvm::BasicBlock::Create(*compiler->context, "arena_wire", curFn);
+                auto* afterBB = llvm::BasicBlock::Create(*compiler->context, "arena_after", curFn);
+                compiler->builder->CreateCondBr(bothOn, wireBB, afterBB);
+
+                compiler->builder->SetInsertPoint(wireBB);
+                EmitProgramToProgramArenaWire(lhsType, lhsStorage, rhsType, rhsStorage, ctx);
+                compiler->builder->CreateBr(afterBB);
+
+                compiler->builder->SetInsertPoint(afterBB);
+                return pipeResult();
+            }
+            if (lhsIsProgram && rhsIsStream && lhsStorage && rhsStorage)
+            {
+                EmitProgramToStreamWire(lhsType, lhsStorage, rhsStorage, ctx);
+                return pipeResult();
+            }
+            if (lhsIsStream && rhsIsProgram && rhsStorage)
+            {
+                llvm::Value* streamPtr = lhsStorage;
+                if (!streamPtr)
+                {
+                    auto* streamTy = compiler->GetDataStructure("stream").StructType;
+                    streamPtr = compiler->AllocaAtEntry(streamTy, nullptr, "stream_spill");
+                    compiler->builder->CreateStore(lv.value, streamPtr);
+                }
+                EmitStreamToProgramWire(streamPtr, rhsType, rhsStorage, ctx);
+                return pipeResult();
+            }
+            if (lhs.accumulated && (lhsIsProgram || rhsIsProgram || lhsIsStream || rhsIsStream))
+            {
+                LogErrorContext(ctx, "chained '>>' piping is not supported; split the statement");
+                return {};
+            }
+        }
+
+        if (op == ">>" || op == "<<")
+        {
+            if ((!lhsType.empty() && compiler->IsCxxRecord(lhsType))
+                || (!rhsType.empty() && compiler->IsCxxRecord(rhsType)))
+            {
+                llvm::Value* lhsStorage = lhsNV.Storage != nullptr ? lhsNV.Storage
+                                                                  : lv.receiverStorage;
+                llvm::Value* rhsStorage = rhsNV.Storage != nullptr ? rhsNV.Storage
+                                                                  : rv.receiverStorage;
+                if (auto* overload = TryBinaryOperatorOverload(
+                        lv.value, op, rv.value, ctx, lv.elemType, rv.pointerDepth,
+                        rv.elemPointer, lhsStorage, rhsStorage, false))
+                {
+                    LLVMBackend::NamedVariable resultNV;
+                    resultNV.Primary = overload;
+                    resultNV.TypeAndValue = compiler->lastCallReturnType;
+                    if (compiler->lastCxxRetValue_ == overload)
+                        resultNV.Storage = compiler->lastCxxRetTemp_;
+                    PrepareAliasCallResult(ctx, resultNV, false);
+                    DiagnoseVoidResultConsumed(ctx, resultNV, use,
+                                               std::format("'operator{}'", op));
+                    ShiftPairResult result;
+                    result.value = { overload, resultNV.TypeAndValue.IsUnsignedInteger() != -1 };
+                    result.value.receiverStorage = resultNV.Storage;
+                    result.named = resultNV;
+                    return result;
+                }
+            }
+            std::string opName = "operator" + op;
+            if (!lhsType.empty() && compiler->IsDataStructure(lhsType)
+                && HasOperatorOverloadForFirstParam(opName, lhsType))
+            {
+                LLVMBackend::NamedVariable la;
+                la.TypeAndValue = lhsNV.TypeAndValue;
+                la.TypeAndValue.VariableName = "";
+                la.Primary      = lv.value;
+                la.BaseType     = lv.value ? lv.value->getType() : nullptr;
+                la.CallerName   = lhsName;
+                LLVMBackend::NamedVariable ra;
+                ra.TypeAndValue = rhsNV.TypeAndValue;
+                ra.TypeAndValue.VariableName = "";
+                ra.Primary      = rv.value;
+                ra.BaseType     = rv.value ? rv.value->getType() : nullptr;
+                ra.CallerName   = rhsName;
+                auto* res = compiler->CreateOverloadedFunctionCall(opName, { la, ra });
+                LLVMBackend::NamedVariable resultNV;
+                resultNV.Primary = res;
+                resultNV.TypeAndValue = compiler->lastCallReturnType;
+                PrepareAliasCallResult(ctx, resultNV, false);
+                DiagnoseVoidResultConsumed(ctx, resultNV, use, std::format("'operator{}'", op));
+                ShiftPairResult result;
+                result.value = { res, resultNV.TypeAndValue.IsUnsignedInteger() != -1 };
+                result.value.receiverStorage = resultNV.Storage;
+                result.named = resultNV;
+                return result;
+            }
+        }
+
+        ShiftPairResult result;
+        result.value = { compiler->CreateOperation(op, lv, rv, lv.isUnsigned, rv.isUnsigned),
+                         lv.isUnsigned };
+        return result;
+    }
+
 LLVMBackend::TypedValue MainListener::ParseShiftExpression(CFlatParser::ShiftExpressionContext* ctx, ResultUse use) {
         DeclExpectedTypeGate declExpectedGate(&declExpectedType, ctx->children.size() == 1);
         auto nextCtxs = ctx->additiveExpression();
+        if (nextCtxs.empty())
+        {
+            LogErrorContext(ctx, "Shift expression has no operands.");
+            return {};
+        }
         if (nextCtxs.size() == 1)
-        {
             return ParseAdditiveExpression(nextCtxs[0], use);
-        }
-        else if (nextCtxs.size() == 2)
+
+        std::vector<std::string> operators;
+        for (size_t i = 0; i < ctx->children.size(); ++i)
         {
-            auto lv = ParseAdditiveExpression(nextCtxs[0], ResultUse::Value);
-            auto rv = ParseAdditiveExpression(nextCtxs[1], ResultUse::Value);
-            // '>>' is two tokens in the grammar (('>' '>')), so children[1] = '>' and children[2] = '>'.
-            // '<<' is a single token, so children[1] = '<<'.
-            std::string op = ctx->children[1]->getText();
-            if (op == ">" && ctx->children.size() > 2 && ctx->children[2]->getText() == ">")
-                op = ">>";
-
-            auto* compiler = Compiler(ctx);
-            std::string lhsName = TryGetSimpleIdentifier(nextCtxs[0]);
-            std::string rhsName = TryGetSimpleIdentifier(nextCtxs[1]);
-
-            auto lhsNV = lhsName.empty() ? LLVMBackend::NamedVariable{} : compiler->GetLocalVariable(lhsName);
-            if (!lhsName.empty() && lhsNV.Storage == nullptr)
-                lhsNV = compiler->GetGlobalVariableNV(lhsName);
-            auto rhsNV = rhsName.empty() ? LLVMBackend::NamedVariable{} : compiler->GetLocalVariable(rhsName);
-            if (!rhsName.empty() && rhsNV.Storage == nullptr)
-                rhsNV = compiler->GetGlobalVariableNV(rhsName);
-
-            const std::string& lhsType = lhsNV.TypeAndValue.TypeName;
-            const std::string& rhsType = rhsNV.TypeAndValue.TypeName;
-
-            if (op == ">>")
+            auto* term = dynamic_cast<antlr4::tree::TerminalNode*>(ctx->children[i]);
+            if (term == nullptr) continue;
+            if (term->getText() == "<<")
             {
-                llvm::Value* lhsStorage = lhsNV.Storage;
-                llvm::Value* rhsStorage = rhsNV.Storage;
-
-                bool lhsIsProgram = !lhsType.empty() && compiler->programTable.count(lhsType) > 0;
-                bool rhsIsProgram = !rhsType.empty() && compiler->programTable.count(rhsType) > 0;
-                bool lhsIsStream  = lhsType == "stream";
-                bool rhsIsStream  = rhsType == "stream";
-
-                if (lhsIsProgram && rhsIsProgram && lhsStorage && rhsStorage)
+                operators.push_back("<<");
+            }
+            else if (term->getText() == ">" && i + 1 < ctx->children.size())
+            {
+                auto* next = dynamic_cast<antlr4::tree::TerminalNode*>(ctx->children[i + 1]);
+                if (next != nullptr && next->getText() == ">")
                 {
-                    // Direct program>>program (the design's "stream always wired, channel additive"):
-                    // the stdout->stdin stream is ALWAYS wired (auto-synthesized + auto-closed); the
-                    // rich arena_channel is wired only when BOTH programs opted in via useChannel = true
-                    // (a runtime branch, since `>>` runs once). useChannel defaults to 0, so programs
-                    // that only pipe stdout pay nothing for an arena_channel they never touch.
-                    EmitProgramToProgramStreamWire(lhsType, lhsStorage, rhsType, rhsStorage, ctx);
-
-                    auto& lpd = compiler->programTable[lhsType];
-                    auto& rpd = compiler->programTable[rhsType];
-                    auto* i32Ty = llvm::Type::getInt32Ty(*compiler->context);
-                    auto* lUseGEP = compiler->builder->CreateStructGEP(
-                        lpd.StructType, lhsStorage, lpd.UseChannelFieldIndex, "l_usechannel_gep");
-                    auto* rUseGEP = compiler->builder->CreateStructGEP(
-                        rpd.StructType, rhsStorage, rpd.UseChannelFieldIndex, "r_usechannel_gep");
-                    auto* lOn = compiler->builder->CreateICmpNE(
-                        compiler->builder->CreateLoad(i32Ty, lUseGEP, "l_usechannel"),
-                        llvm::ConstantInt::get(i32Ty, 0), "l_usechannel_on");
-                    auto* rOn = compiler->builder->CreateICmpNE(
-                        compiler->builder->CreateLoad(i32Ty, rUseGEP, "r_usechannel"),
-                        llvm::ConstantInt::get(i32Ty, 0), "r_usechannel_on");
-                    auto* bothOn = compiler->builder->CreateAnd(lOn, rOn, "usechannel_both");
-
-                    auto* curFn   = compiler->builder->GetInsertBlock()->getParent();
-                    auto* wireBB  = llvm::BasicBlock::Create(*compiler->context, "arena_wire",  curFn);
-                    auto* afterBB = llvm::BasicBlock::Create(*compiler->context, "arena_after", curFn);
-                    compiler->builder->CreateCondBr(bothOn, wireBB, afterBB);
-
-                    compiler->builder->SetInsertPoint(wireBB);
-                    EmitProgramToProgramArenaWire(lhsType, lhsStorage, rhsType, rhsStorage, ctx);
-                    compiler->builder->CreateBr(afterBB);
-
-                    compiler->builder->SetInsertPoint(afterBB);
-                    return rv;  // return consumer so `a >> b >> c` could chain later
-                }
-                if (lhsIsProgram && rhsIsStream && lhsStorage && rhsStorage)
-                {
-                    EmitProgramToStreamWire(lhsType, lhsStorage, rhsStorage, ctx);
-                    return rv;  // return stream value so `p1 >> s >> p2` can chain
-                }
-                if (lhsIsStream && rhsIsProgram && rhsStorage)
-                {
-                    llvm::Value* streamPtr = lhsStorage;
-                    if (!streamPtr)
-                    {
-                        // Spill loaded value (chain case: `(p1 >> s) >> p2` produces a loaded stream)
-                        auto* streamTy = compiler->GetDataStructure("stream").StructType;
-                        streamPtr = compiler->AllocaAtEntry(streamTy, nullptr, "stream_spill");
-                        compiler->builder->CreateStore(lv.value, streamPtr);
-                    }
-                    EmitStreamToProgramWire(streamPtr, rhsType, rhsStorage, ctx);
-                    return rv;  // return program value
+                    operators.push_back(">>");
+                    ++i;
                 }
             }
-
-            // General operator overloading for '>>' / '<<' (e.g. channel<T>::operator>>).
-            // Only dispatched when the LHS is a struct/class type with a matching operator
-            // overload, so primitive integer bit-shifts fall through to CreateOperation.
-            if (op == ">>" || op == "<<")
-            {
-                /*
-                 * A C++ `operator<<` / `operator>>` (member or free, and typically taking its left
-                 * operand by NON-CONST reference - the stream idiom) goes through the shared
-                 * operator path: that is what hands the callee the caller's own storage instead of
-                 * a copy, and what finds a free operator through the right operand's namespace.
-                 */
-                if ((!lhsType.empty() && compiler->IsCxxRecord(lhsType))
-                    || (!rhsType.empty() && compiler->IsCxxRecord(rhsType)))
-                {
-                    llvm::Value* lhsStorage = lhsNV.Storage != nullptr ? lhsNV.Storage
-                                                                      : lv.receiverStorage;
-                    llvm::Value* rhsStorage = rhsNV.Storage != nullptr ? rhsNV.Storage
-                                                                      : rv.receiverStorage;
-                    if (auto* overload = TryBinaryOperatorOverload(
-                            lv.value, op, rv.value, ctx, lv.elemType, rv.pointerDepth,
-                            rv.elemPointer, lhsStorage, rhsStorage, false))
-                    {
-                        LLVMBackend::NamedVariable resultNV;
-                        resultNV.Primary = overload;
-                        resultNV.TypeAndValue = compiler->lastCallReturnType;
-                        DiagnoseVoidResultConsumed(ctx, resultNV, use,
-                                                   std::format("'operator{}'", op));
-                        return { overload, resultNV.TypeAndValue.IsUnsignedInteger() != -1 };
-                    }
-                }
-                std::string opName = "operator" + op;
-                if (!lhsType.empty() && compiler->IsDataStructure(lhsType)
-                    && HasOperatorOverloadForFirstParam(opName, lhsType))
-                {
-                    LLVMBackend::NamedVariable la;
-                    la.TypeAndValue = lhsNV.TypeAndValue;
-                    la.TypeAndValue.VariableName = "";   // positional, not a named arg
-                    la.Primary      = lv.value;
-                    la.BaseType     = lv.value ? lv.value->getType() : nullptr;
-                    la.CallerName   = lhsName;
-                    LLVMBackend::NamedVariable ra;
-                    ra.TypeAndValue = rhsNV.TypeAndValue;
-                    ra.TypeAndValue.VariableName = "";   // positional, not a named arg
-                    ra.Primary      = rv.value;
-                    ra.BaseType     = rv.value ? rv.value->getType() : nullptr;
-                    ra.CallerName   = rhsName;
-                    auto* res = compiler->CreateOverloadedFunctionCall(opName, { la, ra });
-                    LLVMBackend::NamedVariable resultNV;
-                    resultNV.Primary = res;
-                    resultNV.TypeAndValue = compiler->lastCallReturnType;
-                    DiagnoseVoidResultConsumed(ctx, resultNV, use, std::format("'operator{}'", op));
-                    // The result's signedness is the overload's RETURN type, not a fixed signed.
-                    return { res, resultNV.TypeAndValue.IsUnsignedInteger() != -1 };
-                }
-            }
-
-            auto result = compiler->CreateOperation(op, lv, rv, lv.isUnsigned, rv.isUnsigned);
-            return { result, lv.isUnsigned };
+        }
+        if (operators.size() + 1 != nextCtxs.size())
+        {
+            LogErrorContext(ctx, "Shift expression has unexpected operator count.");
+            return {};
         }
 
-        LogErrorContext(ctx, "Shift expression has no operands.");
-        return {};
+        auto* compiler = Compiler(ctx);
+        auto lookup = [&](const std::string& name) {
+            if (name.empty()) return LLVMBackend::NamedVariable{};
+            auto named = compiler->GetLocalVariable(name);
+            if (named.Storage == nullptr) named = compiler->GetGlobalVariableNV(name);
+            return named;
+        };
+
+        ShiftOperand lhs;
+        lhs.value = ParseAdditiveExpression(nextCtxs[0], ResultUse::Value);
+        lhs.name = TryGetSimpleIdentifier(nextCtxs[0]);
+        lhs.named = lookup(lhs.name);
+        for (size_t i = 1; i < nextCtxs.size(); ++i)
+        {
+            ShiftOperand rhs;
+            rhs.value = ParseAdditiveExpression(nextCtxs[i], ResultUse::Value);
+            rhs.name = TryGetSimpleIdentifier(nextCtxs[i]);
+            rhs.named = lookup(rhs.name);
+            auto pair = ParseShiftPair(lhs, rhs, operators[i - 1], ctx,
+                                       i + 1 == nextCtxs.size() ? use : ResultUse::Value);
+            if (pair.value.value == nullptr) return {};
+            lhs.value = pair.value;
+            lhs.named = pair.named;
+            lhs.name = pair.name;
+            lhs.accumulated = true;
+            if (i + 1 < nextCtxs.size() && lhs.named.Primary == nullptr
+                && lhs.named.Storage != nullptr && !lhs.named.TypeAndValue.Pointer)
+            {
+                lhs.value.value = compiler->CreateLoad(lhs.named.Storage);
+                lhs.value.receiverStorage = lhs.named.Storage;
+                lhs.value.isAlias = true;
+            }
+        }
+        return lhs.value;
     }
 
 LLVMBackend::TypedValue MainListener::ParseAdditiveExpression(CFlatParser::AdditiveExpressionContext* ctx, ResultUse use) {
