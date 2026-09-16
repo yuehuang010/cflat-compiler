@@ -309,6 +309,10 @@ test.sh 828/0/8, test_lsp.sh green, test_example.sh 45/0.
 Iteration 1 landed: the `program` boundary catches C++ exceptions through a clang-compiled
 guard and stores `exitCode = -1`; frame cleanup and catches outside `program` remain OPEN.
 
+Ruling 2026-09-16: CFlat has no try/catch and will not get one for this. `program` is the
+only catch boundary; a C++ throw anywhere below it lands there. Iteration 2 is therefore
+frame cleanup between the throw and the boundary (and the Windows C++ path), nothing else.
+
 Define the language contract for foreign exceptions (see surface options above).
 Implement target-specific personality, invoke/unwind edges, cleanup pads/landing pads, and
 destructor ordering. Cover partially constructed objects, temporary arguments, callback
@@ -373,6 +377,16 @@ fixes found by review: address-of-global no longer counts as a string literal; C
 by-reference candidates distinguished. Open: p3 by-value container issue, p2 fixture-time
 issue (test.sh timeout 240), p2 generic [cpp] struct, p2 copy-from-field skips the C++ copy
 constructor (general interop, needs a ruling). Suite 973/0/8.
+Ruling 2026-09-16: copy-from-field is HELD for a later CFlat-interop plan; generic [cpp]
+struct is QUEUED next (CFlat generics already monomorphize, so the work is lifting the
+refusal and emitting one class stub per instantiation); unique_ptr vs unique<T> stays later.
+Multiple and virtual bases are not implemented on any platform, macOS included.
+Rung t31 (2026-09-16, scratch/ladder/torch/t31.cb): a "calculator" MLP (inputs a, b; targets
+a+b, a*b) with the hidden block a generic `[cpp] struct Block<A> : torch.nn.Module` instantiated
+at two activation types, trained with Adam for 1500 steps: loss 0.46 -> 5.6e-5, predictions
+within 0.01, exit 0, 1 s runtime. Compile 12.5 min against libtorch (cold torch requests after
+the v61 bump). Gap found: implicit XOptions(double) conversion works for SGD, not Adam - p3
+internal/issue/p3/cpp-implicit-ctor-conversion-at-call.md.
 Not in v1: multiple bases, virtual bases, new virtuals visible to C++, `base.m()` calls to the
 overridden implementation, protected access through a derived-typed pointer other than `this`,
 `std::make_shared<Foo>` / `register_module` (timebox 2), MSVC verification.

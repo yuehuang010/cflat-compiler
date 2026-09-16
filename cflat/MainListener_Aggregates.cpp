@@ -119,12 +119,45 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
         const bool isCppStruct = hasCppBase
             || std::any_of(rawAnnotations.begin(), rawAnnotations.end(),
                            [](const auto& ann) { return ann.Name == "cpp"; });
-        if (isCppStruct) compiler->RegisterCppStructName(structName);
-        if (isCppStruct && nameOverride.empty() && ctx->genericTypeParameters() != nullptr)
+
+        // A generic template is stored without emitting a C++ class. Its concrete instantiation
+        // carries the substitutions and nameOverride used by the generated class path below.
+        if (nameOverride.empty() && ctx->genericTypeParameters() != nullptr)
         {
-            Compiler(ctx)->LogErrorMessage("generic [cpp] struct is not supported yet");
+            if (Compiler()->gts.scannedGenericInterfaceNames.count(structName) != 0
+                || genericInterfaceTemplates.count(structName) != 0)
+                LogErrorContext(ctx, std::format(
+                    "generic struct '{}' conflicts with a generic interface of the same name",
+                    SpellType(*compiler, LLVMBackend::TypeAndValue{ .TypeName = structName })));
+            std::vector<std::string> valueParams;
+            std::vector<std::string> valueDefaults;
+            auto typeParams = ParseGenericTypeParameters(ctx->genericTypeParameters(), &valueParams,
+                                                         &valueDefaults);
+            genericStructTemplates[structName] = ctx;
+            // Origin marker: a template DECLARED in a core library file. Read by
+            // IsBorrowingContainerElementSink so a user type of the same name is not mistaken
+            // for the core container.
+            if (Compiler()->CurrentSourceIsCoreLibrary())
+                Compiler()->gts.coreGenericTemplates.insert(structName);
+            else
+                Compiler()->gts.coreGenericTemplates.erase(structName);
+            Compiler()->gts.genericTemplateNamespace[structName] = Compiler()->GetCurrentNamespace();
+            Compiler()->RevokeGenericInterfaceInstances(structName);
+            genericStructTypeParams[structName] = typeParams;
+            genericStructValueParams[structName] = valueParams;
+            Compiler()->gts.genericStructValueDefaults[structName] = valueDefaults;
+            genericStructConstraints[structName] = ParseWhereClause(ctx->whereClause());
+            ValidateGenericAggregateAliasNames(ctx, structName);
+            // Record which param (if any) is variadic - always the last one
+            {
+                auto entries = ctx->genericTypeParameters()->typeParameterList()->typeParameterEntry();
+                bool hasPack = !entries.empty() && entries.back()->Ellipsis() != nullptr;
+                genericStructPackIndex[structName] = hasPack ? (typeParams.size() - 1) : std::string::npos;
+            }
             return;
         }
+
+        if (isCppStruct) compiler->RegisterCppStructName(structName);
         std::string cppBaseName;
         std::string cppBaseSpelling;
         size_t cppBaseOwnerGroup = static_cast<size_t>(-1);
@@ -168,42 +201,6 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
                 return;
             }
             compiler->GetCxxTypeOwnerGroup(cppBaseName, cppBaseOwnerGroup);
-        }
-
-        // If this is a generic template definition (not an instantiation), store it and return.
-        if (nameOverride.empty() && ctx->genericTypeParameters() != nullptr)
-        {
-            if (Compiler()->gts.scannedGenericInterfaceNames.count(structName) != 0
-                || genericInterfaceTemplates.count(structName) != 0)
-                LogErrorContext(ctx, std::format(
-                    "generic struct '{}' conflicts with a generic interface of the same name",
-                    SpellType(*compiler, LLVMBackend::TypeAndValue{ .TypeName = structName })));
-            std::vector<std::string> valueParams;
-            std::vector<std::string> valueDefaults;
-            auto typeParams = ParseGenericTypeParameters(ctx->genericTypeParameters(), &valueParams,
-                                                         &valueDefaults);
-            genericStructTemplates[structName] = ctx;
-            // Origin marker: a template DECLARED in a core library file. Read by
-            // IsBorrowingContainerElementSink so a user type of the same name is not mistaken
-            // for the core container.
-            if (Compiler()->CurrentSourceIsCoreLibrary())
-                Compiler()->gts.coreGenericTemplates.insert(structName);
-            else
-                Compiler()->gts.coreGenericTemplates.erase(structName);
-            Compiler()->gts.genericTemplateNamespace[structName] = Compiler()->GetCurrentNamespace();
-            Compiler()->RevokeGenericInterfaceInstances(structName);
-            genericStructTypeParams[structName] = typeParams;
-            genericStructValueParams[structName] = valueParams;
-            Compiler()->gts.genericStructValueDefaults[structName] = valueDefaults;
-            genericStructConstraints[structName] = ParseWhereClause(ctx->whereClause());
-            ValidateGenericAggregateAliasNames(ctx, structName);
-            // Record which param (if any) is variadic - always the last one
-            {
-                auto entries = ctx->genericTypeParameters()->typeParameterList()->typeParameterEntry();
-                bool hasPack = !entries.empty() && entries.back()->Ellipsis() != nullptr;
-                genericStructPackIndex[structName] = hasPack ? (typeParams.size() - 1) : std::string::npos;
-            }
-            return;
         }
 
         // Re-emission guard: if this struct was already fully emitted via a transitive import,

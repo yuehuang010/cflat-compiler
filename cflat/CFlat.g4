@@ -766,21 +766,17 @@ usingDeclaration
 importDeclaration
     : Import importGroup (As Identifier)? libClause? frameworkClause? defineClause* cacheClause? fromClause? ';'
     | Import Identifier StringLiteral As Identifier ';'
-    | Import Identifier StringLiteral libClause? frameworkClause? defineClause* cacheClause? ';'
     | Import 'package-vcpkg' StringLiteral fromClause defineClause* ';'
     | Import 'package-nuget' importGroup fromClause priClause? defineClause* ';'
-    | Import Identifier importGroup ';'
+    | Import Identifier importGroup libClause? frameworkClause? defineClause* cacheClause? ';'
     ;
 
 // A plain file import target: either a single bare filename or a brace-wrapped comma
 // list of them. The list form is a shorthand for writing several `import "file";` lines
 // (so `import { "sqlite3.h", "sqlite3.c" };` binds the header and compiles the .c). Each
-// entry routes exactly like a plain `import "x";`; the optional `as` / `cache` on the
-// importDeclaration apply only when the group holds a single filename. package-nuget also
-// uses importGroup (a multi-entry group binds as one package translation unit; a single
-// entry behaves like the bare form). The remaining alternatives (program/package/
-// package-vcpkg) keep a single direct StringLiteral, so that accessor stays singular for
-// them - dispatch on the keyword (children[1] text) before any importGroup-based routing.
+// entry routes exactly like a plain `import "x";`; `as` applies only to a single filename.
+// Keyword-prefixed forms use this rule for their filenames, except package-vcpkg and the
+// `as`-qualified form, whose dedicated alternatives retain a direct StringLiteral.
 importGroup
     : StringLiteral
     | '{' StringLiteral (',' StringLiteral)* ','? '}'

@@ -63,7 +63,7 @@ static std::string ImportNamespace(CFlatParser::ImportDeclarationContext* imp)
 {
     if (imp == nullptr || imp->children.size() < 2) return {};
     std::string first = imp->children[1]->getText();
-    // `cpp` selects C++ binding mode for the named file, whatever its extension.
+    // `cpp` selects C++ binding mode for the named file or import group, whatever its extension.
     if (first == "program" || first == "package" || first == "framework"
         || first == "cpp" || first == "package-vcpkg" || first == "package-nuget")
         return {};

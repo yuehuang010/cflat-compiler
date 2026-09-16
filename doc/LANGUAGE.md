@@ -2300,6 +2300,20 @@ group's header entries are folded into the cache key together.) An `as` alias is
 when the group holds a single filename, since one alias cannot name several files; use separate
 `import` lines when you need an alias or a per-entry `lib` / `define`.
 
+#### C++ imports (`import cpp`)
+
+Use `import cpp` when a file or header must be bound as C++; the filename extension is irrelevant:
+
+```c
+import cpp "vendor/widget.h" lib "widget.lib" define "WIDGET_USE=1" cache;
+import cpp { "vendor/widget.h", "vector", "string" } cache;
+```
+
+A single-file C++ import accepts `lib`, `framework`, repeated `define`, and `cache` clauses.
+A grouped C++ import accepts the same clauses at group level; `as` is only for one filename, and
+package-only `from` / `pri` clauses are not valid. A grouped import is one C++ translation unit:
+its headers share one header set and one cache key. Use `cache` for large or slow headers.
+
 #### Import alias (`as`)
 
 Give an imported file a local alias so its symbols are accessible under a qualified name:

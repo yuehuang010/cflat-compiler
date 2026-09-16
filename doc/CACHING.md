@@ -271,10 +271,18 @@ group's header stamp, clang driver arguments, compiler build stamp, and whether 
 emitted. A changed header, argument set, compiler, or emit mode is therefore a miss. Missing,
 truncated, or hash-mismatched sidecars are misses and are rewritten with the request entry.
 
-Request entries are written only for successful, non-empty compile requests. Tentative requests,
-`--run`, and LSP analysis are read-only; LSP never writes request entries. Request entries are
-pruned with the owning header entry, and changing the cache format invalidates both together.
-With `-v`, each request reports a hit or a miss and the miss reason.
+Request entries are written whenever the request is accepted: the records are non-empty and, for
+a request carrying a generated prefix source, clang reported no error. A tolerated clang error
+inside a synthesized member body (the body is emptied and the request still succeeds) does not
+block the write, because replay reproduces exactly what the in-process path used. A candidate
+probe that succeeds in a non-final header group is persisted like any other accepted request;
+probes that fail, retrying incomplete-type requests, `--run`, batch prewarm, and LSP analysis
+are read-only. The owning group of each template base is also memoized on disk in
+`cxx-owner-groups.json` (header list, defines, compiler build stamp), so a warm compile tries
+the owner first instead of re-probing every candidate group; a stale or missing memo only
+restores the default probe order. Request entries are pruned with the owning header entry, and
+changing the cache format invalidates both together. With `-v`, each request reports a hit or a
+miss and the miss reason.
 
 ## macOS
 

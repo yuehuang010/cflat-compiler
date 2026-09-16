@@ -375,8 +375,8 @@ static std::vector<std::string> DequoteFrameworkClauses(CFlatParser::ImportDecla
     return fws;
 }
 
-// Inline `define "..."` clauses on an `import package` line. Each is scoped to
-// that header's clang AST dump and appended on top of the process-wide --c-define.
+// Inline `define "..."` clauses on a header, package, or import-group line. Each is scoped to
+// that header group's clang AST dump and appended on top of the process-wide --c-define.
 static std::vector<std::string> DequoteDefineClauses(CFlatParser::ImportDeclarationContext* imp)
 {
     std::vector<std::string> defines;
@@ -390,7 +390,7 @@ static std::vector<std::string> DequoteDefineClauses(CFlatParser::ImportDeclarat
 }
 
 // True when this import line carries an inline `cache` clause, opting the header into the
-// persistent C-header disk cache. Applies to the bare-header and `import package` forms.
+// persistent C-header disk cache. Applies to bare headers, package headers, and import groups.
 static bool HasCacheClause(CFlatParser::ImportDeclarationContext* imp)
 {
     bool found = false;
@@ -398,27 +398,6 @@ static bool HasCacheClause(CFlatParser::ImportDeclarationContext* imp)
         if (ImportClauseHasWord(clause, "cache")) found = true;
     });
     return found;
-}
-
-// Dequoted filenames from a grouped import `import { "a", "b" };`, in source order.
-// Empty when this import is not the grouped form (so callers can fall through to the
-// single-StringLiteral handling). Each entry is a plain import: no alias/lib/define/cache.
-static std::vector<std::string> DequoteImportGroup(CFlatParser::ImportDeclarationContext* imp)
-{
-    std::vector<std::string> out;
-    auto* grp = imp->importGroup();
-    if (grp != nullptr)
-    {
-        for (auto* lit : grp->StringLiteral())
-            out.push_back(DequoteStringLiteral(lit->getText()));
-        return out;
-    }
-    // Once `framework` is a soft identifier, its standalone form is parsed by the
-    // direct-string alternative rather than the old literal-specific alternative.
-    if (imp->children.size() >= 2 && imp->children[1]->getText() == "framework")
-        if (auto* lit = imp->StringLiteral())
-            out.push_back(DequoteStringLiteral(lit->getText()));
-    return out;
 }
 
 // True when this import line is `import package-vcpkg "..." from "...";`. Detected by
@@ -442,8 +421,8 @@ static bool IsFrameworkImport(CFlatParser::ImportDeclarationContext* imp)
     return imp->children.size() >= 2 && imp->children[1]->getText() == "framework";
 }
 
-// True when this import line is `import cpp "..." ...;` or `import cpp { ... };`. `cpp` is an
-// ordinary Identifier (the same soft-keyword mechanism `program` uses), and it is the ONLY
+// True when this import line is `import cpp "..." ...;` or `import cpp { ... } ...;`. `cpp` is
+// an ordinary Identifier (the same soft-keyword mechanism `program` uses), and it is the ONLY
 // thing that selects C++ mode - the file extension never does.
 static bool IsCppImport(CFlatParser::ImportDeclarationContext* imp)
 {
@@ -2149,11 +2128,10 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
                                                  isolatedPolicy_->path));
                             return false;
                         }
-                        // `import { "a", "b" };` - a group of >1 plain imports. Each entry
-                        // routes like a plain `import "x";` (no per-entry alias/lib/define). A
-                        // trailing `cache` on the group applies to every entry (a no-op for
-                        // .cb/.c entries; only the .h header-bind branch consults it).
-                        auto groupedImports = DequoteImportGroup(imp);
+                        // `import { "a", "b" };` / `import cpp { "a", "b" };` - a group of
+                        // >1 imports. Header entries share one TU; a trailing `cache` applies to
+                        // the whole header group (a no-op for .cb/.c entries).
+                        auto groupedImports = ImportFilenames(imp);
                         // `import framework "X";` / `import framework { ... };` - record each
                         // framework for the Mach-O link. Dispatched before the importGroup
                         // routing since it reuses importGroup for its name list.
@@ -2188,16 +2166,7 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
                                 return false;
                             continue;
                         }
-                        // Single filename: from the importGroup (plain/`as`/`cache` form) or,
-                        // for the program/package/vcpkg alternatives, the direct StringLiteral.
-                        std::string importFilename;
-                        if (!groupedImports.empty())
-                            importFilename = groupedImports[0];
-                        else
-                        {
-                            std::string raw = imp->StringLiteral()->getText();
-                            importFilename = DequoteStringLiteral(raw);
-                        }
+                        std::string importFilename = groupedImports[0];
                         // `import package-vcpkg "header" from "port";` - dispatch to the
                         // vcpkg resolver and skip the regular import dedup/parse machinery.
                         if (IsPackageVcpkgImport(imp))
@@ -3417,9 +3386,9 @@ bool LLVMBackend::CompileImportedFile(const std::string& importingFilePath, cons
                                          "allowed in isolated mode (policy '{}')", isolatedPolicy_->path));
                     return false;
                 }
-                // Grouped import `import { "a", "b" };` - one TU for header entries, individual
-                // routing for .cb/.c entries (see CompileImportGroup).
-                auto groupedImports = DequoteImportGroup(imp);
+                // Grouped plain/C++ import - one TU for header entries, individual routing for
+                // .cb/.c entries (see CompileImportGroup).
+                auto groupedImports = ImportFilenames(imp);
                 // `import framework` dispatch first - it reuses importGroup for its names.
                 if (IsFrameworkImport(imp))
                 {
@@ -3450,14 +3419,7 @@ bool LLVMBackend::CompileImportedFile(const std::string& importingFilePath, cons
                         return false;
                     continue;
                 }
-                std::string nested;
-                if (!groupedImports.empty())
-                    nested = groupedImports[0];
-                else
-                {
-                    std::string raw = imp->StringLiteral()->getText();
-                    nested = DequoteStringLiteral(raw);
-                }
+                std::string nested = groupedImports[0];
                 if (IsPackageVcpkgImport(imp))
                 {
                     std::string portSpec = DequoteFromClause(imp);
@@ -4345,9 +4307,9 @@ bool LLVMBackend::Analyze(const std::string& filePath,
                         LogError(error);
                         return false;
                     }
-                    // Grouped import `import { "a", "b" };` - one TU for header entries (see
-                    // CompileImportGroup); .cb/.c entries route individually.
-                    auto groupedImports = DequoteImportGroup(imp);
+                    // Grouped plain/C++ import - one TU for header entries (see CompileImportGroup);
+                    // .cb/.c entries route individually.
+                    auto groupedImports = ImportFilenames(imp);
                     // `import framework` dispatch first - reuses importGroup for its names.
                     // In LSP analyze mode AddFrameworkImport records silently (never errors).
                     if (IsFrameworkImport(imp))
@@ -4377,14 +4339,7 @@ bool LLVMBackend::Analyze(const std::string& filePath,
                             return false;
                         continue;
                     }
-                    std::string importFilename;
-                    if (!groupedImports.empty())
-                        importFilename = groupedImports[0];
-                    else
-                    {
-                        std::string raw = imp->StringLiteral()->getText();
-                        importFilename = DequoteStringLiteral(raw);
-                    }
+                    std::string importFilename = groupedImports[0];
                     if (IsPackageVcpkgImport(imp))
                     {
                         std::string portSpec = DequoteFromClause(imp);

@@ -2167,6 +2167,9 @@ bool LLVMBackend::RequestCxxSignatureTypes(const cflat_cinterop::RawSig& sig,
         if (!sig.isCxx) return true;
         bool ok = true;
         auto request = [&](const std::string& spelling) {
+            if (spelling.find("__cflat_user::") != std::string::npos
+                && GeneratedCxxPrefixForSpelling(spelling).empty())
+                return;
             std::string identity, named;
             const int kind = ClassifyCxxSignatureSpelling(spelling, localEnums, identity, named);
             if (kind == 0) return;
@@ -2901,6 +2904,9 @@ bool LLVMBackend::ExtractCHeaderClang(const std::vector<std::string>& headerPath
         };
         for (const auto& h : headerPaths)
         {
+            // Direct C++ standard-library entries are request catalogs, not bound surfaces. Keep
+            // them in the include set without widening extraction to every sibling implementation header.
+            if (cxxMode && IsSystemCxxHeaderPath(h)) continue;
             std::filesystem::path hdrDirPath = std::filesystem::path(h).parent_path();
             addScopeDir(hdrDirPath.string());
             // macOS framework: sibling headers are spelled `.../X.framework/Headers/...` but the
@@ -3521,7 +3527,8 @@ std::vector<std::pair<std::string, std::string>> LLVMBackend::RetryTentativeCxxT
                                                   /*needDefinitions*/ true,
                                                   /*explicitInstantiation*/ true,
                                                   /*tentative*/ true,
-                                                  /*extraSource*/ {}, generatedSource);
+                                                  /*extraSource*/ {}, generatedSource,
+                                                  /*persistOnSuccess*/ incompleteTypes.empty());
             retryingTentativeCxxType_ = false;
             if (!ok)
             {
@@ -3730,7 +3737,7 @@ std::string LLVMBackend::BuildCxxVirtualThunks(
                 if (!emitted.insert(name).second) continue;
                 if (m.kind == Member::Destructor)
                 {
-                    recordSrc += "extern \"C\" void " + name + "(" + marker + "* p) { p->~"
+                    recordSrc += "extern \"C\" __attribute__((weak)) void " + name + "(" + marker + "* p) { p->~"
                                + marker + "(); }\n";
                     continue;
                 }
@@ -3748,7 +3755,7 @@ std::string LLVMBackend::BuildCxxVirtualThunks(
                                               : "static_cast<" + t + "&&>(" + a + ")";
                 }
                 const std::string call = "p->" + m.name + "(" + args + ")";
-                recordSrc += "extern \"C\" " + m.retType + " " + name + "(" + marker + "* p"
+                recordSrc += "extern \"C\" __attribute__((weak)) " + m.retType + " " + name + "(" + marker + "* p"
                            + (params.empty() ? "" : ", " + params) + ") { "
                            + (m.retType == "void" ? call : "return " + call) + "; }\n";
             }
@@ -3828,7 +3835,7 @@ static std::string BuildStdFunctionCtorUse(const std::string& cxxSpelling,
         std::string helper = "__cflat_std_function_ctor_";
         for (char c : cxxSpelling)
             helper += std::isalnum((unsigned char)c) ? c : '_';
-        return "extern \"C\" void " + helper + "(void* m, " + ret
+        return "extern \"C\" __attribute__((weak)) void " + helper + "(void* m, " + ret
              + " (*a1)(" + params + ")) { (void)::new (m) " + marker + "(a1); }\n";
 }
 
@@ -3882,6 +3889,7 @@ void LLVMBackend::DropCxxRequestPch(const std::string& path)
 std::string LLVMBackend::EnsureCxxRequestPch(const CxxRequestGroup& group,
                                              const std::vector<std::string>& args)
 {
+        llvm::TimeTraceScope scope("EnsureCxxRequestPch", group.label);
         const std::string includes = BuildCxxRequestIncludes(group);
         uint64_t h = 14695981039346656037ULL;
         auto fold = [&h](const std::string& text) {
@@ -3972,6 +3980,7 @@ bool LLVMBackend::RunCxxTypeRequests(const CxxRequestGroup& group,
                                      cflat_cinterop::ExtractResult& raw, std::string& error,
                                      const std::string& prefixSource)
 {
+        llvm::TimeTraceScope scope("RunCxxTypeRequests", group.label);
         cflat_cinterop::ExtractRequest req;
         req.mainFileName = "cflat_cpp_request.cpp";
         req.cxxMode = true;
@@ -4144,8 +4153,10 @@ bool LLVMBackend::TryLoadCxxTypeRequestCache(const CxxRequestGroup& group,
                                              const std::string& requestKey,
                                              bool emitDefinitions,
                                              CFileSigCacheEntry& out,
-                                             std::string& missReason)
+                                             std::string& missReason,
+                                             bool allowDisk)
 {
+        llvm::TimeTraceScope scope("TryLoadCxxTypeRequestCache", requestKey);
         missReason = "missing entry";
         const size_t labelEnd = requestKey.find("|H");
         const std::string requestLabel = requestKey.starts_with("|RQ")
@@ -4220,6 +4231,7 @@ bool LLVMBackend::TryLoadCxxTypeRequestCache(const CxxRequestGroup& group,
             }
         }
 
+        if (!allowDisk) return false;
         const std::string cacheDir = GetCHeaderCacheDir();
         if (!group.diskCache || cacheDir.empty())
         {
@@ -4267,8 +4279,10 @@ void LLVMBackend::StoreCxxTypeRequestCache(const CxxRequestGroup& group,
                                            const std::string& requestKey,
                                            bool emitDefinitions,
                                            CFileSigCacheEntry&& entry,
-                                           bool allowDisk)
+                                           bool allowDisk,
+                                           const char* allowDiskReason)
 {
+        llvm::TimeTraceScope scope("StoreCxxTypeRequestCache", requestKey);
         if (entry.sigs.empty() && entry.records.empty()) return;
         std::filesystem::file_time_type headerMtime{};
         if (!CxxGroupHeaderStamp(group, headerMtime)) return;
@@ -4279,11 +4293,49 @@ void LLVMBackend::StoreCxxTypeRequestCache(const CxxRequestGroup& group,
             std::lock_guard<std::mutex> lock(cFileSigCacheMutex_);
             InsertCFileSigEntry(requestKey, CFileSigCacheEntry(entry), verbose);
         }
-        if (!allowDisk || !group.diskCache || runMode_ || batchMode_
-            || retryingTentativeCxxType_ || symbolSink_ != nullptr) return;
-        if (emitDefinitions && entry.cxxBitcode.empty()) return;
+        const bool generatedRequest = requestKey.find("__cflat_user") != std::string::npos;
+        auto reportRefusal = [&](const char* reason) {
+            if (verbose && generatedRequest)
+                std::cout << std::format(
+                    "[verbose] C++ type request cache STORE REFUSED for {} ({})\n",
+                    requestKey, reason);
+        };
+        if (!allowDisk)
+        {
+            reportRefusal(allowDiskReason != nullptr ? allowDiskReason : "caller disallowed");
+            return;
+        }
+        if (!group.diskCache)
+        {
+            reportRefusal("group has no cache clause");
+            return;
+        }
+        if (runMode_)
+        {
+            reportRefusal("run mode");
+            return;
+        }
+        if (batchMode_)
+        {
+            reportRefusal("batch mode");
+            return;
+        }
+        if (symbolSink_ != nullptr)
+        {
+            reportRefusal("symbol lookup");
+            return;
+        }
+        if (emitDefinitions && entry.cxxBitcode.empty())
+        {
+            reportRefusal("missing definitions sidecar");
+            return;
+        }
         const std::string cacheDir = GetCHeaderCacheDir();
-        if (cacheDir.empty()) return;
+        if (cacheDir.empty())
+        {
+            reportRefusal("cache directory unavailable");
+            return;
+        }
         uint64_t diskKey = 14695981039346656037ULL;
         for (unsigned char byte : requestKey)
         {
@@ -4334,7 +4386,10 @@ LLVMBackend::CxxRequestGroup LLVMBackend::MakeCxxRequestGroup(size_t primary,
         out.defines = cxxImportGroups_[primary].defines;
         out.ownerHeaders = out.headers;
         out.ownerDefines = out.defines;
-        out.diskCache = cxxImportGroups_[primary].diskCache;
+        const bool primaryHasHeaders = !cxxImportGroups_[primary].headers.empty();
+        bool hasDependencyGroup = false;
+        bool allSourceGroupsCacheable = primaryHasHeaders
+            ? cxxImportGroups_[primary].diskCache : true;
         std::vector<size_t> sorted;
         for (size_t d : deps)
             if (d != primary && d < cxxImportGroups_.size()
@@ -4348,6 +4403,9 @@ LLVMBackend::CxxRequestGroup LLVMBackend::MakeCxxRequestGroup(size_t primary,
         });
         for (size_t d : sorted)
         {
+            hasDependencyGroup = true;
+            allSourceGroupsCacheable = allSourceGroupsCacheable
+                && cxxImportGroups_[d].diskCache;
             for (const auto& h : cxxImportGroups_[d].headers)
                 if (std::find(out.headers.begin(), out.headers.end(), h) == out.headers.end())
                     out.headers.push_back(h);
@@ -4355,6 +4413,7 @@ LLVMBackend::CxxRequestGroup LLVMBackend::MakeCxxRequestGroup(size_t primary,
                 if (std::find(out.defines.begin(), out.defines.end(), def) == out.defines.end())
                     out.defines.push_back(def);
         }
+        out.diskCache = allSourceGroupsCacheable && (primaryHasHeaders || hasDependencyGroup);
         out.label = out.headers.empty()
             ? std::string("<no header>")
             : std::filesystem::path(out.headers.front()).filename().string();
@@ -4772,8 +4831,10 @@ bool LLVMBackend::RequestGeneratedCxxWrapper(const CxxRequestGroup& group,
                                              const std::string& wrapperName,
                                              const std::string& cacheTag,
                                              CSigEntry& signature,
-                                             std::string& error)
+                                             std::string& error,
+                                             bool persistOnSuccess)
 {
+        llvm::TimeTraceScope scope("RequestGeneratedCxxWrapper", wrapperName);
         error.clear();
         const bool emitDefinitions = symbolSink_ == nullptr;
         std::vector<CSigEntry> requestSigs;
@@ -4904,7 +4965,11 @@ bool LLVMBackend::RequestGeneratedCxxWrapper(const CxxRequestGroup& group,
             entry.sigs = requestSigs;
             entry.cxxBitcode = requestBitcode;
             StoreCxxTypeRequestCache(group, requestKey, emitDefinitions, std::move(entry),
-                                     /*allowDisk*/ raw.firstError.empty());
+                                     /*allowDisk*/ raw.firstError.empty() && persistOnSuccess,
+                                     /*allowDiskReason*/ !persistOnSuccess
+                                         ? "incomplete generated prefix"
+                                         : (raw.firstError.empty() ? nullptr
+                                                                    : "rejected clang error"));
         }
         if (requestSigs.size() != 1 || !requestSigs.front().isCxx)
         {
@@ -5277,7 +5342,7 @@ bool LLVMBackend::EmitCxxImplicitArgumentConversions(
                     { alreadyBound = true; break; }
             if (alreadyBound) continue;
 
-            std::string wrapperSource = "extern \"C\" decltype(auto) " + wrapperName + "(";
+            std::string wrapperSource = "extern \"C\" __attribute__((weak)) decltype(auto) " + wrapperName + "(";
             for (size_t i = 0; i < candidateActuals.size(); ++i)
             {
                 if (i != 0) wrapperSource += ", ";
@@ -5390,7 +5455,7 @@ bool LLVMBackend::TryBindCxxImplicitDefaultCtor(const std::string& typeName, std
 
         const uint64_t hash = HashWrapperKey(typeName + "|implicit-default-ctor|" + ownerSpelling);
         const std::string wrapperName = std::format("__cflat_implicit_ctor_{:016x}", hash);
-        const std::string wrapperSource = "#include <new>\nextern \"C\" void " + wrapperName + "("
+        const std::string wrapperSource = "#include <new>\nextern \"C\" __attribute__((weak)) void " + wrapperName + "("
             + ownerSpelling + " * p) { new (p) " + ownerSpelling + "(); }\n";
         CxxRequestGroupScope groupScope(*this, &group);
         CSigEntry signature;
@@ -5436,7 +5501,7 @@ const LLVMBackend::CxxClassInfo::Structor* LLVMBackend::TryBindCxxGeneratedMoveC
 
         const uint64_t hash = HashWrapperKey(typeName + "|generated-move-ctor|" + ownerSpelling);
         const std::string wrapperName = std::format("__cflat_move_ctor_{:016x}", hash);
-        const std::string wrapperSource = "#include <new>\nextern \"C\" void " + wrapperName + "("
+        const std::string wrapperSource = "#include <new>\nextern \"C\" __attribute__((weak)) void " + wrapperName + "("
             + ownerSpelling + " * p0, " + ownerSpelling + " * p1) { new (p0) " + ownerSpelling
             + "(static_cast<" + ownerSpelling + " &&>(*p1)); }\n";
         CxxRequestGroupScope groupScope(*this, &group);
@@ -5778,7 +5843,10 @@ bool LLVMBackend::RequestCxxFunctionTemplate(const std::string& functionName,
         auto collectTypeDependencies = [&](auto&& self, const std::string& type) -> void {
             std::string base = type;
             while (!base.empty() && base.back() == '*') base.pop_back();
-            if (auto owner = cxxTypeOwnerGroup_.find(base); owner != cxxTypeOwnerGroup_.end())
+            if (auto owner = cxxTypeOwnerGroup_.find(base);
+                owner != cxxTypeOwnerGroup_.end()
+                && owner->second < cxxImportGroups_.size()
+                && !cxxImportGroups_[owner->second].headers.empty())
                 addDependencyGroup(owner->second);
             TypeSpelling parsed;
             if (!DemangleType(*this, base, parsed)) return;
@@ -5827,7 +5895,7 @@ bool LLVMBackend::RequestCxxFunctionTemplate(const std::string& functionName,
                 return true;
             }
         }
-        std::string wrapperSource = "extern \"C\" auto " + wrapperName + "(";
+        std::string wrapperSource = "extern \"C\" __attribute__((weak)) auto " + wrapperName + "(";
         for (size_t i = 0; i < parameterSpellings.size(); ++i)
         {
             if (i != 0) wrapperSource += ", ";
@@ -5846,7 +5914,7 @@ bool LLVMBackend::RequestCxxFunctionTemplate(const std::string& functionName,
         CSigEntry bound;
         std::string wrapperError;
         if (!RequestGeneratedCxxWrapper(group, generatedTypeSource + wrapperSource, wrapperName, "TPL",
-                                         bound, wrapperError))
+                                         bound, wrapperError, incompleteTypes.empty()))
             return noMatch(wrapperError);
 
         const bool instanceWrapper = selected->kind == cflat_cinterop::RawFunctionTemplate::InstanceMember;
@@ -6635,7 +6703,7 @@ bool LLVMBackend::RequestCxxBraceConstructor(
                     ? selected->paramTypes[brace.parameterIndex + 1] : std::string());
         }
         wrapperName = std::format("__cflat_tpl_{:016x}", HashWrapperKey(hashKey));
-        std::string wrapperSource = "extern \"C\" void " + wrapperName + "(";
+        std::string wrapperSource = "extern \"C\" __attribute__((weak)) void " + wrapperName + "(";
         for (size_t i = 0; i < parameterSpellings.size(); ++i)
         {
             if (i != 0) wrapperSource += ", ";
@@ -6804,7 +6872,7 @@ bool LLVMBackend::RequestCxxVariadicConstructor(
         for (const auto& param : parameterSpellings) hashKey += param;
         wrapperName = std::format("__cflat_ctor_{:016x}", HashWrapperKey(hashKey));
 
-        std::string wrapperSource = "extern \"C\" void " + wrapperName + "(";
+        std::string wrapperSource = "extern \"C\" __attribute__((weak)) void " + wrapperName + "(";
         for (size_t i = 0; i < parameterSpellings.size(); ++i)
         {
             if (i != 0) wrapperSource += ", ";
@@ -6838,7 +6906,7 @@ bool LLVMBackend::RequestCxxVariadicConstructor(
         CSigEntry bound;
         std::string wrapperError;
         if (!RequestGeneratedCxxWrapper(group, wrapperSource, wrapperName, "VARIADIC_CTOR",
-                                         bound, wrapperError))
+                                         bound, wrapperError, incompleteTypes.empty()))
         {
             if (declaredWrapperCtor)
                 error = std::format("C++ variadic constructor call '{}' does not match (clang: {})",
@@ -6906,7 +6974,7 @@ bool LLVMBackend::RequestCxxOperatorArrow(const std::string& typeName, std::stri
         const uint64_t hash = HashWrapperKey(typeName + "|operator->");
         const std::string wrapperName = std::format("__cflat_arrow_{:016x}", hash);
         const std::string wrapperSource =
-            "extern \"C\" auto " + wrapperName + "(" + ownerSpelling
+            "extern \"C\" __attribute__((weak)) auto " + wrapperName + "(" + ownerSpelling
             + " * p0) { return p0->operator->(); }\n";
 
         auto groupIt = cxxTypeOwnerGroup_.find(typeName);
@@ -6947,7 +7015,7 @@ bool LLVMBackend::RequestCxxOperatorArrow(const std::string& typeName, std::stri
  * (`std::vector` from `import cpp "vector"`), then groups that seeded the leading namespace, then
  * every other C++ group. Only the first candidate that actually declares the name is used.
  */
-std::vector<size_t> LLVMBackend::CandidateCxxGroupsFor(const std::string& cxxBase) const
+std::vector<size_t> LLVMBackend::CandidateCxxGroupsFor(const std::string& cxxBase)
 {
         if (auto known = cxxTemplateOwnerGroup_.find(cxxBase); known != cxxTemplateOwnerGroup_.end())
             return { known->second };
@@ -6973,6 +7041,22 @@ std::vector<size_t> LLVMBackend::CandidateCxxGroupsFor(const std::string& cxxBas
         order.insert(order.end(), byName.begin(), byName.end());
         order.insert(order.end(), byNamespace.begin(), byNamespace.end());
         order.insert(order.end(), rest.begin(), rest.end());
+        LoadCxxTemplateOwnerMemo();
+        if (auto memo = cxxTemplateOwnerMemo_.find(cxxBase);
+            memo != cxxTemplateOwnerMemo_.end())
+        {
+            auto owner = std::find_if(order.begin(), order.end(), [&](size_t index) {
+                const auto& group = cxxImportGroups_[index];
+                return group.headers == memo->second.headers
+                    && group.defines == memo->second.defines;
+            });
+            if (owner != order.end() && owner != order.begin())
+            {
+                const size_t group = *owner;
+                order.erase(owner);
+                order.insert(order.begin(), group);
+            }
+        }
         return order;
     }
 
@@ -7052,17 +7136,42 @@ void LLVMBackend::RememberCxxMangledArity(const std::string& cflatName,
         RememberMangledArity(*this, cflatName, args);
 }
 
+std::string LLVMBackend::GeneratedCxxPrefixForSpelling(const std::string& cxxSpelling) const
+{
+        if (cxxSpelling.find("__cflat_user::") == std::string::npos) return {};
+        std::vector<std::string> generatedNames;
+        for (const auto& entry : generatedCxxRecords_)
+        {
+            const std::string& typeName = entry.first;
+            std::string cxxName = "__cflat_user::" + typeName;
+            for (size_t pos = 0; (pos = cxxName.find('.', pos)) != std::string::npos; pos += 2)
+                cxxName.replace(pos, 1, "__");
+            if (cxxSpelling.find(cxxName) != std::string::npos)
+                generatedNames.push_back(typeName);
+        }
+        std::sort(generatedNames.begin(), generatedNames.end());
+        std::string source;
+        for (const std::string& typeName : generatedNames)
+            source += generatedCxxRecords_.at(typeName).source + "\n";
+        return source;
+}
+
 bool LLVMBackend::RequestCxxForeignType(const std::string& cflatName, const std::string& cxxSpelling,
                                         std::string& error, bool needDefinitions,
                                         bool explicitInstantiation, bool tentative,
                                         const std::string& extraSource,
-                                        const std::string& prefixSource)
+                                        const std::string& prefixSource,
+                                        bool persistOnSuccess)
 {
         RememberCxxMangledArity(cflatName, cxxSpelling);
-        const bool incompleteTentative = tentative && !prefixSource.empty();
+        std::string effectivePrefixSource = prefixSource.empty()
+            ? GeneratedCxxPrefixForSpelling(cxxSpelling) : prefixSource;
+        const bool incompleteTentative = tentative && !effectivePrefixSource.empty();
+        const bool incompletePrefix = tentative && !effectivePrefixSource.empty()
+            && !persistOnSuccess;
         const bool upgradingTentative = retryingTentativeCxxType_
             && cxxTentativeTypes_.count(cflatName) != 0;
-        const bool rejectClangErrors = !prefixSource.empty()
+        const bool rejectClangErrors = !effectivePrefixSource.empty()
             && cxxSpelling.find('<') != std::string::npos
             && !cxxSpelling.starts_with("std::shared_ptr<");
         // One attempt per CFlat identity per analysis; the outcome (including the diagnostic text)
@@ -7082,7 +7191,7 @@ bool LLVMBackend::RequestCxxForeignType(const std::string& cflatName, const std:
         // A request compiles against ONE import group. Callers inside a group's extraction run
         // under that group's scope; a CFlat-spelled type resolves its group first.
         if (activeCxxRequestGroup_ == nullptr
-            || (activeCxxRequestGroup_->headers.empty() && prefixSource.empty()))
+            || (activeCxxRequestGroup_->headers.empty() && effectivePrefixSource.empty()))
             return fail(std::format("C++ type '{}' needs a C++ header in scope - "
                                     "import one with 'import cpp \"<header>\";'", cxxSpelling));
         const CxxRequestGroup& group = *activeCxxRequestGroup_;
@@ -7122,7 +7231,7 @@ bool LLVMBackend::RequestCxxForeignType(const std::string& cflatName, const std:
         item.explicitInstantiation = explicitInstantiation;
         const std::vector<CxxRequestItem> single{ item };
         const std::vector<std::string> requestArgs = BuildCxxRequestClangArgs(group);
-        const std::string probeSource = BuildCxxRequestIncludes(group) + prefixSource
+        const std::string probeSource = BuildCxxRequestIncludes(group) + effectivePrefixSource
             + BuildCxxRequestMarkers(single, /*instantiateAll*/ true);
         const std::string probeKey =
             CxxTypeRequestCacheKey(group, item, probeSource, requestArgs, /*emitDefinitions*/ false);
@@ -7138,7 +7247,8 @@ bool LLVMBackend::RequestCxxForeignType(const std::string& cflatName, const std:
             CFileSigCacheEntry cachedEntry;
             std::string missReason;
             if (TryLoadCxxTypeRequestCache(group, probeKey, /*emitDefinitions*/ false,
-                                           cachedEntry, missReason)
+                                           cachedEntry, missReason,
+                                           /*allowDisk*/ !incompletePrefix)
                 && !cachedEntry.records.empty())
             {
                 records = cachedEntry.records;
@@ -7205,7 +7315,8 @@ bool LLVMBackend::RequestCxxForeignType(const std::string& cflatName, const std:
                 {
                     llvm::TimeTraceScope stage1("CxxRequestStage1", cxxSpelling);
                     if (!RunCxxTypeRequests(group, single, /*extraSource*/ {},
-                                            /*emitDefinitions*/ false, probe, error, prefixSource))
+                                            /*emitDefinitions*/ false, probe, error,
+                                            effectivePrefixSource))
                         return fail(std::format("C++ type '{}' could not be parsed: {}",
                                                 cxxSpelling, error));
                 }
@@ -7213,8 +7324,10 @@ bool LLVMBackend::RequestCxxForeignType(const std::string& cflatName, const std:
                     return fail(std::format("C++ type '{}' could not be parsed: {}",
                                             cxxSpelling, FirstCxxErrorLine(probe.firstError)));
                 if (probe.records.empty())
+                {
                     return fail(std::format("'{}' does not name a C++ class type in the imported headers",
                                             cxxSpelling));
+                }
             }
             const auto* probeTarget = findRequestedRecord(probe.records);
             if (probeTarget == nullptr)
@@ -7240,7 +7353,16 @@ bool LLVMBackend::RequestCxxForeignType(const std::string& cflatName, const std:
                 if (!probeRecords.empty())
                     StoreCxxTypeRequestCache(group, probeKey, /*emitDefinitions*/ false,
                                              std::move(entry),
-                                             /*allowDisk*/ !tentative && probe.firstError.empty());
+                                             /*allowDisk*/ (!tentative || persistOnSuccess)
+                                                 && (!rejectClangErrors
+                                                     || probe.firstError.empty())
+                                                 && !probe.records.empty(),
+                                             /*allowDiskReason*/
+                                             tentative && !persistOnSuccess
+                                                 ? "tentative request"
+                                                 : (rejectClangErrors && !probe.firstError.empty()
+                                                        ? "rejected clang error"
+                                                        : nullptr));
             }
             std::vector<CxxRequestItem> memberItems;
             CollectCxxMemberRequestItems(probeRecords, memberItems);
@@ -7274,7 +7396,7 @@ bool LLVMBackend::RequestCxxForeignType(const std::string& cflatName, const std:
                     + BuildCxxDefaultWrappers({}, probe.records)
                     + BuildCxxVirtualThunks(probe.records);
                 const std::string stage2Source =
-                    BuildCxxRequestIncludes(group) + prefixSource
+                    BuildCxxRequestIncludes(group) + effectivePrefixSource
                     + BuildCxxRequestMarkers(single, /*instantiateAll*/ false)
                     + stage2Extra;
                 requestKey =
@@ -7287,7 +7409,8 @@ bool LLVMBackend::RequestCxxForeignType(const std::string& cflatName, const std:
                 CFileSigCacheEntry cachedEntry;
                 std::string missReason;
                 if (TryLoadCxxTypeRequestCache(group, requestKey, /*emitDefinitions*/ true,
-                                               cachedEntry, missReason))
+                                               cachedEntry, missReason,
+                                               /*allowDisk*/ !incompletePrefix))
                 {
                     records = std::move(cachedEntry.records);
                     requestSigs = std::move(cachedEntry.sigs);
@@ -7307,7 +7430,8 @@ bool LLVMBackend::RequestCxxForeignType(const std::string& cflatName, const std:
                 cflat_cinterop::ExtractResult emitted;
                 const bool emittedOk = RunCxxTypeRequests(group, single,
                                       stage2Extra,
-                                      /*emitDefinitions*/ true, emitted, err2, prefixSource);
+                                      /*emitDefinitions*/ true, emitted, err2,
+                                      effectivePrefixSource);
                 if (emittedOk && !emitted.records.empty())
                     raw = std::move(emitted);
                 }
@@ -7319,8 +7443,10 @@ bool LLVMBackend::RequestCxxForeignType(const std::string& cflatName, const std:
                 return fail(std::format("C++ type '{}' could not be parsed: {}",
                                         cxxSpelling, FirstCxxErrorLine(raw.firstError)));
             if (!finalCached && raw.records.empty())
+            {
                 return fail(std::format("'{}' does not name a C++ class type in the imported headers",
                                         cxxSpelling));
+            }
             if (!finalCached)
             {
                 for (const std::string& dropped : raw.droppedCxxDefaultWrappers)
@@ -7363,14 +7489,25 @@ bool LLVMBackend::RequestCxxForeignType(const std::string& cflatName, const std:
                 entry.cxxBitcode = requestBitcode;
                 StoreCxxTypeRequestCache(group, requestKey, needDefinitions,
                                          std::move(entry),
-                                         /*allowDisk*/ !tentative && raw.firstError.empty());
+                                         /*allowDisk*/ (!tentative || persistOnSuccess)
+                                             && (!rejectClangErrors || raw.firstError.empty())
+                                             && !raw.records.empty(),
+                                         /*allowDiskReason*/
+                                         tentative && !persistOnSuccess
+                                             ? "tentative request"
+                                             : (rejectClangErrors && !raw.firstError.empty()
+                                                    ? "rejected clang error" : nullptr));
             }
         }
         if (records.empty())
             return fail(std::format("'{}' does not name a C++ class type in the imported headers",
                                     cxxSpelling));
 
-        if (finalCached || (cached && !needDefinitions))
+        const bool requestCacheReplay = finalCached || (cached && !needDefinitions);
+        std::optional<llvm::TimeTraceScope> replayScope;
+        if (requestCacheReplay)
+            replayScope.emplace("CxxTypeRequestReplay", cxxSpelling);
+        if (requestCacheReplay)
         {
             const auto* cachedTarget = findRegisteredRecord(records);
             if (cachedTarget == nullptr)
@@ -7455,7 +7592,7 @@ bool LLVMBackend::RequestCxxForeignType(const std::string& cflatName, const std:
         // their signatures can map the self-reference; RegisterCRecords fills this shell below.
         if (dataStructures.find(cflatName) == dataStructures.end())
             CreateStructType(cflatName, {});
-        RequestCxxMemberTypes(records);
+        RequestCxxMemberTypes(records, effectivePrefixSource, incompletePrefix);
         if (!requestBitcode.empty() && symbolSink_ == nullptr) AdoptCxxCompanionBitcode(requestBitcode);
         // Registered BEFORE the records so a member signature naming the type itself
         // (`operator=(const vector<int>&)`, `push_back` on a nested element) maps to the CFlat name.
@@ -7934,7 +8071,9 @@ void LLVMBackend::CollectCxxMemberRequestItems(const std::vector<CRecordEntry>& 
         }
 }
 
-void LLVMBackend::RequestCxxMemberTypes(const std::vector<CRecordEntry>& records)
+void LLVMBackend::RequestCxxMemberTypes(const std::vector<CRecordEntry>& records,
+                                        const std::string& prefixSource,
+                                        bool incompletePrefix)
 {
         std::vector<CxxRequestItem> items;
         CollectCxxMemberRequestItems(records, items);
@@ -7942,9 +8081,13 @@ void LLVMBackend::RequestCxxMemberTypes(const std::vector<CRecordEntry>& records
         PrewarmCxxRequestBatch(items);
         for (const CxxRequestItem& item : items)
         {
+            if (prefixSource.empty()
+                && item.cxxSpelling.find("__cflat_user::") != std::string::npos)
+                continue;
             std::string error;
             RequestCxxForeignType(item.cflatName, item.cxxSpelling, error, item.needDefinitions,
-                                  item.explicitInstantiation);
+                                  item.explicitInstantiation, incompletePrefix, {}, prefixSource,
+                                  /*persistOnSuccess*/ !incompletePrefix);
         }
 }
 
@@ -8121,7 +8264,8 @@ bool LLVMBackend::RequestCxxType(const std::string& baseName, const std::vector<
                                                    /*needDefinitions*/ true,
                                                    /*explicitInstantiation*/ true,
                                                    /*tentative*/ !incompleteTypes.empty(),
-                                                   /*extraSource*/ {}, generatedTypeSource);
+                                                   /*extraSource*/ {}, generatedTypeSource,
+                                                   /*persistOnSuccess*/ incompleteTypes.empty());
             if (!ok && !incompleteTypes.empty() && baseName != "std.shared_ptr")
                 error = std::string("\x1f" "CFLAT_INCOMPLETE_CPP_TEMPLATE" "\x1f") + spelling + "\n"
                     + *incompleteTypes.begin();
@@ -8139,7 +8283,10 @@ bool LLVMBackend::RequestCxxType(const std::string& baseName, const std::vector<
         {
             std::string elem = arg;
             while (!elem.empty() && (elem.back() == '*' || elem.back() == ' ')) elem.pop_back();
-            if (auto owner = cxxTypeOwnerGroup_.find(elem); owner != cxxTypeOwnerGroup_.end())
+            if (auto owner = cxxTypeOwnerGroup_.find(elem);
+                owner != cxxTypeOwnerGroup_.end()
+                && owner->second < cxxImportGroups_.size()
+                && !cxxImportGroups_[owner->second].headers.empty())
                 deps.push_back(owner->second);
         }
         for (size_t group : generatedDependencyGroups)
@@ -8182,10 +8329,12 @@ bool LLVMBackend::RequestCxxTypeInOwningGroup(const std::string& cxxBase,
             if (RequestCxxForeignType(cflatName, spelling, localError, /*needDefinitions*/ true,
                                       /*explicitInstantiation*/ true,
                                       /*tentative*/ !last || retryable,
-                                      /*extraSource*/ {}, prefixSource))
+                                      /*extraSource*/ {}, prefixSource,
+                                      /*persistOnSuccess*/ !retryable))
             {
                 cxxTemplateOwnerGroup_[cxxBase] = order[k];
                 cxxTypeOwnerGroup_[cflatName] = order[k];
+                StoreCxxTemplateOwnerMemo(cxxBase, order[k]);
                 return true;
             }
             tried.push_back(group.label);
@@ -10034,6 +10183,8 @@ bool LLVMBackend::TryBindRefusedCxxMember(const std::string& typeName,
                         if (spelling.find("::") == std::string::npos
                             || spelling.find('<') == std::string::npos)
                             continue;
+                        if (spelling.find("__cflat_user::") != std::string::npos)
+                            continue;
                         TypeAndValue mapped;
                         bool mappedForeign = false;
                         if (TryMapCxxForeignSpelling(spelling, mapped, mappedForeign)
@@ -10088,6 +10239,10 @@ bool LLVMBackend::TryBindRefusedCxxMember(const std::string& typeName,
             auto addSpelling = [&](const std::string& raw) {
                 const std::string spelling = CxxMemberValueSpelling(raw);
                 if (spelling.find("::") == std::string::npos) return;
+                if (spelling.find("__cflat_user::") != std::string::npos)
+                    return;
+                if (spelling.find("type-parameter-") != std::string::npos)
+                    return;
                 TypeAndValue mapped;
                 bool mappedForeign = false;
                 const bool mapFound = TryMapCxxForeignSpelling(spelling, mapped, mappedForeign);
@@ -10114,7 +10269,27 @@ bool LLVMBackend::TryBindRefusedCxxMember(const std::string& typeName,
 
         auto ownerIt = cxxTypeOwnerGroup_.find(typeName);
         if (ownerIt == cxxTypeOwnerGroup_.end()) return false;
-        CxxRequestGroup group = MakeCxxRequestGroup(ownerIt->second, {});
+        std::vector<size_t> dependencyGroups;
+        auto addDependencyGroup = [&](const std::string& identity) {
+            auto dependencyIt = cxxTypeOwnerGroup_.find(identity);
+            if (dependencyIt == cxxTypeOwnerGroup_.end()
+                || dependencyIt->second == ownerIt->second
+                || dependencyIt->second >= cxxImportGroups_.size()
+                || cxxImportGroups_[dependencyIt->second].headers.empty())
+                return;
+            if (std::find(dependencyGroups.begin(), dependencyGroups.end(), dependencyIt->second)
+                == dependencyGroups.end())
+                dependencyGroups.push_back(dependencyIt->second);
+        };
+        for (const auto& [identity, spelling] : requests)
+        {
+            addDependencyGroup(identity);
+            const std::string squeezed = SqueezeCxxSpelling(spelling);
+            for (const auto& [knownIdentity, knownSpelling] : cxxCflatToCxxSpelling_)
+                if (squeezed.find(SqueezeCxxSpelling(knownSpelling)) != std::string::npos)
+                    addDependencyGroup(knownIdentity);
+        }
+        CxxRequestGroup group = MakeCxxRequestGroup(ownerIt->second, dependencyGroups);
         if (group.headers.empty()) return false;
         CxxRequestGroupScope groupScope(*this, &group);
         for (const auto& [identity, spelling] : requests)

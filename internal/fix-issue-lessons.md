@@ -3356,3 +3356,21 @@ assume `int` is parameterized the way `long` is.
 Unrelated gap found in the same check: `--platform win32` cannot compile even a printf-only program
 (`os.cb:475`, `VirtualAllocExNuma` overload assumes 64-bit arguments). The win32 target is not
 exercised by any suite.
+
+## Record 2026-09-16: generated C++ helper definitions must be weak
+
+Persisting C++ type-request results (candidate probes and accepted-with-tolerated-error stage-2
+entries, the fix that took the interop fixture from 45 s to 16 s warm) exposed a latent linkage
+rule. Every `extern "C"` helper cflat synthesizes into a companion module (std::function ctor
+helper, record member and destructor thunks, the three RequestGeneratedCxxWrapper shapes) used to
+be a STRONG definition. Two companion blobs carrying the same helper only ever merged because
+`AdoptCxxCompanionBitcode` dedups by blob hash and, live, the same source produces the same bytes.
+Once entries can come from disk, the same spelling can be served by two byte-different blobs
+(one per header group, or one live plus one persisted by another test in a parallel suite), and
+the program link fails with `symbol multiply defined` - seen once as a parallel-suite flake in
+`err_cpp_using_directive_ambiguous`. Rule: every generated helper is `__attribute__((weak))`, as
+the function-template wrappers already were. `LinkCxxCompanionModules` demotes weak
+companion-origin definitions to internal after the link, so inlining and DCE are unaffected.
+
+Generic [cpp] structs must key every generated class, thunk and cache row on the monomorphized nameOverride; dependent template declarations must issue no C++ type request.
+Reverse ABI thunk sanitization must preserve `$`, because generic instantiation identities use it.

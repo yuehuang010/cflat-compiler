@@ -183,6 +183,9 @@
 //                       promotion, receiver sret, member-template overloads, and ref/value rank.
 //   Section M79 (1554-1557): C++ exceptions caught at the `program` boundary, including a
 //                       two-frame CFlat call chain and a normal program run afterward.
+//   Section M80 (1560-1575): generic CFlat-defined [cpp] structs - one C++ class per
+//                       instantiation, dependent C++ base initializers, override dispatch,
+//                       destructor counts, move construction, and a no-base field generic.
 // Section M: C++ interop - `import cpp` selects C++ mode; the extension is irrelevant (the
 // fixture header is a plain .h). The header supplies the declarations, the .cpp is compiled
 // by the host C++ driver and linked in. Both are needed: the header alone has no
@@ -470,6 +473,18 @@ struct M76MemberTripler : cppt.m76.Holder<int>
     override int doubled() { return value * 2 + inner.value; }
 };
 
+struct M80Wrap<T> : cppt.m76.Holder<T>
+{
+    M80Wrap(T v) : cppt.m76.Holder<T>(v) { }
+    override T doubled() { return value + value + 3; }
+};
+
+[cpp] struct M80Value<T>
+{
+    T value = default;
+    M80Value(T v) { value = v; }
+};
+
 cppi.Tracked m77_free_ctor(int value)
 {
     return cppi.Tracked(value);
@@ -685,6 +700,36 @@ extern int main()
         plainAgain.run(argsAgain);
         plainAgain.WaitForExit();
         if (plainAgain.exitCode != 5) return 1557;
+    }
+
+    // ---- Section M80: generic CFlat-defined [cpp] structs (1560-1575) ---------
+    cppt.m76.reset_holder_int_dtors();
+    {
+        M80Wrap<int> source = M80Wrap<int>(5);
+        if (source.doubled() != 13) return 1560;
+        if (cppt.m76.call_doubled<int>(&source) != 13) return 1561;
+        M80Wrap<int> target = move source;
+        if (target.value != 5 || target.doubled() != 13) return 1562;
+        if (cppt.m76.call_doubled<int>(&target) != 13) return 1563;
+        if (cppt.m76.holder_int_dtors() != 0) return 1564;
+    }
+    if (cppt.m76.holder_int_dtors() != 2) return 1565;
+
+    cppt.m76.reset_holder_double_dtors();
+    {
+        M80Wrap<double> value = M80Wrap<double>(2.5);
+        if (value.doubled() != 8.0) return 1566;
+        if (cppt.m76.call_doubled<double>(&value) != 8.0) return 1567;
+    }
+    if (cppt.m76.holder_double_dtors() != 1) return 1568;
+
+    {
+        M80Value<int> intValue = M80Value<int>(17);
+        M80Value<double> doubleValue = M80Value<double>(4.5);
+        if (intValue.value != 17) return 1569;
+        if (doubleValue.value != 4.5) return 1570;
+        M80Value<int> moved = move intValue;
+        if (moved.value != 17) return 1571;
     }
 
     // C++ side of the long double round-trip from Section O.

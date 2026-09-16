@@ -463,6 +463,21 @@ inline std::string DequoteStringLiteral(const std::string& raw)
     return raw.size() >= 2 ? raw.substr(1, raw.size() - 2) : raw;
 }
 
+// Return every import filename, whether it came from importGroup or a direct literal alternative.
+inline std::vector<std::string> ImportFilenames(CFlatParser::ImportDeclarationContext* imp)
+{
+    std::vector<std::string> filenames;
+    if (imp == nullptr) return filenames;
+    if (auto* group = imp->importGroup())
+    {
+        for (auto* literal : group->StringLiteral())
+            filenames.push_back(DequoteStringLiteral(literal->getText()));
+    }
+    else if (auto* literal = imp->StringLiteral())
+        filenames.push_back(DequoteStringLiteral(literal->getText()));
+    return filenames;
+}
+
 // Longest run of quoted-back user source allowed in one diagnostic. An `if const` condition may be
 // arbitrarily long and may nest, so both a single condition and the composed nesting chain are
 // bounded - a multi-kilobyte single-line error message helps nobody.
@@ -3182,8 +3197,16 @@ private:
         bool diskCache = false;
     };
     const CxxRequestGroup* activeCxxRequestGroup_ = nullptr;
+    struct CxxOwnerGroupMemo
+    {
+        std::vector<std::string> headers;
+        std::vector<std::string> defines;
+    };
     // Base C++ spelling ("std::vector") -> the import group index that answered for it.
     std::unordered_map<std::string, size_t> cxxTemplateOwnerGroup_;
+    // Disk memo identities survive process resets; stale identities only affect probe order.
+    std::unordered_map<std::string, CxxOwnerGroupMemo> cxxTemplateOwnerMemo_;
+    bool cxxTemplateOwnerMemoLoaded_ = false;
     std::unordered_map<std::string, std::vector<cflat_cinterop::RawFunctionTemplate>>
         cxxFunctionTemplates_;
     std::unordered_map<std::string, size_t> cxxFunctionTemplateOwnerGroup_;
@@ -5079,12 +5102,16 @@ private:
                                     const std::string& requestKey,
                                     bool emitDefinitions,
                                     CFileSigCacheEntry& out,
-                                    std::string& missReason);
+                                    std::string& missReason,
+                                    bool allowDisk = true);
     void StoreCxxTypeRequestCache(const CxxRequestGroup& group,
                                   const std::string& requestKey,
                                   bool emitDefinitions,
                                   CFileSigCacheEntry&& entry,
-                                  bool allowDisk);
+                                  bool allowDisk,
+                                  const char* allowDiskReason = nullptr);
+    void LoadCxxTemplateOwnerMemo();
+    void StoreCxxTemplateOwnerMemo(const std::string& cxxBase, size_t group);
 
     // Import-group plumbing for the request layer.
     size_t FindOrAddCxxImportGroup(const std::vector<std::string>& headers,
@@ -5123,7 +5150,7 @@ private:
                                        std::string& wrapperName,
                                        std::string& error);
     bool RequestCxxOperatorArrow(const std::string& typeName, std::string& error);
-    std::vector<size_t> CandidateCxxGroupsFor(const std::string& cxxBase) const;
+    std::vector<size_t> CandidateCxxGroupsFor(const std::string& cxxBase);
     bool TryBindCxxFunction(const std::string& functionName);
     void RememberCxxMangledArity(const std::string& cflatName, const std::string& cxxSpelling) const;
     bool CxxSignatureTypesRegistered(const CSigEntry& entry);
@@ -5147,7 +5174,8 @@ private:
                                std::string& error, bool needDefinitions = true,
                                bool explicitInstantiation = true, bool tentative = false,
                                const std::string& extraSource = {},
-                               const std::string& prefixSource = {});
+                               const std::string& prefixSource = {},
+                               bool persistOnSuccess = false);
     bool RequestGeneratedCxxType(const std::string& cflatName,
                                  const std::string& cxxSpelling,
                                  const std::string& source,
@@ -5167,7 +5195,9 @@ private:
                                    uint64_t& length) const;
     void RegisterGeneratedCxxOverrideNames(const std::string& typeName,
                                            const std::set<std::string>& names);
-    void RequestCxxMemberTypes(const std::vector<CRecordEntry>& records);
+    void RequestCxxMemberTypes(const std::vector<CRecordEntry>& records,
+                               const std::string& prefixSource = {},
+                               bool incompletePrefix = false);
     void CollectCxxMemberRequestItems(const std::vector<CRecordEntry>& records,
                                       std::vector<CxxRequestItem>& out);
     bool CxxGroupHeaderStamp(const CxxRequestGroup& group,
@@ -5179,7 +5209,8 @@ private:
                                     const std::string& wrapperName,
                                     const std::string& cacheTag,
                                     CSigEntry& signature,
-                                    std::string& error);
+                                    std::string& error,
+                                    bool persistOnSuccess = true);
     bool TryBindCxxImplicitDefaultCtor(const std::string& typeName, std::string& error);
     struct CxxImplicitArgumentCandidate
     {
@@ -5233,6 +5264,7 @@ private:
      */
     bool TryRequestCxxType(const std::string& baseName, const std::vector<std::string>& typeArgs,
                            const std::string& cflatName, std::string& error);
+    std::string GeneratedCxxPrefixForSpelling(const std::string& cxxSpelling) const;
     bool DecodeCxxIncompleteTemplateError(const std::string& error,
                                           std::string& spelling, std::string& typeName) const;
     bool IsCxxForeignTypeRegistered(const std::string& cflatName) const;

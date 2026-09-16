@@ -758,7 +758,7 @@ llvm::Function* LLVMBackend::GetOrCreateReverseAbiFunctionThunk(
             : stableName;
         auto* loweredTy = BuildExternFunctionType(plan.ret, plan.params, false, plan.recipe);
         for (char& c : key)
-            if (!std::isalnum((unsigned char)c)) c = '_';
+            if (!std::isalnum((unsigned char)c) && c != '_' && c != '$') c = '_';
         llvm::Function* thunk = module->getFunction(key);
         if (thunk != nullptr)
         {

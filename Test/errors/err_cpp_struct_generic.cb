@@ -1,7 +1,6 @@
-expect_error("generic [cpp] struct is not supported yet") {
-    [cpp] struct BadCpp<T>
+expect_error("multiple bases are not supported yet") {
+    [cpp] struct BadCpp<T> : cppt.m76.Holder<T>, cppt.m76.Shape2<T>
     {
-        T value = default;
     };
 }
 

@@ -2,6 +2,8 @@
 
 ## Summary
 
+HELD 2026-09-16 by maintainer ruling: batched into a later CFlat-interop plan. Do not start.
+
 `std.shared_ptr<Leaf> copy = net->l1;` (or `= m.l1;` on a value struct) where `l1` is a
 `std.shared_ptr<Leaf>` field produces a bitwise copy of the handle: no copy constructor runs,
 the use_count does not change. The copy is then treated as an OWNING handle: `copy =

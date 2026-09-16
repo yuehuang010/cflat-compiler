@@ -81,3 +81,12 @@ day, that hour cutoff means the PCH cache is almost always cold.
    limit than an hour.
 
 All three are maintainer calls (staleness policy + cache size), so nothing here is implemented.
+
+## Update 2026-09-16 (macOS, fix landed in tree)
+
+Lever 1 above is implemented: request disk cache now persists successful candidate probes, accepted stage-2
+results with tolerated instantiation errors, and an owner-group memo (cxx-owner-groups.json).
+Fixture warm is 16 s (was 45 s); cold stays ~100-130 s. Remaining cold lever is batching one TU
+per group per stage (~60 s bound, 276 requests / 530 stage runs). Timeout stays 240 s.
+Lever 2 (synthesized `__cflat_user` group has no cache clause) and lever 3 (PCH prune policy) are
+still open and are the next warm items on Windows.

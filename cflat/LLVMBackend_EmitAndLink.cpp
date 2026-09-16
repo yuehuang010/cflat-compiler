@@ -2624,6 +2624,8 @@ bool LLVMBackend::CollectOptimizationInfo(int optLevel,
 // twice under the same configuration - are dropped here; distinct ones merge by ODR at link time.
 void LLVMBackend::AdoptCxxCompanionBitcode(const std::string& bitcode)
 {
+    llvm::TimeTraceScope scope("AdoptCxxCompanionBitcode",
+                               std::to_string(bitcode.size()));
     if (bitcode.empty()) return;
     uint64_t hash = 14695981039346656037ULL;
     for (unsigned char c : bitcode) { hash ^= c; hash *= 1099511628211ULL; }
@@ -2656,8 +2658,11 @@ bool LLVMBackend::LinkCxxCompanionModules()
     for (const std::string& blob : blobs)
     {
         llvm::MemoryBufferRef buffer(blob, "cflat_cxx_companion");
-        llvm::Expected<std::unique_ptr<llvm::Module>> parsed =
-            llvm::parseBitcodeFile(buffer, *context);
+        auto parsed = [&] {
+            llvm::TimeTraceScope parseScope("CxxCompanionBitcodeParse",
+                                             std::to_string(blob.size()));
+            return llvm::parseBitcodeFile(buffer, *context);
+        }();
         if (!parsed)
         {
             LogErrorMessage("{}: the C++ definitions emitted for an imported header could not be "

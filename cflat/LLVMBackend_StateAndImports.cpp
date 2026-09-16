@@ -2456,7 +2456,9 @@ bool LLVMBackend::TryLoadCHeaderDiskCache(
         simdjson::dom::element doc;
         SjVal j;
         {
-            llvm::TimeTraceScope parseScope("CHeaderJsonParse", cachePath.string());
+            llvm::TimeTraceScope parseScope(
+                expectedRequestKey.empty() ? "CHeaderJsonParse" : "CxxTypeRequestJsonParse",
+                cachePath.string());
             auto loaded = simdjson::padded_string::load(cachePath.string());
             if (loaded.error()) return cacheMiss("unreadable entry");
             jsonBuf = std::move(loaded.value());
@@ -2540,7 +2542,7 @@ bool LLVMBackend::TryLoadCHeaderDiskCache(
         // separately from the registration state. v59 preserves the full probe record needed to
         // rebuild an identical stage-2 source from a warm stage-1 hit. v60 preserves enum backing
         // types in cached signatures, so unsigned narrow enum returns keep their signedness.
-        if (version != 60) return cacheMiss("cache version");
+        if (version != 61) return cacheMiss("cache version");
 
         if (!expectedRequestKey.empty()
             && j.value("cxxRequestKey", std::string{}) != expectedRequestKey)
@@ -2606,11 +2608,25 @@ bool LLVMBackend::TryLoadCHeaderDiskCache(
                 if (sidecarName != expectedName) return cacheMiss("sidecar name");
                 const uint64_t expectedLength = blob.value("len", uint64_t{0});
                 const uint64_t expectedHash = blob.value("hash", uint64_t{0});
-                auto sidecar = llvm::MemoryBuffer::getFile(sidecarPath.string());
+                auto sidecar = [&] {
+                    std::optional<llvm::TimeTraceScope> sidecarReadScope;
+                    if (!expectedRequestKey.empty())
+                        sidecarReadScope.emplace("CxxTypeRequestSidecarRead",
+                                                  sidecarPath.string());
+                    return llvm::MemoryBuffer::getFile(sidecarPath.string());
+                }();
                 if (!sidecar || (*sidecar)->getBuffer().size() != expectedLength)
                     return cacheMiss("missing or truncated sidecar");
                 uint64_t actualHash = 0;
-                if (!HashFileFnv1a(sidecarPath.string(), actualHash) || actualHash != expectedHash)
+                bool sidecarHashOk;
+                {
+                    std::optional<llvm::TimeTraceScope> sidecarHashScope;
+                    if (!expectedRequestKey.empty())
+                        sidecarHashScope.emplace("CxxTypeRequestSidecarHash",
+                                                  sidecarPath.string());
+                    sidecarHashOk = HashFileFnv1a(sidecarPath.string(), actualHash);
+                }
+                if (!sidecarHashOk || actualHash != expectedHash)
                     return cacheMiss("sidecar hash");
                 entry.cxxBitcode.assign((*sidecar)->getBuffer().data(), (*sidecar)->getBuffer().size());
             }
@@ -2651,6 +2667,90 @@ static std::string CxxRequestGroupMarker(const std::vector<std::string>& headers
         return marker;
     }
 
+void LLVMBackend::LoadCxxTemplateOwnerMemo()
+{
+        if (cxxTemplateOwnerMemoLoaded_) return;
+        cxxTemplateOwnerMemoLoaded_ = true;
+        const std::string cacheDir = GetCHeaderCacheDir();
+        if (cacheDir.empty()) return;
+        std::ifstream input(std::filesystem::path(cacheDir) / "cxx-owner-groups.json");
+        if (!input.is_open()) return;
+        nlohmann::json doc;
+        try { input >> doc; }
+        catch (...) { return; }
+        if (!doc.is_object() || doc.value("version", 0) != 1
+            || doc.value("compilerBuildStamp", std::string{}) != CompilerBuildStamp())
+            return;
+        auto owners = doc.find("owners");
+        if (owners == doc.end() || !owners->is_object()) return;
+        for (auto it = owners->begin(); it != owners->end(); ++it)
+        {
+            const auto& value = it.value();
+            if (!value.is_object()) continue;
+            auto headers = value.find("headers");
+            auto defines = value.find("defines");
+            if (headers == value.end() || defines == value.end()
+                || !headers->is_array() || !defines->is_array()) continue;
+            try
+            {
+                CxxOwnerGroupMemo memo;
+                memo.headers = headers->get<std::vector<std::string>>();
+                memo.defines = defines->get<std::vector<std::string>>();
+                if (!memo.headers.empty()) cxxTemplateOwnerMemo_.emplace(it.key(), std::move(memo));
+            }
+            catch (...) {}
+        }
+    }
+
+void LLVMBackend::StoreCxxTemplateOwnerMemo(const std::string& cxxBase, size_t group)
+{
+        if (cxxBase.empty() || group >= cxxImportGroups_.size()) return;
+        const CxxImportGroup& owner = cxxImportGroups_[group];
+        if (owner.headers.empty() || !owner.diskCache || runMode_ || batchMode_
+            || retryingTentativeCxxType_ || symbolSink_ != nullptr)
+            return;
+        const std::string cacheDir = GetCHeaderCacheDir();
+        if (cacheDir.empty()) return;
+        LoadCxxTemplateOwnerMemo();
+        cxxTemplateOwnerMemo_[cxxBase] = { owner.headers, owner.defines };
+
+        nlohmann::json doc = {
+            {"version", 1},
+            {"compilerBuildStamp", CompilerBuildStamp()},
+            {"owners", nlohmann::json::object()}
+        };
+        for (const auto& [base, memo] : cxxTemplateOwnerMemo_)
+            doc["owners"][base] = {{"headers", memo.headers}, {"defines", memo.defines}};
+
+        namespace fs = std::filesystem;
+        const fs::path path = fs::path(cacheDir) / "cxx-owner-groups.json";
+        const fs::path temp = fs::path(cacheDir)
+            / std::format("cxx-owner-groups.{}.tmp", _getpid());
+        std::error_code ec;
+        fs::create_directories(cacheDir, ec);
+        if (ec) return;
+        {
+            std::ofstream output(temp, std::ios::binary | std::ios::trunc);
+            if (!output.is_open()) return;
+            output << doc;
+            output.close();
+            if (!output)
+            {
+                fs::remove(temp, ec);
+                return;
+            }
+        }
+        fs::rename(temp, path, ec);
+        if (ec)
+        {
+            ec.clear();
+            fs::remove(path, ec);
+            ec.clear();
+            fs::rename(temp, path, ec);
+        }
+        if (ec) fs::remove(temp, ec);
+    }
+
 void LLVMBackend::WriteCHeaderDiskCache(
         const std::filesystem::path& cacheDir,
         uint64_t diskKey,
@@ -2666,7 +2766,7 @@ void LLVMBackend::WriteCHeaderDiskCache(
         if (ec) return;
 
         nlohmann::json j;
-        j["version"] = 60;
+        j["version"] = 61;
         j["mtime"]   = (int64_t)mtime.time_since_epoch().count();
         j["hash"]    = contentHash;
         j["ldw"]     = entry.longDoubleWidth;
@@ -2745,7 +2845,15 @@ void LLVMBackend::WriteCHeaderDiskCache(
                 return;
             }
             uint64_t sidecarHash = 0;
-            if (!HashFileFnv1a(sidecarPath.string(), sidecarHash))
+            bool sidecarHashOk;
+            {
+                std::optional<llvm::TimeTraceScope> sidecarHashScope;
+                if (!requestKey.empty())
+                    sidecarHashScope.emplace("CxxTypeRequestSidecarHash",
+                                              sidecarPath.string());
+                sidecarHashOk = HashFileFnv1a(sidecarPath.string(), sidecarHash);
+            }
+            if (!sidecarHashOk)
             {
                 fs::remove(sidecarPath, ec);
                 return;

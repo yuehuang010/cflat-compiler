@@ -916,6 +916,7 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                     // A C++ CLASS TEMPLATE spelled with CFlat's angle syntax
                     // (`std.vector<int>`): instantiate it now so the declared type is a real
                     // struct with constructors, a destructor and methods.
+                    if (!Compiler(declSpecs)->AnyGenericTypeTemplateNamed(baseName))
                     {
                         std::string cxxError;
                         const bool cxxType = Compiler(declSpecs)->TryRequestCxxType(
@@ -2580,15 +2581,13 @@ void MainListener::ParseIfConstDeclaration(CFlatParser::IfConstDeclarationContex
                     Compiler()->LogError(error);
                     continue;
                 }
+                auto importFilenames = ImportFilenames(imp);
                 // `import framework "X";` / `import framework { ... };` inside an if-const
                 // branch. Dispatch before the importGroup routing since it reuses importGroup.
                 if (imp->children.size() >= 2 && imp->children[1]->getText() == "framework")
                 {
-                    if (auto* grp = imp->importGroup())
-                        for (auto* lit : grp->StringLiteral())
-                            Compiler()->AddFrameworkImport(DequoteStringLiteral(lit->getText()));
-                    else if (auto* lit = imp->StringLiteral())
-                        Compiler()->AddFrameworkImport(DequoteStringLiteral(lit->getText()));
+                    for (const auto& framework : importFilenames)
+                        Compiler()->AddFrameworkImport(framework);
                     continue;
                 }
                 // A `framework "X"` clause on a header/package/group import (S3): link the
@@ -2602,10 +2601,6 @@ void MainListener::ParseIfConstDeclaration(CFlatParser::IfConstDeclarationContex
                 // ONE package TU, not several plain imports.
                 if (imp->children.size() >= 2 && imp->children[1]->getText() == "package-nuget")
                 {
-                    std::vector<std::string> nugetFiles;
-                    if (auto* grp = imp->importGroup())
-                        for (auto* lit : grp->StringLiteral())
-                            nugetFiles.push_back(DequoteStringLiteral(lit->getText()));
                     std::string packageSpec;
                     if (auto* fc = imp->fromClause())
                         if (fc->StringLiteral())
@@ -2628,49 +2623,38 @@ void MainListener::ParseIfConstDeclaration(CFlatParser::IfConstDeclarationContex
                             std::string pr = pc->StringLiteral()->getText();
                             if (pr.size() >= 2) nugetPri = DequoteStringLiteral(pr);
                         }
-                    Compiler()->CompileNugetImport(nugetFiles, packageSpec, nugetDefines, nugetPri);
+                    Compiler()->CompileNugetImport(importFilenames, packageSpec, nugetDefines, nugetPri);
                     continue;
                 }
-                // Grouped import `import { "a", "b" };` inside an if-const branch - header
-                // entries share one TU; .cb/.c route individually (see CompileImportGroup).
-                if (auto* grp = imp->importGroup())
+                // Grouped plain/C++ import inside an if-const branch - header entries share one
+                // TU; .cb/.c route individually (see CompileImportGroup).
+                if (importFilenames.size() > 1)
                 {
-                    auto lits = grp->StringLiteral();
-                    if (lits.size() > 1)
+                    std::vector<std::string> entries = importFilenames;
+                    std::vector<std::string> grpLibs;
+                    if (auto* lc = imp->libClause())
                     {
-                        std::vector<std::string> entries;
-                        for (auto* lit : lits)
+                        for (auto* lit : lc->StringLiteral())
                         {
-                            std::string gr = lit->getText();
-                            if (gr.size() >= 2) entries.push_back(DequoteStringLiteral(gr));
+                            std::string lr = lit->getText();
+                            if (lr.size() >= 2) grpLibs.push_back(DequoteStringLiteral(lr));
                         }
-                        std::vector<std::string> grpLibs;
-                        if (auto* lc = imp->libClause())
-                            for (auto* lit : lc->StringLiteral())
-                            {
-                                std::string lr = lit->getText();
-                                if (lr.size() >= 2) grpLibs.push_back(DequoteStringLiteral(lr));
-                            }
-                        std::vector<std::string> grpDefines;
-                        for (auto* dc : imp->defineClause())
-                            if (dc->StringLiteral())
-                            {
-                                std::string dr = dc->StringLiteral()->getText();
-                                if (dr.size() >= 2) grpDefines.push_back(DequoteStringLiteral(dr));
-                            }
-                        bool grpIsCpp = imp->children.size() >= 2
-                                     && imp->children[1]->getText() == "cpp";
-                        Compiler()->CompileImportGroup(Compiler()->currentSourceFilePath_, entries,
-                                                       grpLibs, grpDefines, imp->cacheClause() != nullptr,
-                                                       grpIsCpp);
-                        continue;
                     }
+                    std::vector<std::string> grpDefines;
+                    for (auto* dc : imp->defineClause())
+                        if (dc->StringLiteral())
+                        {
+                            std::string dr = dc->StringLiteral()->getText();
+                            if (dr.size() >= 2) grpDefines.push_back(DequoteStringLiteral(dr));
+                        }
+                    bool grpIsCpp = imp->children.size() >= 2
+                                 && imp->children[1]->getText() == "cpp";
+                    Compiler()->CompileImportGroup(Compiler()->currentSourceFilePath_, entries,
+                                                   grpLibs, grpDefines, imp->cacheClause() != nullptr,
+                                                   grpIsCpp);
+                    continue;
                 }
-                std::string importFilename;
-                if (auto* grp = imp->importGroup())
-                    importFilename = DequoteStringLiteral(grp->StringLiteral(0)->getText());
-                else
-                    importFilename = DequoteStringLiteral(imp->StringLiteral()->getText());
+                std::string importFilename = importFilenames[0];
                 // `import package-vcpkg "header" from "port";` inside an if-const branch.
                 if (imp->children.size() >= 2 && imp->children[1]->getText() == "package-vcpkg")
                 {
