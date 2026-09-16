@@ -34,9 +34,8 @@ sized blob - which is why the iostream hierarchy, and only spellings like it, hi
 
 Plus the two spike gaps that were always part of this story:
 [`std-free-functions-and-globals-unreachable.md`](std-free-functions-and-globals-unreachable.md)
-(`std.cout`) and
-[`cpp-alias-template-types-unresolvable.md`](cpp-alias-template-types-unresolvable.md)
-(the `std.ofstream` spelling).
+(`std.cout`); the `std.ofstream` spelling half LANDED 2026-09-16 - the alias resolves and the
+refusal has moved to the virtual-base constructor guard.
 
 ## Acceptance
 

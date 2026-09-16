@@ -8102,7 +8102,11 @@ bool LLVMBackend::TryRequestCxxType(const std::string& baseName,
 {
         error.clear();
         if (!HasCxxImportGroup()) return false;
-        if (baseName.find('.') == std::string::npos) return false;
+        // An undotted name is a CFlat name, not a C++ one - unless a C++ import recorded it as
+        // an alias of a specialization. A map hit, so the dot rule's cost gate is unchanged.
+        if (baseName.find('.') == std::string::npos
+            && !(typeArgs.empty() && cxxLazyAliasSpecializations_.count(baseName) != 0))
+            return false;
         if (IsCxxForeignTypeRegistered(cflatName) && !cxxTentativeTypes_.count(cflatName))
         {
             // A spelling recorded without any struct behind it (a member signature published the

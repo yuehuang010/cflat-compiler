@@ -186,6 +186,8 @@
 //   Section M80 (1560-1575): generic CFlat-defined [cpp] structs - one C++ class per
 //                       instantiation, dependent C++ base initializers, override dispatch,
 //                       destructor counts, move construction, and a no-base field generic.
+//   Section M83 (1576-1580): a class-template specialization named through a GLOBAL-scope C++
+//                       alias or typedef - both spellings reach one record.
 // Section M: C++ interop - `import cpp` selects C++ mode; the extension is irrelevant (the
 // fixture header is a plain .h). The header supplies the declarations, the .cpp is compiled
 // by the host C++ driver and linked in. Both are needed: the header alone has no
@@ -3626,6 +3628,21 @@ extern int main()
         if ((*fresh).forward(2) != 18) return 1552;
     }
     if (cppt.module_dtors() != 5) return 1553;
+
+    // ---- Section M83: global-scope C++ aliases of a specialization (1576-1580) ----
+    M83GlobalAlias m83alias = default;
+    m83alias.value = 5;
+    if (m83alias.value != 5)                        return 1576;
+    M83GlobalAlias2 m83second = default;
+    m83second.value = 6;
+    if (m83second.value != 6)                       return 1577;
+    // Two aliases of ONE specialization must reach ONE record: the header function takes
+    // M83Global<int> by reference, so a separate registration per alias would not bind here.
+    if (m83_take_global(m83alias) != 6)             return 1578;
+    if (m83_take_global(m83second) != 7)            return 1579;
+    M83GlobalTypedef m83typedef = default;
+    m83typedef.value = 2.5;
+    if (m83typedef.value != 2.5)                    return 1580;
 
     return 0;
 }

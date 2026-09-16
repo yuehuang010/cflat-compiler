@@ -29,7 +29,7 @@ when declared `= default`; their constructor-call spelling does not (gap 4).
 | # | Issue | Blocks |
 |---|-------|--------|
 | 1 | [`std-free-functions-and-globals-unreachable.md`](std-free-functions-and-globals-unreachable.md) | all 21 `c*` headers, `algorithm`, `numeric`, `bit`, `limits`, `format`, `iostream` globals |
-| 2 | [`cpp-alias-template-types-unresolvable.md`](cpp-alias-template-types-unresolvable.md) | `std.ofstream`, `std.ostringstream` |
+| 2 | alias of a class-template specialization - LANDED 2026-09-16 (`std.ofstream` / `std.ostringstream` now resolve; the local is refused by the virtual-base constructor guard) | was: `std.ofstream`, `std.ostringstream` |
 | 3 | [`stream-classes-no-callable-destructor.md`](stream-classes-no-callable-destructor.md) (destructor half FIXED 2026-09-10; blocked now by [`cpp-virtual-base-constructor-unreachable.md`](cpp-virtual-base-constructor-unreachable.md) and [`stream-open-instantiation-error.md`](stream-open-instantiation-error.md)) | streams as locals; with 1+2, the whole iostream family |
 | 4 | [`constrained-template-constructor-overload-resolution.md`](constrained-template-constructor-overload-resolution.md) | `complex`, `chrono`, `filesystem`, `tuple`, `optional`, `pair`, `regex`, `random` construction |
 | 5 | `lock` as a member name - LANDED `6f1981c` | was: `std.mutex.lock`, `std.shared_mutex.lock` |
@@ -38,7 +38,7 @@ when declared `= default`; their constructor-call spelling does not (gap 4).
 | 8 | multi-word template arguments - LANDED `6f1981c` in template-argument position only; gap 10 extends the spellings to every type position | was: any specialization over `long long`, `unsigned int`, ... |
 | 9 | [`std-globals-unreachable.md`](std-globals-unreachable.md) | `std` GLOBALS (`std.cout`); the narrowed remainder of gap 1 |
 | 10 | C++ primitive typing - LANDED 2026-09-10 (ruling + identity table at the bottom of `internal/fix-issue-lessons.md`) | was: C multi-word spellings outside template arguments, and `std::u16string`, `std::wstring`, `char8_t` specializations |
-| 11 | [`alias-of-class-template-specialization-loses-fields.md`](alias-of-class-template-specialization-loses-fields.md) | an alias of a specialization declares a local but loses its fields |
+| 11 | alias field loss - RETIRED 2026-09-16, did not reproduce; the residual is a field typed as a specialization, alias or not, filed as [`cpp-specialization-field-embedded-opaque.md`](cpp-specialization-field-embedded-opaque.md) | was: an alias of a specialization declares a local but loses its fields |
 | 12 | C++ `long`/`unsigned long` spelling - LANDED 2026-09-10 with gap 10 | was: `std::vector<DWORD>`, `std::vector<size_t>` |
 
 ## Not spiked

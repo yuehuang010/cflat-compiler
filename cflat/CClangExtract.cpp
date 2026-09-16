@@ -2168,6 +2168,14 @@ namespace cflat_cinterop
                     auto* cxx = canon->getAsCXXRecordDecl();
                     if (cxx == nullptr) continue;
                     CXXRecordDecl* def = cxx->getDefinition();
+                    // A request spelled as a plain ALIAS carries no explicit instantiation and a
+                    // typedef never requires completeness, so complete it silently through Sema.
+                    if (def == nullptr && st.ci != nullptr && st.ci->hasSema()
+                        && llvm::isa<ClassTemplateSpecializationDecl>(cxx))
+                    {
+                        st.ci->getSema().isCompleteType(td->getLocation(), canon);
+                        def = cxx->getDefinition();
+                    }
                     if (def == nullptr) continue;
                     std::function<void(const CXXRecordDecl*)> emitBases;
                     emitBases = [&](const CXXRecordDecl* current) {

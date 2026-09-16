@@ -1,0 +1,13 @@
+// `std::ofstream` is an ALIAS of `basic_ofstream<char>`, and a type request spelled as an alias
+// carries no explicit instantiation, so the specialization used to arrive declaration-only and the
+// name was reported as "cannot find the type 'std.ofstream'". The name now resolves; the local is
+// still refused, by the virtual-base constructor guard - that move is what this test pins.
+import cpp "fstream";
+
+extern int main()
+{
+    expect_error("has no default constructor cflat can call") {
+        std.ofstream m83stream = default;
+    }
+    return 0;
+}

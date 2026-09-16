@@ -1411,3 +1411,11 @@ namespace cppt
     { return shape->area(); }
     }
 }
+
+// Section M83: a class-template specialization named through a GLOBAL-scope alias. The undotted
+// spelling is the one that never reached the C++ type request; cppt covers the namespaced forms.
+template <class T> struct M83Global { T value; };
+using M83GlobalAlias = M83Global<int>;
+using M83GlobalAlias2 = M83Global<int>;
+typedef M83Global<double> M83GlobalTypedef;
+inline int m83_take_global(const M83Global<int>& v) noexcept { return v.value + 1; }
