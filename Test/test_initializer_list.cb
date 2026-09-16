@@ -680,6 +680,19 @@ extern int main()
     int[2][3] q13Nested = {{1, 2, 3}, {4, 5, 6}};
     total++; passed += Test("multi-dimensional nested brace shape",
                             q13Nested[0][0] + q13Nested[1][2], 7);
+    int[4][5] q13Large = {
+        {1, 2, 3, 4, 5}, {6, 7, 8, 9, 10},
+        {11, 12, 13, 14, 15}, {16, 17, 18, 19, 20}
+    };
+    total++; passed += Test("multi-dimensional 4x5 nested brace shape",
+                            q13Large[0][0] + q13Large[3][4], 21);
+    int[3][10] q13Wide = {
+        {1, 2, 3, 4, 5, 6, 7, 8, 9, 10},
+        {11, 12, 13, 14, 15, 16, 17, 18, 19, 20},
+        {21, 22, 23, 24, 25, 26, 27, 28, 29, 30}
+    };
+    total++; passed += Test("multi-dimensional 3x10 nested brace shape",
+                            q13Wide[0][9] + q13Wide[2][0] + q13Wide[2][9], 61);
     char[2][8] q13Rows = {"ab", "cd"};
     total++; passed += Test("multi-dimensional char string rows",
                             (int)q13Rows[0][0] + (int)q13Rows[1][1], 'a' + 'd');

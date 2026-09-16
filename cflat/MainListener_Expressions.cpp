@@ -11996,8 +11996,30 @@ void MainListener::EmitPositionalFixedArrayIntoSlot(
         llvm::Value* zero = compiler->builder->getInt32(0);
         std::vector<llvm::Value*> elementPtrs;
         if (multidim)
-            compiler->EmitFixedArrayElementWalk(*compiler->builder, arrAlloc, elemTy, n,
-                [&](llvm::Value* ptr) { elementPtrs.push_back(ptr); });
+        {
+            // This caller needs every static element pointer; the shared walk may switch to a runtime loop.
+            std::vector<uint64_t> dimensions;
+            dimensions.reserve(tv.ConstInnerDimensions.size() + 1);
+            dimensions.push_back(tv.ConstArraySize);
+            dimensions.insert(dimensions.end(), tv.ConstInnerDimensions.begin(),
+                              tv.ConstInnerDimensions.end());
+            for (uint64_t flatIndex = 0; flatIndex < n; ++flatIndex)
+            {
+                uint64_t remaining = flatIndex;
+                std::vector<llvm::Value*> indices{ zero };
+                for (size_t dim = 0; dim < dimensions.size(); ++dim)
+                {
+                    uint64_t stride = 1;
+                    for (size_t trailing = dim + 1; trailing < dimensions.size(); ++trailing)
+                        stride *= dimensions[trailing];
+                    uint64_t index = stride == 0 ? 0 : remaining / stride;
+                    remaining = stride == 0 ? 0 : remaining % stride;
+                    indices.push_back(compiler->builder->getInt32((uint32_t)index));
+                }
+                elementPtrs.push_back(compiler->builder->CreateInBoundsGEP(
+                    arrTy, arrAlloc, indices, "arrelem"));
+            }
+        }
         for (size_t i = 0; i < elements.size(); i++)
         {
             auto* fi = elements[i];
