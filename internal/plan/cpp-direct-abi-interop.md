@@ -304,7 +304,10 @@ the imported `operator()`; `const std::function&` params bind the alias leg. A c
 closure is refused with LogError (`err_cpp_std_function_capturing.cb`). Host verification:
 test.sh 828/0/8, test_lsp.sh green, test_example.sh 45/0.
 
-### M8 - Exceptions and unwind-safe cleanup - OPEN
+### M8 - Exceptions and unwind-safe cleanup - PARTIAL
+
+Iteration 1 landed: the `program` boundary catches C++ exceptions through a clang-compiled
+guard and stores `exitCode = -1`; frame cleanup and catches outside `program` remain OPEN.
 
 Define the language contract for foreign exceptions (see surface options above).
 Implement target-specific personality, invoke/unwind edges, cleanup pads/landing pads, and

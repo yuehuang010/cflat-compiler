@@ -4488,6 +4488,7 @@ void LLVMBackend::ResetForReanalysis()
     for (const auto& obj : cObjectFiles_) llvm::sys::fs::remove(obj);
     cObjectFiles_.clear();
     cppInteropUsed_ = false;
+    cxxProgramEhGuardAttempted_ = false;
     cxxImportGroups_.clear();
     activeCxxRequestGroup_ = nullptr;
     cxxTemplateOwnerGroup_.clear();

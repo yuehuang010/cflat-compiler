@@ -215,6 +215,48 @@ void LLVMBackend::RejectThrowingCxxFunction(const FunctionSymbol& symbol, const 
                              displayName));
 }
 
+llvm::Function* LLVMBackend::EnsureCxxProgramEhGuard(const std::string& programName)
+{
+        constexpr const char* guardName = "__cflat_program_eh_guard";
+        if (symbolSink_ != nullptr) return nullptr;
+        if (cxxProgramEhGuardAttempted_) return module->getFunction(guardName);
+        cxxProgramEhGuardAttempted_ = true;
+
+        cflat_cinterop::ExtractRequest req;
+        req.mainFileName = "cflat_program_eh_guard.cpp";
+        req.source = R"cpp(
+extern "C" int __cflat_program_eh_guard(int (*fn)(void*), void* ctx, int* rc) noexcept
+{
+    try { *rc = fn(ctx); return 0; } catch (...) { return 1; }
+}
+)cpp";
+        req.args = BuildClangDriverArgs("", {}, /*errorRecovery*/ false, /*asCxx*/ true);
+        req.cxxMode = true;
+        req.emitDefinitions = true;
+        req.verbose = verbose;
+
+        cflat_cinterop::ExtractResult raw;
+        std::string error;
+        if (!cflat_cinterop::ExtractCInterop(req, raw, error) || raw.bitcode.empty())
+        {
+            std::string detail = raw.firstError.empty() ? error : raw.firstError;
+            const size_t newline = detail.find('\n');
+            if (newline != std::string::npos) detail.resize(newline);
+            if (detail.empty()) detail = "no companion bitcode was emitted";
+            LogError(std::format(
+                "program '{}': could not compile the C++ exception guard - {}",
+                programName, detail));
+            return nullptr;
+        }
+
+        AdoptCxxCompanionBitcode(raw.bitcode);
+        auto* ptrType = llvm::PointerType::get(*context, 0);
+        auto* guardType = llvm::FunctionType::get(
+            llvm::Type::getInt32Ty(*context), {ptrType, ptrType, ptrType}, false);
+        return llvm::cast<llvm::Function>(
+            module->getOrInsertFunction(guardName, guardType).getCallee());
+    }
+
 /*
  * By-value gate for a C++ declaration. A TRIVIALLY COPYABLE record crosses the boundary as raw
  * bytes under clang's own arrangement, so it is allowed. A NONTRIVIAL one (user copy/move

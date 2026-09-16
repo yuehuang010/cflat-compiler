@@ -3286,6 +3286,8 @@ a generic body specializes to.
 
 `program` defines a struct-like construct with a managed entry point. The compiler auto-generates a `run(list<string>)` method that spawns a dedicated thread, installs a per-thread `BlockAllocator` (all heap allocations inside `main` are freed automatically on return), calls `main`, and joins the thread.
 
+An unhandled C++ exception thrown from a program's `main` sets `exitCode` to `-1` and lets the program exit cleanly. In this iteration, objects owned by CFlat frames between the throw and the program boundary are not destroyed.
+
 ```c
 import "list.cb";
 import "thread.cb";

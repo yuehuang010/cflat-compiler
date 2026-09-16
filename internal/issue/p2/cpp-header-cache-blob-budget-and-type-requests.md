@@ -11,7 +11,7 @@ raw sidecar `<key>.bc` next to the JSON entry (the JSON keeps `cxxbc: {file, len
 missing, truncated or hash-mismatched sidecar is a whole-entry miss and the entry is rewritten;
 the base64 blob budget (`kMaxDiskCachedCxxBitcode`) is gone. torch.h: 33 MB JSON + 37 MB `.bc`.
 
-Part 2 OPEN and HELD (maintainer ruling 2026-09-13, staleness): C++ type requests
+Part 2 OPEN - hold LIFTED 2026-09-15 (maintainer: interop is stable enough; keep an eye on staleness): C++ type requests
 (`RequestCxxForeignType`, batch/wrapper/function-template paths in
 cflat/LLVMBackend_CInterop.cpp) are cached only in the process-wide in-memory `cFileSigCache_`.
 Every cflat invocation re-runs all of them: each is a stage-1 parse plus a stage-2 parse+CodeGen
@@ -31,7 +31,7 @@ are still changing, that cost outweighs the warm-compile win.
 scratch/ladder/torch/t4.cb with ` cache` added to the import, compiled twice with the recipe in
 scratch/ladder/torch/run_all.sh; `-v` and sum the `extraction stage` lines.
 
-## Fix direction for part 2 (do not start without a ruling)
+## Fix direction for part 2 (ruled 2026-09-15: go)
 
 - Persist only the clang-side result of a request (extraction JSON + companion bitcode), keyed
   by a hash of the FULL generated stub source + group header hash + include/define flags +

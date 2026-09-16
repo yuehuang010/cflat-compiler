@@ -181,6 +181,8 @@
 //                       generated constructors/destructors, virtual dispatch, conversions,
 //                       recursive template arguments, incomplete ordering, move ownership,
 //                       promotion, receiver sret, member-template overloads, and ref/value rank.
+//   Section M79 (1554-1557): C++ exceptions caught at the `program` boundary, including a
+//                       two-frame CFlat call chain and a normal program run afterward.
 // Section M: C++ interop - `import cpp` selects C++ mode; the extension is irrelevant (the
 // fixture header is a plain .h). The header supplies the declarations, the .cpp is compiled
 // by the host C++ driver and linked in. Both are needed: the header alone has no
@@ -209,6 +211,10 @@ import cpp "mutex";
 import cpp "chrono";
 import cpp "string";
 import cpp "functional";
+import cpp "library/cpp_interop_throw.h";
+import "list.cb";
+import "thread.cb";
+import "malloc_allocator.cb";
 
 int m78global = 42;
 extern int strcmp(const char* a, const char* b);
@@ -610,8 +616,77 @@ int m17_direct_array_param(std.array<int, 4> value)
     return cppi.array_total(value);
 }
 
+int cpp_throw_deep2(int value)
+{
+    return cppthrow.throw_if(value);
+}
+
+int cpp_throw_deep1(int value)
+{
+    return cpp_throw_deep2(value);
+}
+
+program CppThrowDirect
+{
+    int main(move list<string> args)
+    {
+        return cppthrow.throw_if(1);
+    }
+};
+
+program CppThrowDeep
+{
+    int main(move list<string> args)
+    {
+        return cpp_throw_deep1(1);
+    }
+};
+
+program CppThrowPlain
+{
+    int main(move list<string> args)
+    {
+        return cppthrow.throw_if(0) + cppthrow.plain(4);
+    }
+};
+
 extern int main()
 {
+    // ---- Section M79: C++ exceptions at the program boundary (1554-1557) ---------
+    // Win64 keeps the existing SEH trampoline and does not emit the C++ guard.
+    if const (__WINDOWS__) {
+        return 0;
+    }
+    {
+        CppThrowDirect direct;
+        list<string> directArgs;
+        direct.run(directArgs);
+        direct.WaitForExit();
+        if (direct.exitCode != -1) return 1554;
+
+        CppThrowDeep deep;
+        list<string> deepArgs;
+        deep.run(deepArgs);
+        deep.WaitForExit();
+        if (deep.exitCode != -1) return 1555;
+
+        // This normal run follows both throwing program threads in the same process.
+        CppThrowPlain plain;
+        list<string> plainArgs;
+        plain.run(plainArgs);
+        plain.WaitForExit();
+        if (plain.exitCode != 5) return 1556;
+    }
+
+    // Keep one additional non-throwing run after the throwing objects have torn down.
+    {
+        CppThrowPlain plainAgain;
+        list<string> argsAgain;
+        plainAgain.run(argsAgain);
+        plainAgain.WaitForExit();
+        if (plainAgain.exitCode != 5) return 1557;
+    }
+
     // C++ side of the long double round-trip from Section O.
     if (cppi.ld_identity(2.5) != 2.5)            return 148;
     if (cppi.ld_add(1.25, 2.5) != 3.75)         return 149;

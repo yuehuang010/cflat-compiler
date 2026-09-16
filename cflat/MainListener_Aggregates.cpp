@@ -2221,6 +2221,135 @@ void MainListener::EmitProgramRunWrapper(const std::string& name, CFlatParser::P
                     exitCodeGEP);
                 compiler->builder->CreateCatchRet(catchPad, cleanupBB);
             }
+            else if (compiler->cppInteropUsed_ && !compiler->targetWindows_
+                     && compiler->symbolSink_ == nullptr)
+            {
+                llvm::Function* ehGuard = compiler->EnsureCxxProgramEhGuard(name);
+                if (ehGuard == nullptr)
+                {
+                    auto* callResult = compiler->builder->CreateCall(
+                        mainFn->getFunctionType(), mainFn, mainArgs, "main_result");
+                    compiler->builder->CreateStore(callResult, exitCodeGEP);
+                    compiler->builder->CreateBr(cleanupBB);
+                }
+                else
+                {
+                    // The C++ guard owns the personality and catch-all landing pad. Keep the
+                    // CFlat trampoline as a normal cleanup function and pass main through it.
+                    auto* ehFrameType = llvm::StructType::create(
+                        *compiler->context,
+                        {voidPtrType, voidPtrType, i32Type, voidPtrType},
+                        "__ProgramEhFrame_" + name);
+                    auto* ehFrame = compiler->AllocaAtEntry(ehFrameType, nullptr, "eh_frame");
+                    auto* nullPtr = llvm::ConstantPointerNull::get(
+                        llvm::cast<llvm::PointerType>(voidPtrType));
+
+                    auto* frameSelfGEP = compiler->builder->CreateStructGEP(
+                        ehFrameType, ehFrame, 0, "eh_frame_self");
+                    llvm::Value* selfForMain = isImported ? static_cast<llvm::Value*>(nullPtr) : self;
+                    compiler->builder->CreateStore(selfForMain, frameSelfGEP);
+
+                    llvm::Value* argsForMain = nullPtr;
+                    if (isListArgs)
+                    {
+                        auto* argsStorage = compiler->AllocaAtEntry(
+                            listStringType, nullptr, "eh_args");
+                        compiler->builder->CreateStore(argsVal, argsStorage);
+                        argsForMain = argsStorage;
+                    }
+                    auto* frameArgsGEP = compiler->builder->CreateStructGEP(
+                        ehFrameType, ehFrame, 1, "eh_frame_args");
+                    compiler->builder->CreateStore(argsForMain, frameArgsGEP);
+
+                    auto* frameArgcGEP = compiler->builder->CreateStructGEP(
+                        ehFrameType, ehFrame, 2, "eh_frame_argc");
+                    llvm::Value* argcForMain = isArgcArgv
+                        ? argc32Val : static_cast<llvm::Value*>(compiler->builder->getInt32(0));
+                    compiler->builder->CreateStore(
+                        argcForMain, frameArgcGEP);
+
+                    auto* frameArgvGEP = compiler->builder->CreateStructGEP(
+                        ehFrameType, ehFrame, 3, "eh_frame_argv");
+                    llvm::Value* argvForMain = isArgcArgv
+                        ? argvPtrVal : static_cast<llvm::Value*>(nullPtr);
+                    compiler->builder->CreateStore(
+                        argvForMain, frameArgvGEP);
+
+                    LLVMBackend::TypeAndValue intReturn;
+                    intReturn.TypeName = "int";
+                    LLVMBackend::DeclTypeAndValue frameParam;
+                    frameParam.TypeName = "void";
+                    frameParam.VariableName = "frame";
+                    frameParam.Pointer = true;
+                    RejectIfProgramMemberSlotTaken(ctx, name, "__program_main_" + name,
+                        "int __program_main_" + name + "(void*)", intReturn, {frameParam});
+
+                    auto* innerFn = llvm::Function::Create(
+                        trampolineFnTy, llvm::Function::InternalLinkage,
+                        "__program_main_" + name, *compiler->module);
+                    auto* innerEntry = llvm::BasicBlock::Create(
+                        *compiler->context, "entry", innerFn);
+                    llvm::IRBuilder<> innerBuilder(innerEntry);
+                    auto* innerFrame = innerBuilder.CreateBitCast(
+                        innerFn->getArg(0), cflat_llvm::PointerTo(ehFrameType), "eh_frame");
+
+                    auto* innerSelf = innerBuilder.CreateLoad(
+                        voidPtrType, innerBuilder.CreateStructGEP(ehFrameType, innerFrame, 0), "self");
+                    auto* innerArgsPtr = innerBuilder.CreateLoad(
+                        voidPtrType, innerBuilder.CreateStructGEP(ehFrameType, innerFrame, 1), "args");
+                    auto* innerArgc = innerBuilder.CreateLoad(
+                        i32Type, innerBuilder.CreateStructGEP(ehFrameType, innerFrame, 2), "argc");
+                    auto* innerArgv = innerBuilder.CreateLoad(
+                        voidPtrType, innerBuilder.CreateStructGEP(ehFrameType, innerFrame, 3), "argv");
+
+                    std::vector<llvm::Value*> innerMainArgs;
+                    if (isImported)
+                    {
+                        if (isNoArgs)
+                            innerMainArgs = {};
+                        else if (isListArgs)
+                            innerMainArgs = {innerBuilder.CreateLoad(
+                                listStringType, innerArgsPtr, "args_val")};
+                        else
+                            innerMainArgs = {innerArgc, innerArgv};
+                    }
+                    else
+                    {
+                        if (isNoArgs)
+                            innerMainArgs = {innerSelf};
+                        else if (isListArgs)
+                            innerMainArgs = {innerSelf, innerBuilder.CreateLoad(
+                                listStringType, innerArgsPtr, "args_val")};
+                        else
+                            innerMainArgs = {innerSelf, innerArgc, innerArgv};
+                    }
+                    auto* innerResult = innerBuilder.CreateCall(
+                        mainFn->getFunctionType(), mainFn, innerMainArgs, "main_result");
+                    innerBuilder.CreateRet(innerResult);
+
+                    // This call is C++ so clang owns the target personality and catch landing pad.
+                    // A nonzero result means the C++ catch-all ran; converge on normal cleanup.
+                    auto* guardResult = compiler->builder->CreateCall(
+                        ehGuard->getFunctionType(), ehGuard, {innerFn, ehFrame, exitCodeGEP},
+                        "eh_guard_result");
+                    auto* guardNormalBB = llvm::BasicBlock::Create(
+                        *compiler->context, "eh_guard_normal", trampolineFn);
+                    auto* guardCatchBB = llvm::BasicBlock::Create(
+                        *compiler->context, "eh_guard_catch", trampolineFn);
+                    auto* guardCaught = compiler->builder->CreateICmpNE(
+                        guardResult, compiler->builder->getInt32(0), "eh_caught");
+                    compiler->builder->CreateCondBr(guardCaught, guardCatchBB, guardNormalBB);
+
+                    compiler->builder->SetInsertPoint(guardCatchBB);
+                    compiler->builder->CreateStore(
+                        llvm::ConstantInt::get(i32Type, static_cast<uint64_t>(-1), true),
+                        exitCodeGEP);
+                    compiler->builder->CreateBr(cleanupBB);
+
+                    compiler->builder->SetInsertPoint(guardNormalBB);
+                    compiler->builder->CreateBr(cleanupBB);
+                }
+            }
             else
             {
                 // No SEH here (Win32 or any POSIX target). On Win32 LLVM's x86 backend drops

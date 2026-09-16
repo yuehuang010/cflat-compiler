@@ -3146,6 +3146,7 @@ private:
     // Set when a C++ source or header is imported. This selects the C++ driver/runtime at
     // native compile/link time; ordinary C imports keep the existing C-only path.
     bool cppInteropUsed_ = false;
+    bool cxxProgramEhGuardAttempted_ = false;
     bool cppStrictNoexcept_ = false;
     /*
      * M5b - ONE `import cpp` statement: its headers in the order the statement spells them, its
@@ -5020,6 +5021,7 @@ private:
     // landing pads or personality routine - the unwinder would run off the top of the CFlat
     // frame. Refuse to bind such a function, whether by call or by function pointer.
     void RejectThrowingCxxFunction(const FunctionSymbol& symbol, const std::string& displayName) const;
+    llvm::Function* EnsureCxxProgramEhGuard(const std::string& programName);
     static std::string SqueezeCxxSpelling(const std::string& spelling);
     static std::string StripCxxRecordTag(std::string spelling);
     // One spelling a request (or a batch of requests) instantiates in an import group's TU.

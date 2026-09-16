@@ -28,3 +28,10 @@ roughly 1-3 s apiece; the baseline compiler is not slower per request (measured:
   requests; or make test.sh give known-heavy tests a per-test budget instead of a global one.
 - Keep the M-section request count visible: `-v` prints each request; a section adding more
   than ~10 should justify it in its header-index line.
+
+## Update 2026-09-16
+
+Type-request disk cache part 2 implemented (worktree cflat-cxJ, branch wip/cxJ, uncommitted) and
+every `import cpp` in the fixture carries `cache`. Measured there: cold 128 s, warm 46 s, both
+exit 0. The suite's cold pass still pays the cold number, so the 240 s timeout stays; the
+remaining cold lever is batching requests per group in the pre-pass (see the plan discussion).
