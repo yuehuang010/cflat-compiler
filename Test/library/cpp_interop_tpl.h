@@ -1419,3 +1419,14 @@ using M83GlobalAlias = M83Global<int>;
 using M83GlobalAlias2 = M83Global<int>;
 typedef M83Global<double> M83GlobalTypedef;
 inline int m83_take_global(const M83Global<int>& v) noexcept { return v.value + 1; }
+
+// Section M84: a class used as a std::map key and as a by-reference parameter. A named lvalue
+// index has to reach overload matching with its class identity intact.
+struct M84Key
+{
+    int v;
+    M84Key() noexcept : v(0) {}
+    explicit M84Key(int a) noexcept : v(a) {}
+    bool operator<(const M84Key& o) const noexcept { return v < o.v; }
+};
+inline int m84_take_key(const M84Key& k) noexcept { return k.v + 1; }

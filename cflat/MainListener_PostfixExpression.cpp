@@ -2721,6 +2721,16 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             LLVMBackend::NamedVariable idxNV;
                             idxNV.Primary  = rvalue;
                             idxNV.BaseType = rvalue->getType();
+                            // A STRUCT index keeps its type and storage, else it reaches overload
+                            // matching unnamed; a scalar stays bare or a declared name narrows it.
+                            if (rvalue->getType()->isStructTy())
+                            {
+                                idxNV = idxNamed;
+                                idxNV.Primary  = rvalue;
+                                idxNV.BaseType = rvalue->getType();
+                                // A non-empty VariableName is a NAMED-argument request.
+                                idxNV.TypeAndValue.VariableName = "";
+                            }
 
                             CheckMovedReceiver(structVar);
                             auto* result = Compiler(ctx)->CreateOverloadedFunctionCall("operator[]", { thisNV, idxNV });

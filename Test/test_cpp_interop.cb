@@ -188,6 +188,11 @@
 //                       destructor counts, move construction, and a no-base field generic.
 //   Section M83 (1576-1580): a class-template specialization named through a GLOBAL-scope C++
 //                       alias or typedef - both spellings reach one record.
+//   Section M84 (1590-1599): a CLASS-typed subscript index - a named std.string lvalue as a
+//                       std.map key (incremented twice, and not moved from), the same key
+//                       through find/count, a struct field and a dereferenced pointer as
+//                       keys, a user-header C++ class key, and a CFlat-native operator[]
+//                       whose index parameter is a struct.
 // Section M: C++ interop - `import cpp` selects C++ mode; the extension is irrelevant (the
 // fixture header is a plain .h). The header supplies the declarations, the .cpp is compiled
 // by the host C++ driver and linked in. Both are needed: the header alone has no
@@ -215,6 +220,7 @@ import cpp "tuple" cache;
 import cpp "mutex" cache;
 import cpp "chrono" cache;
 import cpp "string" cache;
+import cpp "map" cache;
 import cpp "functional" cache;
 import cpp "library/cpp_interop_throw.h" cache;
 import "list.cb";
@@ -487,6 +493,14 @@ struct M80Wrap<T> : cppt.m76.Holder<T>
     M80Value(T v) { value = v; }
 };
 
+// Section M84: a CFlat-native operator[] whose index parameter is a struct. The subscript
+// argument build is shared with the C++ path, so a struct index must keep its type here too.
+struct M84Idx { int v; };
+struct M84Bag { int base; };
+int operator[](M84Bag* bag, M84Idx idx) { return bag->base + idx.v; }
+
+struct M84Holder { std.string name = default; };
+
 cppi.Tracked m77_free_ctor(int value)
 {
     return cppi.Tracked(value);
@@ -673,6 +687,47 @@ extern int main()
     // Win64 keeps the existing SEH trampoline and does not emit the C++ guard.
     if const (__WINDOWS__) {
         return 0;
+    }
+
+    // ---- Section M84: class-typed subscript indices (1590-1599) ----------------
+    // Runs early and in its own scope on purpose: internal/issue/p2/cpp-shared-ptr-vector-
+    // stale-stack-control-block.md is a pre-existing stray write into main's frame.
+    {
+        // A named std.string lvalue as a std.map key. Pre-fix the index reached C++ member
+        // overload matching as an unnamed aggregate value and no candidate bound.
+        std.map<std.string, int> m84counts = default;
+        std.string m84key = std.string("compiler");
+        m84counts[m84key] = m84counts[m84key] + 1;
+        m84counts[m84key] = m84counts[m84key] + 1;
+        if (m84counts[m84key] != 2)                     return 1590;
+        // One entry only: binding the by-value (key_type&&) leg instead of const key_type&
+        // would move from m84key and the second subscript would insert a second, empty key.
+        if ((int)m84counts.size() != 1)                 return 1591;
+        if (m84counts["compiler"] != 2)                 return 1592;
+        // The same named key through the members that already bound it before the fix.
+        if ((int)m84counts.count(m84key) != 1)          return 1593;
+        auto m84found = m84counts.find(m84key);
+        if (m84found == m84counts.end())                return 1594;
+        // A struct FIELD and a DEREFERENCED POINTER are the other lvalue spellings.
+        M84Holder m84holder = default;
+        m84holder.name = m84key;
+        m84counts[m84holder.name] = m84counts[m84holder.name] + 3;
+        if (m84counts[m84holder.name] != 5)             return 1595;
+        std.string* m84ptr = &m84key;
+        if (m84counts[*m84ptr] != 5)                    return 1596;
+        // A user-header C++ class key, and the same class through a const-reference
+        // parameter - so the row is not std.string-specific.
+        std.map<M84Key, int> m84user = default;
+        M84Key m84userkey = M84Key(3);
+        m84user[m84userkey] = 8;
+        if (m84user[m84userkey] != 8)                   return 1597;
+        if (m84_take_key(m84userkey) != 4)              return 1598;
+        // A CFlat-native operator[] taking a struct index shares the argument build.
+        M84Bag m84bag = default;
+        m84bag.base = 10;
+        M84Idx m84idx = default;
+        m84idx.v = 4;
+        if (m84bag[m84idx] != 14)                       return 1599;
     }
     {
         CppThrowDirect direct;
