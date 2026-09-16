@@ -3161,6 +3161,7 @@ private:
         std::vector<std::string> defines;
         std::unordered_set<std::string> namespaces;
         std::unordered_set<std::string> publishedNames;
+        bool diskCache = false;
     };
     std::vector<CxxImportGroup> cxxImportGroups_;
     /*
@@ -3174,8 +3175,11 @@ private:
     {
         std::vector<std::string> headers;
         std::vector<std::string> defines;
+        std::vector<std::string> ownerHeaders;
+        std::vector<std::string> ownerDefines;
         std::string label;
         size_t primary = static_cast<size_t>(-1);   // index into cxxImportGroups_
+        bool diskCache = false;
     };
     const CxxRequestGroup* activeCxxRequestGroup_ = nullptr;
     // Base C++ spelling ("std::vector") -> the import group index that answered for it.
@@ -3451,6 +3455,9 @@ private:
         // CFlat spellings of one specialization agree on. Also the source of the C++ spelling a
         // template ARGUMENT needs, so it must round-trip through the header cache.
         std::string canonicalCtype;
+        std::string qualifiedName;
+        std::string file;
+        bool inScope = true;
         bool hasTrivialDefaultCtor = false;
         bool hasTrivialCopyCtor = false;
         bool hasTrivialDtor = true;
@@ -5033,6 +5040,7 @@ private:
         bool explicitInstantiation = true;
     };
     std::string BuildCxxRequestIncludes(const CxxRequestGroup& group) const;
+    std::vector<std::string> BuildCxxRequestClangArgs(const CxxRequestGroup& group) const;
     std::string BuildCxxRequestMarkers(const std::vector<CxxRequestItem>& items,
                                        bool instantiateAll) const;
     std::string BuildCxxRequestPrologue(const CxxRequestGroup& group,
@@ -5060,13 +5068,28 @@ private:
     // Cache identity of one C++ type request; see the definition for what it folds in.
     std::string CxxTypeRequestCacheKey(const CxxRequestGroup& group,
                                        const std::string& cxxSpelling,
-                                       const std::string& extraSource = {}) const;
+                                       const std::string& requestSource,
+                                       const std::vector<std::string>& clangArgs,
+                                       bool emitDefinitions) const;
     std::string CxxTypeRequestCacheKey(const CxxRequestGroup& group, const CxxRequestItem& item,
-                                       const std::string& extraSource = {}) const;
+                                       const std::string& requestSource,
+                                       const std::vector<std::string>& clangArgs,
+                                       bool emitDefinitions) const;
+    bool TryLoadCxxTypeRequestCache(const CxxRequestGroup& group,
+                                    const std::string& requestKey,
+                                    bool emitDefinitions,
+                                    CFileSigCacheEntry& out,
+                                    std::string& missReason);
+    void StoreCxxTypeRequestCache(const CxxRequestGroup& group,
+                                  const std::string& requestKey,
+                                  bool emitDefinitions,
+                                  CFileSigCacheEntry&& entry,
+                                  bool allowDisk);
 
     // Import-group plumbing for the request layer.
     size_t FindOrAddCxxImportGroup(const std::vector<std::string>& headers,
-                                   const std::vector<std::string>& defines);
+                                   const std::vector<std::string>& defines,
+                                   bool diskCache = false);
     CxxRequestGroup MakeCxxRequestGroup(size_t primary, const std::vector<size_t>& deps) const;
     void PublishCxxGroupNames(size_t group, const std::vector<CRecordEntry>& records);
     void RegisterCxxFunctionTemplates(
@@ -5150,6 +5173,7 @@ private:
     bool CxxGroupHeaderStamp(const CxxRequestGroup& group,
                              std::filesystem::file_time_type& newest) const;
     uint64_t CxxGroupHeaderHash(const CxxRequestGroup& group) const;
+    static cflat_cinterop::RawRecord RawRecordFromCxxCache(const CRecordEntry& cached);
     bool RequestGeneratedCxxWrapper(const CxxRequestGroup& group,
                                     const std::string& wrapperSource,
                                     const std::string& wrapperName,
@@ -9470,14 +9494,23 @@ public:
         uint64_t diskKey,
         std::filesystem::file_time_type mtime,
         uint64_t contentHash,
-        CFileSigCacheEntry& out);
+        CFileSigCacheEntry& out,
+        const std::string& expectedRequestKey = {},
+        bool requireBitcode = false,
+        std::string* missReason = nullptr,
+        bool removeOnMiss = true);
 
     static void WriteCHeaderDiskCache(
         const std::filesystem::path& cacheDir,
         uint64_t diskKey,
         std::filesystem::file_time_type mtime,
         uint64_t contentHash,
-        const CFileSigCacheEntry& entry);
+        const CFileSigCacheEntry& entry,
+        const std::string& requestKey = {},
+        const CxxRequestGroup* requestGroup = nullptr);
+
+    static void PruneCxxTypeRequestDiskCache(const std::filesystem::path& cacheDir,
+                                             const CxxRequestGroup& group);
 
     // Handle `import package-vcpkg "header" from "port[features]";`. Resolves the port
     // through the user-owned vcpkg.json, pushes the resulting include dir / libs / DLLs

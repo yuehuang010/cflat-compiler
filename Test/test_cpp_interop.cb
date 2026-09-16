@@ -187,31 +187,31 @@
 // fixture header is a plain .h). The header supplies the declarations, the .cpp is compiled
 // by the host C++ driver and linked in. Both are needed: the header alone has no
 // definitions, and the source alone would not exercise the header-extraction path.
-import cpp "library/cpp_interop_basic.h";
-import cpp "library/cpp_interop_basic.cpp";
+import cpp "library/cpp_interop_basic.h" cache;
+import cpp "library/cpp_interop_basic.cpp" cache;
 // Section M6: inheritance and virtual dispatch. Definitions are out-of-line on purpose - every
 // virtual function needs a real symbol and the vtable needs a key function.
-import cpp "library/cpp_interop_poly.h";
-import cpp "library/cpp_interop_poly.cpp";
+import cpp "library/cpp_interop_poly.h" cache;
+import cpp "library/cpp_interop_poly.cpp" cache;
 // Section M7: HEADER-ONLY C++ - no .cpp anywhere. Every definition is inline in the header, so
 // clang CodeGen has to emit the bodies, vtables and inline statics into the companion module.
 // The second header re-includes the first from a DIFFERENT import group, which is the
 // duplicate-definition (ODR merge) check.
-import cpp "library/cpp_interop_inline.h";
-import cpp "library/cpp_interop_inline_again.h";
+import cpp "library/cpp_interop_inline.h" cache;
+import cpp "library/cpp_interop_inline_again.h" cache;
 // Section M8: one header-only CLASS TEMPLATE pattern. No specialization has a symbol anywhere
 // until a CFlat declaration asks for one, so every M8 assertion also proves the instantiation
 // path emitted the bodies. Section M9 needs no fixture at all - the libc++ headers are the
 // fixture, reached by the SYSTEM header spelling below.
 import cpp "library/cpp_interop_tpl.h" cache;
-import cpp "library/cpp_interop_by_value.h";
-import cpp "vector";
-import cpp "tuple";
-import cpp "mutex";
-import cpp "chrono";
-import cpp "string";
-import cpp "functional";
-import cpp "library/cpp_interop_throw.h";
+import cpp "library/cpp_interop_by_value.h" cache;
+import cpp "vector" cache;
+import cpp "tuple" cache;
+import cpp "mutex" cache;
+import cpp "chrono" cache;
+import cpp "string" cache;
+import cpp "functional" cache;
+import cpp "library/cpp_interop_throw.h" cache;
 import "list.cb";
 import "thread.cb";
 import "malloc_allocator.cb";

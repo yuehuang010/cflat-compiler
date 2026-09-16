@@ -258,6 +258,24 @@ This is **distinct** from the `import package-vcpkg` cache, which is co-located 
 `vcpkg_installed/.cflat-cache/` (a vcpkg package is already version-pinned, so it caches
 unconditionally). Headers without a `cache` clause are never disk-cached.
 
+### C++ type-request cache
+
+An opted-in C++ import also persists the clang-side result of each type request (class-template
+specialization, function-template wrapper, or generated `[cpp] struct`) beside the owning header
+entry. The request JSON contains only the extracted records and signatures; its companion module
+is stored as a validated raw `<key>.bc` sidecar. Registration state is always rebuilt in the
+current process, so identities, using-directives, and spelling maps do not cross compilations.
+
+The request key includes the complete generated request source without the PCH, the owning
+group's header stamp, clang driver arguments, compiler build stamp, and whether definitions are
+emitted. A changed header, argument set, compiler, or emit mode is therefore a miss. Missing,
+truncated, or hash-mismatched sidecars are misses and are rewritten with the request entry.
+
+Request entries are written only for successful, non-empty compile requests. Tentative requests,
+`--run`, and LSP analysis are read-only; LSP never writes request entries. Request entries are
+pruned with the owning header entry, and changing the cache format invalidates both together.
+With `-v`, each request reports a hit or a miss and the miss reason.
+
 ## macOS
 
 On macOS the cache directory is `~/.cflat` (no `%USERPROFILE%` env var). `cflat --init`
@@ -280,6 +298,11 @@ not discovered via a VS/SDK scan), so that section of the Windows cache does not
 - **Cache not taking effect**: run `cflat.exe --init` (or `--init-local`) to rebuild it after an update.
 - **Unexpected errors after update**: run `cflat.exe --init-clear` to delete both the per-user
   and local caches, then re-run `--init` (or `--init-local`).
+- **C++ import order changes a narrow enum result**: clear and warm the local cache, compile a
+  cached C++ probe twice, then compile the cached C++ fixture; repeat with the fixture first. Both
+  orders must preserve the enum's unsigned backing (for example, `enum class Small8 : unsigned
+  char` must return 200, not -56). A cache hit must replay the same signature type facts as a cold
+  extraction; if it does not, clear the cache after upgrading cflat so the cache format is rebuilt.
 - **Wondering which cache a compile is using**: pass `-v` and look for
   `[verbose] cache dir: <path> (rule: override|CFLAT_CACHE_DIR|local|per-user)`, followed by
   `[verbose] core bitcode cache: hit/miss`. A populated `<exe dir>/.cflat` from an old

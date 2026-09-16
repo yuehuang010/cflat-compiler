@@ -2743,6 +2743,9 @@ void LLVMBackend::MapRawRecords(const cflat_cinterop::ExtractResult& raw, std::v
             rec.isTrivial = r.isTrivial;
             rec.line = r.line ? r.line : 1; rec.col = r.col < 0 ? 0 : r.col;
             rec.uuid = r.uuid;
+            rec.qualifiedName = r.qualifiedName;
+            rec.file = r.file;
+            rec.inScope = r.inScope;
             rec.isPolymorphic = r.isPolymorphic; rec.hasBases = r.hasBases;
             rec.hasVirtualBases = r.hasVirtualBases; rec.isAbstract = r.isAbstract;
             rec.bases = r.bases; rec.layoutRefusal = r.layoutRefusal;
@@ -3574,6 +3577,17 @@ std::string LLVMBackend::BuildCxxRequestIncludes(const CxxRequestGroup& group) c
         return src;
     }
 
+std::vector<std::string> LLVMBackend::BuildCxxRequestClangArgs(
+    const CxxRequestGroup& group) const
+{
+        std::string primaryDir;
+        for (const auto& h : group.headers)
+            if (!IsSystemCxxHeaderPath(h))
+            { primaryDir = std::filesystem::path(h).parent_path().string(); break; }
+        return BuildClangDriverArgs(primaryDir, group.defines, /*errorRecovery*/ true,
+                                    /*asCxx*/ true);
+    }
+
 // The marker typedefs and explicit instantiations alone - everything the include prologue does
 // not cover. This is the whole source of a request TU whose prologue rides in a PCH.
 std::string LLVMBackend::BuildCxxRequestMarkers(const std::vector<CxxRequestItem>& items,
@@ -3971,12 +3985,7 @@ bool LLVMBackend::RunCxxTypeRequests(const CxxRequestGroup& group,
         req.verbose = verbose;
         for (const CxxRequestItem& item : items)
             req.cxxTypeRequests.push_back({ item.cxxSpelling, item.cflatName });
-        std::string primaryDir;
-        for (const auto& h : group.headers)
-            if (!IsSystemCxxHeaderPath(h))
-            { primaryDir = std::filesystem::path(h).parent_path().string(); break; }
-        req.args = BuildClangDriverArgs(primaryDir, group.defines, /*errorRecovery*/ true,
-                                        /*asCxx*/ true);
+        req.args = BuildCxxRequestClangArgs(group);
         const std::string pch = EnsureCxxRequestPch(group, req.args);
         if (!pch.empty())
         {
@@ -4006,41 +4015,48 @@ bool LLVMBackend::RunCxxTypeRequests(const CxxRequestGroup& group,
 
 /*
  * Identity of a C++ type request: the OWNING import group's headers and defines (never every C++
- * header imported so far), the C++ include dirs, the instantiation spelling, the emit mode (an LSP
- * bind carries no bodies and an empty companion module, which a compile must never reuse), and the
+ * header imported so far), the C++ include dirs, the CFlat and C++ instantiation spellings, the
+ * emit mode (an LSP bind carries no bodies and an empty companion module, which a compile must
+ * never reuse), and the
  * compiler build stamp. Shares the C header signature cache, so it shares its row budget and its
  * LRU/root pinning.
  */
 std::string LLVMBackend::CxxTypeRequestCacheKey(const CxxRequestGroup& group,
                                                 const std::string& cxxSpelling,
-                                                const std::string& extraSource) const
+                                                const std::string& requestSource,
+                                                const std::vector<std::string>& clangArgs,
+                                                bool emitDefinitions) const
 {
         std::string key = "|RQ" + cxxSpelling;
         for (const auto& h : group.headers)     key += "|H" + h;
         for (const auto& inc : cIncludeDirs_)   key += "|I" + inc;
         for (const auto& def : cDefines_)       key += "|D" + def;
         for (const auto& def : group.defines)   key += "|d" + def;
-        key += symbolSink_ == nullptr ? "|EDEF" : "|EDECL";
-        key += "|M13F";
-        key += "|C" + CompilerBuildStamp();
-        if (!extraSource.empty())
+        std::filesystem::file_time_type stamp{};
+        if (CxxGroupHeaderStamp(group, stamp))
+            key += "|T" + std::to_string((long long)stamp.time_since_epoch().count());
+        key += emitDefinitions ? "|EDEF" : "|EDECL";
+        uint64_t sourceHash = 14695981039346656037ULL;
+        for (unsigned char byte : requestSource)
         {
-            uint64_t hash = 14695981039346656037ULL;
-            for (unsigned char byte : extraSource)
-            {
-                hash ^= byte;
-                hash *= 1099511628211ULL;
-            }
-            key += std::format("|X{:016x}", hash);
+            sourceHash ^= byte;
+            sourceHash *= 1099511628211ULL;
         }
+        key += std::format("|S{:016x}-{}", sourceHash, requestSource.size());
+        for (const auto& arg : clangArgs) key += "|A" + arg;
+        key += "|C" + CompilerBuildStamp();
         return key;
     }
 
 std::string LLVMBackend::CxxTypeRequestCacheKey(const CxxRequestGroup& group,
                                                 const CxxRequestItem& item,
-                                                const std::string& extraSource) const
+                                                const std::string& requestSource,
+                                                const std::vector<std::string>& clangArgs,
+                                                bool emitDefinitions) const
 {
-        return CxxTypeRequestCacheKey(group, item.cxxSpelling, extraSource)
+        return CxxTypeRequestCacheKey(group, item.cxxSpelling, requestSource, clangArgs,
+                                      emitDefinitions)
+             + "|F" + item.cflatName
              + (item.needDefinitions ? "|FULL" : "|LAYOUT")
              + (item.explicitInstantiation ? "|INST" : "|NOINST");
     }
@@ -4072,20 +4088,233 @@ uint64_t LLVMBackend::CxxGroupHeaderHash(const CxxRequestGroup& group) const
         return combined;
     }
 
+ cflat_cinterop::RawRecord LLVMBackend::RawRecordFromCxxCache(const CRecordEntry& cached)
+{
+        cflat_cinterop::RawRecord raw;
+        raw.name = cached.name;
+        raw.isUnion = cached.isUnion;
+        raw.isCxx = cached.isCxx;
+        raw.isPacked = cached.isPacked;
+        raw.sizeBytes = cached.sizeBytes;
+        raw.alignBytes = cached.alignBytes;
+        raw.isTrivial = cached.isTrivial;
+        raw.isTriviallyCopyable = cached.isTriviallyCopyable;
+        raw.isPolymorphic = cached.isPolymorphic;
+        raw.hasBases = cached.hasBases;
+        raw.hasVirtualBases = cached.hasVirtualBases;
+        raw.isAbstract = cached.isAbstract;
+        raw.bases = cached.bases;
+        raw.layoutRefusal = cached.layoutRefusal;
+        raw.canonicalCtype = cached.canonicalCtype;
+        raw.hasTrivialDefaultCtor = cached.hasTrivialDefaultCtor;
+        raw.hasTrivialCopyCtor = cached.hasTrivialCopyCtor;
+        raw.hasTrivialDtor = cached.hasTrivialDtor;
+        raw.paramDestroyedInCallee = cached.paramDestroyedInCallee;
+        raw.hasDeletedDefaultCtor = cached.hasDeletedDefaultCtor;
+        raw.hasDeletedCopyCtor = cached.hasDeletedCopyCtor;
+        raw.hasDefaultCtor = cached.hasDefaultCtor;
+        raw.hasCopyCtor = cached.hasCopyCtor;
+        raw.isAggregate = cached.isAggregate;
+        raw.members = cached.members;
+        raw.staticVars = cached.staticVars;
+        raw.qualifiedName = cached.qualifiedName.empty() ? cached.name : cached.qualifiedName;
+        raw.file = cached.file;
+        raw.inScope = cached.inScope;
+        raw.uuid = cached.uuid;
+        raw.line = cached.line;
+        raw.col = cached.col;
+        for (const CRecordFieldEntry& field : cached.fields)
+        {
+            cflat_cinterop::RawField rawField;
+            rawField.name = field.name;
+            rawField.ctype = field.ctype;
+            rawField.access = field.access;
+            rawField.isBitfield = field.isBitfield;
+            rawField.bitWidth = field.bitWidth;
+            rawField.offsetBytes = field.offsetBytes;
+            rawField.sizeBytes = field.sizeBytes;
+            rawField.alignBytes = field.alignBytes;
+            rawField.bitOffset = field.bitOffset;
+            raw.fields.push_back(std::move(rawField));
+        }
+        return raw;
+    }
+
+bool LLVMBackend::TryLoadCxxTypeRequestCache(const CxxRequestGroup& group,
+                                             const std::string& requestKey,
+                                             bool emitDefinitions,
+                                             CFileSigCacheEntry& out,
+                                             std::string& missReason)
+{
+        missReason = "missing entry";
+        const size_t labelEnd = requestKey.find("|H");
+        const std::string requestLabel = requestKey.starts_with("|RQ")
+            ? requestKey.substr(3, labelEnd == std::string::npos ? std::string::npos : labelEnd - 3)
+            : requestKey;
+        std::filesystem::file_time_type headerMtime{};
+        if (!CxxGroupHeaderStamp(group, headerMtime))
+        {
+            missReason = "header stamp unavailable";
+            if (verbose && group.diskCache)
+                llvm::errs() << std::format(
+                    "[verbose] C++ type request cache MISS for {} ({})\n",
+                    requestLabel, missReason);
+            return false;
+        }
+        const uint64_t headerHash = CxxGroupHeaderHash(group);
+        const std::string memoryPrefix = [&] {
+            std::string prefix = "|RQ" + requestLabel;
+            for (const auto& h : group.headers) prefix += "|H" + h;
+            for (const auto& inc : cIncludeDirs_) prefix += "|I" + inc;
+            for (const auto& def : cDefines_) prefix += "|D" + def;
+            for (const auto& def : group.defines) prefix += "|d" + def;
+            prefix += "|T" + std::to_string((long long)headerMtime.time_since_epoch().count());
+            prefix += emitDefinitions ? "|EDEF" : "|EDECL";
+            return prefix;
+        }();
+        {
+            std::lock_guard<std::mutex> lock(cFileSigCacheMutex_);
+            auto it = cFileSigCache_.find(requestKey);
+            if (it != cFileSigCache_.end())
+            {
+                if ((it->second.mtime == headerMtime || it->second.hash == headerHash)
+                    && (!emitDefinitions || !it->second.cxxBitcode.empty()))
+                {
+                    it->second.mtime = headerMtime;
+                    TouchCFileSigEntry(requestKey, it->second);
+                    out = it->second;
+                    if (verbose) llvm::errs() << std::format(
+                        "[verbose] C++ type request cache HIT for {} (memory)\n", requestLabel);
+                    return true;
+                }
+                missReason = it->second.mtime == headerMtime || it->second.hash == headerHash
+                    ? "missing sidecar" : "header stamp";
+            }
+            // Imports without a cache clause retain the old batch behavior: one shared in-memory
+            // request TU answers every item in the batch. Disk-backed requests stay exact-source
+            // only, because a broad match would make stale wrappers silently win.
+            if (!group.diskCache)
+            {
+                auto best = cFileSigCache_.end();
+                for (auto candidate = cFileSigCache_.begin();
+                     candidate != cFileSigCache_.end(); ++candidate)
+                {
+                    if (candidate->first == requestKey
+                        || !candidate->first.starts_with(memoryPrefix)
+                        || !candidate->first.ends_with("|BATCH")) continue;
+                    if ((candidate->second.mtime != headerMtime
+                            && candidate->second.hash != headerHash)
+                        || (emitDefinitions && candidate->second.cxxBitcode.empty())) continue;
+                    if (best == cFileSigCache_.end()
+                        || candidate->second.lastUse > best->second.lastUse)
+                        best = candidate;
+                }
+                if (best != cFileSigCache_.end())
+                {
+                    TouchCFileSigEntry(best->first, best->second);
+                    out = best->second;
+                    if (verbose) llvm::errs() << std::format(
+                        "[verbose] C++ type request cache HIT for {} (batch memory)\n", requestLabel);
+                    return true;
+                }
+            }
+        }
+
+        const std::string cacheDir = GetCHeaderCacheDir();
+        if (!group.diskCache || cacheDir.empty())
+        {
+            if (verbose && group.diskCache)
+            {
+                missReason = "cache directory unavailable";
+                llvm::errs() << std::format(
+                    "[verbose] C++ type request cache MISS for {} ({})\n",
+                    requestLabel, missReason);
+            }
+            return false;
+        }
+        uint64_t diskKey = 14695981039346656037ULL;
+        for (unsigned char byte : requestKey)
+        {
+            diskKey ^= byte;
+            diskKey *= 1099511628211ULL;
+        }
+        CFileSigCacheEntry diskEntry;
+        std::string diskReason;
+        {
+            llvm::TimeTraceScope loadScope("CxxTypeRequestJsonLoad", requestKey);
+            if (!TryLoadCHeaderDiskCache(cacheDir, diskKey, headerMtime, headerHash, diskEntry,
+                                         requestKey, emitDefinitions, &diskReason,
+                                         !batchMode_ && !runMode_ && symbolSink_ == nullptr))
+            {
+                missReason = diskReason.empty() ? missReason : diskReason;
+                if (verbose) llvm::errs() << std::format(
+                    "[verbose] C++ type request cache MISS for {} ({})\n",
+                    requestLabel, missReason);
+                return false;
+            }
+        }
+        {
+            std::lock_guard<std::mutex> lock(cFileSigCacheMutex_);
+            InsertCFileSigEntry(requestKey, CFileSigCacheEntry(diskEntry), verbose);
+        }
+        out = std::move(diskEntry);
+        if (verbose) llvm::errs() << std::format(
+            "[verbose] C++ type request cache HIT for {} (disk)\n", requestLabel);
+        return true;
+    }
+
+void LLVMBackend::StoreCxxTypeRequestCache(const CxxRequestGroup& group,
+                                           const std::string& requestKey,
+                                           bool emitDefinitions,
+                                           CFileSigCacheEntry&& entry,
+                                           bool allowDisk)
+{
+        if (entry.sigs.empty() && entry.records.empty()) return;
+        std::filesystem::file_time_type headerMtime{};
+        if (!CxxGroupHeaderStamp(group, headerMtime)) return;
+        const uint64_t headerHash = CxxGroupHeaderHash(group);
+        entry.mtime = headerMtime;
+        entry.hash = headerHash;
+        {
+            std::lock_guard<std::mutex> lock(cFileSigCacheMutex_);
+            InsertCFileSigEntry(requestKey, CFileSigCacheEntry(entry), verbose);
+        }
+        if (!allowDisk || !group.diskCache || runMode_ || batchMode_
+            || retryingTentativeCxxType_ || symbolSink_ != nullptr) return;
+        if (emitDefinitions && entry.cxxBitcode.empty()) return;
+        const std::string cacheDir = GetCHeaderCacheDir();
+        if (cacheDir.empty()) return;
+        uint64_t diskKey = 14695981039346656037ULL;
+        for (unsigned char byte : requestKey)
+        {
+            diskKey ^= byte;
+            diskKey *= 1099511628211ULL;
+        }
+        WriteCHeaderDiskCache(cacheDir, diskKey, headerMtime, headerHash, entry, requestKey, &group);
+        if (verbose) llvm::errs() << std::format(
+            "[verbose] C++ type request cache STORE {} ({})\n",
+            requestKey, emitDefinitions ? "definitions" : "declarations");
+    }
+
 /*
  * One `import cpp` statement, identified by its ordered headers plus its defines - the same tuple
  * the header disk cache hashes. A second import of the same headers with the same defines is the
  * same group, so a repeated import does not split the request cache.
  */
 size_t LLVMBackend::FindOrAddCxxImportGroup(const std::vector<std::string>& headers,
-                                            const std::vector<std::string>& defines)
+                                            const std::vector<std::string>& defines,
+                                            bool diskCache)
 {
         for (size_t i = 0; i < cxxImportGroups_.size(); ++i)
             if (cxxImportGroups_[i].headers == headers && cxxImportGroups_[i].defines == defines)
+            {
+                cxxImportGroups_[i].diskCache |= diskCache;
                 return i;
+            }
         CxxImportGroup group;
         group.headers = headers;
         group.defines = defines;
+        group.diskCache = diskCache;
         cxxImportGroups_.push_back(std::move(group));
         return cxxImportGroups_.size() - 1;
     }
@@ -4103,6 +4332,9 @@ LLVMBackend::CxxRequestGroup LLVMBackend::MakeCxxRequestGroup(size_t primary,
         out.primary = primary;
         out.headers = cxxImportGroups_[primary].headers;
         out.defines = cxxImportGroups_[primary].defines;
+        out.ownerHeaders = out.headers;
+        out.ownerDefines = out.defines;
+        out.diskCache = cxxImportGroups_[primary].diskCache;
         std::vector<size_t> sorted;
         for (size_t d : deps)
             if (d != primary && d < cxxImportGroups_.size()
@@ -4547,25 +4779,20 @@ bool LLVMBackend::RequestGeneratedCxxWrapper(const CxxRequestGroup& group,
         std::vector<CSigEntry> requestSigs;
         std::string requestBitcode;
         bool cached = false;
-        std::filesystem::file_time_type headerMtime{};
-        const bool haveMtime = CxxGroupHeaderStamp(group, headerMtime);
-        const std::string requestKey = CxxTypeRequestCacheKey(group, wrapperSource)
+        const std::string requestSource = BuildCxxRequestPrologue(group, {}, false) + wrapperSource;
+        const std::vector<std::string> requestArgs = BuildCxxRequestClangArgs(group);
+        const std::string requestKey =
+            CxxTypeRequestCacheKey(group, wrapperName, requestSource, requestArgs, emitDefinitions)
             + "|" + cacheTag + "|FULL";
-        if (haveMtime)
+        CFileSigCacheEntry cachedEntry;
+        std::string missReason;
+        if (TryLoadCxxTypeRequestCache(group, requestKey, emitDefinitions, cachedEntry, missReason))
         {
-            std::lock_guard<std::mutex> lock(cFileSigCacheMutex_);
-            auto it = cFileSigCache_.find(requestKey);
-            if (it != cFileSigCache_.end()
-                && (it->second.mtime == headerMtime || it->second.hash == CxxGroupHeaderHash(group)))
-            {
-                it->second.mtime = headerMtime;
-                TouchCFileSigEntry(requestKey, it->second);
-                requestSigs = it->second.sigs;
-                requestBitcode = it->second.cxxBitcode;
-                SetCInteropTargetFacts(it->second.longDoubleWidth,
-                                       it->second.longDoubleIsIEEEDouble, it->second.targetTriple);
-                cached = true;
-            }
+            requestSigs = cachedEntry.sigs;
+            requestBitcode = cachedEntry.cxxBitcode;
+            SetCInteropTargetFacts(cachedEntry.longDoubleWidth,
+                                   cachedEntry.longDoubleIsIEEEDouble, cachedEntry.targetTriple);
+            cached = true;
         }
         if (!cached)
         {
@@ -4581,11 +4808,7 @@ bool LLVMBackend::RequestGeneratedCxxWrapper(const CxxRequestGroup& group,
                 req.skipFunctionBodies = false;
                 req.requireInScope = false;
                 req.cxxFunctionWrapperNames = { wrapperName };
-                std::string primaryDir;
-                for (const auto& h : group.headers)
-                    if (!IsSystemCxxHeaderPath(h))
-                    { primaryDir = std::filesystem::path(h).parent_path().string(); break; }
-                req.args = BuildClangDriverArgs(primaryDir, group.defines, true, true);
+                req.args = requestArgs;
                 const std::string pch = EnsureCxxRequestPch(group, req.args);
                 if (!pch.empty())
                 {
@@ -4667,21 +4890,21 @@ bool LLVMBackend::RequestGeneratedCxxWrapper(const CxxRequestGroup& group,
                 return false;
             }
             requestSigs.push_back(std::move(mapped));
+            if (requestSigs.size() != 1 || !requestSigs.front().isCxx)
+            {
+                error = "the generated wrapper was not extracted";
+                return false;
+            }
             requestBitcode = raw.bitcode;
             SetCInteropTargetFacts(raw);
-            if (haveMtime)
-            {
-                CFileSigCacheEntry entry;
-                entry.mtime = headerMtime;
-                entry.hash = CxxGroupHeaderHash(group);
-                entry.longDoubleWidth = raw.longDoubleWidth;
-                entry.longDoubleIsIEEEDouble = raw.longDoubleIsIEEEDouble;
-                entry.targetTriple = raw.targetTriple;
-                entry.sigs = requestSigs;
-                entry.cxxBitcode = requestBitcode;
-                std::lock_guard<std::mutex> lock(cFileSigCacheMutex_);
-                InsertCFileSigEntry(requestKey, std::move(entry), verbose);
-            }
+            CFileSigCacheEntry entry;
+            entry.longDoubleWidth = raw.longDoubleWidth;
+            entry.longDoubleIsIEEEDouble = raw.longDoubleIsIEEEDouble;
+            entry.targetTriple = raw.targetTriple;
+            entry.sigs = requestSigs;
+            entry.cxxBitcode = requestBitcode;
+            StoreCxxTypeRequestCache(group, requestKey, emitDefinitions, std::move(entry),
+                                     /*allowDisk*/ raw.firstError.empty());
         }
         if (requestSigs.size() != 1 || !requestSigs.front().isCxx)
         {
@@ -6848,73 +7071,131 @@ bool LLVMBackend::RequestCxxForeignType(const std::string& cflatName, const std:
         item.cxxSpelling = cxxSpelling;
         item.needDefinitions = needDefinitions;
         item.explicitInstantiation = explicitInstantiation;
-        const std::string requestKey = CxxTypeRequestCacheKey(group, item, prefixSource);
-        std::filesystem::file_time_type headerMtime{};
-        const bool haveMtime = CxxGroupHeaderStamp(group, headerMtime);
+        const std::vector<CxxRequestItem> single{ item };
+        const std::vector<std::string> requestArgs = BuildCxxRequestClangArgs(group);
+        const std::string probeSource = BuildCxxRequestIncludes(group) + prefixSource
+            + BuildCxxRequestMarkers(single, /*instantiateAll*/ true);
+        const std::string probeKey =
+            CxxTypeRequestCacheKey(group, item, probeSource, requestArgs, /*emitDefinitions*/ false);
+        std::string requestKey = probeKey;
 
         std::vector<CRecordEntry> records;
         std::vector<CSigEntry> requestSigs;
         std::string requestBitcode;
+        cflat_cinterop::ExtractResult probe;
         bool cached = false;
-        if (haveMtime)
+        bool finalCached = false;
         {
-            std::lock_guard<std::mutex> lock(cFileSigCacheMutex_);
-            auto it = cFileSigCache_.find(requestKey);
-            if (it != cFileSigCache_.end()
-                && (it->second.mtime == headerMtime || it->second.hash == CxxGroupHeaderHash(group)))
+            CFileSigCacheEntry cachedEntry;
+            std::string missReason;
+            if (TryLoadCxxTypeRequestCache(group, probeKey, /*emitDefinitions*/ false,
+                                           cachedEntry, missReason)
+                && !cachedEntry.records.empty())
             {
-                it->second.mtime = headerMtime;
-                TouchCFileSigEntry(requestKey, it->second);
-                records = it->second.records;
-                requestSigs = it->second.sigs;
-                requestBitcode = it->second.cxxBitcode;
-                SetCInteropTargetFacts(it->second.longDoubleWidth,
-                                       it->second.longDoubleIsIEEEDouble,
-                                       it->second.targetTriple);
+                records = cachedEntry.records;
+                requestSigs = cachedEntry.sigs;
+                requestBitcode = cachedEntry.cxxBitcode;
+                SetCInteropTargetFacts(cachedEntry.longDoubleWidth,
+                                       cachedEntry.longDoubleIsIEEEDouble,
+                                       cachedEntry.targetTriple);
+                for (const CRecordEntry& record : records)
+                    probe.records.push_back(RawRecordFromCxxCache(record));
                 cached = true;
             }
         }
-        if (cached && verbose)
-            std::cout << std::format("[verbose] C++ type request cache hit for {}\n", cxxSpelling);
+
+        auto findRequestedRecord = [&](const std::vector<cflat_cinterop::RawRecord>& list)
+            -> const cflat_cinterop::RawRecord* {
+            for (const auto& r : list)
+                if (r.name == cflatName || r.qualifiedName == cflatName) return &r;
+            const std::string requestedIdentity =
+                cflat_cinterop::CxxForeignIdentity(cxxSpelling);
+            for (const auto& r : list)
+                if ((!requestedIdentity.empty() && r.name == requestedIdentity)
+                    || (!r.canonicalCtype.empty()
+                        && cflat_cinterop::CxxForeignIdentity(r.canonicalCtype)
+                           == requestedIdentity))
+                    return &r;
+            return nullptr;
+        };
+        auto findRegisteredRecord = [&](const std::vector<CRecordEntry>& list)
+            -> const CRecordEntry* {
+            for (const auto& r : list)
+                if (r.name == cflatName || r.qualifiedName == cflatName) return &r;
+            const std::string requestedIdentity =
+                cflat_cinterop::CxxForeignIdentity(cxxSpelling);
+            for (const auto& r : list)
+                if ((!requestedIdentity.empty() && r.name == requestedIdentity)
+                    || (!r.canonicalCtype.empty()
+                        && cflat_cinterop::CxxForeignIdentity(r.canonicalCtype)
+                           == requestedIdentity))
+                    return &r;
+            return nullptr;
+        };
+        auto publishRequestSpelling = [&](const std::string& canonical) {
+            auto known = cxxForeignTypeSpellings_.find(SqueezeCxxSpelling(canonical));
+            const std::string mappedName = known == cxxForeignTypeSpellings_.end()
+                || isUnparameterizedTemplateHit(known->second, canonical)
+                ? cflatName : known->second;
+            if (!canonical.empty())
+                cxxForeignTypeSpellings_[SqueezeCxxSpelling(canonical)] = mappedName;
+            cxxForeignTypeSpellings_[SqueezeCxxSpelling(cxxSpelling)] = mappedName;
+            cxxCflatToCxxSpelling_[cflatName] = cxxSpelling;
+        };
 
         // Counted per spelling in the trace, cache-hit replays included, so request counts stay
         // comparable across runs; a replay is marked so the two are told apart.
         llvm::TimeTraceScope scope("CxxTypeRequest",
                                    cached ? cxxSpelling + " (cache)" : cxxSpelling);
 
-        if (!cached)
+        if (!cached || needDefinitions)
         {
-            const std::vector<CxxRequestItem> single{ item };
-            // Stage 1: the member list and their canonical signatures. No CodeGen.
-            cflat_cinterop::ExtractResult probe;
+            if (!cached)
             {
-                llvm::TimeTraceScope stage1("CxxRequestStage1", cxxSpelling);
-                if (!RunCxxTypeRequests(group, single, /*extraSource*/ {},
-                                        /*emitDefinitions*/ false, probe, error, prefixSource))
+                // Stage 1: the member list and their canonical signatures. No CodeGen.
+                {
+                    llvm::TimeTraceScope stage1("CxxRequestStage1", cxxSpelling);
+                    if (!RunCxxTypeRequests(group, single, /*extraSource*/ {},
+                                            /*emitDefinitions*/ false, probe, error, prefixSource))
+                        return fail(std::format("C++ type '{}' could not be parsed: {}",
+                                                cxxSpelling, error));
+                }
+                if (rejectClangErrors && !probe.firstError.empty())
                     return fail(std::format("C++ type '{}' could not be parsed: {}",
-                                            cxxSpelling, error));
+                                            cxxSpelling, FirstCxxErrorLine(probe.firstError)));
+                if (probe.records.empty())
+                    return fail(std::format("'{}' does not name a C++ class type in the imported headers",
+                                            cxxSpelling));
             }
-            if (rejectClangErrors && !probe.firstError.empty())
-                return fail(std::format("C++ type '{}' could not be parsed: {}",
-                                        cxxSpelling, FirstCxxErrorLine(probe.firstError)));
-            if (probe.records.empty())
-                return fail(std::format("'{}' does not name a C++ class type in the imported headers",
+            const auto* probeTarget = findRequestedRecord(probe.records);
+            if (probeTarget == nullptr)
+                return fail(std::format("C++ type '{}' was not present in its request result",
                                         cxxSpelling));
-            const auto findRequestedRecord = [&](const std::vector<cflat_cinterop::RawRecord>& list)
-                -> const cflat_cinterop::RawRecord& {
-                for (const auto& r : list)
-                    if (r.name == cflatName) return r;
-                return list.front();
-            };
-            const auto& probeTarget = findRequestedRecord(probe.records);
 
             // The member-signature types exposed by this class are known before its stage 2.
             // Batch the owner and those nested requests so one frontend supplies all ODR-uses.
             std::vector<CRecordEntry> probeRecords;
             MapRawRecords(probe, probeRecords);
+            if (!cached)
+            {
+                CFileSigCacheEntry entry;
+                entry.longDoubleWidth = probe.longDoubleWidth;
+                entry.longDoubleIsIEEEDouble = probe.longDoubleIsIEEEDouble;
+                entry.targetTriple = probe.targetTriple;
+                entry.records = probeRecords;
+                for (const auto& rawSig : probe.sigs)
+                {
+                    CSigEntry sig;
+                    if (MapRawSig(rawSig, sig)) entry.sigs.push_back(std::move(sig));
+                }
+                if (!probeRecords.empty())
+                    StoreCxxTypeRequestCache(group, probeKey, /*emitDefinitions*/ false,
+                                             std::move(entry),
+                                             /*allowDisk*/ !tentative && probe.firstError.empty());
+            }
             std::vector<CxxRequestItem> memberItems;
             CollectCxxMemberRequestItems(probeRecords, memberItems);
-            if (!memberItems.empty())
+            if (!memberItems.empty() && !cached)
             {
                 std::vector<CxxRequestItem> batchItems;
                 batchItems.reserve(memberItems.size() + 1);
@@ -6922,21 +7203,6 @@ bool LLVMBackend::RequestCxxForeignType(const std::string& cflatName, const std:
                 for (CxxRequestItem& memberItem : memberItems)
                     batchItems.push_back(std::move(memberItem));
                 PrewarmCxxRequestBatch(batchItems);
-                bool batchComplete = true;
-                for (const CxxRequestItem& batchItem : batchItems)
-                {
-                    std::lock_guard<std::mutex> lock(cFileSigCacheMutex_);
-                    if (cFileSigCache_.find(CxxTypeRequestCacheKey(group, batchItem))
-                        == cFileSigCache_.end())
-                    {
-                        batchComplete = false;
-                        break;
-                    }
-                }
-                if (batchComplete)
-                    return RequestCxxForeignType(cflatName, cxxSpelling, error,
-                                                 needDefinitions, explicitInstantiation, tentative,
-                                                 extraSource, prefixSource);
             }
 
             cflat_cinterop::ExtractResult raw;
@@ -6950,84 +7216,124 @@ bool LLVMBackend::RequestCxxForeignType(const std::string& cflatName, const std:
              * diagnostics match the compiler's.
              */
             {
+                const std::string stage2Extra =
+                    CxxRequestOdrUsePreamble()
+                    + BuildCxxRequestOdrUses(*probeTarget, "__cflat_req_0", "")
+                    + BuildCxxRequestInheritedOdrUses(probe.records, *probeTarget,
+                                                      "__cflat_req_0", "")
+                    + BuildStdFunctionCtorUse(cxxSpelling, "__cflat_req_0")
+                    + BuildCxxDefaultWrappers({}, probe.records)
+                    + BuildCxxVirtualThunks(probe.records);
+                const std::string stage2Source =
+                    BuildCxxRequestIncludes(group) + prefixSource
+                    + BuildCxxRequestMarkers(single, /*instantiateAll*/ false)
+                    + stage2Extra;
+                requestKey =
+                    CxxTypeRequestCacheKey(group, item, stage2Source, requestArgs,
+                                           /*emitDefinitions*/ true);
+                if (verbose)
+                    llvm::errs() << std::format(
+                        "[verbose] C++ type request stage-2 key for {}: {}\n",
+                        cxxSpelling, requestKey);
+                CFileSigCacheEntry cachedEntry;
+                std::string missReason;
+                if (TryLoadCxxTypeRequestCache(group, requestKey, /*emitDefinitions*/ true,
+                                               cachedEntry, missReason))
+                {
+                    records = std::move(cachedEntry.records);
+                    requestSigs = std::move(cachedEntry.sigs);
+                    requestBitcode = std::move(cachedEntry.cxxBitcode);
+                    SetCInteropTargetFacts(cachedEntry.longDoubleWidth,
+                                           cachedEntry.longDoubleIsIEEEDouble,
+                                           cachedEntry.targetTriple);
+                    finalCached = true;
+                }
+                if (!finalCached)
+                {
+                records.clear();
+                requestSigs.clear();
+                requestBitcode.clear();
                 llvm::TimeTraceScope stage2("CxxRequestStage2", cxxSpelling);
                 std::string err2;
                 cflat_cinterop::ExtractResult emitted;
-                const std::string memberDefaultWrappers =
-                    BuildCxxDefaultWrappers({}, probe.records);
                 const bool emittedOk = RunCxxTypeRequests(group, single,
-                                      CxxRequestOdrUsePreamble()
-                                      + BuildCxxRequestOdrUses(probeTarget, "__cflat_req_0", "")
-                                      + BuildCxxRequestInheritedOdrUses(probe.records, probeTarget,
-                                                                        "__cflat_req_0", "")
-                                      + BuildStdFunctionCtorUse(cxxSpelling, "__cflat_req_0")
-                                      + memberDefaultWrappers
-                                      + BuildCxxVirtualThunks(probe.records),
+                                      stage2Extra,
                                       /*emitDefinitions*/ true, emitted, err2, prefixSource);
                 if (emittedOk && !emitted.records.empty())
                     raw = std::move(emitted);
+                }
             }
             }
             else
                 raw = std::move(probe);
-            if (rejectClangErrors && !raw.firstError.empty())
+            if (!finalCached && rejectClangErrors && !raw.firstError.empty())
                 return fail(std::format("C++ type '{}' could not be parsed: {}",
                                         cxxSpelling, FirstCxxErrorLine(raw.firstError)));
-            for (const std::string& dropped : raw.droppedCxxDefaultWrappers)
-                for (auto& record : raw.records)
-                    for (auto& member : record.members)
-                        for (size_t n = 0; n < member.defaultArgs.size(); ++n)
-                            if (CxxDefaultWrapperName(member.linkageName, n) == dropped)
-                            {
-                                member.defaultArgs[n].kind = "unsupported";
-                                member.defaultArgs[n].value.clear();
-                            }
-            if (!raw.records.empty())
+            if (!finalCached && raw.records.empty())
+                return fail(std::format("'{}' does not name a C++ class type in the imported headers",
+                                        cxxSpelling));
+            if (!finalCached)
             {
-                const auto& rawTarget = findRequestedRecord(raw.records);
-                const std::string canonical = rawTarget.canonicalCtype;
-                auto known = cxxForeignTypeSpellings_.find(SqueezeCxxSpelling(canonical));
-                const std::string mappedName = known == cxxForeignTypeSpellings_.end()
-                    || isUnparameterizedTemplateHit(known->second, canonical)
-                    ? cflatName : known->second;
-                if (!canonical.empty())
-                    cxxForeignTypeSpellings_[SqueezeCxxSpelling(canonical)] = mappedName;
-                cxxForeignTypeSpellings_[SqueezeCxxSpelling(cxxSpelling)] = mappedName;
-                cxxCflatToCxxSpelling_[cflatName] = cxxSpelling;
+                for (const std::string& dropped : raw.droppedCxxDefaultWrappers)
+                    for (auto& record : raw.records)
+                        for (auto& member : record.members)
+                            for (size_t n = 0; n < member.defaultArgs.size(); ++n)
+                                if (CxxDefaultWrapperName(member.linkageName, n) == dropped)
+                                {
+                                    member.defaultArgs[n].kind = "unsupported";
+                                    member.defaultArgs[n].value.clear();
+                                }
             }
-            SetCInteropTargetFacts(raw);
-            MapRawRecords(raw, records);
-            for (const auto& rawSig : raw.sigs)
+            if (!finalCached && !raw.records.empty())
             {
-                CSigEntry sig;
-                if (MapRawSig(rawSig, sig)) requestSigs.push_back(std::move(sig));
+                const auto* rawTarget = findRequestedRecord(raw.records);
+                if (rawTarget == nullptr)
+                    return fail(std::format("C++ type '{}' was not present in its request result",
+                                            cxxSpelling));
+                publishRequestSpelling(rawTarget->canonicalCtype);
             }
-            requestBitcode = raw.bitcode;
-            if (haveMtime && !records.empty())
+            if (!finalCached)
             {
+                SetCInteropTargetFacts(raw);
+                MapRawRecords(raw, records);
+                for (const auto& rawSig : raw.sigs)
+                {
+                    CSigEntry sig;
+                    if (MapRawSig(rawSig, sig)) requestSigs.push_back(std::move(sig));
+                }
+            }
+            if (!finalCached)
+            {
+                requestBitcode = raw.bitcode;
                 CFileSigCacheEntry entry;
-                entry.mtime = headerMtime;
-                entry.hash  = CxxGroupHeaderHash(group);
                 entry.longDoubleWidth = raw.longDoubleWidth;
                 entry.longDoubleIsIEEEDouble = raw.longDoubleIsIEEEDouble;
                 entry.targetTriple = raw.targetTriple;
                 entry.sigs = requestSigs;
                 entry.records = records;
                 entry.cxxBitcode = requestBitcode;
-                std::lock_guard<std::mutex> lock(cFileSigCacheMutex_);
-                InsertCFileSigEntry(requestKey, std::move(entry), verbose);
+                StoreCxxTypeRequestCache(group, requestKey, needDefinitions,
+                                         std::move(entry),
+                                         /*allowDisk*/ !tentative && raw.firstError.empty());
             }
         }
         if (records.empty())
             return fail(std::format("'{}' does not name a C++ class type in the imported headers",
                                     cxxSpelling));
 
-        const auto& registeredTarget = [&]() -> const CRecordEntry& {
-            for (const auto& r : records)
-                if (r.name == cflatName) return r;
-            return records.front();
-        }();
-        const std::string canonical = registeredTarget.canonicalCtype;
+        if (finalCached || (cached && !needDefinitions))
+        {
+            const auto* cachedTarget = findRegisteredRecord(records);
+            if (cachedTarget == nullptr)
+                return fail(std::format("C++ type '{}' was not present in its cache result",
+                                        cxxSpelling));
+            publishRequestSpelling(cachedTarget->canonicalCtype);
+        }
+        const auto* registeredTarget = findRegisteredRecord(records);
+        if (registeredTarget == nullptr)
+            return fail(std::format("C++ type '{}' was not present in its mapped result",
+                                    cxxSpelling));
+        const std::string canonical = registeredTarget->canonicalCtype;
         if (!canonical.empty())
         {
             // Same canonical specialization under a second CFlat spelling (a typedef, or the same
@@ -7059,7 +7365,7 @@ bool LLVMBackend::RequestCxxForeignType(const std::string& cflatName, const std:
                 if (auto infoIt = cxxClasses_.find(known->second); infoIt != cxxClasses_.end()
                     && !infoIt->second.refusedMembers.empty())
                 {
-                    CRecordEntry rebound = registeredTarget;
+                    CRecordEntry rebound = *registeredTarget;
                     rebound.name = known->second;
                     std::vector<std::string> rebindable;
                     for (const auto& m : rebound.members)
@@ -7315,16 +7621,13 @@ void LLVMBackend::PrewarmCxxRequestBatch(std::vector<CxxRequestItem> items)
 {
         if (activeCxxRequestGroup_ == nullptr || activeCxxRequestGroup_->headers.empty()) return;
         const CxxRequestGroup& group = *activeCxxRequestGroup_;
-        std::filesystem::file_time_type headerMtime{};
-        if (!CxxGroupHeaderStamp(group, headerMtime)) return;
-        const uint64_t headerHash = CxxGroupHeaderHash(group);
-
+        // Disk-backed requests use exact per-item source keys. A shared batch source cannot be
+        // reproduced before its nested request closure is known, so leave that optimization to
+        // the in-memory path and let disk-backed requests use their per-item entries.
+        if (group.diskCache) return;
         auto alreadyKnown = [&](const CxxRequestItem& item) {
             if (cxxForeignRequests_.count(item.cflatName) != 0) return true;
-            std::lock_guard<std::mutex> lock(cFileSigCacheMutex_);
-            auto it = cFileSigCache_.find(CxxTypeRequestCacheKey(group, item));
-            return it != cFileSigCache_.end()
-                && (it->second.mtime == headerMtime || it->second.hash == headerHash);
+            return false;
         };
         std::vector<CxxRequestItem> pending;
         std::unordered_set<std::string> seen;
@@ -7344,10 +7647,13 @@ void LLVMBackend::PrewarmCxxRequestBatch(std::vector<CxxRequestItem> items)
          * Stage 1 to a fixpoint: each round adds the nested spellings the previous round's member
          * lists named (an iterator class, a pair<const K, V>) so they are instantiated in the same
          * TU as the type that exposes them.
-         */
+        */
         cflat_cinterop::ExtractResult probe;
+        std::string stage1Source;
         for (int round = 0; round < 3; ++round)
         {
+            stage1Source = BuildCxxRequestIncludes(group)
+                + BuildCxxRequestMarkers(pending, /*instantiateAll*/ true);
             cflat_cinterop::ExtractResult rounded;
             std::string error;
             {
@@ -7376,6 +7682,7 @@ void LLVMBackend::PrewarmCxxRequestBatch(std::vector<CxxRequestItem> items)
         // Stage 2: one CodeGen frontend with the ODR-uses of every spelling in the batch.
         cflat_cinterop::ExtractResult emitted;
         bool haveEmitted = false;
+        std::string stage2Source;
         std::vector<size_t> fullItems;
         for (size_t i = 0; i < pending.size(); ++i)
             if (pending[i].needDefinitions) fullItems.push_back(i);
@@ -7396,6 +7703,8 @@ void LLVMBackend::PrewarmCxxRequestBatch(std::vector<CxxRequestItem> items)
             }
             extra += BuildCxxDefaultWrappers({}, probe.records);
             extra += BuildCxxVirtualThunks(probe.records);
+            stage2Source = BuildCxxRequestIncludes(group)
+                + BuildCxxRequestMarkers(pending, /*instantiateAll*/ false) + extra;
             llvm::TimeTraceScope stage2("CxxRequestStage2", group.label);
             if (verbose)
                 for (size_t i : fullItems)
@@ -7437,7 +7746,8 @@ void LLVMBackend::PrewarmCxxRequestBatch(std::vector<CxxRequestItem> items)
                 cxxCflatToCxxSpelling_[item.cflatName] = item.cxxSpelling;
             }
         };
-        auto storeFrom = [&](const cflat_cinterop::ExtractResult& raw, bool withBitcode) {
+        auto storeFrom = [&](const cflat_cinterop::ExtractResult& raw, bool withBitcode,
+                             const std::string& requestSource) {
             // The published spellings exist only while this batch is mapped: registration itself
             // still runs through the normal request path, which decides what is already mapped.
             const auto savedSpellings = cxxForeignTypeSpellings_;
@@ -7495,17 +7805,18 @@ void LLVMBackend::PrewarmCxxRequestBatch(std::vector<CxxRequestItem> items)
                                              "({} record(s), {} signature(s))\n",
                                              pending[i].cxxSpelling, slice.size(), mine.size());
                 CFileSigCacheEntry entry;
-                entry.mtime = headerMtime;
-                entry.hash = headerHash;
                 entry.longDoubleWidth = raw.longDoubleWidth;
                 entry.longDoubleIsIEEEDouble = raw.longDoubleIsIEEEDouble;
                 entry.targetTriple = raw.targetTriple;
                 entry.sigs = std::move(mine);
                 entry.records = std::move(slice);
                 if (withBitcode) entry.cxxBitcode = raw.bitcode;
-                std::lock_guard<std::mutex> lock(cFileSigCacheMutex_);
-                InsertCFileSigEntry(CxxTypeRequestCacheKey(group, pending[i]), std::move(entry),
-                                    verbose);
+                const std::string key = CxxTypeRequestCacheKey(
+                    group, pending[i], requestSource, BuildCxxRequestClangArgs(group), withBitcode)
+                    + "|BATCH";
+                StoreCxxTypeRequestCache(group, key, withBitcode, std::move(entry),
+                                         /*allowDisk*/ raw.firstError.empty()
+                                             && (!withBitcode || !raw.bitcode.empty()));
             }
         };
         auto markDroppedDefaultWrappers = [](cflat_cinterop::ExtractResult& raw) {
@@ -7521,8 +7832,8 @@ void LLVMBackend::PrewarmCxxRequestBatch(std::vector<CxxRequestItem> items)
         };
         markDroppedDefaultWrappers(probe);
         if (haveEmitted) markDroppedDefaultWrappers(emitted);
-        storeFrom(probe, /*withBitcode*/ false);
-        if (haveEmitted) storeFrom(emitted, /*withBitcode*/ true);
+        storeFrom(probe, /*withBitcode*/ false, stage1Source);
+        if (haveEmitted) storeFrom(emitted, /*withBitcode*/ true, stage2Source);
     }
 
 /*
@@ -10939,7 +11250,7 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
         CxxRequestGroup cxxGroup;
         if (cppMode)
         {
-            cxxGroupIndex = FindOrAddCxxImportGroup(realPaths, extraDefines);
+            cxxGroupIndex = FindOrAddCxxImportGroup(realPaths, extraDefines, diskCache);
             // A standard-library header is a template catalog the walk deliberately skips, so no
             // record of it is ever registered - seed its namespace here or `std.vector<int>` could
             // never be requested at all.
@@ -11422,7 +11733,11 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
             // Nor does LSP analysis write: its entry carries a bound surface with no bodies
             // (see the cache-key comment above), which is not a result a compile may reuse.
             if (diskCache && !runMode_ && symbolSink_ == nullptr && !cHeaderCacheDir.empty())
+            {
+                if (cppMode && !batchMode_)
+                    PruneCxxTypeRequestDiskCache(cHeaderCacheDir, cxxGroup);
                 WriteCHeaderDiskCache(cHeaderCacheDir, diskKey, currentMtime, hashNow(), entry);
+            }
             std::lock_guard<std::mutex> lock(cFileSigCacheMutex_);
             InsertCFileSigEntry(cacheKey, std::move(entry), verbose);
         }

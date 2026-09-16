@@ -1716,6 +1716,7 @@ nlohmann::json LLVMBackend::TvToJson(const TypeAndValue& tv)
         nlohmann::json j;
         j["t"] = s.TypeName;
         if (!s.VariableName.empty()) j["n"] = s.VariableName;
+        if (!s.EnumBacking.empty()) j["eb"] = s.EnumBacking;
         if (s.Pointer)        j["p"]   = true;
         if (s.ElemPointer)    j["ep"]  = true;
         if (s.PointerDepth)   j["pd"]  = s.PointerDepth;
@@ -1775,6 +1776,7 @@ LLVMBackend::TypeAndValue LLVMBackend::TvFromJson(const SjVal& j)
         SerializedTav s;
         s.TypeName = j.value("t", std::string{});
         s.VariableName = j.value("n", std::string{});
+        s.EnumBacking = j.value("eb", std::string{});
         s.Pointer = j.value("p", false);
         s.ElemPointer = j.value("ep", false);
         s.PointerDepth = j.value("pd", 0);
@@ -2208,6 +2210,9 @@ nlohmann::json LLVMBackend::RecordToJson(const CRecordEntry& r)
         nlohmann::json fs = nlohmann::json::array();
         for (const auto& f : r.fields) fs.push_back(FieldToJson(f));
         nlohmann::json j = {{"n", r.name}, {"fs", fs}, {"ln", r.line}, {"co", r.col}};
+        if (!r.qualifiedName.empty()) j["qn"] = r.qualifiedName;
+        if (!r.file.empty()) j["f"] = r.file;
+        if (!r.inScope) j["sc"] = false;
         if (r.isUnion) j["u"] = true;
         if (!r.uuid.empty()) j["id"] = r.uuid;
         // C++ layout facts drive CreateStructType's alignment/packing; dropping them on a warm
@@ -2274,6 +2279,9 @@ LLVMBackend::CRecordEntry LLVMBackend::RecordFromJson(const SjVal& j)
         r.isUnion = j.value("u", false);
         r.line    = j.value("ln", 1);
         r.col     = j.value("co", 0);
+        r.qualifiedName = j.value("qn", std::string{});
+        r.file   = j.value("f", std::string{});
+        r.inScope = j.value("sc", true);
         r.uuid    = j.value("id", std::string{});
         r.isCxx    = j.value("cx", false);
         r.isPacked = j.value("pk", false);
@@ -2417,20 +2425,29 @@ bool LLVMBackend::TryLoadCHeaderDiskCache(
         uint64_t diskKey,
         std::filesystem::file_time_type mtime,
         uint64_t contentHash,
-        CFileSigCacheEntry& out)
+        CFileSigCacheEntry& out,
+        const std::string& expectedRequestKey,
+        bool requireBitcode,
+        std::string* missReason,
+        bool removeOnMiss)
 {
         namespace fs = std::filesystem;
         std::error_code ec;
         auto cachePath = cacheDir / std::format("{:016x}.json", diskKey);
         auto sidecarPath = cacheDir / std::format("{:016x}.bc", diskKey);
-        auto cacheMiss = [&]() {
+        auto markerPath = cacheDir / std::format("{:016x}.rq", diskKey);
+        auto cacheMiss = [&](const char* reason) {
+            if (missReason != nullptr) *missReason = reason;
+            if (!removeOnMiss) return false;
             fs::remove(sidecarPath, ec);
             ec.clear();
             fs::remove(cachePath, ec);
             ec.clear();
+            fs::remove(markerPath, ec);
+            ec.clear();
             return false;
         };
-        if (!fs::exists(cachePath, ec)) return cacheMiss();
+        if (!fs::exists(cachePath, ec)) return cacheMiss("missing entry");
 
         // parser + jsonBuf own the storage that doc/SjVal reference; keep them alive for the
         // whole function. Reads run through SjVal (simdjson DOM); writes still use nlohmann.
@@ -2441,9 +2458,10 @@ bool LLVMBackend::TryLoadCHeaderDiskCache(
         {
             llvm::TimeTraceScope parseScope("CHeaderJsonParse", cachePath.string());
             auto loaded = simdjson::padded_string::load(cachePath.string());
-            if (loaded.error()) return cacheMiss();
+            if (loaded.error()) return cacheMiss("unreadable entry");
             jsonBuf = std::move(loaded.value());
-            if (parser.parse(jsonBuf).get(doc) != simdjson::SUCCESS) return cacheMiss();
+            if (parser.parse(jsonBuf).get(doc) != simdjson::SUCCESS)
+                return cacheMiss("malformed entry");
             j = SjVal{doc};
         }
 
@@ -2518,14 +2536,22 @@ bool LLVMBackend::TryLoadCHeaderDiskCache(
         // v56: C++ members retain explicit override/final attributes for CFlat-derived classes.
         // v57: C++ function-template cache entries retain parameter types so same-arity overloads
         // of one member template are not collapsed into the first declaration.
-        if (version != 57) return cacheMiss();
+        // v58: C++ type-request entries carry their full source/driver identity and are persisted
+        // separately from the registration state. v59 preserves the full probe record needed to
+        // rebuild an identical stage-2 source from a warm stage-1 hit. v60 preserves enum backing
+        // types in cached signatures, so unsigned narrow enum returns keep their signedness.
+        if (version != 60) return cacheMiss("cache version");
+
+        if (!expectedRequestKey.empty()
+            && j.value("cxxRequestKey", std::string{}) != expectedRequestKey)
+            return cacheMiss("request key");
 
         // Accept on mtime match (fast) or content hash match (authoritative on mtime drift).
         auto storedMtime = j.value("mtime", int64_t{-1});
         auto storedHash  = j.value("hash",  uint64_t{0});
         bool mtimeOk = (storedMtime == (int64_t)mtime.time_since_epoch().count());
         bool hashOk  = (storedHash  == contentHash);
-        if (!mtimeOk && !hashOk) return cacheMiss();
+        if (!mtimeOk && !hashOk) return cacheMiss("header stamp");
 
         // Any malformed/incompatible field must degrade to a cache miss (reparse), never abort
         // the compiler: the nlohmann accessors throw on a type mismatch, so guard the whole build.
@@ -2574,20 +2600,22 @@ bool LLVMBackend::TryLoadCHeaderDiskCache(
             {
                 const SjVal blob = j["cxxbc"];
                 if (!blob.contains("file") || !blob.contains("len") || !blob.contains("hash"))
-                    return cacheMiss();
+                    return cacheMiss("missing sidecar metadata");
                 const std::string sidecarName = blob.value("file", std::string{});
                 const std::string expectedName = std::format("{:016x}.bc", diskKey);
-                if (sidecarName != expectedName) return cacheMiss();
+                if (sidecarName != expectedName) return cacheMiss("sidecar name");
                 const uint64_t expectedLength = blob.value("len", uint64_t{0});
                 const uint64_t expectedHash = blob.value("hash", uint64_t{0});
                 auto sidecar = llvm::MemoryBuffer::getFile(sidecarPath.string());
                 if (!sidecar || (*sidecar)->getBuffer().size() != expectedLength)
-                    return cacheMiss();   // missing/truncated blob: reparse rather than bind undefined symbols
+                    return cacheMiss("missing or truncated sidecar");
                 uint64_t actualHash = 0;
                 if (!HashFileFnv1a(sidecarPath.string(), actualHash) || actualHash != expectedHash)
-                    return cacheMiss();   // corrupt blob: reparse rather than bind undefined symbols
+                    return cacheMiss("sidecar hash");
                 entry.cxxBitcode.assign((*sidecar)->getBuffer().data(), (*sidecar)->getBuffer().size());
             }
+            else if (requireBitcode)
+                return cacheMiss("missing sidecar");
 
             // A deep (transitive) entry is only fresh if every recorded include is unchanged.
             // Shallow entries (no "deps") skip this and rely on the top-header check above.
@@ -2599,14 +2627,28 @@ bool LLVMBackend::TryLoadCHeaderDiskCache(
                     dep.path  = dj.value("f", std::string{});
                     dep.mtime = dj.value("mt", int64_t{0});
                     dep.hash  = dj.value("h",  uint64_t{0});
-                    if (!CHeaderDepFresh(dep)) return cacheMiss();
+                    if (!CHeaderDepFresh(dep)) return cacheMiss("dependency stamp");
                     entry.deps.push_back(std::move(dep));
                 }
             }
         }
-        catch (...) { return cacheMiss(); }
+        catch (...) { return cacheMiss("incompatible entry"); }
         out = std::move(entry);
         return true;
+    }
+
+static std::string CxxRequestGroupMarker(const std::vector<std::string>& headers,
+                                         const std::vector<std::string>& defines)
+{
+        // This marker is deliberately tiny compared with a request JSON entry. Length-prefix each
+        // string so paths and defines may contain spaces without making the ownership test lossy.
+        std::string marker = "H" + std::to_string(headers.size()) + ":";
+        for (const auto& header : headers)
+            marker += std::to_string(header.size()) + ":" + header;
+        marker += "D" + std::to_string(defines.size()) + ":";
+        for (const auto& define : defines)
+            marker += std::to_string(define.size()) + ":" + define;
+        return marker;
     }
 
 void LLVMBackend::WriteCHeaderDiskCache(
@@ -2614,7 +2656,9 @@ void LLVMBackend::WriteCHeaderDiskCache(
         uint64_t diskKey,
         std::filesystem::file_time_type mtime,
         uint64_t contentHash,
-        const CFileSigCacheEntry& entry)
+        const CFileSigCacheEntry& entry,
+        const std::string& requestKey,
+        const CxxRequestGroup* requestGroup)
 {
         namespace fs = std::filesystem;
         std::error_code ec;
@@ -2622,12 +2666,18 @@ void LLVMBackend::WriteCHeaderDiskCache(
         if (ec) return;
 
         nlohmann::json j;
-        j["version"] = 57;
+        j["version"] = 60;
         j["mtime"]   = (int64_t)mtime.time_since_epoch().count();
         j["hash"]    = contentHash;
         j["ldw"]     = entry.longDoubleWidth;
         j["ldieee"]  = entry.longDoubleIsIEEEDouble;
         j["triple"]  = entry.targetTriple;
+        if (!requestKey.empty() && requestGroup != nullptr)
+        {
+            j["cxxRequestKey"] = requestKey;
+            j["cxxRequestHeaders"] = requestGroup->headers;
+            j["cxxRequestDefines"] = requestGroup->defines;
+        }
 
         nlohmann::json sigs = nlohmann::json::array();
         for (const auto& s : entry.sigs) sigs.push_back(SigToJson(s));
@@ -2672,6 +2722,7 @@ void LLVMBackend::WriteCHeaderDiskCache(
         auto tmpPath  = cacheDir / std::format("{:016x}.{}.tmp", diskKey, _getpid());
         auto destPath = cacheDir / std::format("{:016x}.json", diskKey);
         const auto sidecarPath = cacheDir / std::format("{:016x}.bc", diskKey);
+        const auto markerPath = cacheDir / std::format("{:016x}.rq", diskKey);
         bool sidecarWritten = false;
         if (!entry.cxxBitcode.empty())
         {
@@ -2742,6 +2793,72 @@ void LLVMBackend::WriteCHeaderDiskCache(
         {
             fs::remove(tmpPath, ec);
             if (sidecarWritten) fs::remove(sidecarPath, ec);
+            return;
+        }
+        if (!requestKey.empty() && requestGroup != nullptr)
+        {
+            const auto markerTmpPath = cacheDir
+                / std::format("{:016x}.{}.rq.tmp", diskKey, _getpid());
+            std::ofstream marker(markerTmpPath, std::ios::binary | std::ios::trunc);
+            auto removeWrittenEntry = [&] {
+                fs::remove(destPath, ec);
+                ec.clear();
+                fs::remove(sidecarPath, ec);
+                ec.clear();
+                fs::remove(markerPath, ec);
+                ec.clear();
+            };
+            if (!marker.is_open())
+            {
+                removeWrittenEntry();
+                return;
+            }
+            marker << CxxRequestGroupMarker(requestGroup->ownerHeaders,
+                                            requestGroup->ownerDefines);
+            marker.close();
+            if (!marker)
+            {
+                fs::remove(markerTmpPath, ec);
+                removeWrittenEntry();
+                return;
+            }
+            fs::remove(markerPath, ec);
+            ec.clear();
+            fs::rename(markerTmpPath, markerPath, ec);
+            if (ec)
+            {
+                fs::remove(markerTmpPath, ec);
+                removeWrittenEntry();
+            }
+        }
+    }
+
+void LLVMBackend::PruneCxxTypeRequestDiskCache(const std::filesystem::path& cacheDir,
+                                               const CxxRequestGroup& group)
+{
+        std::error_code ec;
+        if (!std::filesystem::is_directory(cacheDir, ec)) return;
+        const std::string ownerMarker = CxxRequestGroupMarker(group.ownerHeaders,
+                                                               group.ownerDefines);
+        for (const auto& file : std::filesystem::directory_iterator(cacheDir, ec))
+        {
+            if (ec) return;
+            if (file.path().extension() != ".rq") continue;
+            std::ifstream input(file.path(), std::ios::binary);
+            if (!input.is_open()) continue;
+            std::string marker;
+            std::getline(input, marker);
+            if (marker != ownerMarker) continue;
+            auto jsonPath = file.path();
+            jsonPath.replace_extension(".json");
+            std::filesystem::remove(jsonPath, ec);
+            ec.clear();
+            auto sidecar = jsonPath;
+            sidecar.replace_extension(".bc");
+            std::filesystem::remove(sidecar, ec);
+            ec.clear();
+            std::filesystem::remove(file.path(), ec);
+            ec.clear();
         }
     }
 
