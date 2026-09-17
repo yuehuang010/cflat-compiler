@@ -1,0 +1,25 @@
+// Every element of a C++-class array is default-CONSTRUCTED, so a class whose default constructor
+// is deleted has no array form at all. Pre-fix the declaration compiled to zeroed bytes and then
+// destroyed elements that had never been constructed.
+import cpp "cpp_interop_arrayelem.h";
+
+extern int main()
+{
+    expect_error("C++ class 'cppa.NoDef' has no default constructor cflat can call (it is deleted), so an array of it cannot be default-initialized") {
+        cppa.NoDef[2] bad = default;
+    }
+    expect_error("so an array of it cannot be default-initialized") {
+        cppa.NoDef[2] bad2;
+    }
+    // The per-element brace list and the unlisted TAIL of a short positional list construct too,
+    // so each must refuse here rather than zero-fill. Both are separate emission sites.
+    expect_error("so an array of it cannot be default-initialized") {
+        cppa.NoDef[3] bad3 = { {v=1} };
+    }
+    // Accept set: the remedy the message names must compile and run.
+    cppa.NoDef*[2] ok = default;
+    ok[0] = new cppa.NoDef(3);
+    if (ok[0].v != 3) return 1;
+    delete ok[0];
+    return 0;
+}

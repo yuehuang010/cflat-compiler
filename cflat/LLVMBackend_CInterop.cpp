@@ -12475,6 +12475,64 @@ const LLVMBackend::CxxClassInfo::Structor* LLVMBackend::FindCxxDefaultCtor(const
         return nullptr;
     }
 
+/*
+ * Default-CONSTRUCT every element of a C++-class array (`T[N] a = default;`, `new T[n]`).
+ * The whole-array zeroinitializer these paths used to store skipped the constructor entirely
+ * while the scope-exit / delete path already destroyed each element, so a class whose default
+ * constructor establishes an invariant was destroyed having never been constructed, and a
+ * polymorphic element was left with a null vptr. `count` may be a runtime value.
+ * Returns false with `error` set when the class has no default constructor cflat can call.
+ */
+bool LLVMBackend::EmitCxxArrayDefaultConstruction(const std::string& typeName, llvm::Value* base,
+                                                  llvm::Type* elemTy, llvm::Value* count,
+                                                  std::string& error)
+{
+        if (base == nullptr || elemTy == nullptr || count == nullptr) return true;
+        std::string bindError;
+        TryBindCxxImplicitDefaultCtor(typeName, bindError);
+        const CxxClassInfo::Structor* ctor = FindCxxDefaultCtor(typeName);
+        if (ctor == nullptr)
+        {
+            const CxxClassInfo* info = GetCxxClassInfo(typeName);
+            error = std::format(
+                "C++ class '{}' has no default constructor cflat can call{}, so an array of it "
+                "cannot be default-initialized - declare the array as '{}*[N]' and allocate each "
+                "element with 'new {}(args)'", typeName,
+                info != nullptr && info->hasDeletedDefaultCtor ? " (it is deleted)" : "",
+                typeName, typeName);
+            return false;
+        }
+        auto callCtor = [&](llvm::Value* elemPtr) {
+            EmitCxxStructorCall(typeName, *ctor, elemPtr, {});
+        };
+
+        // A constant extent reuses the walk the per-element DESTRUCTOR uses, so the two
+        // traversals cannot drift; a runtime `new T[n]` needs its own counted loop.
+        if (auto* constCount = llvm::dyn_cast<llvm::ConstantInt>(count))
+        {
+            EmitFixedArrayElementWalk(*builder, base, elemTy, constCount->getZExtValue(), callCtor);
+            return true;
+        }
+
+        auto* i64Ty = builder->getInt64Ty();
+        llvm::Value* total = builder->CreateZExtOrTrunc(count, i64Ty, "cxxarr.n");
+        auto* fn = builder->GetInsertBlock()->getParent();
+        auto* preBB = builder->GetInsertBlock();
+        auto* loopBB = llvm::BasicBlock::Create(*context, "cxxarrctor.loop", fn);
+        auto* doneBB = llvm::BasicBlock::Create(*context, "cxxarrctor.done", fn);
+        builder->CreateCondBr(builder->CreateICmpUGT(total, builder->getInt64(0)), loopBB, doneBB);
+
+        builder->SetInsertPoint(loopBB);
+        auto* idx = builder->CreatePHI(i64Ty, 2, "cxxarrctor.i");
+        idx->addIncoming(builder->getInt64(0), preBB);
+        callCtor(builder->CreateInBoundsGEP(elemTy, base, { idx }, "cxxarrelem"));
+        auto* next = builder->CreateAdd(idx, builder->getInt64(1), "cxxarrctor.next");
+        idx->addIncoming(next, builder->GetInsertBlock());
+        builder->CreateCondBr(builder->CreateICmpULT(next, total), loopBB, doneBB);
+        builder->SetInsertPoint(doneBB);
+        return true;
+    }
+
 const LLVMBackend::CxxClassInfo::Structor* LLVMBackend::FindCxxCopyCtor(const std::string& typeName) const
 {
         const CxxClassInfo* info = GetCxxClassInfo(typeName);

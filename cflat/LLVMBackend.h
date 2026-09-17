@@ -7766,6 +7766,26 @@ public:
     bool EmitCxxStructorCall(const std::string& typeName, const CxxClassInfo::Structor& st,
                              llvm::Value* slot, const std::vector<llvm::Value*>& extraArgs,
                              const std::vector<NamedVariable>* extraArgVars = nullptr);
+    /*
+     * A fixed array / `new T[n]` element of this C++ class must be default-CONSTRUCTED rather
+     * than zero-filled: the class has a NONTRIVIAL default constructor. This is the same fact
+     * the single-object local path acts on (TryDeclareForeignCxxLocal's `fullyTrivial` escape),
+     * and the array paths used to ignore it while still destroying every element.
+     */
+    bool CxxElementNeedsDefaultConstruction(const std::string& typeName) const
+    {
+        if (!IsCxxRecord(typeName)) return false;
+        const CxxClassInfo* info = GetCxxClassInfo(typeName);
+        if (info == nullptr) return false;
+        // A DELETED default constructor is "trivial" to clang (it is not user-provided), so the
+        // triviality bit alone would let `T[N] a = default;` zero-fill a class C++ forbids
+        // default-initializing at all. Ask so the array path can report it.
+        return !info->hasTrivialDefaultCtor || info->hasDeletedDefaultCtor;
+    }
+    // Emit one default-constructor call per element over `count` elements at `base`.
+    bool EmitCxxArrayDefaultConstruction(const std::string& typeName, llvm::Value* base,
+                                         llvm::Type* elemTy, llvm::Value* count,
+                                         std::string& error);
     // A constant C++ default argument as an LLVM value of the parameter's type; nullptr when
     // the default is not a constant this call can reproduce.
     llvm::Value* MaterializeCxxDefaultArgument(const cflat_cinterop::RawDefaultArg& def,

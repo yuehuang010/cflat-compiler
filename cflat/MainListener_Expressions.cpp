@@ -11466,7 +11466,17 @@ void MainListener::EmitBraceElementIntoFixedSlot(
         llvm::Value* seed = compiler->GetFunction(elemTypeName)
             ? compiler->CreateOverloadedFunctionCall(elemTypeName, {}, true)
             : nullptr;
-        if (seed != nullptr && seed->getType() == elemStructTy)
+        // A C++ class has no CFlat constructor FUNCTION, so `seed` is null for it and the zero
+        // store below left the slot unconstructed (a null vptr on a polymorphic element) while
+        // scope exit still destroyed it. Its own default constructor runs here instead.
+        if (seed == nullptr && compiler->CxxElementNeedsDefaultConstruction(elemTypeName))
+        {
+            std::string ctorError;
+            if (!compiler->EmitCxxArrayDefaultConstruction(
+                    elemTypeName, elemPtr, elemStructTy, compiler->builder->getInt64(1), ctorError))
+                LogErrorContext(fi, ctorError);
+        }
+        else if (seed != nullptr && seed->getType() == elemStructTy)
             compiler->CreateAssignment(seed, elemPtr);
         else
             compiler->builder->CreateStore(llvm::Constant::getNullValue(elemStructTy), elemPtr);
@@ -11633,6 +11643,26 @@ void MainListener::EmitArrayValueInitSlots(
         for (uint64_t d : tv.ConstInnerDimensions) n *= d;
         if (n == 0) return;
 
+        // `T[N] a = {};` on a C++-class element value-initializes each element, which for a
+        // nontrivial default constructor means calling it - not storing N zeroed slots.
+        if (compiler->GetFunction(tv.TypeName) == nullptr
+            && compiler->CxxElementNeedsDefaultConstruction(tv.TypeName))
+        {
+            std::string ctorError;
+            if (!compiler->EmitCxxArrayDefaultConstruction(
+                    tv.TypeName, arrAlloc, elemTy, compiler->builder->getInt64(n), ctorError))
+            {
+                if (list != nullptr) LogErrorContext(list, ctorError);
+                else compiler->LogErrorMessage("{}", { ctorError });
+            }
+            // A named-field list still applies per element, exactly as before the ctor ran.
+            if (list != nullptr && !list->fieldInit().empty())
+                compiler->EmitFixedArrayElementWalk(
+                    *compiler->builder, arrAlloc, elemTy, n,
+                    [&](llvm::Value* elemPtr) { EmitFieldInitializer(elemPtr, tv.TypeName, list); });
+            return;
+        }
+
         compiler->EmitFixedArrayElementWalk(
             *compiler->builder, arrAlloc, elemTy, n,
             [&](llvm::Value* elemPtr)
@@ -11658,7 +11688,10 @@ void MainListener::EmitFieldDefaultArraySplat(
         auto* compiler = Compiler(list);
         if (elemTy == nullptr) return;
 
-        if (compiler->IsOwningValueType(field.TypeName))
+        // A C++ element joins the per-slot path: the seed-and-memcpy arm below neither runs the
+        // class's default constructor nor copy-constructs the replicas.
+        if (compiler->IsOwningValueType(field.TypeName)
+            || compiler->CxxElementNeedsDefaultConstruction(field.TypeName))
         {
             EmitArrayValueInitSlots(slot, elemTy, field, list, true);
             return;
@@ -12197,6 +12230,29 @@ void MainListener::EmitPositionalFixedArrayIntoSlot(
             compiler->CreateAssignment(val, elemPtr,
                 nv.TypeAndValue.IsUnsignedInteger() != -1, elemTy);
         }
+
+        /*
+         * C++ VALUE-INITIALIZES the slots past a short positional list, which for a class with a
+         * nontrivial default constructor means calling it. The zero fill above left that tail
+         * unconstructed while scope exit still destroyed all N. The tail is contiguous in the
+         * flat layout (elementPtrs is built in row-major order), so one walk covers it.
+         */
+        if (elemStructTy != nullptr && (uint64_t)elements.size() < n
+            && compiler->GetFunction(tv.TypeName) == nullptr
+            && compiler->CxxElementNeedsDefaultConstruction(tv.TypeName))
+        {
+            uint64_t first = (uint64_t)elements.size();
+            llvm::Value* tailBase = multidim
+                ? elementPtrs[first]
+                : compiler->builder->CreateInBoundsGEP(
+                    arrTy, arrAlloc, { zero, compiler->builder->getInt32((uint32_t)first) },
+                    "arrtail");
+            std::string ctorError;
+            if (!compiler->EmitCxxArrayDefaultConstruction(
+                    tv.TypeName, tailBase, elemStructTy,
+                    compiler->builder->getInt64(n - first), ctorError))
+                LogErrorContext(initList, ctorError);
+        }
     }
 
 /*
@@ -12363,8 +12419,9 @@ void MainListener::EmitFixedArrayValueCopy(antlr4::ParserRuleContext* ctx,
                                         llvm::MaybeAlign(), bytes);
     }
 
-void MainListener::EmitFixedArrayDefaultInit(llvm::Value* arrAlloc, const LLVMBackend::TypeAndValue& tv) {
-        auto* compiler = Compiler();
+void MainListener::EmitFixedArrayDefaultInit(llvm::Value* arrAlloc, const LLVMBackend::TypeAndValue& tv,
+                                             antlr4::ParserRuleContext* where) {
+        auto* compiler = Compiler(where);
         auto structData = compiler->GetDataStructure(tv.TypeName);
         auto* arrTy = llvm::dyn_cast_or_null<llvm::ArrayType>(compiler->GetType(tv));
         if (structData.StructType == nullptr || arrTy == nullptr) return;
@@ -12373,6 +12430,22 @@ void MainListener::EmitFixedArrayDefaultInit(llvm::Value* arrAlloc, const LLVMBa
         uint64_t n = tv.ConstArraySize;
         for (uint64_t d : tv.ConstInnerDimensions) n *= d;
         if (n == 0) return;
+
+        // A foreign C++ element with a nontrivial default constructor: run that constructor once
+        // per slot. The zero store below would skip it while scope exit still destroys all N.
+        if (compiler->GetFunction(tv.TypeName) == nullptr
+            && compiler->CxxElementNeedsDefaultConstruction(tv.TypeName))
+        {
+            std::string ctorError;
+            if (!compiler->EmitCxxArrayDefaultConstruction(
+                    tv.TypeName, arrAlloc, structData.StructType,
+                    compiler->builder->getInt64(n), ctorError))
+            {
+                if (where != nullptr) LogErrorContext(where, ctorError);
+                else compiler->LogErrorMessage("{}", { ctorError });
+            }
+            return;
+        }
 
         // An owning default (its constructor allocates a resource) must be built independently in
         // each slot: a single seed replicated bitwise would alias one resource across all N slots
@@ -13252,11 +13325,23 @@ LLVMBackend::NamedVariable MainListener::ParseNewExpression(CFlatParser::NewExpr
             compiler->builder->CreateMemSet(typedPtr, compiler->builder->getInt8(0), sizeVal, ptrAlign);
         }
 
-        // For array new of a class type: call default constructor for each element (like C++).
-        // Skip when typeIsPtr - the element is a pointer (e.g. Point*), not a struct; calling
-        // the struct ctor would store sizeof(Point)=8 bytes into a sizeof(ptr)=4-byte slot on
-        // Win32, corrupting the heap (on Win64 they happen to be equal so the bug is silent).
-        if (isArray && count && !typeIsPtr && compiler->GetFunction(typeName))
+        /*
+         * For array new of a class type: call the default constructor for each element (like C++).
+         * Skip when typeIsPtr - the element is a pointer (e.g. Point*), not a struct; calling
+         * the struct ctor would store sizeof(Point)=8 bytes into a sizeof(ptr)=4-byte slot on
+         * Win32, corrupting the heap (on Win64 they happen to be equal so the bug is silent).
+         * A foreign C++ class has no CFlat constructor FUNCTION, so the second arm never ran for
+         * it while `delete` already destroyed every element: its own constructor is the first arm.
+         */
+        if (isArray && count && !typeIsPtr && compiler->GetFunction(typeName) == nullptr
+            && compiler->CxxElementNeedsDefaultConstruction(typeName))
+        {
+            std::string ctorError;
+            if (!compiler->EmitCxxArrayDefaultConstruction(typeName, typedPtr, elemType, count,
+                                                           ctorError))
+                LogErrorContext(ctx, ctorError);
+        }
+        else if (isArray && count && !typeIsPtr && compiler->GetFunction(typeName))
         {
             auto* i64Ty = compiler->builder->getInt64Ty();
             auto* indexAlloca = compiler->builder->CreateAlloca(i64Ty, nullptr, "init_i");

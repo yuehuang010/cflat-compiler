@@ -1756,9 +1756,12 @@ llvm::Value* MainListener::GenerateDefaultValue(const LLVMBackend::DeclTypeAndVa
             }
             auto* element = array->getElementType();
             while (element->isArrayTy()) element = element->getArrayElementType();
+            // A C++-class element has no CFlat constructor function; its nontrivial default
+            // constructor is the one EmitFixedArrayDefaultInit calls per slot.
             if (element->isStructTy()
                 && compiler->GetDataStructure(resolved.TypeName).StructType != nullptr
-                && compiler->GetFunction(resolved.TypeName) != nullptr)
+                && (compiler->GetFunction(resolved.TypeName) != nullptr
+                    || compiler->CxxElementNeedsDefaultConstruction(resolved.TypeName)))
             {
                 auto* slot = compiler->AllocaAtEntry(llvmType, nullptr, "arrayfielddefault");
                 compiler->builder->CreateStore(llvm::Constant::getNullValue(llvmType), slot);
@@ -6285,7 +6288,13 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                         bool fixedArrayOfStruct = !global_scope && !typeAndValue.Pointer
                             && typeAndValue.ConstArraySize > 0
                             && compiler->GetDataStructure(typeAndValue.TypeName).StructType != nullptr;
-                        if (fixedArrayOfStruct)
+                        // A C++-class element is default-CONSTRUCTED per slot by
+                        // EmitFixedArrayDefaultInit below; leaving `right` null routes there
+                        // instead of storing a zeroinitializer over every constructed element.
+                        if (fixedArrayOfStruct
+                            && compiler->CxxElementNeedsDefaultConstruction(typeAndValue.TypeName))
+                            right = nullptr;
+                        else if (fixedArrayOfStruct)
                         {
                             // Preferred: fold one element's construction and replicate it as a
                             // CONSTANT array, keeping the single whole-array store this spelling
@@ -6815,7 +6824,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                         RecordAliasBorrowDeclBlock(compiler, nv);
                     }
                     else if (needsArrayDefaultInit)
-                        EmitFixedArrayDefaultInit(alloc, typeAndValue);
+                        EmitFixedArrayDefaultInit(alloc, typeAndValue, direct);
 
                     /*
                      * An owning pointer local with no initializer left its slot uninitialized, so a

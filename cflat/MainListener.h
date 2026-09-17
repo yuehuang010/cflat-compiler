@@ -6036,7 +6036,8 @@ public:
      * covered: plain `int x;` is uninitialized (C semantics), so `int[N] x;` stays that way too.
      * Multi-dimensional arrays are contiguous, so the flat element walk covers `T[N][M]` as well.
      */
-    void EmitFixedArrayDefaultInit(llvm::Value* arrAlloc, const LLVMBackend::TypeAndValue& tv);
+    void EmitFixedArrayDefaultInit(llvm::Value* arrAlloc, const LLVMBackend::TypeAndValue& tv,
+                                   antlr4::ParserRuleContext* where = nullptr);
 
     // Coerce a folded element constant to the array's element type so ConstantArray::get
     // does not assert. Mirrors CreateGlobalVariable's int/fp-widen/null coercion.

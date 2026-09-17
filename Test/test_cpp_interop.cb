@@ -261,6 +261,19 @@
 //                       owner's own nested class, and one whose template has a nontrivial
 //                       destructor that the owner's destruction must run. Each of these
 //                       was embedded as opaque bytes, so every member access failed.
+//   Section M98 (1870-1883, range 1870-1889): array ELEMENTS of a C++ class are
+//                       default-CONSTRUCTED - `T[N] a = default;`, no initializer, `= {}`, two
+//                       dimensions, a nontrivial ctor with a TRIVIAL dtor, a polymorphic element
+//                       called virtually, a CFlat struct field of array type, `new T[n]` at
+//                       constant and runtime extent, a SHORT positional list whose unlisted tail
+//                       must still be constructed, a per-element brace list (plain and
+//                       polymorphic), and a struct field whose array default is a non-empty brace
+//                       list. ONE code per SHAPE: each leg folds the constructor count, the
+//                       constructor's own invariant and the matching destructor count under a
+//                       single code. A fully trivial element keeps the whole-array
+//                       zeroinitializer. Test/errors/err_cpp_array_no_default_ctor.cb pins the
+//                       deleted-default-constructor refusal, including through the brace and
+//                       short-tail spellings.
 import cpp "library/cpp_interop_basic.h" cache;
 import cpp "library/cpp_interop_basic.cpp" cache;
 // Section M6: inheritance and virtual dispatch. Definitions are out-of-line on purpose - every
@@ -293,9 +306,18 @@ import cpp "library/cpp_interop_strop.h" cache;
 // Section M97: C++ REFERENCE data members - bound as pointer fields, never reseatable.
 import cpp "library/cpp_interop_ref_member.h" cache;
 import cpp "library/cpp_interop_field.h" cache;
+// Section M98: array elements of a C++ class. Imported WITHOUT the header cache so the section
+// does not depend on cache state.
+import cpp "library/cpp_interop_arrayelem.h";
 import "list.cb";
 import "thread.cb";
 import "malloc_allocator.cb";
+
+// M98: CFlat structs whose FIELD is a fixed array of a C++ class - `= default`, and a non-empty
+// brace list over an element with a trivial and with a nontrivial destructor.
+struct M98Host { cppa.Trk[2] cells = default; };
+struct M98H5 { cppa.CtorOnly[2] cells = { v = 1 }; };
+struct M98H6 { cppa.Trk[2] cells = { v = 1 }; };
 
 int m78global = 42;
 extern int strcmp(const char* a, const char* b);
@@ -4384,6 +4406,144 @@ extern int main()
         if (m96owner.o.value() != 30 || m96owner.tail != 3) return 1849;
     }
     if (cppf.dtor_count() != 1) return 1849;
+
+    // ---- Section M98: array ELEMENTS of a C++ class are CONSTRUCTED (1870-1889) -----------
+    // ONE return code per SHAPE: each leg folds its constructor count, the constructor's own
+    // invariant (v) and the matching destructor count under a single code, so a CI failure names
+    // the spelling that regressed without a bisect. Pre-fix every ctor_count below read 0 and
+    // every constructed v read 0, while the dtor_count halves already passed - that disagreement
+    // IS the defect. 1884-1889 are unused and reserved for this section.
+    int m98ok = 0;
+
+    cppa.reset();
+    m98ok = 0;
+    {
+        cppa.Trk[3] m98a = default;                       // `T[N] a = default;`
+        if (cppa.ctor_count() == 3 && cppa.dtor_count() == 0
+            && m98a[0].v == 7 && m98a[1].v == 7 && m98a[2].v == 7) m98ok = 1;
+    }
+    if (m98ok != 1 || cppa.dtor_count() != 3) return 1870;
+
+    cppa.reset();
+    m98ok = 0;
+    {
+        cppa.Trk[2] m98b;                                 // no initializer at all
+        if (cppa.ctor_count() == 2 && m98b[0].v == 7 && m98b[1].v == 7) m98ok = 1;
+    }
+    if (m98ok != 1 || cppa.dtor_count() != 2) return 1871;
+
+    cppa.reset();
+    m98ok = 0;
+    {
+        cppa.Trk[2] m98c = {};                            // empty-brace value initialization
+        if (cppa.ctor_count() == 2 && m98c[0].v == 7 && m98c[1].v == 7) m98ok = 1;
+    }
+    if (m98ok != 1 || cppa.dtor_count() != 2) return 1872;
+
+    cppa.reset();
+    m98ok = 0;
+    {
+        cppa.Trk[2][2] m98d = default;                    // every inner dimension counts
+        if (cppa.ctor_count() == 4 && m98d[0][0].v == 7 && m98d[1][1].v == 7) m98ok = 1;
+    }
+    if (m98ok != 1 || cppa.dtor_count() != 4) return 1873;
+
+    cppa.reset();
+    m98ok = 0;
+    {
+        cppa.CtorOnly[3] m98e = default;                  // nontrivial ctor, TRIVIAL dtor
+        if (cppa.ctor_count() == 3
+            && m98e[0].v == 9 && m98e[1].v == 9 && m98e[2].v == 9) m98ok = 1;
+    }
+    // Nothing to destroy, still constructed - the dtor count must stay 0, not merely match.
+    if (m98ok != 1 || cppa.dtor_count() != 0) return 1874;
+
+    cppa.reset();
+    m98ok = 0;
+    {
+        cppa.Poly[2] m98f = default;                      // the vptr slot was zero pre-fix
+        cppa.Poly* m98fp = &m98f[1];
+        // This virtual call SEGFAULTED pre-fix; reaching the comparison at all is the assertion.
+        if (cppa.ctor_count() == 2 && m98f[1].v == 5 && m98fp.kind() == 11) m98ok = 1;
+    }
+    if (m98ok != 1 || cppa.dtor_count() != 2) return 1875;
+
+    cppa.reset();
+    m98ok = 0;
+    {
+        M98Host m98g = default;                           // CFlat struct FIELD of array type
+        if (cppa.ctor_count() == 2
+            && m98g.cells[0].v == 7 && m98g.cells[1].v == 7) m98ok = 1;
+    }
+    if (m98ok != 1 || cppa.dtor_count() != 2) return 1876;
+
+    cppa.reset();
+    int m98n = 4;
+    cppa.Trk* m98h = new cppa.Trk[m98n];                  // RUNTIME extent: a counted loop
+    m98ok = 0;
+    if (cppa.ctor_count() == 4 && m98h[0].v == 7 && m98h[3].v == 7) m98ok = 1;
+    delete m98h;
+    if (m98ok != 1 || cppa.dtor_count() != 4) return 1877;
+
+    cppa.reset();
+    cppa.Trk* m98i = new cppa.Trk[2];                     // CONSTANT extent: unrolled
+    m98ok = 0;
+    if (cppa.ctor_count() == 2 && m98i[0].v == 7 && m98i[1].v == 7) m98ok = 1;
+    delete m98i;
+    if (m98ok != 1 || cppa.dtor_count() != 2) return 1878;
+
+    // Accept set: a FULLY TRIVIAL element keeps the whole-array zeroinitializer, nothing is
+    // constructed and nothing is destroyed. This leg passes on the pre-fix binary too - it is
+    // here so a future widening of the predicate cannot silently start constructing a trivial
+    // element, not to discriminate the fix.
+    cppa.reset();
+    m98ok = 0;
+    {
+        cppa.Plain[3] m98j = default;
+        if (cppa.ctor_count() == 0 && m98j[0].v == 0 && m98j[2].v == 0) m98ok = 1;
+    }
+    if (m98ok != 1 || cppa.dtor_count() != 0) return 1879;
+
+    // Per-element brace list PLUS a short list: slot 2 is unlisted, so C++ value-initializes it.
+    // Pre-fix this read ctor=0 and v=1,2,0 while scope exit destroyed all three.
+    cppa.reset();
+    m98ok = 0;
+    {
+        cppa.Trk[3] m98k = { {v=1}, {v=2} };
+        if (cppa.ctor_count() == 3
+            && m98k[0].v == 1 && m98k[1].v == 2 && m98k[2].v == 7) m98ok = 1;
+    }
+    if (m98ok != 1 || cppa.dtor_count() != 3) return 1880;
+
+    // The same spelling with a POLYMORPHIC element: pre-fix the vptr was zero and this virtual
+    // call exited 139 on a clean compile.
+    cppa.reset();
+    m98ok = 0;
+    {
+        cppa.Poly[2] m98l = { {v=1}, {v=2} };
+        cppa.Poly* m98lp = &m98l[1];
+        if (cppa.ctor_count() == 2 && m98l[1].v == 2 && m98lp.kind() == 11) m98ok = 1;
+    }
+    if (m98ok != 1 || cppa.dtor_count() != 2) return 1881;
+
+    // A struct field whose array default is a non-empty brace list took a seed-and-memcpy arm
+    // that never ran the constructor. TRIVIAL dtor first (nothing destroys, so only the missing
+    // invariant showed), then the nontrivial one.
+    cppa.reset();
+    m98ok = 0;
+    {
+        M98H5 m98m = default;
+        if (cppa.ctor_count() == 2 && m98m.cells[0].v == 1 && m98m.cells[1].v == 1) m98ok = 1;
+    }
+    if (m98ok != 1 || cppa.dtor_count() != 0) return 1882;
+
+    cppa.reset();
+    m98ok = 0;
+    {
+        M98H6 m98o = default;
+        if (cppa.ctor_count() == 2 && m98o.cells[0].v == 1 && m98o.cells[1].v == 1) m98ok = 1;
+    }
+    if (m98ok != 1 || cppa.dtor_count() != 2) return 1883;
 
     return 0;
 }
