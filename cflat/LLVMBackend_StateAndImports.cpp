@@ -2635,7 +2635,9 @@ bool LLVMBackend::TryLoadCHeaderDiskCache(
         // v68 stores the class-template specializations a record holds by value as records of
         // their own, so a field of such a type is laid out instead of embedded as opaque bytes.
         // v69 makes cached C++ signature payloads key-pure by remapping foreign types on replay.
-        if (version != 69) return cacheMiss("cache version");
+        // v70 maps a std::function return to its std.function specialization: an older cache
+        // carries the "return type ... is unsupported" refusal for such a signature.
+        if (version != 70) return cacheMiss("cache version");
 
         if (!expectedRequestKey.empty()
             && j.value("cxxRequestKey", std::string{}) != expectedRequestKey)
@@ -2860,7 +2862,8 @@ void LLVMBackend::WriteCHeaderDiskCache(
 
         nlohmann::json j;
         // v69 makes cached C++ signature payloads key-pure by remapping foreign types on replay.
-        j["version"] = 69;
+        // v70 maps a std::function return to its std.function specialization.
+        j["version"] = 70;
         j["mtime"]   = (int64_t)mtime.time_since_epoch().count();
         j["hash"]    = contentHash;
         j["ldw"]     = entry.longDoubleWidth;

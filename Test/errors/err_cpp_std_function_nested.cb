@@ -1,0 +1,29 @@
+// A spelling that merely CONTAINS `std::function<` is not a std::function: only a TOP-LEVEL one
+// binds as the std.function specialization. `std::vector<std::function<int(int)>>` has no CFlat
+// mapping in any of these three positions, and binding it as the inner std::function passed a
+// callable where a vector was expected (silent wrong value) or crashed on the return.
+// The last leg pins that a `std::function&&` CONSTRUCTOR parameter is refused by CFlat's own
+// overload matching, not by an LLVM module verifier failure.
+import cpp "functional";
+import cpp "cpp_interop_stdfn.h";
+
+int nested_twice(int x) { return x * 2; }
+
+extern int main()
+{
+    expect_error("member 'take_vec' of C++ class 'cppfn.NestedHolder' takes unsupported type") {
+        cppfn.NestedHolder h = cppfn.NestedHolder();
+        int r = h.take_vec(std.function<int(int)>(nested_twice));
+    }
+    expect_error("'cppfn.vec_of_fn' was not bound: return type") {
+        std.function<int(int)> f = cppfn.vec_of_fn();
+    }
+    expect_error("member 'get_vec' of C++ class 'cppfn.NestedHolder' returns unsupported type") {
+        cppfn.NestedHolder h2 = cppfn.NestedHolder();
+        std.function<int(int)> g = h2.get_vec();
+    }
+    expect_error("C++ class 'cppfn.CtorRef' has no constructor whose parameter types match") {
+        cppfn.CtorRef c = cppfn.CtorRef(std.function<int(int)>(nested_twice), 1);
+    }
+    return 0;
+}

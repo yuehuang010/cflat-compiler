@@ -261,6 +261,15 @@
 //                       owner's own nested class, and one whose template has a nontrivial
 //                       destructor that the owner's destruction must run. Each of these
 //                       was embedded as opaque bytes, so every member access failed.
+//   Section M100 (1910-1925, range 1910-1929): std::function as a C++ MEMBER parameter (by
+//                       value, by const&, by &&, on a static member, on a constructor) and as a
+//                       RETURN type (free function, member, static member; called directly and
+//                       through a CFlat local), plus a member that STORES the callable and runs
+//                       it after the CFlat frame that made it is gone, the void() and
+//                       int(const std::string&) signatures, and the free-function forms of the
+//                       same signatures that section M7f already covered. Every member position
+//                       was refused ("takes/returns unsupported type") while the free-function
+//                       parameter one bound.
 //   Section M98 (1870-1883, range 1870-1889): array ELEMENTS of a C++ class are
 //                       default-CONSTRUCTED - `T[N] a = default;`, no initializer, `= {}`, two
 //                       dimensions, a nontrivial ctor with a TRIVIAL dtor, a polymorphic element
@@ -318,6 +327,8 @@ import cpp "library/cpp_interop_field.h" cache;
 import cpp "library/cpp_interop_arrayelem.h";
 // Section M99: using-directives, including ones nominating a namespace nested in the nominator.
 import cpp "library/cpp_interop_usingns.h" cache;
+// Section M100: std::function as a MEMBER parameter and as a RETURN type.
+import cpp "library/cpp_interop_stdfn.h" cache;
 import "list.cb";
 import "thread.cb";
 import "malloc_allocator.cb";
@@ -334,6 +345,20 @@ int my_inc_cb(int x) { return x + 1; }
 
 int m7_cb_add(int a, int b) { return a + b; }
 int m7_cb_twice(int x) { return x * 2; }
+
+// M100 callables handed to C++ through std::function.
+int m100_twice(int x) { return x * 2; }
+int m100_bumped = 0;
+void m100_bump() { m100_bumped = m100_bumped + 1; }
+int m100_len(alias std.string s) { return (int)s.size(); }
+
+// The CFlat std.function local dies with this frame; the handler C++ stored must survive it.
+void m100_install(alias cppfn.Holder h)
+{
+    std.function<int(int)> local = std.function<int(int)>(m100_twice);
+    h.set_handler(local);
+}
+
 int m7_cb_mixed_out(cppi.Mixed m, char** out) { *out = "callback-out"; return m.i + (int)m.d; }
 cppi.Mixed m7_cb_mixed(cppi.Mixed m) { m.d = m.d + 1.0; m.i = m.i + 1; return m; }
 cppi.Large m7_cb_large(cppi.Large v)
@@ -4569,6 +4594,48 @@ extern int main()
     if (cppu_cyc_a.helper6() != 19) return 1897;
     if (cppu_cyc_b.helper5() != 17) return 1898;
     if (cppu_self.via_using7() != 123) return 1899;
+
+    // ---- Section M100: std::function as a member parameter and as a return type (1910-1929) --
+    // Every member leg below was refused at bind time ("member '...' takes/returns unsupported
+    // type 'std::function<...>'") while the free-function parameter forms bound.
+    cppfn.Plain m100p = cppfn.Plain();
+    if (m100p.run_val(std.function<int(int)>(m100_twice), 3) != 106)     return 1910;
+    if (m100p.run_ref(std.function<int(int)>(m100_twice), 4) != 108)     return 1911;
+    if (m100p.run_rv(std.function<int(int)>(m100_twice), 5) != 110)      return 1912;
+    if (cppfn.Plain.run_static(std.function<int(int)>(m100_twice), 6) != 1012) return 1913;
+    // A CONSTRUCTOR parameter bound before this change (its void* shape happened to carry the
+    // address); it is here so the retyped parameter keeps passing the same callable.
+    cppfn.Plain m100c = cppfn.Plain(std.function<int(int)>(m100_twice));
+    if (m100c.bias() != 20)                                              return 1914;
+
+    std.function<int(int)> m100a = cppfn.make_adder(7);
+    if (m100a(4) != 11)                                                  return 1915;
+    if (cppfn.make_adder(3)(4) != 7)                                     return 1916;
+    std.function<int(int)> m100m = m100p.get_adder(5);
+    if (m100m(4) != 9)                                                   return 1917;
+    std.function<int(int)> m100s = cppfn.Plain.make_scaler(3);
+    if (m100s(4) != 12)                                                  return 1918;
+
+    cppfn.Holder m100h = cppfn.Holder();
+    m100_install(m100h);
+    if (m100h.fire(7) != 14)                                             return 1919;
+
+    m100_bumped = 0;
+    if (cppfn.call_void(std.function<void()>(m100_bump)) != 7)           return 1920;
+    cppfn.VoidHolder m100v = cppfn.VoidHolder();
+    if (m100v.go(std.function<void()>(m100_bump)) != 5)                  return 1921;
+    if (m100_bumped != 2)                                                return 1922;
+
+    if (cppfn.call_str(std.function<int(std.string)>(m100_len)) != 4)    return 1923;
+    cppfn.StrHolder m100st = cppfn.StrHolder();
+    if (m100st.go(std.function<int(std.string)>(m100_len)) != 5)         return 1924;
+
+    // A CONSTRUCTOR parameter spelled `const&` keeps the pointer shape its C++ symbol declares;
+    // binding it by value emitted "Call parameter type does not match function signature!".
+    // The `&&` constructor form and the nested-spelling refusals are in
+    // Test/errors/err_cpp_std_function_nested.cb.
+    cppfn.CtorRef m100cr = cppfn.CtorRef(std.function<int(int)>(m100_twice));
+    if (m100cr.v() != 4)                                                 return 1925;
 
     return 0;
 }

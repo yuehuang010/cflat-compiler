@@ -1442,6 +1442,109 @@ void LLVMBackend::SeedCxxNamespacesOfDottedName(const std::string& dottedName)
                 dottedName.substr(0, firstDot));
 }
 
+/*
+ * A spelling that IS a std::function, not one that merely CONTAINS one: SplitStdFunctionSpelling
+ * finds `std::function<` anywhere, so `std::vector<std::function<int(int)>>` and
+ * `std::function<int(int)>*` would otherwise be retyped as the specialization itself. cv and
+ * reference decoration is stripped; whatever is left must be the specialization and nothing else.
+ */
+bool LLVMBackend::IsTopLevelStdFunctionSpelling(const std::string& spelling)
+{
+        std::string bare = spelling;
+        auto trim = [](std::string& t) {
+            while (!t.empty() && std::isspace((unsigned char)t.back())) t.pop_back();
+            while (!t.empty() && std::isspace((unsigned char)t.front())) t.erase(t.begin());
+        };
+        auto stripSuffix = [&](const char* word) {
+            const size_t n = std::strlen(word);
+            if (bare.size() <= n || bare.compare(bare.size() - n, n, word) != 0) return false;
+            if (!std::isspace((unsigned char)bare[bare.size() - n - 1])) return false;
+            bare.erase(bare.size() - n);
+            return true;
+        };
+        for (bool more = true; more; )
+        {
+            trim(bare);
+            more = false;
+            while (!bare.empty() && bare.back() == '&') { bare.pop_back(); trim(bare); more = true; }
+            if (stripSuffix("const") || stripSuffix("volatile")) more = true;
+            if (bare.rfind("const ", 0) == 0)    { bare.erase(0, 6); more = true; }
+            if (bare.rfind("volatile ", 0) == 0) { bare.erase(0, 9); more = true; }
+        }
+        return bare.rfind("std::function<", 0) == 0 && !bare.empty() && bare.back() == '>';
+}
+
+/*
+ * A `std::function<R(Args)>` spelling names the std.function specialization over the equivalent
+ * CFlat closure type. Returns that specialization's CFlat name, or "" when the spelling is not a
+ * std::function, when its signature types have no CFlat mapping, or when the request failed.
+ * requireTopLevel rejects a spelling that merely contains a std::function; the free-function
+ * PARAMETER path passes false because it has always accepted those (and the loose match is the
+ * only thing keeping that pre-existing behaviour identical).
+ */
+std::string LLVMBackend::StdFunctionSpecializationForSpelling(const std::string& spelling,
+                                                              bool requireTopLevel,
+                                                              std::string* requestError)
+{
+        if (requestError != nullptr) requestError->clear();
+        if (requireTopLevel && !IsTopLevelStdFunctionSpelling(spelling)) return {};
+        std::string retText;
+        std::string paramsText;
+        if (!cflat_cinterop::SplitStdFunctionSpelling(spelling, retText, paramsText)) return {};
+        TypeAndValue ret;
+        if (!MapCTypeToTypeAndValue(retText, ret, /*isCxx*/ true)) return {};
+        TypeAndValue closure;
+        closure.IsFunctionPointer = true;
+        closure.TypeName = "__c_fn_ptr";
+        closure.FuncPtrReturnTypeName = ret.TypeName;
+        closure.FuncPtrReturnPointer = ret.Pointer;
+        closure.FuncPtrReturnPointerDepth = ret.ValuePointerDepth();
+        size_t start = 0;
+        int angleDepth = 0;
+        int parenDepth = 0;
+        for (size_t pos = 0; pos <= paramsText.size(); ++pos)
+        {
+            const bool atEnd = pos == paramsText.size();
+            const char c = atEnd ? ',' : paramsText[pos];
+            if (!atEnd && c == '<') ++angleDepth;
+            else if (!atEnd && c == '>') --angleDepth;
+            else if (!atEnd && c == '(') ++parenDepth;
+            else if (!atEnd && c == ')') --parenDepth;
+            if ((c != ',' || angleDepth != 0 || parenDepth != 0) && !atEnd) continue;
+            std::string one = paramsText.substr(start, pos - start);
+            while (!one.empty() && std::isspace((unsigned char)one.front())) one.erase(one.begin());
+            while (!one.empty() && std::isspace((unsigned char)one.back())) one.pop_back();
+            if (!one.empty())
+            {
+                TypeAndValue pv;
+                if (!MapCTypeToTypeAndValue(one, pv, /*isCxx*/ true)) return {};
+                TypeAndValue::FuncPtrParam fp;
+                fp.TypeName = pv.TypeName;
+                fp.Pointer = pv.Pointer;
+                fp.PointerDepth = pv.ValuePointerDepth();
+                closure.FuncPtrParams.push_back(std::move(fp));
+            }
+            start = pos + 1;
+        }
+        std::vector<std::pair<std::string, int>> parts;
+        for (const auto& fp : closure.FuncPtrParams)
+            parts.push_back({ fp.TypeName, fp.PointerDepth });
+        const std::string encoded = MangleClosureType(*this, true, closure.FuncPtrReturnTypeName,
+                                                      closure.FuncPtrReturnPointerDepth, parts);
+        RegisterEncodedClosureType(encoded, closure);
+        const std::string className = MangleGenericInstance(*this, "std.function", { encoded });
+        // The request is memoized per identity (RequestCxxForeignType), so asking again for an
+        // already-registered specialization costs a map lookup - and skipping it would NOT be
+        // equivalent: registration alone leaves the specialization without the definitions a use
+        // site needs.
+        std::string error;
+        if (RequestCxxType("std.function", { encoded }, className, error)) return className;
+        if (requestError != nullptr)
+            *requestError = error.empty()
+                ? "cannot request the C++ std.function specialization" : error;
+        return {};
+}
+
 void LLVMBackend::RegisterCSignatures(const std::vector<CSigEntry>& sigs, const std::string& fileForLsp,
                              const std::string& programAlias)
 {
@@ -1508,95 +1611,63 @@ void LLVMBackend::RegisterCSignatures(const std::vector<CSigEntry>& sigs, const 
             std::vector<TypeAndValue> retypedParams;
             CSigEntry retypedEntry;
             const CSigEntry* sigp = &e;
+            bool changed = false;
+            TypeAndValue retypedRet = e.ret;
+            // A std::function RETURN crosses by value as its specialization, the same type the
+            // parameter retyping below produces - MapRawSig left a placeholder for it.
+            if (e.isCxx && retypedRet.Pointer && retypedRet.TypeName == "void"
+                && !retypedRet.IsFunctionPointer
+                && IsTopLevelStdFunctionSpelling(e.retSpelling))
+            {
+                auto cached = stdFunctionClasses.find(e.retSpelling);
+                std::string className;
+                if (cached != stdFunctionClasses.end()) className = cached->second;
+                else
+                {
+                    std::string requestError;
+                    className = StdFunctionSpecializationForSpelling(e.retSpelling, true, &requestError);
+                    if (!requestError.empty()) LogError(requestError);
+                    if (!className.empty()) stdFunctionClasses.emplace(e.retSpelling, className);
+                }
+                if (!className.empty())
+                {
+                    retypedRet.TypeName = className;
+                    retypedRet.Pointer = false;
+                    // An lvalue-reference return is a borrowed lvalue (`alias T`), as elsewhere.
+                    retypedRet.IsAlias = e.retSpelling.find('&') != std::string::npos
+                        && e.retSpelling.find("&&") == std::string::npos;
+                    changed = true;
+                }
+                else
+                {
+                    // The placeholder must never reach a declaration: without the specialization
+                    // the return has no CFlat type, so keep the refusal MapRawSig would have made.
+                    cxxBindingRefusals_[e.name] = std::format(
+                        "'{}' was not bound: return type '{}' is unsupported", e.name, e.retSpelling);
+                    SeedCxxNamespacesOfDottedName(e.name);
+                    continue;
+                }
+            }
             if (e.isCxx && e.paramSpellings.size() == e.params.size())
             {
                 retypedParams = e.params;
-                bool changed = false;
                 for (size_t i = 0; i < retypedParams.size(); ++i)
                 {
                     TypeAndValue& p = retypedParams[i];
                     const std::string& ps = e.paramSpellings[i];
-                    std::string retText;
-                    std::string paramsText;
-                    if (cflat_cinterop::SplitStdFunctionSpelling(ps, retText, paramsText))
                     {
-                        std::string className;
                         auto cached = stdFunctionClasses.find(ps);
-                        const bool wasCached = cached != stdFunctionClasses.end();
-                        if (wasCached)
-                            className = cached->second;
+                        std::string className;
+                        if (cached != stdFunctionClasses.end()) className = cached->second;
                         else
                         {
-                            TypeAndValue ret;
-                            if (MapCTypeToTypeAndValue(retText, ret, e.isCxx))
-                            {
-                                TypeAndValue closure;
-                                closure.IsFunctionPointer = true;
-                                closure.TypeName = "__c_fn_ptr";
-                                closure.FuncPtrReturnTypeName = ret.TypeName;
-                                closure.FuncPtrReturnPointer = ret.Pointer;
-                                closure.FuncPtrReturnPointerDepth = ret.ValuePointerDepth();
-                                size_t start = 0;
-                                bool ok = true;
-                                int angleDepth = 0;
-                                int parenDepth = 0;
-                                for (size_t pos = 0; pos <= paramsText.size(); ++pos)
-                                {
-                                    const bool atEnd = pos == paramsText.size();
-                                    const char c = atEnd ? ',' : paramsText[pos];
-                                    if (!atEnd && c == '<') ++angleDepth;
-                                    else if (!atEnd && c == '>') --angleDepth;
-                                    else if (!atEnd && c == '(') ++parenDepth;
-                                    else if (!atEnd && c == ')') --parenDepth;
-                                    if ((c != ',' || angleDepth != 0 || parenDepth != 0) && !atEnd)
-                                        continue;
-                                    std::string one = paramsText.substr(start, pos - start);
-                                    while (!one.empty() && std::isspace((unsigned char)one.front()))
-                                        one.erase(one.begin());
-                                    while (!one.empty() && std::isspace((unsigned char)one.back()))
-                                        one.pop_back();
-                                    if (!one.empty())
-                                    {
-                                        TypeAndValue pv;
-                                        if (!MapCTypeToTypeAndValue(one, pv, e.isCxx)) { ok = false; break; }
-                                        TypeAndValue::FuncPtrParam fp;
-                                        fp.TypeName = pv.TypeName;
-                                        fp.Pointer = pv.Pointer;
-                                        fp.PointerDepth = pv.ValuePointerDepth();
-                                        closure.FuncPtrParams.push_back(std::move(fp));
-                                    }
-                                    start = pos + 1;
-                                }
-                                if (ok)
-                                {
-                                    std::vector<std::pair<std::string, int>> parts;
-                                    for (const auto& fp : closure.FuncPtrParams)
-                                        parts.push_back({ fp.TypeName, fp.PointerDepth });
-                                    const std::string encoded = MangleClosureType(*this, true,
-                                        closure.FuncPtrReturnTypeName,
-                                        closure.FuncPtrReturnPointerDepth, parts);
-                                    RegisterEncodedClosureType(encoded, closure);
-                                    className = MangleGenericInstance(*this,
-                                        "std.function", { encoded });
-                                    std::string requestError;
-                                    bool requested = RequestCxxType("std.function", { encoded }, className,
-                                                              requestError);
-                                    if (!requested)
-                                        LogError(requestError.empty()
-                                            ? "cannot request the C++ std.function specialization"
-                                            : requestError);
-                                    stdFunctionClasses.emplace(ps, className);
-                                }
-                            }
-                            if (!className.empty())
-                            {
-                                p.TypeName = className;
-                                p.Pointer = false;
-                                p.IsAlias = true;
-                                changed = true;
-                            }
+                            std::string requestError;
+                            // Loose on purpose: see requireTopLevel on the helper.
+                            className = StdFunctionSpecializationForSpelling(ps, false, &requestError);
+                            if (!requestError.empty()) LogError(requestError);
+                            if (!className.empty()) stdFunctionClasses.emplace(ps, className);
                         }
-                        if (!className.empty() && wasCached)
+                        if (!className.empty())
                         {
                             p.TypeName = className;
                             p.Pointer = false;
@@ -1613,12 +1684,13 @@ void LLVMBackend::RegisterCSignatures(const std::vector<CSigEntry>& sigs, const 
                     p.TypeName = tag;
                     changed = true;
                 }
-                if (changed)
-                {
-                    retypedEntry = e;
-                    retypedEntry.params = std::move(retypedParams);
-                    sigp = &retypedEntry;
-                }
+            }
+            if (changed)
+            {
+                retypedEntry = e;
+                if (!retypedParams.empty()) retypedEntry.params = std::move(retypedParams);
+                retypedEntry.ret = retypedRet;
+                sigp = &retypedEntry;
             }
             const CSigEntry& sig = *sigp;
             if (e.isCxx)
@@ -1909,7 +1981,17 @@ bool LLVMBackend::MapRawSig(const cflat_cinterop::RawSig& r, CSigEntry& e)
         e.file     = r.file;
         e.line     = r.line ? r.line : 1;
         e.col      = r.col < 0 ? 0 : r.col;
-        if (!MapCTypeToTypeAndValue(r.retType, e.ret, r.isCxx))
+        bool retMapped = MapCTypeToTypeAndValue(r.retType, e.ret, r.isCxx);
+        // A std::function return is a placeholder here for the same reason a std::function
+        // PARAMETER is below: RegisterCSignatures retypes it once the specialization exists.
+        if (!retMapped && r.isCxx && IsTopLevelStdFunctionSpelling(r.retType))
+        {
+            e.ret = TypeAndValue{};
+            e.ret.TypeName = "void";
+            e.ret.Pointer = true;
+            retMapped = true;
+        }
+        if (!retMapped)
         {
             if (r.isCxx)
                 e.bindRefusal = IsLongDoubleSpelling(r.retType) && !IsCInteropLongDoubleSupported()
@@ -9949,6 +10031,32 @@ void LLVMBackend::RegisterCxxClassMembers(const CRecordEntry& r, const std::stri
             return true;
         };
 
+        /*
+         * A `std::function<R(Args)>` member parameter or return is its requested std.function
+         * specialization - the same mapping RegisterCSignatures gives a FREE function's
+         * std::function parameter. It has to run BEFORE mapType, which answers void* for an
+         * unknown class reference and would bind a parameter of the wrong shape.
+         */
+        auto mapStdFunction = [&](const std::string& spelling, bool isReturn, bool structorParam,
+                                  TypeAndValue& tv) {
+            // std.function's OWN members (its copy/move constructors and assignment) keep the
+            // shapes the specialization was registered with; retyping them here would rewrite
+            // the surface the cast and copy paths already resolve against.
+            if (IsStdFunctionSpecialization(r.name)) return false;
+            const std::string className = StdFunctionSpecializationForSpelling(spelling, true);
+            if (className.empty()) return false;
+            CxxReferenceKind refKind = CxxReferenceKind::None;
+            CxxSpellingWithoutRef(spelling, &refKind);
+            tv = TypeAndValue{};
+            tv.TypeName = className;
+            // A STRUCTOR's reference parameter keeps the pointer shape the construct-into-slot
+            // path expects (markConstructorReference marks the lvalue one); a by-value one, and
+            // every non-structor member parameter, crosses as the class the free path passes.
+            if (structorParam && refKind != CxxReferenceKind::None) tv.Pointer = true;
+            else tv.IsAlias = !isReturn || refKind == CxxReferenceKind::Lvalue;
+            return true;
+        };
+
         using Member = cflat_cinterop::RawCxxMember;
 
         // const/non-const overload pair: CFlat drops const, so both spell the same CFlat
@@ -10163,15 +10271,17 @@ void LLVMBackend::RegisterCxxClassMembers(const CRecordEntry& r, const std::stri
             }
 
             TypeAndValue ret;
-            if (!mapType(m.retType, ret))
+            CxxReferenceKind returnRefKind = CxxReferenceKind::None;
+            CxxSpellingWithoutRef(m.retType, &returnRefKind);
+            const bool stdFunctionRet = !isStructor
+                && mapStdFunction(m.retType, /*isReturn*/ true, /*structorParam*/ false, ret);
+            if (!stdFunctionRet && !mapType(m.retType, ret))
             {
                 refuse(IsLongDoubleSpelling(m.retType) && !IsCInteropLongDoubleSupported()
                     ? CInteropLongDoubleRefusal()
                     : std::format("returns unsupported type '{}'", m.retType));
                 continue;
             }
-            CxxReferenceKind returnRefKind = CxxReferenceKind::None;
-            CxxSpellingWithoutRef(m.retType, &returnRefKind);
             if (returnRefKind == CxxReferenceKind::Lvalue && ret.Pointer
                 && ret.TypeName == "void")
             {
@@ -10224,6 +10334,11 @@ void LLVMBackend::RegisterCxxClassMembers(const CRecordEntry& r, const std::stri
                     tv = TypeAndValue{};
                     tv.TypeName = r.name;
                     tv.Pointer = true;
+                }
+                // A std::function parameter crosses as its specialization by alias, exactly as
+                // the free-function path passes one; the general mapper cannot express it.
+                else if (mapStdFunction(m.paramTypes[p], /*isReturn*/ false, isStructor, tv))
+                {
                 }
                 else if (!mapType(m.paramTypes[p], tv)
                          || (!tv.Pointer && !tv.IsFunctionPointer && tv.TypeName == "void"))

@@ -5289,6 +5289,15 @@ private:
     void RequestCxxSignatureTypes(const std::vector<CSigEntry>& sigs);
     bool RequestCxxType(const std::string& baseName, const std::vector<std::string>& typeArgs,
                         const std::string& cflatName, std::string& error);
+    // True when the spelling IS a std::function (cv/reference decoration aside), not merely one
+    // that contains a std::function somewhere inside it.
+    static bool IsTopLevelStdFunctionSpelling(const std::string& spelling);
+    // Maps a `std::function<R(Args)>` C++ spelling onto its std.function specialization and
+    // requests it. "" when the spelling is not one, or is not one at top level under
+    // requireTopLevel.
+    std::string StdFunctionSpecializationForSpelling(const std::string& spelling,
+                                                     bool requireTopLevel,
+                                                     std::string* requestError = nullptr);
     bool CxxSpellingForCflatType(const std::string& cflatType, std::string& out) const;
     /*
      * Gate + request in one call, for both ParseDeclarationSpecifiers copies. Returns true when the
