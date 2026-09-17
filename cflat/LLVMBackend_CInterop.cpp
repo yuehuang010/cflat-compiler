@@ -1404,6 +1404,24 @@ bool LLVMBackend::CxxSignatureTypesRegistered(const CSigEntry& e)
         return true;
 }
 
+/*
+ * Register every namespace prefix of a dotted C++ declaration name, and note its leading segment
+ * as a foreign namespace of the active import group. Used by the sites that DROP a declaration:
+ * the namespace is a fact of the header, not a consequence of one declaration binding.
+ */
+void LLVMBackend::SeedCxxNamespacesOfDottedName(const std::string& dottedName)
+{
+        const size_t firstDot = dottedName.find('.');
+        if (firstDot == std::string::npos || firstDot == 0) return;
+        NoteCxxForeignNamespace(dottedName);
+        for (size_t pos = firstDot; pos != std::string::npos; pos = dottedName.find('.', pos + 1))
+            RegisterNamespace(dottedName.substr(0, pos));
+        if (activeCxxRequestGroup_ != nullptr
+            && activeCxxRequestGroup_->primary < cxxImportGroups_.size())
+            cxxImportGroups_[activeCxxRequestGroup_->primary].namespaces.insert(
+                dottedName.substr(0, firstDot));
+}
+
 void LLVMBackend::RegisterCSignatures(const std::vector<CSigEntry>& sigs, const std::string& fileForLsp,
                              const std::string& programAlias)
 {
@@ -1424,10 +1442,17 @@ void LLVMBackend::RegisterCSignatures(const std::vector<CSigEntry>& sigs, const 
             if (!e.bindRefusal.empty())
             {
                 cxxBindingRefusals_[e.name] = e.bindRefusal;
+                if (e.isCxx) SeedCxxNamespacesOfDottedName(e.name);
                 continue;
             }
             // Deferred binding: declare this signature once its C++ types exist, not before.
-            if (e.isCxx && !CxxSignatureTypesRegistered(e)) continue;
+            if (e.isCxx && !CxxSignatureTypesRegistered(e))
+            {
+                // The namespace exists whether or not the signature binds now: without this a
+                // namespace of only-deferred declarations reports "Undefined variable <ns>".
+                SeedCxxNamespacesOfDottedName(e.name);
+                continue;
+            }
             std::string regName  = e.name;
             if (e.isCxx)
             {
@@ -1571,7 +1596,8 @@ void LLVMBackend::RegisterCSignatures(const std::vector<CSigEntry>& sigs, const 
                 // Prototype boundary: the C++ path carries primitives and bare pointers only.
                 // A record by value needs the aggregate ABI arrangement, which is not part of
                 // this prototype - refuse at registration so the LSP sees the same answer.
-                if (RejectCxxRecordByValue(e)) continue;
+                // A refused declaration still proves its namespace exists - seed before the drop.
+                if (RejectCxxRecordByValue(e)) { SeedCxxNamespacesOfDottedName(e.name); continue; }
                 NoteCxxForeignNamespace(regName);
                 for (size_t pos = 0; (pos = regName.find('.', pos)) != std::string::npos; ++pos)
                     RegisterNamespace(regName.substr(0, pos));

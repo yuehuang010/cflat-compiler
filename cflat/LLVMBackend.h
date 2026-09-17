@@ -5168,6 +5168,7 @@ private:
     bool TryBindCxxFunction(const std::string& functionName);
     void RememberCxxMangledArity(const std::string& cflatName, const std::string& cxxSpelling) const;
     bool CxxSignatureTypesRegistered(const CSigEntry& entry);
+    void SeedCxxNamespacesOfDottedName(const std::string& dottedName);
     bool RequestCxxTypeInOwningGroup(const std::string& cxxBase, const std::string& cflatName,
                                      const std::string& spelling,
                                      const std::vector<size_t>& deps, std::string& error,

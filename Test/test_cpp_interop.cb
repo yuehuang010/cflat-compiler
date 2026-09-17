@@ -217,6 +217,10 @@
 //   Section M81 (1640-1658): C++ member ref-qualifiers preserve lvalue/rvalue receiver
 //                       selection for assignment, fields, dereferences, elements, calls,
 //                       temporaries, explicit move, and null-conditional forwarding.
+//   Section M91 (1710-1715): a C++ namespace whose declarations ALL name a std:: specialization
+//                       (parameter, return by value, nested namespace) is registered even
+//                       though binding those signatures is deferred to first use; nsstd_mix is
+//                       the control that one std-free declaration already registered.
 // Section M: C++ interop - `import cpp` selects C++ mode; the extension is irrelevant (the
 // fixture header is a plain .h). The header supplies the declarations, the .cpp is compiled
 // by the host C++ driver and linked in. Both are needed: the header alone has no
@@ -248,6 +252,7 @@ import cpp "map" cache;
 import cpp "functional" cache;
 import cpp "library/cpp_interop_throw.h" cache;
 import cpp "library/cpp_interop_scoped_enum.h" cache;
+import cpp "library/cpp_interop_nsstd.h" cache;
 import "list.cb";
 import "thread.cb";
 import "malloc_allocator.cb";
@@ -4045,6 +4050,22 @@ extern int main()
         if ((int)m90global.use_count() != 2)            return 1709;
         if (fromGlobal->forward(2) != 18)               return 1709;
     }
+
+    // ---- Section M91: namespaces whose every declaration names a std:: specialization ------
+    // Binding such a signature is deferred to first use; the namespace must be registered
+    // anyway, or the call reports "Undefined variable <ns>" and the whole API is unreachable.
+    std.string m91s = std.string("abcd");
+    if (nsstd_param.lens(m91s) != 4) return 1710;
+    std.string m91r = nsstd_ret.makes("abcde");
+    if ((int)m91r.size() != 5) return 1711;
+    std.vector<int> m91v = default;
+    m91v.push_back(1);
+    m91v.push_back(2);
+    if (nsstd_vec.usevec(m91v) != 22) return 1712;
+    if (nsstd_outer.inner.lens(m91s) != 5) return 1713;
+    // Control: nsstd_mix holds one std-free declaration, which registered it even pre-fix.
+    if (nsstd_mix.lens(m91s) != 11) return 1714;
+    if (nsstd_mix.plain(5) != 7) return 1715;
 
     return 0;
 }
