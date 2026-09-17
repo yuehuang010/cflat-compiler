@@ -250,7 +250,7 @@ run_err_warm() {
 
 export -f run_cb cb_extra_args load_err_flags check_err_result run_err run_err_warm is_skipped \
   now_ms write_result
-export CFLAT LIB LOCALE_DIR RES TIMEOUT RUN_MODE
+export CFLAT LIB LOCALE_DIR RES TIMEOUT RUN_MODE TIMEOUT_SECS HEAVY_TIMEOUT_SECS HEAVY_TESTS
 
 # The JIT path is deliberately opt-in. This list excludes fixtures that require a prebuilt C
 # library or the C-backed HeapAudit oracle; those remain AOT-only by design. test_program is
