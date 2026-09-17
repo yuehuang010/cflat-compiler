@@ -456,6 +456,13 @@ namespace cppi
         namespace inner { int deep = 31; }
         inline namespace v1 { int versioned = 41; }
     }
+
+    // M93 - out-of-line definitions for the two m93 members that have one.
+    namespace m93
+    {
+        const int Defined::k;
+        const int Linked::k = 43;
+    }
 }
 
 int cppi_m85_global = 3;

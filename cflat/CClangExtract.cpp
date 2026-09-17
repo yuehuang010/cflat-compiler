@@ -1779,7 +1779,12 @@ namespace cflat_cinterop
                     const auto* vd = llvm::dyn_cast<VarDecl>(d);
                     if (vd == nullptr || !vd->isStaticDataMember()) continue;
                     if (vd->getIdentifier() == nullptr) continue;
-                    if (vd->isConstexpr() && vd->getInit() != nullptr)
+                    // A non-constexpr `static const T k = 41;` initialized IN CLASS has no symbol
+                    // to link against (odr-use is ill-formed), so fold it exactly like constexpr.
+                    const bool foldsFromInClassInit =
+                        !vd->isConstexpr() && !vd->isInline() && vd->hasInit();
+                    if ((vd->isConstexpr() || foldsFromInClassInit) && vd->getInit() != nullptr
+                        && !vd->getInit()->isValueDependent())
                     {
                         Expr::EvalResult result;
                         if (vd->getInit()->EvaluateAsRValue(result, ctx) && result.Val.isInt())

@@ -2586,7 +2586,9 @@ bool LLVMBackend::TryLoadCHeaderDiskCache(
         // changing that member's cached linkage name and ABI.
         // v65 carries C++ member ref-qualifiers, so a warm cache can distinguish lvalue- and
         // rvalue-qualified overloads.
-        if (version != 65) return cacheMiss("cache version");
+        // v66 folds a non-constexpr `static const` member initialized in class, so such a member
+        // is now present with a constant value where an older cache omitted it entirely.
+        if (version != 66) return cacheMiss("cache version");
 
         if (!expectedRequestKey.empty()
             && j.value("cxxRequestKey", std::string{}) != expectedRequestKey)
@@ -2810,7 +2812,7 @@ void LLVMBackend::WriteCHeaderDiskCache(
         if (ec) return;
 
         nlohmann::json j;
-        j["version"] = 65;
+        j["version"] = 66;
         j["mtime"]   = (int64_t)mtime.time_since_epoch().count();
         j["hash"]    = contentHash;
         j["ldw"]     = entry.longDoubleWidth;

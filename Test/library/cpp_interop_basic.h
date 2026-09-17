@@ -897,6 +897,41 @@ namespace cppi
         inline const char* kName = "m85";       // header-only pointer object
     }
 
+    // M93 - class-scope `static const` with an IN-CLASS initializer and no out-of-line
+    // definition. Such a member has no symbol to link, so it binds by its folded value.
+    namespace m93
+    {
+        enum Plain { PA = 7, PB = 8 };
+        enum class Scoped { SA = 21, SB = 22 };
+
+        struct InClass
+        {
+            static const int k = 41;
+            static const unsigned int ku = 4000000001u;
+            static const long long kll = 9000000000LL;
+            static const bool kb = true;
+            static const char kc = 'Q';
+            static const Plain ke = PB;
+            static const Scoped kse = Scoped::SB;
+        };
+
+        // An initializer that reads an earlier member of the same class.
+        struct Chained { static const int base = 10; static const int derived = base + 5; };
+
+        struct Outer { struct Inner { static const int k = 47; }; };
+
+        // In-class initializer AND an out-of-line definition in cpp_interop_basic.cpp.
+        struct Defined { static const int k = 46; };
+
+        // Neighbours that already bound before the fold - they must keep working.
+        struct Cexpr { static constexpr int k = 44; };
+        struct InlineConst { static inline const int k = 45; };
+        struct Linked { static const int k; };   // initializer is the out-of-line definition
+
+        // A folded constant carries no storage, so it must not change the layout.
+        struct WithField { static const int cap = 49; int v; };
+    }
+
 }
 
 extern int cppi_m85_global;   // global-scope C++ object: no mangling at all

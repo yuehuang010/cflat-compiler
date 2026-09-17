@@ -211,6 +211,12 @@
 //                       through find/count, a struct field and a dereferenced pointer as
 //                       keys, a user-header C++ class key, and a CFlat-native operator[]
 //                       whose index parameter is a struct.
+//   Section M93 (1750-1768): class-scope `static const` with an in-class initializer and no
+//                       out-of-line definition - folded by value across int/unsigned/long long/
+//                       bool/char/plain and scoped enum, a chained initializer, a nested class,
+//                       a member that also has an out-of-line definition, use as an array bound
+//                       and a switch case, and the constexpr / inline-const / out-of-line
+//                       neighbours that already bound.
 //   Section M82 (1615-1638): C++ scoped-enum identity in free/member overload matching,
 //                       converting constructors, references, explicit casts, templates, and
 //                       measured preservation of unscoped enum conversions.
@@ -4066,6 +4072,47 @@ extern int main()
     // Control: nsstd_mix holds one std-free declaration, which registered it even pre-fix.
     if (nsstd_mix.lens(m91s) != 11) return 1714;
     if (nsstd_mix.plain(5) != 7) return 1715;
+
+    // ---- Section M93: class-scope `static const` folded from its in-class initializer ----
+    // Every leg below reads a member with NO out-of-line definition except Defined/Linked;
+    // before the fold each of these reported "'k' does not name a value here".
+    if (cppi.m93.InClass.k != 41)                   return 1750;
+    if (cppi.m93.InClass.ku != 4000000001)          return 1751;
+    if (cppi.m93.InClass.kll != 9000000000)         return 1752;
+    if (cppi.m93.InClass.kb != true)                return 1753;
+    if (cppi.m93.InClass.kc != 'Q')                 return 1754;
+    if ((int)cppi.m93.InClass.ke != 8)              return 1755;
+    if (cppi.m93.InClass.kse != cppi.m93.Scoped.SB) return 1756;
+
+    if (cppi.m93.Chained.base != 10)                return 1757;
+    if (cppi.m93.Chained.derived != 15)             return 1758;
+    if (cppi.m93.Outer.Inner.k != 47)               return 1759;
+    if (cppi.m93.Defined.k != 46)                   return 1760;
+
+    // Neighbours that bound before the fold - constexpr, inline const, and a declaration
+    // whose only initializer is the out-of-line definition (read through its real symbol).
+    if (cppi.m93.Cexpr.k != 44)                     return 1761;
+    if (cppi.m93.InlineConst.k != 45)               return 1762;
+    if (cppi.m93.Linked.k != 43)                    return 1763;
+
+    // A folded member is usable where a constant expression is required.
+    int[cppi.m93.InClass.k] m93arr = default;
+    m93arr[cppi.m93.InClass.k - 1] = 12;
+    if (m93arr[40] != 12)                           return 1764;
+
+    int m93sel = 41;
+    switch (m93sel)
+    {
+        case cppi.m93.InClass.k: break;
+        default: return 1765;
+    }
+
+    // The folded constant carries no storage, so the record keeps its single field.
+    cppi.m93.WithField m93wf = default;
+    m93wf.v = 3;
+    if (cppi.m93.WithField.cap != 49)               return 1766;
+    if (m93wf.v != 3)                               return 1767;
+    if (sizeof(cppi.m93.WithField) != sizeof(int))  return 1768;
 
     return 0;
 }
