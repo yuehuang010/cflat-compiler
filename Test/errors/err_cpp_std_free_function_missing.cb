@@ -1,0 +1,9 @@
+import cpp "algorithm" cache;
+
+extern int main()
+{
+    expect_error("'nosuch' is not a member of namespace 'std'") {
+        std.nosuch(1);
+    }
+    return 0;
+}

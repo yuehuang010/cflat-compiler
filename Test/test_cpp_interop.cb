@@ -250,6 +250,9 @@
 //                       construction, reads through the referent), in a base class, in a class
 //                       template specialization, and in an array element. Reseating the field is
 //                       refused; Test/errors/err_cpp_reference_member_reseat.cb pins the message.
+//   Section M88 (1770-1789): ordinary free functions requested on demand from direct standard
+//                       headers: sort, make_shared, string conversion/parsing, C-library
+//                       overloads, numeric algorithms, make_pair, and nested chrono/thread APIs.
 // Section M: C++ interop - `import cpp` selects C++ mode; the extension is irrelevant (the
 // fixture header is a plain .h). The header supplies the declarations, the .cpp is compiled
 // by the host C++ driver and linked in. Both are needed: the header alone has no
@@ -312,7 +315,17 @@ import cpp "vector" cache;
 import cpp "tuple" cache;
 import cpp "mutex" cache;
 import cpp "chrono" cache;
+import cpp "thread" cache;
 import cpp "string" cache;
+import cpp "algorithm" cache;
+import cpp "memory" cache;
+import cpp "numeric" cache;
+import cpp "utility" cache;
+import cpp "cstdlib" cache;
+import cpp "cmath" cache;
+import cpp "cstring" cache;
+import cpp "cctype" cache;
+import cpp "cstdio" cache;
 import cpp "map" cache;
 import cpp "functional" cache;
 import cpp "library/cpp_interop_throw.h" cache;
@@ -406,7 +419,7 @@ int m92_take_box(cppt.Box<int> value) { return value.get(); }
 int m92_take_pair(cppt.CtorPair<int> value) { return value.first() + value.second(); }
 int m92_take_nested(cppt.Box<cppt.Box<int>> value) { return value.get().get(); }
 int m92_take_nested2(cppt.Box<cppt.Box<cppt.Box<int>>> value) { return value.get().get().get(); }
-int m92_take_payload(cppt.Box<cppi.impl_detail.Payload> value) { return value.get().get(); }
+int m92_take_payload(cppt.Box<cppt.impl_detail.Payload> value) { return value.get().get(); }
 cppt.Box<int> m92_return_box(int value) { return cppt.Box<int>(value); }
 
 // M95 helpers: the qualified C++ specialization spelling formed from a CFlat generic's own T.
@@ -474,6 +487,53 @@ namespace m73
 }
 
 int g_m73_early_return = 0;
+
+int m88_standard_free_functions()
+{
+    std.vector<int> values = default;
+    values.push_back(3); values.push_back(1); values.push_back(2);
+    std.printf("m88-before-sort\n");
+    std.sort(values.begin(), values.end());
+    std.printf("m88-after-sort\n");
+    if (values[0] != 1 || values[1] != 2 || values[2] != 3) return 1770;
+    std.shared_ptr<int> shared = std.make_shared<int>(41);
+    if (*shared != 41) return 1771;
+    std.string text = std.to_string(42);
+    if (text.size() != 2) return 1772;
+    if (std.stoi(text) != 42) return 1773;
+    if ((int)std.strlen("abcd") != 4) return 1774;
+
+    int i = -7;
+    double d = -2.5;
+    long l = -9;
+    if (std.abs(i) != 7) return 1775;
+    if (std.abs(d) != 2.5) return 1776;
+    if (std.abs(l) != 9) return 1777;
+    if (std.sqrt(81.0) != 9.0) return 1778;
+    if (std.max(3, 8) != 8) return 1779;
+    if (std.max<int>(9, 2) != 9) return 1780;
+    if (std.gcd(84, 30) != 6) return 1781;
+    if (std.printf("") != 0) return 1782;
+    if (std.toupper('a') != 65) return 1783;
+
+    auto pair = std.make_pair(7, 9);
+    if (pair.first != 7 || pair.second != 9) return 1784;
+    auto started = std.chrono.steady_clock.now();
+    std.chrono.duration<long long> delay = std.chrono.duration<long long>(1);
+    std.this_thread.sleep_for(delay);
+    auto finished = std.chrono.steady_clock.now();
+    if (finished.time_since_epoch().count() <= started.time_since_epoch().count()) return 1785;
+    if (delay.count() != 1) return 1786;
+    return 0;
+}
+
+int m88_import_order_free_functions()
+{
+    std.shared_ptr<int> shared = std.make_shared<int>(41);
+    auto pair = std.make_pair(7, 9);
+    if (*shared != 41 || pair.first != 7 || pair.second != 9) return 1787;
+    return std.max<int>(9, 2) == 9 ? 0 : 1787;
+}
 
 [cpp] struct M73EarlyReturn
 {
@@ -4157,6 +4217,11 @@ extern int main()
         if ((int)m90global.use_count() != 2)            return 1709;
         if (fromGlobal->forward(2) != 18)               return 1709;
     }
+    // ---- Section M88: standard-library free functions and nested namespaces (1770-1789) ----
+    int m88result = m88_standard_free_functions();
+    if (m88result != 0) return m88result;
+    int m88order = m88_import_order_free_functions();
+    if (m88order != 0) return m88order;
 
     // ---- Section M91: namespaces whose every declaration names a std:: specialization ------
     // Binding such a signature is deferred to first use; the namespace must be registered
@@ -4231,10 +4296,10 @@ extern int main()
     if (m92_take_nested(cppt.Box<cppt.Box<int>>(cppt.Box<int>(18))) != 18) return 1739;
     if (m92_take_nested2(cppt.Box<cppt.Box<cppt.Box<int>>>(
             cppt.Box<cppt.Box<int>>(cppt.Box<int>(19)))) != 19) return 1740;
-    cppi.impl_detail.Payload m92payload = default;
-    if (m92_take_payload(cppt.Box<cppi.impl_detail.Payload>(m92payload)) != 3) return 1741;
-    cppt.Box<cppi.impl_detail.Payload> m92payloadBox =
-        cppt.Box<cppi.impl_detail.Payload>(m92payload);
+    cppt.impl_detail.Payload m92payload = default;
+    if (m92_take_payload(cppt.Box<cppt.impl_detail.Payload>(m92payload)) != 3) return 1741;
+    cppt.Box<cppt.impl_detail.Payload> m92payloadBox =
+        cppt.Box<cppt.impl_detail.Payload>(m92payload);
     if (m92payloadBox.get().get() != 3) return 1742;
     cppt.Box<cppt.Box<int>> m92nestedDecl =
         cppt.Box<cppt.Box<int>>(cppt.Box<int>(20));

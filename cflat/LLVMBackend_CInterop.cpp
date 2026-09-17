@@ -1952,6 +1952,9 @@ std::vector<std::string> LLVMBackend::BuildClangDriverArgs(const std::string& he
         {
             args.push_back("-ferror-limit=0");
             args.push_back("-Wno-everything");
+            // Typo correction would silently resolve an unknown request spelling to a similar
+            // real class (std::make_shared -> std::make_signed) and bind that instead.
+            args.push_back("-fno-spell-checking");
         }
         if (!headerDir.empty()) args.push_back("-I" + headerDir);
         for (const auto& inc : cIncludeDirs_) args.push_back("-I" + inc);
@@ -4806,6 +4809,13 @@ bool LLVMBackend::HasCxxFunctionTemplate(const std::string& qualifiedName) const
                                                qualifiedName.substr(dot + 1)).empty();
 }
 
+bool LLVMBackend::IsCxxNamespace(const std::string& name) const
+{
+        const size_t dot = name.find('.');
+        const std::string lead = dot == std::string::npos ? name : name.substr(0, dot);
+        return !lead.empty() && cxxForeignNamespaces_.count(lead) != 0;
+}
+
 std::string LLVMBackend::ResolveCxxFunctionTemplateName(const std::string& owner,
                                                         const std::string& memberName) const
 {
@@ -6278,6 +6288,252 @@ bool LLVMBackend::RequestCxxFunctionTemplate(const std::string& functionName,
                            "template <...> " + selected->name + "(...)");
         ExpandCxxBraceArguments(arguments, braceArguments);
         return true;
+}
+
+bool LLVMBackend::RequestCxxFreeFunction(const std::string& functionName,
+                                         const std::vector<std::string>& explicitArgs,
+                                         const std::vector<NamedVariable>& arguments,
+                                         std::string& registeredName,
+                                         std::string& error)
+{
+        error.clear();
+        registeredName.clear();
+        if (!functionName.starts_with("std."))
+            if (std::string refusal = GetCxxBindingRefusal(functionName); !refusal.empty())
+            {
+                auto fit = functionTable.find(functionName);
+                if (fit == functionTable.end() || fit->second.empty())
+                {
+                    error = refusal;
+                    return false;
+                }
+            }
+        if (functionName.find('.') == std::string::npos || !HasCxxImportGroup()) return false;
+
+        auto argumentType = [&](const NamedVariable& arg) {
+            TypeAndValue type = arg.TypeAndValue;
+            if (type.TypeName.empty())
+            {
+                auto* constant = llvm::dyn_cast_or_null<llvm::Constant>(arg.Primary);
+                if (constant != nullptr && IsStringLiteralConstant(constant))
+                {
+                    type.TypeName = "char";
+                    type.Pointer = true;
+                }
+                else if (arg.BaseType != nullptr && arg.BaseType->isFloatTy())
+                    type.TypeName = "float";
+                else if (arg.BaseType != nullptr && arg.BaseType->isDoubleTy())
+                    type.TypeName = "double";
+                else if (arg.BaseType != nullptr && arg.BaseType->isIntegerTy())
+                {
+                    const unsigned bits = arg.BaseType->getIntegerBitWidth();
+                    type.TypeName = bits == 1 ? "bool" : bits <= 8 ? "i8" : bits <= 16 ? "short"
+                        : bits <= 32 ? "int" : "i64";
+                }
+                else if (auto* st = llvm::dyn_cast_or_null<llvm::StructType>(arg.BaseType))
+                    type.TypeName = st->getName().str();
+                if (type.TypeName.empty()) type.TypeName = arg.InferSourceTypeName;
+            }
+            return type;
+        };
+        auto cflatTypeOf = [&](const NamedVariable& arg) {
+            TypeAndValue type = argumentType(arg);
+            std::string result = type.TypeName;
+            if (type.Pointer)
+            {
+                result += "*";
+                if (type.ElemPointer) result += "*";
+            }
+            return result;
+        };
+
+        std::vector<std::string> parameterSpellings;
+        std::vector<std::string> callArguments;
+        parameterSpellings.reserve(arguments.size());
+        callArguments.reserve(arguments.size());
+        for (size_t i = 0; i < arguments.size(); ++i)
+        {
+            const NamedVariable& arg = arguments[i];
+            TypeAndValue type = argumentType(arg);
+            auto* constant = llvm::dyn_cast_or_null<llvm::Constant>(arg.Primary);
+            const bool stringLiteral = constant != nullptr && IsStringLiteralConstant(constant);
+            if (stringLiteral || (type.Pointer && type.TypeName == "char"))
+            {
+                parameterSpellings.push_back("const char *");
+                callArguments.push_back("p" + std::to_string(i));
+                continue;
+            }
+            const std::string cflatType = cflatTypeOf(arg);
+            if (type.TypeName.empty())
+            {
+                error = std::format("C++ free function '{}' has an argument with no C++ type", functionName);
+                return false;
+            }
+            std::string spelling;
+            if (!CxxSpellingForCflatType(cflatType, spelling))
+            {
+                error = std::format("C++ free function '{}' has an argument type that cannot be spelled in C++",
+                                    functionName);
+                return false;
+            }
+            const bool classValue = !type.Pointer && IsCxxRecord(type.TypeName)
+                && !type.IsInterface;
+            if (classValue)
+            {
+                if (IsRvalueReferenceArgument(arg))
+                {
+                    parameterSpellings.push_back(spelling + " &&");
+                    callArguments.push_back("static_cast<" + spelling + " &&>(p"
+                                            + std::to_string(i) + ")");
+                }
+                else
+                {
+                    parameterSpellings.push_back(spelling + " &");
+                    callArguments.push_back("p" + std::to_string(i));
+                }
+            }
+            else
+            {
+                parameterSpellings.push_back(std::move(spelling));
+                callArguments.push_back("p" + std::to_string(i));
+            }
+        }
+
+        std::vector<std::string> cxxExplicitArgs;
+        cxxExplicitArgs.reserve(explicitArgs.size());
+        for (const std::string& typeArg : explicitArgs)
+        {
+            if (typeArg.starts_with("#"))
+            {
+                cxxExplicitArgs.push_back(typeArg.substr(1));
+                continue;
+            }
+            std::string spelling;
+            if (!CxxSpellingForCflatType(typeArg, spelling))
+            {
+                error = std::format("C++ free function '{}' has an explicit type argument that cannot be spelled in C++",
+                                    functionName);
+                return false;
+            }
+            cxxExplicitArgs.push_back(std::move(spelling));
+        }
+
+        std::string target = CxxNameFromCflat(functionName);
+        if (!cxxExplicitArgs.empty())
+        {
+            target += "<";
+            for (size_t i = 0; i < cxxExplicitArgs.size(); ++i)
+            {
+                if (i != 0) target += ", ";
+                target += cxxExplicitArgs[i];
+            }
+            target += ">";
+        }
+        target += "(";
+        for (size_t i = 0; i < callArguments.size(); ++i)
+        {
+            if (i != 0) target += ", ";
+            target += callArguments[i];
+        }
+        target += ")";
+
+        std::vector<size_t> dependencyGroups;
+        auto addDependencyGroup = [&](size_t group) {
+            if (std::find(dependencyGroups.begin(), dependencyGroups.end(), group)
+                == dependencyGroups.end())
+                dependencyGroups.push_back(group);
+        };
+        auto collectTypeDependencies = [&](const std::string& type) {
+            std::string base = type;
+            while (!base.empty() && base.back() == '*') base.pop_back();
+            if (auto owner = cxxTypeOwnerGroup_.find(base);
+                owner != cxxTypeOwnerGroup_.end()
+                && owner->second < cxxImportGroups_.size()
+                && !cxxImportGroups_[owner->second].headers.empty())
+                addDependencyGroup(owner->second);
+        };
+        for (const auto& argument : arguments)
+            collectTypeDependencies(cflatTypeOf(argument));
+        for (const std::string& explicitArg : explicitArgs)
+            if (!explicitArg.starts_with("#")) collectTypeDependencies(explicitArg);
+
+        const std::string cxxBase = [&] {
+            std::string result = functionName;
+            for (size_t pos = 0; (pos = result.find('.', pos)) != std::string::npos; pos += 2)
+                result.replace(pos, 1, "::");
+            return result;
+        }();
+        const uint64_t hash = HashWrapperKey(functionName + target
+                                             + std::format("|{}", parameterSpellings.size())
+                                             + [&] {
+                                                   std::string result;
+                                                   for (const auto& p : parameterSpellings) result += "|" + p;
+                                                   for (const auto& a : cxxExplicitArgs) result += "|" + a;
+                                                   return result;
+        }());
+        const std::string wrapperName = std::format("__cflat_free_{:016x}", hash);
+        if (auto fit = functionTable.find(functionName); fit != functionTable.end())
+            for (const auto& symbol : fit->second)
+                if (symbol.External && symbol.UniqueName == wrapperName)
+                {
+                    registeredName = functionName;
+                    return true;
+                }
+        std::string wrapperSource = "extern \"C\" __attribute__((weak)) decltype(auto) "
+                                    + wrapperName + "(";
+        for (size_t i = 0; i < parameterSpellings.size(); ++i)
+        {
+            if (i != 0) wrapperSource += ", ";
+            wrapperSource += parameterSpellings[i] + " p" + std::to_string(i);
+        }
+        wrapperSource += ") noexcept(noexcept(" + target + ")) { return " + target + "; }\n";
+
+        std::string lastError;
+        std::vector<size_t> candidateGroups;
+        if (auto owner = cxxFunctionOwnerGroup_.find(functionName);
+            owner != cxxFunctionOwnerGroup_.end() && owner->second < cxxImportGroups_.size())
+            candidateGroups.push_back(owner->second);
+        else if (auto owner = cxxFunctionTemplateOwnerGroup_.find(functionName);
+                 owner != cxxFunctionTemplateOwnerGroup_.end()
+                     && owner->second < cxxImportGroups_.size())
+            candidateGroups.push_back(owner->second);
+        else
+            candidateGroups = CandidateCxxGroupsFor(cxxBase);
+        for (size_t primary : candidateGroups)
+        {
+            CxxRequestGroup group = MakeCxxRequestGroup(primary, dependencyGroups);
+            if (group.headers.empty()) continue;
+            CxxRequestGroupScope groupScope(*this, &group);
+            CSigEntry bound;
+            std::string wrapperError;
+            if (!RequestGeneratedCxxWrapper(group, wrapperSource, wrapperName, "FREE",
+                                             bound, wrapperError))
+            {
+                lastError = FirstCxxErrorLine(wrapperError);
+                continue;
+            }
+            bound.name = functionName;
+            RegisterCSignatures({ bound }, group.headers.front());
+            if (auto fit = functionTable.find(functionName); fit != functionTable.end())
+                for (const auto& symbol : fit->second)
+                    if (symbol.External && symbol.UniqueName == wrapperName)
+                    {
+                        registeredName = functionName;
+                        cxxTemplateOwnerGroup_[cxxBase] = primary;
+                        StoreCxxTemplateOwnerMemo(cxxBase, primary);
+                        return true;
+                    }
+            lastError = "the generated wrapper could not be registered";
+        }
+
+        const size_t missingDot = functionName.rfind('.');
+        const std::string missingMember = functionName.substr(missingDot + 1);
+        const std::string missingNamespace = functionName.substr(0, missingDot);
+        error = std::format("'{}' is not a member of namespace '{}' (C++ free function '{}' "
+                            "could not be bound", missingMember, missingNamespace, functionName);
+        if (!lastError.empty()) error += " (clang: " + lastError + ")";
+        error += ")";
+        return false;
 }
 
 bool LLVMBackend::RequestCxxBraceFunction(const std::string& functionName,
@@ -8557,6 +8813,32 @@ bool LLVMBackend::TryRequestCxxType(const std::string& baseName,
             if (cxxForeignNamespaces_.count(lead) == 0 && !IsCxxForeignTypeRegistered(lead)
                 && cxxCflatToCxxSpelling_.count(lead) == 0)
                 return skipped("its leading segment is not an imported C++ namespace");
+        }
+        /*
+         * A dotted name whose every segment was harvested as a C++ NAMESPACE (`std.chrono`) names a
+         * namespace path, never a class. Probing it as a type finds nothing in ANY import group, so
+         * the request would parse every group's headers once for a guaranteed failure.
+         */
+        if (typeArgs.empty() && baseName.find('.') != std::string::npos
+            && cxxRecords_.count(baseName) == 0
+            && cxxCflatToCxxSpelling_.count(baseName) == 0
+            && !IsCxxForeignTypeRegistered(baseName))
+        {
+            bool everySegmentIsNamespace = true;
+            for (size_t start = 0; start < baseName.size() && everySegmentIsNamespace; )
+            {
+                const size_t dot = baseName.find('.', start);
+                const size_t length = dot == std::string::npos
+                    ? std::string::npos : dot - start;
+                const std::string segment = baseName.substr(start, length);
+                everySegmentIsNamespace =
+                    start == 0 ? cxxForeignNamespaces_.count(segment) != 0
+                               : cxxNestedNamespaceNames_.count(segment) != 0;
+                if (dot == std::string::npos) break;
+                start = dot + 1;
+            }
+            if (everySegmentIsNamespace)
+                return skipped("every segment names an imported C++ namespace");
         }
         return RequestCxxType(baseName, typeArgs, cflatName, error);
 }
@@ -12005,6 +12287,9 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
                 {
                     cxxForeignNamespaces_.insert("std");
                     cxxImportGroups_[cxxGroupIndex].namespaces.insert("std");
+                    // The nested names ("std::chrono") are harvested separately: they must not
+                    // become request leads, they only mark a dotted path as a namespace path.
+                    CollectHeaderNamespaceNames(h, cxxNestedNamespaceNames_);
                 }
                 else
                 {

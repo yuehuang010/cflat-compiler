@@ -3227,6 +3227,9 @@ private:
      * struct is about to define could otherwise be captured by a same-named foreign record.
      */
     std::unordered_set<std::string> cxxForeignNamespaces_;
+    // Namespace names spelled inside an imported C++ header, INCLUDING a system header whose
+    // own namespaces are otherwise not harvested. Used only to recognize a namespace path.
+    std::unordered_set<std::string> cxxNestedNamespaceNames_;
     // Emitted symbol names of bound C++ const/constexpr namespace-scope objects. Their storage is
     // read-only, so a store through one traps at run time; the assignment site rejects it instead.
     std::unordered_set<std::string> cxxConstGlobalSymbols_;
@@ -5156,6 +5159,7 @@ private:
         const std::vector<cflat_cinterop::RawFunctionTemplate>& templates, size_t group,
         const std::string& fileForLsp);
     bool HasCxxFunctionTemplate(const std::string& qualifiedName) const;
+    bool IsCxxNamespace(const std::string& name) const;
     bool HasCxxFunctionTemplateMember(const std::string& owner,
                                       const std::string& memberName) const;
     std::string ResolveCxxFunctionTemplateName(const std::string& owner,
@@ -5167,6 +5171,11 @@ private:
                                     const std::vector<CxxBraceArgument>& braceArguments,
                                     std::string& registeredName,
                                     std::string& error);
+    bool RequestCxxFreeFunction(const std::string& functionName,
+                                const std::vector<std::string>& explicitArgs,
+                                const std::vector<NamedVariable>& arguments,
+                                std::string& registeredName,
+                                std::string& error);
     bool RequestCxxBraceFunction(const std::string& functionName,
                                  const std::string& ownerType,
                                  const std::string& memberName,

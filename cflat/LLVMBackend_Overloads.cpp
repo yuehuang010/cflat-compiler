@@ -3009,7 +3009,7 @@ llvm::Function* LLVMBackend::GetFunction(const std::string& functionName)
         TryBindCxxFunction(functionName);
         auto functionSym = functionTable.find(functionName);
 
-        if (functionSym != functionTable.end())
+        if (functionSym != functionTable.end() && !functionSym->second.empty())
         {
             return functionSym->second.front().Function;
         }
