@@ -3240,6 +3240,20 @@ private:
     // is registered under. This is what maps a member signature's types back to CFlat identities,
     // and what makes two spellings of one specialization resolve to a single registration.
     std::unordered_map<std::string, std::string> cxxForeignTypeSpellings_;
+    struct CxxRebindTypeMapping
+    {
+        size_t foreignSpellingCount = 0;
+        size_t recordCount = 0;
+        bool initialized = false;
+        bool mapped = false;
+        TypeAndValue value;
+    };
+    // Cached C++ signature remaps survive individual header replays, but not registry growth.
+    std::unordered_map<std::string, CxxRebindTypeMapping> cxxRebindParameterMappings_;
+    std::unordered_map<std::string, CxxRebindTypeMapping> cxxRebindReturnMappings_;
+    // Only generated-wrapper replay needs this fallback; rebuild it once per record-table change.
+    mutable std::unordered_map<std::string, std::string> cxxRecordSpellingIndex_;
+    mutable bool cxxRecordSpellingIndexDirty_ = true;
     // CFlat name -> the C++ source spelling it was requested with, for nested template arguments.
     std::unordered_map<std::string, std::string> cxxCflatToCxxSpelling_;
     // A C++ alias of a specialization CFlat cannot spell itself (`using json = basic_json<>;`):
@@ -3382,7 +3396,11 @@ private:
         bool variadic = false;
         bool isCxx = false;
         bool isNoexcept = true;
+        bool needsCxxRebind = false;
         std::string bindRefusal;
+        // Refusal reported by clang extraction, before backend type mapping. A cached C++
+        // signature remaps its types from the preserved spellings and retains this reason.
+        std::string sourceBindRefusal;
         // Clang's own ABI arrangement (C++ mode only). Empty/invalid for C, which keeps the
         // existing size-heuristic path byte for byte.
         cflat_cinterop::RawAbi abi;
@@ -5447,6 +5465,7 @@ private:
                                                bool errorRecovery, bool asCxx = false) const;
 
     bool MapRawSig(const cflat_cinterop::RawSig& r, CSigEntry& e);
+    void RebindCxxCachedSignatures(std::vector<CSigEntry>& sigs);
 
     static std::string FunctionPointerAbiKey(const TypeAndValue& ret,
                                              const std::vector<TypeAndValue>& params);

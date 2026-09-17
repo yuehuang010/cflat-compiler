@@ -1,6 +1,6 @@
 // Diagnostics around the C++ class-template constructor request: a CFlat namespace typo must
 // keep its own message, and a bound C++ variable must not be called a class template.
-import cpp "cpp_interop_tpl.h";
+import cpp "cpp_interop_tpl.h" cache;
 
 namespace err_cpp_tpl_ns
 {

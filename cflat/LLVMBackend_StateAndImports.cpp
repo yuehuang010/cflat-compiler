@@ -1951,11 +1951,21 @@ cflat_cinterop::RawAbi LLVMBackend::AbiFromJson(const SjVal& j)
 nlohmann::json LLVMBackend::SigToJson(const CSigEntry& e)
 {
         nlohmann::json ps = nlohmann::json::array();
-        for (const auto& p : e.params) ps.push_back(TvToJson(p));
-        nlohmann::json j = {{"n", e.name}, {"r", TvToJson(e.ret)}, {"ps", ps},
+        TypeAndValue neutral;
+        neutral.TypeName = "void";
+        if (e.isCxx)
+        {
+            // C++ foreign mappings depend on the writer's registered types. Keep only the
+            // spelling count in the payload; RegisterCSignatures remaps these slots on replay.
+            for (size_t i = 0; i < e.paramSpellings.size(); ++i) ps.push_back(TvToJson(neutral));
+        }
+        else
+            for (const auto& p : e.params) ps.push_back(TvToJson(p));
+        nlohmann::json j = {{"n", e.name}, {"r", TvToJson(e.isCxx ? neutral : e.ret)}, {"ps", ps},
                             {"va", e.variadic}, {"ln", e.line}, {"co", e.col}};
         if (!e.file.empty()) j["f"] = e.file;
-        if (!e.bindRefusal.empty()) j["br"] = e.bindRefusal;
+        const std::string& refusal = e.isCxx ? e.sourceBindRefusal : e.bindRefusal;
+        if (!refusal.empty()) j["br"] = refusal;
         // C++ identity must round-trip: without it a warm cache calls the demangled name and
         // silently drops the throwing-call gate.
         if (!e.linkageName.empty()) j["lk"] = e.linkageName;
@@ -1990,6 +2000,8 @@ LLVMBackend::CSigEntry LLVMBackend::SigFromJson(const SjVal& j)
         e.isNoexcept = !j.value("nx", false);
         e.file     = j.value("f",  std::string{});
         e.bindRefusal = j.value("br", std::string{});
+        e.sourceBindRefusal = e.bindRefusal;
+        e.needsCxxRebind = e.isCxx;
         e.line     = j.value("ln", 1);
         e.col      = j.value("co", 0);
         if (j.contains("ps")) for (const auto& p : j["ps"]) e.params.push_back(TvFromJson(p));
@@ -2622,7 +2634,8 @@ bool LLVMBackend::TryLoadCHeaderDiskCache(
         // "reference members are not supported" layout refusal and an empty field list for it.
         // v68 stores the class-template specializations a record holds by value as records of
         // their own, so a field of such a type is laid out instead of embedded as opaque bytes.
-        if (version != 68) return cacheMiss("cache version");
+        // v69 makes cached C++ signature payloads key-pure by remapping foreign types on replay.
+        if (version != 69) return cacheMiss("cache version");
 
         if (!expectedRequestKey.empty()
             && j.value("cxxRequestKey", std::string{}) != expectedRequestKey)
@@ -2846,7 +2859,8 @@ void LLVMBackend::WriteCHeaderDiskCache(
         if (ec) return;
 
         nlohmann::json j;
-        j["version"] = 68;
+        // v69 makes cached C++ signature payloads key-pure by remapping foreign types on replay.
+        j["version"] = 69;
         j["mtime"]   = (int64_t)mtime.time_since_epoch().count();
         j["hash"]    = contentHash;
         j["ldw"]     = entry.longDoubleWidth;

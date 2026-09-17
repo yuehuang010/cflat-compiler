@@ -4584,6 +4584,10 @@ void LLVMBackend::ResetForReanalysis()
     cxxNontrivialRecords_.clear();
     cxxClasses_.clear();
     cxxRecordEntries_.clear();
+    cxxRebindParameterMappings_.clear();
+    cxxRebindReturnMappings_.clear();
+    cxxRecordSpellingIndex_.clear();
+    cxxRecordSpellingIndexDirty_ = true;
     cxxRefusedMemberRebindInFlight_.clear();
     cxxInheritedRebindInFlight_.clear();
     // Per-analysis ABI facts, keyed by class name / linkage name. A later analysis can reuse a

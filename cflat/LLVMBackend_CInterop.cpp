@@ -1078,7 +1078,6 @@ bool LLVMBackend::TryMapCxxForeignSpelling(const std::string& ctype, TypeAndValu
                                            bool& mapped) const
 {
         mapped = false;
-        if (cxxForeignTypeSpellings_.empty()) return false;
         if (ctype.find('(') != std::string::npos) return false;   // function pointer / function type
         std::string s = ctype;
         int ptr = 0;
@@ -1123,10 +1122,31 @@ bool LLVMBackend::TryMapCxxForeignSpelling(const std::string& ctype, TypeAndValu
                 if (s.rfind(w, 0) == 0) { s.erase(0, std::strlen(w)); peeled = true; break; }
         }
 
-        auto it = cxxForeignTypeSpellings_.find(SqueezeCxxSpelling(s));
-        if (it == cxxForeignTypeSpellings_.end()) return false;
+        const std::string squeezed = SqueezeCxxSpelling(s);
+        std::string foreignName;
+        if (auto it = cxxForeignTypeSpellings_.find(squeezed);
+            it != cxxForeignTypeSpellings_.end())
+            foreignName = it->second;
+        else
+        {
+            // Generated-wrapper replay can see the requested record before the reverse spelling
+            // map is rebuilt. Index the fallback once instead of scanning every record per lookup.
+            if (cxxRecordSpellingIndexDirty_)
+            {
+                cxxRecordSpellingIndex_.clear();
+                for (const auto& [name, record] : cxxRecordEntries_)
+                    if (!record.canonicalCtype.empty())
+                        cxxRecordSpellingIndex_.try_emplace(
+                            StripCxxRecordTag(record.canonicalCtype), name);
+                cxxRecordSpellingIndexDirty_ = false;
+            }
+            if (auto it = cxxRecordSpellingIndex_.find(squeezed);
+                it != cxxRecordSpellingIndex_.end())
+                foreignName = it->second;
+        }
+        if (foreignName.empty()) return false;
         out = TypeAndValue{};
-        out.TypeName = it->second;
+        out.TypeName = foreignName;
         out.IsRvalueRef = ptr > 0 && ctype.find("&&") != std::string::npos;
         if (ptr > 0) out.Pointer = true;
         if (ptr > 1) out.ElemPointer = true;
@@ -1425,8 +1445,18 @@ void LLVMBackend::SeedCxxNamespacesOfDottedName(const std::string& dottedName)
 void LLVMBackend::RegisterCSignatures(const std::vector<CSigEntry>& sigs, const std::string& fileForLsp,
                              const std::string& programAlias)
 {
+        std::vector<CSigEntry> rebound;
+        const std::vector<CSigEntry>* signatures = &sigs;
+        if (std::any_of(sigs.begin(), sigs.end(), [](const CSigEntry& e) {
+                return e.needsCxxRebind;
+            }))
+        {
+            rebound = sigs;
+            RebindCxxCachedSignatures(rebound);
+            signatures = &rebound;
+        }
         std::unordered_map<std::string, std::string> stdFunctionClasses;
-        for (const CSigEntry& e : sigs)
+        for (const CSigEntry& e : *signatures)
         {
             if (e.isCxx)
             {
@@ -1874,6 +1904,7 @@ bool LLVMBackend::MapRawSig(const cflat_cinterop::RawSig& r, CSigEntry& e)
         e.isNoexcept = r.isNoexcept;
         e.paramNames = r.paramNames;
         e.bindRefusal = r.bindRefusal;
+        e.sourceBindRefusal = r.bindRefusal;
         e.variadic = r.variadic;
         e.file     = r.file;
         e.line     = r.line ? r.line : 1;
@@ -1969,6 +2000,117 @@ bool LLVMBackend::MapRawSig(const cflat_cinterop::RawSig& r, CSigEntry& e)
             e.params.push_back(std::move(ptv));
         }
         return true;
+    }
+
+void LLVMBackend::RebindCxxCachedSignatures(std::vector<CSigEntry>& sigs)
+{
+        llvm::TimeTraceScope scope("RebindCxxCachedSignatures", std::to_string(sigs.size()));
+        const size_t foreignSpellingCount = cxxForeignTypeSpellings_.size();
+        const size_t recordCount = cxxRecordEntries_.size();
+        auto mapParameter = [&](const std::string& spelling) -> const CxxRebindTypeMapping& {
+            auto& mapping = cxxRebindParameterMappings_[spelling];
+            if (mapping.initialized
+                && mapping.foreignSpellingCount == foreignSpellingCount
+                && mapping.recordCount == recordCount)
+                return mapping;
+            mapping = CxxRebindTypeMapping{};
+            mapping.initialized = true;
+            mapping.foreignSpellingCount = foreignSpellingCount;
+            mapping.recordCount = recordCount;
+            cflat_cinterop::RawSig raw;
+            raw.name = "__cflat_rebind";
+            raw.retType = "void";
+            raw.paramTypes = { spelling };
+            raw.paramNames = { "p" };
+            raw.isCxx = true;
+            CSigEntry mapped;
+            mapping.mapped = MapRawSig(raw, mapped)
+                && mapped.bindRefusal.empty() && mapped.params.size() == 1;
+            if (mapping.mapped) mapping.value = std::move(mapped.params.front());
+            return mapping;
+        };
+        auto mapReturn = [&](const std::string& spelling) -> const CxxRebindTypeMapping& {
+            auto& mapping = cxxRebindReturnMappings_[spelling];
+            if (mapping.initialized
+                && mapping.foreignSpellingCount == foreignSpellingCount
+                && mapping.recordCount == recordCount)
+                return mapping;
+            mapping = CxxRebindTypeMapping{};
+            mapping.initialized = true;
+            mapping.foreignSpellingCount = foreignSpellingCount;
+            mapping.recordCount = recordCount;
+            cflat_cinterop::RawSig raw;
+            raw.name = "__cflat_rebind";
+            raw.retType = spelling;
+            raw.isCxx = true;
+            CSigEntry mapped;
+            mapping.mapped = MapRawSig(raw, mapped)
+                && mapped.bindRefusal.empty();
+            if (mapping.mapped) mapping.value = std::move(mapped.ret);
+            return mapping;
+        };
+        for (CSigEntry& cached : sigs)
+        {
+            if (!cached.needsCxxRebind
+                || !cached.sourceBindRefusal.empty()
+                || (cached.paramSpellings.empty() && cached.retSpelling.empty()))
+            {
+                cached.needsCxxRebind = false;
+                continue;
+            }
+            cached.ret = TypeAndValue{};
+            cached.params.clear();
+            cached.bindRefusal = cached.sourceBindRefusal;
+            bool failed = false;
+            if (!cached.retSpelling.empty())
+            {
+                const CxxRebindTypeMapping& mapping = mapReturn(cached.retSpelling);
+                if (!mapping.mapped)
+                {
+                    failed = true;
+                }
+                else
+                    cached.ret = mapping.value;
+            }
+            for (size_t i = 0; !failed && i < cached.paramSpellings.size(); ++i)
+            {
+                const CxxRebindTypeMapping& mapping = mapParameter(cached.paramSpellings[i]);
+                if (!mapping.mapped)
+                {
+                    failed = true;
+                    break;
+                }
+                TypeAndValue parameter = mapping.value;
+                if (i < cached.paramNames.size()) parameter.VariableName = cached.paramNames[i];
+                cached.params.push_back(std::move(parameter));
+            }
+            if (failed)
+            {
+                // Re-run the complete mapper only for an unsupported spelling so its diagnostic
+                // retains the actual function and parameter names.
+                cflat_cinterop::RawSig raw;
+                raw.name = cached.name;
+                raw.linkageName = cached.linkageName;
+                raw.retType = cached.retSpelling;
+                raw.paramTypes = cached.paramSpellings;
+                raw.paramNames = cached.paramNames;
+                raw.defaultArgs = cached.defaultArgs;
+                raw.variadic = cached.variadic;
+                raw.isCxx = true;
+                raw.isNoexcept = cached.isNoexcept;
+                raw.bindRefusal = cached.sourceBindRefusal;
+                raw.abi = cached.abi;
+                raw.file = cached.file;
+                raw.line = cached.line;
+                raw.col = cached.col;
+                CSigEntry remapped;
+                if (!MapRawSig(raw, remapped)) continue;
+                cached = std::move(remapped);
+            }
+            cached.needsCxxRebind = false;
+            if (!cached.sourceBindRefusal.empty())
+                cached.bindRefusal = cached.sourceBindRefusal;
+        }
     }
 
 static std::string CxxMemberValueSpelling(const std::string& spelling)
@@ -2223,13 +2365,23 @@ bool LLVMBackend::RequestCxxSignatureTypes(const cflat_cinterop::RawSig& sig,
 // signature names; a cached entry stores only the spellings, so request them again here.
 void LLVMBackend::RequestCxxSignatureTypes(const std::vector<CSigEntry>& sigs)
 {
+        std::unordered_set<std::string> spellings;
+        std::vector<std::string> orderedSpellings;
         for (const CSigEntry& e : sigs)
         {
             if (!e.isCxx) continue;
+            auto addSpelling = [&](const std::string& spelling) {
+                if (!spelling.empty() && spellings.insert(spelling).second)
+                    orderedSpellings.push_back(spelling);
+            };
+            addSpelling(e.retSpelling);
+            for (const std::string& spelling : e.paramSpellings) addSpelling(spelling);
+        }
+        for (const std::string& spelling : orderedSpellings)
+        {
             cflat_cinterop::RawSig raw;
             raw.isCxx = true;
-            raw.retType = e.retSpelling;
-            raw.paramTypes = e.paramSpellings;
+            raw.retType = spelling;
             RequestCxxSignatureTypes(raw);
         }
 }
@@ -5059,6 +5211,8 @@ bool LLVMBackend::RequestGeneratedCxxWrapper(const CxxRequestGroup& group,
         }
         if (!emitDefinitions) requestBitcode.clear();
         RequestCxxSignatureTypes(requestSigs);
+        if (cached)
+            RebindCxxCachedSignatures(requestSigs);
         if (emitDefinitions) AdoptCxxCompanionBitcode(requestBitcode);
         signature = std::move(requestSigs.front());
         return true;
@@ -7716,6 +7870,7 @@ bool LLVMBackend::RequestCxxForeignType(const std::string& cflatName, const std:
             if (refreshed != nullptr)
             {
                 cxxRecordEntries_[cflatName] = *refreshed;
+                cxxRecordSpellingIndexDirty_ = true;
                 /*
                  * The tentative pass saw the argument class as a forward declaration only, so
                  * every member whose signature named it by VALUE or by REFERENCE (shared_ptr's
@@ -9678,6 +9833,7 @@ void LLVMBackend::RegisterCxxClassMembers(const CRecordEntry& r, const std::stri
 {
         if (!r.isCxx) return;
         cxxRecordEntries_[r.name] = r;
+        cxxRecordSpellingIndexDirty_ = true;
         // A class whose layout was REFUSED still needs its CxxClassInfo: that is where the refusal
         // text and the field list the diagnostic reads from live.
         // Empty C++ classes still have constructors/destructors and are valid foreign types.
@@ -10671,6 +10827,7 @@ bool LLVMBackend::TryBindRefusedCxxMember(const std::string& typeName,
         {
             cxxClasses_[typeName] = previousInfo;
             cxxRecordEntries_[typeName] = previousRecord;
+            cxxRecordSpellingIndexDirty_ = true;
             return false;
         }
 
