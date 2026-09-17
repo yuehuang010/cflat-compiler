@@ -1,6 +1,71 @@
 #include "MainListener.h"
 #include <llvm/Support/SaveAndRestore.h>
 
+// The only postfix suffixes that may follow a member and still STORE to it: `obj.r++`.
+static bool IsIncrementSuffix(antlr4::tree::ParseTree* node)
+{
+    const std::string t = node == nullptr ? std::string{} : node->getText();
+    return t == "++" || t == "--";
+}
+
+/*
+ * True when the member `child` names is the destination of a store: either the postfix expression
+ * `ctx` increments it (`obj.r++`), or `child` is the LAST suffix of `ctx` and `ctx` is the whole
+ * left-hand side of an assignment. Only parentheses and single-child pass-through rules may sit
+ * between `ctx` and that left-hand side, so `(obj.r) = v` counts but `obj.r + 1 == v` does not.
+ * A unary operator in front (`*obj.r = v`) makes the assignment's unaryExpression take the
+ * operator alternative, so the climb reaches it as a non-value parent and the answer is false.
+ */
+static bool MemberIsAssignmentDestination(CFlatParser::PostfixExpressionContext* ctx,
+                                          antlr4::tree::ParseTree* child)
+{
+    if (ctx == nullptr || ctx->children.empty() || child == nullptr) return false;
+    // `child` is the identifier token inside a memberNameToken rule, so climb to the direct
+    // child of ctx first; anything after it must be an increment to still be a store.
+    antlr4::tree::ParseTree* suffix = child;
+    while (suffix != nullptr && suffix->parent != ctx) suffix = suffix->parent;
+    if (suffix == nullptr) return false;
+    if (ctx->children.back() != suffix)
+    {
+        size_t at = 0;
+        while (at < ctx->children.size() && ctx->children[at] != suffix) ++at;
+        for (size_t i = at + 1; i < ctx->children.size(); ++i)
+            if (!IsIncrementSuffix(ctx->children[i])) return false;
+        return true;
+    }
+    // Climb while the node is the WHOLE value of its parent, so only a form that assigns to the
+    // member itself reaches the assignment. `(obj.r)++` increments through the parentheses too.
+    for (antlr4::tree::ParseTree* node = ctx; node->parent != nullptr; node = node->parent)
+    {
+        antlr4::tree::ParseTree* parent = node->parent;
+        auto* assign = dynamic_cast<CFlatParser::AssignmentExpressionContext*>(parent);
+        if (assign != nullptr && assign->assignmentOperator() != nullptr)
+        {
+            // Only the left-hand side stores; an operator-less assignmentExpression is the
+            // pass-through the rules below climb over.
+            auto* un = dynamic_cast<CFlatParser::UnaryExpressionContext*>(node);
+            return un != nullptr && assign->unaryExpression() == un;
+        }
+        if (parent->children.size() == 1) continue;
+        if (dynamic_cast<CFlatParser::PostfixExpressionContext*>(parent) != nullptr
+            && parent->children.front() == node)
+        {
+            bool allIncrements = true;
+            for (size_t i = 1; i < parent->children.size(); ++i)
+                if (!IsIncrementSuffix(parent->children[i])) allIncrements = false;
+            if (allIncrements) return true;
+            return false;
+        }
+        // A parenthesized sub-expression - `(obj.r) = v` stores to the member just the same.
+        if (parent->children.size() == 3 && parent->children[1] == node
+            && parent->children.front()->getText() == "("
+            && parent->children.back()->getText() == ")")
+            continue;
+        return false;
+    }
+    return false;
+}
+
 static bool JsonConstIdentifier(const std::string& text)
 {
     if (text.empty() || (!std::isalpha((unsigned char)text[0]) && text[0] != '_')) return false;
@@ -1701,6 +1766,13 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 Compiler(ctx)->RejectInaccessibleCxxMember(
                                     structVar.TypeAndValue.TypeName, primaryIdentifier,
                                     structVar.TypeAndValue.VariableName == "this");
+
+                            // [PFX-2c-ref] A C++ reference member binds as a pointer field, so a
+                            // store to it would reseat the reference - which C++ cannot express.
+                            if (!structVar.TypeAndValue.TypeName.empty()
+                                && MemberIsAssignmentDestination(ctx, terminal))
+                                Compiler(ctx)->RejectCxxReferenceFieldStore(
+                                    structVar.TypeAndValue.TypeName, primaryIdentifier);
 
                             // [PFX-2a] Consumed-COM member sugar: on a thin COM interface pointer - a struct
                             // whose SOLE field `lpVtbl` points at a vtable of function-pointer slots - a name

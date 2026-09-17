@@ -245,6 +245,11 @@
 //                       class and another specialization, the call in statement / argument
 //                       / condition position, a specialization instantiated ONLY by the
 //                       static call, and the spelling inside a CFlat generic body.
+//   Section M97 (1850-1869): C++ REFERENCE data members - a `T&` / `T&&` / `T*&` member bound
+//                       as a pointer field (layout, by-value return and argument, direct
+//                       construction, reads through the referent), in a base class, in a class
+//                       template specialization, and in an array element. Reseating the field is
+//                       refused; Test/errors/err_cpp_reference_member_reseat.cb pins the message.
 // Section M: C++ interop - `import cpp` selects C++ mode; the extension is irrelevant (the
 // fixture header is a plain .h). The header supplies the declarations, the .cpp is compiled
 // by the host C++ driver and linked in. Both are needed: the header alone has no
@@ -278,6 +283,8 @@ import cpp "library/cpp_interop_throw.h" cache;
 import cpp "library/cpp_interop_scoped_enum.h" cache;
 import cpp "library/cpp_interop_nsstd.h" cache;
 import cpp "library/cpp_interop_strop.h" cache;
+// Section M97: C++ REFERENCE data members - bound as pointer fields, never reseatable.
+import cpp "library/cpp_interop_ref_member.h" cache;
 import "list.cb";
 import "thread.cb";
 import "malloc_allocator.cb";
@@ -4260,6 +4267,63 @@ extern int main()
     m94cs += "cd";
     if (m94cs.length() != 4) return 1804;
     if (m94cs != "abcd") return 1805;
+    // ---- Section M97: C++ reference data members (1850-1869) ----------------------------
+    // Before the fix every leg below except the RefDerived ones failed to COMPILE: a reference
+    // member set a layout refusal, so the record was laid out with no fields at all.
+    int m97x = 5;
+    cppref.RefHolder m97h = cppref.make_ref(&m97x);      // by-value return of the record
+    if (m97h.get() != 5)                             return 1850;
+    m97h.set(7);
+    if (m97x != 7)                                   return 1851;
+    if (*m97h.r != 7)                                return 1852;   // the field IS the pointer
+    *m97h.r = 9;                                                     // store to the REFERENT
+    if (m97x != 9 || m97h.get() != 9)                return 1853;
+    int* m97p = m97h.r;                                              // read the field as T*
+    if (*m97p != 9)                                  return 1854;
+
+    cppref.RefHolder m97d = cppref.RefHolder(&m97x);     // direct construction
+    if (m97d.get() != 9)                             return 1855;
+    if (cppref.take_ref(m97d) != 9)                  return 1856;    // by-value argument
+
+    // Layout agrees with clang's own sizeof, so the ABI self-check has real numbers to match.
+    if (sizeof(cppref.RefHolder) != cppref.size_ref_holder())   return 1857;
+    if (sizeof(cppref.RefDerived) != cppref.size_ref_derived()) return 1858;
+    if (sizeof(cppref.TRef<int>) != cppref.size_tref_int())     return 1859;
+
+    cppref.Val m97v = default; m97v.a = 3; m97v.b = 4;
+    cppref.ClassRef m97cr = cppref.ClassRef(&m97v);      // reference to a CLASS
+    if (m97cr.sum() != 7)                            return 1860;
+
+    int m97c = 11;
+    cppref.ConstRef m97const = cppref.ConstRef(&m97c);   // reference to a const int
+    if (m97const.get() != 11)                        return 1861;
+
+    int m97rv = 13;
+    cppref.RvalRef m97rr = cppref.RvalRef(&m97rv);       // RVALUE reference member
+    if (m97rr.get() != 13)                           return 1862;
+
+    int m97t = 17;
+    int* m97tp = &m97t;
+    cppref.PtrRef m97pr = cppref.PtrRef(&m97tp);         // reference to a POINTER
+    if (m97pr.get() != 17)                           return 1863;
+
+    // ACCEPT SET: RefDerived has a base, so it took the FLATTENED field walk and already bound
+    // before the fix. These three legs pin that the flatten path is unchanged.
+    int m97b = 19;
+    cppref.RefDerived m97der = cppref.RefDerived(&m97b, 3);   // reference member in a BASE
+    if (m97der.total() != 22)                        return 1864;
+    if (m97der.extra != 3 || *m97der.r != 19)        return 1865;
+    if (m97der.base_get() != 19)                     return 1866;
+
+    int m97g = 21;
+    cppref.TRef<int> m97tr = cppref.TRef<int>(&m97g);    // class TEMPLATE with a `T&` member
+    if (m97tr.get() != 21)                           return 1867;
+    m97tr.set(23);
+    if (m97g != 23)                                  return 1868;
+
+    int m97e1 = 4; int m97e2 = 6;                                    // array of such records
+    cppref.RefHolder[2] m97arr = { cppref.RefHolder(&m97e1), cppref.RefHolder(&m97e2) };
+    if (m97arr[0].get() != 4 || m97arr[1].get() != 6) return 1869;
 
     return 0;
 }

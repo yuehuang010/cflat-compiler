@@ -1309,12 +1309,9 @@ namespace cflat_cinterop
                     rf.access = MapAccess(f->getAccess());
                     rf.offsetBytes = layout.getFieldOffset(f->getFieldIndex()) / 8;
                     RecordRawFieldLayout(f->getType(), rf);
-                    if (st.req.cxxMode && f->getType()->isReferenceType())
-                    {
-                        rec.layoutRefusal = std::format(
-                            "field '{}' of '{}' is a C++ reference; reference members are not supported",
-                            rf.name, tag);
-                    }
+                    // A reference member is a pointer-sized slot in every ABI cflat targets, and
+                    // the type mapper already peels the '&' - so it binds as `T*`, exactly as the
+                    // flattened (base/vptr) field walk in FlattenCxxLayout already does.
 
                     // Named field whose type is a *truly unnamed* (no tag, no typedef-for-linkage
                     // name) record - the `_LARGE_INTEGER::u` shape: `struct { DWORD LowPart;

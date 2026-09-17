@@ -9475,6 +9475,22 @@ bool LLVMBackend::EmitCxxVirtualDelete(const std::string& typeName, llvm::Value*
         return true;
     }
 
+/*
+ * A C++ reference member binds as a pointer field, so a CFlat store through it would RESEAT the
+ * reference - which C++ has no syntax for. Refuse the store and point at the referent instead.
+ */
+bool LLVMBackend::RejectCxxReferenceFieldStore(const std::string& typeName,
+                                               const std::string& memberName)
+{
+        const CxxClassInfo* info = GetCxxClassInfo(typeName);
+        if (info == nullptr || info->referenceFields.count(memberName) == 0) return false;
+        LogError(std::format(
+            "field '{}' of C++ class '{}' is a C++ reference and cannot be reseated; assign to the "
+            "referent by dereferencing the field instead.",
+            memberName, typeName));
+        return true;
+    }
+
 bool LLVMBackend::RejectInaccessibleCxxMember(const std::string& typeName,
                                               const std::string& memberName,
                                               bool accessedThroughCurrentObject)
@@ -9665,7 +9681,13 @@ void LLVMBackend::RegisterCxxClassMembers(const CRecordEntry& r, const std::stri
             info.hasCopyCtor           = r.hasCopyCtor;
             info.isAggregate           = r.isAggregate;
             for (const auto& f : r.fields)
-                if (!f.name.empty()) info.fieldAccess[f.name] = f.access;
+            {
+                if (f.name.empty()) continue;
+                info.fieldAccess[f.name] = f.access;
+                std::string ct = f.ctype;
+                while (!ct.empty() && std::isspace((unsigned char)ct.back())) ct.pop_back();
+                if (!ct.empty() && ct.back() == '&') info.referenceFields.insert(f.name);
+            }
         }
 
         // A member's declared type, mapped through the shared C spelling mapper. A pointer to a

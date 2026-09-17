@@ -2588,7 +2588,9 @@ bool LLVMBackend::TryLoadCHeaderDiskCache(
         // rvalue-qualified overloads.
         // v66 folds a non-constexpr `static const` member initialized in class, so such a member
         // is now present with a constant value where an older cache omitted it entirely.
-        if (version != 66) return cacheMiss("cache version");
+        // v67 binds a C++ REFERENCE data member as a pointer field: an older cache carries the
+        // "reference members are not supported" layout refusal and an empty field list for it.
+        if (version != 67) return cacheMiss("cache version");
 
         if (!expectedRequestKey.empty()
             && j.value("cxxRequestKey", std::string{}) != expectedRequestKey)
@@ -2812,7 +2814,7 @@ void LLVMBackend::WriteCHeaderDiskCache(
         if (ec) return;
 
         nlohmann::json j;
-        j["version"] = 66;
+        j["version"] = 67;
         j["mtime"]   = (int64_t)mtime.time_since_epoch().count();
         j["hash"]    = contentHash;
         j["ldw"]     = entry.longDoubleWidth;

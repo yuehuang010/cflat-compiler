@@ -7521,6 +7521,9 @@ public:
         bool isAggregate = false;
         // Field name -> access, for the "is private" diagnostic on member access.
         std::map<std::string, int> fieldAccess;
+        // Fields declared `T&` / `T&&`. They bind as `T*`, but C++ cannot RESEAT a reference,
+        // so a store through the CFlat field name is refused at the use site.
+        std::set<std::string> referenceFields;
         // Member name -> access of the best (most accessible) overload, for method calls whose
         // name resolves to nothing because every candidate was filtered out.
         std::map<std::string, int> memberAccess;
@@ -7690,6 +7693,7 @@ public:
      */
     bool RejectInaccessibleCxxMember(const std::string& typeName, const std::string& memberName,
                                      bool accessedThroughCurrentObject = false);
+    bool RejectCxxReferenceFieldStore(const std::string& typeName, const std::string& memberName);
     bool CxxProtectedAccessAllowed(const std::string& typeName,
                                    bool accessedThroughCurrentObject) const;
 
