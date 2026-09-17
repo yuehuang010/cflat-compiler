@@ -1,7 +1,7 @@
 import cpp "cpp_interop_ref_member.h";
 
 /*
- * A C++ reference data member binds as a pointer field (Test/test_cpp_interop.cb section M97),
+ * A C++ reference data member binds as a pointer field (see the C++ reference data members section of Test/test_cpp_interop.cb),
  * so a STORE to the field would RESEAT the reference - which C++ has no syntax for. Reading the
  * field and storing through it (`*h.r = v`) stay legal; only the direct store is refused. The
  * second leg is the flattened (base-class) field walk, which is a separate collection path.

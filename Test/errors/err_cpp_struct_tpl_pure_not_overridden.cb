@@ -1,7 +1,7 @@
 import cpp "cpp_interop_tpl.h";
 
-expect_error("does not override pure virtual method 'cppt.m76.Shape2$int.area'") {
-    struct Bad : cppt.m76.Shape2<int>
+expect_error("does not override pure virtual method 'cppt.tplbase.Shape2$int.area'") {
+    struct Bad : cppt.tplbase.Shape2<int>
     {
     };
 }

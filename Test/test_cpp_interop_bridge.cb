@@ -1,0 +1,1220 @@
+// C++-interop coverage: the CFlat BRIDGE. Everything here is CFlat code that C++ sees -
+// CFlat-defined [cpp] structs (plain, derived, generic), CFlat functions reached through
+// the reverse C++ ABI, and std::function handed a CFlat callable. New bridge work goes
+// in this file. The plain C++ surface is in Test/test_cpp_interop.cb; templates and std::
+// specializations are in Test/test_cpp_interop_template.cb.
+
+// End-to-end C++-interop coverage. Each section exercises one path of the C++ interop
+// pipeline; on failure the section's exit code identifies which one regressed.
+//   CFlat-defined no-base [cpp] structs - fields, layout, structors, ownership, move,
+//     nesting, methods, static methods, and ctor edges.
+//   CFlat-defined derived [cpp] structs - one C++ base, construction, overrides, virtual
+//     dispatch, protected access, and diagnostics.
+//   C++ struct return adoption, destructor counts, and closure rows.
+//   C++ class-template specializations as [cpp] struct bases, including base initializers,
+//     virtual dispatch, move cleanup, and fields.
+//   C++ by-value return temporaries and inherited member-template lookup, including
+//     constructor and sret returns, nested returns, unrelated temps, and implicit/explicit
+//     receiver spellings.
+//   std::make_shared/std::shared_ptr of CFlat-defined [cpp] structs, generated
+//     constructors/destructors, virtual dispatch, conversions, recursive template arguments,
+//     incomplete ordering, move ownership, promotion, receiver sret, member-template
+//     overloads, and ref/value rank.
+//   Generic CFlat-defined [cpp] structs - one C++ class per instantiation, dependent C++ base
+//     initializers, override dispatch, destructor counts, move construction, and a no-base
+//     field generic.
+//   Initializing a local of a NONTRIVIAL C++ class from an lvalue that is not a bare
+//     identifier - a dot field, an arrow field, a dereference, a namespace-scope object and a
+//     vector element - must copy-CONSTRUCT. Every leg reads a refcount or a heap string the
+//     source still owns, so a bitwise store (the pre-fix lowering) shows up as a low
+//     use_count and a double release.
+//   std::function as a C++ MEMBER parameter (by value, by const&, by &&, on a static member,
+//     on a constructor) and as a RETURN type (free function, member, static member; called
+//     directly and through a CFlat local), plus a member that STORES the callable and runs it
+//     after the CFlat frame that made it is gone, the void() and int(const std::string&)
+//     signatures, and the free-function forms of the same signatures already covered by the
+//     plain-CFlat-function checks. Every member position was refused ("takes/returns
+//     unsupported type") while the free-function parameter one bound.
+
+import cpp "library/cpp_interop_basic.h" cache;
+import cpp "library/cpp_interop_basic.cpp" cache;
+// Inheritance and virtual dispatch. Definitions are out-of-line on purpose - every
+// virtual function needs a real symbol and the vtable needs a key function.
+import cpp "library/cpp_interop_poly.h" cache;
+import cpp "library/cpp_interop_poly.cpp" cache;
+// The CFlat-defined [cpp] structs below derive from C++ class-template specializations, and
+// the make_shared checks register them through std::shared_ptr.
+import cpp "library/cpp_interop_tpl.h" cache;
+import cpp "vector" cache;
+import cpp "string" cache;
+import cpp "memory" cache;
+import cpp "functional" cache;
+// std::function as a MEMBER parameter and as a RETURN type.
+import cpp "library/cpp_interop_stdfn.h" cache;
+
+int sharedGlobal = 42;
+extern int strcmp(const char* a, const char* b);
+int cbAdd(int a, int b) { return a + b; }
+int cbTwice(int x) { return x * 2; }
+
+// Callables handed to C++ through std::function.
+int stdfn_twice(int x) { return x * 2; }
+int stdfn_bumped = 0;
+void stdfn_bump() { stdfn_bumped = stdfn_bumped + 1; }
+int stdfn_len(alias std.string s) { return (int)s.size(); }
+
+// The CFlat std.function local dies with this frame; the handler C++ stored must survive it.
+void stdfn_install(alias cppfn.Holder h)
+{
+    std.function<int(int)> local = std.function<int(int)>(stdfn_twice);
+    h.set_handler(local);
+}
+
+int cbMixedOut(cppi.Mixed m, char** out) { *out = "callback-out"; return m.i + (int)m.d; }
+cppi.Mixed cbMixed(cppi.Mixed m) { m.d = m.d + 1.0; m.i = m.i + 1; return m; }
+cppi.Large cbLarge(cppi.Large v)
+{
+    v.x = v.x + 1; v.y = v.y + 1; v.z = v.z + 1; return v;
+}
+cppi.Hfa cbHfa(cppi.Hfa v)
+{
+    v.a = v.a + 1.0f; v.b = v.b + 1.0f; v.c = v.c + 1.0f; v.d = v.d + 1.0f; return v;
+}
+int cbVisit(cppi.Tracked* t, void* ctx)
+{
+    int* state = (int*)ctx;
+    if (cppi.dtor_count() != 0) state[1] = 1;
+    state[0] = state[0] + 1;
+    return t.value();
+}
+
+int g_nobase_dtor = 0;
+int g_nobase_resource_dtor = 0;
+
+struct NoBaseResource
+{
+    ~NoBaseResource() { g_nobase_resource_dtor = g_nobase_resource_dtor + 1; }
+};
+
+[cpp] struct Plain
+{
+    int a = 1;
+    string name = "seed";
+    unique NoBaseResource* resource = new NoBaseResource();
+    int second = 17;
+
+    Plain(int v) { a = v; }
+    ~Plain() { g_nobase_dtor = g_nobase_dtor + 1; }
+    int total() { return a * 2; }
+    static int make_tag() { return 7; }
+};
+
+[cpp] struct NoBaseDefault
+{
+    int v = 3;
+    ~NoBaseDefault() { g_nobase_dtor = g_nobase_dtor + 1; }
+};
+
+struct NoBasePlainOuter
+{
+    NoBaseDefault inner = default;
+};
+
+[cpp] struct NoBaseCppOuter
+{
+    NoBaseDefault inner = default;
+};
+
+[cpp] struct NoBaseOffsets
+{
+    int a = 1;
+    i64 b = 2;
+    int offset() { return (int)(((i64)&b) - ((i64)&a)); }
+};
+
+namespace nobase
+{
+    [cpp] struct Q
+    {
+        int v = 3;
+    };
+}
+
+int g_nobase_early_return = 0;
+
+[cpp] struct NoBaseEarlyReturn
+{
+    unique NoBaseResource* resource = new NoBaseResource();
+    ~NoBaseEarlyReturn()
+    {
+        if (g_nobase_early_return != 0) return;
+    }
+};
+
+[cpp] struct NoBaseNestedDtor
+{
+    int value = 4;
+    ~NoBaseNestedDtor() { g_nobase_dtor = g_nobase_dtor + 1; }
+};
+
+[cpp] struct NoBaseMoveNested
+{
+    NoBaseNestedDtor inner = default;
+};
+
+[cpp] struct NoBaseOverloads
+{
+    int value = 0;
+    NoBaseOverloads(int x) { value = x; }
+    NoBaseOverloads(int x, int y) { value = x * 10 + y; }
+};
+
+[cpp] struct NoBaseDefaultParam
+{
+    int value = 0;
+    NoBaseDefaultParam(int x = 7) { value = x; }
+};
+
+[cpp] struct alignas(16) NoBaseAligned
+{
+    int value = 3;
+};
+
+struct MyCircle : cpppoly.Shape
+{
+    int r = 3;
+    override int area() { return local_area(); }
+    int local_area() { return r * r; }
+    ~MyCircle() { g_nobase_dtor = g_nobase_dtor + 1; }
+};
+
+struct T2 : cpppoly.Tagged
+{
+    T2(int x) : cpppoly.Tagged(x) { }
+};
+
+struct T2Literal : cpppoly.Tagged
+{
+    T2Literal() : cpppoly.Tagged(42) { }
+};
+
+struct ScaleImpl : cpppoly.Scaler
+{
+    override double scale(double x, int k) { return x * k + 1.0; }
+    override const char* label() { return "cflat"; }
+    override int adjust(int x) { return x + 10; }
+};
+
+struct AbstractImpl : cpppoly.Abstract
+{
+    override int pure() { return 7; }
+};
+
+struct CircleImpl : cpppoly.Circle
+{
+    override int area() { return radius + 1; }
+};
+
+struct TaggedImpl : cpppoly.Tagged
+{
+    TaggedImpl(int x) : cpppoly.Tagged(x) { }
+    int protected_field() { return prot; }
+    int protected_method() { return prot_get(); }
+    int protected_sum() { return prot + prot_get(); }
+};
+
+struct TaggedMethodImpl : cpppoly.Tagged
+{
+    TaggedMethodImpl(int x) : cpppoly.Tagged(x) { }
+    int method_only() { return prot_get(); }
+};
+
+struct P2 : cpppoly.Pinned
+{
+    override int v() { return 23; }
+};
+
+struct G2 : cpppoly.Guarded
+{
+    override int hidden() { return 3; }
+};
+
+namespace derived
+{
+    [cpp] struct NamespacedCircle : cpppoly.Shape
+    {
+        override int area() { return 12; }
+    };
+}
+
+[cpp] struct ExplicitCircle : cpppoly.Shape
+{
+    override int area() { return 13; }
+};
+
+struct AdoptReturn : cpppoly.Shape
+{
+    int r = 4;
+    override int area() { return r * r; }
+    ~AdoptReturn() { g_nobase_dtor = g_nobase_dtor + 1; }
+};
+
+struct TplBaseIntTripler : cppt.tplbase.Holder<int>
+{
+    int extra = 1;
+    TplBaseIntTripler(int v) : cppt.tplbase.Holder<int>(v) { }
+    override int doubled() { return value * 3 + extra; }
+};
+
+struct TplBaseDoubleTripler : cppt.tplbase.Holder<double>
+{
+    double extra = 0.5;
+    TplBaseDoubleTripler(double v) : cppt.tplbase.Holder<double>(v) { }
+    override double doubled() { return value * 4.0 + extra; }
+};
+
+struct TplBaseShape : cppt.tplbase.Shape2<int>
+{
+    override int area() { return 42; }
+};
+
+struct TplBaseMemberTripler : cppt.tplbase.Holder<int>
+{
+    cppt.tplbase.Holder<int> inner = default;
+    TplBaseMemberTripler(int v) : cppt.tplbase.Holder<int>(v) { inner.value = 9; }
+    override int doubled() { return value * 2 + inner.value; }
+};
+
+struct GenericWrap<T> : cppt.tplbase.Holder<T>
+{
+    GenericWrap(T v) : cppt.tplbase.Holder<T>(v) { }
+    override T doubled() { return value + value + 3; }
+};
+
+[cpp] struct GenericValue<T>
+{
+    T value = default;
+    GenericValue(T v) { value = v; }
+};
+
+cppi.Tracked rettemp_free_ctor(int value)
+{
+    return cppi.Tracked(value);
+}
+
+cppi.Tracked rettemp_free_sret(int value)
+{
+    return cppi.make_tracked(value);
+}
+
+cppi.Tracked rettemp_inner(int value)
+{
+    return cppi.make_tracked(value);
+}
+
+cppi.Tracked rettemp_outer(int value)
+{
+    return rettemp_inner(value);
+}
+
+cppi.Tracked rettemp_free_both(int value)
+{
+    return cppi.make_tracked(cppi.Tracked(value).value());
+}
+
+struct RetTempPlainReturns
+{
+    cppi.Tracked ctor_return(int value) { return cppi.Tracked(value); }
+    cppi.Tracked sret_return(int value) { return cppi.make_tracked(value); }
+    cppi.Tracked inner(int value) { return cppi.make_tracked(value); }
+    cppi.Tracked outer(int value) { return inner(value); }
+    cppi.Tracked both(int value)
+    {
+        return cppi.make_tracked(cppi.Tracked(value).value());
+    }
+};
+
+[cpp] struct RetTempCppReturns : cpppoly.Shape
+{
+    cppi.Tracked ctor_return(int value) { return cppi.Tracked(value); }
+    cppi.Tracked sret_return(int value) { return cppi.make_tracked(value); }
+    cppi.Tracked inner(int value) { return cppi.make_tracked(value); }
+    cppi.Tracked outer(int value) { return inner(value); }
+    cppi.Tracked both(int value)
+    {
+        return cppi.make_tracked(cppi.Tracked(value).value());
+    }
+};
+
+[cpp] struct RetTempRegistry : cppt.Registry
+{
+    int ctor_reg = 0;
+    RetTempRegistry() { ctor_reg = reg("x", 3); }
+    int implicit_reg(int value) { return reg("y", value); }
+    int explicit_reg(int value) { return this->reg<int>("z", value); }
+};
+
+struct SharedNet : cppt.ModuleBase
+{
+    std.shared_ptr<SharedLeaf> left = default;
+    std.shared_ptr<SharedLeaf> right = default;
+    SharedNet() {}
+    override int forward(int x) { return call_child(1, call_child(0, x)); }
+};
+
+struct SharedLeaf : cppt.ModuleBase
+{
+    int value = 0;
+    SharedLeaf(int v) { value = v; }
+    override int forward(int x) { return x * value; }
+};
+
+void shared_init_net(SharedNet* net)
+{
+    net->register_child("left", std.make_shared<SharedLeaf>(2));
+    net->register_child("right", std.make_shared<SharedLeaf>(3));
+}
+
+// Same registration, but the handles also land in SharedNet's own shared_ptr FIELDS. SharedNet is
+// declared before SharedLeaf, so those fields were requested against a forward declaration only.
+void shared_bind_net(SharedNet* net)
+{
+    net->left = net->register_child("left", std.make_shared<SharedLeaf>(2));
+    net->right = net->register_child("right", std.make_shared<SharedLeaf>(3));
+}
+
+// A plain CFlat struct whose fields are nontrivial C++ classes, so `box.p` / `bp->p` is a
+// field LVALUE used as a local's initializer. copyctorGlobal covers the namespace-scope object leg.
+struct CopyCtorBox
+{
+    std.shared_ptr<SharedLeaf> p = default;
+    std.string s = default;
+};
+
+std.shared_ptr<SharedLeaf> copyctorGlobal = default;
+
+struct SharedSelf : cppt.ModuleBase
+{
+    std.shared_ptr<SharedSelf> self = default;
+    override int forward(int x) { return x + 1; }
+};
+
+struct SharedHolderBlock : cppt.ModuleBase
+{
+    std.shared_ptr<cppt.ModuleBase> leaf = default;
+    SharedHolderBlock(int v)
+    {
+        cppt.HolderOf<cppt.ModuleBase> holder =
+            cppt.HolderOf<cppt.ModuleBase>(std.make_shared<cppt.ModuleBase>());
+        leaf = register_child("leaf", holder);
+    }
+    override int forward(int x) { return leaf->forward(x) + 1; }
+};
+
+struct SharedHolderNet : cppt.ModuleBase
+{
+    std.shared_ptr<SharedHolderBlock> block = default;
+    SharedHolderNet(int v)
+    {
+        block = register_child("block", std.make_shared<SharedHolderBlock>(v));
+    }
+    override int forward(int x) { return block->forward(x) + 1; }
+};
+
+Plain nobase_make_plain(int value)
+{
+    Plain p = Plain(value);
+    return move p;
+}
+
+Plain nobase_make_plain2()
+{
+    return nobase_make_plain(7);
+}
+
+AdoptReturn adopt_make1()
+{
+    AdoptReturn value = default;
+    return move value;
+}
+
+AdoptReturn adopt_make2()
+{
+    return adopt_make1();
+}
+
+void nobase_bump(Plain* p)
+{
+    p.a = p.a + 1;
+}
+
+extern int main()
+{
+    // Win64 keeps the existing SEH trampoline and does not emit the C++ guard, so the
+    // whole C++-interop surface is verified on the Itanium-ABI hosts only.
+    if const (__WINDOWS__) {
+        return 0;
+    }
+
+    // ---- generic CFlat-defined [cpp] structs ----------------------------------------------------
+    cppt.tplbase.reset_holder_int_dtors();
+    {
+        GenericWrap<int> source = GenericWrap<int>(5);
+        if (source.doubled() != 13) return 1560;
+        if (cppt.tplbase.call_doubled<int>(&source) != 13) return 1561;
+        GenericWrap<int> target = move source;
+        if (target.value != 5 || target.doubled() != 13) return 1562;
+        if (cppt.tplbase.call_doubled<int>(&target) != 13) return 1563;
+        if (cppt.tplbase.holder_int_dtors() != 0) return 1564;
+    }
+    if (cppt.tplbase.holder_int_dtors() != 2) return 1565;
+
+    cppt.tplbase.reset_holder_double_dtors();
+    {
+        GenericWrap<double> value = GenericWrap<double>(2.5);
+        if (value.doubled() != 8.0) return 1566;
+        if (cppt.tplbase.call_doubled<double>(&value) != 8.0) return 1567;
+    }
+    if (cppt.tplbase.holder_double_dtors() != 1) return 1568;
+
+    {
+        GenericValue<int> intValue = GenericValue<int>(17);
+        GenericValue<double> doubleValue = GenericValue<double>(4.5);
+        if (intValue.value != 17) return 1569;
+        if (doubleValue.value != 4.5) return 1570;
+        GenericValue<int> moved = move intValue;
+        if (moved.value != 17) return 1571;
+    }
+
+    // ---- reverse C++ ABI callback entry points --------------------------------------------------
+    if (cppi.apply_int(cbAdd, 20, 22) != 42) return 584;
+
+    cppi.Mixed revM = default;
+    revM.d = 1.5; revM.i = 20;
+    cppi.Mixed revMr = cppi.apply_mixed(cbMixed, revM);
+    if (revMr.d != 2.5 || revMr.i != 21)        return 585;
+
+    cppi.Large revL = default;
+    revL.x = 10; revL.y = 20; revL.z = 30;
+    cppi.Large revLr = cppi.apply_large(cbLarge, revL);
+    if (revLr.x != 11 || revLr.y != 21 || revLr.z != 31) return 588;
+
+    cppi.Hfa revH = default;
+    revH.a = 1.0f; revH.b = 2.0f; revH.c = 3.0f; revH.d = 4.0f;
+    cppi.Hfa revHr = cppi.apply_hfa(cbHfa, revH);
+    if (revHr.a != 2.0f || revHr.b != 3.0f || revHr.c != 4.0f || revHr.d != 5.0f) return 589;
+
+    cppi.reset_counts();
+    int[2] revState = {0, 0};
+    if (cppi.visit_tracked(cbVisit, (void*)revState, 7) != 14) return 590;
+    if (revState[0] != 2)                           return 591;
+    if (revState[1] != 0)                           return 592;
+    if (cppi.ctor_count() != 1)                    return 593;
+    if (cppi.copy_count() != 0)                    return 594;
+    if (cppi.dtor_count() != 1)                    return 595;
+
+    // ---- std::function from a plain CFlat function ----------------------------------------------
+    std.function<int(int)> revF = std.function<int(int)>(cbTwice);
+    if (revF(21) != 42)                             return 610;
+    if (cppi.apply_fn(revF, 5) != 10)               return 611;
+    if (cppi.apply_fn(std.function<int(int)>(cbTwice), 5) != 10) return 612;
+    std.function<int(int)> revFCopy = revF;
+    if (revFCopy(4) != 8)                           return 613;
+    std.function<int(int)> revFCopyCtor = std.function<int(int)>(revF);
+    if (revFCopyCtor(6) != 12)                      return 614;
+    using F = std.function<int(int)>;
+    F revFAlias = std.function<int(int)>(cbTwice);
+    if (revFAlias(7) != 14)                         return 615;
+    std.vector<char*> revPv = default;
+    char* revS = "vector-pointer";
+    revPv.push_back(revS);
+    if (revPv[0] != revS)                             return 616;
+    cppi.Mixed revMo = default; revMo.i = 30; revMo.d = 2.0;
+    char* revOut = nullptr;
+    if (cppi.apply_mixed_out(cbMixedOut, revMo, &revOut) != 32) return 617;
+    if (revOut == nullptr || strcmp(revOut, "callback-out") != 0) return 618;
+
+    // ---- CFlat-defined no-base [cpp] structs ----------------------------------------------------
+    g_nobase_dtor = 0;
+    g_nobase_resource_dtor = 0;
+    {
+        Plain nobasePlain = Plain(5);
+        if (nobasePlain.a != 5) return 1360;
+        if (length(nobasePlain.name) != 4 || nobasePlain.second != 17) return 1361;
+        if (nobasePlain.total() != 10) return 1362;
+        nobasePlain.a = 9;
+        if (nobasePlain.a != 9) return 1364;
+        if (nobasePlain.total() != 18) return 1363;
+        // int (4) + padding (4) + string (16) + unique pointer (8) + int (4)
+        // + tail padding (4) = 40.
+        if (sizeof(Plain) != 4 + 4 + 16 + 8 + 4 + 4) return 1365;
+        if (alignof(Plain) != 8) return 1366;
+        if (g_nobase_dtor != 0) return 1368;
+    }
+    if (g_nobase_dtor != 1) return 1367;
+
+    g_nobase_dtor = 0;
+    g_nobase_resource_dtor = 0;
+    {
+        Plain nobaseOwned = Plain(1);
+        if (g_nobase_resource_dtor != 0) return 1369;
+    }
+    if (g_nobase_resource_dtor != 1) return 1370;
+
+    g_nobase_dtor = 0;
+    g_nobase_resource_dtor = 0;
+    {
+        Plain nobaseFrom = Plain(5);
+        Plain nobaseTo = move nobaseFrom;
+        if (nobaseTo.a != 5) return 1371;
+        if (g_nobase_dtor != 0 || g_nobase_resource_dtor != 0) return 1372;
+    }
+    if (g_nobase_dtor != 2 || g_nobase_resource_dtor != 1) return 1373;
+
+    g_nobase_dtor = 0;
+    g_nobase_resource_dtor = 0;
+    {
+        Plain nobaseReturned = nobase_make_plain(6);
+        if (nobaseReturned.a != 6) return 1374;
+    }
+    if (g_nobase_dtor != 1 || g_nobase_resource_dtor != 1) return 1391;
+
+    {
+        Plain nobasePointer = Plain(8);
+        nobase_bump(&nobasePointer);
+        if (nobasePointer.a != 9) return 1375;
+    }
+
+    g_nobase_dtor = 0;
+    g_nobase_resource_dtor = 0;
+    Plain* nobaseHeap = new Plain(2);
+    if (nobaseHeap->a != 2) return 1376;
+    delete nobaseHeap;
+    if (g_nobase_dtor != 1 || g_nobase_resource_dtor != 1) return 1377;
+
+    if (Plain.make_tag() != 7) return 1378;
+
+    {
+        nobase.Q nobaseQ = nobase.Q();
+        if (nobaseQ.v != 3) return 1379;
+    }
+
+    g_nobase_dtor = 0;
+    {
+        NoBasePlainOuter nobaseOuter = default;
+        if (g_nobase_dtor != 0) return 1380;
+    }
+    if (g_nobase_dtor != 1) return 1381;
+
+    g_nobase_dtor = 0;
+    {
+        NoBaseCppOuter nobaseCppouter = default;
+        if (nobaseCppouter.inner.v != 3) return 1382;
+    }
+    if (g_nobase_dtor != 1) return 1383;
+
+    {
+        NoBaseOffsets nobaseOffsets = default;
+        if (nobaseOffsets.offset() != 8) return 1384;
+    }
+
+    g_nobase_resource_dtor = 0;
+    g_nobase_early_return = 1;
+    {
+        NoBaseEarlyReturn nobaseEarly = default;
+    }
+    if (g_nobase_resource_dtor != 1) return 1385;
+    g_nobase_early_return = 0;
+
+    g_nobase_dtor = 0;
+    {
+        NoBaseMoveNested nobaseNestedFrom = default;
+        NoBaseMoveNested nobaseNestedTo = move nobaseNestedFrom;
+        if (nobaseNestedTo.inner.value != 4) return 1386;
+    }
+    if (g_nobase_dtor != 2) return 1387;
+
+    {
+        NoBaseAligned nobaseAligned = default;
+        if (sizeof(NoBaseAligned) != 16 || nobaseAligned.value != 3) return 1388;
+    }
+
+    {
+        NoBaseOverloads nobaseOne = NoBaseOverloads(5);
+        NoBaseOverloads nobaseTwo = NoBaseOverloads(2, 3);
+        if (nobaseOne.value != 5 || nobaseTwo.value != 23) return 1389;
+    }
+
+    {
+        NoBaseDefaultParam nobaseDefault = default;
+        if (nobaseDefault.value != 7) return 1390;
+    }
+
+    // ---- CFlat-defined derived [cpp] structs ----------------------------------------------------
+    cpppoly.reset_poly_counts();
+    {
+        MyCircle c = default;
+        if (c.area() != 9) return 1400;
+        if (cpppoly.call_area(&c) != 9) return 1401;
+        if (cpppoly.call_area_ref(c) != 9) return 1402;
+        if (c.plain() != 101 || cpppoly.call_plain(&c) != 101) return 1403;
+        c.tag = 5;
+        if (c.tag != 5) return 1404;
+        if (cpppoly.call_plain(&c) != 105) return 1405;
+    }
+
+    g_nobase_dtor = 0;
+    cpppoly.reset_poly_counts();
+    cpppoly.Shape* derivedDeleted = new MyCircle();
+    delete derivedDeleted;
+    if (g_nobase_dtor != 1) return 1406;
+    if (cpppoly.shape_dtors() != 1) return 1407;
+    if (cpppoly.circle_dtors() != 0) return 1408;
+
+    {
+        T2 t = T2(7);
+        if (t.tag != 7) return 1409;
+        if (cpppoly.call_get(&t) != 7) return 1410;
+    }
+    {
+        T2Literal t = default;
+        if (t.tag != 42) return 1411;
+    }
+
+    {
+        MyCircle c = default;
+        if (c.tag != 1) return 1412;
+        if (c.plain() != 101) return 1413;
+    }
+
+    {
+        MyCircle c = default;
+        if (c.local_area() != 9) return 1414;
+        if (c.area() != 9) return 1415;
+    }
+
+    {
+        ScaleImpl sc = default;
+        if (cpppoly.call_scale(&sc, 1.5, 2) != 4.0) return 1416;
+        if (sc.scale(1.5, 2) != 4.0) return 1417;
+        if (strcmp(cpppoly.call_label(&sc), "cflat") != 0) return 1418;
+    }
+
+    {
+        AbstractImpl impl = default;
+        if (cpppoly.call_pure(&impl) != 7) return 1419;
+        if (impl.pure() != 7) return 1420;
+    }
+
+    {
+        CircleImpl c = default;
+        if (c.radius != 5) return 1421;
+        if (c.area() != 6) return 1422;
+        cpppoly.Shape* s = &c;
+        if (s.area() != 6) return 1423;
+    }
+
+    {
+        TaggedImpl t = TaggedImpl(7);
+        if (t.protected_field() != 70) return 1424;
+        if (t.protected_method() != 70) return 1425;
+        if (t.protected_sum() != 140) return 1426;
+    }
+
+    g_nobase_dtor = 0;
+    cpppoly.reset_poly_counts();
+    {
+        MyCircle c = default;
+        MyCircle d = move c;
+        if (d.area() != 9) return 1427;
+    }
+    if (g_nobase_dtor != 2) return 1428;
+    if (cpppoly.shape_dtors() != 2) return 1429;
+
+    {
+        derived.NamespacedCircle c = default;
+        if (c.area() != 12) return 1430;
+        ExplicitCircle e = default;
+        if (e.area() != 13) return 1431;
+    }
+
+    {
+        MyCircle c = default;
+        if (c.area() != 9) return 1432;
+        ScaleImpl sc = default;
+        if (cpppoly.call_adjust(&sc, 3) != 13) return 1433;
+    }
+
+    // Clang -v probe on macOS arm64 reports sizeof(__cflat_user::MyCircle) == 24.
+    if (sizeof(MyCircle) <= cpppoly.sizeof_shape()) return 1434;
+    if (sizeof(MyCircle) != cpppoly.sizeof_shape() + 8) return 1435;
+
+    {
+        P2 p = default;
+        if (p.v() != 23 || cpppoly.call_v(&p) != 23) return 1436;
+    }
+
+    {
+        G2 g = default;
+        if (g.hidden() != 3 || g.probe() != 3 || cpppoly.call_hidden(&g) != 3) return 1437;
+    }
+
+    {
+        TaggedMethodImpl t = TaggedMethodImpl(8);
+        if (t.method_only() != 80) return 1438;
+    }
+
+    g_nobase_dtor = 0;
+    cpppoly.reset_poly_counts();
+    cpppoly.destroy(new MyCircle());
+    if (g_nobase_dtor != 1 || cpppoly.shape_dtors() != 1) return 1439;
+
+    // ---- C++ struct return adoption and virtual-chain closure -----------------------------------
+    g_nobase_dtor = 0;
+    cpppoly.reset_poly_counts();
+    {
+        AdoptReturn value = adopt_make1();
+        if (value.area() != 16) return 1440;
+        if (g_nobase_dtor != 0 || cpppoly.shape_dtors() != 0) return 1441;
+    }
+    if (g_nobase_dtor != 1) return 1442;
+    if (cpppoly.shape_dtors() != 1) return 1443;
+
+    g_nobase_dtor = 0;
+    cpppoly.reset_poly_counts();
+    {
+        AdoptReturn value = adopt_make2();
+        if (value.area() != 16) return 1444;
+        if (g_nobase_dtor != 0 || cpppoly.shape_dtors() != 0) return 1445;
+    }
+    if (g_nobase_dtor != 1) return 1446;
+    if (cpppoly.shape_dtors() != 1) return 1447;
+
+    g_nobase_dtor = 0;
+    {
+        Plain value = nobase_make_plain2();
+        if (value.a != 7) return 1448;
+        if (g_nobase_dtor != 0) return 1449;
+    }
+    if (g_nobase_dtor != 1) return 1450;
+
+    g_nobase_dtor = 0;
+    cpppoly.reset_poly_counts();
+    {
+        AdoptReturn value = adopt_make1();
+        if (cpppoly.call_area(&value) != 16) return 1451;
+        if (cpppoly.call_area_ref(value) != 16) return 1452;
+        if (value.area() != 16) return 1453;
+    }
+    if (g_nobase_dtor != 1 || cpppoly.shape_dtors() != 1) return 1454;
+
+    {
+        AdoptReturn value = adopt_make2();
+        cpppoly.Shape* base = &value;
+        if (base.area() != 16) return 1455;
+        if (value.r != 4) return 1456;
+    }
+
+    {
+        Plain value = nobase_make_plain(8);
+        if (value.total() != 16) return 1457;
+        value.a = 9;
+        if (value.total() != 18) return 1458;
+        if (value.second != 17) return 1459;
+    }
+
+    // ---- C++ class-template specialization bases ------------------------------------------------
+    cppt.tplbase.reset_holder_int_dtors();
+    {
+        TplBaseIntTripler value = TplBaseIntTripler(5);
+        if (value.value != 5) return 1460;
+        if (value.doubled() != 16) return 1461;
+        if (cppt.tplbase.call_doubled<int>(&value) != 16) return 1462;
+    }
+    if (cppt.tplbase.holder_int_dtors() != 1) return 1463;
+
+    cppt.tplbase.reset_holder_double_dtors();
+    {
+        TplBaseDoubleTripler value = TplBaseDoubleTripler(2.0);
+        if (value.value != 2.0) return 1464;
+        if (value.doubled() != 8.5) return 1465;
+        if (cppt.tplbase.call_doubled<double>(&value) != 8.5) return 1466;
+    }
+    if (cppt.tplbase.holder_double_dtors() != 1) return 1467;
+
+    {
+        TplBaseShape value = default;
+        if (value.area() != 42) return 1468;
+        if (cppt.tplbase.call_area2<int>(&value) != 42) return 1469;
+    }
+
+    cppt.tplbase.reset_holder_int_dtors();
+    {
+        TplBaseIntTripler source = TplBaseIntTripler(7);
+        TplBaseIntTripler target = move source;
+        if (target.value != 7 || target.doubled() != 22) return 1470;
+        if (cppt.tplbase.holder_int_dtors() != 0) return 1471;
+    }
+    if (cppt.tplbase.holder_int_dtors() != 2) return 1472;
+
+    cppt.tplbase.reset_holder_int_dtors();
+    {
+        TplBaseMemberTripler value = TplBaseMemberTripler(4);
+        if (value.inner.value != 9) return 1473;
+        if (value.doubled() != 17) return 1474;
+        if (cppt.tplbase.call_doubled<int>(&value) != 17) return 1475;
+    }
+    if (cppt.tplbase.holder_int_dtors() != 2) return 1476;
+
+    cppt.tplbase.reset_holder_int_dtors();
+    {
+        TplBaseMemberTripler source = TplBaseMemberTripler(3);
+        TplBaseMemberTripler target = move source;
+        if (target.value != 3 || target.inner.value != 9) return 1477;
+        if (target.doubled() != 15) return 1478;
+    }
+    if (cppt.tplbase.holder_int_dtors() != 4) return 1479;
+
+    // ---- C++ return temporaries and inherited member templates ----------------------------------
+    RetTempPlainReturns rettempPlain = default;
+    RetTempCppReturns rettempCpp = default;
+    RetTempRegistry rettempRegistry = default;
+
+    cppi.reset_counts();
+    {
+        cppi.Tracked value = rettemp_free_ctor(11);
+        if (value.value() != 11) return 1480;
+    }
+    if (cppi.ctor_count() != 1 || cppi.copy_count() != 0 || cppi.move_count() != 0
+        || cppi.dtor_count() != 1) return 1481;
+
+    cppi.reset_counts();
+    {
+        cppi.Tracked value = rettemp_free_sret(12);
+        if (value.value() != 12) return 1482;
+    }
+    if (cppi.ctor_count() != 1 || cppi.copy_count() != 0 || cppi.move_count() != 0
+        || cppi.dtor_count() != 1) return 1483;
+
+    cppi.reset_counts();
+    {
+        cppi.Tracked value = rettempPlain.ctor_return(13);
+        if (value.value() != 13) return 1484;
+    }
+    if (cppi.ctor_count() != 1 || cppi.copy_count() != 0 || cppi.move_count() != 0
+        || cppi.dtor_count() != 1) return 1485;
+
+    cppi.reset_counts();
+    {
+        cppi.Tracked value = rettempPlain.sret_return(14);
+        if (value.value() != 14) return 1486;
+    }
+    if (cppi.ctor_count() != 1 || cppi.copy_count() != 0 || cppi.move_count() != 0
+        || cppi.dtor_count() != 1) return 1487;
+
+    cppi.reset_counts();
+    {
+        cppi.Tracked value = rettempCpp.ctor_return(15);
+        if (value.value() != 15) return 1488;
+    }
+    if (cppi.ctor_count() != 1 || cppi.copy_count() != 0 || cppi.move_count() != 0
+        || cppi.dtor_count() != 1) return 1489;
+
+    cppi.reset_counts();
+    {
+        cppi.Tracked value = rettempCpp.sret_return(16);
+        if (value.value() != 16) return 1490;
+    }
+    if (cppi.ctor_count() != 1 || cppi.copy_count() != 0 || cppi.move_count() != 0
+        || cppi.dtor_count() != 1) return 1491;
+
+    cppi.reset_counts();
+    {
+        cppi.Tracked value = rettemp_outer(17);
+        if (value.value() != 17) return 1492;
+    }
+    if (cppi.ctor_count() != 1 || cppi.copy_count() != 0 || cppi.move_count() != 0
+        || cppi.dtor_count() != 1) return 1493;
+    cppi.reset_counts();
+    {
+        cppi.Tracked value = rettempPlain.outer(18);
+        if (value.value() != 18) return 1492;
+    }
+    if (cppi.ctor_count() != 1 || cppi.copy_count() != 0 || cppi.move_count() != 0
+        || cppi.dtor_count() != 1) return 1493;
+    cppi.reset_counts();
+    {
+        cppi.Tracked value = rettempCpp.outer(19);
+        if (value.value() != 19) return 1492;
+    }
+    if (cppi.ctor_count() != 1 || cppi.dtor_count() != 1) return 1493;
+
+    cppi.reset_counts();
+    {
+        cppi.Tracked value = rettemp_free_both(20);
+        if (value.value() != 20) return 1494;
+    }
+    if (cppi.ctor_count() != 2 || cppi.copy_count() != 0 || cppi.move_count() != 0
+        || cppi.dtor_count() != 2) return 1495;
+    cppi.reset_counts();
+    {
+        cppi.Tracked value = rettempPlain.both(21);
+        if (value.value() != 21) return 1494;
+    }
+    if (cppi.ctor_count() != 2 || cppi.copy_count() != 0 || cppi.move_count() != 0
+        || cppi.dtor_count() != 2) return 1495;
+    cppi.reset_counts();
+    {
+        cppi.Tracked value = rettempCpp.both(22);
+        if (value.value() != 22) return 1494;
+    }
+    if (cppi.ctor_count() != 2 || cppi.copy_count() != 0 || cppi.move_count() != 0
+        || cppi.dtor_count() != 2) return 1495;
+
+    if (rettempRegistry.ctor_reg != 4) return 1496;
+    if (rettempRegistry.implicit_reg(5) != 7) return 1497;
+    if (rettempRegistry.explicit_reg(6) != 8) return 1498;
+    if (rettempRegistry.plain() != 7) return 1499;
+
+    // ---- make_shared of CFlat-defined [cpp] structs ---------------------------------------------
+    cppt.reset_module_dtors();
+    {
+        std.shared_ptr<SharedLeaf> leaf = std.make_shared<SharedLeaf>(3);
+        if (leaf->value != 3) return 1500;
+        if (leaf->forward(2) != 6) return 1501;
+        if (cppt.run_module(leaf, 2) != 6) return 1502;
+        if (cppt.module_use_count(leaf) != 1) return 1503;
+    }
+    if (cppt.module_dtors() != 1) return 1504;
+
+    cppt.reset_module_dtors();
+    {
+        std.shared_ptr<SharedLeaf> leaf = std.make_shared<SharedLeaf>(3);
+        std.shared_ptr<cppt.ModuleBase> base = leaf;
+        if (cppt.run_module(base, 2) != 6) return 1505;
+        if (cppt.run_module(leaf, 5) != 15) return 1506;
+        if (cppt.module_use_count(base) != 2) return 1507;
+        if (cppt.module_use_count(leaf) != 2) return 1508;
+    }
+    if (cppt.module_dtors() != 1) return 1509;
+
+    cppt.reset_module_dtors();
+    {
+        std.shared_ptr<SharedNet> net = std.make_shared<SharedNet>();
+        shared_init_net(net.get());
+        if (net->child_count() != 2) return 1510;
+        if (net->call_child(1, 2) != 6) return 1511;
+        if (net->forward(1) != 6) return 1512;
+        std.shared_ptr<cppt.ModuleBase> base = net;
+        if (cppt.run_module(base, 1) != 6) return 1513;
+    }
+    if (cppt.module_dtors() != 3) return 1514;
+
+    cppt.reset_module_dtors();
+    {
+        std.shared_ptr<SharedNet> net = std.make_shared<SharedNet>();
+        shared_init_net(net.get());
+        std.shared_ptr<SharedLeaf> local = std.make_shared<SharedLeaf>(4);
+        std.shared_ptr<SharedLeaf> returned = net->register_child("local", local);
+        if (net->child_count() != 3) return 1515;
+        if (cppt.module_use_count(local) != 3) return 1516;
+        if (returned->forward(2) != 8) return 1517;
+    }
+    if (cppt.module_dtors() != 4) return 1518;
+
+    cppt.reset_module_dtors();
+    {
+        SharedNet net = SharedNet();
+        shared_init_net(&net);
+        if (net.forward(1) != 6) return 1519;
+        if (net.child_count() != 2) return 1520;
+    }
+    if (cppt.module_dtors() != 3) return 1521;
+
+    {
+        SharedSelf self = SharedSelf();
+        if (self.forward(4) != 5) return 1522;
+    }
+
+    {
+        std.vector<std.shared_ptr<SharedLeaf>> values = default;
+        values.push_back(std.make_shared<SharedLeaf>(2));
+        values.push_back(std.make_shared<SharedLeaf>(5));
+        if (values[0]->forward(2) != 4) return 1523;
+        if (values[1]->forward(2) != 10) return 1524;
+        if (cppt.module_use_count(values[0]) != 1) return 1525;
+        if (cppt.module_use_count(values[1]) != 1) return 1526;
+    }
+
+    {
+        std.shared_ptr<SharedLeaf> source = std.make_shared<SharedLeaf>(7);
+        std.shared_ptr<SharedLeaf> target = move source;
+        if (cppt.module_use_count(target) != 1) return 1527;
+        if (target->forward(2) != 14) return 1528;
+    }
+    if (cppt.module_dtors() != 7) return 1529;
+    cppt.reset_module_dtors();
+    if (cppt.module_dtors() != 0) return 1529;
+
+    cppt.reset_module_dtors();
+    {
+        std.shared_ptr<SharedNet> net = std.make_shared<SharedNet>();
+        std.shared_ptr<SharedLeaf> got = net->take(std.make_shared<SharedLeaf>(4));
+        if (got->forward(1) != 4) return 1530;
+    }
+    if (cppt.module_dtors() != 2) return 1531;
+
+    cppt.reset_module_dtors();
+    {
+        std.shared_ptr<SharedHolderNet> net = std.make_shared<SharedHolderNet>(4);
+        if (net->child_count() != 1) return 1535;
+        if (net->call_child(0, 2) != 3) return 1536;
+        if (net->forward(2) != 4) return 1537;
+        if (cppt.module_use_count(net) != 1) return 1538;
+    }
+    if (cppt.module_dtors() != 3) return 1539;
+
+    std.string sharedText = std.string("abcd");
+    if (cppt.shared_pick_string(sharedText) != 24) return 1540;
+    if (cppt.shared_pick_string(std.string("abc")) != 13) return 1541;
+    if (cppt.shared_pick_pointer(&sharedGlobal) != 11) return 1542;
+
+    // A shared_ptr FIELD whose argument class is declared after the owner: the field's type was
+    // registered from a forward declaration and promoted when SharedLeaf's definition arrived. Every
+    // member below is one the promotion has to hand back complete - operator*, get() with a real
+    // pointee type (not a bare void*), use_count, copy, and assignment from a temporary.
+    cppt.reset_module_dtors();
+    {
+        std.shared_ptr<SharedNet> net = std.make_shared<SharedNet>();
+        shared_bind_net(net.get());
+        if ((*net->left).forward(3) != 6) return 1543;
+        if ((*net->right).value != 3) return 1544;
+        if (net->left.get()->value != 2) return 1545;
+        if (net->left.get()->forward(4) != 8) return 1546;
+        if ((int)net->left.use_count() != 2) return 1547;
+        std.shared_ptr<SharedLeaf> handle = net->left;
+        std.shared_ptr<SharedLeaf> second = handle;
+        // 4 owners: children[0], net->left, handle, second. This read was 3 before the
+        // field-lvalue initializer was copy-CONSTRUCTED - `handle` had skipped the refcount.
+        if ((int)handle.use_count() != 4) return 1548;
+        if (second.get()->forward(5) != 10) return 1549;
+        if ((*second).value != 2) return 1550;
+        std.shared_ptr<SharedLeaf> fresh = std.make_shared<SharedLeaf>(7);
+        if (fresh.get()->value != 7) return 1551;
+        fresh = std.make_shared<SharedLeaf>(9);
+        if ((*fresh).forward(2) != 18) return 1552;
+    }
+    if (cppt.module_dtors() != 5) return 1553;
+
+    // ---- copy-CONSTRUCT a C++ class local from a non-identifier lvalue --------------------------
+    // Every use_count leg below reads a refcount the SOURCE still owns. Pre-fix the initializer
+    // was a bitwise store, so each read was one low and the local's destructor released a
+    // reference it never acquired; the deref / global / element legs did not compile at all.
+    // Measured pre-fix: 1692 read 3, 1694 read 2, 1695 read 2, 1697 read 1, and the run then
+    // aborted in free() before 1707 (the heap-string field's buffer was released twice).
+    // 1690, 1691, 1693, 1696, 1702 are accept-set: they read the same value on both binaries
+    // and are here to pin the source values the failing legs are measured against.
+    cppt.reset_module_dtors();
+    {
+        std.shared_ptr<SharedLeaf> seed = std.make_shared<SharedLeaf>(6);
+        // Accept-set: a bare-identifier source already copy-constructed before this change.
+        std.shared_ptr<SharedLeaf> alias = seed;
+        if ((int)seed.use_count() != 2)                 return 1690;
+        CopyCtorBox box = default;
+        box.p = seed;
+        if ((int)seed.use_count() != 3)                 return 1691;
+        {
+            std.shared_ptr<SharedLeaf> fromDot = box.p;
+            if ((int)seed.use_count() != 4)             return 1692;
+            if (fromDot->forward(2) != 12)              return 1693;
+        }
+        if ((int)seed.use_count() != 3)                 return 1694;
+        CopyCtorBox* bp = &box;
+        {
+            std.shared_ptr<SharedLeaf> fromArrow = bp->p;
+            if ((int)seed.use_count() != 4)             return 1695;
+            if (fromArrow->value != 6)                  return 1696;
+        }
+        if ((int)seed.use_count() != 3)                 return 1697;
+        std.shared_ptr<SharedLeaf>* pp = &box.p;
+        {
+            std.shared_ptr<SharedLeaf> fromDeref = *pp;
+            if ((int)seed.use_count() != 4)             return 1698;
+            if (fromDeref->forward(3) != 18)            return 1699;
+        }
+        std.vector<std.shared_ptr<SharedLeaf>> vec = default;
+        vec.push_back(seed);
+        if ((int)seed.use_count() != 4)                 return 1700;
+        {
+            std.shared_ptr<SharedLeaf> fromElem = vec[0];
+            if ((int)seed.use_count() != 5)             return 1701;
+            if (fromElem->value != 6)                   return 1702;
+        }
+        if ((int)seed.use_count() != 4)                 return 1703;
+        // A HEAP (non-SSO) string field: the pre-fix bitwise copy aliased the buffer and the
+        // local's destructor freed it, so the field read back below aborted in free().
+        std.string copyctorLong = std.string("abcdefghijklmnopqrstuvwxyz0123456789");
+        box.s = copyctorLong;
+        {
+            std.string fromField = box.s;
+            if ((int)fromField.size() != 36)            return 1704;
+        }
+        if ((int)box.s.size() != 36)                    return 1705;
+        if (cppt.shared_pick_string(box.s) != 56)          return 1706;
+    }
+    if (cppt.module_dtors() != 1)                       return 1707;
+
+    // A namespace-scope C++ object as the initializer. Kept last: the global holds its leaf for
+    // the rest of the program, so it must not be inside the destructor count above.
+    copyctorGlobal = std.make_shared<SharedLeaf>(9);
+    if ((int)copyctorGlobal.use_count() != 1)                return 1708;
+    {
+        std.shared_ptr<SharedLeaf> fromGlobal = copyctorGlobal;
+        if ((int)copyctorGlobal.use_count() != 2)            return 1709;
+        if (fromGlobal->forward(2) != 18)               return 1709;
+    }
+
+    // ---- std::function as a member parameter and as a return type -------------------------------
+    // Every member leg below was refused at bind time ("member '...' takes/returns unsupported
+    // type 'std::function<...>'") while the free-function parameter forms bound.
+    cppfn.Plain stdfnP = cppfn.Plain();
+    if (stdfnP.run_val(std.function<int(int)>(stdfn_twice), 3) != 106)     return 1910;
+    if (stdfnP.run_ref(std.function<int(int)>(stdfn_twice), 4) != 108)     return 1911;
+    if (stdfnP.run_rv(std.function<int(int)>(stdfn_twice), 5) != 110)      return 1912;
+    if (cppfn.Plain.run_static(std.function<int(int)>(stdfn_twice), 6) != 1012) return 1913;
+    // A CONSTRUCTOR parameter bound before this change (its void* shape happened to carry the
+    // address); it is here so the retyped parameter keeps passing the same callable.
+    cppfn.Plain stdfnC = cppfn.Plain(std.function<int(int)>(stdfn_twice));
+    if (stdfnC.bias() != 20)                                              return 1914;
+
+    std.function<int(int)> stdfnA = cppfn.make_adder(7);
+    if (stdfnA(4) != 11)                                                  return 1915;
+    if (cppfn.make_adder(3)(4) != 7)                                     return 1916;
+    std.function<int(int)> stdfnM = stdfnP.get_adder(5);
+    if (stdfnM(4) != 9)                                                   return 1917;
+    std.function<int(int)> stdfnS = cppfn.Plain.make_scaler(3);
+    if (stdfnS(4) != 12)                                                  return 1918;
+
+    cppfn.Holder stdfnH = cppfn.Holder();
+    stdfn_install(stdfnH);
+    if (stdfnH.fire(7) != 14)                                             return 1919;
+
+    stdfn_bumped = 0;
+    if (cppfn.call_void(std.function<void()>(stdfn_bump)) != 7)           return 1920;
+    cppfn.VoidHolder stdfnV = cppfn.VoidHolder();
+    if (stdfnV.go(std.function<void()>(stdfn_bump)) != 5)                  return 1921;
+    if (stdfn_bumped != 2)                                                return 1922;
+
+    if (cppfn.call_str(std.function<int(std.string)>(stdfn_len)) != 4)    return 1923;
+    cppfn.StrHolder stdfnSt = cppfn.StrHolder();
+    if (stdfnSt.go(std.function<int(std.string)>(stdfn_len)) != 5)         return 1924;
+
+    // A CONSTRUCTOR parameter spelled `const&` keeps the pointer shape its C++ symbol declares;
+    // binding it by value emitted "Call parameter type does not match function signature!".
+    // The `&&` constructor form and the nested-spelling refusals are in
+    // Test/errors/err_cpp_std_function_nested.cb.
+    cppfn.CtorRef stdfnCr = cppfn.CtorRef(std.function<int(int)>(stdfn_twice));
+    if (stdfnCr.v() != 4)                                                 return 1925;
+
+    return 0;
+}

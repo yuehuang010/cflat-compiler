@@ -447,7 +447,7 @@ extern "C" int cppi_c_linkage(int v) noexcept { return v + 5; }
 // M85 - out-of-line definitions for the namespace-scope objects declared in the header.
 namespace cppi
 {
-    namespace m85
+    namespace nsobj
     {
         int counter = 10;
         const int kLinked = 11;
@@ -457,12 +457,12 @@ namespace cppi
         inline namespace v1 { int versioned = 41; }
     }
 
-    // M93 - out-of-line definitions for the two m93 members that have one.
-    namespace m93
+    // M93 - out-of-line definitions for the two statconst members that have one.
+    namespace statconst
     {
         const int Defined::k;
         const int Linked::k = 43;
     }
 }
 
-int cppi_m85_global = 3;
+int cppi_nsobj_global = 3;

@@ -142,13 +142,14 @@ extern "C" R __cflat_ovr_Foo_m(__cflat_user::Foo*, P...);
 
 ## Test matrix
 
-Fixture rows live in `Test/test_cpp_interop.cb` (new sections M73 = 1360-1399 run A, M74 =
-1400-1439 run B), fixture C++ in `Test/library/cpp_interop_poly.h/.cpp` (extended, no new
+Fixture rows live in `Test/test_cpp_interop_bridge.cb` (codes 1360-1399 run A, under the fixture
+section "CFlat-defined no-base [cpp] structs", and 1400-1439 run B, under "CFlat-defined
+derived [cpp] structs"), fixture C++ in `Test/library/cpp_interop_poly.h/.cpp` (extended, no new
 fixture files), negative tests one per rule in `Test/errors/err_cpp_struct_*.cb`. Every row
 asserts a VALUE or a RESOURCE COUNT that differs between right and wrong behaviour; a row that
 cannot fail is a defect (lessons file). Build the corpus first and record pre-fix behaviour.
 
-Run A, no base (M73):
+Run A, no base (fixture section "CFlat-defined no-base [cpp] structs"):
 
 | Row | Axis | Assertion |
 |-----|------|-----------|
@@ -169,7 +170,7 @@ Run A, no base (M73):
 | 1384 | `[cpp]` explicit + no base, with `alignas`-free i64 field | offset check via a method returning `&b` difference |
 | 1385 | warm cache | (verification step, not a row) rebuild fixture twice, second compile rc 0 and identical output |
 
-Run B, base + override (M74) - see the parent plan's M10 entry once run A lands; the axes:
+Run B, base + override (fixture section "CFlat-defined derived [cpp] structs") - see the parent plan's M10 entry once run A lands; the axes:
 override value through CFlat call, through a C++ `Base*` caller in the fixture
 (`call_area(const Shape*)`), virtual delete from C++ (`destroy(Shape*)`) running the CFlat dtor,
 base ctor args (`Tagged(int)` fixture class), default base ctor, base field read/write, base
@@ -198,13 +199,13 @@ MSVC verification.
 ## Landed after v1 (same day, working tree)
 
 - Template bases (run F): `struct T : tb.Holder<int>` with `: tb.Holder<int>(v)` initializer;
-  mismatch diagnostic `base initializer names '{}' but the base class is '{}'`; M76 (1460-1479),
+  mismatch diagnostic `base initializer names '{}' but the base class is '{}'`; fixture section "C++ class-template specialization bases" (1460-1479),
   err files tpl_base_init_mismatch, tpl_base_generic_param, tpl_hides_virtual,
   tpl_pure_not_overridden, base_init_mismatch_plain.
 - nn::Module spike (run G), both defects general interop, not `[cpp]`-specific: returned C++
   temporaries are adopted by the caller instead of destructed before `ret`
   (`UnregisterOwnedStructTemp` on the return path); implicit-`this` calls to inherited C++
-  member templates (`register_module(...)`) resolve. M77 (1480-1499),
+  member templates (`register_module(...)`) resolve. fixture section "C++ return temporaries and inherited member templates" (1480-1499),
   err_cpp_struct_member_tpl_no_this. `register_module` therefore works in v1 with a
   `std.shared_ptr<torch.nn.LinearImpl>` field; `std::make_shared<Net>` of a `[cpp] struct`
   remains timebox 2.
@@ -222,7 +223,7 @@ MSVC verification.
   CFlat override; make_shared runs the generated ctor and `~Leaf` runs the CFlat dtor.
   A forward-declared (tentative) specialization is promoted by re-registering its whole
   instance member set once the definition exists (`get()` / `operator*` on a handle whose
-  argument class is declared later). Fixture M78 (1500-1553), err files tpl_arg_incomplete (+deque), ladder rung t30 (custom
+  argument class is declared later). Fixture section "make_shared of CFlat-defined [cpp] structs" (1500-1553), err files tpl_arg_incomplete (+deque), ladder rung t30 (custom
   Block sub-module via make_shared, Net via make_shared, upcast to shared_ptr<Module>,
   children()==2, trains). Known: `std.vector<Leaf>` BY VALUE fails at the request
   (internal/issue/p3/cpp-struct-by-value-in-std-container.md); copying a nontrivial C++ class

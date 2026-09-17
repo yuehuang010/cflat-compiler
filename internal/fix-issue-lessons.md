@@ -3336,7 +3336,8 @@ Found reviewing the `long`/`ulong` fix (2026-09-10). The C header disk cache key
 in-memory key, and it stores signatures ALREADY MAPPED (`SigToJson` / `TvToJson`), while records,
 enums and aliases store raw spellings and re-map on load. So a cache written by the old binary
 keeps serving the old mapping for signatures and the new one for everything else: one import, two
-answers. `test_cpp_interop.cb` imports `cpp_interop_tpl.h` with `cache`, so a green suite run can
+answers. `test_cpp_interop_template.cb` / `test_cpp_interop_bridge.cb` import `cpp_interop_tpl.h`
+with `cache`, so a green suite run can
 load a stale entry and prove nothing. Any change to `MapCTypeToTypeAndValue*` output bumps the
 version at BOTH the check and the write (`version != N`, `j["version"] = N`) with a history line.
 

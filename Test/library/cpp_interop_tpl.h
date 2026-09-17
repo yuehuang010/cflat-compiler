@@ -75,10 +75,10 @@ namespace cppt
     { return (int)m.use_count(); }
     inline int module_dtors() noexcept { return module_dtors_counter; }
     inline void reset_module_dtors() noexcept { module_dtors_counter = 0; }
-    inline int m78_pick_string(std::string value) noexcept { return (int)value.size() + 10; }
-    inline int m78_pick_string(const std::string& value) noexcept { return (int)value.size() + 20; }
-    inline int m78_pick_pointer(int*) noexcept { return 11; }
-    inline int m78_pick_pointer(char*) noexcept { return 22; }
+    inline int shared_pick_string(std::string value) noexcept { return (int)value.size() + 10; }
+    inline int shared_pick_string(const std::string& value) noexcept { return (int)value.size() + 20; }
+    inline int shared_pick_pointer(int*) noexcept { return 11; }
+    inline int shared_pick_pointer(char*) noexcept { return 22; }
 
     // M60: constructor temporaries used as C++ member-call and field receivers.
     class Builder
@@ -654,28 +654,28 @@ namespace cppt
 
     // M52: a CRTP base member template returns a specialization whose first argument is the
     // derived class. The transform has only its implicit default constructor.
-    template <typename Self, typename Tr> struct M52Mapped
+    template <typename Self, typename Tr> struct CrtpMapped
     {
         int result_;
-        M52Mapped(Self* self, Tr) : result_(self->value_ + 1) {}
+        CrtpMapped(Self* self, Tr) : result_(self->value_ + 1) {}
         int result() const noexcept { return result_; }
     };
 
-    template <typename Self> struct M52BatchBase
+    template <typename Self> struct CrtpBatchBase
     {
-        template <typename Tr> M52Mapped<Self, Tr> map(Tr t)
+        template <typename Tr> CrtpMapped<Self, Tr> map(Tr t)
         {
-            return M52Mapped<Self, Tr>(static_cast<Self*>(this), t);
+            return CrtpMapped<Self, Tr>(static_cast<Self*>(this), t);
         }
     };
 
-    struct M52Dataset : M52BatchBase<M52Dataset>
+    struct CrtpDataset : CrtpBatchBase<CrtpDataset>
     {
         int value_;
-        explicit M52Dataset(int value) : value_(value) {}
+        explicit CrtpDataset(int value) : value_(value) {}
     };
 
-    template <typename T> struct M52Transform
+    template <typename T> struct CrtpTransform
     {
         int marker_;
         int tag() const noexcept { return 2; }
@@ -684,19 +684,19 @@ namespace cppt
     // M53: a move-only nontrivial result by value. Its counted members make the result's contents
     // observable, and the caller must move-construct its auto local before the sret temporary is
     // destroyed.
-    inline int m53_dtor_counter = 0;
-    inline void m53_reset() noexcept { m53_dtor_counter = 0; }
-    inline int m53_dtor_count() noexcept { return m53_dtor_counter; }
+    inline int autosret_dtor_counter = 0;
+    inline void autosret_reset() noexcept { autosret_dtor_counter = 0; }
+    inline int autosret_dtor_count() noexcept { return autosret_dtor_counter; }
 
-    struct M53Result
+    struct AutoSretResult
     {
         int first_;
         int second_;
         cppi::Tracked* marker = nullptr;
-        M53Result() : first_(31), second_(47) {}
-        M53Result(const M53Result&) = delete;
-        M53Result(M53Result&&) noexcept = default;
-        ~M53Result() { ++m53_dtor_counter; }
+        AutoSretResult() : first_(31), second_(47) {}
+        AutoSretResult(const AutoSretResult&) = delete;
+        AutoSretResult(AutoSretResult&&) noexcept = default;
+        ~AutoSretResult() { ++autosret_dtor_counter; }
         std::size_t size() const noexcept { return 2; }
         int first() const noexcept { return first_; }
         int second() const noexcept { return second_; }
@@ -782,11 +782,11 @@ namespace cppt
         std::size_t size() const noexcept { return values.size(); }
         int first() const noexcept { return values[0]; }
         // M53: return a move-only nontrivial result by value.
-        M53Result tracked_values() const { return M53Result(); }
+        AutoSretResult tracked_values() const { return AutoSretResult(); }
     };
 
     // M53: the same return through a holder that forwards member calls with operator->.
-    struct M53Holder
+    struct AutoSretHolder
     {
         LoaderDataset* target;
         LoaderDataset* operator->() const noexcept { return target; }
@@ -928,7 +928,7 @@ namespace cppt
     // M63: two plain derived classes use different specializations of the same holder base. The
     // implementation types are nontrivial so the inherited constructors and complete-object
     // destruction remain part of the regression, not just the member-call spelling.
-    namespace m63
+    namespace sibbase
     {
         inline int live = 0;
 
@@ -1005,21 +1005,21 @@ namespace cppt
         std::vector<Item> items_;
     };
 
-    struct M65Value
+    struct NestedItemValue
     {
         int value;
         inline static int live_ = 0;
 
-        explicit M65Value(int value_) noexcept : value(value_) { ++live_; }
-        M65Value(const M65Value& other) noexcept : value(other.value) { ++live_; }
-        M65Value(M65Value&& other) noexcept : value(other.value) { ++live_; }
-        ~M65Value() noexcept { --live_; }
+        explicit NestedItemValue(int value_) noexcept : value(value_) { ++live_; }
+        NestedItemValue(const NestedItemValue& other) noexcept : value(other.value) { ++live_; }
+        NestedItemValue(NestedItemValue&& other) noexcept : value(other.value) { ++live_; }
+        ~NestedItemValue() noexcept { --live_; }
 
         int get() const noexcept { return value; }
         static int live() noexcept { return live_; }
     };
 
-    inline Dict<std::string, double> make_m65_text() noexcept
+    inline Dict<std::string, double> make_nesteditem_text() noexcept
     {
         Dict<std::string, double> result;
         result.insert("w", 1.5);
@@ -1027,7 +1027,7 @@ namespace cppt
         return result;
     }
 
-    inline Dict<int, double> make_m65_int() noexcept
+    inline Dict<int, double> make_nesteditem_int() noexcept
     {
         Dict<int, double> result;
         result.insert(7, 3.5);
@@ -1035,11 +1035,11 @@ namespace cppt
         return result;
     }
 
-    inline Dict<int, M65Value> make_m65_counted() noexcept
+    inline Dict<int, NestedItemValue> make_nesteditem_counted() noexcept
     {
-        Dict<int, M65Value> result;
-        result.insert(4, M65Value(9));
-        result.insert(8, M65Value(12));
+        Dict<int, NestedItemValue> result;
+        result.insert(4, NestedItemValue(9));
+        result.insert(8, NestedItemValue(12));
         return result;
     }
 
@@ -1121,15 +1121,15 @@ namespace cppt
     };
 
     // M70: non-explicit conversion into a nontrivial class by-value parameter and local.
-    struct M70Counted
+    struct BraceTmpCounted
     {
         int n;
-        M70Counted(int value) noexcept : n(value) { ++live_; ++ctors_; }
-        M70Counted(const M70Counted& other) noexcept : n(other.n) { ++live_; ++ctors_; }
-        M70Counted(M70Counted&& other) noexcept : n(other.n) {
+        BraceTmpCounted(int value) noexcept : n(value) { ++live_; ++ctors_; }
+        BraceTmpCounted(const BraceTmpCounted& other) noexcept : n(other.n) { ++live_; ++ctors_; }
+        BraceTmpCounted(BraceTmpCounted&& other) noexcept : n(other.n) {
             other.n = -1; ++live_; ++ctors_;
         }
-        ~M70Counted() noexcept { --live_; ++dtors_; }
+        ~BraceTmpCounted() noexcept { --live_; ++dtors_; }
 
         static void reset() noexcept { live_ = 0; ctors_ = 0; dtors_ = 0; }
         static int live() noexcept { return live_; }
@@ -1143,8 +1143,8 @@ namespace cppt
         inline static int dtors_ = 0;
     };
 
-    inline int m70_take(M70Counted value) noexcept { return value.value(); }
-    inline M70Counted m70_make(int value) noexcept { return value; }
+    inline int bracetmp_take(BraceTmpCounted value) noexcept { return value.value(); }
+    inline BraceTmpCounted bracetmp_make(int value) noexcept { return value; }
 
     struct AnyLike
     {
@@ -1176,121 +1176,121 @@ namespace cppt
 namespace cppt
 {
     // M64: overloads with brace arguments at different positions and public base conversions.
-    struct M64Opts
+    struct BracePosOpts
     {
         int value;
-        M64Opts() noexcept : value(0) {}
-        explicit M64Opts(int v) noexcept : value(v) {}
+        BracePosOpts() noexcept : value(0) {}
+        explicit BracePosOpts(int v) noexcept : value(v) {}
     };
 
-    struct M64ArrayRef
+    struct BracePosArrayRef
     {
         const long long* data;
         std::size_t count;
-        M64ArrayRef(const long long* p, std::size_t n) noexcept : data(p), count(n) {}
-        M64ArrayRef(const std::initializer_list<long long>& list) noexcept
+        BracePosArrayRef(const long long* p, std::size_t n) noexcept : data(p), count(n) {}
+        BracePosArrayRef(const std::initializer_list<long long>& list) noexcept
             : data(list.begin()), count(list.size()) {}
         template <std::size_t N>
-        M64ArrayRef(const long long (&array)[N]) noexcept : data(array), count(N) {}
+        BracePosArrayRef(const long long (&array)[N]) noexcept : data(array), count(N) {}
     };
 
-    inline long long m64_brace(long long high, M64ArrayRef size,
-                               M64Opts options = {}) noexcept
+    inline long long bracepos_brace(long long high, BracePosArrayRef size,
+                               BracePosOpts options = {}) noexcept
     {
         return high * 10 + (long long)size.count + options.value;
     }
-    inline long long m64_brace(long long low, long long high, M64ArrayRef size,
-                               M64Opts options = {}) noexcept
+    inline long long bracepos_brace(long long low, long long high, BracePosArrayRef size,
+                               BracePosOpts options = {}) noexcept
     {
         return low * 100 + high * 10 + (long long)size.count + options.value;
     }
 
-    struct M64Pad
+    struct BracePosPad
     {
         long long value;
-        M64Pad() noexcept : value(91) {}
+        BracePosPad() noexcept : value(91) {}
     };
 
-    struct M64Base
+    struct BracePosBase
     {
         int value;
-        explicit M64Base(int v) noexcept : value(v) {}
-        virtual ~M64Base() = default;
+        explicit BracePosBase(int v) noexcept : value(v) {}
+        virtual ~BracePosBase() = default;
         virtual int kind() const noexcept { return 1; }
     };
 
-    struct M64Mid : M64Pad, M64Base
+    struct BracePosMid : BracePosPad, BracePosBase
     {
-        explicit M64Mid(int v) noexcept : M64Pad(), M64Base(v) {}
+        explicit BracePosMid(int v) noexcept : BracePosPad(), BracePosBase(v) {}
     };
 
-    struct M64Leaf : M64Mid
+    struct BracePosLeaf : BracePosMid
     {
-        explicit M64Leaf(int v) noexcept : M64Mid(v) {}
+        explicit BracePosLeaf(int v) noexcept : BracePosMid(v) {}
         int kind() const noexcept override { return 3; }
     };
 
-    struct M64CtorConsumer
+    struct BracePosCtorConsumer
     {
-        M64Base* base;
+        BracePosBase* base;
         int step;
-        M64CtorConsumer(M64Base& b, int s) noexcept : base(&b), step(s) {}
+        BracePosCtorConsumer(BracePosBase& b, int s) noexcept : base(&b), step(s) {}
         int probe() const noexcept { return base->kind() * 1000 + base->value * 10 + step; }
     };
 
-    struct M64MemberConsumer
+    struct BracePosMemberConsumer
     {
         int marker;
-        M64MemberConsumer() noexcept : marker(0) {}
-        int probe(M64Base* base) const noexcept
+        BracePosMemberConsumer() noexcept : marker(0) {}
+        int probe(BracePosBase* base) const noexcept
         {
             return base->kind() * 1000 + base->value * 10;
         }
     };
 
-    inline int m64_free(const M64Base& base) noexcept { return base.kind() + base.value; }
-    inline int m64_virtual_ref(const M64Base& base) noexcept { return base.kind(); }
+    inline int bracepos_free(const BracePosBase& base) noexcept { return base.kind() + base.value; }
+    inline int bracepos_virtual_ref(const BracePosBase& base) noexcept { return base.kind(); }
 }
 
 namespace cppt
 {
     // M66: heterogeneous brace elements are converted by C++ into one destination class. The
     // re-exported slice also keeps the namespace-level using-directive path in the same call.
-    namespace m66_base
+    namespace hetbrace_base
     {
-        struct M66Slice
+        struct HetBraceSlice
         {
             long long start;
             long long stop;
-            M66Slice(long long start_ = 0, long long stop_ = 1000) noexcept
+            HetBraceSlice(long long start_ = 0, long long stop_ = 1000) noexcept
                 : start(start_), stop(stop_) {}
         };
     }
 
-    namespace m66_reexport
+    namespace hetbrace_reexport
     {
-        using namespace m66_base;
+        using namespace hetbrace_base;
     }
 
-    struct M66None {};
+    struct HetBraceNone {};
 
-    struct M66Index
+    struct HetBraceIndex
     {
         int kind;
         long long value;
         inline static int live_ = 0;
 
-        M66Index(long long value_) noexcept : kind(1), value(value_) { ++live_; }
-        M66Index(m66_base::M66Slice slice) noexcept : kind(2), value(slice.stop) { ++live_; }
-        M66Index(M66None) noexcept : kind(3), value(0) { ++live_; }
-        M66Index(const M66Index& other) noexcept : kind(other.kind), value(other.value) { ++live_; }
-        M66Index(M66Index&& other) noexcept : kind(other.kind), value(other.value) { ++live_; }
-        ~M66Index() noexcept { --live_; }
+        HetBraceIndex(long long value_) noexcept : kind(1), value(value_) { ++live_; }
+        HetBraceIndex(hetbrace_base::HetBraceSlice slice) noexcept : kind(2), value(slice.stop) { ++live_; }
+        HetBraceIndex(HetBraceNone) noexcept : kind(3), value(0) { ++live_; }
+        HetBraceIndex(const HetBraceIndex& other) noexcept : kind(other.kind), value(other.value) { ++live_; }
+        HetBraceIndex(HetBraceIndex&& other) noexcept : kind(other.kind), value(other.value) { ++live_; }
+        ~HetBraceIndex() noexcept { --live_; }
 
         static int live() noexcept { return live_; }
     };
 
-    inline int m66_collect(std::initializer_list<M66Index> values) noexcept
+    inline int hetbrace_collect(std::initializer_list<HetBraceIndex> values) noexcept
     {
         int result = 0;
         for (const auto& value : values) result += value.kind * 100 + (int)value.value;
@@ -1302,19 +1302,19 @@ namespace cppc
 {
     // M67: namespace-scope floating and integer constexpr values, including long double's
     // target-specific conversion to CFlat double.
-    constexpr double m67Double = 6.5;
-    constexpr float m67Float = 0.5f;
-    constexpr long double m67LongDouble = 1.25L;
-    constexpr int m67Int = 4;
+    constexpr double constexprDouble = 6.5;
+    constexpr float constexprFloat = 0.5f;
+    constexpr long double constexprLongDouble = 1.25L;
+    constexpr int constexprInt = 4;
 
-    struct M67Statics
+    struct FltConstStatics
     {
         static constexpr double kScale = 4.0;
         static constexpr float kHalf = 0.5f;
         static constexpr int kCount = 3;
     };
 
-    inline float m67_take_float(float value) noexcept { return value; }
+    inline float fltconst_take_float(float value) noexcept { return value; }
 }
 
 namespace cppt
@@ -1322,39 +1322,39 @@ namespace cppt
     // M69: one foreign identity spelling across extractor and backend paths. The two CRTP
     // specializations deliberately have different non-type values, and the byte view exercises
     // a multi-word primitive template argument through both inheritance and a free function.
-    namespace m69
+    namespace unified
     {
         template <int N, class T>
-        struct M69NormBase
+        struct UnifiedNormBase
         {
             int n() const noexcept { return N; }
             T tag() const;
         };
 
-        struct M69Pos : M69NormBase<1, M69Pos>
+        struct UnifiedPos : UnifiedNormBase<1, UnifiedPos>
         {
             int marker;
-            M69Pos() noexcept : marker(11) {}
+            UnifiedPos() noexcept : marker(11) {}
         };
 
-        struct M69Neg : M69NormBase<-1, M69Neg>
+        struct UnifiedNeg : UnifiedNormBase<-1, UnifiedNeg>
         {
             int marker;
-            M69Neg() noexcept : marker(22) {}
+            UnifiedNeg() noexcept : marker(22) {}
         };
 
         template <class T>
-        struct M69ArrayRef
+        struct UnifiedArrayRef
         {
             const T* data;
             std::size_t count;
             std::size_t size() const noexcept { return count; }
         };
 
-        struct M69Bytes : M69ArrayRef<unsigned char>
+        struct UnifiedBytes : UnifiedArrayRef<unsigned char>
         {
             int marker;
-            M69Bytes(const unsigned char* p, std::size_t n) noexcept
+            UnifiedBytes(const unsigned char* p, std::size_t n) noexcept
                 : marker(33)
             {
                 data = p;
@@ -1362,23 +1362,23 @@ namespace cppt
             }
         };
 
-        inline int norm_pos(const M69NormBase<1, M69Pos>& value) noexcept { return value.n(); }
-        inline int norm_neg(const M69NormBase<-1, M69Neg>& value) noexcept { return value.n(); }
-        inline int bytes_as_base(const M69ArrayRef<unsigned char>& value) noexcept
+        inline int norm_pos(const UnifiedNormBase<1, UnifiedPos>& value) noexcept { return value.n(); }
+        inline int norm_neg(const UnifiedNormBase<-1, UnifiedNeg>& value) noexcept { return value.n(); }
+        inline int bytes_as_base(const UnifiedArrayRef<unsigned char>& value) noexcept
         { return (int)value.size(); }
     }
 
-    inline Box<unsigned long> m72_make_unsigned_long(unsigned long value) noexcept
+    inline Box<unsigned long> primid_make_unsigned_long(unsigned long value) noexcept
     { return Box<unsigned long>(value); }
-    inline unsigned long m72_take_unsigned_long(const Box<unsigned long>& value) noexcept
+    inline unsigned long primid_take_unsigned_long(const Box<unsigned long>& value) noexcept
     { return value.get(); }
-    inline Box<size_t> m72_make_size_t(size_t value) noexcept
+    inline Box<size_t> primid_make_size_t(size_t value) noexcept
     { return Box<size_t>(value); }
-    inline Box<unsigned> m72_make_unsigned(unsigned value) noexcept
+    inline Box<unsigned> primid_make_unsigned(unsigned value) noexcept
     { return Box<unsigned>(value); }
-    inline Box<long double> m72_make_long_double(long double value) noexcept
+    inline Box<long double> primid_make_long_double(long double value) noexcept
     { return Box<long double>(value); }
-    inline std::vector<size_t> m72_size_t_vector_roundtrip(
+    inline std::vector<size_t> primid_size_t_vector_roundtrip(
         const std::vector<size_t>& value) noexcept
     { return value; }
 
@@ -1394,7 +1394,7 @@ namespace cppt
     };
 
     // M76: polymorphic class templates used as CFlat-defined struct bases.
-    namespace m76
+    namespace tplbase
     {
     template <typename T>
     class Holder
@@ -1438,92 +1438,92 @@ namespace cppt
 
 // Section M83: a class-template specialization named through a GLOBAL-scope alias. The undotted
 // spelling is the one that never reached the C++ type request; cppt covers the namespaced forms.
-template <class T> struct M83Global { T value; };
-using M83GlobalAlias = M83Global<int>;
-using M83GlobalAlias2 = M83Global<int>;
-typedef M83Global<double> M83GlobalTypedef;
-inline int m83_take_global(const M83Global<int>& v) noexcept { return v.value + 1; }
+template <class T> struct GlobalBox { T value; };
+using GlobalBoxAlias = GlobalBox<int>;
+using GlobalBoxAlias2 = GlobalBox<int>;
+typedef GlobalBox<double> GlobalBoxTypedef;
+inline int globalbox_take_global(const GlobalBox<int>& v) noexcept { return v.value + 1; }
 
 // Section M84: a class used as a std::map key and as a by-reference parameter. A named lvalue
 // index has to reach overload matching with its class identity intact.
-struct M84Key
+struct SubscriptKey
 {
     int v;
-    M84Key() noexcept : v(0) {}
-    explicit M84Key(int a) noexcept : v(a) {}
-    bool operator<(const M84Key& o) const noexcept { return v < o.v; }
+    SubscriptKey() noexcept : v(0) {}
+    explicit SubscriptKey(int a) noexcept : v(a) {}
+    bool operator<(const SubscriptKey& o) const noexcept { return v < o.v; }
 };
-inline int m84_take_key(const M84Key& k) noexcept { return k.v + 1; }
+inline int take_subscript_key(const SubscriptKey& k) noexcept { return k.v + 1; }
 namespace cppt
 {
     // M81: ref-qualified member overloads keep the receiver's C++ value category.
-    class M81AssignBox
+    class RefQualAssignBox
     {
     public:
         int value;
         int tag;
 
-        M81AssignBox() noexcept : value(0), tag(0) {}
-        explicit M81AssignBox(int v) noexcept : value(v), tag(0) {}
-        M81AssignBox(const M81AssignBox&) = default;
-        M81AssignBox(M81AssignBox&&) noexcept = default;
-        ~M81AssignBox() noexcept {}
+        RefQualAssignBox() noexcept : value(0), tag(0) {}
+        explicit RefQualAssignBox(int v) noexcept : value(v), tag(0) {}
+        RefQualAssignBox(const RefQualAssignBox&) = default;
+        RefQualAssignBox(RefQualAssignBox&&) noexcept = default;
+        ~RefQualAssignBox() noexcept {}
 
-        M81AssignBox& operator=(const M81AssignBox& other) & noexcept
+        RefQualAssignBox& operator=(const RefQualAssignBox& other) & noexcept
         { value = other.value; tag = 1; return *this; }
-        M81AssignBox& operator=(const M81AssignBox& other) && noexcept
+        RefQualAssignBox& operator=(const RefQualAssignBox& other) && noexcept
         { value = other.value + 100; tag = 2; return *this; }
-        M81AssignBox& operator=(M81AssignBox&& other) & noexcept
+        RefQualAssignBox& operator=(RefQualAssignBox&& other) & noexcept
         { value = other.value + 200; tag = 3; return *this; }
-        M81AssignBox& operator=(M81AssignBox&& other) && noexcept
+        RefQualAssignBox& operator=(RefQualAssignBox&& other) && noexcept
         { value = other.value + 300; tag = 4; return *this; }
     };
 
-    struct M81FieldHolder
+    struct RefQualFieldHolder
     {
-        M81AssignBox box;
-        M81FieldHolder() noexcept : box(0) {}
+        RefQualAssignBox box;
+        RefQualFieldHolder() noexcept : box(0) {}
     };
 
-    class M81RefqMethods
+    class RefQualMethods
     {
     public:
         // M81: ref-qualified overload fixture.
         int marker;
 
-        M81RefqMethods() noexcept : marker(0) {}
-        explicit M81RefqMethods(int v) noexcept : marker(v) {}
-        explicit M81RefqMethods(std::initializer_list<int> values) noexcept
+        RefQualMethods() noexcept : marker(0) {}
+        explicit RefQualMethods(int v) noexcept : marker(v) {}
+        explicit RefQualMethods(std::initializer_list<int> values) noexcept
             : marker(values.size() == 0 ? 0 : *values.begin()) {}
         int both() & noexcept { return 11; }
         int both() && noexcept { return 22; }
         int onlyR() && noexcept { return 33; }
         int onlyL() & noexcept { return 44; }
         int plain() const noexcept { return 55; }
-        M81RefqMethods& with(int v) & noexcept { marker += v; return *this; }
-        M81RefqMethods&& with(int v) && noexcept
-        { marker += v + 100; return static_cast<M81RefqMethods&&>(*this); }
+        RefQualMethods& with(int v) & noexcept { marker += v; return *this; }
+        RefQualMethods&& with(int v) && noexcept
+        { marker += v + 100; return static_cast<RefQualMethods&&>(*this); }
         int operator[](int i) & noexcept { return 100 + i; }
         int operator[](int i) && noexcept { return 200 + i; }
     };
 
-    struct M81SlotHolder
+    struct RefQualSlotHolder
     {
-        M81AssignBox slots[2];
-        M81SlotHolder() noexcept : slots{M81AssignBox(0), M81AssignBox(0)} {}
-        M81AssignBox& operator[](int i) & noexcept { return slots[i]; }
+        RefQualAssignBox slots[2];
+        RefQualSlotHolder() noexcept : slots{RefQualAssignBox(0), RefQualAssignBox(0)} {}
+        RefQualAssignBox& operator[](int i) & noexcept { return slots[i]; }
     };
 
-    inline M81RefqMethods m81_make_methods(int value) noexcept
-    { return M81RefqMethods(value); }
+    inline RefQualMethods refqual_make_methods(int value) noexcept
+    { return RefQualMethods(value); }
 }
 
 namespace cppt
 {
     // M95 - STATIC members of a class TEMPLATE, reached through the qualified
-    // specialization spelling `cppt.M95Stat<int>.member`.
+    // specialization spelling `cppt.TplStatics<int>.member`.
     template <class T>
-    struct M95Stat
+    struct TplStatics
     {
         static int rank() noexcept { return 7; }
         static T twice(T v) noexcept { return v + v; }
@@ -1531,34 +1531,34 @@ namespace cppt
         static constexpr int kTag = 41;
         static int counter;
         T x;
-        M95Stat() noexcept : x(T()) {}
+        TplStatics() noexcept : x(T()) {}
     };
-    template <class T> int M95Stat<T>::counter = 0;
+    template <class T> int TplStatics<T>::counter = 0;
 
-    class M95Payload
+    class TplStaticPayload
     {
     public:
         int v;
-        M95Payload() noexcept : v(0) {}
-        explicit M95Payload(int value) noexcept : v(value) {}
+        TplStaticPayload() noexcept : v(0) {}
+        explicit TplStaticPayload(int value) noexcept : v(value) {}
     };
 
     // Specialization over a user C++ class, and over another specialization.
     template <class T>
-    struct M95Wrap
+    struct TplStaticWrap
     {
         static int rank() noexcept { return 3; }
         static int score(const T& t) noexcept { return t.v + 5; }
         static int tally;
     };
-    template <class T> int M95Wrap<T>::tally = 0;
+    template <class T> int TplStaticWrap<T>::tally = 0;
 
     template <class T>
-    struct M95Nest
+    struct TplStaticNest
     {
         static int depth() noexcept { return 2; }
         static int fromInner(const T& t) noexcept { return t.x + 1; }
     };
 
-    inline int m95_take(int v) noexcept { return v + 1000; }
+    inline int tplstatic_take(int v) noexcept { return v + 1000; }
 }

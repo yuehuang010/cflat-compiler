@@ -17,7 +17,7 @@ namespace cppbv
 
     // M70: no standard header is needed for an aggregate with an implicit default constructor.
     // C++20's two-argument T(args) initialization must use the ordinary constructor path.
-    struct M70NoStd
+    struct BraceTmpNoStd
     {
         int first;
         int second;

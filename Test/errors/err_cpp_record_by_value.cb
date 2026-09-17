@@ -1,4 +1,4 @@
-// M3 boundary: a trivially copyable C++ record crosses by value under clang's own arrangement,
+// Record boundary: a trivially copyable C++ record crosses by value under clang's own arrangement,
 // but a NONTRIVIAL one (here: a user destructor) needs construction and destruction at the call
 // site, which is not supported yet. The refusal happens when the declaration is registered, so
 import cpp "cpp_interop_by_value.h";

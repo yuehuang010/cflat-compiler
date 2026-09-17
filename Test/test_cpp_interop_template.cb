@@ -1,0 +1,1638 @@
+// C++-interop coverage: CLASS and FUNCTION TEMPLATES, and std:: specializations.
+// The plain C++ surface is in Test/test_cpp_interop.cb; the CFlat bridge (CFlat-defined
+// [cpp] structs and reverse callbacks) is in Test/test_cpp_interop_bridge.cb.
+
+// The libc++ checks below call members that carry no noexcept specification. Following
+// clang, such calls are allowed by default (an escaping exception terminates the program);
+// Test/errors/err_cpp_template_may_throw.cb proves the opt-in --cpp-strict-noexcept gate.
+// End-to-end C++-interop coverage. Each section exercises one path of the C++ interop
+// pipeline; on failure the section's exit code identifies which one regressed.
+//   C++ CLASS TEMPLATES instantiated from CFlat - `cppt.Box<int>` and `cppt.Box<double>`
+//     from one header-only pattern (constructor, get/set, operator[] bound to the index
+//     expression, operator==), a per-specialization static counter, a specialization over a
+//     nontrivial C++ class whose DEFAULTED destructor still has to run, and the same
+//     specialization named in two functions (one registration, one symbol).
+//   libc++ through the same path - std.vector<int>, std.vector<double>, std.string, and the
+//     nested std.vector<std.string>, plus element destruction counted for
+//     std.vector<cppi.Tracked>.
+//   A specialization whose element type is a POINTER (std.vector<char*>), where every member
+//     signature that names the container itself carries an inner '*' that the type mapper
+//     must not strip, and a `move` argument to a libc++ member.
+//   C++ lazy aliases, unnamed nested enums, nullptr defaults, exact constructor ranking, and
+//     member signatures that request nested std::string specializations.
+//   C++ function-template deduction wrappers for free functions, static and instance
+//     members, class returns, string literals, and explicit type arguments.
+//   C++ brace-list arguments through initializer_list, a class constructor from a brace
+//     list, a class parameter, and an explicit function-template specialization.
+//   Dependent function-pointer ABI types in an uninstantiated template.
+//   C++ header-walk implicit and defaulted special members - local destruction, copy/move
+//     construction, and a defaulted destructor.
+//   C++ rvalue receiver lifetime handoff, bool bitfield packing, and inherited constructors
+//     forwarded through operator->.
+//   Constructors declared over DEPENDENT typedefs (the c10::IListRef shape): clang only
+//     offers the dependent pattern, which the extractor now retains so the class is still
+//     constructible.
+//   C++ member default wrappers with a leading long literal, comparing optional and plain
+//     trailing parameters.
+//   A variadic constructor template called with named LOCALS in the `T x = T(a, b)`
+//     declaration form (the torch::nn::Sequential shape).
+//   A refused member with a default-argument wrapper retries once its class-typed parameter
+//     is registered, at full and reduced arity.
+//   Public fields of a requested class-template specialization remain addressable through a
+//     specialization alias, even beside a same-named namespace.
+//   An inferred unique_ptr returned from a C++ loader-shaped function moves its nontrivial
+//     sret result, including a by-value Dataset and a defaulted size_t-converting options
+//     class.
+//   A namespace-scope C++ alias whose default template argument canonicalizes differently
+//     still names the vector element identity.
+//   An inherited CRTP member template with a dependent return type and a transform that has
+//     only an implicit default constructor.
+//   Canonical spelling of a dependent CRTP member-template return whose template argument is
+//     a namespace-local alias, plus retrying a by-value transform apply_batch after its
+//     vector element is registered.
+//   Homogeneous C++ class brace arguments materialized as contiguous copies/moves for
+//     std::vector and pointer-pair SpanOf parameters.
+//   auto locals move-construct nontrivial C++ sret returns before the temporary is nulled,
+//     both directly and through operator-> forwarding.
+//   Namespace-scope C++ using-directives resolve free functions, types, and function
+//     templates through a lookup-time namespace fallback.
+//   A nontrivial C++ class built from `call() * s` and `(a + s) * t` moves the outermost
+//     operator result into the local; temporaries destroyed.
+//   NON-TYPE template arguments on C++ function templates - `cppt.nth_of<0>(v)`,
+//     `box.slot<3>()`, mixed `cppt.scaled<3, int>(5)`, and `std.get<0>/<1>` on a std::tuple
+//     returned by value.
+//   Members inherited from a class-template-specialization base - a CRTP
+//     NormBase<D, Derived> whose members only get a body when the specialization is ODR-used,
+//     reached from plain derived classes and through a holder's operator->.
+//   Namespace-scope C++ constexpr variables retain their qualified names and declared
+//     enum/bool/integer types as compile-time constants.
+//   C++ constructor temporaries are receivers for member calls, chained member calls, fields,
+//     declaration initializers, and const-reference args.
+//   Nested std::tuple returns through auto and explicit locals, nested std.get calls, a
+//     defaulted optional tuple parameter, and RAII cleanup.
+//   C++ string literals and foreign class values use converting constructors at by-value
+//     call arguments; chained calls preserve references and destroy argument temporaries
+//     exactly once.
+//   Sibling class-template-specialization bases keep their own layout, inherited members,
+//     operator->, and inherited constructors.
+//   Brace overloads at parameter indices 1 and 2, defaulted and explicit options, and
+//     derived-to-base references/pointers through a two-level public hierarchy with a
+//     non-primary base and virtual dispatch.
+//   A class-template specialization's nested Item keeps the enclosing specialization identity
+//     for reference-returning operator[] and front(), including two specializations in one
+//     function and a nontrivial value type.
+//   Heterogeneous C++ brace elements convert into one initializer_list element class,
+//     including a namespace-level using-directive re-export and destruction of the
+//     materialized nontrivial elements.
+//   Namespace-scope floating constexpr values retain float/double types, long double narrows
+//     to CFlat double, and all values remain usable in arithmetic, comparisons, and C++
+//     function arguments.
+//   Nontrivial C++ class declaration locals initialized from call/call and
+//     constructor/constructor ternaries, with both branch outcomes and live-count cleanup; a
+//     ternary of temporaries as a call argument.
+//   A parenthesized ternary used as the condition of a class-declaration ternary, with both
+//     outcomes and live-count cleanup.
+//   Named lvalues in class brace lists stay intact, brace temporaries are destroyed per full
+//     expression in a loop, converting constructors balance by-value and local
+//     materialization, and T(args) works for a no-standard-include aggregate with
+//     two-argument initialization.
+//   One shared C++ foreign identity for positive/negative non-type template bases and
+//     unsigned-char ArrayRef-like bases, including inherited members and derived-to-base
+//     free-function conversions.
+//   Canonical C++ primitive identities for unsigned long, size_t, unsigned, long double, and
+//     a std::vector<size_t>-style round trip.
+//   A class-template specialization named through a GLOBAL-scope C++ alias or typedef - both
+//     spellings reach one record.
+//   A CLASS-typed subscript index - a named std.string lvalue as a std.map key (incremented
+//     twice, and not moved from), the same key through find/count, a struct field and a
+//     dereferenced pointer as keys, a user-header C++ class key, and a CFlat-native
+//     operator[] whose index parameter is a struct.
+//   C++ member ref-qualifiers preserve lvalue/rvalue receiver selection for assignment,
+//     fields, dereferences, elements, calls, temporaries, explicit move, and null-conditional
+//     forwarding.
+//   A CFlat string LITERAL as the operand of a C++ operator - it is the 'char*' it lowers to,
+//     not a CFlat 'string', so it binds 'operator+=(const char*)' on std.string and on a user
+//     class, picks the char* leg over the std::string one, reaches a free operator on either
+//     side of the class operand, and still refuses a 'char' parameter
+//     (Test/errors/err_cpp_string_literal_operator_char.cb). The char* local, std.map literal
+//     key, char literal and CFlat-native string legs are controls that behaved identically
+//     before the fix.
+//   A C++ namespace whose declarations ALL name a std:: specialization (parameter, return by
+//     value, nested namespace) is registered even though binding those signatures is deferred
+//     to first use; nsstd_mix is the control that one std-free declaration already registered.
+//   Qualified C++ class-template constructor temporaries in CFlat call arguments, C++
+//     free/member calls, returns, assignment RHS, zero/two-argument constructors, nested
+//     specializations, and user types.
+//   STATIC members of a C++ class TEMPLATE reached through the qualified specialization
+//     spelling - static methods with 0/1/2 arguments, a static data member read and written, a
+//     static constexpr member, specializations over a primitive, a user C++ class and another
+//     specialization, the call in statement / argument / condition position, a specialization
+//     instantiated ONLY by the static call, and the spelling inside a CFlat generic body.
+//   Ordinary free functions requested on demand from direct standard headers: sort,
+//     make_shared, string conversion/parsing, C-library overloads, numeric algorithms,
+//     make_pair, and nested chrono/thread APIs.
+//   A std container whose element is a std specialization over a USER class -
+//     vector<vector<Cell>>, vector<shared_ptr<Cell>>, both map positions, three levels deep,
+//     and a map naming classes from TWO user headers. The request must union the owning group
+//     of every class nested at any depth, not just the outer template's; each of these was
+//     refused with "no imported C++ header declares 'std::vector'".
+//     Test/errors/err_cpp_nested_missing.cb pins the diagnostic for an argument that genuinely
+//     is not declared.
+
+import cpp "library/cpp_interop_basic.h" cache;
+import cpp "library/cpp_interop_basic.cpp" cache;
+// One header-only CLASS TEMPLATE pattern. No specialization has a symbol anywhere until a
+// CFlat declaration asks for one, so every class-template assertion also proves the
+// instantiation path emitted the bodies. The libc++ checks need no fixture at all - the
+// libc++ headers are the fixture, reached by the SYSTEM header spelling below.
+import cpp "library/cpp_interop_tpl.h" cache;
+import cpp "library/cpp_interop_by_value.h" cache;
+import cpp "vector" cache;
+import cpp "tuple" cache;
+import cpp "mutex" cache;
+import cpp "chrono" cache;
+import cpp "thread" cache;
+import cpp "string" cache;
+import cpp "algorithm" cache;
+import cpp "memory" cache;
+import cpp "numeric" cache;
+import cpp "utility" cache;
+import cpp "cstdlib" cache;
+import cpp "cmath" cache;
+import cpp "cstring" cache;
+import cpp "cctype" cache;
+import cpp "cstdio" cache;
+import cpp "map" cache;
+import cpp "library/cpp_interop_scoped_enum.h" cache;
+import cpp "library/cpp_interop_nsstd.h" cache;
+import cpp "library/cpp_interop_strop.h" cache;
+// std containers over std specializations over USER classes. Neither header
+// includes a standard header, so no single group can declare both halves on its own.
+import cpp "library/cpp_interop_nest.h" cache;
+import cpp "library/cpp_interop_nest2.h" cache;
+
+extern int strcmp(const char* a, const char* b);
+// Class-template helper: the SAME specialization `cppt.Box<int>` a second function also declares. One
+// registration and one emitted symbol have to serve both, or the link fails on a duplicate.
+int tplbox_second_use(int v)
+{
+    cppt.Box<int> b = cppt.Box<int>(v);
+    return b.get() + b[0];
+}
+int qualtemp_take_box(cppt.Box<int> value) { return value.get(); }
+int qualtemp_take_pair(cppt.CtorPair<int> value) { return value.first() + value.second(); }
+int qualtemp_take_nested(cppt.Box<cppt.Box<int>> value) { return value.get().get(); }
+int qualtemp_take_nested2(cppt.Box<cppt.Box<cppt.Box<int>>> value) { return value.get().get().get(); }
+int qualtemp_take_payload(cppt.Box<cppt.impl_detail.Payload> value) { return value.get().get(); }
+cppt.Box<int> qualtemp_return_box(int value) { return cppt.Box<int>(value); }
+// Template-static helpers: the qualified C++ specialization spelling formed from a CFlat generic's own T.
+T tplstaticTwiceStatic<T>(T value) { return cppt.TplStatics<T>.twice(value); }
+int tplstaticRankStatic<T>() { return cppt.TplStatics<T>.rank(); }
+// libc++ helper: a std.string built and read in a second function - the specialization is requested
+// once for the whole compilation, not once per use site.
+int libcxx_second_use()
+{
+    std.string s = std.string("abcd");
+    return (int)s.size();
+}
+int stdfree_standard()
+{
+    std.vector<int> values = default;
+    values.push_back(3); values.push_back(1); values.push_back(2);
+    std.printf("stdfree-before-sort\n");
+    std.sort(values.begin(), values.end());
+    std.printf("stdfree-after-sort\n");
+    if (values[0] != 1 || values[1] != 2 || values[2] != 3) return 1770;
+    std.shared_ptr<int> shared = std.make_shared<int>(41);
+    if (*shared != 41) return 1771;
+    std.string text = std.to_string(42);
+    if (text.size() != 2) return 1772;
+    if (std.stoi(text) != 42) return 1773;
+    if ((int)std.strlen("abcd") != 4) return 1774;
+
+    int i = -7;
+    double d = -2.5;
+    long l = -9;
+    if (std.abs(i) != 7) return 1775;
+    if (std.abs(d) != 2.5) return 1776;
+    if (std.abs(l) != 9) return 1777;
+    if (std.sqrt(81.0) != 9.0) return 1778;
+    if (std.max(3, 8) != 8) return 1779;
+    if (std.max<int>(9, 2) != 9) return 1780;
+    if (std.gcd(84, 30) != 6) return 1781;
+    if (std.printf("") != 0) return 1782;
+    if (std.toupper('a') != 65) return 1783;
+
+    auto pair = std.make_pair(7, 9);
+    if (pair.first != 7 || pair.second != 9) return 1784;
+    auto started = std.chrono.steady_clock.now();
+    std.chrono.duration<long long> delay = std.chrono.duration<long long>(1);
+    std.this_thread.sleep_for(delay);
+    auto finished = std.chrono.steady_clock.now();
+    if (finished.time_since_epoch().count() <= started.time_since_epoch().count()) return 1785;
+    if (delay.count() != 1) return 1786;
+    return 0;
+}
+
+int stdfree_import_order()
+{
+    std.shared_ptr<int> shared = std.make_shared<int>(41);
+    auto pair = std.make_pair(7, 9);
+    if (*shared != 41 || pair.first != 7 || pair.second != 9) return 1787;
+    return std.max<int>(9, 2) == 9 ? 0 : 1787;
+}
+// A CFlat-native operator[] whose index parameter is a struct. The subscript
+// argument build is shared with the C++ path, so a struct index must keep its type here too.
+struct KeyIdx { int v; };
+struct KeyBag { int base; };
+int operator[](KeyBag* bag, KeyIdx idx) { return bag->base + idx.v; }
+
+struct KeyHolder { std.string name = default; };
+int veciter_direct_array_param(std.array<int, 4> value)
+{
+    return cppi.array_total(value);
+}
+extern int main()
+{
+    // Win64 keeps the existing SEH trampoline and does not emit the C++ guard, so the
+    // whole C++-interop surface is verified on the Itanium-ABI hosts only.
+    if const (__WINDOWS__) {
+        return 0;
+    }
+
+    // ---- class-typed subscript indices ----------------------------------------------------------
+    // Runs early and in its own scope on purpose: internal/issue/p2/cpp-shared-ptr-vector-
+    // stale-stack-control-block.md is a pre-existing stray write into main's frame.
+    {
+        // A named std.string lvalue as a std.map key. Pre-fix the index reached C++ member
+        // overload matching as an unnamed aggregate value and no candidate bound.
+        std.map<std.string, int> keyCounts = default;
+        std.string keyString = std.string("compiler");
+        keyCounts[keyString] = keyCounts[keyString] + 1;
+        keyCounts[keyString] = keyCounts[keyString] + 1;
+        if (keyCounts[keyString] != 2)                     return 1590;
+        // One entry only: binding the by-value (key_type&&) leg instead of const key_type&
+        // would move from keyString and the second subscript would insert a second, empty key.
+        if ((int)keyCounts.size() != 1)                 return 1591;
+        if (keyCounts["compiler"] != 2)                 return 1592;
+        // The same named key through the members that already bound it before the fix.
+        if ((int)keyCounts.count(keyString) != 1)          return 1593;
+        auto keyFound = keyCounts.find(keyString);
+        if (keyFound == keyCounts.end())                return 1594;
+        // A struct FIELD and a DEREFERENCED POINTER are the other lvalue spellings.
+        KeyHolder keyHolder = default;
+        keyHolder.name = keyString;
+        keyCounts[keyHolder.name] = keyCounts[keyHolder.name] + 3;
+        if (keyCounts[keyHolder.name] != 5)             return 1595;
+        std.string* keyPtr = &keyString;
+        if (keyCounts[*keyPtr] != 5)                    return 1596;
+        // A user-header C++ class key, and the same class through a const-reference
+        // parameter - so the row is not std.string-specific.
+        std.map<SubscriptKey, int> keyUser = default;
+        SubscriptKey keyUserKey = SubscriptKey(3);
+        keyUser[keyUserKey] = 8;
+        if (keyUser[keyUserKey] != 8)                   return 1597;
+        if (take_subscript_key(keyUserKey) != 4)              return 1598;
+        // A CFlat-native operator[] taking a struct index shares the argument build.
+        KeyBag keyBag = default;
+        keyBag.base = 10;
+        KeyIdx keyIdx = default;
+        keyIdx.v = 4;
+        if (keyBag[keyIdx] != 14)                       return 1599;
+    }
+
+    // ---- C++ class templates instantiated from CFlat --------------------------------------------
+    // One header-only pattern, two specializations. Nothing below exists as a symbol until
+    // these declarations ask for it.
+    cppt.box_int_reset();
+    {
+        cppt.Box<int> tplboxB = cppt.Box<int>(7);
+        if (tplboxB.get() != 7)                      return 480;   // constructor taking T
+        if (cppt.box_int_live() != 1)            return 481;   // per-specialization static counter
+        if (cppt.box_int_ctors() != 1)           return 482;
+        tplboxB.set(9);
+        if (tplboxB.get() != 9)                      return 483;   // mutating method taking T
+        if (tplboxB[0] != 9)                         return 484;   // operator[] via the index expression
+        cppt.Box<int> tplboxB2 = cppt.Box<int>(9);
+        if (!(tplboxB == tplboxB2))                      return 485;   // operator== via the overload table
+        cppt.Box<int> tplboxB3 = cppt.Box<int>(4);
+        if (tplboxB == tplboxB3)                         return 486;
+        if (cppt.box_int_live() != 3)            return 487;
+    }
+    if (cppt.box_int_live() != 0)                return 488;   // all three destroyed exactly once
+    if (cppt.box_int_dtors() != 3)               return 489;
+
+    // A SECOND specialization of the same pattern: its own instantiation, its own counter.
+    {
+        cppt.Box<double> tplboxD = cppt.Box<double>(2.5);
+        if (tplboxD.get() != 2.5)                    return 490;
+        if (tplboxD[0] != 2.5)                       return 491;
+        if (cppt.box_double_live() != 1)         return 492;
+        if (cppt.box_int_live() != 0)            return 493;   // counters are per specialization
+    }
+    if (cppt.box_double_live() != 0)             return 494;
+
+    // The same specialization named in another function: one registration, one linked symbol.
+    if (tplbox_second_use(5) != 10)                  return 495;
+    if (cppt.box_int_live() != 0)                return 496;
+
+    // A member can return a specialization that was not requested while its class was bound. The
+    // first chained call must request LazyBox<int>, bind make_box, and then resolve get normally.
+    {
+        cppt.LazyBoxFactory tplboxLazy = default;
+        if (tplboxLazy.make_box(3).get() != 3)        return 756;
+        cppt.LazyBox<int> tplboxLazyBox = tplboxLazy.make_box(4);
+        if (tplboxLazy.take_box(tplboxLazyBox) != 4)      return 757;
+        // A local initialized from a CHAINED call (sret result move-constructed from the
+        // statement temporary) and from a class the ABI returns in registers.
+        cppt.LazyBox<int> tplboxChained = tplboxLazy.self().make_box(5);
+        if (tplboxLazy.take_box(tplboxChained) != 5)      return 758;
+        cppt.Slot tplboxSlot = tplboxLazy.make_slot(6);
+        if (tplboxSlot.get() != 6)                    return 759;
+        cppt.Slot tplboxSlot2 = tplboxLazy.self().make_slot(7);
+        if (tplboxSlot2.get() != 7)                   return 760;
+        cppi.Grid tplboxGrid = default;
+        if (tplboxGrid.sum() != 10)                   return 761;
+        cppi.Earlier tplboxEarly = default;
+        tplboxEarly.a = 5;
+        cppi.Later tplboxLater = tplboxEarly.to_later();
+        if (tplboxLater.sum() != 18)                  return 762;
+        cppi.Later tplboxLater2 = (cppi.Later)tplboxEarly;
+        if (tplboxLater2.sum() != 15)                 return 763;
+        cppt.via_alias.Payload tplboxPayload = default;
+        // The canonical spelling first, so the alias spelling below must alias onto it.
+        cppt.Box<cppt.impl_detail.Payload> tplboxPb0 = cppt.Box<cppt.impl_detail.Payload>(tplboxPayload);
+        if (tplboxPb0.get().get() != 3)               return 765;
+        cppt.Box<cppt.via_alias.Payload> tplboxPb = cppt.Box<cppt.via_alias.Payload>(tplboxPayload);
+        if (tplboxPb.get().get() != 3)                return 764;
+    }
+
+    // A specialization over a NONTRIVIAL C++ class whose destructor is DEFAULTED: there is no
+    // body in the header, so the instantiation has to make clang define and emit it, and it has
+    // to destroy the Tracked member.
+    cppi.reset_counts();
+    {
+        cppt.Holder<cppi.Tracked> tplboxH = cppt.Holder<cppi.Tracked>(4);
+        if (tplboxH.value() != 4)                    return 497;
+        if (cppi.ctor_count() != 1)              return 498;
+        if (cppi.dtor_count() != 0)              return 499;
+    }
+    if (cppi.dtor_count() != 1)                  return 480 + 20;   // 500 - defaulted dtor ran
+
+    // ---- libc++ through the same path -----------------------------------------------------------
+    // std.vector<int>: default construction, push_back, size through the size_t mapping,
+    // element read as an rvalue, element write as an lvalue, and clear.
+    {
+        std.vector<int> libcxxV = default;
+        libcxxV.push_back(3);
+        libcxxV.push_back(4);
+        if ((int)libcxxV.size() != 2)                return 501;
+        int libcxxX = libcxxV[0];
+        if (libcxxX != 3)                            return 502;
+        if (libcxxV[1] != 4)                         return 503;
+        libcxxV[0] = 5;
+        if (libcxxV[0] != 5)                         return 504;
+        libcxxV.clear();
+        if ((int)libcxxV.size() != 0)                return 505;
+    }
+
+    // A second element type is a second specialization of the same libc++ template.
+    {
+        std.vector<double> libcxxD = default;
+        libcxxD.push_back(2.5);
+        if ((int)libcxxD.size() != 1)                return 506;
+        if (libcxxD[0] != 2.5)                       return 507;
+    }
+
+    // std.string: the `const char*` constructor (a member template with an all-defaulted SFINAE
+    // parameter), append, size, c_str and the equality operator.
+    {
+        std.string libcxxS = std.string("hello");
+        if ((int)libcxxS.size() != 5)                return 508;
+        libcxxS.append(" world");
+        if ((int)libcxxS.size() != 11)               return 509;
+        if (strcmp(libcxxS.c_str(), "hello world") != 0) return 510;
+        // libc++ spells string equality as a FREE function TEMPLATE, which this path does not
+        // bind (it is deduced at the call site, not a member of the specialization); the member
+        // `compare` is the equality surface that is available.
+        std.string libcxxS2 = std.string("hello world");
+        if (libcxxS.compare(libcxxS2) != 0)              return 511;
+    }
+    if (libcxx_second_use() != 4)                    return 512;
+
+    // A NESTED template argument: std.vector<std.string> requires std.string to be registered
+    // before the outer name is mangled, and the element access returns a C++ reference.
+    {
+        std.vector<std.string> libcxxN = default;
+        std.string libcxxE = std.string("abc");
+        libcxxN.push_back(libcxxE);
+        if ((int)libcxxN.size() != 1)                return 513;
+        if ((int)libcxxN[0].size() != 3)             return 514;   // member call on the T& element
+        if (strcmp(libcxxN[0].c_str(), "abc") != 0)  return 515;
+    }
+
+    // Element destruction: every Tracked the vector holds is destroyed exactly once when the
+    // vector is, so the total destruction count matches everything ever constructed.
+    cppi.reset_counts();
+    {
+        cppi.Tracked libcxxT = cppi.make_tracked(4);
+        std.vector<cppi.Tracked> libcxxTv = default;
+        libcxxTv.push_back(libcxxT);
+        libcxxTv.push_back(libcxxT);
+        if ((int)libcxxTv.size() != 2)               return 516;
+        if (libcxxTv[0].value() != 4)                return 517;
+        // No exact count inside the scope: growing the buffer moves the existing elements and
+        // destroys the moved-from ones, so libc++ is free to construct and destroy extra objects
+        // here. The invariant below is the assertion - every object ever built is destroyed.
+        if (cppi.ctor_count() != 1)              return 518;
+    }
+    {
+        int libcxxMade = cppi.ctor_count() + cppi.copy_count() + cppi.move_count();
+        if (libcxxMade < 3)                          return 519;   // 1 local + 2 elements at least
+        if (cppi.dtor_count() != libcxxMade)         return 520;   // vector destroyed every element
+    }
+
+    // ---- pointer element types and move arguments to libc++ members -----------------------------
+    /*
+     * A POINTER element type. Clang's canonical spelling of the specialization then carries an
+     * inner '*' ("vector<char *, allocator<char *>>"), and every member signature that mentions the
+     * container itself is spelled that way. Deleting every '*' before the foreign-type lookup used
+     * to leave `swap` taking void**, which accepts any pointer at all - so this section is as much
+     * a type-safety assertion as a functional one.
+     */
+    {
+        char* ptrelemP = nullptr;
+        std.vector<char*> ptrelemV = default;
+        ptrelemV.push_back(ptrelemP);                                   // `char* const&` param binds the value by address
+        if ((int)ptrelemV.size() != 1)               return 530;
+        std.vector<char*> ptrelemW = default;
+        ptrelemV.swap(ptrelemW);                                        // param IS the container type
+        if ((int)ptrelemV.size() != 0)               return 531;
+        if ((int)ptrelemW.size() != 1)               return 532;
+        if (ptrelemW[0] != nullptr)                  return 615;   // `char *&` decays to the element
+    }
+
+    /*
+     * A `move` argument to a libc++ member binds the T&& leg, while an lvalue binds const T&.
+     * The C++ move leaves the source object alive until its normal scope exit.
+     */
+    cppi.reset_counts();
+    {
+        cppi.Tracked ptrelemT = cppi.make_tracked(9);
+        std.vector<cppi.Tracked> ptrelemTv = default;
+        ptrelemTv.push_back(move ptrelemT);
+        if ((int)ptrelemTv.size() != 1)              return 533;
+        if (ptrelemTv[0].value() != 9)               return 534;
+        if (cppi.copy_count() != 0)              return 535;
+        if (cppi.move_count() != 1)              return 536;
+    }
+    {
+        if (cppi.dtor_count() != 2)              return 537;   // element plus moved-from local
+    }
+    cppi.reset_counts();
+    {
+        cppi.Tracked ptrelemT2 = cppi.make_tracked(9);
+        std.vector<cppi.Tracked> ptrelemTv2 = default;
+        ptrelemTv2.push_back(ptrelemT2);
+        if ((int)ptrelemTv2.size() != 1)             return 538;
+        if (ptrelemTv2[0].value() != 9)              return 539;
+        if (cppi.copy_count() != 1)              return 540;
+        if (cppi.move_count() != 0)              return 541;
+    }
+    if (cppi.dtor_count() != 2)                  return 542;
+    {
+        std.vector<std.string> ptrelemSv = default;
+        std.string ptrelemS = std.string("rvalue");
+        ptrelemSv.push_back(move ptrelemS);
+        if (strcmp(ptrelemSv[0].c_str(), "rvalue") != 0) return 543;
+    }
+
+    // A pointer element's C++ T*& result is an alias to the pointer slot, not the slot address.
+    {
+        char* ptrelemS = "element";
+        char* ptrelemT = "replacement";
+        std.vector<char*> ptrelemPv = default;
+        ptrelemPv.push_back(ptrelemS);
+        if (ptrelemPv[0] != ptrelemS)                         return 578;
+        if (ptrelemPv.back() != ptrelemS)                     return 579;
+        ptrelemPv[0] = ptrelemT;
+        if (ptrelemPv[0] != ptrelemT)                         return 580;
+        if (ptrelemPv.back() != ptrelemT)                     return 581;
+    }
+    cppi.reset_counts();
+    {
+        cppi.Tracked ptrelemA = cppi.make_tracked(14);
+        cppi.Tracked ptrelemB = cppi.make_tracked(15);
+        cppi.Tracked* ptrelemPa = &ptrelemA;
+        cppi.Tracked* ptrelemPb = &ptrelemB;
+        std.vector<cppi.Tracked*> ptrelemPpv = default;
+        ptrelemPpv.push_back(ptrelemPa);
+        if (ptrelemPpv[0].value() != 14)                  return 582;
+        ptrelemPpv[0] = ptrelemPb;
+        if (ptrelemPpv[0].value() != 15)                  return 583;
+        if (cppi.dtor_count() != 0)                   return 584;
+    }
+    if (cppi.dtor_count() != 2)                       return 585;
+
+    // ---- std::unique_ptr specialization named only by signatures --------------------------------
+    cppi.reset_counts();
+    {
+        std.unique_ptr<cppi.Tracked> uniqptrP = cppi.make_tracked_ptr(5);
+        if (uniqptrP.get() == nullptr)                  return 658;
+        if (cppi.tracked_ptr_payload(uniqptrP) != 5)    return 659;
+        cppi.Tracked* uniqptrRaw = uniqptrP.release();
+        if (uniqptrRaw == nullptr || uniqptrRaw.value() != 5) return 660;
+        delete uniqptrRaw;
+        if (cppi.dtor_count() != 1)                 return 661;
+        uniqptrP.reset(nullptr);
+    }
+    if (cppi.dtor_count() != 1)                     return 662;
+
+    cppi.reset_counts();
+    {
+        std.unique_ptr<cppi.Tracked> uniqptrP = cppi.make_tracked_ptr(6);
+        uniqptrP.reset(nullptr);
+        if (cppi.dtor_count() != 1)                 return 663;
+    }
+    cppi.reset_counts();
+    {
+        std.unique_ptr<cppi.Tracked> uniqptrP = cppi.make_tracked_ptr(9);
+        if (cppi.consume_tracked_ptr(move uniqptrP) != 9) return 664;
+    }
+    if (cppi.dtor_count() != 1)                     return 665;
+
+    // ---- std::shared_ptr and template statics ---------------------------------------------------
+    cppi.reset_counts();
+    {
+        std.shared_ptr<cppi.Tracked> shptrA = cppi.make_tracked_shared(12);
+        if (shptrA.get() == nullptr)                   return 673;
+        if (cppi.shared_payload(shptrA) != 12)         return 674;
+        if (shptrA.use_count() != 1)                   return 675;
+        std.shared_ptr<cppi.Tracked> shptrB = shptrA;
+        if (shptrA.use_count() != 2)                   return 676;
+        shptrB.reset();
+        if (shptrA.use_count() != 1)                   return 677;
+        if (cppi.consume_tracked_shared(move shptrA) != 12) return 678;
+    }
+    if (cppi.dtor_count() != 1)                     return 679;
+    if (cppi.ctor_count() != 1)                     return 680;
+
+    if (cppi.Registry<int>.count != 0)              return 681;
+    if (cppi.Registry<int>.bump() != 1)             return 682;
+    if (cppi.Registry<int>.bump() != 2)             return 683;
+    if (cppi.Registry<int>.count != 2)              return 684;
+
+    if const (cppi.Limits.kLimit != 32) { return 685; }
+    int shptrLimit = cppi.Limits.kLimit;
+    if (shptrLimit != 32)                              return 686;
+
+    cppi.Outer.Id shptrId = 7;
+    cppi.Outer.Name shptrName = "qualified";
+    if (shptrId != 7 || strcmp(shptrName, "qualified") != 0) return 687;
+    if (cppi.with_call_default(1) != 9)             return 688;
+
+    // ---- std::map<int, int> specialization surface ----------------------------------------------
+    std.map<int, int> intMap = cppi.make_int_map();
+    if (intMap.size() != 2)                          return 689;
+    if (intMap.count(3) != 1)                        return 690;
+    if (intMap.at(3) != 7)                           return 691;
+    if (intMap[3] != 7)                              return 692;
+    intMap[3] = 9;
+    if (intMap[3] != 9)                              return 693;
+    if (cppi.map_total(intMap) != 20)                return 694;
+    int intMapIterTotal = 0;
+    for (auto intMapIt = intMap.begin(); intMapIt != intMap.end(); intMapIt++)
+        intMapIterTotal += intMapIt.second;
+    if (intMapIterTotal != 20)                         return 696;
+    intMap.erase(3);
+    if (intMap.count(3) != 0 || intMap.size() != 1) return 695;
+
+    // ---- std::pair and std::optional ------------------------------------------------------------
+    std.pair<int, double> pairoptPair = cppi.make_pair_value(8, 2.5);
+    if (pairoptPair.first != 8)                         return 666;
+    if (pairoptPair.second != 2.5)                      return 667;
+    std.optional<int> pairoptSome = cppi.make_opt(17, true);
+    if (!pairoptSome.has_value())                       return 668;
+    if (pairoptSome.value() != 17)                      return 669;
+    std.optional<int> pairoptNone = cppi.make_opt(17, false);
+    if (pairoptNone.has_value())                        return 670;
+    if (pairoptNone.value_or(cppi.helper()) != 9)       return 747;
+    pairoptNone.emplace(cppi.helper());
+    if (!pairoptNone || pairoptNone.value() != 9)           return 748;
+    pairoptNone.reset();
+    if (pairoptNone)                                    return 749;
+
+    int[4] rawArray4 = {1, 2, 3, 4};
+    if (cppi.sum4(rawArray4) != 10)                  return 671;
+    if (cppi.sum4_ptr(rawArray4) != 10)              return 672;
+
+    // ---- vector contiguous iteration and std.array by value -------------------------------------
+    {
+        std.vector<int> veciterV = default;
+        veciterV.push_back(2);
+        veciterV.push_back(3);
+        int veciterSum = 0;
+        for (auto veciterIt = veciterV.begin(); veciterIt != veciterV.end(); veciterIt++)
+            veciterSum += *veciterIt;
+        if (veciterSum != 5)                            return 697;
+        if (veciterV.data()[1] != 3)                   return 698;
+    }
+    std.array<int, 4> veciterDirectArray = cppi.make_int_array();
+    veciterDirectArray[0] = 8;
+    if (veciterDirectArray[0] != 8)                return 704;
+    if (cppi.array_total(veciterDirectArray) != 17) return 705;
+    if (veciter_direct_array_param(veciterDirectArray) != 17) return 706;
+    cppi.IntArray4 veciterArray = cppi.make_int_array();
+    if (veciterArray.size() != 4)                      return 699;
+    if (veciterArray[0] != 1 || veciterArray[3] != 4)      return 700;
+    veciterArray[1] = 9;
+    if (veciterArray[1] != 9)                          return 701;
+    if (veciterArray.data()[2] != 3)                   return 702;
+    if (cppi.array_total(veciterArray) != 17)          return 703;
+
+    // ---- std::string_view and a free variadic function ------------------------------------------
+    char* strviewCstr = "hello";
+    std.string_view strviewSv = std.string_view(strviewCstr);
+    if ((int)strviewSv.size() != 5)                      return 740;
+    if (strviewSv.data()[1] != 'e')                     return 741;
+    if (strviewSv[1] != 'e')                            return 742;
+    std.string_view strviewShort = std.string_view(strviewCstr, 3);
+    if ((int)strviewShort.size() != 3)                  return 743;
+    if ((int)strviewSv.substr(1, 3).size() != 3
+        || strviewSv.substr(1, 3)[0] != 'e')                  return 744;
+    if ((int)cppi.return_string_view(cppi.take_string_view(strviewSv.substr(1, 3))).size() != 3
+        || cppi.return_string_view(cppi.take_string_view(strviewSv.substr(1, 3)))[2] != 'l') return 745;
+    if (cppi.sum_varargs(4, 1, 2, 3, 4) != 10)     return 746;
+
+    // ---- lazy aliases and exact C++ interop surfaces --------------------------------------------
+    cppi.AnonEnumHolder lazyAnon = default;
+    if (lazyAnon.get() != 5)                          return 766;
+    cppi.NullDefaulted lazyNull = default;
+    if (lazyNull.get() != 7)                         return 767;
+    cppi.IntPick lazyInt = cppi.IntPick(42);
+    if (lazyInt.which != 1)                          return 768;
+    i64 lazyLongArg = 42;
+    cppi.IntPick lazyLong = cppi.IntPick(lazyLongArg);
+    // `i64` IS `long long` on every target (a C++ import maps `long` to the distinct CFlat `long`),
+    // so it binds IntPick(long long) on LP64 too, not the equal-width IntPick(long).
+    if (lazyLong.which != 4) return 769;
+    cppi.IntPick lazyDouble = cppi.IntPick(2.5);
+    if (lazyDouble.which != 5)                       return 770;
+    cppt.TaggedInt lazyTagged = cppt.TaggedInt(11);
+    if (lazyTagged.get() != 11)                      return 771;
+    std.string lazyTaggedName = lazyTagged.name();
+    if (strcmp(lazyTaggedName.c_str(), "tagged") != 0) return 772;
+    cppt.deep.TaggedLong lazyTaggedLong = default;
+    if (lazyTaggedLong.get() != 0)                   return 773;
+    // A lazy alias first met as a temporary inside a call argument, no declaration before it.
+    if (cppt.tagged_real_value(cppt.TaggedReal(7.5)) != 7.5) return 774;
+    long[3] lazyXs = {1, 2, 3};
+    if (cppt.long_view_sum(cppt.LongView(&lazyXs[0], 3)) != 6) return 775;
+
+    // C++ long / unsigned long are their own specializations, distinct from long long / unsigned
+    // long long. Each sum takes the C++ vector by reference and walks it with C++'s stride.
+    {
+        std.vector<long> lazyLongs = default;
+        lazyLongs.push_back(-5);
+        lazyLongs.push_back(7);
+        if (cppi.long_vector_sum(lazyLongs) != 2)     return 824;
+
+        // A returned unsigned long reads back as ulong, not as the width-mapped u32.
+        auto lazyUlongValue = cppi.unsigned_long_value();
+        if (strcmp(typeof(lazyUlongValue), "ulong") != 0) return 825;
+        std.vector<ulong> lazyUlongs = default;
+        lazyUlongs.push_back(lazyUlongValue);
+        lazyUlongs.push_back(1);
+        if (cppi.ulong_vector_sum(lazyUlongs) != 4000000001) return 826;
+
+        std.vector<i64> lazyI64s = default;
+        lazyI64s.push_back(3000000000);
+        lazyI64s.push_back(-1);
+        if (cppi.long_long_vector_sum(lazyI64s) != 2999999999) return 827;
+
+        std.vector<u64> lazyU64s = default;
+        lazyU64s.push_back(3000000000);
+        lazyU64s.push_back(5000000000);
+        if (cppi.ulong_long_vector_sum(lazyU64s) != 8000000000) return 828;
+    }
+
+    // ---- C++ function-template deduction wrappers -----------------------------------------------
+    if (cppt.twice(21) != 42)                       return 774;
+    if (cppt.twice(1.25) != 2.5)                   return 775;
+    if (cppt.twice<double>(2) != 4.0)              return 776;
+    if (cppt.count_chars("hello") != 5)            return 777;
+    cppt.box_int_reset();
+    {
+        cppt.Box<int> deduceBox = cppt.make_box(5);
+        if (deduceBox.get() != 5)                     return 778;
+    }
+    cppt.Scaler deduceSc = cppt.Scaler(3);
+    if (deduceSc.scaled(7) != 21)                     return 779;
+    if (deduceSc.scaled(1.5) != 4.5)                  return 780;
+    if (cppt.Scaler.from(4) != 40)                 return 781;
+
+    // ---- C++ brace-list arguments ---------------------------------------------------------------
+    if (cppt.sum_il({1, 2, 3}) != 6)              return 782;
+    if (cppt.sum_ild({1.5, 2.5}) != 4.0)          return 783;
+    if (cppt.span_size({7, 8, 9}) != 3)            return 784;
+    if (cppt.span_count<long>({1, 2}) != 2)        return 785;
+    if (cppt.shape_rank({4, 5, 6}) != 3)           return 786;
+
+    // The header also contains an uninstantiated template whose callback alias has a dependent
+    // function prototype. The non-template neighbour proves extraction completed successfully.
+    if (cppt.dependent_abi_neighbor() != 6)         return 787;
+
+    // ---- implicit and defaulted C++ special members ---------------------------------------------
+    cppt.Shape specialShape = cppt.Shape({2, 3});
+    if (specialShape.dim(1) != 3)                      return 788;
+    cppt.Named specialA = cppt.Named("abc", 3);
+    cppt.Named specialB = specialA;
+    if (specialB.id != 3 || strcmp(specialB.cname(), "abc") != 0) return 789;
+    cppt.Named specialC = move specialA;
+    if (specialC.id != 3 || strcmp(specialC.cname(), "abc") != 0) return 790;
+    cppt.Defaulted specialD = default;
+    if (specialD.n() != 0)                              return 791;
+
+    // ---- C++ rvalue receivers, bool bitfields, and inherited variadic constructors --------------
+    if (cppt.make_box(9).get() != 9)                  return 820;
+    cppt.BoolBits rvrecvBits = default;
+    rvrecvBits.ready = true;
+    if (!rvrecvBits.ready)                                return 821;
+    rvrecvBits.mode = true;
+    if (!rvrecvBits.mode)                                 return 822;
+    cppt.InheritedCtorHolder rvrecvHolder = cppt.InheritedCtorHolder(5, 7);
+    if (rvrecvHolder.get() != 12)                         return 823;
+
+    // ---- class-template bases, nontrivial by-value ctor args, and defaulted parameters ---------
+    // cflat cannot spell --------------------------------------------------------------------------
+    cppt.TplHolderA ctorargA = default;
+    if (ctorargA.own_a() != 5)                             return 824;
+    if (ctorargA.base_tag() != 7)                          return 825;
+    cppt.TplHolderB ctorargB = default;
+    if (ctorargB.base_tag() != 7)                          return 826;
+    cppt.ItemBag ctorargBag = cppt.ItemBag(cppi.make_tracked(4));
+    if (ctorargBag.value() != 4)                           return 827;
+    cppt.Picker ctorargPicker = default;
+    if (ctorargPicker.scale() != 11)                       return 829;
+
+    // Batch cpp-interop regressions: keyword member access, multi-word primitive
+    // template arguments, and a value that exercises unsigned specialization.
+    std.mutex batchMutex = default;
+    // Parse-fix leg: compiling proves lock()/try_lock() parse; values only prove the
+    // released mutex can be reacquired, not broader mutex semantics.
+    int batchCounter = 0;
+    batchMutex.lock();
+    batchCounter = batchCounter + 1;
+    batchMutex.unlock();
+    if (batchCounter != 1) return 989;
+    if (!batchMutex.try_lock()) return 990;
+    batchMutex.unlock();
+
+    std.vector<unsigned int> batchUnsigned = default;
+    u32 batchUnsignedValue = 4000000000;
+    batchUnsigned.push_back(batchUnsignedValue);
+    if (batchUnsigned[0] != batchUnsignedValue) return 985;
+    // Element type must be UNSIGNED: read back as 'int' this is negative. The equality
+    // above passes either way, so this is the leg that discriminates the specialization.
+    if (batchUnsigned[0] < 2000000000) return 988;
+
+    // Compile/link assertion only: default count() is zero for every specialization; nonzero
+    // construction remains open in cppinterop/constrained-template-constructor-overload-resolution.md.
+    std.chrono.duration<long long> batchDuration = default;
+    if (batchDuration.count() != 0) return 986;
+
+    cppi.Outer.Inner batchKeyword = default;
+    batchKeyword.value = 21;
+    if (batchKeyword.i64() != 42) return 987;
+
+    // An INHERITED member whose return type is an unregistered template specialization: the
+    // refusal lives on the base, so the derived receiver must rebind through it.
+    cppt.SpanDerived spanDerived = default;
+    if (spanDerived.get_tag() != 5) return 1045;
+    cppt.RefSpan<long> spanView = spanDerived.span();
+    if ((int)spanView.size() != 3) return 1046;
+    if (spanView.at((ulong)0) != 7) return 1047;
+    if (spanView.at((ulong)2) != 9) return 1048;
+
+    // ---- constructors declared over DEPENDENT typedefs ------------------------------------------
+    // TypedList's constructor parameter is spelled `const boxed_type&` where boxed_type is a
+    // member typedef of a traits class, so clang only ever offers the dependent PATTERN.
+    std.vector<long> depctorValues = default;
+    depctorValues.push_back(41);
+    depctorValues.push_back(42);
+    cppt.LongList depctorList = cppt.LongList(depctorValues);
+    if (depctorList.size() != 2) return 1060;
+    if (depctorList.first() != 41) return 1061;
+    if (cppt.long_list_size(depctorList) != 2) return 1062;
+
+    // ---- std::optional parameters at C++ calls --------------------------------------------------
+    // std::optional's constructors are TEMPLATES, so clang's member list carries none of them.
+    // Construction goes through the generated C++ wrapper instead of a listed constructor.
+    std.optional<int> optparamEmpty = std.optional<int>();
+    if (optparamEmpty.has_value())                       return 1070;
+    std.optional<int> optparamFive = std.optional<int>(5);
+    if (!optparamFive.has_value())                       return 1071;
+    if (optparamFive.value() != 5)                       return 1072;
+    short optparamNarrow = 7;
+    std.optional<int> optparamWide = std.optional<int>((int)optparamNarrow);
+    if (!optparamWide.has_value() || optparamWide.value() != 7) return 1073;
+
+    // ---- leading long literal through a C++ default wrapper -------------------------------------
+    cppt.Meter longlitDefaults = default;
+    if (longlitDefaults.f(0, 1, 3) != 131) return 1080;
+    if (longlitDefaults.f(2, 1, 3) != 2131) return 1081;
+    if (longlitDefaults.g(0, 1, 3) != 131) return 1082;
+    if (longlitDefaults.g(7, 1, 3) != 7131) return 1083;
+
+    // ---- variadic constructor template with local-variable arguments ----------------------------
+    // The declaration form used to hand the wrapper call the argument variables' own names, which
+    // overload matching read as named arguments ("named argument 'varctorTag' does not match").
+    long varctorTag = 3;
+    long varctorX = 9;
+    cppt.LongList varctorList = cppt.LongList(varctorTag, varctorX);
+    if (varctorList.size() != 3) return 1100;
+    // A class-typed local through the same wrapper: it is passed by value, so the call needs the
+    // argument's address for the copy constructor (the wrapper call used to drop it).
+    cppt.PackArg varctorArg = cppt.PackArg(9);
+    cppt.LongList varctorList2 = cppt.LongList(4, varctorArg);
+    if (varctorList2.size() != 4) return 1101;
+
+    // ---- refused member default-wrapper retry ---------------------------------------------------
+    // LazyBox<int> is initially visible only in member signatures. Its by-value parameter is
+    // refused until the type request registers the specialization, while the defaults create a
+    // wrapper under the same member name.
+    cppt.LazyBox<int> retrydefBox = cppt.LazyBox<int>(5);
+    if (cppt.LazyBoxFactory.take_box_default(retrydefBox, 4) != 9) return 1090;
+    if (cppt.LazyBoxFactory.take_box_default() != 8) return 1091;
+
+    // ---- fields of a requested class-template specialization ------------------------------------
+    cppt.TEx specfieldEx = cppt.make_ex(7, 11);
+    if (specfieldEx.data.value() != 7) return 1110;
+    if (specfieldEx.target != 11) return 1111;
+
+    // ---- inferred move-only C++ return through a loader-shaped template -------------------------
+    cppt.LoaderDataset uniqDataset = default;
+    uniqDataset.add(10);
+    uniqDataset.add(20);
+    uniqDataset.add(30);
+    uniqDataset.add(40);
+    if (uniqDataset.size() != 4) return 1120;
+    if (uniqDataset.first() != 10) return 1121;
+    auto uniqLoader = cppt.make_loader<cppt.LoaderDataset, cppt.LoaderSampler>(uniqDataset, 2);
+    if (uniqLoader.get() == nullptr) return 1122;
+    if (uniqLoader->dataset_count != 4) return 1123;
+    if (uniqLoader->first_value != 10) return 1124;
+    if (uniqLoader->batch_count != 2) return 1125;
+    if (uniqLoader->dataset_count + uniqLoader->batch_count != 6) return 1126;
+    if (uniqLoader->first_value + uniqLoader->batch_count != 12) return 1127;
+    if (uniqLoader->last_value != 40) return 1128;
+    if (uniqLoader->batch_count != (uniqLoader->dataset_count + 1) / 2) return 1129;
+
+    // ---- inherited CRTP member template and implicit transform ctor -----------------------------
+    cppt.CrtpDataset crtpDataset = cppt.CrtpDataset(40);
+    cppt.CrtpTransform<int> crtpTransform = cppt.CrtpTransform<int>();
+    auto crtpMapped = crtpDataset.map<cppt.CrtpTransform<int>>(crtpTransform);
+    if (crtpMapped.result() != 41) return 1150;
+
+    // ---- canonical dependent wrapper types and by-value retry -----------------------------------
+    cppt.lo.Ds2 depretDataset = cppt.lo.Ds2(5);
+    auto depretMapped = depretDataset.map(cppt.lo.TrA());
+    if (depretMapped.r() != 7) return 1170;
+    auto depretMappedExplicit = depretDataset.map<cppt.lo.TrA>(cppt.lo.TrA());
+    if (depretMappedExplicit.r() != 7) return 1171;
+
+    cppt.lo.BatchDs2 depretBatchDataset = cppt.lo.BatchDs2(5);
+    auto depretBatchMapped = depretBatchDataset.map_batch(cppt.lo.BatchTrA());
+    if (depretBatchMapped.r() != 8) return 1172;
+    std.vector<cppt.TEx2> depretBatch = default;
+    depretBatch.emplace_back(19);
+    if (depretBatchMapped.apply_batch(move depretBatch).data.value() != 19) return 1173;
+
+    // ---- C++ alias identity through a canonicalized default argument ----------------------------
+    // The vector element is Ex2<Tracked, void>; TEx2 spells Ex2<Tracked, NoT>.
+    std.vector<cppt.TEx2> aliasidValues = cppt.make_ex2_vector();
+    if (aliasidValues.size() != 1) return 1140;
+    if (aliasidValues[0].data.value() != 17) return 1141;
+
+    // ---- auto locals from nontrivial C++ sret returns -------------------------------------------
+    cppt.autosret_reset();
+    {
+        cppt.LoaderDataset autosretDataset = default;
+        auto autosretValues = autosretDataset.tracked_values();
+        if ((int)autosretValues.size() != 2) return 1160;
+        if (autosretValues.first() != 31) return 1161;
+        if (cppt.autosret_dtor_count() != 1) return 1162;
+    }
+    if (cppt.autosret_dtor_count() != 2) return 1163;
+
+    cppt.autosret_reset();
+    {
+        cppt.LoaderDataset autosretDataset = default;
+        cppt.AutoSretHolder autosretHolder = cppt.AutoSretHolder(&autosretDataset);
+        auto autosretForwarded = autosretHolder->tracked_values();
+        if ((int)autosretForwarded.size() != 2) return 1164;
+        if (autosretForwarded.second() != 47) return 1165;
+        if (cppt.autosret_dtor_count() != 1) return 1166;
+    }
+    if (cppt.autosret_dtor_count() != 2) return 1167;
+
+    // ---- namespace-scope using-directive lookup -------------------------------------------------
+    if (cppt.via_directive(4) != 12) return 1130;
+    cppt.DirTag usingdirTag = default;
+    usingdirTag.v = 9;
+    if (usingdirTag.v != 9) return 1131;
+    if (cppt.dir_unit<long>() != 1) return 1132;
+
+    // ---- nontrivial C++ operator results from call operands -------------------------------------
+    {
+        cppt.OpVec opresultA = cppt.make_opvec(1.0);
+        cppt.OpVec opresultC = cppt.make_opvec(1.0) * 4.0;
+        if (opresultC.sum() != 8.0) return 1180;
+        cppt.OpVec opresultN = (opresultA + 1.0) * 3.0;
+        if (opresultN.sum() != 12.0) return 1181;
+        cppt.OpVec opresultE = opresultA + 4.0;
+        if (opresultE.sum() != 10.0) return 1182;
+        if (cppt.OpVec.live() != 4) return 1183;
+    }
+    if (cppt.OpVec.live() != 0) return 1184;
+
+    // ---- non-type template arguments on C++ calls -----------------------------------------------
+    {
+        std.vector<int> nontypeV = default;
+        nontypeV.push_back(10);
+        nontypeV.push_back(11);
+        nontypeV.push_back(12);
+        if (cppt.nth_of<0>(nontypeV) != 10) return 1210;
+        if (cppt.nth_of<2>(nontypeV) != 12) return 1211;
+        cppt.SlotBox nontypeBox = cppt.SlotBox(100);
+        if (nontypeBox.slot<0>() != 100) return 1212;
+        if (nontypeBox.slot<3>() != 103) return 1213;
+        if (cppt.scaled<3, int>(5) != 15) return 1214;
+        if (cppt.scaled<2, double>(1.5) != 3.0) return 1215;
+        {
+            std.tuple<cppi.Tracked, int> nontypeT = cppt.make_tracked_pair(7);
+            cppi.Tracked nontypeFirst = std.get<0>(nontypeT);
+            if (nontypeFirst.value() != 7) return 1216;
+            if (std.get<1>(nontypeT) != 14) return 1217;
+        }
+    }
+
+    // ---- members inherited from a class-template-specialization base ----------------------------
+    {
+        cppt.Norm1 crtpbaseA = default;
+        cppt.Norm2 crtpbaseB = default;
+        if (crtpbaseA.dims() != 1) return 1220;
+        if (crtpbaseB.dims() != 2) return 1221;
+        if (crtpbaseA.twice(5) != 10) return 1222;
+        if (crtpbaseB.twice(5) != 15) return 1223;
+        cppt.NormHolder crtpbaseH = default;
+        if (crtpbaseH->twice(2) != 4) return 1224;
+        if (crtpbaseH->dims() != 1) return 1225;
+    }
+
+    // ---- sibling class-template-specialization bases --------------------------------------------
+    {
+        cppt.sibbase.Holder<cppt.sibbase.EmbImpl> sibbaseH = cppt.sibbase.Holder<cppt.sibbase.EmbImpl>(2);
+        if (sibbaseH.forward(1) != 1021) return 1260;
+        if (sibbaseH->forward(1) != 1021) return 1261;
+        cppt.sibbase.Holder<cppt.sibbase.EmbImpl> sibbaseH2 = cppt.sibbase.Holder<cppt.sibbase.EmbImpl>(3);
+        if (sibbaseH2.forward(1) != 1031) return 1262;
+        if (sibbaseH2->forward(1) != 1031) return 1263;
+    }
+    {
+        cppt.sibbase.Embedding sibbaseE = cppt.sibbase.Embedding(2);
+        cppt.sibbase.Linear sibbaseL = cppt.sibbase.Linear(2);
+        if (sibbaseE.forward(1) != 1021) return 1264;
+        if (sibbaseE->forward(1) != 1021) return 1265;
+        if (sibbaseL.forward(1) != 2021) return 1266;
+        if (sibbaseL->forward(1) != 2021) return 1267;
+    }
+    {
+        cppt.sibbase.Linear sibbaseL = cppt.sibbase.Linear(3);
+        cppt.sibbase.Embedding sibbaseE = cppt.sibbase.Embedding(3);
+        if (sibbaseL.forward(1) != 2031 || sibbaseE.forward(1) != 1031) return 1268;
+    }
+    if (cppt.sibbase.live_count() != 0) return 1269;
+
+    // ---- nested Item returns from class-template specializations --------------------------------
+    {
+        cppt.Dict<std.string, double> nesteditemText = cppt.make_nesteditem_text();
+        if (nesteditemText.size() != 2) return 1280;
+        if (strcmp(nesteditemText[0].key().c_str(), "w") != 0) return 1281;
+        if (strcmp(nesteditemText.front().key().c_str(), "w") != 0) return 1282;
+        if (nesteditemText.front().value() != 1.5) return 1283;
+        nesteditemText[1].value() = 6.5;
+        if (nesteditemText[1].value() != 6.5) return 1284;
+
+        cppt.Dict<int, double> nesteditemInts = cppt.make_nesteditem_int();
+        if (nesteditemInts[0].key() != 7 || nesteditemInts.front().value() != 3.5) return 1285;
+        if (nesteditemInts[1].key() != 9 || nesteditemInts[1].value() != 4.5) return 1286;
+
+        cppt.Dict<int, cppt.NestedItemValue> nesteditemCounted = cppt.make_nesteditem_counted();
+        if (cppt.NestedItemValue.live() != 2) return 1287;
+        if (nesteditemCounted[1].key() != 8 || nesteditemCounted[1].value().get() != 12) return 1288;
+    }
+    if (cppt.NestedItemValue.live() != 0) return 1289;
+
+    // CFlat's type grammar does not currently accept a nested class selector after a
+    // specialization (`cppt.Dict<...>.Item`), so the local-type leg is covered by the returned
+    // aliases above.
+
+    // ---- namespace-scope C++ constexpr variables ------------------------------------------------
+    if ((int)cppk.kAnswer != 42) return 1190;
+    if (cppk.kind_of(cppk.kB) != cppk.Kind.B) return 1191;
+    if (cppk.kind_of(cppk.kAlias) != cppk.Kind.B) return 1192;
+    if (!cppk.kOn) return 1193;
+    if ((int)cppk.kInlineAnswer != 43) return 1194;
+    if ((int)cppk.kChar != (int)'q') return 1195;
+
+    // ---- class-valued C++ brace arguments -------------------------------------------------------
+    cppi.reset_counts();
+    {
+        cppi.Tracked a = cppi.Tracked(3);
+        cppi.Tracked b = cppi.Tracked(5);
+        if (cppt.total_tracked({a, b}) != 8) return 1200;
+        if (cppi.copy_count() != 4 || cppi.move_count() != 0) return 1201;
+        if (cppi.dtor_count() != 4) return 1202;
+    }
+    if (cppi.dtor_count() != 6) return 1203;
+
+    cppi.reset_counts();
+    {
+        cppi.Tracked b = cppi.Tracked(7);
+        if (cppt.total_tracked({cppi.make_tracked(1), b}) != 8) return 1204;
+        if (cppi.copy_count() != 3 || cppi.move_count() != 1) return 1205;
+        if (cppi.dtor_count() != 5) return 1206;
+    }
+    if (cppi.dtor_count() != 6) return 1207;
+
+    cppi.reset_counts();
+    {
+        cppi.Tracked a = cppi.Tracked(2);
+        cppi.Tracked b = cppi.Tracked(6);
+        if (cppt.total_span({a, b}) != 8) return 1208;
+        if (cppi.copy_count() != 2) return 1208;
+        if (cppi.move_count() != 0) return 1208;
+        if (cppi.dtor_count() != 2) return 1208;
+    }
+    if (cppi.dtor_count() != 4) return 1209;
+
+    // ---- explicit template arguments on C++ calls -----------------------------------------------
+    cppt.Meter exptplMeter = default;
+    exptplMeter.factor = 2.5;
+    if (exptplMeter.reading<double>() != 2.5) return 1030;
+    if (exptplMeter.reading() != 3) return 1031;
+    if (exptplMeter.data_ptr<double>()[0] != 2.5) return 1032;
+    if (cppt.unit_of<int>() != 1) return 1033;
+    if (cppt.unit_of<double>() != 1.0) return 1034;
+    if (cppi.add(exptplMeter.reading<double>(), 0.5) != 1003) return 1035;
+
+    // ---- function templates with parameter packs ------------------------------------------------
+    if (cppt.pack_count(5) != 5) return 1036;
+    if (cppt.pack_count(5, 7, 8) != 7) return 1037;
+    cppt.PackSink exptplBsink = default;
+    cppt.PackArg exptplBarg = cppt.PackArg(9);
+    exptplBsink.add_all(3, "ab", exptplBarg);
+    if (exptplBsink.total != 109) return 1038;
+    if (cppt.pack_count(exptplBarg, 4) != 10) return 1039;
+
+    // ---- C++ integer argument widths ------------------------------------------------------------
+    cppt.TaggedShort intArgShort = cppt.TaggedShort(7);
+    if (intArgShort.get() != 7) return 1020;
+    cppt.ItemBagN intArgBag = cppt.ItemBagN(cppi.make_tracked(4), 7);
+    if (intArgBag.total() != 11) return 1021;
+    cppt.IntPairN intArgPair = cppt.IntPairN(3, 7);
+    if (intArgPair.total() != 10) return 1022;
+    if (cppt.add_short(3, 7) != 10) return 1023;
+    if (cppt.add_mixed(cppi.make_tracked(4), 7) != 11) return 1024;
+    cppt.IntegerWidths intArgWidths = cppt.IntegerWidths(1, 2, 3, 4, 5, 6);
+    if (intArgWidths.total() != 21) return 1025;
+    cppt.deep.TaggedLong intArgLong = cppt.deep.TaggedLong(7);
+    if (intArgLong.get() != 7) return 1026;
+    if (cppt.add_short((short)3, 7) != 10) return 1027;
+    if (cppt.add_short((u16)3, 7) != 10) return 1028;
+    if (cppt.add_mixed(cppi.make_tracked(4), (long)7) != 11) return 1029;
+
+    // ---- C++ constructor temporaries as member receivers ----------------------------------------
+    {
+        cppt.Builder ctortempB = cppt.Builder(2.0).wd(0.25);
+        if (ctortempB.value() != 2.0) return 1230;
+        if (ctortempB.wd() != 0.25) return 1231;
+
+        cppt.Builder ctortempC = cppt.Builder(2.0).scaled(3.0);
+        if (ctortempC.value() != 6.0) return 1232;
+        if (cppt.Builder(2.0).scaled(3.0).wd(0.75).value() != 6.0) return 1233;
+        if (cppt.consume(cppt.Builder(1.0).wd(0.5)) != 60) return 1234;
+        if (cppt.Builder(4.0).tag_ != 4) return 1235;
+    }
+    if (cppt.Builder.live() != 0) return 1236;
+
+    // ---- nested tuple returns and defaulted optional tuple parameters ---------------------------
+    {
+        cppt.Lstmish lstm = default;
+        cppt.LstmishX x = cppt.LstmishX(5);
+        auto tupleAuto = lstm.forward(x);
+        cppt.LstmishX tupleY = std.get<0>(tupleAuto);
+        if (tupleY.value != 6) return 1240;
+        std.tuple<cppt.LstmishX, cppt.LstmishX> tupleHc = std.get<1>(tupleAuto);
+        if (std.get<0>(tupleHc).value != 2) return 1241;
+        if (std.get<1>(tupleHc).value != 7) return 1242;
+
+        std.tuple<cppt.LstmishX, std.tuple<cppt.LstmishX, cppt.LstmishX>> tupleTyped =
+            lstm.forward(x);
+        if (std.get<0>(tupleTyped).value != 6) return 1243;
+        if (std.get<1>(std.get<1>(tupleTyped)).value != 7) return 1244;
+    }
+    if (cppt.LstmishX.live() != 0) return 1249;
+
+    // ---- implicit C++ argument conversions ------------------------------------------------------
+    {
+        cppt.SeqLike implconvSeq = default;
+        cppt.CountedModule implconvModule = cppt.CountedModule(2);
+        implconvSeq.push_back("fc1", implconvModule);
+        if (cppt.CountedModule.live() != 1) return 1250;
+        if (implconvSeq.total != 2) return 1251;
+        if (implconvSeq.names != 3) return 1252;
+
+        implconvSeq.push_back("act", cppt.CountedModule(1))
+            .push_back("fc2", cppt.CountedModule(4));
+        if (implconvSeq.total != 7) return 1253;
+        if (implconvSeq.names != 9) return 1254;
+        if (cppt.CountedModule.live() != 1) return 1255;
+
+        implconvSeq.push_back(implconvModule);
+        if (implconvSeq.total != 9) return 1256;
+        if (implconvSeq.names != 9) return 1257;
+        if (cppt.CountedModule.live() != 1) return 1258;
+    }
+    if (cppt.CountedModule.live() != 0) return 1259;
+
+    // ---- brace positions and derived-to-base arguments ------------------------------------------
+    {
+        cppt.BracePosOpts braceposOptions = cppt.BracePosOpts(7);
+        if (cppt.bracepos_brace(5, {4}) != 51) return 1270;
+        if (cppt.bracepos_brace(5, {4, 3}, braceposOptions) != 59) return 1271;
+        if (cppt.bracepos_brace(2, 5, {4}) != 251) return 1272;
+        if (cppt.bracepos_brace(4, 5, {4, 3}, braceposOptions) != 459) return 1273;
+
+        cppt.BracePosLeaf braceposLeaf = cppt.BracePosLeaf(3);
+        cppt.BracePosCtorConsumer braceposConsumer = cppt.BracePosCtorConsumer(braceposLeaf, 7);
+        if (braceposConsumer.probe() != 3037) return 1274;
+        if (cppt.bracepos_free(braceposLeaf) != 6) return 1275;
+        cppt.BracePosMemberConsumer braceposMember = default;
+        if (braceposMember.probe(&braceposLeaf) != 3030) return 1276;
+        cppt.BracePosBase* braceposBase = &braceposLeaf;
+        if (braceposBase->kind() != 3) return 1277;
+        if (braceposBase->value != 3) return 1278;
+        if (cppt.bracepos_virtual_ref(braceposLeaf) != 3) return 1279;
+    }
+
+    // ---- heterogeneous brace elements and namespace re-export -----------------------------------
+    {
+        cppt.hetbrace_reexport.HetBraceSlice hetbraceSlice =
+            cppt.hetbrace_reexport.HetBraceSlice(1, 5);
+        if (hetbraceSlice.start != 1 || hetbraceSlice.stop != 5) return 1290;
+
+        if (cppt.hetbrace_collect({cppt.hetbrace_reexport.HetBraceSlice(0, 2), 1}) != 303) return 1291;
+        if (cppt.HetBraceIndex.live() != 0) return 1292;
+
+        if (cppt.hetbrace_collect({cppt.hetbrace_reexport.HetBraceSlice(1, 3), cppt.HetBraceNone()}) != 503)
+            return 1293;
+        if (cppt.HetBraceIndex.live() != 0) return 1294;
+
+        if (cppt.hetbrace_collect({1, 2}) != 203) return 1295;
+        if (cppt.HetBraceIndex.live() != 0) return 1296;
+    }
+    if (cppt.HetBraceIndex.live() != 0) return 1297;
+
+    // ---- floating and integer C++ constexpr values ----------------------------------------------
+    {
+        double fltconstDouble = cppc.constexprDouble;
+        float fltconstFloat = cppc.constexprFloat;
+        double fltconstLongdouble = cppc.constexprLongDouble;
+        int fltconstInt = cppc.constexprInt;
+        if (fltconstDouble != 6.5) return 1300;
+        if (fltconstFloat != 0.5f) return 1301;
+        if (fltconstLongdouble != 1.25) return 1302;
+        if (fltconstInt != 4) return 1303;
+        if (fltconstDouble + fltconstFloat + fltconstLongdouble != 8.25) return 1304;
+        if (cppc.fltconst_take_float(fltconstFloat) != fltconstFloat) return 1305;
+        if (fltconstDouble <= (double)cppc.constexprInt) return 1306;
+        double fltconstScale = cppc.FltConstStatics.kScale;
+        float fltconstHalf = cppc.FltConstStatics.kHalf;
+        int fltconstCount = cppc.FltConstStatics.kCount;
+        if (fltconstScale != 4.0) return 1307;
+        if (fltconstHalf != 0.5f) return 1308;
+        if (fltconstCount != 3) return 1309;
+    }
+
+    // ---- C++ class ternaries construct each arm into the declaration slot -----------------------
+    bool ternaryFalse = false;
+    bool ternaryTrue = true;
+    {
+        cppt.OpVec ternaryCallFalse = ternaryFalse
+            ? cppt.make_opvec(2.0) : cppt.make_opvec(3.0);
+        if (ternaryCallFalse.sum() != 6.0) return 1310;
+        if (cppt.OpVec.live() != 1) return 1311;
+        cppt.OpVec ternaryCallTrue = ternaryTrue
+            ? cppt.make_opvec(4.0) : cppt.make_opvec(5.0);
+        if (ternaryCallTrue.sum() != 8.0) return 1312;
+        if (cppt.OpVec.live() != 2) return 1313;
+    }
+    if (cppt.OpVec.live() != 0) return 1314;
+
+    {
+        cppt.OpVec ternaryCtorFalse = ternaryFalse
+            ? cppt.OpVec(6.0) : cppt.OpVec(7.0);
+        if (ternaryCtorFalse.sum() != 14.0) return 1315;
+        cppt.OpVec ternaryCtorTrue = ternaryTrue
+            ? cppt.OpVec(8.0) : cppt.OpVec(9.0);
+        if (ternaryCtorTrue.sum() != 16.0) return 1316;
+        if (cppt.OpVec.live() != 2) return 1317;
+    }
+    if (cppt.OpVec.live() != 0) return 1318;
+
+    {
+        if (cppt.consume(ternaryTrue ? cppt.Builder(2.0) : cppt.Builder(1.0)) != 20) return 1319;
+    }
+    if (cppt.Builder.live() != 0) return 1319;
+
+    // ---- parenthesized ternary condition in a class declaration ---------------------------------
+    bool parencondCondFalse = false;
+    bool parencondCondTrue = true;
+    {
+        cppt.OpVec parencondFalse = (parencondCondFalse ? true : false)
+            ? cppt.make_opvec(4.0) : cppt.make_opvec(5.0);
+        if (parencondFalse.sum() != 10.0) return 1340;
+        if (cppt.OpVec.live() != 1) return 1341;
+        cppt.OpVec parencondTrue = (parencondCondTrue ? true : false)
+            ? cppt.make_opvec(4.0) : cppt.make_opvec(5.0);
+        if (parencondTrue.sum() != 8.0) return 1342;
+        if (cppt.OpVec.live() != 2) return 1343;
+    }
+    if (cppt.OpVec.live() != 0) return 1344;
+
+    // ---- brace temporaries, converting constructors, and aggregate T(args) ----------------------
+    cppi.reset_counts();
+    {
+        cppi.Tracked bracetmpA = cppi.Tracked(1);
+        if (cppt.total_tracked({bracetmpA, cppi.Tracked(2)}) != 3) return 1330;
+        if (bracetmpA.value() != 1) return 1331;
+        int constructed = cppi.ctor_count() + cppi.copy_count() + cppi.move_count();
+        if (cppi.dtor_count() != constructed - 1) return 1332;
+    }
+    int bracetmpConstructed = cppi.ctor_count() + cppi.copy_count() + cppi.move_count();
+    if (cppi.dtor_count() != bracetmpConstructed) return 1333;
+
+    cppi.reset_counts();
+    for (int i = 0; i < 3; i = i + 1)
+    {
+        if (cppt.total_tracked({cppi.Tracked(i + 1), cppi.Tracked(i + 2)}) != 2 * i + 3)
+            return 1334;
+        int constructed = cppi.ctor_count() + cppi.copy_count() + cppi.move_count();
+        if (cppi.dtor_count() != constructed) return 1335;
+    }
+    int loopConstructed = cppi.ctor_count() + cppi.copy_count() + cppi.move_count();
+    if (cppi.dtor_count() != loopConstructed) return 1336;
+
+    cppt.BraceTmpCounted.reset();
+    if (cppt.bracetmp_take(3) != 3) return 1337;
+    if (cppt.BraceTmpCounted.live() != 0
+        || cppt.BraceTmpCounted.dtors() != cppt.BraceTmpCounted.ctors()) return 1338;
+    {
+        cppt.BraceTmpCounted bracetmpLocal = cppt.bracetmp_make(4);
+        if (bracetmpLocal.value() != 4 || cppt.BraceTmpCounted.live() != 1) return 1339;
+    }
+    if (cppt.BraceTmpCounted.live() != 0
+        || cppt.BraceTmpCounted.dtors() != cppt.BraceTmpCounted.ctors()) return 1339;
+
+    cppbv.BraceTmpNoStd bracetmpArgs = cppbv.BraceTmpNoStd(1, 2);
+    if (bracetmpArgs.first != 1 || bracetmpArgs.second != 2) return 1339;
+
+    // ---- unified C++ foreign identities ---------------------------------------------------------
+    {
+        cppt.unified.UnifiedPos unifiedPos = default;
+        cppt.unified.UnifiedNeg unifiedNeg = default;
+        if (unifiedPos.n() != 1) return 1320;
+        if (unifiedNeg.n() != -1) return 1321;
+        if (cppt.unified.norm_pos(unifiedPos) != 1) return 1322;
+        if (cppt.unified.norm_neg(unifiedNeg) != -1) return 1323;
+        if (unifiedPos.n() != 1 || unifiedNeg.n() != -1) return 1324;
+
+        u8[3] unifiedRaw = { 1, 2, 3 };
+        cppt.unified.UnifiedBytes unifiedBytes = cppt.unified.UnifiedBytes(&unifiedRaw[0], 3);
+        if (unifiedBytes.size() != 3) return 1325;
+        if (cppt.unified.bytes_as_base(unifiedBytes) != 3) return 1326;
+        if ((int)unifiedBytes.count != 3) return 1327;
+        if (unifiedBytes.marker != 33) return 1328;
+        if (unifiedPos.marker != 11 || unifiedNeg.marker != 22) return 1329;
+    }
+
+    // ---- shared C++ primitive identities --------------------------------------------------------
+    {
+        cppt.Box<ulong> primidUl = cppt.primid_make_unsigned_long(17);
+        if (primidUl.get() != 17) return 1350;
+        if (cppt.primid_take_unsigned_long(primidUl) != 17) return 1351;
+
+        // LLP64: size_t is 'unsigned long long' (u64), a distinct type from 32-bit 'unsigned long'.
+        if const (__WINDOWS__)
+        {
+            cppt.Box<u64> primidSize = cppt.primid_make_size_t(18);
+            if (primidSize.get() != 18) return 1352;
+        }
+        else
+        {
+            cppt.Box<ulong> primidSize = cppt.primid_make_size_t(18);
+            if (primidSize.get() != 18) return 1352;
+            if (cppt.primid_take_unsigned_long(primidSize) != 18) return 1353;
+        }
+
+        cppt.Box<u32> primidUnsigned = cppt.primid_make_unsigned(19);
+        if (primidUnsigned.get() != 19) return 1354;
+
+        cppt.Box<longdouble> primidLongdouble = cppt.primid_make_long_double(2.5);
+        if (primidLongdouble.get() != 2.5) return 1355;
+
+        if const (__WINDOWS__)
+        {
+            std.vector<u64> primidValues = default;
+            primidValues.push_back(20);
+            std.vector<u64> primidRoundtrip = cppt.primid_size_t_vector_roundtrip(primidValues);
+            if ((int)primidValues.size() != 1) return 1356;
+            if (primidValues[0] != 20) return 1357;
+            if ((int)primidRoundtrip.size() != 1) return 1358;
+            if (primidRoundtrip[0] != 20) return 1359;
+        }
+        else
+        {
+            std.vector<ulong> primidValues = default;
+            primidValues.push_back(20);
+            std.vector<ulong> primidRoundtrip = cppt.primid_size_t_vector_roundtrip(primidValues);
+            if ((int)primidValues.size() != 1) return 1356;
+            if (primidValues[0] != 20) return 1357;
+            if ((int)primidRoundtrip.size() != 1) return 1358;
+            if (primidRoundtrip[0] != 20) return 1359;
+        }
+    }
+
+    // ---- global-scope C++ aliases of a specialization -------------------------------------------
+    GlobalBoxAlias globalboxAlias = default;
+    globalboxAlias.value = 5;
+    if (globalboxAlias.value != 5)                        return 1576;
+    GlobalBoxAlias2 globalboxSecond = default;
+    globalboxSecond.value = 6;
+    if (globalboxSecond.value != 6)                       return 1577;
+    // Two aliases of ONE specialization must reach ONE record: the header function takes
+    // GlobalBox<int> by reference, so a separate registration per alias would not bind here.
+    if (globalbox_take_global(globalboxAlias) != 6)             return 1578;
+    if (globalbox_take_global(globalboxSecond) != 7)            return 1579;
+    GlobalBoxTypedef globalboxTypedef = default;
+    globalboxTypedef.value = 2.5;
+    if (globalboxTypedef.value != 2.5)                    return 1580;
+
+    // ---- C++ member ref-qualifiers --------------------------------------------------------------
+    cppt.RefQualAssignBox refqualA = cppt.RefQualAssignBox(1);
+    cppt.RefQualAssignBox refqualAlias = refqualA;
+    cppt.RefQualAssignBox refqualB = cppt.RefQualAssignBox(2);
+    refqualA = refqualB;
+    if (refqualA.tag != 1 || refqualA.value != 2) return 1640;
+    if (refqualAlias.value != 1) return 1641;
+    refqualA = move refqualB;
+    if (refqualA.tag != 3 || refqualA.value != 202) return 1642;
+
+    cppt.RefQualFieldHolder refqualField = default;
+    refqualField.box = refqualA;
+    if (refqualField.box.tag != 1 || refqualField.box.value != 202) return 1643;
+    cppt.RefQualAssignBox* refqualPtr = &refqualField.box;
+    *refqualPtr = refqualAlias;
+    if (refqualField.box.tag != 1 || refqualField.box.value != 1) return 1644;
+
+    cppt.RefQualSlotHolder refqualSlots = default;
+    refqualSlots[0] = refqualA;
+    if (refqualSlots[0].tag != 1 || refqualSlots[0].value != 202) return 1645;
+    std.vector<cppt.RefQualAssignBox> refqualVector = default;
+    refqualVector.push_back(refqualAlias);
+    refqualVector[0] = refqualA;
+    if (refqualVector[0].tag != 1 || refqualVector[0].value != 202) return 1652;
+
+    cppt.RefQualMethods refqualMethod = cppt.RefQualMethods(1);
+    if (refqualMethod.both() != 11) return 1646;
+    if (refqualMethod.onlyL() != 44) return 1647;
+    if (refqualMethod.plain() != 55) return 1648;
+    if (cppt.refqual_make_methods(2).both() != 22) return 1649;
+    if ((move refqualMethod).both() != 22) return 1650;
+    cppt.RefQualMethods refqualNullMethod = cppt.RefQualMethods(3);
+    cppt.RefQualMethods* refqualMethodPtr = &refqualNullMethod;
+    if (refqualMethodPtr?.both() != 11) return 1651;
+    if (cppt.RefQualMethods(1).with(2).with(3).marker != 206) return 1653;
+    if (cppt.RefQualMethods(8)[2] != 202) return 1654;
+    if (cppt.RefQualMethods(4).onlyR() != 33) return 1655;
+    if (cppt.RefQualMethods(4).plain() != 55) return 1656;
+    if (cppt.RefQualMethods({4}).with(2).marker != 106) return 1657;
+    if (cppt.RefQualMethods(4)?.both() != 22) return 1658;
+
+    // ---- standard-library free functions and nested namespaces ----------------------------------
+    int stdfreeResult = stdfree_standard();
+    if (stdfreeResult != 0) return stdfreeResult;
+    int stdfreeOrder = stdfree_import_order();
+    if (stdfreeOrder != 0) return stdfreeOrder;
+
+    // ---- namespaces whose every declaration names a std:: specialization ------------------------
+    // Binding such a signature is deferred to first use; the namespace must be registered
+    // anyway, or the call reports "Undefined variable <ns>" and the whole API is unreachable.
+    std.string stdnsS = std.string("abcd");
+    if (nsstd_param.lens(stdnsS) != 4) return 1710;
+    std.string stdnsR = nsstd_ret.makes("abcde");
+    if ((int)stdnsR.size() != 5) return 1711;
+    std.vector<int> stdnsV = default;
+    stdnsV.push_back(1);
+    stdnsV.push_back(2);
+    if (nsstd_vec.usevec(stdnsV) != 22) return 1712;
+    if (nsstd_outer.inner.lens(stdnsS) != 5) return 1713;
+    // Control: nsstd_mix holds one std-free declaration, which registered it even pre-fix.
+    if (nsstd_mix.lens(stdnsS) != 11) return 1714;
+    if (nsstd_mix.plain(5) != 7) return 1715;
+
+    // ---- qualified C++ class-template constructor temporaries -----------------------------------
+    if (qualtemp_take_box(cppt.Box<int>(9)) != 9) return 1730;
+    if (cppt.take_box_arg(cppt.Box<int>(10)) != 10) return 1731;
+    cppt.CtorTempSink qualtempSink = default;
+    if (qualtempSink.take(cppt.Box<int>(11)) != 12) return 1732;
+    if (cppt.make_box(cppt.Box<int>(12)).get().get() != 12) return 1733;
+    if (qualtempSink.take_any(cppt.Box<int>(13)) != 15) return 1734;
+    if (qualtemp_return_box(14).get() != 14) return 1735;
+    std.optional<int> qualtempAssigned = default;
+    qualtempAssigned = std.optional<int>(16);
+    if (!qualtempAssigned.has_value() || qualtempAssigned.value() != 16) return 1736;
+    if (qualtemp_take_box(cppt.Box<int>()) != 0) return 1737;
+    if (qualtemp_take_pair(cppt.CtorPair<int>(16, 17)) != 33) return 1738;
+    if (qualtemp_take_nested(cppt.Box<cppt.Box<int>>(cppt.Box<int>(18))) != 18) return 1739;
+    if (qualtemp_take_nested2(cppt.Box<cppt.Box<cppt.Box<int>>>(
+            cppt.Box<cppt.Box<int>>(cppt.Box<int>(19)))) != 19) return 1740;
+    cppt.impl_detail.Payload qualtempPayload = default;
+    if (qualtemp_take_payload(cppt.Box<cppt.impl_detail.Payload>(qualtempPayload)) != 3) return 1741;
+    cppt.Box<cppt.impl_detail.Payload> qualtempPayloadBox =
+        cppt.Box<cppt.impl_detail.Payload>(qualtempPayload);
+    if (qualtempPayloadBox.get().get() != 3) return 1742;
+    cppt.Box<cppt.Box<int>> qualtempNestedDecl =
+        cppt.Box<cppt.Box<int>>(cppt.Box<int>(20));
+    if (qualtempNestedDecl.get().get() != 20) return 1743;
+    if (qualtemp_take_nested(cppt.Box<cppt.Box<int>>(cppt.Box<int>(21))) != 21) return 1744;
+    if (cppt.take_box_arg(cppt.Box<int>(22)) != 22) return 1745;
+    cppt.Box<double> qualtempDouble = cppt.Box<double>(2.5);
+    if (qualtempDouble.get() != 2.5) return 1746;
+    cppt.Box<int> qualtempDecl = cppt.Box<int>(23);
+    if (qualtempDecl.get() != 23) return 1747;
+    if (cppt.make_box(cppt.Box<int>()).get().get() != 0) return 1748;
+    if (qualtemp_return_box(24).get() != 24) return 1749;
+
+    // ---- static members of a C++ class TEMPLATE -------------------------------------------------
+    // Every leg goes through the qualified-specialization spelling `cppt.TplStatics<T>.member`.
+    // PRE-FIX (532e7bd0): each of these fails name lookup with
+    // "'TplStatics' is not a member of namespace 'cppt'."
+    cppt.TplStatics<int> tplstaticDeclared = default;
+    if (tplstaticDeclared.x != 0) return 1810;
+    if (cppt.TplStatics<int>.rank() != 7) return 1811;              // static method, 0 args
+    if (cppt.TplStatics<int>.twice(5) != 10) return 1812;           // 1 arg
+    if (cppt.TplStatics<int>.combine(4, 3) != 43) return 1813;      // 2 args
+    // No `TplStatics<double>` is declared anywhere: the static call alone instantiates it.
+    if (cppt.TplStatics<double>.rank() != 7) return 1814;
+    if (cppt.TplStatics<double>.twice(2.5) != 5.0) return 1815;
+    if (cppt.TplStatics<double>.combine(4.0, 3.0) != 43.0) return 1816;
+    // Static DATA member: read, write, and per-specialization storage.
+    if (cppt.TplStatics<int>.counter != 0) return 1817;
+    cppt.TplStatics<int>.counter = 9;
+    if (cppt.TplStatics<int>.counter != 9) return 1818;
+    if (cppt.TplStatics<float>.counter != 0) return 1819;
+    if (cppt.TplStatics<int>.kTag != 41) return 1820;               // static constexpr member
+    // Specialization over a user C++ class, and over another specialization.
+    cppt.TplStaticPayload tplstaticPayload = cppt.TplStaticPayload(6);
+    if (cppt.TplStaticWrap<cppt.TplStaticPayload>.rank() != 3) return 1821;
+    if (cppt.TplStaticWrap<cppt.TplStaticPayload>.score(tplstaticPayload) != 11) return 1822;
+    if (cppt.TplStaticNest<cppt.TplStatics<int>>.depth() != 2) return 1823;
+    if (cppt.TplStaticNest<cppt.TplStatics<int>>.fromInner(tplstaticDeclared) != 1) return 1824;
+    // Call positions: as a C++ call argument, as a plain assignment statement.
+    if (cppt.tplstatic_take(cppt.TplStatics<int>.rank()) != 1007) return 1825;
+    int tplstaticAssigned = cppt.TplStatics<int>.combine(1, 2);
+    if (tplstaticAssigned != 12) return 1826;
+    // The same spelling inside a CFlat generic body, on the body's own T.
+    if (tplstaticTwiceStatic<int>(5) != 10) return 1827;
+    if (tplstaticTwiceStatic<double>(1.5) != 3.0) return 1828;
+    if (tplstaticRankStatic<float>() != 7) return 1829;
+
+    // ---- a string LITERAL as a C++ operator operand ---------------------------------------------
+    // Pre-fix every literal leg below reported "no overload of 'operator...' matches the given
+    // arguments" with the matching char* candidate listed, because the literal was wrapped as a
+    // CFlat 'string' before the candidates were ranked.
+    std.string strlitS = std.string("hello");
+    strlitS += " world";
+    if ((int)strlitS.size() != 11) return 1790;
+    strlitS += "!";
+    if ((int)strlitS.size() != 12) return 1791;
+
+    // Both a char* and a std::string overload are declared: C++ picks char* for a literal.
+    cppsop.Acc strlitA = cppsop.Acc();
+    strlitA += "hello";
+    if (strlitA.tag() != 1) return 1792;
+    if (strlitA.n() != 5) return 1793;
+    // Control: a CHAR literal keeps selecting the 'char' leg, before and after the fix.
+    strlitA += 'z';
+    if (strlitA.tag() != 3) return 1794;
+    if (strlitA.n() != 6) return 1795;
+
+    cppsop.CharOnly strlitC = cppsop.CharOnly();
+    strlitC += "abc";
+    if (strlitC.n() != 3) return 1796;
+    if (!(strlitC == "xyz")) return 1797;
+    if (strlitC == "ab") return 1798;
+
+    // FREE operators: the literal on the right, then on the left (the +100 leg proves which
+    // free overload ran rather than an operand swap).
+    cppsop.Free strlitF = cppsop.Free();
+    cppsop.Free strlitG = strlitF + "hello";
+    if (strlitG.n() != 5) return 1799;
+    if (!(strlitG == "world")) return 1800;
+    cppsop.Free strlitH = "hello" + strlitF;
+    if (strlitH.n() != 105) return 1801;
+
+    // Controls that behaved identically pre-fix: a char* local, a literal std.map key, and
+    // the CFlat-native string operators the literal wrap exists for.
+    char* strlitP = " world";
+    std.string strlitS2 = std.string("hello");
+    strlitS2 += strlitP;
+    if ((int)strlitS2.size() != 11) return 1802;
+
+    std.map<std.string, int> strlitM = std.map<std.string, int>();
+    strlitM["k"] = 5;
+    if (strlitM["k"] != 5) return 1803;
+
+    string strlitCs = "ab";
+    strlitCs += "cd";
+    if (strlitCs.length() != 4) return 1804;
+    if (strlitCs != "abcd") return 1805;
+
+    // ---- std containers over std specializations over USER classes ------------------------------
+    /*
+     * Every declaration here names a class (nest::Cell, nest2::Tag) whose header declares no std
+     * template, nested inside a std specialization inside another std template. The request has
+     * to compile against the union of the outer template's group AND the groups owning every
+     * class nested at any depth; unioning only the direct argument's group refused all of these.
+     */
+    {
+        std.vector<std.vector<nest.Cell>> nestuserV = default;
+        std.vector<nest.Cell> nestuserInner = default;
+        nestuserInner.push_back(nest.Cell(8, 9));
+        nestuserV.push_back(nestuserInner);
+        if ((int)nestuserV.size() != 1)                                      return 1930;
+        if ((int)nestuserV[0].size() != 1)                                   return 1931;
+        if (nestuserV[0][0].a != 8)                                          return 1932;
+        if (nestuserV[0][0].sum() != 17)                                     return 1933;
+    }
+    {
+        std.vector<std.shared_ptr<nest.Cell>> nestuserS = default;
+        std.shared_ptr<nest.Cell> nestuserP = default;
+        nestuserS.push_back(nestuserP);
+        if ((int)nestuserS.size() != 1)                                      return 1934;
+        if (nestuserS[0].get() != nullptr)                                   return 1935;
+    }
+    {
+        // The user class in the SECOND map argument, then in the FIRST.
+        std.map<int, std.shared_ptr<nest.Cell>> nestuserM = default;
+        std.shared_ptr<nest.Cell> nestuserMp = default;
+        nestuserM[3] = nestuserMp;
+        if ((int)nestuserM.size() != 1)                                      return 1936;
+        if (nestuserM[3].get() != nullptr)                                   return 1937;
+
+        std.map<std.shared_ptr<nest.Cell>, int> nestuserK = default;
+        std.shared_ptr<nest.Cell> nestuserKey = default;
+        nestuserK[nestuserKey] = 42;
+        if ((int)nestuserK.size() != 1)                                      return 1938;
+        if (nestuserK[nestuserKey] != 42)                                        return 1939;
+    }
+    {
+        // Three levels, and a map naming user classes from TWO different headers.
+        std.vector<std.vector<std.shared_ptr<nest.Cell>>> nestuserD = default;
+        std.vector<std.shared_ptr<nest.Cell>> nestuserDi = default;
+        nestuserD.push_back(nestuserDi);
+        if ((int)nestuserD.size() != 1)                                      return 1940;
+        if ((int)nestuserD[0].size() != 0)                                   return 1941;
+
+        std.map<std.shared_ptr<nest.Cell>, std.shared_ptr<nest2.Tag>> nestuserTwo = default;
+        if ((int)nestuserTwo.size() != 0)                                    return 1942;
+    }
+    {
+        // A USER class template over a user class inside a std container, and a pointer element:
+        // both already bound, and the widened union must not disturb them.
+        std.vector<nest.Box<nest.Cell>> nestuserB = default;
+        nest.Box<nest.Cell> nestuserBox = default;
+        nestuserB.push_back(nestuserBox);
+        if (nestuserB[0].tag() != 7)                                         return 1943;
+
+        nest.Cell nestuserOne = nest.Cell(2, 3);
+        std.vector<nest.Cell*> nestuserPv = default;
+        nestuserPv.push_back(&nestuserOne);
+        if (nestuserPv[0]->b != 3)                                           return 1944;
+    }
+
+    return 0;
+}

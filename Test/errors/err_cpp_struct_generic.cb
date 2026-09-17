@@ -1,5 +1,5 @@
 expect_error("multiple bases are not supported yet") {
-    [cpp] struct BadCpp<T> : cppt.m76.Holder<T>, cppt.m76.Shape2<T>
+    [cpp] struct BadCpp<T> : cppt.tplbase.Holder<T>, cppt.tplbase.Shape2<T>
     {
     };
 }

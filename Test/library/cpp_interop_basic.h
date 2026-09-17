@@ -137,73 +137,73 @@ namespace cppi
 
     // M87: imported C++ bitfields follow the target ABI. Itanium keeps mixed base types in
     // one allocation unit while MSVC starts a new unit on a type change.
-    struct M87Fit
+    struct BitsFit
     {
         int first : 20;
         unsigned int second : 10;
         unsigned int third : 1;
     };
-    struct M87Overflow
+    struct BitsOverflow
     {
         int first : 20;
         unsigned int second : 20;
     };
-    struct M87ShortInt
+    struct BitsShortInt
     {
         short first : 7;
         int middle : 10;
         short last : 5;
     };
-    struct M87BoolInt
+    struct BitsBoolInt
     {
         bool ready : 1;
         int value : 7;
         bool done : 1;
     };
-    struct M87Same
+    struct BitsSame
     {
         unsigned int first : 3;
         unsigned int second : 5;
         unsigned int third : 7;
     };
-    inline int m87_size_fit() noexcept { return (int)sizeof(M87Fit); }
-    inline int m87_size_overflow() noexcept { return (int)sizeof(M87Overflow); }
-    inline int m87_size_short_int() noexcept { return (int)sizeof(M87ShortInt); }
-    inline int m87_size_bool_int() noexcept { return (int)sizeof(M87BoolInt); }
-    inline int m87_size_same() noexcept { return (int)sizeof(M87Same); }
-    inline int m87_fit_first(const M87Fit* v) noexcept { return v->first; }
-    inline int m87_fit_second(const M87Fit* v) noexcept { return (int)v->second; }
-    inline int m87_fit_third(const M87Fit* v) noexcept { return (int)v->third; }
-    inline int m87_overflow_first(const M87Overflow* v) noexcept { return v->first; }
-    inline int m87_overflow_second(const M87Overflow* v) noexcept { return (int)v->second; }
-    inline int m87_short_int_first(const M87ShortInt* v) noexcept { return v->first; }
-    inline int m87_short_int_middle(const M87ShortInt* v) noexcept { return v->middle; }
-    inline int m87_short_int_last(const M87ShortInt* v) noexcept { return v->last; }
-    inline int m87_bool_int_ready(const M87BoolInt* v) noexcept { return v->ready ? 1 : 0; }
-    inline int m87_bool_int_value(const M87BoolInt* v) noexcept { return v->value; }
-    inline int m87_bool_int_done(const M87BoolInt* v) noexcept { return v->done ? 1 : 0; }
-    inline int m87_same_first(const M87Same* v) noexcept { return (int)v->first; }
-    inline int m87_same_second(const M87Same* v) noexcept { return (int)v->second; }
-    inline int m87_same_third(const M87Same* v) noexcept { return (int)v->third; }
+    inline int bits_size_fit() noexcept { return (int)sizeof(BitsFit); }
+    inline int bits_size_overflow() noexcept { return (int)sizeof(BitsOverflow); }
+    inline int bits_size_short_int() noexcept { return (int)sizeof(BitsShortInt); }
+    inline int bits_size_bool_int() noexcept { return (int)sizeof(BitsBoolInt); }
+    inline int bits_size_same() noexcept { return (int)sizeof(BitsSame); }
+    inline int bits_fit_first(const BitsFit* v) noexcept { return v->first; }
+    inline int bits_fit_second(const BitsFit* v) noexcept { return (int)v->second; }
+    inline int bits_fit_third(const BitsFit* v) noexcept { return (int)v->third; }
+    inline int bits_overflow_first(const BitsOverflow* v) noexcept { return v->first; }
+    inline int bits_overflow_second(const BitsOverflow* v) noexcept { return (int)v->second; }
+    inline int bits_short_int_first(const BitsShortInt* v) noexcept { return v->first; }
+    inline int bits_short_int_middle(const BitsShortInt* v) noexcept { return v->middle; }
+    inline int bits_short_int_last(const BitsShortInt* v) noexcept { return v->last; }
+    inline int bits_bool_int_ready(const BitsBoolInt* v) noexcept { return v->ready ? 1 : 0; }
+    inline int bits_bool_int_value(const BitsBoolInt* v) noexcept { return v->value; }
+    inline int bits_bool_int_done(const BitsBoolInt* v) noexcept { return v->done ? 1 : 0; }
+    inline int bits_same_first(const BitsSame* v) noexcept { return (int)v->first; }
+    inline int bits_same_second(const BitsSame* v) noexcept { return (int)v->second; }
+    inline int bits_same_third(const BitsSame* v) noexcept { return (int)v->third; }
 
-    struct M89ZeroSame
+    struct ZeroWidthSame
     {
         unsigned int first : 3;
         int : 0;
         unsigned int second : 3;
     };
-    struct M89ZeroDifferent
+    struct ZeroWidthDifferent
     {
         unsigned short first : 3;
         int : 0;
         unsigned int second : 3;
     };
-    inline int m89_zero_same_size() noexcept { return (int)sizeof(M89ZeroSame); }
-    inline int m89_zero_different_size() noexcept { return (int)sizeof(M89ZeroDifferent); }
-    inline int m89_zero_same_first(const M89ZeroSame* v) noexcept { return (int)v->first; }
-    inline int m89_zero_same_second(const M89ZeroSame* v) noexcept { return (int)v->second; }
-    inline int m89_zero_different_first(const M89ZeroDifferent* v) noexcept { return (int)v->first; }
-    inline int m89_zero_different_second(const M89ZeroDifferent* v) noexcept { return (int)v->second; }
+    inline int zerowidth_same_size() noexcept { return (int)sizeof(ZeroWidthSame); }
+    inline int zerowidth_different_size() noexcept { return (int)sizeof(ZeroWidthDifferent); }
+    inline int zerowidth_same_first(const ZeroWidthSame* v) noexcept { return (int)v->first; }
+    inline int zerowidth_same_second(const ZeroWidthSame* v) noexcept { return (int)v->second; }
+    inline int zerowidth_different_first(const ZeroWidthDifferent* v) noexcept { return (int)v->first; }
+    inline int zerowidth_different_second(const ZeroWidthDifferent* v) noexcept { return (int)v->second; }
 
     int sum4(const int (&a)[4]) noexcept;
     int sum4_ptr(int (*a)[4]) noexcept;
@@ -872,7 +872,7 @@ namespace cppi
      * cpp_interop_basic.cpp and bind to Clang's mangled name; the header-only constants have no
      * library symbol at all, so cflat either folds them or emits their storage itself.
      */
-    namespace m85
+    namespace nsobj
     {
         struct Color { int r; int g; int b; };
         struct Tracker
@@ -894,12 +894,12 @@ namespace cppi
         constexpr Unit kUnit = Unit::Mile;      // scoped-enum constant
         static const int kOld = 7;              // internal linkage, folds
         constexpr Color kRed{1, 2, 3};          // internal linkage, needs storage
-        inline const char* kName = "m85";       // header-only pointer object
+        inline const char* kName = "marker";       // header-only pointer object
     }
 
     // M93 - class-scope `static const` with an IN-CLASS initializer and no out-of-line
     // definition. Such a member has no symbol to link, so it binds by its folded value.
-    namespace m93
+    namespace statconst
     {
         enum Plain { PA = 7, PB = 8 };
         enum class Scoped { SA = 21, SB = 22 };
@@ -934,6 +934,6 @@ namespace cppi
 
 }
 
-extern int cppi_m85_global;   // global-scope C++ object: no mangling at all
+extern int cppi_nsobj_global;   // global-scope C++ object: no mangling at all
 
 extern "C" int cppi_c_linkage(int v) noexcept;

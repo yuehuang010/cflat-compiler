@@ -15,12 +15,12 @@ extern int main()
         int missing = err_cpp_tpl_ns.pik<int>(3, 4);
     }
     // A misspelled member on a class-template specialization names the OWNER in source
-    // spelling: the mangled identity `cppt.M95Stat$int` must never reach the user.
-    expect_error("'rannk' is not a member of namespace 'cppt.M95Stat<int>'.") {
-        int typoMethod = cppt.M95Stat<int>.rannk();
+    // spelling: the mangled identity `cppt.TplStatics$int` must never reach the user.
+    expect_error("'rannk' is not a member of namespace 'cppt.TplStatics<int>'.") {
+        int typoMethod = cppt.TplStatics<int>.rannk();
     }
-    expect_error("'countr' is not a member of namespace 'cppt.M95Stat<int>'.") {
-        int typoData = cppt.M95Stat<int>.countr;
+    expect_error("'countr' is not a member of namespace 'cppt.TplStatics<int>'.") {
+        int typoData = cppt.TplStatics<int>.countr;
     }
     int x = 5;
     expect_error("'cppt.module_dtors_counter' is a C++ variable, not a class template") {
