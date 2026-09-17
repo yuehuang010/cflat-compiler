@@ -1096,7 +1096,8 @@ unsigned LLVMBackend::BitfieldStorageBits(const std::string& typeName)
 
 std::vector<LLVMBackend::DeclTypeAndValue> LLVMBackend::PackBitfields(
         const std::vector<DeclTypeAndValue>& in,
-        std::vector<BitfieldInfo>& outBitfields)
+        std::vector<BitfieldInfo>& outBitfields,
+        bool itaniumPacking)
 {
         std::vector<DeclTypeAndValue> out;
         outBitfields.clear();
@@ -1141,6 +1142,7 @@ std::vector<LLVMBackend::DeclTypeAndValue> LLVMBackend::PackBitfields(
             // Open a new storage unit using the underlying type of the first bitfield.
             unsigned storageIdx = (unsigned)out.size();
             unsigned bitOffset = 0;
+            unsigned currentStorageBits = storageBits;
             DeclTypeAndValue storage = cur;
             // C++ bool bitfields share a byte-sized allocation unit. Keep the semantic
             // bitfield type as bool in BitfieldInfo, but make the synthetic ABI slot a byte so
@@ -1159,8 +1161,10 @@ std::vector<LLVMBackend::DeclTypeAndValue> LLVMBackend::PackBitfields(
             storage.GuardedBy.clear();
             out.push_back(storage);
 
-            // Greedily attach this and subsequent same-type bitfields that fit.
-            while (i < in.size() && in[i].IsBitfield && in[i].TypeName == cur.TypeName)
+            // Greedily attach bitfields that fit. Itanium ignores declared type changes,
+            // and its allocation unit grows to the widest participating base type.
+            while (i < in.size() && in[i].IsBitfield
+                   && (itaniumPacking || in[i].TypeName == cur.TypeName))
             {
                 const auto& bf = in[i];
                 if (bf.BitWidth == 0)
@@ -1169,17 +1173,34 @@ std::vector<LLVMBackend::DeclTypeAndValue> LLVMBackend::PackBitfields(
                     i++;
                     break;
                 }
-                if (bf.BitWidth > storageBits)
+                const unsigned bfStorageBits = BitfieldStorageBits(bf.TypeName);
+                if (bfStorageBits == 0)
                 {
-                    LogError("bitfield '" + bf.VariableName + "' width " + std::to_string(bf.BitWidth)
-                           + " exceeds underlying type '" + SpellType(*this, bf) + "' width " + std::to_string(storageBits));
+                    LogError("bitfield '" + bf.VariableName + "' has unsupported underlying type '"
+                             + SpellType(*this, bf) + "' (must be an integer or bool type)");
                     i++;
                     continue;
                 }
-                if (bitOffset + bf.BitWidth > storageBits)
+                if (bf.BitWidth > bfStorageBits)
+                {
+                    LogError("bitfield '" + bf.VariableName + "' width " + std::to_string(bf.BitWidth)
+                           + " exceeds underlying type '" + SpellType(*this, bf) + "' width " + std::to_string(bfStorageBits));
+                    i++;
+                    continue;
+                }
+                const unsigned candidateStorageBits = itaniumPacking
+                    ? std::max(currentStorageBits, bfStorageBits)
+                    : currentStorageBits;
+                if (bitOffset + bf.BitWidth > candidateStorageBits)
                 {
                     // Doesn't fit - leave it for the outer loop to start a new unit.
                     break;
+                }
+                if (itaniumPacking && bfStorageBits > currentStorageBits)
+                {
+                    currentStorageBits = bfStorageBits;
+                    storage.TypeName = bf.TypeName == "bool" ? "u8" : bf.TypeName;
+                    out[storageIdx].TypeName = storage.TypeName;
                 }
                 if (!bf.VariableName.empty())
                 {

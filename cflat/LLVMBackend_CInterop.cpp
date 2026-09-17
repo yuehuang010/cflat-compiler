@@ -9146,8 +9146,8 @@ void LLVMBackend::RegisterCRecords(std::vector<CRecordEntry>& records, const std
                 }
             }
             if (!ok) continue;
-            // Bitfield packing uses the same MSVC LSB-first layout as native CFlat bitfields;
-            // the packing pass produces synthetic slots and CreateStructType stores BitfieldInfo.
+            // Imported records use the resolved target ABI; native CFlat structs retain the
+            // existing MSVC-style packing. The pass produces synthetic slots and BitfieldInfo.
             std::vector<BitfieldInfo> packedBitfields;
             bool anyBitfields = false;
             for (const auto& tv : fields) { if (tv.IsBitfield) { anyBitfields = true; break; } }
@@ -9157,7 +9157,7 @@ void LLVMBackend::RegisterCRecords(std::vector<CRecordEntry>& records, const std
             if (anyBitfields)
             {
                 prePackFields = fields;
-                fields = PackBitfields(fields, packedBitfields);
+                fields = PackBitfields(fields, packedBitfields, !targetWindows_);
             }
             // A C++ record's layout is clang's, not CFlat's: insert explicit padding wherever
             // clang put a field further along than CFlat's natural packing would (over-aligned

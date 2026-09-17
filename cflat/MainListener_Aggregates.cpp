@@ -379,7 +379,7 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
         bool anyBitfields = false;
         for (const auto& tv : declList) { if (tv.IsBitfield) { anyBitfields = true; break; } }
         if (anyBitfields)
-            declList = compiler->PackBitfields(declList, packedBitfields);
+            declList = compiler->PackBitfields(declList, packedBitfields, false);
 
         // Build the struct body before opening the constructor function so that
         // GetFunctionType can resolve the (sized) return type.  Initializer

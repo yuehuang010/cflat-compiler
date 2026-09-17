@@ -7104,22 +7104,28 @@ public:
                                    const std::string& parentVariableName,
                                    const std::string& owningStructName);
 
-    // MSVC LSB-first bitfield packing. Consumes the user's declList; groups
-    // consecutive bitfields with the same underlying type into one storage
-    // slot each, populates outBitfields, and returns the storage-slot list
-    // that CreateStructType uses to emit the LLVM struct body.
+    // Target-aware LSB-first bitfield packing. Consumes the user's declList;
+    // groups bitfields into storage slots, populates outBitfields, and returns
+    // the storage-slot list that CreateStructType uses to emit the LLVM body.
     //
-    // Rules (matching MSVC ABI):
+    // Rules (MSVC mode):
     // - A bitfield of width W with the same TypeName as the current run fits if
     //   bitOffset + W <= storageBits; otherwise it starts a new storage unit.
     // - A bitfield with a different TypeName always starts a new unit.
+    // Rules (Itanium mode):
+    // - Type changes do not end a run. The storage unit grows to the widest
+    //   participating base type before the fit check; overflow starts a unit.
+    // - Not modeled: Itanium also forbids a bitfield straddling its declared type's
+    //   alignment boundary. A shape needing that rule (e.g. `int a:6; char b:6;`) is
+    //   caught by the imported-record layout verifier and refused, never miscompiled.
     // - Width-0 unnamed bitfield closes the current unit (next bitfield, even of
     //   the same type, starts a fresh unit).
     // - A bitfield wider than the underlying type is a hard error.
     // - Non-bitfield fields end any open run and pass through as their own slot.
     std::vector<DeclTypeAndValue> PackBitfields(
         const std::vector<DeclTypeAndValue>& in,
-        std::vector<BitfieldInfo>& outBitfields);
+        std::vector<BitfieldInfo>& outBitfields,
+        bool itaniumPacking = false);
 
     // Effective alignment of a struct FIELD's slot: the max of the type's ABI alignment,
     // the field's own `alignas(N)`, and the field TYPE's `alignas` (an over-aligned struct

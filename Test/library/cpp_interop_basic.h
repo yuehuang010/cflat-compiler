@@ -134,6 +134,57 @@ namespace cppi
     int use_number(const Number* n) noexcept;
     int use_bits(const Bits* b) noexcept;
     int use_array(const ArrayHolder* a) noexcept;
+
+    // M87: imported C++ bitfields follow the target ABI. Itanium keeps mixed base types in
+    // one allocation unit while MSVC starts a new unit on a type change.
+    struct M87Fit
+    {
+        int first : 20;
+        unsigned int second : 10;
+        unsigned int third : 1;
+    };
+    struct M87Overflow
+    {
+        int first : 20;
+        unsigned int second : 20;
+    };
+    struct M87ShortInt
+    {
+        short first : 7;
+        int middle : 10;
+        short last : 5;
+    };
+    struct M87BoolInt
+    {
+        bool ready : 1;
+        int value : 7;
+        bool done : 1;
+    };
+    struct M87Same
+    {
+        unsigned int first : 3;
+        unsigned int second : 5;
+        unsigned int third : 7;
+    };
+    inline int m87_size_fit() noexcept { return (int)sizeof(M87Fit); }
+    inline int m87_size_overflow() noexcept { return (int)sizeof(M87Overflow); }
+    inline int m87_size_short_int() noexcept { return (int)sizeof(M87ShortInt); }
+    inline int m87_size_bool_int() noexcept { return (int)sizeof(M87BoolInt); }
+    inline int m87_size_same() noexcept { return (int)sizeof(M87Same); }
+    inline int m87_fit_first(const M87Fit* v) noexcept { return v->first; }
+    inline int m87_fit_second(const M87Fit* v) noexcept { return (int)v->second; }
+    inline int m87_fit_third(const M87Fit* v) noexcept { return (int)v->third; }
+    inline int m87_overflow_first(const M87Overflow* v) noexcept { return v->first; }
+    inline int m87_overflow_second(const M87Overflow* v) noexcept { return (int)v->second; }
+    inline int m87_short_int_first(const M87ShortInt* v) noexcept { return v->first; }
+    inline int m87_short_int_middle(const M87ShortInt* v) noexcept { return v->middle; }
+    inline int m87_short_int_last(const M87ShortInt* v) noexcept { return v->last; }
+    inline int m87_bool_int_ready(const M87BoolInt* v) noexcept { return v->ready ? 1 : 0; }
+    inline int m87_bool_int_value(const M87BoolInt* v) noexcept { return v->value; }
+    inline int m87_bool_int_done(const M87BoolInt* v) noexcept { return v->done ? 1 : 0; }
+    inline int m87_same_first(const M87Same* v) noexcept { return (int)v->first; }
+    inline int m87_same_second(const M87Same* v) noexcept { return (int)v->second; }
+    inline int m87_same_third(const M87Same* v) noexcept { return (int)v->third; }
     int sum4(const int (&a)[4]) noexcept;
     int sum4_ptr(int (*a)[4]) noexcept;
 

@@ -193,6 +193,9 @@
 //                       global-scope object, header-only constants that need their own storage,
 //                       and a write through a mutable one. Test/errors/err_cpp_namespace_const_
 //                       assign.cb covers the rejected writes.
+//   Section M87 (1615-1633): imported mixed-type C++ bitfields follow Itanium allocation units;
+//                       overflow still splits, short/int and bool/int use the widest unit, and
+//                       same-type runs preserve their existing layout.
 //   Section M84 (1590-1599): a CLASS-typed subscript index - a named std.string lvalue as a
 //                       std.map key (incremented twice, and not moved from), the same key
 //                       through find/count, a struct field and a dereferenced pointer as
@@ -3772,6 +3775,50 @@ extern int main()
     if (cppi_scope.takeUIntMap(m82unscopedMap) != 8) return 1636;
     if (cppi_scope.deduceKind(cppi_scope.U1.u) != 1) return 1637;
     if (m82module.deduceKind(cppi_scope.U1.u) != 3) return 1638;
+
+    // ---- Section M87: target-aware C++ bitfield packing (1615-1633) ----------------
+    cppi.M87Fit m87fit = default;
+    m87fit.first = 0x54321;
+    m87fit.second = 0x2aa;
+    m87fit.third = 1;
+    if (sizeof(cppi.M87Fit) != cppi.m87_size_fit()) return 1615;
+    if (m87fit.first != cppi.m87_fit_first(&m87fit)) return 1616;
+    if (m87fit.second != cppi.m87_fit_second(&m87fit)) return 1617;
+    if (m87fit.third != cppi.m87_fit_third(&m87fit)) return 1618;
+
+    cppi.M87Overflow m87overflow = default;
+    m87overflow.first = 0x54321;
+    m87overflow.second = 0xabcde;
+    if (sizeof(cppi.M87Overflow) != cppi.m87_size_overflow()) return 1619;
+    if (m87overflow.first != cppi.m87_overflow_first(&m87overflow)) return 1620;
+    if (m87overflow.second != cppi.m87_overflow_second(&m87overflow)) return 1621;
+
+    cppi.M87ShortInt m87short = default;
+    m87short.first = 61;
+    m87short.middle = 0x155;
+    m87short.last = 19;
+    if (sizeof(cppi.M87ShortInt) != cppi.m87_size_short_int()) return 1622;
+    if (m87short.first != cppi.m87_short_int_first(&m87short)) return 1623;
+    if (m87short.middle != cppi.m87_short_int_middle(&m87short)) return 1624;
+    if (m87short.last != cppi.m87_short_int_last(&m87short)) return 1625;
+
+    cppi.M87BoolInt m87bool = default;
+    m87bool.ready = true;
+    m87bool.value = 63;
+    m87bool.done = true;
+    if (sizeof(cppi.M87BoolInt) != cppi.m87_size_bool_int()) return 1626;
+    if ((m87bool.ready ? 1 : 0) != cppi.m87_bool_int_ready(&m87bool)) return 1627;
+    if (m87bool.value != cppi.m87_bool_int_value(&m87bool)) return 1628;
+    if ((m87bool.done ? 1 : 0) != cppi.m87_bool_int_done(&m87bool)) return 1629;
+
+    cppi.M87Same m87same = default;
+    m87same.first = 5;
+    m87same.second = 17;
+    m87same.third = 91;
+    if (sizeof(cppi.M87Same) != cppi.m87_size_same()) return 1630;
+    if (m87same.first != cppi.m87_same_first(&m87same)) return 1631;
+    if (m87same.second != cppi.m87_same_second(&m87same)) return 1632;
+    if (m87same.third != cppi.m87_same_third(&m87same)) return 1633;
 
     return 0;
 }
