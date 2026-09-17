@@ -1,0 +1,9 @@
+import cpp "vector" cache;
+extern int main()
+{
+    expect_error("cannot assign to C++ class 'std.vector$int' from this expression") {
+        std.vector<int> value = default;
+        value = std.vector<int>();
+    }
+    return 0;
+}

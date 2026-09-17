@@ -1,0 +1,22 @@
+// Diagnostics around the C++ class-template constructor request: a CFlat namespace typo must
+// keep its own message, and a bound C++ variable must not be called a class template.
+import cpp "cpp_interop_tpl.h" cache;
+
+namespace err_cpp_tpl_ns
+{
+    T pick<T>(T a, T b) { return a; }
+}
+
+int err_cpp_tpl_both(bool a, bool b) { return a && b ? 1 : 0; }
+
+extern int main()
+{
+    expect_error("'pik' is not a member of namespace 'err_cpp_tpl_ns'.") {
+        int missing = err_cpp_tpl_ns.pik<int>(3, 4);
+    }
+    int x = 5;
+    expect_error("'cppt.module_dtors_counter' is a C++ variable, not a class template") {
+        int ambiguous = err_cpp_tpl_both(cppt.module_dtors_counter < 3, x > (2));
+    }
+    return 0;
+}

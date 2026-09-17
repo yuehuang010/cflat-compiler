@@ -148,6 +148,7 @@ namespace cppt
     class Box
     {
     public:
+        Box() noexcept : v_() { ++live_; ++ctors_; }
         explicit Box(T v) noexcept : v_(v) { ++live_; ++ctors_; }
         Box(const Box& o) noexcept : v_(o.v_) { ++live_; ++ctors_; }
         ~Box() noexcept { --live_; ++dtors_; }
@@ -170,6 +171,29 @@ namespace cppt
         inline static int live_ = 0;
         inline static int ctors_ = 0;
         inline static int dtors_ = 0;
+    };
+
+    template <typename T>
+    class CtorPair
+    {
+    public:
+        CtorPair(T first, int second) : first_(first), second_(second) {}
+        T first() const noexcept { return first_; }
+        int second() const noexcept { return second_; }
+    private:
+        T first_;
+        int second_;
+    };
+
+    inline int take_box_arg(Box<int> value) noexcept { return value.get(); }
+
+    class CtorTempSink
+    {
+    public:
+        CtorTempSink() noexcept {}
+        int take(Box<int> value) noexcept { return value.get() + 1; }
+        template <typename T>
+        int take_any(T value) noexcept { return value.get() + 2; }
     };
 
     template <typename T> T twice(T v) noexcept { return v + v; }

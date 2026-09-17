@@ -5292,6 +5292,14 @@ private:
     // True once any `import cpp` header has been bound in this analysis: the only situation in
     // which an unknown dotted type name is worth resolving as a C++ type.
     bool HasCxxImportGroup() const { return !cxxImportGroups_.empty(); }
+    // True when the LEADING segment of a dotted name is a namespace a C++ import group brought in.
+    // A purely CFlat namespace must not pay for C++-only lookup behaviour.
+    bool IsCxxForeignNamespace(const std::string& dottedName) const
+    {
+        auto dot = dottedName.find('.');
+        const std::string lead = dot == std::string::npos ? dottedName : dottedName.substr(0, dot);
+        return cxxForeignNamespaces_.count(lead) != 0;
+    }
 
     // Prototype boundary for the C++ path: primitives and bare pointers only. A record passed
     // or returned BY VALUE needs the aggregate ABI arrangement, which this prototype does not

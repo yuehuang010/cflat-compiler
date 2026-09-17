@@ -227,6 +227,9 @@
 //                       (parameter, return by value, nested namespace) is registered even
 //                       though binding those signatures is deferred to first use; nsstd_mix is
 //                       the control that one std-free declaration already registered.
+//   Section M92 (1730-1749): qualified C++ class-template constructor temporaries in CFlat
+//                       call arguments, C++ free/member calls, returns, assignment RHS,
+//                       zero/two-argument constructors, nested specializations, and user types.
 // Section M: C++ interop - `import cpp` selects C++ mode; the extension is irrelevant (the
 // fixture header is a plain .h). The header supplies the declarations, the .cpp is compiled
 // by the host C++ driver and linked in. Both are needed: the header alone has no
@@ -311,6 +314,13 @@ int m8_second_use(int v)
     cppt.Box<int> b = cppt.Box<int>(v);
     return b.get() + b[0];
 }
+
+int m92_take_box(cppt.Box<int> value) { return value.get(); }
+int m92_take_pair(cppt.CtorPair<int> value) { return value.first() + value.second(); }
+int m92_take_nested(cppt.Box<cppt.Box<int>> value) { return value.get().get(); }
+int m92_take_nested2(cppt.Box<cppt.Box<cppt.Box<int>>> value) { return value.get().get().get(); }
+int m92_take_payload(cppt.Box<cppi.impl_detail.Payload> value) { return value.get().get(); }
+cppt.Box<int> m92_return_box(int value) { return cppt.Box<int>(value); }
 
 // M9 helper: a std.string built and read in a second function - the specialization is requested
 // once for the whole compilation, not once per use site.
@@ -4113,6 +4123,39 @@ extern int main()
     if (cppi.m93.WithField.cap != 49)               return 1766;
     if (m93wf.v != 3)                               return 1767;
     if (sizeof(cppi.m93.WithField) != sizeof(int))  return 1768;
+
+    // ---- Section M92: qualified C++ class-template constructor temporaries (1730-1749) ---
+    if (m92_take_box(cppt.Box<int>(9)) != 9) return 1730;
+    if (cppt.take_box_arg(cppt.Box<int>(10)) != 10) return 1731;
+    cppt.CtorTempSink m92sink = default;
+    if (m92sink.take(cppt.Box<int>(11)) != 12) return 1732;
+    if (cppt.make_box(cppt.Box<int>(12)).get().get() != 12) return 1733;
+    if (m92sink.take_any(cppt.Box<int>(13)) != 15) return 1734;
+    if (m92_return_box(14).get() != 14) return 1735;
+    std.optional<int> m92assigned = default;
+    m92assigned = std.optional<int>(16);
+    if (!m92assigned.has_value() || m92assigned.value() != 16) return 1736;
+    if (m92_take_box(cppt.Box<int>()) != 0) return 1737;
+    if (m92_take_pair(cppt.CtorPair<int>(16, 17)) != 33) return 1738;
+    if (m92_take_nested(cppt.Box<cppt.Box<int>>(cppt.Box<int>(18))) != 18) return 1739;
+    if (m92_take_nested2(cppt.Box<cppt.Box<cppt.Box<int>>>(
+            cppt.Box<cppt.Box<int>>(cppt.Box<int>(19)))) != 19) return 1740;
+    cppi.impl_detail.Payload m92payload = default;
+    if (m92_take_payload(cppt.Box<cppi.impl_detail.Payload>(m92payload)) != 3) return 1741;
+    cppt.Box<cppi.impl_detail.Payload> m92payloadBox =
+        cppt.Box<cppi.impl_detail.Payload>(m92payload);
+    if (m92payloadBox.get().get() != 3) return 1742;
+    cppt.Box<cppt.Box<int>> m92nestedDecl =
+        cppt.Box<cppt.Box<int>>(cppt.Box<int>(20));
+    if (m92nestedDecl.get().get() != 20) return 1743;
+    if (m92_take_nested(cppt.Box<cppt.Box<int>>(cppt.Box<int>(21))) != 21) return 1744;
+    if (cppt.take_box_arg(cppt.Box<int>(22)) != 22) return 1745;
+    cppt.Box<double> m92double = cppt.Box<double>(2.5);
+    if (m92double.get() != 2.5) return 1746;
+    cppt.Box<int> m92decl = cppt.Box<int>(23);
+    if (m92decl.get() != 23) return 1747;
+    if (cppt.make_box(cppt.Box<int>()).get().get() != 0) return 1748;
+    if (m92_return_box(24).get() != 24) return 1749;
 
     return 0;
 }

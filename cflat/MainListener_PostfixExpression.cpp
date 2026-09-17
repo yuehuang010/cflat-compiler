@@ -1426,6 +1426,9 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             }
                             else
                             {
+                                const bool followedByGenericTypeParameters = childIndex < ctx->children.size()
+                                    && dynamic_cast<CFlatParser::GenericTypeParametersContext*>(
+                                        ctx->children[childIndex]) != nullptr;
                                 // Resolved only on this path: an alias lookup can request a lazy
                                 // C++ specialization, and a name that turned out to be a plain
                                 // namespace must not pay for a clang re-parse (or record a
@@ -1467,6 +1470,34 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     namedVar = {};
                                     structVar = {};
                                     interfaceVar = {};
+                                    break;
+                                }
+                                // A bound C++ OBJECT can never take template arguments: the grammar
+                                // read a '<' comparison as a generic parameter list.
+                                if (followedByGenericTypeParameters
+                                    && Compiler(ctx)->IsCxxForeignNamespace(qualifiedName)
+                                    && Compiler(ctx)->GetGlobalVariableNV(qualifiedName).Storage != nullptr
+                                    && !Compiler(ctx)->HasCxxFunctionTemplate(qualifiedName))
+                                {
+                                    LogErrorContext(ctx, std::format(
+                                        "'{}' is a C++ variable, not a class template; parenthesize "
+                                        "the comparison if you meant '<'", qualifiedName));
+                                    namedVar = {};
+                                    break;
+                                }
+                                // Only a name led by an imported C++ namespace, and not already a
+                                // bound C++ object, can be a class template awaiting its arguments.
+                                if (followedByGenericTypeParameters
+                                    && Compiler(ctx)->HasCxxImportGroup()
+                                    && Compiler(ctx)->IsCxxForeignNamespace(qualifiedName)
+                                    && !genericFunctionTemplates.count(qualifiedName)
+                                    && !genericStructTemplates.count(qualifiedName)
+                                    && !genericClassTemplates.count(qualifiedName)
+                                    && !Compiler(ctx)->HasCxxFunctionTemplate(qualifiedName))
+                                {
+                                    // Preserve the namespace for the generic-parameter request below.
+                                    primaryIdentifier = memberName;
+                                    namedVar = {};
                                     break;
                                 }
                                 // Qualified name (e.g. EnumName.Member, Cfg.W) - try to resolve
