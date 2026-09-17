@@ -185,6 +185,26 @@ namespace cppi
     inline int m87_same_first(const M87Same* v) noexcept { return (int)v->first; }
     inline int m87_same_second(const M87Same* v) noexcept { return (int)v->second; }
     inline int m87_same_third(const M87Same* v) noexcept { return (int)v->third; }
+
+    struct M89ZeroSame
+    {
+        unsigned int first : 3;
+        int : 0;
+        unsigned int second : 3;
+    };
+    struct M89ZeroDifferent
+    {
+        unsigned short first : 3;
+        int : 0;
+        unsigned int second : 3;
+    };
+    inline int m89_zero_same_size() noexcept { return (int)sizeof(M89ZeroSame); }
+    inline int m89_zero_different_size() noexcept { return (int)sizeof(M89ZeroDifferent); }
+    inline int m89_zero_same_first(const M89ZeroSame* v) noexcept { return (int)v->first; }
+    inline int m89_zero_same_second(const M89ZeroSame* v) noexcept { return (int)v->second; }
+    inline int m89_zero_different_first(const M89ZeroDifferent* v) noexcept { return (int)v->first; }
+    inline int m89_zero_different_second(const M89ZeroDifferent* v) noexcept { return (int)v->second; }
+
     int sum4(const int (&a)[4]) noexcept;
     int sum4_ptr(int (*a)[4]) noexcept;
 

@@ -846,6 +846,8 @@ namespace cflat_cinterop
 
             void PrepareHeaderSpecialMembers(const CXXRecordDecl* cxx);
             std::string InvalidDefinitionRefusal(const CXXRecordDecl* def) const;
+            std::string InvalidTypeRequestRefusal(const CXXRecordDecl* def,
+                                                  const std::string& spelling) const;
 
             // Resolve a decl's presumed location WITHOUT applying the in-scope filter. Returns
             // false only on an invalid/unknown location.
@@ -2174,7 +2176,7 @@ namespace cflat_cinterop
              * only producer of records. A ClassTemplateSpecializationDecl is not a child of its
              * DeclContext, which is why the typedef (a real top-level decl) is the handle.
              */
-            void ProcessTypeRequests()
+            bool ProcessTypeRequests()
             {
                 for (size_t i = 0; i < st.req.cxxTypeRequests.size(); ++i)
                 {
@@ -2197,6 +2199,13 @@ namespace cflat_cinterop
                     {
                         st.ci->getSema().isCompleteType(td->getLocation(), canon);
                         def = cxx->getDefinition();
+                    }
+                    if (cxx->isInvalidDecl() || (def != nullptr && def->isInvalidDecl()))
+                    {
+                        st.out.invalidCxxTypeRequestError = InvalidTypeRequestRefusal(
+                            def != nullptr ? def : cxx,
+                            st.req.cxxTypeRequests[i].cxxSpelling);
+                        return false;
                     }
                     if (def == nullptr) continue;
                     std::function<void(const CXXRecordDecl*)> emitBases;
@@ -2286,6 +2295,7 @@ namespace cflat_cinterop
                         rec.members.push_back(std::move(ctor));
                     }
                 }
+                return true;
             }
 
             void ProcessFunctionRequests()
@@ -2754,6 +2764,32 @@ namespace cflat_cinterop
                                            e.message, e.file, e.line);
             }
             return "does not compile as C++ (clang reported an error inside its definition)";
+        }
+
+        std::string DeclVisitor::InvalidTypeRequestRefusal(const CXXRecordDecl* def,
+                                                            const std::string& spelling) const
+        {
+            const auto* diags = st.ci != nullptr
+                ? dynamic_cast<const PrereqDiagConsumer*>(st.ci->getDiagnostics().getClient())
+                : nullptr;
+            std::string detail;
+            std::string file; int first = 0, last = 0, col = 0;
+            if (def != nullptr && LocOfRaw(def, file, first, col))
+            {
+                PresumedLoc endLoc = sm.getPresumedLoc(def->getEndLoc());
+                last = endLoc.isValid() && endLoc.getFilename() == file
+                    ? (int)endLoc.getLine() : first;
+                if (diags != nullptr)
+                    for (const auto& e : diags->errors)
+                        if (e.file == file && (int)e.line >= first && (int)e.line <= last)
+                        {
+                            detail = e.message;
+                            break;
+                        }
+            }
+            if (detail.empty() && diags != nullptr) detail = diags->firstError;
+            if (detail.empty()) detail = "clang reported an invalid specialization";
+            return std::format("C++ type '{}' could not be instantiated: {}", spelling, detail);
         }
 
         void DeclVisitor::PrepareHeaderSpecialMembers(const CXXRecordDecl* cxx)
@@ -3743,7 +3779,7 @@ namespace cflat_cinterop
                                                      "record/sig harvest");
                     if (st.req.cxxTypeRequests.empty() && st.req.cxxFunctionWrapperNames.empty())
                         v.TraverseDecl(ctx.getTranslationUnitDecl());
-                    else if (!st.req.cxxTypeRequests.empty()) v.ProcessTypeRequests();
+                    else if (!st.req.cxxTypeRequests.empty() && !v.ProcessTypeRequests()) return;
                     else v.ProcessFunctionRequests();
                 }
                 if (st.req.cxxMode)

@@ -1011,6 +1011,8 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                         // unknown-type diagnostic below is the right report for a typo.
                         std::string cxxError;
                         Compiler(declSpecs)->TryRequestCxxType(typeName, {}, typeName, cxxError);
+                        if (cxxError.find("could not be instantiated:") != std::string::npos)
+                            LogCxxErrorContext(typeSpec, cxxError);
                     }
                     if (!canonicalTypeName.empty()) typeName = canonicalTypeName;
                     // Apply active type parameter substitutions (e.g. T -> int inside a template body)

@@ -198,6 +198,8 @@
 //   Section M87 (1660-1678): imported mixed-type C++ bitfields follow Itanium allocation units;
 //                       overflow still splits, short/int and bool/int use the widest unit, and
 //                       same-type runs preserve their existing layout.
+//   Section M89 (1680-1685): unnamed zero-width C++ bitfields close an allocation unit under
+//                       both same-type and mixed-type neighbours; fields and sizeof agree with C++.
 //   Section M84 (1590-1599): a CLASS-typed subscript index - a named std.string lvalue as a
 //                       std.map key (incremented twice, and not moved from), the same key
 //                       through find/count, a struct field and a dereferenced pointer as
@@ -3900,6 +3902,21 @@ extern int main()
     if (m87same.first != cppi.m87_same_first(&m87same)) return 1676;
     if (m87same.second != cppi.m87_same_second(&m87same)) return 1677;
     if (m87same.third != cppi.m87_same_third(&m87same)) return 1678;
+
+    // ---- Section M89: unnamed zero-width bitfields close the allocation unit -------------
+    cppi.M89ZeroSame m89same = default;
+    m89same.first = 5;
+    m89same.second = 6;
+    if (sizeof(cppi.M89ZeroSame) != cppi.m89_zero_same_size()) return 1680;
+    if (m89same.first != cppi.m89_zero_same_first(&m89same)) return 1681;
+    if (m89same.second != cppi.m89_zero_same_second(&m89same)) return 1682;
+
+    cppi.M89ZeroDifferent m89different = default;
+    m89different.first = 5;
+    m89different.second = 6;
+    if (sizeof(cppi.M89ZeroDifferent) != cppi.m89_zero_different_size()) return 1683;
+    if (m89different.first != cppi.m89_zero_different_first(&m89different)) return 1684;
+    if (m89different.second != cppi.m89_zero_different_second(&m89different)) return 1685;
 
     return 0;
 }

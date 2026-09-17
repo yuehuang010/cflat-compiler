@@ -553,6 +553,9 @@ namespace cflat_cinterop
         unsigned prereqErrors = 0;
         std::string firstPrereqError;            // formatted text of the first such error
         std::string firstError;                  // first clang error, including wrapper requests
+        // A requested template specialization whose completion failed. This is separate from
+        // firstError because request TUs may contain tolerated errors unrelated to this type.
+        std::string invalidCxxTypeRequestError;
 
         // Errors clang raised INSIDE one of the headers the caller asked to bind (in-scope
         // dirs only, so neither the in-memory stub's intentional macro-probe/wrapper errors nor

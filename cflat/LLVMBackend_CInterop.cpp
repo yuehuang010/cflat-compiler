@@ -7377,6 +7377,8 @@ bool LLVMBackend::RequestCxxForeignType(const std::string& cflatName, const std:
                                             effectivePrefixSource))
                         return fail(std::format("C++ type '{}' could not be parsed: {}",
                                                 cxxSpelling, error));
+                    if (!probe.invalidCxxTypeRequestError.empty())
+                        return fail(probe.invalidCxxTypeRequestError);
                 }
                 if (rejectClangErrors && !probe.firstError.empty())
                     return fail(std::format("C++ type '{}' could not be parsed: {}",
@@ -7490,6 +7492,8 @@ bool LLVMBackend::RequestCxxForeignType(const std::string& cflatName, const std:
                                       stage2Extra,
                                       /*emitDefinitions*/ true, emitted, err2,
                                       effectivePrefixSource);
+                if (emittedOk && !emitted.invalidCxxTypeRequestError.empty())
+                    return fail(emitted.invalidCxxTypeRequestError);
                 if (emittedOk && !emitted.records.empty())
                     raw = std::move(emitted);
                 }
@@ -8789,6 +8793,7 @@ std::string LLVMBackend::VerifyCxxRecordLayout(const CRecordEntry& r)
         {
             if (cf.isBitfield)
             {
+                if (cf.name.empty()) continue;  // unnamed bitfields only reserve storage
                 auto bit = std::find_if(it->second.Bitfields.begin(), it->second.Bitfields.end(),
                                         [&](const BitfieldInfo& b) { return b.Name == cf.name; });
                 if (bit == it->second.Bitfields.end()) return refuse(
