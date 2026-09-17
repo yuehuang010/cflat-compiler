@@ -8892,6 +8892,34 @@ void LLVMBackend::RegisterGeneratedCxxOverrideNames(const std::string& typeName,
         if (it != generatedCxxRecords_.end()) it->second.overrideNames = names;
 }
 
+/*
+ * The record a BY-VALUE field names, normalized to the spelling records are keyed on. Empty for a
+ * pointer, a reference or a function type: those need no layout, so they create no ordering edge.
+ */
+std::string LLVMBackend::ValueFieldRecordKey(const std::string& ctype)
+{
+        std::string s = ctype;
+        if (s.find('(') != std::string::npos) return {};
+        if (auto br = s.find('['); br != std::string::npos) s.erase(br);
+        if (s.find('*') != std::string::npos || s.find('&') != std::string::npos) return {};
+        auto trim = [](std::string& t) {
+            while (!t.empty() && std::isspace((unsigned char)t.back())) t.pop_back();
+            const size_t a = t.find_first_not_of(" \t");
+            if (a == std::string::npos) t.clear();
+            else if (a > 0) t.erase(0, a);
+        };
+        trim(s);
+        for (bool peeled = true; peeled; )
+        {
+            peeled = false;
+            for (const char* w : { "const ", "volatile ", "struct ", "class ", "union ", "enum " })
+                if (s.rfind(w, 0) == 0) { s.erase(0, std::strlen(w)); peeled = true; break; }
+            trim(s);
+        }
+        if (s.empty()) return {};
+        return SqueezeCxxSpelling(s);
+}
+
 void LLVMBackend::RegisterCRecords(std::vector<CRecordEntry>& records, const std::string& fileForLsp)
 {
         if (records.empty()) return;
@@ -8908,6 +8936,16 @@ void LLVMBackend::RegisterCRecords(std::vector<CRecordEntry>& records, const std
             if (r.isCxx)
             {
                 NoteCxxForeignNamespace(r.name);
+                // A record registered under a foreign IDENTITY (a class-template specialization)
+                // is reachable from a field's C++ spelling only through this map.
+                if (!r.canonicalCtype.empty() && r.name.find('$') != std::string::npos)
+                {
+                    cxxForeignTypeSpellings_.emplace(SqueezeCxxSpelling(r.canonicalCtype), r.name);
+                    // The lookup strips an elaborated `class `/`struct ` keyword first, so key the
+                    // stripped spelling too rather than assume which form clang produced.
+                    if (const std::string bare = ValueFieldRecordKey(r.canonicalCtype); !bare.empty())
+                        cxxForeignTypeSpellings_.emplace(bare, r.name);
+                }
                 if (activeCxxRequestGroup_ != nullptr)
                     cxxTypeOwnerGroup_.emplace(r.name, activeCxxRequestGroup_->primary);
                 for (size_t pos = 0; (pos = r.name.find('.', pos)) != std::string::npos; ++pos)
@@ -8927,6 +8965,49 @@ void LLVMBackend::RegisterCRecords(std::vector<CRecordEntry>& records, const std
             // Create the opaque shell so later fields/records in the same batch can refer to it.
             CreateStructType(r.name, /*typeAndValues*/{});
             ours.push_back(&r);
+        }
+
+        /*
+         * Pass 1b: lay a record out AFTER every record it holds BY VALUE. Pass 1 leaves an opaque
+         * shell, and a field whose type is still a shell has no sized LLVM type - the layout below
+         * would embed it as opaque bytes and its members would never resolve (a nested member class
+         * is emitted after its owner by clang's traversal, so this is the common case). Pointer
+         * fields create no edge, so a nested class pointing back at its owner cannot cycle; a cycle
+         * that does exist keeps the original relative order.
+         */
+        {
+            std::unordered_map<std::string, size_t> byKey;
+            for (size_t i = 0; i < ours.size(); ++i)
+            {
+                const CRecordEntry& r = *ours[i];
+                if (!r.name.empty()) byKey.emplace(SqueezeCxxSpelling(r.name), i);
+                if (!r.canonicalCtype.empty())
+                    if (const std::string key = ValueFieldRecordKey(r.canonicalCtype); !key.empty())
+                        byKey.emplace(key, i);
+                std::string cxxSpelling = r.name;
+                for (size_t p = 0; (p = cxxSpelling.find('.', p)) != std::string::npos; p += 2)
+                    cxxSpelling.replace(p, 1, "::");
+                if (cxxSpelling != r.name) byKey.emplace(SqueezeCxxSpelling(cxxSpelling), i);
+            }
+            std::vector<CRecordEntry*> ordered;
+            ordered.reserve(ours.size());
+            std::vector<char> state(ours.size(), 0);      // 0 unvisited, 1 on stack, 2 emitted
+            auto visit = [&](auto&& self, size_t i) -> void {
+                if (state[i] != 0) return;
+                state[i] = 1;
+                for (const auto& f : ours[i]->fields)
+                {
+                    const std::string key = ValueFieldRecordKey(f.ctype);
+                    if (key.empty()) continue;
+                    auto it = byKey.find(key);
+                    if (it == byKey.end() || it->second == i || state[it->second] != 0) continue;
+                    self(self, it->second);
+                }
+                state[i] = 2;
+                ordered.push_back(ours[i]);
+            };
+            for (size_t i = 0; i < ours.size(); ++i) visit(visit, i);
+            ours.swap(ordered);
         }
 
         // Pass 2: bodies. On unmappable fields leave the opaque shell in place so a later
@@ -9217,7 +9298,7 @@ void LLVMBackend::RegisterCRecords(std::vector<CRecordEntry>& records, const std
                     if (r.isCxx && fi < r.fields.size() && !r.fields[fi].isBitfield
                         && MakeOpaqueFieldBlob(r.fields[fi], blob))
                     {
-                        if (verbose) std::cout << std::format("[verbose]   C++ struct '{}': field '{}' of unsized type '{}' embedded as {} opaque bytes\n",
+                        if (verbose) std::cout << std::format("[verbose]   C++ struct '{}': field '{}' has no layout for type '{}' (its record was refused or never registered); embedded as {} opaque bytes\n",
                             r.name, d.VariableName, d.TypeName, r.fields[fi].sizeBytes);
                         d = std::move(blob);
                         continue;

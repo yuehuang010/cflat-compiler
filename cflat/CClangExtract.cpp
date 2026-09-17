@@ -1987,6 +1987,42 @@ namespace cflat_cinterop
              * a libc++ container's fields are private implementation detail CFlat never names, and
              * several of them have no CFlat spelling at all.
              */
+            /*
+             * Export every class-template specialization a record holds BY VALUE, under the
+             * foreign identity the backend keys such a type on. A named class is emitted by the
+             * general traversal, but a ClassTemplateSpecializationDecl is not a child of its
+             * DeclContext, so without this the enclosing layout has no record for the field and
+             * embeds it as opaque bytes. Pointer and reference fields are skipped: a handle needs
+             * no layout, so they neither force an instantiation nor recurse.
+             */
+            void EmitFieldSpecializationRecords(const RecordDecl* rd)
+            {
+                if (!st.req.cxxMode) return;
+                for (const FieldDecl* f : rd->fields())
+                {
+                    QualType qt = f->getType();
+                    while (const ConstantArrayType* cat = ctx.getAsConstantArrayType(qt))
+                        qt = cat->getElementType();
+                    qt = qt.getCanonicalType().getUnqualifiedType();
+                    if (qt->isPointerType() || qt->isReferenceType()) continue;
+                    auto* cxx = qt->getAsCXXRecordDecl();
+                    if (cxx == nullptr || !llvm::isa<ClassTemplateSpecializationDecl>(cxx)) continue;
+                    CXXRecordDecl* def = cxx->getDefinition();
+                    if (def == nullptr || def->isInvalidDecl() || def->isDependentContext()) continue;
+                    // Only a specialization declared by the bound header itself. A standard-library
+                    // one (a std::shared_ptr member) is owned by the request path, which keys it on
+                    // its own CFlat spelling - registering it here would claim that identity first.
+                    std::string defFile; int defLine = 1, defCol = 0;
+                    if (st.req.requireInScope
+                        && (!LocOfRaw(def, defFile, defLine, defCol)
+                            || !PathInScope(defFile, st.normDirs)))
+                        continue;
+                    const std::string identity = CxxForeignIdentity(CanonicalSpelling(ctx, qt));
+                    if (identity.empty()) continue;
+                    EmitDefinedRecord(def, identity);
+                }
+            }
+
             void EmitDefinedRecord(RecordDecl* rd, const std::string& nameOverride,
                                    bool forcedBase = false)
             {
@@ -2125,6 +2161,8 @@ namespace cflat_cinterop
                     }
                 }
                 else if (!flattened) CollectFields(rd, rec.name, rec);
+                // Before the owner, so the batch already holds every by-value field's record.
+                if (rec.layoutRefusal.empty()) EmitFieldSpecializationRecords(rd);
                 st.out.records.push_back(std::move(rec));
                 if (!memberDecls.empty())
                 {

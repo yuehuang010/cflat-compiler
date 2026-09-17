@@ -2590,7 +2590,9 @@ bool LLVMBackend::TryLoadCHeaderDiskCache(
         // is now present with a constant value where an older cache omitted it entirely.
         // v67 binds a C++ REFERENCE data member as a pointer field: an older cache carries the
         // "reference members are not supported" layout refusal and an empty field list for it.
-        if (version != 67) return cacheMiss("cache version");
+        // v68 stores the class-template specializations a record holds by value as records of
+        // their own, so a field of such a type is laid out instead of embedded as opaque bytes.
+        if (version != 68) return cacheMiss("cache version");
 
         if (!expectedRequestKey.empty()
             && j.value("cxxRequestKey", std::string{}) != expectedRequestKey)
@@ -2814,7 +2816,7 @@ void LLVMBackend::WriteCHeaderDiskCache(
         if (ec) return;
 
         nlohmann::json j;
-        j["version"] = 67;
+        j["version"] = 68;
         j["mtime"]   = (int64_t)mtime.time_since_epoch().count();
         j["hash"]    = contentHash;
         j["ldw"]     = entry.longDoubleWidth;

@@ -5067,6 +5067,7 @@ private:
     void RejectThrowingCxxFunction(const FunctionSymbol& symbol, const std::string& displayName) const;
     llvm::Function* EnsureCxxProgramEhGuard(const std::string& programName);
     static std::string SqueezeCxxSpelling(const std::string& spelling);
+    static std::string ValueFieldRecordKey(const std::string& ctype);
     static std::string StripCxxRecordTag(std::string spelling);
     // One spelling a request (or a batch of requests) instantiates in an import group's TU.
     struct CxxRequestItem

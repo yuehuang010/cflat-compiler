@@ -254,6 +254,13 @@
 // fixture header is a plain .h). The header supplies the declarations, the .cpp is compiled
 // by the host C++ driver and linked in. Both are needed: the header alone has no
 // definitions, and the source alone would not exercise the header-extraction path.
+//   Section M96 (1830-1849): a C++ field whose type is a CLASS - a nested member class
+//                       (one and two levels, an array of them, a pointer to one, and one
+//                       pointing back at its owner), a class-template specialization
+//                       spelled directly and through an alias, a specialization over the
+//                       owner's own nested class, and one whose template has a nontrivial
+//                       destructor that the owner's destruction must run. Each of these
+//                       was embedded as opaque bytes, so every member access failed.
 import cpp "library/cpp_interop_basic.h" cache;
 import cpp "library/cpp_interop_basic.cpp" cache;
 // Section M6: inheritance and virtual dispatch. Definitions are out-of-line on purpose - every
@@ -285,6 +292,7 @@ import cpp "library/cpp_interop_nsstd.h" cache;
 import cpp "library/cpp_interop_strop.h" cache;
 // Section M97: C++ REFERENCE data members - bound as pointer fields, never reseatable.
 import cpp "library/cpp_interop_ref_member.h" cache;
+import cpp "library/cpp_interop_field.h" cache;
 import "list.cb";
 import "thread.cb";
 import "malloc_allocator.cb";
@@ -4324,6 +4332,58 @@ extern int main()
     int m97e1 = 4; int m97e2 = 6;                                    // array of such records
     cppref.RefHolder[2] m97arr = { cppref.RefHolder(&m97e1), cppref.RefHolder(&m97e2) };
     if (m97arr[0].get() != 4 || m97arr[1].get() != 6) return 1869;
+    // ---- Section M96: a C++ field whose type is a CLASS (1830-1849) -----------------------
+    // Pre-fix every leg below failed to COMPILE ("Undefined variable ..." / "no overload of
+    // ... matches the given arguments"), because the field was laid out as opaque bytes.
+    cppf.Named m96named = default;                        // accept-set: named top-level class
+    if (m96named.pl.p != 3) return 1830;
+    if (m96named.pl.dbl() != 6) return 1831;
+    if (m96named.get() != 3) return 1832;
+
+    cppf.Outer m96outer = default;                        // nested member class, by value
+    if (m96outer.in.x != 21 || m96outer.tail != 1) return 1833;
+    if (m96outer.in.twice() != 42) return 1834;
+    m96outer.in.x = 4;
+    if (m96outer.in.twice() != 8) return 1835;
+    cppf.Outer.Inner m96inner = default;                  // the nested class on its own
+    m96inner.x = 5;
+    // 1836 is accept-set: the nested class binds on its own pre-fix (matrix cell a02).
+    if (m96inner.twice() != 10) return 1836;
+
+    cppf.Deep m96deep = default;                          // two levels of nesting
+    if (m96deep.md.m != 9) return 1837;
+    if (m96deep.md.lf.l != 7) return 1838;
+    if (m96deep.md.lf.inc() != 8) return 1839;
+
+    cppf.ArrHost m96arr = default;                        // fixed array of a nested class
+    if (m96arr.cells[0].c != 11) return 1840;
+    if (m96arr.cells[1].c != 22) return 1841;
+    if (m96arr.cells[1].plus(3) != 25) return 1842;
+
+    cppf.PtrHost m96ptr = default;                        // pointer field forces no layout
+    if (m96ptr.local != 4) return 1843;
+    if (m96ptr.p != nullptr) return 1844;
+
+    cppf.SelfRef m96self = default;                       // nested class points back at its owner
+    if (m96self.v != 2) return 1845;
+    if (m96self.bk.b != 8 || m96self.bk.owner == nullptr) return 1846;
+
+    cppf.HoldsSpec m96spec = default;                     // field of a specialization
+    if (m96spec.h.v != 6 || m96spec.tail != 1) return 1847;
+    m96spec.h.v = 8;
+    if (m96spec.h.get() != 8) return 1847;
+    cppf.HoldsAlias m96alias = default;                   // same specialization via an alias
+    if (m96alias.a.v != 13 || m96alias.tail != 2) return 1848;
+    cppf.SpecOfNested m96son = default;                   // specialization over a nested class
+    if (m96son.s.v.k != 17) return 1848;
+
+    // The owner's destruction must run the field template's nontrivial destructor exactly once.
+    if (cppf.dtor_count() != 0) return 1849;
+    {
+        cppf.HoldsOwner m96owner = default;
+        if (m96owner.o.value() != 30 || m96owner.tail != 3) return 1849;
+    }
+    if (cppf.dtor_count() != 1) return 1849;
 
     return 0;
 }
