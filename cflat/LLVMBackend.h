@@ -7886,7 +7886,8 @@ public:
     const CxxClassInfo::Structor* SelectCxxConstructor(const std::string& typeName,
                                                        const std::vector<TypeAndValue>& argTypes,
                                                        std::string& why,
-                                                       bool allowNumericConversions = false) const;
+                                                       bool allowNumericConversions = false,
+                                                       const std::vector<NamedVariable>* argVars = nullptr) const;
     // Copy-construct (or move-construct when `useMove`) `dest` from the object at `src`.
     // Returns false after LogError when the needed constructor is missing or inaccessible.
     bool EmitCxxCopyOrMoveConstruct(const std::string& typeName, llvm::Value* dest,

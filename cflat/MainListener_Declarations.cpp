@@ -3951,11 +3951,13 @@ cxx_dtor_ready:
                 return true;
             }
             std::string why;
-            const auto* ctor = compiler->SelectCxxConstructor(typeName, argTypes, why);
+            const auto* ctor = compiler->SelectCxxConstructor(typeName, argTypes, why, false,
+                                                             &ctorArgumentAddresses);
             if (ctor == nullptr)
             {
                 compiler->TryBindRefusedCxxMember(typeName, "__ctor");
-                ctor = compiler->SelectCxxConstructor(typeName, argTypes, why);
+                ctor = compiler->SelectCxxConstructor(typeName, argTypes, why, false,
+                                                      &ctorArgumentAddresses);
             }
             if (ctor == nullptr)
             {

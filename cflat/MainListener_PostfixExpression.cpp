@@ -6447,12 +6447,12 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 }
                                 std::string why;
                                 const auto* ctor = compiler->SelectCxxConstructor(
-                                    functionName, ctorTypes, why);
+                                    functionName, ctorTypes, why, false, &arguments);
                                 if (ctor == nullptr)
                                 {
                                     compiler->TryBindRefusedCxxMember(functionName, "__ctor");
                                     ctor = compiler->SelectCxxConstructor(
-                                        functionName, ctorTypes, why);
+                                        functionName, ctorTypes, why, false, &arguments);
                                 }
                                 if (ctor == nullptr)
                                 {

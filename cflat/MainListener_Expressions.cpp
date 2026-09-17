@@ -13208,7 +13208,8 @@ LLVMBackend::NamedVariable MainListener::ParseNewExpression(CFlatParser::NewExpr
                     ctorArgVars.push_back(std::move(nv));
                 }
             std::string why;
-            const auto* ctor = compiler->SelectCxxConstructor(typeName, ctorArgTypes, why);
+            const auto* ctor = compiler->SelectCxxConstructor(typeName, ctorArgTypes, why, false,
+                                                             &ctorArgVars);
             if (ctor == nullptr)
             {
                 LogErrorContext(ctx, std::format("C++ class '{}' {}", typeName, why));

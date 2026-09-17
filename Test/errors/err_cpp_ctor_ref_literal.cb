@@ -1,0 +1,10 @@
+// A C++ constructor parameter declared non-const `int&` cannot bind an integer LITERAL: the
+// literal has no address, so the reference would point at a temporary that dies at once.
+import cpp "cpp_interop_ctorref.h";
+
+extern int main()
+{
+    expect_error("has no constructor whose parameter types match these arguments");
+    cppcr.IntRef bad = cppcr.IntRef(5);
+    return 0;
+}

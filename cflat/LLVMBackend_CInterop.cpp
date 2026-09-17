@@ -12979,11 +12979,43 @@ bool LLVMBackend::EmitCxxStructorCall(const std::string& typeName,
                     }
                     if (address != nullptr) a = EmitCxxBaseAdjust(address, offset);
                 }
+                // A C++ reference parameter takes the ARGUMENT's address, the same binding the
+                // free and member call paths use; a copy loses every write the callee makes.
+                else if (!source.TypeAndValue.Pointer && param->Pointer && !param->ElemPointer
+                         && (param->IsAlias || param->IsRvalueRef)
+                         && source.Storage != nullptr
+                         && param->TypeName == source.TypeAndValue.TypeName)
+                {
+                    a = source.Storage;
+                }
             }
+            // A reference parameter with no addressable argument left keeps its materialized
+            // temporary; passing the raw value would hand the callee an integer as an address.
             if (param != nullptr && param->Pointer && a != nullptr
-                && !a->getType()->isPointerTy() && a->getType()->isStructTy())
+                && !a->getType()->isPointerTy()
+                && (a->getType()->isStructTy()
+                    || ((param->IsAlias || param->IsRvalueRef) && !param->ElemPointer
+                        && llvm::FunctionType::isValidArgumentType(a->getType()))))
             {
-                auto* temp = AllocaAtEntry(a->getType(), nullptr, "ctor.refarg");
+                // The temporary holds the REFERENT, not the argument: a CFlat integer literal
+                // arrives as i8, and a 1-byte buffer read back as `int` is garbage.
+                llvm::Type* refTy = a->getType();
+                if ((param->IsAlias || param->IsRvalueRef) && !param->ElemPointer)
+                {
+                    TypeAndValue referent = *param;
+                    referent.Pointer = false;
+                    referent.IsAlias = false;
+                    referent.IsRvalueRef = false;
+                    llvm::Type* rt = GetType(referent);
+                    if (rt != nullptr && rt != refTy
+                        && (rt->isIntegerTy() || rt->isFloatingPointTy())
+                        && (refTy->isIntegerTy() || refTy->isFloatingPointTy()))
+                    {
+                        a = CreateCast(a, rt, param->IsUnsignedInteger() == -1);
+                        refTy = a->getType();
+                    }
+                }
+                auto* temp = AllocaAtEntry(refTy, nullptr, "ctor.refarg");
                 builder->CreateStore(a, temp);
                 a = temp;
             }
@@ -13170,7 +13202,8 @@ const LLVMBackend::CxxClassInfo::Structor* LLVMBackend::FindCxxMoveCtor(const st
  */
 const LLVMBackend::CxxClassInfo::Structor* LLVMBackend::SelectCxxConstructor(
         const std::string& typeName, const std::vector<TypeAndValue>& argTypes,
-        std::string& why, bool allowNumericConversions) const
+        std::string& why, bool allowNumericConversions,
+        const std::vector<NamedVariable>* argVars) const
 {
         const CxxClassInfo* info = GetCxxClassInfo(typeName);
         if (info == nullptr) { why = "has no imported constructors"; return nullptr; }
@@ -13201,6 +13234,13 @@ const LLVMBackend::CxxClassInfo::Structor* LLVMBackend::SelectCxxConstructor(
             if (want.Pointer && !got.Pointer && want.IsAlias && !want.ElemPointer
                 && want.TypeName == got.TypeName && dataStructures.count(want.TypeName) != 0)
                 return true;                  // a C++ class const-reference accepts a value
+            // A reference to a PRIMITIVE is an indirect pointer at this stage; an lvalue of
+            // exactly that type binds it (`HasRef(int&)` called with an `int` variable). An
+            // rvalue reference is excluded: `optional<int>(in_place_t, int&&)` must not take it.
+            if (want.Pointer && !got.Pointer && want.IsAlias && !want.IsRvalueRef
+                && !want.ElemPointer && !got.ElemPointer && want.TypeName == got.TypeName
+                && dataStructures.count(want.TypeName) == 0)
+                return true;
             // A scalar C++ reference is represented as an indirect pointer at this stage, but
             // an ordinary pointer parameter is not a numeric conversion target. Without the
             // reference check, an integer index could select std::string(const char*) over size_t.
@@ -13279,6 +13319,13 @@ const LLVMBackend::CxxClassInfo::Structor* LLVMBackend::SelectCxxConstructor(
                     sameType = true;
                 bool copyRef = (c.isCopyCtor || c.isMoveCtor) && sameType;
                 if (!copyRef && !compatible(want, got)) { ok = false; break; }
+                // A reference to a PRIMITIVE needs an ADDRESSABLE argument: a literal has none,
+                // and binding one would hand the callee a pointer into a dead temporary.
+                if (want.Pointer && !got.Pointer && (want.IsAlias || want.IsRvalueRef)
+                    && !want.ElemPointer && dataStructures.count(want.TypeName) == 0
+                    && argVars != nullptr && i < argVars->size()
+                    && (*argVars)[i].Storage == nullptr)
+                { ok = false; break; }
             }
             if (!ok) continue;
             if (verbose)

@@ -281,6 +281,16 @@
 //                       template's; each of these was refused with "no imported C++ header
 //                       declares 'std::vector'". Test/errors/err_cpp_nested_missing.cb pins the
 //                       diagnostic for an argument that genuinely is not declared.
+//   Section M102 (1950-1969): a C++ CONSTRUCTOR parameter declared `T&` binds
+//                       the ARGUMENT's address. Every argument shape (a named local, `*ptr`, a
+//                       CFlat struct field, an array element, `new T(*p)`), a `const T&` given
+//                       an lvalue and a prvalue temporary, a reference DATA MEMBER that must
+//                       alias the argument, a scalar `int&` parameter, a NON-COPYABLE referent,
+//                       and std.lock_guard / std.unique_lock over a CFlat-owned std.mutex
+//                       proved by try_lock. Each leg asserts the referent's value AFTER the
+//                       constructed object was destroyed. Every one of them received a bitwise
+//                       `%ctor.refarg` stack COPY, so the ctor's writes were lost and the dtor
+//                       wrote through a dangling pointer.
 //   Section M98 (1870-1883, range 1870-1889): array ELEMENTS of a C++ class are
 //                       default-CONSTRUCTED - `T[N] a = default;`, no initializer, `= {}`, two
 //                       dimensions, a nontrivial ctor with a TRIVIAL dtor, a polymorphic element
@@ -355,6 +365,8 @@ import cpp "library/cpp_interop_stdfn.h" cache;
 import cpp "library/cpp_interop_nest.h" cache;
 import cpp "library/cpp_interop_nest2.h" cache;
 import cpp "memory" cache;
+// Section M102: a C++ CONSTRUCTOR parameter declared `T&` binds the argument's address.
+import cpp "library/cpp_interop_ctorref.h" cache;
 import "list.cb";
 import "thread.cb";
 import "malloc_allocator.cb";
@@ -362,6 +374,9 @@ import "malloc_allocator.cb";
 // M98: CFlat structs whose FIELD is a fixed array of a C++ class - `= default`, and a non-empty
 // brace list over an element with a trivial and with a nontrivial destructor.
 struct M98Host { cppa.Trk[2] cells = default; };
+
+// M102: a CFlat struct field of C++ class type, used as a ctor `T&` argument.
+struct M102Host { cppcr.Cnt cell = default; };
 struct M98H5 { cppa.CtorOnly[2] cells = { v = 1 }; };
 struct M98H6 { cppa.Trk[2] cells = { v = 1 }; };
 
@@ -4777,6 +4792,124 @@ extern int main()
         m101pv.push_back(&m101one);
         if (m101pv[0]->b != 3)                                           return 1944;
     }
+    // ---- Section M102: a C++ ctor parameter `T&` binds the argument's address (1950-1969) ----
+    // Controls: the free and member `Cnt&` paths already passed the address; they pin that the
+    // constructor fix did not disturb them.
+    cppcr.Cnt m102c = cppcr.make_cnt(0);
+    cppcr.Mem m102m = cppcr.Mem();
+    if (cppcr.by_ref_free(m102c) != 100 || m102c.v != 100
+        || m102m.bump(m102c) != 1100 || m102c.v != 1100)                 return 1950;
+
+    // A named local lvalue: the ctor's `c.v += 1` lands while the Setter lives, the dtor's
+    // `p->v += 10` after it dies. Both went to a `%ctor.refarg` stack copy before the fix.
+    int m102seen = 0;
+    cppcr.Cnt m102a = cppcr.make_cnt(0);
+    {
+        cppcr.Setter m102s = cppcr.Setter(m102a);
+        m102seen = m102a.v;
+    }
+    if (m102seen != 1 || m102a.v != 11)                                  return 1951;
+
+    // A dereferenced pointer.
+    cppcr.Cnt* m102p = &m102a;
+    m102a.v = 0;
+    {
+        cppcr.Setter m102s2 = cppcr.Setter(*m102p);
+        m102seen = m102a.v;
+    }
+    if (m102seen != 1 || m102a.v != 11)                                  return 1952;
+
+    // A CFlat struct FIELD.
+    M102Host m102h = default;
+    m102h.cell.v = 0;
+    {
+        cppcr.Setter m102s3 = cppcr.Setter(m102h.cell);
+        m102seen = m102h.cell.v;
+    }
+    if (m102seen != 1 || m102h.cell.v != 11)                             return 1953;
+
+    // An ARRAY ELEMENT - and the neighbouring element must be untouched.
+    cppcr.Cnt[2] m102arr = default;
+    m102arr[1].v = 0;
+    {
+        cppcr.Setter m102s4 = cppcr.Setter(m102arr[1]);
+        m102seen = m102arr[1].v;
+    }
+    if (m102seen != 1 || m102arr[1].v != 11 || m102arr[0].v != 0)        return 1954;
+
+    // The HEAP form `new T(*p)` uses the same constructor-argument lowering.
+    m102a.v = 0;
+    cppcr.Setter* m102n = new cppcr.Setter(*m102p);
+    m102seen = m102a.v;
+    delete m102n;
+    if (m102seen != 1 || m102a.v != 11)                                  return 1955;
+
+    // `const T&` reads the argument, and still accepts a prvalue temporary.
+    m102a.v = 42;
+    cppcr.Reader m102r = cppcr.Reader(m102a);
+    if (m102r.get() != 42)                                               return 1956;
+    cppcr.Reader m102r2 = cppcr.Reader(cppcr.make_cnt(7));
+    if (m102r2.get() != 7)                                               return 1957;
+
+    // A reference DATA MEMBER must alias the argument: a later write to the argument is
+    // visible through the member, and a write through the member reaches the argument.
+    m102a.v = 3;
+    cppcr.RefMem m102rm = cppcr.RefMem(m102a);
+    m102seen = m102rm.get();
+    m102a.v = 9;
+    if (m102seen != 3 || m102rm.get() != 9)                              return 1958;
+    m102rm.bump();
+    if (m102a.v != 14)                                                   return 1959;
+
+    // A scalar `int&` parameter feeding a reference member.
+    int m102x = 5;
+    cppcr.HasRef m102hr = cppcr.HasRef(m102x);
+    m102seen = m102hr.get();
+    m102x = 9;
+    if (m102seen != 5 || m102hr.get() != 9)                              return 1960;
+
+    // A NON-COPYABLE referent: the bitwise copy that used to be made cannot exist in C++.
+    cppcr.NoCopy m102nc = cppcr.NoCopy();
+    {
+        cppcr.NoCopyUser m102u = cppcr.NoCopyUser(m102nc);
+        m102seen = m102nc.v;
+    }
+    if (m102seen != 1 || m102nc.v != 11)                                 return 1961;
+
+    // std.lock_guard / std.unique_lock over a CFlat-owned mutex: each guard locked a COPY, so
+    // try_lock inside the guarded scope still succeeded and there was no mutual exclusion.
+    std.mutex m102mx = default;
+    if (!m102mx.try_lock())                                              return 1962;
+    m102mx.unlock();
+    bool m102inside = false;
+    {
+        std.lock_guard<std.mutex> m102g = std.lock_guard<std.mutex>(m102mx);
+        m102inside = m102mx.try_lock();
+    }
+    if (m102inside)                                                      return 1963;
+    if (!m102mx.try_lock())                                              return 1964;
+    m102mx.unlock();
+    bool m102owns = false;
+    {
+        std.unique_lock<std.mutex> m102ul = std.unique_lock<std.mutex>(m102mx);
+        m102owns = m102ul.owns_lock();
+        m102inside = m102mx.try_lock();
+    }
+    if (!m102owns || m102inside)                                         return 1965;
+    if (!m102mx.try_lock())                                              return 1966;
+    m102mx.unlock();
+
+    // `const int&` given an integer LITERAL has no address to bind, so the materialized
+    // temporary must hold the REFERENT's width: a CFlat literal arrives as i8, and a 1-byte
+    // buffer read back as `int` printed garbage.
+    cppcr.ConstIntRef m102ci = cppcr.ConstIntRef(5);
+    if (m102ci.seen != 5)                                                return 1967;
+    cppcr.ConstIntRef m102ci2 = cppcr.ConstIntRef(300);
+    if (m102ci2.seen != 300)                                             return 1968;
+    // A NON-const `int&` still takes an addressable lvalue, and writes through it.
+    int m102lv = 41;
+    cppcr.IntRef m102ir = cppcr.IntRef(m102lv);
+    if (m102lv != 42 || m102ir.get() != 42)                              return 1969;
 
     return 0;
 }
