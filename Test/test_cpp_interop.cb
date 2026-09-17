@@ -200,6 +200,12 @@
 //                       same-type runs preserve their existing layout.
 //   Section M89 (1680-1685): unnamed zero-width C++ bitfields close an allocation unit under
 //                       both same-type and mixed-type neighbours; fields and sizeof agree with C++.
+//   Section M90 (1690-1709): initializing a local of a NONTRIVIAL C++ class from an lvalue that
+//                       is not a bare identifier - a dot field, an arrow field, a dereference,
+//                       a namespace-scope object and a vector element - must copy-CONSTRUCT.
+//                       Every leg reads a refcount or a heap string the source still owns, so a
+//                       bitwise store (the pre-fix lowering) shows up as a low use_count and a
+//                       double release.
 //   Section M84 (1590-1599): a CLASS-typed subscript index - a named std.string lvalue as a
 //                       std.map key (incremented twice, and not moved from), the same key
 //                       through find/count, a struct field and a dereferenced pointer as
@@ -605,6 +611,16 @@ void m78_bind_net(M78Net* net)
     net->left = net->register_child("left", std.make_shared<M78Leaf>(2));
     net->right = net->register_child("right", std.make_shared<M78Leaf>(3));
 }
+
+// M90: a plain CFlat struct whose fields are nontrivial C++ classes, so `box.p` / `bp->p` is a
+// field LVALUE used as a local's initializer. m90global covers the namespace-scope object leg.
+struct M90Box
+{
+    std.shared_ptr<M78Leaf> p = default;
+    std.string s = default;
+};
+
+std.shared_ptr<M78Leaf> m90global = default;
 
 struct M78Self : cppt.ModuleBase
 {
@@ -3769,7 +3785,9 @@ extern int main()
         if ((int)net->left.use_count() != 2) return 1547;
         std.shared_ptr<M78Leaf> handle = net->left;
         std.shared_ptr<M78Leaf> second = handle;
-        if ((int)handle.use_count() != 3) return 1548;
+        // 4 owners: children[0], net->left, handle, second. This read was 3 before the
+        // field-lvalue initializer was copy-CONSTRUCTED - `handle` had skipped the refcount.
+        if ((int)handle.use_count() != 4) return 1548;
         if (second.get()->forward(5) != 10) return 1549;
         if ((*second).value != 2) return 1550;
         std.shared_ptr<M78Leaf> fresh = std.make_shared<M78Leaf>(7);
@@ -3917,6 +3935,73 @@ extern int main()
     if (sizeof(cppi.M89ZeroDifferent) != cppi.m89_zero_different_size()) return 1683;
     if (m89different.first != cppi.m89_zero_different_first(&m89different)) return 1684;
     if (m89different.second != cppi.m89_zero_different_second(&m89different)) return 1685;
+    // ---- Section M90: copy-CONSTRUCT a C++ class local from a non-identifier lvalue (1690-1709)
+    // Every use_count leg below reads a refcount the SOURCE still owns. Pre-fix the initializer
+    // was a bitwise store, so each read was one low and the local's destructor released a
+    // reference it never acquired; the deref / global / element legs did not compile at all.
+    // Measured pre-fix: 1692 read 3, 1694 read 2, 1695 read 2, 1697 read 1, and the run then
+    // aborted in free() before 1707 (the heap-string field's buffer was released twice).
+    // 1690, 1691, 1693, 1696, 1702 are accept-set: they read the same value on both binaries
+    // and are here to pin the source values the failing legs are measured against.
+    cppt.reset_module_dtors();
+    {
+        std.shared_ptr<M78Leaf> seed = std.make_shared<M78Leaf>(6);
+        // Accept-set: a bare-identifier source already copy-constructed before this change.
+        std.shared_ptr<M78Leaf> alias = seed;
+        if ((int)seed.use_count() != 2)                 return 1690;
+        M90Box box = default;
+        box.p = seed;
+        if ((int)seed.use_count() != 3)                 return 1691;
+        {
+            std.shared_ptr<M78Leaf> fromDot = box.p;
+            if ((int)seed.use_count() != 4)             return 1692;
+            if (fromDot->forward(2) != 12)              return 1693;
+        }
+        if ((int)seed.use_count() != 3)                 return 1694;
+        M90Box* bp = &box;
+        {
+            std.shared_ptr<M78Leaf> fromArrow = bp->p;
+            if ((int)seed.use_count() != 4)             return 1695;
+            if (fromArrow->value != 6)                  return 1696;
+        }
+        if ((int)seed.use_count() != 3)                 return 1697;
+        std.shared_ptr<M78Leaf>* pp = &box.p;
+        {
+            std.shared_ptr<M78Leaf> fromDeref = *pp;
+            if ((int)seed.use_count() != 4)             return 1698;
+            if (fromDeref->forward(3) != 18)            return 1699;
+        }
+        std.vector<std.shared_ptr<M78Leaf>> vec = default;
+        vec.push_back(seed);
+        if ((int)seed.use_count() != 4)                 return 1700;
+        {
+            std.shared_ptr<M78Leaf> fromElem = vec[0];
+            if ((int)seed.use_count() != 5)             return 1701;
+            if (fromElem->value != 6)                   return 1702;
+        }
+        if ((int)seed.use_count() != 4)                 return 1703;
+        // A HEAP (non-SSO) string field: the pre-fix bitwise copy aliased the buffer and the
+        // local's destructor freed it, so the field read back below aborted in free().
+        std.string m90long = std.string("abcdefghijklmnopqrstuvwxyz0123456789");
+        box.s = m90long;
+        {
+            std.string fromField = box.s;
+            if ((int)fromField.size() != 36)            return 1704;
+        }
+        if ((int)box.s.size() != 36)                    return 1705;
+        if (cppt.m78_pick_string(box.s) != 56)          return 1706;
+    }
+    if (cppt.module_dtors() != 1)                       return 1707;
+
+    // A namespace-scope C++ object as the initializer. Kept last: the global holds its leaf for
+    // the rest of the program, so it must not be inside the destructor count above.
+    m90global = std.make_shared<M78Leaf>(9);
+    if ((int)m90global.use_count() != 1)                return 1708;
+    {
+        std.shared_ptr<M78Leaf> fromGlobal = m90global;
+        if ((int)m90global.use_count() != 2)            return 1709;
+        if (fromGlobal->forward(2) != 18)               return 1709;
+    }
 
     return 0;
 }

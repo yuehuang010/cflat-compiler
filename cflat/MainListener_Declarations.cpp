@@ -4189,6 +4189,24 @@ cxx_dtor_ready:
             }
             return true;
         }
+        /*
+         * A same-class LVALUE that is not a bare identifier - a field (`h.p`, `hp->p`), a
+         * dereference, or an element - reaches here with its address in Storage. Copy-CONSTRUCT
+         * from that address: storing the loaded bytes would add a second owner without running
+         * the copy constructor (a shared_ptr refcount never incremented, a string buffer aliased),
+         * and the slot's scope-exit destructor then releases a resource it never acquired.
+         */
+        if (compiler->lastCxxRetTemp_ == nullptr && rightNV.Storage != nullptr
+            && !rightNV.TypeAndValue.Pointer
+            && rightNV.TypeAndValue.TypeName == typeName
+            && compiler->IsForeignNontrivialCxxClass(typeName))
+        {
+            compiler->SetCurrentDebugLocation(line);
+            compiler->EmitCxxCopyOrMoveConstruct(typeName, slot, rightNV.Storage,
+                                                 /*useMove*/ false,
+                                                 std::format("into local '{}'", name).c_str());
+            return true;
+        }
         // Only the OUTERMOST call's temporary may be moved into the slot: a value assembled from
         // several call results (a PHI of two temporaries) is not that temporary.
         // An operator result reaches here as a bare struct value whose type name may be unset,
