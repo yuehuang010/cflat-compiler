@@ -68,6 +68,10 @@ RES="$OUT/results"
 # 240: test_cpp_interop cold-compiles in ~117 s standalone (every C++ type request re-runs
 # clang; see internal/issue/p2/cpp-interop-fixture-near-timeout.md). test.bat uses 600.
 TIMEOUT_SECS=240
+# test_cpp_interop alone: cold compile measured 197-237 s on 2026-09-16/17 under suite load, so it
+# gets its own budget instead of raising the global one (same issue file).
+HEAVY_TIMEOUT_SECS=480
+HEAVY_TESTS=" test_cpp_interop "
 
 # GNU coreutils timeout: `timeout` on Linux, `gtimeout` on macOS (brew coreutils).
 # Fall back to no wrapper if neither exists so tests still run (just unbounded).
@@ -162,6 +166,8 @@ run_cb() {
   local log="$RES/$n.log" status t0; t0=$(now_ms)
   local -a xargs_cb=()
   read -r -a xargs_cb <<< "$(cb_extra_args "$f")"
+  local TIMEOUT="$TIMEOUT"
+  case "$HEAVY_TESTS" in *" $n "*) TIMEOUT="${TIMEOUT/$TIMEOUT_SECS/$HEAVY_TIMEOUT_SECS}" ;; esac
   if [ "$RUN_MODE" -eq 1 ]; then
     if $TIMEOUT "$CFLAT" "$f" -i "$LIB" --locale-dir "$LOCALE_DIR" \
         ${xargs_cb[@]+"${xargs_cb[@]}"} --run --nologo >"$log" 2>&1; then

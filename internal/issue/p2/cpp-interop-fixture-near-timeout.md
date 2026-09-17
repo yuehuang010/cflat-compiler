@@ -90,3 +90,7 @@ Fixture warm is 16 s (was 45 s); cold stays ~100-130 s. Remaining cold lever is 
 per group per stage (~60 s bound, 276 requests / 530 stage runs). Timeout stays 240 s.
 Lever 2 (synthesized `__cflat_user` group has no cache clause) and lever 3 (PCH prune policy) are
 still open and are the next warm items on Windows.
+
+## Update 2026-09-17
+
+Cold compile in the suite measured 197-237 s (M88-M100 sections added since 09-16), one busy core from the 240 s global timeout; two worktree suite runs showed spurious "FAIL compile" from it. Stopgap: test.sh gives test_cpp_interop its own HEAVY_TIMEOUT_SECS=480 budget (HEAVY_TESTS list) while the global stays 240. The real levers are unchanged: batching type requests per group in the pre-pass, or splitting the fixture by theme with a maintainer ruling.
