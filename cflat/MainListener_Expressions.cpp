@@ -8842,6 +8842,16 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
         if (llvm::isa<llvm::PHINode>(lvalue)) lhsStorage = nullptr;
         if (rvalue != nullptr && llvm::isa<llvm::PHINode>(rvalue)) rhsStorage = nullptr;
 
+        // A C++ right operand keeps the left literal as the `char*` a C++ free operator is
+        // declared over; wrapping it would offer only CFlat 'string' candidates.
+        auto isCxxRecordValue = [&](llvm::Value* value) {
+            if (value == nullptr || !value->getType()->isStructTy()) return false;
+            auto* st = llvm::cast<llvm::StructType>(value->getType());
+            if (st->isLiteral() || !st->hasName()) return false;
+            return compiler->IsCxxRecord(st->getName().str());
+        };
+        bool lhsStringLiteral = false;
+
         // If the LHS is a string literal (ptr to global constant), wrap it
         // as a %string struct so operator+(string, ...) can match.
         if (lvalue->getType()->isPointerTy())
@@ -8849,7 +8859,12 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
             if (auto* c = llvm::dyn_cast<llvm::Constant>(lvalue))
             {
                 if (compiler->stringLiteralLenByPtr.count(c))
-                    lvalue = compiler->WrapStringLiteralAsString(lvalue);
+                {
+                    if (isCxxRecordValue(rvalue))
+                        lhsStringLiteral = true;
+                    else
+                        lvalue = compiler->WrapStringLiteralAsString(lvalue);
+                }
             }
         }
 
@@ -9087,6 +9102,19 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
 
         if (ty->isPointerTy())
         {
+            // An unwrapped left literal against a C++ right operand: its only candidates are the
+            // free operators of that operand's namespace, which the struct paths below never see.
+            // Nothing bound there -> wrap after all and re-enter, so an operator that stays
+            // unmatched keeps the CFlat 'string' diagnostic and its candidate list. This runs
+            // BEFORE the pointer-LHS path, which reports a struct RHS as a pointer misuse.
+            if (lhsStringLiteral)
+            {
+                if (llvm::Value* freeResult = tryFreeOperator()) return freeResult;
+                return TryBinaryOperatorOverload(
+                    compiler->WrapStringLiteralAsString(lvalue), op, rvalue, ctx, lhsElemType,
+                    rhsPointerDepth, rhsElemPointer, lhsStorage, rhsStorage, reportMissing,
+                    allowReversed);
+            }
             if (auto* bound = TryPointerLhsOperatorOverload(lvalue, op, rvalue, ctx, lhsElemType))
                 return bound;
             if (llvm::Value* rewritten = tryRewrites()) return rewritten;
@@ -9223,13 +9251,24 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
             {
                 // If the RHS is a string literal (ptr to global constant), wrap it
                 // as a %string struct so operator+(string, string) can match.
+                /*
+                 * A C++ receiver is the exception: its operators are declared over `const char*`,
+                 * and a CFlat `string` argument can never rank against one. Keep the literal as
+                 * the `char*` it is and flag it, exactly as an ordinary C++ call argument does,
+                 * so the shared char*-literal ranking in CreateOverloadedFunctionCall applies.
+                 */
                 if (auto* c = llvm::dyn_cast<llvm::Constant>(rvalue))
                 {
                     if (compiler->stringLiteralLenByPtr.count(c))
                     {
-                        rightNV.Primary  = compiler->WrapStringLiteralAsString(rvalue);
-                        rightNV.BaseType = rightNV.Primary->getType();
-                        rightNV.TypeAndValue.TypeName = "string";
+                        if (compiler->IsCxxRecord(typeName))
+                            rightNV.IsStringLiteral = true;
+                        else
+                        {
+                            rightNV.Primary  = compiler->WrapStringLiteralAsString(rvalue);
+                            rightNV.BaseType = rightNV.Primary->getType();
+                            rightNV.TypeAndValue.TypeName = "string";
+                        }
                     }
                 }
                 // A recorded operand depth is the only thing that survives the reduction to a raw

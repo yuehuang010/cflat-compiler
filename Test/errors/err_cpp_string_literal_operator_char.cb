@@ -1,0 +1,21 @@
+// A string literal binds a C++ operator declared over 'const char*', but must NOT bind one
+// declared over 'char': that would be a pointer silently narrowed to a character.
+import cpp "cpp_interop_strop.h";
+
+expect_error("no overload of 'operator+=' matches the given arguments") {
+    int lit_into_char_param()
+    {
+        cppsop.CharParam cp = cppsop.CharParam();
+        cp += "ab";
+        return cp.n();
+    }
+}
+
+extern int main()
+{
+    // The accepted spelling: a 'char' literal does bind the 'char' operator.
+    cppsop.CharParam ok = cppsop.CharParam();
+    ok += 'a';
+    if (ok.n() != 1) return 1;
+    return 0;
+}

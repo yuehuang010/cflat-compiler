@@ -223,6 +223,14 @@
 //   Section M81 (1640-1658): C++ member ref-qualifiers preserve lvalue/rvalue receiver
 //                       selection for assignment, fields, dereferences, elements, calls,
 //                       temporaries, explicit move, and null-conditional forwarding.
+//   Section M94 (1790-1805): a CFlat string LITERAL as the operand of a C++ operator - it is
+//                       the 'char*' it lowers to, not a CFlat 'string', so it binds
+//                       'operator+=(const char*)' on std.string and on a user class, picks the
+//                       char* leg over the std::string one, reaches a free operator on either
+//                       side of the class operand, and still refuses a 'char' parameter
+//                       (Test/errors/err_cpp_string_literal_operator_char.cb). The char* local,
+//                       std.map literal key, char literal and CFlat-native string legs are
+//                       controls that behaved identically before the fix.
 //   Section M91 (1710-1715): a C++ namespace whose declarations ALL name a std:: specialization
 //                       (parameter, return by value, nested namespace) is registered even
 //                       though binding those signatures is deferred to first use; nsstd_mix is
@@ -269,6 +277,7 @@ import cpp "functional" cache;
 import cpp "library/cpp_interop_throw.h" cache;
 import cpp "library/cpp_interop_scoped_enum.h" cache;
 import cpp "library/cpp_interop_nsstd.h" cache;
+import cpp "library/cpp_interop_strop.h" cache;
 import "list.cb";
 import "thread.cb";
 import "malloc_allocator.cb";
@@ -4201,6 +4210,56 @@ extern int main()
     if (m95TwiceStatic<int>(5) != 10) return 1827;
     if (m95TwiceStatic<double>(1.5) != 3.0) return 1828;
     if (m95RankStatic<float>() != 7) return 1829;
+    // ---- Section M94: a string LITERAL as a C++ operator operand (1790-1805) --------------
+    // Pre-fix every literal leg below reported "no overload of 'operator...' matches the given
+    // arguments" with the matching char* candidate listed, because the literal was wrapped as a
+    // CFlat 'string' before the candidates were ranked.
+    std.string m94s = std.string("hello");
+    m94s += " world";
+    if ((int)m94s.size() != 11) return 1790;
+    m94s += "!";
+    if ((int)m94s.size() != 12) return 1791;
+
+    // Both a char* and a std::string overload are declared: C++ picks char* for a literal.
+    cppsop.Acc m94a = cppsop.Acc();
+    m94a += "hello";
+    if (m94a.tag() != 1) return 1792;
+    if (m94a.n() != 5) return 1793;
+    // Control: a CHAR literal keeps selecting the 'char' leg, before and after the fix.
+    m94a += 'z';
+    if (m94a.tag() != 3) return 1794;
+    if (m94a.n() != 6) return 1795;
+
+    cppsop.CharOnly m94c = cppsop.CharOnly();
+    m94c += "abc";
+    if (m94c.n() != 3) return 1796;
+    if (!(m94c == "xyz")) return 1797;
+    if (m94c == "ab") return 1798;
+
+    // FREE operators: the literal on the right, then on the left (the +100 leg proves which
+    // free overload ran rather than an operand swap).
+    cppsop.Free m94f = cppsop.Free();
+    cppsop.Free m94g = m94f + "hello";
+    if (m94g.n() != 5) return 1799;
+    if (!(m94g == "world")) return 1800;
+    cppsop.Free m94h = "hello" + m94f;
+    if (m94h.n() != 105) return 1801;
+
+    // Controls that behaved identically pre-fix: a char* local, a literal std.map key, and
+    // the CFlat-native string operators the literal wrap exists for.
+    char* m94p = " world";
+    std.string m94s2 = std.string("hello");
+    m94s2 += m94p;
+    if ((int)m94s2.size() != 11) return 1802;
+
+    std.map<std.string, int> m94m = std.map<std.string, int>();
+    m94m["k"] = 5;
+    if (m94m["k"] != 5) return 1803;
+
+    string m94cs = "ab";
+    m94cs += "cd";
+    if (m94cs.length() != 4) return 1804;
+    if (m94cs != "abcd") return 1805;
 
     return 0;
 }

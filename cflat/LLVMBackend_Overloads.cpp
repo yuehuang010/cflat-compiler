@@ -1661,6 +1661,18 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
             {
                 const auto& arg = arguments[i];
                 std::string typeName = arg.TypeAndValue.TypeName;
+                // A string literal argument carries no CFlat type name. Spell the 'char*' it
+                // actually is instead of the lowered 'ptr' its machine type prints as.
+                auto* argConstant = llvm::dyn_cast_or_null<llvm::Constant>(arg.Primary);
+                if (typeName.empty()
+                    && (arg.IsStringLiteral
+                        || (argConstant != nullptr && IsStringLiteralConstant(argConstant))))
+                {
+                    msg += std::format("    [{}] char* {}\n", i,
+                        arg.TypeAndValue.VariableName.empty()
+                            ? std::string("<unnamed>") : arg.TypeAndValue.VariableName);
+                    continue;
+                }
                 if (typeName.empty() && arg.BaseType)
                 {
                     std::string typeStr;
