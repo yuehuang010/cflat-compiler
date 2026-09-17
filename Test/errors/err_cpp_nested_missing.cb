@@ -1,0 +1,25 @@
+// A template ARGUMENT no imported header declares. The request for the outer template fails in
+// every candidate group, and the last-resort message used to claim the OUTER name was undeclared
+// ("no imported C++ header declares 'std::vector'") even though <vector> is imported and
+// std.vector<nest.Cell> binds in the same program. The message now names the argument that is
+// actually missing. The discriminator is the quoted name: 'nest::Missing', not 'std::vector'.
+// The reject leg comes FIRST on purpose: once a std.vector request succeeds, the template's
+// owning group is memoized, the candidate list collapses to one and the single-candidate arm
+// reports that group's own clang error instead of this last-resort one.
+import cpp "vector" cache;
+import cpp "memory" cache;
+import cpp "cpp_interop_nest.h" cache;
+
+extern int main()
+{
+    expect_error("no imported C++ header declares 'nest::Missing', a template argument of 'std::vector<nest::Missing>'") {
+        std.vector<nest.Missing> bad = default;
+    }
+
+    // The accept half: the same outer template over a DECLARED class of the same user group
+    // binds and runs, so the rejection above is not a blanket refusal of the spelling.
+    std.vector<nest.Cell> ok = default;
+    ok.push_back(nest.Cell(4, 5));
+    if (ok[0].a != 4) return 1;
+    return 0;
+}

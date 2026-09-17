@@ -5193,6 +5193,11 @@ private:
                                        std::string& error);
     bool RequestCxxOperatorArrow(const std::string& typeName, std::string& error);
     std::vector<size_t> CandidateCxxGroupsFor(const std::string& cxxBase);
+    void CollectCxxTypeOwnerGroups(const std::string& cflatTypeName,
+                                   std::vector<size_t>& groups,
+                                   std::unordered_set<std::string>& visited) const;
+    bool FirstUnownedCxxComponent(const std::string& cflatTypeName,
+                                  std::string& outSpelling) const;
     bool TryBindCxxFunction(const std::string& functionName);
     void RememberCxxMangledArity(const std::string& cflatName, const std::string& cxxSpelling) const;
     bool CxxSignatureTypesRegistered(const CSigEntry& entry);

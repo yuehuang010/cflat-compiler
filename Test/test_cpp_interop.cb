@@ -273,6 +273,14 @@
 //                       same signatures that section M7f already covered. Every member position
 //                       was refused ("takes/returns unsupported type") while the free-function
 //                       parameter one bound.
+//   Section M101 (1930-1944, range 1930-1949): a std container whose element is a std
+//                       specialization over a USER class - vector<vector<Cell>>,
+//                       vector<shared_ptr<Cell>>, both map positions, three levels deep, and a
+//                       map naming classes from TWO user headers. The request must union the
+//                       owning group of every class nested at any depth, not just the outer
+//                       template's; each of these was refused with "no imported C++ header
+//                       declares 'std::vector'". Test/errors/err_cpp_nested_missing.cb pins the
+//                       diagnostic for an argument that genuinely is not declared.
 //   Section M98 (1870-1883, range 1870-1889): array ELEMENTS of a C++ class are
 //                       default-CONSTRUCTED - `T[N] a = default;`, no initializer, `= {}`, two
 //                       dimensions, a nontrivial ctor with a TRIVIAL dtor, a polymorphic element
@@ -342,6 +350,11 @@ import cpp "library/cpp_interop_arrayelem.h";
 import cpp "library/cpp_interop_usingns.h" cache;
 // Section M100: std::function as a MEMBER parameter and as a RETURN type.
 import cpp "library/cpp_interop_stdfn.h" cache;
+// Section M101: std containers over std specializations over USER classes. Neither header
+// includes a standard header, so no single group can declare both halves on its own.
+import cpp "library/cpp_interop_nest.h" cache;
+import cpp "library/cpp_interop_nest2.h" cache;
+import cpp "memory" cache;
 import "list.cb";
 import "thread.cb";
 import "malloc_allocator.cb";
@@ -4701,6 +4714,69 @@ extern int main()
     // Test/errors/err_cpp_std_function_nested.cb.
     cppfn.CtorRef m100cr = cppfn.CtorRef(std.function<int(int)>(m100_twice));
     if (m100cr.v() != 4)                                                 return 1925;
+
+    // ---- Section M101: std containers over std specializations over USER classes (1930-1949) --
+    /*
+     * Every declaration here names a class (nest::Cell, nest2::Tag) whose header declares no std
+     * template, nested inside a std specialization inside another std template. The request has
+     * to compile against the union of the outer template's group AND the groups owning every
+     * class nested at any depth; unioning only the direct argument's group refused all of these.
+     */
+    {
+        std.vector<std.vector<nest.Cell>> m101v = default;
+        std.vector<nest.Cell> m101inner = default;
+        m101inner.push_back(nest.Cell(8, 9));
+        m101v.push_back(m101inner);
+        if ((int)m101v.size() != 1)                                      return 1930;
+        if ((int)m101v[0].size() != 1)                                   return 1931;
+        if (m101v[0][0].a != 8)                                          return 1932;
+        if (m101v[0][0].sum() != 17)                                     return 1933;
+    }
+    {
+        std.vector<std.shared_ptr<nest.Cell>> m101s = default;
+        std.shared_ptr<nest.Cell> m101p = default;
+        m101s.push_back(m101p);
+        if ((int)m101s.size() != 1)                                      return 1934;
+        if (m101s[0].get() != nullptr)                                   return 1935;
+    }
+    {
+        // The user class in the SECOND map argument, then in the FIRST.
+        std.map<int, std.shared_ptr<nest.Cell>> m101m = default;
+        std.shared_ptr<nest.Cell> m101mp = default;
+        m101m[3] = m101mp;
+        if ((int)m101m.size() != 1)                                      return 1936;
+        if (m101m[3].get() != nullptr)                                   return 1937;
+
+        std.map<std.shared_ptr<nest.Cell>, int> m101k = default;
+        std.shared_ptr<nest.Cell> m101key = default;
+        m101k[m101key] = 42;
+        if ((int)m101k.size() != 1)                                      return 1938;
+        if (m101k[m101key] != 42)                                        return 1939;
+    }
+    {
+        // Three levels, and a map naming user classes from TWO different headers.
+        std.vector<std.vector<std.shared_ptr<nest.Cell>>> m101d = default;
+        std.vector<std.shared_ptr<nest.Cell>> m101di = default;
+        m101d.push_back(m101di);
+        if ((int)m101d.size() != 1)                                      return 1940;
+        if ((int)m101d[0].size() != 0)                                   return 1941;
+
+        std.map<std.shared_ptr<nest.Cell>, std.shared_ptr<nest2.Tag>> m101two = default;
+        if ((int)m101two.size() != 0)                                    return 1942;
+    }
+    {
+        // A USER class template over a user class inside a std container, and a pointer element:
+        // both already bound, and the widened union must not disturb them.
+        std.vector<nest.Box<nest.Cell>> m101b = default;
+        nest.Box<nest.Cell> m101box = default;
+        m101b.push_back(m101box);
+        if (m101b[0].tag() != 7)                                         return 1943;
+
+        nest.Cell m101one = nest.Cell(2, 3);
+        std.vector<nest.Cell*> m101pv = default;
+        m101pv.push_back(&m101one);
+        if (m101pv[0]->b != 3)                                           return 1944;
+    }
 
     return 0;
 }

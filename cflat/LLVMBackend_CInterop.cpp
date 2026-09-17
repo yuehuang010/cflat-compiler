@@ -3805,6 +3805,10 @@ std::vector<std::pair<std::string, std::string>> LLVMBackend::RetryTentativeCxxT
             if (generatedSource.empty()) continue;
 
             std::vector<size_t> dependencies(dependencyGroups.begin(), dependencyGroups.end());
+            // Same union as the first request: an argument nested at any depth keeps its own header.
+            std::unordered_set<std::string> visitedArgs;
+            for (const std::string& argument : arguments)
+                CollectCxxTypeOwnerGroups(argument, dependencies, visitedArgs);
             CxxRequestGroup group = MakeCxxRequestGroup(ownerIt->second, dependencies);
             CxxRequestGroupScope groupScope(*this, &group);
             std::string error;
@@ -8856,6 +8860,57 @@ bool LLVMBackend::DecodeCxxIncompleteTemplateError(const std::string& error,
         return !spelling.empty() && !typeName.empty();
 }
 
+/*
+ * Owning import groups of every C++ class named ANYWHERE in a requested spelling. A nested
+ * specialization (`std::vector<std::shared_ptr<user::C>>`) is owned by the group of its OUTER
+ * template, so only this recursive union brings `user::C`'s own header into the outer request.
+ */
+void LLVMBackend::CollectCxxTypeOwnerGroups(const std::string& cflatTypeName,
+                                            std::vector<size_t>& groups,
+                                            std::unordered_set<std::string>& visited) const
+{
+        std::string type = cflatTypeName;
+        while (!type.empty() && (type.back() == '*' || type.back() == ' ')) type.pop_back();
+        if (type.empty() || !visited.insert(type).second) return;
+        if (auto owner = cxxTypeOwnerGroup_.find(type);
+            owner != cxxTypeOwnerGroup_.end()
+            && owner->second < cxxImportGroups_.size()
+            && !cxxImportGroups_[owner->second].headers.empty()
+            && std::find(groups.begin(), groups.end(), owner->second) == groups.end())
+            groups.push_back(owner->second);
+        TypeSpelling parsed;
+        if (!DemangleType(*this, type, parsed) || parsed.args.empty()) return;
+        CollectCxxTypeOwnerGroups(parsed.base, groups, visited);
+        for (const TypeSpelling& arg : parsed.args)
+            CollectCxxTypeOwnerGroups(MangleType(*this, arg), groups, visited);
+}
+
+/*
+ * The first nested class-typed component of a requested spelling that no import group owns - the
+ * type a failed request is actually missing, as opposed to the outer template everyone can see.
+ */
+bool LLVMBackend::FirstUnownedCxxComponent(const std::string& cflatTypeName,
+                                           std::string& outSpelling) const
+{
+        TypeSpelling parsed;
+        if (!DemangleType(*this, cflatTypeName, parsed)) return false;
+        for (const TypeSpelling& arg : parsed.args)
+        {
+            if (arg.value) continue;
+            std::string name = MangleType(*this, arg);
+            while (!name.empty() && (name.back() == '*' || name.back() == ' ')) name.pop_back();
+            if (name.empty()) continue;
+            if (FirstUnownedCxxComponent(name, outSpelling)) return true;
+            if (name.find('.') == std::string::npos) continue;
+            if (cxxTypeOwnerGroup_.count(name) != 0 || IsCxxForeignTypeRegistered(name)
+                || !ResolveEnumTypeName(name).empty())
+                continue;
+            if (!CxxSpellingForCflatType(name, outSpelling)) outSpelling = name;
+            return true;
+        }
+        return false;
+}
+
 bool LLVMBackend::RequestCxxType(const std::string& baseName, const std::vector<std::string>& typeArgs,
                                  const std::string& cflatName, std::string& error)
 {
@@ -8913,16 +8968,9 @@ bool LLVMBackend::RequestCxxType(const std::string& baseName, const std::vector<
         while ((bpos = cxxBase.find('.', bpos)) != std::string::npos)
         { cxxBase.replace(bpos, 1, "::"); bpos += 2; }
         std::vector<size_t> deps;
+        std::unordered_set<std::string> visitedArgs;
         for (const std::string& arg : typeArgs)
-        {
-            std::string elem = arg;
-            while (!elem.empty() && (elem.back() == '*' || elem.back() == ' ')) elem.pop_back();
-            if (auto owner = cxxTypeOwnerGroup_.find(elem);
-                owner != cxxTypeOwnerGroup_.end()
-                && owner->second < cxxImportGroups_.size()
-                && !cxxImportGroups_[owner->second].headers.empty())
-                deps.push_back(owner->second);
-        }
+            CollectCxxTypeOwnerGroups(arg, deps, visitedArgs);
         for (size_t group : generatedDependencyGroups)
             if (std::find(deps.begin(), deps.end(), group) == deps.end()) deps.push_back(group);
         const bool ok = RequestCxxTypeInOwningGroup(cxxBase, cflatName, spelling, deps, error,
@@ -8981,7 +9029,12 @@ bool LLVMBackend::RequestCxxTypeInOwningGroup(const std::string& cxxBase,
         llvm::TimeTraceScope groupScope("CxxRequestGroup", spelling + " -> unresolved");
         std::string names;
         for (size_t i = 0; i < tried.size(); ++i) names += (i ? ", '" : "'") + tried[i] + "'";
-        error = std::format("no imported C++ header declares '{}' - tried {}", cxxBase, names);
+        std::string missing;
+        if (FirstUnownedCxxComponent(cflatName, missing))
+            error = std::format("no imported C++ header declares '{}', a template argument of "
+                                "'{}' - tried {}", missing, spelling, names);
+        else
+            error = std::format("no imported C++ header declares '{}' - tried {}", cxxBase, names);
         cxxForeignRequests_[cflatName] = error;
         return false;
     }
