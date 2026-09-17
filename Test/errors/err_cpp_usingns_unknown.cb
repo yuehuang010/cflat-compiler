@@ -1,0 +1,14 @@
+// A name that exists through NO using-directive must be diagnosed, not searched forever. With a
+// directive nominating a namespace nested in the nominating one, the candidate walk grew without
+// bound, so this lookup hung the compiler instead of reporting the missing member.
+import cpp "cpp_interop_usingns.h";
+
+extern int main()
+{
+    expect_error("'no_such_name' is not a member of namespace 'cppu_nest'") {
+        long bad = cppu_nest.no_such_name();
+    }
+    // Accept set: the member that IS reachable through the directive still resolves and runs.
+    if (cppu_nest.helper() != 7) return 1;
+    return 0;
+}

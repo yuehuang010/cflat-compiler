@@ -1247,6 +1247,14 @@ bool LLVMBackend::IsImportAliasMember(const std::string& alias, const std::strin
 bool LLVMBackend::IsDataStructure(const std::string& name) const
 { return dataStructures.count(name) > 0; }
 
+// Safety net for the using-directive worklists below: a hang with no output is the worst
+// failure mode a compiler has, so an unbounded search reports the name instead of spinning.
+// Scaled by the directive count so a long but legitimate directive chain never trips it.
+static size_t UsingDirectiveWorklistCap(size_t directiveCount)
+{
+        return 4096 + 8 * directiveCount;
+}
+
 std::string LLVMBackend::ResolveNamespace(const std::string& name) const
 {
         for (const auto& frame : std::ranges::reverse_view(stackNamedVariable))
@@ -1260,12 +1268,16 @@ std::string LLVMBackend::ResolveNamespace(const std::string& name) const
         // A using-directive can expose a nested namespace through a parent namespace, as in
         // `namespace torch { using namespace at; }` followed by `torch::indexing::Slice`.
         if (name.find('.') == std::string::npos) return name;
-        std::vector<std::string> pending{ name };
+        // A rewrite may only fire at or past the end of the head the previous rewrite wrote
+        // (headEnd). Otherwise a directive that nominates its own child re-matches its own
+        // output forever: `namespace N { using namespace detail; }` gives N.x -> N.detail.x -> ...
+        std::vector<std::pair<std::string, size_t>> pending{ { name, size_t{0} } };
         std::unordered_set<std::string> visited{ name };
         for (size_t i = 0; i < pending.size(); ++i)
         {
-            const std::string current = pending[i];  // by value: push_back below may reallocate pending
-            for (size_t prefixEnd = current.size(); prefixEnd != std::string::npos; )
+            const std::string current = pending[i].first;  // by value: push_back below may reallocate pending
+            const size_t headEnd = pending[i].second;
+            for (size_t prefixEnd = current.size(); prefixEnd != std::string::npos && prefixEnd >= headEnd; )
             {
                 const std::string prefix = current.substr(0, prefixEnd);
                 auto directive = cxxUsingDirectives_.find(prefix);
@@ -1277,7 +1289,14 @@ std::string LLVMBackend::ResolveNamespace(const std::string& name) const
                             && (namespaceTable.count(candidate) != 0
                                 || namespaceAliasTable.count(candidate) != 0))
                             return candidate;
-                        if (visited.insert(candidate).second) pending.push_back(candidate);
+                        if (!visited.insert(candidate).second) continue;
+                        if (pending.size() >= UsingDirectiveWorklistCap(cxxUsingDirectives_.size()))
+                        {
+                            LogError(std::format("could not resolve '{}' through using-directives: "
+                                "the candidate list passed {} entries", name, UsingDirectiveWorklistCap(cxxUsingDirectives_.size())));
+                            return name;
+                        }
+                        pending.emplace_back(candidate, nominated.size());
                     }
                 if (prefixEnd == 0) break;
                 const size_t dot = current.rfind('.', prefixEnd - 1);
@@ -1446,13 +1465,17 @@ std::string LLVMBackend::ResolveThroughUsingDirectives(
 
         const std::string namespaceName = qualified.substr(0, dot);
         const std::string memberName = qualified.substr(dot + 1);
-        std::vector<std::string> pending{ namespaceName };
+        // Same head-progress rule as ResolveNamespace: a rewrite may only fire at or past the
+        // end of the head the previous rewrite wrote, or a directive nominating its own child
+        // rewrites its own output forever.
+        std::vector<std::pair<std::string, size_t>> pending{ { namespaceName, size_t{0} } };
         std::unordered_set<std::string> visited{ namespaceName };
         std::vector<std::string> hits;
         for (size_t i = 0; i < pending.size(); ++i)
         {
-            const std::string current = pending[i];  // by value: push_back below may reallocate pending
-            for (size_t prefixEnd = current.size(); prefixEnd != std::string::npos; )
+            const std::string current = pending[i].first;  // by value: push_back below may reallocate pending
+            const size_t headEnd = pending[i].second;
+            for (size_t prefixEnd = current.size(); prefixEnd != std::string::npos && prefixEnd >= headEnd; )
             {
                 const std::string prefix = current.substr(0, prefixEnd);
                 auto it = cxxUsingDirectives_.find(prefix);
@@ -1465,8 +1488,15 @@ std::string LLVMBackend::ResolveThroughUsingDirectives(
                         if (predicate(candidate)
                             && std::find(hits.begin(), hits.end(), candidate) == hits.end())
                             hits.push_back(candidate);
-                        if (visited.insert(nominatedNamespace).second)
-                            pending.push_back(nominatedNamespace);
+                        if (!visited.insert(nominatedNamespace).second) continue;
+                        if (pending.size() >= UsingDirectiveWorklistCap(cxxUsingDirectives_.size()))
+                        {
+                            LogError(std::format("could not resolve '{}' through using-directives: "
+                                "the candidate list passed {} entries", qualified,
+                                UsingDirectiveWorklistCap(cxxUsingDirectives_.size())));
+                            return qualified;
+                        }
+                        pending.emplace_back(nominatedNamespace, nominated.size());
                     }
                 if (prefixEnd == 0) break;
                 const size_t dot = current.rfind('.', prefixEnd - 1);

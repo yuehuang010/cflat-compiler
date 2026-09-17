@@ -274,6 +274,13 @@
 //                       zeroinitializer. Test/errors/err_cpp_array_no_default_ctor.cb pins the
 //                       deleted-default-constructor refusal, including through the brace and
 //                       short-tail spellings.
+//   Section M99 (1890-1909): C++ using-directives. A directive whose nominated namespace is
+//                       NESTED INSIDE the nominating one (one level and two, plus the member
+//                       reached through it) rewrote its own output forever and hung the
+//                       compiler; the accept set around it - sibling nomination, a two-hop
+//                       chain, a cycle resolved from both ends, and a namespace nominating
+//                       itself - must still resolve. Test/errors/err_cpp_usingns_unknown.cb
+//                       pins the diagnostic for a name that exists through no directive.
 import cpp "library/cpp_interop_basic.h" cache;
 import cpp "library/cpp_interop_basic.cpp" cache;
 // Section M6: inheritance and virtual dispatch. Definitions are out-of-line on purpose - every
@@ -309,6 +316,8 @@ import cpp "library/cpp_interop_field.h" cache;
 // Section M98: array elements of a C++ class. Imported WITHOUT the header cache so the section
 // does not depend on cache state.
 import cpp "library/cpp_interop_arrayelem.h";
+// Section M99: using-directives, including ones nominating a namespace nested in the nominator.
+import cpp "library/cpp_interop_usingns.h" cache;
 import "list.cb";
 import "thread.cb";
 import "malloc_allocator.cb";
@@ -4544,6 +4553,22 @@ extern int main()
         if (cppa.ctor_count() == 2 && m98o.cells[0].v == 1 && m98o.cells[1].v == 1) m98ok = 1;
     }
     if (m98ok != 1 || cppa.dtor_count() != 2) return 1883;
+
+    // ---- Section M99: C++ using-directives and name resolution through them (1890-1909) ----
+    // Legs 1890-1894 hung the compiler before the head-progress rule: the directive's nominated
+    // namespace starts with the key it is stored under, so every rewrite grew the candidate.
+    if (cppu_nest.detail.helper() != 7) return 1890;
+    if (cppu_nest.helper() != 7) return 1891;
+    if (cppu_nest.via_using() != 17) return 1892;
+    if (cppu_deep.mid.inner.helper2() != 9) return 1893;
+    if (cppu_deep.via_using2() != 29) return 1894;
+    // The rest are the accept set the progress rule must not cut off: sibling, chain, cycle
+    // (both directions) and a namespace that nominates itself.
+    if (cppu_sib.b.helper3() != 11) return 1895;
+    if (cppu_chain_a.helper4() != 13) return 1896;
+    if (cppu_cyc_a.helper6() != 19) return 1897;
+    if (cppu_cyc_b.helper5() != 17) return 1898;
+    if (cppu_self.via_using7() != 123) return 1899;
 
     return 0;
 }
