@@ -1577,9 +1577,12 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                             !refusal.empty())
                                             LogErrorContext(ctx, refusal);
                                         else
+                                            // The owner may be a C++ class-template
+                                            // specialization; name it in source spelling.
                                             LogErrorContext(ctx, std::format(
                                                 "'{}' is not a member of namespace '{}'.",
-                                                memberName, namespaceName));
+                                                memberName, SpellType(*Compiler(ctx),
+                                                    LLVMBackend::TypeAndValue{ .TypeName = namespaceName })));
                                     }
                                 }
                             }

@@ -1517,3 +1517,48 @@ namespace cppt
     inline M81RefqMethods m81_make_methods(int value) noexcept
     { return M81RefqMethods(value); }
 }
+
+namespace cppt
+{
+    // M95 - STATIC members of a class TEMPLATE, reached through the qualified
+    // specialization spelling `cppt.M95Stat<int>.member`.
+    template <class T>
+    struct M95Stat
+    {
+        static int rank() noexcept { return 7; }
+        static T twice(T v) noexcept { return v + v; }
+        static T combine(T a, T b) noexcept { return a * 10 + b; }
+        static constexpr int kTag = 41;
+        static int counter;
+        T x;
+        M95Stat() noexcept : x(T()) {}
+    };
+    template <class T> int M95Stat<T>::counter = 0;
+
+    class M95Payload
+    {
+    public:
+        int v;
+        M95Payload() noexcept : v(0) {}
+        explicit M95Payload(int value) noexcept : v(value) {}
+    };
+
+    // Specialization over a user C++ class, and over another specialization.
+    template <class T>
+    struct M95Wrap
+    {
+        static int rank() noexcept { return 3; }
+        static int score(const T& t) noexcept { return t.v + 5; }
+        static int tally;
+    };
+    template <class T> int M95Wrap<T>::tally = 0;
+
+    template <class T>
+    struct M95Nest
+    {
+        static int depth() noexcept { return 2; }
+        static int fromInner(const T& t) noexcept { return t.x + 1; }
+    };
+
+    inline int m95_take(int v) noexcept { return v + 1000; }
+}

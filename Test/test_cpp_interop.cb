@@ -230,6 +230,13 @@
 //   Section M92 (1730-1749): qualified C++ class-template constructor temporaries in CFlat
 //                       call arguments, C++ free/member calls, returns, assignment RHS,
 //                       zero/two-argument constructors, nested specializations, and user types.
+//   Section M95 (1810-1829): STATIC members of a C++ class TEMPLATE reached through the
+//                       qualified specialization spelling - static methods with 0/1/2
+//                       arguments, a static data member read and written, a static
+//                       constexpr member, specializations over a primitive, a user C++
+//                       class and another specialization, the call in statement / argument
+//                       / condition position, a specialization instantiated ONLY by the
+//                       static call, and the spelling inside a CFlat generic body.
 // Section M: C++ interop - `import cpp` selects C++ mode; the extension is irrelevant (the
 // fixture header is a plain .h). The header supplies the declarations, the .cpp is compiled
 // by the host C++ driver and linked in. Both are needed: the header alone has no
@@ -321,6 +328,10 @@ int m92_take_nested(cppt.Box<cppt.Box<int>> value) { return value.get().get(); }
 int m92_take_nested2(cppt.Box<cppt.Box<cppt.Box<int>>> value) { return value.get().get().get(); }
 int m92_take_payload(cppt.Box<cppi.impl_detail.Payload> value) { return value.get().get(); }
 cppt.Box<int> m92_return_box(int value) { return cppt.Box<int>(value); }
+
+// M95 helpers: the qualified C++ specialization spelling formed from a CFlat generic's own T.
+T m95TwiceStatic<T>(T value) { return cppt.M95Stat<T>.twice(value); }
+int m95RankStatic<T>() { return cppt.M95Stat<T>.rank(); }
 
 // M9 helper: a std.string built and read in a second function - the specialization is requested
 // once for the whole compilation, not once per use site.
@@ -4156,6 +4167,40 @@ extern int main()
     if (m92decl.get() != 23) return 1747;
     if (cppt.make_box(cppt.Box<int>()).get().get() != 0) return 1748;
     if (m92_return_box(24).get() != 24) return 1749;
+
+    // ---- Section M95: static members of a C++ class TEMPLATE (1810-1829) ----------------
+    // Every leg goes through the qualified-specialization spelling `cppt.M95Stat<T>.member`.
+    // PRE-FIX (532e7bd0): each of these fails name lookup with
+    // "'M95Stat' is not a member of namespace 'cppt'."
+    cppt.M95Stat<int> m95declared = default;
+    if (m95declared.x != 0) return 1810;
+    if (cppt.M95Stat<int>.rank() != 7) return 1811;              // static method, 0 args
+    if (cppt.M95Stat<int>.twice(5) != 10) return 1812;           // 1 arg
+    if (cppt.M95Stat<int>.combine(4, 3) != 43) return 1813;      // 2 args
+    // No `M95Stat<double>` is declared anywhere: the static call alone instantiates it.
+    if (cppt.M95Stat<double>.rank() != 7) return 1814;
+    if (cppt.M95Stat<double>.twice(2.5) != 5.0) return 1815;
+    if (cppt.M95Stat<double>.combine(4.0, 3.0) != 43.0) return 1816;
+    // Static DATA member: read, write, and per-specialization storage.
+    if (cppt.M95Stat<int>.counter != 0) return 1817;
+    cppt.M95Stat<int>.counter = 9;
+    if (cppt.M95Stat<int>.counter != 9) return 1818;
+    if (cppt.M95Stat<float>.counter != 0) return 1819;
+    if (cppt.M95Stat<int>.kTag != 41) return 1820;               // static constexpr member
+    // Specialization over a user C++ class, and over another specialization.
+    cppt.M95Payload m95payload = cppt.M95Payload(6);
+    if (cppt.M95Wrap<cppt.M95Payload>.rank() != 3) return 1821;
+    if (cppt.M95Wrap<cppt.M95Payload>.score(m95payload) != 11) return 1822;
+    if (cppt.M95Nest<cppt.M95Stat<int>>.depth() != 2) return 1823;
+    if (cppt.M95Nest<cppt.M95Stat<int>>.fromInner(m95declared) != 1) return 1824;
+    // Call positions: as a C++ call argument, as a plain assignment statement.
+    if (cppt.m95_take(cppt.M95Stat<int>.rank()) != 1007) return 1825;
+    int m95assigned = cppt.M95Stat<int>.combine(1, 2);
+    if (m95assigned != 12) return 1826;
+    // The same spelling inside a CFlat generic body, on the body's own T.
+    if (m95TwiceStatic<int>(5) != 10) return 1827;
+    if (m95TwiceStatic<double>(1.5) != 3.0) return 1828;
+    if (m95RankStatic<float>() != 7) return 1829;
 
     return 0;
 }
