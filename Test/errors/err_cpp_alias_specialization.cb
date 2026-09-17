@@ -1,13 +1,17 @@
 // `std::ofstream` is an ALIAS of `basic_ofstream<char>`, and a type request spelled as an alias
 // carries no explicit instantiation, so the specialization used to arrive declaration-only and the
-// name was reported as "cannot find the type 'std.ofstream'". The name now resolves; the local is
-// still refused, by the virtual-base constructor guard - that move is what this test pins.
+// name was reported as "cannot find the type 'std.ofstream'". The name resolves now, and the local
+// CONSTRUCTS (the virtual-base constructor goes through a placement-new thunk). What this test
+// pins is that the alias reaches the specialization's own MEMBER SURFACE: only a fully resolved
+// basic_ofstream<char> knows its copy constructor is deleted. A declaration-only arrival fails
+// earlier, with the type-not-found wording, which is the discriminator for the original defect.
 import cpp "fstream";
 
 extern int main()
 {
-    expect_error("has no default constructor cflat can call") {
+    expect_error("its copy constructor is deleted") {
         std.ofstream m83stream = default;
+        std.ofstream m83copy = m83stream;
     }
     return 0;
 }

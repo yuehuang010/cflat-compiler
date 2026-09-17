@@ -86,7 +86,9 @@
 //                       `OpsSink << FreeOps`, whose left operand lives in another namespace.
 //   Section M36 (820-823): C++ rvalue receiver lifetime handoff, bool bitfield packing, and
 //                       inherited constructors forwarded through operator->.
-//   Section M41 (1000-1025): virtual members whose vtable SLOT cflat cannot name. The fixed
+//   Section M41 (1000-1048): virtual members whose vtable SLOT cflat cannot name, and the
+//                       CONSTRUCTION of a class with virtual bases through a placement-new thunk.
+//                       The fixed
 //                       covariant return and virtual-base destructor use clang-synthesized thunks;
 //                       adjacent guards pin the existing base-record fallback and exact by-value
 //                       resource counts.
@@ -193,7 +195,7 @@
 //                       global-scope object, header-only constants that need their own storage,
 //                       and a write through a mutable one. Test/errors/err_cpp_namespace_const_
 //                       assign.cb covers the rejected writes.
-//   Section M87 (1615-1633): imported mixed-type C++ bitfields follow Itanium allocation units;
+//   Section M87 (1660-1678): imported mixed-type C++ bitfields follow Itanium allocation units;
 //                       overflow still splits, short/int and bool/int use the widest unit, and
 //                       same-type runs preserve their existing layout.
 //   Section M84 (1590-1599): a CLASS-typed subscript index - a named std.string lvalue as a
@@ -512,6 +514,9 @@ struct M84Bag { int base; };
 int operator[](M84Bag* bag, M84Idx idx) { return bag->base + idx.v; }
 
 struct M84Holder { std.string name = default; };
+// M41: a C++ class with VIRTUAL BASES held as a CFlat struct FIELD. Pre-fix this
+// compiled and crashed on the first member call; the field was never constructed.
+struct M41Holder { cpppoly.VBaseArgs<int> a = default; };
 
 cppi.Tracked m77_free_ctor(int value)
 {
@@ -1404,6 +1409,82 @@ extern int main()
     delete m41v2;
     // DISCRIMINATOR: PRE probe exits 1025; delete leaves vbase_dtors at 0 without the thunk.
     if (cpppoly.vbase_dtors() != 1)              return 1025;
+
+    /*
+     * VIRTUAL-BASE CONSTRUCTION. Each constructor of such a class binds to a clang-emitted
+     * placement-new thunk, so clang - not cflat - passes the implicit most-derived flag / VTT.
+     * Legs marked DISCRIMINATOR are refused outright by the pre-fix binary ("has no default
+     * constructor cflat can call"); the GUARD legs are the accept-set the on-demand
+     * variadic-constructor wrapper already served and that must keep working.
+     */
+    // DISCRIMINATOR: PRE binary refuses this declaration; the dtor count proves one object.
+    cpppoly.reset_vbase_dtors();
+    {
+        cpppoly.VBaseUse<int> m41d = default;
+        if (m41d.t() != 107)                     return 1026;   // 7 + 100, through the vbase
+        if (m41d.u() != 9)                       return 1027;
+    }
+    if (cpppoly.vbase_dtors() != 1)              return 1028;
+
+    // GUARD: an explicit-argument constructor already worked through the wrapper path.
+    cpppoly.reset_vbase_dtors();
+    {
+        cpppoly.VBaseArgs<int> m41a = cpppoly.VBaseArgs<int>(5);
+        if (m41a.a() != 5)                       return 1029;
+        if (m41a.t() != 107)                     return 1030;
+        cpppoly.VBaseArgs<int> m41a2 = cpppoly.VBaseArgs<int>(11, 12);
+        if (m41a2.t() != 111)                    return 1031;
+        if (m41a2.a() != 12)                     return 1032;
+    }
+    if (cpppoly.vbase_dtors() != 2)              return 1033;
+
+    // DISCRIMINATOR: the DEFAULT constructor of a class that also declares others.
+    cpppoly.reset_vbase_dtors();
+    {
+        cpppoly.VBaseArgs<int> m41a3 = default;
+        if (m41a3.a() != 1)                      return 1034;
+    }
+    if (cpppoly.vbase_dtors() != 1)              return 1035;
+
+    // DISCRIMINATOR: TWO virtual bases. Both vbase subobjects must be reachable and adjusted.
+    cpppoly.reset_vbase_dtors();
+    {
+        cpppoly.VBaseDiamond<int> m41dm = default;
+        if (m41dm.t() != 13)                     return 1036;   // 3 + 10, first virtual base
+        if (m41dm.s() != 24)                     return 1037;   // 4 + 20, second virtual base
+        if (m41dm.d() != 5)                      return 1038;
+        cpppoly.VBaseDiamond<int> m41dm2 = cpppoly.VBaseDiamond<int>(9);
+        if (m41dm2.d() != 9)                     return 1039;
+    }
+    if (cpppoly.vbase_dtors() != 2)              return 1040;
+
+    // DISCRIMINATOR: a class DERIVING from one with virtual bases. The most-derived flag is 1
+    // for the complete object only, so the vbase is initialized exactly once.
+    cpppoly.reset_vbase_dtors();
+    {
+        cpppoly.VBaseDer<int> m41dr = default;
+        if (m41dr.t() != 102)                    return 1041;   // tv = 2, +100
+        if (m41dr.a() != 1003)                   return 1042;   // av = 3, +1000
+    }
+    if (cpppoly.vbase_dtors() != 2)              return 1043;   // ~VBaseDer then ~VBaseArgs
+
+    // DISCRIMINATOR: the HEAP spelling. PRE binary reports "has no constructor taking 1
+    // argument(s)" - the `new` site has no wrapper fallback, only the bound constructor list.
+    cpppoly.reset_vbase_dtors();
+    cpppoly.VBaseArgs<int>* m41h = new cpppoly.VBaseArgs<int>(5);
+    if (m41h.a() != 5)                           return 1044;
+    delete m41h;
+    if (cpppoly.vbase_dtors() != 1)              return 1045;
+
+    // DISCRIMINATOR: as a CFlat struct FIELD. The PRE binary compiles this and segfaults on the
+    // first member call, because the field is left unconstructed.
+    cpppoly.reset_vbase_dtors();
+    {
+        M41Holder m41f = default;
+        if (m41f.a.t() != 107)                   return 1046;
+        if (m41f.a.a() != 1)                     return 1047;
+    }
+    if (cpppoly.vbase_dtors() != 1)              return 1048;
 
     // ---- Section M7: header-only C++ (definition emission) (460-479) ----------------
     // Inline free function, and one that calls another inline function: 5*3 + 5*3 = 30.
@@ -3776,49 +3857,49 @@ extern int main()
     if (cppi_scope.deduceKind(cppi_scope.U1.u) != 1) return 1637;
     if (m82module.deduceKind(cppi_scope.U1.u) != 3) return 1638;
 
-    // ---- Section M87: target-aware C++ bitfield packing (1615-1633) ----------------
+    // ---- Section M87: target-aware C++ bitfield packing (1660-1678) ----------------
     cppi.M87Fit m87fit = default;
     m87fit.first = 0x54321;
     m87fit.second = 0x2aa;
     m87fit.third = 1;
-    if (sizeof(cppi.M87Fit) != cppi.m87_size_fit()) return 1615;
-    if (m87fit.first != cppi.m87_fit_first(&m87fit)) return 1616;
-    if (m87fit.second != cppi.m87_fit_second(&m87fit)) return 1617;
-    if (m87fit.third != cppi.m87_fit_third(&m87fit)) return 1618;
+    if (sizeof(cppi.M87Fit) != cppi.m87_size_fit()) return 1660;
+    if (m87fit.first != cppi.m87_fit_first(&m87fit)) return 1661;
+    if (m87fit.second != cppi.m87_fit_second(&m87fit)) return 1662;
+    if (m87fit.third != cppi.m87_fit_third(&m87fit)) return 1663;
 
     cppi.M87Overflow m87overflow = default;
     m87overflow.first = 0x54321;
     m87overflow.second = 0xabcde;
-    if (sizeof(cppi.M87Overflow) != cppi.m87_size_overflow()) return 1619;
-    if (m87overflow.first != cppi.m87_overflow_first(&m87overflow)) return 1620;
-    if (m87overflow.second != cppi.m87_overflow_second(&m87overflow)) return 1621;
+    if (sizeof(cppi.M87Overflow) != cppi.m87_size_overflow()) return 1664;
+    if (m87overflow.first != cppi.m87_overflow_first(&m87overflow)) return 1665;
+    if (m87overflow.second != cppi.m87_overflow_second(&m87overflow)) return 1666;
 
     cppi.M87ShortInt m87short = default;
     m87short.first = 61;
     m87short.middle = 0x155;
     m87short.last = 19;
-    if (sizeof(cppi.M87ShortInt) != cppi.m87_size_short_int()) return 1622;
-    if (m87short.first != cppi.m87_short_int_first(&m87short)) return 1623;
-    if (m87short.middle != cppi.m87_short_int_middle(&m87short)) return 1624;
-    if (m87short.last != cppi.m87_short_int_last(&m87short)) return 1625;
+    if (sizeof(cppi.M87ShortInt) != cppi.m87_size_short_int()) return 1667;
+    if (m87short.first != cppi.m87_short_int_first(&m87short)) return 1668;
+    if (m87short.middle != cppi.m87_short_int_middle(&m87short)) return 1669;
+    if (m87short.last != cppi.m87_short_int_last(&m87short)) return 1670;
 
     cppi.M87BoolInt m87bool = default;
     m87bool.ready = true;
     m87bool.value = 63;
     m87bool.done = true;
-    if (sizeof(cppi.M87BoolInt) != cppi.m87_size_bool_int()) return 1626;
-    if ((m87bool.ready ? 1 : 0) != cppi.m87_bool_int_ready(&m87bool)) return 1627;
-    if (m87bool.value != cppi.m87_bool_int_value(&m87bool)) return 1628;
-    if ((m87bool.done ? 1 : 0) != cppi.m87_bool_int_done(&m87bool)) return 1629;
+    if (sizeof(cppi.M87BoolInt) != cppi.m87_size_bool_int()) return 1671;
+    if ((m87bool.ready ? 1 : 0) != cppi.m87_bool_int_ready(&m87bool)) return 1672;
+    if (m87bool.value != cppi.m87_bool_int_value(&m87bool)) return 1673;
+    if ((m87bool.done ? 1 : 0) != cppi.m87_bool_int_done(&m87bool)) return 1674;
 
     cppi.M87Same m87same = default;
     m87same.first = 5;
     m87same.second = 17;
     m87same.third = 91;
-    if (sizeof(cppi.M87Same) != cppi.m87_size_same()) return 1630;
-    if (m87same.first != cppi.m87_same_first(&m87same)) return 1631;
-    if (m87same.second != cppi.m87_same_second(&m87same)) return 1632;
-    if (m87same.third != cppi.m87_same_third(&m87same)) return 1633;
+    if (sizeof(cppi.M87Same) != cppi.m87_size_same()) return 1675;
+    if (m87same.first != cppi.m87_same_first(&m87same)) return 1676;
+    if (m87same.second != cppi.m87_same_second(&m87same)) return 1677;
+    if (m87same.third != cppi.m87_same_third(&m87same)) return 1678;
 
     return 0;
 }

@@ -1,6 +1,7 @@
 // VIRTUAL inheritance is refused: the Itanium ABI reaches a virtual base through a VTT and a
 // vbase offset in the vtable, neither of which cflat models. The class stays an opaque shell -
-// legal to hold through a pointer, illegal to lay out, construct or name a member of.
+// legal to hold through a pointer, illegal to lay out or name a member of. A TEMPLATE
+// spelling is a sized blob instead, and IS constructible - see the note below.
 // Non-virtual inheritance and virtual DISPATCH are supported; see Test/test_c_interop.cb M6.
 import cpp "cpp_interop_poly.h";
 
@@ -11,12 +12,8 @@ extern int main()
         int v = m.mv;
     }
     // A TEMPLATE spelling is held as a sized blob, so the layout refusal above never fires and
-    // its members reach the binder. Its CONSTRUCTOR still cannot be called: every ABI passes an
-    // implicit most-derived argument (the MS is-most-derived flag, the Itanium VTT) that cflat
-    // does not, so a direct call would initialize the vbtable from a garbage register. The
-    // destructor stays callable through a thunk - see Section M41 of Test/test_cpp_interop.cb.
-    expect_error("has no default constructor cflat can call") {
-        cpppoly.VBaseUse<int> u = default;
-    }
+    // its members reach the binder. Its CONSTRUCTOR is now callable too, through a clang-emitted
+    // placement-new thunk - see Section M41 of Test/test_cpp_interop.cb - so no refusal is
+    // pinned for it here.
     return 0;
 }

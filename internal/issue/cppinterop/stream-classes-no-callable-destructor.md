@@ -26,16 +26,25 @@ sized blob - which is why the iostream hierarchy, and only spellings like it, hi
 
 ## What still blocks a stream local
 
-1. [`cpp-virtual-base-constructor-unreachable.md`](cpp-virtual-base-constructor-unreachable.md) -
-   the constructor of a class with virtual bases takes an implicit most-derived argument cflat
-   does not pass. This is now a clean refusal; before the guard it was a crash.
-2. [`stream-open-instantiation-error.md`](stream-open-instantiation-error.md) - `open`'s body is
-   emptied by an error clang reported during instantiation.
+Re-measured 2026-09-16 on macOS arm64 (libc++) after the virtual-base CONSTRUCTOR fix:
 
-Plus the two spike gaps that were always part of this story:
+1. ~~the constructor of a class with virtual bases~~ FIXED. The measured `basic_ofstream<char>`
+   and `ofstream` constructors now bind to clang-emitted placement-new thunks
+   (`cflat_cinterop::CxxCtorNeedsVbaseThunk` / `CxxVbaseCtorThunkName`), so clang supplies the
+   implicit most-derived flag / VTT. `std.basic_ofstream<char> f = default;` and
+   `std.ofstream f = default;` both compile and run.
+2. [`stream-open-instantiation-error.md`](stream-open-instantiation-error.md) - NOT reproduced on
+   this host. `f.open("scratch/x.txt"); f.write("hello", 5); f.close();` compiles, runs, and the
+   file contains `hello`; the destructor runs at scope exit. That issue was filed against the
+   MSVC STL, so keep it open until a Windows host re-measures it.
+
+So on macOS the acceptance below is behaviourally MET and only the assertion in
+`Test/test_cpp_interop.cb` is missing. That leg was deliberately left out of the virtual-base
+constructor change (out of scope) - write it, confirm on Windows, then delete this file.
+
+Plus the spike gap that was always part of this story:
 [`std-free-functions-and-globals-unreachable.md`](std-free-functions-and-globals-unreachable.md)
-(`std.cout`); the `std.ofstream` spelling half LANDED 2026-09-16 - the alias resolves and the
-refusal has moved to the virtual-base constructor guard.
+(`std.cout`). The `std.ofstream` spelling half LANDED 2026-09-16.
 
 ## Acceptance
 

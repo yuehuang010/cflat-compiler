@@ -3736,6 +3736,7 @@ std::string LLVMBackend::BuildCxxVirtualThunks(
         std::string src;
         std::set<std::string> emitted;
         unsigned recv = 0;
+        bool anyCtorThunk = false;
         for (const auto& rec : records)
         {
             // A record whose layout is refused keeps every instance member refused before the
@@ -3745,6 +3746,32 @@ std::string LLVMBackend::BuildCxxVirtualThunks(
             const std::string marker = "__cflat_vthk_recv" + std::to_string(recv);
             for (const auto& m : rec.members)
             {
+                /*
+                 * A CONSTRUCTOR of a class with virtual bases: a placement new inside the thunk
+                 * lets Clang pass the implicit most-derived flag / VTT, and it passes 1 there
+                 * because the thunk builds a COMPLETE object, never a base subobject.
+                 */
+                if (cflat_cinterop::CxxCtorNeedsVbaseThunk(rec, m) && !m.linkageName.empty())
+                {
+                    const std::string cname = cflat_cinterop::CxxVbaseCtorThunkName(m.linkageName);
+                    if (!emitted.insert(cname).second) continue;
+                    std::string params, args;
+                    for (size_t p = 1; p < m.paramTypes.size(); ++p)
+                    {
+                        if (p > 1) { params += ", "; args += ", "; }
+                        const std::string& t = m.paramTypes[p];
+                        const std::string a = "a" + std::to_string(p);
+                        params += t + " " + a;
+                        args += t.ends_with("&&") ? "static_cast<" + t + ">(" + a + ")"
+                              : t.ends_with("&")  ? a
+                                                  : "static_cast<" + t + "&&>(" + a + ")";
+                    }
+                    recordSrc += "extern \"C\" __attribute__((weak)) void " + cname + "("
+                               + marker + "* p" + (params.empty() ? "" : ", " + params)
+                               + ") { ::new ((void*)p) " + marker + "(" + args + "); }\n";
+                    anyCtorThunk = true;
+                    continue;
+                }
                 if (!m.isVirtual || m.linkageName.empty()) continue;
                 if (!CxxMemberNeedsVirtualThunk(m)) continue;
                 if (m.access != cflat_cinterop::AccessPublic || m.isDeleted || m.variadic) continue;
@@ -3781,6 +3808,8 @@ std::string LLVMBackend::BuildCxxVirtualThunks(
             src += "typedef " + rec.canonicalCtype + " " + marker + ";\n" + recordSrc;
             ++recv;
         }
+        // Placement new needs the <new> declaration; nothing else emitted here does.
+        if (anyCtorThunk) src = "\n#include <new>\n" + src;
         return src;
 }
 
@@ -9768,13 +9797,14 @@ void LLVMBackend::RegisterCxxClassMembers(const CRecordEntry& r, const std::stri
             }
             /*
              * A class with VIRTUAL BASES has an implicit extra CONSTRUCTOR argument in every ABI
-             * cflat targets - the MS is-most-derived flag, the Itanium VTT - and cflat passes
-             * neither, so a direct call would initialize the vbtable from whatever happened to be
-             * in that register. Refuse the constructor rather than emit a call that crashes; the
-             * destructor is reached through a synthesized thunk and stays callable, so such an
-             * object can still be built on the C++ side and released by cflat.
+             * cflat targets - the MS is-most-derived flag, the Itanium VTT - and a direct call
+             * passes neither. The extractor redirects such a constructor to a placement-new thunk
+             * (CxxCtorNeedsVbaseThunk / CxxVbaseCtorThunkName), which is recognizable by its
+             * linkage name. Anything that did NOT get one still has the raw symbol, so it stays
+             * refused rather than emitting a call that seeds the vbtable from a garbage register.
              */
-            if (m.kind == Member::Constructor && r.hasVirtualBases)
+            if (m.kind == Member::Constructor && r.hasVirtualBases
+                && !m.linkageName.starts_with(cflat_cinterop::kCxxVbaseCtorThunkPrefix))
             {
                 refuse("belongs to a class with virtual bases, whose constructor takes an implicit "
                        "most-derived argument cflat does not pass");

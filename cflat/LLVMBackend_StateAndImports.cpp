@@ -2580,7 +2580,9 @@ bool LLVMBackend::TryLoadCHeaderDiskCache(
         // v62 stores a bound global's mangled linkage name and const-ness, so a namespace-scope
         // C++ object survives a warm cache.
         // v63 carries C++ enum scopedness for conversion ranking.
-        if (version != 63) return cacheMiss("cache version");
+        // v64 binds the constructor of a class with virtual bases to its placement-new thunk,
+        // changing that member's cached linkage name and ABI.
+        if (version != 64) return cacheMiss("cache version");
 
         if (!expectedRequestKey.empty()
             && j.value("cxxRequestKey", std::string{}) != expectedRequestKey)
@@ -2804,7 +2806,7 @@ void LLVMBackend::WriteCHeaderDiskCache(
         if (ec) return;
 
         nlohmann::json j;
-        j["version"] = 63;
+        j["version"] = 64;
         j["mtime"]   = (int64_t)mtime.time_since_epoch().count();
         j["hash"]    = contentHash;
         j["ldw"]     = entry.longDoubleWidth;

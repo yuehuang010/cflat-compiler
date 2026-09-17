@@ -29,8 +29,8 @@ when declared `= default`; their constructor-call spelling does not (gap 4).
 | # | Issue | Blocks |
 |---|-------|--------|
 | 1 | [`std-free-functions-and-globals-unreachable.md`](std-free-functions-and-globals-unreachable.md) | all 21 `c*` headers, `algorithm`, `numeric`, `bit`, `limits`, `format`, `iostream` globals |
-| 2 | alias of a class-template specialization - LANDED 2026-09-16 (`std.ofstream` / `std.ostringstream` now resolve; the local is refused by the virtual-base constructor guard) | was: `std.ofstream`, `std.ostringstream` |
-| 3 | [`stream-classes-no-callable-destructor.md`](stream-classes-no-callable-destructor.md) (destructor half FIXED 2026-09-10; blocked now by [`cpp-virtual-base-constructor-unreachable.md`](cpp-virtual-base-constructor-unreachable.md) and [`stream-open-instantiation-error.md`](stream-open-instantiation-error.md)) | streams as locals; with 1+2, the whole iostream family |
+| 2 | alias of a class-template specialization - LANDED 2026-09-16 (`std.ofstream` / `std.ostringstream` now resolve; `std.ofstream` construction was measured on macOS) | was: `std.ofstream`, `std.ostringstream` |
+| 3 | [`stream-classes-no-callable-destructor.md`](stream-classes-no-callable-destructor.md) (destructor half FIXED 2026-09-10, constructor half FIXED 2026-09-16; on macOS only the test leg is missing, [`stream-open-instantiation-error.md`](stream-open-instantiation-error.md) stays open for MSVC) | streams as locals; with 1+2, the whole iostream family |
 | 4 | [`constrained-template-constructor-overload-resolution.md`](constrained-template-constructor-overload-resolution.md) | `complex`, `chrono`, `filesystem`, `tuple`, `optional`, `pair`, `regex`, `random` construction |
 | 5 | `lock` as a member name - LANDED `6f1981c` | was: `std.mutex.lock`, `std.shared_mutex.lock` |
 | 6 | [`range-for-over-cpp-container.md`](range-for-over-cpp-container.md) | `for (T x in c)` over every C++ container - PARKED 2026-09-09 by maintainer ruling, awaiting a protocol decision (size/`[]` vs begin/end vs both) |

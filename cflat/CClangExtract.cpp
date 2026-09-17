@@ -205,6 +205,24 @@ namespace cflat_cinterop
         return m.kind == RawCxxMember::Destructor && m.vtableIndex < 0;
     }
 
+    /*
+     * A CONSTRUCTOR of a class with virtual bases takes an implicit extra argument in every ABI
+     * cflat targets (the MS is-most-derived flag, the Itanium VTT) that arrangeCXXMethodType does
+     * not surface, so a direct call would seed the vbtable from a garbage register. Route it
+     * through a placement-new thunk instead and let Clang supply the argument. Deliberately
+     * narrow: only a constructor cflat would otherwise bind directly is redirected. One that
+     * already goes through the on-demand wrapper path (a constructor template, an inherited
+     * variadic) is left alone - that path is a placement new too and is already correct.
+     */
+    bool CxxCtorNeedsVbaseThunk(const RawRecord& rec, const RawCxxMember& m)
+    {
+        if (m.kind != RawCxxMember::Constructor || !rec.hasVirtualBases) return false;
+        if (!rec.layoutRefusal.empty() || rec.canonicalCtype.empty()) return false;
+        if (m.access != AccessPublic || m.isDeleted || m.variadic) return false;
+        if (m.requiresConstructorWrapper || !m.bindRefusal.empty()) return false;
+        return !m.paramTypes.empty();   // no `this` slot: not a real constructor arrangement
+    }
+
     bool SplitStdFunctionSpelling(const std::string& spelling, std::string& ret,
                                   std::string& params)
     {
@@ -3045,10 +3063,10 @@ namespace cflat_cinterop
          * was emitted, so nothing here can turn an unbindable member into a wrong call.
          */
         void BindCxxVirtualThunk(ExtractState& st, ASTContext& ctx,
-                                 clang::CodeGen::CodeGenModule& cgm, RawCxxMember& m)
+                                 clang::CodeGen::CodeGenModule& cgm, RawCxxMember& m,
+                                 const std::string& name)
         {
             using namespace clang::CodeGen;
-            const std::string name = CxxVirtualThunkName(m.linkageName);
             const FunctionDecl* thunk = nullptr;
             for (NamedDecl* nd : ctx.getTranslationUnitDecl()->lookup(
                      DeclarationName(&ctx.Idents.get(name))))
@@ -3067,9 +3085,10 @@ namespace cflat_cinterop
             m.covariantReturnNeedsAdjust = false;
             m.vtableIndex = -1;
             m.vtableIndexDeleting = -1;
-            // The thunk destroys the complete object and never releases storage, whatever the
-            // structor ABI would have done with a returned 'this'.
-            if (m.kind == RawCxxMember::Destructor) { m.retType = "void"; m.returnsThis = false; }
+            // The thunk constructs or destroys the complete object in place and returns nothing,
+            // whatever the structor ABI would have done with a returned 'this'.
+            if (m.kind == RawCxxMember::Destructor || m.kind == RawCxxMember::Constructor)
+            { m.retType = "void"; m.returnsThis = false; }
             // Prove the thunk is a DEFINITION in the companion module the way every other
             // synthesized helper is proved, instead of trusting that the request source compiled.
             m.needsLocalDefinition = true;
@@ -3184,9 +3203,12 @@ namespace cflat_cinterop
                     continue;   // arrangement disagrees with the exported signature: refuse it
                 m.abi = std::move(abi);
 
-                // Slot unusable and no fallback path to the member: hand the dispatch to the
-                // thunk Clang generated for it.
-                if (CxxMemberNeedsVirtualThunk(m)) BindCxxVirtualThunk(st, ctx, cgm, m);
+                // Slot unusable and no fallback path to the member, or an implicit most-derived
+                // argument cflat cannot pass: hand it to the thunk Clang generated for it.
+                if (CxxMemberNeedsVirtualThunk(m))
+                    BindCxxVirtualThunk(st, ctx, cgm, m, CxxVirtualThunkName(m.linkageName));
+                else if (CxxCtorNeedsVbaseThunk(rec, m))
+                    BindCxxVirtualThunk(st, ctx, cgm, m, CxxVbaseCtorThunkName(m.linkageName));
             }
         }
 

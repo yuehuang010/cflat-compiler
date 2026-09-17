@@ -143,4 +143,6 @@ namespace cpppoly
     int vbase_dtors() noexcept { return g_vbase_dtors; }
     VBaseUse<int>* make_vbase_use() noexcept { return new VBaseUse<int>(); }
     void destroy_vbase_use(VBaseUse<int>* p) noexcept { delete p; }
+    VBaseSide::~VBaseSide() noexcept {}
+    int VBaseSide::s() const noexcept { return sv; }
 }

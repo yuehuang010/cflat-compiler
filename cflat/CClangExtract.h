@@ -45,6 +45,29 @@ namespace cflat_cinterop
         return out;
     }
 
+    struct RawRecord;
+
+    // True for a constructor cflat can only reach through a clang-emitted placement-new thunk:
+    // its class has VIRTUAL BASES, so the real symbol takes an implicit most-derived argument.
+    bool CxxCtorNeedsVbaseThunk(const RawRecord& rec, const RawCxxMember& m);
+
+    inline constexpr std::string_view kCxxVbaseCtorThunkPrefix = "__cflat_vctor_";
+
+    /*
+     * Name of the extern "C" THUNK that constructs such a class. Its body is `::new (p) T(args)`,
+     * so Clang owns the implicit most-derived flag / VTT argument; cflat only calls the symbol.
+     * Keyed on the constructor's mangled name, so the request-source builder and the extractor
+     * derive the same name independently.
+     */
+    inline std::string CxxVbaseCtorThunkName(const std::string& linkageName)
+    {
+        std::string out(kCxxVbaseCtorThunkPrefix);
+        for (char c : linkageName)
+            out += (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+                       || c == '_' ? c : '_';
+        return out;
+    }
+
     // One parameter's (or the result's) ABI arrangement as Clang computed it, spelled without a
     // single clang type so the backend can consume it and the caches can round-trip it. `kind`
     // mirrors clang::CodeGen::ABIArgInfo::Kind; coerceType/paddingType are LLVM IR type TEXT

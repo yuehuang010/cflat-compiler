@@ -300,4 +300,45 @@ namespace cpppoly
     };
     VBaseUse<int>* make_vbase_use() noexcept;
     void destroy_vbase_use(VBaseUse<int>* p) noexcept;
+
+    /*
+     * Constructor axes for a class with virtual bases. cflat reaches every one of these through
+     * the placement-new thunk, which is what makes clang pass the implicit most-derived flag /
+     * VTT argument. A SECOND virtual base and a class DERIVING from one are separate shapes:
+     * the flag must be 1 only for the complete object, which the thunk's `new` expression owns.
+     */
+    struct VBaseSide { virtual ~VBaseSide() noexcept; virtual int s() const noexcept; int sv; };
+
+    template <class T>
+    struct VBaseArgs : virtual VBaseTop
+    {
+        VBaseArgs() noexcept : av(1) { tv = 7; }
+        explicit VBaseArgs(int a) noexcept : av(a) { tv = 7; }
+        VBaseArgs(int a, int b) noexcept : av(b) { tv = a; }
+        ~VBaseArgs() noexcept override { note_vbase_dtor(); }
+        int t() const noexcept override { return tv + 100; }
+        virtual int a() const noexcept { return av; }
+        T av;
+    };
+
+    template <class T>
+    struct VBaseDiamond : virtual VBaseTop, virtual VBaseSide
+    {
+        VBaseDiamond() noexcept : dv(5) { tv = 3; sv = 4; }
+        explicit VBaseDiamond(int d) noexcept : dv(d) { tv = 3; sv = 4; }
+        ~VBaseDiamond() noexcept override { note_vbase_dtor(); }
+        int t() const noexcept override { return tv + 10; }
+        int s() const noexcept override { return sv + 20; }
+        virtual int d() const noexcept { return dv; }
+        T dv;
+    };
+
+    template <class T>
+    struct VBaseDer : VBaseArgs<T>
+    {
+        VBaseDer() noexcept : VBaseArgs<T>(2, 3) { }
+        explicit VBaseDer(int x) noexcept : VBaseArgs<T>(x, x + 1) { }
+        ~VBaseDer() noexcept override { note_vbase_dtor(); }
+        int a() const noexcept override { return this->av + 1000; }
+    };
 }
