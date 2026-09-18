@@ -115,6 +115,14 @@
 //     two-hop chain, a cycle resolved from both ends, and a namespace nominating itself -
 //     must still resolve. Test/errors/err_cpp_usingns_unknown.cb pins the diagnostic for a
 //     name that exists through no directive.
+//   C++ FREE OPERATOR TEMPLATES. libc++ declares every std.string binary operator as a free
+//     function template over basic_string, so none was published or instantiated for concrete
+//     operands: `+ == != < > <= >=` are covered for string/string, string/literal and
+//     literal/string, with the result used as an initializer, as a condition, as a C++ call
+//     argument and read back byte-wise. cpp_interop_freeoptpl.h repeats the shape in a header
+//     the fixture owns (a class template with tagged free operator templates, a second one
+//     declaring only == and <=> so the relational forms are C++20 rewrites, two
+//     specializations, and a plain class with NON-template free operators as the accept set).
 
 import cpp "library/cpp_interop_basic.h" cache;
 import cpp "library/cpp_interop_basic.cpp" cache;
@@ -143,6 +151,8 @@ import "cpp_interop_globals.cb";
 import cpp "library/cpp_interop_usingns.h" cache;
 // A C++ CONSTRUCTOR parameter declared `T&` binds the argument's address.
 import cpp "library/cpp_interop_ctorref.h" cache;
+import cpp "library/cpp_interop_freeoptpl.h" cache;
+import cpp "string" cache;
 import "list.cb";
 import "thread.cb";
 import "malloc_allocator.cb";
@@ -2349,5 +2359,94 @@ extern int main()
     // also fails if a global_dtors/atexit entry were ever added.
     if (cppa.gdtor_count() != 0)                                               return 2161;
 
+    // ---- C++ FREE OPERATOR TEMPLATES ------------------------------------------------------
+    // libc++ declares every basic_string binary operator as a free FUNCTION TEMPLATE over
+    // basic_string<CharT, Traits, Alloc>. Pre-fix none was published or instantiated for a
+    // concrete operand pair, so every leg here failed to compile: "no operator 'X' for type
+    // 'std.string'", or "no overload of 'operator+' matches the given arguments" when the left
+    // operand was a literal.
+    std.string fopA = std.string("hello");
+    std.string fopB = std.string(" world");
+    std.string fopCat = fopA + fopB;
+    char* fopCatP = fopCat.c_str();
+    if ((int)fopCat.size() != 11)                                              return 2100;
+    if (fopCatP[0] != 'h' || fopCatP[5] != ' ' || fopCatP[10] != 'd')          return 2101;
+    // A string LITERAL on either side reaches the `const CharT*` overloads of the same template.
+    std.string fopRight = fopA + " there";
+    char* fopRightP = fopRight.c_str();
+    if ((int)fopRight.size() != 11 || fopRightP[5] != ' ' || fopRightP[10] != 'e') return 2102;
+    std.string fopLeft = "say " + fopA;
+    char* fopLeftP = fopLeft.c_str();
+    if ((int)fopLeft.size() != 9 || fopLeftP[0] != 's' || fopLeftP[4] != 'h')  return 2103;
+    // Equality, both operand orders and both answers.
+    std.string fopSame = std.string("hello");
+    if (!(fopA == fopSame) || fopA == fopB)                                    return 2104;
+    if (fopA != fopSame || !(fopA != fopB))                                    return 2105;
+    if (!(fopA == "hello") || fopA == "hellp")                                 return 2106;
+    if (!("hello" == fopA) || "hellp" == fopA)                                 return 2107;
+    // The four relational operators. libc++ at C++20 declares only == and <=> for basic_string,
+    // so these are the REWRITTEN forms; the ordering arrives as a one-byte blob and is read by
+    // the spaceship rewrite. "hello" < " world" is false - ' ' (32) sorts below 'h' (104).
+    if (!(fopB < fopA) || fopA < fopB)                                         return 2108;
+    if (!(fopA > fopB) || fopB > fopA)                                         return 2109;
+    if (!(fopB <= fopA) || !(fopA <= fopSame) || fopA <= fopB)                 return 2110;
+    if (!(fopA >= fopB) || !(fopA >= fopSame) || fopB >= fopA)                 return 2111;
+    // The result of the operator used as a CONDITION, and passed to a C++ function.
+    int fopIf = 0;
+    if (fopA + fopB == std.string("hello world")) { fopIf = 7; }
+    if (fopIf != 7)                                                            return 2112;
+    std.string fopNum1 = std.string("1");
+    std.string fopNum2 = std.string("2");
+    if (std.stoi(fopNum1 + fopNum2) != 12)                                     return 2113;
+    // The compound MEMBER operator was already bound; it must stay bound (pre-fix: 5 / 4).
+    std.string fopPlusEq = std.string("hi");
+    fopPlusEq += " ho";
+    if ((int)fopPlusEq.size() != 5)                                            return 2114;
+    std.string fopPlusEq2 = std.string("hi");
+    fopPlusEq2 += fopNum1;
+    if ((int)fopPlusEq2.size() != 3)                                           return 2115;
+
+    // The same binding on a class template in a header the fixture owns, so the path is not
+    // std::string specific. Each cppfop operator adds its own tag to the result, so a leg tells
+    // WHICH overload C++ selected inside the generated wrapper.
+    cppfop.Box<int> fopBoxA = cppfop.Box<int>(10);
+    cppfop.Box<int> fopBoxB = cppfop.Box<int>(4);
+    if ((fopBoxA + fopBoxB).v() != 15)                                         return 2116;
+    if ((fopBoxA - fopBoxB).v() != 10)                                         return 2117;
+    // A SCALAR operand on either side, requested AFTER the class/class pair above: a wrapper is
+    // keyed on the operand pair, so the class/class one must not answer for these (it did while
+    // the wrapper registered under the shared "cppfop.operator+" name, returning tag 1).
+    if ((fopBoxA + 4).v() != 16)                                               return 2118;
+    if ((4 + fopBoxA).v() != 17)                                               return 2119;
+    // A second specialization of the same class template gets its own wrapper.
+    cppfop.Box<i64> fopBoxW = cppfop.Box<i64>(100);
+    cppfop.Box<i64> fopBoxX = cppfop.Box<i64>(7);
+    if ((int)(fopBoxW + fopBoxX).v() != 108 || (int)(fopBoxW - fopBoxX).v() != 97) return 2120;
+    if (fopBoxA == fopBoxB || !(fopBoxA == cppfop.Box<int>(10)))               return 2121;
+    if (!(fopBoxA != fopBoxB) || fopBoxA != cppfop.Box<int>(10))               return 2122;
+    if (fopBoxA < fopBoxB || !(fopBoxB < fopBoxA))                             return 2123;
+    if (!(fopBoxA > fopBoxB) || fopBoxB > fopBoxA)                             return 2124;
+    if (fopBoxA <= fopBoxB || !(fopBoxB <= fopBoxA))                           return 2125;
+    if (!(fopBoxA >= fopBoxB) || fopBoxB >= fopBoxA)                           return 2126;
+    // cppfop.Ord declares ONLY == and <=> as free templates: != and the four relational
+    // operators exist for it solely as C++20 rewrites over the instantiated <=>.
+    cppfop.Ord<int> fopOrdA = cppfop.Ord<int>(3);
+    cppfop.Ord<int> fopOrdB = cppfop.Ord<int>(9);
+    if (!(fopOrdA == cppfop.Ord<int>(3)) || fopOrdA == fopOrdB)                return 2127;
+    if (!(fopOrdA != fopOrdB) || fopOrdA != cppfop.Ord<int>(3))                return 2128;
+    if (!(fopOrdA < fopOrdB) || fopOrdB < fopOrdA)                             return 2129;
+    if (fopOrdA > fopOrdB || !(fopOrdB > fopOrdA))                             return 2130;
+    if (!(fopOrdA <= fopOrdB) || fopOrdB <= fopOrdA)                           return 2131;
+    if (fopOrdA >= fopOrdB || !(fopOrdB >= fopOrdA))                           return 2132;
+    // The operator result ASSIGNED into a live object of the same class.
+    cppfop.Box<int> fopAssign = cppfop.Box<int>(0);
+    fopAssign = fopBoxA + fopBoxB;
+    if (fopAssign.v() != 15)                                                   return 2133;
+    // ACCEPT SET: NON-template free operators bound before this change and are untouched by it.
+    cppfop.Nt fopNtA = cppfop.Nt(5);
+    cppfop.Nt fopNtB = cppfop.Nt(6);
+    if ((fopNtA + fopNtB).n() != 21)                                           return 2134;
+    if (fopNtA == fopNtB || !(fopNtA == cppfop.Nt(5)))                         return 2135;
+    if (!(fopNtA < fopNtB) || fopNtB < fopNtA)                                 return 2136;
     return 0;
 }

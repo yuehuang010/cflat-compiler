@@ -2652,7 +2652,9 @@ bool LLVMBackend::TryLoadCHeaderDiskCache(
         // has no alias pairs and carries a bindable signature for an immediate function.
         // v72 records `const` on a C++ reference parameter (IsCxxConstRef): an older cache
         // carries the flag as false, so an rvalue would not bind a `const T&` scalar parameter.
-        if (version != 73) return cacheMiss("cache version");
+        // v74 publishes FREE BINARY OPERATOR templates: an older cache has none, so a binary
+        // operator over a class template (every libc++ basic_string operator) finds no candidate.
+        if (version != 74) return cacheMiss("cache version");
 
         if (!expectedRequestKey.empty()
             && j.value("cxxRequestKey", std::string{}) != expectedRequestKey)
@@ -2884,9 +2886,9 @@ void LLVMBackend::WriteCHeaderDiskCache(
         // v70 maps a std::function return to its std.function specialization.
         // v71 harvests C++ namespace aliases and refuses a 'consteval' function.
         // v72 records `const` on a C++ reference parameter (IsCxxConstRef).
-        // v73 records an alias template's target base + argument pattern (catb/caa).
-        // v74 adds each alias template parameter's own default (cad).
-        j["version"] = 73;
+        // v73 records an alias template's target base, argument pattern and parameter defaults
+        // (catb/caa/cad). v74 publishes FREE BINARY OPERATOR templates.
+        j["version"] = 74;
         j["mtime"]   = (int64_t)mtime.time_since_epoch().count();
         j["hash"]    = contentHash;
         j["ldw"]     = entry.longDoubleWidth;

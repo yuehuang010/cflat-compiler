@@ -329,6 +329,29 @@ namespace cflat_cinterop
             return n;
         }
 
+        /*
+         * Enclosing-NAMESPACE-qualified name. A free operator is looked up by the namespace of
+         * its class operand ("std" for std.string), while libc++ declares some of its operators
+         * in the versioned inline namespace std::__1, some directly in std, and some as hidden
+         * friends inside the class. All three must answer to the same CFlat name, so inline
+         * namespaces and record scopes are both skipped and only named namespaces are kept.
+         */
+        std::string CxxEnclosingNamespaceName(const NamedDecl* d)
+        {
+            std::vector<std::string> parts;
+            for (const DeclContext* dc = d->getDeclContext();
+                 dc != nullptr && !dc->isTranslationUnit(); dc = dc->getParent())
+            {
+                const auto* ns = llvm::dyn_cast<NamespaceDecl>(dc);
+                if (ns == nullptr || ns->isInline()) continue;
+                if (ns->isAnonymousNamespace()) return std::string();
+                parts.push_back(ns->getNameAsString());
+            }
+            std::string out;
+            for (auto it = parts.rbegin(); it != parts.rend(); ++it) out += *it + ".";
+            return out + d->getNameAsString();
+        }
+
         // Clang spells an unnamed enclosing scope as "(anonymous namespace)", "(unnamed struct
         // ...)" or "f()::Local". Those collapse to a dotted name CFlat can neither parse nor
         // look up, and none of them is externally linkable, so the decl is dropped instead.
@@ -350,6 +373,29 @@ namespace cflat_cinterop
                 startOfComponent = false;
             }
             return !startOfComponent;
+        }
+
+        /*
+         * The BINARY operators CFlat has a spelling for, as a free (non-member) function. This
+         * mirrors the member operator set in the record walk: the binary-operator overload path
+         * looks a free operator up by its C++ source name ("operator+", "operator=="), so a
+         * published template is reachable with no new registration surface. Unary, subscript,
+         * call and conversion forms are member-only in CFlat and stay out.
+         */
+        bool IsBindableFreeBinaryOperator(OverloadedOperatorKind kind)
+        {
+            switch (kind)
+            {
+                case OO_Plus: case OO_Minus: case OO_Star: case OO_Slash: case OO_Percent:
+                case OO_EqualEqual: case OO_ExclaimEqual:
+                case OO_Less: case OO_Greater: case OO_LessEqual: case OO_GreaterEqual:
+                case OO_Spaceship:
+                case OO_LessLess: case OO_GreaterGreater:
+                case OO_Amp: case OO_Pipe: case OO_Caret:
+                case OO_AmpAmp: case OO_PipePipe:
+                    return true;
+                default: return false;
+            }
         }
 
         RawDefaultArg DefaultArgumentOf(const ParmVarDecl* p, ASTContext& ctx)
@@ -908,9 +954,14 @@ namespace cflat_cinterop
                     || !st.emittedFunctionTemplates.insert(ftd).second)
                     return true;
                 const auto* fd = ftd->getTemplatedDecl();
-                if (fd == nullptr || !fd->getIdentifier() || fd->isVariadic()
-                    || !fd->hasExternalFormalLinkage())
+                if (fd == nullptr || fd->isVariadic() || !fd->hasExternalFormalLinkage())
                     return true;
+                // A FREE binary operator template has no identifier, so the ordinary gate below
+                // drops it; libc++ declares every basic_string operator that way.
+                const bool isFreeBinaryOperatorTemplate =
+                    !llvm::isa<CXXMethodDecl>(fd) && fd->getNumParams() == 2
+                    && IsBindableFreeBinaryOperator(fd->getOverloadedOperator());
+                if (!fd->getIdentifier() && !isFreeBinaryOperatorTemplate) return true;
                 const auto* md = llvm::dyn_cast<CXXMethodDecl>(fd);
                 if (md != nullptr && md->getAccess() != AS_public) return true;
                 if (md == nullptr && fd->getStorageClass() == SC_Static) return true;
@@ -957,8 +1008,19 @@ namespace cflat_cinterop
                 result.kind = md == nullptr ? RawFunctionTemplate::Free
                     : md->isStatic() ? RawFunctionTemplate::StaticMember
                                      : RawFunctionTemplate::InstanceMember;
-                result.name = CxxQualifiedName(fd);
-                if (!IsValidDottedName(result.name)) return true;
+                result.name = isFreeBinaryOperatorTemplate
+                    ? CxxEnclosingNamespaceName(fd) : CxxQualifiedName(fd);
+                // An operator's name is never a dotted identifier ("std.operator+"); the
+                // namespace prefix it carries is validated instead.
+                if (isFreeBinaryOperatorTemplate)
+                {
+                    const size_t dot = result.name.rfind('.');
+                    if (result.name.empty()) return true;
+                    if (dot != std::string::npos
+                        && !IsValidDottedName(result.name.substr(0, dot)))
+                        return true;
+                }
+                else if (!IsValidDottedName(result.name)) return true;
                 if (md != nullptr)
                 {
                     result.owner = CxxQualifiedName(md->getParent());
@@ -2308,6 +2370,53 @@ namespace cflat_cinterop
                         return qt == canon || (rd != nullptr
                             && rd->getCanonicalDecl() == cxx->getCanonicalDecl());
                     };
+                    /*
+                     * The requested type is normally a class-template SPECIALIZATION, and the
+                     * free operators over it are declared as function TEMPLATES (every libc++
+                     * basic_string operator is). Their parameters are dependent, so the concrete
+                     * match above never sees them; match the class template itself instead and
+                     * publish the operator template for on-demand instantiation.
+                     */
+                    const ClassTemplateDecl* requestedTemplate = nullptr;
+                    if (const auto* spec = llvm::dyn_cast<ClassTemplateSpecializationDecl>(cxx);
+                        spec != nullptr && spec->getSpecializedTemplate() != nullptr)
+                        requestedTemplate = spec->getSpecializedTemplate()->getCanonicalDecl();
+                    auto mentionsRequestedTemplate = [&](QualType qt) {
+                        if (requestedTemplate == nullptr) return false;
+                        if (qt->isReferenceType()) qt = qt->getPointeeType();
+                        qt = qt.getUnqualifiedType();
+                        const Type* type = qt.getTypePtrOrNull();
+                        if (type == nullptr) return false;
+                        if (const auto* tst = type->getAs<TemplateSpecializationType>())
+                        {
+                            const auto* ctd = llvm::dyn_cast_or_null<ClassTemplateDecl>(
+                                tst->getTemplateName().getAsTemplateDecl());
+                            if (ctd != nullptr && ctd->getCanonicalDecl() == requestedTemplate)
+                                return true;
+                        }
+                        if (const auto* injected = type->getAs<InjectedClassNameType>())
+                        {
+                            const CXXRecordDecl* rd = injected->getDecl();
+                            if (rd != nullptr && rd->getDescribedClassTemplate() != nullptr
+                                && rd->getDescribedClassTemplate()->getCanonicalDecl()
+                                       == requestedTemplate)
+                                return true;
+                        }
+                        return false;
+                    };
+                    auto collectOperatorTemplate = [&](Decl* decl) {
+                        auto* ftd = llvm::dyn_cast<FunctionTemplateDecl>(decl);
+                        if (ftd == nullptr) return;
+                        const FunctionDecl* pattern = ftd->getTemplatedDecl();
+                        if (pattern == nullptr || llvm::isa<CXXMethodDecl>(pattern)
+                            || pattern->getNumParams() != 2
+                            || !IsBindableFreeBinaryOperator(pattern->getOverloadedOperator()))
+                            return;
+                        bool matches = false;
+                        for (const ParmVarDecl* p : pattern->parameters())
+                            matches = matches || mentionsRequestedTemplate(p->getType());
+                        if (matches) VisitFunctionTemplateDecl(ftd);
+                    };
                     std::unordered_set<const FunctionDecl*> seenOperators;
                     auto collectOperator = [&](Decl* decl) {
                         const auto* fd = llvm::dyn_cast<FunctionDecl>(decl);
@@ -2342,12 +2451,17 @@ namespace cflat_cinterop
                     std::function<void(Decl*)> walkOperators;
                     walkOperators = [&](Decl* decl) {
                         collectOperator(decl);
+                        collectOperatorTemplate(decl);
                         if (llvm::isa<FunctionDecl>(decl)) return;
                         if (auto* dc = llvm::dyn_cast<DeclContext>(decl))
                             for (Decl* child : dc->decls()) walkOperators(child);
                     };
                     walkOperators(ctx.getTranslationUnitDecl());
-                    for (Decl* d : st.announcedDecls) collectOperator(d);
+                    for (Decl* d : st.announcedDecls)
+                    {
+                        collectOperator(d);
+                        collectOperatorTemplate(d);
+                    }
                     std::string ret;
                     std::string params;
                     const std::string& spelling = st.req.cxxTypeRequests[i].cxxSpelling;

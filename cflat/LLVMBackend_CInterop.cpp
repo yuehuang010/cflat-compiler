@@ -6043,7 +6043,8 @@ bool LLVMBackend::RequestCxxFunctionTemplate(const std::string& functionName,
                                              std::vector<NamedVariable>& arguments,
                                              const std::vector<CxxBraceArgument>& braceArguments,
                                              std::string& registeredName,
-                                             std::string& error)
+                                             std::string& error,
+                                             const std::string& infixOperator)
 {
         error.clear();
         registeredName.clear();
@@ -6326,7 +6327,16 @@ bool LLVMBackend::RequestCxxFunctionTemplate(const std::string& functionName,
         }
         const bool instance = selected->kind == cflat_cinterop::RawFunctionTemplate::InstanceMember;
         std::string targetCall;
-        if (instance)
+        /*
+         * A BINARY OPERATOR is asked for as an EXPRESSION, not as a named call: `p0 + p1` lets
+         * C++ consider every candidate the operator has - the namespace's templates, a hidden
+         * friend, a member, and the C++20 rewritten and reversed forms - where `ns::operator+(..)`
+         * sees only the named overload set and loses all three.
+         */
+        const bool infixForm = !infixOperator.empty() && !instance
+            && parameterSpellings.size() == 2;
+        if (infixForm) targetCall = "p0 " + infixOperator + " p1";
+        else if (instance)
             targetCall = callArguments.front() + explicitSuffix + "(";
         else
         {
@@ -6335,12 +6345,15 @@ bool LLVMBackend::RequestCxxFunctionTemplate(const std::string& functionName,
                 ? ownerSpelling + "::" + selected->memberName : selected->cxxSpelling;
             targetCall = staticTarget + explicitSuffix + "(";
         }
-        for (size_t i = instance ? 1u : 0u; i < callArguments.size(); ++i)
+        if (!infixForm)
         {
-            if (i != (instance ? 1u : 0u)) targetCall += ", ";
-            targetCall += callArguments[i];
+            for (size_t i = instance ? 1u : 0u; i < callArguments.size(); ++i)
+            {
+                if (i != (instance ? 1u : 0u)) targetCall += ", ";
+                targetCall += callArguments[i];
+            }
+            targetCall += ")";
         }
-        targetCall += ")";
 
         std::vector<size_t> dependencyGroups;
         auto addDependencyGroup = [&](size_t group) {
@@ -6383,7 +6396,7 @@ bool LLVMBackend::RequestCxxFunctionTemplate(const std::string& functionName,
         for (size_t groupIndex : generatedDependencyGroups)
             addDependencyGroup(groupIndex);
 
-        std::string hashKey = lookupName + std::to_string(selected->kind);
+        std::string hashKey = lookupName + std::to_string(selected->kind) + infixOperator;
         for (const auto& p : parameterSpellings) hashKey += p;
         for (const auto& a : cxxExplicitArgs) hashKey += a;
         for (const auto& brace : braceArguments)
@@ -6394,7 +6407,10 @@ bool LLVMBackend::RequestCxxFunctionTemplate(const std::string& functionName,
             hashKey += braceElementSpelling(brace, {});
         }
         const std::string wrapperName = std::format("__cflat_tpl_{:016x}", HashWrapperKey(hashKey));
-        if (!explicitArgs.empty())
+        // An infix operator wrapper registers under its own unique name, never under the shared
+        // "ns.operatorX" one: that name is the non-template free operators' candidate set, and a
+        // wrapper built for ONE operand pair must not answer for a different pair.
+        if (!explicitArgs.empty() || infixForm)
         {
             registeredName = wrapperName;
             if (functionTable.find(wrapperName) != functionTable.end())
@@ -6410,7 +6426,7 @@ bool LLVMBackend::RequestCxxFunctionTemplate(const std::string& functionName,
             wrapperSource += parameterSpellings[i] + " p" + std::to_string(i);
         }
         wrapperSource += ")";
-        if (selected->isNoexcept) wrapperSource += " noexcept";
+        if (selected->isNoexcept && !infixForm) wrapperSource += " noexcept";
         wrapperSource += " { return " + targetCall + "; }\n";
         auto groupIt = cxxFunctionTemplateOwnerGroup_.find(selected->name);
         if (groupIt == cxxFunctionTemplateOwnerGroup_.end())
@@ -7999,6 +8015,9 @@ bool LLVMBackend::RequestCxxForeignType(const std::string& cflatName, const std:
 
         std::vector<CRecordEntry> records;
         std::vector<CSigEntry> requestSigs;
+        // Free operator TEMPLATES over the requested specialization, harvested by the same walk
+        // that collects its concrete free operators. Cached with the signatures.
+        std::vector<cflat_cinterop::RawFunctionTemplate> requestTemplates;
         std::string requestBitcode;
         cflat_cinterop::ExtractResult probe;
         bool cached = false;
@@ -8013,6 +8032,7 @@ bool LLVMBackend::RequestCxxForeignType(const std::string& cflatName, const std:
             {
                 records = cachedEntry.records;
                 requestSigs = cachedEntry.sigs;
+                requestTemplates = cachedEntry.functionTemplates;
                 requestBitcode = cachedEntry.cxxBitcode;
                 SetCInteropTargetFacts(cachedEntry.longDoubleWidth,
                                        cachedEntry.longDoubleIsIEEEDouble,
@@ -8107,6 +8127,8 @@ bool LLVMBackend::RequestCxxForeignType(const std::string& cflatName, const std:
                 entry.longDoubleIsIEEEDouble = probe.longDoubleIsIEEEDouble;
                 entry.targetTriple = probe.targetTriple;
                 entry.records = probeRecords;
+                entry.functionTemplates = probe.functionTemplates;
+                requestTemplates = probe.functionTemplates;
                 for (const auto& rawSig : probe.sigs)
                 {
                     CSigEntry sig;
@@ -8176,6 +8198,7 @@ bool LLVMBackend::RequestCxxForeignType(const std::string& cflatName, const std:
                 {
                     records = std::move(cachedEntry.records);
                     requestSigs = std::move(cachedEntry.sigs);
+                    requestTemplates = std::move(cachedEntry.functionTemplates);
                     requestBitcode = std::move(cachedEntry.cxxBitcode);
                     SetCInteropTargetFacts(cachedEntry.longDoubleWidth,
                                            cachedEntry.longDoubleIsIEEEDouble,
@@ -8235,6 +8258,7 @@ bool LLVMBackend::RequestCxxForeignType(const std::string& cflatName, const std:
             {
                 SetCInteropTargetFacts(raw);
                 MapRawRecords(raw, records);
+                if (!raw.functionTemplates.empty()) requestTemplates = raw.functionTemplates;
                 for (const auto& rawSig : raw.sigs)
                 {
                     CSigEntry sig;
@@ -8250,6 +8274,7 @@ bool LLVMBackend::RequestCxxForeignType(const std::string& cflatName, const std:
                 entry.targetTriple = raw.targetTriple;
                 entry.sigs = requestSigs;
                 entry.records = records;
+                entry.functionTemplates = requestTemplates;
                 entry.cxxBitcode = requestBitcode;
                 StoreCxxTypeRequestCache(group, requestKey, needDefinitions,
                                          std::move(entry),
@@ -8495,6 +8520,7 @@ bool LLVMBackend::RequestCxxForeignType(const std::string& cflatName, const std:
             }
         }
         RegisterCSignatures(requestSigs, fileForCxxRequest);
+        RegisterCxxFunctionTemplates(requestTemplates, group.primary, fileForCxxRequest);
         if (dataStructures.find(cflatName) == dataStructures.end())
         {
             cxxCflatToCxxSpelling_.erase(cflatName);

@@ -5210,7 +5210,8 @@ private:
                                     std::vector<NamedVariable>& arguments,
                                     const std::vector<CxxBraceArgument>& braceArguments,
                                     std::string& registeredName,
-                                    std::string& error);
+                                    std::string& error,
+                                    const std::string& infixOperator = {});
     bool RequestCxxFreeFunction(const std::string& functionName,
                                 const std::vector<std::string>& explicitArgs,
                                 const std::vector<NamedVariable>& arguments,

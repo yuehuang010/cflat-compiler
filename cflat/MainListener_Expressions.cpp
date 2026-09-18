@@ -8931,14 +8931,56 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
             addNamespace(rightInfo.second);
 
             const std::string opName = "operator" + op;
+            /*
+             * The free operator may be a FUNCTION TEMPLATE over the operand's class template -
+             * every libc++ basic_string operator is. Nothing is registered for it until some
+             * concrete operand pair asks, so instantiate one for THESE operands through the same
+             * generated-wrapper path an ordinary C++ template call uses. The wrapper is keyed and
+             * registered on the operand pair, never on the shared "ns.operatorX" name, so one
+             * pair's wrapper can never answer for another.
+             */
+            auto callOperatorTemplate = [&](const std::string& sourceName) -> llvm::Value* {
+                if (lvalue == nullptr || rvalue == nullptr) return nullptr;
+                if (!compiler->HasCxxFunctionTemplate(sourceName)) return nullptr;
+                auto templateArgument = [&](llvm::Value* value, llvm::Value* storage,
+                                            llvm::StructType* structType,
+                                            const std::string& typeName) {
+                    LLVMBackend::NamedVariable arg;
+                    arg.Primary = value;
+                    arg.Storage = storage;
+                    arg.BaseType = value != nullptr ? value->getType() : nullptr;
+                    arg.TypeAndValue.TypeName = typeName;
+                    // A class operand is spelled `T &` in the generated wrapper, so it needs an
+                    // address; a temporary operand has no storage and is materialized here.
+                    if (structType != nullptr && arg.Storage == nullptr)
+                    {
+                        auto* temp = compiler->CreateAlloca(structType);
+                        compiler->CreateAssignment(value, temp);
+                        arg.Storage = temp;
+                    }
+                    return arg;
+                };
+                std::vector<LLVMBackend::NamedVariable> templateArgs{
+                    templateArgument(lvalue, lhsStorage, leftInfo.first, leftInfo.second),
+                    templateArgument(rvalue, rhsStorage, rightInfo.first, rightInfo.second) };
+                std::string registeredName;
+                std::string templateError;
+                if (!compiler->RequestCxxFunctionTemplate(sourceName, {}, {}, templateArgs, {},
+                                                         registeredName, templateError, op)
+                    || registeredName.empty())
+                    return nullptr;
+                llvm::Value* result = compiler->CreateOverloadedFunctionCall(
+                    registeredName, templateArgs, true);
+                if (result != nullptr) TrackOwnedStringOperatorResult(compiler, result);
+                return result;
+            };
+
             for (const std::string& ns : namespaces)
             {
                 const std::string sourceName = ns.empty() ? opName : ns + "." + opName;
                 compiler->TryBindCxxFunction(sourceName);
                 const std::string lookupName = ns.empty()
                     ? "__cxx_free." + opName : sourceName;
-                auto fit = compiler->functionTable.find(lookupName);
-                if (fit == compiler->functionTable.end()) continue;
 
                 auto isReferenceParam = [&](const LLVMBackend::FunctionSymbol& candidate,
                                             size_t index) {
@@ -8954,28 +8996,38 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
                 bool candidateFound = false;
                 bool leftReference = false;
                 bool rightReference = false;
-                for (const auto& candidate : fit->second)
+                if (auto fit = compiler->functionTable.find(lookupName);
+                    fit != compiler->functionTable.end())
                 {
-                    if (candidate.IsMethod || candidate.Parameters.size() < 2) continue;
-                    if (!leftInfo.second.empty()
-                        && candidate.Parameters[0].TypeName != leftInfo.second)
-                        continue;
-                    if (!rightInfo.second.empty()
-                        && candidate.Parameters[1].TypeName != rightInfo.second)
-                        continue;
-                    candidateFound = true;
-                    // Both operands reach this path as struct VALUES, so a parameter of pointer
-                    // shape - `const T&` or `T&` - is passed as the address of that value. The
-                    // raw spelling is the first source; the mapped shape is the fallback for a
-                    // signature whose spelling was not recorded.
-                    if (!leftInfo.second.empty())
-                        leftReference = leftReference || isReferenceParam(candidate, 0)
-                                     || candidate.Parameters[0].Pointer;
-                    if (!rightInfo.second.empty())
-                        rightReference = rightReference || isReferenceParam(candidate, 1)
-                                      || candidate.Parameters[1].Pointer;
+                    for (const auto& candidate : fit->second)
+                    {
+                        if (candidate.IsMethod || candidate.Parameters.size() < 2) continue;
+                        if (!leftInfo.second.empty()
+                            && candidate.Parameters[0].TypeName != leftInfo.second)
+                            continue;
+                        if (!rightInfo.second.empty()
+                            && candidate.Parameters[1].TypeName != rightInfo.second)
+                            continue;
+                        candidateFound = true;
+                        // Both operands reach this path as struct VALUES, so a parameter of pointer
+                        // shape - `const T&` or `T&` - is passed as the address of that value. The
+                        // raw spelling is the first source; the mapped shape is the fallback for a
+                        // signature whose spelling was not recorded.
+                        if (!leftInfo.second.empty())
+                            leftReference = leftReference || isReferenceParam(candidate, 0)
+                                         || candidate.Parameters[0].Pointer;
+                        if (!rightInfo.second.empty())
+                            rightReference = rightReference || isReferenceParam(candidate, 1)
+                                          || candidate.Parameters[1].Pointer;
+                    }
                 }
-                if (!candidateFound) continue;
+                // No ordinary free operator binds: the namespace may still declare the operator
+                // as a function TEMPLATE over the operand's class template.
+                if (!candidateFound)
+                {
+                    if (llvm::Value* templated = callOperatorTemplate(sourceName)) return templated;
+                    continue;
+                }
 
                 auto makeArgument = [&](llvm::Value* value, llvm::Value* storage,
                                         llvm::StructType* structType, const std::string& typeName,
@@ -9042,11 +9094,17 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
                 lhsStorage, rhsStorage, false, allowReversed);
             if (ordering == nullptr) return nullptr;
             // The type mapper lowers every comparison category to that single signed byte; a
-            // one-field wrapper is unwrapped here for a `<=>` that returns something else.
-            while (ordering->getType()->isStructTy())
+            // one-field wrapper is unwrapped here for a `<=>` that returns something else. An
+            // ordering laid out as an opaque one-byte BLOB (`{ [1 x i8] }`, which is how an
+            // import group that never requested the category spells it) unwraps the same way.
+            while (ordering->getType()->isStructTy() || ordering->getType()->isArrayTy())
             {
-                auto* st = llvm::cast<llvm::StructType>(ordering->getType());
-                if (st->getNumElements() != 1) return nullptr;
+                if (auto* st = llvm::dyn_cast<llvm::StructType>(ordering->getType()))
+                {
+                    if (st->getNumElements() != 1) return nullptr;
+                }
+                else if (llvm::cast<llvm::ArrayType>(ordering->getType())->getNumElements() != 1)
+                    return nullptr;
                 ordering = compiler->builder->CreateExtractValue(ordering, { 0 }, "ordval");
             }
             if (!ordering->getType()->isIntegerTy()) return nullptr;
