@@ -1687,6 +1687,7 @@ namespace cflat_cinterop
                         m.isDefaultCtor = ctor->isDefaultConstructor();
                         m.isCopyCtor = ctor->isCopyConstructor();
                         m.isMoveCtor = ctor->isMoveConstructor();
+                        m.isExplicit = ctor->isExplicit();
                     }
                     else if (dtor != nullptr)
                     {

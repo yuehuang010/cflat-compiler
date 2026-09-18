@@ -2199,6 +2199,7 @@ nlohmann::json LLVMBackend::CxxMemberToJson(const cflat_cinterop::RawCxxMember& 
         if (m.isOverride)           j["ov"] = true;
         if (m.isFinal)              j["fi"] = true;
         if (m.isConversion)         j["cvn"] = true;
+        if (m.isExplicit)           j["xpl"] = true;
         if (m.covariantReturnNeedsAdjust) j["cra"] = true;
         // M6 - the vtable slots. A warm cache that dropped these would re-register a virtual
         // member as a DIRECT call, which silently skips every override.
@@ -2249,6 +2250,7 @@ cflat_cinterop::RawCxxMember LLVMBackend::CxxMemberFromJson(const SjVal& j)
         m.isOverride           = j.value("ov", false);
         m.isFinal              = j.value("fi", false);
         m.isConversion         = j.value("cvn", false);
+        m.isExplicit           = j.value("xpl", false);
         m.covariantReturnNeedsAdjust = j.value("cra", false);
         m.vtableIndex          = j.value("vti", -1);
         m.vtableIndexDeleting  = j.value("vtd", -1);
@@ -2666,7 +2668,9 @@ bool LLVMBackend::TryLoadCHeaderDiskCache(
         // carries the flag as false, so an rvalue would not bind a `const T&` scalar parameter.
         // v74 publishes FREE BINARY OPERATOR templates: an older cache has none, so a binary
         // operator over a class template (every libc++ basic_string operator) finds no candidate.
-        if (version != 74) return cacheMiss("cache version");
+        // v75 records `explicit` on a C++ constructor (xpl): an older cache carries the flag as
+        // false, so an explicit ctor would still be offered as an implicit argument conversion.
+        if (version != 75) return cacheMiss("cache version");
 
         if (!expectedRequestKey.empty()
             && j.value("cxxRequestKey", std::string{}) != expectedRequestKey)
@@ -2900,7 +2904,8 @@ void LLVMBackend::WriteCHeaderDiskCache(
         // v72 records `const` on a C++ reference parameter (IsCxxConstRef).
         // v73 records an alias template's target base, argument pattern and parameter defaults
         // (catb/caa/cad). v74 publishes FREE BINARY OPERATOR templates.
-        j["version"] = 74;
+        // v75 records `explicit` on a C++ constructor (xpl).
+        j["version"] = 75;
         j["mtime"]   = (int64_t)mtime.time_since_epoch().count();
         j["hash"]    = contentHash;
         j["ldw"]     = entry.longDoubleWidth;

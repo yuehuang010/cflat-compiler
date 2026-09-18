@@ -7641,6 +7641,7 @@ public:
             // and void only on a target whose structors return nothing.
             TypeAndValue ret;
             bool isDefaultCtor = false;
+            bool isExplicit = false;
             bool isCopyCtor = false;
             bool isMoveCtor = false;
             bool isDeleted = false;
@@ -7971,7 +7972,25 @@ public:
                                                        const std::vector<TypeAndValue>& argTypes,
                                                        std::string& why,
                                                        bool allowNumericConversions = false,
-                                                       const std::vector<NamedVariable>* argVars = nullptr) const;
+                                                       const std::vector<NamedVariable>* argVars = nullptr,
+                                                       bool allowExplicit = true) const;
+    /*
+     * Name of the `explicit` constructor of `typeName` that WOULD have taken `argTypes` had it
+     * been implicit. Empty when none exists. Drives the diagnostic at a call argument.
+     */
+    std::string ExplicitCxxConstructorBlocking(const std::string& typeName,
+                                               const std::vector<TypeAndValue>& argTypes) const;
+    // Verdict of the one implicit user-defined conversion at a C++ call argument. The two
+    // refusal codes are the only ones the failure note may name.
+    enum class CxxArgConversion { NotApplicable, Convertible, ExplicitCtor, NonConstLvalueRef };
+    CxxArgConversion ClassifyCxxImplicitArgument(const NamedVariable& arg,
+                                                 const TypeAndValue& param,
+                                                 bool cxxByValueParam);
+    // Text of the failure note for that verdict, empty unless the conversion is what refused the
+    // argument. Shares ClassifyCxxImplicitArgument with the ranking predicate by construction.
+    std::string DescribeCxxImplicitArgumentBlock(const NamedVariable& arg,
+                                                 const TypeAndValue& param,
+                                                 bool cxxByValueParam);
     // Copy-construct (or move-construct when `useMove`) `dest` from the object at `src`.
     // Returns false after LogError when the needed constructor is missing or inaccessible.
     bool EmitCxxCopyOrMoveConstruct(const std::string& typeName, llvm::Value* dest,

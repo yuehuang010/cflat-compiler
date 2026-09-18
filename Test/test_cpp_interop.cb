@@ -152,6 +152,9 @@ import cpp "library/cpp_interop_usingns.h" cache;
 // A C++ CONSTRUCTOR parameter declared `T&` binds the argument's address.
 import cpp "library/cpp_interop_ctorref.h" cache;
 import cpp "library/cpp_interop_freeoptpl.h" cache;
+// `explicit` constructors are not implicit conversions at a call argument; the non-explicit
+// converting constructor in the same header is the accept set. Rejections: err_cpp_explicit_ctor.cb.
+import cpp "library/cpp_interop_explicit.h" cache;
 import cpp "string" cache;
 import "list.cb";
 import "thread.cb";
@@ -160,6 +163,10 @@ import "malloc_allocator.cb";
 // CFlat structs whose FIELD is a fixed array of a C++ class - `= default`, and a non-empty
 // brace list over an element with a trivial and with a nontrivial destructor.
 struct ArrElemHost { cppa.Trk[2] cells = default; };
+
+// A CFlat struct argument, the untouched neighbour of the C++ implicit-conversion path.
+struct ExcPlain { int a = default; };
+int ExcTakePlain(ExcPlain p) { return p.a; }
 
 // A CFlat struct field of C++ class type, used as a ctor `T&` argument.
 struct CtorRefHost { cppcr.Cnt cell = default; };
@@ -2448,5 +2455,61 @@ extern int main()
     if ((fopNtA + fopNtB).n() != 21)                                           return 2134;
     if (fopNtA == fopNtB || !(fopNtA == cppfop.Nt(5)))                         return 2135;
     if (!(fopNtA < fopNtB) || fopNtB < fopNtA)                                 return 2136;
+
+    // ---- M104: `explicit` C++ constructors at a call argument (2200-2249) ----------------------
+    // Pre-fix every SPELLED leg below already passed; they are the frozen accept set for the
+    // rejection added in err_cpp_explicit_ctor.cb, which is where the discrimination lives.
+    // The spelled form of an explicit constructor stays legal at every argument position.
+    if (cppexp.take_ex(cppexp.Ex(5)) != 5)                                     return 2200;
+    if (cppexp.take_ex_cref(cppexp.Ex(5)) != 5)                                return 2201;
+    if (cppexp.take_ex_rref(cppexp.Ex(5)) != 5)                                return 2202;
+    cppexp.ExHost excHost = cppexp.ExHost(3);
+    if (excHost.member_take(cppexp.Ex(5)) != 8)                                return 2203;
+    if (cppexp.ExHost.static_take(cppexp.Ex(5)) != 50)                         return 2204;
+    if (cppexp.take_ex_two(cppexp.Ex(5), 2) != 7)                              return 2205;
+    // An explicit ctor with a DEFAULTED second parameter, spelled with one and with two args.
+    if (cppexp.take_exdef(cppexp.ExDef(5)) != 12)                              return 2206;
+    if (cppexp.take_exdef(cppexp.ExDef(5, 1)) != 6)                            return 2207;
+    // A class with BOTH an explicit and a non-explicit constructor: each spelled form picks its
+    // own arity, so a collapse onto one of them is visible in the value.
+    if (cppexp.take_both(cppexp.Both(5)) != 5)                                 return 2208;
+    if (cppexp.take_both(cppexp.Both(1, 2)) != 102)                            return 2209;
+    // A free operator's OPERAND, spelled.
+    cppexp.Ex excNine = cppexp.Ex(9);
+    if (excNine - cppexp.Ex(5) != 4)                                           return 2210;
+    // A C++ CONSTRUCTOR parameter of class type, spelled.
+    cppexp.ExOwner excOwner = cppexp.ExOwner(cppexp.Ex(5));
+    if (excOwner.v != 6)                                                       return 2211;
+    // An `explicit` COPY constructor still copies: the declaration copy runs it (+1000), and
+    // the class binds to a const-reference parameter unchanged.
+    cppexp.ExCopy excCopy = cppexp.ExCopy(5);
+    cppexp.ExCopy excCopy2 = excCopy;
+    if (excCopy2.v != 1005 || cppexp.take_excopy_cref(excCopy) != 5)           return 2212;
+    // ACCEPT SET: a NON-explicit converting constructor is still offered at every parameter
+    // kind C++ allows - by value, by const reference, by rvalue reference, and through a C++
+    // constructor's own parameter. Each function tags its result, so a wrong leg is visible.
+    if (cppexp.opt_by_value(0.5) != 50)                                        return 2213;
+    if (cppexp.opt_by_cref(0.5) != 51)                                         return 2214;
+    if (cppexp.opt_by_rref(0.5) != 52)                                         return 2215;
+    cppexp.OptOwner excOptOwner = cppexp.OptOwner(0.5);
+    if (excOptOwner.v != 57)                                                   return 2216;
+    std.vector<int> excParams = default;
+    excParams.push_back(1);
+    cppexp.Optim excOptim = cppexp.Optim(excParams, 0.5);
+    if (excOptim.v != 1050)                                                    return 2217;
+    cppexp.OptimCref excOptimCref = cppexp.OptimCref(excParams, 0.5);
+    if (excOptimCref.v != 2050)                                                return 2218;
+    cppexp.Options excOpt = cppexp.Options(0.9);
+    if (excOpt - 0.5 != 40)                                                    return 2219;
+    // ACCEPT SET for the non-const-reference half of the rule: a NAMED Options lvalue binds to a
+    // non-const `Options&` parameter, free and member, exactly as before. Only the CONVERSION of
+    // a bare double into such a parameter is refused (err_cpp_explicit_ctor.cb).
+    cppexp.Options excLref = cppexp.Options(0.5);
+    if (cppexp.opt_by_lref(excLref) != 53)                                     return 2221;
+    cppexp.OptHost excOptHost = cppexp.OptHost(4);
+    if (excOptHost.member_lref(excLref) != 54)                                 return 2222;
+    // ACCEPT SET: a CFlat struct argument is not on the C++ conversion path at all.
+    ExcPlain excPlain = { a = 5 };
+    if (ExcTakePlain(excPlain) != 5)                                           return 2220;
     return 0;
 }

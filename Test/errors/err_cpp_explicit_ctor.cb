@@ -1,0 +1,59 @@
+// An `explicit` C++ constructor is not a candidate for the one implicit user-defined conversion
+// C++ allows at a call argument, so a bare scalar must not reach a parameter of that class type.
+// Every leg pins the CANDIDATE it was rejected for, so each one proves its own site fired; the
+// spelled form of each of these calls is a value leg in Test/test_cpp_interop.cb (2200-2220).
+import cpp "cpp_interop_explicit.h";
+
+extern int main()
+{
+    // A free function, parameter by VALUE.
+    expect_error("[cppexp.take_ex] argument 0: C++ constructor 'cppexp.Ex(int)' is declared explicit") {
+        int byValue = cppexp.take_ex(5);
+    }
+    // The same conversion at a const-REFERENCE parameter.
+    expect_error("[cppexp.take_ex_cref] argument 0: C++ constructor 'cppexp.Ex(int)' is declared explicit") {
+        int byCref = cppexp.take_ex_cref(5);
+    }
+    // ... and at an RVALUE-reference parameter.
+    expect_error("[cppexp.take_ex_rref] argument 0: C++ constructor 'cppexp.Ex(int)' is declared explicit") {
+        int byRref = cppexp.take_ex_rref(5);
+    }
+    // A second, exactly-matching argument must not make the first one convertible.
+    expect_error("[cppexp.take_ex_two] argument 0: C++ constructor 'cppexp.Ex(int)' is declared explicit") {
+        int twoArgs = cppexp.take_ex_two(5, 2);
+    }
+    // An INSTANCE member's argument (the receiver occupies index 0).
+    expect_error("[member_take] argument 1: C++ constructor 'cppexp.Ex(int)' is declared explicit") {
+        cppexp.ExHost host = cppexp.ExHost(3);
+        int byMember = host.member_take(5);
+    }
+    // A STATIC member's argument.
+    expect_error("[cppexp.ExHost.static_take] argument 0: C++ constructor 'cppexp.Ex(int)' is declared explicit") {
+        int byStatic = cppexp.ExHost.static_take(5);
+    }
+    // An explicit constructor whose SECOND parameter has a default still is not implicit.
+    expect_error("[cppexp.take_exdef] argument 0: C++ constructor 'cppexp.ExDef(int, int)' is declared explicit") {
+        int byDefaulted = cppexp.take_exdef(5);
+    }
+    // The class also has a NON-explicit two-argument constructor; it cannot rescue a one-argument
+    // conversion, and the explicit one-argument ctor is the candidate named.
+    expect_error("[cppexp.take_both] argument 0: C++ constructor 'cppexp.Both(int)' is declared explicit") {
+        int byBoth = cppexp.take_both(5);
+    }
+    // A free OPERATOR's operand is an argument like any other.
+    expect_error("[operator-] argument 1: C++ constructor 'cppexp.Ex(int)' is declared explicit") {
+        cppexp.Ex nine = cppexp.Ex(9);
+        int byOperator = nine - 5;
+    }
+    // The other half of clang's rule, same predicate: a user-defined conversion is never offered
+    // into a NON-const lvalue reference, even though this constructor is not explicit. The named
+    // lvalue that DOES bind these two parameters is value leg 2221/2222.
+    expect_error("[cppexp.opt_by_lref] argument 0: a user-defined conversion cannot bind to the non-const reference parameter 'cppexp.Options&'") {
+        int byLref = cppexp.opt_by_lref(0.5);
+    }
+    expect_error("[member_lref] argument 1: a user-defined conversion cannot bind to the non-const reference parameter 'cppexp.Options&'") {
+        cppexp.OptHost lrefHost = cppexp.OptHost(4);
+        int byMemberLref = lrefHost.member_lref(0.5);
+    }
+    return 0;
+}

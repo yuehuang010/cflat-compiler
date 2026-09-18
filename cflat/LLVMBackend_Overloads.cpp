@@ -1900,6 +1900,36 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                 }
             }
 
+            /*
+             * Name the mechanism when a C++ candidate was dropped because the one implicit
+             * user-defined conversion its parameter needs runs through an `explicit`
+             * constructor. The dump above prints only `arg=int param=cppexc.Ex`.
+             */
+            for (const auto& c : candidates)
+            {
+                auto pi = c.Parameters.begin();
+                bool named = false;
+                for (size_t i = 0; i < arguments.size() && pi != c.Parameters.end(); i++, ++pi)
+                {
+                    // The implicit object argument of a member call never takes a user-defined
+                    // conversion, exactly as in the ranking loop.
+                    if (c.IsCxx && c.IsMethod && i == 0) continue;
+                    const bool byValueParam = c.IsCxx && i < c.Recipe.paramSlots.size()
+                        && c.Recipe.paramSlots[i].kind == AbiSlot::ByVal;
+                    const bool indirectValueParam = c.IsCxx && c.CxxAbi.valid
+                        && i < c.CxxAbi.params.size()
+                        && c.CxxAbi.params[i].kind == cflat_cinterop::RawAbiSlot::Indirect;
+                    const std::string note = DescribeCxxImplicitArgumentBlock(
+                        arguments[i], *pi, byValueParam || indirectValueParam);
+                    if (note.empty()) continue;
+                    msg += std::format("  [{}] argument {}: {}\n",
+                        c.SourceName.empty() ? shownFunctionName : c.SourceName, i, note);
+                    named = true;
+                    break;
+                }
+                if (named) break;
+            }
+
             // Name the mechanism when a candidate was dropped for a function-pointer SIGNATURE:
             // the dump above prints only `arg=ptr param=__c_fn_ptr`, which points at no cause.
             for (const auto& c : candidates)

@@ -265,6 +265,9 @@ namespace cflat_cinterop
         // Its CFlat registration name is "operator <CFlat spelling of retType>", which only the
         // backend's C-to-CFlat type map can produce, so the flag - not the name - travels here.
         bool isConversion = false;
+        // Declared `explicit`. A ctor carrying it is not a candidate for the ONE implicit
+        // user-defined conversion C++ allows at an argument; it stays reachable spelled out.
+        bool isExplicit = false;
         // A virtual override whose COVARIANT return type needs a pointer adjustment relative to
         // the overridden declaration's return type. Clang answers that with a return-adjusting
         // thunk it emits itself; cflat cannot synthesize one, so such a member is refused.

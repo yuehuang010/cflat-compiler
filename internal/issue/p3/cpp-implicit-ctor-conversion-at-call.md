@@ -25,3 +25,39 @@ it).
 Decide whether one user-defined implicit conversion at a C++ call argument is offered
 uniformly (clang's rule) or never; make SGD and Adam behave the same either way, and add a
 fixture row against an in-repo header (Test/library/cpp_interop_tpl.h style options class).
+
+## Measurements 2026-09-17 (fix/cpp-explicit-ctor) - the filed asymmetry does NOT reproduce
+
+Reproduced the SHAPE in-repo (`Test/library/cpp_interop_explicit.h`, namespace `cppexp`): a
+`Options` class with a NON-explicit `Options(double)`, taken by value, by `const Options&`, by
+`Options&&`, by non-const `Options&`, through a one-parameter class constructor (`OptOwner`),
+through the Adam-style two-parameter constructor (`Optim(std::vector<int>, Options)`), through the
+const-ref variant (`OptimCref`), and as a free operator operand. Measured on master 0fbe6115:
+
+| parameter kind | bare `0.5` accepted? | clang | verdict |
+|----------------|----------------------|-------|---------|
+| by value | yes (50) | ok | correct |
+| `const Options&` | yes (51) | ok | correct |
+| `Options&&` | yes (52) | ok | correct |
+| ctor param, 1 param | yes (57) | ok | correct |
+| ctor param, 2 params (Adam shape) | yes (1050) | ok | correct |
+| ctor param, `const Options&` | yes (2050) | ok | correct |
+| operator operand | yes (40) | ok | correct |
+| non-const `Options&` | yes (53) | **error** | WRONG - over-accepted |
+
+So the one implicit user-defined conversion IS offered uniformly at every parameter kind C++
+allows, including the constructor shape the issue blames. The SGD/Adam split is therefore NOT this
+code path in general - it needs a libtorch-specific cause (option-class ctor shape, template
+constructor, or a signature clang refuses to harvest), and tests may not use libtorch, so the
+issue stays filed with no in-repo repro. These rows are now value legs 2213-2220 in
+`Test/test_cpp_interop.cb`.
+
+The non-const `Options&` row WAS fixed on fix/cpp-explicit-ctor (`CanImplicitlyConstructCxxClass`
+now refuses a user-defined conversion into a non-const lvalue reference).
+
+## Second, separate defect found while measuring (still open)
+
+A C++ TEMPORARY binds to a non-const lvalue reference parameter: `cppexp.take_ex_ref(cppexp.Ex(5))`
+compiles and runs on master and on fix/cpp-explicit-ctor, while clang says
+"non-const lvalue reference to type 'Ex' cannot bind to a temporary". That is argument BINDING, not
+conversion - a different site from the one this file is about.

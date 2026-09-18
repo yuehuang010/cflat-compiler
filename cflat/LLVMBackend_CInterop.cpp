@@ -5564,7 +5564,8 @@ LLVMBackend::CollectCxxImplicitArgumentCandidates(
                     return false;
                 std::string why;
                 return SelectCxxConstructor(targetType.TypeName, { source }, why,
-                                            /*allowNumericConversions*/ true) != nullptr;
+                                            /*allowNumericConversions*/ true, nullptr,
+                                            /*allowExplicit*/ false) != nullptr;
             }
             const std::string target = targetClassIdentity(raw);
             const std::string trimmedRaw = trim(raw);
@@ -11059,6 +11060,7 @@ void LLVMBackend::RegisterCxxClassMembers(const CRecordEntry& r, const std::stri
                     st.ret = ret;
                 }
                 st.isDefaultCtor = m.isDefaultCtor;
+                st.isExplicit = m.isExplicit;
                 st.isCopyCtor = m.isCopyCtor;
                 st.isMoveCtor = m.isMoveCtor;
                 st.isDeleted = m.isDeleted;
@@ -13448,7 +13450,7 @@ const LLVMBackend::CxxClassInfo::Structor* LLVMBackend::FindCxxMoveCtor(const st
 const LLVMBackend::CxxClassInfo::Structor* LLVMBackend::SelectCxxConstructor(
         const std::string& typeName, const std::vector<TypeAndValue>& argTypes,
         std::string& why, bool allowNumericConversions,
-        const std::vector<NamedVariable>* argVars) const
+        const std::vector<NamedVariable>* argVars, bool allowExplicit) const
 {
         const CxxClassInfo* info = GetCxxClassInfo(typeName);
         if (info == nullptr) { why = "has no imported constructors"; return nullptr; }
@@ -13537,6 +13539,9 @@ const LLVMBackend::CxxClassInfo::Structor* LLVMBackend::SelectCxxConstructor(
             // Fewer arguments than parameters is fine when every omitted one has a constant
             // default (`parser(size_t max_capacity = DEFAULT_MAX_CAPACITY)` called as `parser()`).
             if (c.params.size() < argTypes.size() + 1) continue;
+            // C++ offers only NON-explicit constructors as the one implicit user-defined
+            // conversion; an explicit one stays reachable through the spelled form `T(x)`.
+            if (!allowExplicit && c.isExplicit) continue;
             const size_t omitted = c.params.size() - argTypes.size() - 1;
             if (omitted != 0 && !CxxConstantDefaultsFrom(c, argTypes.size() + 1)) continue;
             ++candidates;
@@ -13674,9 +13679,34 @@ static LLVMBackend::TypeAndValue InferImplicitCxxArgumentType(
         return type;
 }
 
-bool LLVMBackend::CanImplicitlyConstructCxxClass(const NamedVariable& arg,
-                                                  const TypeAndValue& param,
-                                                  bool cxxByValueParam)
+std::string LLVMBackend::ExplicitCxxConstructorBlocking(
+        const std::string& typeName, const std::vector<TypeAndValue>& argTypes) const
+{
+        std::string why;
+        if (SelectCxxConstructor(typeName, argTypes, why, /*allowNumericConversions*/ true,
+                                 nullptr, /*allowExplicit*/ false) != nullptr)
+            return {};
+        why.clear();
+        const auto* any = SelectCxxConstructor(typeName, argTypes, why,
+                                               /*allowNumericConversions*/ true, nullptr,
+                                               /*allowExplicit*/ true);
+        if (any == nullptr || !any->isExplicit) return {};
+        std::string shape = typeName + "(";
+        for (size_t i = 1; i < any->params.size(); ++i)
+        {
+            if (i > 1) shape += ", ";
+            shape += any->params[i].TypeName;
+            if (any->params[i].Pointer) shape += any->params[i].IsAlias ? "&" : "*";
+        }
+        return shape + ")";
+}
+
+/*
+ * One classification for the ONE implicit user-defined conversion C++ allows at an argument, so
+ * the ranking predicate and the failure note can never disagree about why a cell was refused.
+ */
+LLVMBackend::CxxArgConversion LLVMBackend::ClassifyCxxImplicitArgument(
+        const NamedVariable& arg, const TypeAndValue& param, bool cxxByValueParam)
 {
         if (param.TypeName.empty() || param.IsInterface || arg.TypeAndValue.Pointer
             || (param.Pointer && !cxxByValueParam
@@ -13684,39 +13714,82 @@ bool LLVMBackend::CanImplicitlyConstructCxxClass(const NamedVariable& arg,
                 && !IsForeignCxxClassWithConstructors(param.TypeName))
             || !IsForeignCxxClassWithConstructors(param.TypeName)
             || arg.TypeAndValue.TypeName == param.TypeName)
-            return false;
+            return CxxArgConversion::NotApplicable;
 
         TypeAndValue argType = InferImplicitCxxArgumentType(arg, *this);
         argType.IsScopedEnum = argType.IsScopedEnum || IsScopedEnumTypeName(argType.TypeName);
-        if (argType.TypeName.empty()) return false;
+        if (argType.TypeName.empty()) return CxxArgConversion::NotApplicable;
         std::string argSpelling;
         std::string paramSpelling;
         if (CxxSpellingForCflatType(argType.TypeName, argSpelling)
             && CxxSpellingForCflatType(param.TypeName, paramSpelling)
             && SqueezeCxxSpelling(argSpelling) == SqueezeCxxSpelling(paramSpelling))
-            return false;
-        if (IsCxxSharedPtrUpcast(argType, param)) return true;
+            return CxxArgConversion::NotApplicable;
+        // A non-const lvalue reference never takes a user-defined conversion - the temporary has
+        // no address. A member's reference arrives bare with IsAlias, so key on IsAlias alone.
+        const bool nonConstLvalueRef = param.IsAlias && !param.IsRvalueRef
+            && !param.IsCxxConstRef && !param.ElemPointer && !cxxByValueParam;
+        auto answer = [&](CxxArgConversion found) {
+            return nonConstLvalueRef ? CxxArgConversion::NonConstLvalueRef : found;
+        };
+        if (IsCxxSharedPtrUpcast(argType, param)) return answer(CxxArgConversion::Convertible);
         // A derived lvalue binds directly to a C++ base reference. Do not turn that standard
         // conversion into a user-defined base copy, even when the base has a copy constructor.
         if (param.IsAlias && !param.ElemPointer && IsCxxDerivedToBaseValue(argType, param))
-            return false;
+            return CxxArgConversion::NotApplicable;
         // A derived-class value slices to a PUBLIC base parameter through the base's copy ctor.
         if (IsCxxDerivedToBaseValue(argType, param)) argType.TypeName = param.TypeName;
         std::string why;
         if (SelectCxxConstructor(param.TypeName, { argType }, why,
-                                 /*allowNumericConversions*/ true) != nullptr)
-            return true;
+                                 /*allowNumericConversions*/ true, nullptr,
+                                 /*allowExplicit*/ false) != nullptr)
+            return answer(CxxArgConversion::Convertible);
+        if (!ExplicitCxxConstructorBlocking(param.TypeName, { argType }).empty())
+            return answer(CxxArgConversion::ExplicitCtor);
+        // Past this point only a speculative clang request could answer, and it re-registers the
+        // class - never run it for a parameter that could not have taken the conversion anyway.
+        if (nonConstLvalueRef) return CxxArgConversion::NotApplicable;
         // A converting constructor clang never lists as a member (std::optional's
         // `template <class U> optional(U&&)`): ask C++ itself whether the conversion compiles.
         // Only for a class with NO listed constructor - a speculative clang request re-registers
         // the class, and ranking must not perturb one that already has a constructor surface.
         const auto* info = GetCxxClassInfo(param.TypeName);
-        if (info == nullptr || !info->constructors.empty()) return false;
+        if (info == nullptr || !info->constructors.empty()) return CxxArgConversion::NotApplicable;
         NamedVariable probe = arg;
         probe.TypeAndValue = argType;
         std::string wrapperName;
         std::string wrapperError;
-        return RequestCxxVariadicConstructor(param.TypeName, { probe }, wrapperName, wrapperError);
+        return RequestCxxVariadicConstructor(param.TypeName, { probe }, wrapperName, wrapperError)
+            ? CxxArgConversion::Convertible : CxxArgConversion::NotApplicable;
+}
+
+bool LLVMBackend::CanImplicitlyConstructCxxClass(const NamedVariable& arg,
+                                                  const TypeAndValue& param,
+                                                  bool cxxByValueParam)
+{
+        return ClassifyCxxImplicitArgument(arg, param, cxxByValueParam)
+            == CxxArgConversion::Convertible;
+}
+
+std::string LLVMBackend::DescribeCxxImplicitArgumentBlock(const NamedVariable& arg,
+                                                          const TypeAndValue& param,
+                                                          bool cxxByValueParam)
+{
+        const CxxArgConversion verdict = ClassifyCxxImplicitArgument(arg, param, cxxByValueParam);
+        if (verdict == CxxArgConversion::ExplicitCtor)
+        {
+            TypeAndValue argType = InferImplicitCxxArgumentType(arg, *this);
+            const std::string shape = ExplicitCxxConstructorBlocking(param.TypeName, { argType });
+            if (shape.empty()) return {};
+            return std::format("C++ constructor '{}' is declared explicit, so it is not offered "
+                               "as an implicit conversion here; spell the conversion out as "
+                               "'{}(<argument>)'", shape, param.TypeName);
+        }
+        if (verdict == CxxArgConversion::NonConstLvalueRef)
+            return std::format("a user-defined conversion cannot bind to the non-const reference "
+                               "parameter '{}&'; pass a named {} lvalue, or take the parameter by "
+                               "value or by const reference", param.TypeName, param.TypeName);
+        return {};
 }
 
 bool LLVMBackend::IsCxxDerivedToBaseValue(const TypeAndValue& from, const TypeAndValue& to) const
@@ -13793,7 +13866,8 @@ bool LLVMBackend::MaterializeImplicitCxxClassArgument(NamedVariable& arg,
         if (slicesToBase) argType.TypeName = param.TypeName;
         std::string why;
         const auto* ctor = SelectCxxConstructor(param.TypeName, { argType }, why,
-                                                /*allowNumericConversions*/ true);
+                                                /*allowNumericConversions*/ true, nullptr,
+                                                /*allowExplicit*/ false);
         if (ctor != nullptr && ctor->params.size() < 2) return false;
 
         TypeAndValue classType;
