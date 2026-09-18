@@ -2005,6 +2005,30 @@ llvm::Type* LLVMBackend::GetFunctionReturnABIType(const TypeAndValue& returnType
         return valueType;
 }
 
+/*
+ * A C++ `const T&` parameter binds an RVALUE by converting it to T and materializing a frame
+ * temporary, exactly as C++ does. Only the free-function binding path keeps such a parameter in
+ * the pointer-ABI shape (Pointer + IsAlias); a member parameter is rewritten to the alias-by-value
+ * shape and already takes the ParameterIsAliasByPointer route. A CLASS referent is excluded: it
+ * binds by handing over the argument's storage and its base-subobject adjust runs elsewhere.
+ */
+bool LLVMBackend::CxxConstScalarRefReferent(const TypeAndValue& param, TypeAndValue& referent) const
+{
+        if (!param.IsCxxConstRef || !param.IsAlias || !param.Pointer) return false;
+        if (param.ElemPointer || param.IsCxxRefToPointer || param.IsRvalueRef) return false;
+        if (param.IsFunctionPointer || param.IsInterface || param.IsArrayView) return false;
+        if (param.ConstArraySize > 0 || param.IsSimd || param.IsMove) return false;
+        if (dataStructures.count(param.TypeName) != 0) return false;
+        referent = param;
+        referent.Pointer = false;
+        referent.ElemPointer = false;
+        referent.PointerDepth = 0;
+        referent.IsAlias = false;
+        referent.IsCxxConstRef = false;
+        llvm::Type* type = GetType(referent);
+        return type != nullptr && (type->isIntegerTy() || type->isFloatingPointTy());
+}
+
 bool LLVMBackend::ParameterIsAliasByPointer(const TypeAndValue& param) const
 {
         // C++ T*& is represented as an alias T* whose ABI parameter is T**: the

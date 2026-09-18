@@ -1001,6 +1001,54 @@ namespace cppi
         inline int read_leaf(const Leaf* leaf) noexcept { return leaf->v; }
     }
 
+    // A CFlat scalar bound to a `const T&` parameter of a FREE function. A literal, a folded
+    // constant and an expression have no address, so the caller must convert to T and materialize
+    // a temporary; passing the raw scalar made the callee read an integer as an address.
+    namespace crefscalar
+    {
+        struct Folded { static constexpr int k = 41; };
+        enum Plain { PlainSeven = 7 };
+        enum class Scoped : int { Nine = 9 };
+        struct Box { int v; };
+
+        inline int take_cint(const int& v) { return v + 1; }
+        inline int take_clonglong(const long long& v) { return (int)(v + 2); }
+        inline int take_cdouble(const double& v) { return (int)(v * 2.0); }
+        inline int take_cbool(const bool& v) { return v ? 5 : 6; }
+        inline int take_cbox(const Box& b) { return b.v + 3; }
+        // Non-const: writes through, so only an addressable lvalue may bind it.
+        inline int take_ncint(int& v) { v = v + 1; return v; }
+        // The address the callee actually received, so a leg can prove it is the caller's own
+        // slot for an exact-width lvalue and a distinct temporary otherwise.
+        inline unsigned long long addr_cint(const int& v) { return (unsigned long long)&v; }
+
+        // Two `const T&` candidates of different referent widths. C++ picks `const int&` for an
+        // `int` argument in BOTH declaration orders; rk3 is rk2 declared the other way round.
+        inline int rk2(const int& v)       { return 3000 + v; }
+        inline int rk2(const long long& v) { return 4000 + (int)v; }
+        inline int rk3(const long long& v) { return 4000 + (int)v; }
+        inline int rk3(const int& v)       { return 3000 + v; }
+        inline int src_int() { return 41; }
+
+        // Mixed shapes: a `const T&` materialization is never a perfect match, so an exact
+        // by-value overload and a true `T&&` arm must both keep winning over it.
+        inline int mixv(int v)        { return 1000 + v; }
+        inline int mixv(const int& v) { return 2000 + v; }
+        inline int mixr(const int& v) { return 100 + v; }
+        inline int mixr(int&& v)      { return 200 + v; }
+
+        // Floating referents, both declaration orders: a materialization never wins a tie.
+        inline int dv(double v)        { return 1000 + (int)v; }
+        inline int dv(const double& v) { return 2000 + (int)v; }
+        inline int dw(const double& v) { return 2000 + (int)v; }
+        inline int dw(double v)        { return 1000 + (int)v; }
+        // A WIDER by-value candidate against an identity-exact const-ref one, both orders.
+        inline int lv(long long v)  { return 1000 + (int)v; }
+        inline int lv(const int& v) { return 2000 + v; }
+        inline int lw(const int& v) { return 2000 + v; }
+        inline int lw(long long v)  { return 1000 + (int)v; }
+    }
+
 }
 
 extern int cppi_nsobj_global;   // global-scope C++ object: no mangling at all

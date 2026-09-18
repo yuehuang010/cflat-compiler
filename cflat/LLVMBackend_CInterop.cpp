@@ -1989,6 +1989,26 @@ std::vector<std::string> LLVMBackend::BuildClangDriverArgs(const std::string& he
 static bool ParseCxxArrayParameter(const std::string& spelling, std::string& element,
                                    uint64_t& extent);
 
+/*
+ * True when a C++ parameter spelling is an LVALUE reference to a const NON-POINTER type
+ * ("const int &", "const double &"). CFlat carries no const qualifier of its own, so this is the
+ * only record that an RVALUE may bind the parameter by materializing a temporary. An rvalue
+ * reference and a reference to a pointer ("const char *&") are excluded - both keep their own
+ * shape and their own lowering.
+ */
+static bool CxxParamIsConstLvalueReference(const std::string& spelling)
+{
+        std::string s = spelling;
+        while (!s.empty() && s.back() == ' ') s.pop_back();
+        int refs = 0;
+        while (!s.empty() && s.back() == '&') { s.pop_back(); ++refs; }
+        if (refs != 1) return false;
+        while (!s.empty() && s.back() == ' ') s.pop_back();
+        // `int *const` qualifies the POINTER, not the referent, so a trailing '*' is not one.
+        if (s.empty() || s.back() == '*') return false;
+        return s.rfind("const ", 0) == 0;
+}
+
 bool LLVMBackend::MapRawSig(const cflat_cinterop::RawSig& r, CSigEntry& e)
 {
         e = CSigEntry();
@@ -2103,6 +2123,7 @@ bool LLVMBackend::MapRawSig(const cflat_cinterop::RawSig& r, CSigEntry& e)
                     ptv.ElemPointer = false;
                     ptv.IsCxxRefToPointer = true;
                 }
+                ptv.IsCxxConstRef = CxxParamIsConstLvalueReference(r.paramTypes[i]);
             }
             if (i < r.paramNames.size()) ptv.VariableName = r.paramNames[i];
             e.params.push_back(std::move(ptv));
@@ -10719,6 +10740,7 @@ void LLVMBackend::RegisterCxxClassMembers(const CRecordEntry& r, const std::stri
                 else
                     tv.Pointer = false;
                 tv.IsAlias = true;
+                tv.IsCxxConstRef = CxxParamIsConstLvalueReference(spelling);
             };
             if (aliasRefs) asAliasIfRef(m.retType, ret);
             std::vector<TypeAndValue> params;

@@ -275,6 +275,9 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
             // wrapper `f(a)` next to `f(a, b = expr)`) beats one that would fill defaults in.
             int omitted = 0;
             int moveScore = 0;
+            // Arguments bound by materializing a temporary for a C++ `const T&` scalar parameter.
+            // A materialization is strictly worse than a by-value or rvalue-ref bind (ruling).
+            int constRefMaterializations = 0;
             // Per argument: RankIntegerConversion cost, or -1 where no integer identity judged it.
             std::vector<int> integerCosts;
         };
@@ -353,6 +356,7 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
             int shapeMismatches = 0;
             // Arguments bound to a 'bool' parameter through the integer -> bool coercion.
             int boolCoercions = 0;
+            int constRefMaterializations = 0;
             std::vector<int> integerCosts;
             integerCosts.reserve(arguments.size());
 
@@ -360,6 +364,11 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
             for (const auto& arg : arguments)
             {
                 int result = -1;
+                // Set ONLY by the two `const T&` scalar arms below, so the integer-identity
+                // ranking reads the REFERENT for candidates only those arms make viable.
+                std::string constRefReferentIdentity;
+                // True when one of those arms bound this argument, integer referent or not.
+                bool constRefReferentArm = false;
                 const bool scopedEnumMismatch = candidate.IsCxx
                     && (arg.TypeAndValue.IsScopedEnum
                         || IsScopedEnumTypeName(arg.TypeAndValue.TypeName))
@@ -556,6 +565,20 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                             && arg.TypeAndValue.IsArrayView && candidateParamItr->IsArrayView
                             && !candidateParamItr->IsInterface)
                             result = 0;
+
+                        // A C++ `const T&` scalar parameter reached by a DIFFERENT scalar type
+                        // (a `char` local into `const int&`) converts to the referent and binds it.
+                        if (result < 0 && !tmpArg.Pointer)
+                        {
+                            TypeAndValue constRefReferent;
+                            if (CxxConstScalarRefReferent(tmpParam, constRefReferent)
+                                && CompareUpconvert(GetType(tmpArg), GetType(constRefReferent)) >= 0)
+                            {
+                                result = 1;
+                                constRefReferentArm = true;
+                                constRefReferentIdentity = IntegerParameterIdentity(constRefReferent);
+                            }
+                        }
                     }
                 }
                 else
@@ -593,6 +616,19 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                         valueParam.ElemPointer = false;
                         valueParam.PointerDepth = 0;
                         result = CompareUpconvert(arg.BaseType, GetType(valueParam));
+                    }
+                    else if (TypeAndValue constRefReferent;
+                             !arg.TypeAndValue.Pointer
+                             && CxxConstScalarRefReferent(*candidateParamItr, constRefReferent))
+                    {
+                        // A C++ `const T&` scalar parameter accepts an rvalue: score it against
+                        // the REFERENT, and let argument lowering materialize the temporary.
+                        result = CompareUpconvert(arg.BaseType, GetType(constRefReferent));
+                        if (result >= 0)
+                        {
+                            constRefReferentArm = true;
+                            constRefReferentIdentity = IntegerParameterIdentity(constRefReferent);
+                        }
                     }
                     else
                         result = candidateParamItr->IsCxxRefToPointer && arg.TypeAndValue.Pointer
@@ -724,12 +760,24 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                 if (result >= 0)
                 {
                     const std::string argIdentity = IntegerArgumentIdentity(arg);
-                    const std::string paramIdentity = IntegerParameterIdentity(*candidateParamItr);
+                    // A reference parameter has no identity of its own; the arms above supply the
+                    // referent's, so `const int&` outranks `const long long&` for an int literal.
+                    const std::string paramIdentity = constRefReferentIdentity.empty()
+                        ? IntegerParameterIdentity(*candidateParamItr)
+                        : constRefReferentIdentity;
                     if (!argIdentity.empty() && !paramIdentity.empty())
                     {
                         integerCost = RankIntegerConversion(argIdentity, paramIdentity);
                         result = integerCost == 0 ? 0 : 1;
                     }
+                }
+                // RULING: a `const T&` materialization is strictly WORSE than a by-value or
+                // rvalue-ref candidate at the same conversion, and never a perfect match.
+                if (constRefReferentArm)
+                {
+                    if (result == 0) result = 1;
+                    if (integerCost >= 0) integerCost += 1;
+                    if (result >= 0) constRefMaterializations++;
                 }
                 integerCosts.push_back(integerCost);
 
@@ -761,6 +809,7 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                 ranked.pair = &pair;
                 ranked.shapeMismatches = shapeMismatches;
                 ranked.boolCoercions = boolCoercions;
+                ranked.constRefMaterializations = constRefMaterializations;
                 ranked.omitted = omitted;
                 ranked.moveScore = ScoreMoveAgreement(arguments, candidate);
                 ranked.integerCosts = std::move(integerCosts);
@@ -891,6 +940,9 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
             if (!undominated.empty())
                 best = std::move(undominated);
             keepLowest(best, [](const Ranked& r) { return r.omitted; });
+            // Ruling: at the SAME conversion a by-value or rvalue-ref bind beats materializing a
+            // temporary for a `const T&`. After dominance, so an identity match still wins first.
+            keepLowest(best, [](const Ranked& r) { return r.constRefMaterializations; });
             // Same move tie-break as the perfect tier: `d.add(1, namedLvalue)` must not silently
             // keep the `move` overload and consume the caller's variable.
             keepLowest(best, [](const Ranked& r) { return -r.moveScore; });
@@ -2143,6 +2195,17 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
             else if (!inVariadicRange && candParamItr->IsCxxRefToPointer)
             {
                 argList.push_back(LowerAliasByPointerArg(arg, *candParamItr));
+            }
+            else if (TypeAndValue constRefReferent;
+                     !inVariadicRange && !arg.TypeAndValue.Pointer
+                     && CxxConstScalarRefReferent(*candParamItr, constRefReferent))
+            {
+                // A C++ `const T&` scalar parameter takes the address of a T-shaped object. An
+                // exact-type lvalue hands over its own slot; anything else - a literal, a folded
+                // constant, an expression, a narrower value - is converted to T and materialized
+                // into a frame temporary. Passing the raw scalar made the callee read an integer
+                // as an address.
+                argList.push_back(LowerAliasByPointerArg(arg, constRefReferent));
             }
             else if (!inVariadicRange && candParamItr->Pointer)
             {

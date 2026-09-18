@@ -1791,6 +1791,7 @@ nlohmann::json LLVMBackend::TvToJson(const TypeAndValue& tv)
         if (s.IsAlias)        j["al"]  = true;
         if (s.IsRvalueRef)    j["rr"]  = true;
         if (s.IsCxxRefToPointer) j["crp"] = true;
+        if (s.IsCxxConstRef) j["ccr"] = true;
         if (s.IsOwningSink)   j["osk"] = true;
         if (s.IsConsumeInferredSink) j["cis"] = true;
         if (s.IsBorrowOfAliasElement) j["bae"] = true;
@@ -1852,6 +1853,7 @@ LLVMBackend::TypeAndValue LLVMBackend::TvFromJson(const SjVal& j)
         s.IsAlias = j.value("al", false);
         s.IsRvalueRef = j.value("rr", false);
         s.IsCxxRefToPointer = j.value("crp", false);
+        s.IsCxxConstRef = j.value("ccr", false);
         s.IsOwningSink = j.value("osk", false);
         s.IsConsumeInferredSink = j.value("cis", false);
         s.IsBorrowOfAliasElement = j.value("bae", false);
@@ -2644,7 +2646,9 @@ bool LLVMBackend::TryLoadCHeaderDiskCache(
         // carries the "return type ... is unsupported" refusal for such a signature.
         // v71 harvests C++ namespace aliases and refuses a 'consteval' function: an older cache
         // has no alias pairs and carries a bindable signature for an immediate function.
-        if (version != 71) return cacheMiss("cache version");
+        // v72 records `const` on a C++ reference parameter (IsCxxConstRef): an older cache
+        // carries the flag as false, so an rvalue would not bind a `const T&` scalar parameter.
+        if (version != 72) return cacheMiss("cache version");
 
         if (!expectedRequestKey.empty()
             && j.value("cxxRequestKey", std::string{}) != expectedRequestKey)
@@ -2875,7 +2879,8 @@ void LLVMBackend::WriteCHeaderDiskCache(
         // v69 makes cached C++ signature payloads key-pure by remapping foreign types on replay.
         // v70 maps a std::function return to its std.function specialization.
         // v71 harvests C++ namespace aliases and refuses a 'consteval' function.
-        j["version"] = 71;
+        // v72 records `const` on a C++ reference parameter (IsCxxConstRef).
+        j["version"] = 72;
         j["mtime"]   = (int64_t)mtime.time_since_epoch().count();
         j["hash"]    = contentHash;
         j["ldw"]     = entry.longDoubleWidth;

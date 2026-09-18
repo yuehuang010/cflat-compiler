@@ -789,6 +789,9 @@ public:
         bool IsAlias = false;    // return/decl declared with 'alias' - borrowed reference; caller must not free the interior
         bool IsRvalueRef = false; // C++ T&& parameter: borrowed address, but only rvalues bind
         bool IsCxxRefToPointer = false; // C++ T*&: the value is the address of a T* slot
+        // C++ `const T&` parameter: an rvalue binds it by materializing a temporary. Set from
+        // the canonical parameter spelling; CFlat itself carries no const qualifier.
+        bool IsCxxConstRef = false;
         // Set by the ForwardRefScanner body-scan on a plain by-value parameter the callee body
         // UNCONDITIONALLY moves (top-level `move <param>`): a synthesized move-sink whose caller
         // source is nulled at the call site. Consumers still gate on the concrete type owning a
@@ -1165,6 +1168,7 @@ public:
         bool IsAlias = false;
         bool IsRvalueRef = false;
         bool IsCxxRefToPointer = false;
+        bool IsCxxConstRef = false;
         bool IsOwningSink = false;
         bool IsConsumeInferredSink = false;
         bool IsBorrowOfAliasElement = false;
@@ -1221,6 +1225,7 @@ public:
             s.IsAlias = t.IsAlias;
             s.IsRvalueRef = t.IsRvalueRef;
             s.IsCxxRefToPointer = t.IsCxxRefToPointer;
+            s.IsCxxConstRef = t.IsCxxConstRef;
             s.IsOwningSink = t.IsOwningSink;
             s.IsConsumeInferredSink = t.IsConsumeInferredSink;
             s.IsBorrowOfAliasElement = t.IsBorrowOfAliasElement;
@@ -1278,6 +1283,7 @@ public:
             t.IsAlias = IsAlias;
             t.IsRvalueRef = IsRvalueRef;
             t.IsCxxRefToPointer = IsCxxRefToPointer;
+            t.IsCxxConstRef = IsCxxConstRef;
             t.IsOwningSink = IsOwningSink;
             t.IsConsumeInferredSink = IsConsumeInferredSink;
             t.IsBorrowOfAliasElement = IsBorrowOfAliasElement;
@@ -7343,6 +7349,10 @@ public:
     // A non-pointer `alias T` PARAMETER borrows the caller's object, so it is passed as a
     // pointer to that object. Every call emitter and the prologue must agree on this predicate.
     bool ParameterIsAliasByPointer(const TypeAndValue& param) const;
+
+    // A C++ `const T&` parameter whose referent T is a SCALAR, in the POINTER-ABI shape the
+    // free-function binding path uses. Fills `referent` with T on a true answer.
+    bool CxxConstScalarRefReferent(const TypeAndValue& param, TypeAndValue& referent) const;
 
     std::string CreateAnonFunctionName();
 

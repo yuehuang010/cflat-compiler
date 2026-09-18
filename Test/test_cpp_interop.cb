@@ -2193,5 +2193,98 @@ extern int main()
     pmH.p = &pmOther;
     if (pmH.p->get() != 3 || pmLeaf.v != 7)                                    return 2021;
 
+    // ---- a CFlat scalar bound to a `const T&` parameter of a FREE function -----------------
+    // The free-function binding path keeps a C++ reference parameter in the pointer-ABI shape
+    // (Pointer + IsAlias), so ParameterIsAliasByPointer is false for it and the member path's
+    // materialization never ran. An argument WITH storage of the exact width was handed over
+    // (legs 1990) and everything else either segfaulted on an `inttoptr` of the value or was
+    // refused by overload resolution.
+
+    // No address at all: a literal was refused ("no overload ... matches").
+    if (cppi.crefscalar.take_cint(41) != 42)                                   return 1980;
+    // A FOLDED constant: `inttoptr (i64 41 to ptr)`, then exit 139.
+    if (cppi.crefscalar.take_cint(cppi.crefscalar.Folded.k) != 42)             return 1981;
+    // A scoped-enum constant through an explicit cast: same `inttoptr`, exit 139.
+    if (cppi.crefscalar.take_cint((int)cppi.crefscalar.Scoped.Nine) != 10)     return 1982;
+    // An arithmetic expression: `inttoptr i64 %sum`, exit 139.
+    int crefBase = 40;
+    if (cppi.crefscalar.take_cint(crefBase + 1) != 42)                         return 1983;
+    // A NARROWER lvalue: refused, because only the identical spelling scored. The temporary
+    // must hold the referent's width - a 1-byte buffer read back as `int` is garbage.
+    char crefNarrow = 41;
+    if (cppi.crefscalar.take_cint(crefNarrow) != 42)                           return 1984;
+    // `const bool&` from a literal: refused (arg=i1, param=bool*).
+    if (cppi.crefscalar.take_cbool(true) != 5)                                 return 1985;
+    // `const double&` from a floating literal: refused.
+    if (cppi.crefscalar.take_cdouble(21.0) != 42)                              return 1986;
+    // `const long long&` from an int literal: refused, though the by-value spelling took it.
+    if (cppi.crefscalar.take_clonglong(40) != 42)                              return 1987;
+
+    // The ADDRESS the callee receives, not just the value: an exact-width lvalue must hand over
+    // its OWN slot (no copy), and a literal must get a temporary that is a different object.
+    int crefOwn = 41;
+    u64 crefOwnAddr = (u64)(&crefOwn);
+    if (cppi.crefscalar.addr_cint(crefOwn) != crefOwnAddr)                     return 1988;
+    if (cppi.crefscalar.addr_cint(41) == crefOwnAddr)                          return 1989;
+
+    // Accept-set anchors - these all bound correctly before the change and must not regress:
+    // an exact-width local, a `const` local, an unscoped enum constant (which has a global
+    // slot), a `bool` local, a `double` local, and a `const T&` whose T is a CLASS.
+    const int crefConst = 41;
+    bool crefBool = true;
+    double crefDbl = 21.0;
+    cppi.crefscalar.Box crefBox = default;
+    crefBox.v = 42;
+    if (cppi.crefscalar.take_cint(crefOwn) != 42
+        || cppi.crefscalar.take_cint(crefConst) != 42
+        || cppi.crefscalar.take_cint(cppi.crefscalar.PlainSeven) != 8
+        || cppi.crefscalar.take_cbool(crefBool) != 5
+        || cppi.crefscalar.take_cdouble(crefDbl) != 42
+        || cppi.crefscalar.take_cbox(crefBox) != 45)                           return 1990;
+    // A NON-const `int&` keeps taking an addressable lvalue and writing through it.
+    int crefWrite = 41;
+    if (cppi.crefscalar.take_ncint(crefWrite) != 42 || crefWrite != 42)        return 1991;
+
+    // Two `const T&` candidates of different referent WIDTHS in one overload set. A reference
+    // parameter has no integer identity of its own, so the referent supplies it: `const int&`
+    // is identity-exact for an `int` and beats the `const long long&` widening, in BOTH
+    // declaration orders. Before this ranking, declaration order decided - rk2 (`const int&`
+    // first) returned the long long leg's 4041 for every int-shaped argument, while rk3 (the
+    // same pair declared the other way) happened to return 3041.
+    char crefRankChar = 41;
+    i64 crefRankWide = 41;
+    if (cppi.crefscalar.rk2(41) != 3041 || cppi.crefscalar.rk3(41) != 3041)    return 1992;
+    if (cppi.crefscalar.rk2(crefRankChar) != 3041
+        || cppi.crefscalar.rk3(crefRankChar) != 3041)                          return 1993;
+    if (cppi.crefscalar.rk2(cppi.crefscalar.src_int()) != 3041
+        || cppi.crefscalar.rk3(cppi.crefscalar.src_int()) != 3041)             return 1994;
+    // The wide argument must still pick the wide referent - the ranking re-ranks, never widens.
+    if (cppi.crefscalar.rk2(crefRankWide) != 4041
+        || cppi.crefscalar.rk3(crefRankWide) != 4041)                          return 1995;
+
+    // The referent identity ranks const-ref candidates against EACH OTHER; it must not make one
+    // a PERFECT match. An exact by-value overload scores 0 and still wins - feeding the identity
+    // through without this made `mixv(41)` ambiguous between `int` and `const int&`.
+    if (cppi.crefscalar.mixv(41) != 1041)                                      return 1996;
+    // A true `T&&` arm also scores 0, so a literal keeps binding the MOVE leg, not the copy -
+    // choosing `const int&` here would silently pick a copy over a move.
+    if (cppi.crefscalar.mixr(41) != 241)                                       return 1997;
+    // RULING: a const-ref materialization is strictly WORSE than a by-value or rvalue-ref bind
+    // at the SAME conversion, so it never wins a tie and CFlat keeps master's by-value pick
+    // instead of C++'s ambiguity. A `char` local promotes to `int` for both candidates; feeding
+    // the referent identity without the penalty made this pair ambiguous.
+    char crefMixChar = 41;
+    if (cppi.crefscalar.mixv(crefMixChar) != 1041)                             return 1998;
+    // A FLOATING referent has no integer identity, so only the materialization tie-break can
+    // order this pair - and it must give the same answer in both declaration orders.
+    if (cppi.crefscalar.dv(21.0) != 1021 || cppi.crefscalar.dw(21.0) != 1021)  return 1999;
+    // Ranking still runs FIRST: an identity-exact `const int&` beats a by-value `long long`
+    // that would have to widen the literal, in both orders. Master picked the widening only
+    // because the const-ref candidate did not bind at all.
+    if (cppi.crefscalar.lv(41) != 2041 || cppi.crefscalar.lw(41) != 2041)      return 2022;
+    // `move` is how CFlat spells "bind the rvalue-ref leg" for a named local; the move leg wins.
+    int crefMixMove = 41;
+    if (cppi.crefscalar.mixr(move crefMixMove) != 241)                         return 2023;
+
     return 0;
 }
