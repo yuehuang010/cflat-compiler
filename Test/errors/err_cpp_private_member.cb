@@ -8,5 +8,12 @@ extern int main()
         cppi.Point p = default;
         int leak = p.hidden_;
     }
+    // A PRIVATE base that is a class-template specialization. The invertible-mangling ruling
+    // requires every user-facing surface to demangle: before the fix this printed the internal
+    // 'cppi.BaseBox$int*', so the expectation below is what discriminates the two binaries.
+    expect_error("cannot convert 'cppi.PrivBoxDerived*' to 'cppi.BaseBox<int>*' for variable 'sneak': 'cppi.BaseBox<int>' is not a PUBLIC base of 'cppi.PrivBoxDerived'") {
+        cppi.PrivBoxDerived priv = default;
+        cppi.BaseBox<int>* sneak = &priv;
+    }
     return 0;
 }

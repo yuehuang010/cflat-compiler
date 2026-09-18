@@ -1049,6 +1049,17 @@ namespace cppi
         inline int lw(long long v)  { return 1000 + (int)v; }
     }
 
+    // A PRIVATE base that is a class-template SPECIALIZATION. The refusal at a pointer store has
+    // to spell the destination the way source does: `cppi.BaseBox<int>`, never `cppi.BaseBox$int`.
+    template <typename T>
+    class BaseBox
+    {
+    public:
+        T bv {};
+        T bget() const noexcept { return bv; }
+    };
+    class PrivBoxDerived : private BaseBox<int> { public: int tag = 7; };
+    class PubBoxDerived  : public  BaseBox<int> { public: int tag = 9; };
 }
 
 extern int cppi_nsobj_global;   // global-scope C++ object: no mangling at all

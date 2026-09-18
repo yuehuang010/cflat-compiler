@@ -1513,8 +1513,11 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 || (qualifiedCxxNamespace && IsFollowedByDot(ctx, terminal)))
                                 && !hasQualifiedMember)
                             {
+                                // A C++ namespace path keeps its exact spelling (no using-directive
+                                // rewrite), but an alias declared INSIDE a namespace still hops.
                                 namespaceContext = qualifiedCxxNamespace
-                                    ? qualifiedName : Compiler(ctx)->ResolveNamespace(qualifiedName);
+                                    ? Compiler(ctx)->ResolveNamespaceAliasExact(qualifiedName)
+                                    : Compiler(ctx)->ResolveNamespace(qualifiedName);
                                 primaryIdentifier = namespaceContext;
                                 namedVar = {};
                             }

@@ -9332,6 +9332,9 @@ public:
     bool IsImportAliasMember(const std::string& alias, const std::string& member) const;
     bool IsDataStructure(const std::string& name) const;
     std::string ResolveNamespace(const std::string& name) const;
+    // Exact alias hop only - no using-directive rewrite. A dotted C++ namespace path with no
+    // alias entry of its own comes back unchanged.
+    std::string ResolveNamespaceAliasExact(const std::string& name) const;
 
     // Candidate keys for scope-sensitive registries. The declaring scope is captured in the key at
     // registration time; lookup walks the active namespace outward and then the global scope.

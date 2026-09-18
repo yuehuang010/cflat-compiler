@@ -34,6 +34,7 @@
 #include "LLVMBackend.h"
 #include "MainListener.h"
 #include "GrammarTreeListener.h"
+#include "TypeMangling.h"
 #include <filesystem>
 #include <optional>
 #include <algorithm>
@@ -10268,10 +10269,15 @@ llvm::Value* LLVMBackend::AdjustCxxPointerForStore(const TypeAndValue& dest,
         if (FindCxxBaseOffset(src.TypeName, dest.TypeName, off, inaccessible))
             return EmitCxxBaseAdjust(value, off);
         if (inaccessible)
+        {
+            // Every user-facing surface demangles: `Box$int` is the internal spelling.
+            const std::string srcBase = SpellType(*this, TypeAndValue{ .TypeName = src.TypeName });
+            const std::string destBase = SpellType(*this, TypeAndValue{ .TypeName = dest.TypeName });
             LogError(std::format(
-                "cannot convert '{}*' to '{}*' for {}: '{}' is not a PUBLIC base of '{}', and a "
+                "cannot convert '{}' to '{}' for {}: '{}' is not a PUBLIC base of '{}', and a "
                 "conversion to a private or protected base is not allowed",
-                src.TypeName, dest.TypeName, destDesc, dest.TypeName, src.TypeName));
+                SpellType(*this, src), SpellType(*this, dest), destDesc, destBase, srcBase));
+        }
         return value;
     }
 

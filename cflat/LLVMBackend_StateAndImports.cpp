@@ -1255,6 +1255,18 @@ static size_t UsingDirectiveWorklistCap(size_t directiveCount)
         return 4096 + 8 * directiveCount;
 }
 
+std::string LLVMBackend::ResolveNamespaceAliasExact(const std::string& name) const
+{
+        for (const auto& frame : std::ranges::reverse_view(stackNamedVariable))
+        {
+            auto it = frame.namespaceAliases.find(name);
+            if (it != frame.namespaceAliases.end()) return it->second;
+        }
+        auto it = namespaceAliasTable.find(name);
+        if (it != namespaceAliasTable.end()) return it->second;
+        return name;
+    }
+
 std::string LLVMBackend::ResolveNamespace(const std::string& name) const
 {
         for (const auto& frame : std::ranges::reverse_view(stackNamedVariable))

@@ -1853,6 +1853,28 @@ extern int main()
         if (atmRd.bump(0.25) != 1.75)                                        return 2140;
         if (atmRd.get() != 1.75)                                             return 2141;
     }
+    {
+        // A C++ namespace alias declared INSIDE a namespace (`namespace cppt { namespace
+        // via_alias = impl_detail; }`) now hops for a namespace-scope OBJECT too. 2300 is the
+        // discriminator: it failed to compile before with "'payload_obj' is not a member of
+        // namespace 'cppt.via_alias'", because the C++-namespace branch kept the exact spelling
+        // instead of hopping the alias. 2301-2303 are the ACCEPT half - a function through the
+        // same nested alias, and both member kinds through a TOP-LEVEL alias - and they pass on
+        // the pre-fix binary too, so a rewrite of the plain C++ namespace path would break them.
+        if (cppt.via_alias.payload_obj != 57)                                return 2300;
+        if (cppt.via_alias.payload_fn() != 59)                               return 2301;
+        if (cppt_via_top.payload_obj != 57)                                  return 2302;
+        if (cppt_via_top.payload_fn() != 59)                                 return 2303;
+
+        // ACCEPT half of the private-base diagnostic change (passes pre-fix too): a PUBLIC
+        // class-template base still converts, so only the refusal's TEXT moved. The refusal
+        // itself is pinned in Test/errors/err_cpp_private_member.cb.
+        cppi.PubBoxDerived tplPubDer = default;
+        cppi.BaseBox<int>* tplPubBase = &tplPubDer;
+        tplPubBase->bv = 13;
+        if (tplPubBase->bget() != 13)                                        return 2304;
+        if (tplPubDer.tag != 9)                                              return 2305;
+    }
 
     {
         // C++ ALIAS TEMPLATE PATTERNS. An alias template names its target with its OWN argument

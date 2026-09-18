@@ -142,6 +142,9 @@ namespace cppt
             Payload() noexcept : v(3) {}
             int get() const noexcept { return v; }
         };
+        // Namespace-scope OBJECT and function: the object is the spelling a NESTED alias lost.
+        inline long payload_obj = 57;
+        inline long payload_fn() noexcept { return 59; }
     }
     namespace via_alias = impl_detail;
 
@@ -839,6 +842,10 @@ namespace cppt
             std::move(dataset), Sampler(batch_count));
     }
 }
+
+// Top-level alias of the SAME target as cppt.via_alias: the shape that already resolved
+// objects, kept here as the accept half of the nested-alias pair.
+namespace cppt_via_top = cppt::impl_detail;
 
 namespace cppt_inner
 {

@@ -38,13 +38,23 @@ namespace, a `using namespace`, or an `#include` to A is enough. The failure mod
 survives every later build, which makes it very expensive to diagnose - it looks exactly like a
 compiler regression.
 
-## Fix direction
+## Fix direction (amended 2026-09-17 after a batch attempt measured the premise)
 
-Fold the identity of the whole request group into the validity key of every entry written from that
-group: hash the group's header list together with each member's mtime+content hash, store it beside
-`cxxRequestKey`, and require it to match on load. Keyless (non-request) entries produced inside a
-multi-header group need it most - those are the ones with nothing else to invalidate them.
+The filed direction does NOT fix the repro. The poisoned entry's request group is
+`[cpp_interop_tpl.h]` alone, and its validity key already covers that group's mtime+content
+hash; `cpp_interop_basic.h` poisons it as a TRANSITIVE `#include` of tpl.h (line 11), not as a
+group member. The real hole: transitive-include dependency tracking (`entry.deps` +
+`CHeaderDepFresh`) is gated behind `--c-header-cache-deep`, off by default. Measured: the
+identical scenario with `--c-header-cache-deep` on both compiles passes
+(scratch/bp3_cache_repro_deep.sh in the batch worktree; plain repro script bp3_cache_repro.sh).
+
+So the fix is a POLICY decision, not a one-site edit: make transitive dependency tracking
+always-on (cost: hashing every transitive include on every C/C++ header import, Windows SDK
+umbrellas included - needs a perf accept-set measured on `import "windows.h" cache;`), or a
+cheaper middle ground (record deps always, but validate them only by mtime, not content hash).
+Needs a maintainer ruling on the cost before build.
 
 Verify with the repro above: break a namespace brace in `cpp_interop_basic.h`, compile
 `Test/test_cpp_interop_template.cb` to write the entries, repair the header, then run
-`x64/Release/cflat --check -i Test/library Test/errors/err_cpp_template_no_match.cb`. It must pass.
+`x64/Release/cflat --check -i Test/library Test/errors/err_cpp_template_no_match.cb`. It must pass
+WITHOUT `--c-header-cache-deep`.
