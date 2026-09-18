@@ -242,7 +242,9 @@ LLVMBackend::DeclTypeAndValue ForwardRefScanner::ParseDeclarationSpecifiers(CFla
                     if (genParams != nullptr)
                     {
                         // Generic type instantiation: Box<MyType> -> Box$MyType
-                        baseName = compiler->ResolveGenericBaseAlias(baseName);
+                        // The authoritative resolution runs on the SPELLED name below, once the
+                        // argument list exists; this hop is the scanner's copy of the old shape.
+                        const std::string spelledBase = baseName;
                         std::vector<std::string> typeArgs;
                     for (auto* entry : genParams->typeParameterList()->typeParameterEntry())
                     {
@@ -250,6 +252,10 @@ LLVMBackend::DeclTypeAndValue ForwardRefScanner::ParseDeclarationSpecifiers(CFla
                         // spellings for closures, nested generics, values, qualifiers, and plain types.
                         typeArgs.push_back(ResolveForwardTypeArg(entry));
                     }
+                    // A C++ alias template names its target with its OWN argument pattern, which
+                    // may fix, reorder or partially bind the target's parameters.
+                    baseName = spelledBase;
+                    compiler->ResolveGenericAliasSpelling(baseName, typeArgs, false);
                     std::string mangledName = MangleGenericInstance(*compiler, baseName, typeArgs);
                     // A generic INTERFACE instantiation is a fat pointer, not a struct: no shell,
                     // no default ctor. Mark it now - interfaceTable only fills in the main pass.
@@ -263,7 +269,9 @@ LLVMBackend::DeclTypeAndValue ForwardRefScanner::ParseDeclarationSpecifiers(CFla
                         std::vector<std::string> interfaceArgs;
                         for (auto* entry : genParams->typeParameterList()->typeParameterEntry())
                             interfaceArgs.push_back(ResolveForwardTypeArg(entry));
-                        mangledName = MangleGenericInstance(*compiler, baseName, interfaceArgs);
+                        std::string interfaceBase = spelledBase;
+                        compiler->ResolveGenericAliasSpelling(interfaceBase, interfaceArgs, false);
+                        mangledName = MangleGenericInstance(*compiler, interfaceBase, interfaceArgs);
                     }
                     // No template anywhere by this name: skip the shell, which would suppress the
                     // `unknown type` this declaration is owed. Main pass gates alike (isKnownTemplate).
@@ -1114,9 +1122,8 @@ std::string ForwardRefScanner::ResolveForwardTypeArg(CFlatParser::TypeParameterE
             std::vector<std::string> innerArgs;
             for (auto* innerEntry : innerParams->typeParameterList()->typeParameterEntry())
                 innerArgs.push_back(ResolveForwardTypeArg(innerEntry));
-            resolved = MangleGenericInstance(*Compiler(entry),
-                                             Compiler(entry)->ResolveGenericBaseAlias(innerBase),
-                                             innerArgs);
+            Compiler(entry)->ResolveGenericAliasSpelling(innerBase, innerArgs, false);
+            resolved = MangleGenericInstance(*Compiler(entry), innerBase, innerArgs);
         }
         else if (typeSpec && typeSpec->functionPointerSpecifier())
         {
@@ -1785,13 +1792,14 @@ void ForwardRefScanner::ScanUsingDeclaration(CFlatParser::UsingDeclarationContex
         std::string baseName;
         if (auto* genParams = GenericSpecOf(typeSpec, baseName))
         {
-            std::string resolvedBaseName = compiler->ResolveGenericBaseAlias(baseName);
             std::vector<std::string> args;
             for (auto* entry : genParams->typeParameterList()->typeParameterEntry())
             {
                 // Route every arg through ResolveForwardTypeArg so this shell matches ParseUsingDeclaration.
                 args.push_back(ResolveForwardTypeArg(entry));
             }
+            std::string resolvedBaseName = baseName;
+            compiler->ResolveGenericAliasSpelling(resolvedBaseName, args, false);
             std::string mangledName = MangleGenericInstance(*compiler, resolvedBaseName, args);
             // A generic interface instantiation gets no struct shell / default ctor (see
             // tryPreDeclare); the alias still names the mangled interface.

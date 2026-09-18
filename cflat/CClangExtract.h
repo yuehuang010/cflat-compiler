@@ -384,6 +384,12 @@ namespace cflat_cinterop
         bool isCxxAliasTemplate = false;
         std::string cxxAliasPattern;
         std::vector<std::string> cxxAliasParams;
+        // The alias template's target as a STRUCTURED pattern: a dotted target base plus its
+        // argument list as written, so a fixed/reordered/partial argument survives the hop.
+        std::string cxxAliasTargetBase;
+        std::vector<std::string> cxxAliasArgs;
+        // Positional with cxxAliasParams; "" where the parameter declares no default.
+        std::vector<std::string> cxxAliasParamDefaults;
         std::string file;
         int line = 1;
         int col = 0;

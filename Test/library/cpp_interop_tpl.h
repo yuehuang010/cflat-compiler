@@ -1680,3 +1680,40 @@ namespace atmrep
     inline std::memory_order order_relaxed() noexcept { return std::memory_order_relaxed; }
     inline std::memory_order order_seq_cst() noexcept { return std::memory_order_seq_cst; }
 }
+
+// C++ ALIAS TEMPLATE PATTERNS. An alias template names a specialization of its target with its
+// own argument PATTERN, which may fix, reorder or partially bind the target's parameters.
+namespace alnp
+{
+    template <class T, int N = 4> struct NBox { T v; NBox() noexcept : v(T(N)) {} };
+    template <class A, class B> struct APair
+    {
+        A a; B b;
+        APair() noexcept : a(A(1)), b(B(2)) {}
+        int tag() const noexcept { return (int)sizeof(A) * 100 + (int)sizeof(B); }
+    };
+    template <class T> struct AWrap { T inner; int mark; AWrap() noexcept : mark(3) {} };
+    template <class T, int N = 4, int M = 3> struct NBox3 { int v; NBox3() noexcept : v(N * 100 + M) {} };
+    template <class T> struct ACell { T value; ACell() noexcept : value(T(5)) {} };
+    template <class T> using ACellSelf = ACell<T>;          // target in the alias's own namespace
+}
+namespace alna
+{
+    template <class T> using NBdef = alnp::NBox<T, 7>;              // fixed non-type argument
+    // The alias's OWN default (5) differs from the target's (4), so a use site that supplies
+    // nothing must see 5 - the alias default, not the target's.
+    template <class T, int N = 5> using NB = alnp::NBox<T, N>;
+    template <class T, int N> using NBfree = alnp::NBox<T, N>;      // no default: target's applies
+    template <class T, int N = 2> using Box3Def = alnp::NBox3<T, N, 9>;   // default + later fixed
+    template <class T, int N = 2> using WrapNBdef = alnp::AWrap<alnp::NBox<T, N>>;  // nested, defaulted
+    template <class T, int N> using Box3Late = alnp::NBox3<T, N, 9>;  // fixed arg after an unsupplied param
+    template <class T> using OneParam = alnp::NBox<T, 7>;           // one parameter only
+    template <class A, class B> using Flip = alnp::APair<B, A>;     // reordered pattern
+    template <class T> using IntPair = alnp::APair<int, T>;         // partially fixed pattern
+    template <class T> using NBdefOfAlias = NBdef<T>;               // pattern names another alias
+    template <class T> using WrapNB = alnp::AWrap<alnp::NBox<T, 9>>; // nested specialization arg
+}
+template <class T> using GNBdef = alnp::NBox<T, 6>;                 // global-scope alias
+template <class T> struct GAlnBox { T value; GAlnBox() noexcept : value(T(8)) {} };
+template <class T> using GAlnBoxAlias = GAlnBox<T>;                 // global unqualified target
+inline int alna_take_nbdef(const alna::NBdef<int>& b) noexcept { return b.v + 1; }

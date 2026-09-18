@@ -2973,7 +2973,19 @@ private:
     std::unordered_map<std::string, std::string> manglingPointerAliases_;
     // `using IReference = Windows.Foundation.IReference;` - alias -> generic BASE name. Separate
     // from typeAliases because a base is not a type until its <...> arguments are supplied.
+    // An alias template's recorded target pattern: `using NBdef = NBox<T, 7>` keeps both the
+    // dotted target base and the argument list, with parameter names left in place.
+    struct CxxAliasPattern
+    {
+        std::string targetBase;
+        std::vector<std::string> params;
+        std::vector<std::string> paramDefaults;
+        std::vector<std::string> args;
+        std::string alias;
+    };
     std::unordered_map<std::string, std::string> genericBaseAliases_;
+    // C++ alias templates only: the target's own argument pattern, keyed the same way.
+    std::unordered_map<std::string, CxxAliasPattern> cxxAliasPatterns_;
     // Closure type aliases (`using Cb = function<R(Args)>;`). Cannot live in string-shaped
     // typeAliases because a closure type carries a full call signature, not a plain type name.
     std::unordered_map<std::string, TypeAndValue> functionTypeAliases;
@@ -3571,6 +3583,9 @@ private:
         bool isCxxAliasTemplate = false;
         std::string cxxAliasPattern;
         std::vector<std::string> cxxAliasParams;
+        std::string cxxAliasTargetBase;
+        std::vector<std::string> cxxAliasArgs;
+        std::vector<std::string> cxxAliasParamDefaults;
         std::string file;
         int line = 1;
         int col = 0;
@@ -5909,6 +5924,17 @@ public:
     void RegisterGenericBaseAlias(const std::string& alias, const std::string& target);
 
     bool IsGenericBaseAlias(const std::string& name) const;
+    void RegisterCxxAliasPattern(const std::string& alias, CxxAliasPattern pattern);
+    // Substitute the use site's arguments into a C++ alias template's pattern, in place. Returns
+    // false (leaving both untouched) when `base` names no such alias OR when the substitution is
+    // refused, in which case `error` carries the reason.
+    bool ApplyCxxAliasPattern(std::string& base, std::vector<std::string>& args,
+                              std::string* error = nullptr) const;
+    // The single alias hop for a generic SPELLING that carries arguments: pattern first, and the
+    // base-only hop for every alias that records no pattern. `report` is false in the
+    // opportunistic pre-pass, which may not have seen every template yet and never errors.
+    void ResolveGenericAliasSpelling(std::string& base, std::vector<std::string>& args,
+                                     bool report = true) const;
 
     std::string ResolveGenericBaseAlias(const std::string& base) const;
 

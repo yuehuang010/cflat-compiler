@@ -1,0 +1,22 @@
+// A C++ alias template is resolved through its recorded argument PATTERN. When the use site
+// leaves a parameter unsupplied, dropping pattern arguments is correct ONLY for trailing BARE
+// parameters, where the target's own defaults then apply. These two shapes cannot be dropped
+// silently, so they are refused by name. Scoped blocks: each leg is armed and checked
+// independently.
+import cpp "cpp_interop_tpl.h";
+
+extern int main()
+{
+    // A FIXED pattern argument after the unsupplied parameter: truncating would lose the 9, and
+    // passing the arguments straight through would bind 9 to N. Pre-fix this silently produced
+    // NBox3<int> -> 403 instead of the impossible-to-express intent.
+    expect_error("still names the template argument '9' after its unsupplied parameter 'N'") {
+        alna.Box3Late<int> late = default;
+    }
+    // More arguments than the alias declares: pre-fix the extra was passed to the TARGET, so
+    // `OneParam<int,9>` silently became NBox<int,9> (9) instead of the alias's fixed NBox<int,7>.
+    expect_error("takes 1 template argument(s), but 2 were given") {
+        alna.OneParam<int,9> extra = default;
+    }
+    return 0;
+}

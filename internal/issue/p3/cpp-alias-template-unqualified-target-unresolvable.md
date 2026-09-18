@@ -1,66 +1,46 @@
-# A C++ alias template whose target clang prints UNQUALIFIED cannot be resolved at all
+Bucket: p3
 
-Bucket: p3 (compile failure on a legal header spelling, no silent wrong data).
+# A GLOBAL-SCOPE C++ class template is not nameable from CFlat, at any spelling
+(compile failure on a legal header spelling, no silent wrong data).
 
 ## Summary
 
-`template <class T> using X = Target<T>;` binds only when clang prints the target of the alias
-as a NAMESPACE-QUALIFIED name. Two legal shapes print it unqualified and then neither the
-CONSTRUCTOR spelling nor the DECLARATION spelling resolves:
+Narrowed and re-measured 2026-09-17 while fixing
+`p2/cpp-alias-template-fixed-nontype-argument-dropped.md`. That fix records an alias template's
+target STRUCTURALLY (clang's qualified name for the target decl), so the half of this issue about
+a target in the ALIAS'S OWN namespace is gone:
+`namespace alnp { template<class T> struct ACell{}; template<class T> using ACellSelf = ACell<T>; }`
+now resolves (leg 2218 in `Test/test_cpp_interop_template.cb`).
 
-- the target template lives in the alias's OWN namespace
-  (`namespace n { template<class T> struct Cell{}; template<class T> using CellA = Cell<T>; }`);
-- the target template is at GLOBAL scope (`template<class T> struct GlobalBox{};`
-  `template<class T> using GlobalBoxAlias = GlobalBox<T>;`).
+What remains is NOT an alias defect. A C++ class template declared at GLOBAL scope cannot be
+named from CFlat even with no alias involved:
 
-The alias-template CONSTRUCTOR spelling was fixed separately (commit that landed
-`IsGenericBaseAlias` hops in `MainListener_PostfixExpression.cpp`); that fix is orthogonal - it
-routes the call to the declaration path, and the declaration path is broken for these two shapes
-too, so both spellings fail together.
+```cflat
+import cpp "cpp_interop_tpl.h";
+extern int main() { GlobalBox<int> c = default; return 0; }   // cannot find the type 'GlobalBox<int>'
+```
+
+`GlobalBox` is `template <class T> struct GlobalBox { T value; };` at global scope in
+`Test/library/cpp_interop_tpl.h` (line 1442). A global-scope alias TO it
+(`template<class T> using GAlnBoxAlias = GAlnBox<T>;`) fails the same way and for the same
+reason: the target has no binding to hop to. A global-scope alias whose target is NAMESPACED
+works and keeps its fixed argument (leg 2214).
 
 ## Repro
 
-`scratch/b2_tpl4.h` + `scratch/b2_tpl5.cb` (target in the alias's own namespace):
-
-```cpp
-namespace b2s
-{
-    template <class T> struct Cell { T value; Cell() noexcept : value(T(5)) {} };
-    template <class T> using CellA = Cell<T>;
-}
-```
-
-```cflat
-import cpp "b2_tpl4.h";
-extern int main() { b2s.CellA<int> c = default; printf("v=%d\n", c.value); return 0; }
-```
-
-```
-b2_tpl5.cb(2,34): cannot find the type 'Cell<int>'
-```
-
-Global-scope target - `scratch/b2_gbox2.cb` against `Test/library/cpp_interop_tpl.h`:
-
-```
-b2_gbox2.cb(2,34): cannot find the type 'GBoxAlias<int>'
-```
-
-The working shape, for contrast, is a qualified target: `namespace a { template<class T> using
-CellAlias = other_ns::AliasCell<T>; }` resolves in both spellings (legs 1581-1586 in
-`Test/test_cpp_interop_template.cb`).
+`scratch/aln_c10f.cb` (direct, no alias) and `scratch/aln_c11_global_unqual.cb` (via alias) in
+the fix-cpp-alias-nontype worktree; both refused on master 884a0c08 and on the branch.
 
 ## Root cause
 
-`RawTypedef::cxxAliasPattern` stores the target as CLANG PRINTED IT. For a target in the alias's
-own namespace or at global scope the printed pattern carries no namespace, so the harvested
-target base ("Cell", "GlobalBox") is not a name the backend can look up from the use site: the
-request is made for a base that does not exist under that spelling, and the error names the bare
-target rather than the alias.
+Not established. The binding path registers C++ class templates that the use site reaches
+through a namespace; a global-scope template appears not to be registered under a key any CFlat
+spelling produces. A concrete C++ specialization of a global template DOES bind
+(`using GlobalBoxAlias = GlobalBox<int>;` works), so the gap is in naming the TEMPLATE, not the
+record.
 
 ## Fix direction
 
-Qualify the printed pattern at harvest time - print the target with a fully-qualified policy (or
-re-qualify against the alias's declaration context) before storing it in `cxxAliasPattern`. This
-is a CACHE PAYLOAD SEMANTICS change: `cxxAliasPattern` is serialized into the C header disk cache,
-so the change needs a cache version bump alongside it, and any consumer that re-parses the pattern
-has to keep accepting the already-qualified form.
+Find where a C++ class template is registered as a generic base and why a global-scope one gets
+no key a bare CFlat spelling finds. Needs its own accept-set: a bare spelling must not start
+absorbing a same-named CFlat generic.

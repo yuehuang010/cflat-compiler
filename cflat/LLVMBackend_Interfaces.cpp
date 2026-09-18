@@ -358,6 +358,156 @@ std::string LLVMBackend::ResolveGenericBaseAlias(const std::string& base) const
         return ResolveGenericTemplateBase(base);
     }
 
+void LLVMBackend::RegisterCxxAliasPattern(const std::string& alias, CxxAliasPattern pattern)
+{
+        RegisterScopedName(cxxAliasPatterns_, alias, std::move(pattern));
+    }
+
+namespace
+{
+    // Replace whole-identifier occurrences of an alias parameter inside a nested pattern argument
+    // ("alnp.NBox<T, 9>" with T = int). Only complete identifiers match, so `TT` is left alone.
+    std::string SubstituteAliasParams(const std::string& text,
+        const std::unordered_map<std::string, std::string>& binding)
+    {
+        std::string out;
+        size_t i = 0;
+        while (i < text.size())
+        {
+            const unsigned char c = (unsigned char)text[i];
+            if (std::isalpha(c) == 0 && c != '_')
+            {
+                out.push_back(text[i++]);
+                continue;
+            }
+            size_t j = i;
+            while (j < text.size()
+                   && (std::isalnum((unsigned char)text[j]) != 0 || text[j] == '_'))
+                ++j;
+            const std::string word = text.substr(i, j - i);
+            auto it = binding.find(word);
+            out += it != binding.end() ? it->second : word;
+            i = j;
+        }
+        return out;
+    }
+
+    // Whole-identifier containment, so `TT` does not match `T`.
+    bool MentionsIdentifier(const std::string& text, const std::string& name)
+    {
+        for (size_t at = 0; (at = text.find(name, at)) != std::string::npos; at += name.size())
+        {
+            const size_t end = at + name.size();
+            const bool leftOk = at == 0
+                || (std::isalnum((unsigned char)text[at - 1]) == 0 && text[at - 1] != '_');
+            const bool rightOk = end == text.size()
+                || (std::isalnum((unsigned char)text[end]) == 0 && text[end] != '_');
+            if (leftOk && rightOk) return true;
+        }
+        return false;
+    }
+}
+
+bool LLVMBackend::ApplyCxxAliasPattern(std::string& base, std::vector<std::string>& args,
+                                       std::string* error) const
+{
+        bool applied = false;
+        // An alias whose pattern names another alias hops again; the bound is a cycle guard, a
+        // header can chain aliases but not unboundedly.
+        for (int hop = 0; hop < 8; ++hop)
+        {
+            const CxxAliasPattern* pattern = FindFirstVisibleScoped(cxxAliasPatterns_, base);
+            if (pattern == nullptr || pattern->targetBase.empty()) break;
+            if (args.size() > pattern->params.size())
+            {
+                if (error != nullptr)
+                    *error = std::format(
+                        "the C++ alias template '{}' takes {} template argument(s), but {} were "
+                        "given", pattern->alias, pattern->params.size(), args.size());
+                return false;
+            }
+            // Use-site arguments bind positionally; the alias's OWN parameter defaults cover the
+            // rest. A default may name an earlier parameter, so bind left to right.
+            std::unordered_map<std::string, std::string> binding;
+            for (size_t i = 0; i < pattern->params.size(); ++i)
+            {
+                if (i < args.size()) { binding.emplace(pattern->params[i], args[i]); continue; }
+                const std::string& fallback = i < pattern->paramDefaults.size()
+                    ? pattern->paramDefaults[i] : std::string{};
+                if (!fallback.empty())
+                    binding.emplace(pattern->params[i], SubstituteAliasParams(fallback, binding));
+            }
+            auto isUnboundParam = [&](const std::string& text) {
+                return binding.count(text) == 0
+                    && std::find(pattern->params.begin(), pattern->params.end(), text)
+                           != pattern->params.end();
+            };
+            // Truncation keeps the TARGET's defaults, so only bare unbound TRAILING pattern args may be
+            // dropped; anything else would silently lose a pattern argument and is refused instead.
+            size_t keep = pattern->args.size();
+            std::string truncatedParam;
+            for (size_t i = 0; i < pattern->args.size(); ++i)
+            {
+                const std::string& patternArg = pattern->args[i];
+                if (isUnboundParam(patternArg))
+                {
+                    if (truncatedParam.empty()) { keep = i; truncatedParam = patternArg; }
+                    continue;
+                }
+                const std::string substitutedArg = SubstituteAliasParams(patternArg, binding);
+                std::string unbound;
+                for (const std::string& param : pattern->params)
+                    if (binding.count(param) == 0 && MentionsIdentifier(substitutedArg, param))
+                        unbound = param;
+                if (!unbound.empty())
+                {
+                    if (error != nullptr)
+                        *error = std::format(
+                            "the C++ alias template '{}' names its parameter '{}' inside the "
+                            "template argument '{}', but the use site supplies no value for it "
+                            "and it declares no default", pattern->alias, unbound, patternArg);
+                    return false;
+                }
+                if (!truncatedParam.empty())
+                {
+                    if (error != nullptr)
+                        *error = std::format(
+                            "the C++ alias template '{}' still names the template argument '{}' "
+                            "after its unsupplied parameter '{}', so the argument cannot be "
+                            "dropped; supply a value for '{}'", pattern->alias, patternArg,
+                            truncatedParam, truncatedParam);
+                    return false;
+                }
+            }
+            std::vector<std::string> substituted;
+            for (size_t i = 0; i < keep; ++i)
+            {
+                auto bound = binding.find(pattern->args[i]);
+                substituted.push_back(bound != binding.end()
+                    ? bound->second : SubstituteAliasParams(pattern->args[i], binding));
+            }
+            base = pattern->targetBase;
+            args = std::move(substituted);
+            applied = true;
+        }
+        return applied;
+    }
+
+void LLVMBackend::ResolveGenericAliasSpelling(std::string& base, std::vector<std::string>& args,
+                                              bool report) const
+{
+        std::string error;
+        if (ApplyCxxAliasPattern(base, args, &error)) return;
+        if (!error.empty())
+        {
+            // The pre-pass is opportunistic and never errors; the codegen copy of the same path
+            // reports, so a refusal is never silent.
+            if (report) LogError(error);
+            return;
+        }
+        base = ResolveGenericBaseAlias(base);
+    }
+
 bool LLVMBackend::IsGenericTemplateKey(const std::string& key) const
 {
         return gts.genericStructTemplates.count(key) != 0

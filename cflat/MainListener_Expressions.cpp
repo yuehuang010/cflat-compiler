@@ -9843,10 +9843,10 @@ LLVMBackend::TypeAndValue MainListener::ParseTypeName(CFlatParser::TypeNameConte
                 else if (genParams != nullptr)
                 {
                     // Generic cast: (channel<int>*) -> mangle to channel__int
-                    baseName = compilerLLVM->ResolveGenericBaseAlias(baseName);
                     std::vector<std::string> typeArgs;
                     for (auto* entry : genParams->typeParameterList()->typeParameterEntry())
                         typeArgs.push_back(ResolveTypeArgEntry(entry));
+                    compilerLLVM->ResolveGenericAliasSpelling(baseName, typeArgs);
                     typeValue.TypeName = MangledGenericName(baseName, typeArgs);
                     std::string cxxError;
                     const bool cxxType = compilerLLVM->TryRequestCxxType(
@@ -10648,12 +10648,12 @@ std::string MainListener::ParseTypeSpecifierName(
         {
             // Generic type: Box<int> -> Box$int
             // Also apply type substitutions to arguments (e.g. Box<T> with T=int -> Box$int)
-            base = Compiler(ctx)->ResolveGenericBaseAlias(base);
             std::vector<std::string> args;
             // ResolveTypeArgEntry applies active substitutions AND recursively
             // resolves/queues nested generics (e.g. list<int> inside list<list<int>>).
             for (auto* entry : genParams->typeParameterList()->typeParameterEntry())
                 args.push_back(ResolveTypeArgEntry(entry));
+            Compiler(ctx)->ResolveGenericAliasSpelling(base, args);
             return MangledGenericName(base, args);
         }
         PrimitiveTypeError canonicalError;

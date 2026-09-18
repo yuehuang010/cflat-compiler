@@ -262,6 +262,12 @@ int veciter_direct_array_param(std.array<int, 4> value)
 {
     return cppi.array_total(value);
 }
+[cpp] struct AlnPatBase : alna.NBdef<int> { };
+
+// A C++ alias template in a FILE-SCOPE CFlat signature: the parameter and return types are
+// resolved by the ForwardRefScanner copy of the declaration path, not by the codegen copy.
+int alnpat_take_nbdef(alna.NBdef<int> value) { return value.v + 100; }
+alna.NBdef<int> alnpat_make_nbdef() { alna.NBdef<int> made = default; return made; }
 extern int main()
 {
     // Win64 keeps the existing SEH trampoline and does not emit the C++ guard, so the
@@ -1846,6 +1852,115 @@ extern int main()
         atmRd.put(1.5);
         if (atmRd.bump(0.25) != 1.75)                                        return 2140;
         if (atmRd.get() != 1.75)                                             return 2141;
+    }
+
+    {
+        // C++ ALIAS TEMPLATE PATTERNS. An alias template names its target with its OWN argument
+        // pattern (`using NBdef = NBox<T, 7>`), which may fix, reorder or partially bind the
+        // target's parameters. Pre-fix the hop kept only the TARGET BASE and re-mangled with the
+        // use site's arguments, so every fixed or reordered pattern argument was dropped: the
+        // fixed-argument legs bound NBox<int> (default 4) with no diagnostic, and the shapes
+        // whose pattern arity differs from the use site's were refused outright. Measured
+        // pre-fix values are stated per leg.
+        alna.NBdef<int> alnFixed = default;
+        if (alnFixed.v != 7)                                                 return 2200;  // was 4
+        alna.NBdef<int> alnFixedCtor = alna.NBdef<int>();
+        if (alnFixedCtor.v != 7)                                             return 2201;  // was 4
+
+        // A pattern that leaves the non-type parameter FREE. alna.NB declares its OWN default
+        // (5), which differs from alnp.NBox's (4) precisely so this leg can go red: pre-fix the
+        // alias default was never recorded and the target's 4 came back. Supplying the argument
+        // already worked pre-fix (accept set).
+        alna.NB<int> alnAliasDefault = default;
+        if (alnAliasDefault.v != 5)                                          return 2202;  // was 4
+        alna.NB<int,9> alnFreeSet = default;
+        if (alnFreeSet.v != 9)                                               return 2203;
+        // ACCEPT SET: a free parameter with NO alias default is the one case truncation is
+        // allowed for - drop the trailing bare parameter and the TARGET's own default applies.
+        alna.NBfree<int> alnFree = default;
+        if (alnFree.v != 4)                                                  return 2222;
+
+        // A REORDERED pattern: Flip<int,double> names APair<double,int>, so tag() (sizeof(A)*100
+        // + sizeof(B)) is 804. Pre-fix the arguments went through in source order -> 408.
+        alna.Flip<int,double> alnFlip = default;
+        if (alnFlip.tag() != 804)                                            return 2204;  // was 408
+        alna.Flip<int,double> alnFlipCtor = alna.Flip<int,double>();
+        if (alnFlipCtor.tag() != 804)                                        return 2205;  // was 408
+
+        // A PARTIALLY FIXED pattern: IntPair<double> names APair<int,double>. Pre-fix the single
+        // use-site argument was passed to the two-parameter target: 'APair<double>' not found.
+        alna.IntPair<double> alnPart = default;
+        if (alnPart.tag() != 408)                                            return 2206;  // was refused
+        alna.IntPair<double> alnPartCtor = alna.IntPair<double>();
+        if (alnPartCtor.tag() != 408)                                        return 2207;  // was refused
+
+        // A pattern naming ANOTHER alias hops again and keeps the inner alias's fixed argument.
+        alna.NBdefOfAlias<int> alnChain = default;
+        if (alnChain.v != 7)                                                 return 2208;  // was refused
+        alna.NBdefOfAlias<int> alnChainCtor = alna.NBdefOfAlias<int>();
+        if (alnChainCtor.v != 7)                                             return 2209;  // was refused
+
+        // A pattern argument that is itself a SPECIALIZATION (`AWrap<NBox<T, 9>>`): the use-site
+        // argument substitutes inside it. Pre-fix the pattern was dropped and the field was an
+        // int, so `.inner.v` did not compile.
+        alna.WrapNB<int> alnNest = default;
+        if (alnNest.inner.v != 9)                                            return 2210;  // was refused
+        if (alnNest.mark != 3)                                               return 2211;  // was refused
+
+        // The alias as a NESTED GENERIC ARGUMENT of another specialization.
+        alnp.AWrap<alna.NBdef<int>> alnAsArg = default;
+        if (alnAsArg.inner.v != 7)                                           return 2212;  // was 4
+        if (alnAsArg.mark != 3)                                              return 2213;
+
+        // A GLOBAL-SCOPE alias with a fixed argument.
+        GNBdef<int> alnGlobal = default;
+        if (alnGlobal.v != 6)                                                return 2214;  // was 4
+
+        // The alias in a FILE-SCOPE CFlat signature (ForwardRefScanner copy of the type path).
+        alna.NBdef<int> alnFromFn = alnpat_make_nbdef();
+        if (alnFromFn.v != 7)                                                return 2215;  // was 4
+        if (alnpat_take_nbdef(alnFromFn) != 107)                             return 2216;  // was 104
+
+        // A C++ function whose parameter is spelled with the alias: pre-fix the declaration bound
+        // NBox<int> while the callee wanted NBox<int,7>, so no overload matched.
+        if (alna_take_nbdef(alnFixed) != 8)                                  return 2217;  // was refused
+
+        // A target in the ALIAS'S OWN namespace, which clang prints without a qualifier. The
+        // structured pattern records the target's qualified name, so it resolves.
+        alnp.ACellSelf<int> alnOwnNs = default;
+        if (alnOwnNs.value != 5)                                             return 2218;  // was refused
+
+        // ACCEPT SET: the type-only aliases that already worked keep their measured values.
+        cppta.CellAlias<int> alnKeepQual = default;
+        if (alnKeepQual.value != 9)                                          return 2219;
+        cppta.CellAlias<int> alnKeepCtor = cppta.CellAlias<int>();
+        if (alnKeepCtor.value != 9)                                          return 2220;
+        GCellAlias<int> alnKeepGlobal = default;
+        if (alnKeepGlobal.value != 9)                                        return 2221;
+
+        // An alias DEFAULT followed by a fixed pattern argument: Box3Def<int> is
+        // NBox3<int, 2, 9> -> 2*100 + 9. Pre-fix both the default and the 9 were dropped (403),
+        // and supplying the argument still dropped the 9 (503).
+        alna.Box3Def<int> alnDefFixed = default;
+        if (alnDefFixed.v != 209)                                            return 2223;  // was 403
+        alna.Box3Def<int,5> alnDefFixedSet = default;
+        if (alnDefFixedSet.v != 509)                                         return 2224;  // was 503
+        // The same shape with NO default on the parameter, but the argument SUPPLIED: the only
+        // legal way to reach a late fixed argument; Box3Late<int> itself is refused (see
+        // Test/errors/err_cpp_alias_pattern.cb).
+        alna.Box3Late<int,5> alnLateSet = default;
+        if (alnLateSet.v != 509)                                             return 2225;  // was 503
+
+        // An alias default consumed INSIDE a nested pattern argument (`AWrap<NBox<T, N>>`).
+        alna.WrapNBdef<int> alnNestDefault = default;
+        if (alnNestDefault.inner.v != 2)                                     return 2226;  // was refused
+        if (alnNestDefault.mark != 3)                                        return 2227;  // was refused
+        alna.WrapNBdef<int,8> alnNestSet = default;
+        if (alnNestSet.inner.v != 8)                                         return 2228;  // was refused
+
+        // The alias as the base of a [cpp] struct (both copies of the base-clause path).
+        AlnPatBase alnBase = default;
+        if (alnBase.v != 7)                                                  return 2229;  // was 4
     }
 
     return 0;

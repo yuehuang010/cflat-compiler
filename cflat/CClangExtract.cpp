@@ -2436,6 +2436,84 @@ namespace cflat_cinterop
                 return true;
             }
 
+            /*
+             * Record an alias template's parameter DEFAULTS and its target STRUCTURALLY: the
+             * target's dotted qualified name plus each pattern argument printed on its own. The
+             * flat `cxxAliasPattern` string cannot be re-split safely (a nested
+             * `AWrap<NBox<T, 9>>` carries commas inside its own angle brackets) and, printed with
+             * the default policy, names a target in the alias's own namespace or at global scope
+             * without any qualifier at all.
+             */
+            void HarvestAliasTemplatePattern(ASTContext& ctx, TypeAliasTemplateDecl* atd,
+                                             const TypeAliasDecl* alias, RawTypedef& t)
+            {
+                PrintingPolicy pp = ctx.getPrintingPolicy();
+                pp.FullyQualifiedName = true;
+                pp.SuppressTagKeyword = true;
+                // The fully-qualified policy also qualifies a reference to the alias's OWN
+                // parameter ("alna.N"); strip that back, since the pattern binds by param name.
+                auto normalize = [&t](std::string text) {
+                    for (size_t p = 0; (p = text.find("::", p)) != std::string::npos; p += 1)
+                        text.replace(p, 2, ".");
+                    for (const std::string& param : t.cxxAliasParams)
+                    {
+                        const std::string suffix = "." + param;
+                        size_t at = 0;
+                        while ((at = text.find(suffix, at)) != std::string::npos)
+                        {
+                            const size_t end = at + suffix.size();
+                            const bool wholeWord = end == text.size()
+                                || (std::isalnum((unsigned char)text[end]) == 0 && text[end] != '_');
+                            size_t start = at;
+                            while (start > 0 && (std::isalnum((unsigned char)text[start - 1]) != 0
+                                                 || text[start - 1] == '_' || text[start - 1] == '.'))
+                                --start;
+                            if (wholeWord)
+                            {
+                                text.erase(start, end - start - param.size());
+                                at = start + param.size();
+                            }
+                            else at = end;
+                        }
+                    }
+                    return text;
+                };
+                auto printArgument = [&](const TemplateArgument& arg) {
+                    std::string text;
+                    llvm::raw_string_ostream os(text);
+                    arg.print(pp, os, /*IncludeType=*/false);
+                    os.flush();
+                    return normalize(std::move(text));
+                };
+                // An alias parameter's own DEFAULT is the alias's, not the target's: dropping it
+                // would silently fall back to whatever default the target declares.
+                for (const NamedDecl* param : *atd->getTemplateParameters())
+                {
+                    const TemplateArgumentLoc* fallback = nullptr;
+                    if (const auto* typeParam = llvm::dyn_cast<TemplateTypeParmDecl>(param))
+                    {
+                        if (typeParam->hasDefaultArgument())
+                            fallback = &typeParam->getDefaultArgument();
+                    }
+                    else if (const auto* valueParam =
+                                 llvm::dyn_cast<NonTypeTemplateParmDecl>(param))
+                    {
+                        if (valueParam->hasDefaultArgument())
+                            fallback = &valueParam->getDefaultArgument();
+                    }
+                    t.cxxAliasParamDefaults.push_back(
+                        fallback != nullptr ? printArgument(fallback->getArgument())
+                                            : std::string{});
+                }
+                const auto* tst = alias->getUnderlyingType()->getAs<TemplateSpecializationType>();
+                if (tst == nullptr) return;
+                if (const TemplateDecl* target = tst->getTemplateName().getAsTemplateDecl())
+                    t.cxxAliasTargetBase = CxxQualifiedName(target);
+                if (t.cxxAliasTargetBase.empty()) return;
+                for (const TemplateArgument& arg : tst->template_arguments())
+                    t.cxxAliasArgs.push_back(printArgument(arg));
+            }
+
             bool VisitTypeAliasTemplateDecl(TypeAliasTemplateDecl* atd)
             {
                 if (!st.req.cxxMode) return true;
@@ -2449,9 +2527,11 @@ namespace cflat_cinterop
                 t.isCxxAliasTemplate = true;
                 t.cxxAliasPattern = alias->getUnderlyingType().getAsString(ctx.getPrintingPolicy());
                 t.underlying = t.cxxAliasPattern;
+                // EVERY parameter, type and non-type alike, and in declaration order: the pattern
+                // binds use-site arguments positionally, so a skipped `int N` shifts the rest.
                 for (const NamedDecl* param : *atd->getTemplateParameters())
-                    if (const auto* typeParam = llvm::dyn_cast<TemplateTypeParmDecl>(param))
-                        t.cxxAliasParams.push_back(typeParam->getNameAsString());
+                    t.cxxAliasParams.push_back(param->getNameAsString());
+                HarvestAliasTemplatePattern(ctx, atd, alias, t);
                 st.out.typedefs.push_back(std::move(t));
                 return true;
             }

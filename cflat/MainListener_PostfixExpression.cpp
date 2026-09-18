@@ -2501,12 +2501,13 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 && !genericStructTemplates.count(baseName)
                                 && Compiler(ctx)->IsGenericBaseAlias(baseName))
                             {
-                                const std::string aliasBase =
-                                    Compiler(ctx)->ResolveGenericBaseAlias(baseName);
+                                std::string aliasBase = baseName;
+                                std::vector<std::string> aliasArgs = typeArgs;
+                                Compiler(ctx)->ResolveGenericAliasSpelling(aliasBase, aliasArgs);
                                 std::string aliasMangled =
-                                    MangleGenericInstance(*Compiler(), aliasBase, typeArgs);
+                                    MangleGenericInstance(*Compiler(), aliasBase, aliasArgs);
                                 std::string cxxError;
-                                Compiler(ctx)->TryRequestCxxType(aliasBase, typeArgs, aliasMangled,
+                                Compiler(ctx)->TryRequestCxxType(aliasBase, aliasArgs, aliasMangled,
                                                                  cxxError);
                                 if (!cxxError.empty()) LogCxxErrorContext(prevPrimary, cxxError);
                                 aliasMangled = Compiler(ctx)->ResolveTypeAlias(aliasMangled);
@@ -3233,8 +3234,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             // A C++ alias template (`template<class T> using Vec = vector<T>;`)
                             // names the aliased template; only the target has an identity to
                             // request, which is the hop the DECLARATION path already performs.
-                            if (Compiler(ctx)->IsGenericBaseAlias(baseName))
-                                baseName = Compiler(ctx)->ResolveGenericBaseAlias(baseName);
+                            Compiler(ctx)->ResolveGenericAliasSpelling(baseName, typeArgs);
                             std::string mangled = MangleGenericInstance(*Compiler(), baseName,
                                                                         typeArgs);
                             std::string cxxError;
@@ -9047,12 +9047,13 @@ void MainListener::ScanAndQueueGenericTypeUses(antlr4::RuleContext* ctx, bool to
                     // GenericSpecOf covers both spellings: bare 'Box<int>' and qualified 'NS.Box<int>'.
                     if (auto* genParams = GenericSpecOf(typeSpec, baseName))
                     {
-                        baseName = Compiler()->ResolveGenericBaseAlias(baseName);
                         std::vector<std::string> typeArgs;
                         // ResolveTypeArgEntry applies active substitutions AND recursively
                         // resolves/queues nested generics (e.g. list<int> inside list<list<int>>).
                         for (auto* entry : genParams->typeParameterList()->typeParameterEntry())
                             typeArgs.push_back(ResolveTypeArgEntry(entry));
+                        // Queue PRE-SCAN: the declaration path reports a refused pattern.
+                        Compiler()->ResolveGenericAliasSpelling(baseName, typeArgs, false);
                         // One queue funnel: it also pre-creates the opaque shell, so a LATER
                         // instantiation naming this one as a field type finds a type even when
                         // the forward scan spelled the shell differently (e.g. an alias arg).
@@ -9068,11 +9069,13 @@ void MainListener::ScanAndQueueGenericTypeUses(antlr4::RuleContext* ctx, bool to
                     auto* primaryExpr = static_cast<CFlatParser::PrimaryExpressionContext*>(ruleCtx);
                     if (primaryExpr->genericIdentifier() != nullptr && primaryExpr->genericIdentifier()->genericTypeParameters() != nullptr && primaryExpr->genericIdentifier()->Identifier() != nullptr)
                     {
-                        std::string baseName = Compiler()->ResolveGenericBaseAlias(
-                            primaryExpr->genericIdentifier()->Identifier()->getText());
+                        std::string baseName =
+                            primaryExpr->genericIdentifier()->Identifier()->getText();
                         std::vector<std::string> typeArgs;
                         for (auto* entry : primaryExpr->genericIdentifier()->genericTypeParameters()->typeParameterList()->typeParameterEntry())
                             typeArgs.push_back(ResolveTypeArgEntry(entry));
+                        // Queue PRE-SCAN: the declaration path reports a refused pattern.
+                        Compiler()->ResolveGenericAliasSpelling(baseName, typeArgs, false);
                         // Same single funnel as the typeSpecifier arm above.
                         QueueGenericInstantiation(baseName, typeArgs,
                             MangledGenericName(baseName, typeArgs),

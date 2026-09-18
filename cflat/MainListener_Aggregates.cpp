@@ -167,17 +167,29 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
             const std::string baseSpelling = BaseSpecifierName(base);
             cppBaseName = baseSpelling;
             std::vector<std::string> typeArgs;
+            std::string baseRequestName = baseSpelling;
             if (auto* generic = base->genericTypeParameters())
             {
-                cppBaseName = compiler->ResolveGenericBaseAlias(cppBaseName);
                 for (auto* entry : generic->typeParameterList()->typeParameterEntry())
                     typeArgs.push_back(ResolveTypeArgEntry(entry));
+                // A C++ alias template substitutes into its own argument pattern; the request
+                // must then name the TARGET, because the arguments are now the target's.
+                std::string aliasError;
+                if (compiler->ApplyCxxAliasPattern(cppBaseName, typeArgs, &aliasError))
+                    baseRequestName = cppBaseName;
+                else if (!aliasError.empty())
+                {
+                    Compiler(ctx)->LogErrorMessage("{}", { aliasError });
+                    return;
+                }
+                else
+                    cppBaseName = compiler->ResolveGenericBaseAlias(cppBaseName);
                 cppBaseName = MangledGenericName(cppBaseName, typeArgs);
             }
             compiler->RecordCppStructBase(structName, cppBaseName);
             std::string baseError;
             if (baseSpelling.empty()
-                || !compiler->TryRequestCxxType(baseSpelling, typeArgs, cppBaseName, baseError)
+                || !compiler->TryRequestCxxType(baseRequestName, typeArgs, cppBaseName, baseError)
                 || !compiler->IsCxxRecord(cppBaseName))
             {
                 Compiler(ctx)->LogErrorMessage(
@@ -799,9 +811,9 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
                 std::vector<std::string> initializerArgs;
                 if (auto* generic = initializerBase->genericTypeParameters())
                 {
-                    initializerName = compiler->ResolveGenericBaseAlias(initializerName);
                     for (auto* entry : generic->typeParameterList()->typeParameterEntry())
                         initializerArgs.push_back(ResolveTypeArgEntry(entry));
+                    compiler->ResolveGenericAliasSpelling(initializerName, initializerArgs);
                     initializerName = MangledGenericName(initializerName, initializerArgs);
                 }
                 if (initializerName != cppBaseName)

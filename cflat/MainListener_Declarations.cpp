@@ -107,10 +107,10 @@ std::string MainListener::ResolveTypeArgEntry(CFlatParser::TypeParameterEntryCon
         if (auto* innerParams = GenericSpecOf(typeSpec, innerBase))
         {
             // Nested generic (e.g., Box<T>): recurse into each type argument
-            innerBase = Compiler()->ResolveGenericBaseAlias(innerBase);
             std::vector<std::string> innerArgs;
             for (auto* innerEntry : innerParams->typeParameterList()->typeParameterEntry())
                 innerArgs.push_back(ResolveTypeArgEntry(innerEntry));
+            Compiler()->ResolveGenericAliasSpelling(innerBase, innerArgs);
             resolved = MangledGenericName(innerBase, innerArgs);
             // A foreign C++ specialization used as a type argument (`list<std.vector<int>>`, or
             // the inner `std.string` of `std.vector<std.string>`) must be registered before the
@@ -890,6 +890,9 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                 if (genParams != nullptr)
                 {
                     // Generic type instantiation: Box<MyType> -> Box$MyType
+                    // Hopped here only for the in-loop `tuple` check; the authoritative
+                    // resolution runs on the SPELLED name once the argument list exists.
+                    const std::string spelledBase = baseName;
                     baseName = Compiler(declSpecs)->ResolveGenericBaseAlias(baseName);
                     std::vector<std::string> typeArgs;
                     for (auto* entry : genParams->typeParameterList()->typeParameterEntry())
@@ -900,6 +903,10 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                             LogErrorContext(entry, "unique is not supported as a tuple element type");
                         typeArgs.push_back(ResolveTypeArgEntry(entry));
                     }
+                    // A C++ alias template names its target with its OWN argument pattern, which
+                    // may fix, reorder or partially bind the target's parameters.
+                    baseName = spelledBase;
+                    Compiler(declSpecs)->ResolveGenericAliasSpelling(baseName, typeArgs);
                     std::string mangledName = MangledGenericName(baseName, typeArgs);
                     if (IsCoreUniqueArrayViewInstantiation(Compiler(declSpecs), mangledName, typeArgs))
                         LogErrorContext(genParams, CoreUniqueArrayViewMessage(typeArgs));
@@ -2146,10 +2153,10 @@ void MainListener::ParseUsingDeclaration(CFlatParser::UsingDeclarationContext* c
         std::string baseName;
         if (auto* genParams = GenericSpecOf(typeSpec, baseName))
         {
-            baseName = compiler->ResolveGenericBaseAlias(baseName);
             std::vector<std::string> typeArgs;
             for (auto* entry : genParams->typeParameterList()->typeParameterEntry())
                 typeArgs.push_back(ResolveTypeArgEntry(entry));
+            compiler->ResolveGenericAliasSpelling(baseName, typeArgs);
             std::string mangledName = MangledGenericName(baseName, typeArgs);
 
             if (baseName == "std.function")

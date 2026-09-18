@@ -2183,7 +2183,6 @@ inline std::string CanonicalWrapperTypeName(const LLVMBackend* compiler, const s
     {
         std::string base = compiler->ResolveTypeAlias(
             compiler->ResolveQualifiedName(spelled.substr(0, lt)));
-        base = compiler->ResolveGenericBaseAlias(base);
         std::vector<std::string> args;
         for (const auto& arg : SplitTopLevelTypeArgs(spelled.substr(lt + 1, spelled.size() - lt - 2)))
         {
@@ -2192,6 +2191,7 @@ inline std::string CanonicalWrapperTypeName(const LLVMBackend* compiler, const s
             else
                 args.push_back(MangleTypeArg(compiler, ResolveTypeArgSpelling(compiler, arg)));
         }
+        compiler->ResolveGenericAliasSpelling(base, args);
         return MangleGenericInstance(*compiler, base, args);
     }
     return compiler->ResolveManglingAlias(
@@ -2861,10 +2861,10 @@ void ScanInterfaceDefinition(CFlatParser::InterfaceDefinitionContext* ctx,
                 std::string baseIdentity = baseName;
                 if (auto* generic = base->genericTypeParameters())
                 {
-                    baseName = compiler->ResolveGenericBaseAlias(baseName);
                     std::vector<std::string> typeArgs;
                     for (auto* entry : generic->typeParameterList()->typeParameterEntry())
                         typeArgs.push_back(ResolveForwardTypeArg(entry));
+                    compiler->ResolveGenericAliasSpelling(baseName, typeArgs, false);
                     baseIdentity = MangleGenericInstance(*compiler, baseName, typeArgs);
                     std::string cxxError;
                     compiler->TryRequestCxxType(baseName, typeArgs, baseIdentity, cxxError);

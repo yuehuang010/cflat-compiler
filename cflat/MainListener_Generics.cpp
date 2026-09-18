@@ -685,7 +685,6 @@ void MainListener::QueueInstantiateGenericType(CFlatParser::DeclarationSpecifier
                 continue;
 
             // This is a generic type instantiation
-            baseName = Compiler()->ResolveGenericBaseAlias(baseName);
             std::vector<std::string> typeArgs;
             // Resolve via ResolveTypeArgEntry so active type-parameter substitutions are
             // applied (e.g. channel<T> -> channel__int inside an instantiated generic body).
@@ -693,6 +692,9 @@ void MainListener::QueueInstantiateGenericType(CFlatParser::DeclarationSpecifier
             // instantiate with "unknown type 'T'". No-op for already-concrete args.
             for (auto* entry : genParams->typeParameterList()->typeParameterEntry())
                 typeArgs.push_back(ResolveTypeArgEntry(entry));
+            // Instantiation PRE-SCAN: opportunistic, so a refused pattern is reported by the
+            // declaration path instead, inside whatever scope the spelling actually sits in.
+            Compiler()->ResolveGenericAliasSpelling(baseName, typeArgs, false);
 
             std::string mangledName = MangledGenericName(baseName, typeArgs);
 

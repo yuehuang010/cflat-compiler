@@ -2832,6 +2832,9 @@ void LLVMBackend::CollectTypeAliases(const cflat_cinterop::ExtractResult& raw,
             entry.cxxSpecialization = t.cxxSpecialization;
             entry.isCxxAliasTemplate = t.isCxxAliasTemplate;
             entry.cxxAliasPattern = t.cxxAliasPattern;
+            entry.cxxAliasTargetBase = t.cxxAliasTargetBase;
+            entry.cxxAliasArgs = t.cxxAliasArgs;
+            entry.cxxAliasParamDefaults = t.cxxAliasParamDefaults;
             entry.cxxAliasParams = t.cxxAliasParams;
             entry.file = t.file;
             entry.line = t.line;
@@ -2990,10 +2993,21 @@ void LLVMBackend::RegisterTypeAliasSymbols(const std::vector<CTypeAliasEntry>& a
                 for (size_t p = 0; (p = targetBase.find("::", p)) != std::string::npos; p += 1)
                     targetBase.replace(p, 2, ".");
                 if (targetBase.empty()) continue;
+                // The structured pattern carries the QUALIFIED target base, so prefer it: the
+                // printed pattern names a target in the alias's own namespace with no qualifier.
+                if (!a.cxxAliasTargetBase.empty()) targetBase = a.cxxAliasTargetBase;
                 if (!a.qualifiedName.empty())
                     RegisterGenericBaseAlias(a.qualifiedName, targetBase);
                 if (a.name != a.qualifiedName)
                     RegisterGenericBaseAlias(a.name, targetBase);
+                if (!a.cxxAliasTargetBase.empty())
+                {
+                    CxxAliasPattern pattern{ a.cxxAliasTargetBase, a.cxxAliasParams,
+                                             a.cxxAliasParamDefaults, a.cxxAliasArgs,
+                                             a.qualifiedName.empty() ? a.name : a.qualifiedName };
+                    if (!a.qualifiedName.empty()) RegisterCxxAliasPattern(a.qualifiedName, pattern);
+                    if (a.name != a.qualifiedName) RegisterCxxAliasPattern(a.name, pattern);
+                }
                 RegisterTypeAliasSymbol(a.qualifiedName.empty() ? a.name : a.qualifiedName,
                                         a.cxxAliasPattern, a.file, a.line, a.col);
                 continue;

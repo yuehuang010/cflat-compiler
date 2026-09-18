@@ -4678,6 +4678,7 @@ void LLVMBackend::ResetForReanalysis()
     manglingAliases_.clear();
     manglingPointerAliases_.clear();
     genericBaseAliases_.clear();
+    cxxAliasPatterns_.clear();
     functionTypeAliases.clear();
     interfaceTable.clear();
     interfaceFields.clear();

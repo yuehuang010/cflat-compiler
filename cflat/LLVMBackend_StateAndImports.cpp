@@ -2476,7 +2476,8 @@ nlohmann::json LLVMBackend::TypeAliasToJson(const CTypeAliasEntry& a)
                 {"ln", a.line}, {"co", a.col}, {"ar", a.isAnonymousRecord},
                 {"qn", a.qualifiedName}, {"cs", a.cxxSpecialization},
                 {"iat", a.isCxxAliasTemplate}, {"cap", a.cxxAliasPattern},
-                {"can", a.cxxAliasParams}};
+                {"can", a.cxxAliasParams}, {"catb", a.cxxAliasTargetBase},
+                {"caa", a.cxxAliasArgs}, {"cad", a.cxxAliasParamDefaults}};
     }
 
 LLVMBackend::CTypeAliasEntry LLVMBackend::TypeAliasFromJson(const SjVal& j)
@@ -2493,6 +2494,9 @@ LLVMBackend::CTypeAliasEntry LLVMBackend::TypeAliasFromJson(const SjVal& j)
         a.isCxxAliasTemplate = j.value("iat", false);
         a.cxxAliasPattern = j.value("cap", std::string{});
         if (j.contains("can")) a.cxxAliasParams = j["can"].to_string_vector();
+        a.cxxAliasTargetBase = j.value("catb", std::string{});
+        if (j.contains("caa")) a.cxxAliasArgs = j["caa"].to_string_vector();
+        if (j.contains("cad")) a.cxxAliasParamDefaults = j["cad"].to_string_vector();
         return a;
     }
 
@@ -2648,7 +2652,7 @@ bool LLVMBackend::TryLoadCHeaderDiskCache(
         // has no alias pairs and carries a bindable signature for an immediate function.
         // v72 records `const` on a C++ reference parameter (IsCxxConstRef): an older cache
         // carries the flag as false, so an rvalue would not bind a `const T&` scalar parameter.
-        if (version != 72) return cacheMiss("cache version");
+        if (version != 73) return cacheMiss("cache version");
 
         if (!expectedRequestKey.empty()
             && j.value("cxxRequestKey", std::string{}) != expectedRequestKey)
@@ -2880,7 +2884,9 @@ void LLVMBackend::WriteCHeaderDiskCache(
         // v70 maps a std::function return to its std.function specialization.
         // v71 harvests C++ namespace aliases and refuses a 'consteval' function.
         // v72 records `const` on a C++ reference parameter (IsCxxConstRef).
-        j["version"] = 72;
+        // v73 records an alias template's target base + argument pattern (catb/caa).
+        // v74 adds each alias template parameter's own default (cad).
+        j["version"] = 73;
         j["mtime"]   = (int64_t)mtime.time_since_epoch().count();
         j["hash"]    = contentHash;
         j["ldw"]     = entry.longDoubleWidth;
