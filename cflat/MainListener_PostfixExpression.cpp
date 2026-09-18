@@ -6255,6 +6255,16 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             // normal overloaded (member/free/extension) function call.
                             // `winrtSlot` is resolved above at [PFX-7-slot].
                             auto* compiler = Compiler(ctx);
+                            // Receiver's C++ class name, so a failed `obj.name(...)` resolution
+                            // reports that class's member set instead of CFlat's free functions.
+                            auto cxxMemberReceiverType = [&]() -> std::string {
+                                std::string recv = structVar.TypeAndValue.TypeName;
+                                if (recv.empty() && structVar.BaseType != nullptr)
+                                    if (auto* st = llvm::dyn_cast<llvm::StructType>(structVar.BaseType))
+                                        recv = st->getName().str();
+                                return compiler->GetCxxClassInfo(recv) != nullptr ? recv
+                                                                                  : std::string();
+                            };
                             auto requestCxxTemplate = [&](std::string& resolvedName) {
                                 std::string owner;
                                 std::string memberName = functionName;
@@ -6689,7 +6699,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 requestCxxTemplate(resolvedFuncName);
 
                                 namedVar.Primary = Compiler(ctx)->CreateOverloadedFunctionCall(
-                                    resolvedFuncName, arguments, globalScopeCall, callDisplayName);
+                                    resolvedFuncName, arguments, globalScopeCall, callDisplayName,
+                                    cxxMemberReceiverType());
                                 globalScopeCall = false;
                                 {
                                     std::string rcvr = structVar.TypeAndValue.VariableName;
@@ -6752,7 +6763,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 }
                                 requestCxxTemplate(resolvedFuncName);
                                 namedVar.Primary = Compiler(primaryCtx)->CreateOverloadedFunctionCall(
-                                    resolvedFuncName, arguments, globalScopeCall, callDisplayName);
+                                    resolvedFuncName, arguments, globalScopeCall, callDisplayName,
+                                    cxxMemberReceiverType());
                                 globalScopeCall = false;
                                 {
                                     std::string rcvr = structVar.TypeAndValue.VariableName;

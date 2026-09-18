@@ -10,6 +10,7 @@
 
 #include "cpp_interop_basic.h"
 #include <cstddef>
+#include <atomic>
 #include <initializer_list>
 #include <memory>
 #include <string>
@@ -1629,4 +1630,53 @@ namespace cppt
     inline int constit_other(ConstIt<const double*> it) noexcept { return (int)*it.p + 5; }
     inline int constit_other(ConstIt<const double*> it, int bump) noexcept
     { return (int)*it.p + bump; }
+}
+
+// ACCEPT SET for the volatile-twin overload election, NOT a reproduction of the std::atomic bug.
+// libc++ declares every __atomic_base member twice - a `volatile` overload and a non-volatile one
+// - and CFlat drops `volatile` exactly as it drops `const`, so both collapse onto ONE CFlat
+// signature and the collapse must elect a twin that has a reachable symbol. Here BOTH twins have
+// one (an in-scope header has every inline body emitted, measured: a bodiless volatile twin in a
+// user header cannot be produced, so the libc++ state is not reproducible outside libc++), which
+// is the case the election must leave exactly as it was.
+namespace atmrep
+{
+    template <class T>
+    struct RepBase
+    {
+        mutable T v_;
+
+        // volatile twin FIRST, the order libc++ writes it in.
+        T get() const volatile noexcept { return v_; }
+        T get() const noexcept { return v_; }
+        void put(T d) volatile noexcept { v_ = d; }
+        void put(T d) noexcept { v_ = d; }
+        // Reversed declaration order, so both orders are covered.
+        T peek() const noexcept { return v_; }
+        T peek() const volatile noexcept { return v_; }
+        bool ready() const volatile noexcept { return true; }
+        bool ready() const noexcept { return static_cast<RepBase const volatile*>(this)->ready(); }
+    };
+
+    // Second template level, as atomic<T> : __atomic_base<T, true> : __atomic_base<T, false>.
+    template <class T>
+    struct RepMid : RepBase<T>
+    {
+        T bump(T d) volatile noexcept { this->v_ = this->v_ + d; return this->v_; }
+        T bump(T d) noexcept { this->v_ = this->v_ + d; return this->v_; }
+    };
+
+    template <class T>
+    struct Rep : RepMid<T>
+    {
+        Rep() noexcept { this->v_ = T(); }
+    };
+}
+
+// std::memory_order has no CFlat spelling for its enumerators yet, so an explicit order reaches
+// a libc++ atomic member through a C++ helper (see internal/issue p3 on scoped-enum enumerators).
+namespace atmrep
+{
+    inline std::memory_order order_relaxed() noexcept { return std::memory_order_relaxed; }
+    inline std::memory_order order_seq_cst() noexcept { return std::memory_order_seq_cst; }
 }

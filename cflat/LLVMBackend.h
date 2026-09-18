@@ -7640,6 +7640,26 @@ public:
         auto it = cxxClasses_.find(typeName);
         return it == cxxClasses_.end() ? nullptr : &it->second;
     }
+    // Every member name CFlat saw on a C++ class or its bases - bound, refused or inaccessible.
+    // Feeds the "no member of that name" diagnostic, which must never fall back to CFlat's own
+    // same-named free functions (core's atomic<T> load/store were reported for std.atomic<int>).
+    void CollectCxxMemberNames(const std::string& typeName,
+                               std::set<std::string>& out,
+                               std::set<std::string>& visited) const
+    {
+        const CxxClassInfo* info = GetCxxClassInfo(typeName);
+        if (info == nullptr || !visited.insert(typeName).second) return;
+        for (const auto& [name, access] : info->memberAccess) out.insert(name);
+        for (const auto& [name, why] : info->refusedMembers)   out.insert(name);
+        for (const auto& method : info->directMethods)         out.insert(method.raw.name);
+        for (const auto& base : info->bases) CollectCxxMemberNames(base.name, out, visited);
+    }
+    bool CxxClassHasMemberNamed(const std::string& typeName, const std::string& memberName) const
+    {
+        std::set<std::string> names, visited;
+        CollectCxxMemberNames(typeName, names, visited);
+        return names.count(memberName) != 0;
+    }
     std::vector<CxxClassInfo::Method> FindCxxBaseMethods(const std::string& baseType,
                                                          const std::string& methodName) const;
     std::vector<CxxClassInfo::Method> FindCxxBaseVirtualMethods(
@@ -8440,8 +8460,11 @@ public:
     // Returns nullptr when name is not an atomic builtin (caller falls through to normal call).
     llvm::Value* TryEmitAtomicBuiltin(const std::string& name, const std::vector<llvm::Value*>& args);
 
+    // cxxMemberReceiver: set by the `obj.name(...)` dispatch when obj is a C++ class, so a failed
+    // resolution can report THAT class's member set instead of CFlat's same-named free functions.
     llvm::Value* CreateOverloadedFunctionCall(const std::string& functionNameIn, const std::vector<LLVMBackend::NamedVariable>& arguments, bool forceRoot = false,
-                                              const std::string& displayName = {});
+                                              const std::string& displayName = {},
+                                              const std::string& cxxMemberReceiver = {});
 
     llvm::Function* GetFunction(const std::string& functionName);
 

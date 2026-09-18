@@ -10,3 +10,16 @@ expect_error("Unknown identifier 'no_such_member'") {
         return 0;
     }
 }
+
+// When a CFlat FREE function shares the missing member's name, the call must not fall through to
+// CFlat's overload table and list that unrelated function: the receiver is a C++ class, so the
+// diagnostic names the class, spelled demangled, and its own member set.
+int load(int x) { return x; }
+
+expect_error("C++ class 'std.vector<int>' has no member 'load'") {
+    int probe_cxx_missing_member()
+    {
+        std.vector<int> v = default;
+        return v.load(1);
+    }
+}

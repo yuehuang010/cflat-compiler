@@ -38,6 +38,9 @@
 //     declaration form (the torch::nn::Sequential shape).
 //   A refused member with a default-argument wrapper retries once its class-typed parameter
 //     is registered, at full and reduced arity.
+//   std.atomic<T> members, whose libc++ shape declares each one twice - a `volatile` overload
+//     and a non-volatile one - that collapse onto a single CFlat signature, plus the same shape
+//     replicated in atmrep (Test/library/cpp_interop_tpl.h) so the coverage is version-proof.
 //   Public fields of a requested class-template specialization remain addressable through a
 //     specialization alias, even beside a same-named namespace.
 //   An inferred unique_ptr returned from a C++ loader-shaped function moves its nontrivial
@@ -169,6 +172,7 @@ import cpp "cstring" cache;
 import cpp "cctype" cache;
 import cpp "cstdio" cache;
 import cpp "map" cache;
+import cpp "atomic" cache;
 import cpp "library/cpp_interop_scoped_enum.h" cache;
 import cpp "library/cpp_interop_nsstd.h" cache;
 import cpp "library/cpp_interop_strop.h" cache;
@@ -1735,6 +1739,113 @@ extern int main()
         // declaration order, so the same answer is required from both spelled orders.
         if (cppt.constit_tie(citu) != 61)                                    return 1997;
         if (cppt.constit_tie2(citu) != 61)                                   return 1998;
+    }
+
+    /*
+     * std::atomic<T> MEMBERS, and the volatile-twin overload shape they are declared in.
+     * libc++'s __atomic_base declares load / store / exchange / fetch_add twice - a `volatile`
+     * overload and a non-volatile one - and CFlat drops `volatile` exactly as it drops `const`,
+     * so both collapse onto ONE CFlat signature. Only the twin something ODR-uses gets a body,
+     * so the collapse must elect the overload with a reachable symbol. Electing the other one
+     * refused every member here while is_lock_free still bound (its non-volatile body calls the
+     * volatile twin, so BOTH had symbols) - the asymmetry that made the bug look type-specific.
+     * Every leg asserts a VALUE, so binding the wrong overload cannot pass.
+     */
+    {
+        std.atomic<int> atmI = default;
+        if ((int)atmI.is_lock_free() != 1)                                   return 2100;
+        if (atmI.load() != 0)                                                return 2101;
+        atmI.store(41);
+        if (atmI.load() != 41)                                               return 2102;
+        // fetch_add / fetch_sub / exchange each return the value the object held BEFORE the write.
+        if (atmI.fetch_add(3) != 41)                                         return 2103;
+        if (atmI.load() != 44)                                               return 2104;
+        if (atmI.fetch_sub(4) != 44)                                         return 2105;
+        if (atmI.load() != 40)                                               return 2106;
+        if (atmI.exchange(7) != 40)                                          return 2107;
+        if (atmI.load() != 7)                                                return 2108;
+
+        // compare_exchange_strong takes its expected value by reference and writes the CURRENT
+        // value back into it on failure, so the two legs below also prove the T& parameter binds.
+        int atmExpect = 7;
+        if ((int)atmI.compare_exchange_strong(atmExpect, 9) != 1)            return 2109;
+        if (atmI.load() != 9)                                                return 2110;
+        int atmStale = 100;
+        if ((int)atmI.compare_exchange_strong(atmStale, 1) != 0)             return 2111;
+        if (atmStale != 9)                                                   return 2112;
+        if (atmI.load() != 9)                                                return 2113;
+
+        // An EXPLICIT memory order. std::memory_order's enumerators have no CFlat spelling yet
+        // (internal/issue p3), so the order arrives from a C++ helper; the legs above took the
+        // seq_cst DEFAULT ARGUMENT, so both argument spellings are covered.
+        atmI.store(12, atmrep.order_seq_cst());
+        if (atmI.load(atmrep.order_relaxed()) != 12)                         return 2114;
+        if (atmI.load(atmrep.order_seq_cst()) != 12)                         return 2115;
+        if (atmI.fetch_add(1, atmrep.order_seq_cst()) != 12)                 return 2116;
+        if (atmI.load() != 13)                                               return 2117;
+        if (atmI.exchange(20, atmrep.order_relaxed()) != 13)                 return 2118;
+
+        // The member OPERATORS on __atomic_base<int, true>, in the same volatile-twin shape.
+        // CFlat's postfix ++/-- bind the C++ arity-0 operator++ / operator-- in place.
+        atmI++;
+        if (atmI.load() != 21)                                               return 2119;
+        atmI += 6;
+        if (atmI.load() != 27)                                               return 2120;
+        atmI -= 5;
+        if (atmI.load() != 22)                                               return 2121;
+        atmI--;
+        if (atmI.load() != 21)                                               return 2122;
+        if ((int)atmI != 21)                                                 return 2123;   // operator int
+    }
+    {
+        // The TYPE axis: a wider integer, bool (which libc++ routes through
+        // __atomic_base<bool, false>, so it has no fetch_add), a floating-point specialization,
+        // and a pointer to a user C++ class.
+        std.atomic<long long> atmL = default;
+        atmL.store(90000000000);
+        if (atmL.load() != 90000000000)                                      return 2124;
+        if (atmL.fetch_add(5) != 90000000000)                                return 2125;
+        if (atmL.load() != 90000000005)                                      return 2126;
+
+        std.atomic<bool> atmB = default;
+        atmB.store(true);
+        if ((int)atmB.load() != 1)                                           return 2127;
+        if ((int)atmB.exchange(false) != 1)                                  return 2128;
+        if ((int)atmB.load() != 0)                                           return 2129;
+
+        std.atomic<double> atmD = default;
+        atmD.store(2.5);
+        if (atmD.load() != 2.5)                                              return 2130;
+        if (atmD.exchange(4.25) != 2.5)                                      return 2131;
+        if (atmD.load() != 4.25)                                             return 2132;
+
+        cppi.Outer.Inner atmCell = default;
+        atmCell.value = 11;
+        std.atomic<cppi.Outer.Inner*> atmP = default;
+        atmP.store(&atmCell);
+        if (atmP.load()->value != 11)                                        return 2133;
+    }
+    {
+        // ACCEPT SET, not a discriminator: these legs PASS on the pre-fix binary too. They pin
+        // that the new election rule does NOT flip a class whose volatile twin is equally
+        // bindable. atmrep.Rep : RepMid<T> : RepBase<T> has the two template base levels of
+        // atomic<int> : __atomic_base<int,true> : __atomic_base<int,false> and the same
+        // volatile-twin overload pairs, but an IN-SCOPE header has every inline body emitted, so
+        // BOTH twins keep a symbol here - measured, and the reason the libc++ state cannot be
+        // replicated in a user header. `peek()` declares its twins in the reverse order.
+        atmrep.Rep<int> atmR = default;
+        if ((int)atmR.ready() != 1)                                          return 2134;
+        if (atmR.get() != 0)                                                 return 2135;
+        atmR.put(6);
+        if (atmR.get() != 6)                                                 return 2136;
+        if (atmR.peek() != 6)                                                return 2137;
+        if (atmR.bump(4) != 10)                                              return 2138;
+        if (atmR.get() != 10)                                                return 2139;
+
+        atmrep.Rep<double> atmRd = default;
+        atmRd.put(1.5);
+        if (atmRd.bump(0.25) != 1.75)                                        return 2140;
+        if (atmRd.get() != 1.75)                                             return 2141;
     }
 
     return 0;

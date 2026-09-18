@@ -10651,6 +10651,20 @@ void LLVMBackend::RegisterCxxClassMembers(const CRecordEntry& r, const std::stri
                 && !tv.ElemPointer && !tv.IsFunctionPointer)
                 tv.IsAlias = true;
         };
+        /*
+         * Does this overload have a symbol cflat could call at all? CFlat drops `volatile` the way
+         * it drops `const`, so libc++'s `volatile` and non-volatile twins (atomic's load / store /
+         * exchange / fetch_add) collapse onto one CFlat signature - and only the twin that was
+         * ODR-used has a body, the other losing its linkage name in the extractor. Electing the
+         * bodiless one would refuse the member outright, so bindability outranks every other
+         * preference below. Mirrors the per-member rejects in the registration loop that depend on
+         * the overload rather than on its class.
+         */
+        auto hasReachableSymbol = [](const Member& m) {
+            return m.bindRefusal.empty() && !m.isDeleted && !m.variadic
+                && !m.requiresConstructorWrapper && !m.needsLocalDefinition
+                && m.abi.valid && !m.linkageName.empty();
+        };
         std::map<std::string, size_t> instanceBySig;
         for (size_t i = 0; i < r.members.size(); ++i)
         {
@@ -10675,8 +10689,11 @@ void LLVMBackend::RegisterCxxClassMembers(const CRecordEntry& r, const std::stri
                 if (m.paramTypes[p].size() > 1
                     && m.paramTypes[p].compare(m.paramTypes[p].size() - 2, 2, "&&") == 0)
                     mineRvalue = true;
-            if (kept.isConst && !m.isConst) it->second = i;
-            else if (keptRvalue && !mineRvalue) it->second = i;
+            const bool keptBindable = hasReachableSymbol(kept);
+            const bool mineBindable = hasReachableSymbol(m);
+            if (keptBindable != mineBindable)         { if (mineBindable) it->second = i; }
+            else if (kept.isConst && !m.isConst)      it->second = i;
+            else if (keptRvalue && !mineRvalue)       it->second = i;
         }
 
         for (size_t i = 0; i < r.members.size(); ++i)

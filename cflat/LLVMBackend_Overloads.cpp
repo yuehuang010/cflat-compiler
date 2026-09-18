@@ -1440,7 +1440,7 @@ bool LLVMBackend::RejectArrayViewParamBinding(const NamedVariable& arg, const Ty
 }
 
 llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functionNameIn, const std::vector<LLVMBackend::NamedVariable>& arguments, bool forceRoot,
-        const std::string& displayName)
+        const std::string& displayName, const std::string& cxxMemberReceiver)
 {
         // These describe only the call being lowered. Clear them before overload probing so a
         // later non-C++ call cannot make a chained result reuse an earlier sret temporary.
@@ -1700,7 +1700,47 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                 }
             }
             if (TryBindCxxImplicitArgumentConversions(functionName, arguments))
-                return CreateOverloadedFunctionCall(functionName, arguments, forceRoot, displayName);
+                return CreateOverloadedFunctionCall(functionName, arguments, forceRoot, displayName,
+                                                    cxxMemberReceiver);
+            /*
+             * `obj.name(...)` on a C++ class that has no member `name` at all. Every candidate here
+             * came from CFlat's own overload table by name only - core's atomic<T> load/store were
+             * printed for std.atomic<int> - so report the C++ class's member set instead. A real
+             * UFCS/extension call is exempt: one of its candidates takes the receiver type itself.
+             */
+            const size_t receiverMemberDot = functionName.rfind('.');
+            const std::string bareMemberName = receiverMemberDot == std::string::npos
+                ? functionName : functionName.substr(receiverMemberDot + 1);
+            if (!cxxMemberReceiver.empty() && GetCxxClassInfo(cxxMemberReceiver) != nullptr
+                && !CxxClassHasMemberNamed(cxxMemberReceiver, bareMemberName)
+                && std::none_of(candidates.begin(), candidates.end(), [&](const auto& c) {
+                       return !c.Parameters.empty()
+                           && c.Parameters[0].TypeName == cxxMemberReceiver;
+                   }))
+            {
+                std::set<std::string> names, visited;
+                CollectCxxMemberNames(cxxMemberReceiver, names, visited);
+                // A library's own reserved names (libc++ writes 27 of them on vector) drown the
+                // list; keep them out unless the call itself asked for one.
+                const bool wantsReserved = bareMemberName.starts_with("__");
+                std::string bound;
+                size_t hidden = 0;
+                for (const auto& name : names)
+                {
+                    if (name == "__ctor" || name == "__dtor") continue;
+                    if (!wantsReserved && name.starts_with("__")) { ++hidden; continue; }
+                    bound += (bound.empty() ? "" : ", ") + name;
+                }
+                if (bound.empty()) bound = "none";
+                if (hidden != 0)
+                    bound += std::format(" (plus {} reserved name(s) starting with '__')", hidden);
+                TypeAndValue receiverType;
+                receiverType.TypeName = cxxMemberReceiver;
+                const std::string shownReceiver = SpellType(*this, receiverType);
+                LogRawError(std::format("C++ class '{}' has no member '{}'.\n  Members of '{}': {}",
+                                        shownReceiver, bareMemberName, shownReceiver, bound));
+                return nullptr;
+            }
             std::string msg = std::format("no overload of '{}' matches the given arguments.\n", shownFunctionName);
 
             // Recover a named-argument diagnostic only from candidates whose parameter names
