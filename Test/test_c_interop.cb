@@ -589,6 +589,14 @@ extern int main()
     if (obk != obv)                              return 222;
     if (c_handle_load(oref) != 0x5A5A5A5A)       return 223;   // passes to a void* param
 
+    // Accept-set leg for the void*-deref rejection: an INCOMPLETE record has no layout, but
+    // `&*p` on a handle never loads it, so it stays legal (the rejection is scoped to a pointee
+    // with no type at all). A by-value `ML_Opaque x = *oref;` keeps its own "incomplete here"
+    // diagnostic instead - see Test/errors/err_void_pointer_deref.cb for the void* arms.
+    ML_Opaque* oaddr = &*oref;
+    if (oaddr != oref)                           return 224;
+    if (c_handle_load(oaddr) != 0x5A5A5A5A)      return 225;
+
     // ---- Section T: C function-pointer struct fields + typed struct pointers -
     // cinterop.c's CbVtbl is a struct of function pointers (a mini COM vtable) and
     // CbObj.vtbl points at it. The C-fn-ptr fields must import as callable thin

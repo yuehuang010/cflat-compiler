@@ -10324,6 +10324,7 @@ LLVMBackend::NamedVariable MainListener::ParseUnaryExpression(CFlatParser::Unary
                 // For char* (ElemPointer=false): deref gives char (clear Pointer).
                 // Depth: `*` removes one level from an already-recorded depth; an unrecorded
                 // operand stays unrecorded.
+                const auto derefOperandType = namedVar.TypeAndValue;
                 if (namedVar.TypeAndValue.PointerDepth >= 1)
                     namedVar.TypeAndValue.PointerDepth--;
                 if (namedVar.TypeAndValue.ElemPointer)
@@ -10334,6 +10335,15 @@ LLVMBackend::NamedVariable MainListener::ParseUnaryExpression(CFlatParser::Unary
                     namedVar.TypeAndValue.IsInterfacePointer = false;
                 }
                 auto* pointeeType = compiler->GetType(namedVar.TypeAndValue);
+                // A TYPELESS pointee (a 'void*') cannot be loaded: LLVM's own alignment query
+                // traps on it instead of reporting anything. An unsized NAMED type (an
+                // incomplete C record) is left alone - `&*p` on one is legal and the load site
+                // has its own "incomplete here" diagnostic.
+                if (pointeeType == nullptr || pointeeType->isVoidTy())
+                    LogErrorContext(ctx, std::format(
+                        "cannot dereference '{}': its pointee has no size, so there is nothing to "
+                        "load. Cast it to a typed pointer first (for example '*(int*)p').",
+                        SpellType(*compiler, derefOperandType)));
                 llvm::Value* baseStorage = namedVar.Storage;
                 // A `*p` dereference of an explicitly-moved-null thin pointer local is statically
                 // null - reject it, same as the '->'/'.' guard.

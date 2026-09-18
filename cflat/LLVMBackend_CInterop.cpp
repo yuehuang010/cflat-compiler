@@ -9842,6 +9842,11 @@ void LLVMBackend::RegisterCRecords(std::vector<CRecordEntry>& records, const std
                 {
                     int ptrLevels = 0;
                     std::string tag = AggregatePointeeTag(elemSpelling, ptrLevels);
+                    // Clang spells a C++ class with no struct/union keyword, so
+                    // AggregatePointeeTag cannot answer for one - CxxRecordPointeeTag can, and it
+                    // covers the reference spelling (`Foo&`, which binds as a pointer) too.
+                    if (tag.empty() && r.isCxx)
+                        tag = CxxRecordPointeeTag(elemSpelling, ptrLevels);
                     if (!tag.empty() && ptrLevels <= 2 && dataStructures.find(tag) != dataStructures.end())
                         tv.TypeName = tag;   // keep Pointer / ElemPointer as the mapper set them
                 }

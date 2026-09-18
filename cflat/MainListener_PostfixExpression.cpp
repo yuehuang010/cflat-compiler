@@ -3119,6 +3119,14 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 elementTypeAndValue.IsInterfacePointer = false;
                             }
                             auto elementType = Compiler(ctx)->GetType(elementTypeAndValue);
+                            // An UNSIZED element has no stride: a 'void*' traps in LLVM's
+                            // alignment query, an incomplete record emitted invalid IR.
+                            if (elementType == nullptr || !elementType->isSized())
+                                LogErrorContext(ctx, std::format(
+                                    "cannot index '{}': its element has no size, so there is no "
+                                    "stride to step by. Cast it to a typed pointer first (for "
+                                    "example '((int*)p)[i]').",
+                                    SpellType(*Compiler(ctx), namedVar.TypeAndValue)));
                             llvm::Value* subBaseStorage = namedVar.Storage;
                             // An indexed deref (`p[i]`) of an explicitly-moved-null thin pointer local
                             // is statically null - reject it, same as the '->'/'.'/'*' guards.

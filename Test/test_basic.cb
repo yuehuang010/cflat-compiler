@@ -6353,5 +6353,19 @@ bool testParenLvalueStore()
     (t.num)++;
     result &= Test("plv_paren_field_increment", t.num, 6);
 
+    // Accept-set for the void*-deref rejection: a 'void**' HAS a sized pointee (a pointer), so
+    // one deref of it stays legal and yields the inner pointer. Deref of the 'void*' itself is
+    // refused in Test/errors/err_void_pointer_deref.cb.
+    int vdTarget = 71;
+    void* vdInner = &vdTarget;
+    void** vdOuter = &vdInner;
+    void* vdBack = (*vdOuter);
+    int* vdTyped = (int*)vdBack;
+    result &= Test("plv_void_double_ptr_deref", (*vdTyped), 71);
+    // Same accept-set for the index arm: a 'void**' element IS a sized pointer.
+    void* vdIdxBack = vdOuter[0];
+    int* vdIdxTyped = (int*)vdIdxBack;
+    result &= Test("plv_void_double_ptr_index", (*vdIdxTyped), 71);
+
     return result;
 }

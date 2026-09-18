@@ -947,6 +947,60 @@ namespace cppi
         struct WithField { static const int cap = 49; int v; };
     }
 
+    // A C++ data member that is a POINTER or REFERENCE to another C++ class. Clang spells the
+    // field type with no struct/union keyword, so the pointee has to be recovered from the C++
+    // spelling or the field decays to an opaque void* and the member chain off it dies.
+    namespace ptrmem
+    {
+        struct Leaf
+        {
+            int v;
+            int get() const noexcept { return v; }
+            void set(int n) noexcept { v = n; }
+        };
+
+        struct Poly
+        {
+            int b;
+            virtual ~Poly() {}
+            virtual int who() const noexcept { return 1; }
+        };
+
+        struct PolyDerived : Poly
+        {
+            int who() const noexcept override { return 2; }
+        };
+
+        struct Holder
+        {
+            Leaf* p;                 // plain pointer member
+            const Leaf* cp;          // const-qualified pointee
+            Leaf& r;                 // reference member (binds as a pointer field)
+            Leaf byval;              // the anchor: a by-value member already chained
+            Poly* poly;              // pointer to a POLYMORPHIC class: dispatch via the vtable
+            Holder(Leaf* leaf, Poly* pv) noexcept
+                : p(leaf), cp(leaf), r(*leaf), byval(*leaf), poly(pv) {}
+        };
+
+        // A pointer member whose pointee itself has a pointer member (chained hops).
+        struct Outer
+        {
+            Holder* h;
+            Outer(Holder* hh) noexcept : h(hh) {}
+        };
+
+        inline Holder& holder_ref() noexcept
+        {
+            static Leaf leaf{ 61 };
+            static Poly poly;
+            static Holder held(&leaf, &poly);
+            return held;
+        }
+
+        inline Poly* make_derived() noexcept { static PolyDerived d; return &d; }
+        inline int read_leaf(const Leaf* leaf) noexcept { return leaf->v; }
+    }
+
 }
 
 extern int cppi_nsobj_global;   // global-scope C++ object: no mangling at all

@@ -1,0 +1,22 @@
+// Dereferencing a 'void*' has no sized pointee to load. Pre-fix the compiler reached
+// llvm::DataLayout::getAlignment on the unsized type and died with SIGTRAP (exit 133) and no
+// diagnostic at all - the trap this file replaces. Scoped-block form: the error is raised while
+// the statement is walked, inside the braces.
+
+expect_error("its pointee has no size") {
+    int voidDerefX = 5;
+    void* voidDerefP = &voidDerefX;
+    int voidDerefY = (*voidDerefP);
+}
+
+// Indexing the same 'void*' is the other arm of the family: no element size means no GEP
+// stride, and it trapped the same way pre-fix.
+expect_error("its element has no size") {
+    int voidIdxX = 5;
+    void* voidIdxP = &voidIdxX;
+    int voidIdxY = (int)voidIdxP[0];
+}
+
+// The void** accept-set neighbours (one deref of a 'void**' is still legal) is a VALUE leg in
+// Test/test_basic.cb ("plv_void_double_ptr_deref"); an err file is only compiled, never run.
+extern int main() { return 0; }

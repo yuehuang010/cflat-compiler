@@ -156,6 +156,11 @@ struct ArrElemH5 { cppa.CtorOnly[2] cells = { v = 1 }; };
 struct ArrElemH6 { cppa.Trk[2] cells = { v = 1 }; };
 extern int strcmp(const char* a, const char* b);
 int my_inc_cb(int x) { return x + 1; }
+// Collision axis for the pointer-member section below: a FREE function named 'p', which the
+// member name 'p' of cppi.ptrmem.Holder must not be resolved to.
+int p(int x) { return x + 100; }
+// Accept-set anchor: a CFlat struct holding a pointer to a C++ class already chained pre-fix.
+struct PtrMemCflatHolder { cppi.ptrmem.Leaf* p = default; };
 static bool near(double actual, double expected, double tol)
 {
     double diff = actual - expected;
@@ -2117,6 +2122,76 @@ extern int main()
     // The '&' spelling stays available and yields the same address.
     cppi.RefCell* refretAmp = &cppi.ref_cell();
     if (refretAmp != refretCell)                                            return 1973;
+
+    // ---- A member call / field read through a POINTER-typed C++ data member ----------------
+    // Pre-fix a C++ field spelled `Leaf*` mapped to an opaque void* (clang writes the class name
+    // with no struct/union keyword, which the pointee recovery keyed on), so the deref that
+    // continues the chain never happened. Discriminators, all measured on master:
+    //   `(*h.p).get()`  -> compiler SIGTRAP (exit 133), no diagnostic: void* has no sized pointee
+    //   `h.p->get()`    -> "the function 'p' is not known." - 'p' fell through to a free-fn lookup
+    //   `h.p->v`        -> "Undefined variable v." - the chain lost its receiver entirely
+    // Each leg below therefore fails on master either by trap or by refusing to compile, and
+    // asserts the VALUE the C++ side sees.
+    cppi.ptrmem.Leaf pmLeaf = default;
+    pmLeaf.v = 7;
+    cppi.ptrmem.Poly pmBase = default;
+    cppi.ptrmem.Holder pmH = cppi.ptrmem.Holder(&pmLeaf, &pmBase);
+
+    // The three spellings of a call through the pointer member. `.` forwards through a pointer
+    // per the operator-dot ruling, so all three mean the same call.
+    if ((*pmH.p).get() != 7)                                                return 2000;
+    if (pmH.p->get() != 7)                                                  return 2001;
+    if (pmH.p.get() != 7)                                                   return 2002;
+    if (pmH.p?.get() != 7)                                                  return 2003;
+    if ((pmH.p)->get() != 7)                                                return 2004;
+    // The by-value member is the anchor: it chained before the fix and must still chain.
+    if (pmH.byval.get() != 7)                                               return 2005;
+
+    // Data-member read through the pointer member, and a WRITE that the C++ side reads back.
+    if (pmH.p->v != 7)                                                      return 2006;
+    if (pmH.p.v != 7)                                                       return 2007;
+    pmH.p->v = 9;
+    if (cppi.ptrmem.read_leaf(pmH.p) != 9 || pmLeaf.v != 9)                    return 2008;
+    pmH.p->set(7);
+    if (pmLeaf.v != 7)                                                      return 2009;
+    // Subscript on the pointer member (index 0 is the pointee itself).
+    if (pmH.p[0].v != 7)                                                    return 2010;
+
+    // A const-qualified pointee and a REFERENCE member reach the same path.
+    if (pmH.cp->get() != 7 || pmH.cp.get() != 7)                               return 2011;
+    if (pmH.r.get() != 7 || pmH.r->get() != 7)                                 return 2012;
+
+    // VIRTUAL dispatch through a pointer member: the derived override must run, so a leg that
+    // resolved statically to Poly::who would answer 1 for both.
+    cppi.ptrmem.Holder pmHd = cppi.ptrmem.Holder(&pmLeaf, cppi.ptrmem.make_derived());
+    if (pmHd.poly->who() != 2)                                              return 2013;
+    if (pmH.poly->who() != 1)                                               return 2014;
+
+    // Chained hops: a pointer member whose pointee has its own pointer member, the holder
+    // reached through a CFlat pointer, and the holder returned BY REFERENCE from C++.
+    cppi.ptrmem.Outer pmO = cppi.ptrmem.Outer(&pmH);
+    if (pmO.h->p->get() != 7)                                               return 2015;
+    cppi.ptrmem.Holder* pmHp = &pmH;
+    if (pmHp->p->get() != 7)                                                return 2016;
+    if (cppi.ptrmem.holder_ref().p->get() != 61)                               return 2017;
+
+    // Collision axis: a free function named 'p' is in scope (see the file-scope declaration).
+    // The MEMBER must win; pre-fix this leg reported "no overload of 'p' matches" instead.
+    if (pmH.p->get() != 7 || p(1) != 101)                                      return 2018;
+
+    // Accept-set anchor: the CFlat-struct holder of the same pointer type worked pre-fix and
+    // must be unchanged, in all three spellings.
+    PtrMemCflatHolder pmCf = default;
+    pmCf.p = pmH.p;
+    if (pmCf.p->get() != 7 || pmCf.p.get() != 7 || (*pmCf.p).get() != 7)       return 2019;
+    // A pointer LOCAL bound off the member (the spelling that already worked) still works.
+    cppi.ptrmem.Leaf* pmLocal = pmH.p;
+    if (pmLocal->get() != 7)                                                return 2020;
+    // Reseating the pointer member retargets the call.
+    cppi.ptrmem.Leaf pmOther = default;
+    pmOther.v = 3;
+    pmH.p = &pmOther;
+    if (pmH.p->get() != 3 || pmLeaf.v != 7)                                    return 2021;
 
     return 0;
 }
