@@ -534,6 +534,9 @@ namespace cflat_cinterop
         // Namespace-scope C++ using-directives, as CFlat dotted namespace pairs. The backend
         // resolves these at lookup time instead of duplicating every nominated declaration.
         std::vector<std::pair<std::string, std::string>> usingDirectives;
+        // Namespace aliases (`namespace a = b::c;`), as CFlat dotted (alias, target) pairs. The
+        // backend registers them as namespace aliases so a use through the alias resolves.
+        std::vector<std::pair<std::string, std::string>> namespaceAliases;
         // Names of generated default-argument wrappers whose declarations or bodies carried
         // parse/Sema errors and were therefore withheld from CodeGen.
         std::vector<std::string> droppedCxxDefaultWrappers;

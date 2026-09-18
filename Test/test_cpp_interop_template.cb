@@ -1390,6 +1390,25 @@ extern int main()
     globalboxTypedef.value = 2.5;
     if (globalboxTypedef.value != 2.5)                    return 1580;
 
+    // ---- C++ ALIAS TEMPLATES, declaration and CONSTRUCTOR spelling ------------------------------
+    // 1581 and 1583 are the discriminators: the constructor spelling of an alias template was
+    // refused as "the function 'CellAlias' is not known" / "unknown generic function 'GCellAlias'",
+    // because the call path looked the name up in the function tables while the declaration path
+    // desugared it. The `= default` legs pin that the declaration spelling still resolves.
+    cppta.CellAlias<int> cellaliasCtor = cppta.CellAlias<int>();
+    if (cellaliasCtor.value != 9)                         return 1581;
+    cppta.CellAlias<int> cellaliasDecl = default;
+    if (cellaliasDecl.value != 9)                         return 1582;
+    GCellAlias<int> gcellaliasCtor = GCellAlias<int>();
+    if (gcellaliasCtor.value != 9)                        return 1583;
+    // The alias and the aliased template must reach ONE record: these header functions take the
+    // ALIASED specialization by reference, so a second registration would not bind here.
+    if (gcellalias_take(gcellaliasCtor) != 11)            return 1584;
+    if (cellalias_take(cellaliasCtor) != 12)              return 1585;
+    // An alias template inside a NESTED namespace, constructor-called.
+    cppta.deep.DeepCellAlias<int> cellaliasDeep = cppta.deep.DeepCellAlias<int>();
+    if (cellaliasDeep.value != 9)                         return 1586;
+
     // ---- C++ member ref-qualifiers --------------------------------------------------------------
     cppt.RefQualAssignBox refqualA = cppt.RefQualAssignBox(1);
     cppt.RefQualAssignBox refqualAlias = refqualA;

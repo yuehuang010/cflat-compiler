@@ -42,3 +42,19 @@ namespace cppu_self
     using namespace cppu_self;
     inline long via_using7() noexcept { return helper7() + 100; }
 }
+
+// A NAMESPACE ALIAS (`namespace a = b;`) is a second spelling for an existing namespace, and
+// every kind of member has to resolve through it: a function, a namespace-scope VARIABLE (the
+// one spelling that bound nothing before), a class type and a scoped-enum member. Covered at a
+// top-level target, a NESTED target, and an alias of an alias.
+namespace cppu_alias_target
+{
+    inline long alias_fn() noexcept { return 29; }
+    inline long alias_counter = 43;   // header-only object, no companion .cpp here
+    struct AliasBox { long v; };
+    enum class AliasE { A = 31, B = 37 };
+    namespace deep { inline long alias_deep_fn() noexcept { return 41; } }
+}
+namespace cppu_al = cppu_alias_target;
+namespace cppu_al_deep = cppu_alias_target::deep;
+namespace cppu_al2 = cppu_al;

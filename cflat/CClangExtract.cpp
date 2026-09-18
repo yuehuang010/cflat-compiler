@@ -1064,7 +1064,13 @@ namespace cflat_cinterop
                     QueueFunctionPointerAbi(st, ctx, p->getType());
                 }
                 QueueFunctionPointerAbi(st, ctx, fd->getReturnType());
-                if (st.req.cxxMode && !fd->isVariadic())
+                // An immediate ('consteval') function is evaluated by the C++ front end and gets
+                // no runtime symbol, so binding it would only fail at link time with a mangled name.
+                if (st.req.cxxMode && fd->isConsteval())
+                    sig.bindRefusal = std::string("C++ function '") + sig.name
+                        + "' is declared 'consteval'; an immediate function has no runtime symbol, "
+                          "so cflat cannot call it";
+                if (st.req.cxxMode && !fd->isVariadic() && sig.bindRefusal.empty())
                     st.abiWork.emplace_back(st.out.sigs.size(), fd);
                 st.out.sigs.push_back(std::move(sig));
                 return true;
@@ -1180,6 +1186,32 @@ namespace cflat_cinterop
                 const std::string to = CxxQualifiedName(nominated);
                 if (IsValidDottedName(from) && IsValidDottedName(to))
                     st.out.usingDirectives.emplace_back(from, to);
+                return true;
+            }
+
+            // `namespace a = b::c;` names an existing namespace under a second spelling. Harvest
+            // the pair so lookup can hop the alias; the alias itself declares nothing.
+            bool VisitNamespaceAliasDecl(NamespaceAliasDecl* na)
+            {
+                if (!st.req.cxxMode || na == nullptr || na->isInvalidDecl()) return true;
+                const NamespaceDecl* target = na->getNamespace();
+                if (target == nullptr || target->isAnonymousNamespace()) return true;
+                if (!na->getIdentifier()) return true;
+                // A function-local or anonymous-namespace alias is not exportable.
+                for (const DeclContext* dc = na->getDeclContext(); dc != nullptr; dc = dc->getParent())
+                {
+                    if (dc->isFunctionOrMethod()) return true;
+                    if (const auto* ns = llvm::dyn_cast<NamespaceDecl>(dc);
+                        ns != nullptr && ns->isAnonymousNamespace())
+                        return true;
+                }
+                std::string file; int line = 1, col = 0;
+                if (!LocOf(na, file, line, col)) return true;
+
+                std::string from = CxxQualifiedName(na);
+                const std::string to = CxxQualifiedName(target);
+                if (IsValidDottedName(from) && IsValidDottedName(to) && from != to)
+                    st.out.namespaceAliases.emplace_back(from, to);
                 return true;
             }
 

@@ -3591,6 +3591,8 @@ private:
         std::vector<CTypeAliasEntry> typeAliases;
         // C++ namespace-scope using-directives, replayed before qualified lookup on cache hits.
         std::vector<std::pair<std::string, std::string>> usingDirectives;
+        // C++ namespace aliases (`namespace a = b;`), replayed on cache hits.
+        std::vector<std::pair<std::string, std::string>> namespaceAliases;
         std::vector<CHeaderDep> deps;
         // M5 companion module: LLVM bitcode holding the C++ definitions Clang emitted for this
         // import group (inline bodies, vtables/RTTI, inline static members). Cached with the
@@ -3623,7 +3625,7 @@ private:
         return entry.sigs.size() + entry.functionTemplates.size() + entry.enums.size() + entry.records.size()
              + entry.macros.size() + entry.funcMacros.size() + entry.globals.size()
              + entry.recordAliases.size() + entry.typeAliases.size()
-             + entry.usingDirectives.size()
+             + entry.usingDirectives.size() + entry.namespaceAliases.size()
              + entry.functionPointerAbis.size() + entry.deps.size()
              + entry.cxxBitcode.size() / kCFileSigBitcodeBytesPerRow;
     }
@@ -5445,6 +5447,8 @@ private:
     std::string GetCxxBindingRefusal(const std::string& name) const;
     void RegisterCxxUsingDirectives(
         const std::vector<std::pair<std::string, std::string>>& directives);
+    void RegisterCxxNamespaceAliases(
+        const std::vector<std::pair<std::string, std::string>>& aliases);
 
     // Foreign C++ specialization lookup on the INTACT spelling; see the definition for why the
     // general '*'/qualifier stripping must not run first.
@@ -5560,7 +5564,8 @@ private:
                              bool* outLongDoubleIsIEEEDouble = nullptr,
                              std::string* outTargetTriple = nullptr,
                              std::vector<cflat_cinterop::RawFunctionTemplate>* outFunctionTemplates = nullptr,
-                             std::vector<std::pair<std::string, std::string>>* outUsingDirectives = nullptr);
+                             std::vector<std::pair<std::string, std::string>>* outUsingDirectives = nullptr,
+                             std::vector<std::pair<std::string, std::string>>* outNamespaceAliases = nullptr);
 
     // Extract externally-linkable functions a .c file DEFINES, via the clang C++ API. Records
     // are registered up front (struct-by-value). Used by the .c auto-extern path.

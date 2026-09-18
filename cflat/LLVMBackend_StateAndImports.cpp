@@ -2642,7 +2642,9 @@ bool LLVMBackend::TryLoadCHeaderDiskCache(
         // v69 makes cached C++ signature payloads key-pure by remapping foreign types on replay.
         // v70 maps a std::function return to its std.function specialization: an older cache
         // carries the "return type ... is unsupported" refusal for such a signature.
-        if (version != 70) return cacheMiss("cache version");
+        // v71 harvests C++ namespace aliases and refuses a 'consteval' function: an older cache
+        // has no alias pairs and carries a bindable signature for an immediate function.
+        if (version != 71) return cacheMiss("cache version");
 
         if (!expectedRequestKey.empty()
             && j.value("cxxRequestKey", std::string{}) != expectedRequestKey)
@@ -2687,6 +2689,10 @@ bool LLVMBackend::TryLoadCHeaderDiskCache(
                 for (const auto& d : j["usingDirectives"])
                     entry.usingDirectives.emplace_back(
                         d.value("from", std::string{}), d.value("to", std::string{}));
+            if (j.contains("namespaceAliases"))
+                for (const auto& a : j["namespaceAliases"])
+                    entry.namespaceAliases.emplace_back(
+                        a.value("from", std::string{}), a.value("to", std::string{}));
             if (j.contains("functionPointerAbis"))
                 for (const auto& p : j["functionPointerAbis"])
                 {
@@ -2868,7 +2874,8 @@ void LLVMBackend::WriteCHeaderDiskCache(
         nlohmann::json j;
         // v69 makes cached C++ signature payloads key-pure by remapping foreign types on replay.
         // v70 maps a std::function return to its std.function specialization.
-        j["version"] = 70;
+        // v71 harvests C++ namespace aliases and refuses a 'consteval' function.
+        j["version"] = 71;
         j["mtime"]   = (int64_t)mtime.time_since_epoch().count();
         j["hash"]    = contentHash;
         j["ldw"]     = entry.longDoubleWidth;
@@ -2915,6 +2922,10 @@ void LLVMBackend::WriteCHeaderDiskCache(
         for (const auto& d : entry.usingDirectives)
             usingDirectives.push_back({{"from", d.first}, {"to", d.second}});
         j["usingDirectives"] = usingDirectives;
+        nlohmann::json namespaceAliases = nlohmann::json::array();
+        for (const auto& a : entry.namespaceAliases)
+            namespaceAliases.push_back({{"from", a.first}, {"to", a.second}});
+        j["namespaceAliases"] = namespaceAliases;
         nlohmann::json functionPointerAbis = nlohmann::json::array();
         for (const auto& p : entry.functionPointerAbis)
             functionPointerAbis.push_back({{"sig", p.signature}, {"rt", p.retType},

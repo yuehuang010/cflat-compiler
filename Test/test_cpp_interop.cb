@@ -1957,6 +1957,30 @@ extern int main()
     if (cppu_cyc_b.helper5() != 17) return 1898;
     if (cppu_self.via_using7() != 123) return 1899;
 
+    // ---- C++ NAMESPACE ALIASES -------------------------------------------------------------
+    // A namespace alias harvested nothing before this fix: 1970 is the leg that failed with
+    // "'alias_counter' is not a member of namespace 'cppu_al'" - a namespace-scope OBJECT is the
+    // spelling with no on-demand clang fallback, so it is the discriminator. The function, class
+    // and enum spellings below already resolved through clang and pin that they still do.
+    if (cppu_al.alias_counter != 43)                 return 1970;
+    if (cppu_al.alias_fn() != 29)                    return 1971;
+    cppu_al.AliasBox aliasBox = default;
+    aliasBox.v = 47;
+    if (aliasBox.v != 47)                            return 1972;
+    if ((int)cppu_al.AliasE.B != 37)                 return 1973;
+    // Alias to a NESTED namespace, and an alias of an alias.
+    if (cppu_al_deep.alias_deep_fn() != 41)          return 1974;
+    if (cppu_al2.alias_counter != 43)                return 1975;
+    // The canonical spelling keeps working alongside the alias.
+    if (cppu_alias_target.alias_counter != 43)       return 1976;
+
+    // ---- 'consteval' accept set -------------------------------------------------------------
+    // A constexpr C++ function called at RUNTIME must keep binding; only the consteval sibling
+    // is refused (Test/errors/err_cpp_consteval_call.cb).
+    if (cppi.immediate.squared(6) != 36)             return 1977;
+    int constevalRuntime = 7;
+    if (cppi.immediate.squared(constevalRuntime) != 49) return 1978;
+
     // ---- a C++ ctor parameter `T&` binds the argument's address ---------------------------------
     // Controls: the free and member `Cnt&` paths already passed the address; they pin that the
     // constructor fix did not disturb them.

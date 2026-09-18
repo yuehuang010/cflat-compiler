@@ -1,0 +1,16 @@
+import cpp "cpp_interop_basic.h";
+
+// A 'consteval' C++ function has no runtime symbol. Before the refusal this call compiled and
+// failed in the LINKER with the mangled spelling ("cppi::immediate::must_fold(int)") and no
+// source location at all.
+extern int main()
+{
+    expect_error("C++ function 'cppi.immediate.must_fold' is declared 'consteval'; an immediate function has no runtime symbol, so cflat cannot call it") {
+        int consteval_value = cppi.immediate.must_fold(4);
+        printf("%d\n", consteval_value);
+    }
+    // The constexpr neighbour in the same namespace still BINDS (its value is asserted in
+    // Test/test_cpp_interop.cb); a refusal that spread to it would error here instead.
+    printf("%d\n", cppi.immediate.squared(6));
+    return 0;
+}

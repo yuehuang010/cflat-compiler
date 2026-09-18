@@ -833,6 +833,27 @@ void LLVMBackend::RegisterCxxUsingDirectives(
         }
 }
 
+// A C++ namespace alias is the same relationship CFlat's own `namespace a = b;` records, so it
+// registers in the same table and every lookup that hops an alias hops this one too.
+void LLVMBackend::RegisterCxxNamespaceAliases(
+        const std::vector<std::pair<std::string, std::string>>& aliases)
+{
+        for (const auto& [alias, target] : aliases)
+        {
+            if (alias.empty() || target.empty() || alias == target) continue;
+            RegisterNamespaceAlias(alias, target);
+            // The alias spelling itself is not a declared namespace, so publish its leading
+            // segment as a foreign one - that is what makes a name led by it a C++ candidate.
+            const size_t firstDot = alias.find('.');
+            const std::string lead = firstDot == std::string::npos
+                ? alias : alias.substr(0, firstDot);
+            cxxForeignNamespaces_.insert(lead);
+            if (activeCxxRequestGroup_ != nullptr
+                && activeCxxRequestGroup_->primary < cxxImportGroups_.size())
+                cxxImportGroups_[activeCxxRequestGroup_->primary].namespaces.insert(lead);
+        }
+}
+
 bool LLVMBackend::IsCInteropLongDoubleSupported() const
 {
         return cInteropLongDoubleWidth_ == 64 && cInteropLongDoubleIsIEEEDouble_;
@@ -3123,7 +3144,8 @@ bool LLVMBackend::ExtractCHeaderClang(const std::vector<std::string>& headerPath
                              bool* outLongDoubleIsIEEEDouble,
                              std::string* outTargetTriple,
                              std::vector<cflat_cinterop::RawFunctionTemplate>* outFunctionTemplates,
-                             std::vector<std::pair<std::string, std::string>>* outUsingDirectives)
+                             std::vector<std::pair<std::string, std::string>>* outUsingDirectives,
+                             std::vector<std::pair<std::string, std::string>>* outNamespaceAliases)
 {
         if (headerPaths.empty()) return false;
 
@@ -3265,7 +3287,9 @@ bool LLVMBackend::ExtractCHeaderClang(const std::vector<std::string>& headerPath
         if (outTargetTriple) *outTargetTriple = raw.targetTriple;
         if (outFunctionTemplates) *outFunctionTemplates = raw.functionTemplates;
         if (outUsingDirectives) *outUsingDirectives = raw.usingDirectives;
+        if (outNamespaceAliases) *outNamespaceAliases = raw.namespaceAliases;
         if (cxxMode) RegisterCxxUsingDirectives(raw.usingDirectives);
+        if (cxxMode) RegisterCxxNamespaceAliases(raw.namespaceAliases);
 
         // A definitions-enabled pass gives us the defaults without entering the extractor's
         // declaration-only path. Re-run only when wrappers are needed, adding their bodies to the
@@ -7703,6 +7727,10 @@ bool LLVMBackend::TryBindCxxFunction(const std::string& functionName)
             raw.variadic = stored.variadic;
             raw.isCxx = stored.isCxx;
             raw.isNoexcept = stored.isNoexcept;
+            // The EXTRACTOR's own refusal (a 'consteval' function, an uninstantiated
+            // specialization) is a fact about the declaration, not about type mapping, so the
+            // deferred remap must not drop it - same rule the cache-replay remap follows.
+            raw.bindRefusal = stored.sourceBindRefusal;
             raw.abi = stored.abi;
             raw.file = stored.file;
             raw.line = stored.line;
@@ -7715,6 +7743,8 @@ bool LLVMBackend::TryBindCxxFunction(const std::string& functionName)
             // remap from the stored spellings cannot reproduce.
             if (!mapped.bindRefusal.empty() && !stored.bindRefusal.empty())
                 mapped.bindRefusal = stored.bindRefusal;
+            if (!stored.sourceBindRefusal.empty())
+                mapped.bindRefusal = stored.sourceBindRefusal;
             bound.push_back(std::move(mapped));
         }
         if (!bound.empty())
@@ -12614,6 +12644,7 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
         std::vector<std::pair<std::string, std::string>> hitAliases;
         std::vector<CTypeAliasEntry> hitTypeAliases;
         std::vector<std::pair<std::string, std::string>> hitUsingDirectives;
+        std::vector<std::pair<std::string, std::string>> hitNamespaceAliases;
         std::vector<cflat_cinterop::RawFunctionTemplate> hitFunctionTemplates;
         std::vector<cflat_cinterop::RawFunctionPointerAbi> hitFunctionPointerAbis;
         std::string hitCxxBitcode;
@@ -12635,6 +12666,7 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
                     hitAliases = entry.recordAliases; hit = true;
                     hitTypeAliases = entry.typeAliases;
                     hitUsingDirectives = entry.usingDirectives;
+                    hitNamespaceAliases = entry.namespaceAliases;
                     hitFunctionTemplates = entry.functionTemplates;
                     hitFunctionPointerAbis = entry.functionPointerAbis;
                     hitCxxBitcode = entry.cxxBitcode;
@@ -12651,6 +12683,7 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
                     hitAliases = entry.recordAliases; hit = true;
                     hitTypeAliases = entry.typeAliases;
                     hitUsingDirectives = entry.usingDirectives;
+                    hitNamespaceAliases = entry.namespaceAliases;
                     hitFunctionTemplates = entry.functionTemplates;
                     hitFunctionPointerAbis = entry.functionPointerAbis;
                     hitCxxBitcode = entry.cxxBitcode;
@@ -12668,6 +12701,7 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
             RegisterRecordAliases(hitAliases);
             RegisterTypeAliasSymbols(hitTypeAliases, cppMode);
             if (cppMode) RegisterCxxUsingDirectives(hitUsingDirectives);
+            if (cppMode) RegisterCxxNamespaceAliases(hitNamespaceAliases);
             if (cppMode)
                 RegisterCxxFunctionTemplates(hitFunctionTemplates, cxxGroupIndex, fileForLsp);
             RegisterCxxFunctionPointerAbis(hitFunctionPointerAbis);
@@ -12733,6 +12767,7 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
                 RegisterRecordAliases(diskEntry.recordAliases);
                 RegisterTypeAliasSymbols(diskEntry.typeAliases, cppMode);
                 if (cppMode) RegisterCxxUsingDirectives(diskEntry.usingDirectives);
+                if (cppMode) RegisterCxxNamespaceAliases(diskEntry.namespaceAliases);
                 if (cppMode)
                     RegisterCxxFunctionTemplates(diskEntry.functionTemplates, cxxGroupIndex, fileForLsp);
                 RegisterCxxFunctionPointerAbis(diskEntry.functionPointerAbis);
@@ -12776,6 +12811,7 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
         std::vector<CTypeAliasEntry> typeAliases;
         std::vector<cflat_cinterop::RawFunctionTemplate> functionTemplates;
         std::vector<std::pair<std::string, std::string>> usingDirectives;
+        std::vector<std::pair<std::string, std::string>> namespaceAliases;
         std::vector<cflat_cinterop::RawFunctionPointerAbi> functionPointerAbis;
         uint64_t longDoubleWidth = 0;
         bool longDoubleIsIEEEDouble = false;
@@ -12795,7 +12831,7 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
                                      &prereqFailure, &prereqMsg, cppMode, &cxxBitcode,
                                      &functionPointerAbis, &longDoubleWidth,
                                      &longDoubleIsIEEEDouble, &targetTriple, &functionTemplates,
-                                     &usingDirectives))
+                                     &usingDirectives, &namespaceAliases))
             {
                 if (prereqFailure)
                     ReportOrphanHeader(headerPaths, prereqMsg, cppMode);
@@ -12821,6 +12857,7 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
             entry.recordAliases = aliases;
             entry.typeAliases = typeAliases;
             entry.usingDirectives = usingDirectives;
+            entry.namespaceAliases = namespaceAliases;
             entry.functionPointerAbis = functionPointerAbis;
             entry.cxxBitcode = cxxBitcode;
             // Keep only real on-disk paths in the transitive dependency list (deep mode).

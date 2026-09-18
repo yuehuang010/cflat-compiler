@@ -1444,6 +1444,27 @@ using GlobalBoxAlias2 = GlobalBox<int>;
 typedef GlobalBox<double> GlobalBoxTypedef;
 inline int globalbox_take_global(const GlobalBox<int>& v) noexcept { return v.value + 1; }
 
+// An ALIAS TEMPLATE (`template<class T> using ... = ...;`), at global scope and inside a
+// namespace. The DECLARATION spelling always resolved through the type request; the CONSTRUCTOR
+// spelling (`GCellAlias<int>()`) reached function lookup instead, where an alias template has no
+// entry, and was refused as an unknown function.
+// NOT covered here: an alias template whose TARGET template is not reachable as a
+// namespace-qualified name (the target in the alias's OWN namespace, or a global-scope target).
+// Clang prints such a pattern unqualified, so the harvested target base carries no namespace and
+// the DECLARATION spelling fails too - a different root cause from the one below.
+namespace cpptacell
+{
+    template <class T> struct AliasCell { T value; AliasCell() noexcept : value(T(9)) {} };
+}
+template <class T> using GCellAlias = cpptacell::AliasCell<T>;
+namespace cppta
+{
+    template <class T> using CellAlias = cpptacell::AliasCell<T>;
+    namespace deep { template <class T> using DeepCellAlias = cpptacell::AliasCell<T>; }
+}
+inline int gcellalias_take(const GCellAlias<int>& c) noexcept { return c.value + 2; }
+inline int cellalias_take(const cppta::CellAlias<int>& c) noexcept { return c.value + 3; }
+
 // Section M84: a class used as a std::map key and as a by-reference parameter. A named lvalue
 // index has to reach overload matching with its class identity intact.
 struct SubscriptKey

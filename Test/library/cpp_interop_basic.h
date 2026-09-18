@@ -901,6 +901,17 @@ namespace cppi
         inline const char* kName = "marker";       // header-only pointer object
     }
 
+    // A 'consteval' (immediate) function has NO runtime symbol: clang evaluates it in the front
+    // end and emits nothing, so binding it as an ordinary function failed at LINK time with a
+    // mangled name and no source location. It is refused at the call site instead;
+    // Test/errors/err_cpp_consteval_call.cb pins the message. The constexpr neighbour beside it
+    // is the accept set - a constexpr function called at RUNTIME still binds normally.
+    namespace immediate
+    {
+        constexpr int squared(int n) noexcept { return n * n; }
+        consteval int must_fold(int n) noexcept { return n + 1; }
+    }
+
     // M93 - class-scope `static const` with an IN-CLASS initializer and no out-of-line
     // definition. Such a member has no symbol to link, so it binds by its folded value.
     namespace statconst

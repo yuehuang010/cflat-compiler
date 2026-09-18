@@ -2493,6 +2493,32 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     break;
                                 }
                             }
+                            // A C++ ALIAS TEMPLATE constructor-called at the undotted spelling
+                            // (`GVec<int>()`): the alias names the aliased template, so request
+                            // the TARGET's specialization the way the declaration path does.
+                            if (isFollowedByCall && Compiler(ctx)->HasCxxImportGroup()
+                                && !genericClassTemplates.count(baseName)
+                                && !genericStructTemplates.count(baseName)
+                                && Compiler(ctx)->IsGenericBaseAlias(baseName))
+                            {
+                                const std::string aliasBase =
+                                    Compiler(ctx)->ResolveGenericBaseAlias(baseName);
+                                std::string aliasMangled =
+                                    MangleGenericInstance(*Compiler(), aliasBase, typeArgs);
+                                std::string cxxError;
+                                Compiler(ctx)->TryRequestCxxType(aliasBase, typeArgs, aliasMangled,
+                                                                 cxxError);
+                                if (!cxxError.empty()) LogCxxErrorContext(prevPrimary, cxxError);
+                                aliasMangled = Compiler(ctx)->ResolveTypeAlias(aliasMangled);
+                                if (Compiler(ctx)->IsCxxForeignTypeRegistered(aliasMangled))
+                                {
+                                    primaryIdentifier = aliasMangled;
+                                    namedVar = {};
+                                    structVar = {};
+                                    interfaceVar = {};
+                                    break;
+                                }
+                            }
                             if (!genericClassTemplates.count(baseName) && !genericStructTemplates.count(baseName)
                                 && isFollowedByCall)
                                 LogErrorContext(prevPrimary, std::format("unknown generic function '{}'", baseName));
@@ -3192,10 +3218,15 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             std::vector<std::string> typeArgs;
                             for (auto* entry : genParams->typeParameterList()->typeParameterEntry())
                                 typeArgs.push_back(ResolveTypeArgEntry(entry));
-                            const std::string baseName = namespaceContext == primaryIdentifier
+                            std::string baseName = namespaceContext == primaryIdentifier
                                 || namespaceContext.ends_with("." + primaryIdentifier)
                                 ? namespaceContext
                                 : namespaceContext + "." + primaryIdentifier;
+                            // A C++ alias template (`template<class T> using Vec = vector<T>;`)
+                            // names the aliased template; only the target has an identity to
+                            // request, which is the hop the DECLARATION path already performs.
+                            if (Compiler(ctx)->IsGenericBaseAlias(baseName))
+                                baseName = Compiler(ctx)->ResolveGenericBaseAlias(baseName);
                             std::string mangled = MangleGenericInstance(*Compiler(), baseName,
                                                                         typeArgs);
                             std::string cxxError;
