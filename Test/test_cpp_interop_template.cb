@@ -138,6 +138,12 @@
 //     refused with "no imported C++ header declares 'std::vector'".
 //     Test/errors/err_cpp_nested_missing.cb pins the diagnostic for an argument that genuinely
 //     is not declared.
+//   The `iterator -> const_iterator` conversion at an OVERLOADED member: vector insert/erase in
+//     three arities, vector<double>, basic_string, a named iterator local, and the same shape on
+//     a USER template (cppt.ConstIt) to show the rule is structural. Identity still outranks it,
+//     a value/reference pair breaks on the argument rather than on declaration order, and
+//     Test/errors/err_cpp_template_no_match.cb pins the three refusals (const removed, a
+//     different pointee, and a constness-keyed partial specialization of differing layout).
 
 import cpp "library/cpp_interop_basic.h" cache;
 import cpp "library/cpp_interop_basic.cpp" cache;
@@ -1651,6 +1657,84 @@ extern int main()
         std.vector<nest.Cell*> nestuserPv = default;
         nestuserPv.push_back(&nestuserOne);
         if (nestuserPv[0]->b != 3)                                           return 1944;
+    }
+
+    {
+        // ITERATOR -> CONST_ITERATOR at an OVERLOADED C++ member. libc++ declares
+        // vector::insert/erase over const_iterator; `v.begin()` yields __wrap_iter<int*> and the
+        // parameter is __wrap_iter<const int*>. Before the structural const-added-pointer
+        // conversion these calls were refused with "no overload of 'insert' matches" while the
+        // cbegin() spelling compiled, so every leg here discriminates on the begin() spelling.
+        std.vector<int> citv = default;
+        citv.push_back(1);
+        citv.push_back(2);
+        int citx = 9;
+        citv.insert(citv.begin(), citx);
+        if ((int)citv.size() != 3)                                           return 1979;
+        if (citv[0] != 9)                                                    return 1980;
+        citv.insert(citv.end(), citx);
+        if ((int)citv.size() != 4)                                           return 1981;
+        if (citv[3] != 9)                                                    return 1982;
+        // The count form: a THIRD parameter after the iterator, so the old wrapper path
+        // (which needs every other argument to match exactly) could never reach it.
+        citv.insert(citv.begin(), (ulong)2, citx);
+        if ((int)citv.size() != 6)                                           return 1983;
+        if (citv[1] != 9)                                                    return 1984;
+        // The cbegin() anchor still resolves to the same member.
+        citv.insert(citv.cbegin(), citx);
+        if ((int)citv.size() != 7)                                           return 1985;
+
+        // erase: single-candidate per arity, and previously accepted through a generated C++
+        // conversion wrapper instead of the ranking. Same values, one mechanism now.
+        citv.erase(citv.begin());
+        if ((int)citv.size() != 6)                                           return 1986;
+        citv.erase(citv.begin(), citv.end());
+        if ((int)citv.size() != 0)                                           return 1987;
+    }
+    {
+        // The rule is on the TEMPLATE ARGUMENT, not on the element type: double repeats it.
+        std.vector<double> citd = default;
+        citd.push_back(2.5);
+        double cityd = 1.5;
+        citd.insert(citd.begin(), cityd);
+        if ((int)citd.size() != 2)                                           return 1988;
+        if ((int)(citd[0] * 10.0) != 15)                                     return 1989;
+
+        // basic_string's iterator is the same __wrap_iter template over char*.
+        std.string cits = default;
+        cits.push_back('b');
+        cits.insert(cits.begin(), 'a');
+        if ((int)cits.size() != 2)                                           return 1990;
+        if ((int)cits[0] != 97)                                              return 1991;
+
+        // A NAMED iterator local, not just a call result in argument position.
+        std.vector<int> citn = default;
+        citn.push_back(4);
+        auto citit = citn.begin();
+        int citv2 = 8;
+        citn.insert(citit, citv2);
+        if ((int)citn.size() != 2)                                           return 1992;
+        if (citn[0] != 8)                                                    return 1993;
+    }
+    {
+        // STRUCTURAL, not keyed on __wrap_iter: a user template with the same shape. Both
+        // cppt.constit_take overloads are declared over ConstIt<const int*>; the argument is a
+        // ConstIt<int*>. Two arities prove the overloaded path, not a single-candidate fallback.
+        int cita = 41;
+        cppt.ConstIt<int*> citu = cppt.constit_make(&cita);
+        if (cppt.constit_take(citu) != 141)                                  return 1994;
+        if (cppt.constit_take(citu, 7) != 48)                                return 1995;
+
+        // Identity still outranks the const-added conversion: constit_pick is declared over BOTH
+        // ConstIt<int*> (+1) and ConstIt<const int*> (+2), and the exact one must win. A perfect
+        // match beats the conversion tier, so a wrong pick shows up as 43 instead of 42.
+        if (cppt.constit_pick(citu) != 42)                                   return 1996;
+
+        // A value and a reference overload BOTH reached through the const-added conversion is a
+        // genuine tie. It must break on the lvalue argument (reference wins, +20) and not on
+        // declaration order, so the same answer is required from both spelled orders.
+        if (cppt.constit_tie(citu) != 61)                                    return 1997;
+        if (cppt.constit_tie2(citu) != 61)                                   return 1998;
     }
 
     return 0;

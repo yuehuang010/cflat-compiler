@@ -12,5 +12,24 @@ extern int main()
         cppt.Box<int> box = cppt.Box<int>(7);
         printf("%d", box);
     }
+    // The `iterator -> const_iterator` conversion is the SAME template with 'const' added on a
+    // pointer argument, bound by reinterpreting the argument's storage. These three must refuse.
+    int sza = 41;
+    // Layout differs: SzIt<const int*> is a constness-keyed partial specialization, so accepting
+    // this would read pad0/pad1/tag out of an 8-byte object.
+    expect_error("no overload of 'cppt.szit_take' matches the given arguments") {
+        cppt.SzIt<int*> szi = cppt.szit_make(&sza);
+        int szr = cppt.szit_take(szi);
+    }
+    // Direction: const REMOVED is not a conversion.
+    expect_error("no overload of 'cppt.constit_strip' matches the given arguments") {
+        auto stc = cppt.constit_make_const(&sza);
+        int str = cppt.constit_strip(stc);
+    }
+    // A different pointee type is not a conversion, const added or not.
+    expect_error("no overload of 'cppt.constit_other' matches the given arguments") {
+        cppt.ConstIt<int*> oth = cppt.constit_make(&sza);
+        int othr = cppt.constit_other(oth);
+    }
     return 0;
 }

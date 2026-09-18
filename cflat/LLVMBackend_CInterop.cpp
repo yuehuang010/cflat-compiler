@@ -207,6 +207,93 @@ std::string LLVMBackend::SqueezeCxxSpelling(const std::string& spelling)
         return out;
     }
 
+/*
+ * Structural test for the standard conversion C++ spells `iterator -> const_iterator`: the SAME
+ * class template, whose template arguments agree except that the parameter added `const` to a
+ * POINTER argument. `__wrap_iter<int *>` -> `__wrap_iter<const int *>` is the libc++ spelling, but
+ * nothing here is keyed on that name - `reverse_iterator` and user templates follow the same rule.
+ * Only ADDING const converts; removing it, or a different pointee, is not a conversion.
+ * SPELLING ONLY. The argument is passed by reinterpreting its storage as the parameter type, so
+ * every caller must also require HasIdenticalCxxRecordLayout - a partial specialization keyed on
+ * constness (`template <class P> struct S<const P*>`) can give the two a different layout.
+ */
+bool LLVMBackend::IsCxxConstAddedPointerSpecialization(const std::string& argSpelling,
+                                                        const std::string& paramSpelling) const
+{
+        // Splits `Name<a, b>` into the squeezed template name and its depth-1 arguments.
+        auto split = [](const std::string& spelling, std::string& name,
+                        std::vector<std::string>& args) {
+            const size_t open = spelling.find('<');
+            if (open == std::string::npos || spelling.back() != '>') return false;
+            name = SqueezeCxxSpelling(spelling.substr(0, open));
+            int depth = 0;
+            std::string current;
+            for (size_t i = open; i + 1 < spelling.size(); ++i)
+            {
+                const char c = spelling[i];
+                if (c == '<')
+                {
+                    if (++depth == 1) continue;
+                }
+                else if (c == '>')
+                {
+                    --depth;
+                }
+                else if (c == ',' && depth == 1)
+                {
+                    args.push_back(current);
+                    current.clear();
+                    continue;
+                }
+                current += c;
+            }
+            args.push_back(current);
+            return !name.empty() && depth == 1;
+        };
+
+        std::string argName;
+        std::string paramName;
+        std::vector<std::string> argArgs;
+        std::vector<std::string> paramArgs;
+        if (!split(argSpelling, argName, argArgs) || !split(paramSpelling, paramName, paramArgs))
+            return false;
+        if (argName != paramName || argArgs.size() != paramArgs.size()) return false;
+
+        bool anyConstAdded = false;
+        for (size_t i = 0; i < argArgs.size(); ++i)
+        {
+            const std::string from = SqueezeCxxSpelling(argArgs[i]);
+            const std::string to = SqueezeCxxSpelling(paramArgs[i]);
+            if (from == to) continue;
+            // Only a pointer argument may gain const, in either written order.
+            if (from.empty() || from.back() != '*') return false;
+            if (to == "const" + from) { anyConstAdded = true; continue; }
+            if (to == from.substr(0, from.size() - 1) + "const*") { anyConstAdded = true; continue; }
+            return false;
+        }
+        return anyConstAdded;
+}
+
+/*
+ * Two registered records whose LLVM bodies agree field for field. The const-added conversion
+ * lowers as a bitwise reinterpretation of the argument object, which is only sound at identical
+ * layout, so refuse whenever either side is unknown or still opaque - a refusal is the behaviour
+ * before the conversion existed, while a wrong accept is a silent miscompile.
+ */
+bool LLVMBackend::HasIdenticalCxxRecordLayout(const std::string& argTypeName,
+                                              const std::string& paramTypeName) const
+{
+        auto argIt = dataStructures.find(argTypeName);
+        auto paramIt = dataStructures.find(paramTypeName);
+        if (argIt == dataStructures.end() || paramIt == dataStructures.end()) return false;
+        llvm::StructType* argType = argIt->second.StructType;
+        llvm::StructType* paramType = paramIt->second.StructType;
+        if (argType == nullptr || paramType == nullptr) return false;
+        if (argType == paramType) return true;
+        if (argType->isOpaque() || paramType->isOpaque()) return false;
+        return argType->isLayoutIdentical(paramType);
+}
+
 void LLVMBackend::RejectThrowingCxxFunction(const FunctionSymbol& symbol, const std::string& displayName) const
 {
         if (!symbol.IsCxx || symbol.IsNoexcept || !cppStrictNoexcept_) return;

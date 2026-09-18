@@ -274,6 +274,9 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
             // Parameters left to their defaults. An exact-arity overload (the C++ default
             // wrapper `f(a)` next to `f(a, b = expr)`) beats one that would fill defaults in.
             int omitted = 0;
+            // Arguments bound through the `iterator -> const_iterator` conversion. Fewer wins, so
+            // an overload declared over the argument's own specialization is never displaced.
+            int constAddedConversions = 0;
             int moveScore = 0;
             // Arguments bound by materializing a temporary for a C++ `const T&` scalar parameter.
             // A materialization is strictly worse than a by-value or rvalue-ref bind (ruling).
@@ -288,6 +291,14 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
             auto* constant = llvm::dyn_cast_or_null<llvm::Constant>(
                 value == nullptr ? nullptr : value->stripPointerCasts());
             return constant != nullptr && IsStringLiteralConstant(constant);
+        };
+        // Cost of one const-added binding, weighted so a value/reference pair does not tie into
+        // declaration order: same polarity as the equal-spelling arm (reference wins an lvalue).
+        auto constAddedBindingCost = [&](const NamedVariable& arg, const TypeAndValue& param) {
+            const bool preferred = param.IsAlias
+                ? !IsRvalueReferenceArgument(arg)
+                : IsRvalueReferenceArgument(arg);
+            return preferred ? 1 : 2;
         };
         auto receiverRefQualifierMatches = [&](const FunctionSymbol& candidate,
                                                 const std::vector<NamedVariable>& arguments) {
@@ -357,6 +368,8 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
             // Arguments bound to a 'bool' parameter through the integer -> bool coercion.
             int boolCoercions = 0;
             int constRefMaterializations = 0;
+            // Arguments bound through the `iterator -> const_iterator` conversion.
+            int constAddedConversions = 0;
             std::vector<int> integerCosts;
             integerCosts.reserve(arguments.size());
 
@@ -484,6 +497,14 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                             result = candidateParamItr->IsAlias
                                 ? (IsRvalueReferenceArgument(arg) ? 1 : 0)
                                 : (IsRvalueReferenceArgument(arg) ? 0 : 1);
+                        // `iterator -> const_iterator`: implicit (1), never perfect, so an
+                        // exactly-typed overload of the same member still wins.
+                        else if (IsCxxConstAddedPointerSpecialization(argSpelling, paramSpelling)
+                            && HasIdenticalCxxRecordLayout(tmpArg.TypeName, tmpParam.TypeName))
+                        {
+                            result = 1;
+                            constAddedConversions += constAddedBindingCost(arg, *candidateParamItr);
+                        }
                     }
                     if (result < 0 && tmpArg.IsTypeMatch(tmpParam))
                         result = 0;
@@ -595,13 +616,24 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                             == SqueezeCxxSpelling(parameterSpelling);
                     const bool sameCxxValue = sameCxxSpelling && !candidateParamItr->IsAlias;
                     const bool sameCxxReference = sameCxxSpelling && candidateParamItr->IsAlias;
+                    // Twin of the named-TypeName arm: same template, const added to a pointer
+                    // template argument. Reached when the argument carries no CFlat TypeName.
+                    const bool constAddedCxxSpelling = !sameCxxSpelling && candidate.IsCxx
+                        && IsCxxConstAddedPointerSpecialization(inferredSpelling, parameterSpelling)
+                        && HasIdenticalCxxRecordLayout(inferredTypeName,
+                                                       candidateParamItr->TypeName);
                     const bool stringLiteralCharPointer = (candidateParamItr->Pointer
                         || candidateParamItr->PointerDepth > 0)
                         && candidateParamItr->TypeName == "char"
                         && arg.BaseType != nullptr && arg.BaseType->isPointerTy()
                         && (arg.IsRvalue || arg.IsStringLiteral || isStringLiteralValue(arg.Primary));
                     auto candidateParam = GetType(*candidateParamItr);
-                    if (sameCxxValue)
+                    if (constAddedCxxSpelling)
+                    {
+                        result = 1;
+                        constAddedConversions += constAddedBindingCost(arg, *candidateParamItr);
+                    }
+                    else if (sameCxxValue)
                         result = IsRvalueReferenceArgument(arg) ? 0 : 1;
                     else if (sameCxxReference)
                         result = IsRvalueReferenceArgument(arg) ? 1 : 0;
@@ -811,6 +843,7 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                 ranked.boolCoercions = boolCoercions;
                 ranked.constRefMaterializations = constRefMaterializations;
                 ranked.omitted = omitted;
+                ranked.constAddedConversions = constAddedConversions;
                 ranked.moveScore = ScoreMoveAgreement(arguments, candidate);
                 ranked.integerCosts = std::move(integerCosts);
                 (perfectMatch ? perfect : possible).push_back(std::move(ranked));
@@ -922,6 +955,8 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
             // Prefer agreeing function-pointer shapes, then fewer integer -> bool coercions.
             keepLowest(best, [](const Ranked& r) { return r.shapeMismatches; });
             keepLowest(best, [](const Ranked& r) { return r.boolCoercions; });
+            // An overload over the argument's own specialization beats a const-added one.
+            keepLowest(best, [](const Ranked& r) { return r.constAddedConversions; });
             // The candidate's tier is its WORST integer argument (0 identity, 1 promotion,
             // 2 conversion); the lowest tier wins before per-argument comparison.
             keepLowest(best, [](const Ranked& r) {
@@ -1748,10 +1783,38 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                 msg += std::format("    [{}] {}{} {}\n", i, typeName, PointerStars(arg.TypeAndValue), name);
             }
 
-            // Candidates
-            msg += std::format("  Candidates ({}):\n", candidates.size());
-            for (const auto& c : candidates)
+            /*
+             * A member call's candidate list is keyed by NAME alone, so an unrelated type's
+             * member of the same name rides along (a std.vector<int> receiver listing CFlat
+             * core `list<string>::insert`). Keep only the receiver's own members - never to
+             * the point of an empty list, so a genuine free/other-type candidate still shows.
+             */
+            std::vector<const FunctionSymbol*> shownCandidates;
+            for (const auto& c : candidates) shownCandidates.push_back(&c);
+            if (!arguments.empty() && !candidates.empty()
+                && !candidates.front().Parameters.empty()
+                && candidates.front().Parameters.front().VariableName.ends_with("__"))
             {
+                std::string receiverName = arguments.front().TypeAndValue.TypeName;
+                if (receiverName.empty() && arguments.front().BaseType)
+                    if (auto* st = llvm::dyn_cast<llvm::StructType>(arguments.front().BaseType))
+                        receiverName = st->getName().str();
+                if (!receiverName.empty())
+                {
+                    std::vector<const FunctionSymbol*> ownMembers;
+                    for (const FunctionSymbol* c : shownCandidates)
+                        if (!c->Parameters.empty()
+                            && c->Parameters.front().TypeName == receiverName)
+                            ownMembers.push_back(c);
+                    if (!ownMembers.empty()) shownCandidates = std::move(ownMembers);
+                }
+            }
+
+            // Candidates
+            msg += std::format("  Candidates ({}):\n", shownCandidates.size());
+            for (const FunctionSymbol* candidatePtr : shownCandidates)
+            {
+                const auto& c = *candidatePtr;
                 std::string paramList;
                 for (size_t i = 0; i < c.Parameters.size(); i++)
                 {

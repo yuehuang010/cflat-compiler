@@ -1583,3 +1583,50 @@ namespace cppt
 
     inline int tplstatic_take(int v) noexcept { return v + 1000; }
 }
+
+namespace cppt
+{
+    // Structural iterator-to-const-iterator coverage: the SAME class template with 'const'
+    // added on a pointer template argument is layout-identical, so it converts implicitly.
+    template <class P> struct ConstIt { P p; };
+
+    inline ConstIt<int*> constit_make(int* p) noexcept { return ConstIt<int*>{ p }; }
+    inline ConstIt<const int*> constit_make_const(const int* p) noexcept
+    { return ConstIt<const int*>{ p }; }
+    inline ConstIt<const double*> constit_make_cdouble(const double* p) noexcept
+    { return ConstIt<const double*>{ p }; }
+
+    // Overloaded on purpose: the arity split is what the single-candidate path never exercised.
+    inline int constit_take(ConstIt<const int*> it) noexcept { return *it.p + 100; }
+    inline int constit_take(ConstIt<const int*> it, int bump) noexcept { return *it.p + bump; }
+
+    // Exact-typed sibling next to the const-added one: identity must still win.
+    inline int constit_pick(ConstIt<int*> it) noexcept { return *it.p + 1; }
+    inline int constit_pick(ConstIt<const int*> it) noexcept { return *it.p + 2; }
+
+    // Value vs reference, both reached through the const-added conversion. BOTH declaration
+    // orders are spelled: an lvalue argument must pick the reference either way, never the
+    // last-declared one.
+    inline int constit_tie(ConstIt<const int*> it) noexcept { return *it.p + 10; }
+    inline int constit_tie(const ConstIt<const int*>& it) noexcept { return *it.p + 20; }
+    inline int constit_tie2(const ConstIt<const int*>& it) noexcept { return *it.p + 20; }
+    inline int constit_tie2(ConstIt<const int*> it) noexcept { return *it.p + 10; }
+
+    // Negative direction: const REMOVED is not a conversion.
+    inline int constit_strip(ConstIt<int*> it) noexcept { return *it.p + 5; }
+    inline int constit_strip(ConstIt<int*> it, int bump) noexcept { return *it.p + bump; }
+
+    // Negative direction: a partial specialization KEYED ON CONSTNESS gives the const-added
+    // spelling a different layout, so the bitwise binding would read past the argument object.
+    template <class P> struct SzIt { P p; };
+    template <class P> struct SzIt<const P*>
+    { const P* p; long long pad0; long long pad1; int tag; };
+    inline SzIt<int*> szit_make(int* p) noexcept { return SzIt<int*>{ p }; }
+    inline int szit_take(SzIt<const int*> it) noexcept { return it.tag; }
+    inline int szit_take(SzIt<const int*> it, int bump) noexcept { return it.tag + bump; }
+
+    // Negative direction: a DIFFERENT pointee type is not a conversion.
+    inline int constit_other(ConstIt<const double*> it) noexcept { return (int)*it.p + 5; }
+    inline int constit_other(ConstIt<const double*> it, int bump) noexcept
+    { return (int)*it.p + bump; }
+}

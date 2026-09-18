@@ -5096,6 +5096,12 @@ private:
     void RejectThrowingCxxFunction(const FunctionSymbol& symbol, const std::string& displayName) const;
     llvm::Function* EnsureCxxProgramEhGuard(const std::string& programName);
     static std::string SqueezeCxxSpelling(const std::string& spelling);
+    // `iterator -> const_iterator`: same template, `const` added to a pointer template argument.
+    bool IsCxxConstAddedPointerSpecialization(const std::string& argSpelling,
+                                              const std::string& paramSpelling) const;
+    // Gate for that conversion: it is lowered bitwise, so the two records must agree on layout.
+    bool HasIdenticalCxxRecordLayout(const std::string& argTypeName,
+                                     const std::string& paramTypeName) const;
     static std::string ValueFieldRecordKey(const std::string& ctype);
     static std::string StripCxxRecordTag(std::string spelling);
     // One spelling a request (or a batch of requests) instantiates in an import group's TU.
