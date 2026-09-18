@@ -138,6 +138,7 @@ import cpp "library/cpp_interop_field.h" cache;
 // Array elements of a C++ class. Imported WITHOUT the header cache so those checks
 // does not depend on cache state.
 import cpp "library/cpp_interop_arrayelem.h";
+import "cpp_interop_globals.cb";
 // Using-directives, including ones nominating a namespace nested in the nominator.
 import cpp "library/cpp_interop_usingns.h" cache;
 // A C++ CONSTRUCTOR parameter declared `T&` binds the argument's address.
@@ -210,6 +211,27 @@ program CppThrowPlain
         return cppthrow.throw_if(0) + cppthrow.plain(4);
     }
 };
+/*
+ * M103: FILE-SCOPE globals of a C++ class with a nontrivial default constructor. Pre-fix every
+ * one of these was a zeroinitializer that nothing ever constructed (gctor_count() == 0 and
+ * gclsPoly.kind() segfaulted on the null vptr); the constructors now run from an
+ * llvm.global_ctors entry before main. RULING: no exit-time destruction, so gdtor_count() == 0.
+ */
+cppa.GTrk gclsSingle = default;       // the plain '= default' spelling
+cppa.GTrk gclsBare;                   // no initializer at all
+cppa.GTrk gclsBrace = {};             // empty-brace value initialization
+static cppa.GTrk gclsStatic = default;// 'static'-spelled file-scope global
+cppa.GTrk[3] gclsArr3 = default;      // global ARRAY: one constructor per element
+cppa.GTrk[2][2] gclsArr22 = default;  // every inner dimension counts
+cppa.GPoly gclsPoly = default;        // the vptr slot was zero pre-fix
+namespace GctNS { cppa.GTrk gclsNs = default; }   // inside a CFlat namespace
+cppa.GSeq gclsSeqA = default;         // ORDER: the imported module's GSeq, then A, then B
+cppa.GSeq gclsSeqB = default;
+cppa.GProbe gclsProbe = default;      // its constructor READS a header-defined C++ static
+// ACCEPT SET: a trivial C++ class stays a plain zero-init global with no init code (asserted in
+// the IR, not by a value - zero IS its constructed value). It is declared here so that routing
+// it into the module initializer by mistake would fail the LINK on a missing constructor symbol.
+cppa.Plain gclsPlain = default;
 extern int main()
 {
     // ---- C++ exceptions at the program boundary -------------------------------------------------
@@ -2285,6 +2307,47 @@ extern int main()
     // `move` is how CFlat spells "bind the rvalue-ref leg" for a named local; the move leg wins.
     int crefMixMove = 41;
     if (cppi.crefscalar.mixr(move crefMixMove) != 241)                         return 2023;
+
+    // ---- M103: file-scope globals of a C++ class (2150-2199) ------------------------------------
+    // Total constructor count over every global declared above: 1 + 1 + 1 + 1 + 3 + 4 + 1 + 1 = 13
+    // GTrk/GPoly constructions. Pre-fix this read 0 - none of them was ever constructed. The
+    // counters are private to the global section and are never reset(), so the count survives
+    // every reset() the earlier sections do.
+    if (cppa.gctor_count() != 13)                                              return 2150;
+    // The constructor's invariant (v = 7) is what a zeroinitializer destroys; each spelling is
+    // asserted separately because each reaches a different declarator arm.
+    if (gclsSingle.v != 7)                                                     return 2151;
+    if (gclsBare.v != 7)                                                       return 2152;
+    if (gclsBrace.v != 7)                                                      return 2153;
+    if (gclsStatic.v != 7)                                                     return 2154;
+    if (GctNS.gclsNs.v != 7)                                                   return 2155;
+    // Global ARRAY: every element, not just the first, and through both dimensions.
+    if (gclsArr3[0].v != 7 || gclsArr3[1].v != 7 || gclsArr3[2].v != 7)        return 2156;
+    if (gclsArr22[0][0].v != 7 || gclsArr22[1][1].v != 7)                      return 2157;
+    // A virtual call on the global: pre-fix the vptr was zero and this segfaulted.
+    cppa.GPoly* gclsPolyP = &gclsPoly;
+    if (gclsPoly.v != 5 || gclsPolyP.kind() != 11)                             return 2158;
+    /*
+     * ORDER, on the GSeq globals' own counter. Three constructions: the one in the IMPORTED
+     * module cpp_interop_globals.cb records 1, then this file's two record 2 and 3. So an
+     * imported module's globals are constructed before the importing module's, and within a
+     * module in declaration order. Pre-fix all three read 0; on 1b082dc9 (which registered one
+     * llvm.global_ctors entry per module and let the loader pick the order) the AOT image ran
+     * this file's entry FIRST and gave 3/1/2, while --run gave 1/2/3 - the two disagreed.
+     */
+    if (gclsImportedSeqIndex() != 1)                                           return 2159;
+    if (gclsSeqA.v != 2 || gclsSeqB.v != 3)                                     return 2162;
+    /*
+     * ORDER against CLANG's own initializers: gclsProbe's constructor reads the header-defined
+     * namespace-scope C++ static cppa.g_reg, which Clang initializes from the companion module's
+     * own llvm.global_ctors entry. Every such entry now runs before any cflat one, from a single
+     * driver, so this reads 4242 under BOTH an AOT image and --run. Pre-fix it read 0 on both;
+     * on 1b082dc9 it read 4242 under AOT and 0 under --run.
+     */
+    if (gclsProbe.saw != 4242 || cppa.g_reg.magic != 4242)                      return 2160;
+    // RULING: globals are NOT destroyed at exit, so nothing has run a destructor by now. This
+    // also fails if a global_dtors/atexit entry were ever added.
+    if (cppa.gdtor_count() != 0)                                               return 2161;
 
     return 0;
 }

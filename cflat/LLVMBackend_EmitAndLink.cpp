@@ -1,6 +1,7 @@
 #pragma warning(push)
 #pragma warning(disable: 4244 4267)
 #include <llvm/IR/IRBuilder.h>
+#include "llvm/Transforms/Utils/ModuleUtils.h"
 #include <llvm/IR/LLVMContext.h>
 #include <llvm/IR/AssemblyAnnotationWriter.h>
 #include <llvm/IR/DebugInfo.h>
@@ -2631,6 +2632,61 @@ void LLVMBackend::AdoptCxxCompanionBitcode(const std::string& bitcode)
     for (unsigned char c : bitcode) { hash ^= c; hash *= 1099511628211ULL; }
     if (!cxxCompanionSeen_.insert(hash).second) return;
     cxxCompanionBitcode_.push_back(bitcode);
+}
+
+/*
+ * Construction order for everything that runs before main, made IDENTICAL under an AOT image and
+ * under --run. The two loaders disagree: the Mach-O image walks llvm.global_ctors in REVERSE
+ * array order while the ORC JIT walks it forward, so neither array order nor priorities can
+ * express the order cflat needs. Collapse the whole list to ONE entry - a driver that calls,
+ * in this order:
+ *   1. Clang's companion initializers (lowest priority first, array order within a priority),
+ *      so a header-defined namespace-scope C++ static is constructed before anything reads it;
+ *   2. the per-module cflat initializers in DEPENDENCY order (an imported module's globals
+ *      before the importing module's, declaration order within a module).
+ * After this the array has a single element, so how the loader walks it no longer matters.
+ */
+void LLVMBackend::FinalizeGlobalConstructorOrder()
+{
+    auto* ctorsVar = module->getGlobalVariable("llvm.global_ctors");
+    std::vector<std::pair<uint32_t, llvm::Function*>> clangInits;
+    if (ctorsVar != nullptr && ctorsVar->hasInitializer())
+    {
+        if (auto* entries = llvm::dyn_cast<llvm::ConstantArray>(ctorsVar->getInitializer()))
+        {
+            for (llvm::Value* element : entries->operand_values())
+            {
+                auto* entry = llvm::dyn_cast<llvm::ConstantStruct>(element);
+                if (entry == nullptr || entry->getNumOperands() < 2) continue;
+                auto* priority = llvm::dyn_cast_or_null<llvm::ConstantInt>(
+                    entry->getAggregateElement(0u));
+                auto* callee = entry->getAggregateElement(1);
+                auto* function = callee == nullptr ? nullptr
+                    : llvm::dyn_cast<llvm::Function>(callee->stripPointerCasts());
+                if (function == nullptr) continue;
+                clangInits.emplace_back(
+                    priority == nullptr ? 65535u : (uint32_t)priority->getZExtValue(), function);
+            }
+        }
+    }
+    if (clangInits.empty() && cflatGlobalCxxInitFns_.empty()) return;
+
+    // stable_sort, so entries sharing a priority keep the array order Clang emitted them in.
+    std::stable_sort(clangInits.begin(), clangInits.end(),
+                     [](const auto& a, const auto& b) { return a.first < b.first; });
+    if (ctorsVar != nullptr) ctorsVar->eraseFromParent();
+
+    auto* voidTy = llvm::FunctionType::get(llvm::Type::getVoidTy(*context), false);
+    auto* driver = llvm::Function::Create(
+        voidTy, llvm::Function::InternalLinkage, "__cflat_module_init", module.get());
+    llvm::IRBuilder<> init(llvm::BasicBlock::Create(*context, "entry", driver));
+    for (const auto& clangInit : clangInits)
+        init.CreateCall(clangInit.second->getFunctionType(), clangInit.second);
+    for (llvm::Function* function : cflatGlobalCxxInitFns_)
+        if (function != nullptr && function->getParent() == module.get())
+            init.CreateCall(function->getFunctionType(), function);
+    init.CreateRetVoid();
+    llvm::appendToGlobalCtors(*module, driver, 65535);
 }
 
 /*

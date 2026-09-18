@@ -1704,6 +1704,77 @@ void MainListener::ResolvePendingGlobalDefaultConstructions()
         }
     }
 
+/*
+ * A file-scope object of a foreign C++ class with a NONTRIVIAL default constructor cannot be
+ * spelled as an LLVM constant initializer, so the global stays zero-initialized and the
+ * constructor runs from a module initializer instead. RULING: globals follow the Rust rule -
+ * the constructor runs before main, and there is NO exit-time destruction, so no matching
+ * llvm.global_dtors entry is emitted. The function is handed to the backend's ordered list;
+ * FinalizeGlobalConstructorOrder registers ONE driver that calls Clang's own initializers and
+ * then these, so AOT and --run agree on the order (see that function).
+ */
+void MainListener::EmitPendingGlobalCxxConstructions()
+{
+        auto pending = std::move(pendingGlobalCxxConstructions_);
+        pendingGlobalCxxConstructions_.clear();
+        if (pending.empty()) return;
+
+        auto* compiler = compilerLLVM;
+        auto savedState = compiler->SaveBuilderState();
+        auto* voidTy = llvm::FunctionType::get(compiler->builder->getVoidTy(), false);
+        auto* initFn = llvm::Function::Create(
+            voidTy, llvm::Function::InternalLinkage, "__cflat_global_cxx_init",
+            compiler->module.get());
+        auto* entry = llvm::BasicBlock::Create(*compiler->context, "entry", initFn);
+        compiler->builder->SetInsertPoint(entry);
+
+        try
+        {
+            // The constructor calls must lower as ordinary instructions, not as file-scope IR.
+            GlobalScopeGuard initScope(global_scope);
+            for (const auto& item : pending)
+            {
+                if (item.Global == nullptr || item.Global->isDeclaration()) continue;
+                const std::string& typeName = item.TypeValue.TypeName;
+                if (item.TypeValue.ConstArraySize > 0)
+                {
+                    EmitFixedArrayDefaultInit(item.Global, item.TypeValue, item.Context);
+                    continue;
+                }
+                if (compiler->RejectUnsupportedCxxLayout(typeName)) continue;
+                if (compiler->RejectAbstractCxxClass(typeName, "declare a global of")) continue;
+                std::string implicitCtorError;
+                compiler->TryBindCxxImplicitDefaultCtor(typeName, implicitCtorError);
+                if (!implicitCtorError.empty()) LogErrorContext(item.Context, implicitCtorError);
+                const auto* ctor = compiler->FindCxxDefaultCtor(typeName);
+                if (ctor == nullptr)
+                {
+                    const auto* info = compiler->GetCxxClassInfo(typeName);
+                    LogErrorContext(item.Context, std::format(
+                        "C++ class '{}' has no default constructor cflat can call{} - a global of "
+                        "it cannot be constructed; hold it through a pointer instead", typeName,
+                        info != nullptr && info->hasDeletedDefaultCtor ? " (it is deleted)" : ""));
+                    continue;
+                }
+                compiler->EmitCxxStructorCall(typeName, *ctor, item.Global, {});
+            }
+        }
+        catch (...)
+        {
+            // LogError THROWS and expect_error resumes the walk, so the half-built initializer
+            // must go and the builder must be restored before the walk continues.
+            initFn->eraseFromParent();
+            compiler->RestoreBuilderState(savedState);
+            throw;
+        }
+
+        compiler->builder->CreateRetVoid();
+        compiler->RestoreBuilderState(savedState);
+        // Recorded, NOT registered in llvm.global_ctors: LLVMBackend::FinalizeGlobalConstructorOrder
+        // collapses the whole list to one driver so AOT and --run construct in the same order.
+        compiler->cflatGlobalCxxInitFns_.push_back(initFn);
+    }
+
 // Replicates one element constant across a fixed-array type, recursing through every inner
 // dimension. Returns null when the shapes do not line up, so the caller falls back to seeding.
 llvm::Constant* MainListener::SplatConstantOverFixedArray(llvm::Constant* elemConst, llvm::Type* arrType) {
@@ -6402,7 +6473,9 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                         else if (global_scope)
                         {
                             right = TryFoldGlobalDefaultConstruction(typeAndValue);
-                            if (right == nullptr)
+                            // A foreign C++ class never folds (its constructor is an opaque call);
+                            // the module initializer constructs it, so neither defer nor warn.
+                            if (right == nullptr && !compiler->IsCxxRecord(typeAndValue.TypeName))
                             {
                                 // A defined outer constructor can still call a field constructor
                                 // emitted later, so defer every candidate until the module walk ends.
@@ -6684,6 +6757,31 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                         srcIsUnsigned);
                     if (pendingGlobalDefaultConstruction && !externDeclOnly)
                         pendingGlobalDefaultConstructions_.push_back({global, typeAndValue, direct});
+                    /*
+                     * A global of a C++ class with a NONTRIVIAL default constructor (or a fixed
+                     * array of one) keeps its zeroinitializer here and gets the constructor call
+                     * from the module initializer instead. Queued for EVERY spelling that reaches
+                     * this point - `= default`, `= {}` and no initializer at all - because all
+                     * three produce the same zero constant. A TRIVIALLY constructible C++ class
+                     * is not queued and stays a plain zero-init global.
+                     */
+                    if (!externDeclOnly && !typeAndValue.Pointer && !typeAndValue.IsArrayView
+                        && !typeAndValue.IsInterface && !typeAndValue.IsAlias
+                        && global != nullptr && !global->isDeclaration()
+                        && compiler->CxxElementNeedsDefaultConstruction(typeAndValue.TypeName))
+                    {
+                        // The module initializer runs on ONE thread, so a 'thread_local' object
+                        // would be constructed only in the launching thread and zeroed in others.
+                        if (typeAndValue.threadLocal)
+                            LogErrorContext(direct, std::format(
+                                "a 'thread_local' global of C++ class '{}' cannot be constructed - "
+                                "its default constructor would run on the starting thread only, "
+                                "leaving every other thread's copy zeroed. Declare it "
+                                "'thread_local {}* {} = nullptr;' and construct it per thread",
+                                typeAndValue.TypeName, SpellType(*compiler, typeAndValue), name));
+                        else
+                            pendingGlobalCxxConstructions_.push_back({global, typeAndValue, direct});
+                    }
                     if (!externDeclOnly && DeclSpecHasConst(declSpec)
                         && typeAndValue.TypeName == "string" && initializer != nullptr
                         && initializer->assignmentExpression() != nullptr)

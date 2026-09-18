@@ -30,6 +30,43 @@ struct Poly {
     virtual ~Poly() { ++dtor_slot(); }
 };
 
+/*
+ * M103: FILE-SCOPE globals of a C++ class. These use their OWN counters, never reset(), because
+ * a global is constructed before main runs and every reset() in the fixture would erase the
+ * evidence. RULING: the constructor runs before main and there is NO exit-time destruction, so
+ * gdtor_count() must still read 0 at the end of main.
+ */
+inline int& gctor_slot() { static int c = 0; return c; }
+inline int& gdtor_slot() { static int d = 0; return d; }
+inline int gctor_count() { return gctor_slot(); }
+inline int gdtor_count() { return gdtor_slot(); }
+struct GTrk { int v; GTrk() : v(7) { ++gctor_slot(); } ~GTrk() { ++gdtor_slot(); } };
+// Polymorphic: the constructor writes the vptr, so a virtual call on a zeroed global crashes.
+struct GPoly {
+    int v;
+    GPoly() : v(5) { ++gctor_slot(); }
+    virtual int kind() const { return 11; }
+    virtual ~GPoly() { ++gdtor_slot(); }
+};
+// Declaration ORDER: each object records its own construction index on a private counter. Also
+// carries the IMPORT order - an imported module's globals are constructed before its importer's.
+inline int& gseq_slot() { static int c = 0; return c; }
+struct GSeq { int v; GSeq() : v(++gseq_slot()) {} ~GSeq() { ++gdtor_slot(); } };
+
+/*
+ * ORDER against CLANG's own initializers: `g_reg` is a header-defined namespace-scope C++ static,
+ * so Clang initializes it from its companion module's llvm.global_ctors entry. A cflat global
+ * whose constructor READS it must therefore be constructed after it - which is only true if the
+ * two lists are sequenced deliberately. Pre-fix the cflat entry was registered ahead of Clang's
+ * at the same priority, and the Mach-O image and the ORC JIT walk that array in OPPOSITE
+ * directions, so AOT saw 4242 and --run saw 0.
+ */
+struct GReg { int magic; GReg(); };
+inline GReg::GReg() : magic(4242) {}
+inline GReg g_reg;
+struct GProbe { int saw; GProbe(); };
+inline GProbe::GProbe() : saw(g_reg.magic) {}
+
 // Default constructor DELETED: an array of it has no default initialization in C++ either.
 struct NoDef { int v; NoDef() = delete; NoDef(int a) : v(a) {} ~NoDef() {} };
 

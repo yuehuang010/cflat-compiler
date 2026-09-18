@@ -1,0 +1,10 @@
+// Helper MODULE for the M103 global-construction section of Test/test_cpp_interop.cb. It exists
+// only to own a file-scope global in an IMPORTED module, so the fixture can assert that an
+// imported module's globals are constructed before the importing module's. Not a test itself -
+// Test/library/ is outside every test glob.
+import cpp "cpp_interop_arrayelem.h";
+
+// Constructed FIRST of the three GSeq globals in this program, so it records index 1.
+cppa.GSeq gclsSeqImported = default;
+
+int gclsImportedSeqIndex() { return gclsSeqImported.v; }

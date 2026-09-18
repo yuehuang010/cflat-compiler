@@ -1,0 +1,15 @@
+// A file-scope object of a C++ class is constructed from a module initializer before main
+// (RULING: no exit-time destruction). Two shapes cannot be served that way and are rejected.
+import cpp "cpp_interop_arrayelem.h";
+
+// The module initializer runs on ONE thread, so a 'thread_local' object would be constructed in
+// the starting thread only. Immediate (raised at the declaration site), so a scoped block works.
+expect_error("its default constructor would run on the starting thread only") {
+    thread_local cppa.Trk gerrTl = default;
+}
+
+// A DELETED default constructor: C++ has no default initialization for it either. The
+// diagnostic is DEFERRED to the end of the module walk (the constructor bind happens when the
+// initializer is emitted), so it needs the bare file-scope form, LAST in compile order.
+expect_error("has no default constructor cflat can call (it is deleted) - a global of it cannot be constructed");
+cppa.NoDef gerrNoDef = default;

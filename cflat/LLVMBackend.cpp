@@ -2263,6 +2263,7 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
             {
                 NoCurrentFunctionScope noCurrent(this);
                 myListener->ResolvePendingGlobalDefaultConstructions();
+                myListener->EmitPendingGlobalCxxConstructions();
             }
             // Now that every implementor is registered, emit the interface rebox if-chains.
             // Resolve-created calls can register deferred interface work, so resolve first.
@@ -2372,6 +2373,10 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
     // C++ definitions Clang emitted for imported headers join the module BEFORE verification and
     // optimization, so they are optimized (and inlined) with the rest of the program.
     if (!LinkCxxCompanionModules()) return false;
+
+    // Clang's own initializers are in llvm.global_ctors only after the link above, so the
+    // single-driver rewrite that fixes construction order has to run here, not earlier.
+    FinalizeGlobalConstructorOrder();
 
     {
         llvm::TimeTraceScope verifyScope("VerifyModule");
@@ -3498,6 +3503,7 @@ bool LLVMBackend::CompileImportedFile(const std::string& importingFilePath, cons
         {
             NoCurrentFunctionScope noCurrent(this);
             myListener->ResolvePendingGlobalDefaultConstructions();
+            myListener->EmitPendingGlobalCxxConstructions();
         }
     }
     if (isCoreImport)
@@ -4407,6 +4413,7 @@ bool LLVMBackend::Analyze(const std::string& filePath,
             {
                 NoCurrentFunctionScope noCurrent(this);
                 myListener->ResolvePendingGlobalDefaultConstructions();
+                myListener->EmitPendingGlobalCxxConstructions();
             }
             // Now that every implementor is registered, emit the interface rebox if-chains.
             // Resolve-created calls can register deferred interface work, so resolve first.
@@ -4461,6 +4468,8 @@ void LLVMBackend::ResetForReanalysis()
     cxxFunctionPointerAbiPlans_.clear();
     cxxFunctionPointerAbiRefusals_.clear();
     cxxCompanionInternalized_ = false;
+    // Holds llvm::Function* into the module this reset is about to replace.
+    cflatGlobalCxxInitFns_.clear();
     cxxCflatToCxxSpelling_.clear();
     cxxLazyAliasSpecializations_.clear();
     cxxForeignRequests_.clear();

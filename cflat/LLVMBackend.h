@@ -3311,6 +3311,17 @@ private:
     bool cxxCompanionInternalized_ = false;
     void AdoptCxxCompanionBitcode(const std::string& bitcode);
     bool LinkCxxCompanionModules();
+public:
+    /*
+     * Per-module initializer functions holding the C++ default constructions of a file's globals
+     * (MainListener::EmitPendingGlobalCxxConstructions), recorded in DEPENDENCY order: an
+     * imported module is walked before its importer, and a module's globals are appended in
+     * declaration order. Not registered in llvm.global_ctors individually - see
+     * FinalizeGlobalConstructorOrder for why the list is collapsed to one driver.
+     */
+    std::vector<llvm::Function*> cflatGlobalCxxInitFns_;
+    void FinalizeGlobalConstructorOrder();
+private:
     std::string cppStandard_ = "c++20";
     int cOptLevel_ = 0;        // optimization level applied to clang C compiles
     bool cDebugInfo_ = false;  // emit CodeView for clang C compiles

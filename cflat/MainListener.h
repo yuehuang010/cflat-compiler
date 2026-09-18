@@ -3244,6 +3244,10 @@ private:
     };
     std::vector<PendingGlobalDefaultConstruction> pendingGlobalDefaultConstructions_;
 
+    // File-scope objects (and arrays of them) of a foreign C++ class whose default constructor
+    // is nontrivial: the call cannot be a constant initializer, so it runs from a module ctor.
+    std::vector<PendingGlobalDefaultConstruction> pendingGlobalCxxConstructions_;
+
     // RAII guard: sets global_scope to false on entry and restores the saved value on exit.
     struct GlobalScopeGuard
     {
@@ -3727,6 +3731,10 @@ public:
 
     // Retry global default folds after all declarations and deferred instantiations are emitted.
     void ResolvePendingGlobalDefaultConstructions();
+
+    // Emit one llvm.global_ctors entry running the C++ default constructors of this file's
+    // globals, in declaration order. No matching global_dtors: globals follow the Rust rule.
+    void EmitPendingGlobalCxxConstructions();
 
     void SetImportNamespace(const std::string& ns);
 
