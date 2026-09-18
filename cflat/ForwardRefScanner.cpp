@@ -1124,6 +1124,13 @@ std::string ForwardRefScanner::ResolveForwardTypeArg(CFlatParser::TypeParameterE
                 innerArgs.push_back(ResolveForwardTypeArg(innerEntry));
             Compiler(entry)->ResolveGenericAliasSpelling(innerBase, innerArgs, false);
             resolved = MangleGenericInstance(*Compiler(entry), innerBase, innerArgs);
+            // Mirror of the main pass's ResolveTypeArgEntry: register a nested foreign C++
+            // specialization BEFORE the outer name is requested around it, so the outer request
+            // carries the inner's owning group (<memory> for std.shared_ptr) as a dependency.
+            {
+                std::string cxxError;
+                Compiler(entry)->TryRequestCxxType(innerBase, innerArgs, resolved, cxxError);
+            }
         }
         else if (typeSpec && typeSpec->functionPointerSpecifier())
         {

@@ -1,0 +1,41 @@
+// A std container over a std specialization over a POINTER to a user class, named in a
+// FILE-SCOPE SIGNATURE. The signature pre-pass now requests every nested component before the
+// outer one, so std.vector<std.shared_ptr<nest.Cell>> binds in a signature (pinned as values in
+// Test/test_cpp_interop_template.cb, section M103). This POINTER shape does not, and it is
+// refused as a LOCAL too - "'std::vector<std::vector<nest::Cell *>>' does not name a C++ class
+// type in the imported headers" - so this refusal says something true rather than contradicting
+// a spelling that works elsewhere. Tracked by
+// internal/issue/p2/cpp-nested-user-class-pointer-at-inner-depth-unresolvable.md.
+//
+// PIN, not a discriminator: this file passes on the pre-fix binary too.
+//
+// Three authoring facts measured while writing it:
+//   1. expect_error matches the UNLOCALIZED format string ("unknown type '{}'"), never the
+//      displayed "cannot find the type ..." text. The nested-argument refusal was reported as
+//      uncatchable; it is catchable, with the source spelling.
+//   2. BARE semicolon form, alone in its file. A refused file-scope signature reports TWICE -
+//      the generic "unknown type" from the signature pre-pass, then the request's own message
+//      from the codegen walk - so a SCOPED block is armed for both and no single expectation
+//      can satisfy it. The bare form stops at the first.
+//   3. It cannot live in err_cpp_nested_missing.cb: a file-scope signature is resolved before
+//      main's body is walked, so a bare expectation here swallows that file's reject leg, and a
+//      scoped one changes that leg's message by memoizing std::vector's owning group.
+import cpp "vector" cache;
+import cpp "cpp_interop_nest.h" cache;
+
+// The accept half comes FIRST: the bare expectation below covers the rest of the file, and the
+// same outer spelling one pointer level shallower has to keep binding.
+int nested_ptr_ok(std.vector<nest.Cell*> v) { return (int)v.size(); }
+
+expect_error("unknown type 'std.vector<std.vector<nest.Cell*>>'");
+int nested_ptr_sig(std.vector<std.vector<nest.Cell*>> v) { return (int)v.size(); }
+
+extern int main()
+{
+    nest.Cell one = nest.Cell(2, 3);
+    std.vector<nest.Cell*> ok = default;
+    ok.push_back(&one);
+    if (nested_ptr_ok(ok) != 1) return 1;
+    if (ok[0]->b != 3) return 2;
+    return 0;
+}

@@ -268,6 +268,65 @@ int veciter_direct_array_param(std.array<int, 4> value)
 // resolved by the ForwardRefScanner copy of the declaration path, not by the codegen copy.
 int alnpat_take_nbdef(alna.NBdef<int> value) { return value.v + 100; }
 alna.NBdef<int> alnpat_make_nbdef() { alna.NBdef<int> made = default; return made; }
+
+/*
+ * Section M103 helpers: a std container over a std specialization over a USER class, spelled in a
+ * FILE-SCOPE SIGNATURE. These reach the type through the ForwardRefScanner's signature pre-pass,
+ * which used to mangle a nested argument without ever requesting it - so the outer specialization
+ * resolved in a <vector>+user-header group that cannot reach <memory> and the inner request
+ * inherited that group and failed. The whole file is refused by the pre-fix binary right here,
+ * with "'std::shared_ptr<nest::Cell>' does not name a C++ class type in the imported headers".
+ */
+int nestsig_param(std.vector<std.shared_ptr<nest.Cell>> v) { return (int)v.size(); }
+// Returns EMPTY on purpose: returning a C++ class that already owns heap by value from a CFlat
+// function aborts (SIGBUS), measured - that is the separate return-by-value copy family, not this
+// fix. The leg below proves the returned object is usable rather than just counting zero.
+std.vector<std.shared_ptr<nest.Cell>> nestsig_return()
+{
+    std.vector<std.shared_ptr<nest.Cell>> made = default;
+    return made;
+}
+// Parameter AND return in one signature. It returns a FRESH empty vector whose capacity carries
+// the parameter's size, rather than `return v;`: passing a by-value C++ class straight back out
+// aborts in libc++ refcount teardown when other by-value legs are present - measured, and
+// measured identically for std.vector<std.string> on the pre-fix binary (scratch/nsg_c1.cb, exit
+// 133 both sides). That is the separate by-value C++ class copy family, not this fix.
+std.vector<std.shared_ptr<nest.Cell>> nestsig_both(std.vector<std.shared_ptr<nest.Cell>> v)
+{
+    std.vector<std.shared_ptr<nest.Cell>> out = default;
+    out.reserve((ulong)((int)v.size() + 4));
+    return out;
+}
+// Depth 3.
+int nestsig_depth3(std.vector<std.vector<std.shared_ptr<nest.Cell>>> v) { return (int)v.size(); }
+// The inner user class taken from the SECOND user header instead.
+int nestsig_group2(std.vector<std.shared_ptr<nest2.Tag>> v) { return (int)v.size(); }
+// Declaration ORDER: this one is declared BEFORE any function that declares a local of the same
+// spelling, so no earlier resolution can have cached the inner's owning group for it.
+int nestsig_order_first(std.vector<std.shared_ptr<nest.Cell>> v) { return (int)v.size() + 100; }
+int nestsig_order_seed()
+{
+    std.vector<std.shared_ptr<nest.Cell>> seeded = default;
+    std.shared_ptr<nest.Cell> seed = default;
+    seeded.push_back(seed);
+    return (int)seeded.size();
+}
+// ... and this one AFTER that local, the order in which the cached resolution could mask the bug.
+int nestsig_order_last(std.vector<std.shared_ptr<nest.Cell>> v) { return (int)v.size() + 200; }
+// The same spelling as a FIELD of a file-scope CFlat struct (ForwardRefScanner struct-shell pass)
+// and as the type ARGUMENT of a file-scope CFlat generic.
+struct NestSigHolder
+{
+    std.vector<std.shared_ptr<nest.Cell>> items = default;
+    int tag = 3;
+};
+struct NestSigBox<T>
+{
+    T item = default;
+    int tag() { return 7; }
+};
+int nestsig_generic_param(NestSigBox<std.vector<std.shared_ptr<nest.Cell>>> b) { return b.tag(); }
+
 extern int main()
 {
     // Win64 keeps the existing SEH trampoline and does not emit the C++ guard, so the
@@ -1983,6 +2042,84 @@ extern int main()
         // The alias as the base of a [cpp] struct (both copies of the base-clause path).
         AlnPatBase alnBase = default;
         if (alnBase.v != 7)                                                  return 2229;  // was 4
+    }
+
+    // ---- M103: a nested std specialization over a user class in a FILE-SCOPE SIGNATURE ---------
+    /*
+     * Every leg below calls a helper declared above main whose PARAMETER, RETURN type, FIELD or
+     * CFlat-generic argument names std.vector<std.shared_ptr<nest.Cell>>. Discriminator: the
+     * pre-fix binary never compiles this file - it refuses each helper's signature, because the
+     * signature pre-pass mangled the nested argument without requesting it. The identical
+     * spelling as a LOCAL bound on the pre-fix binary too, which is what made the refusal
+     * misleading; the local legs here are the ACCEPT SET the fix must not disturb.
+     */
+    {
+        std.vector<std.shared_ptr<nest.Cell>> sigV = default;
+        std.shared_ptr<nest.Cell> sigP = default;
+        sigV.push_back(sigP);
+        // Local form - passed on the pre-fix binary, pinned so the fix cannot trade one for the other.
+        if ((int)sigV.size() != 1)                                           return 2250;
+
+        // Parameter.
+        if (nestsig_param(sigV) != 1)                                        return 2251;
+    }
+    {
+        // Return type. The returned value is then USED, so the leg cannot pass on a vector the
+        // callee never really built.
+        std.shared_ptr<nest.Cell> sigRp = default;
+        std.vector<std.shared_ptr<nest.Cell>> sigR = nestsig_return();
+        if ((int)sigR.size() != 0)                                           return 2252;
+        sigR.push_back(sigRp);
+        sigR.push_back(sigRp);
+        if ((int)sigR.size() != 2)                                           return 2253;
+        if (sigR[1].get() != nullptr)                                        return 2254;
+    }
+    {
+        // Parameter AND return in one signature: the returned vector's capacity is derived from
+        // the parameter's size, so neither half can be optimized away.
+        std.vector<std.shared_ptr<nest.Cell>> sigBv = default;
+        std.shared_ptr<nest.Cell> sigBp = default;
+        sigBv.push_back(sigBp);
+        std.vector<std.shared_ptr<nest.Cell>> sigB = nestsig_both(sigBv);
+        if ((int)sigB.capacity() != 5)                                       return 2266;
+        if ((int)sigB.size() != 0)                                           return 2267;
+    }
+    {
+        // Depth 3 as a parameter.
+        std.vector<std.vector<std.shared_ptr<nest.Cell>>> sigD = default;
+        std.vector<std.shared_ptr<nest.Cell>> sigDi = default;
+        sigD.push_back(sigDi);
+        if (nestsig_depth3(sigD) != 1)                                       return 2255;
+
+        // The inner user class from the SECOND user header.
+        std.vector<std.shared_ptr<nest2.Tag>> sigT = default;
+        std.shared_ptr<nest2.Tag> sigTp = default;
+        sigT.push_back(sigTp);
+        if (nestsig_group2(sigT) != 1)                                       return 2256;
+    }
+    {
+        // Declaration ORDER: the signature written BEFORE any local of the same spelling, and the
+        // one written AFTER it, must both bind. The +100/+200 offsets keep the two apart.
+        std.vector<std.shared_ptr<nest.Cell>> sigO = default;
+        if (nestsig_order_first(sigO) != 100)                                return 2257;
+        if (nestsig_order_seed() != 1)                                       return 2258;
+        if (nestsig_order_last(sigO) != 200)                                 return 2259;
+    }
+    {
+        // The spelling as a FIELD of a file-scope CFlat struct (struct-shell pre-pass).
+        NestSigHolder sigH = default;
+        if (sigH.tag != 3)                                                   return 2260;
+        if ((int)sigH.items.size() != 0)                                     return 2261;
+        std.shared_ptr<nest.Cell> sigHp = default;
+        sigH.items.push_back(sigHp);
+        if ((int)sigH.items.size() != 1)                                     return 2262;
+
+        // The spelling as the type ARGUMENT of a file-scope CFlat generic, as a field of the
+        // instantiation and as a parameter naming it.
+        NestSigBox<std.vector<std.shared_ptr<nest.Cell>>> sigG = default;
+        if (sigG.tag() != 7)                                                 return 2263;
+        if ((int)sigG.item.size() != 0)                                      return 2264;
+        if (nestsig_generic_param(sigG) != 7)                                return 2265;
     }
 
     return 0;
