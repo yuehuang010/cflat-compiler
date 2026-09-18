@@ -189,6 +189,9 @@ int tplbox_second_use(int v)
     cppt.Box<int> b = cppt.Box<int>(v);
     return b.get() + b[0];
 }
+// File-scope signature naming a scoped-enum NON-TYPE specialization: the ForwardRefScanner
+// (ResolveForwardTypeArg) renders the argument here, the codegen pass renders it again.
+int entnttp_take(cppi_scope.HueBox<cppi_scope.Hue.Red> value) { return value.get(); }
 int qualtemp_take_box(cppt.Box<int> value) { return value.get(); }
 int qualtemp_take_pair(cppt.CtorPair<int> value) { return value.first() + value.second(); }
 int qualtemp_take_nested(cppt.Box<cppt.Box<int>> value) { return value.get().get(); }
@@ -2042,6 +2045,59 @@ extern int main()
         // The alias as the base of a [cpp] struct (both copies of the base-clause path).
         AlnPatBase alnBase = default;
         if (alnBase.v != 7)                                                  return 2229;  // was 4
+
+        // ---- C++ SCOPED-ENUM non-type template arguments. Pre-fix the argument was rendered as
+        // its bare integer, so the request reaching clang ('cppi_scope::HueBox<2>') was ill-formed
+        // for a scoped-enum parameter and the diagnostic blamed the class, not the argument.
+        {
+            cppi_scope.HueBox<cppi_scope.Hue.Green> entDecl = default;
+            if (entDecl.get() != 2)                                          return 2320;  // was refused
+            // An unsigned-char backing: the registry keeps the enumerator sign-extended, so the
+            // pre-fix request said '<-56>' for the value 200.
+            cppi_scope.HueBox<cppi_scope.Hue.Deep> entCtor = cppi_scope.HueBox<cppi_scope.Hue.Deep>();
+            if (entCtor.get() != 200)                                        return 2321;  // was refused
+            cppi_scope.ModeBox<cppi_scope.Mode.On> entNoBacking = default;
+            if (entNoBacking.get() != 1)                                     return 2322;  // was refused
+            cppi_scope.SignBox<cppi_scope.Sign.Neg> entNeg = default;
+            if (entNeg.get() != -3)                                          return 2323;  // was refused
+            cppi_scope.deep.ToneBox<cppi_scope.deep.Tone.T2> entNestedNs = default;
+            if (entNestedNs.get() != 12)                                     return 2324;  // was refused
+            cppi_scope.HostBox<cppi_scope.Host.Kind.A> entInClass = default;
+            if (entInClass.get() != 5)                                       return 2325;  // was refused
+            // The file-scope signature spelling (scanner path); pre-fix it failed EARLIER, with
+            // "cannot find the type", so this leg covers a different render site from the rest.
+            cppi_scope.HueBox<cppi_scope.Hue.Red> entForSig = default;
+            if (entnttp_take(entForSig) != 1)                                return 2326;  // was refused
+            // The same argument nested as the INNER argument of an outer specialization.
+            cppi_scope.HueWrap<cppi_scope.HueBox<cppi_scope.Hue.Green>> entInner = default;
+            if (entInner.get() != 1002)                                      return 2327;  // was refused
+            // Alias templates: the fixed-argument alias already worked; the forwarding pattern
+            // rendered the argument itself and did not.
+            cppi_scope.DeepHueBox entAliasFixed = default;
+            if (entAliasFixed.get() != 200)                                  return 2328;  // worked
+            cppi_scope.HueAlias<cppi_scope.Hue.Deep> entAliasPattern = default;
+            if (entAliasPattern.get() != 200)                                return 2329;  // was refused
+            // Two enumerators of one enum must reach two DISTINCT instantiations, so the sum
+            // cannot come from either specialization alone.
+            cppi_scope.HueBox<cppi_scope.Hue.Red> entTwoA = default;
+            cppi_scope.HueBox<cppi_scope.Hue.Deep> entTwoB = default;
+            if (entTwoA.get() + entTwoB.get() != 201)                        return 2330;  // was refused
+            // The specialization as a C++ function parameter.
+            if (cppi_scope.takeGreenBox(entDecl) != 502)                     return 2331;  // was refused
+            // The frozen ACCEPT SET the argument rendering must leave alone: an unscoped-enum,
+            // int, bool and char non-type argument, and a scoped enum as a TYPE argument. All
+            // four compiled and ran identically before this change.
+            cppi_scope.PlainBox<cppi_scope.PN_TWO> entPlain = default;
+            if (entPlain.get() != 2)                                         return 2332;
+            cppi_scope.IntBox<3> entInt = default;
+            if (entInt.get() != 3)                                           return 2333;
+            cppi_scope.BoolBox<true> entBool = default;
+            if (entBool.get() != 41)                                         return 2334;
+            cppi_scope.CharBox<65> entChar = default;
+            if (entChar.get() != 65)                                         return 2335;
+            cppi_scope.HueTag<cppi_scope.Hue> entTypeArg = cppi_scope.HueTag<cppi_scope.Hue>(cppi_scope.Hue.Deep);
+            if (entTypeArg.as_int() != 200)                                  return 2336;
+        }
     }
 
     // ---- M103: a nested std specialization over a user class in a FILE-SCOPE SIGNATURE ---------

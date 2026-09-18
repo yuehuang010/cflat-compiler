@@ -3682,6 +3682,33 @@ bool LLVMBackend::IsCxxForeignTypeRegistered(const std::string& cflatName) const
         return cxxCflatToCxxSpelling_.find(cflatName) != cxxCflatToCxxSpelling_.end();
 }
 
+/*
+ * An enumerator used as a C++ template argument. The registry keeps the value sign-extended from
+ * its backing width, so an unsigned backing is re-read unsigned before it is spelled; and a SCOPED
+ * enumeration has no implicit conversion from its integer, so the argument must carry the cast to
+ * the qualified enumeration type or the request that reaches clang is ill-formed.
+ */
+std::string LLVMBackend::CxxEnumeratorArgumentSpelling(const std::string& enumSpelled,
+                                                       int64_t value) const
+{
+        const std::string enumKey = ResolveEnumTypeName(enumSpelled);
+        std::string literal = std::to_string(value);
+        if (value < 0)
+        {
+            TypeAndValue probe;
+            probe.TypeName = GetEnumBackingType(enumKey);
+            if (const int bits = probe.IsUnsignedInteger(); bits > 0)
+                literal = std::to_string(bits >= 64
+                                             ? (uint64_t)value
+                                             : ((uint64_t)value & ((uint64_t(1) << bits) - 1)));
+        }
+        std::string enumSpelling;
+        if (!enumKey.empty() && scopedEnumTypes_.count(enumKey) != 0
+            && CxxSpellingForCflatType(enumKey, enumSpelling))
+            return "(" + enumSpelling + ")" + literal;
+        return literal;
+}
+
 // CFlat type argument -> C++ spelling. Primitives by width, a previously requested foreign type by
 // its own spelling, one trailing pointer level as a pointer. Anything else (a CFlat struct, a CFlat
 // generic instantiation) has no C++ identity and is refused by the caller.
@@ -3702,10 +3729,11 @@ bool LLVMBackend::CxxSpellingForCflatType(const std::string& cflatType, std::str
         {
             if (auto dot = base.rfind('.'); dot != std::string::npos)
             {
+                const std::string enumSpelled = base.substr(0, dot);
                 int64_t value = 0;
-                if (TryGetEnumMemberInt(base.substr(0, dot), base.substr(dot + 1), value))
+                if (TryGetEnumMemberInt(enumSpelled, base.substr(dot + 1), value))
                 {
-                    out = std::to_string(value);
+                    out = CxxEnumeratorArgumentSpelling(enumSpelled, value);
                     return true;
                 }
             }

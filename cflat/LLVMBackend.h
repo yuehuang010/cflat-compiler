@@ -9323,6 +9323,8 @@ public:
     void RegisterScopedEnumType(const std::string& enumName);
     bool IsScopedEnumTypeName(const std::string& name) const;
     bool IsScopedEnumMatch(const TypeAndValue& from, const TypeAndValue& to) const;
+    // Renders '<enum>.<member>' as a C++ template argument; see the definition for the two rules.
+    std::string CxxEnumeratorArgumentSpelling(const std::string& enumSpelled, int64_t value) const;
     /*
      * Register an enum declaration: the type facts (name -> backing type, name as a member
      * scope) and every member's constant global. Called from BOTH passes - ForwardRefScanner so

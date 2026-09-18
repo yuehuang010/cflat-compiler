@@ -1,0 +1,29 @@
+// A C++ scoped-enum NON-TYPE template argument is rendered as a cast to the qualified enumeration
+// type, so the request that reaches clang is well-formed and the diagnostic quotes the argument
+// the user could not otherwise see. These three legs pin the rendering itself: each message names
+// the ARGUMENT spelling, not just the class. Scoped blocks - each leg is armed independently.
+import cpp "cpp_interop_scoped_enum.h";
+
+extern int main()
+{
+    // Wrong scoped enum for the parameter. Pre-fix the request was 'HueBox<1>' and the message
+    // could not say which enum the 1 came from.
+    expect_error("'cppi_scope::HueBox<(cppi_scope::Mode)1>' does not name a C++ class type") {
+        cppi_scope.HueBox<cppi_scope.Mode.On> wrongEnum = default;
+    }
+
+    // The unsigned-char backing. The registry keeps the enumerator sign-extended, so without the
+    // unsigned re-read this reads '(cppi_scope::Hue)-56' for an enumerator written as 200.
+    expect_error("'cppi_scope::ModeBox<(cppi_scope::Hue)200>' does not name a C++ class type") {
+        cppi_scope.ModeBox<cppi_scope.Hue.Deep> wrongBacking = default;
+    }
+
+    // A scoped enumerator no longer silently satisfies an 'int' non-type parameter: C++ has no
+    // implicit conversion out of a scoped enum, and neither does CFlat. Pre-fix this compiled and
+    // returned 2, because the argument was rendered as the bare integer.
+    expect_error("'cppi_scope::IntBox<(cppi_scope::Hue)2>' does not name a C++ class type") {
+        cppi_scope.IntBox<cppi_scope.Hue.Green> scopedIntoInt = default;
+    }
+
+    return 0;
+}

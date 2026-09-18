@@ -62,4 +62,35 @@ namespace cppi_scope
     inline int takeAMap(const std::map<A, int>&) { return 8; }
     inline int takeUIntVector(const std::vector<unsigned int>&) { return 8; }
     inline int takeUIntMap(const std::map<int, unsigned int>&) { return 8; }
+
+    // Scoped-enum NON-TYPE template parameters. A scoped enumeration has no implicit conversion
+    // from its integer, so the CFlat argument has to reach clang as a cast to the enum type.
+    enum class Hue : unsigned char { Red = 1, Green = 2, Deep = 200 };
+    enum class Mode { Off = 0, On = 1 };          // no explicit underlying type
+    enum class Sign : int { Neg = -3, Pos = 3 };
+    enum PlainN { PN_TWO = 2 };
+
+    template <Hue H>    struct HueBox   { int get() const { return (int)H; } };
+    template <Mode M>   struct ModeBox  { int get() const { return (int)M; } };
+    template <Sign S>   struct SignBox  { int get() const { return (int)S; } };
+    template <PlainN P> struct PlainBox { int get() const { return (int)P; } };
+    template <int N>    struct IntBox   { int get() const { return N; } };
+    template <bool B>   struct BoolBox  { int get() const { return B ? 41 : 17; } };
+    template <char C>   struct CharBox  { int get() const { return (int)C; } };
+    template <typename T> struct HueWrap { T inner; int get() const { return inner.get() + 1000; } };
+    template <typename T> struct HueTag { T v; HueTag(T x) : v(x) {} int as_int() const { return (int)v; } };
+
+    struct Host { enum class Kind : int { A = 5, B = 6 }; };
+    template <Host::Kind K> struct HostBox { int get() const { return (int)K; } };
+
+    using DeepHueBox = HueBox<Hue::Deep>;
+    template <Hue H> using HueAlias = HueBox<H>;
+
+    namespace deep
+    {
+        enum class Tone : int { T1 = 11, T2 = 12 };
+        template <Tone T> struct ToneBox { int get() const { return (int)T; } };
+    }
+
+    inline int takeGreenBox(HueBox<Hue::Green> b) { return b.get() + 500; }
 }
