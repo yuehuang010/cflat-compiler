@@ -1738,16 +1738,18 @@ std::string LLVMBackend::GetCHeaderCacheDir()
 uint64_t LLVMBackend::CHeaderDiskCacheKey(const std::string& fileForLsp,
                                         const std::vector<std::string>& includeDirs,
                                         const std::vector<std::string>& defines,
-                                        const std::vector<std::string>& extraDefines)
+                                        const std::vector<std::string>& extraDefines,
+                                        bool msvcBitfieldPacking)
 {
         return CHeaderDiskCacheKey(std::vector<std::string>{ fileForLsp },
-                                   includeDirs, defines, extraDefines);
+                                   includeDirs, defines, extraDefines, msvcBitfieldPacking);
     }
 
 uint64_t LLVMBackend::CHeaderDiskCacheKey(const std::vector<std::string>& headerPaths,
                                         const std::vector<std::string>& includeDirs,
                                         const std::vector<std::string>& defines,
                                         const std::vector<std::string>& extraDefines,
+                                        bool msvcBitfieldPacking,
                                         bool cxxMode, bool cxxDefinitionsEmitted)
 {
         uint64_t h = 14695981039346656037ULL;
@@ -1758,6 +1760,9 @@ uint64_t LLVMBackend::CHeaderDiskCacheKey(const std::vector<std::string>& header
         for (const auto& inc : includeDirs)  { fold("|I"); fold(inc); }
         for (const auto& def : defines)      { fold("|D"); fold(def); }
         for (const auto& def : extraDefines) { fold("|d"); fold(def); }
+        // A record's bitfield layout is stored here, and it packs by the target's rule: an entry
+        // written for one packing mode is not reusable under the other.
+        fold(msvcBitfieldPacking ? "|BFMS" : "|BFIT");
         // A C++-mode binding of the same header is a different result; keep the keys apart.
         if (cxxMode) fold("|CXX");
         // A declarations-only C++ bind (LSP: no bodies, empty companion module) is a different

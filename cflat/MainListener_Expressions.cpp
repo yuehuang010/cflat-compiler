@@ -3268,6 +3268,15 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                         ? std::format("element of '{}'", namedVar.CallerName)
                         : std::format("'{}'", namedVar.CallerName));
 
+            // `p = cppRefReturningCall();` binds to the referent, exactly as `&<call>` does -
+            // the twin of the declaration-initializer leg in MainListener_Declarations.
+            if (operatorText == "=" && right != nullptr && right->getType()->isStructTy())
+                if (auto* refAddr = compiler->CxxReferenceResultAsPointer(
+                        namedVar.TypeAndValue, rightNV,
+                        namedVar.CallerName.empty() ? std::string("this location")
+                                                    : std::format("'{}'", namedVar.CallerName)))
+                    right = refAddr;
+
             // M6 - `basePtr = derivedPtr;` shifts to the base subobject, matching the declaration
             // initializer leg above.
             if (operatorText == "=" && right != nullptr)

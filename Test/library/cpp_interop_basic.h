@@ -642,6 +642,10 @@ namespace cppi
     int take_rvalue(Tracked&& t) noexcept;
     int take_ref(const Tracked& t) noexcept;
     const Tracked& tracked_ref() noexcept;
+    // A MUTABLE class reference return. A CFlat pointer local binds to the REFERENT, so a write
+    // through that pointer is visible to the next call - a copy would hide it.
+    struct RefCell { int v; };
+    inline RefCell& ref_cell() noexcept { static RefCell cell{770}; return cell; }
     int take_either(const Tracked& t) noexcept;
     int take_either(Tracked&& t) noexcept;
     std::unique_ptr<Tracked> make_tracked_ptr(int payload) noexcept;

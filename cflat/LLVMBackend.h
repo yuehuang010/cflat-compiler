@@ -5307,10 +5307,8 @@ private:
     // that contains a std::function somewhere inside it.
     static bool IsTopLevelStdFunctionSpelling(const std::string& spelling);
     // Maps a `std::function<R(Args)>` C++ spelling onto its std.function specialization and
-    // requests it. "" when the spelling is not one, or is not one at top level under
-    // requireTopLevel.
+    // requests it. "" when the spelling is not a TOP-LEVEL std::function.
     std::string StdFunctionSpecializationForSpelling(const std::string& spelling,
-                                                     bool requireTopLevel,
                                                      std::string* requestError = nullptr);
     bool CxxSpellingForCflatType(const std::string& cflatType, std::string& out) const;
     /*
@@ -7698,6 +7696,13 @@ public:
      */
     llvm::Value* AdjustCxxPointerForStore(const TypeAndValue& dest, const TypeAndValue& src,
                                           llvm::Value* value, const std::string& destDesc);
+    /*
+     * A C++ reference return (`C&` / `const C&`) hands back the referent's ADDRESS, so a CFlat
+     * pointer destination binds to it directly - the same value `&<call>` yields. Returns that
+     * address (base-adjusted like a pointer store), or nullptr when the source is not one.
+     */
+    llvm::Value* CxxReferenceResultAsPointer(const TypeAndValue& dest, const NamedVariable& src,
+                                             const std::string& destDesc);
     // A foreign C++ class whose destructor is virtual: `delete` through a pointer to it must go
     // through the vtable so the DERIVED destructor runs.
     bool CxxHasVirtualDestructor(const std::string& typeName) const
@@ -9470,12 +9475,16 @@ public:
     static uint64_t CHeaderDiskCacheKey(const std::string& fileForLsp,
                                         const std::vector<std::string>& includeDirs,
                                         const std::vector<std::string>& defines,
-                                        const std::vector<std::string>& extraDefines);
+                                        const std::vector<std::string>& extraDefines,
+                                        bool msvcBitfieldPacking);
 
+    // msvcBitfieldPacking: an imported record's bitfields pack by the MSVC rule on a Windows
+    // target and the Itanium rule elsewhere, so the two targets need separate entries.
     static uint64_t CHeaderDiskCacheKey(const std::vector<std::string>& headerPaths,
                                         const std::vector<std::string>& includeDirs,
                                         const std::vector<std::string>& defines,
                                         const std::vector<std::string>& extraDefines,
+                                        bool msvcBitfieldPacking,
                                         bool cxxMode = false,
                                         bool cxxDefinitionsEmitted = false);
 

@@ -6242,6 +6242,15 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                     std::format("variable '{}'", name)))
                                 right = nullptr;
 
+                            // `C* p = cppRefReturningCall();` binds to the referent, exactly as
+                            // the `&<call>` spelling does - the alias result IS that address.
+                            if (right != nullptr && haveInitializerSourceNV
+                                && right->getType()->isStructTy())
+                                if (auto* refAddr = compiler->CxxReferenceResultAsPointer(
+                                        typeAndValue, initializerSourceNV,
+                                        std::format("variable '{}'", name)))
+                                    right = refAddr;
+
                             // M6 - `Base* b = derivedPtr;` shifts to the base subobject, which is
                             // a no-op for a primary base and a byte offset for any other.
                             if (right != nullptr)
@@ -6254,9 +6263,12 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                             if (right && typeAndValue.Pointer && !typeAndValue.IsFunctionPointer
                                 && right->getType()->isStructTy())
                             {
+                                // Spell the RIGHT-HAND side's type - printing the destination's
+                                // pointer type made the message contradict its own reason.
                                 LogErrorContext(assignmentExpression, std::format(
                                     "cannot initialize pointer '{}' with a value of type '{}' - the right-hand side must be a pointer (call getPtr() or use '&')",
-                                    name, SpellType(*compiler, typeAndValue)));
+                                    name, SpellType(*compiler, haveInitializerSourceNV
+                                        ? initializerSourceNV.TypeAndValue : typeAndValue)));
                                 right = nullptr;
                             }
 

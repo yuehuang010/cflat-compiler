@@ -40,6 +40,8 @@
 //     specialization when the enclosing record is returned.
 //   Free C++ operator overloads are found through the operand namespace, including a nested
 //     namespace, and compound assignment falls back to '+'.
+//   A C++ reference return bound to a CFlat pointer local with no '&', in the declaration and
+//     the assignment form, and proven to alias the referent rather than a copy.
 //   Fixed-array pointer ABI, bool and class-typed member defaults, record conversion
 //     through an initializer_list wrapper, and a class const-reference return copied into a
 //     local.
@@ -2073,6 +2075,24 @@ extern int main()
     int ctorrefLv = 41;
     cppcr.IntRef ctorrefIr = cppcr.IntRef(ctorrefLv);
     if (ctorrefLv != 42 || ctorrefIr.get() != 42)                              return 1969;
+
+    // A C++ reference RETURN binds a CFlat pointer with no '&': the call's result already IS the
+    // referent's address. 1970-1972 (no '&') failed to COMPILE before, with a message that printed
+    // the destination's pointer type as if it were the right-hand side's; 1973 is the accept leg
+    // for the '&' spelling, which always worked.
+    cppi.Tracked* refretTracked = cppi.tracked_ref();
+    if (refretTracked.value() != 812)                                       return 1970;
+    cppi.RefCell* refretCell = cppi.ref_cell();
+    refretCell.v = 771;
+    // The pointer aliases the static cell, so the next call sees the write; a copy would read 770.
+    if (cppi.ref_cell().v != 771)                                           return 1971;
+    cppi.RefCell* refretAssign = &cppi.ref_cell();
+    refretAssign = cppi.ref_cell();          // the plain-assignment twin of the declaration form
+    refretAssign.v = 772;
+    if (cppi.ref_cell().v != 772 || refretCell.v != 772)                     return 1972;
+    // The '&' spelling stays available and yields the same address.
+    cppi.RefCell* refretAmp = &cppi.ref_cell();
+    if (refretAmp != refretCell)                                            return 1973;
 
     return 0;
 }

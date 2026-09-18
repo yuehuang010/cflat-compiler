@@ -22,6 +22,12 @@ extern int main()
         cppfn.NestedHolder h2 = cppfn.NestedHolder();
         std.function<int(int)> g = h2.get_vec();
     }
+    // The FREE-parameter position of the same shape. It used to bind as the inner std::function
+    // and hand a callable where a vector was expected (the -292 measurement in the issue file was
+    // taken on its own repro); now the vector by value is refused on its ABI arrangement.
+    expect_error("C++ function 'cppfn.take_vec_free' uses a calling convention cflat cannot express") {
+        int rv = cppfn.take_vec_free(std.function<int(int)>(nested_twice));
+    }
     expect_error("C++ class 'cppfn.CtorRef' has no constructor whose parameter types match") {
         cppfn.CtorRef c = cppfn.CtorRef(std.function<int(int)>(nested_twice), 1);
     }

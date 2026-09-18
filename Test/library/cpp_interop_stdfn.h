@@ -84,6 +84,9 @@ namespace cppfn
     // A spelling that merely CONTAINS a std::function is NOT one: these three positions must keep
     // refusing, and Test/errors/err_cpp_std_function_nested.cb pins each refusal.
     inline std::vector<std::function<int(int)>> vec_of_fn() { return {}; }
+    // The FREE-parameter position of the same shape: it used to bind as the inner std::function
+    // and pass a callable where a vector was expected.
+    inline int take_vec_free(std::vector<std::function<int(int)>> v) { return (int)v.size() + 1; }
     class NestedHolder
     {
     public:

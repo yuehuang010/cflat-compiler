@@ -1478,16 +1478,14 @@ bool LLVMBackend::IsTopLevelStdFunctionSpelling(const std::string& spelling)
  * A `std::function<R(Args)>` spelling names the std.function specialization over the equivalent
  * CFlat closure type. Returns that specialization's CFlat name, or "" when the spelling is not a
  * std::function, when its signature types have no CFlat mapping, or when the request failed.
- * requireTopLevel rejects a spelling that merely contains a std::function; the free-function
- * PARAMETER path passes false because it has always accepted those (and the loose match is the
- * only thing keeping that pre-existing behaviour identical).
+ * A spelling that merely CONTAINS a std::function is not one in any position - member, return or
+ * free parameter - so the top-level anchor is unconditional here.
  */
 std::string LLVMBackend::StdFunctionSpecializationForSpelling(const std::string& spelling,
-                                                              bool requireTopLevel,
                                                               std::string* requestError)
 {
         if (requestError != nullptr) requestError->clear();
-        if (requireTopLevel && !IsTopLevelStdFunctionSpelling(spelling)) return {};
+        if (!IsTopLevelStdFunctionSpelling(spelling)) return {};
         std::string retText;
         std::string paramsText;
         if (!cflat_cinterop::SplitStdFunctionSpelling(spelling, retText, paramsText)) return {};
@@ -1625,7 +1623,7 @@ void LLVMBackend::RegisterCSignatures(const std::vector<CSigEntry>& sigs, const 
                 else
                 {
                     std::string requestError;
-                    className = StdFunctionSpecializationForSpelling(e.retSpelling, true, &requestError);
+                    className = StdFunctionSpecializationForSpelling(e.retSpelling, &requestError);
                     if (!requestError.empty()) LogError(requestError);
                     if (!className.empty()) stdFunctionClasses.emplace(e.retSpelling, className);
                 }
@@ -1662,8 +1660,9 @@ void LLVMBackend::RegisterCSignatures(const std::vector<CSigEntry>& sigs, const 
                         else
                         {
                             std::string requestError;
-                            // Loose on purpose: see requireTopLevel on the helper.
-                            className = StdFunctionSpecializationForSpelling(ps, false, &requestError);
+                            // Top-level only: `std::vector<std::function<int(int)>>` is a vector,
+                            // and retyping it as the inner std.function passed the wrong object.
+                            className = StdFunctionSpecializationForSpelling(ps, &requestError);
                             if (!requestError.empty()) LogError(requestError);
                             if (!className.empty()) stdFunctionClasses.emplace(ps, className);
                         }
@@ -1726,7 +1725,10 @@ void LLVMBackend::RegisterCSignatures(const std::vector<CSigEntry>& sigs, const 
             }
             if (!abiMismatch.empty())
             {
-                cxxBindingRefusals_[e.name] = abiMismatch;
+                // The sink holds a subjectless fragment (the member path names the member around
+                // it), so name the function here or the replayed refusal has no subject.
+                cxxBindingRefusals_[e.name] =
+                    std::format("C++ function '{}' {}", e.name, abiMismatch);
                 if (verbose)
                     std::cout << std::format("[verbose]   C++ function {} not bound: {}\n",
                                              e.name, abiMismatch);
@@ -4348,7 +4350,7 @@ bool LLVMBackend::RunCxxTypeRequests(const CxxRequestGroup& group,
  * Identity of a C++ type request: the OWNING import group's headers and defines (never every C++
  * header imported so far), the C++ include dirs, the CFlat and C++ instantiation spellings, the
  * emit mode (an LSP bind carries no bodies and an empty companion module, which a compile must
- * never reuse), and the
+ * never reuse), the bitfield packing mode of the resolved target, and the
  * compiler build stamp. Shares the C header signature cache, so it shares its row budget and its
  * LRU/root pinning.
  */
@@ -4367,6 +4369,9 @@ std::string LLVMBackend::CxxTypeRequestCacheKey(const CxxRequestGroup& group,
         if (CxxGroupHeaderStamp(group, stamp))
             key += "|T" + std::to_string((long long)stamp.time_since_epoch().count());
         key += emitDefinitions ? "|EDEF" : "|EDECL";
+        // Imported records pack bitfields by the MSVC rule on a Windows target and the Itanium
+        // rule elsewhere, so a cached layout from the other target is not reusable.
+        key += targetWindows_ ? "|BFMS" : "|BFIT";
         uint64_t sourceHash = 14695981039346656037ULL;
         for (unsigned char byte : requestSource)
         {
@@ -10087,6 +10092,32 @@ llvm::Value* LLVMBackend::AdjustCxxPointerForStore(const TypeAndValue& dest,
         return value;
     }
 
+llvm::Value* LLVMBackend::CxxReferenceResultAsPointer(const TypeAndValue& dest,
+                                                      const NamedVariable& src,
+                                                      const std::string& destDesc)
+{
+        if (!dest.Pointer || dest.IsFunctionPointer || dest.IsInterface) return nullptr;
+        const TypeAndValue& srcTv = src.TypeAndValue;
+        if (!srcTv.IsAlias || srcTv.Pointer || !IsCxxRecord(srcTv.TypeName)) return nullptr;
+        // IsAliasValue is the discriminator: the address must be the borrow the call handed back,
+        // never a temp alloca holding a COPY of the referent.
+        if (src.Storage == nullptr || !src.Storage->getType()->isPointerTy()) return nullptr;
+        if (!IsAliasValue(src.Storage)) return nullptr;
+        if (dest.TypeName == srcTv.TypeName) return src.Storage;
+        // A different destination class only binds when it is a PUBLIC base of the referent;
+        // anything else keeps the caller's refusal rather than aliasing an unrelated layout.
+        if (!IsCxxRecord(dest.TypeName)) return nullptr;
+        uint64_t offset = 0;
+        bool inaccessible = false;
+        if (FindCxxBaseOffset(srcTv.TypeName, dest.TypeName, offset, inaccessible))
+            return EmitCxxBaseAdjust(src.Storage, offset);
+        if (!inaccessible) return nullptr;
+        // Found behind a non-public base: AdjustCxxPointerForStore owns that diagnostic.
+        TypeAndValue srcAsPointer = srcTv;
+        srcAsPointer.Pointer = true;
+        return AdjustCxxPointerForStore(dest, srcAsPointer, src.Storage, destDesc);
+    }
+
 llvm::Value* LLVMBackend::EmitCxxVirtualCallee(const FunctionSymbol& candidate,
                                                llvm::Value* thisPtr)
 {
@@ -10378,7 +10409,7 @@ void LLVMBackend::RegisterCxxClassMembers(const CRecordEntry& r, const std::stri
             // shapes the specialization was registered with; retyping them here would rewrite
             // the surface the cast and copy paths already resolve against.
             if (IsStdFunctionSpecialization(r.name)) return false;
-            const std::string className = StdFunctionSpecializationForSpelling(spelling, true);
+            const std::string className = StdFunctionSpecializationForSpelling(spelling);
             if (className.empty()) return false;
             CxxReferenceKind refKind = CxxReferenceKind::None;
             CxxSpellingWithoutRef(spelling, &refKind);
@@ -12677,8 +12708,8 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
         uint64_t diskKey = 0;
         if (diskCache && !mtEc && !cHeaderCacheDir.empty())
         {
-            diskKey = CHeaderDiskCacheKey(realPaths, cIncludeDirs_, cDefines_, extraDefines, cppMode,
-                                          cxxDefinitionsEmitted);
+            diskKey = CHeaderDiskCacheKey(realPaths, cIncludeDirs_, cDefines_, extraDefines,
+                                          targetWindows_, cppMode, cxxDefinitionsEmitted);
             CFileSigCacheEntry diskEntry;
             bool diskHit;
             {

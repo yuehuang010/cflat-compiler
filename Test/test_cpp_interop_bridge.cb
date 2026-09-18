@@ -1216,5 +1216,12 @@ extern int main()
     cppfn.CtorRef stdfnCr = cppfn.CtorRef(std.function<int(int)>(stdfn_twice));
     if (stdfnCr.v() != 4)                                                 return 1925;
 
+    // Anchoring the free-PARAMETER retype at top level must not narrow the real thing: these are
+    // the top-level free-parameter shapes, taken from the same header as the refused
+    // vector<function> one (Test/errors/err_cpp_std_function_nested.cb pins that refusal).
+    if (cppfn.apply_val(std.function<int(int)>(stdfn_twice), 9) != 18)     return 1926;
+    if (cppfn.apply_ref(std.function<int(int)>(stdfn_twice), 11) != 22)    return 1927;
+    if (cppfn.apply_rv(std.function<int(int)>(stdfn_twice), 12) != 24)     return 1928;
+
     return 0;
 }
