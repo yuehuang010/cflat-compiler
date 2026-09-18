@@ -1581,6 +1581,26 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
         // so we do not free a buffer the caller now owns. Any other owned-
         // string intermediates of the return expression must be freed before
         // the ret terminates the block.
+        /*
+         * `return x` initializes the return object under the ASSIGNMENT rules, so a class value
+         * with an IMPLICIT conversion operator converts here exactly as an initializer does.
+         * BEFORE the ledger below: the class temporary is NOT what the caller receives, so it
+         * must stay registered and be destroyed here rather than unregistered as the result.
+         */
+        bool returnConvertedByOperator = false;
+        if (right != nullptr && right->getType()->isStructTy()
+            && !compiler->currentFunctionReturnTypeName.empty())
+        {
+            LLVMBackend::TypeAndValue retDest;
+            retDest.TypeName = compiler->currentFunctionReturnTypeName;
+            if (auto* converted =
+                    compiler->ConvertViaImplicitConversionOperator(right, retDest))
+            {
+                right = converted;
+                returnConvertedByOperator = true;
+            }
+        }
+
         compiler->UnregisterOwnedStringTemp(right);
         compiler->FlushOwnedStringTemps();
         // Same for a returned closure literal (`return () => {...};`): the closure
@@ -1590,9 +1610,12 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
         compiler->FlushOwnedClosureTemps();
         // Owning temp whose field was extracted in the return expr (returning an OWNING
         // field is rejected upstream, so this never frees a buffer the caller now owns).
-        compiler->UnregisterOwnedStructTemp(returnNV.Storage);
-        if (returnNV.Primary == compiler->lastCxxRetValue_)
-            compiler->UnregisterOwnedStructTemp(compiler->lastCxxRetTemp_);
+        if (!returnConvertedByOperator)
+        {
+            compiler->UnregisterOwnedStructTemp(returnNV.Storage);
+            if (returnNV.Primary == compiler->lastCxxRetValue_)
+                compiler->UnregisterOwnedStructTemp(compiler->lastCxxRetTemp_);
+        }
         compiler->FlushOwnedStructTemps();
         // Borrow returns: hand the caller a non-owning copy (see the classification
         // above). Done after the temp-flush so the unregister logic above still sees

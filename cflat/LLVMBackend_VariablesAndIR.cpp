@@ -599,6 +599,12 @@ llvm::StoreInst* LLVMBackend::CreateAssignment(llvm::Value* value, llvm::Value* 
         auto destType = explicitDestType ? explicitDestType : GetTypeFromStorage(destination);
         if (destType == builder->getInt1Ty())
         {
+            // A class with an IMPLICIT 'operator bool' (a std::vector<bool> element proxy)
+            // converts here too - the same conversion the condition path applies.
+            TypeAndValue boolDest;
+            boolDest.TypeName = "bool";
+            if (auto* converted = ConvertViaImplicitConversionOperator(value, boolDest))
+                value = converted;
             // Same truth test as an explicit '(bool)' cast: a float or pointer source needs its
             // own zero, and an integer one tests non-zero rather than keeping bit 0.
             value = CoerceToBoolCondition(value, false);
@@ -1012,6 +1018,10 @@ llvm::Value* LLVMBackend::CreateCast(llvm::Value* value, llvm::Type* destType, b
         // instead of a bitcast LLVM's verifier would reject.
         if (srcType->isAggregateType())
         {
+            // A class value with an IMPLICIT conversion operator reaches its scalar destination
+            // here ('int i = k;'): apply the operator, plus at most one standard conversion.
+            if (auto* converted = ConvertAggregateViaImplicitConversionOperator(value, destType))
+                return converted;
             LogError("cannot cast an aggregate value - a fixed array decays to a pointer to its first element");
             return value;
         }

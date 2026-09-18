@@ -1,0 +1,52 @@
+// An `explicit operator T()` on an imported C++ class converts in a CONDITION and at an
+// EXPLICIT cast (both are value legs in Test/test_cpp_interop_template.cb), and NOWHERE else:
+// not at an initializer, not at an assignment, not at a call argument, not at a return.
+// The implicit twin (BitRef::operator bool) converts at every one of those, so each leg here
+// discriminates on the `explicit` keyword alone, not on the shape.
+import cpp "cpp_interop_proxy.h";
+
+bool proxy_explicit_return(ExplicitBool e)
+{
+    // The return site reports the type mismatch, not the bool-conversion wording: an implicit
+    // 'operator bool' is applied BEFORE this check, so reaching it proves none was applied.
+    expect_error("cannot return this value: its type does not match") {
+        return e;
+    }
+    return false;
+}
+
+extern int main()
+{
+    expect_error("cannot convert 'ExplicitBool' to 'bool'") {
+        ExplicitBool e = ExplicitBool(1);
+        bool b = e;
+    }
+
+    expect_error("cannot convert 'ExplicitBool' to 'bool'") {
+        ExplicitBool e = ExplicitBool(1);
+        bool b = false;
+        b = e;
+    }
+
+    expect_error("no overload of 'proxy_take_bool' matches the given arguments") {
+        ExplicitBool e = ExplicitBool(1);
+        int r = proxy_take_bool(e);
+    }
+
+    // Two conversion functions reach `double` through one standard conversion each, so neither
+    // is better and the conversion is ambiguous (clang agrees). `Both` declares operator int
+    // AND operator bool; the discriminator is that NEITHER is an exact match for double - an
+    // exact `operator double` would win outright with no ambiguity.
+    expect_error("conversion from 'Both' to 'double' is ambiguous") {
+        Both bt = default;
+        double d = bt;
+    }
+
+    // Two overloads, each reached through a different conversion operator at equal rank:
+    // neither wins, and declaration order must not pick one (clang: call is ambiguous).
+    expect_error("ambiguous call to 'ovl_two': no candidate ranks better") {
+        Both bt = default;
+        int r = ovl_two(bt);
+    }
+    return 0;
+}

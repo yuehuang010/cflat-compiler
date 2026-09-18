@@ -9767,6 +9767,16 @@ LLVMBackend::NamedVariable MainListener::ParseCastExpression(CFlatParser::CastEx
                     return namedVar;
                 }
 
+                // No 'operator <dest>' - C++ still allows ONE standard conversion on top of a
+                // user-defined one, so '(int)v[0]' reaches 'operator bool' and widens. A cast is
+                // an explicit context, so an 'explicit' conversion operator participates here.
+                {
+                    auto converted = namedVar;
+                    converted.TypeAndValue.TypeName = sourceTypeName;
+                    if (compiler->ApplyCxxConversionOperator(converted, destTypeName, true))
+                        return converted;
+                }
+
                 LLVMBackend::TypeAndValue sourceType;
                 sourceType.TypeName = sourceTypeName;
                 std::string sourceDisplay = SpellType(*compiler, sourceType);

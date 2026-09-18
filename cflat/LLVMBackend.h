@@ -7630,6 +7630,9 @@ public:
         // Names of instance/static methods that were refused, with the reason, so a use site can
         // say WHY instead of "unknown method".
         std::map<std::string, std::string> refusedMembers;
+        // Registration names ("operator bool", "operator int") of conversion operators declared
+        // `explicit`: bindable at a cast and in a condition, never at an implicit conversion.
+        std::set<std::string> explicitConversions;
         // Constructor overloads and the destructor, keyed by the CFlat-visible parameter list.
         // Function is null until the declaration is materialized.
         struct Structor
@@ -7875,6 +7878,33 @@ public:
     // C++ permits a scalar argument to initialize a class temporary for a reference or
     // by-value parameter. The call resolver uses this predicate; the lowering side materializes
     // the temporary with the selected imported constructor.
+    /*
+     * Conversion-OPERATOR direction of a user-defined conversion (`operator bool` on a proxy
+     * class). Distinct from CanImplicitlyConstructCxxClass below, which is the CONSTRUCTOR
+     * direction; do not merge them.
+     */
+    std::string CxxConversionOperatorTo(const std::string& sourceTypeName,
+                                        const TypeAndValue& dest,
+                                        bool allowExplicit,
+                                        bool* needsStandardConversion = nullptr,
+                                        bool* ambiguous = nullptr,
+                                        std::vector<std::string>* ambiguousCandidates = nullptr) const;
+    std::string ScoreCxxConversionOperatorArgument(const NamedVariable& arg,
+                                                   const TypeAndValue& param,
+                                                   bool& needsStandardConversion,
+                                                   int& userConversions,
+                                                   int& userConversionCost,
+                                                   std::string& userConversionNames) const;
+    void ReportAmbiguousCxxConversion(const std::string& sourceTypeName,
+                                      const TypeAndValue& dest,
+                                      const std::vector<std::string>& candidates) const;
+    bool ApplyCxxConversionOperator(NamedVariable& nv, const TypeAndValue& dest,
+                                    bool allowExplicit);
+    llvm::Value* ConvertViaImplicitConversionOperator(llvm::Value* value,
+                                                      const TypeAndValue& dest);
+    llvm::Value* ConvertAggregateViaImplicitConversionOperator(llvm::Value* value,
+                                                               llvm::Type* destType);
+    static const std::vector<std::string>& ScalarConversionSpellings();
     bool CanImplicitlyConstructCxxClass(const NamedVariable& arg,
                                          const TypeAndValue& param,
                                          bool cxxByValueParam = false);

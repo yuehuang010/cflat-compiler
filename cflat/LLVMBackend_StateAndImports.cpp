@@ -2668,9 +2668,9 @@ bool LLVMBackend::TryLoadCHeaderDiskCache(
         // carries the flag as false, so an rvalue would not bind a `const T&` scalar parameter.
         // v74 publishes FREE BINARY OPERATOR templates: an older cache has none, so a binary
         // operator over a class template (every libc++ basic_string operator) finds no candidate.
-        // v75 records `explicit` on a C++ constructor (xpl): an older cache carries the flag as
-        // false, so an explicit ctor would still be offered as an implicit argument conversion.
-        if (version != 75) return cacheMiss("cache version");
+        // v76 widens `xpl` to a CONVERSION operator as well as a constructor: a v75 cache
+        // carries it as false for a conversion, so an explicit one would convert implicitly.
+        if (version != 76) return cacheMiss("cache version");
 
         if (!expectedRequestKey.empty()
             && j.value("cxxRequestKey", std::string{}) != expectedRequestKey)
@@ -2904,8 +2904,8 @@ void LLVMBackend::WriteCHeaderDiskCache(
         // v72 records `const` on a C++ reference parameter (IsCxxConstRef).
         // v73 records an alias template's target base, argument pattern and parameter defaults
         // (catb/caa/cad). v74 publishes FREE BINARY OPERATOR templates.
-        // v75 records `explicit` on a C++ constructor (xpl).
-        j["version"] = 75;
+        // v76 records `explicit` on a C++ conversion operator too (xpl).
+        j["version"] = 76;
         j["mtime"]   = (int64_t)mtime.time_since_epoch().count();
         j["hash"]    = contentHash;
         j["ldw"]     = entry.longDoubleWidth;

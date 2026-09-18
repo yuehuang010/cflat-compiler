@@ -31,6 +31,7 @@
 
 #include "platform/GeneratedParser.h"
 #include "LLVMBackend.h"
+#include "TypeMangling.h"
 #include "MainListener.h"
 #include "GrammarTreeListener.h"
 #include <filesystem>
@@ -806,10 +807,18 @@ llvm::Value* LLVMBackend::CoerceToBoolCondition(llvm::Value* cond, bool allowOpe
 
         // An aggregate (a `string`, any struct) has no truth value. Diagnose it here rather than
         // handing it to CreateCondBr / CreateSelect, which fails module verification opaquely.
-        LogErrorMessage(
-            "condition must be a scalar (bool, integer, pointer or floating point), not '{}'"
-            " - compare it explicitly",
-            { DescribeConditionType(cond->getType()) });
+        // `allowOperatorBool == false` means the caller is a CONVERSION (an initializer or an
+        // assignment into a bool), not a condition, so it must not borrow the condition wording.
+        if (!allowOperatorBool)
+            LogErrorMessage(
+                "cannot convert '{}' to 'bool': it is not a scalar and declares no implicit"
+                " 'operator bool'",
+                { DescribeConditionType(cond->getType()) });
+        else
+            LogErrorMessage(
+                "condition must be a scalar (bool, integer, pointer or floating point), not '{}'"
+                " - compare it explicitly",
+                { DescribeConditionType(cond->getType()) });
         return builder->getFalse();
     }
 
@@ -853,7 +862,12 @@ std::string LLVMBackend::DescribeConditionType(llvm::Type* t) const
             if (!st->hasName()) return "struct";
             if (st->getName() == "__iface_fat_ptr")   return "interface value";
             if (st->getName() == "__closure_fat_ptr") return "closure value";
-            return st->getName().str();
+            // Per the invertible-mangling ruling every user-facing surface demangles: a C++
+            // specialization reaches here as its raw '$' identity, unreadable as written.
+            TypeAndValue named;
+            named.TypeName = st->getName().str();
+            std::string spelled = SpellType(*this, named);
+            return spelled.empty() ? named.TypeName : spelled;
         }
         if (t->isArrayTy())  return "array";
         if (t->isVectorTy()) return "vector";

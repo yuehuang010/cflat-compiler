@@ -2,7 +2,9 @@ struct NoOperatorBool { int value = 0; };
 
 extern int main()
 {
-    expect_error("condition must be a scalar") {
+    // A CONVERSION into bool reports the conversion, not the condition wording; the two share
+    // one reject site and only the condition leg below may say "condition must be a scalar".
+    expect_error("cannot convert 'NoOperatorBool' to 'bool'") {
         NoOperatorBool x = default;
         bool b = x;
     }

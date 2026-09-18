@@ -1,13 +1,12 @@
-// A C++ conversion operator binds at an EXPLICIT cast only, and a conversion cflat refused
-// to bind reports its recorded refusal at the cast instead of claiming it was never declared.
+// A conversion cflat refused to bind reports its recorded refusal at the cast instead of
+// claiming it was never declared. (An IMPLICIT C++ conversion operator now binds at an
+// initializer too - cppi.Convertible's `operator int` is a value leg in
+// Test/test_cpp_interop_template.cb; only an `explicit` one is cast-and-condition only,
+// which Test/errors/err_cpp_proxy_conversion.cb pins.)
 import cpp "cpp_interop_basic.h";
 
 extern int main()
 {
-    expect_error("cannot cast an aggregate value") {
-        cppi.Convertible c = cppi.Convertible(41);
-        int x = c;
-    }
     expect_error("member 'operator float' of C++ class 'cppi.ConvDeleted' is deleted") {
         cppi.ConvDeleted d = cppi.ConvDeleted(1);
         float g = (float)d;

@@ -7932,14 +7932,52 @@ void LLVMBackend::RememberCxxMangledArity(const std::string& cflatName,
         if (open == std::string::npos || cflatName.find('$') == std::string::npos) return;
         size_t depth = 0;
         size_t args = 1;
+        std::vector<std::pair<size_t, size_t>> topLevelArgs;   // [begin, end) of each argument
+        size_t argBegin = std::string::npos;
         for (size_t i = open; i < cxxSpelling.size(); ++i)
         {
             const char c = cxxSpelling[i];
-            if (c == '<' || c == '(') ++depth;
-            else if (c == '>' || c == ')') { if (--depth == 0) break; }
-            else if (c == ',' && depth == 1) ++args;
+            if (c == '<' || c == '(')
+            {
+                if (++depth == 1) argBegin = i + 1;
+            }
+            else if (c == '>' || c == ')')
+            {
+                if (--depth == 0)
+                {
+                    if (argBegin != std::string::npos) topLevelArgs.emplace_back(argBegin, i);
+                    break;
+                }
+            }
+            else if (c == ',' && depth == 1)
+            {
+                ++args;
+                if (argBegin != std::string::npos) topLevelArgs.emplace_back(argBegin, i);
+                argBegin = i + 1;
+            }
         }
         RememberMangledArity(*this, cflatName, args);
+
+        /*
+         * A NESTED template-id inside the argument list becomes its own mangled identity
+         * (`std.vector<bool, std.allocator<bool>>` inside `std.__bit_reference<...>`), and the
+         * hint lookup takes the LONGEST matching prefix - so without the nested count a shorter
+         * hint for the same base (`std.vector$bool`, arity 1) wins and the demangler renders the
+         * comma as nesting. Record every nesting level the spelling names.
+         */
+        for (const auto& [begin, end] : topLevelArgs)
+        {
+            size_t b = begin;
+            size_t e = end;
+            while (b < e && std::isspace((unsigned char)cxxSpelling[b])) ++b;
+            while (e > b && std::isspace((unsigned char)cxxSpelling[e - 1])) --e;
+            if (b >= e) continue;
+            const std::string argSpelling = cxxSpelling.substr(b, e - b);
+            if (argSpelling.find('<') == std::string::npos) continue;
+            const std::string argName = cflat_cinterop::CxxForeignIdentity(argSpelling);
+            if (argName.empty() || argName.find('$') == std::string::npos) continue;
+            RememberCxxMangledArity(argName, argSpelling);
+        }
 }
 
 std::string LLVMBackend::GeneratedCxxPrefixForSpelling(const std::string& cxxSpelling) const
@@ -10771,6 +10809,13 @@ void LLVMBackend::RegisterCxxClassMembers(const CRecordEntry& r, const std::stri
             else if (keptRvalue && !mineRvalue)       it->second = i;
         }
 
+        // Registration names that have at least ONE implicit conversion declared: the set below
+        // is explicit-only, so a mixed overload set keeps the implicit path open.
+        std::set<std::string> implicitConversionNames;
+        for (const Member& m : r.members)
+            if (m.isConversion && !m.isExplicit)
+                implicitConversionNames.insert(memberRegName(m));
+
         for (size_t i = 0; i < r.members.size(); ++i)
         {
             const Member& m = r.members[i];
@@ -10779,6 +10824,9 @@ void LLVMBackend::RegisterCxxClassMembers(const CRecordEntry& r, const std::stri
             // Settled BEFORE the refusal checks so a private, deleted or otherwise unbindable
             // conversion is recorded under the same key the cast site will ask for.
             const std::string cflatName = memberRegName(m);
+            if (m.isConversion && m.isExplicit
+                && implicitConversionNames.count(cflatName) == 0)
+                info.explicitConversions.insert(cflatName);
             if (!memberFilter.empty() && cflatName != memberFilter) continue;
             if (m.kind == Member::Instance && generatedCxxRecords_.count(r.name) != 0)
             {
@@ -14092,3 +14140,248 @@ void LLVMBackend::EmitCxxHeapFree(const std::string& typeName, llvm::Value* ptr)
         if (overAligned) args.push_back(builder->getInt64(align));
         builder->CreateCall(fn->getFunctionType(), fn, args);
     }
+
+// Scalar targets a conversion operator may name, most-preferred first. 'int' precedes 'u32'
+// so a signed spelling wins when two spellings share one LLVM type.
+const std::vector<std::string>& LLVMBackend::ScalarConversionSpellings()
+{
+        static const std::vector<std::string> spellings = {
+            "bool", "int", "i64", "u32", "u64", "double", "float", "char",
+            "short", "long", "ulong", "u8", "i8", "u16" };
+        return spellings;
+}
+
+/*
+ * Conversion-OPERATOR direction of a user-defined conversion: the source is a C++ (or CFlat
+ * struct) value carrying `operator D`, and the destination is an ordinary CFlat type. This is
+ * the mirror of CanImplicitlyConstructCxxClass, which converts INTO a C++ class through a
+ * CONSTRUCTOR; the two are kept apart deliberately.
+ *
+ * Returns the registration name of the operator to call ("operator bool", or the
+ * "<Type>.operator bool" member spelling), and reports through `needsStandardConversion`
+ * whether the result still needs ONE standard conversion to reach `dest` (C++ allows exactly
+ * one after a user-defined conversion).
+ */
+std::string LLVMBackend::CxxConversionOperatorTo(const std::string& sourceTypeName,
+                                                 const TypeAndValue& dest,
+                                                 bool allowExplicit,
+                                                 bool* needsStandardConversion,
+                                                 bool* ambiguous,
+                                                 std::vector<std::string>* ambiguousCandidates) const
+{
+        if (needsStandardConversion != nullptr) *needsStandardConversion = false;
+        if (ambiguous != nullptr) *ambiguous = false;
+        if (sourceTypeName.empty() || dest.TypeName.empty() || dest.TypeName == "void") return {};
+        if (dest.Pointer || dest.ElemPointer || dest.IsArrayView || dest.IsInterface
+            || dest.IsFunctionPointer)
+            return {};
+        if (!dest.IsPrimitive()) return {};
+        if (IsPrimitiveTypeName(sourceTypeName)) return {};
+        // A CFlat-native `operator T` is EXPLICIT-only by ruling (Test/errors/err_operator_
+        // conversion.cb pins it), so only an imported C++ record converts implicitly - there
+        // `explicit` is spelled in the source and travels on the member.
+        if (!allowExplicit && !IsCxxRecord(sourceTypeName)) return {};
+
+        const CxxClassInfo* info = GetCxxClassInfo(sourceTypeName);
+
+        // A conversion operator is published either under the bare name or, when the bare name
+        // is taken by a free conversion, under "<Type>.operator <spelling>".
+        auto candidateNames = [&](const std::string& spelling) {
+            return std::vector<std::string>{ "operator " + spelling,
+                                             sourceTypeName + ".operator " + spelling };
+        };
+
+        auto usable = [&](const std::string& opName, std::string& returnTypeName) {
+            if (info != nullptr && !allowExplicit
+                && info->explicitConversions.count(opName.find('.') == std::string::npos
+                        ? opName : opName.substr(opName.rfind('.') + 1)) != 0)
+                return false;
+            auto it = functionTable.find(opName);
+            if (it == functionTable.end()) return false;
+            for (const auto& candidate : it->second)
+            {
+                if (candidate.Parameters.size() != 1) continue;
+                const auto& p = candidate.Parameters[0];
+                // A C++ member conversion carries a 'this' receiver, so a registered C++ record
+                // accepts the pointer shape; the call path adjusts the receiver.
+                if ((p.Pointer && !IsCxxRecord(sourceTypeName)) || p.ElemPointer
+                    || p.TypeName != sourceTypeName)
+                    continue;
+                const auto& ret = candidate.ReturnType;
+                if (ret.Pointer || ret.ElemPointer || ret.IsArrayView || !ret.IsPrimitive())
+                    continue;
+                returnTypeName = ret.TypeName;
+                return true;
+            }
+            return false;
+        };
+
+        // An EXACT operator for the destination spelling wins with no standard conversion.
+        std::string returnTypeName;
+        for (const std::string& name : candidateNames(dest.TypeName))
+            if (usable(name, returnTypeName) && returnTypeName == dest.TypeName)
+                return name;
+
+        /*
+         * No exact operator: ONE standard conversion may sit on top of the user-defined one.
+         * Every conversion function that can reach `dest` that way is an equally ranked
+         * candidate, so TWO of them is an ambiguity (clang rejects `double d = bt;` when the
+         * class declares both `operator int` and `operator bool`) - collect, never take first.
+         */
+        if (info == nullptr) return {};
+        std::vector<std::string> viable;
+        std::set<std::string> tried;
+        for (const std::string& spelling : ScalarConversionSpellings())
+        {
+            if (spelling == dest.TypeName) continue;
+            for (const std::string& name : candidateNames(spelling))
+            {
+                if (!tried.insert(name).second) continue;
+                if (!usable(name, returnTypeName)) continue;
+                viable.push_back(name);
+                break;   // the two spellings of ONE operator are the same candidate
+            }
+        }
+        if (viable.empty()) return {};
+        if (viable.size() > 1)
+        {
+            if (ambiguous != nullptr) *ambiguous = true;
+            if (ambiguousCandidates != nullptr) *ambiguousCandidates = viable;
+            return {};
+        }
+        if (needsStandardConversion != nullptr) *needsStandardConversion = true;
+        return viable.front();
+}
+
+/*
+ * Report the ambiguity CxxConversionOperatorTo detected. Split from the lookup because the
+ * lookup also runs as an overload-ranking PREDICATE, where LogError (which throws) must not.
+ */
+void LLVMBackend::ReportAmbiguousCxxConversion(const std::string& sourceTypeName,
+                                               const TypeAndValue& dest,
+                                               const std::vector<std::string>& candidates) const
+{
+        TypeAndValue sourceType;
+        sourceType.TypeName = sourceTypeName;
+        std::string sourceDisplay = SpellType(*this, sourceType);
+        if (sourceDisplay.empty()) sourceDisplay = sourceTypeName;
+        std::string destDisplay = SpellType(*this, dest);
+        if (destDisplay.empty()) destDisplay = dest.TypeName;
+        std::string list;
+        for (size_t i = 0; i < candidates.size(); ++i)
+        {
+            if (i > 0) list += " and ";
+            list += "'" + candidates[i] + "'";
+        }
+        LogErrorMessage(
+            "conversion from '{}' to '{}' is ambiguous: {} each reach it through one standard"
+            " conversion. Cast to the conversion's own type first.",
+            { sourceDisplay, destDisplay, list });
+}
+
+bool LLVMBackend::ApplyCxxConversionOperator(NamedVariable& nv, const TypeAndValue& dest,
+                                             bool allowExplicit)
+{
+        if (nv.Primary == nullptr && nv.Storage == nullptr) return false;
+        const std::string sourceTypeName = nv.TypeAndValue.TypeName;
+        if (nv.TypeAndValue.Pointer || nv.TypeAndValue.ElemPointer) return false;
+        bool needsStandard = false;
+        bool ambiguous = false;
+        std::vector<std::string> ambiguousCandidates;
+        const std::string opName = CxxConversionOperatorTo(sourceTypeName, dest, allowExplicit,
+                                                           &needsStandard, &ambiguous,
+                                                           &ambiguousCandidates);
+        // A materialization site is the one place the ambiguity can be reported; the ranking
+        // predicate shares this lookup and must stay silent (LogError throws).
+        if (ambiguous) ReportAmbiguousCxxConversion(sourceTypeName, dest, ambiguousCandidates);
+        if (opName.empty()) return false;
+
+        auto argNV = nv;
+        argNV.TypeAndValue.VariableName.clear();
+        auto savedReturnType = lastCallReturnType;
+        bool savedReturnsOwned = lastCallReturnsOwned;
+        bool savedOwningResult = lastOwningResult;
+        llvm::Value* result = CreateOverloadedFunctionCall(opName, { argNV });
+        lastCallReturnType = savedReturnType;
+        lastCallReturnsOwned = savedReturnsOwned;
+        lastOwningResult = savedOwningResult;
+        if (result == nullptr) return false;
+
+        if (needsStandard)
+        {
+            llvm::Type* destLLVM = GetType(const_cast<TypeAndValue&>(dest));
+            if (destLLVM == nullptr) return false;
+            if (result->getType() != destLLVM)
+                result = CreateCast(result, destLLVM, !result->getType()->isIntegerTy(1));
+        }
+        nv.Primary = result;
+        nv.Storage = nullptr;
+        nv.TypeAndValue = dest;
+        nv.TypeAndValue.VariableName.clear();
+        return true;
+}
+
+/*
+ * Value-level entry to the conversion-operator path, for sites that hold only the lowered
+ * value (CreateAssignment). IMPLICIT conversions only: an `explicit operator T` is reserved
+ * for a cast and for a boolean context.
+ */
+llvm::Value* LLVMBackend::ConvertViaImplicitConversionOperator(llvm::Value* value,
+                                                               const TypeAndValue& dest)
+{
+        auto* st = llvm::dyn_cast_or_null<llvm::StructType>(
+            value != nullptr ? value->getType() : nullptr);
+        if (st == nullptr || st->isLiteral() || !st->hasName()) return nullptr;
+        NamedVariable nv;
+        nv.Primary = value;
+        nv.BaseType = value->getType();
+        nv.TypeAndValue.TypeName = st->getName().str();
+        if (!ApplyCxxConversionOperator(nv, dest, /*allowExplicit*/ false)) return nullptr;
+        return nv.Primary;
+}
+
+/*
+ * Value-level entry for a site that knows only the lowered destination TYPE (CreateCast, which
+ * the declaration initializer `int i = k;` reaches). IMPLICIT conversions only.
+ */
+llvm::Value* LLVMBackend::ConvertAggregateViaImplicitConversionOperator(llvm::Value* value,
+                                                                        llvm::Type* destType)
+{
+        if (destType == nullptr
+            || (!destType->isIntegerTy() && !destType->isFloatingPointTy()))
+            return nullptr;
+        auto* st = llvm::dyn_cast_or_null<llvm::StructType>(
+            value != nullptr ? value->getType() : nullptr);
+        if (st == nullptr || st->isLiteral() || !st->hasName()) return nullptr;
+        for (const std::string& spelling : ScalarConversionSpellings())
+        {
+            TypeAndValue dest;
+            dest.TypeName = spelling;
+            if (GetType(dest) != destType) continue;
+            return ConvertViaImplicitConversionOperator(value, dest);
+        }
+        return nullptr;
+}
+
+/*
+ * Ranking helper for the conversion-OPERATOR branch of overload scoring: reports the operator
+ * that binds `arg` to `param` and accumulates this candidate's user-defined-conversion cost.
+ * Silent by construction - an ambiguity makes the candidate non-viable here and is reported
+ * only at the materialization site.
+ */
+std::string LLVMBackend::ScoreCxxConversionOperatorArgument(const NamedVariable& arg,
+                                                            const TypeAndValue& param,
+                                                            bool& needsStandardConversion,
+                                                            int& userConversions,
+                                                            int& userConversionCost,
+                                                            std::string& userConversionNames) const
+{
+        needsStandardConversion = false;
+        const std::string opName = CxxConversionOperatorTo(arg.TypeAndValue.TypeName, param,
+                                                           false, &needsStandardConversion);
+        if (opName.empty()) return {};
+        ++userConversions;
+        if (needsStandardConversion) ++userConversionCost;
+        userConversionNames += opName + "|";
+        return opName;
+}

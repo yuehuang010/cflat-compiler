@@ -1665,11 +1665,12 @@ namespace cflat_cinterop
                         default: break;
                     }
                     /*
-                     * Every conversion function is exported, explicit or not: CFlat binds them
-                     * ONLY at an explicit cast `(T)obj`, which is what C++ `explicit` already
-                     * means, so the two spellings need no distinction here. The registration side
-                     * renames the member to "operator <CFlat spelling>" and refuses a target the
-                     * type map cannot express.
+                     * Every conversion function is exported, explicit or not, and the
+                     * `explicit` bit travels with it: an implicit one converts at an
+                     * initializer, assignment, call argument and return as well as at a cast,
+                     * an explicit one only at a cast and in a boolean context. The registration
+                     * side renames the member to "operator <CFlat spelling>" and refuses a
+                     * target the type map cannot express.
                      */
                     const auto* conversion = llvm::dyn_cast<CXXConversionDecl>(md);
                     const bool isBindableBoolConversion = conversion != nullptr
@@ -1699,6 +1700,7 @@ namespace cflat_cinterop
                         m.kind = md->isStatic() ? RawCxxMember::StaticMethod
                                                 : RawCxxMember::Instance;
                         m.isConversion = conversion != nullptr;
+                        m.isExplicit = conversion != nullptr && conversion->isExplicit();
                         m.name = isBindableBoolConversion ? "operator bool" : md->getNameAsString();
                         m.isCopyAssign = md->isCopyAssignmentOperator();
                         m.isMoveAssign = md->isMoveAssignmentOperator();

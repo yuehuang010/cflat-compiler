@@ -156,6 +156,7 @@ import cpp "library/cpp_interop_basic.cpp" cache;
 // libc++ headers are the fixture, reached by the SYSTEM header spelling below.
 import cpp "library/cpp_interop_tpl.h" cache;
 import cpp "library/cpp_interop_by_value.h" cache;
+import cpp "library/cpp_interop_proxy.h" cache;
 import cpp "vector" cache;
 import cpp "tuple" cache;
 import cpp "mutex" cache;
@@ -329,6 +330,20 @@ struct NestSigBox<T>
     int tag() { return 7; }
 };
 int nestsig_generic_param(NestSigBox<std.vector<std.shared_ptr<nest.Cell>>> b) { return b.tag(); }
+
+// `return (*v)[0];` converts the std::vector<bool> element proxy under the ASSIGNMENT rules.
+// Pre-fix this did not compile: "cannot return this value: its type does not match".
+bool proxy_bool_return(std.vector<bool>* v)
+{
+    return (*v)[0];
+}
+
+// The same shape on the counted proxy: its temporary must be destroyed even though the caller
+// receives only the converted bool. See leg 2380.
+bool life_bool_return(LifeBag* b)
+{
+    return (*b)[0];
+}
 
 extern int main()
 {
@@ -2176,6 +2191,149 @@ extern int main()
         if (sigG.tag() != 7)                                                 return 2263;
         if ((int)sigG.item.size() != 0)                                      return 2264;
         if (nestsig_generic_param(sigG) != 7)                                return 2265;
+    }
+
+    {
+        /*
+         * USER-DEFINED CONVERSION through a conversion OPERATOR, at every site an implicit
+         * conversion can occur. Before the fix only a CONDITION found `operator bool`; an
+         * initializer and an assignment reported the CONDITION diagnostic, an explicit cast to
+         * int reported "no 'operator int' defined", and a call argument / return did not match
+         * at all. Each leg below fails on the pre-fix binary at its own site.
+         */
+        std.vector<bool> vb = default;
+        vb.push_back(true);
+        vb.push_back(false);
+
+        // The condition path - the ONE shape that worked before the fix; frozen here so the
+        // widened implicit path cannot regress it. Both polarities, so a collapse onto one
+        // answer cannot pass.
+        int vbcond = 0;
+        if (vb[0]) vbcond += 1;
+        if (vb[1]) vbcond += 2;
+        if (vbcond != 1)                                                     return 2350;
+
+        bool vbInit0 = vb[0];                         // initializer
+        bool vbInit1 = vb[1];
+        if (!vbInit0 || vbInit1)                                             return 2351;
+
+        bool vbAssign = false;                        // assignment to an existing bool
+        vbAssign = vb[0];
+        bool vbAssignHigh = vbAssign;
+        vbAssign = vb[1];
+        if (!vbAssignHigh || vbAssign)                                       return 2352;
+
+        if ((int)(bool)vb[0] != 1 || (int)(bool)vb[1] != 0)                  return 2353;
+        // Explicit cast to int: no 'operator int' exists, so this needs ONE standard
+        // conversion on top of the user-defined `operator bool`.
+        if ((int)vb[0] != 1 || (int)vb[1] != 0)                              return 2354;
+
+        if (proxy_take_bool(vb[0]) != 7 || proxy_take_bool(vb[1]) != 3)      return 2355;
+        if (proxy_take_int(vb[0]) != 101)             // call argument, int parameter
+                                                                             return 2356;
+        if (!proxy_bool_return(&vb))                  // return value of a CFlat function
+                                                                             return 2357;
+        if ((vb[0] ? 5 : 6) != 5)                                            return 2358;
+        if (!vb[1] != true)                                                  return 2359;
+    }
+    {
+        // The SAME shapes on a user proxy class, proving the fix is not vector<bool>-specific:
+        // BitBag.operator[] hands back a BitRef carrying an implicit `operator bool`.
+        BitBag bag = default;                         // data = {1, 0, 1, 0}
+        int bagcond = 0;
+        if (bag[0]) bagcond += 1;
+        if (bag[1]) bagcond += 2;
+        if (bag[2]) bagcond += 4;
+        if (bagcond != 5)                                                    return 2360;
+
+        bool bagInit0 = bag[0];
+        bool bagInit1 = bag[1];
+        if (!bagInit0 || bagInit1)                                           return 2361;
+        bool bagAssign = true;
+        bagAssign = bag[1];
+        if (bagAssign)                                                       return 2362;
+        if ((int)bag[2] != 1 || (int)bag[3] != 0 || (int)(bool)bag[0] != 1)  return 2363;
+        if (proxy_take_bool(bag[0]) != 7 || proxy_take_bool(bag[1]) != 3)    return 2365;
+        if (proxy_take_int(bag[1]) != 100)                                   return 2366;
+    }
+    {
+        // `explicit operator bool` is the C++ rule's other half: it converts in a CONDITION and
+        // at an EXPLICIT cast, and Test/errors/err_cpp_proxy_conversion.cb pins the four sites
+        // that must keep refusing it. Both legs below already held before the fix.
+        ExplicitBool eTrue = ExplicitBool(1);
+        ExplicitBool eFalse = ExplicitBool(0);
+        int ecount = 0;
+        if (eTrue) ecount += 1;
+        if (eFalse) ecount += 2;
+        if (ecount != 1)                                                     return 2367;
+        if ((int)(bool)eTrue != 1 || (int)(bool)eFalse != 0)                 return 2368;
+    }
+    {
+        // A NON-bool conversion operator: `operator int` at an initializer, and the same
+        // operator reaching a double destination through ONE standard conversion on top.
+        IntLike k = IntLike(42);
+        int ki = k;
+        if (ki != 42)                                                        return 2369;
+        double kd = k;
+        if (kd != 42.0)                                                      return 2370;
+        if (proxy_take_double(k) != 42.5)                                    return 2371;
+        // The same shape on the fixture class whose `operator int` is declared non-explicit
+        // next to an EXPLICIT `operator double`.
+        cppi.Convertible conv = cppi.Convertible(41);   // the ctor stores v + 1
+        int convi = conv;
+        if (convi != 42)                                                     return 2372;
+    }
+    {
+        /*
+         * OVERLOAD RANKING of a user-defined conversion sequence, against clang's answers.
+         * Pre-fix the conversion-operator branch scored the same rank as a standard sequence,
+         * so 2373 and 2376/2377 were decided by DECLARATION ORDER and 2374 never compared the
+         * second standard conversion. 2377 is 2376 with the two declarations swapped: the
+         * answer must not move.
+         */
+        Conv c = Conv(7);
+        if (ovl_a(c) != 2)                            // identity `const Conv&` beats operator int
+                                                                             return 2373;
+        if (ovl_b(c) != 10)                           // operator int -> int beats -> double
+                                                                             return 2374;
+        Both bt = default;
+        if (ovl_c(bt) != 30)                          // exact `operator bool` wins outright
+                                                                             return 2375;
+        Der2 d2 = default;
+        if (ovl_f(d2) != 109)                         // derived-to-base bind beats operator int
+                                                                             return 2376;
+        Der3 d3 = default;
+        if (ovl_g(d3) != 109)                         // same pair, declarations swapped
+                                                                             return 2377;
+    }
+    {
+        /*
+         * LIFETIME. Every one of these sites materializes a LifeRef temporary that must be
+         * destroyed; the counters are the RESOURCE assertion, not the values. The return path
+         * regressed here first: it unregistered the proxy as the returned value and then never
+         * destroyed it (ctor=200, dtor=0), because the caller receives the converted bool.
+         * ctor > 0 is asserted too, so a leg that stopped materializing cannot pass vacuously.
+         */
+        LifeBag lb = default;
+        int lbefore = life_ctor();
+        int hits = 0;
+        for (int i = 0; i < 50; i++)
+        {
+            bool li = lb[0];                          // initializer
+            if (li) hits += 1;
+            bool la = false;
+            la = lb[0];                               // assignment
+            if (la) hits += 1;
+            hits += (int)lb[0];                       // explicit cast
+            hits += life_take_bool(lb[0]);            // call argument
+        }
+        if (hits != 200)                                                     return 2378;
+        if (life_ctor() - lbefore < 200 || life_ctor() != life_dtor())       return 2379;
+
+        int rbefore = life_ctor();
+        for (int i = 0; i < 50; i++) { if (life_bool_return(&lb)) hits += 1; }
+        if (hits != 250 || life_ctor() - rbefore < 50
+            || life_ctor() != life_dtor())                                   return 2364;
     }
 
     return 0;

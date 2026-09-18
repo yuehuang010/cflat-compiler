@@ -277,6 +277,19 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
             // Arguments bound through the `iterator -> const_iterator` conversion. Fewer wins, so
             // an overload declared over the argument's own specialization is never displaced.
             int constAddedConversions = 0;
+            /*
+             * Arguments bound through a conversion OPERATOR. A user-defined conversion sequence
+             * ranks strictly WORSE than any standard one (clang: exact match, qualification,
+             * promotion, conversion and a derived-to-base reference bind all beat it), so this
+             * is the FIRST tie-break of the `possible` tier. `userConversionCost` then ranks two
+             * sequences that use the SAME conversion function by their second standard
+             * conversion (operator int -> int beats operator int -> double), and
+             * `userConversionNames` detects two sequences using DIFFERENT ones, which are
+             * ambiguous rather than ordered.
+             */
+            int userConversions = 0;
+            int userConversionCost = 0;
+            std::string userConversionNames;
             int moveScore = 0;
             // Arguments bound by materializing a temporary for a C++ `const T&` scalar parameter.
             // A materialization is strictly worse than a by-value or rvalue-ref bind (ruling).
@@ -370,6 +383,11 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
             int constRefMaterializations = 0;
             // Arguments bound through the `iterator -> const_iterator` conversion.
             int constAddedConversions = 0;
+            // Arguments bound through a conversion OPERATOR, the cost of their second standard
+            // conversion, and the set of operators used (see Ranked for the ranking rule).
+            int userConversions = 0;
+            int userConversionCost = 0;
+            std::string userConversionNames;
             std::vector<int> integerCosts;
             integerCosts.reserve(arguments.size());
 
@@ -477,6 +495,15 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                     if (!cxxReceiverParam
                         && CanImplicitlyConstructCxxClass(arg, *candidateParamItr,
                                                         cxxByValueParam || cxxIndirectValueParam))
+                        result = 1;
+                    // Mirror of the line above in the conversion-OPERATOR direction: a class
+                    // value with an implicit 'operator bool' / 'operator int' binds a scalar
+                    // parameter. Ranked strictly below every standard sequence (see Ranked).
+                    else if (bool needsStandard = false;
+                        !cxxReceiverParam && !arg.TypeAndValue.Pointer
+                        && !ScoreCxxConversionOperatorArgument(
+                                arg, *candidateParamItr, needsStandard, userConversions,
+                                userConversionCost, userConversionNames).empty())
                         result = 1;
                     else if (coreUniqueValueReceiver || rawPointerToCoreUnique || coreUniqueToRawPointer
                         || coreUniqueOutParam
@@ -688,6 +715,15 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                         && CanImplicitlyConstructCxxClass(arg, *candidateParamItr,
                                                         cxxByValueParam || cxxIndirectValueParam))
                         result = 1;
+                    // Mirror of the line above in the conversion-OPERATOR direction: a class
+                    // value with an implicit 'operator bool' / 'operator int' binds a scalar
+                    // parameter. Ranked strictly below every standard sequence (see Ranked).
+                    else if (bool needsStandard = false;
+                        !cxxReceiverParam && !arg.TypeAndValue.Pointer
+                        && !ScoreCxxConversionOperatorArgument(
+                                arg, *candidateParamItr, needsStandard, userConversions,
+                                userConversionCost, userConversionNames).empty())
+                        result = 1;
 
                     /*
                      * A function pointer or closure VALUE does not implicitly convert to a DATA
@@ -844,6 +880,9 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                 ranked.constRefMaterializations = constRefMaterializations;
                 ranked.omitted = omitted;
                 ranked.constAddedConversions = constAddedConversions;
+                ranked.userConversions = userConversions;
+                ranked.userConversionCost = userConversionCost;
+                ranked.userConversionNames = userConversionNames;
                 ranked.moveScore = ScoreMoveAgreement(arguments, candidate);
                 ranked.integerCosts = std::move(integerCosts);
                 (perfectMatch ? perfect : possible).push_back(std::move(ranked));
@@ -952,6 +991,10 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
             std::vector<const Ranked*> best;
             for (const Ranked& r : possible)
                 best.push_back(&r);
+            // A user-defined conversion sequence loses to EVERY standard one, so this ranks
+            // before any other tie-break; then the better second standard conversion wins.
+            keepLowest(best, [](const Ranked& r) { return r.userConversions; });
+            keepLowest(best, [](const Ranked& r) { return r.userConversionCost; });
             // Prefer agreeing function-pointer shapes, then fewer integer -> bool coercions.
             keepLowest(best, [](const Ranked& r) { return r.shapeMismatches; });
             keepLowest(best, [](const Ranked& r) { return r.boolCoercions; });
@@ -981,6 +1024,17 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
             // Same move tie-break as the perfect tier: `d.add(1, namedLvalue)` must not silently
             // keep the `move` overload and consume the caller's variable.
             keepLowest(best, [](const Ranked& r) { return -r.moveScore; });
+            // Two user-defined sequences through DIFFERENT conversion functions are ambiguous in
+            // C++, never ordered - report the tie instead of taking the legacy declaration-order
+            // pick, which would make the answer depend on header order.
+            if (best.size() > 1 && best.front()->userConversions > 0 && tiedOut != nullptr
+                && std::any_of(best.begin(), best.end(), [&](const Ranked* r) {
+                       return r->userConversionNames != best.front()->userConversionNames; }))
+            {
+                for (const Ranked* r : best)
+                    tiedOut->push_back(r->pair->second);
+                return Result{};
+            }
             const Ranked* winner = settle(best, /*legacyLastWins=*/true);
             return winner != nullptr ? *winner->pair : Result{};
         }
@@ -2154,7 +2208,17 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                 && candidate.CxxAbi.params[i].kind == cflat_cinterop::RawAbiSlot::Indirect;
             if (candidate.IsCxx && candidate.IsMethod && i == 0) continue;  // receiver: no UDC
             if (!CanImplicitlyConstructCxxClass(matched[i], candidate.Parameters[i],
-                                                cxxByValueParam || cxxIndirectValueParam)) continue;
+                                                cxxByValueParam || cxxIndirectValueParam))
+            {
+                // Conversion-OPERATOR direction, selected by the same rank above.
+                if (!matched[i].TypeAndValue.Pointer
+                    && !CxxConversionOperatorTo(matched[i].TypeAndValue.TypeName,
+                                                candidate.Parameters[i], false).empty()
+                    && !ApplyCxxConversionOperator(matched[i], candidate.Parameters[i], false))
+                    LogErrorMessage("cannot materialize implicit C++ class argument for '{}'",
+                                    { diagnosticFunctionName });
+                continue;
+            }
             if (!MaterializeImplicitCxxClassArgument(matched[i], candidate.Parameters[i]))
                 LogErrorMessage("cannot materialize implicit C++ class argument for '{}'",
                                 { diagnosticFunctionName });
