@@ -9159,7 +9159,22 @@ void LLVMBackend::CollectCxxTypeOwnerGroups(const std::string& cflatTypeName,
             && std::find(groups.begin(), groups.end(), owner->second) == groups.end())
             groups.push_back(owner->second);
         TypeSpelling parsed;
-        if (!DemangleType(*this, type, parsed) || parsed.args.empty()) return;
+        if (!DemangleType(*this, type, parsed)) return;
+        // A POINTER or VIEW argument mangles as a PREFIX ('.p$nest.Cell'), and no group owns that
+        // key: the owning group is recorded for the POINTEE, so visit it with the prefix removed.
+        if (parsed.pointerDepth > 0 || parsed.view)
+        {
+            TypeSpelling pointee = parsed;
+            pointee.pointerDepth = 0;
+            pointee.view = false;
+            const std::string pointeeName = MangleType(*this, pointee);
+            if (pointeeName != type)
+            {
+                CollectCxxTypeOwnerGroups(pointeeName, groups, visited);
+                return;
+            }
+        }
+        if (parsed.args.empty()) return;
         CollectCxxTypeOwnerGroups(parsed.base, groups, visited);
         for (const TypeSpelling& arg : parsed.args)
             CollectCxxTypeOwnerGroups(MangleType(*this, arg), groups, visited);
@@ -9177,7 +9192,12 @@ bool LLVMBackend::FirstUnownedCxxComponent(const std::string& cflatTypeName,
         for (const TypeSpelling& arg : parsed.args)
         {
             if (arg.value) continue;
-            std::string name = MangleType(*this, arg);
+            // A pointer or view argument mangles as a PREFIX ('.p$nest.Missing'), which is not
+            // writable source: name the POINTEE class, the component a group has to declare.
+            TypeSpelling pointee = arg;
+            pointee.pointerDepth = 0;
+            pointee.view = false;
+            std::string name = MangleType(*this, pointee);
             while (!name.empty() && (name.back() == '*' || name.back() == ' ')) name.pop_back();
             if (name.empty()) continue;
             if (FirstUnownedCxxComponent(name, outSpelling)) return true;

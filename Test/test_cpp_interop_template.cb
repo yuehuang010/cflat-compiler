@@ -173,6 +173,7 @@ import cpp "cstring" cache;
 import cpp "cctype" cache;
 import cpp "cstdio" cache;
 import cpp "map" cache;
+import cpp "deque" cache;
 import cpp "atomic" cache;
 import cpp "library/cpp_interop_scoped_enum.h" cache;
 import cpp "library/cpp_interop_nsstd.h" cache;
@@ -330,6 +331,31 @@ struct NestSigBox<T>
     int tag() { return 7; }
 };
 int nestsig_generic_param(NestSigBox<std.vector<std.shared_ptr<nest.Cell>>> b) { return b.tag(); }
+
+/*
+ * Section M104 helpers: a std container over a std container over a POINTER to a USER class.
+ * The owning-group union walked a mangled argument's template arguments only, and a pointer
+ * mangles as a PREFIX ('.p$nest.Cell') that carries none - so the user header never joined the
+ * outer request's TU and clang answered "use of undeclared identifier 'nest'", surfacing as
+ * "'std::vector<std::vector<nest::Cell *>>' does not name a C++ class type in the imported
+ * headers". Depth 1 (fixture leg 1944) and a non-pointer element (leg 1930) always bound.
+ * The file-scope forms below also come through the ForwardRefScanner signature pre-pass;
+ * Test/errors/err_cpp_nested_ptr_sig.cb pinned their refusal and was deleted with this fix,
+ * its accept leg becoming nestptr_shallow_param.
+ */
+int nestptr_shallow_param(std.vector<nest.Cell*> v) { return (int)v.size(); }
+int nestptr_param(std.vector<std.vector<nest.Cell*>> v) { return (int)v.size() * 10 + (int)v[0].size(); }
+std.vector<std.vector<nest.Cell*>> nestptr_return()
+{
+    std.vector<std.vector<nest.Cell*>> made = default;
+    return made;
+}
+int nestptr_depth3(std.vector<std.vector<std.vector<nest.Cell*>>> v) { return (int)v.size() + 300; }
+struct NestPtrHolder
+{
+    std.vector<std.vector<nest.Cell*>> rows = default;
+    int tag = 4;
+};
 
 // `return (*v)[0];` converts the std::vector<bool> element proxy under the ASSIGNMENT rules.
 // Pre-fix this did not compile: "cannot return this value: its type does not match".
@@ -2334,6 +2360,113 @@ extern int main()
         for (int i = 0; i < 50; i++) { if (life_bool_return(&lb)) hits += 1; }
         if (hits != 250 || life_ctor() - rbefore < 50
             || life_ctor() != life_dtor())                                   return 2364;
+    }
+
+    // ---- M104: a POINTER to a user class at INNER depth of a nested C++ specialization --------
+    /*
+     * Every leg names std.vector<std.vector<nest.Cell*>> or a sibling shape whose inner argument
+     * is a POINTER to a class owned by a user header. Discriminator: on the pre-fix binary the
+     * first local below refuses the whole file with "'std::vector<std::vector<nest::Cell *>>'
+     * does not name a C++ class type in the imported headers" (measured per shape, including the
+     * depth-3, Cell**, map, deque, field, signature, nested-namespace, user-template-pointer and
+     * second-user-group forms). Each leg dereferences through the stored pointer, so a leg
+     * cannot pass on a container that never really held one.
+     */
+    {
+        nest.Cell npOne = nest.Cell(2, 3);
+        nest.Cell npTwo = nest.Cell(5, 7);
+        std.vector<nest.Cell*> npRow = default;
+        npRow.push_back(&npOne);
+        npRow.push_back(&npTwo);
+
+        std.vector<std.vector<nest.Cell*>> npGrid = default;
+        npGrid.push_back(npRow);
+        if ((int)npGrid.size() != 1)                                         return 2400;
+        if ((int)npGrid[0].size() != 2)                                      return 2401;
+        if (npGrid[0][1]->sum() != 12)                                       return 2402;
+
+        // Depth 3, and a POINTER-TO-POINTER element at inner depth.
+        std.vector<std.vector<std.vector<nest.Cell*>>> npDeep = default;
+        npDeep.push_back(npGrid);
+        if (npDeep[0][0][0]->b != 3)                                         return 2403;
+
+        // A pointer-to-pointer element binds as a type; push_back of a T** element is a filed
+        // p3 gap at every depth, so the leg asserts the outer container's own values.
+        std.vector<nest.Cell**> npPp = default;
+        std.vector<std.vector<nest.Cell**>> npPpGrid = default;
+        npPpGrid.push_back(npPp);
+        if ((int)npPpGrid.size() != 1 || (int)npPpGrid[0].size() != 0)       return 2404;
+
+        // Other containers as the OUTER template, and as a map VALUE.
+        std.map<int, std.vector<nest.Cell*>> npMap = default;
+        npMap[9] = npRow;
+        if (npMap[9][0]->a != 2)                                             return 2405;
+
+        std.deque<std.vector<nest.Cell*>> npDeque = default;
+        npDeque.push_back(npRow);
+        if (npDeque[0][1]->a != 5)                                           return 2406;
+
+        // ACCEPT SET: this pair already bound before the fix and must not move.
+        std.pair<int, std.vector<nest.Cell*>> npPair = default;
+        npPair.first = 5;
+        npPair.second = npRow;
+        if (npPair.first != 5 || npPair.second[0]->b != 3)                   return 2407;
+        if (nestptr_shallow_param(npRow) != 2)                               return 2408;
+
+        // File-scope signature forms: parameter, return type, depth 3, and a CFlat struct field.
+        if (nestptr_param(npGrid) != 12)                                     return 2409;
+        std.vector<std.vector<nest.Cell*>> npMade = nestptr_return();
+        npMade.push_back(npRow);
+        if ((int)npMade.size() != 1 || npMade[0][1]->sum() != 12)            return 2410;
+        if (nestptr_depth3(npDeep) != 301)                                   return 2411;
+
+        NestPtrHolder npHolder = default;
+        npHolder.rows.push_back(npRow);
+        if (npHolder.tag != 4 || npHolder.rows[0][0]->sum() != 5)            return 2412;
+    }
+    {
+        // A user class in a NESTED namespace, a user class TEMPLATE specialization pointer, and
+        // a class from the SECOND user header - each at inner depth.
+        nest.deep.Node npNode = nest.deep.Node(6);
+        std.vector<nest.deep.Node*> npNodes = default;
+        npNodes.push_back(&npNode);
+        std.vector<std.vector<nest.deep.Node*>> npNodeGrid = default;
+        npNodeGrid.push_back(npNodes);
+        if (npNodeGrid[0][0]->val() != 6)                                    return 2413;
+
+        nest.Box<int> npBox = default;
+        std.vector<nest.Box<int>*> npBoxes = default;
+        npBoxes.push_back(&npBox);
+        std.vector<std.vector<nest.Box<int>*>> npBoxGrid = default;
+        npBoxGrid.push_back(npBoxes);
+        if (npBoxGrid[0][0]->tag() != 7)                                     return 2414;
+
+        nest2.Tag npTag = nest2.Tag(13);
+        std.vector<nest2.Tag*> npTags = default;
+        npTags.push_back(&npTag);
+        std.vector<std.vector<nest2.Tag*>> npTagGrid = default;
+        npTagGrid.push_back(npTags);
+        if (npTagGrid[0][0]->t != 13)                                        return 2415;
+    }
+    {
+        /*
+         * The same specialization named by a C++ FUNCTION in the header (cppnp::make_grid returns
+         * it, cppnp::take_grid takes it by const reference). The CFlat spelling must resolve to
+         * THAT record: the vector built by CFlat is handed to the C++ function and the vector
+         * built by C++ is grown from CFlat, so a duplicate registration of a second, identical
+         * LLVM type would not survive either direction.
+         */
+        cppnp.Leaf npLeafA = cppnp.Leaf(6);
+        cppnp.Leaf npLeafB = cppnp.Leaf(11);
+        std.vector<std.vector<cppnp.Leaf*>> npCxx = cppnp.make_grid(&npLeafA);
+        if ((int)npCxx.size() != 1)                                          return 2416;
+        if (cppnp.take_grid(npCxx) != 6)                                     return 2417;
+
+        std.vector<cppnp.Leaf*> npCxxRow = default;
+        npCxxRow.push_back(&npLeafB);
+        npCxx.push_back(npCxxRow);
+        if (cppnp.take_grid(npCxx) != 17)                                    return 2418;
+        if (npCxx[1][0]->get() != 11)                                        return 2419;
     }
 
     return 0;

@@ -16,6 +16,15 @@ extern int main()
         std.vector<nest.Missing> bad = default;
     }
 
+    // The same missing class as a POINTER at inner depth. A pointer argument mangles as a
+    // PREFIX ('.p$nest.Missing'), which this message used to quote verbatim - an unwritable
+    // mangled name. Discriminator: the quoted name. The pre-fix binary prints
+    // '.p$nest.Missing' here; only the pointEE spelling passes now. The leg sits AFTER the leg
+    // above and before any successful std.vector request, so both take the multi-candidate arm.
+    expect_error("no imported C++ header declares 'nest::Missing', a template argument of 'std::vector<nest::Missing *>'") {
+        std.vector<nest.Missing*> badptr = default;
+    }
+
     // The accept half: the same outer template over a DECLARED class of the same user group
     // binds and runs, so the rejection above is not a blanket refusal of the spelling.
     std.vector<nest.Cell> ok = default;

@@ -1724,3 +1724,31 @@ template <class T> using GNBdef = alnp::NBox<T, 6>;                 // global-sc
 template <class T> struct GAlnBox { T value; GAlnBox() noexcept : value(T(8)) {} };
 template <class T> using GAlnBoxAlias = GAlnBox<T>;                 // global unqualified target
 inline int alna_take_nbdef(const alna::NBdef<int>& b) noexcept { return b.v + 1; }
+
+// A C++ signature that names a std container over a std container over a POINTER to a user class
+// declared in this same header. A CFlat spelling of the same type must bind to THIS record.
+namespace cppnp
+{
+    struct Leaf
+    {
+        int v;
+        Leaf() noexcept : v(4) {}
+        Leaf(int x) noexcept : v(x) {}
+        int get() const noexcept { return v; }
+    };
+    inline int take_grid(const std::vector<std::vector<Leaf*>>& g) noexcept
+    {
+        int total = 0;
+        for (const std::vector<Leaf*>& row : g)
+            for (Leaf* leaf : row) total += leaf->v;
+        return total;
+    }
+    inline std::vector<std::vector<Leaf*>> make_grid(Leaf* one) noexcept
+    {
+        std::vector<std::vector<Leaf*>> g;
+        std::vector<Leaf*> row;
+        row.push_back(one);
+        g.push_back(row);
+        return g;
+    }
+}

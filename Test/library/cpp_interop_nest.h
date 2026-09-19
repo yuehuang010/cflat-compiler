@@ -14,6 +14,18 @@ struct Cell
     int sum() const { return a + b; }
 };
 
+// A user class in a NESTED namespace: the owning-group union keys on the leading namespace
+// component, so a two-component name must still find this header.
+namespace deep {
+struct Node
+{
+    int n;
+    Node() : n(5) {}
+    Node(int v) : n(v) {}
+    int val() const { return n; }
+};
+}
+
 template <class T>
 struct Box
 {
