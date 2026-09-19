@@ -6340,6 +6340,9 @@ bool LLVMBackend::RunInit(const std::string& runtimeDir, bool verbose)
           "System/Library/Frameworks/Foundation.framework/Foundation.tbd" },
         { "/System/Library/Frameworks/CoreFoundation.framework/Versions/A/CoreFoundation",
           "System/Library/Frameworks/CoreFoundation.framework/CoreFoundation.tbd" },
+        // The SDK's CoreGraphics.tbd names targets the bundled ld64.lld cannot parse.
+        { "/System/Library/Frameworks/CoreGraphics.framework/Versions/A/CoreGraphics",
+          "System/Library/Frameworks/CoreGraphics.framework/CoreGraphics.tbd" },
         { "/usr/lib/libobjc.A.dylib", "usr/lib/libobjc.tbd" },
     };
     for (const auto& fs : macFwSpecs)

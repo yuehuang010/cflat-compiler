@@ -146,7 +146,7 @@ import cpp "library/cpp_interop_field.h" cache;
 // Array elements of a C++ class. Imported WITHOUT the header cache so those checks
 // does not depend on cache state.
 import cpp "library/cpp_interop_arrayelem.h";
-import "cpp_interop_globals.cb";
+import "library/cpp_interop_globals.cb";
 // Using-directives, including ones nominating a namespace nested in the nominator.
 import cpp "library/cpp_interop_usingns.h" cache;
 // A C++ CONSTRUCTOR parameter declared `T&` binds the argument's address.
