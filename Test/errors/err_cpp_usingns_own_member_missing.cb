@@ -1,0 +1,9 @@
+import cpp "cpp_interop_usingns.h" cache;
+
+extern int main()
+{
+    expect_error("'no_such_name' is not a member of namespace 'cppu_shadow_nominator'") {
+        int bad = cppu_shadow_nominator.no_such_name();
+    }
+    return 0;
+}

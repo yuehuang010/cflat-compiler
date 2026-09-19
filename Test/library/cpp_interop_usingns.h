@@ -58,3 +58,50 @@ namespace cppu_alias_target
 namespace cppu_al = cppu_alias_target;
 namespace cppu_al_deep = cppu_alias_target::deep;
 namespace cppu_al2 = cppu_al;
+
+// Own-member lookup: a using-directive must not replace a real namespace path before its
+// members are searched. The nested namespaces deliberately collide so the lookup order is visible.
+namespace cppu_shadow_nominated
+{
+    inline int nominated_function() { return 3054; }
+    inline int same_function() { return 3955; }
+    inline int nominated_variable = 3952;
+    inline int same_variable = 3956;
+    struct SameClass { static inline int answer() { return 3951; } };
+    namespace nested
+    {
+        inline int nominated_nested_function() { return 3953; }
+    }
+}
+
+namespace cppu_shadow_nominator
+{
+    using namespace cppu_shadow_nominated;
+    inline int own_function() { return 3050; }
+    inline int same_function() { return 3055; }
+    inline int own_variable = 3052;
+    inline int same_variable = 3056;
+    struct SameClass { static inline int answer() { return 3051; } };
+    namespace nested
+    {
+        inline int own_nested_function() { return 3053; }
+    }
+}
+
+namespace cppu_shadow_chain_a
+{
+    inline int from_a() { return 3058; }
+    namespace nested { inline int from_a_nested() { return 3958; } }
+}
+namespace cppu_shadow_chain_b
+{
+    using namespace cppu_shadow_chain_a;
+    inline int own_b() { return 3957; }
+    namespace nested { inline int own_b_nested() { return 3959; } }
+}
+namespace cppu_shadow_chain_c
+{
+    using namespace cppu_shadow_chain_b;
+    inline int own_c() { return 3057; }
+    namespace nested { inline int own_c_nested() { return 3059; } }
+}

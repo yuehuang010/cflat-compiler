@@ -2511,5 +2511,24 @@ extern int main()
     // ACCEPT SET: a CFlat struct argument is not on the C++ conversion path at all.
     ExcPlain excPlain = { a = 5 };
     if (ExcTakePlain(excPlain) != 5)                                           return 2220;
+
+    // ---- C++ using-directive own-member lookup (3050-3059) -------------------------------
+    // A real nominating namespace keeps precedence over its using-directive for every member
+    // kind below. The SameClass and same_variable legs assert C++'s own-member hiding rule.
+    if (cppu_shadow_nominator.own_function() != 3050)                         return 3050;
+    if (cppu_shadow_nominator.SameClass.answer() != 3051)                      return 3051;
+    if (cppu_shadow_nominator.own_variable != 3052)                            return 3052;
+    if (cppu_shadow_nominator.nested.own_nested_function() != 3053)            return 3053;
+    // A nominated member remains reachable through the nominator, including below the
+    // colliding nested namespace.
+    if (cppu_shadow_nominator.nominated_function() != 3054
+        || cppu_shadow_nominator.nested.nominated_nested_function() != 3953)   return 3054;
+    if (cppu_shadow_nominator.same_function() != 3055)                         return 3055;
+    if (cppu_shadow_nominator.same_variable != 3056)                            return 3056;
+    // Chained directives: c uses b and b uses a. Each side has an own-member and a nominated
+    // member so both the chain and the exact namespace precedence are observable.
+    if (cppu_shadow_chain_c.own_c() != 3057)                                    return 3057;
+    if (cppu_shadow_chain_c.from_a() != 3058)                                   return 3058;
+    if (cppu_shadow_chain_c.nested.own_c_nested() != 3059)                      return 3059;
     return 0;
 }
