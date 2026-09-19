@@ -2414,12 +2414,15 @@ extern int main()
         npDeep.push_back(npGrid);
         if (npDeep[0][0][0]->b != 3)                                         return 2403;
 
-        // A pointer-to-pointer element binds as a type; push_back of a T** element is a filed
-        // p3 gap at every depth, so the leg asserts the outer container's own values.
+        // A pointer-to-pointer element binds as a type AND can be filled: push_back takes
+        // `value_type const &`, i.e. a reference to a T**. Assert through the element.
+        nest.Cell* npCellPtr = &npOne;
         std.vector<nest.Cell**> npPp = default;
+        npPp.push_back(&npCellPtr);
         std.vector<std.vector<nest.Cell**>> npPpGrid = default;
         npPpGrid.push_back(npPp);
-        if ((int)npPpGrid.size() != 1 || (int)npPpGrid[0].size() != 0)       return 2404;
+        if ((int)npPpGrid.size() != 1 || (int)npPpGrid[0].size() != 1
+            || (*npPpGrid[0][0])->b != 3)                                    return 2404;
 
         // Other containers as the OUTER template, and as a map VALUE.
         std.map<int, std.vector<nest.Cell*>> npMap = default;
@@ -2491,6 +2494,64 @@ extern int main()
         npCxx.push_back(npCxxRow);
         if (cppnp.take_grid(npCxx) != 17)                                    return 2418;
         if (npCxx[1][0]->get() != 11)                                        return 2419;
+    }
+    {
+        /*
+         * Section M102: a C++ REFERENCE to a pointer-to-pointer (`T **const &`, `T **&`), which
+         * is three declarator levels over a type model that holds two. The reference is the ABI's
+         * extra level and IsCxxRefToPointer already encodes it, so the pointee survives; before
+         * that the whole member or function was refused as "takes unsupported type".
+         */
+        nest.Cell ppOne = nest.Cell(2, 3);
+        nest.Cell ppTwo = nest.Cell(4, 5);
+        nest.Cell* ppP1 = &ppOne;
+        nest.Cell* ppP2 = &ppTwo;
+        nest.Cell** ppArg = &ppP1;
+
+        // Free functions. The two reference forms were refused; the by-value and `T *const *`
+        // forms are the pre-existing ACCEPT SET, frozen here so the relaxation cannot widen
+        // into them (these two legs pass on both binaries by design).
+        if (nest.ppcref(ppArg) != 31)                                        return 2440;
+        if (nest.ppref(ppArg) != 32)                                         return 2441;
+        if (nest.ppval(ppArg) != 33)                                         return 2442;
+        if (nest.pconstp(ppArg) != 34)                                       return 2443;
+        // Function-template deduction through the same parameter shape: also accept set.
+        if (nest.ppdeduce<nest.Cell>(ppArg) != 55)                           return 2444;
+
+        // Members, and the two reference RETURN shapes reading back the slot they stored.
+        nest.PpHolder ppHolder = default;
+        if (ppHolder.take(ppArg) != 26)                                      return 2445;
+        if (ppHolder.take_ref(ppArg) != 27)                                  return 2446;
+        nest.Cell** ppBack = ppHolder.ref_out();
+        if ((*ppBack)->b != 3)                                               return 2447;
+        nest.Cell** ppBackC = ppHolder.cref_out();
+        if ((*ppBackC)->b != 3)                                              return 2448;
+
+        // libc++ over a T** element: push_back takes `value_type const &`, operator[] / front /
+        // back / at hand back `value_type &`. Reading THROUGH the element proves the depth.
+        std.vector<nest.Cell**> ppVec = default;
+        ppVec.push_back(&ppP1);
+        ppVec.push_back(&ppP2);
+        if ((int)ppVec.size() != 2 || (*ppVec[1])->b != 5)                   return 2449;
+        if ((*ppVec.front())->b != 3 || (*ppVec.back())->b != 5
+            || (*ppVec.at(0))->a != 2)                                       return 2450;
+        std.vector<std.vector<nest.Cell**>> ppGrid = default;
+        ppGrid.push_back(ppVec);
+        if ((int)ppGrid[0].size() != 2 || (*ppGrid[0][1])->b != 5)           return 2451;
+
+        // The element's pointee kind is its own axis: a std class goes through the foreign
+        // spelling mapper, a primitive through the general one.
+        std.string ppStr = std.string("hey");
+        std.string* ppStrP = &ppStr;
+        std.vector<std.string**> ppStrVec = default;
+        ppStrVec.push_back(&ppStrP);
+        if ((int)(*ppStrVec[0])->size() != 3)                                return 2452;
+        int ppInt = 9;
+        int* ppIntP = &ppInt;
+        std.vector<int**> ppIntVec = default;
+        ppIntVec.push_back(&ppIntP);
+        int** ppIntGot = ppIntVec[0];
+        if (*(*ppIntGot) != 9)                                               return 2453;
     }
 
     // ---- free operator templates with mutable-reference operands (2390-2399) -------------------

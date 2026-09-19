@@ -34,4 +34,24 @@ struct Box
     int tag() const { return 7; }
 };
 
+// Section M102: a REFERENCE to a pointer-to-pointer. Three declarator levels, two of which the
+// CFlat type model holds; the reference itself is the ABI's extra level.
+inline int ppcref(Cell **const &pp) { return (*pp)->b * 10 + 1; }
+inline int ppref(Cell **&pp)        { return (*pp)->b * 10 + 2; }
+inline int ppval(Cell **pp)         { return (*pp)->b * 10 + 3; }
+inline int pconstp(Cell *const *pp) { return (*pp)->b * 10 + 4; }
+
+template <class T>
+inline int ppdeduce(T **const &pp) { return (*pp)->sum() * 10 + 5; }
+
+struct PpHolder
+{
+    Cell **slot;
+    PpHolder() : slot(0) {}
+    int take(Cell **const &pp)   { slot = pp; return (*pp)->a * 10 + 6; }
+    int take_ref(Cell **&pp)     { slot = pp; return (*pp)->a * 10 + 7; }
+    Cell **&ref_out()            { return slot; }
+    Cell **const &cref_out() const { return slot; }
+};
+
 }

@@ -2747,6 +2747,8 @@ bool LLVMBackend::TryLoadCHeaderDiskCache(
         // ("fi"), a signature omits every field sitting at its default, and a C++ type request
         // stores most of its signatures as indices into a shared baseline ("sb"). A v76 entry
         // spells all of it out and has no baseline to resolve against.
+        // v78 binds a reference to a T** (crp at two pointer levels): an older cache carries the
+        // member's refusal instead of a signature.
         if (version != kCHeaderCacheVersion) return cacheMiss("cache version");
 
         if (!expectedRequestKey.empty()
@@ -3154,6 +3156,7 @@ void LLVMBackend::WriteCHeaderDiskCache(
         // v76 records `explicit` on a C++ conversion operator too (xpl).
         // v77 interns source paths into "files", drops defaulted signature fields, and stores a
         // type request's shared signatures once in a baseline ("sb") instead of per entry.
+        // v78 binds a reference to a T** instead of refusing the member.
         j["version"] = kCHeaderCacheVersion;
         j["mtime"]   = (int64_t)mtime.time_since_epoch().count();
         j["hash"]    = contentHash;

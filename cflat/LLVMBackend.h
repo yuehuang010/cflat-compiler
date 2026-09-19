@@ -7825,6 +7825,8 @@ public:
      */
     bool RejectInaccessibleCxxMember(const std::string& typeName, const std::string& memberName,
                                      bool accessedThroughCurrentObject = false);
+    // A C++ class identity spelled for a user-facing message (a specialization key is mangled).
+    std::string DisplayCxxClassName(const std::string& typeName) const;
     bool RejectCxxReferenceFieldStore(const std::string& typeName, const std::string& memberName);
     bool CxxProtectedAccessAllowed(const std::string& typeName,
                                    bool accessedThroughCurrentObject) const;
@@ -9617,7 +9619,7 @@ public:
      * timeout). The PCH key still folds the build stamp, since a PCH belongs to the clang that
      * wrote it.
      */
-    static constexpr int kCHeaderCacheVersion = 77;
+    static constexpr int kCHeaderCacheVersion = 78;
     static std::string CompilerBuildStamp();
 
     static std::string GetCHeaderCacheDir();

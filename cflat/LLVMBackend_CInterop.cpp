@@ -1190,8 +1190,10 @@ bool LLVMBackend::TryMapCxxForeignSpelling(const std::string& ctype, TypeAndValu
         if (ctype.find('(') != std::string::npos) return false;   // function pointer / function type
         std::string s = ctype;
         int ptr = 0;
+        int stars = 0;
+        int refs = 0;
         // A fixed array decays to a pointer to its element, exactly as the general mapper does.
-        if (auto br = s.find('['); br != std::string::npos) { s.erase(br); ++ptr; }
+        if (auto br = s.find('['); br != std::string::npos) { s.erase(br); ++ptr; ++stars; }
 
         auto identChar = [](char c) { return std::isalnum((unsigned char)c) != 0 || c == '_'; };
         static const char* const cvWords[] = { "const", "volatile", "restrict", "__restrict",
@@ -1203,12 +1205,12 @@ bool LLVMBackend::TryMapCxxForeignSpelling(const std::string& ctype, TypeAndValu
             peeled = false;
             while (!s.empty() && (s.back() == ' ' || s.back() == '\t')) s.pop_back();
             if (s.empty()) return false;
-            if (s.back() == '*') { s.pop_back(); ++ptr; peeled = true; continue; }
+            if (s.back() == '*') { s.pop_back(); ++ptr; ++stars; peeled = true; continue; }
             if (s.back() == '&')
             {
                 s.pop_back();
                 if (!s.empty() && s.back() == '&') s.pop_back();
-                ++ptr; peeled = true; continue;
+                ++ptr; ++refs; peeled = true; continue;
             }
             for (const char* w : cvWords)
             {
@@ -1260,6 +1262,15 @@ bool LLVMBackend::TryMapCxxForeignSpelling(const std::string& ctype, TypeAndValu
         if (ptr > 0) out.Pointer = true;
         if (ptr > 1) out.ElemPointer = true;
         mapped = ptr <= 2;
+        // A REFERENCE to a T** is three declarator levels but only two CFlat ones: the reference
+        // is the ABI's extra pointer, which IsCxxRefToPointer already encodes. Store T** and let
+        // the caller keep the flag instead of peeling a level it cannot represent.
+        if (!mapped && refs == 1 && stars == 2)
+        {
+            out.ElemPointer = true;
+            out.IsCxxRefToPointer = true;
+            mapped = true;
+        }
         return true;
     }
 
@@ -1315,17 +1326,21 @@ bool LLVMBackend::MapCTypeToTypeAndValueImpl(std::string ctype, TypeAndValue& ou
         // C++ references use the same machine representation as a pointer to the referred
         // object at a call boundary. Keep the referred nominal type so overload matching remains
         // useful, and normalize Clang's class/namespace spelling to CFlat's dotted names.
+        const int starLevels = ptr;
+        bool isReference = false;
         size_t refPos = ctype.find("&&");
         if (refPos != std::string::npos)
         {
             ctype.erase(refPos, 2);
             ++ptr;
+            isReference = true;
             out.IsRvalueRef = true;
         }
         else if ((refPos = ctype.find('&')) != std::string::npos)
         {
             ctype.erase(refPos, 1);
             ++ptr;
+            isReference = true;
         }
 
         // Collapse runs of whitespace and trim - so "unsigned   long  long" normalizes.
@@ -1354,6 +1369,13 @@ bool LLVMBackend::MapCTypeToTypeAndValueImpl(std::string ctype, TypeAndValue& ou
             }
         for (size_t pos; (pos = base.find("::")) != std::string::npos; ) base.replace(pos, 2, ".");
 
+        // A REFERENCE to a T** keeps the pointee: the reference is the ABI's extra level and
+        // IsCxxRefToPointer already encodes it, so T** fits the two CFlat levels.
+        if (ptr == 3 && isReference && starLevels == 2)
+        {
+            ptr = 2;
+            out.IsCxxRefToPointer = true;
+        }
         // 3+ levels of indirection collapse to void** - CFlat TypeAndValue has at most two pointer
         // levels. Pointers are the same ABI size on x64/x86, so calls still link correctly.
         if (ptr > 2)
@@ -2206,7 +2228,9 @@ bool LLVMBackend::MapRawSig(const cflat_cinterop::RawSig& r, CSigEntry& e)
                 && !ptv.IsFunctionPointer && ptv.Pointer)
             {
                 ptv.IsAlias = true;
-                if (ptv.ElemPointer)
+                // A T**& already arrives flagged and at its CFlat depth (the mapper could not
+                // store the reference as a third level); only a T*& still has one to peel.
+                if (ptv.ElemPointer && !ptv.IsCxxRefToPointer)
                 {
                     ptv.ElemPointer = false;
                     ptv.IsCxxRefToPointer = true;
@@ -10470,6 +10494,15 @@ bool LLVMBackend::EmitCxxVirtualDelete(const std::string& typeName, llvm::Value*
         return true;
     }
 
+// A specialization's CFlat identity is a MANGLED key ('std.vector$.p$.p$nest.Cell'), which is
+// not writable source. Every user-facing message spells it back out.
+std::string LLVMBackend::DisplayCxxClassName(const std::string& typeName) const
+{
+        TypeAndValue probe;
+        probe.TypeName = typeName;
+        return SpellType(*this, probe);
+    }
+
 /*
  * A C++ reference member binds as a pointer field, so a CFlat store through it would RESEAT the
  * reference - which C++ has no syntax for. Refuse the store and point at the referent instead.
@@ -10482,7 +10515,7 @@ bool LLVMBackend::RejectCxxReferenceFieldStore(const std::string& typeName,
         LogError(std::format(
             "field '{}' of C++ class '{}' is a C++ reference and cannot be reseated; assign to the "
             "referent by dereferencing the field instead.",
-            memberName, typeName));
+            memberName, DisplayCxxClassName(typeName)));
         return true;
     }
 
@@ -10503,7 +10536,7 @@ bool LLVMBackend::RejectInaccessibleCxxMember(const std::string& typeName,
             if (f->second == cflat_cinterop::AccessProtected
                 && CxxProtectedAccessAllowed(typeName, accessedThroughCurrentObject)) return false;
             LogError(std::format("field '{}' of C++ class '{}' is {}",
-                                 memberName, typeName,
+                                 memberName, DisplayCxxClassName(typeName),
                                  f->second == cflat_cinterop::AccessPrivate ? "private" : "protected"));
             return true;
         }
@@ -10512,7 +10545,7 @@ bool LLVMBackend::RejectInaccessibleCxxMember(const std::string& typeName,
         {
             if (CxxProtectedAccessAllowed(typeName, accessedThroughCurrentObject)) return false;
             LogErrorMessage("member '{}' of C++ class '{}' is protected",
-                            { memberName, typeName });
+                            { memberName, DisplayCxxClassName(typeName) });
             return true;
         }
         if (auto m = info->refusedMembers.find(memberName); m != info->refusedMembers.end())
@@ -10532,7 +10565,8 @@ bool LLVMBackend::RejectInaccessibleCxxMember(const std::string& typeName,
                        != currentInfo->instanceMethodNames.end())
                 return false;
             if (functionTable.count(typeName + "." + memberName) != 0) return false;   // static
-            LogError(std::format("member '{}' of C++ class '{}' {}", memberName, typeName, refusal));
+            LogError(std::format("member '{}' of C++ class '{}' {}", memberName,
+                                 DisplayCxxClassName(typeName), refusal));
             return true;
         }
         return false;
@@ -11011,7 +11045,12 @@ void LLVMBackend::RegisterCxxClassMembers(const CRecordEntry& r, const std::stri
                 const std::string bare = CxxSpellingWithoutRef(spelling, &refKind);
                 if (refKind == CxxReferenceKind::None || refKind == CxxReferenceKind::Rvalue) return;
                 if (!tv.Pointer || tv.IsFunctionPointer || tv.IsArrayView) return;
-                if (tv.ElemPointer)
+                // A T**& is already at its CFlat depth with the flag set by the mapper; peeling a
+                // level here would turn it into a T*.
+                if (tv.IsCxxRefToPointer)
+                {
+                }
+                else if (tv.ElemPointer)
                 {
                     if (bare.empty() || bare.back() != '*'
                         || std::count(bare.begin(), bare.end(), '*') != 1)
@@ -11046,8 +11085,11 @@ void LLVMBackend::RegisterCxxClassMembers(const CRecordEntry& r, const std::stri
                 {
                 }
                 else if (!mapType(m.paramTypes[p], tv)
-                         || (!tv.Pointer && !tv.IsFunctionPointer && tv.TypeName == "void"))
+                         || (!tv.Pointer && !tv.IsFunctionPointer && tv.TypeName == "void")
+                         || (!aliasRefs && tv.IsCxxRefToPointer))
                 {
+                    // A structor and an assignment operator keep a reference parameter in the raw
+                    // extra-pointer shape, which a reference to a T** would need three levels for.
                     // A by-value spelling the mapper cannot express arrives as bare "void";
                     // an LLVM function type with a void parameter asserts (garbage in Release).
                     refuse(IsLongDoubleSpelling(m.paramTypes[p])

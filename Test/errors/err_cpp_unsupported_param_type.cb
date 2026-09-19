@@ -1,9 +1,29 @@
 import cpp "cpp_interop_basic.h";
+import cpp "vector";
+import cpp "cpp_interop_nest.h";
 
 extern int main()
 {
     expect_error("'cppi.unsupported_param' was not bound: parameter 'value' has unsupported C++ type '_Float16'") {
         cppi.unsupported_param(1);
+    }
+    /*
+     * The boundary of the `T **const &` relaxation. A reference is ONE declarator level the
+     * type model can fold away (into IsCxxRefToPointer), so `T **const &` binds and
+     * `T ***const &` does not. Vacuous against master - which refuses both - and a live
+     * tripwire against a relaxation that stops counting stars.
+     */
+    expect_error("'cppi.ptr_depth3_ref_param' was not bound: parameter 'value' has unsupported C++ type 'cppi::PtrDepthOwner ***const &'") {
+        cppi.PtrDepthOwner pdOwner = default;
+        cppi.PtrDepthOwner* pdP1 = &pdOwner;
+        cppi.PtrDepthOwner** pdP2 = &pdP1;
+        cppi.ptr_depth3_ref_param(pdP2);
+    }
+    // A refusal names the class in WRITABLE source: the CFlat identity of a specialization is
+    // the mangled key 'std.vector$.p$.p$nest.Cell', which master printed verbatim.
+    expect_error("member 'get_allocator' of C++ class 'std.vector<nest.Cell**>' returns unsupported type") {
+        std.vector<nest.Cell**> pdVec = default;
+        pdVec.get_allocator();
     }
     return 0;
 }
