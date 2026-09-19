@@ -1,0 +1,15 @@
+import cpp "cpp_interop_basic.h";
+import cpp "cpp_interop_freeoptpl.h";
+
+extern int main()
+{
+    expect_error("C++ 'operator|' cannot bind its left operand") {
+        cppi.opsfree.FreeOps tag = default;
+        tag.value = 5;
+        cppi.opsfree.MutFree* result = cppi.opsfree.make_mutfree() | tag;
+    }
+    expect_error("C++ 'operator|' cannot bind its left operand") {
+        cppfop.Box<int>* result = cppfop.Box<int>(0) | cppfop.Box<int>(5);
+    }
+    return 0;
+}

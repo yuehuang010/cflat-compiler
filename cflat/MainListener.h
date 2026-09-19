@@ -5684,7 +5684,8 @@ public:
         antlr4::ParserRuleContext* ctx, llvm::Type* lhsElemType = nullptr,
         int rhsPointerDepth = 0, bool rhsElemPointer = false,
         llvm::Value* lhsStorage = nullptr, llvm::Value* rhsStorage = nullptr,
-        bool reportMissing = true, bool allowReversed = true);
+        bool reportMissing = true, bool allowReversed = true,
+        bool lhsIsRvalue = false, bool rhsIsRvalue = false);
 
     LLVMBackend::TypedValue ParseMultiplicativeExpression(CFlatParser::MultiplicativeExpressionContext* ctx,
                                                            ResultUse use = ResultUse::Value);

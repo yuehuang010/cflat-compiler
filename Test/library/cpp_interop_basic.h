@@ -804,6 +804,22 @@ namespace cppi
         // Left operand is a class from the ENCLOSING namespace: found through the right operand.
         inline cppi::OpsSink& operator<<(cppi::OpsSink& sink, const FreeOps& v) noexcept
         { sink.total += v.value; return sink; }
+
+        struct MutFree { int value; };
+        struct MutHost { MutFree field; };
+        inline MutFree& operator|(MutFree& a, const FreeOps& b) noexcept
+        { a.value += b.value; return a; }
+        inline MutFree operator^(MutFree& a, const FreeOps& b) noexcept
+        { a.value += b.value; return a; }
+        inline void operator%(MutFree& a, const FreeOps& b) noexcept
+        { a.value += b.value; }
+        inline MutFree& operator&(const FreeOps& a, MutFree& b) noexcept
+        { b.value += a.value; return b; }
+        inline MutFree make_mutfree() noexcept { return MutFree{}; }
+        // A const-ref overload beside an unrelated mutable-ref one: an rvalue left operand binds.
+        inline int operator+(const MutFree& a, int b) noexcept { return a.value + b; }
+        inline MutFree& operator+(MutFree& a, const FreeOps& b) noexcept
+        { a.value += b.value; return a; }
     }
 
     char16_t char16_value(char16_t value) noexcept;

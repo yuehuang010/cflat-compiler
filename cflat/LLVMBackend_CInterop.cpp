@@ -6342,9 +6342,12 @@ bool LLVMBackend::RequestCxxFunctionTemplate(const std::string& functionName,
                 spelling = "const char *";
             else if (!CxxSpellingForCflatType(cflatType, spelling))
                 return noMatch("an argument type cannot be spelled in C++");
-            if (!arg.TypeAndValue.Pointer && dataStructures.count(arg.TypeAndValue.TypeName) != 0
+            if (!arg.TypeAndValue.Pointer && IsCxxRecord(arg.TypeAndValue.TypeName)
                 && arg.Storage != nullptr && !arg.IsRvalue)
                 spelling += " &";
+            const bool classRvalue = arg.IsRvalue && !arg.TypeAndValue.Pointer
+                && IsCxxRecord(arg.TypeAndValue.TypeName);
+            const std::string valueSpelling = spelling;
             parameterSpellings.push_back(std::move(spelling));
             const std::string parameter = "p" + std::to_string(flatParameterIndex++);
             const bool packArgument = selected->hasParameterPack && i >= selected->minArity;
@@ -6354,6 +6357,8 @@ bool LLVMBackend::RequestCxxFunctionTemplate(const std::string& functionName,
                 if (valueSpelling.ends_with(" &")) valueSpelling.resize(valueSpelling.size() - 2);
                 callArguments.push_back("static_cast<" + valueSpelling + "&&>(" + parameter + ")");
             }
+            else if (classRvalue)
+                callArguments.push_back("static_cast<" + valueSpelling + "&&>(" + parameter + ")");
             else
                 callArguments.push_back(parameter);
         }
@@ -6394,7 +6399,7 @@ bool LLVMBackend::RequestCxxFunctionTemplate(const std::string& functionName,
          */
         const bool infixForm = !infixOperator.empty() && !instance
             && parameterSpellings.size() == 2;
-        if (infixForm) targetCall = "p0 " + infixOperator + " p1";
+        if (infixForm) targetCall = callArguments[0] + " " + infixOperator + " " + callArguments[1];
         else if (instance)
             targetCall = callArguments.front() + explicitSuffix + "(";
         else
@@ -6457,6 +6462,7 @@ bool LLVMBackend::RequestCxxFunctionTemplate(const std::string& functionName,
 
         std::string hashKey = lookupName + std::to_string(selected->kind) + infixOperator;
         for (const auto& p : parameterSpellings) hashKey += p;
+        for (const auto& a : callArguments) hashKey += "|call|" + a;
         for (const auto& a : cxxExplicitArgs) hashKey += a;
         for (const auto& brace : braceArguments)
         {
@@ -6478,7 +6484,7 @@ bool LLVMBackend::RequestCxxFunctionTemplate(const std::string& functionName,
                 return true;
             }
         }
-        std::string wrapperSource = "extern \"C\" __attribute__((weak)) auto " + wrapperName + "(";
+        std::string wrapperSource = "extern \"C\" __attribute__((weak)) decltype(auto) " + wrapperName + "(";
         for (size_t i = 0; i < parameterSpellings.size(); ++i)
         {
             if (i != 0) wrapperSource += ", ";

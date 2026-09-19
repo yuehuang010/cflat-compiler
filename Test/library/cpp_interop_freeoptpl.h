@@ -25,6 +25,10 @@ template <class T> Box<T> operator+(const Box<T>& a, T b) { return Box<T>(a.v_ +
 template <class T> Box<T> operator+(T a, const Box<T>& b) { return Box<T>(a + b.v_ + 3); }
 template <class T> Box<T> operator-(const Box<T>& a, const Box<T>& b)
 { return Box<T>(a.v_ - b.v_ + 4); }
+template <class T> Box<T>& operator|(Box<T>& a, const Box<T>& b)
+{ a.v_ += b.v_; return a; }
+template <class T> Box<T> operator^(Box<T>& a, const Box<T>& b)
+{ a.v_ += b.v_; return a; }
 template <class T> bool operator==(const Box<T>& a, const Box<T>& b) { return a.v_ == b.v_; }
 template <class T> bool operator!=(const Box<T>& a, const Box<T>& b) { return a.v_ != b.v_; }
 template <class T> bool operator<(const Box<T>& a, const Box<T>& b) { return a.v_ < b.v_; }

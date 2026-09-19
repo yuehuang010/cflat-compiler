@@ -2530,5 +2530,44 @@ extern int main()
     if (cppu_shadow_chain_c.own_c() != 3057)                                    return 3057;
     if (cppu_shadow_chain_c.from_a() != 3058)                                   return 3058;
     if (cppu_shadow_chain_c.nested.own_c_nested() != 3059)                      return 3059;
+
+    // ---- free operators with mutable-reference operands (3060-3079) ----------------------------
+    {
+        cppi.opsfree.FreeOps mutTag = default;
+        mutTag.value = 5;
+        cppi.opsfree.MutFree mutLocal = default;
+        cppi.opsfree.MutFree* mutResult = mutLocal | mutTag;
+        if (mutLocal.value != 5 || mutResult->value != 5)                         return 3060;
+
+        cppi.opsfree.MutFree mutChain = default;
+        mutResult = mutChain | mutTag | mutTag;
+        if (mutChain.value != 10 || mutResult->value != 10)                       return 3061;
+
+        cppi.opsfree.MutFree mutValue = default;
+        cppi.opsfree.MutFree mutCopy = mutValue ^ mutTag;
+        if (mutValue.value != 5 || mutCopy.value != 5)                            return 3062;
+
+        cppi.opsfree.MutFree mutVoid = default;
+        mutVoid % mutTag;
+        if (mutVoid.value != 5)                                                   return 3063;
+
+        cppi.opsfree.MutFree mutRight = default;
+        mutResult = mutTag & mutRight;
+        if (mutRight.value != 5 || mutResult->value != 5)                         return 3064;
+
+        cppi.opsfree.MutHost mutHost = default;
+        mutResult = mutHost.field | mutTag;
+        if (mutHost.field.value != 5 || mutResult->value != 5)                    return 3065;
+
+        cppi.opsfree.MutFree mutDeref = default;
+        cppi.opsfree.MutFree* mutPtr = &mutDeref;
+        mutResult = (*mutPtr) | mutTag;
+        if (mutDeref.value != 5 || mutResult->value != 5)                         return 3066;
+
+        // An rvalue operand is refused only when NO viable overload takes it by value/const-ref.
+        if (cppi.opsfree.make_mutfree() + 3 != 3)                                 return 3067;
+        mutResult = mutDeref + mutTag;
+        if (mutDeref.value != 10 || mutResult->value != 10)                       return 3068;
+    }
     return 0;
 }

@@ -150,6 +150,7 @@
 
 import cpp "library/cpp_interop_basic.h" cache;
 import cpp "library/cpp_interop_basic.cpp" cache;
+import cpp "library/cpp_interop_freeoptpl.h" cache;
 // One header-only CLASS TEMPLATE pattern. No specialization has a symbol anywhere until a
 // CFlat declaration asks for one, so every class-template assertion also proves the
 // instantiation path emitted the bodies. The libc++ checks need no fixture at all - the
@@ -2467,6 +2468,22 @@ extern int main()
         npCxx.push_back(npCxxRow);
         if (cppnp.take_grid(npCxx) != 17)                                    return 2418;
         if (npCxx[1][0]->get() != 11)                                        return 2419;
+    }
+
+    // ---- free operator templates with mutable-reference operands (2390-2399) -------------------
+    {
+        cppfop.Box<int> mutBox = cppfop.Box<int>(0);
+        cppfop.Box<int> mutTag = cppfop.Box<int>(5);
+        cppfop.Box<int>* mutResult = mutBox | mutTag;
+        if (mutBox.v() != 5 || mutResult->v() != 5)                               return 2390;
+
+        mutBox = cppfop.Box<int>(0);
+        mutResult = mutBox | mutTag | mutTag;
+        if (mutBox.v() != 10 || mutResult->v() != 10)                             return 2391;
+
+        cppfop.Box<int> mutValue = cppfop.Box<int>(0);
+        cppfop.Box<int> mutCopy = mutValue ^ mutTag;
+        if (mutValue.v() != 5 || mutCopy.v() != 5)                                return 2392;
     }
 
     return 0;

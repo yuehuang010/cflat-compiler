@@ -1702,6 +1702,7 @@ public:
         llvm::Type*  elemType   = nullptr;  // non-null when value is a pointer (enables ptr+int GEP)
         bool         isArrayView = false;   // value came from a thin `int[]` view (pointer arithmetic is banned on it)
         bool         isAlias    = false;    // value is a borrow from an alias result or join
+        bool         isRvalue = false;      // value-producing expression; named lvalues keep this false
         llvm::Value* storage    = nullptr;  // lvalue storage for an addressable alias result/join
         llvm::Value* receiverStorage = nullptr; // lvalue storage retained for synthesized method calls
         // Pointer DEPTH of the operand, carried so an operator's right operand can be judged:
