@@ -2536,6 +2536,19 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                         if (prevPrimary->genericIdentifier() != nullptr && prevPrimary->genericIdentifier()->Identifier() != nullptr)
                         {
                             std::string idName = prevPrimary->genericIdentifier()->Identifier()->getText();
+                            const std::string resolvedTypeAlias = Compiler(ctx)->ResolveTypeAlias(
+                                prevPrimary->getText());
+                            if (resolvedTypeAlias != prevPrimary->getText()
+                                && IsFollowedByDot(ctx, parseTree)
+                                && Compiler(ctx)->IsDataStructure(resolvedTypeAlias))
+                            {
+                                namespaceContext = resolvedTypeAlias;
+                                primaryIdentifier = namespaceContext;
+                                namedVar = {};
+                                structVar = {};
+                                interfaceVar = {};
+                                break;
+                            }
                             // A VARIABLE of the same name shadows a namespace; without this the
                             // primary yielded an EMPTY NamedVariable with no diagnostic. A FIELD of
                             // the enclosing struct, read bare through the implicit 'this', counts.

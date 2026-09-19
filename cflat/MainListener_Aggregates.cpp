@@ -186,6 +186,11 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
                     cppBaseName = compiler->ResolveGenericBaseAlias(cppBaseName);
                 cppBaseName = MangledGenericName(cppBaseName, typeArgs);
             }
+            else
+            {
+                cppBaseName = compiler->ResolveTypeAlias(cppBaseName);
+                baseRequestName = compiler->ResolveTypeAlias(baseRequestName);
+            }
             compiler->RecordCppStructBase(structName, cppBaseName);
             std::string baseError;
             if (baseSpelling.empty()

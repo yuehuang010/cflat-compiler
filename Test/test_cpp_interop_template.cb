@@ -372,6 +372,29 @@ bool life_bool_return(LifeBag* b)
     return (*b)[0];
 }
 
+// CFlat using aliases for foreign specializations. The late alias deliberately follows its
+// signature: the scanner must pre-register the foreign identity before walking that function.
+int uas_alias_before_signature(UasLateVec value) { return (int)value.size(); }
+using UasLateVec = std.vector<int>;
+using UasEarlyVec = std.vector<int>;
+int uas_alias_after_signature(UasEarlyVec value) { return (int)value.size(); }
+int uas_alias_param(UasEarlyVec value) { return (int)value.size(); }
+struct UasAliasField { UasEarlyVec values = default; };
+using UasBase = alnp.NBox<int,7>;
+[cpp] struct UasAliasDerived : UasBase { };
+int uas_alias_twice(int value) { return value * 2; }
+
+namespace uas_alias_ns
+{
+    using UasNsVec = std.vector<int>;
+    int run()
+    {
+        UasNsVec value = default;
+        value.push_back(4);
+        return (int)value.size();
+    }
+}
+
 extern int main()
 {
     // Win64 keeps the existing SEH trampoline and does not emit the C++ guard, so the
@@ -2484,6 +2507,107 @@ extern int main()
         cppfop.Box<int> mutValue = cppfop.Box<int>(0);
         cppfop.Box<int> mutCopy = mutValue ^ mutTag;
         if (mutValue.v() != 5 || mutCopy.v() != 5)                                return 2392;
+    }
+
+    // ---- CFlat using aliases naming C++ specializations (2420-2439) ---------------------------
+    // Each value leg has a distinct discriminator; the pre-fix alias arm rejects the declaration
+    // before the value is observed. The list<V> and C++ by-value return/copy shapes stay out of
+    // scope under the maintainer ruling recorded in scratch/uas_matrix.md.
+    {
+        using UasLocalVec = std.vector<int>;
+        UasLocalVec value = default;
+        value.push_back(4);
+        if (nsstd_vec.usevec(value) != 21)                                  return 2420;
+    }
+    {
+        std.vector<int> direct = default;
+        direct.push_back(4);
+        using UasIdentityVec = std.vector<int>;
+        UasIdentityVec* throughAlias = &direct;
+        if (nsstd_vec.usevec(*throughAlias) != 21)                           return 2421;
+    }
+    {
+        using UasNBox = alnp.NBox<int,7>;
+        UasNBox value = default;
+        if (value.v != 7)                                                    return 2422;
+    }
+    {
+        using UasNbdef = alna.NBdef<int>;
+        UasNbdef value = default;
+        if (value.v != 7 || alna_take_nbdef(value) != 8)                     return 2423;
+    }
+    {
+        using UasNestedVec = std.vector<std.vector<int>>;
+        UasNestedVec value = default;
+        if ((int)value.size() != 0)                                          return 2424;
+    }
+    {
+        using UasPointerVec = std.vector<char*>;
+        UasPointerVec value = default;
+        value.push_back(nullptr);
+        if ((int)value.size() != 1)                                          return 2425;
+    }
+    {
+        using UasFunction = std.function<int(int)>;
+        UasFunction value = UasFunction(uas_alias_twice);
+        if (value(3) != 6)                                                   return 2426;
+    }
+    if (uas_alias_ns.run() != 1)                                             return 2427;
+    {
+        UasLateVec value = default;
+        if (uas_alias_before_signature(value) != 0)                          return 2428;
+        if (uas_alias_after_signature(value) != 0)                           return 2429;
+    }
+    {
+        UasAliasField value = default;
+        if ((int)value.values.size() != 0)                                   return 2430;
+    }
+    {
+        UasEarlyVec value = default;
+        if (uas_alias_param(value) != 0)                                     return 2431;
+    }
+    {
+        using UasConstructorVec = std.vector<int>;
+        UasConstructorVec value = UasConstructorVec(3);
+        if ((int)value.size() != 3)                                          return 2432;
+    }
+    {
+        using UasStatic = cppt.TplStatics<int>;
+        if (UasStatic.twice(3) != 6)                                         return 2433;
+    }
+    {
+        using UasChain1 = std.vector<int>;
+        using UasChain2 = UasChain1;
+        UasChain2 value = default;
+        value.push_back(4);
+        if ((int)value.size() != 1)                                          return 2434;
+    }
+    {
+        UasAliasDerived value = default;
+        if (value.v != 7)                                                    return 2435;
+    }
+    {
+        using UasIdentityBox = alna.NBdef<int>;
+        UasIdentityBox aliasValue = default;
+        alnp.NBox<int,7> directValue = default;
+        if (alna_take_nbdef(aliasValue) != 8
+            || alna_take_nbdef(directValue) != 8)                            return 2436;
+    }
+    {
+        using UasFileScopeVec = std.vector<int>;
+        UasFileScopeVec value = default;
+        if (uas_alias_after_signature(value) != 0)                           return 2437;
+    }
+    {
+        using UasLocalAlias1 = std.vector<int>;
+        using UasLocalAlias2 = UasLocalAlias1;
+        UasLocalAlias2 value = default;
+        value.push_back(4);
+        if ((int)value.size() != 1)                                          return 2438;
+    }
+    {
+        using UasStaticAlias = cppt.TplStatics<int>;
+        if (UasStaticAlias.combine(4, 3) != 43)                              return 2439;
     }
 
     return 0;

@@ -2159,15 +2159,7 @@ void MainListener::ParseUsingDeclaration(CFlatParser::UsingDeclarationContext* c
             compiler->ResolveGenericAliasSpelling(baseName, typeArgs);
             std::string mangledName = MangledGenericName(baseName, typeArgs);
 
-            if (baseName == "std.function")
-            {
-                std::string cxxError;
-                if (!compiler->TryRequestCxxType(baseName, typeArgs, mangledName, cxxError))
-                    compiler->LogError(cxxError.empty()
-                        ? std::format("using alias '{}' = '{}': '{}' is not a generic type",
-                            alias, target, baseName) : cxxError);
-            }
-            else if (genericStructTemplates.count(baseName) != 0
+            if (genericStructTemplates.count(baseName) != 0
                 || genericClassTemplates.count(baseName) != 0
                 || genericInterfaceTemplates.count(baseName) != 0)
             {
@@ -2180,12 +2172,20 @@ void MainListener::ParseUsingDeclaration(CFlatParser::UsingDeclarationContext* c
             // a cast or iidof use-site does, so the alias names a real type instead of erroring.
             else if (!compiler->InstantiateWinrtGenericInterface(baseName, typeArgs, mangledName))
             {
-                compiler->LogError(std::format("using alias '{}' = '{}': '{}' is not a generic type",
-                                               alias, SpellType(*compiler,
-                                                   LLVMBackend::TypeAndValue{ .TypeName = target }),
-                                               SpellType(*compiler,
-                                                   LLVMBackend::TypeAndValue{ .TypeName = baseName })));
-                return;
+                std::string cxxError;
+                const bool cxxType = compiler->TryRequestCxxType(
+                    baseName, typeArgs, mangledName, cxxError);
+                if (!cxxType)
+                {
+                    if (!cxxError.empty()) compiler->LogError(cxxError);
+                    compiler->LogError(std::format(
+                        "using alias '{}' = '{}': '{}' is not a generic type", alias,
+                        SpellType(*compiler,
+                            LLVMBackend::TypeAndValue{ .TypeName = target }),
+                        SpellType(*compiler,
+                            LLVMBackend::TypeAndValue{ .TypeName = baseName })));
+                    return;
+                }
             }
             compiler->RegisterTypeAlias(alias, mangledName + suffix);
             if (auto* s = compiler->GetSymbolSink())

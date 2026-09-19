@@ -2869,6 +2869,8 @@ void ScanInterfaceDefinition(CFlatParser::InterfaceDefinitionContext* ctx,
                     std::string cxxError;
                     compiler->TryRequestCxxType(baseName, typeArgs, baseIdentity, cxxError);
                 }
+                else
+                    baseIdentity = compiler->ResolveTypeAlias(baseIdentity);
                 compiler->RecordCppStructBase(typeName, baseIdentity);
             }
         }

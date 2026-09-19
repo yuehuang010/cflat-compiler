@@ -894,9 +894,32 @@ void ForwardRefScanner::ScanGlobalLockGroup(CFlatParser::LockFieldGroupContext* 
 
 void ForwardRefScanner::RegisterRenameAlias(CFlatParser::UsingDeclarationContext* ctx) {
         RegisterPureRenameAlias(compilerLLVM, ctx);
-        if (ctx == nullptr || ctx->Identifier() == nullptr || ctx->pointer() == nullptr
+        if (ctx == nullptr || ctx->Identifier() == nullptr
             || ctx->arrayTypeSuffix() != nullptr || ctx->typeSpecifier() == nullptr)
             return;
+        if (ctx->pointer() == nullptr)
+        {
+            std::string genericBase;
+            if (auto* genParams = GenericSpecOf(ctx->typeSpecifier(), genericBase))
+            {
+                std::vector<std::string> args;
+                for (auto* entry : genParams->typeParameterList()->typeParameterEntry())
+                    args.push_back(ResolveForwardTypeArg(entry));
+                std::string resolvedBase = genericBase;
+                compilerLLVM->ResolveGenericAliasSpelling(resolvedBase, args, false);
+                if (!compilerLLVM->AnyGenericTypeTemplateNamed(resolvedBase)
+                    && !compilerLLVM->IsGenericInterfaceTemplateName(resolvedBase))
+                {
+                    std::string mangledName = MangleGenericInstance(*compilerLLVM, resolvedBase, args);
+                    std::string cxxError;
+                    compilerLLVM->TryRequestCxxType(resolvedBase, args, mangledName, cxxError);
+                    // Keep the spelling visible to signatures regardless of whether the best-effort
+                    // request found a foreign type; the main alias pass owns the eventual diagnostic.
+                    compilerLLVM->RegisterTypeAlias(ctx->Identifier()->getText(), mangledName);
+                }
+            }
+            return;
+        }
         PrimitiveTypeError targetError;
         std::string targetSpelling = CanonicalTypeSpecifierText(
             ctx->typeSpecifier(), ctx->multiWordTypeSuffix(), false, &targetError);
@@ -1231,7 +1254,7 @@ std::string ForwardRefScanner::ResolveSigComponentScanner(
         std::string result = CanonicalTypeSpecifierText(ts, suffix, false, &error);
         if (HasPrimitiveTypeError(error))
             compilerLLVM->LogError(LocalizePrimitiveTypeError(compilerLLVM, error));
-        return result;
+        return compilerLLVM->ResolveTypeAlias(result);
     }
 
 std::string ForwardRefScanner::SigComponentResolvedKeyScanner(const std::string& name) {
@@ -1812,11 +1835,19 @@ void ForwardRefScanner::ScanUsingDeclaration(CFlatParser::UsingDeclarationContex
             // tryPreDeclare); the alias still names the mangled interface.
             if (compiler->IsGenericInterfaceTemplateName(resolvedBaseName))
                 compiler->gts.genericInterfaceInstances.insert(mangledName);
-            else
+            else if (compiler->AnyGenericTypeTemplateNamed(resolvedBaseName))
             {
                 compiler->CreateStructType(mangledName, {});
                 LLVMBackend::TypeAndValue returnType{ .TypeName = mangledName };
                 compiler->CreateFunctionDeclaration(mangledName, returnType, {});
+            }
+            else
+            {
+                // A C++ specialization needs its foreign layout before a file-scope signature
+                // can use an alias declared later in the file. The main pass remains authoritative
+                // for diagnostics; this request is intentionally best effort.
+                std::string cxxError;
+                compiler->TryRequestCxxType(resolvedBaseName, args, mangledName, cxxError);
             }
             compiler->RegisterTypeAlias(alias, mangledName + suffix);
             return;
