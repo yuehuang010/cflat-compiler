@@ -7,7 +7,8 @@ namespace cppi_scope
 {
     enum class A : int { x = 7 };
     enum class B : int { y = 7 };
-    enum U1 { u = 7 };
+    // Fixed underlying type: an unfixed one is 'unsigned int' on Itanium but 'int' on MSVC.
+    enum U1 : unsigned int { u = 7 };
     enum U2 { w = 7 };
 
     template <typename T>

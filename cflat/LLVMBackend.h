@@ -9604,6 +9604,19 @@ public:
 
     // Identity of the running cflat binary (mtime + size), computed once. Folded into the
     // C-header disk-cache key so bindings do not survive a compiler that would remap them.
+    /*
+     * Schema version of the C header / C++ type-request disk cache. BUMP IT in the same change as
+     * any edit that alters what the extractor harvests, how a cached entry is READ BACK, or how it
+     * is ENCODED (a signature baseline is keyed on this version, so entries and the baseline they
+     * index into can never disagree about the encoding). The numbered history above
+     * TryLoadCFileSigCache says what each bump was for. It is the ONLY
+     * guard on entry compatibility for the type-request cache: that cache is deliberately not
+     * keyed on the compiler build stamp, so entries survive a cflat rebuild (CI rebuilds every
+     * run, and re-harvesting a cold cache is what put test_cpp_interop_template over test.bat's
+     * timeout). The PCH key still folds the build stamp, since a PCH belongs to the clang that
+     * wrote it.
+     */
+    static constexpr int kCHeaderCacheVersion = 77;
     static std::string CompilerBuildStamp();
 
     static std::string GetCHeaderCacheDir();
@@ -9687,6 +9700,15 @@ public:
             double   d; if (t.get(d) == simdjson::SUCCESS) return static_cast<T>(d);
             return defv;
         }
+        // True only when this element is a plain non-negative integer. A cached signature array
+        // mixes baseline indices with inline signature objects, and only an index reads as one.
+        bool as_index(size_t& out) const
+        {
+            uint64_t u;
+            if (!ok || e.get(u) != simdjson::SUCCESS) return false;
+            out = static_cast<size_t>(u);
+            return true;
+        }
         // Converts the canonical array-dimensions field from the simdjson DOM.
         std::vector<uint64_t> to_u64_vector() const
         {
@@ -9729,6 +9751,62 @@ public:
         std::vector<SjVal>::const_iterator end()   const { buildKids(); return kids_.end(); }
     };
 
+    /*
+     * Interns the source path that nearly every cached C header entry repeats verbatim - a header
+     * cache holds hundreds of thousands of entries over fewer than a hundred distinct headers. The
+     * document writes the table once as "files" and each entry stores its index as "fi". A writer
+     * without a table spells the path inline in "f" instead, and the reader accepts both.
+     */
+    struct CCachePathTable
+    {
+        std::vector<std::string> paths;
+        std::unordered_map<std::string, size_t> index;
+
+        size_t Intern(const std::string& path);
+    };
+
+    // The reader side of CCachePathTable: the document's "files" array, resolved by index.
+    using CCachePaths = std::vector<std::string>;
+
+    static void PathToJson(nlohmann::json& j, const std::string& path, CCachePathTable* files);
+    static std::string PathFromJson(const SjVal& j, const CCachePaths* files);
+
+    /*
+     * One shared copy of the signatures that every C++ type request against the same header group
+     * harvests. Each request TU re-parses the group's whole include prologue, so ~97% of what it
+     * harvests is what the previous request harvested; without a baseline every cache entry stores
+     * its own copy of all of it. An entry stores indices into the baseline instead, and only the
+     * signatures it has beyond it.
+     *
+     * A baseline is CONTENT-ADDRESSED by `id` and never rewritten, so a stored index can only ever
+     * resolve to the signature it was written against. An entry naming a baseline that will not
+     * load is a cache miss, never a wrong signature.
+     */
+    struct CSigBaseline
+    {
+        std::string id;
+        CCachePaths paths;
+        std::vector<CSigEntry> sigs;
+        // Writer side only: compact JSON of each signature -> its index. Built on demand, under
+        // the baseline cache mutex, because only a store needs to match against it.
+        std::unordered_map<std::string, size_t> byText;
+        bool byTextBuilt = false;
+    };
+
+    // Identity of the header group an entry's baseline belongs to, as a file-name-safe string.
+    static std::string SigBaselineGroupKey(uint64_t headerHash,
+                                           std::filesystem::file_time_type mtime,
+                                           const std::string& triple,
+                                           const CxxRequestGroup& group);
+    // The baseline for `id`, loaded once per process. Null when it is absent or unreadable.
+    static std::shared_ptr<LLVMBackend::CSigBaseline> LoadSigBaseline(
+        const std::filesystem::path& cacheDir, const std::string& id, bool forWrite);
+    // The baseline a new entry for `groupKey` should encode against, creating one from `sigs` when
+    // the group has none yet. Null when this entry is not worth a baseline.
+    static std::shared_ptr<LLVMBackend::CSigBaseline> AcquireSigBaseline(
+        const std::filesystem::path& cacheDir, const std::string& groupKey,
+        const std::vector<CSigEntry>& sigs);
+
     static nlohmann::json TvToJson(const TypeAndValue& tv);
     static TypeAndValue TvFromJson(const SjVal& j);
 
@@ -9736,11 +9814,12 @@ public:
     static cflat_cinterop::RawAbiSlot AbiSlotFromJson(const SjVal& j);
     static nlohmann::json AbiToJson(const cflat_cinterop::RawAbi& a);
     static cflat_cinterop::RawAbi AbiFromJson(const SjVal& j);
-    static nlohmann::json SigToJson(const CSigEntry& e);
-    static CSigEntry SigFromJson(const SjVal& j);
+    static nlohmann::json SigToJson(const CSigEntry& e, CCachePathTable* files);
+    static CSigEntry SigFromJson(const SjVal& j, const CCachePaths* files);
     static nlohmann::json FunctionTemplateToJson(
-        const cflat_cinterop::RawFunctionTemplate& t);
-    static cflat_cinterop::RawFunctionTemplate FunctionTemplateFromJson(const SjVal& j);
+        const cflat_cinterop::RawFunctionTemplate& t, CCachePathTable* files);
+    static cflat_cinterop::RawFunctionTemplate FunctionTemplateFromJson(
+        const SjVal& j, const CCachePaths* files);
 
     static nlohmann::json EnumToJson(const CEnumEntry& e);
     static CEnumEntry EnumFromJson(const SjVal& j);
@@ -9751,23 +9830,27 @@ public:
     static nlohmann::json FieldToJson(const CRecordFieldEntry& f);
     static CRecordFieldEntry FieldFromJson(const SjVal& j);
 
-    static nlohmann::json CxxMemberToJson(const cflat_cinterop::RawCxxMember& m);
-    static cflat_cinterop::RawCxxMember CxxMemberFromJson(const SjVal& j);
+    static nlohmann::json CxxMemberToJson(
+        const cflat_cinterop::RawCxxMember& m, CCachePathTable* files);
+    static cflat_cinterop::RawCxxMember CxxMemberFromJson(
+        const SjVal& j, const CCachePaths* files);
 
-    static nlohmann::json CxxStaticVarToJson(const cflat_cinterop::RawCxxStaticVar& v);
-    static cflat_cinterop::RawCxxStaticVar CxxStaticVarFromJson(const SjVal& j);
+    static nlohmann::json CxxStaticVarToJson(
+        const cflat_cinterop::RawCxxStaticVar& v, CCachePathTable* files);
+    static cflat_cinterop::RawCxxStaticVar CxxStaticVarFromJson(
+        const SjVal& j, const CCachePaths* files);
 
-    static nlohmann::json RecordToJson(const CRecordEntry& r);
-    static CRecordEntry RecordFromJson(const SjVal& j);
+    static nlohmann::json RecordToJson(const CRecordEntry& r, CCachePathTable* files);
+    static CRecordEntry RecordFromJson(const SjVal& j, const CCachePaths* files);
 
-    static nlohmann::json MacroToJson(const CMacroEntry& m);
-    static CMacroEntry MacroFromJson(const SjVal& j);
+    static nlohmann::json MacroToJson(const CMacroEntry& m, CCachePathTable* files);
+    static CMacroEntry MacroFromJson(const SjVal& j, const CCachePaths* files);
 
-    static nlohmann::json FuncMacroToJson(const CFunctionMacroEntry& m);
-    static CFunctionMacroEntry FuncMacroFromJson(const SjVal& j);
+    static nlohmann::json FuncMacroToJson(const CFunctionMacroEntry& m, CCachePathTable* files);
+    static CFunctionMacroEntry FuncMacroFromJson(const SjVal& j, const CCachePaths* files);
 
-    static nlohmann::json TypeAliasToJson(const CTypeAliasEntry& a);
-    static CTypeAliasEntry TypeAliasFromJson(const SjVal& j);
+    static nlohmann::json TypeAliasToJson(const CTypeAliasEntry& a, CCachePathTable* files);
+    static CTypeAliasEntry TypeAliasFromJson(const SjVal& j, const CCachePaths* files);
 
     static bool CHeaderDepFresh(const CHeaderDep& dep);
 

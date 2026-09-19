@@ -2,18 +2,16 @@
 // opaque shell. Declaring one by value must be a clean diagnostic, not an LLVM
 // module-verification failure.
 //
-// userCLIPFORMAT (wtypes.h) embeds, by value, the MIDL/RPC wire-marshaling union
-// `union __MIDL_IWinTypes_0001 { DWORD dwValue; wchar_t* pwszName; } u;`. That
-// nested tagged union is one of the wtypes.h `__MIDL_IWinTypes_*` family the C
-// interop extractor cannot map, so it stays unsized and the enclosing record is
-// abandoned - exactly the incomplete-layout path this test guards. (The earlier
-// array-of-unnamed-struct case, RETRIEVAL_POINTERS_BUFFER.Extents[1], now imports
-// fine - see Test/test_windows.cb - so this test was repointed at a record that
-// remains genuinely unmappable.)
+// SERVICE_CUSTOM_SYSTEM_STATE_CHANGE_DATA_ITEM (winsvc.h) embeds, by value, an anonymous union
+// whose 'CustomStateId' member (SERVICE_TRIGGER_CUSTOM_STATE_ID) the C interop extractor cannot
+// map, so the union stays unsized and the enclosing record is abandoned - exactly the
+// incomplete-layout path this test guards. (Earlier targets now import fine: the
+// RETRIEVAL_POINTERS_BUFFER.Extents[1] array-of-unnamed-struct case - see Test/test_windows.cb -
+// and userCLIPFORMAT, whose nested MIDL union lays out since records are ordered nested-first.)
 import "windows.h" cache;
 
 extern int main()
 {
     expect_error("is incomplete here (its layout is not available at this point)");
-    userCLIPFORMAT rec = default;
+    SERVICE_CUSTOM_SYSTEM_STATE_CHANGE_DATA_ITEM rec = default;
 }

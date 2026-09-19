@@ -4334,8 +4334,10 @@ static std::string BuildStdFunctionCtorUse(const std::string& cxxSpelling,
         std::string helper = "__cflat_std_function_ctor_";
         for (char c : cxxSpelling)
             helper += std::isalnum((unsigned char)c) ? c : '_';
-        return "extern \"C\" __attribute__((weak)) void " + helper + "(void* m, " + ret
-             + " (*a1)(" + params + ")) { (void)::new (m) " + marker + "(a1); }\n";
+        // Returns 'm': the extractor declares this helper 'void*' with returnsThis
+        // (CClangExtract.cpp), so the emitted definition must carry the same type.
+        return "extern \"C\" __attribute__((weak)) void* " + helper + "(void* m, " + ret
+             + " (*a1)(" + params + ")) { (void)::new (m) " + marker + "(a1); return m; }\n";
 }
 
 /*
@@ -4419,6 +4421,7 @@ std::string LLVMBackend::EnsureCxxRequestPch(const CxxRequestGroup& group,
             if (std::filesystem::exists(path, ec))
             {
                 // Stamp the hit so the age-based prune reads it as live, not abandoned.
+                // Reusing one already on disk is nearly free, so it needs no amortization.
                 resolved = path;
                 std::filesystem::last_write_time(
                     path, std::filesystem::file_time_type::clock::now(), ec);
@@ -4507,16 +4510,34 @@ bool LLVMBackend::RunCxxTypeRequests(const CxxRequestGroup& group,
         // fail the frontend outright, but it can also be error-recovered into an AST where the
         // requested spellings resolve to nothing - the extractor swallows diagnostics, so that
         // reads as success. Treat an empty harvest the same as a hard failure and parse for real.
-        const bool emptyHarvest = ok && !items.empty() && raw.records.empty();
+        // Harvesting no RECORD is not by itself a failed parse: a request whose spelling resolves
+        // to free functions or member signatures alone (the std::function bridge is all of these)
+        // legitimately brings back sigs and no records. Reading that as a broken PCH made every
+        // such request pay a PCH TU and then a full reparse - measured, 289 request TUs where 37
+        // were needed. Only a harvest that brought back NOTHING implicates the PCH.
+        const bool emptyHarvest = ok && !items.empty() && raw.records.empty() && raw.sigs.empty();
         if ((!ok || emptyHarvest) && !pch.empty())
         {
-            DropCxxRequestPch(pch);
-            req.source = BuildCxxRequestIncludes(group) + prefixSource
-                       + BuildCxxRequestMarkers(items, /*instantiateAll*/ !emitDefinitions)
-                       + extraSource;
-            req.args.resize(req.args.size() - 2);
-            raw = cflat_cinterop::ExtractResult();
-            ok = cflat_cinterop::ExtractCInterop(req, raw, error);
+            // Which answer is right is only known AFTER the retry, so the group's shared PCH is
+            // judged on the retry's outcome rather than deleted on suspicion. An empty harvest is
+            // equally the honest answer for a spelling that does not resolve (a dependent
+            // std::chrono::duration<type-parameter-0-0, ...>, say), and dropping the PCH for that
+            // makes every other request in the group re-parse the include prologue.
+            llvm::TimeTraceScope retryScope("CxxRequestPchRetry", group.label);
+            cflat_cinterop::ExtractRequest full = req;
+            full.source = BuildCxxRequestIncludes(group) + prefixSource
+                        + BuildCxxRequestMarkers(items, /*instantiateAll*/ !emitDefinitions)
+                        + extraSource;
+            full.args.resize(full.args.size() - 2);
+            cflat_cinterop::ExtractResult retryRaw;
+            std::string retryError;
+            const bool retryOk = cflat_cinterop::ExtractCInterop(full, retryRaw, retryError);
+            // Only a retry that does strictly better implicates the PCH.
+            if (retryOk && (!ok || !retryRaw.records.empty()))
+                DropCxxRequestPch(pch);
+            raw = std::move(retryRaw);
+            error = std::move(retryError);
+            ok = retryOk;
         }
         return ok;
     }
@@ -4555,7 +4576,11 @@ std::string LLVMBackend::CxxTypeRequestCacheKey(const CxxRequestGroup& group,
         }
         key += std::format("|S{:016x}-{}", sourceHash, requestSource.size());
         for (const auto& arg : clangArgs) key += "|A" + arg;
-        key += "|C" + CompilerBuildStamp();
+        // Schema version, NOT the compiler build stamp: a rebuilt cflat that harvests the same
+        // way must reuse these entries. CI rebuilds on every run, and re-harvesting from cold is
+        // what costs the C++ interop tests their wall clock. kCHeaderCacheVersion is what makes
+        // an incompatible entry miss - bump it whenever the harvest changes.
+        key += "|V" + std::to_string(kCHeaderCacheVersion);
         return key;
     }
 
@@ -5395,12 +5420,16 @@ bool LLVMBackend::RequestGeneratedCxxWrapper(const CxxRequestGroup& group,
                 if (ran && (pch.empty() || wrapperFound())) return ran;
                 if (pch.empty()) return false;
                 // See RunCxxTypeRequests: a PCH may be recovered into an AST that harvests
-                // nothing, so a missing wrapper is retried against the real includes.
-                DropCxxRequestPch(pch);
-                req.source = BuildCxxRequestPrologue(group, {}, false) + wrapperSource;
-                req.args.resize(req.args.size() - 2);
+                // nothing, so a missing wrapper is retried against the real includes - and the
+                // PCH is dropped only if that retry proves the PCH was the reason.
+                cflat_cinterop::ExtractRequest full = req;
+                full.source = BuildCxxRequestPrologue(group, {}, false) + wrapperSource;
+                full.args.resize(full.args.size() - 2);
                 out = cflat_cinterop::ExtractResult();
-                return cflat_cinterop::ExtractCInterop(req, out, runError);
+                const bool retryRan = cflat_cinterop::ExtractCInterop(full, out, runError);
+                if (retryRan && (!ran || wrapperFound()))
+                    DropCxxRequestPch(pch);
+                return retryRan;
             };
             cflat_cinterop::ExtractResult probe;
             std::string probeError;

@@ -1784,6 +1784,34 @@ uint64_t LLVMBackend::CHeaderDiskCacheKey(const std::vector<std::string>& header
         return h;
     }
 
+size_t LLVMBackend::CCachePathTable::Intern(const std::string& path)
+{
+        auto it = index.find(path);
+        if (it != index.end()) return it->second;
+        paths.push_back(path);
+        index.emplace(path, paths.size() - 1);
+        return paths.size() - 1;
+    }
+
+// Stores an entry's source path as a "files" index when the document carries a table, and inline
+// otherwise. PathFromJson is the mirror and reads either spelling.
+void LLVMBackend::PathToJson(nlohmann::json& j, const std::string& path, CCachePathTable* files)
+{
+        if (path.empty()) return;
+        if (files == nullptr) j["f"] = path;
+        else                  j["fi"] = (uint64_t)files->Intern(path);
+    }
+
+std::string LLVMBackend::PathFromJson(const SjVal& j, const CCachePaths* files)
+{
+        if (files != nullptr && j.contains("fi"))
+        {
+            const auto slot = (size_t)j.value("fi", (uint64_t)0);
+            if (slot < files->size()) return (*files)[slot];
+        }
+        return j.value("f", std::string{});
+    }
+
 nlohmann::json LLVMBackend::TvToJson(const TypeAndValue& tv)
 {
         auto s = SerializedTav::From(tv);
@@ -1967,7 +1995,7 @@ cflat_cinterop::RawAbi LLVMBackend::AbiFromJson(const SjVal& j)
         return a;
     }
 
-nlohmann::json LLVMBackend::SigToJson(const CSigEntry& e)
+nlohmann::json LLVMBackend::SigToJson(const CSigEntry& e, CCachePathTable* files)
 {
         nlohmann::json ps = nlohmann::json::array();
         TypeAndValue neutral;
@@ -1980,9 +2008,13 @@ nlohmann::json LLVMBackend::SigToJson(const CSigEntry& e)
         }
         else
             for (const auto& p : e.params) ps.push_back(TvToJson(p));
-        nlohmann::json j = {{"n", e.name}, {"r", TvToJson(e.isCxx ? neutral : e.ret)}, {"ps", ps},
-                            {"va", e.variadic}, {"ln", e.line}, {"co", e.col}};
-        if (!e.file.empty()) j["f"] = e.file;
+        nlohmann::json j = {{"n", e.name}, {"r", TvToJson(e.isCxx ? neutral : e.ret)}, {"ps", ps}};
+        // Everything below is omitted at its SigFromJson default. A header cache holds hundreds of
+        // thousands of signatures, and these four fields sit at their default on nearly all of them.
+        if (e.variadic) j["va"] = true;
+        if (e.line != 1) j["ln"] = e.line;
+        if (e.col != 0)  j["co"] = e.col;
+        PathToJson(j, e.file, files);
         const std::string& refusal = e.isCxx ? e.sourceBindRefusal : e.bindRefusal;
         if (!refusal.empty()) j["br"] = refusal;
         // C++ identity must round-trip: without it a warm cache calls the demangled name and
@@ -1997,18 +2029,40 @@ nlohmann::json LLVMBackend::SigToJson(const CSigEntry& e)
         // Raw parameter spellings: RegisterCSignatures retypes a C++ record-pointer parameter out
         // of void* using these, and a warm cache never sees a clang session to re-derive them.
         if (!e.paramSpellings.empty()) j["pspell"] = e.paramSpellings;
-        if (!e.paramNames.empty()) j["pnames"] = e.paramNames;
+        // paramNames repeats the names already serialized into "ps" for almost every C signature.
+        // Compare against the SERIALIZED slot, so "pnq" means exactly what the reader rebuilds.
+        bool namesMatchSlots = !e.paramNames.empty() && e.paramNames.size() == ps.size();
+        for (size_t i = 0; namesMatchSlots && i < ps.size(); ++i)
+            namesMatchSlots = (ps[i].value("n", std::string{}) == e.paramNames[i]);
+        if (namesMatchSlots)                j["pnq"]    = true;
+        else if (!e.paramNames.empty())     j["pnames"] = e.paramNames;
         if (!e.retSpelling.empty()) j["rspell"] = e.retSpelling;
         if (!e.defaultArgs.empty())
         {
-            nlohmann::json da = nlohmann::json::array();
-            for (const auto& d : e.defaultArgs) da.push_back({{"k", d.kind}, {"v", d.value}});
-            j["defaults"] = da;
+            // The vector is positional and its SIZE is load-bearing (callers gate on
+            // defaultArgs.size() == params.size()), so an all-empty one keeps its length as "nd"
+            // rather than being dropped.
+            bool anyDefault = false;
+            for (const auto& d : e.defaultArgs)
+                if (!d.kind.empty() || !d.value.empty()) { anyDefault = true; break; }
+            if (!anyDefault) j["nd"] = (uint64_t)e.defaultArgs.size();
+            else
+            {
+                nlohmann::json da = nlohmann::json::array();
+                for (const auto& d : e.defaultArgs)
+                {
+                    nlohmann::json one = nlohmann::json::object();
+                    if (!d.kind.empty())  one["k"] = d.kind;
+                    if (!d.value.empty()) one["v"] = d.value;
+                    da.push_back(std::move(one));
+                }
+                j["defaults"] = da;
+            }
         }
         return j;
     }
 
-LLVMBackend::CSigEntry LLVMBackend::SigFromJson(const SjVal& j)
+LLVMBackend::CSigEntry LLVMBackend::SigFromJson(const SjVal& j, const CCachePaths* files)
 {
         CSigEntry e;
         e.name     = j.value("n",  std::string{});
@@ -2017,7 +2071,7 @@ LLVMBackend::CSigEntry LLVMBackend::SigFromJson(const SjVal& j)
         e.linkageName = j.value("lk", std::string{});
         e.isCxx    = j.value("cx", false);
         e.isNoexcept = !j.value("nx", false);
-        e.file     = j.value("f",  std::string{});
+        e.file     = PathFromJson(j, files);
         e.bindRefusal = j.value("br", std::string{});
         e.sourceBindRefusal = e.bindRefusal;
         e.needsCxxRebind = e.isCxx;
@@ -2026,28 +2080,38 @@ LLVMBackend::CSigEntry LLVMBackend::SigFromJson(const SjVal& j)
         if (j.contains("ps")) for (const auto& p : j["ps"]) e.params.push_back(TvFromJson(p));
         if (j.contains("abi")) e.abi = AbiFromJson(j["abi"]);
         if (j.contains("pspell")) e.paramSpellings = j["pspell"].to_string_vector();
-        if (j.contains("pnames")) e.paramNames = j["pnames"].to_string_vector();
+        if (j.value("pnq", false))
+        {
+            if (j.contains("ps"))
+                for (const auto& p : j["ps"]) e.paramNames.push_back(p.value("n", std::string{}));
+        }
+        else if (j.contains("pnames")) e.paramNames = j["pnames"].to_string_vector();
         e.retSpelling = j.value("rspell", std::string{});
         if (j.contains("defaults"))
             for (const auto& d : j["defaults"])
                 e.defaultArgs.push_back({ d.value("k", std::string{}), d.value("v", std::string{}) });
+        else
+            e.defaultArgs.resize((size_t)j.value("nd", (uint64_t)0));
         return e;
     }
 
 nlohmann::json LLVMBackend::FunctionTemplateToJson(
-        const cflat_cinterop::RawFunctionTemplate& t)
+        const cflat_cinterop::RawFunctionTemplate& t, CCachePathTable* files)
 {
-        return { {"n", t.name}, {"o", t.owner}, {"m", t.memberName},
+        nlohmann::json j = { {"n", t.name}, {"o", t.owner}, {"m", t.memberName},
                  {"c", t.cxxSpelling}, {"k", t.kind}, {"mi", t.minArity},
                  {"ma", t.maxArity}, {"tp", t.typeParameterCount}, {"pp", t.hasParameterPack},
                  {"pt", t.parameterTypes},
                  {"tk", t.templateParameterKinds},
                  {"cn", t.isConst},
-                 {"nx", t.isNoexcept}, {"a", t.access}, {"f", t.file},
+                 {"nx", t.isNoexcept}, {"a", t.access},
                  {"ln", t.line}, {"co", t.col} };
+        PathToJson(j, t.file, files);
+        return j;
     }
 
-cflat_cinterop::RawFunctionTemplate LLVMBackend::FunctionTemplateFromJson(const SjVal& j)
+cflat_cinterop::RawFunctionTemplate LLVMBackend::FunctionTemplateFromJson(
+        const SjVal& j, const CCachePaths* files)
 {
         cflat_cinterop::RawFunctionTemplate t;
         t.name = j.value("n", std::string{});
@@ -2064,7 +2128,7 @@ cflat_cinterop::RawFunctionTemplate LLVMBackend::FunctionTemplateFromJson(const 
         t.isConst = j.value("cn", false);
         t.isNoexcept = j.value("nx", false);
         t.access = j.value("a", 0);
-        t.file = j.value("f", std::string{});
+        t.file = PathFromJson(j, files);
         t.line = j.value("ln", 1);
         t.col = j.value("co", 0);
         return t;
@@ -2170,13 +2234,14 @@ LLVMBackend::CRecordFieldEntry LLVMBackend::FieldFromJson(const SjVal& j)
  * field here is read by an analysis (access control, triviality, deleted/defaulted status, the
  * structor tables), so all of it must round-trip or a warm cache silently loses the class.
  */
-nlohmann::json LLVMBackend::CxxMemberToJson(const cflat_cinterop::RawCxxMember& m)
+nlohmann::json LLVMBackend::CxxMemberToJson(
+        const cflat_cinterop::RawCxxMember& m, CCachePathTable* files)
 {
         nlohmann::json j = {{"k", m.kind}, {"n", m.name}, {"rt", m.retType},
                             {"pt", m.paramTypes}, {"pn", m.paramNames},
                             {"ln", m.line}, {"co", m.col}};
         if (!m.linkageName.empty()) j["lk"] = m.linkageName;
-        if (!m.file.empty())        j["f"]  = m.file;
+        PathToJson(j, m.file, files);
         if (m.variadic)             j["va"] = true;
         if (m.requiresConstructorWrapper) j["cw"] = true;
         if (m.isConst)              j["cn"] = true;
@@ -2216,14 +2281,15 @@ nlohmann::json LLVMBackend::CxxMemberToJson(const cflat_cinterop::RawCxxMember& 
         return j;
     }
 
-cflat_cinterop::RawCxxMember LLVMBackend::CxxMemberFromJson(const SjVal& j)
+cflat_cinterop::RawCxxMember LLVMBackend::CxxMemberFromJson(
+        const SjVal& j, const CCachePaths* files)
 {
         cflat_cinterop::RawCxxMember m;
         m.kind        = j.value("k", 0);
         m.name        = j.value("n", std::string{});
         m.retType     = j.value("rt", std::string{});
         m.linkageName = j.value("lk", std::string{});
-        m.file        = j.value("f", std::string{});
+        m.file        = PathFromJson(j, files);
         m.line        = j.value("ln", 1);
         m.col         = j.value("co", 0);
         if (j.contains("pt")) m.paramTypes = j["pt"].to_string_vector();
@@ -2262,7 +2328,8 @@ cflat_cinterop::RawCxxMember LLVMBackend::CxxMemberFromJson(const SjVal& j)
         return m;
     }
 
-nlohmann::json LLVMBackend::CxxStaticVarToJson(const cflat_cinterop::RawCxxStaticVar& v)
+nlohmann::json LLVMBackend::CxxStaticVarToJson(
+        const cflat_cinterop::RawCxxStaticVar& v, CCachePathTable* files)
 {
         nlohmann::json j = {{"n", v.name}, {"ct", v.ctype}, {"lk", v.linkageName},
                             {"ln", v.line}, {"co", v.col}};
@@ -2279,12 +2346,13 @@ nlohmann::json LLVMBackend::CxxStaticVarToJson(const cflat_cinterop::RawCxxStati
             else
                 j["cv"] = v.constantValue;
         }
-        if (!v.file.empty()) j["f"] = v.file;
+        PathToJson(j, v.file, files);
         if (v.access != 0)   j["ac"] = v.access;
         return j;
     }
 
-cflat_cinterop::RawCxxStaticVar LLVMBackend::CxxStaticVarFromJson(const SjVal& j)
+cflat_cinterop::RawCxxStaticVar LLVMBackend::CxxStaticVarFromJson(
+        const SjVal& j, const CCachePaths* files)
 {
         cflat_cinterop::RawCxxStaticVar v;
         v.name        = j.value("n", std::string{});
@@ -2298,20 +2366,20 @@ cflat_cinterop::RawCxxStaticVar LLVMBackend::CxxStaticVarFromJson(const SjVal& j
             std::memcpy(&v.floatValue, &fvbits, sizeof(double));
         }
         v.constantValue = j.value("cv", (int64_t)0);
-        v.file        = j.value("f", std::string{});
+        v.file        = PathFromJson(j, files);
         v.line        = j.value("ln", 1);
         v.col         = j.value("co", 0);
         v.access      = j.value("ac", 0);
         return v;
     }
 
-nlohmann::json LLVMBackend::RecordToJson(const CRecordEntry& r)
+nlohmann::json LLVMBackend::RecordToJson(const CRecordEntry& r, CCachePathTable* files)
 {
         nlohmann::json fs = nlohmann::json::array();
         for (const auto& f : r.fields) fs.push_back(FieldToJson(f));
         nlohmann::json j = {{"n", r.name}, {"fs", fs}, {"ln", r.line}, {"co", r.col}};
         if (!r.qualifiedName.empty()) j["qn"] = r.qualifiedName;
-        if (!r.file.empty()) j["f"] = r.file;
+        PathToJson(j, r.file, files);
         if (!r.inScope) j["sc"] = false;
         if (r.isUnion) j["u"] = true;
         if (!r.uuid.empty()) j["id"] = r.uuid;
@@ -2360,19 +2428,19 @@ nlohmann::json LLVMBackend::RecordToJson(const CRecordEntry& r)
         if (!r.members.empty())
         {
             nlohmann::json ms = nlohmann::json::array();
-            for (const auto& m : r.members) ms.push_back(CxxMemberToJson(m));
+            for (const auto& m : r.members) ms.push_back(CxxMemberToJson(m, files));
             j["mb"] = ms;
         }
         if (!r.staticVars.empty())
         {
             nlohmann::json vs = nlohmann::json::array();
-            for (const auto& v : r.staticVars) vs.push_back(CxxStaticVarToJson(v));
+            for (const auto& v : r.staticVars) vs.push_back(CxxStaticVarToJson(v, files));
             j["sv"] = vs;
         }
         return j;
     }
 
-LLVMBackend::CRecordEntry LLVMBackend::RecordFromJson(const SjVal& j)
+LLVMBackend::CRecordEntry LLVMBackend::RecordFromJson(const SjVal& j, const CCachePaths* files)
 {
         CRecordEntry r;
         r.name    = j.value("n", std::string{});
@@ -2380,7 +2448,7 @@ LLVMBackend::CRecordEntry LLVMBackend::RecordFromJson(const SjVal& j)
         r.line    = j.value("ln", 1);
         r.col     = j.value("co", 0);
         r.qualifiedName = j.value("qn", std::string{});
-        r.file   = j.value("f", std::string{});
+        r.file   = PathFromJson(j, files);
         r.inScope = j.value("sc", true);
         r.uuid    = j.value("id", std::string{});
         r.isCxx    = j.value("cx", false);
@@ -2415,16 +2483,17 @@ LLVMBackend::CRecordEntry LLVMBackend::RecordFromJson(const SjVal& j)
                 rb.isVirtual   = b.value("vi", false);
                 r.bases.push_back(std::move(rb));
             }
-        if (j.contains("mb")) for (const auto& m : j["mb"]) r.members.push_back(CxxMemberFromJson(m));
-        if (j.contains("sv")) for (const auto& v : j["sv"]) r.staticVars.push_back(CxxStaticVarFromJson(v));
+        if (j.contains("mb")) for (const auto& m : j["mb"]) r.members.push_back(CxxMemberFromJson(m, files));
+        if (j.contains("sv")) for (const auto& v : j["sv"]) r.staticVars.push_back(CxxStaticVarFromJson(v, files));
         if (j.contains("fs")) for (const auto& f : j["fs"]) r.fields.push_back(FieldFromJson(f));
         return r;
     }
 
-nlohmann::json LLVMBackend::MacroToJson(const CMacroEntry& m)
+nlohmann::json LLVMBackend::MacroToJson(const CMacroEntry& m, CCachePathTable* files)
 {
-        nlohmann::json j = {{"n", m.name}, {"v", m.value}, {"f", m.file},
+        nlohmann::json j = {{"n", m.name}, {"v", m.value},
                             {"ln", m.line}, {"co", m.col}};
+        PathToJson(j, m.file, files);
         if (m.isPointer) j["isp"]  = true;
         // Store the float as its raw IEEE-754 bit pattern, not as a JSON number:
         // nlohmann serializes inf/NaN as JSON `null` (math.h's INFINITY/NAN/HUGE_VAL),
@@ -2442,12 +2511,12 @@ nlohmann::json LLVMBackend::MacroToJson(const CMacroEntry& m)
         return j;
     }
 
-LLVMBackend::CMacroEntry LLVMBackend::MacroFromJson(const SjVal& j)
+LLVMBackend::CMacroEntry LLVMBackend::MacroFromJson(const SjVal& j, const CCachePaths* files)
 {
         CMacroEntry m;
         m.name      = j.value("n",   std::string{});
         m.value     = j.value("v",   0LL);
-        m.file      = j.value("f",   std::string{});
+        m.file      = PathFromJson(j, files);
         m.line      = j.value("ln",  1);
         m.col       = j.value("co",  0);
         m.isPointer = j.value("isp", false);
@@ -2466,40 +2535,44 @@ LLVMBackend::CMacroEntry LLVMBackend::MacroFromJson(const SjVal& j)
         return m;
     }
 
-nlohmann::json LLVMBackend::FuncMacroToJson(const CFunctionMacroEntry& m)
+nlohmann::json LLVMBackend::FuncMacroToJson(const CFunctionMacroEntry& m, CCachePathTable* files)
 {
-        return {{"n", m.name}, {"ps", m.params}, {"b", m.body},
-                {"f", m.file}, {"ln", m.line},   {"co", m.col}};
+        nlohmann::json j = {{"n", m.name}, {"ps", m.params}, {"b", m.body},
+                            {"ln", m.line}, {"co", m.col}};
+        PathToJson(j, m.file, files);
+        return j;
     }
 
-LLVMBackend::CFunctionMacroEntry LLVMBackend::FuncMacroFromJson(const SjVal& j)
+LLVMBackend::CFunctionMacroEntry LLVMBackend::FuncMacroFromJson(const SjVal& j, const CCachePaths* files)
 {
         CFunctionMacroEntry m;
         m.name = j.value("n",  std::string{});
         m.body = j.value("b",  std::string{});
-        m.file = j.value("f",  std::string{});
+        m.file = PathFromJson(j, files);
         m.line = j.value("ln", 1);
         m.col  = j.value("co", 0);
         if (j.contains("ps")) m.params = j["ps"].to_string_vector();
         return m;
     }
 
-nlohmann::json LLVMBackend::TypeAliasToJson(const CTypeAliasEntry& a)
+nlohmann::json LLVMBackend::TypeAliasToJson(const CTypeAliasEntry& a, CCachePathTable* files)
 {
-        return {{"n", a.name}, {"t", a.target}, {"f", a.file},
+        nlohmann::json j = {{"n", a.name}, {"t", a.target},
                 {"ln", a.line}, {"co", a.col}, {"ar", a.isAnonymousRecord},
                 {"qn", a.qualifiedName}, {"cs", a.cxxSpecialization},
                 {"iat", a.isCxxAliasTemplate}, {"cap", a.cxxAliasPattern},
                 {"can", a.cxxAliasParams}, {"catb", a.cxxAliasTargetBase},
                 {"caa", a.cxxAliasArgs}, {"cad", a.cxxAliasParamDefaults}};
+        PathToJson(j, a.file, files);
+        return j;
     }
 
-LLVMBackend::CTypeAliasEntry LLVMBackend::TypeAliasFromJson(const SjVal& j)
+LLVMBackend::CTypeAliasEntry LLVMBackend::TypeAliasFromJson(const SjVal& j, const CCachePaths* files)
 {
         CTypeAliasEntry a;
         a.name = j.value("n", std::string{});
         a.target = j.value("t", std::string{});
-        a.file = j.value("f", std::string{});
+        a.file = PathFromJson(j, files);
         a.line = j.value("ln", 1);
         a.col = j.value("co", 0);
         a.isAnonymousRecord = j.value("ar", false);
@@ -2670,7 +2743,11 @@ bool LLVMBackend::TryLoadCHeaderDiskCache(
         // operator over a class template (every libc++ basic_string operator) finds no candidate.
         // v76 widens `xpl` to a CONVERSION operator as well as a constructor: a v75 cache
         // carries it as false for a conversion, so an explicit one would convert implicitly.
-        if (version != 76) return cacheMiss("cache version");
+        // v77 shrinks the payload: source paths are interned into a per-document "files" table
+        // ("fi"), a signature omits every field sitting at its default, and a C++ type request
+        // stores most of its signatures as indices into a shared baseline ("sb"). A v76 entry
+        // spells all of it out and has no baseline to resolve against.
+        if (version != kCHeaderCacheVersion) return cacheMiss("cache version");
 
         if (!expectedRequestKey.empty()
             && j.value("cxxRequestKey", std::string{}) != expectedRequestKey)
@@ -2694,23 +2771,47 @@ bool LLVMBackend::TryLoadCHeaderDiskCache(
         // DOM walk -> structs (plus deep-mode deps freshness check). Distinct from the parse
         // span above so the allocation-bound conversion cost can be tracked separately.
         llvm::TimeTraceScope convertScope("CHeaderJsonConvert", cachePath.string());
+        // Signatures this entry shares with every other request against the same header group are
+        // held once in its baseline; the entry stores their indices. A baseline that will not load
+        // is a miss, because the indices name nothing.
+        std::shared_ptr<CSigBaseline> baseline;
+        if (j.contains("sb"))
+        {
+            baseline = LoadSigBaseline(cacheDir, j.value("sb", std::string{}), /*forWrite*/ false);
+            if (baseline == nullptr) return cacheMiss("signature baseline");
+        }
+        // Source paths are interned into one "files" table per document; a document written
+        // before the table existed has none, and every entry then spells its path inline.
+        CCachePaths pathTable;
+        if (baseline != nullptr) pathTable = baseline->paths;
+        if (j.contains("files"))
+            for (auto& p : j["files"].to_string_vector()) pathTable.push_back(std::move(p));
+        const CCachePaths* files = pathTable.empty() ? nullptr : &pathTable;
         try
         {
-            if (j.contains("sigs"))       for (const auto& s : j["sigs"])       entry.sigs.push_back(SigFromJson(s));
+            if (j.contains("sigs"))
+                for (const auto& s : j["sigs"])
+                {
+                    size_t slot = 0;
+                    if (!s.as_index(slot)) { entry.sigs.push_back(SigFromJson(s, files)); continue; }
+                    if (baseline == nullptr || slot >= baseline->sigs.size())
+                        return cacheMiss("signature baseline index");
+                    entry.sigs.push_back(baseline->sigs[slot]);
+                }
             if (j.contains("functionTemplates"))
                 for (const auto& t : j["functionTemplates"])
-                    entry.functionTemplates.push_back(FunctionTemplateFromJson(t));
+                    entry.functionTemplates.push_back(FunctionTemplateFromJson(t, files));
             if (j.contains("enums"))      for (const auto& e : j["enums"])      entry.enums.push_back(EnumFromJson(e));
-            if (j.contains("records"))    for (const auto& r : j["records"])    entry.records.push_back(RecordFromJson(r));
-            if (j.contains("macros"))     for (const auto& m : j["macros"])     entry.macros.push_back(MacroFromJson(m));
-            if (j.contains("funcMacros")) for (const auto& m : j["funcMacros"]) entry.funcMacros.push_back(FuncMacroFromJson(m));
+            if (j.contains("records"))    for (const auto& r : j["records"])    entry.records.push_back(RecordFromJson(r, files));
+            if (j.contains("macros"))     for (const auto& m : j["macros"])     entry.macros.push_back(MacroFromJson(m, files));
+            if (j.contains("funcMacros")) for (const auto& m : j["funcMacros"]) entry.funcMacros.push_back(FuncMacroFromJson(m, files));
             if (j.contains("globals"))    for (const auto& g : j["globals"])    entry.globals.push_back(GlobalFromJson(g));
             if (j.contains("recordAliases"))
                 for (const auto& a : j["recordAliases"])
                     entry.recordAliases.emplace_back(a.value("a", std::string{}), a.value("t", std::string{}));
             if (j.contains("typeAliases"))
                 for (const auto& a : j["typeAliases"])
-                    entry.typeAliases.push_back(TypeAliasFromJson(a));
+                    entry.typeAliases.push_back(TypeAliasFromJson(a, files));
             if (j.contains("usingDirectives"))
                 for (const auto& d : j["usingDirectives"])
                     entry.usingDirectives.emplace_back(
@@ -2883,6 +2984,152 @@ void LLVMBackend::StoreCxxTemplateOwnerMemo(const std::string& cxxBase, size_t g
         if (ec) fs::remove(temp, ec);
     }
 
+// Guards the process-wide baseline cache below. A baseline is immutable once written, so one
+// loaded copy is shared by every entry that names it.
+static std::mutex gSigBaselineMutex;
+
+// 64-bit FNV-1a, spelled as the surrounding cache keys already spell it.
+static uint64_t SigBaselineHash(const std::string& text)
+{
+        uint64_t h = 14695981039346656037ULL;
+        for (unsigned char byte : text)
+        {
+            h ^= byte;
+            h *= 1099511628211ULL;
+        }
+        return h;
+    }
+
+std::string LLVMBackend::SigBaselineGroupKey(uint64_t headerHash,
+                                             std::filesystem::file_time_type mtime,
+                                             const std::string& triple,
+                                             const CxxRequestGroup& group)
+{
+        std::string key = std::format("{:016x}|{}|{}|{}", headerHash,
+                                      (long long)mtime.time_since_epoch().count(), triple,
+                                      kCHeaderCacheVersion);
+        for (const auto& h : group.headers) key += "|H" + h;
+        for (const auto& d : group.defines) key += "|D" + d;
+        return std::format("{:016x}", SigBaselineHash(key));
+    }
+
+std::shared_ptr<LLVMBackend::CSigBaseline> LLVMBackend::LoadSigBaseline(
+        const std::filesystem::path& cacheDir, const std::string& id, bool forWrite)
+{
+        // Only a successful load is memoized. A failed one must stay re-probeable: this process
+        // may be the one that goes on to write that very baseline.
+        static std::unordered_map<std::string, std::shared_ptr<CSigBaseline>> loaded;
+        if (id.empty()) return nullptr;
+        std::lock_guard<std::mutex> lock(gSigBaselineMutex);
+        auto it = loaded.find(id);
+        if (it == loaded.end())
+        {
+            std::shared_ptr<CSigBaseline> built;
+            const auto path = cacheDir / std::format("sigbase.{}.json", id);
+            simdjson::dom::parser parser;
+            auto text = simdjson::padded_string::load(path.string());
+            simdjson::dom::element doc;
+            if (!text.error() && parser.parse(text.value()).get(doc) == simdjson::SUCCESS)
+            {
+                SjVal j{doc};
+                built = std::make_shared<CSigBaseline>();
+                built->id = id;
+                built->paths = j["files"].to_string_vector();
+                const CCachePaths* files = built->paths.empty() ? nullptr : &built->paths;
+                try
+                {
+                    for (const auto& s : j["sigs"]) built->sigs.push_back(SigFromJson(s, files));
+                }
+                catch (...)
+                {
+                    built.reset();
+                }
+            }
+            if (built == nullptr) return nullptr;
+            it = loaded.emplace(id, std::move(built)).first;
+        }
+        std::shared_ptr<CSigBaseline> found = it->second;
+        if (found != nullptr && forWrite && !found->byTextBuilt)
+        {
+            // Match by the exact bytes a store would write. Seeding the table from the baseline's
+            // own paths is what makes an unchanged signature serialize identically in both.
+            CCachePathTable table;
+            for (const auto& p : found->paths) table.Intern(p);
+            for (size_t i = 0; i < found->sigs.size(); ++i)
+                found->byText.emplace(SigToJson(found->sigs[i], &table).dump(), i);
+            found->byTextBuilt = true;
+        }
+        return found;
+    }
+
+/*
+ * A group's first sizeable entry becomes its baseline and every later one encodes against it. The
+ * pointer file is only a hint - a baseline is named by its content, so a stale or racing pointer
+ * costs a larger entry, never a wrong signature. A much larger harvest replaces the pointer, which
+ * leaves entries already written against the old baseline resolving exactly as before: the group's
+ * first entry may have been a small member request, and a baseline that covers little saves little.
+ */
+std::shared_ptr<LLVMBackend::CSigBaseline> LLVMBackend::AcquireSigBaseline(
+        const std::filesystem::path& cacheDir, const std::string& groupKey,
+        const std::vector<CSigEntry>& sigs)
+{
+        namespace fs = std::filesystem;
+        // Below this an entry is cheaper to store whole than to describe against a baseline.
+        static constexpr size_t kMinBaselineSigs = 64;
+        if (groupKey.empty() || sigs.size() < kMinBaselineSigs) return nullptr;
+
+        std::error_code ec;
+        const auto pointerPath = cacheDir / std::format("sigbase.{}.ptr", groupKey);
+        {
+            std::ifstream pointer(pointerPath, std::ios::binary);
+            std::string id;
+            if (pointer.is_open() && std::getline(pointer, id) && !id.empty())
+            {
+                auto existing = LoadSigBaseline(cacheDir, id, /*forWrite*/ true);
+                // A far richer harvest promotes itself over the one that got here first.
+                if (existing != nullptr && sigs.size() <= existing->sigs.size() * 2)
+                    return existing;
+            }
+        }
+
+        CCachePathTable files;
+        nlohmann::json body = nlohmann::json::array();
+        for (const auto& s : sigs) body.push_back(SigToJson(s, &files));
+        nlohmann::json doc;
+        doc["files"] = files.paths;
+        doc["sigs"]  = body;
+        const std::string text = doc.dump();
+        const std::string id = std::format("{:016x}", SigBaselineHash(text));
+        const auto path = cacheDir / std::format("sigbase.{}.json", id);
+        if (!fs::exists(path, ec))
+        {
+            const auto temp = cacheDir / std::format("sigbase.{}.{}.tmp", id, _getpid());
+            {
+                std::ofstream out(temp, std::ios::binary | std::ios::trunc);
+                if (!out.is_open()) return nullptr;
+                out << text;
+                out.close();
+                if (!out) { fs::remove(temp, ec); return nullptr; }
+            }
+            ec.clear();
+            fs::rename(temp, path, ec);
+            if (ec) { ec.clear(); fs::remove(temp, ec); }
+        }
+        {
+            const auto temp = cacheDir / std::format("sigbase.{}.{}.ptr.tmp", groupKey, _getpid());
+            std::ofstream out(temp, std::ios::binary | std::ios::trunc);
+            if (out.is_open())
+            {
+                out << id;
+                out.close();
+                ec.clear();
+                fs::rename(temp, pointerPath, ec);
+                if (ec) { ec.clear(); fs::remove(temp, ec); }
+            }
+        }
+        return LoadSigBaseline(cacheDir, id, /*forWrite*/ true);
+    }
+
 void LLVMBackend::WriteCHeaderDiskCache(
         const std::filesystem::path& cacheDir,
         uint64_t diskKey,
@@ -2905,7 +3152,9 @@ void LLVMBackend::WriteCHeaderDiskCache(
         // v73 records an alias template's target base, argument pattern and parameter defaults
         // (catb/caa/cad). v74 publishes FREE BINARY OPERATOR templates.
         // v76 records `explicit` on a C++ conversion operator too (xpl).
-        j["version"] = 76;
+        // v77 interns source paths into "files", drops defaulted signature fields, and stores a
+        // type request's shared signatures once in a baseline ("sb") instead of per entry.
+        j["version"] = kCHeaderCacheVersion;
         j["mtime"]   = (int64_t)mtime.time_since_epoch().count();
         j["hash"]    = contentHash;
         j["ldw"]     = entry.longDoubleWidth;
@@ -2918,24 +3167,56 @@ void LLVMBackend::WriteCHeaderDiskCache(
             j["cxxRequestDefines"] = requestGroup->defines;
         }
 
+        // Every entry below stores its source path as an index into this table rather than
+        // repeating the path itself; "files" is written once the last of them has interned.
+        // A baseline seeds the table with its own paths so an unchanged signature serializes to
+        // the same bytes here as it did there; only the paths beyond them are written out.
+        CCachePathTable files;
+        std::shared_ptr<CSigBaseline> baseline;
+        if (requestGroup != nullptr)
+            baseline = AcquireSigBaseline(
+                cacheDir, SigBaselineGroupKey(contentHash, mtime, entry.targetTriple, *requestGroup),
+                entry.sigs);
+        if (baseline != nullptr)
+        {
+            j["sb"] = baseline->id;
+            for (const auto& p : baseline->paths) files.Intern(p);
+        }
+        const size_t sharedPathCount = files.paths.size();
+
+        // Each signature stores either its index in the baseline or, when the baseline does not
+        // have it, the signature itself. Order is preserved exactly: replay depends on it.
         nlohmann::json sigs = nlohmann::json::array();
-        for (const auto& s : entry.sigs) sigs.push_back(SigToJson(s));
+        for (const auto& s : entry.sigs)
+        {
+            nlohmann::json one = SigToJson(s, &files);
+            if (baseline != nullptr)
+            {
+                auto hit = baseline->byText.find(one.dump());
+                if (hit != baseline->byText.end())
+                {
+                    sigs.push_back(hit->second);
+                    continue;
+                }
+            }
+            sigs.push_back(std::move(one));
+        }
         j["sigs"] = sigs;
         nlohmann::json functionTemplates = nlohmann::json::array();
         for (const auto& t : entry.functionTemplates)
-            functionTemplates.push_back(FunctionTemplateToJson(t));
+            functionTemplates.push_back(FunctionTemplateToJson(t, &files));
         j["functionTemplates"] = functionTemplates;
         nlohmann::json enums = nlohmann::json::array();
         for (const auto& e : entry.enums) enums.push_back(EnumToJson(e));
         j["enums"] = enums;
         nlohmann::json records = nlohmann::json::array();
-        for (const auto& r : entry.records) records.push_back(RecordToJson(r));
+        for (const auto& r : entry.records) records.push_back(RecordToJson(r, &files));
         j["records"] = records;
         nlohmann::json macros = nlohmann::json::array();
-        for (const auto& m : entry.macros) macros.push_back(MacroToJson(m));
+        for (const auto& m : entry.macros) macros.push_back(MacroToJson(m, &files));
         j["macros"] = macros;
         nlohmann::json funcMacros = nlohmann::json::array();
-        for (const auto& m : entry.funcMacros) funcMacros.push_back(FuncMacroToJson(m));
+        for (const auto& m : entry.funcMacros) funcMacros.push_back(FuncMacroToJson(m, &files));
         j["funcMacros"] = funcMacros;
         nlohmann::json globals = nlohmann::json::array();
         for (const auto& g : entry.globals) globals.push_back(GlobalToJson(g));
@@ -2946,7 +3227,7 @@ void LLVMBackend::WriteCHeaderDiskCache(
         j["recordAliases"] = recordAliases;
         nlohmann::json typeAliases = nlohmann::json::array();
         for (const auto& a : entry.typeAliases)
-            typeAliases.push_back(TypeAliasToJson(a));
+            typeAliases.push_back(TypeAliasToJson(a, &files));
         j["typeAliases"] = typeAliases;
         nlohmann::json usingDirectives = nlohmann::json::array();
         for (const auto& d : entry.usingDirectives)
@@ -2961,6 +3242,10 @@ void LLVMBackend::WriteCHeaderDiskCache(
             functionPointerAbis.push_back({{"sig", p.signature}, {"rt", p.retType},
                                            {"pt", p.paramTypes}, {"abi", AbiToJson(p.abi)}});
         j["functionPointerAbis"] = functionPointerAbis;
+        // Only the paths this entry added: the reader rebuilds the table as the baseline's paths
+        // followed by these, which is the order they were interned in.
+        j["files"] = std::vector<std::string>(files.paths.begin() + sharedPathCount,
+                                              files.paths.end());
 
         auto tmpPath  = cacheDir / std::format("{:016x}.{}.tmp", diskKey, _getpid());
         auto destPath = cacheDir / std::format("{:016x}.json", diskKey);

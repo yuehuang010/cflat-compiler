@@ -1172,9 +1172,10 @@ std::vector<LLVMBackend::DeclTypeAndValue> LLVMBackend::PackBitfields(
             out.push_back(storage);
 
             // Greedily attach bitfields that fit. Itanium ignores declared type changes,
-            // and its allocation unit grows to the widest participating base type.
+            // and its allocation unit grows to the widest participating base type. MSVC
+            // closes the unit only when the declared type SIZE changes (int/unsigned share).
             while (i < in.size() && in[i].IsBitfield
-                   && (itaniumPacking || in[i].TypeName == cur.TypeName))
+                   && (itaniumPacking || BitfieldStorageBits(in[i].TypeName) == storageBits))
             {
                 const auto& bf = in[i];
                 if (bf.BitWidth == 0)
