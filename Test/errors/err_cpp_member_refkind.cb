@@ -1,0 +1,43 @@
+// C++ member and free reference parameters follow C++ value-category binding rules.
+import cpp "cpp_interop_ctorref.h";
+
+extern int main()
+{
+    expect_error("parameter 'x' of 'member_l' is a non-const lvalue reference") {
+        cppcr.RefKindScalarApi api = default;
+        api.member_l(5);
+    }
+    expect_error("parameter 'x' of 'cppcr.RefKindScalarApi.static_l' is a non-const lvalue reference") {
+        cppcr.RefKindScalarApi.static_l(5);
+    }
+    expect_error("parameter 'x' of 'cppcr.refkind_int_l' is a non-const lvalue reference") {
+        cppcr.refkind_int_l(5);
+    }
+    // Arithmetic, a by-VALUE call result and a conversion are rvalues: none has an address
+    // the callee could write through, so each is refused by the same rule as the literal.
+    expect_error("parameter 'x' of 'member_l' is a non-const lvalue reference") {
+        cppcr.RefKindScalarApi api = default;
+        int a = 1;
+        api.member_l(a + 1);
+    }
+    expect_error("parameter 'x' of 'cppcr.RefKindScalarApi.static_l' is a non-const lvalue reference") {
+        cppcr.RefKindScalarApi.static_l(cppcr.make_int(3));
+    }
+    expect_error("parameter 'x' of 'cppcr.refkind_int_l' is a non-const lvalue reference") {
+        short s = 4;
+        cppcr.refkind_int_l((int)s);
+    }
+    // `move p` does not excuse a pointer-depth mismatch at a C++ rvalue reference.
+    expect_error("one fewer level of indirection") {
+        int v = 1;
+        int* p1 = &v;
+        cppcr.refkind_ptrptr_r(move p1);
+    }
+    expect_error("no overload of 'cppcr.refkind_ptr_r' matches") {
+        int v = 1;
+        int* p1 = &v;
+        int** p2 = &p1;
+        cppcr.refkind_ptr_r(move p2);
+    }
+    return 0;
+}

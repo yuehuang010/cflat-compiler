@@ -74,6 +74,7 @@ struct Mem { int bump(Cnt& c) { c.v += 1000; return c.v; } };
 
 inline Cnt make_cnt(int v) { Cnt c; c.v = v; return c; }
 inline int make_int(int v) { return v; }
+inline int* make_ptr(int* p) { return p; }
 inline std::string make_string() { return std::string("call"); }
 
 struct RRefPair {
@@ -123,5 +124,33 @@ struct RefBox {
     RefBox() : v(0) {}
     int& ref() { return v; }
 };
+
+struct RefKindPtrApi {
+    int member_c(int* const& p) const { return p == nullptr ? 100 : *p + 100; }
+    int member_r(int*&& p) const { if (p != nullptr) *p += 10; return p == nullptr ? 200 : *p + 200; }
+    static int static_c(int* const& p) { return p == nullptr ? 100 : *p + 100; }
+    static int static_r(int*&& p) { if (p != nullptr) *p += 10; return p == nullptr ? 200 : *p + 200; }
+};
+
+inline int refkind_ptr_r(int*&& p)
+{
+    if (p != nullptr) *p += 10;
+    return p == nullptr ? 200 : *p + 200;
+}
+
+inline int refkind_ptrptr_r(int**&& p)
+{
+    return p == nullptr || *p == nullptr ? 300 : **p + 300;
+}
+
+struct RefKindScalarApi {
+    int member_l(int& x) const { return ++x; }
+    int member_r(int&& x) const { return x + 200; }
+    static int static_l(int& x) { return ++x; }
+    static int static_r(int&& x) { return x + 200; }
+};
+
+inline int refkind_int_l(int& x) { return ++x; }
+inline int refkind_int_r(int&& x) { return x + 200; }
 
 }

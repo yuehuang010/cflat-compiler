@@ -722,6 +722,10 @@
       "p",
       "move"
     ],
+    "parameterarg0ofarg1i...anrvaluepassanlvalueec25f7364020bcfb": [
+      "x",
+      "member_l"
+    ],
     "parameterarg0ofarg1i...smoveargoratemporarydf5863f826e239c2": [
       "t",
       "cppi.take_rvalue"
@@ -1983,6 +1987,7 @@
     "overrideisonlyvalidi...acppstructwithacbasee727ca8dc9a88350": "'override' is only valid in a [cpp] struct with a C++ base",
     "overridesarg0arg1whichisfinal": "overrides '{0}.{1}' which is final",
     "parameterarg0cannotp...toftheirsourcesscope0c92f2fcfe931fdb": "parameter '{0}': cannot pass bonded value to '{1}' parameter - bonded values cannot be transferred out of their source's scope",
+    "parameterarg0ofarg1i...anrvaluepassanlvalueec25f7364020bcfb": "parameter '{0}' of '{1}' is a non-const lvalue reference and cannot bind an rvalue; pass an lvalue",
     "parameterarg0ofarg1i...smoveargoratemporarydf5863f826e239c2": "parameter '{0}' of '{1}' is an rvalue reference; pass 'move <arg>' or a temporary",
     "programdefinitionsrequireatrailing": "program definitions require a trailing ';'",
     "redefinitionofarg0th...areoneoverloadnottwod3edf872df7d2d1d": "redefinition of '{0}' - the same overload is already defined at {1}({2}). Two parameter lists that differ only in a SPELLING of one type ('int' and 'i32' name the same type) are one overload, not two.",

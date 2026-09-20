@@ -6979,7 +6979,7 @@ public:
     // Address handed to a non-pointer `alias T` parameter: the caller's own slot when the
     // shapes match exactly, otherwise a materialized temp (a converted value has no slot).
     llvm::Value* LowerAliasByPointerArg(const NamedVariable& arg, const TypeAndValue& param);
-    llvm::Value* LowerRvalueRefArg(const NamedVariable& arg, const TypeAndValue& param);
+    llvm::Value* LowerRvalueRefArg(const NamedVariable& arg, const TypeAndValue& param, bool cxxCallee = false);
 
     /*
      * Is this argument PROVABLY unusable for this parameter? Deliberately one-sided, and NOT
@@ -8212,6 +8212,12 @@ public:
      */
     int ScoreMoveAgreement(const std::vector<NamedVariable>& arguments, const FunctionSymbol& candidate) const;
     bool IsRvalueReferenceArgument(const NamedVariable& arg) const;
+    std::string CxxReferenceParameterSpelling(const FunctionSymbol& candidate, size_t index) const;
+    bool IsCxxReferenceParameter(const FunctionSymbol& candidate, size_t index) const;
+    // C++ calls also classify address-less literals and expression results as rvalues. Keep this
+    // broader predicate gated to C++ callees so native CFlat overload selection is unchanged.
+    bool IsCxxRvalueReferenceArgument(const NamedVariable& arg) const;
+    bool CxxReferenceArgumentMatches(const TypeAndValue& param, const NamedVariable& arg) const;
 
     /*
      * Indirection shape of a function-pointer/closure parameter or argument:

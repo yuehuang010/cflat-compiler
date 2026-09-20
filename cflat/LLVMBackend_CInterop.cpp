@@ -2116,7 +2116,12 @@ static bool CxxParamIsConstLvalueReference(const std::string& spelling)
         while (!s.empty() && s.back() == ' ') s.pop_back();
         // `int *const` qualifies the POINTER, not the referent, so a trailing '*' is not one.
         if (s.empty() || s.back() == '*') return false;
-        return s.rfind("const ", 0) == 0;
+        if (s.rfind("const ", 0) == 0)
+            return true;
+        // East const ("int const &"); a pointer spelling is a reference to pointer instead.
+        return s.find('*') == std::string::npos && s.size() >= 5
+            && s.compare(s.size() - 5, 5, "const") == 0
+            && (s.size() == 5 || !std::isalnum((unsigned char)s[s.size() - 6]));
 }
 
 // `T *const &` - const at the POINTER level under one lvalue reference. A distinct overload
@@ -5776,7 +5781,7 @@ LLVMBackend::CollectCxxImplicitArgumentCandidates(
             if (candidate.instanceMember && !arguments.empty()
                 && candidate.refQualifier != cflat_cinterop::CxxRefQualifierNone)
             {
-                const bool receiverRvalue = IsRvalueReferenceArgument(arguments.front());
+                const bool receiverRvalue = IsCxxRvalueReferenceArgument(arguments.front());
                 if ((candidate.refQualifier == cflat_cinterop::CxxRefQualifierLValue
                      && receiverRvalue)
                     || (candidate.refQualifier == cflat_cinterop::CxxRefQualifierRValue
@@ -5938,7 +5943,7 @@ bool LLVMBackend::EmitCxxImplicitArgumentConversions(
             if (!classValue)
                 return ActualArgument{ spelling, "p" + std::to_string(parameterIndex) };
 
-            const bool rvalue = IsRvalueReferenceArgument(arg);
+            const bool rvalue = IsCxxRvalueReferenceArgument(arg);
             if (rvalue)
                 return ActualArgument{ spelling + " &&",
                     "static_cast<" + spelling + " &&>(p" + std::to_string(parameterIndex) + ")" };
@@ -6457,7 +6462,7 @@ bool LLVMBackend::RequestCxxFunctionTemplate(const std::string& functionName,
             parameterSpellings.push_back(std::move(spelling));
             const std::string parameter = "p" + std::to_string(flatParameterIndex++);
             const bool packArgument = selected->hasParameterPack && i >= selected->minArity;
-            if (packArgument && IsRvalueReferenceArgument(arg))
+            if (packArgument && IsCxxRvalueReferenceArgument(arg))
             {
                 std::string valueSpelling = parameterSpellings.back();
                 if (valueSpelling.ends_with(" &")) valueSpelling.resize(valueSpelling.size() - 2);
@@ -6726,7 +6731,7 @@ bool LLVMBackend::RequestCxxFreeFunction(const std::string& functionName,
                 && !type.IsInterface;
             if (classValue)
             {
-                if (IsRvalueReferenceArgument(arg))
+                if (IsCxxRvalueReferenceArgument(arg))
                 {
                     parameterSpellings.push_back(spelling + " &&");
                     callArguments.push_back("static_cast<" + spelling + " &&>(p"
@@ -11195,9 +11200,22 @@ void LLVMBackend::RegisterCxxClassMembers(const CRecordEntry& r, const std::stri
             // the construct-into-slot and assignment paths already expect.
             const bool aliasRefs = !isStructor && !m.isCopyAssign && !m.isMoveAssign;
             auto asAliasIfRef = [&](const std::string& spelling, TypeAndValue& tv) {
+                if (tv.Pointer && tv.TypeName == "void")
+                {
+                    TypeAndValue remapped;
+                    bool representable = false;
+                    if (TryMapCxxForeignSpelling(spelling, remapped, representable) && representable)
+                        tv.TypeName = remapped.TypeName;
+                    int ptrLevels = 0;
+                    const std::string tag = CxxRecordPointeeTag(spelling, ptrLevels);
+                    if (ptrLevels == 1
+                        && (IsCxxRecord(tag) || IsCxxLazyAliasSpecialization(tag)))
+                        tv.TypeName = tag;
+                }
                 CxxReferenceKind refKind = CxxReferenceKind::None;
                 const std::string bare = CxxSpellingWithoutRef(spelling, &refKind);
-                if (refKind == CxxReferenceKind::None || refKind == CxxReferenceKind::Rvalue) return;
+                if (refKind == CxxReferenceKind::None || refKind == CxxReferenceKind::Rvalue)
+                    return;
                 if (!tv.Pointer || tv.IsFunctionPointer || tv.IsArrayView) return;
                 // A T**& is already at its CFlat depth with the flag set by the mapper; peeling a
                 // level here would turn it into a T*.
@@ -13845,18 +13863,8 @@ const LLVMBackend::CxxClassInfo::Structor* LLVMBackend::SelectCxxConstructor(
             if (argVars == nullptr || index >= argVars->size())
                 return false;
             const NamedVariable& arg = (*argVars)[index];
-            if (arg.IsRvalue || IsRvalueReferenceArgument(arg)) return true;
-            if (arg.TypeAndValue.IsAlias) return false;   // a reference-returning call result
-            llvm::Value* storage = arg.Storage;
-            if (storage == nullptr && !arg.CallerName.empty())
-                storage = FindVariableStorage(arg.CallerName).Storage;
-            if (storage == nullptr) return true;          // nothing addressable behind it
-            // Storage alone is not enough: a conversion keeps the SOURCE variable's slot while
-            // its value is a temporary. An lvalue's value is read from that very slot.
-            if (llvm::isa<llvm::PHINode>(storage)) return false;   // a '?:' join of addresses
-            if (arg.Primary == nullptr || arg.Primary == storage) return false;
-            auto* load = llvm::dyn_cast<llvm::LoadInst>(arg.Primary);
-            return load == nullptr || load->getPointerOperand() != storage;
+            // The shared C++ predicate proves rvalue-ness the same way for every callee kind.
+            return IsCxxRvalueReferenceArgument(arg);
         };
         auto isForeignClass = [&](const std::string& name) {
             return IsCxxRecord(name) || IsCxxLazyAliasSpecialization(name);

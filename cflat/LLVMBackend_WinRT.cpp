@@ -2165,12 +2165,42 @@ llvm::Value* LLVMBackend::LowerAliasByPointerArg(const NamedVariable& arg, const
         return temp;
     }
 
-llvm::Value* LLVMBackend::LowerRvalueRefArg(const NamedVariable& arg, const TypeAndValue& param)
+llvm::Value* LLVMBackend::LowerRvalueRefArg(const NamedVariable& arg, const TypeAndValue& param, bool cxxCallee)
 {
+        // `T*&&` receives the pointer VALUE through a temporary T* slot. Passing the value
+        // directly would make the C++ callee interpret the pointee address as a T**.
+        if (cxxCallee && param.ElemPointer && (arg.TypeAndValue.Pointer
+                                  || (arg.Primary != nullptr && arg.Primary->getType()->isPointerTy())
+                                  || llvm::isa_and_nonnull<llvm::ConstantPointerNull>(arg.Primary)))
+        {
+            TypeAndValue referent = param;
+            referent.ElemPointer = false;
+            referent.Pointer = true;
+            referent.PointerDepth = 1;
+            referent.IsAlias = false;
+            referent.IsRvalueRef = false;
+            if (llvm::Type* refTy = GetType(referent); refTy != nullptr && refTy->isPointerTy())
+            {
+                llvm::Value* value = arg.Primary != nullptr ? arg.Primary : LoadArgStorage(arg);
+                auto* temp = AllocaAtEntry(refTy, nullptr, "cxx.rrefarg");
+                builder->CreateStore(value, temp);
+                return temp;
+            }
+        }
         // A pointer argument (`move p` on a T*) already IS the object's address: pass its value,
         // never the slot holding it. Pointers are opaque, so no type test can tell the two apart.
         if (arg.TypeAndValue.Pointer)
             return arg.Primary != nullptr ? arg.Primary : LoadArgStorage(arg);
+
+        // An opaque C++ class reference is still represented by the constructor's pointer result,
+        // even when its CFlat argument metadata is a by-value foreign record.
+        if (cxxCallee && param.TypeName == "void")
+        {
+            if (arg.Storage != nullptr && arg.Storage->getType()->isPointerTy())
+                return arg.Storage;
+            if (arg.Primary != nullptr && arg.Primary->getType()->isPointerTy())
+                return arg.Primary;
+        }
 
         auto aliasParam = param;
         aliasParam.Pointer = false;

@@ -319,10 +319,12 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
         };
         // Cost of one const-added binding, weighted so a value/reference pair does not tie into
         // declaration order: same polarity as the equal-spelling arm (reference wins an lvalue).
-        auto constAddedBindingCost = [&](const NamedVariable& arg, const TypeAndValue& param) {
+        auto constAddedBindingCost = [&](const NamedVariable& arg, const TypeAndValue& param,
+                                         bool cxx) {
+            const bool rvalue = cxx ? IsCxxRvalueReferenceArgument(arg)
+                                    : IsRvalueReferenceArgument(arg);
             const bool preferred = param.IsAlias
-                ? !IsRvalueReferenceArgument(arg)
-                : IsRvalueReferenceArgument(arg);
+                ? !rvalue : rvalue;
             return preferred ? 1 : 2;
         };
         auto receiverRefQualifierMatches = [&](const FunctionSymbol& candidate,
@@ -331,7 +333,7 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                 || candidate.CxxRefQualifier == cflat_cinterop::CxxRefQualifierNone
                 || candidate.Parameters.empty() || arguments.empty())
                 return true;
-            const bool receiverRvalue = IsRvalueReferenceArgument(arguments.front());
+            const bool receiverRvalue = IsCxxRvalueReferenceArgument(arguments.front());
             if (candidate.CxxRefQualifier == cflat_cinterop::CxxRefQualifierLValue)
                 return !receiverRvalue;
             if (candidate.CxxRefQualifier == cflat_cinterop::CxxRefQualifierRValue)
@@ -420,8 +422,41 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
 
                 // A C++ rvalue-reference parameter is address-passed like an alias, but an
                 // lvalue cannot bind it. Keep the candidate visible for the move diagnostic.
+                const bool argIsCxxRvalue = candidate.IsCxx
+                    && IsCxxRvalueReferenceArgument(arg);
+                const size_t paramIndex = std::distance(candidate.Parameters.begin(), candidateParamItr);
+                const bool cxxIndirectValueParam = candidate.IsCxx
+                    && candidate.CxxAbi.valid
+                    && paramIndex < candidate.CxxAbi.params.size()
+                    && candidate.CxxAbi.params[paramIndex].kind == cflat_cinterop::RawAbiSlot::Indirect;
+                const std::string cxxParamSpelling =
+                    CxxReferenceParameterSpelling(candidate, paramIndex);
+                const bool cxxRvalueReference = candidateParamItr->IsRvalueRef
+                    || cxxParamSpelling.find("&&") != std::string::npos;
+                const bool cxxConstReference = candidateParamItr->IsCxxConstRef
+                    || cxxParamSpelling.rfind("const ", 0) == 0;
                 if (candidateParamItr->IsRvalueRef
-                    && !IsRvalueReferenceArgument(arg))
+                    && !(candidate.IsCxx ? argIsCxxRvalue : IsRvalueReferenceArgument(arg)))
+                {
+                    perfectMatch = false;
+                    promotionMatch = false;
+                    implicitMatch = false;
+                    break;
+                }
+
+                if (candidate.IsCxx && argIsCxxRvalue
+                    && candidateParamItr->IsAlias && !candidateParamItr->IsRvalueRef
+                    && !candidateParamItr->IsCxxConstRef
+                    && !(cxxIndirectValueParam && !cxxConstReference && !cxxRvalueReference)
+                    && !cxxRvalueReference
+                    && !cxxConstReference
+                    && IsCxxReferenceParameter(candidate, paramIndex)
+                    && (!arg.BaseType || !arg.BaseType->isStructTy()
+                        || candidateParamItr->TypeName == arg.TypeAndValue.TypeName
+                        || (arg.TypeAndValue.TypeName == "std.string"
+                            && (candidateParamItr->TypeName == "string"
+                                || candidateParamItr->TypeName == "void")))
+                    && CxxReferenceArgumentMatches(*candidateParamItr, arg))
                 {
                     perfectMatch = false;
                     promotionMatch = false;
@@ -520,6 +555,24 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                         result = 0;
                         refPtrConstMismatches += CxxRefToPointerScore(arg, *candidateParamItr);
                     }
+                    // `T *&&` takes the pointer VALUE through a temporary slot, so it binds a
+                    // pointer rvalue whose pointee type matches the referred pointer.
+                    else if (candidate.IsCxx && candidateParamItr->IsRvalueRef
+                        && candidateParamItr->ElemPointer && tmpArg.Pointer
+                        && IsCxxRvalueReferenceArgument(arg))
+                    {
+                        auto referent = *candidateParamItr;
+                        referent.ElemPointer = false;
+                        referent.Pointer = true;
+                        referent.PointerDepth = 1;
+                        referent.IsAlias = false;
+                        referent.IsRvalueRef = false;
+                        result = arg.BaseType != nullptr && GetType(referent) == arg.BaseType
+                            ? 0 : -1;
+                        if (result < 0 && arg.IsExplicitMove
+                            && (tmpArg.TypeName.empty() || tmpArg.TypeName == referent.TypeName))
+                            result = 0;
+                    }
                     if (candidate.IsCxx && !tmpArg.Pointer
                         && !candidateParamItr->IsCxxRefToPointer)
                     {
@@ -529,17 +582,20 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                             CxxSpellingForCflatType(tmpArg.TypeName, argSpelling)
                             && CxxSpellingForCflatType(tmpParam.TypeName, paramSpelling)
                             && SqueezeCxxSpelling(argSpelling) == SqueezeCxxSpelling(paramSpelling);
-                        if (sameCxxSpelling)
+                        const bool sameCxxStdString = tmpArg.TypeName == "std.string"
+                            && (tmpParam.TypeName == "string" || tmpParam.TypeName == "void");
+                        if (sameCxxSpelling || sameCxxStdString)
                             result = candidateParamItr->IsAlias
-                                ? (IsRvalueReferenceArgument(arg) ? 1 : 0)
-                                : (IsRvalueReferenceArgument(arg) ? 0 : 1);
+                                ? (argIsCxxRvalue ? 1 : 0)
+                                : (argIsCxxRvalue ? 0 : 1);
                         // `iterator -> const_iterator`: implicit (1), never perfect, so an
                         // exactly-typed overload of the same member still wins.
                         else if (IsCxxConstAddedPointerSpecialization(argSpelling, paramSpelling)
                             && HasIdenticalCxxRecordLayout(tmpArg.TypeName, tmpParam.TypeName))
                         {
                             result = 1;
-                            constAddedConversions += constAddedBindingCost(arg, *candidateParamItr);
+                            constAddedConversions += constAddedBindingCost(
+                                arg, *candidateParamItr, candidate.IsCxx);
                         }
                     }
                     if (result < 0 && tmpArg.IsTypeMatch(tmpParam))
@@ -667,13 +723,36 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                     if (constAddedCxxSpelling)
                     {
                         result = 1;
-                        constAddedConversions += constAddedBindingCost(arg, *candidateParamItr);
+                        constAddedConversions += constAddedBindingCost(
+                            arg, *candidateParamItr, candidate.IsCxx);
                     }
                     else if (sameCxxValue)
-                        result = IsRvalueReferenceArgument(arg) ? 0 : 1;
+                        result = IsCxxRvalueReferenceArgument(arg) ? 0 : 1;
                     else if (sameCxxReference)
-                        result = IsRvalueReferenceArgument(arg) ? 1 : 0;
+                        result = IsCxxRvalueReferenceArgument(arg) ? 1 : 0;
                     else if (stringLiteralCharPointer)
+                        result = 0;
+                    else if (candidate.IsCxx && candidateParamItr->IsRvalueRef
+                        && candidateParamItr->ElemPointer
+                        && llvm::isa_and_nonnull<llvm::ConstantPointerNull>(arg.Primary))
+                        result = 0;
+                    else if (candidate.IsCxx && candidateParamItr->IsRvalueRef
+                        && candidateParamItr->ElemPointer && arg.BaseType != nullptr
+                        && arg.BaseType->isPointerTy()
+                        && IsCxxRvalueReferenceArgument(arg))
+                    {
+                        auto referent = *candidateParamItr;
+                        referent.ElemPointer = false;
+                        referent.Pointer = true;
+                        referent.PointerDepth = 1;
+                        referent.IsAlias = false;
+                        referent.IsRvalueRef = false;
+                        result = GetType(referent) == arg.BaseType ? 0 : -1;
+                        if (result < 0 && arg.IsExplicitMove)
+                            result = 0;
+                    }
+                    else if (candidate.IsCxx && candidateParamItr->IsRvalueRef
+                        && candidateParamItr->ElemPointer && arg.IsExplicitMove)
                         result = 0;
                     else if (candidateParamItr->IsRvalueRef && !arg.TypeAndValue.Pointer)
                     {
@@ -819,8 +898,16 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                  */
                 // A reference-to-pointer parameter keeps the referred pointer's depth for
                 // overload resolution; only its ABI lowering adds the reference slot.
-                if (result >= 0
-                    && arg.TypeAndValue.PointerDepthRefuses(*candidateParamItr))
+                // A C++ `T*&&` carries the reference as its second level, so depth is judged
+                // against the REFERENT; a flagged `T**&&` is already stored at its referent depth.
+                TypeAndValue depthParam = *candidateParamItr;
+                if (candidate.IsCxx && depthParam.IsRvalueRef && depthParam.ElemPointer
+                    && !depthParam.IsCxxRefToPointer)
+                {
+                    depthParam.ElemPointer = false;
+                    depthParam.PointerDepth = 1;
+                }
+                if (result >= 0 && arg.TypeAndValue.PointerDepthRefuses(depthParam))
                     result = -1;
 
                 // Implicit integer NARROWING at a call argument is not legal (ruling 2026-09-04):
@@ -1734,6 +1821,27 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
 
         if (candidate.Function == nullptr)
         {
+            for (const auto& c : candidates)
+            {
+                const bool arityFits = c.Variadic ? arguments.size() >= c.Parameters.size()
+                                                  : arguments.size() == c.Parameters.size();
+                if (!c.IsCxx || !arityFits) continue;
+                for (size_t i = 0; i < arguments.size() && i < c.Parameters.size(); ++i)
+                {
+                    const auto& param = c.Parameters[i];
+                    if (!IsCxxReferenceParameter(c, i)) continue;
+                    if (!CxxReferenceArgumentMatches(param, arguments[i])) continue;
+                    const bool rvalue = IsCxxRvalueReferenceArgument(arguments[i]);
+                    if (param.IsRvalueRef && !rvalue)
+                        LogErrorMessage(
+                            "parameter '{}' of '{}' is an rvalue reference; pass 'move <arg>' or a temporary",
+                            { param.VariableName, shownFunctionName });
+                    if (param.IsAlias && !param.IsRvalueRef && !param.IsCxxConstRef && rvalue)
+                        LogErrorMessage(
+                            "parameter '{}' of '{}' is a non-const lvalue reference and cannot bind an rvalue; pass an lvalue",
+                            { param.VariableName, shownFunctionName });
+                }
+            }
             // MatchFunction intentionally keeps a ref-qualified candidate visible so the
             // diagnostic can distinguish a receiver-category error from an argument mismatch.
             if (!arguments.empty())
@@ -1753,9 +1861,9 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                         continue;
                     const bool matches = c.CxxRefQualifier == cflat_cinterop::CxxRefQualifierNone
                         || (c.CxxRefQualifier == cflat_cinterop::CxxRefQualifierLValue
-                            && !IsRvalueReferenceArgument(arguments.front()))
+                            && !IsCxxRvalueReferenceArgument(arguments.front()))
                         || (c.CxxRefQualifier == cflat_cinterop::CxxRefQualifierRValue
-                            && IsRvalueReferenceArgument(arguments.front()));
+                            && IsCxxRvalueReferenceArgument(arguments.front()));
                     if (matches) hasReceiverCompatible = true;
                     else
                     {
@@ -1767,7 +1875,7 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                 {
                     const char* qualifier = rejectedRefQualifier
                         == cflat_cinterop::CxxRefQualifierLValue ? "&" : "&&";
-                    const char* category = IsRvalueReferenceArgument(arguments.front())
+                    const char* category = IsCxxRvalueReferenceArgument(arguments.front())
                         ? "rvalue" : "lvalue";
                     LogRawError(std::format(
                         "C++ member '{}' is {}-qualified and cannot be called on an {} receiver",
@@ -2153,7 +2261,8 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                 for (size_t i = 0; i < rvalueArgs.size() && i < rvalueSym.Parameters.size(); ++i)
                 {
                     if (!rvalueSym.Parameters[i].IsRvalueRef
-                        || IsRvalueReferenceArgument(rvalueArgs[i]))
+                        || (rvalueSym.IsCxx ? IsCxxRvalueReferenceArgument(rvalueArgs[i])
+                                            : IsRvalueReferenceArgument(rvalueArgs[i])))
                         continue;
                     LogErrorMessage(
                         "parameter '{}' of '{}' is an rvalue reference; pass 'move <arg>' or a temporary",
@@ -2324,7 +2433,7 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
 
             if (!inVariadicRange && candParamItr->IsRvalueRef)
             {
-                argList.push_back(LowerRvalueRefArg(arg, *candParamItr));
+                argList.push_back(LowerRvalueRefArg(arg, *candParamItr, candidate.IsCxx));
             }
             // A blessed unique<IFace> wrapper is not an implementor: borrow the fat value it
             // holds through get() rather than boxing the wrapper struct itself.

@@ -170,6 +170,15 @@ int ExcTakePlain(ExcPlain p) { return p.a; }
 
 // A CFlat struct field of C++ class type, used as a ctor `T&` argument.
 struct CtorRefHost { cppcr.Cnt cell = default; };
+// Lvalue shapes fed to a C++ `int&` member/static/free parameter (legs 3144-3149).
+struct RefKindProbeBox { int f = default; };
+int refKindProbeGlobal = 3;
+int RefKindProbeThroughParam(int v)
+{
+    cppcr.RefKindScalarApi api = default;
+    int seen = api.member_l(v);
+    return seen * 10 + v;
+}
 struct ArrElemH5 { cppa.CtorOnly[2] cells = { v = 1 }; };
 struct ArrElemH6 { cppa.Trk[2] cells = { v = 1 }; };
 extern int strcmp(const char* a, const char* b);
@@ -2810,6 +2819,127 @@ extern int main()
         box.v = 5;
         cppcr.IntRef r = cppcr.IntRef(box.ref());
         if (r.get() != 6 || box.v != 6) return 3143;
+    }
+    // C++ member/static/free reference parameters (3120-3139). Pre-fix pointer references
+    // either had no candidate, passed the wrong pointer level, or crashed during lowering.
+    {
+        int[2] values = { 41, 42 }; int* p = &values[0];
+        cppcr.RefKindPtrApi api = default;
+        if (api.member_c(p) != 141) return 3120;
+    }
+    {
+        int[2] values = { 41, 42 }; int* p = &values[0];
+        if (cppcr.RefKindPtrApi.static_c(p) != 141) return 3121;
+    }
+    {
+        cppcr.RefKindPtrApi api = default;
+        if (api.member_c(nullptr) != 100) return 3122;
+    }
+    {
+        int[2] values = { 41, 42 }; int* p = &values[0];
+        cppcr.RefKindPtrApi api = default;
+        if (api.member_c(p + 1) != 142) return 3123;
+    }
+    {
+        int[2] values = { 41, 42 }; int* p = &values[0];
+        cppcr.RefKindPtrApi api = default;
+        if (api.member_c(cppcr.make_ptr(p)) != 141) return 3124;
+    }
+    {
+        if (cppcr.RefKindPtrApi.static_c(nullptr) != 100) return 3125;
+    }
+    {
+        int[2] values = { 41, 42 }; int* p = &values[0];
+        if (cppcr.RefKindPtrApi.static_c(p + 1) != 142) return 3126;
+    }
+    {
+        int[2] values = { 41, 42 }; int* p = &values[0];
+        if (cppcr.RefKindPtrApi.static_c(cppcr.make_ptr(p)) != 141) return 3127;
+    }
+    {
+        cppcr.RefKindPtrApi api = default;
+        if (api.member_r(nullptr) != 200) return 3128;
+    }
+    {
+        int[2] values = { 41, 42 }; int* p = &values[0];
+        cppcr.RefKindPtrApi api = default;
+        if (api.member_r(p + 1) != 252) return 3129;
+    }
+    {
+        int[2] values = { 41, 42 }; int* p = &values[0];
+        cppcr.RefKindPtrApi api = default;
+        if (api.member_r(cppcr.make_ptr(p)) != 251) return 3130;
+    }
+    {
+        int[2] values = { 41, 42 }; int* p = &values[0];
+        cppcr.RefKindPtrApi api = default;
+        if (api.member_r(move p) != 251) return 3131;
+    }
+    {
+        if (cppcr.RefKindPtrApi.static_r(nullptr) != 200) return 3132;
+    }
+    {
+        int[2] values = { 41, 42 }; int* p = &values[0];
+        if (cppcr.RefKindPtrApi.static_r(p + 1) != 252) return 3133;
+    }
+    {
+        int[2] values = { 41, 42 }; int* p = &values[0];
+        if (cppcr.RefKindPtrApi.static_r(cppcr.make_ptr(p)) != 251) return 3134;
+    }
+    {
+        int[2] values = { 41, 42 }; int* p = &values[0];
+        if (cppcr.RefKindPtrApi.static_r(move p) != 251) return 3135;
+    }
+    {
+        if (cppcr.refkind_ptr_r(nullptr) != 200) return 3136;
+    }
+    {
+        int[2] values = { 41, 42 }; int* p = &values[0];
+        if (cppcr.refkind_ptr_r(p + 1) != 252) return 3137;
+    }
+    {
+        int[2] values = { 41, 42 }; int* p = &values[0];
+        if (cppcr.refkind_ptr_r(cppcr.make_ptr(p)) != 251) return 3138;
+    }
+    {
+        int[2] values = { 41, 42 }; int* p = &values[0];
+        if (cppcr.refkind_ptr_r(move p) != 251) return 3139;
+    }
+    // ---- `int&` member/static/free binding of lvalue-shaped expressions (3144-3149) ----
+    {
+        // A `?:` over two lvalues selects an OBJECT: the callee writes through to it.
+        int a = 4;
+        int b = 9;
+        cppcr.RefKindScalarApi api = default;
+        if (api.member_l(a > 0 ? a : b) != 5 || a != 5 || b != 9) return 3144;
+        if (cppcr.RefKindScalarApi.static_l(a > 99 ? a : b) != 10 || a != 5 || b != 10)
+            return 3145;
+    }
+    {
+        // A reference-returning call result is an lvalue, free and member alike.
+        int a = 1;
+        cppcr.RefKindScalarApi api = default;
+        if (api.member_l(cppcr.pick_ref(a)) != 2 || a != 2) return 3146;
+        cppcr.RefBox box = cppcr.RefBox();
+        box.v = 5;
+        if (cppcr.refkind_int_l(box.ref()) != 6 || box.v != 6) return 3147;
+    }
+    {
+        // Field, dereferenced pointer, array element and global are all lvalues.
+        RefKindProbeBox host = default;
+        host.f = 1;
+        int local = 7;
+        int* ptr = &local;
+        int[2] cells = { 20, 21 };
+        cppcr.RefKindScalarApi api = default;
+        if (api.member_l(host.f) != 2 || host.f != 2) return 3148;
+        if (cppcr.RefKindScalarApi.static_l(*ptr) != 8 || local != 8) return 31481;
+        if (cppcr.refkind_int_l(cells[1]) != 22 || cells[1] != 22) return 31482;
+        if (api.member_l(refKindProbeGlobal) != 4 || refKindProbeGlobal != 4) return 31483;
+    }
+    {
+        // A function PARAMETER is an lvalue inside the callee.
+        if (RefKindProbeThroughParam(5) != 66) return 3149;
     }
     return 0;
 }

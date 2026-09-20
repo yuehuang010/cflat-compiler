@@ -474,7 +474,91 @@ bool LLVMBackend::IsConsumableTemporary(const NamedVariable& arg) const
 bool LLVMBackend::IsRvalueReferenceArgument(const NamedVariable& arg) const
 {
         return arg.IsExplicitMove || IsConsumableTemporary(arg);
-    }
+}
+
+bool LLVMBackend::IsCxxRvalueReferenceArgument(const NamedVariable& arg) const
+{
+        // Rvalue-ness must be PROVEN. Without argument provenance nothing is proven, and an
+        // argument that has addressable storage or came back as a reference is an lvalue.
+        if (arg.IsRvalue || IsRvalueReferenceArgument(arg)) return true;
+        if (arg.TypeAndValue.IsAlias) return false;   // a reference-returning call result
+        llvm::Value* storage = arg.Storage;
+        if (storage == nullptr && !arg.CallerName.empty())
+            storage = FindVariableStorage(arg.CallerName).Storage;
+        if (storage == nullptr) return true;          // nothing addressable behind it
+        // Storage alone is not enough: a conversion keeps the SOURCE variable's slot while its
+        // value is a temporary. An lvalue's value is read from that very slot.
+        if (llvm::isa<llvm::PHINode>(storage)) return false;   // a '?:' join of addresses
+        if (arg.Primary == nullptr || arg.Primary == storage) return false;
+        auto* load = llvm::dyn_cast<llvm::LoadInst>(arg.Primary);
+        return load == nullptr || load->getPointerOperand() != storage;
+}
+
+bool LLVMBackend::IsCxxReferenceParameter(const FunctionSymbol& candidate, size_t index) const
+{
+        if (!candidate.IsCxx || candidate.UniqueName.starts_with("__cflat_udc_")) return false;
+        const std::string spelling = CxxReferenceParameterSpelling(candidate, index);
+        if (!spelling.empty()) return spelling.find('&') != std::string::npos;
+        return index < candidate.Parameters.size()
+            && (candidate.Parameters[index].IsRvalueRef
+                || candidate.Parameters[index].IsCxxRefToPointer);
+}
+
+std::string LLVMBackend::CxxReferenceParameterSpelling(const FunctionSymbol& candidate,
+                                                       size_t index) const
+{
+        if (!candidate.IsCxx || candidate.UniqueName.starts_with("__cflat_udc_")) return {};
+        if (auto rawIt = cxxFunctionSignatures_.find(candidate.SourceName);
+            rawIt != cxxFunctionSignatures_.end())
+            for (const auto& raw : rawIt->second)
+                if (raw.linkageName == candidate.UniqueName
+                    && index < raw.paramSpellings.size())
+                    return raw.paramSpellings[index];
+        for (const auto& [className, record] : cxxRecordEntries_)
+            for (const auto& method : record.members)
+                if (method.linkageName == candidate.UniqueName
+                    && index < method.paramTypes.size())
+                    return method.paramTypes[index];
+        return {};
+}
+
+bool LLVMBackend::CxxReferenceArgumentMatches(const TypeAndValue& param,
+                                               const NamedVariable& arg) const
+{
+        if (!param.Pointer && !param.IsAlias) return false;
+        if (param.IsCxxRefToPointer)
+            return arg.TypeAndValue.Pointer
+                && (arg.BaseType == nullptr || arg.BaseType == GetType(param));
+        if (param.IsRvalueRef && param.ElemPointer && arg.TypeAndValue.Pointer)
+        {
+            auto referent = param;
+            referent.ElemPointer = false;
+            referent.Pointer = true;
+            referent.PointerDepth = 1;
+            referent.IsAlias = false;
+            referent.IsRvalueRef = false;
+            return arg.BaseType != nullptr && GetType(referent) == arg.BaseType;
+        }
+        if (!arg.TypeAndValue.Pointer && arg.TypeAndValue.TypeName == "std.string"
+            && (param.TypeName == "string" || param.TypeName == "void"))
+            return true;
+        if (arg.Storage == nullptr && arg.BaseType != nullptr
+            && !arg.BaseType->isStructTy()
+            && !IsForeignCxxClassWithConstructors(param.TypeName)
+            && llvm::isa_and_nonnull<llvm::Constant>(arg.Primary))
+            return true;
+        if (arg.TypeAndValue.Pointer) return false;
+        if (!param.TypeName.empty() && param.TypeName == arg.TypeAndValue.TypeName)
+            return true;
+        TypeAndValue referent = param;
+        referent.Pointer = false;
+        referent.ElemPointer = false;
+        referent.PointerDepth = 0;
+        referent.IsAlias = false;
+        referent.IsRvalueRef = false;
+        referent.IsCxxConstRef = false;
+        return arg.BaseType != nullptr && GetType(referent) == arg.BaseType;
+}
 
 int LLVMBackend::ScoreMoveAgreement(const std::vector<NamedVariable>& arguments, const FunctionSymbol& candidate) const
 {
@@ -491,7 +575,8 @@ int LLVMBackend::ScoreMoveAgreement(const std::vector<NamedVariable>& arguments,
             bool argOwning = arg.IsExplicitMove || argIsRValue;
             if (pi->IsMove == argOwning)
                 moveScore++;
-            if (pi->IsRvalueRef == IsRvalueReferenceArgument(arg))
+            const bool rvalue = IsRvalueReferenceArgument(arg);
+            if (pi->IsRvalueRef == rvalue)
                 moveScore++;
             if (pi->IsFunctionPointer && !arg.CallerName.empty()
                 && HasFunctionWithMoveFlags(arg.CallerName, pi->FuncPtrParams))
