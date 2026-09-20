@@ -2749,6 +2749,8 @@ bool LLVMBackend::TryLoadCHeaderDiskCache(
         // spells all of it out and has no baseline to resolve against.
         // v78 binds a reference to a T** (crp at two pointer levels): an older cache carries the
         // member's refusal instead of a signature.
+        // v79 preserves the pointer level when a const-qualified pointer reference collapses
+        // to the CFlat alias surface: an older cache carries the raw shape.
         if (version != kCHeaderCacheVersion) return cacheMiss("cache version");
 
         if (!expectedRequestKey.empty()
@@ -3157,6 +3159,7 @@ void LLVMBackend::WriteCHeaderDiskCache(
         // v77 interns source paths into "files", drops defaulted signature fields, and stores a
         // type request's shared signatures once in a baseline ("sb") instead of per entry.
         // v78 binds a reference to a T** instead of refusing the member.
+        // v79 preserves the pointer level of a collapsed const-qualified pointer reference.
         j["version"] = kCHeaderCacheVersion;
         j["mtime"]   = (int64_t)mtime.time_since_epoch().count();
         j["hash"]    = contentHash;

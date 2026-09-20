@@ -2119,6 +2119,22 @@ static bool CxxParamIsConstLvalueReference(const std::string& spelling)
         return s.rfind("const ", 0) == 0;
 }
 
+// `T *const &` - const at the POINTER level under one lvalue reference. A distinct overload
+// from `T *&`, and the only one of the pair a pointer rvalue can bind.
+static bool CxxParamIsConstRefToPointer(const std::string& spelling)
+{
+        std::string s = spelling;
+        while (!s.empty() && s.back() == ' ') s.pop_back();
+        int refs = 0;
+        while (!s.empty() && s.back() == '&') { s.pop_back(); ++refs; }
+        if (refs != 1) return false;
+        while (!s.empty() && s.back() == ' ') s.pop_back();
+        if (s.size() < 5 || s.compare(s.size() - 5, 5, "const") != 0) return false;
+        s.erase(s.size() - 5);
+        while (!s.empty() && s.back() == ' ') s.pop_back();
+        return !s.empty() && s.back() == '*';
+}
+
 bool LLVMBackend::MapRawSig(const cflat_cinterop::RawSig& r, CSigEntry& e)
 {
         e = CSigEntry();
@@ -2161,8 +2177,18 @@ bool LLVMBackend::MapRawSig(const cflat_cinterop::RawSig& r, CSigEntry& e)
             && r.retType.find("&&") == std::string::npos
             && !e.ret.IsFunctionPointer)
         {
-            e.ret.Pointer = false;
-            e.ret.ElemPointer = false;
+            // A T*& is one CFlat pointer plus the ABI reference slot. T**& already arrives at
+            // its CFlat depth with the flag set by the mapper; do not peel either level there.
+            if (!e.ret.IsCxxRefToPointer)
+            {
+                if (e.ret.ElemPointer)
+                {
+                    e.ret.ElemPointer = false;
+                    e.ret.IsCxxRefToPointer = true;
+                }
+                else
+                    e.ret.Pointer = false;
+            }
             e.ret.IsAlias = true;
         }
         for (size_t i = 0; i < r.paramTypes.size(); ++i)
@@ -2235,7 +2261,9 @@ bool LLVMBackend::MapRawSig(const cflat_cinterop::RawSig& r, CSigEntry& e)
                     ptv.ElemPointer = false;
                     ptv.IsCxxRefToPointer = true;
                 }
-                ptv.IsCxxConstRef = CxxParamIsConstLvalueReference(r.paramTypes[i]);
+                ptv.IsCxxConstRef = CxxParamIsConstLvalueReference(r.paramTypes[i])
+                    || (ptv.IsCxxRefToPointer
+                        && CxxParamIsConstRefToPointer(r.paramTypes[i]));
             }
             if (i < r.paramNames.size()) ptv.VariableName = r.paramNames[i];
             e.params.push_back(std::move(ptv));
@@ -10699,7 +10727,26 @@ static std::string CxxSpellingWithoutRef(const std::string& spelling,
         while (!s.empty() && s.back() == '&') { s.pop_back(); ++refs; }
         if (kind != nullptr) *kind = CxxReferenceKind::None;
         if (refs == 0) return spelling;
-        while (!s.empty() && s.back() == ' ') s.pop_back();
+        static const char* const cvWords[] = { "const", "volatile", "restrict", "__restrict",
+                                               "__restrict__", "_Nonnull", "_Nullable",
+                                               "_Null_unspecified" };
+        for (bool stripped = true; stripped; )
+        {
+            stripped = false;
+            while (!s.empty() && (s.back() == ' ' || s.back() == '\t')) s.pop_back();
+            for (const char* word : cvWords)
+            {
+                const size_t n = std::strlen(word);
+                if (s.size() < n || s.compare(s.size() - n, n, word) != 0) continue;
+                if (s.size() > n
+                    && (std::isalnum((unsigned char)s[s.size() - n - 1])
+                        || s[s.size() - n - 1] == '_'))
+                    continue;
+                s.erase(s.size() - n);
+                stripped = true;
+                break;
+            }
+        }
         if (kind != nullptr)
             *kind = refs > 1 ? CxxReferenceKind::Rvalue
                              : (!s.empty() && s.back() == '*'
@@ -10883,7 +10930,11 @@ void LLVMBackend::RegisterCxxClassMembers(const CRecordEntry& r, const std::stri
                 std::string t = CxxSpellingWithoutRef(m.paramTypes[p], &refKind);
                 if (t.rfind("const ", 0) == 0) t = t.substr(6);
                 if (refKind == CxxReferenceKind::Rvalue) t += "|rvalue";
-                else if (refKind == CxxReferenceKind::RefToPointer) t += "|refptr";
+                else if (refKind == CxxReferenceKind::RefToPointer)
+                {
+                    // `T*&` and `T*const&` are distinct overloads once the cv under the ref is gone.
+                    t += CxxParamIsConstRefToPointer(m.paramTypes[p]) ? "|constrefptr" : "|refptr";
+                }
                 key += "|" + t;
             }
             return key;
@@ -11106,11 +11157,13 @@ void LLVMBackend::RegisterCxxClassMembers(const CRecordEntry& r, const std::stri
                     : std::format("returns unsupported type '{}'", m.retType));
                 continue;
             }
-            if (returnRefKind == CxxReferenceKind::Lvalue && ret.Pointer
+            if ((returnRefKind == CxxReferenceKind::Lvalue
+                 || returnRefKind == CxxReferenceKind::RefToPointer)
+                && ret.Pointer
                 && ret.TypeName == "void")
             {
-                // An unknown T& is represented as void* by the scalar mapper. Do not turn it
-                // into an alias void result: that would declare a different LLVM return type
+                // An unknown T& or T*& is represented as void* by the scalar mapper. Do not turn
+                // it into an alias void result: that would declare a different LLVM return type
                 // from clang and report a misleading ABI mismatch.
                 refuse(std::format("returns a reference to unsupported type '{}'", m.retType));
                 continue;
@@ -11147,7 +11200,8 @@ void LLVMBackend::RegisterCxxClassMembers(const CRecordEntry& r, const std::stri
                 else
                     tv.Pointer = false;
                 tv.IsAlias = true;
-                tv.IsCxxConstRef = CxxParamIsConstLvalueReference(spelling);
+                tv.IsCxxConstRef = CxxParamIsConstLvalueReference(spelling)
+                    || (tv.IsCxxRefToPointer && CxxParamIsConstRefToPointer(spelling));
             };
             if (aliasRefs) asAliasIfRef(m.retType, ret);
             std::vector<TypeAndValue> params;

@@ -22,6 +22,35 @@
 
 namespace cppt
 {
+    inline int constref_string_param(std::string *const &p)
+    { return (int)p->size() * 10 + 5; }
+
+    inline int constref_int_param(int *const &p)
+    { return *p * 10 + 6; }
+
+    inline std::string *const &constref_string_return()
+    {
+        static std::string text = "hello";
+        static std::string *value = &text;
+        return value;
+    }
+
+    inline int *const &constref_int_return()
+    {
+        static int value = 8;
+        static int *slot = &value;
+        return slot;
+    }
+
+    struct ConstRefStringHolder
+    {
+        std::string *slot;
+        ConstRefStringHolder() : slot(nullptr) {}
+        int param(std::string *const &p) { return (int)p->size() * 10 + 5; }
+        std::string *const &out() const { return slot; }
+        void set(std::string *p) { slot = p; }
+    };
+
     // M78: a header-only polymorphic owner for CFlat-defined C++ structs.
     inline int module_dtors_counter = 0;
     template <typename T>

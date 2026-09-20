@@ -2793,5 +2793,68 @@ extern int main()
         if ((int)chsFill.size() != 3 || (int)chsA.find(chsC) != 1)                  return 2494;
     }
 
+    // ---- const-qualified pointer references: strip cv under the reference ----------------------
+    {
+        nest.Cell crpCell = nest.Cell(2, 3);
+        nest.Cell *crp = &crpCell;
+        nest.ConstRefPtrHolder crpHolder = default;
+        int crpInt = 8;
+        if (crpHolder.param(crp) != 23)                                      return 2460;
+        if (crpHolder.param_cv(crp) != 23)                                   return 2461;
+        if (crpHolder.param_const(crp) != 23)                                return 2462;
+        if (crpHolder.param_int(&crpInt) != 86)                              return 2463;
+        if (nest.ConstRefPtrHolder.static_param(crp) != 23)                  return 2464;
+        if (nest.ConstRefPtrHolder.static_param_cv(crp) != 23)               return 2465;
+        if (nest.ConstRefPtrHolder.static_param_const(crp) != 23)            return 2466;
+        if (nest.ConstRefPtrHolder.static_param_int(&crpInt) != 86)          return 2467;
+
+        nest.constref_set_slot(crp);
+        nest.Cell *crpFreeReturn = nest.constref_return();
+        if (crpFreeReturn->b != 3)                                           return 2468;
+        nest.constref_set_const_slot(crp);
+        nest.Cell *crpFreeConstReturn = nest.constref_const_return();
+        if (crpFreeConstReturn->a != 2)                                      return 2469;
+        int *crpFreeIntReturn = cppt.constref_int_return();
+        if (*crpFreeIntReturn != 8)                                          return 2470;
+        std.string *crpFreeStringReturn = cppt.constref_string_return();
+        if (crpFreeStringReturn->size() != 5)                                return 2471;
+
+        crpHolder.set_slot(crp);
+        nest.Cell *crpMemberReturn = crpHolder.out();
+        if (crpMemberReturn->a != 2)                                         return 2472;
+        crpHolder.set_const_slot(crp);
+        nest.Cell *crpMemberConstReturn = crpHolder.const_out();
+        if (crpMemberConstReturn->b != 3)                                    return 2473;
+        crpHolder.set_int_slot(&crpInt);
+        int *crpMemberIntReturn = crpHolder.int_out();
+        if (*crpMemberIntReturn != 8)                                        return 2474;
+        cppt.ConstRefStringHolder crpStringHolder = default;
+        std.string crpText = std.string("abcd");
+        crpStringHolder.set(&crpText);
+        std.string *crpMemberStringReturn = crpStringHolder.out();
+        if (crpMemberStringReturn->size() != 4)                              return 2475;
+
+        nest.ConstRefPtrHolder.static_set(crp);
+        nest.Cell *crpStaticReturn = nest.ConstRefPtrHolder.static_out();
+        if (crpStaticReturn->b != 3)                                         return 2476;
+        nest.ConstRefPtrArray crpArray = default;
+        crpArray.set(crp);
+        nest.Cell *crpIndexed = crpArray[0];
+        if (crpIndexed->a != 2)                                               return 2477;
+        nest.Cell *crpTemplateReturn = nest.constref_template_return(crp);
+        if (crpTemplateReturn->a != 2)                                       return 2478;
+        int *crpStaticIntReturn = nest.ConstRefPtrHolder.static_int_out();
+        if (*crpStaticIntReturn != 8)                                        return 2479;
+
+        // Overload pair, both declaration orders. A modifiable lvalue pointer takes the
+        // non-const reference and sees the callee's write; an rvalue takes the const one.
+        nest.Cell *crpPick = &crpCell;
+        if (crpHolder.pick_a(crpPick) != 1 || crpPick != nullptr)            return 2495;
+        crpPick = &crpCell;
+        if (crpHolder.pick_b(crpPick) != 10 || crpPick != nullptr)           return 2496;
+        if (crpHolder.pick_a(&crpCell) != 2)                                 return 2497;
+        if (crpHolder.pick_b(&crpCell) != 20)                                return 2498;
+    }
+
     return 0;
 }

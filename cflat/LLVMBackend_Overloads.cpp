@@ -62,6 +62,15 @@ static std::string PointerStars(const LLVMBackend::TypeAndValue& tv)
     return (deep && tv.DepthIsAboutThisValue()) ? "**" : "*";
 }
 
+// C++ ranks `T*&` above `T*const&` for a modifiable lvalue pointer, and lets only `T*const&`
+// bind a pointer rvalue. 0 = the overload C++ picks, 1 = viable but worse.
+static int CxxRefToPointerScore(const LLVMBackend::NamedVariable& arg,
+                                const LLVMBackend::TypeAndValue& param)
+{
+    const bool argIsLvalue = arg.Storage != nullptr && !arg.IsRvalue;
+    return (argIsLvalue != param.IsCxxConstRef) ? 0 : 1;
+}
+
 // A declared signature in CFlat spelling, e.g. "int(char*, ...)". Spells each type the way the
 // "no overload matches" candidate list does (SpellType, PointerStars as the fallback), so `const`
 // and the calling convention are not shown - neither can be why two signatures conflict.
@@ -277,6 +286,9 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
             // Arguments bound through the `iterator -> const_iterator` conversion. Fewer wins, so
             // an overload declared over the argument's own specialization is never displaced.
             int constAddedConversions = 0;
+            // Pointer arguments whose value category prefers the OTHER of a `T*&` / `T*const&`
+            // overload pair. Fewer wins, so the binding C++ picks is taken.
+            int refPtrConstMismatches = 0;
             /*
              * Arguments bound through a conversion OPERATOR. A user-defined conversion sequence
              * ranks strictly WORSE than any standard one (clang: exact match, qualification,
@@ -383,6 +395,7 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
             int constRefMaterializations = 0;
             // Arguments bound through the `iterator -> const_iterator` conversion.
             int constAddedConversions = 0;
+            int refPtrConstMismatches = 0;
             // Arguments bound through a conversion OPERATOR, the cost of their second standard
             // conversion, and the set of operators used (see Ranked for the ranking rule).
             int userConversions = 0;
@@ -510,7 +523,10 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                         || IsStackValueToCoreUniqueInterface(arg, tmpParam))
                         result = 0;
                     else if (tmpParam.IsCxxRefToPointer && tmpArg.Pointer)
+                    {
                         result = 0;
+                        refPtrConstMismatches += CxxRefToPointerScore(arg, *candidateParamItr);
+                    }
                     if (candidate.IsCxx && !tmpArg.Pointer
                         && !candidateParamItr->IsCxxRefToPointer)
                     {
@@ -690,8 +706,14 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                         }
                     }
                     else
-                        result = candidateParamItr->IsCxxRefToPointer && arg.TypeAndValue.Pointer
+                    {
+                        const bool refToPointerBind = candidateParamItr->IsCxxRefToPointer
+                            && arg.TypeAndValue.Pointer;
+                        if (refToPointerBind)
+                            refPtrConstMismatches += CxxRefToPointerScore(arg, *candidateParamItr);
+                        result = refToPointerBind
                             ? 0 : CompareUpconvert(arg.BaseType, candidateParam);
+                    }
                     if (SpellType(*this, *candidateParamItr) == "char*"
                         && arg.BaseType != nullptr && arg.BaseType->isPointerTy()
                         && (arg.IsStringLiteral || isStringLiteralValue(arg.Primary)))
@@ -880,6 +902,7 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                 ranked.constRefMaterializations = constRefMaterializations;
                 ranked.omitted = omitted;
                 ranked.constAddedConversions = constAddedConversions;
+                ranked.refPtrConstMismatches = refPtrConstMismatches;
                 ranked.userConversions = userConversions;
                 ranked.userConversionCost = userConversionCost;
                 ranked.userConversionNames = userConversionNames;
@@ -980,6 +1003,7 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
             std::vector<const Ranked*> best;
             for (const Ranked& r : perfect)
                 best.push_back(&r);
+            keepLowest(best, [](const Ranked& r) { return r.refPtrConstMismatches; });
             keepLowest(best, [](const Ranked& r) { return -r.moveScore; });
             keepLowest(best, [](const Ranked& r) { return r.omitted; });
             const Ranked* winner = settle(best, /*legacyLastWins=*/false);
@@ -1000,6 +1024,9 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
             keepLowest(best, [](const Ranked& r) { return r.boolCoercions; });
             // An overload over the argument's own specialization beats a const-added one.
             keepLowest(best, [](const Ranked& r) { return r.constAddedConversions; });
+            // `T*&` over `T*const&` for a modifiable lvalue pointer, and the reverse for a
+            // pointer rvalue - the C++ ranking of the two reference bindings.
+            keepLowest(best, [](const Ranked& r) { return r.refPtrConstMismatches; });
             // The candidate's tier is its WORST integer argument (0 identity, 1 promotion,
             // 2 conversion); the lowest tier wins before per-argument comparison.
             keepLowest(best, [](const Ranked& r) {
