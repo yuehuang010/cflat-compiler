@@ -824,6 +824,28 @@ namespace cppi
         inline int operator+(const MutFree& a, int b) noexcept { return a.value + b; }
         inline MutFree& operator+(MutFree& a, const FreeOps& b) noexcept
         { a.value += b.value; return a; }
+        /*
+         * One mutable-reference free operator per BINARY PAIR PARSER, each with its own
+         * multiplier, so a chain leg can tell which operator ran and how often. `operator|`
+         * above covers the bitwise pair; `<<`/`>>` cover the shift pair, `-`/`*`/`/` the
+         * additive and multiplicative pairs, `<` the relational one and `&&` the logical one.
+         */
+        inline MutFree& operator<<(MutFree& a, const FreeOps& b) noexcept
+        { a.value += b.value; return a; }
+        inline MutFree& operator>>(MutFree& a, const FreeOps& b) noexcept
+        { a.value += b.value * 2; return a; }
+        inline MutFree& operator-(MutFree& a, const FreeOps& b) noexcept
+        { a.value += b.value * 3; return a; }
+        inline MutFree& operator*(MutFree& a, const FreeOps& b) noexcept
+        { a.value += b.value * 4; return a; }
+        inline MutFree& operator/(MutFree& a, const FreeOps& b) noexcept
+        { a.value += b.value * 5; return a; }
+        inline MutFree& operator<<=(MutFree& a, const FreeOps& b) noexcept
+        { a.value += b.value * 6; return a; }
+        inline MutFree& operator&&(MutFree& a, const FreeOps& b) noexcept
+        { a.value += b.value * 7; return a; }
+        inline bool operator<(MutFree& a, const FreeOps& b) noexcept
+        { a.value += b.value; return a.value < b.value; }
     }
 
     char16_t char16_value(char16_t value) noexcept;

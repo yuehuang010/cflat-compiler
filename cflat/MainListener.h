@@ -5579,6 +5579,30 @@ public:
         std::string name;
     };
 
+    /*
+     * A C++ operator declared to return `T&` hands back a POINTER at the CFlat boundary. Both
+     * helpers keep that reference pointing at the real object instead of a copy:
+     * CarryCxxOperatorResult reloads it into the accumulator when another operand follows at the
+     * SAME precedence level (and records the referenced type otherwise), and
+     * NormalizeCxxReferenceOperand does the same for an operand handed UP from an inner level.
+     */
+    void CarryCxxOperatorResult(antlr4::ParserRuleContext* ctx, llvm::Value* result,
+                                bool moreOperands, llvm::Value*& accValue,
+                                llvm::Value*& accStorage, bool& accIsRvalue,
+                                llvm::Type*& accRefType);
+
+    void NormalizeCxxReferenceOperand(antlr4::ParserRuleContext* ctx,
+                                      LLVMBackend::TypedValue& operand);
+
+    void NormalizeCxxReferenceNamed(antlr4::ParserRuleContext* ctx,
+                                    LLVMBackend::NamedVariable& operand);
+
+    // The referenced value type when `value` is the pointer an operator returned for a `T&`
+    // result, else null. Fed to TypedValue::cxxRefValueType.
+    llvm::Type* CxxReferenceResultType(antlr4::ParserRuleContext* ctx,
+                                       const LLVMBackend::NamedVariable& result,
+                                       llvm::Value* value);
+
     ShiftPairResult ParseShiftPair(const ShiftOperand& lhs, const ShiftOperand& rhs,
                                    const std::string& op,
                                    CFlatParser::ShiftExpressionContext* ctx,

@@ -1425,6 +1425,9 @@ public:
         // True only for a value-producing expression. Named variables, fields, elements, aliases,
         // and dereferences remain lvalues even when their LLVM value has no storage of its own.
         bool IsRvalue = false;
+        // Non-null when Primary is the POINTER a C++ operator returned for a `T&` result: the
+        // referenced value type, carried through a parenthesized sub-expression.
+        llvm::Type* CxxRefValueType = nullptr;
         // True when the source expression is a string literal. The lowered pointer may be wrapped
         // in a constant expression before overload matching, so LLVM identity alone is insufficient.
         bool IsStringLiteral = false;
@@ -1705,6 +1708,9 @@ public:
         bool         isRvalue = false;      // value-producing expression; named lvalues keep this false
         llvm::Value* storage    = nullptr;  // lvalue storage for an addressable alias result/join
         llvm::Value* receiverStorage = nullptr; // lvalue storage retained for synthesized method calls
+        // Non-null when `value` is the POINTER a C++ operator returned for a `T&` result: the
+        // referenced value type, so an outer precedence level can reload the real object.
+        llvm::Type*  cxxRefValueType = nullptr;
         // Pointer DEPTH of the operand, carried so an operator's right operand can be judged:
         // the operator path reduces it to a raw llvm::Value and 0 means "not recorded".
         int          pointerDepth = 0;

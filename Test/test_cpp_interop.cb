@@ -2569,5 +2569,114 @@ extern int main()
         mutResult = mutDeref + mutTag;
         if (mutDeref.value != 10 || mutResult->value != 10)                       return 3068;
     }
+
+    // ---- C++ free operators returning `T&`: chains, mixed chains, joined operands (3100-3119) ----
+    // Pre-fix each chain leg FAILED: the reference the first call returned (a pointer at the
+    // CFlat boundary) was fed to the second call as if it were the struct value - exit 139 for
+    // the shift pair, a pointer-arithmetic error for `+`, a verifier failure for `* /`.
+    {
+        cppi.opsfree.FreeOps chTag = default;
+        chTag.value = 5;
+        cppi.opsfree.MutFree chShl = default;
+        cppi.opsfree.MutFree* chResult = chShl << chTag << chTag;
+        if (chShl.value != 10 || chResult->value != 10)                           return 3100;
+
+        cppi.opsfree.MutFree chShl3 = default;
+        chResult = chShl3 << chTag << chTag << chTag;
+        if (chShl3.value != 15 || chResult->value != 15)                          return 3101;
+
+        cppi.opsfree.MutFree chShr = default;
+        chResult = chShr >> chTag >> chTag;
+        if (chShr.value != 20 || chResult->value != 20)                           return 3102;
+
+        cppi.opsfree.MutFree chAdd = default;
+        chResult = chAdd + chTag + chTag;
+        if (chAdd.value != 10 || chResult->value != 10)                           return 3103;
+
+        cppi.opsfree.MutFree chSub = default;
+        chResult = chSub - chTag - chTag;
+        if (chSub.value != 30 || chResult->value != 30)                           return 3104;
+
+        cppi.opsfree.MutFree chMul = default;
+        chResult = chMul * chTag * chTag;
+        if (chMul.value != 40 || chResult->value != 40)                           return 3105;
+
+        cppi.opsfree.MutFree chDiv = default;
+        chResult = chDiv / chTag / chTag;
+        if (chDiv.value != 50 || chResult->value != 50)                           return 3106;
+
+        // Mixed chain across two precedence levels: the multipliers say both ran, once each.
+        cppi.opsfree.MutFree chMix = default;
+        chResult = chMix - chTag | chTag;
+        if (chMix.value != 20 || chResult->value != 20)                           return 3107;
+
+        cppi.opsfree.MutFree chMix2 = default;
+        chResult = chMix2 << chTag * chTag | chTag;
+        if (chMix2.value != 30 || chResult->value != 30)                          return 3108;
+
+        // A parenthesized reference result is the same operand as the bare one.
+        cppi.opsfree.MutFree chParen = default;
+        chResult = (chParen << chTag) << chTag;
+        if (chParen.value != 10 || chResult->value != 10)                         return 3109;
+
+        cppi.opsfree.MutFree chParen2 = default;
+        chResult = (chParen2) << chTag;
+        if (chParen2.value != 5 || chResult->value != 5)                          return 3110;
+
+        // The relational pair takes the reference as its left operand (`<` adds 5 too).
+        cppi.opsfree.MutFree chRel = default;
+        bool chLess = chRel << chTag < chTag;
+        if (chRel.value != 10 || chLess)                                          return 3111;
+
+        // C++ drops short-circuiting for an overloaded '&&', so the chain folds left to right.
+        cppi.opsfree.MutFree chLog = default;
+        chResult = chLog && chTag && chTag;
+        if (chLog.value != 70 || chResult->value != 70)                           return 3112;
+
+        // A ternary of two lvalues binds the SELECTED object, never a copy of the join. Both
+        // arms are asserted, so a fold onto one arm fails here.
+        cppi.opsfree.MutFree chTrue = default;
+        cppi.opsfree.MutFree chFalse = default;
+        bool chPick = chTag.value == 5;
+        chResult = (chPick ? chTrue : chFalse) | chTag;
+        if (chTrue.value != 5 || chFalse.value != 0 || chResult->value != 5)      return 3113;
+        chPick = chTag.value != 5;
+        chResult = (chPick ? chTrue : chFalse) | chTag;
+        if (chTrue.value != 5 || chFalse.value != 5 || chResult->value != 5)      return 3114;
+
+        // ACCEPT SET (unchanged by this fix): the single-operator and free COMPOUND forms.
+        cppi.opsfree.MutFree chCompound = default;
+        chCompound <<= chTag;
+        if (chCompound.value != 30)                                               return 3115;
+        cppi.opsfree.MutFree chSingle = default;
+        chResult = chSingle * chTag;
+        if (chSingle.value != 20 || chResult->value != 20)                        return 3116;
+
+        // ACCEPT SET: a MEMBER-operator chain (`Ops::operator<<` returns by value) keeps
+        // folding left to right and leaves the receiver alone.
+        cppi.Ops chMember = default;
+        chMember.value = 1;
+        cppi.Ops chMemberShift = default;
+        chMemberShift.value = 2;
+        cppi.Ops chMemberResult = chMember << chMemberShift << chMemberShift;
+        if (chMemberResult.value != 16 || chMember.value != 1)                    return 3117;
+
+        // A NESTED ternary arm joins storage too, in either position. Pre-fix (2385fb8b) the
+        // outer join saw no arm storage and refused with "cannot bind its left operand"; on
+        // master it compiled and mutated nothing. Every arm is asserted, so a fold fails here.
+        cppi.opsfree.MutFree chNestA = default;
+        cppi.opsfree.MutFree chNestB = default;
+        cppi.opsfree.MutFree chNestC = default;
+        chResult = (chPick ? chNestA : (chTag.value > 0 ? chNestB : chNestC)) | chTag;
+        if (chNestA.value != 0 || chNestB.value != 5 || chNestC.value != 0
+            || chResult->value != 5)                                              return 3118;
+
+        cppi.opsfree.MutFree chNestD = default;
+        cppi.opsfree.MutFree chNestE = default;
+        cppi.opsfree.MutFree chNestF = default;
+        chResult = (chTag.value > 0 ? (chPick ? chNestD : chNestE) : chNestF) | chTag;
+        if (chNestD.value != 0 || chNestE.value != 5 || chNestF.value != 0
+            || chResult->value != 5)                                              return 3119;
+    }
     return 0;
 }

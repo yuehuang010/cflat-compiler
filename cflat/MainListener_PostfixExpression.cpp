@@ -2705,6 +2705,10 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             if (prevPrimary->expression() != nullptr)
                             {
                                 namedVar.Storage = lastParenExprStorage;
+                                namedVar.CxxRefValueType = lastParenExprNamed.CxxRefValueType;
+                                // Parentheses do not turn a temporary into an lvalue: keep the
+                                // inner expression's rvalue-ness (a `?:` join over a temp arm).
+                                if (lastParenExprNamed.IsRvalue) namedVar.IsRvalue = true;
                                 parenthesizedPostfixStorage = namedVar.Storage;
                             }
                             // Parentheses change the spelling, never the value: hand the ownership

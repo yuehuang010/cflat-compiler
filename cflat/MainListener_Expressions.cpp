@@ -349,6 +349,12 @@ LLVMBackend::NamedVariable MainListener::ParseAssignmentExpressionNamed(CFlatPar
                 result.TypeAndValue.IsAlias = tv.isAlias;
                 result.IsRvalue = tv.isRvalue;
                 result.Storage = tv.storage;
+                result.CxxRefValueType = tv.cxxRefValueType;
+                // A `?:` over two addressable C++ objects joins their storage too; keep it so a
+                // parenthesized ternary operand still names the SELECTED object.
+                if (result.Storage == nullptr && tv.receiverStorage != nullptr
+                    && tv.value != nullptr && tv.value->getType()->isStructTy())
+                    result.Storage = tv.receiverStorage;
                 if (result.Primary)
                 {
                     result.BaseType = result.Primary->getType();
@@ -5664,6 +5670,10 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
                 auto trueTv = ParseTernaryArmExpression(expressionTrueCtx);
                 trueValue = trueTv.value;
                 trueStorage = trueTv.storage;
+                // A NESTED `?:` arm publishes its own storage join on receiverStorage: a PHI
+                // beside the value PHI names the selected object, so seed this arm from it.
+                if (trueStorage == nullptr && llvm::isa_and_nonnull<llvm::PHINode>(trueValue))
+                    trueStorage = trueTv.receiverStorage;
                 trueAlias = trueTv.isAlias;
                 trueUnsigned = trueTv.isUnsigned;
             }
@@ -5716,6 +5726,10 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
             falseValue = falseTv.value;
             falseUnsigned = falseTv.isUnsigned;
             falseStorage = falseTv.storage;
+            // A NESTED `?:` arm publishes its own storage join on receiverStorage: a PHI
+            // beside the value PHI names the selected object, so seed this arm from it.
+            if (falseStorage == nullptr && llvm::isa_and_nonnull<llvm::PHINode>(falseValue))
+                falseStorage = falseTv.receiverStorage;
             falseAlias = falseTv.isAlias;
             if (falseStorage == nullptr && falseValue != nullptr)
                 if (auto* load = llvm::dyn_cast<llvm::LoadInst>(falseValue))
@@ -6120,6 +6134,23 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
         compiler->PropagateProducedTempValue(falseValue, phi);
 
         llvm::Value* storageJoin = nullptr;
+        // Both arms are addressable C++ objects: join their STORAGE as well, so an operator
+        // taking `T&` mutates the SELECTED object instead of a copy of the joined value.
+        llvm::Value* cxxLvalueStorageJoin = nullptr;
+        bool cxxRecordJoin = false;
+        if (trueValue != nullptr && trueValue->getType()->isStructTy())
+        {
+            auto* structTy = llvm::cast<llvm::StructType>(trueValue->getType());
+            cxxRecordJoin = structTy->hasName() && compiler->IsCxxRecord(structTy->getName().str());
+        }
+        if (cxxRecordJoin && trueStorage != nullptr && falseStorage != nullptr)
+        {
+            auto* cxxStoragePhi = compiler->builder->CreatePHI(
+                compiler->builder->getPtrTy(), 2, "cxx_lvalue_storage_join");
+            cxxStoragePhi->addIncoming(trueStorage, trueEnd);
+            cxxStoragePhi->addIncoming(falseStorage, falseEnd);
+            cxxLvalueStorageJoin = cxxStoragePhi;
+        }
         if (compiler->currentFunctionReturnTV.IsAlias || trueAlias || falseAlias)
         {
             auto* storagePhi = compiler->builder->CreatePHI(
@@ -6165,6 +6196,10 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
             LLVMBackend::TypedValue result{ phi, true };
             result.isAlias = trueAlias || falseAlias;
             result.storage = storageJoin;
+            result.receiverStorage = cxxLvalueStorageJoin;
+            // No storage join means at least one arm was a temporary, so the join is one too:
+            // say so, or a `T&` parameter would silently bind a copy.
+            result.isRvalue = cxxRecordJoin && cxxLvalueStorageJoin == nullptr;
             return result;
         }
 
@@ -6192,6 +6227,8 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
         LLVMBackend::TypedValue result{ resultValue, joinUnsigned };
         result.isAlias = trueAlias || falseAlias;
         result.storage = storageJoin;
+        result.receiverStorage = cxxLvalueStorageJoin;
+        result.isRvalue = cxxRecordJoin && cxxLvalueStorageJoin == nullptr;
         return result;
     }
 
@@ -6666,14 +6703,17 @@ llvm::Value* MainListener::TryClassLogicalOperatorChain(
 
         llvm::Value* accumulator = first.value;
         llvm::Value* accumulatorStorage = first.receiverStorage;
+        bool accumulatorIsRvalue = first.isRvalue;
+        llvm::Type* accumulatorRefType = nullptr;
         for (size_t i = 1; i < operandCount; ++i)
         {
             auto rv = parseOperand(i);
+            NormalizeCxxReferenceOperand(ctx, rv);
             llvm::Value* folded = accumulator != nullptr && accumulator->getType()->isStructTy()
                 ? TryBinaryOperatorOverload(accumulator, op, rv.value, ctx, first.elemType,
                                             rv.pointerDepth, rv.elemPointer, accumulatorStorage,
                                             rv.receiverStorage, false, true,
-                                            first.isRvalue, rv.isRvalue)
+                                            accumulatorIsRvalue, rv.isRvalue)
                 : nullptr;
             if (folded == nullptr)
             {
@@ -6687,10 +6727,14 @@ llvm::Value* MainListener::TryClassLogicalOperatorChain(
                 accumulator = compiler->CreateOperation(
                     op == "&&" ? LLVMBackend::Operation::LogicalAnd
                                : LLVMBackend::Operation::LogicalOr, accumulator, right);
+                accumulatorStorage = nullptr;
+                accumulatorIsRvalue = true;
+                accumulatorRefType = nullptr;
             }
             else
-                accumulator = folded;
-            accumulatorStorage = nullptr;
+                CarryCxxOperatorResult(ctx, folded, i + 1 < operandCount, accumulator,
+                                       accumulatorStorage, accumulatorIsRvalue,
+                                       accumulatorRefType);
         }
         return accumulator;
     }
@@ -6835,16 +6879,19 @@ LLVMBackend::TypedValue MainListener::ParseInclusiveOrExpression(CFlatParser::In
             auto* compiler = Compiler(ctx);
             compiler->lastCallReturnsOwned = false;
             auto lv = ParseExclusiveOrExpression(exclusiveCtxs[0], ResultUse::Value);
+            NormalizeCxxReferenceOperand(ctx, lv);
             RegisterBorrowedStringOperandTemp(compiler, lv.value);
             compiler->RegisterOwnedPtrTemp(lv.value);
             llvm::Value* acc = lv.value;
             llvm::Value* accumulatorStorage = lv.receiverStorage;
             bool accumulatorIsRvalue = lv.isRvalue;
+            llvm::Type* accumulatorRefType = nullptr;
             bool unsignedStorage = false;
             for (size_t i = 1; i < exclusiveCtxs.size(); i++)
             {
                 compiler->lastCallReturnsOwned = false;
                 auto rv = ParseExclusiveOrExpression(exclusiveCtxs[i], ResultUse::Value);
+                NormalizeCxxReferenceOperand(ctx, rv);
                 RegisterBorrowedStringOperandTemp(compiler, rv.value);
                 compiler->RegisterOwnedPtrTemp(rv.value);
                 // A struct operand routes to 'operator|' the way the shift/relational paths do;
@@ -6862,19 +6909,9 @@ LLVMBackend::TypedValue MainListener::ParseInclusiveOrExpression(CFlatParser::In
                     resultNV.Primary = overload;
                     resultNV.TypeAndValue = compiler->lastCallReturnType;
                     DiagnoseVoidResultConsumed(ctx, resultNV, use, "'operator|'");
-                    if (compiler->lastCallReturnType.IsAlias && overload->getType()->isPointerTy()
-                        && i + 1 < exclusiveCtxs.size())
-                    {
-                        acc = compiler->CreateLoad(compiler->GetType(compiler->lastCallReturnType), overload);
-                        accumulatorStorage = overload;
-                        accumulatorIsRvalue = false;
-                    }
-                    else
-                    {
-                        acc = overload;
-                        accumulatorStorage = nullptr;
-                        accumulatorIsRvalue = !compiler->lastCallReturnType.IsAlias;
-                    }
+                    CarryCxxOperatorResult(ctx, overload, i + 1 < exclusiveCtxs.size(), acc,
+                                           accumulatorStorage, accumulatorIsRvalue,
+                                           accumulatorRefType);
                     lv.isUnsigned = resultNV.TypeAndValue.IsUnsignedInteger() != -1;
                 }
                 else
@@ -6885,6 +6922,7 @@ LLVMBackend::TypedValue MainListener::ParseInclusiveOrExpression(CFlatParser::In
                                                      lv.isUnsigned, rv.isUnsigned);
                     accumulatorStorage = nullptr;
                     accumulatorIsRvalue = true;
+                    accumulatorRefType = nullptr;
                     unsignedStorage = acc != nullptr && acc->getType()->isIntegerTy()
                         && acc->getType()->getIntegerBitWidth() < 32
                         && (lv.isUnsigned || rv.isUnsigned);
@@ -6893,6 +6931,8 @@ LLVMBackend::TypedValue MainListener::ParseInclusiveOrExpression(CFlatParser::In
             }
             LLVMBackend::TypedValue result{ acc, lv.isUnsigned };
             result.isRvalue = accumulatorIsRvalue;
+            result.receiverStorage = accumulatorStorage;
+            result.cxxRefValueType = accumulatorRefType;
             result.isUnsignedStorage = unsignedStorage;
             return result;
         }
@@ -6912,16 +6952,19 @@ LLVMBackend::TypedValue MainListener::ParseExclusiveOrExpression(CFlatParser::Ex
             auto* compiler = Compiler(ctx);
             compiler->lastCallReturnsOwned = false;
             auto lv = ParseAndExpression(andCtxs[0], ResultUse::Value);
+            NormalizeCxxReferenceOperand(ctx, lv);
             RegisterBorrowedStringOperandTemp(compiler, lv.value);
             compiler->RegisterOwnedPtrTemp(lv.value);
             llvm::Value* acc = lv.value;
             llvm::Value* accumulatorStorage = lv.receiverStorage;
             bool accumulatorIsRvalue = lv.isRvalue;
+            llvm::Type* accumulatorRefType = nullptr;
             bool unsignedStorage = false;
             for (size_t i = 1; i < andCtxs.size(); i++)
             {
                 compiler->lastCallReturnsOwned = false;
                 auto rv = ParseAndExpression(andCtxs[i], ResultUse::Value);
+                NormalizeCxxReferenceOperand(ctx, rv);
                 RegisterBorrowedStringOperandTemp(compiler, rv.value);
                 compiler->RegisterOwnedPtrTemp(rv.value);
                 // A struct operand routes to 'operator^' the way the shift/relational paths do;
@@ -6939,19 +6982,9 @@ LLVMBackend::TypedValue MainListener::ParseExclusiveOrExpression(CFlatParser::Ex
                     resultNV.Primary = overload;
                     resultNV.TypeAndValue = compiler->lastCallReturnType;
                     DiagnoseVoidResultConsumed(ctx, resultNV, use, "'operator^'");
-                    if (compiler->lastCallReturnType.IsAlias && overload->getType()->isPointerTy()
-                        && i + 1 < andCtxs.size())
-                    {
-                        acc = compiler->CreateLoad(compiler->GetType(compiler->lastCallReturnType), overload);
-                        accumulatorStorage = overload;
-                        accumulatorIsRvalue = false;
-                    }
-                    else
-                    {
-                        acc = overload;
-                        accumulatorStorage = nullptr;
-                        accumulatorIsRvalue = !compiler->lastCallReturnType.IsAlias;
-                    }
+                    CarryCxxOperatorResult(ctx, overload, i + 1 < andCtxs.size(), acc,
+                                           accumulatorStorage, accumulatorIsRvalue,
+                                           accumulatorRefType);
                     lv.isUnsigned = resultNV.TypeAndValue.IsUnsignedInteger() != -1;
                 }
                 else
@@ -6962,6 +6995,7 @@ LLVMBackend::TypedValue MainListener::ParseExclusiveOrExpression(CFlatParser::Ex
                                                      lv.isUnsigned, rv.isUnsigned);
                     accumulatorStorage = nullptr;
                     accumulatorIsRvalue = true;
+                    accumulatorRefType = nullptr;
                     unsignedStorage = acc != nullptr && acc->getType()->isIntegerTy()
                         && acc->getType()->getIntegerBitWidth() < 32
                         && (lv.isUnsigned || rv.isUnsigned);
@@ -6970,6 +7004,8 @@ LLVMBackend::TypedValue MainListener::ParseExclusiveOrExpression(CFlatParser::Ex
             }
             LLVMBackend::TypedValue result{ acc, lv.isUnsigned };
             result.isRvalue = accumulatorIsRvalue;
+            result.receiverStorage = accumulatorStorage;
+            result.cxxRefValueType = accumulatorRefType;
             result.isUnsignedStorage = unsignedStorage;
             return result;
         }
@@ -6989,16 +7025,19 @@ LLVMBackend::TypedValue MainListener::ParseAndExpression(CFlatParser::AndExpress
             auto* compiler = Compiler(ctx);
             compiler->lastCallReturnsOwned = false;
             auto lv = ParseEqualityExpression(nextCtxs[0], ResultUse::Value);
+            NormalizeCxxReferenceOperand(ctx, lv);
             RegisterBorrowedStringOperandTemp(compiler, lv.value);
             compiler->RegisterOwnedPtrTemp(lv.value);
             llvm::Value* acc = lv.value;
             llvm::Value* accumulatorStorage = lv.receiverStorage;
             bool accumulatorIsRvalue = lv.isRvalue;
+            llvm::Type* accumulatorRefType = nullptr;
             bool unsignedStorage = false;
             for (size_t i = 1; i < nextCtxs.size(); i++)
             {
                 compiler->lastCallReturnsOwned = false;
                 auto rv = ParseEqualityExpression(nextCtxs[i], ResultUse::Value);
+                NormalizeCxxReferenceOperand(ctx, rv);
                 RegisterBorrowedStringOperandTemp(compiler, rv.value);
                 compiler->RegisterOwnedPtrTemp(rv.value);
                 // A struct operand routes to 'operator&' the way the shift/relational paths do;
@@ -7016,19 +7055,9 @@ LLVMBackend::TypedValue MainListener::ParseAndExpression(CFlatParser::AndExpress
                     resultNV.Primary = overload;
                     resultNV.TypeAndValue = compiler->lastCallReturnType;
                     DiagnoseVoidResultConsumed(ctx, resultNV, use, "'operator&'");
-                    if (compiler->lastCallReturnType.IsAlias && overload->getType()->isPointerTy()
-                        && i + 1 < nextCtxs.size())
-                    {
-                        acc = compiler->CreateLoad(compiler->GetType(compiler->lastCallReturnType), overload);
-                        accumulatorStorage = overload;
-                        accumulatorIsRvalue = false;
-                    }
-                    else
-                    {
-                        acc = overload;
-                        accumulatorStorage = nullptr;
-                        accumulatorIsRvalue = !compiler->lastCallReturnType.IsAlias;
-                    }
+                    CarryCxxOperatorResult(ctx, overload, i + 1 < nextCtxs.size(), acc,
+                                           accumulatorStorage, accumulatorIsRvalue,
+                                           accumulatorRefType);
                     lv.isUnsigned = resultNV.TypeAndValue.IsUnsignedInteger() != -1;
                 }
                 else
@@ -7039,6 +7068,7 @@ LLVMBackend::TypedValue MainListener::ParseAndExpression(CFlatParser::AndExpress
                                                      lv.isUnsigned, rv.isUnsigned);
                     accumulatorStorage = nullptr;
                     accumulatorIsRvalue = true;
+                    accumulatorRefType = nullptr;
                     unsignedStorage = acc != nullptr && acc->getType()->isIntegerTy()
                         && acc->getType()->getIntegerBitWidth() < 32
                         && (lv.isUnsigned || rv.isUnsigned);
@@ -7047,6 +7077,8 @@ LLVMBackend::TypedValue MainListener::ParseAndExpression(CFlatParser::AndExpress
             }
             LLVMBackend::TypedValue result{ acc, lv.isUnsigned };
             result.isRvalue = accumulatorIsRvalue;
+            result.receiverStorage = accumulatorStorage;
+            result.cxxRefValueType = accumulatorRefType;
             result.isUnsignedStorage = unsignedStorage;
             return result;
         }
@@ -7092,10 +7124,12 @@ LLVMBackend::TypedValue MainListener::ParseEqualityExpression(CFlatParser::Equal
             // yields a bool, so the pointer cannot escape and the temp is freed at the same point.
             Compiler(ctx)->lastCallReturnsOwned = false;
             auto lv = ParseTypeCheckExpression(nextCtxs[0], ResultUse::Value);
+            NormalizeCxxReferenceOperand(ctx, lv);
             RegisterBorrowedStringOperandTemp(Compiler(ctx), lv.value);
             Compiler(ctx)->RegisterOwnedPtrTemp(lv.value);
             Compiler(ctx)->lastCallReturnsOwned = false;
             auto rv = ParseTypeCheckExpression(nextCtxs[1], ResultUse::Value);
+            NormalizeCxxReferenceOperand(ctx, rv);
             RegisterBorrowedStringOperandTemp(Compiler(ctx), rv.value);
             Compiler(ctx)->RegisterOwnedPtrTemp(rv.value);
             std::string op = ctx->children[1]->getText();
@@ -7188,6 +7222,7 @@ LLVMBackend::TypedValue MainListener::TypedValueOfNamedOperand(LLVMBackend::Name
         LLVMBackend::TypedValue result{ LoadNamedVariable(namedVar), isUnsigned };
         result.isAlias = namedVar.TypeAndValue.IsAlias || namedVar.IsAliasBorrow;
         result.isRvalue = namedVar.IsRvalue;
+        result.cxxRefValueType = namedVar.CxxRefValueType;
         result.storage = result.isAlias ? namedVar.Storage : nullptr;
         result.receiverStorage = namedVar.Storage;
         if (result.isAlias) Compiler(ctx)->RegisterAliasValue(result.value);
@@ -7847,10 +7882,12 @@ LLVMBackend::TypedValue MainListener::ParseRelationalExpression(CFlatParser::Rel
             // Owning-POINTER operands are registered here too - see ParseEqualityExpression.
             Compiler(ctx)->lastCallReturnsOwned = false;
             auto lv = ParseShiftExpression(nextCtxs[0], ResultUse::Value);
+            NormalizeCxxReferenceOperand(ctx, lv);
             RegisterBorrowedStringOperandTemp(Compiler(ctx), lv.value);
             Compiler(ctx)->RegisterOwnedPtrTemp(lv.value);
             Compiler(ctx)->lastCallReturnsOwned = false;
             auto rv = ParseShiftExpression(nextCtxs[1], ResultUse::Value);
+            NormalizeCxxReferenceOperand(ctx, rv);
             RegisterBorrowedStringOperandTemp(Compiler(ctx), rv.value);
             Compiler(ctx)->RegisterOwnedPtrTemp(rv.value);
             std::string op = ctx->children[1]->getText();
@@ -8283,6 +8320,8 @@ MainListener::ShiftPairResult MainListener::ParseShiftPair(
                     ShiftPairResult result;
                     result.value = { overload, resultNV.TypeAndValue.IsUnsignedInteger() != -1 };
                     result.value.receiverStorage = resultNV.Storage;
+                    result.value.isRvalue = !resultNV.TypeAndValue.IsAlias;
+                    result.value.cxxRefValueType = CxxReferenceResultType(ctx, resultNV, overload);
                     result.named = resultNV;
                     return result;
                 }
@@ -8312,6 +8351,7 @@ MainListener::ShiftPairResult MainListener::ParseShiftPair(
                 ShiftPairResult result;
                 result.value = { res, resultNV.TypeAndValue.IsUnsignedInteger() != -1 };
                 result.value.receiverStorage = resultNV.Storage;
+                result.value.cxxRefValueType = CxxReferenceResultType(ctx, resultNV, res);
                 result.named = resultNV;
                 return result;
             }
@@ -8369,12 +8409,14 @@ LLVMBackend::TypedValue MainListener::ParseShiftExpression(CFlatParser::ShiftExp
 
         ShiftOperand lhs;
         lhs.value = ParseAdditiveExpression(nextCtxs[0], ResultUse::Value);
+        NormalizeCxxReferenceOperand(ctx, lhs.value);
         lhs.name = TryGetSimpleIdentifier(nextCtxs[0]);
         lhs.named = lookup(lhs.name);
         for (size_t i = 1; i < nextCtxs.size(); ++i)
         {
             ShiftOperand rhs;
             rhs.value = ParseAdditiveExpression(nextCtxs[i], ResultUse::Value);
+            NormalizeCxxReferenceOperand(ctx, rhs.value);
             rhs.name = TryGetSimpleIdentifier(nextCtxs[i]);
             rhs.named = lookup(rhs.name);
             auto pair = ParseShiftPair(lhs, rhs, operators[i - 1], ctx,
@@ -8384,12 +8426,14 @@ LLVMBackend::TypedValue MainListener::ParseShiftExpression(CFlatParser::ShiftExp
             lhs.named = pair.named;
             lhs.name = pair.name;
             lhs.accumulated = true;
-            if (i + 1 < nextCtxs.size() && lhs.named.Primary == nullptr
-                && lhs.named.Storage != nullptr && !lhs.named.TypeAndValue.Pointer)
+            // The pair returned a reference: reload the referenced object so the next operand
+            // operates on it, not on the pointer (a chained `a << b << c`).
+            if (i + 1 < nextCtxs.size() && lhs.value.cxxRefValueType != nullptr)
             {
-                lhs.value.value = compiler->CreateLoad(lhs.named.Storage);
-                lhs.value.receiverStorage = lhs.named.Storage;
+                NormalizeCxxReferenceOperand(ctx, lhs.value);
                 lhs.value.isAlias = true;
+                lhs.named = {};
+                lhs.name.clear();
             }
         }
         return lhs.value;
@@ -8409,9 +8453,11 @@ LLVMBackend::TypedValue MainListener::ParseAdditiveExpression(CFlatParser::Addit
             // otherwise leave the flag set and mis-register the next plain-variable operand (double-free).
             Compiler(ctx)->lastCallReturnsOwned = false;
             auto lv = ParseMultiplicativeExpression(nextCtxs[0], ResultUse::Value);
+            NormalizeCxxReferenceOperand(ctx, lv);
             llvm::Value* lvalue = lv.value;
             llvm::Value* lhsStorage = lv.receiverStorage;
             bool lhsIsRvalue = lv.isRvalue;
+            llvm::Type* lhsRefType = nullptr;
             bool lu = lv.isUnsigned;
             llvm::Type* elemType = lv.elemType;
             bool unsignedStorage = false;
@@ -8425,6 +8471,7 @@ LLVMBackend::TypedValue MainListener::ParseAdditiveExpression(CFlatParser::Addit
             {
                 Compiler(ctx)->lastCallReturnsOwned = false;
                 auto rv = ParseMultiplicativeExpression(nextCtxs[i], ResultUse::Value);
+                NormalizeCxxReferenceOperand(ctx, rv);
                 llvm::Value* rvalue = rv.value;
                 bool ru = rv.isUnsigned;
                 TrackOwnedStringOperatorResult(Compiler(ctx), rvalue);
@@ -8508,11 +8555,16 @@ LLVMBackend::TypedValue MainListener::ParseAdditiveExpression(CFlatParser::Addit
                         resultNV.TypeAndValue = Compiler(ctx)->lastCallReturnType;
                         DiagnoseVoidResultConsumed(ctx, resultNV, use, std::format("'operator{}'", op));
                     }
-                    lvalue = overload ? overload : Compiler(ctx)->CreateOperation(op, lvalue, rvalue, lu, ru);
-                    lhsStorage = overload && overload->getType()->isStructTy()
-                        && Compiler(ctx)->lastCxxRetValue_ == overload
-                        ? Compiler(ctx)->lastCxxRetTemp_ : nullptr;
-                    lhsIsRvalue = overload == nullptr || !Compiler(ctx)->lastCallReturnType.IsAlias;
+                    if (overload != nullptr)
+                        CarryCxxOperatorResult(ctx, overload, i + 1 < nextCtxs.size(), lvalue,
+                                               lhsStorage, lhsIsRvalue, lhsRefType);
+                    else
+                    {
+                        lvalue = Compiler(ctx)->CreateOperation(op, lvalue, rvalue, lu, ru);
+                        lhsStorage = nullptr;
+                        lhsIsRvalue = true;
+                        lhsRefType = nullptr;
+                    }
                     unsignedStorage = !overload && lvalue != nullptr && lvalue->getType()->isIntegerTy()
                         && lvalue->getType()->getIntegerBitWidth() < 32 && (lu || ru);
                     // An overload's signedness is its RETURN type, not the operands' flags.
@@ -8524,6 +8576,8 @@ LLVMBackend::TypedValue MainListener::ParseAdditiveExpression(CFlatParser::Addit
 
             LLVMBackend::TypedValue result{ lvalue, lu };
             result.isRvalue = lhsIsRvalue;
+            result.receiverStorage = lhsStorage;
+            result.cxxRefValueType = lhsRefType;
             result.isUnsignedStorage = unsignedStorage;
             result.elemType = elemType;
             return result;
@@ -8916,17 +8970,35 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
         // as the value. A PHI ((c ? a : b) == d, a re-materialized temporary) is fed by several
         // slots, so handing one arm's storage to a C++ operator that mutates its receiver would
         // write to the wrong object. Drop it and take the copy path instead.
-        if (llvm::isa<llvm::PHINode>(lvalue)) lhsStorage = nullptr;
-        if (rvalue != nullptr && llvm::isa<llvm::PHINode>(rvalue)) rhsStorage = nullptr;
-
-        // A C++ right operand keeps the left literal as the `char*` a C++ free operator is
-        // declared over; wrapping it would offer only CFlat 'string' candidates.
         auto isCxxRecordValue = [&](llvm::Value* value) {
             if (value == nullptr || !value->getType()->isStructTy()) return false;
             auto* st = llvm::cast<llvm::StructType>(value->getType());
             if (st->isLiteral() || !st->hasName()) return false;
             return compiler->IsCxxRecord(st->getName().str());
         };
+        // A storage PHI built BESIDE the value PHI, over the same incoming blocks, is the
+        // parallel join: it names whichever arm was selected, so it stays.
+        auto isParallelStorageJoin = [](llvm::Value* value, llvm::Value* storage) {
+            auto* valuePhi = llvm::dyn_cast_or_null<llvm::PHINode>(value);
+            auto* storagePhi = llvm::dyn_cast_or_null<llvm::PHINode>(storage);
+            if (valuePhi == nullptr || storagePhi == nullptr) return false;
+            if (valuePhi->getParent() != storagePhi->getParent()) return false;
+            if (valuePhi->getNumIncomingValues() != storagePhi->getNumIncomingValues())
+                return false;
+            for (unsigned i = 0; i < valuePhi->getNumIncomingValues(); ++i)
+                if (valuePhi->getIncomingBlock(i) != storagePhi->getIncomingBlock(i)) return false;
+            return true;
+        };
+        // Only a C++ record keeps it: native alias joins stay on master's copy path.
+        if (llvm::isa<llvm::PHINode>(lvalue)
+            && !(isCxxRecordValue(lvalue) && isParallelStorageJoin(lvalue, lhsStorage)))
+            lhsStorage = nullptr;
+        if (rvalue != nullptr && llvm::isa<llvm::PHINode>(rvalue)
+            && !(isCxxRecordValue(rvalue) && isParallelStorageJoin(rvalue, rhsStorage)))
+            rhsStorage = nullptr;
+
+        // A C++ right operand keeps the left literal as the `char*` a C++ free operator is
+        // declared over; wrapping it would offer only CFlat 'string' candidates.
         bool lhsStringLiteral = false;
 
         // If the LHS is a string literal (ptr to global constant), wrap it
@@ -9584,14 +9656,18 @@ LLVMBackend::TypedValue MainListener::ParseMultiplicativeExpression(CFlatParser:
         else if (nextCtxs.size() > 1)
         {
             auto firstNV = ParseCastExpression(nextCtxs[0], false, ResultUse::Value);
+            NormalizeCxxReferenceNamed(ctx, firstNV);
             bool lu = firstNV.TypeAndValue.IsUnsignedInteger() != -1;
             bool lhsIsRvalue = firstNV.IsRvalue;
             llvm::Value* lvalue = LoadNamedVariable(firstNV);
+            llvm::Value* lhsStorage = firstNV.Storage;
+            llvm::Type* lhsRefType = nullptr;
             bool unsignedStorage = false;
 
             for (size_t i = 1; i < nextCtxs.size(); i++)
             {
                 auto rightNV = ParseCastExpression(nextCtxs[i], false, ResultUse::Value);
+                NormalizeCxxReferenceNamed(ctx, rightNV);
                 bool ru = rightNV.TypeAndValue.IsUnsignedInteger() != -1;
                 llvm::Value* rvalue = LoadNamedVariable(rightNV);
                 unsigned leftBits = BinaryOperandBits(lvalue);
@@ -9602,8 +9678,8 @@ LLVMBackend::TypedValue MainListener::ParseMultiplicativeExpression(CFlatParser:
                                                               rightNV.TypeAndValue.DepthIsAboutThisValue()
                                                                   ? rightNV.TypeAndValue.PointerDepth : 0,
                                                               rightNV.TypeAndValue.ElemPointer,
-                                                              firstNV.Storage, rightNV.Storage,
-                                                              true, true, firstNV.IsRvalue,
+                                                              lhsStorage, rightNV.Storage,
+                                                              true, true, lhsIsRvalue,
                                                               rightNV.IsRvalue);
                 if (overload)
                 {
@@ -9612,8 +9688,16 @@ LLVMBackend::TypedValue MainListener::ParseMultiplicativeExpression(CFlatParser:
                     resultNV.TypeAndValue = Compiler(ctx)->lastCallReturnType;
                     DiagnoseVoidResultConsumed(ctx, resultNV, use, std::format("'operator{}'", op));
                 }
-                lvalue = overload ? overload : Compiler(ctx)->CreateOperation(op, lvalue, rvalue, lu, ru);
-                lhsIsRvalue = overload == nullptr || !Compiler(ctx)->lastCallReturnType.IsAlias;
+                if (overload != nullptr)
+                    CarryCxxOperatorResult(ctx, overload, i + 1 < nextCtxs.size(), lvalue,
+                                           lhsStorage, lhsIsRvalue, lhsRefType);
+                else
+                {
+                    lvalue = Compiler(ctx)->CreateOperation(op, lvalue, rvalue, lu, ru);
+                    lhsStorage = nullptr;
+                    lhsIsRvalue = true;
+                    lhsRefType = nullptr;
+                }
                 unsignedStorage = !overload && lvalue != nullptr && lvalue->getType()->isIntegerTy()
                     && lvalue->getType()->getIntegerBitWidth() < 32 && (lu || ru);
                 // An overload's signedness is its RETURN type, not the operands' flags.
@@ -9623,6 +9707,8 @@ LLVMBackend::TypedValue MainListener::ParseMultiplicativeExpression(CFlatParser:
 
             LLVMBackend::TypedValue result{ lvalue, lu };
             result.isRvalue = lhsIsRvalue;
+            result.receiverStorage = lhsStorage;
+            result.cxxRefValueType = lhsRefType;
             result.isUnsignedStorage = unsignedStorage;
             return result;
         }
@@ -15820,6 +15906,74 @@ void MainListener::ClassifyPostfixCallResult(
             structVar = result;
             interfaceVar = {};
         }
+}
+
+void MainListener::CarryCxxOperatorResult(
+        antlr4::ParserRuleContext* ctx, llvm::Value* result, bool moreOperands,
+        llvm::Value*& accValue, llvm::Value*& accStorage, bool& accIsRvalue,
+        llvm::Type*& accRefType) {
+        auto* compiler = Compiler(ctx);
+        const auto& returnType = compiler->lastCallReturnType;
+        accValue = result;
+        accStorage = nullptr;
+        accIsRvalue = !returnType.IsAlias;
+        accRefType = nullptr;
+        if (result == nullptr) return;
+        // A by-value C++ class return lives in its sret temporary; that slot is the operand's
+        // storage for a following operator, exactly as the additive path already carried it.
+        if (!returnType.IsAlias)
+        {
+            if (result->getType()->isStructTy() && compiler->lastCxxRetValue_ == result)
+                accStorage = compiler->lastCxxRetTemp_;
+            return;
+        }
+        if (!result->getType()->isPointerTy()) return;
+        auto* valueType = compiler->GetType(returnType);
+        if (valueType == nullptr) return;
+        if (!moreOperands)
+        {
+            accRefType = valueType;
+            return;
+        }
+        accValue = compiler->CreateLoad(valueType, result);
+        accStorage = result;
+        accIsRvalue = false;
+}
+
+llvm::Type* MainListener::CxxReferenceResultType(
+        antlr4::ParserRuleContext* ctx, const LLVMBackend::NamedVariable& result,
+        llvm::Value* value) {
+        if (!result.TypeAndValue.IsAlias || result.TypeAndValue.Pointer || value == nullptr
+            || !value->getType()->isPointerTy())
+            return nullptr;
+        return Compiler(ctx)->GetType(result.TypeAndValue);
+}
+
+void MainListener::NormalizeCxxReferenceNamed(
+        antlr4::ParserRuleContext* ctx, LLVMBackend::NamedVariable& operand) {
+        if (operand.CxxRefValueType == nullptr || operand.Primary == nullptr
+            || !operand.Primary->getType()->isPointerTy())
+            return;
+        operand.Storage = operand.Primary;
+        operand.BaseType = operand.CxxRefValueType;
+        operand.Primary = Compiler(ctx)->CreateLoad(operand.CxxRefValueType, operand.Storage);
+        operand.CxxRefValueType = nullptr;
+        operand.IsRvalue = false;
+}
+
+void MainListener::NormalizeCxxReferenceOperand(
+        antlr4::ParserRuleContext* ctx, LLVMBackend::TypedValue& operand) {
+        if (operand.cxxRefValueType == nullptr || operand.value == nullptr
+            || !operand.value->getType()->isPointerTy())
+            return;
+        auto* compiler = Compiler(ctx);
+        operand.receiverStorage = operand.value;
+        operand.value = compiler->CreateLoad(operand.cxxRefValueType, operand.value);
+        operand.cxxRefValueType = nullptr;
+        operand.isRvalue = false;
+        operand.elemType = nullptr;
+        operand.pointerDepth = 0;
+        operand.elemPointer = false;
 }
 
 void MainListener::PrepareAliasCallResult(

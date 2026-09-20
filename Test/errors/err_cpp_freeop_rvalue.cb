@@ -11,5 +11,11 @@ extern int main()
     expect_error("C++ 'operator|' cannot bind its left operand") {
         cppfop.Box<int>* result = cppfop.Box<int>(0) | cppfop.Box<int>(5);
     }
+    // The shift pair refuses the same shape: a call result is an rvalue, so it does not
+    // bind the non-const `MutFree&` parameter.
+    expect_error("C++ 'operator<<' cannot bind its left operand") {
+        cppi.opsfree.FreeOps shiftTag = default;
+        cppi.opsfree.MutFree* shiftResult = cppi.opsfree.make_mutfree() << shiftTag;
+    }
     return 0;
 }
