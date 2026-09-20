@@ -3963,6 +3963,20 @@ void LLVMBackend::GeneratedCxxDefinitionsFor(
 
             TypeSpelling parsed;
             if (!DemangleType(*this, type, parsed)) return;
+            // A pointer or view argument is prefix-mangled ('.p$BP'), so normalize it to the
+            // pointee before checking generated records and incomplete [cpp] struct names.
+            if (parsed.pointerDepth > 0 || parsed.view)
+            {
+                TypeSpelling pointee = parsed;
+                pointee.pointerDepth = 0;
+                pointee.view = false;
+                const std::string pointeeName = MangleType(*this, pointee);
+                if (pointeeName != type)
+                {
+                    visit(pointeeName);
+                    return;
+                }
+            }
             for (const auto& arg : parsed.args) visit(MangleType(*this, arg));
         };
         for (const std::string& type : cflatTypeNames) visit(type);
@@ -8074,6 +8088,20 @@ bool LLVMBackend::RequestCxxForeignType(const std::string& cflatName, const std:
             && !persistOnSuccess;
         const bool upgradingTentative = retryingTentativeCxxType_
             && cxxTentativeTypes_.count(cflatName) != 0;
+        const bool uniquePtrSpelling = cxxSpelling.starts_with("std::unique_ptr<")
+            || cxxSpelling.starts_with("std::vector<std::unique_ptr<");
+        const bool incompleteUniquePtrTentative = incompleteTentative && uniquePtrSpelling;
+        // Clang reports "no matching function for call to '__construct_at'" for vector<unique_ptr>
+        // and "invalid application of 'sizeof' to an incomplete type '__cflat_user::BP'" directly.
+        const auto allowsIncompleteUniquePtrDiagnostic = [&](const std::string& text) {
+            const std::string first = FirstCxxErrorLine(text);
+            constexpr std::string_view prefix =
+                "invalid application of 'sizeof' to an incomplete type '";
+            const bool incompleteSize = first.starts_with(prefix) && first.size() > prefix.size() + 1
+                && first.back() == '\'';
+            return incompleteUniquePtrTentative
+                && (incompleteSize || first == "no matching function for call to '__construct_at'");
+        };
         const bool rejectClangErrors = !effectivePrefixSource.empty()
             && cxxSpelling.find('<') != std::string::npos
             && !cxxSpelling.starts_with("std::shared_ptr<");
@@ -8229,7 +8257,8 @@ bool LLVMBackend::RequestCxxForeignType(const std::string& cflatName, const std:
                     if (!probe.invalidCxxTypeRequestError.empty())
                         return fail(probe.invalidCxxTypeRequestError);
                 }
-                if (rejectClangErrors && !probe.firstError.empty())
+                if (rejectClangErrors && !probe.firstError.empty()
+                    && !allowsIncompleteUniquePtrDiagnostic(probe.firstError))
                     return fail(std::format("C++ type '{}' could not be parsed: {}",
                                             cxxSpelling, FirstCxxErrorLine(probe.firstError)));
                 if (probe.records.empty())
@@ -8264,12 +8293,15 @@ bool LLVMBackend::RequestCxxForeignType(const std::string& cflatName, const std:
                 if (!probeRecords.empty())
                     StoreCxxTypeRequestCache(group, probeKey, /*emitDefinitions*/ false,
                                              std::move(entry),
-                                             /*allowDisk*/ (!tentative || persistOnSuccess)
+                                             /*allowDisk*/ !incompleteUniquePtrTentative
+                                                 && (!tentative || persistOnSuccess)
                                                  && (!rejectClangErrors
                                                      || probe.firstError.empty())
                                                  && !probe.records.empty(),
                                              /*allowDiskReason*/
-                                             tentative && !persistOnSuccess
+                                             incompleteUniquePtrTentative
+                                                 ? "incomplete unique_ptr request"
+                                                 : tentative && !persistOnSuccess
                                                  ? "tentative request"
                                                  : (rejectClangErrors && !probe.firstError.empty()
                                                         ? "rejected clang error"
@@ -8353,7 +8385,8 @@ bool LLVMBackend::RequestCxxForeignType(const std::string& cflatName, const std:
             }
             else
                 raw = std::move(probe);
-            if (!finalCached && rejectClangErrors && !raw.firstError.empty())
+            if (!finalCached && rejectClangErrors && !raw.firstError.empty()
+                && !allowsIncompleteUniquePtrDiagnostic(raw.firstError))
                 return fail(std::format("C++ type '{}' could not be parsed: {}",
                                         cxxSpelling, FirstCxxErrorLine(raw.firstError)));
             if (!finalCached && raw.records.empty())
@@ -8405,11 +8438,14 @@ bool LLVMBackend::RequestCxxForeignType(const std::string& cflatName, const std:
                 entry.cxxBitcode = requestBitcode;
                 StoreCxxTypeRequestCache(group, requestKey, needDefinitions,
                                          std::move(entry),
-                                         /*allowDisk*/ (!tentative || persistOnSuccess)
+                                         /*allowDisk*/ !incompleteUniquePtrTentative
+                                             && (!tentative || persistOnSuccess)
                                              && (!rejectClangErrors || raw.firstError.empty())
                                              && !raw.records.empty(),
                                          /*allowDiskReason*/
-                                         tentative && !persistOnSuccess
+                                         incompleteUniquePtrTentative
+                                             ? "incomplete unique_ptr request"
+                                             : tentative && !persistOnSuccess
                                              ? "tentative request"
                                              : (rejectClangErrors && !raw.firstError.empty()
                                                     ? "rejected clang error" : nullptr));

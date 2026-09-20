@@ -49,6 +49,8 @@ import cpp "vector" cache;
 import cpp "string" cache;
 import cpp "memory" cache;
 import cpp "functional" cache;
+import cpp "deque" cache;
+import cpp "map" cache;
 // std::function as a MEMBER parameter and as a RETURN type.
 import cpp "library/cpp_interop_stdfn.h" cache;
 
@@ -447,6 +449,86 @@ void nobase_bump(Plain* p)
 {
     p.a = p.a + 1;
 }
+
+// Signature coverage for a generated [cpp] record nested inside C++ template arguments. The
+// first declaration deliberately precedes GrsSigBP to pin declaration-order independence.
+int grs_sig_order(std.vector<std.vector<GrsSigBP*>> v) { return (int)v.size() + 1930; }
+
+[cpp] struct GrsSigBP
+{
+    int v = 7;
+};
+std.vector<std.unique_ptr<GrsSigBP>> grs_sig_unique_global = default;
+
+int grs_sig_param(std.vector<std.vector<GrsSigBP*>> v) { return (int)v.size() + 1931; }
+std.vector<std.vector<GrsSigBP*>> grs_sig_return()
+{
+    std.vector<std.vector<GrsSigBP*>> out = default;
+    return out;
+}
+int grs_sig_depth3(std.vector<std.vector<std.vector<GrsSigBP*>>> v)
+{
+    return (int)v.size() + 1933;
+}
+int grs_sig_shared(std.vector<std.shared_ptr<GrsSigBP>> v)
+{
+    return (int)v.size() + 1934;
+}
+int grs_sig_unique(std.vector<std.unique_ptr<GrsSigBP>>* v)
+{
+    if (v == nullptr || v->size() != 1 || (*v)[0].get() == nullptr) return 0;
+    return (*v)[0].get()->v + 1928;
+}
+int grs_sig_deque(std.deque<std.vector<GrsSigBP*>> v)
+{
+    return (int)v.size() + 1936;
+}
+int grs_sig_map(std.map<int, std.vector<GrsSigBP*>> v)
+{
+    return (int)v.size() + 1937;
+}
+struct GrsSigCflatHolder
+{
+    std.vector<std.vector<GrsSigBP*>> rows = default;
+};
+[cpp] struct GrsSigCppHolder
+{
+    std.vector<std.vector<GrsSigBP*>> rows = default;
+};
+std.vector<std.vector<GrsSigBP*>> grs_sig_global = default;
+using GrsSigBPPtr = GrsSigBP*;
+int grs_sig_alias(std.vector<std.vector<GrsSigBPPtr>> v)
+{
+    return (int)v.size() + 1941;
+}
+
+namespace grs_sig_ns
+{
+    [cpp] struct BP
+    {
+        int v = 8;
+    };
+    int take(std.vector<std.vector<BP*>> v) { return (int)v.size() + 1942; }
+}
+
+[cpp] struct GrsSigDerived : cpppoly.Shape
+{
+    override int area() { return 9; }
+};
+int grs_sig_base(std.vector<std.vector<GrsSigDerived*>> v)
+{
+    return (int)v.size() + 1943;
+}
+// Pre-fix this before-definition signature reports "cannot find the type"; the base clause is
+// the only generated-record marker.
+int grs_sig_base_only(std.vector<std.vector<GrsSigBaseOnly*>> v)
+{
+    return (int)v.size() + 1949;
+}
+struct GrsSigBaseOnly : cpppoly.Shape
+{
+    override int area() { return 10; }
+};
 
 extern int main()
 {
@@ -1222,6 +1304,42 @@ extern int main()
     if (cppfn.apply_val(std.function<int(int)>(stdfn_twice), 9) != 18)     return 1926;
     if (cppfn.apply_ref(std.function<int(int)>(stdfn_twice), 11) != 22)    return 1927;
     if (cppfn.apply_rv(std.function<int(int)>(stdfn_twice), 12) != 24)     return 1928;
+
+    // Generated-record signature legs; the unique_ptr container is global because a local C++ owner
+    // hits the existing no-destructor limitation, but this leg still inserts and reads a BP.
+    std.vector<std.vector<GrsSigBP*>> grsRows = default;
+    if (grs_sig_order(grsRows) != 1930)                                      return 1930;
+    if (grs_sig_param(grsRows) != 1931)                                      return 1931;
+    auto grsReturned = grs_sig_return();
+    if ((int)grsReturned.size() != 0)                                        return 1932;
+    std.vector<std.vector<std.vector<GrsSigBP*>>> grsDeep = default;
+    if (grs_sig_depth3(grsDeep) != 1933)                                    return 1933;
+    std.vector<std.shared_ptr<GrsSigBP>> grsShared = default;
+    if (grs_sig_shared(grsShared) != 1934)                                  return 1934;
+    grs_sig_unique_global.push_back(std.unique_ptr<GrsSigBP>(new GrsSigBP()));
+    if (grs_sig_unique(&grs_sig_unique_global) != 1935)                       return 1935;
+    std.deque<std.vector<GrsSigBP*>> grsDeque = default;
+    if (grs_sig_deque(grsDeque) != 1936)                                    return 1936;
+    std.map<int, std.vector<GrsSigBP*>> grsMap = default;
+    if (grs_sig_map(grsMap) != 1937)                                        return 1937;
+    GrsSigCflatHolder grsCflatHolder = default;
+    if ((int)grsCflatHolder.rows.size() != 0)                               return 1938;
+    GrsSigCppHolder grsCppHolder = default;
+    if ((int)grsCppHolder.rows.size() != 0)                                 return 1939;
+    if ((int)grs_sig_global.size() != 0)                                    return 1940;
+    if (grs_sig_alias(grsRows) != 1941)                                     return 1941;
+    std.vector<std.vector<grs_sig_ns.BP*>> grsNs = default;
+    if (grs_sig_ns.take(grsNs) != 1942)                                     return 1942;
+    std.vector<std.vector<GrsSigDerived*>> grsBase = default;
+    if (grs_sig_base(grsBase) != 1943)                                      return 1943;
+    if (grsRows.size() != 0 || grsDeep.size() != 0)                         return 1944;
+    if (grsShared.size() != 0 || grsDeque.size() != 0)                      return 1945;
+    if (grsMap.size() != 0 || grs_sig_global.size() != 0)                   return 1946;
+    if (grsCflatHolder.rows.size() != 0 || grsCppHolder.rows.size() != 0)   return 1947;
+    GrsSigBP value = GrsSigBP();
+    if (value.v != 7 || grs_sig_ns.BP().v != 8)                              return 1948;
+    std.vector<std.vector<GrsSigBaseOnly*>> grsBaseOnly = default;
+    if (grs_sig_base_only(grsBaseOnly) != 1949)                              return 1949;
 
     return 0;
 }

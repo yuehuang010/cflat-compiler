@@ -2237,6 +2237,7 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
             {
                 scanner.SeedConstIntGlobals(tu);
                 scanner.ScanGenericInterfaceTemplateNames(tu);
+                scanner.PreRegisterCppStructNames(tu);
                 // Type aliases first: MangleTypeArg folds them, and both passes must see the same
                 // set no matter where the `using` sits in the file.
                 scanner.PreRegisterRenameAliases(tu);
@@ -3484,6 +3485,7 @@ bool LLVMBackend::CompileImportedFile(const std::string& importingFilePath, cons
         {
             scanner.SeedConstIntGlobals(tu);
             scanner.ScanGenericInterfaceTemplateNames(tu);
+            scanner.PreRegisterCppStructNames(tu);
             // Type aliases first (see the main-file scan for why).
             scanner.PreRegisterRenameAliases(tu);
             for (auto* decl : tu->externalDeclaration())
@@ -4393,6 +4395,7 @@ bool LLVMBackend::Analyze(const std::string& filePath,
             {
                 scanner.SeedConstIntGlobals(tu);
                 scanner.ScanGenericInterfaceTemplateNames(tu);
+                scanner.PreRegisterCppStructNames(tu);
                 // Type aliases first: MangleTypeArg folds them, and both passes must see the same
                 // set no matter where the `using` sits in the file.
                 scanner.PreRegisterRenameAliases(tu);

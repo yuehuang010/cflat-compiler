@@ -1565,6 +1565,16 @@ static std::vector<Result*> MemberFilter(const std::vector<Member*>& members, Ge
 inline std::vector<CFlatParser::BaseSpecifierContext*> BaseClauseIdentifiers(CFlatParser::ClassDefinitionContext* ctx) { return ctx->baseSpecifier(); }
 inline std::vector<CFlatParser::BaseSpecifierContext*> BaseClauseIdentifiers(CFlatParser::StructDefinitionContext* ctx) { return ctx->baseSpecifier(); }
 
+template <typename TCtx>
+inline bool IsGeneratedCppStruct(TCtx* ctx)
+{
+    if (dynamic_cast<CFlatParser::StructDefinitionContext*>(ctx) == nullptr) return false;
+    const auto annotations = ExtractAnnotations(ctx->annotationList());
+    return !BaseClauseIdentifiers(ctx).empty()
+        || std::any_of(annotations.begin(), annotations.end(),
+                       [](const auto& ann) { return ann.Name == "cpp"; });
+}
+
 // The dotted name a base-clause entry spells, without its generic type arguments:
 // `IS` -> "IS", `shapes.IS` -> "shapes.IS". Empty when the entry has no identifier.
 inline std::string BaseSpecifierName(CFlatParser::BaseSpecifierContext* spec)
@@ -2787,11 +2797,7 @@ void ScanInterfaceDefinition(CFlatParser::InterfaceDefinitionContext* ctx,
         auto* compiler = Compiler(ctx);
         std::string scannedTypeName = ctx->directDeclarator()->getText();
         if (!namespaceName.empty()) scannedTypeName = namespaceName + "." + scannedTypeName;
-        const auto scannedAnnotations = ExtractAnnotations(ctx->annotationList());
-        const bool scannedCppStruct = dynamic_cast<CFlatParser::StructDefinitionContext*>(ctx) != nullptr
-            && (!BaseClauseIdentifiers(ctx).empty()
-                || std::any_of(scannedAnnotations.begin(), scannedAnnotations.end(),
-                               [](const auto& ann) { return ann.Name == "cpp"; }));
+        const bool scannedCppStruct = IsGeneratedCppStruct(ctx);
         if (scannedCppStruct) compiler->RegisterCppStructName(scannedTypeName);
         // Generic template definitions are not pre-declared; they are instantiated on demand.
         // However, we still register the template name and its method names in the LSP
@@ -2843,13 +2849,9 @@ void ScanInterfaceDefinition(CFlatParser::InterfaceDefinitionContext* ctx,
         std::string typeName = baseTypeName;
         if (!namespaceName.empty())
             typeName = namespaceName + "." + typeName;
-        const auto rawAnnotations = ExtractAnnotations(ctx->annotationList());
         const bool isStructDefinition = dynamic_cast<CFlatParser::StructDefinitionContext*>(ctx) != nullptr;
         const auto baseClauses = BaseClauseIdentifiers(ctx);
-        const bool isCppStruct = isStructDefinition
-            && std::any_of(rawAnnotations.begin(), rawAnnotations.end(),
-                           [](const auto& ann) { return ann.Name == "cpp"; })
-            || (isStructDefinition && !baseClauses.empty());
+        const bool isCppStruct = IsGeneratedCppStruct(ctx);
         if (isCppStruct) compiler->RegisterCppStructName(typeName);
 
         if (isStructDefinition && !baseClauses.empty())
@@ -3042,6 +3044,10 @@ public:
     // Reject statically integral operands of pointer casts before code generation. The scanner
     // uses folded semantic constants and explicit scalar cast types, never source-text matching.
     void ValidateIsolatedIntegralPointerCasts(antlr4::tree::ParseTree* tree);
+
+    // Register generated [cpp] struct names before signatures are scanned, so a declaration that
+    // precedes the struct can still park a nested C++ request for retry after codegen emits it.
+    void PreRegisterCppStructNames(antlr4::RuleContext* ctx);
 
     /*
      * Record every file-scope pure-rename or simple pointer `using` alias BEFORE either pass walks

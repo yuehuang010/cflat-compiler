@@ -1578,6 +1578,43 @@ void ForwardRefScanner::ScanGenericInterfaceTemplateNames(antlr4::RuleContext* c
         CollectGenericTemplateDecls(ctx, /*certain*/ true);
     }
 
+void ForwardRefScanner::PreRegisterCppStructNames(antlr4::RuleContext* ctx)
+{
+        if (ctx == nullptr) return;
+        std::function<void(CFlatParser::ExternalDeclarationContext*, const std::string&)> visitExternal;
+        std::function<void(CFlatParser::StructDefinitionContext*, const std::string&)> visitStruct;
+        std::function<void(CFlatParser::ClassDefinitionContext*, const std::string&)> visitClass;
+        auto qualify = [](const std::string& ns, const std::string& name) {
+            return ns.empty() ? name : ns + "." + name;
+        };
+        visitStruct = [&](CFlatParser::StructDefinitionContext* str, const std::string& ns) {
+            const std::string name = qualify(ns, str->directDeclarator()->getText());
+            const bool isCppStruct = IsGeneratedCppStruct(str);
+            if (isCppStruct) compilerLLVM->RegisterCppStructName(name);
+            for (auto* nested : MemberStructDefinitions(str)) visitStruct(nested, name);
+            for (auto* nested : MemberClassDefinitions(str)) visitClass(nested, name);
+        };
+        visitClass = [&](CFlatParser::ClassDefinitionContext* cls, const std::string& ns) {
+            const std::string name = qualify(ns, cls->directDeclarator()->getText());
+            for (auto* nested : MemberStructDefinitions(cls)) visitStruct(nested, name);
+            for (auto* nested : MemberClassDefinitions(cls)) visitClass(nested, name);
+        };
+        visitExternal = [&](CFlatParser::ExternalDeclarationContext* ext, const std::string& ns) {
+            if (auto* nested = ext->namespaceDefinition())
+            {
+                std::string nestedNs;
+                for (auto* id : nested->Identifier())
+                    nestedNs = qualify(nestedNs, id->getText());
+                nestedNs = qualify(ns, nestedNs);
+                for (auto* child : nested->externalDeclaration()) visitExternal(child, nestedNs);
+            }
+            else if (auto* str = ext->structDefinition()) visitStruct(str, ns);
+            else if (auto* cls = ext->classDefinition()) visitClass(cls, ns);
+        };
+        if (auto* tu = dynamic_cast<CFlatParser::TranslationUnitContext*>(ctx))
+            for (auto* ext : tu->externalDeclaration()) visitExternal(ext, {});
+}
+
 void ForwardRefScanner::ScanGenericTypeUses(antlr4::RuleContext* ctx) {
         for (auto* child : ctx->children)
         {
