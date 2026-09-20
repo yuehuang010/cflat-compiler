@@ -879,6 +879,30 @@ extern int main()
     if (deduceSc.scaled(1.5) != 4.5)                  return 780;
     if (cppt.Scaler.from(4) != 40)                 return 781;
 
+    // ---- C++ forwarding-reference templates ----------------------------------------------------
+    int fwdFreeLvalue = 5;
+    if (cppfwd.free_forward(fwdFreeLvalue) != 6 || fwdFreeLvalue != 6) return 2520;
+    if (cppfwd.free_forward(5) != 6) return 2521;
+    int fwdFreeExpr = 5;
+    if (cppfwd.free_forward(fwdFreeExpr + 1) != 7 || fwdFreeExpr != 5) return 2522;
+    int fwdFreeMove = 5;
+    if (cppfwd.free_forward(move fwdFreeMove) != 6) return 2523;
+
+    cppfwd.ForwardBox fwdMemberBox = default;
+    int fwdMemberLvalue = 5;
+    if (fwdMemberBox.member_forward(fwdMemberLvalue) != 6 || fwdMemberLvalue != 6) return 2524;
+    if (fwdMemberBox.member_forward(5) != 6) return 2525;
+    int fwdMemberExpr = 5;
+    if (fwdMemberBox.member_forward(fwdMemberExpr + 1) != 7 || fwdMemberExpr != 5) return 2526;
+    int fwdMemberMove = 5;
+    if (fwdMemberBox.member_forward(move fwdMemberMove) != 6) return 2527;
+
+    std.optional<int> fwdOptional = default;
+    int fwdOptionalLvalue = 5;
+    if (fwdOptional.value_or(fwdOptionalLvalue) != 5) return 2528;
+    if (fwdOptional.value_or(5) != 5) return 2529;
+    if (fwdOptional.value_or(fwdOptionalLvalue + 1) != 6) return 2530;
+
     // ---- C++ brace-list arguments ---------------------------------------------------------------
     if (cppt.sum_il({1, 2, 3}) != 6)              return 782;
     if (cppt.sum_ild({1.5, 2.5}) != 4.0)          return 783;

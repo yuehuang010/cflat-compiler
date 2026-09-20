@@ -2102,6 +2102,7 @@ nlohmann::json LLVMBackend::FunctionTemplateToJson(
                  {"c", t.cxxSpelling}, {"k", t.kind}, {"mi", t.minArity},
                  {"ma", t.maxArity}, {"tp", t.typeParameterCount}, {"pp", t.hasParameterPack},
                  {"pt", t.parameterTypes},
+                 {"fr", t.forwardingReferenceParameters},
                  {"tk", t.templateParameterKinds},
                  {"cn", t.isConst},
                  {"nx", t.isNoexcept}, {"a", t.access},
@@ -2124,6 +2125,9 @@ cflat_cinterop::RawFunctionTemplate LLVMBackend::FunctionTemplateFromJson(
         t.typeParameterCount = (unsigned)j.value("tp", (uint64_t)0);
         t.hasParameterPack = j.value("pp", false);
         if (j.contains("pt")) t.parameterTypes = j["pt"].to_string_vector();
+        if (j.contains("fr"))
+            for (uint64_t value : j["fr"].to_u64_vector())
+                t.forwardingReferenceParameters.push_back(value != 0 ? 1 : 0);
         t.templateParameterKinds = j.value("tk", std::string{});
         t.isConst = j.value("cn", false);
         t.isNoexcept = j.value("nx", false);
@@ -2751,6 +2755,8 @@ bool LLVMBackend::TryLoadCHeaderDiskCache(
         // member's refusal instead of a signature.
         // v79 preserves the pointer level when a const-qualified pointer reference collapses
         // to the CFlat alias surface: an older cache carries the raw shape.
+        // v80 records function-template forwarding-reference parameters: an older cache
+        // carries none, so an lvalue would not bind a template U&& parameter.
         if (version != kCHeaderCacheVersion) return cacheMiss("cache version");
 
         if (!expectedRequestKey.empty()
@@ -3160,6 +3166,7 @@ void LLVMBackend::WriteCHeaderDiskCache(
         // type request's shared signatures once in a baseline ("sb") instead of per entry.
         // v78 binds a reference to a T** instead of refusing the member.
         // v79 preserves the pointer level of a collapsed const-qualified pointer reference.
+        // v80 records function-template forwarding-reference parameters.
         j["version"] = kCHeaderCacheVersion;
         j["mtime"]   = (int64_t)mtime.time_since_epoch().count();
         j["hash"]    = contentHash;

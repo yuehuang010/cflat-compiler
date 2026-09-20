@@ -1781,3 +1781,36 @@ namespace cppnp
         return g;
     }
 }
+
+// Forwarding-reference fixtures: the function template parameter must deduce from the
+// argument's value category, including an lvalue that the body mutates.
+namespace cppfwd
+{
+    template <typename U>
+    int free_forward(U&& value)
+    {
+        ++value;
+        return value;
+    }
+
+    struct ForwardBox
+    {
+        template <typename U>
+        int member_forward(U&& value)
+        {
+            ++value;
+            return value;
+        }
+    };
+
+    // T belongs to the class template, so this is not a forwarding reference.
+    template <typename T>
+    struct FixedBox
+    {
+        int member_fixed(T&& value)
+        {
+            ++value;
+            return value;
+        }
+    };
+}

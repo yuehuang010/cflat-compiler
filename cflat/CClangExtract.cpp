@@ -1039,8 +1039,22 @@ namespace cflat_cinterop
                 result.maxArity = result.hasParameterPack
                     ? std::numeric_limits<unsigned>::max() : result.minArity;
                 for (unsigned i = 0; i < declaredArity; ++i)
+                {
                     result.parameterTypes.push_back(
                         fd->getParamDecl(i)->getType().getAsString());
+                    bool forwardingReference = false;
+                    if (const auto* rvalueReference = fd->getParamDecl(i)->getType()
+                            ->getAs<RValueReferenceType>())
+                        if (const auto* templateParameter = rvalueReference->getPointeeType()
+                                ->getAs<TemplateTypeParmType>())
+                            for (const NamedDecl* functionParameter : *ftd->getTemplateParameters())
+                                if (functionParameter == templateParameter->getDecl())
+                                {
+                                    forwardingReference = true;
+                                    break;
+                                }
+                    result.forwardingReferenceParameters.push_back(forwardingReference ? 1 : 0);
+                }
                 while (result.minArity > 0
                        && fd->getParamDecl(result.minArity - 1)->hasDefaultArg())
                     --result.minArity;
@@ -1513,6 +1527,14 @@ namespace cflat_cinterop
                 std::set<const CXXMethodDecl*> templateExtras;
                 for (const CXXMethodDecl* md : cxx->methods()) methodList.push_back(md);
                 std::set<const CXXMethodDecl*> listedMethods(methodList.begin(), methodList.end());
+                if (const auto* spec = llvm::dyn_cast<ClassTemplateSpecializationDecl>(cxx);
+                    spec != nullptr && spec->getSpecializedTemplate() != nullptr)
+                {
+                    const CXXRecordDecl* pattern = spec->getSpecializedTemplate()->getTemplatedDecl();
+                    for (const Decl* d : pattern->decls())
+                        if (const auto* ftd = llvm::dyn_cast<FunctionTemplateDecl>(d))
+                            VisitFunctionTemplateDecl(const_cast<FunctionTemplateDecl*>(ftd));
+                }
                 // A using-declaration re-exposes a base member under ITS OWN access: the MSVC
                 // STL keeps _Ptr_base::get protected and publishes it with `using _Mybase::get;`
                 // in shared_ptr, so the shadow's access is the one this class grants.
@@ -1533,6 +1555,7 @@ namespace cflat_cinterop
                         if (ftd == nullptr) continue;
                         const auto* pattern = llvm::dyn_cast<CXXMethodDecl>(ftd->getTemplatedDecl());
                         if (pattern == nullptr) continue;
+                        VisitFunctionTemplateDecl(const_cast<FunctionTemplateDecl*>(ftd));
                         bool allDefaulted = true;
                         for (const NamedDecl* tp : *ftd->getTemplateParameters())
                         {

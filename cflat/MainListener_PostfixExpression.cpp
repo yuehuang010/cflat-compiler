@@ -6349,6 +6349,11 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 {
                                     bool hasNonWrapper = false;
                                     bool hasExactNonWrapper = false;
+                                    const bool hasForwardingReferenceTemplate = owner.empty()
+                                        ? compiler->HasCxxForwardingReferenceTemplate(functionName)
+                                        : compiler->HasCxxForwardingReferenceTemplateMember(
+                                            owner, memberName);
+                                    bool hasForwardingReferenceLvalue = false;
                                     for (const auto& symbol : existing->second)
                                         if (!symbol.UniqueName.starts_with("__cflat_tpl_")
                                             && !symbol.UniqueName.starts_with("__cflat_free_")
@@ -6373,9 +6378,26 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                                 hasExactNonWrapper = hasExactNonWrapper || exact;
                                             }
                                         }
+                                    if (hasForwardingReferenceTemplate)
+                                    {
+                                        const bool hasInstanceReceiver = !owner.empty()
+                                            && !structVar.TypeAndValue.TypeName.empty()
+                                            && !arguments.empty()
+                                            && arguments.front().TypeAndValue.TypeName
+                                                   == structVar.TypeAndValue.TypeName;
+                                        const size_t firstUserArgument = hasInstanceReceiver ? 1 : 0;
+                                        for (size_t i = firstUserArgument; i < arguments.size(); ++i)
+                                            if (!compiler->IsCxxRvalueReferenceArgument(arguments[i]))
+                                            {
+                                                hasForwardingReferenceLvalue = true;
+                                                break;
+                                            }
+                                    }
                                     if (hasNonWrapper
                                         && (!cxxFreeFunction || !functionName.starts_with("std.")
-                                            || hasExactNonWrapper)) return;
+                                            || hasExactNonWrapper)
+                                        && !(hasForwardingReferenceTemplate
+                                             && hasForwardingReferenceLvalue)) return;
                                 }
                                 if (!isTemplate && owner.empty() && cxxBraceArguments.empty())
                                 {

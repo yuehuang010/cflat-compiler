@@ -5115,6 +5115,22 @@ bool LLVMBackend::HasCxxFunctionTemplate(const std::string& qualifiedName) const
                                                qualifiedName.substr(dot + 1)).empty();
 }
 
+static bool CxxTemplateHasForwardingReferenceParameter(
+        const cflat_cinterop::RawFunctionTemplate& candidate)
+{
+        return std::any_of(candidate.forwardingReferenceParameters.begin(),
+                           candidate.forwardingReferenceParameters.end(),
+                           [](uint8_t value) { return value != 0; });
+}
+
+bool LLVMBackend::HasCxxForwardingReferenceTemplate(const std::string& qualifiedName) const
+{
+        auto it = cxxFunctionTemplates_.find(qualifiedName);
+        if (it == cxxFunctionTemplates_.end()) return false;
+        return std::any_of(it->second.begin(), it->second.end(),
+                           CxxTemplateHasForwardingReferenceParameter);
+}
+
 bool LLVMBackend::IsCxxNamespace(const std::string& name) const
 {
         const size_t dot = name.find('.');
@@ -5172,6 +5188,14 @@ bool LLVMBackend::HasCxxFunctionTemplateMember(const std::string& owner,
                                                const std::string& memberName) const
 {
         return !ResolveCxxFunctionTemplateName(owner, memberName).empty();
+}
+
+bool LLVMBackend::HasCxxForwardingReferenceTemplateMember(const std::string& owner,
+                                                          const std::string& memberName) const
+{
+        const std::string resolved = ResolveCxxFunctionTemplateName(owner, memberName);
+        if (resolved.empty()) return false;
+        return HasCxxForwardingReferenceTemplate(resolved);
 }
 
 static std::string FirstCxxErrorLine(const std::string& text)
@@ -6453,16 +6477,30 @@ bool LLVMBackend::RequestCxxFunctionTemplate(const std::string& functionName,
                 spelling = "const char *";
             else if (!CxxSpellingForCflatType(cflatType, spelling))
                 return noMatch("an argument type cannot be spelled in C++");
-            if (!arg.TypeAndValue.Pointer && IsCxxRecord(arg.TypeAndValue.TypeName)
-                && arg.Storage != nullptr && !arg.IsRvalue)
+            const size_t templateParameterIndex = i - (selected->kind
+                == cflat_cinterop::RawFunctionTemplate::InstanceMember ? 1u : 0u);
+            const bool forwardingReference = templateParameterIndex
+                < selected->forwardingReferenceParameters.size()
+                && selected->forwardingReferenceParameters[templateParameterIndex] != 0;
+            const bool cxxRvalue = IsCxxRvalueReferenceArgument(arg);
+            if (forwardingReference)
+            {
+                if (cxxRvalue) spelling += " &&";
+                else spelling += " &";
+            }
+            else if (!arg.TypeAndValue.Pointer && IsCxxRecord(arg.TypeAndValue.TypeName)
+                     && arg.Storage != nullptr && !arg.IsRvalue)
                 spelling += " &";
             const bool classRvalue = arg.IsRvalue && !arg.TypeAndValue.Pointer
                 && IsCxxRecord(arg.TypeAndValue.TypeName);
-            const std::string valueSpelling = spelling;
+            const std::string valueSpelling = spelling.ends_with(" &&")
+                ? spelling.substr(0, spelling.size() - 3) : spelling;
             parameterSpellings.push_back(std::move(spelling));
             const std::string parameter = "p" + std::to_string(flatParameterIndex++);
             const bool packArgument = selected->hasParameterPack && i >= selected->minArity;
-            if (packArgument && IsCxxRvalueReferenceArgument(arg))
+            if (forwardingReference && cxxRvalue)
+                callArguments.push_back("static_cast<" + valueSpelling + "&&>(" + parameter + ")");
+            else if (packArgument && cxxRvalue)
             {
                 std::string valueSpelling = parameterSpellings.back();
                 if (valueSpelling.ends_with(" &")) valueSpelling.resize(valueSpelling.size() - 2);

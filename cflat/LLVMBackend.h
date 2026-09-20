@@ -5209,9 +5209,12 @@ private:
         const std::vector<cflat_cinterop::RawFunctionTemplate>& templates, size_t group,
         const std::string& fileForLsp);
     bool HasCxxFunctionTemplate(const std::string& qualifiedName) const;
+    bool HasCxxForwardingReferenceTemplate(const std::string& qualifiedName) const;
     bool IsCxxNamespace(const std::string& name) const;
     bool HasCxxFunctionTemplateMember(const std::string& owner,
                                       const std::string& memberName) const;
+    bool HasCxxForwardingReferenceTemplateMember(const std::string& owner,
+                                                 const std::string& memberName) const;
     std::string ResolveCxxFunctionTemplateName(const std::string& owner,
                                                const std::string& memberName) const;
     bool RequestCxxFunctionTemplate(const std::string& functionName,
@@ -9639,7 +9642,7 @@ public:
      * timeout). The PCH key still folds the build stamp, since a PCH belongs to the clang that
      * wrote it.
      */
-    static constexpr int kCHeaderCacheVersion = 79;
+    static constexpr int kCHeaderCacheVersion = 80;
     static std::string CompilerBuildStamp();
 
     static std::string GetCHeaderCacheDir();

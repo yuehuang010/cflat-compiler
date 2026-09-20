@@ -166,6 +166,7 @@ namespace cflat_cinterop
         unsigned maxArity = 0;
         unsigned typeParameterCount = 0;
         std::vector<std::string> parameterTypes;
+        std::vector<uint8_t> forwardingReferenceParameters;
         // One char per template parameter, in order: 'T' type, 'P' type pack,
         // 'N' non-defaulted integral non-type, 'd' defaulted non-type (SFINAE helper).
         std::string templateParameterKinds;

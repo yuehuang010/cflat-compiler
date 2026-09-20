@@ -1,5 +1,6 @@
 // C++ member and free reference parameters follow C++ value-category binding rules.
 import cpp "cpp_interop_ctorref.h";
+import cpp "cpp_interop_tpl.h" cache;
 
 extern int main()
 {
@@ -38,6 +39,11 @@ extern int main()
         int* p1 = &v;
         int** p2 = &p1;
         cppcr.refkind_ptr_r(move p2);
+    }
+    expect_error("parameter 'value' of 'member_fixed' is an rvalue reference") {
+        cppfwd.FixedBox<int> box = default;
+        int value = 5;
+        box.member_fixed(value);
     }
     return 0;
 }
