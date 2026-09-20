@@ -395,6 +395,11 @@ namespace uas_alias_ns
     }
 }
 
+// Fixture for the char-identity legs (2480-2494): a char FIELD and a char-returning call,
+// two operand shapes the C++ template wrapper has to spell as `char` and not `signed char`.
+struct ChsCharBox { char ch; };
+char chs_char_source() { return 67; }
+
 extern int main()
 {
     // Win64 keeps the existing SEH trampoline and does not emit the C++ guard, so the
@@ -2669,6 +2674,123 @@ extern int main()
     {
         using UasStaticAlias = cppt.TplStatics<int>;
         if (UasStaticAlias.combine(4, 3) != 43)                              return 2439;
+    }
+
+    /*
+     * PRIMITIVE IDENTITY at a C++ TEMPLATE boundary (2480-2494). A template argument is
+     * deduced from the spelling the generated wrapper writes; before this was fixed the
+     * spelling came from the argument's LLVM type, so every i8 was offered as `signed char`
+     * and `std.string + char` failed deduction outright (_CharT = char vs signed char).
+     */
+    {
+        std.string chsA = std.string("hi");
+        char chsC = 33;
+        std.string chsT = chsA + chsC;
+        if ((int)chsT.size() != 3 || cppsop.stropTail(chsT) != 33)                  return 2480;
+    }
+    {
+        std.string chsA = std.string("hi");
+        char chsC = 33;
+        std.string chsT = chsC + chsA;
+        if ((int)chsT.size() != 3 || cppsop.stropTail(chsT) != 105)                 return 2481;
+    }
+    {
+        std.string chsA = std.string("hi");
+        std.string chsT = chsA + (char)64;
+        if ((int)chsT.size() != 3 || cppsop.stropTail(chsT) != 64)                  return 2482;
+    }
+    {
+        std.string chsA = std.string("hi");
+        ChsCharBox chsBox = default;
+        chsBox.ch = 65;
+        std.string chsT = chsA + chsBox.ch;
+        if ((int)chsT.size() != 3 || cppsop.stropTail(chsT) != 65)                  return 2483;
+    }
+    {
+        std.string chsA = std.string("hi");
+        char[4] chsArr = default;
+        chsArr[1] = 66;
+        std.string chsT = chsA + chsArr[1];
+        if ((int)chsT.size() != 3 || cppsop.stropTail(chsT) != 66)                  return 2484;
+    }
+    {
+        std.string chsA = std.string("hi");
+        std.string chsT = chsA + chs_char_source();
+        if ((int)chsT.size() != 3 || cppsop.stropTail(chsT) != 67)                  return 2485;
+    }
+    {
+        std.string chsA = std.string("hi");
+        char chsC = 68;
+        char* chsP = &chsC;
+        std.string chsT = chsA + *chsP;
+        if ((int)chsT.size() != 3 || cppsop.stropTail(chsT) != 68)                  return 2486;
+    }
+    {
+        // A USER function template over basic_string<C> and C: same deduction shape as the
+        // libc++ operators, reached through the ordinary call path instead of the operator one.
+        std.string chsA = std.string("banana");
+        char chsC = 97;
+        if (cppsop.countChar(chsA, chsC) != 3)                                      return 2487;
+    }
+    {
+        // The 8-bit identities together: `char` is the one that was wrong, and i8/u8/bool are
+        // the accept set that must keep its own spelling in the same leg.
+        char chsC = 1;
+        i8 chsI8 = 1;
+        u8 chsU8 = 1;
+        bool chsB = true;
+        if (cppsop.typeCodeOf(chsC) != 1 || cppsop.typeCodeOf(chsI8) != 2
+            || cppsop.typeCodeOf(chsU8) != 3 || cppsop.typeCodeOf(chsB) != 4)       return 2488;
+    }
+    {
+        // ACCEPT SET, frozen: these already spelled correctly before the fix and must not move.
+        short chsS = 1;
+        u16 chsUs = 1;
+        int chsI = 1;
+        uint chsUi = 1;
+        if (cppsop.typeCodeOf(chsS) != 5 || cppsop.typeCodeOf(chsUs) != 6
+            || cppsop.typeCodeOf(chsI) != 7 || cppsop.typeCodeOf(chsUi) != 8)       return 2489;
+    }
+    {
+        // `long` and `i64` are the same width on this target and DIFFERENT C++ types.
+        long chsL = 1;
+        ulong chsUl = 1;
+        i64 chsLl = 1;
+        u64 chsUll = 1;
+        if (cppsop.typeCodeOf(chsL) != 9 || cppsop.typeCodeOf(chsUl) != 10
+            || cppsop.typeCodeOf(chsLl) != 11 || cppsop.typeCodeOf(chsUll) != 12)   return 2490;
+    }
+    {
+        // `wchar` shares its width with `int` (macOS/Linux) or `u16` (Windows) and is neither.
+        // Discriminator: pre-fix this file did not even compile - `wchar` spelled as `int`
+        // made the wrapper ambiguous against the `c32` instantiation registered above it.
+        c8 chsC8 = 1;
+        c16 chsC16 = 1;
+        c32 chsC32 = 1;
+        wchar chsW = 1;
+        if (cppsop.typeCodeOf(chsC8) != 18 || cppsop.typeCodeOf(chsC16) != 13
+            || cppsop.typeCodeOf(chsC32) != 17 || cppsop.typeCodeOf(chsW) != 14)    return 2491;
+    }
+    {
+        // ACCEPT SET, frozen: float/double were never ambiguous.
+        float chsF = 1.0f;
+        double chsD = 1.0;
+        if (cppsop.typeCodeOf(chsF) != 15 || cppsop.typeCodeOf(chsD) != 16)         return 2492;
+    }
+    {
+        // The NON-template member paths take their spelling from the declared signature, so
+        // these already worked; they are here to pin that the plumb did not move them.
+        std.string chsA = std.string("hi");
+        char chsC = 33;
+        chsA += chsC;
+        chsA.push_back(chsC);
+        if ((int)chsA.size() != 4 || cppsop.stropTail(chsA) != 33)                  return 2493;
+    }
+    {
+        std.string chsA = std.string("hi");
+        char chsC = 105;
+        std.string chsFill = std.string(3, chsC);
+        if ((int)chsFill.size() != 3 || (int)chsA.find(chsC) != 1)                  return 2494;
     }
 
     return 0;

@@ -5717,7 +5717,9 @@ public:
         int rhsPointerDepth = 0, bool rhsElemPointer = false,
         llvm::Value* lhsStorage = nullptr, llvm::Value* rhsStorage = nullptr,
         bool reportMissing = true, bool allowReversed = true,
-        bool lhsIsRvalue = false, bool rhsIsRvalue = false);
+        bool lhsIsRvalue = false, bool rhsIsRvalue = false,
+        const std::string& lhsTypeName = std::string(),
+        const std::string& rhsTypeName = std::string());
 
     LLVMBackend::TypedValue ParseMultiplicativeExpression(CFlatParser::MultiplicativeExpressionContext* ctx,
                                                            ResultUse use = ResultUse::Value);

@@ -1715,6 +1715,9 @@ public:
         // the operator path reduces it to a raw llvm::Value and 0 means "not recorded".
         int          pointerDepth = 0;
         bool         elemPointer  = false;
+        // Declared source type name of the operand. Carried for C++ IDENTITY only (a `char`
+        // operand must not reach a C++ template as `signed char`); no other path reads it.
+        std::string  sourceTypeName;
 
         TypedValue() = default;
         TypedValue(llvm::Value* v, bool u = false) : value(v), isUnsigned(u) {}
@@ -5359,6 +5362,11 @@ private:
     std::string StdFunctionSpecializationForSpelling(const std::string& spelling,
                                                      std::string* requestError = nullptr);
     bool CxxSpellingForCflatType(const std::string& cflatType, std::string& out) const;
+
+    // The operand's DECLARED primitive name, for an argument whose machine type cannot recover
+    // its C++ identity (i8 is `char` or `i8`, i32 is `int` or `wchar`, i64 is `long` or `i64`).
+    std::string DeclaredPrimitiveIdentityForCxxArgument(const NamedVariable& arg,
+                                                        llvm::Type* valueType) const;
     /*
      * Gate + request in one call, for both ParseDeclarationSpecifiers copies. Returns true when the
      * CFlat name now denotes a registered foreign C++ type. Returns false with `error` EMPTY when

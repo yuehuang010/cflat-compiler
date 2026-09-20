@@ -58,4 +58,43 @@ inline Free operator+(const char* s, const Free& f)
 inline bool operator==(const Free& f, const char* s)
 { return (int)std::strlen(s) == f.n_; }
 
+// PRIMITIVE IDENTITY at a C++ template boundary. A template argument is deduced from the
+// SPELLING the wrapper writes, so each CFlat primitive must land on its own C++ type: `char`
+// is not `signed char`, `long` is not `long long`, `wchar` is not `int`. One code per C++
+// type makes a wrong spelling a wrong VALUE instead of a silent rebind.
+template<class C> struct TypeCode { static const int value = 0; };
+template<> struct TypeCode<char> { static const int value = 1; };
+template<> struct TypeCode<signed char> { static const int value = 2; };
+template<> struct TypeCode<unsigned char> { static const int value = 3; };
+template<> struct TypeCode<bool> { static const int value = 4; };
+template<> struct TypeCode<short> { static const int value = 5; };
+template<> struct TypeCode<unsigned short> { static const int value = 6; };
+template<> struct TypeCode<int> { static const int value = 7; };
+template<> struct TypeCode<unsigned int> { static const int value = 8; };
+template<> struct TypeCode<long> { static const int value = 9; };
+template<> struct TypeCode<unsigned long> { static const int value = 10; };
+template<> struct TypeCode<long long> { static const int value = 11; };
+template<> struct TypeCode<unsigned long long> { static const int value = 12; };
+template<> struct TypeCode<char16_t> { static const int value = 13; };
+template<> struct TypeCode<wchar_t> { static const int value = 14; };
+template<> struct TypeCode<float> { static const int value = 15; };
+template<> struct TypeCode<double> { static const int value = 16; };
+template<> struct TypeCode<char32_t> { static const int value = 17; };
+template<> struct TypeCode<char8_t> { static const int value = 18; };
+
+template<class C> int typeCodeOf(C v) { (void)v; return TypeCode<C>::value; }
+
+// A user function template over basic_string<C> and C: deduction fails unless both operands
+// carry the SAME character identity, which is the shape libc++'s own string operators have.
+template<class C> int countChar(const std::basic_string<C>& s, C c)
+{
+    int n = 0;
+    for (std::size_t i = 0; i < s.size(); ++i) if (s[i] == c) ++n;
+    return n;
+}
+
+// Last byte of a string, so a concatenation leg can assert WHICH byte was appended.
+inline int stropTail(const std::string& s)
+{ return s.empty() ? -1 : (int)(unsigned char)s[s.size() - 1]; }
+
 }

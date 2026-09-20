@@ -3736,6 +3736,32 @@ std::string LLVMBackend::CxxEnumeratorArgumentSpelling(const std::string& enumSp
 // CFlat type argument -> C++ spelling. Primitives by width, a previously requested foreign type by
 // its own spelling, one trailing pointer level as a pointer. Anything else (a CFlat struct, a CFlat
 // generic instantiation) has no C++ identity and is refused by the caller.
+/*
+ * A C++ template argument is offered to deduction by SPELLING, so a primitive argument has to
+ * keep its CFlat identity. The machine type cannot supply it: i8 is `char` and `i8` and `u8`
+ * alike, i32 is `int` and `wchar`, i64 is `long` and `i64`. The call path drops TypeName for
+ * primitives on purpose (implicit conversions must stay open in overload resolution) but keeps
+ * the declared name in InferSourceTypeName, so that is the identity source here. The declared
+ * name is accepted only when it lowers to EXACTLY the value's machine type, so an operand that
+ * was widened or converted on the way in still falls back to the machine-type guess.
+ */
+std::string LLVMBackend::DeclaredPrimitiveIdentityForCxxArgument(const NamedVariable& arg,
+                                                                 llvm::Type* valueType) const
+{
+        static const std::unordered_set<std::string> primitives = {
+            "bool", "char", "i8", "u8", "short", "i16", "u16", "int", "i32", "uint", "u32",
+            "long", "ulong", "i64", "u64", "c8", "c16", "c32", "wchar", "float", "double",
+        };
+        const std::string& name = arg.InferSourceTypeName;
+        if (name.empty() || valueType == nullptr) return std::string();
+        if (arg.TypeAndValue.Pointer || arg.TypeAndValue.ElemPointer) return std::string();
+        if (primitives.count(name) == 0) return std::string();
+        TypeAndValue declared;
+        declared.TypeName = name;
+        if (GetType(declared, nullptr, false) != valueType) return std::string();
+        return name;
+}
+
 bool LLVMBackend::CxxSpellingForCflatType(const std::string& cflatType, std::string& out) const
 {
         std::string base = cflatType;
@@ -5304,6 +5330,9 @@ std::string LLVMBackend::CxxBraceElementSpelling(const CxxBraceArgument& brace,
             std::string type = arg.TypeAndValue.TypeName;
             bool pointer = arg.TypeAndValue.Pointer;
             llvm::Type* valueType = arg.Primary != nullptr ? arg.Primary->getType() : arg.BaseType;
+            // The declared primitive identity outranks the machine-type guess below, which
+            // cannot tell `char` from `i8` or `long` from `i64`.
+            if (type.empty()) type = DeclaredPrimitiveIdentityForCxxArgument(arg, valueType);
             if (type.empty())
             {
                 if (auto* constant = llvm::dyn_cast_or_null<llvm::Constant>(arg.Primary);
@@ -5595,6 +5624,10 @@ LLVMBackend::CollectCxxImplicitArgumentCandidates(
 
         auto argumentType = [&](const NamedVariable& arg) {
             TypeAndValue type = arg.TypeAndValue;
+            // The declared primitive identity outranks the machine-type guess below, which
+            // cannot tell `char` from `i8` or `long` from `i64`.
+            if (type.TypeName.empty())
+                type.TypeName = DeclaredPrimitiveIdentityForCxxArgument(arg, arg.BaseType);
             if (type.TypeName.empty())
             {
                 auto* constant = llvm::dyn_cast_or_null<llvm::Constant>(arg.Primary);
@@ -5827,6 +5860,10 @@ bool LLVMBackend::EmitCxxImplicitArgumentConversions(
 
         auto argumentType = [&](const NamedVariable& arg) {
             TypeAndValue type = arg.TypeAndValue;
+            // The declared primitive identity outranks the machine-type guess below, which
+            // cannot tell `char` from `i8` or `long` from `i64`.
+            if (type.TypeName.empty())
+                type.TypeName = DeclaredPrimitiveIdentityForCxxArgument(arg, arg.BaseType);
             if (type.TypeName.empty())
             {
                 auto* constant = llvm::dyn_cast_or_null<llvm::Constant>(arg.Primary);
@@ -6176,6 +6213,9 @@ bool LLVMBackend::RequestCxxFunctionTemplate(const std::string& functionName,
             std::string type = arg.TypeAndValue.TypeName;
             bool pointer = arg.TypeAndValue.Pointer;
             llvm::Type* valueType = arg.Primary != nullptr ? arg.Primary->getType() : arg.BaseType;
+            // The declared primitive identity outranks the machine-type guess below, which
+            // cannot tell `char` from `i8` or `long` from `i64`.
+            if (type.empty()) type = DeclaredPrimitiveIdentityForCxxArgument(arg, valueType);
             if (type.empty())
             {
                 if (auto* constant = llvm::dyn_cast_or_null<llvm::Constant>(arg.Primary);
@@ -6586,6 +6626,10 @@ bool LLVMBackend::RequestCxxFreeFunction(const std::string& functionName,
 
         auto argumentType = [&](const NamedVariable& arg) {
             TypeAndValue type = arg.TypeAndValue;
+            // The declared primitive identity outranks the machine-type guess below, which
+            // cannot tell `char` from `i8` or `long` from `i64`.
+            if (type.TypeName.empty())
+                type.TypeName = DeclaredPrimitiveIdentityForCxxArgument(arg, arg.BaseType);
             if (type.TypeName.empty())
             {
                 auto* constant = llvm::dyn_cast_or_null<llvm::Constant>(arg.Primary);
@@ -7044,6 +7088,9 @@ bool LLVMBackend::RequestCxxBraceFunction(const std::string& functionName,
             std::string type = arg.TypeAndValue.TypeName;
             bool pointer = arg.TypeAndValue.Pointer;
             llvm::Type* valueType = arg.Primary != nullptr ? arg.Primary->getType() : arg.BaseType;
+            // The declared primitive identity outranks the machine-type guess below, which
+            // cannot tell `char` from `i8` or `long` from `i64`.
+            if (type.empty()) type = DeclaredPrimitiveIdentityForCxxArgument(arg, valueType);
             if (type.empty())
             {
                 if (auto* constant = llvm::dyn_cast_or_null<llvm::Constant>(arg.Primary);
@@ -7678,6 +7725,9 @@ bool LLVMBackend::RequestCxxVariadicConstructor(
             std::string type = arg.TypeAndValue.TypeName;
             bool pointer = arg.TypeAndValue.Pointer;
             llvm::Type* valueType = arg.Primary != nullptr ? arg.Primary->getType() : arg.BaseType;
+            // The declared primitive identity outranks the machine-type guess below, which
+            // cannot tell `char` from `i8` or `long` from `i64`.
+            if (type.empty()) type = DeclaredPrimitiveIdentityForCxxArgument(arg, valueType);
             if (type.empty())
             {
                 if (auto* constant = llvm::dyn_cast_or_null<llvm::Constant>(arg.Primary);
