@@ -6504,6 +6504,12 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 for (auto& arg : arguments)
                                 {
                                     llvm::Value* value = LoadNamedVariable(arg);
+                                    // Same rule as the declaration path: an address-less
+                                    // constant is a temporary, a stored value is an lvalue.
+                                    if (llvm::isa_and_nonnull<llvm::Constant>(value)
+                                        && arg.Storage == nullptr
+                                        && !arg.TypeAndValue.IsAlias)
+                                        arg.IsRvalue = true;
                                     ctorValues.push_back(value);
                                     ctorTypes.push_back(arg.TypeAndValue);
                                     // The call-argument builder blanks a primitive TypeName on
@@ -6517,13 +6523,15 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 std::string why;
                                 const auto* ctor = compiler->SelectCxxConstructor(
                                     functionName, ctorTypes, why, false, &arguments);
-                                if (ctor == nullptr)
+                                bool hardReferenceRejection = why.starts_with("constructor '");
+                                if (ctor == nullptr && !hardReferenceRejection)
                                 {
                                     compiler->TryBindRefusedCxxMember(functionName, "__ctor");
                                     ctor = compiler->SelectCxxConstructor(
                                         functionName, ctorTypes, why, false, &arguments);
+                                    hardReferenceRejection = why.starts_with("constructor '");
                                 }
-                                if (ctor == nullptr)
+                                if (ctor == nullptr && !hardReferenceRejection)
                                 {
                                     // Some foreign class constructors are templates or inherited
                                     // variadics, so use the declaration initializer's wrapper path.
@@ -6566,6 +6574,12 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                             "C++ class '{}' {}", functionName, why));
                                         namedVar = {};
                                     }
+                                }
+                                else if (ctor == nullptr)
+                                {
+                                    LogErrorContext(primaryCtx, std::format(
+                                        "C++ class '{}' {}", functionName, why));
+                                    namedVar = {};
                                 }
                                 else
                                 {

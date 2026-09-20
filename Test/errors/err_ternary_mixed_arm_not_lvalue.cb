@@ -1,0 +1,16 @@
+// A ternary is an lvalue only when BOTH arms are lvalues; a literal or call-result arm makes it
+// an rvalue, so it cannot be assigned or incremented.
+int mk() { return 3; }
+
+extern int main()
+{
+    int a = 1;
+    bool c = true;
+    expect_error("not an addressable lvalue") {
+        (c ? a : 5) = 9;
+    }
+    expect_error("not an addressable lvalue") {
+        (c ? a : mk()) = 9;
+    }
+    return 0;
+}

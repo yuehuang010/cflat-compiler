@@ -10984,11 +10984,26 @@ void LLVMBackend::RegisterCxxClassMembers(const CRecordEntry& r, const std::stri
             info.directMethods.push_back(std::move(method));
         };
         auto markConstructorReference = [&](const std::string& spelling, TypeAndValue& tv) {
+            if (tv.Pointer && tv.TypeName == "void")
+            {
+                TypeAndValue remapped;
+                bool representable = false;
+                if (TryMapCxxForeignSpelling(spelling, remapped, representable) && representable)
+                    tv.TypeName = remapped.TypeName;
+                int ptrLevels = 0;
+                const std::string tag = CxxRecordPointeeTag(spelling, ptrLevels);
+                if (ptrLevels == 1
+                    && (IsCxxRecord(tag) || IsCxxLazyAliasSpecialization(tag)))
+                    tv.TypeName = tag;
+            }
             CxxReferenceKind refKind = CxxReferenceKind::None;
             CxxSpellingWithoutRef(spelling, &refKind);
             if (refKind == CxxReferenceKind::Lvalue && tv.Pointer
                 && !tv.ElemPointer && !tv.IsFunctionPointer)
+            {
                 tv.IsAlias = true;
+                tv.IsCxxConstRef = CxxParamIsConstLvalueReference(spelling);
+            }
         };
         /*
          * Does this overload have a symbol cflat could call at all? CFlat drops `volatile` the way
@@ -13548,9 +13563,31 @@ bool LLVMBackend::EmitCxxStructorCall(const std::string& typeName,
                 else if (!source.TypeAndValue.Pointer && param->Pointer && !param->ElemPointer
                          && (param->IsAlias || param->IsRvalueRef)
                          && source.Storage != nullptr
-                         && param->TypeName == source.TypeAndValue.TypeName)
+                         && (param->TypeName == source.TypeAndValue.TypeName
+                             || (param->TypeName == "void"
+                                 && IsForeignCxxClassWithConstructors(
+                                     source.TypeAndValue.TypeName))))
                 {
                     a = source.Storage;
+                }
+            }
+            // `T&&` where T is itself a pointer receives the pointer VALUE through a temporary
+            // slot; passing `&x` directly makes the callee read x's bytes as an address.
+            if (param != nullptr && param->IsRvalueRef && param->ElemPointer
+                && a != nullptr && a->getType()->isPointerTy())
+            {
+                TypeAndValue referent = *param;
+                referent.ElemPointer = false;
+                referent.Pointer = true;
+                referent.PointerDepth = 1;
+                referent.IsAlias = false;
+                referent.IsRvalueRef = false;
+                if (llvm::Type* refTy = GetType(referent); refTy != nullptr
+                    && refTy->isPointerTy())
+                {
+                    auto* temp = AllocaAtEntry(refTy, nullptr, "ctor.rrefarg");
+                    builder->CreateStore(a, temp);
+                    a = temp;
                 }
             }
             // A reference parameter with no addressable argument left keeps its materialized
@@ -13650,6 +13687,22 @@ bool LLVMBackend::EmitCxxStructorCall(const std::string& typeName,
                                indirectArgAddrs.empty() ? nullptr : &indirectArgAddrs);
         else
             CreateFunctionCall(fn, args);
+        if (extraArgVars != nullptr && !extraArgVars->empty())
+        {
+            NamedVariable self;
+            self.Primary = slot;
+            self.Storage = slot;
+            self.BaseType = slot->getType();
+            if (!st.params.empty()) self.TypeAndValue = st.params.front();
+            std::vector<NamedVariable> transferArgs;
+            transferArgs.reserve(extraArgVars->size() + 1);
+            transferArgs.push_back(std::move(self));
+            transferArgs.insert(transferArgs.end(), extraArgVars->begin(), extraArgVars->end());
+            ApplyMoveParamTransfer(typeName, st.params, transferArgs,
+                                   /*paramsCarryAllocAlign=*/false,
+                                   /*calleeIsMethod=*/false,
+                                   /*beforeCall=*/false);
+        }
         return true;
     }
 
@@ -13786,24 +13839,64 @@ const LLVMBackend::CxxClassInfo::Structor* LLVMBackend::SelectCxxConstructor(
             const int aFloat = a.IsFloatingPoint();
             return aFloat != -1 && aFloat == b.IsFloatingPoint();
         };
+        auto argumentIsRvalue = [&](size_t index) {
+            // Rvalue-ness must be PROVEN. Without argument provenance nothing is proven, and an
+            // argument that has addressable storage or came back as a reference is an lvalue.
+            if (argVars == nullptr || index >= argVars->size())
+                return false;
+            const NamedVariable& arg = (*argVars)[index];
+            if (arg.IsRvalue || IsRvalueReferenceArgument(arg)) return true;
+            if (arg.TypeAndValue.IsAlias) return false;   // a reference-returning call result
+            llvm::Value* storage = arg.Storage;
+            if (storage == nullptr && !arg.CallerName.empty())
+                storage = FindVariableStorage(arg.CallerName).Storage;
+            if (storage == nullptr) return true;          // nothing addressable behind it
+            // Storage alone is not enough: a conversion keeps the SOURCE variable's slot while
+            // its value is a temporary. An lvalue's value is read from that very slot.
+            if (llvm::isa<llvm::PHINode>(storage)) return false;   // a '?:' join of addresses
+            if (arg.Primary == nullptr || arg.Primary == storage) return false;
+            auto* load = llvm::dyn_cast<llvm::LoadInst>(arg.Primary);
+            return load == nullptr || load->getPointerOperand() != storage;
+        };
+        auto isForeignClass = [&](const std::string& name) {
+            return IsCxxRecord(name) || IsCxxLazyAliasSpecialization(name);
+        };
+        auto scalarRvalueReference = [&](const TypeAndValue& want,
+                                         const TypeAndValue& got, bool rvalue) {
+            TypeAndValue referent = want;
+            referent.Pointer = false;
+            referent.ElemPointer = false;
+            return want.Pointer && want.IsRvalueRef && !want.ElemPointer && !got.Pointer
+                && rvalue && want.TypeName != "void" && !isForeignClass(want.TypeName)
+                && scalarFamily(referent) == scalarFamily(got);
+        };
         auto compatible = [&](const TypeAndValue& want, const TypeAndValue& got) {
             if (got.IsScopedEnum)
                 return IsScopedEnumMatch(got, want);
             if (want.TypeName == got.TypeName && want.Pointer == got.Pointer) return true;
             if (want.Pointer && got.Pointer && IsCxxDerivedToBasePointer(got, want))
                 return true;                 // a public derived pointer converts to Base*
+            if (want.Pointer && got.Pointer && want.IsRvalueRef && want.ElemPointer
+                && !got.ElemPointer && dataStructures.count(want.TypeName) == 0
+                && dataStructures.count(got.TypeName) == 0 && scalarEquivalent(want, got))
+                return true;                 // a pointer rvalue-reference binds a pointer value
             if (want.Pointer && got.Pointer == false && want.IsAlias && !want.ElemPointer
                 && IsCxxDerivedToBaseValue(got, want))
                 return true;                 // a public derived value binds to Base&
-            if (want.Pointer && !got.Pointer && want.IsAlias && !want.ElemPointer
-                && want.TypeName == got.TypeName && dataStructures.count(want.TypeName) != 0)
-                return true;                  // a C++ class const-reference accepts a value
+            if (want.Pointer && !got.Pointer && (want.IsAlias || want.IsRvalueRef)
+                && !want.ElemPointer && want.TypeName == "void"
+                && IsForeignCxxClassWithConstructors(got.TypeName))
+                return true;                 // a late-requested C++ class reference was opaque
+            if (want.Pointer && !got.Pointer && (want.IsAlias || want.IsRvalueRef)
+                && !want.ElemPointer && want.TypeName == got.TypeName
+                && isForeignClass(want.TypeName))
+                return true;                  // a class reference accepts a value of its referent
             // A reference to a PRIMITIVE is an indirect pointer at this stage; an lvalue of
             // exactly that type binds it (`HasRef(int&)` called with an `int` variable). An
             // rvalue reference is excluded: `optional<int>(in_place_t, int&&)` must not take it.
             if (want.Pointer && !got.Pointer && want.IsAlias && !want.IsRvalueRef
                 && !want.ElemPointer && !got.ElemPointer && want.TypeName == got.TypeName
-                && dataStructures.count(want.TypeName) == 0)
+                && !isForeignClass(want.TypeName))
                 return true;
             // A scalar C++ reference is represented as an indirect pointer at this stage, but
             // an ordinary pointer parameter is not a numeric conversion target. Without the
@@ -13849,6 +13942,18 @@ const LLVMBackend::CxxClassInfo::Structor* LLVMBackend::SelectCxxConstructor(
         };
         size_t foundOmitted = 0;
         size_t foundExact = 0;
+        size_t foundReferencePreference = 0;
+        std::string referenceRejection;
+        auto referenceParameterName = [](const TypeAndValue& param, size_t index) {
+            return param.VariableName.empty()
+                ? std::format("parameter {}", index + 1) : param.VariableName;
+        };
+        auto referencePreference = [](const TypeAndValue& param, bool rvalue) {
+            if (!param.Pointer || param.IsCxxRefToPointer) return size_t(0);
+            if (param.IsRvalueRef) return rvalue ? size_t(2) : size_t(0);
+            if (!param.IsAlias) return size_t(0);
+            return param.IsCxxConstRef ? size_t(1) : (rvalue ? size_t(0) : size_t(2));
+        };
         // A tie is only final once every candidate has been seen: a later exact match wins.
         bool ambiguous = false;
         for (const auto& c : info->constructors)
@@ -13864,10 +13969,40 @@ const LLVMBackend::CxxClassInfo::Structor* LLVMBackend::SelectCxxConstructor(
             ++candidates;
             bool ok = true;
             size_t exact = 0;
+            size_t currentReferencePreference = 0;
             for (size_t i = 0; i < argTypes.size(); ++i)
             {
                 const auto& want = c.params[i + 1];
                 const auto& got = argTypes[i];
+                const bool rvalue = argumentIsRvalue(i);
+                const bool sameReferenceReferent = (want.TypeName == got.TypeName
+                    && ((want.ElemPointer && want.Pointer && got.Pointer)
+                        || (!want.ElemPointer && !got.Pointer)))
+                    || scalarRvalueReference(want, got, rvalue);
+                if (sameReferenceReferent
+                    && want.Pointer && want.IsRvalueRef && !rvalue)
+                {
+                    if (!c.needsLocalDefinition && referenceRejection.empty())
+                        referenceRejection = std::format(
+                            "constructor '{}' parameter '{}' is an rvalue reference; "
+                            "pass 'move <argument>' or a temporary value",
+                            typeName, referenceParameterName(want, i));
+                    ok = false;
+                    break;
+                }
+                if (sameReferenceReferent && want.Pointer && want.IsAlias
+                    && !want.IsRvalueRef && !want.IsCxxConstRef && !want.IsCxxRefToPointer
+                    && rvalue)
+                {
+                    if (!c.needsLocalDefinition && referenceRejection.empty())
+                        referenceRejection = std::format(
+                            "constructor '{}' parameter '{}' is a non-const lvalue "
+                            "reference and cannot bind an rvalue; pass an lvalue",
+                            typeName, referenceParameterName(want, i));
+                    ok = false;
+                    break;
+                }
+                currentReferencePreference += referencePreference(want, rvalue);
                 if (want.TypeName == got.TypeName
                     && (want.Pointer == got.Pointer
                         || (allowNumericConversions && want.Pointer && !got.Pointer)))
@@ -13885,14 +14020,31 @@ const LLVMBackend::CxxClassInfo::Structor* LLVMBackend::SelectCxxConstructor(
                     && IsStdFunctionSpecialization(got.TypeName))
                     sameType = true;
                 bool copyRef = (c.isCopyCtor || c.isMoveCtor) && sameType;
-                if (!copyRef && !compatible(want, got)) { ok = false; break; }
+                const bool scalarRvalueRef = scalarRvalueReference(want, got, rvalue);
+                const bool compatibleArg = compatible(want, got);
+                if (!copyRef && !scalarRvalueRef && !compatibleArg)
+                { ok = false; break; }
                 // A reference to a PRIMITIVE needs an ADDRESSABLE argument: a literal has none,
                 // and binding one would hand the callee a pointer into a dead temporary.
                 if (want.Pointer && !got.Pointer && (want.IsAlias || want.IsRvalueRef)
-                    && !want.ElemPointer && dataStructures.count(want.TypeName) == 0
+                    && !want.ElemPointer && !isForeignClass(want.TypeName)
                     && argVars != nullptr && i < argVars->size()
                     && (*argVars)[i].Storage == nullptr)
-                { ok = false; break; }
+                {
+                    // A const reference and an rvalue reference both materialize a temporary, and
+                    // so does an lvalue whose address the front end did not keep. Only a PROVEN
+                    // rvalue is refused by a non-const lvalue reference.
+                    if (!want.IsCxxConstRef && !want.IsRvalueRef && rvalue)
+                    {
+                        if (!c.needsLocalDefinition && referenceRejection.empty())
+                            referenceRejection = std::format(
+                                "constructor '{}' parameter '{}' is a non-const lvalue "
+                                "reference and cannot bind an rvalue; pass an lvalue",
+                                typeName, referenceParameterName(want, i));
+                        ok = false;
+                        break;
+                    }
+                }
             }
             if (!ok) continue;
             if (verbose)
@@ -13913,11 +14065,27 @@ const LLVMBackend::CxxClassInfo::Structor* LLVMBackend::SelectCxxConstructor(
                 if (omitted > foundOmitted) continue;
                 if (omitted < foundOmitted)
                 {
-                    found = &c; foundOmitted = omitted; foundExact = exact; ambiguous = false;
+                    found = &c; foundOmitted = omitted; foundExact = exact;
+                    foundReferencePreference = currentReferencePreference;
+                    ambiguous = false;
                     continue;
                 }
                 if (exact < foundExact) continue;
-                if (exact > foundExact) { found = &c; foundExact = exact; ambiguous = false; continue; }
+                if (exact > foundExact)
+                {
+                    found = &c; foundExact = exact;
+                    foundReferencePreference = currentReferencePreference;
+                    ambiguous = false;
+                    continue;
+                }
+                if (currentReferencePreference < foundReferencePreference) continue;
+                if (currentReferencePreference > foundReferencePreference)
+                {
+                    found = &c;
+                    foundReferencePreference = currentReferencePreference;
+                    ambiguous = false;
+                    continue;
+                }
                 bool sameShape = c.params.size() == found->params.size();
                 for (size_t i = 0; sameShape && i < c.params.size(); ++i)
                     sameShape = sameBoundaryType(c.params[i], found->params[i]);
@@ -13927,6 +14095,7 @@ const LLVMBackend::CxxClassInfo::Structor* LLVMBackend::SelectCxxConstructor(
             found = &c;
             foundOmitted = omitted;
             foundExact = exact;
+            foundReferencePreference = currentReferencePreference;
         }
         if (ambiguous)
         {
@@ -13937,6 +14106,11 @@ const LLVMBackend::CxxClassInfo::Structor* LLVMBackend::SelectCxxConstructor(
         if (candidates == 0)
         {
             why = std::format("has no constructor taking {} argument(s)", (uint64_t)argTypes.size());
+            return nullptr;
+        }
+        if (!referenceRejection.empty())
+        {
+            why = referenceRejection;
             return nullptr;
         }
         // Name the argument types: with several same-arity overloads, "no match" alone does not say

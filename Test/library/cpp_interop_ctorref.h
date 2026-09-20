@@ -1,4 +1,5 @@
 #pragma once
+#include <string>
 // Section M102: a C++ CONSTRUCTOR parameter declared `T&` must bind the ARGUMENT's address.
 // Every class here proves it by writing through the reference after the ctor returned.
 namespace cppcr {
@@ -61,11 +62,66 @@ struct IntRef {
     int get() const { return *p; }
 };
 
+struct LRef {
+    int seen;
+    LRef(Cnt& c, int& x) : seen(c.v + x) { c.v += 10; x += 20; }
+};
+
 // Controls: a free and a member function with the same `T&` parameter already passed the
 // address, so these pin that the fix did not disturb them.
 inline int by_ref_free(Cnt& c) { c.v += 100; return c.v; }
 struct Mem { int bump(Cnt& c) { c.v += 1000; return c.v; } };
 
 inline Cnt make_cnt(int v) { Cnt c; c.v = v; return c; }
+inline int make_int(int v) { return v; }
+inline std::string make_string() { return std::string("call"); }
+
+struct RRefPair {
+    int seen;
+    RRefPair(Cnt&& c, int&& x) : seen(c.v + x + 100) { c.v += 10; x += 20; }
+    ~RRefPair() {}
+};
+
+struct CtorChoice {
+    inline static int copy_count = 0;
+    inline static int move_count = 0;
+    CtorChoice(const Cnt&) { ++copy_count; }
+    CtorChoice(Cnt&&) { ++move_count; }
+    static void reset() { copy_count = 0; move_count = 0; }
+    static int copies() { return copy_count; }
+    static int moves() { return move_count; }
+};
+
+struct ScalarRRef {
+    int seen;
+    ScalarRRef(int&& x) : seen(x + 1) { x += 10; }
+    ~ScalarRRef() {}
+};
+
+struct PointerRRef {
+    int seen;
+    PointerRRef(int*&& p) : seen(*p) { *p += 10; }
+    ~PointerRRef() {}
+};
+
+struct StringRRef {
+    int seen;
+    StringRRef(std::string&& s) : seen((int)s.size()) {}
+    ~StringRRef() {}
+};
+
+template <typename T>
+struct RRefBox {
+    int seen;
+    RRefBox(T&& x) : seen(x + 3) {}
+};
+
+// Reference-RETURNING helpers: their result is an LVALUE, so a `T&` ctor parameter must bind it.
+inline int& pick_ref(int& a) { return a; }
+struct RefBox {
+    int v;
+    RefBox() : v(0) {}
+    int& ref() { return v; }
+};
 
 }

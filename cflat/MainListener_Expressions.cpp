@@ -353,7 +353,7 @@ LLVMBackend::NamedVariable MainListener::ParseAssignmentExpressionNamed(CFlatPar
                 // A `?:` over two addressable C++ objects joins their storage too; keep it so a
                 // parenthesized ternary operand still names the SELECTED object.
                 if (result.Storage == nullptr && tv.receiverStorage != nullptr
-                    && tv.value != nullptr && tv.value->getType()->isStructTy())
+                    && tv.value != nullptr && !tv.value->getType()->isPointerTy())
                     result.Storage = tv.receiverStorage;
                 if (result.Primary)
                 {
@@ -6147,7 +6147,13 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
             auto* structTy = llvm::cast<llvm::StructType>(trueValue->getType());
             cxxRecordJoin = structTy->hasName() && compiler->IsCxxRecord(structTy->getName().str());
         }
-        if (cxxRecordJoin && trueStorage != nullptr && falseStorage != nullptr)
+        // Two addressable arms join their STORAGE, record or plain scalar: `c ? a : b` selects
+        // an OBJECT, so a C++ `T&` parameter must bind the selected one, not a copy. POINTER
+        // joins are excluded - their ownership analysis reads the value, not a joined slot.
+        const bool scalarLvalueJoin = !cxxRecordJoin && trueValue != nullptr
+            && (trueValue->getType()->isIntegerTy() || trueValue->getType()->isFloatingPointTy());
+        if ((cxxRecordJoin || scalarLvalueJoin)
+            && trueStorage != nullptr && falseStorage != nullptr)
         {
             auto* cxxStoragePhi = compiler->builder->CreatePHI(
                 compiler->builder->getPtrTy(), 2, "cxx_lvalue_storage_join");

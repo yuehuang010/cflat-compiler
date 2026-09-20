@@ -4,7 +4,20 @@ import cpp "cpp_interop_ctorref.h";
 
 extern int main()
 {
-    expect_error("has no constructor whose parameter types match these arguments");
-    cppcr.IntRef bad = cppcr.IntRef(5);
+    expect_error("constructor 'cppcr.IntRef' parameter 'x'") {
+        cppcr.IntRef bad = cppcr.IntRef(5);
+    }
+    expect_error("constructor 'cppcr.LRef' parameter 'c'") {
+        cppcr.LRef bad = cppcr.LRef(cppcr.make_cnt(3), 4);
+    }
+    expect_error("constructor 'cppcr.LRef' parameter 'x'") {
+        cppcr.Cnt c = cppcr.make_cnt(3);
+        cppcr.LRef bad = cppcr.LRef(c, 4 + 1);
+    }
+    expect_error("constructor 'cppcr.RRefPair' parameter 'c'") {
+        cppcr.Cnt c = cppcr.make_cnt(3);
+        int x = 4;
+        cppcr.RRefPair bad = cppcr.RRefPair(c, x);
+    }
     return 0;
 }

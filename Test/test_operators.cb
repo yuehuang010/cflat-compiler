@@ -773,6 +773,19 @@ extern int main()
     terPassed += Test("nested ternary picks one leaf", scN, 10);
     terPassed += Test("nested ternary skips others",   g_sideEffects, 10);
 
+    // A ternary over two lvalues is itself an lvalue (C++ rule): a write lands on the selected
+    // arm only, and reading the ternary into a variable still copies.
+    int terLa = 1;
+    int terLb = 2;
+    (terB ? terLa : terLb) = 5;
+    terPassed += Test("ternary lvalue assign selected", terLa, 5);
+    terPassed += Test("ternary lvalue assign other",    terLb, 2);
+    (terI0 ? terLa : terLb)++;
+    terPassed += Test("ternary lvalue ++ selected",     terLb, 3);
+    int terCopy = terB ? terLa : terLb;
+    terLa = 99;
+    terPassed += Test("ternary read still copies",      terCopy, 5);
+
     // Raw-pointer left operand selects the free operator==(PtrNode*, PtrKey). The pointer
     // is passed straight through as `this` - it is never copied into a temporary alloca.
     int ptrOpPassed = 0;
@@ -895,7 +908,7 @@ extern int main()
     int i128Passed = i128FeatureLegs();
     int reversedPassed = reversedAndZeroArgOverloadLegs();
 
-    return (callPassed == 12 && terPassed == 19 && ptrOpPassed == 8 && uPassed == 3
+    return (callPassed == 12 && terPassed == 23 && ptrOpPassed == 8 && uPassed == 3
         && unsignedLiteralPassed == 8 && unsignedAcceptPassed == 7
         && chainPassed == 11 && softPassed == 1 && promoPassed == 11
         && signednessPassed == 38 && autoNarrowPassed == 4 && joinAcceptPassed == 5

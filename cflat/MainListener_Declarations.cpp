@@ -3982,6 +3982,11 @@ cxx_dtor_ready:
                 argTypes.push_back(nv.TypeAndValue);
                 TypeUntypedCtorArg(argTypes.back(), argValue);
                 LLVMBackend::NamedVariable addressVar = nv;
+                // Only an address-less constant is provably a temporary here; a nameless
+                // expression with storage (ternary, reference-returning call) stays an lvalue.
+                if (llvm::isa_and_nonnull<llvm::Constant>(argValue) && nv.Storage == nullptr
+                    && !nv.TypeAndValue.IsAlias)
+                    addressVar.IsRvalue = true;
                 if (addressVar.Storage == nullptr && cxxRetTemp != nullptr)
                 {
                     // A prvalue temp: MOVE out of it. It stays on the end-of-statement owned-temp
@@ -4031,13 +4036,15 @@ cxx_dtor_ready:
             std::string why;
             const auto* ctor = compiler->SelectCxxConstructor(typeName, argTypes, why, false,
                                                              &ctorArgumentAddresses);
-            if (ctor == nullptr)
+            bool hardReferenceRejection = why.starts_with("constructor '");
+            if (ctor == nullptr && !hardReferenceRejection)
             {
                 compiler->TryBindRefusedCxxMember(typeName, "__ctor");
                 ctor = compiler->SelectCxxConstructor(typeName, argTypes, why, false,
                                                       &ctorArgumentAddresses);
+                hardReferenceRejection = why.starts_with("constructor '");
             }
-            if (ctor == nullptr)
+            if (ctor == nullptr && !hardReferenceRejection)
             {
                 std::string wrapperName;
                 std::string wrapperError;
@@ -4071,6 +4078,11 @@ cxx_dtor_ready:
                     return true;
                 }
                 if (!wrapperError.empty()) why = wrapperError;
+                LogErrorContext(direct, std::format("C++ class '{}' {}", typeName, why));
+                return true;
+            }
+            if (ctor == nullptr)
+            {
                 LogErrorContext(direct, std::format("C++ class '{}' {}", typeName, why));
                 return true;
             }

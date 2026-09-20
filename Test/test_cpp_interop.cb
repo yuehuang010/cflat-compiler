@@ -2678,5 +2678,138 @@ extern int main()
         if (chNestD.value != 0 || chNestE.value != 5 || chNestF.value != 0
             || chResult->value != 5)                                              return 3119;
     }
+
+    // ---- C++ ctor reference-kind resolution (3080-3099) ------------------------------
+    // Every cell below was a no-match, wrong-leg, or pointer-value crash before this fix.
+    {
+        cppcr.Cnt c = cppcr.make_cnt(3);
+        int x = 4;
+        cppcr.RRefPair pair = cppcr.RRefPair(move c, move x);
+        if (pair.seen != 107) return 3080;
+    }
+    {
+        cppcr.RRefPair pair = cppcr.RRefPair(cppcr.make_cnt(3), cppcr.make_int(4));
+        if (pair.seen != 107) return 3081;
+    }
+    {
+        cppcr.Cnt c = cppcr.make_cnt(3);
+        int x = 4;
+        cppcr.RRefPair pair = cppcr.RRefPair(move c, x + 1);
+        if (pair.seen != 108) return 3082;
+    }
+    {
+        int x = 4;
+        cppcr.RRefPair pair = cppcr.RRefPair(cppcr.make_cnt(3), move x);
+        if (pair.seen != 107) return 3083;
+    }
+    {
+        cppcr.Cnt c = cppcr.make_cnt(3);
+        cppcr.RRefPair pair = cppcr.RRefPair(move c, cppcr.make_int(4));
+        if (pair.seen != 107) return 3084;
+    }
+    {
+        cppcr.CtorChoice.reset();
+        cppcr.Cnt c = cppcr.make_cnt(3);
+        cppcr.CtorChoice picked = cppcr.CtorChoice(move c);
+        if (cppcr.CtorChoice.copies() != 0 || cppcr.CtorChoice.moves() != 1) return 3085;
+    }
+    {
+        cppcr.CtorChoice.reset();
+        cppcr.CtorChoice picked = cppcr.CtorChoice(cppcr.make_cnt(3));
+        if (cppcr.CtorChoice.copies() != 0 || cppcr.CtorChoice.moves() != 1) return 3086;
+    }
+    {
+        int x = 4;
+        cppcr.ScalarRRef scalar = cppcr.ScalarRRef(x + 1);
+        if (scalar.seen != 6) return 3087;
+    }
+    {
+        cppcr.ScalarRRef scalar = cppcr.ScalarRRef(cppcr.make_int(6));
+        if (scalar.seen != 7) return 3088;
+    }
+    {
+        int x = 7;
+        cppcr.PointerRRef pointer = cppcr.PointerRRef(&x);
+        if (pointer.seen != 7 || x != 17) return 3089;
+    }
+    {
+        std.string text = std.string("abcd");
+        cppcr.StringRRef stringRef = cppcr.StringRRef(move text);
+        if (stringRef.seen != 4) return 3090;
+    }
+    {
+        cppcr.StringRRef stringRef = cppcr.StringRRef(cppcr.make_string());
+        if (stringRef.seen != 4) return 3091;
+    }
+    {
+        cppcr.Cnt c = cppcr.make_cnt(3);
+        int x = 4;
+        cppcr.RRefPair* pair = new cppcr.RRefPair(move c, move x);
+        if (pair.seen != 107) return 3092;
+        delete pair;
+    }
+    {
+        cppcr.ScalarRRef* scalar = new cppcr.ScalarRRef(5);
+        if (scalar.seen != 6) return 3093;
+        delete scalar;
+    }
+    {
+        int x = 4;
+        cppcr.ScalarRRef* scalar = new cppcr.ScalarRRef(x + 1);
+        if (scalar.seen != 6) return 3094;
+        delete scalar;
+    }
+    {
+        cppcr.ScalarRRef* scalar = new cppcr.ScalarRRef(cppcr.make_int(6));
+        if (scalar.seen != 7) return 3095;
+        delete scalar;
+    }
+    {
+        int x = 7;
+        cppcr.PointerRRef* pointer = new cppcr.PointerRRef(&x);
+        if (pointer.seen != 7 || x != 17) return 3096;
+        delete pointer;
+    }
+    {
+        int x = 4;
+        cppcr.RRefBox<int> box = cppcr.RRefBox<int>(x + 1);
+        if (box.seen != 8) return 3097;
+    }
+    {
+        cppcr.RRefBox<int> box = cppcr.RRefBox<int>(cppcr.make_int(5));
+        if (box.seen != 8) return 3098;
+    }
+    {
+        cppcr.RRefPair* pair = new cppcr.RRefPair(cppcr.make_cnt(2), 3 + 1);
+        if (pair.seen != 106) return 3099;
+        delete pair;
+    }
+    // ---- C++ ctor `T&` binding of lvalue-shaped expressions (3140-3145) ---------------
+    {
+        // A `?:` over two lvalues selects an OBJECT: the ctor must write through to it.
+        int b = 6;
+        int c = 9;
+        cppcr.IntRef r = cppcr.IntRef(b > 0 ? b : c);
+        if (r.get() != 7 || b != 7 || c != 9) return 3140;
+    }
+    {
+        int b = 0;
+        int c = 4;
+        cppcr.IntRef r = cppcr.IntRef(b > 0 ? b : c);
+        if (r.get() != 5 || b != 0 || c != 5) return 3141;
+    }
+    {
+        // A reference-returning FREE call is an lvalue.
+        int a = 1;
+        cppcr.IntRef r = cppcr.IntRef(cppcr.pick_ref(a));
+        if (r.get() != 2 || a != 2) return 3142;
+    }
+    {
+        // A reference-returning MEMBER call is an lvalue too.
+        cppcr.RefBox box = cppcr.RefBox();
+        box.v = 5;
+        cppcr.IntRef r = cppcr.IntRef(box.ref());
+        if (r.get() != 6 || box.v != 6) return 3143;
+    }
     return 0;
 }
