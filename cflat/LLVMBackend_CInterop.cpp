@@ -11191,8 +11191,12 @@ void LLVMBackend::RegisterCxxClassMembers(const CRecordEntry& r, const std::stri
                 }
                 else if (tv.ElemPointer)
                 {
-                    if (bare.empty() || bare.back() != '*'
-                        || std::count(bare.begin(), bare.end(), '*') != 1)
+                    std::string bareWithoutCv = bare;
+                    for (const char* q : { "const", "volatile", "restrict", "__restrict",
+                                           "__restrict__" })
+                        EraseDeclaratorToken(bareWithoutCv, q);
+                    if (bareWithoutCv.empty() || bareWithoutCv.back() != '*'
+                        || std::count(bareWithoutCv.begin(), bareWithoutCv.end(), '*') != 1)
                         return;
                     tv.ElemPointer = false;
                     tv.IsCxxRefToPointer = true;

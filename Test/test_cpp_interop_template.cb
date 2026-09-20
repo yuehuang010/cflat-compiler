@@ -2856,5 +2856,32 @@ extern int main()
         if (crpHolder.pick_b(&crpCell) != 20)                                return 2498;
     }
 
+    // ---- reference-to-pointer overload ranking (2500-2514) -------------------------------
+    // Each pair has the same arity and differs only by pointer depth; return values identify
+    // the selected C++ overload. The calls use heap pointers or primitive locals, not C++ values.
+    {
+        nest.Cell* rprCell = new nest.Cell(2, 3);
+        nest.Cell** rprCellPtr = &rprCell;
+        int rprInt = 9;
+        int* rprIntPtr = &rprInt;
+        int** rprIntPtrPtr = &rprIntPtr;
+        if (nest.rpr_rank_free_cell(rprCell) != 1)                         return 2500;
+        if (nest.rpr_rank_free_cell(rprCellPtr) != 2)                      return 2501;
+        if (nest.rpr_rank_free_cell_const(rprCell) != 3)                   return 2502;
+        if (nest.rpr_rank_free_cell_const(rprCellPtr) != 4)                return 2503;
+        if (nest.rpr_rank_free_int(rprIntPtr) != 5)                         return 2504;
+        if (nest.rpr_rank_free_int(rprIntPtrPtr) != 6)                      return 2505;
+        nest.RprRankHolder* rprHolder = new nest.RprRankHolder();
+        if (rprHolder->member_cell(rprCell) != 7)                           return 2506;
+        if (rprHolder->member_cell(rprCellPtr) != 8)                       return 2507;
+        if (rprHolder->member_int_const(rprIntPtr) != 9)                   return 2508;
+        if (rprHolder->member_int_const(rprIntPtrPtr) != 10)               return 2509;
+        if (nest.RprRankHolder.static_cell_const(rprCell) != 11)           return 2510;
+        if (nest.RprRankHolder.static_cell_const(rprCellPtr) != 12)        return 2511;
+        if (nest.RprRankHolder.static_int(rprIntPtr) != 13)                 return 2512;
+        if (nest.RprRankHolder.static_int(rprIntPtrPtr) != 14)              return 2513;
+        if (rprHolder->member_cell_const(rprCellPtr) != 16)                return 2514;
+    }
+
     return 0;
 }

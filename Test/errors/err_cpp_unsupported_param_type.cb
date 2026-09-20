@@ -25,5 +25,45 @@ extern int main()
         std.vector<nest.Cell**> pdVec = default;
         pdVec.get_allocator();
     }
+    expect_error("no overload of 'nest.rpr_rank_single_cell_shallow' matches the given arguments") {
+        nest.Cell* rprP = new nest.Cell(1, 2);
+        nest.Cell** rprPP = &rprP;
+        nest.rpr_rank_single_cell_shallow(rprPP);
+    }
+    expect_error("no overload of 'nest.rpr_rank_single_cell_deep' matches the given arguments") {
+        nest.Cell* rprP = new nest.Cell(1, 2);
+        nest.rpr_rank_single_cell_deep(rprP);
+    }
+    expect_error("no overload of 'nest.rpr_rank_single_cell_shallow_const' matches the given arguments") {
+        nest.Cell* rprP = new nest.Cell(1, 2);
+        nest.Cell** rprPP = &rprP;
+        nest.rpr_rank_single_cell_shallow_const(rprPP);
+    }
+    expect_error("no overload of 'nest.rpr_rank_single_cell_deep_const' matches the given arguments") {
+        nest.Cell* rprP = new nest.Cell(1, 2);
+        nest.rpr_rank_single_cell_deep_const(rprP);
+    }
+    expect_error("no overload of 'nest.rpr_rank_single_int_shallow' matches the given arguments") {
+        int rprV = 1;
+        int* rprP = &rprV;
+        int** rprPP = &rprP;
+        nest.rpr_rank_single_int_shallow(rprPP);
+    }
+    expect_error("no overload of 'nest.rpr_rank_single_int_deep' matches the given arguments") {
+        int rprV = 1;
+        int* rprP = &rprV;
+        nest.rpr_rank_single_int_deep(rprP);
+    }
+    expect_error("no overload of 'nest.rpr_rank_single_int_shallow_const' matches the given arguments") {
+        int rprV = 1;
+        int* rprP = &rprV;
+        int** rprPP = &rprP;
+        nest.rpr_rank_single_int_shallow_const(rprPP);
+    }
+    expect_error("no overload of 'nest.rpr_rank_single_int_deep_const' matches the given arguments") {
+        int rprV = 1;
+        int* rprP = &rprV;
+        nest.rpr_rank_single_int_deep_const(rprP);
+    }
     return 0;
 }

@@ -128,4 +128,34 @@ struct ConstRefPtrArray
     Cell *const &operator[](int) const { return slot; }
 };
 
+inline int rpr_rank_free_cell(Cell*&) { return 1; }
+inline int rpr_rank_free_cell(Cell**&) { return 2; }
+inline int rpr_rank_free_cell_const(Cell*const&) { return 3; }
+inline int rpr_rank_free_cell_const(Cell**const&) { return 4; }
+inline int rpr_rank_free_int(int*&) { return 5; }
+inline int rpr_rank_free_int(int**&) { return 6; }
+
+struct RprRankHolder
+{
+    int member_cell(Cell*&) { return 7; }
+    int member_cell(Cell**&) { return 8; }
+    int member_int_const(int*const&) { return 9; }
+    int member_int_const(int**const&) { return 10; }
+    int member_cell_const(Cell*const&) { return 15; }
+    int member_cell_const(Cell**const&) { return 16; }
+    static int static_cell_const(Cell*const&) { return 11; }
+    static int static_cell_const(Cell**const&) { return 12; }
+    static int static_int(int*&) { return 13; }
+    static int static_int(int**&) { return 14; }
+};
+
+inline int rpr_rank_single_cell_shallow(Cell*&) { return 21; }
+inline int rpr_rank_single_cell_deep(Cell**&) { return 22; }
+inline int rpr_rank_single_cell_shallow_const(Cell*const&) { return 23; }
+inline int rpr_rank_single_cell_deep_const(Cell**const&) { return 24; }
+inline int rpr_rank_single_int_shallow(int*&) { return 25; }
+inline int rpr_rank_single_int_deep(int**&) { return 26; }
+inline int rpr_rank_single_int_shallow_const(int*const&) { return 27; }
+inline int rpr_rank_single_int_deep_const(int**const&) { return 28; }
+
 }

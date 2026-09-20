@@ -467,13 +467,6 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
 
                     LLVMBackend::TypeAndValue tmpArg = arg.TypeAndValue;
                     LLVMBackend::TypeAndValue tmpParam = *candidateParamItr;
-                    if (tmpParam.IsCxxRefToPointer)
-                    {
-                        // Match T*& by its CFlat-facing alias T* shape; the natural
-                        // ABI remains T** and is restored only by argument lowering.
-                        tmpParam.ElemPointer = false;
-                        tmpParam.PointerDepth = tmpParam.Pointer ? 1 : 0;
-                    }
 
                     tmpArg.TypeName = resolveName(tmpArg.TypeName);
                     tmpParam.TypeName = resolveName(tmpParam.TypeName);
@@ -824,7 +817,9 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                  * as one 32-bit "int", and the empty-TypeName branch sees only opaque pointers.
                  * Same predicate IsTypeMatch uses, so it refuses exactly what that refuses.
                  */
-                if (result >= 0 && !candidateParamItr->IsCxxRefToPointer
+                // A reference-to-pointer parameter keeps the referred pointer's depth for
+                // overload resolution; only its ABI lowering adds the reference slot.
+                if (result >= 0
                     && arg.TypeAndValue.PointerDepthRefuses(*candidateParamItr))
                     result = -1;
 
