@@ -1685,121 +1685,224 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                 && !namedVar.TypeAndValue.Pointer
                 && compiler->IsForeignNontrivialCxxClass(namedVar.TypeAndValue.TypeName))
             {
-                const std::string tn = namedVar.TypeAndValue.TypeName;
-                auto* mv = TopLevelMoveExpression(assignCtx);
-                const bool useMove = mv != nullptr;
-                auto* srcCtx = useMove ? (antlr4::ParserRuleContext*)mv->unaryExpression()
-                                       : (antlr4::ParserRuleContext*)assignCtx;
-                const std::string srcName = srcCtx != nullptr ? srcCtx->getText() : std::string();
-                auto* rhsUnary = assignCtx != nullptr ? tryGetUnaryExpression(assignCtx) : nullptr;
-                auto* rhsPostfix = rhsUnary != nullptr ? rhsUnary->postfixExpression() : nullptr;
-                const bool rhsTemporary = rhsPostfix != nullptr
-                    && !rhsPostfix->argumentExpressionList().empty();
-                const auto* info = compiler->GetCxxClassInfo(tn);
-                const LLVMBackend::CxxClassInfo::Structor* op = nullptr;
-                auto lvalueReceiverAssignment = [](const auto& overloads,
-                                                    const auto& fallback)
-                    -> const LLVMBackend::CxxClassInfo::Structor* {
-                    for (const auto& candidate : overloads)
-                        if (candidate.refQualifier == cflat_cinterop::CxxRefQualifierNone
-                            || candidate.refQualifier == cflat_cinterop::CxxRefQualifierLValue)
-                            return &candidate;
-                    if (overloads.empty()
-                        && (fallback.refQualifier == cflat_cinterop::CxxRefQualifierNone
-                            || fallback.refQualifier == cflat_cinterop::CxxRefQualifierLValue))
-                        return &fallback;
-                    return nullptr;
-                };
-                if (info != nullptr)
                 {
-                    if ((useMove || rhsTemporary) && info->hasMoveAssign)
-                        op = lvalueReceiverAssignment(info->moveAssignOverloads, info->moveAssign);
-                    if (op == nullptr && info->hasCopyAssign)
-                        op = lvalueReceiverAssignment(info->copyAssignOverloads, info->copyAssign);
-                    if (op == nullptr && !useMove && !rhsTemporary && info->hasMoveAssign)
-                        op = lvalueReceiverAssignment(info->moveAssignOverloads, info->moveAssign);
-                }
+                    const std::string tn = namedVar.TypeAndValue.TypeName;
+                    auto* mv = TopLevelMoveExpression(assignCtx);
+                    const bool useMove = mv != nullptr;
+                    auto* srcCtx = useMove ? (antlr4::ParserRuleContext*)mv->unaryExpression()
+                                           : (antlr4::ParserRuleContext*)assignCtx;
+                    const std::string srcName = srcCtx != nullptr ? srcCtx->getText() : std::string();
+                    auto* rhsUnary = assignCtx != nullptr ? tryGetUnaryExpression(assignCtx) : nullptr;
+                    auto* rhsPostfix = rhsUnary != nullptr ? rhsUnary->postfixExpression() : nullptr;
+                    const bool rhsTemporary = rhsPostfix != nullptr && !rhsPostfix->LeftParen().empty();
+                    const bool rhsConstructor = assignCtx != nullptr
+                        && ForeignCxxConstructArgs(assignCtx, tn) != nullptr;
+                    const bool rhsDefault = assignCtx != nullptr && assignCtx->getText() == "default";
+                    // Created on demand by whichever of release/assignment is compiled first, so an
+                    // assignment may precede the releasing function in source order.
+                    auto* destinationGlobalLiveFlag = compiler->EnsureGlobalCxxLiveFlag(namedVar);
+                    const bool destinationReleased = namedVar.ExplicitlyMovedNull
+                        && namedVar.ConditionalDropFlag == nullptr;
+                    const bool destinationConditional = namedVar.ConditionalDropFlag != nullptr;
+                    const bool destinationGlobalConditional = destinationGlobalLiveFlag != nullptr;
+                    const auto* info = compiler->GetCxxClassInfo(tn);
+                    auto lvalueReceiverAssignment = [](const auto& overloads,
+                                                        const auto& fallback)
+                        -> const LLVMBackend::CxxClassInfo::Structor* {
+                        for (const auto& candidate : overloads)
+                            if (candidate.refQualifier == cflat_cinterop::CxxRefQualifierNone
+                                || candidate.refQualifier == cflat_cinterop::CxxRefQualifierLValue)
+                                return &candidate;
+                        if (overloads.empty()
+                            && (fallback.refQualifier == cflat_cinterop::CxxRefQualifierNone
+                                || fallback.refQualifier == cflat_cinterop::CxxRefQualifierLValue))
+                            return &fallback;
+                        return nullptr;
+                    };
 
-                // A C++ return temporary is constructed in a scratch slot, then assigned into
-                // the live destination so the old value is released by the assignment operator.
-                if (rhsTemporary && op != nullptr)
-                {
+                    auto ownedTempMark = compiler->MarkOwnedTemps();
+                    compiler->lastCxxRetTemp_ = nullptr;
+                    compiler->lastCxxRetValue_ = nullptr;
                     LLVMBackend::TypeAndValue tempType;
                     tempType.TypeName = tn;
-                    auto* temp = compiler->AllocaAtEntry(compiler->GetType(tempType), nullptr,
-                                                          "cxx.assign.temp",
-                                                          namedVar.TypeAndValue.AllocAlignValue);
-                    compiler->pendingCxxSretDest_ = temp;
-                    compiler->pendingCxxSretTypeName_ = tn;
-                    auto rhsNV = ParseAssignmentExpressionNamed(assignCtx);
-                    const bool consumed = compiler->pendingCxxSretDest_ == nullptr;
-                    compiler->pendingCxxSretDest_ = nullptr;
-                    compiler->pendingCxxSretTypeName_.clear();
-                    if (consumed && rhsNV.TypeAndValue.TypeName == tn && !rhsNV.TypeAndValue.Pointer)
+                    llvm::Value* forcedTemp = nullptr;
+                    bool consumed = false;
+                    LLVMBackend::NamedVariable rhsNV;
+                    if (rhsDefault)
                     {
-                        compiler->EmitCxxStructorCall(tn, *op, destination, { temp });
-                        compiler->RegisterOwnedStructTemp(temp, tn);
-                        compiler->MarkVariableUnmoved(namedVar.CallerName);
-                        return nullptr;
+                        std::string defaultError;
+                        compiler->TryBindCxxImplicitDefaultCtor(tn, defaultError);
+                        if (!defaultError.empty()) LogErrorContext(ctx, defaultError);
+                        const auto* ctor = compiler->FindCxxDefaultCtor(tn);
+                        if (ctor == nullptr)
+                            LogErrorContext(ctx, std::format(
+                                "C++ class '{}' has no default constructor cflat can call", tn));
+                        forcedTemp = compiler->AllocaAtEntry(
+                            compiler->GetType(tempType), nullptr, "cxx.assign.temp",
+                            namedVar.TypeAndValue.AllocAlignValue);
+                        compiler->EmitCxxStructorCall(tn, *ctor, forcedTemp, {});
+                        compiler->RegisterOwnedStructTemp(forcedTemp, tn);
                     }
-                }
-                if (!IsBareIdentifierText(srcName))
-                {
-                    LogErrorContext(ctx, std::format(
-                        "cannot assign to C++ class '{}' from this expression; the source must be "
-                        "a '{}' variable, optionally written 'move <variable>'", tn, tn));
-                    return nullptr;
-                }
-                auto* srcNV = compiler->FindLiveNamedVariable(srcName);
-                if (srcNV == nullptr || srcNV->Storage == nullptr
-                    || srcNV->TypeAndValue.Pointer || srcNV->TypeAndValue.TypeName != tn)
-                {
-                    LogErrorContext(ctx, std::format(
-                        "'{}' is not a '{}' value that can be assigned to a '{}'", srcName, tn, tn));
-                    return nullptr;
-                }
-                if (srcNV->IsMoved || srcNV->ExplicitlyMovedNull)
-                {
-                    LogErrorContext(ctx, std::format("use of moved variable '{}'", srcName));
-                    return nullptr;
-                }
-                if (op == nullptr)
-                {
-                    const char* qualifier = nullptr;
-                    if (info != nullptr)
+                    else
                     {
-                        const auto noteRvalueOnly = [&](const auto& overloads,
-                                                        const auto& fallback) {
-                            if (!overloads.empty())
-                                for (const auto& candidate : overloads)
-                                    if (candidate.refQualifier
-                                        == cflat_cinterop::CxxRefQualifierRValue)
-                                        return true;
-                            return overloads.empty()
-                                && fallback.refQualifier == cflat_cinterop::CxxRefQualifierRValue;
-                        };
-                        const bool moveOnly = noteRvalueOnly(info->moveAssignOverloads,
-                                                             info->moveAssign);
-                        const bool copyOnly = noteRvalueOnly(info->copyAssignOverloads,
-                                                             info->copyAssign);
-                        if (moveOnly || copyOnly) qualifier = "&&";
+                        const bool armReturnTemp = rhsTemporary || rhsConstructor;
+                        if (armReturnTemp)
+                        {
+                            forcedTemp = compiler->AllocaAtEntry(
+                                compiler->GetType(tempType), nullptr, "cxx.assign.temp",
+                                namedVar.TypeAndValue.AllocAlignValue);
+                            compiler->pendingCxxSretDest_ = forcedTemp;
+                            compiler->pendingCxxSretTypeName_ = tn;
+                        }
+                        rhsNV = ParseAssignmentExpressionNamed(assignCtx);
+                        consumed = armReturnTemp && compiler->pendingCxxSretDest_ == nullptr;
+                        compiler->pendingCxxSretDest_ = nullptr;
+                        compiler->pendingCxxSretTypeName_.clear();
+                        if (armReturnTemp && !consumed && rhsNV.Storage != forcedTemp)
+                            forcedTemp = nullptr;
                     }
-                    if (qualifier != nullptr)
+
+                    auto* returnedTemp = compiler->lastCxxRetTemp_;
+                    auto* returnedValue = compiler->lastCxxRetValue_;
+                    const bool outermostTemp = returnedTemp != nullptr
+                        && ((rhsNV.Primary != nullptr && rhsNV.Primary == returnedValue)
+                            || rhsNV.Storage == returnedTemp);
+                    const bool forcedTempProduced = forcedTemp != nullptr
+                        && (consumed || rhsNV.Storage == forcedTemp);
+                    const bool unmarkedCxxTemp = !forcedTempProduced && !rhsDefault
+                        && !outermostTemp && rhsNV.IsRvalue && rhsNV.Storage != nullptr
+                        && !rhsNV.TypeAndValue.Pointer
+                        && rhsNV.TypeAndValue.TypeName == tn;
+                    llvm::Value* rhsTemp = forcedTempProduced || rhsDefault
+                        ? forcedTemp : (outermostTemp ? returnedTemp
+                                                      : (unmarkedCxxTemp ? rhsNV.Storage : nullptr));
+                    if (forcedTempProduced && !rhsDefault)
+                        compiler->RegisterOwnedStructTemp(forcedTemp, tn);
+                    compiler->lastCxxRetTemp_ = nullptr;
+                    compiler->lastCxxRetValue_ = nullptr;
+
+                    llvm::Value* sourceStorage = rhsNV.Storage;
+                    if (useMove)
+                    {
+                        if (!IsBareIdentifierText(srcName))
+                            LogErrorContext(ctx, std::format(
+                                "cannot assign to C++ class '{}' from this expression; the source must be "
+                                "a '{}' variable, optionally written 'move <variable>'", tn, tn));
+                        auto* srcNV = compiler->FindLiveNamedVariable(srcName);
+                        if (srcNV == nullptr || srcNV->Storage == nullptr
+                            || srcNV->TypeAndValue.Pointer || srcNV->TypeAndValue.TypeName != tn)
+                            LogErrorContext(ctx, std::format(
+                                "'{}' is not a '{}' value that can be assigned to a '{}'", srcName, tn, tn));
+                        if (srcNV->IsMoved || srcNV->ExplicitlyMovedNull)
+                            LogErrorContext(ctx, std::format("use of moved variable '{}'", srcName));
+                        sourceStorage = srcNV->Storage;
+                    }
+                    else if (rhsTemp == nullptr
+                        && (rhsNV.TypeAndValue.Pointer || rhsNV.TypeAndValue.TypeName != tn
+                            || rhsNV.Storage == nullptr))
                     {
                         LogErrorContext(ctx, std::format(
-                            "C++ class '{}' assignment operator is {}-qualified and cannot be "
-                            "called on an lvalue receiver", tn, qualifier));
-                        return nullptr;
+                            "cannot assign to C++ class '{}' from this expression; the source must be "
+                            "a '{}' variable, optionally written 'move <variable>'", tn, tn));
                     }
-                    LogErrorContext(ctx, std::format(
-                        "C++ class '{}' has no assignment operator cflat can call (it is implicit, "
-                        "deleted, inaccessible, or defined inline in the header) - assign through a "
-                        "pointer, or re-declare the destination instead", tn));
+                    else if (rhsTemp == nullptr && (rhsNV.IsMoved || rhsNV.ExplicitlyMovedNull))
+                    {
+                        LogErrorContext(ctx, std::format(
+                            "use of moved variable '{}'", rhsNV.CallerName));
+                    }
+
+                    const bool sourceIsTemporary = rhsTemp != nullptr;
+                    const auto* op = [&]() -> const LLVMBackend::CxxClassInfo::Structor* {
+                        if (info == nullptr) return nullptr;
+                        const LLVMBackend::CxxClassInfo::Structor* result = nullptr;
+                        if ((useMove || sourceIsTemporary) && info->hasMoveAssign)
+                            result = lvalueReceiverAssignment(
+                                info->moveAssignOverloads, info->moveAssign);
+                        if (result == nullptr && info->hasCopyAssign)
+                            result = lvalueReceiverAssignment(
+                                info->copyAssignOverloads, info->copyAssign);
+                        if (result == nullptr && !useMove && !sourceIsTemporary
+                            && info->hasMoveAssign)
+                            result = lvalueReceiverAssignment(
+                                info->moveAssignOverloads, info->moveAssign);
+                        return result;
+                    }();
+
+                    auto emitConstruct = [&]() {
+                        llvm::Value* source = rhsTemp != nullptr ? rhsTemp : sourceStorage;
+                        if (source == nullptr)
+                            LogErrorContext(ctx, std::format(
+                                "cannot construct C++ class '{}' from this expression", tn));
+                        compiler->EmitCxxCopyOrMoveConstruct(
+                            tn, destination, source, useMove || sourceIsTemporary,
+                            "into an assigned destination");
+                    };
+                    auto emitAssign = [&]() {
+                        if (op == nullptr)
+                            LogErrorContext(ctx, std::format(
+                                "C++ class '{}' has no assignment operator cflat can call (it is implicit, "
+                                "deleted, inaccessible, or defined inline in the header) - assign through a "
+                                "pointer, or re-declare the destination instead", tn));
+                        llvm::Value* source = rhsTemp != nullptr ? rhsTemp : sourceStorage;
+                        if (source == nullptr)
+                            LogErrorContext(ctx, std::format(
+                                "cannot assign to C++ class '{}' from this expression", tn));
+                        compiler->EmitCxxStructorCall(tn, *op, destination, { source });
+                    };
+
+                    if (destinationGlobalConditional)
+                    {
+                        auto* liveBlock = compiler->CreateBasicBlock("cxx.assign.global.live");
+                        auto* constructBlock = compiler->CreateBasicBlock("cxx.assign.global.construct");
+                        auto* doneBlock = compiler->CreateBasicBlock("cxx.assign.global.done");
+                        auto* live = compiler->builder->CreateLoad(
+                            compiler->builder->getInt1Ty(), destinationGlobalLiveFlag,
+                            "cxx.assign.global.livef");
+                        compiler->CreateConditionJump(live, liveBlock, constructBlock);
+                        compiler->SwitchToBlock(liveBlock);
+                        emitAssign();
+                        compiler->CreateJump(doneBlock);
+                        compiler->SwitchToBlock(constructBlock);
+                        emitConstruct();
+                        compiler->CreateJump(doneBlock);
+                        compiler->SwitchToBlock(doneBlock);
+                    }
+                    else if (destinationConditional)
+                    {
+                        auto* liveBlock = compiler->CreateBasicBlock("cxx.assign.live");
+                        auto* constructBlock = compiler->CreateBasicBlock("cxx.assign.construct");
+                        auto* doneBlock = compiler->CreateBasicBlock("cxx.assign.done");
+                        auto* live = compiler->builder->CreateLoad(
+                            compiler->builder->getInt1Ty(), namedVar.ConditionalDropFlag,
+                            "cxx.assign.livef");
+                        compiler->CreateConditionJump(live, liveBlock, constructBlock);
+                        compiler->SwitchToBlock(liveBlock);
+                        emitAssign();
+                        compiler->CreateJump(doneBlock);
+                        compiler->SwitchToBlock(constructBlock);
+                        emitConstruct();
+                        compiler->CreateJump(doneBlock);
+                        compiler->SwitchToBlock(doneBlock);
+                    }
+                    else if (destinationReleased)
+                        emitConstruct();
+                    else
+                        emitAssign();
+
+                    if (destinationGlobalConditional)
+                        compiler->builder->CreateStore(compiler->builder->getInt1(true),
+                                                       destinationGlobalLiveFlag);
+
+                    if (useMove) compiler->MarkVariableMoved(srcName);
+                    if (rhsTemp != nullptr)
+                        compiler->FlushOwnedTempsSince(ownedTempMark, nullptr, nullptr);
+                    if (namedVar.FieldName.empty() && !namedVar.CallerName.empty())
+                    {
+                        compiler->MarkVariableUnmoved(namedVar.CallerName);
+                        compiler->MarkVariableNotExplicitlyMovedNull(namedVar.CallerName);
+                    }
                     return nullptr;
                 }
-                compiler->EmitCxxStructorCall(tn, *op, destination, { srcNV->Storage });
-                if (useMove) compiler->MarkVariableMoved(srcName);
-                return nullptr;
             }
 
             // A range-for variable is a borrow of the current element, not an owning local. For
@@ -3472,6 +3575,16 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                 && compiler->IsCoreUniqueType(namedVar.TypeAndValue.TypeName)
                 && !namedVar.TypeAndValue.Pointer)
                 destIsUniqueFieldSlot = true;
+            auto emitOwningDestinationDrop = [&]() {
+                // Only a struct with a C++ field gets a drop flag, so only there is the static
+                // released fact exact. A native released slot is a null shell: dropping it is safe.
+                if (namedVar.ExplicitlyMovedNull && namedVar.ConditionalDropFlag == nullptr
+                    && compiler->HasForeignNontrivialCxxField(namedVar.TypeAndValue.TypeName))
+                    return;
+                if (auto* dtor = compiler->GetOrCreateFullDestructor(
+                        namedVar.TypeAndValue.TypeName))
+                    compiler->EmitConditionalFullDestructor(namedVar, dtor);
+            };
 
             // A field of an alias-borrow local can arrive through the generic owning-local
             // reassignment path rather than the specialized field-read arm. Ask the shared source
@@ -3946,8 +4059,8 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                 && compiler->IsOwningValueType(rightNV.TypeAndValue.TypeName))
             {
                 if (!destIsAliasBorrowLocal)
-                    if (auto* dtor = compiler->GetOrCreateFullDestructor(namedVar.TypeAndValue.TypeName))
-                        compiler->builder->CreateCall(dtor->getFunctionType(), dtor, { destination });
+                    if (compiler->GetOrCreateFullDestructor(namedVar.TypeAndValue.TypeName) != nullptr)
+                        compiler->DropValue(namedVar);
                 compiler->builder->CreateStore(right, destination);
                 RetireAliasBorrowOnRebind(compiler, destination);
                 auto* srcGep = compiler->builder->CreateStructGEP(
@@ -4143,8 +4256,7 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                         compiler, rightNV, rightNV.TypeAndValue.IsMove, ctx))
                     return finishStore(right);
                 if (!destIsAliasBorrowLocal)
-                    if (auto* dtor = compiler->GetOrCreateFullDestructor(namedVar.TypeAndValue.TypeName))
-                        compiler->builder->CreateCall(dtor->getFunctionType(), dtor, { destination });
+                    emitOwningDestinationDrop();
                 compiler->builder->CreateStore(toStore, destination);
                 RetireAliasBorrowOnRebind(compiler, destination);
                 if (kind == AssignSourceKind::Move)
@@ -4154,11 +4266,18 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                     // Only a named slot has a spelling to report a later use of; an indirect lvalue
                     // (field/element/deref) is consumed silently, exactly as `move w.b` already is.
                     if (srcIsNamedSlot)
+                    {
                         compiler->MarkVariableMoved(rightNV.CallerName);
+                        if (compiler->HasForeignNontrivialCxxField(rightNV.TypeAndValue.TypeName))
+                            compiler->MarkVariableExplicitlyMovedNull(rightNV.CallerName);
+                    }
                 }
                 // The destination is now live again (it may have been moved-from earlier).
                 if (!namedVar.CallerName.empty() && namedVar.FieldName.empty())
+                {
                     compiler->MarkVariableUnmoved(namedVar.CallerName);
+                    compiler->MarkVariableNotExplicitlyMovedNull(namedVar.CallerName);
+                }
                 return finishStore(toStore);
             }
 
@@ -4424,8 +4543,7 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                 // NOTE: closes the reassignment LEAK but does NOT fix aliasing of an owning-value RHS -
                 // ownership is a runtime property (_len owned bit), so auto copy/move is unsafe for string.
                 if (!destIsAliasBorrowLocal && !coreUniqueInterfaceResetValue)
-                    if (auto* dtor = compiler->GetOrCreateFullDestructor(namedVar.TypeAndValue.TypeName))
-                        compiler->builder->CreateCall(dtor->getFunctionType(), dtor, { destination });
+                    emitOwningDestinationDrop();
                 RetireAliasBorrowOnRebind(compiler, destination);
             }
 
@@ -15143,6 +15261,9 @@ void MainListener::AdoptWrapperProvenance(LLVMBackend::NamedVariable& dst,
         dst.MovedIntoInterface = src.MovedIntoInterface;
         dst.ExplicitlyMovedNull = src.ExplicitlyMovedNull;
         dst.ExplicitNullBlock   = src.ExplicitNullBlock;
+        dst.ConditionalDropFlag = src.ConditionalDropFlag;
+        dst.DeclarationScopeDepth = src.DeclarationScopeDepth;
+        dst.DeclarationBlock = src.DeclarationBlock;
         // The element / view / owning-local borrow proofs the delete guards consult.
         dst.BorrowsOwnedElement            = src.BorrowsOwnedElement;
         dst.BorrowedElementExternallyOwned = src.BorrowedElementExternallyOwned;

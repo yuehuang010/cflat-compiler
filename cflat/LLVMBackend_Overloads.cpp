@@ -4450,6 +4450,9 @@ void LLVMBackend::MarkVariableExplicitlyMovedNull(const std::string& name)
                 if (it->second.AddressEscaped) return;
                 it->second.ExplicitlyMovedNull = true;
                 it->second.ExplicitNullBlock = bb;
+                EnsureConditionalDropFlag(it->second);
+                if (it->second.ConditionalDropFlag != nullptr)
+                    builder->CreateStore(builder->getInt1(false), it->second.ConditionalDropFlag);
                 RecordNullSet(name);
                 return;
             }
@@ -4458,6 +4461,9 @@ void LLVMBackend::MarkVariableExplicitlyMovedNull(const std::string& name)
                 if (it->second.AddressEscaped) return;
                 it->second.ExplicitlyMovedNull = true;
                 it->second.ExplicitNullBlock = bb;
+                EnsureConditionalDropFlag(it->second);
+                if (it->second.ConditionalDropFlag != nullptr)
+                    builder->CreateStore(builder->getInt1(false), it->second.ConditionalDropFlag);
                 RecordNullSet(name);
                 return;
             }
@@ -4471,9 +4477,19 @@ void LLVMBackend::MarkVariableNotExplicitlyMovedNull(const std::string& name)
         for (auto& frame : std::ranges::reverse_view(stackNamedVariable))
         {
             if (auto it = frame.namedVariable.find(name); it != frame.namedVariable.end())
-                { it->second.ExplicitlyMovedNull = false; it->second.ExplicitNullBlock = nullptr; return; }
+                {
+                    it->second.ExplicitlyMovedNull = false;
+                    it->second.ExplicitNullBlock = nullptr;
+                    RearmConditionalDropFlag(it->second);
+                    return;
+                }
             if (auto it = frame.functionArgument.find(name); it != frame.functionArgument.end())
-                { it->second.ExplicitlyMovedNull = false; it->second.ExplicitNullBlock = nullptr; return; }
+                {
+                    it->second.ExplicitlyMovedNull = false;
+                    it->second.ExplicitNullBlock = nullptr;
+                    RearmConditionalDropFlag(it->second);
+                    return;
+                }
         }
     }
 

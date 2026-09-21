@@ -4701,6 +4701,7 @@ void LLVMBackend::ResetForReanalysis()
     typeAnnotations_.clear();
     globalNamedVariable.clear();
     globalVariableTypes.clear();
+    globalCxxLiveFlags_.clear();
     globalDeclSite.clear();
     namespaceTable.clear();
     stringPool.clear();

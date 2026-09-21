@@ -363,6 +363,8 @@ LLVMBackend::NamedVariable& LLVMBackend::GetOrCreateStackVariable(const std::str
 void LLVMBackend::RegisterFunctionArgument(const std::string& name, NamedVariable namedVar)
 {
         namedVar.DeclSequence = nextDeclSequence++;
+        namedVar.DeclarationScopeDepth = stackNamedVariable.size();
+        namedVar.DeclarationBlock = builder != nullptr ? builder->GetInsertBlock() : nullptr;
         stackNamedVariable.back().functionArgument[name] = std::move(namedVar);
 }
 
@@ -372,6 +374,11 @@ void LLVMBackend::SetStackVariable(const std::string& name, NamedVariable namedV
         const uint64_t sequence = slot.DeclSequence;
         slot = std::move(namedVar);
         slot.DeclSequence = sequence;
+        if (slot.DeclarationBlock == nullptr)
+        {
+            slot.DeclarationScopeDepth = stackNamedVariable.size();
+            slot.DeclarationBlock = builder != nullptr ? builder->GetInsertBlock() : nullptr;
+        }
     }
 
 llvm::Value* LLVMBackend::CreateLocalVariable(const TypeAndValue& typeValue, llvm::Type* autoType, llvm::Value* arraySize, size_t line, uint64_t userAlign)
@@ -464,6 +471,8 @@ llvm::Value* LLVMBackend::CreateLocalVariable(const TypeAndValue& typeValue, llv
         namedVariable.Storage = alloc;
         namedVariable.TypeAndValue = typeValue;
         namedVariable.BaseType = type;
+        namedVariable.DeclarationScopeDepth = stackNamedVariable.size();
+        namedVariable.DeclarationBlock = builder->GetInsertBlock();
         if (typeValue.Pointer && typeValue.ConstArraySize == 0
             && !typeValue.IsFunctionPointer && !typeValue.IsInterface
             && !typeValue.IsInterfacePointer)

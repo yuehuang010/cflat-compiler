@@ -1411,6 +1411,11 @@ public:
         llvm::Function* OwnedStringBorrowFunction = nullptr;
         bool IsOwningStruct = false;     // true for move parameters of struct types with destructors - destructor called on scope exit
         bool IsMoved = false;            // compile-time: true after this variable's ownership was transferred via a move call
+        // Runtime liveness for a foreign C++ value whose explicit release is conditional. The
+        // static ExplicitlyMovedNull fact remains for same-block diagnostics and fast paths.
+        llvm::Value* ConditionalDropFlag = nullptr;
+        size_t DeclarationScopeDepth = 0;
+        llvm::BasicBlock* DeclarationBlock = nullptr;
         // compile-time: the DECLARED element type name of this call argument, kept even where the
         // call site drops TypeName for a primitive so overload matching stays LLVM-type based.
         // Generic type-argument inference reads it; not part of the --init cache round-trip.
@@ -2935,6 +2940,9 @@ private:
     nulldf::NoReturnSet provenNoReturn_;
     std::unordered_map<std::string, llvm::GlobalVariable*> globalNamedVariable;
     std::unordered_map<std::string, TypeAndValue> globalVariableTypes;
+    // Module-level liveness for C++ globals explicitly released by a move. Keyed by the LLVM
+    // global symbol so imported declarations share the same flag.
+    std::unordered_map<std::string, llvm::GlobalVariable*> globalCxxLiveFlags_;
     // Declaration LINE of each global, for same-scope redeclaration detection. A true in-source
     // duplicate is the same name at DIFFERENT lines (`int g=1; int g=2;`). The same name at the
     // SAME line is benign re-registration of one declaration: a core file analyzed as a root (via a
@@ -4804,6 +4812,11 @@ private:
     // primitives, and moved/aliased locals are no-ops. Shared by EmitDestructorsForScope and the
     // `drop` statement so a value is released identically at scope exit and on explicit drop.
     void DropValue(const NamedVariable& namedVar);
+
+    bool NeedsConditionalDropFlag(const NamedVariable& namedVar) const;
+    void EnsureConditionalDropFlag(NamedVariable& namedVar);
+    void RearmConditionalDropFlag(NamedVariable& namedVar);
+    void EmitConditionalFullDestructor(const NamedVariable& namedVar, llvm::Function* dtor);
 
     // True when DropValue would release a real resource for this local (owning ptr/interface/
     // array/struct/string). Borrows, primitives, aliased/return-moved locals own nothing, so an
@@ -9115,6 +9128,10 @@ public:
     llvm::GlobalVariable* GetGlobalVariable(const std::string& name);
 
     NamedVariable GetGlobalVariableNV(const std::string& name);
+
+    // Lazily create the live flag for a directly-bound nontrivial C++ class global. The flag is
+    // absent for globals that are never explicitly released, preserving their original IR.
+    llvm::GlobalVariable* EnsureGlobalCxxLiveFlag(const NamedVariable& namedVar);
 
     llvm::Constant* GetPlatformConstant();
 

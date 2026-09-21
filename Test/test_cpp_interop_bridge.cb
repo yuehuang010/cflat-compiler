@@ -1168,6 +1168,10 @@ struct CopyCtorBox
 
 std.shared_ptr<SharedLeaf> copyctorGlobal = default;
 
+cpptw.Twin bridge_global_twin_direct = default;
+cpptw.Twin bridge_global_twin_helper = default;
+cpptw.Twin bridge_global_twin_conditional = default;
+
 struct SharedSelf : cppt.ModuleBase
 {
     std.shared_ptr<SharedSelf> self = default;
@@ -1536,6 +1540,179 @@ int bridge_tracked_range_balanced()
     if (cpptw.tracked_range_bad_dtor_count() != 0) return 0;
     if (cpptw.tracked_range_live_count() != 0) return 0;
     return 1;
+}
+
+struct BridgeConditionalBox
+{
+    int tag = 0;
+    cpptw.Twin value = default;
+};
+
+struct BridgeConditionalOuter
+{
+    BridgeConditionalBox box = default;
+};
+
+int bridge_conditional_value = 1;
+
+void bridge_conditional_twin_release(bool condition)
+{
+    cpptw.Twin value = cpptw.Twin(1);
+    if (condition) { _ = move value; }
+}
+
+int bridge_global_twin_direct_reinit()
+{
+    _ = move bridge_global_twin_direct;
+    {
+        cpptw.Twin n = cpptw.Twin(2);
+        bridge_global_twin_direct = n;
+    }
+    return bridge_global_twin_direct.value();
+}
+
+void bridge_release_global_twin_helper()
+{
+    _ = move bridge_global_twin_helper;
+}
+
+int bridge_global_twin_helper_reinit()
+{
+    bridge_release_global_twin_helper();
+    {
+        cpptw.Twin n = cpptw.Twin(3);
+        bridge_global_twin_helper = n;
+    }
+    return bridge_global_twin_helper.value();
+}
+
+int bridge_global_twin_conditional_reinit(bool condition)
+{
+    if (condition) { _ = move bridge_global_twin_conditional; }
+    {
+        cpptw.Twin n = cpptw.Twin(4);
+        bridge_global_twin_conditional = n;
+    }
+    return bridge_global_twin_conditional.value();
+}
+
+void bridge_conditional_box_move(bool condition)
+{
+    BridgeConditionalBox value = default;
+    if (condition)
+    {
+        BridgeConditionalBox moved = move value;
+        moved.tag = 1;
+    }
+}
+
+// Explicit discard of a struct whose C++ field owns a resource: destroyed once on either path.
+void bridge_conditional_box_release(bool condition)
+{
+    BridgeConditionalBox box = default;
+    if (condition)
+        _ = move box;
+}
+
+void bridge_conditional_outer_move(bool condition)
+{
+    BridgeConditionalOuter value = default;
+    if (condition)
+    {
+        BridgeConditionalOuter moved = move value;
+        moved.box.tag = 1;
+    }
+}
+
+void bridge_reinit_twin(bool condition)
+{
+    cpptw.Twin a = cpptw.Twin(1);
+    if (condition) { _ = move a; }
+    cpptw.Twin n = cpptw.Twin(2);
+    a = n;
+}
+
+void bridge_reinit_box(bool condition)
+{
+    BridgeConditionalBox a = default;
+    if (condition)
+    {
+        BridgeConditionalBox moved = move a;
+        moved.tag = 1;
+    }
+    BridgeConditionalBox fresh = default;
+    a = move fresh;
+}
+
+int bridge_reinit_twin_prvalue()
+{
+    cpptw.Twin a = cpptw.Twin(1);
+    a = cpptw.Twin(2);
+    return a.value();
+}
+
+int bridge_reinit_shared_ptr(bool condition)
+{
+    std.shared_ptr<int> a = std.make_shared<int>(1);
+    if (condition) { _ = move a; }
+    std.shared_ptr<int> n = std.make_shared<int>(2);
+    a = n;
+    return (int)a.use_count() * 10 + (int)n.use_count();
+}
+
+void bridge_conditional_loop(bool condition)
+{
+    for (int i = 0; i < 2; i++)
+    {
+        cpptw.Twin value = cpptw.Twin(i + 1);
+        if (condition && i == 1) { _ = move value; }
+    }
+}
+
+void bridge_conditional_loop_break(bool condition)
+{
+    for (int i = 0; i < 2; i++)
+    {
+        cpptw.Twin value = cpptw.Twin(i + 1);
+        if (condition && i == 1) { _ = move value; }
+        if (i == 0) break;
+    }
+}
+
+void bridge_conditional_switch(bool condition)
+{
+    cpptw.Twin value = cpptw.Twin(1);
+    switch (condition ? 1 : 0)
+    {
+        case 1: _ = move value; break;
+        default: break;
+    }
+}
+
+void bridge_conditional_both_arms(bool condition)
+{
+    cpptw.Twin value = cpptw.Twin(1);
+    if (condition) { _ = move value; }
+    else { _ = move value; }
+}
+
+int bridge_conditional_return_before_move(bool condition)
+{
+    cpptw.Twin value = cpptw.Twin(1);
+    if (condition) return 9;
+    _ = move value;
+    return 0;
+}
+
+int bridge_conditional_move_then_return(bool condition)
+{
+    cpptw.Twin value = cpptw.Twin(1);
+    if (condition)
+    {
+        _ = move value;
+        return 9;
+    }
+    return 0;
 }
 
 extern int main(int argc, char** argv)
@@ -3284,6 +3461,33 @@ extern int main(int argc, char** argv)
     bridge_check("bridge nullable C++ move", cpptw.move_count(), 0);
     bridge_check("bridge nullable C++ dtor", cpptw.dtor_count(), 1);
     bridge_check("bridge nullable C++ live", cpptw.live_allocations(), 0);
+
+    cpptw.reset_counts();
+    bridge_check("global Twin direct reinit value", bridge_global_twin_direct_reinit(), 2);
+    bridge_check("global Twin direct reinit copy", cpptw.copy_count(), 1);
+    bridge_check("global Twin direct reinit dtor", cpptw.dtor_count(), 2);
+    bridge_check("global Twin direct reinit live", cpptw.live_allocations(), 0);
+
+    cpptw.reset_counts();
+    bridge_check("global Twin helper reinit value", bridge_global_twin_helper_reinit(), 3);
+    bridge_check("global Twin helper reinit copy", cpptw.copy_count(), 1);
+    bridge_check("global Twin helper reinit dtor", cpptw.dtor_count(), 2);
+    bridge_check("global Twin helper reinit live", cpptw.live_allocations(), 0);
+
+    // The helper global is live again here: releasing it twice must destroy it once.
+    cpptw.reset_counts();
+    bridge_release_global_twin_helper();
+    bridge_release_global_twin_helper();
+    bridge_check("global Twin double release dtor", cpptw.dtor_count(), 1);
+
+    bridge_conditional_value = 1;
+    cpptw.reset_counts();
+    bridge_check("global Twin conditional reinit value",
+        bridge_global_twin_conditional_reinit(bridge_conditional_value != 0), 4);
+    bridge_check("global Twin conditional reinit copy", cpptw.copy_count(), 1);
+    bridge_check("global Twin conditional reinit dtor", cpptw.dtor_count(), 2);
+    bridge_check("global Twin conditional reinit live", cpptw.live_allocations(), 0);
+
     if (bridge_passed != bridge_checks) return 2000;
 
     return 0;

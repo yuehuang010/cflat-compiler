@@ -3899,6 +3899,98 @@ void LLVMBackend::FlushOwnedTemps()
         tempFieldValues_.clear();
     }
 
+bool LLVMBackend::NeedsConditionalDropFlag(const NamedVariable& namedVar) const
+{
+        if (namedVar.ConditionalDropFlag != nullptr || namedVar.Storage == nullptr || builder == nullptr)
+            return namedVar.ConditionalDropFlag != nullptr;
+        const std::string& typeName = namedVar.TypeAndValue.TypeName;
+        if (!(IsForeignNontrivialCxxClass(typeName) || HasForeignNontrivialCxxField(typeName)))
+            return false;
+        auto* moveBlock = builder->GetInsertBlock();
+        if (moveBlock == nullptr) return false;
+        if (namedVar.DeclarationScopeDepth < stackNamedVariable.size()) return true;
+        if (namedVar.DeclarationBlock == nullptr || moveBlock == namedVar.DeclarationBlock)
+            return false;
+
+        // A direct successor of a conditional/switch terminator is a branch arm. A join block
+        // has multiple predecessors, so a move after the branch remains straight-line cleanup.
+        if (llvm::pred_size(moveBlock) != 1) return false;
+        auto* predecessor = *llvm::pred_begin(moveBlock);
+        auto* terminator = predecessor->getTerminator();
+        return terminator != nullptr && terminator->getNumSuccessors() > 1;
+    }
+
+llvm::GlobalVariable* LLVMBackend::EnsureGlobalCxxLiveFlag(const NamedVariable& namedVar)
+{
+        auto* global = llvm::dyn_cast_or_null<llvm::GlobalVariable>(namedVar.Storage);
+        if (global == nullptr || !IsForeignNontrivialCxxClass(namedVar.TypeAndValue.TypeName))
+            return nullptr;
+        const std::string key = global->getName().str();
+        if (auto it = globalCxxLiveFlags_.find(key); it != globalCxxLiveFlags_.end())
+            return it->second;
+
+        const std::string flagName = "__cflat_cxx_live." + key;
+        auto* flag = module->getGlobalVariable(flagName, true);
+        if (flag == nullptr)
+        {
+            flag = new llvm::GlobalVariable(
+                *module, builder->getInt1Ty(), false, global->getLinkage(),
+                llvm::ConstantInt::getTrue(*context), flagName);
+        }
+        globalCxxLiveFlags_[key] = flag;
+        return flag;
+    }
+
+void LLVMBackend::EnsureConditionalDropFlag(NamedVariable& namedVar)
+{
+        if (namedVar.ConditionalDropFlag != nullptr || !NeedsConditionalDropFlag(namedVar)) return;
+        auto* savedBlock = builder->GetInsertBlock();
+        auto savedPoint = builder->GetInsertPoint();
+        namedVar.ConditionalDropFlag = AllocaAtEntry(
+            builder->getInt1Ty(), nullptr, namedVar.TypeAndValue.VariableName + ".dropflag");
+
+        auto* declarationBlock = namedVar.DeclarationBlock;
+        if (declarationBlock != nullptr && declarationBlock != savedBlock
+            && declarationBlock->getTerminator() != nullptr)
+        {
+            builder->SetInsertPoint(declarationBlock, declarationBlock->getTerminator()->getIterator());
+        }
+        else if (declarationBlock != nullptr && declarationBlock != savedBlock)
+        {
+            builder->SetInsertPoint(declarationBlock);
+        }
+        // A nested compound can share its LLVM block with the declaration. In that case the
+        // first move is the first point at which the lazily-created flag can be initialized.
+        builder->CreateStore(builder->getInt1(true), namedVar.ConditionalDropFlag);
+        if (savedBlock != nullptr) builder->SetInsertPoint(savedBlock, savedPoint);
+    }
+
+void LLVMBackend::RearmConditionalDropFlag(NamedVariable& namedVar)
+{
+        if (namedVar.ConditionalDropFlag == nullptr || builder == nullptr) return;
+        builder->CreateStore(builder->getInt1(true), namedVar.ConditionalDropFlag);
+    }
+
+void LLVMBackend::EmitConditionalFullDestructor(const NamedVariable& namedVar, llvm::Function* dtor)
+{
+        if (dtor == nullptr) return;
+        if (namedVar.ConditionalDropFlag == nullptr)
+        {
+            EmitFullDestructorOverStorage(*builder, namedVar.Storage, namedVar.BaseType, dtor);
+            return;
+        }
+        auto* function = builder->GetInsertBlock()->getParent();
+        auto* liveBlock = llvm::BasicBlock::Create(*context, "cxx.drop.live", function);
+        auto* afterBlock = llvm::BasicBlock::Create(*context, "cxx.drop.after", function);
+        auto* live = builder->CreateLoad(builder->getInt1Ty(), namedVar.ConditionalDropFlag,
+                                         "cxx.drop.livef");
+        builder->CreateCondBr(live, liveBlock, afterBlock);
+        builder->SetInsertPoint(liveBlock);
+        EmitFullDestructorOverStorage(*builder, namedVar.Storage, namedVar.BaseType, dtor);
+        builder->CreateBr(afterBlock);
+        builder->SetInsertPoint(afterBlock);
+    }
+
 void LLVMBackend::DropValue(const NamedVariable& namedVar)
 {
         // A `static` local's storage outlives the scope (and every later call), so scope exit must
@@ -3963,12 +4055,13 @@ void LLVMBackend::DropValue(const NamedVariable& namedVar)
             // per the M4b ruling the moved-from object is still destroyed at scope exit.
             if (namedVar.ExplicitlyMovedNull
                 && (IsForeignNontrivialCxxClass(namedVar.TypeAndValue.TypeName)
-                    || HasForeignNontrivialCxxField(namedVar.TypeAndValue.TypeName))) return;
+                    || HasForeignNontrivialCxxField(namedVar.TypeAndValue.TypeName))
+                && namedVar.ConditionalDropFlag == nullptr) return;
             // Skip the struct value being moved out via `return` - the caller now owns it.
             if (namedVar.Storage == returnedStructDtorSkipAlloca) return;
             // A fixed-array local (`T[N] a;`) owns every element - destruct all N.
             if (auto* fn = GetOrCreateFullDestructor(namedVar.TypeAndValue.TypeName))
-                EmitFullDestructorOverStorage(*builder, namedVar.Storage, namedVar.BaseType, fn);
+                EmitConditionalFullDestructor(namedVar, fn);
         }
     }
 
@@ -3989,7 +4082,8 @@ bool LLVMBackend::OwnsDroppableResource(const NamedVariable& namedVar) const
         if (namedVar.Storage == returnedStructDtorSkipAlloca) return false;
         if (namedVar.ExplicitlyMovedNull
             && (IsForeignNontrivialCxxClass(namedVar.TypeAndValue.TypeName)
-                || HasForeignNontrivialCxxField(namedVar.TypeAndValue.TypeName))) return false;
+                || HasForeignNontrivialCxxField(namedVar.TypeAndValue.TypeName))
+            && namedVar.ConditionalDropFlag == nullptr) return false;
         return true;
     }
 

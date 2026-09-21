@@ -4390,7 +4390,8 @@ void MainListener::ReleaseOwningLocalNow(antlr4::ParserRuleContext* ctx, LLVMBac
         nv->RefCountStorage = nullptr;
         compiler->MarkVariableMoved(name);
         if (compiler->IsCoreUniqueType(nv->TypeAndValue.TypeName)
-            || compiler->IsForeignNontrivialCxxClass(nv->TypeAndValue.TypeName))
+            || compiler->IsForeignNontrivialCxxClass(nv->TypeAndValue.TypeName)
+            || compiler->HasForeignNontrivialCxxField(nv->TypeAndValue.TypeName))
             compiler->MarkVariableExplicitlyMovedNull(name);
     }
 
@@ -4402,9 +4403,27 @@ void MainListener::ReleaseOwningGlobalNow(antlr4::ParserRuleContext* ctx, const 
             return;
         if (!compiler->OwnsDroppableResource(nv))
             return;
+        auto* liveFlag = compiler->EnsureGlobalCxxLiveFlag(nv);
+        // A second release (another function, a loop) must not destroy the object again.
+        llvm::BasicBlock* releasedBB = nullptr;
+        if (liveFlag != nullptr)
+        {
+            auto* fn = compiler->builder->GetInsertBlock()->getParent();
+            auto* dropBB = llvm::BasicBlock::Create(*compiler->context, "global.release.live", fn);
+            releasedBB = llvm::BasicBlock::Create(*compiler->context, "global.release.done", fn);
+            auto* live = compiler->builder->CreateLoad(compiler->builder->getInt1Ty(), liveFlag);
+            compiler->builder->CreateCondBr(live, dropBB, releasedBB);
+            compiler->builder->SetInsertPoint(dropBB);
+        }
         compiler->DropValue(nv);
         if (nv.BaseType != nullptr)
             compiler->builder->CreateStore(llvm::Constant::getNullValue(nv.BaseType), nv.Storage);
+        if (liveFlag != nullptr)
+        {
+            compiler->builder->CreateStore(compiler->builder->getInt1(false), liveFlag);
+            compiler->builder->CreateBr(releasedBB);
+            compiler->builder->SetInsertPoint(releasedBB);
+        }
     }
 
 void MainListener::ApplyMovedSlotOwnership(LLVMBackend::NamedVariable& nv,
