@@ -1,0 +1,11 @@
+import cpp "vector";
+import cpp "memory";
+
+extern int main()
+{
+    expect_error("cannot bind C++ move-only element") {
+        std.vector<std.unique_ptr<int>> values = default;
+        for (std.unique_ptr<int> value in values) { }
+    }
+    return 0;
+}

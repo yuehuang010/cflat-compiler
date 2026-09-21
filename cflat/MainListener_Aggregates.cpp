@@ -87,6 +87,101 @@ void MainListener::PrepareLaterCppStructDefinitions(
     }
 }
 
+llvm::Value* MainListener::EmitAggregateFieldInitialization(
+    const std::string& structName,
+    llvm::StructType*& structType,
+    std::vector<LLVMBackend::DeclTypeAndValue>& fields)
+{
+    auto* compiler = Compiler();
+    std::vector<llvm::Value*> initializers;
+    std::vector<char> initializerUnsigned;
+    for (auto& field : fields)
+    {
+        llvm::Value* rvalue = nullptr;
+        bool fieldSrcUnsigned = false;
+        if (auto* braceList = FieldDefaultBraceList(field))
+        {
+            GlobalScopeGuard fieldInitScope(global_scope);
+            rvalue = ParseFieldDefaultBraceInitializer(structName, field, braceList);
+        }
+        else if (field.Initializer != nullptr)
+        {
+            auto* assignmentExpression = field.Initializer->assignmentExpression();
+            if (assignmentExpression != nullptr)
+            {
+                rvalue = ParseFieldDefaultInitializer(
+                    structName, field, assignmentExpression, &fieldSrcUnsigned);
+                if (field.TypeName == "auto")
+                {
+                    field.TypeName = rvalue->getType()->getStructName();
+                    structType = compiler->CreateStructType(structName, fields);
+                }
+            }
+            else if (field.Initializer->Default() != nullptr)
+            {
+                GlobalScopeGuard fieldInitScope(global_scope);
+                rvalue = GenerateDefaultValue(field);
+            }
+        }
+        if (rvalue == nullptr)
+        {
+            auto* fieldType = compiler->GetType(field);
+            if (fieldType != nullptr && fieldType->isArrayTy())
+            {
+                GlobalScopeGuard fieldInitScope(global_scope);
+                rvalue = GenerateDefaultValue(field);
+            }
+        }
+        initializers.push_back(rvalue);
+        initializerUnsigned.push_back(fieldSrcUnsigned ? 1 : 0);
+    }
+
+    llvm::Value* structValue = llvm::Constant::getNullValue(structType);
+    for (unsigned index = 0; index < initializers.size(); ++index)
+    {
+        if (index >= structType->getNumElements())
+            break;
+        llvm::Value* rvalue = initializers[index];
+        auto* destType = structType->getTypeAtIndex(index);
+        auto& field = fields[index];
+        if (rvalue == nullptr && (destType->isStructTy() || destType->isArrayTy()))
+        {
+            if (destType->isArrayTy())
+                rvalue = GenerateDefaultValue(field);
+            else if (compiler->GetFunction(field.TypeName))
+                rvalue = compiler->CreateOverloadedFunctionCall(field.TypeName, {}, true);
+            else
+                rvalue = llvm::Constant::getNullValue(destType);
+        }
+        if (rvalue == nullptr)
+            continue;
+
+        rvalue = compiler->Upconvert(rvalue, destType,
+            index < initializerUnsigned.size() && initializerUnsigned[index] != 0);
+        if (rvalue->getType() != destType)
+        {
+            if (destType->isStructTy())
+            {
+                if (compiler->GetFunction(field.TypeName))
+                    rvalue = compiler->CreateOverloadedFunctionCall(field.TypeName, {}, true);
+                else
+                    rvalue = llvm::Constant::getNullValue(destType);
+            }
+            else
+            {
+                if (ShouldWarnImplicitFieldNarrowing(rvalue, destType, field.TypeName))
+                    compiler->LogWarning(std::format(
+                        "implicit narrowing to '{}' in field '{}' - use an explicit cast",
+                        SpellType(*compiler, field), field.VariableName));
+                rvalue = compiler->CreateCast(rvalue, destType);
+            }
+        }
+        if (rvalue->getType() == destType)
+            structValue = compiler->CreateInsertValue(structValue, rvalue, index);
+    }
+    return structValue;
+}
+
 void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* ctx, const std::string& nameOverride, const std::string& namespaceName) {
         ResolvedMembersScope memberScope_(resolvedMembers_, (const void*)ctx);
         auto* compiler = Compiler(ctx);
@@ -1215,7 +1310,7 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
                     bool suppliesNoArgCtor = !isUnion && !hasBareNoArgCtor
                         && AllParametersDefaulted(func->parameterTypeList());
                     ParseConstructorDefinition(func, structName, suppliesNoArgCtor,
-                        isCppStruct ? cppCtorIndex++ : SIZE_MAX);
+                        isCppStruct ? cppCtorIndex++ : SIZE_MAX, hasExplicitNoArgCtor);
                     continue;
                 }
                 // A generic member method - static or instance - is stored as a template keyed by
@@ -4112,7 +4207,8 @@ void MainListener::ParseClassDefinition(CFlatParser::ClassDefinitionContext* ctx
                     // no bare 'T()' was written - it must seed fields itself, not self-delegate.
                     bool suppliesNoArgCtor = !hasBareNoArgCtor
                         && AllParametersDefaulted(func->parameterTypeList());
-                    ParseConstructorDefinition(func, structName, suppliesNoArgCtor);
+                    ParseConstructorDefinition(func, structName, suppliesNoArgCtor, SIZE_MAX,
+                                               hasExplicitNoArgCtor);
                     continue;
                 }
                 // A generic member method - static or instance - is stored as a template keyed by
@@ -4718,7 +4814,11 @@ void MainListener::EmitCppStructMoveThunk(antlr4::ParserRuleContext* ctx,
         compiler->ClearCurrentSubprogram();
 }
 
-void MainListener::ParseConstructorDefinition(CFlatParser::FunctionDefinitionContext* func, const std::string& structName, bool suppliesNoArgCtor, size_t cppCtorIndex) {
+void MainListener::ParseConstructorDefinition(CFlatParser::FunctionDefinitionContext* func,
+                                               const std::string& structName,
+                                               bool suppliesNoArgCtor,
+                                               size_t cppCtorIndex,
+                                               bool hasExplicitNoArgCtor) {
         auto* compiler = Compiler(func);
         if (func->baseSpecifier() != nullptr && !compiler->HasTypeAnnotation(structName, "cpp"))
         {
@@ -4863,9 +4963,17 @@ void MainListener::ParseConstructorDefinition(CFlatParser::FunctionDefinitionCon
                 fieldIdx++;
             }
         }
+        else if (hasExplicitNoArgCtor)
+        {
+            auto fields = compiler->GetDataStructure(structName).StructFields;
+            auto* fieldValue = EmitAggregateFieldInitialization(
+                structName, structLLVMType, fields);
+            if (fieldValue)
+                compiler->builder->CreateStore(fieldValue, thisAlloca);
+        }
         else
         {
-            // Parameterized constructor: delegate to the no-arg ctor for default initialization.
+            // With no user no-arg ctor, the synthesized ctor remains the field-init path.
             auto* defaultVal = compiler->CreateOverloadedFunctionCall(structName, {});
             if (defaultVal)
                 compiler->builder->CreateStore(defaultVal, thisAlloca);

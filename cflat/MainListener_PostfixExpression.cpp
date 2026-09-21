@@ -664,11 +664,28 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
 
             auto ParseCallArgument = [&](auto&& parse) {
                 auto* backend = Compiler(ctx);
+                backend->lastCxxRetTemp_ = nullptr;
+                backend->lastCxxRetValue_ = nullptr;
                 llvm::SaveAndRestore<llvm::Value*> savedCxxSretDest(
                     backend->pendingCxxSretDest_, nullptr);
                 llvm::SaveAndRestore<std::string> savedCxxSretType(
                     backend->pendingCxxSretTypeName_, std::string{});
-                return parse();
+                llvm::SaveAndRestore<bool> savedCxxSretForFixedArray(
+                    backend->pendingCxxSretForFixedArray_, false);
+                auto parsed = parse();
+                llvm::Value* retTemp = backend->lastCxxRetTemp_;
+                llvm::Value* retValue = backend->lastCxxRetValue_;
+                backend->lastCxxRetTemp_ = nullptr;
+                backend->lastCxxRetValue_ = nullptr;
+                // Only the complete argument expression may consume the ambient C++ return
+                // temporary. A nested call or field access must not inherit its move source.
+                if (retTemp != nullptr
+                    && (parsed.Storage == retTemp || parsed.Primary == retValue))
+                {
+                    parsed.Storage = retTemp;
+                    parsed.IsRvalue = true;
+                }
+                return parsed;
             };
 
             int functionArgCounter = 0;
@@ -3514,6 +3531,143 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             }
                         }
 
+                        // Construct into raw storage. This is deliberately a call-site builtin so
+                        // '=' remains assignment to every live object, including container elements.
+                        if (functionName == "construct_at" && structVar.BaseType == nullptr)
+                        {
+                            auto* compiler = Compiler(ctx);
+                            if (compiler->GetFunction(functionName) != nullptr)
+                            {
+                                LogErrorContext(ctx,
+                                    "construct_at is a compiler builtin and cannot be redeclared as a user function");
+                                namedVar = {};
+                                break;
+                            }
+                            auto callArgs = argumentList.empty()
+                                ? std::vector<CFlatParser::ArgumentNamedExpressionContext*>()
+                                : argumentList[0]->argumentNamedExpression();
+                            if (callArgs.size() != 2)
+                            {
+                                LogErrorContext(ctx, "construct_at requires exactly two arguments: a T* slot and a value");
+                                namedVar = {};
+                                break;
+                            }
+
+                            auto slotNV = ParseAssignmentExpressionNamed(
+                                callArgs[0]->assignmentExpression());
+                            auto slotValue = slotNV.Primary ? slotNV.Primary : LoadNamedVariable(slotNV);
+                            const int slotPointerDepth = slotNV.TypeAndValue.ValuePointerDepth();
+                            if (slotValue == nullptr || !slotValue->getType()->isPointerTy()
+                                || slotPointerDepth < 1 || slotNV.TypeAndValue.ConstArraySize > 0
+                                || slotNV.TypeAndValue.TypeName.empty())
+                            {
+                                LogErrorContext(ctx, "construct_at first argument must be a pointer to one T slot");
+                                namedVar = {};
+                                break;
+                            }
+
+                            LLVMBackend::TypeAndValue destType = slotNV.TypeAndValue;
+                            // Address-of unwraps a unique holder to _p for normal pointers.
+                            // construct_at needs the parent slot, so recover it and preserve its type.
+                            bool constructTargetIsCoreUnique = false;
+                            if (auto* slotGep = llvm::dyn_cast<llvm::GetElementPtrInst>(slotValue))
+                            {
+                                auto* slotStruct = llvm::dyn_cast<llvm::StructType>(
+                                    slotGep->getSourceElementType());
+                                if (slotStruct != nullptr && slotStruct->hasName()
+                                    && compiler->IsCoreUniqueType(slotStruct->getName().str()))
+                                {
+                                    constructTargetIsCoreUnique = true;
+                                    slotValue = slotGep->getPointerOperand();
+                                    destType.TypeName = slotStruct->getName().str();
+                                    destType.Pointer = false;
+                                    destType.ElemPointer = false;
+                                    destType.IsInterfacePointer = false;
+                                    destType.PointerDepth = 0;
+                                }
+                            }
+                            if (!constructTargetIsCoreUnique)
+                            {
+                                const int elementPointerDepth = slotPointerDepth - 1;
+                                destType.Pointer = elementPointerDepth > 0;
+                                destType.ElemPointer = elementPointerDepth >= 2;
+                                destType.IsInterfacePointer = false;
+                                destType.PointerDepth = elementPointerDepth;
+                            }
+                            destType.VariableName.clear();
+
+                            DeclExpectedTypeScope expected(&declExpectedType, destType);
+                            compiler->lastCxxRetTemp_ = nullptr;
+                            compiler->lastCxxRetValue_ = nullptr;
+                            auto ownedTempMark = compiler->MarkOwnedTemps();
+                            auto sourceNV = ParseAssignmentExpressionNamed(
+                                callArgs[1]->assignmentExpression());
+                            auto sourceValue = sourceNV.Primary
+                                ? sourceNV.Primary : LoadNamedVariable(sourceNV);
+                            sourceNV.IsRvalue = sourceNV.IsRvalue || sourceNV.IsExplicitMove
+                                || sourceNV.TypeAndValue.IsMove;
+                            if (sourceValue == nullptr)
+                            {
+                                LogErrorContext(ctx, "construct_at second argument does not produce a value");
+                                namedVar = {};
+                                break;
+                            }
+
+                            auto reviveDirectSlot = [&]() {
+                                // Only `&local` identifies the binding; pointer variables may point anywhere.
+                                if (slotNV.Primary == nullptr || slotNV.Storage != nullptr
+                                    || slotNV.IsElementAccess || slotNV.CallerName.empty())
+                                    return;
+                                if (slotNV.FieldName.empty())
+                                {
+                                    compiler->MarkVariableUnmoved(slotNV.CallerName);
+                                    compiler->MarkVariableNotExplicitlyMovedNull(slotNV.CallerName);
+                                }
+                                else
+                                    compiler->MarkVariableFieldUnmoved(
+                                        slotNV.CallerName, slotNV.FieldName);
+                            };
+
+                            if (compiler->IsForeignNontrivialCxxClass(destType.TypeName))
+                            {
+                                EmitForeignCxxValueIntoSlot(destType, slotValue, sourceNV, sourceValue,
+                                    ownedTempMark, "into construct_at storage", ctx);
+                                reviveDirectSlot();
+                            }
+                            else if (sourceValue->getType()->isStructTy()
+                                && (compiler->IsOwningValueType(destType.TypeName)
+                                    || NamedVarIsString(sourceNV)))
+                            {
+                                AssignSourceKind kind;
+                                auto toStore = ClassifyOwningAssignSource(
+                                    sourceValue, destType.TypeName, sourceNV.TypeAndValue.IsMove,
+                                    ctx, kind);
+                                compiler->builder->CreateStore(toStore, slotValue);
+                                if (kind == AssignSourceKind::Move && sourceNV.Storage != nullptr)
+                                {
+                                    compiler->builder->CreateStore(
+                                        llvm::ConstantAggregateZero::get(toStore->getType()), sourceNV.Storage);
+                                    if (!sourceNV.CallerName.empty()
+                                        && !sourceNV.IsElementAccess)
+                                        compiler->MarkVariableMoved(sourceNV.CallerName);
+                                }
+                                TransferMoveStringOwnershipOnStore(sourceNV, ctx);
+                                reviveDirectSlot();
+                            }
+                            else
+                            {
+                                compiler->CreateAssignment(
+                                    sourceValue, slotValue,
+                                    sourceNV.TypeAndValue.IsUnsignedInteger() != -1);
+                                TransferPointerOwnershipOnStore(
+                                    sourceNV, slotValue, destType.IsInterface, ctx);
+                                TransferMoveStringOwnershipOnStore(sourceNV, ctx);
+                                reviveDirectSlot();
+                            }
+                            namedVar = {};
+                            break;
+                        }
+
                         // Compile-time intrinsic: annotationof(TypeName, "fieldName", "AnnotationName")
                         // queries a field; annotationof(TypeName, "AnnotationName") queries the type
                         // itself (e.g. a class's [winrt]). Returns the annotation's argument value as
@@ -4880,7 +5034,21 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                         }
                                         CallArgumentScope callArgumentScope(
                                             inCallArgument_, ternaryCallArgumentDepth_);
+                                        auto* backend = Compiler(ctx);
+                                        backend->lastCxxRetTemp_ = nullptr;
+                                        backend->lastCxxRetValue_ = nullptr;
                                         auto argNV = this->ParseAssignmentExpressionNamed(namedArgument->assignmentExpression());
+                                        llvm::Value* retTemp = backend->lastCxxRetTemp_;
+                                        llvm::Value* retValue = backend->lastCxxRetValue_;
+                                        backend->lastCxxRetTemp_ = nullptr;
+                                        backend->lastCxxRetValue_ = nullptr;
+                                        // Consume only this argument's outermost C++ call result.
+                                        if (retTemp != nullptr
+                                            && (argNV.Storage == retTemp || argNV.Primary == retValue))
+                                        {
+                                            argNV.Storage = retTemp;
+                                            argNV.IsRvalue = true;
+                                        }
                                         if (argNV.ContainsBondedClosure)
                                             Compiler(ctx)->LogError(
                                                 "cannot pass a holder containing a bonded closure to a function - the callee could stash it beyond the captured local's lifetime");
@@ -4968,6 +5136,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     && !Compiler(ctx)->lastCallReturnType.IsAlias
                                     && !Compiler(ctx)->lastCallReturnType.Pointer
                                     && Compiler(ctx)->lastCallReturnType.TypeName != "string"
+                                    && !Compiler(ctx)->IsForeignNontrivialCxxReturnClass(
+                                        Compiler(ctx)->lastCallReturnType.TypeName)
                                     && Compiler(ctx)->IsOwningValueType(
                                         Compiler(ctx)->lastCallReturnType.TypeName))
                                 {
@@ -5304,6 +5474,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     // and the borrow-param diagnostic after overload resolution.
                                     argVar.IsExplicitMove = argNV.IsExplicitMove;
                                     argVar.IsRvalue = argNV.IsRvalue;
+                                    argVar.CxxParamLastUse = argNV.CxxParamLastUse;
                                     const std::string argText = namedArgument->assignmentExpression()->getText();
                                     argVar.IsStringLiteral = argNV.IsStringLiteral
                                         || (argText.size() >= 2 && argText.front() == '"'
@@ -6085,6 +6256,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     // and the borrow-param diagnostic after overload resolution.
                                     argVar.IsExplicitMove = argNV.IsExplicitMove;
                                     argVar.IsRvalue = argNV.IsRvalue;
+                                    argVar.CxxParamLastUse = argNV.CxxParamLastUse;
                                     const std::string argText = namedArgument->assignmentExpression()->getText();
                                     argVar.IsStringLiteral = argNV.IsStringLiteral
                                         || (argText.size() >= 2 && argText.front() == '"'
@@ -6483,7 +6655,19 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 }
                                 auto* objectType = compiler->GetType(
                                     LLVMBackend::TypeAndValue{ .TypeName = functionName });
-                                auto* slot = compiler->CreateAlloca(objectType);
+                                const bool directSret = (compiler->pendingCxxSretForFixedArray_
+                                        || compiler->pendingCxxSretReturn_)
+                                    && compiler->pendingCxxSretDest_ != nullptr
+                                    && compiler->pendingCxxSretTypeName_ == functionName;
+                                auto* slot = directSret ? compiler->pendingCxxSretDest_
+                                                         : compiler->CreateAlloca(objectType);
+                                if (directSret)
+                                {
+                                    compiler->pendingCxxSretDest_ = nullptr;
+                                    compiler->pendingCxxSretTypeName_.clear();
+                                    compiler->pendingCxxSretForFixedArray_ = false;
+                                    compiler->pendingCxxSretReturn_ = false;
+                                }
                                 LLVMBackend::NamedVariable self;
                                 self.Primary = slot;
                                 self.BaseType = slot->getType();
@@ -6497,7 +6681,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 compiler->SetCurrentDebugLocation(primaryCtx->getStart()->getLine());
                                 compiler->CreateOverloadedFunctionCall(wrapperName, wrapperArguments);
                                 cxxBraceArguments.clear();
-                                if (compiler->IsForeignNontrivialCxxClass(functionName))
+                                if (!directSret && compiler->IsForeignNontrivialCxxClass(functionName))
                                     compiler->RegisterOwnedStructTemp(slot, functionName);
                                 namedVar = {};
                                 namedVar.Primary = compiler->CreateLoad(slot);
@@ -6564,7 +6748,19 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     {
                                         auto* objectType = compiler->GetType(
                                             LLVMBackend::TypeAndValue{ .TypeName = functionName });
-                                        auto* slot = compiler->CreateAlloca(objectType);
+                                        const bool directSret = (compiler->pendingCxxSretForFixedArray_
+                                                || compiler->pendingCxxSretReturn_)
+                                            && compiler->pendingCxxSretDest_ != nullptr
+                                            && compiler->pendingCxxSretTypeName_ == functionName;
+                                        auto* slot = directSret ? compiler->pendingCxxSretDest_
+                                                                 : compiler->CreateAlloca(objectType);
+                                        if (directSret)
+                                        {
+                                            compiler->pendingCxxSretDest_ = nullptr;
+                                            compiler->pendingCxxSretTypeName_.clear();
+                                            compiler->pendingCxxSretForFixedArray_ = false;
+                                            compiler->pendingCxxSretReturn_ = false;
+                                        }
                                         LLVMBackend::NamedVariable self;
                                         self.Primary = slot;
                                         self.BaseType = slot->getType();
@@ -6579,7 +6775,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                         compiler->SetCurrentDebugLocation(primaryCtx->getStart()->getLine());
                                         compiler->CreateOverloadedFunctionCall(wrapperName,
                                                                                 wrapperArguments);
-                                        if (compiler->IsForeignNontrivialCxxClass(functionName))
+                                        if (!directSret
+                                            && compiler->IsForeignNontrivialCxxClass(functionName))
                                             compiler->RegisterOwnedStructTemp(slot, functionName);
                                         namedVar = {};
                                         namedVar.Primary = compiler->CreateLoad(slot);
@@ -6607,10 +6804,22 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 {
                                     auto* objectType = compiler->GetType(
                                         LLVMBackend::TypeAndValue{ .TypeName = functionName });
-                                    auto* slot = compiler->CreateAlloca(objectType);
+                                    const bool directSret = (compiler->pendingCxxSretForFixedArray_
+                                            || compiler->pendingCxxSretReturn_)
+                                        && compiler->pendingCxxSretDest_ != nullptr
+                                        && compiler->pendingCxxSretTypeName_ == functionName;
+                                    auto* slot = directSret ? compiler->pendingCxxSretDest_
+                                                             : compiler->CreateAlloca(objectType);
+                                    if (directSret)
+                                    {
+                                        compiler->pendingCxxSretDest_ = nullptr;
+                                        compiler->pendingCxxSretTypeName_.clear();
+                                        compiler->pendingCxxSretForFixedArray_ = false;
+                                        compiler->pendingCxxSretReturn_ = false;
+                                    }
                                     compiler->EmitCxxStructorCall(functionName, *ctor, slot, ctorValues,
                                                                   &arguments);
-                                    if (compiler->IsForeignNontrivialCxxClass(functionName))
+                                    if (!directSret && compiler->IsForeignNontrivialCxxClass(functionName))
                                         compiler->RegisterOwnedStructTemp(slot, functionName);
                                     namedVar = {};
                                     namedVar.Primary = compiler->CreateLoad(slot);
@@ -8218,12 +8427,20 @@ llvm::Value* MainListener::ParseElementExpression(CFlatParser::ElementExpression
                         break;
                     }
                 }
+                auto ownedTempMark = compiler->MarkOwnedTemps();
+                compiler->lastCxxRetTemp_ = nullptr;
+                compiler->lastCxxRetValue_ = nullptr;
                 rightNV = ParseAssignmentExpressionNamed(attr->assignmentExpression());
                 lambdaExpectedType = {};
+                rightNV.CastOccurrenceId = thisCastOcc;
+                compiler->EndCastOccurrence(savedCastOcc);
+                EmitOneFieldInit(structPtr, sd, tagName, fieldName, rightNV, ownedTempMark, attr);
+                continue;
             }
             rightNV.CastOccurrenceId = thisCastOcc;
             compiler->EndCastOccurrence(savedCastOcc);
-            EmitOneFieldInit(structPtr, sd, tagName, fieldName, rightNV, attr);
+            EmitOneFieldInit(structPtr, sd, tagName, fieldName, rightNV,
+                             compiler->MarkOwnedTemps(), attr);
         }
 
         // Children -> add() calls. The receiver self NV is rebuilt per call because
@@ -8678,7 +8895,7 @@ LLVMBackend::NamedVariable MainListener::ParseIdentifier(antlr4::tree::TerminalN
         // Compiler intrinsics handled at the call site - not in the function table.
         static const std::unordered_set<std::string> kIntrinsics = {
             "va_start", "va_end", "is_pointer", "is_unique", "is_interface", "is_copyable", "is_primitive", "is_string", "annotationof",
-            "compile_error", "embed",
+            "compile_error", "construct_at", "embed",
             "reflect", "reflect_set", "json_const", "xml_const", "__rdtscp", "__readcyclecounter", "__lfence", "__pause",
             "__popcount", "__ctz", "__clz", "__prefetch", "__fma", "__likely", "__unlikely",
             "__atomic_acquire_fence",
@@ -8957,6 +9174,14 @@ void MainListener::RegisterOwningTempReceiver(antlr4::ParserRuleContext* ctx,
             && compiler->lastCxxRetTemp_ != nullptr)
         {
             thisArg.Storage = compiler->lastCxxRetTemp_;
+            return;
+        }
+
+        if (compiler->IsForeignNontrivialCxxReturnClass(typeName))
+        {
+            LogErrorContext(ctx,
+                "internal: nontrivial C++ receiver reached register-return temporary lowering; "
+                "the value must arrive through sret storage");
             return;
         }
 

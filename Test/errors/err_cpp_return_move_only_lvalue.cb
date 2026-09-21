@@ -1,0 +1,19 @@
+// Returning a non-identifier lvalue of a move-only imported C++ class must copy-construct it.
+import cpp "cpp_interop_basic.h";
+
+struct ReturnMoveOnlyHolder
+{
+    cppi.NoCopy value = cppi.NoCopy(3);
+};
+
+expect_error("cannot copy C++ class 'cppi.NoCopy' into the return slot") {
+    cppi.NoCopy return_field(ReturnMoveOnlyHolder* holder)
+    {
+        return holder->value;
+    }
+}
+
+extern int main()
+{
+    return 0;
+}

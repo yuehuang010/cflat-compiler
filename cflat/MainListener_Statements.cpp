@@ -2,6 +2,7 @@
 
 MainListener::RangeForContext* MainListener::FindActiveRangeForVariable(
         const LLVMBackend::NamedVariable& nv) {
+        if (!nv.FieldName.empty()) return nullptr;
         std::string name = nv.CallerName.empty() ? nv.TypeAndValue.VariableName : nv.CallerName;
         for (auto it = rangeForStack_.rbegin(); it != rangeForStack_.rend(); ++it)
             if (it->variableName == name)
@@ -572,6 +573,40 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
         returnExpectedScope.emplace(&declExpectedType, compiler->currentFunctionReturnTV);
         if (assignExpr != nullptr)
             ArmArrayNewDesugar(assignExpr, compiler->currentFunctionReturnTV);
+        const bool cxxSretReturn = compiler->currentFunctionAbiRecipe.hasLowering
+            && compiler->currentFunctionAbiRecipe.retSlot.kind == LLVMBackend::AbiSlot::SRetReturn
+            && !compiler->currentFunctionReturnTV.Pointer
+            && !compiler->currentFunctionReturnTV.IsAlias
+            && compiler->IsForeignNontrivialCxxReturnClass(
+                compiler->currentFunctionReturnTypeName);
+        llvm::Value* cxxSretDest = nullptr;
+        if (cxxSretReturn && compiler->currentFunction != nullptr)
+        {
+            const unsigned sretIndex = compiler->SRetArgIndex(compiler->currentFunctionAbiRecipe);
+            if (compiler->currentFunction->arg_size() <= sretIndex)
+                LogErrorContext(errCtx, "cannot return C++ class: the hidden sret slot is missing");
+            cxxSretDest = compiler->currentFunction->getArg(sretIndex);
+        }
+        const bool cxxReturnTernary = cxxSretReturn && assignExpr != nullptr
+            && assignExpr->conditionalExpression() != nullptr
+            && assignExpr->conditionalExpression()->Question() != nullptr;
+        if (cxxSretReturn && assignExpr != nullptr && !cxxReturnTernary)
+        {
+            compiler->pendingCxxSretDest_ = cxxSretDest;
+            compiler->pendingCxxSretTypeName_ = compiler->currentFunctionReturnTypeName;
+            compiler->pendingCxxSretReturn_ = true;
+        }
+        else if (cxxReturnTernary)
+        {
+            compiler->pendingCxxTernaryDeclDest_ = cxxSretDest;
+            compiler->pendingCxxTernaryDeclTypeName_ = compiler->currentFunctionReturnTypeName;
+        }
+        if (cxxSretReturn)
+        {
+            // A temporary left by an EARLIER statement must not mark this operand movable.
+            compiler->lastCxxRetTemp_ = nullptr;
+            compiler->lastCxxRetValue_ = nullptr;
+        }
         if (assignExpr != nullptr)
             returnNV = ParseAssignmentExpressionNamed(assignExpr, ResultUse::ReturnOperand);
         else if (defaultValue)
@@ -581,12 +616,160 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
             LLVMBackend::DeclTypeAndValue dtv;
             static_cast<LLVMBackend::TypeAndValue&>(dtv) = compiler->currentFunctionReturnTV;
             returnNV.TypeAndValue = compiler->currentFunctionReturnTV;
-            returnNV.Primary = GenerateDefaultValue(dtv);
+            if (!cxxSretReturn)
+                returnNV.Primary = GenerateDefaultValue(dtv);
         }
+        const bool cxxReturnCallConstructed = cxxSretReturn && !defaultValue && !cxxReturnTernary
+            && compiler->pendingCxxSretDest_ == nullptr;
+        const bool cxxReturnTernaryConstructed = cxxReturnTernary
+            && compiler->pendingCxxTernaryDeclConsumed_;
+        const bool cxxReturnTernaryFailed = cxxReturnTernary
+            && compiler->pendingCxxTernaryDeclFailed_;
+        compiler->pendingCxxSretDest_ = nullptr;
+        compiler->pendingCxxSretTypeName_.clear();
+        compiler->pendingCxxSretReturn_ = false;
+        compiler->pendingCxxTernaryDeclDest_ = nullptr;
+        compiler->pendingCxxTernaryDeclTypeName_.clear();
+        compiler->pendingCxxTernaryDeclConsumed_ = false;
+        compiler->pendingCxxTernaryDeclFailed_ = false;
         returnExpectedScope.reset();
         arrayNewDesugarCtx = nullptr;
         compiler->pendingInitAllocAlign = 0;  // one-shot
         lambdaExpectedType = {};
+
+        if (cxxSretReturn)
+        {
+            auto finishCxxSretReturn = [&]() {
+                ProcessPlusPlus();
+                compiler->FlushOwnedTemps();
+                compiler->CreateReturnCall(nullptr);
+            };
+            if (cxxReturnTernaryFailed)
+            {
+                LogErrorContext(errCtx, std::format(
+                    "cannot return C++ class '{}' from this conditional expression",
+                    CurrentReturnTypeSpelling(compiler)));
+                return;
+            }
+            if (cxxReturnCallConstructed || cxxReturnTernaryConstructed)
+            {
+                finishCxxSretReturn();
+                return;
+            }
+            if (defaultValue)
+            {
+                std::string ctorError;
+                compiler->TryBindCxxImplicitDefaultCtor(
+                    compiler->currentFunctionReturnTypeName, ctorError);
+                const auto* ctor = compiler->FindCxxDefaultCtor(
+                    compiler->currentFunctionReturnTypeName);
+                if (ctor == nullptr)
+                {
+                    LogErrorContext(errCtx, ctorError.empty()
+                        ? std::format("C++ class '{}' has no default constructor cflat can call",
+                            CurrentReturnTypeSpelling(compiler)) : ctorError);
+                    return;
+                }
+                compiler->EmitCxxStructorCall(compiler->currentFunctionReturnTypeName,
+                                               *ctor, cxxSretDest, {});
+                finishCxxSretReturn();
+                return;
+            }
+
+            const std::string typeName = compiler->currentFunctionReturnTypeName;
+            auto moveExpr = assignExpr != nullptr ? TopLevelMoveExpression(assignExpr) : nullptr;
+            const bool explicitMove = moveExpr != nullptr;
+            const std::string moveName = explicitMove && moveExpr->unaryExpression() != nullptr
+                ? moveExpr->unaryExpression()->getText() : std::string();
+            LLVMBackend::NamedVariable source = returnNV;
+            bool useMove = false;
+            std::string sourceName;
+            if (explicitMove && IsBareIdentifierText(moveName))
+            {
+                source = compiler->GetScopedLocalOrArgument(moveName);
+                sourceName = moveName;
+                useMove = true;
+            }
+            else if (!explicitMove && IsBareIdentifierText(retText)
+                && compiler->IsFunctionParameter(retText)
+                && !returnNV.TypeAndValue.Pointer
+                && compiler->IsForeignNontrivialCxxClass(returnNV.TypeAndValue.TypeName)
+                && IsLastUseOfForeignCxxParam(compiler, assignExpr, returnNV))
+            {
+                source = compiler->GetScopedLocalOrArgument(retText);
+                sourceName = retText;
+                useMove = true;
+            }
+            else if (!explicitMove && IsBareIdentifierText(retText)
+                && compiler->GetFunctionArgument(retText).GetValue() == nullptr
+                && compiler->GetScopedLocalOrArgument(retText).Storage != nullptr
+                && !compiler->GetScopedLocalOrArgument(retText).IsBorrowed
+                && !compiler->GetScopedLocalOrArgument(retText).IsBorrowedOwningValue
+                && !compiler->GetScopedLocalOrArgument(retText).IsAliasBorrow
+                && !compiler->GetScopedLocalOrArgument(retText).IsRangeForBorrow
+                && !compiler->GetScopedLocalOrArgument(retText).IsClosureRefCapture
+                && !compiler->GetScopedLocalOrArgument(retText).IsClosureValueCapture)
+            {
+                source = compiler->GetScopedLocalOrArgument(retText);
+                sourceName = retText;
+                useMove = true;
+            }
+            else if (compiler->lastCxxRetTemp_ != nullptr
+                && returnNV.TypeAndValue.TypeName == typeName
+                && ((returnNV.Primary != nullptr
+                        && returnNV.Primary == compiler->lastCxxRetValue_)
+                    || returnNV.Storage == compiler->lastCxxRetTemp_))
+            {
+                // Only the OUTERMOST call's temporary is moved, as in a C++ local declaration.
+                source.Storage = compiler->lastCxxRetTemp_;
+                useMove = true;
+            }
+            else if (returnNV.IsRvalue && returnNV.Storage != nullptr)
+            {
+                useMove = true;
+            }
+
+            if (!explicitMove && IsBareIdentifierText(retText) && source.Storage != nullptr
+                && !source.TypeAndValue.Pointer && source.TypeAndValue.TypeName != typeName
+                && compiler->CanImplicitlyConstructCxxClass(
+                    source, compiler->currentFunctionReturnTV, true))
+            {
+                std::string wrapperName;
+                std::string wrapperError;
+                if (compiler->RequestCxxVariadicConstructor(
+                        typeName, { source }, wrapperName, wrapperError))
+                {
+                    LLVMBackend::NamedVariable self;
+                    self.Primary = cxxSretDest;
+                    self.BaseType = cxxSretDest->getType();
+                    self.TypeAndValue.TypeName = typeName;
+                    self.TypeAndValue.Pointer = true;
+                    self.IsRvalue = true;
+                    auto sourceArg = source;
+                    sourceArg.TypeAndValue.VariableName.clear();
+                    compiler->CreateOverloadedFunctionCall(wrapperName, { self, sourceArg });
+                    finishCxxSretReturn();
+                    return;
+                }
+            }
+
+            if (source.Storage == nullptr || source.TypeAndValue.TypeName != typeName
+                || source.TypeAndValue.Pointer)
+            {
+                LogErrorContext(errCtx, std::format(
+                    "cannot return C++ class '{}': the expression has no constructible source",
+                    CurrentReturnTypeSpelling(compiler)));
+                return;
+            }
+            compiler->SetCurrentDebugLocation(errCtx->getStart()->getLine());
+            compiler->EmitCxxCopyOrMoveConstruct(typeName, cxxSretDest, source.Storage,
+                                                 useMove,
+                                                 useMove ? "into the return slot"
+                                                         : "into the return slot");
+            if (useMove && !sourceName.empty()) compiler->MarkVariableMoved(sourceName);
+            finishCxxSretReturn();
+            return;
+        }
 
         if (compiler->HasRawNewArrayProvenance(returnNV)
             && returnNV.TypeAndValue.Pointer
@@ -2240,8 +2423,14 @@ void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {
                     // Push scope; continue -> increment, break/else -> resume
                     compiler->InitializeBlock(blockInit, true, blockIncrement, blockResume, blockResume);
 
-                    // Evaluate the collection expression (needs typed NamedVariable for dispatch)
+                    // Evaluate the collection expression (needs typed NamedVariable for dispatch).
+                    // These are ambient call-result markers; do not let a nested call make a
+                    // later range-for operand look like the outermost temporary.
+                    compiler->lastCxxRetTemp_ = nullptr;
+                    compiler->lastCxxRetValue_ = nullptr;
                     auto collNV = ParseAssignmentExpressionNamed(collExprCtx->assignmentExpression());
+                    auto* collectionRetTemp = compiler->lastCxxRetTemp_;
+                    auto* collectionRetValue = compiler->lastCxxRetValue_;
 
                     // Spill into alloca if the collection was returned by value (no storage)
                     if (collNV.Storage == nullptr && collNV.Primary != nullptr)
@@ -2396,6 +2585,361 @@ void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {
                     bool isArrayView  = collNV.TypeAndValue.IsArrayView;
                     bool isDirectContainer = MangledBase(collNV.TypeAndValue.TypeName) == "list"
                         || MangledBase(collNV.TypeAndValue.TypeName) == "array";
+
+                    // Imported C++ containers use the C++ range protocol directly. In
+                    // particular, do not route them through CFlat's count()/get() protocol:
+                    // begin/end also covers containers whose only indexing shape is an iterator.
+                    const auto* foreignInfo = compiler->GetCxxClassInfo(collNV.TypeAndValue.TypeName);
+                    const bool hasBegin = foreignInfo != nullptr
+                        && std::find(foreignInfo->instanceMethodNames.begin(),
+                                     foreignInfo->instanceMethodNames.end(), "begin")
+                               != foreignInfo->instanceMethodNames.end();
+                    const bool hasEnd = foreignInfo != nullptr
+                        && std::find(foreignInfo->instanceMethodNames.begin(),
+                                     foreignInfo->instanceMethodNames.end(), "end")
+                               != foreignInfo->instanceMethodNames.end();
+                    const bool isForeignRangeClass = !isFaceType && !isFixedArray && !isArrayView
+                        && foreignInfo != nullptr && hasBegin && hasEnd;
+
+                    if (isForeignRangeClass)
+                    {
+                        auto makeReceiver = [&]() {
+                            LLVMBackend::NamedVariable receiver = collNV;
+                            receiver.TypeAndValue.VariableName.clear();
+                            receiver.Primary = nullptr;
+                            return receiver;
+                        };
+
+                        // A call result has no stable receiver address until it is bound. Move
+                        // only the result marked by this operand's own call, never an ambient
+                        // temporary left by a nested expression.
+                        const bool collectionIsOuterTemp = collectionRetTemp != nullptr
+                            && collNV.Storage == collectionRetTemp
+                            && (collectionRetValue == nullptr || collNV.Primary == collectionRetValue
+                                || collNV.Primary == nullptr);
+                        const bool collectionIsRegisterResult = collectionRetValue != nullptr
+                            && collNV.Primary == collectionRetValue;
+                        if (collectionIsOuterTemp || collectionIsRegisterResult)
+                        {
+                            auto collectionType = collNV.TypeAndValue;
+                            collectionType.VariableName = "__cflat_range_collection";
+                            llvm::Value* collectionStorage = nullptr;
+                            if (collectionIsOuterTemp && collectionRetTemp != nullptr
+                                && !collectionType.Pointer
+                                && compiler->IsForeignNontrivialCxxClass(collectionType.TypeName))
+                            {
+                                // The sret slot is already a fully constructed range object. Adopt
+                                // that slot as the hidden local instead of copy/move-constructing
+                                // another object from it.
+                                collectionStorage = collectionRetTemp;
+                                auto& collectionVariable =
+                                    compiler->GetOrCreateStackVariable(collectionType.VariableName);
+                                collectionVariable.Storage = collectionStorage;
+                                collectionVariable.Primary = nullptr;
+                                collectionVariable.BaseType = compiler->GetType(collectionType);
+                                collectionVariable.TypeAndValue = collectionType;
+                                compiler->RecordMoveGenBind(collectionType.VariableName);
+                                compiler->UnregisterOwnedStructTemp(collectionRetTemp);
+                            }
+                            else
+                                collectionStorage = compiler->CreateLocalVariable(collectionType);
+                            if (collectionStorage != collectionRetTemp
+                                && collectionIsOuterTemp && !collectionType.Pointer
+                                && compiler->IsForeignNontrivialCxxClass(collectionType.TypeName))
+                            {
+                                compiler->EmitCxxCopyOrMoveConstruct(
+                                    collectionType.TypeName, collectionStorage, collectionRetTemp,
+                                    true, "into a range-for collection");
+                                compiler->UnregisterOwnedStructTemp(collectionRetTemp);
+                            }
+                            else if (collNV.Primary != nullptr)
+                                compiler->CreateAssignment(collNV.Primary, collectionStorage);
+                            else if (collNV.Storage != nullptr)
+                                compiler->CreateAssignment(
+                                    compiler->CreateLoad(collNV.BaseType, collNV.Storage), collectionStorage);
+                            collNV.Storage = collectionStorage;
+                            collNV.Primary = nullptr;
+                            collNV.TypeAndValue = collectionType;
+                        }
+
+                        auto materializeIterator = [&](const std::string& name,
+                                                       const char* method) -> LLVMBackend::NamedVariable {
+                            std::optional<LLVMBackend::TypeAndValue> expectedResult;
+                            if (foreignInfo != nullptr)
+                            {
+                                for (const auto& methodInfo : foreignInfo->directMethods)
+                                    if (methodInfo.raw.name == method && methodInfo.params.size() == 1)
+                                    {
+                                        expectedResult = methodInfo.ret;
+                                        break;
+                                    }
+                                if (!expectedResult.has_value())
+                                    for (const auto& base : foreignInfo->bases)
+                                        for (const auto& methodInfo : compiler->FindCxxBaseMethods(
+                                                 base.name, method))
+                                            if (methodInfo.params.size() == 1)
+                                            {
+                                                expectedResult = methodInfo.ret;
+                                                break;
+                                            }
+                            }
+                            compiler->lastCxxRetTemp_ = nullptr;
+                            compiler->lastCxxRetValue_ = nullptr;
+                            llvm::Value* storage = nullptr;
+                            bool directSret = expectedResult.has_value()
+                                && !expectedResult->Pointer && !expectedResult->IsAlias
+                                && compiler->IsForeignNontrivialCxxClass(expectedResult->TypeName);
+                            if (directSret)
+                            {
+                                expectedResult->VariableName = name;
+                                storage = compiler->CreateLocalVariable(*expectedResult);
+                                compiler->pendingCxxSretDest_ = storage;
+                                compiler->pendingCxxSretTypeName_ = expectedResult->TypeName;
+                            }
+                            auto* result = compiler->CreateOverloadedFunctionCall(
+                                method, { makeReceiver() }, false, {}, collNV.TypeAndValue.TypeName);
+                            auto resultType = compiler->lastCallReturnType;
+                            auto* resultTemp = compiler->lastCxxRetTemp_;
+                            auto* resultMarker = compiler->lastCxxRetValue_;
+                            if (directSret && compiler->pendingCxxSretDest_ != nullptr)
+                            {
+                                compiler->pendingCxxSretDest_ = nullptr;
+                                compiler->pendingCxxSretTypeName_.clear();
+                                directSret = false;
+                            }
+                            if (directSret)
+                                resultType = *expectedResult;
+                            resultType.VariableName = name;
+                            if (storage == nullptr)
+                                storage = compiler->CreateLocalVariable(resultType);
+                            if (!directSret && resultTemp != nullptr && resultMarker == result
+                                && !resultType.Pointer
+                                && compiler->IsForeignNontrivialCxxClass(resultType.TypeName))
+                            {
+                                compiler->EmitCxxCopyOrMoveConstruct(
+                                    resultType.TypeName, storage, resultTemp, true,
+                                    "into a range-for iterator");
+                                compiler->UnregisterOwnedStructTemp(resultTemp);
+                            }
+                            else if (!directSret && result != nullptr)
+                                compiler->CreateAssignment(result, storage);
+                            LLVMBackend::NamedVariable out;
+                            out.Storage = storage;
+                            out.BaseType = compiler->GetType(resultType);
+                            out.TypeAndValue = resultType;
+                            return out;
+                        };
+
+                        auto beginNV = materializeIterator("__cflat_range_begin", "begin");
+                        auto endNV = materializeIterator("__cflat_range_end", "end");
+
+                        // Keep loop control in an empty frame. The iterator and collection locals
+                        // live in the outer init frame, so break reaches resume without cleaning
+                        // that frame; the resume path emits those destructors exactly once.
+                        compiler->InitializeBlock(nullptr, true, blockIncrement, blockResume, blockResume);
+
+                        auto iteratorPointeeType = [](LLVMBackend::TypeAndValue type) {
+                            int depth = type.PointerDepth;
+                            if (depth == 0 && type.Pointer)
+                                depth = type.ElemPointer ? 2 : 1;
+                            if (depth > 0) --depth;
+                            type.PointerDepth = depth;
+                            type.Pointer = depth > 0;
+                            type.ElemPointer = depth >= 2;
+                            return type;
+                        };
+
+                        auto blockInnerElement = [&]() {
+                            compiler->InitializeBlock(blockInner, true);
+
+                            auto loadIterator = [&](const LLVMBackend::NamedVariable& iterator) {
+                                return compiler->CreateLoad(iterator.BaseType, iterator.Storage);
+                            };
+                            auto* iteratorValue = loadIterator(beginNV);
+                            LLVMBackend::TypeAndValue sourceType;
+                            llvm::Value* elementValue = nullptr;
+                            llvm::Value* elementStorage = nullptr;
+                            bool elementResultIsReference = false;
+
+                            compiler->lastCxxRetTemp_ = nullptr;
+                            compiler->lastCxxRetValue_ = nullptr;
+                            if (beginNV.TypeAndValue.Pointer)
+                            {
+                                sourceType = iteratorPointeeType(beginNV.TypeAndValue);
+                                sourceType.IsArrayView = false;
+                                auto* elementType = compiler->GetType(sourceType);
+                                elementStorage = iteratorValue;
+                                elementValue = compiler->CreateLoad(elementType, elementStorage);
+                            }
+                            else
+                            {
+                                LLVMBackend::NamedVariable iteratorArg = beginNV;
+                                iteratorArg.TypeAndValue.VariableName.clear();
+                                elementValue = compiler->CreateOverloadedFunctionCall(
+                                    "operator*", { iteratorArg }, false, {},
+                                    beginNV.TypeAndValue.TypeName);
+                                sourceType = compiler->lastCallReturnType;
+                                auto* elementTemp = compiler->lastCxxRetTemp_;
+                                auto* elementMarker = compiler->lastCxxRetValue_;
+                                if (sourceType.IsAlias && !sourceType.Pointer
+                                    && elementValue != nullptr && elementValue->getType()->isPointerTy())
+                                {
+                                    elementResultIsReference = true;
+                                    sourceType.IsAlias = false;
+                                    auto* elementType = compiler->GetType(sourceType);
+                                    elementStorage = elementValue;
+                                    elementValue = compiler->CreateLoad(elementType, elementStorage);
+                                }
+                                else if (!sourceType.Pointer && elementValue != nullptr
+                                         && elementValue->getType()->isStructTy())
+                                {
+                                    if (elementTemp != nullptr && elementMarker == elementValue)
+                                        elementStorage = elementTemp;
+                                    else
+                                    {
+                                        elementStorage = compiler->CreateAlloca(elementValue->getType());
+                                        compiler->CreateAssignment(elementValue, elementStorage);
+                                    }
+                                }
+                            }
+
+                            auto actualElement = elemType;
+                            const bool inferElement = actualElement.TypeName.empty()
+                                || actualElement.TypeName == "auto";
+                            if (inferElement)
+                            {
+                                const bool borrow = actualElement.IsAlias;
+                                static_cast<LLVMBackend::TypeAndValue&>(actualElement) = sourceType;
+                                actualElement.IsAlias = borrow;
+                            }
+                            actualElement.VariableName = varName;
+                            if (actualElement.IsAlias)
+                            {
+                                if (!beginNV.TypeAndValue.Pointer && !elementResultIsReference)
+                                {
+                                    LogErrorContext(iterationStatement, std::format(
+                                        "cannot bind range-for element '{}' by alias: operator* returns '{}' by value; "
+                                        "alias requires a C++ reference result",
+                                        varName, compiler->DisplayCxxClassName(sourceType.TypeName)));
+                                    return;
+                                }
+                                if (elementStorage == nullptr)
+                                {
+                                    LogErrorContext(iterationStatement,
+                                        "a borrowing range-for element requires an addressable operator* result");
+                                    return;
+                                }
+                                auto& rangeVariable = compiler->GetOrCreateStackVariable(varName);
+                                rangeVariable.Storage = elementStorage;
+                                rangeVariable.Primary = nullptr;
+                                rangeVariable.BaseType = compiler->GetType(actualElement);
+                                rangeVariable.TypeAndValue = actualElement;
+                                rangeVariable.IsAliasBorrow = true;
+                                rangeVariable.IsOwning = false;
+                                compiler->RecordMoveGenBind(varName);
+                            }
+                            else
+                            {
+                                auto* elementAlloca = compiler->CreateLocalVariable(actualElement);
+                                const auto* elementInfo = compiler->GetCxxClassInfo(actualElement.TypeName);
+                                const auto* elementCopyCtor = elementInfo == nullptr
+                                    ? nullptr : compiler->FindCxxCopyCtor(actualElement.TypeName);
+                                const bool copyCtorDeleted = elementInfo != nullptr
+                                    && (elementInfo->hasDeletedCopyCtor
+                                        || (elementCopyCtor != nullptr && elementCopyCtor->isDeleted));
+                                if (elementInfo != nullptr && !actualElement.Pointer
+                                    && (copyCtorDeleted
+                                        || (!elementInfo->hasTrivialCopyCtor && elementCopyCtor == nullptr)))
+                                {
+                                    LogErrorContext(iterationStatement, std::format(
+                                        "cannot bind C++ move-only element '{}' by value in a range-for; "
+                                        "use 'alias {}' to borrow it",
+                                        compiler->DisplayCxxClassName(actualElement.TypeName),
+                                        compiler->DisplayCxxClassName(actualElement.TypeName)));
+                                    return;
+                                }
+                                if (elementInfo != nullptr && !actualElement.Pointer
+                                    && !elementInfo->hasTrivialCopyCtor)
+                                {
+                                    if (elementStorage == nullptr)
+                                    {
+                                        LogErrorContext(iterationStatement,
+                                            "a C++ range-for element has no addressable source for copy construction");
+                                        return;
+                                    }
+                                    compiler->EmitCxxCopyOrMoveConstruct(
+                                        actualElement.TypeName, elementAlloca, elementStorage, false,
+                                        "a range-for element");
+                                }
+                                else if (elementValue != nullptr)
+                                    compiler->CreateAssignment(elementValue, elementAlloca);
+                            }
+
+                            RangeForContext rangeCtx;
+                            rangeCtx.variableName = varName;
+                            rangeCtx.collection = collNV;
+                            rangeCtx.collectionStorage = collNV.Storage;
+                            rangeCtx.elementStorage = elementStorage;
+                            rangeCtx.elementBaseType = compiler->GetType(actualElement);
+                            rangeCtx.elementType = actualElement;
+                            rangeForStack_.push_back(std::move(rangeCtx));
+                            compiler->RecordMoveGenBind(varName);
+                            ParseControlledBody(bodyStmt);
+                            rangeForStack_.pop_back();
+                            compiler->CreateContinueCall();
+                            compiler->CreateBlockBreak(nullptr, true);
+                        };
+
+                        auto loadIterator = [&](const LLVMBackend::NamedVariable& iterator) {
+                            return compiler->CreateLoad(iterator.BaseType, iterator.Storage);
+                        };
+
+                        compiler->CreateBlockBreak(blockCond, false);
+                        compiler->InitializeBlock(blockCond, false);
+                        auto* beginValue = loadIterator(beginNV);
+                        auto* endValue = loadIterator(endNV);
+                        compiler->lastCxxRetTemp_ = nullptr;
+                        compiler->lastCxxRetValue_ = nullptr;
+                        auto* rangeCondition = TryBinaryOperatorOverload(
+                            beginValue, "!=", endValue, iterationStatement, nullptr,
+                            endNV.TypeAndValue.PointerDepth, endNV.TypeAndValue.ElemPointer,
+                            beginNV.Storage, endNV.Storage, true, true, false, false,
+                            beginNV.TypeAndValue.TypeName, endNV.TypeAndValue.TypeName);
+                        if (rangeCondition == nullptr && beginValue != nullptr && endValue != nullptr
+                            && beginValue->getType()->isPointerTy() && endValue->getType()->isPointerTy())
+                            rangeCondition = compiler->builder->CreateICmpNE(beginValue, endValue, "range.ne");
+                        compiler->CreateConditionJump(rangeCondition, blockInner, blockResume);
+                        blockInnerElement();
+
+                        compiler->InitializeBlock(blockIncrement, false);
+                        if (beginNV.TypeAndValue.Pointer)
+                        {
+                            auto beginPointee = iteratorPointeeType(beginNV.TypeAndValue);
+                            auto* elementType = compiler->GetType(beginPointee);
+                            auto* current = compiler->CreateLoad(beginNV.BaseType, beginNV.Storage);
+                            compiler->builder->CreateStore(
+                                compiler->builder->CreateInBoundsGEP(
+                                    elementType, current, compiler->builder->getInt64(1), "range.next"),
+                                beginNV.Storage);
+                        }
+                        else
+                        {
+                            LLVMBackend::NamedVariable iteratorArg = beginNV;
+                            iteratorArg.TypeAndValue.VariableName.clear();
+                            compiler->lastCxxRetTemp_ = nullptr;
+                            compiler->lastCxxRetValue_ = nullptr;
+                            compiler->CreateOverloadedFunctionCall(
+                                "operator++", { iteratorArg }, false, {},
+                                beginNV.TypeAndValue.TypeName);
+                        }
+                        compiler->CreateBlockBreak(blockCond, false);
+
+                        compiler->InitializeBlock(blockResume, false);
+                        compiler->CreateBlockBreak(nullptr, true);
+                        compiler->CreateBlockBreak(nullptr, true);
+                        return;
+                    }
+
                     int dataFieldIndex = -1;
                     if (isDirectContainer && !isFaceType && !isFixedArray && !isArrayView && collNV.BaseType
                         && collNV.BaseType->isStructTy())

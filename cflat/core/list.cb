@@ -45,7 +45,7 @@ class list<T> : IEnumerable<T>, IList<T>, ICopyable<list<T>>
         int i = 0;
         while (i < _size)
         {
-            newData[i] = move _data[i];
+            construct_at(&newData[i], move _data[i]);
             i++;
         }
         if (_data != nullptr)
@@ -86,7 +86,7 @@ class list<T> : IEnumerable<T>, IList<T>, ICopyable<list<T>>
     void add(T value)
     {
         if (_size >= _capacity) _grow();
-        _data[_size] = value;
+        construct_at(&_data[_size], value);
         _size++;
     }
 
@@ -101,7 +101,7 @@ class list<T> : IEnumerable<T>, IList<T>, ICopyable<list<T>>
         void add(move T value)
         {
             if (_size >= _capacity) _grow();
-            _data[_size] = move value;
+            construct_at(&_data[_size], move value);
             _size++;
         }
 
@@ -115,7 +115,7 @@ class list<T> : IEnumerable<T>, IList<T>, ICopyable<list<T>>
     {
         _checkBounds(index, "set");
         _releaseAt(index);
-        _data[index] = value;
+        construct_at(&_data[index], value);
     }
 
     // set()'s transfer counterpart, guarded exactly like add(move T) above. Declaration order
@@ -127,7 +127,7 @@ class list<T> : IEnumerable<T>, IList<T>, ICopyable<list<T>>
         {
             _checkBounds(index, "set");
             _releaseAt(index);
-            _data[index] = move value;
+            construct_at(&_data[index], move value);
         }
     }
 
@@ -158,7 +158,7 @@ class list<T> : IEnumerable<T>, IList<T>, ICopyable<list<T>>
         int i = index;
         while (i < _size - 1)
         {
-            _data[i] = move _data[i + 1];
+            construct_at(&_data[i], move _data[i + 1]);
             i++;
         }
         _size--;
@@ -176,7 +176,7 @@ class list<T> : IEnumerable<T>, IList<T>, ICopyable<list<T>>
         int i = index;
         while (i < _size - 1)
         {
-            _data[i] = move _data[i + 1];
+            construct_at(&_data[i], move _data[i + 1]);
             i++;
         }
         _size--;
@@ -220,7 +220,7 @@ class list<T> : IEnumerable<T>, IList<T>, ICopyable<list<T>>
             while (i < _size)
             {
                 if const (!is_copyable(T)) compile_error("cannot copy this list: its element type owns a 'unique' pointer and has no 'copy()'; give the type a 'copy()' method, or 'move' the list instead of copying it");
-                else                       result.add(_data[i].copy());
+                else                       result.add(_data[i]);
                 i++;
             }
             return result;
@@ -249,9 +249,9 @@ class list<T> : IEnumerable<T>, IList<T>, ICopyable<list<T>>
             int i = 0;
             while (i < _size)
             {
-                // Total .copy() per element (identity for borrows, deep for copyable owners).
+                // Total copy policy per element (identity for borrows, deep for copyable owners).
                 if const (!is_copyable(T)) compile_error("cannot copy this list: its element type owns a 'unique' pointer and has no 'copy()'; give the type a 'copy()' method, or 'move' the list instead of copying it");
-                else                       result.add(_data[i].copy());
+                else                       result.add(_data[i]);
                 i++;
             }
 
@@ -328,10 +328,10 @@ class list<T> : IEnumerable<T>, IList<T>, ICopyable<list<T>>
         int i = _size;
         while (i > index)
         {
-            _data[i] = move _data[i - 1];
+            construct_at(&_data[i], move _data[i - 1]);
             i--;
         }
-        _data[index] = value;
+        construct_at(&_data[index], value);
         _size++;
     }
 
@@ -350,10 +350,10 @@ class list<T> : IEnumerable<T>, IList<T>, ICopyable<list<T>>
             int i = _size;
             while (i > index)
             {
-                _data[i] = move _data[i - 1];
+                construct_at(&_data[i], move _data[i - 1]);
                 i--;
             }
-            _data[index] = move value;
+            construct_at(&_data[index], move value);
             _size++;
         }
 

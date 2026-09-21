@@ -3962,7 +3962,8 @@ void LLVMBackend::DropValue(const NamedVariable& namedVar)
             // A plain `move x` (into another slot or a by-value parameter) does NOT set this flag:
             // per the M4b ruling the moved-from object is still destroyed at scope exit.
             if (namedVar.ExplicitlyMovedNull
-                && IsForeignNontrivialCxxClass(namedVar.TypeAndValue.TypeName)) return;
+                && (IsForeignNontrivialCxxClass(namedVar.TypeAndValue.TypeName)
+                    || HasForeignNontrivialCxxField(namedVar.TypeAndValue.TypeName))) return;
             // Skip the struct value being moved out via `return` - the caller now owns it.
             if (namedVar.Storage == returnedStructDtorSkipAlloca) return;
             // A fixed-array local (`T[N] a;`) owns every element - destruct all N.
@@ -3987,7 +3988,8 @@ bool LLVMBackend::OwnsDroppableResource(const NamedVariable& namedVar) const
         if (namedVar.IsAliasBorrow) return false;
         if (namedVar.Storage == returnedStructDtorSkipAlloca) return false;
         if (namedVar.ExplicitlyMovedNull
-            && IsForeignNontrivialCxxClass(namedVar.TypeAndValue.TypeName)) return false;
+            && (IsForeignNontrivialCxxClass(namedVar.TypeAndValue.TypeName)
+                || HasForeignNontrivialCxxField(namedVar.TypeAndValue.TypeName))) return false;
         return true;
     }
 
@@ -4040,6 +4042,13 @@ void LLVMBackend::EmitDestructorsForScope(const StackState& frame)
             // Clean up move struct parameters
             if (namedVar.IsOwningStruct && namedVar.Storage != nullptr)
             {
+                // A foreign C++ move parameter aliases the caller's moved-from object. The
+                // caller owns its lifetime, so a move-constructing container store suppresses
+                // this callee-side cleanup while leaving the caller's destructor intact.
+                if (namedVar.ExplicitlyMovedNull
+                    && (IsForeignNontrivialCxxClass(namedVar.TypeAndValue.TypeName)
+                        || HasForeignNontrivialCxxField(namedVar.TypeAndValue.TypeName)))
+                    continue;
                 if (namedVar.IsMoved && HasTypeAnnotation(namedVar.TypeAndValue.TypeName, "unique"))
                     continue;
                 if (auto* dtor = GetOrCreateFullDestructor(namedVar.TypeAndValue.TypeName))

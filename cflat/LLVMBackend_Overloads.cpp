@@ -3037,6 +3037,15 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
             argList = std::move(abiArgs);
         }
 
+        std::vector<llvm::Value*> cflatRawArrayCounts;
+        if (!candidate.External && candidate.Recipe.hasLowering)
+        {
+            cflatRawArrayCounts.resize(candidate.Parameters.size(), nullptr);
+            for (size_t i = 0; i < candidate.Parameters.size() && i < matched.size(); ++i)
+                if (ParameterCarriesRawArrayCount(candidate.Parameters[i]))
+                    cflatRawArrayCounts[i] = RawArrayCountArgument(matched[i]);
+        }
+
         // Null move sources before the callee can observe or reseat an aliased slot.
         ApplyMoveParamTransfer(functionName, candidate.Parameters, matched, true,
                                candidate.IsMethod, true);
@@ -3058,7 +3067,15 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
         std::vector<llvm::Value*> cxxIndirectArgAddrs;
         llvm::Value* cxxSretDest = nullptr;
         llvm::Value* cxxRetTemp = nullptr;
-        if (candidate.Recipe.hasLowering && candidate.IsCxx)
+        const bool cxxClassReturn = candidate.Recipe.hasLowering
+            && candidate.Recipe.retSlot.kind == AbiSlot::SRetReturn
+            && !candidate.ReturnType.Pointer
+            && IsForeignNontrivialCxxReturnClass(candidate.ReturnType.TypeName);
+        const bool cxxClassParam = std::any_of(candidate.Recipe.paramSlots.begin(),
+            candidate.Recipe.paramSlots.end(), [&](const AbiSlot& slot) {
+                return slot.kind == AbiSlot::ByVal && slot.structTy != nullptr;
+            });
+        if (candidate.Recipe.hasLowering && (candidate.IsCxx || cxxClassReturn || cxxClassParam))
         {
             for (size_t i = 0; i < candidate.Recipe.paramSlots.size()
                             && i < candidate.Parameters.size(); ++i)
@@ -3078,16 +3095,25 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                 auto* structTy = candidate.Recipe.paramSlots[i].structTy;
                 auto* temp = AllocaAtEntry(structTy, nullptr, "cxx.argtemp",
                                            candidate.Recipe.paramSlots[i].align);
-                if (!EmitCxxCopyOrMoveConstruct(pn, temp, matched[i].Storage,
-                                                matched[i].IsExplicitMove,
+                const bool useMove = candidate.Parameters[i].IsMove
+                    || matched[i].IsExplicitMove
+                    || matched[i].CxxParamLastUse
+                    || (!candidate.IsCxx && matched[i].IsRvalue);
+                if (!EmitCxxCopyOrMoveConstruct(pn, temp, matched[i].Storage, useMove,
                                                 "into a by-value parameter"))
                     continue;
                 if (!IsCxxParamDestroyedInCallee(pn)) RegisterOwnedStructTemp(temp, pn);
                 cxxIndirectArgAddrs.resize(candidate.Recipe.paramSlots.size(), nullptr);
                 cxxIndirectArgAddrs[i] = temp;
+                if (matched[i].CxxParamLastUse && !matched[i].IsElementAccess
+                    && matched[i].FieldName.empty())
+                {
+                    const std::string sourceName = matched[i].CallerName.empty()
+                        ? matched[i].TypeAndValue.VariableName : matched[i].CallerName;
+                    MarkVariableMoved(sourceName);
+                }
             }
-            if (candidate.Recipe.retSlot.kind == AbiSlot::SRetReturn
-                && IsForeignNontrivialCxxClass(candidate.ReturnType.TypeName))
+            if (cxxClassReturn)
             {
                 if (pendingCxxSretDest_ != nullptr
                     && candidate.ReturnType.TypeName == pendingCxxSretTypeName_)
@@ -3154,7 +3180,8 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
         llvm::Value* result = candidate.Recipe.hasLowering
             ? EmitAbiLoweredCall(candidate, argList, cxxSretDest,
                                  cxxIndirectArgAddrs.empty() ? nullptr : &cxxIndirectArgAddrs,
-                                 cxxVirtualCallee)
+                                 cxxVirtualCallee,
+                                 cflatRawArrayCounts.empty() ? nullptr : &cflatRawArrayCounts)
             : (cxxVirtualCallee != nullptr
                 ? (llvm::Value*)builder->CreateCall(candidate.Function->getFunctionType(),
                                                     cxxVirtualCallee, argList)
@@ -3164,7 +3191,8 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
             RegisterOwnedStructTemp(cxxRetTemp, candidate.ReturnType.TypeName);
             result = builder->CreateLoad(candidate.Recipe.retSlot.structTy, cxxRetTemp);
         }
-        if (candidate.Recipe.hasLowering && candidate.IsCxx
+        if (candidate.Recipe.hasLowering
+            && (candidate.IsCxx || cxxClassReturn)
             && !candidate.ReturnType.Pointer && result != nullptr && result->getType()->isStructTy())
         {
             // Remembered for a declaration initialized by this call: the temp (sret) or null

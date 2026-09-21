@@ -357,6 +357,26 @@ namespace cppi
     int Tracked::value() const noexcept { return payload; }
     bool Tracked::operator==(const Tracked& other) const noexcept { return payload == other.payload; }
 
+    TrackedBase::~TrackedBase() noexcept = default;
+
+    ConvertSource::ConvertSource(int value) noexcept : value_(value) {}
+    ConvertSource::ConvertSource(const ConvertSource& other) noexcept : value_(other.value_) {}
+    ConvertSource::ConvertSource(ConvertSource&& other) noexcept : value_(other.value_)
+    {
+        other.value_ = -1;
+    }
+    ConvertSource::~ConvertSource() noexcept {}
+    int ConvertSource::value() const noexcept { return value_; }
+
+    ConvertTarget::ConvertTarget(const ConvertSource& other) noexcept : value_(other.value()) {}
+    ConvertTarget::ConvertTarget(const ConvertTarget& other) noexcept : value_(other.value_) {}
+    ConvertTarget::ConvertTarget(ConvertTarget&& other) noexcept : value_(other.value_)
+    {
+        other.value_ = -1;
+    }
+    ConvertTarget::~ConvertTarget() noexcept {}
+    int ConvertTarget::value() const noexcept { return value_; }
+
     ScalarBox::ScalarBox(double value) noexcept : value_(value) {}
     ScalarBox::~ScalarBox() noexcept {}
     double ScalarBox::value() const noexcept { return value_; }
@@ -387,6 +407,7 @@ namespace cppi
     int NoCopy::value() const noexcept { return v_; }
 
     Tracked make_tracked(int payload) noexcept { return Tracked(payload); }
+
     int take_tracked(Tracked t) noexcept { return t.value(); }
     int take_moved(Tracked t) noexcept { return t.value() * 10; }
     int take_rvalue(Tracked&& t) noexcept

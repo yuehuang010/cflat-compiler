@@ -1,0 +1,7 @@
+import cpp "cpp_interop_basic.h";
+
+expect_error("C++ class 'cppi.Tracked' has no default constructor cflat can call") {
+    cppi.Tracked return_default_no_default() { return default; }
+}
+
+extern int main() { return 0; }

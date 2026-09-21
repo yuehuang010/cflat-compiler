@@ -431,6 +431,61 @@ struct AllDefaultedStruct
     AllDefaultedStruct(int x = 5) { a = x; }
 };
 
+int ctorPreludePlainDefault = 0;
+int ctorPreludePlainArg = 0;
+struct CtorPreludePlain
+{
+    CtorPreludePlain() { ctorPreludePlainDefault++; }
+    CtorPreludePlain(int value) { ctorPreludePlainArg++; }
+};
+
+int ctorPreludeClassDefault = 0;
+int ctorPreludeClassArg = 0;
+class CtorPreludeClass
+{
+    CtorPreludeClass() { ctorPreludeClassDefault++; }
+    CtorPreludeClass(int value) { ctorPreludeClassArg++; }
+};
+
+int ctorPreludeGenericDefault = 0;
+int ctorPreludeGenericArg = 0;
+struct CtorPreludeGeneric<T>
+{
+    CtorPreludeGeneric() { ctorPreludeGenericDefault++; }
+    CtorPreludeGeneric(int value) { ctorPreludeGenericArg++; }
+};
+
+bool testParameterizedConstructorPrelude()
+{
+    bool result = true;
+
+    ctorPreludePlainDefault = 0;
+    ctorPreludePlainArg = 0;
+    CtorPreludePlain plain = CtorPreludePlain(9);
+    result &= Test("ctor_prelude_plain_arg_body", ctorPreludePlainArg, 1);
+    result &= Test("ctor_prelude_plain_default_body", ctorPreludePlainDefault, 0);
+
+    ctorPreludePlainDefault = 0;
+    ctorPreludePlainArg = 0;
+    CtorPreludePlain* plainHeap = new CtorPreludePlain(10);
+    result &= Test("ctor_prelude_new_arg_body", ctorPreludePlainArg, 1);
+    result &= Test("ctor_prelude_new_default_body", ctorPreludePlainDefault, 0);
+    delete plainHeap;
+
+    ctorPreludeClassDefault = 0;
+    ctorPreludeClassArg = 0;
+    CtorPreludeClass klass = CtorPreludeClass(11);
+    result &= Test("ctor_prelude_class_arg_body", ctorPreludeClassArg, 1);
+    result &= Test("ctor_prelude_class_default_body", ctorPreludeClassDefault, 0);
+
+    ctorPreludeGenericDefault = 0;
+    ctorPreludeGenericArg = 0;
+    CtorPreludeGeneric<int> generic = CtorPreludeGeneric<int>(12);
+    result &= Test("ctor_prelude_generic_arg_body", ctorPreludeGenericArg, 1);
+    result &= Test("ctor_prelude_generic_default_body", ctorPreludeGenericDefault, 0);
+    return result;
+}
+
 bool testAllDefaultedConstructor()
 {
     bool result = true;
@@ -4470,6 +4525,7 @@ extern int main()
     total++; passed += testIntToBoolCallArgument()       ? 1 : 0;
     total++; passed += testDefaultExpression()           ? 1 : 0;
     total++; passed += testDefaultParamNameCollision()   ? 1 : 0;
+    total++; passed += testParameterizedConstructorPrelude() ? 1 : 0;
     total++; passed += testAllDefaultedConstructor()     ? 1 : 0;
     total++; passed += testNoArgCtorFieldSeeding()       ? 1 : 0;
     total++; passed += testNoArgCtorFieldSeedingCasts()  ? 1 : 0;

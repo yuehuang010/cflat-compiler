@@ -563,6 +563,39 @@ namespace cppi
     private:
     };
 
+    class TrackedBase
+    {
+    public:
+        virtual ~TrackedBase() noexcept;
+        virtual Tracked make(int payload) noexcept = 0;
+    };
+
+    class ConvertSource
+    {
+    public:
+        explicit ConvertSource(int value) noexcept;
+        ConvertSource(const ConvertSource& other) noexcept;
+        ConvertSource(ConvertSource&& other) noexcept;
+        ~ConvertSource() noexcept;
+        int value() const noexcept;
+
+    private:
+        int value_;
+    };
+
+    class ConvertTarget
+    {
+    public:
+        ConvertTarget(const ConvertSource& other) noexcept;
+        ConvertTarget(const ConvertTarget& other) noexcept;
+        ConvertTarget(ConvertTarget&& other) noexcept;
+        ~ConvertTarget() noexcept;
+        int value() const noexcept;
+
+    private:
+        int value_;
+    };
+
     // M34: a non-explicit converting constructor makes scalar arguments legal for const-reference
     // parameters. The destructor keeps chained-return lifetime on the same nontrivial path.
     class ScalarBox

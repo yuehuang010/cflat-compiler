@@ -1662,6 +1662,23 @@ void LLVMBackend::ApplyMoveParamTransfer(const std::string& functionName,
 {
         for (size_t i = 0; i < params.size() && i < args.size(); i++)
         {
+            // C++ class by-value transfer constructs a separate parameter object. The source
+            // remains a live moved-from object, so never zero its storage like a CFlat sink.
+            if (!params[i].Pointer && !params[i].IsAlias
+                && IsForeignNontrivialCxxClass(params[i].TypeName))
+            {
+                if (!beforeCall && (params[i].IsMove || args[i].IsExplicitMove))
+                {
+                    std::string movedName = args[i].CallerName.empty()
+                        ? args[i].TypeAndValue.VariableName : args[i].CallerName;
+                    if (!movedName.empty() && args[i].FieldName.empty()
+                        && !args[i].IsElementAccess)
+                        MarkVariableMoved(movedName);
+                    else if (!movedName.empty() && !args[i].FieldName.empty())
+                        MarkVariableFieldMoved(movedName, args[i].FieldName);
+                }
+                continue;
+            }
             std::string sourceName = args[i].CallerName;
             if (sourceName.empty() && args[i].FieldName.empty())
                 sourceName = args[i].TypeAndValue.VariableName;
@@ -2690,13 +2707,56 @@ llvm::Value* LLVMBackend::CallInterfaceMethod(llvm::Value* ifacePtr, const std::
         // (needed for chaining a method on the result, e.g. `e.toJson().data()`).
         lastCallReturnType = methodInfo->ReturnType;
 
-        llvm::Type* retTy = GetFunctionReturnABIType(methodInfo->ReturnType);
-        std::vector<llvm::Type*> paramTypes = { ptrTy };
+        lastCxxRetTemp_ = nullptr;
+        lastCxxRetValue_ = nullptr;
+        const bool cxxSretReturn = !methodInfo->ReturnType.Pointer
+            && !methodInfo->ReturnType.IsAlias
+            && !methodInfo->ReturnType.IsArrayView
+            && IsForeignNontrivialCxxReturnClass(methodInfo->ReturnType.TypeName);
+        std::vector<TypeAndValue> interfaceRecipeParams;
+        TypeAndValue receiver;
+        receiver.TypeName = ifaceName;
+        receiver.Pointer = true;
+        interfaceRecipeParams.push_back(receiver);
+        interfaceRecipeParams.insert(interfaceRecipeParams.end(), methodInfo->Parameters.begin(),
+                                     methodInfo->Parameters.end());
+        AbiRecipe cxxSretRecipe = ComputeCxxReturnAbiRecipe(methodInfo->ReturnType,
+                                                            interfaceRecipeParams);
+        llvm::Value* cxxSretDest = nullptr;
+        if (cxxSretReturn)
+        {
+            auto* structTy = GetType(methodInfo->ReturnType);
+            if (structTy == nullptr || !structTy->isStructTy())
+                return nullptr;
+            if (pendingCxxSretDest_ != nullptr
+                && pendingCxxSretTypeName_ == methodInfo->ReturnType.TypeName)
+            {
+                cxxSretDest = pendingCxxSretDest_;
+                pendingCxxSretDest_ = nullptr;
+                pendingCxxSretTypeName_.clear();
+            }
+            else
+            {
+                const uint64_t align = module->getDataLayout().getABITypeAlign(structTy).value();
+                cxxSretDest = AllocaAtEntry(structTy, nullptr, "cxx.interface.rettemp", align);
+                RegisterOwnedStructTemp(cxxSretDest, methodInfo->ReturnType.TypeName);
+                lastCxxRetTemp_ = cxxSretDest;
+            }
+        }
+
+        llvm::Type* retTy = cxxSretReturn ? builder->getVoidTy()
+                                          : GetFunctionReturnABIType(methodInfo->ReturnType);
+        std::vector<llvm::Type*> paramTypes;
+        if (cxxSretReturn)
+            paramTypes.push_back(cflat_llvm::PointerTo(GetType(methodInfo->ReturnType)));
+        paramTypes.push_back(ptrTy);
         for (const auto& p : methodInfo->Parameters)
         {
             // Same alias-borrow param ABI the definition emitted (GetFunctionType).
-            paramTypes.push_back(ParameterIsAliasByPointer(p) ? cflat_llvm::PointerTo(GetType(p))
-                                                              : GetType(p));
+            paramTypes.push_back(!p.Pointer && IsForeignNontrivialCxxClass(p.TypeName)
+                ? cflat_llvm::PointerTo(GetType(p))
+                : (ParameterIsAliasByPointer(p) ? cflat_llvm::PointerTo(GetType(p))
+                                                : GetType(p)));
             if (ParameterCarriesRawArrayCount(p))
                 paramTypes.push_back(builder->getInt64Ty());
         }
@@ -2706,11 +2766,50 @@ llvm::Value* LLVMBackend::CallInterfaceMethod(llvm::Value* ifacePtr, const std::
 
         // callArgNVs is arity-matched to Parameters by the resolver, so no clamp here: a
         // mismatched arity was already rejected instead of silently truncating the call.
-        std::vector<llvm::Value*> callArgs = { dataPtr };
+        std::vector<llvm::Value*> callArgs;
+        if (cxxSretReturn)
+            callArgs.push_back(cxxSretDest);
+        callArgs.push_back(dataPtr);
         for (size_t i = 0; i < callArgNVs.size() && i < methodInfo->Parameters.size(); i++)
         {
             const auto& nv = callArgNVs[i];
             const auto& param = methodInfo->Parameters[i];
+
+            const size_t recipeIndex = i + 1; // slot zero is the interface receiver
+            if (recipeIndex < cxxSretRecipe.paramSlots.size()
+                && cxxSretRecipe.paramSlots[recipeIndex].kind == AbiSlot::ByVal
+                && !param.Pointer && !param.IsAlias
+                && IsForeignNontrivialCxxClass(param.TypeName))
+            {
+                if (nv.Storage == nullptr)
+                {
+                    LogError(std::format(
+                        "cannot pass C++ class '{}' through interface method '{}.{}': the argument must "
+                        "have addressable storage so its copy or move constructor can run",
+                        param.TypeName, ifaceName, methodName));
+                    continue;
+                }
+                auto* temp = AllocaAtEntry(cxxSretRecipe.paramSlots[recipeIndex].structTy,
+                                           nullptr, "cxx.interface.argtemp",
+                                           cxxSretRecipe.paramSlots[recipeIndex].align);
+                const bool useMove = param.IsMove || nv.IsExplicitMove
+                    || nv.CxxParamLastUse || nv.IsRvalue;
+                if (!EmitCxxCopyOrMoveConstruct(param.TypeName, temp, nv.Storage, useMove,
+                                                "into an interface by-value parameter"))
+                    continue;
+                if (!IsCxxParamDestroyedInCallee(param.TypeName))
+                    RegisterOwnedStructTemp(temp, param.TypeName);
+                if (nv.CxxParamLastUse && !nv.IsElementAccess && nv.FieldName.empty())
+                {
+                    const std::string sourceName = nv.CallerName.empty()
+                        ? nv.TypeAndValue.VariableName : nv.CallerName;
+                    MarkVariableMoved(sourceName);
+                }
+                callArgs.push_back(temp);
+                if (ParameterCarriesRawArrayCount(param))
+                    callArgs.push_back(RawArrayCountArgument(nv));
+                continue;
+            }
 
             // Same closure SHAPE gate the direct call path applies (RejectFuncPtrShapeMismatch):
             // a vtable slot lowers each argument by bit pattern, so a mismatch is called as code.
@@ -2831,6 +2930,14 @@ llvm::Value* LLVMBackend::CallInterfaceMethod(llvm::Value* ifacePtr, const std::
         ApplyMoveParamTransfer(ifaceName + "." + methodName, methodInfo->Parameters, callArgNVs,
             true, false, true);
         auto* callResult = builder->CreateCall(fnTy, fnPtr, callArgs);
+        if (cxxSretRecipe.hasLowering)
+            ApplyAbiCallAttributes(callResult, cxxSretRecipe);
+        llvm::Value* resultValue = callResult;
+        if (cxxSretReturn)
+        {
+            resultValue = CreateLoad(cxxSretDest);
+            lastCxxRetValue_ = resultValue;
+        }
         RegisterRawArrayCallResult(callResult, rawReturnCountSlot,
                                    methodInfo->ReturnType.AllocAlignValue);
 
@@ -2873,7 +2980,7 @@ llvm::Value* LLVMBackend::CallInterfaceMethod(llvm::Value* ifacePtr, const std::
 
         // A temp's `unique` field handed to a PLAIN `T*` parameter of a VIRTUAL slot. Same point
         // in the sequence as the direct path's RecordTempUniqueFieldArgs, for the same reason.
-        RecordTempUniqueFieldInterfaceArgs(callResult, ifaceName, *methodInfo, callArgNVs);
+        RecordTempUniqueFieldInterfaceArgs(resultValue, ifaceName, *methodInfo, callArgNVs);
 
         // Classify the virtual result's ownership exactly like the direct-call path
         // (CreateOverloadedFunctionCall): a 'move string' / 'move T*' / 'move <interface>'
@@ -2893,13 +3000,13 @@ llvm::Value* LLVMBackend::CallInterfaceMethod(llvm::Value* ifacePtr, const std::
             && (rt.TypeName == "string" || rt.Pointer || rt.IsInterface
                 || IsCoreUniqueType(rt.TypeName));
         if (lastCallReturnsOwned)
-            RegisterOwnedReturnTemp(callResult, ifaceName + "." + methodName, rt);
+            RegisterOwnedReturnTemp(resultValue, ifaceName + "." + methodName, rt);
         lastCallReturnsAllocAlign = rt.AllocAlignValue;
         if (lastCallReturnsOwned
-            && callResult->getType() == llvm::StructType::getTypeByName(*context, "string"))
-            RegisterOwnedStringTemp(callResult);
+            && resultValue->getType() == llvm::StructType::getTypeByName(*context, "string"))
+            RegisterOwnedStringTemp(resultValue);
 
-        return callResult;
+        return resultValue;
     }
 
 LLVMBackend::NamedVariable LLVMBackend::MakeStringLiteralNV(const std::string& text)

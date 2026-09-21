@@ -722,36 +722,61 @@ llvm::Function* LLVMBackend::GetOrCreateFunctionShim(llvm::Function* original)
 
         auto* origTy  = original->getFunctionType();
         auto* i8PtrTy = cflat_llvm::PointerTo(builder->getInt8Ty());
+        const auto* symbol = FindSymbolForFunction(original);
+        const AbiRecipe* abiRecipe = symbol != nullptr && symbol->Recipe.hasLowering
+            ? &symbol->Recipe : nullptr;
+        const bool returnCarriesRawArrayCount = symbol != nullptr
+            && ReturnCarriesRawArrayCount(symbol->ReturnType);
 
         std::vector<llvm::Type*> shimParamTypes;
-        for (auto* paramTy : origTy->params())
-            shimParamTypes.push_back(paramTy);
-        shimParamTypes.push_back(i8PtrTy); // env (trailing, ignored)
+        for (unsigned i = 0; i < origTy->getNumParams(); ++i)
+        {
+            if (returnCarriesRawArrayCount && i + 1 == origTy->getNumParams()) continue;
+            shimParamTypes.push_back(origTy->getParamType(i));
+        }
+        shimParamTypes.push_back(i8PtrTy); // env (ignored)
+        if (returnCarriesRawArrayCount)
+            shimParamTypes.push_back(origTy->getParamType(origTy->getNumParams() - 1));
 
         auto* shimTy = llvm::FunctionType::get(origTy->getReturnType(), shimParamTypes, false);
         auto* shim   = llvm::Function::Create(shimTy, llvm::Function::InternalLinkage, shimName, module.get());
+        if (abiRecipe != nullptr)
+            ApplyAbiAttributes(shim, *abiRecipe);
 
         auto* entry = llvm::BasicBlock::Create(*context, "entry", shim);
         llvm::IRBuilder<> b(entry);
 
         // Forward every param except the trailing env to the original.
         std::vector<llvm::Value*> callArgs;
-        for (unsigned i = 0; i + 1 < shim->arg_size(); ++i)
+        const unsigned originalParamCount = origTy->getNumParams();
+        for (unsigned i = 0; i < originalParamCount; ++i)
+        {
+            if (returnCarriesRawArrayCount && i + 1 == originalParamCount) continue;
             callArgs.push_back(shim->getArg(i));
+        }
+        if (returnCarriesRawArrayCount)
+            callArgs.push_back(shim->getArg(originalParamCount + 1));
 
         if (origTy->getReturnType()->isVoidTy())
         {
-            b.CreateCall(origTy, original, callArgs);
+            auto* call = b.CreateCall(origTy, original, callArgs);
+            if (abiRecipe != nullptr)
+                ApplyAbiCallAttributes(call, *abiRecipe);
             b.CreateRetVoid();
         }
         else
         {
-            b.CreateRet(b.CreateCall(origTy, original, callArgs));
+            auto* call = b.CreateCall(origTy, original, callArgs);
+            if (abiRecipe != nullptr)
+                ApplyAbiCallAttributes(call, *abiRecipe);
+            b.CreateRet(call);
         }
         return shim;
     }
 
-llvm::Function* LLVMBackend::GetOrCreateCFuncPtrThunk(llvm::FunctionType* cFnTy)
+llvm::Function* LLVMBackend::GetOrCreateCFuncPtrThunk(llvm::FunctionType* cFnTy,
+                                                      const AbiRecipe* abiRecipe,
+                                                      bool returnCarriesRawArrayCount)
 {
         // Build a stable signature key (mangled function type) so we share thunks across
         // identical signatures (e.g. multiple `int(int,int)` callbacks).
@@ -764,30 +789,57 @@ llvm::Function* LLVMBackend::GetOrCreateCFuncPtrThunk(llvm::FunctionType* cFnTy)
         // LLVM may emit punctuation; sanitize to identifier-friendly chars.
         for (char& c : key) if (!std::isalnum((unsigned char)c)) c = '_';
 
-        if (auto* existing = module->getFunction(key)) return existing;
+        if (auto* existing = module->getFunction(key))
+        {
+            if (abiRecipe != nullptr)
+                ApplyAbiAttributes(existing, *abiRecipe);
+            return existing;
+        }
 
         auto* i8PtrTy = cflat_llvm::PointerTo(builder->getInt8Ty());
         std::vector<llvm::Type*> thunkParams;
-        for (auto* pt : cFnTy->params()) thunkParams.push_back(pt);
-        thunkParams.push_back(i8PtrTy); // env (trailing) carries the real C fn ptr at runtime
+        const unsigned cFnParamCount = cFnTy->getNumParams();
+        for (unsigned i = 0; i < cFnParamCount; ++i)
+        {
+            if (returnCarriesRawArrayCount && i + 1 == cFnParamCount) continue;
+            thunkParams.push_back(cFnTy->getParamType(i));
+        }
+        thunkParams.push_back(i8PtrTy); // env carries the real C fn ptr at runtime
+        if (returnCarriesRawArrayCount)
+            thunkParams.push_back(cFnTy->getParamType(cFnParamCount - 1));
         auto* thunkTy = llvm::FunctionType::get(cFnTy->getReturnType(), thunkParams, false);
 
         auto* thunk = llvm::Function::Create(thunkTy, llvm::Function::InternalLinkage, key, *module);
+        if (abiRecipe != nullptr)
+            ApplyAbiAttributes(thunk, *abiRecipe);
 
         auto* entry = llvm::BasicBlock::Create(*context, "entry", thunk);
         llvm::IRBuilder<> b(entry);
-        auto* envArg = thunk->getArg((unsigned)thunk->arg_size() - 1);
+        const unsigned envIndex = returnCarriesRawArrayCount
+            ? cFnParamCount - 1 : cFnParamCount;
+        auto* envArg = thunk->getArg(envIndex);
         auto* fnPtr  = b.CreateBitCast(envArg, cflat_llvm::PointerTo(cFnTy), "cfn");
         std::vector<llvm::Value*> callArgs;
-        for (unsigned i = 0; i + 1 < thunk->arg_size(); ++i) callArgs.push_back(thunk->getArg(i));
+        for (unsigned i = 0; i < cFnParamCount; ++i)
+        {
+            if (returnCarriesRawArrayCount && i + 1 == cFnParamCount) continue;
+            callArgs.push_back(thunk->getArg(i));
+        }
+        if (returnCarriesRawArrayCount)
+            callArgs.push_back(thunk->getArg(cFnParamCount + 1));
         if (cFnTy->getReturnType()->isVoidTy())
         {
-            b.CreateCall(cFnTy, fnPtr, callArgs);
+            auto* call = b.CreateCall(cFnTy, fnPtr, callArgs);
+            if (abiRecipe != nullptr)
+                ApplyAbiCallAttributes(call, *abiRecipe);
             b.CreateRetVoid();
         }
         else
         {
-            b.CreateRet(b.CreateCall(cFnTy, fnPtr, callArgs));
+            auto* call = b.CreateCall(cFnTy, fnPtr, callArgs);
+            if (abiRecipe != nullptr)
+                ApplyAbiCallAttributes(call, *abiRecipe);
+            b.CreateRet(call);
         }
         return thunk;
     }
@@ -833,9 +885,16 @@ llvm::Function* LLVMBackend::GetOrCreateCAbiFunctionThunk(const FunctionSymbol& 
         TypeAndValue ret;
         std::vector<TypeAndValue> params;
         UnpackFuncPtrSignature(fpTV, ret, params);
-        auto* naturalTy = GetFunctionType(ret, params, false, false);
+        const bool cxxSretReturn = !ret.Pointer && !ret.IsAlias
+            && !ret.IsArrayView && IsForeignNontrivialCxxReturnClass(ret.TypeName);
+        const AbiRecipe& recipe = symbol.Recipe;
+        auto* naturalTy = cxxSretReturn
+            ? BuildExternFunctionType(ret, params, false, recipe)
+            : GetFunctionType(ret, params, false, false);
         auto* thunk = llvm::Function::Create(
             naturalTy, llvm::Function::InternalLinkage, key, *module);
+        if (cxxSretReturn && recipe.retSlot.kind == AbiSlot::SRetReturn)
+            ApplyAbiAttributes(thunk, recipe);
         cAbiFunctionThunkCache_[key] = thunk;
 
         auto* entry = llvm::BasicBlock::Create(*context, "entry", thunk);
@@ -843,15 +902,25 @@ llvm::Function* LLVMBackend::GetOrCreateCAbiFunctionThunk(const FunctionSymbol& 
         std::vector<llvm::Value*> loweredArgs;
         unsigned sourceArg = 0;
         llvm::AllocaInst* sretSlot = nullptr;
-        const AbiRecipe& recipe = symbol.Recipe;
+        llvm::Value* incomingSret = nullptr;
         if (recipe.retSlot.kind == AbiSlot::SRetReturn)
         {
-            sretSlot = b.CreateAlloca(recipe.retSlot.structTy, nullptr, "sret");
-            loweredArgs.push_back(sretSlot);
+            if (cxxSretReturn)
+            {
+                const unsigned sretIndex = SRetArgIndex(recipe);
+                incomingSret = thunk->getArg(sretIndex);
+                if (sretIndex == 0) ++sourceArg;
+            }
+            else
+            {
+                sretSlot = b.CreateAlloca(recipe.retSlot.structTy, nullptr, "sret");
+                loweredArgs.push_back(sretSlot);
+            }
         }
 
         for (size_t i = 0; i < recipe.paramSlots.size(); ++i)
         {
+            if (cxxSretReturn && i == 1 && SRetArgIndex(recipe) == 1) ++sourceArg;
             llvm::Value* value = thunk->getArg(sourceArg++);
             if (i < params.size() && ParameterCarriesRawArrayCount(params[i])) ++sourceArg;
             const AbiSlot& slot = recipe.paramSlots[i];
@@ -882,9 +951,14 @@ llvm::Function* LLVMBackend::GetOrCreateCAbiFunctionThunk(const FunctionSymbol& 
             }
         }
 
+        if (cxxSretReturn)
+            loweredArgs.insert(loweredArgs.begin() + SRetArgIndex(recipe), incomingSret);
+
         auto* call = b.CreateCall(symbol.Function->getFunctionType(), symbol.Function, loweredArgs);
         ApplyAbiCallAttributes(call, recipe);
-        if (recipe.retSlot.kind == AbiSlot::Direct)
+        if (cxxSretReturn)
+            b.CreateRetVoid();
+        else if (recipe.retSlot.kind == AbiSlot::Direct)
             b.CreateRet(call);
         else if (sretSlot != nullptr)
             b.CreateRet(b.CreateLoad(recipe.retSlot.structTy, sretSlot));
@@ -937,8 +1011,15 @@ llvm::Function* LLVMBackend::GetOrCreateReverseAbiFunctionThunk(
         naturalArgs.reserve(plan.params.size());
         unsigned loweredIndex = 0;
         llvm::Value* sret = nullptr;
+        const bool cxxSretReturn = plan.recipe.retSlot.kind == AbiSlot::SRetReturn
+            && !plan.ret.Pointer && !plan.ret.IsAlias
+            && IsForeignNontrivialCxxReturnClass(plan.ret.TypeName);
         if (plan.recipe.retSlot.kind == AbiSlot::SRetReturn)
-            sret = thunk->getArg(loweredIndex++);
+        {
+            const unsigned sretIndex = SRetArgIndex(plan.recipe);
+            sret = thunk->getArg(sretIndex);
+            if (sretIndex == 0) ++loweredIndex;
+        }
 
         auto abiPieces = [&](const AbiSlot& slot) {
             std::vector<std::pair<llvm::Type*, uint64_t>> pieces;
@@ -962,6 +1043,7 @@ llvm::Function* LLVMBackend::GetOrCreateReverseAbiFunctionThunk(
 
         for (size_t i = 0; i < plan.params.size(); ++i)
         {
+            if (cxxSretReturn && i == 1 && SRetArgIndex(plan.recipe) == 1) ++loweredIndex;
             const AbiSlot& slot = plan.recipe.paramSlots[i];
             if (slot.kind == AbiSlot::Ignore)
             {
@@ -994,37 +1076,49 @@ llvm::Function* LLVMBackend::GetOrCreateReverseAbiFunctionThunk(
             naturalArgs.push_back(value);
         }
 
-        auto* naturalTy = GetFunctionType(plan.ret, plan.params, false, false);
-        auto* call = b.CreateCall(naturalTy, original, naturalArgs);
-        if (plan.recipe.retSlot.kind == AbiSlot::SRetReturn)
+        if (cxxSretReturn)
         {
-            b.CreateStore(call, sret);
+            naturalArgs.insert(naturalArgs.begin() + SRetArgIndex(plan.recipe), sret);
+            auto* call = b.CreateCall(original->getFunctionType(), original, naturalArgs);
+            ApplyAbiCallAttributes(call, plan.recipe);
             b.CreateRetVoid();
         }
-        else if (plan.recipe.retSlot.kind == AbiSlot::Direct)
-            b.CreateRet(call);
         else
         {
-            const auto& slot = plan.recipe.retSlot;
-            auto pieces = abiPieces(slot);
-            llvm::Type* holderTy = slot.coerceTy;
-            if (slot.kind == AbiSlot::CoercePair)
-                holderTy = slot.structTy;
-            else if (slot.kind == AbiSlot::CoerceFlat)
-                holderTy = slot.coerceStructTy;
-            auto* storage = AllocaForCoerce(slot.structTy, holderTy,
-                                             slot.align, "callback.ret");
-            b.CreateStore(call, storage);
-            if (slot.kind == AbiSlot::CoerceToInt)
-                b.CreateRet(LoadCoerceAt(storage, pieces.front().first, pieces.front().second));
+            auto* naturalTy = GetFunctionType(plan.ret, plan.params, false, false);
+            auto* call = b.CreateCall(naturalTy, original, naturalArgs);
+            if (plan.recipe.retSlot.kind == AbiSlot::SRetReturn)
+            {
+                b.CreateStore(call, sret);
+                b.CreateRetVoid();
+                builder->restoreIP(savedIP);
+                return thunk;
+            }
+            if (plan.recipe.retSlot.kind == AbiSlot::Direct)
+                b.CreateRet(call);
             else
             {
-                llvm::Value* result = llvm::UndefValue::get(loweredTy->getReturnType());
-                for (size_t i = 0; i < pieces.size(); ++i)
-                    result = b.CreateInsertValue(result,
-                        LoadCoerceAt(storage, pieces[i].first, pieces[i].second),
-                        { static_cast<unsigned>(i) });
-                b.CreateRet(result);
+                const auto& slot = plan.recipe.retSlot;
+                auto pieces = abiPieces(slot);
+                llvm::Type* holderTy = slot.coerceTy;
+                if (slot.kind == AbiSlot::CoercePair)
+                    holderTy = slot.structTy;
+                else if (slot.kind == AbiSlot::CoerceFlat)
+                    holderTy = slot.coerceStructTy;
+                auto* storage = AllocaForCoerce(slot.structTy, holderTy,
+                                                 slot.align, "callback.ret");
+                b.CreateStore(call, storage);
+                if (slot.kind == AbiSlot::CoerceToInt)
+                    b.CreateRet(LoadCoerceAt(storage, pieces.front().first, pieces.front().second));
+                else
+                {
+                    llvm::Value* result = llvm::UndefValue::get(loweredTy->getReturnType());
+                    for (size_t i = 0; i < pieces.size(); ++i)
+                        result = b.CreateInsertValue(result,
+                            LoadCoerceAt(storage, pieces[i].first, pieces[i].second),
+                            { static_cast<unsigned>(i) });
+                    b.CreateRet(result);
+                }
             }
         }
         builder->restoreIP(savedIP);
@@ -1039,14 +1133,39 @@ llvm::Value* LLVMBackend::WrapCFuncPtrAsFatStruct(llvm::Value* cFnPtrValue, cons
         for (const auto& p : fpTV.FuncPtrParams)
         {
             TypeAndValue pTV; pTV.TypeName = p.TypeName; pTV.Pointer = p.Pointer;
+            pTV.IsMove = p.IsMove;
             paramTypes.push_back(GetType(pTV));
+            if (ParameterCarriesRawArrayCount(pTV))
+                paramTypes.push_back(builder->getInt64Ty());
         }
         TypeAndValue retTV;
         retTV.TypeName = fpTV.FuncPtrReturnTypeName;
         retTV.Pointer  = fpTV.FuncPtrReturnPointer;
-        auto* cFnTy = llvm::FunctionType::get(GetType(retTV), paramTypes, false);
+        retTV.IsMove   = fpTV.FuncPtrReturnOwned;
+        retTV.IsAlias  = fpTV.FuncPtrReturnAlias;
+        llvm::Type* returnType = GetType(retTV);
+        if (!retTV.Pointer && !retTV.IsAlias
+            && IsForeignNontrivialCxxReturnClass(retTV.TypeName))
+        {
+            auto* structTy = GetType(retTV);
+            if (structTy != nullptr && structTy->isStructTy())
+            {
+                paramTypes.insert(paramTypes.begin(), cflat_llvm::PointerTo(structTy));
+                returnType = builder->getVoidTy();
+            }
+        }
+        if (ReturnCarriesRawArrayCount(retTV))
+            paramTypes.push_back(cflat_llvm::PointerTo(builder->getInt64Ty()));
+        TypeAndValue cxxRecipeRet;
+        std::vector<TypeAndValue> cxxRecipeParams;
+        UnpackFuncPtrSignature(fpTV, cxxRecipeRet, cxxRecipeParams);
+        AbiRecipe cxxSretRecipe = ComputeCxxReturnAbiRecipe(cxxRecipeRet, cxxRecipeParams);
+        auto* cFnTy = llvm::FunctionType::get(returnType, paramTypes, false);
 
-        auto* thunk    = GetOrCreateCFuncPtrThunk(cFnTy);
+        auto* thunk    = GetOrCreateCFuncPtrThunk(cFnTy,
+                                                  cxxSretRecipe.retSlot.kind == AbiSlot::SRetReturn
+                                                      ? &cxxSretRecipe : nullptr,
+                                                  ReturnCarriesRawArrayCount(retTV));
         auto* thunkI8  = builder->CreateBitCast(thunk, i8PtrTy, "thunk_i8");
         auto* envI8    = builder->CreateBitCast(cFnPtrValue, i8PtrTy, "cfnret_i8");
         auto* closureTy = GetClosureFatPtrType();

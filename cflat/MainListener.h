@@ -2314,6 +2314,90 @@ inline Ctx* AsRuleCtx(antlr4::tree::ParseTree* node)
     return rule->getRuleIndex() == RuleIndexOf<Ctx>::value ? static_cast<Ctx*>(rule) : nullptr;
 }
 
+// A foreign C++ by-value parameter is a real object in the callee. Moving from it is safe only
+// when this bare occurrence is its final proven use. The scan is deliberately conservative:
+// every other occurrence after the site, a nested lambda use, or a loop use keeps the copy.
+// Unknown or deleted copy constructors also keep the established copy diagnostic.
+inline bool IsLastUseOfForeignCxxParam(
+    const LLVMBackend* compiler, antlr4::ParserRuleContext* useCtx,
+    const LLVMBackend::NamedVariable& source)
+{
+    if (compiler == nullptr || useCtx == nullptr || source.FieldName.size() != 0
+        || source.TypeAndValue.Pointer || source.TypeAndValue.IsAlias
+        || compiler->IsCoreUniqueType(source.TypeAndValue.TypeName)
+        || !compiler->IsForeignNontrivialCxxClass(source.TypeAndValue.TypeName))
+        return false;
+    if (const auto* info = compiler->GetCxxClassInfo(source.TypeAndValue.TypeName);
+        info == nullptr || !info->hasCopyCtor || info->hasDeletedCopyCtor)
+        return false;
+    const std::string name = source.CallerName.empty()
+        ? source.TypeAndValue.VariableName : source.CallerName;
+    if (name.empty() || !compiler->IsFunctionParameter(name) || useCtx->getText() != name)
+        return false;
+
+    CFlatParser::FunctionDefinitionContext* function = nullptr;
+    for (antlr4::tree::ParseTree* node = useCtx; node != nullptr; node = node->parent)
+    {
+        if (dynamic_cast<CFlatParser::LambdaExpressionContext*>(node) != nullptr)
+            return false;
+        if (auto* fn = dynamic_cast<CFlatParser::FunctionDefinitionContext*>(node))
+        {
+            function = fn;
+            break;
+        }
+    }
+    antlr4::tree::ParseTree* body = function != nullptr
+        ? static_cast<antlr4::tree::ParseTree*>(function->compoundStatement()) : nullptr;
+    if (body == nullptr) return false;
+
+    struct Occurrence
+    {
+        size_t token = 0;
+        bool inLoop = false;
+        bool inNestedLambda = false;
+    };
+    std::vector<Occurrence> occurrences;
+    auto collect = [&](auto&& self, antlr4::tree::ParseTree* node) -> void {
+        if (node == nullptr) return;
+        if (auto* primary = dynamic_cast<CFlatParser::PrimaryExpressionContext*>(node))
+        {
+            if (primary->genericIdentifier() != nullptr && primary->getText() == name)
+            {
+                bool inLoop = false;
+                bool inNestedLambda = false;
+                for (auto* parent = primary->parent; parent != nullptr && parent != body;
+                     parent = parent->parent)
+                {
+                    if (dynamic_cast<CFlatParser::IterationStatementContext*>(parent) != nullptr)
+                        inLoop = true;
+                    if (dynamic_cast<CFlatParser::LambdaExpressionContext*>(parent) != nullptr)
+                        inNestedLambda = true;
+                }
+                occurrences.push_back({ (size_t)primary->getStart()->getTokenIndex(),
+                                        inLoop, inNestedLambda });
+            }
+            return;
+        }
+        for (auto* child : node->children) self(self, child);
+    };
+    collect(collect, body);
+
+    const size_t useToken = (size_t)useCtx->getStart()->getTokenIndex();
+    bool found = false;
+    for (const auto& occurrence : occurrences)
+    {
+        if (occurrence.token == useToken && !found)
+        {
+            found = true;
+            if (occurrence.inLoop || occurrence.inNestedLambda) return false;
+            continue;
+        }
+        if (occurrence.inNestedLambda) return false;
+        if (occurrence.token > useToken) return false;
+    }
+    return found;
+}
+
 // Collect the 'return <expr>;' expressions a function body owns itself. A nested lambda's
 // returns belong to the lambda, so its subtree is skipped.
 static void CollectOwnReturnExpressions(antlr4::tree::ParseTree* node,
@@ -2604,6 +2688,17 @@ inline void CollectConsumedStoreNames(antlr4::tree::ParseTree* node, std::unorde
         if (asn->assignmentOperator() != nullptr && asn->assignmentOperator()->getText() == "="
             && asn->assignmentExpression() != nullptr)
             RecordConsumeSourceName(asn->assignmentExpression(), out, wrapped);
+    // `construct_at(slot, value)` is the explicit raw-slot spelling of the same native
+    // owning sink as `_data[i] = value`; its second argument must participate in inference.
+    if (auto* call = dynamic_cast<CFlatParser::PostfixExpressionContext*>(node))
+        if (call->primaryExpression() != nullptr
+            && call->primaryExpression()->getText() == "construct_at"
+            && call->argumentExpressionList().size() == 1)
+        {
+            auto args = call->argumentExpressionList(0)->argumentNamedExpression();
+            if (args.size() == 2 && args[1]->assignmentExpression() != nullptr)
+                RecordConsumeSourceName(args[1]->assignmentExpression(), out, wrapped);
+        }
     if (auto* init = AsRuleCtx<CFlatParser::InitDeclaratorContext>(node))
     {
         if (auto* iz = init->initializer(); iz != nullptr)
@@ -5793,6 +5888,25 @@ public:
         const std::string& typeName,
         const std::string& fieldName,
         LLVMBackend::NamedVariable& rightNV,
+        const LLVMBackend::OwnedTempMark& ownedTempMark,
+        antlr4::ParserRuleContext* errCtx);
+
+    // Construct one foreign nontrivial C++ value into a fresh or replacement slot. This is
+    // shared by scalar struct fields and fixed-array elements so their copy/move decisions agree.
+    bool EmitForeignCxxValueIntoSlot(
+        const LLVMBackend::TypeAndValue& destType,
+        llvm::Value* destination,
+        LLVMBackend::NamedVariable& sourceNV,
+        llvm::Value* sourceValue,
+        const LLVMBackend::OwnedTempMark& ownedTempMark,
+        const char* context,
+        antlr4::ParserRuleContext* errCtx);
+    void DestroyForeignCxxRelocationSource(const LLVMBackend::NamedVariable& sourceNV);
+    bool EmitForeignCxxFixedArrayIntoSlot(
+        const LLVMBackend::DeclTypeAndValue& field,
+        llvm::Value* destination,
+        llvm::Value* sourceSlot,
+        const char* context,
         antlr4::ParserRuleContext* errCtx);
 
     /*
@@ -5884,6 +5998,12 @@ public:
         const LLVMBackend::DeclTypeAndValue& field,
         CFlatParser::InitializerListContext* list);
 
+    // Build field initialization for a native constructor without a user ctor body.
+    llvm::Value* EmitAggregateFieldInitialization(
+        const std::string& structName,
+        llvm::StructType*& structType,
+        std::vector<LLVMBackend::DeclTypeAndValue>& fields);
+
     /*
      * The fixed-array arm of the above. The list is POSITIONAL, so the value has to be built
      * as an '[N x T]' aggregate for the CreateInsertValue into the containing struct - the
@@ -5894,7 +6014,8 @@ public:
     llvm::Value* EmitFieldDefaultFixedArrayBrace(
         const std::string& structName,
         const LLVMBackend::DeclTypeAndValue& field,
-        CFlatParser::InitializerListContext* list);
+        CFlatParser::InitializerListContext* list,
+        llvm::Value** outSlot = nullptr);
 
     // Per-slot value-init of an array whose element type owns a resource: construct each slot
     // independently and re-apply the named overrides there, instead of splatting one seed.
@@ -6666,7 +6787,8 @@ public:
         const std::vector<std::string>& typeArgs);
 
     void ParseConstructorDefinition(CFlatParser::FunctionDefinitionContext* func, const std::string& structName,
-                                    bool suppliesNoArgCtor = false, size_t cppCtorIndex = SIZE_MAX);
+                                    bool suppliesNoArgCtor = false, size_t cppCtorIndex = SIZE_MAX,
+                                    bool hasExplicitNoArgCtor = false);
     void EmitCppStructConstructorThunk(antlr4::ParserRuleContext* ctx,
                                        CFlatParser::BlockItemListContext* body,
                                        const std::string& structName,

@@ -394,6 +394,10 @@ s.num1 = 10;
 int t = s.Total();   // 12
 ```
 
+Every constructor runs the field-initialization phase first. `MyStruct()` then runs the user
+no-argument body, while `MyStruct(args)` runs only its own body; it does not delegate to the
+user no-argument constructor. Use a direct `MyStruct()` call when that body is wanted.
+
 ### Unions
 
 Unions use C++-style raw storage: they have no hidden active-member tag and their size is
@@ -1964,6 +1968,12 @@ the method is actually called (not merely instantiated), which is what lets
 `list<unique T*>.copy()` exist in source without breaking every unique-list
 instantiation that never calls `.copy()`.
 
+#### `construct_at(T* slot, value)`
+
+`construct_at` initializes one raw, uninitialized slot. An lvalue value is copy-constructed;
+`move value` and prvalues are move-constructed. The builtin is for raw storage only; `=` always
+assigns to an already-live object. `construct_at` is reserved and cannot be redeclared.
+
 ### Ownership at Global and `static` Scope
 
 Storage whose lifetime outlives the frame - a file-scope global, or a `static` local -
@@ -2813,7 +2823,7 @@ named brace initializers (`field = { ... }`) are ordinary brace initialization a
 
 ## Range-Based For
 
-Iterate over any type that provides `count()` and `get(int)` methods (including `list<T>`, `array<T>`), or directly over C-style fixed arrays:
+Iterate over any type that provides `count()` and `get(int)` methods (including `list<T>`, `array<T>`), over an imported C++ class with callable `begin()` and `end()`, or directly over C-style fixed arrays:
 
 ```c
 import "list.cb";
@@ -3210,7 +3220,7 @@ Note: `program` remains required at the start of a managed-entry-point definitio
 
 **Reserved compiler intrinsics** (built-in pseudo-functions - cannot be redefined):
 
-`annotationof`, `embed`, `expect_error`, `is_pointer`, `json_const`, `nameof`,
+`annotationof`, `construct_at`, `embed`, `expect_error`, `is_pointer`, `json_const`, `nameof`,
 `reflect`, `reflect_set`, `sizeof`, `typeof`, `xml_const`
 
 **Compiler-recognized methods** (not reserved - you define them on a type, the

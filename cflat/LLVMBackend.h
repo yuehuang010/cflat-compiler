@@ -1425,6 +1425,9 @@ public:
         // True only for a value-producing expression. Named variables, fields, elements, aliases,
         // and dereferences remain lvalues even when their LLVM value has no storage of its own.
         bool IsRvalue = false;
+        // Set by the front-end when this expression is the last proven use of a foreign C++
+        // by-value parameter. Transient call-site metadata; never cache-serialized.
+        bool CxxParamLastUse = false;
         // Non-null when Primary is the POINTER a C++ operator returned for a `T&` result: the
         // referenced value type, carried through a parenthesized sub-expression.
         llvm::Type* CxxRefValueType = nullptr;
@@ -4815,7 +4818,7 @@ private:
 
     int GetOrMintViewScope(const std::string& originKey);
 
-    void createFunctionBlock(llvm::Function* fn, const std::string& friendlyName, std::vector<LLVMBackend::TypeAndValue> arguments, bool returnsOwned = false, bool returnIsArrayView = false, const std::string& returnTypeName = "", const AbiRecipe* abiRecipe = nullptr);
+    void createFunctionBlock(llvm::Function* fn, const std::string& friendlyName, std::vector<LLVMBackend::TypeAndValue> arguments, bool returnsOwned = false, bool returnIsArrayView = false, const std::string& returnTypeName = "", const AbiRecipe* abiRecipe = nullptr, bool preserveCFlatLowerings = false);
 
     llvm::DIType* GetDIType(const TypeAndValue& tv);
 
@@ -4980,6 +4983,7 @@ private:
 
     bool HasNonTrivialDestructor(const std::string& typeName);
     bool IsOwningValueType(const std::string& typeName);
+    bool HasForeignNontrivialCxxField(const std::string& typeName) const;
 
     // True when the array-view element described by `elemField` owns nothing, so bit-copying it
     // (the get/set noalias fast path) is safe: no string, no owning-dtor struct/closure, no
@@ -6130,7 +6134,9 @@ public:
 
     // Wraps a bare C function pointer as a closure {thunk, env=cfnptr}. The env slot carries
     // the real C fn ptr; the thunk reads env back, bitcasts to C signature, and tail-calls through it.
-    llvm::Function* GetOrCreateCFuncPtrThunk(llvm::FunctionType* cFnTy);
+    llvm::Function* GetOrCreateCFuncPtrThunk(llvm::FunctionType* cFnTy,
+                                             const AbiRecipe* abiRecipe = nullptr,
+                                             bool returnCarriesRawArrayCount = false);
 
     // Adapt an extern function's lowered C ABI to the natural CFlat function-pointer ABI.
     llvm::Function* GetOrCreateCAbiFunctionThunk(const FunctionSymbol& symbol,
@@ -7564,6 +7570,11 @@ public:
     AbiRecipe ComputeAbiRecipe(const TypeAndValue& retType,
                                const std::vector<TypeAndValue>& params);
 
+    // A CFlat definition returning a nontrivial foreign C++ class uses the same indirect
+    // return slot as the C++ declaration path, while keeping CFlat parameters on their ABI.
+    AbiRecipe ComputeCxxReturnAbiRecipe(const TypeAndValue& retType,
+                                         const std::vector<TypeAndValue>& params);
+
     // Parse the LLVM IR type TEXT clang serialized into a RawAbiSlot ("i64", "[2 x i64]",
     // "{ i64, i32 }", "<2 x float>", "float", "ptr"). Returns nullptr on anything outside that
     // grammar - the caller turns that into a LogError rather than guessing.
@@ -7862,6 +7873,13 @@ public:
     {
         return cxxNontrivialRecords_.count(typeName) != 0;
     }
+    bool IsForeignNontrivialCxxReturnClass(const std::string& typeName) const
+    {
+        // CFlat-defined [cpp] structs have generated C++ special members but keep their existing
+        // direct CFlat ABI; only imported classes need the foreign sret convention here.
+        return IsForeignNontrivialCxxClass(typeName)
+            && generatedCxxRecords_.count(typeName) == 0;
+    }
     bool IsForeignCxxClassWithConstructors(const std::string& typeName) const
     {
         if (typeName.starts_with("std.pair$")) return false;
@@ -8055,6 +8073,8 @@ public:
      */
     llvm::Value* pendingCxxSretDest_ = nullptr;
     std::string pendingCxxSretTypeName_;
+    bool pendingCxxSretForFixedArray_ = false;
+    bool pendingCxxSretReturn_ = false;
     // A C++ class declaration whose RHS is a ternary claims this separately: each arm must
     // move-construct the declaration slot from its own return temporary before the join.
     llvm::Value* pendingCxxTernaryDeclDest_ = nullptr;
@@ -8102,6 +8122,12 @@ public:
                                                 const std::vector<TypeAndValue>& params,
                                                 bool varargs,
                                                 const AbiRecipe& recipe);
+
+    // Build a normal CFlat function type with only the foreign-class sret slot added.
+    llvm::FunctionType* BuildCFlatSRetFunctionType(const TypeAndValue& retType,
+                                                   const std::vector<TypeAndValue>& params,
+                                                   bool varargs,
+                                                   const AbiRecipe& recipe);
 
     // Attach byval / sret / alignment attributes on the function declaration per the recipe.
     // These are LLVM-level hints required for correct ABI lowering (the x86/x64 backend
@@ -9145,7 +9171,8 @@ public:
     llvm::Value* EmitAbiLoweredCall(const FunctionSymbol& candidate, std::vector<llvm::Value*>& argList,
                                     llvm::Value* sretDest = nullptr,
                                     const std::vector<llvm::Value*>* indirectArgAddrs = nullptr,
-                                    llvm::Value* calleeOverride = nullptr);
+                                    llvm::Value* calleeOverride = nullptr,
+                                    const std::vector<llvm::Value*>* rawArrayCounts = nullptr);
     // A pointer to a C++ class binds to a parameter/slot of a PUBLIC base of that class, with the
     // base subobject offset added. Non-public bases are refused at the conversion site.
     // A C++ class VALUE slices to a by-value/by-reference parameter of a PUBLIC base of it.

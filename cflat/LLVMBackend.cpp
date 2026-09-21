@@ -4614,6 +4614,8 @@ void LLVMBackend::ResetForReanalysis()
     // would then construct into storage from a discarded module.
     pendingCxxSretDest_ = nullptr;
     pendingCxxSretTypeName_.clear();
+    pendingCxxSretForFixedArray_ = false;
+    pendingCxxSretReturn_ = false;
     pendingCxxTernaryDeclDest_ = nullptr;
     pendingCxxTernaryDeclTypeName_.clear();
     pendingCxxTernaryDeclConsumed_ = false;
@@ -7755,6 +7757,11 @@ bool LLVMBackend::LoadCoreBitcodeIfFresh(const std::string& cacheDir, const std:
                     continue;
                 }
                 auto recipe = ComputeAbiRecipe(sym.ReturnType, sym.Parameters);
+                if (recipe.hasLowering) sym.Recipe = std::move(recipe);
+            }
+            else
+            {
+                auto recipe = ComputeCxxReturnAbiRecipe(sym.ReturnType, sym.Parameters);
                 if (recipe.hasLowering) sym.Recipe = std::move(recipe);
             }
 

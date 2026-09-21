@@ -1,0 +1,16 @@
+import cpp "memory";
+
+expect_error("cannot copy C++ class 'std.unique_ptr$int' in synthesized struct copy") {
+    struct CppStructCopyMoveOnly
+    {
+        std.unique_ptr<int> value = default;
+    };
+
+    extern int main()
+    {
+        CppStructCopyMoveOnly source = default;
+        source.value.reset(new int(7));
+        CppStructCopyMoveOnly copy = source;
+        return copy.value.get() == nullptr ? 0 : 1;
+    }
+}

@@ -534,33 +534,124 @@ llvm::Value* LLVMBackend::CreateIndirectCall(const TypeAndValue& funcPtrType, ll
                                              const std::vector<llvm::Value*>* rawArrayCounts)
 {
         auto* i8PtrTy = cflat_llvm::PointerTo(builder->getInt8Ty());
+        lastCxxRetTemp_ = nullptr;
+        lastCxxRetValue_ = nullptr;
+        auto prepareCxxSret = [&](const TypeAndValue& retTV)
+            -> std::pair<llvm::Type*, llvm::Value*> {
+            if (retTV.Pointer || retTV.IsAlias
+                || !IsForeignNontrivialCxxReturnClass(retTV.TypeName))
+                return { nullptr, nullptr };
+            auto* structTy = GetType(retTV);
+            if (structTy == nullptr || !structTy->isStructTy()) return { nullptr, nullptr };
+            llvm::Value* dest = nullptr;
+            if (pendingCxxSretDest_ != nullptr && pendingCxxSretTypeName_ == retTV.TypeName)
+            {
+                dest = pendingCxxSretDest_;
+                pendingCxxSretDest_ = nullptr;
+                pendingCxxSretTypeName_.clear();
+            }
+            else
+            {
+                const uint64_t align = module->getDataLayout().getABITypeAlign(structTy).value();
+                dest = AllocaAtEntry(structTy, nullptr, "cxx.indirect.rettemp", align);
+                RegisterOwnedStructTemp(dest, retTV.TypeName);
+                lastCxxRetTemp_ = dest;
+            }
+            return { structTy, dest };
+        };
+        TypeAndValue cxxRecipeRet;
+        std::vector<TypeAndValue> cxxRecipeParams;
+        UnpackFuncPtrSignature(funcPtrType, cxxRecipeRet, cxxRecipeParams);
+        const AbiRecipe cxxIndirectRecipe = ComputeCxxReturnAbiRecipe(
+            cxxRecipeRet, cxxRecipeParams);
+        auto materializeCxxIndirectArgs = [&](const std::vector<TypeAndValue::FuncPtrParam>& params,
+                                              std::vector<llvm::Value*>& prepared) {
+            if (cxxIndirectRecipe.paramSlots.size() < params.size()) return;
+            for (size_t i = 0; i < params.size(); ++i)
+            {
+                const auto& slot = cxxIndirectRecipe.paramSlots[i];
+                if (slot.kind != AbiSlot::ByVal) continue;
+                if (argNVs == nullptr || i >= argNVs->size() || (*argNVs)[i].Storage == nullptr)
+                {
+                    LogError(std::format(
+                        "cannot pass C++ class '{}' through a function value: the argument must "
+                        "have addressable storage so its copy or move constructor can run",
+                        params[i].TypeName));
+                    continue;
+                }
+                auto* temp = AllocaAtEntry(slot.structTy, nullptr, "cxx.indirect.argtemp", slot.align);
+                const bool useMove = params[i].IsMove || (*argNVs)[i].IsExplicitMove
+                    || (*argNVs)[i].CxxParamLastUse || (*argNVs)[i].IsRvalue;
+                if (!EmitCxxCopyOrMoveConstruct(params[i].TypeName, temp,
+                                                (*argNVs)[i].Storage, useMove,
+                                                "into a by-value function parameter"))
+                    continue;
+                if (!IsCxxParamDestroyedInCallee(params[i].TypeName))
+                    RegisterOwnedStructTemp(temp, params[i].TypeName);
+                if ((*argNVs)[i].CxxParamLastUse && !(*argNVs)[i].IsElementAccess
+                    && (*argNVs)[i].FieldName.empty())
+                {
+                    const std::string sourceName = (*argNVs)[i].CallerName.empty()
+                        ? (*argNVs)[i].TypeAndValue.VariableName : (*argNVs)[i].CallerName;
+                    MarkVariableMoved(sourceName);
+                }
+                if (prepared.size() < params.size()) prepared.resize(params.size(), nullptr);
+                prepared[i] = temp;
+            }
+        };
 
         // Thin `function<T>`: a bare C function pointer. Direct call, no env, exact C signature.
         if (funcPtrType.IsThinFnPtr())
         {
-            std::vector<llvm::Type*> paramTypes;
-            for (const auto& p : funcPtrType.FuncPtrParams)
-            {
-                TypeAndValue pTV; pTV.TypeName = p.TypeName; pTV.Pointer = p.Pointer; pTV.IsMove = p.IsMove;
-                paramTypes.push_back(GetType(pTV));
-                if (ParameterCarriesRawArrayCount(pTV))
-                    paramTypes.push_back(builder->getInt64Ty());
-            }
             TypeAndValue retTV;
             retTV.TypeName = funcPtrType.FuncPtrReturnTypeName;
             retTV.Pointer  = funcPtrType.FuncPtrReturnPointer;
             retTV.IsMove   = funcPtrType.FuncPtrReturnOwned;
             retTV.IsAlias  = funcPtrType.FuncPtrReturnAlias;
+            auto cxxSret = prepareCxxSret(retTV);
+            const bool cxxSretReturn = cxxSret.first != nullptr;
+            AbiRecipe cxxSretRecipe = cxxIndirectRecipe;
+            std::vector<llvm::Type*> paramTypes;
+            if (cxxSretReturn) paramTypes.push_back(cflat_llvm::PointerTo(cxxSret.first));
+            for (const auto& p : funcPtrType.FuncPtrParams)
+            {
+                TypeAndValue pTV; pTV.TypeName = p.TypeName; pTV.Pointer = p.Pointer; pTV.IsMove = p.IsMove;
+                paramTypes.push_back(!p.Pointer && IsForeignNontrivialCxxClass(p.TypeName)
+                    ? cflat_llvm::PointerTo(GetType(pTV)) : GetType(pTV));
+                if (ParameterCarriesRawArrayCount(pTV))
+                    paramTypes.push_back(builder->getInt64Ty());
+            }
             if (ReturnCarriesRawArrayCount(retTV))
                 paramTypes.push_back(cflat_llvm::PointerTo(builder->getInt64Ty()));
-            auto* retTy   = GetFunctionReturnABIType(retTV);
+            auto* retTy   = cxxSretReturn ? builder->getVoidTy() : GetFunctionReturnABIType(retTV);
             auto* cFnTy   = llvm::FunctionType::get(retTy, paramTypes, false);
             auto* fnPtr   = builder->CreateBitCast(funcPtr, cflat_llvm::PointerTo(cFnTy), "cfn_ptr");
             std::vector<llvm::Value*> abiArgs;
-            size_t typeIndex = 0;
+            if (cxxSretReturn) abiArgs.push_back(cxxSret.second);
+            std::vector<llvm::Value*> cxxIndirectArgs;
+            materializeCxxIndirectArgs(funcPtrType.FuncPtrParams, cxxIndirectArgs);
+            size_t typeIndex = cxxSretReturn ? 1 : 0;
             for (size_t i = 0; i < args.size() && i < funcPtrType.FuncPtrParams.size(); i++)
             {
                 auto* destTy = paramTypes[typeIndex++];
+                if (i < cxxIndirectArgs.size() && cxxIndirectArgs[i] != nullptr)
+                {
+                    abiArgs.push_back(cxxIndirectArgs[i]);
+                    TypeAndValue pTV;
+                    pTV.TypeName = funcPtrType.FuncPtrParams[i].TypeName;
+                    pTV.Pointer = funcPtrType.FuncPtrParams[i].Pointer;
+                    pTV.IsMove = funcPtrType.FuncPtrParams[i].IsMove;
+                    if (ParameterCarriesRawArrayCount(pTV))
+                    {
+                        llvm::Value* count = rawArrayCounts != nullptr && i < rawArrayCounts->size()
+                            ? (*rawArrayCounts)[i] : nullptr;
+                        if (count == nullptr && argNVs != nullptr && i < argNVs->size())
+                            count = RawArrayCountArgument((*argNVs)[i]);
+                        abiArgs.push_back(count != nullptr ? count : builder->getInt64(-1));
+                        ++typeIndex;
+                    }
+                    continue;
+                }
                 auto* strTy  = llvm::StructType::getTypeByName(*context, "string");
                 if (strTy && destTy == strTy && args[i]->getType()->isPointerTy())
                     args[i] = WrapStringLiteralAsString(args[i]);
@@ -594,7 +685,12 @@ llvm::Value* LLVMBackend::CreateIndirectCall(const TypeAndValue& funcPtrType, ll
             }
             lastCallReturnType = retTV;
             auto* result = builder->CreateCall(cFnTy, fnPtr, abiArgs);
-            llvm::Value* value = retTy->isVoidTy() ? nullptr : result;
+            if (cxxSretRecipe.hasLowering)
+                ApplyAbiCallAttributes(result, cxxSretRecipe);
+            llvm::Value* value = cxxSretReturn
+                ? static_cast<llvm::Value*>(builder->CreateLoad(cxxSret.first, cxxSret.second))
+                : (retTy->isVoidTy() ? nullptr : result);
+            if (cxxSretReturn) lastCxxRetValue_ = value;
             RegisterRawArrayCallResult(value, rawReturnCountSlot);
             return value;
         }
@@ -616,7 +712,8 @@ llvm::Value* LLVMBackend::CreateIndirectCall(const TypeAndValue& funcPtrType, ll
         for (const auto& p : funcPtrType.FuncPtrParams)
         {
             TypeAndValue pTV; pTV.TypeName = p.TypeName; pTV.Pointer = p.Pointer; pTV.IsMove = p.IsMove;
-            paramTypes.push_back(GetType(pTV));
+            paramTypes.push_back(!p.Pointer && IsForeignNontrivialCxxClass(p.TypeName)
+                ? cflat_llvm::PointerTo(GetType(pTV)) : GetType(pTV));
             if (ParameterCarriesRawArrayCount(pTV))
                 paramTypes.push_back(builder->getInt64Ty());
         }
@@ -626,9 +723,14 @@ llvm::Value* LLVMBackend::CreateIndirectCall(const TypeAndValue& funcPtrType, ll
         retTV.Pointer  = funcPtrType.FuncPtrReturnPointer;
         retTV.IsMove   = funcPtrType.FuncPtrReturnOwned;
         retTV.IsAlias  = funcPtrType.FuncPtrReturnAlias;
+        auto cxxSret = prepareCxxSret(retTV);
+        const bool cxxSretReturn = cxxSret.first != nullptr;
+        AbiRecipe cxxSretRecipe = cxxIndirectRecipe;
+        if (cxxSretReturn) paramTypes.insert(paramTypes.begin(),
+            cflat_llvm::PointerTo(cxxSret.first));
         if (ReturnCarriesRawArrayCount(retTV))
             paramTypes.push_back(cflat_llvm::PointerTo(builder->getInt64Ty()));
-        auto* retTy     = GetFunctionReturnABIType(retTV);
+        auto* retTy     = cxxSretReturn ? builder->getVoidTy() : GetFunctionReturnABIType(retTV);
         auto* invokerTy = llvm::FunctionType::get(retTy, paramTypes, false);
         auto* fnPtr     = builder->CreateBitCast(fnPtrI8, cflat_llvm::PointerTo(invokerTy), "fn_ptr");
 
@@ -636,10 +738,30 @@ llvm::Value* LLVMBackend::CreateIndirectCall(const TypeAndValue& funcPtrType, ll
         // String literals arrive as i8* - wrap them into %string{ptr,len} when the
         // param expects a string value type.
         std::vector<llvm::Value*> userArgs;
-        size_t typeIndex = 0;
+        std::vector<llvm::Value*> cxxIndirectArgs;
+        materializeCxxIndirectArgs(funcPtrType.FuncPtrParams, cxxIndirectArgs);
+        size_t typeIndex = cxxSretReturn ? 1 : 0;
         for (size_t i = 0; i < args.size() && i < funcPtrType.FuncPtrParams.size(); i++)
         {
             auto* destTy = paramTypes[typeIndex++];
+            if (i < cxxIndirectArgs.size() && cxxIndirectArgs[i] != nullptr)
+            {
+                userArgs.push_back(cxxIndirectArgs[i]);
+                TypeAndValue pTV;
+                pTV.TypeName = funcPtrType.FuncPtrParams[i].TypeName;
+                pTV.Pointer = funcPtrType.FuncPtrParams[i].Pointer;
+                pTV.IsMove = funcPtrType.FuncPtrParams[i].IsMove;
+                if (ParameterCarriesRawArrayCount(pTV))
+                {
+                    llvm::Value* count = rawArrayCounts != nullptr && i < rawArrayCounts->size()
+                        ? (*rawArrayCounts)[i] : nullptr;
+                    if (count == nullptr && argNVs != nullptr && i < argNVs->size())
+                        count = RawArrayCountArgument((*argNVs)[i]);
+                    userArgs.push_back(count != nullptr ? count : builder->getInt64(-1));
+                    ++typeIndex;
+                }
+                continue;
+            }
             auto* strTy  = llvm::StructType::getTypeByName(*context, "string");
             if (strTy && destTy == strTy && args[i]->getType()->isPointerTy())
                 args[i] = WrapStringLiteralAsString(args[i]);
@@ -668,6 +790,7 @@ llvm::Value* LLVMBackend::CreateIndirectCall(const TypeAndValue& funcPtrType, ll
 
         // Append env to call args (env-last)
         std::vector<llvm::Value*> fullArgs(userArgs.begin(), userArgs.end());
+        if (cxxSretReturn) fullArgs.insert(fullArgs.begin(), cxxSret.second);
         fullArgs.push_back(envPtr);
 
         llvm::Value* rawReturnCountSlot = nullptr;
@@ -679,7 +802,12 @@ llvm::Value* LLVMBackend::CreateIndirectCall(const TypeAndValue& funcPtrType, ll
 
         lastCallReturnType = retTV;
         auto* result = builder->CreateCall(invokerTy, fnPtr, fullArgs);
-        llvm::Value* value = retTy->isVoidTy() ? nullptr : result;
+        if (cxxSretRecipe.hasLowering)
+            ApplyAbiCallAttributes(result, cxxSretRecipe);
+        llvm::Value* value = cxxSretReturn
+            ? static_cast<llvm::Value*>(builder->CreateLoad(cxxSret.first, cxxSret.second))
+            : (retTy->isVoidTy() ? nullptr : result);
+        if (cxxSretReturn) lastCxxRetValue_ = value;
         RegisterRawArrayCallResult(value, rawReturnCountSlot);
         return value;
     }
@@ -1174,6 +1302,53 @@ LLVMBackend::AbiRecipe LLVMBackend::ComputeAbiRecipe(const TypeAndValue& retType
         return recipe;
     }
 
+LLVMBackend::AbiRecipe LLVMBackend::ComputeCxxReturnAbiRecipe(
+    const TypeAndValue& retType, const std::vector<TypeAndValue>& params)
+{
+        AbiRecipe recipe;
+        const bool cxxReturn = !retType.Pointer && !retType.IsAlias
+            && IsForeignNontrivialCxxReturnClass(retType.TypeName);
+        bool cxxParam = false;
+        for (const auto& param : params)
+            if (!param.Pointer && !param.IsAlias
+                && IsForeignNontrivialCxxClass(param.TypeName))
+            {
+                cxxParam = true;
+                break;
+            }
+        if (!cxxReturn && !cxxParam)
+            return recipe;
+
+        if (cxxReturn)
+        {
+            auto it = dataStructures.find(retType.TypeName);
+            if (it == dataStructures.end() || it->second.StructType == nullptr) return {};
+            recipe.retSlot.kind = AbiSlot::SRetReturn;
+            recipe.retSlot.structTy = it->second.StructType;
+            recipe.retSlot.align = module->getDataLayout().getABITypeAlign(
+                recipe.retSlot.structTy).value();
+        }
+        recipe.paramSlots.resize(params.size());
+        for (size_t i = 0; i < params.size(); ++i)
+        {
+            const auto& param = params[i];
+            if (param.Pointer || param.IsAlias
+                || !IsForeignNontrivialCxxClass(param.TypeName))
+                continue;
+            auto it = dataStructures.find(param.TypeName);
+            if (it == dataStructures.end() || it->second.StructType == nullptr) return {};
+            auto& slot = recipe.paramSlots[i];
+            slot.kind = AbiSlot::ByVal;
+            slot.structTy = it->second.StructType;
+            slot.align = module->getDataLayout().getABITypeAlign(slot.structTy).value();
+            // A nontrivial C++ value parameter is a caller-owned object on Itanium. Keep the
+            // pointer shape, without LLVM's byval copy, so the caller's constructor runs.
+            slot.indirectByVal = false;
+        }
+        recipe.hasLowering = cxxReturn || cxxParam;
+        return recipe;
+}
+
 namespace
 {
     // Recursive-descent reader for the LLVM IR type text clang serialized. Deliberately narrow:
@@ -1492,6 +1667,41 @@ llvm::FunctionType* LLVMBackend::BuildExternFunctionType(const TypeAndValue& ret
         return llvm::FunctionType::get(loweredRet, ptypes, varargs);
     }
 
+llvm::FunctionType* LLVMBackend::BuildCFlatSRetFunctionType(
+    const TypeAndValue& retType, const std::vector<TypeAndValue>& params,
+    bool varargs, const AbiRecipe& recipe)
+    {
+        auto* natural = GetFunctionType(retType, params, varargs, false);
+        std::vector<llvm::Type*> ptypes;
+        ptypes.reserve(natural->getNumParams() + 1);
+        size_t naturalIndex = 0;
+        for (size_t i = 0; i < params.size(); ++i)
+        {
+            const AbiSlot& slot = recipe.paramSlots[i];
+            if (slot.kind == AbiSlot::ByVal)
+                ptypes.push_back(cflat_llvm::PointerTo(slot.structTy));
+            else
+                ptypes.push_back(natural->getParamType((unsigned)naturalIndex));
+            ++naturalIndex;
+            if (ParameterCarriesRawArrayCount(params[i]))
+                ptypes.push_back(natural->getParamType((unsigned)naturalIndex++));
+        }
+        const unsigned sretIndex = SRetArgIndex(recipe);
+        if (sretIndex > ptypes.size())
+        {
+            LogError("cannot build CFlat sret function type: invalid hidden return slot index");
+            return llvm::FunctionType::get(natural->getReturnType(), ptypes, varargs);
+        }
+        llvm::Type* returnType = natural->getReturnType();
+        if (recipe.retSlot.kind == AbiSlot::SRetReturn)
+        {
+            ptypes.insert(ptypes.begin() + sretIndex,
+                cflat_llvm::PointerTo(recipe.retSlot.structTy));
+            returnType = builder->getVoidTy();
+        }
+        return llvm::FunctionType::get(returnType, ptypes, varargs);
+}
+
 void LLVMBackend::ApplyAbiAttributes(llvm::Function* fn, const AbiRecipe& recipe)
 {
         unsigned attrIdx = 0; // LLVM param attribute indices are 0-based on the function's actual param list
@@ -1578,10 +1788,28 @@ void LLVMBackend::FlushPendingFunctionDeclarations()
             if (d.External)
             {
                 recipe = ComputeAbiRecipe(d.ReturnType, d.Arguments);
+                if (!d.ReturnType.Pointer && !d.ReturnType.IsAlias
+                    && IsForeignNontrivialCxxReturnClass(d.ReturnType.TypeName))
+                {
+                    auto cxxReturn = ComputeCxxReturnAbiRecipe(d.ReturnType, d.Arguments);
+                    if (cxxReturn.retSlot.kind == AbiSlot::SRetReturn)
+                    {
+                        recipe.retSlot = cxxReturn.retSlot;
+                        recipe.hasLowering = true;
+                    }
+                }
                 useRecipe = recipe.hasLowering;
             }
+            else
+            {
+                recipe = ComputeCxxReturnAbiRecipe(d.ReturnType, d.Arguments);
+                useRecipe = recipe.hasLowering;
+            }
+            const bool cflatAbiLowering = !d.External && recipe.hasLowering;
             llvm::FunctionType* wanted = useRecipe
-                ? BuildExternFunctionType(d.ReturnType, d.Arguments, d.Varargs, recipe)
+                ? (cflatAbiLowering
+                    ? BuildCFlatSRetFunctionType(d.ReturnType, d.Arguments, d.Varargs, recipe)
+                    : BuildExternFunctionType(d.ReturnType, d.Arguments, d.Varargs, recipe))
                 : GetFunctionType(d.ReturnType, d.Arguments, d.Varargs, d.External);
 
             llvm::Function* provisional = module->getFunction(d.MangledName);
@@ -1612,7 +1840,7 @@ void LLVMBackend::FlushPendingFunctionDeclarations()
                     if (sym.UniqueName == d.MangledName)
                     {
                         sym.Function = repaired;
-                        if (d.External) sym.Recipe = recipe;
+                        sym.Recipe = recipe;
                     }
         }
         flushingPendingDeclarations_ = false;
@@ -1676,12 +1904,32 @@ void LLVMBackend::CreateFunctionDeclaration(const std::string& functionName, con
         else if (external && !provisional)
         {
             recipe = ComputeAbiRecipe(returnType, arguments);
+            if (!returnType.Pointer && !returnType.IsAlias
+                && IsForeignNontrivialCxxReturnClass(returnType.TypeName))
+            {
+                auto cxxReturn = ComputeCxxReturnAbiRecipe(returnType, arguments);
+                if (cxxReturn.retSlot.kind == AbiSlot::SRetReturn)
+                {
+                    recipe.retSlot = cxxReturn.retSlot;
+                    recipe.hasLowering = true;
+                }
+            }
+            useRecipe = recipe.hasLowering;
+        }
+        else if (!external && !provisional)
+        {
+            recipe = ComputeCxxReturnAbiRecipe(returnType, arguments);
             useRecipe = recipe.hasLowering;
         }
 
-        llvm::FunctionType* functionType = useRecipe
-            ? BuildExternFunctionType(returnType, arguments, varargs, recipe)
-            : GetFunctionType(returnType, arguments, varargs, external, provisional);
+        const bool cflatAbiLowering = !external && recipe.hasLowering;
+        const bool cflatSretReturn = cflatAbiLowering
+            && recipe.retSlot.kind == AbiSlot::SRetReturn;
+        llvm::FunctionType* functionType = cflatAbiLowering
+            ? BuildCFlatSRetFunctionType(returnType, arguments, varargs, recipe)
+            : (useRecipe
+                ? BuildExternFunctionType(returnType, arguments, varargs, recipe)
+                : GetFunctionType(returnType, arguments, varargs, external, provisional));
 
         // Whole-signature cross-check against clang's own llvm::FunctionType for the callee.
         // Any difference means the lowering above does not match the real ABI - refuse rather
@@ -1898,7 +2146,10 @@ llvm::Type* LLVMBackend::BuildThinFnPtrType(const TypeAndValue& tv) const
         {
             TypeAndValue pTV; pTV.TypeName = p.TypeName; pTV.Pointer = p.Pointer;
             pTV.IsMove = p.IsMove;
-            paramTypes.push_back(SizedParamOrPlaceholder(GetType(pTV), *builder));
+            if (!p.Pointer && IsForeignNontrivialCxxClass(p.TypeName))
+                paramTypes.push_back(cflat_llvm::PointerTo(GetType(pTV)));
+            else
+                paramTypes.push_back(SizedParamOrPlaceholder(GetType(pTV), *builder));
             if (ParameterCarriesRawArrayCount(pTV))
                 paramTypes.push_back(builder->getInt64Ty());
         }
@@ -1909,7 +2160,18 @@ llvm::Type* LLVMBackend::BuildThinFnPtrType(const TypeAndValue& tv) const
         retTV.IsAlias  = tv.FuncPtrReturnAlias;
         if (ReturnCarriesRawArrayCount(retTV))
             paramTypes.push_back(cflat_llvm::PointerTo(builder->getInt64Ty()));
-        return cflat_llvm::PointerTo(llvm::FunctionType::get(GetFunctionReturnABIType(retTV), paramTypes, false));
+        llvm::Type* returnType = GetFunctionReturnABIType(retTV);
+        if (!retTV.Pointer && !retTV.IsAlias && !retTV.IsArrayView
+            && IsForeignNontrivialCxxReturnClass(retTV.TypeName))
+        {
+            auto* structTy = GetType(retTV);
+            if (structTy != nullptr && structTy->isStructTy())
+            {
+                paramTypes.insert(paramTypes.begin(), cflat_llvm::PointerTo(structTy));
+                returnType = builder->getVoidTy();
+            }
+        }
+        return cflat_llvm::PointerTo(llvm::FunctionType::get(returnType, paramTypes, false));
     }
 
 bool LLVMBackend::ParameterCarriesRawArrayCount(const TypeAndValue& param) const
@@ -2113,11 +2375,31 @@ llvm::Function* LLVMBackend::CreateFunctionDefinition(const std::string& functio
         if (external)
         {
             recipe = ComputeAbiRecipe(returnType, arguments);
+            if (!returnType.Pointer && !returnType.IsAlias
+                && IsForeignNontrivialCxxReturnClass(returnType.TypeName))
+            {
+                auto cxxReturn = ComputeCxxReturnAbiRecipe(returnType, arguments);
+                if (cxxReturn.retSlot.kind == AbiSlot::SRetReturn)
+                {
+                    recipe.retSlot = cxxReturn.retSlot;
+                    recipe.hasLowering = true;
+                }
+            }
             useRecipe = recipe.hasLowering;
         }
-        llvm::FunctionType* functionType = useRecipe
-            ? BuildExternFunctionType(returnType, arguments, varargs, recipe)
-            : GetFunctionType(returnType, arguments, varargs, external);
+        else
+        {
+            recipe = ComputeCxxReturnAbiRecipe(returnType, arguments);
+            useRecipe = recipe.hasLowering;
+        }
+        const bool cflatAbiLowering = !external && recipe.hasLowering;
+        const bool cflatSretReturn = cflatAbiLowering
+            && recipe.retSlot.kind == AbiSlot::SRetReturn;
+        llvm::FunctionType* functionType = cflatAbiLowering
+            ? BuildCFlatSRetFunctionType(returnType, arguments, varargs, recipe)
+            : (useRecipe
+                ? BuildExternFunctionType(returnType, arguments, varargs, recipe)
+                : GetFunctionType(returnType, arguments, varargs, external));
 
         // Only a `main` declared in the root translation unit is the program entry point -
         // an imported library's own `main` must mangle normally or it collides with the app's.
@@ -2235,7 +2517,8 @@ llvm::Function* LLVMBackend::CreateFunctionDefinition(const std::string& functio
         }
 
         createFunctionBlock(fn, functionName, arguments, returnsOwned, returnType.IsArrayView,
-                            returnType.TypeName, useRecipe ? &recipe : nullptr);
+                            returnType.TypeName, useRecipe ? &recipe : nullptr,
+                            cflatAbiLowering);
         // Sibling of the currentFunctionReturn* fields set inside createFunctionBlock: retain the
         // full return TypeAndValue so a returned lambda literal can adopt a function<> return type.
         currentFunctionReturnTV = returnType;

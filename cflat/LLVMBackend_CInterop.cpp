@@ -13872,11 +13872,22 @@ bool LLVMBackend::EmitCxxStructorCall(const std::string& typeName,
                 }
                 auto* temp = AllocaAtEntry(recipe.paramSlots[i].structTy, nullptr, "cxx.argtemp",
                                            recipe.paramSlots[i].align);
+                const bool useMove = (*extraArgVars)[argIndex].IsExplicitMove
+                    || (*extraArgVars)[argIndex].CxxParamLastUse;
                 if (!EmitCxxCopyOrMoveConstruct(pn, temp, (*extraArgVars)[argIndex].Storage,
-                                                (*extraArgVars)[argIndex].IsExplicitMove,
+                                                useMove,
                                                 "into a by-value constructor parameter"))
                     continue;
                 if (!IsCxxParamDestroyedInCallee(pn)) RegisterOwnedStructTemp(temp, pn);
+                if ((*extraArgVars)[argIndex].CxxParamLastUse
+                    && !(*extraArgVars)[argIndex].IsElementAccess
+                    && (*extraArgVars)[argIndex].FieldName.empty())
+                {
+                    const std::string sourceName = (*extraArgVars)[argIndex].CallerName.empty()
+                        ? (*extraArgVars)[argIndex].TypeAndValue.VariableName
+                        : (*extraArgVars)[argIndex].CallerName;
+                    MarkVariableMoved(sourceName);
+                }
                 indirectArgAddrs.resize(recipe.paramSlots.size(), nullptr);
                 indirectArgAddrs[i] = temp;
             }

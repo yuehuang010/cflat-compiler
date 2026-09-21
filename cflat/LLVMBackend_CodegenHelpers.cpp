@@ -52,7 +52,7 @@
 
 // ---- Definitions moved out of LLVMBackend.h (CodegenHelpers) ----
 
-void LLVMBackend::createFunctionBlock(llvm::Function* fn, const std::string& friendlyName, std::vector<LLVMBackend::TypeAndValue> arguments, bool returnsOwned, bool returnIsArrayView, const std::string& returnTypeName, const AbiRecipe* abiRecipe)
+void LLVMBackend::createFunctionBlock(llvm::Function* fn, const std::string& friendlyName, std::vector<LLVMBackend::TypeAndValue> arguments, bool returnsOwned, bool returnIsArrayView, const std::string& returnTypeName, const AbiRecipe* abiRecipe, bool preserveCFlatLowerings)
 {
         // all function starts at "entry" block
         auto entry = CreateBasicBlock("entry", fn);
@@ -125,7 +125,13 @@ void LLVMBackend::createFunctionBlock(llvm::Function* fn, const std::string& fri
             if (abiSlot != nullptr && abiSlot->kind != AbiSlot::Direct)
             {
                 if (abiSlot->kind == AbiSlot::ByVal)
-                    argValue = builder->CreateLoad(abiSlot->structTy, incomingArg);
+                {
+                    // A nontrivial imported C++ parameter is already a pointer to the
+                    // caller-owned object. Do not reload it into a CFlat aggregate value.
+                    argValue = IsForeignNontrivialCxxClass(itr_nameArg->TypeName)
+                        ? static_cast<llvm::Value*>(incomingArg)
+                        : static_cast<llvm::Value*>(builder->CreateLoad(abiSlot->structTy, incomingArg));
+                }
                 else
                 {
                     auto* slot = AllocaAtEntry(abiSlot->structTy, nullptr,
@@ -145,15 +151,30 @@ void LLVMBackend::createFunctionBlock(llvm::Function* fn, const std::string& fri
             }
 
             llvm::Argument* rawArrayCountArg = nullptr;
-            if (abiRecipe == nullptr && ParameterCarriesRawArrayCount(*itr_nameArg)
+            if ((abiRecipe == nullptr || preserveCFlatLowerings)
+                && ParameterCarriesRawArrayCount(*itr_nameArg)
                 && llvmArgIt != fn->arg_end())
                 rawArrayCountArg = &*llvmArgIt++;
             if (rawArrayCountArg != nullptr)
                 rawArrayCountArg->setName(itr_nameArg->VariableName + ".raw_array_count");
 
+            // A nontrivial imported C++ by-value parameter arrives as the object address. Its
+            // destruction remains on the ABI-selected side: caller on Itanium, callee on MS ABI.
+            if (abiSlot != nullptr && abiSlot->kind == AbiSlot::ByVal
+                && IsForeignNontrivialCxxClass(itr_nameArg->TypeName))
+            {
+                NamedVariable namedVar{
+                    .TypeAndValue = *itr_nameArg,
+                    .BaseType = abiSlot->structTy,
+                    .Primary = nullptr,
+                    .Storage = incomingArg,
+                    .IsOwningStruct = IsCxxParamDestroyedInCallee(itr_nameArg->TypeName),
+                };
+                RegisterFunctionArgument(itr_nameArg->VariableName, namedVar);
+            }
             // A non-pointer `alias T` param arrives as a POINTER to the caller's object: bind
             // Storage to it directly so reads, writes and `&param` all reach the caller's slot.
-            if (ParameterIsAliasByPointer(*itr_nameArg))
+            else if (ParameterIsAliasByPointer(*itr_nameArg))
             {
                 NamedVariable namedVar{
                     .TypeAndValue = *itr_nameArg,
@@ -1548,6 +1569,26 @@ bool LLVMBackend::IsOwningValueType(const std::string& typeName)
         return HasTypeAnnotation(typeName, "unique") || HasNonTrivialDestructor(typeName);
     }
 
+bool LLVMBackend::HasForeignNontrivialCxxField(const std::string& typeName) const
+{
+        std::unordered_set<std::string> seen;
+        std::function<bool(const std::string&)> contains = [&](const std::string& name) {
+            if (IsForeignNontrivialCxxClass(name)) return true;
+            if (!seen.insert(name).second) return false;
+            auto it = dataStructures.find(name);
+            if (it == dataStructures.end()) return false;
+            for (const auto& field : it->second.StructFields)
+            {
+                if (field.Pointer || field.ElemPointer || field.IsArrayView
+                    || field.IsSimd || field.IsBitfield || field.IsPadding)
+                    continue;
+                if (contains(field.TypeName)) return true;
+            }
+            return false;
+        };
+        return contains(typeName);
+    }
+
 bool LLVMBackend::TypeOwnsUniquePointer(const std::string& typeName, std::string* outPath,
                                std::unordered_set<std::string>* seen) const
 {
@@ -1609,6 +1650,16 @@ bool LLVMBackend::IsCopyableType(const std::string& typeNameIn) const
         if (base.rfind("alias ", 0) == 0) base = base.substr(6);
         if (base.empty()) return false;
         if (base.back() == '*') return true;
+        if (IsForeignNontrivialCxxClass(base))
+        {
+            const auto* info = GetCxxClassInfo(base);
+            if (info == nullptr || info->hasDeletedCopyCtor) return false;
+            for (const auto& ctor : info->constructors)
+                if (ctor.isCopyCtor && !ctor.isDeleted
+                    && ctor.access != cflat_cinterop::AccessPrivate)
+                    return true;
+            return false;
+        }
         if (dataStructures.count(base) == 0) return true;
         // A raw pointer/view plus a non-trivial destructor needs an author-defined copy policy.
         // Safe destructor-backed value types may still use the memberwise synth.
@@ -1823,12 +1874,22 @@ llvm::Function* LLVMBackend::GetOrCreateMemberwiseCopy(const std::string& typeNa
             {
                 // Owning fixed-array value field: deep-copy every element so the copy is
                 // independent (FULLY-LIVE contract, in lockstep with the destructor).
-                if (!HasCopyOverloadFor(f.TypeName) && !IsOwningValueType(f.TypeName))
+                if (!HasCopyOverloadFor(f.TypeName) && !IsOwningValueType(f.TypeName)
+                    && !IsForeignNontrivialCxxClass(f.TypeName))
                     continue;                   // POD element array: the shallow copy is correct
                 llvm::Type* elemTy = nullptr;
                 uint64_t n = PeelFixedArrayType(structTy->getElementType(i), elemTy);
                 auto* base = builder->CreateStructGEP(structTy, resultSlot, i, "fldarr");
                 EmitFixedArrayElementWalk(*builder, base, elemTy, n, [&](llvm::Value* elemPtr) {
+                    if (IsForeignNontrivialCxxClass(f.TypeName))
+                    {
+                        auto* sourceSlot = AllocaAtEntry(elemTy, nullptr, "fldarrsrc");
+                        builder->CreateStore(builder->CreateLoad(elemTy, elemPtr), sourceSlot);
+                        EmitCxxCopyOrMoveConstruct(f.TypeName, elemPtr, sourceSlot,
+                                                   /*useMove*/ false,
+                                                   "in synthesized struct copy");
+                        return;
+                    }
                     NamedVariable elemNV;
                     elemNV.Storage  = elemPtr;
                     elemNV.BaseType = elemTy;
@@ -1838,9 +1899,19 @@ llvm::Function* LLVMBackend::GetOrCreateMemberwiseCopy(const std::string& typeNa
                 });
                 continue;
             }
-            if (!HasCopyOverloadFor(f.TypeName) && !IsOwningValueType(f.TypeName))
+            if (!HasCopyOverloadFor(f.TypeName) && !IsOwningValueType(f.TypeName)
+                && !IsForeignNontrivialCxxClass(f.TypeName))
                 continue;                       // POD field: the shallow copy is already correct
             auto* fieldPtr = builder->CreateStructGEP(structTy, resultSlot, i, "fld");
+            if (IsForeignNontrivialCxxClass(f.TypeName))
+            {
+                auto* sourceSlot = AllocaAtEntry(structTy->getElementType(i), nullptr, "fldsrc");
+                builder->CreateStore(
+                    builder->CreateLoad(structTy->getElementType(i), fieldPtr), sourceSlot);
+                EmitCxxCopyOrMoveConstruct(f.TypeName, fieldPtr, sourceSlot,
+                                           /*useMove*/ false, "in synthesized struct copy");
+                continue;
+            }
             NamedVariable argNV;
             argNV.Storage  = fieldPtr;
             argNV.BaseType = structTy->getElementType(i);

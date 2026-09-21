@@ -1,0 +1,10 @@
+import cpp "cpp_interop_twin.h";
+
+extern int main()
+{
+    expect_error("operator* returns 'cpptw.Twin' by value") {
+        cpptw.PrvalueTwinRange values = default;
+        for (alias cpptw.Twin x in values) x.set(0);
+    }
+    return 0;
+}

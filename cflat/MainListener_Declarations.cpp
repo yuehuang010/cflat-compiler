@@ -204,8 +204,10 @@ std::string MainListener::ResolveTypeArgEntry(CFlatParser::TypeParameterEntryCon
             }
             else if (entry->pointer() == nullptr && entry->arrayTypeSuffix() == nullptr
                      && entry->Identifier() == nullptr && typeSpec != nullptr
-                     && typeSpec->genericIdentifier() != nullptr
-                     && typeSpec->genericIdentifier()->genericTypeParameters() == nullptr)
+                     && ((typeSpec->genericIdentifier() != nullptr
+                          && typeSpec->genericIdentifier()->genericTypeParameters() == nullptr)
+                         || (typeSpec->qualifiedGenericIdentifier() != nullptr
+                             && typeSpec->qualifiedGenericIdentifier()->genericTypeParameters() == nullptr)))
             {
                 auto valueIt = activeValueSubstitutions.find(resolved);
                 if (valueIt != activeValueSubstitutions.end())
@@ -2873,6 +2875,12 @@ void MainListener::ParseFunctionDefinition(CFlatParser::FunctionDefinitionContex
         auto name = nameOverride.empty() ? ::getFunctionName(func, compiler) : nameOverride;
         if (!namespaceName.empty())
             name = namespaceName + "." + name;
+        if (name == "construct_at")
+        {
+            LogErrorContext(func,
+                "construct_at is a compiler builtin and cannot be redeclared as a user function");
+            return;
+        }
         std::string cppStructBase;
         const bool cppDerivedContext = !structName.empty()
             && compiler->HasTypeAnnotation(structName, "cpp")
@@ -4099,6 +4107,22 @@ cxx_dtor_ready:
             const std::string srcName = inner != nullptr ? inner->getText() : std::string();
             if (!IsBareIdentifierText(srcName))
             {
+                // An indirect C++ lvalue is raw storage, not a named scope-owned object.
+                // Move-construct the declared object from that slot and destroy the source.
+                compiler->lastCxxRetTemp_ = nullptr;
+                compiler->lastCxxRetValue_ = nullptr;
+                auto sourceNV = ParseMoveExpression(moveExpr);
+                if ((sourceNV.IsElementAccess || sourceNV.FieldPathThroughPointer
+                        || llvm::isa<llvm::LoadInst>(sourceNV.Storage))
+                    && sourceNV.Storage != nullptr && !sourceNV.TypeAndValue.Pointer
+                    && sourceNV.TypeAndValue.TypeName == typeName)
+                {
+                    compiler->EmitCxxCopyOrMoveConstruct(
+                        typeName, slot, sourceNV.Storage, /*useMove*/ true,
+                        std::format("into local '{}'", name).c_str());
+                    DestroyForeignCxxRelocationSource(sourceNV);
+                    return true;
+                }
                 LogErrorContext(moveExpr, std::format(
                     "'move' into C++ class '{}' needs a plain variable as its source", typeName));
                 return true;
@@ -4128,6 +4152,23 @@ cxx_dtor_ready:
         // ---- a `T` lvalue: copy construction ------------------------------------------------
         {
             const std::string srcText = assign->getText();
+            if (!IsBareIdentifierText(srcText)
+                && srcText.find('[') != std::string::npos)
+            {
+                compiler->lastCxxRetTemp_ = nullptr;
+                compiler->lastCxxRetValue_ = nullptr;
+                auto elementOwnedTempMark = compiler->MarkOwnedTemps();
+                auto sourceNV = ParseAssignmentExpressionNamed(assign);
+                auto sourceValue = LoadNamedVariable(sourceNV);
+                if (sourceValue != nullptr && sourceNV.IsElementAccess
+                    && sourceNV.Storage != nullptr && !sourceNV.TypeAndValue.Pointer
+                    && sourceNV.TypeAndValue.TypeName == typeName)
+                {
+                    EmitForeignCxxValueIntoSlot(declType, slot, sourceNV, sourceValue,
+                        elementOwnedTempMark, std::format("into local '{}'", name).c_str(), assign);
+                    return true;
+                }
+            }
             if (IsBareIdentifierText(srcText))
             {
                 auto* srcNV = compiler->FindLiveNamedVariable(srcText);
@@ -4160,9 +4201,12 @@ cxx_dtor_ready:
                         return true;
                     }
                     compiler->SetCurrentDebugLocation(line);
+                    const bool implicitLastUse = IsLastUseOfForeignCxxParam(
+                        compiler, assign, *srcNV);
                     compiler->EmitCxxCopyOrMoveConstruct(typeName, slot, srcNV->Storage,
-                                                         /*useMove*/ false,
+                                                         implicitLastUse,
                                                          std::format("into local '{}'", name).c_str());
+                    if (implicitLastUse) compiler->MarkVariableMoved(srcText);
                     return true;
                 }
             }
@@ -4916,6 +4960,12 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                     if (typeAndValue.external)
                         linkName = declName;
                     declName = namespaceName + "." + declName;
+                }
+                if (declName == "construct_at")
+                {
+                    LogErrorContext(direct,
+                        "construct_at is a compiler builtin and cannot be redeclared as a user function");
+                    continue;
                 }
                 /*
                  * Same reject as the function DEFINITION path (see ParseFunctionDefinition): a
@@ -7313,8 +7363,23 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                     typeAndValue.TypeName, alloc, srcCxxRetTemp, true,
                                     std::format("into local '{}'", name).c_str());
                             }
+                            const bool movedOwningStruct = srcIsMove
+                                && !typeAndValue.Pointer && right->getType()->isStructTy()
+                                && srcStorage != nullptr
+                                && srcInferredTypeName == typeAndValue.TypeName
+                                && compiler->HasForeignNontrivialCxxField(typeAndValue.TypeName);
                             auto* initStore = movedCxxReturn
                                 ? nullptr : compiler->CreateAssignment(right, alloc, srcIsUnsigned);
+                            if (movedOwningStruct)
+                            {
+                                compiler->builder->CreateStore(
+                                    llvm::ConstantAggregateZero::get(right->getType()), srcStorage);
+                                if (!srcCallerName.empty())
+                                {
+                                    compiler->MarkVariableMoved(srcCallerName);
+                                    compiler->MarkVariableExplicitlyMovedNull(srcCallerName);
+                                }
+                            }
                             if (coreUniqueImplicitDefault && initStore != nullptr)
                                 initStore->setMetadata(
                                     LLVMBackend::kIfaceDeclSplatMD,

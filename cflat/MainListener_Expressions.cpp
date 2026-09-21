@@ -313,6 +313,8 @@ LLVMBackend::NamedVariable MainListener::ParseAssignmentExpressionNamed(CFlatPar
                                                         const std::string text = ctx->getText();
                                                         passthrough.IsStringLiteral = text.size() >= 2
                                                             && text.front() == '"' && text.back() == '"';
+                                                        passthrough.CxxParamLastUse = IsLastUseOfForeignCxxParam(
+                                                            compilerLLVM, ctx, passthrough);
                                                         return FinishAssignmentExpressionNamed(passthrough, savedOwned);
                                                     }
                                                 }
@@ -473,6 +475,7 @@ LLVMBackend::NamedVariable MainListener::ParseAssignmentExpressionNamed(CFlatPar
                 result.TypeAndValue = lastRedundantAsNamed_.TypeAndValue;
                 AdoptWrapperProvenance(result, lastRedundantAsNamed_);
             }
+            result.CxxParamLastUse = IsLastUseOfForeignCxxParam(compilerLLVM, ctx, result);
             lastRedundantAsCtx_ = nullptr;
             return FinishAssignmentExpressionNamed(result, savedOwned);
         }
@@ -1613,7 +1616,21 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                     }
                 }
 
+                compiler->lastCxxRetTemp_ = nullptr;
+                compiler->lastCxxRetValue_ = nullptr;
                 auto rhsNV = ParseAssignmentExpressionNamed(assignCtx);
+
+                // A foreign C++ element is a live object in the container slot. Its explicit
+                // discard is the release operation, so call the foreign destructor on that slot.
+                if (rhsNV.IsElementAccess && !rhsNV.TypeAndValue.Pointer
+                    && rhsNV.Storage != nullptr
+                    && compiler->IsForeignNontrivialCxxClass(rhsNV.TypeAndValue.TypeName))
+                {
+                    if (auto* dtor = compiler->GetFullDestructorForDelete(
+                            rhsNV.TypeAndValue.TypeName))
+                        compiler->builder->CreateCall(dtor->getFunctionType(), dtor, { rhsNV.Storage });
+                    return rhsNV.Primary;
+                }
 
                 // `_ = move <container element slot>;` (e.g. `_ = move _data[i]`): the slot read
                 // demoted an owning element to a borrow and there is no destination type to
@@ -5571,9 +5588,24 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
             const bool sameValue = armValue != nullptr
                 && (armValue == compiler->lastCxxRetValue_ || armStorage == temp);
             auto* declSlot = llvm::dyn_cast_or_null<llvm::AllocaInst>(cxxTernaryDeclDest);
+            llvm::Type* declType = declSlot != nullptr ? declSlot->getAllocatedType()
+                : compiler->GetType(LLVMBackend::TypeAndValue{ .TypeName = cxxTernaryDeclType });
+            if (temp == nullptr && armStorage != nullptr && declType != nullptr
+                && armValue != nullptr && armValue->getType() == declType)
+            {
+                if (!compiler->EmitCxxCopyOrMoveConstruct(
+                        cxxTernaryDeclType, cxxTernaryDeclDest, armStorage,
+                        /*useMove*/ false, "into a ternary declaration"))
+                {
+                    cxxTernaryDeclFailed = true;
+                    return;
+                }
+                ++cxxTernaryDeclArmsMoved;
+                return;
+            }
             auto* tempSlot = llvm::dyn_cast_or_null<llvm::AllocaInst>(temp);
-            const bool sameType = tempSlot != nullptr && declSlot != nullptr
-                && tempSlot->getAllocatedType() == declSlot->getAllocatedType();
+            const bool sameType = tempSlot != nullptr && declType != nullptr
+                && tempSlot->getAllocatedType() == declType;
             if (!sameValue || !sameType)
             {
                 cxxTernaryDeclFailed = true;
@@ -11200,12 +11232,163 @@ bool MainListener::RejectValueIntoArrayViewField(
         return true;
     }
 
+bool MainListener::EmitForeignCxxValueIntoSlot(
+        const LLVMBackend::TypeAndValue& destType,
+        llvm::Value* destination,
+        LLVMBackend::NamedVariable& sourceNV,
+        llvm::Value* sourceValue,
+        const LLVMBackend::OwnedTempMark& ownedTempMark,
+        const char* context,
+        antlr4::ParserRuleContext* errCtx) {
+        auto* compiler = Compiler(errCtx);
+        if (destination == nullptr || sourceValue == nullptr
+            || destType.Pointer || destType.ElemPointer || destType.IsArrayView
+            || !compiler->IsForeignNontrivialCxxClass(destType.TypeName))
+            return false;
+
+        auto* retTemp = compiler->lastCxxRetTemp_;
+        const bool outermostTemp = retTemp != nullptr
+            && ((sourceNV.Primary != nullptr && sourceNV.Primary == compiler->lastCxxRetValue_)
+                || sourceNV.Storage == retTemp);
+        const bool sameClass = !sourceNV.TypeAndValue.Pointer
+            && sourceNV.TypeAndValue.TypeName == destType.TypeName;
+        if (outermostTemp)
+        {
+            compiler->EmitCxxCopyOrMoveConstruct(destType.TypeName, destination, retTemp,
+                                                 /*useMove*/ true, context);
+            // The returned temporary was selected by this store. Its moved-from C++ object still
+            // owes a destructor, so flush only the temporaries created by this RHS.
+            compiler->FlushOwnedTempsSince(ownedTempMark, nullptr, nullptr);
+            compiler->lastCxxRetTemp_ = nullptr;
+            compiler->lastCxxRetValue_ = nullptr;
+            return true;
+        }
+        if (retTemp == nullptr && sameClass && sourceNV.Storage != nullptr)
+        {
+            compiler->EmitCxxCopyOrMoveConstruct(destType.TypeName, destination,
+                                                 sourceNV.Storage,
+                                                 sourceNV.IsRvalue || sourceNV.CxxParamLastUse,
+                                                 context);
+            if (sourceNV.IsElementAccess && sourceNV.IsRvalue)
+                DestroyForeignCxxRelocationSource(sourceNV);
+            // A CFlat `move T` parameter is passed as the class bits, not as a separately
+            // constructed C++ parameter object. The caller still destroys its moved-from source,
+            // so suppress the parameter cleanup after its move-constructing store.
+            const auto* sourceBinding = !sourceNV.IsElementAccess
+                ? compiler->FindVariableByStorage(sourceNV.Storage) : nullptr;
+            if ((sourceNV.IsRvalue || sourceNV.TypeAndValue.IsMove
+                    || sourceNV.CxxParamLastUse
+                    || (sourceBinding != nullptr
+                        && (sourceBinding->TypeAndValue.IsMove || sourceBinding->IsOwningStruct)))
+                && !sourceNV.IsElementAccess)
+            {
+                const std::string sourceName = sourceNV.CallerName.empty()
+                    ? (sourceBinding != nullptr ? sourceBinding->TypeAndValue.VariableName
+                                                : sourceNV.TypeAndValue.VariableName)
+                    : sourceNV.CallerName;
+                if (!sourceName.empty())
+                {
+                    if (sourceNV.CxxParamLastUse)
+                        compiler->MarkVariableMoved(sourceName);
+                    else if (auto* source = compiler->FindLiveNamedVariable(sourceName);
+                             source != nullptr && source->Storage == sourceNV.Storage)
+                        source->ExplicitlyMovedNull = true;
+                    else
+                        compiler->MarkVariableExplicitlyMovedNull(sourceName);
+                }
+            }
+            return true;
+        }
+        if (retTemp == nullptr && sameClass && sourceValue->getType() == compiler->GetType(destType))
+        {
+            compiler->builder->CreateStore(sourceValue, destination);
+            return true;
+        }
+
+        LogErrorContext(errCtx, std::format(
+            "cannot initialize C++ class '{}' from this expression; use '{}(args)', a '{}' lvalue, "
+            "or 'move <{}> lvalue'",
+            destType.TypeName, destType.TypeName, destType.TypeName, destType.TypeName));
+        return true;
+}
+
+void MainListener::DestroyForeignCxxRelocationSource(
+        const LLVMBackend::NamedVariable& sourceNV) {
+    auto* compiler = Compiler();
+    const bool dereferencedStorage = llvm::isa<llvm::LoadInst>(sourceNV.Storage);
+    if ((!sourceNV.IsElementAccess && !sourceNV.FieldPathThroughPointer
+            && !dereferencedStorage)
+        || !sourceNV.IsRvalue || sourceNV.Storage == nullptr
+        || sourceNV.TypeAndValue.Pointer
+        || !compiler->IsForeignNontrivialCxxClass(sourceNV.TypeAndValue.TypeName))
+        return;
+    if (auto* dtor = compiler->GetFullDestructorForDelete(sourceNV.TypeAndValue.TypeName))
+        compiler->builder->CreateCall(dtor->getFunctionType(), dtor, { sourceNV.Storage });
+}
+
+bool MainListener::EmitForeignCxxFixedArrayIntoSlot(
+        const LLVMBackend::DeclTypeAndValue& field,
+        llvm::Value* destination,
+        llvm::Value* sourceSlot,
+        const char* context,
+        antlr4::ParserRuleContext* errCtx) {
+        auto* compiler = Compiler(errCtx);
+        if (destination == nullptr || field.Pointer
+            || field.ElemPointer || field.IsArrayView || field.ConstArraySize == 0
+            || !compiler->IsForeignNontrivialCxxClass(field.TypeName))
+            return false;
+
+        auto* arrTy = llvm::dyn_cast<llvm::ArrayType>(compiler->GetType(field));
+        auto* dtor = compiler->GetOrCreateFullDestructor(field.TypeName);
+        if (arrTy == nullptr || dtor == nullptr) return false;
+
+        uint64_t count = field.ConstArraySize;
+        for (uint64_t dim : field.ConstInnerDimensions) count *= dim;
+        llvm::Value* zero = compiler->builder->getInt32(0);
+        std::vector<uint64_t> dimensions;
+        dimensions.reserve(field.ConstInnerDimensions.size() + 1);
+        dimensions.push_back(field.ConstArraySize);
+        dimensions.insert(dimensions.end(), field.ConstInnerDimensions.begin(),
+                          field.ConstInnerDimensions.end());
+
+        for (uint64_t flatIndex = 0; flatIndex < count; ++flatIndex)
+        {
+            uint64_t remaining = flatIndex;
+            std::vector<llvm::Value*> indices{ zero };
+            for (size_t dim = 0; dim < dimensions.size(); ++dim)
+            {
+                uint64_t stride = 1;
+                for (size_t trailing = dim + 1; trailing < dimensions.size(); ++trailing)
+                    stride *= dimensions[trailing];
+                uint64_t index = remaining / stride;
+                remaining %= stride;
+                indices.push_back(compiler->builder->getInt32((uint32_t)index));
+            }
+
+            auto* destinationElem = compiler->builder->CreateInBoundsGEP(
+                arrTy, destination, indices, "fieldarrelem");
+            if (sourceSlot == nullptr)
+            {
+                compiler->builder->CreateCall(dtor->getFunctionType(), dtor, { destinationElem });
+                continue;
+            }
+            auto* sourceElem = compiler->builder->CreateInBoundsGEP(
+                arrTy, sourceSlot, indices, "fieldsrcarrelem");
+            compiler->builder->CreateCall(dtor->getFunctionType(), dtor, { destinationElem });
+            compiler->EmitCxxCopyOrMoveConstruct(field.TypeName, destinationElem, sourceElem,
+                                                 /*useMove*/ true, context);
+            compiler->builder->CreateCall(dtor->getFunctionType(), dtor, { sourceElem });
+        }
+        return true;
+}
+
 bool MainListener::EmitOneFieldInit(
         llvm::Value* structPtr,
         const LLVMBackend::StructData& sd,
         const std::string& typeName,
         const std::string& fieldName,
         LLVMBackend::NamedVariable& rightNV,
+        const LLVMBackend::OwnedTempMark& ownedTempMark,
         antlr4::ParserRuleContext* errCtx) {
         auto* compiler = Compiler(errCtx);
         const std::string displayTypeName = SpellType(*compiler,
@@ -11228,6 +11411,9 @@ bool MainListener::EmitOneFieldInit(
                 SpellType(*compiler, LLVMBackend::TypeAndValue{ .TypeName = typeName }), fieldName));
             return false;
         }
+        const bool isForeignCxxField = !fieldType.Pointer && !fieldType.ElemPointer
+            && !fieldType.IsArrayView && fieldType.ConstArraySize == 0
+            && compiler->IsForeignNontrivialCxxClass(fieldType.TypeName);
 
         // Ahead of every store rule: a single object bound to a VIEW field is not one element of
         // it, and the store below would leave the slot pointing at something that is not an array.
@@ -11459,7 +11645,9 @@ bool MainListener::EmitOneFieldInit(
             // Brace-init always targets a FRESH slot, so a self-assign is impossible here. There is no
             // second copy path in brace-init, so the copied flag is unused.
             bool braceCopied = false;
-            if (RejectOwningValueCopyIntoField(rightNV, val, false, braceCopied, errCtx)) return false;
+            if (!isForeignCxxField
+                && RejectOwningValueCopyIntoField(rightNV, val, false, braceCopied, errCtx))
+                return false;
         }
 
         // Coerce char* string literals to the string struct type
@@ -11602,6 +11790,13 @@ bool MainListener::EmitOneFieldInit(
             {
                 if (auto* dtor = compiler->GetOrCreateFullDestructor(fieldType.TypeName))
                     compiler->builder->CreateCall(dtor->getFunctionType(), dtor, { gep });
+            }
+            if (isForeignCxxField
+                && EmitForeignCxxValueIntoSlot(fieldType, gep, rightNV, val, ownedTempMark,
+                                               "into a struct field", errCtx))
+            {
+                destination = gep;
+                return true;
             }
             compiler->builder->CreateStore(val, gep);
             destination = gep;
@@ -11955,7 +12150,8 @@ llvm::Value* MainListener::ParseFieldDefaultBraceInitializer(
 llvm::Value* MainListener::EmitFieldDefaultFixedArrayBrace(
         const std::string& structName,
         const LLVMBackend::DeclTypeAndValue& field,
-        CFlatParser::InitializerListContext* list) {
+        CFlatParser::InitializerListContext* list,
+        llvm::Value** outSlot) {
         auto* compiler = Compiler(list);
         const std::string displayStructName = SpellType(*compiler,
             LLVMBackend::TypeAndValue{ .TypeName = structName });
@@ -11974,6 +12170,7 @@ llvm::Value* MainListener::EmitFieldDefaultFixedArrayBrace(
         std::string path = std::format("{}.{}", structName, field.VariableName);
         const std::string displayPath = displayStructName + "." + field.VariableName;
         auto* slot = compiler->AllocaAtEntry(arrTy, nullptr, path + "_arrbrace");
+        if (outSlot != nullptr) *outSlot = slot;
         compiler->builder->CreateStore(llvm::Constant::getNullValue(arrTy), slot);
 
         auto structData = compiler->GetDataStructure(field.TypeName);
@@ -12226,10 +12423,40 @@ void MainListener::EmitFieldInitializer(
                         (unsigned)nestedFieldIndex, fieldName + "_nested_init");
                 if (nestedField.ConstArraySize > 0)
                 {
-                    auto nestedValue = EmitFieldDefaultFixedArrayBrace(typeName, nestedField, nested);
+                    const bool foreignCxxArray = !nestedField.Pointer && !nestedField.ElemPointer
+                        && !nestedField.IsArrayView
+                        && compiler->IsForeignNontrivialCxxClass(nestedField.TypeName);
+                    bool positionalArray = false;
+                    for (auto* nestedInit : nested->fieldInit())
+                        if (nestedInit->Identifier() == nullptr
+                            && (nestedInit->assignmentExpression().size() == 1
+                                || FieldInitIsBraceElement(nestedInit)))
+                        {
+                            positionalArray = true;
+                            break;
+                        }
+                    if (foreignCxxArray && positionalArray)
+                    {
+                        if (EmitForeignCxxFixedArrayIntoSlot(
+                                nestedField, nestedDestination, nullptr,
+                                "into a fixed-array field", fi))
+                            EmitPositionalFixedArrayIntoSlot(
+                                std::format("{}.{}", typeName, fieldName),
+                                nestedField, nested, nestedDestination);
+                        continue;
+                    }
+                    llvm::Value* nestedSlot = nullptr;
+                    auto nestedValue = EmitFieldDefaultFixedArrayBrace(
+                        typeName, nestedField, nested, &nestedSlot);
                     if (nestedValue != nullptr)
-                        compiler->CreateAssignment(nestedValue, nestedDestination, false,
-                            compiler->GetType(nestedField));
+                    {
+                        if (!foreignCxxArray
+                            || !EmitForeignCxxFixedArrayIntoSlot(
+                                nestedField, nestedDestination, nestedSlot,
+                                "into a fixed-array field", fi))
+                            compiler->CreateAssignment(nestedValue, nestedDestination, false,
+                                compiler->GetType(nestedField));
+                    }
                     continue;
                 }
 
@@ -12308,11 +12535,14 @@ void MainListener::EmitFieldInitializer(
                     compiler->pendingInitAllocAlign = field.AllocAlignValue;
                 break;
             }
+            auto ownedTempMark = compiler->MarkOwnedTemps();
+            compiler->lastCxxRetTemp_ = nullptr;
+            compiler->lastCxxRetValue_ = nullptr;
             auto rightNV = ParseAssignmentExpressionNamed(fi->assignmentExpression(0));
             lambdaExpectedType = {};
             rightNV.CastOccurrenceId = thisCastOcc;
             compiler->EndCastOccurrence(savedCastOcc);
-            EmitOneFieldInit(structPtr, sd, typeName, fieldName, rightNV, fi);
+            EmitOneFieldInit(structPtr, sd, typeName, fieldName, rightNV, ownedTempMark, fi);
         }
     }
 
@@ -12536,6 +12766,10 @@ void MainListener::EmitPositionalFixedArrayIntoSlot(
         for (size_t i = 0; i < elements.size(); i++)
         {
             auto* fi = elements[i];
+            llvm::Value* idx = compiler->builder->getInt32((uint32_t)i);
+            auto* elemPtr = multidim
+                ? elementPtrs[i]
+                : compiler->builder->CreateInBoundsGEP(arrTy, arrAlloc, { zero, idx }, "arrelem");
             // A BRACED element carries no assignmentExpression at all (CFlat.g4 fieldInit's
             // '{' initializerList? '}' alternative), so it must be split off before the
             // expression read - that read is what walked a null context and crashed.
@@ -12566,7 +12800,76 @@ void MainListener::EmitPositionalFixedArrayIntoSlot(
                 EmitBraceElementIntoFixedSlot(braceElemPtr, elemStructTy, tv.TypeName, fi);
                 continue;
             }
-            auto nv = ParseAssignmentExpressionNamed(fi->assignmentExpression(0));
+            auto* assignment = fi->assignmentExpression(0);
+            const bool cxxElement = !fixedElemTV.Pointer && !fixedElemTV.ElemPointer
+                && !fixedElemTV.IsArrayView
+                && compiler->IsForeignNontrivialCxxClass(tv.TypeName);
+            auto* moveExpr = TopLevelMoveExpression(assignment);
+
+            // A C++ move keeps the source object alive; do not route it through CFlat's
+            // destructive ParseMoveExpression before calling the C++ move constructor.
+            if (cxxElement && moveExpr != nullptr)
+            {
+                auto* inner = moveExpr->unaryExpression();
+                const std::string sourceName = inner != nullptr ? inner->getText() : std::string();
+                if (IsBareIdentifierText(sourceName))
+                {
+                    auto* source = compiler->FindLiveNamedVariable(sourceName);
+                    if (source != nullptr && source->Storage != nullptr
+                        && !source->TypeAndValue.Pointer
+                        && source->TypeAndValue.TypeName == tv.TypeName)
+                    {
+                        if (source->IsMoved || source->ExplicitlyMovedNull)
+                        {
+                            LogErrorContext(moveExpr,
+                                std::format("use of moved variable '{}'", sourceName));
+                        }
+                        else
+                        {
+                            compiler->SetCurrentDebugLocation(moveExpr->getStart()->getLine());
+                            compiler->EmitCxxCopyOrMoveConstruct(
+                                tv.TypeName, elemPtr, source->Storage, /*useMove*/ true,
+                                "into a fixed-array element");
+                            compiler->MarkVariableMoved(sourceName);
+                        }
+                        continue;
+                    }
+                }
+            }
+
+            // A single C++ call can construct directly in the fresh array slot, matching the
+            // scalar declaration path. More complex expressions use the temporary-then-move path.
+            bool cxxSretArmed = false;
+            if (cxxElement)
+            {
+                // Per element: a temporary left by an EARLIER element must not mark this one movable.
+                compiler->lastCxxRetTemp_ = nullptr;
+                compiler->lastCxxRetValue_ = nullptr;
+            }
+            if (cxxElement && moveExpr == nullptr)
+            {
+                const std::string text = assignment->getText();
+                const bool singleCall = !text.empty() && text.back() == ')'
+                    && std::count(text.begin(), text.end(), '(') == 1;
+                if (singleCall)
+                {
+                    compiler->pendingCxxSretDest_ = elemPtr;
+                    compiler->pendingCxxSretTypeName_ = tv.TypeName;
+                    compiler->pendingCxxSretForFixedArray_ = true;
+                    cxxSretArmed = true;
+                }
+            }
+            auto elementOwnedTempMark = compiler->MarkOwnedTemps();
+            auto nv = ParseAssignmentExpressionNamed(assignment);
+            const bool cxxSretConsumed = cxxSretArmed
+                && compiler->pendingCxxSretDest_ == nullptr;
+            if (cxxSretArmed)
+            {
+                compiler->pendingCxxSretDest_ = nullptr;
+                compiler->pendingCxxSretTypeName_.clear();
+                compiler->pendingCxxSretForFixedArray_ = false;
+            }
+            if (cxxSretConsumed) continue;
             llvm::Value* val = LoadNamedVariable(nv);
             if (!val) continue;
 
@@ -12605,10 +12908,12 @@ void MainListener::EmitPositionalFixedArrayIntoSlot(
             if (!tv.ElemPointer && compiler->IsInterfaceType(tv.TypeName))
                 val = CoerceInitValueToInterface(nv, val, tv.TypeName, fi);
 
-            llvm::Value* idx = compiler->builder->getInt32((uint32_t)i);
-            auto* elemPtr = multidim
-                ? elementPtrs[i]
-                : compiler->builder->CreateInBoundsGEP(arrTy, arrAlloc, { zero, idx }, "arrelem");
+            if (cxxElement)
+            {
+                EmitForeignCxxValueIntoSlot(fixedElemTV, elemPtr, nv, val,
+                    elementOwnedTempMark, "into a fixed-array element", fi);
+                continue;
+            }
             ConsumeOwningBraceElementSource(nv, val, elemPtr, fixedElemTV, tv.TypeName, fi);
             compiler->CreateAssignment(val, elemPtr,
                 nv.TypeAndValue.IsUnsignedInteger() != -1, elemTy);
@@ -15128,6 +15433,17 @@ LLVMBackend::NamedVariable MainListener::ParseMoveExpression(CFlatParser::MoveEx
         }
 
         llvm::Value* ptrVal = LoadNamedVariable(argNV);
+
+        // A foreign nontrivial C++ object must stay constructed while its move constructor reads
+        // it. The return/assignment/argument consumer performs that construction and owns the
+        // moved-from destructor; zeroing the bytes here would bypass the C++ move contract.
+        if (!argNV.TypeAndValue.Pointer && argNV.Storage != nullptr
+            && compiler->IsForeignNontrivialCxxReturnClass(argNV.TypeAndValue.TypeName))
+        {
+            argNV.IsExplicitMove = true;
+            argNV.IsRvalue = true;
+            return argNV;
+        }
 
         // move on a named struct value type: capture the value, then zero the source storage
         // to leave it in a "moved-from" (default) state - enables safe delete[n] on the source.

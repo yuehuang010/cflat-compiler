@@ -51,10 +51,14 @@ import cpp "memory" cache;
 import cpp "functional" cache;
 import cpp "deque" cache;
 import cpp "map" cache;
+import cpp "set" cache;
+import cpp "list" cache;
+import cpp "array" cache;
 // std::function as a MEMBER parameter and as a RETURN type.
 import cpp "library/cpp_interop_stdfn.h" cache;
 import cpp "library/cpp_interop_twin.h" cache;
 import "test_helper.cb";
+import "list.cb";
 
 int bridge_cf_ctor = 0;
 int bridge_cf_copy = 0;
@@ -123,6 +127,49 @@ struct BridgeCopyFieldHolder<T>
     T value = default;
 };
 
+struct BridgeNestedCopyFieldHolder<T>
+{
+    BridgeCopyFieldHolder<T> inner = default;
+};
+
+struct BridgeArrayCopyFieldHolder<T>
+{
+    T[2] values = default;
+};
+
+struct BridgeStringCopyFieldHolder
+{
+    std.string value = default;
+};
+
+struct BridgeSharedCopyFieldHolder
+{
+    std.shared_ptr<int> value = default;
+};
+
+struct BridgeListField<T>
+{
+    list<T> values = default;
+};
+
+struct BridgeListBox
+{
+    TwinCf twin = default;
+    int tag = 0;
+};
+
+T bridge_return_field<T>(BridgeFieldHolder<T>* holder)
+{
+    return holder->value;
+}
+
+T bridge_return_local<T>(int value)
+{
+    T local = default;
+    local.set(value);
+    return local;
+}
+
 int bridge_method_field<T>(T* pointer)
 {
     (*pointer).set(pointer->value() + 1);
@@ -147,12 +194,104 @@ int bridge_lifetime<T>(int seed)
     return result;
 }
 
+int bridge_parameterized<T>(int value)
+{
+    T* local = new T(value);
+    int result = local->value();
+    delete local;
+    return result;
+}
+
 int bridge_fixed_array<T>()
 {
     T[2] values = default;
     values[0].set(3);
     values[1].set(4);
     return values[0].value() + values[1].value() + values[0][1];
+}
+
+int bridge_brace_array_prvalue_cf()
+{
+    TwinCf[2] values = { TwinCf(), TwinCf() };
+    return values[0].value() + values[1].value();
+}
+
+int bridge_brace_array_prvalue_cpp()
+{
+    cpptw.Twin[2] values = { cpptw.Twin(), cpptw.Twin() };
+    return values[0].value() + values[1].value();
+}
+
+int bridge_brace_array_lvalue_cf()
+{
+    TwinCf left = default;
+    TwinCf right = default;
+    left.set(7);
+    right.set(8);
+    TwinCf[2] values = { left, right };
+    return values[0].value() + values[1].value();
+}
+
+int bridge_brace_array_lvalue_cpp()
+{
+    cpptw.Twin left = default;
+    cpptw.Twin right = default;
+    left.set(7);
+    right.set(8);
+    cpptw.Twin[2] values = { left, right };
+    return values[0].value() + values[1].value();
+}
+
+int bridge_brace_array_move_cf()
+{
+    TwinCf source = default;
+    source.set(8);
+    TwinCf[1] values = { move source };
+    return values[0].value();
+}
+
+int bridge_brace_array_move_cpp()
+{
+    cpptw.Twin source = default;
+    source.set(8);
+    cpptw.Twin[1] values = { move source };
+    return values[0].value();
+}
+
+int bridge_brace_array_short_cf()
+{
+    TwinCf[3] values = { TwinCf(), TwinCf() };
+    return values[0].value() + values[1].value() + values[2].value();
+}
+
+int bridge_brace_array_short_cpp()
+{
+    cpptw.Twin[3] values = { cpptw.Twin(), cpptw.Twin() };
+    return values[0].value() + values[1].value() + values[2].value();
+}
+
+int bridge_brace_identity(int v) { return v; }
+
+// An lvalue element AFTER a call-result element must still be copied, not moved:
+// the earlier element's return temporary must not mark the later one movable.
+int bridge_brace_array_call_then_lvalue()
+{
+    std.shared_ptr<int> kept = std.make_shared<int>(7);
+    int inside = 0;
+    {
+        std.shared_ptr<int>[2] values = { std.make_shared<int>(bridge_brace_identity(1)), kept };
+        inside = (int)kept.use_count() * 10 + (int)values[1].use_count();
+    }
+    return inside * 10 + (int)kept.use_count();
+}
+
+cpptw.Twin bridge_brace_make_twin(int v) { return cpptw.Twin(v); }
+
+// A CFlat function result has no storage; it must still be accepted as an element.
+int bridge_brace_array_cflat_result()
+{
+    cpptw.Twin[2] values = { bridge_brace_make_twin(28), bridge_brace_make_twin(2) };
+    return values[0].value() + values[1].value();
 }
 
 int bridge_struct_field<T>()
@@ -169,6 +308,94 @@ int bridge_copy_field<T>()
     holder.value.set(8);
     T copy = holder.value;
     return holder.value.value() + copy.value();
+}
+
+int bridge_enclosing_assign<T>()
+{
+    BridgeCopyFieldHolder<T> source = default;
+    source.value.set(7);
+    BridgeCopyFieldHolder<T> target = default;
+    target.value.set(3);
+    target = source;
+    return target.value.value();
+}
+
+int bridge_enclosing_nested_copy<T>()
+{
+    BridgeNestedCopyFieldHolder<T> source = default;
+    source.inner.value.set(7);
+    BridgeNestedCopyFieldHolder<T> copy = source;
+    return copy.inner.value.value();
+}
+
+int bridge_enclosing_move<T>()
+{
+    BridgeCopyFieldHolder<T> source = default;
+    source.value.set(7);
+    BridgeCopyFieldHolder<T> moved = move source;
+    return moved.value.value();
+}
+
+int bridge_enclosing_array_copy<T>()
+{
+    BridgeArrayCopyFieldHolder<T> source = default;
+    source.values[0].set(7);
+    source.values[1].set(8);
+    BridgeArrayCopyFieldHolder<T> copy = source;
+    return copy.values[0].value() + copy.values[1].value();
+}
+
+int bridge_enclosing_brace_lvalue_cf()
+{
+    TwinCf source = default;
+    source.set(4);
+    BridgeCopyFieldHolder<TwinCf> value = { value = source };
+    return value.value.value();
+}
+
+int bridge_enclosing_brace_lvalue_cpp()
+{
+    cpptw.Twin source = default;
+    source.set(4);
+    BridgeCopyFieldHolder<cpptw.Twin> value = { value = source };
+    return value.value.value();
+}
+
+int bridge_enclosing_brace_prvalue_cpp()
+{
+    BridgeCopyFieldHolder<cpptw.Twin> value = { value = cpptw.Twin(4) };
+    return value.value.value();
+}
+
+int bridge_enclosing_brace_array_cpp()
+{
+    cpptw.Twin source = default;
+    source.set(5);
+    BridgeArrayCopyFieldHolder<cpptw.Twin> value = {
+        values = { cpptw.Twin(2), source }
+    };
+    return value.values[0].value() + value.values[1].value();
+}
+
+int bridge_enclosing_string_copy()
+{
+    BridgeStringCopyFieldHolder source = {
+        value = std.string("bridge-field-copy")
+    };
+    BridgeStringCopyFieldHolder copy = source;
+    return (int)copy.value.size();
+}
+
+int bridge_enclosing_shared_copy()
+{
+    BridgeSharedCopyFieldHolder source = default;
+    source.value = std.make_shared<int>(7);
+    int inside = 0;
+    {
+        BridgeSharedCopyFieldHolder copy = source;
+        inside = (int)copy.value.use_count() * 10 + *copy.value;
+    }
+    return inside * 10 + (int)source.value.use_count();
 }
 
 int bridge_reference<T>(alias T value)
@@ -191,6 +418,266 @@ int bridge_nullable<T>(T* value)
     if (value?.value() == 5) return 1;
     return 0;
 }
+
+TwinCf bridge_list_make_cf(int value)
+{
+    return TwinCf(value);
+}
+
+cpptw.Twin bridge_list_make_cpp(int value)
+{
+    return cpptw.Twin(value);
+}
+
+int bridge_list_prvalue_cf()
+{
+    list<TwinCf> values = default;
+    values.add(TwinCf(7));
+    return values[0].value();
+}
+
+int bridge_list_prvalue_cpp()
+{
+    list<cpptw.Twin> values = default;
+    values.add(cpptw.Twin(7));
+    return values[0].value();
+}
+
+int bridge_list_call_cf()
+{
+    list<TwinCf> values = default;
+    values.add(bridge_list_make_cf(8));
+    return values[0].value();
+}
+
+int bridge_list_call_cpp()
+{
+    list<cpptw.Twin> values = default;
+    values.add(bridge_list_make_cpp(8));
+    return values[0].value();
+}
+
+// One value-element body runs against both the native and imported Twin. It covers copy and move
+// insertion, set/remove/clear, alias and by-value reads, and list.copy() without triggering growth.
+int bridge_list_twin<T>()
+{
+    list<T> values = default;
+    T source = default;
+    source.set(2);
+    values.add(source);
+    T moved = default;
+    moved.set(3);
+    values.add(move moved);
+    T replacement = default;
+    replacement.set(4);
+    values.set(0, replacement);
+    int result = values.get(0).value() + values[1].value();
+    for (T value in values) result = result + value.value();
+    for (alias T value in values) value.set(value.value() + 1);
+    list<T> copy = values.copy();
+    result = result + copy[0].value();
+    values.removeAt(0);
+    values.clear();
+    return result + copy[1].value();
+}
+
+int bridge_list_growth<T>()
+{
+    list<T> values = default;
+    int i = 0;
+    while (i < 40)
+    {
+        T value = default;
+        value.set(i);
+        values.add(move value);
+        i++;
+    }
+    int sum = 0;
+    i = 0;
+    while (i < values.count())
+    {
+        sum = sum + values[i].value();
+        i++;
+    }
+    return sum;
+}
+
+int bridge_list_shift_heavy<T>()
+{
+    list<T> values = default;
+    int i = 0;
+    while (i < 10)
+    {
+        T value = default;
+        value.set(i);
+        values.add(move value);
+        i++;
+    }
+    i = 0;
+    while (i < 5)
+    {
+        values.removeAt(0);
+        i++;
+    }
+    i = 0;
+    while (i < 10)
+    {
+        T value = default;
+        value.set(100 + i);
+        values.add(move value);
+        i++;
+    }
+    int sum = 0;
+    i = 0;
+    while (i < values.count())
+    {
+        sum = sum + values[i].value();
+        i++;
+    }
+    values.clear();
+    return sum;
+}
+
+int bridge_fixed_array_live_overwrite<T>()
+{
+    T[2] values = default;
+    T first = default;
+    first.set(1);
+    values[0] = first;
+    T second = default;
+    second.set(9);
+    values[0] = second;
+    return values[0].value();
+}
+
+int bridge_list_sort_cf()
+{
+    list<TwinCf> values = default;
+    TwinCf first = default; first.set(30); values.add(move first);
+    TwinCf second = default; second.set(10); values.add(move second);
+    TwinCf third = default; third.set(20); values.add(move third);
+    values.sort((TwinCf a, TwinCf b) => { return a.value() < b.value(); });
+    return values[0].value() * 100 + values[1].value() * 10 + values[2].value();
+}
+
+int bridge_list_sort_cpp()
+{
+    list<cpptw.Twin> values = default;
+    cpptw.Twin first = default; first.set(30); values.add(move first);
+    cpptw.Twin second = default; second.set(10); values.add(move second);
+    cpptw.Twin third = default; third.set(20); values.add(move third);
+    values.sort((cpptw.Twin a, cpptw.Twin b) => { return a.value() < b.value(); });
+    return values[0].value() * 100 + values[1].value() * 10 + values[2].value();
+}
+
+int bridge_list_string()
+{
+    list<std.string> values = default;
+    values.add(std.string("a"));
+    values.add(std.string("bb"));
+    values.add(std.string("ccc"));
+    values.add(std.string("dddd"));
+    values.add(std.string("eeeee"));
+    int total = 0;
+    for (std.string value in values) total = total + (int)value.size();
+    return total;
+}
+
+int bridge_list_shared()
+{
+    std.shared_ptr<int> value = std.make_shared<int>(7);
+    list<std.shared_ptr<int>> values = default;
+    values.add(value);
+    int inside = (int)value.use_count() * 1000 + (int)values[0].use_count() * 100;
+    values.removeAt(0);
+    int afterRemove = (int)value.use_count() * 10;
+    values.add(value);
+    values.clear();
+    return inside + afterRemove + (int)value.use_count();
+}
+
+int bridge_list_field<T>()
+{
+    BridgeListField<T> holder = default;
+    T value = default;
+    value.set(6);
+    holder.values.add(value);
+    return holder.values[0].value();
+}
+
+int bridge_list_box()
+{
+    BridgeListBox box = default;
+    box.twin.set(7);
+    box.tag = 3;
+    list<BridgeListBox> values = default;
+    values.add(box);
+    return values[0].twin.value() + values[0].tag;
+}
+
+int bridge_param_free(cpptw.Twin value) { return value.value(); }
+int bridge_param_free_move(move cpptw.Twin value) { return value.value(); }
+
+int bridge_cxx_param_twice(cpptw.Twin value)
+{
+    cpptw.Twin first = value;
+    cpptw.Twin second = value;
+    return first.value() + second.value();
+}
+
+int bridge_cxx_param_loop(cpptw.Twin value)
+{
+    int i = 0;
+    while (i < 2)
+    {
+        cpptw.Twin copy = value;
+        i++;
+    }
+    cpptw.Twin last = value;
+    return i + last.value();
+}
+
+void bridge_cxx_param_inner(cpptw.Twin value) { }
+void bridge_cxx_param_outer(cpptw.Twin value) { bridge_cxx_param_inner(value); }
+cpptw.Twin bridge_cxx_param_return(cpptw.Twin value) { return value; }
+
+int bridge_list_lvalue_add_cpp()
+{
+    list<cpptw.Twin> values = default;
+    cpptw.Twin source = default;
+    source.set(31);
+    values.add(source);
+    return values[0].value();
+}
+
+int bridge_param_generic<T>(T value) { return value.value(); }
+int bridge_param_generic_move<T>(move T value) { return value.value(); }
+
+struct BridgeParamMethod
+{
+    int take(cpptw.Twin value) { return value.value(); }
+    int take_move(move cpptw.Twin value) { return value.value(); }
+};
+
+interface BridgeParamIface
+{
+    int take(cpptw.Twin value);
+    int take_move(move cpptw.Twin value);
+};
+
+class BridgeParamIfaceImpl : BridgeParamIface
+{
+    int take(cpptw.Twin value) { return value.value(); }
+    int take_move(move cpptw.Twin value) { return value.value(); }
+};
+
+int bridge_param_string(std.string value)
+{
+    value.append("-changed");
+    return (int)value.size();
+}
+
+int bridge_param_shared(std.shared_ptr<int> value) { return (int)value.use_count(); }
 
 int bridge_checks = 0;
 int bridge_passed = 0;
@@ -470,6 +957,146 @@ cppi.Tracked rettemp_free_both(int value)
     return cppi.make_tracked(cppi.Tracked(value).value());
 }
 
+interface BridgeTrackedIface
+{
+    cppi.Tracked make(int value);
+};
+
+class BridgeTrackedImpl : BridgeTrackedIface
+{
+    cppi.Tracked make(int value) { return cppi.Tracked(value); }
+};
+
+[cpp] struct BridgeTrackedDerived : cppi.TrackedBase
+{
+    override cppi.Tracked make(int value) { return cppi.Tracked(value); }
+};
+
+[cpp] struct BridgeTrackedDerivedAlt : cppi.TrackedBase
+{
+    override cppi.Tracked make(int value) { return cppi.Tracked(value + 100); }
+};
+
+int bridge_sret_virtual_apply(cppi.TrackedBase* base, int value)
+{
+    cppi.Tracked result = base->make(value);
+    return result.value();
+}
+
+int bridge_sret_virtual_run(int selector)
+{
+    BridgeTrackedDerived first = default;
+    BridgeTrackedDerivedAlt second = default;
+    cppi.TrackedBase* base = &first;
+    if (selector != 0) base = &second;
+    return bridge_sret_virtual_apply(base, 7);
+}
+
+cpptw.Twin bridge_sret_thin_first(int value) { return cpptw.Twin(value); }
+cpptw.Twin bridge_sret_thin_second(int value) { return cpptw.Twin(value + 100); }
+
+int bridge_sret_thin_apply(function<cpptw.Twin(int)> fn, int value)
+{
+    cpptw.Twin result = fn(value);
+    return result.value();
+}
+
+int bridge_sret_thin_run(int selector)
+{
+    function<cpptw.Twin(int)> fn = bridge_sret_thin_first;
+    if (selector != 0) fn = bridge_sret_thin_second;
+    return bridge_sret_thin_apply(fn, 3);
+}
+
+interface BridgeOpaqueTwin
+{
+    cpptw.Twin make(int value);
+};
+
+class BridgeOpaqueTwinFirst : BridgeOpaqueTwin
+{
+    cpptw.Twin make(int value) { return cpptw.Twin(value); }
+};
+
+class BridgeOpaqueTwinSecond : BridgeOpaqueTwin
+{
+    cpptw.Twin make(int value) { return cpptw.Twin(value + 100); }
+};
+
+move BridgeOpaqueTwin bridge_sret_iface_pick(int selector)
+{
+    if (selector != 0) return new BridgeOpaqueTwinSecond();
+    return new BridgeOpaqueTwinFirst();
+}
+
+int bridge_sret_iface_apply(BridgeOpaqueTwin value, int input)
+{
+    cpptw.Twin result = value?.make(input);
+    return result.value();
+}
+
+int bridge_sret_iface_run(int selector)
+{
+    BridgeOpaqueTwin value = bridge_sret_iface_pick(selector);
+    return bridge_sret_iface_apply(value, 7);
+}
+
+int bridge_sret_lambda_apply(Lambda<cpptw.Twin(int)> fn, int value)
+{
+    cpptw.Twin result = fn(value);
+    return result.value();
+}
+
+int bridge_sret_lambda_run(int selector)
+{
+    int bias = selector;
+    Lambda<cpptw.Twin(int)> fn = (int value) => { return cpptw.Twin(value + bias); };
+    if (selector != 0)
+        fn = (int value) => { return cpptw.Twin(value + bias + 100); };
+    return bridge_sret_lambda_apply(fn, 5);
+}
+
+int bridge_sret_array_dtors = 0;
+struct BridgeSretArrayElem
+{
+    BridgeSretArrayElem() { }
+    ~BridgeSretArrayElem() { bridge_sret_array_dtors++; }
+};
+
+int bridge_sret_array_base(move BridgeSretArrayElem* value)
+{
+    return 0;
+}
+
+cpptw.Twin bridge_sret_array_return(move BridgeSretArrayElem* value)
+{
+    return cpptw.Twin(1);
+}
+
+cppi.Tracked bridge_capture_return(cppi.Tracked source)
+{
+    Lambda<cppi.Tracked()> captured = () => { return source; };
+    return captured();
+}
+
+int bridge_capture_probe(int value)
+{
+    cppi.Tracked source = cppi.Tracked(value);
+    Lambda<cppi.Tracked()> captured = () => { return source; };
+    cppi.Tracked result = captured();
+    return source.value() * 100 + result.value();
+}
+
+extern cppi.Tracked bridge_exported_for_test(int value)
+{
+    return cppi.Tracked(value);
+}
+
+cppi.ConvertTarget bridge_convert_return(cppi.ConvertSource source)
+{
+    return source;
+}
+
 struct RetTempPlainReturns
 {
     cppi.Tracked ctor_return(int value) { return cppi.Tracked(value); }
@@ -568,6 +1195,29 @@ struct SharedHolderNet : cppt.ModuleBase
     }
     override int forward(int x) { return block->forward(x) + 1; }
 };
+
+struct ReturnSharedBox
+{
+    std.shared_ptr<SharedLeaf> value = default;
+};
+
+std.shared_ptr<SharedLeaf> bridge_return_shared(ReturnSharedBox* box)
+{
+    return box->value;
+}
+
+// A call statement BEFORE the return leaves a dead temporary; the field must still be copied.
+std.shared_ptr<SharedLeaf> bridge_return_shared_after_call(ReturnSharedBox* box)
+{
+    std.make_shared<SharedLeaf>(1);
+    return box->value;
+}
+
+std.function<int(int)> bridge_return_function()
+{
+    std.function<int(int)> local = std.function<int(int)>(stdfn_twice);
+    return local;
+}
 
 Plain nobase_make_plain(int value)
 {
@@ -676,13 +1326,666 @@ struct GrsSigBaseOnly : cpppoly.Shape
     override int area() { return 10; }
 };
 
-extern int main()
+int bridge_range_twin_container<T>(int value)
+{
+    T container = default;
+    container.set(value);
+    int sum = 0;
+    for (int x in container) sum = sum + x;
+    return sum;
+}
+
+int bridge_range_vector_int()
+{
+    std.vector<int> values = default;
+    values.push_back(2); values.push_back(5); values.push_back(8);
+    int sum = 0;
+    for (int x in values) sum = sum + x;
+    return sum;
+}
+
+int bridge_range_vector_string()
+{
+    std.vector<std.string> values = default;
+    values.push_back(std.string("ab"));
+    values.push_back(std.string("cdef"));
+    int total = 0;
+    for (std.string value in values) total = total + (int)value.size();
+    return total;
+}
+
+int bridge_range_map()
+{
+    std.map<int, int> values = default;
+    values[2] = 7;
+    values[5] = 11;
+    int sum = 0;
+    for (auto value in values) sum = sum + value.first + value.second;
+    return sum;
+}
+
+int bridge_range_map_alias()
+{
+    std.map<int, int> values = default;
+    values[2] = 7;
+    values[5] = 11;
+    for (alias auto value in values) value.second = value.second + 1;
+    return values[2] + values[5];
+}
+
+int bridge_range_raw_pointer_element()
+{
+    cpptw.RawPointerRange values = default;
+    int sum = 0;
+    for (int* value in values) sum = sum + *value;
+    return sum;
+}
+
+int bridge_range_set()
+{
+    std.set<int> values = default;
+    values.insert(4); values.insert(9);
+    int sum = 0;
+    for (int x in values) sum = sum + x;
+    return sum;
+}
+
+int bridge_range_list()
+{
+    std.list<int> values = default;
+    values.push_back(3); values.push_back(6);
+    int sum = 0;
+    for (int x in values) sum = sum + x;
+    return sum;
+}
+
+int bridge_range_array()
+{
+    std.array<int, 3> values = default;
+    values[0] = 1; values[1] = 4; values[2] = 9;
+    int sum = 0;
+    for (int x in values) sum = sum + x;
+    return sum;
+}
+
+int bridge_range_mutation()
+{
+    std.vector<int> values = default;
+    values.push_back(1); values.push_back(2);
+    for (alias int x in values) x = x * 10;
+    return values[0] + values[1];
+}
+
+int bridge_range_twin_break_continue()
+{
+    std.vector<cpptw.Twin> values = default;
+    values.push_back(cpptw.Twin(1));
+    values.push_back(cpptw.Twin(2));
+    values.push_back(cpptw.Twin(3));
+    int sum = 0;
+    for (cpptw.Twin value in values)
+    {
+        if (value.value() == 1) continue;
+        sum = sum + value.value();
+        if (value.value() == 2) break;
+    }
+    return sum;
+}
+
+int bridge_range_twin_return()
+{
+    std.vector<cpptw.Twin> values = default;
+    values.push_back(cpptw.Twin(4));
+    values.push_back(cpptw.Twin(6));
+    for (cpptw.Twin value in values)
+        if (value.value() == 6) return value.value();
+    return -1;
+}
+
+std.vector<int> bridge_range_make_vector()
+{
+    std.vector<int> values = default;
+    values.push_back(6); values.push_back(7);
+    return move values;
+}
+
+int bridge_range_temporary()
+{
+    int sum = 0;
+    for (int x in bridge_range_make_vector()) sum = sum + x;
+    return sum;
+}
+
+int bridge_tracked_range_normal()
+{
+    cpptw.TrackedRange values = default;
+    int sum = 0;
+    for (int x in values) sum = sum + x;
+    return sum;
+}
+
+int bridge_tracked_range_break()
+{
+    cpptw.TrackedRange values = default;
+    int sum = 0;
+    for (int x in values)
+    {
+        sum = sum + x;
+        if (x == 5) break;
+    }
+    return sum;
+}
+
+int bridge_tracked_range_continue()
+{
+    cpptw.TrackedRange values = default;
+    int sum = 0;
+    for (int x in values)
+    {
+        if (x == 5) continue;
+        sum = sum + x;
+    }
+    return sum;
+}
+
+int bridge_tracked_range_return_target()
+{
+    cpptw.TrackedRange values = default;
+    for (int x in values)
+        if (x == 5) return x;
+    return -1;
+}
+
+int bridge_tracked_range_nested()
+{
+    cpptw.TrackedRange outer = default;
+    int sum = 0;
+    for (int x in outer)
+    {
+        cpptw.TrackedRange inner = default;
+        for (int y in inner)
+        {
+            sum = sum + y;
+            if (y == 5) break;
+        }
+    }
+    return sum;
+}
+
+int bridge_tracked_range_temporary()
+{
+    int sum = 0;
+    for (int x in cpptw.make_tracked_range()) sum = sum + x;
+    return sum;
+}
+
+int bridge_range_prvalue_by_value()
+{
+    cpptw.PrvalueTwinRange values = default;
+    int sum = 0;
+    for (cpptw.Twin value in values) sum = sum + value.value();
+    return sum;
+}
+
+int bridge_tracked_range_balanced()
+{
+    if (cpptw.tracked_iter_made_count() != cpptw.tracked_iter_dtor_count()) return 0;
+    if (cpptw.tracked_iter_bad_dtor_count() != 0) return 0;
+    if (cpptw.tracked_iter_live_count() != 0) return 0;
+    if (cpptw.tracked_range_made_count() != cpptw.tracked_range_dtor_count()) return 0;
+    if (cpptw.tracked_range_bad_dtor_count() != 0) return 0;
+    if (cpptw.tracked_range_live_count() != 0) return 0;
+    return 1;
+}
+
+extern int main(int argc, char** argv)
 {
     // Win64 keeps the existing SEH trampoline and does not emit the C++ guard, so the
     // whole C++-interop surface is verified on the Itanium-ABI hosts only.
     if const (__WINDOWS__) {
         return 0;
     }
+
+    // Nontrivial C++ by-value parameters use constructors, not an aggregate bit copy.
+    cpptw.reset_counts();
+    {
+        cpptw.Twin source = cpptw.Twin(10);
+        bridge_check("byvalue free lvalue value", bridge_param_free(source), 10);
+    }
+    bridge_check("byvalue free lvalue copy", cpptw.copy_count(), 1);
+    bridge_check("byvalue free lvalue dtor", cpptw.dtor_count(), 2);
+    bridge_check("byvalue free lvalue live", cpptw.live_allocations(), 0);
+    cpptw.reset_counts();
+    bridge_check("byvalue free move prvalue value", bridge_param_free_move(cpptw.Twin(11)), 11);
+    bridge_check("byvalue free move prvalue move", cpptw.move_count(), 1);
+    bridge_check("byvalue free move prvalue dtor", cpptw.dtor_count(), 2);
+    bridge_check("byvalue free move prvalue live", cpptw.live_allocations(), 0);
+
+    cpptw.reset_counts();
+    {
+        BridgeParamMethod method = default;
+        cpptw.Twin source = cpptw.Twin(12);
+        bridge_check("byvalue method lvalue value", method.take(source), 12);
+    }
+    bridge_check("byvalue method lvalue copy", cpptw.copy_count(), 1);
+    bridge_check("byvalue method lvalue dtor", cpptw.dtor_count(), 2);
+    bridge_check("byvalue method lvalue live", cpptw.live_allocations(), 0);
+    cpptw.reset_counts();
+    {
+        BridgeParamMethod method = default;
+        bridge_check("byvalue method move prvalue value", method.take_move(cpptw.Twin(13)), 13);
+    }
+    bridge_check("byvalue method move prvalue move", cpptw.move_count(), 1);
+    bridge_check("byvalue method move prvalue dtor", cpptw.dtor_count(), 2);
+    bridge_check("byvalue method move prvalue live", cpptw.live_allocations(), 0);
+
+    cpptw.reset_counts();
+    {
+        cpptw.Twin source = cpptw.Twin(14);
+        bridge_check("byvalue generic lvalue value", bridge_param_generic<cpptw.Twin>(source), 14);
+    }
+    bridge_check("byvalue generic lvalue copy", cpptw.copy_count(), 1);
+    bridge_check("byvalue generic lvalue dtor", cpptw.dtor_count(), 2);
+    bridge_check("byvalue generic lvalue live", cpptw.live_allocations(), 0);
+    cpptw.reset_counts();
+    bridge_check("byvalue generic move prvalue value",
+        bridge_param_generic_move<cpptw.Twin>(cpptw.Twin(15)), 15);
+    bridge_check("byvalue generic move prvalue move", cpptw.move_count(), 1);
+    bridge_check("byvalue generic move prvalue dtor", cpptw.dtor_count(), 2);
+    bridge_check("byvalue generic move prvalue live", cpptw.live_allocations(), 0);
+
+    cpptw.reset_counts();
+    {
+        cpptw.Twin source = cpptw.Twin(16);
+        Lambda<int(cpptw.Twin)> fn = (cpptw.Twin value) => { return value.value(); };
+        bridge_check("byvalue lambda lvalue value", fn(source), 16);
+    }
+    bridge_check("byvalue lambda lvalue copy", cpptw.copy_count(), 1);
+    bridge_check("byvalue lambda lvalue dtor", cpptw.dtor_count(), 2);
+    bridge_check("byvalue lambda lvalue live", cpptw.live_allocations(), 0);
+    cpptw.reset_counts();
+    {
+        Lambda<int(move cpptw.Twin)> fn = (move cpptw.Twin value) => { return value.value(); };
+        bridge_check("byvalue lambda move prvalue value", fn(cpptw.Twin(17)), 17);
+    }
+    bridge_check("byvalue lambda move prvalue move", cpptw.move_count(), 1);
+    bridge_check("byvalue lambda move prvalue dtor", cpptw.dtor_count(), 2);
+    bridge_check("byvalue lambda move prvalue live", cpptw.live_allocations(), 0);
+
+    cpptw.reset_counts();
+    {
+        cpptw.Twin source = cpptw.Twin(18);
+        function<int(cpptw.Twin)> fn = bridge_param_free;
+        bridge_check("byvalue function pointer lvalue value", fn(source), 18);
+    }
+    bridge_check("byvalue function pointer lvalue copy", cpptw.copy_count(), 1);
+    bridge_check("byvalue function pointer lvalue dtor", cpptw.dtor_count(), 2);
+    bridge_check("byvalue function pointer lvalue live", cpptw.live_allocations(), 0);
+    cpptw.reset_counts();
+    {
+        function<int(move cpptw.Twin)> fn = bridge_param_free_move;
+        bridge_check("byvalue function pointer move prvalue value", fn(cpptw.Twin(19)), 19);
+    }
+    bridge_check("byvalue function pointer move prvalue move", cpptw.move_count(), 1);
+    bridge_check("byvalue function pointer move prvalue dtor", cpptw.dtor_count(), 2);
+    bridge_check("byvalue function pointer move prvalue live", cpptw.live_allocations(), 0);
+
+    cpptw.reset_counts();
+    {
+        BridgeParamIface value = new BridgeParamIfaceImpl();
+        cpptw.Twin source = cpptw.Twin(20);
+        bridge_check("byvalue interface lvalue value", value?.take(source), 20);
+    }
+    bridge_check("byvalue interface lvalue copy", cpptw.copy_count(), 1);
+    bridge_check("byvalue interface lvalue dtor", cpptw.dtor_count(), 2);
+    bridge_check("byvalue interface lvalue live", cpptw.live_allocations(), 0);
+    cpptw.reset_counts();
+    {
+        BridgeParamIface value = new BridgeParamIfaceImpl();
+        bridge_check("byvalue interface move prvalue value", value?.take_move(cpptw.Twin(21)), 21);
+    }
+    bridge_check("byvalue interface move prvalue move", cpptw.move_count(), 1);
+    bridge_check("byvalue interface move prvalue dtor", cpptw.dtor_count(), 2);
+    bridge_check("byvalue interface move prvalue live", cpptw.live_allocations(), 0);
+
+    cpptw.reset_counts();
+    bridge_check("last-use list lvalue add value", bridge_list_lvalue_add_cpp(), 31);
+    bridge_check("last-use list lvalue add copy", cpptw.copy_count(), 1);
+    bridge_check("last-use list lvalue add move", cpptw.move_count(), 1);
+    bridge_check("last-use list lvalue add dtor", cpptw.dtor_count(), 3);
+    bridge_check("last-use list lvalue add live", cpptw.live_allocations(), 0);
+
+    cpptw.reset_counts();
+    {
+        cpptw.Twin source = default;
+        bridge_check("last-use parameter twice value", bridge_cxx_param_twice(source), 0);
+    }
+    bridge_check("last-use parameter twice copy", cpptw.copy_count(), 2);
+    bridge_check("last-use parameter twice move", cpptw.move_count(), 1);
+    bridge_check("last-use parameter twice dtor", cpptw.dtor_count(), 4);
+    bridge_check("last-use parameter twice live", cpptw.live_allocations(), 0);
+
+    cpptw.reset_counts();
+    {
+        cpptw.Twin source = default;
+        bridge_check("last-use parameter loop value", bridge_cxx_param_loop(source), 2);
+    }
+    bridge_check("last-use parameter loop copy", cpptw.copy_count(), 3);
+    bridge_check("last-use parameter loop move", cpptw.move_count(), 1);
+    bridge_check("last-use parameter loop dtor", cpptw.dtor_count(), 5);
+    bridge_check("last-use parameter loop live", cpptw.live_allocations(), 0);
+
+    cpptw.reset_counts();
+    {
+        cpptw.Twin source = default;
+        bridge_cxx_param_outer(source);
+    }
+    bridge_check("last-use parameter forward copy", cpptw.copy_count(), 1);
+    bridge_check("last-use parameter forward move", cpptw.move_count(), 1);
+    bridge_check("last-use parameter forward dtor", cpptw.dtor_count(), 3);
+    bridge_check("last-use parameter forward live", cpptw.live_allocations(), 0);
+
+    cpptw.reset_counts();
+    {
+        cpptw.Twin source = default;
+        cpptw.Twin result = bridge_cxx_param_return(source);
+        bridge_check("last-use parameter return value", result.value(), 0);
+    }
+    bridge_check("last-use parameter return copy", cpptw.copy_count(), 1);
+    bridge_check("last-use parameter return move", cpptw.move_count(), 1);
+    bridge_check("last-use parameter return dtor", cpptw.dtor_count(), 3);
+    bridge_check("last-use parameter return live", cpptw.live_allocations(), 0);
+
+    std.string bridgeText = std.string("0123456789012345678901234567890123456789");
+    bridge_check("byvalue std.string size", bridge_param_string(bridgeText), 48);
+    bridge_check("byvalue std.string source survives", (int)bridgeText.size(), 40);
+    bridge_check("byvalue std.string content survives",
+        strcmp(bridgeText.c_str(), "0123456789012345678901234567890123456789"), 0);
+    std.shared_ptr<int> bridgeShared = std.make_shared<int>(7);
+    bridge_check("byvalue shared_ptr inside count", bridge_param_shared(bridgeShared), 2);
+    bridge_check("byvalue shared_ptr source count", (int)bridgeShared.use_count(), 1);
+
+    bridge_conditional_value = 1;
+    cpptw.reset_counts();
+    bridge_conditional_box_release(bridge_conditional_value != 0);
+    bridge_check("conditional box discard taken dtor", cpptw.dtor_count(), 1);
+    bridge_check("conditional box discard taken live", cpptw.live_allocations(), 0);
+    bridge_conditional_value = 0;
+    cpptw.reset_counts();
+    bridge_conditional_box_release(bridge_conditional_value != 0);
+    bridge_check("conditional box discard not taken dtor", cpptw.dtor_count(), 1);
+    bridge_check("conditional box discard not taken live", cpptw.live_allocations(), 0);
+
+    bridge_conditional_value = 1;
+    cpptw.reset_counts();
+    bridge_conditional_twin_release(bridge_conditional_value != 0);
+    bridge_check("conditional C++ local taken dtor", cpptw.dtor_count(), 1);
+    bridge_check("conditional C++ local taken live", cpptw.live_allocations(), 0);
+
+    bridge_conditional_value = 0;
+    cpptw.reset_counts();
+    bridge_conditional_twin_release(bridge_conditional_value != 0);
+    bridge_check("conditional C++ local not taken dtor", cpptw.dtor_count(), 1);
+    bridge_check("conditional C++ local not taken live", cpptw.live_allocations(), 0);
+
+    bridge_conditional_value = 1;
+    cpptw.reset_counts();
+    bridge_conditional_box_move(bridge_conditional_value != 0);
+    bridge_check("conditional C++ field box taken dtor", cpptw.dtor_count(), 1);
+    bridge_check("conditional C++ field box taken live", cpptw.live_allocations(), 0);
+
+    bridge_conditional_value = 0;
+    cpptw.reset_counts();
+    bridge_conditional_box_move(bridge_conditional_value != 0);
+    bridge_check("conditional C++ field box not taken dtor", cpptw.dtor_count(), 1);
+    bridge_check("conditional C++ field box not taken live", cpptw.live_allocations(), 0);
+
+    bridge_conditional_value = 1;
+    cpptw.reset_counts();
+    bridge_conditional_outer_move(bridge_conditional_value != 0);
+    bridge_check("conditional nested C++ field taken dtor", cpptw.dtor_count(), 1);
+    bridge_check("conditional nested C++ field taken live", cpptw.live_allocations(), 0);
+
+    bridge_conditional_value = 0;
+    cpptw.reset_counts();
+    bridge_conditional_outer_move(bridge_conditional_value != 0);
+    bridge_check("conditional nested C++ field not taken dtor", cpptw.dtor_count(), 1);
+    bridge_check("conditional nested C++ field not taken live", cpptw.live_allocations(), 0);
+
+    bridge_conditional_value = 1;
+    cpptw.reset_counts();
+    bridge_reinit_twin(bridge_conditional_value != 0);
+    bridge_check("reinit released Twin made", cpptw.ctor_count() + cpptw.copy_count()
+        + cpptw.move_count(), 3);
+    bridge_check("reinit released Twin copy construct", cpptw.copy_count(), 1);
+    bridge_check("reinit released Twin dtor", cpptw.dtor_count(), 3);
+    bridge_check("reinit released Twin live", cpptw.live_allocations(), 0);
+
+    bridge_conditional_value = 0;
+    cpptw.reset_counts();
+    bridge_reinit_twin(bridge_conditional_value != 0);
+    bridge_check("reinit live Twin copy assign", cpptw.copy_assign_count(), 1);
+    bridge_check("reinit live Twin dtor", cpptw.dtor_count(), 2);
+    bridge_check("reinit live Twin live", cpptw.live_allocations(), 0);
+
+    bridge_conditional_value = 1;
+    cpptw.reset_counts();
+    bridge_reinit_box(bridge_conditional_value != 0);
+    bridge_check("reinit released Box made", cpptw.ctor_count() + cpptw.copy_count()
+        + cpptw.move_count(), 2);
+    bridge_check("reinit released Box dtor", cpptw.dtor_count(), 2);
+    bridge_check("reinit released Box live", cpptw.live_allocations(), 0);
+
+    bridge_conditional_value = 0;
+    cpptw.reset_counts();
+    bridge_reinit_box(bridge_conditional_value != 0);
+    bridge_check("reinit live Box dtor", cpptw.dtor_count(), 2);
+    bridge_check("reinit live Box live", cpptw.live_allocations(), 0);
+
+    cpptw.reset_counts();
+    bridge_check("reinit Twin constructor prvalue value", bridge_reinit_twin_prvalue(), 2);
+    bridge_check("reinit Twin constructor prvalue move assign", cpptw.move_assign_count(), 1);
+    bridge_check("reinit Twin constructor prvalue dtor", cpptw.dtor_count(), 2);
+    bridge_check("reinit Twin constructor prvalue live", cpptw.live_allocations(), 0);
+
+    bridge_conditional_value = 1;
+    bridge_check("reinit shared_ptr released use count",
+        bridge_reinit_shared_ptr(bridge_conditional_value != 0), 22);
+    bridge_conditional_value = 0;
+    bridge_check("reinit shared_ptr live use count",
+        bridge_reinit_shared_ptr(bridge_conditional_value != 0), 22);
+
+    bridge_conditional_value = 1;
+    cpptw.reset_counts();
+    bridge_conditional_loop(bridge_conditional_value != 0);
+    bridge_check("conditional C++ local loop dtor", cpptw.dtor_count(), 2);
+    bridge_check("conditional C++ local loop live", cpptw.live_allocations(), 0);
+
+    bridge_conditional_value = 0;
+    cpptw.reset_counts();
+    bridge_conditional_loop(bridge_conditional_value != 0);
+    bridge_check("conditional C++ local loop no move dtor", cpptw.dtor_count(), 2);
+    bridge_check("conditional C++ local loop no move live", cpptw.live_allocations(), 0);
+
+    bridge_conditional_value = 1;
+    cpptw.reset_counts();
+    bridge_conditional_loop_break(bridge_conditional_value != 0);
+    bridge_check("conditional C++ local loop break dtor", cpptw.dtor_count(), 1);
+    bridge_check("conditional C++ local loop break live", cpptw.live_allocations(), 0);
+
+    bridge_conditional_value = 0;
+    cpptw.reset_counts();
+    bridge_conditional_loop_break(bridge_conditional_value != 0);
+    bridge_check("conditional C++ local loop break no move dtor", cpptw.dtor_count(), 1);
+    bridge_check("conditional C++ local loop break no move live", cpptw.live_allocations(), 0);
+
+    bridge_conditional_value = 1;
+    cpptw.reset_counts();
+    bridge_conditional_switch(bridge_conditional_value != 0);
+    bridge_check("conditional C++ local switch taken dtor", cpptw.dtor_count(), 1);
+    bridge_check("conditional C++ local switch taken live", cpptw.live_allocations(), 0);
+
+    bridge_conditional_value = 0;
+    cpptw.reset_counts();
+    bridge_conditional_switch(bridge_conditional_value != 0);
+    bridge_check("conditional C++ local switch not taken dtor", cpptw.dtor_count(), 1);
+    bridge_check("conditional C++ local switch not taken live", cpptw.live_allocations(), 0);
+
+    bridge_conditional_value = 1;
+    cpptw.reset_counts();
+    bridge_conditional_both_arms(bridge_conditional_value != 0);
+    bridge_check("conditional C++ local both arms taken dtor", cpptw.dtor_count(), 1);
+    bridge_check("conditional C++ local both arms taken live", cpptw.live_allocations(), 0);
+
+    bridge_conditional_value = 0;
+    cpptw.reset_counts();
+    bridge_conditional_both_arms(bridge_conditional_value != 0);
+    bridge_check("conditional C++ local both arms else dtor", cpptw.dtor_count(), 1);
+    bridge_check("conditional C++ local both arms else live", cpptw.live_allocations(), 0);
+
+    bridge_conditional_value = 1;
+    cpptw.reset_counts();
+    bridge_conditional_return_before_move(bridge_conditional_value != 0);
+    bridge_check("conditional C++ local return before move dtor", cpptw.dtor_count(), 1);
+    bridge_check("conditional C++ local return before move live", cpptw.live_allocations(), 0);
+
+    bridge_conditional_value = 0;
+    cpptw.reset_counts();
+    bridge_conditional_return_before_move(bridge_conditional_value != 0);
+    bridge_check("conditional C++ local return then move dtor", cpptw.dtor_count(), 1);
+    bridge_check("conditional C++ local return then move live", cpptw.live_allocations(), 0);
+
+    bridge_conditional_value = 1;
+    cpptw.reset_counts();
+    bridge_conditional_move_then_return(bridge_conditional_value != 0);
+    bridge_check("conditional C++ local move then return dtor", cpptw.dtor_count(), 1);
+    bridge_check("conditional C++ local move then return live", cpptw.live_allocations(), 0);
+
+    bridge_conditional_value = 0;
+    cpptw.reset_counts();
+    bridge_conditional_move_then_return(bridge_conditional_value != 0);
+    bridge_check("conditional C++ local fallthrough return dtor", cpptw.dtor_count(), 1);
+    bridge_check("conditional C++ local fallthrough return live", cpptw.live_allocations(), 0);
+
+    bridge_check("range-for Twin CFlat begin/end", bridge_range_twin_container<TwinCf>(4), 15);
+    bridge_check("range-for Twin C++ begin/end", bridge_range_twin_container<cpptw.Twin>(4), 15);
+    bridge_check("range-for vector int", bridge_range_vector_int(), 15);
+    bridge_check("range-for vector string length", bridge_range_vector_string(), 6);
+    bridge_check("range-for map key/value", bridge_range_map(), 25);
+    bridge_check("range-for map alias mutation", bridge_range_map_alias(), 20);
+    bridge_check("range-for raw pointer element", bridge_range_raw_pointer_element(), 11);
+    bridge_check("range-for set", bridge_range_set(), 13);
+    bridge_check("range-for list", bridge_range_list(), 9);
+    bridge_check("range-for array", bridge_range_array(), 14);
+    bridge_check("range-for borrowing mutation", bridge_range_mutation(), 30);
+
+    bridge_reset_cf();
+    bridge_check("list Twin CFlat value", bridge_list_twin<TwinCf>(), 23);
+    bridge_check("list Twin CFlat ctor", bridge_cf_ctor, 3);
+    bridge_check("list Twin CFlat copy", bridge_cf_copy, 4);
+    bridge_check("list Twin CFlat move", bridge_cf_move, 0);
+    bridge_check("list Twin CFlat dtor", bridge_cf_dtor, 9);
+    bridge_check("list Twin CFlat live", bridge_cf_live, 0);
+
+    cpptw.reset_counts();
+    bridge_check("list Twin C++ value", bridge_list_twin<cpptw.Twin>(), 23);
+    bridge_check("list Twin C++ ctor", cpptw.ctor_count(), 3);
+    bridge_check("list Twin C++ copy", cpptw.copy_count(), 4);
+    bridge_check("list Twin C++ move", cpptw.move_count(), 7);
+    bridge_check("list Twin C++ dtor", cpptw.dtor_count(), 14);
+    bridge_check("list Twin C++ live", cpptw.live_allocations(), 0);
+    bridge_check("list Twin C++ balance", cpptw.ctor_count() + cpptw.copy_count() + cpptw.move_count(),
+        cpptw.dtor_count());
+
+    bridge_reset_cf();
+    bridge_check("list Twin CFlat growth value", bridge_list_growth<TwinCf>(), 780);
+    cpptw.reset_counts();
+    bridge_check("list Twin C++ growth value", bridge_list_growth<cpptw.Twin>(), 780);
+    bridge_check("list Twin C++ growth ctor", cpptw.ctor_count(), 40);
+    bridge_check("list Twin C++ growth copy", cpptw.copy_count(), 0);
+    bridge_check("list Twin C++ growth move", cpptw.move_count(), 140);
+    bridge_check("list Twin C++ growth dtor", cpptw.dtor_count(), 180);
+    bridge_check("list Twin C++ growth balance",
+        cpptw.ctor_count() + cpptw.copy_count() + cpptw.move_count(), cpptw.dtor_count());
+    bridge_check("list Twin C++ growth live", cpptw.live_allocations(), 0);
+
+    bridge_reset_cf();
+    bridge_check("list Twin CFlat shift value", bridge_list_shift_heavy<TwinCf>(), 1080);
+    cpptw.reset_counts();
+    bridge_check("list Twin C++ shift value", bridge_list_shift_heavy<cpptw.Twin>(), 1080);
+    bridge_check("list Twin C++ shift ctor", cpptw.ctor_count(), 20);
+    bridge_check("list Twin C++ shift copy", cpptw.copy_count(), 0);
+    bridge_check("list Twin C++ shift move", cpptw.move_count(), 87);
+    bridge_check("list Twin C++ shift dtor", cpptw.dtor_count(), 107);
+    bridge_check("list Twin C++ shift balance",
+        cpptw.ctor_count() + cpptw.copy_count() + cpptw.move_count(), cpptw.dtor_count());
+    bridge_check("list Twin C++ shift live", cpptw.live_allocations(), 0);
+
+    bridge_reset_cf();
+    bridge_check("fixed array Twin CFlat live overwrite value", bridge_fixed_array_live_overwrite<TwinCf>(), 9);
+    bridge_check("fixed array Twin CFlat live overwrite", bridge_cf_live, 0);
+    cpptw.reset_counts();
+    bridge_check("fixed array Twin C++ live overwrite value", bridge_fixed_array_live_overwrite<cpptw.Twin>(), 9);
+    bridge_check("fixed array Twin C++ live overwrite copy assign", cpptw.copy_assign_count(), 2);
+    bridge_check("fixed array Twin C++ live overwrite live", cpptw.live_allocations(), 0);
+
+    bridge_reset_cf();
+    bridge_check("list Twin CFlat sort value", bridge_list_sort_cf(), 1230);
+    bridge_check("list Twin CFlat sort live", bridge_cf_live, 0);
+    cpptw.reset_counts();
+    bridge_check("list Twin C++ sort value", bridge_list_sort_cpp(), 1230);
+    bridge_check("list Twin C++ sort live", cpptw.live_allocations(), 0);
+    bridge_check("list Twin C++ sort balance",
+        cpptw.ctor_count() + cpptw.copy_count() + cpptw.move_count(), cpptw.dtor_count());
+
+    bridge_check("list Twin CFlat prvalue", bridge_list_prvalue_cf(), 7);
+    bridge_check("list Twin C++ prvalue", bridge_list_prvalue_cpp(), 7);
+    bridge_check("list Twin CFlat call result", bridge_list_call_cf(), 8);
+    bridge_check("list Twin C++ call result", bridge_list_call_cpp(), 8);
+
+    bridge_check("list std.string growth length", bridge_list_string(), 15);
+    bridge_check("list shared_ptr use counts", bridge_list_shared(), 2211);
+    bridge_check("list Twin CFlat field", bridge_list_field<TwinCf>(), 6);
+    bridge_check("list Twin C++ field", bridge_list_field<cpptw.Twin>(), 6);
+    bridge_check("list CFlat Box with Twin field", bridge_list_box(), 10);
+
+    cpptw.reset_counts();
+    bridge_check("range-for Twin break/continue", bridge_range_twin_break_continue(), 2);
+    bridge_check("range-for Twin break/continue balance",
+        cpptw.ctor_count() + cpptw.copy_count() + cpptw.move_count(), cpptw.dtor_count());
+    bridge_check("range-for Twin break/continue live", cpptw.live_allocations(), 0);
+
+    cpptw.reset_counts();
+    bridge_check("range-for Twin return", bridge_range_twin_return(), 6);
+    bridge_check("range-for Twin return balance",
+        cpptw.ctor_count() + cpptw.copy_count() + cpptw.move_count(), cpptw.dtor_count());
+    bridge_check("range-for Twin return live", cpptw.live_allocations(), 0);
+    bridge_check("range-for temporary collection", bridge_range_temporary(), 13);
+
+    cpptw.reset_tracked_range_counts();
+    bridge_check("range-for tracked normal value", bridge_tracked_range_normal(), 15);
+    bridge_check("range-for tracked normal resources", bridge_tracked_range_balanced(), 1);
+
+    cpptw.reset_tracked_range_counts();
+    bridge_check("range-for tracked break value", bridge_tracked_range_break(), 8);
+    bridge_check("range-for tracked break resources", bridge_tracked_range_balanced(), 1);
+
+    cpptw.reset_tracked_range_counts();
+    bridge_check("range-for tracked continue value", bridge_tracked_range_continue(), 10);
+    bridge_check("range-for tracked continue resources", bridge_tracked_range_balanced(), 1);
+
+    cpptw.reset_tracked_range_counts();
+    bridge_check("range-for tracked return value", bridge_tracked_range_return_target(), 5);
+    bridge_check("range-for tracked return resources", bridge_tracked_range_balanced(), 1);
+
+    cpptw.reset_tracked_range_counts();
+    bridge_check("range-for tracked nested value", bridge_tracked_range_nested(), 24);
+    bridge_check("range-for tracked nested resources", bridge_tracked_range_balanced(), 1);
+
+    cpptw.reset_tracked_range_counts();
+    bridge_check("range-for tracked temporary value", bridge_tracked_range_temporary(), 15);
+    bridge_check("range-for tracked temporary resources", bridge_tracked_range_balanced(), 1);
+    bridge_check("range-for custom prvalue by value", bridge_range_prvalue_by_value(), 3);
 
     // ---- generic CFlat-defined [cpp] structs ----------------------------------------------------
     cppt.tplbase.reset_holder_int_dtors();
@@ -1199,6 +2502,59 @@ extern int main()
     if (cppi.ctor_count() != 2 || cppi.copy_count() != 0 || cppi.move_count() != 0
         || cppi.dtor_count() != 2) return 1495;
 
+    cppi.reset_counts();
+    {
+        BridgeTrackedIface iface = new BridgeTrackedImpl();
+        cppi.Tracked value = iface?.make(41);
+        bridge_check("interface C++ return value", value.value(), 41);
+    }
+    bridge_check("interface C++ return ctor", cppi.ctor_count(), 1);
+    bridge_check("interface C++ return copy", cppi.copy_count(), 0);
+    bridge_check("interface C++ return move", cppi.move_count(), 0);
+    bridge_check("interface C++ return dtor", cppi.dtor_count(), 1);
+    bridge_check("extern C++ caller return value", cpptw.call_bridge_exported(47), 47);
+
+    cppi.reset_counts();
+    {
+        BridgeTrackedDerived derived = default;
+        cppi.TrackedBase* base = &derived;
+        cppi.Tracked value = base->make(59);
+        bridge_check("virtual C++ return value", value.value(), 59);
+    }
+    bridge_check("virtual C++ return ctor", cppi.ctor_count(), 1);
+    bridge_check("virtual C++ return copy", cppi.copy_count(), 0);
+    bridge_check("virtual C++ return move", cppi.move_count(), 0);
+    bridge_check("virtual C++ return dtor", cppi.dtor_count(), 1);
+
+    bridge_check("opaque virtual C++ return", bridge_sret_virtual_run(argc > 1), 7);
+    bridge_check("opaque thin function return", bridge_sret_thin_run(argc > 1), 3);
+    bridge_check("opaque interface return", bridge_sret_iface_run(argc > 1), 7);
+    bridge_check("opaque captured lambda return", bridge_sret_lambda_run(argc > 1), 5);
+
+    bridge_sret_array_dtors = 0;
+    BridgeSretArrayElem* arrayBase = new BridgeSretArrayElem[3];
+    bridge_sret_array_base(move arrayBase);
+    bridge_check("sret raw array base dtors", bridge_sret_array_dtors, 3);
+    bridge_sret_array_dtors = 0;
+    BridgeSretArrayElem* arrayReturn = new BridgeSretArrayElem[3];
+    cpptw.Twin arrayResult = bridge_sret_array_return(move arrayReturn);
+    bridge_check("sret raw array return dtors", bridge_sret_array_dtors, 3);
+
+    cppi.reset_counts();
+    {
+        cppi.Tracked value = bridge_capture_return(cppi.Tracked(43));
+        bridge_check("captured C++ return value", value.value(), 43);
+    }
+    bridge_check("captured C++ return copy", cppi.copy_count(), 2);
+    bridge_check("captured C++ return move", cppi.move_count(), 1);
+    bridge_check("captured C++ return dtor", cppi.dtor_count(), 4);
+    bridge_check("captured C++ source remains", bridge_capture_probe(43), 4343);
+
+    {
+        cppi.ConvertTarget value = bridge_convert_return(cppi.ConvertSource(53));
+        bridge_check("converted C++ return value", value.value(), 53);
+    }
+
     if (rettempRegistry.ctor_reg != 4) return 1496;
     if (rettempRegistry.implicit_reg(5) != 7) return 1497;
     if (rettempRegistry.explicit_reg(6) != 8) return 1498;
@@ -1402,6 +2758,20 @@ extern int main()
         if (fromGlobal->forward(2) != 18)               return 1709;
     }
 
+    {
+        ReturnSharedBox box = default;
+        box.value = std.make_shared<SharedLeaf>(4);
+        std.shared_ptr<SharedLeaf> returned = bridge_return_shared(&box);
+        bridge_check("bridge return shared_ptr value", (int)returned.use_count(), 2);
+        std.shared_ptr<SharedLeaf> afterCall = bridge_return_shared_after_call(&box);
+        bridge_check("bridge return shared_ptr after a call statement", (int)afterCall.use_count(), 3);
+        if ((int)box.value.use_count() != 3) return 1710;
+    }
+    // The return slot owns the copied function object; the local in bridge_return_function is
+    // moved-from and destroyed exactly once before this call observes the returned handler.
+    std.function<int(int)> returnedFunction = bridge_return_function();
+    bridge_check("bridge return std.function value", returnedFunction(2), 4);
+
     // ---- std::function as a member parameter and as a return type -------------------------------
     // Every member leg below was refused at bind time ("member '...' takes/returns unsupported
     // type 'std::function<...>'") while the free-function parameter forms bound.
@@ -1533,6 +2903,20 @@ extern int main()
     bridge_check("bridge lifetime C++ dtor", cpptw.dtor_count(), 3);
     bridge_check("bridge lifetime C++ live", cpptw.live_allocations(), 0);
 
+    // A parameterized constructor runs field initialization and its own body, not the user
+    // no-arg body. The same generic harness must produce the same constructor count for both twins.
+    bridge_reset_cf();
+    bridge_check("bridge parameterized CFlat value", bridge_parameterized<TwinCf>(7), 7);
+    bridge_check("bridge parameterized CFlat ctor", bridge_cf_ctor, 1);
+    bridge_check("bridge parameterized CFlat dtor", bridge_cf_dtor, 1);
+    bridge_check("bridge parameterized CFlat live", bridge_cf_live, 0);
+
+    cpptw.reset_counts();
+    bridge_check("bridge parameterized C++ value", bridge_parameterized<cpptw.Twin>(7), 7);
+    bridge_check("bridge parameterized C++ ctor", cpptw.ctor_count(), 1);
+    bridge_check("bridge parameterized C++ dtor", cpptw.dtor_count(), 1);
+    bridge_check("bridge parameterized C++ live", cpptw.live_allocations(), 0);
+
     bridge_reset_cf();
     int bridgeArrayCf = bridge_fixed_array<TwinCf>();
     bridge_check("bridge fixed array CFlat value", bridgeArrayCf, 11);
@@ -1550,6 +2934,71 @@ extern int main()
     bridge_check("bridge fixed array C++ move", cpptw.move_count(), 0);
     bridge_check("bridge fixed array C++ dtor", cpptw.dtor_count(), 2);
     bridge_check("bridge fixed array C++ live", cpptw.live_allocations(), 0);
+
+    // Brace-constructed CFlat values call the user no-arg constructor, just like C++.
+    bridge_reset_cf();
+    int bridgeBracePrvalueCf = bridge_brace_array_prvalue_cf();
+    bridge_check("bridge brace-init array prvalue CFlat value", bridgeBracePrvalueCf, 0);
+    bridge_check("bridge brace-init array prvalue CFlat dtor", bridge_cf_dtor, 2);
+    bridge_check("bridge brace-init array prvalue CFlat live", bridge_cf_live, 0);
+
+    cpptw.reset_counts();
+    int bridgeBracePrvalueCpp = bridge_brace_array_prvalue_cpp();
+    bridge_check("bridge brace-init array prvalue C++ value", bridgeBracePrvalueCpp, 0);
+    bridge_check("bridge brace-init array prvalue C++ ctor", cpptw.ctor_count(), 2);
+    bridge_check("bridge brace-init array prvalue C++ copy", cpptw.copy_count(), 0);
+    bridge_check("bridge brace-init array prvalue C++ move", cpptw.move_count(), 0);
+    bridge_check("bridge brace-init array prvalue C++ dtor", cpptw.dtor_count(), 2);
+    bridge_check("bridge brace-init array prvalue C++ live", cpptw.live_allocations(), 0);
+
+    bridge_reset_cf();
+    int bridgeBraceLvalueCf = bridge_brace_array_lvalue_cf();
+    bridge_check("bridge brace-init array lvalue CFlat value", bridgeBraceLvalueCf, 15);
+    bridge_check("bridge brace-init array lvalue CFlat dtor", bridge_cf_dtor, 4);
+    bridge_check("bridge brace-init array lvalue CFlat live", bridge_cf_live, 0);
+
+    cpptw.reset_counts();
+    int bridgeBraceLvalueCpp = bridge_brace_array_lvalue_cpp();
+    bridge_check("bridge brace-init array lvalue C++ value", bridgeBraceLvalueCpp, 15);
+    bridge_check("bridge brace-init array lvalue C++ ctor", cpptw.ctor_count(), 2);
+    bridge_check("bridge brace-init array lvalue C++ copy", cpptw.copy_count(), 2);
+    bridge_check("bridge brace-init array lvalue C++ move", cpptw.move_count(), 0);
+    bridge_check("bridge brace-init array lvalue C++ dtor", cpptw.dtor_count(), 4);
+    bridge_check("bridge brace-init array lvalue C++ live", cpptw.live_allocations(), 0);
+
+    bridge_reset_cf();
+    int bridgeBraceMoveCf = bridge_brace_array_move_cf();
+    bridge_check("bridge brace-init array move CFlat value", bridgeBraceMoveCf, 8);
+    bridge_check("bridge brace-init array move CFlat dtor", bridge_cf_dtor, 2);
+    bridge_check("bridge brace-init array move CFlat live", bridge_cf_live, 0);
+
+    cpptw.reset_counts();
+    int bridgeBraceMoveCpp = bridge_brace_array_move_cpp();
+    bridge_check("bridge brace-init array move C++ value", bridgeBraceMoveCpp, 8);
+    bridge_check("bridge brace-init array move C++ ctor", cpptw.ctor_count(), 1);
+    bridge_check("bridge brace-init array move C++ copy", cpptw.copy_count(), 0);
+    bridge_check("bridge brace-init array move C++ move", cpptw.move_count(), 1);
+    bridge_check("bridge brace-init array move C++ dtor", cpptw.dtor_count(), 2);
+    bridge_check("bridge brace-init array move C++ live", cpptw.live_allocations(), 0);
+
+    bridge_reset_cf();
+    int bridgeBraceShortCf = bridge_brace_array_short_cf();
+    bridge_check("bridge brace-init array short CFlat value", bridgeBraceShortCf, 0);
+    bridge_check("bridge brace-init array short CFlat dtor", bridge_cf_dtor, 3);
+    bridge_check("bridge brace-init array short CFlat live", bridge_cf_live, 0);
+
+    cpptw.reset_counts();
+    int bridgeBraceShortCpp = bridge_brace_array_short_cpp();
+    bridge_check("bridge brace-init array short C++ value", bridgeBraceShortCpp, 0);
+    bridge_check("bridge brace-init array short C++ ctor", cpptw.ctor_count(), 3);
+    bridge_check("bridge brace-init array short C++ copy", cpptw.copy_count(), 0);
+    bridge_check("bridge brace-init array short C++ move", cpptw.move_count(), 0);
+    bridge_check("bridge brace-init array short C++ dtor", cpptw.dtor_count(), 3);
+    bridge_check("bridge brace-init array short C++ live", cpptw.live_allocations(), 0);
+    bridge_check("bridge brace-init array call then lvalue copies", bridge_brace_array_call_then_lvalue(), 221);
+    cpptw.reset_counts();
+    bridge_check("bridge brace-init array CFlat function result value", bridge_brace_array_cflat_result(), 30);
+    bridge_check("bridge brace-init array CFlat function result live", cpptw.live_allocations(), 0);
 
     bridge_reset_cf();
     int bridgeFieldCf = bridge_struct_field<TwinCf>();
@@ -1586,6 +3035,173 @@ extern int main()
     bridge_check("bridge copy field C++ move", cpptw.move_count(), 0);
     bridge_check("bridge copy field C++ dtor", cpptw.dtor_count(), 2);
     bridge_check("bridge copy field C++ live", cpptw.live_allocations(), 0);
+
+    bridge_reset_cf();
+    int bridgeEnclosingCopyCf = bridge_copy_field<TwinCf>();
+    bridge_check("bridge enclosing copy CFlat value", bridgeEnclosingCopyCf, 16);
+    bridge_check("bridge enclosing copy CFlat ctor", bridge_cf_ctor, 1);
+    bridge_check("bridge enclosing copy CFlat copy", bridge_cf_copy, 1);
+    bridge_check("bridge enclosing copy CFlat dtor", bridge_cf_dtor, 2);
+    bridge_check("bridge enclosing copy CFlat live", bridge_cf_live, 0);
+
+    cpptw.reset_counts();
+    int bridgeEnclosingCopyCpp = bridge_copy_field<cpptw.Twin>();
+    bridge_check("bridge enclosing copy C++ value", bridgeEnclosingCopyCpp, 16);
+    bridge_check("bridge enclosing copy C++ ctor", cpptw.ctor_count(), 1);
+    bridge_check("bridge enclosing copy C++ copy", cpptw.copy_count(), 1);
+    bridge_check("bridge enclosing copy C++ dtor", cpptw.dtor_count(), 2);
+    bridge_check("bridge enclosing copy C++ live", cpptw.live_allocations(), 0);
+
+    bridge_reset_cf();
+    int bridgeEnclosingAssignCf = bridge_enclosing_assign<TwinCf>();
+    bridge_check("bridge enclosing assignment CFlat value", bridgeEnclosingAssignCf, 7);
+    bridge_check("bridge enclosing assignment CFlat ctor", bridge_cf_ctor, 2);
+    bridge_check("bridge enclosing assignment CFlat copy", bridge_cf_copy, 1);
+    bridge_check("bridge enclosing assignment CFlat dtor", bridge_cf_dtor, 3);
+    bridge_check("bridge enclosing assignment CFlat live", bridge_cf_live, 0);
+
+    cpptw.reset_counts();
+    int bridgeEnclosingAssignCpp = bridge_enclosing_assign<cpptw.Twin>();
+    bridge_check("bridge enclosing assignment C++ value", bridgeEnclosingAssignCpp, 7);
+    bridge_check("bridge enclosing assignment C++ ctor", cpptw.ctor_count(), 2);
+    bridge_check("bridge enclosing assignment C++ copy", cpptw.copy_count(), 1);
+    bridge_check("bridge enclosing assignment C++ dtor", cpptw.dtor_count(), 3);
+    bridge_check("bridge enclosing assignment C++ live", cpptw.live_allocations(), 0);
+
+    bridge_reset_cf();
+    int bridgeEnclosingNestedCf = bridge_enclosing_nested_copy<TwinCf>();
+    bridge_check("bridge nested enclosing copy CFlat value", bridgeEnclosingNestedCf, 7);
+    bridge_check("bridge nested enclosing copy CFlat ctor", bridge_cf_ctor, 1);
+    bridge_check("bridge nested enclosing copy CFlat copy", bridge_cf_copy, 1);
+    bridge_check("bridge nested enclosing copy CFlat dtor", bridge_cf_dtor, 2);
+    bridge_check("bridge nested enclosing copy CFlat live", bridge_cf_live, 0);
+
+    cpptw.reset_counts();
+    int bridgeEnclosingNestedCpp = bridge_enclosing_nested_copy<cpptw.Twin>();
+    bridge_check("bridge nested enclosing copy C++ value", bridgeEnclosingNestedCpp, 7);
+    bridge_check("bridge nested enclosing copy C++ ctor", cpptw.ctor_count(), 1);
+    bridge_check("bridge nested enclosing copy C++ copy", cpptw.copy_count(), 1);
+    bridge_check("bridge nested enclosing copy C++ dtor", cpptw.dtor_count(), 2);
+    bridge_check("bridge nested enclosing copy C++ live", cpptw.live_allocations(), 0);
+
+    bridge_reset_cf();
+    int bridgeEnclosingMoveCf = bridge_enclosing_move<TwinCf>();
+    bridge_check("bridge enclosing move CFlat value", bridgeEnclosingMoveCf, 7);
+    bridge_check("bridge enclosing move CFlat ctor", bridge_cf_ctor, 1);
+    bridge_check("bridge enclosing move CFlat copy", bridge_cf_copy, 0);
+    bridge_check("bridge enclosing move CFlat dtor", bridge_cf_dtor, 2);
+    bridge_check("bridge enclosing move CFlat live", bridge_cf_live, 0);
+
+    cpptw.reset_counts();
+    int bridgeEnclosingMoveCpp = bridge_enclosing_move<cpptw.Twin>();
+    bridge_check("bridge enclosing move C++ value", bridgeEnclosingMoveCpp, 7);
+    bridge_check("bridge enclosing move C++ ctor", cpptw.ctor_count(), 1);
+    bridge_check("bridge enclosing move C++ copy", cpptw.copy_count(), 0);
+    bridge_check("bridge enclosing move C++ move", cpptw.move_count(), 0);
+    bridge_check("bridge enclosing move C++ dtor", cpptw.dtor_count(), 1);
+    bridge_check("bridge enclosing move C++ live", cpptw.live_allocations(), 0);
+
+    bridge_reset_cf();
+    int bridgeEnclosingArrayCf = bridge_enclosing_array_copy<TwinCf>();
+    bridge_check("bridge array-field copy CFlat value", bridgeEnclosingArrayCf, 15);
+    bridge_check("bridge array-field copy CFlat ctor", bridge_cf_ctor, 2);
+    bridge_check("bridge array-field copy CFlat copy", bridge_cf_copy, 2);
+    bridge_check("bridge array-field copy CFlat dtor", bridge_cf_dtor, 4);
+    bridge_check("bridge array-field copy CFlat live", bridge_cf_live, 0);
+
+    cpptw.reset_counts();
+    int bridgeEnclosingArrayCpp = bridge_enclosing_array_copy<cpptw.Twin>();
+    bridge_check("bridge array-field copy C++ value", bridgeEnclosingArrayCpp, 15);
+    bridge_check("bridge array-field copy C++ ctor", cpptw.ctor_count(), 2);
+    bridge_check("bridge array-field copy C++ copy", cpptw.copy_count(), 2);
+    bridge_check("bridge array-field copy C++ dtor", cpptw.dtor_count(), 4);
+    bridge_check("bridge array-field copy C++ live", cpptw.live_allocations(), 0);
+
+    bridge_reset_cf();
+    int bridgeBraceFieldCf = bridge_enclosing_brace_lvalue_cf();
+    bridge_check("bridge enclosing brace lvalue CFlat value", bridgeBraceFieldCf, 4);
+    bridge_check("bridge enclosing brace lvalue CFlat ctor", bridge_cf_ctor, 2);
+    bridge_check("bridge enclosing brace lvalue CFlat copy", bridge_cf_copy, 1);
+    bridge_check("bridge enclosing brace lvalue CFlat dtor", bridge_cf_dtor, 3);
+    bridge_check("bridge enclosing brace lvalue CFlat live", bridge_cf_live, 0);
+
+    cpptw.reset_counts();
+    int bridgeBraceFieldCpp = bridge_enclosing_brace_lvalue_cpp();
+    bridge_check("bridge enclosing brace lvalue C++ value", bridgeBraceFieldCpp, 4);
+    bridge_check("bridge enclosing brace lvalue C++ ctor", cpptw.ctor_count(), 2);
+    bridge_check("bridge enclosing brace lvalue C++ copy", cpptw.copy_count(), 1);
+    bridge_check("bridge enclosing brace lvalue C++ move", cpptw.move_count(), 0);
+    bridge_check("bridge enclosing brace lvalue C++ dtor", cpptw.dtor_count(), 3);
+    bridge_check("bridge enclosing brace lvalue C++ live", cpptw.live_allocations(), 0);
+
+    cpptw.reset_counts();
+    int bridgeBracePrvalueFieldCpp = bridge_enclosing_brace_prvalue_cpp();
+    bridge_check("bridge enclosing brace prvalue C++ value", bridgeBracePrvalueFieldCpp, 4);
+    bridge_check("bridge enclosing brace prvalue C++ ctor", cpptw.ctor_count(), 2);
+    bridge_check("bridge enclosing brace prvalue C++ copy", cpptw.copy_count(), 0);
+    bridge_check("bridge enclosing brace prvalue C++ move", cpptw.move_count(), 1);
+    bridge_check("bridge enclosing brace prvalue C++ dtor", cpptw.dtor_count(), 3);
+    bridge_check("bridge enclosing brace prvalue C++ live", cpptw.live_allocations(), 0);
+
+    cpptw.reset_counts();
+    int bridgeBraceArrayFieldCpp = bridge_enclosing_brace_array_cpp();
+    bridge_check("bridge enclosing array-field brace C++ value", bridgeBraceArrayFieldCpp, 7);
+    bridge_check("bridge enclosing array-field brace C++ ctor", cpptw.ctor_count(), 4);
+    bridge_check("bridge enclosing array-field brace C++ copy", cpptw.copy_count(), 1);
+    bridge_check("bridge enclosing array-field brace C++ move", cpptw.move_count(), 0);
+    bridge_check("bridge enclosing array-field brace C++ dtor", cpptw.dtor_count(), 5);
+    bridge_check("bridge enclosing array-field brace C++ live", cpptw.live_allocations(), 0);
+
+    bridge_check("bridge enclosing std.string field copy", bridge_enclosing_string_copy(), 17);
+    bridge_check("bridge enclosing shared_ptr field copy", bridge_enclosing_shared_copy(), 271);
+
+    bridge_reset_cf();
+    {
+        BridgeFieldHolder<TwinCf> holder = default;
+        holder.value.set(9);
+        TwinCf returned = bridge_return_field<TwinCf>(&holder);
+        bridge_check("bridge return field CFlat value", returned.value(), 9);
+    }
+    bridge_check("bridge return field CFlat ctor", bridge_cf_ctor, 1);
+    bridge_check("bridge return field CFlat copy", bridge_cf_copy, 1);
+    bridge_check("bridge return field CFlat move", bridge_cf_move, 0);
+    bridge_check("bridge return field CFlat dtor", bridge_cf_dtor, 2);
+    bridge_check("bridge return field CFlat live", bridge_cf_live, 0);
+
+    cpptw.reset_counts();
+    {
+        BridgeFieldHolder<cpptw.Twin> holder = default;
+        holder.value.set(9);
+        cpptw.Twin returned = bridge_return_field<cpptw.Twin>(&holder);
+        bridge_check("bridge return field C++ value", returned.value(), 9);
+    }
+    bridge_check("bridge return field C++ ctor", cpptw.ctor_count(), 1);
+    bridge_check("bridge return field C++ copy", cpptw.copy_count(), 1);
+    bridge_check("bridge return field C++ move", cpptw.move_count(), 0);
+    bridge_check("bridge return field C++ dtor", cpptw.dtor_count(), 2);
+    bridge_check("bridge return field C++ live", cpptw.live_allocations(), 0);
+
+    bridge_reset_cf();
+    {
+        TwinCf returned = bridge_return_local<TwinCf>(10);
+        bridge_check("bridge return local CFlat value", returned.value(), 10);
+    }
+    bridge_check("bridge return local CFlat ctor", bridge_cf_ctor, 1);
+    bridge_check("bridge return local CFlat copy", bridge_cf_copy, 0);
+    bridge_check("bridge return local CFlat move", bridge_cf_move, 0);
+    bridge_check("bridge return local CFlat dtor", bridge_cf_dtor, 1);
+    bridge_check("bridge return local CFlat live", bridge_cf_live, 0);
+
+    cpptw.reset_counts();
+    {
+        cpptw.Twin returned = bridge_return_local<cpptw.Twin>(10);
+        bridge_check("bridge return local C++ value", returned.value(), 10);
+    }
+    bridge_check("bridge return local C++ ctor", cpptw.ctor_count(), 1);
+    bridge_check("bridge return local C++ copy", cpptw.copy_count(), 0);
+    bridge_check("bridge return local C++ move", cpptw.move_count(), 1);
+    bridge_check("bridge return local C++ dtor", cpptw.dtor_count(), 2);
+    bridge_check("bridge return local C++ live", cpptw.live_allocations(), 0);
 
     bridge_reset_cf();
     int bridgeReferenceCf = 0;

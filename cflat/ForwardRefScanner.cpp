@@ -1172,9 +1172,18 @@ std::string ForwardRefScanner::ResolveForwardTypeArg(CFlatParser::TypeParameterE
             resolved = Compiler(entry)->ResolveTypeArgBaseName(CanonicalTemplateTypeArgument(entry));
             if (entry->pointer() == nullptr && entry->arrayTypeSuffix() == nullptr
                 && entry->Identifier() == nullptr && typeSpec != nullptr
-                && typeSpec->genericIdentifier() != nullptr
-                && typeSpec->genericIdentifier()->genericTypeParameters() == nullptr)
+                && ((typeSpec->genericIdentifier() != nullptr
+                     && typeSpec->genericIdentifier()->genericTypeParameters() == nullptr)
+                    || (typeSpec->qualifiedGenericIdentifier() != nullptr
+                        && typeSpec->qualifiedGenericIdentifier()->genericTypeParameters() == nullptr)))
             {
+                // A plain imported C++ class used directly as a generic argument (for example
+                // std.string in list<std.string>) must be materialized during the scan too.
+                if (resolved.find('.') != std::string::npos)
+                {
+                    std::string cxxError;
+                    Compiler(entry)->TryRequestCxxType(resolved, {}, resolved, cxxError);
+                }
                 if (Compiler(entry)->IsTypeArgTypeKey(resolved)
                     || Compiler(entry)->IsKnownTypeName(resolved))
                     ;

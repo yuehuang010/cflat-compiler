@@ -390,6 +390,41 @@ std::string MainListener::InstantiateGenericFunction(const std::string& baseName
         // and "Instruction does not dominate all uses" verifier error).
         auto savedStack = std::move(instCompiler->stackNamedVariable);
         instCompiler->stackNamedVariable.clear();
+        // The body may itself return a foreign C++ class. Keep its transient sret arm private so
+        // instantiating it cannot consume the caller's pending return destination.
+        struct PendingCxxReturnScope
+        {
+            LLVMBackend* backend;
+            llvm::Value* sret;
+            std::string sretType;
+            bool sretReturn;
+            llvm::Value* ternary;
+            std::string ternaryType;
+            bool ternaryConsumed;
+            bool ternaryFailed;
+            ~PendingCxxReturnScope()
+            {
+                backend->pendingCxxSretDest_ = sret;
+                backend->pendingCxxSretTypeName_ = std::move(sretType);
+                backend->pendingCxxSretReturn_ = sretReturn;
+                backend->pendingCxxTernaryDeclDest_ = ternary;
+                backend->pendingCxxTernaryDeclTypeName_ = std::move(ternaryType);
+                backend->pendingCxxTernaryDeclConsumed_ = ternaryConsumed;
+                backend->pendingCxxTernaryDeclFailed_ = ternaryFailed;
+            }
+        } pendingCxxReturnScope{
+            instCompiler, instCompiler->pendingCxxSretDest_,
+            instCompiler->pendingCxxSretTypeName_, instCompiler->pendingCxxSretReturn_,
+            instCompiler->pendingCxxTernaryDeclDest_,
+            instCompiler->pendingCxxTernaryDeclTypeName_,
+            instCompiler->pendingCxxTernaryDeclConsumed_, instCompiler->pendingCxxTernaryDeclFailed_};
+        instCompiler->pendingCxxSretDest_ = nullptr;
+        instCompiler->pendingCxxSretTypeName_.clear();
+        instCompiler->pendingCxxSretReturn_ = false;
+        instCompiler->pendingCxxTernaryDeclDest_ = nullptr;
+        instCompiler->pendingCxxTernaryDeclTypeName_.clear();
+        instCompiler->pendingCxxTernaryDeclConsumed_ = false;
+        instCompiler->pendingCxxTernaryDeclFailed_ = false;
         // Tail of the module's function list before the body walk: anything appended below is
         // this instantiation's, and must be sealed if the walk throws (expect_error resumes).
         auto& functionList = instCompiler->module->getFunctionList();

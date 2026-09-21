@@ -1161,7 +1161,8 @@ void LLVMBackend::ApplyAbiCallAttributes(llvm::CallInst* ci, const AbiRecipe& re
 llvm::Value* LLVMBackend::EmitAbiLoweredCall(const FunctionSymbol& candidate, std::vector<llvm::Value*>& argList,
                                             llvm::Value* sretDest,
                                             const std::vector<llvm::Value*>* indirectArgAddrs,
-                                            llvm::Value* calleeOverride)
+                                            llvm::Value* calleeOverride,
+                                            const std::vector<llvm::Value*>* rawArrayCounts)
 {
         const AbiRecipe& recipe = candidate.Recipe;
         std::vector<llvm::Value*> loweredArgs;
@@ -1185,6 +1186,9 @@ llvm::Value* LLVMBackend::EmitAbiLoweredCall(const FunctionSymbol& candidate, st
             if (s.kind == AbiSlot::Direct)
             {
                 loweredArgs.push_back(v);
+                if (rawArrayCounts != nullptr && i < rawArrayCounts->size()
+                    && (*rawArrayCounts)[i] != nullptr)
+                    loweredArgs.push_back((*rawArrayCounts)[i]);
             }
             else if (s.kind == AbiSlot::Ignore)
             {
