@@ -1218,6 +1218,81 @@ Open from the M5 review (2026-09-06):
   `alias T*` keeps its value semantics (the first attempt without the flag broke
   err_move.cb's unique-field borrow diagnostics under the discovery pass).
 
+### Open for maintainer ruling (2026-09-19 timebox)
+
+RULED 2026-09-20, recorded in `cpp-bridge-transparency.md` "Rulings made": Q1 keep (R9), Q2
+implicit for both (R8), Q3 char everywhere (R10), Q4 `move p` at the call (R3), Q5 no disk store
+on a clang error + one in-memory MRU slot. Q6: chained-ctor p2 closed; the held copy family is
+unblocked by R1; the stash question is still open. Text below kept as the context record.
+
+Questions raised while fixing C++-consumption bugs. Each blocks or shapes a specific item; none
+changes landed behaviour until answered, except Q1 (landed provisionally, one commit to reverse).
+
+Q1. Is a ternary over two lvalues an assignable lvalue in NATIVE CFlat?
+- Context: the C++ constructor reference-kind fix (fix/cpp-ctor-refkind) needs `IntRef(c ? a : b)`
+  to bind the SELECTED variable to a non-const `T&` parameter (C++ rule; master bound a temporary,
+  so neither variable was written - silently wrong). The fix extended the `?:` storage join from
+  C++ record arms (3cd2d86f) to scalar arms, and as a side effect `(c ? a : b) = 5;` and
+  `(c ? a : b)++` now compile in plain CFlat and write the selected arm. Master refused both
+  ("not an addressable lvalue").
+- Still refused: a mixed ternary (`c ? a : 5`, `c ? a : f()`), pinned by
+  Test/errors/err_ternary_mixed_arm_not_lvalue.cb. Reading a ternary still copies. Pinned by four
+  legs in Test/test_operators.cb.
+- Options: (a) accept - C++ semantics, nothing more to do; (b) reject - gate the Storage adoption
+  in MainListener_Expressions.cpp (the `isStructTy()` -> `!isPointerTy()` change) to C++ records,
+  and either give the constructor path a private channel for the join or refuse a scalar ternary
+  at `T&` as an rvalue.
+- Recommendation: (a). It matches C++, the bridge-transparency direction, and the unselected arm
+  is provably not evaluated or loaded.
+
+Q2. Native CFlat `operator T`: implicit like C++, or explicit-cast only?
+- Context: since 8232e659 an imported C++ class's implicit `operator T` converts at initializers,
+  assignments, call arguments, casts and returns (needed for `bool b = v[0]` on
+  `std::vector<bool>`). A native CFlat `operator T` still converts only at an explicit cast; that
+  restriction was a session call made 2026-09-07 under the no-implicit-narrowing rule, not a
+  maintainer ruling. Use sites now differ by where the type was written.
+- Options: (a) native operators implicit too (C++ semantics; `explicit` opt-out would need a
+  spelling); (b) keep native explicit-only and accept the asymmetry; (c) make both explicit-only
+  (re-breaks the vector<bool> proxy).
+- Recommendation: (a), for bridge transparency.
+
+Q3. Is a CFlat char literal `'x'` a `char` or an `int` at a C++ template boundary?
+- Context: eb7e9737 spells a `char` VARIABLE as `char` to C++ deduction, so `std.string + c`
+  works. A LITERAL still reaches the boundary as a 32-bit constant under the literal-ranks-as-int
+  rule, so `a + 'x'` fails deduction (`_CharT` = char vs int). Filed:
+  internal/issue/p3/cpp-char-literal-spelled-int-at-cxx-template-boundary.md. `s + (c ? x : y)`
+  and `s + (c + 1)` fail the same way and would follow the answer.
+- Options: (a) a char literal carries `char` identity at C++ boundaries only; (b) everywhere in
+  CFlat (touches native overload ranking); (c) leave, require `(char)'x'`.
+- Recommendation: (a).
+
+Q4. Ownership when a C++ callee deletes a pointer CFlat still owns.
+- Context: internal/issue/p2/cpp-pointer-deleted-by-cpp-callee-destroyed-again-at-scope-exit.md.
+  `new Impl()` handed to a C++ function whose body does `delete p` leaves the CFlat local owning,
+  so scope exit destroys it again (use-after-free, then double free). C++ signatures carry no
+  ownership information for a raw `T*` parameter.
+- Options: (a) require `move p` at the call site to transfer ownership into a raw-pointer C++
+  parameter (caller states intent; borrow stays the default); (b) an import-side annotation that
+  marks a parameter as a sink; (c) both. Not started without a ruling.
+- Recommendation: (a) now, (b) later if headers need it at scale.
+
+Q5. Should the C++ header disk cache key include the import's request group (always-on
+transitive dependency tracking)?
+- Context: internal/issue/p3/cpp-header-cache-entry-not-keyed-on-its-request-group.md. Costs a
+  dependency scan on every warm compile; without it a changed sibling header can serve a stale
+  entry. Related and still open above: whether `cache` opts type requests into disk caching.
+
+Q6. Housekeeping that needs a yes/no:
+- internal/issue/p2/cpp-ctor-ambiguous-when-a-method-is-chained.md no longer reproduces (12
+  in-repo cells + libtorch, all three filed hypotheses contradicted). Close it, or re-bucket under
+  internal/issue/p3/cpp-implicit-ctor-conversion-at-call.md, which is what blocks that libtorch
+  line now?
+- `stash@{0}` "WIP on fix/cpp-nested-sig" is a leftover from the 2026-09-17 stash collision; both
+  agents reported intact trees. Drop it?
+- The CFlat-side by-value copy family stays HELD (p1 by-value parameter, p2 struct copy,
+  copy-from-field, brace-init element, return synth copy, std.function returned by value). It is
+  the largest remaining memory-safety surface in C++ interop; say when it should be scheduled.
+
 ## Landed history
 
 | Commit | Content | Suite |

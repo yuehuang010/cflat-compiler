@@ -304,6 +304,7 @@ namespace cflat_cinterop
     namespace
     {
         const char kProbePrefix[] = "__cflat_macro_";
+        const char kHeaderScopeSentinel[] = "__cflat_header_scope_sentinel";
 
         std::string CanonicalSpelling(const ASTContext& ctx, QualType qt)
         {
@@ -667,6 +668,7 @@ namespace cflat_cinterop
             std::unordered_set<const RecordDecl*> emittedDefinedRecords;
             std::unordered_set<std::string> emittedRequestedRecords;
             std::vector<std::string> normDirs; // req.inScopeDirs normalized once (NormPath + trailing-/ stripped)
+            const NamedDecl* scopeSentinel = nullptr;
             // Set in BeginSourceFileAction so the ABI pass can build a CodeGenerator against the
             // very invocation that produced the AST (same triple, same target features).
             CompilerInstance* ci = nullptr;
@@ -705,6 +707,23 @@ namespace cflat_cinterop
                     while (!nd.empty() && nd.back() == '/') nd.pop_back();
                     normDirs.push_back(std::move(nd));
                 }
+            }
+        };
+
+        struct HeaderScopeSentinelVisitor
+            : RecursiveASTVisitor<HeaderScopeSentinelVisitor>
+        {
+            ExtractState& st;
+            explicit HeaderScopeSentinelVisitor(ExtractState& s) : st(s) {}
+
+            bool VisitNamedDecl(NamedDecl* decl)
+            {
+                if (!st.req.checkHeaderScope || st.scopeSentinel != nullptr
+                    || decl->getName() != kHeaderScopeSentinel || st.ci == nullptr)
+                    return true;
+                if (st.ci->getSourceManager().isInMainFile(decl->getLocation()))
+                    st.scopeSentinel = decl;
+                return true;
             }
         };
 
@@ -1369,6 +1388,7 @@ namespace cflat_cinterop
                 const ASTRecordLayout& layout = ctx.getASTRecordLayout(rd);
                 for (const FieldDecl* f : rd->fields())
                 {
+                    if (f->getNameAsString() == kHeaderScopeSentinel) continue;
                     if (f->getDeclName().isEmpty())
                     {
                         if (f->isBitField())
@@ -2539,6 +2559,7 @@ namespace cflat_cinterop
             bool VisitTypedefNameDecl(TypedefNameDecl* td)
             {
                 if (!td->getIdentifier()) return true;
+                if (td->getName() == kHeaderScopeSentinel) return true;
                 if (auto* alias = llvm::dyn_cast<TypeAliasDecl>(td);
                     alias != nullptr && alias->getDescribedAliasTemplate() != nullptr)
                     return true;
@@ -2816,6 +2837,7 @@ namespace cflat_cinterop
                 const IdentifierInfo* ii = vd->getIdentifier();
                 if (!ii) return true;
                 StringRef nm = ii->getName();
+                if (nm == kHeaderScopeSentinel) return true;
                 if (!nm.starts_with(kProbePrefix)) return HarvestGlobalVar(vd);
                 unsigned idx = 0;
                 if (nm.drop_front(sizeof(kProbePrefix) - 1).getAsInteger(10, idx)) return true;
@@ -3288,6 +3310,60 @@ namespace cflat_cinterop
          * wrapper requests - and in system headers - an ill-formed STL instantiation, which the
          * error-body sweep already contains - are not this case and stay tolerated.
          */
+        void RecordHeaderScopeError(ExtractState& st, ASTContext& ctx)
+        {
+            if (!st.req.checkHeaderScope || st.ci == nullptr || st.out.headerErrors > 0) return;
+            // A balanced stub declares the sentinel at file scope, where this lookup finds it.
+            // Only a sentinel swallowed by a header scope needs the full AST walk.
+            for (const NamedDecl* found :
+                 ctx.getTranslationUnitDecl()->lookup(&ctx.Idents.get(kHeaderScopeSentinel)))
+                if (st.ci->getSourceManager().isInMainFile(found->getLocation()))
+                {
+                    st.scopeSentinel = found;
+                    break;
+                }
+            if (st.scopeSentinel == nullptr)
+            {
+                HeaderScopeSentinelVisitor visitor(st);
+                visitor.TraverseDecl(ctx.getTranslationUnitDecl());
+            }
+
+            const SourceManager& sm = st.ci->getSourceManager();
+            const DeclContext* scope = st.scopeSentinel == nullptr
+                ? nullptr : st.scopeSentinel->getDeclContext();
+            bool balanced = scope != nullptr && scope->isTranslationUnit();
+            if (scope != nullptr && llvm::isa<LinkageSpecDecl>(scope))
+            {
+                const Decl* linkage = Decl::castFromDeclContext(scope);
+                balanced = scope->getParent()->isTranslationUnit()
+                        && sm.isInMainFile(linkage->getLocation());
+            }
+            if (balanced) return;
+
+            std::string scopeName = "an unknown scope";
+            std::string scopePath = st.req.scopeHeaderPath;
+            if (scope != nullptr)
+            {
+                if (const auto* ns = llvm::dyn_cast<NamespaceDecl>(scope))
+                    scopeName = ns->getQualifiedNameAsString();
+                else if (const auto* record = llvm::dyn_cast<RecordDecl>(scope))
+                    scopeName = record->getQualifiedNameAsString();
+                else if (llvm::isa<LinkageSpecDecl>(scope))
+                    scopeName = "extern \"C\"";
+                else
+                    scopeName = scope->getDeclKindName();
+                if (const auto* decl = llvm::dyn_cast<Decl>(scope))
+                {
+                    PresumedLoc pl = sm.getPresumedLoc(decl->getLocation());
+                    if (pl.isValid()) scopePath = pl.getFilename();
+                }
+            }
+            st.out.headerErrors = 1;
+            st.out.firstHeaderError = std::format(
+                "header leaves a namespace or brace scope open: {}{}", scopeName,
+                scopePath.empty() ? std::string() : std::format(" at {}", scopePath));
+        }
+
         void RecordInScopeHeaderErrors(ExtractState& st)
         {
             st.out.headerErrors = 0;
@@ -4063,6 +4139,7 @@ namespace cflat_cinterop
                 // into Clang machinery a real driver would never reach after an error. The caller
                 // refuses the bind with the diagnostic instead.
                 RecordInScopeHeaderErrors(st);
+                RecordHeaderScopeError(st, ctx);
                 if (st.out.headerErrors > 0)
                 {
                     if (st.req.verbose)

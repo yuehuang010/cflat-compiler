@@ -469,6 +469,8 @@ namespace cflat_cinterop
         bool wantMacros = false;            // header-bind path harvests macros; .c path does not
         bool requireInScope = false;        // keep only decls whose file is under inScopeDirs
         std::vector<std::string> inScopeDirs;
+        bool checkHeaderScope = false;      // reject a stub sentinel left inside a header scope
+        std::string scopeHeaderPath;        // fallback path for a missing sentinel
         bool definitionsOnly = false;       // .c auto-extern: only functions defined in this TU
         bool wantIncludes = false;          // deep header-cache: record every transitively included file
         bool skipFunctionBodies = false;    // header bind: parse declarations only, skip function bodies
@@ -570,6 +572,7 @@ namespace cflat_cinterop
         // the prerequisite, instead of silently registering the error-recovered remnants.
         // Stub-local errors (the intentional macro-probe "type name where an expression was
         // expected" diagnostics) are excluded by source location, so they do not inflate it.
+        // A structural sentinel adds one error when the stub itself is left inside a header scope.
         unsigned prereqErrors = 0;
         std::string firstPrereqError;            // formatted text of the first such error
         std::string firstError;                  // first clang error, including wrapper requests

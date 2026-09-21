@@ -1,5 +1,9 @@
 # An owning pointer deleted by a C++ callee is destroyed AGAIN at CFlat scope exit
 
+RULED 2026-09-20 (R3, `internal/plan/cpp-bridge-transparency.md`): `move p` at the call site
+transfers ownership into a raw-pointer C++ parameter and consumes the CFlat owner; borrow stays
+the default. Import-side sink annotation is a later option. Ready to start.
+
 Found 2026-09-16 by the C++-interop bug bash round 2 (macOS arm64, Release, master 24016619).
 
 ## Summary

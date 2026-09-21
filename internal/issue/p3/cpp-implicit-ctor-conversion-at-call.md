@@ -1,5 +1,11 @@
 # C++ implicit user-defined conversion at a call argument is not offered for some ctors
 
+Also blocks (2026-09-20): the libtorch line
+`c10.TensorOptions(c10.ScalarType.Float).requires_grad(true)`. It was filed as
+`p2/cpp-ctor-ambiguous-when-a-method-is-chained.md`; that ambiguity no longer reproduces (12
+in-repo cells + libtorch, all three filed hypotheses contradicted) and the file was closed. What
+stops the line now is this issue.
+
 ## Summary
 
 `torch.optim.Adam(params, 0.01)` fails with "C++ class 'torch.optim.Adam' has no constructor

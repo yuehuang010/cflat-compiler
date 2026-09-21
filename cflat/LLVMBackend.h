@@ -5614,6 +5614,7 @@ private:
                              std::vector<std::string>* outIncludes = nullptr,
                              bool* outPrereqFailure = nullptr,
                              std::string* outPrereqMsg = nullptr,
+                             bool* outHeaderFailure = nullptr,
                              bool cxxMode = false,
                              std::string* outCxxBitcode = nullptr,
                              std::vector<cflat_cinterop::RawFunctionPointerAbi>* outFunctionPointerAbis = nullptr,

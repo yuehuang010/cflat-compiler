@@ -2,6 +2,10 @@ p3
 
 # A CFlat character literal is spelled `int` at a C++ template boundary
 
+RULED 2026-09-20 (R10, `internal/plan/cpp-bridge-transparency.md`): a char literal is a `char`
+EVERYWHERE, not only at C++ boundaries. The fix touches native overload ranking - audit `char`
+vs `int` overload pairs and literal arithmetic (`'a' + 1`) when landing.
+
 ## Summary
 
 `std.string a; a + 'x'` does not compile, while `a + c` for a `char c` and `a + (char)33` both do

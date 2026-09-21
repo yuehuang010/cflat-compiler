@@ -57,6 +57,104 @@
 
 // ---- Definitions moved out of LLVMBackend.h (CInterop) ----
 
+struct CHeaderRefusalDep
+{
+        std::string path;
+        int64_t mtime = 0;
+        uintmax_t size = 0;
+};
+
+struct CHeaderRefusalMru
+{
+        std::mutex mutex;
+        uint64_t groupKey = 0;
+        std::string validityKey;
+        std::string text;
+        std::vector<CHeaderRefusalDep> deps;
+        bool valid = false;
+};
+
+static CHeaderRefusalMru gCHeaderRefusalMru;
+
+static std::string CHeaderRefusalValidityKey(
+    uint64_t groupKey, const std::vector<std::string>& paths,
+    const std::vector<int64_t>& mtimes, uint64_t contentHash)
+{
+        std::string key = std::to_string(groupKey);
+        for (size_t i = 0; i < paths.size(); ++i)
+            key += "|H" + paths[i] + "|M" + std::to_string(mtimes[i]);
+        key += "|X" + std::to_string(contentHash);
+        return key;
+}
+
+static bool LookupCHeaderRefusal(uint64_t groupKey, const std::string& validityKey,
+                                 std::string& text, std::string& stalePath)
+{
+        std::lock_guard<std::mutex> lock(gCHeaderRefusalMru.mutex);
+        if (!gCHeaderRefusalMru.valid || gCHeaderRefusalMru.groupKey != groupKey
+            || gCHeaderRefusalMru.validityKey != validityKey)
+            return false;
+        for (const auto& dep : gCHeaderRefusalMru.deps)
+        {
+            std::error_code mtimeEc;
+            std::error_code sizeEc;
+            const auto mtime = std::filesystem::last_write_time(dep.path, mtimeEc);
+            const auto size = std::filesystem::file_size(dep.path, sizeEc);
+            if (mtimeEc || sizeEc || (int64_t)mtime.time_since_epoch().count() != dep.mtime
+                || size != dep.size)
+            {
+                stalePath = dep.path;
+                gCHeaderRefusalMru.validityKey.clear();
+                gCHeaderRefusalMru.text.clear();
+                gCHeaderRefusalMru.deps.clear();
+                gCHeaderRefusalMru.valid = false;
+                return false;
+            }
+        }
+        text = gCHeaderRefusalMru.text;
+        return true;
+}
+
+static void RememberCHeaderRefusal(uint64_t groupKey, std::string validityKey,
+                                   std::string text, std::vector<CHeaderRefusalDep> deps)
+{
+        if (deps.empty()) return;
+        std::lock_guard<std::mutex> lock(gCHeaderRefusalMru.mutex);
+        gCHeaderRefusalMru.groupKey = groupKey;
+        gCHeaderRefusalMru.validityKey = std::move(validityKey);
+        gCHeaderRefusalMru.text = std::move(text);
+        gCHeaderRefusalMru.deps = std::move(deps);
+        gCHeaderRefusalMru.valid = true;
+}
+
+static void ClearCHeaderRefusal(uint64_t groupKey)
+{
+        std::lock_guard<std::mutex> lock(gCHeaderRefusalMru.mutex);
+        if (gCHeaderRefusalMru.valid && gCHeaderRefusalMru.groupKey == groupKey)
+        {
+            gCHeaderRefusalMru.validityKey.clear();
+            gCHeaderRefusalMru.text.clear();
+            gCHeaderRefusalMru.deps.clear();
+            gCHeaderRefusalMru.valid = false;
+        }
+}
+
+static bool CaptureCHeaderRefusalDeps(const std::vector<std::string>& includes,
+                                      std::vector<CHeaderRefusalDep>& deps)
+{
+        std::unordered_set<std::string> seen;
+        for (const auto& include : includes)
+        {
+            std::error_code mtimeEc;
+            std::error_code sizeEc;
+            const auto mtime = std::filesystem::last_write_time(include, mtimeEc);
+            const auto size = std::filesystem::file_size(include, sizeEc);
+            if (mtimeEc || sizeEc || !seen.insert(include).second) continue;
+            deps.push_back({ include, (int64_t)mtime.time_since_epoch().count(), size });
+        }
+        return !deps.empty();
+}
+
 // Scoped wall-clock timer for one stage of a C++ header import. Prints under -v only.
 struct CxxExtractionStageTimer
 {
@@ -3317,6 +3415,7 @@ bool LLVMBackend::ExtractCHeaderClang(const std::vector<std::string>& headerPath
                              std::vector<std::string>* outIncludes,
                              bool* outPrereqFailure,
                              std::string* outPrereqMsg,
+                             bool* outHeaderFailure,
                              bool cxxMode,
                              std::string* outCxxBitcode,
                              std::vector<cflat_cinterop::RawFunctionPointerAbi>* outFunctionPointerAbis,
@@ -3328,6 +3427,7 @@ bool LLVMBackend::ExtractCHeaderClang(const std::vector<std::string>& headerPath
                              std::vector<std::pair<std::string, std::string>>* outNamespaceAliases)
 {
         if (headerPaths.empty()) return false;
+        if (outHeaderFailure) *outHeaderFailure = false;
 
         // The first header's directory anchors the primary -I; also labels TimeTrace scopes
         // and attributes registered decls for LSP go-to-def.
@@ -3352,6 +3452,8 @@ bool LLVMBackend::ExtractCHeaderClang(const std::vector<std::string>& headerPath
             std::replace(fwd.begin(), fwd.end(), '\\', '/');
             source += "#include \"" + fwd + "\"\n";
         }
+        source += cxxMode ? "typedef int __cflat_header_scope_sentinel;\n"
+                          : "int __cflat_header_scope_sentinel;\n";
 
         cflat_cinterop::ExtractRequest req;
         if (cxxMode) cppInteropUsed_ = true;
@@ -3361,6 +3463,8 @@ bool LLVMBackend::ExtractCHeaderClang(const std::vector<std::string>& headerPath
         req.cxxMode        = cxxMode;
         req.wantMacros     = true;
         req.requireInScope = true;
+        req.checkHeaderScope = true;
+        req.scopeHeaderPath = headerPaths.front();
         /*
          * M5 - a C++ header bind needs the inline BODIES: they are the only definition of an
          * inline function, an all-inline method or the key function of a vtable, and Clang emits
@@ -3420,6 +3524,7 @@ bool LLVMBackend::ExtractCHeaderClang(const std::vector<std::string>& headerPath
             return false;
         }
         SetCInteropTargetFacts(raw);
+        if (outIncludes) *outIncludes = raw.includedFiles;
         if (cxxMode && activeCxxRequestGroup_ != nullptr)
         {
             // Signature types are bound on first lookup now, so a namespace that only appears in
@@ -3571,14 +3676,14 @@ bool LLVMBackend::ExtractCHeaderClang(const std::vector<std::string>& headerPath
         // them). Report the clang diagnostic rather than binding the error-recovered remnants.
         if (raw.headerErrors > 0)
         {
+            if (outHeaderFailure) *outHeaderFailure = true;
+            if (outPrereqMsg) *outPrereqMsg = raw.firstHeaderError;
             if (verbose)
                 std::cout << std::format("[verbose]   header does not compile: {}\n",
                                          raw.firstHeaderError);
-            ReportUncompilableHeader(headerPaths, raw.firstHeaderError, cxxMode);
             return false;
         }
 
-        if (outIncludes) *outIncludes = std::move(raw.includedFiles);
         if (outFunctionPointerAbis) *outFunctionPointerAbis = raw.functionPointerAbis;
 
         // Enum-backed widths are needed while mapping signatures and record fields, both of
@@ -13194,13 +13299,24 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
 
         std::error_code mtEc;
         std::filesystem::file_time_type currentMtime{};
+        std::vector<int64_t> headerMtimes;
+        headerMtimes.reserve(realPaths.size());
         for (const auto& rp : realPaths)
         {
             std::error_code ec;
             auto mt = std::filesystem::last_write_time(rp, ec);
-            if (ec) { mtEc = ec; break; }
+            if (ec)
+            {
+                if (!mtEc) mtEc = ec;
+                headerMtimes.push_back(0);
+                continue;
+            }
+            headerMtimes.push_back((int64_t)mt.time_since_epoch().count());
             if (mt > currentMtime) currentMtime = mt;
         }
+        const uint64_t refusalGroupKey = CHeaderDiskCacheKey(
+            realPaths, cIncludeDirs_, cDefines_, extraDefines,
+            targetWindows_, cppMode, cxxDefinitionsEmitted);
 
         std::vector<CSigEntry> hitSigs;
         std::vector<CEnumEntry> hitEnums;
@@ -13300,17 +13416,16 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
                         aliasRetries.push_back(std::move(rewritten));
                 }
             RegisterCFunctionMacros(aliasRetries, fileForLsp + "@alias-retry");
+            ClearCHeaderRefusal(refusalGroupKey);
             return true;
         }
 
         // Persistent disk cache (opt-in via `cache` import clause). On hit, preloads the
         // in-memory cache and registers decls, skipping the clang header parse entirely.
         std::filesystem::path cHeaderCacheDir = GetCHeaderCacheDir();
-        uint64_t diskKey = 0;
+        const uint64_t diskKey = refusalGroupKey;
         if (diskCache && !mtEc && !cHeaderCacheDir.empty())
         {
-            diskKey = CHeaderDiskCacheKey(realPaths, cIncludeDirs_, cDefines_, extraDefines,
-                                          targetWindows_, cppMode, cxxDefinitionsEmitted);
             CFileSigCacheEntry diskEntry;
             bool diskHit;
             {
@@ -13364,9 +13479,26 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
                             aliasRetries.push_back(std::move(rewritten));
                     }
                 RegisterCFunctionMacros(aliasRetries, fileForLsp + "@alias-retry");
+                ClearCHeaderRefusal(refusalGroupKey);
                 return true;
             }
         }
+
+        const std::string refusalKey = CHeaderRefusalValidityKey(
+            refusalGroupKey, realPaths, headerMtimes, hashNow());
+        std::string refusalText;
+        std::string refusalStalePath;
+        if (LookupCHeaderRefusal(refusalGroupKey, refusalKey, refusalText, refusalStalePath))
+        {
+            if (verbose)
+                std::cout << std::format(
+                    "[verbose] C header negative MRU hit for {}\n", fileForLsp);
+            ReportUncompilableHeader(headerPaths, refusalText, cppMode);
+            return false;
+        }
+        if (verbose && !refusalStalePath.empty())
+            std::cout << std::format(
+                "[verbose] C header negative MRU stale: {} changed\n", refusalStalePath);
 
         std::vector<CSigEntry> sigs;
         std::vector<CEnumEntry> enums;
@@ -13392,16 +13524,25 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
             // for macro names). Uses clang C++ API, not clang-cl or libclang.
             llvm::TimeTraceScope extractScope("CHeaderExtract", fileForLsp);
             bool prereqFailure = false;
+            bool headerFailure = false;
             std::string prereqMsg;
             if (!ExtractCHeaderClang(realPaths, sigs, enums, records, macros, funcMacros, globals,
-                                     aliases, typeAliases, extraDefines, wantDeps ? &includes : nullptr,
-                                     &prereqFailure, &prereqMsg, cppMode, &cxxBitcode,
+                                     aliases, typeAliases, extraDefines, &includes,
+                                     &prereqFailure, &prereqMsg, &headerFailure, cppMode, &cxxBitcode,
                                      &functionPointerAbis, &longDoubleWidth,
                                      &longDoubleIsIEEEDouble, &targetTriple, &functionTemplates,
                                      &usingDirectives, &namespaceAliases))
             {
                 if (prereqFailure)
                     ReportOrphanHeader(headerPaths, prereqMsg, cppMode);
+                else if (headerFailure)
+                {
+                    std::vector<CHeaderRefusalDep> refusalDeps;
+                    if (CaptureCHeaderRefusalDeps(includes, refusalDeps))
+                        RememberCHeaderRefusal(refusalGroupKey, refusalKey, prereqMsg,
+                                               std::move(refusalDeps));
+                    ReportUncompilableHeader(headerPaths, prereqMsg, cppMode);
+                }
                 return false;
             }
         }
@@ -13487,6 +13628,7 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
                 }
             RegisterCFunctionMacros(aliasRetries, fileForLsp + "@alias-retry");
         }
+        ClearCHeaderRefusal(refusalGroupKey);
         return true;
     }
 

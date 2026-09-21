@@ -2,6 +2,11 @@ p3
 
 # A C++ header disk-cache entry is validated only against its OWN mtime+hash, so a sibling header in the same request group can poison it permanently
 
+RULED 2026-09-20: stopgap first - a clang run that reports errors is never written to the disk
+cache; its result lives in ONE in-memory most-recent slot so the LSP still gets a fast,
+partially correct answer while a header is broken. Request-group keying stays open here after
+the stopgap lands.
+
 Found 2026-09-17 while root-causing a post-rebase "regression" on fix/cpp-const-ref-scalar that
 turned out to be a poisoned cache entry, not a code defect. Cost one review round.
 

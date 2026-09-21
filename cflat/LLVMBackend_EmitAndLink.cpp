@@ -4028,11 +4028,32 @@ bool LLVMBackend::JitRun(int& runExitCode)
             return false;
         }
         std::unique_ptr<llvm::orc::LLJIT> jit = std::move(*jitOrErr);
+        llvm::orc::LocalCXXRuntimeOverrides cxxRuntimeOverrides;
+        // The generic platform already defines __dso_handle in the main JITDylib.
+        // Keep both C++ runtime overrides together in a separate dylib.
+        llvm::orc::JITDylib& cxxRuntimeJD =
+            jit->getExecutionSession().createBareJITDylib("cflat_cxx_runtime");
 
         // The module's data layout must match the JIT's. Set both layout and triple to the
         // JIT's host values before handing the module over.
         module->setDataLayout(jit->getDataLayout());
         module->setTargetTriple(jit->getTargetTriple());
+
+        llvm::orc::MangleAndInterner jitMangler(jit->getExecutionSession(), jit->getDataLayout());
+        if (auto err = cxxRuntimeOverrides.enable(cxxRuntimeJD, jitMangler))
+        {
+            LogErrorMessage("{}: failed to install C++ runtime overrides: {}",
+                            { "--run", llvm::toString(std::move(err)) });
+            return false;
+        }
+        llvm::orc::JITDylibSearchOrder linkOrder;
+        jit->getMainJITDylib().withLinkOrderDo([&](const auto& current) {
+            linkOrder.assign(current.begin(), current.end());
+        });
+        // Resolve JIT C++ atexit registrations before the host process symbols.
+        linkOrder.insert(linkOrder.begin(),
+                         { &cxxRuntimeJD, llvm::orc::JITDylibLookupFlags::MatchAllSymbols });
+        jit->getMainJITDylib().setLinkOrder(std::move(linkOrder), false);
 
         // Disable builtin libcall recognition for the in-process JIT (equivalent to -fno-builtin).
         // cflat DEFINES its own hook-aware libc functions (printf/vsnprintf/memcpy/...). LLVM's
@@ -4188,6 +4209,7 @@ bool LLVMBackend::JitRun(int& runExitCode)
         // Run static destructors (atexit-style) registered via the JIT.
         if (auto err = jit->deinitialize(jit->getMainJITDylib()))
             llvm::consumeError(std::move(err)); // best-effort; program already ran
+        cxxRuntimeOverrides.runDestructors();
 
         return true;
     }

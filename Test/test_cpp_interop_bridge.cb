@@ -53,6 +53,152 @@ import cpp "deque" cache;
 import cpp "map" cache;
 // std::function as a MEMBER parameter and as a RETURN type.
 import cpp "library/cpp_interop_stdfn.h" cache;
+import cpp "library/cpp_interop_twin.h" cache;
+import "test_helper.cb";
+
+int bridge_cf_ctor = 0;
+int bridge_cf_copy = 0;
+int bridge_cf_move = 0;
+int bridge_cf_dtor = 0;
+int bridge_cf_copy_assign = 0;
+int bridge_cf_move_assign = 0;
+int bridge_cf_live = 0;
+
+void bridge_reset_cf()
+{
+    bridge_cf_ctor = 0; bridge_cf_copy = 0; bridge_cf_move = 0;
+    bridge_cf_dtor = 0; bridge_cf_copy_assign = 0; bridge_cf_move_assign = 0;
+    bridge_cf_live = 0;
+}
+
+struct TwinCf
+{
+    int* data = new int[3];
+    int field = 0;
+
+    TwinCf() { bridge_cf_ctor++; bridge_cf_live++; data[0] = 0; data[1] = 1; data[2] = 2; }
+    TwinCf(int value)
+    {
+        bridge_cf_ctor++; bridge_cf_live++; field = value;
+        data[0] = value; data[1] = value + 1; data[2] = value + 2;
+    }
+    ~TwinCf()
+    {
+        if (data != nullptr) { delete[] data; bridge_cf_live--; }
+        bridge_cf_dtor++;
+    }
+    TwinCf copy()
+    {
+        TwinCf result = default;
+        bridge_cf_ctor--; bridge_cf_copy++;
+        result.field = field;
+        result.data[0] = data[0]; result.data[1] = data[1]; result.data[2] = data[2];
+        return move result;
+    }
+    int value() { return field; }
+    void set(int value)
+    {
+        field = value;
+        data[0] = value; data[1] = value + 1; data[2] = value + 2;
+    }
+    bool operator==(alias TwinCf other) { return field == other.field; }
+    int operator[](int index) { return data[index]; }
+    int* begin() { return data; }
+    int* end() { return data + 3; }
+    int count() { return 3; }
+    int get(int index) { return data[index]; }
+    static int static_value() { return 73; }
+};
+
+bool operator bool(alias TwinCf value) { return value.field != 0; }
+
+struct BridgeFieldHolder<T>
+{
+    T value = default;
+    int tag = 2;
+};
+
+struct BridgeCopyFieldHolder<T>
+{
+    T value = default;
+};
+
+int bridge_method_field<T>(T* pointer)
+{
+    (*pointer).set(pointer->value() + 1);
+    pointer->set(pointer->value() + 1);
+    return (*pointer).value() + pointer->value() + pointer->field;
+}
+
+int bridge_lifetime<T>(int seed)
+{
+    int result = 0;
+    {
+        T local = default;
+        local.set(seed);
+        for (int i = 0; i < 2; i++)
+        {
+            T loop = default;
+            loop.set(local.value() + i);
+            result = result + loop.value();
+        }
+        if (result > 0) return result;
+    }
+    return result;
+}
+
+int bridge_fixed_array<T>()
+{
+    T[2] values = default;
+    values[0].set(3);
+    values[1].set(4);
+    return values[0].value() + values[1].value() + values[0][1];
+}
+
+int bridge_struct_field<T>()
+{
+    BridgeFieldHolder<T> holder = default;
+    holder.value.set(6);
+    holder.tag = holder.value.value();
+    return holder.value.value() + holder.tag;
+}
+
+int bridge_copy_field<T>()
+{
+    BridgeCopyFieldHolder<T> holder = default;
+    holder.value.set(8);
+    T copy = holder.value;
+    return holder.value.value() + copy.value();
+}
+
+int bridge_reference<T>(alias T value)
+{
+    value.set(value.value() + 2);
+    return value.value();
+}
+
+int bridge_operators<T>(T* left, T* right)
+{
+    int result = 0;
+    if ((*left) == (*right)) result = result + 1;
+    if ((*left)[1] == left->value() + 1) result = result + 2;
+    if (*left) result = result + 4;
+    return result;
+}
+
+int bridge_nullable<T>(T* value)
+{
+    if (value?.value() == 5) return 1;
+    return 0;
+}
+
+int bridge_checks = 0;
+int bridge_passed = 0;
+void bridge_check(const char* name, int actual, int expected)
+{
+    bridge_checks++;
+    bridge_passed += Test(name, actual, expected);
+}
 
 int sharedGlobal = 42;
 extern int strcmp(const char* a, const char* b);
@@ -1340,6 +1486,189 @@ extern int main()
     if (value.v != 7 || grs_sig_ns.BP().v != 8)                              return 1948;
     std.vector<std.vector<GrsSigBaseOnly*>> grsBaseOnly = default;
     if (grs_sig_base_only(grsBaseOnly) != 1949)                              return 1949;
+
+    bridge_reset_cf();
+    int bridgeMethodCf = 0;
+    {
+        TwinCf value = default;
+        value.set(5);
+        bridgeMethodCf = bridge_method_field<TwinCf>(&value) + TwinCf.static_value();
+    }
+    bridge_check("bridge method/field CFlat value", bridgeMethodCf, 94);
+    bridge_check("bridge method/field CFlat ctor", bridge_cf_ctor, 1);
+    bridge_check("bridge method/field CFlat copy", bridge_cf_copy, 0);
+    bridge_check("bridge method/field CFlat move", bridge_cf_move, 0);
+    bridge_check("bridge method/field CFlat dtor", bridge_cf_dtor, 1);
+    bridge_check("bridge method/field CFlat live", bridge_cf_live, 0);
+
+    cpptw.reset_counts();
+    int bridgeMethodCpp = 0;
+    {
+        cpptw.Twin value = default;
+        value.set(5);
+        bridgeMethodCpp = bridge_method_field<cpptw.Twin>(&value) + cpptw.Twin.static_value();
+    }
+    bridge_check("bridge method/field C++ value", bridgeMethodCpp, 94);
+    bridge_check("bridge method/field C++ ctor", cpptw.ctor_count(), 1);
+    bridge_check("bridge method/field C++ copy", cpptw.copy_count(), 0);
+    bridge_check("bridge method/field C++ move", cpptw.move_count(), 0);
+    bridge_check("bridge method/field C++ dtor", cpptw.dtor_count(), 1);
+    bridge_check("bridge method/field C++ live", cpptw.live_allocations(), 0);
+
+    bridge_reset_cf();
+    int bridgeLifetimeCf = bridge_lifetime<TwinCf>(7);
+    bridge_check("bridge lifetime CFlat value", bridgeLifetimeCf, 15);
+    bridge_check("bridge lifetime CFlat ctor", bridge_cf_ctor, 3);
+    bridge_check("bridge lifetime CFlat copy", bridge_cf_copy, 0);
+    bridge_check("bridge lifetime CFlat move", bridge_cf_move, 0);
+    bridge_check("bridge lifetime CFlat dtor", bridge_cf_dtor, 3);
+    bridge_check("bridge lifetime CFlat live", bridge_cf_live, 0);
+
+    cpptw.reset_counts();
+    int bridgeLifetimeCpp = bridge_lifetime<cpptw.Twin>(7);
+    bridge_check("bridge lifetime C++ value", bridgeLifetimeCpp, 15);
+    bridge_check("bridge lifetime C++ ctor", cpptw.ctor_count(), 3);
+    bridge_check("bridge lifetime C++ copy", cpptw.copy_count(), 0);
+    bridge_check("bridge lifetime C++ move", cpptw.move_count(), 0);
+    bridge_check("bridge lifetime C++ dtor", cpptw.dtor_count(), 3);
+    bridge_check("bridge lifetime C++ live", cpptw.live_allocations(), 0);
+
+    bridge_reset_cf();
+    int bridgeArrayCf = bridge_fixed_array<TwinCf>();
+    bridge_check("bridge fixed array CFlat value", bridgeArrayCf, 11);
+    bridge_check("bridge fixed array CFlat ctor", bridge_cf_ctor, 2);
+    bridge_check("bridge fixed array CFlat copy", bridge_cf_copy, 0);
+    bridge_check("bridge fixed array CFlat move", bridge_cf_move, 0);
+    bridge_check("bridge fixed array CFlat dtor", bridge_cf_dtor, 2);
+    bridge_check("bridge fixed array CFlat live", bridge_cf_live, 0);
+
+    cpptw.reset_counts();
+    int bridgeArrayCpp = bridge_fixed_array<cpptw.Twin>();
+    bridge_check("bridge fixed array C++ value", bridgeArrayCpp, 11);
+    bridge_check("bridge fixed array C++ ctor", cpptw.ctor_count(), 2);
+    bridge_check("bridge fixed array C++ copy", cpptw.copy_count(), 0);
+    bridge_check("bridge fixed array C++ move", cpptw.move_count(), 0);
+    bridge_check("bridge fixed array C++ dtor", cpptw.dtor_count(), 2);
+    bridge_check("bridge fixed array C++ live", cpptw.live_allocations(), 0);
+
+    bridge_reset_cf();
+    int bridgeFieldCf = bridge_struct_field<TwinCf>();
+    bridge_check("bridge struct field CFlat value", bridgeFieldCf, 12);
+    bridge_check("bridge struct field CFlat ctor", bridge_cf_ctor, 1);
+    bridge_check("bridge struct field CFlat copy", bridge_cf_copy, 0);
+    bridge_check("bridge struct field CFlat move", bridge_cf_move, 0);
+    bridge_check("bridge struct field CFlat dtor", bridge_cf_dtor, 1);
+    bridge_check("bridge struct field CFlat live", bridge_cf_live, 0);
+
+    cpptw.reset_counts();
+    int bridgeFieldCpp = bridge_struct_field<cpptw.Twin>();
+    bridge_check("bridge struct field C++ value", bridgeFieldCpp, 12);
+    bridge_check("bridge struct field C++ ctor", cpptw.ctor_count(), 1);
+    bridge_check("bridge struct field C++ copy", cpptw.copy_count(), 0);
+    bridge_check("bridge struct field C++ move", cpptw.move_count(), 0);
+    bridge_check("bridge struct field C++ dtor", cpptw.dtor_count(), 1);
+    bridge_check("bridge struct field C++ live", cpptw.live_allocations(), 0);
+
+    bridge_reset_cf();
+    int bridgeCopyFieldCf = bridge_copy_field<TwinCf>();
+    bridge_check("bridge copy field CFlat value", bridgeCopyFieldCf, 16);
+    bridge_check("bridge copy field CFlat ctor", bridge_cf_ctor, 1);
+    bridge_check("bridge copy field CFlat copy", bridge_cf_copy, 1);
+    bridge_check("bridge copy field CFlat move", bridge_cf_move, 0);
+    bridge_check("bridge copy field CFlat dtor", bridge_cf_dtor, 2);
+    bridge_check("bridge copy field CFlat live", bridge_cf_live, 0);
+
+    cpptw.reset_counts();
+    int bridgeCopyFieldCpp = bridge_copy_field<cpptw.Twin>();
+    bridge_check("bridge copy field C++ value", bridgeCopyFieldCpp, 16);
+    bridge_check("bridge copy field C++ ctor", cpptw.ctor_count(), 1);
+    bridge_check("bridge copy field C++ copy", cpptw.copy_count(), 1);
+    bridge_check("bridge copy field C++ move", cpptw.move_count(), 0);
+    bridge_check("bridge copy field C++ dtor", cpptw.dtor_count(), 2);
+    bridge_check("bridge copy field C++ live", cpptw.live_allocations(), 0);
+
+    bridge_reset_cf();
+    int bridgeReferenceCf = 0;
+    {
+        TwinCf value = default;
+        bridgeReferenceCf = bridge_reference<TwinCf>(value);
+    }
+    bridge_check("bridge reference CFlat value", bridgeReferenceCf, 2);
+    bridge_check("bridge reference CFlat ctor", bridge_cf_ctor, 1);
+    bridge_check("bridge reference CFlat copy", bridge_cf_copy, 0);
+    bridge_check("bridge reference CFlat move", bridge_cf_move, 0);
+    bridge_check("bridge reference CFlat dtor", bridge_cf_dtor, 1);
+    bridge_check("bridge reference CFlat live", bridge_cf_live, 0);
+
+    cpptw.reset_counts();
+    int bridgeReferenceCpp = 0;
+    {
+        cpptw.Twin value = default;
+        bridgeReferenceCpp = bridge_reference<cpptw.Twin>(value);
+    }
+    bridge_check("bridge reference C++ value", bridgeReferenceCpp, 2);
+    bridge_check("bridge reference C++ ctor", cpptw.ctor_count(), 1);
+    bridge_check("bridge reference C++ copy", cpptw.copy_count(), 0);
+    bridge_check("bridge reference C++ move", cpptw.move_count(), 0);
+    bridge_check("bridge reference C++ dtor", cpptw.dtor_count(), 1);
+    bridge_check("bridge reference C++ live", cpptw.live_allocations(), 0);
+
+    bridge_reset_cf();
+    int bridgeOperatorsCf = 0;
+    {
+        TwinCf left = default; left.set(5);
+        TwinCf right = default; right.set(5);
+        bridgeOperatorsCf = bridge_operators<TwinCf>(&left, &right);
+    }
+    bridge_check("bridge operators CFlat value", bridgeOperatorsCf, 7);
+    bridge_check("bridge operators CFlat ctor", bridge_cf_ctor, 2);
+    bridge_check("bridge operators CFlat copy", bridge_cf_copy, 0);
+    bridge_check("bridge operators CFlat move", bridge_cf_move, 0);
+    bridge_check("bridge operators CFlat dtor", bridge_cf_dtor, 2);
+    bridge_check("bridge operators CFlat live", bridge_cf_live, 0);
+
+    cpptw.reset_counts();
+    int bridgeOperatorsCpp = 0;
+    {
+        cpptw.Twin left = default; left.set(5);
+        cpptw.Twin right = default; right.set(5);
+        bridgeOperatorsCpp = bridge_operators<cpptw.Twin>(&left, &right);
+    }
+    bridge_check("bridge operators C++ value", bridgeOperatorsCpp, 7);
+    bridge_check("bridge operators C++ ctor", cpptw.ctor_count(), 2);
+    bridge_check("bridge operators C++ copy", cpptw.copy_count(), 0);
+    bridge_check("bridge operators C++ move", cpptw.move_count(), 0);
+    bridge_check("bridge operators C++ dtor", cpptw.dtor_count(), 2);
+    bridge_check("bridge operators C++ live", cpptw.live_allocations(), 0);
+
+    bridge_reset_cf();
+    int bridgeNullableCf = 0;
+    {
+        TwinCf value = default;
+        value.set(5);
+        bridgeNullableCf = bridge_nullable<TwinCf>(&value);
+    }
+    bridge_check("bridge nullable CFlat value", bridgeNullableCf, 1);
+    bridge_check("bridge nullable CFlat ctor", bridge_cf_ctor, 1);
+    bridge_check("bridge nullable CFlat copy", bridge_cf_copy, 0);
+    bridge_check("bridge nullable CFlat move", bridge_cf_move, 0);
+    bridge_check("bridge nullable CFlat dtor", bridge_cf_dtor, 1);
+    bridge_check("bridge nullable CFlat live", bridge_cf_live, 0);
+
+    cpptw.reset_counts();
+    int bridgeNullableCpp = 0;
+    {
+        cpptw.Twin value = default;
+        value.set(5);
+        bridgeNullableCpp = bridge_nullable<cpptw.Twin>(&value);
+    }
+    bridge_check("bridge nullable C++ value", bridgeNullableCpp, 1);
+    bridge_check("bridge nullable C++ ctor", cpptw.ctor_count(), 1);
+    bridge_check("bridge nullable C++ copy", cpptw.copy_count(), 0);
+    bridge_check("bridge nullable C++ move", cpptw.move_count(), 0);
+    bridge_check("bridge nullable C++ dtor", cpptw.dtor_count(), 1);
+    bridge_check("bridge nullable C++ live", cpptw.live_allocations(), 0);
+    if (bridge_passed != bridge_checks) return 2000;
 
     return 0;
 }

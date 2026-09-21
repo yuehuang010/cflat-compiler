@@ -48,27 +48,28 @@ behaves like a CFlat type", never "CFlat code inherits C++ hazards".
 
 ## What "transparent" covers - the use-site matrix
 
-Status column is from landed history and open issues; phase 0 replaces it with measured rows.
+Status column is from landed history and open issues (gap column re-synced with
+`internal/issue/` 2026-09-20); phase 0 replaces it with measured rows.
 
 | Use site | CFlat type | C++ type today | Gap |
 |----------|-----------|----------------|-----|
-| `obj.m()`, `p->m()`, static, field read/write | yes | yes | method call through a pointer MEMBER crashes (p2); std-specialization field still opaque (p3) |
-| Namespaces, `using`, qualified names | yes | yes | namespace alias unbound (p3); using-directive shadowing (p2) |
-| Construct: `T(args)`, `= default`, brace | yes | mostly | `T&&` ctor matches nothing (p2); alias template not ctor-callable (p3); chained-method ctor ambiguity (p2); explicit ctor used implicitly (p3) |
-| Local lifetime, early exits, arrays, fields | yes | yes | file-scope objects never constructed/destroyed (p2) |
+| `obj.m()`, `p->m()`, static, field read/write | yes | yes | std-specialization field still opaque (p3) |
+| Namespaces, `using`, qualified names | yes | yes | global-scope class template not nameable (p3) |
+| Construct: `T(args)`, `= default`, brace | yes | mostly | implicit converting ctor at a call argument (p3); constrained/templated ctor resolution (cppinterop bucket) |
+| Local lifetime, early exits, arrays, fields | yes | yes | C++ field of a CFlat struct GLOBAL never constructed (p3) |
 | **Copy / pass by value / return by value** | inferred | **bitwise in several paths** | HELD family: by-value into a CFlat function (p1), struct copy skips field copy ctor (p2), copy from field (p2), brace-init array element (p2), return by value uses synth copy (p2), std::function returned by value segfaults (p2) |
 | `move` | yes | yes | - |
-| Reference params (`T&`, `const T&`) | borrow | yes | literal to `const int&` free/member param (p3, p2 segfault on folded constant); non-const ref accepts a prvalue (p2); variadic/inheriting ctor `U&` (p3) |
-| Operators incl. `[]`, `()`, `->`, conversions | yes | yes (parity ruling) | std::string free operator templates (p2); vector<bool> proxy (p3); iterator -> const_iterator (p2) |
+| Reference params (`T&`, `const T&`) | borrow | yes | variadic/inheriting ctor `U&` (p3, unconfirmed); variadic forwarding pack copies lvalues (p3); reference return refused at `return` (p3) |
+| Operators incl. `[]`, `()`, `->`, conversions | yes | yes (parity ruling) | proxy assignment / equality (p3); assignment rejects a non-call temporary RHS (p3); char literal at a template boundary (p3, ruled R10) |
 | `for (x : c)` | yes | **no** | range-for over a C++ container (cppinterop bucket) |
 | `?.` null-safe | yes | ruled (null check + smart forward) | verify on smart pointers |
 | CFlat generic over a C++ type (`list<std.string>`) | yes | partial | audit: copy/move/destroy inside generic bodies ride on the held copy family |
 | C++ template over a CFlat type | n/a | partial | template member not instantiated for a CFlat type (p2); `[cpp] struct` by value in a std container (p3) |
 | CFlat `interface` satisfied by a C++ class | yes | **unknown** | design question below |
-| Callbacks / `std::function` from CFlat callables | yes | yes (M7, M100) | loose free-parameter match (p2) |
+| Callbacks / `std::function` from CFlat callables | yes | yes (M7, M100) | - |
 | Exceptions | none in CFlat | `program` boundary only | unwind skips CFlat frame destructors (p2); M8 iteration 2 |
-| Ownership handoff | `unique<T>` | raw | pointer deleted by C++ callee destroyed again at scope exit (p2); `unique_ptr` vs `unique<T>` open |
-| Atomics, streams | own lib | **no** | std::atomic members unbound (p2); standard streams unusable (p2) |
+| Ownership handoff | `unique<T>` | raw | pointer deleted by C++ callee destroyed again at scope exit (p2, ruled R3); `unique_ptr` vs `unique<T>` open |
+| Atomics, streams | own lib | **no** | standard streams unusable (p2, cppinterop bucket) |
 | Diagnostics, hover, completion | yes | partial | relayed clang text not localized (p4); M9 tooling |
 
 The matrix says it plainly: calls, members, operators, and lifetime are already transparent.
@@ -197,15 +198,35 @@ Not leaks - these are the improvement, and they apply to CFlat types equally:
 - No prefix `++`; C++ prefix `operator++` binds to CFlat postfix.
 - Raw borrowed-pointer lifetimes are untracked (safety is at function boundaries).
 
+## Rulings made (2026-09-20)
+
+- **R1 - RULED.** CFlat concepts are a remix of C++ concepts and map DIRECTLY onto the existing
+  C++ ones (copy ctor, move ctor, destructor, reference binding); no parallel CFlat-only
+  mechanism. Where C++ offers a choice, CFlat takes the safer and faster one by default, because
+  it carries no legacy: borrow instead of a by-value copy, error instead of an implicit copy of a
+  move-only type. D1 is unblocked; the held copy family is schedulable.
+- **R3 - RULED.** `move p` at the call site transfers ownership into a raw-pointer C++
+  parameter and consumes the CFlat owner. Borrow stays the default. An import-side sink
+  annotation is a later option, only if headers need it at scale.
+- **R8 - RULED (was Q2).** A native CFlat `operator T` converts implicitly, the same as an
+  imported C++ one. An `explicit` opt-out spelling is not designed yet.
+- **R9 - RULED (was Q1).** A ternary over two lvalues stays an assignable lvalue in native CFlat.
+  That it was refused before counts as a CFlat gap, now closed; mixed arms stay refused.
+- **R10 - RULED (was Q3).** A char literal `'x'` is a `char` EVERYWHERE, not only at C++
+  boundaries. Touches native overload ranking; audit `char` vs `int` overload pairs when landing.
+- **Header cache (was Q5) - RULED.** A clang run that reports errors is never written to the
+  disk cache. Its result is kept in ONE in-memory most-recent slot, so the LSP gets a fast,
+  partially correct answer while a header is broken. Full request-group keying stays a p3.
+
 ## Rulings needed
 
-- **R1 (blocks D1).** Confirm "C++ class = owning CFlat struct with foreign special members" as
+- **R1 (RULED above; original text kept for the sub-questions).** Confirm "C++ class = owning CFlat struct with foreign special members" as
   the single rule for the held copy family, including: read-only by-value parameter is a borrow
   (no copy ctor call), and copy-from-field is a COPY when the type is copyable and an ERROR
   (needs `move`) when it is move-only.
 - **R2 (blocks D4).** May a plain CFlat struct be used as a C++ template argument without
   `[cpp]`, by synthesizing its C++ view on demand?
-- **R3 (D2).** Where does "this C++ callee takes ownership" come from: `unique_ptr`/`T&&`
+- **R3 (RULED above).** Where does "this C++ callee takes ownership" come from: `unique_ptr`/`T&&`
   signatures only (safe, incomplete), or also a CFlat-side annotation at the import?
 - **R4 (D3).** Container -> `T[]` view decay: implicit at a call, or an explicit spelling?
 - **R5.** `std::unique_ptr<T>` vs `unique<T>` (open since M10): under this plan they stay two

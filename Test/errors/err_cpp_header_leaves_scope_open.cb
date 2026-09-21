@@ -1,0 +1,9 @@
+// A header that leaves a namespace open reports "expected '}'" inside the generated stub, not
+// inside the header. It must still be refused as uncompilable (and never reach the header cache).
+expect_error("header leaves a namespace or brace scope open");
+import cpp "cpp_interop_scope_open.h";
+
+extern int main()
+{
+    return 0;
+}
