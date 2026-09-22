@@ -49,6 +49,7 @@ namespace cpppoly
     // was written by C++ and the CFlat side only reads it.
     Shape* make(int kind) noexcept;
     void destroy(Shape* s) noexcept;
+    inline void destroy_through(Shape* s) noexcept { delete s; }
 
     void reset_poly_counts() noexcept;
     int shape_dtors() noexcept;

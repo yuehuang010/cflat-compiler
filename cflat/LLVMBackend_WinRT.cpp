@@ -1579,7 +1579,7 @@ void LLVMBackend::DiagnoseExplicitMoveToBorrowParam(const std::string& functionN
     }
 
 void LLVMBackend::DiagnoseExplicitMoveToBorrowParam(const std::string& functionName,
-        const TypeAndValue& param, const NamedVariable& arg)
+        const TypeAndValue& param, const NamedVariable& arg, bool foreignCxxCallee)
 {
         // A `unique`-typed parameter is a sink even without the `move` keyword: the type
         // itself says the callee takes ownership, so an explicit `move` at the call site is fine.
@@ -1587,6 +1587,8 @@ void LLVMBackend::DiagnoseExplicitMoveToBorrowParam(const std::string& functionN
         // type) is likewise a real sink, so `move` into it transfers rather than "nothing".
         bool inferredSinkConsumes = param.IsConsumeInferredSink
             && !IsCopyableType(param.TypeName);
+        bool foreignCxxPointerSink = foreignCxxCallee && param.Pointer && !param.IsAlias
+            && !param.IsRvalueRef && !param.IsCxxRefToPointer && !param.IsCxxConstRef;
         bool paramIsSink = param.IsMove
             || param.IsRvalueRef
             || (!param.Pointer && !param.IsAlias && IsCoreUniqueType(param.TypeName))
@@ -1594,6 +1596,7 @@ void LLVMBackend::DiagnoseExplicitMoveToBorrowParam(const std::string& functionN
             // move-CONSTRUCTS the callee's caller-owned temp from the argument, so `move x`
             // transfers exactly what C++ transfers.
             || (!param.Pointer && IsForeignNontrivialCxxClass(param.TypeName))
+            || foreignCxxPointerSink
             || inferredSinkConsumes
             || (OwningSinkConsumesConcrete(param) && IsOwningValueOrClosureType(param.TypeName));
         DiagnoseExplicitMoveToBorrowParam(
@@ -1658,7 +1661,7 @@ void LLVMBackend::ApplyFuncPtrSinkTransfer(const std::string& functionName,
 
 void LLVMBackend::ApplyMoveParamTransfer(const std::string& functionName,
         const std::vector<TypeAndValue>& params, const std::vector<NamedVariable>& args,
-        bool paramsCarryAllocAlign, bool calleeIsMethod, bool beforeCall)
+        bool paramsCarryAllocAlign, bool calleeIsMethod, bool beforeCall, bool calleeIsCxx)
 {
         for (size_t i = 0; i < params.size() && i < args.size(); i++)
         {
@@ -1706,6 +1709,10 @@ void LLVMBackend::ApplyMoveParamTransfer(const std::string& functionName,
             // Admit __closure_fat_ptr and any encoded closure element type; a thin C fn ptr owns
             // nothing and never reaches here as a sink (ParamIsOwningSinkEligible rejects it).
             bool paramOwnsResource = IsOwningValueOrClosureType(params[i].TypeName);
+            bool foreignCxxPointerSink = calleeIsCxx && args[i].IsExplicitMove
+                && params[i].Pointer && !params[i].IsAlias
+                && !params[i].IsRvalueRef && !params[i].IsCxxRefToPointer
+                && !params[i].IsCxxConstRef;
             bool inferredSinkConsumes = params[i].IsConsumeInferredSink
                 && !IsCopyableType(params[i].TypeName);
             // A borrow/alias arg has no ownership to transfer - nulling it would orphan a value
@@ -1723,8 +1730,9 @@ void LLVMBackend::ApplyMoveParamTransfer(const std::string& functionName,
                     || IsVariableOwning(sourceName) || IsVariableOwningString(sourceName)
                     || IsOwnedClosureTemp(args[i].Primary)
                     || (!sourceName.empty() && paramOwnsResource));
-            bool isOwningSink = (OwningSinkConsumesConcrete(params[i]) || inferredSinkConsumes)
-                && argIsOwner && paramOwnsResource;
+            bool isOwningSink = (OwningSinkConsumesConcrete(params[i]) || inferredSinkConsumes
+                                 || foreignCxxPointerSink)
+                && argIsOwner && (paramOwnsResource || foreignCxxPointerSink);
             // Ownership-laundering guard: the arg is a value this function only BORROWS (a plain
             // by-value owning-value param of the current function) but the callee's param CONSUMES
             // it (a sink / `move` / unique). Transferring would null this function's alias while the
@@ -1878,6 +1886,10 @@ void LLVMBackend::ApplyMoveParamTransfer(const std::string& functionName,
 
                 if (beforeCall)
                 {
+                    // A unique<T> wrapper releases its pointee while lowering the raw-pointer
+                    // argument. Do not clear the wrapper before that release call runs.
+                    if (foreignCxxPointerSink && !args[i].TypeAndValue.Pointer)
+                        continue;
                     // Clear the source before the callee can observe or reseat an aliased slot.
                     if (params[i].IsFatInterfaceValue()
                         && args[i].TypeAndValue.IsFatInterfaceValue()
@@ -1961,6 +1973,13 @@ void LLVMBackend::ApplyMoveParamTransfer(const std::string& functionName,
                     }
                 }
             }
+
+            // The unique<T> raw-pointer adapter already released and nulled the holder before
+            // this call. Retire its source here so later reads use the normal moved-value error.
+            if (!beforeCall && foreignCxxPointerSink && !args[i].TypeAndValue.Pointer
+                && IsCoreUniqueType(args[i].TypeAndValue.TypeName)
+                && args[i].IsExplicitMove && !sourceName.empty())
+                MarkVariableMoved(sourceName);
         }
     }
 
@@ -2825,6 +2844,15 @@ llvm::Value* LLVMBackend::CallInterfaceMethod(llvm::Value* ifacePtr, const std::
             if (param.IsArrayView
                 && RejectArrayViewParamBinding(nv, param, ifaceName + "." + methodName))
                 return nullptr;
+
+            if (IsImplicitPrimitiveToPointer(param, nv, nv.Primary))
+            {
+                LogError(DescribeImplicitPrimitiveToPointer(
+                    param, nv, nv.Primary, "pass",
+                    std::format("parameter '{}' of interface method '{}.{}'",
+                                param.VariableName, ifaceName, methodName)));
+                return nullptr;
+            }
 
             // A blessed unique<IFace> wrapper is not an implementor: borrow the fat value it holds
             // through get(), the same lowering the direct call path applies.

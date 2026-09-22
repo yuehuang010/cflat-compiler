@@ -1,0 +1,26 @@
+import cpp "cpp_interop_poly.h" cache;
+
+expect_error("use of moved variable 'owner'") {
+    void use_after_move()
+    {
+        cpppoly.Shape* owner = new cpppoly.Shape();
+        cpppoly.destroy_through(move owner);
+        _ = owner->plain();
+    }
+}
+
+expect_error("cannot move borrowed parameter 'borrowed'") {
+    void borrowed_parameter_move(cpppoly.Shape* borrowed)
+    {
+        cpppoly.destroy_through(move borrowed);
+    }
+}
+
+expect_error("cannot 'move' 'borrowed' - it copies 'owner'") {
+    void copied_owner_move()
+    {
+        cpppoly.Shape* owner = new cpppoly.Shape();
+        cpppoly.Shape* borrowed = owner;
+        cpppoly.destroy_through(move borrowed);
+    }
+}

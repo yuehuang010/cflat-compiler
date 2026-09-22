@@ -2324,6 +2324,9 @@ A grouped C++ import accepts the same clauses at group level; `as` is only for o
 package-only `from` / `pri` clauses are not valid. A grouped import is one C++ translation unit:
 its headers share one header set and one cache key. Use `cache` for large or slow headers.
 
+Raw-pointer parameters of imported C++ functions borrow by default. To transfer a CFlat owner to
+a C++ callee that takes ownership, write `move p`; this consumes `p`, and later use is rejected.
+
 #### Import alias (`as`)
 
 Give an imported file a local alias so its symbols are accessible under a qualified name:

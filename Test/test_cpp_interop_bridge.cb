@@ -823,6 +823,15 @@ struct MyCircle : cpppoly.Shape
     ~MyCircle() { g_nobase_dtor = g_nobase_dtor + 1; }
 };
 
+void bridge_cpp_destroy_move(bool chooseFirst)
+{
+    MyCircle* owner = new MyCircle();
+    if (chooseFirst)
+        cpppoly.destroy_through(move owner);
+    else
+        cpppoly.destroy_through(move owner);
+}
+
 struct T2 : cpppoly.Tagged
 {
     T2(int x) : cpppoly.Tagged(x) { }
@@ -2378,6 +2387,38 @@ extern int main(int argc, char** argv)
     if (g_nobase_dtor != 1) return 1406;
     if (cpppoly.shape_dtors() != 1) return 1407;
     if (cpppoly.circle_dtors() != 0) return 1408;
+
+    // R3: an explicit move into an imported C++ raw-pointer parameter transfers the owner.
+    // The MyCircle* -> Shape* conversion must happen on the moved value, not on a borrow copy.
+    g_nobase_dtor = 0;
+    cpppoly.reset_poly_counts();
+    bridge_cpp_destroy_move(true);
+    bridge_check("C++ move callee true CFlat dtor", g_nobase_dtor, 1);
+    bridge_check("C++ move callee true Shape dtor", cpppoly.shape_dtors(), 1);
+    bridge_check("C++ move callee true live", cpppoly.circle_dtors(), 0);
+
+    g_nobase_dtor = 0;
+    cpppoly.reset_poly_counts();
+    bridge_cpp_destroy_move(false);
+    bridge_check("C++ move callee false CFlat dtor", g_nobase_dtor, 1);
+    bridge_check("C++ move callee false Shape dtor", cpppoly.shape_dtors(), 1);
+    bridge_check("C++ move callee false live", cpppoly.circle_dtors(), 0);
+
+    // A plain C++ pointer parameter remains a borrow; the caller still owns and deletes it.
+    cpppoly.reset_poly_counts();
+    cpppoly.Shape* borrowedCxx = new cpppoly.Square();
+    if (cpppoly.call_area(borrowedCxx) != 49) return 1444;
+    delete borrowedCxx;
+    bridge_check("C++ plain pointer borrow dtor", cpppoly.shape_dtors(), 1);
+    bridge_check("C++ plain pointer borrow square dtor", cpppoly.square_dtors(), 1);
+
+    // The same explicit handoff releases a unique<T> holder exactly once.
+    cpppoly.reset_poly_counts();
+    {
+        unique cpppoly.Shape* uniqueOwner = new cpppoly.Shape();
+        cpppoly.destroy_through(move uniqueOwner);
+    }
+    bridge_check("C++ move unique holder dtor", cpppoly.shape_dtors(), 1);
 
     {
         T2 t = T2(7);

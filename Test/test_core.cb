@@ -1309,7 +1309,8 @@ int testString()
     passed += Test("char* assign local data",   assignLocal.data(),   "abc");
 
     StringRow row;
-    row.name = cbuf;
+    string rowSource = cbuf;
+    row.name = rowSource.copy();
     passed += Test("char* assign field length", row.name.length(), 3);
     passed += Test("char* assign field data",   row.name.data(),   "abc");
 

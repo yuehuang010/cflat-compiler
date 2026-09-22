@@ -1,0 +1,67 @@
+// A char[N] buffer is stack storage. Wrapping its address in string borrows that storage, so
+// the string may stay in the current frame but may not escape into a longer-lived string slot.
+import "string.cb";
+import "list.cb";
+
+struct StackStringHolder { string s = default; };
+string gStackString = default;
+
+expect_error("cannot store a string borrowed from stack buffer 'buf'") {
+    void stackStringFieldThroughPointer() {
+        char[16] buf = "field";
+        StackStringHolder* h = new StackStringHolder();
+        h->s = &buf[0];
+        delete h;
+    }
+}
+
+expect_error("cannot store a string borrowed from stack buffer 'buf'") {
+    void stackStringFieldThroughLocalStruct() {
+        char[16] buf = "field";
+        StackStringHolder h = default;
+        h.s = &buf[1];
+    }
+}
+
+expect_error("cannot store a string borrowed from stack buffer 'buf'") {
+    void stackStringFieldBraceInit() {
+        char[16] buf = "field";
+        StackStringHolder h = { s = &buf[0] };
+    }
+}
+
+expect_error("cannot store a string borrowed from stack buffer 'buf'") {
+    void stackStringGlobalFromDecay() {
+        char[16] buf = "global";
+        gStackString = buf;
+    }
+}
+
+expect_error("cannot store a string borrowed from stack buffer 'buf'") {
+    string stackStringReturn() {
+        char[16] buf = "return";
+        return &buf[0];
+    }
+}
+
+expect_error("cannot store a string borrowed from stack buffer 'buf'") {
+    void stackStringOutParameter(string* out) {
+        char[16] buf = "out";
+        char* p = &buf[0];
+        *out = p;
+    }
+}
+
+expect_error("cannot store a string borrowed from stack buffer 'buf'") {
+    void stackStringOuterLocal() {
+        string outer = default;
+        {
+            char[16] buf = "inner";
+            outer = &buf[0];
+        }
+    }
+}
+
+// list<string>.add is intentionally absent from the rejects: its value insertion path copies
+// a borrowed string, as pinned by testStringStackBufferSources in test_list_ownership.cb.
+extern int main() { return 0; }

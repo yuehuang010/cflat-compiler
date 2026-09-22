@@ -1423,7 +1423,7 @@ bool LLVMBackend::BorrowProofRetiredByRebind(const NamedVariable& nv) const
 bool LLVMBackend::OwningLocalCopyStillAliases(const NamedVariable& nv) const
 {
         if (!nv.BorrowsOwningLocal || nv.OwningLocalOrigin.empty()) return false;
-        if (nv.IsOwning || nv.PointerRebound) return false;
+        if (nv.IsOwning || (nv.PointerRebound && nv.AssignBorrowBlock == nullptr)) return false;
         const NamedVariable* src = FindVariableByStorage(nv.OwningLocalStorage);
         return src != nullptr && src->IsOwning && !src->PointerRebound;
     }

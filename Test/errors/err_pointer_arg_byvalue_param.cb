@@ -17,11 +17,18 @@ class Counter : ICounter { int bump(int n) { return 100 + n; } };
 // an i8 slot - another module-verifier dump with no location.
 int takeU8(u8 v) { return (int)v; }
 int sumU8(u8 v, ...) { return (int)v; }
+int takePrimitivePointer(int* p) { return p == nullptr ? 1 : 0; }
 interface INarrow { int n(u8 v); };
 class NarrowImpl : INarrow { int n(u8 v) { return (int)v; } };
 
 extern int main()
 {
+    // Literal zero is the one primitive-to-pointer exception. A nonzero literal remains a
+    // rejected primitive value, and this direct-call leg pins the dedicated diagnostic.
+    expect_error("cannot pass parameter 'p' of 'takePrimitivePointer'") {
+        int r = takePrimitivePointer(1);
+    }
+
     // Direct call: no candidate remains, so the located "no overload" diagnostic stands.
     expect_error("no overload of 'byVal' matches the given arguments") {
         Circle* a = new Circle();

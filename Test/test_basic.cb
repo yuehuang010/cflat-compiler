@@ -2658,6 +2658,7 @@ void pdFill(PdCircle** c, int v) { (*c)->r = v; }
 int pdPrimDeref(int* p) { return 100 + *p; }
 int pdPrimDerefPP(int** p) { return 200 + **p; }
 int pdSumArr(int* p) { return p[0] + p[1]; }
+int pdZeroPtr(int* p) { return p == nullptr ? 1 : 0; }
 int pdFirstR(PdCircle* c) { return 90 + c->r; }
 // An OVERLOAD SET holding both depths: a 'T*[N]' argument decays to 'T**' and must select the
 // 'T**' body, not merely be refused by the 'T*' one.
@@ -2828,6 +2829,9 @@ bool testOverloadResolution()
     result &= Test("pd_prim_ptrptr_into_ptrptr_param", pdPrimDerefPP(pdIPP), 203);
     result &= Test("pd_prim_addrof_ptr_into_ptrptr_param", pdPrimDerefPP(&pdIP), 203);
     result &= Test("pd_prim_ptrptr_into_voidptr_param", pdByVoid(pdIPP), 1);
+    // A direct integer literal zero is a null pointer constant; a nonzero primitive remains
+    // rejected by the primitive-to-pointer diagnostic.
+    result &= Test("pd_literal_zero_into_ptr_param", pdZeroPtr(0), 1);
 
     // ---- ARRAY DECAY is a sanctioned spelling ----
     // 'T[N]' decays to 'T*', so 'T*[N]' decays to 'T**' - only binding that decayed 'T**' to a
@@ -3686,6 +3690,44 @@ bool testPointerTypeAlias()
     NodePtrAlias np = &n;
     result &= Test("ptr_alias_struct", np->v,                99);
 
+    return result;
+}
+
+int pointerPositiveFn(int x) { return x + 1; }
+int* pointerNullReturnZero() { return 0; }
+int pointerNullArg(int* p) { return p == nullptr ? 1 : 0; }
+
+bool testPointerScalarAcceptSet()
+{
+    bool result = true;
+    int value = 11;
+    int* zero = 0;
+    int* nil = nullptr;
+    result &= Test("ptr_scalar_literal_zero", zero == nullptr, true);
+    result &= Test("ptr_scalar_nullptr", nil == nullptr, true);
+    result &= Test("ptr_scalar_return_zero", pointerNullReturnZero() == nullptr, true);
+    result &= Test("ptr_scalar_call_nullptr", pointerNullArg(nullptr), 1);
+
+    int* explicitCast = (int*)value;
+    result &= Test("ptr_scalar_explicit_cast", (i64)explicitCast, 11);
+
+    char* text = "ok";
+    result &= Test("ptr_scalar_string_literal", text[1], 'k');
+
+    int[2] values = { 4, 8 };
+    int* decay = values;
+    result &= Test("ptr_scalar_array_decay", decay[1], 8);
+
+    void* erased = &value;
+    int* restored = (int*)erased;
+    result &= Test("ptr_scalar_void_roundtrip", *restored, 11);
+
+    function<int(int)> fn = pointerPositiveFn;
+    result &= Test("ptr_scalar_function_pointer", fn(4), 5);
+
+    int* next = decay + 1;
+    result &= Test("ptr_scalar_pointer_add", (int)(next - decay), 1);
+    result &= Test("ptr_scalar_pointer_compare", next > decay, true);
     return result;
 }
 
@@ -4588,6 +4630,7 @@ extern int main()
     total++; passed += testPointerArithmetic()           ? 1 : 0;
     total++; passed += testPrimitiveTypeAlias()          ? 1 : 0;
     total++; passed += testPointerTypeAlias()            ? 1 : 0;
+    total++; passed += testPointerScalarAcceptSet()      ? 1 : 0;
     total++; passed += testArrayTypeAlias()              ? 1 : 0;
     total++; passed += testNestedStructClass()           ? 1 : 0;
     total++; passed += testInPlaceDtor()                 ? 1 : 0;
@@ -4661,6 +4704,21 @@ bool testPointerArithmetic()
     // p-- decrements by sizeof(int)
     p--;
     result &= Test("int* p-- elem", *p, 20);
+
+    // Assignment to an existing plain pointer borrows the owning source.
+    int* assigned = arr + 1;
+    assigned = arr;
+    assigned++;
+    result &= Test("pointer assignment keeps source live", arr[0], 10);
+    result &= Test("pointer assignment advances borrow", *assigned, 20);
+
+    destructorCallCount = 0;
+    {
+        Tracked* owned = nullptr;
+        owned = new Tracked();
+        result &= Test("pointer assignment owns new value", owned != nullptr ? 1 : 0, 1);
+    }
+    result &= Test("pointer assignment new freed", destructorCallCount, 1);
 
     // (*p)++ / (*p)-- increment the POINTEE, not the pointer. Regression: the
     // parenthesized deref lost its storage, so the increment silently no-op'd

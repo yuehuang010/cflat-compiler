@@ -5157,6 +5157,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                 bool srcBorrowsOwningLocal = false;
                 std::string srcOwningLocalOrigin;
                 llvm::Value* srcOwningLocalStorage = nullptr;
+                bool srcOwningLocalBorrowAfterRebind = false;
                 // Concrete type inferred from the initializer, used to resolve an 'auto'
                 // declaration's TypeName (LLVM opaque pointers cannot recover the pointee
                 // from the value type alone, so typeof/nameof need the name captured here).
@@ -5958,6 +5959,8 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                     srcBorrowsOwningLocal = true;
                                     srcOwningLocalOrigin = rightNV.CallerName;
                                     srcOwningLocalStorage = srcRef.Storage;
+                                    if (srcVar != nullptr)
+                                        srcOwningLocalBorrowAfterRebind = srcVar->PointerRebound;
                                 }
                                 // A plain copy of a live OWNING local: the source still frees the
                                 // pointee at its own scope exit, so the copy owns nothing. Resolved by
@@ -5973,6 +5976,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                         srcOwningLocalOrigin =
                                             compiler->FindVariableNameByStorage(rightNV.Storage);
                                         srcOwningLocalStorage = rightNV.Storage;
+                                        srcOwningLocalBorrowAfterRebind = srcBind->PointerRebound;
                                     }
                                     // One hop further (`T* d = b;`): carry the origin, unless the
                                     // source was rebound since - then its declaration fact is stale.
@@ -5983,6 +5987,8 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                         srcBorrowsOwningLocal = true;
                                         srcOwningLocalOrigin = srcBind->OwningLocalOrigin;
                                         srcOwningLocalStorage = srcBind->OwningLocalStorage;
+                                        srcOwningLocalBorrowAfterRebind =
+                                            srcBind->OwningLocalBorrowAfterRebind;
                                     }
                                 }
                                 srcInferredTypeName = rightNV.TypeAndValue.TypeName;
@@ -6075,6 +6081,10 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                 RejectArrayViewElementMismatch(assignmentExpression, typeAndValue, rightNV);
                                 // int[] v = runtimeInt; reinterprets a number as an address.
                                 RejectPrimitiveValueIntoArrayView(assignmentExpression, typeAndValue, rightNV);
+                                if (RejectImplicitPrimitiveToPointer(
+                                        assignmentExpression, typeAndValue, rightNV, right,
+                                        "initialize", std::format("variable '{}'", name)))
+                                    right = nullptr;
                                 // Declarator-init leg of the code-value store gate: `Rec* r = w;`
                                 // stored a code address in a data pointer and wrote through it.
                                 if (compiler->CodeValueIntoDataDestination(rightNV, typeAndValue))
@@ -7619,9 +7629,12 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                     || typeAndValue.IsInterface))
                             || (!genericCoreUniqueTypeArg && !typeAndValue.Pointer
                                 && compiler->IsCoreUniqueType(typeAndValue.TypeName));
-                        bool borrowMoveKeepsBorrow = srcIsBorrowed && !srcMovedFromSlot
-                            && typeAndValue.Pointer && !typeAndValue.ElemPointer
-                            && !typeAndValue.IsUnique && !destUniqueLoc;
+                        bool plainPointerBorrow = ShouldBorrowPlainPointerBinding(
+                            typeAndValue, initializerSourceNV, nullptr, srcMovedFromSlot);
+                        bool borrowMoveKeepsBorrow = plainPointerBorrow
+                            || (srcIsBorrowed && !srcMovedFromSlot
+                                && typeAndValue.Pointer && !typeAndValue.ElemPointer
+                                && !typeAndValue.IsUnique && !destUniqueLoc);
                         if (initResultOwns)
                         {
                             // ParseMoveExpression sets lastOwningResult unconditionally and records the
@@ -7659,6 +7672,21 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                             && (compiler->IsBorrowedAddressValue(initializerSourceNV.Primary)
                                 || initializerSourceNV.PointsToBorrowedAddress))
                             compiler->GetOrCreateStackVariable(name).PointsToBorrowedAddress = true;
+                        if (haveInitializerSourceNV
+                            && (typeAndValue.Pointer || (!typeAndValue.Pointer
+                                && typeAndValue.TypeName == "string"))
+                            && initializerSourceNV.StackCharBufferBorrow)
+                        {
+                            auto& local = compiler->GetOrCreateStackVariable(name);
+                            if (!typeAndValue.Pointer && typeAndValue.TypeName == "string"
+                                && StackCharBufferOutlives(initializerSourceNV, local))
+                                RejectStackCharBufferEscape(initializerSourceNV, initDecl);
+                            local.StackCharBufferBorrow = true;
+                            local.StackCharBufferSource = initializerSourceNV.StackCharBufferSource.empty()
+                                ? initializerSourceNV.CallerName
+                                : initializerSourceNV.StackCharBufferSource;
+                            local.StackCharBufferScopeDepth = initializerSourceNV.StackCharBufferScopeDepth;
+                        }
                         // A channel the value-identity gate rejected is stale (a `new` from an argument
                         // list); retire it here so no later declaration or return reads it as owned.
                         compiler->lastOwningResult = false;
@@ -7790,6 +7818,8 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                 nv.BorrowsOwningLocal = true;
                                 nv.OwningLocalOrigin = srcOwningLocalOrigin;
                                 nv.OwningLocalStorage = srcOwningLocalStorage;
+                                nv.OwningLocalBorrowAfterRebind =
+                                    srcOwningLocalBorrowAfterRebind;
                             }
                         }
 
@@ -8509,6 +8539,54 @@ bool MainListener::RejectLocalAllocAlignMismatch(
         return true;
     }
 
+bool MainListener::ShouldBorrowPlainPointerBinding(
+        const LLVMBackend::TypeAndValue& destination,
+        const LLVMBackend::NamedVariable& source,
+        const LLVMBackend::NamedVariable* existingDestination,
+        bool sourceMovedFromSlot) const {
+        if (compilerLLVM == nullptr || sourceMovedFromSlot
+            || !destination.Pointer || destination.ElemPointer
+            || destination.IsUnique || destination.IsMove
+            || !source.TypeAndValue.Pointer || source.TypeAndValue.IsMove
+            || source.IsExplicitMove || source.Storage == nullptr
+            || source.FromOwningTempField || !source.FieldName.empty()
+            || source.IsElementAccess || !source.OwningStructName.empty()
+            || !source.FieldPathText.empty()
+            || !source.TypeAndValue.ParentVariableName.empty())
+            return false;
+        if (existingDestination != nullptr
+            && (existingDestination->IsOwning || existingDestination->IsNewAllocated
+                || destination.AllocAlignValue > LLVMBackend::kDefaultNewAlign))
+            return false;
+        if (existingDestination != nullptr && existingDestination->Storage != nullptr
+            && compilerLLVM->IsOwningValueType(source.TypeAndValue.TypeName))
+        {
+            // A null resource pointer is an established owning-acquisition sink. A non-null raw
+            // pointer rebind remains a borrow, which is the ordinary assignment case.
+            const auto* currentBlock = compilerLLVM->builder->GetInsertBlock();
+            const llvm::StoreInst* latestStore = nullptr;
+            for (auto* user : existingDestination->Storage->users())
+            {
+                auto* store = llvm::dyn_cast<llvm::StoreInst>(user);
+                if (store == nullptr || store->getPointerOperand() != existingDestination->Storage
+                    || store->getParent() != currentBlock)
+                    continue;
+                if (latestStore == nullptr || latestStore->comesBefore(store))
+                    latestStore = store;
+            }
+            if (latestStore != nullptr
+                && llvm::isa<llvm::ConstantPointerNull>(latestStore->getValueOperand()))
+                return false;
+        }
+        if (existingDestination != nullptr
+            && compilerLLVM->IsOwningValueType(source.TypeAndValue.TypeName)
+            && !compilerLLVM->IsCopyableType(source.TypeAndValue.TypeName))
+            return false;
+        const auto* sourceBinding = compilerLLVM->FindVariableByStorage(source.Storage);
+        return sourceBinding != nullptr
+            && (sourceBinding->IsOwning || sourceBinding->BorrowsOwningLocal);
+    }
+
 void MainListener::TransferPointerOwnershipOnStore(
         const LLVMBackend::NamedVariable& rightNV,
         llvm::Value* destination,
@@ -8986,7 +9064,38 @@ bool MainListener::NamedVarIsString(const LLVMBackend::NamedVariable& nv) {
         if (auto* st = llvm::dyn_cast_or_null<llvm::StructType>(nv.BaseType))
             return st->getName() == "string";
         return false;
-    }
+}
+
+bool MainListener::IsStackCharBufferBorrow(const LLVMBackend::NamedVariable& nv) {
+        return nv.StackCharBufferBorrow;
+}
+
+bool MainListener::StackCharBufferOutlives(
+        const LLVMBackend::NamedVariable& source,
+        const LLVMBackend::NamedVariable& destination) {
+        return IsStackCharBufferBorrow(source)
+            && source.StackCharBufferScopeDepth != 0
+            && destination.DeclarationScopeDepth != 0
+            && source.StackCharBufferScopeDepth > destination.DeclarationScopeDepth;
+}
+
+std::string MainListener::StackCharBufferSource(const LLVMBackend::NamedVariable& nv) {
+        if (!nv.StackCharBufferSource.empty()) return nv.StackCharBufferSource;
+        if (!nv.CallerName.empty()) return nv.CallerName;
+        if (!nv.TypeAndValue.VariableName.empty()) return nv.TypeAndValue.VariableName;
+        return "the current stack buffer";
+}
+
+bool MainListener::RejectStackCharBufferEscape(const LLVMBackend::NamedVariable& nv,
+                                               antlr4::ParserRuleContext* ctx) {
+        if (!IsStackCharBufferBorrow(nv)) return false;
+        LogErrorContext(ctx, std::format(
+            "cannot store a string borrowed from stack buffer '{}' into a longer-lived location; "
+            "its buffer is owned by the current stack frame and would be freed out from under the "
+            "destination. Use '.copy()' for an independent copy.",
+            StackCharBufferSource(nv)));
+        return true;
+}
 
 // The READ twin of `destIsFixedArrayElem`: a `string` element whose slot is LIVE storage the
 // reader does not own. Two shapes qualify. A FIXED array (`dst[0]`, `dst[0][0]`, `w.arr[0]`, a
@@ -9113,6 +9222,17 @@ bool MainListener::FieldPathRootIsFrameLocal(llvm::Value* storage) {
 
 LLVMBackend::NamedVariable MainListener::FinishAssignmentExpressionNamed(
         LLVMBackend::NamedVariable nv, bool savedOwned) {
+        if (nv.TypeAndValue.TypeName == "char"
+            && (PointsIntoStackFrame(nv.Primary)
+                || (nv.TypeAndValue.ConstArraySize > 0
+                    && PointsIntoStackFrame(nv.Storage))))
+        {
+            nv.StackCharBufferBorrow = true;
+            if (nv.StackCharBufferSource.empty())
+                nv.StackCharBufferSource = !nv.CallerName.empty()
+                    ? nv.CallerName : nv.TypeAndValue.VariableName;
+            nv.StackCharBufferScopeDepth = nv.DeclarationScopeDepth;
+        }
         if (nv.Primary != nullptr && (nv.TypeAndValue.IsAlias || nv.IsAliasBorrow))
             compilerLLVM->RegisterAliasValue(nv.Primary);
         if (nv.Primary != nullptr && nv.FromOwningTempField && !nv.OwningTempParent)

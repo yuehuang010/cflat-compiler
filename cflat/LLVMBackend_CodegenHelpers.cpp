@@ -1537,6 +1537,61 @@ bool LLVMBackend::IsStringLiteralIntoStructPointer(const TypeAndValue& destTV, l
     return GetDataStructure(destTV.TypeName).StructType != nullptr;
 }
 
+bool LLVMBackend::IsImplicitPrimitiveToPointer(const TypeAndValue& destTV,
+                                               const NamedVariable& sourceNV,
+                                               llvm::Value* value) const
+{
+    if (!destTV.Pointer || destTV.IsArrayView || value == nullptr)
+        return false;
+    const auto& sourceTV = sourceNV.TypeAndValue;
+    if (sourceTV.Pointer || sourceTV.IsArrayView || sourceTV.ConstArraySize != 0
+        || sourceTV.IsInterface || sourceTV.IsFunctionPointer || sourceTV.IsSimd
+        || value->getType()->isPointerTy())
+        return false;
+
+    auto* constantInt = llvm::dyn_cast<llvm::ConstantInt>(value);
+    if (sourceTV.TypeName.empty())
+    {
+        if (!value->getType()->isIntegerTy() && !value->getType()->isFloatingPointTy())
+            return false;
+        // Preserve the existing CFlat null spelling: only an integer literal zero is exempt.
+        return constantInt == nullptr || !constantInt->isZero()
+            || value->getType()->isIntegerTy(1);
+    }
+
+    const std::string resolved = ResolveTypeAlias(sourceTV.TypeName);
+    if (resolved == "void")
+        return false;
+    const bool isEnum = sourceTV.IsScopedEnum || !ResolveEnumTypeName(resolved).empty()
+        || !sourceTV.EnumBacking.empty();
+    return isEnum || IsPrimitiveTypeName(resolved);
+}
+
+std::string LLVMBackend::DescribeImplicitPrimitiveToPointer(
+    const TypeAndValue& destTV, const NamedVariable& sourceNV, llvm::Value* value,
+    const std::string& action, const std::string& destination) const
+{
+    std::string sourceType = SpellType(*this, sourceNV.TypeAndValue);
+    if (sourceType.empty())
+    {
+        auto* sourceLlvmType = value == nullptr ? nullptr : value->getType();
+        if (sourceLlvmType != nullptr && sourceLlvmType->isIntegerTy())
+            sourceType = sourceLlvmType->isIntegerTy(1) ? "bool" : "int";
+        else if (sourceLlvmType != nullptr && sourceLlvmType->isDoubleTy())
+            sourceType = "double";
+        else if (sourceLlvmType != nullptr && sourceLlvmType->isFloatingPointTy())
+            sourceType = "float";
+        else
+            sourceType = LlvmTypeToTypeName(sourceLlvmType);
+    }
+    const std::string targetType = SpellType(*this, destTV);
+    return std::format(
+        "cannot {} {} of type '{}' from a value of type '{}' - an integer or other primitive "
+        "is not an address; use '&x' to take an address or an explicit cast '({})x' to assert "
+        "this conversion",
+        action, destination, targetType, sourceType, targetType);
+}
+
 std::string LLVMBackend::DescribeStringLiteralIntoStructPointer(const TypeAndValue& destTV,
                                                    const std::string& destDesc) const
 {

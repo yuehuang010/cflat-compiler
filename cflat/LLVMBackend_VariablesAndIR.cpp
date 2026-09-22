@@ -1970,6 +1970,77 @@ llvm::Value* LLVMBackend::CreateOperation(Operation op, llvm::Value* left, llvm:
             auto* i64Ty = builder->getInt64Ty();
             bool leftIsPtr  = left->getType()->isPointerTy();
             bool rightIsPtr = right->getType()->isPointerTy();
+            const bool hasInvalidPointerOperator = [&]() {
+                switch (op)
+                {
+                case Operation::Multiply:
+                case Operation::MultiplyAssignment:
+                case Operation::Divide:
+                case Operation::DivideAssignment:
+                case Operation::Modulo:
+                case Operation::ModAssignment:
+                case Operation::ShiftLeft:
+                case Operation::LeftShiftAssignment:
+                case Operation::ShiftRight:
+                case Operation::RightShiftAssignment:
+                case Operation::BitwiseAnd:
+                case Operation::AndAssignment:
+                case Operation::BitwiseOr:
+                case Operation::OrAssignment:
+                case Operation::BitwiseXor:
+                case Operation::XorAssignment:
+                    return true;
+                case Operation::Add:
+                case Operation::AddAssignment:
+                {
+                    const bool leftIndexType = !leftIsPtr && left->getType()->isStructTy();
+                    const bool rightIndexType = !rightIsPtr && right->getType()->isStructTy();
+                    const bool keepExistingIndexDiagnostic = leftIndexType || rightIndexType
+                        || (!leftIsPtr && LlvmTypeToTypeName(left->getType()) == "string")
+                        || (!rightIsPtr && LlvmTypeToTypeName(right->getType()) == "string");
+                    return (leftIsPtr && rightIsPtr)
+                        || (!keepExistingIndexDiagnostic
+                            && leftIsPtr && !rightIsPtr && !right->getType()->isIntegerTy())
+                        || (!keepExistingIndexDiagnostic
+                            && rightIsPtr && !leftIsPtr && !left->getType()->isIntegerTy());
+                }
+                case Operation::Subtract:
+                case Operation::MinusAssignment:
+                    return !(leftIsPtr && rightIsPtr)
+                        && ((leftIsPtr && !right->getType()->isIntegerTy())
+                            || (rightIsPtr && !left->getType()->isIntegerTy()));
+                default:
+                    return false;
+                }
+            }();
+            if (hasInvalidPointerOperator)
+            {
+                const char* opText = "operator";
+                switch (op)
+                {
+                case Operation::Multiply: case Operation::MultiplyAssignment: opText = "*"; break;
+                case Operation::Divide: case Operation::DivideAssignment: opText = "/"; break;
+                case Operation::Modulo: case Operation::ModAssignment: opText = "%"; break;
+                case Operation::ShiftLeft: case Operation::LeftShiftAssignment: opText = "<<"; break;
+                case Operation::ShiftRight: case Operation::RightShiftAssignment: opText = ">>"; break;
+                case Operation::BitwiseAnd: case Operation::AndAssignment: opText = "&"; break;
+                case Operation::BitwiseOr: case Operation::OrAssignment: opText = "|"; break;
+                case Operation::BitwiseXor: case Operation::XorAssignment: opText = "^"; break;
+                case Operation::Add: case Operation::AddAssignment: opText = "+"; break;
+                case Operation::Subtract: case Operation::MinusAssignment: opText = "-"; break;
+                default: break;
+                }
+                const auto operandTypeName = [&](llvm::Type* type) {
+                    return type->isPointerTy() ? std::string("pointer")
+                                               : LlvmTypeToTypeName(type);
+                };
+                LogError(std::format(
+                    "cannot apply binary operator '{}' to operands of type '{}' and '{}': "
+                    "pointer arithmetic is limited to pointer +/- integer, pointer - pointer, "
+                    "and comparisons",
+                    opText, operandTypeName(left->getType()), operandTypeName(right->getType())));
+                return nullptr;
+            }
             switch (op)
             {
             case Operation::Less:

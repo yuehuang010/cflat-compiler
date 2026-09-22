@@ -71,6 +71,14 @@ static int CxxRefToPointerScore(const LLVMBackend::NamedVariable& arg,
     return (argIsLvalue != param.IsCxxConstRef) ? 0 : 1;
 }
 
+static bool IsNullPointerConstantArgument(const LLVMBackend::NamedVariable& arg)
+{
+    if (arg.LiteralIdentity != "int")
+        return false;
+    auto* constant = llvm::dyn_cast_or_null<llvm::ConstantInt>(arg.Primary);
+    return constant != nullptr && constant->isZero();
+}
+
 // A declared signature in CFlat spelling, e.g. "int(char*, ...)". Spells each type the way the
 // "no overload matches" candidate list does (SpellType, PointerStars as the fallback), so `const`
 // and the calling convention are not shown - neither can be why two signatures conflict.
@@ -308,6 +316,9 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
             int constRefMaterializations = 0;
             // Per argument: RankIntegerConversion cost, or -1 where no integer identity judged it.
             std::vector<int> integerCosts;
+            // Per argument: standard conversion cost, including a literal zero to a pointer.
+            std::vector<int> standardCosts;
+            int nullPointerConversions = 0;
         };
         std::vector<Ranked> perfect;
         std::vector<Ranked> possible;   // the promotion/implicit tier
@@ -395,6 +406,8 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
             // Arguments bound to a 'bool' parameter through the integer -> bool coercion.
             int boolCoercions = 0;
             int constRefMaterializations = 0;
+            std::vector<int> standardCosts;
+            int nullPointerConversions = 0;
             // Arguments bound through the `iterator -> const_iterator` conversion.
             int constAddedConversions = 0;
             int refPtrConstMismatches = 0;
@@ -819,6 +832,16 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                                 userConversionCost, userConversionNames).empty())
                         result = 1;
 
+                    // A direct integer literal zero is a C++ null pointer constant. It is a
+                    // conversion, below nullptr and pointer identity matches.
+                    if (result < 0 && candidateParamItr->Pointer
+                        && !candidateParamItr->IsArrayView
+                        && IsNullPointerConstantArgument(arg))
+                    {
+                        result = 1;
+                        ++nullPointerConversions;
+                    }
+
                     /*
                      * A function pointer or closure VALUE does not implicitly convert to a DATA
                      * pointer of any pointee - it is code, not data, and ISO C has no
@@ -952,6 +975,10 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                     if (result >= 0) constRefMaterializations++;
                 }
                 integerCosts.push_back(integerCost);
+                standardCosts.push_back(integerCost);
+                if (standardCosts.back() < 0 && IsNullPointerConstantArgument(arg)
+                    && candidateParamItr->Pointer && !candidateParamItr->IsArrayView)
+                    standardCosts.back() = kIntegerConversionCost;
 
                 if (result != 0)
                 {
@@ -990,6 +1017,8 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                 ranked.userConversionNames = userConversionNames;
                 ranked.moveScore = ScoreMoveAgreement(arguments, candidate);
                 ranked.integerCosts = std::move(integerCosts);
+                ranked.standardCosts = std::move(standardCosts);
+                ranked.nullPointerConversions = nullPointerConversions;
                 (perfectMatch ? perfect : possible).push_back(std::move(ranked));
             }
         }
@@ -1021,7 +1050,7 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
             return strictlyBetter;
         };
 
-        enum class TieKind { IdenticalParameters, IntegerOnly, Other };
+        enum class TieKind { IdenticalParameters, RankedStandardOnly, Other };
         auto classifyTie = [&](const Ranked& a, const Ranked& b) {
             const auto& aParams = a.pair->second.Parameters;
             const auto& bParams = b.pair->second.Parameters;
@@ -1034,44 +1063,48 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                     && aParams[i].ToUniqueString(*this) == bParams[i].ToUniqueString(*this))
                     continue;
                 anyDiffers = true;
-                // An enum parameter ranks as its backing type, so its identity is not judged here.
-                const bool judged = i < a.integerCosts.size() && i < b.integerCosts.size()
+                const bool integerJudged = i < a.integerCosts.size() && i < b.integerCosts.size()
                     && a.integerCosts[i] >= 0 && b.integerCosts[i] >= 0
                     && enumBackingTypes.count(aParams[i].TypeName) == 0
                     && enumBackingTypes.count(bParams[i].TypeName) == 0;
+                const bool nullPointerJudged = i < a.integerCosts.size() && i < b.integerCosts.size()
+                    && i < a.standardCosts.size() && i < b.standardCosts.size()
+                    && a.integerCosts[i] < 0 && b.integerCosts[i] < 0
+                    && a.standardCosts[i] >= 0 && b.standardCosts[i] >= 0;
+                const bool judged = integerJudged || nullPointerJudged;
                 if (!judged)
                     return TieKind::Other;
             }
             if (!anyDiffers)
                 return (a.pair->second.IsCxx || b.pair->second.IsCxx) ? TieKind::Other
                                                                       : TieKind::IdenticalParameters;
-            return TieKind::IntegerOnly;
+            return TieKind::RankedStandardOnly;
         };
 
         /*
          * Settles candidates every tie-break above left equal. Identical parameter lists: the later
          * registration shadows the earlier (a program's own `void WaitForExit(int)` over the
-         * synthesized `bool WaitForExit(int)`). A tie that only integer identity could have decided
-         * is a genuine ambiguity, reported through `tiedOut`. A tie at any other kind of position is
-         * outside the integer ranking and keeps the legacy declaration-order pick.
+         * synthesized `bool WaitForExit(int)`). A tie that only integer identity or null-pointer
+         * conversion ranking could have decided is a genuine ambiguity, reported through `tiedOut`.
+         * A tie at any other kind of position is outside this ranking and keeps the legacy pick.
          */
         auto settle = [&](const std::vector<const Ranked*>& best, bool legacyLastWins) -> const Ranked* {
             if (best.size() == 1)
                 return best.front();
             bool allIdentical = true;
-            bool anyIntegerOnly = false;
+            bool anyRankedOnly = false;
             bool anyOther = false;
             for (size_t i = 0; i < best.size(); ++i)
                 for (size_t j = i + 1; j < best.size(); ++j)
                 {
                     TieKind kind = classifyTie(*best[i], *best[j]);
                     allIdentical &= kind == TieKind::IdenticalParameters;
-                    anyIntegerOnly |= kind == TieKind::IntegerOnly;
+                    anyRankedOnly |= kind == TieKind::RankedStandardOnly;
                     anyOther |= kind == TieKind::Other;
                 }
             if (allIdentical)
                 return best.back();
-            if (anyIntegerOnly && !anyOther && tiedOut != nullptr)
+            if (anyRankedOnly && !anyOther && tiedOut != nullptr)
             {
                 for (const Ranked* r : best)
                     tiedOut->push_back(r->pair->second);
@@ -1116,6 +1149,8 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                 for (int cost : r.integerCosts)
                     if (cost > 0)
                         tier = std::max(tier, cost >= kIntegerConversionCost ? 2 : 1);
+                if (r.nullPointerConversions > 0)
+                    tier = 2;
                 return tier;
             });
             std::vector<const Ranked*> undominated;
@@ -1925,6 +1960,24 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                                         shownReceiver, bareMemberName, shownReceiver, bound));
                 return nullptr;
             }
+            for (const auto& c : candidates)
+            {
+                if (c.IsCxx || c.Parameters.size() != arguments.size()) continue;
+                if (!std::all_of(arguments.begin(), arguments.end(), [](const auto& arg) {
+                        return arg.TypeAndValue.VariableName.empty();
+                    }))
+                    continue;
+                for (size_t i = 0; i < arguments.size(); ++i)
+                    if (IsImplicitPrimitiveToPointer(c.Parameters[i], arguments[i], arguments[i].Primary))
+                    {
+                        LogError(DescribeImplicitPrimitiveToPointer(
+                            c.Parameters[i], arguments[i], arguments[i].Primary, "pass",
+                            std::format("parameter '{}' of '{}'", c.Parameters[i].VariableName,
+                                        shownFunctionName)));
+                        return nullptr;
+                    }
+            }
+
             std::string msg = std::format("no overload of '{}' matches the given arguments.\n", shownFunctionName);
 
             // Recover a named-argument diagnostic only from candidates whose parameter names
@@ -2413,6 +2466,16 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
             if (!inVariadicRange)
                 RejectArrayViewParamBinding(arg, *candParamItr, diagnosticFunctionName);
 
+            if (!inVariadicRange && IsImplicitPrimitiveToPointer(
+                    *candParamItr, arg, arg.Primary) && !candidate.IsCxx)
+            {
+                LogError(DescribeImplicitPrimitiveToPointer(
+                    *candParamItr, arg, arg.Primary, "pass",
+                    std::format("parameter '{}' of '{}'", candParamItr->VariableName,
+                                diagnosticFunctionName)));
+                return nullptr;
+            }
+
             // Closure SHAPE gate (value vs pointer vs view), shared with virtual dispatch.
             // Hoisted above the binding branches: it judges the pair, not one binding arm.
             if (!inVariadicRange && !candParamItr->IsInterface
@@ -2441,7 +2504,8 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                 && !arg.TypeAndValue.IsInterface
                 && IsCoreUniqueToRawPointer(arg, *candParamItr))
             {
-                argList.push_back(CreateCoreUniqueRawPointerCall(arg, *candParamItr));
+                argList.push_back(CreateCoreUniqueRawPointerCall(arg, *candParamItr,
+                                                                  candidate.IsCxx));
             }
             // An 'IA[]' parameter is a THIN view over fat elements, never a fat value itself, so
             // nothing binds to it by boxing - the declarator door excludes views the same way.
@@ -2540,7 +2604,8 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                 bool coreUniqueToRawPointer = IsCoreUniqueToRawPointer(arg, *candParamItr);
                 if (coreUniqueToRawPointer)
                 {
-                    argList.push_back(CreateCoreUniqueRawPointerCall(arg, *candParamItr));
+                    argList.push_back(CreateCoreUniqueRawPointerCall(arg, *candParamItr,
+                                                                      candidate.IsCxx));
                 }
                 else
                 {
@@ -2570,7 +2635,19 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                 // be the wrong type for a pointer parameter.
                 // Guard: if Primary is already a pointer value (e.g. loaded from a global ptr),
                 // use Primary directly - Storage would be the wrong level of indirection.
-                if (!arg.TypeAndValue.Pointer && arg.Storage != nullptr
+                if (IsNullPointerConstantArgument(arg))
+                {
+                    auto* pointerType = GetType(*candParamItr);
+                    if (pointerType == nullptr || !pointerType->isPointerTy())
+                    {
+                        LogErrorMessage("cannot lower null pointer argument for parameter '{}' of '{}'",
+                                        { candParamItr->VariableName, diagnosticFunctionName });
+                        return nullptr;
+                    }
+                    argList.push_back(llvm::ConstantPointerNull::get(
+                        llvm::cast<llvm::PointerType>(pointerType)));
+                }
+                else if (!arg.TypeAndValue.Pointer && arg.Storage != nullptr
                     && !(arg.Primary != nullptr && arg.Primary->getType()->isPointerTy()))
                     argList.push_back(arg.Storage);
                 else if (!arg.TypeAndValue.Pointer && arg.Storage == nullptr
@@ -2893,13 +2970,18 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
             if (!isCoreUniqueConstructor && !isCoreUniqueReset)
             {
                 const auto& sinkParam = candidate.Parameters[i];
+                bool foreignCxxPointerSink = candidate.IsCxx && matched[i].IsExplicitMove
+                    && sinkParam.Pointer
+                    && !sinkParam.IsAlias && !sinkParam.IsRvalueRef
+                    && !sinkParam.IsCxxRefToPointer && !sinkParam.IsCxxConstRef;
                 bool paramIsSink = !sinkParam.IsAlias
                     && ((sinkParam.IsMove
                          && (sinkParam.Pointer || sinkParam.IsInterfacePointer
                              || sinkParam.IsFatInterfaceValue()))
                         // A `unique<T>` BY-VALUE parameter is a sink without the keyword: the
                         // type says the callee takes ownership.
-                        || (!sinkParam.Pointer && IsCoreUniqueType(sinkParam.TypeName)));
+                        || (!sinkParam.Pointer && IsCoreUniqueType(sinkParam.TypeName))
+                        || foreignCxxPointerSink);
                 const auto& arg = matched[i];
                 bool storageIsLocalSlot = arg.Storage != nullptr
                     && llvm::isa<llvm::AllocaInst>(arg.Storage);
@@ -2988,7 +3070,8 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
             // "move into a borrow parameter transfers nothing" diagnostic is wrong there.
             if (!IsBorrowingContainerElementSink(functionName, candidate.Parameters, i,
                                                  candidate.IsMethod))
-                DiagnoseExplicitMoveToBorrowParam(functionName, candidate.Parameters[i], matched[i]);
+                DiagnoseExplicitMoveToBorrowParam(functionName, candidate.Parameters[i], matched[i],
+                                                   candidate.IsCxx);
             RejectOwningLocalIntoBorrowingContainer(functionName, candidate.Parameters, i,
                                                     candidate.IsMethod, matched[i]);
             RejectOwningLocalIntoBorrowingHelper(functionName, candidate, i, matched[i]);
@@ -3048,7 +3131,7 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
 
         // Null move sources before the callee can observe or reseat an aliased slot.
         ApplyMoveParamTransfer(functionName, candidate.Parameters, matched, true,
-                               candidate.IsMethod, true);
+                               candidate.IsMethod, true, candidate.IsCxx);
 
         /*
          * M4b - foreign nontrivial C++ values crossing this call by value.
@@ -3380,7 +3463,7 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
 
         // Retire move temporaries and mark the source moved after the call.
         ApplyMoveParamTransfer(functionName, candidate.Parameters, matched, true,
-                               candidate.IsMethod);
+                               candidate.IsMethod, false, candidate.IsCxx);
 
         // A temp's `unique` field handed to a PLAIN `T*` parameter. Runs AFTER the sink reject
         // above, so `unique` / `move` parameters never reach the callee-side question.
@@ -3947,9 +4030,12 @@ llvm::Value* LLVMBackend::CreateCoreUniqueFromRawPointerCall(
 }
 
 llvm::Value* LLVMBackend::CreateCoreUniqueRawPointerCall(
-    const NamedVariable& arg, const TypeAndValue& param)
+    const NamedVariable& arg, const TypeAndValue& param, bool calleeIsCxx)
 {
-        bool consumesCoreUnique = arg.IsExplicitMove && IsMoveOrCoreUniqueValue(param);
+        bool foreignCxxPointerSink = calleeIsCxx && param.Pointer && !param.IsAlias
+            && !param.IsRvalueRef && !param.IsCxxRefToPointer && !param.IsCxxConstRef;
+        bool consumesCoreUnique = arg.IsExplicitMove
+            && (IsMoveOrCoreUniqueValue(param) || foreignCxxPointerSink);
         bool carriesTempUniqueField = JoinCarriesOwningTempUniqueField(arg.Primary)
             || (arg.FromOwningTempField && arg.OwningTempParent);
         if (consumesCoreUnique && !arg.CallerName.empty())
@@ -4350,11 +4436,44 @@ void LLVMBackend::RecordAssignBorrow(const std::string& name, const std::string&
             // A '??=' keeps the OLD referent when its arm is not taken, so it may not overwrite the
             // origin an existing borrow names - only supply one where there was none.
             if (keepExistingOrigin && nv->IsBorrowed && !nv->BorrowedOrigin.empty()) return;
+            nv->BorrowsOwningLocal = false;
+            nv->OwningLocalOrigin.clear();
+            nv->OwningLocalStorage = nullptr;
+            nv->OwningLocalBorrowAfterRebind = false;
             nv->IsBorrowed = true;
             nv->BorrowedOrigin = origin;
             nv->BorrowedUniqueField = uniqueField;
             nv->BorrowedUniqueFieldViaCall = uniqueFieldViaCall;
             nv->BorrowedThroughField = throughField;
+            nv->AssignBorrowBlock = builder->GetInsertBlock();
+            return;
+        }
+    }
+
+void LLVMBackend::RecordAssignOwningLocalBorrow(const std::string& name,
+                                       const std::string& origin,
+                                       llvm::Value* ownerStorage)
+{
+        if (name.empty() || origin.empty() || ownerStorage == nullptr) return;
+        for (auto& frame : std::ranges::reverse_view(stackNamedVariable))
+        {
+            NamedVariable* nv = nullptr;
+            if (auto it = frame.namedVariable.find(name); it != frame.namedVariable.end())
+                nv = &it->second;
+            else if (auto it2 = frame.functionArgument.find(name); it2 != frame.functionArgument.end())
+                nv = &it2->second;
+            if (nv == nullptr) continue;
+            if (nv->IsOwning || nv->IsNewAllocated) return;
+            nv->IsBorrowed = false;
+            nv->BorrowedOrigin.clear();
+            nv->BorrowedUniqueField.clear();
+            nv->BorrowedUniqueFieldViaCall = false;
+            nv->BorrowedThroughField = false;
+            nv->BorrowsOwningLocal = true;
+            nv->OwningLocalOrigin = origin;
+            nv->OwningLocalStorage = ownerStorage;
+            const auto* owner = FindVariableByStorage(ownerStorage);
+            nv->OwningLocalBorrowAfterRebind = owner != nullptr && owner->PointerRebound;
             nv->AssignBorrowBlock = builder->GetInsertBlock();
             return;
         }
@@ -4389,8 +4508,27 @@ void LLVMBackend::SetPointsToBorrowedAddress(const std::string& name, bool value
             if (nv == nullptr) continue;
             nv->PointsToBorrowedAddress = value;
             return;
-        }
     }
+}
+
+void LLVMBackend::SetStackCharBufferBorrow(const std::string& name, bool value,
+                                           const std::string& source, size_t scopeDepth)
+{
+        if (name.empty()) return;
+        for (auto& frame : std::ranges::reverse_view(stackNamedVariable))
+        {
+            NamedVariable* nv = nullptr;
+            if (auto it = frame.namedVariable.find(name); it != frame.namedVariable.end())
+                nv = &it->second;
+            else if (auto it2 = frame.functionArgument.find(name); it2 != frame.functionArgument.end())
+                nv = &it2->second;
+            if (nv == nullptr) continue;
+            nv->StackCharBufferBorrow = value;
+            nv->StackCharBufferSource = value ? source : std::string();
+            nv->StackCharBufferScopeDepth = value ? scopeDepth : 0;
+            return;
+        }
+}
 
 void LLVMBackend::RetireAssignBorrow(const std::string& name)
 {
@@ -4411,6 +4549,10 @@ void LLVMBackend::RetireAssignBorrow(const std::string& name)
             nv->BorrowedUniqueField.clear();
             nv->BorrowedUniqueFieldViaCall = false;
             nv->BorrowedThroughField = false;
+            nv->BorrowsOwningLocal = false;
+            nv->OwningLocalOrigin.clear();
+            nv->OwningLocalStorage = nullptr;
+            nv->OwningLocalBorrowAfterRebind = false;
             nv->AssignBorrowBlock = nullptr;
             return;
         }

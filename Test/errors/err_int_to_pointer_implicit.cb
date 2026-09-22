@@ -1,0 +1,53 @@
+// A primitive value is not an address. The integer literal 0 is the existing null exception.
+enum PointerEnum : int { One = 1 };
+struct BracePointerField { int* p = default; };
+
+expect_error("an integer or other primitive is not an address") {
+    int x = 5;
+    int* p = x;
+}
+
+expect_error("an integer or other primitive is not an address") {
+    void badAssignment() {
+        int x = 5;
+        int* p = nullptr;
+        p = x;
+    }
+}
+
+expect_error("an integer or other primitive is not an address") {
+    int* badReturn() { return 5; }
+}
+
+expect_error("an integer or other primitive is not an address") {
+    void takePointer(int* p) {}
+    void badCall() { int x = 5; takePointer(x); }
+}
+
+expect_error("an integer or other primitive is not an address") {
+    bool b = false;
+    int* p = b;
+}
+
+expect_error("an integer or other primitive is not an address") {
+    float f = 1.0f;
+    int* p = f;
+}
+
+expect_error("an integer or other primitive is not an address") {
+    void badEnum() {
+        PointerEnum e = PointerEnum.One;
+        int* p = e;
+    }
+}
+
+expect_error("an integer or other primitive is not an address") {
+    struct DefaultPointerField { int* p = 5; };
+}
+
+expect_error("an integer or other primitive is not an address") {
+    void badBrace() {
+        int braceX = 5;
+        BracePointerField value = { p = braceX };
+    }
+}

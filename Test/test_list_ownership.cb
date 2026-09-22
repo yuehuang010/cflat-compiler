@@ -571,6 +571,37 @@ int testStringTempFieldBorrow()
     return passed;
 }
 
+string stackStringParam(char* p) { return p; }
+
+int testStringStackBufferSources()
+{
+    int passed = 0;
+    char[16] buf = "stack";
+    string local = &buf[0];
+    string literal = "literal";
+    char* heap = new char[16];
+    strcpy(heap, "heap");
+    string heapString = heap;
+    char[16] paramBuf = "param";
+    string paramString = stackStringParam(paramBuf);
+
+    list<string> copied = default;
+    copied.add(local);
+    copied.add(&buf[0]);
+    buf[0] = 'X';
+
+    passed += Test("stack char buffer same-scope string", local, "Xtack");
+    passed += Test("string literal remains valid", literal, "literal");
+    passed += Test("heap char pointer string remains valid", heapString, "heap");
+    passed += Test("char pointer parameter string remains valid", paramString, "param");
+    passed += Test("list copies wrapped stack string count", copied.count(), 2);
+    passed += Test("list copies named wrapped stack string", copied[0], "stack");
+    passed += Test("list copies direct wrapped stack string", copied[1], "stack");
+
+    delete heap;
+    return passed;
+}
+
 // --- bare pointer: BORROWS --------------------------------------------------------
 
 int testBarePointerBorrows()
@@ -1475,6 +1506,7 @@ extern int main()
     total += 12; passed += testStringTempFieldCopy();
     total += 8;  passed += testStringTempElementCopy();
     total += 4;  passed += testStringTempFieldBorrow();
+    total += 7;  passed += testStringStackBufferSources();
     total += 5;  passed += testBarePointerBorrows();
     total += 4;  passed += testBorrowedPointerElementBorrows();
     total += 7;  passed += testAliasPointerElementBorrows();

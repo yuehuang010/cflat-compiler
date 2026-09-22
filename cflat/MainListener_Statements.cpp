@@ -619,6 +619,10 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
             if (!cxxSretReturn)
                 returnNV.Primary = GenerateDefaultValue(dtv);
         }
+        if (!defaultValue && compiler->currentFunctionReturnTV.TypeName == "string"
+            && !compiler->currentFunctionReturnTV.Pointer
+            && RejectStackCharBufferEscape(returnNV, errCtx))
+            return;
         const bool cxxReturnCallConstructed = cxxSretReturn && !defaultValue && !cxxReturnTernary
             && compiler->pendingCxxSretDest_ == nullptr;
         const bool cxxReturnTernaryConstructed = cxxReturnTernary
@@ -1056,6 +1060,8 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
         }
         // A string LITERAL is a 'const char*', never a 'T*' - the RETURN leg of the same gate the
         // declarator, `=`, brace-init, field-default and argument sites apply.
+        RejectImplicitPrimitiveToPointer(
+            errCtx, compiler->currentFunctionReturnTV, returnNV, right, "return", "the pointer");
         RejectStringLiteralIntoStructPointer(errCtx, compiler->currentFunctionReturnTV, right,
                                              "the return value");
         // Coerce the returned value to the function-pointer return type (thin vs

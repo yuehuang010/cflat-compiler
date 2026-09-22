@@ -1,0 +1,105 @@
+expect_error("cannot apply binary operator '*'") {
+    void badMultiply() {
+        int* a = new int;
+        int* b = new int;
+        auto value = a * b;
+    }
+}
+
+expect_error("cannot apply binary operator '/'") {
+    void badDivide() {
+        int* a = new int;
+        int* b = new int;
+        auto value = a / b;
+    }
+}
+
+expect_error("cannot apply binary operator '%'") {
+    void badModulo() {
+        int* a = new int;
+        int* b = new int;
+        auto value = a % b;
+    }
+}
+
+expect_error("cannot apply binary operator '&'") {
+    void badAnd() {
+        int* a = new int;
+        int* b = new int;
+        auto value = a & b;
+    }
+}
+
+expect_error("cannot apply binary operator '|'") {
+    void badOr() {
+        int* a = new int;
+        int* b = new int;
+        auto value = a | b;
+    }
+}
+
+expect_error("cannot apply binary operator '^'") {
+    void badXor() {
+        int* a = new int;
+        int* b = new int;
+        auto value = a ^ b;
+    }
+}
+
+expect_error("cannot apply binary operator '<<'") {
+    void badLeftShift() {
+        int* a = new int;
+        int* b = new int;
+        auto value = a << b;
+    }
+}
+
+expect_error("cannot apply binary operator '>>'") {
+    void badRightShift() {
+        int* a = new int;
+        int* b = new int;
+        auto value = a >> b;
+    }
+}
+
+expect_error("cannot apply binary operator '+'") {
+    void badPointerAdd() {
+        int* a = new int;
+        int* b = new int;
+        auto value = a + b;
+    }
+}
+
+expect_error("cannot apply binary operator '+'") {
+    void badPointerFloatAdd() {
+        int* a = new int;
+        float offset = 1.0f;
+        auto value = a + offset;
+    }
+}
+
+expect_error("cannot apply binary operator '-'") {
+    void badPointerFloatSubtract() {
+        int* a = new int;
+        float offset = 1.0f;
+        auto value = a - offset;
+    }
+}
+
+expect_error("cannot delete 'p' - it copies 'arr'") {
+    void deletePointerAssignmentBorrow() {
+        int* arr = new int[1];
+        int* p = arr + 0;
+        p = arr;
+        delete p;
+    }
+}
+
+expect_error("dereference of moved variable 'arr'") {
+    void movePointerAssignmentConsumesSource() {
+        int* arr = new int[1];
+        int* p;
+        p = move arr;
+        int value = arr[0];
+    }
+}

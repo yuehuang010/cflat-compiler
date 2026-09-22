@@ -4900,6 +4900,13 @@ public:
         antlr4::ParserRuleContext* trueCtx, antlr4::ParserRuleContext* falseCtx,
         antlr4::ParserRuleContext* ctx);
 
+    // Shared declaration/assignment predicate for borrowing a named owning pointer source.
+    bool ShouldBorrowPlainPointerBinding(
+        const LLVMBackend::TypeAndValue& destination,
+        const LLVMBackend::NamedVariable& source,
+        const LLVMBackend::NamedVariable* existingDestination,
+        bool sourceMovedFromSlot) const;
+
     /*
      * Is the RHS's allocation alignment PRECISE at a global store? Only a recorded alignment
      * (AllocAlignKnown) or an OWNING fresh/raw-new binding qualifies: new-provenance flags are
@@ -4967,6 +4974,12 @@ public:
 
     // True when the NamedVariable's value is the `string` value type.
     bool NamedVarIsString(const LLVMBackend::NamedVariable& nv);
+    static bool IsStackCharBufferBorrow(const LLVMBackend::NamedVariable& nv);
+    static bool StackCharBufferOutlives(const LLVMBackend::NamedVariable& source,
+                                        const LLVMBackend::NamedVariable& destination);
+    static std::string StackCharBufferSource(const LLVMBackend::NamedVariable& nv);
+    bool RejectStackCharBufferEscape(const LLVMBackend::NamedVariable& nv,
+                                     antlr4::ParserRuleContext* ctx);
     bool IsOwningArrayStringElementRead(const LLVMBackend::NamedVariable& nv, llvm::Value* value);
     bool IsRawHeapStringElementRead(const LLVMBackend::NamedVariable& nv, llvm::Value* value);
     bool RawHeapBaseIsNewArrayLocal(llvm::Value* gepBase);
@@ -5395,6 +5408,14 @@ public:
     bool RejectPrimitiveValueIntoArrayView(antlr4::ParserRuleContext* ctx,
                                      const LLVMBackend::TypeAndValue& target,
                                      const LLVMBackend::NamedVariable& rhsNV);
+
+    // Primitive-to-pointer sibling: a nonzero scalar is a value, not an address.
+    bool RejectImplicitPrimitiveToPointer(antlr4::ParserRuleContext* ctx,
+                                     const LLVMBackend::TypeAndValue& target,
+                                     const LLVMBackend::NamedVariable& rhsNV,
+                                     llvm::Value* value,
+                                     const std::string& action,
+                                     const std::string& destination);
 
     // Element identity of a view read out of a struct FIELD, however the field was addressed.
     bool ViewFieldElementForRead(llvm::Value* value, llvm::Value* storage,

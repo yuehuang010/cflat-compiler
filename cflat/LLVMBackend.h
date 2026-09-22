@@ -1443,6 +1443,11 @@ public:
         // it provably borrows - `&x` never yields an owner. Positive provenance recorded where the
         // binding is produced (never re-derived from IR); not part of the --init cache round-trip.
         bool PointsToBorrowedAddress = false;
+        // True when this raw char* or string value points into a fixed char buffer in the current
+        // stack frame. The source name is retained for escape diagnostics.
+        bool StackCharBufferBorrow = false;
+        std::string StackCharBufferSource;
+        size_t StackCharBufferScopeDepth = 0;
         // compile-time: the occurrence id (see currentCastOccurrence_) this argument's own value
         // was produced under, stamped when a call-argument's evaluation finishes. Lets a DEFERRED
         // gate (ArgumentIsCodeValue / ArgumentIsProvablyDataPointer, run after every sibling
@@ -1593,6 +1598,8 @@ public:
         // The owning binding's SLOT, so the delete sites can re-ask whether it STILL owns. Rebinding
         // the SOURCE (`c = new T();`) makes this copy the sole owner of what it holds.
         llvm::Value* OwningLocalStorage = nullptr;
+        // True when the owner had already been rebound before this borrow was created.
+        bool OwningLocalBorrowAfterRebind = false;
         llvm::Value* RefCountStorage = nullptr; // lazy i32 alloca at function entry; non-null only when pointer escaped to a field
         std::string CallerName;          // the variable's name at the call site, for move tracking
         // Canonical lock path of the argument spelling ('&o.inner' -> 'o.inner'), empty when the
@@ -6436,7 +6443,8 @@ public:
     bool IsStackValueToCoreUniqueInterface(const NamedVariable& arg, const TypeAndValue& param) const;
     llvm::Value* CreateCoreUniqueFromRawPointerCall(const NamedVariable& arg,
                                                      const TypeAndValue& param);
-    llvm::Value* CreateCoreUniqueRawPointerCall(const NamedVariable& arg, const TypeAndValue& param);
+    llvm::Value* CreateCoreUniqueRawPointerCall(const NamedVariable& arg, const TypeAndValue& param,
+                                                bool calleeIsCxx = false);
 
     // Rebuild only when the source and destination interfaces actually differ (the common
     // same-interface case stays a plain by-value copy, with no if-chain emitted). The ambiguous
@@ -6797,6 +6805,16 @@ public:
      */
     bool IsStringLiteralIntoStructPointer(const TypeAndValue& destTV, llvm::Value* right);
 
+    // Reject an implicit scalar-to-pointer bind while the source's semantic type is still known.
+    bool IsImplicitPrimitiveToPointer(const TypeAndValue& destTV,
+                                      const NamedVariable& sourceNV,
+                                      llvm::Value* value) const;
+    std::string DescribeImplicitPrimitiveToPointer(const TypeAndValue& destTV,
+                                                   const NamedVariable& sourceNV,
+                                                   llvm::Value* value,
+                                                   const std::string& action,
+                                                   const std::string& destination) const;
+
     // One ARM of the string-literal question: 1 = proven string literal, 0 = neutral (a null
     // constant carries no data), -1 = unproven, which alone leaves the whole join unproven.
     int JoinArmStringLiteralKind(const llvm::Value* value, int depth) const;
@@ -6851,7 +6869,7 @@ public:
         const NamedVariable& arg);
 
     void DiagnoseExplicitMoveToBorrowParam(const std::string& functionName,
-        const TypeAndValue& param, const NamedVariable& arg);
+        const TypeAndValue& param, const NamedVariable& arg, bool foreignCxxCallee = false);
 
     /*
      * A `unique T*` / `move T*` PARAMETER states the ownership claim AT the call site, so passing
@@ -6896,7 +6914,8 @@ public:
     // and compile-time moved marking in their existing order.
     void ApplyMoveParamTransfer(const std::string& functionName,
         const std::vector<TypeAndValue>& params, const std::vector<NamedVariable>& args,
-        bool paramsCarryAllocAlign = true, bool calleeIsMethod = false, bool beforeCall = false);
+        bool paramsCarryAllocAlign = true, bool calleeIsMethod = false, bool beforeCall = false,
+        bool calleeIsCxx = false);
 
     // Indirect-call twin: a lambda literal's inferred owning sinks ride the funcptr TYPE
     // (FuncPtrParam::IsOwningSink), so the caller's source must be transferred exactly as a direct
@@ -8781,9 +8800,16 @@ public:
                             bool keepExistingOrigin = false,
                             bool uniqueFieldViaCall = false);
 
+    void RecordAssignOwningLocalBorrow(const std::string& name,
+                                       const std::string& origin,
+                                       llvm::Value* ownerStorage);
+
     void SetPointsToBorrowedByValueParam(const std::string& name, bool value);
     // Record/retire the address-of borrow provenance on a live pointer binding by name.
     void SetPointsToBorrowedAddress(const std::string& name, bool value);
+    // Record/retire provenance that a char pointer or string borrows a current-frame buffer.
+    void SetStackCharBufferBorrow(const std::string& name, bool value,
+                                  const std::string& source, size_t scopeDepth);
 
     /*
      * Drop a borrow that a plain '=' recorded (never a declaration-time one) when a later '='
