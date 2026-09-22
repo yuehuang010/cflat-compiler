@@ -254,12 +254,13 @@ export -f run_cb cb_extra_args load_err_flags check_err_result run_err run_err_w
 export CFLAT LIB LOCALE_DIR RES TIMEOUT RUN_MODE TIMEOUT_SECS HEAVY_TIMEOUT_SECS HEAVY_TESTS
 
 # The JIT path is deliberately opt-in. This list excludes fixtures that require a prebuilt C
-# library or the C-backed HeapAudit oracle; those remain AOT-only by design. test_program is
-# included because it exercises both CFlat and real-C imported program adapters.
+# library or the C-backed HeapAudit oracle; those remain AOT-only by design. The macOS JIT
+# keeps its image mapped until host exit, so test_program is included for its program and
+# real-C imported program adapters.
 RUN_TESTS="test_allocators test_basic test_bitmap test_c test_com test_core test_crt \
   test_cpp_interop test_filesystem test_fpenv test_function_ptr test_generics test_hpc test_hpc_kernels \
   test_import_group test_initializer_list test_interface test_linear_mat test_math test_module \
-  test_move test_operators test_parallel test_process test_program test_random test_regex \
+  test_operators test_parallel test_process test_program test_random test_regex \
   test_socket test_stdio test_stream test_sync test_terminal test_threadpool test_time test_vectorize"
 
 # Build the work list, then fan out across $JOBS workers via xargs -P.
@@ -420,6 +421,35 @@ elif ! grep -Fq ".static.node.own_origin" "$tooling_ll" \
   write_result "$tooling_name" "FAIL: static-local origin or debug metadata is missing" "$tooling_t0"
 else
   write_result "$tooling_name" "PASS" "$tooling_t0"
+fi
+fi
+
+# Darwin debug-info tooling: -g must leave source lines reachable through either a dSYM
+# or the retained object when dsymutil is unavailable.
+if [ "$RUN_MODE" -eq 0 ] && [ "$(uname -s)" = "Darwin" ] \
+    && command -v dwarfdump >/dev/null 2>&1; then
+dsym_name="macos_g_dsym"
+dsym_log="$RES/$dsym_name.log"
+dsym_bin="$RES/$dsym_name.bin"
+dsym_debug="$RES/$dsym_name.debug"
+dsym_t0=$(now_ms)
+if ! $TIMEOUT "$CFLAT" "$SRC/test_function_ptr.cb" -i "$LIB" -g \
+    --locale-dir "$LOCALE_DIR" -o "$dsym_bin" >"$dsym_log" 2>&1; then
+  write_result "$dsym_name" "FAIL compile" "$dsym_t0"
+else
+  dsym_artifact=""
+  if [ -d "$dsym_bin.dSYM" ]; then
+    dsym_artifact="$dsym_bin.dSYM"
+  elif [ -f "$dsym_bin.o" ]; then
+    dsym_artifact="$dsym_bin.o"
+  fi
+  if [ -z "$dsym_artifact" ] \
+      || ! dwarfdump --debug-line "$dsym_artifact" >"$dsym_debug" 2>&1 \
+      || ! grep -Fq "test_function_ptr.cb" "$dsym_debug"; then
+    write_result "$dsym_name" "FAIL: source lines are not reachable" "$dsym_t0"
+  else
+    write_result "$dsym_name" "PASS" "$dsym_t0"
+  fi
 fi
 fi
 

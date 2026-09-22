@@ -5467,6 +5467,9 @@ private:
     // Bundled Mach-O linker (deployed next to cflat by the build), else PATH.
     // "" if absent, in which case the link falls back to the host clang driver.
     std::string FindBundledLd64Lld() const;
+    // Find dsymutil in the pinned LLVM install, then PATH. "" if absent.
+    std::string FindDsymutil() const;
+    bool EmitMacDebugInfo(const std::string& exePath) const;
 #endif
 
     // GCC-style C compiler driver for the ELF (non-Windows) target. Prefers clang to

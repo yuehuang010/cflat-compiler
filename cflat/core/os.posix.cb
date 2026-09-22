@@ -552,6 +552,17 @@ namespace os.posix
     extern win_int waitpid(i32 pid, i32* status, i32 options);
     extern win_int kill(i32 pid, i32 sig);
     extern void    _exit(i32 code);
+    if const (__MACOS__) {
+        // Opaque on Darwin; posix_spawn avoids executing JIT code in a post-fork child.
+        extern win_int posix_spawnp(i32* pid, const char* file, void** actions, void** attr,
+                                    const char** argv, const char** envp);
+        extern win_int posix_spawn_file_actions_init(void** actions);
+        extern win_int posix_spawn_file_actions_adddup2(void** actions, i32 from, i32 to);
+        extern win_int posix_spawn_file_actions_addclose(void** actions, i32 fd);
+        extern win_int posix_spawn_file_actions_destroy(void** actions);
+        // A null envp gives the child an EMPTY environment; execvp inherits, so pass this.
+        extern void** _NSGetEnviron();   // really char***; the type model caps at 2 levels
+    }
     int WNOHANG = 1;
     int SIGKILL = 9;
     int SIGPIPE = 13;

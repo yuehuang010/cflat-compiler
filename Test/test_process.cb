@@ -152,6 +152,29 @@ extern int main(int argc, char** argv)
     }
     printf("PASS: test5 (bonded callback, len=%d)\n", response5.length());
 
+    // Test: the child inherits the parent's environment (a null envp to posix_spawnp
+    // hands the child an EMPTY one; execvp always inherited).
+    if const (!__WINDOWS__) {
+        list<string>* ae = new list<string>;
+        string sea = shellFlag();
+        string seb = "test -n \"$HOME\" && echo env-ok";
+        ae->add(sea);
+        ae->add(seb);
+        process pe;
+        pe.exe = shellExe();
+        pe.captureStdout = true;
+        pe.run(ae);
+        pe.WaitForExit();
+        delete ae;
+        string capEnv = pe.stdoutText;
+        if (pe.exitCode != 0 || !capEnv.startsWith("env-ok"))
+        {
+            printf("FAIL: child environment not inherited (exitCode=%d)\n", pe.exitCode);
+            return 1;
+        }
+        printf("PASS: child inherits environment\n");
+    }
+
     printf("All process tests passed.\n");
     return 0;
 }

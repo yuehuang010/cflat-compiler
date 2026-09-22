@@ -321,9 +321,9 @@ class process : IProcess {
                 _stdin_read = nullptr;
             }
         } else {
-            // POSIX: pipe() + fork() + execvp(). Child wires its stdout/stderr (and
-            // optionally stdin) to the pipe ends, then execs; the parent keeps the
-            // opposite ends and reaps the pid in WaitForExit.
+            // POSIX: pipe() + spawn/exec. Darwin uses posix_spawnp because a post-fork
+            // child cannot safely continue through JIT code before exec; other POSIX
+            // hosts retain the fork/exec path. The parent keeps the opposite pipe ends.
             i32[2] outPipe = default;
             os.posix.pipe(&outPipe[0]);
             i32[2] inPipe = default;
@@ -345,10 +345,38 @@ class process : IProcess {
             // signal) if the child closes its stdin before consuming all input.
             os.posix.ignore_sigpipe();
 
-            i32 pid = os.posix.fork();
+            i32 pid = -1;
+            if const (__MACOS__) {
+                void* actions = nullptr;
+                bool actionsOk = os.posix.posix_spawn_file_actions_init(&actions) == 0;
+                if (actionsOk) actionsOk = os.posix.posix_spawn_file_actions_adddup2(&actions, outPipe[1], 1) == 0;
+                if (actionsOk) actionsOk = os.posix.posix_spawn_file_actions_adddup2(&actions, outPipe[1], 2) == 0;
+                if (actionsOk) actionsOk = os.posix.posix_spawn_file_actions_addclose(&actions, outPipe[0]) == 0;
+                if (actionsOk) actionsOk = os.posix.posix_spawn_file_actions_addclose(&actions, outPipe[1]) == 0;
+                if (_want_stdin && actionsOk) actionsOk = os.posix.posix_spawn_file_actions_adddup2(&actions, inPipe[0], 0) == 0;
+                if (_want_stdin && actionsOk) actionsOk = os.posix.posix_spawn_file_actions_addclose(&actions, inPipe[0]) == 0;
+                if (_want_stdin && actionsOk) actionsOk = os.posix.posix_spawn_file_actions_addclose(&actions, inPipe[1]) == 0;
+                void** envSlot = os.posix._NSGetEnviron();
+                if (actionsOk) actionsOk = os.posix.posix_spawnp(&pid, argv[0], &actions, nullptr, argv, (const char**)*envSlot) == 0;
+                if (actions != nullptr) os.posix.posix_spawn_file_actions_destroy(&actions);
+                if (!actionsOk) pid = -1;
+            } else {
+                pid = os.posix.fork();
+                if (pid == 0) {
+                    // Child: redirect std handles, close all pipe fds, then exec.
+                    os.posix.dup2(outPipe[1], 1);
+                    os.posix.dup2(outPipe[1], 2);
+                    if (_want_stdin) os.posix.dup2(inPipe[0], 0);
+                    os.posix.close(outPipe[0]);
+                    os.posix.close(outPipe[1]);
+                    if (_want_stdin) { os.posix.close(inPipe[0]); os.posix.close(inPipe[1]); }
+                    os.posix.execvp(argv[0], argv);
+                    os.posix._exit(127);   // exec failed
+                }
+            }
             if (pid < 0) {
-                // fork failed: close both pipe ends, free the argv copies, and leave
-                // the process unstarted so no wait path reaps an unrelated child.
+                // Spawn failed: close both pipe ends, free argv, and leave the process
+                // unstarted so no wait path reaps an unrelated child.
                 int fi = 0;
                 while (fi <= argc) { free((void*)argv[fi]); fi++; }
                 free((void*)argv);
@@ -358,21 +386,8 @@ class process : IProcess {
                 exitCode = -1;
                 return;
             }
-            if (pid == 0) {
-                // Child: redirect std handles to the pipe ends, close all pipe fds,
-                // then exec. Only async-signal-safe calls between fork and exec.
-                os.posix.dup2(outPipe[1], 1);
-                os.posix.dup2(outPipe[1], 2);
-                if (_want_stdin) os.posix.dup2(inPipe[0], 0);
-                os.posix.close(outPipe[0]);
-                os.posix.close(outPipe[1]);
-                if (_want_stdin) { os.posix.close(inPipe[0]); os.posix.close(inPipe[1]); }
-                os.posix.execvp(argv[0], argv);
-                os.posix._exit(127);   // exec failed
-            }
 
-            // Parent: free the argv copies (the child has its own via fork), keep
-            // the reading/writing ends, close the child-side ends.
+            // Parent: free argv, keep the reading/writing ends, close child-side ends.
             int fi = 0;
             while (fi <= argc) { free((void*)argv[fi]); fi++; }
             free((void*)argv);

@@ -620,6 +620,69 @@ std::string LLVMBackend::FindBundledLd64Lld() const
         if (auto p = llvm::sys::findProgramByName("ld64.lld")) return *p;
         return "";
     }
+
+std::string LLVMBackend::FindDsymutil() const
+{
+        std::vector<std::filesystem::path> installs;
+        for (const char* homeVar : { "HOME", "USERPROFILE" })
+        {
+            const char* home = std::getenv(homeVar);
+            if (!home || !*home) continue;
+            std::filesystem::path deps = std::filesystem::path(home) / ".cflat-compiler-deps";
+            std::error_code ec;
+            for (const auto& entry : std::filesystem::directory_iterator(deps, ec))
+            {
+                if (!entry.is_directory(ec)) continue;
+                const std::string name = entry.path().filename().string();
+                if (name.rfind("llvm-", 0) == 0) installs.push_back(entry.path());
+            }
+            if (!installs.empty()) break;
+        }
+        // Prefer the release install when both release and assertion-enabled trees exist.
+        std::sort(installs.begin(), installs.end(), [](const auto& a, const auto& b) {
+            const bool aAssert = a.filename().string().find("-assert") != std::string::npos;
+            const bool bAssert = b.filename().string().find("-assert") != std::string::npos;
+            if (aAssert != bAssert) return !aAssert;
+            return a.string() > b.string();
+        });
+        for (const auto& install : installs)
+        {
+            for (const char* name : { "dsymutil", "llvm-dsymutil" })
+            {
+                const auto candidate = install / "bin" / name;
+                if (llvm::sys::fs::exists(candidate.string())) return candidate.string();
+            }
+        }
+        if (auto p = llvm::sys::findProgramByName("dsymutil")) return *p;
+        if (auto p = llvm::sys::findProgramByName("llvm-dsymutil")) return *p;
+        return "";
+    }
+
+bool LLVMBackend::EmitMacDebugInfo(const std::string& exePath) const
+{
+        const std::string dsymutil = FindDsymutil();
+        if (dsymutil.empty())
+        {
+            if (verbose)
+                std::cout << "[verbose] dsymutil not found; keeping debug object files\n";
+            return false;
+        }
+
+        const std::string dsymPath = exePath + ".dSYM";
+        std::vector<std::string> argStrs = { dsymutil, exePath, "-o", dsymPath };
+        std::vector<llvm::StringRef> args;
+        for (auto& arg : argStrs) args.push_back(arg);
+        std::string dsymErr;
+        int rc = llvm::sys::ExecuteAndWait(dsymutil, args, std::nullopt, {}, 0, 0, &dsymErr);
+        if (rc != 0 || !llvm::sys::fs::exists(dsymPath))
+        {
+            if (verbose)
+                std::cout << std::format("[verbose] dsymutil failed; keeping debug object files{}{}\n",
+                    dsymErr.empty() ? "" : ": ", dsymErr);
+            return false;
+        }
+        return true;
+    }
 #endif
 
 std::string LLVMBackend::FindCDriver() const

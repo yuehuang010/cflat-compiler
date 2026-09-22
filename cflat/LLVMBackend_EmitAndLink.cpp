@@ -3242,12 +3242,18 @@ bool LLVMBackend::EmitExecutableMachO(const std::string& exePath, bool debugInfo
                                          stubRoot.empty() ? "" : ", SDK-free", exePath);
                 std::string linkErr;
                 int rc = llvm::sys::ExecuteAndWait(ld64, args, std::nullopt, {}, 0, 0, &linkErr);
-                llvm::sys::fs::remove(objPath);
-                for (auto& cObj : cObjectFiles_) llvm::sys::fs::remove(cObj);
                 if (rc != 0)
                 {
+                    llvm::sys::fs::remove(objPath);
+                    for (auto& cObj : cObjectFiles_) llvm::sys::fs::remove(cObj);
                     std::cout << std::format("Error: linking failed (exit {}): {}\n", rc, linkErr);
                     return false;
+                }
+                const bool keepObjects = debugInfo && !EmitMacDebugInfo(exePath);
+                if (!keepObjects)
+                {
+                    llvm::sys::fs::remove(objPath);
+                    for (auto& cObj : cObjectFiles_) llvm::sys::fs::remove(cObj);
                 }
                 return true;
             }
@@ -3294,12 +3300,21 @@ bool LLVMBackend::EmitExecutableMachO(const std::string& exePath, bool debugInfo
         std::cout << std::format("Linking (mach-o): {}\n", exePath);
         std::string linkErr;
         int rc = llvm::sys::ExecuteAndWait(cc, args, std::nullopt, {}, 0, 0, &linkErr);
-        llvm::sys::fs::remove(objPath);
-        for (auto& cObj : cObjectFiles_) llvm::sys::fs::remove(cObj);
         if (rc != 0)
         {
+            llvm::sys::fs::remove(objPath);
+            for (auto& cObj : cObjectFiles_) llvm::sys::fs::remove(cObj);
             std::cout << std::format("Error: linking failed (exit {}): {}\n", rc, linkErr);
             return false;
+        }
+        bool keepObjects = false;
+#if defined(__APPLE__)
+        keepObjects = debugInfo && !EmitMacDebugInfo(exePath);
+#endif
+        if (!keepObjects)
+        {
+            llvm::sys::fs::remove(objPath);
+            for (auto& cObj : cObjectFiles_) llvm::sys::fs::remove(cObj);
         }
     return true;
     }
@@ -4210,6 +4225,11 @@ bool LLVMBackend::JitRun(int& runExitCode)
         if (auto err = jit->deinitialize(jit->getMainJITDylib()))
             llvm::consumeError(std::move(err)); // best-effort; program already ran
         cxxRuntimeOverrides.runDestructors();
+
+        // --run is process-lifetime execution. A POSIX thread cancelled at an unsafe point can
+        // still be executing JIT code after main returns, so keep the JIT image mapped until the
+        // host exits instead of unmapping it while that thread is still alive.
+        (void)jit.release();
 
         return true;
     }
