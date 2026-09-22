@@ -468,6 +468,12 @@ int switchHexI32(int x)
 // Enum members are compile-time constants, so they are legal case labels.
 enum SwitchDir : int { Back = -1, None = 0, Fwd = 1 };
 enum SwitchSmall : u8 { Lo = 1, Mid = 200, Hi = 255 };
+// Pre-fix these file-scope enum initializers were rejected as non-constant; keep both the
+// enum-typed value and its explicit cast covered by value-asserting legs.
+const SwitchDir globalConstSwitchDir = SwitchDir.Fwd;
+const int globalConstSwitchValue = (int)SwitchDir.Back;
+
+int readGlobalConstSwitchDir(SwitchDir value) { return (int)value; }
 
 int switchEnumInt(int x)
 {
@@ -926,6 +932,9 @@ extern int main(int argc, char** argv)
     result &= Test("switch_enum_param",   switchEnumParam(SwitchDir.Back), 10);
     result &= Test("switch_enum_param_fwd", switchEnumParam(SwitchDir.Fwd), 30);
     result &= Test("switch_enum_return",  (int)switchEnumMake(), 1);
+    result &= Test("global_const_enum", (int)globalConstSwitchDir, 1);
+    result &= Test("global_const_enum_arg", readGlobalConstSwitchDir(globalConstSwitchDir), 1);
+    result &= Test("global_const_enum_cast", globalConstSwitchValue, -1);
     result &= Test("switch_enum_ns_label_neg", switchEnumQualifiedLabel(-1), 11);
     result &= Test("switch_enum_ns_label_pos", switchEnumQualifiedLabel(1), 31);
     result &= Test("switch_fall1",     switchFallthrough(1), 12);

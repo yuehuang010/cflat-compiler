@@ -1810,6 +1810,18 @@ struct P2TernaryOwn
         if (s._ptr != nullptr) g_p2_ternary_buffer_dtor++;
     }
 };
+int g_p2_ternary_native_dtor = 0;
+int g_p2_ternary_native_buffer_dtor = 0;
+struct P2TernaryNative
+{
+    int tag = 0;
+    int* p = new int[1];
+    ~P2TernaryNative()
+    {
+        g_p2_ternary_native_dtor++;
+        if (p != nullptr) { delete[] p; g_p2_ternary_native_buffer_dtor++; }
+    }
+};
 int g_p2_ternary_eager = true ? default : 4;
 // Both arms 'default' is pointless but logically correct: the destination type is known, so the
 // join takes its type from there rather than reporting an untyped 'default'.
@@ -1991,8 +2003,7 @@ int testDefaultAsExpression()
     g_p2_ternary_dtor = 0;
     g_p2_ternary_buffer_dtor = 0;
     {
-        // Arms must AGREE on ownership - an owning 'default' paired with a borrowed local is
-        // rejected at the join - so both arms here are borrows of live owners.
+        // The selected lvalue follows the ordinary declaration-from-lvalue path.
         P2TernaryOwn owningOther = default;
         owningOther.s = "owned".copy();
         P2TernaryOwn owningEmpty = default;
@@ -2003,10 +2014,38 @@ int testDefaultAsExpression()
         passed += Test("default_ternary_owning_string_value", owningResult.s.length(), 0);
         passed += Test("default_ternary_owning_struct_value", owningResult.n, 3);
     }
-    // Two owners now (both '?:' arms are borrows of live locals); the borrow join itself adds
-    // no destructor, and only the one owner holding a heap string frees a buffer.
-    passed += Test("default_ternary_owning_destructors", g_p2_ternary_dtor, 2);
-    passed += Test("default_ternary_owning_buffers", g_p2_ternary_buffer_dtor, 1);
+    // The selected empty arm is copied, so the destination adds one destructor.
+    passed += Test("default_ternary_owning_destructors", g_p2_ternary_dtor, 3);
+    passed += Test("default_ternary_owning_buffers", g_p2_ternary_buffer_dtor, 2);
+
+    g_p2_ternary_native_dtor = 0;
+    g_p2_ternary_native_buffer_dtor = 0;
+    {
+        P2TernaryNative nativeLeft = default;
+        P2TernaryNative nativeRight = default;
+        nativeLeft.tag = 11;
+        nativeRight.tag = 22;
+        P2TernaryNative nativePicked = p2TernaryPick(1) ? nativeLeft : nativeRight;
+        nativePicked.tag = 99;
+        passed += Test("ternary native owning selected value", nativePicked.tag, 99);
+    }
+    passed += Test("ternary native owning destructors", g_p2_ternary_native_dtor, 3);
+    passed += Test("ternary native owning buffers", g_p2_ternary_native_buffer_dtor, 2);
+
+    g_p2_ternary_native_dtor = 0;
+    g_p2_ternary_native_buffer_dtor = 0;
+    {
+        P2TernaryNative nativeLeft = default;
+        P2TernaryNative nativeRight = default;
+        nativeLeft.tag = 11;
+        nativeRight.tag = 22;
+        alias P2TernaryNative nativeAlias = p2TernaryPick(1) ? nativeLeft : nativeRight;
+        nativeAlias.tag = 99;
+        passed += Test("ternary native alias writes selected arm", nativeLeft.tag, 99);
+        passed += Test("ternary native alias leaves other arm", nativeRight.tag, 22);
+    }
+    passed += Test("ternary native alias destructors", g_p2_ternary_native_dtor, 2);
+    passed += Test("ternary native alias buffers", g_p2_ternary_native_buffer_dtor, 2);
 
     // Both arms own, so the joined value is owned: exactly one destructor and exactly one heap
     // buffer freed on the call arm, one destructor and no buffer on the 'default' arm.
@@ -4739,7 +4778,7 @@ extern int main()
     r = testRawArrayRuntimeCount(); passed += r; total += 100;
     r = testDictEnumeration();  passed += r; total += 12;
     r = testLiteralReceiverAndNullChain(); passed += r; total += 9;
-    r = testDefaultAsExpression(); passed += r; total += 82;
+    r = testDefaultAsExpression(); passed += r; total += 89;
     r = testEmbed();            passed += r; total += 9;
     r = testApplication();      passed += r; total += 6;
 

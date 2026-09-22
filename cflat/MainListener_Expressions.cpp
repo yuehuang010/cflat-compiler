@@ -5937,7 +5937,7 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
         CFlatParser::ExpressionContext* expressionTrueCtx,
         CFlatParser::ConditionalExpressionContext* expressionFalseCtx, ResultUse use,
         const LLVMBackend::TypeAndValue& outerExpected, llvm::Value* cxxTernaryDeclDest,
-        const std::string& cxxTernaryDeclType) {
+        const std::string& cxxTernaryDeclType, bool collapseLvalueArms) {
         auto* compiler = Compiler(ctx);
         const bool moveInterfaceReturn = compiler->currentFunctionReturnsOwned
             && compiler->currentFunctionReturnTV.IsInterface;
@@ -6046,6 +6046,9 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
         bool falseUnsigned = false;
         LLVMBackend::OwnedTempMark trueMark  = compiler->MarkOwnedTemps();
         LLVMBackend::OwnedTempMark falseMark = trueMark;
+        const auto ternaryPreMovedState = compiler->SaveMovedState();
+        auto trueTernaryMovedState = ternaryPreMovedState;
+        auto falseTernaryMovedState = ternaryPreMovedState;
         // Give each arm its OWN cast occurrence: both arms share the enclosing argument slot, so
         // without this a cast on one arm launders a bare sibling naming the same constant.
         size_t trueOcc  = compiler->CurrentCastOccurrence();
@@ -6056,6 +6059,24 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
             auto expected = otherIsDefault ? LLVMBackend::TypeAndValue{} : InferTernaryArmType(otherValue);
             if (expected.TypeName.empty()) expected = outerExpected;
             return expected;
+        };
+        auto isBorrowedTernaryArm = [&](llvm::Value* storage) {
+            const auto* source = storage != nullptr ? compiler->FindVariableByStorage(storage) : nullptr;
+            return source != nullptr && (source->IsAliasBorrow || source->IsBorrowedOwningValue
+                || source->RootIsBorrowedByValueParam || source->TypeAndValue.IsAlias);
+        };
+        auto markImplicitTernaryMove = [&](llvm::Value* storage, llvm::Value* value) {
+            if (!collapseLvalueArms || storage == nullptr || value == nullptr
+                || outerExpected.IsAlias || outerExpected.IsMove
+                || outerExpected.Pointer || outerExpected.TypeName.empty()
+                || !compiler->IsOwningValueType(outerExpected.TypeName)
+                || compiler->IsCopyableType(outerExpected.TypeName))
+                return;
+            const auto* source = compiler->FindVariableByStorage(storage);
+            if (source != nullptr && isBorrowedTernaryArm(storage))
+                return;
+            const std::string sourceName = compiler->FindVariableNameByStorage(storage);
+            if (!sourceName.empty()) compiler->MarkVariableMoved(sourceName);
         };
         auto parseTrueArm = [&]() {
             compiler->SwitchToBlock(trueBlock);
@@ -6179,8 +6200,37 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
         };
         try
         {
-            if (trueDefault) { parseFalseArm(); parseTrueArm(); }
-            else { parseTrueArm(); parseFalseArm(); }
+            if (trueDefault)
+            {
+                parseFalseArm();
+                falseTernaryMovedState = compiler->SaveMovedState();
+                compiler->RestoreMovedState(ternaryPreMovedState);
+                parseTrueArm();
+                trueTernaryMovedState = compiler->SaveMovedState();
+            }
+            else
+            {
+                parseTrueArm();
+                trueTernaryMovedState = compiler->SaveMovedState();
+                compiler->RestoreMovedState(ternaryPreMovedState);
+                parseFalseArm();
+                falseTernaryMovedState = compiler->SaveMovedState();
+            }
+            const bool lvalueArmCandidate = collapseLvalueArms && trueValue != nullptr
+                && falseValue != nullptr && trueValue->getType() == falseValue->getType()
+                && !trueValue->getType()->isPointerTy()
+                && trueStorage != nullptr && falseStorage != nullptr
+                && !isBorrowedTernaryArm(trueStorage) && !isBorrowedTernaryArm(falseStorage);
+            if (lvalueArmCandidate)
+            {
+                compiler->RestoreMovedState(trueTernaryMovedState);
+                markImplicitTernaryMove(trueStorage, trueValue);
+                trueTernaryMovedState = compiler->SaveMovedState();
+                compiler->RestoreMovedState(falseTernaryMovedState);
+                markImplicitTernaryMove(falseStorage, falseValue);
+                falseTernaryMovedState = compiler->SaveMovedState();
+            }
+            compiler->MergeMovedStates(trueTernaryMovedState, falseTernaryMovedState);
             if (use == ResultUse::Discard)
             {
                 LLVMBackend::NamedVariable arm;
@@ -6552,8 +6602,8 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
         compiler->PropagateProducedTempValue(falseValue, phi);
 
         llvm::Value* storageJoin = nullptr;
-        // Both arms are addressable C++ objects: join their STORAGE as well, so an operator
-        // taking `T&` mutates the SELECTED object instead of a copy of the joined value.
+        // Both arms are addressable values: join their STORAGE as well, so the result names the
+        // SELECTED object instead of becoming a detached copy of the joined value.
         llvm::Value* cxxLvalueStorageJoin = nullptr;
         bool cxxRecordJoin = false;
         if (trueValue != nullptr && trueValue->getType()->isStructTy())
@@ -6566,7 +6616,12 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
         // joins are excluded - their ownership analysis reads the value, not a joined slot.
         const bool scalarLvalueJoin = !cxxRecordJoin && trueValue != nullptr
             && (trueValue->getType()->isIntegerTy() || trueValue->getType()->isFloatingPointTy());
-        if ((cxxRecordJoin || scalarLvalueJoin)
+        const bool valueLvalueJoin = collapseLvalueArms && trueValue != nullptr && falseValue != nullptr
+            && trueValue->getType() == falseValue->getType()
+            && !trueValue->getType()->isPointerTy()
+            && trueStorage != nullptr && falseStorage != nullptr
+            && !isBorrowedTernaryArm(trueStorage) && !isBorrowedTernaryArm(falseStorage);
+        if ((cxxRecordJoin || scalarLvalueJoin || valueLvalueJoin)
             && trueStorage != nullptr && falseStorage != nullptr)
         {
             auto* cxxStoragePhi = compiler->builder->CreatePHI(
@@ -6575,6 +6630,7 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
             cxxStoragePhi->addIncoming(falseStorage, falseEnd);
             cxxLvalueStorageJoin = cxxStoragePhi;
         }
+        const bool collapsedLvalueJoin = collapseLvalueArms && cxxLvalueStorageJoin != nullptr;
         if (compiler->currentFunctionReturnTV.IsAlias || trueAlias || falseAlias)
         {
             auto* storagePhi = compiler->builder->CreatePHI(
@@ -6619,7 +6675,7 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
             compiler->lastCallReturnsOwned = true;
             LLVMBackend::TypedValue result{ phi, true };
             result.isAlias = trueAlias || falseAlias;
-            result.storage = storageJoin;
+            result.storage = storageJoin != nullptr ? storageJoin : cxxLvalueStorageJoin;
             result.receiverStorage = cxxLvalueStorageJoin;
             // No storage join means at least one arm was a temporary, so the join is one too:
             // say so, or a `T&` parameter would silently bind a copy.
@@ -6632,7 +6688,7 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
         // A mixed join owns NOTHING the receiver may free, so the sticky per-expression ownership
         // side-channels must be cleared too: they carry no value identity, so a declaration would
         // otherwise adopt the phi whichever arm ran and double-free the borrow arm's live pointee.
-        if (compiler->PropagateTernaryOwnership(trueValue, falseValue, phi))
+        if (!collapsedLvalueJoin && compiler->PropagateTernaryOwnership(trueValue, falseValue, phi))
         {
             compiler->ClearOwnedResultChannels();
             RejectMixedOwnershipTernaryJoin(trueValue, falseValue, phi,
@@ -6650,7 +6706,7 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
         llvm::Value* resultValue = CloneTernaryClosureValue(phi, ctx);
         LLVMBackend::TypedValue result{ resultValue, joinUnsigned };
         result.isAlias = trueAlias || falseAlias;
-        result.storage = storageJoin;
+        result.storage = storageJoin != nullptr ? storageJoin : cxxLvalueStorageJoin;
         result.receiverStorage = cxxLvalueStorageJoin;
         result.isRvalue = cxxRecordJoin && cxxLvalueStorageJoin == nullptr;
         return result;
@@ -6661,6 +6717,22 @@ LLVMBackend::TypedValue MainListener::ParseConditionalExpression(
         LLVMBackend::TypeAndValue outerExpected = declExpectedType;
         DeclExpectedTypeGate declExpectedGate(&declExpectedType, ctx->children.size() == 1);
         auto* compiler = Compiler(ctx);
+        bool collapseLvalueArms = false;
+        bool crossedCallArgument = false;
+        for (auto* parent = ctx->parent; parent != nullptr; parent = parent->parent)
+        {
+            if (dynamic_cast<CFlatParser::ArgumentNamedExpressionContext*>(parent) != nullptr
+                || dynamic_cast<CFlatParser::ArgumentExpressionListContext*>(parent) != nullptr)
+            {
+                crossedCallArgument = true;
+                break;
+            }
+            if (dynamic_cast<CFlatParser::InitializerContext*>(parent) != nullptr)
+            {
+                collapseLvalueArms = !crossedCallArgument;
+                break;
+            }
+        }
         auto logicCtx = ctx->logicalOrExpression();
 
         if (ctx->QuestionQuestion())
@@ -6972,7 +7044,8 @@ LLVMBackend::TypedValue MainListener::ParseConditionalExpression(
                     && insertBB->getParent() == compiler->currentFunction)
                 {
                     return ParseTernaryBranches(ctx, condTv, expressionTrueCtx, expressionFalseCtx,
-                        use, outerExpected, cxxTernaryDeclDest, cxxTernaryDeclType);
+                        use, outerExpected, cxxTernaryDeclDest, cxxTernaryDeclType,
+                        collapseLvalueArms);
                 }
 
                 // Eager fallback: BOTH arms execute unconditionally, so a deref only sound under
@@ -14503,6 +14576,8 @@ LLVMBackend::NamedVariable MainListener::ParseNewExpression(CFlatParser::NewExpr
                     if (compiler->IsCoreUniqueType(argNV.TypeAndValue.TypeName)
                         && !argNV.TypeAndValue.Pointer)
                         argVar = argNV;
+                    else
+                        argVar.TypeAndValue = argNV.TypeAndValue;
                     argVar.BaseType = argVal->getType();
                     argVar.Primary = argVal;
                     argVar.TypeAndValue.VariableName.clear();
@@ -14522,6 +14597,39 @@ LLVMBackend::NamedVariable MainListener::ParseNewExpression(CFlatParser::NewExpr
             }
             if (structVal)
                 compiler->builder->CreateStore(structVal, typedPtr);
+        }
+
+        // A non-class `new T(value)` has no constructor function to consume the argument. Keep
+        // the C++ value-initialization meaning and use the ordinary assignment store conversion.
+        if (!isArray && compiler->GetFunction(typeName) == nullptr
+            && (typeIsPtr || !compiler->IsCxxRecord(typeName)))
+        {
+            auto* argList = ctx->argumentExpressionList();
+            if (argList != nullptr && !argList->argumentNamedExpression().empty())
+            {
+                auto args = argList->argumentNamedExpression();
+                if (args.size() != 1)
+                {
+                    LogErrorContext(ctx, std::format(
+                        "'new {}' with a non-class type requires exactly one argument",
+                        spellNewType()));
+                    return {};
+                }
+                auto* namedArg = args.front();
+                if (namedArg->assignmentExpression() == nullptr || namedArg->Identifier() != nullptr)
+                {
+                    LogErrorContext(namedArg, std::format(
+                        "the initializer for 'new {}' must be a plain expression",
+                        spellNewType()));
+                    return {};
+                }
+                auto argNV = ParseAssignmentExpressionNamed(namedArg->assignmentExpression());
+                llvm::Value* argVal = argNV.Primary != nullptr
+                    ? argNV.Primary : LoadNamedVariable(argNV);
+                if (argVal != nullptr)
+                    compiler->CreateAssignment(
+                        argVal, typedPtr, argNV.TypeAndValue.IsUnsignedInteger() != -1, elemType);
+            }
         }
 
         // Apply field initializer: new Type { field=val, ... }

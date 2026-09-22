@@ -6527,6 +6527,16 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                 if (globalInitTempFn != nullptr)
                 {
                     // Check that the initializer reduced to a compile-time constant.
+                    if (right != nullptr && llvm::dyn_cast_or_null<llvm::Constant>(right) == nullptr
+                        && initializer != nullptr && initializer->assignmentExpression() != nullptr)
+                    {
+                        auto folded = FoldCompileTimeInt(compiler, initializer->assignmentExpression());
+                        auto* initType = compiler->GetType(typeAndValue);
+                        if (folded && initType != nullptr && initType->isIntegerTy())
+                            right = llvm::ConstantInt::get(initType,
+                                llvm::APInt(initType->getIntegerBitWidth(), static_cast<uint64_t>(*folded),
+                                            false, true));
+                    }
                     if (right != nullptr && llvm::dyn_cast_or_null<llvm::Constant>(right) == nullptr)
                     {
                         LogErrorContext(initializer->assignmentExpression(),

@@ -1,0 +1,13 @@
+expect_error("requires exactly one argument") {
+    int npTooManyArgs() { int* p = new int(1, 2); return *p; }
+}
+
+expect_error("cannot cast an aggregate value") {
+    struct NpBadNewValue { int value; };
+    int npBadNewConversion()
+    {
+        NpBadNewValue value = default;
+        int* p = new int(value);
+        return *p;
+    }
+}

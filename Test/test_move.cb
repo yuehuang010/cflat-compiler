@@ -4075,7 +4075,8 @@ int testOwningStructTernaryJoin()
     }
     passed += Test("struct_ternary_move_fix_true_total", dtorCount, 2);
 
-    // ALL-BORROW join: neither arm owns, so the receiver borrows and the owner frees exactly once.
+    // An owning declaration from lvalue arms moves the selected source. Both arms are therefore
+    // conditionally moved, even though this spelling names the same owner on each arm.
     dtorCount = 0;
     {
         UniqueBox owner = makeUniqueBox(9);
@@ -4083,9 +4084,9 @@ int testOwningStructTernaryJoin()
             UniqueBox k = identityBool(false) ? owner : owner;
             passed += Test("struct_ternary_all_borrow_value", k.item->id, 9);
         }
-        passed += Test("struct_ternary_all_borrow_no_adoption", dtorCount, 0);
-        passed += Test("struct_ternary_all_borrow_owner_alive", owner.item->id, 9);
+        passed += Test("struct_ternary_all_borrow_no_early_free", dtorCount, 1);
     }
+    passed += Test("struct_ternary_all_borrow_selected_freed", dtorCount, 1);
     passed += Test("struct_ternary_all_borrow_owner_freed_once", dtorCount, 1);
 
     // ALL-OWNING join, false arm: adopted, and freed exactly once at scope exit.
@@ -4231,7 +4232,7 @@ int testOwningStructTernaryJoin()
     {
         UniqueBox owner = makeUniqueBox(6);
         {
-            UniqueBox k = identityBool(false) ? owner : owner;
+            alias UniqueBox k = identityBool(false) ? owner : owner;
             UniqueBox k2 = k;
             passed += Test("alias_borrow_join_chain_value", k2.item->id, 6);
             passed += Test("alias_borrow_join_chain_no_free", dtorCount, 0);

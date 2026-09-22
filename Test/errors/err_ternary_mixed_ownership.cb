@@ -67,8 +67,9 @@ extern int main(int argc, char** argv)
     MixOwn e = h ? MixMake() : MixMake();
     printf("e %d\n", e.n->v);
 
-    // ACCEPT: both arms borrows, read only.
-    MixOwn f = h ? other : other2;
+    // ACCEPT: an alias keeps both borrowed arms live; an owning declaration would conditionally
+    // move the selected arm under the ternary-lvalue ruling.
+    alias MixOwn f = h ? other : other2;
     printf("f %d\n", f.n->v);
 
     // ACCEPT: 'move' makes the borrowed side owning, so both arms own.

@@ -184,6 +184,11 @@ import cpp "library/cpp_interop_strop.h" cache;
 import cpp "library/cpp_interop_nest.h" cache;
 import cpp "library/cpp_interop_nest2.h" cache;
 
+// Pre-fix this unscoped C++ enum initializer was rejected as non-constant at file scope. The
+// value leg below also proves the folded global retains its enum type at an enum-typed call.
+const cppi_scope.PlainN globalConstCppUnscoped = cppi_scope.PN_TWO;
+int readGlobalConstCppUnscoped(cppi_scope.PlainN value) { return (int)value; }
+
 extern int strcmp(const char* a, const char* b);
 // Class-template helper: the SAME specialization `cppt.Box<int>` a second function also declares. One
 // registration and one emitted symbol have to serve both, or the link fails on a duplicate.
@@ -2183,6 +2188,8 @@ extern int main()
             // four compiled and ran identically before this change.
             cppi_scope.PlainBox<cppi_scope.PN_TWO> entPlain = default;
             if (entPlain.get() != 2)                                         return 2332;
+            if ((int)globalConstCppUnscoped != 2)                             return 2337;
+            if (readGlobalConstCppUnscoped(globalConstCppUnscoped) != 2)      return 2338;
             cppi_scope.IntBox<3> entInt = default;
             if (entInt.get() != 3)                                           return 2333;
             cppi_scope.BoolBox<true> entBool = default;

@@ -1476,6 +1476,54 @@ struct PointerOps
     }
 };
 
+enum NewInitColor : int { NewInitRed = 3 };
+
+struct NewInitCopy
+{
+    int value = 0;
+    NewInitCopy(NewInitCopy other) { value = other.value; }
+};
+
+move T* make<T>(T value) { return new T(value); }
+
+bool testNewPrimitiveInitializers()
+{
+    bool result = true;
+    int x = 6;
+    int* pi = new int(7);
+    double* pd = new double(2.5);
+    bool* pb = new bool(true);
+    i64* pl = new i64(-1);
+    u8* pu = new u8(200);
+    int* pr = new int(x + 1);
+    NewInitColor* pc = new NewInitColor(NewInitColor.NewInitRed);
+    int* pz = new int();
+    result &= Test("new primitive int", *pi, 7);
+    result &= Test("new primitive double", (float)*pd, 2.5f);
+    result &= Test("new primitive bool", *pb, true);
+    result &= Test("new primitive i64", *pl, (i64)-1);
+    result &= Test("new primitive u8", (int)*pu, 200);
+    result &= Test("new primitive runtime expr", *pr, 7);
+    result &= Test("new primitive enum", (int)*pc, 3);
+    result &= Test("new primitive empty parens", *pz, 0);
+
+    int* source = &x;
+    int** pp = make<int*>(source);
+    result &= Test("new primitive pointer element", **pp, 6);
+
+    int* gi = make<int>(8);
+    result &= Test("new primitive generic int", *gi, 8);
+
+    NewInitCopy copy = default;
+    copy.value = 9;
+    NewInitCopy* gs = make<NewInitCopy>(copy);
+    result &= Test("new primitive generic struct", gs->value, 9);
+
+    delete pi; delete pd; delete pb; delete pl; delete pu; delete pr;
+    delete pc; delete pz; delete pp; delete gi; delete gs;
+    return result;
+}
+
 // --- Template with interface type ---
 interface IComparable
 {
@@ -5179,6 +5227,7 @@ extern int main()
     total++; passed += testMixedGenericFields()          ? 1 : 0;
     total++; passed += testIsPointerIntrinsic()          ? 1 : 0;
     total++; passed += testTemplateFunctions()           ? 1 : 0;
+    total++; passed += testNewPrimitiveInitializers()    ? 1 : 0;
     total++; passed += testGenericInstanceMethods()      ? 1 : 0;
     total++; passed += testGenericStaticMethods()        ? 1 : 0;
     total++; passed += testBasicStructConstraint()       ? 1 : 0;

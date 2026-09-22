@@ -945,6 +945,21 @@ static std::optional<int64_t> FoldCompileTimeIntLeaf(LLVMBackend* compiler, antl
                         return InScannerInt32Range(ev) ? std::optional<int64_t>(ev) : std::nullopt;
                 }
             }
+            // C++ enum members keep their fully qualified spelling in the global registry, so
+            // use that key for nested owners and unscoped namespace members.
+            if (compiler != nullptr)
+            {
+                auto global = compiler->GetGlobalVariableNV(n->getText());
+                if (global.Storage != nullptr && !global.TypeAndValue.EnumBacking.empty())
+                {
+                    auto* gv = llvm::dyn_cast<llvm::GlobalVariable>(global.Storage);
+                    auto* ci = gv != nullptr && gv->hasInitializer()
+                        ? llvm::dyn_cast<llvm::ConstantInt>(gv->getInitializer()) : nullptr;
+                    if (ci != nullptr && ci->getBitWidth() <= 64)
+                        return InScannerInt32Range(ci->getSExtValue())
+                            ? std::optional<int64_t>(ci->getSExtValue()) : std::nullopt;
+                }
+            }
             return std::nullopt;
         }
         if (auto* n = dynamic_cast<CFlatParser::PrimaryExpressionContext*>(node))
@@ -5503,7 +5518,8 @@ public:
         ResultUse use,
         const LLVMBackend::TypeAndValue& outerExpected,
         llvm::Value* cxxTernaryDeclDest,
-        const std::string& cxxTernaryDeclType);
+        const std::string& cxxTernaryDeclType,
+        bool collapseLvalueArms);
 
     LLVMBackend::TypedValue ParseConditionalExpression(CFlatParser::ConditionalExpressionContext* ctx,
                                                         ResultUse use = ResultUse::Value);

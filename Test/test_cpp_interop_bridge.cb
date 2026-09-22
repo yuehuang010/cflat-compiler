@@ -398,6 +398,28 @@ int bridge_enclosing_shared_copy()
     return inside * 10 + (int)source.value.use_count();
 }
 
+int bridge_ternary_field_copy_cpp(bool choose)
+{
+    BridgeCopyFieldHolder<cpptw.Twin> left = default;
+    BridgeCopyFieldHolder<cpptw.Twin> right = default;
+    left.value.set(11);
+    right.value.set(22);
+    BridgeCopyFieldHolder<cpptw.Twin> picked = choose ? left : right;
+    picked.value.set(99);
+    return picked.value.value();
+}
+
+int bridge_ternary_field_alias_cpp(bool choose)
+{
+    BridgeCopyFieldHolder<cpptw.Twin> left = default;
+    BridgeCopyFieldHolder<cpptw.Twin> right = default;
+    left.value.set(11);
+    right.value.set(22);
+    alias BridgeCopyFieldHolder<cpptw.Twin> picked = choose ? left : right;
+    picked.value.set(99);
+    return left.value.value() * 100 + right.value.value() * 10;
+}
+
 int bridge_reference<T>(alias T value)
 {
     value.set(value.value() + 2);
@@ -3269,6 +3291,21 @@ extern int main(int argc, char** argv)
     bridge_check("bridge enclosing copy C++ copy", cpptw.copy_count(), 1);
     bridge_check("bridge enclosing copy C++ dtor", cpptw.dtor_count(), 2);
     bridge_check("bridge enclosing copy C++ live", cpptw.live_allocations(), 0);
+
+    cpptw.reset_counts();
+    bridge_check("bridge ternary field C++ true value", bridge_ternary_field_copy_cpp(true), 99);
+    bridge_check("bridge ternary field C++ true copy", cpptw.copy_count(), 1);
+    bridge_check("bridge ternary field C++ true dtor", cpptw.dtor_count(), 3);
+    bridge_check("bridge ternary field C++ true live", cpptw.live_allocations(), 0);
+
+    cpptw.reset_counts();
+    bridge_check("bridge ternary field C++ false value", bridge_ternary_field_copy_cpp(false), 99);
+    bridge_check("bridge ternary field C++ false copy", cpptw.copy_count(), 1);
+    bridge_check("bridge ternary field C++ false dtor", cpptw.dtor_count(), 3);
+    bridge_check("bridge ternary field C++ false live", cpptw.live_allocations(), 0);
+
+    bridge_check("bridge ternary field alias C++ true", bridge_ternary_field_alias_cpp(true), 10120);
+    bridge_check("bridge ternary field alias C++ false", bridge_ternary_field_alias_cpp(false), 2090);
 
     bridge_reset_cf();
     int bridgeEnclosingAssignCf = bridge_enclosing_assign<TwinCf>();

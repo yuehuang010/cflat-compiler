@@ -160,6 +160,11 @@ import "list.cb";
 import "thread.cb";
 import "malloc_allocator.cb";
 
+// Pre-fix the C++ scoped enum initializer was rejected as non-constant at file scope. This value
+// leg also proves the folded global retains its enum type when passed to an enum-typed parameter.
+const cppi_scope.Hue globalConstCppScoped = cppi_scope.Hue.Green;
+int readGlobalConstCppScoped(cppi_scope.Hue value) { return (int)value; }
+
 // CFlat structs whose FIELD is a fixed array of a C++ class - `= default`, and a non-empty
 // brace list over an element with a trivial and with a nontrivial destructor.
 struct ArrElemHost { cppa.Trk[2] cells = default; };
@@ -1644,6 +1649,8 @@ extern int main()
     if (cppi_scope.takeUIntMap(senumUnscopedMap) != 8) return 1636;
     if (cppi_scope.deduceKind(cppi_scope.U1.u) != 1) return 1637;
     if (senumModule.deduceKind(cppi_scope.U1.u) != 3) return 1638;
+    if ((int)globalConstCppScoped != 2) return 1639;
+    if (readGlobalConstCppScoped(globalConstCppScoped) != 2) return 1640;
 
     // ---- target-aware C++ bitfield packing ------------------------------------------------------
     cppi.BitsFit bitsFit = default;
