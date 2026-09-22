@@ -5206,7 +5206,9 @@ private:
                             cflat_cinterop::ExtractResult& raw, std::string& error,
                             const std::string& prefixSource = {});
     CxxIncrementalGroup* GetCxxIncrementalGroup(const CxxRequestGroup& group,
-                                                std::string& error);
+                                                std::string& error,
+                                                const std::string& initialSource = {},
+                                                bool tolerateDiagnostics = false);
     // Cache identity of one C++ type request; see the definition for what it folds in.
     std::string CxxTypeRequestCacheKey(const CxxRequestGroup& group,
                                        const std::string& cxxSpelling,

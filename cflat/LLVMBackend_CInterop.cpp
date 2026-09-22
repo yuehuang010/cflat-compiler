@@ -205,6 +205,9 @@ static bool IsSystemCxxHeaderPath(const std::string& path)
         return false;
 }
 
+static bool UseCxxIncrementalRequests();
+static std::atomic<unsigned> gCxxIncrementalChunk;
+
 static std::string CxxDefaultWrapperName(const std::string& linkageName, size_t omittedArity);
 static bool HasNonConstDefaultSuffix(const std::vector<cflat_cinterop::RawDefaultArg>& defaults,
                                      size_t first);
@@ -3582,7 +3585,62 @@ bool LLVMBackend::ExtractCHeaderClang(const std::vector<std::string>& headerPath
 
         cflat_cinterop::ExtractResult raw;
         std::string err;
-        if (!cflat_cinterop::ExtractCInterop(req, raw, err))
+        const bool incrementalHeader = cxxMode && !batchMode_ && activeCxxRequestGroup_ != nullptr
+            && UseCxxIncrementalRequests();
+        bool extracted = false;
+        if (incrementalHeader)
+        {
+            cflat_cinterop::ExtractResult prepass;
+            cflat_cinterop::ExtractRequest macroReq = req;
+            macroReq.source = source;
+            if (cflat_cinterop::ExtractCxxMacroPrepass(macroReq, prepass, err))
+            {
+                cflat_cinterop::ExtractRequest incrementalReq = req;
+                incrementalReq.cxxMacroProbes = prepass.macroProbes;
+                incrementalReq.checkHeaderScope = false;
+                std::string headerChunk = BuildCxxRequestIncludes(*activeCxxRequestGroup_);
+                headerChunk += "typedef int __cflat_header_scope_sentinel;\n";
+                raw = prepass;
+                CxxIncrementalGroup* incremental = GetCxxIncrementalGroup(
+                    *activeCxxRequestGroup_, err, headerChunk, /*tolerateDiagnostics*/ true);
+                extracted = incremental != nullptr
+                    && incremental->HarvestHeader(incrementalReq, raw, err)
+                    && raw.incompleteCxxTypeSpellings.empty();
+                if (extracted && !prepass.macroProbes.empty())
+                {
+                    std::string probes;
+                    for (size_t i = 0; i < prepass.macroProbes.size(); ++i)
+                    {
+                        probes += "static const __auto_type __cflat_macro_";
+                        probes += std::to_string(i);
+                        probes += " = ";
+                        probes += prepass.macroProbes[i].name;
+                        probes += ";\n";
+                    }
+                    cflat_cinterop::ExtractRequest probeReq = incrementalReq;
+                    probeReq.cxxWrapperBatch = true;
+                    probeReq.emitDefinitions = false;
+                    probeReq.assumeInlineDefinitions = true;
+                    probeReq.skipFunctionBodies = true;
+                    probeReq.wantMacros = false;
+                    cflat_cinterop::ExtractResult probeRaw;
+                    extracted = incremental->ParseRequest(probeReq, probes, probeRaw, err);
+                    if (extracted)
+                        raw.macros.insert(raw.macros.end(), probeRaw.macros.begin(),
+                                          probeRaw.macros.end());
+                }
+            }
+            if (!extracted)
+            {
+                req.source = source;
+                req.cxxMacroProbes.clear();
+                raw = cflat_cinterop::ExtractResult();
+                extracted = cflat_cinterop::ExtractCInterop(req, raw, err);
+            }
+        }
+        else
+            extracted = cflat_cinterop::ExtractCInterop(req, raw, err);
+        if (!extracted)
         {
             if (verbose) std::cout << std::format("[verbose]   C header extraction failed: {}\n", err);
             return false;
@@ -3667,7 +3725,17 @@ bool LLVMBackend::ExtractCHeaderClang(const std::vector<std::string>& headerPath
                 bool wrapperOk = false;
                 {
                     CxxExtractionStageTimer wrapperParse(verbose, "default-wrapper second parse");
-                    wrapperOk = cflat_cinterop::ExtractCInterop(wrappedReq, wrapped, wrappedError);
+                    if (incrementalHeader)
+                    {
+                        CxxIncrementalGroup* incremental = GetCxxIncrementalGroup(
+                            *activeCxxRequestGroup_, wrappedError);
+                        wrappedReq.source = wrappers;
+                        wrappedReq.cxxWrapperBatch = true;
+                        wrapperOk = incremental != nullptr
+                            && incremental->ParseRequest(wrappedReq, wrappers, wrapped, wrappedError);
+                    }
+                    else
+                        wrapperOk = cflat_cinterop::ExtractCInterop(wrappedReq, wrapped, wrappedError);
                 }
                 if (!wrapperOk)
                 {
@@ -4417,7 +4485,9 @@ static void ReplaceCxxRequestUseText(std::string& source, const std::string& to)
 }
 
 CxxIncrementalGroup* LLVMBackend::GetCxxIncrementalGroup(const CxxRequestGroup& group,
-                                                          std::string& error)
+                                                          std::string& error,
+                                                          const std::string& initialSource,
+                                                          bool tolerateDiagnostics)
 {
         std::string key;
         auto append = [&](const char prefix, const std::string& value) {
@@ -4428,9 +4498,12 @@ CxxIncrementalGroup* LLVMBackend::GetCxxIncrementalGroup(const CxxRequestGroup& 
         auto found = cxxIncrementalGroups_.find(key);
         if (found != cxxIncrementalGroups_.end()) return found->second.get();
 
+        const std::string source = initialSource.empty()
+            ? BuildCxxRequestIncludes(group) : initialSource;
         std::unique_ptr<CxxIncrementalGroup> created = CxxIncrementalGroup::Create(
-            BuildCxxRequestClangArgs(group), BuildCxxRequestIncludes(group), verbose, error);
+            BuildCxxRequestClangArgs(group), source, verbose, error, tolerateDiagnostics);
         if (!created) return nullptr;
+        if (initialSource.empty()) gCxxIncrementalChunk.fetch_add(3);
         CxxIncrementalGroup* result = created.get();
         cxxIncrementalGroups_.emplace(std::move(key), std::move(created));
         return result;
@@ -4875,9 +4948,8 @@ bool LLVMBackend::RunCxxTypeRequests(const CxxRequestGroup& group,
             CxxIncrementalGroup* incremental = GetCxxIncrementalGroup(group, error);
             if (incremental == nullptr) return false;
             const bool instantiateAll = !emitDefinitions;
-            static std::atomic<unsigned> nextChunk = 0;
             const std::string chunkPrefix = "__cflat_inc_"
-                + std::to_string(nextChunk.fetch_add(1)) + "_";
+                + std::to_string(gCxxIncrementalChunk.fetch_add(1)) + "_";
             const std::string markerPrefix = chunkPrefix + "req_";
             req.cxxRequestMarkerPrefix = markerPrefix;
             std::unordered_set<std::string> checked;

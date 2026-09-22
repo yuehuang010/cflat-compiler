@@ -7,6 +7,8 @@
 #include "clang/Frontend/CompilerInstance.h"
 #include "clang/Interpreter/Interpreter.h"
 #include "clang/Interpreter/PartialTranslationUnit.h"
+#include "clang/Lex/PPCallbacks.h"
+#include "clang/Lex/Preprocessor.h"
 #include "clang/Sema/Sema.h"
 #include "llvm/Support/Error.h"
 #include "llvm/Support/TargetSelect.h"
@@ -61,6 +63,24 @@ namespace
         }
     };
 
+    class IncludeCollector : public clang::PPCallbacks
+    {
+    public:
+        clang::Preprocessor& pp;
+        std::vector<std::string>& files;
+
+        IncludeCollector(clang::Preprocessor& p, std::vector<std::string>& f)
+            : pp(p), files(f) {}
+
+        void FileChanged(clang::SourceLocation loc, FileChangeReason reason,
+                         clang::SrcMgr::CharacteristicKind, clang::FileID) override
+        {
+            if (reason != EnterFile) return;
+            llvm::StringRef file = pp.getSourceManager().getFilename(loc);
+            if (!file.empty()) files.push_back(file.str());
+        }
+    };
+
     std::string ErrorText(llvm::Error error)
     {
         return llvm::toString(std::move(error));
@@ -88,6 +108,7 @@ struct CxxIncrementalGroup::Impl
 {
     std::unique_ptr<clang::Interpreter> interpreter;
     clang::TranslationUnitDecl* headerRoot = nullptr;
+    std::vector<std::string> includedFiles;
     std::unordered_set<std::string> prefixSources;
     bool verbose = false;
     std::unordered_map<std::string, cflat_cinterop::ExtractResult> wrapperResults;
@@ -108,7 +129,7 @@ CxxIncrementalGroup::~CxxIncrementalGroup()
 
 std::unique_ptr<CxxIncrementalGroup> CxxIncrementalGroup::Create(
     const std::vector<std::string>& args, const std::string& headerSource,
-    bool verbose, std::string& error)
+    bool verbose, std::string& error, bool tolerateDiagnostics)
 {
     std::vector<std::string> storage = InterpreterArgs(args);
     std::vector<const char*> cargs;
@@ -141,6 +162,10 @@ std::unique_ptr<CxxIncrementalGroup> CxxIncrementalGroup::Create(
     impl->verbose = verbose;
     {
         DiagnosticScope diagnostics(impl->interpreter->getCompilerInstance()->getDiagnostics());
+        impl->interpreter->getCompilerInstance()->getPreprocessor().addPPCallbacks(
+            std::make_unique<IncludeCollector>(
+                impl->interpreter->getCompilerInstance()->getPreprocessor(),
+                impl->includedFiles));
         auto ptu = impl->interpreter->Parse(headerSource);
         if (!ptu)
         {
@@ -148,7 +173,7 @@ std::unique_ptr<CxxIncrementalGroup> CxxIncrementalGroup::Create(
             if (error.empty()) error = diagnostics.consumer.firstError;
             return nullptr;
         }
-        if (diagnostics.consumer.errors != 0)
+        if (!tolerateDiagnostics && diagnostics.consumer.errors != 0)
         {
             error = diagnostics.consumer.firstError;
             return nullptr;
@@ -157,6 +182,23 @@ std::unique_ptr<CxxIncrementalGroup> CxxIncrementalGroup::Create(
     }
     return std::unique_ptr<CxxIncrementalGroup>(
         new CxxIncrementalGroup(std::move(impl)));
+}
+
+bool CxxIncrementalGroup::HarvestHeader(const cflat_cinterop::ExtractRequest& req,
+                                         cflat_cinterop::ExtractResult& out,
+                                         std::string& error)
+{
+    if (impl_ == nullptr || impl_->headerRoot == nullptr)
+    {
+        error = "incremental header parse returned no translation-unit part";
+        return false;
+    }
+    DiagnosticScope diagnostics(impl_->interpreter->getCompilerInstance()->getDiagnostics());
+    const bool harvested = cflat_cinterop::ExtractCxxIncremental(
+        req, *impl_->interpreter->getCompilerInstance(), impl_->headerRoot,
+        impl_->headerRoot, {}, nullptr, out, error, true);
+    out.includedFiles = impl_->includedFiles;
+    return harvested;
 }
 
 bool CxxIncrementalGroup::PrecheckSpelling(const std::string& spelling, std::string& error)
@@ -241,6 +283,7 @@ bool CxxIncrementalGroup::ParseRequest(const cflat_cinterop::ExtractRequest& req
         typeKey += request.cflatName + "\n";
     const std::string wrapperName = req.cxxFunctionWrapperNames.size() == 1
         ? req.cxxFunctionWrapperNames.front() : std::string{};
+    const bool wrapperBatch = req.cxxWrapperBatch || !wrapperName.empty();
     if (!wrapperName.empty())
     {
         auto found = impl_->wrapperResults.find(wrapperName);
@@ -261,6 +304,11 @@ bool CxxIncrementalGroup::ParseRequest(const cflat_cinterop::ExtractRequest& req
         return false;
     }
     cflat_cinterop::ExtractRequest effective = req;
+    if (wrapperBatch)
+    {
+        effective.requireInScope = false;
+        effective.checkHeaderScope = false;
+    }
     if (!wrapperName.empty())
     {
         effective.emitDefinitions = true;
@@ -274,7 +322,7 @@ bool CxxIncrementalGroup::ParseRequest(const cflat_cinterop::ExtractRequest& req
     }
     const bool harvested = cflat_cinterop::ExtractCxxIncremental(
         effective, *impl_->interpreter->getCompilerInstance(), (*ptu).TUPart,
-        impl_->headerRoot, extraRoots,
+        wrapperBatch ? nullptr : impl_->headerRoot, extraRoots,
         (*ptu).TheModule.get(), out, error);
     if (harvested && !typeKey.empty() && !req.emitDefinitions)
     {

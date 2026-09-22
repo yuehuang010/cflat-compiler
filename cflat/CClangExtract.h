@@ -466,6 +466,15 @@ namespace cflat_cinterop
         int col = 0;
     };
 
+    struct CxxMacroProbe
+    {
+        std::string name;
+        std::string file;
+        std::string aliasTarget;
+        int line = 1;
+        int col = 0;
+    };
+
     struct ExtractRequest
     {
         // Virtual main-file name for the in-memory stub (e.g. "cflat_hdr_stub.c"). When
@@ -478,6 +487,7 @@ namespace cflat_cinterop
         std::vector<std::string> args;
 
         bool wantMacros = false;            // header-bind path harvests macros; .c path does not
+        std::vector<CxxMacroProbe> cxxMacroProbes;
         bool requireInScope = false;        // keep only decls whose file is under inScopeDirs
         std::vector<std::string> inScopeDirs;
         bool checkHeaderScope = false;      // reject a stub sentinel left inside a header scope
@@ -526,6 +536,7 @@ namespace cflat_cinterop
         // Request mode for a generated deduction wrapper. Only these ordinary free wrapper
         // declarations are exported; the included header remains available to CodeGen.
         std::vector<std::string> cxxFunctionWrapperNames;
+        bool cxxWrapperBatch = false;
         // Header extraction may need one retry after forcing a named specialization complete.
         bool autoInstantiateCxxTypes = true;
         /*
@@ -555,6 +566,7 @@ namespace cflat_cinterop
         std::vector<RawGlobalVar> globals;
         std::vector<RawMacro> macros;
         std::vector<RawFuncMacro> funcMacros;
+        std::vector<CxxMacroProbe> macroProbes;
         std::vector<std::string> includedFiles;  // populated only when req.wantIncludes
         // Namespace-scope C++ using-directives, as CFlat dotted namespace pairs. The backend
         // resolves these at lookup time instead of duplicating every nominated declaration.
@@ -591,6 +603,7 @@ namespace cflat_cinterop
         // A requested template specialization whose completion failed. This is separate from
         // firstError because request TUs may contain tolerated errors unrelated to this type.
         std::string invalidCxxTypeRequestError;
+        std::vector<std::string> incompleteCxxTypeSpellings;
 
         // Errors clang raised INSIDE one of the headers the caller asked to bind (in-scope
         // dirs only, so neither the in-memory stub's intentional macro-probe/wrapper errors nor
@@ -607,11 +620,14 @@ namespace cflat_cinterop
     // old -ferror-limit=0 path). `err` carries a human-readable reason on hard failure.
     bool ExtractCInterop(const ExtractRequest& req, ExtractResult& out, std::string& err);
 
+    bool ExtractCxxMacroPrepass(const ExtractRequest& req, ExtractResult& out, std::string& err);
+
     // Harvest one incremental PTU with the same visitor and ABI/codegen pipeline as a full TU.
     bool ExtractCxxIncremental(const ExtractRequest& req, clang::CompilerInstance& ci,
                                clang::TranslationUnitDecl* root,
                                clang::TranslationUnitDecl* headerRoot,
                                const std::vector<clang::TranslationUnitDecl*>& extraRoots,
                                llvm::Module* module,
-                               ExtractResult& out, std::string& err);
+                               ExtractResult& out, std::string& err,
+                               bool checkHeader = false);
 }

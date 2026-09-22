@@ -11,7 +11,7 @@ class CxxIncrementalGroup
 public:
     static std::unique_ptr<CxxIncrementalGroup> Create(
         const std::vector<std::string>& args, const std::string& headerSource,
-        bool verbose, std::string& error);
+        bool verbose, std::string& error, bool tolerateDiagnostics = false);
 
     ~CxxIncrementalGroup();
 
@@ -19,6 +19,9 @@ public:
     bool HasPrefixSource(const std::string& source) const;
     std::string UnseenPrefixSource(const std::string& source) const;
     void RememberPrefixSource(const std::string& source);
+    bool HarvestHeader(const cflat_cinterop::ExtractRequest& req,
+                       cflat_cinterop::ExtractResult& out,
+                       std::string& error);
     bool ParseRequest(const cflat_cinterop::ExtractRequest& req,
                       const std::string& source,
                       cflat_cinterop::ExtractResult& out,

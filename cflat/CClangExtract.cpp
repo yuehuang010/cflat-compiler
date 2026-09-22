@@ -580,17 +580,6 @@ namespace cflat_cinterop
             return false;
         }
 
-        // One object-like macro discovered in the prepass, awaiting value/type deduction by its
-        // injected probe. Its index is its probe slot (probe var `__cflat_macro_<index>`).
-        struct MacroProbe
-        {
-            std::string name;
-            std::string file;
-            std::string aliasTarget;   // body is exactly one identifier token (`#define A B`)
-            int line = 1;
-            int col = 0;
-        };
-
         class PrereqDiagConsumer : public DiagnosticConsumer
         {
         public:
@@ -661,7 +650,7 @@ namespace cflat_cinterop
         {
             const ExtractRequest& req;
             ExtractResult& out;
-            std::vector<MacroProbe> probes;   // index == probe slot
+            std::vector<CxxMacroProbe> probes;   // index == probe slot
             std::unordered_set<unsigned> emittedProbes;  // probe slots that produced a RawMacro
             std::unordered_set<std::string> emittedGlobals;  // dedup global var redeclarations by name
             std::unordered_set<const UsingDecl*> emittedUsingDecls;
@@ -711,6 +700,7 @@ namespace cflat_cinterop
             std::vector<std::string> stillIncompleteSpellings;
             ExtractState(const ExtractRequest& r, ExtractResult& o) : req(r), out(o)
             {
+                probes = r.cxxMacroProbes;
                 for (const auto& d : r.inScopeDirs)
                 {
                     std::string nd = NormPath(d);
@@ -847,7 +837,7 @@ namespace cflat_cinterop
                     return;
                 }
 
-                MacroProbe mp;
+                CxxMacroProbe mp;
                 mp.name = name; mp.file = file; mp.line = line; mp.col = col;
                 mp.aliasTarget = aliasTarget;
                 st.probes.push_back(std::move(mp));
@@ -2857,7 +2847,7 @@ namespace cflat_cinterop
                 unsigned idx = 0;
                 if (nm.drop_front(sizeof(kProbePrefix) - 1).getAsInteger(10, idx)) return true;
                 if (idx >= st.probes.size()) return true;
-                const MacroProbe& mp = st.probes[idx];
+                const CxxMacroProbe& mp = st.probes[idx];
                 RawMacro m;
                 m.name = mp.name; m.file = mp.file; m.line = mp.line; m.col = mp.col;
                 m.aliasTarget = mp.aliasTarget;
@@ -4465,7 +4455,7 @@ namespace cflat_cinterop
                                clang::TranslationUnitDecl* headerRoot,
                                const std::vector<clang::TranslationUnitDecl*>& extraRoots,
                                llvm::Module* module,
-                               ExtractResult& out, std::string& err)
+                               ExtractResult& out, std::string& err, bool checkHeader)
     {
         if (root == nullptr)
         {
@@ -4492,7 +4482,22 @@ namespace cflat_cinterop
         for (clang::TranslationUnitDecl* extra : extraRoots)
             if (extra != nullptr && extra != root && extra != headerRoot)
                 HarvestTranslationUnit(st, ci.getASTContext(), extra, false, false);
-        HarvestTranslationUnit(st, ci.getASTContext(), root, false, true);
+        HarvestTranslationUnit(st, ci.getASTContext(), root,
+                               checkHeader && root == headerRoot, true);
+        for (const auto& queued : st.incompleteCxxTypes)
+            if (queued.type->isIncompleteType())
+                out.incompleteCxxTypeSpellings.push_back(queued.spelling);
+        return true;
+    }
+
+    bool ExtractCxxMacroPrepass(const ExtractRequest& req, ExtractResult& out, std::string& err)
+    {
+        ExtractState st(req, out);
+        CxxExtractionStageTimer parseStage(req.verbose && req.cxxMode,
+                                           "clang parse stage 1");
+        PrepassAction prepass(st);
+        if (!RunAction(req, req.source, prepass, err)) return false;
+        out.macroProbes = std::move(st.probes);
         return true;
     }
 
@@ -4637,7 +4642,7 @@ namespace cflat_cinterop
             // an unknown identifier) still reports its alias spelling; the binder decides.
             for (size_t i = 0; i < st.probes.size(); ++i)
             {
-                const MacroProbe& mp = st.probes[i];
+                const CxxMacroProbe& mp = st.probes[i];
                 if (mp.aliasTarget.empty()) continue;
                 if (st.emittedProbes.count((unsigned)i)) continue;
                 RawMacro m;
