@@ -19,6 +19,8 @@
 
 namespace cppi
 {
+    inline long cpp_std() noexcept { return __cplusplus; }
+
     // Overload pair. The double leg adds 1000 so the SELECTED overload is observable
     // from the return value alone.
     int add(int a, int b) noexcept;

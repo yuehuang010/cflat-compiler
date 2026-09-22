@@ -8085,6 +8085,17 @@ public:
                 && record->second.hasCtorTemplate);
         return result;
     }
+    bool IsForeignCxxClassWithUserDeclaredConstructor(const std::string& typeName) const
+    {
+        auto record = cxxRecordEntries_.find(typeName);
+        return record != cxxRecordEntries_.end()
+            && (record->second.hasCtorTemplate
+                || std::any_of(record->second.members.begin(), record->second.members.end(),
+                [](const auto& member) {
+                    return member.kind == cflat_cinterop::RawCxxMember::Constructor
+                        && !member.isImplicit;
+                }));
+    }
     // C++ permits a scalar argument to initialize a class temporary for a reference or
     // by-value parameter. The call resolver uses this predicate; the lowering side materializes
     // the temporary with the selected imported constructor.
@@ -9772,6 +9783,8 @@ public:
     void ValidateIsolatedExtern(CFlatParser::DeclarationContext* ctx);
     void ValidateIsolatedProgram(antlr4::ParserRuleContext* ctx);
     void SetCppStrictNoexcept(bool v);
+    static bool IsValidCppStandard(const std::string& standard);
+    bool SetCppStandard(const std::string& standard);
     void SetWindowsSubsystem(const std::string& v);
 
     const std::vector<std::string>& GetDependencyFiles() const { return dependencyFiles_; }
@@ -9867,7 +9880,7 @@ public:
      * timeout). The PCH key still folds the build stamp, since a PCH belongs to the clang that
      * wrote it.
      */
-    static constexpr int kCHeaderCacheVersion = 81;
+    static constexpr int kCHeaderCacheVersion = 83;
     static std::string CompilerBuildStamp();
 
     static std::string GetCHeaderCacheDir();
@@ -9889,7 +9902,8 @@ public:
                                         bool msvcBitfieldPacking,
                                         const std::string& targetTriple,
                                         bool cxxMode = false,
-                                        bool cxxDefinitionsEmitted = false);
+                                        bool cxxDefinitionsEmitted = false,
+                                        const std::string& cppStandard = "c++20");
 
     // Read-only adapter exposing the nlohmann subset the *FromJson converters use, backed by a
     // simdjson DOM element. Keeps converter bodies unchanged while parsing with simdjson.

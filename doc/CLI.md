@@ -293,6 +293,7 @@ AppKit / Foundation / CoreFoundation / `libobjc` tbd stubs under `~/.cflat/macsd
 | `--no-cache` | Bypass the core bitcode cache and reparse the core libraries from source. |
 | `--error-on-cpp-reparse cold\|warm` | Verify the C/C++ translation-unit cache (`cheaders/`). Every TU the compile touches - a C++ header import group, a C header import, an imported `.c`/`.cpp` file's signature extraction, and its object compile - counts each full clang parse. `cold` fails the compile when any TU is parsed more than once; `warm` fails it when any TU is parsed at all, i.e. the cache must serve every one. The error names the TU and its count. With `-v`, every counted parse prints one `[verbose] clang parse: <kind> '<tu>' #<n> (<stage>)` line, so `grep "clang parse:"` counts them. Without the switch, the `CFLAT_CPP_MAX_HEADER_PARSES=<n>` environment variable sets the same per-TU budget. `test.bat` / `test.sh` / `test_err.bat` pass `cold` on every compile, then recompile the C++ interop suites `warm`. |
 | `--cpp-strict-noexcept` | Refuse calls to C++ functions without a `noexcept` specification. Off by default: as with clang, such calls are allowed and an exception escaping into CFlat code terminates the program. |
+| `--cpp-std` | Set one C++ standard for every `import cpp` in this invocation: `c++17`, `c++20` (default), `c++23`, `c++26`, or the matching `gnu++` spelling. |
 
 Cache design and troubleshooting: [`doc/CACHING.md`](CACHING.md).
 

@@ -153,6 +153,8 @@
 //     explicit template (direct call only; Test/errors/err_cpp_explicit_template_ctor.cb pins
 //     the implicit refusal), `new` of a nontrivial class, and the libc++ complex / chrono /
 //     filesystem::path / tuple constructors (2540-2559).
+//   Explicit free-function-template instantiations keep distinct wrapper registrations when
+//     their CFlat ABI signatures match; repeated identical instantiations still share one.
 
 import cpp "library/cpp_interop_basic.h";
 import cpp "library/cpp_interop_basic.cpp";
@@ -185,6 +187,7 @@ import cpp "atomic";
 import cpp "complex";
 import cpp "filesystem";
 import cpp "library/cpp_interop_scoped_enum.h";
+import cpp "library/cpp_interop_nttp.h";
 import cpp "library/cpp_interop_nsstd.h";
 import cpp "library/cpp_interop_strop.h";
 // std containers over std specializations over USER classes. Neither header
@@ -2965,9 +2968,8 @@ extern int main()
         std.string ctorPathStr = std.string("a/b.txt");
         std.filesystem.path ctorPath = std.filesystem.path(ctorPathStr);
         if ((int)ctorPath.filename().string().size() != 5)                  return 2552;
-        // Controls: the remaining filed repros (literal path, complex, chrono, tuple) already
-        // ran on master. std.get<1> is left out: see
-        // internal/issue/cppinterop/nttp-function-template-wrapper-collision.md.
+        // Control: this suite's earlier imports route std.get through __cflat_tpl_, so these
+        // tuple values do not exercise the __cflat_free_ fallback.
         std.filesystem.path ctorPathLit = std.filesystem.path("dir/x.cb");
         if ((int)ctorPathLit.filename().string().size() != 4)               return 2553;
         double ctorRe = 1.0;
@@ -2979,6 +2981,26 @@ extern int main()
         if (ctorMs.count() != 42)                                           return 2555;
         std.tuple<int, int> ctorTup = std.tuple<int, int>(7, 8);
         if (std.get<0>(ctorTup) != 7)                                       return 2556;
+        if (std.get<1>(ctorTup) != 8)                                       return 2557;
+    }
+
+    // ---- explicit free-function-template controls (section 2560-2579) --------------------------
+    {
+        std.tuple<int, long> mixedType = std.tuple<int, long>(13, 29);
+        if (std.get<0>(mixedType) != 13)                                    return 2561;
+        if (std.get<1>(mixedType) != 29)                                    return 2562;
+
+        std.tuple<int, int> repeatedA = std.tuple<int, int>(31, 37);
+        std.tuple<int, int> repeatedB = std.tuple<int, int>(41, 43);
+        if (std.get<0>(repeatedA) != 31 || std.get<0>(repeatedB) != 41)    return 2563;
+
+        int[2] values = { 17, 23 };
+        int* valuesPtr = &values[0];
+        if (nttp.pick<1>(valuesPtr) != 23 || nttp.pick<0>(valuesPtr) != 17) return 2564;
+        if (nttp.scale<3, int>(7) != 21 || nttp.scale<2, int>(7) != 14)    return 2565;
+        if (nttp.zero<int>() != 4 || nttp.zero<long>() != 8)                return 2566;
+        if (nttp.enumVal<nttp.Choice.High>() != 9
+            || nttp.enumVal<nttp.Choice.Low>() != 4)                        return 2567;
     }
 
     return 0;

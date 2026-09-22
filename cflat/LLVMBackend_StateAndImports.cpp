@@ -1622,6 +1622,27 @@ void LLVMBackend::SetNoCache(bool v)
 void LLVMBackend::SetCppStrictNoexcept(bool v)
 { cppStrictNoexcept_ = v; }
 
+bool LLVMBackend::SetCppStandard(const std::string& standard)
+{
+        if (!IsValidCppStandard(standard))
+        {
+            LogError(std::format("invalid --cpp-std '{}'; accepted values: c++17, c++20, c++23, "
+                                 "c++26, gnu++17, gnu++20, gnu++23, gnu++26", standard));
+            return false;
+        }
+        cppStandard_ = standard;
+        return true;
+}
+
+bool LLVMBackend::IsValidCppStandard(const std::string& standard)
+{
+        static const std::vector<std::string> accepted = {
+            "c++17", "c++20", "c++23", "c++26",
+            "gnu++17", "gnu++20", "gnu++23", "gnu++26"
+        };
+        return std::find(accepted.begin(), accepted.end(), standard) != accepted.end();
+}
+
 void LLVMBackend::SetWindowsSubsystem(const std::string& v)
 { windowsSubsystem_ = v; }
 
@@ -1766,7 +1787,8 @@ uint64_t LLVMBackend::CHeaderDiskCacheKey(const std::vector<std::string>& header
                                         const std::vector<std::string>& extraDefines,
                                         bool msvcBitfieldPacking,
                                         const std::string& targetTriple,
-                                        bool cxxMode, bool cxxDefinitionsEmitted)
+                                        bool cxxMode, bool cxxDefinitionsEmitted,
+                                        const std::string& cppStandard)
 {
         uint64_t h = 14695981039346656037ULL;
         auto fold = [&h](const std::string& s) {
@@ -1784,6 +1806,7 @@ uint64_t LLVMBackend::CHeaderDiskCacheKey(const std::vector<std::string>& header
         fold("|T"); fold(targetTriple);
         // A C++-mode binding of the same header is a different result; keep the keys apart.
         if (cxxMode) fold("|CXX");
+        if (cxxMode) { fold("|STD"); fold(cppStandard); }
         // A declarations-only C++ bind (LSP: no bodies, empty companion module) is a different
         // result again, and never a substitute for a compile's. Nothing writes such an entry to
         // disk today; keying it apart means an older entry can never be mistaken for one either.
@@ -2768,6 +2791,7 @@ bool LLVMBackend::TryLoadCHeaderDiskCache(
         // carries none, so an lvalue would not bind a template U&& parameter.
         // v81 records a public constructor TEMPLATE on a C++ record (hct): an older cache
         // carries none, so `T(args)` would never reach clang's constructor overload resolution.
+        // v83 keys C++ header and type-request entries by the selected language standard.
         if (version != kCHeaderCacheVersion) return cacheMiss("cache version");
 
         if (!expectedRequestKey.empty()
@@ -3179,6 +3203,7 @@ void LLVMBackend::WriteCHeaderDiskCache(
         // v79 preserves the pointer level of a collapsed const-qualified pointer reference.
         // v80 records function-template forwarding-reference parameters.
         // v81 records a public constructor template on a C++ record (hct).
+        // v82 registers explicit free-function-template wrappers under their unique names.
         j["version"] = kCHeaderCacheVersion;
         j["mtime"]   = (int64_t)mtime.time_since_epoch().count();
         j["hash"]    = contentHash;

@@ -14399,15 +14399,18 @@ LLVMBackend::NamedVariable MainListener::ParseNewExpression(CFlatParser::NewExpr
             return {};
         }
         /*
-         * M4b - `new T(args)` on a foreign NONTRIVIAL C++ class: storage from the C++ GLOBAL
-         * allocator (never CFlat's), then a C++ constructor into it. CFlat's own `new` would
-         * zero-fill and look for a CFlat constructor, leaving the object never constructed.
+         * M4b - `new T(args)` on a foreign C++ class with a user constructor: allocate storage,
+         * then invoke the selected C++ constructor. CFlat's own `new` would zero-fill and drop
+         * the arguments. Fully trivial records without a user constructor keep the old path.
          */
-        if (!isArray && !typeIsPtr && compiler->IsForeignNontrivialCxxClass(typeName))
+        if (!isArray && !typeIsPtr
+            && (compiler->IsForeignNontrivialCxxClass(typeName)
+                || compiler->IsForeignCxxClassWithUserDeclaredConstructor(typeName)))
         {
             if (compiler->RejectUnsupportedCxxLayout(typeName)) return {};
             if (compiler->RejectAbstractCxxClass(typeName, "allocate")) return {};
-            if (compiler->GetOrCreateCxxClassDestructor(typeName) == nullptr)
+            if (!compiler->HasTrivialCxxDtor(typeName)
+                && compiler->GetOrCreateCxxClassDestructor(typeName) == nullptr)
             {
                 LogErrorContext(ctx, std::format(
                     "cannot allocate C++ class '{}' with 'new': it has no destructor cflat can "
@@ -15452,7 +15455,9 @@ LLVMBackend::NamedVariable MainListener::ParseDeleteExpression(CFlatParser::Dele
         bool useAlignedDelete = deleteEffAlign > LLVMBackend::kDefaultNewAlign;
         // A foreign nontrivial C++ object came from the C++ global allocator, so it must go back
         // to the matching C++ operator delete (sized, and over-aligned where the class is).
-        if (!elemIsPtr && compiler->IsForeignNontrivialCxxClass(typeName))
+        if (!elemIsPtr
+            && (compiler->IsForeignNontrivialCxxClass(typeName)
+                || compiler->IsForeignCxxClassWithUserDeclaredConstructor(typeName)))
         {
             compiler->EmitCxxHeapFree(typeName, voidPtr);
         }

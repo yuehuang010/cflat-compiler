@@ -470,12 +470,13 @@ class LspServer
 public:
     LspServer(int protocolFd, const std::string& runtimeDir, const std::vector<std::string>& importDirs, bool verbose,
               unsigned int poolSizeOverride = 0, bool ftimeTrace = false,
-              bool cppStrictNoexcept = false)
+              bool cppStrictNoexcept = false, std::string cppStandard = "c++20")
         : loop_(protocolFd, verbose)
         , runtimeDir_(runtimeDir)
         , importSearchDirs_(importDirs)
         , verbose_(verbose)
         , cppStrictNoexcept_(cppStrictNoexcept)
+        , cppStandard_(std::move(cppStandard))
         , timeTraceEnabled_(ftimeTrace)
         , currentIndex_(std::make_shared<LspSymbolIndex>())
     {
@@ -526,6 +527,7 @@ public:
             auto b = std::make_unique<LLVMBackend>();
             b->SetRuntimeDir(runtimeDir_);
             b->SetVerbose(verbose_);
+            b->SetCppStandard(cppStandard_);
             ApplyLocale(*b);
             backendPool_.push_back(std::move(b));
             freeBackends_.push_back(i);
@@ -2230,6 +2232,7 @@ private:
             });
             backend->SetSymbolSink(newIndex.get());
             backend->SetCppStrictNoexcept(cppStrictNoexcept_);
+            backend->SetCppStandard(cppStandard_);
             backend->SetAnalyzeDebugInfo(job.analyzeDebugInfo);
 
             bool ok = false;
@@ -2921,6 +2924,7 @@ private:
     // Mirrors the compiler's --cpp-strict-noexcept: a workspace built with it must see the
     // throw gate as an editor error on every potentially-throwing C++ call.
     bool cppStrictNoexcept_ = false;
+    std::string cppStandard_ = "c++20";
 
     std::mutex docsMutex_;
     std::unordered_map<std::string, OpenDocument> docs_;
@@ -3020,6 +3024,7 @@ int RunLspServer(int argc, char* argv[])
     unsigned int poolSizeOverride = 0;
     bool ftimeTrace = false;
     bool cppStrictNoexcept = false;
+    std::string cppStandard = "c++20";
     for (int i = 0; i < argc; ++i)
     {
         std::string_view arg(argv[i]);
@@ -3036,11 +3041,20 @@ int RunLspServer(int argc, char* argv[])
             ftimeTrace = true;
         else if (arg == "--cpp-strict-noexcept")
             cppStrictNoexcept = true;
+        else if (arg == "--cpp-std" && i + 1 < argc)
+            cppStandard = argv[++i];
+    }
+
+    if (!LLVMBackend::IsValidCppStandard(cppStandard))
+    {
+        std::cerr << "[lsp] invalid --cpp-std value; accepted values: c++17, c++20, c++23, c++26, "
+                     "gnu++17, gnu++20, gnu++23, gnu++26\n";
+        return 2;
     }
 
     if (verbose) std::cerr << "[lsp] server starting\n";
     LspServer server(protocolFd, runtimeDir, importDirs, verbose, poolSizeOverride, ftimeTrace,
-                     cppStrictNoexcept);
+                     cppStrictNoexcept, cppStandard);
     if (verbose) std::cerr << "[lsp] entering Run()\n";
     server.Run();
     if (verbose) std::cerr << "[lsp] Run() returned\n";

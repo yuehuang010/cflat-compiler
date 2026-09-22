@@ -1773,10 +1773,114 @@ void MainListener::ResolvePendingGlobalDefaultConstructions()
  * FinalizeGlobalConstructorOrder registers ONE driver that calls Clang's own initializers and
  * then these, so AOT and --run agree on the order (see that function).
  */
+bool MainListener::HasGlobalCxxFieldDefaultConstruction(
+        const LLVMBackend::TypeAndValue& typeValue)
+{
+        std::unordered_set<std::string> visiting;
+        std::function<bool(const LLVMBackend::TypeAndValue&)> contains =
+            [&](const LLVMBackend::TypeAndValue& tv) -> bool
+        {
+            if (tv.Pointer || tv.ElemPointer || tv.IsAlias || tv.IsArrayView
+                || tv.IsInterface || tv.IsFunctionPointer || tv.IsSimd)
+                return false;
+            llvm::Type* type = compilerLLVM->GetType(tv);
+            if (auto* arrayType = llvm::dyn_cast_or_null<llvm::ArrayType>(type))
+            {
+                auto element = tv;
+                element.ConstArraySize = 0;
+                element.ConstInnerDimensions.clear();
+                return contains(element);
+            }
+            if (compilerLLVM->IsCxxRecord(tv.TypeName))
+                return compilerLLVM->CxxElementNeedsDefaultConstruction(tv.TypeName);
+            auto data = compilerLLVM->GetDataStructure(tv.TypeName);
+            if (data.StructType == nullptr || data.IsUnion
+                || !visiting.insert(tv.TypeName).second)
+                return false;
+            for (const auto& field : data.StructFields)
+            {
+                if (field.IsBitfield || field.IsPadding || contains(field))
+                {
+                    if (field.IsBitfield || field.IsPadding) continue;
+                    visiting.erase(tv.TypeName);
+                    return true;
+                }
+            }
+            visiting.erase(tv.TypeName);
+            return false;
+        };
+        return contains(typeValue);
+}
+
+void MainListener::EmitGlobalCxxFieldDefaultConstruction(
+        llvm::Value* slot, llvm::Type* type,
+        const LLVMBackend::TypeAndValue& typeValue,
+        antlr4::ParserRuleContext* context)
+{
+        if (slot == nullptr || type == nullptr || typeValue.Pointer || typeValue.ElemPointer
+            || typeValue.IsAlias || typeValue.IsArrayView || typeValue.IsInterface
+            || typeValue.IsFunctionPointer || typeValue.IsSimd)
+            return;
+        auto* compiler = compilerLLVM;
+        if (auto* arrayType = llvm::dyn_cast<llvm::ArrayType>(type))
+        {
+            llvm::Type* elementType = type;
+            uint64_t count = 1;
+            while (auto* innerArray = llvm::dyn_cast<llvm::ArrayType>(elementType))
+            {
+                count *= innerArray->getNumElements();
+                elementType = innerArray->getElementType();
+            }
+            compiler->EmitFixedArrayElementWalk(*compiler->builder, slot, elementType, count,
+                [&](llvm::Value* elementSlot) {
+                    EmitGlobalCxxFieldDefaultConstruction(
+                        elementSlot, elementType, typeValue, context);
+                });
+            return;
+        }
+        if (compiler->IsCxxRecord(typeValue.TypeName))
+        {
+            if (!compiler->CxxElementNeedsDefaultConstruction(typeValue.TypeName)) return;
+            if (compiler->RejectUnsupportedCxxLayout(typeValue.TypeName)) return;
+            if (compiler->RejectAbstractCxxClass(typeValue.TypeName, "declare a global field of")) return;
+            std::string ctorError;
+            compiler->TryBindCxxImplicitDefaultCtor(typeValue.TypeName, ctorError);
+            if (!ctorError.empty()) LogErrorContext(context, ctorError);
+            const auto* ctor = compiler->FindCxxDefaultCtor(typeValue.TypeName);
+            if (ctor == nullptr)
+            {
+                const auto* info = compiler->GetCxxClassInfo(typeValue.TypeName);
+                LogErrorContext(context, std::format(
+                    "C++ class '{}' has no default constructor cflat can call{} - a global field of "
+                    "it cannot be constructed; hold it through a pointer instead", typeValue.TypeName,
+                    info != nullptr && info->hasDeletedDefaultCtor ? " (it is deleted)" : ""));
+                return;
+            }
+            compiler->EmitCxxStructorCall(typeValue.TypeName, *ctor, slot, {});
+            return;
+        }
+        auto data = compiler->GetDataStructure(typeValue.TypeName);
+        if (data.StructType == nullptr || data.IsUnion) return;
+        for (unsigned i = 0; i < data.StructFields.size(); ++i)
+        {
+            const auto& field = data.StructFields[i];
+            if (field.IsBitfield || field.IsPadding) continue;
+            llvm::Value* fieldSlot = compiler->builder->CreateStructGEP(
+                data.StructType, slot, i, "global.cxx.field");
+            EmitGlobalCxxFieldDefaultConstruction(
+                fieldSlot, data.StructType->getElementType(i), field, context);
+        }
+}
+
 void MainListener::EmitPendingGlobalCxxConstructions()
 {
         auto pending = std::move(pendingGlobalCxxConstructions_);
         pendingGlobalCxxConstructions_.clear();
+        pending.erase(std::remove_if(pending.begin(), pending.end(), [&](const auto& item) {
+            if (item.Global == nullptr || item.Global->isDeclaration()) return true;
+            if (compilerLLVM->IsCxxRecord(item.TypeValue.TypeName)) return false;
+            return !HasGlobalCxxFieldDefaultConstruction(item.TypeValue);
+        }), pending.end());
         if (pending.empty()) return;
 
         auto* compiler = compilerLLVM;
@@ -1796,6 +1900,12 @@ void MainListener::EmitPendingGlobalCxxConstructions()
             {
                 if (item.Global == nullptr || item.Global->isDeclaration()) continue;
                 const std::string& typeName = item.TypeValue.TypeName;
+                if (!compiler->IsCxxRecord(typeName))
+                {
+                    EmitGlobalCxxFieldDefaultConstruction(
+                        item.Global, item.Global->getValueType(), item.TypeValue, item.Context);
+                    continue;
+                }
                 if (item.TypeValue.ConstArraySize > 0)
                 {
                     EmitFixedArrayDefaultInit(item.Global, item.TypeValue, item.Context);
@@ -6948,6 +7058,17 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                         else
                             pendingGlobalCxxConstructions_.push_back({global, typeAndValue, direct});
                     }
+                    bool explicitZeroDefault = initializer != nullptr
+                        && (initializer->Default() != nullptr
+                            || (initializer->LeftBrace() != nullptr
+                                && initializer->initializerList() == nullptr));
+                    if (global_scope && explicitZeroDefault && !externDeclOnly
+                        && !typeAndValue.Pointer && !typeAndValue.IsArrayView
+                        && !typeAndValue.IsInterface && !typeAndValue.IsAlias
+                        && global != nullptr && !global->isDeclaration()
+                        && !compiler->IsCxxRecord(typeAndValue.TypeName)
+                        && compiler->GetDataStructure(typeAndValue.TypeName).StructType != nullptr)
+                        pendingGlobalCxxConstructions_.push_back({global, typeAndValue, direct});
                     if (!externDeclOnly && DeclSpecHasConst(declSpec)
                         && typeAndValue.TypeName == "string" && initializer != nullptr
                         && initializer->assignmentExpression() != nullptr)

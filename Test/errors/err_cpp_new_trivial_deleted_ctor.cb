@@ -1,0 +1,9 @@
+import cpp "cpp_interop_explicit.h";
+
+expect_error("has no constructor taking 1 argument") {
+    extern int main()
+    {
+        cppexp.NewDeleted* p = new cppexp.NewDeleted(2);
+        return p != nullptr;
+    }
+}

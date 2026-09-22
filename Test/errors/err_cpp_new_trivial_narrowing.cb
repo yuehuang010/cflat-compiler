@@ -1,0 +1,10 @@
+import cpp "cpp_interop_explicit.h";
+
+expect_error("parameter types match these arguments") {
+    extern int main()
+    {
+        double narrowArg = 40000.0;
+        cppexp.NewNarrow* p = new cppexp.NewNarrow(narrowArg);
+        return p != nullptr;
+    }
+}

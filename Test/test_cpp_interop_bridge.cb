@@ -41,6 +41,9 @@
 //   Owning lvalue ternaries at assignment sinks select storage for direct, nested, field,
 //     array-element, and dereference arms; C++ fields copy-assign once, and explicit move
 //     consumes only the selected C++ class arm.
+//   Global CFlat structs with C++ fields construct each field before main through nested
+//     structs and fixed arrays, preserve imported-module order, and keep global lifetime
+//     without exit-time destruction. Regular, local-static, and [cpp] neighbours are covered.
 
 import cpp "library/cpp_interop_basic.h";
 import cpp "library/cpp_interop_basic.cpp";
@@ -63,6 +66,9 @@ import cpp "array";
 // std::function as a MEMBER parameter and as a RETURN type.
 import cpp "library/cpp_interop_stdfn.h";
 import cpp "library/cpp_interop_twin.h";
+import cpp "library/cpp_interop_arrayelem.h";
+import "library/cpp_interop_gfield_a.cb";
+import "library/cpp_interop_gfield_b.cb";
 import "test_helper.cb";
 import "list.cb";
 
@@ -1882,6 +1888,28 @@ int bridge_move_ternary_cpp(bool choose)
     cpptw.Twin right = cpptw.Twin(82);
     cpptw.Twin moved = move (choose ? left : right);
     return moved.value() * 1000 + left.value() * 10 + right.value();
+}
+
+struct GFieldOne { cppa.GTrk item = default; };
+GFieldOne gfieldOne = default;
+struct GFieldPair { cppa.GTrk first = default; int middle; cppa.GTrk last = default; };
+GFieldPair gfieldPair = default;
+struct GFieldInner { cppa.GTrk item = default; };
+struct GFieldOuter { int before; GFieldInner nested = default; int after; };
+GFieldOuter gfieldNested = default;
+struct GFieldArrayHolder { cppa.GTrk item = default; };
+GFieldArrayHolder[3] gfieldArrayHolders = default;
+struct GFieldCppArrayHolder { cppa.GTrk[2] items = default; };
+GFieldCppArrayHolder gfieldCppArray = default;
+GFieldOne gfieldEmptyBrace = {};
+GFieldOne gfieldBare;
+[cpp] struct GFieldBridgeHolder { cppa.GTrk item = default; };
+GFieldBridgeHolder gfieldBridge = default;
+
+int bridge_global_field_static_value()
+{
+    static GFieldOne value = default;
+    return value.item.v;
 }
 
 extern int main(int argc, char** argv)
@@ -4087,6 +4115,35 @@ extern int main(int argc, char** argv)
         || cpptw.live_allocations() != 0) return 1969;
 
     if (bridge_passed != bridge_checks) return 2000;
+
+    // ---- CFlat struct globals with C++ fields (2020-2039) ---------------------------
+    // Twelve GTrk fields across these globals must be constructed before main.
+    // One field: the pre-fix value was zero and no GTrk constructor had run.
+    if (cppa.gctor_count() != 12 || gfieldOne.item.v != 7) return 2020;
+    // Two fields around an int: both constructors and both field values are observable.
+    if (cppa.gctor_count() != 12 || gfieldPair.first.v != 7
+        || gfieldPair.last.v != 7 || gfieldPair.middle != 0) return 2021;
+    // The C++ field is reached through a nested CFlat holder.
+    if (cppa.gctor_count() != 12 || gfieldNested.nested.item.v != 7) return 2022;
+    // Each array element holder owns one independently constructed C++ field.
+    if (cppa.gctor_count() != 12 || gfieldArrayHolders[0].item.v != 7
+        || gfieldArrayHolders[2].item.v != 7) return 2023;
+    // A fixed array of C++ classes is reached through its CFlat holder.
+    if (cppa.gctor_count() != 12 || gfieldCppArray.items[0].v != 7
+        || gfieldCppArray.items[1].v != 7) return 2024;
+    // Empty-brace defaulting follows the same zero-fill path as '= default'.
+    if (cppa.gctor_count() != 12 || gfieldEmptyBrace.item.v != 7) return 2025;
+    // No-initializer globals already use the synthesized CFlat constructor.
+    if (cppa.gctor_count() != 12 || gfieldBare.item.v != 7) return 2026;
+    // The [cpp] aggregate already uses its own constructor path on both binaries.
+    if (cppa.gctor_count() != 12 || gfieldBridge.item.v != 7) return 2027;
+    // Separate imported CFlat modules construct in import order before main.
+    if (cppa.gseq_slot() != 2 || gfieldOrderA.item.v != 1) return 2028;
+    if (cppa.gseq_slot() != 2 || gfieldOrderB.item.v != 2) return 2029;
+    // A function-local static holder remains constructed on its first call.
+    if (bridge_global_field_static_value() != 7 || cppa.gctor_count() != 13) return 2030;
+    // Globals follow the no-exit-destruction ruling; every remaining dtor count must be zero.
+    if (cppa.gdtor_count() != 0) return 2031;
 
     return 0;
 }

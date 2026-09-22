@@ -18,6 +18,9 @@
 //     (copy and move) and by-value returns constructed straight into the local, plus
 //     new/delete and `unique T*` through the C++ operators. Every assertion is an EXACT
 //     instrumented count, so an extra copy or a missed destructor fails here.
+//   `new T(args)` on trivially-copyable imported C++ classes - ordinary, template,
+//     constrained-template, enable_if, explicit-exact and default constructors, plus
+//     a class-typed member. Deleted and narrowing constructors are pinned in err_cpp tests.
 //   HEADER-ONLY C++ - inline free functions (including one that calls another, and one with
 //     a static local), an all-inline nontrivial class, inline static data members as
 //     lifetime counters, and an all-inline VIRTUAL hierarchy with no key function. Nothing
@@ -131,6 +134,7 @@
 //     the fixture owns (a class template with tagged free operator templates, a second one
 //     declaring only == and <=> so the relational forms are C++20 rewrites, two
 //     specializations, and a plain class with NON-template free operators as the accept set).
+//   The default C++ import standard is c++20 (`__cplusplus == 202002L`).
 
 import cpp "library/cpp_interop_basic.h";
 import cpp "library/cpp_interop_basic.cpp";
@@ -3436,5 +3440,41 @@ extern int main()
         r = cppunw.guarded(UnwTempAfterCall, 5); // its call returned; a later call throws
         if (r != -5 || (int)HeapAudit.reportLeaks() != heapBase) return 3198;
     }
+    // Trivially-copyable imported C++ classes still need their user constructors on `new`.
+    {
+        cppexp.NewPlain* p = new cppexp.NewPlain(2, 3);
+        int plainV = p->v;
+        int plainHow = p->how;
+        delete p;
+        if (plainV != 5 || plainHow != 9) return 3190;
+
+        int templateArg = 2;
+        cppexp.NewTemplate* templ = new cppexp.NewTemplate(templateArg);
+        if (templ->v != 22 || templ->how != 1) return 3191;
+        delete templ;
+
+        cppexp.NewReq* required = new cppexp.NewReq((i64)2);
+        if (required->v != 102 || required->how != 2) return 3192;
+        delete required;
+
+        double enabledArg = 2.0;
+        cppexp.NewEnabled* enabled = new cppexp.NewEnabled(enabledArg);
+        if (enabled->v != 20 || enabled->how != 3) return 3193;
+        delete enabled;
+
+        int explicitArg = 2;
+        cppexp.Ex* explicitExact = new cppexp.Ex(explicitArg);
+        if (explicitExact->v != 2) return 3194;
+        delete explicitExact;
+
+        cppexp.NewDefault* defaulted = new cppexp.NewDefault();
+        if (defaulted->v != 41 || defaulted->how != 4) return 3195;
+        delete defaulted;
+
+        cppexp.NewWithMember* member = new cppexp.NewWithMember(2);
+        if (member->inner.v != 52 || member->how != 5) return 3196;
+        delete member;
+    }
+    if (cppi.cpp_std() != 202002L) return 3200;
     return 0;
 }

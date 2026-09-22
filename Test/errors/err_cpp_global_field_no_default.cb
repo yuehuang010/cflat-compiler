@@ -1,0 +1,7 @@
+// The field walk resolves the C++ constructor during the module-initializer pass, so this
+// deferred diagnostic needs a bare file-scope expectation.
+import cpp "cpp_interop_arrayelem.h";
+struct Holder { cppa.NoDef item = default; };
+expect_error("has no default constructor cflat can call (it is deleted) - a global field of it cannot be constructed");
+Holder global = default;
+extern int main() { return 0; }

@@ -1,0 +1,3 @@
+import cpp "cpp_interop_arrayelem.h";
+struct GFieldOrderB { cppa.GSeq item = default; };
+GFieldOrderB gfieldOrderB = default;

@@ -61,6 +61,14 @@
 static const std::string kCxxWrapperPidDecl =
     "template <class T> struct __cflat_pid { typedef T type; };\n";
 
+static std::string ClangClCppStandard(const std::string& standard)
+{
+        std::string value = standard;
+        if (value.starts_with("gnu++")) value.replace(0, 5, "c++");
+        if (value == "c++26") return "c++latest";
+        return value;
+}
+
 // ---- Definitions moved out of LLVMBackend.h (CInterop) ----
 
 struct CHeaderRefusalDep
@@ -1014,7 +1022,7 @@ bool LLVMBackend::CompileCFile(const std::string& cSourcePath, const std::string
         // not clang-cl's /MT default (libcmt) which the freestanding link cannot satisfy. Covers
         // both user .c interop and the imported diagnostic/heap_audit.c.
         std::vector<std::string> argStrs = { clangPath, "/c", "/MD", "/nologo", target, cSourcePath };
-        if (cxxMode) argStrs.push_back("/std:c++20");
+        if (cxxMode) argStrs.push_back("/std:" + ClangClCppStandard(cppStandard_));
         // cflat's own bundled runtime .c files (e.g. diagnostic/heap_audit.c) are compiled
         // freestanding like crashdump.c/cflat_builtins.c: /GS- so they emit no __security_check_
         // cookie reference (that symbol lives in msvcrt.lib, which the freestanding link drops).
@@ -5329,6 +5337,7 @@ std::string LLVMBackend::CxxTypeRequestCacheKey(const CxxRequestGroup& group,
                                                 bool emitDefinitions) const
 {
         std::string key = "|RQ" + cxxSpelling;
+        key += "|STD" + cppStandard_;
         for (const auto& h : group.headers)     key += "|H" + h;
         for (const auto& inc : cIncludeDirs_)   key += "|I" + inc;
         for (const auto& def : cDefines_)       key += "|D" + def;
@@ -7574,11 +7583,12 @@ bool LLVMBackend::RequestCxxFreeFunction(const std::string& functionName,
                                                    return result;
         }());
         const std::string wrapperName = std::format("__cflat_free_{:016x}", hash);
-        if (auto fit = functionTable.find(functionName); fit != functionTable.end())
+        const std::string registrationName = explicitArgs.empty() ? functionName : wrapperName;
+        if (auto fit = functionTable.find(registrationName); fit != functionTable.end())
             for (const auto& symbol : fit->second)
                 if (symbol.External && symbol.UniqueName == wrapperName)
                 {
-                    registeredName = functionName;
+                    registeredName = registrationName;
                     return true;
                 }
         std::string wrapperSource = "extern \"C\" __attribute__((weak)) decltype(auto) "
@@ -7614,13 +7624,13 @@ bool LLVMBackend::RequestCxxFreeFunction(const std::string& functionName,
                 lastError = FirstCxxErrorLine(wrapperError);
                 continue;
             }
-            bound.name = functionName;
+            bound.name = registrationName;
             RegisterCSignatures({ bound }, group.headers.front());
-            if (auto fit = functionTable.find(functionName); fit != functionTable.end())
+            if (auto fit = functionTable.find(registrationName); fit != functionTable.end())
                 for (const auto& symbol : fit->second)
                     if (symbol.External && symbol.UniqueName == wrapperName)
                     {
-                        registeredName = functionName;
+                        registeredName = registrationName;
                         cxxTemplateOwnerGroup_[cxxBase] = primary;
                         StoreCxxTemplateOwnerMemo(cxxBase, primary);
                         return true;
@@ -10304,7 +10314,8 @@ bool LLVMBackend::ExtractCSignatures(const std::string& cSourcePath, const std::
 
         // Defines can gate which functions a .c defines, so fold them into the cache key
         // (the file path alone is the LSP identity; the key is path + defines).
-        std::string cacheKey = fileForLsp + (cxxMode ? "|CXX" : "|C");
+        std::string cacheKey = fileForLsp
+            + (cxxMode ? "|CXX|STD" + cppStandard_ : "|C");
         for (const auto& def : cDefines_) cacheKey += "|D" + def;
 
         // Hash the file at most once per call, and only when actually needed.
@@ -13940,7 +13951,7 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
         for (const auto& def : extraDefines)   cacheKey += "|d" + def;
         // C and C++ mode bind the same header differently (qualified names, linkage names),
         // so they must never share a cache entry.
-        if (cppMode) cacheKey += "|CXX";
+        if (cppMode) cacheKey += "|CXX|STD" + cppStandard_;
         /*
          * LSP analysis binds a C++ group with assumeInlineDefinitions instead of emitDefinitions:
          * every inline member gets a linkage name and a callable surface, but no body is emitted
@@ -13991,7 +14002,8 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
         }
         const uint64_t refusalGroupKey = CHeaderDiskCacheKey(
             realPaths, cIncludeDirs_, cDefines_, extraDefines,
-            targetWindows_, CInteropTargetTriple(), cppMode, cxxDefinitionsEmitted);
+            targetWindows_, CInteropTargetTriple(), cppMode, cxxDefinitionsEmitted,
+            cppStandard_);
 
         std::vector<CSigEntry> hitSigs;
         std::vector<std::string> hitDepPaths;

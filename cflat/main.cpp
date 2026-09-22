@@ -190,6 +190,7 @@ int main(int argc, char* argv[])
     args.addFlag("no-cache", 0, "Bypass the core bitcode cache and reparse core libraries from source");
     args.addOption("error-on-cpp-reparse", 0, "cold|warm. Fail the compile when a C/C++ translation unit (header group, C header, imported .c/.cpp extraction or object compile) is parsed more than once (cold) or at all (warm: the TU cache must serve every one). -v logs each parse as 'clang parse:'");
     args.addFlag("cpp-strict-noexcept", 0, "Refuse calls to C++ functions that may throw (no noexcept specification). Default follows clang: the call is allowed and an escaping exception terminates the program");
+    args.addOption("cpp-std", 0, "C++ standard for every C++ import (c++17, c++20, c++23, c++26, gnu++17, gnu++20, gnu++23, gnu++26; default: c++20)", "c++20");
     args.addMultiOption("symbol", 0, "Look up one or more symbols (IDE-style quick search) and exit. An exact name match prints detailed info (kind, signature, location, members); a miss suggests the closest symbols. Indexes the positional source file if given, otherwise the whole core library");
     args.addMultiOption("symbol-dump", 0, "Dump symbol info for source elements, then exit (repeatable). Selector: line:<n>, line:<a>-<b>, or function:<name>. Requires a positional source file");
     args.addMultiOption("symbol-dump-ir", 0, "Dump unoptimized LLVM IR for a selector, then exit (repeatable). Selector: module, line:<n>, or function:<name>. Requires a positional source file");
@@ -574,6 +575,11 @@ int main(int argc, char* argv[])
         compiler.SetBatchMode(true);
         compiler.SetNoCache(args.hasFlag("no-cache") || isolatedPolicy.has_value());
         compiler.SetCppStrictNoexcept(args.hasFlag("cpp-strict-noexcept"));
+        try
+        {
+            if (!compiler.SetCppStandard(args.getOption("cpp-std").value_or("c++20"))) return 1;
+        }
+        catch (const CompilerAbortException&) { return 1; }
 
         int failures = 0;
         for (size_t i = 0; i < args.positionalCount(); ++i)
@@ -626,6 +632,7 @@ int main(int argc, char* argv[])
     auto isolatedPolicy = ConfigureIsolatedMode(compiler, args);
     compiler.SetNoCache(args.hasFlag("no-cache") || isolatedPolicy.has_value());
     compiler.SetCppStrictNoexcept(args.hasFlag("cpp-strict-noexcept"));
+    if (!compiler.SetCppStandard(args.getOption("cpp-std").value_or("c++20"))) return 1;
     if (auto sub = args.getOption("subsystem"))
     {
         if (*sub != "console" && *sub != "windows")

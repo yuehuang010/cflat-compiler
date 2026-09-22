@@ -3369,6 +3369,9 @@ private:
     // File-scope objects (and arrays of them) of a foreign C++ class whose default constructor
     // is nontrivial: the call cannot be a constant initializer, so it runs from a module ctor.
     std::vector<PendingGlobalDefaultConstruction> pendingGlobalCxxConstructions_;
+    bool HasGlobalCxxFieldDefaultConstruction(const LLVMBackend::TypeAndValue& typeValue);
+    void EmitGlobalCxxFieldDefaultConstruction(llvm::Value* slot, llvm::Type* type,
+        const LLVMBackend::TypeAndValue& typeValue, antlr4::ParserRuleContext* context);
 
     // RAII guard: sets global_scope to false on entry and restores the saved value on exit.
     struct GlobalScopeGuard

@@ -3,6 +3,7 @@
 // it; the spelled form `cppexp.Ex(5)` stays legal. The non-explicit `Options(double)` shapes
 // below are the ACCEPT set: they must keep converting at every parameter kind C++ allows.
 #pragma once
+#include <type_traits>
 #include <vector>
 
 namespace cppexp {
@@ -69,5 +70,57 @@ struct Optim {
 struct OptimCref {
     int v;
     OptimCref(std::vector<int> p, const Options& o) : v((int)p.size() * 2000 + (int)(o.lr * 100)) {}
+};
+
+struct NewPlain {
+    int v;
+    int how;
+    NewPlain(int a, int b) : v(a + b), how(9) {}
+};
+
+struct NewTemplate {
+    int v;
+    int how;
+    template<class T> NewTemplate(T x) : v((int)x + 20), how(1) {}
+};
+
+struct NewReq {
+    int v;
+    int how;
+    template<class T> requires (sizeof(T) == 8)
+    NewReq(T x) : v((int)x + 100), how(2) {}
+};
+
+struct NewEnabled {
+    int v;
+    int how;
+    template<class T, std::enable_if_t<std::is_same_v<T, double>, int> = 0>
+    NewEnabled(T x) : v((int)(x * 10.0)), how(3) {}
+};
+
+struct NewDefault {
+    int v;
+    int how;
+    NewDefault() : v(41), how(4) {}
+};
+
+struct NewInner {
+    int v;
+    NewInner(int x) : v(x + 50) {}
+};
+
+struct NewWithMember {
+    NewInner inner;
+    int how;
+    NewWithMember(int x) : inner(x), how(5) {}
+};
+
+struct NewDeleted {
+    NewDeleted(int) = delete;
+};
+
+struct NewNarrow {
+    int v;
+    NewNarrow(int x) : v(x) {}
 };
 }
