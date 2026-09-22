@@ -312,7 +312,7 @@ path.
 For an opus round: spawn (round 1 under fallback, or round 2) or continue via
 SendMessage (any later opus round) a code-review agent at **opus** in the
 worktree. For a codex round: run, in the worktree,
-`codex exec -c model="gpt-5.6-luna" -c model_reasoning_effort="high" "<prompt>"`.
+`codex exec -c model="gpt-6-luna" -c model_reasoning_effort="high" "<prompt>"`.
 Either way, the reviewer for that round reviews `git diff master...HEAD` in
 that worktree for correctness bugs, and for the CLAUDE.md constraints listed
 above. Give it the fix agent's coverage matrix and ask it to audit the matrix,
