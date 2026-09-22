@@ -298,7 +298,7 @@ seq.fetchAdd(1);
 - `core/latch.cb` - `Latch` countdown; `countDown`, `wait` (one-shot - see [Barrier](#barrier-corebarriercb) for the reusable equivalent)
 - `core/barrier.cb` - `barrier` / `spin_barrier` reusable rendezvous; `arrive_and_wait`
 - `core/rwlock.cb` - `rwlock`; taken with `lock(rw.read)` (shared) or `lock(rw.write)` / `lock(rw)` (exclusive)
-- `core/channel.cb` - `channel<T>` blocking MPMC queue; `send`, `recv`, `tryRecv`
+- `core/channel.cb` - `channel<T>` blocking MPMC queue; `send`, `receive`, `try_receive`, `add_producer`, `close_producer`
 - `core/spsc_queue.cb` - `spsc_queue<T>` wait-free single-producer/single-consumer ring
 
 ```c
@@ -306,8 +306,11 @@ import "channel.cb";
 
 channel<int> ch;
 ch.init(1024);
+ch.add_producer();
 ch.send(42);
-int v = ch.receive();   // 42
+ch.close_producer();
+int v = 0;
+while (ch.receive(&v)) { /* process v; the loop ends after close_producer() */ }
 ```
 
 **Piping (`operator>>`)** - `src >> dst` spawns a forwarder that drains every value from `src` into `dst`. It uses borrow semantics: when `src`'s last producer closes (`close_producer()`), the forwarder drains the remaining items and closes `dst`. Pipes can be chained, and EOF propagates through every stage:

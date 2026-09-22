@@ -35,6 +35,7 @@
 
 #include "platform/GeneratedParser.h"
 #include "LLVMBackend.h"
+#include "CxxIncrementalGroup.h"
 #include "MainListener.h"
 #include "GrammarTreeListener.h"
 #include "Version.h"
@@ -2552,6 +2553,9 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
 
     if (exePath)
     {
+        // The live C++ interpreters retain the shared AST until all requests finish. Release them
+        // before object emission so the linker does not compete with their resident AST memory.
+        cxxIncrementalGroups_.clear();
         llvm::TimeTraceScope emitScope("EmitExecutable", *exePath);
         std::string emitPath = *exePath;
         bool isolatedOutput = isolatedPolicy_.has_value();
@@ -4455,6 +4459,7 @@ void LLVMBackend::ResetForReanalysis()
     cppInteropUsed_ = false;
     cxxProgramEhGuardAttempted_ = false;
     cxxImportGroups_.clear();
+    cxxIncrementalGroups_.clear();
     activeCxxRequestGroup_ = nullptr;
     cxxTemplateOwnerGroup_.clear();
     cxxFunctionTemplates_.clear();

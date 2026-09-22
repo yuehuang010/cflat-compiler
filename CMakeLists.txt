@@ -161,6 +161,7 @@ set(CFLAT_SOURCES
   ${CFLAT_DIR}/LLVMBackend_OwnershipTemps.cpp
   ${CFLAT_DIR}/LLVMBackend_CodegenHelpers.cpp
   ${CFLAT_DIR}/LLVMBackend_CInterop.cpp
+  ${CFLAT_DIR}/CxxIncrementalGroup.cpp
   ${CFLAT_DIR}/AppResources.cpp
   ${CFLAT_DIR}/LLVMBackend_EmitAndLink.cpp
   ${CFLAT_DIR}/LLVMBackend_Interfaces.cpp
@@ -278,6 +279,7 @@ set_source_files_properties(${ANTLR_GEN_SOURCES} ${WINMD_SOURCES}
 
 # Clang frontend libs (imported targets carry their own transitive deps).
 set(CLANG_LIBS
+  clangInterpreter
   clangFrontend clangFrontendTool clangTooling clangToolingCore
   clangParse clangSema clangAnalysis clangEdit clangAST clangASTMatchers
   clangLex clangDriver clangSerialization clangCodeGen clangRewrite

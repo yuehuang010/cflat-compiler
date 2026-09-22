@@ -2,10 +2,16 @@ p3
 
 # A C++ header disk-cache entry is validated only against its OWN mtime+hash, so a sibling header in the same request group can poison it permanently
 
-RULED 2026-09-20: stopgap first - a clang run that reports errors is never written to the disk
-cache; its result lives in ONE in-memory most-recent slot so the LSP still gets a fast,
-partially correct answer while a header is broken. Request-group keying stays open here after
-the stopgap lands.
+RULED 2026-09-20, stopgap LANDED as 1cd4d31a. Measured first: "any clang error -> no store" is
+too broad (clean SDK headers report intentional macro-probe errors in the stub), and in-header
+errors were already refused. The actual hole was a header that leaves a scope OPEN: clang's
+"expected '}'" lands in the generated stub, which the in-scope error count skips. The stub now
+carries a sentinel after the includes; a sentinel outside file scope refuses the group, names the
+scope, and nothing is stored. One in-memory slot remembers the last refusal (validated by stat of
+every file the failed TU entered) so the LSP does not re-run clang. Pinned by
+Test/errors/err_cpp_header_leaves_scope_open.cb. STILL OPEN here: a sibling / transitive edit
+that changes extraction WITHOUT any error (a new `using namespace`, an added #include) - that is
+the request-group / always-on dependency keying question below.
 
 Found 2026-09-17 while root-causing a post-rebase "regression" on fix/cpp-const-ref-scalar that
 turned out to be a poisoned cache entry, not a code defect. Cost one review round.

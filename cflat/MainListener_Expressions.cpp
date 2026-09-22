@@ -11240,6 +11240,15 @@ LLVMBackend::NamedVariable MainListener::ParseUnaryExpression(CFlatParser::Unary
                 }
                 else
                 {
+                    // An aggregate operand has no truth value; without this LLVM asserts in
+                    // CreateNot instead of reporting it.
+                    if (newValue != nullptr && !newValue->getType()->isSingleValueType())
+                    {
+                        LogErrorContext(ctx, std::format(
+                            "operator '!' needs a bool, number or pointer operand; '{}' has no operator bool",
+                            namedVar.TypeAndValue.TypeName));
+                        newValue = compiler->builder->getInt1(false);
+                    }
                     // Logical negation yields a plain rvalue bool, whatever the operand was
                     // (int, pointer, float). Reset the type so a negated pointer/owning/view
                     // operand cannot carry those flags into the result.

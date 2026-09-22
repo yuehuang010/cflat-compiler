@@ -28,6 +28,7 @@
 #include "clang/AST/VTableBuilder.h"
 #include "clang/AST/BaseSubobject.h"
 #include "clang/Basic/Diagnostic.h"
+#include "clang/Basic/DiagnosticSema.h"
 #include "clang/Basic/TargetInfo.h"
 #include "clang/CodeGen/CGFunctionInfo.h"
 #include "clang/CodeGen/CodeGenABITypes.h"
@@ -672,6 +673,7 @@ namespace cflat_cinterop
             // Set in BeginSourceFileAction so the ABI pass can build a CodeGenerator against the
             // very invocation that produced the AST (same triple, same target features).
             CompilerInstance* ci = nullptr;
+            TranslationUnitDecl* contextRoot = nullptr;
             // cxxMode only: (index into out.sigs, the decl it came from). Resolved after the
             // traversal so a single CodeGenerator serves every declaration.
             std::vector<std::pair<size_t, const FunctionDecl*>> abiWork;
@@ -698,7 +700,15 @@ namespace cflat_cinterop
             // inline / constexpr static data members whose storage lives in the companion module.
             std::vector<const CXXRecordDecl*> vtableWork;
             std::vector<const VarDecl*> varEmitWork;
-            std::vector<std::string> incompleteCxxTypes;
+            struct IncompleteCxxType
+            {
+                QualType type;
+                std::string spelling;
+            };
+            std::vector<IncompleteCxxType> incompleteCxxTypes;
+            // Spellings still incomplete after the harvest; the QualTypes above die with the
+            // CompilerInstance, so anything read after RunAction must use this instead.
+            std::vector<std::string> stillIncompleteSpellings;
             ExtractState(const ExtractRequest& r, ExtractResult& o) : req(r), out(o)
             {
                 for (const auto& d : r.inScopeDirs)
@@ -742,9 +752,11 @@ namespace cflat_cinterop
             // instantiation is not required for the enclosing type's ABI and may be ill-formed.
             if (specialization->getSpecializedTemplate()->getDeclContext()->isRecord()) return;
             std::string spelling = CanonicalSpelling(ctx, qt);
-            if (std::find(st.incompleteCxxTypes.begin(), st.incompleteCxxTypes.end(), spelling)
-                    == st.incompleteCxxTypes.end())
-                st.incompleteCxxTypes.push_back(std::move(spelling));
+            if (std::find_if(st.incompleteCxxTypes.begin(), st.incompleteCxxTypes.end(),
+                             [&](const ExtractState::IncompleteCxxType& queued) {
+                                 return queued.spelling == spelling;
+                             }) == st.incompleteCxxTypes.end())
+                st.incompleteCxxTypes.push_back({ qt, std::move(spelling) });
         }
 
         void QueueFunctionPointerAbi(ExtractState& st, ASTContext& ctx, QualType qt)
@@ -2362,13 +2374,14 @@ namespace cflat_cinterop
              * only producer of records. A ClassTemplateSpecializationDecl is not a child of its
              * DeclContext, which is why the typedef (a real top-level decl) is the handle.
              */
-            bool ProcessTypeRequests()
+            bool ProcessTypeRequests(TranslationUnitDecl* root)
             {
                 for (size_t i = 0; i < st.req.cxxTypeRequests.size(); ++i)
                 {
-                    const std::string marker = "__cflat_req_" + std::to_string(i);
+                    const std::string marker = st.req.cxxRequestMarkerPrefix
+                                              + std::to_string(i);
                     const TypedefNameDecl* td = nullptr;
-                    for (Decl* d : ctx.getTranslationUnitDecl()->decls())
+                    for (Decl* d : root->decls())
                     {
                         auto* cand = llvm::dyn_cast<TypedefNameDecl>(d);
                         if (cand != nullptr && cand->getNameAsString() == marker) { td = cand; break; }
@@ -2502,7 +2515,9 @@ namespace cflat_cinterop
                         if (auto* dc = llvm::dyn_cast<DeclContext>(decl))
                             for (Decl* child : dc->decls()) walkOperators(child);
                     };
-                    walkOperators(ctx.getTranslationUnitDecl());
+                    walkOperators(root);
+                    if (st.contextRoot != nullptr && st.contextRoot != root)
+                        walkOperators(st.contextRoot);
                     for (Decl* d : st.announcedDecls)
                     {
                         collectOperator(d);
@@ -2536,7 +2551,7 @@ namespace cflat_cinterop
                 return true;
             }
 
-            void ProcessFunctionRequests()
+            void ProcessFunctionRequests(TranslationUnitDecl* root)
             {
                 std::function<void(Decl*)> walk = [&](Decl* decl) {
                     if (decl == nullptr) return;
@@ -2553,7 +2568,7 @@ namespace cflat_cinterop
                     if (auto* dc = llvm::dyn_cast<DeclContext>(decl))
                         for (Decl* child : dc->decls()) walk(child);
                 };
-                walk(ctx.getTranslationUnitDecl());
+                walk(root);
             }
 
             bool VisitTypedefNameDecl(TypedefNameDecl* td)
@@ -3052,8 +3067,10 @@ namespace cflat_cinterop
          * is what lets the recipe survive the on-disk signature cache.
          */
         void ComputeCxxMemberAbi(ExtractState& st, ASTContext& ctx,
+                                 TranslationUnitDecl* root,
                                  clang::CodeGen::CodeGenModule& cgm, CodeGenerator& cg);
-        void EmitCxxDefinitions(ExtractState& st, ASTContext& ctx, CodeGenerator& cg);
+        void EmitCxxDefinitions(ExtractState& st, ASTContext& ctx,
+                                TranslationUnitDecl* root, CodeGenerator& cg);
 
         /*
          * Plain header records are not template requests, so no later instantiation pass asks
@@ -3388,7 +3405,7 @@ namespace cflat_cinterop
             }
         }
 
-        void ComputeCxxAbi(ExtractState& st, ASTContext& ctx)
+        void ComputeCxxAbi(ExtractState& st, ASTContext& ctx, TranslationUnitDecl* root)
         {
             if (st.ci == nullptr) return;
             DefineHeaderImplicitSpecialMembers(st);
@@ -3455,13 +3472,14 @@ namespace cflat_cinterop
                 st.out.functionPointerAbis.push_back(std::move(plan));
             }
 
-            ComputeCxxMemberAbi(st, ctx, cgm, *cg);
+            ComputeCxxMemberAbi(st, ctx, root, cgm, *cg);
 
             if (st.req.emitDefinitions)
             {
                 llvm::TimeTraceScope emitScope("CxxDefinitionEmit");
-                EmitCxxDefinitions(st, ctx, *cg);
+                EmitCxxDefinitions(st, ctx, root, *cg);
             }
+            (void)cg->ReleaseModule();
         }
 
         /*
@@ -3473,12 +3491,13 @@ namespace cflat_cinterop
          * was emitted, so nothing here can turn an unbindable member into a wrong call.
          */
         void BindCxxVirtualThunk(ExtractState& st, ASTContext& ctx,
+                                 TranslationUnitDecl* root,
                                  clang::CodeGen::CodeGenModule& cgm, RawCxxMember& m,
                                  const std::string& name)
         {
             using namespace clang::CodeGen;
             const FunctionDecl* thunk = nullptr;
-            for (NamedDecl* nd : ctx.getTranslationUnitDecl()->lookup(
+            for (NamedDecl* nd : root->lookup(
                      DeclarationName(&ctx.Idents.get(name))))
                 if (const auto* fd = llvm::dyn_cast<FunctionDecl>(nd))
                     if (fd->doesThisDeclarationHaveABody()) { thunk = fd; break; }
@@ -3510,6 +3529,7 @@ namespace cflat_cinterop
         // from Clang's own GetAddrOfGlobal declaration - that is the only source that knows a
         // structor returns 'this' on Itanium/Darwin.
         void ComputeCxxMemberAbi(ExtractState& st, ASTContext& ctx,
+                                 TranslationUnitDecl* root,
                                  clang::CodeGen::CodeGenModule& cgm, CodeGenerator& cg)
         {
             using namespace clang::CodeGen;
@@ -3616,9 +3636,9 @@ namespace cflat_cinterop
                 // Slot unusable and no fallback path to the member, or an implicit most-derived
                 // argument cflat cannot pass: hand it to the thunk Clang generated for it.
                 if (CxxMemberNeedsVirtualThunk(m))
-                    BindCxxVirtualThunk(st, ctx, cgm, m, CxxVirtualThunkName(m.linkageName));
+                    BindCxxVirtualThunk(st, ctx, root, cgm, m, CxxVirtualThunkName(m.linkageName));
                 else if (CxxCtorNeedsVbaseThunk(rec, m))
-                    BindCxxVirtualThunk(st, ctx, cgm, m, CxxVbaseCtorThunkName(m.linkageName));
+                    BindCxxVirtualThunk(st, ctx, root, cgm, m, CxxVbaseCtorThunkName(m.linkageName));
             }
         }
 
@@ -3638,7 +3658,8 @@ namespace cflat_cinterop
          * The referencing loop takes plain GlobalDecls, so a later milestone can add template
          * specializations to it without changing anything else.
          */
-        void EmitCxxDefinitions(ExtractState& st, ASTContext& ctx, CodeGenerator& cg)
+        void EmitCxxDefinitions(ExtractState& st, ASTContext& ctx,
+                                TranslationUnitDecl* root, CodeGenerator& cg)
         {
             /*
              * Plain-header implicit special members are defined and marked while Sema is still
@@ -3848,7 +3869,7 @@ namespace cflat_cinterop
                     return true;
                 }
             } errorBodies(*errorReach);
-            errorBodies.TraverseDecl(ctx.getTranslationUnitDecl());
+            errorBodies.TraverseDecl(root);
             for (Decl* d : st.announcedDecls) errorBodies.TraverseDecl(d);
             for (FunctionDecl* fd : errorBodies.direct)
             {
@@ -3859,11 +3880,32 @@ namespace cflat_cinterop
             }
 
             // Phase 1: show Clang the whole translation unit. Inline definitions stay deferred.
-            for (Decl* d : ctx.getTranslationUnitDecl()->decls())
+            for (Decl* d : root->decls())
                 emitDecl(d, emitDecl);
             // Plus everything Sema announced that decls() does not contain (see announcedDecls).
             for (Decl* d : st.announcedDecls)
                 emitDecl(d, emitDecl);
+
+            // A live Interpreter does not replay Sema's announced member definitions. Feed the
+            // resolved records' body-bearing methods directly, matching a real CodeGen consumer.
+            if (st.contextRoot != nullptr)
+            {
+                std::unordered_set<const CXXRecordDecl*> records;
+                for (const auto& w : st.memberAbiWork)
+                    if (w.md != nullptr) records.insert(w.md->getParent()->getDefinition());
+                std::unordered_set<const FunctionDecl*> methods;
+                for (const CXXRecordDecl* rd : records)
+                {
+                    if (rd == nullptr) continue;
+                    for (const CXXMethodDecl* md : rd->methods())
+                    {
+                        if (!md->doesThisDeclarationHaveABody() || md->isInvalidDecl()
+                            || isDependentCodeGenDecl(md) || !methods.insert(md).second)
+                            continue;
+                        cg.HandleTopLevelDecl(DeclGroupRef(const_cast<CXXMethodDecl*>(md)));
+                    }
+                }
+            }
             /*
              * An inline static data member is not a top-level decl, and unlike a member FUNCTION
              * there is no lexically-in-a-record fallback that finds it later - CodeGen only knows
@@ -3899,7 +3941,8 @@ namespace cflat_cinterop
                     return true;
                 }
             } usedStaticVars(st);
-            usedStaticVars.TraverseDecl(ctx.getTranslationUnitDecl());
+            usedStaticVars.TraverseDecl(root);
+            for (Decl* d : st.announcedDecls) usedStaticVars.TraverseDecl(d);
 
             for (const VarDecl* vd : st.varEmitWork)
                 if (vd != nullptr && !declHasErrors(vd))
@@ -3964,7 +4007,8 @@ namespace cflat_cinterop
                     return true;
                 }
             } usedFunctions(usedFunctionWork);
-            usedFunctions.TraverseDecl(ctx.getTranslationUnitDecl());
+            usedFunctions.TraverseDecl(root);
+            for (Decl* d : st.announcedDecls) usedFunctions.TraverseDecl(d);
             for (const FunctionDecl* fd : usedFunctionWork)
             {
                 cg.HandleTopLevelDecl(DeclGroupRef(const_cast<FunctionDecl*>(fd)));
@@ -4112,6 +4156,129 @@ namespace cflat_cinterop
             st.out.emittedDefinitions = defs;
         }
 
+        void ResetHarvestState(ExtractState& st)
+        {
+            st.out.sigs.clear();
+            st.out.functionTemplates.clear();
+            st.out.enums.clear();
+            st.out.records.clear();
+            st.out.typedefs.clear();
+            st.out.functionPointerAbis.clear();
+            st.out.globals.clear();
+            st.out.macros.clear();
+            st.out.funcMacros.clear();
+            st.out.usingDirectives.clear();
+            st.out.namespaceAliases.clear();
+            st.out.weakPromoteSymbols.clear();
+
+            st.emittedProbes.clear();
+            st.emittedGlobals.clear();
+            st.emittedUsingDecls.clear();
+            st.emittedOpaqueForward.clear();
+            st.emittedDefinedRecords.clear();
+            st.emittedRequestedRecords.clear();
+            st.abiWork.clear();
+            st.functionPointerAbiWork.clear();
+            st.functionPointerAbiSeen.clear();
+            st.emittedFunctionTemplates.clear();
+            st.memberAbiWork.clear();
+            st.headerSpecialMemberWork.clear();
+            st.headerSpecialMemberSeen.clear();
+            st.vtableWork.clear();
+            st.varEmitWork.clear();
+        }
+
+        size_t CompleteIncompleteCxxTypes(ExtractState& st)
+        {
+            if (st.ci == nullptr || !st.ci->hasSema() || st.incompleteCxxTypes.empty()) return 0;
+            Sema& sema = st.ci->getSema();
+            clang::Scope tuScope(nullptr, clang::Scope::DeclScope, st.ci->getDiagnostics());
+            const bool lendScope = sema.TUScope == nullptr;
+            if (lendScope) sema.TUScope = &tuScope;
+            struct ScopeReset
+            {
+                Sema& sema;
+                bool active;
+                ~ScopeReset() { if (active) sema.TUScope = nullptr; }
+            } scopeReset{sema, lendScope};
+
+            for (const auto& queued : st.incompleteCxxTypes)
+            {
+                if (!queued.type->isIncompleteType()) continue;
+                const auto* cxx = queued.type->getAsCXXRecordDecl();
+                if (cxx == nullptr) continue;
+                sema.RequireCompleteType(cxx->getLocation(), queued.type,
+                                         diag::err_incomplete_type);
+            }
+            sema.PerformPendingInstantiations();
+
+            size_t completed = 0;
+            for (const auto& queued : st.incompleteCxxTypes)
+                if (!queued.type->isIncompleteType()) ++completed;
+            return completed;
+        }
+
+        void HarvestTranslationUnit(ExtractState& st, ASTContext& ctx,
+                                     TranslationUnitDecl* root, bool checkHeader,
+                                     bool runAbi = true)
+        {
+            if (checkHeader)
+            {
+                RecordInScopeHeaderErrors(st);
+                RecordHeaderScopeError(st, ctx);
+                if (st.out.headerErrors > 0)
+                {
+                    if (st.req.verbose)
+                        std::cout << std::format(
+                            "[verbose]   bound header does not compile: {}\n",
+                            st.out.firstHeaderError);
+                    return;
+                }
+            }
+            DeclVisitor v(ctx, st);
+            {
+                CxxExtractionStageTimer harvest(st.req.verbose && st.req.cxxMode,
+                                                 "record/sig harvest");
+                if (st.req.cxxTypeRequests.empty() && st.req.cxxFunctionWrapperNames.empty())
+                    v.TraverseDecl(root);
+                else if (!st.req.cxxTypeRequests.empty() && !v.ProcessTypeRequests(root)) return;
+                else v.ProcessFunctionRequests(root);
+            }
+            if (st.req.cxxMode && st.req.autoInstantiateCxxTypes
+                && !st.incompleteCxxTypes.empty())
+            {
+                const size_t completed = CompleteIncompleteCxxTypes(st);
+                if (st.req.verbose)
+                    std::cout << std::format(
+                        "[verbose]   completed {} incomplete C++ specializations in place\n",
+                        completed);
+                if (completed != 0)
+                {
+                    ResetHarvestState(st);
+                    CxxExtractionStageTimer reharvest(st.req.verbose,
+                                                       "record/sig re-harvest");
+                    DeclVisitor refreshed(ctx, st);
+                    if (st.req.cxxTypeRequests.empty()
+                        && st.req.cxxFunctionWrapperNames.empty())
+                        refreshed.TraverseDecl(root);
+                    else if (!st.req.cxxTypeRequests.empty()
+                             && !refreshed.ProcessTypeRequests(root)) return;
+                    else refreshed.ProcessFunctionRequests(root);
+                }
+            }
+            st.stillIncompleteSpellings.clear();
+            for (const auto& queued : st.incompleteCxxTypes)
+                if (queued.type->isIncompleteType())
+                    st.stillIncompleteSpellings.push_back(queued.spelling);
+            if (st.req.cxxMode && runAbi)
+            {
+                llvm::TimeTraceScope abiScope("CxxAbiArrange");
+                CxxExtractionStageTimer codegen(st.req.verbose,
+                                                 "stage-2 CodeGen/companion emission");
+                ComputeCxxAbi(st, ctx, root);
+            }
+        }
+
         struct ExtractConsumer : public ASTConsumer
         {
             ExtractState& st;
@@ -4134,36 +4301,7 @@ namespace cflat_cinterop
             }
             void HandleTranslationUnit(ASTContext& ctx) override
             {
-                // A bound header clang rejected leaves invalid declarations behind, and neither
-                // the harvest nor the ABI/CodeGen pass below is safe to run over them - both walk
-                // into Clang machinery a real driver would never reach after an error. The caller
-                // refuses the bind with the diagnostic instead.
-                RecordInScopeHeaderErrors(st);
-                RecordHeaderScopeError(st, ctx);
-                if (st.out.headerErrors > 0)
-                {
-                    if (st.req.verbose)
-                        std::cout << std::format(
-                            "[verbose]   bound header does not compile: {}\n",
-                            st.out.firstHeaderError);
-                    return;
-                }
-                DeclVisitor v(ctx, st);
-                {
-                    CxxExtractionStageTimer harvest(st.req.verbose && st.req.cxxMode,
-                                                     "record/sig harvest");
-                    if (st.req.cxxTypeRequests.empty() && st.req.cxxFunctionWrapperNames.empty())
-                        v.TraverseDecl(ctx.getTranslationUnitDecl());
-                    else if (!st.req.cxxTypeRequests.empty() && !v.ProcessTypeRequests()) return;
-                    else v.ProcessFunctionRequests();
-                }
-                if (st.req.cxxMode)
-                {
-                    llvm::TimeTraceScope abiScope("CxxAbiArrange");
-                    CxxExtractionStageTimer codegen(st.req.verbose,
-                                                     "stage-2 CodeGen/companion emission");
-                    ComputeCxxAbi(st, ctx);
-                }
+                HarvestTranslationUnit(st, ctx, ctx.getTranslationUnitDecl(), true);
             }
         };
 
@@ -4322,6 +4460,42 @@ namespace cflat_cinterop
         }
     } // namespace
 
+    bool ExtractCxxIncremental(const ExtractRequest& req, clang::CompilerInstance& ci,
+                               clang::TranslationUnitDecl* root,
+                               clang::TranslationUnitDecl* headerRoot,
+                               const std::vector<clang::TranslationUnitDecl*>& extraRoots,
+                               llvm::Module* module,
+                               ExtractResult& out, std::string& err)
+    {
+        if (root == nullptr)
+        {
+            err = "incremental parse returned no translation-unit part";
+            return false;
+        }
+        (void)module;
+        ExtractState st(req, out);
+        st.ci = &ci;
+        st.contextRoot = headerRoot;
+        const clang::TargetInfo& target = ci.getTarget();
+        out.longDoubleWidth = target.getLongDoubleWidth();
+        out.longDoubleIsIEEEDouble =
+            &target.getLongDoubleFormat() == &llvm::APFloat::IEEEdouble();
+        out.targetTriple = target.getTriple().str();
+        if (req.emitDefinitions && headerRoot != nullptr)
+        {
+            for (clang::Decl* decl : headerRoot->decls()) st.announcedDecls.push_back(decl);
+        }
+        if (req.emitDefinitions && root != headerRoot)
+            for (clang::Decl* decl : root->decls()) st.announcedDecls.push_back(decl);
+        if (headerRoot != nullptr && headerRoot != root)
+            HarvestTranslationUnit(st, ci.getASTContext(), headerRoot, false, false);
+        for (clang::TranslationUnitDecl* extra : extraRoots)
+            if (extra != nullptr && extra != root && extra != headerRoot)
+                HarvestTranslationUnit(st, ci.getASTContext(), extra, false, false);
+        HarvestTranslationUnit(st, ci.getASTContext(), root, false, true);
+        return true;
+    }
+
     bool ExtractCInterop(const ExtractRequest& req, ExtractResult& out, std::string& err)
     {
         ExtractState st(req, out);
@@ -4395,58 +4569,67 @@ namespace cflat_cinterop
             if (ok && req.cxxMode && req.autoInstantiateCxxTypes
                 && !st.incompleteCxxTypes.empty())
             {
-                ExtractRequest retry = req;
-                retry.autoInstantiateCxxTypes = false;
-                retry.source = req.source;
-                for (const std::string& spelling : st.incompleteCxxTypes)
-                    retry.source += "\ntemplate class " + spelling + ";\n";
-                ExtractResult retried;
-                std::string retryError;
-                if (ExtractCInterop(retry, retried, retryError))
+                // The CompilerInstance is gone; only the spelling snapshot is safe to read.
+                const std::vector<std::string>& incompleteSpellings = st.stillIncompleteSpellings;
+                if (!incompleteSpellings.empty())
                 {
-                    bool recovered = true;
-                    for (const RawSig& original : out.sigs)
+                    ExtractRequest retry = req;
+                    retry.autoInstantiateCxxTypes = false;
+                    retry.source = req.source;
+                    for (const auto& queued : st.incompleteCxxTypes)
+                        retry.source += "\ntemplate class " + queued.spelling + ";\n";
+                    if (req.verbose)
+                        std::cout << std::format(
+                            "[verbose]   falling back to a reparse for {} incomplete C++ specializations\n",
+                            incompleteSpellings.size());
+                    ExtractResult retried;
+                    std::string retryError;
+                    if (ExtractCInterop(retry, retried, retryError))
                     {
-                        bool namesIncomplete = false;
-                        for (const std::string& spelling : st.incompleteCxxTypes)
-                            if (original.retType == spelling
-                                || std::find(original.paramTypes.begin(), original.paramTypes.end(), spelling)
-                                       != original.paramTypes.end())
-                            { namesIncomplete = true; break; }
-                        if (!namesIncomplete) continue;
-                        auto found = std::find_if(retried.sigs.begin(), retried.sigs.end(),
-                            [&](const RawSig& candidate) {
-                                return candidate.linkageName == original.linkageName
-                                    && candidate.name == original.name;
-                            });
-                        if (found == retried.sigs.end() || !found->abi.valid)
-                        { recovered = false; break; }
+                        bool recovered = true;
+                        for (const RawSig& original : out.sigs)
+                        {
+                            bool namesIncomplete = false;
+                            for (const std::string& spelling : incompleteSpellings)
+                                if (original.retType == spelling
+                                    || std::find(original.paramTypes.begin(), original.paramTypes.end(), spelling)
+                                           != original.paramTypes.end())
+                                { namesIncomplete = true; break; }
+                            if (!namesIncomplete) continue;
+                            auto found = std::find_if(retried.sigs.begin(), retried.sigs.end(),
+                                [&](const RawSig& candidate) {
+                                    return candidate.linkageName == original.linkageName
+                                        && candidate.name == original.name;
+                                });
+                            if (found == retried.sigs.end() || !found->abi.valid)
+                            { recovered = false; break; }
+                        }
+                        if (recovered)
+                            for (const RawRecord& original : out.records)
+                                for (const RawCxxMember& member : original.members)
+                                {
+                                    bool namesIncomplete = false;
+                                    for (const std::string& spelling : incompleteSpellings)
+                                        if (member.retType == spelling
+                                            || std::find(member.paramTypes.begin(), member.paramTypes.end(), spelling)
+                                                   != member.paramTypes.end())
+                                        { namesIncomplete = true; break; }
+                                    if (!namesIncomplete) continue;
+                                    auto record = std::find_if(retried.records.begin(), retried.records.end(),
+                                        [&](const RawRecord& candidate) { return candidate.name == original.name; });
+                                    if (record == retried.records.end()) { recovered = false; break; }
+                                    auto found = std::find_if(record->members.begin(), record->members.end(),
+                                        [&](const RawCxxMember& candidate) {
+                                            return candidate.name == member.name
+                                                && candidate.retType == member.retType
+                                                && candidate.paramTypes == member.paramTypes;
+                                        });
+                                    if (found == record->members.end() || !found->abi.valid
+                                        || found->bindRefusal.size() != 0)
+                                    { recovered = false; break; }
+                                }
+                        if (recovered) out = std::move(retried);
                     }
-                    if (recovered)
-                        for (const RawRecord& original : out.records)
-                            for (const RawCxxMember& member : original.members)
-                            {
-                                bool namesIncomplete = false;
-                                for (const std::string& spelling : st.incompleteCxxTypes)
-                                    if (member.retType == spelling
-                                        || std::find(member.paramTypes.begin(), member.paramTypes.end(), spelling)
-                                               != member.paramTypes.end())
-                                    { namesIncomplete = true; break; }
-                                if (!namesIncomplete) continue;
-                                auto record = std::find_if(retried.records.begin(), retried.records.end(),
-                                    [&](const RawRecord& candidate) { return candidate.name == original.name; });
-                                if (record == retried.records.end()) { recovered = false; break; }
-                                auto found = std::find_if(record->members.begin(), record->members.end(),
-                                    [&](const RawCxxMember& candidate) {
-                                        return candidate.name == member.name
-                                            && candidate.retType == member.retType
-                                            && candidate.paramTypes == member.paramTypes;
-                                    });
-                                if (found == record->members.end() || !found->abi.valid
-                                    || found->bindRefusal.size() != 0)
-                                { recovered = false; break; }
-                            }
-                    if (recovered) out = std::move(retried);
                 }
             }
 

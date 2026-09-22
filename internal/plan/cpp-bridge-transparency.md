@@ -76,6 +76,34 @@ The matrix says it plainly: calls, members, operators, and lifetime are already 
 The bridge shows in three places - **value semantics** (copy), **protocol sugar** (iteration),
 and **generic crossing** (templates over CFlat types). Those are the plan.
 
+## Phase 0 result (measured 2026-09-20, master ee3cbdf0, macOS arm64 Release)
+
+Twin harness: `cpptw.Twin` (Test/library/cpp_interop_twin.h) vs CFlat `TwinCf`, one generic body
+per row, counts are ctor/copy/move/dtor/live. Transparent rows are asserted legs in
+Test/test_cpp_interop_bridge.cb; leaking rows are issue files, never disabled legs.
+
+| Row | Status | Note |
+|-----|--------|------|
+| method via `.` / `->`, field, static | TRANSPARENT | 1/0/0/1/0 both |
+| local lifetime, early return, loop scopes | TRANSPARENT | 3/0/0/3/0 both |
+| fixed array of T | TRANSPARENT | 2/0/0/2/0 both |
+| T as a struct field | TRANSPARENT | |
+| copy from a field | TRANSPARENT | 1/1/0/2/0 both; field, deref, array-element and `vector[i]` sources all copy-construct once - the old p2 head issue is closed |
+| reference / alias parameter | TRANSPARENT | |
+| operators `==` `[]` `bool` | TRANSPARENT | |
+| `?.` | TRANSPARENT | |
+| construct `T(args)` | LEAK (native side) | CFlat twin 3/0/0/2, C++ 2/0/0/2: a parameterized CFlat ctor also runs the USER default ctor body (p2 parameterized-ctor-runs-user-default-ctor-body, needs ruling) |
+| pass by value to a CFlat function | LEAK (both twins equal) | both are a shallow bitwise copy with no callee dtor and no copy; native `copy()` is never called either. The p1 hazard is a MUTATING callee. Needs ruling: borrow when read-only, copy-construct at entry when mutated |
+| return by value, field source | FIXED d01d8c0e | CFlat-defined functions returning a nontrivial C++ class use sret + copy/move-construct (direct, indirect, interface, thunks, extern); twin rows asserted |
+| copy of an enclosing struct | FIXED 8cfd0d10 | copy / assign / brace-init / array field run the field's C++ copy ctor. Still open: ternary of two struct lvalues (p2), conditional explicit move leak (p2) |
+| brace-init array element | FIXED 45748d49 | prvalue in place, lvalue copy, `move x` move; native twin 4/0/0/2/+2 is the default-ctor-body artifact above |
+| `move` | BY DESIGN (D1a) | C++ move=1, CFlat destructive move has no ctor; values, dtor, live agree |
+| `for (x in c)` | FIXED (see git log: range-for commit) | C++ begin()/end() lowering; by-value element copy-constructed per iteration, `alias` borrows a reference result, prvalue under alias is an error; iterator / temporary-collection lifetimes asserted with an instrumented iterator |
+| T inside CFlat `list<T>` | LEAK | "cannot assign to C++ class" at the element store (p3 cflat-list-of-imported-owning-class-refuses-element-store) |
+| CFlat interface satisfied by T | DESIGN INPUT (D5) | CFlat conformance is NOMINAL (`class X : IFoo`); a C++ class has nowhere to declare it. D5 needs either structural conformance for foreign classes or a declaration-site spelling at the import |
+
+Also seen: zero-argument `v.emplace_back()` does not bind (empty variadic pack).
+
 ## Design
 
 ### D1. Value semantics - one copy/move/destroy contract (lifts the held family)

@@ -101,6 +101,7 @@ inline std::string CanonicalPrimitiveTypeName(std::string_view type)
 #include <fstream>
 #include "ArgParser.h"
 #include "CClangExtract.h"
+#include "CxxIncrementalGroup.h"
 #include "WinmdExtract.h"
 #include "WinmdEmit.h"
 #include "WinmdSignature.h"
@@ -3249,6 +3250,8 @@ private:
         bool diskCache = false;
     };
     const CxxRequestGroup* activeCxxRequestGroup_ = nullptr;
+    std::unordered_map<std::string, std::unique_ptr<CxxIncrementalGroup>>
+        cxxIncrementalGroups_;
     struct CxxOwnerGroupMemo
     {
         std::vector<std::string> headers;
@@ -5175,7 +5178,9 @@ private:
     std::string BuildCxxRequestIncludes(const CxxRequestGroup& group) const;
     std::vector<std::string> BuildCxxRequestClangArgs(const CxxRequestGroup& group) const;
     std::string BuildCxxRequestMarkers(const std::vector<CxxRequestItem>& items,
-                                       bool instantiateAll) const;
+                                       bool instantiateAll,
+                                       const std::string& markerPrefix = "__cflat_req_",
+                                       bool includeExplicitInstantiation = true) const;
     std::string BuildCxxRequestPrologue(const CxxRequestGroup& group,
                                         const std::vector<CxxRequestItem>& items,
                                         bool instantiateAll) const;
@@ -5187,17 +5192,21 @@ private:
     static inline std::unordered_map<std::string, std::string> cxxRequestPchCache_;
     static inline std::mutex cxxRequestPchMutex_;
     std::string BuildCxxRequestOdrUses(const cflat_cinterop::RawRecord& rec,
-                                       const std::string& marker, const std::string& tagPrefix) const;
+                                       const std::string& marker, const std::string& tagPrefix,
+                                       bool incrementalSource = false) const;
     std::string BuildCxxRequestInheritedOdrUses(const std::vector<cflat_cinterop::RawRecord>& records,
                                                 const cflat_cinterop::RawRecord& rec,
                                                 const std::string& marker,
-                                                const std::string& tagPrefix) const;
+                                                const std::string& tagPrefix,
+                                                bool incrementalSource = false) const;
     std::string BuildCxxVirtualThunks(const std::vector<cflat_cinterop::RawRecord>& records) const;
     bool RunCxxTypeRequests(const CxxRequestGroup& group,
                             const std::vector<CxxRequestItem>& items,
                             const std::string& extraSource, bool emitDefinitions,
                             cflat_cinterop::ExtractResult& raw, std::string& error,
                             const std::string& prefixSource = {});
+    CxxIncrementalGroup* GetCxxIncrementalGroup(const CxxRequestGroup& group,
+                                                std::string& error);
     // Cache identity of one C++ type request; see the definition for what it folds in.
     std::string CxxTypeRequestCacheKey(const CxxRequestGroup& group,
                                        const std::string& cxxSpelling,
@@ -5336,7 +5345,8 @@ private:
                                     const std::string& cacheTag,
                                     CSigEntry& signature,
                                     std::string& error,
-                                    bool persistOnSuccess = true);
+                                    bool persistOnSuccess = true,
+                                    bool allowIncremental = true);
     bool TryBindCxxImplicitDefaultCtor(const std::string& typeName, std::string& error);
     struct CxxImplicitArgumentCandidate
     {
@@ -8133,6 +8143,9 @@ public:
     void RegisterCxxClassMembers(const CRecordEntry& r, const std::string& fileForLsp,
                                  const std::string& memberFilter = {});
     bool TryBindRefusedCxxMember(const std::string& typeName, const std::string& memberName);
+    // True when every class-template specialization in the member's signature is already
+    // registered or requested, so a retry can bind it without issuing a new C++ type request.
+    bool CxxRefusedMemberSignatureKnown(const CRecordEntry& record, const std::string& memberName) const;
     void RequestCxxSpecializationBase(const std::string& derivedName,
                                       const cflat_cinterop::RawCxxBase& b);
     bool TryBindRefusedCxxBaseMember(const std::string& typeName, const std::string& memberName);

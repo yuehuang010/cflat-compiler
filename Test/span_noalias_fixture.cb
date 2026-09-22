@@ -110,7 +110,7 @@ extern int main()
     int* ep = move e; delete[_] ep;
     int* fp = move f; delete[_] fp;
 
-    int* cp = move c; delete[_] cp;
+    int* cp = move ca; delete[_] cp;
     int* dp = move d; delete[_] dp;
     int* ap = move a; delete[_] ap;
     int* bp = move b; delete[_] bp;

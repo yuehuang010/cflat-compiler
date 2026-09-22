@@ -13,5 +13,11 @@ extern int main()
         NoOperatorBool y = default;
         if (y) { }
     }
+
+    // Logical negation of an aggregate used to reach LLVM's CreateNot and assert.
+    expect_error("operator '!' needs a bool, number or pointer operand") {
+        NoOperatorBool z = default;
+        if (!z) { }
+    }
     return 0;
 }

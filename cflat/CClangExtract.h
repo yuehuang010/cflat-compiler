@@ -16,6 +16,17 @@
 #include <utility>
 #include <vector>
 
+namespace clang
+{
+    class CompilerInstance;
+    class TranslationUnitDecl;
+}
+
+namespace llvm
+{
+    class Module;
+}
+
 namespace cflat_cinterop
 {
     // One CFlat identity for every canonical C++ spelling used by extraction and backend lookup.
@@ -511,6 +522,7 @@ namespace cflat_cinterop
             std::string cflatName;     // CFlat identity to register, e.g. the mangled generic name
         };
         std::vector<CxxTypeRequest> cxxTypeRequests;
+        std::string cxxRequestMarkerPrefix = "__cflat_req_";
         // Request mode for a generated deduction wrapper. Only these ordinary free wrapper
         // declarations are exported; the included header remains available to CodeGen.
         std::vector<std::string> cxxFunctionWrapperNames;
@@ -594,4 +606,12 @@ namespace cflat_cinterop
     // a TU produced with diagnostics still returns true (per-decl error recovery, like the
     // old -ferror-limit=0 path). `err` carries a human-readable reason on hard failure.
     bool ExtractCInterop(const ExtractRequest& req, ExtractResult& out, std::string& err);
+
+    // Harvest one incremental PTU with the same visitor and ABI/codegen pipeline as a full TU.
+    bool ExtractCxxIncremental(const ExtractRequest& req, clang::CompilerInstance& ci,
+                               clang::TranslationUnitDecl* root,
+                               clang::TranslationUnitDecl* headerRoot,
+                               const std::vector<clang::TranslationUnitDecl*>& extraRoots,
+                               llvm::Module* module,
+                               ExtractResult& out, std::string& err);
 }

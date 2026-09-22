@@ -409,18 +409,21 @@ Use an enclosing struct when alternatives need lifetime management. Keep the tag
 union and release the selected raw resource in the wrapper destructor:
 
 ```c
-enum ValueKind { Number, Node };
+enum ValueKind : int { Number, Node };
 union ValueData { int number; Node* node; };
 
 struct Value
 {
-    ValueKind kind = Number;
+    ValueKind kind = ValueKind.Number;
     ValueData data = default;
 
     ~Value()
     {
-        if (kind == Node && data.node != nullptr)
-            delete data.node;
+        if (kind == ValueKind.Node && data.node != nullptr)
+        {
+            Node* p = move data.node;
+            delete p;
+        }
     }
 };
 ```
@@ -3695,7 +3698,7 @@ need a real wall-clock or millisecond duration.
 
 | File | Purpose |
 |------|---------|
-| `thread.cb` | `thread<T>` - Win32 thread wrapper |
+| `thread.cb` | `Thread` - OS thread wrapper |
 | `threadpool.cb` | `ThreadPool` - priority work queue with `submit`/`then`/`drain` |
 | `mutex.cb` | `mutex`, `atomic<T>`, `lock` statement - synchronization primitives |
 | `atomic.cb` | `Atomic<T>` - load/store/fetchAdd over LLVM atomic IR |
@@ -3708,6 +3711,17 @@ need a real wall-clock or millisecond duration.
 | `spsc_queue.cb` | `spsc_queue<T>` - wait-free single-producer/single-consumer ring |
 | `stop_token.cb` | `StopSource` / `StopToken` - cooperative cancellation |
 | `program.cb` | `program` construct runtime support (thread + allocator lifecycle) |
+
+After importing `thread.cb`, a `Thread` worker can borrow a context pointer. The context
+must stay alive until `join()` returns, and `join()` returns the worker's `int`:
+
+```c
+struct Context { int value = 41; };
+int worker(void* raw) { return ((Context*)raw)->value + 1; }
+extern int main() {
+    Context ctx = Context(); Thread t; t.start(worker, (void*)&ctx);
+    int result = t.join(); return result == 42 ? 0 : 1; }
+```
 
 **I/O, system & time**
 

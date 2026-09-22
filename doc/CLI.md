@@ -132,9 +132,9 @@ program argument, so program args are never mistaken for compiler flags or sourc
 
 - *Read-only.* `--run` writes nothing to disk, so it cannot be combined with `-o`/`--output`,
   `-l`/`--out-lli`, `--out-asm`, or `-b`/`--bitcode`. To get the IR or assembly *and* a run, do two invocations.
-- *Single-threaded only.* A program that spawns a thread (via the `program` construct or
-  `thread<T>`) is rejected - in-process JIT'd workers would need Windows SEH unwind tables the
-  JIT cannot register. Compile to an exe instead. Importing `thread.cb` without spawning is fine.
+- *Windows only.* On Windows, a program that spawns a thread (via the `program` construct or
+  `Thread`) is rejected - in-process JIT'd workers would need Windows SEH unwind tables the JIT
+  cannot register. Compile to an exe instead. On macOS, `--run` supports threaded programs.
 - *C interop.* Importing a real C source file (`import "file.c";`) is supported and its object is
   loaded into the in-process JIT. Prebuilt C libraries (`--c-lib`, an inline `lib` clause, or a
   package import that resolves to a library) are not supported by `--run`; use an AOT build with

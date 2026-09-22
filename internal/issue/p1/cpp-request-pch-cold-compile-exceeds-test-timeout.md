@@ -1,3 +1,69 @@
+STATUS 2026-09-22 09:40: Phase 2 (header as chunk 0, on-mode simdjson cold 2.5 s / exactly one header parse,
+warm 0.7 s / zero parses) exists on branch feature/cpp-incremental-phase2 (81a0fa4b + an uncommitted default-on
++ CFLAT_CPP_MAX_HEADER_PARSES guard attempt, patch scratch/opus_wip_0923.diff) but is NOT landable: in on-mode
+test_cpp_interop_template and _bridge fail, because the request ODR-use builder there reached "budget 1" by
+name-matched suppressions (every non-ctor member of any record named *optional*, shared_ptr::operator[],
+Payload::operator==, simdjson_result::get - all must go), constructors were dropped as "__" members (fixed in
+the patch), and libc++ hidden-friend comparison operators are never harvested from a request chunk (partial fix
+in the patch). Ruling stands: incremental becomes the default only with cold budget 1 / warm 0 enforced for
+every test_cpp_interop* on the default path. What landed on master from that work: the post-stage-2
+use-after-free on st.incompleteCxxTypes (QualTypes read after the CompilerInstance died; Debug LLVM caught it),
+the unconsumed llvm::Expected on a failed incremental Parse, and a compile error for `!` on an aggregate
+(was an LLVM assert in CreateNot).
+
+MEASURED 2026-09-22 02:50, after c0cedadc (master): the persistent-Sema direction (1c)/(plan-level) is now on
+master behind `CFLAT_CPP_INCREMENTAL=1`: cflat/CxxIncrementalGroup.cpp keeps ONE clang::Interpreter per import
+group (chunk 0 = the include prologue, each type request = an appended Parse chunk harvested from its
+PartialTranslationUnit by the same HarvestTranslationUnit the request TUs use). Default path unchanged
+(cache entries byte-identical to d96eb929). simdjson s1 cold: off 5.5 s -> on 4.3-4.7 s, warm 0.6-0.7 s.
+Spike numbers (scratch/interp_spike/REPORT*.md): header chunk 0 = 635 ms live, 0.07 ms from a PCH built
+with -fincremental-extensions; request chunk 0.43 ms; fresh CodeGenerator per request 2.2 ms for 10 requests;
+after any failed request chunk later requests stay 10/10 with a DiagnosticConsumer installed (never Undo;
+recreate from PCH = 105 ms if ever needed). Also: d96eb929 completes incomplete specializations in the live
+Sema (one header parse fewer). Still open in on-mode: each on-mode .bc entry has ~245 fewer weak inline
+definitions than legacy (cache-wide union differs by 23 names, libc++ <compare> helpers; probe links), json
+entries differ (input_line_N source names), the Interpreter is leaked at teardown (clang aborts on
+destruction after the fresh CodeGenerators ran), std/smart-pointer spellings still take the legacy path, and
+the header extraction + default-wrapper parse are still separate frontends (Phase 2: header as chunk 0, and
+the request PCH built with -fincremental-extensions, are the remaining ~2 s).
+
+MEASURED 2026-09-21 23:20, after 0791cb7b (fix direction (1) landed + request-prune order fix):
+- libtorch t1 (`import cpp "torch/torch.h" cache;`, fresh CFLAT_CACHE_DIR): cold 259 s / 128 TUs / 82
+  requests (was 35+ min, 600+ TUs); warm 14 s, 82 disk hits, 0 TUs (was 212 s: the header-entry write
+  pruned the group's request entries AFTER registration had stored them; prune now runs before extraction).
+- simdjson s1: cold 6-7 s, warm 1 s. Cold profile (s1_cache.time-trace.json): core imports 0.36 s; header
+  parsed FOUR times without PCH at ~0.8 s each (stage-2 full parse, the incomplete-specialization retry at
+  CClangExtract.cpp:4395, the default-wrapper second parse at LLVMBackend_CInterop.cpp:3668, the request
+  PCH build); then 15 PCH-backed request TUs at 0.16 s (stage 1) / 0.4 s (stage 2 CodeGen) = ~3 s.
+  clang++ -std=c++20 -fsyntax-only on the same header: 0.75 s (0.15 s with PCH). A full AST walk over a
+  PCH-backed TU costs 0.74 s vs 0.98 s parsed (-ast-dump-all), so the PCH only pays for lazy walks.
+- Remaining directions: (1b) complete incomplete specializations in the live Sema (RequireCompleteType in
+  HandleTranslationUnit, then re-walk) instead of re-parsing the header; (1c) run the wrapper parse on the
+  request PCH; (2)-(4) as below; structural bound = one clang frontend per type request, so C++-like cold
+  cost needs a persistent Sema per import group (clang-repl style incremental completion) - plan-level.
+
+MEASURED 2026-09-21 22:30-22:45, simdjson as the model (scratch/simdjson_spike/sj_r1.log + sj_r1.trace.json,
+fresh CFLAT_CACHE_DIR, `import cpp "simdjson.h" cache;`), with a plain-clang comparison point:
+- clang++ -std=c++20 on a TU including torch/torch.h: 4.2 s parse+codegen, 1.2 s with a PCH; simdjson.h
+  0.4 s. cflat cold on torch t1: >600 clang TUs at ~2.2 s (PCH used) = >25 min. It is not "reading a
+  header slowly", it is running hundreds of clang frontends.
+- Request tree for s1 (2 source-level types -> 30 requests, 62 TUs, 18 s): root simdjson_result<dom::element>
+  13.6 s. Its 10 children (simdjson_result<bool/double/long long/string_view/...>, <vector<element>>) come
+  from the EAGER refused-member retry in RegisterCxxClassMembers (LLVMBackend_CInterop.cpp:11764): every
+  requested specialization retries every member refused for "returns/takes unsupported type", which
+  requests that type, which registers a specialization, which retries ITS members - a transitive closure
+  over return/parameter types regardless of what the program calls (t1 calls torch::ones only; 331
+  requests, 96 of them std::function<...> callback members). vector<element> then pulls 7 libc++ iterator
+  types (3.9 s) through CollectCxxMemberRequestItems (begin/end/operator->/operator*).
+- Every request is stage 1 + stage 2 = 2 clang TUs, serial on one thread.
+- PrewarmCxxRequestBatch (one stage-1 + one stage-2 TU for a whole nested closure) is DISABLED when the
+  group has the `cache` clause (:9049 `if (group.diskCache) return;`). So: with `cache` you get disk
+  persistence but no batching; without it batching but nothing persists. Neither mode gets both.
+- Fix directions, in order of payoff: (1) make the refused-member retry lazy (retry at first use site,
+  which TryBindRefusedCxxMember already supports) instead of eager at registration; (2) allow batching
+  with disk cache (write per-item entries from the batch result, as the comment at :9049 already
+  proposes); (3) run request TUs in parallel; (4) default `import cpp` to disk persistence.
+
 # C++ interop request cost: cold compile of test_cpp_interop_template exceeds test.bat's timeout
 
 STATUS 2026-09-19: largely FIXED. `test.bat Release` is green in 243s (was 660s with

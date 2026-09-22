@@ -61,7 +61,7 @@ Method-level API discovery is via the LSP (hover / completion / `--symbol`); thi
 
 | File | Exports |
 |------|---------|
-| `thread.cb` | `thread<T>` - Win32 thread wrapper |
+| `thread.cb` | `Thread` - OS thread wrapper |
 | `threadpool.cb` | `ThreadPool` - priority work queue with `submit`/`then`/`drain`; `TaskHandle`, `TaskResult<T>` |
 | `mutex.cb` | `mutex`, `atomic<T>`, `lock` statement - synchronization primitives |
 | `atomic.cb` | `Atomic<T>` - load/store/fetchAdd over LLVM atomic IR |
