@@ -14,7 +14,7 @@
 // Build & run:
 //   x64/Release/cflat.exe example/windows/registry_dump.cb -o out/registry_dump.exe
 //   out\registry_dump.exe
-import "windows.h" lib "advapi32.lib" cache;
+import "windows.h" lib "advapi32.lib";
 
 extern int main()
 {

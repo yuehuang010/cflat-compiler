@@ -1,5 +1,5 @@
-// Grouped C++ import with a clause: the group form accepts cache/lib/define like the single form.
-import cpp { "cpp_interop_tpl.h", "vector" } cache;
+// Grouped C++ import: the group form accepts lib/define clauses like the single form.
+import cpp { "cpp_interop_tpl.h", "vector" };
 
 expect_error("no instantiation of C++ function template 'cppt.twice' accepts these argument types") {
     extern int main()

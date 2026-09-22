@@ -17,7 +17,7 @@ import "Windows.Storage.winmd";      // IPathIOStatics - async file round-trip (
 // the WinRT import libs, and supplies hstring/activationFactory/awaitAsync/winrtInit. windows.h
 // supplies the kernel32 calls the async test uses (GetTempPathW/CreateFileW/CloseHandle).
 import "winrt.cb";
-import "windows.h" cache;
+import "windows.h";
 import "test_helper.cb";
 import "guid.cb";
 import "function.cb";   // capturing-closure delegate handler (clone/free env primitives)

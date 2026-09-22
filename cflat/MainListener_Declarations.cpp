@@ -2737,8 +2737,7 @@ void MainListener::ParseIfConstDeclaration(CFlatParser::IfConstDeclarationContex
                     bool grpIsCpp = imp->children.size() >= 2
                                  && imp->children[1]->getText() == "cpp";
                     Compiler()->CompileImportGroup(Compiler()->currentSourceFilePath_, entries,
-                                                   grpLibs, grpDefines, imp->cacheClause() != nullptr,
-                                                   grpIsCpp);
+                                                   grpLibs, grpDefines, grpIsCpp);
                     continue;
                 }
                 std::string importFilename = importFilenames[0];
@@ -2780,8 +2779,7 @@ void MainListener::ParseIfConstDeclaration(CFlatParser::IfConstDeclarationContex
                 // `import cpp "..."` inside an if-const branch selects C++ mode, same as at file scope.
                 bool isCppImport = imp->children.size() >= 2 && imp->children[1]->getText() == "cpp";
                 Compiler()->CompileImportedFile(Compiler()->currentSourceFilePath_, importFilename, ns, "",
-                                                explicitLibs, extraDefines,
-                                                imp->cacheClause() != nullptr, isCppImport);
+                                                explicitLibs, extraDefines, isCppImport);
             }
         }
 

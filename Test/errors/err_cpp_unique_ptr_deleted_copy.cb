@@ -1,6 +1,6 @@
 // std::unique_ptr has a deleted copy constructor and must not silently copy an owner.
 import cpp "cpp_interop_basic.h";
-import cpp "memory" cache;
+import cpp "memory";
 import "list.cb";
 
 expect_error("cannot copy C++ class 'std.unique_ptr$cppi.Tracked' into construct_at storage") {

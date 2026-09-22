@@ -33,7 +33,7 @@
 //   x64/Release/cflat.exe example/windows/pipe_echo.cb -o out/pipe_echo.exe
 //   out\pipe_echo.exe server 4      (in one console)
 //   out\pipe_echo.exe client 4      (in another - prints PASS/FAIL, exit 0 on PASS)
-import "windows.h" cache;
+import "windows.h";
 import "string.cb";
 
 // The pipe path. In a cflat string literal "\\" is one backslash, so this is

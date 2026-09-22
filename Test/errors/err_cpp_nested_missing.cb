@@ -6,9 +6,9 @@
 // The reject leg comes FIRST on purpose: once a std.vector request succeeds, the template's
 // owning group is memoized, the candidate list collapses to one and the single-candidate arm
 // reports that group's own clang error instead of this last-resort one.
-import cpp "vector" cache;
-import cpp "memory" cache;
-import cpp "cpp_interop_nest.h" cache;
+import cpp "vector";
+import cpp "memory";
+import cpp "cpp_interop_nest.h";
 
 extern int main()
 {

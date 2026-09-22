@@ -4477,9 +4477,7 @@ bool LLVMBackend::CountCxxHeaderParse(const CxxRequestGroup& group, const char* 
             std::cout << std::format(
                 "[verbose] C++ header group '{}' full header parse count: {} ({})\n",
                 group.label, count, stage);
-        std::optional<unsigned> limit = CxxMaxHeaderParses();
-        // An import line without the `cache` clause parses its one TU on every compile.
-        if (limit.has_value() && *limit == 0 && !importGroup.diskCache) limit = 1u;
+        const std::optional<unsigned> limit = CxxMaxHeaderParses();
         if (limit.has_value() && count > *limit)
         {
             LogErrorMessage("C++ header group '{}' was parsed {} times in one compile; the budget is {} "
@@ -4549,7 +4547,12 @@ CxxIncrementalGroup* LLVMBackend::GetCxxIncrementalGroup(const CxxRequestGroup& 
         auto append = [&](const char prefix, const std::string& value) {
             key += prefix + std::to_string(value.size()) + ":" + value + "|";
         };
-        if (!group.headers.empty()) append('H', group.headers.front());
+        // One TU per import line: {a.h, b.h} and {a.h, c.h} share a first header but not a TU, so
+        // key on the line's whole header set. Dependency-group headers appended after it do not split it.
+        if (!group.ownerHeaders.empty())
+            for (const auto& header : group.ownerHeaders) append('H', header);
+        else if (!group.headers.empty())
+            append('H', group.headers.front());
         for (const auto& define : group.defines) append('D', define);
         auto found = cxxIncrementalGroups_.find(key);
         if (found != cxxIncrementalGroups_.end()) return found->second.get();
@@ -5268,16 +5271,6 @@ bool LLVMBackend::TryLoadCxxTypeRequestCache(const CxxRequestGroup& group,
             return false;
         }
         const uint64_t headerHash = CxxGroupHeaderHash(group);
-        const std::string memoryPrefix = [&] {
-            std::string prefix = "|RQ" + requestLabel;
-            for (const auto& h : group.headers) prefix += "|H" + h;
-            for (const auto& inc : cIncludeDirs_) prefix += "|I" + inc;
-            for (const auto& def : cDefines_) prefix += "|D" + def;
-            for (const auto& def : group.defines) prefix += "|d" + def;
-            prefix += "|T" + std::to_string((long long)headerMtime.time_since_epoch().count());
-            prefix += emitDefinitions ? "|EDEF" : "|EDECL";
-            return prefix;
-        }();
         {
             std::lock_guard<std::mutex> lock(cFileSigCacheMutex_);
             auto it = cFileSigCache_.find(requestKey);
@@ -5295,34 +5288,6 @@ bool LLVMBackend::TryLoadCxxTypeRequestCache(const CxxRequestGroup& group,
                 }
                 missReason = it->second.mtime == headerMtime || it->second.hash == headerHash
                     ? "missing sidecar" : "header stamp";
-            }
-            // Imports without a cache clause retain the old batch behavior: one shared in-memory
-            // request TU answers every item in the batch. Disk-backed requests stay exact-source
-            // only, because a broad match would make stale wrappers silently win.
-            if (!group.diskCache)
-            {
-                auto best = cFileSigCache_.end();
-                for (auto candidate = cFileSigCache_.begin();
-                     candidate != cFileSigCache_.end(); ++candidate)
-                {
-                    if (candidate->first == requestKey
-                        || !candidate->first.starts_with(memoryPrefix)
-                        || !candidate->first.ends_with("|BATCH")) continue;
-                    if ((candidate->second.mtime != headerMtime
-                            && candidate->second.hash != headerHash)
-                        || (emitDefinitions && candidate->second.cxxBitcode.empty())) continue;
-                    if (best == cFileSigCache_.end()
-                        || candidate->second.lastUse > best->second.lastUse)
-                        best = candidate;
-                }
-                if (best != cFileSigCache_.end())
-                {
-                    TouchCFileSigEntry(best->first, best->second);
-                    out = best->second;
-                    if (verbose) llvm::errs() << std::format(
-                        "[verbose] C++ type request cache HIT for {} (batch memory)\n", requestLabel);
-                    return true;
-                }
             }
         }
 
@@ -5402,7 +5367,7 @@ void LLVMBackend::StoreCxxTypeRequestCache(const CxxRequestGroup& group,
         }
         if (!group.diskCache)
         {
-            reportRefusal("group has no cache clause");
+            reportRefusal("no import group supplies a header");
             return;
         }
         if (runMode_)
@@ -5449,19 +5414,14 @@ void LLVMBackend::StoreCxxTypeRequestCache(const CxxRequestGroup& group,
  * same group, so a repeated import does not split the request cache.
  */
 size_t LLVMBackend::FindOrAddCxxImportGroup(const std::vector<std::string>& headers,
-                                            const std::vector<std::string>& defines,
-                                            bool diskCache)
+                                            const std::vector<std::string>& defines)
 {
         for (size_t i = 0; i < cxxImportGroups_.size(); ++i)
             if (cxxImportGroups_[i].headers == headers && cxxImportGroups_[i].defines == defines)
-            {
-                cxxImportGroups_[i].diskCache |= diskCache;
                 return i;
-            }
         CxxImportGroup group;
         group.headers = headers;
         group.defines = defines;
-        group.diskCache = diskCache;
         cxxImportGroups_.push_back(std::move(group));
         return cxxImportGroups_.size() - 1;
     }
@@ -5483,8 +5443,6 @@ LLVMBackend::CxxRequestGroup LLVMBackend::MakeCxxRequestGroup(size_t primary,
         out.ownerDefines = out.defines;
         const bool primaryHasHeaders = !cxxImportGroups_[primary].headers.empty();
         bool hasDependencyGroup = false;
-        bool allSourceGroupsCacheable = primaryHasHeaders
-            ? cxxImportGroups_[primary].diskCache : true;
         std::vector<size_t> sorted;
         for (size_t d : deps)
             if (d != primary && d < cxxImportGroups_.size()
@@ -5499,8 +5457,6 @@ LLVMBackend::CxxRequestGroup LLVMBackend::MakeCxxRequestGroup(size_t primary,
         for (size_t d : sorted)
         {
             hasDependencyGroup = true;
-            allSourceGroupsCacheable = allSourceGroupsCacheable
-                && cxxImportGroups_[d].diskCache;
             for (const auto& h : cxxImportGroups_[d].headers)
                 if (std::find(out.headers.begin(), out.headers.end(), h) == out.headers.end())
                     out.headers.push_back(h);
@@ -5508,13 +5464,12 @@ LLVMBackend::CxxRequestGroup LLVMBackend::MakeCxxRequestGroup(size_t primary,
                 if (std::find(out.defines.begin(), out.defines.end(), def) == out.defines.end())
                     out.defines.push_back(def);
         }
-        out.diskCache = allSourceGroupsCacheable && (primaryHasHeaders || hasDependencyGroup);
-        // A request with no header at all (a CFlat struct handed to C++ that needs nothing but
-        // itself) is keyed by its whole generated source. It follows the compile's opt-in: any
-        // import with a cache clause makes it disk-cacheable, so a warm compile reparses nothing.
-        if (!primaryHasHeaders && !hasDependencyGroup)
-            out.diskCache = std::any_of(cxxImportGroups_.begin(), cxxImportGroups_.end(),
-                [](const CxxImportGroup& g) { return !g.headers.empty() && g.diskCache; });
+        // Every import is disk-cached. A request with no header at all (a CFlat struct handed to
+        // C++ that needs nothing but itself) is keyed by its whole generated source, and is
+        // cacheable as soon as the compile imports any C++ header.
+        out.diskCache = primaryHasHeaders || hasDependencyGroup
+            || std::any_of(cxxImportGroups_.begin(), cxxImportGroups_.end(),
+                           [](const CxxImportGroup& g) { return !g.headers.empty(); });
         out.label = out.headers.empty()
             ? std::string("<no header>")
             : std::filesystem::path(out.headers.front()).filename().string();
@@ -9008,17 +8963,6 @@ bool LLVMBackend::RequestCxxForeignType(const std::string& cflatName, const std:
                                              rejectClangErrors && !probe.firstError.empty()
                                                  ? "rejected clang error" : nullptr);
             }
-            std::vector<CxxRequestItem> memberItems;
-            CollectCxxMemberRequestItems(probeRecords, memberItems);
-            if (!memberItems.empty() && !cached)
-            {
-                std::vector<CxxRequestItem> batchItems;
-                batchItems.reserve(memberItems.size() + 1);
-                batchItems.push_back(item);
-                for (CxxRequestItem& memberItem : memberItems)
-                    batchItems.push_back(std::move(memberItem));
-                PrewarmCxxRequestBatch(batchItems);
-            }
 
             cflat_cinterop::ExtractResult raw;
             if (needDefinitions)
@@ -9492,261 +9436,8 @@ bool LLVMBackend::GetGeneratedCxxFieldBlock(const std::string& typeName,
     }
 
 /*
- * Item 2 - one stage-1 and one stage-2 translation unit for every spelling ONE import statement
- * asks for, instead of two Clang frontends per spelling. Stage 1 runs to a fixpoint so a nested
- * type it discovers (a vector's iterator) joins the same stage 2 instead of starting its own
- * request. The result is split back into exactly the per-spelling cache entries the single-request
- * path writes, so every caller of RequestCxxForeignType, and both cache-hit replays, are
- * unchanged - a spelling missing from the batch simply runs the single path.
- */
-void LLVMBackend::PrewarmCxxRequestBatch(std::vector<CxxRequestItem> items)
-{
-        if (activeCxxRequestGroup_ == nullptr || activeCxxRequestGroup_->headers.empty()) return;
-        const CxxRequestGroup& group = *activeCxxRequestGroup_;
-        // Disk-backed requests use exact per-item source keys. A shared batch source cannot be
-        // reproduced before its nested request closure is known, so leave that optimization to
-        // the in-memory path and let disk-backed requests use their per-item entries.
-        if (group.diskCache) return;
-        auto alreadyKnown = [&](const CxxRequestItem& item) {
-            if (cxxForeignRequests_.count(item.cflatName) != 0) return true;
-            return false;
-        };
-        std::vector<CxxRequestItem> pending;
-        std::unordered_set<std::string> seen;
-        for (CxxRequestItem& item : items)
-        {
-            if (!seen.insert(item.cflatName).second) continue;
-            if (alreadyKnown(item)) continue;
-            pending.push_back(std::move(item));
-        }
-        if (pending.size() < 2) return;   // the single path is already one stage-1 plus one stage-2
-        const bool incrementalBatch = UseCxxIncrementalRequests() && !batchMode_
-            && std::all_of(pending.begin(), pending.end(), [](const CxxRequestItem& item) {
-                   return CxxIncrementalSpellingSafe(item.cxxSpelling);
-               });
-
-        llvm::TimeTraceScope batchScope("CxxRequestBatch", [&] {
-            return group.label + " x " + std::to_string(pending.size());
-        });
-
-        /*
-         * Stage 1 to a fixpoint: each round adds the nested spellings the previous round's member
-         * lists named (an iterator class, a pair<const K, V>) so they are instantiated in the same
-         * TU as the type that exposes them.
-        */
-        cflat_cinterop::ExtractResult probe;
-        std::string stage1Source;
-        for (int round = 0; round < 3; ++round)
-        {
-            stage1Source = BuildCxxRequestIncludes(group)
-                + BuildCxxRequestMarkers(pending, /*instantiateAll*/ true);
-            cflat_cinterop::ExtractResult rounded;
-            std::string error;
-            {
-                llvm::TimeTraceScope stage1("CxxRequestStage1", group.label);
-                if (!RunCxxTypeRequests(group, pending, /*extraSource*/ {},
-                                        /*emitDefinitions*/ false, rounded, error))
-                    return;   // fall back to the single-request path, one spelling at a time
-            }
-            if (rounded.records.empty()) return;
-            probe = std::move(rounded);
-            std::vector<CRecordEntry> mapped;
-            MapRawRecords(probe, mapped);
-            std::vector<CxxRequestItem> nested;
-            CollectCxxMemberRequestItems(mapped, nested);
-            bool grew = false;
-            for (CxxRequestItem& item : nested)
-            {
-                if (!seen.insert(item.cflatName).second) continue;
-                if (alreadyKnown(item)) continue;
-                pending.push_back(std::move(item));
-                grew = true;
-            }
-            if (!grew) break;
-        }
-
-        // Stage 2: one CodeGen frontend with the ODR-uses of every spelling in the batch.
-        cflat_cinterop::ExtractResult emitted;
-        bool haveEmitted = false;
-        std::string stage2Source;
-        std::string stage2CacheSource;
-        std::vector<size_t> fullItems;
-        for (size_t i = 0; i < pending.size(); ++i)
-            if (pending[i].needDefinitions) fullItems.push_back(i);
-        if (!fullItems.empty())
-        {
-            std::string extra = CxxRequestOdrUsePreamble();
-            for (size_t i : fullItems)
-            {
-                const std::string marker = "__cflat_req_" + std::to_string(i);
-                const cflat_cinterop::RawRecord* target = nullptr;
-                for (const auto& r : probe.records)
-                    if (r.name == pending[i].cflatName) { target = &r; break; }
-                if (target == nullptr) continue;
-                extra += BuildCxxRequestOdrUses(*target, marker, "b" + std::to_string(i) + "_",
-                                                incrementalBatch);
-                extra += BuildCxxRequestInheritedOdrUses(probe.records, *target, marker,
-                                                         "b" + std::to_string(i) + "_",
-                                                         incrementalBatch);
-                extra += BuildStdFunctionCtorUse(pending[i].cxxSpelling, marker);
-            }
-            extra += BuildCxxDefaultWrappers({}, probe.records);
-            extra += BuildCxxVirtualThunks(probe.records);
-            stage2Source = BuildCxxRequestIncludes(group)
-                + BuildCxxRequestMarkers(pending, /*instantiateAll*/ false) + extra;
-            std::string cacheExtra = CxxRequestOdrUsePreamble();
-            for (size_t i : fullItems)
-            {
-                const std::string marker = "__cflat_req_" + std::to_string(i);
-                const cflat_cinterop::RawRecord* target = nullptr;
-                for (const auto& r : probe.records)
-                    if (r.name == pending[i].cflatName) { target = &r; break; }
-                if (target == nullptr) continue;
-                cacheExtra += BuildCxxRequestOdrUses(*target, marker,
-                                                     "b" + std::to_string(i) + "_", false);
-                cacheExtra += BuildCxxRequestInheritedOdrUses(
-                    probe.records, *target, marker, "b" + std::to_string(i) + "_", false);
-                cacheExtra += BuildStdFunctionCtorUse(pending[i].cxxSpelling, marker);
-            }
-            cacheExtra += BuildCxxDefaultWrappers({}, probe.records);
-            cacheExtra += BuildCxxVirtualThunks(probe.records);
-            stage2CacheSource = BuildCxxRequestIncludes(group)
-                + BuildCxxRequestMarkers(pending, /*instantiateAll*/ false) + cacheExtra;
-            llvm::TimeTraceScope stage2("CxxRequestStage2", group.label);
-            if (verbose)
-                for (size_t i : fullItems)
-                    std::cout << std::format("[verbose]   C++ type request batch member: {}\n",
-                                             pending[i].cxxSpelling);
-            std::string error;
-            haveEmitted = RunCxxTypeRequests(group, pending, extra, /*emitDefinitions*/ true,
-                                             emitted, error)
-                       && !emitted.records.empty();
-        }
-
-        /*
-         * Split the batch back into per-spelling entries. The extractor emits a request's base
-         * records immediately before the request's own record, in request order, so the record list
-         * partitions exactly the way the single-request TU would have produced it. A free operator
-         * goes to every spelling it names, and to all of them when it names none.
-         */
-        /*
-         * A spelling has to be mapped to its CFlat identity BEFORE the batch's records and
-         * signatures are mapped: the single-request path publishes the canonical spelling of the
-         * type it just parsed and then maps that TU's signatures, so a free operator's parameter
-         * resolves to the CFlat type rather than to an opaque one. A batch maps several TUs' worth
-         * of signatures at once, so it publishes all of them first.
-         */
-        auto publishSpellings = [&](const cflat_cinterop::ExtractResult& raw) {
-            for (const CxxRequestItem& item : pending)
-            {
-                const cflat_cinterop::RawRecord* rec = nullptr;
-                for (const auto& r : raw.records)
-                    if (r.name == item.cflatName) { rec = &r; break; }
-                if (rec == nullptr) continue;
-                const std::string canonical = rec->canonicalCtype;
-                auto known = cxxForeignTypeSpellings_.find(SqueezeCxxSpelling(canonical));
-                const std::string mappedName = known == cxxForeignTypeSpellings_.end()
-                    ? item.cflatName : known->second;
-                if (!canonical.empty())
-                    cxxForeignTypeSpellings_[SqueezeCxxSpelling(canonical)] = mappedName;
-                cxxForeignTypeSpellings_[SqueezeCxxSpelling(item.cxxSpelling)] = mappedName;
-                cxxCflatToCxxSpelling_[item.cflatName] = item.cxxSpelling;
-            }
-        };
-        auto storeFrom = [&](const cflat_cinterop::ExtractResult& raw, bool withBitcode,
-                             const std::string& requestSource) {
-            // The published spellings exist only while this batch is mapped: registration itself
-            // still runs through the normal request path, which decides what is already mapped.
-            const auto savedSpellings = cxxForeignTypeSpellings_;
-            const auto savedCflatToCxx = cxxCflatToCxxSpelling_;
-            publishSpellings(raw);
-            std::vector<CRecordEntry> mapped;
-            MapRawRecords(raw, mapped);
-            std::vector<CSigEntry> sigs;
-            for (const auto& rawSig : raw.sigs)
-            {
-                CSigEntry sig;
-                if (MapRawSig(rawSig, sig)) sigs.push_back(std::move(sig));
-            }
-            cxxForeignTypeSpellings_ = savedSpellings;
-            cxxCflatToCxxSpelling_ = savedCflatToCxx;
-            size_t cursor = 0;
-            for (size_t i = 0; i < pending.size(); ++i)
-            {
-                size_t stop = 0;
-                bool haveTarget = false;
-                for (size_t r = cursor; r < mapped.size(); ++r)
-                    if (mapped[r].name == pending[i].cflatName)
-                    { stop = r + 1; haveTarget = true; break; }
-                if (!haveTarget) continue;   // this spelling produced no record; single path retries
-                std::vector<CRecordEntry> slice(mapped.begin() + cursor, mapped.begin() + stop);
-                cursor = stop;
-                if (pending[i].needDefinitions != withBitcode) continue;
-                std::string canonical;
-                for (const auto& r : slice)
-                    if (r.name == pending[i].cflatName) canonical = SqueezeCxxSpelling(r.canonicalCtype);
-                std::vector<CSigEntry> mine;
-                const std::string spellingKey = SqueezeCxxSpelling(pending[i].cxxSpelling);
-                for (const CSigEntry& sig : sigs)
-                {
-                    std::vector<std::string> spellings = sig.paramSpellings;
-                    spellings.push_back(sig.retSpelling);
-                    bool namesMine = false, namesAny = false;
-                    for (const auto& spelling : spellings)
-                    {
-                        const std::string squeezed = SqueezeCxxSpelling(spelling);
-                        namesMine = namesMine
-                            || (!canonical.empty() && squeezed.find(canonical) != std::string::npos)
-                            || squeezed.find(spellingKey) != std::string::npos;
-                        for (const CxxRequestItem& other : pending)
-                            namesAny = namesAny
-                                || squeezed.find(SqueezeCxxSpelling(other.cxxSpelling))
-                                   != std::string::npos;
-                    }
-                    // A free operator goes to every spelling it names; one that names none of them
-                    // (a plain helper the TU happened to instantiate) goes to all of them.
-                    if (namesMine || !namesAny) mine.push_back(sig);
-                }
-                if (verbose)
-                    std::cout << std::format("[verbose] C++ request batch entry for {} "
-                                             "({} record(s), {} signature(s))\n",
-                                             pending[i].cxxSpelling, slice.size(), mine.size());
-                CFileSigCacheEntry entry;
-                entry.longDoubleWidth = raw.longDoubleWidth;
-                entry.longDoubleIsIEEEDouble = raw.longDoubleIsIEEEDouble;
-                entry.targetTriple = raw.targetTriple;
-                entry.sigs = std::move(mine);
-                entry.records = std::move(slice);
-                if (withBitcode) entry.cxxBitcode = raw.bitcode;
-                const std::string key = CxxTypeRequestCacheKey(
-                    group, pending[i], requestSource, BuildCxxRequestClangArgs(group), withBitcode)
-                    + "|BATCH";
-                StoreCxxTypeRequestCache(group, key, withBitcode, std::move(entry),
-                                         /*allowDisk*/ raw.firstError.empty()
-                                             && (!withBitcode || !raw.bitcode.empty()));
-            }
-        };
-        auto markDroppedDefaultWrappers = [](cflat_cinterop::ExtractResult& raw) {
-            for (const std::string& dropped : raw.droppedCxxDefaultWrappers)
-                for (auto& record : raw.records)
-                    for (auto& member : record.members)
-                        for (size_t n = 0; n < member.defaultArgs.size(); ++n)
-                            if (CxxDefaultWrapperName(member.linkageName, n) == dropped)
-                            {
-                                member.defaultArgs[n].kind = "unsupported";
-                                member.defaultArgs[n].value.clear();
-                            }
-        };
-        markDroppedDefaultWrappers(probe);
-        if (haveEmitted) markDroppedDefaultWrappers(emitted);
-        storeFrom(probe, /*withBitcode*/ false, stage1Source);
-        if (haveEmitted) storeFrom(emitted, /*withBitcode*/ true, stage2CacheSource);
-    }
-
-/*
  * The nested specializations a record's members expose (a container's iterator, a smart pointer's
- * pointee). Collected separately from the requesting so one import's batch can instantiate them in
- * the same translation unit as the class that names them.
+ * pointee), in the order RequestCxxMemberTypes requests them.
  */
 void LLVMBackend::CollectCxxMemberRequestItems(const std::vector<CRecordEntry>& records,
                                                std::vector<CxxRequestItem>& out)
@@ -9800,7 +9491,6 @@ void LLVMBackend::RequestCxxMemberTypes(const std::vector<CRecordEntry>& records
         std::vector<CxxRequestItem> items;
         CollectCxxMemberRequestItems(records, items);
         CxxExtractionStageTimer requestStage(verbose, "member-signature type requests", items.size());
-        PrewarmCxxRequestBatch(items);
         for (const CxxRequestItem& item : items)
         {
             if (prefixSource.empty()
@@ -13610,14 +13300,14 @@ void LLVMBackend::ReportUncompilableHeader(const std::vector<std::string>& heade
     }
 
 bool LLVMBackend::CompileCHeader(const std::string& headerPath, const std::vector<std::string>& extraDefines,
-                        bool diskCache, bool cppMode)
+                        bool cppMode)
 {
-        return CompileCHeaderGroup(std::vector<std::string>{ headerPath }, extraDefines, diskCache, cppMode);
+        return CompileCHeaderGroup(std::vector<std::string>{ headerPath }, extraDefines, cppMode);
     }
 
 bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPaths,
                              const std::vector<std::string>& extraDefines,
-                             bool diskCache, bool cppMode)
+                             bool cppMode)
 {
         if (headerPaths.empty()) return true;
 
@@ -13645,7 +13335,7 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
         CxxRequestGroup cxxGroup;
         if (cppMode)
         {
-            cxxGroupIndex = FindOrAddCxxImportGroup(realPaths, extraDefines, diskCache);
+            cxxGroupIndex = FindOrAddCxxImportGroup(realPaths, extraDefines);
             // A standard-library header is a template catalog the walk deliberately skips, so no
             // record of it is ever registered - seed its namespace here or `std.vector<int>` could
             // never be requested at all.
@@ -13898,7 +13588,7 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
         }
         const uint64_t refusalGroupKey = CHeaderDiskCacheKey(
             realPaths, cIncludeDirs_, cDefines_, extraDefines,
-            targetWindows_, cppMode, cxxDefinitionsEmitted);
+            targetWindows_, CInteropTargetTriple(), cppMode, cxxDefinitionsEmitted);
 
         std::vector<CSigEntry> hitSigs;
         std::vector<CEnumEntry> hitEnums;
@@ -14003,11 +13693,11 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
             return true;
         }
 
-        // Persistent disk cache (opt-in via `cache` import clause). On hit, preloads the
-        // in-memory cache and registers decls, skipping the clang header parse entirely.
+        // Persistent disk cache (every import). On hit, preloads the in-memory cache and
+        // registers decls, skipping the clang header parse entirely.
         std::filesystem::path cHeaderCacheDir = GetCHeaderCacheDir();
         const uint64_t diskKey = refusalGroupKey;
-        if (diskCache && !mtEc && !cHeaderCacheDir.empty())
+        if (!mtEc && !cHeaderCacheDir.empty())
         {
             CFileSigCacheEntry diskEntry;
             bool diskHit;
@@ -14017,6 +13707,8 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
             }
             if (diskHit)
             {
+                // The output's up-to-date check must see the transitive includes on a hit too.
+                for (const auto& dep : diskEntry.deps) RecordDependency(dep.path);
                 if (verbose) std::cout << std::format("[verbose] C header disk cache hit for {}\n", fileForLsp);
                 {
                     std::lock_guard<std::mutex> lock(cFileSigCacheMutex_);
@@ -14099,14 +13791,15 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
         uint64_t longDoubleWidth = 0;
         bool longDoubleIsIEEEDouble = false;
         std::string targetTriple;
-        // Deep mode: collect the transitive include set so the disk entry can validate it.
-        bool wantDeps = diskCache && cHeaderCacheDeep_ && !cHeaderCacheDir.empty();
+        // Collect the transitive include set so the disk entry can validate it: every import is
+        // cached, so an edit to an indirectly included header must invalidate the entry.
+        bool wantDeps = !cHeaderCacheDir.empty();
         std::vector<std::string> includes;
         std::string cxxBitcode;   // M5 companion module for this group, empty for C imports
         // The group's request entries belong to the header entry being rebuilt: drop them now,
         // before registration issues requests, so what this compile stores is not deleted by
         // the entry write below (measured: a second libtorch compile re-ran 72 of 82 requests).
-        if (diskCache && cppMode && !batchMode_ && !runMode_ && symbolSink_ == nullptr
+        if (cppMode && !batchMode_ && !runMode_ && symbolSink_ == nullptr
             && !cHeaderCacheDir.empty())
             PruneCxxTypeRequestDiskCache(cHeaderCacheDir, cxxGroup);
         {
@@ -14158,7 +13851,7 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
             entry.namespaceAliases = namespaceAliases;
             entry.functionPointerAbis = functionPointerAbis;
             entry.cxxBitcode = cxxBitcode;
-            // Keep only real on-disk paths in the transitive dependency list (deep mode).
+            // Keep only real on-disk paths in the transitive dependency list.
             // Non-existent deps would otherwise poison every later cache validation.
             if (wantDeps)
             {
@@ -14177,11 +13870,11 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
                     entry.deps.push_back(std::move(dep));
                 }
             }
-            // --run is read-only: never persist header cache to disk even with 'cache' clause.
+            // --run is read-only: never persist the header cache to disk.
             // The in-memory entry still serves this compile.
             // Nor does LSP analysis write: its entry carries a bound surface with no bodies
             // (see the cache-key comment above), which is not a result a compile may reuse.
-            if (diskCache && !runMode_ && symbolSink_ == nullptr && !cHeaderCacheDir.empty())
+            if (!runMode_ && symbolSink_ == nullptr && !cHeaderCacheDir.empty())
                 WriteCHeaderDiskCache(cHeaderCacheDir, diskKey, currentMtime, hashNow(), entry);
             std::lock_guard<std::mutex> lock(cFileSigCacheMutex_);
             InsertCFileSigEntry(cacheKey, std::move(entry), verbose);

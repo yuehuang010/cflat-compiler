@@ -19,7 +19,7 @@
 // Build & run (needs a real console - exits politely if stdin is redirected):
 //   x64/Release/cflat.exe example/windows/console_raw.cb -o out/console_raw.exe
 //   out\console_raw.exe
-import "windows.h" cache;
+import "windows.h";
 
 extern int main()
 {

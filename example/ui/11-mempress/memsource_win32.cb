@@ -7,7 +7,7 @@ import "appsample.cb";
 import "dictionary.cb";
 import "ui_native.cb";
 import "wstring.cb";
-import { "windows.h", "shellapi.h" } lib "shell32.lib" cache;
+import { "windows.h", "shellapi.h" } lib "shell32.lib";
 extern stdcall i32 SHDefExtractIconW(u16* pszIconFile, i32 iIndex, u32 uFlags, void** phiconLarge, void** phiconSmall, u32 nIconSize);
 import "memcore/grouper.cb";
 import "memcore/pressure.cb";

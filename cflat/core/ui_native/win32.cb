@@ -21,7 +21,7 @@
 //
 // This file has no main(); an app imports it and calls runAppGuiNative().
 import "windows.h" lib { "user32.lib", "gdi32.lib", "comctl32.lib", "dwmapi.lib", "comdlg32.lib",
-                         "uxtheme.lib", "advapi32.lib", "shell32.lib", "ole32.lib" } cache;
+                         "uxtheme.lib", "advapi32.lib", "shell32.lib", "ole32.lib" };
 import "ui_native.cb";
 import "manifest.cb";
 import "graphic/bitmap.cb";   // 24bpp BMP writer for nativeSaveWindowBmp (the shot() backend)

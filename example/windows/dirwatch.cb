@@ -23,7 +23,7 @@
 // Build & run:
 //   x64/Release/cflat.exe example/windows/dirwatch.cb -o out/dirwatch.exe
 //   out\dirwatch.exe <dir> [maxEvents]      (defaults: ".", 10)
-import "windows.h" cache;
+import "windows.h";
 import "string.cb";
 
 // Map a FILE_ACTION_* code to a fixed-width label.

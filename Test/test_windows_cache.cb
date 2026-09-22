@@ -1,12 +1,12 @@
-// C-header disk-cache regression test. Mirrors test_windows.cb but opts the windows.h
-// bind into the persistent disk cache via the `cache` import clause. The first compile
+// C-header disk-cache regression test. Mirrors test_windows.cb; every import is bound
+// through the persistent disk cache. The first compile
 // extracts windows.h and writes %USERPROFILE%\.cflat\cheaders\<key>.json; later compiles
 // load the JSON instead of re-running the clang header parse. Either way the extracted
 // decls must be identical, so the same calls resolve and run. The struct + macro checks
 // also verify the cached record set, the cached typedef->tag aliases (recordAliases), and
 // the cached object-like macros survive a disk-cache round-trip.
 import "test_helper.cb";
-import "windows.h" cache;
+import "windows.h";
 
 extern int main()
 {

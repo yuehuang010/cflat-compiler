@@ -20,7 +20,7 @@
 // Build & run:
 //   x64/Release/cflat.exe example/windows/vmmap.cb -o out/vmmap.exe
 //   out\vmmap.exe
-import "windows.h" cache;
+import "windows.h";
 import "string.cb";
 
 // Decode the State field to a short fixed-width label.

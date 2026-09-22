@@ -24,7 +24,7 @@
 // com.cb (ComPtr + S_OK/...) is imported BEFORE objbase.h so its HRESULT globals win the
 // redeclaration; objbase.h supplies IMalloc + CoGetMalloc (both from the header) and links ole32.lib.
 import "com.cb";
-import "objbase.h" lib "ole32.lib" cache;
+import "objbase.h" lib "ole32.lib";
 
 extern int main()
 {

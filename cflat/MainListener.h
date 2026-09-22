@@ -79,7 +79,6 @@ static void ForEachImportClause(CFlatParser::ImportDeclarationContext* imp, Fn&&
     fn(imp->frameworkClause());
     for (auto* clause : imp->defineClause())
         fn(clause);
-    fn(imp->cacheClause());
     fn(imp->fromClause());
     fn(imp->priClause());
 }

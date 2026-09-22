@@ -162,7 +162,7 @@ cflat has **no built-in knowledge** of which header is the prerequisite - that b
 import { "windows.h", "tlhelp32.h" } lib { "user32.lib", "gdi32.lib" };
 ```
 
-Each header still registers only the decls that live in its own directory (the union of the group's header directories, plus the SDK `um/`<->`shared/` sibling expansion), so the group does not over-expose. Group-level `lib`, `define`, and `cache` clauses apply to the whole group; non-header (`.cb`/`.c`) entries in the same group route individually as usual. The grouped header set is folded into the cache key, so a header bound standalone never collides with the same header bound after a prerequisite.
+Each header still registers only the decls that live in its own directory (the union of the group's header directories, plus the SDK `um/`<->`shared/` sibling expansion), so the group does not over-expose. Group-level `lib` and `define` clauses apply to the whole group; non-header (`.cb`/`.c`) entries in the same group route individually as usual. The grouped header set is folded into the cache key, so a header bound standalone never collides with the same header bound after a prerequisite.
 
 #### Companion headers a library intentionally does not include
 
@@ -187,7 +187,7 @@ A bare `import "windows.h";` binds the system header with **no `--c-include` fla
 `kernel32.lib` is already on the default link line. Functions from other system libraries (e.g. `user32.lib` / `gdi32.lib` for a GUI app) are linked with the inline `lib` clause, naming the bare lib filename - cflat resolves it against the SDK lib dir it already discovered, so no `--c-lib` or absolute path is needed:
 
 ```c
-import "windows.h" lib { "user32.lib", "gdi32.lib" } cache;
+import "windows.h" lib { "user32.lib", "gdi32.lib" };
 ```
 
 See `example/windows/sysinfo.cb` (console, kernel32 only) and `example/windows/win_red_button.cb` (a GUI window + owner-drawn red button, linking user32/gdi32 via the inline `lib` clause).

@@ -14,7 +14,7 @@
 //   out\run_capture.exe cmd /c "exit 42"
 //   out\run_capture.exe cmd /c dir
 //   out\run_capture.exe --sizeof          (prints struct sizes and exits)
-import "windows.h" cache;
+import "windows.h";
 import "string.cb";
 
 // Join argv[1..] into a single command line. Any argument containing a space is

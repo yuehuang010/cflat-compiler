@@ -13,7 +13,7 @@
 // when the window is resized. See example/ui/03-canvas-win32/win32_boxes.cb for a demo.
 //
 // This file has no main(); it is imported by an app file that calls runAppGui().
-import "windows.h" lib { "user32.lib", "gdi32.lib" } cache;
+import "windows.h" lib { "user32.lib", "gdi32.lib" };
 import "ui_native.cb";
 
 // Layout is in CHARACTER CELLS; GdiCanvas maps a cell to this many pixels. Hit

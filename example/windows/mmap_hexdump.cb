@@ -21,7 +21,7 @@
 //   out\mmap_hexdump.exe somefile.txt
 //   out\mmap_hexdump.exe somefile.bin 64
 //   out\mmap_hexdump.exe --probe            (prints the union-overlay diagnostic)
-import "windows.h" cache;
+import "windows.h";
 import "string.cb";
 
 // Print one hexdump row: an 8-digit offset, up to 16 hex bytes, then the ASCII

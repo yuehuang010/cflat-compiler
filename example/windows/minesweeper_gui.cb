@@ -9,7 +9,7 @@
 // Build & run:
 //   x64/Release/cflat.exe example/customer/minesweeper-win32/main.cb -i Test/library -o example/customer/minesweeper-win32/app.exe
 //   example\customer\minesweeper-win32\app.exe
-import "windows.h" lib { "user32.lib", "gdi32.lib" } cache;
+import "windows.h" lib { "user32.lib", "gdi32.lib" };
 import "random.cb";
 
 // -- Board constants --------------------------------------------------------

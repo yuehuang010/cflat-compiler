@@ -6,7 +6,7 @@ function 'std.min' could not be bound (clang: no matching function for call to '
 `std.min(a, b + 1)`, `std.max(a + 1, b)` and `std.min(5, 6)` all bind and run.
 
 ## Repro
-    import cpp "algorithm" cache;
+    import cpp "algorithm";
     extern int main() { int a = 3; return std.min(a, 5) == 3 ? 0 : 1; }
 
 ## Root cause (suspected)

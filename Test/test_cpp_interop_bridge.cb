@@ -36,27 +36,27 @@
 //     plain-CFlat-function checks. Every member position was refused ("takes/returns
 //     unsupported type") while the free-function parameter one bound.
 
-import cpp "library/cpp_interop_basic.h" cache;
-import cpp "library/cpp_interop_basic.cpp" cache;
+import cpp "library/cpp_interop_basic.h";
+import cpp "library/cpp_interop_basic.cpp";
 // Inheritance and virtual dispatch. Definitions are out-of-line on purpose - every
 // virtual function needs a real symbol and the vtable needs a key function.
-import cpp "library/cpp_interop_poly.h" cache;
-import cpp "library/cpp_interop_poly.cpp" cache;
+import cpp "library/cpp_interop_poly.h";
+import cpp "library/cpp_interop_poly.cpp";
 // The CFlat-defined [cpp] structs below derive from C++ class-template specializations, and
 // the make_shared checks register them through std::shared_ptr.
-import cpp "library/cpp_interop_tpl.h" cache;
-import cpp "vector" cache;
-import cpp "string" cache;
-import cpp "memory" cache;
-import cpp "functional" cache;
-import cpp "deque" cache;
-import cpp "map" cache;
-import cpp "set" cache;
-import cpp "list" cache;
-import cpp "array" cache;
+import cpp "library/cpp_interop_tpl.h";
+import cpp "vector";
+import cpp "string";
+import cpp "memory";
+import cpp "functional";
+import cpp "deque";
+import cpp "map";
+import cpp "set";
+import cpp "list";
+import cpp "array";
 // std::function as a MEMBER parameter and as a RETURN type.
-import cpp "library/cpp_interop_stdfn.h" cache;
-import cpp "library/cpp_interop_twin.h" cache;
+import cpp "library/cpp_interop_stdfn.h";
+import cpp "library/cpp_interop_twin.h";
 import "test_helper.cb";
 import "list.cb";
 

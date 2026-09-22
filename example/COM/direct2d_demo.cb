@@ -30,7 +30,7 @@
 // (not a COM-registered object), so it stays a hand `extern`; everything reached through it comes
 // from the metadata. The core `Guid` type lays out exactly like REFIID and supplies the factory
 // IID (iidof is not yet wired for Win32-metadata interfaces - WinRT only).
-import "windows.h" lib { "user32.lib", "gdi32.lib", "d2d1.lib" } cache;
+import "windows.h" lib { "user32.lib", "gdi32.lib", "d2d1.lib" };
 import "Windows.Win32.winmd";
 import "guid.cb";
 

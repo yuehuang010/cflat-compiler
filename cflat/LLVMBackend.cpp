@@ -390,16 +390,6 @@ static std::vector<std::string> DequoteDefineClauses(CFlatParser::ImportDeclarat
     return defines;
 }
 
-// True when this import line carries an inline `cache` clause, opting the header into the
-// persistent C-header disk cache. Applies to bare headers, package headers, and import groups.
-static bool HasCacheClause(CFlatParser::ImportDeclarationContext* imp)
-{
-    bool found = false;
-    ForEachImportClause(imp, [&](antlr4::ParserRuleContext* clause) {
-        if (ImportClauseHasWord(clause, "cache")) found = true;
-    });
-    return found;
-}
 
 // True when this import line is `import package-vcpkg "..." from "...";`. Detected by
 // the second child token text - mirrors the existing `package` / `program` test.
@@ -2130,8 +2120,7 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
                             return false;
                         }
                         // `import { "a", "b" };` / `import cpp { "a", "b" };` - a group of
-                        // >1 imports. Header entries share one TU; a trailing `cache` applies to
-                        // the whole header group (a no-op for .cb/.c entries).
+                        // >1 imports. Header entries share one TU.
                         auto groupedImports = ImportFilenames(imp);
                         // `import framework "X";` / `import framework { ... };` - record each
                         // framework for the Mach-O link. Dispatched before the importGroup
@@ -2162,8 +2151,7 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
                         {
                             if (verbose) std::cout << std::format("[verbose] import requested (group of {})\n", groupedImports.size());
                             if (!CompileImportGroup(filename, groupedImports, DequoteLibClauses(imp),
-                                                    DequoteDefineClauses(imp), HasCacheClause(imp),
-                                                    IsCppImport(imp)))
+                                                    DequoteDefineClauses(imp), IsCppImport(imp)))
                                 return false;
                             continue;
                         }
@@ -2186,9 +2174,8 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
                         bool isCppImport = IsCppImport(imp);
                         std::vector<std::string> explicitLibs = DequoteLibClauses(imp);
                         std::vector<std::string> extraDefines = DequoteDefineClauses(imp);
-                        bool cacheHeader = HasCacheClause(imp);
-                        if (verbose) std::cout << std::format("[verbose] import requested: {}{}{}\n", importFilename, ns.empty() ? "" : " as " + ns, cacheHeader ? " (cache)" : "");
-                        if (!CompileImportedFile(filename, importFilename, ns, isCProgram ? alias : "", explicitLibs, extraDefines, cacheHeader, isCppImport))
+                        if (verbose) std::cout << std::format("[verbose] import requested: {}{}\n", importFilename, ns.empty() ? "" : " as " + ns);
+                        if (!CompileImportedFile(filename, importFilename, ns, isCProgram ? alias : "", explicitLibs, extraDefines, isCppImport))
                             return false;
 
                         if (isProgram)
@@ -3104,12 +3091,12 @@ bool LLVMBackend::ResolveImportPath(const std::string& importingFilePath, const 
 // individually (each like a plain `import "x";`) in listed order; every header entry of the
 // group is bound as ONE translation unit, in listed order, so an earlier header satisfies a
 // later one's prerequisites (the explicit replacement for the old windows.h prepend special
-// case). Group-level `lib`/`define`/`cache` clauses apply to the whole header group.
+// case). Group-level `lib`/`define` clauses apply to the whole header group.
 bool LLVMBackend::CompileImportGroup(const std::string& importingFilePath,
                                      const std::vector<std::string>& entries,
                                      const std::vector<std::string>& groupLibs,
                                      const std::vector<std::string>& groupDefines,
-                                     bool cacheGroup, bool cppMode)
+                                     bool cppMode)
 {
     std::vector<std::string> headerCanonicals;
     bool anyNewHeader = false;
@@ -3127,7 +3114,7 @@ bool LLVMBackend::CompileImportGroup(const std::string& importingFilePath,
         if (!isHeader)
         {
             // .cb / .c entries are independent - route each like a plain `import "x";`.
-            if (!CompileImportedFile(importingFilePath, entry, {}, {}, {}, {}, false, cppMode))
+            if (!CompileImportedFile(importingFilePath, entry, {}, {}, {}, {}, cppMode))
                 return false;
             continue;
         }
@@ -3166,12 +3153,12 @@ bool LLVMBackend::CompileImportGroup(const std::string& importingFilePath,
         if (!lib.empty())
             cLinkLibs_.push_back(ResolveCLinkLib(lib, importingFilePath));
 
-    bool ok = CompileCHeaderGroup(headerCanonicals, groupDefines, cacheGroup, cppMode);
+    bool ok = CompileCHeaderGroup(headerCanonicals, groupDefines, cppMode);
     if (ok) ProcessPendingMacroSources();
     return ok;
 }
 
-bool LLVMBackend::CompileImportedFile(const std::string& importingFilePath, const std::string& importFilename, const std::string& namespaceName, const std::string& programAlias, const std::vector<std::string>& explicitLibs, const std::vector<std::string>& extraDefines, bool cacheHeader, bool cppMode)
+bool LLVMBackend::CompileImportedFile(const std::string& importingFilePath, const std::string& importFilename, const std::string& namespaceName, const std::string& programAlias, const std::vector<std::string>& explicitLibs, const std::vector<std::string>& extraDefines, bool cppMode)
 {
     if (isolatedPolicy_)
     {
@@ -3334,7 +3321,7 @@ bool LLVMBackend::CompileImportedFile(const std::string& importingFilePath, cons
                 if (explicitLib.empty()) continue;
                 cLinkLibs_.push_back(ResolveCLinkLib(explicitLib, importingFilePath));
             }
-            bool ok = CompileCHeader(canonicalStr, extraDefines, cacheHeader, cppMode);
+            bool ok = CompileCHeader(canonicalStr, extraDefines, cppMode);
             // Translate any queued function-like-macro source into generic templates so
             // they are visible to the importing file's ForwardRefScanner.
             if (ok) ProcessPendingMacroSources();
@@ -3424,8 +3411,7 @@ bool LLVMBackend::CompileImportedFile(const std::string& importingFilePath, cons
                 {
                     if (verbose) std::cout << std::format("[verbose]   nested import (group of {})\n", groupedImports.size());
                     if (!CompileImportGroup(canonicalStr, groupedImports, DequoteLibClauses(imp),
-                                            DequoteDefineClauses(imp), HasCacheClause(imp),
-                                            IsCppImport(imp)))
+                                            DequoteDefineClauses(imp), IsCppImport(imp)))
                         return false;
                     continue;
                 }
@@ -3443,7 +3429,7 @@ bool LLVMBackend::CompileImportedFile(const std::string& importingFilePath, cons
                 std::vector<std::string> nestedDefines = DequoteDefineClauses(imp);
                 if (verbose) std::cout << std::format("[verbose]   nested import: {}{}\n", nested, nestedNs.empty() ? "" : " as " + nestedNs);
                 if (!CompileImportedFile(canonicalStr, nested, nestedNs, "", nestedLibs, nestedDefines,
-                                         HasCacheClause(imp), IsCppImport(imp)))
+                                         IsCppImport(imp)))
                     return false;
             }
         }
@@ -4346,8 +4332,7 @@ bool LLVMBackend::Analyze(const std::string& filePath,
                     if (groupedImports.size() > 1)
                     {
                         if (!CompileImportGroup(filePath, groupedImports, DequoteLibClauses(imp),
-                                                DequoteDefineClauses(imp), HasCacheClause(imp),
-                                                IsCppImport(imp)))
+                                                DequoteDefineClauses(imp), IsCppImport(imp)))
                             return false;
                         continue;
                     }
@@ -4367,7 +4352,7 @@ bool LLVMBackend::Analyze(const std::string& filePath,
                     bool isCppImport = IsCppImport(imp);
                     std::vector<std::string> explicitLibs = DequoteLibClauses(imp);
                     std::vector<std::string> extraDefines = DequoteDefineClauses(imp);
-                    if (!CompileImportedFile(filePath, importFilename, ns, isCProgram ? alias : "", explicitLibs, extraDefines, HasCacheClause(imp), isCppImport))
+                    if (!CompileImportedFile(filePath, importFilename, ns, isCProgram ? alias : "", explicitLibs, extraDefines, isCppImport))
                         return false;
 
                     // Mirror Compile()'s 'import program "file.cb" as Name' handling:

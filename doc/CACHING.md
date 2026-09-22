@@ -174,7 +174,7 @@ bitcode, `compiler_path.txt`, the linker-path JSON files, the synthesized import
 `cheaders/` C-header cache, and the macOS `macsdk/` stubs.
 
 Note that `cheaders/` is the one entry `--init` does **not** rebuild: the C-header cache is
-populated lazily by compiles that use the `cache` import clause, so an expensive header cache
+populated lazily by compiles that import the header, so an expensive header cache
 (e.g. `windows.h`) has to be re-earned by the next compile that imports it. Everything else in
 the list comes back with one `--init` / `--init-local`.
 
@@ -213,18 +213,19 @@ The code additionally refuses to act on a root unless its last path component is
 `GetUserCacheDir()` or `<exe dir>/.cflat` as the code stands today - they are defence-in-depth
 against a future change to either helper, not a filter on hostile input.
 
-## C-header cache (opt-in)
+## C-header cache
 
 Binding a large C header (e.g. `import "windows.h";`) runs a full clang parse of the header
 and its transitive includes. For `windows.h` that dominates a cold compile (~1.3s of ~2.3s,
 visible as the `CHeaderExtract` phase under `-ftime-trace`). The in-memory cache only helps
 *within* one process (LSP, `--check` batches); a fresh `cflat.exe` starts cold.
 
-Opt a header into a persistent disk cache with the inline `cache` clause:
+Every header import is disk-cached; there is no opt-in clause (the former `cache` clause was
+removed, and spelling it is now a syntax error):
 
 ```cpp
-import "windows.h" cache;
-import package "curl/curl.h" lib "libcurl.lib" cache;   // clause comes last
+import "windows.h";
+import package "curl/curl.h" lib "libcurl.lib";
 ```
 
 The extracted declarations (functions, enums, records, macros, globals) are serialized to:
@@ -240,23 +241,21 @@ header is reparsed instead of binding declarations without their bodies; invalid
 rewrites without companion bitcode remove the stale sidecar.
 
 The `<key>` is an FNV-1a hash of the canonical header path plus every `--c-include` dir,
-`--c-define`, and inline `define` - the same inputs as the in-memory cache key - so a header
-exposed differently under different roots/defines never collides on a stale entry.
+`--c-define`, and inline `define` - the same inputs as the in-memory cache key - plus the target
+triple, so a header exposed differently under different roots/defines, or bound for a different
+target (`-p win32` vs `-p win64`), never collides on a stale entry.
 
-### Validation: shallow (default) vs deep
+### Validation
 
-| Mode | Trigger | What is checked |
-|------|---------|-----------------|
-| Shallow | default | Top header mtime (hash on mtime drift) + the version-stamped SDK include dirs baked into the key. An SDK upgrade changes those paths -> automatic miss. |
-| Deep | `--c-header-cache-deep` | Every transitively `#include`d file's mtime/hash, recorded as a `deps` list in the JSON and re-checked on load. Catches an in-place SDK header edit the top-header check would miss, at the cost of validating hundreds of files. |
-
-A `cache` clause with no `--c-header-cache-deep` writes a shallow entry; adding the switch
-rewrites it with a `deps` list on the next miss. Loading is forward-compatible: a shallow
-entry skips the transitive check, a deep entry enforces it regardless of the current switch.
+Every header entry records each transitively `#include`d file's mtime/hash as a `deps` list in
+the JSON, and a load re-checks all of them (a stat per file; the hash only on mtime drift). An
+edit to any included header - not just the imported one - is a miss. The version-stamped SDK
+include dirs are also baked into the key, so an SDK upgrade is a miss without reaching the
+`deps` check.
 
 This is **distinct** from the `import package-vcpkg` cache, which is co-located in
 `vcpkg_installed/.cflat-cache/` (a vcpkg package is already version-pinned, so it caches
-unconditionally). Headers without a `cache` clause are never disk-cached.
+unconditionally). `--run` and LSP analysis read the disk cache but never write it.
 
 ### C++ type-request cache
 
@@ -316,4 +315,4 @@ not discovered via a VS/SDK scan), so that section of the Windows cache does not
   `[verbose] core bitcode cache: hit/miss`. A populated `<exe dir>/.cflat` from an old
   `--init-local` run takes priority over the per-user cache even if you did not pass a flag.
 - **Bypass for debugging**: pass `--no-cache` to force a full parse for a single invocation.
-- **Profiling a slow compile**: pass `-ftime-trace` (clang's single-dash spelling) to write a Chrome-trace JSON to `<input>.time-trace.json`. Load it in `chrome://tracing` or Perfetto to see where the time goes. With a warm cache `RuntimeImport` should be small; the usual remaining cost is `CHeaderExtract` (libclang parsing of any imported C header, e.g. `windows.h`), which is not yet disk-cached.
+- **Profiling a slow compile**: pass `-ftime-trace` (clang's single-dash spelling) to write a Chrome-trace JSON to `<input>.time-trace.json`. Load it in `chrome://tracing` or Perfetto to see where the time goes. With a warm cache `RuntimeImport` should be small; the usual remaining cost is `CHeaderExtract` (the clang parse of an imported C header, e.g. `windows.h`), which runs only on a C-header cache miss.

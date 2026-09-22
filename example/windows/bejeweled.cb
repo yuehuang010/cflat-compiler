@@ -10,7 +10,7 @@
 //   x64/Release/cflat.exe example/bejeweled.cb -o out/bejeweled.exe
 //   out\bejeweled.exe
 
-import "windows.h" lib { "user32.lib", "gdi32.lib" } cache;
+import "windows.h" lib { "user32.lib", "gdi32.lib" };
 import "random.cb";
 import "array.cb";
 import "time.cb";

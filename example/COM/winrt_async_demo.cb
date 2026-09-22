@@ -23,7 +23,7 @@
 
 import "winrt.cb";                // hstring/activationFactory/awaitAsync + Windows.Foundation.winmd + WinRT libs
 import "Windows.Storage.winmd";   // IPathIOStatics (the PathIO activation factory)
-import "windows.h" cache;         // kernel32: GetTempPathW, CreateFileW, CloseHandle
+import "windows.h";         // kernel32: GetTempPathW, CreateFileW, CloseHandle
 
 // WinMD types are registered under their FULLY-QUALIFIED WinRT name, so a projection can never
 // displace a type of your own. Alias the ones you use to keep the call sites short.

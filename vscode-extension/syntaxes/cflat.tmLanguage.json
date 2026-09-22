@@ -165,7 +165,7 @@
         },
         {
           "name": "keyword.control.import-clause.cflat",
-          "match": "\\b(lib|framework|define|cache|from|pri)\\b(?=\\s*(?:\"|\\{))"
+          "match": "\\b(lib|framework|define|from|pri)\\b(?=\\s*(?:\"|\\{))"
         },
         {
           "name": "keyword.control.program.cflat",

@@ -1,4 +1,4 @@
-import cpp "cpp_interop_poly.h" cache;
+import cpp "cpp_interop_poly.h";
 
 expect_error("use of moved variable 'owner'") {
     void use_after_move()

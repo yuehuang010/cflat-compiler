@@ -1,4 +1,4 @@
-import cpp "cpp_interop_invalid_specialization.h" cache;
+import cpp "cpp_interop_invalid_specialization.h";
 
 expect_error("C++ type 'cppbadns::BadT<int>' could not be instantiated") {
     cppbadns.BadT<int> value = default;

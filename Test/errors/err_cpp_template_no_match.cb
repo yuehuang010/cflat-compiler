@@ -1,4 +1,4 @@
-import cpp "../library/cpp_interop_tpl.h" cache;
+import cpp "../library/cpp_interop_tpl.h";
 
 extern int main()
 {

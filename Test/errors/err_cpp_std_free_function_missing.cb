@@ -1,4 +1,4 @@
-import cpp "algorithm" cache;
+import cpp "algorithm";
 
 extern int main()
 {

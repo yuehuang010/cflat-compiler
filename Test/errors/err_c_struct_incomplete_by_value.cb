@@ -8,7 +8,7 @@
 // incomplete-layout path this test guards. (Earlier targets now import fine: the
 // RETRIEVAL_POINTERS_BUFFER.Extents[1] array-of-unnamed-struct case - see Test/test_windows.cb -
 // and userCLIPFORMAT, whose nested MIDL union lays out since records are ordered nested-first.)
-import "windows.h" cache;
+import "windows.h";
 
 extern int main()
 {

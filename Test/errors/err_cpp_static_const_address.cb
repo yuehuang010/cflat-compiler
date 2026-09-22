@@ -1,7 +1,7 @@
 // A class-scope `static const int k = 41;` with an in-class initializer and no out-of-line
 // definition has NO symbol, so it binds by value. Taking its address must be refused here
 // rather than left to fail as an unresolved symbol at link time.
-import cpp "cpp_interop_basic.h" cache;
+import cpp "cpp_interop_basic.h";
 
 expect_error("Address-of an object without a Storage") {
     int* m93_address_of_folded() { return &cppi.statconst.InClass.k; }

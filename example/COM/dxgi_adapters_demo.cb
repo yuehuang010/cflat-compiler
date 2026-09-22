@@ -25,7 +25,7 @@
 // com.cb (ComPtr + S_OK/...) is imported BEFORE dxgi.h so its HRESULT globals win the
 // redeclaration; dxgi.h supplies IDXGIFactory + IDXGIAdapter + CreateDXGIFactory and links dxgi.lib.
 import "com.cb";
-import "dxgi.h" lib "dxgi.lib" cache;
+import "dxgi.h" lib "dxgi.lib";
 
 // Map the well-known PCI vendor id to a readable name. Anything else prints as hex.
 char* vendorName(u32 id)

@@ -59,6 +59,9 @@ fresh CFLAT_CACHE_DIR, `import cpp "simdjson.h" cache;`), with a plain-clang com
 - PrewarmCxxRequestBatch (one stage-1 + one stage-2 TU for a whole nested closure) is DISABLED when the
   group has the `cache` clause (:9049 `if (group.diskCache) return;`). So: with `cache` you get disk
   persistence but no batching; without it batching but nothing persists. Neither mode gets both.
+  UPDATE 2026-09-22: the `cache` clause is removed and every import is disk-cached; the incremental
+  executor (one Interpreter TU per import line) replaced request TUs, and PrewarmCxxRequestBatch is
+  deleted. Direction (4) is done; (2) is moot.
 - Fix directions, in order of payoff: (1) make the refused-member retry lazy (retry at first use site,
   which TryBindRefusedCxxMember already supports) instead of eager at registration; (2) allow batching
   with disk cache (write per-item entries from the batch result, as the comment at :9049 already

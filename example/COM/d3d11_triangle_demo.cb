@@ -24,7 +24,7 @@
 
 // com.cb is imported BEFORE the SDK headers so its S_OK/E_FAIL/... globals win the redeclaration.
 import "com.cb";
-import { "d3d11.h", "d3dcompiler.h" } lib { "d3d11.lib", "d3dcompiler.lib" } cache;
+import { "d3d11.h", "d3dcompiler.h" } lib { "d3d11.lib", "d3dcompiler.lib" };
 
 const i32 W = 256;
 const i32 H = 256;

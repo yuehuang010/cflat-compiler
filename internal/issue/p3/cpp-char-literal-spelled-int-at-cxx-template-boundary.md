@@ -21,7 +21,7 @@ constant branch of the spelling lambdas ranks every integer literal as `int`:
 ## Repro
 
 ```cflat
-import cpp "string" cache;
+import cpp "string";
 extern int main()
 {
     std.string a = std.string("hi");

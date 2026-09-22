@@ -1,4 +1,4 @@
-import cpp "cpp_interop_tpl.h" cache;
+import cpp "cpp_interop_tpl.h";
 
 expect_error("Undefined variable reg.") {
     int bad_member_template_call()

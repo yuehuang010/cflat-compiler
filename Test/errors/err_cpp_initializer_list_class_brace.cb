@@ -1,4 +1,4 @@
-import cpp "cpp_interop_tpl.h" cache;
+import cpp "cpp_interop_tpl.h";
 
 expect_error("C++ parameter 'values' of 'cppt.total_init' takes std::initializer_list") {
     extern int main()

@@ -11,7 +11,7 @@ that is not a bare identifier is refused, including an operator result and a par
 ## Repro
 
 ```cflat
-import cpp "string" cache;
+import cpp "string";
 extern int main()
 {
     std.string a = std.string("hi");

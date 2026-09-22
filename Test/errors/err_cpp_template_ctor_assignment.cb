@@ -1,4 +1,4 @@
-import cpp "vector" cache;
+import cpp "vector";
 extern int main()
 {
     expect_error("cannot assign to C++ class 'std.vector$int' from this expression") {

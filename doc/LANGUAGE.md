@@ -2302,14 +2302,14 @@ source. (A bare `import "tlhelp32.h";` fails with a diagnostic suggesting this g
 Each header still registers only the decls in its own directory, so the group does not
 over-expose. See [C Interop](C_INTEROP.md) for details.
 
-Group-level `lib`, `define`, and `cache` clauses apply to the **whole group**:
+Group-level `lib` and `define` clauses apply to the **whole group**:
 
 ```c
-import { "windows.h", "shlwapi.h" } cache;   // both headers opt into the disk cache
+import { "windows.h", "shlwapi.h" } lib "shlwapi.lib";
 ```
 
-(`cache` is a no-op for `.cb` / `.c` entries - only the `.h` header-bind path consults it; the
-group's header entries are folded into the cache key together.) An `as` alias is meaningful only
+Every header import is disk-cached (see [Caching](CACHING.md)); a group's header entries are
+folded into one cache key together. An `as` alias is meaningful only
 when the group holds a single filename, since one alias cannot name several files; use separate
 `import` lines when you need an alias or a per-entry `lib` / `define`.
 
@@ -2318,14 +2318,15 @@ when the group holds a single filename, since one alias cannot name several file
 Use `import cpp` when a file or header must be bound as C++; the filename extension is irrelevant:
 
 ```c
-import cpp "vendor/widget.h" lib "widget.lib" define "WIDGET_USE=1" cache;
-import cpp { "vendor/widget.h", "vector", "string" } cache;
+import cpp "vendor/widget.h" lib "widget.lib" define "WIDGET_USE=1";
+import cpp { "vendor/widget.h", "vector", "string" };
 ```
 
-A single-file C++ import accepts `lib`, `framework`, repeated `define`, and `cache` clauses.
+A single-file C++ import accepts `lib`, `framework`, and repeated `define` clauses.
 A grouped C++ import accepts the same clauses at group level; `as` is only for one filename, and
 package-only `from` / `pri` clauses are not valid. A grouped import is one C++ translation unit:
-its headers share one header set and one cache key. Use `cache` for large or slow headers.
+its headers share one header set and one cache key. Every import is disk-cached, so a warm
+compile does not reparse the headers.
 
 Raw-pointer parameters of imported C++ functions borrow by default. To transfer a CFlat owner to
 a C++ callee that takes ownership, write `move p`; this consumes `p`, and later use is rejected.
@@ -3219,10 +3220,10 @@ variable, function, struct, or namespace names.
 **Soft keywords** (text-matched by the listener - reserved in the positions where
 they have syntactic meaning, but legal as identifiers in other positions):
 
-`bond`, `cache`, `define`, `from`, `framework`, `lib`, `lock`, `package`, `pri`, `program`, `vectorize`
+`bond`, `define`, `from`, `framework`, `lib`, `lock`, `package`, `pri`, `program`, `vectorize`
 
 Note: `program` remains required at the start of a managed-entry-point definition and
-`program`/`package`/`framework` remain fixed import-form markers (see [`program` Keyword](#program-keyword)); all are legal ordinary identifiers elsewhere. `lib`, `define`, `from`, `pri`, and `cache` are checked by text in their fixed import-clause positions. `in` is a hard keyword and cannot be used as a variable name at all.
+`program`/`package`/`framework` remain fixed import-form markers (see [`program` Keyword](#program-keyword)); all are legal ordinary identifiers elsewhere. `lib`, `define`, `from`, and `pri` are checked by text in their fixed import-clause positions. `in` is a hard keyword and cannot be used as a variable name at all.
 
 **Reserved compiler intrinsics** (built-in pseudo-functions - cannot be redefined):
 

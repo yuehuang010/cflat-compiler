@@ -6,7 +6,7 @@
 // DWORD without including the header that defines them.
 
 import { "windows.h", "psapi.h", "pdh.h", "pdhmsg.h", "appmodel.h", "winver.h" }
-    lib { "psapi.lib", "pdh.lib", "version.lib", "user32.lib", "advapi32.lib" } cache;
+    lib { "psapi.lib", "pdh.lib", "version.lib", "user32.lib", "advapi32.lib" };
 
 // NtQuerySystemInformation is documented in winternl.h but its
 // SYSTEM_PROCESS_INFORMATION layout is deliberately abridged there, so the record

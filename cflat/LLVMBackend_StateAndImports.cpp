@@ -1621,8 +1621,6 @@ void LLVMBackend::SetBatchMode(bool v)
 void LLVMBackend::SetNoCache(bool v)
 { noCache_ = v; }
 
-void LLVMBackend::SetCHeaderCacheDeep(bool v)
-{ cHeaderCacheDeep_ = v; }
 
 void LLVMBackend::SetCppStrictNoexcept(bool v)
 { cppStrictNoexcept_ = v; }
@@ -1757,10 +1755,12 @@ uint64_t LLVMBackend::CHeaderDiskCacheKey(const std::string& fileForLsp,
                                         const std::vector<std::string>& includeDirs,
                                         const std::vector<std::string>& defines,
                                         const std::vector<std::string>& extraDefines,
-                                        bool msvcBitfieldPacking)
+                                        bool msvcBitfieldPacking,
+                                        const std::string& targetTriple)
 {
         return CHeaderDiskCacheKey(std::vector<std::string>{ fileForLsp },
-                                   includeDirs, defines, extraDefines, msvcBitfieldPacking);
+                                   includeDirs, defines, extraDefines, msvcBitfieldPacking,
+                                   targetTriple);
     }
 
 uint64_t LLVMBackend::CHeaderDiskCacheKey(const std::vector<std::string>& headerPaths,
@@ -1768,6 +1768,7 @@ uint64_t LLVMBackend::CHeaderDiskCacheKey(const std::vector<std::string>& header
                                         const std::vector<std::string>& defines,
                                         const std::vector<std::string>& extraDefines,
                                         bool msvcBitfieldPacking,
+                                        const std::string& targetTriple,
                                         bool cxxMode, bool cxxDefinitionsEmitted)
 {
         uint64_t h = 14695981039346656037ULL;
@@ -1781,6 +1782,9 @@ uint64_t LLVMBackend::CHeaderDiskCacheKey(const std::vector<std::string>& header
         // A record's bitfield layout is stored here, and it packs by the target's rule: an entry
         // written for one packing mode is not reusable under the other.
         fold(msvcBitfieldPacking ? "|BFMS" : "|BFIT");
+        // Pointer width, long width and the ABI follow the target: win32 and win64 share every
+        // other input above, so an entry is only valid for the triple it was extracted for.
+        fold("|T"); fold(targetTriple);
         // A C++-mode binding of the same header is a different result; keep the keys apart.
         if (cxxMode) fold("|CXX");
         // A declarations-only C++ bind (LSP: no bodies, empty companion module) is a different
@@ -2955,7 +2959,7 @@ void LLVMBackend::StoreCxxTemplateOwnerMemo(const std::string& cxxBase, size_t g
 {
         if (cxxBase.empty() || group >= cxxImportGroups_.size()) return;
         const CxxImportGroup& owner = cxxImportGroups_[group];
-        if (owner.headers.empty() || !owner.diskCache || runMode_ || batchMode_
+        if (owner.headers.empty() || runMode_ || batchMode_
             || retryingTentativeCxxType_ || symbolSink_ != nullptr)
             return;
         const std::string cacheDir = GetCHeaderCacheDir();
@@ -3316,7 +3320,7 @@ void LLVMBackend::WriteCHeaderDiskCache(
             ec.clear();
         }
 
-        // Deep mode only: the transitive include set for strict (transitive) validation.
+        // The transitive include set (header imports) for transitive validation.
         if (!entry.deps.empty())
         {
             nlohmann::json deps = nlohmann::json::array();
@@ -3747,7 +3751,7 @@ bool LLVMBackend::CompileNugetImport(const std::vector<std::string>& files,
                     { f, packageSpec });
                 return false;
             }
-            bool ok = CompileCHeaderGroup(headerCanonicals, extraDefines, /*diskCache=*/true);
+            bool ok = CompileCHeaderGroup(headerCanonicals, extraDefines);
             if (ok) ProcessPendingMacroSources();
             return ok;
         }

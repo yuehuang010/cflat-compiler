@@ -33,7 +33,7 @@ inline int liveCount() { return Tr::live; }
 `scratch/bb2_ex2.cb`:
 
 ```cflat
-import cpp "bb2_ex.h" cache;
+import cpp "bb2_ex.h";
 
 int callee(int x)
 {

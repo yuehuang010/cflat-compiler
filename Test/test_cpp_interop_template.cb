@@ -148,41 +148,41 @@
 //     Test/errors/err_cpp_template_no_match.cb pins the three refusals (const removed, a
 //     different pointee, and a constness-keyed partial specialization of differing layout).
 
-import cpp "library/cpp_interop_basic.h" cache;
-import cpp "library/cpp_interop_basic.cpp" cache;
-import cpp "library/cpp_interop_freeoptpl.h" cache;
+import cpp "library/cpp_interop_basic.h";
+import cpp "library/cpp_interop_basic.cpp";
+import cpp "library/cpp_interop_freeoptpl.h";
 // One header-only CLASS TEMPLATE pattern. No specialization has a symbol anywhere until a
 // CFlat declaration asks for one, so every class-template assertion also proves the
 // instantiation path emitted the bodies. The libc++ checks need no fixture at all - the
 // libc++ headers are the fixture, reached by the SYSTEM header spelling below.
-import cpp "library/cpp_interop_tpl.h" cache;
-import cpp "library/cpp_interop_by_value.h" cache;
-import cpp "library/cpp_interop_proxy.h" cache;
-import cpp "vector" cache;
-import cpp "tuple" cache;
-import cpp "mutex" cache;
-import cpp "chrono" cache;
-import cpp "thread" cache;
-import cpp "string" cache;
-import cpp "algorithm" cache;
-import cpp "memory" cache;
-import cpp "numeric" cache;
-import cpp "utility" cache;
-import cpp "cstdlib" cache;
-import cpp "cmath" cache;
-import cpp "cstring" cache;
-import cpp "cctype" cache;
-import cpp "cstdio" cache;
-import cpp "map" cache;
-import cpp "deque" cache;
-import cpp "atomic" cache;
-import cpp "library/cpp_interop_scoped_enum.h" cache;
-import cpp "library/cpp_interop_nsstd.h" cache;
-import cpp "library/cpp_interop_strop.h" cache;
+import cpp "library/cpp_interop_tpl.h";
+import cpp "library/cpp_interop_by_value.h";
+import cpp "library/cpp_interop_proxy.h";
+import cpp "vector";
+import cpp "tuple";
+import cpp "mutex";
+import cpp "chrono";
+import cpp "thread";
+import cpp "string";
+import cpp "algorithm";
+import cpp "memory";
+import cpp "numeric";
+import cpp "utility";
+import cpp "cstdlib";
+import cpp "cmath";
+import cpp "cstring";
+import cpp "cctype";
+import cpp "cstdio";
+import cpp "map";
+import cpp "deque";
+import cpp "atomic";
+import cpp "library/cpp_interop_scoped_enum.h";
+import cpp "library/cpp_interop_nsstd.h";
+import cpp "library/cpp_interop_strop.h";
 // std containers over std specializations over USER classes. Neither header
 // includes a standard header, so no single group can declare both halves on its own.
-import cpp "library/cpp_interop_nest.h" cache;
-import cpp "library/cpp_interop_nest2.h" cache;
+import cpp "library/cpp_interop_nest.h";
+import cpp "library/cpp_interop_nest2.h";
 
 // Pre-fix this unscoped C++ enum initializer was rejected as non-constant at file scope. The
 // value leg below also proves the folded global retains its enum type at an enum-typed call.

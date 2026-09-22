@@ -11,7 +11,7 @@
 // Build & run:
 //   x64/Release/cflat.exe example/windows/enum_windows.cb -o out/enum_windows.exe
 //   out\enum_windows.exe
-import "windows.h" lib "user32.lib" cache;
+import "windows.h" lib "user32.lib";
 
 // State shared with the callback, passed by pointer through LPARAM.
 struct EnumStats

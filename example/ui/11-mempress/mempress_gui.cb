@@ -8,7 +8,7 @@
 
 import { "windows.h", "commctrl.h", "uxtheme.h", "dwmapi.h", "shellapi.h", "shlobj.h" }
     lib { "user32.lib", "gdi32.lib", "comctl32.lib", "uxtheme.lib", "dwmapi.lib",
-          "shell32.lib", "ole32.lib", "advapi32.lib" } cache;
+          "shell32.lib", "ole32.lib", "advapi32.lib" };
 
 import "manifest.cb";
 import "appicon.cb";

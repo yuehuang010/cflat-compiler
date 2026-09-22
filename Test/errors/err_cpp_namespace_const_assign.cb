@@ -1,7 +1,7 @@
 // A bound C++ const/constexpr namespace object lives in read-only storage, so a store through
 // it traps at run time. Each leg is a separate scoped block: they are checked independently.
-import cpp "cpp_interop_basic.h" cache;
-import cpp "cpp_interop_basic.cpp" cache;
+import cpp "cpp_interop_basic.h";
+import cpp "cpp_interop_basic.cpp";
 
 extern int main()
 {

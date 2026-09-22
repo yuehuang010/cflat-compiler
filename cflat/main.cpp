@@ -188,7 +188,6 @@ int main(int argc, char* argv[])
     args.addOption("cpu", 0, "Target CPU for code generation (name from --print-supported-cpus, or 'native'); sets ISA features + tuning", "");
     args.addOption("tune", 0, "Tune scheduling for this CPU without changing the instruction set (name or 'native')", "");
     args.addFlag("no-cache", 0, "Bypass the core bitcode cache and reparse core libraries from source");
-    args.addFlag("c-header-cache-deep", 0, "For C headers opted in with the 'cache' import clause, validate every transitively included file (mtime/hash), not just the top header");
     args.addFlag("cpp-strict-noexcept", 0, "Refuse calls to C++ functions that may throw (no noexcept specification). Default follows clang: the call is allowed and an escaping exception terminates the program");
     args.addMultiOption("symbol", 0, "Look up one or more symbols (IDE-style quick search) and exit. An exact name match prints detailed info (kind, signature, location, members); a miss suggests the closest symbols. Indexes the positional source file if given, otherwise the whole core library");
     args.addMultiOption("symbol-dump", 0, "Dump symbol info for source elements, then exit (repeatable). Selector: line:<n>, line:<a>-<b>, or function:<name>. Requires a positional source file");
@@ -573,7 +572,6 @@ int main(int argc, char* argv[])
         auto isolatedPolicy = ConfigureIsolatedMode(compiler, args);
         compiler.SetBatchMode(true);
         compiler.SetNoCache(args.hasFlag("no-cache") || isolatedPolicy.has_value());
-        compiler.SetCHeaderCacheDeep(args.hasFlag("c-header-cache-deep"));
         compiler.SetCppStrictNoexcept(args.hasFlag("cpp-strict-noexcept"));
 
         int failures = 0;
@@ -626,7 +624,6 @@ int main(int argc, char* argv[])
     compiler.SetSkipRuntimeImport(args.hasFlag("no-runtime"));
     auto isolatedPolicy = ConfigureIsolatedMode(compiler, args);
     compiler.SetNoCache(args.hasFlag("no-cache") || isolatedPolicy.has_value());
-    compiler.SetCHeaderCacheDeep(args.hasFlag("c-header-cache-deep"));
     compiler.SetCppStrictNoexcept(args.hasFlag("cpp-strict-noexcept"));
     if (auto sub = args.getOption("subsystem"))
     {

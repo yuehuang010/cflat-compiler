@@ -11,7 +11,7 @@ libc++ on arm64 macOS. This removes the normal C++ formatting and parsing path. 
 ## Repro
 
 ```cflat
-import cpp "sstream" cache;
+import cpp "sstream";
 
 extern int main()
 {

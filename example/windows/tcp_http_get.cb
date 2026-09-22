@@ -22,7 +22,7 @@
 //   out\tcp_http_get.exe example.com /
 //   out\tcp_http_get.exe neverdns.invalid /    (failure path - clean error, exit 1)
 //   out\tcp_http_get.exe --probe               (prints the struct-size diagnostic)
-import {"winsock2.h", "ws2tcpip.h"} lib "ws2_32.lib" cache;
+import {"winsock2.h", "ws2tcpip.h"} lib "ws2_32.lib";
 import "string.cb";
 
 // Winsock numeric constants. AF_INET / SOCK_STREAM / IPPROTO_TCP all fold to

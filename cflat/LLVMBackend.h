@@ -3173,7 +3173,6 @@ private:
     bool batchMode_ = false;
     bool noCache_ = false;
     std::optional<IsolatedPolicy> isolatedPolicy_;
-    bool cHeaderCacheDeep_ = false;  // --c-header-cache-deep: transitive validation of cached C headers
     // --subsystem: PE subsystem for the Windows link ("console" or "windows"). A GUI program
     // needs "windows" or it ships a stray console window; ignored on ELF/Mach-O targets.
     std::string windowsSubsystem_ = "console";
@@ -3229,7 +3228,6 @@ private:
         std::vector<std::string> defines;
         std::unordered_set<std::string> namespaces;
         std::unordered_set<std::string> publishedNames;
-        bool diskCache = false;
         unsigned headerParseCount = 0;
     };
     std::vector<CxxImportGroup> cxxImportGroups_;
@@ -5241,8 +5239,7 @@ private:
 
     // Import-group plumbing for the request layer.
     size_t FindOrAddCxxImportGroup(const std::vector<std::string>& headers,
-                                   const std::vector<std::string>& defines,
-                                   bool diskCache = false);
+                                   const std::vector<std::string>& defines);
     CxxRequestGroup MakeCxxRequestGroup(size_t primary, const std::vector<size_t>& deps) const;
     void PublishCxxGroupNames(size_t group, const std::vector<CRecordEntry>& records);
     void RegisterCxxFunctionTemplates(
@@ -5400,7 +5397,6 @@ private:
     void CollectCxxSignatureRequestItems(const cflat_cinterop::RawSig& sig,
                                          const std::unordered_set<std::string>* localEnums,
                                          std::vector<CxxRequestItem>& out);
-    void PrewarmCxxRequestBatch(std::vector<CxxRequestItem> items);
     bool RequestCxxSignatureTypes(const cflat_cinterop::RawSig& sig,
                                   const std::unordered_set<std::string>* localEnums = nullptr);
     void RequestCxxSignatureTypes(const std::vector<CSigEntry>& sigs);
@@ -5719,11 +5715,11 @@ private:
 
     // Single-header convenience wrapper - the common case (one `import "x.h";`).
     bool CompileCHeader(const std::string& headerPath, const std::vector<std::string>& extraDefines = {},
-                        bool diskCache = false, bool cppMode = false);
+                        bool cppMode = false);
 
     bool CompileCHeaderGroup(const std::vector<std::string>& headerPaths,
                              const std::vector<std::string>& extraDefines = {},
-                             bool diskCache = false, bool cppMode = false);
+                             bool cppMode = false);
 
     // Build a TargetMachine for the current target so the optimizer's PassBuilder
     // has TargetTransformInfo. Without a TM the loop vectorizer cannot cost vector
@@ -9645,9 +9641,6 @@ public:
     void ReportIsolatedPolicyError(const std::string& message) const;
     void ValidateIsolatedExtern(CFlatParser::DeclarationContext* ctx);
     void ValidateIsolatedProgram(antlr4::ParserRuleContext* ctx);
-    // When true, headers opted into the disk cache (via the `cache` import clause) record and
-    // validate every transitively-included file's mtime/hash rather than just the top header.
-    void SetCHeaderCacheDeep(bool v);
     void SetCppStrictNoexcept(bool v);
     void SetWindowsSubsystem(const std::string& v);
 
@@ -9708,7 +9701,7 @@ public:
 
     bool CheckGrammar(const std::string& filename);
 
-    bool CompileImportedFile(const std::string& importingFilePath, const std::string& importFilename, const std::string& namespaceName = {}, const std::string& programAlias = {}, const std::vector<std::string>& explicitLibs = {}, const std::vector<std::string>& extraDefines = {}, bool cacheHeader = false, bool cppMode = false);
+    bool CompileImportedFile(const std::string& importingFilePath, const std::string& importFilename, const std::string& namespaceName = {}, const std::string& programAlias = {}, const std::vector<std::string>& explicitLibs = {}, const std::vector<std::string>& extraDefines = {}, bool cppMode = false);
 
     bool ResolveImportPath(const std::string& importingFilePath, const std::string& importFilename,
                            std::string& outCanonical, bool quiet = false);
@@ -9717,7 +9710,7 @@ public:
                             const std::vector<std::string>& entries,
                             const std::vector<std::string>& groupLibs,
                             const std::vector<std::string>& groupDefines,
-                            bool cacheGroup, bool cppMode = false);
+                            bool cppMode = false);
 
     static std::string ResolveCLinkLib(const std::string& lib, const std::string& importingFilePath);
 
@@ -9753,15 +9746,18 @@ public:
                                         const std::vector<std::string>& includeDirs,
                                         const std::vector<std::string>& defines,
                                         const std::vector<std::string>& extraDefines,
-                                        bool msvcBitfieldPacking);
+                                        bool msvcBitfieldPacking,
+                                        const std::string& targetTriple);
 
     // msvcBitfieldPacking: an imported record's bitfields pack by the MSVC rule on a Windows
     // target and the Itanium rule elsewhere, so the two targets need separate entries.
+    // targetTriple: layouts, constants and signatures differ per target (win32 vs win64).
     static uint64_t CHeaderDiskCacheKey(const std::vector<std::string>& headerPaths,
                                         const std::vector<std::string>& includeDirs,
                                         const std::vector<std::string>& defines,
                                         const std::vector<std::string>& extraDefines,
                                         bool msvcBitfieldPacking,
+                                        const std::string& targetTriple,
                                         bool cxxMode = false,
                                         bool cxxDefinitionsEmitted = false);
 

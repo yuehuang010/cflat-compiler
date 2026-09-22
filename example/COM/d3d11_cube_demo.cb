@@ -25,7 +25,7 @@
 // com.cb is imported BEFORE the SDK headers so its S_OK/E_FAIL/... globals win the redeclaration.
 import "com.cb";
 import { "windows.h", "d3d11.h", "d3dcompiler.h" }
-    lib { "user32.lib", "gdi32.lib", "d3d11.lib", "d3dcompiler.lib", "dxgi.lib" } cache;
+    lib { "user32.lib", "gdi32.lib", "d3d11.lib", "d3dcompiler.lib", "dxgi.lib" };
 import "math.cb";
 import "linear_math.cb";   // mat4f - row-major float 4x4 matrix math
 

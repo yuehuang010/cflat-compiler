@@ -124,38 +124,37 @@
 //     declaring only == and <=> so the relational forms are C++20 rewrites, two
 //     specializations, and a plain class with NON-template free operators as the accept set).
 
-import cpp "library/cpp_interop_basic.h" cache;
-import cpp "library/cpp_interop_basic.cpp" cache;
+import cpp "library/cpp_interop_basic.h";
+import cpp "library/cpp_interop_basic.cpp";
 // Inheritance and virtual dispatch. Definitions are out-of-line on purpose - every
 // virtual function needs a real symbol and the vtable needs a key function.
-import cpp "library/cpp_interop_poly.h" cache;
-import cpp "library/cpp_interop_poly.cpp" cache;
+import cpp "library/cpp_interop_poly.h";
+import cpp "library/cpp_interop_poly.cpp";
 // HEADER-ONLY C++ - no .cpp anywhere. Every definition is inline in the header, so
 // clang CodeGen has to emit the bodies, vtables and inline statics into the companion module.
 // The second header re-includes the first from a DIFFERENT import group, which is the
 // duplicate-definition (ODR merge) check.
-import cpp "library/cpp_interop_inline.h" cache;
-import cpp "library/cpp_interop_inline_again.h" cache;
+import cpp "library/cpp_interop_inline.h";
+import cpp "library/cpp_interop_inline_again.h";
 // The `T&` constructor-parameter checks lock a CFlat-owned std.mutex through std.lock_guard / std.unique_lock.
-import cpp "mutex" cache;
-import cpp "library/cpp_interop_throw.h" cache;
-import cpp "library/cpp_interop_scoped_enum.h" cache;
+import cpp "mutex";
+import cpp "library/cpp_interop_throw.h";
+import cpp "library/cpp_interop_scoped_enum.h";
 // C++ REFERENCE data members - bound as pointer fields, never reseatable.
-import cpp "library/cpp_interop_ref_member.h" cache;
-import cpp "library/cpp_interop_field.h" cache;
-// Array elements of a C++ class. Imported WITHOUT the header cache so those checks
-// does not depend on cache state.
+import cpp "library/cpp_interop_ref_member.h";
+import cpp "library/cpp_interop_field.h";
+// Array elements of a C++ class.
 import cpp "library/cpp_interop_arrayelem.h";
 import "library/cpp_interop_globals.cb";
 // Using-directives, including ones nominating a namespace nested in the nominator.
-import cpp "library/cpp_interop_usingns.h" cache;
+import cpp "library/cpp_interop_usingns.h";
 // A C++ CONSTRUCTOR parameter declared `T&` binds the argument's address.
-import cpp "library/cpp_interop_ctorref.h" cache;
-import cpp "library/cpp_interop_freeoptpl.h" cache;
+import cpp "library/cpp_interop_ctorref.h";
+import cpp "library/cpp_interop_freeoptpl.h";
 // `explicit` constructors are not implicit conversions at a call argument; the non-explicit
 // converting constructor in the same header is the accept set. Rejections: err_cpp_explicit_ctor.cb.
-import cpp "library/cpp_interop_explicit.h" cache;
-import cpp "string" cache;
+import cpp "library/cpp_interop_explicit.h";
+import cpp "string";
 import "list.cb";
 import "thread.cb";
 import "malloc_allocator.cb";

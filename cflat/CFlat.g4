@@ -764,11 +764,11 @@ usingDeclaration
     ;
 
 importDeclaration
-    : Import importGroup (As Identifier)? libClause? frameworkClause? defineClause* cacheClause? fromClause? ';'
+    : Import importGroup (As Identifier)? libClause? frameworkClause? defineClause* fromClause? ';'
     | Import Identifier StringLiteral As Identifier ';'
     | Import 'package-vcpkg' StringLiteral fromClause defineClause* ';'
     | Import 'package-nuget' importGroup fromClause priClause? defineClause* ';'
-    | Import Identifier importGroup libClause? frameworkClause? defineClause* cacheClause? ';'
+    | Import Identifier importGroup libClause? frameworkClause? defineClause* ';'
     ;
 
 // A plain file import target: either a single bare filename or a brace-wrapped comma
@@ -820,16 +820,6 @@ defineClause
 // output exe as <exe>.pri. Only valid on the package-nuget import alternative.
 priClause
     : Identifier StringLiteral
-    ;
-
-// Optional inline opt-in to the persistent C-header disk cache:
-//   import "windows.h" cache;
-//   import package "curl/curl.h" lib "libcurl.lib" cache;
-// `cache` is a soft keyword (inline literal, like lib/define/from). When present, the
-// extracted declarations for this header are cached to %USERPROFILE%\.cflat\cheaders so
-// the next cold compile loads the JSON instead of re-running the clang header parse.
-cacheClause
-    : Identifier
     ;
 
 // Required source spec on an `import package-vcpkg` / `import package-nuget` line:

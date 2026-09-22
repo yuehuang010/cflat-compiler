@@ -10,8 +10,8 @@
 //
 // windows.h + tlhelp32.h are bound as ONE group: tlhelp32.h is not self-contained (it uses
 // HANDLE/DWORD without including the header that defines them), so windows.h must be included
-// first in the same translation unit. The `cache` clause persists the extracted decls.
-import {"windows.h", "tlhelp32.h"} cache;   // PROCESSENTRY32 + CreateToolhelp32Snapshot/Process32First/Next
+// first in the same translation unit. The extracted decls persist in the disk cache.
+import {"windows.h", "tlhelp32.h"};   // PROCESSENTRY32 + CreateToolhelp32Snapshot/Process32First/Next
 import "string.cb";
 import "list.cb";
 import "dictionary.cb";

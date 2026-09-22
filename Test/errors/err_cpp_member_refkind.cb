@@ -1,6 +1,6 @@
 // C++ member and free reference parameters follow C++ value-category binding rules.
 import cpp "cpp_interop_ctorref.h";
-import cpp "cpp_interop_tpl.h" cache;
+import cpp "cpp_interop_tpl.h";
 
 extern int main()
 {

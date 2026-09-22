@@ -1,5 +1,5 @@
 // The scripts force a zero header-parse budget, so the first C++ header parse must be reported.
-// The `cache` clause makes budget 0 strict (an uncached import line may always parse its one TU);
-// the define keeps the group key private, and the rejected parse never stores, so warm runs fire too.
+// The define keeps this import's cache key private; the refused parse never stores, so the warm
+// run parses and reports again.
 expect_error("was parsed");
-import cpp "cpp_interop_basic.h" define "CFLAT_HEADER_BUDGET_PROBE" cache;
+import cpp "cpp_interop_basic.h" define "CFLAT_HEADER_BUDGET_PROBE";
