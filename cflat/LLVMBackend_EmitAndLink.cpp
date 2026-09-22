@@ -1531,7 +1531,7 @@ bool ViewTypesCompatible(const llvm::Type* first, const llvm::Type* second)
 std::unique_ptr<llvm::Module> LLVMBackend::GetOrBuildOptimizedView(int optLevel)
 {
     optimizedViewWasIncremental_ = false;
-    const bool viewTraceEnabled = viewTraceEnabled_ || std::getenv("CFLAT_VIEW_INC_TRACE");
+    const bool viewTraceEnabled = std::getenv("CFLAT_VIEW_INC_TRACE") != nullptr;
     if (optLevel <= 0 || !context)
         return nullptr;
 

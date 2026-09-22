@@ -831,14 +831,12 @@ bool testGlobalDefaultSeeding()
     result &= Test("gseed_ns_global_a", gSeedNs.a, 94);
 
     /*
-     * Policy pin, not a discriminator: a user-written constructor BODY runs statements, and a
-     * global initializer has to be a compile-time constant, so that construction does not fold
-     * and the global stays zeroed (with a located note saying so). The local twin below is the
-     * value the global deliberately does NOT get.
+     * A user-written constructor BODY runs statements, so that construction does not fold to a
+     * constant initializer; it runs before main instead, and the global matches its local twin.
      */
     GSeedUserCtor lUser;
     result &= Test("gseed_userctor_local_a", lUser.a, 96);
-    result &= Test("gseed_userctor_global_a", gSeedUserCtor.a, 0);
+    result &= Test("gseed_userctor_global_a", gSeedUserCtor.a, 96);
     return result;
 }
 

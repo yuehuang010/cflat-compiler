@@ -1698,6 +1698,7 @@ void MainListener::ResolvePendingGlobalDefaultConstructions()
         auto pending = std::move(pendingGlobalDefaultConstructions_);
         pendingGlobalDefaultConstructions_.clear();
         FoldConstructedValueState foldState;
+        std::vector<const PendingGlobalDefaultConstruction*> runtime;
         for (const auto& item : pending)
         {
             if (item.Global == nullptr || item.Global->isDeclaration()) continue;
@@ -1707,10 +1708,60 @@ void MainListener::ResolvePendingGlobalDefaultConstructions()
                 item.Global->setInitializer(folded);
                 continue;
             }
-            LogWarningContext(item.Context, std::format(
-                "({}) global is zero-initialized: its default construction could not be reduced to a compile-time constant here.",
-                SpellType(*compilerLLVM, item.TypeValue)));
+            // The module initializer runs on ONE thread, so a 'thread_local' copy in any other
+            // thread would still read zero.
+            if (item.TypeValue.threadLocal)
+            {
+                LogWarningContext(item.Context, std::format(
+                    "({}) global is zero-initialized: its default construction could not be reduced to a compile-time constant here.",
+                    SpellType(*compilerLLVM, item.TypeValue)));
+                continue;
+            }
+            runtime.push_back(&item);
         }
+        if (runtime.empty()) return;
+
+        /*
+         * A construction that does not fold (a constructor body, an owning field) runs before main
+         * instead, exactly as the local declarator would run it. RULING: globals follow the Rust
+         * rule - constructed before main, no exit-time destruction. The function joins the C++
+         * global initializers, so FinalizeGlobalConstructorOrder calls it in AOT and --run alike.
+         */
+        auto* compiler = compilerLLVM;
+        auto savedState = compiler->SaveBuilderState();
+        auto* voidTy = llvm::FunctionType::get(compiler->builder->getVoidTy(), false);
+        auto* initFn = llvm::Function::Create(
+            voidTy, llvm::Function::InternalLinkage, "__cflat_global_default_init",
+            compiler->module.get());
+        compiler->builder->SetInsertPoint(llvm::BasicBlock::Create(*compiler->context, "entry", initFn));
+        try
+        {
+            GlobalScopeGuard initScope(global_scope);
+            for (const auto* item : runtime)
+            {
+                if (item->TypeValue.ConstArraySize > 0)
+                {
+                    EmitFixedArrayDefaultInit(item->Global, item->TypeValue, item->Context);
+                    continue;
+                }
+                if (compiler->GetFunction(item->TypeValue.TypeName) == nullptr) continue;
+                llvm::Value* constructed =
+                    compiler->CreateOverloadedFunctionCall(item->TypeValue.TypeName, {}, true);
+                if (constructed != nullptr && constructed->getType() == item->Global->getValueType())
+                    compiler->builder->CreateStore(constructed, item->Global);
+            }
+        }
+        catch (...)
+        {
+            // LogError THROWS and expect_error resumes the walk, so the half-built initializer
+            // must go and the builder must be restored before the walk continues.
+            initFn->eraseFromParent();
+            compiler->RestoreBuilderState(savedState);
+            throw;
+        }
+        compiler->builder->CreateRetVoid();
+        compiler->RestoreBuilderState(savedState);
+        compiler->cflatGlobalCxxInitFns_.push_back(initFn);
     }
 
 /*

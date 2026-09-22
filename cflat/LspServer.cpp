@@ -526,7 +526,6 @@ public:
             auto b = std::make_unique<LLVMBackend>();
             b->SetRuntimeDir(runtimeDir_);
             b->SetVerbose(verbose_);
-            b->SetViewTraceEnabled(true);
             ApplyLocale(*b);
             backendPool_.push_back(std::move(b));
             freeBackends_.push_back(i);
@@ -2265,7 +2264,6 @@ private:
                 auto fresh = std::make_unique<LLVMBackend>();
                 fresh->SetRuntimeDir(runtimeDir_);
                 fresh->SetVerbose(verbose_);
-                fresh->SetViewTraceEnabled(true);
                 ApplyLocale(*fresh);
                 backendPool_[slot] = std::move(fresh);
                 backendAnalyzed_[slot] = false;
@@ -2464,7 +2462,9 @@ private:
                        size_t textSize, size_t mappingCount,
                        size_t functionCount, size_t remarkCount, bool cached = false)
     {
-        if (!job.irRequest) return;
+        // Timing is opt-in via CFLAT_VIEW_INC_TRACE only (not --verbose, which the VS Code debug
+        // launch passes), so the extension's output window never shows view traces.
+        if (!job.irRequest || std::getenv("CFLAT_VIEW_INC_TRACE") == nullptr) return;
         const auto& request = *job.irRequest;
         const std::string function = request.function.value_or("");
         std::cerr << std::format("[lsp] view kind={} opt={} fn='{}' analyze={}ms emit={}ms total={}ms",

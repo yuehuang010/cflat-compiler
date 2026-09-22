@@ -2930,7 +2930,6 @@ private:
     };
     std::optional<IncrementalViewSnapshot> incrementalViewSnapshot_;
     bool optimizedViewWasIncremental_ = false;
-    bool viewTraceEnabled_ = false;
     // Names present when a core bitcode cache was loaded; later functions are user IR.
     std::optional<std::unordered_set<std::string>> cachedFunctionNames_;
 
@@ -9610,7 +9609,6 @@ public:
                                 std::vector<std::string> arguments = {}) const;
     std::function<std::string(std::string, std::vector<std::string>)> MakeDiagnosticLocalizer() const;
     void SetVerbose(bool v);
-    void SetViewTraceEnabled(bool enabled);
     bool IsVerbose() const;
     // Enable AddressSanitizer instrumentation + runtime linking. Best paired with -g.
     void SetAsan(bool v);
