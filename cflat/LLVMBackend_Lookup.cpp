@@ -480,7 +480,17 @@ bool LLVMBackend::IsCxxRvalueReferenceArgument(const NamedVariable& arg) const
 {
         // Rvalue-ness must be PROVEN. Without argument provenance nothing is proven, and an
         // argument that has addressable storage or came back as a reference is an lvalue.
-        if (arg.IsRvalue || IsRvalueReferenceArgument(arg)) return true;
+        if (arg.IsExplicitMove) return true;
+        if (arg.IsRvalue && arg.TypeAndValue.Pointer) return true;
+        if (arg.IsRvalue && IsConsumableTemporary(arg)) return true;
+        if (arg.IsRvalue)
+        {
+            if (arg.Storage != nullptr) return false;
+            if (!arg.CallerName.empty() && FindVariableStorage(arg.CallerName).Storage != nullptr)
+                return false;
+            return true;
+        }
+        if (IsRvalueReferenceArgument(arg)) return true;
         if (arg.TypeAndValue.IsAlias) return false;   // a reference-returning call result
         llvm::Value* storage = arg.Storage;
         if (storage == nullptr && !arg.CallerName.empty())

@@ -423,6 +423,11 @@
       "300",
       "i8"
     ],
+    "cheadergrouparg0wasp...atcppmaxheaderparses6e18d1ff4cf3c9e3": [
+      "cpp_interop_basic.h",
+      "1",
+      "0"
+    ],
     "classarg0doesnotimpl...arg2expectedtypearg3ebaf272f95f0b03d": [
       "Untitled",
       "ITitled",
@@ -1889,6 +1894,7 @@
     "cannotstoreathatjoin...ndependentownedvalue71d560cf28a01507": "cannot store a '?:' that joins two borrowed '{0}' arms into {1}; the destination's destructor would free a value its existing owner still frees. Assign each arm in its own branch, 'move' each arm into a fresh owned value, declare the function 'alias' to hand the borrow through, or write a 'copy()' method for '{2}' and copy the arm into an independent owned value.",
     "cannotstorenewarg0ni...heelementtypesdiffer50877848c28b7c8c": "cannot store 'new {0}[n]' into '{1}': the element types differ",
     "caselabelarg0doesnot...witchoperandtypearg173c0ac994b6f333f": "case label '{0}' does not fit the switch operand type '{1}'",
+    "cheadergrouparg0wasp...atcppmaxheaderparses6e18d1ff4cf3c9e3": "C++ header group '{0}' was parsed {1} times in one compile; the budget is {2} (set CFLAT_CPP_MAX_HEADER_PARSES)",
     "cheaderimporttargeti...nshowsdkpathresolves750eacee18ce6665": "C header import targeting macOS requires an SDK: set $SDKROOT or install Xcode / Command Line Tools so 'xcrun --show-sdk-path' resolves",
     "checkparameterlistmissingtypeorclosing": "check parameter list - missing type or closing ')'?",
     "checkthefunctionsign...ntypeorparametertypee122f770d128f73e": "check the function signature - missing return type or parameter type?",

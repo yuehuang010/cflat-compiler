@@ -9581,9 +9581,12 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
             std::vector<std::string> namespaces;
             auto addNamespace = [&](const std::string& typeName) {
                 if (typeName.empty()) return;
-                const size_t dot = typeName.rfind('.');
+                // Template arguments follow the first '$' and carry their own dots
+                // ("std.__wrap_iter$std.stringptr"); the namespace comes from the base name.
+                const std::string base = typeName.substr(0, typeName.find('$'));
+                const size_t dot = base.rfind('.');
                 const std::string ns = dot == std::string::npos
-                    ? std::string() : typeName.substr(0, dot);
+                    ? std::string() : base.substr(0, dot);
                 if (std::find(namespaces.begin(), namespaces.end(), ns) == namespaces.end())
                     namespaces.push_back(ns);
             };

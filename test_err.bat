@@ -49,6 +49,7 @@ set /a GRP_REM=%~1-1
 call :RunModuloGroup !GRP_REM! %GROUP_COUNT%
 call :RunPolicyModuloGroup !GRP_REM! %GROUP_COUNT%
 if "%~1"=="1" (
+    call :RunHeaderBudgetTest
     for %%F in (%SRC%\errors\circular\entry_*.cb) do (
         call :RunCircularTest %%~nxF
     )
@@ -66,7 +67,7 @@ set /a CTR=0
 set "GROUPFILES="
 for %%F in (%SRC%\errors\err_*.cb) do (
     REM A file with a `.cb.flags` sidecar needs its own flags, so it runs alone (see below).
-    if not exist "%%F.flags" (
+    if not exist "%%F.flags" if /I not "%%~nF"=="err_cpp_header_parse_budget" (
         set /a MOD=CTR %% MOD_DIV
         if !MOD!==!MOD_REM! set "GROUPFILES=!GROUPFILES! %SRC%\errors\%%~nxF"
         set /a CTR+=1
@@ -79,6 +80,23 @@ if defined GROUPFILES (
         set /a ERRORS+=1
         set /a NORMAL_ERRORS+=1
     )
+)
+exit /b
+
+:RunHeaderBudgetTest
+set "HEADER_BUDGET_FILE=%SRC%\errors\err_cpp_header_parse_budget.cb"
+if not exist "%HEADER_BUDGET_FILE%" exit /b
+echo === %~n0: err_cpp_header_parse_budget ===
+set CFLAT_CPP_MAX_HEADER_PARSES=0
+%COMPILER% --check -i %LIB% --locale pseudo --locale-dir "%CFLAT_LOCALE_DIR%" --nologo "%HEADER_BUDGET_FILE%"
+set HEADER_BUDGET_RC=!ERRORLEVEL!
+set CFLAT_CPP_MAX_HEADER_PARSES=
+if !HEADER_BUDGET_RC! neq 0 (
+    set /a ERRORS+=1
+    set /a NORMAL_ERRORS+=1
+    echo FAILED: err_cpp_header_parse_budget
+) else (
+    echo PASS: err_cpp_header_parse_budget
 )
 exit /b
 
@@ -195,9 +213,13 @@ exit /b
 
 :Discover
 set "DISCOVERY_FILES="
-for %%F in (%SRC%\errors\err_*.cb) do if not exist "%%F.flags" set "DISCOVERY_FILES=!DISCOVERY_FILES! "%SRC%\errors\%%~nxF""
+for %%F in (%SRC%\errors\err_*.cb) do if not exist "%%F.flags" if /I not "%%~nF"=="err_cpp_header_parse_budget" set "DISCOVERY_FILES=!DISCOVERY_FILES! "%SRC%\errors\%%~nxF""
 %COMPILER% --locale pseudo --update-locale en-pseudo --locale-dir "%CFLAT_LOCALE_DIR%" --check -i %LIB% --nologo !DISCOVERY_FILES!
 if errorlevel 1 exit /b 1
+set CFLAT_CPP_MAX_HEADER_PARSES=0
+%COMPILER% --locale pseudo --update-locale en-pseudo --locale-dir "%CFLAT_LOCALE_DIR%" --check -i %LIB% --nologo %SRC%\errors\err_cpp_header_parse_budget.cb
+if errorlevel 1 exit /b 1
+set CFLAT_CPP_MAX_HEADER_PARSES=
 REM Top-level fixtures with a `.cb.flags` sidecar are discovered one at a time, with their flags.
 for %%F in (%SRC%\errors\err_*.cb) do if exist "%%F.flags" (
     call :LoadPolicyFlags "%%F"

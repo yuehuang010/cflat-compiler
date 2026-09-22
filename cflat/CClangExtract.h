@@ -12,6 +12,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -20,6 +21,7 @@ namespace clang
 {
     class CompilerInstance;
     class TranslationUnitDecl;
+    class Decl;
 }
 
 namespace llvm
@@ -477,6 +479,9 @@ namespace cflat_cinterop
 
     struct ExtractRequest
     {
+        // Called immediately before a full frontend parse that includes the C++ header group.
+        // Macro prepasses and incremental request chunks do not invoke it.
+        std::function<bool(const char*)> cxxHeaderParseGuard;
         // Virtual main-file name for the in-memory stub (e.g. "cflat_hdr_stub.c"). When
         // `source` is empty, `realPath` names a real .c file on disk to parse instead.
         std::string mainFileName;
@@ -629,5 +634,7 @@ namespace cflat_cinterop
                                const std::vector<clang::TranslationUnitDecl*>& extraRoots,
                                llvm::Module* module,
                                ExtractResult& out, std::string& err,
-                               bool checkHeader = false);
+                               bool checkHeader = false,
+                               clang::TranslationUnitDecl* preludeRoot = nullptr,
+                               const std::vector<clang::Decl*>* announcedDecls = nullptr);
 }

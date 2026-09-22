@@ -134,6 +134,20 @@ is_err_skipped() {
   return 1
 }
 
+cpp_budget_enabled() {
+  case "${CFLAT_CPP_INCREMENTAL:-}" in
+    0|off|false) return 1 ;;
+  esac
+  return 0
+}
+
+is_cpp_interop_test() {
+  case "$1" in
+    test_cpp_interop*) return 0 ;;
+  esac
+  return 1
+}
+
 # Millisecond wall clock: bash's $SECONDS is too coarse and BSD date has no %N,
 # so use perl Time::HiRes (present on macOS and Linux), falling back to seconds.
 now_ms() {
@@ -166,18 +180,43 @@ run_cb() {
   local f="$1" n; n="$(basename "$f" .cb)"
   local log="$RES/$n.log" status t0; t0=$(now_ms)
   local -a xargs_cb=()
+  local -a compiler_env=(env)
   read -r -a xargs_cb <<< "$(cb_extra_args "$f")"
+  if cpp_budget_enabled && is_cpp_interop_test "$n"; then
+    compiler_env=(env CFLAT_CPP_MAX_HEADER_PARSES=1)
+  fi
   local TIMEOUT="$TIMEOUT"
   case "$HEAVY_TESTS" in *" $n "*) TIMEOUT="${TIMEOUT/$TIMEOUT_SECS/$HEAVY_TIMEOUT_SECS}" ;; esac
   if [ "$RUN_MODE" -eq 1 ]; then
-    if $TIMEOUT "$CFLAT" "$f" -i "$LIB" --locale-dir "$LOCALE_DIR" \
+    if $TIMEOUT "${compiler_env[@]}" "$CFLAT" "$f" -i "$LIB" --locale-dir "$LOCALE_DIR" \
         ${xargs_cb[@]+"${xargs_cb[@]}"} --run --nologo >"$log" 2>&1; then
       status="PASS"
     else
       status="FAIL run"
     fi
-  elif ! $TIMEOUT "$CFLAT" "$f" -i "$LIB" --locale-dir "$LOCALE_DIR" \
+  elif ! $TIMEOUT "${compiler_env[@]}" "$CFLAT" "$f" -i "$LIB" --locale-dir "$LOCALE_DIR" \
         ${xargs_cb[@]+"${xargs_cb[@]}"} -o "$RES/$n.bin" >"$log" 2>&1; then
+    status="FAIL compile"
+  elif $TIMEOUT "$RES/$n.bin" </dev/null >>"$log" 2>&1; then
+    status="PASS"
+  else
+    status="FAIL run(rc=$?)"
+  fi
+  write_result "$n" "$status" "$t0"
+}
+
+run_cb_warm() {
+  local f="$1" base n; base="$(basename "$f" .cb)"; n="$base.warm"
+  local log="$RES/$n.log" status t0; t0=$(now_ms)
+  local -a xargs_cb=()
+  local -a compiler_env=()
+  read -r -a xargs_cb <<< "$(cb_extra_args "$f")"
+  if cpp_budget_enabled; then
+    compiler_env=(env CFLAT_CPP_MAX_HEADER_PARSES=0)
+  fi
+  if ! $TIMEOUT "${compiler_env[@]}" "$CFLAT" "$f" -i "$LIB" \
+      --locale-dir "$LOCALE_DIR" ${xargs_cb[@]+"${xargs_cb[@]}"} -o "$RES/$n.bin" \
+      >"$log" 2>&1; then
     status="FAIL compile"
   elif $TIMEOUT "$RES/$n.bin" </dev/null >>"$log" 2>&1; then
     status="PASS"
@@ -223,8 +262,12 @@ check_err_result() {
 run_err() {
   local f="$1" n; n="$(basename "$f" .cb)"
   local log="$RES/$n.log" rc=0 t0; t0=$(now_ms)
+  local -a compiler_env=()
+  if [ "$n" = "err_cpp_header_parse_budget" ]; then
+    compiler_env=(env CFLAT_CPP_MAX_HEADER_PARSES=0)
+  fi
   load_err_flags "$f.flags"
-  $TIMEOUT "$CFLAT" "$f" -i "$LIB" --locale pseudo --locale-dir "$LOCALE_DIR" --check \
+  $TIMEOUT "${compiler_env[@]}" "$CFLAT" "$f" -i "$LIB" --locale pseudo --locale-dir "$LOCALE_DIR" --check \
     "${ERR_FLAGS[@]}" >"$log" 2>&1 || rc=$?
   if check_err_result "$rc" "$log"; then
     write_result "$n" "PASS" "$t0"
@@ -239,8 +282,12 @@ run_err() {
 run_err_warm() {
   local f="$1" n; n="$(basename "$f" .cb).warm"
   local log="$RES/$n.log" rc=0 t0; t0=$(now_ms)
+  local -a compiler_env=()
+  if [ "${n%.warm}" = "err_cpp_header_parse_budget" ]; then
+    compiler_env=(env CFLAT_CPP_MAX_HEADER_PARSES=0)
+  fi
   load_err_flags "$f.flags"
-  $TIMEOUT "$CFLAT" "$f" -i "$LIB" --locale pseudo --locale-dir "$LOCALE_DIR" --check \
+  $TIMEOUT "${compiler_env[@]}" "$CFLAT" "$f" -i "$LIB" --locale pseudo --locale-dir "$LOCALE_DIR" --check \
     "${ERR_FLAGS[@]}" >"$log" 2>&1 || rc=$?
   if check_err_result "$rc" "$log"; then
     write_result "$n" "PASS" "$t0"
@@ -249,7 +296,8 @@ run_err_warm() {
   fi
 }
 
-export -f run_cb cb_extra_args load_err_flags check_err_result run_err run_err_warm is_skipped \
+export -f run_cb run_cb_warm cb_extra_args load_err_flags check_err_result run_err run_err_warm \
+  is_cpp_interop_test cpp_budget_enabled is_skipped \
   now_ms write_result
 export CFLAT LIB LOCALE_DIR RES TIMEOUT RUN_MODE TIMEOUT_SECS HEAVY_TIMEOUT_SECS HEAVY_TESTS
 
@@ -265,18 +313,21 @@ RUN_TESTS="test_allocators test_basic test_bitmap test_c test_com test_core test
 
 # Build the work list, then fan out across $JOBS workers via xargs -P.
 cb_list=""
+cpp_list=""
 if [ "$RUN_MODE" -eq 1 ]; then
   for n in $RUN_TESTS; do
     f="$SRC/$n.cb"
     [ -f "$f" ] || { echo "missing opt-in --run fixture: $f"; exit 1; }
     is_skipped "$n" && continue
-    cb_list="$cb_list$f"$'\n'
+    if is_cpp_interop_test "$n"; then cpp_list="$cpp_list$f"$'\n';
+    else cb_list="$cb_list$f"$'\n'; fi
   done
 else
   for f in "$SRC"/test_*.cb; do
     n="$(basename "$f" .cb)"
     is_skipped "$n" && continue
-    cb_list="$cb_list$f"$'\n'
+    if is_cpp_interop_test "$n"; then cpp_list="$cpp_list$f"$'\n';
+    else cb_list="$cb_list$f"$'\n'; fi
   done
 fi
 err_list=""
@@ -290,7 +341,11 @@ if [ -d "$SRC/errors" ]; then
     err_list="$err_list$f"$'\n'
     err_files+=("$f")
     # A fixture with a `.cb.flags` sidecar is discovered one at a time below, with its flags.
-    if [ -f "$f.flags" ]; then err_sidecar_files+=("$f"); else err_discovery_files+=("$f"); fi
+    if [ -f "$f.flags" ]; then
+      err_sidecar_files+=("$f")
+    elif [ "$n" != "err_cpp_header_parse_budget" ]; then
+      err_discovery_files+=("$f")
+    fi
   done
   if [ -d "$SRC/errors/policy" ]; then
     for f in "$SRC"/errors/policy/err_*.cb; do
@@ -300,6 +355,16 @@ if [ -d "$SRC/errors" ]; then
       err_list="$err_list$f"$'\n'
       err_files+=("$f")
     done
+  fi
+fi
+
+if [ "$RUN_MODE" -eq 0 ] && [ -f "$SRC/errors/err_cpp_header_parse_budget.cb" ]; then
+  if ! CFLAT_CPP_MAX_HEADER_PARSES=0 "$CFLAT" --locale pseudo --update-locale en-pseudo \
+      --locale-dir "$LOCALE_DIR" --check -i "$LIB" \
+      "$SRC/errors/err_cpp_header_parse_budget.cb" >"$RES/_header_budget_locale.log" 2>&1; then
+    echo "FAIL: header-parse budget diagnostic discovery failed"
+    tail -n 20 "$RES/_header_budget_locale.log"
+    exit 1
   fi
 fi
 
@@ -327,7 +392,23 @@ if [ "$RUN_MODE" -eq 0 ]; then
   done
 fi
 
+# C++ interop tests get an explicit cold header-cache pass. Keep the per-exe core cache intact,
+# but clear all persisted C++ header/request entries so the budgeted run really creates chunk 0.
+if [ "$RUN_MODE" -eq 0 ] && cpp_budget_enabled; then
+  cpp_headers="$(dirname "$CFLAT")/.cflat/cheaders"
+  if [ -d "$cpp_headers" ]; then
+    find "$cpp_headers" -mindepth 1 -delete
+  fi
+fi
+
 printf '%s' "$cb_list"  | grep -v '^$' | xargs -P "$JOBS" -I{} bash -c 'run_cb "$@"' _ {}
+while IFS= read -r f; do
+  [ -n "$f" ] || continue
+  cpp_headers="$(dirname "$CFLAT")/.cflat/cheaders"
+  if [ -d "$cpp_headers" ]; then find "$cpp_headers" -mindepth 1 -delete; fi
+  run_cb "$f"
+  if [ "$RUN_MODE" -eq 0 ] && cpp_budget_enabled; then run_cb_warm "$f"; fi
+done <<< "$cpp_list"
 if [ "$RUN_MODE" -eq 0 ]; then
   printf '%s' "$err_list" | grep -v '^$' | xargs -P "$JOBS" -I{} bash -c 'run_err "$@"' _ {}
 fi

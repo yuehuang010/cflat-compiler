@@ -56,6 +56,10 @@
 #include <sys/sysctl.h>
 #endif
 
+// Identity helper declared once per default-wrapper chunk; an incremental group remembers it.
+static const std::string kCxxWrapperPidDecl =
+    "template <class T> struct __cflat_pid { typedef T type; };\n";
+
 // ---- Definitions moved out of LLVMBackend.h (CInterop) ----
 
 struct CHeaderRefusalDep
@@ -2625,7 +2629,7 @@ static std::string BuildCxxDefaultWrappers(
                                  int refQualifier) {
             if (!emitted)
             {
-                source += "template <class T> struct __cflat_pid { typedef T type; };\n";
+                source += kCxxWrapperPidDecl;
                 emitted = true;
             }
             const std::string cppName = base + "_cpp";
@@ -3447,6 +3451,8 @@ void LLVMBackend::HarvestComUuids(const std::vector<std::string>& headerPaths, c
         req.uuidHarvestCxx    = true;
         req.skipFunctionBodies = true;
         req.verbose            = verbose;
+        if (activeCxxRequestGroup_ != nullptr)
+            AttachCxxHeaderParseGuard(req, *activeCxxRequestGroup_);
 
         cflat_cinterop::ExtractResult uuidRaw;
         std::string err;
@@ -3544,6 +3550,8 @@ bool LLVMBackend::ExtractCHeaderClang(const std::vector<std::string>& headerPath
         req.skipFunctionBodies = !req.emitDefinitions;
         req.wantIncludes   = (outIncludes != nullptr) || cxxMode;
         req.verbose        = verbose;
+        if (cxxMode && activeCxxRequestGroup_ != nullptr)
+            AttachCxxHeaderParseGuard(req, *activeCxxRequestGroup_);
 
         // Expand um/<->shared/ siblings: the Windows SDK splits its surface across both and
         // code from MSDN fails without the sibling (ERROR_SUCCESS, MAX_PATH, etc.).
@@ -3604,8 +3612,7 @@ bool LLVMBackend::ExtractCHeaderClang(const std::vector<std::string>& headerPath
                 CxxIncrementalGroup* incremental = GetCxxIncrementalGroup(
                     *activeCxxRequestGroup_, err, headerChunk, /*tolerateDiagnostics*/ true);
                 extracted = incremental != nullptr
-                    && incremental->HarvestHeader(incrementalReq, raw, err)
-                    && raw.incompleteCxxTypeSpellings.empty();
+                    && incremental->HarvestHeader(incrementalReq, raw, err);
                 if (extracted && !prepass.macroProbes.empty())
                 {
                     std::string probes;
@@ -3624,10 +3631,13 @@ bool LLVMBackend::ExtractCHeaderClang(const std::vector<std::string>& headerPath
                     probeReq.skipFunctionBodies = true;
                     probeReq.wantMacros = false;
                     cflat_cinterop::ExtractResult probeRaw;
-                    extracted = incremental->ParseRequest(probeReq, probes, probeRaw, err);
-                    if (extracted)
+                    const bool probesExtracted = incremental->ParseRequest(
+                        probeReq, probes, probeRaw, err);
+                    if (probesExtracted)
                         raw.macros.insert(raw.macros.end(), probeRaw.macros.begin(),
                                           probeRaw.macros.end());
+                    else
+                        err.clear();
                 }
             }
             if (!extracted)
@@ -3729,10 +3739,17 @@ bool LLVMBackend::ExtractCHeaderClang(const std::vector<std::string>& headerPath
                     {
                         CxxIncrementalGroup* incremental = GetCxxIncrementalGroup(
                             *activeCxxRequestGroup_, wrappedError);
-                        wrappedReq.source = wrappers;
                         wrappedReq.cxxWrapperBatch = true;
+                        const std::string wrapperInput = incremental == nullptr ? wrappers
+                            : BuildCxxRequestIncludes(*activeCxxRequestGroup_)
+                                + incremental->UnseenPrefixSource(wrappers);
                         wrapperOk = incremental != nullptr
-                            && incremental->ParseRequest(wrappedReq, wrappers, wrapped, wrappedError);
+                            && incremental->ParseRequest(wrappedReq, wrapperInput, wrapped,
+                                                         wrappedError);
+                        // A live Interpreter keeps the helper once a chunk declared it;
+                        // later chunks must not redefine it.
+                        if (wrapperOk && wrapperInput.find(kCxxWrapperPidDecl) != std::string::npos)
+                            incremental->RememberPrefixSource(kCxxWrapperPidDecl);
                     }
                     else
                         wrapperOk = cflat_cinterop::ExtractCInterop(wrappedReq, wrapped, wrappedError);
@@ -4430,30 +4447,69 @@ static bool UseCxxIncrementalRequests()
 {
         static const bool enabled = [] {
             const char* value = std::getenv("CFLAT_CPP_INCREMENTAL");
-            return value != nullptr && std::string_view(value) == "1";
+            if (value == nullptr) return true;
+            const std::string_view setting(value);
+            return setting != "0" && setting != "off" && setting != "false";
         }();
         return enabled;
 }
 
+static std::optional<unsigned> CxxMaxHeaderParses()
+{
+        static const std::optional<unsigned> limit = []() -> std::optional<unsigned> {
+            const char* value = std::getenv("CFLAT_CPP_MAX_HEADER_PARSES");
+            if (value == nullptr || *value == '\0') return std::nullopt;
+            char* end = nullptr;
+            const unsigned long parsed = std::strtoul(value, &end, 10);
+            if (end == value || *end != '\0' || parsed > std::numeric_limits<unsigned>::max())
+                return std::nullopt;
+            return static_cast<unsigned>(parsed);
+        }();
+        return limit;
+}
+
+bool LLVMBackend::CountCxxHeaderParse(const CxxRequestGroup& group, const char* stage)
+{
+        if (group.primary >= cxxImportGroups_.size()) return true;
+        CxxImportGroup& importGroup = cxxImportGroups_[group.primary];
+        const unsigned count = ++importGroup.headerParseCount;
+        if (verbose)
+            std::cout << std::format(
+                "[verbose] C++ header group '{}' full header parse count: {} ({})\n",
+                group.label, count, stage);
+        std::optional<unsigned> limit = CxxMaxHeaderParses();
+        // An import line without the `cache` clause parses its one TU on every compile.
+        if (limit.has_value() && *limit == 0 && !importGroup.diskCache) limit = 1u;
+        if (limit.has_value() && count > *limit)
+        {
+            LogErrorMessage("C++ header group '{}' was parsed {} times in one compile; the budget is {} "
+                            "(set CFLAT_CPP_MAX_HEADER_PARSES)",
+                            { group.label, std::to_string(count), std::to_string(*limit) });
+            return false;
+        }
+        return true;
+}
+
+void LLVMBackend::ReportCxxHeaderParseSummary(const CxxRequestGroup& group) const
+{
+        if (!verbose || group.primary >= cxxImportGroups_.size()) return;
+        std::cout << std::format(
+            "[verbose] C++ header group '{}' full header parse count: {} (summary)\n",
+            group.label, cxxImportGroups_[group.primary].headerParseCount);
+}
+
+void LLVMBackend::AttachCxxHeaderParseGuard(cflat_cinterop::ExtractRequest& req,
+                                             const CxxRequestGroup& group) const
+{
+        req.cxxHeaderParseGuard = [this, &group](const char* stage) {
+            return const_cast<LLVMBackend*>(this)->CountCxxHeaderParse(group, stage);
+        };
+}
+
 static bool CxxIncrementalSpellingSafe(const std::string& spelling)
 {
-        return spelling.find("std::function<") == std::string::npos
-            && spelling.find("std::__function::") == std::string::npos
-            && spelling.find("std::shared_ptr<") == std::string::npos
-            && spelling.find("std::unique_ptr<") == std::string::npos
-            && spelling.find("std::__wrap_iter<") == std::string::npos
-            && spelling.find("std::__") == std::string::npos
-            && spelling.find("std::map<") == std::string::npos
-            && spelling.find("std::multimap<") == std::string::npos
-            && spelling.find("std::set<") == std::string::npos
-            && spelling.find("std::unordered_") == std::string::npos
-            && spelling.find("std::list<") == std::string::npos
-            && spelling.find("std::deque<") == std::string::npos
-            && spelling.find("std::array<") == std::string::npos
-            && spelling.find("std::vector<") == std::string::npos
-            && spelling.find("std::pair<") == std::string::npos
-            && spelling.find("std::reverse_iterator<") == std::string::npos
-            && !spelling.starts_with("cppt::HolderOf<");
+        (void)spelling;
+        return true;
 }
 
 static void ReplaceCxxRequestText(std::string& source, const std::string& from,
@@ -4493,21 +4549,26 @@ CxxIncrementalGroup* LLVMBackend::GetCxxIncrementalGroup(const CxxRequestGroup& 
         auto append = [&](const char prefix, const std::string& value) {
             key += prefix + std::to_string(value.size()) + ":" + value + "|";
         };
-        for (const auto& header : group.headers) append('H', header);
+        if (!group.headers.empty()) append('H', group.headers.front());
         for (const auto& define : group.defines) append('D', define);
         auto found = cxxIncrementalGroups_.find(key);
         if (found != cxxIncrementalGroups_.end()) return found->second.get();
 
         const std::string source = initialSource.empty()
             ? BuildCxxRequestIncludes(group) : initialSource;
+        if (!CountCxxHeaderParse(group, "incremental chunk 0"))
+            return nullptr;
         std::unique_ptr<CxxIncrementalGroup> created = CxxIncrementalGroup::Create(
             BuildCxxRequestClangArgs(group), source, verbose, error, tolerateDiagnostics);
         if (!created) return nullptr;
         if (initialSource.empty()) gCxxIncrementalChunk.fetch_add(3);
         CxxIncrementalGroup* result = created.get();
+        result->RememberPrefixSource(BuildCxxRequestIncludes(group));
         cxxIncrementalGroups_.emplace(std::move(key), std::move(created));
         return result;
 }
+
+static std::string NameCxxParameter(const std::string& type, const std::string& name);
 
 /*
  * One ODR-USE per exported member of the stage-1 record, so Sema instantiates the bodies.
@@ -4532,7 +4593,6 @@ std::string LLVMBackend::BuildCxxRequestOdrUses(const cflat_cinterop::RawRecord&
             if (m.access != cflat_cinterop::AccessPublic || m.isDeleted || m.variadic) continue;
             if (m.isImplicit && m.kind != Member::Constructor) continue;
             if (m.isDefaulted && m.kind != Member::Constructor) continue;
-            if (incrementalSource && m.name == "get") continue;
             if (m.kind == Member::Destructor) continue;   // covered above
             const std::string tag = tagPrefix + std::to_string(n++);
             if (m.kind == Member::Constructor)
@@ -4545,7 +4605,7 @@ std::string LLVMBackend::BuildCxxRequestOdrUses(const cflat_cinterop::RawRecord&
                 for (size_t p = 1; p < m.paramTypes.size(); ++p)
                 {
                     if (p > 1) { params += ", "; args += ", "; }
-                    params += m.paramTypes[p] + " a" + std::to_string(p);
+                    params += NameCxxParameter(m.paramTypes[p], "a" + std::to_string(p));
                     args += m.paramTypes[p].size() > 2
                             && m.paramTypes[p].compare(m.paramTypes[p].size() - 2, 2, "&&") == 0
                         ? "static_cast<" + m.paramTypes[p] + ">(a" + std::to_string(p) + ")"
@@ -4778,6 +4838,26 @@ static std::string BuildStdFunctionCtorUse(const std::string& cxxSpelling,
              + " (*a1)(" + params + ")) { (void)::new (m) " + marker + "(a1); return m; }\n";
 }
 
+static std::string NameCxxParameter(const std::string& type, const std::string& name)
+{
+        for (size_t i = 0; i < type.size(); ++i)
+        {
+            if (type[i] != '(') continue;
+            size_t symbol = i + 1;
+            while (symbol < type.size() && std::isspace((unsigned char)type[symbol])) ++symbol;
+            if (symbol >= type.size() || (type[symbol] != '*' && type[symbol] != '&')) continue;
+            size_t close = symbol + 1;
+            if (type[symbol] == '&' && close < type.size() && type[close] == '&') ++close;
+            while (close < type.size() && type[close] != ')') ++close;
+            if (close >= type.size()) continue;
+            std::string declarator = type.substr(symbol, close - symbol);
+            if (!declarator.empty() && !std::isspace((unsigned char)declarator.back()))
+                declarator += ' ';
+            return type.substr(0, i + 1) + declarator + name + type.substr(close);
+        }
+        return type + " " + name;
+}
+
 /*
  * Keep the PCH directory bounded. Each file is tens of MB and every cflat rebuild orphans the
  * whole set, because the build stamp is part of the key - a day of compiler work would otherwise
@@ -4890,6 +4970,7 @@ std::string LLVMBackend::EnsureCxxRequestPch(const CxxRequestGroup& group,
                 req.pchOutputPath = temp;
                 req.verbose = verbose;
                 req.args = pchArgs;
+                AttachCxxHeaderParseGuard(req, group);
                 cflat_cinterop::ExtractResult ignored;
                 std::string pchError;
                 const bool built = cflat_cinterop::ExtractCInterop(req, ignored, pchError);
@@ -4932,6 +5013,7 @@ bool LLVMBackend::RunCxxTypeRequests(const CxxRequestGroup& group,
         req.skipFunctionBodies = false;
         req.requireInScope = false;
         req.verbose = verbose;
+        AttachCxxHeaderParseGuard(req, group);
         for (const CxxRequestItem& item : items)
             req.cxxTypeRequests.push_back({ item.cxxSpelling, item.cflatName });
         req.args = BuildCxxRequestClangArgs(group);
@@ -4940,10 +5022,20 @@ bool LLVMBackend::RunCxxTypeRequests(const CxxRequestGroup& group,
             [](const CxxRequestItem& item) { return CxxIncrementalSpellingSafe(item.cxxSpelling); });
         if (incrementalRequests && incrementalSpellingSafe)
         {
-            auto legacyFallback = [&]() {
-                req.cxxRequestMarkerPrefix = "__cflat_req_";
+            /*
+             * No request-TU fallback: it would be a second parse of the group's headers, and a
+             * request TU fails the same way. Report it like a request TU whose marker did not
+             * parse - no records, the clang error as firstError - so callers word it the same.
+             */
+            auto requestFailed = [&]() {
+                if (verbose)
+                    std::cout << std::format("[verbose] C++ incremental request for '{}' failed: {}\n",
+                                             items.empty() ? std::string() : items.front().cxxSpelling,
+                                             error);
                 raw = cflat_cinterop::ExtractResult();
-                return cflat_cinterop::ExtractCInterop(req, raw, error);
+                raw.firstError = error;
+                error.clear();
+                return true;
             };
             CxxIncrementalGroup* incremental = GetCxxIncrementalGroup(group, error);
             if (incremental == nullptr) return false;
@@ -4952,23 +5044,18 @@ bool LLVMBackend::RunCxxTypeRequests(const CxxRequestGroup& group,
                 + std::to_string(gCxxIncrementalChunk.fetch_add(1)) + "_";
             const std::string markerPrefix = chunkPrefix + "req_";
             req.cxxRequestMarkerPrefix = markerPrefix;
-            std::unordered_set<std::string> checked;
-            for (const CxxRequestItem& item : items)
-            {
-                if (item.cxxSpelling.find('<') == std::string::npos
-                    || (!instantiateAll && !item.explicitInstantiation)
-                    || !checked.insert(item.cxxSpelling).second)
-                    continue;
-                if (!incremental->PrecheckSpelling(item.cxxSpelling, error)) return legacyFallback();
-            }
+            req.autoInstantiateCxxTypes = emitDefinitions;
             std::string incrementalExtra = extraSource;
             ReplaceCxxRequestText(incrementalExtra, "__cflat_req_", markerPrefix);
+            ReplaceCxxRequestText(incrementalExtra, "__cflat_pid", markerPrefix + "pid");
             ReplaceCxxRequestUseText(incrementalExtra, chunkPrefix + "use");
             ReplaceCxxRequestText(incrementalExtra, "__cflat_vthk_recv",
                                   chunkPrefix + "vthk_recv");
-            const std::string incrementalPrefix = incremental->UnseenPrefixSource(prefixSource);
+            const std::string incrementalPrefix = BuildCxxRequestIncludes(group)
+                + incremental->UnseenPrefixSource(prefixSource);
+            const bool includeExplicitInstantiation = emitDefinitions;
             req.source = incrementalPrefix + BuildCxxRequestMarkers(
-                items, instantiateAll, markerPrefix, !emitDefinitions) + incrementalExtra;
+                items, instantiateAll, markerPrefix, includeExplicitInstantiation) + incrementalExtra;
             raw = cflat_cinterop::ExtractResult();
             CxxExtractionStageTimer parseStage(verbose, "clang parse stage incremental");
             if (incremental->ParseRequest(req, req.source, raw, error))
@@ -4976,7 +5063,7 @@ bool LLVMBackend::RunCxxTypeRequests(const CxxRequestGroup& group,
                 incremental->RememberPrefixSource(prefixSource);
                 return true;
             }
-            return legacyFallback();
+            return requestFailed();
         }
         const std::string pch = EnsureCxxRequestPch(group, req.args);
         if (!pch.empty())
@@ -5291,7 +5378,7 @@ void LLVMBackend::StoreCxxTypeRequestCache(const CxxRequestGroup& group,
                                            const char* allowDiskReason)
 {
         llvm::TimeTraceScope scope("StoreCxxTypeRequestCache", requestKey);
-        if (entry.sigs.empty() && entry.records.empty()) return;
+        if (entry.sigs.empty() && entry.records.empty() && entry.macros.empty()) return;
         std::filesystem::file_time_type headerMtime{};
         if (!CxxGroupHeaderStamp(group, headerMtime)) return;
         const uint64_t headerHash = CxxGroupHeaderHash(group);
@@ -5422,6 +5509,12 @@ LLVMBackend::CxxRequestGroup LLVMBackend::MakeCxxRequestGroup(size_t primary,
                     out.defines.push_back(def);
         }
         out.diskCache = allSourceGroupsCacheable && (primaryHasHeaders || hasDependencyGroup);
+        // A request with no header at all (a CFlat struct handed to C++ that needs nothing but
+        // itself) is keyed by its whole generated source. It follows the compile's opt-in: any
+        // import with a cache clause makes it disk-cacheable, so a warm compile reparses nothing.
+        if (!primaryHasHeaders && !hasDependencyGroup)
+            out.diskCache = std::any_of(cxxImportGroups_.begin(), cxxImportGroups_.end(),
+                [](const CxxImportGroup& g) { return !g.headers.empty() && g.diskCache; });
         out.label = out.headers.empty()
             ? std::string("<no header>")
             : std::filesystem::path(out.headers.front()).filename().string();
@@ -5868,6 +5961,12 @@ void LLVMBackend::DiscardCxxBraceArguments(
                 arguments.erase(arguments.begin() + braceArguments[n].argumentIndex);
 }
 
+static const std::string kNegativeCxxRequestMarker = "__cflat_negative_request";
+
+/*
+ * A wrapper clang rejects is as deterministic as one it accepts: the outcome is a function of the
+ * same key. Cache the reason too, so a warm compile (or a repeated use site) does not parse again.
+ */
 bool LLVMBackend::RequestGeneratedCxxWrapper(const CxxRequestGroup& group,
                                              const std::string& wrapperSource,
                                              const std::string& wrapperName,
@@ -5876,6 +5975,55 @@ bool LLVMBackend::RequestGeneratedCxxWrapper(const CxxRequestGroup& group,
                                              std::string& error,
                                              bool persistOnSuccess,
                                              bool allowIncremental)
+{
+        const bool emitDefinitions = symbolSink_ == nullptr;
+        const std::string negativeKey = CxxTypeRequestCacheKey(
+            group, wrapperName, BuildCxxRequestPrologue(group, {}, false) + wrapperSource,
+            BuildCxxRequestClangArgs(group), emitDefinitions) + "|" + cacheTag + "|NEG";
+        {
+            CFileSigCacheEntry negative;
+            std::string missReason;
+            if (TryLoadCxxTypeRequestCache(group, negativeKey, /*emitDefinitions*/ false, negative,
+                                           missReason, /*allowDisk*/ true)
+                && negative.macros.size() == 1
+                && negative.macros.front().name == kNegativeCxxRequestMarker)
+            {
+                error = negative.macros.front().file;
+                return false;
+            }
+        }
+        const unsigned parsesBefore = group.primary < cxxImportGroups_.size()
+            ? cxxImportGroups_[group.primary].headerParseCount : 0;
+        if (RequestGeneratedCxxWrapperUncached(group, wrapperSource, wrapperName, cacheTag,
+                                               signature, error, persistOnSuccess,
+                                               allowIncremental))
+            return true;
+        // A budget refusal is about this compile, not the wrapper; never remember it.
+        const bool budgetRefused = CxxMaxHeaderParses().has_value()
+            && group.primary < cxxImportGroups_.size()
+            && cxxImportGroups_[group.primary].headerParseCount > parsesBefore
+            && cxxImportGroups_[group.primary].headerParseCount > *CxxMaxHeaderParses();
+        if (persistOnSuccess && !error.empty() && !budgetRefused)
+        {
+            CFileSigCacheEntry negative;
+            CMacroEntry marker;
+            marker.name = kNegativeCxxRequestMarker;
+            marker.file = error;
+            negative.macros.push_back(std::move(marker));
+            StoreCxxTypeRequestCache(group, negativeKey, /*emitDefinitions*/ false,
+                                     std::move(negative), /*allowDisk*/ true, nullptr);
+        }
+        return false;
+}
+
+bool LLVMBackend::RequestGeneratedCxxWrapperUncached(const CxxRequestGroup& group,
+                                                     const std::string& wrapperSource,
+                                                     const std::string& wrapperName,
+                                                     const std::string& cacheTag,
+                                                     CSigEntry& signature,
+                                                     std::string& error,
+                                                     bool persistOnSuccess,
+                                                     bool allowIncremental)
 {
         llvm::TimeTraceScope scope("RequestGeneratedCxxWrapper", wrapperName);
         error.clear();
@@ -5913,13 +6061,18 @@ bool LLVMBackend::RequestGeneratedCxxWrapper(const CxxRequestGroup& group,
                 req.requireInScope = false;
                 req.cxxFunctionWrapperNames = { wrapperName };
                 req.args = requestArgs;
+                AttachCxxHeaderParseGuard(req, group);
                 if (UseCxxIncrementalRequests() && !batchMode_ && allowIncremental)
                 {
                     CxxIncrementalGroup* incremental = GetCxxIncrementalGroup(group, runError);
                     if (incremental == nullptr) return false;
-                    req.source = wrapperSource;
+                    req.source = BuildCxxRequestIncludes(group)
+                        + incremental->UnseenPrefixSource(wrapperSource);
                     out = cflat_cinterop::ExtractResult();
-                    return incremental->ParseRequest(req, req.source, out, runError);
+                    if (!incremental->ParseRequest(req, req.source, out, runError)) return false;
+                    if (req.source.find(kCxxWrapperPidDecl) != std::string::npos)
+                        incremental->RememberPrefixSource(kCxxWrapperPidDecl);
+                    return true;
                 }
                 const std::string pch = EnsureCxxRequestPch(group, req.args);
                 if (!pch.empty())
@@ -6881,7 +7034,7 @@ bool LLVMBackend::RequestCxxFunctionTemplate(const std::string& functionName,
                 if (cxxRvalue) spelling += " &&";
                 else spelling += " &";
             }
-            else if (!arg.TypeAndValue.Pointer && IsCxxRecord(arg.TypeAndValue.TypeName)
+            if (!arg.TypeAndValue.Pointer && IsCxxRecord(arg.TypeAndValue.TypeName)
                      && arg.Storage != nullptr && !arg.IsRvalue)
                 spelling += " &";
             const bool classRvalue = arg.IsRvalue && !arg.TypeAndValue.Pointer
@@ -6970,6 +7123,11 @@ bool LLVMBackend::RequestCxxFunctionTemplate(const std::string& functionName,
         auto collectTypeDependencies = [&](auto&& self, const std::string& type) -> void {
             std::string base = type;
             while (!base.empty() && base.back() == '*') base.pop_back();
+            // A pointer template argument demangles with its "ptr" suffix still in the name
+            // ("cpptw.Twinptr"); the owner is registered under the pointee.
+            while (!cxxTypeOwnerGroup_.contains(base) && base.size() > 3 && base.ends_with("ptr")
+                   && base.find('$') == std::string::npos)
+                base.resize(base.size() - 3);
             if (auto owner = cxxTypeOwnerGroup_.find(base);
                 owner != cxxTypeOwnerGroup_.end()
                 && owner->second < cxxImportGroups_.size()
@@ -7045,13 +7203,7 @@ bool LLVMBackend::RequestCxxFunctionTemplate(const std::string& functionName,
         CSigEntry bound;
         std::string wrapperError;
         std::string wrapperInput = generatedTypeSource + wrapperSource;
-        const bool allowIncremental = false;
-        if (UseCxxIncrementalRequests() && !batchMode_ && allowIncremental)
-        {
-            CxxIncrementalGroup* incremental = GetCxxIncrementalGroup(group, wrapperError);
-            if (incremental == nullptr) return noMatch(wrapperError);
-            wrapperInput = incremental->UnseenPrefixSource(generatedTypeSource) + wrapperSource;
-        }
+        const bool allowIncremental = true;
         if (!RequestGeneratedCxxWrapper(group, wrapperInput, wrapperName, "TPL",
                                          bound, wrapperError, incompleteTypes.empty(),
                                          allowIncremental))
@@ -8252,6 +8404,12 @@ bool LLVMBackend::RequestCxxVariadicConstructor(
             {
                 return giveUp("a constructor argument type has no C++ spelling");
             }
+            const bool namedLvalue = arg.Storage != nullptr
+                || (!arg.CallerName.empty() && FindVariableStorage(arg.CallerName).Storage != nullptr);
+            if (!arg.TypeAndValue.Pointer && IsCxxRecord(arg.TypeAndValue.TypeName)
+                     && ((namedLvalue)
+                         || IsForeignNontrivialCxxClass(arg.TypeAndValue.TypeName)))
+                spelling += " &";
             parameterSpellings.push_back(std::move(spelling));
             callArguments.push_back("p" + std::to_string(i + 1));
         }
@@ -8275,7 +8433,6 @@ bool LLVMBackend::RequestCxxVariadicConstructor(
             wrapperSource += parameterSpellings[i] + " p" + std::to_string(i);
         }
         wrapperSource += ") { new (p0) " + targetCall + "; }\n";
-
         std::vector<std::string> generatedTypeArguments{ typeName };
         for (const NamedVariable& argument : arguments)
             generatedTypeArguments.push_back(cflatTypeOf(argument));
@@ -8300,17 +8457,7 @@ bool LLVMBackend::RequestCxxVariadicConstructor(
         CSigEntry bound;
         std::string wrapperError;
         std::string wrapperInput = generatedTypeSource + wrapperSource;
-        const bool allowIncremental = generatedTypeSource.empty();
-        if (UseCxxIncrementalRequests() && !batchMode_ && allowIncremental)
-        {
-            CxxIncrementalGroup* incremental = GetCxxIncrementalGroup(group, wrapperError);
-            if (incremental == nullptr)
-            {
-                error = wrapperError;
-                return false;
-            }
-            wrapperInput = incremental->UnseenPrefixSource(generatedTypeSource) + wrapperSource;
-        }
+        const bool allowIncremental = true;
         if (!RequestGeneratedCxxWrapper(group, wrapperInput, wrapperName, "VARIADIC_CTOR",
                                          bound, wrapperError, incompleteTypes.empty(),
                                          allowIncremental))
@@ -8703,6 +8850,30 @@ bool LLVMBackend::RequestCxxForeignType(const std::string& cflatName, const std:
         const std::string probeKey =
             CxxTypeRequestCacheKey(group, item, probeSource, requestArgs, /*emitDefinitions*/ false);
         std::string requestKey = probeKey;
+        /*
+         * A probe clang rejects (a namespace asked for as a class, a spelling that does not
+         * compile) is as deterministic as a success, so its reason is cached too; a warm compile
+         * then answers it without parsing the header.
+         */
+        const std::string negativeKey = probeKey + "|NEG";
+        {
+            CFileSigCacheEntry negative;
+            std::string negativeMiss;
+            if (TryLoadCxxTypeRequestCache(group, negativeKey, /*emitDefinitions*/ false, negative,
+                                           negativeMiss, /*allowDisk*/ true)
+                && negative.macros.size() == 1 && negative.macros.front().name == kNegativeCxxRequestMarker)
+                return fail(negative.macros.front().file);
+        }
+        auto failDeterministic = [&](std::string why) {
+            CFileSigCacheEntry negative;
+            CMacroEntry marker;
+            marker.name = kNegativeCxxRequestMarker;
+            marker.file = why;
+            negative.macros.push_back(std::move(marker));
+            StoreCxxTypeRequestCache(group, negativeKey, /*emitDefinitions*/ false,
+                                     std::move(negative), /*allowDisk*/ true, nullptr);
+            return fail(std::move(why));
+        };
 
         std::vector<CRecordEntry> records;
         std::vector<CSigEntry> requestSigs;
@@ -8718,13 +8889,14 @@ bool LLVMBackend::RequestCxxForeignType(const std::string& cflatName, const std:
             std::string missReason;
             if (TryLoadCxxTypeRequestCache(group, probeKey, /*emitDefinitions*/ false,
                                            cachedEntry, missReason,
-                                           /*allowDisk*/ !incompletePrefix)
+                                           /*allowDisk*/ true)
                 && !cachedEntry.records.empty())
             {
                 records = cachedEntry.records;
                 requestSigs = cachedEntry.sigs;
                 requestTemplates = cachedEntry.functionTemplates;
                 requestBitcode = cachedEntry.cxxBitcode;
+                probe.functionTemplates = requestTemplates;
                 SetCInteropTargetFacts(cachedEntry.longDoubleWidth,
                                        cachedEntry.longDoubleIsIEEEDouble,
                                        cachedEntry.targetTriple);
@@ -8795,12 +8967,12 @@ bool LLVMBackend::RequestCxxForeignType(const std::string& cflatName, const std:
                 }
                 if (rejectClangErrors && !probe.firstError.empty()
                     && !allowsIncompleteUniquePtrDiagnostic(probe.firstError))
-                    return fail(std::format("C++ type '{}' could not be parsed: {}",
+                    return failDeterministic(std::format("C++ type '{}' could not be parsed: {}",
                                             cxxSpelling, FirstCxxErrorLine(probe.firstError)));
                 if (probe.records.empty())
                 {
-                    return fail(std::format("'{}' does not name a C++ class type in the imported headers",
-                                            cxxSpelling));
+                    return failDeterministic(std::format(
+                        "'{}' does not name a C++ class type in the imported headers", cxxSpelling));
                 }
             }
             const auto* probeTarget = findRequestedRecord(probe.records);
@@ -8829,19 +9001,12 @@ bool LLVMBackend::RequestCxxForeignType(const std::string& cflatName, const std:
                 if (!probeRecords.empty())
                     StoreCxxTypeRequestCache(group, probeKey, /*emitDefinitions*/ false,
                                              std::move(entry),
-                                             /*allowDisk*/ !incompleteUniquePtrTentative
-                                                 && (!tentative || persistOnSuccess)
-                                                 && (!rejectClangErrors
+                                             /*allowDisk*/ (!rejectClangErrors
                                                      || probe.firstError.empty())
                                                  && !probe.records.empty(),
                                              /*allowDiskReason*/
-                                             incompleteUniquePtrTentative
-                                                 ? "incomplete unique_ptr request"
-                                                 : tentative && !persistOnSuccess
-                                                 ? "tentative request"
-                                                 : (rejectClangErrors && !probe.firstError.empty()
-                                                        ? "rejected clang error"
-                                                        : nullptr));
+                                             rejectClangErrors && !probe.firstError.empty()
+                                                 ? "rejected clang error" : nullptr);
             }
             std::vector<CxxRequestItem> memberItems;
             CollectCxxMemberRequestItems(probeRecords, memberItems);
@@ -8866,6 +9031,34 @@ bool LLVMBackend::RequestCxxForeignType(const std::string& cflatName, const std:
              * diagnostics match the compiler's.
              */
             {
+                std::string freeTemplateUses;
+                const size_t templateEnd = cxxSpelling.find('<');
+                const std::string requestedBase = templateEnd == std::string::npos
+                    ? cxxSpelling : cxxSpelling.substr(0, templateEnd);
+                const size_t namespaceEnd = requestedBase.rfind("::");
+                const std::string requestedShort = namespaceEnd == std::string::npos
+                    ? requestedBase : requestedBase.substr(namespaceEnd + 2);
+                const std::string requestedNamespace = namespaceEnd == std::string::npos
+                    ? std::string() : requestedBase.substr(0, namespaceEnd);
+                for (const auto& functionTemplate : probe.functionTemplates)
+                {
+                    if (requestedBase.starts_with("std::")) continue;
+                    if (functionTemplate.kind != cflat_cinterop::RawFunctionTemplate::Free
+                        || functionTemplate.cxxSpelling.find("operator<=>") == std::string::npos
+                        || (!requestedNamespace.empty()
+                            && functionTemplate.cxxSpelling.find(requestedNamespace)
+                                   == std::string::npos))
+                        continue;
+                    const bool mentionsRequestedType = std::any_of(
+                        functionTemplate.parameterTypes.begin(),
+                        functionTemplate.parameterTypes.end(), [&](const std::string& parameter) {
+                            return parameter.find(requestedShort) != std::string::npos;
+                        });
+                    if (!mentionsRequestedType) continue;
+                    freeTemplateUses += "__attribute__((used, noinline)) static void "
+                        "__cflat_use_free_cmp___cflat_req_0(" + cxxSpelling
+                        + "* a, " + cxxSpelling + "* b) { (void)(*a <=> *b); }\n";
+                }
                 const std::string stage2Extra =
                     CxxRequestOdrUsePreamble()
                     + BuildCxxRequestOdrUses(*probeTarget, "__cflat_req_0", "",
@@ -8875,7 +9068,8 @@ bool LLVMBackend::RequestCxxForeignType(const std::string& cflatName, const std:
                                                       incrementalRequests && incrementalSpellingSafe)
                     + BuildStdFunctionCtorUse(cxxSpelling, "__cflat_req_0")
                     + BuildCxxDefaultWrappers({}, probe.records)
-                    + BuildCxxVirtualThunks(probe.records);
+                    + BuildCxxVirtualThunks(probe.records)
+                    + freeTemplateUses;
                 const std::string stage2CacheExtra =
                     CxxRequestOdrUsePreamble()
                     + BuildCxxRequestOdrUses(*probeTarget, "__cflat_req_0", "", false)
@@ -8883,7 +9077,8 @@ bool LLVMBackend::RequestCxxForeignType(const std::string& cflatName, const std:
                                                       "__cflat_req_0", "", false)
                     + BuildStdFunctionCtorUse(cxxSpelling, "__cflat_req_0")
                     + BuildCxxDefaultWrappers({}, probe.records)
-                    + BuildCxxVirtualThunks(probe.records);
+                    + BuildCxxVirtualThunks(probe.records)
+                    + freeTemplateUses;
                 const std::string stage2Source =
                     BuildCxxRequestIncludes(group) + effectivePrefixSource
                     + BuildCxxRequestMarkers(single, /*instantiateAll*/ false)
@@ -8903,7 +9098,7 @@ bool LLVMBackend::RequestCxxForeignType(const std::string& cflatName, const std:
                 std::string missReason;
                 if (TryLoadCxxTypeRequestCache(group, requestKey, /*emitDefinitions*/ true,
                                                cachedEntry, missReason,
-                                               /*allowDisk*/ !incompletePrefix))
+                                               /*allowDisk*/ true))
                 {
                     records = std::move(cachedEntry.records);
                     requestSigs = std::move(cachedEntry.sigs);
@@ -8991,17 +9186,11 @@ bool LLVMBackend::RequestCxxForeignType(const std::string& cflatName, const std:
                 entry.cxxBitcode = requestBitcode;
                 StoreCxxTypeRequestCache(group, requestKey, needDefinitions,
                                          std::move(entry),
-                                         /*allowDisk*/ !incompleteUniquePtrTentative
-                                             && (!tentative || persistOnSuccess)
-                                             && (!rejectClangErrors || raw.firstError.empty())
+                                         /*allowDisk*/ (!rejectClangErrors || raw.firstError.empty())
                                              && !raw.records.empty(),
                                          /*allowDiskReason*/
-                                         incompleteUniquePtrTentative
-                                             ? "incomplete unique_ptr request"
-                                             : tentative && !persistOnSuccess
-                                             ? "tentative request"
-                                             : (rejectClangErrors && !raw.firstError.empty()
-                                                    ? "rejected clang error" : nullptr));
+                                         rejectClangErrors && !raw.firstError.empty()
+                                             ? "rejected clang error" : nullptr);
             }
         }
         if (records.empty())
@@ -9584,7 +9773,8 @@ void LLVMBackend::CollectCxxMemberRequestItems(const std::vector<CRecordEntry>& 
                 {
                     std::string named = CxxMemberValueSpelling(spelling);
                     if (named.find('<') == std::string::npos
-                        || named.find('(') != std::string::npos)
+                        || named.find('(') != std::string::npos
+                        || named.find("type-parameter-") != std::string::npos)
                         continue;
                     TypeAndValue mapped;
                     bool mappedForeign = false;
@@ -9634,6 +9824,8 @@ bool LLVMBackend::TryRequestCxxType(const std::string& baseName,
 {
         error.clear();
         if (!HasCxxImportGroup()) return false;
+        if (typeArgs.empty() && GetGlobalVariableNV(cflatName).Storage != nullptr)
+            return false;
         // An undotted name is a CFlat name, not a C++ one - unless a C++ import recorded it as
         // an alias of a specialization. A map hit, so the dot rule's cost gate is unchanged.
         if (baseName.find('.') == std::string::npos
@@ -12146,7 +12338,8 @@ bool LLVMBackend::TryBindRefusedCxxMember(const std::string& typeName,
                         if (spelling.find("::") == std::string::npos
                             || spelling.find('<') == std::string::npos)
                             continue;
-                        if (spelling.find("__cflat_user::") != std::string::npos)
+                        if (spelling.find("__cflat_user::") != std::string::npos
+                            || spelling.find("type-parameter-") != std::string::npos)
                             continue;
                         TypeAndValue mapped;
                         bool mappedForeign = false;
@@ -12337,6 +12530,7 @@ bool LLVMBackend::TryBindRefusedCxxMember(const std::string& typeName,
         // The first extraction may have refused this member before assigning its linkage name,
         // so its default wrapper was absent from the companion TU. The refreshed record now has
         // the complete return/parameter spellings; emit the missing C++ forwarding body here.
+        RegisterCxxClassMembers(reboundRecord, fileForLsp, memberName);
         for (const auto& member : reboundRecord.members)
         {
             if (member.name != memberName
@@ -12358,6 +12552,15 @@ bool LLVMBackend::TryBindRefusedCxxMember(const std::string& typeName,
                     || !HasNonConstDefaultSuffix(member.defaultArgs, n))
                     continue;
                 const std::string wrapperName = CxxDefaultWrapperName(member.linkageName, n);
+                const std::string wrapperRegName = member.kind == cflat_cinterop::RawCxxMember::StaticMethod
+                    ? reboundRecord.name + "." + memberName : reboundRecord.name;
+                bool wrapperDeclared = false;
+                if (auto functions = functionTable.find(wrapperRegName);
+                    functions != functionTable.end())
+                    for (const auto& function : functions->second)
+                        if (function.External && function.UniqueName == wrapperName)
+                        { wrapperDeclared = true; break; }
+                if (wrapperDeclared) continue;
                 CSigEntry ignored;
                 std::string wrapperError;
                 if (!RequestGeneratedCxxWrapper(group, wrapperSource, wrapperName,
@@ -12371,8 +12574,6 @@ bool LLVMBackend::TryBindRefusedCxxMember(const std::string& typeName,
                 }
             }
         }
-        RegisterCxxClassMembers(reboundRecord, fileForLsp, memberName);
-
         auto updated = cxxClasses_.find(typeName);
         if (updated == cxxClasses_.end()) return false;
         const bool instanceBound = std::find(updated->second.instanceMethodNames.begin(),
@@ -13798,6 +13999,7 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
                 }
             RegisterCFunctionMacros(aliasRetries, fileForLsp + "@alias-retry");
             ClearCHeaderRefusal(refusalGroupKey);
+            if (cppMode) ReportCxxHeaderParseSummary(cxxGroup);
             return true;
         }
 
@@ -13861,6 +14063,7 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
                     }
                 RegisterCFunctionMacros(aliasRetries, fileForLsp + "@alias-retry");
                 ClearCHeaderRefusal(refusalGroupKey);
+                if (cppMode) ReportCxxHeaderParseSummary(cxxGroup);
                 return true;
             }
         }

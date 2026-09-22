@@ -3230,6 +3230,7 @@ private:
         std::unordered_set<std::string> namespaces;
         std::unordered_set<std::string> publishedNames;
         bool diskCache = false;
+        unsigned headerParseCount = 0;
     };
     std::vector<CxxImportGroup> cxxImportGroups_;
     /*
@@ -5205,6 +5206,10 @@ private:
                             const std::string& extraSource, bool emitDefinitions,
                             cflat_cinterop::ExtractResult& raw, std::string& error,
                             const std::string& prefixSource = {});
+    bool CountCxxHeaderParse(const CxxRequestGroup& group, const char* stage);
+    void ReportCxxHeaderParseSummary(const CxxRequestGroup& group) const;
+    void AttachCxxHeaderParseGuard(cflat_cinterop::ExtractRequest& req,
+                                   const CxxRequestGroup& group) const;
     CxxIncrementalGroup* GetCxxIncrementalGroup(const CxxRequestGroup& group,
                                                 std::string& error,
                                                 const std::string& initialSource = {},
@@ -5349,6 +5354,14 @@ private:
                                     std::string& error,
                                     bool persistOnSuccess = true,
                                     bool allowIncremental = true);
+    bool RequestGeneratedCxxWrapperUncached(const CxxRequestGroup& group,
+                                            const std::string& wrapperSource,
+                                            const std::string& wrapperName,
+                                            const std::string& cacheTag,
+                                            CSigEntry& signature,
+                                            std::string& error,
+                                            bool persistOnSuccess,
+                                            bool allowIncremental);
     bool TryBindCxxImplicitDefaultCtor(const std::string& typeName, std::string& error);
     struct CxxImplicitArgumentCandidate
     {

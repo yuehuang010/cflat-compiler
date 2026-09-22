@@ -22,6 +22,7 @@
 #include "clang/AST/DeclCXX.h"
 #include "clang/AST/CXXInheritance.h"
 #include "clang/AST/Expr.h"
+#include "clang/AST/ExprCXX.h"
 #include "clang/AST/Mangle.h"
 #include "clang/AST/RecursiveASTVisitor.h"
 #include "clang/AST/RecordLayout.h"
@@ -675,6 +676,8 @@ namespace cflat_cinterop
             // Plain C++ header records whose implicit special members must be materialized before
             // CollectCxxMembers walks the record's methods.
             std::vector<const CXXRecordDecl*> headerSpecialMemberWork;
+            // Hidden friend operators of a requested record, published after the walk.
+            std::vector<FunctionDecl*> pendingFriendOps;
             std::unordered_set<const CXXRecordDecl*> headerSpecialMemberSeen;
             /*
              * Every decl Sema ANNOUNCED to the consumer, in order. This is the set a real compile's
@@ -1089,6 +1092,30 @@ namespace cflat_cinterop
                 result.col = col;
                 st.out.functionTemplates.push_back(std::move(result));
                 return true;
+            }
+
+            /*
+             * A hidden friend operator is reachable only through its own class, and its body is
+             * instantiated only on odr-use: an incremental request chunk never writes such a use,
+             * so the ADL operator libc++ containers rely on would be lost. Instantiate and publish
+             * the queued ones here - after the traversal, since Sema appends decls to the TU.
+             */
+            void PublishPendingFriendOperators()
+            {
+                if (st.pendingFriendOps.empty()) return;
+                std::vector<FunctionDecl*> pending;
+                pending.swap(st.pendingFriendOps);
+                if (st.ci != nullptr && st.ci->hasSema())
+                {
+                    Sema& sema = st.ci->getSema();
+                    for (FunctionDecl* fn : pending)
+                        if (!fn->hasBody() && !fn->isInvalidDecl())
+                            sema.MarkFunctionReferenced(fn->getLocation(), fn,
+                                                        /*MightBeOdrUse*/ true);
+                    sema.PerformPendingInstantiations();
+                }
+                for (FunctionDecl* fn : pending)
+                    if (fn->hasBody() && !fn->isInvalidDecl()) VisitFunctionDecl(fn);
             }
 
             bool VisitFunctionDecl(FunctionDecl* fd)
@@ -2196,6 +2223,38 @@ namespace cflat_cinterop
                 if (!nameOverride.empty()
                     && !st.emittedRequestedRecords.insert(nameOverride).second)
                     return;
+                // A hidden friend operator is reachable only through its own class. The
+                // incremental request walk never visits it, so publish it with the record.
+                if (st.req.cxxMode && !nameOverride.empty())
+                    if (const auto* cxx = llvm::dyn_cast<CXXRecordDecl>(rd))
+                        for (const FriendDecl* fr : cxx->friends())
+                        {
+                            auto* fn = llvm::dyn_cast_or_null<FunctionDecl>(fr->getFriendDecl());
+                            if (fn == nullptr || fn->isInvalidDecl()
+                                || fn->getType()->isDependentType())
+                                continue;
+                            switch (fn->getOverloadedOperator())
+                            {
+                            case OO_EqualEqual: case OO_ExclaimEqual: case OO_Less:
+                            case OO_LessEqual: case OO_Greater: case OO_GreaterEqual:
+                            case OO_Spaceship:
+                                break;
+                            default: continue;
+                            }
+                            // Only the homogeneous ADL comparisons of the requested type: a
+                            // mixed-type friend drags in specializations this request never asked
+                            // for.
+                            const std::string self = CanonicalSpelling(
+                                ctx, ctx.getCanonicalTagType(cxx));
+                            bool homogeneous = fn->getNumParams() == 2;
+                            for (const ParmVarDecl* p : fn->parameters())
+                            {
+                                QualType bare = p->getType().getNonReferenceType()
+                                                    .getUnqualifiedType();
+                                if (CanonicalSpelling(ctx, bare) != self) homogeneous = false;
+                            }
+                            if (homogeneous) st.pendingFriendOps.push_back(fn);
+                        }
 
                 RawRecord rec;
                 rec.name = rd->getNameAsString();
@@ -3876,14 +3935,17 @@ namespace cflat_cinterop
             for (Decl* d : st.announcedDecls)
                 emitDecl(d, emitDecl);
 
-            // A live Interpreter does not replay Sema's announced member definitions. Feed the
-            // resolved records' body-bearing methods directly, matching a real CodeGen consumer.
+            // In a live Interpreter, members instantiated by an EARLIER chunk were announced then,
+            // not now. Feed the resolved records' body-bearing methods directly as well.
             if (st.contextRoot != nullptr)
             {
                 std::unordered_set<const CXXRecordDecl*> records;
                 for (const auto& w : st.memberAbiWork)
                     if (w.md != nullptr) records.insert(w.md->getParent()->getDefinition());
+                // Skip what the announcement replay above already handed to CodeGen.
                 std::unordered_set<const FunctionDecl*> methods;
+                for (Decl* d : st.announcedDecls)
+                    if (auto* fd = llvm::dyn_cast_or_null<FunctionDecl>(d)) methods.insert(fd);
                 for (const CXXRecordDecl* rd : records)
                 {
                     if (rd == nullptr) continue;
@@ -3972,6 +4034,45 @@ namespace cflat_cinterop
 
                 explicit UsedFunctionVisitor(std::vector<const FunctionDecl*>& w) : work(w) {}
                 bool shouldVisitTemplateInstantiations() const { return true; }
+                void AddFunction(const FunctionDecl* fd)
+                {
+                    if (fd == nullptr || llvm::isa<CXXMethodDecl>(fd)) return;
+                    const FunctionDecl* definition = fd;
+                    if (!definition->hasBody() || definition->getType()->isDependentType())
+                    {
+                        const FunctionDecl* candidate = fd->getDefinition();
+                        if (candidate != nullptr) definition = candidate;
+                    }
+                    if (!definition->hasBody()) return;
+                    const bool ownDefinitionNeeded = fd->getTemplateSpecializationKind()
+                            != TSK_Undeclared
+                        || definition->hasAttr<AlwaysInlineAttr>()
+                        || definition->hasAttr<InternalLinkageAttr>()
+                        || definition->isInlined()
+                        || definition->getTemplateSpecializationKind() != TSK_Undeclared
+                        || definition->getFormalLinkage() == Linkage::Internal;
+                    if (!ownDefinitionNeeded || definition->getType()->isDependentType()
+                        || definition->getDeclContext()->isDependentContext())
+                        return;
+                    if (seen.insert(definition).second) work.push_back(definition);
+                }
+                bool VisitCallExpr(CallExpr* call)
+                {
+                    if (call != nullptr) AddFunction(call->getDirectCallee());
+                    return true;
+                }
+                bool VisitDeclRefExpr(DeclRefExpr* ref)
+                {
+                    if (ref != nullptr)
+                        AddFunction(llvm::dyn_cast<FunctionDecl>(ref->getDecl()));
+                    return true;
+                }
+                bool VisitCXXRewrittenBinaryOperator(CXXRewrittenBinaryOperator* op)
+                {
+                    if (op == nullptr) return true;
+                    auto* call = llvm::dyn_cast<CallExpr>(op->getSemanticForm());
+                    return call == nullptr || VisitCallExpr(call);
+                }
                 bool VisitFunctionDecl(FunctionDecl* fd)
                 {
                     // Anything whose definition this module would have to provide itself: an
@@ -4068,7 +4169,24 @@ namespace cflat_cinterop
                 if (!f.isDeclaration()) ++defs;
             for (const llvm::GlobalVariable& g : mod->globals())
                 if (!g.isDeclaration()) ++defs;
-            if (defs == 0) return;
+            if (defs == 0)
+            {
+                for (const auto& w : st.memberAbiWork)
+                {
+                    if (w.recordIdx >= st.out.records.size()
+                        || w.memberIdx >= st.out.records[w.recordIdx].members.size())
+                        continue;
+                    RawCxxMember& m = st.out.records[w.recordIdx].members[w.memberIdx];
+                    if (!m.needsLocalDefinition || w.md == nullptr) continue;
+                    if (w.md->getTemplateSpecializationKind()
+                            == clang::TSK_ExplicitInstantiationDeclaration
+                        && w.md->isExternallyVisible()
+                        && w.md->getVisibility() == clang::DefaultVisibility
+                        && !w.md->hasAttr<clang::ExcludeFromExplicitInstantiationAttr>())
+                        m.needsLocalDefinition = false;
+                }
+                return;
+            }
 
             /*
              * A member whose body Clang did not emit must stay refused: prove the symbol is a
@@ -4233,6 +4351,7 @@ namespace cflat_cinterop
                     v.TraverseDecl(root);
                 else if (!st.req.cxxTypeRequests.empty() && !v.ProcessTypeRequests(root)) return;
                 else v.ProcessFunctionRequests(root);
+                v.PublishPendingFriendOperators();
             }
             if (st.req.cxxMode && st.req.autoInstantiateCxxTypes
                 && !st.incompleteCxxTypes.empty())
@@ -4254,6 +4373,7 @@ namespace cflat_cinterop
                     else if (!st.req.cxxTypeRequests.empty()
                              && !refreshed.ProcessTypeRequests(root)) return;
                     else refreshed.ProcessFunctionRequests(root);
+                    refreshed.PublishPendingFriendOperators();
                 }
             }
             st.stillIncompleteSpellings.clear();
@@ -4455,7 +4575,9 @@ namespace cflat_cinterop
                                clang::TranslationUnitDecl* headerRoot,
                                const std::vector<clang::TranslationUnitDecl*>& extraRoots,
                                llvm::Module* module,
-                               ExtractResult& out, std::string& err, bool checkHeader)
+                               ExtractResult& out, std::string& err, bool checkHeader,
+                               clang::TranslationUnitDecl* preludeRoot,
+                               const std::vector<clang::Decl*>* announcedDecls)
     {
         if (root == nullptr)
         {
@@ -4477,6 +4599,17 @@ namespace cflat_cinterop
         }
         if (req.emitDefinitions && root != headerRoot)
             for (clang::Decl* decl : root->decls()) st.announcedDecls.push_back(decl);
+        // The includes this request committed as their own chunk; a request TU parses them
+        // inline, so their decls are announced like the request's own.
+        if (req.emitDefinitions && preludeRoot != nullptr && preludeRoot != headerRoot)
+            for (clang::Decl* decl : preludeRoot->decls()) st.announcedDecls.push_back(decl);
+        // What Sema announced while parsing this chunk: implicit instantiations and the members
+        // an explicit instantiation defines, none of which are children of the chunk's root.
+        if (req.emitDefinitions && announcedDecls != nullptr)
+            st.announcedDecls.insert(st.announcedDecls.end(), announcedDecls->begin(),
+                                     announcedDecls->end());
+        if (preludeRoot != nullptr && preludeRoot != headerRoot && preludeRoot != root)
+            HarvestTranslationUnit(st, ci.getASTContext(), preludeRoot, false, false);
         if (headerRoot != nullptr && headerRoot != root)
             HarvestTranslationUnit(st, ci.getASTContext(), headerRoot, false, false);
         for (clang::TranslationUnitDecl* extra : extraRoots)
@@ -4484,9 +4617,9 @@ namespace cflat_cinterop
                 HarvestTranslationUnit(st, ci.getASTContext(), extra, false, false);
         HarvestTranslationUnit(st, ci.getASTContext(), root,
                                checkHeader && root == headerRoot, true);
-        for (const auto& queued : st.incompleteCxxTypes)
-            if (queued.type->isIncompleteType())
-                out.incompleteCxxTypeSpellings.push_back(queued.spelling);
+        out.incompleteCxxTypeSpellings.insert(out.incompleteCxxTypeSpellings.end(),
+                                              st.stillIncompleteSpellings.begin(),
+                                              st.stillIncompleteSpellings.end());
         return true;
     }
 
@@ -4508,6 +4641,9 @@ namespace cflat_cinterop
         // Precompile the group's include prologue. One parse now, `-include-pch` later.
         if (!req.pchOutputPath.empty())
         {
+            if (req.cxxHeaderParseGuard != nullptr
+                && !req.cxxHeaderParseGuard("clang precompile header"))
+                return false;
             llvm::TimeTraceScope pchScope("GeneratePch", req.mainFileName);
             CxxExtractionStageTimer pchStage(req.verbose && req.cxxMode, "clang precompile header");
             clang::GeneratePCHAction generate;
@@ -4517,6 +4653,9 @@ namespace cflat_cinterop
         // C++ uuid harvest: a single full parse that only collects record __declspec(uuid) GUIDs.
         if (req.uuidHarvestCxx)
         {
+            if (req.cxxHeaderParseGuard != nullptr
+                && !req.cxxHeaderParseGuard("C++ uuid harvest"))
+                return false;
             llvm::TimeTraceScope parseScope("UuidHarvest", req.mainFileName);
             UuidAction harvest(st);
             return RunAction(req, req.source, harvest, err);
@@ -4564,6 +4703,9 @@ namespace cflat_cinterop
 
         // Stage 2: the single full parse - harvests decls and reads the probe VarDecls.
         {
+            if (req.cxxHeaderParseGuard != nullptr
+                && !req.cxxHeaderParseGuard("clang parse stage 2"))
+                return false;
             llvm::TimeTraceScope parseScope("FullParse", req.mainFileName.empty() ? req.realPath : req.mainFileName);
             CxxExtractionStageTimer parseStage(req.verbose && req.cxxMode,
                                                "clang parse stage 2");

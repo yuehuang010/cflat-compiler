@@ -2,9 +2,12 @@
 
 #include "clang/AST/ASTContext.h"
 #include "clang/AST/Decl.h"
+#include "clang/AST/RecursiveASTVisitor.h"
+#include "clang/AST/Stmt.h"
 #include "clang/Basic/Diagnostic.h"
 #include "clang/Basic/DiagnosticSema.h"
 #include "clang/Frontend/CompilerInstance.h"
+#include "clang/Frontend/MultiplexConsumer.h"
 #include "clang/Interpreter/Interpreter.h"
 #include "clang/Interpreter/PartialTranslationUnit.h"
 #include "clang/Lex/PPCallbacks.h"
@@ -12,10 +15,18 @@
 #include "clang/Sema/Sema.h"
 #include "llvm/Support/Error.h"
 #include "llvm/Support/TargetSelect.h"
+#include "llvm/IR/Module.h"
+#include "llvm/Bitcode/BitcodeWriter.h"
+#include "llvm/Linker/Linker.h"
+#include "llvm/Support/MemoryBuffer.h"
+#include "llvm/Support/raw_ostream.h"
 
 #include <algorithm>
+#include <cctype>
 #include <format>
+#include <iostream>
 #include <memory>
+#include <set>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -26,18 +37,95 @@ namespace
     public:
         unsigned errors = 0;
         std::string firstError;
+        // Lines of the newest interpreter input buffer that an error or its notes point at.
+        std::string blamedBuffer;
+        std::set<unsigned> blamedLines;
 
         void HandleDiagnostic(clang::DiagnosticsEngine::Level level,
                               const clang::Diagnostic& info) override
         {
-            if (level < clang::DiagnosticsEngine::Error) return;
+            if (level == clang::DiagnosticsEngine::Note)
+            {
+                if (!inErrorGroup) return;
+                Blame(info);
+                RecordFailedInstantiation(info);
+                return;
+            }
+            inErrorGroup = level >= clang::DiagnosticsEngine::Error;
+            if (!inErrorGroup) return;
             ++errors;
+            Blame(info);
             if (firstError.empty())
             {
                 llvm::SmallString<256> text;
                 info.FormatDiagnostic(text);
                 firstError = text.str().str();
             }
+        }
+
+        // Unqualified names of members whose instantiation failed. Clang keeps such a member
+        // as an invalid decl across the rollback, and a later use of it reaches CodeGen.
+        std::set<std::string> failedMembers;
+        std::vector<clang::FunctionDecl*> failedFunctions;
+
+    private:
+        bool inErrorGroup = false;
+
+        void RecordFailedInstantiation(const clang::Diagnostic& info)
+        {
+            if (info.getNumArgs() > 0
+                && info.getArgKind(0) == clang::DiagnosticsEngine::ak_nameddecl)
+                if (auto* function = llvm::dyn_cast_or_null<clang::FunctionDecl>(
+                        reinterpret_cast<clang::NamedDecl*>(info.getRawArg(0))))
+                    failedFunctions.push_back(function);
+            llvm::SmallString<256> text;
+            info.FormatDiagnostic(text);
+            const std::string note = text.str().str();
+            for (const char* lead : { "in instantiation of member function '",
+                                      "in instantiation of function template specialization '" })
+            {
+                if (!note.starts_with(lead)) continue;
+                const size_t begin = std::char_traits<char>::length(lead);
+                const size_t end = note.find('\'', begin);
+                if (end == std::string::npos) return;
+                std::string name = note.substr(begin, end - begin);
+                // Strip trailing template arguments, then take the last scope component.
+                int depth = 0;
+                size_t split = std::string::npos;
+                for (size_t i = 0; i < name.size(); ++i)
+                {
+                    if (name[i] == '<' && !(i > 0 && name.compare(0, i, "operator") == 0)) ++depth;
+                    else if (name[i] == '>' && depth > 0) --depth;
+                    else if (depth == 0 && name.compare(i, 2, "::") == 0) split = i + 2;
+                }
+                if (split != std::string::npos) name = name.substr(split);
+                const size_t args = name.find('<');
+                if (args != std::string::npos && !name.starts_with("operator")) name.resize(args);
+                if (!name.empty()) failedMembers.insert(name);
+                return;
+            }
+        }
+
+        void Blame(const clang::Diagnostic& info)
+        {
+            if (!info.getLocation().isValid() || !info.hasSourceManager()) return;
+            const clang::SourceManager& sm = info.getSourceManager();
+            const clang::SourceLocation loc = sm.getExpansionLoc(info.getLocation());
+            const clang::PresumedLoc presumed = sm.getPresumedLoc(loc);
+            if (presumed.isInvalid()) return;
+            const std::string buffer = presumed.getFilename();
+            if (!buffer.starts_with("input_line_")) return;
+            if (buffer != blamedBuffer)
+            {
+                // Interpreter buffers are numbered; only the newest one is the failing chunk.
+                if (!blamedBuffer.empty()
+                    && std::strtoul(buffer.c_str() + 11, nullptr, 10)
+                           < std::strtoul(blamedBuffer.c_str() + 11, nullptr, 10))
+                    return;
+                blamedBuffer = buffer;
+                blamedLines.clear();
+            }
+            blamedLines.insert(presumed.getLine());
         }
     };
 
@@ -81,6 +169,188 @@ namespace
         }
     };
 
+    /*
+     * A request chunk is one Interpreter::Parse, and a PTU with any error is rolled back whole.
+     * A request TU instead error-recovers each top-level ODR-use on its own. Emulate that: split
+     * the chunk into top-level declarations by brace depth, drop the ones an error blamed, and
+     * let the caller re-parse. Marker typedefs and preprocessor lines are never dropped - an
+     * error there is a real request failure. False when nothing droppable was blamed.
+     */
+    bool DropBlamedDeclarations(const std::string& source, const std::set<unsigned>& blamed,
+                                const std::set<std::string>& failedMembers,
+                                std::string& kept, std::string& dropped)
+    {
+        kept.clear();
+        dropped.clear();
+        bool droppedAny = false;
+        std::string segment;
+        bool segmentBlamed = false;
+        int depth = 0;
+        unsigned line = 0;
+        size_t pos = 0;
+        while (pos < source.size())
+        {
+            size_t end = source.find('\n', pos);
+            if (end == std::string::npos) end = source.size(); else ++end;
+            const std::string text = source.substr(pos, end - pos);
+            pos = end;
+            ++line;
+            for (char c : text)
+            {
+                if (c == '{') ++depth;
+                else if (c == '}') --depth;
+            }
+            segment += text;
+            if (blamed.count(line) != 0) segmentBlamed = true;
+            if (depth > 0) continue;
+            depth = 0;
+            const size_t first = segment.find_first_not_of(" \t\r\n");
+            const bool protectedSegment = first == std::string::npos || segment[first] == '#'
+                || segment.find("typedef ") != std::string::npos;
+            if (!protectedSegment && !segmentBlamed)
+                for (const std::string& member : failedMembers)
+                    if (segment.find("::" + member + ")") != std::string::npos
+                        || segment.find("->" + member + "(") != std::string::npos
+                        || segment.find("." + member + "(") != std::string::npos)
+                    {
+                        segmentBlamed = true;
+                        break;
+                    }
+            if (segmentBlamed && !protectedSegment)
+            {
+                dropped += segment;
+                droppedAny = true;
+            }
+            else
+            {
+                if (segmentBlamed) return false;
+                kept += segment;
+            }
+            segment.clear();
+            segmentBlamed = false;
+        }
+        kept += segment;
+        return droppedAny;
+    }
+
+    /*
+     * A failed Parse does not roll back everything: an explicit instantiation stays done, and
+     * CodeGen keeps the definitions it already emitted. So a retry drops every explicit
+     * instantiation (it ran already) and renames the ODR-use helpers, which exist only to force
+     * instantiation, so they cannot collide with their emitted first copies.
+     */
+    std::string PrepareRetryChunk(const std::string& source, unsigned attempt)
+    {
+        std::string result;
+        size_t pos = 0;
+        while (pos < source.size())
+        {
+            size_t end = source.find('\n', pos);
+            end = end == std::string::npos ? source.size() : end + 1;
+            if (source.compare(pos, 15, "template class ") != 0)
+                result.append(source, pos, end - pos);
+            pos = end;
+        }
+        const std::string prefix = "__cflat_inc_";
+        const std::string retryTag = "r" + std::to_string(attempt) + "_";
+        pos = 0;
+        while ((pos = result.find(prefix, pos)) != std::string::npos)
+        {
+            size_t cursor = pos + prefix.size();
+            while (cursor < result.size() && std::isdigit((unsigned char)result[cursor])) ++cursor;
+            if (cursor > pos + prefix.size() && cursor < result.size() && result[cursor] == '_')
+            {
+                // Replace an earlier retry's tag ("r1_") so a second retry gets fresh names too.
+                size_t tagEnd = cursor + 1;
+                if (tagEnd < result.size() && result[tagEnd] == 'r')
+                {
+                    size_t digits = tagEnd + 1;
+                    while (digits < result.size() && std::isdigit((unsigned char)result[digits]))
+                        ++digits;
+                    if (digits > tagEnd + 1 && digits < result.size() && result[digits] == '_')
+                        tagEnd = digits + 1;
+                }
+                if (result.compare(tagEnd, 3, "use") == 0)
+                    result.replace(cursor + 1, tagEnd - (cursor + 1), retryTag);
+            }
+            pos = cursor;
+        }
+        return result;
+    }
+
+    struct ContainsErrors : clang::RecursiveASTVisitor<ContainsErrors>
+    {
+        bool found = false;
+        bool VisitExpr(clang::Expr* expr)
+        {
+            if (expr->containsErrors()) found = true;
+            return !found;
+        }
+    };
+
+    /*
+     * First consumer in the Interpreter's chain, so it runs before CodeGen. It records every decl
+     * Sema announces while a sink is attached, and it neutralizes a generated request helper
+     * (a "__cflat_" ODR-use) that holds error nodes without an error: a member whose body failed
+     * to instantiate in an earlier chunk stays invalid, and a later use of it is silent but
+     * cannot be lowered. The helper only exists to force instantiation, so dropping its
+     * initializer or body loses nothing.
+     */
+    class ChunkConsumer : public clang::ASTConsumer
+    {
+    public:
+        std::vector<clang::Decl*>* sink = nullptr;
+        clang::ASTContext* context = nullptr;
+        std::vector<std::string> neutralized;
+
+        bool HandleTopLevelDecl(clang::DeclGroupRef group) override
+        {
+            for (clang::Decl* decl : group)
+            {
+                Neutralize(decl);
+                if (sink != nullptr) sink->push_back(decl);
+            }
+            return true;
+        }
+
+    private:
+        void Neutralize(clang::Decl* decl)
+        {
+            auto* named = llvm::dyn_cast<clang::NamedDecl>(decl);
+            const clang::IdentifierInfo* id = named != nullptr ? named->getIdentifier() : nullptr;
+            if (id == nullptr || context == nullptr || !id->getName().starts_with("__cflat_"))
+                return;
+            if (auto* var = llvm::dyn_cast<clang::VarDecl>(decl))
+            {
+                if (var->getInit() != nullptr && var->getInit()->containsErrors())
+                {
+                    var->setInit(nullptr);
+                    neutralized.push_back(var->getNameAsString());
+                }
+                return;
+            }
+            auto* function = llvm::dyn_cast<clang::FunctionDecl>(decl);
+            if (function == nullptr || !function->doesThisDeclarationHaveABody()) return;
+            ContainsErrors scan;
+            scan.TraverseStmt(function->getBody());
+            if (!scan.found) return;
+            function->setBody(clang::CompoundStmt::CreateEmpty(*context, /*NumStmts*/ 0,
+                                                               /*HasFPFeatures*/ false));
+            neutralized.push_back(function->getNameAsString());
+        }
+    };
+
+    // The Interpreter's consumer is a MultiplexConsumer with no public way to add one; its
+    // list is protected, so reach it through a derived accessor.
+    struct MultiplexAccess : clang::MultiplexConsumer
+    {
+        static std::vector<std::unique_ptr<clang::ASTConsumer>>& ListOf(
+            clang::MultiplexConsumer& consumer)
+        {
+            return static_cast<MultiplexAccess&>(consumer).Consumers;
+        }
+    };
+
     std::string ErrorText(llvm::Error error)
     {
         return llvm::toString(std::move(error));
@@ -102,18 +372,49 @@ namespace
         }
         return result;
     }
+
+    bool MergeBitcode(const std::string& first, const std::string& second,
+                      std::string& merged)
+    {
+        llvm::LLVMContext context;
+        auto left = llvm::parseBitcodeFile(llvm::MemoryBufferRef(first, "cflat-cxx-left"),
+                                           context);
+        auto right = llvm::parseBitcodeFile(llvm::MemoryBufferRef(second, "cflat-cxx-right"),
+                                            context);
+        if (!left || !right) return false;
+        llvm::Linker linker(*left.get());
+        if (linker.linkInModule(std::move(*right), llvm::Linker::OverrideFromSrc)) return false;
+        llvm::raw_string_ostream stream(merged);
+        llvm::WriteBitcodeToFile(*left.get(), stream);
+        stream.flush();
+        return true;
+    }
+
+    std::string SerializeModule(llvm::Module& module)
+    {
+        std::string result;
+        llvm::raw_string_ostream stream(result);
+        llvm::WriteBitcodeToFile(module, stream);
+        stream.flush();
+        return result;
+    }
 }
 
 struct CxxIncrementalGroup::Impl
 {
     std::unique_ptr<clang::Interpreter> interpreter;
     clang::TranslationUnitDecl* headerRoot = nullptr;
+    llvm::Module* headerModule = nullptr;
     std::vector<std::string> includedFiles;
     std::unordered_set<std::string> prefixSources;
     bool verbose = false;
     std::unordered_map<std::string, cflat_cinterop::ExtractResult> wrapperResults;
     std::unordered_map<std::string, cflat_cinterop::ExtractResult> typeResults;
     std::unordered_map<std::string, clang::TranslationUnitDecl*> typeRoots;
+    // Include preludes already committed as their own chunk, with the root they produced.
+    std::unordered_map<std::string, clang::TranslationUnitDecl*> preludeRoots;
+    ChunkConsumer* announcer = nullptr;   // owned by the Interpreter's consumer chain
+    unsigned wrapperRenames = 0;
 };
 
 CxxIncrementalGroup::CxxIncrementalGroup(std::unique_ptr<Impl> impl)
@@ -160,6 +461,15 @@ std::unique_ptr<CxxIncrementalGroup> CxxIncrementalGroup::Create(
     auto impl = std::make_unique<Impl>();
     impl->interpreter = std::move(*interpreter);
     impl->verbose = verbose;
+    if (auto* multiplex = dynamic_cast<clang::MultiplexConsumer*>(
+            &impl->interpreter->getCompilerInstance()->getASTConsumer()))
+    {
+        auto recorder = std::make_unique<ChunkConsumer>();
+        recorder->context = &impl->interpreter->getCompilerInstance()->getASTContext();
+        impl->announcer = recorder.get();
+        auto& consumers = MultiplexAccess::ListOf(*multiplex);
+        consumers.insert(consumers.begin(), std::move(recorder));
+    }
     {
         DiagnosticScope diagnostics(impl->interpreter->getCompilerInstance()->getDiagnostics());
         impl->interpreter->getCompilerInstance()->getPreprocessor().addPPCallbacks(
@@ -179,6 +489,7 @@ std::unique_ptr<CxxIncrementalGroup> CxxIncrementalGroup::Create(
             return nullptr;
         }
         impl->headerRoot = (*ptu).TUPart;
+        impl->headerModule = (*ptu).TheModule.get();
     }
     return std::unique_ptr<CxxIncrementalGroup>(
         new CxxIncrementalGroup(std::move(impl)));
@@ -196,8 +507,18 @@ bool CxxIncrementalGroup::HarvestHeader(const cflat_cinterop::ExtractRequest& re
     DiagnosticScope diagnostics(impl_->interpreter->getCompilerInstance()->getDiagnostics());
     const bool harvested = cflat_cinterop::ExtractCxxIncremental(
         req, *impl_->interpreter->getCompilerInstance(), impl_->headerRoot,
-        impl_->headerRoot, {}, nullptr, out, error, true);
+        impl_->headerRoot, {}, impl_->headerModule, out, error, true);
     out.includedFiles = impl_->includedFiles;
+    if (harvested && impl_->headerModule != nullptr)
+    {
+        std::string headerBitcode = SerializeModule(*impl_->headerModule);
+        if (!headerBitcode.empty() && !out.bitcode.empty())
+        {
+            std::string merged;
+            if (MergeBitcode(headerBitcode, out.bitcode, merged)) out.bitcode = std::move(merged);
+        }
+        else if (!headerBitcode.empty()) out.bitcode = std::move(headerBitcode);
+    }
     return harvested;
 }
 
@@ -233,17 +554,6 @@ bool CxxIncrementalGroup::PrecheckSpelling(const std::string& spelling, std::str
         return false;
     }
 
-    clang::QualType type = typedefDecl->getUnderlyingType().getCanonicalType();
-    clang::Sema& sema = impl_->interpreter->getCompilerInstance()->getSema();
-    clang::Sema::SFINAETrap trap(sema);
-    const bool incomplete = sema.RequireCompleteType(
-        typedefDecl->getLocation(), type, clang::diag::err_incomplete_type);
-    if (incomplete || trap.hasErrorOccurred() || type->isIncompleteType())
-    {
-        error = diagnostics.consumer.firstError;
-        if (error.empty()) error = std::format("C++ type '{}' is incomplete", spelling);
-        return false;
-    }
     return diagnostics.consumer.errors == 0;
 }
 
@@ -293,17 +603,155 @@ bool CxxIncrementalGroup::ParseRequest(const cflat_cinterop::ExtractRequest& req
             return true;
         }
     }
-    DiagnosticScope diagnostics(impl_->interpreter->getCompilerInstance()->getDiagnostics());
-    auto ptu = impl_->interpreter->Parse(source);
-    if (!ptu)
+    // Type requests recover per declaration like a request TU; a wrapper request is all or nothing.
+    const bool recoverDeclarations = !typeKey.empty() && !wrapperBatch;
+    std::string chunk = source;
+    /*
+     * An earlier batch chunk may already define this wrapper (a default-argument wrapper whose
+     * member was refused at the time). Parse under a fresh name, then restore the requested name
+     * in the result; both definitions are weak and identical.
+     */
+    // Wrapper names re-spelled in this chunk, fresh name -> requested name.
+    std::vector<std::pair<std::string, std::string>> renamedWrappers;
+    auto identChar = [](char c) { return std::isalnum(static_cast<unsigned char>(c)) || c == '_'; };
+    // Rewrites NAME and its NAME_cpp helper, never a longer identifier that starts with NAME.
+    auto rewrite = [&](const std::string& name, const std::string& fresh) {
+        bool changed = false;
+        for (size_t pos = 0; (pos = chunk.find(name, pos)) != std::string::npos;)
+        {
+            size_t after = pos + name.size();
+            if (chunk.compare(after, 4, "_cpp") == 0) after += 4;
+            if ((pos != 0 && identChar(chunk[pos - 1]))
+                || (after < chunk.size() && identChar(chunk[after])))
+            {
+                pos += name.size();
+                continue;
+            }
+            chunk.replace(pos, name.size(), fresh);
+            pos += fresh.size();
+            changed = true;
+        }
+        return changed;
+    };
+    /*
+     * A failed attempt's definitions stay emitted in the Interpreter's CodeGen module, so every
+     * retry re-spells all earlier renames too, not just the new one.
+     */
+    auto renameWrapper = [&](const std::string& name) {
+        auto freshName = [&](const std::string& original) {
+            return std::format("{}__cflat_again{}", original, impl_->wrapperRenames++);
+        };
+        const std::string fresh = freshName(name);
+        if (!rewrite(name, fresh)) return false;
+        for (auto& [renamed, original] : renamedWrappers)
+        {
+            const std::string next = freshName(original);
+            rewrite(renamed, next);
+            renamed = next;
+        }
+        renamedWrappers.emplace_back(fresh, name);
+        return true;
+    };
+    if (!wrapperName.empty())
     {
+        clang::ASTContext& context = impl_->interpreter->getCompilerInstance()->getASTContext();
+        if (!context.getTranslationUnitDecl()->lookup(
+                clang::DeclarationName(&context.Idents.get(wrapperName))).empty())
+            renameWrapper(wrapperName);
+    }
+    clang::TranslationUnitDecl* preludeRoot = nullptr;
+    {
+        /*
+         * Commit the leading #include lines first, in their own chunk. A failed chunk that is the
+         * first to include a header rolls back the header's decls, but its include guard stays
+         * set, so every later chunk would see the header as empty ("undeclared identifier 'std'").
+         */
+        size_t bodyStart = 0;
+        while (bodyStart < chunk.size() && (chunk[bodyStart] == '#' || chunk[bodyStart] == '\n'))
+        {
+            const size_t end = chunk.find('\n', bodyStart);
+            bodyStart = end == std::string::npos ? chunk.size() : end + 1;
+        }
+        const std::string prelude = chunk.substr(0, bodyStart);
+        if (!prelude.empty() && bodyStart < chunk.size())
+        {
+            auto known = impl_->preludeRoots.find(prelude);
+            if (known == impl_->preludeRoots.end())
+            {
+                DiagnosticScope diagnostics(
+                    impl_->interpreter->getCompilerInstance()->getDiagnostics());
+                auto ptu = impl_->interpreter->Parse(prelude);
+                if (!ptu)
+                {
+                    const std::string parseError = ErrorText(ptu.takeError());
+                    error = diagnostics.consumer.firstError;
+                    if (error.empty()) error = parseError;
+                    return false;
+                }
+                known = impl_->preludeRoots.emplace(prelude, (*ptu).TUPart).first;
+            }
+            preludeRoot = known->second;
+            chunk.erase(0, bodyStart);
+        }
+    }
+    clang::PartialTranslationUnit* parsed = nullptr;
+    std::vector<clang::Decl*> announced;
+    for (unsigned attempt = 0;; ++attempt)
+    {
+        DiagnosticScope diagnostics(impl_->interpreter->getCompilerInstance()->getDiagnostics());
+        announced.clear();
+        if (impl_->announcer != nullptr) impl_->announcer->sink = &announced;
+        auto ptu = impl_->interpreter->Parse(chunk);
+        if (impl_->announcer != nullptr) impl_->announcer->sink = nullptr;
+        if (impl_->verbose && impl_->announcer != nullptr)
+            for (const std::string& name : impl_->announcer->neutralized)
+                std::cout << "[verbose] incremental request helper " << name
+                          << " uses a member that failed to instantiate earlier; emptied\n";
+        if (impl_->announcer != nullptr) impl_->announcer->neutralized.clear();
+        if (ptu)
+        {
+            parsed = &*ptu;
+            break;
+        }
         // Consume the Expected either way; an unchecked one aborts under LLVM assertions.
         const std::string parseError = ErrorText(ptu.takeError());
         error = diagnostics.consumer.firstError;
         if (error.empty()) error = parseError;
-        return false;
+        /*
+         * An earlier chunk already defines a generated wrapper this chunk repeats (a batch that
+         * emitted it while its member was refused). Parse the repeat under a fresh name.
+         */
+        static const std::string kRedefinition = "redefinition of '__cflat_";
+        if (wrapperBatch && attempt < 16 && error.starts_with(kRedefinition))
+        {
+            const size_t start = kRedefinition.size() - std::string("__cflat_").size();
+            const size_t end = error.find('\'', start);
+            std::string name = error.substr(start, end - start);
+            if (name.ends_with("_cpp")) name.resize(name.size() - 4);
+            if (renameWrapper(name)) continue;
+        }
+        std::string kept, dropped;
+        if (!recoverDeclarations || attempt >= 3
+            || !DropBlamedDeclarations(chunk, diagnostics.consumer.blamedLines,
+                                       diagnostics.consumer.failedMembers, kept, dropped))
+            return false;
+        // The failed instantiations keep bodies with error nodes, CodeGen has no guard for
+        // them, and it may already have them queued. Empty them, as the request-TU sweep does.
+        clang::ASTContext& context = impl_->interpreter->getCompilerInstance()->getASTContext();
+        for (clang::FunctionDecl* function : diagnostics.consumer.failedFunctions)
+            if (function->doesThisDeclarationHaveABody())
+                function->setBody(clang::CompoundStmt::CreateEmpty(context, /*NumStmts*/ 0,
+                                                                   /*HasFPFeatures*/ false));
+        if (impl_->verbose)
+            std::cout << std::format("[verbose] incremental request dropped declarations after "
+                                     "'{}':\n{}", error, dropped);
+        chunk = PrepareRetryChunk(kept, attempt + 1);
     }
+    error.clear();
     cflat_cinterop::ExtractRequest effective = req;
+    for (auto& name : effective.cxxFunctionWrapperNames)
+        for (const auto& [renamed, original] : renamedWrappers)
+            if (name == original) name = renamed;
     if (wrapperBatch)
     {
         effective.requireInScope = false;
@@ -321,13 +769,38 @@ bool CxxIncrementalGroup::ParseRequest(const cflat_cinterop::ExtractRequest& req
         if (found != impl_->typeRoots.end()) extraRoots.push_back(found->second);
     }
     const bool harvested = cflat_cinterop::ExtractCxxIncremental(
-        effective, *impl_->interpreter->getCompilerInstance(), (*ptu).TUPart,
+        effective, *impl_->interpreter->getCompilerInstance(), parsed->TUPart,
         wrapperBatch ? nullptr : impl_->headerRoot, extraRoots,
-        (*ptu).TheModule.get(), out, error);
+        parsed->TheModule.get(), out, error, false, wrapperBatch ? nullptr : preludeRoot,
+        &announced);
+    if (harvested && !renamedWrappers.empty())
+    {
+        llvm::Module* module = parsed->TheModule.get();
+        for (const auto& [renamed, original] : renamedWrappers)
+        {
+            for (auto& sig : out.sigs)
+            {
+                if (sig.name == renamed) sig.name = original;
+                if (sig.linkageName == renamed) sig.linkageName = original;
+            }
+            for (auto& name : out.droppedCxxDefaultWrappers)
+                if (name == renamed) name = original;
+            if (module != nullptr)
+                if (llvm::GlobalValue* value = module->getNamedValue(renamed))
+                    value->setName(original);
+        }
+        if (module != nullptr && !out.bitcode.empty())
+        {
+            out.bitcode.clear();
+            llvm::raw_string_ostream os(out.bitcode);
+            llvm::WriteBitcodeToFile(*module, os);
+            os.flush();
+        }
+    }
     if (harvested && !typeKey.empty() && !req.emitDefinitions)
     {
         impl_->typeResults[typeKey] = out;
-        impl_->typeRoots[typeKey] = (*ptu).TUPart;
+        impl_->typeRoots[typeKey] = parsed->TUPart;
     }
     if (harvested && !typeKey.empty() && req.emitDefinitions)
     {

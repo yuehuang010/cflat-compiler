@@ -1175,6 +1175,12 @@ bool LLVMBackend::TryGetEnumMemberInt(const std::string& enumSpelling, const std
         std::string enumKey = ResolveEnumTypeName(enumSpelling);
         if (enumKey.empty()) return false;
         auto it = globalNamedVariable.find(enumKey + "." + member);
+        if (it == globalNamedVariable.end())
+        {
+            const size_t namespaceEnd = enumKey.rfind('.');
+            if (namespaceEnd != std::string::npos)
+                it = globalNamedVariable.find(enumKey.substr(0, namespaceEnd) + "." + member);
+        }
         if (it == globalNamedVariable.end() || it->second == nullptr) return false;
         auto* ci = llvm::dyn_cast_or_null<llvm::ConstantInt>(it->second->getInitializer());
         if (ci == nullptr || ci->getBitWidth() > 64) return false;
