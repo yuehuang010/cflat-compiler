@@ -3577,6 +3577,7 @@ private:
         bool hasDeletedCopyCtor = false;
         bool hasDefaultCtor = false;
         bool hasCopyCtor = false;
+        bool hasCtorTemplate = false;
         bool isAggregate = false;
         std::vector<cflat_cinterop::RawCxxMember> members;
         std::vector<cflat_cinterop::RawCxxStaticVar> staticVars;
@@ -4948,7 +4949,7 @@ private:
     void EmitUniqueInterfaceFieldRelease(llvm::IRBuilder<>& b, llvm::Value* fieldPtr,
                                          const std::string& ifaceName);
 
-    llvm::Function* GetOrCreateFullDestructor(const std::string& typeName);
+    llvm::Function* GetOrCreateFullDestructor(const std::string& typeName, bool membersOnly = false);
     void EmitCflatOwnedFieldsDestruction(llvm::IRBuilder<>& b, const std::string& typeName,
                                          llvm::Value* self);
 
@@ -5149,10 +5150,79 @@ private:
     // declaration of a unique-element list (whose copy() is poisoned) stays legal.
     void CheckPoisonedFunctionCalls();
 
-    // A C++ declaration without a noexcept specification can unwind, and cflat emits no
-    // landing pads or personality routine - the unwinder would run off the top of the CFlat
-    // frame. Refuse to bind such a function, whether by call or by function pointer.
+    // --cpp-strict-noexcept: refuse to bind a C++ declaration without a noexcept specification,
+    // whether by call or by function pointer. By default such a call is allowed and unwinds
+    // through CFlat frames via CreateCallOrInvoke's cleanup landing pads.
     void RejectThrowingCxxFunction(const FunctionSymbol& symbol, const std::string& displayName) const;
+    // The target's EH personality: __C_specific_handler on Win64 (the SEH routine the `program`
+    // trampoline also installs), __gxx_personality_v0 on Itanium targets, null on Win32.
+    llvm::Function* GetTargetEhPersonality();
+    // True when a call to `symbol` can unwind: a C++ declaration without noexcept, or any CFlat
+    // function (it may reach one transitively). C declarations and body-less externs cannot.
+    bool CalleeMayUnwind(const FunctionSymbol& symbol) const;
+    // True when an exception unwinding out of the current point would skip a cleanup this
+    // CFlat frame owes: an owning local or parameter, a held lock, or a pending struct temp.
+    bool FrameOwesUnwindCleanup();
+    /*
+     * A C++ exception unwinding THROUGH a CFlat frame must run every destructor the frame owes.
+     * When `mayUnwind`, C++ interop is in use and the frame owes cleanup, emit an invoke whose
+     * landing pad runs the same scope-exit destruction a `return` runs (plus the statement's
+     * pending struct temps) and resumes; otherwise a plain call. CFlat never catches.
+     */
+    llvm::CallBase* CreateCallOrInvoke(llvm::FunctionType* fnTy, llvm::Value* callee,
+                                       llvm::ArrayRef<llvm::Value*> args, bool mayUnwind,
+                                       const llvm::Twine& name = "");
+    bool emittingUnwindCleanup_ = false;
+    // A declaration registers its local before the initializer finishes, so an unwind out of that
+    // initializer must not destroy it: (scope depth, first DeclSequence) per open declarator.
+    std::vector<std::pair<size_t, uint64_t>> unwindInitFloors_;
+    // Set per scope while an unwind pad runs EmitDestructorsForScope; locals at or above it skip.
+    uint64_t unwindSkipSeqFloor_ = UINT64_MAX;
+    uint64_t UnwindInitFloorForDepth(size_t depth) const;
+    struct UnwindInitScope
+    {
+        LLVMBackend& backend;
+        explicit UnwindInitScope(LLVMBackend& b) : backend(b)
+        {
+            backend.unwindInitFloors_.emplace_back(backend.stackNamedVariable.size(), backend.nextDeclSequence);
+        }
+        ~UnwindInitScope() { backend.unwindInitFloors_.pop_back(); }
+    };
+    /*
+     * Partial construction: what an unwind out of the object under construction must release.
+     * A finished field VALUE (destroyed through a spill) or field SLOT (in place), the MEMBERS of a built `this` slot
+     * while a constructor body runs (never its user ~T), and a `new` block whose constructor
+     * has not returned (freed, never destroyed). Keyed by function; the pad runs them newest
+     * first, before the statement temps. UnwindPartialScope pops what its region pushed.
+     */
+    struct UnwindPartialEntry
+    {
+        enum class Kind { Value, Slot, Members, CxxHeap, CflatHeap } K;
+        llvm::Value* V;
+        std::string TypeName;
+        llvm::Function* Fn;
+        uint64_t AllocAlign = 0;
+    };
+    std::vector<UnwindPartialEntry> unwindPartial_;
+    struct UnwindPartialScope
+    {
+        LLVMBackend& backend;
+        size_t mark;
+        explicit UnwindPartialScope(LLVMBackend& b) : backend(b), mark(b.unwindPartial_.size()) {}
+        ~UnwindPartialScope() { Release(); }
+        void Release()
+        {
+            if (backend.unwindPartial_.size() > mark) backend.unwindPartial_.resize(mark);
+        }
+    };
+    void NoteUnwindPartial(UnwindPartialEntry::Kind kind, llvm::Value* v, const std::string& typeName,
+                           uint64_t allocAlign = 0);
+    void EmitUnwindPartialRelease(const UnwindPartialEntry& e);
+    // Sink-parameter arguments of the call being emitted: the callee owns them from the invoke
+    // on, so its pad must not free them (the post-call transfer drops them from the temp lists).
+    std::vector<llvm::Value*> unwindCallConsumedTemps_;
+    std::vector<llvm::Value*> moveTransferConsumedTemps_;
+    bool UnwindTempConsumedByCall(llvm::Value* v) const;
     llvm::Function* EnsureCxxProgramEhGuard(const std::string& programName);
     static std::string SqueezeCxxSpelling(const std::string& spelling);
     // `iterator -> const_iterator`: same template, `const` added to a pointer template argument.
@@ -5286,10 +5356,13 @@ private:
                                     const std::vector<CxxBraceArgument>& braceArguments,
                                     std::string& wrapperName,
                                     std::string& error);
+    // copyInit: the wrapper copy-initializes (`T t = arg;`), so an explicit constructor is
+    // never a candidate - the form every IMPLICIT conversion site must use.
     bool RequestCxxVariadicConstructor(const std::string& typeName,
                                        const std::vector<NamedVariable>& arguments,
                                        std::string& wrapperName,
-                                       std::string& error);
+                                       std::string& error,
+                                       bool copyInit = false);
     bool RequestCxxOperatorArrow(const std::string& typeName, std::string& error);
     std::vector<size_t> CandidateCxxGroupsFor(const std::string& cxxBase);
     void CollectCxxTypeOwnerGroups(const std::string& cflatTypeName,
@@ -7732,6 +7805,7 @@ public:
         bool hasDeletedCopyCtor = false;
         bool hasDefaultCtor = false;
         bool hasCopyCtor = false;
+        bool hasCtorTemplate = false;
         bool isAggregate = false;
         // Field name -> access, for the "is private" diagnostic on member access.
         std::map<std::string, int> fieldAccess;
@@ -7957,6 +8031,14 @@ public:
     {
         return cxxNontrivialRecords_.count(typeName) != 0;
     }
+    bool HasForeignNontrivialCxxFieldForAnalysis(const std::string& typeName) const
+    {
+        return HasForeignNontrivialCxxField(typeName);
+    }
+    bool IsCopyableTypeForAnalysis(const std::string& typeName) const
+    {
+        return IsCopyableType(typeName);
+    }
     bool IsForeignNontrivialCxxReturnClass(const std::string& typeName) const
     {
         // CFlat-defined [cpp] structs have generated C++ special members but keep their existing
@@ -7964,7 +8046,10 @@ public:
         return IsForeignNontrivialCxxClass(typeName)
             && generatedCxxRecords_.count(typeName) == 0;
     }
-    bool IsForeignCxxClassWithConstructors(const std::string& typeName) const
+    // countCtorTemplates=false answers as if constructor templates were invisible, the surface
+    // a class-typed implicit argument conversion still keys on.
+    bool IsForeignCxxClassWithConstructors(const std::string& typeName,
+                                           bool countCtorTemplates = true) const
     {
         if (typeName.starts_with("std.pair$")) return false;
         auto it = cxxClasses_.find(typeName);
@@ -7995,7 +8080,9 @@ public:
             || (cxxRecords_.count(typeName) != 0 && it != cxxClasses_.end()
                 && (!it->second.constructors.empty()
                     || it->second.refusedMembers.count("__ctor") != 0))
-            || missingCtor || hasPublicImplicitDefaultCtor;
+            || missingCtor || hasPublicImplicitDefaultCtor
+            || (countCtorTemplates && record != cxxRecordEntries_.end()
+                && record->second.hasCtorTemplate);
         return result;
     }
     // C++ permits a scalar argument to initialize a class temporary for a reference or
@@ -8128,6 +8215,16 @@ public:
                                                        const std::vector<NamedVariable>* argVars = nullptr,
                                                        bool allowExplicit = true) const;
     /*
+     * True when `T(args)` must be resolved by clang rather than by SelectCxxConstructor: the
+     * class declares a constructor TEMPLATE (never listed as a member), and the listed pick
+     * `selected` is absent or not an identity match for every argument. A non-template exact
+     * match beats any template in C++, so that pick stands; anything else could lose to a
+     * template specialization CFlat cannot see.
+     */
+    bool CxxConstructorNeedsClangResolution(const std::string& typeName,
+                                            const CxxClassInfo::Structor* selected,
+                                            const std::vector<TypeAndValue>& argTypes) const;
+    /*
      * Name of the `explicit` constructor of `typeName` that WOULD have taken `argTypes` had it
      * been implicit. Empty when none exists. Drives the diagnostic at a call argument.
      */
@@ -8148,6 +8245,8 @@ public:
     // Returns false after LogError when the needed constructor is missing or inaccessible.
     bool EmitCxxCopyOrMoveConstruct(const std::string& typeName, llvm::Value* dest,
                                     llvm::Value* src, bool useMove, const char* context);
+    bool EmitCxxByValueParamConstruct(const std::string& typeName, llvm::Value* dest,
+                                      llvm::Value* src, bool useMove, const char* context);
     /*
      * Destination slot that a foreign nontrivial C++ result must be constructed INTO, armed by
      * the declaration site for the duration of one initializer and consumed by the first call
@@ -9248,7 +9347,7 @@ public:
 
     // Mirror of ApplyAbiAttributes but for a CallInst. LLVM's verifier requires that the
     // sret / byval attributes appear on both the function declaration AND every call site.
-    void ApplyAbiCallAttributes(llvm::CallInst* ci, const AbiRecipe& recipe);
+    void ApplyAbiCallAttributes(llvm::CallBase* ci, const AbiRecipe& recipe);
 
     // Emit a C-extern call when the resolved overload's signature contains struct-by-value
     // params or return. argList holds the CFlat-natural argument values (struct values are
@@ -9272,7 +9371,8 @@ public:
                                     llvm::Value* sretDest = nullptr,
                                     const std::vector<llvm::Value*>* indirectArgAddrs = nullptr,
                                     llvm::Value* calleeOverride = nullptr,
-                                    const std::vector<llvm::Value*>* rawArrayCounts = nullptr);
+                                    const std::vector<llvm::Value*>* rawArrayCounts = nullptr,
+                                    bool mayUnwind = false);
     // A pointer to a C++ class binds to a parameter/slot of a PUBLIC base of that class, with the
     // base subobject offset added. Non-public bases are refused at the conversion site.
     // A C++ class VALUE slices to a by-value/by-reference parameter of a PUBLIC base of it.
@@ -9300,7 +9400,8 @@ public:
     // bytes (used to scatter SysV eightbytes returned in registers back into a struct).
     void StoreCoerceAt(llvm::Value* structSlot, llvm::Value* val, uint64_t byteOff);
 
-    llvm::Value* CreateFunctionCall(llvm::Function* func, const std::vector<llvm::Value*>& arg);
+    llvm::Value* CreateFunctionCall(llvm::Function* func, const std::vector<llvm::Value*>& arg,
+                                    bool mayUnwind = false);
 
     bool ParameterCarriesRawArrayCount(const TypeAndValue& param) const;
     bool ReturnCarriesRawArrayCount(const TypeAndValue& returnType) const;
@@ -9766,7 +9867,7 @@ public:
      * timeout). The PCH key still folds the build stamp, since a PCH belongs to the clang that
      * wrote it.
      */
-    static constexpr int kCHeaderCacheVersion = 80;
+    static constexpr int kCHeaderCacheVersion = 81;
     static std::string CompilerBuildStamp();
 
     static std::string GetCHeaderCacheDir();

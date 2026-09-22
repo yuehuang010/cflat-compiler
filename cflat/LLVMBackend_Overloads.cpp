@@ -3146,8 +3146,11 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
         }
 
         // Null move sources before the callee can observe or reseat an aliased slot.
+        moveTransferConsumedTemps_.clear();
         ApplyMoveParamTransfer(functionName, candidate.Parameters, matched, true,
                                candidate.IsMethod, true, candidate.IsCxx);
+        std::vector<llvm::Value*> sinkConsumedTemps = std::move(moveTransferConsumedTemps_);
+        moveTransferConsumedTemps_.clear();
 
         /*
          * M4b - foreign nontrivial C++ values crossing this call by value.
@@ -3181,7 +3184,9 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
             {
                 if (candidate.Recipe.paramSlots[i].kind != AbiSlot::ByVal) continue;
                 const std::string& pn = candidate.Parameters[i].TypeName;
-                if (!IsForeignNontrivialCxxClass(pn)) continue;
+                const bool cxxObject = IsForeignNontrivialCxxClass(pn);
+                const bool cflatHolder = !cxxObject && HasForeignNontrivialCxxField(pn);
+                if (!cxxObject && !cflatHolder) continue;
                 if (i >= matched.size() || matched[i].Storage == nullptr)
                 {
                     LogError(std::format(
@@ -3198,13 +3203,13 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                     || matched[i].IsExplicitMove
                     || matched[i].CxxParamLastUse
                     || (!candidate.IsCxx && matched[i].IsRvalue);
-                if (!EmitCxxCopyOrMoveConstruct(pn, temp, matched[i].Storage, useMove,
-                                                "into a by-value parameter"))
-                    continue;
-                if (!IsCxxParamDestroyedInCallee(pn)) RegisterOwnedStructTemp(temp, pn);
+                if (!EmitCxxByValueParamConstruct(pn, temp, matched[i].Storage, useMove,
+                                                  "into a by-value parameter")) continue;
+                if (cxxObject && !IsCxxParamDestroyedInCallee(pn))
+                    RegisterOwnedStructTemp(temp, pn);
                 cxxIndirectArgAddrs.resize(candidate.Recipe.paramSlots.size(), nullptr);
                 cxxIndirectArgAddrs[i] = temp;
-                if (matched[i].CxxParamLastUse && !matched[i].IsElementAccess
+                if (matched[i].CxxParamLastUse && !cflatHolder && !matched[i].IsElementAccess
                     && matched[i].FieldName.empty())
                 {
                     const std::string sourceName = matched[i].CallerName.empty()
@@ -3276,15 +3281,26 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
             }
         }
 
+        const bool calleeMayUnwind = CalleeMayUnwind(candidate);
+        // Only this call's own invoke treats the sink arguments as handed over; an unwind out of
+        // an argument conversion emitted above still owns and frees them.
+        struct ConsumedTempsScope
+        {
+            LLVMBackend& b;
+            ~ConsumedTempsScope() { b.unwindCallConsumedTemps_.clear(); }
+        } consumedTempsScope{ *this };
+        unwindCallConsumedTemps_ = std::move(sinkConsumedTemps);
         llvm::Value* result = candidate.Recipe.hasLowering
             ? EmitAbiLoweredCall(candidate, argList, cxxSretDest,
                                  cxxIndirectArgAddrs.empty() ? nullptr : &cxxIndirectArgAddrs,
                                  cxxVirtualCallee,
-                                 cflatRawArrayCounts.empty() ? nullptr : &cflatRawArrayCounts)
+                                 cflatRawArrayCounts.empty() ? nullptr : &cflatRawArrayCounts,
+                                 calleeMayUnwind)
             : (cxxVirtualCallee != nullptr
-                ? (llvm::Value*)builder->CreateCall(candidate.Function->getFunctionType(),
-                                                    cxxVirtualCallee, argList)
-                : CreateFunctionCall(candidate.Function, argList));
+                ? (llvm::Value*)CreateCallOrInvoke(candidate.Function->getFunctionType(),
+                                                   cxxVirtualCallee, argList, calleeMayUnwind)
+                : CreateFunctionCall(candidate.Function, argList, calleeMayUnwind));
+        unwindCallConsumedTemps_.clear();
         if (cxxRetTemp != nullptr)
         {
             RegisterOwnedStructTemp(cxxRetTemp, candidate.ReturnType.TypeName);

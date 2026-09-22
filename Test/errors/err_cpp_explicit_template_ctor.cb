@@ -1,0 +1,12 @@
+// An `explicit` constructor TEMPLATE never converts implicitly (CFlat rule, and C++'s):
+// the implicit-argument probe copy-initializes, so clang refuses it. A direct `T(3)` call is
+// legal (Test/test_cpp_interop_template.cb, 2545).
+import cpp "cpp_interop_tmplctor.h";
+
+extern int main()
+{
+    expect_error("no overload of 'cppctor.take_expl' matches the given arguments") {
+        int e = cppctor.take_expl(3);
+    }
+    return 0;
+}

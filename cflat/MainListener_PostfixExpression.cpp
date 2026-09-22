@@ -5118,10 +5118,16 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     if (fp.Pointer && fp.IsMove)
                                         rawArrayCounts[i] = Compiler(ctx)->RawArrayCountArgument(argNVs[i]);
                                 }
+                                Compiler(ctx)->moveTransferConsumedTemps_.clear();
                                 Compiler(ctx)->ApplyFuncPtrSinkTransfer(
                                     functionName, funcPtrTV.FuncPtrParams, argNVs, true);
+                                // The call's unwind pad leaves the sink arguments to the callee.
+                                Compiler(ctx)->unwindCallConsumedTemps_ =
+                                    std::move(Compiler(ctx)->moveTransferConsumedTemps_);
+                                Compiler(ctx)->moveTransferConsumedTemps_.clear();
                                 auto result = Compiler(ctx)->CreateIndirectCall(
                                     funcPtrTV, funcPtr, callArgs, &argNVs, &rawArrayCounts);
+                                Compiler(ctx)->unwindCallConsumedTemps_.clear();
                                 Compiler(ctx)->lastCallReturnsOwned = funcPtrTV.FuncPtrReturnOwned;
                                 if (result != nullptr && funcPtrTV.FuncPtrReturnOwned)
                                 {
@@ -6737,14 +6743,21 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                         functionName, ctorTypes, why, false, &arguments);
                                     hardReferenceRejection = why.starts_with("constructor '");
                                 }
-                                if (ctor == nullptr && !hardReferenceRejection)
+                                // A constructor template can outrank the listed pick: clang
+                                // resolves `T(args)`, the listed pick stays the fallback.
+                                const bool clangResolves = compiler->CxxConstructorNeedsClangResolution(
+                                    functionName, ctor, ctorTypes);
+                                std::string wrapperName;
+                                std::string wrapperError;
+                                const bool wrapped = ((ctor == nullptr && !hardReferenceRejection)
+                                        || clangResolves)
+                                    && compiler->RequestCxxVariadicConstructor(
+                                        functionName, arguments, wrapperName, wrapperError);
+                                if (wrapped || (ctor == nullptr && !hardReferenceRejection))
                                 {
                                     // Some foreign class constructors are templates or inherited
                                     // variadics, so use the declaration initializer's wrapper path.
-                                    std::string wrapperName;
-                                    std::string wrapperError;
-                                    if (compiler->RequestCxxVariadicConstructor(
-                                            functionName, arguments, wrapperName, wrapperError))
+                                    if (wrapped)
                                     {
                                         auto* objectType = compiler->GetType(
                                             LLVMBackend::TypeAndValue{ .TypeName = functionName });

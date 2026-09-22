@@ -4101,7 +4101,11 @@ cxx_dtor_ready:
                                                       &ctorArgumentAddresses);
                 hardReferenceRejection = why.starts_with("constructor '");
             }
-            if (ctor == nullptr && !hardReferenceRejection)
+            // A constructor template can outrank the listed pick (or the listed refusal): let
+            // clang resolve `T(args)` over every constructor, and keep the listed pick otherwise.
+            const bool clangResolves =
+                compiler->CxxConstructorNeedsClangResolution(typeName, ctor, argTypes);
+            if ((ctor == nullptr && !hardReferenceRejection) || clangResolves)
             {
                 std::string wrapperName;
                 std::string wrapperError;
@@ -4134,9 +4138,12 @@ cxx_dtor_ready:
                     compiler->CreateOverloadedFunctionCall(wrapperName, wrapperArguments);
                     return true;
                 }
-                if (!wrapperError.empty()) why = wrapperError;
-                LogErrorContext(direct, std::format("C++ class '{}' {}", typeName, why));
-                return true;
+                if (ctor == nullptr)
+                {
+                    if (!wrapperError.empty() && !hardReferenceRejection) why = wrapperError;
+                    LogErrorContext(direct, std::format("C++ class '{}' {}", typeName, why));
+                    return true;
+                }
             }
             if (ctor == nullptr)
             {
@@ -4162,7 +4169,8 @@ cxx_dtor_ready:
                 compiler->lastCxxRetValue_ = nullptr;
                 auto sourceNV = ParseMoveExpression(moveExpr);
                 if ((sourceNV.IsElementAccess || sourceNV.FieldPathThroughPointer
-                        || llvm::isa<llvm::LoadInst>(sourceNV.Storage))
+                        || llvm::isa<llvm::LoadInst>(sourceNV.Storage)
+                        || llvm::isa<llvm::PHINode>(sourceNV.Storage))
                     && sourceNV.Storage != nullptr && !sourceNV.TypeAndValue.Pointer
                     && sourceNV.TypeAndValue.TypeName == typeName)
                 {
@@ -4227,7 +4235,7 @@ cxx_dtor_ready:
                     std::string wrapperName;
                     std::string wrapperError;
                     if (compiler->RequestCxxVariadicConstructor(
-                            typeName, { *srcNV }, wrapperName, wrapperError))
+                            typeName, { *srcNV }, wrapperName, wrapperError, /*copyInit*/ true))
                     {
                         LLVMBackend::NamedVariable self;
                         self.Primary = slot;
@@ -4970,6 +4978,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
         for (auto initDecl : initDeclarVec)
         {
             typeAndValue = parsedTypeAndValue;
+            LLVMBackend::UnwindInitScope unwindInit(*compiler);
             /*
             declarator
             : directDeclarator

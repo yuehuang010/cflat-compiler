@@ -22,7 +22,7 @@ fails is reaching the declarations inside.
 
 Container construction (`= default`), `push_back` / `push` / `operator[]` / `size` / `find`,
 member calls on a `T&` element, and `auto it = m.find(1)` all work. `optional` and `pair` work
-when declared `= default`; their constructor-call spelling does not (gap 4).
+when declared `= default`; `optional` construction now works too, `pair` construction does not (gap 4).
 
 ## L1: gaps
 
@@ -31,7 +31,7 @@ when declared `= default`; their constructor-call spelling does not (gap 4).
 | 1 | [`std-free-functions-and-globals-unreachable.md`](std-free-functions-and-globals-unreachable.md) | all 21 `c*` headers, `algorithm`, `numeric`, `bit`, `limits`, `format`, `iostream` globals |
 | 2 | alias of a class-template specialization - LANDED 2026-09-16 (`std.ofstream` / `std.ostringstream` now resolve; `std.ofstream` construction was measured on macOS) | was: `std.ofstream`, `std.ostringstream` |
 | 3 | [`stream-classes-no-callable-destructor.md`](stream-classes-no-callable-destructor.md) (destructor half FIXED 2026-09-10, constructor half FIXED 2026-09-16; on macOS only the test leg is missing, [`stream-open-instantiation-error.md`](stream-open-instantiation-error.md) stays open for MSVC) | streams as locals; with 1+2, the whole iostream family |
-| 4 | [`constrained-template-constructor-overload-resolution.md`](constrained-template-constructor-overload-resolution.md) | `complex`, `chrono`, `filesystem`, `tuple`, `optional`, `pair`, `regex`, `random` construction |
+| 4 | constructor templates in `T(args)` - LANDED 2026-09-22 (clang resolves `T(args)` whenever the class declares a constructor template and the listed pick is not an identity match); `complex`, `chrono`, `filesystem`, `tuple`, `optional`, `regex`, `random` construction run. Residual: [`std-pair-constructor-call-unresolved.md`](std-pair-constructor-call-unresolved.md) | `pair` construction |
 | 5 | `lock` as a member name - LANDED `6f1981c` | was: `std.mutex.lock`, `std.shared_mutex.lock` |
 | 6 | [`range-for-over-cpp-container.md`](range-for-over-cpp-container.md) | `for (T x in c)` over every C++ container - PARKED 2026-09-09 by maintainer ruling, awaiting a protocol decision (size/`[]` vs begin/end vs both) |
 | 7 | [`no-cpp-standard-selection-flag.md`](no-cpp-standard-selection-flag.md) | `expected`, `flat_map`, `flat_set`, `generator`, `mdspan`, `print`, `stacktrace`, `stdfloat` |
@@ -53,9 +53,8 @@ surface at all before a spike means anything.
 ## Sequencing
 
 Gaps 1, 5, 6, 8 are independent and small. Gap 1 unlocks the most headers per unit of work and
-should go first. Gaps 2 and 3 are one story - neither alone makes a stream usable. Gap 4 is the
-deepest: constructor overload ranking over constrained member templates, the same machinery the
-working `const char*` constructor of `std.string` already exercises. Gap 7 needs a maintainer
+should go first. Gaps 2 and 3 are one story - neither alone makes a stream usable. Gap 4 landed
+except `pair`. Gap 7 needs a maintainer
 ruling on the target standard before it is a flag.
 
 Gap 3 split on 2026-09-10: the virtual destructor is fixed (a clang-emitted thunk carries the

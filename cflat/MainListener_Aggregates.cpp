@@ -95,6 +95,8 @@ llvm::Value* MainListener::EmitAggregateFieldInitialization(
     auto* compiler = Compiler();
     std::vector<llvm::Value*> initializers;
     std::vector<char> initializerUnsigned;
+    // A field initializer that unwinds destroys the fields already built.
+    LLVMBackend::UnwindPartialScope partialFields(*compiler);
     for (auto& field : fields)
     {
         llvm::Value* rvalue = nullptr;
@@ -134,6 +136,8 @@ llvm::Value* MainListener::EmitAggregateFieldInitialization(
         }
         initializers.push_back(rvalue);
         initializerUnsigned.push_back(fieldSrcUnsigned ? 1 : 0);
+        compiler->NoteUnwindPartial(LLVMBackend::UnwindPartialEntry::Kind::Value, rvalue,
+                                    field.TypeName);
     }
 
     llvm::Value* structValue = llvm::Constant::getNullValue(structType);
@@ -142,6 +146,7 @@ llvm::Value* MainListener::EmitAggregateFieldInitialization(
         if (index >= structType->getNumElements())
             break;
         llvm::Value* rvalue = initializers[index];
+        llvm::Value* const firstPassValue = rvalue;
         auto* destType = structType->getTypeAtIndex(index);
         auto& field = fields[index];
         if (rvalue == nullptr && (destType->isStructTy() || destType->isArrayTy()))
@@ -177,7 +182,12 @@ llvm::Value* MainListener::EmitAggregateFieldInitialization(
             }
         }
         if (rvalue->getType() == destType)
+        {
             structValue = compiler->CreateInsertValue(structValue, rvalue, index);
+            if (rvalue != firstPassValue)
+                compiler->NoteUnwindPartial(LLVMBackend::UnwindPartialEntry::Kind::Value, rvalue,
+                                            field.TypeName);
+        }
     }
     return structValue;
 }
@@ -1117,6 +1127,8 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
             {
                 std::vector<llvm::Value*> initializers;
                 std::vector<char> initializerUnsigned;
+                // A field initializer that unwinds destroys the fields already built.
+                LLVMBackend::UnwindPartialScope partialFields(*compiler);
                 for (auto& typeValue : declList)
                 {
                     auto initializer = typeValue.Initializer;
@@ -1161,6 +1173,8 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
                     }
                     initializers.push_back(rvalue);
                     initializerUnsigned.push_back(fieldSrcUnsigned ? 1 : 0);
+                    compiler->NoteUnwindPartial(LLVMBackend::UnwindPartialEntry::Kind::Value,
+                                                rvalue, typeValue.TypeName);
                 }
 
                 // Seed with zero (not undef) so fields lacking an explicit initializer read as
@@ -1177,6 +1191,7 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
 
                 for (auto rvalue : initializers)
                 {
+                    llvm::Value* const firstPassValue = rvalue;
                     auto* destType = structType->getTypeAtIndex(structIndex);
                     // No explicit initializer on a struct-typed field - call its default ctor.
                     if (rvalue == nullptr && (destType->isStructTy() || destType->isArrayTy()))
@@ -1229,10 +1244,14 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
                             }
                         }
                         structVal = compiler->CreateInsertValue(structVal, rvalue, structIndex);
+                        if (rvalue != firstPassValue)
+                            compiler->NoteUnwindPartial(LLVMBackend::UnwindPartialEntry::Kind::Value,
+                                                        rvalue, declList[structIndex].TypeName);
                     }
 
                     structIndex++;
                 }
+                partialFields.Release();
 
                 // close constructor.
                 compiler->CreateReturnCall(structVal);
@@ -2025,17 +2044,7 @@ void MainListener::EmitProgramRunWrapper(const std::string& name, CFlatParser::P
             // guards the crash cases with if const (__WINDOWS__ ...). Both non-SEH targets fall
             // through to the plain-call path below.
             if (compiler->targetWindows_ && compiler->platformValue == 64)
-            {
-                llvm::Function* cshFn = compiler->module->getFunction("__C_specific_handler");
-                if (!cshFn)
-                {
-                    auto* cshTy = llvm::FunctionType::get(i32Type, /*isVarArg=*/true);
-                    cshFn = llvm::cast<llvm::Function>(
-                        compiler->module->getOrInsertFunction("__C_specific_handler", cshTy).getCallee());
-                    cshFn->setDLLStorageClass(llvm::GlobalValue::DLLImportStorageClass);
-                }
-                trampolineFn->setPersonalityFn(cshFn);
-            }
+                trampolineFn->setPersonalityFn(compiler->GetTargetEhPersonality());
 
             auto* ctxArg = trampolineFn->getArg(0);
 
@@ -4870,6 +4879,9 @@ void MainListener::ParseConstructorDefinition(CFlatParser::FunctionDefinitionCon
         // Alloca the struct so we can GEP into fields via 'this'
         auto* thisAlloca = compiler->AllocaAtEntry(structLLVMType, nullptr, structName + "__");
 
+        // An unwind out of a field initializer destroys the fields already built; one out of
+        // the body destroys every member but never runs the user ~T (construction never ended).
+        LLVMBackend::UnwindPartialScope partialCtor(*compiler);
         // suppliesNoArgCtor: this ctor's own cutoff-0 wrapper IS structName(), so delegating to
         // it would be self-recursive exactly as in the bare no-arg case. Seed fields in line.
         if (allParams.empty() || suppliesNoArgCtor)
@@ -4958,6 +4970,8 @@ void MainListener::ParseConstructorDefinition(CFlatParser::FunctionDefinitionCon
                         auto* fieldPtr = compiler->builder->CreateStructGEP(
                             structLLVMType, thisAlloca, fieldIdx, field.VariableName);
                         compiler->builder->CreateStore(fieldVal, fieldPtr);
+                        compiler->NoteUnwindPartial(LLVMBackend::UnwindPartialEntry::Kind::Value,
+                                                    fieldVal, field.TypeName);
                     }
                 }
                 fieldIdx++;
@@ -4978,6 +4992,10 @@ void MainListener::ParseConstructorDefinition(CFlatParser::FunctionDefinitionCon
             if (defaultVal)
                 compiler->builder->CreateStore(defaultVal, thisAlloca);
         }
+
+        partialCtor.Release();
+        compiler->NoteUnwindPartial(LLVMBackend::UnwindPartialEntry::Kind::Members, thisAlloca,
+                                    structName);
 
         // Register the alloca as the implicit 'this' pointer so member field access works
         LLVMBackend::TypeAndValue thisTv;

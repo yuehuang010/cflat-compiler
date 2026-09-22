@@ -161,14 +161,17 @@ void LLVMBackend::createFunctionBlock(llvm::Function* fn, const std::string& fri
             // A nontrivial imported C++ by-value parameter arrives as the object address. Its
             // destruction remains on the ABI-selected side: caller on Itanium, callee on MS ABI.
             if (abiSlot != nullptr && abiSlot->kind == AbiSlot::ByVal
-                && IsForeignNontrivialCxxClass(itr_nameArg->TypeName))
+                && (IsForeignNontrivialCxxClass(itr_nameArg->TypeName)
+                    || HasForeignNontrivialCxxField(itr_nameArg->TypeName)))
             {
                 NamedVariable namedVar{
                     .TypeAndValue = *itr_nameArg,
                     .BaseType = abiSlot->structTy,
                     .Primary = nullptr,
                     .Storage = incomingArg,
-                    .IsOwningStruct = IsCxxParamDestroyedInCallee(itr_nameArg->TypeName),
+                    .IsOwningStruct = (!IsForeignNontrivialCxxClass(itr_nameArg->TypeName)
+                        && HasForeignNontrivialCxxField(itr_nameArg->TypeName))
+                        || IsCxxParamDestroyedInCallee(itr_nameArg->TypeName),
                 };
                 RegisterFunctionArgument(itr_nameArg->VariableName, namedVar);
             }
@@ -1139,8 +1142,18 @@ void LLVMBackend::EmitUniqueInterfaceFieldRelease(llvm::IRBuilder<>& b, llvm::Va
         if (savedBB != nullptr) builder->SetInsertPoint(savedBB, savedIt);
     }
 
-llvm::Function* LLVMBackend::GetOrCreateFullDestructor(const std::string& typeName)
+llvm::Function* LLVMBackend::GetOrCreateFullDestructor(const std::string& typeName, bool membersOnly)
 {
+        // membersOnly: the fields' destruction without the user ~T - what a constructor whose
+        // body unwinds owes (the object never finished construction).
+        if (membersOnly)
+        {
+            auto dsIt = dataStructures.find(typeName);
+            if (typeName == "string" || typeName == "__closure_fat_ptr" || dsIt == dataStructures.end()
+                || IsCxxRecord(typeName) || dsIt->second.IsUnion)
+                return nullptr;
+            if (dsIt->second.Destructor == nullptr) return GetOrCreateFullDestructor(typeName);
+        }
         // `string` full dtor is the lazily registered string dtor. Resolve live (never cache)
         // so a call before lazy registration doesn't poison the cache with null.
         if (typeName == "string")
@@ -1161,7 +1174,8 @@ llvm::Function* LLVMBackend::GetOrCreateFullDestructor(const std::string& typeNa
 
         // Only synthesized wrappers are cached - they are stable once built. Direct lookups
         // are resolved live so forward-declared types (e.g. generic ~list) aren't frozen as null.
-        if (auto it = fullDestructorCache_.find(typeName); it != fullDestructorCache_.end())
+        const std::string cacheKey = membersOnly ? typeName + "#members" : typeName;
+        if (auto it = fullDestructorCache_.find(cacheKey); it != fullDestructorCache_.end())
             return it->second;
 
         auto dsIt = dataStructures.find(typeName);
@@ -1193,9 +1207,9 @@ llvm::Function* LLVMBackend::GetOrCreateFullDestructor(const std::string& typeNa
         // Value-type member cycles are impossible (infinite size), but guard defensively
         // so a malformed registry cannot recurse forever - fall back to the user dtor.
         if (!fullDestructorInProgress_.insert(typeName).second)
-            return dsIt->second.Destructor;
+            return membersOnly ? nullptr : dsIt->second.Destructor;
 
-        llvm::Function* userDtor = dsIt->second.Destructor;
+        llvm::Function* userDtor = membersOnly ? nullptr : dsIt->second.Destructor;
 
         // Collect member fields that need destruction.
         struct MemberWork { unsigned Index; llvm::Function* Dtor; bool IsUniquePtr; std::string TypeName; uint64_t AllocAlign; bool IsUniqueArray = false; bool IsIface = false; bool IsUniqueIface = false; };
@@ -1273,9 +1287,10 @@ llvm::Function* LLVMBackend::GetOrCreateFullDestructor(const std::string& typeNa
         auto* selfPtrTy = cflat_llvm::PointerTo(structTy);
         auto* fnTy = llvm::FunctionType::get(voidTy, { selfPtrTy }, false);
         auto* fn = llvm::Function::Create(fnTy, llvm::Function::InternalLinkage,
-                                          typeName + ".dtorfull", *module);
+                                          typeName + (membersOnly ? ".dtormembers" : ".dtorfull"),
+                                          *module);
         fn->arg_begin()->setName("self");
-        fullDestructorCache_[typeName] = fn;   // memoize before body emission
+        fullDestructorCache_[cacheKey] = fn;   // memoize before body emission
 
         auto* entry = llvm::BasicBlock::Create(*context, "entry", fn);
         llvm::IRBuilder<> b(entry);
@@ -1919,6 +1934,9 @@ llvm::Function* LLVMBackend::GetOrCreateMemberwiseCopy(const std::string& typeNa
         auto* resultSlot = builder->CreateAlloca(structTy, nullptr, "result");
         builder->CreateStore(&*fn->arg_begin(), resultSlot);
 
+        // An unwind out of a field copy destroys the fields already deep-copied; the rest still
+        // alias `self` and must not be touched.
+        UnwindPartialScope copiedFields(*this);
         // Deep-copy each managed value field, overwriting the aliased shallow handle.
         for (unsigned i = 0; i < dsIt->second.StructFields.size(); ++i)
         {
@@ -1965,6 +1983,7 @@ llvm::Function* LLVMBackend::GetOrCreateMemberwiseCopy(const std::string& typeNa
                     builder->CreateLoad(structTy->getElementType(i), fieldPtr), sourceSlot);
                 EmitCxxCopyOrMoveConstruct(f.TypeName, fieldPtr, sourceSlot,
                                            /*useMove*/ false, "in synthesized struct copy");
+                NoteUnwindPartial(UnwindPartialEntry::Kind::Slot, fieldPtr, f.TypeName);
                 continue;
             }
             NamedVariable argNV;
@@ -1972,8 +1991,12 @@ llvm::Function* LLVMBackend::GetOrCreateMemberwiseCopy(const std::string& typeNa
             argNV.BaseType = structTy->getElementType(i);
             argNV.TypeAndValue.TypeName = f.TypeName;
             if (auto* copied = CreateOverloadedFunctionCall("copy", { argNV }))
+            {
                 builder->CreateStore(copied, fieldPtr);
+                NoteUnwindPartial(UnwindPartialEntry::Kind::Slot, fieldPtr, f.TypeName);
+            }
         }
+        copiedFields.Release();
 
         auto* resultVal = builder->CreateLoad(structTy, resultSlot, "copyresult");
         builder->CreateRet(resultVal);

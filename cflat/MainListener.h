@@ -2339,11 +2339,16 @@ inline bool IsLastUseOfForeignCxxParam(
     if (compiler == nullptr || useCtx == nullptr || source.FieldName.size() != 0
         || source.TypeAndValue.Pointer || source.TypeAndValue.IsAlias
         || compiler->IsCoreUniqueType(source.TypeAndValue.TypeName)
-        || !compiler->IsForeignNontrivialCxxClass(source.TypeAndValue.TypeName))
+        || !(compiler->IsForeignNontrivialCxxClass(source.TypeAndValue.TypeName)
+             || compiler->HasForeignNontrivialCxxFieldForAnalysis(source.TypeAndValue.TypeName)))
         return false;
-    if (const auto* info = compiler->GetCxxClassInfo(source.TypeAndValue.TypeName);
-        info == nullptr || !info->hasCopyCtor || info->hasDeletedCopyCtor)
-        return false;
+    if (compiler->IsForeignNontrivialCxxClass(source.TypeAndValue.TypeName))
+    {
+        if (const auto* info = compiler->GetCxxClassInfo(source.TypeAndValue.TypeName);
+            info == nullptr || !info->hasCopyCtor || info->hasDeletedCopyCtor)
+            return false;
+    }
+    else if (!compiler->IsCopyableTypeForAnalysis(source.TypeAndValue.TypeName)) return false;
     const std::string name = source.CallerName.empty()
         ? source.TypeAndValue.VariableName : source.CallerName;
     if (name.empty() || !compiler->IsFunctionParameter(name) || useCtx->getText() != name)
@@ -5518,7 +5523,8 @@ public:
         const LLVMBackend::TypeAndValue& outerExpected,
         llvm::Value* cxxTernaryDeclDest,
         const std::string& cxxTernaryDeclType,
-        bool collapseLvalueArms);
+        bool collapseLvalueArms,
+        bool collapseLvalueSink);
 
     LLVMBackend::TypedValue ParseConditionalExpression(CFlatParser::ConditionalExpressionContext* ctx,
                                                         ResultUse use = ResultUse::Value);

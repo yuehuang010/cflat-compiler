@@ -1568,6 +1568,12 @@ namespace cflat_cinterop
                 rec.hasCopyCtor = cxx->hasCopyConstructorWithConstParam()
                                || cxx->needsImplicitCopyConstructor()
                                || cxx->hasUserDeclaredCopyConstructor();
+                for (const Decl* d : cxx->decls())
+                    if (const auto* ftd = llvm::dyn_cast<FunctionTemplateDecl>(d);
+                        ftd != nullptr && ftd->getAccess() == AS_public
+                        && llvm::isa<CXXConstructorDecl>(ftd->getTemplatedDecl())
+                        && !ftd->getTemplatedDecl()->isDeleted())
+                        rec.hasCtorTemplate = true;
                 rec.isAggregate = cxx->isAggregate();
 
                 /*

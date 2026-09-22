@@ -2414,6 +2414,7 @@ nlohmann::json LLVMBackend::RecordToJson(const CRecordEntry& r, CCachePathTable*
         if (r.hasDeletedCopyCtor)    j["dcc"] = true;
         if (r.hasDefaultCtor)        j["hdc"] = true;
         if (r.hasCopyCtor)           j["hcc"] = true;
+        if (r.hasCtorTemplate)       j["hct"] = true;
         if (r.isAggregate)           j["ag"] = true;
         // M6 - inheritance surface. Base offsets drive every derived-to-base adjustment and the
         // abstract/virtual-base gates; a warm cache that lost them would emit unadjusted pointers.
@@ -2478,6 +2479,7 @@ LLVMBackend::CRecordEntry LLVMBackend::RecordFromJson(const SjVal& j, const CCac
         r.hasDeletedCopyCtor    = j.value("dcc", false);
         r.hasDefaultCtor        = j.value("hdc", false);
         r.hasCopyCtor           = j.value("hcc", false);
+        r.hasCtorTemplate       = j.value("hct", false);
         r.isAggregate           = j.value("ag", false);
         r.hasVirtualBases       = j.value("hvb", false);
         r.isAbstract            = j.value("abs", false);
@@ -2764,6 +2766,8 @@ bool LLVMBackend::TryLoadCHeaderDiskCache(
         // to the CFlat alias surface: an older cache carries the raw shape.
         // v80 records function-template forwarding-reference parameters: an older cache
         // carries none, so an lvalue would not bind a template U&& parameter.
+        // v81 records a public constructor TEMPLATE on a C++ record (hct): an older cache
+        // carries none, so `T(args)` would never reach clang's constructor overload resolution.
         if (version != kCHeaderCacheVersion) return cacheMiss("cache version");
 
         if (!expectedRequestKey.empty()
@@ -3174,6 +3178,7 @@ void LLVMBackend::WriteCHeaderDiskCache(
         // v78 binds a reference to a T** instead of refusing the member.
         // v79 preserves the pointer level of a collapsed const-qualified pointer reference.
         // v80 records function-template forwarding-reference parameters.
+        // v81 records a public constructor template on a C++ record (hct).
         j["version"] = kCHeaderCacheVersion;
         j["mtime"]   = (int64_t)mtime.time_since_epoch().count();
         j["hash"]    = contentHash;

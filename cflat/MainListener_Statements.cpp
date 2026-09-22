@@ -741,7 +741,7 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
                 std::string wrapperName;
                 std::string wrapperError;
                 if (compiler->RequestCxxVariadicConstructor(
-                        typeName, { source }, wrapperName, wrapperError))
+                        typeName, { source }, wrapperName, wrapperError, /*copyInit*/ true))
                 {
                     LLVMBackend::NamedVariable self;
                     self.Primary = cxxSretDest;
@@ -3600,7 +3600,14 @@ void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {
                         if (entryWasUnterminated && entryBB->getParent() == function)
                         {
                             if (auto* terminator = cflat_llvm::GetTerminatorOrNull(entryBB))
+                            {
+                                // An unwind-cleanup invoke can end the entry block; its result
+                                // feeds only the abandoned continuation.
+                                if (!terminator->use_empty())
+                                    terminator->replaceAllUsesWith(
+                                        llvm::PoisonValue::get(terminator->getType()));
                                 terminator->eraseFromParent();
+                            }
                             compilerLLVM->builder->SetInsertPoint(entryBB);
                             compilerLLVM->builder->CreateBr(resume);
                         }

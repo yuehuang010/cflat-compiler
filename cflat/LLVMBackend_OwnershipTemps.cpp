@@ -1551,7 +1551,7 @@ void LLVMBackend::PropagateOwnedReturnTemp(llvm::Value* from, llvm::Value* to)
 bool LLVMBackend::IsProducedTempValue(llvm::Value* value) const
 {
         if (value == nullptr) return false;
-        if (llvm::isa<llvm::CallInst>(value)) return true;
+        if (llvm::isa<llvm::CallBase>(value)) return true;
         return std::find(nullConditionalTempResults_.begin(), nullConditionalTempResults_.end(),
                          value) != nullConditionalTempResults_.end();
 }
@@ -4108,7 +4108,8 @@ void LLVMBackend::EmitDestructorsForScope(const StackState& frame)
             return left->DeclSequence > right->DeclSequence;
         });
         for (const auto* namedVar : locals)
-            DropValue(*namedVar);
+            if (namedVar->DeclSequence < unwindSkipSeqFloor_)
+                DropValue(*namedVar);
 
         // Clean up owning function parameters (move params)
         for (const auto& [varName, namedVar] : frame.functionArgument)
@@ -4157,6 +4158,231 @@ void LLVMBackend::EmitDestructorsForScope(const StackState& frame)
             builder->CreateCall(it->UnlockFn->getFunctionType(), it->UnlockFn, { it->MutexPtr });
         }
     }
+
+bool LLVMBackend::CalleeMayUnwind(const FunctionSymbol& symbol) const
+{
+        if (!cppInteropUsed_) return false;
+        if (symbol.IsCxx) return !symbol.IsNoexcept;
+        if (symbol.IsCInteropDeclaration) return false;
+        llvm::Function* fn = symbol.Function;
+        if (fn == nullptr) return true;
+        if (fn->isIntrinsic() || fn->doesNotThrow()) return false;
+        // A body-less `extern` prototype names a C function (malloc, printf); a CFlat
+        // function body can reach a throwing C++ callee transitively.
+        return !(symbol.External && fn->isDeclaration());
+}
+
+uint64_t LLVMBackend::UnwindInitFloorForDepth(size_t depth) const
+{
+        for (auto it = unwindInitFloors_.rbegin(); it != unwindInitFloors_.rend(); ++it)
+            if (it->first == depth) return it->second;
+        return UINT64_MAX;
+}
+
+bool LLVMBackend::UnwindTempConsumedByCall(llvm::Value* v) const
+{
+        return v != nullptr && std::find(unwindCallConsumedTemps_.begin(),
+                                         unwindCallConsumedTemps_.end(), v)
+                                   != unwindCallConsumedTemps_.end();
+}
+
+void LLVMBackend::NoteUnwindPartial(UnwindPartialEntry::Kind kind, llvm::Value* v,
+                                    const std::string& typeName, uint64_t allocAlign)
+{
+        if (!cppInteropUsed_ || v == nullptr || builder->GetInsertBlock() == nullptr) return;
+        // Only what the pad would actually release: otherwise the entry just turns later calls
+        // into invokes with an empty pad.
+        if (kind == UnwindPartialEntry::Kind::Value
+            && (!v->getType()->isStructTy() || !HasNonTrivialDestructor(typeName)))
+            return;
+        if (kind == UnwindPartialEntry::Kind::Members
+            && GetOrCreateFullDestructor(typeName, /*membersOnly=*/true) == nullptr)
+            return;
+        if (kind == UnwindPartialEntry::Kind::Slot && !HasNonTrivialDestructor(typeName)) return;
+        unwindPartial_.push_back({ kind, v, typeName, builder->GetInsertBlock()->getParent(),
+                                   allocAlign });
+}
+
+void LLVMBackend::EmitUnwindPartialRelease(const UnwindPartialEntry& e)
+{
+        switch (e.K)
+        {
+        case UnwindPartialEntry::Kind::Value:
+        {
+            llvm::Function* dtor = GetOrCreateFullDestructor(e.TypeName);
+            if (dtor == nullptr) return;
+            // The field's finished value is an SSA aggregate; destroy it through a spill.
+            auto* tmp = AllocaAtEntry(e.V->getType(), nullptr, "unwind.part");
+            builder->CreateStore(e.V, tmp);
+            builder->CreateCall(dtor->getFunctionType(), dtor, { tmp });
+            return;
+        }
+        case UnwindPartialEntry::Kind::Slot:
+            if (llvm::Function* dtor = GetOrCreateFullDestructor(e.TypeName))
+                builder->CreateCall(dtor->getFunctionType(), dtor, { e.V });
+            return;
+        case UnwindPartialEntry::Kind::Members:
+            if (llvm::Function* dtor = GetOrCreateFullDestructor(e.TypeName, /*membersOnly=*/true))
+                builder->CreateCall(dtor->getFunctionType(), dtor, { e.V });
+            return;
+        case UnwindPartialEntry::Kind::CxxHeap:
+            EmitCxxHeapFree(e.TypeName, e.V);
+            return;
+        case UnwindPartialEntry::Kind::CflatHeap:
+        {
+            // Free only: the constructor never returned, so there is no object to destroy.
+            uint64_t effAlign = e.AllocAlign;
+            TypeAndValue tv{ .TypeName = e.TypeName };
+            if (llvm::Type* t = GetType(tv); t != nullptr && t->isSized())
+                effAlign = std::max(effAlign, GetEffectiveAlignmentForType(e.TypeName, t));
+            llvm::Function* del = effAlign > kDefaultNewAlign
+                ? GetFunction("__delete_aligned") : GetFunction("operator delete");
+            if (del != nullptr)
+                builder->CreateCall(del->getFunctionType(), del,
+                    { builder->CreateBitCast(e.V, cflat_llvm::PointerTo(builder->getInt8Ty())) });
+            return;
+        }
+        }
+}
+
+bool LLVMBackend::FrameOwesUnwindCleanup()
+{
+        auto* insertBlock = builder->GetInsertBlock();
+        llvm::Function* fn = insertBlock->getParent();
+        for (const auto& e : unwindPartial_)
+            if (e.Fn == fn) return true;
+        if (fn != currentFunction) return false;
+        {
+            std::optional<llvm::DominatorTree> domTree;
+            for (const auto& t : pendingOwnedStructTemps)
+                if (t.Alloca != nullptr && OwnedTempDominatesHere(t.Block, insertBlock, domTree))
+                    return true;
+            for (const auto& [v, bb] : pendingOwnedStringTemps)
+                if (v != nullptr && !UnwindTempConsumedByCall(v)
+                    && OwnedTempDominatesHere(bb, insertBlock, domTree))
+                    return true;
+            for (const auto& [v, bb] : pendingOwnedClosureTemps)
+                if (v != nullptr && !UnwindTempConsumedByCall(v)
+                    && OwnedTempDominatesHere(bb, insertBlock, domTree))
+                    return true;
+            for (const auto& t : pendingOwnedPtrTemps)
+                if (t.Value != nullptr && !UnwindTempConsumedByCall(t.Value)
+                    && OwnedTempDominatesHere(t.Block, insertBlock, domTree))
+                    return true;
+        }
+        for (auto it = stackNamedVariable.rbegin(); it != stackNamedVariable.rend(); ++it)
+        {
+            if (!it->lockCleanups.empty()) return true;
+            const uint64_t floor = UnwindInitFloorForDepth((size_t)(stackNamedVariable.rend() - it));
+            for (const auto& [name, nv] : it->namedVariable)
+                if (nv.DeclSequence < floor && OwnsDroppableResource(nv)) return true;
+            for (const auto& [name, nv] : it->functionArgument)
+            {
+                if (nv.Storage == nullptr) continue;
+                if (nv.TypeAndValue.IsFatInterfaceValue() ? IsOwningInterfaceValue(nv)
+                        : (nv.IsOwning || nv.IsOwningString || nv.IsOwningStruct))
+                    return true;
+            }
+            if (it->isFunction) break;
+        }
+        return false;
+}
+
+llvm::CallBase* LLVMBackend::CreateCallOrInvoke(llvm::FunctionType* fnTy, llvm::Value* callee,
+                                                llvm::ArrayRef<llvm::Value*> args, bool mayUnwind,
+                                                const llvm::Twine& name)
+{
+        if (!mayUnwind || !cppInteropUsed_ || emittingUnwindCleanup_ || !IsInsertBlockLive()
+            || currentFunction == nullptr)
+            return builder->CreateCall(fnTy, callee, args, name);
+        // A synthesized helper emitted out of line (a struct copy) owes only its partial
+        // construction; the scope walk and statement temps belong to currentFunction.
+        llvm::Function* fn = builder->GetInsertBlock()->getParent();
+        const bool ownFrame = fn == currentFunction;
+        llvm::Function* personality = GetTargetEhPersonality();
+        if (personality == nullptr
+            || (fn->hasPersonalityFn() && fn->getPersonalityFn() != personality)
+            || !FrameOwesUnwindCleanup())
+            return builder->CreateCall(fnTy, callee, args, name);
+
+        auto* padBB = llvm::BasicBlock::Create(*context, "unwind.cleanup", fn);
+        auto* contBB = llvm::BasicBlock::Create(*context, "invoke.cont", fn);
+        auto* invoke = builder->CreateInvoke(fnTy, callee, contBB, padBB, args, name);
+        if (!fn->hasPersonalityFn()) fn->setPersonalityFn(personality);
+
+        const llvm::DebugLoc savedLoc = builder->getCurrentDebugLocation();
+        builder->SetInsertPoint(padBB);
+        emittingUnwindCleanup_ = true;
+        // A diagnostic thrown mid-pad must not leave normal scope exits skipping locals.
+        struct PadStateReset
+        {
+            LLVMBackend& b;
+            ~PadStateReset() { b.emittingUnwindCleanup_ = false; b.unwindSkipSeqFloor_ = UINT64_MAX; }
+        } padStateReset{ *this };
+        const bool funclet = targetWindows_;
+        llvm::Value* pad = nullptr;
+        if (funclet)
+            pad = builder->CreateCleanupPad(llvm::ConstantTokenNone::get(*context), {}, "unwind.pad");
+        else
+        {
+            auto* lpTy = llvm::StructType::get(*context, { builder->getPtrTy(), builder->getInt32Ty() });
+            auto* lp = builder->CreateLandingPad(lpTy, 0, "unwind.lp");
+            lp->setCleanup(true);
+            pad = lp;
+        }
+        // The object under construction first (newest entry first), as C++ unwinds a
+        // constructor's finished subobjects before the full-expression's temporaries.
+        for (auto it = unwindPartial_.rbegin(); it != unwindPartial_.rend(); ++it)
+            if (it->Fn == fn && IsInsertBlockLive()) EmitUnwindPartialRelease(*it);
+        if (ownFrame)
+        {
+            // Then the statement's temps still OWNED at the invoke: in FlushOwnedStructTemps'
+            // ledger order, and never an argument this call hands to a sink parameter.
+            auto* invokeBlock = invoke->getParent();
+            for (const auto& t : pendingOwnedStructTemps)
+            {
+                std::optional<llvm::DominatorTree> domTree;
+                if (t.Alloca == nullptr || !IsInsertBlockLive()) continue;
+                if (!OwnedTempDominatesHere(t.Block, invokeBlock, domTree)) continue;
+                EmitOwnedStructTempFree(t);
+            }
+            {
+                std::optional<llvm::DominatorTree> domTree;
+                for (const auto& [v, bb] : pendingOwnedStringTemps)
+                    if (v != nullptr && IsInsertBlockLive() && !UnwindTempConsumedByCall(v)
+                        && OwnedTempDominatesHere(bb, invokeBlock, domTree))
+                        EmitOwnedStringTempFree(v);
+                for (const auto& [v, bb] : pendingOwnedClosureTemps)
+                    if (v != nullptr && IsInsertBlockLive() && !UnwindTempConsumedByCall(v)
+                        && OwnedTempDominatesHere(bb, invokeBlock, domTree))
+                        EmitOwnedClosureTempFree(v);
+            }
+            for (const auto& t : pendingOwnedPtrTemps)
+            {
+                std::optional<llvm::DominatorTree> domTree;
+                if (t.Value == nullptr || !IsInsertBlockLive() || UnwindTempConsumedByCall(t.Value))
+                    continue;
+                if (!OwnedTempDominatesHere(t.Block, invokeBlock, domTree)) continue;
+                EmitOwnedPtrTempFree(t.Value, t.TypeName, t.AllocAlign, t.RawArrayCount);
+            }
+            for (auto it = stackNamedVariable.rbegin(); it != stackNamedVariable.rend(); ++it)
+            {
+                unwindSkipSeqFloor_ = UnwindInitFloorForDepth((size_t)(stackNamedVariable.rend() - it));
+                EmitDestructorsForScope(*it);
+                if (it->isFunction) break;
+            }
+        }
+        if (IsInsertBlockLive())
+        {
+            if (funclet)
+                builder->CreateCleanupRet(llvm::cast<llvm::CleanupPadInst>(pad));
+            else
+                builder->CreateResume(pad);
+        }
+        builder->SetInsertPoint(contBB);
+        builder->SetCurrentDebugLocation(savedLoc);
+        return invoke;
+}
 
 int LLVMBackend::MintAliasScope()
 {

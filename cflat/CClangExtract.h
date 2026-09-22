@@ -369,6 +369,9 @@ namespace cflat_cinterop
         bool hasDeletedCopyCtor = false;
         bool hasDefaultCtor = false;
         bool hasCopyCtor = false;
+        // A public, non-deleted constructor TEMPLATE. Its specializations are never listed as
+        // members, so only a clang-resolved `T(args)` wrapper can reach them.
+        bool hasCtorTemplate = false;
         bool isAggregate = false;
         std::vector<RawCxxMember> members;
         std::vector<RawCxxStaticVar> staticVars;

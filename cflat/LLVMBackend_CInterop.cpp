@@ -410,6 +410,27 @@ void LLVMBackend::RejectThrowingCxxFunction(const FunctionSymbol& symbol, const 
                              displayName));
 }
 
+llvm::Function* LLVMBackend::GetTargetEhPersonality()
+{
+        auto* i32Ty = llvm::Type::getInt32Ty(*context);
+        if (targetWindows_)
+        {
+            // Win32 has no personality: LLVM's x86 backend drops handler bodies under
+            // _except_handler3 (see the `program` trampoline).
+            if (platformValue != 64) return nullptr;
+            llvm::Function* csh = module->getFunction("__C_specific_handler");
+            if (csh == nullptr)
+            {
+                csh = llvm::cast<llvm::Function>(module->getOrInsertFunction(
+                    "__C_specific_handler", llvm::FunctionType::get(i32Ty, /*isVarArg=*/true)).getCallee());
+                csh->setDLLStorageClass(llvm::GlobalValue::DLLImportStorageClass);
+            }
+            return csh;
+        }
+        return llvm::cast<llvm::Function>(module->getOrInsertFunction(
+            "__gxx_personality_v0", llvm::FunctionType::get(i32Ty, /*isVarArg=*/true)).getCallee());
+}
+
 llvm::Function* LLVMBackend::EnsureCxxProgramEhGuard(const std::string& programName)
 {
         constexpr const char* guardName = "__cflat_program_eh_guard";
@@ -3516,6 +3537,7 @@ void LLVMBackend::MapRawRecords(const cflat_cinterop::ExtractResult& raw, std::v
             rec.hasDeletedDefaultCtor = r.hasDeletedDefaultCtor;
             rec.hasDeletedCopyCtor = r.hasDeletedCopyCtor;
             rec.hasDefaultCtor = r.hasDefaultCtor; rec.hasCopyCtor = r.hasCopyCtor;
+            rec.hasCtorTemplate = r.hasCtorTemplate;
             rec.isAggregate = r.isAggregate;
             rec.members = r.members;
             rec.staticVars = r.staticVars;
@@ -5400,6 +5422,7 @@ uint64_t LLVMBackend::CxxGroupHeaderHash(const CxxRequestGroup& group) const
         raw.hasDeletedCopyCtor = cached.hasDeletedCopyCtor;
         raw.hasDefaultCtor = cached.hasDefaultCtor;
         raw.hasCopyCtor = cached.hasCopyCtor;
+        raw.hasCtorTemplate = cached.hasCtorTemplate;
         raw.isAggregate = cached.isAggregate;
         raw.members = cached.members;
         raw.staticVars = cached.staticVars;
@@ -8432,9 +8455,33 @@ bool LLVMBackend::RequestCxxBraceConstructor(
         return true;
 }
 
+bool LLVMBackend::CxxConstructorNeedsClangResolution(
+        const std::string& typeName, const CxxClassInfo::Structor* selected,
+        const std::vector<TypeAndValue>& argTypes) const
+{
+        const CxxClassInfo* info = GetCxxClassInfo(typeName);
+        if (info == nullptr || !info->hasCtorTemplate) return false;
+        if (selected == nullptr) return true;
+        if (selected->isCopyCtor || selected->isMoveCtor) return false;
+        if (selected->params.size() < argTypes.size() + 1) return true;
+        for (size_t i = 0; i < argTypes.size(); ++i)
+        {
+            const TypeAndValue& want = selected->params[i + 1];
+            const TypeAndValue& got = argTypes[i];
+            if (want.TypeName != got.TypeName) return true;
+            if (want.Pointer == got.Pointer && want.ElemPointer == got.ElemPointer) continue;
+            // A reference parameter is an indirect pointer here; binding it to a value of
+            // exactly its referent type is still an identity conversion.
+            const bool reference = want.IsAlias || want.IsRvalueRef || want.IsCxxConstRef;
+            if (reference && want.Pointer && !want.ElemPointer && !got.Pointer) continue;
+            return true;
+        }
+        return false;
+}
+
 bool LLVMBackend::RequestCxxVariadicConstructor(
         const std::string& typeName, const std::vector<NamedVariable>& arguments,
-        std::string& wrapperName, std::string& error)
+        std::string& wrapperName, std::string& error, bool copyInit)
 {
         error.clear();
         wrapperName.clear();
@@ -8558,6 +8605,11 @@ bool LLVMBackend::RequestCxxVariadicConstructor(
         }
         targetCall += ")";
 
+        // Copy-initialization through a returning lambda: `return p1;` refuses an explicit
+        // constructor, and the prvalue initializes *p0 directly (guaranteed elision).
+        if (copyInit && callArguments.size() == 1)
+            targetCall = ownerSpelling + "([&]() -> " + ownerSpelling + " { return "
+                       + callArguments[0] + "; }())";
         std::string hashKey = "variadic_ctor" + typeName + targetCall;
         for (const auto& param : parameterSpellings) hashKey += param;
         wrapperName = std::format("__cflat_ctor_{:016x}", HashWrapperKey(hashKey));
@@ -11571,6 +11623,7 @@ void LLVMBackend::RegisterCxxClassMembers(const CRecordEntry& r, const std::stri
             info.hasDeletedCopyCtor    = r.hasDeletedCopyCtor;
             info.hasDefaultCtor        = r.hasDefaultCtor;
             info.hasCopyCtor           = r.hasCopyCtor;
+            info.hasCtorTemplate       = r.hasCtorTemplate;
             info.isAggregate           = r.isAggregate;
             for (const auto& f : r.fields)
             {
@@ -14538,11 +14591,14 @@ bool LLVMBackend::EmitCxxStructorCall(const std::string& typeName,
                 indirectArgAddrs.resize(recipe.paramSlots.size(), nullptr);
                 indirectArgAddrs[i] = temp;
             }
+        // A constructor or assignment without noexcept can throw into this frame's cleanup.
+        const bool mayUnwind = CalleeMayUnwind(sym);
         if (recipe.hasLowering)
             EmitAbiLoweredCall(sym, args, /*sretDest*/ nullptr,
-                               indirectArgAddrs.empty() ? nullptr : &indirectArgAddrs);
+                               indirectArgAddrs.empty() ? nullptr : &indirectArgAddrs,
+                               nullptr, nullptr, mayUnwind);
         else
-            CreateFunctionCall(fn, args);
+            CreateFunctionCall(fn, args, mayUnwind);
         if (extraArgVars != nullptr && !extraArgVars->empty())
         {
             NamedVariable self;
@@ -15056,6 +15112,11 @@ LLVMBackend::CxxArgConversion LLVMBackend::ClassifyCxxImplicitArgument(
         TypeAndValue argType = InferImplicitCxxArgumentType(arg, *this);
         argType.IsScopedEnum = argType.IsScopedEnum || IsScopedEnumTypeName(argType.TypeName);
         if (argType.TypeName.empty()) return CxxArgConversion::NotApplicable;
+        // A class argument into a class reachable only through constructor templates keeps the
+        // C++-side call path it had before those templates were recorded.
+        if (IsCxxRecord(argType.TypeName)
+            && !IsForeignCxxClassWithConstructors(param.TypeName, /*countCtorTemplates*/ false))
+            return CxxArgConversion::NotApplicable;
         std::string argSpelling;
         std::string paramSpelling;
         if (CxxSpellingForCflatType(argType.TypeName, argSpelling)
@@ -15088,15 +15149,19 @@ LLVMBackend::CxxArgConversion LLVMBackend::ClassifyCxxImplicitArgument(
         if (nonConstLvalueRef) return CxxArgConversion::NotApplicable;
         // A converting constructor clang never lists as a member (std::optional's
         // `template <class U> optional(U&&)`): ask C++ itself whether the conversion compiles.
-        // Only for a class with NO listed constructor - a speculative clang request re-registers
-        // the class, and ranking must not perturb one that already has a constructor surface.
+        // Only for a class with NO listed constructor, or a constructor TEMPLATE fed a non-class
+        // argument (a class argument keeps the C++-side call path) - a speculative clang request
+        // re-registers the class. The probe copy-initializes: an explicit ctor never converts.
         const auto* info = GetCxxClassInfo(param.TypeName);
-        if (info == nullptr || !info->constructors.empty()) return CxxArgConversion::NotApplicable;
+        if (info == nullptr || (!info->constructors.empty()
+                                && !(info->hasCtorTemplate && !IsCxxRecord(argType.TypeName))))
+            return CxxArgConversion::NotApplicable;
         NamedVariable probe = arg;
         probe.TypeAndValue = argType;
         std::string wrapperName;
         std::string wrapperError;
-        return RequestCxxVariadicConstructor(param.TypeName, { probe }, wrapperName, wrapperError)
+        return RequestCxxVariadicConstructor(param.TypeName, { probe }, wrapperName, wrapperError,
+                                             /*copyInit*/ true)
             ? CxxArgConversion::Convertible : CxxArgConversion::NotApplicable;
 }
 
@@ -15205,7 +15270,10 @@ bool LLVMBackend::MaterializeImplicitCxxClassArgument(NamedVariable& arg,
         const auto* ctor = SelectCxxConstructor(param.TypeName, { argType }, why,
                                                 /*allowNumericConversions*/ true, nullptr,
                                                 /*allowExplicit*/ false);
-        if (ctor != nullptr && ctor->params.size() < 2) return false;
+        // A converting constructor TEMPLATE can outrank a listed non-identity pick.
+        const bool clangResolves = !slicesToBase
+            && CxxConstructorNeedsClangResolution(param.TypeName, ctor, { argType });
+        if (ctor != nullptr && ctor->params.size() < 2 && !clangResolves) return false;
 
         TypeAndValue classType;
         classType.TypeName = param.TypeName;
@@ -15213,20 +15281,22 @@ bool LLVMBackend::MaterializeImplicitCxxClassArgument(NamedVariable& arg,
         if (objectType == nullptr || !objectType->isSized()) return false;
         llvm::Value* value = arg.Primary != nullptr ? arg.Primary : LoadArgStorage(arg);
         if (value == nullptr) return false;
-        // No listed constructor: construct through the generated C++ wrapper, which binds the
-        // template converting constructor the member list never carried.
-        if (ctor == nullptr)
+        // No listed constructor, or a template that may outrank it: construct through the
+        // generated copy-initializing C++ wrapper, which lets clang resolve the conversion.
+        std::string wrapperName;
+        std::string wrapperError;
+        NamedVariable source = arg;
+        source.TypeAndValue = argType;
+        source.TypeAndValue.VariableName.clear();
+        const auto* info = GetCxxClassInfo(param.TypeName);
+        const bool wrapped = (ctor == nullptr || clangResolves) && info != nullptr
+            && (info->constructors.empty()
+                || (info->hasCtorTemplate && !IsCxxRecord(argType.TypeName)))
+            && RequestCxxVariadicConstructor(param.TypeName, { source }, wrapperName,
+                                             wrapperError, /*copyInit*/ true);
+        if (!wrapped && (ctor == nullptr || ctor->params.size() < 2)) return false;
+        if (wrapped)
         {
-            const auto* info = GetCxxClassInfo(param.TypeName);
-            if (info == nullptr || !info->constructors.empty()) return false;
-            NamedVariable source = arg;
-            source.TypeAndValue = argType;
-            source.TypeAndValue.VariableName.clear();
-            std::string wrapperName;
-            std::string wrapperError;
-            if (!RequestCxxVariadicConstructor(param.TypeName, { source }, wrapperName,
-                                               wrapperError))
-                return false;
             auto* wrapperSlot = CreateAlloca(objectType);
             NamedVariable self;
             self.Primary = wrapperSlot;
@@ -15339,6 +15409,75 @@ bool LLVMBackend::EmitCxxCopyOrMoveConstruct(const std::string& typeName, llvm::
         return EmitCxxStructorCall(typeName, *ctor, dest, { src });
     }
 
+bool LLVMBackend::EmitCxxByValueParamConstruct(const std::string& typeName, llvm::Value* dest,
+                                                llvm::Value* src, bool useMove,
+                                                const char* context)
+{
+        if (IsForeignNontrivialCxxClass(typeName))
+            return EmitCxxCopyOrMoveConstruct(typeName, dest, src, useMove, context);
+        if (!HasForeignNontrivialCxxField(typeName)) return false;
+        if (!useMove)
+        {
+            auto* copyFn = GetOrCreateMemberwiseCopy(typeName);
+            if (copyFn == nullptr) return false;
+            auto* copied = builder->CreateCall(copyFn,
+                { builder->CreateLoad(GetType(TypeAndValue{ .TypeName = typeName }), src) },
+                "cxx.holder.copy");
+            builder->CreateStore(copied, dest);
+            return true;
+        }
+
+        auto* holderTy = GetType(TypeAndValue{ .TypeName = typeName });
+        builder->CreateStore(builder->CreateLoad(holderTy, src), dest);
+        std::function<bool(const std::string&, llvm::Value*, llvm::Value*)> moveFields;
+        moveFields = [&](const std::string& name, llvm::Value* target, llvm::Value* source) {
+            auto it = dataStructures.find(name);
+            if (it == dataStructures.end() || it->second.StructType == nullptr) return true;
+            for (unsigned i = 0; i < it->second.StructFields.size(); ++i)
+            {
+                const auto& field = it->second.StructFields[i];
+                if (field.Pointer || field.ElemPointer || field.IsArrayView || field.IsSimd
+                    || field.IsBitfield || field.IsPadding) continue;
+                if (field.ConstArraySize > 0)
+                {
+                    auto* arrayTy = llvm::dyn_cast<llvm::ArrayType>(
+                        it->second.StructType->getElementType(i));
+                    if (arrayTy == nullptr) continue;
+                    auto* dstArray = builder->CreateStructGEP(it->second.StructType, target, i);
+                    auto* srcArray = builder->CreateStructGEP(it->second.StructType, source, i);
+                    for (uint64_t n = 0; n < arrayTy->getNumElements(); ++n)
+                    {
+                        llvm::Value* indices[] = { builder->getInt32(0),
+                            builder->getInt32(static_cast<uint32_t>(n)) };
+                        auto* dstElement = builder->CreateInBoundsGEP(arrayTy, dstArray, indices);
+                        auto* srcElement = builder->CreateInBoundsGEP(arrayTy, srcArray, indices);
+                        if (IsForeignNontrivialCxxClass(field.TypeName))
+                        {
+                            if (!EmitCxxCopyOrMoveConstruct(field.TypeName, dstElement, srcElement,
+                                    true, context)) return false;
+                        }
+                        else if (HasForeignNontrivialCxxField(field.TypeName)
+                            && !moveFields(field.TypeName, dstElement, srcElement)) return false;
+                    }
+                    continue;
+                }
+                if (IsForeignNontrivialCxxClass(field.TypeName))
+                {
+                    auto* dstField = builder->CreateStructGEP(it->second.StructType, target, i);
+                    auto* srcField = builder->CreateStructGEP(it->second.StructType, source, i);
+                    if (!EmitCxxCopyOrMoveConstruct(field.TypeName, dstField, srcField, true,
+                            context)) return false;
+                }
+                else if (HasForeignNontrivialCxxField(field.TypeName)
+                    && !moveFields(field.TypeName,
+                        builder->CreateStructGEP(it->second.StructType, target, i),
+                        builder->CreateStructGEP(it->second.StructType, source, i))) return false;
+            }
+            return true;
+        };
+        return moveFields(typeName, dest, src);
+    }
+
 bool LLVMBackend::CxxObjectSizeAndAlign(const std::string& typeName, uint64_t& size, uint64_t& align)
 {
         TypeAndValue tv{ .TypeName = typeName };
@@ -15387,7 +15526,8 @@ llvm::Value* LLVMBackend::EmitCxxHeapAllocate(const std::string& typeName)
         llvm::Function* fn = GetCxxOperatorNew(overAligned);
         std::vector<llvm::Value*> args{ builder->getInt64(size) };
         if (overAligned) args.push_back(builder->getInt64(align));
-        return builder->CreateCall(fn->getFunctionType(), fn, args, "cxx.new");
+        // operator new throws std::bad_alloc through this frame.
+        return CreateCallOrInvoke(fn->getFunctionType(), fn, args, /*mayUnwind=*/true, "cxx.new");
     }
 
 void LLVMBackend::EmitCxxHeapFree(const std::string& typeName, llvm::Value* ptr)

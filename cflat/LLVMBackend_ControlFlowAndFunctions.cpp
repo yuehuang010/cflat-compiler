@@ -582,13 +582,17 @@ llvm::Value* LLVMBackend::CreateIndirectCall(const TypeAndValue& funcPtrType, ll
                 auto* temp = AllocaAtEntry(slot.structTy, nullptr, "cxx.indirect.argtemp", slot.align);
                 const bool useMove = params[i].IsMove || (*argNVs)[i].IsExplicitMove
                     || (*argNVs)[i].CxxParamLastUse || (*argNVs)[i].IsRvalue;
-                if (!EmitCxxCopyOrMoveConstruct(params[i].TypeName, temp,
-                                                (*argNVs)[i].Storage, useMove,
-                                                "into a by-value function parameter"))
+                if (!EmitCxxByValueParamConstruct(params[i].TypeName, temp,
+                                                   (*argNVs)[i].Storage, useMove,
+                                                   "into a by-value function parameter"))
                     continue;
-                if (!IsCxxParamDestroyedInCallee(params[i].TypeName))
+                const bool cflatHolder = !IsForeignNontrivialCxxClass(params[i].TypeName)
+                    && HasForeignNontrivialCxxField(params[i].TypeName);
+                if (!cflatHolder && !IsCxxParamDestroyedInCallee(params[i].TypeName))
                     RegisterOwnedStructTemp(temp, params[i].TypeName);
-                if ((*argNVs)[i].CxxParamLastUse && !(*argNVs)[i].IsElementAccess
+                if ((*argNVs)[i].CxxParamLastUse
+                    && !HasForeignNontrivialCxxField(params[i].TypeName)
+                    && !(*argNVs)[i].IsElementAccess
                     && (*argNVs)[i].FieldName.empty())
                 {
                     const std::string sourceName = (*argNVs)[i].CallerName.empty()
@@ -616,7 +620,8 @@ llvm::Value* LLVMBackend::CreateIndirectCall(const TypeAndValue& funcPtrType, ll
             for (const auto& p : funcPtrType.FuncPtrParams)
             {
                 TypeAndValue pTV; pTV.TypeName = p.TypeName; pTV.Pointer = p.Pointer; pTV.IsMove = p.IsMove;
-                paramTypes.push_back(!p.Pointer && IsForeignNontrivialCxxClass(p.TypeName)
+                paramTypes.push_back(!p.Pointer && (IsForeignNontrivialCxxClass(p.TypeName)
+                        || HasForeignNontrivialCxxField(p.TypeName))
                     ? cflat_llvm::PointerTo(GetType(pTV)) : GetType(pTV));
                 if (ParameterCarriesRawArrayCount(pTV))
                     paramTypes.push_back(builder->getInt64Ty());
@@ -684,7 +689,7 @@ llvm::Value* LLVMBackend::CreateIndirectCall(const TypeAndValue& funcPtrType, ll
                 abiArgs.push_back(rawReturnCountSlot);
             }
             lastCallReturnType = retTV;
-            auto* result = builder->CreateCall(cFnTy, fnPtr, abiArgs);
+            auto* result = CreateCallOrInvoke(cFnTy, fnPtr, abiArgs, /*mayUnwind=*/true);
             if (cxxSretRecipe.hasLowering)
                 ApplyAbiCallAttributes(result, cxxSretRecipe);
             llvm::Value* value = cxxSretReturn
@@ -712,7 +717,8 @@ llvm::Value* LLVMBackend::CreateIndirectCall(const TypeAndValue& funcPtrType, ll
         for (const auto& p : funcPtrType.FuncPtrParams)
         {
             TypeAndValue pTV; pTV.TypeName = p.TypeName; pTV.Pointer = p.Pointer; pTV.IsMove = p.IsMove;
-            paramTypes.push_back(!p.Pointer && IsForeignNontrivialCxxClass(p.TypeName)
+            paramTypes.push_back(!p.Pointer && (IsForeignNontrivialCxxClass(p.TypeName)
+                    || HasForeignNontrivialCxxField(p.TypeName))
                 ? cflat_llvm::PointerTo(GetType(pTV)) : GetType(pTV));
             if (ParameterCarriesRawArrayCount(pTV))
                 paramTypes.push_back(builder->getInt64Ty());
@@ -801,7 +807,7 @@ llvm::Value* LLVMBackend::CreateIndirectCall(const TypeAndValue& funcPtrType, ll
         }
 
         lastCallReturnType = retTV;
-        auto* result = builder->CreateCall(invokerTy, fnPtr, fullArgs);
+        auto* result = CreateCallOrInvoke(invokerTy, fnPtr, fullArgs, /*mayUnwind=*/true);
         if (cxxSretRecipe.hasLowering)
             ApplyAbiCallAttributes(result, cxxSretRecipe);
         llvm::Value* value = cxxSretReturn
@@ -1311,7 +1317,8 @@ LLVMBackend::AbiRecipe LLVMBackend::ComputeCxxReturnAbiRecipe(
         bool cxxParam = false;
         for (const auto& param : params)
             if (!param.Pointer && !param.IsAlias
-                && IsForeignNontrivialCxxClass(param.TypeName))
+                && (IsForeignNontrivialCxxClass(param.TypeName)
+                    || HasForeignNontrivialCxxField(param.TypeName)))
             {
                 cxxParam = true;
                 break;
@@ -1333,7 +1340,8 @@ LLVMBackend::AbiRecipe LLVMBackend::ComputeCxxReturnAbiRecipe(
         {
             const auto& param = params[i];
             if (param.Pointer || param.IsAlias
-                || !IsForeignNontrivialCxxClass(param.TypeName))
+                || !(IsForeignNontrivialCxxClass(param.TypeName)
+                     || HasForeignNontrivialCxxField(param.TypeName)))
                 continue;
             auto it = dataStructures.find(param.TypeName);
             if (it == dataStructures.end() || it->second.StructType == nullptr) return {};
@@ -2146,7 +2154,8 @@ llvm::Type* LLVMBackend::BuildThinFnPtrType(const TypeAndValue& tv) const
         {
             TypeAndValue pTV; pTV.TypeName = p.TypeName; pTV.Pointer = p.Pointer;
             pTV.IsMove = p.IsMove;
-            if (!p.Pointer && IsForeignNontrivialCxxClass(p.TypeName))
+            if (!p.Pointer && (IsForeignNontrivialCxxClass(p.TypeName)
+                || HasForeignNontrivialCxxField(p.TypeName)))
                 paramTypes.push_back(cflat_llvm::PointerTo(GetType(pTV)));
             else
                 paramTypes.push_back(SizedParamOrPlaceholder(GetType(pTV), *builder));

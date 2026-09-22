@@ -35,6 +35,12 @@
 //     signatures, and the free-function forms of the same signatures already covered by the
 //     plain-CFlat-function checks. Every member position was refused ("takes/returns
 //     unsupported type") while the free-function parameter one bound.
+//   CFlat by-value holder parameters with nontrivial C++ fields: read, mutation isolation,
+//     nested and multiple fields, last-use move, loop copies, explicit move, return, recursion,
+//     and calls through function values.
+//   Owning lvalue ternaries at assignment sinks select storage for direct, nested, field,
+//     array-element, and dereference arms; C++ fields copy-assign once, and explicit move
+//     consumes only the selected C++ class arm.
 
 import cpp "library/cpp_interop_basic.h";
 import cpp "library/cpp_interop_basic.cpp";
@@ -146,6 +152,72 @@ struct BridgeSharedCopyFieldHolder
 {
     std.shared_ptr<int> value = default;
 };
+
+struct BridgeMultiCxxFieldHolder<T>
+{
+    T first = default;
+    T second = default;
+    int marker = 0;
+};
+
+int bridge_bvh_inner<T>(BridgeFieldHolder<T> value) { return value.value.value(); }
+int bridge_bvh_read<T>(BridgeFieldHolder<T> value) { return value.value.value(); }
+int bridge_bvh_mutate<T>(BridgeFieldHolder<T> value)
+{
+    value.value.set(52);
+    return value.value[0];
+}
+int bridge_bvh_nested<T>(BridgeNestedCopyFieldHolder<T> value)
+{
+    return value.inner.value.value();
+}
+int bridge_bvh_array<T>(BridgeArrayCopyFieldHolder<T> value)
+{
+    return value.values[0].value() + value.values[1].value();
+}
+int bridge_bvh_array_move<T>(move BridgeArrayCopyFieldHolder<T> value)
+{
+    return value.values[0].value() + value.values[1].value();
+}
+int bridge_bvh_multi<T>(BridgeMultiCxxFieldHolder<T> value)
+{
+    return value.first.value() + value.second.value() + value.marker;
+}
+cpptw.Twin bridge_bvh_move_field(BridgeFieldHolder<cpptw.Twin> value)
+{
+    return move value.value;
+}
+TwinCf bridge_bvh_move_field_cf(move BridgeFieldHolder<TwinCf> value)
+{
+    return move value.value;
+}
+int bridge_bvh_loop<T>(BridgeFieldHolder<T> value)
+{
+    int total = 0;
+    for (int i = 0; i < 2; i++) total += bridge_bvh_inner<T>(value);
+    return total;
+}
+int bridge_bvh_last_use<T>(BridgeFieldHolder<T> value)
+{
+    return bridge_bvh_inner<T>(value);
+}
+int bridge_bvh_move<T>(BridgeFieldHolder<T> value)
+{
+    return value.value.value();
+}
+int bridge_bvh_move_cf(move BridgeFieldHolder<TwinCf> value)
+{
+    return value.value.value();
+}
+BridgeFieldHolder<T> bridge_bvh_return<T>(BridgeFieldHolder<T> value)
+{
+    return move value;
+}
+int bridge_bvh_recurse<T>(BridgeFieldHolder<T> value, int depth)
+{
+    if (depth == 0) return value.value.value();
+    return bridge_bvh_recurse<T>(value, depth - 1);
+}
 
 struct BridgeListField<T>
 {
@@ -1744,6 +1816,72 @@ int bridge_conditional_move_then_return(bool condition)
         return 9;
     }
     return 0;
+}
+
+int bridge_ternary_lvalue_cf(bool choose)
+{
+    TwinCf left = default; left.set(11);
+    TwinCf right = default; right.set(22);
+    TwinCf target = default;
+    target = choose ? left : right;
+    return target.value() * 10000 + left.value() * 100 + right.value();
+}
+
+int bridge_ternary_lvalue_nested_cf(bool outer, bool inner)
+{
+    TwinCf left = default; left.set(11);
+    TwinCf middle = default; middle.set(22);
+    TwinCf right = default; right.set(33);
+    TwinCf target = default;
+    target = outer ? left : (inner ? middle : right);
+    return target.value() * 1000000 + left.value() * 10000
+        + middle.value() * 100 + right.value();
+}
+
+int bridge_ternary_lvalue_field_cf(bool choose)
+{
+    BridgeCopyFieldHolder<TwinCf> left = default; left.value.set(41);
+    BridgeCopyFieldHolder<TwinCf> right = default; right.value.set(42);
+    TwinCf target = default;
+    target = choose ? left.value : right.value;
+    return target.value() * 10000 + left.value.value() * 100 + right.value.value();
+}
+
+int bridge_ternary_lvalue_array_cf(bool choose)
+{
+    TwinCf[2] values = default;
+    values[0].set(51); values[1].set(52);
+    TwinCf target = default;
+    target = choose ? values[0] : values[1];
+    return target.value() * 10000 + values[0].value() * 100 + values[1].value();
+}
+
+int bridge_ternary_lvalue_deref_cf(bool choose)
+{
+    TwinCf left = default; left.set(61);
+    TwinCf right = default; right.set(62);
+    TwinCf target = default;
+    TwinCf* leftPtr = &left;
+    TwinCf* rightPtr = &right;
+    target = choose ? *leftPtr : *rightPtr;
+    return target.value() * 10000 + left.value() * 100 + right.value();
+}
+
+int bridge_ternary_lvalue_cppfield(bool choose)
+{
+    BridgeCopyFieldHolder<cpptw.Twin> left = default; left.value.set(71);
+    BridgeCopyFieldHolder<cpptw.Twin> right = default; right.value.set(72);
+    BridgeCopyFieldHolder<cpptw.Twin> target = default;
+    target = choose ? left : right;
+    return target.value.value() * 10000 + left.value.value() * 100 + right.value.value();
+}
+
+int bridge_move_ternary_cpp(bool choose)
+{
+    cpptw.Twin left = cpptw.Twin(81);
+    cpptw.Twin right = cpptw.Twin(82);
+    cpptw.Twin moved = move (choose ? left : right);
+    return moved.value() * 1000 + left.value() * 10 + right.value();
 }
 
 extern int main(int argc, char** argv)
@@ -3565,6 +3703,388 @@ extern int main(int argc, char** argv)
     bridge_check("global Twin conditional reinit copy", cpptw.copy_count(), 1);
     bridge_check("global Twin conditional reinit dtor", cpptw.dtor_count(), 2);
     bridge_check("global Twin conditional reinit live", cpptw.live_allocations(), 0);
+
+    // A CFlat value holder must construct each nontrivial C++ field for a by-value parameter.
+    int bridgeBvhStartChecks = bridge_checks;
+    int bridgeBvhStartPassed = bridge_passed;
+    cpptw.reset_counts();
+    {
+        BridgeFieldHolder<cpptw.Twin> value = default;
+        value.value.set(29);
+        function<int(BridgeFieldHolder<cpptw.Twin>)> fn = bridge_bvh_read<cpptw.Twin>;
+        bridge_check("BV holder function value C++", fn(value), 29);
+    }
+    bridge_check("BV holder function value C++ ctor", cpptw.ctor_count(), 1);
+    bridge_check("BV holder function value C++ copy", cpptw.copy_count(), 1);
+    bridge_check("BV holder function value C++ move", cpptw.move_count(), 0);
+    bridge_check("BV holder function value C++ dtor", cpptw.dtor_count(), 2);
+    bridge_check("BV holder function value C++ live", cpptw.live_allocations(), 0);
+
+    bridge_reset_cf();
+    {
+        BridgeFieldHolder<TwinCf> value = default;
+        value.value.set(29);
+        function<int(BridgeFieldHolder<TwinCf>)> fn = bridge_bvh_read<TwinCf>;
+        bridge_check("BV holder function value CFlat", fn(value), 29);
+    }
+    bridge_check("BV holder function value CFlat ctor", bridge_cf_ctor, 1);
+    bridge_check("BV holder function value CFlat copy", bridge_cf_copy, 0);
+    bridge_check("BV holder function value CFlat move", bridge_cf_move, 0);
+    bridge_check("BV holder function value CFlat dtor", bridge_cf_dtor, 1);
+    bridge_check("BV holder function value CFlat live", bridge_cf_live, 0);
+
+    cpptw.reset_counts();
+    {
+        BridgeFieldHolder<cpptw.Twin> value = default;
+        value.value.set(31);
+        bridge_check("BV holder C++ read", bridge_bvh_read<cpptw.Twin>(value), 31);
+    }
+    bridge_check("BV holder C++ read ctor", cpptw.ctor_count(), 1);
+    bridge_check("BV holder C++ read copy", cpptw.copy_count(), 1);
+    bridge_check("BV holder C++ read move", cpptw.move_count(), 0);
+    bridge_check("BV holder C++ read dtor", cpptw.dtor_count(), 2);
+    bridge_check("BV holder C++ read live", cpptw.live_allocations(), 0);
+
+    bridge_reset_cf();
+    {
+        BridgeFieldHolder<TwinCf> value = default;
+        value.value.set(31);
+        bridge_check("BV holder CFlat read", bridge_bvh_read<TwinCf>(value), 31);
+    }
+    bridge_check("BV holder CFlat read ctor", bridge_cf_ctor, 1);
+    bridge_check("BV holder CFlat read copy", bridge_cf_copy, 0);
+    bridge_check("BV holder CFlat read move", bridge_cf_move, 0);
+    bridge_check("BV holder CFlat read dtor", bridge_cf_dtor, 1);
+    bridge_check("BV holder CFlat read live", bridge_cf_live, 0);
+
+    cpptw.reset_counts();
+    {
+        BridgeFieldHolder<cpptw.Twin> value = default;
+        value.value.set(7);
+        bridge_check("BV holder C++ mutation result", bridge_bvh_mutate<cpptw.Twin>(value), 52);
+        bridge_check("BV holder C++ mutation source value", value.value.value(), 7);
+        bridge_check("BV holder C++ mutation source data", value.value[0], 7);
+    }
+    bridge_check("BV holder C++ mutation ctor", cpptw.ctor_count(), 1);
+    bridge_check("BV holder C++ mutation copy", cpptw.copy_count(), 1);
+    bridge_check("BV holder C++ mutation move", cpptw.move_count(), 0);
+    bridge_check("BV holder C++ mutation dtor", cpptw.dtor_count(), 2);
+    bridge_check("BV holder C++ mutation live", cpptw.live_allocations(), 0);
+
+    bridge_reset_cf();
+    {
+        BridgeFieldHolder<TwinCf> value = default;
+        value.value.set(7);
+        bridge_check("BV holder CFlat mutation result", bridge_bvh_mutate<TwinCf>(value), 52);
+        bridge_check("BV holder CFlat mutation source value", value.value.value(), 7);
+        bridge_check("BV holder CFlat mutation source data", value.value[0], 52);
+    }
+    bridge_check("BV holder CFlat mutation ctor", bridge_cf_ctor, 1);
+    bridge_check("BV holder CFlat mutation copy", bridge_cf_copy, 0);
+    bridge_check("BV holder CFlat mutation dtor", bridge_cf_dtor, 1);
+    bridge_check("BV holder CFlat mutation live", bridge_cf_live, 0);
+
+    cpptw.reset_counts();
+    {
+        BridgeNestedCopyFieldHolder<cpptw.Twin> value = default;
+        value.inner.value.set(9);
+        bridge_check("BV holder nested C++ value", bridge_bvh_nested<cpptw.Twin>(value), 9);
+    }
+    bridge_check("BV holder nested C++ ctor", cpptw.ctor_count(), 1);
+    bridge_check("BV holder nested C++ copy", cpptw.copy_count(), 1);
+    bridge_check("BV holder nested C++ move", cpptw.move_count(), 0);
+    bridge_check("BV holder nested C++ dtor", cpptw.dtor_count(), 2);
+    bridge_check("BV holder nested C++ live", cpptw.live_allocations(), 0);
+
+    bridge_reset_cf();
+    {
+        BridgeNestedCopyFieldHolder<TwinCf> value = default;
+        value.inner.value.set(9);
+        bridge_check("BV holder nested CFlat value", bridge_bvh_nested<TwinCf>(value), 9);
+    }
+    bridge_check("BV holder nested CFlat ctor", bridge_cf_ctor, 1);
+    bridge_check("BV holder nested CFlat copy", bridge_cf_copy, 0);
+    bridge_check("BV holder nested CFlat move", bridge_cf_move, 0);
+    bridge_check("BV holder nested CFlat dtor", bridge_cf_dtor, 1);
+    bridge_check("BV holder nested CFlat live", bridge_cf_live, 0);
+
+    cpptw.reset_counts();
+    {
+        BridgeArrayCopyFieldHolder<cpptw.Twin> value = default;
+        value.values[0].set(4); value.values[1].set(5);
+        bridge_check("BV holder C++ array value", bridge_bvh_array<cpptw.Twin>(value), 9);
+    }
+    bridge_check("BV holder C++ array ctor", cpptw.ctor_count(), 2);
+    bridge_check("BV holder C++ array copy", cpptw.copy_count(), 2);
+    bridge_check("BV holder C++ array move", cpptw.move_count(), 0);
+    bridge_check("BV holder C++ array dtor", cpptw.dtor_count(), 4);
+    bridge_check("BV holder C++ array live", cpptw.live_allocations(), 0);
+
+    bridge_reset_cf();
+    {
+        BridgeArrayCopyFieldHolder<TwinCf> value = default;
+        value.values[0].set(4); value.values[1].set(5);
+        bridge_check("BV holder CFlat array value", bridge_bvh_array<TwinCf>(value), 9);
+    }
+    bridge_check("BV holder CFlat array ctor", bridge_cf_ctor, 2);
+    bridge_check("BV holder CFlat array copy", bridge_cf_copy, 0);
+    bridge_check("BV holder CFlat array move", bridge_cf_move, 0);
+    bridge_check("BV holder CFlat array dtor", bridge_cf_dtor, 2);
+    bridge_check("BV holder CFlat array live", bridge_cf_live, 0);
+
+    cpptw.reset_counts();
+    {
+        BridgeArrayCopyFieldHolder<cpptw.Twin> value = default;
+        value.values[0].set(6); value.values[1].set(7);
+        bridge_check("BV holder C++ array move value",
+            bridge_bvh_array_move<cpptw.Twin>(move value), 13);
+    }
+    bridge_check("BV holder C++ array move ctor", cpptw.ctor_count(), 2);
+    bridge_check("BV holder C++ array move copy", cpptw.copy_count(), 0);
+    bridge_check("BV holder C++ array move move", cpptw.move_count(), 2);
+    bridge_check("BV holder C++ array move dtor", cpptw.dtor_count(), 4);
+    bridge_check("BV holder C++ array move live", cpptw.live_allocations(), 0);
+
+    bridge_reset_cf();
+    {
+        BridgeArrayCopyFieldHolder<TwinCf> value = default;
+        value.values[0].set(6); value.values[1].set(7);
+        bridge_check("BV holder CFlat array move value",
+            bridge_bvh_array_move<TwinCf>(move value), 13);
+    }
+    bridge_check("BV holder CFlat array move ctor", bridge_cf_ctor, 2);
+    bridge_check("BV holder CFlat array move copy", bridge_cf_copy, 0);
+    bridge_check("BV holder CFlat array move move", bridge_cf_move, 0);
+    bridge_check("BV holder CFlat array move dtor", bridge_cf_dtor, 4);
+    bridge_check("BV holder CFlat array move live", bridge_cf_live, 0);
+
+    cpptw.reset_counts();
+    {
+        BridgeMultiCxxFieldHolder<cpptw.Twin> value = default;
+        value.first.set(2); value.second.set(3); value.marker = 4;
+        bridge_check("BV holder two C++ fields value", bridge_bvh_multi<cpptw.Twin>(value), 9);
+    }
+    bridge_check("BV holder two C++ fields ctor", cpptw.ctor_count(), 2);
+    bridge_check("BV holder two C++ fields copy", cpptw.copy_count(), 2);
+    bridge_check("BV holder two C++ fields move", cpptw.move_count(), 0);
+    bridge_check("BV holder two C++ fields dtor", cpptw.dtor_count(), 4);
+    bridge_check("BV holder two C++ fields live", cpptw.live_allocations(), 0);
+
+    bridge_reset_cf();
+    {
+        BridgeMultiCxxFieldHolder<TwinCf> value = default;
+        value.first.set(2); value.second.set(3); value.marker = 4;
+        bridge_check("BV holder two CFlat fields value", bridge_bvh_multi<TwinCf>(value), 9);
+    }
+    bridge_check("BV holder two CFlat fields ctor", bridge_cf_ctor, 2);
+    bridge_check("BV holder two CFlat fields copy", bridge_cf_copy, 0);
+    bridge_check("BV holder two CFlat fields move", bridge_cf_move, 0);
+    bridge_check("BV holder two CFlat fields dtor", bridge_cf_dtor, 2);
+    bridge_check("BV holder two CFlat fields live", bridge_cf_live, 0);
+
+    cpptw.reset_counts();
+    {
+        BridgeFieldHolder<cpptw.Twin> value = default;
+        value.value.set(29);
+        cpptw.Twin result = bridge_bvh_move_field(value);
+        bridge_check("BV holder field move C++ value", result.value(), 29);
+    }
+    bridge_check("BV holder field move C++ ctor", cpptw.ctor_count(), 1);
+    bridge_check("BV holder field move C++ copy", cpptw.copy_count(), 1);
+    bridge_check("BV holder field move C++ move", cpptw.move_count(), 1);
+    bridge_check("BV holder field move C++ dtor", cpptw.dtor_count(), 3);
+    bridge_check("BV holder field move C++ live", cpptw.live_allocations(), 0);
+
+    bridge_reset_cf();
+    {
+        BridgeFieldHolder<TwinCf> value = default;
+        value.value.set(29);
+        TwinCf result = bridge_bvh_move_field_cf(move value);
+        bridge_check("BV holder field move CFlat value", result.value(), 29);
+    }
+    bridge_check("BV holder field move CFlat ctor", bridge_cf_ctor, 1);
+    bridge_check("BV holder field move CFlat copy", bridge_cf_copy, 0);
+    bridge_check("BV holder field move CFlat move", bridge_cf_move, 0);
+    bridge_check("BV holder field move CFlat dtor", bridge_cf_dtor, 3);
+    bridge_check("BV holder field move CFlat live", bridge_cf_live, 0);
+
+    cpptw.reset_counts();
+    {
+        BridgeFieldHolder<cpptw.Twin> value = default;
+        value.value.set(11);
+        bridge_check("BV holder last-use C++ value", bridge_bvh_last_use<cpptw.Twin>(value), 11);
+    }
+    bridge_check("BV holder last-use C++ copy", cpptw.copy_count(), 1);
+    bridge_check("BV holder last-use C++ move", cpptw.move_count(), 1);
+    bridge_check("BV holder last-use C++ dtor", cpptw.dtor_count(), 3);
+    bridge_check("BV holder last-use C++ live", cpptw.live_allocations(), 0);
+
+    bridge_reset_cf();
+    {
+        BridgeFieldHolder<TwinCf> value = default;
+        value.value.set(11);
+        bridge_check("BV holder last-use CFlat value", bridge_bvh_last_use<TwinCf>(value), 11);
+    }
+    bridge_check("BV holder last-use CFlat ctor", bridge_cf_ctor, 1);
+    bridge_check("BV holder last-use CFlat copy", bridge_cf_copy, 0);
+    bridge_check("BV holder last-use CFlat move", bridge_cf_move, 0);
+    bridge_check("BV holder last-use CFlat dtor", bridge_cf_dtor, 1);
+    bridge_check("BV holder last-use CFlat live", bridge_cf_live, 0);
+
+    cpptw.reset_counts();
+    {
+        BridgeFieldHolder<cpptw.Twin> value = default;
+        value.value.set(13);
+        bridge_check("BV holder loop C++ value", bridge_bvh_loop<cpptw.Twin>(value), 26);
+    }
+    bridge_check("BV holder loop C++ copy", cpptw.copy_count(), 3);
+    bridge_check("BV holder loop C++ move", cpptw.move_count(), 0);
+    bridge_check("BV holder loop C++ dtor", cpptw.dtor_count(), 4);
+    bridge_check("BV holder loop C++ live", cpptw.live_allocations(), 0);
+
+    bridge_reset_cf();
+    {
+        BridgeFieldHolder<TwinCf> value = default;
+        value.value.set(13);
+        bridge_check("BV holder loop CFlat value", bridge_bvh_loop<TwinCf>(value), 26);
+    }
+    bridge_check("BV holder loop CFlat ctor", bridge_cf_ctor, 1);
+    bridge_check("BV holder loop CFlat copy", bridge_cf_copy, 0);
+    bridge_check("BV holder loop CFlat move", bridge_cf_move, 0);
+    bridge_check("BV holder loop CFlat dtor", bridge_cf_dtor, 1);
+    bridge_check("BV holder loop CFlat live", bridge_cf_live, 0);
+
+    cpptw.reset_counts();
+    {
+        BridgeFieldHolder<cpptw.Twin> value = default;
+        value.value.set(17);
+        bridge_check("BV holder explicit move C++ value",
+            bridge_bvh_move<cpptw.Twin>(move value), 17);
+    }
+    bridge_check("BV holder explicit move C++ ctor", cpptw.ctor_count(), 1);
+    bridge_check("BV holder explicit move C++ copy", cpptw.copy_count(), 0);
+    bridge_check("BV holder explicit move C++ move", cpptw.move_count(), 1);
+    bridge_check("BV holder explicit move C++ dtor", cpptw.dtor_count(), 2);
+    bridge_check("BV holder explicit move C++ live", cpptw.live_allocations(), 0);
+
+    bridge_reset_cf();
+    {
+        BridgeFieldHolder<TwinCf> value = default;
+        value.value.set(17);
+        bridge_check("BV holder explicit move CFlat value",
+            bridge_bvh_move_cf(move value), 17);
+    }
+    bridge_check("BV holder explicit move CFlat ctor", bridge_cf_ctor, 1);
+    bridge_check("BV holder explicit move CFlat copy", bridge_cf_copy, 0);
+    bridge_check("BV holder explicit move CFlat move", bridge_cf_move, 0);
+    bridge_check("BV holder explicit move CFlat dtor", bridge_cf_dtor, 2);
+    bridge_check("BV holder explicit move CFlat live", bridge_cf_live, 0);
+
+    cpptw.reset_counts();
+    {
+        BridgeFieldHolder<cpptw.Twin> value = default;
+        value.value.set(19);
+        BridgeFieldHolder<cpptw.Twin> result = bridge_bvh_return<cpptw.Twin>(value);
+        bridge_check("BV holder return C++ value", result.value.value(), 19);
+    }
+    bridge_check("BV holder return C++ ctor", cpptw.ctor_count(), 1);
+    bridge_check("BV holder return C++ copy", cpptw.copy_count(), 1);
+    bridge_check("BV holder return C++ move", cpptw.move_count(), 0);
+    bridge_check("BV holder return C++ dtor", cpptw.dtor_count(), 2);
+    bridge_check("BV holder return C++ live", cpptw.live_allocations(), 0);
+
+    bridge_reset_cf();
+    {
+        BridgeFieldHolder<TwinCf> value = default;
+        value.value.set(19);
+        BridgeFieldHolder<TwinCf> result = bridge_bvh_return<TwinCf>(value);
+        bridge_check("BV holder return CFlat value", result.value.value(), 19);
+    }
+    bridge_check("BV holder return CFlat ctor", bridge_cf_ctor, 1);
+    bridge_check("BV holder return CFlat copy", bridge_cf_copy, 0);
+    bridge_check("BV holder return CFlat move", bridge_cf_move, 0);
+    bridge_check("BV holder return CFlat dtor", bridge_cf_dtor, 2);
+    bridge_check("BV holder return CFlat live", bridge_cf_live, 0);
+
+    cpptw.reset_counts();
+    {
+        BridgeFieldHolder<cpptw.Twin> value = default;
+        value.value.set(23);
+        bridge_check("BV holder recursion C++ value",
+            bridge_bvh_recurse<cpptw.Twin>(value, 2), 23);
+    }
+    bridge_check("BV holder recursion C++ copy", cpptw.copy_count(), 1);
+    bridge_check("BV holder recursion C++ move", cpptw.move_count(), 2);
+    bridge_check("BV holder recursion C++ dtor", cpptw.dtor_count(), 4);
+    bridge_check("BV holder recursion C++ live", cpptw.live_allocations(), 0);
+
+    bridge_reset_cf();
+    {
+        BridgeFieldHolder<TwinCf> value = default;
+        value.value.set(23);
+        bridge_check("BV holder recursion CFlat value",
+            bridge_bvh_recurse<TwinCf>(value, 2), 23);
+    }
+    bridge_check("BV holder recursion CFlat ctor", bridge_cf_ctor, 1);
+    bridge_check("BV holder recursion CFlat copy", bridge_cf_copy, 0);
+    bridge_check("BV holder recursion CFlat move", bridge_cf_move, 0);
+    bridge_check("BV holder recursion CFlat dtor", bridge_cf_dtor, 1);
+    bridge_check("BV holder recursion CFlat live", bridge_cf_live, 0);
+
+    if (bridge_passed - bridgeBvhStartPassed != bridge_checks - bridgeBvhStartChecks)
+        return 2010;
+    // ---- owning ternary lvalue sinks (1950-1969) -----------------------------------
+    bridge_reset_cf();
+    if (bridge_ternary_lvalue_cf(true) != 110000 + 1100 + 22) return 1950;
+    if (bridge_cf_copy != 1 || bridge_cf_dtor != 4 || bridge_cf_live != 0) return 1951;
+    bridge_reset_cf();
+    if (bridge_ternary_lvalue_cf(false) != 220000 + 1100 + 22) return 1952;
+    if (bridge_cf_copy != 1 || bridge_cf_dtor != 4 || bridge_cf_live != 0) return 1953;
+    bridge_reset_cf();
+    if (bridge_ternary_lvalue_nested_cf(false, true) != 22000000 + 110000 + 2200 + 33) return 1954;
+    if (bridge_cf_copy != 1 || bridge_cf_dtor != 5 || bridge_cf_live != 0) return 1955;
+    bridge_reset_cf();
+    if (bridge_ternary_lvalue_nested_cf(true, false) != 11000000 + 110000 + 2200 + 33) return 1954;
+    if (bridge_cf_copy != 1 || bridge_cf_dtor != 5 || bridge_cf_live != 0) return 1955;
+    bridge_reset_cf();
+    if (bridge_ternary_lvalue_nested_cf(false, false) != 33000000 + 110000 + 2200 + 33) return 1954;
+    if (bridge_cf_copy != 1 || bridge_cf_dtor != 5 || bridge_cf_live != 0) return 1955;
+    bridge_reset_cf();
+    if (bridge_ternary_lvalue_field_cf(true) != 410000 + 4100 + 42) return 1956;
+    if (bridge_cf_copy != 1 || bridge_cf_dtor != 4 || bridge_cf_live != 0) return 1957;
+    bridge_reset_cf();
+    if (bridge_ternary_lvalue_field_cf(false) != 420000 + 4100 + 42) return 1956;
+    if (bridge_cf_copy != 1 || bridge_cf_dtor != 4 || bridge_cf_live != 0) return 1957;
+    bridge_reset_cf();
+    if (bridge_ternary_lvalue_array_cf(false) != 520000 + 5100 + 52) return 1958;
+    if (bridge_cf_copy != 1 || bridge_cf_dtor != 4 || bridge_cf_live != 0) return 1959;
+    bridge_reset_cf();
+    if (bridge_ternary_lvalue_array_cf(true) != 510000 + 5100 + 52) return 1958;
+    if (bridge_cf_copy != 1 || bridge_cf_dtor != 4 || bridge_cf_live != 0) return 1959;
+    bridge_reset_cf();
+    if (bridge_ternary_lvalue_deref_cf(true) != 610000 + 6100 + 62) return 1960;
+    if (bridge_cf_copy != 1 || bridge_cf_dtor != 4 || bridge_cf_live != 0) return 1961;
+    bridge_reset_cf();
+    if (bridge_ternary_lvalue_deref_cf(false) != 620000 + 6100 + 62) return 1960;
+    if (bridge_cf_copy != 1 || bridge_cf_dtor != 4 || bridge_cf_live != 0) return 1961;
+
+    cpptw.reset_counts();
+    if (bridge_ternary_lvalue_cppfield(true) != 710000 + 7100 + 72) return 1962;
+    if (cpptw.copy_count() != 1 || cpptw.dtor_count() != 4
+        || cpptw.live_allocations() != 0) return 1963;
+    cpptw.reset_counts();
+    if (bridge_ternary_lvalue_cppfield(false) != 720000 + 7100 + 72) return 1964;
+    if (cpptw.copy_count() != 1 || cpptw.dtor_count() != 4
+        || cpptw.live_allocations() != 0) return 1965;
+
+    cpptw.reset_counts();
+    if (bridge_move_ternary_cpp(true) != 81000 - 10 + 82) return 1966;
+    if (cpptw.move_count() != 1 || cpptw.dtor_count() != 3
+        || cpptw.live_allocations() != 0) return 1967;
+    cpptw.reset_counts();
+    if (bridge_move_ternary_cpp(false) != 82000 + 810 - 1) return 1968;
+    if (cpptw.move_count() != 1 || cpptw.dtor_count() != 3
+        || cpptw.live_allocations() != 0) return 1969;
 
     if (bridge_passed != bridge_checks) return 2000;
 

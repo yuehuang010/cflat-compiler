@@ -5524,7 +5524,7 @@ bool MainListener::TernaryArmViewType(llvm::Value* value, llvm::Value* storage,
         }
         // A FIELD read names no local slot; its element lives on the field's declaration.
         if (ViewFieldElementForRead(value, storage, out)) return true;
-        if (auto* call = llvm::dyn_cast<llvm::CallInst>(value))
+        if (auto* call = llvm::dyn_cast<llvm::CallBase>(value))
             if (const auto* symbol = compiler->FindSymbolForFunction(call->getCalledFunction());
                 symbol != nullptr && symbol->ReturnType.IsArrayView)
             {
@@ -5937,7 +5937,8 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
         CFlatParser::ExpressionContext* expressionTrueCtx,
         CFlatParser::ConditionalExpressionContext* expressionFalseCtx, ResultUse use,
         const LLVMBackend::TypeAndValue& outerExpected, llvm::Value* cxxTernaryDeclDest,
-        const std::string& cxxTernaryDeclType, bool collapseLvalueArms) {
+        const std::string& cxxTernaryDeclType, bool collapseLvalueArms,
+        bool collapseLvalueSink) {
         auto* compiler = Compiler(ctx);
         const bool moveInterfaceReturn = compiler->currentFunctionReturnsOwned
             && compiler->currentFunctionReturnTV.IsInterface;
@@ -6065,8 +6066,30 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
             return source != nullptr && (source->IsAliasBorrow || source->IsBorrowedOwningValue
                 || source->RootIsBorrowedByValueParam || source->TypeAndValue.IsAlias);
         };
+        auto isOwningRecordValue = [&](llvm::Value* value) {
+            auto* structType = llvm::dyn_cast_or_null<llvm::StructType>(value != nullptr
+                ? value->getType() : nullptr);
+            if (structType == nullptr || !structType->hasName()) return false;
+            const std::string typeName = structType->getName().str();
+            return !compiler->IsCxxRecord(typeName) && compiler->IsOwningValueType(typeName);
+        };
+        auto isAddressableLvalue = [&](llvm::Value* value, llvm::Value* storage) {
+            if (value == nullptr || storage == nullptr) return false;
+            LLVMBackend::NamedVariable armNV;
+            armNV.Primary = value;
+            armNV.Storage = storage;
+            if (auto* structType = llvm::dyn_cast<llvm::StructType>(value->getType());
+                structType != nullptr && structType->hasName())
+                armNV.TypeAndValue.TypeName = structType->getName().str();
+            return !compiler->IsOwnedTempValue(armNV);
+        };
+        auto collapseThisLvalue = [&](llvm::Value* value, llvm::Value* storage) {
+            return collapseLvalueArms || (collapseLvalueSink
+                && isOwningRecordValue(value) && isAddressableLvalue(value, storage)
+                && !compiler->IsTempFieldValue(value));
+        };
         auto markImplicitTernaryMove = [&](llvm::Value* storage, llvm::Value* value) {
-            if (!collapseLvalueArms || storage == nullptr || value == nullptr
+            if (!collapseThisLvalue(value, storage) || storage == nullptr || value == nullptr
                 || outerExpected.IsAlias || outerExpected.IsMove
                 || outerExpected.Pointer || outerExpected.TypeName.empty()
                 || !compiler->IsOwningValueType(outerExpected.TypeName)
@@ -6216,7 +6239,8 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
                 parseFalseArm();
                 falseTernaryMovedState = compiler->SaveMovedState();
             }
-            const bool lvalueArmCandidate = collapseLvalueArms && trueValue != nullptr
+            const bool lvalueArmCandidate = (collapseThisLvalue(trueValue, trueStorage)
+                    && collapseThisLvalue(falseValue, falseStorage)) && trueValue != nullptr
                 && falseValue != nullptr && trueValue->getType() == falseValue->getType()
                 && !trueValue->getType()->isPointerTy()
                 && trueStorage != nullptr && falseStorage != nullptr
@@ -6616,7 +6640,13 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
         // joins are excluded - their ownership analysis reads the value, not a joined slot.
         const bool scalarLvalueJoin = !cxxRecordJoin && trueValue != nullptr
             && (trueValue->getType()->isIntegerTy() || trueValue->getType()->isFloatingPointTy());
-        const bool valueLvalueJoin = collapseLvalueArms && trueValue != nullptr && falseValue != nullptr
+        const bool collapseSinkJoin = collapseLvalueSink && isOwningRecordValue(trueValue)
+            && isOwningRecordValue(falseValue)
+            && isAddressableLvalue(trueValue, trueStorage)
+            && isAddressableLvalue(falseValue, falseStorage)
+            && !trueTempField && !falseTempField;
+        const bool collapseStorageJoin = collapseLvalueArms || collapseSinkJoin;
+        const bool valueLvalueJoin = collapseStorageJoin && trueValue != nullptr && falseValue != nullptr
             && trueValue->getType() == falseValue->getType()
             && !trueValue->getType()->isPointerTy()
             && trueStorage != nullptr && falseStorage != nullptr
@@ -6630,7 +6660,7 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
             cxxStoragePhi->addIncoming(falseStorage, falseEnd);
             cxxLvalueStorageJoin = cxxStoragePhi;
         }
-        const bool collapsedLvalueJoin = collapseLvalueArms && cxxLvalueStorageJoin != nullptr;
+        const bool collapsedLvalueJoin = collapseStorageJoin && cxxLvalueStorageJoin != nullptr;
         if (compiler->currentFunctionReturnTV.IsAlias || trueAlias || falseAlias)
         {
             auto* storagePhi = compiler->builder->CreatePHI(
@@ -6718,6 +6748,7 @@ LLVMBackend::TypedValue MainListener::ParseConditionalExpression(
         DeclExpectedTypeGate declExpectedGate(&declExpectedType, ctx->children.size() == 1);
         auto* compiler = Compiler(ctx);
         bool collapseLvalueArms = false;
+        bool collapseLvalueSink = false;
         bool crossedCallArgument = false;
         for (auto* parent = ctx->parent; parent != nullptr; parent = parent->parent)
         {
@@ -6725,13 +6756,19 @@ LLVMBackend::TypedValue MainListener::ParseConditionalExpression(
                 || dynamic_cast<CFlatParser::ArgumentExpressionListContext*>(parent) != nullptr)
             {
                 crossedCallArgument = true;
-                break;
             }
             if (dynamic_cast<CFlatParser::InitializerContext*>(parent) != nullptr)
             {
                 collapseLvalueArms = !crossedCallArgument;
                 break;
             }
+            if (!crossedCallArgument)
+                if (auto* assignment = dynamic_cast<CFlatParser::AssignmentExpressionContext*>(parent);
+                    assignment != nullptr && assignment->assignmentOperator() != nullptr)
+                {
+                    collapseLvalueSink = true;
+                    break;
+                }
         }
         auto logicCtx = ctx->logicalOrExpression();
 
@@ -7045,7 +7082,7 @@ LLVMBackend::TypedValue MainListener::ParseConditionalExpression(
                 {
                     return ParseTernaryBranches(ctx, condTv, expressionTrueCtx, expressionFalseCtx,
                         use, outerExpected, cxxTernaryDeclDest, cxxTernaryDeclType,
-                        collapseLvalueArms);
+                        collapseLvalueArms, collapseLvalueSink);
                 }
 
                 // Eager fallback: BOTH arms execute unconditionally, so a deref only sound under
@@ -14406,7 +14443,14 @@ LLVMBackend::NamedVariable MainListener::ParseNewExpression(CFlatParser::NewExpr
             std::string why;
             const auto* ctor = compiler->SelectCxxConstructor(typeName, ctorArgTypes, why, false,
                                                              &ctorArgVars);
-            if (ctor == nullptr)
+            // A constructor template can outrank the listed pick: clang resolves it then.
+            std::string wrapperName;
+            std::string wrapperError;
+            const bool wrapped =
+                compiler->CxxConstructorNeedsClangResolution(typeName, ctor, ctorArgTypes)
+                && compiler->RequestCxxVariadicConstructor(typeName, ctorArgVars, wrapperName,
+                                                           wrapperError);
+            if (ctor == nullptr && !wrapped)
             {
                 LogErrorContext(ctx, std::format("C++ class '{}' {}", typeName, why));
                 return {};
@@ -14418,7 +14462,30 @@ LLVMBackend::NamedVariable MainListener::ParseNewExpression(CFlatParser::NewExpr
                     "'new': cannot compute the size of C++ class '{}'", typeName));
                 return {};
             }
-            compiler->EmitCxxStructorCall(typeName, *ctor, block, ctorArgs, &ctorArgVars);
+            // A throwing constructor frees the block (operator delete) and never destroys it.
+            LLVMBackend::UnwindPartialScope newBlockScope(*compiler);
+            compiler->NoteUnwindPartial(LLVMBackend::UnwindPartialEntry::Kind::CxxHeap, block,
+                                        typeName);
+            if (wrapped)
+            {
+                LLVMBackend::NamedVariable self;
+                self.Primary = block;
+                self.BaseType = block->getType();
+                self.TypeAndValue.TypeName = typeName;
+                self.TypeAndValue.Pointer = true;
+                self.IsRvalue = true;
+                std::vector<LLVMBackend::NamedVariable> wrapperArguments{ self };
+                // A positional argument keeps its source name; the wrapper would read it as named.
+                for (LLVMBackend::NamedVariable argVar : ctorArgVars)
+                {
+                    argVar.TypeAndValue.VariableName.clear();
+                    wrapperArguments.push_back(std::move(argVar));
+                }
+                compiler->CreateOverloadedFunctionCall(wrapperName, wrapperArguments);
+            }
+            else
+                compiler->EmitCxxStructorCall(typeName, *ctor, block, ctorArgs, &ctorArgVars);
+            newBlockScope.Release();
             LLVMBackend::NamedVariable result;
             result.TypeAndValue = LLVMBackend::TypeAndValue{ .TypeName = typeName, .Pointer = true };
             result.Primary = block;
@@ -14570,6 +14637,11 @@ LLVMBackend::NamedVariable MainListener::ParseNewExpression(CFlatParser::NewExpr
         // For non-array new of a class type: call constructor and store result
         if (!isArray && compiler->GetFunction(typeName))
         {
+            // An unwind out of the arguments or the constructor frees the global-new block.
+            LLVMBackend::UnwindPartialScope newBlockScope(*compiler);
+            if (!(!typeName.empty() && compiler->GetFunction(opNewName)))
+                compiler->NoteUnwindPartial(LLVMBackend::UnwindPartialEntry::Kind::CflatHeap,
+                                            typedPtr, typeName, useAligned ? allocAlign : 0);
             std::vector<LLVMBackend::NamedVariable> ctorArgs;
             auto argList = ctx->argumentExpressionList();
             if (argList != nullptr)
@@ -14598,6 +14670,7 @@ LLVMBackend::NamedVariable MainListener::ParseNewExpression(CFlatParser::NewExpr
                 }
             }
             llvm::Value* structVal = compiler->CreateOverloadedFunctionCall(typeName, ctorArgs);
+            newBlockScope.Release();
             // The constructed value is about to land in a HEAP block that outlives the statement.
             // No other escape site sees this store, so the ctor-launder leg is asked here.
             if (structVal)

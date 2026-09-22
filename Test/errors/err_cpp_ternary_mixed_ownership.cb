@@ -1,0 +1,21 @@
+struct TernaryOwnership
+{
+    int value = 0;
+    ~TernaryOwnership() { }
+    TernaryOwnership copy()
+    {
+        TernaryOwnership result = default;
+        result.value = value;
+        return move result;
+    }
+};
+
+expect_error("'?:' arms differ in ownership") {
+    extern int main()
+    {
+        TernaryOwnership borrowed = default;
+        TernaryOwnership target = default;
+        target = true ? borrowed : default;
+        return 0;
+    }
+}

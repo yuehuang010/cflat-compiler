@@ -4770,6 +4770,12 @@ void LLVMBackend::ResetForReanalysis()
     currentFunctionAbiRecipe = AbiRecipe{};
     pendingOwnedStringTemps.clear();
     pendingOwnedStructTemps.clear();
+    emittingUnwindCleanup_ = false;
+    unwindSkipSeqFloor_ = UINT64_MAX;
+    unwindInitFloors_.clear();
+    unwindPartial_.clear();
+    unwindCallConsumedTemps_.clear();
+    moveTransferConsumedTemps_.clear();
     pendingOwnedPtrTemps.clear();
     ownedReturnTemps_.clear();
     ownedReturnReleaseTemps_.clear();

@@ -1592,10 +1592,11 @@ void LLVMBackend::DiagnoseExplicitMoveToBorrowParam(const std::string& functionN
         bool paramIsSink = param.IsMove
             || param.IsRvalueRef
             || (!param.Pointer && !param.IsAlias && IsCoreUniqueType(param.TypeName))
-            // A foreign nontrivial C++ class taken BY VALUE is a real sink: the call site
-            // move-CONSTRUCTS the callee's caller-owned temp from the argument, so `move x`
-            // transfers exactly what C++ transfers.
-            || (!param.Pointer && IsForeignNontrivialCxxClass(param.TypeName))
+            // A foreign C++ class or holder taken by value gets a constructed parameter temp.
+            // Explicit `move x` transfers its fields with their C++ move constructors.
+            || (!param.Pointer && !param.IsAlias
+                && (IsForeignNontrivialCxxClass(param.TypeName)
+                    || HasForeignNontrivialCxxField(param.TypeName)))
             || foreignCxxPointerSink
             || inferredSinkConsumes
             || (OwningSinkConsumesConcrete(param) && IsOwningValueOrClosureType(param.TypeName));
@@ -1668,16 +1669,19 @@ void LLVMBackend::ApplyMoveParamTransfer(const std::string& functionName,
             // C++ class by-value transfer constructs a separate parameter object. The source
             // remains a live moved-from object, so never zero its storage like a CFlat sink.
             if (!params[i].Pointer && !params[i].IsAlias
-                && IsForeignNontrivialCxxClass(params[i].TypeName))
+                && (IsForeignNontrivialCxxClass(params[i].TypeName)
+                    || HasForeignNontrivialCxxField(params[i].TypeName)))
             {
                 if (!beforeCall && (params[i].IsMove || args[i].IsExplicitMove))
                 {
                     std::string movedName = args[i].CallerName.empty()
                         ? args[i].TypeAndValue.VariableName : args[i].CallerName;
-                    if (!movedName.empty() && args[i].FieldName.empty()
+                    if (IsForeignNontrivialCxxClass(params[i].TypeName)
+                        && !movedName.empty() && args[i].FieldName.empty()
                         && !args[i].IsElementAccess)
                         MarkVariableMoved(movedName);
-                    else if (!movedName.empty() && !args[i].FieldName.empty())
+                    else if (IsForeignNontrivialCxxClass(params[i].TypeName)
+                             && !movedName.empty() && !args[i].FieldName.empty())
                         MarkVariableFieldMoved(movedName, args[i].FieldName);
                 }
                 continue;
@@ -1840,6 +1844,10 @@ void LLVMBackend::ApplyMoveParamTransfer(const std::string& functionName,
                     }
                 }
 
+                // The pass after the call drops these from the temp lists; an unwind out of
+                // the call itself must already treat them as the callee's.
+                if (beforeCall && args[i].Primary != nullptr)
+                    moveTransferConsumedTemps_.push_back(args[i].Primary);
                 if (!beforeCall)
                 {
                     // A `move string` argument transfers ownership to the callee, which frees

@@ -80,6 +80,14 @@
 //     referent), in a base class, in a class template specialization, and in an array
 //     element. Reseating the field is refused;
 //     Test/errors/err_cpp_reference_member_reseat.cb pins the message.
+//   A C++ exception unwinding THROUGH CFlat frames up to a C++ catch: every destructor each
+//     frame owes (C++ locals and fields, CFlat ~T(), unique<T>, by-value argument temps,
+//     full-expression temps, drop-flagged locals, loop and nested-block locals, sink params)
+//     runs exactly once, and a local whose initializer throws is never destroyed.
+//   Throwing C++ constructors, copy/move assignment and operator new (bad_alloc) in such a
+//     frame; partial construction of a CFlat struct (built fields destroyed, the rest and the
+//     struct not), `new` freeing its block when the ctor throws, and string / closure / pointer
+//     temporaries released at the throw unless already handed to a sink parameter (3178-3198).
 // `import cpp` selects C++ mode; the extension is irrelevant (the fixture header is a plain
 // .h). The header supplies the declarations, the .cpp is compiled by the host C++ driver
 // and linked in. Both are needed: the header alone has no definitions, and the source alone
@@ -158,6 +166,320 @@ import cpp "string";
 import "list.cb";
 import "thread.cb";
 import "malloc_allocator.cb";
+import "unique.cb";
+// Instrumented counters for a C++ exception unwinding through CFlat frames. The .cpp replaces the
+// global operator new/delete with counting ones; heap_audit counts CFlat string/closure/`new` blocks.
+import cpp "library/cpp_interop_unwind.h";
+import cpp "library/cpp_interop_unwind.cpp";
+import "diagnostic/heap_audit.cb";
+
+// A C++ exception unwinding THROUGH CFlat frames (the C++ `guarded` catch sits above them): every
+// destructor each frame owes runs exactly once and the catch still sees the thrown value.
+int unwOwnDtors = 0;
+struct UnwOwn
+{
+    int v = 0;
+    ~UnwOwn() { unwOwnDtors = unwOwnDtors + 1; }
+};
+struct UnwHolder
+{
+    int v = 0;
+    cppunw.Tr t = default;
+};
+int UnwOneFrame(int x)
+{
+    cppunw.Tr t = default;
+    return cppunw.thrower(x);
+}
+int UnwInner(int x)
+{
+    cppunw.Tr b = cppunw.Tr(2);
+    return cppunw.thrower(x);
+}
+int UnwTwoFrames(int x)
+{
+    cppunw.Tr a = cppunw.Tr(1);
+    return UnwInner(x) + 1;
+}
+int UnwCflatOwning(int x)
+{
+    UnwOwn o = default;
+    o.v = x;
+    return cppunw.thrower(x);
+}
+int UnwUnique(int x)
+{
+    unique<UnwOwn> p = unique<UnwOwn>(new UnwOwn());
+    return cppunw.thrower(x);
+}
+int UnwCppField(int x)
+{
+    UnwHolder h = default;
+    return cppunw.thrower(x);
+}
+int UnwDeclAfter(int x)
+{
+    cppunw.Tr a = default;
+    int r = cppunw.thrower(x);
+    cppunw.Tr late = cppunw.Tr(9);
+    return r + late.get();
+}
+int UnwInnerExited(int x)
+{
+    {
+        cppunw.Tr a = default;
+    }
+    cppunw.Tr b = default;
+    return cppunw.thrower(x);
+}
+int UnwLoop(int x)
+{
+    int s = 0;
+    for (int i = 0; i < 4; i++)
+    {
+        cppunw.Tr t = cppunw.Tr(i);
+        if (i == 2) s = s + cppunw.thrower(x);
+    }
+    return s;
+}
+int UnwTakeByValue(cppunw.Tr t, int x)
+{
+    return cppunw.thrower(x) + t.get();
+}
+int UnwByValueParam(int x)
+{
+    cppunw.Tr a = cppunw.Tr(7);
+    return UnwTakeByValue(a, x);
+}
+int unwMoveNow = 1;
+int UnwMovedFlag(int x)
+{
+    cppunw.Tr a = cppunw.Tr(1);
+    if (unwMoveNow != 0) { _ = move a; }
+    return cppunw.thrower(x);
+}
+int UnwViaPtrTarget(int x)
+{
+    return cppunw.thrower(x);
+}
+int UnwFuncPtr(int x)
+{
+    cppunw.Tr a = default;
+    Lambda<int(int)> fp = UnwViaPtrTarget;
+    return fp(x);
+}
+[cpp] struct UnwRunner
+{
+    int k = 1;
+    int run(int x) { return cppunw.thrower(x) + k; }
+};
+int UnwCppStructMethod(int x)
+{
+    cppunw.Tr a = default;
+    UnwRunner rr = default;
+    return rr.run(x);
+}
+int UnwLambda(int x)
+{
+    cppunw.Tr a = default;
+    function<int(int)> f = (int v) => { return cppunw.thrower(v); };
+    return f(x);
+}
+int UnwContinue(int x)
+{
+    cppunw.Tr t = cppunw.Tr(3);
+    return cppunw.thrower(x) + t.get();
+}
+UnwOwn UnwMakeOwn(int x)
+{
+    UnwOwn o = default;
+    o.v = cppunw.thrower(x);
+    return o;
+}
+int UnwInitThrowsCpp(int x)
+{
+    cppunw.Tr a = default;
+    cppunw.Tr b = cppunw.Tr(cppunw.thrower(x));
+    return b.get();
+}
+int UnwInitThrowsCflat(int x)
+{
+    cppunw.Tr a = default;
+    UnwOwn o = UnwMakeOwn(x);
+    return o.v;
+}
+int UnwUse(cppunw.Tr t, int v)
+{
+    return t.get() + v;
+}
+int UnwTempArg(int x)
+{
+    cppunw.Tr a = default;
+    return UnwUse(cppunw.Tr(7), cppunw.thrower(x));
+}
+int UnwSink(move UnwOwn* p, int x)
+{
+    cppunw.Tr t = default;
+    return cppunw.thrower(x) + p->v;
+}
+int UnwMoveSink(int x)
+{
+    cppunw.Tr a = default;
+    UnwOwn* p = new UnwOwn();
+    return UnwSink(move p, x);
+}
+
+// Throwing C++ constructors / assignments / operator new, and statement temporaries, in a frame an
+// exception unwinds through (legs 3178-3198). cppunw.Tx throws from the special member setArm(n)
+// selects; everything already constructed must be destroyed exactly once, nothing else touched.
+struct UnwTx2 { cppunw.Tx f1 = default; cppunw.Tx f2 = default; };
+struct UnwTxInit { cppunw.Tx f1 = default; cppunw.Tx f2 = cppunw.Tx(5); };
+struct UnwTxInner { cppunw.Tx f = default; };
+struct UnwTxOuter { UnwTxInner i = default; cppunw.Tx g = default; };
+struct UnwTxCtor { int v = 0; cppunw.Tx f1 = default; UnwTxCtor(int x) { v = cppunw.thrower(x); } };
+struct UnwCtorThrows { int v = 0; UnwCtorThrows(int x) { v = cppunw.thrower(x); } };
+struct UnwPlain { int v = 0; };
+int UnwCtorLocal(int x)
+{
+    cppunw.Tr a = default;
+    cppunw.Tx b = cppunw.Tx(x);
+    return b.get();
+}
+int UnwDefaultCtorLocal(int x)
+{
+    cppunw.Tr a = default;
+    cppunw.setArm(1);
+    cppunw.Tx b = default;
+    return b.get();
+}
+int UnwCopyCtorLocal(int x)
+{
+    cppunw.Tx a = cppunw.Tx(0);
+    cppunw.setArm(1);
+    cppunw.Tx b = a;
+    return b.get();
+}
+int UnwFieldCtor(int x)
+{
+    cppunw.Tr a = default;
+    cppunw.setArm(2);
+    UnwTx2 h = default;
+    return h.f1.get();
+}
+int UnwCopyAssign(int x)
+{
+    cppunw.Tx a = cppunw.Tx(0);
+    cppunw.Tx b = cppunw.Tx(-3);
+    cppunw.setArm(1);
+    a = b;
+    return a.get();
+}
+int UnwMoveAssign(int x)
+{
+    cppunw.Tx a = cppunw.Tx(0);
+    cppunw.Tx b = cppunw.Tx(-3);
+    cppunw.setArm(1);
+    a = move b;
+    return a.get();
+}
+int UnwUseTx(cppunw.Tx t, int v) { return t.get() + v; }
+int UnwByValueCopy(int x)
+{
+    cppunw.Tx a = cppunw.Tx(0);
+    cppunw.setArm(1);
+    return UnwUseTx(a, x);
+}
+int UnwStructCopy(int x)
+{
+    UnwTx2 h = default;
+    cppunw.setArm(2);
+    UnwTx2 g = h;
+    return g.f1.get();
+}
+int UnwCtorBody(int x)
+{
+    cppunw.Tr a = default;
+    UnwTxCtor s = UnwTxCtor(x);
+    return s.v;
+}
+int UnwFieldInitArgs(int x)
+{
+    cppunw.Tr a = default;
+    UnwTxInit u = default;
+    return u.f1.get();
+}
+int UnwNestedField(int x)
+{
+    cppunw.setArm(2);
+    UnwTxOuter o = default;
+    return o.g.get();
+}
+int UnwBracePartial(int x)
+{
+    cppunw.setArm(2);
+    UnwTx2 u = { f1 = cppunw.Tx(0) };
+    return u.f1.get();
+}
+int UnwNewCtor(int x)
+{
+    cppunw.Tr a = default;
+    cppunw.Tx* p = new cppunw.Tx(x);
+    int v = p->get();
+    delete p;
+    return v;
+}
+int UnwNewCtorAlone(int x)
+{
+    cppunw.Tx* p = new cppunw.Tx(x);
+    int v = p->get();
+    delete p;
+    return v;
+}
+int UnwNewBadAlloc(int x)
+{
+    cppunw.Tr a = default;
+    cppunw.failNew(1);
+    cppunw.Tx* p = new cppunw.Tx(0);
+    int v = p->get();
+    delete p;
+    return v;
+}
+int UnwCflatNewCtor(int x)
+{
+    UnwCtorThrows* q = new UnwCtorThrows(x);
+    int v = q->v;
+    delete q;
+    return v;
+}
+string unwSa = "abc";
+string unwSb = "defgh";
+int UnwStrUse(string s, int x) { return cppunw.thrower(x) + s.length(); }
+int UnwStrSink(move string s, int x) { return cppunw.thrower(x) + s.length(); }
+int UnwStrTwo(move string s, string t, int x) { return cppunw.thrower(x) + s.length() + t.length(); }
+int UnwFnUse(Lambda<int(int)> f, int x) { return cppunw.thrower(x) + f(1); }
+move UnwPlain* UnwMakePlain() { UnwPlain* p = new UnwPlain(); return p; }
+move string UnwMakeStr() { string s = unwSa + unwSb; return s; }
+int UnwStrTemp(int x)
+{
+    cppunw.Tr a = default;
+    return UnwStrUse(unwSa + unwSb, x);
+}
+int UnwStrTempAlone(int x) { return UnwStrUse(unwSa + unwSb, x); }
+int UnwClosureTemp(int x)
+{
+    int kq = 3;
+    return UnwFnUse((int v) => { return v + kq; }, x);
+}
+int UnwSinkTemp(int x) { return UnwStrSink(unwSa + unwSb, x); }
+int UnwSinkAndLiveTemp(int x)
+{
+    cppunw.Tr a = default;
+    return UnwStrTwo(unwSa + unwSb, unwSb + unwSa, x);
+}
+int UnwTempLaterArg(int x) { return UnwStrUse(unwSa + unwSb, cppunw.thrower(x)); }
+int UnwPtrTemp(int x) { return (UnwMakePlain() != nullptr ? 1 : 0) + cppunw.thrower(x); }
+int UnwOwnedRetTemp(int x) { return UnwMakeStr().length() + cppunw.thrower(x); }
+int UnwTempAfterCall(int x) { return UnwStrUse(unwSa + unwSb, -1) + cppunw.thrower(x); }
 
 // Pre-fix the C++ scoped enum initializer was rejected as non-constant at file scope. This value
 // leg also proves the folded global retains its enum type when passed to an enum-typed parameter.
@@ -2946,6 +3268,173 @@ extern int main()
     {
         // A function PARAMETER is an lvalue inside the callee.
         if (RefKindProbeThroughParam(5) != 66) return 3149;
+    }
+    {
+        // ---- C++ exception unwinding THROUGH CFlat frames ------------------------------------
+        // Each leg lets cppunw.thrower's `throw 5` cross CFlat frames up to the C++ catch in
+        // cppunw.guarded, which returns -5. live == 0 proves every owed destructor ran; the exact
+        // destructor count proves none ran twice or on an object never constructed.
+        cppunw.reset();
+        int r = cppunw.guarded(UnwOneFrame, 5);
+        if (r != -5 || cppunw.live() != 0 || cppunw.dtors() != 1) return 3160;
+        cppunw.reset();
+        r = cppunw.guarded(UnwTwoFrames, 5);   // both frames' locals
+        if (r != -5 || cppunw.live() != 0 || cppunw.dtors() != 2) return 3161;
+        unwOwnDtors = 0;
+        r = cppunw.guarded(UnwCflatOwning, 5); // a CFlat struct with its own ~T()
+        if (r != -5 || unwOwnDtors != 1) return 3162;
+        unwOwnDtors = 0;
+        r = cppunw.guarded(UnwUnique, 5);      // unique<T> frees its pointee
+        if (r != -5 || unwOwnDtors != 1) return 3163;
+        cppunw.reset();
+        r = cppunw.guarded(UnwCppField, 5);    // a CFlat struct holding a C++ field
+        if (r != -5 || cppunw.live() != 0 || cppunw.dtors() != 1) return 3164;
+        cppunw.reset();
+        r = cppunw.guarded(UnwDeclAfter, 5);   // 'late' is declared after the throw: untouched
+        if (r != -5 || cppunw.live() != 0 || cppunw.dtors() != 1) return 3165;
+        cppunw.reset();
+        r = cppunw.guarded(UnwInnerExited, 5); // the exited inner block's local is not re-run
+        if (r != -5 || cppunw.live() != 0 || cppunw.dtors() != 2) return 3166;
+        cppunw.reset();
+        r = cppunw.guarded(UnwLoop, 5);        // two finished iterations + the throwing one
+        if (r != -5 || cppunw.live() != 0 || cppunw.dtors() != 3) return 3167;
+        cppunw.reset();
+        r = cppunw.guarded(UnwByValueParam, 5); // the caller-owned by-value argument temp
+        if (r != -5 || cppunw.live() != 0 || cppunw.dtors() != 2) return 3168;
+        // The drop flag decides: released before the throw (flag clear, no second destructor)
+        // and still live at the throw (the pad destroys it). One code for both paths.
+        cppunw.reset();
+        unwMoveNow = 1;
+        r = cppunw.guarded(UnwMovedFlag, 5);
+        bool releasedOk = r == -5 && cppunw.live() == 0 && cppunw.dtors() == 1;
+        cppunw.reset();
+        unwMoveNow = 0;
+        r = cppunw.guarded(UnwMovedFlag, 5);
+        if (!releasedOk || r != -5 || cppunw.live() != 0 || cppunw.dtors() != 1) return 3169;
+        cppunw.reset();
+        r = cppunw.guarded(UnwFuncPtr, 5);     // thrower reached through a CFlat function value
+        if (r != -5 || cppunw.live() != 0 || cppunw.dtors() != 1) return 3170;
+        cppunw.reset();
+        r = cppunw.guarded(UnwCppStructMethod, 5);
+        if (r != -5 || cppunw.live() != 0 || cppunw.dtors() != 1) return 3171;
+        cppunw.reset();
+        r = cppunw.guarded(UnwLambda, 5);
+        if (r != -5 || cppunw.live() != 0 || cppunw.dtors() != 1) return 3172;
+        // After the catch the caller runs on normally: a second, non-throwing call and a fresh
+        // local behave as usual.
+        cppunw.reset();
+        int r1 = cppunw.guarded(UnwContinue, 5);
+        int r2 = cppunw.guarded(UnwContinue, -1);
+        cppunw.Tr after = cppunw.Tr(4);
+        if (r1 != -5 || r2 != 2 || after.get() + r2 != 6
+            || cppunw.live() != 1 || cppunw.dtors() != 2) return 3173;
+        // The local whose INITIALIZER throws was never constructed, so only 'a' is destroyed.
+        cppunw.reset();
+        r = cppunw.guarded(UnwInitThrowsCpp, 5);
+        if (r != -5 || cppunw.live() != 0 || cppunw.dtors() != 1) return 3174;
+        cppunw.reset();
+        unwOwnDtors = 0;
+        r = cppunw.guarded(UnwInitThrowsCflat, 5);
+        if (r != -5 || cppunw.live() != 0 || cppunw.dtors() != 1 || unwOwnDtors != 1) return 3175;
+        // A full-expression temporary already built when a later argument throws.
+        cppunw.reset();
+        r = cppunw.guarded(UnwTempArg, 5);
+        if (r != -5 || cppunw.live() != 0 || cppunw.dtors() != 2) return 3176;
+        // A pointer moved into a sink parameter: the callee's frame frees it, the caller's not.
+        cppunw.reset();
+        unwOwnDtors = 0;
+        r = cppunw.guarded(UnwMoveSink, 5);
+        if (r != -5 || cppunw.live() != 0 || cppunw.dtors() != 2 || unwOwnDtors != 1) return 3177;
+        // A throwing C++ CONSTRUCTOR / ASSIGNMENT: the frame's earlier objects are destroyed, the
+        // object being initialized is not (it was never constructed).
+        cppunw.reset();
+        r = cppunw.guarded(UnwCtorLocal, 5);
+        bool ctorLocalOk = r == -5 && cppunw.live() == 0 && cppunw.dtors() == 1;
+        cppunw.reset();
+        r = cppunw.guarded(UnwDefaultCtorLocal, 5);
+        if (!ctorLocalOk || r != -5 || cppunw.live() != 0 || cppunw.dtors() != 1) return 3178;
+        cppunw.reset();
+        r = cppunw.guarded(UnwCopyCtorLocal, 5);
+        if (r != -5 || cppunw.live() != 0 || cppunw.dtors() != 1) return 3179;
+        cppunw.reset();
+        r = cppunw.guarded(UnwCopyAssign, 5);  // both operands stay alive and are destroyed
+        if (r != -5 || cppunw.live() != 0 || cppunw.dtors() != 2) return 3180;
+        cppunw.reset();
+        r = cppunw.guarded(UnwMoveAssign, 5);
+        if (r != -5 || cppunw.live() != 0 || cppunw.dtors() != 2) return 3181;
+        cppunw.reset();
+        r = cppunw.guarded(UnwByValueCopy, 5); // the by-value parameter's copy constructor throws
+        if (r != -5 || cppunw.live() != 0 || cppunw.dtors() != 1) return 3182;
+        // PARTIAL construction of a CFlat struct: field 1 built, field 2 throws. Field 1 is
+        // destroyed, field 2 and the struct itself are not.
+        cppunw.reset();
+        r = cppunw.guarded(UnwFieldCtor, 5);   // 'a' + h.f1
+        if (r != -5 || cppunw.live() != 0 || cppunw.dtors() != 2) return 3183;
+        cppunw.reset();
+        r = cppunw.guarded(UnwFieldInitArgs, 5); // field 2 is `= cppunw.Tx(5)`
+        if (r != -5 || cppunw.live() != 0 || cppunw.dtors() != 2) return 3184;
+        cppunw.reset();
+        r = cppunw.guarded(UnwNestedField, 5); // a finished nested struct field, then a throw
+        if (r != -5 || cppunw.live() != 0 || cppunw.dtors() != 1) return 3185;
+        cppunw.reset();
+        r = cppunw.guarded(UnwBracePartial, 5); // brace list gives f1, f2's default ctor throws
+        if (r != -5 || cppunw.live() != 0 || cppunw.dtors() != 1) return 3186;
+        cppunw.reset();
+        r = cppunw.guarded(UnwStructCopy, 5);  // synthesized copy: g.f1 copied, g.f2 throws
+        if (r != -5 || cppunw.live() != 0 || cppunw.dtors() != 3) return 3187;
+        cppunw.reset();
+        r = cppunw.guarded(UnwCtorBody, 5);    // a CFlat ctor BODY throws after its C++ field
+        if (r != -5 || cppunw.live() != 0 || cppunw.dtors() != 2) return 3188;
+        // `new T(args)`: a throwing constructor frees the block (never destroys it); a throwing
+        // operator new leaves nothing to free.
+        cppunw.reset();
+        r = cppunw.guarded(UnwNewCtor, 5);
+        if (r != -5 || cppunw.live() != 0 || cppunw.dtors() != 1
+            || cppunw.news() != 1 || cppunw.deletes() != 1) return 3189;
+        cppunw.reset();
+        r = cppunw.guarded(UnwNewCtorAlone, 5); // no other cleanup in the frame
+        if (r != -5 || cppunw.live() != 0 || cppunw.dtors() != 0
+            || cppunw.news() != 1 || cppunw.deletes() != 1) return 3190;
+        cppunw.reset();
+        r = cppunw.guardedAlloc(UnwNewBadAlloc, 5); // std::bad_alloc, caught as -100
+        if (r != -100 || cppunw.live() != 0 || cppunw.dtors() != 1 || cppunw.news() != 0)
+            return 3191;
+        // Statement TEMPORARIES still owned at the throw are released; one already handed to a
+        // sink parameter belongs to the callee (a second free would abort here).
+        HeapAudit.enable();
+        int heapBase = (int)HeapAudit.reportLeaks(); // re-read before each leg below
+        r = cppunw.guarded(UnwCflatNewCtor, 5); // CFlat `new` whose CFlat ctor throws
+        if (r != -5 || (int)HeapAudit.reportLeaks() != heapBase) return 3192;
+        cppunw.reset();
+        heapBase = (int)HeapAudit.reportLeaks();
+        r = cppunw.guarded(UnwStrTemp, 5);
+        bool strTempOk = r == -5 && cppunw.live() == 0 && (int)HeapAudit.reportLeaks() == heapBase;
+        heapBase = (int)HeapAudit.reportLeaks();
+        r = cppunw.guarded(UnwStrTempAlone, 5);
+        if (!strTempOk || r != -5 || (int)HeapAudit.reportLeaks() != heapBase) return 3193;
+        heapBase = (int)HeapAudit.reportLeaks();
+        r = cppunw.guarded(UnwClosureTemp, 5);
+        if (r != -5 || (int)HeapAudit.reportLeaks() != heapBase) return 3194;
+        heapBase = (int)HeapAudit.reportLeaks();
+        r = cppunw.guarded(UnwSinkTemp, 5);
+        bool sinkOk = r == -5 && (int)HeapAudit.reportLeaks() == heapBase;
+        cppunw.reset();
+        heapBase = (int)HeapAudit.reportLeaks();
+        r = cppunw.guarded(UnwSinkAndLiveTemp, 5); // first consumed by the sink, second live
+        if (!sinkOk || r != -5 || cppunw.live() != 0 || (int)HeapAudit.reportLeaks() != heapBase)
+            return 3195;
+        heapBase = (int)HeapAudit.reportLeaks();
+        r = cppunw.guarded(UnwTempLaterArg, 5);  // a later argument throws
+        if (r != -5 || (int)HeapAudit.reportLeaks() != heapBase) return 3196;
+        heapBase = (int)HeapAudit.reportLeaks();
+        r = cppunw.guarded(UnwPtrTemp, 5);       // an owning-pointer result used as an operand
+        bool ptrTempOk = r == -5 && (int)HeapAudit.reportLeaks() == heapBase;
+        heapBase = (int)HeapAudit.reportLeaks();
+        r = cppunw.guarded(UnwOwnedRetTemp, 5);  // an owning-string result used as a receiver
+        if (!ptrTempOk || r != -5 || (int)HeapAudit.reportLeaks() != heapBase) return 3197;
+        heapBase = (int)HeapAudit.reportLeaks();
+        r = cppunw.guarded(UnwTempAfterCall, 5); // its call returned; a later call throws
+        if (r != -5 || (int)HeapAudit.reportLeaks() != heapBase) return 3198;
     }
     return 0;
 }

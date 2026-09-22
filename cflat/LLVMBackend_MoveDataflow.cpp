@@ -386,7 +386,7 @@ bool LLVMBackend::StoreWritesInterfaceLoc(const llvm::StoreInst* st, const llvm:
 const llvm::Constant* LLVMBackend::NullIfaceStoredConstant(const llvm::Value* v)
 {
         if (const auto* c = llvm::dyn_cast<llvm::Constant>(v)) return c;
-        const auto* call = llvm::dyn_cast<llvm::CallInst>(v);
+        const auto* call = llvm::dyn_cast<llvm::CallBase>(v);
         if (call == nullptr) return nullptr;
         const llvm::Function* callee = call->getCalledFunction();
         if (callee == nullptr || callee->isDeclaration()) return nullptr;
@@ -1126,7 +1126,7 @@ LLVMBackend::StructData LLVMBackend::GetDataStructure(llvm::StructType* structTy
         return {};
     }
 
-void LLVMBackend::ApplyAbiCallAttributes(llvm::CallInst* ci, const AbiRecipe& recipe)
+void LLVMBackend::ApplyAbiCallAttributes(llvm::CallBase* ci, const AbiRecipe& recipe)
 {
         unsigned attrIdx = 0;
         if (recipe.retSlot.kind == AbiSlot::SRetReturn)
@@ -1162,7 +1162,8 @@ llvm::Value* LLVMBackend::EmitAbiLoweredCall(const FunctionSymbol& candidate, st
                                             llvm::Value* sretDest,
                                             const std::vector<llvm::Value*>* indirectArgAddrs,
                                             llvm::Value* calleeOverride,
-                                            const std::vector<llvm::Value*>* rawArrayCounts)
+                                            const std::vector<llvm::Value*>* rawArrayCounts,
+                                            bool mayUnwind)
 {
         const AbiRecipe& recipe = candidate.Recipe;
         std::vector<llvm::Value*> loweredArgs;
@@ -1249,9 +1250,8 @@ llvm::Value* LLVMBackend::EmitAbiLoweredCall(const FunctionSymbol& candidate, st
 
         // A virtual member is reached through the pointer loaded out of the receiver's vptr; the
         // SIGNATURE still comes from the declaration, which carries clang's own arrangement.
-        auto* ci = calleeOverride != nullptr
-            ? builder->CreateCall(candidate.Function->getFunctionType(), calleeOverride, loweredArgs)
-            : builder->CreateCall(candidate.Function, loweredArgs);
+        auto* ci = CreateCallOrInvoke(candidate.Function->getFunctionType(),
+            calleeOverride != nullptr ? calleeOverride : candidate.Function, loweredArgs, mayUnwind);
         ci->setCallingConv(candidate.Function->getCallingConv());
         ApplyAbiCallAttributes(ci, recipe);
 
@@ -1331,7 +1331,8 @@ void LLVMBackend::StoreCoerceAt(llvm::Value* structSlot, llvm::Value* val, uint6
         builder->CreateStore(val, cp);
     }
 
-llvm::Value* LLVMBackend::CreateFunctionCall(llvm::Function* func, const std::vector<llvm::Value*>& arg)
+llvm::Value* LLVMBackend::CreateFunctionCall(llvm::Function* func, const std::vector<llvm::Value*>& arg,
+                                            bool mayUnwind)
 {
         // Perform Default Argument Promotions for Variadic arguments
         std::vector<llvm::Value*> callArgs;
@@ -1377,7 +1378,7 @@ llvm::Value* LLVMBackend::CreateFunctionCall(llvm::Function* func, const std::ve
                 callArgs.push_back(Upconvert(arg[i], func->getArg(i)));
         }
 
-        auto* ci = builder->CreateCall(func, callArgs);
+        auto* ci = CreateCallOrInvoke(func->getFunctionType(), func, callArgs, mayUnwind);
         ci->setCallingConv(func->getCallingConv());
         return ci;
     }

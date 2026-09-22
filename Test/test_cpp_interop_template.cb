@@ -147,6 +147,12 @@
 //     a value/reference pair breaks on the argument rather than on declaration order, and
 //     Test/errors/err_cpp_template_no_match.cb pins the three refusals (const removed, a
 //     different pointee, and a constness-keyed partial specialization of differing layout).
+//   Constructor TEMPLATES reach `T(args)` through clang's overload resolution: a class whose
+//     only constructor is a template (temporary receiver, C++ argument conversion), a
+//     requires-constrained and an enable_if template beating or losing to a non-template, an
+//     explicit template (direct call only; Test/errors/err_cpp_explicit_template_ctor.cb pins
+//     the implicit refusal), `new` of a nontrivial class, and the libc++ complex / chrono /
+//     filesystem::path / tuple constructors (2540-2559).
 
 import cpp "library/cpp_interop_basic.h";
 import cpp "library/cpp_interop_basic.cpp";
@@ -176,6 +182,8 @@ import cpp "cstdio";
 import cpp "map";
 import cpp "deque";
 import cpp "atomic";
+import cpp "complex";
+import cpp "filesystem";
 import cpp "library/cpp_interop_scoped_enum.h";
 import cpp "library/cpp_interop_nsstd.h";
 import cpp "library/cpp_interop_strop.h";
@@ -183,6 +191,8 @@ import cpp "library/cpp_interop_strop.h";
 // includes a standard header, so no single group can declare both halves on its own.
 import cpp "library/cpp_interop_nest.h";
 import cpp "library/cpp_interop_nest2.h";
+// Constructor TEMPLATES on user classes (section 2540-2559).
+import cpp "library/cpp_interop_tmplctor.h";
 
 // Pre-fix this unscoped C++ enum initializer was rejected as non-constant at file scope. The
 // value leg below also proves the folded global retains its enum type at an enum-typed call.
@@ -2912,6 +2922,63 @@ extern int main()
         if (nest.RprRankHolder.static_int(rprIntPtr) != 13)                 return 2512;
         if (nest.RprRankHolder.static_int(rprIntPtrPtr) != 14)              return 2513;
         if (rprHolder->member_cell_const(rprCellPtr) != 16)                return 2514;
+    }
+
+    // ---- constructor templates (2540-2559) ------------------------------------------------
+    // SelectCxxConstructor ranks only LISTED constructors; a template's specializations are
+    // never listed. Pre-fix a listed non-template won through a narrowing conversion, a
+    // template-only class was not a constructor class at all. Legs marked "control" passed
+    // on master too; they pin the listed-pick and already-working shapes.
+    {
+        long ctorLong = 5;
+        short ctorShort = 3;
+        double ctorDbl = 1.5;
+        // Pre-fix: Req(short) picked by narrowing (how 22). C++ picks the exact template.
+        cppctor.Req ctorReq = cppctor.Req(ctorLong);
+        if (ctorReq.v != 105 || ctorReq.how != 2)                           return 2540;
+        // Control: the non-template exact match is kept (listed pick, no clang round trip).
+        cppctor.Req ctorReqS = cppctor.Req(ctorShort);
+        if (ctorReqS.v != 3 || ctorReqS.how != 22)                          return 2541;
+        // Pre-fix: Mixed(int) by narrowing (how 44); the template is the exact match.
+        cppctor.Mixed ctorMixL = cppctor.Mixed(ctorLong);
+        if (ctorMixL.v != 5 || ctorMixL.how != 4)                           return 2542;
+        // Control: a non-template exact match beats the template (C++ rule).
+        if (cppctor.Mixed(9).how != 44)                                     return 2543;
+        // Pre-fix: a template-only class resolved `T(21)` as a C++ free function, so the
+        // temporary could not be a receiver ("'v' is not a member of namespace").
+        if (cppctor.Plain(21).v != 42 || cppctor.Plain(ctorDbl).how != 1)  return 2544;
+        if (cppctor.Expl(3).v != 10)                                        return 2545;
+        // Pre-fix: the implicit conversion probe skipped a class with listed constructors.
+        if (cppctor.take_plain(21) != 42)                                   return 2546;
+        if (cppctor.take_enab(ctorDbl) != 153)                              return 2547;
+        // Pre-fix: `new` picked Heavy(short) by narrowing (how 77); the template is exact.
+        cppctor.Heavy* ctorHeavy = new cppctor.Heavy(ctorLong);
+        if (ctorHeavy->v != 15 || ctorHeavy->how != 7)                     return 2548;
+        if (cppctor.Heavy.live() != 1)                                      return 2549;
+        delete ctorHeavy;
+        if (cppctor.Heavy.live() != 0)                                      return 2550;
+        // Control: a variadic template already used the wrapper.
+        cppctor.Vari ctorVari = cppctor.Vari(1, 2, 3);
+        if (ctorVari.v != 6 || ctorVari.how != 6)                           return 2551;
+        // libc++. Pre-fix path(std::string lvalue) hard-rejected the listed rvalue overload
+        // before the template path(const Source&) was tried.
+        std.string ctorPathStr = std.string("a/b.txt");
+        std.filesystem.path ctorPath = std.filesystem.path(ctorPathStr);
+        if ((int)ctorPath.filename().string().size() != 5)                  return 2552;
+        // Controls: the remaining filed repros (literal path, complex, chrono, tuple) already
+        // ran on master. std.get<1> is left out: see
+        // internal/issue/cppinterop/nttp-function-template-wrapper-collision.md.
+        std.filesystem.path ctorPathLit = std.filesystem.path("dir/x.cb");
+        if ((int)ctorPathLit.filename().string().size() != 4)               return 2553;
+        double ctorRe = 1.0;
+        double ctorIm = 2.0;
+        std.complex<double> ctorC = std.complex<double>(ctorRe, ctorIm);
+        if (ctorC.real() != 1.0 || ctorC.imag() != 2.0)                     return 2554;
+        long long ctorMsN = 42;
+        std.chrono.milliseconds ctorMs = std.chrono.milliseconds(ctorMsN);
+        if (ctorMs.count() != 42)                                           return 2555;
+        std.tuple<int, int> ctorTup = std.tuple<int, int>(7, 8);
+        if (std.get<0>(ctorTup) != 7)                                       return 2556;
     }
 
     return 0;
