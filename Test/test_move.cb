@@ -12708,17 +12708,17 @@ int testAddressOfBorrowDeleteAccepts()
         stackRes.id = 11;
         Resource* p = new Resource();
         p->id = 21;
-        p = &stackRes;          // p now borrows the stack local (would leak the first Resource)
+        p = &stackRes;          // releases the first Resource; p now borrows the stack local
         p = new Resource();     // rebind to a fresh owner retires the borrow proof
         p->id = 31;
         passed += Test("addr_of_retired_by_new_value", p->id, 31);
         delete p;
-        // Only the explicitly deleted heap Resource has been freed so far; the leaked first
-        // allocation is never destructed and `stackRes` outlives this point.
-        passed += Test("addr_of_retired_by_new_freed_once", dtorCount, 1);
+        // The first Resource (released at `p = &stackRes`) and the deleted one have been freed;
+        // `stackRes` outlives this point.
+        passed += Test("addr_of_retired_by_new_freed_once", dtorCount, 2);
     }
     // Scope exit destructs the stack local, and nothing double-frees the deleted heap object.
-    passed += Test("addr_of_retired_stack_local_destructed", dtorCount, 2);
+    passed += Test("addr_of_retired_stack_local_destructed", dtorCount, 3);
 
     // A `move` parameter OWNS, so deleting through it stays legal - the rejection must not
     // reach a binding whose value came from a transfer rather than an `&`.

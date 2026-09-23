@@ -1638,11 +1638,11 @@ public:
         // Runtime array state for a local pointer/view binding. -1 means scalar/unknown; values
         // >= 0 are raw-array element counts, including the distinct zero-length case.
         llvm::Value* RawArrayLengthStorage = nullptr;
-        // Runtime "this view local owns its block" (i1), seeded at declaration end; while active,
-        // scope exit and EmitOwnedViewRelease free only when set (never a borrowed/fixed block).
-        llvm::AllocaInst* ViewOwnFlag = nullptr;
-        llvm::StoreInst* ViewOwnFlagInit = nullptr;
-        bool ViewOwnFlagActive = false;
+        // Runtime "this pointer/view local owns its block" (i1), seeded at declaration end; while
+        // active, scope exit and EmitOwnedPtrRelease free only when set (never a borrowed block).
+        llvm::AllocaInst* OwnFlag = nullptr;
+        llvm::StoreInst* OwnFlagInit = nullptr;
+        bool OwnFlagActive = false;
         // Same question for an `alias`-BORROW local root (`Box k = w.get(); move k.item;`): answered
         // where the root binding is RESOLVED, since a downstream name lookup cannot see a shadow.
         bool RootIsAliasBorrowLocal = false;
@@ -2804,6 +2804,31 @@ private:
         size_t Column = 0;
     };
     std::vector<OwningLocalBorrowingHelperArg> owningLocalBorrowingHelperArgs_;
+
+    // One per reassignment release site: an entry-block i1 stored false (no release), patched
+    // true after the walk when no alias-leaving use of the slot can reach the site.
+    struct OwnReleaseGate
+    {
+        llvm::WeakVH Slot;
+        llvm::WeakVH Init;
+        llvm::WeakVH Site;
+    };
+    std::vector<OwnReleaseGate> ownReleaseGates_;
+    // One per adoption of a block from another local slot (`b = a`, `b = move a`): an entry-block
+    // i1 stored false (the adopter does not own), patched true after the walk when no alias of the
+    // source slot (or of a slot the source itself adopted from) can reach the transferring load.
+    struct OwnAdoptGate
+    {
+        llvm::WeakVH Source;
+        llvm::WeakVH Dest;
+        llvm::WeakVH Init;
+        llvm::WeakVH Site;
+    };
+    std::vector<OwnAdoptGate> ownAdoptGates_;
+    // Loads of an owning slot whose value LEAVES the slot (release, delete, move, transfer):
+    // they free or null the old block, so they never leave an alias behind. Weak handles, so an
+    // erased load's reused address is never mistaken for one.
+    std::vector<llvm::WeakVH> ownSlotLeavingLoads_;
 
     // Depth counter, not a bool: '?:' arms can nest (a ? (b ? c : d) : e), so a plain flag would
     // clear early on the inner ternary's exit. Non-zero while lowering either arm of a '?:' in the
@@ -4043,15 +4068,34 @@ private:
                                  const std::string& typeName,
                                  llvm::Value* rawArrayCount = nullptr);
 
-    void EmitOwningPtrCleanup(const NamedVariable& namedVar, llvm::Value* replacement = nullptr);
-    // Reassignment of an owning array-view local: release the old block (element destructors
-    // over the old count, paired free) unless it is null, equal to `replacement`, or not owned.
-    void EmitOwnedViewRelease(const NamedVariable& namedVar, llvm::Value* replacement);
-    // Seeds the declared view local's runtime ownership flag from its final IsOwning.
-    void ActivateViewOwnFlag(const std::string& varName);
-    // A view local stored into a field no longer owns its block alone: it is never released at
-    // reassignment, and scope exit (refcount-gated) keeps its pre-existing behaviour.
-    void ClearViewOwnFlag(const std::string& varName);
+    // `releaseGate` (i1, optional) additionally skips the cleanup when it is false.
+    void EmitOwningPtrCleanup(const NamedVariable& namedVar, llvm::Value* replacement = nullptr,
+                              llvm::Value* releaseGate = nullptr);
+    // Reassignment of an owning pointer / array-view local: release the old block (destructors,
+    // paired free) unless it is null, equal to `replacement`, or not owned (runtime flag).
+    // `rhsOwnerSlot`: the owning local a borrowed replacement aliases; `rhsBorrowedParam`: the
+    // replacement is (a borrow of) a borrowed parameter - neither is ever adopted from its owner.
+    void EmitOwnedPtrRelease(const NamedVariable& namedVar, llvm::Value* replacement,
+                             llvm::Value* rhsOwnerSlot = nullptr, bool rhsBorrowedParam = false);
+    // `to` is reached exactly when `from` is (a release diamond rejoined): same-block facts
+    // recorded in `from` (rebind, borrow, explicit null...) carry over to `to`.
+    void RetargetStraightLineBlockFacts(llvm::BasicBlock* from, llvm::BasicBlock* to);
+    // Records a load of an owning slot whose value leaves it (see ownSlotLeavingLoads_).
+    void NoteOwnSlotLeavingLoad(const llvm::Value* load);
+    // `nv` just adopted `stored` (runtime flag set true): when `stored` is the value loaded out
+    // of another local slot, the flag instead takes an adoption gate resolved after the walk.
+    void GateOwnFlagAdoption(const NamedVariable& nv, llvm::Value* stored);
+    // After the walk: a gate becomes true when no alias-leaving use of its slot reaches it.
+    void ResolveOwnedReleaseGates();
+    // The uses of `slot` after which a copy of the block it holds may live on elsewhere.
+    std::vector<const llvm::Instruction*> OwnedSlotAliasPoints(
+        const llvm::AllocaInst* slot, const std::unordered_set<const llvm::Value*>& leavingLoads);
+    bool OwnedSlotLoadEscapes(const llvm::LoadInst* root, const llvm::AllocaInst* slot);
+    // Seeds the declared pointer/view local's runtime ownership flag from its final IsOwning.
+    void ActivateOwnFlag(const std::string& varName);
+    // A pointer/view local stored into a field no longer owns its block alone: it is never
+    // released at reassignment, and scope exit (refcount-gated) keeps its pre-existing behaviour.
+    void ClearOwnFlag(const std::string& varName);
     NamedVariable* FindStackVariableByStorage(const llvm::Value* storage);
 
     // Null-safe reverse-order element destruction shared by scope cleanup and `delete[n]`.

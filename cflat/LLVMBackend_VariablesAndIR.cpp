@@ -481,12 +481,13 @@ llvm::Value* LLVMBackend::CreateLocalVariable(const TypeAndValue& typeValue, llv
                 AllocaAtEntry(builder->getInt64Ty(), nullptr,
                               typeValue.VariableName + ".raw_array_count");
             builder->CreateStore(builder->getInt64(-1), namedVariable.RawArrayLengthStorage);
-            if (typeValue.IsArrayView)
+            // `unique T*` keeps its own compile-time ownership and drop-old; it never holds `&x`.
+            if (typeValue.IsArrayView || !typeValue.IsUnique)
             {
-                namedVariable.ViewOwnFlag = AllocaAtEntry(
+                namedVariable.OwnFlag = AllocaAtEntry(
                     builder->getInt1Ty(), nullptr, typeValue.VariableName + ".owns");
-                namedVariable.ViewOwnFlagInit =
-                    builder->CreateStore(builder->getInt1(false), namedVariable.ViewOwnFlag);
+                namedVariable.OwnFlagInit =
+                    builder->CreateStore(builder->getInt1(false), namedVariable.OwnFlag);
             }
         }
         RecordMoveGenBind(typeValue.VariableName); // fresh local binding

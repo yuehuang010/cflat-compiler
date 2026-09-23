@@ -187,6 +187,16 @@
 //   Character literals keep their C++ identity through free operators, member calls,
 //     constructors and class-template deduction. `L`, `u` and `U` spell wchar, char16_t and
 //     char32_t; numeric literals and native overloads keep their measured behavior (3450-3459).
+//   A plain T* local carries the same runtime owns-flag as a view (3430-3449): reassignment
+//     releases the old object (CFlat struct, C++ class with its class operator delete, primitive),
+//     a conditionally taken new never frees a stack address, `p = &x` releases then borrows, and
+//     a reassignment an alias of the old block can reach (a local borrow, a field store, a
+//     retaining call) releases nothing - for plain pointers and views alike.
+//   A block adopted from another local slot (`b = a`, `b = move a`) is never freed while an alias
+//     of that source slot taken before the transfer may still read it; it leaks instead
+//     (3460-3462). An aliased owner reassigned to a borrowed pointer disowns (3463).
+//     A borrow whose owner no longer holds the block (swap through a temporary, moved owner)
+//     is never adopted; the block leaks (3464-3465).
 
 import cpp "library/cpp_interop_basic.h";
 import cpp "library/cpp_interop_basic.cpp";
@@ -819,6 +829,27 @@ int VrUnwind(int x)
     cppunw.Tr t = cppunw.Tr(x);
     v = new cppon.Plain[2];
     return v[0].get() + cppunw.thrower(x);
+}
+// Plain T* local reassignment (legs 3430-3449). RpS counts CFlat destructors.
+int rpDtors = 0;
+struct RpS { int v = 7; ~RpS() { rpDtors = rpDtors + 1; } };
+struct RpH { RpS* ptr = nullptr; };
+move RpS* RpMake(int v) { RpS* s = new RpS(); s.v = v; return s; }
+int RpParam(RpS* a, RpS* b) { a = b; return a.v; }
+int RpEarly(int k)
+{
+    RpS* p = new RpS();
+    p = new RpS();
+    if (k > 0) return p.v;
+    p = new RpS();
+    return p.v + 1;
+}
+int RpUnwind(int x)
+{
+    RpS* p = new RpS();
+    cppunw.Tr t = cppunw.Tr(x);
+    p = new RpS();
+    return p.v + cppunw.thrower(x);
 }
 int fnptr_add_one(int x) { return x + 1; }
 int apply_fnptr(function<int(int)> f, int x) { return f(x); }
@@ -4647,5 +4678,187 @@ extern int main()
 
     if (cppsop.typeCodeOf(L'x') != 14 || cppsop.typeCodeOf(u'x') != 13
         || cppsop.typeCodeOf(U'x') != 17) return 3459;
+
+    // ---- A plain T* local releases the object it owned on reassignment (3430-3449) ----------
+    // Pre-fix owner-ness was a walk-order compile-time bit: the old object leaked (every `mid`
+    // below read 0), and a pointer that borrowed on the path taken freed that address at exit.
+    {
+        int heapBase = (int)HeapAudit.reportLeaks();
+        rpDtors = 0;
+        int mid = 0;
+        int got = 0;
+        { RpS* p = new RpS(); p = new RpS(); mid = rpDtors; }
+        if (mid != 1 || rpDtors != 2 || (int)HeapAudit.reportLeaks() != heapBase) return 3430;
+        // A C++ class with class-scope operator new / delete: the old object goes through it.
+        cppon.reset();
+        { cppon.Cls* p = new cppon.Cls(1); p = new cppon.Cls(2); mid = cppon.clsDel(); got = p->get(); }
+        if (mid != 1 || got != 2 || cppon.clsDel() != 2 || cppon.dtors() != 2 || cppon.live() != 0)
+            return 3431;
+        // Conditional owner, branch NOT taken: scope exit must not free the stack local's address
+        // (pre-fix SIGABRT), for a CFlat struct and a C++ class.
+        rpDtors = 0;
+        { RpS x; RpS* q = &x; if (vrZero > 0) q = new RpS(); got = q.v; mid = rpDtors; }
+        if (got != 7 || mid != 0 || rpDtors != 1 || (int)HeapAudit.reportLeaks() != heapBase)
+            return 3432;
+        cppon.reset();
+        { cppon.Cls x = cppon.Cls(3); cppon.Cls* q = &x; if (vrZero > 0) q = new cppon.Cls(4);
+          got = q->get(); }
+        if (got != 3 || cppon.dtors() != 1 || cppon.clsDel() != 0 || cppon.live() != 0) return 3433;
+        // Conditional owner, branch taken, then reassigned: the taken block is released.
+        rpDtors = 0;
+        { RpS x; RpS* q = &x; if (vrZero == 0) q = new RpS(); q = new RpS(); mid = rpDtors; }
+        if (mid != 1 || rpDtors != 3 || (int)HeapAudit.reportLeaks() != heapBase) return 3434;
+        // `p = &x` after p owned: the old object goes, then p borrows (pre-fix: freed &x, SIGABRT).
+        rpDtors = 0;
+        { RpS x; x.v = 5; RpS* p = new RpS(); p = &x; mid = rpDtors; got = p.v; }
+        if (mid != 1 || got != 5 || rpDtors != 2 || (int)HeapAudit.reportLeaks() != heapBase)
+            return 3435;
+        cppon.reset();
+        { cppon.Cls x = cppon.Cls(3); cppon.Cls* p = new cppon.Cls(1); p = &x; mid = cppon.clsDel(); }
+        if (mid != 1 || cppon.dtors() != 2 || cppon.live() != 0) return 3436;
+        // `p = move q` and `p = q` (an owning q is moved by the plain store): p's old object goes,
+        // p frees q's object exactly once.
+        rpDtors = 0;
+        bool qNull = false;
+        { RpS* p = new RpS(); RpS* q = new RpS(); q.v = 9; p = move q; mid = rpDtors; qNull = q == nullptr;
+          got = p.v; }
+        if (mid != 1 || !qNull || got != 9 || rpDtors != 2 || (int)HeapAudit.reportLeaks() != heapBase)
+            return 3437;
+        rpDtors = 0;
+        { RpS* p = new RpS(); RpS* q = new RpS(); q.v = 9; p = q; mid = rpDtors; got = p.v; }
+        if (mid != 1 || got != 9 || rpDtors != 2 || (int)HeapAudit.reportLeaks() != heapBase)
+            return 3438;
+        // Accept-set, passes on both binaries: `delete p; p = new` and `p = nullptr` after a
+        // delete release nothing twice.
+        heapBase = (int)HeapAudit.reportLeaks();
+        rpDtors = 0;
+        { RpS* p = new RpS(); delete p; p = new RpS(); mid = rpDtors; RpS* d = new RpS(); delete d;
+          d = nullptr; }
+        if (mid != 1 || rpDtors != 3 || (int)HeapAudit.reportLeaks() != heapBase) return 3439;
+        // A loop, break, early return, a move-returning call and `p = nullptr`.
+        rpDtors = 0;
+        { RpS* p = new RpS(); for (int i = 0; i < 4; i++) p = new RpS(); mid = rpDtors; }
+        if (mid != 4 || rpDtors != 5 || (int)HeapAudit.reportLeaks() != heapBase) return 3440;
+        rpDtors = 0;
+        { RpS* p = new RpS(); for (int i = 0; i < 5; i++) { p = new RpS(); if (i == 2) break; }
+          mid = rpDtors; }
+        if (mid != 3 || rpDtors != 4 || (int)HeapAudit.reportLeaks() != heapBase) return 3441;
+        rpDtors = 0;
+        got = RpEarly(1) + RpEarly(0);
+        if (got != 15 || rpDtors != 5 || (int)HeapAudit.reportLeaks() != heapBase) return 3442;
+        rpDtors = 0;
+        { RpS* p = RpMake(1); p = RpMake(2); mid = rpDtors; got = p.v; RpS* n = new RpS(); n = nullptr; }
+        if (mid != 1 || got != 2 || rpDtors != 3 || (int)HeapAudit.reportLeaks() != heapBase)
+            return 3443;
+        // A C++ exception after the reassignment: the old object was released, the new one is
+        // freed by the unwind cleanup.
+        rpDtors = 0;
+        if (cppunw.guarded(RpUnwind, 5) != -5 || rpDtors != 2
+            || (int)HeapAudit.reportLeaks() != heapBase) return 3444;
+        // A primitive pointee is freed too.
+        { int* ip = new int(3); ip = new int(4); got = *ip; }
+        if (got != 4 || (int)HeapAudit.reportLeaks() != heapBase) return 3445;
+
+        // Accept-set, passes on both binaries: a borrowed parameter never releases, and a local
+        // borrow of the old object keeps it alive (the release is withheld when an alias of the
+        // old block can reach the reassignment): `first` stays readable and deletable, a swap
+        // through a temporary keeps both objects. A release there would be a use-after-free.
+        heapBase = (int)HeapAudit.reportLeaks();
+        rpDtors = 0;
+        {
+            RpS* a = new RpS();
+            RpS* b = new RpS();
+            b.v = 9;
+            got = RpParam(a, b);
+            RpS* p = new RpS();
+            p.v = 5;
+            RpS* first = p;
+            p = new RpS();
+            got = got + first.v;
+            delete first;
+            RpS* s = new RpS();
+            RpS* t = new RpS();
+            s.v = 1;
+            t.v = 2;
+            RpS* tmp = s;
+            s = t;
+            t = tmp;
+            got = got * 100 + s.v * 10 + t.v;
+            mid = rpDtors;
+        }
+        // The swap orphans s's first object (release withheld under tmp): it leaks, never adopted.
+        if (got != 1421 || mid != 1 || rpDtors != 5 || (int)HeapAudit.reportLeaks() != heapBase + 1)
+            return 3446;
+        heapBase = (int)HeapAudit.reportLeaks();
+        // A pointer stored into a struct field is shared: the reassignment releases nothing and
+        // the field keeps reading the old object, which leaks as the pre-existing field-escape
+        // leak (+1); scope exit frees the new one. Pre-fix neither was freed (+2).
+        rpDtors = 0;
+        {
+            RpH h;
+            RpS* p = new RpS();
+            p.v = 11;
+            h.ptr = p;
+            p = new RpS();
+            got = h.ptr.v;
+            mid = rpDtors;
+        }
+        if (got != 11 || mid != 0 || rpDtors != 1 || (int)HeapAudit.reportLeaks() != heapBase + 1)
+            return 3447;
+        heapBase = (int)HeapAudit.reportLeaks();
+        // The same alias rule for an array view: a local borrow of the old block withholds the
+        // release (pre-fix the view freed it under `t` - a use-after-free read; now it leaks, +1).
+        vrDtors = 0;
+        { VrS[] v = new VrS[3]; v[0].v = 5; VrS[] t = v; v = new VrS[2]; got = t[0].v; mid = vrDtors; }
+        if (got != 5 || mid != 0 || vrDtors != 2 || (int)HeapAudit.reportLeaks() != heapBase + 1)
+            return 3448;
+
+        // ---- An adopted block answers to aliases of the slot it came from (3460-3469) ----------
+        // `kp` borrows a's block before `b = a` / `b = move a` hands it to b: b's later
+        // reassignment or scope exit must not free it under kp (pre-fix: freed, use-after-free
+        // read). The block leaks (+1) instead. Chained `q = p = new` is out of scope here.
+        heapBase = (int)HeapAudit.reportLeaks();
+        rpDtors = 0;
+        { RpS* a = new RpS(); a.v = 5; RpS* kp = a; RpS* b = nullptr; b = a; b = new RpS();
+          mid = rpDtors; got = kp.v; }
+        if (mid != 0 || got != 5 || rpDtors != 1 || (int)HeapAudit.reportLeaks() != heapBase + 1)
+            return 3460;
+        heapBase = (int)HeapAudit.reportLeaks();
+        rpDtors = 0;
+        { RpS* a = new RpS(); a.v = 5; RpS* kp = a; { RpS* b = nullptr; b = a; } mid = rpDtors;
+          got = kp.v; }
+        if (mid != 0 || got != 5 || rpDtors != 0 || (int)HeapAudit.reportLeaks() != heapBase + 1)
+            return 3461;
+        heapBase = (int)HeapAudit.reportLeaks();
+        rpDtors = 0;
+        { RpS* a = new RpS(); a.v = 5; RpS* kp = a; RpS* b = new RpS(); b = move a; b = new RpS();
+          mid = rpDtors; got = kp.v; }
+        if (mid != 1 || got != 5 || rpDtors != 2 || (int)HeapAudit.reportLeaks() != heapBase + 1)
+            return 3462;
+        // An aliased owner reassigned to a BORROWED heap pointer gives up ownership: scope exit
+        // frees a's block once (through a) and leaks p's first block (+1); pre-fix p kept its
+        // owns-flag and freed a's block a second time.
+        heapBase = (int)HeapAudit.reportLeaks();
+        rpDtors = 0;
+        { RpS* a = new RpS(); a.v = 5; RpS* b = a; RpS* p = new RpS(); RpS* c = p; p = b;
+          mid = rpDtors; got = c.v + p.v; }
+        if (mid != 0 || got != 12 || rpDtors != 1 || (int)HeapAudit.reportLeaks() != heapBase + 1)
+            return 3463;
+        // A borrow whose owner no longer holds the block is never adopted: after a swap through
+        // `tmp` (3464) or a move of the owner (3465) the block may still be read through the
+        // borrow or freed by its new holder, so it leaks (+1) (pre-fix: freed under tmp / b).
+        heapBase = (int)HeapAudit.reportLeaks();
+        rpDtors = 0;
+        { RpS* s = new RpS(); s.v = 5; RpS* t = new RpS(); t.v = 6; RpS* tmp = s; s = t; t = tmp;
+          t = new RpS(); mid = rpDtors; got = tmp.v; }
+        if (mid != 0 || got != 5 || rpDtors != 2 || (int)HeapAudit.reportLeaks() != heapBase + 1)
+            return 3464;
+        heapBase = (int)HeapAudit.reportLeaks();
+        rpDtors = 0;
+        { RpS* q = new RpS(); q.v = 5; RpS* c = q; RpS* b = move q; RpS* p = new RpS(); p = c;
+          p = new RpS(); mid = rpDtors; got = b.v; }
+        if (mid != 1 || got != 5 || rpDtors != 2 || (int)HeapAudit.reportLeaks() != heapBase + 1)
+            return 3465;
+    }
     return 0;
 }

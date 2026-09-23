@@ -2302,6 +2302,8 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
             SettledInterfaceInstancesScope settled(this);
             ResolveOwningLocalBorrowingHelperArgs();
             ResolveTempUniqueFieldArgEscapes();
+            // Callee bodies are complete, so ParameterRetainsArgument can answer the alias scan.
+            ResolveOwnedReleaseGates();
 
             // The RETURN half of the same deferral: the escape SITE, not the callee question.
             // After the store half, matching the eager order within a statement.
@@ -4447,6 +4449,9 @@ bool LLVMBackend::Analyze(const std::string& filePath,
             // bodies of deferred delete-site destructor wrappers (recursive containers whose
             // element type was incomplete when the container dtor was emitted).
             EmitDeferredFullDestructorBodies();
+            // Same post-walk gate resolution as Compile, so IR dumps show the real releases.
+            NoCurrentFunctionScope noCurrent(this);
+            ResolveOwnedReleaseGates();
         }
         ResolveMaterializedInterfaceUses();
         stream.close();
@@ -4468,6 +4473,9 @@ bool LLVMBackend::LastOptimizedViewWasIncremental() const
 void LLVMBackend::ResetForReanalysis()
 {
     EndActiveRoot();
+    ownReleaseGates_.clear();
+    ownAdoptGates_.clear();
+    ownSlotLeavingLoads_.clear();
     analyzeDebugInfo_ = false;
     isolatedPolicy_.reset();
     // Core hashes are per-analysis so LSP notices edits; batch mode keeps one process-wide hash.
@@ -7046,6 +7054,13 @@ bool LLVMBackend::CompileCoreOnly(const std::string& platform)
     // thunks, but cannot repair invalid IR that was already serialized.
     if (!deferredIfaceRebox_.empty())
         LogError("cannot save core bitcode with deferred interface rebox thunks");
+    {
+        // Core bodies are complete: resolve the release / adoption gates the walk left false. A
+        // release that survives needs its deferred destructor wrapper defined in the bitcode.
+        NoCurrentFunctionScope noCurrent(this);
+        EmitDeferredFullDestructorBodies();
+        ResolveOwnedReleaseGates();
+    }
     return true;
 }
 

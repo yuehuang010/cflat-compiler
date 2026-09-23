@@ -5136,12 +5136,16 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                 // The declaration path verifies the initializer against the declared clause; this
                 // is the same check for the reassignment door, before the re-derive below.
                 RejectLocalAllocAlignMismatch(namedVar, rightNV, right, ctx);
-                // Reassigning an owning view local releases the block it held, before the count
-                // below is re-derived. '??=' only stores into a null view, so it has nothing to free.
-                if (namedVar.TypeAndValue.IsArrayView && coalesceResume == nullptr && right != nullptr
+                // Reassigning an owning pointer/view local releases the block it held, before the
+                // count below is re-derived. '??=' only stores into null, so it has nothing to free.
+                if (coalesceResume == nullptr && right != nullptr
                     && llvm::isa<llvm::AllocaInst>(namedVar.Storage))
                     if (auto* viewLocal = compiler->FindStackVariableByStorage(namedVar.Storage))
-                        compiler->EmitOwnedViewRelease(*viewLocal, right);
+                        compiler->EmitOwnedPtrRelease(
+                            *viewLocal, right,
+                            rightNV.BorrowsOwningLocal ? rightNV.OwningLocalStorage : nullptr,
+                            rightNV.IsBorrowed && !rightNV.IsOwning && !rightNV.BorrowsOwningLocal
+                                && !rightNV.TypeAndValue.IsMove);
                 auto* asgNewArr = assignCtx ? AsDirectNew(assignCtx) : nullptr;
                 const bool rhsIsWholeRawArrayBinding = rightNV.FieldName.empty()
                     && rightNV.OwningStructName.empty() && !rightNV.IsElementAccess
@@ -5311,12 +5315,15 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                     compiler->AttachViewNoalias(st, namedVar.TypeAndValue.NoaliasScopeId);
             // Skip when the unique-field store above already consumed the source: it did the
             // transfer explicitly, and re-running here would take the aliasing refcount path.
+            bool storeNulledSource = false;
             if (operatorText == "=" && !consumedUniqueFieldSource)
-                TransferPointerOwnershipOnStore(
+                storeNulledSource = TransferPointerOwnershipOnStore(
                     rightNV, destination, namedVar.TypeAndValue.IsInterface, ctx);
             // A plain pointer local adopts an owned new/move/call result at assignment, just as
             // declaration-init does. Borrowed named-pointer stores never reach this gate.
-            if (operatorText == "=" && assignmentAdoptsOwnedSource
+            // `p = q` from an owning pointer local nulled q above, so p is now the owner.
+            if (operatorText == "="
+                && (assignmentAdoptsOwnedSource || (storeNulledSource && rightNV.FieldName.empty()))
                 && !destinationHadBorrowProvenance
                 && namedVar.TypeAndValue.Pointer && !namedVar.TypeAndValue.IsUnique
                 && namedVar.FieldName.empty() && !namedVar.CallerName.empty()
@@ -5325,6 +5332,9 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
             {
                 compiler->SetVariableOwning(namedVar.CallerName, true);
                 compiler->ConsumeOwnedNewTemp(rightNV.Primary);
+                // Adopting from another local slot answers to that slot's aliases (leak if any).
+                if (auto* adopter = compiler->FindStackVariableByStorage(destination))
+                    compiler->GateOwnFlagAdoption(*adopter, right);
             }
             // Transfer ownership for move string: null _ptr so string.dtor is a no-op
             // after the value has been moved to persistent storage (e.g. list::add).
@@ -15598,6 +15608,7 @@ LLVMBackend::NamedVariable MainListener::ParseDeleteExpression(CFlatParser::Dele
             if (namedVar.Storage)
             {
                 ptrVal = compiler->CreateLoad(namedVar.Storage);
+                compiler->NoteOwnSlotLeavingLoad(ptrVal);   // `delete p` frees what it read
                 if (llvm::isa<llvm::AllocaInst>(namedVar.Storage))
                 {
                     srcAlloca = namedVar.Storage;
@@ -16597,7 +16608,10 @@ LLVMBackend::NamedVariable MainListener::ParseMoveExpression(CFlatParser::MoveEx
 
         // Null the source (field GEP or local alloca) to transfer ownership.
         if (auto* ptrTy = llvm::dyn_cast<llvm::PointerType>(ptrVal->getType()))
+        {
             compiler->builder->CreateStore(llvm::ConstantPointerNull::get(ptrTy), argNV.Storage);
+            compiler->NoteOwnSlotLeavingLoad(ptrVal);
+        }
         if (moveSourceIsWholeBinding)
             compiler->StoreRawArrayLength(argNV, nullptr);
 

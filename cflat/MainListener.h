@@ -4780,9 +4780,9 @@ public:
      * field-store paths - `=` in ParseAssignmentExpression and brace-init / `<Tag attr=...>` sugar
      * via EmitOneFieldInit - so a pointer stored through either spelling is freed exactly once.
      * `destination` is the slot actually stored to; `destIsInterface` drives the moved-into-interface
-     * flag.
+     * flag. Returns true when the owning source slot was nulled (ownership left it).
      */
-    void TransferPointerOwnershipOnStore(
+    bool TransferPointerOwnershipOnStore(
         const LLVMBackend::NamedVariable& rightNV,
         llvm::Value* destination,
         bool destIsInterface,

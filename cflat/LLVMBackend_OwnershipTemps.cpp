@@ -1,5 +1,6 @@
 #pragma warning(push)
 #pragma warning(disable: 4244 4267)
+#include <llvm/IR/CFG.h>
 #include <llvm/IR/IRBuilder.h>
 #include <llvm/IR/LLVMContext.h>
 #include <llvm/IR/Module.h>
@@ -1077,9 +1078,9 @@ void LLVMBackend::SetVariableOwning(const std::string& varName, bool value)
             if (it != frame.namedVariable.end())
             {
                 it->second.IsOwning = value;
-                // Keep an active view flag in step at the program point of the ownership event.
-                auto* flag = it->second.ViewOwnFlag;
-                if (it->second.ViewOwnFlagActive && flag != nullptr && IsInsertBlockLive()
+                // Keep an active ownership flag in step at the program point of the ownership event.
+                auto* flag = it->second.OwnFlag;
+                if (it->second.OwnFlagActive && flag != nullptr && IsInsertBlockLive()
                     && flag->getFunction() == builder->GetInsertBlock()->getParent())
                     builder->CreateStore(builder->getInt1(value), flag);
                 return;
@@ -1087,15 +1088,50 @@ void LLVMBackend::SetVariableOwning(const std::string& varName, bool value)
         }
     }
 
-void LLVMBackend::ActivateViewOwnFlag(const std::string& varName)
+void LLVMBackend::ActivateOwnFlag(const std::string& varName)
 {
         if (varName.empty() || stackNamedVariable.empty()) return;
         auto& frame = stackNamedVariable.back().namedVariable;
         auto it = frame.find(varName);
-        if (it == frame.end() || it->second.ViewOwnFlagInit == nullptr) return;
-        it->second.ViewOwnFlagInit->setOperand(0, builder->getInt1(it->second.IsOwning));
-        it->second.ViewOwnFlagInit = nullptr;
-        it->second.ViewOwnFlagActive = true;
+        if (it == frame.end() || it->second.OwnFlagInit == nullptr) return;
+        it->second.OwnFlagInit->setOperand(0, builder->getInt1(it->second.IsOwning));
+        it->second.OwnFlagInit = nullptr;
+        it->second.OwnFlagActive = true;
+        // `T* b = move a;` adopted a's block: the adoption answers to a's aliases too.
+        auto* slot = llvm::dyn_cast_or_null<llvm::AllocaInst>(it->second.Storage);
+        if (!it->second.IsOwning || slot == nullptr || !IsInsertBlockLive()) return;
+        llvm::StoreInst* last = nullptr;
+        for (llvm::User* u : slot->users())
+            if (auto* st = llvm::dyn_cast<llvm::StoreInst>(u))
+                if (st->getPointerOperand() == slot && st->getParent() == builder->GetInsertBlock()
+                    && (last == nullptr || last->comesBefore(st)))
+                    last = st;
+        if (last != nullptr) GateOwnFlagAdoption(it->second, last->getValueOperand());
+    }
+
+void LLVMBackend::GateOwnFlagAdoption(const NamedVariable& nv, llvm::Value* stored)
+{
+        if (!nv.OwnFlagActive || nv.OwnFlag == nullptr || stored == nullptr || !IsInsertBlockLive()
+            || nv.OwnFlag->getFunction() != builder->GetInsertBlock()->getParent()) return;
+        auto* dest = llvm::dyn_cast_or_null<llvm::AllocaInst>(nv.Storage);
+        auto* ld = llvm::dyn_cast<llvm::LoadInst>(stored->stripPointerCasts());
+        if (dest == nullptr || ld == nullptr || !ld->getType()->isPointerTy()) return;
+        auto* src = llvm::dyn_cast<llvm::AllocaInst>(ld->getPointerOperand());
+        if (src == nullptr || src == dest || src->getFunction() != dest->getFunction()) return;
+        // Stored false at entry (adopter does not own: leak, never free) until the post-walk
+        // scan proves no alias of the source slot reaches the transferring load.
+        auto* gateSlot = AllocaAtEntry(builder->getInt1Ty(), nullptr,
+                                       nv.TypeAndValue.VariableName + ".adopt");
+        llvm::StoreInst* init = nullptr;
+        {
+            llvm::IRBuilderBase::InsertPointGuard guard(*builder);
+            builder->SetInsertPoint(gateSlot->getParent(), std::next(gateSlot->getIterator()));
+            init = builder->CreateStore(builder->getInt1(false), gateSlot);
+        }
+        NoteOwnSlotLeavingLoad(ld);
+        ownAdoptGates_.push_back({ src, dest, init, ld });
+        builder->CreateStore(builder->CreateLoad(builder->getInt1Ty(), gateSlot, "own.adopt"),
+                             nv.OwnFlag);
     }
 
 LLVMBackend::NamedVariable* LLVMBackend::FindStackVariableByStorage(const llvm::Value* storage)
@@ -1107,21 +1143,68 @@ LLVMBackend::NamedVariable* LLVMBackend::FindStackVariableByStorage(const llvm::
         return nullptr;
     }
 
-void LLVMBackend::EmitOwnedViewRelease(const NamedVariable& namedVar, llvm::Value* replacement)
+void LLVMBackend::EmitOwnedPtrRelease(const NamedVariable& namedVar, llvm::Value* replacement,
+                                      llvm::Value* rhsOwnerSlot, bool rhsBorrowedParam)
 {
-        if (!namedVar.ViewOwnFlagActive || namedVar.ViewOwnFlag == nullptr || replacement == nullptr
+        if (!namedVar.OwnFlagActive || namedVar.OwnFlag == nullptr || replacement == nullptr
             || !replacement->getType()->isPointerTy() || !IsInsertBlockLive()
-            || namedVar.ViewOwnFlag->getFunction() != builder->GetInsertBlock()->getParent()) return;
-        // Re-storing the block the view already holds keeps its ownership; any other value is
+            || namedVar.OwnFlag->getFunction() != builder->GetInsertBlock()->getParent()) return;
+        auto* slot = llvm::dyn_cast<llvm::AllocaInst>(namedVar.Storage);
+        if (slot == nullptr) return;
+        // An opaque / void pointee was never allocated by `new`, so the local can never own it.
+        if (!namedVar.TypeAndValue.ElemPointer)
+        {
+            TypeAndValue pointee{ .TypeName = namedVar.TypeAndValue.TypeName };
+            llvm::Type* t = namedVar.TypeAndValue.TypeName.empty() ? nullptr : GetType(pointee);
+            if (t == nullptr || !t->isSized()) return;
+        }
+        // Stored false at entry (no release) until the post-walk alias scan proves it safe.
+        auto* gateSlot = AllocaAtEntry(builder->getInt1Ty(), nullptr,
+                                       namedVar.TypeAndValue.VariableName + ".release");
+        llvm::StoreInst* init = nullptr;
+        {
+            llvm::IRBuilderBase::InsertPointGuard guard(*builder);   // also keeps the !dbg location
+            builder->SetInsertPoint(gateSlot->getParent(), std::next(gateSlot->getIterator()));
+            init = builder->CreateStore(builder->getInt1(false), gateSlot);
+        }
+        // Re-storing the block the local already holds keeps its ownership; any other value is
         // unowned until SetVariableOwning(true) adopts it later in this statement.
-        auto* old = builder->CreateLoad(namedVar.BaseType, namedVar.Storage, "view.old");
-        auto* same = builder->CreateICmpEQ(old, replacement, "view.same");
-        auto* owned = builder->CreateLoad(builder->getInt1Ty(), namedVar.ViewOwnFlag, "view.owned");
-        // A field escape already cleared the flag (ClearViewOwnFlag), so an escaped block is never
+        auto* old = builder->CreateLoad(namedVar.BaseType, namedVar.Storage, "own.old");
+        ownReleaseGates_.push_back({ slot, init, old });
+        auto* same = builder->CreateICmpEQ(old, replacement, "own.same");
+        auto* owned = builder->CreateLoad(builder->getInt1Ty(), namedVar.OwnFlag, "own.owned");
+        auto* gate = builder->CreateLoad(builder->getInt1Ty(), gateSlot, "own.gate");
+        // A field escape already cleared the flag (ClearOwnFlag), so an escaped block is never
         // released here; the replacement block starts a fresh field-escape count of one holder.
-        EmitOwningPtrCleanup(namedVar, replacement);
-        builder->CreateStore(builder->CreateSelect(same, owned, builder->getInt1(false)),
-                             namedVar.ViewOwnFlag);
+        auto* preBlock = builder->GetInsertBlock();
+        EmitOwningPtrCleanup(namedVar, replacement, gate);
+        RetargetStraightLineBlockFacts(preBlock, builder->GetInsertBlock());
+        // An aliased old block is neither released nor disowned (the pre-existing scope-exit
+        // behaviour), except that a provable stack address or null is never owned.
+        const bool rhsNotHeap = llvm::isa<llvm::ConstantPointerNull>(replacement)
+            || IsProvableNonHeapAddress(replacement) || rhsBorrowedParam;
+        llvm::Value* aliasedFlag = rhsNotHeap ? builder->getInt1(false) : static_cast<llvm::Value*>(owned);
+        llvm::Value* next = builder->CreateSelect(gate, builder->getInt1(false), aliasedFlag);
+        // A borrow of an owning local: disown while that owner still holds (and owns) the block;
+        // otherwise the round-1 rule (never adopt a block that may be moved or still aliased).
+        const NamedVariable* owner = rhsOwnerSlot != nullptr && !rhsNotHeap
+            ? FindStackVariableByStorage(rhsOwnerSlot) : nullptr;
+        if (owner != nullptr && owner->Storage != namedVar.Storage && owner->BaseType != nullptr
+            && owner->BaseType->isPointerTy()
+            && llvm::isa<llvm::AllocaInst>(owner->Storage)
+            && llvm::cast<llvm::AllocaInst>(owner->Storage)->getFunction()
+                == builder->GetInsertBlock()->getParent())
+        {
+            auto* held = builder->CreateICmpEQ(
+                builder->CreateLoad(owner->BaseType, owner->Storage, "own.src"), replacement);
+            if (owner->OwnFlagActive && owner->OwnFlag != nullptr)
+                held = builder->CreateAnd(
+                    held, builder->CreateLoad(builder->getInt1Ty(), owner->OwnFlag, "own.srcowns"));
+            else if (!owner->IsOwning)
+                held = builder->getInt1(false);
+            next = builder->CreateSelect(held, builder->getInt1(false), next);
+        }
+        builder->CreateStore(builder->CreateSelect(same, owned, next), namedVar.OwnFlag);
         if (namedVar.RefCountStorage != nullptr)
         {
             auto* count = builder->CreateLoad(builder->getInt32Ty(), namedVar.RefCountStorage);
@@ -1130,14 +1213,222 @@ void LLVMBackend::EmitOwnedViewRelease(const NamedVariable& namedVar, llvm::Valu
         }
     }
 
-void LLVMBackend::ClearViewOwnFlag(const std::string& varName)
+void LLVMBackend::RetargetStraightLineBlockFacts(llvm::BasicBlock* from, llvm::BasicBlock* to)
+{
+        if (from == nullptr || to == nullptr || from == to) return;
+        auto retarget = [&](NamedVariable& nv)
+        {
+            for (llvm::BasicBlock** b : { &nv.OwnedStringBorrowBlock, &nv.DeclarationBlock,
+                                          &nv.ReboundBlock, &nv.ExplicitNullBlock, &nv.BondDeclBlock,
+                                          &nv.AliasBorrowDeclBlock, &nv.AssignBorrowBlock,
+                                          &nv.OwnedElementBorrowBlock })
+                if (*b == from) *b = to;
+        };
+        for (auto& frame : stackNamedVariable)
+        {
+            for (auto& [name, nv] : frame.namedVariable) retarget(nv);
+            for (auto& [name, nv] : frame.functionArgument) retarget(nv);
+        }
+    }
+
+void LLVMBackend::NoteOwnSlotLeavingLoad(const llvm::Value* load)
+{
+        if (llvm::isa_and_nonnull<llvm::LoadInst>(load))
+            ownSlotLeavingLoads_.emplace_back(const_cast<llvm::Value*>(load));
+    }
+
+/*
+ * Where may a copy of the block an owning slot holds live on elsewhere? A load of the slot whose
+ * value (or a pointer derived from it, or a pointer read out of its pointee) is stored anywhere
+ * but back into the slot, handed to a callee that may retain it, or used in an unmodelled way
+ * escapes at that load; any use of the slot other than a load or a store into it (`&p`) escapes
+ * at that use. Loads that free or null the slot (ownSlotLeavingLoads_) alias nothing.
+ */
+std::vector<const llvm::Instruction*> LLVMBackend::OwnedSlotAliasPoints(
+    const llvm::AllocaInst* slot, const std::unordered_set<const llvm::Value*>& leavingLoads)
+{
+        std::vector<const llvm::Instruction*> points;
+        for (const llvm::User* u : slot->users())
+        {
+            const auto* inst = llvm::dyn_cast<llvm::Instruction>(u);
+            if (inst == nullptr) { points.push_back(slot); continue; }
+            if (const auto* st = llvm::dyn_cast<llvm::StoreInst>(inst))
+            {
+                if (st->getPointerOperand() != slot || st->getValueOperand() == slot)
+                    points.push_back(inst);
+                continue;
+            }
+            const auto* ld = llvm::dyn_cast<llvm::LoadInst>(inst);
+            if (ld == nullptr) { points.push_back(inst); continue; }
+            if (!leavingLoads.contains(ld) && OwnedSlotLoadEscapes(ld, slot))
+                points.push_back(ld);
+        }
+        return points;
+    }
+
+bool LLVMBackend::OwnedSlotLoadEscapes(const llvm::LoadInst* root, const llvm::AllocaInst* slot)
+{
+        llvm::SmallPtrSet<const llvm::Value*, 16> visited;
+        llvm::SmallVector<const llvm::Value*, 16> work;
+        visited.insert(root);
+        work.push_back(root);
+        while (!work.empty())
+        {
+            if (visited.size() > kMaxRetainUses) return true;
+            const llvm::Value* v = work.pop_back_val();
+            for (const llvm::User* u : v->users())
+            {
+                const auto* inst = llvm::dyn_cast<llvm::Instruction>(u);
+                if (inst == nullptr) return true;
+                // A comparison yields a bool; a return ends the frame before any later rebind.
+                if (llvm::isa<llvm::ICmpInst>(inst) || llvm::isa<llvm::ReturnInst>(inst)) continue;
+                if (const auto* st = llvm::dyn_cast<llvm::StoreInst>(inst))
+                {
+                    if (st->getValueOperand() != v) continue;       // writing THROUGH the block
+                    // `p = p` stores the slot's own value back; any other destination aliases.
+                    if (v == root && st->getPointerOperand() == slot) continue;
+                    return true;
+                }
+                if (const auto* ld = llvm::dyn_cast<llvm::LoadInst>(inst))
+                {
+                    // A scalar read ends here; a pointer read out of the block may die with it.
+                    if (TypeHoldsPointer(ld->getType()) && visited.insert(ld).second)
+                        work.push_back(ld);
+                    continue;
+                }
+                if (const auto* call = llvm::dyn_cast<llvm::CallBase>(inst))
+                {
+                    const llvm::Function* callee = call->getCalledFunction();
+                    if (callee == nullptr) return true;
+                    if (CallIsPointerOpaqueIntrinsic(callee))
+                    {
+                        if (callee->getName().starts_with("llvm.mem")) return true;
+                        continue;
+                    }
+                    // An element / field destroyed and written back over (`s[0] = x`).
+                    if (CallIsOverwrittenFieldDestructor(call, v)) continue;
+                    bool passedAsArg = false;
+                    for (unsigned i = 0; i < call->arg_size(); ++i)
+                    {
+                        if (call->getArgOperand(i) != v) continue;
+                        passedAsArg = true;
+                        if (ParameterRetainsArgument(callee, i, 0)) return true;
+                    }
+                    if (!passedAsArg) return true;
+                    continue;
+                }
+                if (llvm::isa<llvm::GetElementPtrInst>(inst) || llvm::isa<llvm::BitCastInst>(inst)
+                    || llvm::isa<llvm::AddrSpaceCastInst>(inst) || llvm::isa<llvm::PHINode>(inst)
+                    || llvm::isa<llvm::SelectInst>(inst) || llvm::isa<llvm::InsertValueInst>(inst)
+                    || llvm::isa<llvm::ExtractValueInst>(inst))
+                {
+                    if (visited.insert(inst).second) work.push_back(inst);
+                    continue;
+                }
+                return true;
+            }
+        }
+        return false;
+    }
+
+void LLVMBackend::ResolveOwnedReleaseGates()
+{
+        std::vector<OwnReleaseGate> pending;
+        pending.swap(ownReleaseGates_);
+        std::vector<OwnAdoptGate> adopts;
+        adopts.swap(ownAdoptGates_);
+        std::unordered_set<const llvm::Value*> leavingLoads;
+        for (const auto& load : ownSlotLeavingLoads_)
+            if (load) leavingLoads.insert(load);
+        ownSlotLeavingLoads_.clear();
+        struct SlotAliases
+        {
+            std::vector<const llvm::Instruction*> Points;
+            std::unordered_set<const llvm::BasicBlock*> ReachedByEdge;   // >= 1 CFG edge from a point
+            bool Always = false;
+        };
+        std::unordered_map<const llvm::AllocaInst*, SlotAliases> bySlot;
+        auto aliasesOf = [&](const llvm::AllocaInst* slot) -> const SlotAliases&
+        {
+            auto it = bySlot.find(slot);
+            if (it != bySlot.end()) return it->second;
+            SlotAliases aliases;
+            aliases.Points = OwnedSlotAliasPoints(slot, leavingLoads);
+            std::vector<const llvm::BasicBlock*> work;
+            for (const auto* point : aliases.Points)
+            {
+                if (point == slot) aliases.Always = true;
+                for (const auto* succ : llvm::successors(point->getParent()))
+                    if (aliases.ReachedByEdge.insert(succ).second) work.push_back(succ);
+            }
+            while (!work.empty())
+            {
+                const auto* bb = work.back();
+                work.pop_back();
+                for (const auto* succ : llvm::successors(bb))
+                    if (aliases.ReachedByEdge.insert(succ).second) work.push_back(succ);
+            }
+            return bySlot.emplace(slot, std::move(aliases)).first->second;
+        };
+        // Flow-sensitive: an alias taken only after the site (never looping back to it)
+        // cannot hold the block the site moves.
+        auto aliasedAt = [&](const llvm::AllocaInst* slot, const llvm::Instruction* site)
+        {
+            const auto& aliases = aliasesOf(slot);
+            if (aliases.Always || aliases.ReachedByEdge.contains(site->getParent())) return true;
+            for (const auto* point : aliases.Points)
+                if (point->getParent() == site->getParent() && point->comesBefore(site))
+                    return true;
+            return false;
+        };
+        for (auto& gate : pending)
+        {
+            auto* slot = llvm::dyn_cast_or_null<llvm::AllocaInst>(gate.Slot);
+            auto* init = llvm::dyn_cast_or_null<llvm::StoreInst>(gate.Init);
+            auto* site = llvm::dyn_cast_or_null<llvm::Instruction>(gate.Site);
+            if (slot == nullptr || init == nullptr || site == nullptr) continue;
+            if (!aliasedAt(slot, site))
+                init->setOperand(0, llvm::ConstantInt::getTrue(init->getContext()));
+        }
+        // An adopted block may also be reached through an alias of any slot it passed through.
+        std::unordered_map<const llvm::AllocaInst*, std::vector<const llvm::AllocaInst*>> adoptedFrom;
+        for (auto& gate : adopts)
+        {
+            auto* src = llvm::dyn_cast_or_null<llvm::AllocaInst>(gate.Source);
+            auto* dest = llvm::dyn_cast_or_null<llvm::AllocaInst>(gate.Dest);
+            if (src != nullptr && dest != nullptr) adoptedFrom[dest].push_back(src);
+        }
+        for (auto& gate : adopts)
+        {
+            auto* src = llvm::dyn_cast_or_null<llvm::AllocaInst>(gate.Source);
+            auto* init = llvm::dyn_cast_or_null<llvm::StoreInst>(gate.Init);
+            auto* site = llvm::dyn_cast_or_null<llvm::Instruction>(gate.Site);
+            if (src == nullptr || init == nullptr || site == nullptr) continue;
+            std::unordered_set<const llvm::AllocaInst*> seen{ src };
+            std::vector<const llvm::AllocaInst*> work{ src };
+            bool aliased = false;
+            while (!aliased && !work.empty())
+            {
+                const auto* slot = work.back();
+                work.pop_back();
+                if (slot->getFunction() != site->getFunction() || aliasedAt(slot, site))
+                    aliased = true;
+                else if (auto it = adoptedFrom.find(slot); it != adoptedFrom.end())
+                    for (const auto* from : it->second)
+                        if (seen.insert(from).second) work.push_back(from);
+            }
+            if (!aliased) init->setOperand(0, llvm::ConstantInt::getTrue(init->getContext()));
+        }
+    }
+
+void LLVMBackend::ClearOwnFlag(const std::string& varName)
 {
         for (auto& frame : std::ranges::reverse_view(stackNamedVariable))
         {
             auto it = frame.namedVariable.find(varName);
             if (it == frame.namedVariable.end()) continue;
-            auto* flag = it->second.ViewOwnFlag;
-            if (it->second.ViewOwnFlagActive && flag != nullptr && IsInsertBlockLive()
+            auto* flag = it->second.OwnFlag;
+            if (it->second.OwnFlagActive && flag != nullptr && IsInsertBlockLive()
                 && flag->getFunction() == builder->GetInsertBlock()->getParent())
                 builder->CreateStore(builder->getInt1(false), flag);
             return;
@@ -1346,10 +1637,12 @@ void LLVMBackend::EmitOwningPtrDestructor(const NamedVariable& namedVar, llvm::V
         builder->CreateCall(dtor->getFunctionType(), dtor, { ptrVal });
     }
 
-void LLVMBackend::EmitOwningPtrCleanup(const NamedVariable& namedVar, llvm::Value* replacement)
+void LLVMBackend::EmitOwningPtrCleanup(const NamedVariable& namedVar, llvm::Value* replacement,
+                                       llvm::Value* releaseGate)
 {
         // Load the current pointer value from the alloca
         auto* ptrVal = builder->CreateLoad(namedVar.BaseType, namedVar.Storage);
+        NoteOwnSlotLeavingLoad(ptrVal);
 
         // Skip if null (pointer may have been moved out)
         llvm::Value* skipCleanup = builder->CreateICmpEQ(
@@ -1358,10 +1651,12 @@ void LLVMBackend::EmitOwningPtrCleanup(const NamedVariable& namedVar, llvm::Valu
         if (replacement != nullptr && replacement->getType() == ptrVal->getType())
             skipCleanup = builder->CreateOr(
                 skipCleanup, builder->CreateICmpEQ(ptrVal, replacement, "move.same"));
-        if (namedVar.ViewOwnFlagActive && namedVar.ViewOwnFlag != nullptr
-            && namedVar.ViewOwnFlag->getFunction() == builder->GetInsertBlock()->getParent())
+        if (namedVar.OwnFlagActive && namedVar.OwnFlag != nullptr
+            && namedVar.OwnFlag->getFunction() == builder->GetInsertBlock()->getParent())
             skipCleanup = builder->CreateOr(skipCleanup, builder->CreateNot(builder->CreateLoad(
-                builder->getInt1Ty(), namedVar.ViewOwnFlag, "view.owns")));
+                builder->getInt1Ty(), namedVar.OwnFlag, "own.flag")));
+        if (releaseGate != nullptr)
+            skipCleanup = builder->CreateOr(skipCleanup, builder->CreateNot(releaseGate));
         auto* cleanupBB = llvm::BasicBlock::Create(*context, "move.cleanup", builder->GetInsertBlock()->getParent());
         auto* afterBB   = llvm::BasicBlock::Create(*context, "move.after",   builder->GetInsertBlock()->getParent());
         builder->CreateCondBr(skipCleanup, afterBB, cleanupBB);

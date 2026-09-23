@@ -5128,12 +5128,12 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
             auto declarator = initDecl->declarator();
             auto direct = declarator->directDeclarator();
             std::string declaratorName = direct != nullptr ? getDirectDeclName(direct) : std::string();
-            // A view local's runtime ownership flag starts from what the finished declaration owns.
-            struct ViewOwnFlagSeed
+            // A pointer/view local's runtime ownership flag starts from what the finished declaration owns.
+            struct OwnFlagSeed
             {
                 LLVMBackend* c; const std::string& n;
-                ~ViewOwnFlagSeed() { c->ActivateViewOwnFlag(n); }
-            } viewOwnFlagSeed{ compiler, declaratorName };
+                ~OwnFlagSeed() { c->ActivateOwnFlag(n); }
+            } ownFlagSeed{ compiler, declaratorName };
             // unique<T> owns exactly ONE object - it has no element count to free an array with.
             // Catch the direct `new T[n]` initializer here, before the wrapper's constructor
             // overload resolution reports the mismatch in wrapper terms.
@@ -8808,7 +8808,7 @@ bool MainListener::ShouldBorrowPlainPointerBinding(
             && (sourceBinding->IsOwning || sourceBinding->BorrowsOwningLocal);
     }
 
-void MainListener::TransferPointerOwnershipOnStore(
+bool MainListener::TransferPointerOwnershipOnStore(
         const LLVMBackend::NamedVariable& rightNV,
         llvm::Value* destination,
         bool destIsInterface,
@@ -8842,7 +8842,7 @@ void MainListener::TransferPointerOwnershipOnStore(
             compiler->builder->CreateStore(
                 compiler->builder->CreateAdd(cur, compiler->builder->getInt32(1), "refinc"),
                 refAlloca);
-            compiler->ClearViewOwnFlag(rightNV.CallerName);
+            compiler->ClearOwnFlag(rightNV.CallerName);
         }
 
         // Transfer ownership: null the source alloca so EmitDestructorsForScope
@@ -8882,6 +8882,7 @@ void MainListener::TransferPointerOwnershipOnStore(
                 {
                     compiler->builder->CreateStore(
                         llvm::ConstantPointerNull::get(ptrTy), srcStorage);
+                    compiler->NoteOwnSlotLeavingLoad(rightNV.Primary);
                     const bool sourceIsWholeRawArrayBinding = !rightNV.IsElementAccess
                         && rightNV.FieldName.empty() && rightNV.OwningStructName.empty()
                         && (llvm::isa<llvm::AllocaInst>(srcStorage)
@@ -8900,9 +8901,11 @@ void MainListener::TransferPointerOwnershipOnStore(
                         if (destIsInterface)
                             compiler->MarkVariableMovedIntoInterface(rightNV.CallerName);
                     }
+                    return true;
                 }
             }
         }
+        return false;
     }
 
 llvm::Value* MainListener::CloneClosureFromNamedSource(
