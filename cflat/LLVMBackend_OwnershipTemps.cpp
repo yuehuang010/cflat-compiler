@@ -1305,7 +1305,19 @@ void LLVMBackend::EmitOwningPtrCleanup(const NamedVariable& namedVar, llvm::Valu
         // M6 - a foreign C++ pointee with a VIRTUAL destructor is released through the vtable's
         // DELETING destructor, which destroys the derived object and frees its storage in one
         // call. This is the scope-exit leg of the explicit `delete` path and must agree with it.
-        if (!namedVar.TypeAndValue.ElemPointer
+        // A C++ class `new T[n]` block (a view, or a constant raw array count) is an array: never
+        // the deleting destructor of element 0.
+        const std::string& ownTypeName = namedVar.TypeAndValue.TypeName;
+        const bool cxxAllocator = !namedVar.TypeAndValue.ElemPointer
+            && CxxClassUsesCxxAllocator(ownTypeName);
+        llvm::Value* cxxArrayCount = nullptr;
+        if (cxxAllocator
+            && (namedVar.RawArrayLengthStorage != nullptr || namedVar.RawArrayLength != nullptr))
+            cxxArrayCount = LoadRawArrayLength(namedVar);
+        auto* constCount = llvm::dyn_cast_or_null<llvm::ConstantInt>(cxxArrayCount);
+        const bool knownCxxArray = cxxAllocator && (namedVar.TypeAndValue.IsArrayView
+            || (constCount != nullptr && !constCount->isNegative()));
+        if (!namedVar.TypeAndValue.ElemPointer && !knownCxxArray
             && CxxHasVirtualDestructor(namedVar.TypeAndValue.TypeName)
             && EmitCxxVirtualDelete(namedVar.TypeAndValue.TypeName, ptrVal))
         {
@@ -1339,10 +1351,12 @@ void LLVMBackend::EmitOwningPtrCleanup(const NamedVariable& namedVar, llvm::Valu
         // A foreign nontrivial C++ pointee was allocated by the C++ global operator new, so its
         // release must use the matching C++ operator delete - this is the `unique T* p = new T(..)`
         // scope-exit leg, and it has to agree with the explicit `delete p` leg.
-        if (!namedVar.TypeAndValue.ElemPointer
-            && IsForeignNontrivialCxxClass(namedVar.TypeAndValue.TypeName))
+        if (cxxAllocator)
         {
-            EmitCxxHeapFree(namedVar.TypeAndValue.TypeName, voidPtr);
+            if (namedVar.TypeAndValue.IsArrayView)
+                EmitCxxHeapFreeArray(ownTypeName, voidPtr, cxxArrayCount, effAlign);
+            else
+                EmitCxxHeapFreeCounted(ownTypeName, voidPtr, cxxArrayCount, effAlign);
             builder->CreateBr(afterBB);
             builder->SetInsertPoint(afterBB);
             return;
@@ -4187,7 +4201,8 @@ bool LLVMBackend::UnwindTempConsumedByCall(llvm::Value* v) const
 }
 
 void LLVMBackend::NoteUnwindPartial(UnwindPartialEntry::Kind kind, llvm::Value* v,
-                                    const std::string& typeName, uint64_t allocAlign)
+                                    const std::string& typeName, uint64_t allocAlign,
+                                    llvm::Value* count)
 {
         if (!cppInteropUsed_ || v == nullptr || builder->GetInsertBlock() == nullptr) return;
         // Only what the pad would actually release: otherwise the entry just turns later calls
@@ -4202,7 +4217,7 @@ void LLVMBackend::NoteUnwindPartial(UnwindPartialEntry::Kind kind, llvm::Value* 
             return;
         if (kind == UnwindPartialEntry::Kind::Slot && !HasNonTrivialDestructor(typeName)) return;
         unwindPartial_.push_back({ kind, v, typeName, builder->GetInsertBlock()->getParent(),
-                                   allocAlign });
+                                   allocAlign, count });
 }
 
 void LLVMBackend::EmitUnwindPartialRelease(const UnwindPartialEntry& e)
@@ -4270,6 +4285,9 @@ void LLVMBackend::EmitUnwindPartialRelease(const UnwindPartialEntry& e)
             return;
         case UnwindPartialEntry::Kind::CxxHeap:
             EmitCxxHeapFree(e.TypeName, e.V);
+            return;
+        case UnwindPartialEntry::Kind::CxxHeapArray:
+            EmitCxxHeapFreeArray(e.TypeName, e.V, e.Count, e.AllocAlign);
             return;
         case UnwindPartialEntry::Kind::CflatHeap:
         {

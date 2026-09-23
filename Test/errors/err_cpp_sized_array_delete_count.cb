@@ -1,0 +1,29 @@
+// A `new T[n]` block of a C++ class whose only operator delete[] is the SIZED class-scope form
+// needs the element count at the free (a CFlat array block carries no cookie). A `delete[_]` of a
+// field, which carries no count, is refused; `delete[n] buf` and a local's `delete` are the
+// accept set (test_cpp_interop 3362). Pre-fix it compiled and freed through the single-object
+// global operator delete.
+import cpp "cpp_interop_opnew.h";
+
+expect_error("cannot free this 'new cppon.Arr[n]' block: the class declares only a sized 'operator delete[](void*, size_t)'") {
+    struct OnHolder
+    {
+        cppon.Arr* buf = nullptr;
+        void Drop() { delete[_] buf; buf = nullptr; }
+    };
+}
+
+// Accept set: the same field freed with its count compiles.
+struct OnHolderCounted
+{
+    cppon.Arr* buf = nullptr;
+    void Drop() { delete[3] buf; buf = nullptr; }
+};
+
+extern int main()
+{
+    OnHolderCounted h = default;
+    h.buf = new cppon.Arr[3];
+    h.Drop();
+    return 0;
+}

@@ -22,11 +22,6 @@ Still open:
    interacts with the `program` catch-all on a hardware fault are unverified; the array-prefix pad
    adds a destructor LOOP inside the cleanup (a runtime `new T[n]` or > 16 elements), and its calls
    carry no funclet bundle. test_cpp_interop returns 0 at the top of main on Windows.
-4. `new T` for a C++ class ignores a class-level `operator new` / `operator delete` (always the global
-   `_Znwm` / `_ZdlPvm`), and `new T[n]` of a C++ class allocates through the CFlat `operator new`
-   rather than `::operator new[]`, while `delete` of that array frees through the C++
-   `operator delete` (HeapAudit reports the CFlat block leaked: `new cppunw.Tx[3]` + `delete p`,
-   measured 2026-09-22). Not an unwind issue, found while building the fixture.
 
 Repro base: Test/library/cpp_interop_unwind.h / .cpp and the unwind section of Test/test_cpp_interop.cb
 (codes 3160-3198, 3261-3281).

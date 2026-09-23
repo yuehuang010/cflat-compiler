@@ -15616,10 +15616,107 @@ llvm::Function* LLVMBackend::GetCxxOperatorDelete(bool overAligned)
         return llvm::Function::Create(fnTy, llvm::GlobalValue::ExternalLinkage, name, module.get());
     }
 
+llvm::Function* LLVMBackend::GetCxxOperatorNewArray(bool overAligned)
+{
+        // Itanium `_Znam` / MS `??_U@YAPEAX_K@Z`: operator new[](size_t[, std::align_val_t]).
+        const char* name = targetWindows_
+            ? (overAligned ? "??_U@YAPEAX_KW4align_val_t@std@@@Z" : "??_U@YAPEAX_K@Z")
+            : (overAligned ? "_ZnamSt11align_val_t" : "_Znam");
+        if (llvm::Function* existing = module->getFunction(name)) return existing;
+        auto* i64 = builder->getInt64Ty();
+        std::vector<llvm::Type*> params{ i64 };
+        if (overAligned) params.push_back(i64);
+        auto* fnTy = llvm::FunctionType::get(cflat_llvm::PointerTo(builder->getInt8Ty()), params, false);
+        return llvm::Function::Create(fnTy, llvm::GlobalValue::ExternalLinkage, name, module.get());
+    }
+
+llvm::Function* LLVMBackend::GetCxxOperatorDeleteArray(bool overAligned)
+{
+        // Itanium `_ZdaPv` / MS `??_V@YAXPEAX@Z`: operator delete[](void*[, std::align_val_t]).
+        // The unsized form: a CFlat array block carries no cookie to recover the size from.
+        const char* name = targetWindows_
+            ? (overAligned ? "??_V@YAXPEAXW4align_val_t@std@@@Z" : "??_V@YAXPEAX@Z")
+            : (overAligned ? "_ZdaPvSt11align_val_t" : "_ZdaPv");
+        if (llvm::Function* existing = module->getFunction(name)) return existing;
+        std::vector<llvm::Type*> params{ cflat_llvm::PointerTo(builder->getInt8Ty()) };
+        if (overAligned) params.push_back(builder->getInt64Ty());
+        auto* fnTy = llvm::FunctionType::get(builder->getVoidTy(), params, false);
+        return llvm::Function::Create(fnTy, llvm::GlobalValue::ExternalLinkage, name, module.get());
+    }
+
+const LLVMBackend::FunctionSymbol* LLVMBackend::FindCxxClassAllocFunction(
+    const std::string& typeName, const std::string& opName, bool& sized)
+{
+        /*
+         * C++ name lookup for a class-scope allocation function: the class, then its bases, and
+         * the FIRST scope declaring the name wins (a base's operator is inherited). Within that
+         * scope the usual forms were the only ones exported: operator new(size_t) and operator
+         * delete(void*) / (void*, size_t), where a class-scope delete prefers the unsized one.
+         */
+        sized = false;
+        std::vector<std::string> work{ typeName };
+        std::set<std::string> seen;
+        for (size_t i = 0; i < work.size(); ++i)
+        {
+            const std::string cls = work[i];
+            if (!seen.insert(cls).second) continue;
+            auto it = functionTable.find(cls + "." + opName);
+            if (it != functionTable.end() && !it->second.empty())
+            {
+                const FunctionSymbol* unsized = nullptr;
+                const FunctionSymbol* withSize = nullptr;
+                for (const FunctionSymbol& sym : it->second)
+                {
+                    if (!sym.IsCxx || sym.IsMethod || sym.Function == nullptr) continue;
+                    if (sym.Parameters.size() == 1 && unsized == nullptr) unsized = &sym;
+                    else if (sym.Parameters.size() == 2 && withSize == nullptr) withSize = &sym;
+                }
+                if (unsized != nullptr) return unsized;
+                sized = withSize != nullptr;
+                return withSize;
+            }
+            if (const CxxClassInfo* info = GetCxxClassInfo(cls))
+                for (const CxxClassInfo::BaseRef& b : info->bases)
+                    if (!b.isVirtual) work.push_back(b.name);
+        }
+        return nullptr;
+    }
+
+bool LLVMBackend::CxxClassUsesCxxAllocator(const std::string& typeName)
+{
+        if (typeName.empty() || GetCxxClassInfo(typeName) == nullptr) return false;
+        if (IsForeignNontrivialCxxClass(typeName)
+            || IsForeignCxxClassWithUserDeclaredConstructor(typeName)) return true;
+        bool sized = false;
+        for (const char* op : { "operator new", "operator delete", "operator new[]", "operator delete[]" })
+            if (FindCxxClassAllocFunction(typeName, op, sized) != nullptr) return true;
+        return false;
+    }
+
+llvm::Value* LLVMBackend::CallCxxClassAllocFunction(const FunctionSymbol& sym,
+                                                    std::vector<llvm::Value*> args, bool mayUnwind)
+{
+        llvm::Function* fn = sym.Function;
+        llvm::FunctionType* fty = fn->getFunctionType();
+        if (fty->getNumParams() != args.size()) return nullptr;
+        for (unsigned i = 0; i < args.size(); ++i)
+        {
+            llvm::Type* want = fty->getParamType(i);
+            if (want->isIntegerTy()) args[i] = builder->CreateZExtOrTrunc(args[i], want);
+            else if (want->isPointerTy()) args[i] = builder->CreateBitCast(args[i], want);
+        }
+        return CreateCallOrInvoke(fty, fn, args, mayUnwind && !sym.IsNoexcept,
+                                  fty->getReturnType()->isVoidTy() ? "" : "cxx.clsalloc");
+    }
+
 llvm::Value* LLVMBackend::EmitCxxHeapAllocate(const std::string& typeName)
 {
         uint64_t size = 0, align = 0;
         if (!CxxObjectSizeAndAlign(typeName, size, align)) return nullptr;
+        // A class-scope operator new (own or inherited) replaces the global one.
+        bool sized = false;
+        if (const FunctionSymbol* cls = FindCxxClassAllocFunction(typeName, "operator new", sized))
+            return CallCxxClassAllocFunction(*cls, { builder->getInt64(size) }, true);
         const bool overAligned = align > kDefaultNewAlign;
         llvm::Function* fn = GetCxxOperatorNew(overAligned);
         std::vector<llvm::Value*> args{ builder->getInt64(size) };
@@ -15632,12 +15729,93 @@ void LLVMBackend::EmitCxxHeapFree(const std::string& typeName, llvm::Value* ptr)
 {
         uint64_t size = 0, align = 0;
         if (ptr == nullptr || !CxxObjectSizeAndAlign(typeName, size, align)) return;
+        auto* voidPtr = builder->CreateBitCast(ptr, cflat_llvm::PointerTo(builder->getInt8Ty()));
+        bool sized = false;
+        if (const FunctionSymbol* cls = FindCxxClassAllocFunction(typeName, "operator delete", sized))
+        {
+            std::vector<llvm::Value*> args{ voidPtr };
+            if (sized) args.push_back(builder->getInt64(size));
+            CallCxxClassAllocFunction(*cls, args, false);
+            return;
+        }
         const bool overAligned = align > kDefaultNewAlign;
         llvm::Function* fn = GetCxxOperatorDelete(overAligned);
-        auto* voidPtr = builder->CreateBitCast(ptr, cflat_llvm::PointerTo(builder->getInt8Ty()));
         std::vector<llvm::Value*> args{ voidPtr, builder->getInt64(size) };
         if (overAligned) args.push_back(builder->getInt64(align));
         builder->CreateCall(fn->getFunctionType(), fn, args);
+    }
+
+llvm::Value* LLVMBackend::EmitCxxHeapAllocateArray(const std::string& typeName, llvm::Value* bytes,
+                                                   uint64_t allocAlign)
+{
+        uint64_t size = 0, align = 0;
+        if (bytes == nullptr || !CxxObjectSizeAndAlign(typeName, size, align)) return nullptr;
+        bytes = builder->CreateZExtOrTrunc(bytes, builder->getInt64Ty());
+        // `new T[n]` looks up operator new[] only: a class-scope operator new never applies.
+        bool sized = false;
+        if (const FunctionSymbol* cls = FindCxxClassAllocFunction(typeName, "operator new[]", sized))
+            return CallCxxClassAllocFunction(*cls, { bytes }, true);
+        align = std::max(align, allocAlign);
+        const bool overAligned = align > kDefaultNewAlign;
+        llvm::Function* fn = GetCxxOperatorNewArray(overAligned);
+        std::vector<llvm::Value*> args{ bytes };
+        if (overAligned) args.push_back(builder->getInt64(align));
+        return CreateCallOrInvoke(fn->getFunctionType(), fn, args, /*mayUnwind=*/true, "cxx.newarr");
+    }
+
+bool LLVMBackend::EmitCxxHeapFreeArray(const std::string& typeName, llvm::Value* ptr,
+                                       llvm::Value* count, uint64_t allocAlign)
+{
+        uint64_t size = 0, align = 0;
+        if (ptr == nullptr || !CxxObjectSizeAndAlign(typeName, size, align)) return true;
+        auto* voidPtr = builder->CreateBitCast(ptr, cflat_llvm::PointerTo(builder->getInt8Ty()));
+        bool sized = false;
+        if (const FunctionSymbol* cls = FindCxxClassAllocFunction(typeName, "operator delete[]", sized))
+        {
+            std::vector<llvm::Value*> args{ voidPtr };
+            if (sized)
+            {
+                // No cookie: the size is the element count times the stride, so it must be known.
+                if (count == nullptr) return false;
+                args.push_back(builder->CreateMul(
+                    builder->CreateZExtOrTrunc(count, builder->getInt64Ty()), builder->getInt64(size)));
+            }
+            CallCxxClassAllocFunction(*cls, args, false);
+            return true;
+        }
+        align = std::max(align, allocAlign);
+        const bool overAligned = align > kDefaultNewAlign;
+        llvm::Function* fn = GetCxxOperatorDeleteArray(overAligned);
+        std::vector<llvm::Value*> args{ voidPtr };
+        if (overAligned) args.push_back(builder->getInt64(align));
+        builder->CreateCall(fn->getFunctionType(), fn, args);
+        return true;
+    }
+
+void LLVMBackend::EmitCxxHeapFreeCounted(const std::string& typeName, llvm::Value* ptr,
+                                         llvm::Value* count, uint64_t allocAlign)
+{
+        // A raw array count < 0 (or none) marks a single object; >= 0 a `new T[n]` block.
+        if (count == nullptr) { EmitCxxHeapFree(typeName, ptr); return; }
+        count = builder->CreateSExtOrTrunc(count, builder->getInt64Ty());
+        if (auto* c = llvm::dyn_cast<llvm::ConstantInt>(count))
+        {
+            if (c->isNegative()) EmitCxxHeapFree(typeName, ptr);
+            else EmitCxxHeapFreeArray(typeName, ptr, count, allocAlign);
+            return;
+        }
+        auto* fn = builder->GetInsertBlock()->getParent();
+        auto* arrBB = llvm::BasicBlock::Create(*context, "cxxfree.arr", fn);
+        auto* oneBB = llvm::BasicBlock::Create(*context, "cxxfree.one", fn);
+        auto* doneBB = llvm::BasicBlock::Create(*context, "cxxfree.done", fn);
+        builder->CreateCondBr(builder->CreateICmpSGE(count, builder->getInt64(0)), arrBB, oneBB);
+        builder->SetInsertPoint(arrBB);
+        EmitCxxHeapFreeArray(typeName, ptr, count, allocAlign);
+        builder->CreateBr(doneBB);
+        builder->SetInsertPoint(oneBB);
+        EmitCxxHeapFree(typeName, ptr);
+        builder->CreateBr(doneBB);
+        builder->SetInsertPoint(doneBB);
     }
 
 // Scalar targets a conversion operator may name, most-preferred first. 'int' precedes 'u32'

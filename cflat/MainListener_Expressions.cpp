@@ -1776,6 +1776,28 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                     llvm::Value* rhsTemp = forcedTempProduced || rhsDefault
                         ? forcedTemp : (outermostTemp ? returnedTemp
                                                       : (unmarkedCxxTemp ? rhsNV.Storage : nullptr));
+                    // A '?:' of C++ temporaries joins the arms' SLOTS, so its storage looks like an
+                    // lvalue; every incoming slot still pending destruction proves it a temporary.
+                    std::function<bool(llvm::Value*, int)> pendingTempSlot =
+                        [&](llvm::Value* slot, int depth) -> bool {
+                        if (slot == nullptr || depth > 16) return false;
+                        if (auto* phi = llvm::dyn_cast<llvm::PHINode>(slot))
+                        {
+                            if (phi->getNumIncomingValues() == 0) return false;
+                            for (llvm::Value* incoming : phi->incoming_values())
+                                if (!pendingTempSlot(incoming, depth + 1)) return false;
+                            return true;
+                        }
+                        LLVMBackend::NamedVariable probe;
+                        probe.Storage = slot;
+                        return compiler->IsOwnedTempValue(probe);
+                    };
+                    if (rhsTemp == nullptr && !useMove && !rhsDefault
+                        && rhsNV.Storage != nullptr && !rhsNV.TypeAndValue.Pointer
+                        && rhsNV.TypeAndValue.TypeName == tn
+                        && llvm::isa<llvm::PHINode>(rhsNV.Storage)
+                        && pendingTempSlot(rhsNV.Storage, 0))
+                        rhsTemp = rhsNV.Storage;
                     if (forcedTempProduced && !rhsDefault)
                         compiler->RegisterOwnedStructTemp(forcedTemp, tn);
                     compiler->lastCxxRetTemp_ = nullptr;
@@ -1812,6 +1834,9 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                     }
 
                     const bool sourceIsTemporary = rhsTemp != nullptr;
+                    // An addressable, non-temporary source outlives this statement: an lvalue.
+                    const bool sourceIsLvalue = !useMove && !sourceIsTemporary
+                        && rhsNV.Storage != nullptr && !rhsNV.IsRvalue;
                     const auto* op = [&]() -> const LLVMBackend::CxxClassInfo::Structor* {
                         if (info == nullptr) return nullptr;
                         const LLVMBackend::CxxClassInfo::Structor* result = nullptr;
@@ -1822,11 +1847,20 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                             result = lvalueReceiverAssignment(
                                 info->copyAssignOverloads, info->copyAssign);
                         if (result == nullptr && !useMove && !sourceIsTemporary
-                            && info->hasMoveAssign)
+                            && info->hasMoveAssign && !sourceIsLvalue)
                             result = lvalueReceiverAssignment(
                                 info->moveAssignOverloads, info->moveAssign);
                         return result;
                     }();
+                    // Only a move assignment exists: taking it from an lvalue would silently
+                    // empty the source, which C++ refuses (its copy assignment is deleted).
+                    if (op == nullptr && sourceIsLvalue && info != nullptr && info->hasMoveAssign
+                        && !destinationReleased && !destinationConditional
+                        && !destinationGlobalConditional)
+                        LogErrorContext(ctx, std::format(
+                            "cannot copy-assign C++ class '{}': it has no copy assignment operator "
+                            "cflat can call, and assigning from an lvalue would silently move from "
+                            "it; write 'move <variable>' or assign a temporary", tn));
 
                     auto emitConstruct = [&]() {
                         llvm::Value* source = rhsTemp != nullptr ? rhsTemp : sourceStorage;
@@ -14742,7 +14776,24 @@ LLVMBackend::NamedVariable MainListener::ParseNewExpression(CFlatParser::NewExpr
             alignArg.BaseType = alignArg.Primary->getType();
             newArgs.push_back(alignArg);
         }
-        if (!typeName.empty() && compiler->GetFunction(opNewName))
+        // A C++ class allocates through C++'s allocation functions, matched on every free site:
+        // `new T[n]` looks up operator new[] (class-scope, else global), never operator new.
+        const bool cxxAllocator = !typeIsPtr && compiler->CxxClassUsesCxxAllocator(typeName);
+        if (cxxAllocator)
+        {
+            rawPtr = isArray ? compiler->EmitCxxHeapAllocateArray(typeName, sizeVal, allocAlign)
+                             : compiler->EmitCxxHeapAllocate(typeName);
+            if (rawPtr == nullptr)
+            {
+                LogErrorContext(ctx, std::format(
+                    "'new': cannot compute the size of C++ class '{}'", typeName));
+                return {};
+            }
+            // CFlat's operator new hands back zeroed storage; keep that for a trivial element.
+            compiler->builder->CreateMemSet(rawPtr, compiler->builder->getInt8(0), sizeVal,
+                                            llvm::MaybeAlign(1));
+        }
+        else if (!typeName.empty() && compiler->GetFunction(opNewName))
         {
             rawPtr = compiler->CreateOverloadedFunctionCall(opNewName, newArgs);
         }
@@ -14783,7 +14834,11 @@ LLVMBackend::NamedVariable MainListener::ParseNewExpression(CFlatParser::NewExpr
          */
         // A throwing element constructor destroys the elements before it, then frees the block.
         LLVMBackend::UnwindPartialScope newArrayScope(*compiler);
-        if (isArray && count && !typeIsPtr && !compiler->GetFunction(opNewName)
+        if (isArray && count && cxxAllocator
+            && compiler->CxxElementNeedsDefaultConstruction(typeName))
+            compiler->NoteUnwindPartial(LLVMBackend::UnwindPartialEntry::Kind::CxxHeapArray,
+                                        typedPtr, typeName, allocAlign, count);
+        else if (isArray && count && !typeIsPtr && !compiler->GetFunction(opNewName)
             && (compiler->GetFunction(typeName) != nullptr
                 || compiler->CxxElementNeedsDefaultConstruction(typeName)))
             compiler->NoteUnwindPartial(LLVMBackend::UnwindPartialEntry::Kind::CflatHeap,
@@ -15560,7 +15615,23 @@ LLVMBackend::NamedVariable MainListener::ParseDeleteExpression(CFlatParser::Dele
          * delete. Getting this wrong through a base pointer would run the base destructor only
          * and free with the wrong size.
          */
-        if (!isArray && !isRawFree && !elemIsPtr && !typeName.empty()
+        // A C++ class block's element count, when this operand carries one: it decides between
+        // the single-object and the array deallocation function below.
+        const bool cxxAllocator = !elemIsPtr && compiler->CxxClassUsesCxxAllocator(typeName);
+        const bool viewOperand = !sawCast && operandNamedVar.TypeAndValue.IsArrayView;
+        llvm::Value* cxxArrayCount = nullptr;
+        if (cxxAllocator && !isArray)
+        {
+            cxxArrayCount = compiler->RawArrayCountOf(ptrVal);
+            if (cxxArrayCount == nullptr && (operandNamedVar.RawArrayLengthStorage != nullptr
+                                             || operandNamedVar.RawArrayLength != nullptr))
+                cxxArrayCount = compiler->LoadRawArrayLength(operandNamedVar);
+        }
+        // A `new T[n]` block is never released through the deleting destructor of element 0.
+        auto* constCount = llvm::dyn_cast_or_null<llvm::ConstantInt>(cxxArrayCount);
+        const bool knownCxxArray = cxxAllocator
+            && (viewOperand || (constCount != nullptr && !constCount->isNegative()));
+        if (!isArray && !isRawFree && !elemIsPtr && !typeName.empty() && !knownCxxArray
             && compiler->CxxHasVirtualDestructor(typeName))
         {
             auto* nullPtr = llvm::ConstantPointerNull::get(
@@ -15613,15 +15684,19 @@ LLVMBackend::NamedVariable MainListener::ParseDeleteExpression(CFlatParser::Dele
         // 1b. For delete[n]: call ~T() on each element using the caller-supplied count.
         // elemIsPtr suppresses destructor calls for pointer-element arrays (e.g. list<T*> buffer).
         llvm::Value* freeBase = ptrVal;
+        llvm::Value* sizeExprCount = nullptr;
         if (hasSizeExpr && !isRawFree && compiler->IsDataStructure(typeName) && !elemIsPtr)
         {
             llvm::Function* elemDtor = compiler->GetFullDestructorForDelete(typeName);
             if (elemDtor)
             {
                 llvm::Value* arrCount = ParseExpression(ctx->deleteArraySize()->expression());
+                sizeExprCount = arrCount;
                 compiler->EmitCountedArrayDestruction(ptrVal, typeName, arrCount);
             }
         }
+        if (cxxAllocator && hasSizeExpr && !isRawFree && sizeExprCount == nullptr)
+            sizeExprCount = ParseExpression(ctx->deleteArraySize()->expression());
 
         // 2. Convert free base to void*
         auto* voidPtrTy = cflat_llvm::PointerTo(compiler->builder->getInt8Ty());
@@ -15648,11 +15723,25 @@ LLVMBackend::NamedVariable MainListener::ParseDeleteExpression(CFlatParser::Dele
         bool useAlignedDelete = deleteEffAlign > LLVMBackend::kDefaultNewAlign;
         // A foreign nontrivial C++ object came from the C++ global allocator, so it must go back
         // to the matching C++ operator delete (sized, and over-aligned where the class is).
-        if (!elemIsPtr
-            && (compiler->IsForeignNontrivialCxxClass(typeName)
-                || compiler->IsForeignCxxClassWithUserDeclaredConstructor(typeName)))
+        // `delete[..]` and a view free a `new T[n]` block; a bare `delete p` decides by the raw
+        // array count it carries (none = one object).
+        if (cxxAllocator && (isArray || viewOperand))
         {
-            compiler->EmitCxxHeapFree(typeName, voidPtr);
+            llvm::Value* n = sizeExprCount;
+            if (n == nullptr) n = compiler->RawArrayCountOf(ptrVal);
+            if (n == nullptr && (operandNamedVar.RawArrayLengthStorage != nullptr
+                                 || operandNamedVar.RawArrayLength != nullptr))
+                n = compiler->LoadRawArrayLength(operandNamedVar);
+            if (!compiler->EmitCxxHeapFreeArray(typeName, voidPtr, n, operandAllocAlign))
+                LogErrorContext(ctx, std::format(
+                    "cannot free this 'new {}[n]' block: the class declares only a sized "
+                    "'operator delete[](void*, size_t)', which needs the element count, and this "
+                    "operand carries none - write 'delete[n] ptr' with the count",
+                    SpellType(*compiler, LLVMBackend::TypeAndValue{ .TypeName = typeName })));
+        }
+        else if (cxxAllocator)
+        {
+            compiler->EmitCxxHeapFreeCounted(typeName, voidPtr, cxxArrayCount, operandAllocAlign);
         }
         else if (!typeName.empty() && compiler->GetFunction(opDelName))
         {

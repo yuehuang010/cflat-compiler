@@ -1750,6 +1750,25 @@ namespace cflat_cinterop
                         // overload registers separately.
                         case OO_Call:
                             isBindableOperator = true; break;
+                        /*
+                         * Class-scope allocation functions: `new T` / `delete p` of this class
+                         * call them instead of the global ones. Only the USUAL forms bind -
+                         * operator new(size_t) and operator delete(void*[, size_t]); placement,
+                         * aligned and destroying forms stay out.
+                         */
+                        case OO_New: case OO_Array_New:
+                            isBindableOperator = md->getNumParams() == 1
+                                && ctx.hasSameType(md->getParamDecl(0)->getType(),
+                                                   ctx.getSizeType());
+                            break;
+                        case OO_Delete: case OO_Array_Delete:
+                            isBindableOperator = !md->isDestroyingOperatorDelete()
+                                && md->getParamDecl(0)->getType()->isVoidPointerType()
+                                && (md->getNumParams() == 1
+                                    || (md->getNumParams() == 2
+                                        && ctx.hasSameType(md->getParamDecl(1)->getType(),
+                                                           ctx.getSizeType())));
+                            break;
                         default: break;
                     }
                     /*

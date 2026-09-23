@@ -33,19 +33,24 @@ struct Tx
     int get() const noexcept { return tag; }
 };
 inline void setArm(int v) noexcept { Tx::arm = v; }
-// The global operator new/delete replacements in cpp_interop_unwind.cpp count calls while
-// counting is on; failNew(1) makes the next operator new throw std::bad_alloc.
+// The global operator new/delete and new[]/delete[] replacements in cpp_interop_unwind.cpp count
+// calls while counting is on; failNew(1) makes the next operator new throw std::bad_alloc.
 extern int newCalls;
 extern int deleteCalls;
+extern int newArrCalls;
+extern int deleteArrCalls;
 extern int failNextNew;
 extern bool countHeap;
 inline void failNew(int v) noexcept { failNextNew = v; }
 inline int news() noexcept { return newCalls; }
 inline int deletes() noexcept { return deleteCalls; }
+inline int newArrs() noexcept { return newArrCalls; }
+inline int deleteArrs() noexcept { return deleteArrCalls; }
 inline void reset() noexcept
 {
     Tr::live = 0; Tr::dtors = 0; Tx::arm = 0;
-    newCalls = 0; deleteCalls = 0; failNextNew = 0; countHeap = true;
+    newCalls = 0; deleteCalls = 0; newArrCalls = 0; deleteArrCalls = 0; failNextNew = 0;
+    countHeap = true;
 }
 inline int live() noexcept { return Tr::live; }
 inline int dtors() noexcept { return Tr::dtors; }

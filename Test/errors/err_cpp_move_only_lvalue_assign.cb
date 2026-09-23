@@ -1,0 +1,36 @@
+// Assigning an LVALUE of a move-only C++ class (copy assignment deleted) into a live object used
+// to fall back to the move assignment operator, silently emptying the source (it read back -1).
+// Each lvalue spelling is refused; a temporary and an explicit 'move' still assign (the accept
+// set is Test/test_cpp_interop.cb 3333-3335).
+import cpp "cpp_interop_assign.h";
+
+struct MoveOnlyHost { cppas.MoveOnly m = cppas.MoveOnly(1); };
+
+extern int main()
+{
+    cppas.MoveOnly a = cppas.MoveOnly(3);
+    cppas.MoveOnly b = cppas.MoveOnly(4);
+    cppas.MoveOnly t = cppas.MoveOnly(100);
+    MoveOnlyHost host = { m = cppas.MoveOnly(1) };
+    cppas.MoveOnly* p = &a;
+    int c = 1;
+    expect_error("cannot copy-assign C++ class 'cppas.MoveOnly': it has no copy assignment operator") {
+        t = a;
+    }
+    expect_error("cannot copy-assign C++ class 'cppas.MoveOnly': it has no copy assignment operator") {
+        t = (a);
+    }
+    expect_error("cannot copy-assign C++ class 'cppas.MoveOnly': it has no copy assignment operator") {
+        t = *p;
+    }
+    expect_error("cannot copy-assign C++ class 'cppas.MoveOnly': it has no copy assignment operator") {
+        t = c > 0 ? a : b;
+    }
+    expect_error("cannot copy-assign C++ class 'cppas.MoveOnly': it has no copy assignment operator") {
+        t = host.m;
+    }
+    expect_error("cannot copy-assign C++ class 'cppas.MoveOnly': it has no copy assignment operator") {
+        host.m = a;
+    }
+    return 0;
+}

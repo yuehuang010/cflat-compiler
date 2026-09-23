@@ -6,6 +6,8 @@
 namespace cppunw {
 int newCalls = 0;
 int deleteCalls = 0;
+int newArrCalls = 0;
+int deleteArrCalls = 0;
 int failNextNew = 0;
 bool countHeap = false;
 int guardedAlloc(Cb f, int x)
@@ -28,3 +30,17 @@ void operator delete(void* p) noexcept
     std::free(p);
 }
 void operator delete(void* p, std::size_t) noexcept { operator delete(p); }
+// ::operator new[] / delete[] count separately, so a `new T[n]` block proves which family it
+// was allocated and freed through.
+void* operator new[](std::size_t n)
+{
+    if (cppunw::countHeap) ++cppunw::newArrCalls;
+    if (void* p = std::malloc(n ? n : 1)) return p;
+    throw std::bad_alloc();
+}
+void operator delete[](void* p) noexcept
+{
+    if (p != nullptr && cppunw::countHeap) ++cppunw::deleteArrCalls;
+    std::free(p);
+}
+void operator delete[](void* p, std::size_t) noexcept { operator delete[](p); }

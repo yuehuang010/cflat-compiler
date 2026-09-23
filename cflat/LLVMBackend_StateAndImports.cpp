@@ -2822,6 +2822,8 @@ bool LLVMBackend::TryLoadCHeaderDiskCache(
         // has none, so a member inherited through a virtual base gets the wrong `this`.
         // v85 omits out-of-line C++ static data members from the bare-global list; they are
         // registered through their class record instead.
+        // v86 exports class-scope operator new / delete / new[] / delete[] members: an older
+        // record has none, so `new T` of such a class would call the global allocator.
         if (version != kCHeaderCacheVersion) return cacheMiss("cache version");
 
         if (!expectedRequestKey.empty()
@@ -3237,6 +3239,7 @@ void LLVMBackend::WriteCHeaderDiskCache(
         // v84 defines vtable virtual members + used out-of-line inline members in the companion
         // bitcode, and records virtual-base offsets (vbs).
         // v85 omits out-of-line C++ static data members from the bare-global list.
+        // v86 exports class-scope operator new / delete / new[] / delete[] members.
         j["version"] = kCHeaderCacheVersion;
         j["mtime"]   = (int64_t)mtime.time_since_epoch().count();
         j["hash"]    = contentHash;

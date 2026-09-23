@@ -5204,7 +5204,7 @@ private:
      */
     struct UnwindPartialEntry
     {
-        enum class Kind { Value, Slot, Members, CxxHeap, CflatHeap, ArrayPrefix } K;
+        enum class Kind { Value, Slot, Members, CxxHeap, CxxHeapArray, CflatHeap, ArrayPrefix } K;
         llvm::Value* V;
         std::string TypeName;
         llvm::Function* Fn;
@@ -5224,8 +5224,10 @@ private:
             if (backend.unwindPartial_.size() > mark) backend.unwindPartial_.resize(mark);
         }
     };
+    // CxxHeapArray: a C++ class `new T[n]` block of Count elements, freed through the array
+    // deallocation function its allocation paired with.
     void NoteUnwindPartial(UnwindPartialEntry::Kind kind, llvm::Value* v, const std::string& typeName,
-                           uint64_t allocAlign = 0);
+                           uint64_t allocAlign = 0, llvm::Value* count = nullptr);
     void EmitUnwindPartialRelease(const UnwindPartialEntry& e);
     void NoteUnwindArrayPrefix(llvm::Value* base, llvm::Type* elemTy, llvm::Value* count,
                                const std::string& elemTypeName);
@@ -8213,6 +8215,29 @@ public:
     llvm::Value* EmitCxxHeapAllocate(const std::string& typeName);
     // Release storage obtained from EmitCxxHeapAllocate. The destructor is NOT run here.
     void EmitCxxHeapFree(const std::string& typeName, llvm::Value* ptr);
+    // ::operator new[] / ::operator delete[] (unsized), declared on demand like the pair above.
+    llvm::Function* GetCxxOperatorNewArray(bool overAligned);
+    llvm::Function* GetCxxOperatorDeleteArray(bool overAligned);
+    // The class-scope usual allocation function 'opName' ("operator new", "operator delete",
+    // "operator new[]", "operator delete[]") of the class or the nearest base declaring it;
+    // nullptr when the global one applies. 'sized' = the (void*, size_t) delete form.
+    const FunctionSymbol* FindCxxClassAllocFunction(const std::string& typeName,
+                                                    const std::string& opName, bool& sized);
+    llvm::Value* CallCxxClassAllocFunction(const FunctionSymbol& sym, std::vector<llvm::Value*> args,
+                                           bool mayUnwind);
+    // A foreign C++ class whose heap blocks come from the C++ allocation functions (class-scope
+    // or global) on every allocate AND free site; the rest keep CFlat's operator new/delete.
+    bool CxxClassUsesCxxAllocator(const std::string& typeName);
+    // `new T[n]` storage of 'bytes': class-scope operator new[] or ::operator new[]. The
+    // elements are NOT constructed here; the matching release is EmitCxxHeapFreeArray.
+    llvm::Value* EmitCxxHeapAllocateArray(const std::string& typeName, llvm::Value* bytes,
+                                          uint64_t allocAlign);
+    // False only when a sized class-scope operator delete[] needs a count that is unknown.
+    bool EmitCxxHeapFreeArray(const std::string& typeName, llvm::Value* ptr, llvm::Value* count,
+                              uint64_t allocAlign);
+    // Free by raw array count: null or < 0 = one object, >= 0 = a `new T[n]` block.
+    void EmitCxxHeapFreeCounted(const std::string& typeName, llvm::Value* ptr, llvm::Value* count,
+                                uint64_t allocAlign);
     // sizeof / alignof of a foreign class, as the C++ allocator needs them.
     bool CxxObjectSizeAndAlign(const std::string& typeName, uint64_t& size, uint64_t& align);
     // A destructor with a real linkage symbol exists (not implicit / inline-only), so the class
@@ -9905,7 +9930,7 @@ public:
      * timeout). The PCH key still folds the build stamp, since a PCH belongs to the clang that
      * wrote it.
      */
-    static constexpr int kCHeaderCacheVersion = 85;
+    static constexpr int kCHeaderCacheVersion = 86;
     static std::string CompilerBuildStamp();
 
     static std::string GetCHeaderCacheDir();

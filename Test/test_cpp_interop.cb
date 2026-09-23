@@ -152,6 +152,16 @@
 //     std::function, void callbacks, nullptr, and literal 0.
 //   Out-of-line C++ static data member definitions stay class-scoped (3310-3319), including a
 //     template specialization; bare member names are not registered as CFlat globals.
+//   Assignment INTO a live nontrivial C++ object from a temporary (3320-3339): operator
+//     results (free and member), a parenthesized name, by-value member and free calls, a
+//     C++ field and array element as the destination, self-assignment, and a '?:' of two
+//     temporaries, which must MOVE-assign (or move-construct into a released destination).
+//     Test/errors/err_cpp_move_only_lvalue_assign.cb pins the move-only lvalue refusal.
+//   Class-scope allocation functions (3350-3366): `new T` / `delete p` of a C++ class with a
+//     class-level operator new / delete (own, inherited, sized, through unique T* and unique<T>,
+//     the deleting destructor, a throwing constructor, a trivial class), and `new T[n]` of a C++
+//     class allocated and freed through the SAME family - ::operator new[] / delete[] or the
+//     class's own - on `delete`, `delete[n]`, `delete[_]`, scope exit and unwind.
 
 import cpp "library/cpp_interop_basic.h";
 import cpp "library/cpp_interop_basic.cpp";
@@ -192,11 +202,15 @@ import "unique.cb";
 // global operator new/delete with counting ones; heap_audit counts CFlat string/closure/`new` blocks.
 import cpp "library/cpp_interop_unwind.h";
 import cpp "library/cpp_interop_unwind.cpp";
+// Class-scope operator new / delete / new[] / delete[] (legs 3350-3366).
+import cpp "library/cpp_interop_opnew.h";
 import "diagnostic/heap_audit.cb";
 // Standard streams: one grouped std import (stringstream is not visible through a user header alone).
 import cpp {"sstream", "fstream", "iostream", "iomanip"};
 import cpp "library/cpp_interop_stream.h";
 import cpp "library/cpp_interop_list.h";
+// Assignment into a live object from a temporary: instrumented, header-only.
+import cpp "library/cpp_interop_assign.h";
 
 int cppListTakeValue = 0;
 void take<T>(list<T>* values, int expectedCount)
@@ -207,6 +221,7 @@ void take<T>(list<T>* values, int expectedCount)
 struct CppListBox<T> { list<T> values; };
 struct CppListHolder { cpplist.Plain item = default; int tag = 0; };
 struct CppListValue { int value = 0; };
+struct CppAssignHost { cppas.Life l = cppas.Life(1); std.string s; };
 import cpp "library/cpp_interop_fnptr.h";
 
 // A C++ exception unwinding THROUGH CFlat frames (the C++ `guarded` catch sits above them): every
@@ -745,6 +760,13 @@ int StrmThrowingInsert(int v)
     f << b;
     return 0;
 }
+// Class-scope allocation functions (legs 3350-3366). cppon counts every class-level operator,
+// cppunw every global one (new[] / delete[] apart from new / delete), heap_audit every CFlat block.
+int OnUniqueCls(int x) { unique cppon.Cls* p = new cppon.Cls(x); return p->get(); }
+int OnUniqueLib(int x) { unique<cppon.Cls> p = new cppon.Cls(x); return p->get(); }
+int OnViewScope(int x) { cppon.Plain[] p = new cppon.Plain[3]; return p[2].get() + x; }
+int OnClsCtorThrows(int x) { cppon.Cls* p = new cppon.Cls(-x); int v = p->get(); delete p; return v; }
+int onArrN = 4;
 int fnptr_add_one(int x) { return x + 1; }
 int apply_fnptr(function<int(int)> f, int x) { return f(x); }
 void fnptr_noop() {}
@@ -3924,6 +3946,255 @@ extern int main()
     if (cppi.statconst.NoInit.k != 0) return 3311;
     if (cppi.ExternPoly<int>.linkedStatic != 67) return 3312;
     if (cppi_nsobj_global != 3) return 3313;
+
     if (cppi.nsobj.inner.deep != 31) return 3314;
+    // ---- assignment into a live nontrivial C++ object from a temporary (3320-3339) ----------
+    // cppas.Life counts every special member and its destructor records the payload it saw
+    // (last_dtor) then poisons it to -99, so a copy where a move belongs, a second destruction,
+    // or a read of a destroyed temporary each change a count or a value.
+    {
+        cppas.Life a = cppas.Life(3);
+        cppas.Life b = cppas.Life(4);
+        cppas.Life t = cppas.Life(100);
+        int c = 0;
+        // Freeze legs (3320-3326): these shapes were refused when the issue was filed and were
+        // accepted by 50476d5b; each asserts exactly one move assignment from one temporary,
+        // destroyed once after being moved from (last_dtor -1), operands untouched.
+        cppas.Life.reset();
+        t = a + b;
+        if (t.value() != 7 || a.value() != 3 || b.value() != 4 || cppas.Life.ctors != 1
+            || cppas.Life.move_assigns != 1 || cppas.Life.copy_assigns != 0
+            || cppas.Life.copies != 0 || cppas.Life.moves != 0 || cppas.Life.dtors != 1
+            || cppas.Life.last_dtor != -1)
+            return 3320;
+        cppas.Life.reset();
+        t = b - a;
+        if (t.value() != 1 || cppas.Life.ctors != 1 || cppas.Life.move_assigns != 1
+            || cppas.Life.copy_assigns != 0 || cppas.Life.dtors != 1 || cppas.Life.last_dtor != -1)
+            return 3321;
+        cppas.Life.reset();
+        t = a.twice();
+        if (t.value() != 6 || cppas.Life.move_assigns != 1 || cppas.Life.copy_assigns != 0
+            || cppas.Life.dtors != 1 || cppas.Life.last_dtor != -1)
+            return 3322;
+        // A parenthesized name is an lvalue: copy assignment, nothing constructed or destroyed.
+        cppas.Life.reset();
+        t = (a);
+        if (t.value() != 3 || a.value() != 3 || cppas.Life.copy_assigns != 1
+            || cppas.Life.move_assigns != 0 || cppas.Life.dtors != 0)
+            return 3323;
+        // Self-assignment reads both operands before the temporary replaces t.
+        cppas.Life.reset();
+        t = t + t;
+        if (t.value() != 6 || cppas.Life.move_assigns != 1 || cppas.Life.dtors != 1)
+            return 3324;
+        // A C++ field of a CFlat struct and an array element as the destination.
+        CppAssignHost host = { l = cppas.Life(1) };
+        cppas.Life[2] cells = default;
+        cppas.Life.reset();
+        host.l = a + b;
+        cells[1] = b - a;
+        if (host.l.value() != 7 || cells[1].value() != 1 || cppas.Life.ctors != 2
+            || cppas.Life.move_assigns != 2 || cppas.Life.copy_assigns != 0
+            || cppas.Life.dtors != 2 || cppas.Life.last_dtor != -1)
+            return 3325;
+        // A chain: the inner temporary and the outer one are each destroyed exactly once.
+        cppas.Life.reset();
+        t = a + b + a;
+        if (t.value() != 10 || cppas.Life.ctors != 2 || cppas.Life.move_assigns != 1
+            || cppas.Life.dtors != 2)
+            return 3326;
+        // A constructor temporary takes the unmarked-temporary arm: move, never copy, assigned.
+        cppas.Life.reset();
+        t = cppas.Life(11);
+        if (t.value() != 11 || cppas.Life.move_assigns != 1 || cppas.Life.copy_assigns != 0
+            || cppas.Life.dtors != 1 || cppas.Life.last_dtor != -1)
+            return 3326;
+        // A '?:' whose arms are both temporaries joins their slots, so the join looked like an
+        // lvalue and was COPY-assigned from (copy_assigns 1, last_dtor 1 on the pre-fix binary).
+        cppas.Life.reset();
+        t = c > 0 ? a + b : b - a;
+        if (t.value() != 1 || cppas.Life.ctors != 1 || cppas.Life.move_assigns != 1
+            || cppas.Life.copy_assigns != 0 || cppas.Life.dtors != 1 || cppas.Life.last_dtor != -1)
+            return 3327;
+        // Two by-value member calls, and a nested '?:' of temporaries: the same join.
+        cppas.Life.reset();
+        t = c > 0 ? a.twice() : (c == 0 ? b.twice() : a.twice());
+        if (t.value() != 8 || cppas.Life.move_assigns != 1 || cppas.Life.copy_assigns != 0
+            || cppas.Life.dtors != 1 || cppas.Life.last_dtor != -1)
+            return 3328;
+        // A released destination is CONSTRUCTED from the join: a move construction, not a copy
+        // (copies 1 on the pre-fix binary).
+        _ = move t;
+        cppas.Life.reset();
+        t = c > 0 ? a + b : b - a;
+        if (t.value() != 1 || cppas.Life.moves != 1 || cppas.Life.copies != 0
+            || cppas.Life.dtors != 1 || cppas.Life.last_dtor != -1)
+            return 3329;
+        // In a loop: one temporary per iteration, each destroyed once.
+        cppas.Life.reset();
+        for (int i = 0; i < 3; i++) { t = i > 1 ? a + b : b - a; }
+        if (t.value() != 7 || cppas.Life.ctors != 3 || cppas.Life.move_assigns != 3
+            || cppas.Life.copy_assigns != 0 || cppas.Life.dtors != 3)
+            return 3330;
+    }
+    // Scope exit after assignment: every object constructed is destroyed exactly once.
+    cppas.Life.reset();
+    {
+        cppas.Life a = cppas.Life(3);
+        cppas.Life t = cppas.Life(100);
+        t = a + a;
+        if (t.value() != 6) return 3331;
+    }
+    if (cppas.Life.ctors != 3 || cppas.Life.dtors != 3 || cppas.Life.last_dtor != 3) return 3332;
+    // A move-only class (copy assignment deleted) takes a '?:' of temporaries into a RELEASED
+    // destination by move construction; the pre-fix binary refused it as a copy.
+    {
+        cppas.MoveOnly a = cppas.MoveOnly(3);
+        cppas.MoveOnly t = cppas.MoveOnly(100);
+        int c = 1;
+        cppas.MoveOnly.move_assigns = 0;
+        t = a + a;
+        if (t.value() != 6 || cppas.MoveOnly.move_assigns != 1) return 3333;
+        _ = move t;
+        t = c > 0 ? a + a : a + a + a;
+        if (t.value() != 6 || a.value() != 3) return 3334;
+        t = move a;
+        if (t.value() != 3 || cppas.MoveOnly.move_assigns != 2) return 3335;
+    }
+    // std.string: operator result, literal operand, parenthesized name, member call, '?:' of
+    // temporaries and self-assignment, all past the small-string buffer.
+    {
+        std.string a = std.string("a long string well past the small buffer");
+        std.string b = std.string(" and a long tail");
+        std.string t = std.string("an old long value that must be released!!");
+        int c = 0;
+        t = a + b;
+        if (t.size() != 56 || a.size() != 40 || b.size() != 16) return 3336;
+        t = (b);
+        if (t.size() != 16 || b.size() != 16) return 3337;
+        t = c > 0 ? a + b : b + a;
+        if (t.size() != 56 || t.substr(0, 4) != std.string(" and")) return 3338;
+        t = t + t;
+        if (t.size() != 112 || t.substr(56, 4) != std.string(" and")) return 3339;
+    }
+
+    // ---- Class-scope operator new / delete, and `new T[n]` of a C++ class (3350-3366) ----------
+    // `new T` / `delete p` call the class's own operator new / delete (inherited through a base,
+    // the sized delete given sizeof(T)); `new T[n]` pairs ::operator new[] (or the class's
+    // operator new[]) with the matching delete[] on every free site. Pre-fix every single object
+    // went through the GLOBAL operator new / delete, and every array block came from CFlat's
+    // operator new but was freed through the C++ single-object delete (heap_audit: one leak).
+    {
+        cppunw.reset();
+        cppon.reset();
+        int heapBase = (int)HeapAudit.reportLeaks();
+        cppon.Cls* onA = new cppon.Cls(5);
+        int onV = onA->get();
+        delete onA;
+        if (onV != 5 || cppon.clsNew() != 1 || cppon.clsDel() != 1 || cppunw.news() != 0
+            || cppunw.deletes() != 0 || cppon.live() != 0) return 3350;
+        cppon.reset();
+        if (OnUniqueCls(6) != 6 || cppon.clsNew() != 1 || cppon.clsDel() != 1
+            || cppunw.news() != 0 || cppon.live() != 0) return 3351;      // unique T* scope exit
+        cppon.reset();
+        if (OnUniqueLib(8) != 8 || cppon.clsNew() != 1 || cppon.clsDel() != 1
+            || cppunw.news() != 0 || cppon.live() != 0) return 3352;      // unique<T> (unique.cb)
+        cppon.reset();
+        cppon.Sized* onS = new cppon.Sized(9);
+        onV = onS->get();
+        delete onS;
+        if (onV != 9 || cppon.clsNew() != 1 || cppon.clsDel() != 1 || cppunw.news() != 0)
+            return 3353;                                                  // sized: n == sizeof
+        cppon.reset();
+        cppon.ClsDerived* onD = new cppon.ClsDerived(4);
+        onV = onD->get();
+        delete onD;
+        if (onV != 4 || cppon.clsNew() != 1 || cppon.clsDel() != 1 || cppunw.news() != 0)
+            return 3354;                                                  // inherited operators
+        cppon.reset();
+        cppon.Poly* onP = new cppon.PolyDerived(5);                       // deleting destructor
+        onV = onP->get();
+        delete onP;
+        if (onV != 10 || cppon.clsNew() != 1 || cppon.clsDel() != 1 || cppunw.news() != 0
+            || cppon.dtors() != 2 || cppon.live() != 0) return 3355;
+        // A throwing constructor frees the block through the class's delete, not the global one.
+        cppon.reset();
+        if (cppunw.guarded(OnClsCtorThrows, 3) != -3 || cppon.clsNew() != 1
+            || cppon.clsDel() != 1 || cppunw.deletes() != 0 || cppon.live() != 0) return 3356;
+
+        // Arrays: every leg asserts the ::operator new[] / delete[] pair, no single-object free,
+        // and no CFlat block left behind.
+        cppunw.reset();
+        cppon.reset();
+        cppon.Plain[] onArr = new cppon.Plain[3];
+        onV = onArr[0].get() + onArr[2].get();
+        delete onArr;
+        if (onV != 14 || cppunw.newArrs() != 1 || cppunw.deleteArrs() != 1 || cppunw.deletes() != 0
+            || cppon.dtors() != 3 || (int)HeapAudit.reportLeaks() != heapBase) return 3357;
+        cppunw.reset();
+        cppon.reset();
+        cppon.Plain* onRt = new cppon.Plain[onArrN];                      // runtime n, `delete p`
+        onV = onRt[3].get();
+        delete onRt;
+        if (onV != 7 || cppunw.newArrs() != 1 || cppunw.deleteArrs() != 1 || cppunw.deletes() != 0
+            || cppon.dtors() != 4 || (int)HeapAudit.reportLeaks() != heapBase) return 3358;
+        cppunw.reset();
+        cppon.reset();
+        cppon.Plain* onSz = new cppon.Plain[3];
+        delete[3] onSz;
+        bool onSizedOk = cppunw.newArrs() == 1 && cppunw.deleteArrs() == 1 && cppon.dtors() == 3;
+        cppunw.reset();
+        cppon.reset();
+        cppon.Plain* onRaw = new cppon.Plain[2];
+        delete[_] onRaw;                                                  // frees, runs no dtor
+        if (!onSizedOk || cppunw.newArrs() != 1 || cppunw.deleteArrs() != 1 || cppunw.deletes() != 0
+            || cppon.dtors() != 0 || (int)HeapAudit.reportLeaks() != heapBase) return 3359;
+        cppunw.reset();
+        cppon.reset();
+        if (OnViewScope(1) != 8 || cppunw.newArrs() != 1 || cppunw.deleteArrs() != 1
+            || cppon.dtors() != 3 || (int)HeapAudit.reportLeaks() != heapBase) return 3360;
+        // `new Cls[n]` looks up operator new[] only: the class's operator new never applies.
+        cppunw.reset();
+        cppon.reset();
+        cppon.Cls[] onCa = new cppon.Cls[2];
+        onV = onCa[1].get();
+        delete onCa;
+        if (onV != 7 || cppon.clsNew() != 0 || cppon.clsDel() != 0 || cppunw.newArrs() != 1
+            || cppunw.deleteArrs() != 1 || cppon.dtors() != 2) return 3361;
+        // The class's own operator new[] / sized delete[] (size = n * sizeof).
+        cppunw.reset();
+        cppon.reset();
+        cppon.Arr[] onAa = new cppon.Arr[3];
+        onV = onAa[2].get();
+        delete onAa;
+        if (onV != 3 || cppon.clsNewArr() != 1 || cppon.clsDelArr() != 1 || cppon.clsNew() != 0
+            || cppunw.newArrs() != 0 || cppon.dtors() != 3) return 3362;
+        // A polymorphic element array: n destructors, never element 0's deleting destructor.
+        cppunw.reset();
+        cppon.reset();
+        cppon.Poly[] onPa = new cppon.Poly[2];
+        onV = onPa[1].get();
+        delete onPa;
+        if (onV != 1 || cppon.clsDel() != 0 || cppunw.deleteArrs() != 1 || cppon.dtors() != 2
+            || cppon.live() != 0) return 3363;
+        // Over-aligned element: the aligned ::operator new[] / delete[] pair.
+        cppon.reset();
+        cppon.Wide[] onW = new cppon.Wide[3];
+        onV = onW[2].get();
+        delete onW;
+        if (onV != 6 || cppon.dtors() != 3 || (int)HeapAudit.reportLeaks() != heapBase) return 3364;
+        // A throwing element constructor frees the block through ::operator delete[] (UnwArrNew).
+        cppunw.reset();
+        if (cppunw.guarded(UnwArrNew, 5) != -5 || cppunw.dtors() != 3 || cppunw.newArrs() != 1
+            || cppunw.deleteArrs() != 1 || cppunw.deletes() != 0) return 3365;
+        // A TRIVIAL class (no user constructor) with class operators: the class new and delete,
+        // and the block still reads zeroed as CFlat's own `new` storage does.
+        cppon.reset();
+        cppon.Triv* onT = new cppon.Triv;
+        onV = onT->a + onT->b;
+        delete onT;
+        if (onV != 0 || cppon.clsNew() != 1 || cppon.clsDel() != 1) return 3366;
+    }
     return 0;
 }
