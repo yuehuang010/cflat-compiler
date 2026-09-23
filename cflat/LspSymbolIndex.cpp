@@ -113,6 +113,7 @@ void LspSymbolIndex::Clear()
 {
     symbols_.clear();
     variables_.clear();
+    variableLocations_.clear();
     functionRanges_.clear();
     candidates_.clear();
 }
@@ -172,6 +173,17 @@ void LspSymbolIndex::RegisterVariable(const std::string& varName, const std::str
     info.file = file;
     info.line = line;
     info.column = column;
+    if (!file.empty() && line > 0)
+    {
+        auto& locations = variableLocations_[varName];
+        auto existing = std::find_if(locations.begin(), locations.end(), [&](const VariableInfo& loc) {
+            return loc.file == file && loc.line == line && loc.column == column;
+        });
+        if (existing == locations.end())
+            locations.push_back(info);
+        else
+            *existing = info;
+    }
 }
 
 const std::string* LspSymbolIndex::LookupVariableType(const std::string& varName) const
@@ -187,12 +199,61 @@ const VariableInfo* LspSymbolIndex::LookupVariable(const std::string& varName) c
     return (it != variables_.end()) ? &it->second : nullptr;
 }
 
+const VariableInfo* LspSymbolIndex::LookupVariable(const std::string& varName,
+                                                    const std::string& preferredFile) const
+{
+    if (!preferredFile.empty())
+    {
+        auto locations = variableLocations_.find(varName);
+        if (locations != variableLocations_.end())
+            for (auto it = locations->second.rbegin(); it != locations->second.rend(); ++it)
+                if (it->file == preferredFile)
+                    return &*it;
+    }
+    return LookupVariable(varName);
+}
+
+const VariableInfo* LspSymbolIndex::LookupVariable(const std::string& varName,
+                                                    const std::string& preferredFile,
+                                                    int queryLine, int scopeStartLine,
+                                                    int scopeEndLine) const
+{
+    auto locations = variableLocations_.find(varName);
+    if (locations != variableLocations_.end() && !preferredFile.empty())
+    {
+        const VariableInfo* nearest = nullptr;
+        for (const auto& info : locations->second)
+        {
+            if (info.file != preferredFile) continue;
+            if (scopeStartLine > 0 && (info.line < scopeStartLine || info.line > scopeEndLine))
+                continue;
+            if (queryLine > 0 && info.line <= queryLine
+                && (!nearest || info.line > nearest->line))
+                nearest = &info;
+        }
+        if (nearest) return nearest;
+    }
+    return LookupVariable(varName, preferredFile);
+}
+
 void LspSymbolIndex::MergeVariablesFrom(const LspSymbolIndex& other)
 {
     // Union, new-wins: a partial parse truncates registration early, so wholesale
     // replacement would drop variables the cached index legitimately still has.
     for (const auto& [name, info] : other.variables_)
         variables_[name] = info;
+    for (const auto& [name, locations] : other.variableLocations_)
+    {
+        auto& merged = variableLocations_[name];
+        for (const auto& info : locations)
+        {
+            auto existing = std::find_if(merged.begin(), merged.end(), [&](const VariableInfo& loc) {
+                return loc.file == info.file && loc.line == info.line && loc.column == info.column;
+            });
+            if (existing == merged.end()) merged.push_back(info);
+            else *existing = info;
+        }
+    }
 }
 
 void LspSymbolIndex::RemapFile(const std::string& fromFile, const std::string& toFile)
@@ -203,6 +264,10 @@ void LspSymbolIndex::RemapFile(const std::string& fromFile, const std::string& t
     for (auto& [name, info] : variables_)
         if (info.file == fromFile)
             info.file = toFile;
+    for (auto& [name, locations] : variableLocations_)
+        for (auto& info : locations)
+            if (info.file == fromFile)
+                info.file = toFile;
     for (auto& range : functionRanges_)
         if (range.file == fromFile)
             range.file = toFile;

@@ -8,11 +8,23 @@ namespace cpppoly
     static int g_shape_dtors = 0;
     static int g_circle_dtors = 0;
     static int g_square_dtors = 0;
+    static int g_left_unique_adjust_dtors = 0;
+    static int g_right_unique_adjust_dtors = 0;
+    static int g_both_unique_adjust_dtors = 0;
 
     void reset_poly_counts() noexcept { g_shape_dtors = 0; g_circle_dtors = 0; g_square_dtors = 0; }
     int shape_dtors() noexcept { return g_shape_dtors; }
     int circle_dtors() noexcept { return g_circle_dtors; }
     int square_dtors() noexcept { return g_square_dtors; }
+    void reset_unique_adjust_counts() noexcept
+    {
+        g_left_unique_adjust_dtors = 0;
+        g_right_unique_adjust_dtors = 0;
+        g_both_unique_adjust_dtors = 0;
+    }
+    int left_unique_adjust_dtors() noexcept { return g_left_unique_adjust_dtors; }
+    int right_unique_adjust_dtors() noexcept { return g_right_unique_adjust_dtors; }
+    int both_unique_adjust_dtors() noexcept { return g_both_unique_adjust_dtors; }
 
     Shape::Shape() noexcept { tag = 1; }
     Shape::~Shape() noexcept { ++g_shape_dtors; }
@@ -40,18 +52,20 @@ namespace cpppoly
     void destroy(Shape* s) noexcept { delete s; }
 
     Left::Left() noexcept { lv = 11; }
-    Left::~Left() noexcept {}
+    Left::~Left() noexcept { ++g_left_unique_adjust_dtors; }
     int Left::l() const noexcept { return lv; }
 
     Right::Right() noexcept { rv = 22; }
-    Right::~Right() noexcept {}
+    Right::~Right() noexcept { ++g_right_unique_adjust_dtors; }
     int Right::r() const noexcept { return rv; }
 
     Both::Both() noexcept { lv = 33; rv = 44; }
-    Both::~Both() noexcept {}
+    Both::~Both() noexcept { ++g_both_unique_adjust_dtors; }
     int Both::l() const noexcept { return lv + 1000; }
     int Both::r() const noexcept { return rv + 2000; }
     int Both::both_only() const noexcept { return lv + rv; }
+
+    NoVirtualDerived::NoVirtualDerived() noexcept { nv = 71; }
 
     int read_right(const Right* p) noexcept { return p->rv; }
     int call_right(const Right* p) noexcept { return p->r(); }

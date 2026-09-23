@@ -48,6 +48,8 @@
 //     move, loop copies, explicit move, holder return, composed C++ sret return, two implementors,
 //     and a generic interface.
 //     Plain CFlat aggregate and bare-class interface calls pin the existing ABI neighbours.
+//   C++ sink parameter checks (2060-2079) for a CFlat-defined [cpp] derived struct: push_back
+//     refuses an implicit copy, while explicit move, temporaries, emplace_back, and const-ref borrowing work.
 
 import cpp "library/cpp_interop_basic.h";
 import cpp "library/cpp_interop_basic.cpp";
@@ -67,6 +69,8 @@ import cpp "map";
 import cpp "set";
 import cpp "list";
 import cpp "array";
+import cpp "library/cpp_interop_lvalue_sink.h";
+import cpp "library/cpp_interop_assign.h";
 // std::function as a MEMBER parameter and as a RETURN type.
 import cpp "library/cpp_interop_stdfn.h";
 import cpp "library/cpp_interop_twin.h";
@@ -75,6 +79,13 @@ import "library/cpp_interop_gfield_a.cb";
 import "library/cpp_interop_gfield_b.cb";
 import "test_helper.cb";
 import "list.cb";
+
+[cpp] struct BridgeSinkCheck : cplv.Module
+{
+    int k = 0;
+    BridgeSinkCheck(int value) { k = value; tag = value; }
+    override int forward(int x) { return x + k; }
+};
 
 int bridge_cf_ctor = 0;
 int bridge_cf_copy = 0;
@@ -4342,6 +4353,73 @@ extern int main(int argc, char** argv)
     }
     if (bridge_passed - bridgeIfhStartPassed != bridge_checks - bridgeIfhStartChecks)
         return 2059;
+
+    // ---- C++ sink parameters and derived [cpp] struct copy refusal (2060-2079) --------
+    int bridgeLvsStartChecks = bridge_checks;
+    int bridgeLvsStartPassed = bridge_passed;
+    {
+        std.vector<BridgeSinkCheck> values = default;
+        BridgeSinkCheck local = BridgeSinkCheck(4);
+        BridgeSinkCheck* source = &local;
+        values.push_back(move local);
+        bridge_check("LVS vector move value", values[0].forward(1), 5);
+        bridge_check("LVS vector moved-from", source.k, 0);
+    }
+    {
+        std.vector<BridgeSinkCheck> values = default;
+        values.push_back(BridgeSinkCheck(4));
+        bridge_check("LVS vector temporary", values[0].forward(1), 5);
+    }
+    {
+        std.vector<BridgeSinkCheck> values = default;
+        values.emplace_back(4);
+        bridge_check("LVS vector emplace", values[0].forward(1), 5);
+    }
+    {
+        std.deque<BridgeSinkCheck> values = default;
+        BridgeSinkCheck local = BridgeSinkCheck(6);
+        values.push_back(move local);
+        bridge_check("LVS deque move", values[0].forward(1), 7);
+    }
+    {
+        BridgeSinkCheck local = BridgeSinkCheck(8);
+        bridge_check("LVS const-ref borrow", cplv.borrow(local), 8);
+        bridge_check("LVS const-ref source", local.k, 8);
+    }
+    if (bridge_passed - bridgeLvsStartPassed != bridge_checks - bridgeLvsStartChecks)
+        return 2079;
+
+    // ---- C++ sink accept neighbours (2080-2089) --------------------------------------
+    int bridgeLvaStartChecks = bridge_checks;
+    int bridgeLvaStartPassed = bridge_passed;
+    {
+        std.vector<cppas.MoveOnly> values = default;
+        cppas.MoveOnly local = cppas.MoveOnly(10);
+        cppas.MoveOnly* source = &local;
+        values.emplace_back(move local);
+        bridge_check("LVS emplace move value", values.front().value(), 10);
+        bridge_check("LVS emplace moved-from", source.value(), -1);
+    }
+    {
+        std.vector<cppas.Life> values = default;
+        cppas.Life local = cppas.Life(12);
+        cppas.Life* source = &local;
+        values.insert(values.end(), move local);
+        bridge_check("LVS insert move value", values.front().value(), 12);
+        bridge_check("LVS insert moved-from", source.value(), -1);
+    }
+    {
+        std.set<std.string> values = default;
+        std.string key = std.string("lvs");
+        values.insert(key);
+        int count = values.count(key);
+        int found = 0;
+        if (values.find(key) != values.end()) found = 1;
+        bridge_check("LVS set count copyable key", count, 1);
+        bridge_check("LVS set find copyable key", found, 1);
+    }
+    if (bridge_passed - bridgeLvaStartPassed != bridge_checks - bridgeLvaStartChecks)
+        return 2089;
 
     return 0;
 }

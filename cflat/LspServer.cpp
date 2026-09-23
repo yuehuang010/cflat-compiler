@@ -1250,7 +1250,20 @@ private:
         // the type's definition (legacy behavior for unlocated entries).
         if (!def && receiver.empty() && !word.empty())
         {
-            if (const VariableInfo* vi = index->LookupVariable(word))
+            int scopeStartLine = 0;
+            int scopeEndLine = 0;
+            auto functions = index->FunctionsEnclosing(filePath, line + 1);
+            if (!functions.empty())
+            {
+                const FunctionRange* closest = *std::min_element(functions.begin(), functions.end(),
+                    [](const FunctionRange* a, const FunctionRange* b) {
+                        return (a->endLine - a->startLine) < (b->endLine - b->startLine);
+                    });
+                scopeStartLine = closest->startLine;
+                scopeEndLine = closest->endLine;
+            }
+            if (const VariableInfo* vi = index->LookupVariable(word, filePath, line + 1,
+                                                                scopeStartLine, scopeEndLine))
             {
                 if (vi->line > 0 && !vi->file.empty())
                 {

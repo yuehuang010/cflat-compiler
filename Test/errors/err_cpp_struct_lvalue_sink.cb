@@ -1,0 +1,19 @@
+import cpp "vector";
+import cpp "cpp_interop_lvalue_sink.h";
+
+[cpp] struct SinkCheck : cplv.Module
+{
+    int k = 0;
+    SinkCheck(int value) { k = value; tag = value; }
+    override int forward(int x) { return x + k; }
+};
+
+extern int main()
+{
+    expect_error("its copy constructor is deleted") {
+        std.vector<SinkCheck> values = default;
+        SinkCheck local = SinkCheck(4);
+        values.push_back(local);
+    }
+    return 0;
+}

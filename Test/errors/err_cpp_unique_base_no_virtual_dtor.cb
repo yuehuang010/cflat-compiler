@@ -1,0 +1,9 @@
+import cpp "cpp_interop_poly.h";
+import cpp "cpp_interop_poly.cpp";
+
+extern int main() {
+    expect_error("has no virtual destructor, so deleting through the base would be undefined") {
+        unique cpppoly.NoVirtualBase* p = new cpppoly.NoVirtualDerived();
+    }
+    return 0;
+}

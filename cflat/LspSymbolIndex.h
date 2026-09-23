@@ -82,6 +82,12 @@ public:
                           const std::string& displayTypeName = {});
     const std::string* LookupVariableType(const std::string& varName) const;
     const VariableInfo* LookupVariable(const std::string& varName) const;
+    const VariableInfo* LookupVariable(const std::string& varName,
+                                       const std::string& preferredFile) const;
+    const VariableInfo* LookupVariable(const std::string& varName,
+                                       const std::string& preferredFile,
+                                       int queryLine, int scopeStartLine,
+                                       int scopeEndLine) const;
 
     // Unused-code candidates (declarations that may turn out to be unreferenced).
     void RegisterCandidate(const UnusedCandidate& cand);
@@ -101,5 +107,6 @@ private:
     std::unordered_map<std::string, SymbolDef> symbols_;
     std::vector<FunctionRange> functionRanges_;
     std::unordered_map<std::string, VariableInfo> variables_;
+    std::unordered_map<std::string, std::vector<VariableInfo>> variableLocations_;
     std::vector<UnusedCandidate> candidates_;
 };

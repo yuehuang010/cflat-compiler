@@ -934,6 +934,8 @@ static bool ReadSourceLines(const std::string& path, std::vector<std::string>& l
 static void DumpSymbolLine(const LspSymbolIndex& index,
                            const std::vector<std::string>& sourceLines,
                            size_t lineNumber, bool& firstLine,
+                           const std::string& preferredFile,
+                           int scopeStartLine, int scopeEndLine,
                            const SymbolDef* preferredFunction = nullptr)
 {
     if (!firstLine) std::cout << "\n";
@@ -969,7 +971,9 @@ static void DumpSymbolLine(const LspSymbolIndex& index,
 
         if (!token.hasMember)
         {
-            const VariableInfo* variable = index.LookupVariable(token.path);
+            const VariableInfo* variable = index.LookupVariable(token.path, preferredFile,
+                                                                 (int)lineNumber,
+                                                                 scopeStartLine, scopeEndLine);
             const std::string* typeName = index.LookupVariableType(token.path);
             if (IsSymbolLineKeyword(token.path) && !variable && !typeName)
                 continue;
@@ -1230,7 +1234,8 @@ int RunSymbolDumpQuery(ArgParser& args, const std::string& runtimeDir, bool show
             }
             for (size_t lineNumber = selector.firstLine;; ++lineNumber)
             {
-                DumpSymbolLine(index, inputLines, lineNumber, firstLine);
+                DumpSymbolLine(index, inputLines, lineNumber, firstLine,
+                               std::filesystem::absolute(*source).string(), 0, 0);
                 if (lineNumber == selector.lastLine) break;
             }
             continue;
@@ -1260,7 +1265,8 @@ int RunSymbolDumpQuery(ArgParser& args, const std::string& runtimeDir, bool show
         }
         for (size_t lineNumber = startLine;; ++lineNumber)
         {
-            DumpSymbolLine(index, functionLines, lineNumber, firstLine, def);
+            DumpSymbolLine(index, functionLines, lineNumber, firstLine, def->file,
+                           (int)startLine, (int)endLine, def);
             if (lineNumber == endLine) break;
         }
     }

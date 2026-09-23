@@ -1,0 +1,12 @@
+import cpp "vector";
+import cpp "cpp_interop_assign.h";
+
+extern int main()
+{
+    expect_error("its copy constructor is deleted") {
+        std.vector<cppas.MoveOnly> values = default;
+        cppas.MoveOnly local = cppas.MoveOnly(4);
+        values.push_back(local);
+    }
+    return 0;
+}

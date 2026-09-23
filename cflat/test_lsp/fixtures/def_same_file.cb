@@ -1,4 +1,4 @@
-// $cursor line=1 col=27
-// $expect definition line=0
-extern int add(int a, int b) { return a + b; }
+// $cursor line=0 col=34
+// $expect definition line=0 file="same"
+int add(int head, int b) { return head + b; }
 extern int main() { return add(1, 2); }

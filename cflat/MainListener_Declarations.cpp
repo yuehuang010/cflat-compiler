@@ -3067,6 +3067,23 @@ void MainListener::ParseFunctionDefinition(CFlatParser::FunctionDefinitionContex
         auto returnType = this->getFunctionReturnType(func);
         CFlatParser::ParameterTypeListContext* paramTypeList = func->parameterTypeList();
         auto params = this->ParseParameterTypeList(paramTypeList);
+        if (auto* s = compiler->GetSymbolSink(); s && !InGenericInstantiation()
+            && paramTypeList && paramTypeList->parameterList())
+        {
+            auto declarations = paramTypeList->parameterList()->parameterDeclaration();
+            const size_t count = std::min(params.size(), declarations.size());
+            for (size_t i = 0; i < count; ++i)
+            {
+                auto* declarator = declarations[i]->declarator();
+                auto* direct = declarator ? declarator->directDeclarator() : nullptr;
+                if (!direct || params[i].VariableName.empty()) continue;
+                s->RegisterVariable(params[i].VariableName, params[i].TypeName,
+                                    compiler->GetSourceFilePath(),
+                                    (int)direct->getStart()->getLine(),
+                                    (int)direct->getStart()->getCharPositionInLine(),
+                                    SpellType(*compiler, params[i]));
+            }
+        }
         size_t line = func->getStart()->getLine();
         bool varargs = paramTypeList && paramTypeList->Ellipsis() != nullptr;
 
@@ -6594,6 +6611,11 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                     // its canonical pointee shape to overload resolution.
                                     ctorArg.TypeAndValue.TypeName =
                                         initializerSourceNV.TypeAndValue.TypeName;
+                                    right = compiler->AdjustCxxPointerForUniqueAdoption(
+                                        ctorArg, typeAndValue, right,
+                                        std::format("variable '{}'", name));
+                                    ctorArg.Primary = right;
+                                    ctorArg.BaseType = right->getType();
                                     ShapeCoreUniqueCtorArg(compiler, ctorArg,
                                                            typeAndValue.TypeName, right);
                                     right = compiler->CreateOverloadedFunctionCall(

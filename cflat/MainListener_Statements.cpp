@@ -1079,6 +1079,10 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
                 auto ctorArg = returnNV;
                 ctorArg.Primary = right;
                 ctorArg.BaseType = right->getType();
+                right = compiler->AdjustCxxPointerForUniqueAdoption(
+                    ctorArg, compiler->currentFunctionReturnTV, right, "the return value");
+                ctorArg.Primary = right;
+                ctorArg.BaseType = right->getType();
                 ShapeCoreUniqueCtorArg(
                     compiler, ctorArg, compiler->currentFunctionReturnTV.TypeName, right);
                 right = compiler->CreateCoreUniqueFromRawPointerCall(

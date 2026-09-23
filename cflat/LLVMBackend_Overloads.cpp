@@ -1897,6 +1897,53 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
             return nullptr;
         }
 
+        // Refuse lvalues copied into a C++ template's element storage, while retaining key borrows.
+        // The signature must name the specialization's value type (or pair/tuple), not just T&.
+        if (candidate.IsCxx && candidate.IsMethod && !candidate.Parameters.empty())
+        {
+            const auto ownerRecord = cxxRecordEntries_.find(candidate.Parameters[0].TypeName);
+            const bool isSpecialization = ownerRecord != cxxRecordEntries_.end()
+                && ownerRecord->second.canonicalCtype.find('<') != std::string::npos;
+            const bool constMethod = ownerRecord != cxxRecordEntries_.end()
+                && std::any_of(ownerRecord->second.members.begin(), ownerRecord->second.members.end(),
+                    [&](const auto& member) {
+                        return member.linkageName == candidate.UniqueName && member.isConst;
+                    });
+            const bool oneKeyLookup = arguments.size() == 2
+                && !candidate.ReturnType.Pointer
+                && (candidate.ReturnType.TypeName == "bool"
+                    || candidate.ReturnType.TypeName == "int"
+                    || candidate.ReturnType.TypeName == "unsigned int"
+                    || candidate.ReturnType.TypeName == "long"
+                    || candidate.ReturnType.TypeName == "unsigned long"
+                    || candidate.ReturnType.TypeName == "size_t");
+            if (isSpecialization && !constMethod && !oneKeyLookup)
+            for (size_t i = 0; i < arguments.size() && i < matched.size()
+                            && i < candidate.Parameters.size(); ++i)
+            {
+                if (i == 0) continue;
+                const auto& arg = matched[i];
+                const auto& param = candidate.Parameters[i];
+                const CxxClassInfo* cxxInfo = GetCxxClassInfo(arg.TypeAndValue.TypeName);
+                const bool copyDeleted = IsCppStructName(arg.TypeAndValue.TypeName)
+                    || (cxxInfo != nullptr && cxxInfo->hasDeletedCopyCtor);
+                if (!copyDeleted || IsCxxRvalueReferenceArgument(arg) || arg.IsExplicitMove)
+                    continue;
+                std::string argSpelling;
+                const bool templateElement = ownerRecord != cxxRecordEntries_.end()
+                    && CxxSpellingForCflatType(arg.TypeAndValue.TypeName, argSpelling)
+                    && (ownerRecord->second.canonicalCtype.find(argSpelling) != std::string::npos
+                        || argSpelling.find("pair<") != std::string::npos
+                        || argSpelling.find("tuple<") != std::string::npos);
+                if (!templateElement) continue;
+                LogError(std::format(
+                    "cannot copy C++ class '{}' into parameter '{}' of '{}': its copy "
+                    "constructor is deleted - pass 'move x' or a temporary",
+                    DisplayCxxClassName(arg.TypeAndValue.TypeName), param.VariableName,
+                    shownFunctionName));
+            }
+        }
+
         if (candidate.Function == nullptr)
         {
             for (const auto& c : candidates)
@@ -4121,6 +4168,9 @@ llvm::Value* LLVMBackend::CreateCoreUniqueFromRawPointerCall(
                 { arg.CallerName.empty() ? arg.BorrowedOrigin : arg.CallerName,
                   arg.BorrowedUniqueField });
         auto receiver = arg;
+        if (receiver.Primary != nullptr && receiver.Primary->getType()->isPointerTy())
+            receiver.Primary = AdjustCxxPointerForUniqueAdoption(
+                receiver, param, receiver.Primary, "unique pointer adoption");
         // A plain factory result has no owner marker; treat it as the ownership handoff while
         // still rejecting named or explicitly borrowed pointers.
         if (receiver.Storage == nullptr && !receiver.IsBorrowed && !receiver.IsAliasBorrow

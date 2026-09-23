@@ -6650,6 +6650,10 @@ public:
     bool IsStackValueToCoreUniqueInterface(const NamedVariable& arg, const TypeAndValue& param) const;
     llvm::Value* CreateCoreUniqueFromRawPointerCall(const NamedVariable& arg,
                                                      const TypeAndValue& param);
+    llvm::Value* AdjustCxxPointerForUniqueAdoption(const NamedVariable& arg,
+                                                   const TypeAndValue& param,
+                                                   llvm::Value* value,
+                                                   const std::string& destDesc);
     llvm::Value* CreateCoreUniqueRawPointerCall(const NamedVariable& arg, const TypeAndValue& param,
                                                 bool calleeIsCxx = false);
 

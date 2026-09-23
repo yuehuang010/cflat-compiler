@@ -11458,6 +11458,46 @@ llvm::Value* LLVMBackend::AdjustCxxPointerForStore(const TypeAndValue& dest,
         return value;
     }
 
+llvm::Value* LLVMBackend::AdjustCxxPointerForUniqueAdoption(
+    const NamedVariable& arg, const TypeAndValue& param, llvm::Value* value,
+    const std::string& destDesc)
+{
+        if (value == nullptr || !value->getType()->isPointerTy()
+            || !IsCoreUniqueType(param.TypeName))
+            return value;
+        const std::string targetName = MangledGenericArgument(*this, param.TypeName);
+        const std::string sourceName = arg.TypeAndValue.TypeName;
+        if (!IsCxxRecord(targetName) || !IsCxxRecord(sourceName)
+            || targetName == sourceName)
+            return value;
+
+        uint64_t offset = 0;
+        bool inaccessible = false;
+        if (!FindCxxBaseOffset(sourceName, targetName, offset, inaccessible))
+        {
+            if (!inaccessible) return value;
+            TypeAndValue destPointer;
+            destPointer.TypeName = targetName;
+            destPointer.Pointer = true;
+            TypeAndValue sourcePointer = arg.TypeAndValue;
+            sourcePointer.Pointer = true;
+            return AdjustCxxPointerForStore(
+                destPointer, sourcePointer, value, destDesc);
+        }
+        if (!CxxHasVirtualDestructor(targetName))
+        {
+            TypeAndValue targetType;
+            targetType.TypeName = targetName;
+            LogError(std::format(
+                "cannot adopt a '{}' into 'unique {}*': '{}' has no virtual destructor, so "
+                "deleting through the base would be undefined",
+                SpellType(*this, arg.TypeAndValue), SpellType(*this, targetType),
+                SpellType(*this, targetType)));
+        }
+
+        return EmitCxxBaseAdjust(value, offset);
+    }
+
 llvm::Value* LLVMBackend::CxxReferenceResultAsPointer(const TypeAndValue& dest,
                                                       const NamedVariable& src,
                                                       const std::string& destDesc)

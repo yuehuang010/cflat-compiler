@@ -55,6 +55,10 @@ namespace cpppoly
     int shape_dtors() noexcept;
     int circle_dtors() noexcept;
     int square_dtors() noexcept;
+    void reset_unique_adjust_counts() noexcept;
+    int left_unique_adjust_dtors() noexcept;
+    int right_unique_adjust_dtors() noexcept;
+    int both_unique_adjust_dtors() noexcept;
 
     struct Left
     {
@@ -79,6 +83,12 @@ namespace cpppoly
         int l() const noexcept override;
         int r() const noexcept override;
         int both_only() const noexcept;
+    };
+
+    struct NoVirtualBase { int nv; };
+    struct NoVirtualDerived : Left, NoVirtualBase
+    {
+        NoVirtualDerived() noexcept;
     };
 
     // Takes the NON-PRIMARY base. Passing a Both* here is only correct if the caller added

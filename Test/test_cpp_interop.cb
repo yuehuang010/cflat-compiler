@@ -197,6 +197,8 @@
 //     (3460-3462). An aliased owner reassigned to a borrowed pointer disowns (3463).
 //     A borrow whose owner no longer holds the block (swap through a temporary, moved owner)
 //     is never adopted; the block leaks (3464-3465).
+//   `unique Base*` adopts a C++ pointer adjusted to its base subobject, retains virtual dispatch,
+//     and invokes exactly one destructor for locals, returns, and fields (3470-3479).
 
 import cpp "library/cpp_interop_basic.h";
 import cpp "library/cpp_interop_basic.cpp";
@@ -874,7 +876,11 @@ cppi.RefCell* RrNested(int k)
     return nullptr;
 }
 int RrReadRight(cpppoly.Right* r) { return r.rv; }
+unique cpppoly.Right* UaMakeRight() { return new cpppoly.Both(); }
+move cpppoly.Right* UaMakeMovedRight() { return new cpppoly.Both(); }
 struct RrSlots { cppi.RefCell* c; cpppoly.Right* r; };
+struct UaUniqueHolder { unique cpppoly.Right* r = new cpppoly.Both(); };
+struct UaUniqueBraceHolder { unique cpppoly.Right* r; };
 struct RrDefaults { cppi.RefCell* c = cppi.ref_cell(); cpppoly.Right* r = &cpppoly.both_ref(); };
 
 int lu_no_shadow(cpptw.Twin t) { return cpptw.take(t); }
@@ -4860,5 +4866,115 @@ extern int main()
         if (mid != 1 || got != 5 || rpDtors != 2 || (int)HeapAudit.reportLeaks() != heapBase + 1)
             return 3465;
     }
+    cpppoly.reset_unique_adjust_counts();
+    int uaField = 0;
+    int uaCall = 0;
+    {
+        unique cpppoly.Right* r = new cpppoly.Both();
+        uaField = r.rv;
+        uaCall = r.r();
+    }
+    if (uaField != 44 || uaCall != 2044 || cpppoly.left_unique_adjust_dtors() != 1
+        || cpppoly.right_unique_adjust_dtors() != 1
+        || cpppoly.both_unique_adjust_dtors() != 1) return 3470;
+
+    cpppoly.reset_unique_adjust_counts();
+    uaField = 0;
+    uaCall = 0;
+    {
+        unique cpppoly.Right* r = UaMakeRight();
+        uaField = r.rv;
+        uaCall = r.r();
+    }
+    if (uaField != 44 || uaCall != 2044 || cpppoly.left_unique_adjust_dtors() != 1
+        || cpppoly.right_unique_adjust_dtors() != 1
+        || cpppoly.both_unique_adjust_dtors() != 1) return 3471;
+
+    cpppoly.reset_unique_adjust_counts();
+    uaField = 0;
+    uaCall = 0;
+    {
+        unique cpppoly.Right* r = default;
+        cpppoly.Both* b = new cpppoly.Both();
+        r = move b;
+        uaField = r.rv;
+        uaCall = r.r();
+    }
+    if (uaField != 44 || uaCall != 2044 || cpppoly.left_unique_adjust_dtors() != 1
+        || cpppoly.right_unique_adjust_dtors() != 1
+        || cpppoly.both_unique_adjust_dtors() != 1) return 3472;
+
+    cpppoly.reset_unique_adjust_counts();
+    uaField = 0;
+    uaCall = 0;
+    {
+        cpppoly.Both* b = new cpppoly.Both();
+        unique cpppoly.Right* r = move b;
+        uaField = r.rv;
+        uaCall = r.r();
+    }
+    if (uaField != 44 || uaCall != 2044 || cpppoly.left_unique_adjust_dtors() != 1
+        || cpppoly.right_unique_adjust_dtors() != 1
+        || cpppoly.both_unique_adjust_dtors() != 1) return 3473;
+
+    cpppoly.reset_unique_adjust_counts();
+    uaField = 0;
+    uaCall = 0;
+    {
+        unique cpppoly.Right* r = new cpppoly.Right();
+        uaField = r.rv;
+        uaCall = r.r();
+    }
+    if (uaField != 22 || uaCall != 22 || cpppoly.left_unique_adjust_dtors() != 0
+        || cpppoly.right_unique_adjust_dtors() != 1
+        || cpppoly.both_unique_adjust_dtors() != 0) return 3474;
+
+    cpppoly.reset_unique_adjust_counts();
+    uaField = 0;
+    uaCall = 0;
+    {
+        unique cpppoly.Left* l = new cpppoly.Both();
+        uaField = l.lv;
+        uaCall = l.l();
+    }
+    if (uaField != 33 || uaCall != 1033 || cpppoly.left_unique_adjust_dtors() != 1
+        || cpppoly.right_unique_adjust_dtors() != 1
+        || cpppoly.both_unique_adjust_dtors() != 1) return 3475;
+
+    cpppoly.reset_unique_adjust_counts();
+    uaField = 0;
+    uaCall = 0;
+    {
+        unique cpppoly.Right* r = UaMakeMovedRight();
+        uaField = r.rv;
+        uaCall = r.r();
+    }
+    if (uaField != 44 || uaCall != 2044 || cpppoly.left_unique_adjust_dtors() != 1
+        || cpppoly.right_unique_adjust_dtors() != 1
+        || cpppoly.both_unique_adjust_dtors() != 1) return 3476;
+
+    cpppoly.reset_unique_adjust_counts();
+    uaField = 0;
+    uaCall = 0;
+    {
+        UaUniqueHolder h = default;
+        uaField = h.r.rv;
+        uaCall = h.r.r();
+    }
+    if (uaField != 44 || uaCall != 2044 || cpppoly.left_unique_adjust_dtors() != 1
+        || cpppoly.right_unique_adjust_dtors() != 1
+        || cpppoly.both_unique_adjust_dtors() != 1) return 3477;
+
+    cpppoly.reset_unique_adjust_counts();
+    uaField = 0;
+    uaCall = 0;
+    {
+        UaUniqueBraceHolder h = { r = new cpppoly.Both() };
+        uaField = h.r.rv;
+        uaCall = h.r.r();
+    }
+    if (uaField != 44 || uaCall != 2044 || cpppoly.left_unique_adjust_dtors() != 1
+        || cpppoly.right_unique_adjust_dtors() != 1
+        || cpppoly.both_unique_adjust_dtors() != 1) return 3478;
     return 0;
 }

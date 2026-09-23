@@ -12304,6 +12304,11 @@ bool MainListener::EmitOneFieldInit(
             auto ctorArg = rightNV;
             ctorArg.Primary = val;
             ctorArg.BaseType = val->getType();
+            val = compiler->AdjustCxxPointerForUniqueAdoption(
+                ctorArg, fieldType, val,
+                std::format("field '{}.{}'", displayTypeName, fieldName));
+            ctorArg.Primary = val;
+            ctorArg.BaseType = val->getType();
             ShapeCoreUniqueCtorArg(compiler, ctorArg, fieldType.TypeName, val);
             ctorArg.IsOwning = ctorArg.IsOwning || compiler->lastOwningResult
                 || compiler->lastCallReturnsOwned || compiler->IsOwnedNewTemp(val)
@@ -12683,6 +12688,10 @@ llvm::Value* MainListener::ParseFieldDefaultInitializer(
                         *compiler, field.TypeName)))))
         {
             auto ctorArg = nv;
+            ctorArg.Primary = val;
+            ctorArg.BaseType = val->getType();
+            val = compiler->AdjustCxxPointerForUniqueAdoption(
+                ctorArg, field, val, std::format("field of '{}'", structName));
             ctorArg.Primary = val;
             ctorArg.BaseType = val->getType();
             ShapeCoreUniqueCtorArg(compiler, ctorArg, field.TypeName, val);

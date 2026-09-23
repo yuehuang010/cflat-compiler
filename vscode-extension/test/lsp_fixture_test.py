@@ -197,6 +197,8 @@ def run_fixture(client: LspClient, fixture_path: Path) -> str | None:
         expected_line = expect_kv.get("line")
         if expected_line is not None and target_line != expected_line:
             return f"definition: expected line {expected_line}, got line {target_line}"
+        if expect_kv.get("file") == "same" and results[0].get("uri") != uri:
+            return f"definition: expected same-file URI {uri!r}, got {results[0].get('uri')!r}"
         return None
 
     if expect_kind == "completion":
