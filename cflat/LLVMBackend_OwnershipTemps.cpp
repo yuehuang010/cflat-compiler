@@ -1077,8 +1077,70 @@ void LLVMBackend::SetVariableOwning(const std::string& varName, bool value)
             if (it != frame.namedVariable.end())
             {
                 it->second.IsOwning = value;
+                // Keep an active view flag in step at the program point of the ownership event.
+                auto* flag = it->second.ViewOwnFlag;
+                if (it->second.ViewOwnFlagActive && flag != nullptr && IsInsertBlockLive()
+                    && flag->getFunction() == builder->GetInsertBlock()->getParent())
+                    builder->CreateStore(builder->getInt1(value), flag);
                 return;
             }
+        }
+    }
+
+void LLVMBackend::ActivateViewOwnFlag(const std::string& varName)
+{
+        if (varName.empty() || stackNamedVariable.empty()) return;
+        auto& frame = stackNamedVariable.back().namedVariable;
+        auto it = frame.find(varName);
+        if (it == frame.end() || it->second.ViewOwnFlagInit == nullptr) return;
+        it->second.ViewOwnFlagInit->setOperand(0, builder->getInt1(it->second.IsOwning));
+        it->second.ViewOwnFlagInit = nullptr;
+        it->second.ViewOwnFlagActive = true;
+    }
+
+LLVMBackend::NamedVariable* LLVMBackend::FindStackVariableByStorage(const llvm::Value* storage)
+{
+        if (storage == nullptr) return nullptr;
+        for (auto& frame : std::ranges::reverse_view(stackNamedVariable))
+            for (auto& [name, nv] : frame.namedVariable)
+                if (nv.Storage == storage) return &nv;
+        return nullptr;
+    }
+
+void LLVMBackend::EmitOwnedViewRelease(const NamedVariable& namedVar, llvm::Value* replacement)
+{
+        if (!namedVar.ViewOwnFlagActive || namedVar.ViewOwnFlag == nullptr || replacement == nullptr
+            || !replacement->getType()->isPointerTy() || !IsInsertBlockLive()
+            || namedVar.ViewOwnFlag->getFunction() != builder->GetInsertBlock()->getParent()) return;
+        // Re-storing the block the view already holds keeps its ownership; any other value is
+        // unowned until SetVariableOwning(true) adopts it later in this statement.
+        auto* old = builder->CreateLoad(namedVar.BaseType, namedVar.Storage, "view.old");
+        auto* same = builder->CreateICmpEQ(old, replacement, "view.same");
+        auto* owned = builder->CreateLoad(builder->getInt1Ty(), namedVar.ViewOwnFlag, "view.owned");
+        // A field escape already cleared the flag (ClearViewOwnFlag), so an escaped block is never
+        // released here; the replacement block starts a fresh field-escape count of one holder.
+        EmitOwningPtrCleanup(namedVar, replacement);
+        builder->CreateStore(builder->CreateSelect(same, owned, builder->getInt1(false)),
+                             namedVar.ViewOwnFlag);
+        if (namedVar.RefCountStorage != nullptr)
+        {
+            auto* count = builder->CreateLoad(builder->getInt32Ty(), namedVar.RefCountStorage);
+            builder->CreateStore(builder->CreateSelect(same, count, builder->getInt32(1)),
+                                 namedVar.RefCountStorage);
+        }
+    }
+
+void LLVMBackend::ClearViewOwnFlag(const std::string& varName)
+{
+        for (auto& frame : std::ranges::reverse_view(stackNamedVariable))
+        {
+            auto it = frame.namedVariable.find(varName);
+            if (it == frame.namedVariable.end()) continue;
+            auto* flag = it->second.ViewOwnFlag;
+            if (it->second.ViewOwnFlagActive && flag != nullptr && IsInsertBlockLive()
+                && flag->getFunction() == builder->GetInsertBlock()->getParent())
+                builder->CreateStore(builder->getInt1(false), flag);
+            return;
         }
     }
 
@@ -1296,6 +1358,10 @@ void LLVMBackend::EmitOwningPtrCleanup(const NamedVariable& namedVar, llvm::Valu
         if (replacement != nullptr && replacement->getType() == ptrVal->getType())
             skipCleanup = builder->CreateOr(
                 skipCleanup, builder->CreateICmpEQ(ptrVal, replacement, "move.same"));
+        if (namedVar.ViewOwnFlagActive && namedVar.ViewOwnFlag != nullptr
+            && namedVar.ViewOwnFlag->getFunction() == builder->GetInsertBlock()->getParent())
+            skipCleanup = builder->CreateOr(skipCleanup, builder->CreateNot(builder->CreateLoad(
+                builder->getInt1Ty(), namedVar.ViewOwnFlag, "view.owns")));
         auto* cleanupBB = llvm::BasicBlock::Create(*context, "move.cleanup", builder->GetInsertBlock()->getParent());
         auto* afterBB   = llvm::BasicBlock::Create(*context, "move.after",   builder->GetInsertBlock()->getParent());
         builder->CreateCondBr(skipCleanup, afterBB, cleanupBB);

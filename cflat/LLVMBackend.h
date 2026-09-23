@@ -1638,6 +1638,11 @@ public:
         // Runtime array state for a local pointer/view binding. -1 means scalar/unknown; values
         // >= 0 are raw-array element counts, including the distinct zero-length case.
         llvm::Value* RawArrayLengthStorage = nullptr;
+        // Runtime "this view local owns its block" (i1), seeded at declaration end; while active,
+        // scope exit and EmitOwnedViewRelease free only when set (never a borrowed/fixed block).
+        llvm::AllocaInst* ViewOwnFlag = nullptr;
+        llvm::StoreInst* ViewOwnFlagInit = nullptr;
+        bool ViewOwnFlagActive = false;
         // Same question for an `alias`-BORROW local root (`Box k = w.get(); move k.item;`): answered
         // where the root binding is RESOLVED, since a downstream name lookup cannot see a shadow.
         bool RootIsAliasBorrowLocal = false;
@@ -4039,6 +4044,15 @@ private:
                                  llvm::Value* rawArrayCount = nullptr);
 
     void EmitOwningPtrCleanup(const NamedVariable& namedVar, llvm::Value* replacement = nullptr);
+    // Reassignment of an owning array-view local: release the old block (element destructors
+    // over the old count, paired free) unless it is null, equal to `replacement`, or not owned.
+    void EmitOwnedViewRelease(const NamedVariable& namedVar, llvm::Value* replacement);
+    // Seeds the declared view local's runtime ownership flag from its final IsOwning.
+    void ActivateViewOwnFlag(const std::string& varName);
+    // A view local stored into a field no longer owns its block alone: it is never released at
+    // reassignment, and scope exit (refcount-gated) keeps its pre-existing behaviour.
+    void ClearViewOwnFlag(const std::string& varName);
+    NamedVariable* FindStackVariableByStorage(const llvm::Value* storage);
 
     // Null-safe reverse-order element destruction shared by scope cleanup and `delete[n]`.
     void EmitCountedArrayDestruction(llvm::Value* ptrVal, const std::string& typeName,

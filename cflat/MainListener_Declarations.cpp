@@ -5120,6 +5120,12 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
             auto declarator = initDecl->declarator();
             auto direct = declarator->directDeclarator();
             std::string declaratorName = direct != nullptr ? getDirectDeclName(direct) : std::string();
+            // A view local's runtime ownership flag starts from what the finished declaration owns.
+            struct ViewOwnFlagSeed
+            {
+                LLVMBackend* c; const std::string& n;
+                ~ViewOwnFlagSeed() { c->ActivateViewOwnFlag(n); }
+            } viewOwnFlagSeed{ compiler, declaratorName };
             // unique<T> owns exactly ONE object - it has no element count to free an array with.
             // Catch the direct `new T[n]` initializer here, before the wrapper's constructor
             // overload resolution reports the mismatch in wrapper terms.
@@ -8827,6 +8833,7 @@ void MainListener::TransferPointerOwnershipOnStore(
             compiler->builder->CreateStore(
                 compiler->builder->CreateAdd(cur, compiler->builder->getInt32(1), "refinc"),
                 refAlloca);
+            compiler->ClearViewOwnFlag(rightNV.CallerName);
         }
 
         // Transfer ownership: null the source alloca so EmitDestructorsForScope

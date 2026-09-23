@@ -173,6 +173,13 @@
 //   C++ temporary binding to reference parameters (3390-3399): non-const `T&` rejects direct,
 //     moved, returned and operator-result temporaries; named lvalues, `const T&`, `T&&`, overload
 //     selection, CFlat C++ fields and C++ reference returns retain their value-category rules.
+//   Reassigning an owning array view (3400-3420) destroys and frees the block it held - element
+//     destructors over the OLD count, then the element type's paired delete (CFlat struct, C++
+//     class with global / class / aligned operator delete[]) - for `new`, `move`, move-returning
+//     calls, `default`, loops, early return, break and unwind; null, self and borrowed views
+//     release nothing, and a view that holds a fixed array on the path taken is never freed.
+//     A view stored into a struct field (3420) is shared: reassigning the local frees only the new
+//     block at scope exit and leaves the field's block readable.
 
 import cpp "library/cpp_interop_basic.h";
 import cpp "library/cpp_interop_basic.cpp";
@@ -781,6 +788,29 @@ int OnUniqueLib(int x) { unique<cppon.Cls> p = new cppon.Cls(x); return p->get()
 int OnViewScope(int x) { cppon.Plain[] p = new cppon.Plain[3]; return p[2].get() + x; }
 int OnClsCtorThrows(int x) { cppon.Cls* p = new cppon.Cls(-x); int v = p->get(); delete p; return v; }
 int onArrN = 4;
+// Owning array-view reassignment (legs 3400-3420). VrS counts CFlat element destructors; vrZero
+// keeps the branch legs' conditions opaque to the optimizer.
+int vrDtors = 0;
+int vrZero = 0;
+struct VrS { int v = 7; ~VrS() { vrDtors = vrDtors + 1; } };
+struct VrH { VrS[] items = default; };
+move VrS[] VrMake(int n) { return new VrS[n]; }
+int VrParam(VrS[] p, VrS[] q) { p = q; return p[0].v; }
+int VrEarly(int k)
+{
+    VrS[] v = new VrS[3];
+    v = new VrS[2];
+    if (k > 0) return v[1].v;
+    v = new VrS[1];
+    return v[0].v + 1;
+}
+int VrUnwind(int x)
+{
+    cppon.Plain[] v = new cppon.Plain[3];
+    cppunw.Tr t = cppunw.Tr(x);
+    v = new cppon.Plain[2];
+    return v[0].get() + cppunw.thrower(x);
+}
 int fnptr_add_one(int x) { return x + 1; }
 int apply_fnptr(function<int(int)> f, int x) { return f(x); }
 void fnptr_noop() {}
@@ -4402,5 +4432,168 @@ extern int main()
     }
     // ---- C++ temporary binding to reference parameters (3390-3399) -----------------------------
     // Keep the added locals in a helper frame so the existing unwind tests keep their frame shape.
+    // ---- Reassigning an owning array view releases the old block (3400-3420) ------------------
+    // Pre-fix the view store overwrote the slot and nothing ever destroyed or freed the first
+    // block: every `mid` count below read 0 and HeapAudit kept one live block per reassignment.
+    {
+        int heapBase = (int)HeapAudit.reportLeaks();
+        vrDtors = 0;
+        int mid = 0;
+        { VrS[] v = new VrS[3]; v = new VrS[2]; mid = vrDtors; }
+        if (mid != 3 || vrDtors != 5 || (int)HeapAudit.reportLeaks() != heapBase) return 3400;
+        // C++ class elements free through ::operator delete[], never the single-object delete.
+        cppunw.reset();
+        cppon.reset();
+        int midDel = 0;
+        { cppon.Plain[] v = new cppon.Plain[3]; v = new cppon.Plain[2]; mid = cppon.dtors();
+          midDel = cppunw.deleteArrs(); }
+        if (mid != 3 || midDel != 1 || cppon.dtors() != 5 || cppunw.deleteArrs() != 2
+            || cppunw.deletes() != 0 || cppon.live() != 0) return 3401;
+        // The class's own operator delete[] (sized: a whole number of elements, else +100).
+        cppon.reset();
+        { cppon.Arr[] v = new cppon.Arr[3]; v = new cppon.Arr[2]; mid = cppon.clsDelArr(); }
+        if (mid != 1 || cppon.clsDelArr() != 2 || cppon.dtors() != 5 || cppon.live() != 0) return 3402;
+        // Polymorphic elements: n destructors, never element 0's deleting destructor.
+        cppunw.reset();
+        cppon.reset();
+        { cppon.Poly[] v = new cppon.Poly[3]; v = new cppon.Poly[2]; mid = cppon.dtors(); }
+        if (mid != 3 || cppon.clsDel() != 0 || cppunw.deleteArrs() != 2 || cppon.live() != 0)
+            return 3403;
+        // Over-aligned element: the aligned delete[] pair.
+        cppon.reset();
+        { cppon.Wide[] v = new cppon.Wide[3]; v = new cppon.Wide[2]; mid = cppon.dtors(); }
+        if (mid != 3 || cppon.live() != 0 || (int)HeapAudit.reportLeaks() != heapBase) return 3404;
+
+        // `v = move w`: v's old block goes, w is nulled, and v frees w's block exactly once.
+        vrDtors = 0;
+        bool wNull = false;
+        { VrS[] v = new VrS[3]; VrS[] w = new VrS[2]; v = move w; mid = vrDtors; wNull = w == nullptr; }
+        if (mid != 3 || !wNull || vrDtors != 5 || (int)HeapAudit.reportLeaks() != heapBase) return 3405;
+        cppunw.reset();
+        cppon.reset();
+        { cppon.Plain[] v = new cppon.Plain[3]; cppon.Plain[] w = new cppon.Plain[2]; v = move w;
+          mid = cppon.dtors(); }
+        if (mid != 3 || cppon.dtors() != 5 || cppunw.deleteArrs() != 2 || cppon.live() != 0)
+            return 3406;
+        // Accept-set, passes on both binaries: `v = v` keeps the live block and releases nothing.
+        heapBase = (int)HeapAudit.reportLeaks();
+        vrDtors = 0;
+        int v0 = 0;
+        { VrS[] v = new VrS[3]; v = v; mid = vrDtors; v0 = v[2].v; }
+        if (mid != 0 || v0 != 7 || vrDtors != 3 || (int)HeapAudit.reportLeaks() != heapBase) return 3407;
+
+        // A loop releases on every iteration (CFlat struct, then a C++ class).
+        vrDtors = 0;
+        { VrS[] v = new VrS[1]; for (int i = 0; i < 4; i++) v = new VrS[2]; mid = vrDtors; }
+        if (mid != 7 || vrDtors != 9 || (int)HeapAudit.reportLeaks() != heapBase) return 3408;
+        cppunw.reset();
+        cppon.reset();
+        { cppon.Plain[] v = new cppon.Plain[1]; for (int i = 0; i < 4; i++) v = new cppon.Plain[2];
+          mid = cppon.dtors(); midDel = cppunw.deleteArrs(); }
+        if (mid != 7 || midDel != 4 || cppunw.deleteArrs() != 5 || cppon.live() != 0) return 3409;
+
+        // A null / `default` / moved-from old view frees nothing; `v = default` releases the block.
+        vrDtors = 0;
+        {
+            VrS[] n = default;
+            n = new VrS[2];
+            VrS[] w = new VrS[3];
+            VrS[] m = move w;
+            w = new VrS[1];
+            VrS[] d = new VrS[4];
+            d = default;
+            mid = vrDtors;
+        }
+        if (mid != 4 || vrDtors != 10 || (int)HeapAudit.reportLeaks() != heapBase) return 3410;
+
+        // Accept-set, passes on both binaries: borrowed views release nothing - a `T[]` parameter
+        // and a local bound to another view.
+        heapBase = (int)HeapAudit.reportLeaks();
+        vrDtors = 0;
+        int got = 0;
+        {
+            VrS[] a = new VrS[3];
+            VrS[] b = new VrS[2];
+            b[0].v = 9;
+            got = VrParam(a, b);
+            VrS[] x = a;
+            x = b;
+            got = got + x[0].v;
+            mid = vrDtors;
+        }
+        if (got != 18 || mid != 0 || vrDtors != 5 || (int)HeapAudit.reportLeaks() != heapBase)
+            return 3411;
+        // `v = w` from an OWNING view without `move`: v's block goes and v borrows w's.
+        // Pre-fix v kept its ownership and freed w's block a second time (SIGTRAP).
+        vrDtors = 0;
+        { VrS[] v = new VrS[3]; VrS[] w = new VrS[2]; v = w; mid = vrDtors; }
+        if (mid != 3 || vrDtors != 5 || (int)HeapAudit.reportLeaks() != heapBase) return 3412;
+
+        // A view that holds a FIXED array on the path taken is never freed, at the reassignment
+        // or at scope exit. Pre-fix the scope exit freed the stack array when the branch that
+        // adopted `new` was not taken (SIGABRT).
+        vrDtors = 0;
+        {
+            VrS[3] fa;
+            VrS[] x = fa;
+            if (vrZero > 0) x = new VrS[2];
+            mid = vrDtors;
+        }
+        if (mid != 0 || vrDtors != 3 || (int)HeapAudit.reportLeaks() != heapBase) return 3413;
+        vrDtors = 0;
+        {
+            VrS[3] fa;
+            VrS[] x = fa;
+            if (vrZero > 0) x = new VrS[2];
+            x = new VrS[4];
+            VrS[] o = new VrS[1];
+            VrS[] b = new VrS[2];
+            if (vrZero > 0) o = b;
+            o = new VrS[5];                                           // releases the S[1] block
+            mid = vrDtors;
+        }
+        if (mid != 1 || vrDtors != 15 || (int)HeapAudit.reportLeaks() != heapBase) return 3414;
+
+        // Early return, break, a move-returning call and a '?:' of two `new` blocks.
+        vrDtors = 0;
+        got = VrEarly(1) + VrEarly(0);
+        if (got != 15 || vrDtors != 11 || (int)HeapAudit.reportLeaks() != heapBase) return 3415;
+        vrDtors = 0;
+        { VrS[] v = new VrS[1]; for (int i = 0; i < 5; i++) { v = new VrS[2]; if (i == 2) break; }
+          mid = vrDtors; }
+        if (mid != 5 || vrDtors != 7 || (int)HeapAudit.reportLeaks() != heapBase) return 3416;
+        vrDtors = 0;
+        { VrS[] v = VrMake(3); v = VrMake(2); v = vrZero > 0 ? new VrS[1] : new VrS[4]; mid = vrDtors; }
+        if (mid != 5 || vrDtors != 9 || (int)HeapAudit.reportLeaks() != heapBase) return 3417;
+
+        // A C++ exception after the reassignment: the old block was already released, the new
+        // one is freed by the unwind cleanup - through ::operator delete[] both times.
+        cppunw.reset();
+        cppon.reset();
+        if (cppunw.guarded(VrUnwind, 5) != -5 || cppon.dtors() != 5 || cppunw.deleteArrs() != 2
+            || cppon.live() != 0 || cppunw.live() != 0) return 3418;
+
+        // Primitive and string element views: the old block is freed (string buffers included).
+        { int[] p = new int[3]; p = new int[2]; string[] s = new string[2]; s[0] = "abc".copy();
+          s = new string[3]; }
+        if ((int)HeapAudit.reportLeaks() != heapBase) return 3419;
+
+        // A view stored into a struct field keeps its block alive for the field: the reassignment
+        // releases nothing and scope exit frees only the new block. The escaped block is still the
+        // pre-existing field-escape leak (+1). Pre-fix HEAD freed it under the field (UAF, 2 read).
+        vrDtors = 0;
+        int held = 0;
+        {
+            VrH h;
+            VrS[] v = new VrS[3];
+            v[0].v = 11;
+            h.items = v;
+            v = new VrS[2];
+            held = h.items[0].v;
+            mid = vrDtors;
+        }
+        if (held != 11 || mid != 0 || vrDtors != 2 || (int)HeapAudit.reportLeaks() != heapBase + 1)
+            return 3420;
+    }
     return CppTemporaryRefCases();
 }

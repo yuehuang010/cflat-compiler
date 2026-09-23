@@ -5127,6 +5127,12 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                 // The declaration path verifies the initializer against the declared clause; this
                 // is the same check for the reassignment door, before the re-derive below.
                 RejectLocalAllocAlignMismatch(namedVar, rightNV, right, ctx);
+                // Reassigning an owning view local releases the block it held, before the count
+                // below is re-derived. '??=' only stores into a null view, so it has nothing to free.
+                if (namedVar.TypeAndValue.IsArrayView && coalesceResume == nullptr && right != nullptr
+                    && llvm::isa<llvm::AllocaInst>(namedVar.Storage))
+                    if (auto* viewLocal = compiler->FindStackVariableByStorage(namedVar.Storage))
+                        compiler->EmitOwnedViewRelease(*viewLocal, right);
                 auto* asgNewArr = assignCtx ? AsDirectNew(assignCtx) : nullptr;
                 const bool rhsIsWholeRawArrayBinding = rightNV.FieldName.empty()
                     && rightNV.OwningStructName.empty() && !rightNV.IsElementAccess

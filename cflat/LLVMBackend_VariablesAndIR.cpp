@@ -481,6 +481,13 @@ llvm::Value* LLVMBackend::CreateLocalVariable(const TypeAndValue& typeValue, llv
                 AllocaAtEntry(builder->getInt64Ty(), nullptr,
                               typeValue.VariableName + ".raw_array_count");
             builder->CreateStore(builder->getInt64(-1), namedVariable.RawArrayLengthStorage);
+            if (typeValue.IsArrayView)
+            {
+                namedVariable.ViewOwnFlag = AllocaAtEntry(
+                    builder->getInt1Ty(), nullptr, typeValue.VariableName + ".owns");
+                namedVariable.ViewOwnFlagInit =
+                    builder->CreateStore(builder->getInt1(false), namedVariable.ViewOwnFlag);
+            }
         }
         RecordMoveGenBind(typeValue.VariableName); // fresh local binding
         // --sanitize=ownership (M1): give every pointer local a zero-initialized move-origin slot.
