@@ -4192,8 +4192,10 @@ void LLVMBackend::NoteUnwindPartial(UnwindPartialEntry::Kind kind, llvm::Value* 
         if (!cppInteropUsed_ || v == nullptr || builder->GetInsertBlock() == nullptr) return;
         // Only what the pad would actually release: otherwise the entry just turns later calls
         // into invokes with an empty pad.
+        // A finished fixed-array field value is destroyed element by element.
         if (kind == UnwindPartialEntry::Kind::Value
-            && (!v->getType()->isStructTy() || !HasNonTrivialDestructor(typeName)))
+            && ((!v->getType()->isStructTy() && !v->getType()->isArrayTy())
+                || !HasNonTrivialDestructor(typeName)))
             return;
         if (kind == UnwindPartialEntry::Kind::Members
             && GetOrCreateFullDestructor(typeName, /*membersOnly=*/true) == nullptr)
@@ -4214,7 +4216,48 @@ void LLVMBackend::EmitUnwindPartialRelease(const UnwindPartialEntry& e)
             // The field's finished value is an SSA aggregate; destroy it through a spill.
             auto* tmp = AllocaAtEntry(e.V->getType(), nullptr, "unwind.part");
             builder->CreateStore(e.V, tmp);
+            if (e.V->getType()->isArrayTy())
+            {
+                llvm::Type* elemTy = nullptr;
+                const uint64_t n = PeelFixedArrayType(e.V->getType(), elemTy);
+                EmitUnwindPartialRelease({ UnwindPartialEntry::Kind::ArrayPrefix, tmp, e.TypeName,
+                                           e.Fn, 0, builder->getInt64(n), elemTy });
+                return;
+            }
             builder->CreateCall(dtor->getFunctionType(), dtor, { tmp });
+            return;
+        }
+        case UnwindPartialEntry::Kind::ArrayPrefix:
+        {
+            llvm::Function* dtor = GetOrCreateFullDestructor(e.TypeName);
+            if (dtor == nullptr || e.Count == nullptr || e.ElemTy == nullptr) return;
+            auto destroyAt = [&](llvm::Value* index) {
+                builder->CreateCall(dtor->getFunctionType(), dtor,
+                    { builder->CreateInBoundsGEP(e.ElemTy, e.V, { index }, "unwind.arrelem") });
+            };
+            auto* constCount = llvm::dyn_cast<llvm::ConstantInt>(e.Count);
+            if (constCount != nullptr && constCount->getZExtValue() <= kMaxUnrolledArrayElements)
+            {
+                for (uint64_t i = constCount->getZExtValue(); i > 0; --i)
+                    destroyAt(builder->getInt64(i - 1));
+                return;
+            }
+            // Newest first: i = count-1 down to 0.
+            auto* i64Ty = builder->getInt64Ty();
+            llvm::Value* total = builder->CreateZExtOrTrunc(e.Count, i64Ty, "unwind.arrn");
+            auto* fn = builder->GetInsertBlock()->getParent();
+            auto* preBB = builder->GetInsertBlock();
+            auto* loopBB = llvm::BasicBlock::Create(*context, "unwind.arrloop", fn);
+            auto* doneBB = llvm::BasicBlock::Create(*context, "unwind.arrdone", fn);
+            builder->CreateCondBr(builder->CreateICmpNE(total, builder->getInt64(0)), loopBB, doneBB);
+            builder->SetInsertPoint(loopBB);
+            auto* idx = builder->CreatePHI(i64Ty, 2, "unwind.arri");
+            idx->addIncoming(total, preBB);
+            auto* prev = builder->CreateSub(idx, builder->getInt64(1), "unwind.arrprev");
+            destroyAt(prev);
+            idx->addIncoming(prev, builder->GetInsertBlock());
+            builder->CreateCondBr(builder->CreateICmpNE(prev, builder->getInt64(0)), loopBB, doneBB);
+            builder->SetInsertPoint(doneBB);
             return;
         }
         case UnwindPartialEntry::Kind::Slot:
@@ -4243,6 +4286,31 @@ void LLVMBackend::EmitUnwindPartialRelease(const UnwindPartialEntry& e)
             return;
         }
         }
+}
+
+void LLVMBackend::NoteUnwindArrayPrefix(llvm::Value* base, llvm::Type* elemTy, llvm::Value* count,
+                                        const std::string& elemTypeName)
+{
+        if (!cppInteropUsed_ || base == nullptr || elemTy == nullptr || count == nullptr
+            || builder->GetInsertBlock() == nullptr)
+            return;
+        // Element 0 has nothing built before it: no entry, so no invoke with an empty pad.
+        if (auto* c = llvm::dyn_cast<llvm::ConstantInt>(count); c != nullptr && c->isZero()) return;
+        if (!HasNonTrivialDestructor(elemTypeName)) return;
+        unwindPartial_.push_back({ UnwindPartialEntry::Kind::ArrayPrefix, base, elemTypeName,
+                                   builder->GetInsertBlock()->getParent(), 0, count, elemTy });
+}
+
+void LLVMBackend::EmitArrayConstructionWalk(llvm::Value* base, llvm::Type* elemTy, uint64_t n,
+                                            const std::string& elemTypeName,
+                                            const std::function<void(llvm::Value*)>& emitElem)
+{
+        EmitFixedArrayElementWalk(*builder, base, elemTy, n,
+            [&](llvm::Value* elemPtr, llvm::Value* index) {
+                UnwindPartialScope builtElements(*this);
+                NoteUnwindArrayPrefix(base, elemTy, index, elemTypeName);
+                emitElem(elemPtr);
+            });
 }
 
 bool LLVMBackend::FrameOwesUnwindCleanup()

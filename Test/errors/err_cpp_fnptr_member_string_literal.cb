@@ -1,0 +1,9 @@
+import cpp "cpp_interop_fnptr.h";
+extern int main()
+{
+    cppfnptr.Sink sink = default;
+    expect_error("cannot pass a non-function pointer value to 'function<>' parameter") {
+        sink.member("abc");
+    }
+    return 0;
+}

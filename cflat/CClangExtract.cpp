@@ -2331,6 +2331,21 @@ namespace cflat_cinterop
                                     : ctx.getASTRecordLayout(cxx).getBaseClassOffset(brd->getDefinition())).getQuantity();
                             rec.bases.push_back(std::move(rb));
                         }
+                        const clang::ASTRecordLayout& selfLayout = ctx.getASTRecordLayout(cxx);
+                        for (const CXXBaseSpecifier& vb : cxx->vbases())
+                        {
+                            const auto* vrd = vb.getType()->getAsCXXRecordDecl();
+                            if (vrd == nullptr || vrd->getDefinition() == nullptr) continue;
+                            RawCxxBase rb;
+                            rb.canonicalType = CanonicalSpelling(ctx, vb.getType());
+                            rb.name = rb.canonicalType.empty() ? CxxQualifiedName(vrd)
+                                : CxxForeignIdentity(rb.canonicalType);
+                            rb.access = MapAccess(vb.getAccessSpecifier());
+                            rb.isVirtual = true;
+                            rb.offsetBytes = (uint64_t)selfLayout
+                                .getVBaseClassOffset(vrd->getDefinition()).getQuantity();
+                            rec.virtualBases.push_back(std::move(rb));
+                        }
                         // A vptr or a base subobject has no CFlat spelling, so the layout is
                         // flattened out of Clang's own record layout instead of read field by
                         // field. Virtual inheritance needs a VTT and is refused outright.
@@ -2885,10 +2900,9 @@ namespace cflat_cinterop
             // Dedups redeclarations by name. Returns true (continue traversal) unconditionally.
             bool HarvestGlobalVar(VarDecl* vd)
             {
-                if (!vd->isFileVarDecl()) return true;            // locals, params, members
-
-                if (st.req.cxxMode && !vd->isStaticDataMember())
-                    return HarvestCxxNamespaceVar(vd);
+                if (!vd->isFileVarDecl()) return true;            // locals, params, instance members
+                if (vd->isStaticDataMember()) return true;       // reached through its class
+                if (st.req.cxxMode) return HarvestCxxNamespaceVar(vd);
 
                 if (vd->getStorageClass() == SC_Static) return true;  // internal linkage
                 if (!vd->hasExternalFormalLinkage()) return true;
@@ -3383,6 +3397,38 @@ namespace cflat_cinterop
         }
 
         /*
+         * Itanium counterpart of the above, for exactly the vtables the companion emits itself
+         * (vtableWork minus a key-function or `extern template` anchor - the same filter as the
+         * HandleVTable loop). A blind HandleVTable references every virtual member, but Sema only
+         * instantiates a class template's virtual bodies once the vtable is USED, so an inline
+         * virtual (libc++'s hidden basic_stringbuf<char>::seekpos when the dylib does not export
+         * the specialization) stayed a declaration and the final link could not resolve it.
+         */
+        void DefineEmittedVTableMembers(ExtractState& st, ASTContext& ctx)
+        {
+            if (!st.ci->hasSema() || !st.req.emitDefinitions
+                || ctx.getTargetInfo().getCXXABI().isMicrosoft())
+                return;
+            Sema& sema = st.ci->getSema();
+            bool marked = false;
+            for (const CXXRecordDecl* rd : st.vtableWork)
+            {
+                const CXXRecordDecl* def = CompleteNonDependentCxxRecord(rd);
+                if (def == nullptr || !def->isDynamicClass() || def->isInvalidDecl()
+                    || ctx.getCurrentKeyFunction(def) != nullptr
+                    || def->getTemplateSpecializationKind()
+                        == clang::TSK_ExplicitInstantiationDeclaration)
+                    continue;
+                sema.MarkVTableUsed(def->getLocation(), const_cast<CXXRecordDecl*>(def),
+                                    /*DefinitionRequired*/ true);
+                marked = true;
+            }
+            if (!marked) return;
+            sema.DefineUsedVTables();
+            sema.PerformPendingInstantiations();
+        }
+
+        /*
          * An error clang raised inside a header the caller asked to bind poisons everything
          * downstream: Sema marks the offending declarations invalid, every instantiation that
          * touches them comes out holding error expressions, and companion CodeGen would then walk
@@ -3476,6 +3522,7 @@ namespace cflat_cinterop
             DefineHeaderImplicitSpecialMembers(st);
             DefineDefaultedSpecialMembers(st);
             DefineMicrosoftVTableMembers(st, ctx);
+            DefineEmittedVTableMembers(st, ctx);
             if (st.abiWork.empty() && st.functionPointerAbiWork.empty()
                 && st.memberAbiWork.empty() && !st.req.emitDefinitions) return;
             using namespace clang::CodeGen;
@@ -4069,9 +4116,28 @@ namespace cflat_cinterop
 
                 explicit UsedFunctionVisitor(std::vector<const FunctionDecl*>& w) : work(w) {}
                 bool shouldVisitTemplateInstantiations() const { return true; }
+                /*
+                 * Clang finds a member body defined INSIDE its class on first reference, so only an
+                 * out-of-line member (libc++'s `inline ios_base::flags() const`, or an instantiated
+                 * out-of-line member of a class template) needs promoting like a free function.
+                 * Constructors and destructors stay with their structor-kind requests.
+                 */
+                static bool SkippedMember(const FunctionDecl* fd)
+                {
+                    if (!llvm::isa<CXXMethodDecl>(fd)) return false;
+                    if (llvm::isa<CXXConstructorDecl>(fd) || llvm::isa<CXXDestructorDecl>(fd))
+                        return true;
+                    const FunctionDecl* body = nullptr;
+                    if (!fd->hasBody(body) || body == nullptr) return true;
+                    return llvm::isa<CXXRecordDecl>(body->getLexicalDeclContext());
+                }
+                // Every callee seen, and every definition whose body a traversal already walked.
+                std::vector<const FunctionDecl*> reach;
+                std::unordered_set<const FunctionDecl*> reachSeen, walked;
                 void AddFunction(const FunctionDecl* fd)
                 {
-                    if (fd == nullptr || llvm::isa<CXXMethodDecl>(fd)) return;
+                    if (fd != nullptr && reachSeen.insert(fd).second) reach.push_back(fd);
+                    if (fd == nullptr || SkippedMember(fd)) return;
                     const FunctionDecl* definition = fd;
                     if (!definition->hasBody() || definition->getType()->isDependentType())
                     {
@@ -4108,8 +4174,16 @@ namespace cflat_cinterop
                     auto* call = llvm::dyn_cast<CallExpr>(op->getSemanticForm());
                     return call == nullptr || VisitCallExpr(call);
                 }
+                bool VisitCXXConstructExpr(CXXConstructExpr* ce)
+                {
+                    if (ce != nullptr && ce->getConstructor() != nullptr
+                        && reachSeen.insert(ce->getConstructor()).second)
+                        reach.push_back(ce->getConstructor());
+                    return true;
+                }
                 bool VisitFunctionDecl(FunctionDecl* fd)
                 {
+                    if (fd != nullptr && fd->doesThisDeclarationHaveABody()) walked.insert(fd);
                     // Anything whose definition this module would have to provide itself: an
                     // internal-linkage helper (libc++'s _LIBCPP_HIDE_FROM_ABI), an inline body, or
                     // a template instantiation. A plain external non-inline function is NOT
@@ -4119,7 +4193,7 @@ namespace cflat_cinterop
                             || fd->isInlined()
                             || fd->getTemplateSpecializationKind() == TSK_ImplicitInstantiation
                             || fd->getFormalLinkage() == Linkage::Internal);
-                    if (fd == nullptr || llvm::isa<CXXMethodDecl>(fd) || !fd->hasBody()
+                    if (fd == nullptr || SkippedMember(fd) || !fd->hasBody()
                         || !fd->isUsed() || !ownDefinitionNeeded
                         || fd->getType()->isDependentType()
                         || fd->getDeclContext()->isDependentContext())
@@ -4135,6 +4209,22 @@ namespace cflat_cinterop
             } usedFunctions(usedFunctionWork);
             usedFunctions.TraverseDecl(root);
             for (Decl* d : st.announcedDecls) usedFunctions.TraverseDecl(d);
+            /*
+             * The TU walk never enters a member of an `extern template` specialization, yet its
+             * hidden inline members (libc++ basic_string::__grow_by_without_replace) are lowered
+             * here and call further helpers. Close over every reached body clang emits locally.
+             */
+            for (size_t i = 0; i < usedFunctions.reach.size(); ++i)
+            {
+                const FunctionDecl* body = nullptr;
+                if (!usedFunctions.reach[i]->hasBody(body) || body == nullptr
+                    || body->getType()->isDependentType() || body->isDependentContext()
+                    || !usedFunctions.walked.insert(body).second)
+                    continue;
+                const GVALinkage linkage = ctx.GetGVALinkageForFunction(body);
+                if (linkage != GVA_DiscardableODR && linkage != GVA_Internal) continue;
+                usedFunctions.TraverseStmt(body->getBody());
+            }
             for (const FunctionDecl* fd : usedFunctionWork)
             {
                 cg.HandleTopLevelDecl(DeclGroupRef(const_cast<FunctionDecl*>(fd)));

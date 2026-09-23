@@ -5710,7 +5710,17 @@ public:
         LLVMBackend::NamedVariable named;
         std::string name;
         bool accumulated = false;
+        // "char" / "int" / "long" when the operand is written as a literal: its C++ type.
+        std::string literalType;
+        // A dotted name in an imported C++ namespace that is no CFlat value (`std.cout`,
+        // `std.endl`): spelled into the C++ infix expression instead of being evaluated.
+        std::string cxxName;
     };
+    llvm::Value* TryCxxInfixShift(CFlatParser::ShiftExpressionContext* ctx, const std::string& op,
+                                  const ShiftOperand& lhs, const std::string& lhsClass,
+                                  llvm::Value* lhsStorage,
+                                  const ShiftOperand& rhs, const std::string& rhsClass,
+                                  llvm::Value* rhsStorage);
 
     struct ShiftPairResult
     {
@@ -6043,11 +6053,13 @@ public:
         const LLVMBackend::DeclTypeAndValue& field,
         CFlatParser::InitializerListContext* list);
 
-    // Build field initialization for a native constructor without a user ctor body.
+    // Build field initialization for a native constructor without a user ctor body. Only the
+    // first `fieldCount` fields are initialized (a program's synthetic fields follow its own).
     llvm::Value* EmitAggregateFieldInitialization(
         const std::string& structName,
         llvm::StructType*& structType,
-        std::vector<LLVMBackend::DeclTypeAndValue>& fields);
+        std::vector<LLVMBackend::DeclTypeAndValue>& fields,
+        size_t fieldCount = SIZE_MAX);
 
     /*
      * The fixed-array arm of the above. The list is POSITIONAL, so the value has to be built

@@ -91,6 +91,10 @@
 //     frame; partial construction of a CFlat struct (built fields destroyed, the rest and the
 //     struct not), `new` freeing its block when the ctor throws, and string / closure / pointer
 //     temporaries released at the throw unless already handed to a sink parameter (3178-3198).
+//   Partial construction of ARRAYS (local `= default` / `{}` / positional / short tail, 2-D,
+//     the runtime-loop walk, `new T[n]` constant and runtime, CFlat element types, array fields,
+//     the synthesized copy), of `class` / `program` / `[cpp] struct` fields, and interface
+//     method calls as invokes (3261-3281).
 // `import cpp` selects C++ mode; the extension is irrelevant (the fixture header is a plain
 // .h). The header supplies the declarations, the .cpp is compiled by the host C++ driver
 // and linked in. Both are needed: the header alone has no definitions, and the source alone
@@ -134,7 +138,20 @@
 //     the fixture owns (a class template with tagged free operator templates, a second one
 //     declaring only == and <=> so the relational forms are C++20 rewrites, two
 //     specializations, and a plain class with NON-template free operators as the accept set).
-//   The default C++ import standard is c++20 (`__cplusplus == 202002L`).
+//   C++ STANDARD STREAMS (3200-3211). ostringstream/stringstream/ofstream/ifstream/cout through
+//     `<<` and `>>` chains, bound as clang-resolved infix expressions (members, free templates,
+//     ADL, derived-to-base) including name operands (std.endl, std.cout), plus the link of every
+//     inline libc++ body they reach and basic_ios members reached through the virtual base.
+//   The default C++ import standard is c++20 (`__cplusplus == 202002L`, 3212).
+//   Core list<T> stores trivially-copyable imported C++ classes with user constructors through
+//     add/get/remove/iteration/clear, direct and C++ typedef-alias spellings, and generic function and
+//     struct instantiations; no-ctor classes, a CFlat holder field, arrays, unique, and a
+//     nontrivial C++ class pin the neighbouring paths (codes 3230-3241).
+//   C++ callback parameters (3290-3302): matching named functions through typedef and inline
+//     signatures, a C++ callback return, static method bridge, constructor and member params,
+//     std::function, void callbacks, nullptr, and literal 0.
+//   Out-of-line C++ static data member definitions stay class-scoped (3310-3319), including a
+//     template specialization; bare member names are not registered as CFlat globals.
 
 import cpp "library/cpp_interop_basic.h";
 import cpp "library/cpp_interop_basic.cpp";
@@ -176,6 +193,21 @@ import "unique.cb";
 import cpp "library/cpp_interop_unwind.h";
 import cpp "library/cpp_interop_unwind.cpp";
 import "diagnostic/heap_audit.cb";
+// Standard streams: one grouped std import (stringstream is not visible through a user header alone).
+import cpp {"sstream", "fstream", "iostream", "iomanip"};
+import cpp "library/cpp_interop_stream.h";
+import cpp "library/cpp_interop_list.h";
+
+int cppListTakeValue = 0;
+void take<T>(list<T>* values, int expectedCount)
+{
+    if (values->count() == expectedCount && expectedCount > 0)
+        cppListTakeValue = values->get(0).value;
+}
+struct CppListBox<T> { list<T> values; };
+struct CppListHolder { cpplist.Plain item = default; int tag = 0; };
+struct CppListValue { int value = 0; };
+import cpp "library/cpp_interop_fnptr.h";
 
 // A C++ exception unwinding THROUGH CFlat frames (the C++ `guarded` catch sits above them): every
 // destructor each frame owes runs exactly once and the catch still sees the thrown value.
@@ -471,8 +503,8 @@ int UnwStrTemp(int x)
 int UnwStrTempAlone(int x) { return UnwStrUse(unwSa + unwSb, x); }
 int UnwClosureTemp(int x)
 {
-    int kq = 3;
-    return UnwFnUse((int v) => { return v + kq; }, x);
+    int k = 3;
+    return UnwFnUse((int v) => { return v + k; }, x);
 }
 int UnwSinkTemp(int x) { return UnwStrSink(unwSa + unwSb, x); }
 int UnwSinkAndLiveTemp(int x)
@@ -484,6 +516,120 @@ int UnwTempLaterArg(int x) { return UnwStrUse(unwSa + unwSb, cppunw.thrower(x));
 int UnwPtrTemp(int x) { return (UnwMakePlain() != nullptr ? 1 : 0) + cppunw.thrower(x); }
 int UnwOwnedRetTemp(int x) { return UnwMakeStr().length() + cppunw.thrower(x); }
 int UnwTempAfterCall(int x) { return UnwStrUse(unwSa + unwSb, -1) + cppunw.thrower(x); }
+// Partial construction of ARRAYS, class / program / [cpp] struct fields, and interface calls in a
+// frame an exception unwinds through (legs 3261-3281). setArm(n) makes the n-th next Tx default or
+// copy constructor throw: every element or field built before it is destroyed exactly once, newest
+// first; the throwing one, the ones after it and the enclosing object never are.
+struct UnwArrInner { cppunw.Tx f = default; };
+struct UnwArrField { cppunw.Tx a = default; cppunw.Tx[3] arr = default; };
+struct UnwArrThenField { cppunw.Tx[2] arr = default; cppunw.Tx b = default; };
+struct UnwArrCopy { cppunw.Tx[3] arr = default; };
+class UnwCls2 { cppunw.Tx f1 = default; cppunw.Tx f2 = default; };
+class UnwClsCtor2 { cppunw.Tx f1 = default; cppunw.Tx f2 = default; UnwClsCtor2(int v) { } };
+program UnwProg2
+{
+    cppunw.Tx f1 = default;
+    cppunw.Tx f2 = default;
+    int main(move list<string> args) { return f1.get(); }
+};
+[cpp] struct UnwCppFields { cppunw.Tx f1 = default; cppunw.Tx f2 = default; };
+[cpp] struct UnwCppFieldsCtor { cppunw.Tx f1 = default; cppunw.Tx f2 = default; UnwCppFieldsCtor(int v) { } };
+interface IUnwRun { int run(int x); };
+class UnwRunImpl : IUnwRun { int k = 1; int run(int x) { return cppunw.thrower(x) + k; } };
+int unwArrN = 3;
+int UnwArrLocal(int x)
+{
+    cppunw.Tr a = default;
+    cppunw.setArm(3);
+    cppunw.Tx[3] arr = default;
+    return arr[0].get();
+}
+int UnwArrEmptyBrace(int x) { cppunw.setArm(3); cppunw.Tx[3] arr = {}; return arr[0].get(); }
+int UnwArrShortTail(int x) { cppunw.setArm(2); cppunw.Tx[3] arr = { cppunw.Tx(0) }; return arr[0].get(); }
+int UnwArr2D(int x) { cppunw.setArm(4); cppunw.Tx[2][2] arr = default; return arr[0][0].get(); }
+int UnwArrLoop(int x) { cppunw.setArm(11); cppunw.Tx[20] arr = default; return arr[0].get(); }
+int UnwArrPositional(int x)
+{
+    cppunw.Tx[3] arr = { cppunw.Tx(0), cppunw.Tx(0), cppunw.Tx(x) };
+    return arr[0].get();
+}
+int UnwArrNew(int x)
+{
+    cppunw.Tr a = default;
+    cppunw.setArm(3);
+    cppunw.Tx[] p = new cppunw.Tx[3];
+    int v = p[0].get();
+    delete p;
+    return v;
+}
+int UnwArrNewRuntime(int x)
+{
+    cppunw.setArm(3);
+    cppunw.Tx[] p = new cppunw.Tx[unwArrN];
+    int v = p[0].get();
+    delete p;
+    return v;
+}
+int UnwArrCflatElem(int x) { cppunw.setArm(3); UnwArrInner[3] arr = default; return arr[0].f.get(); }
+int UnwArrNewCflatElem(int x)
+{
+    cppunw.setArm(3);
+    UnwArrInner[] p = new UnwArrInner[3];
+    int v = p[0].f.get();
+    delete p;
+    return v;
+}
+int UnwArrFieldElem(int x) { cppunw.setArm(4); UnwArrField s = default; return s.a.get(); }
+int UnwArrThenFieldThrows(int x) { cppunw.setArm(3); UnwArrThenField s = default; return s.b.get(); }
+int UnwArrFieldCopy(int x)
+{
+    UnwArrCopy h = default;
+    cppunw.setArm(2);
+    UnwArrCopy g = h;
+    return g.arr[0].get();
+}
+int UnwClassFields(int x) { cppunw.Tr a = default; cppunw.setArm(2); UnwCls2 c = default; return c.f1.get(); }
+int UnwClassCtorFields(int x) { cppunw.setArm(2); UnwClsCtor2 c = UnwClsCtor2(1); return c.f1.get(); }
+int UnwProgramFields(int x) { cppunw.Tr a = default; cppunw.setArm(2); UnwProg2 p; return p.f1.get(); }
+int UnwCppStructFields(int x)
+{
+    cppunw.Tr a = default;
+    cppunw.setArm(2);
+    UnwCppFields s = default;
+    return s.f1.get();
+}
+int UnwCppStructCtorFields(int x)
+{
+    cppunw.setArm(2);
+    UnwCppFieldsCtor s = UnwCppFieldsCtor(1);
+    return s.f1.get();
+}
+int UnwIfaceValue(int x)
+{
+    cppunw.Tr a = default;
+    UnwRunImpl impl = default;
+    IUnwRun i = impl;
+    return i.run(x);
+}
+int UnwIfaceCall(IUnwRun i, int x) { cppunw.Tr a = default; return i.run(x); }
+int UnwIfaceParam(int x) { UnwRunImpl impl = default; return UnwIfaceCall(impl, x); }
+// Accept set: the same shapes with nothing armed construct and destroy every element and field.
+int UnwArrAcceptAll(int x)
+{
+    cppunw.Tx[3] arr = default;
+    cppunw.Tx[3] brace = { cppunw.Tx(0) };
+    UnwArrField s = default;
+    UnwArrCopy h = default;
+    UnwArrCopy g = h;
+    UnwCls2 c = default;
+    UnwProg2 p;
+    UnwCppFields cs = default;
+    UnwArrInner[] r = new UnwArrInner[unwArrN];
+    int v = arr[2].get() + brace[2].get() + s.arr[2].get() + g.arr[2].get() + c.f2.get()
+        + p.f2.get() + cs.f2.get() + r[2].f.get() + x;
+    delete r;
+    return v;
+}
 
 // Pre-fix the C++ scoped enum initializer was rejected as non-constant at file scope. This value
 // leg also proves the folded global retains its enum type when passed to an enum-typed parameter.
@@ -588,6 +734,21 @@ cppa.GProbe gclsProbe = default;      // its constructor READS a header-defined 
 // the IR, not by a value - zero IS its constructed value). It is declared here so that routing
 // it into the module initializer by mistake would fail the LINK on a missing constructor symbol.
 cppa.Plain gclsPlain = default;
+// An ofstream in a CFlat frame that a throwing free operator<< unwinds through (3208).
+int StrmThrowingInsert(int v)
+{
+    std.ofstream f = default;
+    f.open("test_cpp_stream_unwind.txt");
+    f << "kept";
+    cppstrm.Bomb b = default;
+    b.v = v;
+    f << b;
+    return 0;
+}
+int fnptr_add_one(int x) { return x + 1; }
+int apply_fnptr(function<int(int)> f, int x) { return f(x); }
+void fnptr_noop() {}
+
 extern int main()
 {
     // ---- C++ exceptions at the program boundary -------------------------------------------------
@@ -3439,42 +3600,330 @@ extern int main()
         heapBase = (int)HeapAudit.reportLeaks();
         r = cppunw.guarded(UnwTempAfterCall, 5); // its call returned; a later call throws
         if (r != -5 || (int)HeapAudit.reportLeaks() != heapBase) return 3198;
+        // ARRAY partial construction: a throw at element i destroys elements [0, i) only; a
+        // `new T[n]` also frees its block (HeapAudit: CFlat operator new/delete).
+        cppunw.reset();
+        r = cppunw.guarded(UnwArrLocal, 5);        // 'a' + elements 0-1
+        if (r != -5 || cppunw.live() != 0 || cppunw.dtors() != 3) return 3261;
+        cppunw.reset();
+        r = cppunw.guarded(UnwArrEmptyBrace, 5);   // `= {}` value-initialization
+        bool arrBraceOk = r == -5 && cppunw.live() == 0 && cppunw.dtors() == 2;
+        cppunw.reset();
+        r = cppunw.guarded(UnwArrShortTail, 5);    // positional element 0, tail element 2 throws
+        if (!arrBraceOk || r != -5 || cppunw.live() != 0 || cppunw.dtors() != 2) return 3262;
+        cppunw.reset();
+        r = cppunw.guarded(UnwArr2D, 5);           // flat element 3 of a Tx[2][2]
+        if (r != -5 || cppunw.live() != 0 || cppunw.dtors() != 3) return 3263;
+        cppunw.reset();
+        r = cppunw.guarded(UnwArrLoop, 5);         // 20 > the unroll limit: the runtime-loop walk
+        if (r != -5 || cppunw.live() != 0 || cppunw.dtors() != 10) return 3264;
+        cppunw.reset();
+        r = cppunw.guarded(UnwArrPositional, 5);   // positional list, element 2's initializer
+        if (r != -5 || cppunw.live() != 0 || cppunw.dtors() != 2) return 3265;
+        cppunw.reset();
+        heapBase = (int)HeapAudit.reportLeaks();
+        r = cppunw.guarded(UnwArrNew, 5);
+        if (r != -5 || cppunw.live() != 0 || cppunw.dtors() != 3
+            || (int)HeapAudit.reportLeaks() != heapBase) return 3266;
+        cppunw.reset();
+        heapBase = (int)HeapAudit.reportLeaks();
+        r = cppunw.guarded(UnwArrNewRuntime, 5);   // runtime element count
+        if (r != -5 || cppunw.live() != 0 || cppunw.dtors() != 2
+            || (int)HeapAudit.reportLeaks() != heapBase) return 3267;
+        cppunw.reset();
+        r = cppunw.guarded(UnwArrCflatElem, 5);    // CFlat element type holding a Tx
+        if (r != -5 || cppunw.live() != 0 || cppunw.dtors() != 2) return 3268;
+        cppunw.reset();
+        heapBase = (int)HeapAudit.reportLeaks();
+        r = cppunw.guarded(UnwArrNewCflatElem, 5); // `new` of the CFlat element type
+        if (r != -5 || cppunw.live() != 0 || cppunw.dtors() != 2
+            || (int)HeapAudit.reportLeaks() != heapBase) return 3269;
+        cppunw.reset();
+        r = cppunw.guarded(UnwArrFieldElem, 5);    // array FIELD element 2: s.a + elements 0-1
+        if (r != -5 || cppunw.live() != 0 || cppunw.dtors() != 3) return 3270;
+        cppunw.reset();
+        r = cppunw.guarded(UnwArrThenFieldThrows, 5); // a finished array field, then a throw
+        if (r != -5 || cppunw.live() != 0 || cppunw.dtors() != 2) return 3271;
+        cppunw.reset();
+        r = cppunw.guarded(UnwArrFieldCopy, 5);    // synthesized copy: h's 3 + g.arr[0]
+        if (r != -5 || cppunw.live() != 0 || cppunw.dtors() != 4) return 3272;
+        // FIELD partial construction in `class`, `program` and `[cpp] struct` (its C++
+        // constructor thunk): field 1 is destroyed, field 2 and the object are not.
+        cppunw.reset();
+        r = cppunw.guarded(UnwClassFields, 5);
+        if (r != -5 || cppunw.live() != 0 || cppunw.dtors() != 2) return 3273;
+        cppunw.reset();
+        r = cppunw.guarded(UnwClassCtorFields, 5); // a user ctor seeds through the synthesized one
+        if (r != -5 || cppunw.live() != 0 || cppunw.dtors() != 1) return 3274;
+        cppunw.reset();
+        r = cppunw.guarded(UnwProgramFields, 5);
+        if (r != -5 || cppunw.live() != 0 || cppunw.dtors() != 2) return 3275;
+        cppunw.reset();
+        r = cppunw.guarded(UnwCppStructFields, 5);
+        if (r != -5 || cppunw.live() != 0 || cppunw.dtors() != 2) return 3276;
+        cppunw.reset();
+        r = cppunw.guarded(UnwCppStructCtorFields, 5);
+        if (r != -5 || cppunw.live() != 0 || cppunw.dtors() != 1) return 3277;
+        // An INTERFACE method call is an invoke: the implementation throws through it and the
+        // calling frame's C++ local is destroyed.
+        cppunw.reset();
+        r = cppunw.guarded(UnwIfaceValue, 5);
+        if (r != -5 || cppunw.live() != 0 || cppunw.dtors() != 1) return 3278;
+        cppunw.reset();
+        r = cppunw.guarded(UnwIfaceParam, 5);      // through an interface parameter
+        if (r != -5 || cppunw.live() != 0 || cppunw.dtors() != 1) return 3279;
+        // Accept set (green pre-fix too): with nothing thrown the interface call returns its
+        // value, and every element and field is built and destroyed exactly once
+        // (3 + 3 + 4 + 3 + 3 + 2 + 2 + 2 + 3 = 25).
+        cppunw.reset();
+        r = cppunw.guarded(UnwIfaceValue, 0);
+        if (r != 1 || cppunw.live() != 0 || cppunw.dtors() != 1) return 3280;
+        cppunw.reset();
+        heapBase = (int)HeapAudit.reportLeaks();
+        r = cppunw.guarded(UnwArrAcceptAll, 7);
+        if (r != 7 || cppunw.live() != 0 || cppunw.dtors() != 25
+            || (int)HeapAudit.reportLeaks() != heapBase) return 3281;
     }
-    // Trivially-copyable imported C++ classes still need their user constructors on `new`.
+    // Trivially-copyable imported C++ classes still need their user constructors on `new` (3220-3226).
     {
         cppexp.NewPlain* p = new cppexp.NewPlain(2, 3);
         int plainV = p->v;
         int plainHow = p->how;
         delete p;
-        if (plainV != 5 || plainHow != 9) return 3190;
+        if (plainV != 5 || plainHow != 9) return 3220;
 
         int templateArg = 2;
         cppexp.NewTemplate* templ = new cppexp.NewTemplate(templateArg);
-        if (templ->v != 22 || templ->how != 1) return 3191;
+        if (templ->v != 22 || templ->how != 1) return 3221;
         delete templ;
 
         cppexp.NewReq* required = new cppexp.NewReq((i64)2);
-        if (required->v != 102 || required->how != 2) return 3192;
+        if (required->v != 102 || required->how != 2) return 3222;
         delete required;
 
         double enabledArg = 2.0;
         cppexp.NewEnabled* enabled = new cppexp.NewEnabled(enabledArg);
-        if (enabled->v != 20 || enabled->how != 3) return 3193;
+        if (enabled->v != 20 || enabled->how != 3) return 3223;
         delete enabled;
 
         int explicitArg = 2;
         cppexp.Ex* explicitExact = new cppexp.Ex(explicitArg);
-        if (explicitExact->v != 2) return 3194;
+        if (explicitExact->v != 2) return 3224;
         delete explicitExact;
 
         cppexp.NewDefault* defaulted = new cppexp.NewDefault();
-        if (defaulted->v != 41 || defaulted->how != 4) return 3195;
+        if (defaulted->v != 41 || defaulted->how != 4) return 3225;
         delete defaulted;
 
         cppexp.NewWithMember* member = new cppexp.NewWithMember(2);
-        if (member->inner.v != 52 || member->how != 5) return 3196;
+        if (member->inner.v != 52 || member->how != 5) return 3226;
         delete member;
     }
-    if (cppi.cpp_std() != 202002L) return 3200;
+    // ---- C++ standard streams --------------------------------------------------------------------
+    // Pre-fix reasons are per leg; each leg alone was compiled with the pre-fix binary.
+    {
+        // Chain on the returned ostream&: pre-fix "unhandled operation 20".
+        std.ostringstream o = default;
+        o << "id=" << 42 << ' ' << 2.5;
+        std.string s = o.str();
+        if (s != "id=42 2.5") return 3200;
+        // Literal widths: an i8-narrowed literal must reach int/char/bool/long overloads, not
+        // unsigned long long; pre-fix the chain emitted `shl %std.ostream` (verifier failure).
+        std.ostringstream lit = default;
+        lit << -41 << 'c' << true << 5000000000;
+        std.string ls = lit.str();
+        if (ls != "-41c15000000000") return 3201;
+        // `>>` into an int lvalue: pre-fix bound through a ull& temporary, v stayed 0.
+        std.stringstream ss = default;
+        ss << 41;
+        int v = 0;
+        ss >> v;
+        if (v != 41) return 3202;
+        // Mixed extraction chain: pre-fix "unhandled operation 21".
+        std.stringstream words = default;
+        words << "12 3.5 word x";
+        int a = 0; double d = 0; std.string w; char c = 0;
+        words >> a >> d >> w >> c;
+        if (a != 12 || d != 3.5 || w != "word" || c != 'x') return 3203;
+        // basic_ios members through the VIRTUAL base: pre-fix the summed-path `this` offset read
+        // the wrong word (fresh good() false, rdstate garbage).
+        std.stringstream st = default;
+        bool freshGood = st.good();
+        st << "zz";
+        int bad = 5;
+        st >> bad;
+        if (!freshGood || !st.fail() || st.good() || bad != 0
+            || st.rdstate() != std.ios_base.failbit) return 3204;
+        // ofstream flushed by its destructor at scope exit, read back by ifstream + getline;
+        // pre-fix std.endl as an operand was "does not name a value".
+        {
+            std.ofstream out = default;
+            out.open("test_cpp_stream_rt.txt");
+            out << "flushed " << 99 << std.endl << "second line" << std.endl;
+        }
+        std.ifstream in2 = default;
+        in2.open("test_cpp_stream_rt.txt");
+        std.string word; int n = 0; std.string rest; std.string line2;
+        in2 >> word >> n;
+        std.getline(in2, rest);
+        std.getline(in2, line2);
+        if (word != "flushed" || n != 99 || rest.size() != 0 || line2 != "second line") return 3205;
+        in2.close();
+        // std.cout as a name operand, captured into a string: pre-fix "'cout' is not a member".
+        cppstrm.capture_cout();
+        std.cout << "x" << 7 << std.endl;
+        std.string cap = cppstrm.end_capture();
+        if (cap != "x7\n") return 3206;
+        // Manipulators: function-template names and a free operator over setw's result.
+        std.ostringstream man = default;
+        man << "a" << std.endl << std.flush << std.setw(4) << 42;
+        std.string ms = man.str();
+        if (ms != "a\n  42") return 3207;
+        // A throwing user free operator<< (ADL) unwinds through StrmThrowingInsert, whose ofstream
+        // destructor must flush "kept"; pre-fix the free operator had no overload.
+        int r = cppunw.guarded(StrmThrowingInsert, 3);
+        std.ifstream kept = default;
+        kept.open("test_cpp_stream_unwind.txt");
+        std.string kw;
+        kept >> kw;
+        kept.close();
+        std.ostringstream bo = default;
+        cppstrm.Bomb quiet = default;
+        bo << quiet;
+        std.string bs = bo.str();
+        if (r != -3 || kw != "kept" || bs != "B0") return 3208;
+        // Header inline bodies using streams: pre-fix LINK failure (ios_base::flags[abi] and
+        // basic_stringbuf::seekpos declared, never defined in the companion module).
+        if (cppstrm.fmt_len(123) != 5 || cppstrm.parse("77") != 77) return 3209;
+        // Pointer operands: unnamed char* results, a cast char*, void*; pre-fix "cannot apply
+        // binary operator '<<' ... 'pointer'".
+        std.ostringstream po = default;
+        std.string src = std.string("cs");
+        char* p = "pp";
+        po << src.c_str() << "|" << (char*)p << "|" << (void*)nullptr << "|" << src;
+        std.string ps = po.str();
+        if (ps != "cs|pp|0|cs") return 3210;
+        // Template spelling; precision() lives in the virtual base: pre-fix crashed (SIGSEGV).
+        std.basic_ostringstream<char> bsp = default;
+        bsp << 12;
+        std.string bss = bsp.str();
+        if (bss != "12" || !bsp.good() || bsp.rdstate() != 0 || bsp.width() != 0
+            || bsp.precision() != 6) return 3211;
+        cppstrm.remove_file("test_cpp_stream_rt.txt");
+        cppstrm.remove_file("test_cpp_stream_unwind.txt");
+    }
+    // ---- C++ callback parameters -----------------------------------------------------------------
+    {
+        if (cppfnptr.callback_call(fnptr_add_one, 4) != 5) return 3290;
+        if (cppfnptr.inline_callback(fnptr_add_one, 5) != 6) return 3291;
+        cppfnptr.Sink sink = cppfnptr.Sink(fnptr_add_one);
+        if (sink.value != 5 || sink.member(fnptr_add_one) != 1) return 3292;
+        function<int(int)> returned = cppfnptr.callback_return();
+        if (returned(5) != 6) return 3293;
+        if (apply_fnptr(cppfnptr.Source.callback, 4) != 44) return 3294;
+        if (cppfnptr.callback_present(nullptr) != 0) return 3295;
+        if (cppfnptr.callback_present(0) != 0) return 3296;
+        if (cppfnptr.std_function_callback(std.function<int(int)>(fnptr_add_one), 3) != 4) return 3297;
+        if (cppfnptr.void_callback(fnptr_noop) != 1) return 3298;
+        function<int(int)> callback = fnptr_add_one;
+        if (cppfnptr.callback_call(callback, 4) != 5) return 3299;
+        if (cppfnptr.callback_call(cppfnptr.Source.callback, 4) != 44) return 3300;
+        cppfnptr.Sink nullSink = cppfnptr.Sink(0);
+        if (nullSink.value != -1) return 3301;
+        cppfnptr.Sink memberSink = default;
+        if (memberSink.member(0) != 0) return 3302;
+    }
+    if (cppi.cpp_std() != 202002L) return 3212;
+
+    // Core list<T> must store trivial foreign classes even when they have user constructors.
+    {
+        cpplist.countedCtorCalls = 0;
+        list<cpplist.Counted> counted;
+        counted.add(cpplist.Counted(4));
+        if (counted.get(0).value != 4 || cpplist.countedCtorCalls != 1) return 3230;
+        counted.add(cpplist.Counted(8));
+        int countedSum = 0;
+        for (cpplist.Counted value in counted) countedSum += value.value;
+        if (countedSum != 12 || counted[1].value != 8 || cpplist.countedCtorCalls != 2)
+            return 3231;
+        counted.removeAt(0);
+        if (counted.count() != 1 || counted[0].value != 8) return 3232;
+        counted.clear();
+        if (counted.count() != 0 || cpplist.countedCtorCalls != 2) return 3233;
+    }
+
+    // The C++ typedef spelling resolves to the same foreign record and list specialization.
+    {
+        cpplist.countedCtorCalls = 0;
+        list<cpplist.CountedAlias> aliased;
+        aliased.add(cpplist.CountedAlias(29));
+        if (aliased.get(0).value != 29 || cpplist.countedCtorCalls != 1) return 3234;
+    }
+
+    // A fully trivial foreign record with no user constructor stays bitwise copyable.
+    {
+        list<cpplist.Plain> plain;
+        cpplist.Plain item = default;
+        item.value = 6;
+        item.marker = 7;
+        plain.add(item);
+        if (plain[0].value != 6 || plain[0].marker != 7 || plain.count() != 1)
+            return 3235;
+    }
+
+    // CFlat and generic holders exercise the neighbouring aggregate and instantiation paths.
+    {
+        CppListHolder holder;
+        holder.item.value = 17;
+        holder.item.marker = 3;
+        holder.tag = 4;
+        list<CppListHolder> holders;
+        holders.add(holder);
+        if (holders[0].item.value != 17 || holders[0].tag != 4) return 3236;
+
+        cpplist.countedCtorCalls = 0;
+        list<cpplist.Counted> genericValues;
+        genericValues.add(cpplist.Counted(23));
+        cppListTakeValue = 0;
+        take<cpplist.Counted>(&genericValues, 1);
+        CppListBox<cpplist.Counted> box;
+        box.values.add(cpplist.Counted(31));
+        if (cppListTakeValue != 23 || box.values[0].value != 31
+            || cpplist.countedCtorCalls != 2) return 3237;
+    }
+
+    // Arrays and unique use the same trivial class without changing their constructor counts.
+    {
+        cpplist.countedCtorCalls = 0;
+        cpplist.Counted[2] fixed = default;
+        cpplist.Counted[] view = fixed;
+        if (view[0].value != 70 || view[1].value != 70 || cpplist.countedCtorCalls != 2)
+            return 3238;
+        unique<cpplist.Counted> owned = new cpplist.Counted(9);
+        if (owned->value != 9 || cpplist.countedCtorCalls != 3) return 3239;
+    }
+
+    // Nontrivial foreign values still use C++ copy and destruction with exact counts.
+    {
+        cpplist.nontrivialCtorCalls = 0;
+        cpplist.nontrivialDtorCalls = 0;
+        {
+            list<cpplist.Nontrivial> nontrivial;
+            cpplist.Nontrivial item = cpplist.Nontrivial(37);
+            nontrivial.add(item);
+            if (nontrivial.get(0).value != 37 || cpplist.nontrivialCtorCalls != 3)
+                return 3240;
+            nontrivial.removeAt(0);
+        }
+        if (cpplist.nontrivialCtorCalls != 3 || cpplist.nontrivialDtorCalls != 3)
+            return 3241;
+    }
+
+    // Companion definitions of C++ static members stay reachable through their class only.
+    if (cppi.statconst.Linked.k != 43) return 3310;
+    if (cppi.statconst.NoInit.k != 0) return 3311;
+    if (cppi.ExternPoly<int>.linkedStatic != 67) return 3312;
+    if (cppi_nsobj_global != 3) return 3313;
+    if (cppi.nsobj.inner.deep != 31) return 3314;
     return 0;
 }

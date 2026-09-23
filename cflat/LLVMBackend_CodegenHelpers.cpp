@@ -1025,12 +1025,23 @@ uint64_t LLVMBackend::PeelFixedArrayType(llvm::Type* ty, llvm::Type*& elemTy)
 void LLVMBackend::EmitFixedArrayElementWalk(llvm::IRBuilder<>& b, llvm::Value* base, llvm::Type* elemTy,
                                    uint64_t n, const std::function<void(llvm::Value*)>& emitElem)
 {
+        EmitFixedArrayElementWalk(b, base, elemTy, n,
+            [&](llvm::Value* elemPtr, llvm::Value*) { emitElem(elemPtr); });
+    }
+
+void LLVMBackend::EmitFixedArrayElementWalk(llvm::IRBuilder<>& b, llvm::Value* base, llvm::Type* elemTy,
+                                   uint64_t n,
+                                   const std::function<void(llvm::Value*, llvm::Value*)>& emitElem)
+{
         if (base == nullptr || elemTy == nullptr || n == 0) return;
 
         if (n <= kMaxUnrolledArrayElements)
         {
             for (uint64_t i = 0; i < n; i++)
-                emitElem(b.CreateInBoundsGEP(elemTy, base, { b.getInt64(i) }, "arrelem"));
+            {
+                llvm::Value* index = b.getInt64(i);
+                emitElem(b.CreateInBoundsGEP(elemTy, base, { index }, "arrelem"), index);
+            }
             return;
         }
 
@@ -1043,7 +1054,7 @@ void LLVMBackend::EmitFixedArrayElementWalk(llvm::IRBuilder<>& b, llvm::Value* b
         b.SetInsertPoint(loopBB);
         auto* idx = b.CreatePHI(b.getInt64Ty(), 2, "arrwalk.i");
         idx->addIncoming(b.getInt64(0), preBB);
-        emitElem(b.CreateInBoundsGEP(elemTy, base, { idx }, "arrelem"));
+        emitElem(b.CreateInBoundsGEP(elemTy, base, { idx }, "arrelem"), idx);
         auto* next = b.CreateAdd(idx, b.getInt64(1), "arrwalk.next");
         idx->addIncoming(next, b.GetInsertBlock());
         b.CreateCondBr(b.CreateICmpULT(next, b.getInt64(n)), loopBB, doneBB);
@@ -1953,7 +1964,7 @@ llvm::Function* LLVMBackend::GetOrCreateMemberwiseCopy(const std::string& typeNa
                 llvm::Type* elemTy = nullptr;
                 uint64_t n = PeelFixedArrayType(structTy->getElementType(i), elemTy);
                 auto* base = builder->CreateStructGEP(structTy, resultSlot, i, "fldarr");
-                EmitFixedArrayElementWalk(*builder, base, elemTy, n, [&](llvm::Value* elemPtr) {
+                EmitArrayConstructionWalk(base, elemTy, n, f.TypeName, [&](llvm::Value* elemPtr) {
                     if (IsForeignNontrivialCxxClass(f.TypeName))
                     {
                         auto* sourceSlot = AllocaAtEntry(elemTy, nullptr, "fldarrsrc");
@@ -1970,6 +1981,7 @@ llvm::Function* LLVMBackend::GetOrCreateMemberwiseCopy(const std::string& typeNa
                     if (auto* copied = CreateOverloadedFunctionCall("copy", { elemNV }))
                         builder->CreateStore(copied, elemPtr);
                 });
+                NoteUnwindArrayPrefix(base, elemTy, builder->getInt64(n), f.TypeName);
                 continue;
             }
             if (!HasCopyOverloadFor(f.TypeName) && !IsOwningValueType(f.TypeName)

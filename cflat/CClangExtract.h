@@ -355,6 +355,9 @@ namespace cflat_cinterop
         bool hasVirtualBases = false;       // virtual inheritance: rejected, the VTT is not modelled
         bool isAbstract = false;            // has an unoverridden pure virtual: cannot be created
         std::vector<RawCxxBase> bases;      // DIRECT bases, in declaration order
+        // EVERY virtual base, direct or indirect, at its offset in THIS class's complete-object
+        // layout - the only place a shared virtual base's offset is fixed.
+        std::vector<RawCxxBase> virtualBases;
         // Non-empty when the C++ layout could not be flattened into a CFlat struct (virtual
         // inheritance, or a bitfield / anonymous member in a class that has bases). The record
         // stays an opaque shell and every use site reports this text.

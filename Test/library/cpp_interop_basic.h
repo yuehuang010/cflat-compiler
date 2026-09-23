@@ -940,6 +940,7 @@ namespace cppi
     struct ExternPoly
     {
         T value;
+        static int linkedStatic;
         explicit ExternPoly(T v) noexcept : value(v) {}
         virtual ~ExternPoly() {}
         virtual T get() const noexcept { return value; }
@@ -1019,6 +1020,7 @@ namespace cppi
         struct Cexpr { static constexpr int k = 44; };
         struct InlineConst { static inline const int k = 45; };
         struct Linked { static const int k; };   // initializer is the out-of-line definition
+        struct NoInit { static int k; };
 
         // A folded constant carries no storage, so it must not change the layout.
         struct WithField { static const int cap = 49; int v; };

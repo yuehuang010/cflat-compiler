@@ -14,6 +14,7 @@ namespace cppi
     int nested_outer_dtors() noexcept { return g_nested_outer_dtors; }
 
     // The explicit instantiation DEFINITION that owns ExternPoly<int>'s vtable and members.
+    template<typename T> int ExternPoly<T>::linkedStatic = 67;
     template struct ExternPoly<int>;
 
     int add(int a, int b) noexcept { return a + b; }
@@ -483,6 +484,7 @@ namespace cppi
     {
         const int Defined::k;
         const int Linked::k = 43;
+        int NoInit::k;
     }
 }
 

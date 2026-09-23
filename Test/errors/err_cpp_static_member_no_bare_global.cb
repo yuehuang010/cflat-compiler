@@ -1,0 +1,10 @@
+import cpp "cpp_interop_basic.h";
+import cpp "cpp_interop_basic.cpp";
+
+extern int main()
+{
+    expect_error("Undefined variable k.") {
+        int r = k;
+    }
+    return 0;
+}

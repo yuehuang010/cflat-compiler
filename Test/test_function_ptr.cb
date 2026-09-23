@@ -4735,6 +4735,64 @@ bool testCallbackContextSlot()
     return result;
 }
 
+// A lambda capturing a LOCAL (or parameter, loop variable, enclosing-lambda parameter) that
+// SHADOWS a same-named global. Pre-fix the capture scan skipped every name present in the global
+// table before looking at the enclosing frames, so the local was never captured and the body
+// loaded the outer function's alloca: "Referring to an instruction in another function!"
+// (the whole file failed module verification). Every leg below reads a value only the LOCAL can
+// produce; the globals keep distinct values and are asserted untouched.
+int lcsK = 100;
+string lcsS = "global-long";
+struct LcsBox { int v = 0; };
+LcsBox lcsB = default;
+int lcsUse(Lambda<int(int)> f, int x) { return f(1) + x; }
+int lcsLocal(int x) { int lcsK = 3; return lcsUse((int v) => { return v + lcsK; }, x); }
+int lcsParam(int lcsK) { return lcsUse((int v) => { return v + lcsK; }, 10); }
+int lcsLoop()
+{
+    int s = 0;
+    for (int lcsK = 1; lcsK <= 3; lcsK++) s += lcsUse((int v) => { return v * lcsK; }, 0);
+    return s;
+}
+int lcsString(int x) { string lcsS = "abc"; return lcsUse((int v) => { return v + lcsS.length(); }, x); }
+int lcsStructByRef(int x)
+{
+    LcsBox lcsB = default;
+    lcsB.v = 3;
+    int r = lcsUse((int v) => { lcsB.v = lcsB.v + v; return lcsB.v; }, x);
+    return r * 100 + lcsB.v;
+}
+int lcsMutate(int x) { int lcsK = 3; int r = lcsUse((int v) => { lcsK = lcsK + v; return lcsK; }, x); return r * 100 + lcsK; }
+int lcsNested(int x) { int lcsK = 3; return lcsUse((int v) => { return lcsUse((int w) => { return w + lcsK; }, v); }, x); }
+int lcsOuterLambdaParam(int x) { return lcsUse((int lcsK) => { return lcsUse((int w) => { return w + lcsK; }, 0); }, x); }
+struct LcsHolder { int f = 5; int probe(int x) { int lcsK = 3; return lcsUse((int v) => { return v + lcsK + this->f; }, x); } };
+int lcsGeneric<T>(T x) { T lcsK = (T)3; return lcsUse((int v) => { return v + (int)lcsK; }, (int)x); }
+// Accept set: with no shadowing local the body still reads the LIVE global (no capture).
+int lcsGlobalLive(int x) { Lambda<int(int)> f = (int v) => { return v + lcsK; }; lcsK = 7; int r = f(1) + x; lcsK = 100; return r; }
+int lcsDeclaredAfter(int x) { Lambda<int(int)> f = (int v) => { return v + lcsK; }; int lcsK = 3; return f(1) + x + lcsK; }
+
+bool testLambdaCaptureShadowsGlobal()
+{
+    bool result = true;
+    result &= Test("lcs_local", lcsLocal(10), 14);
+    result &= Test("lcs_param", lcsParam(3), 14);
+    result &= Test("lcs_loop_var", lcsLoop(), 6);
+    result &= Test("lcs_string", lcsString(10), 14);
+    result &= Test("lcs_struct_by_ref", lcsStructByRef(10), 1404);
+    result &= Test("lcs_struct_global_untouched", lcsB.v, 0);
+    result &= Test("lcs_mutate", lcsMutate(10), 1403);
+    result &= Test("lcs_nested_lambda", lcsNested(10), 15);
+    result &= Test("lcs_outer_lambda_param", lcsOuterLambdaParam(10), 12);
+    LcsHolder h = default;
+    result &= Test("lcs_method", h.probe(10), 19);
+    result &= Test("lcs_generic", lcsGeneric<int>(10), 14);
+    result &= Test("lcs_global_live", lcsGlobalLive(10), 18);
+    result &= Test("lcs_declared_after", lcsDeclaredAfter(10), 114);
+    result &= Test("lcs_global_untouched", lcsK, 100);
+    result &= Test("lcs_string_global_untouched", lcsS.length(), 11);
+    return result;
+}
+
 extern int main(int argc, char** argv)
 {
     // The tooling regression harness passes one argument and calls this twice. The second call
@@ -4918,6 +4976,9 @@ extern int main(int argc, char** argv)
     // `void* userdata`, ...). The cast out must borrow, not consume: the context stays live and
     // owning members survive. Documented in doc/C_INTEROP.md.
     total++; passed += testCallbackContextSlot()            ? 1 : 0;
+
+    // A lambda capturing a local that shadows a same-named global (fix/lambda-capture-scope).
+    total++; passed += testLambdaCaptureShadowsGlobal()     ? 1 : 0;
 
     printf("Function pointer / lambda tests: %d/%d passed.\n", passed, total);
     return passed == total ? 0 : 1;

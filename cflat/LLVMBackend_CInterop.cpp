@@ -3537,6 +3537,7 @@ void LLVMBackend::MapRawRecords(const cflat_cinterop::ExtractResult& raw, std::v
             rec.isPolymorphic = r.isPolymorphic; rec.hasBases = r.hasBases;
             rec.hasVirtualBases = r.hasVirtualBases; rec.isAbstract = r.isAbstract;
             rec.bases = r.bases; rec.layoutRefusal = r.layoutRefusal;
+            rec.virtualBases = r.virtualBases;
             rec.canonicalCtype = r.canonicalCtype;
             rec.hasTrivialDefaultCtor = r.hasTrivialDefaultCtor;
             rec.hasTrivialCopyCtor = r.hasTrivialCopyCtor;
@@ -5421,6 +5422,7 @@ uint64_t LLVMBackend::CxxGroupHeaderHash(const CxxRequestGroup& group) const
         raw.hasVirtualBases = cached.hasVirtualBases;
         raw.isAbstract = cached.isAbstract;
         raw.bases = cached.bases;
+        raw.virtualBases = cached.virtualBases;
         raw.layoutRefusal = cached.layoutRefusal;
         raw.canonicalCtype = cached.canonicalCtype;
         raw.hasTrivialDefaultCtor = cached.hasTrivialDefaultCtor;
@@ -7401,8 +7403,21 @@ bool LLVMBackend::RequestCxxFreeFunction(const std::string& functionName,
                                          const std::vector<std::string>& explicitArgs,
                                          const std::vector<NamedVariable>& arguments,
                                          std::string& registeredName,
-                                         std::string& error)
+                                         std::string& error,
+                                         const std::string& infixOperator,
+                                         const std::string& infixLhsName,
+                                         const std::string& infixRhsName)
 {
+        /*
+         * An INFIX request (`p0 << p1`) lets C++ pick among members, free operators and ADL
+         * candidates; it registers under its own wrapper name, never the shared operator name.
+         * An operand given as a C++ NAME (`std.cout`, `std.endl`) is spelled into the expression
+         * itself instead of becoming a parameter.
+         */
+        const size_t infixNames = (infixLhsName.empty() ? 0 : 1) + (infixRhsName.empty() ? 0 : 1);
+        const bool infix = !infixOperator.empty() && arguments.size() + infixNames == 2
+            && explicitArgs.empty();
+        const size_t infixRhsIndex = infixLhsName.empty() ? 1 : 0;
         error.clear();
         registeredName.clear();
         if (!functionName.starts_with("std."))
@@ -7505,6 +7520,11 @@ bool LLVMBackend::RequestCxxFreeFunction(const std::string& functionName,
             }
             else
             {
+                // `stream >> v` writes v: a scalar lvalue operand of an infix `>>` stays one.
+                if (infix && infixOperator == ">>" && infixRhsName.empty() && i == infixRhsIndex
+                    && !type.Pointer
+                    && arg.Storage != nullptr && !arg.IsRvalue)
+                    spelling += " &";
                 parameterSpellings.push_back(std::move(spelling));
                 callArguments.push_back("p" + std::to_string(i));
             }
@@ -7530,7 +7550,13 @@ bool LLVMBackend::RequestCxxFreeFunction(const std::string& functionName,
         }
 
         std::string target = CxxNameFromCflat(functionName);
-        if (!cxxExplicitArgs.empty())
+        if (infix)
+            target = (infixLhsName.empty() ? callArguments[0] : CxxNameFromCflat(infixLhsName))
+                + " " + infixOperator + " "
+                + (infixRhsName.empty() ? callArguments[infixRhsIndex]
+                                        : CxxNameFromCflat(infixRhsName));
+        if (infix) {}
+        else if (!cxxExplicitArgs.empty())
         {
             target += "<";
             for (size_t i = 0; i < cxxExplicitArgs.size(); ++i)
@@ -7540,13 +7566,16 @@ bool LLVMBackend::RequestCxxFreeFunction(const std::string& functionName,
             }
             target += ">";
         }
-        target += "(";
-        for (size_t i = 0; i < callArguments.size(); ++i)
+        if (!infix)
         {
-            if (i != 0) target += ", ";
-            target += callArguments[i];
+            target += "(";
+            for (size_t i = 0; i < callArguments.size(); ++i)
+            {
+                if (i != 0) target += ", ";
+                target += callArguments[i];
+            }
+            target += ")";
         }
-        target += ")";
 
         std::vector<size_t> dependencyGroups;
         auto addDependencyGroup = [&](size_t group) {
@@ -7583,12 +7612,13 @@ bool LLVMBackend::RequestCxxFreeFunction(const std::string& functionName,
                                                    return result;
         }());
         const std::string wrapperName = std::format("__cflat_free_{:016x}", hash);
-        const std::string registrationName = explicitArgs.empty() ? functionName : wrapperName;
-        if (auto fit = functionTable.find(registrationName); fit != functionTable.end())
+        // Infix wrappers and explicit instantiations register under their unique wrapper name.
+        const std::string bindName = (infix || !explicitArgs.empty()) ? wrapperName : functionName;
+        if (auto fit = functionTable.find(bindName); fit != functionTable.end())
             for (const auto& symbol : fit->second)
                 if (symbol.External && symbol.UniqueName == wrapperName)
                 {
-                    registeredName = registrationName;
+                    registeredName = bindName;
                     return true;
                 }
         std::string wrapperSource = "extern \"C\" __attribute__((weak)) decltype(auto) "
@@ -7602,7 +7632,20 @@ bool LLVMBackend::RequestCxxFreeFunction(const std::string& functionName,
 
         std::string lastError;
         std::vector<size_t> candidateGroups;
-        if (auto owner = cxxFunctionOwnerGroup_.find(functionName);
+        // An infix request is keyed on its operands, not on the operator's name: try the groups
+        // that own the operand types first, then every group declaring the namespace. The
+        // per-name owner memo is neither read nor written - one pair must not steer another.
+        if (infix)
+        {
+            candidateGroups = dependencyGroups;
+            const std::string lead = !infixLhsName.empty() ? infixLhsName
+                : !infixRhsName.empty() ? infixRhsName : functionName;
+            for (size_t group : CandidateCxxGroupsFor(CxxNameFromCflat(lead) + "::"))
+                if (std::find(candidateGroups.begin(), candidateGroups.end(), group)
+                    == candidateGroups.end())
+                    candidateGroups.push_back(group);
+        }
+        else if (auto owner = cxxFunctionOwnerGroup_.find(functionName);
             owner != cxxFunctionOwnerGroup_.end() && owner->second < cxxImportGroups_.size())
             candidateGroups.push_back(owner->second);
         else if (auto owner = cxxFunctionTemplateOwnerGroup_.find(functionName);
@@ -7624,20 +7667,29 @@ bool LLVMBackend::RequestCxxFreeFunction(const std::string& functionName,
                 lastError = FirstCxxErrorLine(wrapperError);
                 continue;
             }
-            bound.name = registrationName;
+            bound.name = bindName;
             RegisterCSignatures({ bound }, group.headers.front());
-            if (auto fit = functionTable.find(registrationName); fit != functionTable.end())
+            if (auto fit = functionTable.find(bindName); fit != functionTable.end())
                 for (const auto& symbol : fit->second)
                     if (symbol.External && symbol.UniqueName == wrapperName)
                     {
-                        registeredName = registrationName;
-                        cxxTemplateOwnerGroup_[cxxBase] = primary;
-                        StoreCxxTemplateOwnerMemo(cxxBase, primary);
+                        registeredName = bindName;
+                        if (!infix)
+                        {
+                            cxxTemplateOwnerGroup_[cxxBase] = primary;
+                            StoreCxxTemplateOwnerMemo(cxxBase, primary);
+                        }
                         return true;
                     }
             lastError = "the generated wrapper could not be registered";
         }
 
+        if (infix)
+        {
+            error = lastError.empty() ? std::string("no C++ import declares it")
+                                      : "clang: " + lastError;
+            return false;
+        }
         const size_t missingDot = functionName.rfind('.');
         const std::string missingMember = functionName.substr(missingDot + 1);
         const std::string missingNamespace = functionName.substr(0, missingDot);
@@ -13172,8 +13224,37 @@ bool LLVMBackend::RegisterCxxInheritedMembers(const CRecordEntry& r)
                         auto a = cxxThisAdjust_.find(CxxThisAdjustKey(baseName, sym.UniqueName));
                         return a == cxxThisAdjust_.end() ? 0ull : a->second;
                     }();
+                    /*
+                     * A member whose owner sits inside a VIRTUAL base has no fixed offset along
+                     * the inheritance path: the base is shared and placed by the most derived
+                     * class. Re-resolve it from THIS class's own virtual-base table.
+                     */
+                    std::string ownerVirtualBase;
+                    uint64_t insideVirtualBase = 0;
+                    if (auto v = cxxThisVirtualBase_.find(CxxThisAdjustKey(baseName, sym.UniqueName));
+                        v != cxxThisVirtualBase_.end())
+                    {
+                        ownerVirtualBase = v->second.first;
+                        insideVirtualBase = v->second.second;
+                    }
+                    else if (b.isVirtual)
+                    {
+                        ownerVirtualBase = baseName;
+                        insideVirtualBase = inherited;
+                    }
+                    uint64_t adjust = b.offsetBytes + inherited;
+                    if (!ownerVirtualBase.empty())
+                        for (const auto& vb : r.virtualBases)
+                        {
+                            const std::string vbIdentity = ResolveCxxBaseIdentity(vb);
+                            if ((vbIdentity.empty() ? vb.name : vbIdentity) != ownerVirtualBase)
+                                continue;
+                            adjust = vb.offsetBytes + insideVirtualBase;
+                            cxxThisVirtualBase_[CxxThisAdjustKey(r.name, sym.UniqueName)] =
+                                { ownerVirtualBase, insideVirtualBase };
+                            break;
+                        }
                     sym.Parameters[0].TypeName = r.name;
-                    const uint64_t adjust = b.offsetBytes + inherited;
                     if (adjust != 0)
                         cxxThisAdjust_[CxxThisAdjustKey(r.name, sym.UniqueName)] = adjust;
                     functionTable[mn].push_back(std::move(sym));
@@ -14690,10 +14771,11 @@ bool LLVMBackend::EmitCxxArrayDefaultConstruction(const std::string& typeName, l
         };
 
         // A constant extent reuses the walk the per-element DESTRUCTOR uses, so the two
-        // traversals cannot drift; a runtime `new T[n]` needs its own counted loop.
+        // traversals cannot drift; a runtime `new T[n]` needs its own counted loop. Either way a
+        // throwing constructor destroys only the elements before it.
         if (auto* constCount = llvm::dyn_cast<llvm::ConstantInt>(count))
         {
-            EmitFixedArrayElementWalk(*builder, base, elemTy, constCount->getZExtValue(), callCtor);
+            EmitArrayConstructionWalk(base, elemTy, constCount->getZExtValue(), typeName, callCtor);
             return true;
         }
 
@@ -14708,7 +14790,11 @@ bool LLVMBackend::EmitCxxArrayDefaultConstruction(const std::string& typeName, l
         builder->SetInsertPoint(loopBB);
         auto* idx = builder->CreatePHI(i64Ty, 2, "cxxarrctor.i");
         idx->addIncoming(builder->getInt64(0), preBB);
-        callCtor(builder->CreateInBoundsGEP(elemTy, base, { idx }, "cxxarrelem"));
+        {
+            UnwindPartialScope builtElements(*this);
+            NoteUnwindArrayPrefix(base, elemTy, idx, typeName);
+            callCtor(builder->CreateInBoundsGEP(elemTy, base, { idx }, "cxxarrelem"));
+        }
         auto* next = builder->CreateAdd(idx, builder->getInt64(1), "cxxarrctor.next");
         idx->addIncoming(next, builder->GetInsertBlock());
         builder->CreateCondBr(builder->CreateICmpULT(next, total), loopBB, doneBB);

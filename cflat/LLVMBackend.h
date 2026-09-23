@@ -3561,6 +3561,7 @@ private:
         bool hasVirtualBases = false;
         bool isAbstract = false;
         std::vector<cflat_cinterop::RawCxxBase> bases;
+        std::vector<cflat_cinterop::RawCxxBase> virtualBases;   // see RawRecord::virtualBases
         std::string layoutRefusal;
         // Clang's canonical C++ spelling of the record (`class cppi::Tracked`), the identity two
         // CFlat spellings of one specialization agree on. Also the source of the C++ spelling a
@@ -4912,6 +4913,10 @@ private:
      */
     void EmitFixedArrayElementWalk(llvm::IRBuilder<>& b, llvm::Value* base, llvm::Type* elemTy,
                                    uint64_t n, const std::function<void(llvm::Value*)>& emitElem);
+    // Same walk; `emitElem` also receives the element index (a constant, or the loop's phi).
+    void EmitFixedArrayElementWalk(llvm::IRBuilder<>& b, llvm::Value* base, llvm::Type* elemTy,
+                                   uint64_t n,
+                                   const std::function<void(llvm::Value*, llvm::Value*)>& emitElem);
 
     /*
      * Call `dtor` on `storage`: once when it holds a scalar, once per element when it holds a
@@ -5194,14 +5199,18 @@ private:
      * while a constructor body runs (never its user ~T), and a `new` block whose constructor
      * has not returned (freed, never destroyed). Keyed by function; the pad runs them newest
      * first, before the statement temps. UnwindPartialScope pops what its region pushed.
+     * ArrayPrefix: the first `Count` elements (ElemTy, element type TypeName) at V are built;
+     * the pad destroys them newest first. Count may be a runtime value (a loop's phi).
      */
     struct UnwindPartialEntry
     {
-        enum class Kind { Value, Slot, Members, CxxHeap, CflatHeap } K;
+        enum class Kind { Value, Slot, Members, CxxHeap, CflatHeap, ArrayPrefix } K;
         llvm::Value* V;
         std::string TypeName;
         llvm::Function* Fn;
         uint64_t AllocAlign = 0;
+        llvm::Value* Count = nullptr;
+        llvm::Type* ElemTy = nullptr;
     };
     std::vector<UnwindPartialEntry> unwindPartial_;
     struct UnwindPartialScope
@@ -5218,6 +5227,13 @@ private:
     void NoteUnwindPartial(UnwindPartialEntry::Kind kind, llvm::Value* v, const std::string& typeName,
                            uint64_t allocAlign = 0);
     void EmitUnwindPartialRelease(const UnwindPartialEntry& e);
+    void NoteUnwindArrayPrefix(llvm::Value* base, llvm::Type* elemTy, llvm::Value* count,
+                               const std::string& elemTypeName);
+    // Construct `n` contiguous elements at `base` with `emitElem`; an unwind out of element i
+    // destroys elements [0, i) newest first, never element i or later.
+    void EmitArrayConstructionWalk(llvm::Value* base, llvm::Type* elemTy, uint64_t n,
+                                   const std::string& elemTypeName,
+                                   const std::function<void(llvm::Value*)>& emitElem);
     // Sink-parameter arguments of the call being emitted: the callee owns them from the invoke
     // on, so its pad must not free them (the post-call transfer drops them from the temp lists).
     std::vector<llvm::Value*> unwindCallConsumedTemps_;
@@ -5344,7 +5360,10 @@ private:
                                 const std::vector<std::string>& explicitArgs,
                                 const std::vector<NamedVariable>& arguments,
                                 std::string& registeredName,
-                                std::string& error);
+                                std::string& error,
+                                const std::string& infixOperator = {},
+                                const std::string& infixLhsName = {},
+                                const std::string& infixRhsName = {});
     bool RequestCxxBraceFunction(const std::string& functionName,
                                  const std::string& ownerType,
                                  const std::string& memberName,
@@ -7914,6 +7933,10 @@ public:
                                                 const std::string& methodName,
                                                 const std::vector<TypeAndValue>& params);
     bool IsCxxRecord(const std::string& typeName) const { return cxxRecords_.count(typeName) != 0; }
+    bool IsCxxTriviallyCopyableRecord(const std::string& typeName) const
+    {
+        return cxxTriviallyCopyableRecords_.count(typeName) != 0;
+    }
     // A C++ alias of a specialization that is still unrequested (`c10.IntArrayRef` before any use).
     bool IsCxxLazyAliasSpecialization(const std::string& name) const
     {
@@ -7935,6 +7958,9 @@ public:
     // "<receiver CFlat type>#<callee linkage name>" -> bytes to add to `this` before the call,
     // for a member INHERITED from a base whose subobject is not at offset 0.
     std::map<std::string, uint64_t> cxxThisAdjust_;
+    // Same key: a cloned member whose owner sits inside a VIRTUAL base -> {that base's identity,
+    // the member owner's offset inside it}. A further-derived class re-resolves the base offset.
+    std::map<std::string, std::pair<std::string, uint64_t>> cxxThisVirtualBase_;
     static std::string CxxThisAdjustKey(const std::string& recv, const std::string& linkage)
     {
         return recv + "#" + linkage;
@@ -8051,7 +8077,6 @@ public:
     bool IsForeignCxxClassWithConstructors(const std::string& typeName,
                                            bool countCtorTemplates = true) const
     {
-        if (typeName.starts_with("std.pair$")) return false;
         auto it = cxxClasses_.find(typeName);
         auto record = cxxRecordEntries_.find(typeName);
         const bool hasUserDeclaredCtor = record != cxxRecordEntries_.end()
@@ -9880,7 +9905,7 @@ public:
      * timeout). The PCH key still folds the build stamp, since a PCH belongs to the clang that
      * wrote it.
      */
-    static constexpr int kCHeaderCacheVersion = 83;
+    static constexpr int kCHeaderCacheVersion = 85;
     static std::string CompilerBuildStamp();
 
     static std::string GetCHeaderCacheDir();

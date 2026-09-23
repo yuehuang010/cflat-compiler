@@ -1,0 +1,9 @@
+import cpp "cpp_interop_fnptr.h";
+int wrong_arity(int x, int y) { return x + y; }
+extern int main()
+{
+    expect_error("function-pointer signature mismatch: parameter takes 'int(int)' but function 'wrong_arity' has 'int(int, int)'") {
+        cppfnptr.callback_call(wrong_arity, 1);
+    }
+    return 0;
+}

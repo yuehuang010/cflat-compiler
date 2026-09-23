@@ -1,0 +1,9 @@
+import cpp "cpp_interop_fnptr.h";
+long long wrong_return(int x) { return x; }
+extern int main()
+{
+    expect_error("function-pointer signature mismatch: parameter takes 'int(int)' but function 'wrong_return' has 'i64(int)'") {
+        cppfnptr.callback_call(wrong_return, 1);
+    }
+    return 0;
+}

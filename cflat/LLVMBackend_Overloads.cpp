@@ -481,7 +481,13 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                 // lambda fat struct, or stored function<T> variable). Type fidelity is checked at codegen.
                 // An encoded closure param (list<Lambda<...>>::add's `T value`, gap a) accepts the same
                 // arguments; an encoded closure arg satisfies a function<T> param likewise.
-                if ((candidateParamItr->IsFunctionPointer || IsEncodedClosureType(candidateParamItr->TypeName))
+                if (candidate.IsCxx && candidateParamItr->IsFunctionPointer
+                    && IsNullPointerConstantArgument(arg))
+                {
+                    result = 1;
+                    ++nullPointerConversions;
+                }
+                else if ((candidateParamItr->IsFunctionPointer || IsEncodedClosureType(candidateParamItr->TypeName))
                     && (ArgumentIsFunctionPointerish(arg)
                         || (arg.BaseType && arg.BaseType->isPointerTy())))
                 {
@@ -2192,8 +2198,21 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                 {
                     if (!pi->IsFunctionPointer) continue;
                     std::string why = DescribeFuncPtrSignatureMismatch(arguments[i].TypeAndValue, *pi);
+                    if (why.empty() && c.IsCxx
+                        && NamedFunctionArgMismatches(arguments[i], *pi))
+                    {
+                        auto* function = llvm::dyn_cast_or_null<llvm::Function>(arguments[i].Primary);
+                        const TypeAndValue actual = FuncPtrSigOfBoundFunction(
+                            arguments[i].CallerName, function);
+                        if (actual.IsFunctionPointer)
+                            why = std::format("function-pointer signature mismatch: parameter takes '{}' "
+                                "but function '{}' has '{}'", FuncPtrSpellingOf(*pi),
+                                arguments[i].CallerName, FuncPtrSpellingOf(actual));
+                    }
                     if (why.empty()) continue;
-                    msg += std::format("  [{}] {}\n", SpellFunctionSymbol(*this, c.UniqueName), why);
+                    msg += std::format("  [{}] {}\n",
+                        c.SourceName.empty() ? SpellFunctionSymbol(*this, c.UniqueName) : c.SourceName,
+                        why);
                     break;
                 }
             }

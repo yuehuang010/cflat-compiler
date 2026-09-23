@@ -90,15 +90,17 @@ void MainListener::PrepareLaterCppStructDefinitions(
 llvm::Value* MainListener::EmitAggregateFieldInitialization(
     const std::string& structName,
     llvm::StructType*& structType,
-    std::vector<LLVMBackend::DeclTypeAndValue>& fields)
+    std::vector<LLVMBackend::DeclTypeAndValue>& fields,
+    size_t fieldCount)
 {
     auto* compiler = Compiler();
     std::vector<llvm::Value*> initializers;
     std::vector<char> initializerUnsigned;
     // A field initializer that unwinds destroys the fields already built.
     LLVMBackend::UnwindPartialScope partialFields(*compiler);
-    for (auto& field : fields)
+    for (size_t fieldIndex = 0; fieldIndex < fields.size() && fieldIndex < fieldCount; ++fieldIndex)
     {
+        auto& field = fields[fieldIndex];
         llvm::Value* rvalue = nullptr;
         bool fieldSrcUnsigned = false;
         if (auto* braceList = FieldDefaultBraceList(field))
@@ -3401,90 +3403,10 @@ void MainListener::ParseProgramDefinition(CFlatParser::ProgramDefinitionContext*
             returnType.TypeName = name;
             compiler->CreateFunctionDefinition(name, returnType, {});
 
-            std::vector<llvm::Value*> initializers;
-            std::vector<char> initializerUnsigned;
-            for (auto& typeValue : declList)
-            {
-                llvm::Value* rvalue = nullptr;
-                bool fieldSrcUnsigned = false;
-                auto* initializer = typeValue.Initializer;
-                if (auto* braceList = FieldDefaultBraceList(typeValue))
-                {
-                    // Emitting a real function body; clear the stale file-scope global_scope
-                    // so the brace list's stores and calls lower as ordinary instructions.
-                    GlobalScopeGuard defaultCtorScope(global_scope);
-                    rvalue = ParseFieldDefaultBraceInitializer(name, typeValue, braceList);
-                }
-                else if (initializer)
-                {
-                    if (auto* ae = initializer->assignmentExpression())
-                        rvalue = ParseFieldDefaultInitializer(name, typeValue, ae, &fieldSrcUnsigned);
-                    else if (initializer->Default())
-                    {
-                        // Synthetic default-ctor body: clear the stale file-scope global_scope so a
-                        // struct-typed field's `= default` runs that field's own default constructor
-                        // (its field initializers) rather than zero-filling. See GenerateDefaultValue.
-                        GlobalScopeGuard defaultCtorScope(global_scope);
-                        rvalue = GenerateDefaultValue(typeValue);
-                    }
-                }
-                initializers.push_back(rvalue);
-                initializerUnsigned.push_back(fieldSrcUnsigned ? 1 : 0);
-            }
-
-            // Seed with zero (not undef) so fields lacking an explicit initializer read as
-            // 0/null after `= default` / `= {}` instead of leaking stack garbage. Fields that
-            // do have an initializer are overwritten by CreateInsertValue below, so a
-            // fully-initialized struct optimizes to the same IR as the old undef seed.
-            llvm::Value* structVal = llvm::Constant::getNullValue(structType);
-            unsigned int idx = 0;
-            for (auto* rvalue : initializers)
-            {
-                auto* destType = structType->getTypeAtIndex(idx);
-                // No explicit initializer on a struct-typed USER field - call its default ctor
-                // (same fallback as ParseStructDefinition). Synthetic fields are written below.
-                if (rvalue == nullptr && idx < exitCodeFieldIndex && destType->isStructTy())
-                {
-                    std::string fieldTypeName = declList[idx].TypeName;
-                    // forceRoot: the GetFunction guard is an exact-key lookup, so a namespace walk
-                    // here would call a same-named sibling type's ctor (layer 3).
-                    if (compiler->GetFunction(fieldTypeName))
-                        rvalue = compiler->CreateOverloadedFunctionCall(fieldTypeName, {}, true);
-                    else
-                        rvalue = llvm::Constant::getNullValue(destType);
-                }
-                if (rvalue)
-                {
-                    rvalue = compiler->Upconvert(rvalue, destType,
-                        idx < initializerUnsigned.size() && initializerUnsigned[idx] != 0);
-                    if (rvalue->getType() != destType)
-                    {
-                        if (destType->isStructTy())
-                        {
-                            // Initializer type doesn't match struct field type (same fallback as ParseStructDefinition).
-                            std::string fieldTypeName = declList[idx].TypeName;
-                            // forceRoot: the GetFunction guard is an exact-key lookup, so a namespace walk
-                            // here would call a same-named sibling type's ctor (layer 3).
-                            if (compiler->GetFunction(fieldTypeName))
-                                rvalue = compiler->CreateOverloadedFunctionCall(fieldTypeName, {}, true);
-                            else
-                                rvalue = llvm::Constant::getNullValue(destType);
-                        }
-                        else
-                        {
-                            // Narrowing field initializer (e.g. u8 r = 255 has i32 literal).
-                            if (ShouldWarnImplicitFieldNarrowing(rvalue, destType, declList[idx].TypeName))
-                                compiler->LogWarning(std::format(
-                                    "implicit narrowing to '{}' in field '{}' - use an explicit cast",
-                                    SpellType(*compiler, declList[idx]),
-                                    declList[idx].VariableName));
-                            rvalue = compiler->CreateCast(rvalue, destType);
-                        }
-                    }
-                    structVal = compiler->CreateInsertValue(structVal, rvalue, idx);
-                }
-                idx++;
-            }
+            // User fields share the struct default ctor's field walk (a field initializer that
+            // unwinds destroys the fields already built); synthetic fields are written below.
+            llvm::Value* structVal = EmitAggregateFieldInitialization(name, structType, declList,
+                                                                      exitCodeFieldIndex);
 
             // Synthetic field: exitCode = -1
             {
@@ -3990,105 +3912,9 @@ void MainListener::ParseClassDefinition(CFlatParser::ClassDefinitionContext* ctx
         {
             auto funcDef = compiler->CreateFunctionDefinition(structName, returnType, {});
 
-            std::vector<llvm::Value*> initializers;
-            std::vector<char> initializerUnsigned;
-            for (auto& typeValue : declList)
-            {
-                auto initializer = typeValue.Initializer;
-                llvm::Value* rvalue = nullptr;
-                bool fieldSrcUnsigned = false;
-                if (auto* braceList = FieldDefaultBraceList(typeValue))
-                {
-                    // Emitting a real function body; clear the stale file-scope global_scope
-                    // so the brace list's stores and calls lower as ordinary instructions.
-                    GlobalScopeGuard defaultCtorScope(global_scope);
-                    rvalue = ParseFieldDefaultBraceInitializer(structName, typeValue, braceList);
-                }
-                else if (initializer != nullptr)
-                {
-                    auto assignmentExpression = initializer->assignmentExpression();
-                    if (assignmentExpression != nullptr)
-                    {
-                        rvalue = ParseFieldDefaultInitializer(
-                            structName, typeValue, assignmentExpression, &fieldSrcUnsigned);
-                        if (typeValue.TypeName == "auto")
-                        {
-                            typeValue.TypeName = rvalue->getType()->getStructName();
-                            structType = compiler->CreateStructType(structName, declList);
-                        }
-                    }
-                    else if (initializer->Default() != nullptr)
-                    {
-                        // Synthetic default-ctor body: clear the stale file-scope global_scope so a
-                        // struct-typed field's `= default` runs that field's own default constructor
-                        // (its field initializers) rather than zero-filling. See GenerateDefaultValue.
-                        GlobalScopeGuard defaultCtorScope(global_scope);
-                        rvalue = GenerateDefaultValue(typeValue);
-                    }
-                }
-                initializers.push_back(rvalue);
-                initializerUnsigned.push_back(fieldSrcUnsigned ? 1 : 0);
-            }
-
-            // Seed with zero (not undef) so fields lacking an explicit initializer read as
-            // 0/null instead of leaking stack garbage. Mirrors the struct default ctor above.
-            llvm::Value* structVal = llvm::Constant::getNullValue(structType);
-
-            LLVMBackend::TypeAndValue myStruct;
-            myStruct.TypeName = structName;
-            myStruct.VariableName = "_" + structName;
-
-            unsigned int structIndex = 0;
-
-            for (auto rvalue : initializers)
-            {
-                auto* destType = structType->getTypeAtIndex(structIndex);
-                // No explicit initializer on a struct-typed field - call its default ctor.
-                if (rvalue == nullptr && (destType->isStructTy() || destType->isArrayTy()))
-                {
-                    std::string fieldTypeName = declList[structIndex].TypeName;
-                    // forceRoot: the GetFunction guard is an exact-key lookup, so a namespace walk
-                    // here would call a same-named sibling type's ctor (layer 3).
-                    if (destType->isArrayTy())
-                        rvalue = GenerateDefaultValue(declList[structIndex]);
-                    else if (compiler->GetFunction(fieldTypeName))
-                        rvalue = compiler->CreateOverloadedFunctionCall(fieldTypeName, {}, true);
-                    else
-                        rvalue = llvm::Constant::getNullValue(destType);
-                }
-                if (rvalue != nullptr)
-                {
-                    rvalue = compiler->Upconvert(rvalue, destType,
-                        structIndex < initializerUnsigned.size() && initializerUnsigned[structIndex] != 0);
-                    if (rvalue->getType() != destType)
-                    {
-                        if (destType->isStructTy())
-                        {
-                            std::string fieldTypeName = declList[structIndex].TypeName;
-                            // forceRoot: the GetFunction guard is an exact-key lookup, so a namespace walk
-                            // here would call a same-named sibling type's ctor (layer 3).
-                            if (compiler->GetFunction(fieldTypeName))
-                                rvalue = compiler->CreateOverloadedFunctionCall(fieldTypeName, {}, true);
-                            else
-                                rvalue = llvm::Constant::getNullValue(destType);
-                        }
-                        else
-                        {
-                            // Narrowing field initializer (e.g. u8 r = 255 has i32 literal).
-                            if (ShouldWarnImplicitFieldNarrowing(
-                                    rvalue, destType, declList[structIndex].TypeName))
-                                compiler->LogWarning(std::format(
-                                    "implicit narrowing to '{}' in field '{}' - use an explicit cast",
-                                    SpellType(*compiler, declList[structIndex]),
-                                    declList[structIndex].VariableName));
-                            rvalue = compiler->CreateCast(rvalue, destType);
-                        }
-                    }
-                    structVal = compiler->CreateInsertValue(structVal, rvalue, structIndex);
-                }
-
-                structIndex++;
-            }
+            // The struct default ctor's field walk: a field initializer that unwinds destroys the
+            // fields already built.
+            llvm::Value* structVal = EmitAggregateFieldInitialization(structName, structType, declList);
 
             compiler->CreateReturnCall(structVal);
             compiler->CreateBlockBreak(nullptr, true);
@@ -4674,6 +4500,9 @@ void MainListener::EmitCppStructConstructorThunk(
                 compiler->builder->getInt64(fieldBytes), llvm::Align(1));
         }
 
+        // The C++ constructor never completes if a field initializer or the body throws, so C++
+        // runs no destructor thunk: an unwind destroys the CFlat fields already built here.
+        LLVMBackend::UnwindPartialScope builtFields(*compiler);
         for (size_t fieldIndex = 0; fieldIndex < fields.size(); ++fieldIndex)
         {
             if (fieldIndex >= structType->getNumElements()) break;
@@ -4709,9 +4538,22 @@ void MainListener::EmitCppStructConstructorThunk(
                     value = compiler->CreateCast(value, destinationType);
             }
             if (value != nullptr && value->getType() == destinationType)
-                compiler->builder->CreateStore(value,
-                    compiler->builder->CreateStructGEP(structType, dst,
-                                                        (unsigned)fieldIndex, field.VariableName));
+            {
+                auto* fieldPtr = compiler->builder->CreateStructGEP(structType, dst,
+                                                                    (unsigned)fieldIndex,
+                                                                    field.VariableName);
+                compiler->builder->CreateStore(value, fieldPtr);
+                if (destinationType->isArrayTy())
+                {
+                    llvm::Type* elemTy = nullptr;
+                    const uint64_t n = compiler->PeelFixedArrayType(destinationType, elemTy);
+                    compiler->NoteUnwindArrayPrefix(fieldPtr, elemTy,
+                                                    compiler->builder->getInt64(n), field.TypeName);
+                }
+                else if (destinationType->isStructTy())
+                    compiler->NoteUnwindPartial(LLVMBackend::UnwindPartialEntry::Kind::Slot,
+                                                fieldPtr, field.TypeName);
+            }
         }
 
         if (body != nullptr) ParseBlockItemList(body);

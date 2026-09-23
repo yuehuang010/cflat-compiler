@@ -155,6 +155,9 @@
 //     filesystem::path / tuple constructors (2540-2559).
 //   Explicit free-function-template instantiations keep distinct wrapper registrations when
 //     their CFlat ABI signatures match; repeated identical instantiations still share one.
+//   `std.pair<T, U>(...)` resolves through clang's constructor-template wrapper for scalar,
+//     string, named-local, nested-pair, and vector-element construction, while C++ returns,
+//     default initialization, and free `std.make_pair` retain their value behavior (2580-2584).
 
 import cpp "library/cpp_interop_basic.h";
 import cpp "library/cpp_interop_basic.cpp";
@@ -3001,6 +3004,30 @@ extern int main()
         if (nttp.zero<int>() != 4 || nttp.zero<long>() != 8)                return 2566;
         if (nttp.enumVal<nttp.Choice.High>() != 9
             || nttp.enumVal<nttp.Choice.Low>() != 4)                        return 2567;
+    }
+
+    // ---- std::pair constructor templates and value-record controls (section 2580-2599) ---------
+    {
+        std.pair<int, double> scalarPair = std.pair<int, double>(1, 2.5);
+        if (scalarPair.first != 1 || scalarPair.second != 2.5)              return 2580;
+
+        std.pair<std.string, int> stringPair = std.pair<std.string, int>("a", 1);
+        if ((int)stringPair.first.size() != 1 || stringPair.second != 1)   return 2581;
+
+        int pairFirst = 3;
+        double pairSecond = 4.5;
+        std.pair<int, double> namedPair = std.pair<int, double>(pairFirst, pairSecond);
+        if (namedPair.first != 3 || namedPair.second != 4.5)                return 2582;
+
+        std.vector<std.pair<int, double>> pairVector = default;
+        pairVector.push_back(std.pair<int, double>(5, 6.5));
+        if ((int)pairVector.size() != 1 || pairVector[0].first != 5
+            || pairVector[0].second != 6.5)                                return 2583;
+
+        std.pair<int, std.pair<int, int>> nestedPair =
+            std.pair<int, std.pair<int, int>>(7, std.pair<int, int>(8, 9));
+        if (nestedPair.first != 7 || nestedPair.second.first != 8
+            || nestedPair.second.second != 9)                               return 2584;
     }
 
     return 0;

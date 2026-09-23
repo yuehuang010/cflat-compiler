@@ -1996,6 +1996,8 @@ bool LLVMBackend::ArgumentIsProvablyDataPointer(llvm::Value* value, const NamedV
         if (llvm::isa<llvm::Function>(value)) return false;               // a named function
         if (llvm::isa<llvm::ConstantPointerNull>(value)) return false;    // parity with the direct path
         if (arg.TypeAndValue.IsFunctionPointer) return false;             // a closure value
+        if (auto* constant = llvm::dyn_cast_or_null<llvm::Constant>(value);
+            constant != nullptr && IsStringLiteralConstant(constant)) return true;
         // The only declared evidence available here: the type is a pointer. A call result with no
         // recorded shape, or a bare identifier, leaves this false.
         if (arg.TypeAndValue.Pointer) return true;
@@ -2777,10 +2779,14 @@ llvm::Value* LLVMBackend::CallInterfaceMethod(llvm::Value* ifacePtr, const std::
         if (cxxSretReturn)
             paramTypes.push_back(cflat_llvm::PointerTo(GetType(methodInfo->ReturnType)));
         paramTypes.push_back(ptrTy);
-        for (const auto& p : methodInfo->Parameters)
+        for (size_t i = 0; i < methodInfo->Parameters.size(); ++i)
         {
-            // Same alias-borrow param ABI the definition emitted (GetFunctionType).
-            paramTypes.push_back(!p.Pointer && IsForeignNontrivialCxxClass(p.TypeName)
+            const auto& p = methodInfo->Parameters[i];
+            const size_t recipeIndex = i + 1;
+            const bool byVal = recipeIndex < cxxSretRecipe.paramSlots.size()
+                && cxxSretRecipe.paramSlots[recipeIndex].kind == AbiSlot::ByVal;
+            // Match the definition's ByVal recipe and alias-borrow lowering.
+            paramTypes.push_back(byVal
                 ? cflat_llvm::PointerTo(GetType(p))
                 : (ParameterIsAliasByPointer(p) ? cflat_llvm::PointerTo(GetType(p))
                                                 : GetType(p)));
@@ -2804,9 +2810,7 @@ llvm::Value* LLVMBackend::CallInterfaceMethod(llvm::Value* ifacePtr, const std::
 
             const size_t recipeIndex = i + 1; // slot zero is the interface receiver
             if (recipeIndex < cxxSretRecipe.paramSlots.size()
-                && cxxSretRecipe.paramSlots[recipeIndex].kind == AbiSlot::ByVal
-                && !param.Pointer && !param.IsAlias
-                && IsForeignNontrivialCxxClass(param.TypeName))
+                && cxxSretRecipe.paramSlots[recipeIndex].kind == AbiSlot::ByVal)
             {
                 if (nv.Storage == nullptr)
                 {
@@ -2819,14 +2823,18 @@ llvm::Value* LLVMBackend::CallInterfaceMethod(llvm::Value* ifacePtr, const std::
                 auto* temp = AllocaAtEntry(cxxSretRecipe.paramSlots[recipeIndex].structTy,
                                            nullptr, "cxx.interface.argtemp",
                                            cxxSretRecipe.paramSlots[recipeIndex].align);
+                const bool cxxObject = IsForeignNontrivialCxxClass(param.TypeName);
+                const bool cflatHolder = !cxxObject
+                    && HasForeignNontrivialCxxField(param.TypeName);
                 const bool useMove = param.IsMove || nv.IsExplicitMove
                     || nv.CxxParamLastUse || nv.IsRvalue;
-                if (!EmitCxxCopyOrMoveConstruct(param.TypeName, temp, nv.Storage, useMove,
-                                                "into an interface by-value parameter"))
+                if (!EmitCxxByValueParamConstruct(param.TypeName, temp, nv.Storage, useMove,
+                                                  "into an interface by-value parameter"))
                     continue;
-                if (!IsCxxParamDestroyedInCallee(param.TypeName))
+                if (cxxObject && !IsCxxParamDestroyedInCallee(param.TypeName))
                     RegisterOwnedStructTemp(temp, param.TypeName);
-                if (nv.CxxParamLastUse && !nv.IsElementAccess && nv.FieldName.empty())
+                if (nv.CxxParamLastUse && !cflatHolder
+                    && !nv.IsElementAccess && nv.FieldName.empty())
                 {
                     const std::string sourceName = nv.CallerName.empty()
                         ? nv.TypeAndValue.VariableName : nv.CallerName;
@@ -2963,9 +2971,15 @@ llvm::Value* LLVMBackend::CallInterfaceMethod(llvm::Value* ifacePtr, const std::
             callArgs.push_back(rawReturnCountSlot);
         }
 
+        moveTransferConsumedTemps_.clear();
         ApplyMoveParamTransfer(ifaceName + "." + methodName, methodInfo->Parameters, callArgNVs,
             true, false, true);
-        auto* callResult = builder->CreateCall(fnTy, fnPtr, callArgs);
+        // The implementation is a CFlat method, so it may throw through: invoke when this frame
+        // owes cleanup. Its pad leaves the sink arguments to the callee.
+        unwindCallConsumedTemps_ = std::move(moveTransferConsumedTemps_);
+        moveTransferConsumedTemps_.clear();
+        auto* callResult = CreateCallOrInvoke(fnTy, fnPtr, callArgs, /*mayUnwind=*/true);
+        unwindCallConsumedTemps_.clear();
         if (cxxSretRecipe.hasLowering)
             ApplyAbiCallAttributes(callResult, cxxSretRecipe);
         llvm::Value* resultValue = callResult;

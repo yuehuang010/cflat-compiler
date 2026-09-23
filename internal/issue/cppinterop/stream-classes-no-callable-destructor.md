@@ -46,6 +46,12 @@ Plus the spike gap that was always part of this story:
 [`std-free-functions-and-globals-unreachable.md`](std-free-functions-and-globals-unreachable.md)
 (`std.cout`). The `std.ofstream` spelling half LANDED 2026-09-16.
 
+## Re-measured 2026-09-22 (macOS arm64 / libc++)
+
+The acceptance leg now exists: `Test/test_cpp_interop.cb` 3205 opens an `std.ofstream` local,
+writes through `<<`, lets the destructor flush it at scope exit and reads it back. Still MSVC-filed:
+delete once a Windows host passes that leg.
+
 ## Acceptance
 
 Unchanged: a `std.ofstream` local opens a file in `scratch/`, writes, and destructs at scope

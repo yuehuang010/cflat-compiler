@@ -2460,6 +2460,18 @@ nlohmann::json LLVMBackend::RecordToJson(const CRecordEntry& r, CCachePathTable*
             }
             j["bs"] = bs;
         }
+        if (!r.virtualBases.empty())
+        {
+            nlohmann::json bs = nlohmann::json::array();
+            for (const auto& b : r.virtualBases)
+            {
+                nlohmann::json bj = {{"n", b.name}, {"of", b.offsetBytes}};
+                if (!b.canonicalType.empty()) bj["ct"] = b.canonicalType;
+                if (b.access != 0) bj["ac"] = b.access;
+                bs.push_back(std::move(bj));
+            }
+            j["vbs"] = bs;
+        }
         if (!r.members.empty())
         {
             nlohmann::json ms = nlohmann::json::array();
@@ -2518,6 +2530,17 @@ LLVMBackend::CRecordEntry LLVMBackend::RecordFromJson(const SjVal& j, const CCac
                 rb.access      = b.value("ac", 0);
                 rb.isVirtual   = b.value("vi", false);
                 r.bases.push_back(std::move(rb));
+            }
+        if (j.contains("vbs"))
+            for (const auto& b : j["vbs"])
+            {
+                cflat_cinterop::RawCxxBase rb;
+                rb.name          = b.value("n", std::string{});
+                rb.canonicalType = b.value("ct", std::string{});
+                rb.offsetBytes   = b.value("of", (uint64_t)0);
+                rb.access        = b.value("ac", 0);
+                rb.isVirtual     = true;
+                r.virtualBases.push_back(std::move(rb));
             }
         if (j.contains("mb")) for (const auto& m : j["mb"]) r.members.push_back(CxxMemberFromJson(m, files));
         if (j.contains("sv")) for (const auto& v : j["sv"]) r.staticVars.push_back(CxxStaticVarFromJson(v, files));
@@ -2792,6 +2815,13 @@ bool LLVMBackend::TryLoadCHeaderDiskCache(
         // v81 records a public constructor TEMPLATE on a C++ record (hct): an older cache
         // carries none, so `T(args)` would never reach clang's constructor overload resolution.
         // v83 keys C++ header and type-request entries by the selected language standard.
+        // v82 registers explicit free-function-template wrappers under their unique names.
+        // v84 companion bitcode defines the virtual members of a vtable it emits and the
+        // out-of-line inline members it uses: an older sidecar declares them (link failure).
+        // v84 also records every virtual base's complete-object offset ("vbs"): an older record
+        // has none, so a member inherited through a virtual base gets the wrong `this`.
+        // v85 omits out-of-line C++ static data members from the bare-global list; they are
+        // registered through their class record instead.
         if (version != kCHeaderCacheVersion) return cacheMiss("cache version");
 
         if (!expectedRequestKey.empty()
@@ -3204,6 +3234,9 @@ void LLVMBackend::WriteCHeaderDiskCache(
         // v80 records function-template forwarding-reference parameters.
         // v81 records a public constructor template on a C++ record (hct).
         // v82 registers explicit free-function-template wrappers under their unique names.
+        // v84 defines vtable virtual members + used out-of-line inline members in the companion
+        // bitcode, and records virtual-base offsets (vbs).
+        // v85 omits out-of-line C++ static data members from the bare-global list.
         j["version"] = kCHeaderCacheVersion;
         j["mtime"]   = (int64_t)mtime.time_since_epoch().count();
         j["hash"]    = contentHash;

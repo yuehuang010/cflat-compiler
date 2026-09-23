@@ -8758,6 +8758,98 @@ bool MainListener::HasOperatorOverloadForFirstParam(const std::string& opName, c
         return false;
     }
 
+/*
+ * `a << b` / `a >> b` with a C++ class on the left is a C++ expression, so C++ resolves it: a
+ * generated `decltype(auto) w(A& p0, B p1) { return p0 << p1; }` sees the members, the free
+ * operator templates (`operator<<(basic_ostream<char, T>&, const char*)`), ADL candidates and
+ * derived-to-base conversions. A scalar lvalue read by `>>` is passed as `T &` so the extraction
+ * lands in the CFlat variable. nullptr -> no wrapper; the caller falls back to CFlat's resolution.
+ */
+llvm::Value* MainListener::TryCxxInfixShift(CFlatParser::ShiftExpressionContext* ctx,
+                                            const std::string& op,
+                                            const ShiftOperand& lhs, const std::string& lhsClass,
+                                            llvm::Value* lhsStorage,
+                                            const ShiftOperand& rhs, const std::string& rhsClass,
+                                            llvm::Value* rhsStorage)
+{
+        auto* compiler = Compiler(ctx);
+        if ((lhs.value.value == nullptr && lhs.cxxName.empty())
+            || (rhs.value.value == nullptr && rhs.cxxName.empty()))
+            return nullptr;
+        const std::string& owner = !lhs.cxxName.empty() ? lhs.cxxName : lhsClass;
+        const std::string base = owner.substr(0, owner.find('$'));
+        const size_t dot = base.rfind('.');
+        const std::string sourceName = (dot == std::string::npos ? std::string()
+                                        : base.substr(0, dot) + ".") + "operator" + op;
+        auto operand = [&](const ShiftOperand& o, const std::string& cls, llvm::Value* storage) {
+            LLVMBackend::NamedVariable arg;
+            arg.Primary = o.value.value;
+            arg.BaseType = o.value.value->getType();
+            const bool isClass = !cls.empty() && compiler->IsCxxRecord(cls);
+            auto* literal = llvm::dyn_cast<llvm::ConstantInt>(o.value.value);
+            if (isClass) arg.TypeAndValue.TypeName = cls;
+            else if (literal != nullptr && o.named.Storage == nullptr && !o.literalType.empty())
+            {
+                // A CFlat literal is narrowed to its smallest type; C++ reads `42` as int.
+                arg.TypeAndValue.TypeName = o.literalType;
+                LLVMBackend::TypeAndValue declared;
+                declared.TypeName = o.literalType;
+                llvm::Type* literalTy = compiler->GetType(declared, nullptr, false);
+                if (literalTy != nullptr && literalTy->isIntegerTy())
+                {
+                    arg.Primary = llvm::ConstantInt::get(literalTy, literal->getSExtValue(), true);
+                    arg.BaseType = literalTy;
+                }
+            }
+            else if (o.named.Storage != nullptr && !o.named.TypeAndValue.TypeName.empty())
+                arg.TypeAndValue = o.named.TypeAndValue;
+            else if (arg.BaseType->isPointerTy() && !o.value.sourceTypeName.empty())
+            {
+                // An unnamed pointer (`s.c_str()`, `(void*)p`): the declared pointee is the
+                // source type name; the pointer level must survive or `char*` reads as `char`.
+                arg.TypeAndValue.TypeName = o.value.sourceTypeName;
+                arg.TypeAndValue.Pointer = true;
+                arg.TypeAndValue.ElemPointer = o.value.elemPointer || o.value.pointerDepth > 1;
+            }
+            else arg.InferSourceTypeName = o.value.sourceTypeName;
+            arg.TypeAndValue.VariableName.clear();
+            arg.Storage = o.value.isRvalue && isClass ? nullptr : storage;
+            if (!isClass && o.named.Storage == nullptr) arg.Storage = nullptr;
+            arg.IsRvalue = isClass && arg.Storage == nullptr;
+            if (arg.IsRvalue)
+            {
+                auto* temp = compiler->CreateAlloca(arg.BaseType);
+                compiler->CreateAssignment(arg.Primary, temp);
+                arg.Storage = temp;
+            }
+            return arg;
+        };
+        std::vector<LLVMBackend::NamedVariable> args;
+        if (lhs.cxxName.empty()) args.push_back(operand(lhs, lhsClass, lhsStorage));
+        if (rhs.cxxName.empty()) args.push_back(operand(rhs, rhsClass, rhsStorage));
+        std::string registeredName;
+        std::string error;
+        if (!compiler->RequestCxxFreeFunction(sourceName, {}, args, registeredName, error, op,
+                                              lhs.cxxName, rhs.cxxName)
+            || registeredName.empty())
+        {
+            if (!lhs.cxxName.empty() || !rhs.cxxName.empty())
+            {
+                auto shown = [&](const ShiftOperand& o, const std::string& cls) {
+                    if (!o.cxxName.empty()) return o.cxxName;
+                    if (!cls.empty())
+                        return SpellType(*compiler, LLVMBackend::TypeAndValue{ .TypeName = cls });
+                    return std::string("value");
+                };
+                LogErrorContext(ctx, std::format("C++ expression '{} {} {}' could not be bound ({})",
+                                                 shown(lhs, lhsClass), op, shown(rhs, rhsClass),
+                                                 error));
+            }
+            return nullptr;
+        }
+        return compiler->CreateOverloadedFunctionCall(registeredName, args, true);
+}
+
 MainListener::ShiftPairResult MainListener::ParseShiftPair(
     const ShiftOperand& lhs, const ShiftOperand& rhs, const std::string& op,
     CFlatParser::ShiftExpressionContext* ctx, ResultUse use) {
@@ -8846,17 +8938,37 @@ MainListener::ShiftPairResult MainListener::ParseShiftPair(
 
         if (op == ">>" || op == "<<")
         {
-            if ((!lhsType.empty() && compiler->IsCxxRecord(lhsType))
-                || (!rhsType.empty() && compiler->IsCxxRecord(rhsType)))
+            // A chained operand (the reference a previous `<<` returned) has no named variable;
+            // its class comes from the loaded value.
+            auto className = [&](const std::string& declared, llvm::Value* value) {
+                if (!declared.empty()) return declared;
+                auto* st = value != nullptr ? llvm::dyn_cast<llvm::StructType>(value->getType())
+                                            : nullptr;
+                return st != nullptr && !st->isLiteral() && st->hasName()
+                    ? st->getName().str() : std::string();
+            };
+            const std::string lhsClass = className(lhsType, lv.value);
+            const std::string rhsClass = className(rhsType, rv.value);
+            if (!lhs.cxxName.empty() || !rhs.cxxName.empty()
+                || (!lhsClass.empty() && compiler->IsCxxRecord(lhsClass))
+                || (!rhsClass.empty() && compiler->IsCxxRecord(rhsClass)))
             {
                 llvm::Value* lhsStorage = lhsNV.Storage != nullptr ? lhsNV.Storage
                                                                   : lv.receiverStorage;
                 llvm::Value* rhsStorage = rhsNV.Storage != nullptr ? rhsNV.Storage
                                                                   : rv.receiverStorage;
-                if (auto* overload = TryBinaryOperatorOverload(
+                llvm::Value* overload = nullptr;
+                const bool namedOperand = !lhs.cxxName.empty() || !rhs.cxxName.empty();
+                if (namedOperand || (!lhsClass.empty() && compiler->IsCxxRecord(lhsClass)))
+                    overload = TryCxxInfixShift(ctx, op, lhs, lhsClass, lhsStorage,
+                                                rhs, rhsClass, rhsStorage);
+                if (namedOperand && overload == nullptr) return {};
+                if (overload == nullptr)
+                    overload = TryBinaryOperatorOverload(
                         lv.value, op, rv.value, ctx, lv.elemType, rv.pointerDepth,
                         rv.elemPointer, lhsStorage, rhsStorage, false, true,
-                        lv.isRvalue, rv.isRvalue, lv.sourceTypeName, rv.sourceTypeName))
+                        lv.isRvalue, rv.isRvalue, lv.sourceTypeName, rv.sourceTypeName);
+                if (overload != nullptr)
                 {
                     LLVMBackend::NamedVariable resultNV;
                     resultNV.Primary = overload;
@@ -8956,18 +9068,62 @@ LLVMBackend::TypedValue MainListener::ParseShiftExpression(CFlatParser::ShiftExp
             return named;
         };
 
+        auto literalTypeOf = [](antlr4::ParserRuleContext* operand, const LLVMBackend::TypedValue& v) {
+            auto* constant = llvm::dyn_cast_or_null<llvm::ConstantInt>(v.value);
+            if (constant == nullptr || operand == nullptr) return std::string();
+            const std::string text = operand->getText();
+            if (text.size() >= 3 && text.front() == '\'' && text.back() == '\'') return std::string("char");
+            size_t i = !text.empty() && text[0] == '-' ? 1 : 0;
+            if (i >= text.size() || !std::isdigit((unsigned char)text[i])) return std::string();
+            for (; i < text.size(); ++i)
+                if (!std::isalnum((unsigned char)text[i]) && text[i] != '_') return std::string();
+            const int64_t value = constant->getSExtValue();
+            return std::string(value >= INT32_MIN && value <= INT32_MAX ? "int" : "long");
+        };
+        // `std.cout` / `std.endl`: a dotted name in an imported C++ namespace that names no
+        // CFlat variable or type. A function (template) name such as a manipulator is spelled
+        // into the C++ expression too, where C++ deduces it against the stream.
+        auto cxxNameOf = [&](antlr4::ParserRuleContext* operand) -> std::string {
+            const std::string text = operand != nullptr ? operand->getText() : std::string();
+            const size_t lastDot = text.rfind('.');
+            if (lastDot == std::string::npos || lastDot == 0 || lastDot + 1 == text.size())
+                return {};
+            for (size_t i = 0; i < text.size(); ++i)
+            {
+                const char c = text[i];
+                const bool start = i == 0 || text[i - 1] == '.';
+                if (c == '.' ? start : !(std::isalpha((unsigned char)c) || c == '_'
+                                         || (!start && std::isdigit((unsigned char)c))))
+                    return {};
+            }
+            if (!compiler->IsCxxNamespace(text.substr(0, text.find('.')))
+                || !compiler->IsCxxNamespace(text.substr(0, lastDot)))
+                return {};
+            if (lookup(text).Storage != nullptr || compiler->IsDataStructure(text)) return {};
+            return text;
+        };
         ShiftOperand lhs;
-        lhs.value = ParseAdditiveExpression(nextCtxs[0], ResultUse::Value);
-        NormalizeCxxReferenceOperand(ctx, lhs.value);
-        lhs.name = TryGetSimpleIdentifier(nextCtxs[0]);
-        lhs.named = lookup(lhs.name);
+        lhs.cxxName = cxxNameOf(nextCtxs[0]);
+        if (lhs.cxxName.empty())
+        {
+            lhs.value = ParseAdditiveExpression(nextCtxs[0], ResultUse::Value);
+            NormalizeCxxReferenceOperand(ctx, lhs.value);
+            lhs.name = TryGetSimpleIdentifier(nextCtxs[0]);
+            lhs.named = lookup(lhs.name);
+            lhs.literalType = literalTypeOf(nextCtxs[0], lhs.value);
+        }
         for (size_t i = 1; i < nextCtxs.size(); ++i)
         {
             ShiftOperand rhs;
-            rhs.value = ParseAdditiveExpression(nextCtxs[i], ResultUse::Value);
-            NormalizeCxxReferenceOperand(ctx, rhs.value);
-            rhs.name = TryGetSimpleIdentifier(nextCtxs[i]);
-            rhs.named = lookup(rhs.name);
+            rhs.cxxName = cxxNameOf(nextCtxs[i]);
+            if (rhs.cxxName.empty())
+            {
+                rhs.value = ParseAdditiveExpression(nextCtxs[i], ResultUse::Value);
+                NormalizeCxxReferenceOperand(ctx, rhs.value);
+                rhs.name = TryGetSimpleIdentifier(nextCtxs[i]);
+                rhs.named = lookup(rhs.name);
+                rhs.literalType = literalTypeOf(nextCtxs[i], rhs.value);
+            }
             auto pair = ParseShiftPair(lhs, rhs, operators[i - 1], ctx,
                                        i + 1 == nextCtxs.size() ? use : ResultUse::Value);
             if (pair.value.value == nullptr) return {};
@@ -8975,6 +9131,8 @@ LLVMBackend::TypedValue MainListener::ParseShiftExpression(CFlatParser::ShiftExp
             lhs.named = pair.named;
             lhs.name = pair.name;
             lhs.accumulated = true;
+            lhs.cxxName.clear();
+            lhs.literalType.clear();
             // The pair returned a reference: reload the referenced object so the next operand
             // operates on it, not on the pointer (a chained `a << b << c`).
             if (i + 1 < nextCtxs.size() && lhs.value.cxxRefValueType != nullptr)
@@ -11827,7 +11985,8 @@ bool MainListener::EmitForeignCxxValueIntoSlot(
 void MainListener::DestroyForeignCxxRelocationSource(
         const LLVMBackend::NamedVariable& sourceNV) {
     auto* compiler = Compiler();
-    const bool dereferencedStorage = llvm::isa<llvm::LoadInst>(sourceNV.Storage);
+    const bool dereferencedStorage = sourceNV.Storage != nullptr
+        && llvm::isa<llvm::LoadInst>(sourceNV.Storage);
     if ((!sourceNV.IsElementAccess && !sourceNV.FieldPathThroughPointer
             && !dereferencedStorage)
         || !sourceNV.IsRvalue || sourceNV.Storage == nullptr
@@ -12759,16 +12918,22 @@ void MainListener::EmitArrayValueInitSlots(
                 if (list != nullptr) LogErrorContext(list, ctorError);
                 else compiler->LogErrorMessage("{}", { ctorError });
             }
-            // A named-field list still applies per element, exactly as before the ctor ran.
+            // A named-field list still applies per element, exactly as before the ctor ran; all
+            // N elements are built by then.
             if (list != nullptr && !list->fieldInit().empty())
+            {
+                LLVMBackend::UnwindPartialScope builtElements(*compiler);
+                compiler->NoteUnwindArrayPrefix(arrAlloc, elemTy, compiler->builder->getInt64(n),
+                                                tv.TypeName);
                 compiler->EmitFixedArrayElementWalk(
                     *compiler->builder, arrAlloc, elemTy, n,
                     [&](llvm::Value* elemPtr) { EmitFieldInitializer(elemPtr, tv.TypeName, list); });
+            }
             return;
         }
 
-        compiler->EmitFixedArrayElementWalk(
-            *compiler->builder, arrAlloc, elemTy, n,
+        compiler->EmitArrayConstructionWalk(
+            arrAlloc, elemTy, n, tv.TypeName,
             [&](llvm::Value* elemPtr)
             {
                 llvm::Value* elem = compiler->GetFunction(tv.TypeName)
@@ -12778,6 +12943,9 @@ void MainListener::EmitArrayValueInitSlots(
                     compiler->CreateAssignment(elem, elemPtr);
                 else
                     compiler->builder->CreateStore(llvm::Constant::getNullValue(elemTy), elemPtr);
+                // Built: the named overrides below may throw.
+                compiler->NoteUnwindPartial(LLVMBackend::UnwindPartialEntry::Kind::Slot, elemPtr,
+                                            tv.TypeName);
                 if (list != nullptr && !list->fieldInit().empty())
                     EmitFieldInitializer(elemPtr, tv.TypeName, list);
             });
@@ -13298,13 +13466,25 @@ void MainListener::EmitPositionalFixedArrayIntoSlot(
                     arrTy, arrAlloc, indices, "arrelem"));
             }
         }
+        // An unwind out of element i (or the value-initialized tail) destroys the elements
+        // already built, newest first; element i itself never.
+        LLVMBackend::UnwindPartialScope builtElements(*compiler);
+        llvm::Value* builtElemPtr = nullptr;
+        auto noteBuiltElement = [&]() {
+            if (builtElemPtr != nullptr && elemStructTy != nullptr)
+                compiler->NoteUnwindPartial(LLVMBackend::UnwindPartialEntry::Kind::Slot,
+                                            builtElemPtr, tv.TypeName);
+            builtElemPtr = nullptr;
+        };
         for (size_t i = 0; i < elements.size(); i++)
         {
+            noteBuiltElement();
             auto* fi = elements[i];
             llvm::Value* idx = compiler->builder->getInt32((uint32_t)i);
             auto* elemPtr = multidim
                 ? elementPtrs[i]
                 : compiler->builder->CreateInBoundsGEP(arrTy, arrAlloc, { zero, idx }, "arrelem");
+            builtElemPtr = elemPtr;
             // A BRACED element carries no assignmentExpression at all (CFlat.g4 fieldInit's
             // '{' initializerList? '}' alternative), so it must be split off before the
             // expression read - that read is what walked a null context and crashed.
@@ -13458,6 +13638,7 @@ void MainListener::EmitPositionalFixedArrayIntoSlot(
             compiler->CreateAssignment(val, elemPtr,
                 nv.TypeAndValue.IsUnsignedInteger() != -1, elemTy);
         }
+        noteBuiltElement();
 
         /*
          * C++ VALUE-INITIALIZES the slots past a short positional list, which for a class with a
@@ -13681,8 +13862,8 @@ void MainListener::EmitFixedArrayDefaultInit(llvm::Value* arrAlloc, const LLVMBa
         // traversals cannot drift.
         if (compiler->GetFunction(tv.TypeName) && compiler->IsOwningValueType(tv.TypeName))
         {
-            compiler->EmitFixedArrayElementWalk(
-                *compiler->builder, arrAlloc, structData.StructType, n,
+            compiler->EmitArrayConstructionWalk(
+                arrAlloc, structData.StructType, n, tv.TypeName,
                 [&](llvm::Value* elemPtr)
                 {
                     llvm::Value* elem = compiler->CreateOverloadedFunctionCall(tv.TypeName, {});
@@ -13717,8 +13898,8 @@ void MainListener::EmitFixedArrayDefaultInit(llvm::Value* arrAlloc, const LLVMBa
 
         // Otherwise the element default is non-trivial: run it ONCE PER ELEMENT, the same rule
         // C++ applies to `S a[N]`. A single seed replicated bitwise runs its effects once.
-        compiler->EmitFixedArrayElementWalk(
-            *compiler->builder, arrAlloc, structData.StructType, n,
+        compiler->EmitArrayConstructionWalk(
+            arrAlloc, structData.StructType, n, tv.TypeName,
             [&](llvm::Value* elemPtr)
             {
                 llvm::Value* elem = compiler->CreateOverloadedFunctionCall(tv.TypeName, {});
@@ -14600,6 +14781,13 @@ LLVMBackend::NamedVariable MainListener::ParseNewExpression(CFlatParser::NewExpr
          * A foreign C++ class has no CFlat constructor FUNCTION, so the second arm never ran for
          * it while `delete` already destroyed every element: its own constructor is the first arm.
          */
+        // A throwing element constructor destroys the elements before it, then frees the block.
+        LLVMBackend::UnwindPartialScope newArrayScope(*compiler);
+        if (isArray && count && !typeIsPtr && !compiler->GetFunction(opNewName)
+            && (compiler->GetFunction(typeName) != nullptr
+                || compiler->CxxElementNeedsDefaultConstruction(typeName)))
+            compiler->NoteUnwindPartial(LLVMBackend::UnwindPartialEntry::Kind::CflatHeap,
+                                        typedPtr, typeName, useAligned ? allocAlign : 0);
         if (isArray && count && !typeIsPtr && compiler->GetFunction(typeName) == nullptr
             && compiler->CxxElementNeedsDefaultConstruction(typeName))
         {
@@ -14627,15 +14815,20 @@ LLVMBackend::NamedVariable MainListener::ParseNewExpression(CFlatParser::NewExpr
             compiler->builder->SetInsertPoint(bodyBB);
             auto* idx2 = compiler->builder->CreateLoad(i64Ty, indexAlloca);
             auto* elemPtr = compiler->builder->CreateGEP(elemType, typedPtr, idx2, "new_elem");
-            llvm::Value* structVal = compiler->CreateOverloadedFunctionCall(typeName, {});
-            if (structVal)
-                compiler->builder->CreateStore(structVal, elemPtr);
+            {
+                LLVMBackend::UnwindPartialScope builtElements(*compiler);
+                compiler->NoteUnwindArrayPrefix(typedPtr, elemType, idx2, typeName);
+                llvm::Value* structVal = compiler->CreateOverloadedFunctionCall(typeName, {});
+                if (structVal)
+                    compiler->builder->CreateStore(structVal, elemPtr);
+            }
             auto* next = compiler->builder->CreateAdd(idx2, compiler->builder->getInt64(1));
             compiler->builder->CreateStore(next, indexAlloca);
             compiler->builder->CreateBr(condBB);
 
             compiler->builder->SetInsertPoint(afterBB);
         }
+        newArrayScope.Release();
 
         // For non-array new of a class type: call constructor and store result
         if (!isArray && compiler->GetFunction(typeName))

@@ -33,6 +33,10 @@ placement-new thunk), and on macOS arm64 / libc++ `open` is NOT reproduced any m
 `std.ofstream` local opens, writes and closes. Keep this open for the MSVC STL, which is what it
 was filed against.
 
+Re-measured 2026-09-22 on macOS arm64: the repro's `--check -v` shows no emptied body and no
+"cannot be instantiated"; only the `std::string` / `filesystem::path` overloads stay refused, and
+leg 3205 of `Test/test_cpp_interop.cb` opens, writes and reads back a file. MSVC not re-measured.
+
 ## Notes toward a root cause
 
 The three emptied bodies co-occurred: `basic_ios::narrow` picked up a default-argument wrapper,

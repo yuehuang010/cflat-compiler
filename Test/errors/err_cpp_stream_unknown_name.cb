@@ -1,0 +1,9 @@
+// A C++ name operand in a stream expression that clang cannot resolve is refused with the
+// clang reason; pre-fix the name failed namespace-member lookup with a different message.
+import cpp "iostream";
+extern int main()
+{
+    expect_error("could not be bound");
+    std.cout << std.nosuchthing;
+    return 0;
+}

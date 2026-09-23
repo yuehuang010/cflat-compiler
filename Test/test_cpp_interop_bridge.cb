@@ -44,6 +44,10 @@
 //   Global CFlat structs with C++ fields construct each field before main through nested
 //     structs and fixed arrays, preserve imported-module order, and keep global lifetime
 //     without exit-time destruction. Regular, local-static, and [cpp] neighbours are covered.
+//   Interface dispatch with CFlat holder and bare C++ class parameters by value: copy, last-use
+//     move, loop copies, explicit move, holder return, composed C++ sret return, two implementors,
+//     and a generic interface.
+//     Plain CFlat aggregate and bare-class interface calls pin the existing ABI neighbours.
 
 import cpp "library/cpp_interop_basic.h";
 import cpp "library/cpp_interop_basic.cpp";
@@ -164,6 +168,56 @@ struct BridgeMultiCxxFieldHolder<T>
     T first = default;
     T second = default;
     int marker = 0;
+};
+
+interface BridgeIfhHolder { int read(BridgeFieldHolder<cpptw.Twin> value); };
+class BridgeIfhHolderA : BridgeIfhHolder
+{
+    int read(BridgeFieldHolder<cpptw.Twin> value)
+    {
+        value.value.set(77);
+        return value.value.value() + value.tag;
+    }
+};
+class BridgeIfhHolderB : BridgeIfhHolder
+{
+    int read(BridgeFieldHolder<cpptw.Twin> value) { return value.value.value() + 9; }
+};
+int bridge_ifh_last_use(BridgeIfhHolder value, BridgeFieldHolder<cpptw.Twin> holder)
+{
+    return value.read(holder);
+}
+interface BridgeIfhEcho
+{
+    BridgeFieldHolder<cpptw.Twin> echo(BridgeFieldHolder<cpptw.Twin> value);
+};
+class BridgeIfhEchoImpl : BridgeIfhEcho
+{
+    BridgeFieldHolder<cpptw.Twin> echo(BridgeFieldHolder<cpptw.Twin> value) { return move value; }
+};
+interface BridgeIfhSret { cpptw.Twin take(BridgeFieldHolder<cpptw.Twin> value); };
+class BridgeIfhSretImpl : BridgeIfhSret
+{
+    cpptw.Twin take(BridgeFieldHolder<cpptw.Twin> value)
+    {
+        return cpptw.Twin(value.value.value());
+    }
+};
+interface BridgeIfhGeneric<T> { int read(T value); };
+class BridgeIfhGenericImpl : BridgeIfhGeneric<BridgeFieldHolder<cpptw.Twin>>
+{
+    int read(BridgeFieldHolder<cpptw.Twin> value) { return value.value.value() + value.tag; }
+};
+interface BridgeIfhTwin { int read(cpptw.Twin value); };
+class BridgeIfhTwinImpl : BridgeIfhTwin
+{
+    int read(cpptw.Twin value) { return value.value(); }
+};
+struct BridgeIfhPlain { int x = 2; int y = 3; };
+interface BridgeIfhPlainRead { int read(BridgeIfhPlain value); };
+class BridgeIfhPlainImpl : BridgeIfhPlainRead
+{
+    int read(BridgeIfhPlain value) { value.x = 9; return value.x * 10 + value.y; }
 };
 
 int bridge_bvh_inner<T>(BridgeFieldHolder<T> value) { return value.value.value(); }
@@ -4144,6 +4198,150 @@ extern int main(int argc, char** argv)
     if (bridge_global_field_static_value() != 7 || cppa.gctor_count() != 13) return 2030;
     // Globals follow the no-exit-destruction ruling; every remaining dtor count must be zero.
     if (cppa.gdtor_count() != 0) return 2031;
+
+    // ---- C++ holder parameters through interface dispatch (2040-2059) ----------------
+    int bridgeIfhStartChecks = bridge_checks;
+    int bridgeIfhStartPassed = bridge_passed;
+    cpptw.reset_counts();
+    {
+        BridgeIfhHolderA impl = default;
+        BridgeIfhHolder iface = impl;
+        BridgeFieldHolder<cpptw.Twin> value = default;
+        value.value.set(31);
+        bridge_check("IFH holder value", iface.read(value), 79);
+        bridge_check("IFH holder source isolated", value.value.value(), 31);
+    }
+    bridge_check("IFH holder ctor", cpptw.ctor_count(), 1);
+    bridge_check("IFH holder copy", cpptw.copy_count(), 1);
+    bridge_check("IFH holder move", cpptw.move_count(), 0);
+    bridge_check("IFH holder dtor", cpptw.dtor_count(), 2);
+    bridge_check("IFH holder live", cpptw.live_allocations(), 0);
+
+    cpptw.reset_counts();
+    {
+        BridgeIfhHolderA impl = default;
+        BridgeIfhHolder iface = impl;
+        BridgeFieldHolder<cpptw.Twin> value = default;
+        value.value.set(32);
+        bridge_check("IFH last-use value", bridge_ifh_last_use(iface, value), 79);
+    }
+    bridge_check("IFH last-use ctor", cpptw.ctor_count(), 1);
+    bridge_check("IFH last-use copy", cpptw.copy_count(), 1);
+    bridge_check("IFH last-use move", cpptw.move_count(), 1);
+    bridge_check("IFH last-use dtor", cpptw.dtor_count(), 3);
+    bridge_check("IFH last-use live", cpptw.live_allocations(), 0);
+
+    cpptw.reset_counts();
+    {
+        BridgeIfhHolderB impl = default;
+        BridgeIfhHolder iface = impl;
+        BridgeFieldHolder<cpptw.Twin> value = default;
+        value.value.set(33);
+        int total = 0;
+        for (int i = 0; i < 2; i++) total += iface.read(value);
+        bridge_check("IFH loop values", total, 84);
+    }
+    bridge_check("IFH loop ctor", cpptw.ctor_count(), 1);
+    bridge_check("IFH loop copy", cpptw.copy_count(), 2);
+    bridge_check("IFH loop move", cpptw.move_count(), 0);
+    bridge_check("IFH loop dtor", cpptw.dtor_count(), 3);
+    bridge_check("IFH loop live", cpptw.live_allocations(), 0);
+
+    cpptw.reset_counts();
+    {
+        BridgeIfhHolderB impl = default;
+        BridgeIfhHolder iface = impl;
+        BridgeFieldHolder<cpptw.Twin> value = default;
+        value.value.set(34);
+        bridge_check("IFH explicit move value", iface.read(move value), 43);
+    }
+    bridge_check("IFH explicit move ctor", cpptw.ctor_count(), 1);
+    bridge_check("IFH explicit move copy", cpptw.copy_count(), 0);
+    bridge_check("IFH explicit move count", cpptw.move_count(), 1);
+    bridge_check("IFH explicit move dtor", cpptw.dtor_count(), 2);
+    bridge_check("IFH explicit move live", cpptw.live_allocations(), 0);
+
+    cpptw.reset_counts();
+    {
+        BridgeIfhEchoImpl impl = default;
+        BridgeIfhEcho iface = impl;
+        BridgeFieldHolder<cpptw.Twin> value = default;
+        value.value.set(35);
+        BridgeFieldHolder<cpptw.Twin> result = iface.echo(value);
+        bridge_check("IFH return value", result.value.value(), 35);
+    }
+    bridge_check("IFH return ctor", cpptw.ctor_count(), 1);
+    bridge_check("IFH return copy", cpptw.copy_count(), 1);
+    bridge_check("IFH return move", cpptw.move_count(), 0);
+    bridge_check("IFH return dtor", cpptw.dtor_count(), 2);
+    bridge_check("IFH return live", cpptw.live_allocations(), 0);
+
+    cpptw.reset_counts();
+    {
+        BridgeIfhSretImpl impl = default;
+        BridgeIfhSret iface = impl;
+        BridgeFieldHolder<cpptw.Twin> value = default;
+        value.value.set(35);
+        cpptw.Twin result = iface.take(value);
+        bridge_check("IFH sret return value", result.value(), 35);
+    }
+    bridge_check("IFH sret ctor", cpptw.ctor_count(), 2);
+    bridge_check("IFH sret copy", cpptw.copy_count(), 1);
+    bridge_check("IFH sret move", cpptw.move_count(), 0);
+    bridge_check("IFH sret dtor", cpptw.dtor_count(), 3);
+    bridge_check("IFH sret live", cpptw.live_allocations(), 0);
+
+    cpptw.reset_counts();
+    {
+        BridgeIfhHolderA first = default;
+        BridgeIfhHolderB second = default;
+        BridgeIfhHolder left = first;
+        BridgeIfhHolder right = second;
+        BridgeFieldHolder<cpptw.Twin> value = default;
+        value.value.set(36);
+        bridge_check("IFH two implementors", left.read(value) + right.read(value), 124);
+    }
+    bridge_check("IFH two ctor", cpptw.ctor_count(), 1);
+    bridge_check("IFH two copies", cpptw.copy_count(), 2);
+    bridge_check("IFH two moves", cpptw.move_count(), 0);
+    bridge_check("IFH two dtors", cpptw.dtor_count(), 3);
+    bridge_check("IFH two live", cpptw.live_allocations(), 0);
+
+    cpptw.reset_counts();
+    {
+        BridgeIfhGenericImpl impl = default;
+        BridgeIfhGeneric<BridgeFieldHolder<cpptw.Twin>> iface = impl;
+        BridgeFieldHolder<cpptw.Twin> value = default;
+        value.value.set(37);
+        bridge_check("IFH generic value", iface.read(value), 39);
+    }
+    bridge_check("IFH generic ctor", cpptw.ctor_count(), 1);
+    bridge_check("IFH generic copy", cpptw.copy_count(), 1);
+    bridge_check("IFH generic move", cpptw.move_count(), 0);
+    bridge_check("IFH generic dtor", cpptw.dtor_count(), 2);
+    bridge_check("IFH generic live", cpptw.live_allocations(), 0);
+
+    cpptw.reset_counts();
+    {
+        BridgeIfhTwinImpl impl = default;
+        BridgeIfhTwin iface = impl;
+        cpptw.Twin value = cpptw.Twin(38);
+        bridge_check("IFH bare Twin value", iface.read(value), 38);
+    }
+    bridge_check("IFH bare Twin ctor", cpptw.ctor_count(), 1);
+    bridge_check("IFH bare Twin copy", cpptw.copy_count(), 1);
+    bridge_check("IFH bare Twin dtor", cpptw.dtor_count(), 2);
+    bridge_check("IFH bare Twin live", cpptw.live_allocations(), 0);
+
+    {
+        BridgeIfhPlainImpl impl = default;
+        BridgeIfhPlainRead iface = impl;
+        BridgeIfhPlain value = default;
+        bridge_check("IFH plain value", iface.read(value), 93);
+        bridge_check("IFH plain source", value.x * 10 + value.y, 23);
+    }
+    if (bridge_passed - bridgeIfhStartPassed != bridge_checks - bridgeIfhStartChecks)
+        return 2059;
 
     return 0;
 }

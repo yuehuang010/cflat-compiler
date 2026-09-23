@@ -7624,11 +7624,13 @@ std::vector<MainListener::CaptureInfo> MainListener::CollectLambdaCaptures(
                     // finds nothing and we capture nothing. Excluding on functionTable here
                     // dropped captures whose name collided with an in-scope method (e.g. a
                     // captured `seed` when random.cb defines Random.seed), leaving the body
-                    // to reference the OUTER storage across the closure boundary.
+                    // to reference the OUTER storage across the closure boundary. Globals are not
+                    // excluded either, for the same reason: a local shadows a same-named global
+                    // (CFlat or C/C++-imported), and the body resolves the local first, so the
+                    // capture must too. A plain global reference finds no frame entry.
                     if (!seenNames.count(name)
                         && !lambdaParamNames.count(name)
-                        && !shadowed.count(name)
-                        && !compiler->globalNamedVariable.count(name))
+                        && !shadowed.count(name))
                     {
                         for (const auto& frame : std::ranges::reverse_view(compiler->stackNamedVariable))
                         {

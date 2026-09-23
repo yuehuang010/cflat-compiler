@@ -4278,16 +4278,33 @@ cxx_dtor_ready:
                 compiler->lastCxxRetTemp_ = nullptr;
                 compiler->lastCxxRetValue_ = nullptr;
                 auto sourceNV = ParseMoveExpression(moveExpr);
-                if ((sourceNV.IsElementAccess || sourceNV.FieldPathThroughPointer
+                if (sourceNV.Storage != nullptr
+                    && (sourceNV.IsElementAccess || sourceNV.FieldPathThroughPointer
                         || llvm::isa<llvm::LoadInst>(sourceNV.Storage)
                         || llvm::isa<llvm::PHINode>(sourceNV.Storage))
-                    && sourceNV.Storage != nullptr && !sourceNV.TypeAndValue.Pointer
+                    && !sourceNV.TypeAndValue.Pointer
                     && sourceNV.TypeAndValue.TypeName == typeName)
                 {
                     compiler->EmitCxxCopyOrMoveConstruct(
                         typeName, slot, sourceNV.Storage, /*useMove*/ true,
                         std::format("into local '{}'", name).c_str());
                     DestroyForeignCxxRelocationSource(sourceNV);
+                    return true;
+                }
+                if (sourceNV.Storage == nullptr && sourceNV.Primary != nullptr
+                    && compiler->IsCxxTriviallyCopyableRecord(typeName)
+                    && !sourceNV.TypeAndValue.Pointer
+                    && sourceNV.TypeAndValue.TypeName == typeName
+                    && sourceNV.Primary->getType() == slot->getAllocatedType())
+                {
+                    compiler->builder->CreateStore(sourceNV.Primary, slot);
+                    return true;
+                }
+                if (sourceNV.Storage == nullptr)
+                {
+                    LogErrorContext(moveExpr, std::format(
+                        "cannot move C++ class '{}' from this expression because it has no addressable storage",
+                        typeName));
                     return true;
                 }
                 LogErrorContext(moveExpr, std::format(

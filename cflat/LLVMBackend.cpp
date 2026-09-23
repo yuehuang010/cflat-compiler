@@ -4630,6 +4630,7 @@ void LLVMBackend::ResetForReanalysis()
     // name with a different inheritance layout, so a survivor would shift `this` for a receiver
     // that no longer needs it, or turn a plain call into a vptr load.
     cxxThisAdjust_.clear();
+    cxxThisVirtualBase_.clear();
     cxxVirtualSlotByLinkage_.clear();
     cxxAbiMismatchSink_ = nullptr;
     pendingCxxAbi_ = nullptr;   // an aborted registration must not leak clang's plan forward
