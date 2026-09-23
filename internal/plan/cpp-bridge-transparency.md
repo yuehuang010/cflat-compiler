@@ -242,6 +242,11 @@ Not leaks - these are the improvement, and they apply to CFlat types equally:
   That it was refused before counts as a CFlat gap, now closed; mixed arms stay refused.
 - **R10 - RULED (was Q3).** A char literal `'x'` is a `char` EVERYWHERE, not only at C++
   boundaries. Touches native overload ranking; audit `char` vs `int` overload pairs when landing.
+- **R2 - RULED 2026-09-23: NO, for now.** A plain CFlat struct or class (one without the
+  `[cpp]` attribute) cannot be a C++ template / generic argument. D4 generic crossing is out of
+  scope until the maintainer reopens it; only `[cpp] struct` crosses into C++ templates.
+- **D5 - RULED 2026-09-23: OUT OF SCOPE.** A CFlat `interface` is not compatible with C++
+  interop; no C++ class satisfies one and no design is pursued. Too hard for now.
 - **Header cache (was Q5) - RULED.** A clang run that reports errors is never written to the
   disk cache. Its result is kept in ONE in-memory most-recent slot, so the LSP gets a fast,
   partially correct answer while a header is broken. Full request-group keying stays a p3.
