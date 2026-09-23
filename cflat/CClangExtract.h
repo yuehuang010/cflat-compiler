@@ -66,6 +66,10 @@ namespace cflat_cinterop
 
     inline constexpr std::string_view kCxxVbaseCtorThunkPrefix = "__cflat_vctor_";
 
+    // Declared after the header in every stub; it lands outside file scope iff the header
+    // leaves a namespace or brace scope open.
+    inline constexpr char kHeaderScopeSentinel[] = "__cflat_header_scope_sentinel";
+
     /*
      * Name of the extern "C" THUNK that constructs such a class. Its body is `::new (p) T(args)`,
      * so Clang owns the implicit most-derived flag / VTT argument; cflat only calls the symbol.
@@ -538,6 +542,9 @@ namespace cflat_cinterop
         };
         std::vector<CxxTypeRequest> cxxTypeRequests;
         std::string cxxRequestMarkerPrefix = "__cflat_req_";
+        // Appended to every virtual / vbase-constructor thunk name. An incremental group's chunks
+        // share one scope, so a thunk that a later request repeats needs a name of its own.
+        std::string cxxThunkSuffix;
         // Request mode for a generated deduction wrapper. Only these ordinary free wrapper
         // declarations are exported; the included header remains available to CodeGen.
         std::vector<std::string> cxxFunctionWrapperNames;
@@ -572,6 +579,7 @@ namespace cflat_cinterop
         std::vector<RawMacro> macros;
         std::vector<RawFuncMacro> funcMacros;
         std::vector<CxxMacroProbe> macroProbes;
+        bool headerScopeOpen = false;  // C++ macro prepass: the stub's scope sentinel is inside a brace
         std::vector<std::string> includedFiles;  // populated only when req.wantIncludes
         // Namespace-scope C++ using-directives, as CFlat dotted namespace pairs. The backend
         // resolves these at lookup time instead of duplicating every nominated declaration.

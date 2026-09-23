@@ -59,12 +59,13 @@ if "%~1"=="--worker-cb" (
     REM /n numbers the matches; the ":1:" filter keeps LINE 1 only, so a mid-file mention of the
     REM marker cannot add flags on Windows that test.sh (head -n 1) would never see.
     for /f "usebackq tokens=1,2,* delims=:" %%A in (`findstr /n /b /c:"// cflat-args:" !SRC!\!NAME!.cb ^| findstr /b /c:"1:"`) do set CB_ARGS=%%C
-    if /I "!CFLAT_CPP_INCREMENTAL!"=="0" set CFLAT_CPP_MAX_HEADER_PARSES=
-    if /I "!CFLAT_CPP_INCREMENTAL!"=="off" set CFLAT_CPP_MAX_HEADER_PARSES=
-    if /I "!CFLAT_CPP_INCREMENTAL!"=="false" set CFLAT_CPP_MAX_HEADER_PARSES=
-    if /I "!NAME:~0,16!"=="test_cpp_interop" if "!CFLAT_CPP_BUDGET_ENABLED!"=="1" set CFLAT_CPP_MAX_HEADER_PARSES=1
+    REM Every test compile parses each C/C++ TU at most once (legacy C++ mode reparses by design).
+    REM The budget comes from the switch only; an inherited env budget would leak.
+    set CFLAT_CPP_MAX_HEADER_PARSES=
+    set TU_CHECK=
+    if "!CFLAT_CPP_BUDGET_ENABLED!"=="1" set TU_CHECK=--error-on-cpp-reparse cold
     set T0=!TIME!
-    !COMPILER! !SRC!\!NAME!.cb -i !LIB! --locale-dir "!CFLAT_LOCALE_DIR!" -o !OUT!\!NAME!.exe --nologo --out-lli !OUT!\!NAME!.ll !CFLAT_PLATFORM_FLAG! !CB_ARGS! !CFLAT_EXTRA! > "!OUT!\results\!NAME!.log" 2>&1
+    !COMPILER! !SRC!\!NAME!.cb -i !LIB! --locale-dir "!CFLAT_LOCALE_DIR!" -o !OUT!\!NAME!.exe --nologo --out-lli !OUT!\!NAME!.ll !CFLAT_PLATFORM_FLAG! !TU_CHECK! !CB_ARGS! !CFLAT_EXTRA! > "!OUT!\results\!NAME!.log" 2>&1
     if !ERRORLEVEL! neq 0 (
         echo FAILED: !NAME! - compiler error>"!OUT!\results\!NAME!.result"
         goto :WorkerDone
@@ -86,8 +87,8 @@ if "%~1"=="--worker-cb" (
     goto :WorkerDone
 )
 
-REM Warm C++ interop worker: the cold worker has already populated cheaders, so zero is the
-REM deliberate budget for this second compile.
+REM Warm C++ interop worker: the cold worker has already populated cheaders, so zero parses
+REM (--error-on-cpp-reparse warm) is the deliberate budget for this second compile.
 if "%~1"=="--worker-cb-warm" (
     set NAME=%~2
     set COMPILER=x64\%CFLAT_CONFIG%\cflat.exe
@@ -98,8 +99,8 @@ if "%~1"=="--worker-cb-warm" (
     if not defined CFLAT_PLATFORM_FLAG set CFLAT_PLATFORM_FLAG=
     set DONEFILE=!OUT!\results\done\!NAME!.warm.done
     set T0=!TIME!
-    set CFLAT_CPP_MAX_HEADER_PARSES=0
-    !COMPILER! !SRC!\!NAME!.cb -i !LIB! --locale-dir "!CFLAT_LOCALE_DIR!" -o !OUT!\!NAME!.warm.exe --nologo --out-lli !OUT!\!NAME!.warm.ll !CFLAT_PLATFORM_FLAG! > "!OUT!\results\!NAME!.warm.log" 2>&1
+    set CFLAT_CPP_MAX_HEADER_PARSES=
+    !COMPILER! !SRC!\!NAME!.cb -i !LIB! --locale-dir "!CFLAT_LOCALE_DIR!" -o !OUT!\!NAME!.warm.exe --nologo --out-lli !OUT!\!NAME!.warm.ll !CFLAT_PLATFORM_FLAG! --error-on-cpp-reparse warm > "!OUT!\results\!NAME!.warm.log" 2>&1
     if !ERRORLEVEL! neq 0 (
         echo FAILED: !NAME!.warm - compiler error>"!OUT!\results\!NAME!.warm.result"
         goto :WorkerDone

@@ -317,6 +317,7 @@ if(MSVC)
     ${CFLAT_DIR}/MainListener_Aggregates.cpp
     ${CFLAT_DIR}/MainListener_Utilities.cpp
     ${CFLAT_DIR}/CClangExtract.cpp
+    ${CFLAT_DIR}/CxxIncrementalGroup.cpp
     ${ANTLR_GEN_DIR}/CFlatParser.cpp
     PROPERTIES COMPILE_OPTIONS "/bigobj")
   # /permissive- matched ConformanceMode=true; /wd4251 quiets antlr's dll-iface

@@ -180,21 +180,20 @@ run_cb() {
   local f="$1" n; n="$(basename "$f" .cb)"
   local log="$RES/$n.log" status t0; t0=$(now_ms)
   local -a xargs_cb=()
-  local -a compiler_env=(env)
   read -r -a xargs_cb <<< "$(cb_extra_args "$f")"
-  if cpp_budget_enabled && is_cpp_interop_test "$n"; then
-    compiler_env=(env CFLAT_CPP_MAX_HEADER_PARSES=1)
+  if cpp_budget_enabled; then
+    xargs_cb+=(--error-on-cpp-reparse cold)
   fi
   local TIMEOUT="$TIMEOUT"
   case "$HEAVY_TESTS" in *" $n "*) TIMEOUT="${TIMEOUT/$TIMEOUT_SECS/$HEAVY_TIMEOUT_SECS}" ;; esac
   if [ "$RUN_MODE" -eq 1 ]; then
-    if $TIMEOUT "${compiler_env[@]}" "$CFLAT" "$f" -i "$LIB" --locale-dir "$LOCALE_DIR" \
+    if $TIMEOUT "$CFLAT" "$f" -i "$LIB" --locale-dir "$LOCALE_DIR" \
         ${xargs_cb[@]+"${xargs_cb[@]}"} --run --nologo >"$log" 2>&1; then
       status="PASS"
     else
       status="FAIL run"
     fi
-  elif ! $TIMEOUT "${compiler_env[@]}" "$CFLAT" "$f" -i "$LIB" --locale-dir "$LOCALE_DIR" \
+  elif ! $TIMEOUT "$CFLAT" "$f" -i "$LIB" --locale-dir "$LOCALE_DIR" \
         ${xargs_cb[@]+"${xargs_cb[@]}"} -o "$RES/$n.bin" >"$log" 2>&1; then
     status="FAIL compile"
   elif $TIMEOUT "$RES/$n.bin" </dev/null >>"$log" 2>&1; then
@@ -209,12 +208,11 @@ run_cb_warm() {
   local f="$1" base n; base="$(basename "$f" .cb)"; n="$base.warm"
   local log="$RES/$n.log" status t0; t0=$(now_ms)
   local -a xargs_cb=()
-  local -a compiler_env=()
   read -r -a xargs_cb <<< "$(cb_extra_args "$f")"
   if cpp_budget_enabled; then
-    compiler_env=(env CFLAT_CPP_MAX_HEADER_PARSES=0)
+    xargs_cb+=(--error-on-cpp-reparse warm)
   fi
-  if ! $TIMEOUT "${compiler_env[@]}" "$CFLAT" "$f" -i "$LIB" \
+  if ! $TIMEOUT "$CFLAT" "$f" -i "$LIB" \
       --locale-dir "$LOCALE_DIR" ${xargs_cb[@]+"${xargs_cb[@]}"} -o "$RES/$n.bin" \
       >"$log" 2>&1; then
     status="FAIL compile"
@@ -263,12 +261,15 @@ run_err() {
   local f="$1" n; n="$(basename "$f" .cb)"
   local log="$RES/$n.log" rc=0 t0; t0=$(now_ms)
   local -a compiler_env=()
+  local -a tu_check=()
   if [ "$n" = "err_cpp_header_parse_budget" ]; then
     compiler_env=(env CFLAT_CPP_MAX_HEADER_PARSES=0)
+  elif cpp_budget_enabled; then
+    tu_check=(--error-on-cpp-reparse cold)
   fi
   load_err_flags "$f.flags"
   $TIMEOUT "${compiler_env[@]}" "$CFLAT" "$f" -i "$LIB" --locale pseudo --locale-dir "$LOCALE_DIR" --check \
-    "${ERR_FLAGS[@]}" >"$log" 2>&1 || rc=$?
+    ${tu_check[@]+"${tu_check[@]}"} "${ERR_FLAGS[@]}" >"$log" 2>&1 || rc=$?
   if check_err_result "$rc" "$log"; then
     write_result "$n" "PASS" "$t0"
   else

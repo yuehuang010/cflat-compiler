@@ -33,6 +33,18 @@
       "int main()",
       "int main(int argc, char** argv)"
     ],
+    "arg0arg1wasparsedarg...atcppmaxheaderparses31ffe58a2cba473a": [
+      "C++ header group",
+      "cpp_interop_basic.h",
+      "1",
+      "0"
+    ],
+    "arg0arg1wasparsedarg...atcppmaxheaderparses8894ec8bd684ecf2": [
+      "C++ header group",
+      "cpp_interop_basic.h",
+      "1",
+      "0"
+    ],
     "arg0cannotbeatypearg...whichisnotavalidtypee3edb49144ced697": [
       "int[]",
       "list",
@@ -1780,6 +1792,8 @@
     "ambiguouscalltoarg0n...parametertypeyoumean6524b093d1fa9da7": "ambiguous call to '{0}': no candidate ranks better than the others: {1}. Cast the argument to the parameter type you mean.",
     "arg0": "{0}",
     "arg0arg1mustbearg2or...obeexecutedinprocess28e30d1abeb98a2b": "{0}: '{1}' must be '{2}' or '{3}' to be executed in-process.",
+    "arg0arg1wasparsedarg...atcppmaxheaderparses31ffe58a2cba473a": "{0} '{1}' was parsed {2} times in one compile; the budget is {3} (--error-on-cpp-reparse or CFLAT_CPP_MAX_HEADER_PARSES)",
+    "arg0arg1wasparsedarg...atcppmaxheaderparses8894ec8bd684ecf2": "{0} '{1}' was parsed {2} times in one compile; the budget is {3} (--tu-parse-check or CFLAT_CPP_MAX_HEADER_PARSES)",
     "arg0asanruntimedllar...sssanitizercomponent4c29a1f95801007b": "{0}: asan runtime DLL '{1}' not found under '{2}\\bin'. The import library was present but the matching runtime DLL is missing; reinstall the 'C++ AddressSanitizer' component.",
     "arg0asanruntimeimpor...ntforthismsvctoolsetc5e9e50ae7d9edfe": "{0}: asan runtime import library '{1}' not found in '{2}'. Install the 'C++ AddressSanitizer' component for this MSVC toolset.",
     "arg0cannotbeatypearg...whichisnotavalidtypee3edb49144ced697": "'{0}' cannot be a type argument of '{1}': instantiating the body forms '{2}', which is not a valid type",

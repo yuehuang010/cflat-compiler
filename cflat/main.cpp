@@ -188,6 +188,7 @@ int main(int argc, char* argv[])
     args.addOption("cpu", 0, "Target CPU for code generation (name from --print-supported-cpus, or 'native'); sets ISA features + tuning", "");
     args.addOption("tune", 0, "Tune scheduling for this CPU without changing the instruction set (name or 'native')", "");
     args.addFlag("no-cache", 0, "Bypass the core bitcode cache and reparse core libraries from source");
+    args.addOption("error-on-cpp-reparse", 0, "cold|warm. Fail the compile when a C/C++ translation unit (header group, C header, imported .c/.cpp extraction or object compile) is parsed more than once (cold) or at all (warm: the TU cache must serve every one). -v logs each parse as 'clang parse:'");
     args.addFlag("cpp-strict-noexcept", 0, "Refuse calls to C++ functions that may throw (no noexcept specification). Default follows clang: the call is allowed and an escaping exception terminates the program");
     args.addMultiOption("symbol", 0, "Look up one or more symbols (IDE-style quick search) and exit. An exact name match prints detailed info (kind, signature, location, members); a miss suggests the closest symbols. Indexes the positional source file if given, otherwise the whole core library");
     args.addMultiOption("symbol-dump", 0, "Dump symbol info for source elements, then exit (repeatable). Selector: line:<n>, line:<a>-<b>, or function:<name>. Requires a positional source file");

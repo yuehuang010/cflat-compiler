@@ -3227,6 +3227,8 @@ private:
         std::vector<std::string> defines;
         std::unordered_set<std::string> namespaces;
         std::unordered_set<std::string> publishedNames;
+        // Own headers plus their transitive includes, normalized: what a probe may claim to own.
+        std::unordered_set<std::string> reachableFiles;
         unsigned headerParseCount = 0;
     };
     std::vector<CxxImportGroup> cxxImportGroups_;
@@ -3290,17 +3292,6 @@ private:
     // is registered under. This is what maps a member signature's types back to CFlat identities,
     // and what makes two spellings of one specialization resolve to a single registration.
     std::unordered_map<std::string, std::string> cxxForeignTypeSpellings_;
-    struct CxxRebindTypeMapping
-    {
-        size_t foreignSpellingCount = 0;
-        size_t recordCount = 0;
-        bool initialized = false;
-        bool mapped = false;
-        TypeAndValue value;
-    };
-    // Cached C++ signature remaps survive individual header replays, but not registry growth.
-    std::unordered_map<std::string, CxxRebindTypeMapping> cxxRebindParameterMappings_;
-    std::unordered_map<std::string, CxxRebindTypeMapping> cxxRebindReturnMappings_;
     // Only generated-wrapper replay needs this fallback; rebuild it once per record-table change.
     mutable std::unordered_map<std::string, std::string> cxxRecordSpellingIndex_;
     mutable bool cxxRecordSpellingIndexDirty_ = true;
@@ -3364,6 +3355,10 @@ public:
     void FinalizeGlobalConstructorOrder();
 private:
     std::string cppStandard_ = "c++20";
+    // --error-on-cpp-reparse: 1 (cold) or 0 (warm) clang parses allowed per translation unit.
+    std::optional<unsigned> tuParseBudget_;
+    // Parses per non-header-group TU in this compile, keyed "<kind>|<key>".
+    std::unordered_map<std::string, unsigned> tuParseCounts_;
     int cOptLevel_ = 0;        // optimization level applied to clang C compiles
     bool cDebugInfo_ = false;  // emit CodeView for clang C compiles
     // Off by default; when off, codegen/linking is byte-for-byte identical (no overhead).
@@ -3703,16 +3698,19 @@ private:
     static constexpr size_t kMaxActiveRoots = 16;
     static inline std::unordered_map<std::string, ActiveRoot> activeRoots_;
     static inline std::unordered_map<std::string, size_t> pinnedHeaderRefs_;  // key -> active roots
+    static inline std::unordered_map<std::string, size_t> inProgressRoots_;  // root -> backends analyzing it; mutates under cFileSigCacheMutex_
     std::string activeRootKey_;  // root of the analysis in progress on this backend
     // Locks the mutex itself. Registers `rootPath` as the current root (most recently used),
     // drops the least recently used roots over the cap, then re-applies the row budget.
     void BeginActiveRoot(const std::string& rootPath);
+    // Ends this backend's in-progress use while retaining the root and its pins.
+    void EndActiveRoot();
     // Caller must hold cFileSigCacheMutex_. Records `key` on the current root.
     void PinHeaderForActiveRoot(const std::string& key)
     {
         if (activeRootKey_.empty()) return;
         auto root = activeRoots_.find(activeRootKey_);
-        if (root == activeRoots_.end()) return;  // aged out mid-analysis; nothing to pin to
+        if (root == activeRoots_.end()) return;  // in-progress roots are never aged out; defensive
         if (root->second.headerKeys.insert(key).second) ++pinnedHeaderRefs_[key];
     }
     // Caller must hold cFileSigCacheMutex_. Evicts the least recently used UNPINNED entries
@@ -5204,6 +5202,17 @@ private:
                             cflat_cinterop::ExtractResult& raw, std::string& error,
                             const std::string& prefixSource = {});
     bool CountCxxHeaderParse(const CxxRequestGroup& group, const char* stage);
+    /*
+     * Per-compile clang parse budget of one translation unit: --error-on-cpp-reparse cold (1) or
+     * warm (0), else CFLAT_CPP_MAX_HEADER_PARSES. C++ header groups count on their
+     * CxxImportGroup; every other TU (C header, .c/.cpp extraction, .c/.cpp object compile)
+     * counts here under `kind` + `key`.
+     */
+    std::optional<unsigned> TuParseBudget() const;
+    // Logs the parse under -v ("clang parse:"), then errors when `count` exceeds the budget.
+    bool NoteTuParse(const std::string& kind, const std::string& label, unsigned count, const char* stage);
+    bool CountTuParse(const std::string& kind, const std::string& key, const std::string& label,
+                      const char* stage);
     void ReportCxxHeaderParseSummary(const CxxRequestGroup& group) const;
     void AttachCxxHeaderParseGuard(cflat_cinterop::ExtractRequest& req,
                                    const CxxRequestGroup& group) const;
@@ -5307,13 +5316,16 @@ private:
         { backend.activeCxxRequestGroup_ = group; }
         ~CxxRequestGroupScope() { backend.activeCxxRequestGroup_ = previous; }
     };
+    bool CxxDeclaringFileBelongsToOtherImportGroup(const std::string& declaringFile) const;
+    void RememberCxxGroupReachableFiles(size_t group, const std::vector<std::string>& files);
 
     bool RequestCxxForeignType(const std::string& cflatName, const std::string& cxxSpelling,
                                std::string& error, bool needDefinitions = true,
                                bool explicitInstantiation = true, bool tentative = false,
                                const std::string& extraSource = {},
                                const std::string& prefixSource = {},
-                               bool persistOnSuccess = false);
+                               bool persistOnSuccess = false,
+                               bool ownershipProbe = false);
     bool RequestGeneratedCxxType(const std::string& cflatName,
                                  const std::string& cxxSpelling,
                                  const std::string& source,
@@ -5322,6 +5334,9 @@ private:
                                  std::string& error,
                                  size_t ownerGroup = static_cast<size_t>(-1),
                                  const std::set<std::string>& overrideNames = {});
+    // After a successful incremental parse: remember each generated record definition in
+    // `source`, so a later prefix combining that record differently skips it.
+    void RememberGeneratedCxxRecords(CxxIncrementalGroup& incremental, const std::string& source) const;
     void GeneratedCxxDefinitionsFor(const std::vector<std::string>& cflatTypeNames,
                                     std::string& outSource,
                                     std::set<size_t>& outDependencyGroups,
@@ -5501,6 +5516,14 @@ private:
     // ELF link. Mirrors CompileCFile's MSVC path but with POSIX flags (-c/-o/-D/-fPIC).
     bool CompileCFileElf(const std::string& cSourcePath, const std::string& programAlias,
                          bool cppMode = false);
+    /*
+     * Object cache for .c/.cpp compiles, keyed on the full compile command (output excluded).
+     * The driver writes a depfile; an entry is reused only while every input it lists is
+     * unchanged. Both calls also record those inputs as dependencies of the output.
+     */
+    static uint64_t CObjectCommandKey(const std::vector<std::string>& argStrs, const std::string& cSourcePath);
+    bool TryReuseCObject(uint64_t commandKey, const std::string& objPath);
+    void StoreCObject(uint64_t commandKey, const std::string& objPath, const std::string& depFilePath);
 
     // GetCflatCacheDir() / GetUserCacheDir() / SetCacheDirOverride() are declared in the
     // public section below (near RunInit) since main.cpp needs to call them for
@@ -5674,12 +5697,18 @@ private:
 
     // Extract externally-linkable functions a .c file DEFINES, via the clang C++ API. Records
     // are registered up front (struct-by-value). Used by the .c auto-extern path.
-    bool ExtractCFileClang(const std::string& cSourcePath,
+    // The file's typedefs come back as aliases and its transitive includes as paths, so the
+    // result can be persisted and replayed by ExtractCSignatures.
+    bool ExtractCFileClang(const std::string& cSourcePath, const std::vector<std::string>& driverArgs,
                            std::vector<CSigEntry>& outSigs, std::vector<CRecordEntry>& outRecords,
-                           std::vector<CGlobalEntry>& outGlobals, bool cxxMode = false,
-                           uint64_t* outLongDoubleWidth = nullptr,
-                           bool* outLongDoubleIsIEEEDouble = nullptr,
-                           std::string* outTargetTriple = nullptr);
+                           std::vector<CGlobalEntry>& outGlobals, std::vector<CTypeAliasEntry>& outTypedefs,
+                           std::vector<std::string>& outIncludes, bool cxxMode,
+                           uint64_t& outLongDoubleWidth, bool& outLongDoubleIsIEEEDouble,
+                           std::string& outTargetTriple);
+    // Replays a cached source-file entry: typedefs, records, then signatures and globals.
+    // Non-const: RegisterCRecords normalizes the records it registers.
+    void RegisterCFileSigEntry(CFileSigCacheEntry& entry, const std::string& fileForLsp,
+                               const std::string& programAlias);
 
     bool ExtractCSignatures(const std::string& cSourcePath, const std::string& programAlias = "", bool cxxMode = false);
 
@@ -8165,6 +8194,8 @@ public:
     std::set<std::string> cxxRefusedMemberRebindInFlight_;
     // Re-entry guard for the inherited-member rebind above (a diamond can reach one base twice).
     std::set<std::string> cxxInheritedRebindInFlight_;
+    // Re-entry guard for the one refused-member retry after overload resolution fails.
+    std::set<std::string> cxxOverloadRebindInFlight_;
     // Set by RegisterCSignatures around a C++ declaration so CreateFunctionDeclaration adopts
     // clang's arrangement instead of ComputeAbiRecipe.
     const cflat_cinterop::RawAbi* pendingCxxAbi_ = nullptr;

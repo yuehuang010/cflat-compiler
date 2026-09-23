@@ -20,10 +20,11 @@ extern int main()
         cppi.ptr_depth3_ref_param(pdP2);
     }
     // A refusal names the class in WRITABLE source: the CFlat identity of a specialization is
-    // the mangled key 'std.vector$.p$.p$nest.Cell', which master printed verbatim.
-    expect_error("member 'get_allocator' of C++ class 'std.vector<nest.Cell**>' returns unsupported type") {
+    // the mangled key 'std.vector$.p$.p$nest.Cell', which master printed verbatim. data() returns
+    // 'nest::Cell ***', which no lazy retry can bind (get_allocator now binds on use).
+    expect_error("member 'data' of C++ class 'std.vector<nest.Cell**>' returns unsupported type") {
         std.vector<nest.Cell**> pdVec = default;
-        pdVec.get_allocator();
+        pdVec.data();
     }
     expect_error("no overload of 'nest.rpr_rank_single_cell_shallow' matches the given arguments") {
         nest.Cell* rprP = new nest.Cell(1, 2);

@@ -4197,6 +4197,9 @@ int LLVMBackend::GetOrMintViewScope(const std::string& originKey)
 LLVMBackend::~LLVMBackend()
 {
         CompilerManager::Instance().Unregister(this);
+        // An LSP slot replaced after a crash skipped its analysis' scope guards (SEH unwinds no
+        // destructors): release its header-cache root or it stays in progress forever.
+        EndActiveRoot();
 
         builder.release();
         module.release();

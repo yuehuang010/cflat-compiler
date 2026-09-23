@@ -24,6 +24,7 @@
 #include <llvm/ADT/StringSet.h>
 #include <llvm/Support/CommandLine.h>
 #include <llvm/Support/TimeProfiler.h>
+#include <llvm/Support/Process.h>
 #include <llvm/Support/JSON.h>
 #include <llvm/IR/DiagnosticInfo.h>
 #include <llvm/IR/DiagnosticHandler.h>
@@ -707,6 +708,156 @@ std::string LLVMBackend::FindCxxDriver() const
         return "";
 }
 
+// Depfile target name passed with -MT, so the prerequisite list starts at a known offset.
+static constexpr const char* kCObjectDepTarget = "cflat_obj";
+// Bump when the object cache layout or the meaning of its key changes.
+static constexpr int64_t kCObjectCacheVersion = 1;
+
+// Prerequisites of a Make-style depfile written with `-MT cflat_obj`: escaped spaces, `$$`
+// and backslash-newline continuations are undone; any other backslash is a path separator.
+static std::vector<std::string> ParseCObjectDepFile(llvm::StringRef text)
+{
+        std::vector<std::string> paths;
+        const std::string target = std::string(kCObjectDepTarget) + ":";
+        if (!text.starts_with(target)) return paths;
+        std::string current;
+        auto flush = [&]() {
+            if (!current.empty()) paths.push_back(std::move(current));
+            current.clear();
+        };
+        for (size_t i = target.size(); i < text.size(); ++i)
+        {
+            const char c = text[i];
+            const char next = i + 1 < text.size() ? text[i + 1] : '\0';
+            if (c == '\\' && (next == '\n' || next == '\r')) { flush(); continue; }
+            if (c == '\\' && (next == ' ' || next == '#')) { current += next; ++i; continue; }
+            if (c == '$' && next == '$') { current += '$'; ++i; continue; }
+            if (c == ' ' || c == '\t' || c == '\r' || c == '\n') { flush(); continue; }
+            current += c;
+        }
+        flush();
+        return paths;
+}
+
+uint64_t LLVMBackend::CObjectCommandKey(const std::vector<std::string>& argStrs, const std::string& cSourcePath)
+{
+        // The source is keyed by absolute path: the same relative spelling from another
+        // working directory names a different file.
+        std::error_code ec;
+        const std::string absoluteSource = std::filesystem::absolute(cSourcePath, ec).string();
+        uint64_t h = 14695981039346656037ULL;
+        auto fold = [&h](const std::string& s) {
+            for (unsigned char c : s) { h ^= c; h *= 1099511628211ULL; }
+        };
+        fold(std::format("|V{}", kCObjectCacheVersion));
+        for (const auto& arg : argStrs)
+        {
+            fold("|A");
+            fold(arg == cSourcePath && !ec ? absoluteSource : arg);
+        }
+        return h;
+}
+
+bool LLVMBackend::TryReuseCObject(uint64_t commandKey, const std::string& objPath)
+{
+        const std::string cacheDir = GetCHeaderCacheDir();
+        if (cacheDir.empty()) return false;
+        const std::filesystem::path base =
+            std::filesystem::path(cacheDir) / "objects" / std::format("{:016x}", commandKey);
+        auto stampText = llvm::MemoryBuffer::getFile(base.string() + ".deps.json");
+        if (!stampText) return false;
+        llvm::Expected<llvm::json::Value> parsed = llvm::json::parse((*stampText)->getBuffer());
+        if (!parsed)
+        {
+            llvm::consumeError(parsed.takeError());
+            return false;
+        }
+        const llvm::json::Object* root = parsed->getAsObject();
+        const llvm::json::Array* stamps = root != nullptr ? root->getArray("deps") : nullptr;
+        if (stamps == nullptr || root->getInteger("version") != kCObjectCacheVersion) return false;
+
+        std::vector<CHeaderDep> deps;
+        for (const llvm::json::Value& value : *stamps)
+        {
+            const llvm::json::Object* stamp = value.getAsObject();
+            if (stamp == nullptr) return false;
+            std::optional<llvm::StringRef> path = stamp->getString("f");
+            std::optional<int64_t> mtime = stamp->getInteger("mt");
+            std::optional<llvm::StringRef> hash = stamp->getString("h");
+            CHeaderDep dep;
+            if (!path || !mtime || !hash || hash->getAsInteger(16, dep.hash)) return false;
+            dep.path = path->str();
+            dep.mtime = *mtime;
+            if (!CHeaderDepFresh(dep))
+            {
+                if (verbose)
+                    std::cout << std::format("[verbose] C object cache stale: {} changed\n", dep.path);
+                return false;
+            }
+            deps.push_back(std::move(dep));
+        }
+        if (llvm::sys::fs::copy_file(base.string() + ".obj", objPath)) return false;
+        for (const auto& dep : deps) RecordDependency(dep.path);
+        if (verbose)
+            std::cout << std::format("[verbose] C object cache hit: {}\n", base.string() + ".obj");
+        return true;
+}
+
+void LLVMBackend::StoreCObject(uint64_t commandKey, const std::string& objPath, const std::string& depFilePath)
+{
+        auto depText = llvm::MemoryBuffer::getFile(depFilePath);
+        llvm::sys::fs::remove(depFilePath);
+        if (!depText) return;
+        llvm::json::Array stamps;
+        std::unordered_set<std::string> seen;
+        for (const std::string& listed : ParseCObjectDepFile((*depText)->getBuffer()))
+        {
+            std::error_code ec;
+            const std::string path = std::filesystem::absolute(listed, ec).string();
+            if (ec || !seen.insert(path).second) continue;
+            RecordDependency(path);
+            auto mtime = std::filesystem::last_write_time(path, ec);
+            uint64_t hash = 0;
+            if (ec || !HashFileFnv1a(path, hash)) continue;
+            stamps.push_back(llvm::json::Object{
+                {"f", path},
+                {"mt", (int64_t)mtime.time_since_epoch().count()},
+                {"h", std::format("{:016x}", hash)}});
+        }
+        // A depfile without inputs cannot validate a reuse, so it is never stored.
+        const std::string cacheDir = GetCHeaderCacheDir();
+        if (stamps.empty() || cacheDir.empty() || runMode_) return;
+
+        std::error_code ec;
+        const std::filesystem::path dir = std::filesystem::path(cacheDir) / "objects";
+        std::filesystem::create_directories(dir, ec);
+        if (ec) return;
+        const std::string base = (dir / std::format("{:016x}", commandKey)).string();
+        // The object lands first and the stamp file last, each by rename: a stamp file on disk
+        // always names a complete object.
+        const std::string tempSuffix = std::format(".{}.tmp", llvm::sys::Process::getProcessId());
+        if (llvm::sys::fs::copy_file(objPath, base + ".obj" + tempSuffix)
+            || llvm::sys::fs::rename(base + ".obj" + tempSuffix, base + ".obj"))
+        {
+            llvm::sys::fs::remove(base + ".obj" + tempSuffix);
+            return;
+        }
+        std::string json;
+        llvm::raw_string_ostream os(json);
+        os << llvm::json::Value(llvm::json::Object{{"version", kCObjectCacheVersion},
+                                                   {"deps", std::move(stamps)}});
+        os.flush();
+        const std::string depsTemp = base + ".deps.json" + tempSuffix;
+        bool written;
+        {
+            std::ofstream out(depsTemp, std::ios::binary | std::ios::trunc);
+            out << json;
+            written = static_cast<bool>(out);
+        }
+        if (!written || llvm::sys::fs::rename(depsTemp, base + ".deps.json"))
+            llvm::sys::fs::remove(depsTemp);
+}
+
 bool LLVMBackend::CompileCFileElf(const std::string& cSourcePath, const std::string& programAlias,
                                   bool cxxMode)
 {
@@ -727,7 +878,7 @@ bool LLVMBackend::CompileCFileElf(const std::string& cSourcePath, const std::str
         std::string objPath = objFile.str().str();
 
         // -fPIC so the object links into the position-independent image the ELF path emits.
-        std::vector<std::string> argStrs = { cc, "-c", "-fPIC", cSourcePath, "-o", objPath };
+        std::vector<std::string> argStrs = { cc, "-c", "-fPIC", cSourcePath };
         // Match the deployment target EmitExecutableMachO links against. Without it the host
         // clang stamps its own (newer) minos and ld64 warns on every C-interop link.
         if (targetMacOS_)
@@ -753,6 +904,23 @@ bool LLVMBackend::CompileCFileElf(const std::string& cSourcePath, const std::str
         if (!programAlias.empty())
             argStrs.push_back("-Dmain=__imported_main_" + programAlias);
 
+        const uint64_t commandKey = CObjectCommandKey(argStrs, cSourcePath);
+        if (TryReuseCObject(commandKey, objPath))
+        {
+            cObjectFiles_.push_back(objPath);
+            return true;
+        }
+        if (!CountTuParse(cxxMode ? "C++ source" : "C source", std::format("obj:{:016x}", commandKey),
+                          cSourcePath, "object compile"))
+        {
+            llvm::sys::fs::remove(objPath);
+            return false;
+        }
+        const std::string depPath = objPath + ".d";
+        for (const std::string& arg : { std::string("-o"), objPath, std::string("-MD"), std::string("-MF"),
+                                        depPath, std::string("-MT"), std::string(kCObjectDepTarget) })
+            argStrs.push_back(arg);
+
         std::vector<llvm::StringRef> args;
         for (auto& s : argStrs) args.push_back(s);
 
@@ -774,11 +942,13 @@ bool LLVMBackend::CompileCFileElf(const std::string& cSourcePath, const std::str
         if (rc != 0)
         {
             llvm::sys::fs::remove(objPath);
+            llvm::sys::fs::remove(depPath);
             LogRawError(std::format("C compiler failed to compile C source '{}' (exit {}){}{}",
                 cSourcePath, rc, compileErr.empty() ? "" : ": ", compileErr));
             return false;
         }
 
+        StoreCObject(commandKey, objPath, depPath);
         cObjectFiles_.push_back(objPath);
         return true;
     }
@@ -819,12 +989,10 @@ bool LLVMBackend::CompileCFile(const std::string& cSourcePath, const std::string
         const std::string target = (platformValue == 32)
             ? "--target=i686-pc-windows-msvc"
             : "--target=x86_64-pc-windows-msvc";
-        const std::string foArg = "/Fo" + objPath;
-
         // /MD (dynamic UCRT) so this object's CRT /defaultlib directives are the dynamic set,
         // not clang-cl's /MT default (libcmt) which the freestanding link cannot satisfy. Covers
         // both user .c interop and the imported diagnostic/heap_audit.c.
-        std::vector<std::string> argStrs = { clangPath, "/c", "/MD", "/nologo", target, cSourcePath, foArg };
+        std::vector<std::string> argStrs = { clangPath, "/c", "/MD", "/nologo", target, cSourcePath };
         if (cxxMode) argStrs.push_back("/std:c++20");
         // cflat's own bundled runtime .c files (e.g. diagnostic/heap_audit.c) are compiled
         // freestanding like crashdump.c/cflat_builtins.c: /GS- so they emit no __security_check_
@@ -851,6 +1019,24 @@ bool LLVMBackend::CompileCFile(const std::string& cSourcePath, const std::string
         if (!programAlias.empty())
             argStrs.push_back("/Dmain=__imported_main_" + programAlias);
 
+        const uint64_t commandKey = CObjectCommandKey(argStrs, cSourcePath);
+        if (TryReuseCObject(commandKey, objPath))
+        {
+            cObjectFiles_.push_back(objPath);
+            return true;
+        }
+        if (!CountTuParse(cxxMode ? "C++ source" : "C source", std::format("obj:{:016x}", commandKey),
+                          cSourcePath, "object compile"))
+        {
+            llvm::sys::fs::remove(objPath);
+            return false;
+        }
+        const std::string depPath = objPath + ".d";
+        argStrs.push_back("/Fo" + objPath);
+        argStrs.push_back("/clang:-MD");
+        argStrs.push_back("/clang:-MF" + depPath);
+        argStrs.push_back(std::string("/clang:-MT") + kCObjectDepTarget);
+
         std::vector<llvm::StringRef> args;
         for (auto& s : argStrs) args.push_back(s);
 
@@ -871,11 +1057,13 @@ bool LLVMBackend::CompileCFile(const std::string& cSourcePath, const std::string
         if (rc != 0)
         {
             llvm::sys::fs::remove(objPath);
+            llvm::sys::fs::remove(depPath);
             LogRawError(std::format("clang-cl failed to compile C source '{}' (exit {}){}{}",
                 cSourcePath, rc, clangCompileErr.empty() ? "" : ": ", clangCompileErr));
             return false;
         }
 
+        StoreCObject(commandKey, objPath, depPath);
         cObjectFiles_.push_back(objPath);
         return true;
     }
@@ -2445,116 +2633,38 @@ bool LLVMBackend::MapRawSig(const cflat_cinterop::RawSig& r, CSigEntry& e)
         return true;
     }
 
+// Cache entries contain mapped CFlat names from their storing analysis; remap each C++ signature
+// from its preserved spelling after this backend has registered the requested and nested types.
 void LLVMBackend::RebindCxxCachedSignatures(std::vector<CSigEntry>& sigs)
 {
         llvm::TimeTraceScope scope("RebindCxxCachedSignatures", std::to_string(sigs.size()));
-        const size_t foreignSpellingCount = cxxForeignTypeSpellings_.size();
-        const size_t recordCount = cxxRecordEntries_.size();
-        auto mapParameter = [&](const std::string& spelling) -> const CxxRebindTypeMapping& {
-            auto& mapping = cxxRebindParameterMappings_[spelling];
-            if (mapping.initialized
-                && mapping.foreignSpellingCount == foreignSpellingCount
-                && mapping.recordCount == recordCount)
-                return mapping;
-            mapping = CxxRebindTypeMapping{};
-            mapping.initialized = true;
-            mapping.foreignSpellingCount = foreignSpellingCount;
-            mapping.recordCount = recordCount;
-            cflat_cinterop::RawSig raw;
-            raw.name = "__cflat_rebind";
-            raw.retType = "void";
-            raw.paramTypes = { spelling };
-            raw.paramNames = { "p" };
-            raw.isCxx = true;
-            CSigEntry mapped;
-            mapping.mapped = MapRawSig(raw, mapped)
-                && mapped.bindRefusal.empty() && mapped.params.size() == 1;
-            if (mapping.mapped) mapping.value = std::move(mapped.params.front());
-            return mapping;
-        };
-        auto mapReturn = [&](const std::string& spelling) -> const CxxRebindTypeMapping& {
-            auto& mapping = cxxRebindReturnMappings_[spelling];
-            if (mapping.initialized
-                && mapping.foreignSpellingCount == foreignSpellingCount
-                && mapping.recordCount == recordCount)
-                return mapping;
-            mapping = CxxRebindTypeMapping{};
-            mapping.initialized = true;
-            mapping.foreignSpellingCount = foreignSpellingCount;
-            mapping.recordCount = recordCount;
-            cflat_cinterop::RawSig raw;
-            raw.name = "__cflat_rebind";
-            raw.retType = spelling;
-            raw.isCxx = true;
-            CSigEntry mapped;
-            mapping.mapped = MapRawSig(raw, mapped)
-                && mapped.bindRefusal.empty();
-            if (mapping.mapped) mapping.value = std::move(mapped.ret);
-            return mapping;
-        };
         for (CSigEntry& cached : sigs)
         {
-            if (!cached.needsCxxRebind
-                || !cached.sourceBindRefusal.empty()
+            if (!cached.isCxx
                 || (cached.paramSpellings.empty() && cached.retSpelling.empty()))
             {
                 cached.needsCxxRebind = false;
                 continue;
             }
-            cached.ret = TypeAndValue{};
-            cached.params.clear();
-            cached.bindRefusal = cached.sourceBindRefusal;
-            bool failed = false;
-            if (!cached.retSpelling.empty())
-            {
-                const CxxRebindTypeMapping& mapping = mapReturn(cached.retSpelling);
-                if (!mapping.mapped)
-                {
-                    failed = true;
-                }
-                else
-                    cached.ret = mapping.value;
-            }
-            for (size_t i = 0; !failed && i < cached.paramSpellings.size(); ++i)
-            {
-                const CxxRebindTypeMapping& mapping = mapParameter(cached.paramSpellings[i]);
-                if (!mapping.mapped)
-                {
-                    failed = true;
-                    break;
-                }
-                TypeAndValue parameter = mapping.value;
-                if (i < cached.paramNames.size()) parameter.VariableName = cached.paramNames[i];
-                cached.params.push_back(std::move(parameter));
-            }
-            if (failed)
-            {
-                // Re-run the complete mapper only for an unsupported spelling so its diagnostic
-                // retains the actual function and parameter names.
-                cflat_cinterop::RawSig raw;
-                raw.name = cached.name;
-                raw.linkageName = cached.linkageName;
-                raw.retType = cached.retSpelling;
-                raw.paramTypes = cached.paramSpellings;
-                raw.paramNames = cached.paramNames;
-                raw.defaultArgs = cached.defaultArgs;
-                raw.variadic = cached.variadic;
-                raw.isCxx = true;
-                raw.isNoexcept = cached.isNoexcept;
-                raw.bindRefusal = cached.sourceBindRefusal;
-                raw.abi = cached.abi;
-                raw.file = cached.file;
-                raw.line = cached.line;
-                raw.col = cached.col;
-                CSigEntry remapped;
-                if (!MapRawSig(raw, remapped)) continue;
-                cached = std::move(remapped);
-            }
-            cached.needsCxxRebind = false;
-            if (!cached.sourceBindRefusal.empty())
-                cached.bindRefusal = cached.sourceBindRefusal;
+            cflat_cinterop::RawSig raw;
+            raw.name = cached.name;
+            raw.linkageName = cached.linkageName;
+            raw.retType = cached.retSpelling;
+            raw.paramTypes = cached.paramSpellings;
+            raw.paramNames = cached.paramNames;
+            raw.defaultArgs = cached.defaultArgs;
+            raw.variadic = cached.variadic;
+            raw.isCxx = true;
+            raw.isNoexcept = cached.isNoexcept;
+            raw.bindRefusal = cached.sourceBindRefusal;
+            raw.abi = cached.abi;
+            raw.file = cached.file;
+            raw.line = cached.line;
+            raw.col = cached.col;
+            CSigEntry remapped;
+            if (MapRawSig(raw, remapped)) cached = std::move(remapped);
         }
-    }
+}
 
 static std::string CxxMemberValueSpelling(const std::string& spelling)
 {
@@ -3593,7 +3703,7 @@ bool LLVMBackend::ExtractCHeaderClang(const std::vector<std::string>& headerPath
 
         cflat_cinterop::ExtractResult raw;
         std::string err;
-        const bool incrementalHeader = cxxMode && !batchMode_ && activeCxxRequestGroup_ != nullptr
+        const bool incrementalHeader = cxxMode && activeCxxRequestGroup_ != nullptr
             && UseCxxIncrementalRequests();
         bool extracted = false;
         if (incrementalHeader)
@@ -3601,7 +3711,12 @@ bool LLVMBackend::ExtractCHeaderClang(const std::vector<std::string>& headerPath
             cflat_cinterop::ExtractResult prepass;
             cflat_cinterop::ExtractRequest macroReq = req;
             macroReq.source = source;
-            if (cflat_cinterop::ExtractCxxMacroPrepass(macroReq, prepass, err))
+            // A header that leaves a scope open would swallow every later chunk; clang's
+            // incremental parser corrupts its AST on it. Only the full parse may report it.
+            const bool prepassed = cflat_cinterop::ExtractCxxMacroPrepass(macroReq, prepass, err);
+            if (prepassed && prepass.headerScopeOpen)
+                err = "header leaves a namespace or brace scope open";
+            else if (prepassed)
             {
                 cflat_cinterop::ExtractRequest incrementalReq = req;
                 incrementalReq.cxxMacroProbes = prepass.macroProbes;
@@ -3642,10 +3757,29 @@ bool LLVMBackend::ExtractCHeaderClang(const std::vector<std::string>& headerPath
             }
             if (!extracted)
             {
+                if (verbose)
+                    std::cout << std::format("[verbose]   incremental header extraction failed ({}); "
+                                             "falling back to a full parse\n", err);
                 req.source = source;
                 req.cxxMacroProbes.clear();
                 raw = cflat_cinterop::ExtractResult();
+                /*
+                 * A header that fails this parse too must report its own clang diagnostic, not a
+                 * parse-budget refusal. So the fallback's parses are recorded and counted only
+                 * once it has produced a usable header.
+                 */
+                std::vector<const char*> fallbackStages;
+                auto parseGuard = std::move(req.cxxHeaderParseGuard);
+                req.cxxHeaderParseGuard = [&fallbackStages](const char* stage) {
+                    fallbackStages.push_back(stage);
+                    return true;
+                };
                 extracted = cflat_cinterop::ExtractCInterop(req, raw, err);
+                req.cxxHeaderParseGuard = std::move(parseGuard);
+                if (extracted && raw.headerErrors == 0 && raw.prereqErrors == 0
+                    && req.cxxHeaderParseGuard != nullptr)
+                    for (const char* stage : fallbackStages)
+                        if (!req.cxxHeaderParseGuard(stage)) return false;
             }
         }
         else
@@ -4236,6 +4370,17 @@ bool LLVMBackend::CxxSpellingForCflatType(const std::string& cflatType, std::str
         return true;
 }
 
+void LLVMBackend::RememberGeneratedCxxRecords(CxxIncrementalGroup& incremental,
+                                              const std::string& source) const
+{
+        for (const auto& [name, record] : generatedCxxRecords_)
+        {
+            const std::string definition = record.source + '\n';  // as GeneratedCxxDefinitionsFor emits it
+            if (source.find(definition) != std::string::npos)
+                incremental.RememberPrefixSource(definition);
+        }
+}
+
 void LLVMBackend::GeneratedCxxDefinitionsFor(
         const std::vector<std::string>& cflatTypeNames, std::string& outSource,
         std::set<size_t>& outDependencyGroups,
@@ -4468,24 +4613,36 @@ static std::optional<unsigned> CxxMaxHeaderParses()
         return limit;
 }
 
+std::optional<unsigned> LLVMBackend::TuParseBudget() const
+{
+        return tuParseBudget_.has_value() ? tuParseBudget_ : CxxMaxHeaderParses();
+}
+
+bool LLVMBackend::NoteTuParse(const std::string& kind, const std::string& label, unsigned count,
+                              const char* stage)
+{
+        // One line per counted parse, same shape for every TU kind: grep "clang parse:" to count.
+        if (verbose)
+            std::cout << std::format("[verbose] clang parse: {} '{}' #{} ({})\n", kind, label, count, stage);
+        const std::optional<unsigned> limit = TuParseBudget();
+        if (!limit.has_value() || count <= *limit) return true;
+        LogErrorMessage("{} '{}' was parsed {} times in one compile; the budget is {} "
+                        "(--error-on-cpp-reparse or CFLAT_CPP_MAX_HEADER_PARSES)",
+                        { kind, label, std::to_string(count), std::to_string(*limit) });
+        return false;
+}
+
+bool LLVMBackend::CountTuParse(const std::string& kind, const std::string& key, const std::string& label,
+                               const char* stage)
+{
+        return NoteTuParse(kind, label, ++tuParseCounts_[kind + "|" + key], stage);
+}
+
 bool LLVMBackend::CountCxxHeaderParse(const CxxRequestGroup& group, const char* stage)
 {
         if (group.primary >= cxxImportGroups_.size()) return true;
         CxxImportGroup& importGroup = cxxImportGroups_[group.primary];
-        const unsigned count = ++importGroup.headerParseCount;
-        if (verbose)
-            std::cout << std::format(
-                "[verbose] C++ header group '{}' full header parse count: {} ({})\n",
-                group.label, count, stage);
-        const std::optional<unsigned> limit = CxxMaxHeaderParses();
-        if (limit.has_value() && count > *limit)
-        {
-            LogErrorMessage("C++ header group '{}' was parsed {} times in one compile; the budget is {} "
-                            "(set CFLAT_CPP_MAX_HEADER_PARSES)",
-                            { group.label, std::to_string(count), std::to_string(*limit) });
-            return false;
-        }
-        return true;
+        return NoteTuParse("C++ header group", group.label, ++importGroup.headerParseCount, stage);
 }
 
 void LLVMBackend::ReportCxxHeaderParseSummary(const CxxRequestGroup& group) const
@@ -4518,6 +4675,25 @@ static void ReplaceCxxRequestText(std::string& source, const std::string& from,
         {
             source.replace(pos, from.size(), to);
             pos += to.size();
+        }
+}
+
+// Appends `suffix` to every thunk name BuildCxxVirtualThunks defined in `source`.
+static void AppendCxxThunkSuffix(std::string& source, const std::string& suffix)
+{
+        for (const std::string_view prefix :
+             { std::string_view("__cflat_vthk_"), cflat_cinterop::kCxxVbaseCtorThunkPrefix })
+        {
+            size_t pos = 0;
+            while ((pos = source.find(prefix, pos)) != std::string::npos)
+            {
+                pos += prefix.size();
+                while (pos < source.size()
+                       && (std::isalnum(static_cast<unsigned char>(source[pos])) || source[pos] == '_'))
+                    ++pos;
+                source.insert(pos, suffix);
+                pos += suffix.size();
+            }
         }
 }
 
@@ -5020,7 +5196,7 @@ bool LLVMBackend::RunCxxTypeRequests(const CxxRequestGroup& group,
         for (const CxxRequestItem& item : items)
             req.cxxTypeRequests.push_back({ item.cxxSpelling, item.cflatName });
         req.args = BuildCxxRequestClangArgs(group);
-        const bool incrementalRequests = UseCxxIncrementalRequests() && !batchMode_;
+        const bool incrementalRequests = UseCxxIncrementalRequests();
         const bool incrementalSpellingSafe = std::all_of(items.begin(), items.end(),
             [](const CxxRequestItem& item) { return CxxIncrementalSpellingSafe(item.cxxSpelling); });
         if (incrementalRequests && incrementalSpellingSafe)
@@ -5047,6 +5223,7 @@ bool LLVMBackend::RunCxxTypeRequests(const CxxRequestGroup& group,
                 + std::to_string(gCxxIncrementalChunk.fetch_add(1)) + "_";
             const std::string markerPrefix = chunkPrefix + "req_";
             req.cxxRequestMarkerPrefix = markerPrefix;
+            req.cxxThunkSuffix = chunkPrefix + "thk";
             req.autoInstantiateCxxTypes = emitDefinitions;
             std::string incrementalExtra = extraSource;
             ReplaceCxxRequestText(incrementalExtra, "__cflat_req_", markerPrefix);
@@ -5054,6 +5231,7 @@ bool LLVMBackend::RunCxxTypeRequests(const CxxRequestGroup& group,
             ReplaceCxxRequestUseText(incrementalExtra, chunkPrefix + "use");
             ReplaceCxxRequestText(incrementalExtra, "__cflat_vthk_recv",
                                   chunkPrefix + "vthk_recv");
+            AppendCxxThunkSuffix(incrementalExtra, req.cxxThunkSuffix);
             const std::string incrementalPrefix = BuildCxxRequestIncludes(group)
                 + incremental->UnseenPrefixSource(prefixSource);
             const bool includeExplicitInstantiation = emitDefinitions;
@@ -5064,6 +5242,7 @@ bool LLVMBackend::RunCxxTypeRequests(const CxxRequestGroup& group,
             if (incremental->ParseRequest(req, req.source, raw, error))
             {
                 incremental->RememberPrefixSource(prefixSource);
+                RememberGeneratedCxxRecords(*incremental, prefixSource);
                 return true;
             }
             return requestFailed();
@@ -5954,10 +6133,11 @@ bool LLVMBackend::RequestGeneratedCxxWrapper(const CxxRequestGroup& group,
                                                allowIncremental))
             return true;
         // A budget refusal is about this compile, not the wrapper; never remember it.
-        const bool budgetRefused = CxxMaxHeaderParses().has_value()
+        const std::optional<unsigned> parseBudget = TuParseBudget();
+        const bool budgetRefused = parseBudget.has_value()
             && group.primary < cxxImportGroups_.size()
             && cxxImportGroups_[group.primary].headerParseCount > parsesBefore
-            && cxxImportGroups_[group.primary].headerParseCount > *CxxMaxHeaderParses();
+            && cxxImportGroups_[group.primary].headerParseCount > *parseBudget;
         if (persistOnSuccess && !error.empty() && !budgetRefused)
         {
             CFileSigCacheEntry negative;
@@ -6017,7 +6197,7 @@ bool LLVMBackend::RequestGeneratedCxxWrapperUncached(const CxxRequestGroup& grou
                 req.cxxFunctionWrapperNames = { wrapperName };
                 req.args = requestArgs;
                 AttachCxxHeaderParseGuard(req, group);
-                if (UseCxxIncrementalRequests() && !batchMode_ && allowIncremental)
+                if (UseCxxIncrementalRequests() && allowIncremental)
                 {
                     CxxIncrementalGroup* incremental = GetCxxIncrementalGroup(group, runError);
                     if (incremental == nullptr) return false;
@@ -6027,6 +6207,7 @@ bool LLVMBackend::RequestGeneratedCxxWrapperUncached(const CxxRequestGroup& grou
                     if (!incremental->ParseRequest(req, req.source, out, runError)) return false;
                     if (req.source.find(kCxxWrapperPidDecl) != std::string::npos)
                         incremental->RememberPrefixSource(kCxxWrapperPidDecl);
+                    RememberGeneratedCxxRecords(*incremental, wrapperSource);
                     return true;
                 }
                 const std::string pch = EnsureCxxRequestPch(group, req.args);
@@ -8709,12 +8890,84 @@ std::string LLVMBackend::GeneratedCxxPrefixForSpelling(const std::string& cxxSpe
         return source;
 }
 
+static std::string NormalizeCxxOwnershipPath(const std::string& value)
+{
+        if (value.empty()) return {};
+        std::filesystem::path path(value);
+        std::error_code ec;
+        path = std::filesystem::absolute(path, ec);
+        if (ec) path = std::filesystem::path(value);
+        std::string normalized = path.lexically_normal().generic_string();
+#if defined(_WIN32)
+        std::transform(normalized.begin(), normalized.end(), normalized.begin(),
+                       [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+#endif
+        return normalized;
+}
+
+// Rejection text the owning-group candidate loop recognizes; never shown to the user.
+static constexpr const char* kCxxOwnershipProbeRejected =
+    "C++ ownership probe rejected this candidate";
+
+// The group's own headers and everything they transitively include, recorded when the group
+// is bound (cold: clang's include list; warm: the cache entry's dependency list).
+void LLVMBackend::RememberCxxGroupReachableFiles(size_t group,
+                                                 const std::vector<std::string>& files)
+{
+        // No include list (a system header bound without a parse) leaves the closure unknown.
+        if (group >= cxxImportGroups_.size() || files.empty()) return;
+        CxxImportGroup& g = cxxImportGroups_[group];
+        for (const std::string& header : g.headers)
+            g.reachableFiles.insert(NormalizeCxxOwnershipPath(header));
+        for (const std::string& file : files)
+            g.reachableFiles.insert(NormalizeCxxOwnershipPath(file));
+}
+
+/*
+ * An owning-group probe compiles against its candidate's headers PLUS the groups owning the
+ * template arguments, and its incremental TU keeps every header an earlier request fed in. So a
+ * probe can succeed in a group that never declares the type. A candidate owns the record only
+ * when the record's file is reachable from the candidate's own headers; a record reachable from
+ * some other group alone is left for that group's probe. A file no group can place is accepted,
+ * and so is everything when the candidate's own closure is unknown (see RememberCxxGroupReachableFiles).
+ */
+bool LLVMBackend::CxxDeclaringFileBelongsToOtherImportGroup(
+    const std::string& declaringFile) const
+{
+        if (declaringFile.empty() || activeCxxRequestGroup_ == nullptr
+            || activeCxxRequestGroup_->primary >= cxxImportGroups_.size())
+            return false;
+        const std::string normalizedFile = NormalizeCxxOwnershipPath(declaringFile);
+        auto reaches = [&](const CxxImportGroup& g) {
+            if (g.reachableFiles.count(normalizedFile) != 0) return true;
+            for (const std::string& header : g.headers)
+                if (NormalizeCxxOwnershipPath(header) == normalizedFile) return true;
+            return false;
+        };
+        const CxxImportGroup& candidate = cxxImportGroups_[activeCxxRequestGroup_->primary];
+        if (candidate.reachableFiles.empty() || reaches(candidate)) return false;
+        for (size_t i = 0; i < cxxImportGroups_.size(); ++i)
+        {
+            if (i == activeCxxRequestGroup_->primary || !reaches(cxxImportGroups_[i])) continue;
+            if (verbose)
+                std::cout << std::format("[verbose] C++ ownership probe: '{}' is not reachable "
+                                         "from '{}' ({} files), only from '{}'\n",
+                                         declaringFile, activeCxxRequestGroup_->label,
+                                         cxxImportGroups_[activeCxxRequestGroup_->primary]
+                                             .reachableFiles.size(),
+                                         cxxImportGroups_[i].headers.front());
+            return true;
+        }
+        return false;
+}
+
 bool LLVMBackend::RequestCxxForeignType(const std::string& cflatName, const std::string& cxxSpelling,
                                         std::string& error, bool needDefinitions,
                                         bool explicitInstantiation, bool tentative,
                                         const std::string& extraSource,
                                         const std::string& prefixSource,
-                                        bool persistOnSuccess)
+                                        bool persistOnSuccess,
+                                        bool ownershipProbe)
 {
         RememberCxxMangledArity(cflatName, cxxSpelling);
         std::string effectivePrefixSource = prefixSource.empty()
@@ -8727,6 +8980,8 @@ bool LLVMBackend::RequestCxxForeignType(const std::string& cflatName, const std:
         const bool uniquePtrSpelling = cxxSpelling.starts_with("std::unique_ptr<")
             || cxxSpelling.starts_with("std::vector<std::unique_ptr<");
         const bool incompleteUniquePtrTentative = incompleteTentative && uniquePtrSpelling;
+        // A generated record in the spelling is still incomplete (not the upgrade after completion).
+        const bool incompleteUniquePtrPrefix = incompletePrefix && uniquePtrSpelling;
         // Clang reports "no matching function for call to '__construct_at'" for vector<unique_ptr>
         // and "invalid application of 'sizeof' to an incomplete type '__cflat_user::BP'" directly.
         const auto allowsIncompleteUniquePtrDiagnostic = [&](const std::string& text) {
@@ -8796,7 +9051,7 @@ bool LLVMBackend::RequestCxxForeignType(const std::string& cflatName, const std:
         item.cxxSpelling = cxxSpelling;
         item.needDefinitions = needDefinitions;
         item.explicitInstantiation = explicitInstantiation;
-        const bool incrementalRequests = UseCxxIncrementalRequests() && !batchMode_;
+        const bool incrementalRequests = UseCxxIncrementalRequests();
         const bool incrementalSpellingSafe = CxxIncrementalSpellingSafe(cxxSpelling);
         const std::vector<CxxRequestItem> single{ item };
         const std::vector<std::string> requestArgs = BuildCxxRequestClangArgs(group);
@@ -8934,6 +9189,9 @@ bool LLVMBackend::RequestCxxForeignType(const std::string& cflatName, const std:
             if (probeTarget == nullptr)
                 return fail(std::format("C++ type '{}' was not present in its request result",
                                         cxxSpelling));
+            if (ownershipProbe
+                && CxxDeclaringFileBelongsToOtherImportGroup(probeTarget->file))
+                return fail(kCxxOwnershipProbeRejected);
 
             // The member-signature types exposed by this class are known before its stage 2.
             // Batch the owner and those nested requests so one frontend supplies all ODR-uses.
@@ -9040,9 +9298,17 @@ bool LLVMBackend::RequestCxxForeignType(const std::string& cflatName, const std:
                         cxxSpelling, requestKey);
                 CFileSigCacheEntry cachedEntry;
                 std::string missReason;
-                if (TryLoadCxxTypeRequestCache(group, requestKey, /*emitDefinitions*/ true,
-                                               cachedEntry, missReason,
-                                               /*allowDisk*/ true))
+                /*
+                 * A tentative unique_ptr over a not-yet-complete CFlat record cannot instantiate
+                 * its deleter, so stage 2 can only fail. Worse, in an incremental group the failed
+                 * default_delete::operator() survives the rollback as an invalid instantiation, and
+                 * the upgrade after completion never emits its body. Keep the stage-1 surface.
+                 */
+                if (incompleteUniquePtrPrefix)
+                    raw = probe;
+                else if (TryLoadCxxTypeRequestCache(group, requestKey, /*emitDefinitions*/ true,
+                                                    cachedEntry, missReason,
+                                                    /*allowDisk*/ true))
                 {
                     records = std::move(cachedEntry.records);
                     requestSigs = std::move(cachedEntry.sigs);
@@ -9053,7 +9319,7 @@ bool LLVMBackend::RequestCxxForeignType(const std::string& cflatName, const std:
                                            cachedEntry.targetTriple);
                     finalCached = true;
                 }
-                if (!finalCached)
+                if (!finalCached && !incompleteUniquePtrPrefix)
                 {
                 records.clear();
                 requestSigs.clear();
@@ -9140,6 +9406,14 @@ bool LLVMBackend::RequestCxxForeignType(const std::string& cflatName, const std:
         if (records.empty())
             return fail(std::format("'{}' does not name a C++ class type in the imported headers",
                                     cxxSpelling));
+
+        if (finalCached && ownershipProbe)
+        {
+            const auto* cachedTarget = findRegisteredRecord(records);
+            if (cachedTarget != nullptr
+                && CxxDeclaringFileBelongsToOtherImportGroup(cachedTarget->file))
+                return fail(kCxxOwnershipProbeRejected);
+        }
 
         const bool requestCacheReplay = finalCached || (cached && !needDefinitions);
         std::optional<llvm::TimeTraceScope> replayScope;
@@ -9368,6 +9642,7 @@ bool LLVMBackend::RequestCxxForeignType(const std::string& cflatName, const std:
                 }
             }
         }
+        if (requestCacheReplay) RebindCxxCachedSignatures(requestSigs);
         RegisterCSignatures(requestSigs, fileForCxxRequest);
         RegisterCxxFunctionTemplates(requestTemplates, group.primary, fileForCxxRequest);
         if (dataStructures.find(cflatName) == dataStructures.end())
@@ -9838,7 +10113,8 @@ bool LLVMBackend::RequestCxxTypeInOwningGroup(const std::string& cxxBase,
                                       /*explicitInstantiation*/ true,
                                       /*tentative*/ !last || retryable,
                                       /*extraSource*/ {}, prefixSource,
-                                      /*persistOnSuccess*/ !retryable))
+                                      /*persistOnSuccess*/ !retryable,
+                                      /*ownershipProbe*/ true))
             {
                 cxxTemplateOwnerGroup_[cxxBase] = order[k];
                 cxxTypeOwnerGroup_[cflatName] = order[k];
@@ -9846,7 +10122,12 @@ bool LLVMBackend::RequestCxxTypeInOwningGroup(const std::string& cxxBase,
                 return true;
             }
             tried.push_back(group.label);
-            if (last && order.size() == 1)
+            if (verbose)
+                std::cout << std::format("[verbose] C++ owner candidate '{}' rejected for {}: {}\n",
+                                         group.label, spelling, localError);
+            // An ownership rejection is not a clang diagnostic worth relaying; it reads as
+            // "no header declares" below, like any exhausted candidate list.
+            if (last && order.size() == 1 && localError != kCxxOwnershipProbeRejected)
             {
                 error = localError;
                 return false;
@@ -9865,20 +10146,21 @@ bool LLVMBackend::RequestCxxTypeInOwningGroup(const std::string& cxxBase,
         return false;
     }
 
-bool LLVMBackend::ExtractCFileClang(const std::string& cSourcePath,
+bool LLVMBackend::ExtractCFileClang(const std::string& cSourcePath, const std::vector<std::string>& driverArgs,
                            std::vector<CSigEntry>& outSigs, std::vector<CRecordEntry>& outRecords,
-                           std::vector<CGlobalEntry>& outGlobals, bool cxxMode,
-                           uint64_t* outLongDoubleWidth,
-                           bool* outLongDoubleIsIEEEDouble,
-                           std::string* outTargetTriple)
+                           std::vector<CGlobalEntry>& outGlobals, std::vector<CTypeAliasEntry>& outTypedefs,
+                           std::vector<std::string>& outIncludes, bool cxxMode,
+                           uint64_t& outLongDoubleWidth, bool& outLongDoubleIsIEEEDouble,
+                           std::string& outTargetTriple)
 {
         llvm::TimeTraceScope extractScope("CFileExtract", cSourcePath);
 
         cflat_cinterop::ExtractRequest req;
         req.realPath        = cSourcePath;     // parsed from disk
-        req.args            = BuildClangDriverArgs(/*headerDir*/ "", /*extraDefines*/ {}, /*errorRecovery*/ true, cxxMode);
+        req.args            = driverArgs;
         req.cxxMode         = cxxMode;
         req.wantMacros      = false;
+        req.wantIncludes    = true;
         req.requireInScope  = true;
         req.inScopeDirs.push_back(std::filesystem::path(cSourcePath).parent_path().string());
         req.definitionsOnly = true;
@@ -9896,14 +10178,22 @@ bool LLVMBackend::ExtractCFileClang(const std::string& cSourcePath,
             return false;
         }
         SetCInteropTargetFacts(raw);
-        if (outLongDoubleWidth) *outLongDoubleWidth = raw.longDoubleWidth;
-        if (outLongDoubleIsIEEEDouble)
-            *outLongDoubleIsIEEEDouble = raw.longDoubleIsIEEEDouble;
-        if (outTargetTriple) *outTargetTriple = raw.targetTriple;
+        outLongDoubleWidth = raw.longDoubleWidth;
+        outLongDoubleIsIEEEDouble = raw.longDoubleIsIEEEDouble;
+        outTargetTriple = raw.targetTriple;
+        outIncludes = raw.includedFiles;
 
         {
             llvm::TimeTraceScope adoptScope("AdoptTypedefs", cSourcePath);
             AdoptRawTypedefs(raw);
+            for (const auto& t : raw.typedefs)
+            {
+                CTypeAliasEntry alias;
+                alias.name = t.name;
+                alias.target = t.underlying;
+                alias.qualifiedName = t.qualifiedName;
+                outTypedefs.push_back(std::move(alias));
+            }
         }
         {
             llvm::TimeTraceScope recordScope("RegisterCRecords", cSourcePath);
@@ -9931,6 +10221,27 @@ bool LLVMBackend::ExtractCFileClang(const std::string& cSourcePath,
         return true;
     }
 
+void LLVMBackend::RegisterCFileSigEntry(CFileSigCacheEntry& entry, const std::string& fileForLsp,
+                                        const std::string& programAlias)
+{
+        // The output's up-to-date check must see the transitive includes on a hit too.
+        for (const auto& dep : entry.deps) RecordDependency(dep.path);
+        SetCInteropTargetFacts(entry.longDoubleWidth, entry.longDoubleIsIEEEDouble, entry.targetTriple);
+        // Same adoption AdoptRawTypedefs performs on the parse path.
+        for (const auto& alias : entry.typeAliases)
+            if (!alias.name.empty() && !alias.target.empty() && alias.target != alias.name)
+            {
+                cTypedefMap_.emplace(alias.name, alias.target);
+                if (!alias.qualifiedName.empty() && alias.qualifiedName != alias.name)
+                    cTypedefMap_.emplace(alias.qualifiedName, alias.target);
+            }
+        // Records must be registered before sigs so signatures referencing struct-by-
+        // value resolve to the same dataStructures entries on cache hits.
+        RegisterCRecords(entry.records, fileForLsp);
+        RegisterCSignatures(entry.sigs, fileForLsp, programAlias);
+        RegisterCGlobals(entry.globals, fileForLsp);
+    }
+
 bool LLVMBackend::ExtractCSignatures(const std::string& cSourcePath, const std::string& programAlias, bool cxxMode)
 {
         // Canonical path: stable cache key + the real .c for LSP go-to-definition.
@@ -9956,11 +10267,9 @@ bool LLVMBackend::ExtractCSignatures(const std::string& cSourcePath, const std::
         std::error_code mtEc;
         auto currentMtime = std::filesystem::last_write_time(fileForLsp, mtEc);
 
-        // --- Cache lookup under lock. Copy the signatures out, then register after the
-        //     lock is released, so the global cache never serializes per-backend work. ---
-        std::vector<CSigEntry> hitSigs;
-        std::vector<CRecordEntry> hitRecords;
-        std::vector<CGlobalEntry> hitGlobals;
+        // --- Cache lookup under lock. Copy the entry out, then register after the lock is
+        //     released, so the global cache never serializes per-backend work. ---
+        CFileSigCacheEntry hitEntry;
         bool hit = false;
         {
             std::lock_guard<std::mutex> lock(cFileSigCacheMutex_);
@@ -9971,70 +10280,108 @@ bool LLVMBackend::ExtractCSignatures(const std::string& cSourcePath, const std::
                 if (entry.mtime == currentMtime)
                 {
                     if (verbose) std::cout << std::format("[verbose] C signatures cache hit (mtime) for {}\n", fileForLsp);
-                    SetCInteropTargetFacts(entry.longDoubleWidth, entry.longDoubleIsIEEEDouble,
-                                           entry.targetTriple);
-                    TouchCFileSigEntry(cacheKey, entry);
-                    hitSigs = entry.sigs;
-                    hitRecords = entry.records;
-                    hitGlobals = entry.globals;
                     hit = true;
                 }
                 // Timestamp moved but content may be identical - only now pay for a hash.
                 else if (hashNow() == entry.hash)
                 {
                     if (verbose) std::cout << std::format("[verbose] C signatures cache hit (hash) for {}\n", fileForLsp);
-                    SetCInteropTargetFacts(entry.longDoubleWidth, entry.longDoubleIsIEEEDouble,
-                                           entry.targetTriple);
                     entry.mtime = currentMtime; // refresh so the next check short-circuits on mtime
-                    TouchCFileSigEntry(cacheKey, entry);
-                    hitSigs = entry.sigs;
-                    hitRecords = entry.records;
-                    hitGlobals = entry.globals;
                     hit = true;
+                }
+                if (hit)
+                {
+                    TouchCFileSigEntry(cacheKey, entry);
+                    hitEntry = entry;
                 }
             }
         }
         if (hit)
         {
-            // Records must be registered before sigs so signatures referencing struct-by-
-            // value resolve to the same dataStructures entries on cache hits.
-            RegisterCRecords(hitRecords, fileForLsp);
-            RegisterCSignatures(hitSigs, fileForLsp, programAlias);
-            RegisterCGlobals(hitGlobals, fileForLsp);
+            RegisterCFileSigEntry(hitEntry, fileForLsp, programAlias);
             return true;
+        }
+
+        // The disk entry is keyed on the whole clang invocation (include dirs, defines, target),
+        // so a compile under different options never replays another's surface.
+        const std::vector<std::string> driverArgs =
+            BuildClangDriverArgs(/*headerDir*/ "", /*extraDefines*/ {}, /*errorRecovery*/ true, cxxMode);
+        uint64_t diskKey = 14695981039346656037ULL;
+        auto fold = [&diskKey](const std::string& s) {
+            for (unsigned char c : s) { diskKey ^= c; diskKey *= 1099511628211ULL; }
+        };
+        fold("|SRC"); fold(fileForLsp); fold(cxxMode ? "|CXX" : "|C");
+        for (const auto& arg : driverArgs) { fold("|A"); fold(arg); }
+        const std::string cacheDir = GetCHeaderCacheDir();
+        const bool diskAllowed = !mtEc && !cacheDir.empty();
+        if (diskAllowed)
+        {
+            CFileSigCacheEntry diskEntry;
+            std::string missReason;
+            bool diskHit;
+            {
+                llvm::TimeTraceScope loadScope("CFileJsonLoad", fileForLsp);
+                diskHit = TryLoadCHeaderDiskCache(cacheDir, diskKey, currentMtime, hashNow(), diskEntry,
+                                                  /*expectedRequestKey*/ {}, /*requireBitcode*/ false,
+                                                  &missReason);
+            }
+            if (diskHit)
+            {
+                if (verbose) std::cout << std::format("[verbose] C signatures disk cache hit for {}\n", fileForLsp);
+                {
+                    std::lock_guard<std::mutex> lock(cFileSigCacheMutex_);
+                    InsertCFileSigEntry(cacheKey, CFileSigCacheEntry(diskEntry), verbose);
+                }
+                RegisterCFileSigEntry(diskEntry, fileForLsp, programAlias);
+                return true;
+            }
+            if (verbose)
+                std::cout << std::format("[verbose] C signatures disk cache miss for {}: {}\n",
+                                         fileForLsp, missReason);
         }
 
         // Cache miss - parse outside the lock; concurrent misses redo work harmlessly.
         // Extraction uses the clang C++ API in-process (no clang-cl needed), so LSP works too.
-        std::vector<CSigEntry> sigs;
-        std::vector<CRecordEntry> records;
-        std::vector<CGlobalEntry> globals;
-        uint64_t longDoubleWidth = 0;
-        bool longDoubleIsIEEEDouble = false;
-        std::string targetTriple;
-        if (!ExtractCFileClang(cSourcePath, sigs, records, globals, cxxMode,
-                               &longDoubleWidth, &longDoubleIsIEEEDouble, &targetTriple))
+        if (!CountTuParse(cxxMode ? "C++ source" : "C source", cacheKey, fileForLsp, "signature extraction"))
+            return false;
+        CFileSigCacheEntry entry;
+        std::vector<std::string> includes;
+        if (!ExtractCFileClang(cSourcePath, driverArgs, entry.sigs, entry.records, entry.globals,
+                               entry.typeAliases, includes, cxxMode, entry.longDoubleWidth,
+                               entry.longDoubleIsIEEEDouble, entry.targetTriple))
             return false;
 
-        if (!mtEc)
+        // Keep only real on-disk paths in the transitive dependency list.
+        // Non-existent deps would otherwise poison every later cache validation.
+        std::unordered_set<std::string> seenIncludes;
+        for (const auto& inc : includes)
         {
-            CFileSigCacheEntry entry;
-            entry.mtime = currentMtime;
-            entry.hash  = hashNow();
-            entry.longDoubleWidth = longDoubleWidth;
-            entry.longDoubleIsIEEEDouble = longDoubleIsIEEEDouble;
-            entry.targetTriple = targetTriple;
-            entry.sigs  = sigs;
-            entry.records = records;
-            entry.globals = globals;
-            std::lock_guard<std::mutex> lock(cFileSigCacheMutex_);
-            InsertCFileSigEntry(cacheKey, std::move(entry), verbose);
+            RecordDependency(inc);
+            std::error_code dec;
+            auto dm = std::filesystem::last_write_time(inc, dec);
+            if (dec || !seenIncludes.insert(inc).second) continue;
+            CHeaderDep dep;
+            dep.path  = inc;
+            dep.mtime = (int64_t)dm.time_since_epoch().count();
+            HashFileFnv1a(inc, dep.hash);
+            entry.deps.push_back(std::move(dep));
         }
 
         // Records were already registered inside ExtractCFileClang (so it could map
         // struct-by-value parameter types); do not re-register here.
-        RegisterCSignatures(sigs, fileForLsp, programAlias);
-        RegisterCGlobals(globals, fileForLsp);
+        RegisterCSignatures(entry.sigs, fileForLsp, programAlias);
+        RegisterCGlobals(entry.globals, fileForLsp);
+
+        if (!mtEc)
+        {
+            entry.mtime = currentMtime;
+            entry.hash  = hashNow();
+            // Same rule as the header cache: --run and LSP analysis never write to disk.
+            if (diskAllowed && !runMode_ && symbolSink_ == nullptr)
+                WriteCHeaderDiskCache(cacheDir, diskKey, currentMtime, entry.hash, entry);
+            std::lock_guard<std::mutex> lock(cFileSigCacheMutex_);
+            InsertCFileSigEntry(cacheKey, std::move(entry), verbose);
+        }
         return true;
     }
 
@@ -12591,8 +12938,11 @@ llvm::Function* LLVMBackend::EmitCppStructOverrideThunk(
                 plan.params[0].TypeName = structName;
                 plan.params[0].Pointer = true;
                 std::string mismatch;
-                CxxAbiPlanScope abiScope(*this, &candidate.raw.abi, &mismatch);
-                if (!BuildAbiRecipeFromClangPlan(methodName, candidate.raw.abi,
+                // The generated callback is a free extern "C" helper, so sret precedes `this`.
+                cflat_cinterop::RawAbi helperAbi = candidate.raw.abi;
+                helperAbi.ret.sretAfterThis = false;
+                CxxAbiPlanScope abiScope(*this, &helperAbi, &mismatch);
+                if (!BuildAbiRecipeFromClangPlan(methodName, helperAbi,
                                                   plan.ret, plan.params, plan.recipe))
                 {
                     LogErrorMessage("override method '{}.{}' has an unsupported C++ ABI: {}",
@@ -13591,6 +13941,7 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
             targetWindows_, CInteropTargetTriple(), cppMode, cxxDefinitionsEmitted);
 
         std::vector<CSigEntry> hitSigs;
+        std::vector<std::string> hitDepPaths;
         std::vector<CEnumEntry> hitEnums;
         std::vector<CRecordEntry> hitRecords;
         std::vector<CMacroEntry> hitMacros;
@@ -13625,6 +13976,7 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
                     hitFunctionTemplates = entry.functionTemplates;
                     hitFunctionPointerAbis = entry.functionPointerAbis;
                     hitCxxBitcode = entry.cxxBitcode;
+                    for (const auto& dep : entry.deps) hitDepPaths.push_back(dep.path);
                 }
                 else if (hashNow() == entry.hash)
                 {
@@ -13642,11 +13994,16 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
                     hitFunctionTemplates = entry.functionTemplates;
                     hitFunctionPointerAbis = entry.functionPointerAbis;
                     hitCxxBitcode = entry.cxxBitcode;
+                    for (const auto& dep : entry.deps) hitDepPaths.push_back(dep.path);
                 }
             }
         }
         if (hit)
         {
+            // A memory hit carries the storing analysis' mapped CFlat names; remap C++ signatures
+            // on registration exactly like a disk hit does.
+            for (CSigEntry& sig : hitSigs) sig.needsCxxRebind = sig.isCxx;
+            if (cppMode) RememberCxxGroupReachableFiles(cxxGroupIndex, hitDepPaths);
             // The C++ definitions this header needed were emitted on the cold run; relink the very
             // same bitcode instead of running CodeGen again.
             AdoptCxxCompanionBitcode(hitCxxBitcode);
@@ -13708,7 +14065,13 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
             if (diskHit)
             {
                 // The output's up-to-date check must see the transitive includes on a hit too.
-                for (const auto& dep : diskEntry.deps) RecordDependency(dep.path);
+                std::vector<std::string> diskDepPaths;
+                for (const auto& dep : diskEntry.deps)
+                {
+                    RecordDependency(dep.path);
+                    diskDepPaths.push_back(dep.path);
+                }
+                if (cppMode) RememberCxxGroupReachableFiles(cxxGroupIndex, diskDepPaths);
                 if (verbose) std::cout << std::format("[verbose] C header disk cache hit for {}\n", fileForLsp);
                 {
                     std::lock_guard<std::mutex> lock(cFileSigCacheMutex_);
@@ -13802,6 +14165,10 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
         if (cppMode && !batchMode_ && !runMode_ && symbolSink_ == nullptr
             && !cHeaderCacheDir.empty())
             PruneCxxTypeRequestDiskCache(cHeaderCacheDir, cxxGroup);
+        // A C++ group counts its own parses (AttachCxxHeaderParseGuard); a C header counts here.
+        if (!cppMode && !CountTuParse("C header", std::format("{:016x}", refusalGroupKey), fileForLsp,
+                                    "header extraction"))
+            return false;
         {
             // All C entities are extracted in one full parse (plus a cheap preprocess-only prepass
             // for macro names). Uses clang C++ API, not clang-cl or libclang.
@@ -13829,6 +14196,7 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
                 return false;
             }
         }
+        if (cppMode) RememberCxxGroupReachableFiles(cxxGroupIndex, includes);
 
         if (!mtEc)
         {

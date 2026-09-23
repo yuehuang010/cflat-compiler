@@ -306,7 +306,6 @@ namespace cflat_cinterop
     namespace
     {
         const char kProbePrefix[] = "__cflat_macro_";
-        const char kHeaderScopeSentinel[] = "__cflat_header_scope_sentinel";
 
         std::string CanonicalSpelling(const ASTContext& ctx, QualType qt)
         {
@@ -405,10 +404,11 @@ namespace cflat_cinterop
         {
             RawDefaultArg result;
             if (p == nullptr || !p->hasDefaultArg()) return result;
-            // A template member default is not instantiated until used: never a constant here.
-            if (p->hasUninstantiatedDefaultArg()) { result.kind = "nonconst"; return result; }
-            const Expr* init = p->getDefaultArg();
-            if (init == nullptr || init->containsErrors() || init->isValueDependent())
+            // A template member default stays uninstantiated until some call uses it. Read the
+            // pattern so the answer does not depend on whether this TU happened to use it.
+            const Expr* init = p->hasUninstantiatedDefaultArg()
+                ? p->getUninstantiatedDefaultArg() : p->getDefaultArg();
+            if (init == nullptr || init->containsErrors() || init->isInstantiationDependent())
             {
                 result.kind = "nonconst";
                 return result;
@@ -855,6 +855,16 @@ namespace cflat_cinterop
             {
                 ci.getPreprocessor().addPPCallbacks(
                     std::make_unique<MacroCollector>(ci.getPreprocessor(), st));
+                // Brace depth over the expanded tokens: a balanced header leaves the stub's scope
+                // sentinel at depth 0. An incremental parse must never see an unbalanced header.
+                if (st.req.cxxMode)
+                    ci.getPreprocessor().setTokenWatcher([out = &st.out, depth = 0](const Token& tok) mutable {
+                        if (tok.is(tok::l_brace)) ++depth;
+                        else if (tok.is(tok::r_brace)) --depth;
+                        else if (depth != 0 && tok.is(tok::identifier)
+                                 && tok.getIdentifierInfo()->getName() == kHeaderScopeSentinel)
+                            out->headerScopeOpen = true;
+                    });
                 return true;
             }
         };
@@ -3685,9 +3695,11 @@ namespace cflat_cinterop
                 // Slot unusable and no fallback path to the member, or an implicit most-derived
                 // argument cflat cannot pass: hand it to the thunk Clang generated for it.
                 if (CxxMemberNeedsVirtualThunk(m))
-                    BindCxxVirtualThunk(st, ctx, root, cgm, m, CxxVirtualThunkName(m.linkageName));
+                    BindCxxVirtualThunk(st, ctx, root, cgm, m,
+                                        CxxVirtualThunkName(m.linkageName) + st.req.cxxThunkSuffix);
                 else if (CxxCtorNeedsVbaseThunk(rec, m))
-                    BindCxxVirtualThunk(st, ctx, root, cgm, m, CxxVbaseCtorThunkName(m.linkageName));
+                    BindCxxVirtualThunk(st, ctx, root, cgm, m,
+                                        CxxVbaseCtorThunkName(m.linkageName) + st.req.cxxThunkSuffix);
             }
         }
 
@@ -3840,7 +3852,18 @@ namespace cflat_cinterop
                     return errorReach->active ? errorReach->Reaches(fd)
                                               : errorReach->HasOwnError(fd);
                 if (const auto* vd = llvm::dyn_cast<VarDecl>(d))
-                    return vd->getInit() != nullptr && vd->getInit()->containsErrors();
+                {
+                    if (vd->getInit() != nullptr && vd->getInit()->containsErrors()) return true;
+                    // Lowering a member pointer needs its class's MS inheritance model, and an
+                    // incremental rollback can leave that class an invalid instantiation.
+                    if (const auto* mpt = vd->getType()->getAs<MemberPointerType>())
+                    {
+                        const CXXRecordDecl* cls = mpt->getMostRecentCXXRecordDecl();
+                        return cls == nullptr || cls->isInvalidDecl() || !cls->hasDefinition()
+                            || cls->getDefinition()->isInvalidDecl();
+                    }
+                    return false;
+                }
                 return false;
             };
             auto isDependentCodeGenDecl = [](const Decl* d) {
@@ -3854,6 +3877,12 @@ namespace cflat_cinterop
                 if (const auto* linkage = llvm::dyn_cast<LinkageSpecDecl>(d))
                 {
                     for (Decl* member : linkage->decls()) emitDeclRef(member, emitDeclRef);
+                    return;
+                }
+                // Per member, so the error checks below see every declaration CodeGen would emit.
+                if (const auto* ns = llvm::dyn_cast<NamespaceDecl>(d))
+                {
+                    for (Decl* member : ns->decls()) emitDeclRef(member, emitDeclRef);
                     return;
                 }
                 if (declHasErrors(d))

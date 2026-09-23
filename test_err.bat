@@ -10,6 +10,11 @@ set GROUP=0
 if not defined CFLAT_OUT set CFLAT_OUT=out
 set OUT=%CFLAT_OUT%
 if not defined CFLAT_POLICY_SUPPORTED set CFLAT_POLICY_SUPPORTED=1
+REM Every check parses each C/C++ TU at most once (legacy C++ mode reparses by design).
+set "TU_CHECK=--error-on-cpp-reparse cold"
+if /I "%CFLAT_CPP_INCREMENTAL%"=="0" set "TU_CHECK="
+if /I "%CFLAT_CPP_INCREMENTAL%"=="off" set "TU_CHECK="
+if /I "%CFLAT_CPP_INCREMENTAL%"=="false" set "TU_CHECK="
 
 if "%~1"=="--group" set GROUP=%~2
 
@@ -75,7 +80,7 @@ for %%F in (%SRC%\errors\err_*.cb) do (
 )
 if defined GROUPFILES (
     echo === error group %~1 of %~2 ===
-    %COMPILER% --check -i %LIB% --locale pseudo --locale-dir "%CFLAT_LOCALE_DIR%" --nologo!GROUPFILES!
+    %COMPILER% --check -i %LIB% --locale pseudo --locale-dir "%CFLAT_LOCALE_DIR%" --nologo %TU_CHECK%!GROUPFILES!
     if !ERRORLEVEL! neq 0 (
         set /a ERRORS+=1
         set /a NORMAL_ERRORS+=1
@@ -153,7 +158,7 @@ if /I "!CFLAT_POLICY_SUPPORTED!"=="0" (
 )
 call :LoadPolicyFlags "!POLICY_FILE!"
 set "POLICY_T0=!TIME!"
-%COMPILER% "!POLICY_FILE!" -i %LIB% --locale-dir "%CFLAT_LOCALE_DIR%" --check --nologo !POLICY_FLAGS! >"!POLICY_LOG!" 2>&1
+%COMPILER% "!POLICY_FILE!" -i %LIB% --locale-dir "%CFLAT_LOCALE_DIR%" --check --nologo %TU_CHECK% !POLICY_FLAGS! >"!POLICY_LOG!" 2>&1
 set "POLICY_RC=!ERRORLEVEL!"
 set "POLICY_PASS=0"
 if /I "!POLICY_EXPECT_EXIT!"=="nonzero" (

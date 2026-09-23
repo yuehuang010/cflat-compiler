@@ -1930,6 +1930,22 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
             const size_t receiverMemberDot = functionName.rfind('.');
             const std::string bareMemberName = receiverMemberDot == std::string::npos
                 ? functionName : functionName.substr(receiverMemberDot + 1);
+            // A bound overload hides a refused sibling whose signature type no request had
+            // registered yet (set::insert returning pair<iterator, bool>). Retry that bind once.
+            if (!cxxMemberReceiver.empty() && GetCxxClassInfo(cxxMemberReceiver) != nullptr)
+            {
+                const std::string retryKey = cxxMemberReceiver + "." + bareMemberName;
+                if (cxxOverloadRebindInFlight_.insert(retryKey).second)
+                {
+                    llvm::Value* retried = nullptr;
+                    const bool rebound = TryBindRefusedCxxMember(cxxMemberReceiver, bareMemberName);
+                    if (rebound)
+                        retried = CreateOverloadedFunctionCall(functionName, arguments, forceRoot,
+                                                               displayName, cxxMemberReceiver);
+                    cxxOverloadRebindInFlight_.erase(retryKey);
+                    if (rebound) return retried;
+                }
+            }
             if (!cxxMemberReceiver.empty() && GetCxxClassInfo(cxxMemberReceiver) != nullptr
                 && !CxxClassHasMemberNamed(cxxMemberReceiver, bareMemberName)
                 && std::none_of(candidates.begin(), candidates.end(), [&](const auto& c) {

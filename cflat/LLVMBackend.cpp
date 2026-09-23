@@ -1626,6 +1626,10 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
     currentSourceFilePath_ = rootCanonical;
     analyzedRootPath_ = rootCanonical;
     BeginActiveRoot(rootCanonical);
+    struct ActiveRootGuard {
+        LLVMBackend& backend;
+        ~ActiveRootGuard() { backend.EndActiveRoot(); }
+    } activeRootGuard{*this};
     currentSourceIsCore_ = false;
     // See rootCoreDir_: a core library source compiled directly imports its siblings from ITS
     // checkout, which is not runtimeDir/core.
@@ -1688,6 +1692,17 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
     }
     // Captured for clang C compiles (imports run during parse, before EmitExecutable).
     cOptLevel_ = args.getOptimizationLevel();
+    tuParseBudget_.reset();
+    if (auto check = args.getOption("error-on-cpp-reparse"))
+    {
+        if (*check == "cold")      tuParseBudget_ = 1;
+        else if (*check == "warm") tuParseBudget_ = 0;
+        else
+        {
+            LogErrorMessage("--error-on-cpp-reparse requires 'cold' or 'warm' (got '{}')", { *check });
+            return false;
+        }
+    }
     cDebugInfo_ = debugInfo;
     // Cross-thread sharing scan level (--xthread-scan N, N in 1..3); 0 = silent default.
     // Threads through --check too since that path also calls Compile(args, file).
@@ -2687,15 +2702,19 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
 
 void LLVMBackend::BeginActiveRoot(const std::string& rootPath)
 {
+    EndActiveRoot();
     std::lock_guard<std::mutex> lock(cFileSigCacheMutex_);
     activeRootKey_ = rootPath;
+    ++inProgressRoots_[rootPath];
     activeRoots_[rootPath].lastUse = ++cFileSigCacheClock_;
     while (activeRoots_.size() > kMaxActiveRoots)
     {
         auto oldest = activeRoots_.end();
         for (auto it = activeRoots_.begin(); it != activeRoots_.end(); ++it)
-            if (oldest == activeRoots_.end() || it->second.lastUse < oldest->second.lastUse)
+            if (inProgressRoots_.find(it->first) == inProgressRoots_.end()
+                && (oldest == activeRoots_.end() || it->second.lastUse < oldest->second.lastUse))
                 oldest = it;
+        if (oldest == activeRoots_.end()) break;
         for (const auto& key : oldest->second.headerKeys)
         {
             auto pin = pinnedHeaderRefs_.find(key);
@@ -2706,6 +2725,16 @@ void LLVMBackend::BeginActiveRoot(const std::string& rootPath)
         activeRoots_.erase(oldest);
     }
     EvictUnpinnedOverBudget(std::string(), verbose);
+}
+
+void LLVMBackend::EndActiveRoot()
+{
+    std::lock_guard<std::mutex> lock(cFileSigCacheMutex_);
+    if (activeRootKey_.empty()) return;
+    auto inProgress = inProgressRoots_.find(activeRootKey_);
+    if (inProgress != inProgressRoots_.end() && --inProgress->second == 0)
+        inProgressRoots_.erase(inProgress);
+    activeRootKey_.clear();
 }
 
 bool LLVMBackend::IsParseTreeFresh(const CachedParseTree& tree)
@@ -4153,6 +4182,10 @@ bool LLVMBackend::Analyze(const std::string& filePath,
     BeginActiveRoot(sourceDisplayName_.empty() || sourceFileDir_.empty()
         ? rootCanonical
         : (std::filesystem::path(sourceFileDir_) / sourceDisplayName_).string());
+    struct ActiveRootGuard {
+        LLVMBackend& backend;
+        ~ActiveRootGuard() { backend.EndActiveRoot(); }
+    } activeRootGuard{*this};
     currentSourceIsCore_ = false;   // the analyzed root file is treated as user code
     importedFiles.insert(rootCanonical);
     importStack.push_back(rootCanonical);
@@ -4434,6 +4467,7 @@ bool LLVMBackend::LastOptimizedViewWasIncremental() const
 
 void LLVMBackend::ResetForReanalysis()
 {
+    EndActiveRoot();
     analyzeDebugInfo_ = false;
     isolatedPolicy_.reset();
     // Core hashes are per-analysis so LSP notices edits; batch mode keeps one process-wide hash.
@@ -4444,6 +4478,7 @@ void LLVMBackend::ResetForReanalysis()
     cppInteropUsed_ = false;
     cxxProgramEhGuardAttempted_ = false;
     cxxImportGroups_.clear();
+    tuParseCounts_.clear();
     cxxIncrementalGroups_.clear();
     activeCxxRequestGroup_ = nullptr;
     cxxTemplateOwnerGroup_.clear();
@@ -4587,8 +4622,6 @@ void LLVMBackend::ResetForReanalysis()
     cxxNontrivialRecords_.clear();
     cxxClasses_.clear();
     cxxRecordEntries_.clear();
-    cxxRebindParameterMappings_.clear();
-    cxxRebindReturnMappings_.clear();
     cxxRecordSpellingIndex_.clear();
     cxxRecordSpellingIndexDirty_ = true;
     cxxRefusedMemberRebindInFlight_.clear();

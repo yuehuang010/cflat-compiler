@@ -14617,7 +14617,10 @@ LLVMBackend::NamedVariable MainListener::ParseNewExpression(CFlatParser::NewExpr
             && (typeIsPtr || !compiler->IsCxxRecord(typeName)))
         {
             auto* argList = ctx->argumentExpressionList();
-            if (argList != nullptr && !argList->argumentNamedExpression().empty())
+            // `new T()` (and bare `new T`) value-initializes: the fresh heap slot reads zero.
+            if (argList == nullptr || argList->argumentNamedExpression().empty())
+                compiler->builder->CreateStore(llvm::Constant::getNullValue(elemType), typedPtr);
+            else
             {
                 auto args = argList->argumentNamedExpression();
                 if (args.size() != 1)

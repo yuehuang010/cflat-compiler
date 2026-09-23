@@ -37,6 +37,8 @@ namespace
     public:
         unsigned errors = 0;
         std::string firstError;
+        // First error naming a not-yet-defined CFlat record: no retry can complete that record.
+        std::string incompleteRecordError;
         // Lines of the newest interpreter input buffer that an error or its notes point at.
         std::string blamedBuffer;
         std::set<unsigned> blamedLines;
@@ -47,7 +49,9 @@ namespace
             if (level == clang::DiagnosticsEngine::Note)
             {
                 if (!inErrorGroup) return;
-                Blame(info);
+                // This note names the incomplete type's declaration, not the use that failed.
+                // Dropping that declaration only turns the retry into an undeclared name.
+                if (info.getID() != clang::diag::note_forward_declaration) Blame(info);
                 RecordFailedInstantiation(info);
                 return;
             }
@@ -55,11 +59,15 @@ namespace
             if (!inErrorGroup) return;
             ++errors;
             Blame(info);
-            if (firstError.empty())
+            if (firstError.empty() || incompleteRecordError.empty())
             {
                 llvm::SmallString<256> text;
                 info.FormatDiagnostic(text);
-                firstError = text.str().str();
+                std::string message = text.str().str();
+                if (incompleteRecordError.empty()
+                    && message.find("incomplete type '__cflat_user::") != std::string::npos)
+                    incompleteRecordError = message;
+                if (firstError.empty()) firstError = std::move(message);
             }
         }
 
@@ -133,10 +141,12 @@ namespace
     {
         clang::DiagnosticsEngine& diagnostics;
         clang::DiagnosticConsumer* previous;
+        // setClient(..., false) deletes an owned client, so hold it for the restore.
+        std::unique_ptr<clang::DiagnosticConsumer> ownedPrevious;
         CountingDiagnosticConsumer consumer;
 
         explicit DiagnosticScope(clang::DiagnosticsEngine& d)
-            : diagnostics(d), previous(d.getClient())
+            : diagnostics(d), previous(d.getClient()), ownedPrevious(d.takeClient())
         {
             diagnostics.Reset(/*soft*/ true);
             diagnostics.setSuppressAllDiagnostics(false);
@@ -145,7 +155,10 @@ namespace
 
         ~DiagnosticScope()
         {
-            diagnostics.setClient(previous, /*ShouldOwnClient*/ false);
+            if (ownedPrevious != nullptr)
+                diagnostics.setClient(ownedPrevious.release(), /*ShouldOwnClient*/ true);
+            else
+                diagnostics.setClient(previous, /*ShouldOwnClient*/ false);
             diagnostics.setSuppressAllDiagnostics(true);
             diagnostics.Reset(/*soft*/ true);
         }
@@ -270,7 +283,8 @@ namespace
                     if (digits > tagEnd + 1 && digits < result.size() && result[digits] == '_')
                         tagEnd = digits + 1;
                 }
-                if (result.compare(tagEnd, 3, "use") == 0)
+                // "use" helpers and "thk" thunk-name suffixes (ExtractRequest::cxxThunkSuffix).
+                if (result.compare(tagEnd, 3, "use") == 0 || result.compare(tagEnd, 3, "thk") == 0)
                     result.replace(cursor + 1, tagEnd - (cursor + 1), retryTag);
             }
             pos = cursor;
@@ -348,6 +362,31 @@ namespace
             clang::MultiplexConsumer& consumer)
         {
             return static_cast<MultiplexAccess&>(consumer).Consumers;
+        }
+    };
+
+    /*
+     * Sema hands CodeGen an instantiated static data member the moment it instantiates it, with
+     * no error check in between. An explicit instantiation over an incomplete CFlat record (e.g.
+     * a deque's `_Block_size = sizeof(T) ...`) yields a broken one, and emitting it crashes.
+     * The Interpreter's consumers sit behind this guard, which drops such members.
+     */
+    class StaticMemberGuard : public clang::MultiplexConsumer
+    {
+    public:
+        using clang::MultiplexConsumer::MultiplexConsumer;
+
+        void HandleCXXStaticMemberVarInstantiation(clang::VarDecl* var) override
+        {
+            const bool brokenInit = var->getInit() != nullptr && var->getInit()->containsErrors();
+            if (!var->isInvalidDecl() && !brokenInit)
+            {
+                clang::MultiplexConsumer::HandleCXXStaticMemberVarInstantiation(var);
+                return;
+            }
+            // A surviving use still takes its address. Without an initializer that is a plain
+            // external declaration, not a constant CodeGen cannot evaluate.
+            if (var->getInit() != nullptr) var->setInit(nullptr);
         }
     };
 
@@ -468,7 +507,10 @@ std::unique_ptr<CxxIncrementalGroup> CxxIncrementalGroup::Create(
         recorder->context = &impl->interpreter->getCompilerInstance()->getASTContext();
         impl->announcer = recorder.get();
         auto& consumers = MultiplexAccess::ListOf(*multiplex);
-        consumers.insert(consumers.begin(), std::move(recorder));
+        auto guarded = std::make_unique<StaticMemberGuard>(std::move(consumers));
+        consumers.clear();
+        consumers.push_back(std::move(recorder));
+        consumers.push_back(std::move(guarded));
     }
     {
         DiagnosticScope diagnostics(impl->interpreter->getCompilerInstance()->getDiagnostics());
@@ -696,6 +738,10 @@ bool CxxIncrementalGroup::ParseRequest(const cflat_cinterop::ExtractRequest& req
     }
     clang::PartialTranslationUnit* parsed = nullptr;
     std::vector<clang::Decl*> announced;
+    unsigned parsedAttempt = 0;
+    // A drop over a not-yet-defined CFlat record: the request reports that error as firstError.
+    // Any other drop is an ordinary recovery.
+    std::string recoveredError;
     for (unsigned attempt = 0;; ++attempt)
     {
         DiagnosticScope diagnostics(impl_->interpreter->getCompilerInstance()->getDiagnostics());
@@ -711,6 +757,7 @@ bool CxxIncrementalGroup::ParseRequest(const cflat_cinterop::ExtractRequest& req
         if (ptu)
         {
             parsed = &*ptu;
+            parsedAttempt = attempt;
             break;
         }
         // Consume the Expected either way; an unchecked one aborts under LLVM assertions.
@@ -742,6 +789,7 @@ bool CxxIncrementalGroup::ParseRequest(const cflat_cinterop::ExtractRequest& req
             if (function->doesThisDeclarationHaveABody())
                 function->setBody(clang::CompoundStmt::CreateEmpty(context, /*NumStmts*/ 0,
                                                                    /*HasFPFeatures*/ false));
+        if (recoveredError.empty()) recoveredError = diagnostics.consumer.incompleteRecordError;
         if (impl_->verbose)
             std::cout << std::format("[verbose] incremental request dropped declarations after "
                                      "'{}':\n{}", error, dropped);
@@ -749,6 +797,9 @@ bool CxxIncrementalGroup::ParseRequest(const cflat_cinterop::ExtractRequest& req
     }
     error.clear();
     cflat_cinterop::ExtractRequest effective = req;
+    // A retry renamed the thunks with its tag; the extractor looks them up by that name.
+    if (parsedAttempt > 0 && !effective.cxxThunkSuffix.empty())
+        effective.cxxThunkSuffix = PrepareRetryChunk(effective.cxxThunkSuffix, parsedAttempt);
     for (auto& name : effective.cxxFunctionWrapperNames)
         for (const auto& [renamed, original] : renamedWrappers)
             if (name == original) name = renamed;
@@ -773,6 +824,7 @@ bool CxxIncrementalGroup::ParseRequest(const cflat_cinterop::ExtractRequest& req
         wrapperBatch ? nullptr : impl_->headerRoot, extraRoots,
         parsed->TheModule.get(), out, error, false, wrapperBatch ? nullptr : preludeRoot,
         &announced);
+    if (harvested && out.firstError.empty()) out.firstError = recoveredError;
     if (harvested && !renamedWrappers.empty())
     {
         llvm::Module* module = parsed->TheModule.get();
