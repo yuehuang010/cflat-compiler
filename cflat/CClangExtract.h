@@ -577,6 +577,7 @@ namespace cflat_cinterop
         std::string targetTriple;
         std::vector<RawSig> sigs;
         std::vector<RawFunctionTemplate> functionTemplates;
+        std::vector<std::string> classTemplateNames;
         std::vector<RawEnum> enums;
         std::vector<RawRecord> records;
         std::vector<RawTypedef> typedefs;

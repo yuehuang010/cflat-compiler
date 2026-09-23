@@ -3638,7 +3638,8 @@ bool LLVMBackend::ExtractCHeaderClang(const std::vector<std::string>& headerPath
                              std::string* outTargetTriple,
                              std::vector<cflat_cinterop::RawFunctionTemplate>* outFunctionTemplates,
                              std::vector<std::pair<std::string, std::string>>* outUsingDirectives,
-                             std::vector<std::pair<std::string, std::string>>* outNamespaceAliases)
+                             std::vector<std::pair<std::string, std::string>>* outNamespaceAliases,
+                             std::vector<std::string>* outClassTemplateNames)
 {
         if (headerPaths.empty()) return false;
         if (outHeaderFailure) *outHeaderFailure = false;
@@ -3868,6 +3869,7 @@ bool LLVMBackend::ExtractCHeaderClang(const std::vector<std::string>& headerPath
             *outLongDoubleIsIEEEDouble = raw.longDoubleIsIEEEDouble;
         if (outTargetTriple) *outTargetTriple = raw.targetTriple;
         if (outFunctionTemplates) *outFunctionTemplates = raw.functionTemplates;
+        if (outClassTemplateNames) *outClassTemplateNames = raw.classTemplateNames;
         if (outUsingDirectives) *outUsingDirectives = raw.usingDirectives;
         if (outNamespaceAliases) *outNamespaceAliases = raw.namespaceAliases;
         if (cxxMode) RegisterCxxUsingDirectives(raw.usingDirectives);
@@ -6983,9 +6985,13 @@ bool LLVMBackend::RequestCxxFunctionTemplate(const std::string& functionName,
         }
 
         auto cflatTypeOf = [&](const NamedVariable& arg) {
-            std::string type = arg.TypeAndValue.TypeName;
+            std::string type = !arg.LiteralIdentity.empty()
+                ? arg.LiteralIdentity : arg.TypeAndValue.TypeName;
             bool pointer = arg.TypeAndValue.Pointer;
             llvm::Type* valueType = arg.Primary != nullptr ? arg.Primary->getType() : arg.BaseType;
+            if (arg.LiteralIdentity.empty()
+                && (arg.InferSourceTypeName == "float" || arg.InferSourceTypeName == "double"))
+                type = arg.InferSourceTypeName;
             // The declared primitive identity outranks the machine-type guess below, which
             // cannot tell `char` from `i8` or `long` from `i64`.
             if (type.empty()) type = DeclaredPrimitiveIdentityForCxxArgument(arg, valueType);
@@ -7193,8 +7199,11 @@ bool LLVMBackend::RequestCxxFunctionTemplate(const std::string& functionName,
                 spelling = "const char *";
             else if (!CxxSpellingForCflatType(cflatType, spelling))
                 return noMatch("an argument type cannot be spelled in C++");
-            const size_t templateParameterIndex = i - (selected->kind
+            size_t templateParameterIndex = i - (selected->kind
                 == cflat_cinterop::RawFunctionTemplate::InstanceMember ? 1u : 0u);
+            if (selected->hasParameterPack && !selected->parameterTypes.empty()
+                && templateParameterIndex >= selected->parameterTypes.size() - 1)
+                templateParameterIndex = selected->parameterTypes.size() - 1;
             const bool forwardingReference = templateParameterIndex
                 < selected->forwardingReferenceParameters.size()
                 && selected->forwardingReferenceParameters[templateParameterIndex] != 0;
@@ -7204,7 +7213,8 @@ bool LLVMBackend::RequestCxxFunctionTemplate(const std::string& functionName,
                 if (cxxRvalue) spelling += " &&";
                 else spelling += " &";
             }
-            if (!arg.TypeAndValue.Pointer && IsCxxRecord(arg.TypeAndValue.TypeName)
+            if (!forwardingReference && !arg.TypeAndValue.Pointer
+                && IsCxxRecord(arg.TypeAndValue.TypeName)
                      && arg.Storage != nullptr && !arg.IsRvalue)
                 spelling += " &";
             const bool classRvalue = arg.IsRvalue && !arg.TypeAndValue.Pointer
@@ -7434,6 +7444,12 @@ bool LLVMBackend::RequestCxxFreeFunction(const std::string& functionName,
 
         auto argumentType = [&](const NamedVariable& arg) {
             TypeAndValue type = arg.TypeAndValue;
+            if (!arg.LiteralIdentity.empty())
+                type.TypeName = arg.LiteralIdentity;
+            // Preserve a floating source type for template deduction even if argument setup
+            // widened the LLVM value to match a candidate wrapper.
+            else if (arg.InferSourceTypeName == "float" || arg.InferSourceTypeName == "double")
+                type.TypeName = arg.InferSourceTypeName;
             // The declared primitive identity outranks the machine-type guess below, which
             // cannot tell `char` from `i8` or `long` from `i64`.
             if (type.TypeName.empty())
@@ -9905,10 +9921,16 @@ bool LLVMBackend::TryRequestCxxType(const std::string& baseName,
         if (!HasCxxImportGroup()) return false;
         if (typeArgs.empty() && GetGlobalVariableNV(cflatName).Storage != nullptr)
             return false;
-        // An undotted name is a CFlat name, not a C++ one - unless a C++ import recorded it as
-        // an alias of a specialization. A map hit, so the dot rule's cost gate is unchanged.
+        // Bare names are C++ candidates only when a header published that global template name.
+        const bool unqualifiedTemplateRequest = !typeArgs.empty()
+            && baseName.find('.') == std::string::npos
+            && std::any_of(cxxImportGroups_.begin(), cxxImportGroups_.end(),
+                [&](const CxxImportGroup& group) {
+                    return group.publishedNames.count(baseName) != 0;
+                });
         if (baseName.find('.') == std::string::npos
-            && !(typeArgs.empty() && cxxLazyAliasSpecializations_.count(baseName) != 0))
+            && !(typeArgs.empty() && cxxLazyAliasSpecializations_.count(baseName) != 0)
+            && !unqualifiedTemplateRequest)
             return false;
         if (IsCxxForeignTypeRegistered(cflatName) && !cxxTentativeTypes_.count(cflatName))
         {
@@ -10009,7 +10031,8 @@ bool LLVMBackend::TryRequestCxxType(const std::string& baseName,
          */
         {
             const std::string lead = baseName.substr(0, baseName.find('.'));
-            if (cxxForeignNamespaces_.count(lead) == 0 && !IsCxxForeignTypeRegistered(lead)
+            if (!unqualifiedTemplateRequest && cxxForeignNamespaces_.count(lead) == 0
+                && !IsCxxForeignTypeRegistered(lead)
                 && cxxCflatToCxxSpelling_.count(lead) == 0)
                 return skipped("its leading segment is not an imported C++ namespace");
         }
@@ -14098,6 +14121,7 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
         std::vector<std::pair<std::string, std::string>> hitUsingDirectives;
         std::vector<std::pair<std::string, std::string>> hitNamespaceAliases;
         std::vector<cflat_cinterop::RawFunctionTemplate> hitFunctionTemplates;
+        std::vector<std::string> hitClassTemplateNames;
         std::vector<cflat_cinterop::RawFunctionPointerAbi> hitFunctionPointerAbis;
         std::string hitCxxBitcode;
         bool hit = false;
@@ -14120,6 +14144,7 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
                     hitUsingDirectives = entry.usingDirectives;
                     hitNamespaceAliases = entry.namespaceAliases;
                     hitFunctionTemplates = entry.functionTemplates;
+                    hitClassTemplateNames = entry.classTemplateNames;
                     hitFunctionPointerAbis = entry.functionPointerAbis;
                     hitCxxBitcode = entry.cxxBitcode;
                     for (const auto& dep : entry.deps) hitDepPaths.push_back(dep.path);
@@ -14138,6 +14163,7 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
                     hitUsingDirectives = entry.usingDirectives;
                     hitNamespaceAliases = entry.namespaceAliases;
                     hitFunctionTemplates = entry.functionTemplates;
+                    hitClassTemplateNames = entry.classTemplateNames;
                     hitFunctionPointerAbis = entry.functionPointerAbis;
                     hitCxxBitcode = entry.cxxBitcode;
                     for (const auto& dep : entry.deps) hitDepPaths.push_back(dep.path);
@@ -14165,6 +14191,9 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
             RegisterCxxFunctionPointerAbis(hitFunctionPointerAbis);
             if (cppMode && activeCxxRequestGroup_ != nullptr)
             {
+                if (cxxGroupIndex < cxxImportGroups_.size())
+                    for (const auto& name : hitClassTemplateNames)
+                        cxxImportGroups_[cxxGroupIndex].publishedNames.insert(name);
                 // Cache-hit replay: the group still owns these names. Signature types are bound
                 // on first lookup here too, so the warm path matches the cold one.
                 PublishCxxGroupNames(activeCxxRequestGroup_->primary, hitRecords);
@@ -14239,6 +14268,9 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
                 RegisterCxxFunctionPointerAbis(diskEntry.functionPointerAbis);
                 if (cppMode && activeCxxRequestGroup_ != nullptr)
                 {
+                    if (cxxGroupIndex < cxxImportGroups_.size())
+                        for (const auto& name : diskEntry.classTemplateNames)
+                            cxxImportGroups_[cxxGroupIndex].publishedNames.insert(name);
                     PublishCxxGroupNames(activeCxxRequestGroup_->primary, diskEntry.records);
                 }
                 else
@@ -14294,6 +14326,7 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
         std::vector<std::pair<std::string, std::string>> aliases;
         std::vector<CTypeAliasEntry> typeAliases;
         std::vector<cflat_cinterop::RawFunctionTemplate> functionTemplates;
+        std::vector<std::string> classTemplateNames;
         std::vector<std::pair<std::string, std::string>> usingDirectives;
         std::vector<std::pair<std::string, std::string>> namespaceAliases;
         std::vector<cflat_cinterop::RawFunctionPointerAbi> functionPointerAbis;
@@ -14327,7 +14360,7 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
                                      &prereqFailure, &prereqMsg, &headerFailure, cppMode, &cxxBitcode,
                                      &functionPointerAbis, &longDoubleWidth,
                                      &longDoubleIsIEEEDouble, &targetTriple, &functionTemplates,
-                                     &usingDirectives, &namespaceAliases))
+                                     &usingDirectives, &namespaceAliases, &classTemplateNames))
             {
                 if (prereqFailure)
                     ReportOrphanHeader(headerPaths, prereqMsg, cppMode);
@@ -14354,6 +14387,7 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
             entry.targetTriple = targetTriple;
             entry.sigs  = sigs;
             entry.functionTemplates = functionTemplates;
+            entry.classTemplateNames = classTemplateNames;
             entry.enums = enums;
             entry.records = records;
             entry.macros = macros;
@@ -14399,6 +14433,9 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
             llvm::TimeTraceScope registerScope("CHeaderRegister", fileForLsp);
             if (cppMode)
                 RegisterCxxFunctionTemplates(functionTemplates, cxxGroupIndex, fileForLsp);
+            if (cppMode && cxxGroupIndex < cxxImportGroups_.size())
+                for (const auto& name : classTemplateNames)
+                    cxxImportGroups_[cxxGroupIndex].publishedNames.insert(name);
             RegisterCSignatures(sigs, fileForLsp);
             if (!cppMode) RegisterTypeAliasSymbols(typeAliases, false);
             RegisterCEnums(enums, fileForLsp, cppMode);

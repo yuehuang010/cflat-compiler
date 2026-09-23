@@ -162,9 +162,22 @@
 //     the deleting destructor, a throwing constructor, a trivial class), and `new T[n]` of a C++
 //     class allocated and freed through the SAME family - ::operator new[] / delete[] or the
 //     class's own - on `delete`, `delete[n]`, `delete[_]`, scope exit and unwind.
+//   By-value C++ parameter last-use identity (3340-3349): only the parameter slot moves;
+//     shadow locals copy, a later outer use stays last, and loop/lambda/prefix/repeated-arg
+//     neighbours retain their measured behavior.
+//   A C++ reference return and a derived pointer convert at a RETURN statement exactly as at a
+//     declaration or assignment (3370-3389): C& and const C& to C*, a receiver held in a CFlat
+//     struct field, single and non-primary base adjust, a pending destructor, a lambda body, a
+//     CFlat base-pointer parameter, and the brace-init and field-default stores.
+//     Test/errors/err_cpp_ref_return_escape.cb pins the refusals.
+//   C++ temporary binding to reference parameters (3390-3399): non-const `T&` rejects direct,
+//     moved, returned and operator-result temporaries; named lvalues, `const T&`, `T&&`, overload
+//     selection, CFlat C++ fields and C++ reference returns retain their value-category rules.
 
 import cpp "library/cpp_interop_basic.h";
 import cpp "library/cpp_interop_basic.cpp";
+import cpp "library/cpp_interop_twin.h";
+import cpp "library/cpp_interop_lastuse.h";
 // Inheritance and virtual dispatch. Definitions are out-of-line on purpose - every
 // virtual function needs a real symbol and the vtable needs a key function.
 import cpp "library/cpp_interop_poly.h";
@@ -211,6 +224,7 @@ import cpp "library/cpp_interop_stream.h";
 import cpp "library/cpp_interop_list.h";
 // Assignment into a live object from a temporary: instrumented, header-only.
 import cpp "library/cpp_interop_assign.h";
+import cpp "library/cpp_interop_refbinding.h";
 
 int cppListTakeValue = 0;
 void take<T>(list<T>* values, int expectedCount)
@@ -770,6 +784,99 @@ int onArrN = 4;
 int fnptr_add_one(int x) { return x + 1; }
 int apply_fnptr(function<int(int)> f, int x) { return f(x); }
 void fnptr_noop() {}
+// A C++ reference return and a derived pointer at a RETURN statement (3370-3389). Each helper
+// returns through the conversion the declaration and '=' forms already applied.
+cppi.RefCell* RrCell() { return cppi.ref_cell(); }
+cppi.RefCell* RrCellConst() { return cppi.ref_cell_const(); }
+struct RrHolder { cppi.RefBox box; };
+cppi.RefCell* RrHeld(RrHolder* h) { return h.box.get(); }
+cppi.RefCell* RrHeldConst(RrHolder* h) { return h.box.cget(); }
+cpppoly.Shape* RrShapeFromRef() { return cpppoly.circle_ref(); }
+cpppoly.Right* RrRightFromRef() { return cpppoly.both_ref(); }
+cpppoly.Right* RrRightFromPtr(cpppoly.Both* b) { return b; }
+cpppoly.Shape* RrShapeFromPtr(cpppoly.Circle* c) { return c; }
+cppi.RefCell* RrNested(int k)
+{
+    {
+        cpppoly.Circle pending = default;
+        if (k > 0) { return cppi.ref_cell(); }
+    }
+    return nullptr;
+}
+int RrReadRight(cpppoly.Right* r) { return r.rv; }
+struct RrSlots { cppi.RefCell* c; cpppoly.Right* r; };
+struct RrDefaults { cppi.RefCell* c = cppi.ref_cell(); cpppoly.Right* r = &cpppoly.both_ref(); };
+
+int lu_no_shadow(cpptw.Twin t) { return cpptw.take(t); }
+int lu_loop(cpptw.Twin t)
+{
+    int value = 0;
+    for (int i = 0; i < 2; i++) value = value + cpptw.take(t);
+    return value;
+}
+int lu_lambda(cpptw.Twin t)
+{
+    Lambda<int()> f = () => { return cpptw.take(t); };
+    return f() + cpptw.take(t);
+}
+int lu_shadow_alias(cpptw.Twin t)
+{
+    int value = cpptw.take(t);
+    {
+        cpptw.Twin t = cpptw.Twin(50);
+        cpptw.Twin* alias = &t;
+        value = value + cpptw.take(t);
+        value = value + alias->value();
+    }
+    return value;
+}
+int lu_after_block(cpptw.Twin t)
+{
+    int value = cpptw.take(t);
+    {
+        cpptw.Twin t = cpptw.Twin(50);
+        cpptw.Twin* alias = &t;
+        value = value + cpptw.take(t);
+        value = value + alias->value();
+    }
+    return value + cpptw.take(t);
+}
+int lu_with_global(cpptw.Twin t) { return cpptw.take(t) + cpptw.nested_global(); }
+int lu_prefix(cpptw.Twin t, cpptw.Twin t2)
+{
+    return cpptw.take(t2) * 100 + cpptw.take(t);
+}
+int lu_double_call(cpptw.Twin t) { return cpptw.take2(t, t); }
+int lu_plain_local()
+{
+    cpptw.Twin value = cpptw.Twin(50);
+    cpptw.Twin* alias = &value;
+    return cpptw.take(value) + alias->value();
+}
+int lu_shadow_exact(cpptw.Twin t)
+{
+    int value = cpptw.take(t);
+    { cpptw.Twin t = cpptw.Twin(50); value = value + cpptw.take(t); }
+    return value;
+}
+
+struct ExFieldHolder { cppref.Ex ex = cppref.Ex(5); };
+
+int CppTemporaryRefCases()
+{
+    cppref.Ex refBindLvalue = cppref.Ex(5);
+    if (cppref.take_ref(refBindLvalue) != 6 || refBindLvalue.v != 6)          return 3390;
+    if (cppref.take_cref(cppref.Ex(5)) != 1005)                              return 3391;
+    if (cppref.take_rref(cppref.Ex(5)) != 2005)                              return 3392;
+    if (cppref.choose_cref(cppref.Ex(5)) != 205)                             return 3393;
+    cppref.Ex refPickLvalue = cppref.Ex(5);
+    if (cppref.choose_rref(cppref.Ex(5)) != 405
+        || cppref.choose_rref(refPickLvalue) != 306 || refPickLvalue.v != 6) return 3394;
+    ExFieldHolder refField = default;
+    if (cppref.take_ref(refField.ex) != 6 || refField.ex.v != 6)             return 3395;
+    if (cppref.take_ref(cppref.ref_ex()) != 71 || cppref.ref_ex().v != 71)  return 3396;
+    return 0;
+}
 
 extern int main()
 {
@@ -4196,5 +4303,104 @@ extern int main()
         delete onT;
         if (onV != 0 || cppon.clsNew() != 1 || cppon.clsDel() != 1) return 3366;
     }
-    return 0;
+
+    // By-value C++ last-use identity: counts include the transfer into each CFlat helper.
+    {
+        cpptw.reset_counts();
+        int observed = lu_no_shadow(cpptw.Twin(7));
+        if (observed != 7 || cpptw.packed_counts() != 23) return 3340;
+    }
+    {
+        cpptw.reset_counts();
+        int observed = lu_loop(cpptw.Twin(7));
+        if (observed != 14 || cpptw.packed_counts() != 214) return 3341;
+    }
+    {
+        cpptw.reset_counts();
+        int observed = lu_lambda(cpptw.Twin(7));
+        if (observed != 14 || cpptw.packed_counts() != 124) return 3342;
+    }
+    {
+        cpptw.reset_counts();
+        int observed = lu_shadow_alias(cpptw.Twin(7));
+        if (observed != 107 || cpptw.packed_counts() != 125) return 3343;
+    }
+    {
+        cpptw.reset_counts();
+        int observed = lu_after_block(cpptw.Twin(7));
+        if (observed != 114 || cpptw.packed_counts() != 226) return 3344;
+    }
+    {
+        cpptw.reset_counts();
+        int observed = lu_with_global(cpptw.Twin(7));
+        if (observed != 37 || cpptw.packed_counts() != 23) return 3345;
+    }
+    {
+        cpptw.reset_counts();
+        int observed = lu_prefix(cpptw.Twin(7), cpptw.Twin(8));
+        if (observed != 807 || cpptw.packed_counts() != 46) return 3346;
+    }
+    {
+        cpptw.reset_counts();
+        int observed = lu_double_call(cpptw.Twin(7));
+        if (observed != 14 || cpptw.packed_counts() != 124) return 3347;
+    }
+    {
+        cpptw.reset_counts();
+        int observed = lu_plain_local();
+        if (observed != 100 || cpptw.packed_counts() != 102) return 3348;
+    }
+    {
+        cpptw.reset_counts();
+        int observed = lu_shadow_exact(cpptw.Twin(7));
+        if (observed != 57 || cpptw.packed_counts() != 125) return 3349;
+    }
+
+    // ---- a C++ reference return and a derived pointer at a RETURN statement (3370-3389) ----
+    // Pre-fix 3370-3373 and 3379 failed to COMPILE ("cannot return this value: its type does not
+    // match"), 3374, 3375 and 3380 were refused as an 'alias' escape, and 3376 / 3381 handed over
+    // Both's address unadjusted (rv read Left's lv). 3377 (primary base, offset 0) and 3378 (null
+    // stays null through the adjust) are accept-set controls that passed before.
+    {
+        cppi.RefCell* rc = RrCell();
+        rc.v = 773;                              // aliases the static cell, not a copy
+        if (cppi.ref_cell().v != 773)                                        return 3370;
+        if (RrCellConst() != rc || RrCellConst().v != 773)                   return 3371;
+        RrHolder rrh = default;
+        rrh.box.c.v = 5;
+        cppi.RefCell* held = RrHeld(&rrh);
+        held.v = 6;
+        if (rrh.box.c.v != 6)                                                return 3372;
+        if (RrHeldConst(&rrh) != held)                                       return 3373;
+        cpppoly.Shape* rrs = RrShapeFromRef();
+        if (rrs.area() != 50 || rrs.tag != 2)                                return 3374;
+        // Right is Both's NON-primary base: the returned pointer must be 16 bytes in, and the
+        // virtual call through Right's vtable must reach Both::r (rv + 2000).
+        cpppoly.Right* rrr = RrRightFromRef();
+        if (rrr.rv != 44 || rrr.r() != 2044)                                 return 3375;
+        cpppoly.Right* rrp = RrRightFromPtr(&cpppoly.both_ref());
+        if (rrp != rrr || rrp.r() != 2044)                                   return 3376;
+        if (RrShapeFromPtr(&cpppoly.circle_ref()).area() != 50)              return 3377;
+        if (RrRightFromPtr(nullptr) != nullptr)                              return 3378;
+        // The return leaves a block with a C++ destructor pending; it runs exactly once.
+        int rrCircleDtors = cpppoly.circle_dtors();
+        if (RrNested(1) != rc || cpppoly.circle_dtors() != rrCircleDtors + 1) return 3379;
+        function<cpppoly.Right*()> rrLam = () => cpppoly.both_ref();
+        if (rrLam() != rrr)                                                  return 3380;
+        // A derived pointer passed to a CFlat function's base-pointer parameter is adjusted too.
+        if (RrReadRight(&cpppoly.both_ref()) != 44)                          return 3381;
+        // The brace-init and field-default stores are the same conversion. Pre-fix 3382 stored
+        // the loaded RefCell bits as the pointer, 3383 / 3385 stored Both's address unadjusted,
+        // and 3384's field default was refused at compile time (the struct value met a pointer).
+        cpppoly.Both* rrBoth = &cpppoly.both_ref();
+        RrSlots rrSlots = { c = cppi.ref_cell(), r = rrBoth };
+        if (rrSlots.c != rc)                                                 return 3382;
+        if (rrSlots.r.rv != 44 || rrSlots.r != rrr)                          return 3383;
+        RrDefaults rrDefaults = default;
+        if (rrDefaults.c != rc)                                              return 3384;
+        if (rrDefaults.r.rv != 44 || rrDefaults.r.r() != 2044)               return 3385;
+    }
+    // ---- C++ temporary binding to reference parameters (3390-3399) -----------------------------
+    // Keep the added locals in a helper frame so the existing unwind tests keep their frame shape.
+    return CppTemporaryRefCases();
 }

@@ -85,6 +85,10 @@ namespace cpppoly
     // Right's base offset; reading rv proves it did.
     int read_right(const Right* p) noexcept;
     int call_right(const Right* p) noexcept;
+    // Reference returns of a derived object for the RETURN-statement legs (3370-3389): a CFlat
+    // `Right*` / `Shape*` function returning one must add the base offset (16 for Right).
+    Both& both_ref() noexcept;
+    Circle& circle_ref() noexcept;
 
     // M6b - class names that CONTAIN a declarator keyword as a substring ("const" inside
     // "constant", "class" inside "classBase"). Stripping the keyword as a substring loses the

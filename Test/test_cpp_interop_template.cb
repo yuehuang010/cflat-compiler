@@ -158,6 +158,14 @@
 //   `std.pair<T, U>(...)` resolves through clang's constructor-template wrapper for scalar,
 //     string, named-local, nested-pair, and vector-element construction, while C++ returns,
 //     default initialization, and free `std.make_pair` retain their value behavior (2580-2584).
+//   Variadic forwarding-reference packs preserve each element's lvalue/rvalue category through
+//     mutation, a mixed literal/move call, a nontrivial lvalue, zero arguments, and std::forward
+//     into a constructor (2600-2607).
+//   Bare global-scope C++ class templates resolve with direct, alias, constructor, nested-field,
+//     and signature spellings; colliding and unique CFlat generics retain their own values.
+//   `std.min` / `std.max` / `std.clamp` deduction with named variables and integer, negative, floating,
+//     character, bool, unsigned, and long literals; same-type controls, floating-literal identity,
+//     and an own-header `const T&` function-template control (2620-2640).
 
 import cpp "library/cpp_interop_basic.h";
 import cpp "library/cpp_interop_basic.cpp";
@@ -193,12 +201,25 @@ import cpp "library/cpp_interop_scoped_enum.h";
 import cpp "library/cpp_interop_nttp.h";
 import cpp "library/cpp_interop_nsstd.h";
 import cpp "library/cpp_interop_strop.h";
+import cpp "library/cpp_interop_mm.h";
 // std containers over std specializations over USER classes. Neither header
 // includes a standard header, so no single group can declare both halves on its own.
 import cpp "library/cpp_interop_nest.h";
 import cpp "library/cpp_interop_nest2.h";
 // Constructor TEMPLATES on user classes (section 2540-2559).
 import cpp "library/cpp_interop_tmplctor.h";
+import cpp "library/cpp_interop_global_scope.h";
+import cpp "library/cpp_interop_global_collision.h";
+
+// Keep these collision names local to this test program; the C++ fixture declares the same
+// CollisionBox template, while the CFlat template owns its ordinary instantiation.
+struct CollisionBox<T> { T value; };
+struct LocalOnly<T> { T value; };
+
+int read_globalbox(GlobalBox<int> value) { return value.value; }
+
+int mmLiteralType(float value) { return 1; }
+int mmLiteralType(double value) { return 2; }
 
 // Pre-fix this unscoped C++ enum initializer was rejected as non-constant at file scope. The
 // value leg below also proves the folded global retains its enum type at an enum-typed call.
@@ -3028,6 +3049,126 @@ extern int main()
             std.pair<int, std.pair<int, int>>(7, std.pair<int, int>(8, 9));
         if (nestedPair.first != 7 || nestedPair.second.first != 8
             || nestedPair.second.second != 9)                               return 2584;
+    }
+
+    // ---- C++ variadic forwarding-reference packs (section 2600-2619) ---------------------------
+    {
+        int packA = 1;
+        int packB = 2;
+        cppfwd.vbump(packA, packB);
+        if (packA != 2 || packB != 3)                                       return 2600;
+
+        int mixedPack = 4;
+        cppfwd.vbump(mixedPack, 9);
+        if (mixedPack != 5)                                                 return 2601;
+
+        cppfwd.reset_pack_counts();
+        cppfwd.PackItem packLvalue = cppfwd.PackItem(5);
+        cppfwd.PackItem packMove = cppfwd.PackItem(8);
+        int packResult = cppfwd.forward_pair(packLvalue, move packMove);
+        if (packResult != 608 || packLvalue.value != 6
+            || cppfwd.pack_moved_from() != -1 || cppfwd.pack_copy_count() != 0
+            || cppfwd.pack_move_count() != 1 || cppfwd.pack_alive_count() != 2) return 2602;
+
+        cppfwd.reset_pack_counts();
+        cppfwd.PackItem packObject = cppfwd.PackItem(11);
+        cppfwd.vbump(packObject);
+        if (packObject.value != 12 || cppfwd.pack_copy_count() != 0
+            || cppfwd.pack_alive_count() != 3)                              return 2605;
+
+        if (cppfwd.vbump() != 0)                                            return 2606;
+        cppfwd.PackItem packedConstructed = cppfwd.make_pack_item(3, 7);
+        if (packedConstructed.value != 37)                                 return 2607;
+    }
+
+    // ---- global-scope C++ class templates (section 2640-2659) ---------------------------------
+    {
+        GlobalBox<int> globalInt = default;
+        globalInt.value = 41;
+        if (globalInt.value != 41)                                          return 2640;
+
+        GlobalBox<double> globalDouble = default;
+        globalDouble.value = 4.5;
+        if (globalDouble.value != 4.5)                                      return 2641;
+
+        GlobalCtorBox<int> globalCtor = GlobalCtorBox<int>(5);
+        if (globalCtor.value != 5 || globalCtor.doubled() != 10)            return 2642;
+
+        GAlnBoxAlias<int> globalAlias = default;
+        if (globalAlias.value != 8)                                         return 2643;
+        GAlnBoxAlias<int> globalAliasCtor = GAlnBoxAlias<int>();
+        if (globalAliasCtor.value != 8)                                     return 2653;
+
+        global_scope_fixture.Holder nestedGlobal = default;
+        nestedGlobal.box.value = 17;
+        if (nestedGlobal.box.value != 17)                                   return 2644;
+        global_scope_fixture.Holder nestedEcho = default;
+        nestedEcho.box = global_scope_fixture.echo(nestedGlobal.box);
+        if (nestedEcho.box.value != 17)                                     return 2645;
+
+        GlobalBoxAlias globalParam = default;
+        globalParam.value = 13;
+        if (globalbox_take_global(globalParam) != 14)                       return 2646;
+
+        GlobalBox<int> globalParameter = default;
+        globalParameter.value = 19;
+        if (read_globalbox(globalParameter) != 19)                          return 2647;
+
+        CollisionBox<int> cflatCollision = default;
+        cflatCollision.value = 23;
+        if (cflatCollision.value != 23)                                    return 2648;
+
+        LocalOnly<int> cflatUnique = default;
+        cflatUnique.value = 29;
+        if (cflatUnique.value != 29)                                       return 2649;
+
+        cppt.Box<int> namespaced = cppt.Box<int>(3);
+        if (namespaced.get() != 3)                                         return 2650;
+
+        std.vector<int> globalVector = default;
+        globalVector.push_back(31);
+        if ((int)globalVector.size() != 1 || globalVector[0] != 31)       return 2651;
+    }
+
+    // ---- min/max template deduction from literals (section 2620-2639, 2660) --------------------------
+    {
+        int mmInt = 3;
+        if (std.min(mmInt, 5) != 3)                                         return 2620;
+        if (std.min(5, mmInt) != 3)                                         return 2621;
+        if (std.max(mmInt, 5) != 5)                                         return 2622;
+
+        int mmNegative = -3;
+        if (std.min(mmNegative, -1) != -3)                                 return 2623;
+
+        double mmDouble = 1.5;
+        if (std.min(mmDouble, 2.5) != 1.5)                                 return 2624;
+        float mmFloat = 1.5f;
+        if (std.min(mmFloat, 2.5f) != 1.5f)                                return 2625;
+        if (mmprobe.accept_float(2.5) != 2.5f)                             return 2637;
+        if (mmprobe.twice(2.5) != 5.0 || mmLiteralType(mmprobe.twice(2.5)) != 2)
+            return 2638;
+        if (mmprobe.twice(2.5f) != 5.0f || mmLiteralType(mmprobe.twice(2.5f)) != 1)
+            return 2639;
+        if (mmLiteralType(1.5) != 1)                                       return 2660;
+
+        char mmChar = 'a';
+        if (std.min(mmChar, 'z') != 'a')                                   return 2626;
+        bool mmBool = false;
+        if (std.min(mmBool, true) != false)                                return 2627;
+        unsigned mmUnsigned = 3u;
+        if (std.min(mmUnsigned, 5u) != 3u)                                 return 2628;
+        long mmLong = 3L;
+        if (std.min(mmLong, 5L) != 3L)                                     return 2629;
+
+        int mmOther = 4;
+        if (std.min(mmInt, mmOther) != 3)                                  return 2630;
+        if (std.min(5, 6) != 5)                                             return 2631;
+        if (mmprobe.byref(mmInt, 5) != 3)                                   return 2632;
+        if (std.clamp(mmInt, 1, 10) != 3)                                  return 2633;
+        if (std.max(5, mmInt) != 5)                                         return 2634;
+        int mmExprOther = 5;
+        if (std.min(mmInt, mmExprOther + 1) != 3)                           return 2635;
+        if (std.max(mmInt + 1, mmExprOther) != 5)                           return 2636;
     }
 
     return 0;

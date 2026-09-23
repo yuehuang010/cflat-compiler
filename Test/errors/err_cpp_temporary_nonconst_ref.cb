@@ -1,0 +1,23 @@
+// A C++ non-const lvalue reference accepts named lvalues but cannot bind a temporary.
+import cpp "cpp_interop_refbinding.h";
+
+extern int main()
+{
+    expect_error("non-const lvalue reference") {
+        cppref.take_ref(cppref.Ex(5));
+    }
+    expect_error("non-const lvalue reference") {
+        cppref.Ex value = cppref.Ex(5);
+        cppref.take_ref(move value);
+    }
+    expect_error("non-const lvalue reference") {
+        cppref.take_ref(cppref.make_ex(5));
+    }
+    expect_error("non-const lvalue reference") {
+        cppref.take_ref(cppref.Ex(2) + cppref.Ex(3));
+    }
+    expect_error("is a non-const lvalue reference and cannot bind an rvalue") {
+        cppref.RefOwner owner = cppref.RefOwner(cppref.Ex(5));
+    }
+    return 0;
+}

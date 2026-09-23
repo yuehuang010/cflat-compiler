@@ -1,0 +1,18 @@
+// A C++ reference return converts to a BORROWED pointer at a return statement. The refusals:
+// an owning `unique C*` return, a reference into a frame-local receiver, and a private base.
+import cpp "cpp_interop_basic.h";
+
+expect_error("cannot return borrowed value 'cppi.ref_cell' as 'unique<cppi.RefCell>'") {
+    unique cppi.RefCell* RrOwned() { return cppi.ref_cell(); }
+}
+expect_error("cannot return the C++ reference result of 'b.get()' as 'cppi.RefCell*': it refers into a local object") {
+    cppi.RefCell* RrLocalReceiver() { cppi.RefBox b = default; return b.get(); }
+}
+expect_error("cannot convert 'cppi.PrivBoxDerived*' to 'cppi.BaseBox<int>*' for the return value: 'cppi.BaseBox<int>' is not a PUBLIC base of 'cppi.PrivBoxDerived'") {
+    cppi.BaseBox<int>* RrPrivateBase(cppi.PrivBoxDerived* p) { return p; }
+}
+
+extern int main()
+{
+    return 0;
+}

@@ -15,6 +15,7 @@
 #include <memory>
 #include <string>
 #include <tuple>
+#include <utility>
 #include <vector>
 
 // This dependent callback alias is intentionally never instantiated. Its canonical function
@@ -1481,6 +1482,14 @@ using GlobalBoxAlias2 = GlobalBox<int>;
 typedef GlobalBox<double> GlobalBoxTypedef;
 inline int globalbox_take_global(const GlobalBox<int>& v) noexcept { return v.value + 1; }
 
+template <class T>
+struct GlobalCtorBox
+{
+    T value;
+    explicit GlobalCtorBox(T v) noexcept : value(v) {}
+    T doubled() const noexcept { return value + value; }
+};
+
 // An ALIAS TEMPLATE (`template<class T> using ... = ...;`), at global scope and inside a
 // namespace. The DECLARATION spelling always resolved through the type request; the CONSTRUCTOR
 // spelling (`GCellAlias<int>()`) reached function lookup instead, where an alias template has no
@@ -1786,6 +1795,57 @@ namespace cppnp
 // argument's value category, including an lvalue that the body mutates.
 namespace cppfwd
 {
+    inline int packCopies = 0;
+    inline int packMoves = 0;
+    inline int packAlive = 0;
+    inline int packMovedFrom = 0;
+
+    struct PackItem
+    {
+        int value;
+        PackItem(int v) : value(v) { ++packAlive; }
+        PackItem(int x, int y) : value(x * 10 + y) { ++packAlive; }
+        PackItem(const PackItem& other) : value(other.value)
+        { ++packCopies; ++packAlive; }
+        PackItem(PackItem&& other) : value(other.value)
+        { other.value = -1; ++packMoves; ++packAlive; }
+        ~PackItem() { --packAlive; }
+        PackItem& operator++() { ++value; return *this; }
+    };
+
+    inline void reset_pack_counts() { packCopies = 0; packMoves = 0; }
+    inline int pack_copy_count() { return packCopies; }
+    inline int pack_move_count() { return packMoves; }
+    inline int pack_alive_count() { return packAlive; }
+    inline int pack_moved_from() { return packMovedFrom; }
+
+    template <typename... A>
+    int vbump(A&&... values)
+    {
+        ((++values), ...);
+        return 0;
+    }
+
+    inline int dispatch_pack(PackItem& lhs, PackItem&& rhs)
+    {
+        PackItem moved(static_cast<PackItem&&>(rhs));
+        packMovedFrom = rhs.value;
+        ++lhs.value;
+        return lhs.value * 100 + moved.value;
+    }
+
+    template <typename... A>
+    int forward_pair(A&&... values)
+    {
+        return dispatch_pack(std::forward<A>(values)...);
+    }
+
+    template <typename... A>
+    PackItem make_pack_item(A&&... values)
+    {
+        return PackItem(std::forward<A>(values)...);
+    }
+
     template <typename U>
     int free_forward(U&& value)
     {

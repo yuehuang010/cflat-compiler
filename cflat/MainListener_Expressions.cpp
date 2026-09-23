@@ -12290,6 +12290,19 @@ bool MainListener::EmitOneFieldInit(
                 std::format("field '{}.{}'", displayTypeName, fieldName)))
             return false;
 
+        // `{ f = cppRefCall() }` binds the referent and `{ f = derivedPtr }` shifts to the base
+        // subobject: the brace twin of the declaration-initializer and `=` legs.
+        {
+            const std::string braceDest = std::format("field '{}.{}'", displayTypeName, fieldName);
+            if (val != nullptr && val->getType()->isStructTy())
+                if (auto* refAddr = compiler->CxxReferenceResultAsPointer(
+                        fieldType, rightNV, braceDest))
+                    val = refAddr;
+            if (val != nullptr)
+                val = compiler->AdjustCxxPointerForStore(
+                    fieldType, rightNV.TypeAndValue, val, braceDest);
+        }
+
         // A string LITERAL is a 'const char*', never a 'T*' - the brace leg of the same gate the
         // declarator and `=` paths apply, so no spelling can seed a struct pointer with characters.
         if (RejectStringLiteralIntoStructPointer(
@@ -12660,6 +12673,17 @@ llvm::Value* MainListener::ParseFieldDefaultInitializer(
             return val;
         RejectCodeValueIntoDataSlot(ae, nv, field, "default-initialize",
             std::format("field '{}.{}' of", structName, field.VariableName));
+        // The field-DEFAULT twin of the declaration-initializer and `=` legs: a C++ reference
+        // result binds the referent, a derived pointer shifts to the base subobject.
+        {
+            const std::string defaultDest = std::format("field '{}.{}'", structName,
+                                                        field.VariableName);
+            if (val != nullptr && val->getType()->isStructTy())
+                if (auto* refAddr = compiler->CxxReferenceResultAsPointer(field, nv, defaultDest))
+                    val = refAddr;
+            if (val != nullptr)
+                val = compiler->AdjustCxxPointerForStore(field, nv.TypeAndValue, val, defaultDest);
+        }
         // A string LITERAL is a 'const char*', never a 'T*' - the field-DEFAULT leg of the same
         // gate the declarator, `=`, brace-init, return and argument sites apply.
         RejectStringLiteralIntoStructPointer(ae, field, val,

@@ -2824,6 +2824,8 @@ bool LLVMBackend::TryLoadCHeaderDiskCache(
         // registered through their class record instead.
         // v86 exports class-scope operator new / delete / new[] / delete[] members: an older
         // record has none, so `new T` of such a class would call the global allocator.
+        // v87 recognizes forwarding references in C++ function parameter packs.
+        // v88 publishes global class and alias-template names for bare CFlat type requests.
         if (version != kCHeaderCacheVersion) return cacheMiss("cache version");
 
         if (!expectedRequestKey.empty()
@@ -2878,6 +2880,8 @@ bool LLVMBackend::TryLoadCHeaderDiskCache(
             if (j.contains("functionTemplates"))
                 for (const auto& t : j["functionTemplates"])
                     entry.functionTemplates.push_back(FunctionTemplateFromJson(t, files));
+            if (j.contains("classTemplateNames"))
+                entry.classTemplateNames = j["classTemplateNames"].to_string_vector();
             if (j.contains("enums"))      for (const auto& e : j["enums"])      entry.enums.push_back(EnumFromJson(e));
             if (j.contains("records"))    for (const auto& r : j["records"])    entry.records.push_back(RecordFromJson(r, files));
             if (j.contains("macros"))     for (const auto& m : j["macros"])     entry.macros.push_back(MacroFromJson(m, files));
@@ -3240,6 +3244,8 @@ void LLVMBackend::WriteCHeaderDiskCache(
         // bitcode, and records virtual-base offsets (vbs).
         // v85 omits out-of-line C++ static data members from the bare-global list.
         // v86 exports class-scope operator new / delete / new[] / delete[] members.
+        // v87 recognizes forwarding references in C++ function parameter packs.
+        // v88 publishes global class and alias-template names for bare CFlat type requests.
         j["version"] = kCHeaderCacheVersion;
         j["mtime"]   = (int64_t)mtime.time_since_epoch().count();
         j["hash"]    = contentHash;
@@ -3292,6 +3298,7 @@ void LLVMBackend::WriteCHeaderDiskCache(
         for (const auto& t : entry.functionTemplates)
             functionTemplates.push_back(FunctionTemplateToJson(t, &files));
         j["functionTemplates"] = functionTemplates;
+        j["classTemplateNames"] = entry.classTemplateNames;
         nlohmann::json enums = nlohmann::json::array();
         for (const auto& e : entry.enums) enums.push_back(EnumToJson(e));
         j["enums"] = enums;

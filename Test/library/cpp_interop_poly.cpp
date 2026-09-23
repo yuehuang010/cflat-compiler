@@ -55,6 +55,8 @@ namespace cpppoly
 
     int read_right(const Right* p) noexcept { return p->rv; }
     int call_right(const Right* p) noexcept { return p->r(); }
+    Both& both_ref() noexcept { static Both b; return b; }
+    Circle& circle_ref() noexcept { static Circle c; return c; }
 
     QualNames::QualNames() noexcept { lv = 55; cv = 66; bv = 77; }
     QualNames::~QualNames() noexcept {}

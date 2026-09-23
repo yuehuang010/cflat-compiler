@@ -2328,12 +2328,11 @@ inline Ctx* AsRuleCtx(antlr4::tree::ParseTree* node)
     return rule->getRuleIndex() == RuleIndexOf<Ctx>::value ? static_cast<Ctx*>(rule) : nullptr;
 }
 
-// A foreign C++ by-value parameter is a real object in the callee. Moving from it is safe only
-// when this bare occurrence is its final proven use. The scan is deliberately conservative:
-// every other occurrence after the site, a nested lambda use, or a loop use keeps the copy.
+// A foreign C++ by-value parameter is a real object in the callee. Move only its own final
+// bare use; a shadowing local is a different slot. Loop and nested-lambda uses stay conservative.
 // Unknown or deleted copy constructors also keep the established copy diagnostic.
 inline bool IsLastUseOfForeignCxxParam(
-    const LLVMBackend* compiler, antlr4::ParserRuleContext* useCtx,
+    LLVMBackend* compiler, antlr4::ParserRuleContext* useCtx,
     const LLVMBackend::NamedVariable& source)
 {
     if (compiler == nullptr || useCtx == nullptr || source.FieldName.size() != 0
@@ -2352,6 +2351,9 @@ inline bool IsLastUseOfForeignCxxParam(
     const std::string name = source.CallerName.empty()
         ? source.TypeAndValue.VariableName : source.CallerName;
     if (name.empty() || !compiler->IsFunctionParameter(name) || useCtx->getText() != name)
+        return false;
+    const auto parameter = compiler->GetFunctionArgument(name);
+    if (parameter.Storage == nullptr || source.Storage != parameter.Storage)
         return false;
 
     CFlatParser::FunctionDefinitionContext* function = nullptr;
@@ -2376,12 +2378,47 @@ inline bool IsLastUseOfForeignCxxParam(
         bool inNestedLambda = false;
     };
     std::vector<Occurrence> occurrences;
+    // Declaration contexts supply lexical slot identity for later uses not visited yet.
+    auto isShadowedByLocal = [&](CFlatParser::PrimaryExpressionContext* primary) {
+        const size_t token = (size_t)primary->getStart()->getTokenIndex();
+        for (auto* parent = primary->parent; parent != nullptr && parent != body;
+             parent = parent->parent)
+        {
+            auto* block = dynamic_cast<CFlatParser::CompoundStatementContext*>(parent);
+            if (block == nullptr || block->blockItemList() == nullptr) continue;
+            for (auto* item : block->blockItemList()->blockItem())
+            {
+                if (item->getStart() == nullptr
+                    || (size_t)item->getStart()->getTokenIndex() >= token)
+                    continue;
+                if (auto* declaration = item->declaration())
+                {
+                    if (declaration->initDeclaratorList() == nullptr) continue;
+                    for (auto* init : declaration->initDeclaratorList()->initDeclarator())
+                    {
+                        auto* declarator = init->declarator();
+                        auto* direct = declarator != nullptr ? declarator->directDeclarator() : nullptr;
+                        if (direct != nullptr && direct->Identifier() != nullptr
+                            && direct->Identifier()->getText() == name)
+                            return true;
+                    }
+                }
+                if (auto* destructuring = item->destructuringDeclaration())
+                    for (auto* entry : destructuring->destructuringEntry())
+                        if (entry->Identifier() != nullptr
+                            && entry->Identifier()->getText() == name)
+                            return true;
+            }
+        }
+        return false;
+    };
     auto collect = [&](auto&& self, antlr4::tree::ParseTree* node) -> void {
         if (node == nullptr) return;
         if (auto* primary = dynamic_cast<CFlatParser::PrimaryExpressionContext*>(node))
         {
             if (primary->genericIdentifier() != nullptr && primary->getText() == name)
             {
+                if (isShadowedByLocal(primary)) return;
                 bool inLoop = false;
                 bool inNestedLambda = false;
                 for (auto* parent = primary->parent; parent != nullptr && parent != body;

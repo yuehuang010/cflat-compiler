@@ -1,0 +1,15 @@
+// Conflicting template argument deduction for int and floating-point arguments remains refused.
+import cpp "algorithm";
+
+extern int main()
+{
+    expect_error("C++ free function 'std.min' could not be bound (clang: no matching function for call to 'min')") {
+        int value = 3;
+        std.min(value, 2.5);
+    }
+    expect_error("C++ free function 'std.min' could not be bound (clang: no matching function for call to 'min')") {
+        float value = 3.0f;
+        std.min(value, 2.5);
+    }
+    return 0;
+}

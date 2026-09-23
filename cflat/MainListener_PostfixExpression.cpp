@@ -6308,6 +6308,18 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     // The declared element type, for generic inference only: the
                                     // TypeName below stays empty for primitives on purpose.
                                     argVar.InferSourceTypeName = argNV.TypeAndValue.TypeName;
+                                    if (argVar.InferSourceTypeName.empty() && argNV.BaseType != nullptr)
+                                    {
+                                        if (argNV.BaseType->isFloatTy()) argVar.InferSourceTypeName = "float";
+                                        else if (argNV.BaseType->isDoubleTy()) argVar.InferSourceTypeName = "double";
+                                    }
+                                    if (auto* storage = llvm::dyn_cast_or_null<llvm::AllocaInst>(argNV.Storage))
+                                    {
+                                        if (storage->getAllocatedType()->isFloatTy())
+                                            argVar.InferSourceTypeName = "float";
+                                        else if (storage->getAllocatedType()->isDoubleTy())
+                                            argVar.InferSourceTypeName = "double";
+                                    }
                                     // C++ scoped enums keep their identity at the overload boundary;
                                     // their lowered integer representation is not a CFlat conversion.
                                     if (argNV.TypeAndValue.IsScopedEnum
@@ -6318,9 +6330,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                         argVar.TypeAndValue.EnumBacking = argNV.TypeAndValue.EnumBacking;
                                         argVar.TypeAndValue.IsScopedEnum = true;
                                     }
-                                    // An unsuffixed integer literal lowers at its smallest width but
-                                    // ranks as 'int' (C++) in overload resolution.
-                                    argVar.LiteralIdentity = LLVMBackend::UnsuffixedIntegerLiteralIdentity(
+                                    // Preserve source literal identity across lowered-width inference.
+                                    argVar.LiteralIdentity = LLVMBackend::LiteralIdentityForOverload(
                                         namedArgument->assignmentExpression()->getText());
                                     // Preserve unsigned-integer TypeName so Upconvert can choose ZExt over SExt.
                                     if (argNV.TypeAndValue.IsUnsignedInteger() != -1)

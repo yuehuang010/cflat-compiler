@@ -148,12 +148,38 @@ bool LLVMBackend::ArgumentConvertsToBoolParameter(const NamedVariable& arg, cons
             && !arg.BaseType->isIntegerTy(1);
 }
 
-// An unsuffixed integer literal ranks as `int` (C++); a value past `int` ranks as the first of
-// `long`, `i64` that holds it on the target. Only a bare, optionally negated literal qualifies.
-std::string LLVMBackend::UnsuffixedIntegerLiteralIdentity(std::string_view text)
+// Record C++ identities before literal values lose source spelling and narrow during lowering.
+std::string LLVMBackend::LiteralIdentityForOverload(std::string_view text)
 {
+        if (text.size() >= 3 && text.front() == '\'' && text.back() == '\'')
+            return "char";
         const bool negative = !text.empty() && text.front() == '-';
-        std::string_view digits = negative ? text.substr(1) : text;
+        const bool signedLiteral = negative || (!text.empty() && text.front() == '+');
+        std::string_view digits = signedLiteral ? text.substr(1) : text;
+        if (digits.empty())
+            return "";
+        if (!std::isdigit((unsigned char)digits.front()) && digits.front() != '.')
+            return "";
+        const bool hexadecimal = digits.size() > 2 && digits[0] == '0'
+            && (digits[1] == 'x' || digits[1] == 'X');
+        const bool hasFloatSuffix = digits.back() == 'f' || digits.back() == 'F';
+        const bool hasLongFloatSuffix = digits.back() == 'l' || digits.back() == 'L';
+        std::string_view floatingDigits = digits;
+        if (hasFloatSuffix || hasLongFloatSuffix) floatingDigits.remove_suffix(1);
+        const bool floatingLiteral = floatingDigits.find('.') != std::string_view::npos
+            || (hexadecimal
+                ? floatingDigits.find_first_of("pP") != std::string_view::npos
+                : floatingDigits.find_first_of("eE") != std::string_view::npos);
+        if (floatingLiteral)
+            return hasLongFloatSuffix ? "" : hasFloatSuffix ? "float" : "double";
+        if (hasFloatSuffix)
+            return "";
+        bool explicitLong = false;
+        if (!digits.empty() && (digits.back() == 'l' || digits.back() == 'L'))
+        {
+            explicitLong = true;
+            digits.remove_suffix(1);
+        }
         int base = 10;
         bool hex = false;
         if (digits.size() > 2 && digits[0] == '0' && (digits[1] == 'x' || digits[1] == 'X'))
@@ -178,7 +204,10 @@ std::string LLVMBackend::UnsuffixedIntegerLiteralIdentity(std::string_view text)
         uint64_t value = 0;
         auto parsed = std::from_chars(digits.data(), digits.data() + digits.size(), value, base);
         if (parsed.ec != std::errc() || parsed.ptr != digits.data() + digits.size())
-            return "";   // a suffix, an operator, or out of u64 range
+            return "";   // an unsupported suffix, an operator, or out of u64 range
+
+        if (explicitLong)
+            return "long";
 
         const uint64_t intMax = (uint64_t)std::numeric_limits<int32_t>::max();
         if (negative ? value <= intMax + 1 : value <= intMax)
@@ -3134,6 +3163,20 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
             firstCallLocation_.emplace(candidate.Function->getName().str(),
                 std::make_pair(currentLine, currentColumn));
 
+        // The pointer arm holds for a CFlat callee too: overload scoring accepts a derived C++
+        // pointer for any public-base parameter, so the argument must arrive adjusted either way.
+        if (!candidate.IsCxx && !candidate.Recipe.hasLowering)
+            for (size_t i = 0; i < candidate.Parameters.size() && i < matched.size()
+                            && i < argList.size(); ++i)
+            {
+                const TypeAndValue& at = matched[i].TypeAndValue;
+                const TypeAndValue& pt = candidate.Parameters[i];
+                uint64_t off = 0;
+                bool inaccessible = false;
+                if (IsCxxDerivedToBasePointer(at, pt)
+                    && FindCxxBaseOffset(at.TypeName, pt.TypeName, off, inaccessible))
+                    argList[i] = EmitCxxBaseAdjust(argList[i], off);
+            }
         llvm::Value* rawReturnCountSlot = nullptr;
         if (!candidate.Recipe.hasLowering && !candidate.External)
         {

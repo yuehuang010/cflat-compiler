@@ -685,6 +685,16 @@ namespace cppi
     // through that pointer is visible to the next call - a copy would hide it.
     struct RefCell { int v; };
     inline RefCell& ref_cell() noexcept { static RefCell cell{770}; return cell; }
+    // RETURN-statement twins (3370-3389): a const reference to the same cell, a second cell for
+    // '?:', and a member accessor whose referent lives inside its receiver.
+    inline const RefCell& ref_cell_const() noexcept { return ref_cell(); }
+    inline RefCell& ref_cell_other() noexcept { static RefCell cell{880}; return cell; }
+    struct RefBox
+    {
+        RefCell c;
+        RefCell& get() noexcept { return c; }
+        const RefCell& cget() const noexcept { return c; }
+    };
     int take_either(const Tracked& t) noexcept;
     int take_either(Tracked&& t) noexcept;
     std::unique_ptr<Tracked> make_tracked_ptr(int payload) noexcept;

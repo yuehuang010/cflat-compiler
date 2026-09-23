@@ -670,6 +670,7 @@ namespace cflat_cinterop
             std::vector<QualType> functionPointerAbiWork;
             std::unordered_set<std::string> functionPointerAbiSeen;
             std::unordered_set<const FunctionTemplateDecl*> emittedFunctionTemplates;
+            std::unordered_set<std::string> emittedClassTemplateNames;
             // cxxMode only: (index into out.records, index into that record's members, decl).
             struct MemberAbiWork { size_t recordIdx; size_t memberIdx; const CXXMethodDecl* md; };
             std::vector<MemberAbiWork> memberAbiWork;
@@ -1077,8 +1078,10 @@ namespace cflat_cinterop
                     result.parameterTypes.push_back(
                         fd->getParamDecl(i)->getType().getAsString());
                     bool forwardingReference = false;
-                    if (const auto* rvalueReference = fd->getParamDecl(i)->getType()
-                            ->getAs<RValueReferenceType>())
+                    QualType parameterType = fd->getParamDecl(i)->getType();
+                    if (const auto* packExpansion = parameterType->getAs<PackExpansionType>())
+                        parameterType = packExpansion->getPattern();
+                    if (const auto* rvalueReference = parameterType->getAs<RValueReferenceType>())
                         if (const auto* templateParameter = rvalueReference->getPointeeType()
                                 ->getAs<TemplateTypeParmType>())
                             for (const NamedDecl* functionParameter : *ftd->getTemplateParameters())
@@ -1101,6 +1104,21 @@ namespace cflat_cinterop
                 result.line = line;
                 result.col = col;
                 st.out.functionTemplates.push_back(std::move(result));
+                return true;
+            }
+
+            bool VisitClassTemplateDecl(ClassTemplateDecl* ctd)
+            {
+                if (!st.req.cxxMode || ctd == nullptr
+                    || !ctd->getDeclContext()->isTranslationUnit())
+                    return true;
+                std::string file;
+                int line = 1, col = 0;
+                LocOfRaw(ctd, file, line, col);
+                if (st.req.requireInScope && !PathInScope(file, st.normDirs)) return true;
+                const std::string name = CxxQualifiedName(ctd->getTemplatedDecl());
+                if (!name.empty() && st.emittedClassTemplateNames.insert(name).second)
+                    st.out.classTemplateNames.push_back(name);
                 return true;
             }
 
@@ -2799,6 +2817,9 @@ namespace cflat_cinterop
                 t.qualifiedName = CxxQualifiedName(alias);
                 LocOfRaw(atd, t.file, t.line, t.col);
                 if (st.req.requireInScope && !PathInScope(t.file, st.normDirs)) return true;
+                if (atd->getDeclContext()->isTranslationUnit() && !t.qualifiedName.empty()
+                    && st.emittedClassTemplateNames.insert(t.qualifiedName).second)
+                    st.out.classTemplateNames.push_back(t.qualifiedName);
                 t.isCxxAliasTemplate = true;
                 t.cxxAliasPattern = alias->getUnderlyingType().getAsString(ctx.getPrintingPolicy());
                 t.underlying = t.cxxAliasPattern;

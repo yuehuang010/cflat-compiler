@@ -964,11 +964,66 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
                     break;
                 }
         }
-        bool coreUniqueRawReturn = !aliasRefReturn
+        /*
+         * `C* f() { return cppRefCall(); }` binds to the referent exactly as the declaration and
+         * `=` forms do (return converts like assignment), base-adjusted for a `Base*` return. The
+         * pointer is a BORROW, never owning: a `unique C*` return keeps the alias marker so the
+         * owned-pointee gate below refuses it, and a reference into a frame-local receiver is
+         * refused here because the object dies at this return.
+         */
+        llvm::Value* cxxRefReturnAddr = nullptr;
+        if (!aliasRefReturn && assignExpr != nullptr)
+        {
+            const auto& retTV = compiler->currentFunctionReturnTV;
+            LLVMBackend::TypeAndValue refDest = retTV;
+            const bool uniqueDest = !retTV.Pointer && compiler->IsCoreUniqueType(retTV.TypeName);
+            if (uniqueDest)
+            {
+                refDest = LLVMBackend::TypeAndValue{};
+                refDest.TypeName = MangledGenericArgument(*compiler, retTV.TypeName);
+                refDest.Pointer = true;
+            }
+            cxxRefReturnAddr = compiler->CxxReferenceResultAsPointer(
+                refDest, returnNV, "the return value");
+            if (cxxRefReturnAddr != nullptr)
+            {
+                // The call's receiver (`this`, argument 0 of a method) rooted at an alloca is a
+                // local object destroyed at this return; the reference would dangle.
+                auto* call = llvm::dyn_cast<llvm::CallBase>(returnNV.Storage->stripPointerCasts());
+                auto* callee = call != nullptr ? call->getCalledFunction() : nullptr;
+                const auto* sym = callee != nullptr ? compiler->FindSymbolForFunction(callee)
+                                                    : nullptr;
+                if (!retTV.IsAlias && sym != nullptr && sym->IsMethod && call->arg_size() > 0
+                    && PointsIntoStackFrame(call->getArgOperand(0)))
+                    LogErrorContext(errCtx, std::format(
+                        "cannot return the C++ reference result of '{}' as '{}': it refers into "
+                        "a local object that is destroyed when the function returns, so the "
+                        "pointer would dangle; declare the return type 'alias {}' to manage the "
+                        "lifetime by hand",
+                        retText, SpellType(*compiler, retTV), SpellType(*compiler, retTV)));
+                returnNV.Primary = cxxRefReturnAddr;
+                returnNV.BaseType = cxxRefReturnAddr->getType();
+                returnNV.Storage = nullptr;
+                returnNV.TypeAndValue.TypeName = refDest.TypeName;
+                returnNV.TypeAndValue.Pointer = true;
+                returnNV.TypeAndValue.IsAlias = uniqueDest;
+                returnNV.IsAliasBorrow = false;
+                returnNV.IsOwning = false;
+            }
+        }
+        bool coreUniqueRawReturn = !aliasRefReturn && cxxRefReturnAddr == nullptr
             && compiler->IsCoreUniqueToRawPointer(returnNV, compiler->currentFunctionReturnTV);
         auto right = coreUniqueRawReturn
             ? compiler->CreateCoreUniqueRawPointerCall(returnNV, compiler->currentFunctionReturnTV)
+            : cxxRefReturnAddr != nullptr ? cxxRefReturnAddr
             : (aliasRefReturn ? returnNV.Storage : LoadNamedVariable(returnNV));
+        // M6 - `Base* f() { return derivedPtr; }` shifts to the base subobject, the RETURN twin of
+        // the declaration-initializer and `=` legs (a no-op for a primary base).
+        if (right != nullptr && cxxRefReturnAddr == nullptr && !aliasRefReturn
+            && compiler->currentFunctionReturnTV.Pointer && returnNV.TypeAndValue.Pointer)
+            right = compiler->AdjustCxxPointerForStore(
+                compiler->currentFunctionReturnTV, returnNV.TypeAndValue, right,
+                "the return value");
         if (coreUniqueRawReturn)
             returnNV.TypeAndValue = compiler->currentFunctionReturnTV;
 

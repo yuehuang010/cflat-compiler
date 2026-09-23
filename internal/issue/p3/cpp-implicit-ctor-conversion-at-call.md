@@ -60,10 +60,3 @@ issue stays filed with no in-repo repro. These rows are now value legs 2213-2220
 
 The non-const `Options&` row WAS fixed on fix/cpp-explicit-ctor (`CanImplicitlyConstructCxxClass`
 now refuses a user-defined conversion into a non-const lvalue reference).
-
-## Second, separate defect found while measuring (still open)
-
-A C++ TEMPORARY binds to a non-const lvalue reference parameter: `cppexp.take_ex_ref(cppexp.Ex(5))`
-compiles and runs on master and on fix/cpp-explicit-ctor, while clang says
-"non-const lvalue reference to type 'Ex' cannot bind to a temporary". That is argument BINDING, not
-conversion - a different site from the one this file is about.

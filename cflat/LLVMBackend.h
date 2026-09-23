@@ -1421,8 +1421,8 @@ public:
         // call site drops TypeName for a primitive so overload matching stays LLVM-type based.
         // Generic type-argument inference reads it; not part of the --init cache round-trip.
         std::string InferSourceTypeName;
-        // compile-time: the identity an unsuffixed integer literal argument ranks as in overload
-        // resolution ('int', else 'long'/'i64'); empty otherwise. Not part of the --init cache round-trip.
+        // compile-time: the C++ literal identity before lowering narrows it (including int and
+        // double for suffix-less literals). Not part of the --init cache round-trip.
         std::string LiteralIdentity;
         // compile-time: this argument was written 'move x' at a call site and is a VALUE type
         // (string/owning struct/closure). Zeroing is deferred to ApplyMoveParamTransfer so the
@@ -3638,6 +3638,7 @@ private:
         std::string targetTriple;
         std::vector<CSigEntry> sigs;
         std::vector<cflat_cinterop::RawFunctionTemplate> functionTemplates;
+        std::vector<std::string> classTemplateNames;
         std::vector<cflat_cinterop::RawFunctionPointerAbi> functionPointerAbis;
         std::vector<CEnumEntry> enums;
         std::vector<CRecordEntry> records;
@@ -3680,7 +3681,8 @@ private:
     static constexpr size_t kCFileSigBitcodeBytesPerRow = 2048;
     static size_t CFileSigEntryRows(const CFileSigCacheEntry& entry)
     {
-        return entry.sigs.size() + entry.functionTemplates.size() + entry.enums.size() + entry.records.size()
+        return entry.sigs.size() + entry.functionTemplates.size() + entry.classTemplateNames.size()
+             + entry.enums.size() + entry.records.size()
              + entry.macros.size() + entry.funcMacros.size() + entry.globals.size()
              + entry.recordAliases.size() + entry.typeAliases.size()
              + entry.usingDirectives.size() + entry.namespaceAliases.size()
@@ -5787,7 +5789,8 @@ private:
                              std::string* outTargetTriple = nullptr,
                              std::vector<cflat_cinterop::RawFunctionTemplate>* outFunctionTemplates = nullptr,
                              std::vector<std::pair<std::string, std::string>>* outUsingDirectives = nullptr,
-                             std::vector<std::pair<std::string, std::string>>* outNamespaceAliases = nullptr);
+                             std::vector<std::pair<std::string, std::string>>* outNamespaceAliases = nullptr,
+                             std::vector<std::string>* outClassTemplateNames = nullptr);
 
     // Extract externally-linkable functions a .c file DEFINES, via the clang C++ API. Records
     // are registered up front (struct-by-value). Used by the .c auto-extern path.
@@ -8808,9 +8811,8 @@ public:
         const std::vector<std::pair<std::vector<NamedVariable>, FunctionSymbol>>& candidates,
         std::vector<FunctionSymbol>* tiedOut = nullptr);
 
-    // Integer identity ranking for overload resolution (C++ order, ruling 2026-09-10). The two
-    // identity helpers return "" when the side is not a plain integer primitive of known identity.
-    static std::string UnsuffixedIntegerLiteralIdentity(std::string_view text);
+    // Integer identity ranking for overload resolution (C++ order, ruling 2026-09-10).
+    static std::string LiteralIdentityForOverload(std::string_view text);
     std::string IntegerArgumentIdentity(const NamedVariable& arg) const;
     std::string IntegerParameterIdentity(const TypeAndValue& param) const;
     static int RankIntegerConversion(const std::string& argIdentity, const std::string& paramIdentity);
@@ -9930,7 +9932,7 @@ public:
      * timeout). The PCH key still folds the build stamp, since a PCH belongs to the clang that
      * wrote it.
      */
-    static constexpr int kCHeaderCacheVersion = 86;
+    static constexpr int kCHeaderCacheVersion = 88;
     static std::string CompilerBuildStamp();
 
     static std::string GetCHeaderCacheDir();
