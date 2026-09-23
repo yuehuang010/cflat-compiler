@@ -1,0 +1,15 @@
+import cpp "cpp_interop_tpl.h";
+
+extern int main()
+{
+    int packValue = 4;
+    expect_error("parameter 'values' of 'cppfwd.vbump' is an rvalue reference; pass 'move <arg>' or a temporary") {
+        cppfwd.vbump<int>(packValue);
+    }
+
+    int oneValue = 5;
+    expect_error("parameter 'value' of 'cppfwd.one' is an rvalue reference; pass 'move <arg>' or a temporary") {
+        cppfwd.one<int>(oneValue);
+    }
+    return 0;
+}

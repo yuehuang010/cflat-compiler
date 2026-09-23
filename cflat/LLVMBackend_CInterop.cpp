@@ -6031,7 +6031,8 @@ std::string LLVMBackend::CxxBraceElementSpelling(const CxxBraceArgument& brace,
         // Keep scalar brace arguments matchable when C++ converts them into a record element.
         if (!target.empty() && !(targetIsCxxRecord && brace.allIntegerLiterals)) return target;
         auto cflatTypeOf = [&](const NamedVariable& arg) {
-            std::string type = arg.TypeAndValue.TypeName;
+            std::string type = !arg.LiteralIdentity.empty()
+                ? arg.LiteralIdentity : arg.TypeAndValue.TypeName;
             bool pointer = arg.TypeAndValue.Pointer;
             llvm::Type* valueType = arg.Primary != nullptr ? arg.Primary->getType() : arg.BaseType;
             // The declared primitive identity outranks the machine-type guess below, which
@@ -6399,6 +6400,8 @@ LLVMBackend::CollectCxxImplicitArgumentCandidates(
 
         auto argumentType = [&](const NamedVariable& arg) {
             TypeAndValue type = arg.TypeAndValue;
+            if (!arg.LiteralIdentity.empty())
+                type.TypeName = arg.LiteralIdentity;
             // The declared primitive identity outranks the machine-type guess below, which
             // cannot tell `char` from `i8` or `long` from `i64`.
             if (type.TypeName.empty())
@@ -6635,6 +6638,8 @@ bool LLVMBackend::EmitCxxImplicitArgumentConversions(
 
         auto argumentType = [&](const NamedVariable& arg) {
             TypeAndValue type = arg.TypeAndValue;
+            if (!arg.LiteralIdentity.empty())
+                type.TypeName = arg.LiteralIdentity;
             // The declared primitive identity outranks the machine-type guess below, which
             // cannot tell `char` from `i8` or `long` from `i64`.
             if (type.TypeName.empty())
@@ -7135,6 +7140,47 @@ bool LLVMBackend::RequestCxxFunctionTemplate(const std::string& functionName,
             break;
         }
         if (selected == nullptr) return noMatch();
+
+        const size_t functionArgumentOffset = selected->kind
+            == cflat_cinterop::RawFunctionTemplate::InstanceMember ? 1u : 0u;
+        for (size_t i = functionArgumentOffset; i < arguments.size(); ++i)
+        {
+            size_t parameterIndex = i - functionArgumentOffset;
+            if (selected->hasParameterPack && !selected->parameterTypes.empty()
+                && parameterIndex >= selected->parameterTypes.size() - 1)
+                parameterIndex = selected->parameterTypes.size() - 1;
+            if (parameterIndex >= selected->forwardingReferenceTemplateParameterIndices.size()
+                || parameterIndex >= selected->forwardingReferenceParameters.size()
+                || !selected->forwardingReferenceParameters[parameterIndex]
+                || IsCxxRvalueReferenceArgument(arguments[i]))
+                continue;
+
+            const unsigned templateParameterIndex =
+                selected->forwardingReferenceTemplateParameterIndices[parameterIndex];
+            if (templateParameterIndex >= explicitArgs.size()
+                || isValueArg(explicitArgs[templateParameterIndex])
+                || explicitArgs[templateParameterIndex].find('&') != std::string::npos)
+                continue;
+
+            const std::string argumentType = cflatTypeOf(arguments[i]);
+            if (argumentType.empty()) continue;
+            std::string explicitTypeSpelling;
+            std::string argumentTypeSpelling;
+            const std::string explicitType = displayArg(explicitArgs[templateParameterIndex]);
+            if (!CxxSpellingForCflatType(explicitType, explicitTypeSpelling))
+                explicitTypeSpelling = explicitType;
+            if (!CxxSpellingForCflatType(argumentType, argumentTypeSpelling))
+                argumentTypeSpelling = argumentType;
+            if (explicitTypeSpelling != argumentTypeSpelling) continue;
+
+            const std::string parameterName = parameterIndex < selected->parameterNames.size()
+                && !selected->parameterNames[parameterIndex].empty()
+                    ? selected->parameterNames[parameterIndex] : "argument";
+            error = std::format(
+                "parameter '{}' of '{}' is an rvalue reference; pass 'move <arg>' or a temporary",
+                parameterName, lookupName);
+            return false;
+        }
 
         std::string ownerSpelling;
         if (selected->kind != cflat_cinterop::RawFunctionTemplate::Free)
@@ -7947,7 +7993,8 @@ bool LLVMBackend::RequestCxxBraceFunction(const std::string& functionName,
             return nullptr;
         };
         auto cflatTypeOf = [&](const NamedVariable& arg) {
-            std::string type = arg.TypeAndValue.TypeName;
+            std::string type = !arg.LiteralIdentity.empty()
+                ? arg.LiteralIdentity : arg.TypeAndValue.TypeName;
             bool pointer = arg.TypeAndValue.Pointer;
             llvm::Type* valueType = arg.Primary != nullptr ? arg.Primary->getType() : arg.BaseType;
             // The declared primitive identity outranks the machine-type guess below, which
@@ -8340,7 +8387,8 @@ bool LLVMBackend::RequestCxxBraceFunction(const std::string& functionName,
                 {
                     error = std::format(
                         "cannot copy C++ class '{}' into a brace-list element: the element is "
-                        "not an addressable lvalue or C++ call result", brace.cxxElementType);
+                        "not an addressable lvalue or C++ call result",
+                        DisplayCxxClassName(brace.cxxElementType));
                     return false;
                 }
                 if (!EmitCxxCopyOrMoveConstruct(
@@ -8608,7 +8656,8 @@ bool LLVMBackend::RequestCxxVariadicConstructor(
         }
 
         auto cflatTypeOf = [&](const NamedVariable& arg) {
-            std::string type = arg.TypeAndValue.TypeName;
+            std::string type = !arg.LiteralIdentity.empty()
+                ? arg.LiteralIdentity : arg.TypeAndValue.TypeName;
             bool pointer = arg.TypeAndValue.Pointer;
             llvm::Type* valueType = arg.Primary != nullptr ? arg.Primary->getType() : arg.BaseType;
             // The declared primitive identity outranks the machine-type guess below, which
@@ -9834,7 +9883,7 @@ bool LLVMBackend::GetGeneratedCxxFieldBlock(const std::string& typeName,
         if (start + length > dl.getTypeAllocSize(data->second.StructType))
         {
             LogErrorMessage("generated C++ struct '{}' has an invalid CFlat field block",
-                            { typeName });
+                            { DisplayCxxClassName(typeName) });
             return false;
         }
         return true;
@@ -11243,7 +11292,7 @@ void LLVMBackend::RegisterCRecords(std::vector<CRecordEntry>& records, const std
                     r.layoutRefusal = std::move(mismatch);
                     if (generated)
                         LogErrorMessage("generated C++ struct '{}' has a layout disagreement: {}",
-                                        { r.name, r.layoutRefusal });
+                                        { DisplayCxxClassName(r.name), r.layoutRefusal });
                     if (verbose) std::cout << std::format("[verbose]   C++ struct '{}': {}\n", r.name, r.layoutRefusal);
                 }
                 deferredMembers.emplace_back(&r, true);
@@ -11325,7 +11374,8 @@ bool LLVMBackend::RejectUnsupportedCxxLayout(const std::string& typeName)
 {
         const CxxClassInfo* info = GetCxxClassInfo(typeName);
         if (info == nullptr || info->layoutRefusal.empty()) return false;
-        LogError(std::format("C++ class '{}' {}", typeName, info->layoutRefusal));
+        LogError(std::format("C++ class '{}' {}", DisplayCxxClassName(typeName),
+                             info->layoutRefusal));
         return true;
     }
 
@@ -11336,7 +11386,7 @@ bool LLVMBackend::RejectAbstractCxxClass(const std::string& typeName, const char
         LogError(std::format(
             "cannot {} C++ class '{}': it is abstract (it has an unoverridden pure virtual "
             "member), so no complete object of it can exist - use a pointer to a derived class",
-            what, typeName));
+            what, DisplayCxxClassName(typeName)));
         return true;
     }
 
@@ -14492,7 +14542,8 @@ llvm::Function* LLVMBackend::GetOrCreateCxxStructor(const std::string& typeName,
                 // the user wrote. llvm::demangle returns the input unchanged if it is not one.
                 LogError(std::format(
                     "internal: C++ special member '{}' of '{}' was already declared with a "
-                    "different signature", llvm::demangle(st.linkageName), typeName));
+                    "different signature", llvm::demangle(st.linkageName),
+                    DisplayCxxClassName(typeName)));
                 return nullptr;
             }
             return existing;
@@ -14660,7 +14711,8 @@ bool LLVMBackend::EmitCxxStructorCall(const std::string& typeName,
         if (args.size() != st.params.size())
         {
             LogError(std::format("C++ special member of '{}' expects {} argument(s), got {}",
-                                 typeName, (uint64_t)st.params.size() - 1,
+                                 DisplayCxxClassName(typeName),
+                                 (uint64_t)st.params.size() - 1,
                                  (uint64_t)args.size() - 1));
             return false;
         }
@@ -14697,7 +14749,8 @@ bool LLVMBackend::EmitCxxStructorCall(const std::string& typeName,
                     LogError(std::format(
                         "cannot pass C++ class '{}' by value to a constructor of '{}': the "
                         "argument must be a variable, a field or another addressable object so "
-                        "its copy constructor can run", pn, typeName));
+                        "its copy constructor can run", DisplayCxxClassName(pn),
+                        DisplayCxxClassName(typeName)));
                     continue;
                 }
                 auto* temp = AllocaAtEntry(recipe.paramSlots[i].structTy, nullptr, "cxx.argtemp",
@@ -14798,9 +14851,9 @@ bool LLVMBackend::EmitCxxArrayDefaultConstruction(const std::string& typeName, l
             error = std::format(
                 "C++ class '{}' has no default constructor cflat can call{}, so an array of it "
                 "cannot be default-initialized - declare the array as '{}*[N]' and allocate each "
-                "element with 'new {}(args)'", typeName,
+                "element with 'new {}(args)'", DisplayCxxClassName(typeName),
                 info != nullptr && info->hasDeletedDefaultCtor ? " (it is deleted)" : "",
-                typeName, typeName);
+                DisplayCxxClassName(typeName), DisplayCxxClassName(typeName));
             return false;
         }
         auto callCtor = [&](llvm::Value* elemPtr) {
@@ -15536,7 +15589,7 @@ bool LLVMBackend::EmitCxxCopyOrMoveConstruct(const std::string& typeName, llvm::
             LogError(std::format(
                 "cannot {} C++ class '{}' {}: its {} constructor is {} - "
                 "pass or hold it by pointer instead",
-                useMove ? "move" : "copy", typeName, context,
+                useMove ? "move" : "copy", DisplayCxxClassName(typeName), context,
                 useMove ? "move or copy" : "copy",
                 deleted ? "deleted" : "not accessible from the imported header"));
             return false;

@@ -576,7 +576,7 @@ llvm::Value* LLVMBackend::CreateIndirectCall(const TypeAndValue& funcPtrType, ll
                     LogError(std::format(
                         "cannot pass C++ class '{}' through a function value: the argument must "
                         "have addressable storage so its copy or move constructor can run",
-                        params[i].TypeName));
+                        DisplayCxxClassName(params[i].TypeName)));
                     continue;
                 }
                 auto* temp = AllocaAtEntry(slot.structTy, nullptr, "cxx.indirect.argtemp", slot.align);

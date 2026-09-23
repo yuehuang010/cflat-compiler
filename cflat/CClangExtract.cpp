@@ -1075,9 +1075,11 @@ namespace cflat_cinterop
                     ? std::numeric_limits<unsigned>::max() : result.minArity;
                 for (unsigned i = 0; i < declaredArity; ++i)
                 {
+                    result.parameterNames.push_back(fd->getParamDecl(i)->getNameAsString());
                     result.parameterTypes.push_back(
                         fd->getParamDecl(i)->getType().getAsString());
                     bool forwardingReference = false;
+                    unsigned forwardingTemplateParameterIndex = (unsigned)-1;
                     QualType parameterType = fd->getParamDecl(i)->getType();
                     if (const auto* packExpansion = parameterType->getAs<PackExpansionType>())
                         parameterType = packExpansion->getPattern();
@@ -1088,9 +1090,14 @@ namespace cflat_cinterop
                                 if (functionParameter == templateParameter->getDecl())
                                 {
                                     forwardingReference = true;
+                                    if (const auto* typeParameter =
+                                            llvm::dyn_cast<TemplateTypeParmDecl>(functionParameter))
+                                        forwardingTemplateParameterIndex = typeParameter->getIndex();
                                     break;
                                 }
                     result.forwardingReferenceParameters.push_back(forwardingReference ? 1 : 0);
+                    result.forwardingReferenceTemplateParameterIndices.push_back(
+                        forwardingTemplateParameterIndex);
                 }
                 while (result.minArity > 0
                        && fd->getParamDecl(result.minArity - 1)->hasDefaultArg())

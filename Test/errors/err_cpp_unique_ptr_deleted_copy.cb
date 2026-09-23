@@ -3,7 +3,7 @@ import cpp "cpp_interop_basic.h";
 import cpp "memory";
 import "list.cb";
 
-expect_error("cannot copy C++ class 'std.unique_ptr$cppi.Tracked' into construct_at storage") {
+expect_error("cannot copy C++ class 'std.unique_ptr<cppi.Tracked>' into construct_at storage") {
     int list_unique_copy_error()
     {
         list<std.unique_ptr<cppi.Tracked>> values = default;

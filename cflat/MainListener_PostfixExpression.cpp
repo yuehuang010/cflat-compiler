@@ -2664,7 +2664,11 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             {
                                 auto literalType = ParseLiteralTypeAndValue(literal->getText());
                                 if (!literalType.TypeName.empty())
+                                {
                                     namedVar.TypeAndValue = literalType;
+                                    namedVar.LiteralIdentity = LLVMBackend::LiteralIdentityForOverload(
+                                        literal->getText());
+                                }
                                 namedVar.IsRvalue = true;
                             }
                             if (!prevPrimary->StringLiteral().empty())
@@ -6667,7 +6671,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     if (constructorError.empty())
                                         constructorError = std::format(
                                             "C++ class '{}' has no constructor accepting this brace list",
-                                            functionName);
+                                            compiler->DisplayCxxClassName(functionName));
                                     LogErrorContext(primaryCtx, constructorError);
                                 }
                                 auto* objectType = compiler->GetType(
@@ -6814,14 +6818,16 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     {
                                         if (!wrapperError.empty()) why = wrapperError;
                                         LogErrorContext(primaryCtx, std::format(
-                                            "C++ class '{}' {}", functionName, why));
+                                            "C++ class '{}' {}",
+                                            compiler->DisplayCxxClassName(functionName), why));
                                         namedVar = {};
                                     }
                                 }
                                 else if (ctor == nullptr)
                                 {
                                     LogErrorContext(primaryCtx, std::format(
-                                        "C++ class '{}' {}", functionName, why));
+                                        "C++ class '{}' {}",
+                                        compiler->DisplayCxxClassName(functionName), why));
                                     namedVar = {};
                                 }
                                 else
@@ -8766,6 +8772,10 @@ llvm::Value* MainListener::ParsePrimaryExpression(CFlatParser::PrimaryExpression
                     constantText[1] == '\''))
             {
                 char c = ParseCharLiteral(constantText);
+                auto literalType = ParseLiteralTypeAndValue(constantText);
+                if (!literalType.TypeName.empty())
+                    return compiler->CreateConstant(literalType.TypeName,
+                        std::to_string(static_cast<unsigned char>(c)));
                 return compiler->CreateConstant(LLVMBackend::ConstantVariant(c));
             }
             else

@@ -652,7 +652,7 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
             {
                 LogErrorContext(errCtx, std::format(
                     "cannot return C++ class '{}' from this conditional expression",
-                    CurrentReturnTypeSpelling(compiler)));
+                    compiler->DisplayCxxClassName(CurrentReturnTypeSpelling(compiler))));
                 return;
             }
             if (cxxReturnCallConstructed || cxxReturnTernaryConstructed)
@@ -671,7 +671,8 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
                 {
                     LogErrorContext(errCtx, ctorError.empty()
                         ? std::format("C++ class '{}' has no default constructor cflat can call",
-                            CurrentReturnTypeSpelling(compiler)) : ctorError);
+                            compiler->DisplayCxxClassName(CurrentReturnTypeSpelling(compiler)))
+                        : ctorError);
                     return;
                 }
                 compiler->EmitCxxStructorCall(compiler->currentFunctionReturnTypeName,
@@ -762,7 +763,7 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
             {
                 LogErrorContext(errCtx, std::format(
                     "cannot return C++ class '{}': the expression has no constructible source",
-                    CurrentReturnTypeSpelling(compiler)));
+                    compiler->DisplayCxxClassName(CurrentReturnTypeSpelling(compiler))));
                 return;
             }
             compiler->SetCurrentDebugLocation(errCtx->getStart()->getLine());

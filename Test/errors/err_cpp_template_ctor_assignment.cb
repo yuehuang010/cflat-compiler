@@ -1,7 +1,7 @@
 import cpp "vector";
 extern int main()
 {
-    expect_error("cannot assign to C++ class 'std.vector$int' from this expression") {
+    expect_error("cannot assign to C++ class 'std.vector<int>' from this expression") {
         std.vector<int> value = default;
         value = 7;
     }

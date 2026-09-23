@@ -352,6 +352,17 @@ LLVMBackend::TypeAndValue MainListener::ParseLiteralTypeAndValue(const std::stri
         LLVMBackend::TypeAndValue type;
         if (rawNumber == "nullptr" || rawNumber == "true" || rawNumber == "false")
             return type;
+        if (rawNumber.size() >= 3 && rawNumber.back() == '\'')
+        {
+            if (rawNumber.front() == '\'') type.TypeName = "char";
+            else if (rawNumber.size() >= 4 && rawNumber[1] == '\'')
+            {
+                if (rawNumber.front() == 'L') type.TypeName = "wchar";
+                else if (rawNumber.front() == 'u') type.TypeName = "c16";
+                else if (rawNumber.front() == 'U') type.TypeName = "c32";
+            }
+            return type;
+        }
         auto constant = ParseNumberConstant(rawNumber);
         if (std::get_if<LLVMBackend::WideIntegerConstant>(&constant) != nullptr)
             type.TypeName = std::get<LLVMBackend::WideIntegerConstant>(constant).IsUnsigned ? "u128" : "i128";

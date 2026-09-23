@@ -1853,6 +1853,13 @@ namespace cppfwd
         return value;
     }
 
+    template <typename U>
+    int one(U&& value)
+    {
+        ++value;
+        return value;
+    }
+
     struct ForwardBox
     {
         template <typename U>

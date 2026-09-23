@@ -1736,7 +1736,8 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                         const auto* ctor = compiler->FindCxxDefaultCtor(tn);
                         if (ctor == nullptr)
                             LogErrorContext(ctx, std::format(
-                                "C++ class '{}' has no default constructor cflat can call", tn));
+                                "C++ class '{}' has no default constructor cflat can call",
+                                compiler->DisplayCxxClassName(tn)));
                         forcedTemp = compiler->AllocaAtEntry(
                             compiler->GetType(tempType), nullptr, "cxx.assign.temp",
                             namedVar.TypeAndValue.AllocAlignValue);
@@ -1809,7 +1810,9 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                         if (!IsBareIdentifierText(srcName))
                             LogErrorContext(ctx, std::format(
                                 "cannot assign to C++ class '{}' from this expression; the source must be "
-                                "a '{}' variable, optionally written 'move <variable>'", tn, tn));
+                                "a '{}' variable, optionally written 'move <variable>'",
+                                compiler->DisplayCxxClassName(tn),
+                                compiler->DisplayCxxClassName(tn)));
                         auto* srcNV = compiler->FindLiveNamedVariable(srcName);
                         if (srcNV == nullptr || srcNV->Storage == nullptr
                             || srcNV->TypeAndValue.Pointer || srcNV->TypeAndValue.TypeName != tn)
@@ -1825,7 +1828,9 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                     {
                         LogErrorContext(ctx, std::format(
                             "cannot assign to C++ class '{}' from this expression; the source must be "
-                            "a '{}' variable, optionally written 'move <variable>'", tn, tn));
+                            "a '{}' variable, optionally written 'move <variable>'",
+                            compiler->DisplayCxxClassName(tn),
+                            compiler->DisplayCxxClassName(tn)));
                     }
                     else if (rhsTemp == nullptr && (rhsNV.IsMoved || rhsNV.ExplicitlyMovedNull))
                     {
@@ -1860,13 +1865,15 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                         LogErrorContext(ctx, std::format(
                             "cannot copy-assign C++ class '{}': it has no copy assignment operator "
                             "cflat can call, and assigning from an lvalue would silently move from "
-                            "it; write 'move <variable>' or assign a temporary", tn));
+                            "it; write 'move <variable>' or assign a temporary",
+                            compiler->DisplayCxxClassName(tn)));
 
                     auto emitConstruct = [&]() {
                         llvm::Value* source = rhsTemp != nullptr ? rhsTemp : sourceStorage;
                         if (source == nullptr)
                             LogErrorContext(ctx, std::format(
-                                "cannot construct C++ class '{}' from this expression", tn));
+                                "cannot construct C++ class '{}' from this expression",
+                                compiler->DisplayCxxClassName(tn)));
                         compiler->EmitCxxCopyOrMoveConstruct(
                             tn, destination, source, useMove || sourceIsTemporary,
                             "into an assigned destination");
@@ -1876,11 +1883,13 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                             LogErrorContext(ctx, std::format(
                                 "C++ class '{}' has no assignment operator cflat can call (it is implicit, "
                                 "deleted, inaccessible, or defined inline in the header) - assign through a "
-                                "pointer, or re-declare the destination instead", tn));
+                            "pointer, or re-declare the destination instead",
+                            compiler->DisplayCxxClassName(tn)));
                         llvm::Value* source = rhsTemp != nullptr ? rhsTemp : sourceStorage;
                         if (source == nullptr)
                             LogErrorContext(ctx, std::format(
-                                "cannot assign to C++ class '{}' from this expression", tn));
+                                "cannot assign to C++ class '{}' from this expression",
+                                compiler->DisplayCxxClassName(tn)));
                         compiler->EmitCxxStructorCall(tn, *op, destination, { source });
                     };
 
@@ -7934,7 +7943,8 @@ LLVMBackend::TypedValue MainListener::ParseTypeCheckExpression(CFlatParser::Type
                         "'{}' is not supported on the imported C++ class '{}': a C++ runtime type "
                         "test is a dynamic_cast, which needs the C++ RTTI ABI (not supported yet). "
                         "Use a C++-side helper that performs the cast and returns the result",
-                        op, cxxCompiler->IsCxxRecord(srcTypeName) ? srcTypeName : targetTypeName));
+                        op, cxxCompiler->DisplayCxxClassName(
+                            cxxCompiler->IsCxxRecord(srcTypeName) ? srcTypeName : targetTypeName)));
                     return { result, false };
                 }
                 if (op == "is")
@@ -12018,7 +12028,10 @@ bool MainListener::EmitForeignCxxValueIntoSlot(
         LogErrorContext(errCtx, std::format(
             "cannot initialize C++ class '{}' from this expression; use '{}(args)', a '{}' lvalue, "
             "or 'move <{}> lvalue'",
-            destType.TypeName, destType.TypeName, destType.TypeName, destType.TypeName));
+            compiler->DisplayCxxClassName(destType.TypeName),
+            compiler->DisplayCxxClassName(destType.TypeName),
+            compiler->DisplayCxxClassName(destType.TypeName),
+            compiler->DisplayCxxClassName(destType.TypeName)));
         return true;
 }
 
@@ -14659,13 +14672,16 @@ LLVMBackend::NamedVariable MainListener::ParseNewExpression(CFlatParser::NewExpr
             {
                 LogErrorContext(ctx, std::format(
                     "cannot allocate C++ class '{}' with 'new': it has no destructor cflat can "
-                    "call, so the object could never be deleted", typeName));
+                    "call, so the object could never be deleted",
+                    compiler->DisplayCxxClassName(typeName)));
                 return {};
             }
             if (ctx->initializerList() != nullptr)
             {
                 LogErrorContext(ctx, std::format(
-                    "cannot brace-initialize C++ class '{}'; use 'new {}(args)'", typeName, typeName));
+                    "cannot brace-initialize C++ class '{}'; use 'new {}(args)'",
+                    compiler->DisplayCxxClassName(typeName),
+                    compiler->DisplayCxxClassName(typeName)));
                 return {};
             }
             std::vector<llvm::Value*> ctorArgs;
@@ -14679,7 +14695,7 @@ LLVMBackend::NamedVariable MainListener::ParseNewExpression(CFlatParser::NewExpr
                     {
                         LogErrorContext(named, std::format(
                             "a constructor argument for C++ class '{}' must be a plain expression",
-                            typeName));
+                            compiler->DisplayCxxClassName(typeName)));
                         return {};
                     }
                     auto nv = ParseAssignmentExpressionNamed(argAssign);
@@ -14700,14 +14716,16 @@ LLVMBackend::NamedVariable MainListener::ParseNewExpression(CFlatParser::NewExpr
                                                            wrapperError);
             if (ctor == nullptr && !wrapped)
             {
-                LogErrorContext(ctx, std::format("C++ class '{}' {}", typeName, why));
+                LogErrorContext(ctx, std::format("C++ class '{}' {}",
+                    compiler->DisplayCxxClassName(typeName), why));
                 return {};
             }
             llvm::Value* block = compiler->EmitCxxHeapAllocate(typeName);
             if (block == nullptr)
             {
                 LogErrorContext(ctx, std::format(
-                    "'new': cannot compute the size of C++ class '{}'", typeName));
+                    "'new': cannot compute the size of C++ class '{}'",
+                    compiler->DisplayCxxClassName(typeName)));
                 return {};
             }
             // A throwing constructor frees the block (operator delete) and never destroys it.
@@ -14816,7 +14834,8 @@ LLVMBackend::NamedVariable MainListener::ParseNewExpression(CFlatParser::NewExpr
             if (rawPtr == nullptr)
             {
                 LogErrorContext(ctx, std::format(
-                    "'new': cannot compute the size of C++ class '{}'", typeName));
+                    "'new': cannot compute the size of C++ class '{}'",
+                    compiler->DisplayCxxClassName(typeName)));
                 return {};
             }
             // CFlat's operator new hands back zeroed storage; keep that for a trivial element.

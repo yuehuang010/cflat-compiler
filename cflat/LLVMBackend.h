@@ -9946,7 +9946,7 @@ public:
      * timeout). The PCH key still folds the build stamp, since a PCH belongs to the clang that
      * wrote it.
      */
-    static constexpr int kCHeaderCacheVersion = 88;
+    static constexpr int kCHeaderCacheVersion = 89;
     static std::string CompilerBuildStamp();
 
     static std::string GetCHeaderCacheDir();

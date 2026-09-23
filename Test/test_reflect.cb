@@ -472,7 +472,7 @@ extern int main()
     total++; passed += Test("typeof_auto_double",      typeof(litDouble), "double");
     total++; passed += Test("typeof_auto_float_sfx",   typeof(litFloatF), "float");
     total++; passed += Test("typeof_auto_bool",        typeof(litBool),   "bool");
-    total++; passed += Test("typeof_auto_char",        typeof(litChar),   "i8");
+    total++; passed += Test("typeof_auto_char",        typeof(litChar),   "char");
 
     // -- from explicitly-typed sources: width + signedness preserved -------------
     i8  srcI8  = 1;   auto fromI8  = srcI8;

@@ -84,6 +84,11 @@ template<> struct TypeCode<char8_t> { static const int value = 18; };
 
 template<class C> int typeCodeOf(C v) { (void)v; return TypeCode<C>::value; }
 
+template<class T> struct LiteralBox {
+    int code;
+    LiteralBox(T) : code(TypeCode<T>::value) {}
+};
+
 // A user function template over basic_string<C> and C: deduction fails unless both operands
 // carry the SAME character identity, which is the shape libc++'s own string operators have.
 template<class C> int countChar(const std::basic_string<C>& s, C c)
@@ -92,6 +97,34 @@ template<class C> int countChar(const std::basic_string<C>& s, C c)
     for (std::size_t i = 0; i < s.size(); ++i) if (s[i] == c) ++n;
     return n;
 }
+
+struct LiteralCtor {
+    int code;
+    LiteralCtor(char) : code(1) {}
+    LiteralCtor(int) : code(7) {}
+};
+
+struct LiteralMember {
+    int value;
+    LiteralMember() : value(0) {}
+    int pick(char) { return 1; }
+    int pick(int) { return 7; }
+    int find(char) { return 1; }
+    int find(int) { return 7; }
+    void push_back(char c) { value = c; }
+    void push_back(int i) { value = i + 1000; }
+};
+
+struct LiteralOps {
+    int value;
+    LiteralOps() : value(0) {}
+    LiteralOps operator+(char) const { LiteralOps r; r.value = 1; return r; }
+    LiteralOps operator+(int) const { LiteralOps r; r.value = 7; return r; }
+    LiteralOps& operator+=(char) { value = 1; return *this; }
+    LiteralOps& operator+=(int) { value = 7; return *this; }
+    bool operator==(char) const { return true; }
+    bool operator==(int) const { return false; }
+};
 
 // Last byte of a string, so a concatenation leg can assert WHICH byte was appended.
 inline int stropTail(const std::string& s)

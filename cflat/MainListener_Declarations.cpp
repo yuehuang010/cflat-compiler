@@ -1852,7 +1852,8 @@ void MainListener::EmitGlobalCxxFieldDefaultConstruction(
                 const auto* info = compiler->GetCxxClassInfo(typeValue.TypeName);
                 LogErrorContext(context, std::format(
                     "C++ class '{}' has no default constructor cflat can call{} - a global field of "
-                    "it cannot be constructed; hold it through a pointer instead", typeValue.TypeName,
+                    "it cannot be constructed; hold it through a pointer instead",
+                    compiler->DisplayCxxClassName(typeValue.TypeName),
                     info != nullptr && info->hasDeletedDefaultCtor ? " (it is deleted)" : ""));
                 return;
             }
@@ -1922,7 +1923,8 @@ void MainListener::EmitPendingGlobalCxxConstructions()
                     const auto* info = compiler->GetCxxClassInfo(typeName);
                     LogErrorContext(item.Context, std::format(
                         "C++ class '{}' has no default constructor cflat can call{} - a global of "
-                        "it cannot be constructed; hold it through a pointer instead", typeName,
+                        "it cannot be constructed; hold it through a pointer instead",
+                        compiler->DisplayCxxClassName(typeName),
                         info != nullptr && info->hasDeletedDefaultCtor ? " (it is deleted)" : ""));
                     continue;
                 }
@@ -3435,7 +3437,7 @@ void MainListener::ParseFunctionDefinition(CFlatParser::FunctionDefinitionContex
                         fn, structName, overrideMethodName, overrideParams) == nullptr)
                     Compiler(func)->LogErrorMessage(
                         "could not emit the C++ override thunk for '{}.{}'",
-                        { structName, overrideMethodName });
+                        { compiler->DisplayCxxClassName(structName), overrideMethodName });
             }
         }
 
@@ -3997,7 +3999,10 @@ bool MainListener::TryDeclareForeignCxxLocal(CFlatParser::InitDeclaratorContext*
             LogErrorContext(where, std::format(
                 "cannot initialize C++ class '{}' from this expression; use '{}(args)', "
                 "'= default', a '{}' lvalue, or 'move <{}> lvalue'",
-                typeName, typeName, typeName, typeName));
+                compiler->DisplayCxxClassName(typeName),
+                compiler->DisplayCxxClassName(typeName),
+                compiler->DisplayCxxClassName(typeName),
+                compiler->DisplayCxxClassName(typeName)));
         };
         if (initializer != nullptr && assign == nullptr && !isDefaultForm)
         {
@@ -4029,7 +4034,7 @@ bool MainListener::TryDeclareForeignCxxLocal(CFlatParser::InitDeclaratorContext*
             LogErrorContext(direct, std::format(
                 "cannot declare a local of C++ class '{}': it has no destructor cflat can call "
                 "(the destructor is implicit or defined inline in the header) - hold it through a "
-                "pointer instead", typeName));
+                "pointer instead", compiler->DisplayCxxClassName(typeName)));
             return true;
         }
 cxx_dtor_ready:
@@ -4046,9 +4051,9 @@ cxx_dtor_ready:
                 const auto* info = compiler->GetCxxClassInfo(typeName);
                 LogErrorContext(direct, std::format(
                     "C++ class '{}' has no default constructor cflat can call{} - initialize it "
-                    "with '{}(args)'", typeName,
+                    "with '{}(args)'", compiler->DisplayCxxClassName(typeName),
                     info != nullptr && info->hasDeletedDefaultCtor ? " (it is deleted)" : "",
-                    typeName));
+                    compiler->DisplayCxxClassName(typeName)));
                 return true;
             }
             compiler->SetCurrentDebugLocation(line);
@@ -4134,7 +4139,7 @@ cxx_dtor_ready:
                 {
                     LogErrorContext(named, std::format(
                         "a constructor argument for C++ class '{}' must be a plain expression",
-                        typeName));
+                        compiler->DisplayCxxClassName(typeName)));
                     return true;
                 }
                 compiler->lastCxxRetTemp_ = nullptr;
@@ -4183,7 +4188,7 @@ cxx_dtor_ready:
                     if (constructorError.empty())
                         constructorError = std::format(
                             "C++ class '{}' has no constructor accepting this brace list",
-                            typeName);
+                            compiler->DisplayCxxClassName(typeName));
                     LogErrorContext(direct, constructorError);
                 }
                 LLVMBackend::NamedVariable self;
@@ -4251,13 +4256,15 @@ cxx_dtor_ready:
                 if (ctor == nullptr)
                 {
                     if (!wrapperError.empty() && !hardReferenceRejection) why = wrapperError;
-                    LogErrorContext(direct, std::format("C++ class '{}' {}", typeName, why));
+                    LogErrorContext(direct, std::format("C++ class '{}' {}",
+                        compiler->DisplayCxxClassName(typeName), why));
                     return true;
                 }
             }
             if (ctor == nullptr)
             {
-                LogErrorContext(direct, std::format("C++ class '{}' {}", typeName, why));
+                LogErrorContext(direct, std::format("C++ class '{}' {}",
+                    compiler->DisplayCxxClassName(typeName), why));
                 return true;
             }
             compiler->SetCurrentDebugLocation(line);
@@ -4304,11 +4311,12 @@ cxx_dtor_ready:
                 {
                     LogErrorContext(moveExpr, std::format(
                         "cannot move C++ class '{}' from this expression because it has no addressable storage",
-                        typeName));
+                        compiler->DisplayCxxClassName(typeName)));
                     return true;
                 }
                 LogErrorContext(moveExpr, std::format(
-                    "'move' into C++ class '{}' needs a plain variable as its source", typeName));
+                    "'move' into C++ class '{}' needs a plain variable as its source",
+                    compiler->DisplayCxxClassName(typeName)));
                 return true;
             }
             auto* srcNV = compiler->FindLiveNamedVariable(srcName);
@@ -7077,7 +7085,8 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                 "its default constructor would run on the starting thread only, "
                                 "leaving every other thread's copy zeroed. Declare it "
                                 "'thread_local {}* {} = nullptr;' and construct it per thread",
-                                typeAndValue.TypeName, SpellType(*compiler, typeAndValue), name));
+                                compiler->DisplayCxxClassName(typeAndValue.TypeName),
+                                SpellType(*compiler, typeAndValue), name));
                         else
                             pendingGlobalCxxConstructions_.push_back({global, typeAndValue, direct});
                     }

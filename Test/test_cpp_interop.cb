@@ -78,6 +78,8 @@
 //   C++ scoped-enum identity in free/member overload matching, converting constructors,
 //     references, explicit casts, templates, and measured preservation of unscoped enum
 //     conversions.
+//   N/A (diagnostic-only) - explicit C++ forwarding-reference template arguments reject
+//     lvalues with the CFlat rvalue-reference message; Test/errors/err_cpp_explicit_template_forwarding_lvalue.cb.
 //   C++ REFERENCE data members - a `T&` / `T&&` / `T*&` member bound as a pointer field
 //     (layout, by-value return and argument, direct construction, reads through the
 //     referent), in a base class, in a class template specialization, and in an array
@@ -180,6 +182,11 @@
 //     release nothing, and a view that holds a fixed array on the path taken is never freed.
 //     A view stored into a struct field (3420) is shared: reassigning the local frees only the new
 //     block at scope exit and leaves the field's block readable.
+//   C++ class diagnostic names (basic, nested, pointer-element, and plain namespaced forms)
+//     are pinned in Test/errors/err_cpp_diag_display_names.cb.
+//   Character literals keep their C++ identity through free operators, member calls,
+//     constructors and class-template deduction. `L`, `u` and `U` spell wchar, char16_t and
+//     char32_t; numeric literals and native overloads keep their measured behavior (3450-3459).
 
 import cpp "library/cpp_interop_basic.h";
 import cpp "library/cpp_interop_basic.cpp";
@@ -214,6 +221,8 @@ import cpp "library/cpp_interop_freeoptpl.h";
 // converting constructor in the same header is the accept set. Rejections: err_cpp_explicit_ctor.cb.
 import cpp "library/cpp_interop_explicit.h";
 import cpp "string";
+import cpp "vector";
+import cpp "library/cpp_interop_strop.h";
 import "list.cb";
 import "thread.cb";
 import "malloc_allocator.cb";
@@ -4595,5 +4604,48 @@ extern int main()
         if (held != 11 || mid != 0 || vrDtors != 2 || (int)HeapAudit.reportLeaks() != heapBase + 1)
             return 3420;
     }
-    return CppTemporaryRefCases();
+    int refResult = CppTemporaryRefCases();
+    if (refResult != 0) return refResult;
+
+    // Character literal identity crosses each C++ overload boundary as char.
+    std.string literalBase = std.string("hi");
+    std.string literalAdded = literalBase + 'x';
+    if (literalAdded != std.string("hix") || cppsop.stropTail(literalAdded) != 120) return 3450;
+
+    // This free template also pins the existing int-literal rule.
+    if (cppsop.typeCodeOf('x') != 1 || cppsop.typeCodeOf(5) != 7) return 3451;
+
+    std.string literalAppended = std.string("a");
+    literalAppended += 'x';
+    if (literalAppended != std.string("ax")) return 3452;
+
+    std.string literalMembers = std.string("abc");
+    literalMembers.push_back('x');
+    if ((int)literalMembers.find('x') != 3 || cppsop.stropTail(literalMembers) != 120) return 3453;
+
+    std.string literalConstructed = std.string(3, 'x');
+    if ((int)literalConstructed.size() != 3 || cppsop.stropTail(literalConstructed) != 120) return 3454;
+
+    cppsop.LiteralCtor literalCtor = cppsop.LiteralCtor('x');
+    if (literalCtor.code != 1) return 3455;
+
+    cppsop.LiteralMember literalMember = default;
+    literalMember.push_back('x');
+    if (literalMember.pick('x') != 1 || literalMember.find('x') != 1
+        || literalMember.value != 120) return 3456;
+
+    cppsop.LiteralOps literalOps = default;
+    cppsop.LiteralOps literalSum = literalOps + 'x';
+    literalOps += 'x';
+    if (literalSum.value != 1 || literalOps.value != 1 || !(literalOps == 'x')) return 3457;
+
+    std.vector<char> literalVector = default;
+    literalVector.push_back('x');
+    auto literalBox = cppsop.LiteralBox('x');
+    if ((int)literalVector[0] != 120 || (int)literalVector.size() != 1
+        || literalBox.code != 1) return 3458;
+
+    if (cppsop.typeCodeOf(L'x') != 14 || cppsop.typeCodeOf(u'x') != 13
+        || cppsop.typeCodeOf(U'x') != 17) return 3459;
+    return 0;
 }

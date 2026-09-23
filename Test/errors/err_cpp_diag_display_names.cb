@@ -1,0 +1,25 @@
+import cpp "vector";
+import cpp "utility";
+import cpp "cpp_interop_nest.h";
+import cpp "cpp_interop_assign.h";
+
+extern int main()
+{
+    // Nested specialization names must render recursively, including the comma in pair args.
+    expect_error("cannot assign to C++ class 'std.vector<std.pair<int, double>>' from this expression") {
+        std.vector<std.pair<int, double>> nested = default;
+        nested = 7;
+    }
+    // Pointer elements retain their declarator spelling when a C++ member refusal names the owner.
+    expect_error("member 'data' of C++ class 'std.vector<nest.Cell**>' returns unsupported type") {
+        std.vector<nest.Cell**> pointers = default;
+        pointers.data();
+    }
+    // DisplayCxxClassName leaves an ordinary namespace-qualified class unchanged.
+    expect_error("cannot copy-assign C++ class 'cppas.MoveOnly': it has no copy assignment operator") {
+        cppas.MoveOnly destination = cppas.MoveOnly(1);
+        cppas.MoveOnly source = cppas.MoveOnly(2);
+        destination = source;
+    }
+    return 0;
+}

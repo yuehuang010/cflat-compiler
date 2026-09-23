@@ -2817,7 +2817,7 @@ llvm::Value* LLVMBackend::CallInterfaceMethod(llvm::Value* ifacePtr, const std::
                     LogError(std::format(
                         "cannot pass C++ class '{}' through interface method '{}.{}': the argument must "
                         "have addressable storage so its copy or move constructor can run",
-                        param.TypeName, ifaceName, methodName));
+                        DisplayCxxClassName(param.TypeName), ifaceName, methodName));
                     continue;
                 }
                 auto* temp = AllocaAtEntry(cxxSretRecipe.paramSlots[recipeIndex].structTy,

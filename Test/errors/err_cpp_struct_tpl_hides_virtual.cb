@@ -1,6 +1,6 @@
 import cpp "cpp_interop_tpl.h";
 
-expect_error("hides virtual method 'cppt.tplbase.Holder$int.doubled'; add override") {
+expect_error("hides virtual method 'cppt.tplbase.Holder<int>.doubled'; add override") {
     struct Bad : cppt.tplbase.Holder<int>
     {
         Bad(int value) : cppt.tplbase.Holder<int>(value) { }

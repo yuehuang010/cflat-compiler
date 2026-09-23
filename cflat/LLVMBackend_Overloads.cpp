@@ -151,8 +151,16 @@ bool LLVMBackend::ArgumentConvertsToBoolParameter(const NamedVariable& arg, cons
 // Record C++ identities before literal values lose source spelling and narrow during lowering.
 std::string LLVMBackend::LiteralIdentityForOverload(std::string_view text)
 {
-        if (text.size() >= 3 && text.front() == '\'' && text.back() == '\'')
-            return "char";
+        if (text.size() >= 3 && text.back() == '\'')
+        {
+            if (text.front() == '\'') return "char";
+            if (text.size() >= 4 && text[1] == '\'')
+            {
+                if (text.front() == 'L') return "wchar";
+                if (text.front() == 'u') return "c16";
+                if (text.front() == 'U') return "c32";
+            }
+        }
         const bool negative = !text.empty() && text.front() == '-';
         const bool signedLiteral = negative || (!text.empty() && text.front() == '+');
         std::string_view digits = signedLiteral ? text.substr(1) : text;
@@ -2006,7 +2014,7 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                     bound += std::format(" (plus {} reserved name(s) starting with '__')", hidden);
                 TypeAndValue receiverType;
                 receiverType.TypeName = cxxMemberReceiver;
-                const std::string shownReceiver = SpellType(*this, receiverType);
+                const std::string shownReceiver = DisplayCxxClassName(cxxMemberReceiver);
                 LogRawError(std::format("C++ class '{}' has no member '{}'.\n  Members of '{}': {}",
                                         shownReceiver, bareMemberName, shownReceiver, bound));
                 return nullptr;
@@ -2510,7 +2518,7 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                 LogError(std::format(
                     "cannot pass non-trivial C++ class '{}' to the variadic '{}' slot of '{}'; "
                     "bind it to an owner before passing it",
-                    argCxxClassName, "...", diagnosticFunctionName));
+                    DisplayCxxClassName(argCxxClassName), "...", diagnosticFunctionName));
                 return nullptr;
             }
 
@@ -3254,7 +3262,7 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                     LogError(std::format(
                         "cannot pass C++ class '{}' by value to parameter '{}' of '{}': the "
                         "argument must be a variable, a field or another addressable object so "
-                        "its copy constructor can run", pn,
+                        "its copy constructor can run", DisplayCxxClassName(pn),
                         candidate.Parameters[i].VariableName, diagnosticFunctionName));
                     continue;
                 }

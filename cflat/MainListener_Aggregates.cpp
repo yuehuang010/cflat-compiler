@@ -721,7 +721,7 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
                         if (candidate.raw.isVirtual)
                             Compiler(func)->LogErrorMessage(
                                 "hides virtual method '{}.{}'; add override",
-                                { candidate.ownerType, methodName });
+                                { compiler->DisplayCxxClassName(candidate.ownerType), methodName });
                     continue;
                 }
                 if (candidates.empty())
@@ -745,12 +745,12 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
                     {
                         Compiler(func)->LogErrorMessage(
                             "does not override '{}.{}' (its C++ signature has no CFlat spelling)",
-                            { unspellable->ownerType, methodName });
+                        { compiler->DisplayCxxClassName(unspellable->ownerType), methodName });
                         continue;
                     }
                     Compiler(func)->LogErrorMessage(
                         "is marked override but '{}.{}' is not virtual",
-                        { candidates.front().ownerType, methodName });
+                        { compiler->DisplayCxxClassName(candidates.front().ownerType), methodName });
                     continue;
                 }
                 auto params = ParseParameterTypeList(func->parameterTypeList());
@@ -771,7 +771,7 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
                     {
                         Compiler(func)->LogErrorMessage(
                             "does not override '{}.{}' (its C++ signature has no CFlat spelling)",
-                            { unspellable->ownerType, methodName });
+                            { compiler->DisplayCxxClassName(unspellable->ownerType), methodName });
                         continue;
                     }
                     const auto& expected = virtuals.front();
@@ -784,12 +784,14 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
                         std::vector<LLVMBackend::TypeAndValue> candidateParams(
                             candidate.params.begin() + 1, candidate.params.end());
                         candidatesText += std::format("'{}.{}' expected {}({})",
-                            candidate.ownerType, methodName, SpellType(*compiler, candidate.ret),
+                            compiler->DisplayCxxClassName(candidate.ownerType), methodName,
+                            SpellType(*compiler, candidate.ret),
                             DescribeParameterTypes(candidateParams));
                     }
                     Compiler(func)->LogErrorMessage(
                         "does not override '{}.{}' (expected {}({}); candidates: {})",
-                        { expected.ownerType, methodName, SpellType(*compiler, expected.ret),
+                        { compiler->DisplayCxxClassName(expected.ownerType), methodName,
+                          SpellType(*compiler, expected.ret),
                           DescribeParameterTypes(expectedParams), candidatesText });
                     continue;
                 }
@@ -797,7 +799,7 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
                 {
                     Compiler(func)->LogErrorMessage(
                         "overrides '{}.{}' which is final",
-                        { matched->ownerType, methodName });
+                        { compiler->DisplayCxxClassName(matched->ownerType), methodName });
                     continue;
                 }
                 const size_t ordinal = overrideOrdinals[methodName]++;
@@ -836,11 +838,11 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
                     if (!pure.spellable)
                         Compiler(ctx)->LogErrorMessage(
                             "does not override pure virtual method '{}.{}' (its C++ signature has no CFlat spelling)",
-                            { pure.ownerType, pure.raw.name });
+                            { compiler->DisplayCxxClassName(pure.ownerType), pure.raw.name });
                     else
                         Compiler(ctx)->LogErrorMessage(
                             "does not override pure virtual method '{}.{}'",
-                            { pure.ownerType, pure.raw.name });
+                            { compiler->DisplayCxxClassName(pure.ownerType), pure.raw.name });
                 }
             }
             }

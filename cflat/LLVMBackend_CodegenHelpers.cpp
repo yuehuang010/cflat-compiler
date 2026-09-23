@@ -1204,7 +1204,8 @@ llvm::Function* LLVMBackend::GetOrCreateFullDestructor(const std::string& typeNa
         if (IsCxxRecord(typeName))
         {
             if (generatedCxxRecords_.contains(typeName) && dsIt->second.Destructor == nullptr)
-                LogErrorMessage("generated C++ struct '{}' has no bound destructor", { typeName });
+                LogErrorMessage("generated C++ struct '{}' has no bound destructor",
+                                { DisplayCxxClassName(typeName) });
             return dsIt->second.Destructor;
         }
 

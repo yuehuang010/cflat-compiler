@@ -2132,7 +2132,9 @@ nlohmann::json LLVMBackend::FunctionTemplateToJson(
                  {"c", t.cxxSpelling}, {"k", t.kind}, {"mi", t.minArity},
                  {"ma", t.maxArity}, {"tp", t.typeParameterCount}, {"pp", t.hasParameterPack},
                  {"pt", t.parameterTypes},
+                 {"pn", t.parameterNames},
                  {"fr", t.forwardingReferenceParameters},
+                 {"fpi", t.forwardingReferenceTemplateParameterIndices},
                  {"tk", t.templateParameterKinds},
                  {"cn", t.isConst},
                  {"nx", t.isNoexcept}, {"a", t.access},
@@ -2155,9 +2157,13 @@ cflat_cinterop::RawFunctionTemplate LLVMBackend::FunctionTemplateFromJson(
         t.typeParameterCount = (unsigned)j.value("tp", (uint64_t)0);
         t.hasParameterPack = j.value("pp", false);
         if (j.contains("pt")) t.parameterTypes = j["pt"].to_string_vector();
+        if (j.contains("pn")) t.parameterNames = j["pn"].to_string_vector();
         if (j.contains("fr"))
             for (uint64_t value : j["fr"].to_u64_vector())
                 t.forwardingReferenceParameters.push_back(value != 0 ? 1 : 0);
+        if (j.contains("fpi"))
+            for (uint64_t value : j["fpi"].to_u64_vector())
+                t.forwardingReferenceTemplateParameterIndices.push_back((unsigned)value);
         t.templateParameterKinds = j.value("tk", std::string{});
         t.isConst = j.value("cn", false);
         t.isNoexcept = j.value("nx", false);
@@ -2826,6 +2832,7 @@ bool LLVMBackend::TryLoadCHeaderDiskCache(
         // record has none, so `new T` of such a class would call the global allocator.
         // v87 recognizes forwarding references in C++ function parameter packs.
         // v88 publishes global class and alias-template names for bare CFlat type requests.
+        // v89 stores function-template parameter names and forwarding template-parameter indices.
         if (version != kCHeaderCacheVersion) return cacheMiss("cache version");
 
         if (!expectedRequestKey.empty()
@@ -3246,6 +3253,7 @@ void LLVMBackend::WriteCHeaderDiskCache(
         // v86 exports class-scope operator new / delete / new[] / delete[] members.
         // v87 recognizes forwarding references in C++ function parameter packs.
         // v88 publishes global class and alias-template names for bare CFlat type requests.
+        // v89 stores function-template parameter names and forwarding template-parameter indices.
         j["version"] = kCHeaderCacheVersion;
         j["mtime"]   = (int64_t)mtime.time_since_epoch().count();
         j["hash"]    = contentHash;
