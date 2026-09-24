@@ -111,6 +111,7 @@ same function. The trailing `int` is optional where C allows it (`unsigned long 
 | `unsigned long` | `ulong` |
 | `long long`, `long long int`, `signed long long`, `signed long long int` | `i64` |
 | `unsigned long long`, `unsigned long long int` | `u64` |
+| `long double` | `longdouble` |
 
 The C++ character spellings `char8_t`, `char16_t`, `char32_t`, and `wchar_t` are accepted as
 aliases for `c8`, `c16`, `c32`, and `wchar`. These are identity types for C++ template
@@ -118,8 +119,9 @@ specializations, not aliases for `i8`, `u16`, `u32`, or one another. `c8`, `c16`
 unsigned 8-, 16-, and 32-bit values. `wchar` follows the target ABI: it is unsigned 16-bit on
 Windows and signed 32-bit on the supported LP64 targets.
 
-`long double` is not a native CFlat type. It is accepted only as a C++ template argument (where
-it is represented internally as `longdouble`); use `double` for native CFlat declarations.
+`long double` and `longdouble` name the same native CFlat type. It uses the `double` LLVM
+representation and preserves its C++ identity on targets where `long double` is 64-bit IEEE.
+C++ `long double` interop remains refused on targets with a different representation.
 
 `int` and `long` follow the native C ABI of the **target** platform, exactly as a C compiler
 would - the target is the one selected by `--platform`, not the host you compile on. `long` is

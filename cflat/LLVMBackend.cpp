@@ -2383,6 +2383,7 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
     // Clang's own initializers are in llvm.global_ctors only after the link above, so the
     // single-driver rewrite that fixes construction order has to run here, not earlier.
     FinalizeGlobalConstructorOrder();
+    StampProgramTargetAttributes();
 
     {
         llvm::TimeTraceScope verifyScope("VerifyModule");
@@ -6350,6 +6351,7 @@ bool LLVMBackend::RunInit(const std::string& runtimeDir, bool verbose)
         return false;
     }
     std::cout << std::format("Cache directory: {}\n", cacheDir);
+    (void)GetCHeaderCacheDir();
 
     // Record this exe's path so the VS Code extension can auto-detect the compiler.
     if (WriteCompilerPathToCache())

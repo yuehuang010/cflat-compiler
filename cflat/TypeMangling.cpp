@@ -22,7 +22,7 @@ struct TypeManglingAccess
             || base == "i32" || base == "u32" || base == "i64" || base == "u64"
             || base == "i128" || base == "u128"
             || base == "c8" || base == "c16" || base == "c32" || base == "wchar"
-            || base == "float" || base == "double" || base == "bool"
+            || base == "float" || base == "double" || base == "longdouble" || base == "bool"
             || base == "char" || base == "string" || base == "void")
             return;
         compiler.gts.mangledArityHints[std::string(mangled)] = arity;
@@ -502,7 +502,7 @@ std::string PrintTypeSpelling(const LLVMBackend& compiler, const TypeSpelling& s
     if (spelling.value) return spelling.base;
 
     std::string result = spelling.alias ? "alias " : "";
-    result += spelling.base;
+    result += spelling.base == "longdouble" ? "long double" : spelling.base;
     if (!spelling.args.empty())
     {
         result += "<";

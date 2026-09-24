@@ -1,0 +1,33 @@
+import cpp "cpp_interop_sink_blame.h";
+
+// A deleted-copy diagnostic is reported only when clang's error names the argument's own copy
+// constructor; any other instantiation failure keeps its own text.
+extern int main()
+{
+    expect_error("member 'observe' of C++ class 'sbl.Obs<int>' cannot be instantiated for these template arguments") {
+        sbl.Obs<int> o = default;
+        int l = 4;
+        int r = o.observe(l);
+    }
+    expect_error("member 'observe' of C++ class 'sbl.Obs3<sbl.Key>' cannot be instantiated for these template arguments") {
+        sbl.Obs3<sbl.Key> o = default;
+        sbl.Key l = sbl.Key(4);
+        int r = o.observe(l);
+    }
+    expect_error("(clang: call to implicitly-deleted copy constructor of 'struct Hold')") {
+        sbl.Reg<sbl.Key> r = default;
+        sbl.Key k = sbl.Key(4);
+        int x = r.del(k);
+    }
+    expect_error("(clang: no member named 'nonexistent' in 'sbl::Key')") {
+        sbl.Reg<sbl.Key> r = default;
+        sbl.Key k = sbl.Key(4);
+        int x = r.lv(k);
+    }
+    expect_error("cannot copy C++ class 'sbl.Key' into parameter 't' of 'add': its copy constructor is deleted - pass 'move x' or a temporary") {
+        sbl.ByVal<sbl.Key> b = default;
+        sbl.Key l = sbl.Key(4);
+        b.add(l);
+    }
+    return 0;
+}

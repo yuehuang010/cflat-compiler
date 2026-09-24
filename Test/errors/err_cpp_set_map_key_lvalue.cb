@@ -1,0 +1,34 @@
+import cpp "vector";
+import cpp "set";
+import cpp "map";
+import cpp "utility";
+import cpp "cpp_interop_lvalue_sink.h";
+
+// Inserting a deleted-copy key lvalue into set/map, or filling a vector from one, copies it:
+// refuse with the deleted-copy diagnostic (these used to crash the compiler).
+[cpp] struct KeyCheck : cplv.Module
+{
+    int k = 0;
+    KeyCheck(int value) { k = value; tag = value; }
+};
+
+extern int main()
+{
+    // clang's copy diagnostic arises in the header harvest, where it is not captured.
+    expect_error("parameter '__v' of 'insert' is an rvalue reference; pass 'move <arg>' or a temporary") {
+        std.set<cplv.Key> keys = default;
+        cplv.Key local = cplv.Key(4);
+        keys.insert(local);
+    }
+    // clang rejects insert<P> on is_constructible and never names a copy constructor.
+    expect_error("no instantiation of C++ function template 'std.map$cplv.Key$int.insert' accepts these argument types (std.map$cplv.Key$int, std.pair$cplv.Key$int) (clang: no matching member function for call to 'insert')") {
+        std.map<cplv.Key, int> table = default;
+        std.pair<cplv.Key, int> entry = std.make_pair(cplv.Key(4), 7);
+        table.insert(entry);
+    }
+    expect_error("cannot copy C++ class 'KeyCheck' into constructor parameter '__x'") {
+        KeyCheck local = KeyCheck(4);
+        std.vector<KeyCheck> values = std.vector<KeyCheck>(3, local);
+    }
+    return 0;
+}

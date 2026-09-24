@@ -50,6 +50,15 @@
 //     Plain CFlat aggregate and bare-class interface calls pin the existing ABI neighbours.
 //   C++ sink parameter checks (2060-2079) for a CFlat-defined [cpp] derived struct: push_back
 //     refuses an implicit copy, while explicit move, temporaries, emplace_back, and const-ref borrowing work.
+//   C++ container members over deleted-copy keys and elements (2090-2099): set/map lookups by
+//     const-ref lvalue, insert by move and temporary, map emplace, and emplace_back(move) bind.
+//   C++ override helper ABI returns (2100-2109): void, scalar, pointer, reference, 8/16-byte
+//     aggregates, and sret, with the adjacent scalar forms kept as value-checking neighbours.
+//   C++ contiguous container -> CFlat T[] call-site decay (3510-3519): vectors, references,
+//     temporaries, array, string, span, nested calls, fields, mutation, exact elements and rank.
+//   C++ proxy prvalue assignment and binary operators (2100-2129): assignment and conversion cases
+//     mutate the temporary's referent, temporary destruction is exact, and C++ member/free/builtin
+//     comparisons bind while the implicit-only assignment remains an error.
 
 import cpp "library/cpp_interop_basic.h";
 import cpp "library/cpp_interop_basic.cpp";
@@ -57,6 +66,7 @@ import cpp "library/cpp_interop_basic.cpp";
 // virtual function needs a real symbol and the vtable needs a key function.
 import cpp "library/cpp_interop_poly.h";
 import cpp "library/cpp_interop_poly.cpp";
+import cpp "library/cpp_interop_override_abi.h";
 // The CFlat-defined [cpp] structs below derive from C++ class-template specializations, and
 // the make_shared checks register them through std::shared_ptr.
 import cpp "library/cpp_interop_tpl.h";
@@ -69,8 +79,22 @@ import cpp "map";
 import cpp "set";
 import cpp "list";
 import cpp "array";
+import cpp "library/cpp_interop_view_decay.h";
 import cpp "library/cpp_interop_lvalue_sink.h";
 import cpp "library/cpp_interop_assign.h";
+import cpp "library/cpp_interop_proxy_assign.h";
+
+int proxyCppAssignValue = 0;
+[cpp] struct ProxyCppRecord
+{
+    int value = 0;
+    void operator=(int next) { value = next; proxyCppAssignValue = next; }
+};
+ProxyCppRecord makeProxyCppRecord()
+{
+    ProxyCppRecord result = default;
+    return move result;
+}
 // std::function as a MEMBER parameter and as a RETURN type.
 import cpp "library/cpp_interop_stdfn.h";
 import cpp "library/cpp_interop_twin.h";
@@ -85,6 +109,49 @@ import "list.cb";
     int k = 0;
     BridgeSinkCheck(int value) { k = value; tag = value; }
     override int forward(int x) { return x + k; }
+};
+
+[cpp] struct BridgeOverrideAbi : cppoa.Base
+{
+    int field = 0;
+    override void set_value(int* out) { *out = 47; }
+    override int integer() { return 37; }
+    override double floating() { return 19.5; }
+    override int* pointer() { field = 41; return &field; }
+    override int* reference() { field = 43; return &field; }
+    override cppoa.Small8 small8()
+    {
+        cppoa.Small8 result = default;
+        result.a = 3;
+        result.b = 4;
+        return result;
+    }
+    override cppoa.Small16 small16()
+    {
+        cppoa.Small16 result = default;
+        result.a = 5;
+        result.b = 7;
+        return result;
+    }
+    override cppoa.Large24 large24()
+    {
+        cppoa.Large24 result = default;
+        result.a = 1;
+        result.b = 2;
+        result.c = 3;
+        return result;
+    }
+    override int byvalue(cppoa.Dtor value) { return value.value + 1; }
+};
+
+[cpp] struct BridgeGenericOverrideAbi<T> : cppoa.GenericBase<T>
+{
+    override T value(cppoa.Dtor value)
+    {
+        T result = default;
+        result.a = value.value;
+        return result;
+    }
 };
 
 int bridge_cf_ctor = 0;
@@ -1970,6 +2037,70 @@ GFieldOne gfieldEmptyBrace = {};
 GFieldOne gfieldBare;
 [cpp] struct GFieldBridgeHolder { cppa.GTrk item = default; };
 GFieldBridgeHolder gfieldBridge = default;
+
+int bridge_view_sum(int[] values)
+{
+    return values[0] * 10 + values[1];
+}
+
+void bridge_view_fill(int[] values)
+{
+    values[0] = 61;
+}
+
+int bridge_view_generic<T>(T values)
+{
+    return bridge_view_sum(values);
+}
+
+int bridge_view_inferred<T>(T[] values)
+{
+    return values[0] * 10 + values[1];
+}
+
+int bridge_view_inferred_nested<T>(T[] values)
+{
+    return bridge_view_inferred(values);
+}
+
+int bridge_view_pair<T>(T[] a, T[] b)
+{
+    return a[0] * 10 + b[1];
+}
+
+int bridge_view_scale<T>(T[] values, T k)
+{
+    return values[0] * k;
+}
+
+int bridge_view_string_generic<T>(T[] values)
+{
+    return (int)values[0] + (int)values[1] + (int)values[2];
+}
+
+int bridge_view_check_string(char[] values)
+{
+    return values[0] == 'a' && values[1] == 'b' && values[2] == 'c'
+        && values[3] == '\0' ? 1 : 0;
+}
+
+std.vector<int> bridge_view_make_vector()
+{
+    std.vector<int> values = default;
+    values.push_back(5); values.push_back(8);
+    return move values;
+}
+
+int bridge_view_class_sum(cppview.Item[] values)
+{
+    return values[0].value * 10 + values[1].value;
+}
+
+int bridge_view_rank(int[] values) { return 100 + values[0]; }
+int bridge_view_rank(std.vector<int> values) { return 200 + values[0]; }
+
+struct BridgeViewHolder { std.vector<int> values; };
+[cpp] struct BridgeViewCppHolder { std.vector<int> values; };
 
 int bridge_global_field_static_value()
 {
@@ -4420,6 +4551,303 @@ extern int main(int argc, char** argv)
     }
     if (bridge_passed - bridgeLvaStartPassed != bridge_checks - bridgeLvaStartChecks)
         return 2089;
+
+    // ---- C++ container members over deleted-copy keys (2090-2099) ---------------------
+    int bridgeKeyStartChecks = bridge_checks;
+    int bridgeKeyStartPassed = bridge_passed;
+    {
+        std.set<cplv.Key> keys = default;
+        keys.insert(cplv.Key(4));
+        keys.insert(cplv.Key(2));
+        cplv.Key probe = cplv.Key(4);
+        int found = 0;
+        if (keys.find(probe) != keys.end()) found = 1;
+        bridge_check("KEY set find const-ref lvalue", found, 1);
+        bridge_check("KEY set count const-ref lvalue", (int)keys.count(probe), 1);
+        bridge_check("KEY set erase const-ref lvalue", (int)keys.erase(probe), 1);
+        bridge_check("KEY set size after erase", (int)keys.size(), 1);
+        bridge_check("KEY set probe untouched", probe.value(), 4);
+    }
+    {
+        std.set<cplv.Key> keys = default;
+        cplv.Key local = cplv.Key(7);
+        cplv.Key* source = &local;
+        keys.insert(move local);
+        keys.insert(cplv.Key(3));
+        bridge_check("KEY set insert move+temporary size", (int)keys.size(), 2);
+        bridge_check("KEY set insert moved-from", source.value(), -1);
+        bridge_check("KEY set insert moved value", (int)keys.count(cplv.Key(7)), 1);
+    }
+    {
+        std.map<cplv.Key, int> table = default;
+        table[cplv.Key(4)] = 7;
+        cplv.Key probe = cplv.Key(4);
+        int found = 0;
+        if (table.find(probe) != table.end()) found = 1;
+        bridge_check("KEY map find const-ref lvalue", found, 1);
+        bridge_check("KEY map at const-ref lvalue", table.at(probe), 7);
+    }
+    {
+        std.map<int, cppas.MoveOnly> table = default;
+        table.emplace(1, 5);
+        int key = 1;
+        bridge_check("KEY map move-only value count", (int)table.count(key), 1);
+        bridge_check("KEY map move-only value at", table.at(key).value(), 5);
+    }
+    {
+        std.vector<cplv.Key> values = default;
+        cplv.Key local = cplv.Key(4);
+        cplv.Key* source = &local;
+        values.emplace_back(move local);
+        values.emplace_back(cplv.Key(6));
+        bridge_check("KEY emplace_back move value", values[0].value(), 4);
+        bridge_check("KEY emplace_back temporary value", values[1].value(), 6);
+        bridge_check("KEY emplace_back moved-from", source.value(), -1);
+    }
+    if (bridge_passed - bridgeKeyStartPassed != bridge_checks - bridgeKeyStartChecks)
+        return 2099;
+    // ---- override helper return ABI and accept neighbours (2100-2109) -------------------
+    int bridgeOaStartChecks = bridge_checks;
+    int bridgeOaStartPassed = bridge_passed;
+    {
+        BridgeOverrideAbi derived = default;
+        cppoa.Base* base = &derived;
+        int value = 0;
+        cppoa.call_set_value(base, &value);
+        bridge_check("override ABI void", value, 47);
+        bridge_check("override ABI int", cppoa.call_integer(base), 37);
+        bridge_check("override ABI double", cppoa.call_floating(base), 39);
+        bridge_check("override ABI pointer", cppoa.call_pointer(base), 41);
+        bridge_check("override ABI reference", cppoa.call_reference(base), 43);
+        bridge_check("override ABI small8", cppoa.call_small8(base), 34);
+        bridge_check("override ABI small16", cppoa.call_small16(base), 5000007);
+        bridge_check("override ABI large24", cppoa.call_large24(base), 1002003);
+        cppoa.reset_dtor_count();
+        bridge_check("override ABI nontrivial byvalue", cppoa.call_byvalue(base), 24);
+        bridge_check("override ABI nontrivial byvalue dtors", cppoa.dtor_count(), 3);
+        BridgeGenericOverrideAbi<cppoa.Small8> generic = default;
+        cppoa.GenericBase<cppoa.Small8>* genericBase = &generic;
+        cppoa.Small8 genericValue = cppoa.call_generic_value(genericBase, cppoa.Dtor(11));
+        bridge_check("override ABI generic fallback small8", genericValue.a, 11);
+    }
+    if (bridge_passed - bridgeOaStartPassed != bridge_checks - bridgeOaStartChecks)
+        return 2109;
+
+    // ---- C++ contiguous-container -> T[] call-site decay (3510-3519) -------------------
+    int bridgeViewStartChecks = bridge_checks;
+    int bridgeViewStartPassed = bridge_passed;
+    {
+        std.vector<int> values = default;
+        values.push_back(4); values.push_back(7);
+        bridge_check("VD vector lvalue", bridge_view_sum(values), 47);
+    }
+    if (bridge_passed - bridgeViewStartPassed != bridge_checks - bridgeViewStartChecks)
+        return 3510;
+
+    int bridgeViewTempStartChecks = bridge_checks;
+    int bridgeViewTempStartPassed = bridge_passed;
+    bridge_check("VD vector temporary full-expression lifetime",
+                 bridge_view_sum(bridge_view_make_vector()), 58);
+    if (bridge_passed - bridgeViewTempStartPassed != bridge_checks - bridgeViewTempStartChecks)
+        return 3511;
+
+    int bridgeViewRefStartChecks = bridge_checks;
+    int bridgeViewRefStartPassed = bridge_passed;
+    bridge_check("VD vector reference result", bridge_view_sum(cppview.vector_ref()), 69);
+    bridge_check("VD const vector reference result",
+                 bridge_view_sum(cppview.const_vector_ref()), 69);
+    if (bridge_passed - bridgeViewRefStartPassed != bridge_checks - bridgeViewRefStartChecks)
+        return 3512;
+
+    int bridgeViewArrayStartChecks = bridge_checks;
+    int bridgeViewArrayStartPassed = bridge_passed;
+    {
+        std.array<int, 2> values = default;
+        values[0] = 4; values[1] = 8;
+        bridge_check("VD std.array", bridge_view_sum(values), 48);
+    }
+    if (bridge_passed - bridgeViewArrayStartPassed != bridge_checks - bridgeViewArrayStartChecks)
+        return 3513;
+
+    int bridgeViewSpanStartChecks = bridge_checks;
+    int bridgeViewSpanStartPassed = bridge_passed;
+    bridge_check("VD std.span", bridge_view_sum(cppview.span_ref()), 69);
+    if (bridge_passed - bridgeViewSpanStartPassed != bridge_checks - bridgeViewSpanStartChecks)
+        return 3514;
+
+    int bridgeViewStringStartChecks = bridge_checks;
+    int bridgeViewStringStartPassed = bridge_passed;
+    {
+        std.string values = std.string("abc");
+        bridge_check("VD string size excludes terminator", (int)values.size(), 3);
+        bridge_check("VD string data contents and terminator", bridge_view_check_string(values), 1);
+    }
+    if (bridge_passed - bridgeViewStringStartPassed != bridge_checks - bridgeViewStringStartChecks)
+        return 3515;
+
+    int bridgeViewNestedStartChecks = bridge_checks;
+    int bridgeViewNestedStartPassed = bridge_passed;
+    {
+        std.vector<int> values = default;
+        values.push_back(5); values.push_back(8);
+        bridge_check("VD generic nested call", bridge_view_generic(values), 58);
+        Lambda<int()> nested = () => { return bridge_view_sum(values); };
+        bridge_check("VD lambda nested call", nested(), 58);
+    }
+    if (bridge_passed - bridgeViewNestedStartPassed != bridge_checks - bridgeViewNestedStartChecks)
+        return 3516;
+
+    int bridgeViewMutationStartChecks = bridge_checks;
+    int bridgeViewMutationStartPassed = bridge_passed;
+    {
+        std.vector<int> values = default;
+        values.push_back(3); values.push_back(6);
+        bridge_view_fill(values);
+        bridge_check("VD mutation aliases vector storage", values[0], 61);
+    }
+    if (bridge_passed - bridgeViewMutationStartPassed != bridge_checks - bridgeViewMutationStartChecks)
+        return 3517;
+
+    int bridgeViewFieldStartChecks = bridge_checks;
+    int bridgeViewFieldStartPassed = bridge_passed;
+    {
+        BridgeViewHolder regular = default;
+        regular.values.push_back(2); regular.values.push_back(9);
+        bridge_check("VD regular CFlat field", bridge_view_sum(regular.values), 29);
+        BridgeViewCppHolder bridge = default;
+        bridge.values.push_back(2); bridge.values.push_back(9);
+        bridge_check("VD [cpp] holder field", bridge_view_sum(bridge.values), 29);
+    }
+    if (bridge_passed - bridgeViewFieldStartPassed != bridge_checks - bridgeViewFieldStartChecks)
+        return 3518;
+
+    int bridgeViewRankStartChecks = bridge_checks;
+    int bridgeViewRankStartPassed = bridge_passed;
+    bridge_check("VD C++ class element exact view", bridge_view_class_sum(cppview.make_items()), 135);
+    {
+        std.vector<int> values = default;
+        values.push_back(7);
+        bridge_check("VD exact C++ class overload beats view decay",
+                     bridge_view_rank(values), 207);
+    }
+    {
+        int[2] values = {3, 7};
+        bridge_check("VD existing fixed-array view caller", bridge_view_sum(values), 37);
+    }
+    if (bridge_passed - bridgeViewRankStartPassed != bridge_checks - bridgeViewRankStartChecks)
+        return 3519;
+
+    int bridgeViewGenericStartChecks = bridge_checks;
+    int bridgeViewGenericStartPassed = bridge_passed;
+    {
+        std.vector<int> values = default;
+        values.push_back(4); values.push_back(7);
+        std.vector<long> longValues = default;
+        longValues.push_back(5); longValues.push_back(8);
+        int[2] nativeInt2 = { 2, 9 };
+        int[] existingView = nativeInt2;
+        bridge_check("VD inferred vector int", bridge_view_inferred(values), 47);
+        bridge_check("VD inferred vector long", bridge_view_inferred(longValues), 58);
+        bridge_check("VD inferred vector plus native array", bridge_view_pair(values, nativeInt2), 49);
+        bridge_check("VD inferred existing view", bridge_view_inferred(existingView), 29);
+        bridge_check("VD inferred scalar deduction", bridge_view_scale(values, 3), 12);
+        bridge_check("VD nested inferred generic", bridge_view_inferred_nested(values), 47);
+        std.string text = std.string("abc");
+        bridge_check("VD inferred string char view", bridge_view_string_generic(text), 294);
+    }
+    if (bridge_passed - bridgeViewGenericStartPassed != bridge_checks - bridgeViewGenericStartChecks)
+        return 3520;
+
+    // ---- C++ proxy prvalue assignment and binary operators (2100-2129) -----------------
+    int bridgeProxyStartChecks = bridge_checks;
+    int bridgeProxyStartPassed = bridge_passed;
+    {
+        std.vector<bool> bits = default;
+        bits.push_back(false);
+        bits.push_back(true);
+        bits[0] = true;
+        bridge_check("PROXY vector bool assign true", bits[0] ? 1 : 0, 1);
+        bits[0] = false;
+        bridge_check("PROXY vector bool assign false", bits[0] ? 1 : 0, 0);
+        bits[0] = bits[1];
+        bridge_check("PROXY vector bool assign proxy rhs", bits[0] ? 1 : 0, 1);
+        bits[0] = bits[1] = true;
+        bridge_check("PROXY vector bool chained assignment", bits[0] && bits[1] ? 1 : 0, 1);
+        bool copied = bits[0];
+        bridge_check("PROXY vector bool read", copied ? 1 : 0, 1);
+        bridge_check("PROXY vector bool member equality", bits[0] == true ? 1 : 0, 1);
+        bridge_check("PROXY vector bool reversed equality", true == bits[0] ? 1 : 0, 1);
+        bridge_check("PROXY vector bool inequality", bits[0] != bits[1] ? 1 : 0, 0);
+        bridge_check("PROXY vector bool logical and", bits[0] && copied ? 1 : 0, 1);
+        int entered = 0;
+        if (bits[0]) entered = 1;
+        bridge_check("PROXY vector bool condition", entered, 1);
+    }
+    {
+        std.vector<int> values = default;
+        values.push_back(4);
+        values[0] = 19;
+        bridge_check("PROXY vector int reference assignment", values[0], 19);
+    }
+    {
+        cpppa.AssignBox box = default;
+        int before = cpppa.proxy_dtor_count;
+        box[0] = 31;
+        bridge_check("PROXY full-expression temporary dtor", cpppa.proxy_dtor_count - before, 1);
+        bridge_check("PROXY user assignment value", box[0], 31);
+    }
+    {
+        cpppa.VoidBox box = default;
+        box[1] = 37;
+        bridge_check("PROXY void assignment return", box[1], 37);
+    }
+    {
+        cpppa.CompoundBox box = default;
+        box[2] |= 5;
+        bridge_check("PROXY declared compound assignment", box[2], 5);
+    }
+    {
+        cpppa.TemplateAssignBox box = default;
+        box[3] = 53;
+        bridge_check("PROXY templated assignment operator", box[3], 53);
+    }
+    {
+        cpppa.ProxyIntBox box = default;
+        box[0] = box[1] = 3;
+        bridge_check("PROXY custom int chained assignment", box[0], 3);
+        bridge_check("PROXY custom int chained rhs", box[1], 3);
+    }
+    {
+        cpppa.MemberEqBox box = default;
+        bridge_check("PROXY member equality overload", box[1] == true ? 1 : 0, 1);
+        cpppa.FreeEqBox freeBox = default;
+        bridge_check("PROXY free equality overload", freeBox[1] == true ? 1 : 0, 1);
+        cpppa.ConvertBox convertBox = default;
+        bridge_check("PROXY conversion then builtin equality", convertBox[1] == true ? 1 : 0, 1);
+    }
+    {
+        cpppa.BoolOnlyBox box = default;
+        bridge_check("PROXY bool-only equality", box[1] == true ? 1 : 0, 1);
+        bridge_check("PROXY bool-only inequality", box[1] != false ? 1 : 0, 1);
+        bridge_check("PROXY bool-only logical and", box[1] && box[1] ? 1 : 0, 1);
+        int entered = 0;
+        if (box[1] && box[1]) entered = 1;
+        bridge_check("PROXY bool-only condition", entered, 1);
+    }
+    {
+        cpppa.IntOnlyBox box = default;
+        bridge_check("PROXY int-only addition", box[1] + 1, 2);
+        bridge_check("PROXY int-only less-than", box[1] < 2 ? 1 : 0, 1);
+        bridge_check("PROXY int-only equality", box[1] == 1 ? 1 : 0, 1);
+    }
+    {
+        ProxyCppRecord record = makeProxyCppRecord();
+        record.value = 2;
+        makeProxyCppRecord() = 43;
+        bridge_check("PROXY CFlat-defined cpp record assignment", proxyCppAssignValue, 43);
+    }
+    if (bridge_passed - bridgeProxyStartPassed != bridge_checks - bridgeProxyStartChecks)
+        return 2129;
 
     return 0;
 }

@@ -64,17 +64,16 @@ LLVMBackend::DeclTypeAndValue ForwardRefScanner::ParseDeclarationSpecifiers(CFla
         std::string canonicalTypeName;
         PrimitiveTypeError canonicalTypeError;
         CanonicalizePrimitiveTypeWords(typeWords, canonicalTypeName, canonicalTypeError);
-        if (canonicalTypeName == "longdouble" && !HasPrimitiveTypeError(canonicalTypeError))
-            canonicalTypeError = LongDoubleNativeTypeError();
+        if (canonicalTypeName == "longdouble" && !HasPrimitiveTypeError(canonicalTypeError)
+            && !compiler->IsCInteropLongDoubleSupported())
+            compiler->LogError(compiler->CInteropLongDoubleRefusal());
         if (HasPrimitiveTypeError(canonicalTypeError))
         {
             // Point at the written type words, not at the declaration's first column.
             auto* errorSpec = LastDeclarationTypeSpecifier(declSpecs->declarationSpecifier());
             auto* errorCompiler = errorSpec != nullptr ? Compiler(errorSpec) : Compiler(declSpecs);
             errorCompiler->LogError(LocalizePrimitiveTypeError(errorCompiler, canonicalTypeError));
-            // Recover as the CFlat spelling so the unknown 'longdouble' cannot cascade.
-            if (canonicalTypeError.kind == PrimitiveTypeErrorKind::LongDoubleNative)
-                canonicalTypeName = "double";
+            // Recover as the CFlat spelling so an invalid type cannot cascade.
         }
         else if (typeWords.size() > 1)
         {

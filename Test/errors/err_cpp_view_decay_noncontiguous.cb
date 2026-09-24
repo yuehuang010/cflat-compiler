@@ -1,0 +1,47 @@
+import cpp "list";
+import cpp "vector";
+import cpp "cpp_interop_view_decay.h";
+
+int first(int[] values)
+{
+    return values[0];
+}
+
+int first_base(cppview.Base[] values)
+{
+    return values[0].value;
+}
+
+int pair_view<T>(T[] a, T[] b)
+{
+    return a[0] + b[0];
+}
+
+extern int main()
+{
+    expect_error("contiguous view decay requires public data() and size(); data() must return exactly 'int*' or 'const int*'")
+    {
+        std.list<int> values = default;
+        values.push_back(5);
+        first(values);
+    }
+    expect_error("contiguous view decay requires public data() and size(); data() must return exactly 'int*' or 'const int*'")
+    {
+        std.vector<long> values = default;
+        values.push_back(5);
+        first(values);
+    }
+    expect_error("contiguous view decay requires public data() and size(); data() must return exactly 'cppview.Base*' or 'const cppview.Base*'")
+    {
+        first_base(cppview.make_derived());
+    }
+    expect_error("cannot pass C++ class 'std.vector<int>' to array-view parameter 'a' of 'pair_view<long>'")
+    {
+        std.vector<int> ints = default;
+        std.vector<long> longs = default;
+        ints.push_back(1);
+        longs.push_back(2);
+        pair_view(ints, longs);
+    }
+    return 0;
+}

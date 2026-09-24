@@ -14,6 +14,7 @@
 #include <cstdint>
 #include <functional>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -22,6 +23,7 @@ namespace clang
     class CompilerInstance;
     class TranslationUnitDecl;
     class Decl;
+    class FunctionDecl;
 }
 
 namespace llvm
@@ -160,6 +162,8 @@ namespace cflat_cinterop
         bool isCxx = false;
         bool isNoexcept = false;
         std::string bindRefusal;
+        // The clang diagnostic lines behind a refusal, when one is known (never displayed).
+        std::string refusalCause;
         // Clang's ABI arrangement for this declaration. Filled only in cxxMode.
         RawAbi abi;
         std::string file;
@@ -271,6 +275,8 @@ namespace cflat_cinterop
          * arrangement is even attempted.
          */
         std::string bindRefusal;
+        // The clang diagnostic lines behind a refusal, when one is known (never displayed).
+        std::string refusalCause;
         // Copy / move constructor and copy / move assignment recognition, so the backend can
         // bind `T y = x;`, `y = x;` and `T y = move x;` without re-deriving it from the params.
         bool isCopyCtor = false;
@@ -557,6 +563,11 @@ namespace cflat_cinterop
         // declarations are exported; the included header remains available to CodeGen.
         std::vector<std::string> cxxFunctionWrapperNames;
         bool cxxWrapperBatch = false;
+        // A live Interpreter's POISONED bodies: specializations emptied because their instantiation
+        // failed in an earlier chunk, with the reason. A body reaching one is refused, not bound.
+        std::unordered_map<const clang::FunctionDecl*, std::string>* poisonedFunctions = nullptr;
+        // Per failed instantiation, the clang error group that named it (error plus notes).
+        const std::unordered_map<const clang::FunctionDecl*, std::string>* errorCauses = nullptr;
         // Header extraction may need one retry after forcing a named specialization complete.
         bool autoInstantiateCxxTypes = true;
         /*

@@ -42,3 +42,15 @@ never emitted. Which record in `cpp_interop_tpl.h` triggers it is not identified
 
 Find the destructor (bisect `cpp_interop_tpl.h`), then skip trivial destructors wherever cflat
 forces emission. Debug `test.bat` should then get past this header.
+
+## Status 2026-09-23 (macOS arm64)
+
+Does not reproduce on macOS Debug (assertions-enabled LLVM 23.1 tree): the minimal importer
+passes in incremental and legacy mode, and test_cpp_interop_template.cb / test_cpp_interop_bridge.cb
+pass under `--check`. The assert text mentions `DLLExportAttr`, so the trigger is Windows-only
+(MSVC ABI dllexport handling). Needs a Windows Debug session to bisect. Candidate forcing sites
+audited on macOS (no measurement): `DefineDefaultedSpecialMembers` marks every unbodied defaulted
+method with no triviality guard; `ComputeCxxMemberAbi` calls `GetAddrOfGlobal` per eligible member;
+`EmitCxxDefinitions` replays announced declarations without a trivial-destructor predicate.
+Two separate macOS Debug-only asserts found during the sweep are filed as
+p2/cpp-debug-invalid-constexpr-cast.md and p2/cpp-debug-incomplete-deque-itaniummangle-unreachable.md.

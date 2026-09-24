@@ -996,10 +996,14 @@ namespace cflat_cinterop
                 const bool isFreeBinaryOperatorTemplate =
                     !llvm::isa<CXXMethodDecl>(fd) && fd->getNumParams() == 2
                     && IsBindableFreeBinaryOperator(fd->getOverloadedOperator());
-                if (!fd->getIdentifier() && !isFreeBinaryOperatorTemplate) return true;
                 const auto* md = llvm::dyn_cast<CXXMethodDecl>(fd);
                 if (md != nullptr && md->getAccess() != AS_public) return true;
                 if (md == nullptr && fd->getStorageClass() == SC_Static) return true;
+                const bool isMemberAssignmentOperatorTemplate = md != nullptr
+                    && md->getOverloadedOperator() == OO_Equal
+                    && !md->isCopyAssignmentOperator() && !md->isMoveAssignmentOperator();
+                if (!fd->getIdentifier() && !isFreeBinaryOperatorTemplate
+                    && !isMemberAssignmentOperatorTemplate) return true;
 
                 unsigned typeParameterCount = 0;
                 std::string templateParameterKinds;
@@ -1055,7 +1059,9 @@ namespace cflat_cinterop
                         && !IsValidDottedName(result.name.substr(0, dot)))
                         return true;
                 }
-                else if (!IsValidDottedName(result.name)) return true;
+                else if (isMemberAssignmentOperatorTemplate
+                    ? !IsValidDottedName(CxxQualifiedName(md->getParent()))
+                    : !IsValidDottedName(result.name)) return true;
                 if (md != nullptr)
                 {
                     result.owner = CxxQualifiedName(md->getParent());
@@ -1745,6 +1751,11 @@ namespace cflat_cinterop
                     bool isBindableOperator = false;
                     switch (md->getOverloadedOperator())
                     {
+                        // Non-special operator= overloads (for example operator=(int)) are
+                        // ordinary callable members. Copy/move assignment stays on the special-
+                        // member path above and below, never in the member operator table.
+                        case OO_Equal:
+                            isBindableOperator = !isAssignSpecial; break;
                         case OO_Subscript: case OO_EqualEqual: case OO_ExclaimEqual:
                         case OO_Plus: case OO_Minus: case OO_Star: case OO_Slash:
                         case OO_PlusEqual: case OO_MinusEqual:
@@ -3872,13 +3883,57 @@ namespace cflat_cinterop
                 // Off for a translation unit that reported no error at all: no body can hold an
                 // error expression then, so the whole walk is skipped.
                 bool active = true;
+                // A live Interpreter's bodies emptied by an earlier chunk (see ExtractRequest).
+                const std::unordered_map<const FunctionDecl*, std::string>* poisoned = nullptr;
+
+                // The reason of the first poisoned body a walk reached, for the refusal text.
+                std::string poisonReason;
+                // Clang error groups per failed instantiation (ExtractRequest::errorCauses), and
+                // per refused definition the diagnostic lines of the body that doomed it.
+                const std::unordered_map<const FunctionDecl*, std::string>* causes = nullptr;
+                std::unordered_map<const FunctionDecl*, std::string> causeMemo;
+
+                static const FunctionDecl* DefinitionOf(const FunctionDecl* fd)
+                {
+                    const FunctionDecl* def = nullptr;
+                    if (!fd->hasBody(def) || def == nullptr) def = fd;
+                    return def;
+                }
+
+                std::string OwnCause(const FunctionDecl* def) const
+                {
+                    if (poisoned != nullptr)
+                        if (auto it = poisoned->find(def); it != poisoned->end()) return it->second;
+                    if (causes != nullptr)
+                        if (auto it = causes->find(def); it != causes->end()) return it->second;
+                    return std::string();
+                }
+
+                std::string CauseOf(const FunctionDecl* fd) const
+                {
+                    if (fd == nullptr) return std::string();
+                    auto it = causeMemo.find(DefinitionOf(fd));
+                    return it == causeMemo.end() ? std::string() : it->second;
+                }
+
+                bool IsPoisoned(const FunctionDecl* fd)
+                {
+                    if (poisoned == nullptr || poisoned->empty() || fd == nullptr) return false;
+                    const FunctionDecl* def = nullptr;
+                    if (!fd->hasBody(def) || def == nullptr) def = fd;
+                    auto it = poisoned->find(def);
+                    if (it == poisoned->end()) it = poisoned->find(fd);
+                    if (it == poisoned->end()) return false;
+                    if (poisonReason.empty()) poisonReason = it->second;
+                    return true;
+                }
 
                 // The body of THIS function contains an error expression (as opposed to
                 // reaching one through a call).
                 bool HasOwnError(const FunctionDecl* fd)
                 {
                     if (fd == nullptr) return false;
-                    if (fd->isInvalidDecl()) return true;
+                    if (fd->isInvalidDecl() || IsPoisoned(fd)) return true;
                     struct OwnErrorVisitor : RecursiveASTVisitor<OwnErrorVisitor>
                     {
                         bool found = false;
@@ -3931,21 +3986,31 @@ namespace cflat_cinterop
                             return true;
                         }
                     } visitor;
-                    if (def->isInvalidDecl()) { memo[def] = true; return true; }
+                    if (def->isInvalidDecl() || IsPoisoned(def))
+                    {
+                        memo[def] = true;
+                        causeMemo[def] = OwnCause(def);
+                        return true;
+                    }
                     if (def->getBody() != nullptr) visitor.TraverseStmt(def->getBody());
                     bool bad = visitor.found;
+                    if (bad) causeMemo[def] = OwnCause(def);
                     for (const FunctionDecl* callee : visitor.callees)
                     {
                         if (bad) break;
                         if (callee == nullptr || callee == def) continue;
                         bad = Reaches(callee, depth + 1);
+                        if (bad) causeMemo[def] = CauseOf(callee);
                     }
                     memo[def] = bad;
                     return bad;
                 }
             };
             auto errorReach = std::make_shared<ErrorReachScan>();
-            errorReach->active = sawParseErrors;
+            errorReach->poisoned = st.req.poisonedFunctions;
+            errorReach->causes = st.req.errorCauses;
+            errorReach->active = sawParseErrors
+                || (st.req.poisonedFunctions != nullptr && !st.req.poisonedFunctions->empty());
             auto declHasErrors = [errorReach](const Decl* d) {
                 if (d == nullptr || d->isInvalidDecl()) return true;
                 if (const auto* fd = llvm::dyn_cast<FunctionDecl>(d))
@@ -3965,6 +4030,27 @@ namespace cflat_cinterop
                     return false;
                 }
                 return false;
+            };
+            // A requested template wrapper whose body is not emitted must not bind: its call
+            // would link against nothing. Say which instantiation failed instead.
+            auto refuseDroppedRequestWrapper = [&](const FunctionDecl* fd) {
+                if (fd == nullptr || st.req.cxxFunctionWrapperNames.empty()) return;
+                const std::string name = fd->getNameAsString();
+                if (std::find(st.req.cxxFunctionWrapperNames.begin(),
+                              st.req.cxxFunctionWrapperNames.end(), name)
+                    == st.req.cxxFunctionWrapperNames.end())
+                    return;
+                const std::string reason = errorReach->poisonReason.substr(
+                    0, errorReach->poisonReason.find('\n'));
+                for (auto& sig : st.out.sigs)
+                    if ((sig.name == name || sig.linkageName == name) && sig.bindRefusal.empty())
+                    {
+                        sig.bindRefusal = reason.empty()
+                            ? std::string("clang reported an error inside the body it generated")
+                            : reason;
+                        sig.refusalCause = errorReach->CauseOf(fd);
+                        if (sig.refusalCause.empty()) sig.refusalCause = errorReach->poisonReason;
+                    }
             };
             auto isDependentCodeGenDecl = [](const Decl* d) {
                 if (d == nullptr || d->getDeclContext()->isDependentContext()) return true;
@@ -3988,6 +4074,7 @@ namespace cflat_cinterop
                 if (declHasErrors(d))
                 {
                     rememberDroppedWrapper(llvm::dyn_cast<FunctionDecl>(d));
+                    refuseDroppedRequestWrapper(llvm::dyn_cast<FunctionDecl>(d));
                     return;
                 }
                 // The extern "C" half of a default wrapper only forwards to the C++ half. If that
@@ -4043,7 +4130,8 @@ namespace cflat_cinterop
                     if (fd == nullptr || !fd->doesThisDeclarationHaveABody()) return true;
                     // Memoize the whole call graph BEFORE any body is emptied, so a later query
                     // cannot mistake an emptied body for a clean one.
-                    if (scan.Reaches(fd) && scan.HasOwnError(fd)) direct.push_back(fd);
+                    if (!scan.IsPoisoned(fd) && scan.Reaches(fd) && scan.HasOwnError(fd))
+                        direct.push_back(fd);
                     return true;
                 }
             } errorBodies(*errorReach);
@@ -4055,6 +4143,10 @@ namespace cflat_cinterop
                     std::cout << "[verbose]   C++ body emptied, its instantiation reported an "
                                  "error: " << fd->getQualifiedNameAsString() << "\n";
                 fd->setBody(CompoundStmt::CreateEmpty(ctx, /*NumStmts*/ 0, /*HasFPFeatures*/ false));
+                // A live Interpreter keeps this specialization; a later chunk must not see it clean.
+                if (st.req.poisonedFunctions != nullptr)
+                    st.req.poisonedFunctions->emplace(fd, "clang reported an error inside the "
+                        "body it generated for '" + fd->getQualifiedNameAsString() + "'");
             }
 
             // Phase 1: show Clang the whole translation unit. Inline definitions stay deferred.
@@ -4380,8 +4472,11 @@ namespace cflat_cinterop
                 if (w.md != nullptr && errorReach->Reaches(w.md))
                 {
                     if (m.bindRefusal.empty())
+                    {
                         m.bindRefusal = "cannot be instantiated for these template arguments "
                                         "(clang reported an error inside the body it generated)";
+                        m.refusalCause = errorReach->CauseOf(w.md);
+                    }
                     m.linkageName.clear();
                     m.abi = RawAbi{};
                     continue;

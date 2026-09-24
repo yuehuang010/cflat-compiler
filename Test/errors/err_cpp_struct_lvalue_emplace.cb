@@ -1,0 +1,33 @@
+import cpp "vector";
+import cpp "deque";
+import cpp "cpp_interop_lvalue_sink.h";
+
+// emplace forwards its pack by reference, so a [cpp] struct lvalue would be copied into the
+// element: refuse it like push_back instead of storing a default-constructed element.
+[cpp] struct EmplaceCheck : cplv.Module
+{
+    int k = 0;
+    EmplaceCheck(int value) { k = value; tag = value; }
+    override int forward(int x) { return x + k; }
+};
+
+extern int main()
+{
+    expect_error("into parameter '__args' of 'emplace_back': its copy constructor is deleted - pass 'move x'") {
+        std.vector<EmplaceCheck> values = default;
+        EmplaceCheck local = EmplaceCheck(4);
+        values.emplace_back(local);
+    }
+    // A mid-vector emplace copy-assigns; clang's own text names the deleted operator=.
+    expect_error("(clang: overload resolution selected deleted operator '=')") {
+        std.vector<EmplaceCheck> values = default;
+        EmplaceCheck local = EmplaceCheck(5);
+        values.emplace(values.begin(), local);
+    }
+    expect_error("into parameter '__args' of 'emplace_front': its copy constructor is deleted") {
+        std.deque<EmplaceCheck> values = default;
+        EmplaceCheck local = EmplaceCheck(6);
+        values.emplace_front(local);
+    }
+    return 0;
+}

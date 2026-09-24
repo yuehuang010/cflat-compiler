@@ -217,7 +217,7 @@ std::optional<std::string> MainListener::FoldConstLiteral(
             || name == "ulong";
     };
     auto isScalarType = [&](const std::string& name) {
-        return isIntegerType(name) || name == "float" || name == "double"
+        return isIntegerType(name) || name == "float" || name == "double" || name == "longdouble"
             || name == "bool" || name == "string"
             || !compiler->GetEnumBackingType(name).empty();
     };
@@ -251,7 +251,7 @@ std::optional<std::string> MainListener::FoldConstLiteral(
             if (!JsonConstIntegerToken(raw)) { literalError(expression); return {}; }
             return raw;
         }
-        if (fieldType == "float" || fieldType == "double")
+        if (fieldType == "float" || fieldType == "double" || fieldType == "longdouble")
         {
             if (!JsonConstFloatToken(raw)) { literalError(expression); return {}; }
             if (!raw.empty() && (raw.back() == 'f' || raw.back() == 'F')) raw.pop_back();
@@ -728,6 +728,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
             // NamedVariable that callers dereference (SIGSEGV). See the exit check below.
             std::string danglingMemberName;
             std::string danglingMemberOwner;
+            bool postfixMemberCallPending = false;
             bool danglingIsMethod = false;
 
             auto FindImplicitCxxTemplateThis = [&](const std::string& memberName) {
@@ -1064,6 +1065,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                     // access ('(' calls it, '[' / '++' / '--' / '.' start a new link).
                     if (tokenType != CFlatParser::Identifier)
                     {
+                        if (tokenType == CFlatParser::LeftParen && danglingIsMethod)
+                            postfixMemberCallPending = true;
                         danglingMemberName.clear();
                         danglingMemberOwner.clear();
                         danglingIsMethod = false;
@@ -1835,7 +1838,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             if (!structVar.TypeAndValue.TypeName.empty())
                                 Compiler(ctx)->RejectInaccessibleCxxMember(
                                     structVar.TypeAndValue.TypeName, primaryIdentifier,
-                                    structVar.TypeAndValue.VariableName == "this");
+                                    structVar.TypeAndValue.VariableName == "this", true);
 
                             // [PFX-2c-ref] A C++ reference member binds as a pointer field, so a
                             // store to it would reseat the reference - which C++ cannot express.
@@ -3370,7 +3373,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             && Compiler(ctx)->IsCxxRecord(structVar.TypeAndValue.TypeName)
                             && Compiler(ctx)->RejectInaccessibleCxxMember(
                                 structVar.TypeAndValue.TypeName, functionName,
-                                structVar.TypeAndValue.VariableName == "this"))
+                                structVar.TypeAndValue.VariableName == "this", true))
                             return {};
                         // A foreign std::function value uses CFlat's natural call spelling. Its
                         // C++ member is surfaced under operator(), with the value as receiver.
@@ -3903,7 +3906,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                         boolNV.TypeAndValue.TypeName = "bool";
                                         compiler->CallInterfaceMethod(visitorAlloca, "IReflector", "visitBool", {nameNV, boolNV});
                                     }
-                                    else if ((typeName == "float" || typeName == "double") && !field.Pointer)
+                                    else if ((typeName == "float" || typeName == "double" || typeName == "longdouble") && !field.Pointer)
                                     {
                                         llvm::Value* val = compiler->builder->CreateLoad(compiler->GetType(field), gep);
                                         // visitFloat takes double, so widen a 'float' field instead of narrowing.
@@ -3987,7 +3990,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                             elemBoolNV.TypeAndValue.TypeName = "bool";
                                             compiler->CallInterfaceMethod(visitorAlloca, "IReflector", "visitBool", {emptyNV, elemBoolNV});
                                         }
-                                        else if (elemTypeName == "float" || elemTypeName == "double")
+                                        else if (elemTypeName == "float" || elemTypeName == "double" || elemTypeName == "longdouble")
                                         {
                                             llvm::Value* val = elemNV;
                                             if (elemTypeName == "float")
@@ -4291,7 +4294,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                         compiler->builder->CreateStore(boolVal, gep);
                                     }
                                     // ── float / double ────────────────────────────────────────
-                                    else if ((typeName == "float" || typeName == "double") && !field.Pointer)
+                                    else if ((typeName == "float" || typeName == "double" || typeName == "longdouble") && !field.Pointer)
                                     {
                                         auto* fVal = compiler->CallInterfaceMethod(srcA, "IJSON", "getFloat", {nameNV});
                                         if (typeName == "double")
@@ -4389,7 +4392,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                             elemNV.TypeAndValue.TypeName = "bool";
                                             compiler->CreateOverloadedFunctionCall("add", {listNV, elemNV});
                                         }
-                                        else if (elemTypeName == "float" || elemTypeName == "double")
+                                        else if (elemTypeName == "float" || elemTypeName == "double" || elemTypeName == "longdouble")
                                         {
                                             auto* v = compiler->CallInterfaceMethod(arrAlloca, "IJSONArray", "getFloat", {idxNV});
                                             LLVMBackend::NamedVariable elemNV;
@@ -4692,7 +4695,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 "u8", "u16", "u32", "u64", "u128",
                                 "c8", "c16", "c32", "wchar",
                                 "short", "int", "long", "ulong",
-                                "float", "double",
+                                "float", "double", "longdouble",
                             };
                             bool isPrim = false;
                             if (argumentList.size() > 0)
@@ -5057,6 +5060,30 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                             Compiler(ctx)->LogError(
                                                 "cannot pass a holder containing a bonded closure to a function - the callee could stash it beyond the captured local's lifetime");
                                         auto argValue = argNV.Primary ? argNV.Primary : LoadNamedVariable(argNV);
+                                        if (argParamIndex < funcPtrTV.FuncPtrParams.size())
+                                        {
+                                            const auto& param = funcPtrTV.FuncPtrParams[argParamIndex];
+                                            if (param.Pointer && param.PointerDepth <= 1)
+                                            {
+                                                if (auto* referent = backend->CxxReferenceResultAsPointer(
+                                                        argExpectedDest, argNV,
+                                                        std::format("parameter {} of function value", argParamIndex)))
+                                                {
+                                                    argValue = referent;
+                                                    argNV.Primary = referent;
+                                                    argNV.Storage = nullptr;
+                                                    argNV.BaseType = referent->getType();
+                                                    argNV.TypeAndValue = argExpectedDest;
+                                                    argNV.IsRvalue = false;
+                                                }
+                                                else
+                                                {
+                                                    argValue = backend->AdjustCxxPointerForStore(
+                                                        argExpectedDest, argNV.TypeAndValue, argValue,
+                                                        std::format("parameter {} of function value", argParamIndex));
+                                                }
+                                            }
+                                        }
                                         if (Compiler(ctx)->IsCoreUniqueToRawPointer(argNV, argExpectedDest))
                                             argValue = Compiler(ctx)->CreateCoreUniqueRawPointerCall(
                                                 argNV, argExpectedDest);
@@ -6317,12 +6344,15 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                         if (argNV.BaseType->isFloatTy()) argVar.InferSourceTypeName = "float";
                                         else if (argNV.BaseType->isDoubleTy()) argVar.InferSourceTypeName = "double";
                                     }
-                                    if (auto* storage = llvm::dyn_cast_or_null<llvm::AllocaInst>(argNV.Storage))
+                                    if (argVar.InferSourceTypeName.empty())
                                     {
-                                        if (storage->getAllocatedType()->isFloatTy())
-                                            argVar.InferSourceTypeName = "float";
-                                        else if (storage->getAllocatedType()->isDoubleTy())
-                                            argVar.InferSourceTypeName = "double";
+                                        if (auto* storage = llvm::dyn_cast_or_null<llvm::AllocaInst>(argNV.Storage))
+                                        {
+                                            if (storage->getAllocatedType()->isFloatTy())
+                                                argVar.InferSourceTypeName = "float";
+                                            else if (storage->getAllocatedType()->isDoubleTy())
+                                                argVar.InferSourceTypeName = "double";
+                                        }
                                     }
                                     // C++ scoped enums keep their identity at the overload boundary;
                                     // their lowered integer representation is not a CFlat conversion.
@@ -6478,6 +6508,18 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 return compiler->GetCxxClassInfo(recv) != nullptr ? recv
                                                                                   : std::string();
                             };
+                            const bool isPostfixMemberCall = postfixMemberCallPending;
+                            postfixMemberCallPending = false;
+                            const bool callHasCxxBraceArguments = !cxxBraceArguments.empty();
+                            std::string enclosingFunctionName;
+                            for (antlr4::tree::ParseTree* node = ctx; node != nullptr;
+                                 node = node->parent)
+                                if (auto* enclosingFunction = dynamic_cast<
+                                        CFlatParser::FunctionDefinitionContext*>(node))
+                                {
+                                    enclosingFunctionName = getFunctionName(enclosingFunction);
+                                    break;
+                                }
                             auto requestCxxTemplate = [&](std::string& resolvedName) {
                                 std::string owner;
                                 std::string memberName = functionName;
@@ -6995,7 +7037,9 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
 
                                 namedVar.Primary = Compiler(ctx)->CreateOverloadedFunctionCall(
                                     resolvedFuncName, arguments, globalScopeCall, callDisplayName,
-                                    cxxMemberReceiverType());
+                                    cxxMemberReceiverType(),
+                                    isPostfixMemberCall && !callHasCxxBraceArguments,
+                                    enclosingFunctionName);
                                 globalScopeCall = false;
                                 {
                                     std::string rcvr = structVar.TypeAndValue.VariableName;
@@ -7059,7 +7103,9 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 requestCxxTemplate(resolvedFuncName);
                                 namedVar.Primary = Compiler(primaryCtx)->CreateOverloadedFunctionCall(
                                     resolvedFuncName, arguments, globalScopeCall, callDisplayName,
-                                    cxxMemberReceiverType());
+                                    cxxMemberReceiverType(),
+                                    isPostfixMemberCall && !callHasCxxBraceArguments,
+                                    enclosingFunctionName);
                                 globalScopeCall = false;
                                 {
                                     std::string rcvr = structVar.TypeAndValue.VariableName;

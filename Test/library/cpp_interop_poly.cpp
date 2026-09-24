@@ -64,11 +64,20 @@ namespace cpppoly
     int Both::l() const noexcept { return lv + 1000; }
     int Both::r() const noexcept { return rv + 2000; }
     int Both::both_only() const noexcept { return lv + rv; }
+    Both& BothBox::get() noexcept { return value; }
+
+    BothLate::BothLate() noexcept { lv = 66; nv = 70; rv = 77; }
+    BothLate::~BothLate() noexcept {}
+    int BothLate::l() const noexcept { return lv + 2000; }
+    int BothLate::r() const noexcept { return rv + 3000; }
 
     NoVirtualDerived::NoVirtualDerived() noexcept { nv = 71; }
 
     int read_right(const Right* p) noexcept { return p->rv; }
     int call_right(const Right* p) noexcept { return p->r(); }
+    int take_right_ptr(Right* p) noexcept { p->rv += 2; return p->rv; }
+    int take_right_ref(Right& r) noexcept { r.rv += 1; return r.rv; }
+    int read_right_cref(const Right& r) noexcept { return r.rv; }
     Both& both_ref() noexcept { static Both b; return b; }
     Circle& circle_ref() noexcept { static Circle c; return c; }
 

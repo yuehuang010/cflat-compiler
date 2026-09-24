@@ -960,6 +960,9 @@ public:
             if (CanonicalPrimitiveTypeName(TypeName) == CanonicalPrimitiveTypeName(other.TypeName))
                 return true;
 
+            if (IsFloatingPoint() >= 0 && IsFloatingPoint() == other.IsFloatingPoint())
+                return true;
+
             return false;
         }
 
@@ -1046,7 +1049,7 @@ public:
         int IsFloatingPoint() const
         {
             if (TypeName == "float")  return 32;
-            if (TypeName == "double") return 64;
+            if (TypeName == "double" || TypeName == "longdouble") return 64;
             return -1;
         }
 
@@ -5910,6 +5913,8 @@ private:
     // and SLP still fire). Mirrors the triple/CPU resolution in EmitExecutable.
     // Returns null on failure (the optimizer then runs target-agnostic, as before).
     std::unique_ptr<llvm::TargetMachine> CreateOptTargetMachine(int optLevel = -1);
+    std::pair<std::string, std::string> ProgramTargetCPUFeatures() const;
+    void StampProgramTargetAttributes();
 
     // Shared prologue for PrintModuleView and CollectOptimizationInfo. Keep them on one
     // path: the core materialization below is load-bearing on a warm cache.
@@ -8000,6 +8005,10 @@ public:
                                                 const std::string& methodName,
                                                 const std::vector<TypeAndValue>& params);
     bool IsCxxRecord(const std::string& typeName) const { return cxxRecords_.count(typeName) != 0; }
+    bool IsCxxContiguousViewSource(const NamedVariable& arg,
+                                   const TypeAndValue& param,
+                                   bool* useConstData = nullptr,
+                                   std::string* deducedElementType = nullptr) const;
     bool IsCxxTriviallyCopyableRecord(const std::string& typeName) const
     {
         return cxxTriviallyCopyableRecords_.count(typeName) != 0;
@@ -8104,7 +8113,8 @@ public:
      * Returns true when it reported; a name the class does not have is left alone.
      */
     bool RejectInaccessibleCxxMember(const std::string& typeName, const std::string& memberName,
-                                     bool accessedThroughCurrentObject = false);
+                                     bool accessedThroughCurrentObject = false,
+                                     bool deferElementCopySink = false);
     // A C++ class identity spelled for a user-facing message (a specialization key is mangled).
     std::string DisplayCxxClassName(const std::string& typeName) const;
     bool RejectCxxReferenceFieldStore(const std::string& typeName, const std::string& memberName);
@@ -8562,6 +8572,30 @@ public:
     // broader predicate gated to C++ callees so native CFlat overload selection is unchanged.
     bool IsCxxRvalueReferenceArgument(const NamedVariable& arg) const;
     bool CxxReferenceArgumentMatches(const TypeAndValue& param, const NamedVariable& arg) const;
+    // An lvalue of a C++ class whose copy constructor is deleted (every [cpp] struct): binding
+    // it to a C++ parameter that copies, or to an rvalue reference, is ill-formed in C++.
+    bool IsCopyDeletedCxxLvalue(const NamedVariable& arg) const;
+    std::string CxxDeletedCopyMessage(const NamedVariable& arg, const std::string& paramName,
+                                      const std::string& functionName, bool moveRemedy) const;
+    /*
+     * A REFUSED member `memberName` of `receiverType` (clang could not instantiate it) whose
+     * parameter at a copy-deleted lvalue's position is `const T&` of that lvalue's type: the
+     * call needed the copy. `args` excludes the receiver. Fills the argument index and the
+     * C++ parameter name.
+     */
+    // The clang errors and notes behind the newest failed RequestGeneratedCxxWrapper.
+    std::string lastCxxWrapperCause_;
+    std::string pendingCxxWrapperCause_;
+    // True when one line of `diagnostics` names the copy constructor of the class spelled
+    // `cxxSpelling` (or a deleted constructor of it): the failure really was that copy.
+    bool CxxDiagnosticBlamesCopyOf(const std::string& diagnostics,
+                                   const std::string& cxxSpelling) const;
+    bool IsCxxElementCopySinkRefusal(const std::string& receiverType,
+                                     const std::string& memberName) const;
+    bool FindRefusedCxxCopySink(const std::string& receiverType, const std::string& memberName,
+                                const std::vector<NamedVariable>& args, size_t& argIndex,
+                                std::string& paramName, bool& rvalueSibling,
+                                bool requireRefusal = true) const;
 
     /*
      * Indirection shape of a function-pointer/closure parameter or argument:
@@ -8917,7 +8951,9 @@ public:
     // resolution can report THAT class's member set instead of CFlat's same-named free functions.
     llvm::Value* CreateOverloadedFunctionCall(const std::string& functionNameIn, const std::vector<LLVMBackend::NamedVariable>& arguments, bool forceRoot = false,
                                               const std::string& displayName = {},
-                                              const std::string& cxxMemberReceiver = {});
+                                              const std::string& cxxMemberReceiver = {},
+                                              bool postfixMemberCall = false,
+                                              const std::string& enclosingFunctionName = {});
 
     llvm::Function* GetFunction(const std::string& functionName);
 
@@ -9994,7 +10030,7 @@ public:
      * timeout). The PCH key still folds the build stamp, since a PCH belongs to the clang that
      * wrote it.
      */
-    static constexpr int kCHeaderCacheVersion = 89;
+    static constexpr int kCHeaderCacheVersion = 93;
     static std::string CompilerBuildStamp();
 
     static std::string GetCHeaderCacheDir();
@@ -10017,7 +10053,9 @@ public:
                                         const std::string& targetTriple,
                                         bool cxxMode = false,
                                         bool cxxDefinitionsEmitted = false,
-                                        const std::string& cppStandard = "c++20");
+                                        const std::string& cppStandard = "c++20",
+                                        const std::string& targetCpu = {},
+                                        const std::string& targetFeatures = {});
 
     // Read-only adapter exposing the nlohmann subset the *FromJson converters use, backed by a
     // simdjson DOM element. Keeps converter bodies unchanged while parsing with simdjson.
@@ -10258,6 +10296,7 @@ public:
 
     static void PruneCxxTypeRequestDiskCache(const std::filesystem::path& cacheDir,
                                              const CxxRequestGroup& group);
+
 
     // Handle `import package-vcpkg "header" from "port[features]";`. Resolves the port
     // through the user-owned vcpkg.json, pushes the resulting include dir / libs / DLLs

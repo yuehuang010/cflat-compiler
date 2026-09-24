@@ -429,6 +429,7 @@ llvm::DIType* LLVMBackend::GetDIType(const TypeAndValue& tv)
         else if (tv.TypeName == "ulong")  basic = diBuilder->createBasicType("ulong", longBits_, DW_ATE_unsigned);
         else if (tv.TypeName == "float")  basic = diBuilder->createBasicType("float", 32, DW_ATE_float);
         else if (tv.TypeName == "double") basic = diBuilder->createBasicType("double", 64, DW_ATE_float);
+        else if (tv.TypeName == "longdouble") basic = diBuilder->createBasicType("long double", 64, DW_ATE_float);
         else if (tv.TypeName == "bool")   basic = diBuilder->createBasicType("bool", 1, DW_ATE_boolean);
         else if (tv.TypeName == "i8")     basic = diBuilder->createBasicType("i8", 8, DW_ATE_signed);
         else if (tv.TypeName == "i16")    basic = diBuilder->createBasicType("i16", 16, DW_ATE_signed);

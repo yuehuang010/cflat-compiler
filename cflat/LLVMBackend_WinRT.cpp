@@ -3412,7 +3412,7 @@ llvm::Function* LLVMBackend::SynthesizeReflectFunction(const std::string& struct
                     {nameNV, boolNV});
             }
             // Float / double types
-            else if ((typeName == "float" || typeName == "double") && !isPtr && !isInterface)
+            else if ((typeName == "float" || typeName == "double" || typeName == "longdouble") && !isPtr && !isInterface)
             {
                 llvm::Value* raw = compiler->builder->CreateLoad(compiler->GetType(field), gep);
                 // visitFloat takes double, so widen a 'float' field instead of narrowing.

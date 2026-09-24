@@ -10,10 +10,21 @@ import cpp "cpp_interop_lvalue_sink.h";
 
 extern int main()
 {
-    expect_error("its copy constructor is deleted") {
+    expect_error("into parameter '__x' of 'push_back': its copy constructor is deleted - pass 'move x' or a temporary") {
         std.vector<SinkCheck> values = default;
         SinkCheck local = SinkCheck(4);
         values.push_back(local);
+    }
+    // assign copy-ASSIGNS the element; clang names operator=, not the copy constructor.
+    expect_error("member 'assign' of C++ class 'std.vector<SinkCheck>' cannot be instantiated for these template arguments") {
+        std.vector<SinkCheck> values = default;
+        SinkCheck local = SinkCheck(5);
+        values.assign(3, local);
+    }
+    expect_error("into parameter '__x' of 'resize': its copy constructor is deleted") {
+        std.vector<SinkCheck> values = default;
+        SinkCheck local = SinkCheck(6);
+        values.resize(3, local);
     }
     return 0;
 }

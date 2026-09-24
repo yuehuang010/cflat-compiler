@@ -450,7 +450,7 @@ static SymbolArgumentFamily SymbolTypeFamily(const std::string& typeName)
         lower == "c8" || lower == "c16" || lower == "c32" || lower == "wchar" ||
         lower == "u64" || lower == "u128" || lower == "long" || lower == "short")
         return SymbolArgumentFamily::Integer;
-    if (lower == "float" || lower == "double") return SymbolArgumentFamily::Floating;
+    if (lower == "float" || lower == "double" || lower == "longdouble") return SymbolArgumentFamily::Floating;
     if (type.find('*') != std::string::npos) return SymbolArgumentFamily::Pointer;
     return SymbolArgumentFamily::Exact;
 }

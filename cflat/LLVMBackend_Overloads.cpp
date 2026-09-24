@@ -654,6 +654,11 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                                 arg, *candidateParamItr, candidate.IsCxx);
                         }
                     }
+                    // A contiguous C++ range converts to a CFlat view only after exact matches
+                    // and native view bindings have had the chance to win.
+                    if (result < 0 && !candidate.IsCxx
+                        && IsCxxContiguousViewSource(arg, *candidateParamItr))
+                        result = 1;
                     if (result < 0 && tmpArg.IsTypeMatch(tmpParam))
                         result = 0;
                     // A C++ lvalue reference is represented as an alias value in CFlat. A
@@ -1681,7 +1686,8 @@ bool LLVMBackend::RejectArrayViewParamBinding(const NamedVariable& arg, const Ty
 }
 
 llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functionNameIn, const std::vector<LLVMBackend::NamedVariable>& arguments, bool forceRoot,
-        const std::string& displayName, const std::string& cxxMemberReceiver)
+        const std::string& displayName, const std::string& cxxMemberReceiver,
+        bool postfixMemberCall, const std::string& enclosingFunctionName)
 {
         // These describe only the call being lowered. Clear them before overload probing so a
         // later non-C++ call cannot make a chained result reuse an earlier sret temporary.
@@ -1781,11 +1787,43 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
 
         // Deferred C++ binding: complete this name's overload set before resolving against it.
         if (TryBindCxxFunction(functionName)) { /* bound now, or already was */ }
-        auto funcSym = functionTable.find(functionName);
+        std::string bareMemberName = functionName;
+        if (const size_t dot = bareMemberName.find_last_of('.'); dot != std::string::npos)
+            bareMemberName.erase(0, dot + 1);
+        std::string receiverType = arguments.empty()
+            ? std::string() : arguments.front().TypeAndValue.TypeName;
+        if (receiverType.empty() && !arguments.empty() && arguments.front().BaseType)
+            if (auto* receiverStruct = llvm::dyn_cast<llvm::StructType>(
+                    arguments.front().BaseType))
+                receiverType = receiverStruct->getName().str();
+        const bool receiverHasCxxMember = (postfixMemberCall || !cxxMemberReceiver.empty())
+            && !receiverType.empty()
+            && CxxClassHasMemberNamed(receiverType, bareMemberName);
+        auto originalFuncSym = functionTable.find(functionName);
+        auto funcSym = originalFuncSym;
+        std::vector<FunctionSymbol> receiverMemberCandidates;
+        const auto bareMemberSet = functionTable.find(bareMemberName);
+        if ((postfixMemberCall || receiverHasCxxMember) && !arguments.empty()
+            && bareMemberSet != functionTable.end())
+        {
+            for (const auto& candidate : bareMemberSet->second)
+            {
+                if (!candidate.IsMethod || candidate.Parameters.empty()) continue;
+                const std::string& ownerType = candidate.Parameters.front().TypeName;
+                if (ownerType == receiverType
+                    || (candidate.IsCxx && !receiverType.empty()
+                        && IsCxxBaseOf(ownerType, receiverType)))
+                    receiverMemberCandidates.push_back(candidate);
+            }
+            if (receiverHasCxxMember && !receiverMemberCandidates.empty())
+                funcSym = bareMemberSet;
+        }
         if (funcSym == functionTable.end())
         {
             if (TryBindCxxImplicitArgumentConversions(functionName, arguments))
-                return CreateOverloadedFunctionCall(functionName, arguments, forceRoot, displayName);
+                return CreateOverloadedFunctionCall(functionName, arguments, forceRoot, displayName,
+                                                    cxxMemberReceiver, postfixMemberCall,
+                                                    enclosingFunctionName);
             if (std::string refusal = GetCxxBindingRefusal(functionName); !refusal.empty())
                 LogErrorMessage(refusal);
             else if (displayName.empty())
@@ -1795,7 +1833,44 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
             return nullptr;
         }
 
-        const auto& candidates = funcSym->second;
+        const std::vector<FunctionSymbol>* candidateSet = &funcSym->second;
+        const bool cxxReceiverHasMember = !cxxMemberReceiver.empty()
+            && CxxClassHasMemberNamed(cxxMemberReceiver, bareMemberName);
+        if ((postfixMemberCall || cxxReceiverHasMember) && !arguments.empty())
+        {
+            const auto& shadowCandidates = originalFuncSym != functionTable.end()
+                ? originalFuncSym->second : funcSym->second;
+            const bool currentFreeFunctionIsCandidate = std::any_of(
+                shadowCandidates.begin(), shadowCandidates.end(), [&](const auto& candidate) {
+                    return !candidate.IsMethod && candidate.Function != nullptr
+                        && candidate.Function == currentFunction;
+                });
+            const std::string enclosingShortName = enclosingFunctionName.substr(
+                enclosingFunctionName.find_last_of('.') == std::string::npos ? 0
+                    : enclosingFunctionName.find_last_of('.') + 1);
+            const bool enclosingFreeFunctionIsCandidate = !enclosingShortName.empty()
+                && std::any_of(shadowCandidates.begin(), shadowCandidates.end(),
+                    [&](const auto& candidate) {
+                        const size_t sourceDot = candidate.SourceName.find_last_of('.');
+                        const std::string sourceShortName = candidate.SourceName.substr(
+                            sourceDot == std::string::npos ? 0 : sourceDot + 1);
+                        return !candidate.IsMethod && sourceShortName == enclosingShortName;
+                    });
+            const bool receiverFirstFreeFunctionIsCandidate = !arguments.empty()
+                && std::any_of(shadowCandidates.begin(), shadowCandidates.end(),
+                    [&](const auto& candidate) {
+                        return !candidate.IsMethod && !candidate.IsCxx
+                            && !candidate.UniqueName.starts_with("__cflat_tpl_")
+                            && !candidate.UniqueName.starts_with("__cflat_free_")
+                            && !candidate.Parameters.empty()
+                            && candidate.Parameters.front().TypeName == receiverType;
+                    });
+            if (!receiverMemberCandidates.empty()
+                && (currentFreeFunctionIsCandidate || enclosingFreeFunctionIsCandidate
+                    || (receiverHasCxxMember && receiverFirstFreeFunctionIsCandidate)))
+                candidateSet = &receiverMemberCandidates;
+        }
+        const auto& candidates = *candidateSet;
 
         std::vector<std::pair<std::vector<NamedVariable>, FunctionSymbol>> resolvedCandidate;
 
@@ -1897,53 +1972,47 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
             return nullptr;
         }
 
-        // Refuse lvalues copied into a C++ template's element storage, while retaining key borrows.
-        // The signature must name the specialization's value type (or pair/tuple), not just T&.
-        if (candidate.IsCxx && candidate.IsMethod && !candidate.Parameters.empty())
-        {
-            const auto ownerRecord = cxxRecordEntries_.find(candidate.Parameters[0].TypeName);
-            const bool isSpecialization = ownerRecord != cxxRecordEntries_.end()
-                && ownerRecord->second.canonicalCtype.find('<') != std::string::npos;
-            const bool constMethod = ownerRecord != cxxRecordEntries_.end()
-                && std::any_of(ownerRecord->second.members.begin(), ownerRecord->second.members.end(),
-                    [&](const auto& member) {
-                        return member.linkageName == candidate.UniqueName && member.isConst;
-                    });
-            const bool oneKeyLookup = arguments.size() == 2
-                && !candidate.ReturnType.Pointer
-                && (candidate.ReturnType.TypeName == "bool"
-                    || candidate.ReturnType.TypeName == "int"
-                    || candidate.ReturnType.TypeName == "unsigned int"
-                    || candidate.ReturnType.TypeName == "long"
-                    || candidate.ReturnType.TypeName == "unsigned long"
-                    || candidate.ReturnType.TypeName == "size_t");
-            if (isSpecialization && !constMethod && !oneKeyLookup)
-            for (size_t i = 0; i < arguments.size() && i < matched.size()
-                            && i < candidate.Parameters.size(); ++i)
-            {
-                if (i == 0) continue;
-                const auto& arg = matched[i];
-                const auto& param = candidate.Parameters[i];
-                const CxxClassInfo* cxxInfo = GetCxxClassInfo(arg.TypeAndValue.TypeName);
-                const bool copyDeleted = IsCppStructName(arg.TypeAndValue.TypeName)
-                    || (cxxInfo != nullptr && cxxInfo->hasDeletedCopyCtor);
-                if (!copyDeleted || IsCxxRvalueReferenceArgument(arg) || arg.IsExplicitMove)
-                    continue;
-                std::string argSpelling;
-                const bool templateElement = ownerRecord != cxxRecordEntries_.end()
-                    && CxxSpellingForCflatType(arg.TypeAndValue.TypeName, argSpelling)
-                    && (ownerRecord->second.canonicalCtype.find(argSpelling) != std::string::npos
-                        || argSpelling.find("pair<") != std::string::npos
-                        || argSpelling.find("tuple<") != std::string::npos);
-                if (!templateElement) continue;
-                LogError(std::format(
-                    "cannot copy C++ class '{}' into parameter '{}' of '{}': its copy "
-                    "constructor is deleted - pass 'move x' or a temporary",
-                    DisplayCxxClassName(arg.TypeAndValue.TypeName), param.VariableName,
-                    shownFunctionName));
-            }
-        }
-
+        // Blame a deleted copy at a T&& parameter only when a refused const T& sibling shows the
+        // lvalue needed that copy; a lone T&& parameter keeps the rvalue-reference message.
+        auto refusedCopySinkAt = [&](const std::vector<NamedVariable>& args, size_t index) {
+            if (cxxMemberReceiver.empty() || index == 0 || args.empty()
+                || args.front().TypeAndValue.TypeName != cxxMemberReceiver)
+                return false;
+            const size_t dot = functionName.rfind('.');
+            const std::string bare = dot == std::string::npos ? functionName
+                                                              : functionName.substr(dot + 1);
+            const std::vector<NamedVariable> userArgs(args.begin() + 1, args.end());
+            size_t sinkIndex = 0;
+            std::string sinkParam;
+            bool refusedRvalue = false;
+            // Any unbound const T& sibling counts: a bound one would have taken the lvalue.
+            return FindRefusedCxxCopySink(cxxMemberReceiver, bare, userArgs, sinkIndex, sinkParam,
+                                          refusedRvalue, /*requireRefusal*/ false)
+                && sinkIndex + 1 == index;
+        };
+        // An unbound const T& sibling refused for its own reason: that reason explains why the
+        // lvalue found only the T&& overload.
+        auto refusedConstRefSibling = [&](const std::vector<NamedVariable>& args, size_t index) {
+            std::string text;
+            if (cxxMemberReceiver.empty() || index == 0 || index >= args.size()
+                || args.front().TypeAndValue.TypeName != cxxMemberReceiver)
+                return text;
+            auto record = cxxRecordEntries_.find(cxxMemberReceiver);
+            std::string spelling;
+            if (record == cxxRecordEntries_.end()
+                || !CxxSpellingForCflatType(args[index].TypeAndValue.TypeName, spelling))
+                return text;
+            const size_t dot = functionName.rfind('.');
+            const std::string bare = dot == std::string::npos ? functionName
+                                                              : functionName.substr(dot + 1);
+            for (const auto& member : record->second.members)
+                if (member.name == bare && !member.bindRefusal.empty()
+                    && member.paramTypes.size() == args.size()
+                    && member.paramTypes[index] == "const " + spelling + " &")
+                    return std::format("member '{}' of C++ class '{}' {}", bare,
+                                       DisplayCxxClassName(cxxMemberReceiver), member.bindRefusal);
+            return text;
+        };
         if (candidate.Function == nullptr)
         {
             for (const auto& c : candidates)
@@ -1957,6 +2026,15 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                     if (!IsCxxReferenceParameter(c, i)) continue;
                     if (!CxxReferenceArgumentMatches(param, arguments[i])) continue;
                     const bool rvalue = IsCxxRvalueReferenceArgument(arguments[i]);
+                    if (param.IsRvalueRef && !rvalue && IsCopyDeletedCxxLvalue(arguments[i]))
+                    {
+                        const std::string sibling = refusedConstRefSibling(arguments, i);
+                        if (refusedCopySinkAt(arguments, i))
+                            LogError(CxxDeletedCopyMessage(arguments[i], param.VariableName,
+                                                           shownFunctionName, /*moveRemedy*/ true));
+                        else if (!sibling.empty())
+                            LogError(sibling);
+                    }
                     if (param.IsRvalueRef && !rvalue)
                         LogErrorMessage(
                             "parameter '{}' of '{}' is an rvalue reference; pass 'move <arg>' or a temporary",
@@ -2010,7 +2088,28 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
             }
             if (TryBindCxxImplicitArgumentConversions(functionName, arguments))
                 return CreateOverloadedFunctionCall(functionName, arguments, forceRoot, displayName,
-                                                    cxxMemberReceiver);
+                                                    cxxMemberReceiver, postfixMemberCall,
+                                                    enclosingFunctionName);
+            for (const auto& failed : candidates)
+            {
+                if (failed.IsCxx) continue;
+                for (size_t i = 0; i < arguments.size() && i < failed.Parameters.size(); ++i)
+                {
+                    const auto& arg = arguments[i];
+                    const auto& param = failed.Parameters[i];
+                    if (!param.IsArrayView || param.IsMove || param.IsUnique
+                        || param.IsOwningSink || !IsCxxRecord(arg.TypeAndValue.TypeName))
+                        continue;
+                    const std::string element = SpellType(*this,
+                        TypeAndValue{ .TypeName = param.TypeName });
+                    const std::string container = SpellType(*this, arg.TypeAndValue);
+                    LogError(std::format(
+                        "cannot pass C++ class '{}' to array-view parameter '{}' of '{}': "
+                        "contiguous view decay requires public data() and size(); data() must "
+                        "return exactly '{}*' or 'const {}*'",
+                        container, param.VariableName, shownFunctionName, element, element));
+                }
+            }
             /*
              * `obj.name(...)` on a C++ class that has no member `name` at all. Every candidate here
              * came from CFlat's own overload table by name only - core's atomic<T> load/store were
@@ -2031,7 +2130,9 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                     const bool rebound = TryBindRefusedCxxMember(cxxMemberReceiver, bareMemberName);
                     if (rebound)
                         retried = CreateOverloadedFunctionCall(functionName, arguments, forceRoot,
-                                                               displayName, cxxMemberReceiver);
+                                                               displayName, cxxMemberReceiver,
+                                                               postfixMemberCall,
+                                                               enclosingFunctionName);
                     cxxOverloadRebindInFlight_.erase(retryKey);
                     if (rebound) return retried;
                 }
@@ -2082,6 +2183,34 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                                         shownFunctionName)));
                         return nullptr;
                     }
+            }
+
+            // A copy-deleted lvalue whose const T& overload clang refused to instantiate: the
+            // call needed the copy. Offer 'move x' only when an rvalue overload is bound.
+            if (!cxxMemberReceiver.empty() && !arguments.empty()
+                && arguments.front().TypeAndValue.TypeName == cxxMemberReceiver)
+            {
+                const std::vector<NamedVariable> userArgs(arguments.begin() + 1, arguments.end());
+                size_t sinkIndex = 0;
+                std::string sinkParam;
+                bool refusedRvalue = false;
+                if (FindRefusedCxxCopySink(cxxMemberReceiver, bareMemberName, userArgs, sinkIndex,
+                                           sinkParam, refusedRvalue))
+                {
+                    // Suggest 'move x' only when a bound T&& or by-value overload takes it.
+                    const std::string& sinkType = userArgs[sinkIndex].TypeAndValue.TypeName;
+                    const bool moveRemedy = std::any_of(candidates.begin(), candidates.end(),
+                        [&](const auto& c) {
+                            if (!c.IsCxx || c.Parameters.size() != arguments.size()) return false;
+                            const auto& p = c.Parameters[sinkIndex + 1];
+                            return p.IsRvalueRef
+                                || (!p.IsAlias && !p.IsCxxConstRef && !p.Pointer
+                                    && p.TypeName == sinkType);
+                        });
+                    LogError(CxxDeletedCopyMessage(userArgs[sinkIndex], sinkParam,
+                                                   shownFunctionName, moveRemedy));
+                    return nullptr;
+                }
             }
 
             std::string msg = std::format("no overload of '{}' matches the given arguments.\n", shownFunctionName);
@@ -2436,6 +2565,16 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                         || (rvalueSym.IsCxx ? IsCxxRvalueReferenceArgument(rvalueArgs[i])
                                             : IsRvalueReferenceArgument(rvalueArgs[i])))
                         continue;
+                    if (rvalueSym.IsCxx && IsCopyDeletedCxxLvalue(rvalueArgs[i]))
+                    {
+                        const std::string sibling = refusedConstRefSibling(rvalueArgs, i);
+                        if (refusedCopySinkAt(rvalueArgs, i))
+                            LogError(CxxDeletedCopyMessage(rvalueArgs[i],
+                                                           rvalueSym.Parameters[i].VariableName,
+                                                           shownFunctionName, /*moveRemedy*/ true));
+                        else if (!sibling.empty())
+                            LogError(sibling);
+                    }
                     LogErrorMessage(
                         "parameter '{}' of '{}' is an rvalue reference; pass 'move <arg>' or a temporary",
                         { rvalueSym.Parameters[i].VariableName, shownFunctionName });
@@ -2497,9 +2636,72 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
             }
         }
 
+        // Materialize a borrowed pointer view only after this CFlat overload has won.
+        for (size_t i = 0; i < matched.size() && i < candidate.Parameters.size(); ++i)
+        {
+            const auto& param = candidate.Parameters[i];
+            auto& arg = matched[i];
+            if (candidate.IsCxx || !param.IsArrayView || param.IsMove || param.IsUnique
+                || param.IsOwningSink || !IsCxxContiguousViewSource(arg, param))
+                continue;
+
+            const std::string receiverType = arg.TypeAndValue.TypeName;
+            bool useConstData = false;
+            IsCxxContiguousViewSource(arg, param, &useConstData);
+            llvm::Value* count = CreateOverloadedFunctionCall(
+                "size", { arg }, false, "size", receiverType, true, enclosingFunctionName);
+            llvm::Value* data = CreateOverloadedFunctionCall(
+                useConstData ? "__cflat_view_decay_const_data" : "data",
+                { arg }, false, "data", useConstData ? "" : receiverType,
+                !useConstData, enclosingFunctionName);
+            if (count == nullptr || data == nullptr || !data->getType()->isPointerTy())
+                LogError(std::format("cannot materialize contiguous view for parameter '{}' of '{}'",
+                                     param.VariableName, diagnosticFunctionName));
+
+            auto* countType = llvm::dyn_cast<llvm::IntegerType>(count->getType());
+            if (countType == nullptr)
+                LogError(std::format("size() for contiguous view parameter '{}' of '{}' must return an integer",
+                                     param.VariableName, diagnosticFunctionName));
+            llvm::Type* lengthType = llvm::Type::getInt64Ty(*context);
+            if (countType->getBitWidth() < 64)
+                count = builder->CreateZExt(count, lengthType, "view_size");
+            else if (countType->getBitWidth() > 64)
+                count = builder->CreateTrunc(count, lengthType, "view_size");
+
+            arg.Primary = data;
+            arg.Storage = nullptr;
+            arg.BaseType = data->getType();
+            arg.TypeAndValue = param;
+            arg.IsOwning = false;
+            arg.IsOwningStruct = false;
+            arg.IsOwningString = false;
+            arg.IsExplicitMove = false;
+            arg.IsRvalue = true;
+            arg.RawArrayLength = count;
+        }
+
         // A scalar can bind to a C++ class reference through an implicit converting constructor.
         // Materialize those temporaries only after overload selection so the selected constructor
         // and the selected function agree on the same C++ conversion.
+        for (size_t i = 0; i < matched.size() && i < candidate.Parameters.size(); ++i)
+        {
+            const auto& param = candidate.Parameters[i];
+            auto& arg = matched[i];
+            if (!param.Pointer || param.IsAlias || param.IsCxxRefToPointer || param.IsCxxConstRef
+                || param.IsRvalueRef || arg.TypeAndValue.Pointer
+                || !IsCxxRecord(arg.TypeAndValue.TypeName))
+                continue;
+            if (auto* referent = CxxReferenceResultAsPointer(
+                    param, arg, std::format("parameter '{}' of '{}'", param.VariableName,
+                                            diagnosticFunctionName)))
+            {
+                arg.Primary = referent;
+                arg.Storage = nullptr;
+                arg.BaseType = referent->getType();
+                arg.TypeAndValue = param;
+                arg.IsRvalue = false;
+            }
+        }
         for (size_t i = 0; i < matched.size() && i < candidate.Parameters.size(); ++i)
         {
             const bool cxxByValueParam = candidate.IsCxx
@@ -2510,6 +2712,12 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                 && i < candidate.CxxAbi.params.size()
                 && candidate.CxxAbi.params[i].kind == cflat_cinterop::RawAbiSlot::Indirect;
             if (candidate.IsCxx && candidate.IsMethod && i == 0) continue;  // receiver: no UDC
+            const auto& param = candidate.Parameters[i];
+            const auto& arg = matched[i];
+            if (param.Pointer && !param.IsAlias && !param.IsCxxRefToPointer && !param.IsCxxConstRef
+                && !param.IsRvalueRef && !arg.TypeAndValue.Pointer
+                && IsCxxRecord(param.TypeName) && IsCxxRecord(arg.TypeAndValue.TypeName))
+                continue;
             if (!CanImplicitlyConstructCxxClass(matched[i], candidate.Parameters[i],
                                                 cxxByValueParam || cxxIndirectValueParam))
             {
@@ -2768,7 +2976,22 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                 }
                 else if (!arg.TypeAndValue.Pointer && arg.Storage != nullptr
                     && !(arg.Primary != nullptr && arg.Primary->getType()->isPointerTy()))
-                    argList.push_back(arg.Storage);
+                {
+                    llvm::Value* address = arg.Storage;
+                    if (!candParamItr->IsAlias && !candParamItr->IsCxxRefToPointer
+                        && !candParamItr->IsCxxConstRef && !candParamItr->IsRvalueRef
+                        && IsCxxRecord(candParamItr->TypeName)
+                        && IsCxxRecord(arg.TypeAndValue.TypeName))
+                    {
+                        TypeAndValue sourcePointer = arg.TypeAndValue;
+                        sourcePointer.Pointer = true;
+                        address = AdjustCxxPointerForStore(
+                            *candParamItr, sourcePointer, address,
+                            std::format("parameter '{}' of '{}'", candParamItr->VariableName,
+                                        diagnosticFunctionName));
+                    }
+                    argList.push_back(address);
+                }
                 else if (!arg.TypeAndValue.Pointer && arg.Storage == nullptr
                          && arg.Primary != nullptr && arg.Primary->getType()->isStructTy())
                 {
@@ -2782,11 +3005,13 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                 {
                     // arg is a pointer type; Storage may be an alloca holding the pointer
                     // (promoted param). Load through it to get the actual pointer value.
+                    llvm::Value* pointerValue = nullptr;
                     if (arg.Primary == nullptr && arg.Storage != nullptr
                         && llvm::isa<llvm::AllocaInst>(arg.Storage))
-                        argList.push_back(LoadArgStorage(arg));
+                        pointerValue = LoadArgStorage(arg);
                     else
-                        argList.push_back(arg.GetValue());
+                        pointerValue = arg.GetValue();
+                    argList.push_back(pointerValue);
                 }
 
                 // A `move` parameter is checked while the argument's origin is still visible.
@@ -3320,6 +3545,15 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                     || matched[i].IsExplicitMove
                     || matched[i].CxxParamLastUse
                     || (!candidate.IsCxx && matched[i].IsRvalue);
+                // A by-value parameter a 'move x' can fill: name the deleted copy and that remedy.
+                if (!useMove && cxxObject && FindCxxCopyCtor(pn) == nullptr
+                    && IsCopyDeletedCxxLvalue(matched[i])
+                    && (FindCxxMoveCtor(pn) != nullptr || TryBindCxxGeneratedMoveCtor(pn) != nullptr))
+                {
+                    LogError(CxxDeletedCopyMessage(matched[i], candidate.Parameters[i].VariableName,
+                                                   diagnosticFunctionName, /*moveRemedy*/ true));
+                    continue;
+                }
                 if (!EmitCxxByValueParamConstruct(pn, temp, matched[i].Storage, useMove,
                                                   "into a by-value parameter")) continue;
                 if (cxxObject && !IsCxxParamDestroyedInCallee(pn))
@@ -3407,6 +3641,13 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
             ~ConsumedTempsScope() { b.unwindCallConsumedTemps_.clear(); }
         } consumedTempsScope{ *this };
         unwindCallConsumedTemps_ = std::move(sinkConsumedTemps);
+        if (IsVerbose() && functionName.find("operator") != std::string::npos)
+        {
+            const std::string selectedName = candidate.SourceName.empty()
+                ? functionName : candidate.SourceName;
+            std::cout << std::format("[verbose] selected operator overload: {} ({})\n",
+                                     selectedName, candidate.UniqueName);
+        }
         llvm::Value* result = candidate.Recipe.hasLowering
             ? EmitAbiLoweredCall(candidate, argList, cxxSretDest,
                                  cxxIndirectArgAddrs.empty() ? nullptr : &cxxIndirectArgAddrs,

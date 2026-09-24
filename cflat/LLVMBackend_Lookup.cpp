@@ -57,7 +57,7 @@ bool LLVMBackend::IsKnownTypeName(const std::string& name) const
 {
         static const std::unordered_set<std::string> scalars = {
             "void", "char", "i8", "u8", "c8", "short", "i16", "u16", "c16", "int", "i32", "u32", "uint", "c32",
-            "long", "ulong", "i64", "u64", "i128", "u128", "wchar", "float", "double", "bool", "va_list", "auto" };
+            "long", "ulong", "i64", "u64", "i128", "u128", "wchar", "float", "double", "longdouble", "bool", "va_list", "auto" };
         if (scalars.count(name)) return true;
         std::string resolved = ResolveTypeAlias(name);
         return enumBackingTypes.count(resolved) > 0 || resolved != name
@@ -305,7 +305,7 @@ llvm::Type* LLVMBackend::GetType(const LLVMBackend::TypeAndValue& typeAndValue, 
         else if (resolvedTypeName == "wchar")
             { type = (wcharBits_ == 16) ? builder->getInt16Ty() : builder->getInt32Ty(); }
         else if (resolvedTypeName == "float") { type = builder->getFloatTy(); }
-        else if (resolvedTypeName == "double") { type = builder->getDoubleTy(); }
+        else if (resolvedTypeName == "double" || resolvedTypeName == "longdouble") { type = builder->getDoubleTy(); }
         else if (resolvedTypeName == "bool") { type = builder->getInt1Ty(); }
         else if (resolvedTypeName == "va_list") { type = llvm::PointerType::getUnqual(*context); }
         else if (resolvedTypeName == "auto" && autoType != nullptr) { type = autoType; }
@@ -474,6 +474,154 @@ bool LLVMBackend::IsConsumableTemporary(const NamedVariable& arg) const
 bool LLVMBackend::IsRvalueReferenceArgument(const NamedVariable& arg) const
 {
         return arg.IsExplicitMove || IsConsumableTemporary(arg);
+}
+
+bool LLVMBackend::IsCopyDeletedCxxLvalue(const NamedVariable& arg) const
+{
+        const std::string& type = arg.TypeAndValue.TypeName;
+        if (type.empty() || arg.TypeAndValue.Pointer || arg.IsExplicitMove
+            || IsCxxRvalueReferenceArgument(arg))
+            return false;
+        if (IsCppStructName(type)) return true;
+        const CxxClassInfo* info = GetCxxClassInfo(type);
+        return info != nullptr && info->hasDeletedCopyCtor;
+}
+
+std::string LLVMBackend::CxxDeletedCopyMessage(const NamedVariable& arg,
+                                               const std::string& paramName,
+                                               const std::string& functionName,
+                                               bool moveRemedy) const
+{
+        const std::string shown = DisplayCxxClassName(arg.TypeAndValue.TypeName);
+        if (moveRemedy)
+            return std::format("cannot copy C++ class '{}' into parameter '{}' of '{}': its copy "
+                               "constructor is deleted - pass 'move x' or a temporary",
+                               shown, paramName, functionName);
+        return std::format("cannot copy C++ class '{}' into parameter '{}' of '{}': its copy "
+                           "constructor is deleted", shown, paramName, functionName);
+}
+
+bool LLVMBackend::FindRefusedCxxCopySink(const std::string& receiverType,
+                                         const std::string& memberName,
+                                         const std::vector<NamedVariable>& args,
+                                         size_t& argIndex, std::string& paramName,
+                                         bool& rvalueSibling, bool requireRefusal) const
+{
+        rvalueSibling = false;
+        auto record = cxxRecordEntries_.find(receiverType);
+        if (record == cxxRecordEntries_.end()) return false;
+        for (size_t i = 0; i < args.size(); ++i)
+        {
+            if (!IsCopyDeletedCxxLvalue(args[i])) continue;
+            std::string argSpelling;
+            if (!CxxSpellingForCflatType(args[i].TypeAndValue.TypeName, argSpelling)) continue;
+            const std::string wanted = "const " + argSpelling + " &";
+            for (const auto& member : record->second.members)
+            {
+                if (member.name != memberName
+                    || (requireRefusal && !member.bindRefusal.starts_with("cannot be instantiated"))
+                    || member.paramTypes.size() != args.size() + 1
+                    || member.paramTypes[i + 1] != wanted
+                    || !CxxDiagnosticBlamesCopyOf(member.refusalCause, argSpelling))
+                    continue;
+                argIndex = i;
+                paramName = i + 1 < member.paramNames.size() ? member.paramNames[i + 1]
+                                                             : std::string();
+                if (paramName.empty()) paramName = std::format("parameter {}", i + 1);
+                // A T&& sibling exists; the caller decides whether it is bound.
+                rvalueSibling = std::any_of(record->second.members.begin(),
+                    record->second.members.end(), [&](const auto& other) {
+                        return other.name == memberName
+                            && other.paramTypes.size() == args.size() + 1
+                            && other.paramTypes[i + 1].ends_with("&&");
+                    });
+                return true;
+            }
+        }
+        return false;
+}
+
+bool LLVMBackend::CxxDiagnosticBlamesCopyOf(const std::string& diagnostics,
+                                            const std::string& cxxSpelling) const
+{
+        if (diagnostics.empty() || cxxSpelling.empty()) return false;
+        // A pair<K, V> is copied member by member: clang names K's (or V's) constructor.
+        std::vector<std::string> classes{ cxxSpelling };
+        if (cxxSpelling.starts_with("std::pair<") && cxxSpelling.ends_with(">"))
+        {
+            const std::string inner = cxxSpelling.substr(10, cxxSpelling.size() - 11);
+            int depth = 0;
+            size_t start = 0;
+            for (size_t i = 0; i <= inner.size(); ++i)
+            {
+                if (i < inner.size() && inner[i] == '<') ++depth;
+                else if (i < inner.size() && inner[i] == '>') --depth;
+                else if (i == inner.size() || (inner[i] == ',' && depth == 0))
+                {
+                    std::string part = inner.substr(start, i - start);
+                    while (!part.empty() && part.front() == ' ') part.erase(0, 1);
+                    if (!part.empty()) classes.push_back(part);
+                    start = i + 1;
+                }
+            }
+        }
+        size_t begin = 0;
+        while (begin < diagnostics.size())
+        {
+            size_t end = diagnostics.find('\n', begin);
+            if (end == std::string::npos) end = diagnostics.size();
+            const std::string line = diagnostics.substr(begin, end - begin);
+            begin = end + 1;
+            if (line.find("copy constructor") == std::string::npos
+                && line.find("deleted") == std::string::npos)
+                continue;
+            for (const std::string& cls : classes)
+                for (const char* prefix : { "", "const ", "struct ", "class ", "const struct ",
+                                            "const class " })
+                    if (line.find("'" + std::string(prefix) + cls + "'") != std::string::npos)
+                        return true;
+        }
+        return false;
+}
+
+// A refused member taking the receiver's element (or map pair) by const reference: its
+// refusal is the element's deleted copy, which the call site reports once it sees the argument.
+bool LLVMBackend::IsCxxElementCopySinkRefusal(const std::string& receiverType,
+                                              const std::string& memberName) const
+{
+        // Only the template route sees the arguments; without it the refusal must speak now.
+        if (!HasCxxFunctionTemplateMember(receiverType, memberName)) return false;
+        auto record = cxxRecordEntries_.find(receiverType);
+        if (record == cxxRecordEntries_.end()) return false;
+        const std::string& owner = record->second.canonicalCtype;
+        const size_t open = owner.find('<');
+        if (open == std::string::npos || !owner.ends_with(">")) return false;
+        const std::string ownerArgs = owner.substr(open + 1, owner.size() - open - 2);
+        for (const auto& member : record->second.members)
+        {
+            if (member.name != memberName
+                || !member.bindRefusal.starts_with("cannot be instantiated"))
+                continue;
+            for (size_t i = 1; i < member.paramTypes.size(); ++i)
+            {
+                // `const E &` or by-value E, with E the receiver's element (a map's pair).
+                std::string referent = member.paramTypes[i];
+                if (referent.starts_with("const ") && referent.ends_with(" &"))
+                    referent = referent.substr(6, referent.size() - 8);
+                else if (referent.ends_with("&") || referent.ends_with("*"))
+                    continue;
+                std::string element = referent;
+                if (element.starts_with("std::pair<") && element.ends_with(">"))
+                    element = element.substr(10, element.size() - 11);
+                if (element.starts_with("const ")) element = element.substr(6);
+                if (element.empty() || !ownerArgs.starts_with(element)
+                    || (ownerArgs.size() != element.size() && ownerArgs[element.size()] != ','))
+                    continue;
+                // Clang must have named E's copy as the failure.
+                if (CxxDiagnosticBlamesCopyOf(member.refusalCause, referent)) return true;
+            }
+        }
+        return false;
 }
 
 bool LLVMBackend::IsCxxRvalueReferenceArgument(const NamedVariable& arg) const

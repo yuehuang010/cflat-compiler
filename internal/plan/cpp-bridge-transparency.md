@@ -187,7 +187,7 @@ Shape-driven, resolved at compile time, identical for CFlat and C++ types:
   close the listed gaps (proxy results, iterator conversions, free operator templates).
 - **Null-safe**: `?.` on anything with `operator bool` / comparison to `nullptr` + `operator->`.
 - **Sized / contiguous**: `size()` + `data()` lets a C++ container decay to a `T[]` view where a
-  CFlat API takes a view. Borrowed, not copied. Needs R4.
+  CFlat API takes a view. Borrowed, not copied. Landed under R4.
 
 No sugar keyed on a type NAME. If `std::vector` iterates, so does any class with that shape.
 
@@ -236,6 +236,8 @@ Not leaks - these are the improvement, and they apply to CFlat types equally:
 - **R3 - RULED.** `move p` at the call site transfers ownership into a raw-pointer C++
   parameter and consumes the CFlat owner. Borrow stays the default. An import-side sink
   annotation is a later option, only if headers need it at scale.
+- **R4 - RULED 2026-09-23: LANDED.** A C++ contiguous range with public `data()` returning
+  the exact `T*` or `const T*` and integral `size()` implicitly decays at a CFlat `T[]` call as a borrow.
 - **R8 - RULED (was Q2).** A native CFlat `operator T` converts implicitly, the same as an
   imported C++ one. An `explicit` opt-out spelling is not designed yet.
 - **R9 - RULED (was Q1).** A ternary over two lvalues stays an assignable lvalue in native CFlat.
@@ -261,7 +263,6 @@ Not leaks - these are the improvement, and they apply to CFlat types equally:
   `[cpp]`, by synthesizing its C++ view on demand?
 - **R3 (RULED above).** Where does "this C++ callee takes ownership" come from: `unique_ptr`/`T&&`
   signatures only (safe, incomplete), or also a CFlat-side annotation at the import?
-- **R4 (D3).** Container -> `T[]` view decay: implicit at a call, or an explicit spelling?
 - **R5.** `std::unique_ptr<T>` vs `unique<T>` (open since M10): under this plan they stay two
   types that both obey D1; confirm no mapping.
 - **R6.** Exceptions stay as ruled 2026-09-16 (no try/catch). Confirm that a throwing C++ call

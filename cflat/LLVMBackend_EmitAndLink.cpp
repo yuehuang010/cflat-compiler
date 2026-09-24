@@ -450,11 +450,7 @@ std::unique_ptr<llvm::TargetMachine> LLVMBackend::CreateOptTargetMachine(int opt
             ? std::string("arm64-apple-macosx")
             : targetWindows_ ? (platformValue == 32 ? "i686-pc-windows-msvc" : "x86_64-pc-windows-msvc")
                              : llvm::sys::getProcessTriple();
-        std::string cpu = !targetCpu_.empty()
-            ? targetCpu_
-            : DefaultCpuForPlatform(targetMacOS_ ? "macos"
-                                    : targetWindows_ ? (platformValue == 32 ? "win32" : "win64")
-                                                     : "linux");
+        auto [cpu, features] = ProgramTargetCPUFeatures();
 
         std::string err;
         const llvm::Target* target = llvm::TargetRegistry::lookupTarget(llvm::Triple(triple), err);
@@ -464,8 +460,53 @@ std::unique_ptr<llvm::TargetMachine> LLVMBackend::CreateOptTargetMachine(int opt
         llvm::TargetOptions opt;
         if (optLevel < 0) optLevel = cOptLevel_;
         return std::unique_ptr<llvm::TargetMachine>(
-            target->createTargetMachine(llvm::Triple(triple), cpu, "", opt, llvm::Reloc::PIC_,
+            target->createTargetMachine(llvm::Triple(triple), cpu, features, opt, llvm::Reloc::PIC_,
                                         std::nullopt, CodeGenLevelFor(optLevel)));
+    }
+
+std::pair<std::string, std::string> LLVMBackend::ProgramTargetCPUFeatures() const
+{
+        if (!targetCpu_.empty()) return { targetCpu_, {} };
+
+        const llvm::Triple requested(CInteropTargetTriple());
+        const llvm::Triple host(llvm::sys::getProcessTriple());
+        const bool nativeOS = targetMacOS_ ? host.isOSDarwin()
+            : targetWindows_ ? host.isOSWindows() : host.isOSLinux();
+        if (requested.getArch() != host.getArch() || !nativeOS)
+            return { {}, {} };
+
+        // Clang's Darwin driver canonicalizes apple-m1 to apple-a14 in function attrs.
+        // Use that canonical CPU for the target machine and harvested request TUs.
+        const std::string cpu = targetMacOS_
+            ? std::string("apple-a14") : llvm::sys::getHostCPUName().str();
+        if (targetMacOS_)
+            return { cpu, "+aes,+altnzcv,+ccdp,+ccidx,+ccpp,+complxnum,+crc,+dit,+dotprod,+flagm,+fp-armv8,+fp16fml,+fptoint,+fullfp16,+jsconv,+lse,+neon,+pauth,+perfmon,+predres,+ras,+rcpc,+rdm,+sb,+sha2,+sha3,+specrestrict,+ssbs,+v8.1a,+v8.2a,+v8.3a,+v8.4a,+v8a" };
+        const auto hostFeatures = llvm::sys::getHostCPUFeatures();
+        std::string features;
+        if (!hostFeatures.empty())
+        {
+            std::map<std::string, bool> ordered;
+            for (const auto& feature : hostFeatures)
+                ordered.emplace(feature.getKey().str(), feature.getValue());
+            for (const auto& [name, enabled] : ordered)
+            {
+                if (!features.empty()) features += ',';
+                features += enabled ? '+' : '-';
+                features += name;
+            }
+        }
+        return { cpu, features };
+    }
+
+void LLVMBackend::StampProgramTargetAttributes()
+{
+        auto [cpu, features] = ProgramTargetCPUFeatures();
+        for (llvm::Function& function : module->functions())
+        {
+            if (function.isDeclaration() || function.hasFnAttribute("target-cpu")) continue;
+            if (!cpu.empty()) function.addFnAttr("target-cpu", cpu);
+            if (!features.empty()) function.addFnAttr("target-features", features);
+        }
     }
 
 // Materialize the core and clone the module so a view/measurement pass can mutate it
@@ -2784,6 +2825,25 @@ bool LLVMBackend::LinkCxxCompanionModules()
         }
     }
 
+    // Companion TUs are emitted at Clang's O1 with LLVM passes disabled, so frontend attributes
+    // retain source intent while the unoptimized bodies remain reusable at every cflat level.
+    // Restore O0's debug barrier here; at O1+ preserve the frontend's attributes as emitted.
+    for (llvm::Function& function : module->functions())
+    {
+        if (function.isDeclaration() || !function.hasName()
+            || programOrigin.count(function.getName().str()) != 0)
+            continue;
+
+        // Harvest and program functions share the same CPU/features baseline. Keep any extra
+        // target features declared on an individual companion function so LLVM respects its ISA
+        // requirements and only inlines it into callers that support them.
+        if (cOptLevel_ == 0 && !function.hasFnAttribute(llvm::Attribute::AlwaysInline))
+        {
+            function.addFnAttr(llvm::Attribute::OptimizeNone);
+            function.addFnAttr(llvm::Attribute::NoInline);
+        }
+    }
+
     /*
      * Clang emits every inline body the bound surface mentions, not only the ones cflat calls, and
      * an unreferenced one can name a symbol that exists in no library (a member of a specialization
@@ -2851,14 +2911,14 @@ bool LLVMBackend::EmitExecutableElf(const std::string& exePath, bool debugInfo,
             return false;
         }
 
-        std::string cpu = targetCpu_.empty() ? std::string("x86-64") : targetCpu_;
+        auto [cpu, features] = ProgramTargetCPUFeatures();
         llvm::TargetOptions opt;
         opt.FunctionSections = true;
         opt.DataSections     = true;
         // PIC so the object links into a position-independent executable (the
         // default on modern Linux toolchains).
         auto TM = std::unique_ptr<llvm::TargetMachine>(
-            target->createTargetMachine(llvm::Triple(triple), cpu, "", opt, llvm::Reloc::PIC_,
+            target->createTargetMachine(llvm::Triple(triple), cpu, features, opt, llvm::Reloc::PIC_,
                                         std::nullopt, CodeGenLevelFor(cOptLevel_)));
         module->setDataLayout(TM->createDataLayout());
 
@@ -3090,13 +3150,13 @@ bool LLVMBackend::EmitExecutableMachO(const std::string& exePath, bool debugInfo
         }
 
         // Apple Silicon baseline. --cpu overrides (e.g. apple-m2).
-        std::string cpu = targetCpu_.empty() ? std::string("apple-m1") : targetCpu_;
+        auto [cpu, features] = ProgramTargetCPUFeatures();
         llvm::TargetOptions opt;
         opt.FunctionSections = true;
         opt.DataSections     = true;
         // Darwin code is always PIC.
         auto TM = std::unique_ptr<llvm::TargetMachine>(
-            target->createTargetMachine(llvm::Triple(triple), cpu, "", opt, llvm::Reloc::PIC_,
+            target->createTargetMachine(llvm::Triple(triple), cpu, features, opt, llvm::Reloc::PIC_,
                                         std::nullopt, CodeGenLevelFor(cOptLevel_)));
         module->setDataLayout(TM->createDataLayout());
 
@@ -3447,10 +3507,8 @@ bool LLVMBackend::EmitExecutable(const std::string& exePath, const std::string& 
             return false;
         }
 
-        // --cpu overrides the platform default. The value was already resolved ("native"
-        // -> host CPU) and validated in Compile, so it can be used verbatim here.
-        if (!targetCpu_.empty())
-            cpu = targetCpu_;
+        auto targetCpuFeatures = ProgramTargetCPUFeatures();
+        if (!targetCpuFeatures.first.empty()) cpu = targetCpuFeatures.first;
 
         llvm::TargetOptions opt;
         // Emit one section per function/global so lld-link's /OPT:REF can garbage-collect
@@ -3459,7 +3517,8 @@ bool LLVMBackend::EmitExecutable(const std::string& exePath, const std::string& 
         opt.FunctionSections = true;
         opt.DataSections     = true;
         auto TM = std::unique_ptr<llvm::TargetMachine>(
-            target->createTargetMachine(llvm::Triple(triple), cpu, "", opt, llvm::Reloc::PIC_,
+            target->createTargetMachine(llvm::Triple(triple), cpu, targetCpuFeatures.second,
+                                        opt, llvm::Reloc::PIC_,
                                         std::nullopt, CodeGenLevelFor(cOptLevel_)));
         module->setDataLayout(TM->createDataLayout());
 

@@ -81,6 +81,7 @@ template<> struct TypeCode<float> { static const int value = 15; };
 template<> struct TypeCode<double> { static const int value = 16; };
 template<> struct TypeCode<char32_t> { static const int value = 17; };
 template<> struct TypeCode<char8_t> { static const int value = 18; };
+template<> struct TypeCode<long double> { static const int value = 19; };
 
 template<class C> int typeCodeOf(C v) { (void)v; return TypeCode<C>::value; }
 

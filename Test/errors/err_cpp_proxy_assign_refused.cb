@@ -1,0 +1,40 @@
+import cpp "vector";
+import cpp "cpp_interop_proxy_assign.h";
+
+struct ProxyFlatValue { int value = 0; };
+ProxyFlatValue makeProxyFlatValue()
+{
+    ProxyFlatValue result = default;
+    return result;
+}
+
+extern int main()
+{
+    expect_error("Left side of assignment is not an addressable lvalue") {
+        cpppa.ImplicitBox box = default;
+        box[0] = box[0];
+    }
+    expect_error("Left side of assignment is not an addressable lvalue") {
+        std.vector<bool> bits = default;
+        bits.push_back(false);
+        bits[0] |= true;
+    }
+    expect_error("Left side of assignment is not an addressable lvalue") {
+        std.vector<int> values = default;
+        values.push_back(4);
+        values.size() = 19;
+    }
+    expect_error("Left side of assignment is not an addressable lvalue") {
+        std.vector<int> values = default;
+        values.push_back(4);
+        values.data() = nullptr;
+    }
+    expect_error("Left side of assignment is not an addressable lvalue") {
+        makeProxyFlatValue() = makeProxyFlatValue();
+    }
+    expect_error("operator int' and 'operator long") {
+        cpppa.AmbiguousBox box = default;
+        int result = box[1] == true;
+    }
+    return 0;
+}

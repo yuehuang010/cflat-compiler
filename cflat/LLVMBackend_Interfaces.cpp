@@ -184,7 +184,7 @@ bool LLVMBackend::IsPrimitiveTypeName(const std::string& name)
 {
         static const std::unordered_set<std::string> primitives = {
             "int", "char", "short", "long", "ulong", "bool", "void",
-            "float", "double",
+            "float", "double", "longdouble",
             "i8", "i16", "i32", "i64", "i128",
             "u8", "u16", "u32", "u64", "u128", "c8", "c16", "c32", "wchar",
         };
@@ -1057,7 +1057,11 @@ llvm::Function* LLVMBackend::GetOrCreateReverseAbiFunctionThunk(
             else if (slot.kind == AbiSlot::ByVal)
             {
                 auto* incoming = thunk->getArg(loweredIndex++);
-                value = b.CreateLoad(slot.structTy, incoming, "callback.byval");
+                if (!plan.params[i].Pointer && !plan.params[i].IsAlias
+                    && IsForeignNontrivialCxxClass(plan.params[i].TypeName))
+                    value = incoming;
+                else
+                    value = b.CreateLoad(slot.structTy, incoming, "callback.byval");
             }
             else
             {
@@ -1076,6 +1080,17 @@ llvm::Function* LLVMBackend::GetOrCreateReverseAbiFunctionThunk(
             naturalArgs.push_back(value);
         }
 
+        const bool voidReturn = !plan.ret.Pointer && plan.ret.TypeName == "void";
+        if (plan.recipe.retSlot.kind == AbiSlot::Ignore
+            || (voidReturn && plan.recipe.retSlot.kind == AbiSlot::Direct))
+        {
+            auto* call = b.CreateCall(original->getFunctionType(), original, naturalArgs);
+            ApplyAbiCallAttributes(call, plan.recipe);
+            b.CreateRetVoid();
+            builder->restoreIP(savedIP);
+            return thunk;
+        }
+
         if (cxxSretReturn)
         {
             naturalArgs.insert(naturalArgs.begin() + SRetArgIndex(plan.recipe), sret);
@@ -1085,8 +1100,7 @@ llvm::Function* LLVMBackend::GetOrCreateReverseAbiFunctionThunk(
         }
         else
         {
-            auto* naturalTy = GetFunctionType(plan.ret, plan.params, false, false);
-            auto* call = b.CreateCall(naturalTy, original, naturalArgs);
+            auto* call = b.CreateCall(original->getFunctionType(), original, naturalArgs);
             if (plan.recipe.retSlot.kind == AbiSlot::SRetReturn)
             {
                 b.CreateStore(call, sret);

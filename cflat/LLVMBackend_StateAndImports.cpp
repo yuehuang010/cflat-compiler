@@ -39,6 +39,11 @@
 #include <cctype>
 #include <map>
 #include <set>
+#include <atomic>
+#include <mutex>
+
+static std::mutex gCHeaderDiskCachePublishMutex;
+static std::atomic<uint64_t> gCHeaderDiskCacheTempCounter{0};
 
 #if defined(__APPLE__)
 // Step 3 (macOS self-contained link): harvest libSystem's exported symbols from
@@ -1766,8 +1771,120 @@ std::string LLVMBackend::GetCHeaderCacheDir()
         if (base.empty()) return {};
         // Forward slash: Win32 accepts it, and a backslash would otherwise become part of
         // the directory NAME on POSIX (a literal "~/.cflat\cheaders" entry).
-        return base + "/cheaders";
-    }
+        const std::string cacheDir = base + "/cheaders";
+        static std::mutex cleanupMutex;
+        static std::set<std::string> cleanedDirs;
+        {
+            std::lock_guard<std::mutex> lock(cleanupMutex);
+            if (cleanedDirs.insert(cacheDir).second)
+            {
+                std::lock_guard<std::mutex> publishLock(gCHeaderDiskCachePublishMutex);
+                namespace fs = std::filesystem;
+                std::error_code ec;
+                const auto now = fs::file_time_type::clock::now();
+                constexpr auto grace = std::chrono::minutes(10);
+                if (fs::is_directory(cacheDir, ec))
+                {
+                    for (const auto& file : fs::directory_iterator(cacheDir, ec))
+                    {
+                        if (ec) break;
+                        const auto path = file.path();
+                        if (path.extension() != ".json") continue;
+                        const auto originalTime = fs::last_write_time(path, ec);
+                        if (ec) { ec.clear(); continue; }
+                        if (now - originalTime < grace) continue;
+                        nlohmann::json json;
+                        bool valid = false;
+                        {
+                            std::ifstream input(path, std::ios::binary);
+                            try { if (input.is_open()) { input >> json; valid = true; } }
+                            catch (...) { valid = false; }
+                        }
+                        bool stale = !valid;
+                        if (valid)
+                        {
+                            try
+                            {
+                                stale = json.value("version", 0) != kCHeaderCacheVersion;
+                                if (!stale && json.contains("cxxRequestKey"))
+                                {
+                                    auto markerPath = path;
+                                    markerPath.replace_extension(".rq");
+                                    stale = !fs::exists(markerPath, ec);
+                                    ec.clear();
+                                }
+                            }
+                            catch (...) { stale = true; }
+                        }
+                        if (!stale) continue;
+                        const auto latestTime = fs::last_write_time(path, ec);
+                        if (ec || latestTime != originalTime) { ec.clear(); continue; }
+                        nlohmann::json latest;
+                        bool stillStale = false;
+                        {
+                            std::ifstream input(path, std::ios::binary);
+                            try
+                            {
+                                if (input.is_open())
+                                {
+                                    input >> latest;
+                                    stillStale = latest.value("version", 0) != kCHeaderCacheVersion;
+                                    if (!stillStale && latest.contains("cxxRequestKey"))
+                                    {
+                                        auto markerPath = path;
+                                        markerPath.replace_extension(".rq");
+                                        stillStale = !fs::exists(markerPath, ec);
+                                        ec.clear();
+                                    }
+                                }
+                            }
+                            catch (...) { stillStale = true; }
+                        }
+                        if (!valid) stillStale = true;
+                        if (stillStale) { fs::remove(path, ec); ec.clear(); }
+                    }
+                    std::set<std::string> referencedSidecars;
+                    for (const auto& file : fs::directory_iterator(cacheDir, ec))
+                    {
+                        if (ec) break;
+                        if (file.path().extension() != ".json") continue;
+                        std::ifstream input(file.path(), std::ios::binary);
+                        nlohmann::json json;
+                        try
+                        {
+                            if (input.is_open()) input >> json;
+                            if (json.contains("cxxbc"))
+                                referencedSidecars.insert(json["cxxbc"].value("file", std::string{}));
+                        }
+                        catch (...) {}
+                    }
+                    for (const auto& file : fs::directory_iterator(cacheDir, ec))
+                    {
+                        if (ec) break;
+                        if (file.path().extension() == ".bc")
+                        {
+                            const std::string name = file.path().filename().string();
+                            const auto sidecarTime = fs::last_write_time(file.path(), ec);
+                            if (ec) { ec.clear(); continue; }
+                            if (now - sidecarTime >= grace && !referencedSidecars.contains(name))
+                            { fs::remove(file.path(), ec); ec.clear(); }
+                        }
+                        else if (file.path().extension() == ".rq")
+                        {
+                            const auto age = now - fs::last_write_time(file.path(), ec);
+                            if (ec) { ec.clear(); continue; }
+                            if (age < grace) continue;
+                            auto jsonPath = file.path(); jsonPath.replace_extension(".json");
+                            if (fs::exists(jsonPath, ec)) { ec.clear(); continue; }
+                            ec.clear();
+                            fs::remove(file.path(), ec); ec.clear();
+                        }
+                    }
+                }
+            }
+        }
+        return cacheDir;
+}
 
 uint64_t LLVMBackend::CHeaderDiskCacheKey(const std::string& fileForLsp,
                                         const std::vector<std::string>& includeDirs,
@@ -1788,7 +1905,9 @@ uint64_t LLVMBackend::CHeaderDiskCacheKey(const std::vector<std::string>& header
                                         bool msvcBitfieldPacking,
                                         const std::string& targetTriple,
                                         bool cxxMode, bool cxxDefinitionsEmitted,
-                                        const std::string& cppStandard)
+                                        const std::string& cppStandard,
+                                        const std::string& targetCpu,
+                                        const std::string& targetFeatures)
 {
         uint64_t h = 14695981039346656037ULL;
         auto fold = [&h](const std::string& s) {
@@ -1811,6 +1930,11 @@ uint64_t LLVMBackend::CHeaderDiskCacheKey(const std::vector<std::string>& header
         // result again, and never a substitute for a compile's. Nothing writes such an entry to
         // disk today; keying it apart means an older entry can never be mistaken for one either.
         if (cxxMode) fold(cxxDefinitionsEmitted ? "|EDEF" : "|EDECL");
+        // C++ request and header-body bitcode uses O1 with LLVM passes disabled.
+        if (cxxMode)
+        {
+            fold("|O1-NO-LLVM-PASSES-V4|CPU=" + targetCpu + "|FEATURES=" + targetFeatures);
+        }
         return h;
     }
 
@@ -2294,6 +2418,7 @@ nlohmann::json LLVMBackend::CxxMemberToJson(
         if (m.isTemplateSpecialization) j["ts"] = true;
         if (m.needsLocalDefinition) j["nd"] = true;
         if (!m.bindRefusal.empty()) j["br"] = m.bindRefusal;
+        if (!m.refusalCause.empty()) j["rcs"] = m.refusalCause;
         if (m.returnsThis)          j["rth"] = true;
         if (m.isCopyCtor)           j["cc"] = true;
         if (m.isMoveCtor)           j["mc"] = true;
@@ -2346,6 +2471,7 @@ cflat_cinterop::RawCxxMember LLVMBackend::CxxMemberFromJson(
         m.isTemplateSpecialization = j.value("ts", false);
         m.needsLocalDefinition = j.value("nd", false);
         m.bindRefusal = j.value("br", std::string());
+        m.refusalCause = j.value("rcs", std::string());
         m.returnsThis          = j.value("rth", false);
         m.isCopyCtor           = j.value("cc", false);
         m.isMoveCtor           = j.value("mc", false);
@@ -2676,17 +2802,10 @@ bool LLVMBackend::TryLoadCHeaderDiskCache(
         namespace fs = std::filesystem;
         std::error_code ec;
         auto cachePath = cacheDir / std::format("{:016x}.json", diskKey);
-        auto sidecarPath = cacheDir / std::format("{:016x}.bc", diskKey);
-        auto markerPath = cacheDir / std::format("{:016x}.rq", diskKey);
         auto cacheMiss = [&](const char* reason) {
             if (missReason != nullptr) *missReason = reason;
-            if (!removeOnMiss) return false;
-            fs::remove(sidecarPath, ec);
-            ec.clear();
-            fs::remove(cachePath, ec);
-            ec.clear();
-            fs::remove(markerPath, ec);
-            ec.clear();
+            // Cache files are shared by concurrent compilers; a miss must not unlink a writer's entry.
+            (void)removeOnMiss;
             return false;
         };
         if (!fs::exists(cachePath, ec)) return cacheMiss("missing entry");
@@ -2833,6 +2952,12 @@ bool LLVMBackend::TryLoadCHeaderDiskCache(
         // v87 recognizes forwarding references in C++ function parameter packs.
         // v88 publishes global class and alias-template names for bare CFlat type requests.
         // v89 stores function-template parameter names and forwarding template-parameter indices.
+        // v90 stores companion bitcode under a content-addressed name and validates the bytes
+        // read from that file, so concurrent publishers cannot pair another writer's module.
+        // v91 stores long double signatures with their distinct longdouble identity.
+        // v92 refuses bodies reaching an incremental chunk's emptied (poisoned) specialization
+        // and stores the clang diagnostic behind a member refusal (refusalCause).
+        // v93 exports non-special user operator= overloads and member templates for assignment calls.
         if (version != kCHeaderCacheVersion) return cacheMiss("cache version");
 
         if (!expectedRequestKey.empty()
@@ -2925,8 +3050,13 @@ bool LLVMBackend::TryLoadCHeaderDiskCache(
                 if (!blob.contains("file") || !blob.contains("len") || !blob.contains("hash"))
                     return cacheMiss("missing sidecar metadata");
                 const std::string sidecarName = blob.value("file", std::string{});
-                const std::string expectedName = std::format("{:016x}.bc", diskKey);
-                if (sidecarName != expectedName) return cacheMiss("sidecar name");
+                const std::string sidecarPrefix = std::format("{:016x}.", diskKey);
+                const fs::path sidecarRel(sidecarName);
+                if (sidecarRel.filename() != sidecarRel
+                    || !sidecarName.starts_with(sidecarPrefix)
+                    || !sidecarName.ends_with(".bc"))
+                    return cacheMiss("sidecar name");
+                const fs::path sidecarPath = cacheDir / sidecarRel;
                 const uint64_t expectedLength = blob.value("len", uint64_t{0});
                 const uint64_t expectedHash = blob.value("hash", uint64_t{0});
                 auto sidecar = [&] {
@@ -2945,7 +3075,13 @@ bool LLVMBackend::TryLoadCHeaderDiskCache(
                     if (!expectedRequestKey.empty())
                         sidecarHashScope.emplace("CxxTypeRequestSidecarHash",
                                                   sidecarPath.string());
-                    sidecarHashOk = HashFileFnv1a(sidecarPath.string(), actualHash);
+                    actualHash = 14695981039346656037ULL;
+                    for (unsigned char byte : (*sidecar)->getBuffer())
+                    {
+                        actualHash ^= byte;
+                        actualHash *= 1099511628211ULL;
+                    }
+                    sidecarHashOk = true;
                 }
                 if (!sidecarHashOk || actualHash != expectedHash)
                     return cacheMiss("sidecar hash");
@@ -2972,20 +3108,6 @@ bool LLVMBackend::TryLoadCHeaderDiskCache(
         catch (...) { return cacheMiss("incompatible entry"); }
         out = std::move(entry);
         return true;
-    }
-
-static std::string CxxRequestGroupMarker(const std::vector<std::string>& headers,
-                                         const std::vector<std::string>& defines)
-{
-        // This marker is deliberately tiny compared with a request JSON entry. Length-prefix each
-        // string so paths and defines may contain spaces without making the ownership test lossy.
-        std::string marker = "H" + std::to_string(headers.size()) + ":";
-        for (const auto& header : headers)
-            marker += std::to_string(header.size()) + ":" + header;
-        marker += "D" + std::to_string(defines.size()) + ":";
-        for (const auto& define : defines)
-            marker += std::to_string(define.size()) + ":" + define;
-        return marker;
     }
 
 void LLVMBackend::LoadCxxTemplateOwnerMemo()
@@ -3087,6 +3209,9 @@ static uint64_t SigBaselineHash(const std::string& text)
         }
         return h;
     }
+
+static std::string CxxRequestGroupMarker(const std::vector<std::string>& headers,
+                                         const std::vector<std::string>& defines);
 
 std::string LLVMBackend::SigBaselineGroupKey(uint64_t headerHash,
                                              std::filesystem::file_time_type mtime,
@@ -3254,6 +3379,11 @@ void LLVMBackend::WriteCHeaderDiskCache(
         // v87 recognizes forwarding references in C++ function parameter packs.
         // v88 publishes global class and alias-template names for bare CFlat type requests.
         // v89 stores function-template parameter names and forwarding template-parameter indices.
+        // v90 content-addresses companion bitcode and records its byte length with the hash.
+        // v91 stores long double signatures with their distinct longdouble identity.
+        // v92 refuses bodies reaching an incremental chunk's emptied (poisoned) specialization
+        // and stores the clang diagnostic behind a member refusal (refusalCause).
+        // v93 exports non-special user operator= overloads and member templates for assignment calls.
         j["version"] = kCHeaderCacheVersion;
         j["mtime"]   = (int64_t)mtime.time_since_epoch().count();
         j["hash"]    = contentHash;
@@ -3348,14 +3478,21 @@ void LLVMBackend::WriteCHeaderDiskCache(
         j["files"] = std::vector<std::string>(files.paths.begin() + sharedPathCount,
                                               files.paths.end());
 
-        auto tmpPath  = cacheDir / std::format("{:016x}.{}.tmp", diskKey, _getpid());
+        const uint64_t tempId = gCHeaderDiskCacheTempCounter.fetch_add(1, std::memory_order_relaxed);
+        auto tmpPath  = cacheDir / std::format("{:016x}.{}.{}.tmp", diskKey, _getpid(), tempId);
         auto destPath = cacheDir / std::format("{:016x}.json", diskKey);
-        const auto sidecarPath = cacheDir / std::format("{:016x}.bc", diskKey);
-        const auto markerPath = cacheDir / std::format("{:016x}.rq", diskKey);
-        bool sidecarWritten = false;
+        fs::path sidecarPath;
+        fs::path sidecarTmpPath;
         if (!entry.cxxBitcode.empty())
         {
-            const auto sidecarTmpPath = cacheDir / std::format("{:016x}.{}.bc.tmp", diskKey, _getpid());
+            const uint64_t sidecarHash = SigBaselineHash(entry.cxxBitcode);
+            const auto publishedAt = std::chrono::system_clock::now().time_since_epoch().count();
+            const std::string sidecarName = std::format("{:016x}.{:016x}.{}.{}.bc",
+                                                        diskKey, sidecarHash, publishedAt,
+                                                        _getpid(), tempId);
+            sidecarPath = cacheDir / sidecarName;
+            sidecarTmpPath = cacheDir
+                / std::format("{:016x}.{}.{}.{}.bc.tmp", diskKey, _getpid(), tempId, sidecarHash);
             {
                 std::ofstream f(sidecarTmpPath, std::ios::binary | std::ios::trunc);
                 if (!f.is_open()) return;
@@ -3367,35 +3504,9 @@ void LLVMBackend::WriteCHeaderDiskCache(
                     return;
                 }
             }
-            fs::rename(sidecarTmpPath, sidecarPath, ec);
-            if (ec)
-            {
-                fs::remove(sidecarTmpPath, ec);
-                return;
-            }
-            uint64_t sidecarHash = 0;
-            bool sidecarHashOk;
-            {
-                std::optional<llvm::TimeTraceScope> sidecarHashScope;
-                if (!requestKey.empty())
-                    sidecarHashScope.emplace("CxxTypeRequestSidecarHash",
-                                              sidecarPath.string());
-                sidecarHashOk = HashFileFnv1a(sidecarPath.string(), sidecarHash);
-            }
-            if (!sidecarHashOk)
-            {
-                fs::remove(sidecarPath, ec);
-                return;
-            }
-            sidecarWritten = true;
             j["cxxbc"] = {{"file", sidecarPath.filename().string()},
                            {"len", static_cast<uint64_t>(entry.cxxBitcode.size())},
                            {"hash", sidecarHash}};
-        }
-        else
-        {
-            fs::remove(sidecarPath, ec);
-            ec.clear();
         }
 
         // The transitive include set (header imports) for transitive validation.
@@ -3407,13 +3518,11 @@ void LLVMBackend::WriteCHeaderDiskCache(
             j["deps"] = deps;
         }
 
-        // Atomic write: PID-stamped temp file renamed over the target. The sidecar above is
-        // committed first, so a JSON entry never names a sidecar that is not present.
+        // The content-addressed sidecar is committed first; this JSON file is the entry index.
         {
             std::ofstream f(tmpPath);
             if (!f.is_open())
             {
-                if (sidecarWritten) fs::remove(sidecarPath, ec);
                 return;
             }
             f << j;
@@ -3421,81 +3530,90 @@ void LLVMBackend::WriteCHeaderDiskCache(
             {
                 f.close();
                 fs::remove(tmpPath, ec);
-                if (sidecarWritten) fs::remove(sidecarPath, ec);
                 return;
             }
         }
-        fs::rename(tmpPath, destPath, ec);
+        {
+            std::lock_guard<std::mutex> publishLock(gCHeaderDiskCachePublishMutex);
+            if (!sidecarTmpPath.empty())
+            {
+                ec = llvm::sys::fs::rename(sidecarTmpPath.string(), sidecarPath.string());
+                if (ec)
+                {
+                    fs::remove(sidecarTmpPath, ec);
+                    fs::remove(tmpPath, ec);
+                    return;
+                }
+            }
+            ec = llvm::sys::fs::rename(tmpPath.string(), destPath.string());
+        }
         if (ec)
         {
             fs::remove(tmpPath, ec);
-            if (sidecarWritten) fs::remove(sidecarPath, ec);
             return;
         }
         if (!requestKey.empty() && requestGroup != nullptr)
         {
+            const std::string marker = CxxRequestGroupMarker(requestGroup->ownerHeaders,
+                                                              requestGroup->ownerDefines);
+            const auto markerPath = cacheDir / std::format("{:016x}.rq", diskKey);
             const auto markerTmpPath = cacheDir
-                / std::format("{:016x}.{}.rq.tmp", diskKey, _getpid());
-            std::ofstream marker(markerTmpPath, std::ios::binary | std::ios::trunc);
-            auto removeWrittenEntry = [&] {
-                fs::remove(destPath, ec);
-                ec.clear();
-                fs::remove(sidecarPath, ec);
-                ec.clear();
-                fs::remove(markerPath, ec);
-                ec.clear();
-            };
-            if (!marker.is_open())
+                / std::format("{:016x}.{}.{}.rq.tmp", diskKey, _getpid(), tempId);
+            std::ofstream markerFile(markerTmpPath, std::ios::binary | std::ios::trunc);
+            if (markerFile.is_open())
             {
-                removeWrittenEntry();
-                return;
+                markerFile << marker;
+                markerFile.close();
+                if (markerFile)
+                {
+                    {
+                        std::lock_guard<std::mutex> publishLock(gCHeaderDiskCachePublishMutex);
+                        ec = llvm::sys::fs::rename(markerTmpPath.string(), markerPath.string());
+                    }
+                    if (ec) { ec.clear(); fs::remove(markerTmpPath, ec); }
+                }
+                else { fs::remove(markerTmpPath, ec); ec.clear(); }
             }
-            marker << CxxRequestGroupMarker(requestGroup->ownerHeaders,
-                                            requestGroup->ownerDefines);
-            marker.close();
-            if (!marker)
-            {
-                fs::remove(markerTmpPath, ec);
-                removeWrittenEntry();
-                return;
-            }
-            fs::remove(markerPath, ec);
-            ec.clear();
-            fs::rename(markerTmpPath, markerPath, ec);
-            if (ec)
-            {
-                fs::remove(markerTmpPath, ec);
-                removeWrittenEntry();
-            }
+            std::lock_guard<std::mutex> publishLock(gCHeaderDiskCachePublishMutex);
+            PruneCxxTypeRequestDiskCache(cacheDir, *requestGroup);
         }
     }
 
-void LLVMBackend::PruneCxxTypeRequestDiskCache(const std::filesystem::path& cacheDir,
-                                               const CxxRequestGroup& group)
+static std::string CxxRequestGroupMarker(const std::vector<std::string>& headers,
+                                         const std::vector<std::string>& defines)
 {
+        std::string marker = "H" + std::to_string(headers.size()) + ":";
+        for (const auto& header : headers)
+            marker += std::to_string(header.size()) + ":" + header;
+        marker += "D" + std::to_string(defines.size()) + ":";
+        for (const auto& define : defines)
+            marker += std::to_string(define.size()) + ":" + define;
+        return marker;
+    }
+
+void LLVMBackend::PruneCxxTypeRequestDiskCache(const std::filesystem::path& cacheDir,
+                                                const CxxRequestGroup& group)
+{
+        namespace fs = std::filesystem;
         std::error_code ec;
-        if (!std::filesystem::is_directory(cacheDir, ec)) return;
-        const std::string ownerMarker = CxxRequestGroupMarker(group.ownerHeaders,
-                                                               group.ownerDefines);
-        for (const auto& file : std::filesystem::directory_iterator(cacheDir, ec))
+        if (!fs::is_directory(cacheDir, ec)) return;
+        const std::string owner = CxxRequestGroupMarker(group.ownerHeaders, group.ownerDefines);
+        const auto now = fs::file_time_type::clock::now();
+        constexpr auto grace = std::chrono::minutes(10);
+        for (const auto& file : fs::directory_iterator(cacheDir, ec))
         {
             if (ec) return;
             if (file.path().extension() != ".rq") continue;
+            const auto age = now - fs::last_write_time(file.path(), ec);
+            if (ec) { ec.clear(); continue; }
+            if (age < grace) continue;
             std::ifstream input(file.path(), std::ios::binary);
-            if (!input.is_open()) continue;
             std::string marker;
-            std::getline(input, marker);
-            if (marker != ownerMarker) continue;
+            if (!input.is_open() || !std::getline(input, marker) || marker != owner) continue;
             auto jsonPath = file.path();
             jsonPath.replace_extension(".json");
-            std::filesystem::remove(jsonPath, ec);
-            ec.clear();
-            auto sidecar = jsonPath;
-            sidecar.replace_extension(".bc");
-            std::filesystem::remove(sidecar, ec);
-            ec.clear();
-            std::filesystem::remove(file.path(), ec);
-            ec.clear();
+            fs::remove(jsonPath, ec); ec.clear();
+            fs::remove(file.path(), ec); ec.clear();
         }
     }
 

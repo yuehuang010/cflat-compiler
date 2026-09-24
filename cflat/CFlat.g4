@@ -1017,7 +1017,7 @@ operatorFunctionId
                | PlusPlus | MinusMinus
                | PlusAssign | MinusAssign | StarAssign | DivAssign | ModAssign
                | LeftShiftAssign | RightShiftAssign | AndAssign | XorAssign | OrAssign
-               | Equal | NotEqual | Less | LessEqual | Greater | GreaterEqual
+               | Assign | Equal | NotEqual | Less | LessEqual | Greater | GreaterEqual
                | LeftShift | Greater Greater
                | LeftBracket RightBracket
                | LeftParen RightParen

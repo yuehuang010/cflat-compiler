@@ -85,7 +85,20 @@ namespace cpppoly
         int both_only() const noexcept;
     };
 
+    struct BothBox
+    {
+        Both value;
+        Both& get() noexcept;
+    };
+
     struct NoVirtualBase { int nv; };
+    struct BothLate : Left, NoVirtualBase, Right
+    {
+        BothLate() noexcept;
+        ~BothLate() noexcept override;
+        int l() const noexcept override;
+        int r() const noexcept override;
+    };
     struct NoVirtualDerived : Left, NoVirtualBase
     {
         NoVirtualDerived() noexcept;
@@ -95,6 +108,9 @@ namespace cpppoly
     // Right's base offset; reading rv proves it did.
     int read_right(const Right* p) noexcept;
     int call_right(const Right* p) noexcept;
+    int take_right_ptr(Right* p) noexcept;
+    int take_right_ref(Right& r) noexcept;
+    int read_right_cref(const Right& r) noexcept;
     // Reference returns of a derived object for the RETURN-statement legs (3370-3389): a CFlat
     // `Right*` / `Shape*` function returning one must add the base offset (16 for Right).
     Both& both_ref() noexcept;

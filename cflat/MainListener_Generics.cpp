@@ -269,13 +269,11 @@ bool MainListener::IsFollowedByCall(CFlatParser::PostfixExpressionContext* ctx, 
 
 std::string MainListener::InstantiateGenericFunction(const std::string& baseName,
                                                     const std::vector<std::string>& spelledArgs) {
-        // Same refusal as QueuePendingInstantiation; the location is still the written argument.
-        if (genericFunctionTemplates.count(baseName) != 0 && HasLongDoubleTypeArgument(spelledArgs))
-        {
-            compilerLLVM->LogError(LocalizePrimitiveTypeError(compilerLLVM, LongDoubleNativeTypeError()));
-            return {};
-        }
         std::vector<std::string> typeArgs = spelledArgs;
+        if (genericFunctionTemplates.count(baseName) != 0
+            && HasLongDoubleTypeArgument(typeArgs)
+            && !compilerLLVM->IsCInteropLongDoubleSupported())
+            compilerLLVM->LogError(compilerLLVM->CInteropLongDoubleRefusal());
         std::string mangledName = MangledGenericName(baseName, typeArgs);
         FillGenericValueDefaults(*Compiler(), baseName,
                                  genericFunctionTypeParams[baseName].size(), typeArgs);
@@ -581,19 +579,38 @@ std::string MainListener::TryInferAndInstantiateFromArgs(const std::string& func
                     {
                         // A view parameter binds from a view argument or from a FIXED array,
                         // which decays to one at the call (`First(plain)` with `int[3] plain`).
-                        if (!argView && tv.ConstArraySize == 0) break;
-                        argView = false;
+                        if (!argView && tv.ConstArraySize == 0)
+                        {
+                            // A C++ contiguous record can bind to T[] at the call site. Ask the
+                            // same structural gate used by overload scoring for its exact data()
+                            // element spelling, then let instantiation run through that path.
+                            LLVMBackend::TypeAndValue viewParam;
+                            viewParam.IsArrayView = true;
+                            std::string elementType;
+                            if (!compilerLLVM->IsCxxContiguousViewSource(args[i], viewParam,
+                                                                        nullptr, &elementType))
+                                break;
+                            argType = elementType;
+                            declared = true;
+                        }
+                        else
+                        {
+                            argView = false;
+                        }
                     }
-                    else if (argView && paramStars > 0)
+                    else if (!paramView && argView && paramStars > 0)
                     {
                         // 'T*' over a view argument decays to the ELEMENT pointer (q09 ruling).
                         argView = false;
                         argStars += 1;
                     }
-                    if (argStars < paramStars) break;
-                    argStars -= paramStars;
-                    argType = base + std::string(argStars, '*') + (argView ? "[]" : "");
-                    declared = true;
+                    if (argType.empty())
+                    {
+                        if (argStars < paramStars) break;
+                        argStars -= paramStars;
+                        argType = base + std::string(argStars, '*') + (argView ? "[]" : "");
+                        declared = true;
+                    }
                 }
                 // Free-function calls drop TypeName for signed-int args. Fall back to the LLVM
                 // BaseType so literals infer; NOT for a view, whose opaque pointer recovers as
@@ -751,18 +768,15 @@ void MainListener::QueuePendingInstantiation(const std::string& templateName,
     const std::vector<std::string>& typeArgs, const std::string& mangledName,
     antlr4::ParserRuleContext* site)
 {
-        // `long double` exists only as a C++ template argument. Refuse it for a CFlat template
-        // here, before the body is instantiated and fails deep inside the template's own file.
         const bool cflatTemplate = genericStructTemplates.count(templateName) != 0
             || genericClassTemplates.count(templateName) != 0
             || genericInterfaceTemplates.count(templateName) != 0;
-        if (cflatTemplate && HasLongDoubleTypeArgument(typeArgs))
+        if (cflatTemplate && HasLongDoubleTypeArgument(typeArgs)
+            && !compilerLLVM->IsCInteropLongDoubleSupported())
         {
-            auto message = LocalizePrimitiveTypeError(compilerLLVM, LongDoubleNativeTypeError());
-            if (site != nullptr)
-                LogErrorContext(site, message);
-            else
-                compilerLLVM->LogError(message);
+            const std::string message = compilerLLVM->CInteropLongDoubleRefusal();
+            if (site != nullptr) LogErrorContext(site, message);
+            else compilerLLVM->LogError(message);
             return;
         }
         PendingInstantiation record{ templateName, typeArgs, mangledName };

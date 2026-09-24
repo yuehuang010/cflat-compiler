@@ -1674,6 +1674,162 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
             auto namedVar = ParseUnaryExpression(unaryCtx);
             auto destination = namedVar.Storage;
 
+            // An imported C++ call may already have an sret slot for its prvalue. Route every
+            // such assignment before the ordinary lvalue and special-member assignment paths.
+            const std::string prvalueTypeName = namedVar.TypeAndValue.TypeName;
+            const bool generatedPrvalueRecord =
+                compiler->generatedCxxRecords_.count(prvalueTypeName) != 0;
+            if (namedVar.IsRvalue && !namedVar.TypeAndValue.Pointer
+                && (compiler->IsCxxRecord(prvalueTypeName) || generatedPrvalueRecord))
+            {
+                const auto methodName = operatorText == "=" ? std::string("operator=")
+                    : operatorText.ends_with("=") ? "operator" + operatorText : std::string();
+                bool userDeclared = false;
+                if (!methodName.empty())
+                {
+                    if (const auto* info = compiler->GetCxxClassInfo(prvalueTypeName))
+                        userDeclared = std::any_of(info->directMethods.begin(),
+                            info->directMethods.end(), [&](const auto& method) {
+                                return method.raw.name == methodName && !method.raw.isImplicit
+                                    && !method.raw.isDeleted && method.raw.bindRefusal.empty();
+                            });
+                    if (!userDeclared)
+                        if (auto record = compiler->cxxRecordEntries_.find(prvalueTypeName);
+                            record != compiler->cxxRecordEntries_.end())
+                            userDeclared = std::any_of(record->second.members.begin(),
+                                record->second.members.end(), [&](const auto& method) {
+                                    return method.name == methodName && !method.isImplicit
+                                        && !method.isDeleted && method.bindRefusal.empty();
+                                });
+                    if (!userDeclared && generatedPrvalueRecord)
+                        userDeclared = HasOperatorOverloadForFirstParam(
+                            methodName, prvalueTypeName);
+                    if (!userDeclared && compiler->IsCxxRecord(prvalueTypeName))
+                        userDeclared = compiler->HasCxxFunctionTemplateMember(
+                            prvalueTypeName, methodName);
+                }
+                if (methodName.empty() || !userDeclared)
+                    LogErrorContext(unaryCtx,
+                        "Left side of assignment is not an addressable lvalue.");
+
+                if (destination == nullptr)
+                {
+                    destination = compiler->CreateAlloca(namedVar.BaseType);
+                    compiler->CreateAssignment(namedVar.Primary, destination);
+                    bool hasTrivialCxxDestructor = false;
+                    if (compiler->IsCxxRecord(prvalueTypeName))
+                        if (auto record = compiler->cxxRecordEntries_.find(prvalueTypeName);
+                            record != compiler->cxxRecordEntries_.end())
+                            hasTrivialCxxDestructor = record->second.hasTrivialDtor;
+                    if (!hasTrivialCxxDestructor)
+                        compiler->RegisterOwnedStructTemp(destination, prvalueTypeName);
+                }
+                auto rightNV = ParseAssignmentExpressionNamed(assignCtx);
+                // An overloaded assignment expression returns the C++ operator's declared
+                // result. When that is T&, the ABI value is a pointer to the proxy object;
+                // expose it as an lvalue T so a chained assignment can bind operator=(const T&).
+                auto operatorRightNV = rightNV;
+                llvm::Value* assignmentRef = rightNV.Primary;
+                if (assignmentRef == nullptr && rightNV.Storage != nullptr
+                    && rightNV.BaseType != nullptr && rightNV.BaseType->isPointerTy())
+                    assignmentRef = compiler->builder->CreateLoad(
+                        rightNV.BaseType, rightNV.Storage);
+                if (assignCtx->assignmentOperator() != nullptr
+                    && (rightNV.TypeAndValue.TypeName.empty()
+                        || rightNV.TypeAndValue.TypeName == "ptr")
+                    && assignmentRef != nullptr && assignmentRef->getType()->isPointerTy())
+                {
+                    // The nested assignment visitor can erase the C++ reference's pointee
+                    // metadata to the opaque `ptr` spelling. Its result is still the declared
+                    // proxy type of this assignment expression's left-hand operand.
+                    if (operatorRightNV.TypeAndValue.TypeName.empty()
+                        || operatorRightNV.TypeAndValue.TypeName == "ptr")
+                    {
+                        operatorRightNV.TypeAndValue = {};
+                        operatorRightNV.TypeAndValue.TypeName = prvalueTypeName;
+                    }
+                    operatorRightNV.TypeAndValue.Pointer = false;
+                    operatorRightNV.TypeAndValue.PointerDepth = 0;
+                    operatorRightNV.TypeAndValue.ElemPointer = false;
+                    operatorRightNV.IsRvalue = false;
+                    operatorRightNV.Storage = assignmentRef;
+                    operatorRightNV.BaseType = compiler->GetType(operatorRightNV.TypeAndValue);
+                    operatorRightNV.Primary = compiler->builder->CreateLoad(
+                        operatorRightNV.BaseType, operatorRightNV.Storage);
+                }
+                auto* right = LoadNamedVariable(operatorRightNV);
+                auto* left = compiler->CreateLoad(namedVar.BaseType, destination);
+                auto invokePrvalueOperator = [&]() -> llvm::Value* {
+                    const std::string lookupName = operatorText == "=" ? "operator=" : methodName;
+                    if (compiler->IsCxxRecord(prvalueTypeName)
+                        && compiler->HasCxxFunctionTemplateMember(prvalueTypeName, lookupName))
+                    {
+                        LLVMBackend::NamedVariable receiver;
+                        receiver.Primary = destination;
+                        receiver.Storage = destination;
+                        receiver.BaseType = destination->getType();
+                        receiver.TypeAndValue.TypeName = prvalueTypeName;
+                        receiver.TypeAndValue.Pointer = true;
+                        std::vector<LLVMBackend::NamedVariable> templateArguments;
+                        templateArguments.push_back(std::move(receiver));
+                        templateArguments.push_back(rightNV);
+                        std::string registeredName, templateError;
+                        compiler->RequestCxxFunctionTemplate(
+                            lookupName, prvalueTypeName, {}, templateArguments, {},
+                            registeredName, templateError);
+                    }
+                    auto candidates = compiler->functionTable.find(lookupName);
+                    if (operatorText != "=" || !compiler->IsCxxRecord(prvalueTypeName)
+                        || candidates == compiler->functionTable.end())
+                        return TryBinaryOperatorOverload(
+                            left, operatorText, right, ctx, namedVar.BaseType,
+                            operatorRightNV.TypeAndValue.DepthIsAboutThisValue()
+                                ? operatorRightNV.TypeAndValue.PointerDepth : 0,
+                            operatorRightNV.TypeAndValue.ElemPointer, destination,
+                            operatorRightNV.Storage, false, false, false,
+                            operatorRightNV.IsRvalue, prvalueTypeName,
+                            operatorRightNV.TypeAndValue.TypeName);
+
+                    std::set<std::string> declaredLinkages;
+                    if (auto record = compiler->cxxRecordEntries_.find(prvalueTypeName);
+                        record != compiler->cxxRecordEntries_.end())
+                        for (const auto& member : record->second.members)
+                            if (member.name == "operator=" && !member.isImplicit
+                                && !member.isDeleted && member.bindRefusal.empty())
+                                declaredLinkages.insert(member.linkageName);
+                    auto original = candidates->second;
+                    candidates->second.erase(std::remove_if(candidates->second.begin(),
+                        candidates->second.end(), [&](const auto& candidate) {
+                            return candidate.IsCxx && !candidate.Parameters.empty()
+                                && candidate.Parameters[0].TypeName == prvalueTypeName
+                                && declaredLinkages.count(candidate.UniqueName) == 0
+                                && !candidate.UniqueName.starts_with("__cflat_tpl_");
+                        }), candidates->second.end());
+                    auto restore = [&]() { candidates->second = std::move(original); };
+                    try
+                    {
+                        auto* result = TryBinaryOperatorOverload(
+                            left, operatorText, right, ctx, namedVar.BaseType,
+                            operatorRightNV.TypeAndValue.DepthIsAboutThisValue()
+                                ? operatorRightNV.TypeAndValue.PointerDepth : 0,
+                            operatorRightNV.TypeAndValue.ElemPointer, destination,
+                            operatorRightNV.Storage, false, false, false,
+                            operatorRightNV.IsRvalue, prvalueTypeName,
+                            operatorRightNV.TypeAndValue.TypeName);
+                        restore();
+                        return result;
+                    }
+                    catch (...)
+                    {
+                        restore();
+                        throw;
+                    }
+                };
+                if (auto* result = invokePrvalueOperator()) return result;
+                LogErrorContext(unaryCtx,
+                    "Left side of assignment is not an addressable lvalue.");
+            }
+
             /*
              * M4b - assignment to a foreign NONTRIVIAL C++ object runs the C++ assignment
              * operator. The generic path would store bytes over a live object, which for a class
@@ -3700,7 +3856,8 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                         compoundOverloadExists = HasOperatorOverloadForFirstParam(
                             "operator" + operatorText, leftType);
                         cxxCompoundInPlace = compoundOverloadExists
-                            && compiler->IsCxxRecord(leftType);
+                            && (compiler->IsCxxRecord(leftType)
+                                || compiler->generatedCxxRecords_.count(leftType) != 0);
                         if (compoundOverloadExists)
                             overload = TryBinaryOperatorOverload(
                                 left, operatorText, right, ctx, namedVar.BaseType,
@@ -5999,6 +6156,18 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
         const std::string& cxxTernaryDeclType, bool collapseLvalueArms,
         bool collapseLvalueSink) {
         auto* compiler = Compiler(ctx);
+        LLVMBackend::TypeAndValue pointerJoinDest;
+        if (outerExpected.Pointer && compiler->IsCxxRecord(outerExpected.TypeName))
+            pointerJoinDest = outerExpected;
+        auto adjustCxxPointerArm = [&](llvm::Value*& value) {
+            if (value == nullptr || !pointerJoinDest.Pointer || !value->getType()->isPointerTy())
+                return;
+            if (compiler->builder->GetInsertBlock() == nullptr) return;
+            auto source = InferTernaryArmType(value);
+            if (!source.Pointer || !compiler->IsCxxRecord(source.TypeName)) return;
+            value = compiler->AdjustCxxPointerForStore(
+                pointerJoinDest, source, value, "conditional expression");
+        };
         const bool moveInterfaceReturn = compiler->currentFunctionReturnsOwned
             && compiler->currentFunctionReturnTV.IsInterface;
 
@@ -6594,6 +6763,10 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
             compiler->SwitchToBlock(resumeBlock);
             return {};
         }
+        atTrue();
+        adjustCxxPointerArm(trueValue);
+        atFalse();
+        adjustCxxPointerArm(falseValue);
         // The fat interface LLVM type is shared by every interface. Rebox each moved arm against
         // the declared return interface after unification, using the per-value source-interface
         // ledger; this also handles parent/derived arms whose LLVM types are identical.
@@ -6792,6 +6965,8 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
         compiler->PropagateUniqueFieldRead(trueValue, falseValue, phi);
         compiler->PropagateFatInterfaceJoin(trueValue, falseValue, phi);
         PropagateTernaryViewElement(ctx, trueValue, trueStorage, falseValue, falseStorage, phi);
+        if (phi->getType()->isPointerTy() && pointerJoinDest.Pointer)
+            compiler->RegisterValueElementTypeName(phi, pointerJoinDest.TypeName);
         llvm::Value* resultValue = CloneTernaryClosureValue(phi, ctx);
         LLVMBackend::TypedValue result{ resultValue, joinUnsigned };
         result.isAlias = trueAlias || falseAlias;
@@ -6804,8 +6979,23 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
 LLVMBackend::TypedValue MainListener::ParseConditionalExpression(
         CFlatParser::ConditionalExpressionContext* ctx, ResultUse use) {
         LLVMBackend::TypeAndValue outerExpected = declExpectedType;
-        DeclExpectedTypeGate declExpectedGate(&declExpectedType, ctx->children.size() == 1);
         auto* compiler = Compiler(ctx);
+        DeclExpectedTypeGate declExpectedGate(&declExpectedType,
+            ctx->children.size() == 1
+                || (declExpectedType.Pointer && compiler->IsCxxRecord(declExpectedType.TypeName)));
+        auto adjustCxxPointerArm = [&](llvm::Value*& value, const LLVMBackend::TypeAndValue& dest) {
+            if (value == nullptr || !dest.Pointer || !value->getType()->isPointerTy()
+                || !compiler->IsCxxRecord(dest.TypeName)) return;
+            if (compiler->builder->GetInsertBlock() == nullptr) return;
+            auto source = InferTernaryArmType(value);
+            if (!source.Pointer || !compiler->IsCxxRecord(source.TypeName)) return;
+            value = compiler->AdjustCxxPointerForStore(dest, source, value, "conditional expression");
+        };
+        auto cxxPointerJoinDest = [&]() -> LLVMBackend::TypeAndValue {
+            if (outerExpected.Pointer && compiler->IsCxxRecord(outerExpected.TypeName))
+                return outerExpected;
+            return {};
+        };
         bool collapseLvalueArms = false;
         bool collapseLvalueSink = false;
         bool crossedCallArgument = false;
@@ -6845,6 +7035,8 @@ LLVMBackend::TypedValue MainListener::ParseConditionalExpression(
                 lhs = lhsTv.value;
             }
             if (!lhs) return {};
+            auto pointerJoinDest = cxxPointerJoinDest();
+            adjustCxxPointerArm(lhs, pointerJoinDest);
             llvm::Value* lhsStorage = lhsTv.receiverStorage;
             const bool lhsUniqueFieldRead = compiler->IsUniqueFieldReadValue(lhs);
             auto clearUniqueFieldRead = [&](llvm::Value* value, llvm::Value* storage) {
@@ -6971,6 +7163,7 @@ LLVMBackend::TypedValue MainListener::ParseConditionalExpression(
                     auto rhsTv = ParseConditionalExpression(ctx->conditionalExpression(), use);
                     rhs = rhsTv.value;
                     rhsStorage = rhsTv.receiverStorage;
+                    adjustCxxPointerArm(rhs, pointerJoinDest);
                     rhsUniqueFieldRead = compiler->IsUniqueFieldReadValue(rhs);
                     rhsAlias = compiler->IsAliasValue(rhs);
                     rhsTempField = compiler->IsTempFieldValue(rhs);
@@ -7034,6 +7227,8 @@ LLVMBackend::TypedValue MainListener::ParseConditionalExpression(
 
             compiler->SwitchToBlock(resumeBlock);
             auto* joined = compiler->CreateLoad(resultAlloca);
+            if (joined != nullptr && pointerJoinDest.Pointer)
+                compiler->RegisterValueElementTypeName(joined, pointerJoinDest.TypeName);
             if (lhsAlias || rhsAlias) compiler->RegisterAliasValue(joined);
             if (lhsTempField || rhsTempField) compiler->RegisterTempFieldValue(joined);
             // A '??' joins two views exactly as '?:' does, and the join is a plain load off a
@@ -7161,7 +7356,9 @@ LLVMBackend::TypedValue MainListener::ParseConditionalExpression(
                 };
                 auto parseTrueArm = [&]() {
                     std::optional<DeclExpectedTypeScope> expectedScope;
-                    if (trueDefault)
+                    if (outerExpected.Pointer && compiler->IsCxxRecord(outerExpected.TypeName))
+                        expectedScope.emplace(&declExpectedType, outerExpected);
+                    else if (trueDefault)
                     {
                         auto expected = expectedForDefault(falseValue, falseDefault);
                         if (!expected.TypeName.empty()) expectedScope.emplace(&declExpectedType, expected);
@@ -7183,7 +7380,9 @@ LLVMBackend::TypedValue MainListener::ParseConditionalExpression(
                 };
                 auto parseFalseArm = [&]() {
                     std::optional<DeclExpectedTypeScope> expectedScope;
-                    if (falseDefault)
+                    if (outerExpected.Pointer && compiler->IsCxxRecord(outerExpected.TypeName))
+                        expectedScope.emplace(&declExpectedType, outerExpected);
+                    else if (falseDefault)
                     {
                         auto expected = expectedForDefault(trueValue, trueDefault);
                         if (!expected.TypeName.empty()) expectedScope.emplace(&declExpectedType, expected);
@@ -7220,6 +7419,10 @@ LLVMBackend::TypedValue MainListener::ParseConditionalExpression(
                         compiler->CurrentCastOccurrence(), compiler->CurrentCastOccurrence(),
                         trueUnsigned, falseUnsigned))
                     return {};
+
+                auto pointerJoinDest = cxxPointerJoinDest();
+                adjustCxxPointerArm(trueValue, pointerJoinDest);
+                adjustCxxPointerArm(falseValue, pointerJoinDest);
 
                 // LLVM's select requires an i1 condition; a non-bool CFlat condition
                 // (int, char, pointer, float) must be lowered the same way if/while do.
@@ -7259,6 +7462,8 @@ LLVMBackend::TypedValue MainListener::ParseConditionalExpression(
                 compiler->PropagateBondedValue(trueValue, falseValue, selectValue);
                 compiler->PropagateFatInterfaceJoin(trueValue, falseValue, selectValue);
                 PropagateTernaryViewElement(ctx, trueValue, nullptr, falseValue, nullptr, selectValue);
+                if (selectValue != nullptr && pointerJoinDest.Pointer)
+                    compiler->RegisterValueElementTypeName(selectValue, pointerJoinDest.TypeName);
                 selectValue = CloneTernaryClosureValue(selectValue, ctx);
                 LLVMBackend::TypedValue result{ selectValue, joinUnsigned };
                 result.isAlias = compiler->IsAliasValue(selectValue);
@@ -10131,6 +10336,84 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
         };
 
         auto reportNoOperator = [&](const std::string& typeName) -> llvm::Value* {
+            // A C++ record with no viable member/free operator may still reach a built-in
+            // operator through one implicit conversion function. Keep this after operator
+            // lookup so a real C++ overload always wins, and never apply it to CFlat structs.
+            auto tryImplicitBuiltinConversion = [&]() -> llvm::Value* {
+                static const std::set<std::string> builtinOperators = {
+                    "+", "-", "*", "/", "%", "<<", ">>", "&", "|", "^",
+                    "==", "!=", "<", "<=", ">", ">=", "&&", "||"
+                };
+                if (builtinOperators.count(op) == 0) return nullptr;
+                auto trySide = [&](llvm::Value* value, llvm::Value* other,
+                                   const std::string& sourceName,
+                                   const std::string& otherName,
+                                   bool convertLeft) -> llvm::Value* {
+                    if (value == nullptr || other == nullptr || sourceName.empty()
+                        || (!compiler->IsCxxRecord(sourceName)
+                            && compiler->generatedCxxRecords_.count(sourceName) == 0)
+                        || (!other->getType()->isIntegerTy()
+                            && !other->getType()->isFloatingPointTy()))
+                        return nullptr;
+                    std::string targetName = otherName.empty()
+                        ? ScalarTypeNameForValue(other->getType()) : otherName;
+                    if (targetName.empty() || !LLVMBackend::IsPrimitiveTypeName(targetName))
+                        return nullptr;
+                    if (const auto* info = compiler->GetCxxClassInfo(sourceName))
+                    {
+                        std::vector<std::string> conversions;
+                        for (const auto& method : info->directMethods)
+                            if (method.spellable && method.raw.isConversion && !method.raw.isExplicit
+                                && !method.raw.isDeleted && method.raw.bindRefusal.empty()
+                                && method.ret.IsPrimitive()
+                                && ((op != "%" && op != "<<" && op != ">>"
+                                     && op != "&" && op != "|" && op != "^")
+                                    || method.ret.IsUnsignedInteger() != -1
+                                    || method.ret.TypeName == "int"
+                                    || method.ret.TypeName == "bool"
+                                    || method.ret.TypeName == "char"
+                                    || method.ret.TypeName == "short"
+                                    || method.ret.TypeName == "long"
+                                    || method.ret.TypeName == "i8"
+                                    || method.ret.TypeName == "i16"
+                                    || method.ret.TypeName == "i32"
+                                    || method.ret.TypeName == "i64"))
+                                conversions.push_back(method.raw.name);
+                        std::sort(conversions.begin(), conversions.end());
+                        conversions.erase(std::unique(conversions.begin(), conversions.end()),
+                                          conversions.end());
+                        if (conversions.size() > 1)
+                        {
+                            std::string candidates;
+                            for (const auto& name : conversions)
+                                candidates += (candidates.empty() ? std::string() : std::string(" and "))
+                                    + "'" + name + "'";
+                            LogErrorContext(ctx, std::format(
+                                "ambiguous implicit conversion for built-in operator '{}': {} "
+                                "are viable conversion functions",
+                                op, candidates));
+                        }
+                    }
+                    LLVMBackend::TypeAndValue target;
+                    target.TypeName = targetName;
+                    llvm::Value* converted = compiler->ConvertViaImplicitConversionOperator(
+                        value, target);
+                    if (converted == nullptr) return nullptr;
+                    LLVMBackend::TypeAndValue otherType;
+                    otherType.TypeName = targetName;
+                    const bool otherUnsigned = otherType.IsUnsignedInteger() != -1;
+                    if (convertLeft)
+                        return compiler->CreateOperation(op, converted, other,
+                            target.IsUnsignedInteger() != -1, otherUnsigned);
+                    return compiler->CreateOperation(op, other, converted,
+                        otherUnsigned, target.IsUnsignedInteger() != -1);
+                };
+                if (llvm::Value* converted = trySide(lvalue, rvalue, lhsTypeName,
+                                                     rhsTypeName, true))
+                    return converted;
+                return trySide(rvalue, lvalue, rhsTypeName, lhsTypeName, false);
+            };
+            if (llvm::Value* converted = tryImplicitBuiltinConversion()) return converted;
             if (!reportMissing || typeName.empty()
                 || typeName == "__iface_fat_ptr" || typeName == "__closure_fat_ptr")
                 return nullptr;
@@ -10391,7 +10674,9 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
              * pointer, so it never reaches this branch and still gets its copy.
              */
             llvm::Value* tempAlloca = nullptr;
-            if (!lhsIsRvalue && lhsStorage != nullptr && compiler->IsCxxRecord(typeName))
+            if (!lhsIsRvalue && lhsStorage != nullptr
+                && (compiler->IsCxxRecord(typeName)
+                    || compiler->generatedCxxRecords_.count(typeName) != 0))
                 tempAlloca = lhsStorage;
             else
             {
@@ -10961,12 +11246,6 @@ LLVMBackend::TypeAndValue MainListener::ParseTypeName(CFlatParser::TypeNameConte
                     const bool cxxType = compilerLLVM->TryRequestCxxType(
                         baseName, typeArgs, typeValue.TypeName, cxxError);
                     if (!cxxType && !cxxError.empty()) LogCxxErrorContext(genParams, cxxError);
-                    bool hasLongDouble = false;
-                    for (const auto& arg : typeArgs)
-                        hasLongDouble = hasLongDouble || arg == "longdouble";
-                    if (hasLongDouble && !cxxType)
-                        LogErrorContext(genParams, LocalizePrimitiveTypeError(
-                            compilerLLVM, LongDoubleNativeTypeError()));
                     // A deferred winmd generic interface named directly in a cast (no `using` or
                     // forward-ref scan reached it) is instantiated on demand here. Idempotent/cached,
                     // and a no-op false for CFlat generics (already queued by the scanner).
@@ -10979,8 +11258,9 @@ LLVMBackend::TypeAndValue MainListener::ParseTypeName(CFlatParser::TypeNameConte
                     for (auto* ts : typeSpecs) words.push_back(ts->getText());
                     PrimitiveTypeError canonicalError;
                     CanonicalizePrimitiveTypeWords(words, typeValue.TypeName, canonicalError);
-                    if (typeValue.TypeName == "longdouble" && !HasPrimitiveTypeError(canonicalError))
-                        canonicalError = LongDoubleNativeTypeError();
+                    if (typeValue.TypeName == "longdouble" && !HasPrimitiveTypeError(canonicalError)
+                        && !compilerLLVM->IsCInteropLongDoubleSupported())
+                        LogErrorContext(ctx, compilerLLVM->CInteropLongDoubleRefusal());
                     if (HasPrimitiveTypeError(canonicalError))
                         LogErrorContext(ctx, LocalizePrimitiveTypeError(compilerLLVM, canonicalError));
                     // Apply active type-parameter substitutions (e.g. T -> int inside a generic function body).

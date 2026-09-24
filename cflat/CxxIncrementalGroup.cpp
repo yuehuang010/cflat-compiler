@@ -49,6 +49,7 @@ namespace
             if (level == clang::DiagnosticsEngine::Note)
             {
                 if (!inErrorGroup) return;
+                AppendGroupLine(info);
                 // This note names the incomplete type's declaration, not the use that failed.
                 // Dropping that declaration only turns the retry into an undeclared name.
                 if (info.getID() != clang::diag::note_forward_declaration) Blame(info);
@@ -57,6 +58,9 @@ namespace
             }
             inErrorGroup = level >= clang::DiagnosticsEngine::Error;
             if (!inErrorGroup) return;
+            groupFunctions.clear();
+            groupText.clear();
+            AppendGroupLine(info);
             ++errors;
             Blame(info);
             if (firstError.empty() || incompleteRecordError.empty())
@@ -75,17 +79,30 @@ namespace
         // as an invalid decl across the rollback, and a later use of it reaches CodeGen.
         std::set<std::string> failedMembers;
         std::vector<clang::FunctionDecl*> failedFunctions;
+        // Every error with its notes, and per failed instantiation the lines of its own error
+        // group, so a refusal can later be matched against the diagnostic that caused it.
+        std::string allText;
+        std::unordered_map<const clang::FunctionDecl*, std::string>* causes = nullptr;
 
     private:
         bool inErrorGroup = false;
+        std::string groupText;
+        std::vector<const clang::FunctionDecl*> groupFunctions;
+
+        void AppendGroupLine(const clang::Diagnostic& info)
+        {
+            llvm::SmallString<256> text;
+            info.FormatDiagnostic(text);
+            const std::string line = text.str().str();
+            groupText += (groupText.empty() ? "" : "\n") + line;
+            if (allText.size() < 65536) allText += (allText.empty() ? "" : "\n") + line;
+            if (causes != nullptr)
+                for (const clang::FunctionDecl* function : groupFunctions)
+                    (*causes)[function] += "\n" + line;
+        }
 
         void RecordFailedInstantiation(const clang::Diagnostic& info)
         {
-            if (info.getNumArgs() > 0
-                && info.getArgKind(0) == clang::DiagnosticsEngine::ak_nameddecl)
-                if (auto* function = llvm::dyn_cast_or_null<clang::FunctionDecl>(
-                        reinterpret_cast<clang::NamedDecl*>(info.getRawArg(0))))
-                    failedFunctions.push_back(function);
             llvm::SmallString<256> text;
             info.FormatDiagnostic(text);
             const std::string note = text.str().str();
@@ -93,6 +110,21 @@ namespace
                                       "in instantiation of function template specialization '" })
             {
                 if (!note.starts_with(lead)) continue;
+                // Only the instantiation chain failed; a "'g' declared here" note names a
+                // callee that may be valid and must not be emptied.
+                if (info.getNumArgs() > 0
+                    && info.getArgKind(0) == clang::DiagnosticsEngine::ak_nameddecl)
+                    if (auto* function = llvm::dyn_cast_or_null<clang::FunctionDecl>(
+                            reinterpret_cast<clang::NamedDecl*>(info.getRawArg(0))))
+                    {
+                        failedFunctions.push_back(function);
+                        groupFunctions.push_back(function);
+                        if (causes != nullptr)
+                        {
+                            std::string& cause = (*causes)[function];
+                            cause += (cause.empty() ? "" : "\n") + groupText;
+                        }
+                    }
                 const size_t begin = std::char_traits<char>::length(lead);
                 const size_t end = note.find('\'', begin);
                 if (end == std::string::npos) return;
@@ -316,6 +348,8 @@ namespace
         std::vector<clang::Decl*>* sink = nullptr;
         clang::ASTContext* context = nullptr;
         std::vector<std::string> neutralized;
+        std::unordered_map<const clang::FunctionDecl*, std::string>* poisoned = nullptr;
+        const std::unordered_map<const clang::FunctionDecl*, std::string>* causes = nullptr;
 
         bool HandleTopLevelDecl(clang::DeclGroupRef group) override
         {
@@ -328,8 +362,49 @@ namespace
         }
 
     private:
+        // Error nodes in a statement tree. An Expr's containsErrors() already covers its
+        // subexpressions, so only statements are descended.
+        static bool StmtHasErrors(const clang::Stmt* stmt)
+        {
+            if (stmt == nullptr) return false;
+            if (const auto* expr = llvm::dyn_cast<clang::Expr>(stmt)) return expr->containsErrors();
+            for (const clang::Stmt* child : stmt->children())
+                if (StmtHasErrors(child)) return true;
+            return false;
+        }
+
+        /*
+         * An instantiated body can come out with error nodes and NO error diagnostic (clang
+         * instantiated it under a SFINAE trap, or an earlier chunk's rollback kept it). CodeGen
+         * then raises "cannot compile this l-value expression yet", drops the PTU's module, and
+         * the Interpreter dereferences the null module. Empty the body before CodeGen sees it and
+         * poison it, so every later body that reaches it is refused instead of calling nothing.
+         */
+        void EmptyErroneousInstantiation(clang::Decl* decl)
+        {
+            auto* function = llvm::dyn_cast<clang::FunctionDecl>(decl);
+            if (function == nullptr || context == nullptr
+                || !function->doesThisDeclarationHaveABody()
+                || function->getTemplateInstantiationPattern() == nullptr
+                || !StmtHasErrors(function->getBody()))
+                return;
+            function->setBody(clang::CompoundStmt::CreateEmpty(*context, /*NumStmts*/ 0,
+                                                               /*HasFPFeatures*/ false));
+            if (poisoned != nullptr)
+            {
+                std::string reason = "clang reported an error inside the body it generated for '"
+                    + function->getQualifiedNameAsString() + "'";
+                if (causes != nullptr)
+                    if (auto cause = causes->find(function); cause != causes->end())
+                        reason += "\n" + cause->second;
+                poisoned->emplace(function, reason);
+            }
+            neutralized.push_back(function->getQualifiedNameAsString());
+        }
+
         void Neutralize(clang::Decl* decl)
         {
+            EmptyErroneousInstantiation(decl);
             auto* named = llvm::dyn_cast<clang::NamedDecl>(decl);
             const clang::IdentifierInfo* id = named != nullptr ? named->getIdentifier() : nullptr;
             if (id == nullptr || context == nullptr || !id->getName().starts_with("__cflat_"))
@@ -407,6 +482,11 @@ namespace
                 ++i;
                 continue;
             }
+            if (args[i] == "-Xclang" && i + 1 < args.size())
+            {
+                result.push_back(args[++i]);
+                continue;
+            }
             result.push_back(args[i]);
         }
         return result;
@@ -454,6 +534,23 @@ struct CxxIncrementalGroup::Impl
     std::unordered_map<std::string, clang::TranslationUnitDecl*> preludeRoots;
     ChunkConsumer* announcer = nullptr;   // owned by the Interpreter's consumer chain
     unsigned wrapperRenames = 0;
+    // Specializations whose bodies were emptied after a failed instantiation, with the reason.
+    std::unordered_map<const clang::FunctionDecl*, std::string> poisoned;
+    // Per failed instantiation, the clang error group (error plus notes) that named it.
+    std::unordered_map<const clang::FunctionDecl*, std::string> causes;
+    // Every error and note the newest ParseRequest reported, across its recovery attempts.
+    std::string lastDiagnostics;
+    bool headerHadDiagnostics = false;
+
+    ~Impl()
+    {
+        if (headerHadDiagnostics && interpreter != nullptr)
+        {
+            // Clang CodeGeneratorImpl asserts on deferred inline members after a failed header
+            // parse; DiagnosticScope has reset the error state, so only this path must leak it.
+            (void)interpreter.release();
+        }
+    }
 };
 
 CxxIncrementalGroup::CxxIncrementalGroup(std::unique_ptr<Impl> impl)
@@ -461,11 +558,7 @@ CxxIncrementalGroup::CxxIncrementalGroup(std::unique_ptr<Impl> impl)
 {
 }
 
-CxxIncrementalGroup::~CxxIncrementalGroup()
-{
-    // Clang's interpreter teardown is unsafe after CodeGen has visited its live AST.
-    if (impl_ != nullptr) (void)impl_->interpreter.release();
-}
+CxxIncrementalGroup::~CxxIncrementalGroup() = default;
 
 std::unique_ptr<CxxIncrementalGroup> CxxIncrementalGroup::Create(
     const std::vector<std::string>& args, const std::string& headerSource,
@@ -505,6 +598,8 @@ std::unique_ptr<CxxIncrementalGroup> CxxIncrementalGroup::Create(
     {
         auto recorder = std::make_unique<ChunkConsumer>();
         recorder->context = &impl->interpreter->getCompilerInstance()->getASTContext();
+        recorder->poisoned = &impl->poisoned;
+        recorder->causes = &impl->causes;
         impl->announcer = recorder.get();
         auto& consumers = MultiplexAccess::ListOf(*multiplex);
         auto guarded = std::make_unique<StaticMemberGuard>(std::move(consumers));
@@ -519,6 +614,7 @@ std::unique_ptr<CxxIncrementalGroup> CxxIncrementalGroup::Create(
                 impl->interpreter->getCompilerInstance()->getPreprocessor(),
                 impl->includedFiles));
         auto ptu = impl->interpreter->Parse(headerSource);
+        impl->headerHadDiagnostics = diagnostics.consumer.errors != 0;
         if (!ptu)
         {
             error = ErrorText(ptu.takeError());
@@ -547,6 +643,7 @@ bool CxxIncrementalGroup::HarvestHeader(const cflat_cinterop::ExtractRequest& re
         return false;
     }
     DiagnosticScope diagnostics(impl_->interpreter->getCompilerInstance()->getDiagnostics());
+    diagnostics.consumer.causes = &impl_->causes;
     const bool harvested = cflat_cinterop::ExtractCxxIncremental(
         req, *impl_->interpreter->getCompilerInstance(), impl_->headerRoot,
         impl_->headerRoot, {}, impl_->headerModule, out, error, true);
@@ -630,6 +727,7 @@ bool CxxIncrementalGroup::ParseRequest(const cflat_cinterop::ExtractRequest& req
                                        cflat_cinterop::ExtractResult& out,
                                        std::string& error)
 {
+    impl_->lastDiagnostics.clear();
     std::string typeKey;
     for (const auto& request : req.cxxTypeRequests)
         typeKey += request.cflatName + "\n";
@@ -745,6 +843,7 @@ bool CxxIncrementalGroup::ParseRequest(const cflat_cinterop::ExtractRequest& req
     for (unsigned attempt = 0;; ++attempt)
     {
         DiagnosticScope diagnostics(impl_->interpreter->getCompilerInstance()->getDiagnostics());
+        diagnostics.consumer.causes = &impl_->causes;
         announced.clear();
         if (impl_->announcer != nullptr) impl_->announcer->sink = &announced;
         auto ptu = impl_->interpreter->Parse(chunk);
@@ -764,6 +863,8 @@ bool CxxIncrementalGroup::ParseRequest(const cflat_cinterop::ExtractRequest& req
         const std::string parseError = ErrorText(ptu.takeError());
         error = diagnostics.consumer.firstError;
         if (error.empty()) error = parseError;
+        impl_->lastDiagnostics += (impl_->lastDiagnostics.empty() ? "" : "\n")
+            + diagnostics.consumer.allText;
         /*
          * An earlier chunk already defines a generated wrapper this chunk repeats (a batch that
          * emitted it while its member was refused). Parse the repeat under a fresh name.
@@ -787,8 +888,13 @@ bool CxxIncrementalGroup::ParseRequest(const cflat_cinterop::ExtractRequest& req
         clang::ASTContext& context = impl_->interpreter->getCompilerInstance()->getASTContext();
         for (clang::FunctionDecl* function : diagnostics.consumer.failedFunctions)
             if (function->doesThisDeclarationHaveABody())
+            {
                 function->setBody(clang::CompoundStmt::CreateEmpty(context, /*NumStmts*/ 0,
                                                                    /*HasFPFeatures*/ false));
+                auto cause = impl_->causes.find(function);
+                impl_->poisoned.emplace(function, cause != impl_->causes.end()
+                                                      ? cause->second : error);
+            }
         if (recoveredError.empty()) recoveredError = diagnostics.consumer.incompleteRecordError;
         if (impl_->verbose)
             std::cout << std::format("[verbose] incremental request dropped declarations after "
@@ -797,6 +903,8 @@ bool CxxIncrementalGroup::ParseRequest(const cflat_cinterop::ExtractRequest& req
     }
     error.clear();
     cflat_cinterop::ExtractRequest effective = req;
+    effective.poisonedFunctions = &impl_->poisoned;
+    effective.errorCauses = &impl_->causes;
     // A retry renamed the thunks with its tag; the extractor looks them up by that name.
     if (parsedAttempt > 0 && !effective.cxxThunkSuffix.empty())
         effective.cxxThunkSuffix = PrepareRetryChunk(effective.cxxThunkSuffix, parsedAttempt);
@@ -924,4 +1032,9 @@ bool CxxIncrementalGroup::ParseRequest(const cflat_cinterop::ExtractRequest& req
     }
     if (harvested && !wrapperName.empty()) impl_->wrapperResults.emplace(wrapperName, out);
     return harvested;
+}
+
+const std::string& CxxIncrementalGroup::LastRequestDiagnostics() const
+{
+    return impl_->lastDiagnostics;
 }

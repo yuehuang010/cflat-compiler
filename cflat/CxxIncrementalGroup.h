@@ -26,6 +26,8 @@ public:
                       const std::string& source,
                       cflat_cinterop::ExtractResult& out,
                       std::string& error);
+    // Every clang error and note the newest ParseRequest reported (empty on a clean parse).
+    const std::string& LastRequestDiagnostics() const;
 
 private:
     struct Impl;

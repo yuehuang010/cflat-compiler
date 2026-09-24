@@ -199,9 +199,19 @@
 //     is never adopted; the block leaks (3464-3465).
 //   `unique Base*` adopts a C++ pointer adjusted to its base subobject, retains virtual dispatch,
 //     and invokes exactly one destructor for locals, returns, and fields (3470-3479).
+//   Derived C++ pointers are adjusted per arm before conditional joins, including indirect calls
+//     and C++ reference results passed to base-pointer parameters (3480-3489).
+//   A postfix member call wins over an enclosing same-named free function for C++ classes,
+//     CFlat structs and generic structs, while a C++ free-function receiver fallback remains
+//     available when the receiver has no member of that name (3490-3499).
+//   Native long double aliases retain C++ identity over the supported 64-bit representation
+//     through declarations, aggregates, generics, arithmetic, reflection and C++ deduction (3500-3509).
+//   C++ proxy prvalue assignment and binary operands, including vector<bool> write-through,
+//     readback, comparison, logical conversion, and truth-value forms (3520-3538).
 
 import cpp "library/cpp_interop_basic.h";
 import cpp "library/cpp_interop_basic.cpp";
+import cpp "library/cpp_interop_member_shadow.h";
 import cpp "library/cpp_interop_twin.h";
 import cpp "library/cpp_interop_lastuse.h";
 // Inheritance and virtual dispatch. Definitions are out-of-line on purpose - every
@@ -252,6 +262,7 @@ import cpp "library/cpp_interop_stream.h";
 import cpp "library/cpp_interop_list.h";
 // Assignment into a live object from a temporary: instrumented, header-only.
 import cpp "library/cpp_interop_assign.h";
+import cpp "library/cpp_interop_proxy_assign.h";
 import cpp "library/cpp_interop_refbinding.h";
 
 int cppListTakeValue = 0;
@@ -954,12 +965,89 @@ int CppTemporaryRefCases()
     return 0;
 }
 
+cpppoly.Right* DaReturnRight(int k, cpppoly.Both* b, cpppoly.Right* r)
+{
+    return k > 0 ? b : r;
+}
+int DaTakeRight(cpppoly.Right* r)
+{
+    int before = r.rv;
+    r.rv = before + 3;
+    return before * 10000 + cpppoly.call_right(r);
+}
+struct DaCallbackBox { function<int(cpppoly.Right*)> f; };
+int DaSelect(cpppoly.Right* r) { return 1; }
+int DaSelect(cpppoly.Both* b) { return 2; }
+namespace MemberShadowTests
+{
+    struct Plain { int value = 374; int get() { return value; } };
+    struct Generic<T> { T value = default; T get() { return value; } };
+    struct Caller { int get(cppms.Value value) { return value.get(); } };
+    [cpp] struct Native { int value = 386; int get() { return value; } };
+    struct NativeCaller { int get(Native* value) { return value->get(); } };
+
+    int get(cppms.Value value) { return value.get(); }
+    int invokeGet(cppms.Value value) { return value.get(); }
+    int get(cppms.Value* value) { return value->get(); }
+    int get(cppms.ParenValue value) { return (value).get(); }
+    int get(cppms.Chain value) { return value.get().x; }
+    int get(Plain value) { return value.get(); }
+    int get(Generic<int> value) { return value.get(); }
+    int get<T>(T value) { return value.get(); }
+    int get(cppms.Value value, bool useLambda)
+    {
+        Lambda<int()> callback = () => { return value.get(); };
+        return useLambda ? callback() : value.get();
+    }
+    int sizeFallback(cppms.Plain value) { return value.size(); }
+}
+
+long double ldInteropRoundTrip(long double value) { return value; }
+struct LdInteropBox<T> { T value = default; };
+T ldInteropIdentity<T>(T value) { return value; }
+
+int testLongDoubleNativeInterop()
+{
+    // Native long double has double's representation and its own C++ type identity.
+    long double ldWords = 1.5;
+    longdouble ldAlias = 2.25;
+    long double ldSum = ldWords + ldAlias;
+    long double ldMixed = ldSum + 1.0f + 1;
+    if (ldSum != 3.75 || ldMixed != 5.75) return 3500;
+    if (!(ldWords < ldAlias) || !(ldAlias > 2.0)) return 3501;
+    long double ldDoubleMix = ldWords + 2.0;
+    if (ldDoubleMix != 3.5 || !(ldWords < 2.0) || !(ldWords < 2.0f)
+        || !(ldWords < 2)) return 3507;
+    double ldAsDouble = ldWords;
+    long double ldFromDouble = ldAsDouble;
+    if (ldAsDouble != 1.5 || ldFromDouble != 1.5) return 3502;
+    tuple<long double, int> ldTuple = default;
+    ldTuple.item_0 = 2.5;
+    ldTuple.item_1 = 7;
+    simd<long double, 4> ldSimd = 2.5;
+    list<long double> ldList = default;
+    ldList.add(3.5);
+    if (ldTuple.item_0 != 2.5 || ldTuple.item_1 != 7 || ldSimd[2] != 2.5
+        || ldList.get(0) != 3.5) return 3508;
+    LdInteropBox<long double> ldBox = default;
+    ldBox.value = ldInteropIdentity<longdouble>(3.25);
+    if (ldInteropRoundTrip(2.75) != 2.75 || ldBox.value != 3.25) return 3509;
+    if (strcmp(typeof(ldWords), "long double") != 0
+        || strcmp(typeof(ldAlias), "long double") != 0
+        || strcmp(typeof(cppi.ld_add(ldWords, ldAlias)), "long double") != 0) return 3503;
+    if (cppsop.typeCodeOf(ldWords) != 19 || cppsop.typeCodeOf(ldAlias) != 19) return 3504;
+    if (cppi.ld_add(ldWords, ldAlias) != 3.75) return 3505;
+    auto ldReturned = cppi.ld_add(1.25, 2.5);
+    if (typeof(ldReturned) != "long double" || cppsop.typeCodeOf(ldReturned) != 19) return 3506;
+    return 0;
+}
+
 extern int main()
 {
     // ---- C++ exceptions at the program boundary -------------------------------------------------
     // Win64 keeps the existing SEH trampoline and does not emit the C++ guard.
     if const (__WINDOWS__) {
-        return 0;
+        return testLongDoubleNativeInterop();
     }
 
     {
@@ -4976,5 +5064,194 @@ extern int main()
     if (uaField != 44 || uaCall != 2044 || cpppoly.left_unique_adjust_dtors() != 1
         || cpppoly.right_unique_adjust_dtors() != 1
         || cpppoly.both_unique_adjust_dtors() != 1) return 3478;
+
+    // ---- derived C++ pointer adjustment before joins and indirect calls (3480-3489) ----
+    cpppoly.Both* daBoth = new cpppoly.Both();
+    cpppoly.Right* daRight = new cpppoly.Right();
+    cpppoly.Right* daJoined = 1 > 0 ? daBoth : daRight;
+    if (DaTakeRight(daJoined) != 442047 || daBoth.rv != 47) return 3480;
+    cpppoly.Right* daBaseArm = 0 > 0 ? daBoth : daRight;
+    if (DaTakeRight(daBaseArm) != 220025 || daRight.rv != 25) return 3480;
+    delete daBoth;
+
+    cpppoly.Both* daBothA = new cpppoly.Both();
+    cpppoly.Both* daBothB = new cpppoly.Both();
+    cpppoly.Right* daBothJoin = 1 > 0 ? daBothA : daBothB;
+    if (DaTakeRight(daBothJoin) != 442047 || daBothA.rv != 47) return 3481;
+
+    cpppoly.Both* daEarly = new cpppoly.Both();
+    cpppoly.BothLate* daLate = new cpppoly.BothLate();
+    cpppoly.Right* daOffsetJoin = 1 > 0 ? daEarly : daLate;
+    if (DaTakeRight(daOffsetJoin) != 442047 || daEarly.rv != 47) return 3482;
+    cpppoly.Right* daOtherOffsetJoin = 0 > 0 ? daEarly : daLate;
+    if (DaTakeRight(daOtherOffsetJoin) != 773080 || daLate.rv != 80) return 3482;
+    delete daEarly;
+    delete daLate;
+
+    cpppoly.Both* daNestedBoth = new cpppoly.Both();
+    cpppoly.Right* daNested = 0 > 0 ? daRight : (1 > 0 ? daNestedBoth : daRight);
+    if (DaTakeRight(daNested) != 442047 || daNestedBoth.rv != 47) return 3483;
+    cpppoly.Right* daAssigned = daRight;
+    daAssigned = 1 > 0 ? daNestedBoth : daRight;
+    if (DaTakeRight(daAssigned) != 472050 || daNestedBoth.rv != 50) return 3483;
+    delete daNestedBoth;
+
+    cpppoly.Right* daCoalesced = nullptr;
+    daCoalesced = daCoalesced ?? daBothB;
+    if (DaTakeRight(daCoalesced) != 442047 || daBothB.rv != 47) return 3484;
+
+    cpppoly.Both* daReturnBoth = new cpppoly.Both();
+    cpppoly.Right* daReturned = DaReturnRight(1, daReturnBoth, daRight);
+    if (DaTakeRight(daReturned) != 442047 || daReturnBoth.rv != 47) return 3485;
+    daRight.rv = 22;
+    cpppoly.Right* daReturnedBase = DaReturnRight(0, daReturnBoth, daRight);
+    if (daReturnedBase.rv != 22 || daReturnedBase.r() != 22) return 3485;
+    daReturnedBase.rv = 25;
+    if (daRight.rv != 25) return 3485;
+    delete daReturnBoth;
+
+    cpppoly.Both* daCallBoth = new cpppoly.Both();
+    if (DaTakeRight(1 > 0 ? daCallBoth : daRight) != 442047 || daCallBoth.rv != 47)
+        return 3486;
+    delete daCallBoth;
+
+    cpppoly.Both* daFuncBoth = new cpppoly.Both();
+    function<int(cpppoly.Right*)> daFunc = DaTakeRight;
+    if (daFunc(daFuncBoth) != 442047 || daFuncBoth.rv != 47) return 3487;
+    delete daFuncBoth;
+
+    cpppoly.Both* daFieldBoth = new cpppoly.Both();
+    DaCallbackBox daBox = default;
+    daBox.f = DaTakeRight;
+    if (daBox.f(daFieldBoth) != 442047 || daFieldBoth.rv != 47) return 3488;
+    delete daFieldBoth;
+    cpppoly.Both* daElementBoth = new cpppoly.Both();
+    function<int(cpppoly.Right*)>[1] daFunctions;
+    daFunctions[0] = DaTakeRight;
+    if (daFunctions[0](daElementBoth) != 442047 || daElementBoth.rv != 47) return 3488;
+    delete daElementBoth;
+    cpppoly.Both* daLambdaBoth = new cpppoly.Both();
+    function<int(cpppoly.Right*)> daLambda = (cpppoly.Right* p) => {
+        int before = p.rv;
+        p.rv = before + 3;
+        return before * 10000 + cpppoly.call_right(p);
+    };
+    if (daLambda(daLambdaBoth) != 442047 || daLambdaBoth.rv != 47) return 3488;
+    delete daLambdaBoth;
+
+    cpppoly.both_ref().rv = 44;
+    if (DaTakeRight(cpppoly.both_ref()) != 442047
+        || cpppoly.both_ref().rv != 47 || cpppoly.call_right(&cpppoly.both_ref()) != 2047)
+        return 3489;
+    cpppoly.Both* daIndirectControl = new cpppoly.Both();
+    cpppoly.Both** daIndirectControlPtr = &daIndirectControl;
+    if (DaTakeRight(*daIndirectControlPtr) != 442047 || daIndirectControl.rv != 47)
+        return 3489;
+    cpppoly.Both*[1] daIndirectControlArray;
+    daIndirectControlArray[0] = daIndirectControl;
+    if (DaTakeRight(daIndirectControlArray[0]) != 472050
+        || daIndirectControl.rv != 50) return 3489;
+    delete daIndirectControl;
+
+    // Addressable non-pointer expressions borrow their adjusted Right subobject, not a copy.
+    cpppoly.Both[2] daArray = default;
+    daArray[1].rv = 44;
+    if (DaTakeRight(daArray[1]) != 442047 || daArray[1].rv != 47) return 3489;
+    cpppoly.Both daDerefObject = default;
+    cpppoly.Both* daDerefPtr = &daDerefObject;
+    if (DaTakeRight(*daDerefPtr) != 442047 || daDerefObject.rv != 47) return 3489;
+    std.vector<cpppoly.Both> daVector = default;
+    daVector.push_back(cpppoly.Both());
+    daVector[0].rv = 44;
+    if (DaTakeRight(daVector[0]) != 442047 || daVector[0].rv != 47) return 3489;
+    cpppoly.BothBox daGetterBox = default;
+    daGetterBox.get().rv = 44;
+    if (DaTakeRight(daGetterBox.get()) != 442047 || daGetterBox.get().rv != 47) return 3489;
+
+    // A C++ pointer parameter must borrow a C++ reference result and adjust its base address.
+    cpppoly.both_ref().rv = 44;
+    if (cpppoly.take_right_ptr(cpppoly.both_ref()) != 46
+        || cpppoly.both_ref().rv != 46) return 3489;
+    cpppoly.Both daCppObject = default;
+    cpppoly.Both* daCppPointer = &daCppObject;
+    if (cpppoly.take_right_ptr(daCppPointer) != 46 || daCppObject.rv != 46) return 3489;
+    cpppoly.both_ref().rv = 44;
+    if (cpppoly.take_right_ref(cpppoly.both_ref()) != 45
+        || cpppoly.both_ref().rv != 45) return 3489;
+    daCppObject.rv = 44;
+    if (cpppoly.take_right_ref(*daCppPointer) != 45 || daCppObject.rv != 45) return 3489;
+    cpppoly.both_ref().rv = 44;
+    if (cpppoly.read_right_cref(cpppoly.both_ref()) != 44) return 3489;
+    daCppObject.rv = 44;
+    if (cpppoly.read_right_cref(*daCppPointer) != 44) return 3489;
+
+    // The Both* exact match wins even though the reference result can convert to Right*.
+    cpppoly.both_ref().rv = 44;
+    if (DaSelect(cpppoly.both_ref()) != 2 || cpppoly.both_ref().rv != 44) return 3489;
+    delete daRight;
+    delete daBothA;
+    delete daBothB;
+    // ---- Member-call name shadowing and receiver fallback (3490-3499) ----------------------
+    cppms.Value shadowValue = cppms.Value(371);
+    if (MemberShadowTests.get(shadowValue) != 371
+        || MemberShadowTests.invokeGet(shadowValue) != 371) return 3490;
+    cppms.Value* shadowPtr = &shadowValue;
+    if (MemberShadowTests.get(shadowPtr) != 371) return 3491;
+    cppms.ParenValue parenValue = cppms.ParenValue(373);
+    if (MemberShadowTests.get(parenValue) != 373) return 3492;
+    cppms.Chain chainValue = cppms.Chain(379);
+    if (MemberShadowTests.get(chainValue) != 379) return 3493;
+    MemberShadowTests.Caller shadowCaller;
+    MemberShadowTests.Native nativeValue;
+    MemberShadowTests.NativeCaller nativeCaller;
+    if (shadowCaller.get(shadowValue) != 371 || nativeCaller.get(&nativeValue) != 386)
+        return 3494;
+    MemberShadowTests.Plain plainValue;
+    if (MemberShadowTests.get(plainValue) != 374) return 3495;
+    MemberShadowTests.Generic<int> genericValue;
+    genericValue.value = 375;
+    if (MemberShadowTests.get(genericValue) != 375) return 3496;
+    if (MemberShadowTests.get<cppms.Value>(shadowValue) != 371) return 3497;
+    if (MemberShadowTests.get(shadowValue, true) != 371) return 3498;
+    if (MemberShadowTests.sizeFallback(cppms.Plain(400)) != 405) return 3499;
+
+    int longDoubleResult = testLongDoubleNativeInterop();
+    if (longDoubleResult != 0) return longDoubleResult;
+
+    std.vector<bool> proxyBits = default;
+    proxyBits.push_back(false);
+    proxyBits.push_back(true);
+    proxyBits[0] = true;
+    if (!proxyBits[0]) return 3520;
+    proxyBits[0] = false;
+    if (proxyBits[0]) return 3521;
+    proxyBits[0] = proxyBits[1];
+    if (!proxyBits[0]) return 3522;
+    bool proxyRead = proxyBits[0];
+    if (!proxyRead) return 3523;
+    if (!(proxyBits[0] == true)) return 3524;
+    if (!(true == proxyBits[0])) return 3525;
+    if (proxyBits[0] != proxyBits[1]) return 3526;
+    if (!(proxyBits[0] && proxyRead)) return 3527;
+    int proxyEntered = 0;
+    if (proxyBits[0]) proxyEntered = 1;
+    if (proxyEntered != 1) return 3528;
+    if (proxyBits[0] != true) return 3529;
+    proxyBits[0] = proxyBits[1] = true;
+    if (!proxyBits[0] || !proxyBits[1]) return 3530;
+    cpppa.ProxyIntBox proxyInts = default;
+    proxyInts[0] = proxyInts[1] = 3;
+    if (proxyInts[0] != 3 || proxyInts[1] != 3) return 3531;
+    cpppa.BoolOnlyBox boolOnly = default;
+    if (!(boolOnly[1] == true)) return 3532;
+    if (boolOnly[1] == false) return 3533;
+    if (!(boolOnly[1] && boolOnly[1])) return 3534;
+    int boolOnlyEntered = 0;
+    if (boolOnly[1] && boolOnly[1]) boolOnlyEntered = 1;
+    if (boolOnlyEntered != 1) return 3535;
+    cpppa.IntOnlyBox intOnly = default;
+    if (intOnly[1] + 1 != 2) return 3536;
+    if (!(intOnly[1] < 2)) return 3537;
+    if (intOnly[1] != 1) return 3538;
     return 0;
 }

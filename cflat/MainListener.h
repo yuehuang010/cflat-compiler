@@ -181,8 +181,7 @@ enum class PrimitiveTypeErrorKind
     None,
     ExpectedType,
     InvalidSpelling,
-    InvalidSpellingSuggestion,
-    LongDoubleNative
+    InvalidSpellingSuggestion
 };
 
 struct PrimitiveTypeError
@@ -195,6 +194,17 @@ struct PrimitiveTypeError
 static bool HasPrimitiveTypeError(const PrimitiveTypeError& error)
 {
     return error.kind != PrimitiveTypeErrorKind::None;
+}
+
+static bool HasLongDoubleTypeArgument(const std::vector<std::string>& typeArgs)
+{
+    for (std::string arg : typeArgs)
+    {
+        while (!arg.empty() && (arg.back() == '*' || arg.back() == '[' || arg.back() == ']'))
+            arg.pop_back();
+        if (arg == "longdouble") return true;
+    }
+    return false;
 }
 
 static std::string LocalizePrimitiveTypeError(const LLVMBackend* compiler,
@@ -210,32 +220,10 @@ static std::string LocalizePrimitiveTypeError(const LLVMBackend* compiler,
     case PrimitiveTypeErrorKind::InvalidSpellingSuggestion:
         return compiler->LocalizeMessage("invalid type spelling '{}': use '{}'",
             { error.spelling, error.suggestion });
-    case PrimitiveTypeErrorKind::LongDoubleNative:
-        return compiler->LocalizeMessage(
-            "'long double' is only usable as a C++ template argument; use 'double' in CFlat",
-            {});
     case PrimitiveTypeErrorKind::None:
         break;
     }
     return {};
-}
-
-static PrimitiveTypeError LongDoubleNativeTypeError()
-{
-    return { PrimitiveTypeErrorKind::LongDoubleNative, "long double", "double" };
-}
-
-// True when a resolved type-argument list names `long double` (bare, pointer or view element).
-// Only a C++ template may take it; a CFlat generic has no `longdouble` type to substitute.
-static bool HasLongDoubleTypeArgument(const std::vector<std::string>& typeArgs)
-{
-    for (std::string arg : typeArgs)
-    {
-        while (!arg.empty() && (arg.back() == '*' || arg.back() == '[' || arg.back() == ']'))
-            arg.pop_back();
-        if (arg == "longdouble") return true;
-    }
-    return false;
 }
 
 // Canonicalize one complete C/C++ primitive spelling. A single unknown word is left alone so
@@ -429,7 +417,7 @@ static std::vector<std::string> TypeSpecifierWords(
 static std::string CanonicalTypeSpecifierText(
     CFlatParser::TypeSpecifierContext* typeSpec,
     CFlatParser::MultiWordTypeSuffixContext* suffix = nullptr,
-    bool allowLongDoubleTemplateArgument = false,
+    bool = false,
     PrimitiveTypeError* errorOut = nullptr)
 {
     std::string canonical;
@@ -438,11 +426,6 @@ static std::string CanonicalTypeSpecifierText(
     {
         if (errorOut != nullptr) *errorOut = error;
         return typeSpec != nullptr ? typeSpec->getText() : std::string{};
-    }
-    if (!allowLongDoubleTemplateArgument && canonical == "longdouble")
-    {
-        error = LongDoubleNativeTypeError();
-        if (errorOut != nullptr) *errorOut = error;
     }
     return canonical;
 }
@@ -588,6 +571,7 @@ inline std::string getOperatorName(CFlatParser::OperatorFunctionIdContext* opId)
     if (opId->AndAssign())        return "operator&=";
     if (opId->XorAssign())        return "operator^=";
     if (opId->OrAssign())         return "operator|=";
+    if (opId->Assign())           return "operator=";
     if (opId->Equal())        return "operator==";
     if (opId->NotEqual())     return "operator!=";
     if (opId->Less())         return "operator<";

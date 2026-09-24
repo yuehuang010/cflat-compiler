@@ -589,8 +589,9 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
         PrimitiveTypeError canonicalTypeError;
         std::string canonicalTypeName;
         CanonicalizePrimitiveTypeWords(typeWords, canonicalTypeName, canonicalTypeError);
-        if (canonicalTypeName == "longdouble" && !HasPrimitiveTypeError(canonicalTypeError))
-            canonicalTypeError = LongDoubleNativeTypeError();
+        if (canonicalTypeName == "longdouble" && !HasPrimitiveTypeError(canonicalTypeError)
+            && !Compiler(declSpecs)->IsCInteropLongDoubleSupported())
+            LogErrorContext(declSpecs, Compiler(declSpecs)->CInteropLongDoubleRefusal());
         if (HasPrimitiveTypeError(canonicalTypeError))
         {
             auto* errorSpec = LastDeclarationTypeSpecifier(declSpecList);
@@ -599,9 +600,7 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                 LogErrorContext(errorSpec, message);
             else
                 LogErrorContext(declSpecs, message);
-            // Recover as the CFlat spelling so the unknown 'longdouble' cannot cascade.
-            if (canonicalTypeError.kind == PrimitiveTypeErrorKind::LongDoubleNative)
-                canonicalTypeName = "double";
+            // Recover as the CFlat spelling so an invalid type cannot cascade.
         }
         else if (typeWords.size() > 1)
         {
@@ -933,12 +932,6 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                             baseName, typeArgs, mangledName, cxxError);
                         if (!cxxType && !cxxError.empty())
                             LogCxxErrorContext(genParams, cxxError);
-                        bool hasLongDouble = false;
-                        for (const auto& arg : typeArgs)
-                            hasLongDouble = hasLongDouble || arg == "longdouble";
-                        if (hasLongDouble && !cxxType)
-                            LogErrorContext(genParams, LocalizePrimitiveTypeError(
-                                Compiler(), LongDoubleNativeTypeError()));
                         // A second CFlat spelling of one specialization (a namespace alias in
                         // a type argument) is registered as an alias of the first: declare the
                         // local with the registration's own name so its members resolve.
