@@ -1,5 +1,6 @@
 import cpp "vector";
 import cpp "cpp_interop_lvalue_sink.h";
+import cpp "cpp_interop_sink_cause.h";
 
 [cpp] struct SinkCheck : cplv.Module
 {
@@ -16,7 +17,7 @@ extern int main()
         values.push_back(local);
     }
     // assign copy-ASSIGNS the element; clang names operator=, not the copy constructor.
-    expect_error("member 'assign' of C++ class 'std.vector<SinkCheck>' cannot be instantiated for these template arguments") {
+    expect_error("clang: overload resolution selected deleted operator '='") {
         std.vector<SinkCheck> values = default;
         SinkCheck local = SinkCheck(5);
         values.assign(3, local);
@@ -25,6 +26,18 @@ extern int main()
         std.vector<SinkCheck> values = default;
         SinkCheck local = SinkCheck(6);
         values.resize(3, local);
+    }
+    // Same-name same-arity overloads: each refusal names its own copy, never the sibling's cause.
+    expect_error("cannot copy C++ class 'cplv.Key' into parameter 'value' of 'add'") {
+        ConstOnly values = default;
+        cplv.Key local = cplv.Key(8);
+        values.add(local);
+    }
+    expect_error("(clang: call to deleted constructor of 'OtherSink')") {
+        ConstOnly values = default;
+        OtherSink local = default;
+        OtherSink* pointer = &local;
+        values.add(pointer);
     }
     return 0;
 }

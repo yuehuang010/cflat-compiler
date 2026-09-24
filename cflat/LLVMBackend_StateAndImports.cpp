@@ -2398,6 +2398,15 @@ LLVMBackend::CRecordFieldEntry LLVMBackend::FieldFromJson(const SjVal& j)
  * field here is read by an analysis (access control, triviality, deleted/defaulted status, the
  * structor tables), so all of it must round-trip or a warm cache silently loses the class.
  */
+static constexpr size_t kCxxRefusalCauseMaxBytes = 4096;
+
+static std::string CxxRefusalCauseForCache(const std::string& cause)
+{
+        if (cause.size() <= kCxxRefusalCauseMaxBytes) return cause;
+        const size_t newline = cause.rfind('\n', kCxxRefusalCauseMaxBytes - 1);
+        return newline == std::string::npos ? std::string{} : cause.substr(0, newline);
+}
+
 nlohmann::json LLVMBackend::CxxMemberToJson(
         const cflat_cinterop::RawCxxMember& m, CCachePathTable* files)
 {
@@ -2418,7 +2427,11 @@ nlohmann::json LLVMBackend::CxxMemberToJson(
         if (m.isTemplateSpecialization) j["ts"] = true;
         if (m.needsLocalDefinition) j["nd"] = true;
         if (!m.bindRefusal.empty()) j["br"] = m.bindRefusal;
-        if (!m.refusalCause.empty()) j["rcs"] = m.refusalCause;
+        if (!m.refusalCause.empty())
+        {
+            const std::string cause = CxxRefusalCauseForCache(m.refusalCause);
+            if (!cause.empty()) j["rcs"] = cause;
+        }
         if (m.returnsThis)          j["rth"] = true;
         if (m.isCopyCtor)           j["cc"] = true;
         if (m.isMoveCtor)           j["mc"] = true;
@@ -2958,6 +2971,8 @@ bool LLVMBackend::TryLoadCHeaderDiskCache(
         // v92 refuses bodies reaching an incremental chunk's emptied (poisoned) specialization
         // and stores the clang diagnostic behind a member refusal (refusalCause).
         // v93 exports non-special user operator= overloads and member templates for assignment calls.
+        // v94 caps each serialized C++ member refusal cause at 4 KB on a line boundary.
+        // v95 refuses a member whose signature contains clang error nodes instead of mangling it.
         if (version != kCHeaderCacheVersion) return cacheMiss("cache version");
 
         if (!expectedRequestKey.empty()
@@ -3384,6 +3399,8 @@ void LLVMBackend::WriteCHeaderDiskCache(
         // v92 refuses bodies reaching an incremental chunk's emptied (poisoned) specialization
         // and stores the clang diagnostic behind a member refusal (refusalCause).
         // v93 exports non-special user operator= overloads and member templates for assignment calls.
+        // v94 caps each serialized C++ member refusal cause at 4 KB on a line boundary.
+        // v95 refuses a member whose signature contains clang error nodes instead of mangling it.
         j["version"] = kCHeaderCacheVersion;
         j["mtime"]   = (int64_t)mtime.time_since_epoch().count();
         j["hash"]    = contentHash;

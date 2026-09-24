@@ -1654,6 +1654,14 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
     // Default target platform = native host OS. Overridable with --platform for
     // cross-compilation (e.g. macos Mach-O emission from a Windows/WSL host).
     auto platformOption = args.getOption("platform").value_or(DefaultPlatform());
+    // An unknown name would silently fall through to the host triple (`-p windows` built linux).
+    if (platformOption != "win32" && platformOption != "win64" && platformOption != "linux"
+        && platformOption != "macos" && platformOption != "macos-arm64")
+    {
+        LogErrorMessage("unknown target platform '{}'; expected win64, win32, linux or macos",
+                        { platformOption });
+        return false;
+    }
 
     // Windows images must be named *.exe to be runnable, so `-o foo` would produce a
     // file the shell refuses to launch. Supply the extension when none was given.

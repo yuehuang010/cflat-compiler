@@ -1,47 +1,22 @@
-# Members refused during the suppressed header harvest carry no clang cause; stored cause is never shown
+# C++ refusal causes are only partly surfaced
 
-Found 2026-09-23 by the round-3 review of fix/cpp-container-sink-gaps (macOS arm64, Release).
-That branch stores clang's diagnostic text for a failed instantiation as the refusal "cause"
-(header cache v91, `CxxDiagnosticBlamesCopyOf` in LLVMBackend_Lookup.cpp) and keys the
-deleted-copy blame on it. Gaps left open:
+Updated 2026-09-24 on `fix/cpp-sink-refusal-cause` (macOS arm64, Release).
 
-## M1: harvest-time refusals have no cause
+## Landed
 
-Diagnostics are suppressed while clang harvests the header (`CxxIncrementalGroup.cpp` ~172-194),
-so members refused there store no cause and real copy sinks lose the precise message:
+- L1: refusals with a stored cause now append its first clang error line. Absolute diagnostic paths are reduced to `basename:line`. `vector.assign(n, l)` now reports `overload resolution selected deleted operator '='`.
+- L2: header cache serialization caps each member's refusal cause at 4 KB, ending on a line boundary when possible. Cache version is 94 at both read validation and write, with v94 history entries.
 
-- `ConstOnly<Key>.add(l)` (add copies): now "member 'add' ... cannot be instantiated ... (clang
-  reported an error inside the body it generated)". Round 2 of the branch said "cannot copy C++
-  class 'cplv.Key' into parameter 't' of 'add'". Pre-branch crashed (139).
-- `std.set<Key>.insert(l)`: prints "parameter '__v' of 'insert' takes ownership of the value;
-  pass 'move <arg>' or a temporary value". True (`insert(move l)` binds) but does not say why
-  the lvalue failed.
+## Remaining: M1 harvest-time cause capture
 
-Engine limitation, confirmed: turning suppression off sets clang's error flag, the interpreter
-drops the module and module generation dereferences null - the same mechanism as the set/map
-crash the branch fixed. Direction: capture the harvest diagnostics into the cause, then reset
-clang's error state before code generation.
+Measured before the change, `ConstOnly<Key>.add(l)` and `std.set<Key>.insert(l)` have no reliably associated per-function cause; they show the generic body refusal and ownership/move refusal respectively. Three capture/mapping attempts did not associate `std.set<Key>.insert(l)`'s harvest diagnostics with its refused overload. Each attempt left only the generic allocator construction diagnostic in the member cause. The changes were reverted per the three-attempt stop rule. Simply enabling unsuppressed diagnostics remains unsafe: clang marks the interpreter as failed, it drops the module, and later codegen dereferences null.
 
-## L1: the stored cause is never printed
+Do not capture a diagnostic for a function unless its location can be reliably mapped to that function. `map.insert(pair lvalue)` also still has no stored cause to append; the only printed clang clause is `no matching member function for call to 'insert'`.
 
-It often holds the useful line: `vector.assign(n, l)` -> clang's "deleted operator '='";
-`map.insert(pair lvalue)` -> `is_constructible<pair<const Key,int>, pair<Key,int>&>`
-requirement. Printing its first error line after the CFlat refusal would restore the clarity
-lost for the assign / map-insert legs of Test/errors/err_cpp_struct_lvalue_sink.cb.
+## Remaining: L3
 
-## L2: per-function cause text has no size cap
+Class-name matching can blame a member copy as a parameter copy. Resolving that requires clang source-location attribution.
 
-Only the overall text is capped at 64 KB. Bridge fixture measurement: 235 entries, 219 KB of
-34.8 MB cache JSON (0.63%), largest entry 5.8 KB / 26 lines. Add the same cap per entry.
+## Verification note
 
-## L3: class-name matching cannot tell which object was copied
-
-`Reg<nb::Key>::other(u)` copies a member of type `nb::Key` but the blame names parameter 'u'.
-Right class, wrong parameter, no wrong fix suggested. Needs clang's source location of the copy,
-not the class name.
-
-## Acceptance
-
-- M1 repros print a cause-carrying message; L1 prints clang's first error line; L2 cap in the
-  serializer with a history line; L3 optional.
-- Existing sink err tests keep passing cold and warm with `--error-on-cpp-reparse`.
+`./test.sh Release` on this host reported 1,110 passed, 1 failed, 8 skipped. The only failure was `test_cpp_interop.warm` reparsing `cpp_interop_basic.h` during the parallel suite. The isolated cold/warm sequence passed. `test_example.sh` passed 45/0.

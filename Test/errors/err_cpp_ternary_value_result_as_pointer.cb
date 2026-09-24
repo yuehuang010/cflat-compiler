@@ -1,0 +1,10 @@
+import cpp "../library/cpp_interop_ternaryref.h";
+
+extern int main()
+{
+    bool choose = true;
+    expect_error("cannot initialize pointer 'p' with a value of type 'ternref.C'") {
+        ternref.C* p = choose ? ternref.value_a() : ternref.value_b();
+    }
+    return 0;
+}

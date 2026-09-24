@@ -16,6 +16,8 @@
 #include <utility>
 #include <vector>
 
+#include "cpp_interop_ternaryref.h"
+
 
 namespace cppi
 {

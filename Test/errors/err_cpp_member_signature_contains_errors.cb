@@ -1,0 +1,30 @@
+// A std.deque of a type no TU defines: the iterator-returning members' signatures hold a clang
+// error node (sizeof of the incomplete element in the iterator's block-size argument). They
+// are refused by name at the use site; before, the harvest mangled them, which reached
+// ItaniumMangle's "unexpected statement kind" unreachable on an assertions-enabled build and
+// left begin/end refused later with a misleading "error inside the body" cause.
+import cpp "cpp_interop_incomplete.h";
+
+// The members whose signatures are sound still bind on the same specialization.
+int count(std.deque<cpin.Opaque>* p) { return p->empty() ? 0 : (int)p->size(); }
+
+int touch(std.deque<cpin.Opaque>* p)
+{
+    expect_error("member 'begin' of C++ class 'std.deque<cpin.Opaque>' has a signature clang could not instantiate for these template arguments") {
+        auto it = p->begin();
+    }
+    expect_error("member 'end' of C++ class 'std.deque<cpin.Opaque>' has a signature clang could not instantiate for these template arguments") {
+        auto it = p->end();
+    }
+    // cbegin was refused before as "clang emitted no body for it".
+    expect_error("member 'cbegin' of C++ class 'std.deque<cpin.Opaque>' has a signature clang could not instantiate for these template arguments") {
+        auto it = p->cbegin();
+    }
+    return count(p);
+}
+
+extern int main()
+{
+    std.deque<cpin.Opaque>* p = nullptr;
+    return p == nullptr ? 0 : touch(p);
+}

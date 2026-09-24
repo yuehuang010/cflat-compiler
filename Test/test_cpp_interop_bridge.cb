@@ -59,6 +59,8 @@
 //   C++ proxy prvalue assignment and binary operators (2100-2129): assignment and conversion cases
 //     mutate the temporary's referent, temporary destruction is exact, and C++ member/free/builtin
 //     comparisons bind while the implicit-only assignment remains an error.
+//   std::set::insert of a generated, copyable [cpp] struct accepts a temporary and preserves
+//     its set size and element value (3540-3549).
 
 import cpp "library/cpp_interop_basic.h";
 import cpp "library/cpp_interop_basic.cpp";
@@ -77,12 +79,18 @@ import cpp "functional";
 import cpp "deque";
 import cpp "map";
 import cpp "set";
+import cpp "library/cpp_interop_setcopy.h";
 import cpp "list";
 import cpp "array";
 import cpp "library/cpp_interop_view_decay.h";
 import cpp "library/cpp_interop_lvalue_sink.h";
 import cpp "library/cpp_interop_assign.h";
 import cpp "library/cpp_interop_proxy_assign.h";
+
+[cpp] struct BridgeSetCopyKey : cppsetcopy.CopyBase
+{
+    BridgeSetCopyKey(int value) { tag = value; }
+};
 
 int proxyCppAssignValue = 0;
 [cpp] struct ProxyCppRecord
@@ -4848,6 +4856,18 @@ extern int main(int argc, char** argv)
     }
     if (bridge_passed - bridgeProxyStartPassed != bridge_checks - bridgeProxyStartChecks)
         return 2129;
+
+    // ---- std::set insert of a generated copyable [cpp] struct (3540-3549) ---------------
+    int bridgeSetInsertStartChecks = bridge_checks;
+    int bridgeSetInsertStartPassed = bridge_passed;
+    {
+        std.set<BridgeSetCopyKey> values = default;
+        values.insert(BridgeSetCopyKey(37));
+        bridge_check("SET generated copyable size", (int)values.size(), 1);
+        bridge_check("SET generated copyable value", values.begin().tag, 37);
+    }
+    if (bridge_passed - bridgeSetInsertStartPassed != bridge_checks - bridgeSetInsertStartChecks)
+        return 3540;
 
     return 0;
 }

@@ -1967,6 +1967,11 @@ namespace cflat_cinterop
                                         "defines it alongside this one)";
                         break;
                     }
+                    // A signature holding an error node (an incomplete element's sizeof in a
+                    // default template argument) has no Itanium mangling and no ABI arrangement.
+                    if (m.bindRefusal.empty() && md->getType()->containsErrors())
+                        m.bindRefusal = "has a signature clang could not instantiate for these "
+                                        "template arguments (it names an invalid or incomplete type)";
                     if (m.bindRefusal.empty() && md->getReturnType()->isUndeducedType())
                         m.bindRefusal = "has a deduced return type ('auto') that this translation "
                                         "unit never deduced (its body was not instantiated)";

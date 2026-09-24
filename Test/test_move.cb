@@ -25,6 +25,10 @@ struct Resource
     int readId(int v) { return v; }
 };
 
+Resource* gChainedAssign = nullptr;
+
+struct ChainedAssignHolder { Resource* item = nullptr; };
+
 int uniqueAttributeDtorCount = 0;
 
 [unique] struct Handle
@@ -12680,6 +12684,9 @@ extern int main()
     passed += Test("guard_chain_guarded_deref_freed", dtorCount, 2);
     total += 3;
 
+    passed += testChainedPointerAssignment();
+    total += 37;
+
     printf("\n%d / %d tests passed.\n", passed, total);
     return passed == total ? 0 : 1;
 }
@@ -12747,3 +12754,147 @@ Resource* identityResourceDefinedBelow(Resource* p) { return p; }
 // no destination, or with a pointer that is not a temporary's field.
 Resource* lateRetGlobalResource(Resource* r) { return gKeptResource2; }
 Resource* latePassthruResource(Resource* r) { return r; }
+
+
+// Chained assignments yield the stored value and preserve one owner.
+int testChainedPointerAssignment()
+{
+    int passed = 0;
+    dtorCount = 0;
+    {
+        Resource* p = nullptr;
+        Resource* q = nullptr;
+        q = p = new Resource();
+        p->id = 81;
+        passed += Test("cpa_local_value", q->id, 81);
+        passed += Test("cpa_local_alias", q == p ? 1 : 0, 1);
+        passed += Test("cpa_local_no_early_dtor", dtorCount, 0);
+    }
+    passed += Test("cpa_local_dtor_once", dtorCount, 1);
+
+    dtorCount = 0;
+    {
+        Resource* p = nullptr;
+        Resource* q = nullptr;
+        Resource* r = nullptr;
+        r = q = p = new Resource();
+        p->id = 82;
+        passed += Test("cpa_depth3_value", r->id, 82);
+        passed += Test("cpa_depth3_alias", r == q && q == p ? 1 : 0, 1);
+        passed += Test("cpa_depth3_no_early_dtor", dtorCount, 0);
+    }
+    passed += Test("cpa_depth3_dtor_once", dtorCount, 1);
+
+    dtorCount = 0;
+    {
+        Resource* p = nullptr;
+        Resource* q = nullptr;
+        q = p = makeChainedAssignResource(83);
+        passed += Test("cpa_return_rhs_value", q->id, 83);
+        passed += Test("cpa_return_rhs_alias", q == p ? 1 : 0, 1);
+        passed += Test("cpa_return_rhs_no_early_dtor", dtorCount, 0);
+    }
+    passed += Test("cpa_return_rhs_dtor_once", dtorCount, 1);
+
+    dtorCount = 0;
+    {
+        Resource* source = new Resource();
+        source->id = 84;
+        Resource* p = nullptr;
+        Resource* q = nullptr;
+        q = p = source;
+        passed += Test("cpa_pointer_rhs_value", q->id, 84);
+        passed += Test("cpa_pointer_rhs_alias", q == p ? 1 : 0, 1);
+        passed += Test("cpa_pointer_rhs_no_early_dtor", dtorCount, 0);
+    }
+    passed += Test("cpa_pointer_rhs_dtor_once", dtorCount, 1);
+
+    dtorCount = 0;
+    {
+        Resource* p = nullptr;
+        int got = setAndReadChainedAssign(p = new Resource());
+        passed += Test("cpa_call_argument_value", got, 85);
+        passed += Test("cpa_call_argument_no_early_dtor", dtorCount, 0);
+    }
+    passed += Test("cpa_call_argument_dtor_once", dtorCount, 1);
+
+    dtorCount = 0;
+    {
+        Resource* p = nullptr;
+        Resource* q = new Resource();
+        q->id = 86;
+        if ((p = q) != nullptr)
+            p->id = 87;
+        passed += Test("cpa_condition_value", q->id, 87);
+        passed += Test("cpa_condition_no_early_dtor", dtorCount, 0);
+    }
+    passed += Test("cpa_condition_dtor_once", dtorCount, 1);
+
+    dtorCount = 0;
+    {
+        Resource* p = nullptr;
+        gChainedAssign = p = new Resource();
+        p->id = 88;
+        passed += Test("cpa_global_lhs_value", gChainedAssign->id, 88);
+        passed += Test("cpa_global_lhs_no_early_dtor", dtorCount, 0);
+    }
+    passed += Test("cpa_global_lhs_dtor_once", dtorCount, 1);
+    gChainedAssign = nullptr;
+
+    dtorCount = 0;
+    {
+        ChainedAssignHolder holder = default;
+        Resource* p = nullptr;
+        holder.item = p = new Resource();
+        p->id = 89;
+        passed += Test("cpa_field_lhs_value", holder.item->id, 89);
+        passed += Test("cpa_field_lhs_no_early_dtor", dtorCount, 0);
+    }
+    passed += Test("cpa_field_lhs_dtor_once", dtorCount, 1);
+
+    dtorCount = 0;
+    {
+        Resource* items[1] = default;
+        Resource* p = nullptr;
+        items[0] = p = new Resource();
+        p->id = 90;
+        passed += Test("cpa_array_lhs_value", items[0]->id, 90);
+        passed += Test("cpa_array_lhs_no_early_dtor", dtorCount, 0);
+    }
+    passed += Test("cpa_array_lhs_dtor_once", dtorCount, 1);
+
+    dtorCount = 0;
+    {
+        unique Resource* p = nullptr;
+        unique Resource* q = nullptr;
+        q = p = new Resource();
+        q->id = 91;
+        passed += Test("cpa_unique_value", q->id, 91);
+        passed += Test("cpa_unique_no_early_dtor", dtorCount, 0);
+    }
+    passed += Test("cpa_unique_dtor_once", dtorCount, 1);
+
+    dtorCount = 0;
+    {
+        Resource* p = new Resource();
+        Resource* q = nullptr;
+        q = p = nullptr;
+        passed += Test("cpa_null_rhs_values", p == nullptr && q == nullptr ? 1 : 0, 1);
+        passed += Test("cpa_null_rhs_old_dtor_once", dtorCount, 1);
+    }
+    passed += Test("cpa_null_rhs_no_extra_dtor", dtorCount, 1);
+    return passed;
+}
+
+move Resource* makeChainedAssignResource(int id)
+{
+    Resource* result = new Resource();
+    result->id = id;
+    return result;
+}
+
+int setAndReadChainedAssign(Resource* value)
+{
+    value->id = 85;
+    return value->id;
+}

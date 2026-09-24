@@ -505,9 +505,11 @@ bool LLVMBackend::FindRefusedCxxCopySink(const std::string& receiverType,
                                          const std::string& memberName,
                                          const std::vector<NamedVariable>& args,
                                          size_t& argIndex, std::string& paramName,
-                                         bool& rvalueSibling, bool requireRefusal) const
+                                         std::string& refusalCause, bool& rvalueSibling,
+                                         bool requireRefusal) const
 {
         rvalueSibling = false;
+        refusalCause.clear();
         auto record = cxxRecordEntries_.find(receiverType);
         if (record == cxxRecordEntries_.end()) return false;
         for (size_t i = 0; i < args.size(); ++i)
@@ -528,6 +530,7 @@ bool LLVMBackend::FindRefusedCxxCopySink(const std::string& receiverType,
                 paramName = i + 1 < member.paramNames.size() ? member.paramNames[i + 1]
                                                              : std::string();
                 if (paramName.empty()) paramName = std::format("parameter {}", i + 1);
+                refusalCause = member.refusalCause;
                 // A T&& sibling exists; the caller decides whether it is bound.
                 rvalueSibling = std::any_of(record->second.members.begin(),
                     record->second.members.end(), [&](const auto& other) {
@@ -539,6 +542,29 @@ bool LLVMBackend::FindRefusedCxxCopySink(const std::string& receiverType,
             }
         }
         return false;
+}
+
+std::string LLVMBackend::CxxFirstDiagnosticLine(const std::string& diagnostics) const
+{
+        const size_t end = diagnostics.find('\n');
+        std::string line = diagnostics.substr(0, end);
+        const size_t error = line.find(": error: ");
+        if (error == std::string::npos) return line;
+        const size_t column = line.rfind(':', error - 1);
+        if (column == std::string::npos) return line;
+        const size_t row = line.rfind(':', column - 1);
+        if (row == std::string::npos) return line;
+        const std::string filename = line.substr(0, row);
+        if (column == 0 || filename.empty()
+            || (filename.front() != '/' && filename.find('\\') == std::string::npos))
+            return line;
+        const size_t slash = filename.find_last_of("/\\");
+        const std::string basename = slash == std::string::npos ? filename : filename.substr(slash + 1);
+        const std::string lineNumber = line.substr(row + 1, column - row - 1);
+        if (lineNumber.empty() || !std::all_of(lineNumber.begin(), lineNumber.end(),
+                                               [](unsigned char c) { return std::isdigit(c); }))
+            return line;
+        return basename + ":" + lineNumber + line.substr(error);
 }
 
 bool LLVMBackend::CxxDiagnosticBlamesCopyOf(const std::string& diagnostics,
@@ -580,6 +606,22 @@ bool LLVMBackend::CxxDiagnosticBlamesCopyOf(const std::string& diagnostics,
                                             "const class " })
                     if (line.find("'" + std::string(prefix) + cls + "'") != std::string::npos)
                         return true;
+            if (cxxSpelling.starts_with("std::pair<") && line.find("std::pair<") != std::string::npos
+                && line.find("copy constructor") != std::string::npos)
+            {
+                auto normalizePair = [](const std::string& value) {
+                    std::string normalized;
+                    for (size_t i = 0; i < value.size(); ++i)
+                    {
+                        if (value.compare(i, 6, "const ") == 0) { i += 5; continue; }
+                        if (!std::isspace(static_cast<unsigned char>(value[i])))
+                            normalized += value[i];
+                    }
+                    return normalized;
+                };
+                if (normalizePair(line).find(normalizePair(cxxSpelling)) != std::string::npos)
+                    return true;
+            }
         }
         return false;
 }

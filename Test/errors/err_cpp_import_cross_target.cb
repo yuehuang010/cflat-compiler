@@ -1,0 +1,16 @@
+// C++ import under a cross target (`-p win64` from this file's .flags sidecar; a native Windows
+// run ignores the sidecar and binds the same LLP64 layout). The clang interpreter's default
+// executor was an in-process JIT for the -p triple; tearing it down ran foreign-architecture code
+// (exit 139 on macOS arm64). The fixture dir ships a minimal <new> so the group parses cleanly,
+// which is the state where the interpreter is torn down instead of leaked.
+import cpp "cpp_cross_target/cpp_interop_cross_target.h";
+
+extern int main()
+{
+    // sizeof binds the target layout: char + 4-byte LLP64 long = 8 (an LP64 layout gives 16).
+    expect_error("cannot initialize fixed array 'int[8]' from 'int[3]'") {
+        int[3] small = default;
+        int[sizeof(CrossTargetLong)] big = small;
+    }
+    return cross_target_long_size();
+}

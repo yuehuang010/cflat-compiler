@@ -389,8 +389,20 @@ LLVMBackend::NamedVariable MainListener::ParseAssignmentExpressionNamed(CFlatPar
             }
             else
             {
-                result.Primary = ParseAssignmentExpression(ctx);
-                if (result.Primary) result.BaseType = result.Primary->getType();
+                LLVMBackend::NamedVariable assignmentResult;
+                result.Primary = ParseAssignmentExpression(ctx,
+                    use == ResultUse::Discard ? nullptr : &assignmentResult);
+                if (result.Primary)
+                {
+                    result.BaseType = result.Primary->getType();
+                    result.TypeAndValue = assignmentResult.TypeAndValue;
+                    result.Storage = assignmentResult.Storage;
+                    result.CallerName = assignmentResult.CallerName;
+                    result.FieldName = assignmentResult.FieldName;
+                    result.IsOwning = assignmentResult.IsOwning;
+                    result.IsBorrowed = assignmentResult.IsBorrowed;
+                    result.BorrowedOrigin = assignmentResult.BorrowedOrigin;
+                }
             }
             if (const auto* raw = compilerLLVM->FindRawArrayResult(result.Primary))
             {
@@ -1565,7 +1577,9 @@ bool MainListener::RejectArrayViewElementMismatch(antlr4::ParserRuleContext* ctx
         return true;
     }
 
-llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpressionContext* ctx) {
+llvm::Value* MainListener::ParseAssignmentExpression(
+        CFlatParser::AssignmentExpressionContext* ctx,
+        LLVMBackend::NamedVariable* assignmentResult) {
         auto* compiler = Compiler(ctx);
         auto condCtx = ctx->conditionalExpression();
         auto assignmentOp = ctx->assignmentOperator();
@@ -2381,10 +2395,45 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
             // Closes the '??=' assign arm and yields the destination's value at the join. Identity
             // for a plain '=', which has no arm to close.
             auto finishStore = [&](llvm::Value* v) -> llvm::Value* {
-                if (coalesceResume == nullptr) return v;
-                compiler->CreateJump(coalesceResume);
-                compiler->SwitchToBlock(coalesceResume);
-                return derefLoad();
+                llvm::Value* resultValue = v;
+                if (coalesceResume == nullptr)
+                {
+                    if (auto* store = llvm::dyn_cast_or_null<llvm::StoreInst>(v))
+                        resultValue = store->getValueOperand();
+                }
+                else
+                {
+                    compiler->CreateJump(coalesceResume);
+                    compiler->SwitchToBlock(coalesceResume);
+                    resultValue = derefLoad();
+                }
+                if (assignmentResult != nullptr)
+                {
+                    // The stored owner now belongs to the LHS; the assignment rvalue is only an alias.
+                    compiler->lastCallReturnsOwned = false;
+                    *assignmentResult = {};
+                    assignmentResult->TypeAndValue = namedVar.TypeAndValue;
+                    assignmentResult->TypeAndValue.VariableName.clear();
+                    assignmentResult->TypeAndValue.IsMove = false;
+                    assignmentResult->Primary = resultValue;
+                    assignmentResult->BaseType = resultValue != nullptr
+                        ? resultValue->getType() : namedVar.BaseType;
+                    if (coalesceResume == nullptr
+                        && (namedVar.TypeAndValue.IsUnique
+                            || compiler->IsCoreUniqueType(namedVar.TypeAndValue.TypeName)))
+                    {
+                        assignmentResult->Storage = destination;
+                        assignmentResult->CallerName = namedVar.CallerName;
+                        assignmentResult->FieldName = namedVar.FieldName;
+                        assignmentResult->IsOwning = true;
+                    }
+                    else if (namedVar.TypeAndValue.Pointer)
+                    {
+                        assignmentResult->IsBorrowed = true;
+                        assignmentResult->BorrowedOrigin = namedVar.CallerName;
+                    }
+                }
+                return resultValue;
             };
 
             // The assignment DESTINATION is the context an immediately-invoked literal in the RHS
@@ -2516,12 +2565,15 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
              * PointerRebound alone cannot tell those apart. Full rationale at the `unique T*`
              * reassignment further down, which reads the same bool.
              */
-            bool srcIsOwnedPtrRhs = AsDirectNew(assignCtx) != nullptr
-                || TopLevelMoveExpression(assignCtx) != nullptr
-                || compiler->IsOwningPtrTempValue(rightNV.Primary)
-                || compiler->IsOwnedNewTemp(rightNV.Primary)
-                || compiler->RawArrayResultOwns(rightNV.Primary)
-                || compiler->IsMovedOutPtrValue(rightNV.Primary);
+            // An assignment expression over an owned temporary yields its borrowed destination value.
+            // Keep the temporary's old identity from making an outer assignment adopt that borrow.
+            bool srcIsOwnedPtrRhs = !rightNV.IsBorrowed
+                && (AsDirectNew(assignCtx) != nullptr
+                    || TopLevelMoveExpression(assignCtx) != nullptr
+                    || compiler->IsOwningPtrTempValue(rightNV.Primary)
+                    || compiler->IsOwnedNewTemp(rightNV.Primary)
+                    || compiler->RawArrayResultOwns(rightNV.Primary)
+                    || compiler->IsMovedOutPtrValue(rightNV.Primary));
             bool assignmentAdoptsOwnedSource = false;
             // Reassignment / field store into an array-view: `a = rawIntPtr;` or `s.view = p;`
             // would launder a raw pointer into the noalias contract - reject (decay is one-way).
@@ -6755,6 +6807,60 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
         bool joinUnsigned = TernaryJoinIsUnsigned(
             trueUnsigned,  trueValue->getType()->isIntegerTy()  ? trueValue->getType()->getIntegerBitWidth()  : 0,
             falseUnsigned, falseValue->getType()->isIntegerTy() ? falseValue->getType()->getIntegerBitWidth() : 0);
+        auto cxxReferenceRecordType = [&](llvm::Value* value, llvm::Value* storage, bool isAlias) {
+            auto* record = llvm::dyn_cast_or_null<llvm::StructType>(
+                value != nullptr ? value->getType() : nullptr);
+            return isAlias && storage != nullptr && record != nullptr && record->hasName()
+                && compiler->IsCxxRecord(record->getName().str());
+        };
+        const bool trueCxxReference = cxxReferenceRecordType(trueValue, trueStorage, trueAlias);
+        const bool falseCxxReference = cxxReferenceRecordType(falseValue, falseStorage, falseAlias);
+        const bool trueCxxPointer = trueValue != nullptr && trueValue->getType()->isPointerTy()
+            && compiler->IsCxxRecord(InferTernaryArmType(trueValue).TypeName);
+        const bool falseCxxPointer = falseValue != nullptr && falseValue->getType()->isPointerTy()
+            && compiler->IsCxxRecord(InferTernaryArmType(falseValue).TypeName);
+        // Every arm must be addressable (a reference result or a pointer): a by-value arm keeps
+        // the value join and its existing diagnostic.
+        if ((trueCxxReference || falseCxxReference)
+            && (trueCxxReference || (trueValue != nullptr && trueValue->getType()->isPointerTy()))
+            && (falseCxxReference || (falseValue != nullptr && falseValue->getType()->isPointerTy())))
+        {
+            LLVMBackend::TypeAndValue pointerJoinDest = outerExpected;
+            if (!pointerJoinDest.Pointer || !compiler->IsCxxRecord(pointerJoinDest.TypeName))
+            {
+                pointerJoinDest = {};
+                if (trueCxxPointer) pointerJoinDest = InferTernaryArmType(trueValue);
+                else if (falseCxxPointer) pointerJoinDest = InferTernaryArmType(falseValue);
+            }
+            const bool wantPointerJoin = pointerJoinDest.Pointer
+                && compiler->IsCxxRecord(pointerJoinDest.TypeName);
+            if (wantPointerJoin)
+            {
+                auto addressFor = [&](llvm::Value* value, llvm::Value* storage) {
+                    auto source = InferTernaryArmType(value);
+                    if (source.Pointer)
+                        return compiler->AdjustCxxPointerForStore(
+                            pointerJoinDest, source, value, "conditional expression");
+                    source.Pointer = true;
+                    return compiler->AdjustCxxPointerForStore(
+                        pointerJoinDest, source, storage, "conditional expression");
+                };
+                if (trueCxxReference)
+                {
+                    atTrue();
+                    trueValue = addressFor(trueValue, trueStorage);
+                    trueStorage = nullptr;
+                    trueAlias = false;
+                }
+                if (falseCxxReference)
+                {
+                    atFalse();
+                    falseValue = addressFor(falseValue, falseStorage);
+                    falseStorage = nullptr;
+                    falseAlias = false;
+                }
+            }
+        }
         if (!UnifyTernaryArmTypes(ctx, trueValue, falseValue, atTrue, atFalse, trueOcc, falseOcc,
                 trueUnsigned, falseUnsigned))
         {

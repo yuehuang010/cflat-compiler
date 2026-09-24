@@ -1974,7 +1974,8 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
 
         // Blame a deleted copy at a T&& parameter only when a refused const T& sibling shows the
         // lvalue needed that copy; a lone T&& parameter keeps the rvalue-reference message.
-        auto refusedCopySinkAt = [&](const std::vector<NamedVariable>& args, size_t index) {
+        auto refusedCopySinkAt = [&](const std::vector<NamedVariable>& args, size_t index,
+                                     std::string& cause) {
             if (cxxMemberReceiver.empty() || index == 0 || args.empty()
                 || args.front().TypeAndValue.TypeName != cxxMemberReceiver)
                 return false;
@@ -1983,12 +1984,13 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                                                               : functionName.substr(dot + 1);
             const std::vector<NamedVariable> userArgs(args.begin() + 1, args.end());
             size_t sinkIndex = 0;
-            std::string sinkParam;
+            std::string sinkParam, sinkCause;
             bool refusedRvalue = false;
             // Any unbound const T& sibling counts: a bound one would have taken the lvalue.
-            return FindRefusedCxxCopySink(cxxMemberReceiver, bare, userArgs, sinkIndex, sinkParam,
-                                          refusedRvalue, /*requireRefusal*/ false)
-                && sinkIndex + 1 == index;
+            const bool found = FindRefusedCxxCopySink(cxxMemberReceiver, bare, userArgs,
+                sinkIndex, sinkParam, sinkCause, refusedRvalue, /*requireRefusal*/ false);
+            if (found && sinkIndex + 1 == index) cause = std::move(sinkCause);
+            return found && sinkIndex + 1 == index;
         };
         // An unbound const T& sibling refused for its own reason: that reason explains why the
         // lvalue found only the T&& overload.
@@ -2029,9 +2031,15 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                     if (param.IsRvalueRef && !rvalue && IsCopyDeletedCxxLvalue(arguments[i]))
                     {
                         const std::string sibling = refusedConstRefSibling(arguments, i);
-                        if (refusedCopySinkAt(arguments, i))
-                            LogError(CxxDeletedCopyMessage(arguments[i], param.VariableName,
-                                                           shownFunctionName, /*moveRemedy*/ true));
+                        std::string cause;
+                        if (refusedCopySinkAt(arguments, i, cause))
+                        {
+                            std::string message = CxxDeletedCopyMessage(arguments[i],
+                                param.VariableName, shownFunctionName, /*moveRemedy*/ true);
+                            const std::string causeLine = CxxFirstDiagnosticLine(cause);
+                            if (!causeLine.empty()) message += std::format(" (clang: {})", causeLine);
+                            LogError(message);
+                        }
                         else if (!sibling.empty())
                             LogError(sibling);
                     }
@@ -2192,10 +2200,10 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
             {
                 const std::vector<NamedVariable> userArgs(arguments.begin() + 1, arguments.end());
                 size_t sinkIndex = 0;
-                std::string sinkParam;
+                std::string sinkParam, sinkCause;
                 bool refusedRvalue = false;
                 if (FindRefusedCxxCopySink(cxxMemberReceiver, bareMemberName, userArgs, sinkIndex,
-                                           sinkParam, refusedRvalue))
+                                           sinkParam, sinkCause, refusedRvalue))
                 {
                     // Suggest 'move x' only when a bound T&& or by-value overload takes it.
                     const std::string& sinkType = userArgs[sinkIndex].TypeAndValue.TypeName;
@@ -2207,8 +2215,11 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                                 || (!p.IsAlias && !p.IsCxxConstRef && !p.Pointer
                                     && p.TypeName == sinkType);
                         });
-                    LogError(CxxDeletedCopyMessage(userArgs[sinkIndex], sinkParam,
-                                                   shownFunctionName, moveRemedy));
+                    std::string message = CxxDeletedCopyMessage(userArgs[sinkIndex], sinkParam,
+                                                                shownFunctionName, moveRemedy);
+                    const std::string causeLine = CxxFirstDiagnosticLine(sinkCause);
+                    if (!causeLine.empty()) message += std::format(" (clang: {})", causeLine);
+                    LogError(message);
                     return nullptr;
                 }
             }
@@ -2568,10 +2579,16 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                     if (rvalueSym.IsCxx && IsCopyDeletedCxxLvalue(rvalueArgs[i]))
                     {
                         const std::string sibling = refusedConstRefSibling(rvalueArgs, i);
-                        if (refusedCopySinkAt(rvalueArgs, i))
-                            LogError(CxxDeletedCopyMessage(rvalueArgs[i],
-                                                           rvalueSym.Parameters[i].VariableName,
-                                                           shownFunctionName, /*moveRemedy*/ true));
+                        std::string cause;
+                        if (refusedCopySinkAt(rvalueArgs, i, cause))
+                        {
+                            std::string message = CxxDeletedCopyMessage(rvalueArgs[i],
+                                rvalueSym.Parameters[i].VariableName, shownFunctionName,
+                                /*moveRemedy*/ true);
+                            const std::string causeLine = CxxFirstDiagnosticLine(cause);
+                            if (!causeLine.empty()) message += std::format(" (clang: {})", causeLine);
+                            LogError(message);
+                        }
                         else if (!sibling.empty())
                             LogError(sibling);
                     }
@@ -3102,6 +3119,13 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                         // A rejection does not return, so this never stores null.
                         val = LowerClosureFatToThinFnPtr(val, llvmParamTy,
                             candParamItr->VariableName, arg.LambdaCaptureNames);
+                    }
+                    else if (candidate.IsCxx && llvmParamTy->isPointerTy()
+                             && IsNullPointerConstantArgument(arg))
+                    {
+                        // Literal 0 matched as a C++ null pointer constant: an integer cannot be
+                        // bitcast to ptr (invalid constant cast), so pass the typed null.
+                        val = llvm::ConstantPointerNull::get(llvm::cast<llvm::PointerType>(llvmParamTy));
                     }
                     else if (val && !val->getType()->isPointerTy())
                     {

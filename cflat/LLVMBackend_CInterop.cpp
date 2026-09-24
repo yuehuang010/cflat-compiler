@@ -7166,6 +7166,57 @@ bool LLVMBackend::RequestCxxFunctionTemplate(const std::string& functionName,
             error = std::format("no instantiation of C++ function template '{}' accepts these "
                                 "argument types ({})", displayedName, argumentDisplay);
             if (!extra.empty()) error += " (clang: " + extra + ")";
+            if (!ownerType.empty())
+            {
+                /*
+                 * Stored causes are per member, not per call: attach one only when it cannot belong
+                 * to a sibling overload - exactly one same-name same-arity member carries a cause,
+                 * and the name-keyed refusal is used only for a name with a single member.
+                 */
+                const size_t dot = functionName.rfind('.');
+                const std::string bareName = dot == std::string::npos
+                    ? functionName : functionName.substr(dot + 1);
+                size_t sameName = 0;
+                if (auto record = cxxRecordEntries_.find(ownerType);
+                    record != cxxRecordEntries_.end())
+                {
+                    const cflat_cinterop::RawCxxMember* only = nullptr;
+                    size_t withCause = 0;
+                    for (const auto& member : record->second.members)
+                    {
+                        if (member.name != bareName) continue;
+                        ++sameName;
+                        if (member.paramTypes.size() != arguments.size()
+                            || !member.bindRefusal.starts_with("cannot be instantiated")
+                            || member.refusalCause.empty())
+                            continue;
+                        ++withCause;
+                        only = &member;
+                    }
+                    if (withCause == 1)
+                    {
+                        const std::string causeLine = CxxFirstDiagnosticLine(only->refusalCause);
+                        if (!causeLine.empty() && error.find(causeLine) == std::string::npos)
+                            error += std::format(" (clang: {})", causeLine);
+                    }
+                }
+                const CxxClassInfo* info = sameName <= 1 ? GetCxxClassInfo(ownerType) : nullptr;
+                if (info != nullptr)
+                {
+                    if (auto refusal = info->refusedMembers.find(bareName);
+                        refusal != info->refusedMembers.end())
+                    {
+                        const size_t note = refusal->second.find(" (clang: ");
+                        const size_t end = note == std::string::npos
+                            ? std::string::npos : refusal->second.find(')', note + 9);
+                        if (end != std::string::npos)
+                        {
+                            const std::string clause = refusal->second.substr(note, end - note + 1);
+                            if (error.find(clause) == std::string::npos) error += clause;
+                        }
+                    }
+                }
+            }
             return false;
         };
 
@@ -7514,10 +7565,10 @@ bool LLVMBackend::RequestCxxFunctionTemplate(const std::string& functionName,
                 const std::vector<NamedVariable> userArgs(arguments.begin() + 1, arguments.end());
                 const std::string bareName = functionName.substr(functionName.rfind('.') + 1);
                 size_t sinkIndex = 0;
-                std::string sinkParam;
+                std::string sinkParam, sinkCause;
                 bool refusedRvalue = false;
                 if (FindRefusedCxxCopySink(ownerType, bareName, userArgs, sinkIndex, sinkParam,
-                                           refusedRvalue))
+                                           sinkCause, refusedRvalue))
                 {
                     // Suggest 'move x' only when a bound T&& or by-value overload takes it.
                     const std::string& sinkType = userArgs[sinkIndex].TypeAndValue.TypeName;
@@ -7534,6 +7585,8 @@ bool LLVMBackend::RequestCxxFunctionTemplate(const std::string& functionName,
                         }
                     error = CxxDeletedCopyMessage(userArgs[sinkIndex], sinkParam, bareName,
                                                   boundMoveSink);
+                    const std::string causeLine = CxxFirstDiagnosticLine(sinkCause);
+                    if (!causeLine.empty()) error += std::format(" (clang: {})", causeLine);
                     return false;
                 }
                 // The member access deferred this refusal for the arguments; they do not
@@ -9190,7 +9243,23 @@ void LLVMBackend::RememberCxxMangledArity(const std::string& cflatName,
                 argBegin = i + 1;
             }
         }
-        RememberMangledArity(*this, cflatName, args);
+        /*
+         * A mapped identity drops defaulted trailing arguments (`std.set$cplv.Key` for the full
+         * `std::set<cplv::Key, std::less<..>, std::allocator<..>>`). Record the count the NAME
+         * carries: the full spelling's count would make the demangler reject the name.
+         */
+        const std::string fullIdentity = cflat_cinterop::CxxForeignIdentity(cxxSpelling);
+        if (!fullIdentity.empty() && fullIdentity != cflatName)
+        {
+            size_t named = 0;
+            for (size_t k = 1; k < topLevelArgs.size() && named == 0; ++k)
+                if (cflat_cinterop::CxxForeignIdentity(
+                        cxxSpelling.substr(0, topLevelArgs[k - 1].second) + ">") == cflatName)
+                    named = k;
+            if (named != 0) RememberMangledArity(*this, cflatName, named);
+        }
+        else
+            RememberMangledArity(*this, cflatName, args);
 
         /*
          * A NESTED template-id inside the argument list becomes its own mangled identity
@@ -12213,17 +12282,25 @@ void LLVMBackend::RegisterCxxClassMembers(const CRecordEntry& r, const std::stri
             }
 
             auto refuse = [&](const std::string& why) {
+                std::string displayedWhy = why;
+                if (displayedWhy.starts_with("cannot be instantiated")
+                    && !m.refusalCause.empty())
+                {
+                    const std::string causeLine = CxxFirstDiagnosticLine(m.refusalCause);
+                    if (!causeLine.empty())
+                        displayedWhy += std::format(" (clang: {})", causeLine);
+                }
                 if (verbose)
                     std::cout << std::format("[verbose]   C++ member {}.{} not bound: {}\n",
-                                             r.name, m.name, why);
+                                             r.name, m.name, displayedWhy);
                 if (isStructor) return;
                 // An overload clang could not instantiate must not hide a sibling's retryable
                 // refusal (an unrequested return type): the use site rebinds only on the latter.
                 auto known = info.refusedMembers.find(cflatName);
-                if (known == info.refusedMembers.end()) info.refusedMembers[cflatName] = why;
+                if (known == info.refusedMembers.end()) info.refusedMembers[cflatName] = displayedWhy;
                 else if (known->second.starts_with("cannot be instantiated")
-                         && !why.starts_with("cannot be instantiated"))
-                    known->second = why;
+                         && !displayedWhy.starts_with("cannot be instantiated"))
+                    known->second = displayedWhy;
             };
             recordDirectMethod(m);
             if (m.access == cflat_cinterop::AccessPrivate)    { refuse("is private");   continue; }
@@ -12841,7 +12918,8 @@ bool LLVMBackend::TryBindRefusedCxxMember(const std::string& typeName,
             auto addSpelling = [&](const std::string& raw) {
                 const std::string spelling = CxxMemberValueSpelling(raw);
                 if (spelling.find("::") == std::string::npos) return;
-                if (spelling.find("__cflat_user::") != std::string::npos)
+                if (spelling.find("__cflat_user::") != std::string::npos
+                    && GeneratedCxxPrefixForSpelling(spelling).empty())
                     return;
                 if (spelling.find("type-parameter-") != std::string::npos)
                     return;
@@ -15508,16 +15586,18 @@ const LLVMBackend::CxxClassInfo::Structor* LLVMBackend::SelectCxxConstructor(
         if (found != nullptr) return found;
         // A copy-deleted lvalue whose const T& constructor clang refused to instantiate.
         size_t sinkIndex = 0;
-        std::string sinkParam;
+        std::string sinkParam, sinkCause;
         bool refusedRvalue = false;
         if (argVars != nullptr)
             if (FindRefusedCxxCopySink(typeName, "__ctor", *argVars, sinkIndex, sinkParam,
-                                       refusedRvalue))
+                                       sinkCause, refusedRvalue))
             {
                 why = std::format("cannot copy C++ class '{}' into constructor parameter '{}': "
                                   "its copy constructor is deleted",
                                   DisplayCxxClassName((*argVars)[sinkIndex].TypeAndValue.TypeName),
                                   sinkParam);
+                const std::string causeLine = CxxFirstDiagnosticLine(sinkCause);
+                if (!causeLine.empty()) why += std::format(" (clang: {})", causeLine);
                 return nullptr;
             }
         if (candidates == 0)

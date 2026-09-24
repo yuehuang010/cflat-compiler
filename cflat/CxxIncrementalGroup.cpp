@@ -32,6 +32,33 @@
 
 namespace
 {
+    /*
+     * The interpreter is used only to parse and emit bitcode; nothing it produces is ever run.
+     * Clang's default executor is an in-process LLJIT for the TU's triple, which under a cross
+     * `-p` target JITs foreign-architecture code (the runtime prelude and the LLJIT at-exit thunk)
+     * and calls into it from interpreter teardown. This executor accepts every module and runs
+     * nothing, so no triple ever reaches ORC.
+     */
+    class ParseOnlyExecutor : public clang::IncrementalExecutor
+    {
+    public:
+        llvm::Error addModule(clang::PartialTranslationUnit&) override { return llvm::Error::success(); }
+        llvm::Error removeModule(clang::PartialTranslationUnit&) override { return llvm::Error::success(); }
+        llvm::Error runCtors() const override { return llvm::Error::success(); }
+        llvm::Error cleanUp() override { return llvm::Error::success(); }
+        llvm::Expected<llvm::orc::ExecutorAddr> getSymbolAddress(llvm::StringRef name,
+                                                                 SymbolNameKind) const override
+        {
+            return llvm::createStringError(llvm::inconvertibleErrorCode(),
+                "cflat C++ interpreter does not execute code: no address for '" + name.str() + "'");
+        }
+        llvm::Error LoadDynamicLibrary(const char* name) override
+        {
+            return llvm::createStringError(llvm::inconvertibleErrorCode(),
+                "cflat C++ interpreter does not execute code: cannot load '" + std::string(name) + "'");
+        }
+    };
+
     class CountingDiagnosticConsumer : public clang::DiagnosticConsumer
     {
     public:
@@ -583,7 +610,9 @@ std::unique_ptr<CxxIncrementalGroup> CxxIncrementalGroup::Create(
         error = ErrorText(compiler.takeError());
         return nullptr;
     }
-    auto interpreter = clang::Interpreter::create(std::move(*compiler));
+    auto executorBuilder = std::make_unique<clang::IncrementalExecutorBuilder>();
+    executorBuilder->IE = std::make_unique<ParseOnlyExecutor>();
+    auto interpreter = clang::Interpreter::create(std::move(*compiler), std::move(executorBuilder));
     if (!interpreter)
     {
         error = ErrorText(interpreter.takeError());

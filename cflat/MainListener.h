@@ -5473,7 +5473,8 @@ public:
                                      llvm::Value* falseValue, llvm::Value* falseStorage,
                                      llvm::Value* join, bool nullCoalesce = false);
 
-    llvm::Value* ParseAssignmentExpression(CFlatParser::AssignmentExpressionContext* ctx);
+    llvm::Value* ParseAssignmentExpression(CFlatParser::AssignmentExpressionContext* ctx,
+                                           LLVMBackend::NamedVariable* assignmentResult = nullptr);
 
     // Box a THIN '?:' arm (`new T()` / `nullptr` / a borrowed pointer) into the interface fat
     // struct, matching a sibling arm already fat (e.g. `move` of an interface-typed local).

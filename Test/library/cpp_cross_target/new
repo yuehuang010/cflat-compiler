@@ -1,0 +1,7 @@
+// Minimal <new> for the cross-target import fixture (Test/errors/err_cpp_import_cross_target.cb).
+// A macOS or Linux host has no C++ standard headers for a -p win64 target, so the real <new> is
+// not found and the header group parses with an error. This stand-in lets the group parse
+// cleanly, which is the state that exercised interpreter teardown under a foreign triple.
+#pragma once
+typedef decltype(sizeof(0)) __cflat_cross_target_size_t;
+inline void* operator new(__cflat_cross_target_size_t, void* p) noexcept { return p; }

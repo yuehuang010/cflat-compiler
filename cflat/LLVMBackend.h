@@ -8590,11 +8590,13 @@ public:
     // `cxxSpelling` (or a deleted constructor of it): the failure really was that copy.
     bool CxxDiagnosticBlamesCopyOf(const std::string& diagnostics,
                                    const std::string& cxxSpelling) const;
+    std::string CxxFirstDiagnosticLine(const std::string& diagnostics) const;
     bool IsCxxElementCopySinkRefusal(const std::string& receiverType,
                                      const std::string& memberName) const;
     bool FindRefusedCxxCopySink(const std::string& receiverType, const std::string& memberName,
                                 const std::vector<NamedVariable>& args, size_t& argIndex,
-                                std::string& paramName, bool& rvalueSibling,
+                                std::string& paramName, std::string& refusalCause,
+                                bool& rvalueSibling,
                                 bool requireRefusal = true) const;
 
     /*
@@ -10030,7 +10032,7 @@ public:
      * timeout). The PCH key still folds the build stamp, since a PCH belongs to the clang that
      * wrote it.
      */
-    static constexpr int kCHeaderCacheVersion = 93;
+    static constexpr int kCHeaderCacheVersion = 95;
     static std::string CompilerBuildStamp();
 
     static std::string GetCHeaderCacheDir();

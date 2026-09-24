@@ -208,6 +208,8 @@
 //     through declarations, aggregates, generics, arithmetic, reflection and C++ deduction (3500-3509).
 //   C++ proxy prvalue assignment and binary operands, including vector<bool> write-through,
 //     readback, comparison, logical conversion, and truth-value forms (3520-3538).
+//   C++ reference-result conditional joins preserve selected-object identity at declarations,
+//     assignments, arguments, base conversions, and nested conditionals (3550-3559).
 
 import cpp "library/cpp_interop_basic.h";
 import cpp "library/cpp_interop_basic.cpp";
@@ -5253,5 +5255,43 @@ extern int main()
     if (intOnly[1] + 1 != 2) return 3536;
     if (!(intOnly[1] < 2)) return 3537;
     if (intOnly[1] != 1) return 3538;
+
+    // Reference arms carry the selected referent's address through each pointer sink.
+    bool trDeclChoice = true;
+    ternref.C* trDecl = trDeclChoice ? ternref.ref_a() : ternref.ref_b();
+    trDecl->v = 3550;
+    if (ternref.ref_a().v != 3550 || ternref.ref_b().v != 2) return 3550;
+
+    ternref.C* trAssigned = &ternref.ref_a();
+    bool trAssignChoice = false;
+    trAssigned = trAssignChoice ? ternref.ref_a() : ternref.ref_b();
+    trAssigned->v = 3551;
+    if (ternref.ref_a().v != 3550 || ternref.ref_b().v != 3551) return 3551;
+
+    // The C* parameter supplies the destination; the Derived/C reference results must join first.
+    bool trArgumentChoice = true;
+    ternref.write(trArgumentChoice ? ternref.ref_derived() : ternref.ref_a(), 3552);
+    if (ternref.ref_derived().v != 3552 || ternref.ref_a().v != 3550
+        || ternref.ref_derived().tag != 40) return 3552;
+
+    bool trDerivedFirst = true;
+    ternref.C* trBase1 = trDerivedFirst ? ternref.ref_derived() : ternref.ref_a();
+    trBase1->v = 3553;
+    if (ternref.ref_derived().v != 3553 || ternref.ref_a().v != 3550
+        || ternref.ref_derived().tag != 40) return 3553;
+
+    bool trDerivedSecond = false;
+    ternref.C* trBase2 = trDerivedSecond ? ternref.ref_a() : ternref.ref_derived();
+    trBase2->v = 3554;
+    if (ternref.ref_derived().v != 3554 || ternref.ref_a().v != 3550
+        || ternref.ref_derived().tag != 40) return 3554;
+
+    bool trOuter = false;
+    bool trInner = true;
+    ternref.C* trNested = trOuter ? ternref.ref_a()
+        : (trInner ? ternref.ref_b() : ternref.ref_c());
+    trNested->v = 3555;
+    if (ternref.ref_a().v != 3550 || ternref.ref_b().v != 3555
+        || ternref.ref_c().v != 3) return 3555;
     return 0;
 }
