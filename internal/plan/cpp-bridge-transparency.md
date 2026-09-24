@@ -249,6 +249,16 @@ Not leaks - these are the improvement, and they apply to CFlat types equally:
   scope until the maintainer reopens it; only `[cpp] struct` crosses into C++ templates.
 - **D5 - RULED 2026-09-23: OUT OF SCOPE.** A CFlat `interface` is not compatible with C++
   interop; no C++ class satisfies one and no design is pursued. Too hard for now.
+- **R4 - RULED 2026-09-23: implicit.** A C++ container decays to a `T[]` view implicitly at a
+  call (borrowed, never owning); no explicit spelling.
+- **R5 - RULED 2026-09-23.** `std::unique_ptr<T>` and `unique<T>` stay different types. The
+  `unique` KEYWORD is the bridge: on a C++ class type it applies `std::unique_ptr<T>`, on a
+  CFlat native type it applies `unique<T>`. `unique` and `move` are SUGAR: on a C++ type they
+  are `std::unique_ptr<T>` and `std::move(x)` themselves. Work item: internal/issue/p2/unique-keyword-maps-to-std-unique-ptr-for-cpp-types.md.
+- **`long double` - RULED 2026-09-23.** Windows matters (64-bit there too): add `longdouble` as a
+  CFlat native type alias so an inbound C++ `long double` keeps its identity and flows back.
+- **`&` on a C++ reference result at return - NOT RULED 2026-09-23.** Maintainer wants a spike
+  first (memory-safety and lifetime view, plus LLVM IR optimization consequences).
 - **Header cache (was Q5) - RULED.** A clang run that reports errors is never written to the
   disk cache. Its result is kept in ONE in-memory most-recent slot, so the LSP gets a fast,
   partially correct answer while a header is broken. Full request-group keying stays a p3.
