@@ -704,6 +704,15 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
                     && left.IsRvalueRef == right.IsRvalueRef;
             };
             std::vector<OverrideSourceInfo> overrides;
+            struct CppMethodSourceInfo
+            {
+                std::vector<LLVMBackend::DeclTypeAndValue> Params;
+                std::string ReturnSpelling;
+                std::string Name;
+                std::string StableName;
+            };
+            std::vector<CppMethodSourceInfo> cppMethods;
+            std::map<std::string, size_t> cppMethodOrdinals;
             std::set<std::string> overrideNames;
             std::map<std::string, size_t> overrideOrdinals;
             if (hasCppBase)
@@ -845,6 +854,93 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
                             { compiler->DisplayCxxClassName(pure.ownerType), pure.raw.name });
                 }
             }
+            }
+            for (auto* func : functionList)
+            {
+                if (!FunctionDeclaresReturnType(func)
+                    || func->genericTypeParameters() != nullptr
+                    || isFunctionStatic(func)
+                    || HasSoftDeclarationSpecifier(func->declarationSpecifiers(), "override"))
+                    continue;
+                const std::string methodName = getFunctionName(func);
+                const bool helperIdentifier = !methodName.empty()
+                    && (std::isalpha((unsigned char)methodName.front())
+                        || methodName.front() == '_')
+                    && std::all_of(methodName.begin() + 1, methodName.end(),
+                        [](unsigned char ch) { return std::isalnum(ch) || ch == '_'; });
+                if (!helperIdentifier) continue;
+                // Based on cppreference's C++ keywords table; the later-standard additions are gated below.
+                static const std::set<std::string> cxxKeywords = {
+                    "alignas", "alignof", "and", "and_eq", "asm", "auto", "bitand",
+                    "bitor", "bool", "break", "case", "catch", "char", "char16_t",
+                    "char32_t", "class", "compl", "const", "constexpr", "const_cast",
+                    "continue", "decltype", "default", "delete", "do", "double",
+                    "dynamic_cast", "else", "enum", "explicit", "export", "extern",
+                    "false", "float", "for", "friend", "goto", "if", "inline", "int",
+                    "long", "mutable", "namespace", "new", "noexcept", "not", "not_eq",
+                    "nullptr", "operator", "or", "or_eq", "private", "protected", "public",
+                    "register", "reinterpret_cast", "return", "short", "signed", "sizeof",
+                    "static", "static_assert", "static_cast", "struct", "switch", "template",
+                    "this", "thread_local", "throw", "true", "try", "typedef", "typeid",
+                    "typename", "union", "unsigned", "using", "virtual", "void", "volatile",
+                    "wchar_t", "while", "xor", "xor_eq", "char8_t", "concept", "consteval",
+                    "constinit", "co_await", "co_return", "co_yield", "requires"
+                };
+                static const std::set<std::string> cxx20Keywords = {
+                    "char8_t", "concept", "consteval", "constinit", "co_await", "co_return",
+                    "co_yield", "requires"
+                };
+                static const std::set<std::string> cxx26Keywords = { "contract_assert" };
+                if (cxxKeywords.count(methodName) != 0
+                    && (compiler->cppStandard_ != "c++17" && compiler->cppStandard_ != "gnu++17"
+                        || cxx20Keywords.count(methodName) == 0)
+                    || ((compiler->cppStandard_ == "c++26" || compiler->cppStandard_ == "gnu++26")
+                        && cxx26Keywords.count(methodName) != 0)) continue;
+                std::vector<LLVMBackend::DeclTypeAndValue> params;
+                if (func->parameterTypeList() != nullptr)
+                    params = ParseParameterTypeList(func->parameterTypeList());
+                std::string returnSpelling;
+                const auto returnType = getFunctionReturnType(func);
+                if ((!returnType.Pointer && !returnType.IsRvalueRef
+                     && compiler->IsCxxRecord(returnType.TypeName))
+                    || !compiler->CxxSpellingForCflatType(returnType.TypeName, returnSpelling))
+                    continue;
+                const int returnDepth = returnType.PointerDepth > 0 ? returnType.PointerDepth
+                    : (returnType.Pointer ? (returnType.ElemPointer ? 2 : 1) : 0);
+                for (int i = 0; i < returnDepth; ++i) returnSpelling += " *";
+                if (returnType.IsRvalueRef) returnSpelling += " &&";
+                bool spellable = true;
+                for (auto& param : params)
+                {
+                    if (!param.Pointer && !param.IsRvalueRef
+                        && compiler->IsCxxRecord(param.TypeName))
+                    {
+                        spellable = false;
+                        break;
+                    }
+                    std::string spelling;
+                    if (!appendParamSpelling(param, spelling))
+                    {
+                        spellable = false;
+                        break;
+                    }
+                    const int depth = param.PointerDepth > 0 ? param.PointerDepth
+                        : (param.Pointer ? (param.ElemPointer ? 2 : 1) : 0);
+                    if (depth == 0 && param.IsRvalueRef) spelling += " &&";
+                    else if (depth == 0 && param.IsCxxConstRef) spelling += " const&";
+                }
+                if (!spellable) continue;
+                const size_t ordinal = cppMethodOrdinals[methodName]++;
+                const std::string stable = "__cflat_mth_" + shortName + "_" + methodName
+                    + "_" + std::to_string(ordinal);
+                std::vector<LLVMBackend::TypeAndValue> methodParams;
+                methodParams.reserve(params.size());
+                for (const auto& param : params) methodParams.push_back(param);
+                compiler->RegisterCppStructOverrideName(structName, methodName,
+                                                         methodParams, stable);
+                overrideNames.insert(methodName);
+                cppMethods.push_back({ std::move(params), returnSpelling,
+                                       methodName, stable });
             }
             struct ConstructorSourceInfo
             {
@@ -1023,9 +1119,37 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
                            : "p" + std::to_string(i - 1));
                 source += ");\n";
             }
+            for (const auto& method : cppMethods)
+            {
+                source += method.ReturnSpelling + " " + method.StableName + "("
+                    + cxxName + "* self";
+                for (size_t i = 0; i < method.Params.size(); ++i)
+                {
+                    std::string spelling;
+                    appendParamSpelling(method.Params[i], spelling);
+                    if (method.Params[i].IsRvalueRef) spelling += " &&";
+                    else if (method.Params[i].IsCxxConstRef) spelling += " const&";
+                    source += ", " + spelling + " "
+                        + (method.Params[i].VariableName.empty()
+                           ? "p" + std::to_string(i) : method.Params[i].VariableName);
+                }
+                source += ");\n";
+            }
             source += "}\nnamespace __cflat_user {\nstruct " + shortName + " final";
             if (!baseCxxName.empty()) source += " : public " + baseCxxName;
             source += " {\n";
+            std::set<std::pair<std::string, std::string>> inheritedUsing;
+            for (const auto& method : cppMethods)
+                for (const auto& candidate : compiler->FindCxxBaseMethods(cppBaseName, method.Name))
+                {
+                    // `using` on a private base member is ill-formed; it is not visible anyway.
+                    if (candidate.raw.access == cflat_cinterop::AccessPrivate) continue;
+                    std::string ownerSpelling;
+                    if (compiler->CxxSpellingForCflatType(candidate.ownerType, ownerSpelling))
+                        inheritedUsing.emplace(ownerSpelling, method.Name);
+                }
+            for (const auto& [owner, name] : inheritedUsing)
+                source += "    using " + owner + "::" + name + ";\n";
             source += "    alignas(" + std::to_string(cxxFieldAlign) + ") unsigned char __cflat_fields["
                    + std::to_string(std::max<uint64_t>(1, fieldBytes)) + "];\n";
             if (hasGeneratedNoArgCtor)
@@ -1082,6 +1206,27 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
                     source += ", " + (overrideInfo.Params[i].VariableName.empty()
                                       ? "p" + std::to_string(i)
                                       : overrideInfo.Params[i].VariableName);
+                source += "); }\n";
+            }
+            for (const auto& method : cppMethods)
+            {
+                source += "    " + method.ReturnSpelling + " " + method.Name + "(";
+                for (size_t i = 0; i < method.Params.size(); ++i)
+                {
+                    if (i != 0) source += ", ";
+                    std::string spelling;
+                    appendParamSpelling(method.Params[i], spelling);
+                    if (method.Params[i].IsRvalueRef) spelling += " &&";
+                    else if (method.Params[i].IsCxxConstRef) spelling += " const&";
+                    source += spelling + " " + (method.Params[i].VariableName.empty()
+                        ? "p" + std::to_string(i) : method.Params[i].VariableName);
+                }
+                source += ") { ";
+                if (method.ReturnSpelling != "void") source += "return ";
+                source += method.StableName + "(this";
+                for (size_t i = 0; i < method.Params.size(); ++i)
+                    source += ", " + (method.Params[i].VariableName.empty()
+                        ? "p" + std::to_string(i) : method.Params[i].VariableName);
                 source += "); }\n";
             }
             source += "};\n}\n";
@@ -4510,6 +4655,19 @@ void MainListener::EmitCppStructConstructorThunk(
             if (fieldIndex >= structType->getNumElements()) break;
             const auto& field = fields[fieldIndex];
             if (!field.IsCflatOwned || field.IsPadding) continue;
+            auto* destinationType = structType->getTypeAtIndex((unsigned)fieldIndex);
+            auto* fieldPtr = compiler->builder->CreateStructGEP(structType, dst,
+                (unsigned)fieldIndex, field.VariableName);
+            auto* fieldInit = field.Initializer;
+            const bool defaultOnly = fieldInit == nullptr
+                || fieldInit->Default() != nullptr;
+            if (defaultOnly && !destinationType->isArrayTy()
+                && EmitNontrivialCxxDefaultAt(fieldPtr, field))
+            {
+                compiler->NoteUnwindPartial(LLVMBackend::UnwindPartialEntry::Kind::Slot,
+                                            fieldPtr, field.TypeName);
+                continue;
+            }
             llvm::Value* value = nullptr;
             bool valueUnsigned = false;
             bool fromBraceList = false;
@@ -4526,7 +4684,6 @@ void MainListener::EmitCppStructConstructorThunk(
                 else if (field.Initializer->Default() != nullptr)
                     value = GenerateDefaultValue(field);
             }
-            auto* destinationType = structType->getTypeAtIndex((unsigned)fieldIndex);
             if (value == nullptr && (destinationType->isStructTy() || destinationType->isArrayTy()))
                 value = GenerateDefaultValue(field);
             if (value == nullptr) continue;
@@ -4541,9 +4698,6 @@ void MainListener::EmitCppStructConstructorThunk(
             }
             if (value != nullptr && value->getType() == destinationType)
             {
-                auto* fieldPtr = compiler->builder->CreateStructGEP(structType, dst,
-                                                                    (unsigned)fieldIndex,
-                                                                    field.VariableName);
                 compiler->builder->CreateStore(value, fieldPtr);
                 if (destinationType->isArrayTy())
                 {

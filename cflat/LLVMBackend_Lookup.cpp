@@ -492,7 +492,16 @@ std::string LLVMBackend::CxxDeletedCopyMessage(const NamedVariable& arg,
                                                const std::string& functionName,
                                                bool moveRemedy) const
 {
-        const std::string shown = DisplayCxxClassName(arg.TypeAndValue.TypeName);
+        std::string shown = SpellDiagnosticType(*this, arg.TypeAndValue);
+        if (arg.TypeAndValue.DiagnosticTypeName.empty() && !arg.CallerName.empty())
+            for (auto frame = stackNamedVariable.rbegin(); frame != stackNamedVariable.rend(); ++frame)
+                if (auto it = frame->namedVariable.find(arg.CallerName);
+                    it != frame->namedVariable.end()
+                    && !it->second.TypeAndValue.DiagnosticTypeName.empty())
+                {
+                    shown = it->second.TypeAndValue.DiagnosticTypeName;
+                    break;
+                }
         if (moveRemedy)
             return std::format("cannot copy C++ class '{}' into parameter '{}' of '{}': its copy "
                                "constructor is deleted - pass 'move x' or a temporary",

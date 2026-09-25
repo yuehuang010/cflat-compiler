@@ -27,6 +27,11 @@ class Res
     ~Res() { g_dtor = g_dtor + 1; }
 };
 
+[unique] struct SortUniqueToken
+{
+    int value = 0;
+};
+
 // g_ctor counts DEFAULT constructions only - a memberwise copy into a list slot does not run
 // the constructor, so ctor and dtor totals differ by the number of copies, not by leaked slots.
 int g_ctor = 0;
@@ -1141,6 +1146,15 @@ int testSort()
         passed += Test("sort<T*> dtor freed nothing", g_dtor, 0);
     }
     passed += Test("sort<T*> owner frees each once", g_dtor, 3);
+
+    list<SortUniqueToken> uniqueValues = default;
+    SortUniqueToken high = default; high.value = 9;
+    SortUniqueToken low = default; low.value = 4;
+    uniqueValues.add(move high);
+    uniqueValues.add(move low);
+    uniqueValues.sort((SortUniqueToken a, SortUniqueToken b) => { return a.value < b.value; });
+    passed += Test("sort<[unique] struct> first", uniqueValues[0].value, 4);
+    passed += Test("sort<[unique] struct> last", uniqueValues[1].value, 9);
     return passed;
 }
 
@@ -1527,7 +1541,7 @@ extern int main()
     total += 3;  passed += testImplicitMoveReturn();
     total += 3;  passed += testNonCopyableMoveOnly();
     total += 9;  passed += testIsCopyable();
-    total += 7;  passed += testSort();
+    total += 9;  passed += testSort();
     total += 11; passed += testInsert();
     total += 14; passed += testAddSiteAcceptSet();
     total += 4;  passed += testUserDefinedContainersAccept();

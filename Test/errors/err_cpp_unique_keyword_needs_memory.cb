@@ -1,0 +1,10 @@
+// R5: `unique T*` on a C++ class names std::unique_ptr<T>; without <memory> it is refused
+// with the import to add, never silently lowered to core unique<T>.
+import cpp "cpp_interop_poly.h";
+import cpp "cpp_interop_poly.cpp";
+
+expect_error("which no imported C++ header declares - add 'import cpp \"memory\";'") {
+    int UqNoMemory() { unique cpppoly.NoVirtualBase* p = new cpppoly.NoVirtualDerived(); return 0; }
+}
+
+extern int main() { return 0; }

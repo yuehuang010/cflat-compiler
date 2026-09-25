@@ -6587,6 +6587,7 @@ static llvm::json::Object SerializeTav(const TAV& t)
     auto s = LLVMBackend::SerializedTav::From(t);
     llvm::json::Object o;
     o["t"] = s.TypeName;
+    if (!s.DiagnosticTypeName.empty()) o["dt"] = s.DiagnosticTypeName;
     if (!s.VariableName.empty())  o["n"]   = s.VariableName;
     if (!s.EnumBacking.empty())   o["eb"]  = s.EnumBacking;
     if (s.IsScopedEnum)           o["se"]  = true;
@@ -6662,6 +6663,7 @@ static TAV DeserializeTav(const llvm::json::Object& o)
 {
     LLVMBackend::SerializedTav s;
     if (auto v = o.getString("t"))   s.TypeName = v->str();
+    if (auto v = o.getString("dt"))  s.DiagnosticTypeName = v->str();
     if (auto v = o.getString("n"))   s.VariableName = v->str();
     if (auto v = o.getString("eb"))  s.EnumBacking = v->str();
     if (auto v = o.getBoolean("se"))  s.IsScopedEnum = *v;

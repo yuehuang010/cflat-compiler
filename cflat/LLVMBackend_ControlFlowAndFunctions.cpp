@@ -580,7 +580,10 @@ llvm::Value* LLVMBackend::CreateIndirectCall(const TypeAndValue& funcPtrType, ll
                     continue;
                 }
                 auto* temp = AllocaAtEntry(slot.structTy, nullptr, "cxx.indirect.argtemp", slot.align);
-                const bool useMove = params[i].IsMove || (*argNVs)[i].IsExplicitMove
+                const bool useMove = params[i].IsMove
+                    || (IsForeignNontrivialCxxClass(params[i].TypeName)
+                        && OwningSinkConsumesConcrete(FuncPtrParamAsTypeAndValue(params[i], i)))
+                    || (*argNVs)[i].IsExplicitMove
                     || (*argNVs)[i].CxxParamLastUse || (*argNVs)[i].IsRvalue;
                 if (!EmitCxxByValueParamConstruct(params[i].TypeName, temp,
                                                    (*argNVs)[i].Storage, useMove,

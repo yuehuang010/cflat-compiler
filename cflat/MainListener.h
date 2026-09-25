@@ -3860,6 +3860,8 @@ private:
     //   - struct types (global scope): the constant value of that same construction, if it has one.
     //   - everything else: zero-initializes.
     llvm::Value* GenerateDefaultValue(const LLVMBackend::DeclTypeAndValue& typeValue);
+    bool EmitNontrivialCxxDefaultAt(llvm::Value* destination,
+                                   const LLVMBackend::DeclTypeAndValue& typeValue);
 
     // Constant value of a type's default construction, or nullptr when it is not constant.
     llvm::Constant* TryFoldGlobalDefaultConstruction(const LLVMBackend::DeclTypeAndValue& typeValue);

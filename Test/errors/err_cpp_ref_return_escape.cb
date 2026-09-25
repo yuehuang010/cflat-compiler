@@ -1,15 +1,47 @@
 // A C++ reference return converts to a BORROWED pointer at a return statement. The refusals:
 // an owning `unique C*` return, a reference into a frame-local receiver, and a private base.
 import cpp "cpp_interop_basic.h";
+import cpp "cpp_interop_refgate.h";
 
-expect_error("cannot return borrowed value 'cppi.ref_cell' as 'unique<cppi.RefCell>'") {
+expect_error("cannot return borrowed value 'cppi.ref_cell' as 'std.unique_ptr<cppi.RefCell>'") {
     unique cppi.RefCell* RrOwned() { return cppi.ref_cell(); }
 }
-expect_error("cannot return the C++ reference result of 'b.get()' as 'cppi.RefCell*': it refers into a local object") {
+expect_error("cannot return the C++ reference result of 'b.get()' as 'cppi.RefCell*': its receiver in 'b.get()' refers into a local object") {
     cppi.RefCell* RrLocalReceiver() { cppi.RefBox b = default; return b.get(); }
 }
 expect_error("cannot convert 'cppi.PrivBoxDerived*' to 'cppi.BaseBox<int>*' for the return value: 'cppi.BaseBox<int>' is not a PUBLIC base of 'cppi.PrivBoxDerived'") {
     cppi.BaseBox<int>* RrPrivateBase(cppi.PrivBoxDerived* p) { return p; }
+}
+
+// Prefix refuses this `&` spelling through R1; the post-fix diagnostic must identify the local receiver.
+expect_error("cannot return the C++ reference result of '&b.get()' as 'cppi.RefCell*': its receiver in '&b.get()' refers into a local object") {
+    cppi.RefCell* RrLocalReceiverAddress() {
+        cppi.RefBox b = default;
+        return &b.get();
+    }
+}
+
+// Prefix accepts this local reference argument; the new gate must name its frame root.
+expect_error("cannot return the C++ reference result of 'cpprefgate.local_ref(local)' as 'cpprefgate.C*': its argument #0 in 'cpprefgate.local_ref(local)' refers into a local object") {
+    cpprefgate.C* RgFrameArgument() {
+        cpprefgate.C local = { v = 53 };
+        return cpprefgate.local_ref(local);
+    }
+}
+// Prefix reports generic R1 for this join; the return gate must name its local argument arm.
+expect_error("cannot return the C++ reference result of 'c?cpprefgate.local_ref(local):cpprefgate.cell()' as 'cpprefgate.C*': its argument #0 in 'c?cpprefgate.local_ref(local):cpprefgate.cell()' refers into a local object") {
+    cpprefgate.C* RgFrameTernary(bool c) {
+        cpprefgate.C local = { v = 59 };
+        return c ? cpprefgate.local_ref(local) : cpprefgate.cell();
+    }
+}
+
+// A nested reference-result call: the outer argument is the inner call, rooted in `local`.
+expect_error("its argument #0 in 'cpprefgate.local_ref(cpprefgate.local_ref(local))' refers into a local object") {
+    cpprefgate.C* RgFrameNested() {
+        cpprefgate.C local = { v = 61 };
+        return cpprefgate.local_ref(cpprefgate.local_ref(local));
+    }
 }
 
 extern int main()

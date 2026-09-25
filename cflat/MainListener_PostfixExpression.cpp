@@ -662,6 +662,18 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
             std::string namespaceContext;
             std::vector<std::string> cxxExplicitTemplateArgs;
 
+            auto HasCFlatMemberMethod = [&](const std::string& ownerType,
+                                            const std::string& methodName) {
+                auto it = Compiler(ctx)->functionTable.find(methodName);
+                if (it == Compiler(ctx)->functionTable.end()) return false;
+                return std::any_of(it->second.begin(), it->second.end(),
+                    [&](const LLVMBackend::FunctionSymbol& candidate) {
+                        return candidate.IsMethod && !candidate.IsCxx
+                            && !candidate.Parameters.empty()
+                            && candidate.Parameters.front().TypeName == ownerType;
+                    });
+            };
+
             auto ParseCallArgument = [&](auto&& parse) {
                 auto* backend = Compiler(ctx);
                 backend->lastCxxRetTemp_ = nullptr;
@@ -1835,7 +1847,10 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             // protected field is laid out (the record's size depends on it) but
                             // must not be nameable, and a member cflat refused to bind reports WHY
                             // rather than surfacing as an unknown identifier.
-                            if (!structVar.TypeAndValue.TypeName.empty())
+                            if (!structVar.TypeAndValue.TypeName.empty()
+                                && !(IsFollowedByCall(ctx, terminal)
+                                     && HasCFlatMemberMethod(
+                                         structVar.TypeAndValue.TypeName, primaryIdentifier)))
                                 Compiler(ctx)->RejectInaccessibleCxxMember(
                                     structVar.TypeAndValue.TypeName, primaryIdentifier,
                                     structVar.TypeAndValue.VariableName == "this", true);
@@ -3371,6 +3386,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                         std::string functionName = primaryIdentifier;
                         if (structVar.BaseType && !structVar.TypeAndValue.TypeName.empty()
                             && Compiler(ctx)->IsCxxRecord(structVar.TypeAndValue.TypeName)
+                            && !HasCFlatMemberMethod(
+                                structVar.TypeAndValue.TypeName, functionName)
                             && Compiler(ctx)->RejectInaccessibleCxxMember(
                                 structVar.TypeAndValue.TypeName, functionName,
                                 structVar.TypeAndValue.VariableName == "this", true))
@@ -3611,8 +3628,12 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 callArgs[1]->assignmentExpression());
                             auto sourceValue = sourceNV.Primary
                                 ? sourceNV.Primary : LoadNamedVariable(sourceNV);
+                            const bool consumesInferredSink = compiler->IsForeignNontrivialCxxClass(
+                                    destType.TypeName)
+                                && sourceNV.TypeAndValue.IsOwningSink
+                                && compiler->OwningSinkConsumesConcrete(sourceNV.TypeAndValue);
                             sourceNV.IsRvalue = sourceNV.IsRvalue || sourceNV.IsExplicitMove
-                                || sourceNV.TypeAndValue.IsMove;
+                                || sourceNV.TypeAndValue.IsMove || consumesInferredSink;
                             if (sourceValue == nullptr)
                             {
                                 LogErrorContext(ctx, "construct_at second argument does not produce a value");
@@ -4648,6 +4669,33 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             break;
                         }
 
+                        // Compile-time intrinsic: is_cpp_class(T) - true for imported C++ records.
+                        // Generic container code uses it to isolate C++ ABI restrictions from
+                        // CFlat move-only structs, which remain valid value types.
+                        if (functionName == "is_cpp_class")
+                        {
+                            bool isCppClass = false;
+                            if (argumentList.size() > 0)
+                            {
+                                auto namedArgCtx = argumentList[functionArgCounter]->argumentNamedExpression();
+                                if (!namedArgCtx.empty())
+                                {
+                                    std::string argText = namedArgCtx[0]->assignmentExpression()->getText();
+                                    auto substIt = activeTypeSubstitutions.find(argText);
+                                    if (substIt != activeTypeSubstitutions.end())
+                                    {
+                                        std::string base = substIt->second;
+                                        StripOwnershipQualifiers(base);
+                                        isCppClass = Compiler(ctx)->IsCxxRecord(base);
+                                    }
+                                }
+                            }
+                            namedVar.Primary = llvm::ConstantInt::get(
+                                llvm::Type::getInt1Ty(*Compiler(ctx)->context), isCppClass ? 1 : 0);
+                            namedVar.TypeAndValue.TypeName = "int";
+                            break;
+                        }
+
                         // Compile-time intrinsic: compile_error("msg") - raises a compile error with
                         // the given message when this branch is INSTANTIATED (live for the current
                         // monomorphization); a no-op in dead `if const` branches (never codegen'd).
@@ -5520,6 +5568,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     // without its alignment tag is rejected instead of mis-freed.
                                     argVar.AllocAlignment = argNV.AllocAlignment;
                                     argVar.TypeAndValue.Pointer = argNV.TypeAndValue.Pointer;
+                                    argVar.TypeAndValue.DiagnosticTypeName =
+                                        argNV.TypeAndValue.DiagnosticTypeName;
                                     argVar.TypeAndValue.IsMove = argNV.TypeAndValue.IsMove;
                                     argVar.TypeAndValue.IsUnique = argNV.TypeAndValue.IsUnique;
                                     argVar.TypeAndValue.IsBorrowOfAliasElement =
@@ -6792,13 +6842,15 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 std::string why;
                                 const auto* ctor = compiler->SelectCxxConstructor(
                                     functionName, ctorTypes, why, false, &arguments);
-                                bool hardReferenceRejection = why.starts_with("constructor '");
+                                bool hardReferenceRejection = why.starts_with("constructor '")
+                                    || why.starts_with("no overload of '");
                                 if (ctor == nullptr && !hardReferenceRejection)
                                 {
                                     compiler->TryBindRefusedCxxMember(functionName, "__ctor");
                                     ctor = compiler->SelectCxxConstructor(
                                         functionName, ctorTypes, why, false, &arguments);
-                                    hardReferenceRejection = why.starts_with("constructor '");
+                                    hardReferenceRejection = why.starts_with("constructor '")
+                                        || why.starts_with("no overload of '");
                                 }
                                 // A constructor template can outrank the listed pick: clang
                                 // resolves `T(args)`, the listed pick stays the fallback.
@@ -6859,17 +6911,17 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     else
                                     {
                                         if (!wrapperError.empty()) why = wrapperError;
-                                        LogErrorContext(primaryCtx, std::format(
-                                            "C++ class '{}' {}",
-                                            compiler->DisplayCxxClassName(functionName), why));
+                                        LogErrorContext(primaryCtx, why.starts_with("no overload of '")
+                                            ? why : std::format("C++ class '{}' {}",
+                                                compiler->DisplayCxxClassName(functionName), why));
                                         namedVar = {};
                                     }
                                 }
                                 else if (ctor == nullptr)
                                 {
-                                    LogErrorContext(primaryCtx, std::format(
-                                        "C++ class '{}' {}",
-                                        compiler->DisplayCxxClassName(functionName), why));
+                                    LogErrorContext(primaryCtx, why.starts_with("no overload of '")
+                                        ? why : std::format("C++ class '{}' {}",
+                                            compiler->DisplayCxxClassName(functionName), why));
                                     namedVar = {};
                                 }
                                 else
@@ -8976,7 +9028,7 @@ LLVMBackend::NamedVariable MainListener::ParseIdentifier(antlr4::tree::TerminalN
 
         // Compiler intrinsics handled at the call site - not in the function table.
         static const std::unordered_set<std::string> kIntrinsics = {
-            "va_start", "va_end", "is_pointer", "is_unique", "is_interface", "is_copyable", "is_primitive", "is_string", "annotationof",
+            "va_start", "va_end", "is_pointer", "is_unique", "is_interface", "is_copyable", "is_cpp_class", "is_primitive", "is_string", "annotationof",
             "compile_error", "construct_at", "embed",
             "reflect", "reflect_set", "json_const", "xml_const", "__rdtscp", "__readcyclecounter", "__lfence", "__pause",
             "__popcount", "__ctz", "__clz", "__prefetch", "__fma", "__likely", "__unlikely",

@@ -1975,7 +1975,31 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                     compiler->lastCxxRetValue_ = nullptr;
 
                     llvm::Value* sourceStorage = rhsNV.Storage;
-                    if (useMove)
+                    // R5: `p = new T();` / `p = move raw;` into a `unique T*` (std::unique_ptr<T>)
+                    // adopts into a temp that is then move-assigned (the old pointee is released).
+                    bool adoptedRaw = false;
+                    if (rhsTemp == nullptr && !rhsDefault
+                        && compiler->IsRawPointerForCxxUniquePtr(tn, rhsNV))
+                    {
+                        LLVMBackend::NamedVariable adoptSource = rhsNV;
+                        if (useMove)
+                        {
+                            adoptSource.IsExplicitMove = true;
+                            if (adoptSource.CallerName.empty() && IsBareIdentifierText(srcName))
+                                adoptSource.CallerName = srcName;
+                        }
+                        auto* adoptTemp = compiler->AllocaAtEntry(
+                            compiler->GetType(tempType), nullptr, "cxx.adopt.temp");
+                        if (compiler->TryAdoptRawPointerIntoCxxUniquePtr(
+                                tn, adoptTemp, adoptSource, "an assigned destination",
+                                &namedVar.TypeAndValue))
+                        {
+                            compiler->RegisterOwnedStructTemp(adoptTemp, tn);
+                            rhsTemp = adoptTemp;
+                            adoptedRaw = true;
+                        }
+                    }
+                    if (useMove && !adoptedRaw)
                     {
                         if (!IsBareIdentifierText(srcName))
                             LogErrorContext(ctx, std::format(
@@ -2106,7 +2130,7 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                         compiler->builder->CreateStore(compiler->builder->getInt1(true),
                                                        destinationGlobalLiveFlag);
 
-                    if (useMove) compiler->MarkVariableMoved(srcName);
+                    if (useMove && !adoptedRaw) compiler->MarkVariableMoved(srcName);
                     if (rhsTemp != nullptr)
                         compiler->FlushOwnedTempsSince(ownedTempMark, nullptr, nullptr);
                     if (namedVar.FieldName.empty() && !namedVar.CallerName.empty())
@@ -8064,6 +8088,35 @@ LLVMBackend::TypedValue MainListener::ParseEqualityExpression(CFlatParser::Equal
                 std::string name = structTy->getName().str();
                 return MangledBase(name) == "unique" ? name : std::string();
             };
+            // R5: the `unique` keyword's std::unique_ptr<T> compares through get(), as C++ does.
+            auto cxxUniquePtrType = [&](llvm::Value* value) -> std::string {
+                auto* structTy = llvm::dyn_cast_or_null<llvm::StructType>(
+                    value != nullptr ? value->getType() : nullptr);
+                if (structTy == nullptr || !structTy->hasName()) return {};
+                std::string name = structTy->getName().str();
+                return Compiler(ctx)->CxxUniquePtrPointee(name).empty() ? std::string() : name;
+            };
+            auto lowerCxxUniquePtrValue = [&](LLVMBackend::TypedValue& uniqueValue) {
+                std::string typeName = cxxUniquePtrType(uniqueValue.value);
+                if (typeName.empty()) return;
+                LLVMBackend::NamedVariable receiver;
+                receiver.Primary = uniqueValue.value;
+                receiver.Storage = uniqueValue.receiverStorage;
+                receiver.BaseType = uniqueValue.value->getType();
+                receiver.TypeAndValue.TypeName = typeName;
+                LLVMBackend::TypeAndValue rawType;
+                rawType.TypeName = Compiler(ctx)->CxxUniquePtrPointee(typeName);
+                rawType.Pointer = true;
+                uniqueValue.value = Compiler(ctx)->CreateCoreUniqueRawPointerCall(receiver, rawType);
+                auto elemType = rawType;
+                elemType.Pointer = false;
+                uniqueValue.elemType = Compiler(ctx)->GetType(elemType);
+                uniqueValue.pointerDepth = 0;
+                uniqueValue.elemPointer = false;
+                uniqueValue.receiverStorage = nullptr;
+            };
+            lowerCxxUniquePtrValue(lv);
+            lowerCxxUniquePtrValue(rv);
             auto lowerCoreUniqueNullCompare = [&](LLVMBackend::TypedValue& uniqueValue,
                                                    bool isEqual) -> llvm::Value* {
                 std::string typeName = coreUniqueType(uniqueValue.value);
@@ -11654,6 +11707,12 @@ LLVMBackend::NamedVariable MainListener::ParseUnaryExpression(CFlatParser::Unary
                 savedElse = compiler->ExchangeElseBlock(nullptr);
 
             auto namedVar = ParseCastExpression(castExpCtx);
+            const bool cxxReferenceResult = namedVar.TypeAndValue.IsAlias
+                && !namedVar.TypeAndValue.Pointer
+                && compiler->IsCxxRecord(namedVar.TypeAndValue.TypeName)
+                && namedVar.Storage != nullptr
+                && namedVar.Storage->getType()->isPointerTy()
+                && compiler->IsAliasValue(namedVar.Storage);
 
             if (opText == "!")
                 compiler->ExchangeElseBlock(savedElse);
@@ -11711,10 +11770,8 @@ LLVMBackend::NamedVariable MainListener::ParseUnaryExpression(CFlatParser::Unary
                         ? namedVar.CallerName : namedVar.TypeAndValue.VariableName;
                     namedVar.StackCharBufferScopeDepth = namedVar.DeclarationScopeDepth;
                 }
-                // `&` over an alias lvalue yields a PLAIN borrowed pointer - the same value the
-                // accessor spelling (`c.eqPtr()`) hands back, so it stores like any other pointer.
-                // The provenance moves to PointsToAliasBorrow, which the return/delete boundary
-                // gates below read; the alias markers themselves are dropped here.
+                // `&` over an alias lvalue normally records borrow provenance for return/delete.
+                // C++ reference-result addresses use the dedicated frame-rooted return gate.
                 // A non-pointer `alias` PARAMETER is a borrow of the CALLER's object, so its
                 // address is the caller's - not frame-local, and legitimate to return or store.
                 const bool addrOfAliasParam = namedVar.Primary != nullptr
@@ -11724,7 +11781,7 @@ LLVMBackend::NamedVariable MainListener::ParseUnaryExpression(CFlatParser::Unary
                 {
                     namedVar.FromOwningTempField = false;
                     namedVar.OwningTempParent = false;
-                    namedVar.PointsToAliasBorrow = !addrOfAliasParam;
+                    namedVar.PointsToAliasBorrow = !addrOfAliasParam && !cxxReferenceResult;
                     namedVar.IsAliasBorrow = false;
                     namedVar.TypeAndValue.IsAlias = false;
                 }
@@ -12393,6 +12450,8 @@ bool MainListener::EmitForeignCxxValueIntoSlot(
             const auto* sourceBinding = !sourceNV.IsElementAccess
                 ? compiler->FindVariableByStorage(sourceNV.Storage) : nullptr;
             if ((sourceNV.IsRvalue || sourceNV.TypeAndValue.IsMove
+                    || (sourceNV.TypeAndValue.IsOwningSink
+                        && compiler->OwningSinkConsumesConcrete(sourceNV.TypeAndValue))
                     || sourceNV.CxxParamLastUse
                     || (sourceBinding != nullptr
                         && (sourceBinding->TypeAndValue.IsMove || sourceBinding->IsOwningStruct)))
@@ -12419,6 +12478,15 @@ bool MainListener::EmitForeignCxxValueIntoSlot(
         {
             compiler->builder->CreateStore(sourceValue, destination);
             return true;
+        }
+        // R5: a raw T* into a `unique T*` slot on a C++ class (std::unique_ptr<T>) adopts it.
+        {
+            auto adoptSource = sourceNV;
+            adoptSource.Primary = sourceValue;
+            if (compiler->IsRawPointerForCxxUniquePtr(destType.TypeName, adoptSource)
+                && compiler->TryAdoptRawPointerIntoCxxUniquePtr(destType.TypeName, destination,
+                                                                adoptSource, context, &destType))
+                return true;
         }
 
         LogErrorContext(errCtx, std::format(
@@ -12672,6 +12740,23 @@ bool MainListener::EmitOneFieldInit(
 
         llvm::Value* val = LoadNamedVariable(rightNV);
         if (!val) return false;
+
+        // R5: `{ f = new T() }` into a `unique T*` field on a C++ class (std::unique_ptr<T>).
+        if (!fieldType.Pointer && val->getType()->isPointerTy())
+        {
+            auto adoptSource = rightNV;
+            adoptSource.Primary = val;
+            if (auto* adopted = compiler->AdoptRawPointerAsCxxUniquePtrValue(
+                    fieldType.TypeName, adoptSource,
+                    std::format("field '{}.{}'", displayTypeName, fieldName)))
+            {
+                val = adopted;
+                // The slot store below now sees the adopted class value, not the raw pointer.
+                rightNV.TypeAndValue = LLVMBackend::TypeAndValue{ .TypeName = fieldType.TypeName };
+                rightNV.Storage = nullptr;
+                rightNV.Primary = adopted;
+            }
+        }
 
         if (!fieldType.Pointer && compiler->IsCoreUniqueType(fieldType.TypeName)
             && RejectFieldAllocAlignMismatch(
@@ -13066,6 +13151,15 @@ llvm::Value* MainListener::ParseFieldDefaultInitializer(
         auto nv = ParseAssignmentExpressionNamed(ae);
         llvm::Value* val = LoadNamedVariable(nv);
         RejectRawHeapArrayIntoUniqueField(nv, field, field.VariableName, ae);
+        // R5: `unique T* f = new T();` on a C++ class (std::unique_ptr<T>) adopts the pointer.
+        if (val != nullptr && !field.Pointer && val->getType()->isPointerTy())
+        {
+            auto adoptSource = nv;
+            adoptSource.Primary = val;
+            if (auto* adopted = compiler->AdoptRawPointerAsCxxUniquePtrValue(
+                    field.TypeName, adoptSource, std::format("field of '{}'", structName)))
+                val = adopted;
+        }
         if (val != nullptr && !field.Pointer
             && compiler->IsCoreUniqueType(field.TypeName)
             && (val->getType()->isPointerTy()
@@ -15121,8 +15215,9 @@ LLVMBackend::NamedVariable MainListener::ParseNewExpression(CFlatParser::NewExpr
                                                            wrapperError);
             if (ctor == nullptr && !wrapped)
             {
-                LogErrorContext(ctx, std::format("C++ class '{}' {}",
-                    compiler->DisplayCxxClassName(typeName), why));
+                LogErrorContext(ctx, why.starts_with("no overload of '")
+                    ? why : std::format("C++ class '{}' {}",
+                        compiler->DisplayCxxClassName(typeName), why));
                 return {};
             }
             llvm::Value* block = compiler->EmitCxxHeapAllocate(typeName);

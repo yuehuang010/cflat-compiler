@@ -210,8 +210,11 @@
 //     readback, comparison, logical conversion, and truth-value forms (3520-3538).
 //   C++ reference-result conditional joins preserve selected-object identity at declarations,
 //     assignments, arguments, base conversions, and nested conditionals (3550-3559).
+//   C++ reference-result return gates agree across `&`, argument roots, pointer fields, and
+//     conditional returns, while alias returns retain their override (3560-3569).
 
 import cpp "library/cpp_interop_basic.h";
+import cpp "library/cpp_interop_refgate.h";
 import cpp "library/cpp_interop_basic.cpp";
 import cpp "library/cpp_interop_member_shadow.h";
 import cpp "library/cpp_interop_twin.h";
@@ -871,6 +874,19 @@ int apply_fnptr(function<int(int)> f, int x) { return f(x); }
 void fnptr_noop() {}
 // A C++ reference return and a derived pointer at a RETURN statement (3370-3389). Each helper
 // returns through the conversion the declaration and '=' forms already applied.
+cpprefgate.C* RgStaticAmp() { return &cpprefgate.cell(); }
+cpprefgate.C* RgHeap(cpprefgate.Hold* h) { return h.member(); }
+cpprefgate.C* RgHeapAmp(cpprefgate.Hold* h) { return &h.member(); }
+cpprefgate.C* RgParam(cpprefgate.C* p) { return cpprefgate.local_ref(*p); }
+cpprefgate.C* RgParamAmp(cpprefgate.C* p) { return &cpprefgate.local_ref(*p); }
+cpprefgate.C* RgTernary(bool choose) {
+    return choose ? cpprefgate.cell() : cpprefgate.other_cell();
+}
+alias cpprefgate.C* RgAlias() { return cpprefgate.cell(); }
+alias cpprefgate.C* RgAliasAmp() { return &cpprefgate.cell(); }
+struct RgFields { cpprefgate.B* r = default; };
+struct RgFieldDefault { cpprefgate.B* r = cpprefgate.bref(); };
+
 cppi.RefCell* RrCell() { return cppi.ref_cell(); }
 cppi.RefCell* RrCellConst() { return cppi.ref_cell_const(); }
 struct RrHolder { cppi.RefBox box; };
@@ -4125,6 +4141,8 @@ extern int main()
         if (cppfnptr.callback_call(cppfnptr.Source.callback, 4) != 44) return 3300;
         cppfnptr.Sink nullSink = cppfnptr.Sink(0);
         if (nullSink.value != -1) return 3301;
+        cppfnptr.Sink nullptrSink = cppfnptr.Sink(nullptr);
+        if (nullptrSink.value != -1) return 3303;
         cppfnptr.Sink memberSink = default;
         if (memberSink.member(0) != 0) return 3302;
     }
@@ -5293,5 +5311,38 @@ extern int main()
     trNested->v = 3555;
     if (ternref.ref_a().v != 3550 || ternref.ref_b().v != 3555
         || ternref.ref_c().v != 3) return 3555;
+
+    // C++ reference-result returns share one frame-root rule across both spellings.
+    cpprefgate.C* rgStatic = RgStaticAmp();
+    rgStatic.v = 31;
+    if (rgStatic != &cpprefgate.cell() || cpprefgate.cell().v != 31) return 3560;
+    cpprefgate.Hold* rgHeap = new cpprefgate.Hold();
+    cpprefgate.C* rgMember = RgHeap(rgHeap);
+    rgMember.v = 37;
+    if (rgHeap.c.v != 37 || RgHeapAmp(rgHeap) != rgMember) return 3561;
+    cpprefgate.C rgParamCell = { v = 41 };
+    if (RgParam(&rgParamCell) != &rgParamCell || RgParamAmp(&rgParamCell) != &rgParamCell)
+        return 3562;
+    cpprefgate.C* rgSelectedA = RgTernary(true);
+    rgSelectedA.v = 43;
+    if (rgSelectedA != &cpprefgate.cell() || cpprefgate.cell().v != 43
+        || cpprefgate.other_cell().v != 17) return 3563;
+    cpprefgate.C* rgSelectedB = RgTernary(false);
+    rgSelectedB.v = 47;
+    if (rgSelectedB != &cpprefgate.other_cell() || cpprefgate.other_cell().v != 47
+        || cpprefgate.cell().v != 43) return 3564;
+    RgFields rgDirect = default;
+    rgDirect.r = cpprefgate.bref();
+    if (rgDirect.r != &cpprefgate.bref() || rgDirect.r.v != 29) return 3565;
+    RgFields rgBrace = { r = cpprefgate.bref() };
+    if (rgBrace.r != &cpprefgate.bref() || rgBrace.r.v != 29) return 3566;
+    RgFields rgAmp = default;
+    rgAmp.r = &cpprefgate.bref();
+    if (rgAmp.r != &cpprefgate.bref() || rgAmp.r.v != 29) return 3567;
+    RgFieldDefault rgDefault = default;
+    if (rgDefault.r != &cpprefgate.bref() || rgDefault.r.v != 29
+        || RgAlias() != &cpprefgate.cell() || RgAliasAmp() != &cpprefgate.cell()) return 3568;
+    delete rgHeap;
+    if (cpprefgate.cell().v != 43 || cpprefgate.other_cell().v != 47) return 3569;
     return 0;
 }

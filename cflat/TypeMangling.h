@@ -45,6 +45,8 @@ void RememberMangledArity(const LLVMBackend& compiler, std::string_view mangled,
 
 std::string SpellType(const LLVMBackend& compiler,
                       const LLVMBackend::TypeAndValue& type);
+std::string SpellDiagnosticType(const LLVMBackend& compiler,
+                                const LLVMBackend::TypeAndValue& type);
 std::string_view MangledBase(std::string_view mangled);
 // Declared defaults of a template's generic parameters (parallel to its parameter list; empty
 // string = no default). Null when the template name is unknown.

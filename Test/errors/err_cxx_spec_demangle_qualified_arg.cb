@@ -1,0 +1,17 @@
+import cpp "cpp_interop_basic.h";
+
+expect_error("std.unique_ptr<cppi.Tracked>") {
+    int report_qualified<T>(T x) { return x; }
+    int trigger_qualified() {
+        unique cppi.Tracked* p = cppi.make_tracked_ptr(1);
+        return report_qualified(p);
+    }
+}
+
+expect_error("std.vector<std.unique_ptr<cppi.Tracked>>") {
+    int report_nested<T>(T x) { return x; }
+    int trigger_nested() {
+        std.vector<std.unique_ptr<cppi.Tracked>> p = default;
+        return report_nested(p);
+    }
+}

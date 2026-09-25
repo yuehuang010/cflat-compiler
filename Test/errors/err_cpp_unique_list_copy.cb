@@ -1,0 +1,10 @@
+import cpp "cpp_interop_uniqueptr.h";
+import "list.cb";
+
+expect_error("cannot copy this list");
+extern int main()
+{
+    list<unique cpuq.Widget*> values = default;
+    list<unique cpuq.Widget*> copied = values.copy();
+    return 0;
+}

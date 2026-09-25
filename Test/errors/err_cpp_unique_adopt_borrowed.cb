@@ -1,0 +1,28 @@
+// R5: `unique T*` on a C++ class is std::unique_ptr<T>; adopting a BORROWED raw pointer would
+// free the pointee twice, so every adoption site refuses it like core unique<T> does.
+import cpp "cpp_interop_uniqueptr.h";
+
+struct UqRawField { cpuq.Widget* p = nullptr; };
+
+expect_error("cannot adopt borrowed value 'p' into 'unique cpuq.Widget*' for local 'w'") {
+    int UqBorrowedLocal(cpuq.Widget* p) { unique cpuq.Widget* w = p; return 0; }
+}
+expect_error("cannot return borrowed value 'p' as 'unique cpuq.Widget*'") {
+    unique cpuq.Widget* UqBorrowedReturn(cpuq.Widget* p) { return p; }
+}
+expect_error("cannot adopt borrowed value 'p' into 'unique cpuq.Widget*' for an assigned destination") {
+    int UqBorrowedAssign(cpuq.Widget* p) { unique cpuq.Widget* w = default; w = p; return 0; }
+}
+expect_error("into 'std.unique_ptr<cpuq.Widget>' for a call argument") {
+    int UqBorrowedArgument(cpuq.Widget* p) { return cpuq.take(p); }
+}
+expect_error("cannot adopt borrowed value 's' into 'unique cpuq.Widget*' for local 'w'") {
+    int UqBorrowedField() {
+        UqRawField s = default;
+        s.p = new cpuq.Widget(1);
+        unique cpuq.Widget* w = s.p;
+        return 0;
+    }
+}
+
+extern int main() { return 0; }

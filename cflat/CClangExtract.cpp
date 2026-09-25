@@ -3148,6 +3148,23 @@ namespace cflat_cinterop
             return false;
         }
 
+        // A record clang marked invalid (instantiated over an incomplete CFlat record), named by
+        // value or through pointers / references: CodeGen's layout query asserts on it.
+        static bool ProtoHasInvalidRecord(const FunctionProtoType* fpt)
+        {
+            auto invalid = [](QualType t) {
+                t = t.getCanonicalType();
+                while (t->isPointerType() || t->isReferenceType())
+                    t = t->getPointeeType().getCanonicalType();
+                const CXXRecordDecl* rd = t->getAsCXXRecordDecl();
+                return rd != nullptr && rd->isInvalidDecl();
+            };
+            if (invalid(fpt->getReturnType())) return true;
+            for (QualType p : fpt->getParamTypes())
+                if (invalid(p)) return true;
+            return false;
+        }
+
         // A return type that is still an undeduced `auto` (the MSVC STL writes
         // `auto insert(node_type&&)`): an explicit class instantiation never instantiates that
         // body, so there is no return type to arrange and CodeGen dereferences the placeholder.
@@ -3610,6 +3627,13 @@ namespace cflat_cinterop
                             "uses a C++ class template specialization that the header never instantiates";
                     continue;
                 }
+                if (ProtoHasInvalidRecord(fpt.getTypePtr()))
+                {
+                    if (st.out.sigs[idx].bindRefusal.empty())
+                        st.out.sigs[idx].bindRefusal =
+                            "uses a C++ class whose instantiation failed";
+                    continue;
+                }
                 if (ProtoHasUnmodeledMemberPointer(st, ctx, fpt.getTypePtr())) continue;
                 if (ProtoHasUndeducedReturn(fpt.getTypePtr())) continue;
                 const CGFunctionInfo& fi = arrangeFreeFunctionType(cgm, fpt);
@@ -3633,6 +3657,7 @@ namespace cflat_cinterop
                     continue;
                 }
                 if (ProtoHasIncompleteRecord(fptPtr)) continue;
+                if (ProtoHasInvalidRecord(fptPtr)) continue;
                 if (ProtoHasUnmodeledMemberPointer(st, ctx, fptPtr)) continue;
                 if (ProtoHasUndeducedReturn(fptPtr)) continue;
                 CanQual<FunctionProtoType> fpt =
@@ -3769,6 +3794,7 @@ namespace cflat_cinterop
                 if (canon->getAs<FunctionProtoType>() == nullptr) continue;
                 CanQual<FunctionProtoType> fpt = canon.castAs<FunctionProtoType>();
                 if (ProtoHasIncompleteRecord(fpt.getTypePtr())) continue;
+                if (ProtoHasInvalidRecord(fpt.getTypePtr())) continue;
                 if (ProtoHasUnmodeledMemberPointer(st, ctx, fpt.getTypePtr())) continue;
                 if (ProtoHasUndeducedReturn(fpt.getTypePtr())) continue;
 
@@ -4371,6 +4397,12 @@ namespace cflat_cinterop
             }
             for (const FunctionDecl* fd : usedFunctionWork)
             {
+                // A prototype or class over an invalid record has no layout to arrange.
+                const auto* method = llvm::dyn_cast<CXXMethodDecl>(fd);
+                const auto* proto = fd->getType()->getAs<FunctionProtoType>();
+                if ((method != nullptr && method->getParent()->isInvalidDecl())
+                    || (proto != nullptr && ProtoHasInvalidRecord(proto)))
+                    continue;
                 cg.HandleTopLevelDecl(DeclGroupRef(const_cast<FunctionDecl*>(fd)));
                 cg.GetAddrOfGlobal(GlobalDecl(const_cast<FunctionDecl*>(fd)),
                                    /*isForDefinition*/ true);

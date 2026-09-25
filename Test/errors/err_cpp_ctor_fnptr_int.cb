@@ -1,0 +1,14 @@
+import cpp "cpp_interop_fnptr.h";
+
+extern int main()
+{
+    expect_error("no overload of 'cppfnptr.Sink' matches the given arguments.") {
+        int z = 7;
+        cppfnptr.Sink value = cppfnptr.Sink(z);
+    }
+    expect_error("no overload of 'cppfnptr.Sink' matches the given arguments.") {
+        int z = 7;
+        cppfnptr.Sink* value = new cppfnptr.Sink(z);
+    }
+    return 0;
+}

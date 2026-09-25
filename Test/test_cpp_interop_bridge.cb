@@ -61,7 +61,22 @@
 //     comparisons bind while the implicit-only assignment remains an error.
 //   std::set::insert of a generated, copyable [cpp] struct accepts a temporary and preserves
 //     its set size and element value (3540-3549).
+//   `unique T*` / `unique<T>` on a C++ class is std::unique_ptr<T> (ruling R5): adoption of `new`,
+//     raw owners and nullptr, C++ move, fields, returns, sinks, and exact structor counts (3550-3559).
+//   SFINAE member probes on CFlat-defined [cpp] methods and non-template forwarding calls
+//     (3560-3569), including keyword-name omission, inherited overload visibility, and
+//     same-signature CFlat hiding through C++ templates.
+//   CFlat methods on a [cpp] derived struct hide same-named protected C++ base members for
+//     direct, pointer, and in-method calls (3570-3579).
+//   Nontrivial C++ field defaults in a generated [cpp] constructor construct in place for
+//     direct initialization, declaration defaults, and `= default` (3580-3589).
+//   CFlat by-value C++ unique_ptr parameters accept prvalue arguments and their returned
+//     temporaries move into locals once, for `new`, C++ call results, and both type spellings
+//     (3590-3599).
+//   list<unique C++*> uses std::unique_ptr values for sinks, borrowing, take, release, growth,
+//     and destruction, with exact C++ destructor counts (3600-3609).
 
+import cpp "library/cpp_interop_sfinae.h";
 import cpp "library/cpp_interop_basic.h";
 import cpp "library/cpp_interop_basic.cpp";
 // Inheritance and virtual dispatch. Definitions are out-of-line on purpose - every
@@ -81,15 +96,31 @@ import cpp "map";
 import cpp "set";
 import cpp "library/cpp_interop_setcopy.h";
 import cpp "list";
+import "list.cb";
 import cpp "array";
 import cpp "library/cpp_interop_view_decay.h";
 import cpp "library/cpp_interop_lvalue_sink.h";
 import cpp "library/cpp_interop_assign.h";
 import cpp "library/cpp_interop_proxy_assign.h";
+import cpp "library/cpp_interop_uniqueptr.h";
+import cpp "library/cpp_interop_own_method.h";
 
 [cpp] struct BridgeSetCopyKey : cppsetcopy.CopyBase
 {
     BridgeSetCopyKey(int value) { tag = value; }
+};
+
+[cpp] struct BridgeOwnMethodFirst : cppownmethod.ProtectedBase
+{
+    int prot() { return 30; }
+    int bare() { return prot(); }
+    int explicit_this() { return this->prot(); }
+};
+
+[cpp] struct BridgeListRelocHolder : cppt.ModuleBase
+{
+    std.list<int> values = default;
+    override int forward(int x) { return x; }
 };
 
 int proxyCppAssignValue = 0;
@@ -111,6 +142,27 @@ import "library/cpp_interop_gfield_a.cb";
 import "library/cpp_interop_gfield_b.cb";
 import "test_helper.cb";
 import "list.cb";
+
+[cpp] struct BridgeHidingMembers : cppsf.HidingBase
+{
+    int size() { return 1; }
+    int read() { return 3; }
+    int same(int x) { return x + 2; }
+    // Same name as a PRIVATE base member: no `using` may be emitted for it.
+    int secret() { return 4; }
+};
+
+[cpp] struct BridgeMultipleBaseMembers : cppsf.HidingMulti
+{
+    int choose(int x) { return x + 1; }
+};
+
+[cpp] struct BridgeCppKeywordMethods
+{
+    int concept() { return 1; }
+    int requires() { return 2; }
+    int and() { return 3; }
+};
 
 [cpp] struct BridgeSinkCheck : cplv.Module
 {
@@ -2110,10 +2162,161 @@ int bridge_view_rank(std.vector<int> values) { return 200 + values[0]; }
 struct BridgeViewHolder { std.vector<int> values; };
 [cpp] struct BridgeViewCppHolder { std.vector<int> values; };
 
+[cpp] struct BridgeSFINAEModule : cppsf.ModBase
+{
+    int value = 0;
+    BridgeSFINAEModule(int v) { value = v; }
+    int forward(int x) { return x + value; }
+};
+
 int bridge_global_field_static_value()
 {
     static GFieldOne value = default;
     return value.item.v;
+}
+
+// R5 (ruling 2026-09-23): the `unique` keyword on a C++ class IS std::unique_ptr<T> (3550-3559).
+// Every leg hands the owner to a C++ API typed std::unique_ptr (peek/take/take_rr), which a
+// core unique<T> cannot bind, and counts Widget structors to prove single destruction.
+struct UqHolder { unique cpuq.Widget* w = default; int tag = 0; };
+struct UqDefaultHolder { unique cpuq.Widget* w = new cpuq.Widget(31); int tag = 0; };
+unique cpuq.Widget* UqMakeNew(int v) { return new cpuq.Widget(v); }
+unique cpuq.Widget* UqMakeMoved(int v) { cpuq.Widget* raw = new cpuq.Widget(v); return move raw; }
+unique cpuq.Widget* UqForward(unique cpuq.Widget* p) { return move p; }
+std.unique_ptr<cpuq.Widget> UqForwardSpelled(std.unique_ptr<cpuq.Widget> p) { return move p; }
+int UqSink(unique cpuq.Widget* p) { return cpuq.peek(p); }
+UqHolder UqMakeHolder(int v) { UqHolder h = default; h.w = cpuq.make(v); return move h; }
+
+int uq_scope_exit()
+{
+    cpuq.reset_counts();
+    {
+        unique cpuq.Widget* w = new cpuq.Widget(1);
+        if (cpuq.peek(w) != 1 || w.value() != 1) return 3550;
+        if (cpuq.dtors() != 0) return 3550;
+    }
+    if (cpuq.ctors() != 1 || cpuq.dtors() != 1) return 3550;
+    return 0;
+}
+int uq_take_by_value()
+{
+    cpuq.reset_counts();
+    {
+        unique cpuq.Widget* w = new cpuq.Widget(2);
+        if (cpuq.take(move w) != 2) return 3551;
+        if (cpuq.dtors() != 1) return 3551;    // destroyed by the callee's parameter
+    }
+    if (cpuq.dtors() != 1) return 3551;
+    return 0;
+}
+int uq_take_rvalue_ref()
+{
+    cpuq.reset_counts();
+    {
+        unique cpuq.Widget* w = cpuq.make(3);
+        if (cpuq.take_rr(move w) != 3) return 3552;
+        if (cpuq.dtors() != 1) return 3552;
+    }
+    if (cpuq.dtors() != 1) return 3552;
+    cpuq.reset_counts();
+    {
+        unique cpuq.Widget* w = cpuq.make(4);
+        if (cpuq.take_rr_keep(move w) != 4) return 3553;
+        if (cpuq.dtors() != 0) return 3553;    // && did not adopt: w still owns
+    }
+    if (cpuq.dtors() != 1) return 3553;
+    return 0;
+}
+int uq_returns()
+{
+    cpuq.reset_counts();
+    {
+        unique cpuq.Widget* a = cpuq.make(5);
+        unique cpuq.Widget* b = UqMakeNew(6);
+        unique cpuq.Widget* c = UqMakeMoved(7);
+        unique cpuq.Widget* d = UqForward(move a);
+        if (cpuq.peek(b) + cpuq.peek(c) + cpuq.peek(d) != 18) return 3554;
+        if (cpuq.dtors() != 0) return 3554;
+    }
+    if (cpuq.ctors() != 3 || cpuq.dtors() != 3) return 3554;
+    return 0;
+}
+int uq_fields()
+{
+    cpuq.reset_counts();
+    {
+        UqHolder h = default;
+        h.w = cpuq.make(8);
+        if (cpuq.peek(h.w) != 8) return 3555;
+        h.w = new cpuq.Widget(9);                  // old pointee released at the assignment
+        if (cpuq.dtors() != 1 || cpuq.peek(h.w) != 9) return 3555;
+        UqDefaultHolder d = default;
+        if (cpuq.peek(d.w) != 31) return 3555;
+        UqHolder m = UqMakeHolder(10);
+        if (cpuq.peek(m.w) != 10) return 3555;
+    }
+    if (cpuq.ctors() != 4 || cpuq.dtors() != 4) return 3555;
+    return 0;
+}
+int uq_reassign_and_adopt()
+{
+    cpuq.reset_counts();
+    {
+        unique cpuq.Widget* w = new cpuq.Widget(11);
+        w = cpuq.make(12);
+        if (cpuq.dtors() != 1 || cpuq.peek(w) != 12) return 3556;
+        cpuq.Widget* raw = new cpuq.Widget(13);
+        w = move raw;                              // adopts; raw reads null afterwards
+        if (raw != nullptr || cpuq.dtors() != 2 || cpuq.peek(w) != 13) return 3556;
+        cpuq.Widget* raw2 = new cpuq.Widget(14);
+        unique cpuq.Widget* v = move raw2;
+        if (raw2 != nullptr || cpuq.peek(v) != 14) return 3556;
+        w = nullptr;
+        if (cpuq.dtors() != 3 || cpuq.peek(w) != -1) return 3556;
+    }
+    if (cpuq.ctors() != 4 || cpuq.dtors() != 4) return 3556;
+    return 0;
+}
+int uq_spellings()
+{
+    cpuq.reset_counts();
+    {
+        unique<cpuq.Widget> g = cpuq.make(15);         // the spelled unique<T> form
+        std.unique_ptr<cpuq.Widget> s = cpuq.make(16);
+        unique cpuq.Widget* k = move s;                // one type: move-construct, no adoption
+        std.unique_ptr<cpuq.Widget> back = move g;
+        if (cpuq.peek(k) != 16 || cpuq.peek(back) != 15) return 3557;
+        if (cpuq.dtors() != 0) return 3557;
+    }
+    if (cpuq.dtors() != 2) return 3557;
+    return 0;
+}
+int uq_cflat_sink()
+{
+    cpuq.reset_counts();
+    {
+        unique cpuq.Widget* w = cpuq.make(17);
+        if (UqSink(move w) != 17) return 3558;
+        if (cpuq.dtors() != 1) return 3558;
+        if (UqSink(new cpuq.Widget(18)) != 18) return 3558;
+        if (cpuq.dtors() != 2) return 3558;
+        if (cpuq.take(new cpuq.Widget(19)) != 19) return 3558;
+        if (cpuq.dtors() != 3) return 3558;
+    }
+    if (cpuq.ctors() != 3 || cpuq.dtors() != 3) return 3558;
+    return 0;
+}
+int uq_null_compare()
+{
+    cpuq.reset_counts();
+    {
+        unique cpuq.Widget* w = default;
+        if (w != nullptr || !(w == nullptr) || cpuq.peek(w) != -1) return 3559;
+        w = new cpuq.Widget(20);
+        if (w == nullptr || nullptr == w || cpuq.peek(w) != 20) return 3559;
+    }
+    if (cpuq.dtors() != 1) return 3559;
+    return 0;
 }
 
 extern int main(int argc, char** argv)
@@ -4857,6 +5060,35 @@ extern int main(int argc, char** argv)
     if (bridge_passed - bridgeProxyStartPassed != bridge_checks - bridgeProxyStartChecks)
         return 2129;
 
+    // ---- SFINAE constrained and unconstrained C++ member probes (3560-3569) ----------------
+    int bridgeSFINAEStartChecks = bridge_checks;
+    int bridgeSFINAEStartPassed = bridge_passed;
+    {
+        BridgeSFINAEModule module = BridgeSFINAEModule(40);
+        bridge_check("SFINAE CFlat direct member call", module.forward(2), 42);
+        cppsf.Container constrained = default;
+        constrained->push_back(std.string("constrained"), std.make_shared<BridgeSFINAEModule>(40));
+        bridge_check("SFINAE decltype member address", constrained.result, 41);
+        constrained->push_call(std.string("declval"), std.make_shared<BridgeSFINAEModule>(50));
+        bridge_check("SFINAE declval member call", constrained.result, 51);
+        constrained->push_free(std.string("unconstrained"), std.make_shared<BridgeSFINAEModule>(60));
+        bridge_check("SFINAE unconstrained control", constrained.result, 61);
+    }
+    {
+        BridgeHidingMembers value = default;
+        BridgeCppKeywordMethods keywords = default;
+        cppsf.accept_keywords(keywords);
+        bridge_check("SFINAE inherited overload visible", cppsf.inherited_size(value), 11);
+        bridge_check("SFINAE inherited const member visible", cppsf.inherited_read(value), 8);
+        bridge_check("SFINAE CFlat method hides same signature", cppsf.same_call(value), 7);
+        bridge_check("SFINAE method named like a private base member", value.secret(), 4);
+        BridgeMultipleBaseMembers multiple = default;
+        bridge_check("SFINAE overloads from both bases visible",
+                     cppsf.inherited_right(multiple), 42);
+    }
+    if (bridge_passed - bridgeSFINAEStartPassed != bridge_checks - bridgeSFINAEStartChecks)
+        return 3560;
+
     // ---- std::set insert of a generated copyable [cpp] struct (3540-3549) ---------------
     int bridgeSetInsertStartChecks = bridge_checks;
     int bridgeSetInsertStartPassed = bridge_passed;
@@ -4868,6 +5100,226 @@ extern int main(int argc, char** argv)
     }
     if (bridge_passed - bridgeSetInsertStartPassed != bridge_checks - bridgeSetInsertStartChecks)
         return 3540;
+
+    // ---- `unique T*` on a C++ class is std::unique_ptr<T> (3550-3559) -------------------
+    int uqResult = uq_scope_exit();
+    if (uqResult == 0) uqResult = uq_take_by_value();
+    if (uqResult == 0) uqResult = uq_take_rvalue_ref();
+    if (uqResult == 0) uqResult = uq_returns();
+    if (uqResult == 0) uqResult = uq_fields();
+    if (uqResult == 0) uqResult = uq_reassign_and_adopt();
+    if (uqResult == 0) uqResult = uq_spellings();
+    if (uqResult == 0) uqResult = uq_cflat_sink();
+    if (uqResult == 0) uqResult = uq_null_compare();
+    if (uqResult != 0) return uqResult;
+
+    // ---- CFlat method before protected C++ base member (3570-3579) ---------------------
+    int bridgeOwnMethodStartChecks = bridge_checks;
+    int bridgeOwnMethodStartPassed = bridge_passed;
+    {
+        BridgeOwnMethodFirst value = BridgeOwnMethodFirst();
+        BridgeOwnMethodFirst* pointer = &value;
+        bridge_check("OWN method direct", value.prot(), 30);
+        bridge_check("OWN method pointer", pointer->prot(), 30);
+        bridge_check("OWN method explicit this", value.explicit_this(), 30);
+    }
+    if (bridge_passed - bridgeOwnMethodStartPassed != bridge_checks - bridgeOwnMethodStartChecks)
+        return 3570;
+
+    // ---- nontrivial C++ field defaults in [cpp] constructors (3580-3589) ----------------
+    int bridgeFieldRelocStartChecks = bridge_checks;
+    int bridgeFieldRelocStartPassed = bridge_passed;
+    {
+        BridgeListRelocHolder direct = BridgeListRelocHolder();
+        direct.values.push_back(5);
+        direct.values.push_back(9);
+        bridge_check("field relocation direct construction",
+                     direct.values.front() * 10 + (int)direct.values.size(), 52);
+    }
+    {
+        BridgeListRelocHolder implicit;
+        implicit.values.push_back(5);
+        implicit.values.push_back(9);
+        bridge_check("field relocation implicit construction",
+                     implicit.values.front() * 10 + (int)implicit.values.size(), 52);
+    }
+    {
+        BridgeListRelocHolder defaulted = default;
+        defaulted.values.push_back(5);
+        defaulted.values.push_back(9);
+        bridge_check("field relocation default construction",
+                     defaulted.values.front() * 10 + (int)defaulted.values.size(), 52);
+    }
+    if (bridge_passed - bridgeFieldRelocStartPassed != bridge_checks - bridgeFieldRelocStartChecks)
+        return 3580;
+    // ---- prvalue arguments to CFlat by-value C++ class parameters (3590-3599) -------------
+    int bridgeUqPrvalueStartChecks = bridge_checks;
+    int bridgeUqPrvalueStartPassed = bridge_passed;
+    cpuq.reset_counts();
+    {
+        unique cpuq.Widget* x = UqForward(new cpuq.Widget(61));
+        bridge_check("unique prvalue parameter from new", cpuq.peek(x), 61);
+    }
+    bridge_check("unique prvalue new structor counts", cpuq.ctors() * 100 + cpuq.dtors(), 101);
+    cpuq.reset_counts();
+    {
+        unique cpuq.Widget* x = UqForward(cpuq.make(62));
+        bridge_check("unique prvalue parameter from C++ call", cpuq.peek(x), 62);
+    }
+    bridge_check("unique prvalue call structor counts", cpuq.ctors() * 100 + cpuq.dtors(), 101);
+    cpuq.reset_counts();
+    {
+        unique cpuq.Widget* x = UqForward(UqForward(cpuq.make(63)));
+        bridge_check("unique nested prvalue parameter", cpuq.peek(x), 63);
+    }
+    bridge_check("unique nested prvalue structor counts", cpuq.ctors() * 100 + cpuq.dtors(), 101);
+    cpuq.reset_counts();
+    {
+        std.unique_ptr<cpuq.Widget> x = UqForwardSpelled(new cpuq.Widget(64));
+        bridge_check("spelled unique prvalue parameter from new", cpuq.peek(x), 64);
+    }
+    bridge_check("spelled unique prvalue new structor counts", cpuq.ctors() * 100 + cpuq.dtors(), 101);
+    cpuq.reset_counts();
+    {
+        std.unique_ptr<cpuq.Widget> x = UqForwardSpelled(cpuq.make(65));
+        bridge_check("spelled unique prvalue parameter from C++ call", cpuq.peek(x), 65);
+    }
+    bridge_check("spelled unique prvalue call structor counts", cpuq.ctors() * 100 + cpuq.dtors(), 101);
+    if (bridge_passed - bridgeUqPrvalueStartPassed != bridge_checks - bridgeUqPrvalueStartChecks)
+        return 3590;
+
+    // ---- list<unique C++*> stores move-only std::unique_ptr values (3600-3609) ------------
+    int bridgeUniqueListStartChecks = bridge_checks;
+    int bridgeUniqueListStartPassed = bridge_passed;
+    cpuq.reset_counts();
+    {
+        list<unique cpuq.Widget*> values = default;
+        values.add(new cpuq.Widget(70));
+        bridge_check("unique list add new", cpuq.peek(values[0]), 70);
+        bridge_check("unique list add new alive", cpuq.dtors(), 0);
+    }
+    bridge_check("unique list add new destroyed", cpuq.ctors() * 100 + cpuq.dtors(), 101);
+    if (bridge_passed - bridgeUniqueListStartPassed != bridge_checks - bridgeUniqueListStartChecks)
+        return 3600;
+
+    cpuq.reset_counts();
+    {
+        list<unique cpuq.Widget*> values = default;
+        unique cpuq.Widget* owner = cpuq.make(71);
+        values.add(owner);
+        unique cpuq.Widget* moved = new cpuq.Widget(72);
+        values.add(move moved);
+        bridge_check("unique list inferred sink value", cpuq.peek(values.get(0)), 71);
+        bridge_check("unique list explicit move value", cpuq.peek(values[1]), 72);
+        bridge_check("unique list add move alive", cpuq.dtors(), 0);
+    }
+    bridge_check("unique list sinks destroyed", cpuq.ctors() * 100 + cpuq.dtors(), 202);
+    if (bridge_passed - bridgeUniqueListStartPassed != bridge_checks - bridgeUniqueListStartChecks)
+        return 3601;
+
+    cpuq.reset_counts();
+    {
+        list<unique cpuq.Widget*> values = default;
+        values.add(cpuq.make(72));
+        bridge_check("unique list add C++ result", cpuq.peek(values[0]), 72);
+        bridge_check("unique list add C++ result alive", cpuq.dtors(), 0);
+    }
+    bridge_check("unique list add C++ result destroyed", cpuq.ctors() * 100 + cpuq.dtors(), 101);
+    if (bridge_passed - bridgeUniqueListStartPassed != bridge_checks - bridgeUniqueListStartChecks)
+        return 3602;
+
+    cpuq.reset_counts();
+    {
+        list<unique cpuq.Widget*> values = default;
+        values.add(new cpuq.Widget(73));
+        unique cpuq.Widget* replacement = cpuq.make(74);
+        values.set(0, replacement);
+        bridge_check("unique list set value", cpuq.peek(values[0]), 74);
+        bridge_check("unique list set old destroyed", cpuq.dtors(), 1);
+    }
+    bridge_check("unique list set both destroyed", cpuq.ctors() * 100 + cpuq.dtors(), 202);
+    if (bridge_passed - bridgeUniqueListStartPassed != bridge_checks - bridgeUniqueListStartChecks)
+        return 3603;
+
+    cpuq.reset_counts();
+    {
+        list<unique cpuq.Widget*> values = default;
+        values.add(new cpuq.Widget(75));
+        bridge_check("unique list index borrow to W*", cpuq.peek_raw(values[0]), 75);
+        bridge_check("unique list get borrow to W*", cpuq.peek_raw(values.get(0).get()), 75);
+        bridge_check("unique list borrow keeps owner", cpuq.dtors(), 0);
+    }
+    bridge_check("unique list borrow destroyed once", cpuq.ctors() * 100 + cpuq.dtors(), 101);
+    if (bridge_passed - bridgeUniqueListStartPassed != bridge_checks - bridgeUniqueListStartChecks)
+        return 3604;
+
+    cpuq.reset_counts();
+    {
+        list<unique cpuq.Widget*> values = default;
+        values.add(new cpuq.Widget(76));
+        unique cpuq.Widget* owner = values.take(0);
+        bridge_check("unique list take value", cpuq.peek(owner), 76);
+        bridge_check("unique list take empties", values.count(), 0);
+        bridge_check("unique list take alive", cpuq.dtors(), 0);
+    }
+    bridge_check("unique list take returned owner destroyed", cpuq.ctors() * 100 + cpuq.dtors(), 101);
+    if (bridge_passed - bridgeUniqueListStartPassed != bridge_checks - bridgeUniqueListStartChecks)
+        return 3605;
+
+    cpuq.reset_counts();
+    {
+        list<unique cpuq.Widget*> values = default;
+        values.add(new cpuq.Widget(77));
+        values.add(new cpuq.Widget(78));
+        values.removeAt(0);
+        bridge_check("unique list removeAt destroys removed", cpuq.dtors(), 1);
+        bridge_check("unique list removeAt shifts", cpuq.peek(values[0]), 78);
+    }
+    bridge_check("unique list removeAt destroys all once", cpuq.ctors() * 100 + cpuq.dtors(), 202);
+    if (bridge_passed - bridgeUniqueListStartPassed != bridge_checks - bridgeUniqueListStartChecks)
+        return 3606;
+
+    cpuq.reset_counts();
+    {
+        list<unique cpuq.Widget*> values = default;
+        values.add(new cpuq.Widget(79));
+        values.add(cpuq.make(80));
+        values.clear();
+        bridge_check("unique list clear destroys values", cpuq.dtors(), 2);
+        bridge_check("unique list clear empties", values.count(), 0);
+    }
+    bridge_check("unique list clear teardown once", cpuq.ctors() * 100 + cpuq.dtors(), 202);
+    if (bridge_passed - bridgeUniqueListStartPassed != bridge_checks - bridgeUniqueListStartChecks)
+        return 3607;
+
+    cpuq.reset_counts();
+    {
+        list<unique cpuq.Widget*> values = default;
+        int i = 0;
+        while (i < 9)
+        {
+            values.add(new cpuq.Widget(90 + i));
+            i++;
+        }
+        bridge_check("unique list grow count", values.count(), 9);
+        bridge_check("unique list grow first", cpuq.peek(values[0]), 90);
+        bridge_check("unique list grow last", cpuq.peek(values[8]), 98);
+        bridge_check("unique list grow has no early destroy", cpuq.dtors(), 0);
+    }
+    bridge_check("unique list grow destroys once", cpuq.ctors() * 100 + cpuq.dtors(), 909);
+    if (bridge_passed - bridgeUniqueListStartPassed != bridge_checks - bridgeUniqueListStartChecks)
+        return 3608;
+
+    cpuq.reset_counts();
+    {
+        list<unique cpuq.Widget*> values = default;
+        values.add(cpuq.make(99));
+        values.add(new cpuq.Widget(100));
+        bridge_check("unique list destruction before scope exit", cpuq.dtors(), 0);
+    }
+    bridge_check("unique list destruction exact", cpuq.ctors() * 100 + cpuq.dtors(), 202);
+    if (bridge_passed - bridgeUniqueListStartPassed != bridge_checks - bridgeUniqueListStartChecks)
+        return 3609;
 
     return 0;
 }

@@ -2099,9 +2099,11 @@ void LLVMBackend::RegisterCSignatures(const std::vector<CSigEntry>& sigs, const 
         std::unordered_map<std::string, std::string> stdFunctionClasses;
         for (const CSigEntry& e : *signatures)
         {
-            // Override helpers have C linkage but still need their extracted free-function ABI.
+            // CFlat [cpp] method helpers have C linkage but need their extracted free-function ABI.
             if (e.isCxx || e.name.starts_with("__cflat_ovr_")
-                || e.linkageName.starts_with("__cflat_ovr_"))
+                || e.linkageName.starts_with("__cflat_ovr_")
+                || e.name.starts_with("__cflat_mth_")
+                || e.linkageName.starts_with("__cflat_mth_"))
             {
                 auto& rawEntries = cxxFunctionSignatures_[e.name];
                 const bool duplicate = std::any_of(rawEntries.begin(), rawEntries.end(), [&](const auto& old) {
@@ -11197,7 +11199,8 @@ void LLVMBackend::RegisterCRecords(std::vector<CRecordEntry>& records, const std
                 deferredMembers.emplace_back(&r, false);
                 if (auto* s = GetSymbolSink())
                     s->Register(SymbolKind::Struct, r.name, fileForLsp, r.line,
-                                r.col < 0 ? 0 : r.col, "class " + r.name);
+                                r.col < 0 ? 0 : r.col, "class " + SpellType(*this,
+                                    TypeAndValue{ .TypeName = r.name }));
                 continue;
             }
             std::vector<DeclTypeAndValue> fields;
@@ -11534,7 +11537,8 @@ void LLVMBackend::RegisterCRecords(std::vector<CRecordEntry>& records, const std
             if (auto* s = GetSymbolSink())
             {
                 s->Register(SymbolKind::Struct, r.name, fileForLsp, r.line, r.col < 0 ? 0 : r.col,
-                            (r.isUnion ? "union " : "struct ") + r.name);
+                            (r.isUnion ? "union " : "struct ") + SpellType(*this,
+                                TypeAndValue{ .TypeName = r.name }));
                 // For bitfield records use prePackFields (semantic names before packing).
                 const auto& symFields = anyBitfields ? prePackFields : fields;
                 for (const auto& f : symFields)
@@ -11731,6 +11735,202 @@ llvm::Value* LLVMBackend::AdjustCxxPointerForUniqueAdoption(
 
         return EmitCxxBaseAdjust(value, offset);
     }
+
+bool LLVMBackend::IsCxxUniquePtrPointee(const std::string& pointee) const
+{
+        if (pointee.empty() || !HasCxxImportGroup()) return false;
+        const std::string resolved = ResolveTypeAlias(pointee);
+        return IsCxxRecord(resolved) || IsCppStructName(resolved);
+}
+
+std::string LLVMBackend::CxxUniquePtrForUniqueKeyword(const std::string& pointee,
+                                                      std::string& error)
+{
+        error.clear();
+        if (!IsCxxUniquePtrPointee(pointee)) return {};
+        const std::string resolved = ResolveTypeAlias(pointee);
+        const std::string name = MangleGenericInstance(*this, "std.unique_ptr", { resolved });
+        if (dataStructures.count(name) != 0 && CxxUniquePtrPointee(name) == resolved) return name;
+        if (TryRequestCxxType("std.unique_ptr", { resolved }, name, error))
+            return ResolveTypeAlias(name);
+        if (error.empty() || error.find("does not name a C++ class type") != std::string::npos)
+            error = std::format("'unique' on C++ class '{}' names std::unique_ptr<{}>, which no "
+                                "imported C++ header declares - add 'import cpp \"memory\";'",
+                                SpellType(*this, TypeAndValue{ .TypeName = resolved }),
+                                SpellType(*this, TypeAndValue{ .TypeName = resolved }));
+        return {};
+}
+
+std::string LLVMBackend::CxxUniquePtrPointee(const std::string& typeName) const
+{
+        if (!typeName.starts_with("std.unique_ptr$")) return {};
+        TypeSpelling spelling;
+        if (!DemangleType(*this, typeName, spelling) || spelling.base != "std.unique_ptr"
+            || spelling.args.size() != 1)
+            return {};
+        return MangleType(*this, spelling.args[0]);
+}
+
+bool LLVMBackend::IsRawPointerForCxxUniquePtr(const std::string& typeName,
+                                              const NamedVariable& source) const
+{
+        const std::string pointee = CxxUniquePtrPointee(typeName);
+        if (pointee.empty()) return false;
+        if (source.Primary != nullptr && llvm::isa<llvm::ConstantPointerNull>(source.Primary))
+            return true;
+        const TypeAndValue& tv = source.TypeAndValue;
+        if (!tv.Pointer || tv.ElemPointer || tv.IsInterface || tv.IsFunctionPointer
+            || tv.IsArrayView || tv.PointerDepth > 1)
+            return false;
+        const std::string sourceType = ResolveTypeAlias(tv.TypeName);
+        if (sourceType == pointee) return true;
+        return IsCxxRecord(sourceType) && IsCxxRecord(pointee) && IsCxxBaseOf(pointee, sourceType);
+}
+
+bool LLVMBackend::IsOwnedCxxAdoptSource(const NamedVariable& arg) const
+{
+        bool rebound = false;
+        if (arg.BorrowsOwningLocal && arg.OwningLocalStorage != nullptr)
+        {
+            const auto* owner = FindVariableByStorage(arg.OwningLocalStorage);
+            rebound = arg.PointerRebound || (owner != nullptr && owner->PointerRebound);
+        }
+        bool isBorrowed = arg.IsBorrowed || arg.IsAliasBorrow || arg.TypeAndValue.IsAlias
+            || arg.BorrowsOwnedElement || (arg.BorrowsOwningLocal && !rebound);
+        if (isBorrowed) return false;
+        return arg.IsOwning || arg.IsOwningString || arg.IsOwningStruct || arg.TypeAndValue.IsMove
+            || arg.IsExplicitMove || lastCallReturnsOwned || lastOwningResult
+            || IsOwnedNewTemp(arg.Primary) || IsOwningPtrTempValue(arg.Primary)
+            || IsMovedOutPtrValue(arg.Primary) || rebound
+            || (arg.FieldName.empty() && !arg.CallerName.empty() && IsVariableOwning(arg.CallerName));
+}
+
+bool LLVMBackend::TryAdoptRawPointerIntoCxxUniquePtr(const std::string& typeName,
+                                                    llvm::Value* slot,
+                                                    const NamedVariable& source,
+                                                    const std::string& destDesc,
+                                                    const TypeAndValue* targetTypeInfo)
+{
+        if (slot == nullptr || !IsRawPointerForCxxUniquePtr(typeName, source)) return false;
+        llvm::Value* value = source.Primary != nullptr ? source.Primary : LoadArgStorage(source);
+        if (value == nullptr || !value->getType()->isPointerTy()) return false;
+        if (llvm::isa<llvm::ConstantPointerNull>(value))
+        {
+            const auto* ctor = FindCxxDefaultCtor(typeName);
+            if (ctor == nullptr) return false;
+            EmitCxxStructorCall(typeName, *ctor, slot, {});
+            return true;
+        }
+        const std::string pointee = CxxUniquePtrPointee(typeName);
+        if (!IsOwnedCxxAdoptSource(source))
+        {
+            // Same owned/borrowed split as core unique<T>'s `move T*` ctor: adopting a borrow
+            // would free the pointee twice.
+            const std::string borrowed = BorrowedSourceName(source);
+            TypeAndValue fallbackType{ .TypeName = typeName };
+            const std::string uniqueType = SpellDiagnosticType(*this,
+                targetTypeInfo != nullptr ? *targetTypeInfo : fallbackType);
+            if (destDesc == "the return value")
+                LogErrorMessage(
+                    "cannot return borrowed value '{}' as '{}'; the return type owns the pointee - "
+                    "use 'new', a move source, or a move-returning call",
+                    { borrowed.empty() ? std::string("expression") : borrowed, uniqueType });
+            else if (borrowed.empty())
+                LogErrorMessage(
+                    "cannot adopt a borrowed value into '{}' for {} - the source still owns it; "
+                    "use 'new', a 'move' expression, or a move-returning call",
+                    { uniqueType, destDesc });
+            else
+                LogErrorMessage(
+                    "cannot adopt borrowed value '{}' into '{}' for {} - the source still owns it; "
+                    "use 'new', a 'move' expression, or a move-returning call",
+                    { borrowed, uniqueType, destDesc });
+            return true;
+        }
+        const std::string sourceType = ResolveTypeAlias(source.TypeAndValue.TypeName);
+        if (sourceType != pointee && !CxxHasVirtualDestructor(pointee))
+        {
+            TypeAndValue targetType{ .TypeName = pointee };
+            LogError(std::format(
+                "cannot adopt a '{}' into 'unique {}*': '{}' has no virtual destructor, so "
+                "deleting through the base would be undefined",
+                SpellType(*this, source.TypeAndValue), SpellType(*this, targetType),
+                SpellType(*this, targetType)));
+            return true;
+        }
+        // A derived pointer is adjusted to its base subobject here, as C++ would at the
+        // unique_ptr(pointer) parameter.
+        if (sourceType != pointee)
+        {
+            uint64_t offset = 0;
+            bool inaccessible = false;
+            if (!FindCxxBaseOffset(sourceType, pointee, offset, inaccessible)) return false;
+            value = EmitCxxBaseAdjust(value, offset);
+        }
+        // A named source is consumed like a core unique<T>'s `move T*` argument: its slot reads
+        // null afterwards, so its own ownership flag can never free the adopted pointee too.
+        llvm::Value* sourceSlot = source.Storage;
+        if (sourceSlot == nullptr && !source.CallerName.empty())
+            sourceSlot = FindVariableStorage(source.CallerName).Storage;
+        const std::string sourceName = !source.CallerName.empty() ? source.CallerName
+            : source.Storage != nullptr ? source.TypeAndValue.VariableName : std::string();
+        if (sourceSlot != nullptr && sourceSlot->getType()->isPointerTy())
+            builder->CreateStore(llvm::ConstantPointerNull::get(
+                llvm::cast<llvm::PointerType>(value->getType())), sourceSlot);
+        if (!sourceName.empty() && sourceSlot != nullptr)
+        {
+            RecordNullSet(sourceName);
+            // An explicit `move p` of a raw pointer leaves p readable as null, not moved-from.
+            if (source.IsExplicitMove)
+            {
+                MarkVariableUnmoved(sourceName);
+                MarkVariableExplicitlyMovedNull(sourceName);
+            }
+        }
+        TypeAndValue pointerType{ .TypeName = pointee };
+        pointerType.Pointer = true;
+        NamedVariable raw;
+        raw.Primary = value;
+        raw.BaseType = value->getType();
+        raw.TypeAndValue = pointerType;
+        raw.IsRvalue = true;
+        const std::vector<NamedVariable> rawArgs{ raw };
+        std::string why;
+        const auto* ctor = SelectCxxConstructor(typeName, { pointerType }, why, false, &rawArgs);
+        if (ctor == nullptr)
+        {
+            TryBindRefusedCxxMember(typeName, "__ctor");
+            ctor = SelectCxxConstructor(typeName, { pointerType }, why, false, &rawArgs);
+        }
+        if (ctor == nullptr)
+        {
+            LogError(std::format("cannot adopt a raw pointer into '{}' for {}: {}",
+                                 SpellType(*this, TypeAndValue{ .TypeName = typeName }),
+                                 destDesc, why));
+            return true;
+        }
+        EmitCxxStructorCall(typeName, *ctor, slot, { value }, &rawArgs);
+        // The unique_ptr now owns the pointee: no end-of-expression release of the source temp.
+        ConsumeOwnedNewTemp(source.Primary);
+        ConsumeOwnedNewTemp(value);
+        lastOwningResult = false;
+        lastCallReturnsOwned = false;
+        return true;
+}
+
+llvm::Value* LLVMBackend::AdoptRawPointerAsCxxUniquePtrValue(const std::string& typeName,
+                                                             const NamedVariable& source,
+                                                             const std::string& destDesc)
+{
+        if (!IsRawPointerForCxxUniquePtr(typeName, source)) return nullptr;
+        llvm::Type* objectType = GetType(TypeAndValue{ .TypeName = typeName });
+        if (objectType == nullptr || !objectType->isSized()) return nullptr;
+        auto* slot = AllocaAtEntry(objectType, nullptr, "cxx.adopt.value");
+        if (!TryAdoptRawPointerIntoCxxUniquePtr(typeName, slot, source, destDesc)) return nullptr;
+        // Relocated, not copied: a default-deleter unique_ptr is one pointer, and the slot is
+        // never destroyed, so the caller's store is the object's only owner.
+        return CreateLoad(objectType, slot);
+}
 
 llvm::Value* LLVMBackend::CxxReferenceResultAsPointer(const TypeAndValue& dest,
                                                       const NamedVariable& src,
@@ -13407,9 +13607,41 @@ llvm::Function* LLVMBackend::EmitCppStructOverrideThunk(
         std::string baseName;
         std::string stableName;
         if (!GetCppStructBase(structName, baseName))
-            return nullptr;
+            baseName.clear();
         if (!GetCppStructOverrideName(structName, methodName, params, stableName))
             return nullptr;
+        if (stableName.starts_with("__cflat_mth_"))
+        {
+            const CSigEntry* helperSig = nullptr;
+            for (const auto& [name, signatures] : cxxFunctionSignatures_)
+            {
+                (void)name;
+                auto found = std::find_if(signatures.begin(), signatures.end(),
+                    [&](const CSigEntry& sig) {
+                        return (sig.linkageName == stableName || sig.name == stableName)
+                            && sig.abi.valid && sig.params.size() == params.size() + 1;
+                    });
+                if (found != signatures.end()) { helperSig = &*found; break; }
+            }
+            if (helperSig == nullptr) return nullptr;
+            CxxFunctionPointerAbiPlan plan;
+            plan.ret = helperSig->ret;
+            plan.params = helperSig->params;
+            plan.params[0].TypeName = structName;
+            plan.params[0].Pointer = true;
+            std::string mismatch;
+            CxxAbiPlanScope abiScope(*this, &helperSig->abi, &mismatch);
+            if (!BuildAbiRecipeFromClangPlan(methodName, helperSig->abi,
+                                             plan.ret, plan.params, plan.recipe))
+            {
+                LogErrorMessage("C++ method '{}.{}' has an unsupported ABI: {}",
+                                { structName, methodName,
+                                  mismatch.empty() ? "unknown ABI mismatch" : mismatch });
+                return nullptr;
+            }
+            return GetOrCreateReverseAbiFunctionThunk(original, plan, stableName, true);
+        }
+        if (baseName.empty()) return nullptr;
         for (const auto& candidate : FindCxxBaseMethods(baseName, methodName))
         {
             if (candidate.raw.abi.valid)
@@ -15362,6 +15594,8 @@ const LLVMBackend::CxxClassInfo::Structor* LLVMBackend::SelectCxxConstructor(
             return scalarFamily(want) == scalarFamily(got);
         };
 
+        bool rejectedIntegerFunctionPointer = false;
+
         /*
          * An opaque `void&` parameter (its class was not requested when the constructor was
          * harvested) accepts any C++ class value. When the harvested C++ spelling names a
@@ -15453,6 +15687,22 @@ const LLVMBackend::CxxClassInfo::Structor* LLVMBackend::SelectCxxConstructor(
             {
                 const auto& want = c.params[i + 1];
                 const auto& got = argTypes[i];
+                if (want.IsFunctionPointer && !got.IsFunctionPointer && got.IsInteger() != -1)
+                {
+                    bool nullPointerConstant = false;
+                    if (argVars != nullptr && i < argVars->size())
+                    {
+                        const NamedVariable& arg = (*argVars)[i];
+                        auto* constant = llvm::dyn_cast_or_null<llvm::ConstantInt>(arg.Primary);
+                        nullPointerConstant = constant != nullptr && constant->isZero();
+                    }
+                    if (!nullPointerConstant)
+                    {
+                        rejectedIntegerFunctionPointer = true;
+                        ok = false;
+                        break;
+                    }
+                }
                 const bool rvalue = argumentIsRvalue(i);
                 const bool sameReferenceReferent = (want.TypeName == got.TypeName
                     && ((want.ElemPointer && want.Pointer && got.Pointer)
@@ -15584,6 +15834,12 @@ const LLVMBackend::CxxClassInfo::Structor* LLVMBackend::SelectCxxConstructor(
             return nullptr;
         }
         if (found != nullptr) return found;
+        if (rejectedIntegerFunctionPointer)
+        {
+            why = std::format("no overload of '{}' matches the given arguments.",
+                              DisplayCxxClassName(typeName));
+            return nullptr;
+        }
         // A copy-deleted lvalue whose const T& constructor clang refused to instantiate.
         size_t sinkIndex = 0;
         std::string sinkParam, sinkCause;
@@ -15696,6 +15952,12 @@ std::string LLVMBackend::ExplicitCxxConstructorBlocking(
 LLVMBackend::CxxArgConversion LLVMBackend::ClassifyCxxImplicitArgument(
         const NamedVariable& arg, const TypeAndValue& param, bool cxxByValueParam)
 {
+        // R5: a raw T* (or nullptr) at a std::unique_ptr<T> parameter - the `unique T*` sugar -
+        // adopts through unique_ptr(pointer); a non-const lvalue reference still takes no temp.
+        if (!param.IsInterface && IsRawPointerForCxxUniquePtr(param.TypeName, arg))
+            return param.IsAlias && !param.IsRvalueRef && !param.IsCxxConstRef
+                    && !param.ElemPointer && !cxxByValueParam
+                ? CxxArgConversion::NonConstLvalueRef : CxxArgConversion::Convertible;
         if (param.TypeName.empty() || param.IsInterface || arg.TypeAndValue.Pointer
             || (param.Pointer && !cxxByValueParam
                 && (!param.IsAlias || param.IsCxxRefToPointer)
@@ -15951,6 +16213,27 @@ bool LLVMBackend::IsCxxSharedPtrUpcast(const TypeAndValue& from,
 bool LLVMBackend::MaterializeImplicitCxxClassArgument(NamedVariable& arg,
                                                        const TypeAndValue& param)
 {
+        if (IsRawPointerForCxxUniquePtr(param.TypeName, arg))
+        {
+            TypeAndValue classType{ .TypeName = param.TypeName };
+            llvm::Type* objectType = GetType(classType);
+            if (objectType == nullptr || !objectType->isSized()) return false;
+            auto* adoptSlot = CreateAlloca(objectType);
+            if (!TryAdoptRawPointerIntoCxxUniquePtr(param.TypeName, adoptSlot, arg,
+                                                    "a call argument", &param))
+                return false;
+            // The temporary dies at the end of the full expression, moved-from or not.
+            RegisterOwnedStructTemp(adoptSlot, param.TypeName);
+            NamedVariable adopted;
+            adopted.Primary = CreateLoad(objectType, adoptSlot);
+            adopted.Storage = adoptSlot;
+            adopted.BaseType = objectType;
+            adopted.TypeAndValue.TypeName = param.TypeName;
+            adopted.IsRvalue = true;
+            adopted.IsExplicitMove = true;
+            arg = std::move(adopted);
+            return true;
+        }
         TypeAndValue argType = InferImplicitCxxArgumentType(arg, *this);
         const bool sharedPtrConversion = IsCxxSharedPtrUpcast(argType, param);
         if (sharedPtrConversion)
@@ -16111,7 +16394,8 @@ bool LLVMBackend::MaterializeImplicitCxxClassArgument(NamedVariable& arg,
 }
 
 bool LLVMBackend::EmitCxxCopyOrMoveConstruct(const std::string& typeName, llvm::Value* dest,
-                                             llvm::Value* src, bool useMove, const char* context)
+                                             llvm::Value* src, bool useMove, const char* context,
+                                             const std::string& displayTypeName)
 {
         if (dest == nullptr || src == nullptr) return false;
         // C++ falls back from move to COPY construction when the class declares no move
@@ -16127,7 +16411,8 @@ bool LLVMBackend::EmitCxxCopyOrMoveConstruct(const std::string& typeName, llvm::
             LogError(std::format(
                 "cannot {} C++ class '{}' {}: its {} constructor is {} - "
                 "pass or hold it by pointer instead",
-                useMove ? "move" : "copy", DisplayCxxClassName(typeName), context,
+                useMove ? "move" : "copy",
+                displayTypeName.empty() ? DisplayCxxClassName(typeName) : displayTypeName, context,
                 useMove ? "move or copy" : "copy",
                 deleted ? "deleted" : "not accessible from the imported header"));
             return false;

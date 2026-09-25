@@ -1717,7 +1717,8 @@ void LLVMBackend::CreateReturnCall(llvm::Value* value, llvm::Value* returnedLoca
             if (value->getType() != retTy)
             {
                 LogErrorMessage("cannot return this value: its type does not match the declared "
-                                "return type of function '{}'", { FindFunctionSourceName(currentFunction) });
+                                "return type of function '{}'", { SpellType(*this,
+                                    TypeAndValue{ .TypeName = FindFunctionSourceName(currentFunction) }) });
             }
             builder->CreateRet(value);
         }

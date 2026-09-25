@@ -307,6 +307,13 @@ std::string MainListener::ResolveTypeArgEntry(CFlatParser::TypeParameterEntryCon
             if (CanDesugarUniqueTypeArg(Compiler(entry), uniqueBase, hasPointer, pointerDepth,
                                         hasArrayView))
             {
+                // R5: a C++ class pointee names std::unique_ptr<T>, not core unique<T>.
+                std::string cxxUniqueError;
+                std::string cxxUniqueType = hasPointer && pointerDepth == 1 && !hasArrayView
+                    ? Compiler(entry)->CxxUniquePtrForUniqueKeyword(uniqueBase, cxxUniqueError)
+                    : std::string();
+                if (!cxxUniqueError.empty()) LogCxxErrorContext(entry, cxxUniqueError);
+                if (!cxxUniqueType.empty()) return cxxUniqueType;
                 std::string uniqueType = MangledGenericName("unique", { uniqueBase });
                 QueueGenericInstantiation("unique", { uniqueBase }, uniqueType);
                 return uniqueType;
@@ -1234,14 +1241,27 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                         || (uniqueArrayOk || !HasParameterArrayDeclarator(declSpecs))))
                 {
                     std::string elementType = declType.TypeName;
+                    // R5: on a C++ class pointee the keyword IS std::unique_ptr<T> (C++ special
+                    // members, C++ by-value parameter rule); CFlat pointees keep core unique<T>.
+                    std::string cxxUniqueError;
+                    std::string cxxUniqueType = uniqueFatInterface || declType.AllocAlignValue != 0
+                        ? std::string()
+                        : Compiler(declSpecs)->CxxUniquePtrForUniqueKeyword(elementType, cxxUniqueError);
+                    if (!cxxUniqueError.empty()) LogCxxErrorContext(declSpecs, cxxUniqueError);
+                    if (!cxxUniqueType.empty())
+                        declType.DiagnosticTypeName = "unique " + SpellType(*Compiler(declSpecs), declType);
                     // The declared allocation alignment travels in the TYPE: `alignas(0, N) unique
                     // T*` is `unique<T, N>`, so the deallocator that matches the allocation is
                     // part of the type rather than a side flag on the local.
                     std::vector<std::string> uniqueArgs{ elementType };
                     if (declType.AllocAlignValue != 0)
                         uniqueArgs.push_back(std::to_string(declType.AllocAlignValue));
-                    std::string uniqueType = MangledGenericName("unique", uniqueArgs);
-                    QueueGenericInstantiation("unique", uniqueArgs, uniqueType);
+                    std::string uniqueType = cxxUniqueType;
+                    if (uniqueType.empty())
+                    {
+                        uniqueType = MangledGenericName("unique", uniqueArgs);
+                        QueueGenericInstantiation("unique", uniqueArgs, uniqueType);
+                    }
                     declType.TypeName = uniqueType;
                     declType.Pointer = false;
                     declType.ElemPointer = false;
@@ -1250,7 +1270,7 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                     // The declared type is now the wrapper STRUCT, not the interface it stores.
                     declType.IsInterface = false;
                     declType.IsInterfacePointer = false;
-                    if (isParameterDecl)
+                    if (isParameterDecl && cxxUniqueType.empty())
                         declType.IsMove = true;
                 }
                 if (declSpecWithSuffix->Question())
@@ -3434,8 +3454,7 @@ void MainListener::ParseFunctionDefinition(CFlatParser::FunctionDefinitionContex
                     break;
                 }
             }
-            if (cppOverrideContext
-                && HasSoftDeclarationSpecifier(func->declarationSpecifiers(), "override"))
+            if (!structName.empty() && compiler->HasTypeAnnotation(structName, "cpp"))
             {
                 std::vector<LLVMBackend::TypeAndValue> overrideParams;
                 const size_t firstUserParam = structName.empty() ? 0 : 1;
@@ -3443,11 +3462,17 @@ void MainListener::ParseFunctionDefinition(CFlatParser::FunctionDefinitionContex
                 for (size_t i = firstUserParam; i < params.size(); ++i)
                     overrideParams.push_back(params[i]);
                 const std::string overrideMethodName = ::getFunctionName(func);
-                if (compiler->EmitCppStructOverrideThunk(
-                        fn, structName, overrideMethodName, overrideParams) == nullptr)
-                    Compiler(func)->LogErrorMessage(
-                        "could not emit the C++ override thunk for '{}.{}'",
-                        { compiler->DisplayCxxClassName(structName), overrideMethodName });
+                const bool isOverride = HasSoftDeclarationSpecifier(
+                    func->declarationSpecifiers(), "override");
+                std::string helperName;
+                const bool hasMethodHelper = compiler->GetCppStructOverrideName(
+                    structName, overrideMethodName, overrideParams, helperName);
+                if (isOverride || hasMethodHelper)
+                    if (compiler->EmitCppStructOverrideThunk(
+                            fn, structName, overrideMethodName, overrideParams) == nullptr)
+                        Compiler(func)->LogErrorMessage(
+                            "could not emit the C++ method thunk for '{}.{}'",
+                            { compiler->DisplayCxxClassName(structName), overrideMethodName });
             }
         }
 
@@ -3645,6 +3670,9 @@ void MainListener::ValidateUniqueField(const LLVMBackend::DeclTypeAndValue& f, a
             && Compiler(ctx)->gts.coreGenericTemplates.count("unique") != 0;
         if ((Compiler(ctx)->IsCoreUniqueType(f.TypeName) || pendingCoreUnique)
             && !f.Pointer)
+            return;
+        // R5: a C++ class pointee became std::unique_ptr<T>, whose own members own the pointee.
+        if (!f.Pointer && !Compiler(ctx)->CxxUniquePtrPointee(f.TypeName).empty())
             return;
         // `unique T* f[N]` is allowed since 2026-07-20: the synthesized destructor walks the array
         // and releases each slot (EmitOwningUniqueArrayCleanup, shared with the array-LOCAL path).
@@ -4049,6 +4077,15 @@ bool MainListener::TryDeclareForeignCxxLocal(CFlatParser::InitDeclaratorContext*
         }
 cxx_dtor_ready:
 
+        // R5: `unique T* p = <raw T*>` (the keyword's std::unique_ptr<T>) adopts the pointer
+        // through unique_ptr(pointer); false leaves the ordinary refusal to the caller.
+        auto adoptRaw = [&](const LLVMBackend::NamedVariable& nv) {
+            if (!compiler->IsRawPointerForCxxUniquePtr(typeName, nv)) return false;
+            compiler->SetCurrentDebugLocation(line);
+            return compiler->TryAdoptRawPointerIntoCxxUniquePtr(
+                typeName, slot, nv, std::format("local '{}'", name), &declType);
+        };
+
         // ---- `= default`, or no initializer at all: the default constructor ----------------
         if (initializer == nullptr || isDefaultForm)
         {
@@ -4218,13 +4255,15 @@ cxx_dtor_ready:
             std::string why;
             const auto* ctor = compiler->SelectCxxConstructor(typeName, argTypes, why, false,
                                                              &ctorArgumentAddresses);
-            bool hardReferenceRejection = why.starts_with("constructor '");
+            bool hardReferenceRejection = why.starts_with("constructor '")
+                || why.starts_with("no overload of '");
             if (ctor == nullptr && !hardReferenceRejection)
             {
                 compiler->TryBindRefusedCxxMember(typeName, "__ctor");
                 ctor = compiler->SelectCxxConstructor(typeName, argTypes, why, false,
                                                       &ctorArgumentAddresses);
-                hardReferenceRejection = why.starts_with("constructor '");
+                hardReferenceRejection = why.starts_with("constructor '")
+                    || why.starts_with("no overload of '");
             }
             // A constructor template can outrank the listed pick (or the listed refusal): let
             // clang resolve `T(args)` over every constructor, and keep the listed pick otherwise.
@@ -4266,15 +4305,17 @@ cxx_dtor_ready:
                 if (ctor == nullptr)
                 {
                     if (!wrapperError.empty() && !hardReferenceRejection) why = wrapperError;
-                    LogErrorContext(direct, std::format("C++ class '{}' {}",
-                        compiler->DisplayCxxClassName(typeName), why));
+                    LogErrorContext(direct, why.starts_with("no overload of '")
+                        ? why : std::format("C++ class '{}' {}",
+                            compiler->DisplayCxxClassName(typeName), why));
                     return true;
                 }
             }
             if (ctor == nullptr)
             {
-                LogErrorContext(direct, std::format("C++ class '{}' {}",
-                    compiler->DisplayCxxClassName(typeName), why));
+                LogErrorContext(direct, why.starts_with("no overload of '")
+                    ? why : std::format("C++ class '{}' {}",
+                        compiler->DisplayCxxClassName(typeName), why));
                 return true;
             }
             compiler->SetCurrentDebugLocation(line);
@@ -4304,7 +4345,7 @@ cxx_dtor_ready:
                 {
                     compiler->EmitCxxCopyOrMoveConstruct(
                         typeName, slot, sourceNV.Storage, /*useMove*/ true,
-                        std::format("into local '{}'", name).c_str());
+                        std::format("into local '{}'", name).c_str(), declType.DiagnosticTypeName);
                     DestroyForeignCxxRelocationSource(sourceNV);
                     return true;
                 }
@@ -4317,6 +4358,7 @@ cxx_dtor_ready:
                     compiler->builder->CreateStore(sourceNV.Primary, slot);
                     return true;
                 }
+                if (adoptRaw(sourceNV)) return true;
                 if (sourceNV.Storage == nullptr)
                 {
                     LogErrorContext(moveExpr, std::format(
@@ -4330,6 +4372,14 @@ cxx_dtor_ready:
                 return true;
             }
             auto* srcNV = compiler->FindLiveNamedVariable(srcName);
+            if (srcNV != nullptr && srcNV->Storage != nullptr && srcNV->TypeAndValue.Pointer)
+            {
+                LLVMBackend::NamedVariable rawSource = *srcNV;
+                rawSource.Primary = nullptr;
+                rawSource.IsExplicitMove = true;
+                rawSource.CallerName = srcName;
+                if (adoptRaw(rawSource)) return true;
+            }
             if (srcNV == nullptr || srcNV->Storage == nullptr
                 || srcNV->TypeAndValue.TypeName != typeName || srcNV->TypeAndValue.Pointer)
             {
@@ -4344,7 +4394,8 @@ cxx_dtor_ready:
             }
             compiler->SetCurrentDebugLocation(line);
             compiler->EmitCxxCopyOrMoveConstruct(typeName, slot, srcNV->Storage, /*useMove*/ true,
-                                                 std::format("into local '{}'", name).c_str());
+                                                 std::format("into local '{}'", name).c_str(),
+                                                 declType.DiagnosticTypeName);
             // RULING: the moved-from object is compile-time consumed but STILL destroyed at scope
             // exit - C++ has no null state to leave behind, so its destructor must run.
             compiler->MarkVariableMoved(srcName);
@@ -4407,7 +4458,8 @@ cxx_dtor_ready:
                         compiler, assign, *srcNV);
                     compiler->EmitCxxCopyOrMoveConstruct(typeName, slot, srcNV->Storage,
                                                          implicitLastUse,
-                                                         std::format("into local '{}'", name).c_str());
+                                                         std::format("into local '{}'", name).c_str(),
+                                                         declType.DiagnosticTypeName);
                     if (implicitLastUse) compiler->MarkVariableMoved(srcText);
                     return true;
                 }
@@ -4448,16 +4500,21 @@ cxx_dtor_ready:
             // is cleared by PrepareAliasCallResult, so copy it into the declared slot as a class lvalue.
             if (sameType && rightNV.Storage != nullptr)
             {
+                const bool useMove = compiler->IsCxxRvalueReferenceArgument(rightNV)
+                    && compiler->FindCxxCopyCtor(typeName) == nullptr
+                    && compiler->FindCxxMoveCtor(typeName) != nullptr;
                 compiler->EmitCxxCopyOrMoveConstruct(typeName, slot, rightNV.Storage,
-                                                     /*useMove*/ false,
-                                                     std::format("into local '{}'", name).c_str());
+                                                     useMove,
+                                                     std::format("into local '{}'", name).c_str(),
+                                                     declType.DiagnosticTypeName);
                 return true;
             }
             if (sameType && compiler->lastCxxRetTemp_ != nullptr)
             {
                 compiler->EmitCxxCopyOrMoveConstruct(typeName, slot, compiler->lastCxxRetTemp_,
                                                      /*useMove*/ true,
-                                                     std::format("into local '{}'", name).c_str());
+                                                     std::format("into local '{}'", name).c_str(),
+                                                     declType.DiagnosticTypeName);
                 return true;
             }
             const bool sameCflatValue = rightNV.TypeAndValue.TypeName == typeName
@@ -4475,6 +4532,7 @@ cxx_dtor_ready:
                 compiler->builder->CreateStore(rightNV.Primary, slot);   // returned in registers
                 return true;
             }
+            if (adoptRaw(rightNV)) return true;
             badInit(assign);
             return true;
         }
@@ -4545,7 +4603,8 @@ cxx_dtor_ready:
             compiler->SetCurrentDebugLocation(line);
             compiler->EmitCxxCopyOrMoveConstruct(typeName, slot, rightNV.Storage,
                                                  /*useMove*/ false,
-                                                 std::format("into local '{}'", name).c_str());
+                                                 std::format("into local '{}'", name).c_str(),
+                                                 declType.DiagnosticTypeName);
             return true;
         }
         // Only the OUTERMOST call's temporary may be moved into the slot: a value assembled from
@@ -4562,12 +4621,14 @@ cxx_dtor_ready:
             if (compiler->lastCxxRetTemp_ != nullptr)
                 compiler->EmitCxxCopyOrMoveConstruct(typeName, slot, compiler->lastCxxRetTemp_,
                                                      /*useMove*/ true,
-                                                     std::format("into local '{}'", name).c_str());
+                                                     std::format("into local '{}'", name).c_str(),
+                                                     declType.DiagnosticTypeName);
             else
                 compiler->builder->CreateStore(rightNV.Primary, slot);
             return true;
         }
 
+        if (adoptRaw(rightNV)) return true;
         badInit(assign);
         return true;
     }
@@ -4715,6 +4776,21 @@ bool MainListener::ValidateApplicationIcons(antlr4::ParserRuleContext* ctx,
     }
     out.IconKind = AppIconKind::PngSet;
     return true;
+}
+
+bool MainListener::EmitNontrivialCxxDefaultAt(
+    llvm::Value* destination, const LLVMBackend::DeclTypeAndValue& typeValue)
+{
+    auto* compiler = Compiler();
+    if (destination == nullptr || typeValue.Pointer
+        || !compiler->IsForeignCxxClassWithConstructors(typeValue.TypeName)
+        || compiler->IsCxxTriviallyCopyableRecord(typeValue.TypeName))
+        return false;
+    std::string error;
+    compiler->TryBindCxxImplicitDefaultCtor(typeValue.TypeName, error);
+    const auto* ctor = compiler->FindCxxDefaultCtor(typeValue.TypeName);
+    if (ctor == nullptr) return false;
+    return compiler->EmitCxxStructorCall(typeValue.TypeName, *ctor, destination, {});
 }
 
 /*
@@ -9087,6 +9163,15 @@ bool MainListener::RejectAliasStoreIntoField(
         llvm::Value* right,
         antlr4::ParserRuleContext* ctx) {
         auto* compiler = Compiler(ctx);
+        // A C++ reference result is already the referent address, not an owning value copy.
+        const bool cxxReferenceResultAsPointer = right != nullptr
+            && right->getType()->isPointerTy()
+            && rightNV.TypeAndValue.IsAlias && !rightNV.TypeAndValue.Pointer
+            && compiler->IsCxxRecord(rightNV.TypeAndValue.TypeName)
+            && rightNV.Storage != nullptr
+            && rightNV.Storage->getType()->isPointerTy()
+            && compiler->IsAliasValue(rightNV.Storage);
+        if (cxxReferenceResultAsPointer) return false;
         if (!(right && SourceIsDanglingAliasBorrow(compiler, rightNV)))
             return false;
 

@@ -3568,6 +3568,10 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                 const bool useMove = candidate.Parameters[i].IsMove
                     || matched[i].IsExplicitMove
                     || matched[i].CxxParamLastUse
+                    || (!candidate.IsCxx
+                        && IsForeignNontrivialCxxClass(candidate.Parameters[i].TypeName)
+                        && candidate.Parameters[i].IsOwningSink
+                        && OwningSinkConsumesConcrete(candidate.Parameters[i]))
                     || (!candidate.IsCxx && matched[i].IsRvalue);
                 // A by-value parameter a 'move x' can fill: name the deleted copy and that remedy.
                 if (!useMove && cxxObject && FindCxxCopyCtor(pn) == nullptr
@@ -4316,10 +4320,14 @@ bool LLVMBackend::IsMoveOrCoreUniqueValue(const TypeAndValue& t) const
 
 bool LLVMBackend::IsCoreUniqueToRawPointer(const NamedVariable& arg, const TypeAndValue& param) const
 {
-        if (arg.TypeAndValue.Pointer || !IsCoreUniqueType(arg.TypeAndValue.TypeName)
-            || MangledGenericArgument(*this, arg.TypeAndValue.TypeName).empty())
+        if (arg.TypeAndValue.Pointer) return false;
+        // R5: a `unique T*` on a C++ class is std::unique_ptr<T>; it borrows to T* the same way.
+        const std::string cxxPointee = CxxUniquePtrPointee(arg.TypeAndValue.TypeName);
+        if (cxxPointee.empty() && (!IsCoreUniqueType(arg.TypeAndValue.TypeName)
+            || MangledGenericArgument(*this, arg.TypeAndValue.TypeName).empty()))
             return false;
-        const std::string argPointee = MangledGenericArgument(*this, arg.TypeAndValue.TypeName);
+        const std::string argPointee = !cxxPointee.empty() ? cxxPointee
+            : MangledGenericArgument(*this, arg.TypeAndValue.TypeName);
         // Interface arm: unique<IShape> borrows to a plain IShape parameter through get().
         if (!param.Pointer)
             return param.IsFatInterfaceValue()

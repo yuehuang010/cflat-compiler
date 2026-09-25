@@ -4010,6 +4010,13 @@ struct ExternAliasRow { int a = default; int b = default; };
 ExternAliasRow g_externAliasRow = default;
 extern alias ExternAliasRow externAliasRow() { return g_externAliasRow; }
 
+// A '?:' of `&` over CFlat alias results is refused at a non-alias return for every root, like
+// the direct form (Test/errors/err_cflat_alias_ternary_return.cb); `alias T*` is the override.
+struct AtRow { int v = default; string s = default; };
+struct AtTab { AtRow r = default; alias AtRow at() { return r; } };
+// `alias T*` keeps the manual override even with a local arm; only the param arm is read.
+alias AtRow* atPickAliasLocal(AtTab* t, bool c) { AtTab local; return c ? &local.at() : &t.at(); }
+
 // A `move Resource*` sink for the re-bound-borrow legs: it adopts the pointee and frees it.
 void sinkBoxItem(move Resource* p) { }
 
@@ -4279,6 +4286,9 @@ int testOwningStructTernaryJoin()
     g_externAliasRow.b = 6;
     passed += Test("extern_alias_return_first_field", externAliasRow().a, 5);
     passed += Test("extern_alias_return_second_field", externAliasRow().b, 6);
+    AtTab atT;
+    atT.r.v = 7;
+    passed += Test("alias_ternary_return_alias_type", atPickAliasLocal(&atT, false).v, 7);
 
     // The guards sit in front of the owning-value MOVE and `move`-argument paths, so the plain
     // OWNER spellings they share a site with must still transfer: `dest = ownedLocal` releases the
@@ -12572,7 +12582,7 @@ extern int main()
     total += 22;
 
     passed += testOwningStructTernaryJoin();
-    total += 114;
+    total += 115;
 
     passed += testBucketAExpressionOwnership();
     total += 109;

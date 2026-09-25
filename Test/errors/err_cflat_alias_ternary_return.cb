@@ -1,0 +1,66 @@
+// A '?:' of `&` over CFlat-native alias results returned from a non-alias function is refused
+// when ANY arm (either side, nested, through GEPs) is a CFlat alias call result, for every root -
+// the direct `return &x.at();` rule. `alias T*` return types are accepted: Test/test_move.cb.
+struct Row { int v = default; string s = default; };
+struct Tab { Row r = default; alias Row at() { return r; } };
+struct Outer { Tab tab = default; alias Tab inner() { return tab; } };
+Tab g = default;
+Tab* gHeap = nullptr;
+
+expect_error("cannot return an 'alias' value 'Row*'; it borrows storage it does not own") {
+    Row* localTrueArm(Tab* t, bool c) { Tab local; return c ? &local.at() : &t.at(); }
+}
+
+expect_error("cannot return an 'alias' value 'Row*'; it borrows storage it does not own") {
+    Row* localFalseArm(Tab* t, bool c) { Tab local; return c ? &t.at() : &local.at(); }
+}
+
+expect_error("cannot return an 'alias' value 'Row*'; it borrows storage it does not own") {
+    Row* nestedDeepLocal(Tab* t, bool c, bool d)
+    {
+        Tab local;
+        return c ? &t.at() : (d ? &g.at() : &local.at());
+    }
+}
+
+expect_error("cannot return an 'alias' value 'Row*'; it borrows storage it does not own") {
+    Row* aliasChainLocal(Tab* t, bool c) { Outer o; return c ? &t.at() : &o.inner().at(); }
+}
+
+expect_error("cannot return an 'alias' value 'Row*'; it borrows storage it does not own") {
+    Row* localFieldReceiver(Tab* t, bool c) { Outer o; return c ? &o.tab.at() : &t.at(); }
+}
+
+expect_error("cannot return an 'alias' value 'Row*'; it borrows storage it does not own") {
+    Row* byValueParam(Tab tv, Tab* t, bool c) { return c ? &tv.at() : &t.at(); }
+}
+
+expect_error("cannot return an 'alias' value 'Row*'; it borrows storage it does not own") {
+    Row* parenthesized(Tab* t, bool c) { Tab local; return (c ? &local.at() : &t.at()); }
+}
+
+expect_error("cannot return an 'alias' value 'Row*'; it borrows storage it does not own") {
+    Row* nullArm(bool c) { Tab local; return c ? &local.at() : nullptr; }
+}
+
+expect_error("cannot return an 'alias' value 'Row*'; it borrows storage it does not own") {
+    Row* bothParams(Tab* a, Tab* b, bool c) { return c ? &a.at() : &b.at(); }
+}
+
+expect_error("cannot return an 'alias' value 'Row*'; it borrows storage it does not own") {
+    Row* globalArm(Tab* t, bool c) { return c ? &g.at() : &t.at(); }
+}
+
+expect_error("cannot return an 'alias' value 'Row*'; it borrows storage it does not own") {
+    Row* heapArm(Tab* t, bool c) { return c ? &t.at() : &gHeap.at(); }
+}
+
+expect_error("cannot return an 'alias' value 'Row*'; it borrows storage it does not own") {
+    Row* paramNullArm(Tab* t, bool c) { return c ? &t.at() : nullptr; }
+}
+
+expect_error("cannot return an 'alias' value 'int*'; it borrows storage it does not own") {
+    int* fieldOfAliasArm(Tab* t, bool c) { return c ? &t.at().v : nullptr; }
+}
+
+extern int main() { return 0; }

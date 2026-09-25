@@ -917,6 +917,8 @@ public:
         // The mode that grant is seeded in: lock(this) / lock(this.write) -> Exclusive,
         // lock(this.read) -> Shared, lock(this.optimistic) -> Optimistic (reads only).
         LockMode LockThisMode = LockMode::Exclusive;
+        // Source spelling for diagnostics when a declaration lowers to a different C++ type.
+        std::string DiagnosticTypeName;
 
         bool IsPrimitive() const
         {
@@ -1160,6 +1162,7 @@ public:
     struct SerializedTav
     {
         std::string TypeName;
+        std::string DiagnosticTypeName;
         std::string VariableName;
         bool Pointer = false;
         bool ElemPointer = false;
@@ -1215,6 +1218,7 @@ public:
         {
             SerializedTav s;
             s.TypeName = t.TypeName;
+            s.DiagnosticTypeName = t.DiagnosticTypeName;
             s.VariableName = t.VariableName;
             s.EnumBacking = t.EnumBacking;
             s.IsScopedEnum = t.IsScopedEnum;
@@ -1273,6 +1277,7 @@ public:
         {
             TypeAndValue t;
             t.TypeName = TypeName;
+            t.DiagnosticTypeName = DiagnosticTypeName;
             t.VariableName = VariableName;
             t.EnumBacking = EnumBacking;
             t.IsScopedEnum = IsScopedEnum;
@@ -6661,6 +6666,32 @@ public:
                                                    const std::string& destDesc);
     llvm::Value* CreateCoreUniqueRawPointerCall(const NamedVariable& arg, const TypeAndValue& param,
                                                 bool calleeIsCxx = false);
+    /*
+     * R5 (ruling 2026-09-23): the `unique` keyword on an imported C++ class or a [cpp] struct IS
+     * std::unique_ptr<T>. Returns the specialization's CFlat name for such a pointee, requesting
+     * it when needed; "" for a CFlat-native pointee (the core unique<T> path). A failed request
+     * returns "" with `error` set; the pre-pass passes report=false and stays silent.
+     */
+    std::string CxxUniquePtrForUniqueKeyword(const std::string& pointee, std::string& error);
+    bool IsCxxUniquePtrPointee(const std::string& pointee) const;
+    // "std.unique_ptr$T" (default deleter) -> "T"; "" for any other type.
+    std::string CxxUniquePtrPointee(const std::string& typeName) const;
+    /*
+     * Raw-pointer adoption into a std::unique_ptr<T> slot - the `unique T* p = new T()` sugar:
+     * constructs `slot` through unique_ptr(pointer) from a T* (or a public-derived pointer, whose
+     * base must have a virtual destructor) or nullptr. False, emitting nothing, when `typeName`
+     * is not a std.unique_ptr or `source` is not such a pointer.
+     */
+    bool TryAdoptRawPointerIntoCxxUniquePtr(const std::string& typeName, llvm::Value* slot,
+                                            const NamedVariable& source,
+                                            const std::string& destDesc,
+                                            const TypeAndValue* targetTypeInfo = nullptr);
+    bool IsOwnedCxxAdoptSource(const NamedVariable& arg) const;
+    bool IsRawPointerForCxxUniquePtr(const std::string& typeName, const NamedVariable& source) const;
+    // Value form for callers that store the result themselves (field initializers).
+    llvm::Value* AdoptRawPointerAsCxxUniquePtrValue(const std::string& typeName,
+                                                    const NamedVariable& source,
+                                                    const std::string& destDesc);
 
     // Rebuild only when the source and destination interfaces actually differ (the common
     // same-interface case stays a plain by-value copy, with no if-chain emitted). The ambiguous
@@ -8380,7 +8411,8 @@ public:
     // Copy-construct (or move-construct when `useMove`) `dest` from the object at `src`.
     // Returns false after LogError when the needed constructor is missing or inaccessible.
     bool EmitCxxCopyOrMoveConstruct(const std::string& typeName, llvm::Value* dest,
-                                    llvm::Value* src, bool useMove, const char* context);
+                                    llvm::Value* src, bool useMove, const char* context,
+                                    const std::string& displayTypeName = {});
     bool EmitCxxByValueParamConstruct(const std::string& typeName, llvm::Value* dest,
                                       llvm::Value* src, bool useMove, const char* context);
     /*
@@ -10032,7 +10064,8 @@ public:
      * timeout). The PCH key still folds the build stamp, since a PCH belongs to the clang that
      * wrote it.
      */
-    static constexpr int kCHeaderCacheVersion = 95;
+    // 96: generated [cpp] member helpers now expose non-override methods to C++ templates.
+    static constexpr int kCHeaderCacheVersion = 96;
     static std::string CompilerBuildStamp();
 
     static std::string GetCHeaderCacheDir();

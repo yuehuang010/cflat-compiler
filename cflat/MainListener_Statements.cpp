@@ -758,6 +758,38 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
                 }
             }
 
+            // R5: `return new T();` / `return move p;` from a `unique T*` (std::unique_ptr<T>)
+            // function adopts the raw pointer; the value is the one evaluated before any nulling.
+            {
+                LLVMBackend::NamedVariable adoptSource = returnNV;
+                if (adoptSource.CallerName.empty()) adoptSource.CallerName = sourceName;
+                if (explicitMove) adoptSource.IsExplicitMove = true;
+                if (compiler->IsRawPointerForCxxUniquePtr(typeName, adoptSource))
+                {
+                    compiler->SetCurrentDebugLocation(errCtx->getStart()->getLine());
+                    if (compiler->TryAdoptRawPointerIntoCxxUniquePtr(typeName, cxxSretDest,
+                                                                     adoptSource, "the return value",
+                                                                     &compiler->currentFunctionReturnTV))
+                    {
+                        finishCxxSretReturn();
+                        return;
+                    }
+                }
+                // A C++ reference result of the pointee is a borrow, never an owner to adopt.
+                const std::string uqPointee = compiler->CxxUniquePtrPointee(typeName);
+                if (!uqPointee.empty() && adoptSource.TypeAndValue.IsAlias
+                    && !adoptSource.TypeAndValue.Pointer
+                    && compiler->ResolveTypeAlias(adoptSource.TypeAndValue.TypeName) == uqPointee)
+                {
+                    const std::string borrowed = LLVMBackend::BorrowedSourceName(adoptSource);
+                    LogErrorContext(errCtx, std::format(
+                        "cannot return borrowed value '{}' as '{}'; the return type owns the pointee - "
+                        "use 'new', a move source, or a move-returning call",
+                        borrowed.empty() ? std::string("expression") : borrowed,
+                        SpellType(*compiler, LLVMBackend::TypeAndValue{ .TypeName = typeName })));
+                    return;
+                }
+            }
             if (source.Storage == nullptr || source.TypeAndValue.TypeName != typeName
                 || source.TypeAndValue.Pointer)
             {
@@ -966,16 +998,24 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
                 }
         }
         /*
-         * `C* f() { return cppRefCall(); }` binds to the referent exactly as the declaration and
-         * `=` forms do (return converts like assignment), base-adjusted for a `Base*` return. The
-         * pointer is a BORROW, never owning: a `unique C*` return keeps the alias marker so the
-         * owned-pointee gate below refuses it, and a reference into a frame-local receiver is
-         * refused here because the object dies at this return.
+         * `C* f() { return cppRefCall(); }` binds to the referent like declaration and `=` forms.
+         * The pointer is borrowed: a non-alias return rejects any receiver or pointer argument
+         * rooted in this frame; alias returns keep the manual lifetime override.
          */
         llvm::Value* cxxRefReturnAddr = nullptr;
+        bool cxxReferenceResultTernaryJoin = false;
         if (!aliasRefReturn && assignExpr != nullptr)
         {
             const auto& retTV = compiler->currentFunctionReturnTV;
+            llvm::Value* cxxReturnSource = returnNV.Storage != nullptr
+                ? returnNV.Storage : returnNV.Primary;
+            auto* returnFunction = compiler->builder->GetInsertBlock() != nullptr
+                ? compiler->builder->GetInsertBlock()->getParent() : nullptr;
+            const auto* returnSymbol = returnFunction != nullptr
+                ? compiler->FindSymbolForFunction(returnFunction) : nullptr;
+            const bool declaredAliasReturn = retTV.IsAlias
+                || (returnSymbol != nullptr && returnSymbol->ReturnsAlias)
+                || (returnFunction != nullptr && returnFunction->getName().contains(".a$"));
             LLVMBackend::TypeAndValue refDest = retTV;
             const bool uniqueDest = !retTV.Pointer && compiler->IsCoreUniqueType(retTV.TypeName);
             if (uniqueDest)
@@ -986,22 +1026,100 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
             }
             cxxRefReturnAddr = compiler->CxxReferenceResultAsPointer(
                 refDest, returnNV, "the return value");
+            if (!declaredAliasReturn && (retTV.Pointer || uniqueDest))
+            {
+                std::unordered_set<llvm::Value*> visited;
+                bool frameRootedReferenceFound = false;
+                bool sawReferenceResultCall = false;
+                bool onlyReferenceResultArms = true;
+                const bool sourceIsJoin = llvm::isa_and_nonnull<llvm::PHINode>(cxxReturnSource)
+                    || llvm::isa_and_nonnull<llvm::SelectInst>(cxxReturnSource);
+                // An argument is frame-rooted directly, or through a nested C++ reference-result
+                // call whose own receiver/arguments are (`local_ref(local_ref(lc))`).
+                std::function<bool(llvm::Value*, unsigned)> argumentRootedInFrame;
+                argumentRootedInFrame = [&](llvm::Value* arg, unsigned depth) -> bool {
+                    if (arg == nullptr || !arg->getType()->isPointerTy()) return false;
+                    if (PointsIntoStackFrame(arg)) return true;
+                    llvm::Value* base = arg->stripPointerCasts();
+                    while (auto* gep = llvm::dyn_cast<llvm::GEPOperator>(base))
+                        base = gep->getPointerOperand()->stripPointerCasts();
+                    auto* inner = llvm::dyn_cast<llvm::CallBase>(base);
+                    if (inner == nullptr || depth > 16 || !compiler->IsAliasValue(inner))
+                        return false;
+                    auto* innerCallee = inner->getCalledFunction();
+                    const auto* innerSym = innerCallee != nullptr
+                        ? compiler->FindSymbolForFunction(innerCallee) : nullptr;
+                    if (innerSym == nullptr || !innerSym->IsCxx || !innerSym->ReturnType.IsAlias
+                        || innerSym->ReturnType.Pointer)
+                        return false;
+                    for (unsigned j = 0; j < inner->arg_size(); ++j)
+                        if (argumentRootedInFrame(inner->getArgOperand(j), depth + 1)) return true;
+                    return false;
+                };
+                std::function<void(llvm::Value*)> rejectFrameRootedReferenceArm;
+                rejectFrameRootedReferenceArm = [&](llvm::Value* value) {
+                    if (value == nullptr || frameRootedReferenceFound) return;
+                    value = value->stripPointerCasts();
+                    if (!visited.insert(value).second) return;
+                    if (auto* phi = llvm::dyn_cast<llvm::PHINode>(value))
+                    {
+                        for (llvm::Value* incoming : phi->incoming_values())
+                            rejectFrameRootedReferenceArm(incoming);
+                        return;
+                    }
+                    if (auto* select = llvm::dyn_cast<llvm::SelectInst>(value))
+                    {
+                        rejectFrameRootedReferenceArm(select->getTrueValue());
+                        rejectFrameRootedReferenceArm(select->getFalseValue());
+                        return;
+                    }
+                    if (auto* gep = llvm::dyn_cast<llvm::GEPOperator>(value))
+                    {
+                        rejectFrameRootedReferenceArm(gep->getPointerOperand());
+                        return;
+                    }
+                    auto* call = llvm::dyn_cast<llvm::CallBase>(value);
+                    if (call == nullptr || !compiler->IsAliasValue(call))
+                    {
+                        onlyReferenceResultArms = false;
+                        return;
+                    }
+                    auto* callee = call->getCalledFunction();
+                    const auto* sym = callee != nullptr ? compiler->FindSymbolForFunction(callee)
+                                                        : nullptr;
+                    if (sym == nullptr || !sym->IsCxx || !sym->ReturnType.IsAlias
+                        || sym->ReturnType.Pointer
+                        || !compiler->IsCxxRecord(sym->ReturnType.TypeName))
+                    {
+                        onlyReferenceResultArms = false;
+                        return;
+                    }
+                    sawReferenceResultCall = true;
+                    for (unsigned i = 0; i < call->arg_size(); ++i)
+                    {
+                        llvm::Value* arg = call->getArgOperand(i);
+                        if (!argumentRootedInFrame(arg, 0)) continue;
+                        const bool isReceiver = sym->IsMethod && i == 0;
+                        const std::string role = isReceiver ? "receiver"
+                            : std::format("argument #{}", i - (sym->IsMethod ? 1 : 0));
+                        LogErrorContext(errCtx, std::format(
+                            "cannot return the C++ reference result of '{}' as '{}': its {} in "
+                            "'{}' "
+                            "refers into a local object that is destroyed when the function "
+                            "returns, so the pointer would dangle; declare the return type "
+                            "'alias {}' to manage the lifetime by hand",
+                            retText, SpellType(*compiler, retTV), role, retText,
+                            SpellType(*compiler, retTV)));
+                        frameRootedReferenceFound = true;
+                        return;
+                    }
+                };
+                rejectFrameRootedReferenceArm(cxxReturnSource);
+                cxxReferenceResultTernaryJoin = sourceIsJoin
+                    && sawReferenceResultCall && onlyReferenceResultArms;
+            }
             if (cxxRefReturnAddr != nullptr)
             {
-                // The call's receiver (`this`, argument 0 of a method) rooted at an alloca is a
-                // local object destroyed at this return; the reference would dangle.
-                auto* call = llvm::dyn_cast<llvm::CallBase>(returnNV.Storage->stripPointerCasts());
-                auto* callee = call != nullptr ? call->getCalledFunction() : nullptr;
-                const auto* sym = callee != nullptr ? compiler->FindSymbolForFunction(callee)
-                                                    : nullptr;
-                if (!retTV.IsAlias && sym != nullptr && sym->IsMethod && call->arg_size() > 0
-                    && PointsIntoStackFrame(call->getArgOperand(0)))
-                    LogErrorContext(errCtx, std::format(
-                        "cannot return the C++ reference result of '{}' as '{}': it refers into "
-                        "a local object that is destroyed when the function returns, so the "
-                        "pointer would dangle; declare the return type 'alias {}' to manage the "
-                        "lifetime by hand",
-                        retText, SpellType(*compiler, retTV), SpellType(*compiler, retTV)));
                 returnNV.Primary = cxxRefReturnAddr;
                 returnNV.BaseType = cxxRefReturnAddr->getType();
                 returnNV.Storage = nullptr;
@@ -1011,6 +1129,57 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
                 returnNV.IsAliasBorrow = false;
                 returnNV.IsOwning = false;
             }
+        }
+        /*
+         * A '?:' of CFlat-native alias results (`c ? &t.at() : nullptr`) drops the
+         * PointsToAliasBorrow provenance the direct form is refused on, for every root. Walk the
+         * join's arms (nested joins, through GEPs) and refuse when any arm is a CFlat alias call
+         * result. C++ reference results are the gate above's; `alias T*` keeps the override.
+         */
+        bool cflatAliasJoinArm = false;
+        if (!aliasRefReturn && assignExpr != nullptr && cxxRefReturnAddr == nullptr
+            && !cxxReferenceResultTernaryJoin && !compiler->currentFunctionReturnTV.IsAlias
+            && compiler->currentFunctionReturnTV.Pointer)
+        {
+            auto isCflatAliasCall = [&](llvm::Value* value) -> bool {
+                auto* call = llvm::dyn_cast<llvm::CallBase>(value);
+                if (call == nullptr || !compiler->IsAliasValue(call)) return false;
+                auto* callee = call->getCalledFunction();
+                const auto* sym = callee != nullptr ? compiler->FindSymbolForFunction(callee)
+                                                    : nullptr;
+                return sym != nullptr && !sym->IsCxx && !sym->ReturnType.Pointer
+                    && (sym->ReturnType.IsAlias || sym->ReturnsAlias);
+            };
+            std::unordered_set<llvm::Value*> visitedArms;
+            std::function<void(llvm::Value*, bool)> walkJoinArms;
+            walkJoinArms = [&](llvm::Value* value, bool underJoin) {
+                if (value == nullptr || cflatAliasJoinArm) return;
+                value = value->stripPointerCasts();
+                if (!visitedArms.insert(value).second) return;
+                if (auto* phi = llvm::dyn_cast<llvm::PHINode>(value))
+                {
+                    for (llvm::Value* incoming : phi->incoming_values())
+                        walkJoinArms(incoming, true);
+                    return;
+                }
+                if (auto* select = llvm::dyn_cast<llvm::SelectInst>(value))
+                {
+                    walkJoinArms(select->getTrueValue(), true);
+                    walkJoinArms(select->getFalseValue(), true);
+                    return;
+                }
+                if (auto* gep = llvm::dyn_cast<llvm::GEPOperator>(value))
+                {
+                    walkJoinArms(gep->getPointerOperand(), underJoin);
+                    return;
+                }
+                // Only a join's arms: a direct return is the PointsToAliasBorrow check's.
+                if (underJoin && isCflatAliasCall(value))
+                    cflatAliasJoinArm = true;
+            };
+            // Only an unnamed '?:' result; a named local (`Row* p = c ? ...; return p;`) is not.
+            if (returnNV.CallerName.empty())
+                walkJoinArms(returnNV.Primary, false);
         }
         bool coreUniqueRawReturn = !aliasRefReturn && cxxRefReturnAddr == nullptr
             && compiler->IsCoreUniqueToRawPointer(returnNV, compiler->currentFunctionReturnTV);
@@ -1065,7 +1234,7 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
                     "cannot return borrowed value '{}' as '{}'; the return type owns the "
                     "pointee - use 'new', a move source, or a move-returning call",
                     sourceName.empty() ? "this expression" : sourceName,
-                    SpellType(*compiler, compiler->currentFunctionReturnTV)));
+                    SpellDiagnosticType(*compiler, compiler->currentFunctionReturnTV)));
             }
             if (returnedNull)
             {
@@ -1574,15 +1743,21 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
                     && !returnNV.FromOwningTempField
                     && !returnNV.IsClosureValueCapture
                     && ReturnSourceIsIndirectOwningLvalue(returnNV, right)));
-        if (!compiler->currentFunctionReturnTV.IsAlias
-            && (SourceIsDanglingAliasBorrow(compiler, returnNV) || returnNV.PointsToAliasBorrow)
-            && !aliasBorrowRootExcused)
+        if (!compiler->currentFunctionReturnTV.IsAlias && !cxxReferenceResultTernaryJoin
+            && (((SourceIsDanglingAliasBorrow(compiler, returnNV)
+                    || returnNV.PointsToAliasBorrow)
+                 && !aliasBorrowRootExcused)
+                || cflatAliasJoinArm))
         {
+            std::string aliasName = returnNV.CallerName.empty()
+                ? SpellType(*compiler, returnNV.TypeAndValue) : returnNV.CallerName;
+            // A '?:' join carries no type name of its own; spell the return type.
+            if (aliasName.empty())
+                aliasName = SpellType(*compiler, compiler->currentFunctionReturnTV);
             LogErrorContext(errCtx, std::format(
                 "cannot return an 'alias' value '{}'; it borrows storage it does not own and "
                 "would dangle. Declare the function 'alias', or use '.copy()' for an owned copy.",
-                returnNV.CallerName.empty() ? SpellType(*compiler, returnNV.TypeAndValue)
-                                            : returnNV.CallerName));
+                aliasName));
         }
 
         // Same hazard through a suppressed (mixed) '?:' join of an owning-value

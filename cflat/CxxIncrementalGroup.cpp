@@ -2,6 +2,8 @@
 
 #include "clang/AST/ASTContext.h"
 #include "clang/AST/Decl.h"
+#include "clang/AST/DeclCXX.h"
+#include "clang/AST/DeclTemplate.h"
 #include "clang/AST/RecursiveASTVisitor.h"
 #include "clang/AST/Stmt.h"
 #include "clang/Basic/Diagnostic.h"
@@ -59,6 +61,73 @@ namespace
         }
     };
 
+    const clang::CXXRecordDecl* IncompleteCflatRecordIn(
+        llvm::ArrayRef<clang::TemplateArgument> args, unsigned depth);
+
+    bool InCflatUserNamespace(const clang::Decl* decl)
+    {
+        for (const clang::DeclContext* scope = decl->getDeclContext(); scope != nullptr;
+             scope = scope->getParent())
+            if (const auto* ns = llvm::dyn_cast<clang::NamespaceDecl>(scope))
+                if (ns->getName() == "__cflat_user") return true;
+        return false;
+    }
+
+    clang::QualType StripIndirection(clang::QualType type)
+    {
+        while (!type.isNull())
+        {
+            type = type.getCanonicalType();
+            if (type->isPointerType() || type->isReferenceType()
+                || type->isMemberPointerType())
+                type = type->getPointeeType();
+            else if (const clang::ArrayType* array = type->getAsArrayTypeUnsafe())
+                type = array->getElementType();
+            else
+                break;
+        }
+        return type;
+    }
+
+    // A not-yet-defined CFlat record named by TYPE, directly or through template arguments.
+    const clang::CXXRecordDecl* IncompleteCflatRecord(clang::QualType type, unsigned depth)
+    {
+        type = StripIndirection(type);
+        if (type.isNull() || depth > 8) return nullptr;
+        const clang::CXXRecordDecl* record = type->getAsCXXRecordDecl();
+        if (record == nullptr) return nullptr;
+        if (const auto* spec = llvm::dyn_cast<clang::ClassTemplateSpecializationDecl>(record))
+            if (const clang::CXXRecordDecl* found =
+                    IncompleteCflatRecordIn(spec->getTemplateArgs().asArray(), depth + 1))
+                return found;
+        return !record->hasDefinition() && InCflatUserNamespace(record) ? record : nullptr;
+    }
+
+    const clang::CXXRecordDecl* IncompleteCflatRecordIn(
+        llvm::ArrayRef<clang::TemplateArgument> args, unsigned depth)
+    {
+        for (const clang::TemplateArgument& arg : args)
+        {
+            const clang::CXXRecordDecl* found = nullptr;
+            if (arg.getKind() == clang::TemplateArgument::Type)
+                found = IncompleteCflatRecord(arg.getAsType(), depth);
+            else if (arg.getKind() == clang::TemplateArgument::Pack)
+                found = IncompleteCflatRecordIn(arg.pack_elements(), depth);
+            if (found != nullptr) return found;
+        }
+        return nullptr;
+    }
+
+    // The incomplete CFlat record under TYPE when TYPE's record was left invalid by it.
+    const clang::CXXRecordDecl* InvalidOverIncompleteCflatRecord(clang::QualType type)
+    {
+        type = StripIndirection(type);
+        if (type.isNull()) return nullptr;
+        const clang::CXXRecordDecl* record = type->getAsCXXRecordDecl();
+        if (record == nullptr || !record->isInvalidDecl()) return nullptr;
+        return IncompleteCflatRecord(type, 0);
+    }
+
     class CountingDiagnosticConsumer : public clang::DiagnosticConsumer
     {
     public:
@@ -66,6 +135,8 @@ namespace
         std::string firstError;
         // First error naming a not-yet-defined CFlat record: no retry can complete that record.
         std::string incompleteRecordError;
+        // Some error names a type built over a not-yet-defined CFlat record.
+        bool incompleteRecordInvolved = false;
         // Lines of the newest interpreter input buffer that an error or its notes point at.
         std::string blamedBuffer;
         std::set<unsigned> blamedLines;
@@ -90,6 +161,11 @@ namespace
             AppendGroupLine(info);
             ++errors;
             Blame(info);
+            for (unsigned i = 0; i < info.getNumArgs() && !incompleteRecordInvolved; ++i)
+                if (info.getArgKind(i) == clang::DiagnosticsEngine::ak_qualtype)
+                    incompleteRecordInvolved = InvalidOverIncompleteCflatRecord(
+                        clang::QualType::getFromOpaquePtr(
+                            reinterpret_cast<void*>(info.getRawArg(i)))) != nullptr;
             if (firstError.empty() || incompleteRecordError.empty())
             {
                 llvm::SmallString<256> text;
@@ -429,8 +505,88 @@ namespace
             neutralized.push_back(function->getQualifiedNameAsString());
         }
 
+        // Only a body over an incomplete CFlat record (or a generated `__cflat_` helper, always
+        // scanned) can reach one of its broken instantiations; other bodies skip the scan.
+        static bool MentionsIncompleteCflatRecord(const clang::FunctionDecl* function)
+        {
+            if (const clang::TemplateArgumentList* args =
+                    function->getTemplateSpecializationArgs())
+                if (IncompleteCflatRecordIn(args->asArray(), 0) != nullptr) return true;
+            for (const clang::DeclContext* scope = function->getDeclContext(); scope != nullptr;
+                 scope = scope->getParent())
+                if (const auto* spec = llvm::dyn_cast<clang::ClassTemplateSpecializationDecl>(scope))
+                    if (IncompleteCflatRecordIn(spec->getTemplateArgs().asArray(), 0) != nullptr)
+                        return true;
+            return false;
+        }
+
+        // First record, among the types a body names, that is invalid over an incomplete CFlat record.
+        struct InvalidRecordUse : clang::RecursiveASTVisitor<InvalidRecordUse>
+        {
+            const clang::CXXRecordDecl* invalid = nullptr;
+            const clang::CXXRecordDecl* incomplete = nullptr;
+            void Check(clang::QualType type)
+            {
+                if (invalid != nullptr) return;
+                incomplete = InvalidOverIncompleteCflatRecord(type);
+                if (incomplete != nullptr)
+                    invalid = StripIndirection(type)->getAsCXXRecordDecl();
+            }
+            bool VisitExpr(clang::Expr* expr)
+            {
+                Check(expr->getType());
+                return invalid == nullptr;
+            }
+            bool VisitValueDecl(clang::ValueDecl* value)
+            {
+                Check(value->getType());
+                return invalid == nullptr;
+            }
+        };
+
+        /*
+         * Under a SFINAE trap, instantiating a node or value record over an incomplete CFlat
+         * record (std::list's __list_node<Leaf>) marks it invalid with no error counted. A body
+         * using it then reaches CodeGen, whose layout query asserts or crashes. Empty and poison
+         * that body, and report the incomplete record so this chunk fails before CodeGen runs.
+         */
+        void RefuseInvalidRecordUse(clang::Decl* decl)
+        {
+            auto* function = llvm::dyn_cast<clang::FunctionDecl>(decl);
+            if (function == nullptr || context == nullptr
+                || !function->doesThisDeclarationHaveABody())
+                return;
+            const clang::IdentifierInfo* id = function->getIdentifier();
+            const bool helper = id != nullptr && id->getName().starts_with("__cflat_");
+            if (!helper && !MentionsIncompleteCflatRecord(function)) return;
+            InvalidRecordUse scan;
+            for (const clang::ParmVarDecl* param : function->parameters())
+                scan.Check(param->getType());
+            scan.Check(function->getReturnType());
+            if (scan.invalid == nullptr) scan.TraverseStmt(function->getBody());
+            if (scan.invalid == nullptr) return;
+            const std::string name = function->getQualifiedNameAsString();
+            const std::string incomplete = scan.incomplete->getQualifiedNameAsString();
+            function->setBody(clang::CompoundStmt::CreateEmpty(*context, /*NumStmts*/ 0,
+                                                               /*HasFPFeatures*/ false));
+            if (poisoned != nullptr)
+                poisoned->emplace(function, std::format(
+                    "the body clang generated for '{}' uses '{}', which is invalid because "
+                    "'{}' is incomplete", name, scan.invalid->getQualifiedNameAsString(),
+                    incomplete));
+            neutralized.push_back(name);
+            clang::DiagnosticsEngine& diagnostics = context->getDiagnostics();
+            const unsigned diagId = diagnostics.getCustomDiagID(clang::DiagnosticsEngine::Error,
+                "incomplete type '%0' used in the definition of '%1'");
+            clang::SourceLocation where = function->getPointOfInstantiation();
+            if (where.isInvalid()) where = function->getLocation();
+            diagnostics.Report(where, diagId) << incomplete << name;
+        }
+
         void Neutralize(clang::Decl* decl)
         {
+            // First, so a body with error nodes over an invalid record still reports it.
+            RefuseInvalidRecordUse(decl);
             EmptyErroneousInstantiation(decl);
             auto* named = llvm::dyn_cast<clang::NamedDecl>(decl);
             const clang::IdentifierInfo* id = named != nullptr ? named->getIdentifier() : nullptr;
@@ -873,6 +1029,9 @@ bool CxxIncrementalGroup::ParseRequest(const cflat_cinterop::ExtractRequest& req
     {
         DiagnosticScope diagnostics(impl_->interpreter->getCompilerInstance()->getDiagnostics());
         diagnostics.consumer.causes = &impl_->causes;
+        // A retry chunk has its explicit instantiations removed (PrepareRetryChunk).
+        const bool explicitInstantiation = chunk.starts_with("template class ")
+            || chunk.find("\ntemplate class ") != std::string::npos;
         announced.clear();
         if (impl_->announcer != nullptr) impl_->announcer->sink = &announced;
         auto ptu = impl_->interpreter->Parse(chunk);
@@ -884,6 +1043,15 @@ bool CxxIncrementalGroup::ParseRequest(const cflat_cinterop::ExtractRequest& req
         if (impl_->announcer != nullptr) impl_->announcer->neutralized.clear();
         if (ptu)
         {
+            // An error raised while instantiating at the end of the chunk does not fail Parse.
+            // One over an incomplete CFlat record leaves nothing sound to harvest.
+            if (explicitInstantiation && !diagnostics.consumer.incompleteRecordError.empty())
+            {
+                error = diagnostics.consumer.incompleteRecordError;
+                impl_->lastDiagnostics += (impl_->lastDiagnostics.empty() ? "" : "\n")
+                    + diagnostics.consumer.allText;
+                return false;
+            }
             parsed = &*ptu;
             parsedAttempt = attempt;
             break;
@@ -907,23 +1075,37 @@ bool CxxIncrementalGroup::ParseRequest(const cflat_cinterop::ExtractRequest& req
             if (name.ends_with("_cpp")) name.resize(name.size() - 4);
             if (renameWrapper(name)) continue;
         }
+        // The failed instantiations keep bodies with error nodes, CodeGen has no guard for
+        // them, and it may already have them queued. Empty them, as the request-TU sweep does.
+        auto emptyFailedFunctions = [&] {
+            clang::ASTContext& context =
+                impl_->interpreter->getCompilerInstance()->getASTContext();
+            for (clang::FunctionDecl* function : diagnostics.consumer.failedFunctions)
+                if (function->doesThisDeclarationHaveABody())
+                {
+                    function->setBody(clang::CompoundStmt::CreateEmpty(
+                        context, /*NumStmts*/ 0, /*HasFPFeatures*/ false));
+                    auto cause = impl_->causes.find(function);
+                    impl_->poisoned.emplace(function, cause != impl_->causes.end()
+                                                          ? cause->second : error);
+                }
+        };
+        // The explicit instantiation left records invalid over an incomplete CFlat record; a
+        // retry would harvest, and emit, bodies built on them. Refuse the request instead.
+        if (explicitInstantiation && (!diagnostics.consumer.incompleteRecordError.empty()
+                                      || diagnostics.consumer.incompleteRecordInvolved))
+        {
+            emptyFailedFunctions();
+            if (!diagnostics.consumer.incompleteRecordError.empty())
+                error = diagnostics.consumer.incompleteRecordError;
+            return false;
+        }
         std::string kept, dropped;
         if (!recoverDeclarations || attempt >= 3
             || !DropBlamedDeclarations(chunk, diagnostics.consumer.blamedLines,
                                        diagnostics.consumer.failedMembers, kept, dropped))
             return false;
-        // The failed instantiations keep bodies with error nodes, CodeGen has no guard for
-        // them, and it may already have them queued. Empty them, as the request-TU sweep does.
-        clang::ASTContext& context = impl_->interpreter->getCompilerInstance()->getASTContext();
-        for (clang::FunctionDecl* function : diagnostics.consumer.failedFunctions)
-            if (function->doesThisDeclarationHaveABody())
-            {
-                function->setBody(clang::CompoundStmt::CreateEmpty(context, /*NumStmts*/ 0,
-                                                                   /*HasFPFeatures*/ false));
-                auto cause = impl_->causes.find(function);
-                impl_->poisoned.emplace(function, cause != impl_->causes.end()
-                                                      ? cause->second : error);
-            }
+        emptyFailedFunctions();
         if (recoveredError.empty()) recoveredError = diagnostics.consumer.incompleteRecordError;
         if (impl_->verbose)
             std::cout << std::format("[verbose] incremental request dropped declarations after "

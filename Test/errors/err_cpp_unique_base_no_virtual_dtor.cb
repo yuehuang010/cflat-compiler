@@ -1,3 +1,4 @@
+import cpp "memory";
 import cpp "cpp_interop_poly.h";
 import cpp "cpp_interop_poly.cpp";
 

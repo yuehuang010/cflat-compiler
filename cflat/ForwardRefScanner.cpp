@@ -458,8 +458,18 @@ LLVMBackend::DeclTypeAndValue ForwardRefScanner::ParseDeclarationSpecifiers(CFla
                     std::vector<std::string> uniqueArgs{ declType.TypeName };
                     if (allocAlignSpecifierValue != 0)
                         uniqueArgs.push_back(std::to_string(allocAlignSpecifierValue));
-                    declType.TypeName = MangleGenericInstance(*compiler, "unique", uniqueArgs);
-                    if ((isParameterDecl || isReturnDecl)
+                    // R5 mirror: a C++ class pointee is std::unique_ptr<T>. Silent on a failed
+                    // request - the main pass owns the diagnostic.
+                    std::string cxxUniqueError;
+                    const std::string cxxUniqueType =
+                        declType.IsFatInterfaceValue() || allocAlignSpecifierValue != 0
+                        ? std::string()
+                        : compiler->CxxUniquePtrForUniqueKeyword(declType.TypeName, cxxUniqueError);
+                    if (!cxxUniqueType.empty())
+                        declType.DiagnosticTypeName = "unique " + SpellType(*compiler, declType);
+                    declType.TypeName = !cxxUniqueType.empty() ? cxxUniqueType
+                        : MangleGenericInstance(*compiler, "unique", uniqueArgs);
+                    if ((isParameterDecl || isReturnDecl) && cxxUniqueType.empty()
                         && compiler->AnyGenericTypeTemplateNamed("unique"))
                     {
                         compiler->CreateStructType(declType.TypeName, {});
@@ -473,7 +483,7 @@ LLVMBackend::DeclTypeAndValue ForwardRefScanner::ParseDeclarationSpecifiers(CFla
                     // The declared type is now the wrapper STRUCT, not the interface it stores.
                     declType.IsInterface = false;
                     declType.IsInterfacePointer = false;
-                    if (isParameterDecl)
+                    if (isParameterDecl && cxxUniqueType.empty())
                         declType.IsMove = true;
                 }
                 if (declSpecWithSuffix->Question())
@@ -1232,7 +1242,14 @@ std::string ForwardRefScanner::ResolveForwardTypeArg(CFlatParser::TypeParameterE
             // Mirror of the MainListener rewrite: a `unique` type ARGUMENT names core unique<X>.
             if (CanDesugarUniqueTypeArg(compilerLLVM, uniqueArgBase, uniqueArgStars > 0,
                                         uniqueArgStars, uniqueArgView, baseIsGenericInstantiation))
+            {
+                std::string cxxUniqueError;
+                std::string cxxUniqueType = uniqueArgStars == 1 && !uniqueArgView
+                    ? compilerLLVM->CxxUniquePtrForUniqueKeyword(uniqueArgBase, cxxUniqueError)
+                    : std::string();
+                if (!cxxUniqueType.empty()) return cxxUniqueType;
                 return MangleGenericInstance(*compilerLLVM, "unique", { uniqueArgBase });
+            }
             // The forward scan must not emit a diagnostic here: expect_error matching and
             // localization are owned by the codegen pass. Returning the ordinary resolved
             // spelling keeps this reject path out of the retired prefix/token scheme.

@@ -260,57 +260,62 @@ class list<T> : IEnumerable<T>, IList<T>, ICopyable<list<T>>
         }
     }
 
-    // Lomuto partition: pivot at _data[hi], returns final pivot index.
-    int _partition(int lo, int hi, Lambda<bool(T, T)> compare)
+    // Imported move-only C++ values cannot pass by-value comparator arguments.
+    // Keep sort available for all CFlat value types, including move-only structs.
+    if const (!is_cpp_class(T) || is_copyable(T))
     {
-        int i = lo - 1;
-        int j = lo;
-        while (j < hi)
+        // Lomuto partition: pivot at _data[hi], returns final pivot index.
+        int _partition(int lo, int hi, Lambda<bool(T, T)> compare)
         {
-            if (compare(_data[j], _data[hi]))
+            int i = lo - 1;
+            int j = lo;
+            while (j < hi)
             {
-                i++;
-                T tmp = _data[i];
-                _data[i] = _data[j];
-                _data[j] = tmp;
+                if (compare(_data[j], _data[hi]))
+                {
+                    i++;
+                    T tmp = _data[i];
+                    _data[i] = _data[j];
+                    _data[j] = tmp;
+                }
+                j++;
             }
-            j++;
+            i++;
+            T tmp = _data[i];
+            _data[i] = _data[hi];
+            _data[hi] = tmp;
+            return i;
         }
-        i++;
-        T tmp = _data[i];
-        _data[i] = _data[hi];
-        _data[hi] = tmp;
-        return i;
-    }
 
-    // Place the median of _data[lo], _data[mid], _data[hi] at position hi.
-    void _medianPivot(int lo, int mid, int hi, Lambda<bool(T, T)> compare)
-    {
-        if (compare(_data[hi], _data[lo])) { T t = _data[lo]; _data[lo] = _data[hi]; _data[hi] = t; }
-        if (compare(_data[mid], _data[lo])) { T t = _data[lo]; _data[lo] = _data[mid]; _data[mid] = t; }
-        if (compare(_data[hi], _data[mid])) { T t = _data[mid]; _data[mid] = _data[hi]; _data[hi] = t; }
-        T tmp = _data[mid];
-        _data[mid] = _data[hi];
-        _data[hi] = tmp;
-    }
+        // Place the median of _data[lo], _data[mid], _data[hi] at position hi.
+        void _medianPivot(int lo, int mid, int hi, Lambda<bool(T, T)> compare)
+        {
+            if (compare(_data[hi], _data[lo])) { T t = _data[lo]; _data[lo] = _data[hi]; _data[hi] = t; }
+            if (compare(_data[mid], _data[lo])) { T t = _data[lo]; _data[lo] = _data[mid]; _data[mid] = t; }
+            if (compare(_data[hi], _data[mid])) { T t = _data[mid]; _data[mid] = _data[hi]; _data[hi] = t; }
+            T tmp = _data[mid];
+            _data[mid] = _data[hi];
+            _data[hi] = tmp;
+        }
 
-    // Recursive quicksort over [lo, hi] using median-of-three pivot selection.
-    void _qsort(int lo, int hi, Lambda<bool(T, T)> compare)
-    {
-        if (lo >= hi) return;
-        int mid = lo + (hi - lo) / 2;
-        _medianPivot(lo, mid, hi, compare);
-        int p = _partition(lo, hi, compare);
-        _qsort(lo, p - 1, compare);
-        _qsort(p + 1, hi, compare);
-    }
+        // Recursive quicksort over [lo, hi] using median-of-three pivot selection.
+        void _qsort(int lo, int hi, Lambda<bool(T, T)> compare)
+        {
+            if (lo >= hi) return;
+            int mid = lo + (hi - lo) / 2;
+            _medianPivot(lo, mid, hi, compare);
+            int p = _partition(lo, hi, compare);
+            _qsort(lo, p - 1, compare);
+            _qsort(p + 1, hi, compare);
+        }
 
-    // Sort in-place using a comparator: compare(a, b) returns true if a should
-    // come before b.  Uses quicksort (O(n log n) average).  Not stable.
-    void sort(Lambda<bool(T, T)> compare)
-    {
-        if (_size > 1)
-            _qsort(0, _size - 1, compare);
+        // Sort in-place using a comparator: compare(a, b) returns true if a should
+        // come before b. Uses quicksort (O(n log n) average). Not stable.
+        void sort(Lambda<bool(T, T)> compare)
+        {
+            if (_size > 1)
+                _qsort(0, _size - 1, compare);
+        }
     }
 
     // Insert value at index, shifting [index, count) up by one slot; index == count() appends.

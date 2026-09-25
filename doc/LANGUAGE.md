@@ -1967,6 +1967,18 @@ if const (is_unique(T))
 }
 ```
 
+`is_copyable(T)` reports whether the current generic element type can be copied. `is_cpp_class(T)`
+reports whether it is an imported C++ class value. These can distinguish a CFlat move-only value
+from a non-copyable C++ class when an operation is constrained by the C++ class ABI, while keeping
+the CFlat value operation available:
+
+```c
+if const (is_cpp_class(T) && !is_copyable(T))
+{
+    // T is an imported C++ class whose copy constructor is unavailable
+}
+```
+
 `compile_error("message")` is a builtin usable inside `if const` in generic code. It
 marks the enclosing method as poisoned for that instantiation; the error only fires if
 the method is actually called (not merely instantiated), which is what lets
@@ -3229,7 +3241,8 @@ Note: `program` remains required at the start of a managed-entry-point definitio
 
 **Reserved compiler intrinsics** (built-in pseudo-functions - cannot be redefined):
 
-`annotationof`, `construct_at`, `embed`, `expect_error`, `is_pointer`, `json_const`, `nameof`,
+`annotationof`, `construct_at`, `embed`, `expect_error`, `is_copyable`, `is_cpp_class`,
+`is_interface`, `is_pointer`, `is_primitive`, `is_string`, `is_unique`, `json_const`, `nameof`,
 `reflect`, `reflect_set`, `sizeof`, `typeof`, `xml_const`
 
 **Compiler-recognized methods** (not reserved - you define them on a type, the

@@ -725,6 +725,13 @@ std::string SpellType(const LLVMBackend& compiler,
     return PrintTypeSpelling(compiler, spelling);
 }
 
+std::string SpellDiagnosticType(const LLVMBackend& compiler,
+                                const LLVMBackend::TypeAndValue& type)
+{
+    return type.DiagnosticTypeName.empty() ? SpellType(compiler, type)
+                                           : type.DiagnosticTypeName;
+}
+
 std::string MangleFunctionSymbol(const LLVMBackend& compiler, std::string_view name,
                                  const LLVMBackend::TypeAndValue& returnType,
                                  const std::vector<LLVMBackend::TypeAndValue>& parameters,

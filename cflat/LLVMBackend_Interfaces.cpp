@@ -506,6 +506,14 @@ void LLVMBackend::ResolveGenericAliasSpelling(std::string& base, std::vector<std
             return;
         }
         base = ResolveGenericBaseAlias(base);
+        // R5: the spelled `unique<T>` over a C++ class IS std::unique_ptr<T>; the caller's C++
+        // request path instantiates it. `unique<T, N>` (aligned) stays core.
+        if (base == "unique" && args.size() == 1 && gts.coreGenericTemplates.count("unique") != 0
+            && IsCxxUniquePtrPointee(args[0]))
+        {
+            base = "std.unique_ptr";
+            args[0] = ResolveTypeAlias(args[0]);
+        }
     }
 
 bool LLVMBackend::IsGenericTemplateKey(const std::string& key) const

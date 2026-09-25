@@ -192,6 +192,11 @@
       "move",
       "copy()"
     ],
+    "cannotadoptborrowedv...oramovereturningcall2be8eab4d99f5d77": [
+      "p",
+      "std.unique_ptr<cpuq.Widget>",
+      "local 'w'"
+    ],
     "cannotarg0arg1arg2fr...oramovereturningcall24368f2be24c7fe1": [
       "reset",
       "unique<Resource>",
@@ -412,6 +417,10 @@
       "a 'void*' value",
       "function<>",
       "(function<...>)value"
+    ],
+    "cannotreturnborrowed...oramovereturningcallb3f87323df3d389a": [
+      "p",
+      "std.unique_ptr<cpuq.Widget>"
     ],
     "cannotreturntheheapa...rriesthecountinsteada0699340cd34f249": [
       "from 'new'",
@@ -1853,6 +1862,7 @@
     "calltoarg0omitsparam...sionpassitexplicitly13c4f1d3258e50d5": "call to '{0}' omits parameter '{1}' whose default argument is not a constant expression; pass it explicitly",
     "calltoarg0parametera...theparameterarg5arg6cdcea6fb1f430195": "call to '{0}': parameter '{1}' BORROWS its argument, so '{2} {3}' transfers nothing - the callee never takes ownership and the value would be orphaned. Drop the '{4}', or declare the parameter '{5} {6}'.",
     "calltoarg0parametera...yorpassacopywitharg4f93457f5afd53b01": "call to '{0}': parameter '{1}' takes ownership of a value this function only borrows ('{2}' is a by-value parameter, so the caller keeps ownership). Accept the parameter as a sink ({3} it in the body), or pass a copy with '{4}'.",
+    "cannotadoptborrowedv...oramovereturningcall2be8eab4d99f5d77": "cannot adopt borrowed value '{0}' into '{1}' for {2} - the source still owns it; use 'new', a 'move' expression, or a move-returning call",
     "cannotarg0arg1arg2fr...oramovereturningcall24368f2be24c7fe1": "cannot {0} {1} '{2}' from a borrowed value - the source still owns it; use 'new', a 'move' expression, or a move-returning call",
     "cannotarg0arg1arg2fr...oramovereturningcall3006f824415239a3": "cannot {0} {1} '{2}' from borrowed value '{3}' - the source still owns it; use 'new', a 'move' expression, or a move-returning call",
     "cannotarg0arg1fromab...oramovereturningcall540141ea59f3ddd7": "cannot {0} {1} from a borrowed value - the source still owns it; use 'new', a 'move' expression, or a move-returning call",
@@ -1902,6 +1912,7 @@
     "cannotrepairtheexter...arationisalreadyused97e1fff5ca82f8ac": "cannot repair the extern '{0}' declaration after ABI lowering was selected: the old declaration is already used",
     "cannotreturnarg0asaa...thanexplicitcastarg3333d4a23a24e8453": "cannot return {0} as a '{1}' value: only a named function, a '{2}' value or a non-capturing lambda converts to a function pointer - a data pointer would be called as code. If the value really holds a code address, assert it with an explicit cast: '{3}'.",
     "cannotreturnarg0asac...thanexplicitcastarg27058792fbe609be6": "cannot return {0} as a closure: only a named function, a '{1}' value or a lambda converts to a closure - a data pointer would be called as code. If the value really holds a code address, assert it with an explicit cast: '{2}'.",
+    "cannotreturnborrowed...oramovereturningcallb3f87323df3d389a": "cannot return borrowed value '{0}' as '{1}'; the return type owns the pointee - use 'new', a move source, or a move-returning call",
     "cannotreturntheheapa...rriesthecountinsteada0699340cd34f249": "cannot return the heap array {0} as '{1}': the element count is lost at the return - return 'array<{2}>' or 'move {3}[]' (which carries the count) instead",
     "cannotreturnthisvalu...ecabireturnaggregateaeb4fb26a401f892": "cannot return this value from extern function: it does not match the C ABI return aggregate",
     "cannotreturnthisvalu...rntypeoffunctionarg0e2e1290e116bcbfc": "cannot return this value: its type does not match the declared return type of function '{0}'",
