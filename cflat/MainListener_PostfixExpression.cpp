@@ -1944,6 +1944,30 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 fieldIndex++;
                             }
 
+                            // [PFX-2-std] A by-value std specialization field of an imported C++
+                            // record is opaque bytes until first access; bind it to its class here.
+                            bool lazyStdField = false;
+                            if (fieldIndex < dataStructure.StructFields.size() && !dataStructure.IsUnion)
+                            {
+                                LLVMBackend::TypeAndValue lazyStdBound;
+                                lazyStdField = Compiler(ctx)->BindLazyCxxStdField(
+                                    dataStructure.StructType, dataStructure.StructFields[fieldIndex], lazyStdBound);
+                                if (lazyStdField)
+                                    static_cast<LLVMBackend::TypeAndValue&>(dataStructure.StructFields[fieldIndex]) = lazyStdBound;
+                            }
+                            // The field's address typed as the class, so every later suffix sees it.
+                            auto lazyStdFieldAddress = [&](llvm::Value* raw) -> llvm::Value* {
+                                auto* classTy = Compiler(ctx)->GetType(dataStructure.StructFields[fieldIndex]);
+                                return Compiler(ctx)->builder->Insert(llvm::GetElementPtrInst::CreateInBounds(
+                                    classTy, raw, { Compiler(ctx)->builder->getInt32(0) }), "stdfield");
+                            };
+                            if (lazyStdField && structVar.Storage == nullptr && structVar.Primary != nullptr)
+                            {
+                                auto* spill = Compiler(ctx)->AllocaAtEntry(structVar.BaseType, nullptr, "stdfield.owner");
+                                Compiler(ctx)->builder->CreateStore(structVar.Primary, spill);
+                                structVar.Storage = spill;
+                            }
+
                             if (fieldIndex < dataStructure.StructFields.size())
                             {
                                 const auto& fieldType = dataStructure.StructFields[fieldIndex];
@@ -1989,6 +2013,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     {
                                         namedVar.UnionFieldType = nullptr;
                                         namedVar.Storage = Compiler(ctx)->CreateStructGEP(structVar.BaseType, structVar.Storage, fieldIndex);
+                                        if (lazyStdField) namedVar.Storage = lazyStdFieldAddress(namedVar.Storage);
                                         if (llvm::isa<llvm::ArrayType>(fieldLLVMType))
                                         {
                                             namedVar.Primary = nullptr;
@@ -2053,6 +2078,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                             // union access in the chain (e.g. union.structField.subField).
                                             namedVar.UnionFieldType = nullptr;
                                             namedVar.Storage = Compiler(ctx)->CreateStructGEP(structVar.BaseType, structVar.Storage, fieldIndex);
+                                            if (lazyStdField) namedVar.Storage = lazyStdFieldAddress(namedVar.Storage);
                                             if (llvm::isa<llvm::ArrayType>(fieldLLVMType))
                                             {
                                                 // Array field: keep GEP pointer; don't load the whole array

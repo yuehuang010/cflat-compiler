@@ -94,6 +94,11 @@
     "arg0thecdefinitionse...moduleflagsorsymbolsf8f4cb84892a598d": [
       "import cpp"
     ],
+    "arg0wasrefusedearlie...inactemplateargument08a79c9c35f57ae4": [
+      "std.list<Leaf>",
+      "Leaf",
+      "Leaf"
+    ],
     "armsdifferinownershi...dmakebotharmsborrows33877404c72b56a3": [
       "new PtrJoinNode()",
       "borrowed"
@@ -191,6 +196,14 @@
       "w",
       "move",
       "copy()"
+    ],
+    "calltoarg0resolvesin...litorcasttomatcharg59f50ca8350c87130": [
+      "cpppa.rank_k",
+      "cpppa.rank_k(double, int)",
+      "1",
+      "int",
+      "double",
+      "cpppa.rank_k(long, long)"
     ],
     "cannotadoptborrowedv...oramovereturningcall2be8eab4d99f5d77": [
       "p",
@@ -1837,6 +1850,7 @@
     "arg0thecdefinitionse...isprogramtargetsarg2765459a78d57c2b9": "{0}: the C++ definitions emitted for an imported header target '{1}', but this program targets '{2}'.",
     "arg0thecdefinitionse...moduleflagsorsymbolsf8f4cb84892a598d": "{0}: the C++ definitions emitted for an imported header could not be linked into this program (conflicting module flags or symbols).",
     "arg0thecdefinitionse...uldnotbereadbackarg11132800ef91716b3": "{0}: the C++ definitions emitted for an imported header could not be read back: {1}",
+    "arg0wasrefusedearlie...inactemplateargument08a79c9c35f57ae4": "'{0}' was refused earlier in this compile because '{1}' was incomplete at that point; declare '{2}' before its first use in a C++ template argument",
     "argumentforinterface...hasnoresolvedstorage7ebcdaffd59e5355": "argument for interface parameter '{0}' of {1} has no resolved storage",
     "armsdifferinownershi...dmakebotharmsborrows33877404c72b56a3": "'?:' arms differ in ownership: '{0}' allocates a value the join cannot own and '{1}' is a borrow of an existing value, so the allocating arm leaks whenever it is taken. Either 'move' the borrowed side into a fresh value so both arms own, or allocate into a named owner before the '?:' and make both arms borrows.",
     "armsdifferinownershi...rmakebotharmsborrows499fceef95c57fab": "'?:' arms differ in ownership: '{0}' is an owning value and '{1}' is a borrow of an existing value. Either 'move' the borrowed side into a fresh value so both arms own, or make both arms borrows.",
@@ -1862,6 +1876,7 @@
     "calltoarg0omitsparam...sionpassitexplicitly13c4f1d3258e50d5": "call to '{0}' omits parameter '{1}' whose default argument is not a constant expression; pass it explicitly",
     "calltoarg0parametera...theparameterarg5arg6cdcea6fb1f430195": "call to '{0}': parameter '{1}' BORROWS its argument, so '{2} {3}' transfers nothing - the callee never takes ownership and the value would be orphaned. Drop the '{4}', or declare the parameter '{5} {6}'.",
     "calltoarg0parametera...yorpassacopywitharg4f93457f5afd53b01": "call to '{0}': parameter '{1}' takes ownership of a value this function only borrows ('{2}' is a by-value parameter, so the caller keeps ownership). Accept the parameter as a sink ({3} it in the body), or pass a copy with '{4}'.",
+    "calltoarg0resolvesin...litorcasttomatcharg59f50ca8350c87130": "call to '{0}' resolves in C++ to {1}, which needs a conversion CFlat does not make implicitly at argument {2} ('{3}' to '{4}'); cast that argument to call it, or cast to match {5}.",
     "cannotadoptborrowedv...oramovereturningcall2be8eab4d99f5d77": "cannot adopt borrowed value '{0}' into '{1}' for {2} - the source still owns it; use 'new', a 'move' expression, or a move-returning call",
     "cannotarg0arg1arg2fr...oramovereturningcall24368f2be24c7fe1": "cannot {0} {1} '{2}' from a borrowed value - the source still owns it; use 'new', a 'move' expression, or a move-returning call",
     "cannotarg0arg1arg2fr...oramovereturningcall3006f824415239a3": "cannot {0} {1} '{2}' from borrowed value '{3}' - the source still owns it; use 'new', a 'move' expression, or a move-returning call",

@@ -1151,6 +1151,27 @@ namespace cppi
     };
     class PrivBoxDerived : private BaseBox<int> { public: int tag = 7; };
     class PubBoxDerived  : public  BaseBox<int> { public: int tag = 9; };
+
+    class HoldsStdVector
+    {
+    public:
+        std::vector<int> v;
+        int tail;
+        HoldsStdVector() : tail(5) { v.push_back(9); }
+    };
+    inline HoldsStdVector make_holds_std_vector() { return HoldsStdVector(); }
+    inline HoldsStdVector holds_std_vector_global;
+
+    struct StatefulLess
+    {
+        bool operator()(int a, int b) const noexcept { return a < b; }
+    };
+    class HoldsCustomMap
+    {
+    public:
+        std::map<int, int, StatefulLess> m;
+        HoldsCustomMap() { m[4] = 97; }
+    };
 }
 
 extern int cppi_nsobj_global;   // global-scope C++ object: no mangling at all

@@ -4639,6 +4639,7 @@ void LLVMBackend::ResetForReanalysis()
     cxxNontrivialRecords_.clear();
     cxxClasses_.clear();
     cxxRecordEntries_.clear();
+    cxxOpaqueFieldOwners_.clear();
     cxxRecordSpellingIndex_.clear();
     cxxRecordSpellingIndexDirty_ = true;
     cxxRefusedMemberRebindInFlight_.clear();
@@ -4793,6 +4794,7 @@ void LLVMBackend::ResetForReanalysis()
     unwindInitFloors_.clear();
     unwindPartial_.clear();
     unwindCallConsumedTemps_.clear();
+    cflatExternBodyNames_.clear();
     moveTransferConsumedTemps_.clear();
     pendingOwnedPtrTemps.clear();
     ownedReturnTemps_.clear();
@@ -6934,6 +6936,14 @@ static llvm::json::Object SerializeFuncSym(const std::string& key, const FS& s)
         o["cxxrq"] = s.CxxRefQualifier;
     if (!s.IsNoexcept)  o["nx"] = true;
     if (s.ReturnsAlias) o["ra"] = true;
+    if (s.HasCFlatBody) o["cb"] = true;
+    if (s.CannotUnwind) o["nu"] = true;
+    if (!s.NoUnwindExternDeps.empty())
+    {
+        llvm::json::Array nd;
+        for (const auto& n : s.NoUnwindExternDeps) nd.push_back(n);
+        o["nud"] = std::move(nd);
+    }
     if (s.IsMethod)     o["m"]  = true;
     if (!s.RequiredLocks.empty())
     {
@@ -7073,6 +7083,7 @@ bool LLVMBackend::CompileCoreOnly(const std::string& platform)
         EmitDeferredFullDestructorBodies();
         ResolveOwnedReleaseGates();
     }
+    InferCoreNoUnwind();
     return true;
 }
 
@@ -7743,6 +7754,11 @@ bool LLVMBackend::LoadCoreBitcodeIfFresh(const std::string& cacheDir, const std:
             if (auto v = fo->getBoolean("nx")) sym.IsNoexcept = !*v;
             if (auto* ab = fo->getObject("cxxabi")) sym.CxxAbi = DeserializeCxxAbi(*ab);
             if (auto v = fo->getBoolean("ra")) sym.ReturnsAlias = *v;
+            if (auto v = fo->getBoolean("cb")) sym.HasCFlatBody = *v;
+            if (auto v = fo->getBoolean("nu")) sym.CannotUnwind = *v;
+            if (auto* nd = fo->getArray("nud"))
+                for (auto& ne : *nd)
+                    if (auto v = ne.getAsString()) sym.NoUnwindExternDeps.push_back(v->str());
             if (auto v = fo->getBoolean("m"))  sym.IsMethod = *v;
             if (auto* rl = fo->getArray("rl"))
                 for (auto& le : *rl)

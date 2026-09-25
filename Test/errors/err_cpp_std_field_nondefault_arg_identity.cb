@@ -1,0 +1,12 @@
+import cpp "cpp_interop_basic.h";
+
+extern int main()
+{
+    cppi.HoldsCustomMap holder = cppi.HoldsCustomMap();
+    if (holder.m.size() != 1) return 1;
+    expect_error("cannot assign to C++ class 'std.map<int, int>' from this expression") {
+        std.map<int, int> defaultMap = default;
+        defaultMap = holder.m;
+    }
+    return 0;
+}

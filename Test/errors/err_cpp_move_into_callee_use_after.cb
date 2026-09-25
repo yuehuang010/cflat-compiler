@@ -1,4 +1,5 @@
 import cpp "cpp_interop_poly.h";
+import cpp "memory";
 
 expect_error("use of moved variable 'owner'") {
     void use_after_move()
@@ -6,6 +7,15 @@ expect_error("use of moved variable 'owner'") {
         cpppoly.Shape* owner = new cpppoly.Shape();
         cpppoly.destroy_through(move owner);
         _ = owner->plain();
+    }
+}
+
+expect_error("use of moved variable 'owner'") {
+    void unique_derived_owner_use_after_move()
+    {
+        unique cpppoly.Circle* owner = new cpppoly.Circle();
+        cpppoly.destroy_through(move owner);
+        _ = owner->area();
     }
 }
 

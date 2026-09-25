@@ -30,6 +30,9 @@ public:
     inline int value() const noexcept { return v_; }
     // By-value MEMBER call result.
     inline Life twice() const noexcept { return Life(v_ * 2); }
+    inline Life& ref() noexcept { return *this; }
+    inline const Life& const_ref() const noexcept { return *this; }
+    inline Life* ptr() noexcept { return this; }
     // By-value MEMBER operator result.
     inline Life operator-(const Life& o) const noexcept { return Life(v_ - o.v_); }
     int v_;
@@ -56,5 +59,6 @@ inline MoveOnly operator+(const MoveOnly& a, const MoveOnly& b) noexcept { retur
 inline Life operator+(const Life& a, const Life& b) noexcept { return Life(a.v_ + b.v_); }
 // By-value free-function result.
 inline Life make_life(int v) noexcept { return Life(v); }
+inline int read_life(Life value) noexcept { return value.value(); }
 
 } // namespace cppas

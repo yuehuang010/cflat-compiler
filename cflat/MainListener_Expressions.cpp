@@ -7023,6 +7023,21 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
             cxxLvalueStorageJoin = cxxStoragePhi;
         }
         const bool collapsedLvalueJoin = collapseStorageJoin && cxxLvalueStorageJoin != nullptr;
+        auto isOwnedCxxTempArm = [&](llvm::Value* value, llvm::Value* storage) {
+            if (value == nullptr || storage == nullptr || !value->getType()->isStructTy())
+                return false;
+            auto* structType = llvm::cast<llvm::StructType>(value->getType());
+            if (!structType->hasName()
+                || !compiler->IsForeignNontrivialCxxClass(structType->getName().str()))
+                return false;
+            LLVMBackend::NamedVariable arm;
+            arm.Primary = value;
+            arm.Storage = storage;
+            arm.TypeAndValue.TypeName = structType->getName().str();
+            return compiler->IsOwnedTempValue(arm);
+        };
+        const bool bothOwnedCxxTempArms = isOwnedCxxTempArm(trueValue, trueStorage)
+            && isOwnedCxxTempArm(falseValue, falseStorage);
         if (compiler->currentFunctionReturnTV.IsAlias || trueAlias || falseAlias)
         {
             auto* storagePhi = compiler->builder->CreatePHI(
@@ -7102,7 +7117,8 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
         result.isAlias = trueAlias || falseAlias;
         result.storage = storageJoin != nullptr ? storageJoin : cxxLvalueStorageJoin;
         result.receiverStorage = cxxLvalueStorageJoin;
-        result.isRvalue = cxxRecordJoin && cxxLvalueStorageJoin == nullptr;
+        result.isRvalue = cxxRecordJoin
+            && (cxxLvalueStorageJoin == nullptr || bothOwnedCxxTempArms);
         return result;
     }
 
@@ -12436,6 +12452,31 @@ bool MainListener::EmitForeignCxxValueIntoSlot(
             compiler->lastCxxRetValue_ = nullptr;
             return true;
         }
+        // A C++ value ternary joins the selected sret slots with a storage PHI. The branch
+        // temporaries are still individually tracked, so move from the selected slot and flush
+        // those temporaries after the destination has taken the value.
+        auto* valuePhi = llvm::dyn_cast<llvm::PHINode>(sourceValue);
+        auto* storagePhi = llvm::dyn_cast_or_null<llvm::PHINode>(sourceNV.Storage);
+        bool ownedCxxTempJoin = sameClass && valuePhi != nullptr && storagePhi != nullptr
+            && valuePhi->getNumIncomingValues() == storagePhi->getNumIncomingValues();
+        for (unsigned i = 0; ownedCxxTempJoin && i < valuePhi->getNumIncomingValues(); ++i)
+        {
+            LLVMBackend::NamedVariable arm;
+            arm.Primary = valuePhi->getIncomingValue(i);
+            arm.Storage = storagePhi->getIncomingValue(i);
+            arm.TypeAndValue.TypeName = destType.TypeName;
+            ownedCxxTempJoin = compiler->IsOwnedTempValue(arm);
+        }
+        if (ownedCxxTempJoin)
+        {
+            compiler->EmitCxxCopyOrMoveConstruct(destType.TypeName, destination,
+                                                 sourceNV.Storage,
+                                                 /*useMove*/ true, context);
+            compiler->FlushOwnedTempsSince(ownedTempMark, nullptr, nullptr);
+            compiler->lastCxxRetTemp_ = nullptr;
+            compiler->lastCxxRetValue_ = nullptr;
+            return true;
+        }
         if (retTemp == nullptr && sameClass && sourceNV.Storage != nullptr)
         {
             compiler->EmitCxxCopyOrMoveConstruct(destType.TypeName, destination,
@@ -15155,6 +15196,44 @@ LLVMBackend::NamedVariable MainListener::ParseNewExpression(CFlatParser::NewExpr
                 SpellType(*compiler, LLVMBackend::TypeAndValue{ .TypeName = typeName })));
             return {};
         }
+        const std::string allocOperator = isArray ? "operator new[]" : "operator new";
+        const std::string deleteOperator = isArray ? "operator delete[]" : "operator delete";
+        auto selectedAllocAccess = [&](const std::string& name) -> std::optional<int> {
+            std::vector<std::string> work{ typeName };
+            std::set<std::string> seen;
+            for (size_t i = 0; i < work.size(); ++i)
+            {
+                if (!seen.insert(work[i]).second) continue;
+                const auto* info = compiler->GetCxxClassInfo(work[i]);
+                if (info == nullptr) continue;
+                if (auto it = info->memberAccess.find(name); it != info->memberAccess.end())
+                    return it->second;
+                if (auto it = info->refusedMembers.find(name); it != info->refusedMembers.end())
+                {
+                    if (it->second == "is private") return cflat_cinterop::AccessPrivate;
+                    if (it->second == "is protected") return cflat_cinterop::AccessProtected;
+                }
+                if (auto it = compiler->functionTable.find(work[i] + "." + name);
+                    it != compiler->functionTable.end() && !it->second.empty())
+                    return cflat_cinterop::AccessPublic;
+                for (const auto& base : info->bases)
+                    if (!base.isVirtual) work.push_back(base.name);
+            }
+            return std::nullopt;
+        };
+        auto allocAccess = selectedAllocAccess(allocOperator);
+        auto deleteAccess = selectedAllocAccess(deleteOperator);
+        const std::string denied = allocAccess && *allocAccess != cflat_cinterop::AccessPublic
+            ? allocOperator
+            : deleteAccess && *deleteAccess != cflat_cinterop::AccessPublic
+                ? deleteOperator : std::string{};
+        if (!denied.empty())
+        {
+            LogErrorContext(ctx, std::format(
+                "cannot 'new' C++ class '{}': its class-level '{}' is not accessible here",
+                SpellType(*compiler, LLVMBackend::TypeAndValue{ .TypeName = typeName }), denied));
+            return {};
+        }
         /*
          * M4b - `new T(args)` on a foreign C++ class with a user constructor: allocate storage,
          * then invoke the selected C++ constructor. CFlat's own `new` would zero-fill and drop
@@ -16181,6 +16260,43 @@ LLVMBackend::NamedVariable MainListener::ParseDeleteExpression(CFlatParser::Dele
         auto* constCount = llvm::dyn_cast_or_null<llvm::ConstantInt>(cxxArrayCount);
         const bool knownCxxArray = cxxAllocator
             && (viewOperand || (constCount != nullptr && !constCount->isNegative()));
+        if (cxxAllocator && !viewOperand && !isArray && !isRawFree && !elemIsPtr
+            && cxxArrayCount != nullptr && constCount == nullptr
+            && compiler->CxxHasVirtualDestructor(typeName))
+        {
+            auto* fn = compiler->builder->GetInsertBlock()->getParent();
+            auto* arrayBB = llvm::BasicBlock::Create(*compiler->context, "cxxdelete.runtime.array", fn);
+            auto* singleBB = llvm::BasicBlock::Create(*compiler->context, "cxxdelete.runtime.single", fn);
+            auto* doneBB = llvm::BasicBlock::Create(*compiler->context, "cxxdelete.runtime.done", fn);
+            auto* nonNullBB = llvm::BasicBlock::Create(*compiler->context, "cxxdelete.runtime.nonnull", fn);
+            auto* nullPtr = llvm::ConstantPointerNull::get(
+                llvm::cast<llvm::PointerType>(ptrVal->getType()));
+            auto* count = compiler->builder->CreateSExtOrTrunc(
+                cxxArrayCount, compiler->builder->getInt64Ty());
+            compiler->builder->CreateCondBr(
+                compiler->builder->CreateICmpEQ(ptrVal, nullPtr), doneBB, nonNullBB);
+            compiler->builder->SetInsertPoint(nonNullBB);
+            compiler->builder->CreateCondBr(
+                compiler->builder->CreateICmpSGE(count, compiler->builder->getInt64(0)),
+                arrayBB, singleBB);
+            compiler->builder->SetInsertPoint(arrayBB);
+            compiler->EmitCountedArrayDestruction(ptrVal, typeName, count);
+            auto* voidPtr = compiler->builder->CreateBitCast(
+                ptrVal, cflat_llvm::PointerTo(compiler->builder->getInt8Ty()));
+            compiler->EmitCxxHeapFreeArray(typeName, voidPtr, count, operandAllocAlign);
+            compiler->builder->CreateBr(doneBB);
+            compiler->builder->SetInsertPoint(singleBB);
+            compiler->EmitCxxVirtualDelete(typeName, ptrVal);
+            compiler->builder->CreateBr(doneBB);
+            compiler->builder->SetInsertPoint(doneBB);
+            if (srcAlloca != nullptr && srcAllocaElemType != nullptr)
+                if (auto* ptrTy = llvm::dyn_cast<llvm::PointerType>(srcAllocaElemType))
+                {
+                    compiler->builder->CreateStore(llvm::ConstantPointerNull::get(ptrTy), srcAlloca);
+                    compiler->StoreRawArrayLength(operandNamedVar, nullptr);
+                }
+            return {};
+        }
         if (!isArray && !isRawFree && !elemIsPtr && !typeName.empty() && !knownCxxArray
             && compiler->CxxHasVirtualDestructor(typeName))
         {

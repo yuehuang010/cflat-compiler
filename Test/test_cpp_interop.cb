@@ -97,6 +97,9 @@
 //     the runtime-loop walk, `new T[n]` constant and runtime, CFlat element types, array fields,
 //     the synthesized copy), of `class` / `program` / `[cpp] struct` fields, and interface
 //     method calls as invokes (3261-3281).
+//   An `extern` CFlat function called before its body is emitted, around core helpers that stay
+//     plain calls (3282-3285); a core helper whose C callee the program defines stays an invoke
+//     (3286-3287).
 // `import cpp` selects C++ mode; the extension is irrelevant (the fixture header is a plain
 // .h). The header supplies the declarations, the .cpp is compiled by the host C++ driver
 // and linked in. Both are needed: the header alone has no definitions, and the source alone
@@ -159,7 +162,7 @@
 //     C++ field and array element as the destination, self-assignment, and a '?:' of two
 //     temporaries, which must MOVE-assign (or move-construct into a released destination).
 //     Test/errors/err_cpp_move_only_lvalue_assign.cb pins the move-only lvalue refusal.
-//   Class-scope allocation functions (3350-3366): `new T` / `delete p` of a C++ class with a
+//   Class-scope allocation functions (3350-3368): `new T` / `delete p` of a C++ class with a
 //     class-level operator new / delete (own, inherited, sized, through unique T* and unique<T>,
 //     the deleting destructor, a throwing constructor, a trivial class), and `new T[n]` of a C++
 //     class allocated and freed through the SAME family - ::operator new[] / delete[] or the
@@ -212,6 +215,8 @@
 //     assignments, arguments, base conversions, and nested conditionals (3550-3559).
 //   C++ reference-result return gates agree across `&`, argument roots, pointer fields, and
 //     conditional returns, while alias returns retain their override (3560-3569).
+//   Variadic and inherited C++ constructors preserve mutable lvalue references without copies
+//     across variadic reference packs and mixed by-value arguments (3580-3583).
 
 import cpp "library/cpp_interop_basic.h";
 import cpp "library/cpp_interop_refgate.h";
@@ -243,6 +248,7 @@ import "library/cpp_interop_globals.cb";
 import cpp "library/cpp_interop_usingns.h";
 // A C++ CONSTRUCTOR parameter declared `T&` binds the argument's address.
 import cpp "library/cpp_interop_ctorref.h";
+import cpp "library/cpp_interop_varctor.h";
 import cpp "library/cpp_interop_freeoptpl.h";
 // `explicit` constructors are not implicit conversions at a call argument; the non-explicit
 // converting constructor in the same header is the accept set. Rejections: err_cpp_explicit_ctor.cb.
@@ -258,7 +264,7 @@ import "unique.cb";
 // global operator new/delete with counting ones; heap_audit counts CFlat string/closure/`new` blocks.
 import cpp "library/cpp_interop_unwind.h";
 import cpp "library/cpp_interop_unwind.cpp";
-// Class-scope operator new / delete / new[] / delete[] (legs 3350-3366).
+// Class-scope operator new / delete / new[] / delete[] (legs 3350-3368).
 import cpp "library/cpp_interop_opnew.h";
 import "diagnostic/heap_audit.cb";
 // Standard streams: one grouped std import (stringstream is not visible through a user header alone).
@@ -703,6 +709,28 @@ int UnwArrAcceptAll(int x)
     delete r;
     return v;
 }
+// An `extern` CFlat function called ahead of its body (UnwLaterExtern, defined at the end of this
+// file) may unwind: pre-fix it was taken for a C prototype, the call stayed a plain `call` and
+// the caller's live locals were never destroyed (3282-3284).
+int UnwFwdExternTr(int x)
+{
+    cppunw.Tr t = cppunw.Tr(1);
+    return UnwLaterExtern(x) + 1;
+}
+int UnwFwdExternOwn(int x)
+{
+    UnwOwn o = default;
+    o.v = x;
+    return UnwLaterExtern(x) + 1;
+}
+// Core helpers proven not to unwind (string length, compare) stay plain calls around the throw.
+int UnwCoreHelpers(int x)
+{
+    cppunw.Tr t = cppunw.Tr(1);
+    string s = "abcd";
+    int n = s.length() + (s == "abcd" ? 10 : 0);
+    return UnwLaterExtern(x) + n;
+}
 
 // Pre-fix the C++ scoped enum initializer was rejected as non-constant at file scope. This value
 // leg also proves the folded global retains its enum type when passed to an enum-typed parameter.
@@ -818,7 +846,7 @@ int StrmThrowingInsert(int v)
     f << b;
     return 0;
 }
-// Class-scope allocation functions (legs 3350-3366). cppon counts every class-level operator,
+// Class-scope allocation functions (legs 3350-3368). cppon counts every class-level operator,
 // cppunw every global one (new[] / delete[] apart from new / delete), heap_audit every CFlat block.
 int OnUniqueCls(int x) { unique cppon.Cls* p = new cppon.Cls(x); return p->get(); }
 int OnUniqueLib(int x) { unique<cppon.Cls> p = new cppon.Cls(x); return p->get(); }
@@ -3994,6 +4022,29 @@ extern int main()
         r = cppunw.guarded(UnwArrAcceptAll, 7);
         if (r != 7 || cppunw.live() != 0 || cppunw.dtors() != 25
             || (int)HeapAudit.reportLeaks() != heapBase) return 3281;
+        cppunw.reset();
+        r = cppunw.guarded(UnwFwdExternTr, 5);
+        if (r != -5 || cppunw.live() != 0 || cppunw.dtors() != 1) return 3282;
+        unwOwnDtors = 0;
+        r = cppunw.guarded(UnwFwdExternOwn, 6);
+        if (r != -6 || unwOwnDtors != 1) return 3283;
+        cppunw.reset();
+        heapBase = (int)HeapAudit.reportLeaks();
+        r = cppunw.guarded(UnwCoreHelpers, 5);
+        if (r != -5 || cppunw.live() != 0 || cppunw.dtors() != 1
+            || (int)HeapAudit.reportLeaks() != heapBase) return 3284;
+        // Accept set: nothing thrown, the helper values arrive and the local is destroyed once.
+        cppunw.reset();
+        r = cppunw.guarded(UnwCoreHelpers, 0);
+        if (r != 14 || cppunw.live() != 0 || cppunw.dtors() != 1) return 3285;
+        // Refusal side: core toLong was proven through the body-less atoll, which this program
+        // defines in CFlat (throwing when armed), so the call to toLong must stay an invoke.
+        cppunw.reset();
+        r = cppunw.guarded(UnwCoreOverridden, 5);
+        if (r != -5 || cppunw.live() != 0 || cppunw.dtors() != 1) return 3286;
+        cppunw.reset();
+        r = cppunw.guarded(UnwCoreOverridden, 0);
+        if (r != 42 || cppunw.live() != 0 || cppunw.dtors() != 1) return 3287;
     }
     // Trivially-copyable imported C++ classes still need their user constructors on `new` (3220-3226).
     {
@@ -4370,7 +4421,7 @@ extern int main()
         if (t.size() != 112 || t.substr(56, 4) != std.string(" and")) return 3339;
     }
 
-    // ---- Class-scope operator new / delete, and `new T[n]` of a C++ class (3350-3366) ----------
+    // ---- Class-scope operator new / delete, and `new T[n]` of a C++ class (3350-3368) ----------
     // `new T` / `delete p` call the class's own operator new / delete (inherited through a base,
     // the sized delete given sizeof(T)); `new T[n]` pairs ::operator new[] (or the class's
     // operator new[]) with the matching delete[] on every free site. Pre-fix every single object
@@ -4486,6 +4537,17 @@ extern int main()
         onV = onT->a + onT->b;
         delete onT;
         if (onV != 0 || cppon.clsNew() != 1 || cppon.clsDel() != 1) return 3366;
+
+        // A runtime delete count destroys every polymorphic element before one array free.
+        cppunw.reset();
+        cppon.reset();
+        cppon.Poly* onPr = new cppon.Poly[onArrN];
+        delete onPr;
+        if (cppon.dtors() != onArrN || cppon.live() != 0 || cppon.clsNew() != 0
+            || cppon.clsDel() != 0 || cppon.clsNewArr() != 0 || cppon.clsDelArr() != 0
+            || cppunw.newArrs() != 1 || cppunw.deleteArrs() != 1 || cppunw.deletes() != 0)
+            return 3368;
+
     }
 
     // By-value C++ last-use identity: counts include the transfer into each CFlat helper.
@@ -5344,5 +5406,133 @@ extern int main()
         || RgAlias() != &cpprefgate.cell() || RgAliasAmp() != &cpprefgate.cell()) return 3568;
     delete rgHeap;
     if (cpprefgate.cell().v != 43 || cpprefgate.other_cell().v != 47) return 3569;
+
+    // ---- C++ value ternaries keep temporary ownership through every destination (3570-3579) ----
+    for (int i = 0; i < 2; i++)
+    {
+        cppas.Life a = cppas.Life(3);
+        cppas.Life b = cppas.Life(4);
+        cppas.Life t = cppas.Life(100);
+        bool c = i == 0;
+        cppas.Life.reset();
+        t = c ? a + b : a.twice();
+        int expected = c ? 7 : 6;
+        if (t.value() != expected || cppas.Life.ctors != 1 || cppas.Life.copies != 0
+            || cppas.Life.moves != 0 || cppas.Life.move_assigns != 1
+            || cppas.Life.copy_assigns != 0 || cppas.Life.dtors != 1
+            || cppas.Life.last_dtor != -1) return 3570;
+    }
+
+    for (int i = 0; i < 2; i++)
+    {
+        bool c = i == 0;
+        int expected = c ? 21 : 22;
+        cppas.Life.reset();
+        {
+            CppAssignHost h = { l = c ? cppas.Life(21) : cppas.Life(22) };
+            if (h.l.value() != expected || cppas.Life.ctors != 2 || cppas.Life.copies != 0
+                || cppas.Life.moves != 1 || cppas.Life.dtors != 2
+                || cppas.Life.last_dtor != -1) return 3571;
+        }
+        if (cppas.Life.dtors != 3 || cppas.Life.last_dtor != expected) return 3571;
+    }
+
+    for (int i = 0; i < 2; i++)
+    {
+        bool c = i == 0;
+        cppas.Life.reset();
+        int value = cppas.read_life(c ? cppas.Life(41) : cppas.Life(42));
+        int expected = c ? 41 : 42;
+        if (value != expected || cppas.Life.ctors != 1 || cppas.Life.copies != 0
+            || cppas.Life.moves != 1 || cppas.Life.dtors != 2
+            || cppas.Life.last_dtor != expected) return 3572;
+    }
+
+    for (int i = 0; i < 2; i++)
+    {
+        cppas.Life a = cppas.Life(51);
+        cppas.Life b = cppas.Life(52);
+        bool c = i == 0;
+        int expected = c ? 51 : 52;
+        cppas.Life.reset();
+        cppas.Life* selected = c ? a.ptr() : b.ptr();
+        if (selected->value() != expected || cppas.Life.ctors != 0
+            || cppas.Life.moves != 0 || cppas.Life.copies != 0
+            || cppas.Life.dtors != 0) return 3573;
+    }
+    // ---- C++ variadic and inherited constructor references preserve the caller (3580-3583) ----
+    cppvarctor.reset();
+    {
+        cppvarctor.Cnt c = cppvarctor.Cnt(10);
+        cppvarctor.VariadicL v = cppvarctor.VariadicL(c);
+        if (c.value != 11 || cppvarctor.copies() != 0 || cppvarctor.moves() != 0) return 3580;
+    }
+    if (cppvarctor.ctors() != 1 || cppvarctor.dtors() != 1) return 3580;
+
+    cppvarctor.reset();
+    {
+        cppvarctor.Cnt c = cppvarctor.Cnt(20);
+        cppvarctor.VariadicR v = cppvarctor.VariadicR(c);
+        if (c.value != 21 || cppvarctor.copies() != 0 || cppvarctor.moves() != 0) return 3581;
+    }
+    if (cppvarctor.ctors() != 1 || cppvarctor.dtors() != 1) return 3581;
+
+    cppvarctor.reset();
+    {
+        cppvarctor.Cnt c = cppvarctor.Cnt(30);
+        cppvarctor.Derived d = cppvarctor.Derived(c);
+        if (c.value != 31 || cppvarctor.copies() != 0 || cppvarctor.moves() != 0) return 3582;
+    }
+    if (cppvarctor.ctors() != 1 || cppvarctor.dtors() != 1) return 3582;
+
+    cppvarctor.reset();
+    {
+        cppvarctor.Cnt c = cppvarctor.Cnt(40);
+        cppvarctor.Mixed m = cppvarctor.Mixed(c, 7);
+        if (c.value != 41 || m.value != 7 || cppvarctor.copies() != 0
+            || cppvarctor.moves() != 0) return 3583;
+    }
+    if (cppvarctor.ctors() != 1 || cppvarctor.dtors() != 1) return 3583;
+    cppi.HoldsStdVector holdsStdVector = cppi.HoldsStdVector();
+    if (holdsStdVector.v.size() != 1 || holdsStdVector.v[0] != 9
+        || holdsStdVector.tail != 5) return 3570;
+    holdsStdVector.v.push_back(10);
+    if (holdsStdVector.v.size() != 2 || holdsStdVector.v[1] != 10) return 3571;
+    std.vector<int> sameStdVector = holdsStdVector.v;
+    if (sameStdVector.size() != 2 || sameStdVector[0] != 9) return 3572;
+    // The std field binds from any receiver: call result, element, header global, pointer.
+    if (cppi.make_holds_std_vector().v[0] != 9 || cppi.make_holds_std_vector().v.size() != 1) return 3573;
+    std.vector<cppi.HoldsStdVector> holdsStdVectors = default;
+    holdsStdVectors.push_back(cppi.make_holds_std_vector());
+    if (holdsStdVectors[0].v[0] != 9 || holdsStdVectors[0].v.size() != 1) return 3574;
+    if (cppi.holds_std_vector_global.v[0] != 9 || cppi.holds_std_vector_global.tail != 5) return 3575;
+    cppi.HoldsStdVector* holdsStdVectorPtr = &holdsStdVector;
+    holdsStdVectorPtr->v[0] = 11;
+    if (holdsStdVector.v[0] != 11 || holdsStdVectorPtr->v[1] != 10) return 3576;
     return 0;
+}
+
+// A CFlat body for a C name core relies on (legs 3286-3287): core's toLong binds to it here.
+int unwAtollArm = 0;
+extern i64 atoll(const char* str)
+{
+    if (unwAtollArm > 0) cppunw.thrower(unwAtollArm);
+    i64 v = 0;
+    for (int i = 0; str[i] >= '0' && str[i] <= '9'; i++) v = v * 10 + (i64)(str[i] - '0');
+    return v;
+}
+int UnwCoreOverridden(int x)
+{
+    cppunw.Tr t = cppunw.Tr(1);
+    string s = "42";
+    unwAtollArm = x;
+    int v = (int)s.toLong();
+    unwAtollArm = 0;
+    return v;
+}
+
+// Defined after its callers on purpose (legs 3282-3285): see UnwFwdExternTr.
+extern int UnwLaterExtern(int x)
+{
+    return cppunw.thrower(x);
 }

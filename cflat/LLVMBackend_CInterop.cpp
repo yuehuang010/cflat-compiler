@@ -2747,6 +2747,94 @@ static std::string CxxMemberValueSpelling(const std::string& spelling)
         return out;
 }
 
+static std::string CxxFieldIdentitySpelling(const std::string& spelling)
+{
+        const std::string value = CxxMemberValueSpelling(spelling);
+        const size_t open = value.find('<');
+        const size_t close = value.rfind('>');
+        if (open == std::string::npos || close == std::string::npos || close < open) return value;
+
+        std::vector<std::string> args;
+        size_t start = open + 1;
+        int depth = 0;
+        for (size_t i = start; i <= close; ++i)
+        {
+            const char ch = i == close ? ',' : value[i];
+            if (ch == '<') ++depth;
+            else if (ch == '>') --depth;
+            else if (ch == ',' && depth == 0)
+            {
+                std::string arg = value.substr(start, i - start);
+                const size_t first = arg.find_first_not_of(" \t");
+                const size_t last = arg.find_last_not_of(" \t");
+                if (first != std::string::npos) arg = arg.substr(first, last - first + 1);
+                args.push_back(CxxFieldIdentitySpelling(arg));
+                start = i + 1;
+            }
+        }
+        if (args.empty()) return value;
+
+        const std::string base = value.substr(0, open);
+        auto isDefaultArg = [&](size_t index) -> std::string
+        {
+            if (args.empty()) return {};
+            const std::string& first = args[0];
+            const std::string second = args.size() > 1 ? args[1] : std::string();
+            if (base == "std::vector" && index == 1)
+                return "std::allocator<" + first + ">";
+            if (base == "std::unique_ptr" && index == 1)
+                return "std::default_delete<" + first + ">";
+            if (base == "std::basic_string")
+            {
+                if (index == 1) return "std::char_traits<" + first + ">";
+                if (index == 2) return "std::allocator<" + first + ">";
+            }
+            if (base == "std::map" || base == "std::multimap")
+            {
+                if (index == 2) return "std::less<" + first + ">";
+                if (index == 3)
+                    return "std::allocator<std::pair<const " + first + ", " + second + ">>";
+            }
+            if (base == "std::unordered_map" || base == "std::unordered_multimap")
+            {
+                if (index == 2) return "std::hash<" + first + ">";
+                if (index == 3) return "std::equal_to<" + first + ">";
+                if (index == 4)
+                    return "std::allocator<std::pair<const " + first + ", " + second + ">>";
+            }
+            if (base == "std::set" || base == "std::multiset")
+            {
+                if (index == 1) return "std::less<" + first + ">";
+                if (index == 2) return "std::allocator<" + first + ">";
+            }
+            if (base == "std::unordered_set" || base == "std::unordered_multiset")
+            {
+                if (index == 1) return "std::hash<" + first + ">";
+                if (index == 2) return "std::equal_to<" + first + ">";
+                if (index == 3) return "std::allocator<" + first + ">";
+            }
+            return {};
+        };
+        std::vector<bool> defaults(args.size(), false);
+        for (size_t i = 1; i < args.size(); ++i)
+        {
+            const std::string expected = isDefaultArg(i);
+            defaults[i] = !expected.empty() && args[i] == CxxFieldIdentitySpelling(expected);
+        }
+
+        size_t identityArgCount = args.size();
+        while (identityArgCount > 1 && defaults[identityArgCount - 1])
+            --identityArgCount;
+        std::string result = base + "<";
+        for (size_t i = 0; i < identityArgCount; ++i)
+        {
+            if (i != 0) result += ", ";
+            result += args[i];
+        }
+        result += ">";
+        return result;
+}
+
 static std::string CxxDefaultWrapperName(const std::string& linkageName, size_t omittedArity)
 {
         std::string out = "__cflat_dflt_";
@@ -10174,6 +10262,93 @@ void LLVMBackend::CollectCxxMemberRequestItems(const std::vector<CRecordEntry>& 
         }
 }
 
+/*
+ * A by-value `std::` specialization field of an imported C++ record is laid out as opaque bytes
+ * of clang's size and alignment (RegisterCRecords). The first member access through such a field
+ * requests the specialization under its default-trimmed CFlat identity and returns the field's
+ * class type; the owner's layout never changes, so a program that never touches the field issues
+ * no request. False (field stays opaque) when it is not such a field or the request fails.
+ */
+bool LLVMBackend::BindLazyCxxStdField(llvm::StructType* owner, const TypeAndValue& stored,
+                                      TypeAndValue& bound)
+{
+        if (owner == nullptr || stored.ConstArraySize == 0 || stored.Pointer
+            || stored.VariableName.empty() || !stored.ConstInnerDimensions.empty()
+            || (stored.TypeName != "u8" && stored.TypeName != "u16" && stored.TypeName != "u32"
+                && stored.TypeName != "u64"))
+            return false;
+        auto ownerIt0 = cxxOpaqueFieldOwners_.find(owner);
+        if (ownerIt0 == cxxOpaqueFieldOwners_.end()) return false;
+        const std::string ownerName = ownerIt0->second;
+        auto dataIt = dataStructures.find(ownerName);
+        if (dataIt == dataStructures.end() || dataIt->second.StructType != owner
+            || cxxRecords_.count(ownerName) == 0)
+            return false;
+        auto recordIt = cxxRecordEntries_.find(ownerName);
+        if (recordIt == cxxRecordEntries_.end() || recordIt->second.name.starts_with("std."))
+            return false;
+        const CRecordFieldEntry* field = nullptr;
+        for (const CRecordFieldEntry& f : recordIt->second.fields)
+            if (f.name == stored.VariableName) { field = &f; break; }
+        if (field == nullptr || field->isBitfield || field->sizeBytes == 0) return false;
+
+        const std::string spelling = CxxMemberValueSpelling(field->ctype);
+        const bool isStringAlias = spelling == "std::string";
+        if ((spelling.find('<') == std::string::npos && !isStringAlias)
+            || spelling.find("__cflat_user::") != std::string::npos
+            || spelling.find("type-parameter-") != std::string::npos
+            || (!isStringAlias && spelling.rfind("std::", 0) != 0))
+            return false;
+        int angleDepth = 0;
+        for (char ch : field->ctype)
+        {
+            if (ch == '<') ++angleDepth;
+            else if (ch == '>' && angleDepth > 0) --angleDepth;
+            else if (angleDepth == 0 && (ch == '*' || ch == '&' || ch == '[')) return false;
+        }
+        const std::string identity = cflat_cinterop::CxxForeignIdentity(
+            CxxFieldIdentitySpelling(spelling));
+        if (identity.empty()) return false;
+
+        if (cxxForeignRequests_.count(identity) == 0 || cxxForeignDefinitions_.count(identity) == 0)
+        {
+            auto ownerIt = cxxTypeOwnerGroup_.find(ownerName);
+            if (ownerIt == cxxTypeOwnerGroup_.end()) return false;
+            CxxRequestGroup group = MakeCxxRequestGroup(ownerIt->second, {});
+            if (group.headers.empty()) return false;
+            CxxRequestGroupScope groupScope(*this, &group);
+            std::string error;
+            if (!RequestCxxForeignType(identity, spelling, error, /*needDefinitions*/ true,
+                                       /*explicitInstantiation*/ true))
+                return false;
+        }
+        else if (!cxxForeignRequests_[identity].empty())
+            return false;
+
+        TypeAndValue mapped;
+        if (!MapCTypeToTypeAndValue(spelling, mapped, /*cxxBoundary*/ true) || mapped.Pointer
+            || mapped.ConstArraySize != 0 || cxxRecords_.count(mapped.TypeName) == 0)
+            return false;
+        auto* classTy = GetType(mapped);
+        if (classTy == nullptr || !classTy->isSized()) return false;
+        const llvm::DataLayout& dl = module->getDataLayout();
+        const uint64_t size = (uint64_t)dl.getTypeAllocSize(classTy);
+        const uint64_t align = (uint64_t)dl.getABITypeAlign(classTy).value();
+        if (size != field->sizeBytes || align > field->alignBytes)
+        {
+            LogError(std::format("C++ field '{}' of '{}' has type '{}' whose CFlat layout "
+                                 "({} bytes, align {}) differs from C++ ({} bytes, align {}); "
+                                 "it stays opaque storage",
+                                 field->name, DisplayCxxClassName(ownerName), spelling, size, align,
+                                 field->sizeBytes, field->alignBytes));
+            return false;
+        }
+        bound = mapped;
+        bound.VariableName = stored.VariableName;
+        bound.GuardedBy = stored.GuardedBy;
+        return true;
+}
+
 void LLVMBackend::RequestCxxMemberTypes(const std::vector<CRecordEntry>& records,
                                         const std::string& prefixSource,
                                         bool incompletePrefix)
@@ -10352,10 +10527,15 @@ bool LLVMBackend::TryRequestCxxType(const std::string& baseName,
 
 bool LLVMBackend::DecodeCxxIncompleteTemplateError(const std::string& error,
                                                     std::string& spelling,
-                                                    std::string& typeName) const
+                                                    std::string& typeName,
+                                                    bool* refusedEarlier) const
 {
-        constexpr std::string_view marker = "\x1f" "CFLAT_INCOMPLETE_CPP_TEMPLATE" "\x1f";
-        if (!error.starts_with(marker)) return false;
+        constexpr std::string_view current = "\x1f" "CFLAT_INCOMPLETE_CPP_TEMPLATE" "\x1f";
+        constexpr std::string_view earlier = "\x1f" "CFLAT_REFUSED_INCOMPLETE_CPP_TEMPLATE" "\x1f";
+        const bool isEarlier = error.starts_with(earlier);
+        if (!isEarlier && !error.starts_with(current)) return false;
+        if (refusedEarlier != nullptr) *refusedEarlier = isEarlier;
+        const std::string_view marker = isEarlier ? earlier : current;
         const size_t split = error.find('\n', marker.size());
         if (split == std::string::npos) return false;
         spelling = error.substr(marker.size(), split - marker.size());
@@ -10470,6 +10650,33 @@ bool LLVMBackend::RequestCxxType(const std::string& baseName, const std::vector<
         std::unordered_set<std::string> incompleteTypes;
         GeneratedCxxDefinitionsFor(typeArgs, generatedTypeSource, generatedDependencyGroups,
                                     incompleteTypes);
+        /*
+         * A refusal over an incomplete argument is keyed on the full specialization. clang keeps
+         * the invalid instantiation in the live TU, so a use after the struct is defined cannot
+         * bind either; it is refused naming the earlier cause instead of blaming the import.
+         */
+        const std::string incompleteKey = cflatName + "\x1f" "INCOMPLETE";
+        if (auto it = cxxForeignRequests_.find(incompleteKey); it != cxxForeignRequests_.end())
+        {
+            if (!incompleteTypes.empty())
+            {
+                error = it->second;
+                return false;
+            }
+            std::string refusedSpelling;
+            std::string refusedType;
+            DecodeCxxIncompleteTemplateError(it->second, refusedSpelling, refusedType);
+            error = std::string("\x1f" "CFLAT_REFUSED_INCOMPLETE_CPP_TEMPLATE" "\x1f")
+                + SpellType(*this, TypeAndValue{ .TypeName = cflatName }) + "\n"
+                + SpellType(*this, TypeAndValue{ .TypeName = refusedType });
+            return false;
+        }
+        auto rememberIncomplete = [&](bool ok) {
+            std::string spelled, incompleteName;
+            if (!ok && DecodeCxxIncompleteTemplateError(error, spelled, incompleteName))
+                cxxForeignRequests_[incompleteKey] = error;
+            return ok;
+        };
         if (activeCxxRequestGroup_ != nullptr)
         {
             const bool ok = RequestCxxForeignType(cflatName, spelling, error,
@@ -10481,7 +10688,7 @@ bool LLVMBackend::RequestCxxType(const std::string& baseName, const std::vector<
             if (!ok && !incompleteTypes.empty() && baseName != "std.shared_ptr")
                 error = std::string("\x1f" "CFLAT_INCOMPLETE_CPP_TEMPLATE" "\x1f") + spelling + "\n"
                     + *incompleteTypes.begin();
-            return ok;
+            return rememberIncomplete(ok);
         }
 
         // A type spelled by CFlat code: find the import that owns the template, and bring in the
@@ -10502,7 +10709,7 @@ bool LLVMBackend::RequestCxxType(const std::string& baseName, const std::vector<
         if (!ok && !incompleteTypes.empty() && baseName != "std.shared_ptr")
             error = std::string("\x1f" "CFLAT_INCOMPLETE_CPP_TEMPLATE" "\x1f") + spelling + "\n"
                 + *incompleteTypes.begin();
-        return ok;
+        return rememberIncomplete(ok);
 }
 
 /*
@@ -10564,7 +10771,9 @@ bool LLVMBackend::RequestCxxTypeInOwningGroup(const std::string& cxxBase,
                                 "'{}' - tried {}", missing, spelling, names);
         else
             error = std::format("no imported C++ header declares '{}' - tried {}", cxxBase, names);
-        cxxForeignRequests_[cflatName] = error;
+        // A refusal over a still-incomplete CFlat argument is not memoized as a missing
+        // header; RequestCxxType keys it on the specialization's incomplete refusal instead.
+        if (!retryable) cxxForeignRequests_[cflatName] = error;
         return false;
     }
 
@@ -11204,6 +11413,7 @@ void LLVMBackend::RegisterCRecords(std::vector<CRecordEntry>& records, const std
                 continue;
             }
             std::vector<DeclTypeAndValue> fields;
+            bool anyOpaqueBlob = false;   // candidate for BindLazyCxxStdField
             bool ok = true;
             std::string badFieldName;
             std::string badFieldType;
@@ -11375,6 +11585,7 @@ void LLVMBackend::RegisterCRecords(std::vector<CRecordEntry>& records, const std
                         if (verbose) std::cout << std::format("[verbose]   C++ struct '{}': field '{}' of type '{}' embedded as {} opaque bytes\n",
                             r.name, f.name, f.ctype, f.sizeBytes);
                         fields.push_back(std::move(blob));
+                        anyOpaqueBlob = true;
                         continue;
                     }
                     badFieldName = f.name;
@@ -11475,6 +11686,7 @@ void LLVMBackend::RegisterCRecords(std::vector<CRecordEntry>& records, const std
                         if (verbose) std::cout << std::format("[verbose]   C++ struct '{}': field '{}' has no layout for type '{}' (its record was refused or never registered); embedded as {} opaque bytes\n",
                             r.name, d.VariableName, d.TypeName, r.fields[fi].sizeBytes);
                         d = std::move(blob);
+                        anyOpaqueBlob = true;
                         continue;
                     }
                     if (verbose) std::cout << std::format("[verbose]   skipping C {} '{}': field '{}' has incomplete (unsized) type '{}'\n",
@@ -11505,8 +11717,13 @@ void LLVMBackend::RegisterCRecords(std::vector<CRecordEntry>& records, const std
             if (r.isUnion)
                 CreateUnionType(r.name, fields, r.isCxx ? r.alignBytes : 0);
             else
+            {
                 CreateStructType(r.name, fields, r.isCxx ? r.alignBytes : 0,
                     anyBitfields ? &packedBitfields : nullptr, r.isCxx && r.isPacked);
+                if (r.isCxx && anyOpaqueBlob)
+                    if (auto it = dataStructures.find(r.name); it != dataStructures.end())
+                        cxxOpaqueFieldOwners_[it->second.StructType] = r.name;
+            }
             if (r.isCxx)
             {
                 cxxRecords_.insert(r.name);

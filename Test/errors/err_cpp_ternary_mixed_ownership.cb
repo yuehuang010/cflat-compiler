@@ -1,3 +1,5 @@
+import cpp "../library/cpp_interop_assign.h";
+
 struct TernaryOwnership
 {
     int value = 0;
@@ -17,5 +19,35 @@ expect_error("'?:' arms differ in ownership") {
         TernaryOwnership target = default;
         target = true ? borrowed : default;
         return 0;
+    }
+}
+
+expect_error("'?:' arms differ in ownership: 'a + b' is an owning value and 'b' is a borrow") {
+    void cppNamedBorrow(bool c)
+    {
+        cppas.Life a = cppas.Life(3);
+        cppas.Life b = cppas.Life(4);
+        cppas.Life target = cppas.Life(0);
+        target = c ? a + b : b;
+    }
+}
+
+expect_error("'?:' arms differ in ownership: 'a + b' is an owning value and 'a.ref()' is a borrow") {
+    void cppRefBorrow(bool c)
+    {
+        cppas.Life a = cppas.Life(3);
+        cppas.Life b = cppas.Life(4);
+        cppas.Life target = cppas.Life(0);
+        target = c ? a + b : a.ref();
+    }
+}
+
+expect_error("'?:' arms differ in ownership: 'a + b' is an owning value and 'a.const_ref()' is a borrow") {
+    void cppConstRefBorrow(bool c)
+    {
+        cppas.Life a = cppas.Life(3);
+        cppas.Life b = cppas.Life(4);
+        cppas.Life target = cppas.Life(0);
+        target = c ? a + b : a.const_ref();
     }
 }

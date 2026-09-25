@@ -6907,7 +6907,15 @@ public:
     {
         std::string spelling;
         std::string typeName;
-        if (Compiler(ctx)->DecodeCxxIncompleteTemplateError(errorMessage, spelling, typeName))
+        bool refusedEarlier = false;
+        const bool incomplete = Compiler(ctx)->DecodeCxxIncompleteTemplateError(
+            errorMessage, spelling, typeName, &refusedEarlier);
+        if (incomplete && refusedEarlier)
+            Compiler(ctx)->LogErrorMessage(
+                "'{}' was refused earlier in this compile because '{}' was incomplete at that "
+                "point; declare '{}' before its first use in a C++ template argument",
+                { spelling, typeName, typeName });
+        else if (incomplete)
             Compiler(ctx)->LogErrorMessage(
                 "'{}' needs the complete definition of [cpp] struct '{}'; define the struct before this use",
                 { spelling, typeName });

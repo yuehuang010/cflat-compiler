@@ -2095,6 +2095,37 @@ bool LLVMBackend::TernaryArmJoinsOwning(llvm::Value* arm)
         if (auto* c = llvm::dyn_cast<llvm::Constant>(arm); c != nullptr && c->isNullValue()) return true;
         if (IsOwningPtrTempValue(arm) || IsMovedOutPtrValue(arm)
             || RawArrayResultOwns(arm)) return true;
+        // A nontrivial C++ value returned by value is held in a tracked sret slot. Its loaded
+        // SSA value is an owning temporary even though C++ records are not CFlat owning structs.
+        std::unordered_set<const llvm::Value*> visiting;
+        auto ownsCxxTemp = [&](auto&& self, const llvm::Value* value) -> bool {
+            if (value == nullptr || !visiting.insert(value).second) return false;
+            auto* st = llvm::dyn_cast<llvm::StructType>(value->getType());
+            if (st == nullptr || !st->hasName()
+                || !IsForeignNontrivialCxxClass(st->getName().str()))
+            {
+                visiting.erase(value);
+                return false;
+            }
+            bool owns = false;
+            if (auto* phi = llvm::dyn_cast<llvm::PHINode>(value); phi != nullptr)
+            {
+                owns = phi->getNumIncomingValues() != 0;
+                for (unsigned i = 0; owns && i < phi->getNumIncomingValues(); ++i)
+                    owns = self(self, phi->getIncomingValue(i));
+            }
+            if (!owns)
+            {
+                NamedVariable temp;
+                temp.Primary = const_cast<llvm::Value*>(value);
+                if (auto* load = llvm::dyn_cast<llvm::LoadInst>(value))
+                    temp.Storage = const_cast<llvm::Value*>(load->getPointerOperand());
+                owns = IsOwnedTempValue(temp);
+            }
+            visiting.erase(value);
+            return owns;
+        };
+        if (ownsCxxTemp(ownsCxxTemp, arm)) return true;
         // An INTERFACE fat value and a by-value OWNING STRUCT both own through the owning-RETURN
         // release ledger, which the pointer-only IsOwningPtrTempValue cannot see. A plain LOAD of
         // a named local/parameter is never in that
@@ -4539,12 +4570,112 @@ bool LLVMBackend::CalleeMayUnwind(const FunctionSymbol& symbol) const
         if (!cppInteropUsed_) return false;
         if (symbol.IsCxx) return !symbol.IsNoexcept;
         if (symbol.IsCInteropDeclaration) return false;
+        if (symbol.CannotUnwind
+            && std::none_of(symbol.NoUnwindExternDeps.begin(), symbol.NoUnwindExternDeps.end(),
+                            [&](const std::string& n) { return cflatExternBodyNames_.count(n) != 0; }))
+            return false;
         llvm::Function* fn = symbol.Function;
         if (fn == nullptr) return true;
         if (fn->isIntrinsic() || fn->doesNotThrow()) return false;
         // A body-less `extern` prototype names a C function (malloc, printf); a CFlat
         // function body can reach a throwing C++ callee transitively.
-        return !(symbol.External && fn->isDeclaration());
+        return !(symbol.External && fn->isDeclaration() && !symbol.HasCFlatBody);
+}
+
+/*
+ * Proves a complete core body cannot unwind: every call is direct and reaches an intrinsic, a
+ * nounwind function, a C prototype without function-pointer parameters, or a core body proven
+ * the same way. An indirect call, an invoke, inline asm, a C++ callee, a function whose address
+ * escapes as a value (a callback) and any recursion (a cycle is never proven) all refuse.
+ */
+size_t LLVMBackend::InferCoreNoUnwind()
+{
+        std::unordered_map<const llvm::Function*, std::vector<FunctionSymbol*>> symbolsOf;
+        for (auto& [key, syms] : functionTable)
+            for (auto& sym : syms)
+                if (sym.Function != nullptr) symbolsOf[sym.Function].push_back(&sym);
+
+        enum class State { Visiting, Proven, Refused };
+        std::unordered_map<const llvm::Function*, State> state;
+        std::unordered_map<const llvm::Function*, std::set<std::string>> deps;
+        std::function<bool(const llvm::Function*)> prove = [&](const llvm::Function* f) -> bool {
+            if (f->isIntrinsic() || f->doesNotThrow()) return true;
+            if (auto it = state.find(f); it != state.end()) return it->second == State::Proven;
+            // A synthesized helper (destructor, implicit ctor) has no symbol; its body decides.
+            auto symIt = symbolsOf.find(f);
+            if (symIt == symbolsOf.end() && f->isDeclaration()) return false;
+            if (symIt != symbolsOf.end())
+                for (const FunctionSymbol* sym : symIt->second)
+                    if (sym->IsCxx || !sym->IsNoexcept) return false;
+            if (f->isDeclaration())
+            {
+                // A body-less C prototype; a function-pointer parameter may call back into CFlat.
+                for (const FunctionSymbol* sym : symIt->second)
+                {
+                    if (!sym->External || sym->HasCFlatBody) return false;
+                    for (const auto& p : sym->Parameters)
+                        if (p.IsFunctionPointer) return false;
+                }
+                deps[f] = { f->getName().str() };
+                return true;
+            }
+            state[f] = State::Visiting;
+            bool ok = true;
+            for (const auto& bb : *f)
+            {
+                for (const auto& inst : bb)
+                {
+                    const auto* call = llvm::dyn_cast<llvm::CallBase>(&inst);
+                    if (call != nullptr)
+                    {
+                        const llvm::Function* callee = call->getCalledFunction();
+                        if (llvm::isa<llvm::InvokeInst>(call) || call->isInlineAsm()
+                            || callee == nullptr || !prove(callee))
+                            ok = false;
+                        else if (auto d = deps.find(callee); d != deps.end())
+                        {
+                            const std::set<std::string> calleeDeps = d->second;
+                            deps[f].insert(calleeDeps.begin(), calleeDeps.end());
+                        }
+                    }
+                    for (const auto& op : inst.operands())
+                    {
+                        if (call != nullptr && &op == &call->getCalledOperandUse()) continue;
+                        if (llvm::isa<llvm::Function>(op.get()->stripPointerCasts())) ok = false;
+                    }
+                    if (!ok) break;
+                }
+                if (!ok) break;
+            }
+            state[f] = ok ? State::Proven : State::Refused;
+            return ok;
+        };
+
+        size_t marked = 0;
+        for (auto& [fn, syms] : symbolsOf)
+        {
+            if (fn->isDeclaration() || !prove(fn)) continue;
+            const auto d = deps.find(fn);
+            for (FunctionSymbol* sym : syms)
+            {
+                sym->CannotUnwind = true;
+                if (d != deps.end())
+                    sym->NoUnwindExternDeps.assign(d->second.begin(), d->second.end());
+            }
+            ++marked;
+        }
+        return marked;
+}
+
+void LLVMBackend::NoteCFlatExternBody(const std::string& functionName, const std::string& linkageName)
+{
+        cflatExternBodyNames_.insert(linkageName);
+        auto it = functionTable.find(functionName);
+        if (it == functionTable.end()) return;
+        for (auto& sym : it->second)
+            if (sym.External && !sym.IsCxx && !sym.IsCInteropDeclaration && sym.Function != nullptr
+                && sym.Function->getName() == linkageName)
+                sym.HasCFlatBody = true;
 }
 
 uint64_t LLVMBackend::UnwindInitFloorForDepth(size_t depth) const

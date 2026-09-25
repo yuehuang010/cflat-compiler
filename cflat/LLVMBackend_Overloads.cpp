@@ -312,9 +312,188 @@ int LLVMBackend::RankIntegerConversion(const std::string& argIdentity, const std
         return 1 + paramBits;
 }
 
+/*
+ * Ranks only what C++ ranks without further context: arithmetic to arithmetic (by value or
+ * through a `const T&`), a class value to its own class, and a class value through a conversion
+ * operator to an arithmetic parameter. Enums, pointers, views, other references and every
+ * other class binding stay -1, so a candidate carrying one is never compared. Rank -2 marks the
+ * implicit object parameter of a member, equal only to another member's.
+ */
+std::vector<LLVMBackend::CxxConversionRank> LLVMBackend::RankCxxConversionSequences(
+        const std::vector<NamedVariable>& arguments, const FunctionSymbol& candidate) const
+{
+        auto integerBits = [](const std::string& name) {
+            TypeAndValue probe;
+            probe.TypeName = name;
+            return probe.IsInteger();
+        };
+        // Character types promote to their underlying type, not to `int`; leave them unjudged.
+        auto arithmeticName = [&](const std::string& name) -> std::string {
+            if (name == "bool" || name == "float" || name == "double") return name;
+            if (name == "wchar" || name == "c16" || name == "c32" || name == "c8") return "";
+            return integerBits(name) > 0 ? CanonicalPrimitiveTypeName(name) : "";
+        };
+        auto argumentIdentity = [&](const NamedVariable& arg) -> std::string {
+            const TypeAndValue& tv = arg.TypeAndValue;
+            if (tv.Pointer || tv.ElemPointer || tv.IsArrayView || tv.ConstArraySize > 0 || tv.IsSimd
+                || tv.IsFunctionPointer || tv.IsInterface || tv.IsScopedEnum
+                || enumBackingTypes.count(tv.TypeName) != 0 || IsScopedEnumTypeName(tv.TypeName)
+                || arg.BaseType == nullptr)
+                return "";
+            if (arg.BaseType->isIntegerTy(1))
+                return "bool";
+            if (arg.BaseType->isIntegerTy())
+                return arithmeticName(IntegerArgumentIdentity(arg));
+            if (!arg.BaseType->isFloatTy() && !arg.BaseType->isDoubleTy())
+                return "";
+            // An unsuffixed floating literal is a C++ `double` even where it lowers as a float.
+            for (const std::string* recorded : { &arg.LiteralIdentity, &tv.TypeName, &arg.InferSourceTypeName })
+                if (*recorded == "float" || *recorded == "double")
+                    return *recorded;
+            if (!tv.TypeName.empty() || !arg.InferSourceTypeName.empty())
+                return "";
+            return arg.BaseType->isFloatTy() ? "float" : "double";
+        };
+        auto arithmeticRank = [&](const std::string& from, const std::string& to) {
+            if (from == to) return 0;
+            if (from == "float" && to == "double") return 1;
+            // Integral promotion: bool and every integer type narrower than int, to int.
+            if (to == "int" && (from == "bool" || (integerBits(from) > 0 && integerBits(from) < 32)))
+                return 1;
+            return 2;
+        };
+
+        std::vector<CxxConversionRank> ranks(arguments.size());
+        for (size_t i = 0; i < arguments.size() && i < candidate.Parameters.size(); ++i)
+        {
+            const NamedVariable& arg = arguments[i];
+            const TypeAndValue& param = candidate.Parameters[i];
+            CxxConversionRank& out = ranks[i];
+            // The implicit object parameter (`this` on an imported C++ member); its cv-qualifier
+            // comes from the Itanium mangling, and a name that does not show it stays unjudged.
+            if (candidate.IsMethod && i == 0
+                && (param.VariableName.ends_with("__") || (candidate.IsCxx && param.VariableName == "this")))
+            {
+                // Only a receiver of the member's own class is judged: a same-named member of
+                // another class is not a candidate at all, and derived receivers stay unjudged.
+                if (candidate.UniqueName.starts_with("_ZN") && arg.TypeAndValue.TypeName == param.TypeName)
+                {
+                    out.rank = -2;
+                    out.second = candidate.UniqueName.starts_with("_ZNK") ? 1 : 0;
+                    out.second += candidate.CxxRefQualifier * 2;
+                    out.cxxViable = true;
+                }
+                continue;
+            }
+            // A C++ reference parameter is an address-passed alias; only its referent is ranked.
+            const bool reference = param.IsAlias || param.IsRvalueRef;
+            if ((param.Pointer && !reference) || param.ElemPointer || param.IsArrayView || param.ConstArraySize > 0
+                || param.IsSimd || param.IsFunctionPointer || param.IsInterface
+                || param.IsCxxRefToPointer || param.IsScopedEnum
+                || enumBackingTypes.count(param.TypeName) != 0 || IsScopedEnumTypeName(param.TypeName))
+                continue;
+            const bool constReference = reference && !param.IsRvalueRef
+                && (param.IsCxxConstRef
+                    || CxxReferenceParameterSpelling(candidate, i).rfind("const ", 0) == 0);
+
+            const TypeAndValue& at = arg.TypeAndValue;
+            if (!at.Pointer && !at.ElemPointer && !at.TypeName.empty() && IsCxxRecord(at.TypeName))
+            {
+                if (param.TypeName == at.TypeName)
+                {
+                    // Same class: an identity binding. C++ viability is proved only for a
+                    // `const T&`, which binds any object of the class.
+                    if (!param.IsRvalueRef)
+                        out.rank = 0;
+                    out.cxxViable = constReference;
+                    continue;
+                }
+                if (reference && !constReference)
+                    continue;
+                const std::string to = arithmeticName(param.TypeName);
+                if (to.empty())
+                    continue;
+                TypeAndValue dest;
+                dest.TypeName = param.TypeName;
+                bool needsStandard = false;
+                bool ambiguous = false;
+                std::vector<std::string> ambiguousOperators;
+                const std::string op = CxxConversionOperatorTo(at.TypeName, dest, false, &needsStandard,
+                                                               &ambiguous, &ambiguousOperators);
+                out.from = at.TypeName;
+                if (ambiguous)
+                {
+                    // An ambiguous conversion sequence: user-defined, indistinguishable from any
+                    // other user-defined sequence ([over.best.ics]/10).
+                    out.rank = 3;
+                    out.cxxViable = true;
+                    out.ambiguousOperators = std::move(ambiguousOperators);
+                }
+                else if (!op.empty())
+                {
+                    out.rank = 3;
+                    out.cxxViable = true;
+                    out.userFunction = op;
+                    const size_t spelled = op.rfind("operator ");
+                    const std::string from = arithmeticName(op.substr(spelled + 9));
+                    out.second = !needsStandard ? 0 : from.empty() ? 2 : arithmeticRank(from, to);
+                }
+                continue;
+            }
+
+            if (reference && !constReference)
+                continue;
+            const std::string from = argumentIdentity(arg);
+            const std::string to = arithmeticName(param.TypeName);
+            if (from.empty() || to.empty())
+                continue;
+            out.rank = arithmeticRank(from, to);
+            out.cxxViable = true;
+            out.from = from;
+        }
+        return ranks;
+}
+
+int LLVMBackend::CompareCxxConversionRanks(const std::vector<CxxConversionRank>& a,
+                                           const std::vector<CxxConversionRank>& b, bool& crossing)
+{
+        crossing = false;
+        if (a.size() != b.size())
+            return 2;
+        bool aBetter = false;
+        bool bBetter = false;
+        for (size_t i = 0; i < a.size(); ++i)
+        {
+            const CxxConversionRank& x = a[i];
+            const CxxConversionRank& y = b[i];
+            // Implicit object parameters compare equal only at the same cv- and ref-qualifier;
+            // the [over.ics.rank] binding rules between them are not modelled.
+            if (x.rank == -2 || y.rank == -2)
+            {
+                if (x.rank != y.rank || x.second != y.second) return 2;
+                continue;
+            }
+            if (x.rank < 0 || y.rank < 0)
+                return 2;
+            int order = 0;
+            if (x.rank < 3 || y.rank < 3)
+                order = x.rank - y.rank;
+            // Two sequences through the SAME conversion function rank by the second standard
+            // conversion; different functions (or an ambiguous one) are indistinguishable.
+            else if (!x.userFunction.empty() && x.userFunction == y.userFunction)
+                order = x.second - y.second;
+            aBetter |= order < 0;
+            bBetter |= order > 0;
+        }
+        crossing = aBetter && bBetter;
+        if (aBetter == bBetter)
+            return 0;
+        return aBetter ? -1 : 1;
+}
+
 std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> LLVMBackend::ComputeOverloadFunction(
         const std::vector<std::pair<std::vector<NamedVariable>, FunctionSymbol>>& candidates,
-        std::vector<FunctionSymbol>* tiedOut)
+        std::vector<FunctionSymbol>* tiedOut, CxxPreferredOverload* preferredOut)
 {
         // One viable candidate and the facts the tie-breaks below read.
         struct Ranked
@@ -1161,6 +1340,127 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
             return legacyLastWins ? best.back() : best.front();
         };
 
+        /*
+         * C++ [over.match.best] over an all-C++ candidate set, argument by argument: a candidate
+         * no worse at every argument and better at one removes the other from BOTH tiers, and two
+         * survivors each better at some argument are ambiguous. The tiers alone cannot see this:
+         * they count conversions per candidate, and a floating position is never ranked in them.
+         */
+        const bool cxxRanking = tiedOut != nullptr && variadicFallback == nullptr
+            && !candidates.empty()
+            && std::all_of(candidates.begin(), candidates.end(), [](const auto& c) {
+                   return c.second.IsCxx && !c.second.Variadic; });
+        std::map<const Result*, std::vector<CxxConversionRank>> cxxRanks;
+        auto fullyRanked = [](const std::vector<CxxConversionRank>& ranks) {
+            return std::none_of(ranks.begin(), ranks.end(),
+                                [](const CxxConversionRank& r) { return r.rank == -1; });
+        };
+        if (cxxRanking)
+        {
+            std::vector<const Ranked*> viable;
+            for (const Ranked& r : perfect) viable.push_back(&r);
+            for (const Ranked& r : possible) viable.push_back(&r);
+            for (const Ranked* r : viable)
+                cxxRanks[r->pair] = RankCxxConversionSequences(r->pair->first, r->pair->second);
+            std::set<const Result*> dominated;
+            for (const Ranked* a : viable)
+                for (const Ranked* b : viable)
+                {
+                    bool crossing = false;
+                    if (a != b && CompareCxxConversionRanks(cxxRanks[a->pair], cxxRanks[b->pair],
+                                                            crossing) == -1)
+                        dominated.insert(b->pair);
+                }
+            std::vector<const Ranked*> survivors;
+            for (const Ranked* r : viable)
+                if (dominated.count(r->pair) == 0)
+                    survivors.push_back(r);
+            bool anyCrossing = false;
+            for (size_t i = 0; i < survivors.size(); ++i)
+                for (size_t j = i + 1; j < survivors.size(); ++j)
+                {
+                    bool crossing = false;
+                    CompareCxxConversionRanks(cxxRanks[survivors[i]->pair],
+                                              cxxRanks[survivors[j]->pair], crossing);
+                    anyCrossing |= crossing;
+                }
+            // Refuse only when every survivor is fully judged: an unjudged one might beat both.
+            if (anyCrossing && std::all_of(survivors.begin(), survivors.end(), [&](const Ranked* r) {
+                    return fullyRanked(cxxRanks[r->pair]); }))
+            {
+                for (const Ranked* r : survivors)
+                    tiedOut->push_back(r->pair->second);
+                return Result{};
+            }
+            if (!survivors.empty())
+            {
+                std::erase_if(perfect, [&](const Ranked& r) { return dominated.count(r.pair) != 0; });
+                std::erase_if(possible, [&](const Ranked& r) { return dominated.count(r.pair) != 0; });
+            }
+        }
+
+        /*
+         * A candidate CFlat's call rules refuse (a narrowing or an int <-> floating argument, an
+         * ambiguous conversion operator) is still viable in C++. The pick stands only if it beats
+         * every such candidate; otherwise C++ would have refused the call or picked the other.
+         */
+        // Does CFlat's own scoring bind argument `i` of `pair` alone? Probed on a one-parameter
+        // copy, without `tiedOut`, so the C++ ranking above does not recurse.
+        auto cflatAccepts = [&](const Result& pair, size_t i) {
+            FunctionSymbol probe = pair.second;
+            probe.Parameters = { pair.second.Parameters[i] };
+            probe.IsMethod = false;
+            probe.UniqueName = "__cflat_udc_rank_probe";   // no declared C++ spelling to look up
+            probe.CxxAbi.valid = false;
+            probe.Recipe.paramSlots.clear();
+            const std::vector<Result> one = { Result{ { pair.first[i] }, probe } };
+            return !ComputeOverloadFunction(one).second.Parameters.empty();
+        };
+        auto finish = [&](const Ranked* winner) -> Result {
+            if (winner == nullptr)
+                return Result{};
+            if (!cxxRanking || !fullyRanked(cxxRanks[winner->pair]))
+                return *winner->pair;
+            const auto& won = cxxRanks[winner->pair];
+            for (const auto& pair : candidates)
+            {
+                if (cxxRanks.count(&pair) != 0 || !receiverRefQualifierMatches(pair.second, pair.first))
+                    continue;
+                // A second registration of the winner itself (another receiver shape) is no rival.
+                if (pair.second.UniqueName == winner->pair->second.UniqueName)
+                    continue;
+                const auto ranks = RankCxxConversionSequences(pair.first, pair.second);
+                if (!std::all_of(ranks.begin(), ranks.end(),
+                                 [](const CxxConversionRank& r) { return r.cxxViable; }))
+                    continue;
+                bool crossing = false;
+                const int order = CompareCxxConversionRanks(won, ranks, crossing);
+                if (order == -1 || order == 2)
+                    continue;
+                // Strictly better in C++: report it by name at the first argument CFlat refuses.
+                if (order == 1 && preferredOut != nullptr)
+                    for (size_t i = 0; i < ranks.size(); ++i)
+                    {
+                        if (ranks[i].rank < 0 || cflatAccepts(pair, i))
+                            continue;
+                        const auto& param = pair.second.Parameters[i];
+                        preferredOut->set = true;
+                        preferredOut->preferred = pair.second;
+                        preferredOut->picked = winner->pair->second;
+                        preferredOut->argument = pair.second.IsMethod ? i : i + 1;
+                        preferredOut->from = ranks[i].from;
+                        preferredOut->to = SpellType(*this, param);
+                        if (preferredOut->to.empty())
+                            preferredOut->to = param.TypeName;
+                        return Result{};
+                    }
+                tiedOut->push_back(winner->pair->second);
+                tiedOut->push_back(pair.second);
+                return Result{};
+            }
+            return *winner->pair;
+        };
+
         if (!perfect.empty())
         {
             std::vector<const Ranked*> best;
@@ -1169,8 +1469,7 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
             keepLowest(best, [](const Ranked& r) { return r.refPtrConstMismatches; });
             keepLowest(best, [](const Ranked& r) { return -r.moveScore; });
             keepLowest(best, [](const Ranked& r) { return r.omitted; });
-            const Ranked* winner = settle(best, /*legacyLastWins=*/false);
-            return winner != nullptr ? *winner->pair : Result{};
+            return finish(settle(best, /*legacyLastWins=*/false));
         }
 
         if (!possible.empty())
@@ -1227,8 +1526,7 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                     tiedOut->push_back(r->pair->second);
                 return Result{};
             }
-            const Ranked* winner = settle(best, /*legacyLastWins=*/true);
-            return winner != nullptr ? *winner->pair : Result{};
+            return finish(settle(best, /*legacyLastWins=*/true));
         }
 
         if (variadicFallback != nullptr)
@@ -1944,28 +2242,49 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
         }
 
         std::vector<FunctionSymbol> tiedCandidates;
-        auto [matched, candidate] = ComputeOverloadFunction(resolvedCandidate, &tiedCandidates);
+        CxxPreferredOverload cxxPreferred;
+        auto [matched, candidate] = ComputeOverloadFunction(resolvedCandidate, &tiedCandidates,
+                                                            &cxxPreferred);
+
+        auto spellCandidate = [&](const FunctionSymbol& c) {
+            std::string paramList;
+            for (size_t i = 0; i < c.Parameters.size(); i++)
+            {
+                const auto& p = c.Parameters[i];
+                if (i == 0 && c.IsMethod
+                    && (p.VariableName.ends_with("__") || (c.IsCxx && p.VariableName == "this")))
+                    continue;   // the implicit 'this'
+                std::string spelled = SpellType(*this, p);
+                // A free C++ function's reference parameter keeps its declared spelling.
+                if (c.IsCxx && !c.IsMethod && (p.IsAlias || p.IsRvalueRef))
+                    if (std::string declared = CxxReferenceParameterSpelling(c, i); !declared.empty())
+                        spelled = declared;
+                if (spelled.empty())
+                    spelled = p.TypeName + PointerStars(p);
+                paramList += (paramList.empty() ? "" : ", ") + spelled;
+            }
+            const std::string name = c.SourceName.empty() ? shownFunctionName : c.SourceName;
+            return std::format("{}({})", name, paramList);
+        };
+
+        // C++ would call a candidate CFlat's call rules refuse: name it and the refused conversion.
+        if (cxxPreferred.set)
+        {
+            LogErrorMessage("call to '{}' resolves in C++ to {}, which needs a conversion CFlat does not "
+                            "make implicitly at argument {} ('{}' to '{}'); cast that argument to call it, "
+                            "or cast to match {}.",
+                            { shownFunctionName, spellCandidate(cxxPreferred.preferred),
+                              std::to_string(cxxPreferred.argument), cxxPreferred.from, cxxPreferred.to,
+                              spellCandidate(cxxPreferred.picked) });
+            return nullptr;
+        }
 
         // A tie only integer identity could have decided is ambiguous (ruling 2026-09-10).
         if (!tiedCandidates.empty())
         {
             std::string candidateList;
             for (const auto& c : tiedCandidates)
-            {
-                std::string paramList;
-                for (size_t i = 0; i < c.Parameters.size(); i++)
-                {
-                    const auto& p = c.Parameters[i];
-                    if (i == 0 && c.IsMethod && p.VariableName.ends_with("__"))
-                        continue;   // the implicit 'this'
-                    std::string spelled = SpellType(*this, p);
-                    if (spelled.empty())
-                        spelled = p.TypeName + PointerStars(p);
-                    paramList += (paramList.empty() ? "" : ", ") + spelled;
-                }
-                const std::string name = c.SourceName.empty() ? shownFunctionName : c.SourceName;
-                candidateList += (candidateList.empty() ? "" : ", ") + std::format("{}({})", name, paramList);
-            }
+                candidateList += (candidateList.empty() ? "" : ", ") + spellCandidate(c);
             LogErrorMessage("ambiguous call to '{}': no candidate ranks better than the others: {}. "
                             "Cast the argument to the parameter type you mean.",
                             { shownFunctionName, candidateList });
@@ -2223,6 +2542,28 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                     return nullptr;
                 }
             }
+
+            // A C++ candidate C++ accepts through an AMBIGUOUS conversion operator: spell that
+            // ambiguity instead of a bare mismatch (clang refuses the call for the same reason).
+            if (!resolvedCandidate.empty()
+                && std::all_of(resolvedCandidate.begin(), resolvedCandidate.end(), [](const auto& c) {
+                       return c.second.IsCxx && !c.second.Variadic; }))
+                for (const auto& [ambiguousArgs, ambiguousSym] : resolvedCandidate)
+                {
+                    const auto ranks = RankCxxConversionSequences(ambiguousArgs, ambiguousSym);
+                    if (!std::all_of(ranks.begin(), ranks.end(),
+                                     [](const CxxConversionRank& r) { return r.cxxViable; }))
+                        continue;
+                    for (size_t i = 0; i < ranks.size(); ++i)
+                        if (ranks[i].rank == 3 && ranks[i].userFunction.empty())
+                        {
+                            TypeAndValue dest;
+                            dest.TypeName = ambiguousSym.Parameters[i].TypeName;
+                            ReportAmbiguousCxxConversion(ambiguousArgs[i].TypeAndValue.TypeName, dest,
+                                                         ranks[i].ambiguousOperators);
+                            return nullptr;
+                        }
+                }
 
             std::string msg = std::format("no overload of '{}' matches the given arguments.\n", shownFunctionName);
 
@@ -2948,8 +3289,22 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                 bool coreUniqueToRawPointer = IsCoreUniqueToRawPointer(arg, *candParamItr);
                 if (coreUniqueToRawPointer)
                 {
-                    argList.push_back(CreateCoreUniqueRawPointerCall(arg, *candParamItr,
-                                                                      candidate.IsCxx));
+                    llvm::Value* rawPointer = CreateCoreUniqueRawPointerCall(
+                        arg, *candParamItr, candidate.IsCxx);
+                    if (candidate.IsCxx && rawPointer != nullptr)
+                    {
+                        TypeAndValue rawSource;
+                        rawSource.TypeName = CxxUniquePtrPointee(arg.TypeAndValue.TypeName);
+                        if (rawSource.TypeName.empty())
+                            rawSource.TypeName = MangledGenericArgument(
+                                *this, arg.TypeAndValue.TypeName);
+                        rawSource.Pointer = !rawSource.TypeName.empty();
+                        rawPointer = AdjustCxxPointerForStore(
+                            *candParamItr, rawSource, rawPointer,
+                            std::format("parameter '{}' of '{}'", candParamItr->VariableName,
+                                        diagnosticFunctionName));
+                    }
+                    argList.push_back(rawPointer);
                 }
                 else
                 {
@@ -3572,7 +3927,8 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                         && IsForeignNontrivialCxxClass(candidate.Parameters[i].TypeName)
                         && candidate.Parameters[i].IsOwningSink
                         && OwningSinkConsumesConcrete(candidate.Parameters[i]))
-                    || (!candidate.IsCxx && matched[i].IsRvalue);
+                    || (matched[i].IsRvalue
+                        && (cxxObject || !candidate.IsCxx));
                 // A by-value parameter a 'move x' can fill: name the deleted copy and that remedy.
                 if (!useMove && cxxObject && FindCxxCopyCtor(pn) == nullptr
                     && IsCopyDeletedCxxLvalue(matched[i])
@@ -4337,6 +4693,10 @@ bool LLVMBackend::IsCoreUniqueToRawPointer(const NamedVariable& arg, const TypeA
         uniquePointee.Pointer = true;
         if (param.ElemPointer) return false;
         if (uniquePointee.TypeName == param.TypeName) return true;
+
+        // Releasing an owner yields its pointee pointer first; that raw pointer then takes the
+        // same public derived-to-base standard conversion as a raw pointer argument.
+        if (IsCxxDerivedToBasePointer(uniquePointee, param)) return true;
 
         // Generic substitutions may spell the same C-equivalent pointee as `i32` in
         // unique<T> and `int` in the instantiated method parameter. Compare their value

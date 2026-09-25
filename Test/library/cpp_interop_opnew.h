@@ -84,6 +84,21 @@ struct Triv
     { ++Cnt::clsNew; void* p = std::malloc(n); std::memset(p, 0x5a, n); return p; }
     static void operator delete(void* p) { ++Cnt::clsDel; std::free(p); }
 };
+struct PrivateNew
+{
+    explicit PrivateNew(int x) : v(x) {}
+    int v;
+private:
+    static void* operator new(std::size_t);
+};
+struct PrivateDelete
+{
+    explicit PrivateDelete(int x) : v(x) {}
+    int v;
+    static void* operator new(std::size_t);
+private:
+    static void operator delete(void*);
+};
 // Over-aligned, no class operators: the aligned global forms.
 struct alignas(64) Wide
 {

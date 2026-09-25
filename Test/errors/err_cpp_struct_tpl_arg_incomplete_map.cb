@@ -9,9 +9,49 @@ expect_error("'std::map<int, __cflat_user::Leaf>' needs the complete definition 
     };
 }
 
+// While Leaf is still incomplete, a second use is refused again.
+expect_error("'std::map<int, __cflat_user::Leaf>' needs the complete definition of [cpp] struct 'Leaf'; define the struct before this use") {
+    struct Holder2 : cppt.ModuleBase
+    {
+        std.map<int, Leaf> values = default;
+        override int forward(int x) { return x; }
+    };
+}
+
 struct Leaf : cppt.ModuleBase
 {
+    int v = 0;
+    override int forward(int x) { return x + v; }
+};
+
+// The refused specialization stays refused after Leaf is defined, naming the cause.
+expect_error("'std.map<int, Leaf>' was refused earlier in this compile because 'Leaf' was incomplete at that point; declare 'Leaf' before its first use in a C++ template argument") {
+    struct Later : cppt.ModuleBase
+    {
+        std.map<int, Leaf> m = default;
+        override int forward(int x) { return x; }
+    };
+}
+
+struct Other : cppt.ModuleBase
+{
+    int v = 0;
+    override int forward(int x) { return x + v; }
+};
+
+// Another specialization of the same template still binds.
+struct Fine : cppt.ModuleBase
+{
+    std.map<int, Other> m = default;
     override int forward(int x) { return x; }
 };
 
-extern int main() { return 0; }
+extern int main()
+{
+    Fine b = Fine();
+    b.m[4].v = 6;
+    b.m[9].v = 1;
+    if (b.m.size() != 2) return 1;
+    if (b.m[4].forward(1) != 7) return 2;
+    return 0;
+}

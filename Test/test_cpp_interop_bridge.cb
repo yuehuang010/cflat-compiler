@@ -75,6 +75,11 @@
 //     (3590-3599).
 //   list<unique C++*> uses std::unique_ptr values for sinks, borrowing, take, release, growth,
 //     and destruction, with exact C++ destructor counts (3600-3609).
+//   C++ overload resolution compares each argument's conversion sequence on its own: equal
+//     user conversions defer to the next argument, and an unsuffixed literal is a double, for
+//     free functions and for members of an imported class (3620-3629).
+//   Moving core and C++ unique owners of a derived class into a C++ base-pointer sink adjusts
+//     after release and destroys once; the exact-base owner remains unchanged (3610-3619).
 
 import cpp "library/cpp_interop_sfinae.h";
 import cpp "library/cpp_interop_basic.h";
@@ -104,6 +109,7 @@ import cpp "library/cpp_interop_assign.h";
 import cpp "library/cpp_interop_proxy_assign.h";
 import cpp "library/cpp_interop_uniqueptr.h";
 import cpp "library/cpp_interop_own_method.h";
+import "unique.cb";
 
 [cpp] struct BridgeSetCopyKey : cppsetcopy.CopyBase
 {
@@ -1113,6 +1119,12 @@ struct MyCircle : cpppoly.Shape
     override int area() { return local_area(); }
     int local_area() { return r * r; }
     ~MyCircle() { g_nobase_dtor = g_nobase_dtor + 1; }
+};
+
+[cpp] struct UniqueCppCircle : cpppoly.Shape
+{
+    override int area() { return 9; }
+    ~UniqueCppCircle() { g_nobase_dtor = g_nobase_dtor + 1; }
 };
 
 void bridge_cpp_destroy_move(bool chooseFirst)
@@ -5320,6 +5332,96 @@ extern int main(int argc, char** argv)
     bridge_check("unique list destruction exact", cpuq.ctors() * 100 + cpuq.dtors(), 202);
     if (bridge_passed - bridgeUniqueListStartPassed != bridge_checks - bridgeUniqueListStartChecks)
         return 3609;
+
+    // ---- per-argument C++ overload ranking, [over.match.best] (3620-3629) ------------------
+    // The ambiguous cells (better at one argument, worse at another) are pinned in
+    // Test/errors/err_cpp_overload_ambiguous_per_arg.cb.
+    int bridgeRankStartChecks = bridge_checks;
+    int bridgeRankStartPassed = bridge_passed;
+    {
+        cpppa.RankP rp = cpppa.RankP();
+        float rf = 1.0f;
+        // The same operator int on argument 1 both ways, so argument 2 decides: float exact beats
+        // float -> double, in both declaration orders (was declaration order: 8, 7).
+        bridge_check("per-arg rank equal user conversion, exact second argument",
+                     cpppa.rank_euf(rp, rf) * 100 + cpppa.rank_euf2(rp, rf), 707);
+    }
+    if (bridge_passed - bridgeRankStartPassed != bridge_checks - bridgeRankStartChecks)
+        return 3620;
+    // An unsuffixed floating literal is a C++ double: exact beats double -> float (was 11).
+    bridge_check("per-arg rank double literal", cpppa.rank_fd(1.0) * 100 + cpppa.rank_fd(1.0f), 1011);
+    if (bridge_passed - bridgeRankStartPassed != bridge_checks - bridgeRankStartChecks)
+        return 3621;
+    // The same cells on overloaded members of an imported class (each was 2, 4, 6 before).
+    {
+        cpppa.RankM rm = cpppa.RankM();
+        cpppa.RankP mp = cpppa.RankP();
+        bool flag = true;
+        float mf = 1.0f;
+        bridge_check("per-arg rank member bool exact", rm.bf(flag), 1);
+        if (bridge_passed - bridgeRankStartPassed != bridge_checks - bridgeRankStartChecks)
+            return 3622;
+        bridge_check("per-arg rank member equal user conversion", rm.e(mp, mf), 3);
+        if (bridge_passed - bridgeRankStartPassed != bridge_checks - bridgeRankStartChecks)
+            return 3623;
+        bridge_check("per-arg rank member double literal", rm.d(1.0), 5);
+        if (bridge_passed - bridgeRankStartPassed != bridge_checks - bridgeRankStartChecks)
+            return 3624;
+    }
+    int bridgeUniqueDerivedStartChecks = bridge_checks;
+    int bridgeUniqueDerivedStartPassed = bridge_passed;
+    cpppoly.reset_poly_counts();
+    {
+        unique<cpppoly.Circle> owner = new cpppoly.Circle();
+        cpppoly.destroy_through(move owner);
+    }
+    bridge_check("unique derived-to-base core owner", cpppoly.shape_dtors(), 1);
+    bridge_check("unique derived-to-base core destructor", cpppoly.circle_dtors(), 1);
+
+    cpppoly.reset_poly_counts();
+    {
+        unique cpppoly.Circle* owner = new cpppoly.Circle();
+        cpppoly.destroy_through(move owner);
+    }
+    bridge_check("unique derived-to-base C++ owner", cpppoly.shape_dtors(), 1);
+    bridge_check("unique derived-to-base C++ destructor", cpppoly.circle_dtors(), 1);
+
+    cpppoly.reset_poly_counts();
+    {
+        unique cpppoly.Shape* owner = new cpppoly.Shape();
+        cpppoly.destroy_through(move owner);
+    }
+    bridge_check("unique exact-base owner", cpppoly.shape_dtors(), 1);
+
+    cpppoly.reset_unique_adjust_counts();
+    {
+        unique<cpppoly.Both> owner = new cpppoly.Both();
+        cpppoly.destroy_right_through(move owner);
+    }
+    bridge_check("unique non-primary base destroys Left", cpppoly.left_unique_adjust_dtors(), 1);
+    bridge_check("unique non-primary base destroys Right", cpppoly.right_unique_adjust_dtors(), 1);
+    bridge_check("unique non-primary base destroys Both", cpppoly.both_unique_adjust_dtors(), 1);
+
+    cpppoly.reset_poly_counts();
+    g_nobase_dtor = 0;
+    {
+        unique MyCircle* owner = new MyCircle();
+        cpppoly.destroy_through(move owner);
+    }
+    bridge_check("unique CFlat-derived core owner", cpppoly.shape_dtors(), 1);
+    bridge_check("unique CFlat-derived core destructor", g_nobase_dtor, 1);
+
+    cpppoly.reset_poly_counts();
+    g_nobase_dtor = 0;
+    {
+        unique<UniqueCppCircle> owner = new UniqueCppCircle();
+        cpppoly.destroy_through(move owner);
+    }
+    bridge_check("unique [cpp]-derived base destructor", cpppoly.shape_dtors(), 1);
+    bridge_check("unique [cpp]-derived destructor", g_nobase_dtor, 1);
+    if (bridge_passed - bridgeUniqueDerivedStartPassed
+        != bridge_checks - bridgeUniqueDerivedStartChecks)
+        return 3610;
 
     return 0;
 }

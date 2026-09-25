@@ -85,6 +85,8 @@ namespace cpppoly
         int both_only() const noexcept;
     };
 
+    inline void destroy_right_through(Right* p) noexcept { delete p; }
+
     struct BothBox
     {
         Both value;

@@ -1910,6 +1910,14 @@ public:
         bool IsNoexcept = true;    // potentially throwing C++ calls are gated until EH support
         bool IsCInteropAlias = false;
         bool IsCInteropDeclaration = false;
+        // An `extern` CFlat function whose body the ForwardRefScanner saw: not a C prototype even
+        // while its llvm::Function is still a declaration (a call ahead of the body may unwind).
+        bool HasCFlatBody = false;
+        // Core-cache only: InferCoreNoUnwind proved the body cannot unwind, so calls stay `call`.
+        bool CannotUnwind = false;
+        // The body-less externs (C names) that proof relied on, transitively. A CFlat `extern` body
+        // for one of them in this compile binds core's call to it and voids the proof.
+        std::vector<std::string> NoUnwindExternDeps;
         std::vector<std::string> RequiredLocks; // canonical lock-set that the caller must hold (from lock clause)
         AbiRecipe Recipe;          // populated for extern (cdecl) functions whose signature contains struct-by-value
         // Clang's serialized arrangement behind Recipe (C++ declarations only). Kept so a warm
@@ -5233,6 +5241,13 @@ private:
     // True when a call to `symbol` can unwind: a C++ declaration without noexcept, or any CFlat
     // function (it may reach one transitively). C declarations and body-less externs cannot.
     bool CalleeMayUnwind(const FunctionSymbol& symbol) const;
+    // Mark the `extern` CFlat function `linkageName` as having a CFlat body (see HasCFlatBody).
+    void NoteCFlatExternBody(const std::string& functionName, const std::string& linkageName);
+    // Core-cache build only (every core body complete): set CannotUnwind on each core function
+    // whose body provably cannot unwind. Returns the number marked.
+    size_t InferCoreNoUnwind();
+    // Linkage names given an `extern` CFlat body in this compile (NoteCFlatExternBody).
+    std::unordered_set<std::string> cflatExternBodyNames_;
     // True when an exception unwinding out of the current point would skip a cleanup this
     // CFlat frame owes: an owning local or parameter, a held lock, or a pending struct temp.
     bool FrameOwesUnwindCleanup();
@@ -5602,7 +5617,8 @@ private:
                            const std::string& cflatName, std::string& error);
     std::string GeneratedCxxPrefixForSpelling(const std::string& cxxSpelling) const;
     bool DecodeCxxIncompleteTemplateError(const std::string& error,
-                                          std::string& spelling, std::string& typeName) const;
+                                          std::string& spelling, std::string& typeName,
+                                          bool* refusedEarlier = nullptr) const;
     bool IsCxxForeignTypeRegistered(const std::string& cflatName) const;
     bool IsStdFunctionSpecialization(const std::string& name) const
     {
@@ -8444,11 +8460,17 @@ public:
     std::map<std::string, std::string> cppStructOverrideNames_;
     // Retained extractor records let a refused member be rebound when its specialization is used.
     std::map<std::string, CRecordEntry> cxxRecordEntries_;
+    // C++ records laid out with an opaque-bytes field, keyed by LLVM type (BindLazyCxxStdField).
+    std::unordered_map<llvm::StructType*, std::string> cxxOpaqueFieldOwners_;
     // Register the callable surface of one imported C++ class: instance methods, static methods,
     // static data members, and the constructor/destructor table used by lifetime codegen.
     void RegisterCxxClassMembers(const CRecordEntry& r, const std::string& fileForLsp,
                                  const std::string& memberFilter = {});
     bool TryBindRefusedCxxMember(const std::string& typeName, const std::string& memberName);
+    // A by-value std specialization field kept as opaque bytes: request its class at first member
+    // access and return the field typed as that class (owner layout unchanged).
+    bool BindLazyCxxStdField(llvm::StructType* owner, const TypeAndValue& stored,
+                             TypeAndValue& bound);
     // True when every class-template specialization in the member's signature is already
     // registered or requested, so a retry can bind it without issuing a new C++ type request.
     bool CxxRefusedMemberSignatureKnown(const CRecordEntry& record, const std::string& memberName) const;
@@ -8935,15 +8957,49 @@ public:
     std::string DescribeCodeValueAsCompoundOperand(const std::string& spelling, const std::string& op,
                                                    bool destIsPointer) const;
 
-    // `tiedOut`, when given, receives the candidates of a genuine integer-ranking tie (and the
-    // result is empty); without it such a tie falls back to the legacy declaration-order pick.
-    std::pair<std::vector<NamedVariable>, FunctionSymbol> ComputeOverloadFunction(
-        const std::vector<std::pair<std::vector<NamedVariable>, FunctionSymbol>>& candidates,
-        std::vector<FunctionSymbol>* tiedOut = nullptr);
 
     // Integer identity ranking for overload resolution (C++ order, ruling 2026-09-10).
     static std::string LiteralIdentityForOverload(std::string_view text);
     std::string IntegerArgumentIdentity(const NamedVariable& arg) const;
+
+    /*
+     * One argument's C++ implicit conversion sequence ([over.ics.rank]) against an imported C++
+     * candidate: rank 0 exact, 1 promotion, 2 conversion, 3 user-defined, -1 not judged. A
+     * user-defined sequence names its conversion function and ranks its second standard
+     * conversion; an empty name is an ambiguous conversion sequence. `cxxViable` is set only
+     * where C++ provably accepts the binding whatever CFlat's own call rules say.
+     */
+    struct CxxConversionRank
+    {
+        int rank = -1;
+        std::string userFunction;
+        int second = 0;
+        bool cxxViable = false;
+        std::vector<std::string> ambiguousOperators;
+        std::string from;   // the argument's type as ranked, for diagnostics
+    };
+    // The candidate C++ would call when CFlat's call rules refuse it (see ComputeOverloadFunction).
+    struct CxxPreferredOverload
+    {
+        bool set = false;
+        FunctionSymbol preferred;
+        FunctionSymbol picked;
+        size_t argument = 0;   // 1-based, the implicit object not counted
+        std::string from;
+        std::string to;
+    };
+    // `tiedOut`, when given, receives the candidates of a genuine integer-ranking tie (and the
+    // result is empty); without it such a tie falls back to the legacy declaration-order pick.
+    // `preferredOut` is set (result empty) when C++ would call a candidate CFlat refuses.
+    std::pair<std::vector<NamedVariable>, FunctionSymbol> ComputeOverloadFunction(
+        const std::vector<std::pair<std::vector<NamedVariable>, FunctionSymbol>>& candidates,
+        std::vector<FunctionSymbol>* tiedOut = nullptr, CxxPreferredOverload* preferredOut = nullptr);
+    std::vector<CxxConversionRank> RankCxxConversionSequences(
+        const std::vector<NamedVariable>& arguments, const FunctionSymbol& candidate) const;
+    // [over.match.best] per-argument comparison: -1 `a` better, 1 `b` better, 0 neither
+    // (indistinguishable, or `crossing` when each is better somewhere), 2 not judged.
+    static int CompareCxxConversionRanks(const std::vector<CxxConversionRank>& a,
+                                         const std::vector<CxxConversionRank>& b, bool& crossing);
     std::string IntegerParameterIdentity(const TypeAndValue& param) const;
     static int RankIntegerConversion(const std::string& argIdentity, const std::string& paramIdentity);
 

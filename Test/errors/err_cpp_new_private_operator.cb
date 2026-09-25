@@ -1,0 +1,15 @@
+import cpp "cpp_interop_opnew.h";
+
+expect_error("its class-level 'operator new' is not accessible") {
+    int PrivateNewProbe() {
+        cppon.PrivateNew* p = new cppon.PrivateNew(1);
+        return p->v;
+    }
+}
+
+expect_error("its class-level 'operator delete' is not accessible") {
+    int PrivateDeleteProbe() {
+        cppon.PrivateDelete* p = new cppon.PrivateDelete(2);
+        return p->v;
+    }
+}

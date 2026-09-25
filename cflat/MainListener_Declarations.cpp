@@ -7709,6 +7709,33 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                 && srcStorage != nullptr
                                 && srcInferredTypeName == typeAndValue.TypeName
                                 && compiler->HasForeignNontrivialCxxField(typeAndValue.TypeName);
+                            if (!typeAndValue.Pointer && !typeAndValue.IsFunctionPointer
+                                && haveInitializerSourceNV && right->getType()->isStructTy())
+                            {
+                                const auto& sourceType = initializerSourceNV.TypeAndValue;
+                                const bool cxxAggregate = compiler->IsCxxRecord(sourceType.TypeName)
+                                    || !compiler->CxxUniquePtrPointee(sourceType.TypeName).empty();
+                                auto* destType = compiler->GetType(typeAndValue);
+                                const bool scalarDestination = destType != nullptr
+                                    && (destType->isIntegerTy() || destType->isFloatingPointTy());
+                                bool hasImplicitConversion = false;
+                                bool ambiguousConversion = false;
+                                if (cxxAggregate && scalarDestination)
+                                    hasImplicitConversion = !compiler->CxxConversionOperatorTo(
+                                        sourceType.TypeName, typeAndValue, false, nullptr,
+                                        &ambiguousConversion).empty();
+                                const bool hasExplicitBoolConversion = cxxAggregate
+                                    && destType != nullptr && destType->isIntegerTy(1)
+                                    && !hasImplicitConversion
+                                    && !compiler->CxxConversionOperatorTo(
+                                        sourceType.TypeName, typeAndValue, true).empty();
+                                if (cxxAggregate && scalarDestination && !hasImplicitConversion
+                                    && !ambiguousConversion && !hasExplicitBoolConversion)
+                                    LogErrorContext(direct, std::format(
+                                        "cannot convert value of type '{}' to '{}'",
+                                        SpellDiagnosticType(*compiler, sourceType),
+                                        SpellDiagnosticType(*compiler, typeAndValue)));
+                            }
                             auto* initStore = movedCxxReturn
                                 ? nullptr : compiler->CreateAssignment(right, alloc, srcIsUnsigned);
                             if (movedOwningStruct)

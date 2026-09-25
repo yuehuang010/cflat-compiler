@@ -1,0 +1,77 @@
+// C++ [over.match.best] compares each argument's implicit conversion sequence on its own: a
+// candidate better at one argument and worse at another is not better, so the call is
+// ambiguous (clang: "call to '...' is ambiguous"). Each leg below was a silent pick before -
+// the candidate with fewer user-defined conversions, the lower integer tier, or declaration
+// order. Fixtures: Test/library/cpp_interop_proxy_assign.h (rank_*).
+import cpp "cpp_interop_proxy_assign.h";
+
+extern int main()
+{
+    // Argument 1: operator int (user-defined) vs identity; argument 2: exact vs double -> float.
+    // The float candidate is viable only in C++ (CFlat refuses the narrowing), yet C++ would not
+    // have picked rank_mix(int, double) either.
+    expect_error("ambiguous call to 'cpppa.rank_mix': no candidate ranks better") {
+        cpppa.RankP p = cpppa.RankP();
+        double d = 1.0;
+        int r = cpppa.rank_mix(p, d);
+    }
+
+    // Both candidates viable in CFlat: user-defined + exact vs identity + int -> long.
+    expect_error("ambiguous call to 'cpppa.rank_mxi': no candidate ranks better") {
+        cpppa.RankP p = cpppa.RankP();
+        int i = 1;
+        int r = cpppa.rank_mxi(p, i);
+    }
+
+    // Same shape with a floating second argument: exact vs float -> double promotion.
+    expect_error("ambiguous call to 'cpppa.rank_mxf': no candidate ranks better") {
+        cpppa.RankP p = cpppa.RankP();
+        float f = 1.0f;
+        int r = cpppa.rank_mxf(p, f);
+    }
+
+    // Standard conversions only: float -> float exact + int -> long vs float -> double + exact.
+    expect_error("ambiguous call to 'cpppa.rank_sx': no candidate ranks better") {
+        float f = 1.0f;
+        int i = 1;
+        int r = cpppa.rank_sx(f, i);
+    }
+
+    // int -> long and int -> double are both conversions; the double candidate is viable only
+    // in C++, so the long pick is not C++'s.
+    expect_error("ambiguous call to 'cpppa.rank_hl': no candidate ranks better") {
+        int i = 1;
+        int r = cpppa.rank_hl(i);
+    }
+
+    // Every candidate reaches its parameter through two conversion operators: the conversion
+    // itself is ambiguous (previously a bare "no overload ... matches").
+    expect_error("conversion from 'cpppa.RankB' to 'double' is ambiguous") {
+        cpppa.RankB b = cpppa.RankB();
+        int r = cpppa.rank_amb(b);
+    }
+    // C++ has a unique pick here, rank_k(double, int), but it needs int -> double, which CFlat
+    // does not do implicitly at a call: name C++'s pick instead of claiming an ambiguity.
+    expect_error("call to 'cpppa.rank_k' resolves in C++ to cpppa.rank_k(double, int), which needs a conversion CFlat does not make implicitly at argument 1 ('int' to 'double')") {
+        int i = 1;
+        int j = 2;
+        int r = cpppa.rank_k(i, j);
+    }
+
+    // Member forms, through a value and a pointer receiver: int -> long + float exact vs
+    // int exact + float -> double.
+    expect_error("ambiguous call to 'g': no candidate ranks better") {
+        cpppa.RankM m = cpppa.RankM();
+        int i = 1;
+        float f = 1.0f;
+        int r = m.g(i, f);
+    }
+    expect_error("ambiguous call to 'g': no candidate ranks better") {
+        cpppa.RankM* m = new cpppa.RankM();
+        int i = 1;
+        float f = 1.0f;
+        int r = m->g(i, f);
+        delete m;
+    }
+    return 0;
+}
