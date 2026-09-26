@@ -2751,8 +2751,16 @@ private:
         std::string TypeName;
         uint64_t AllocAlign = 0;
         llvm::BasicBlock* Block = nullptr;
+        // Entry-block i1 slot (see cxxThisEscapeGates_): the free runs only when it holds true.
+        llvm::Value* ReleaseGate = nullptr;
+        // Entry-block pointer slot for an address-bearing conditional arm, null when untaken.
+        llvm::Value* ConditionalSlot = nullptr;
     };
     std::vector<PendingOwnedPtrTemp> pendingOwnedPtrTemps;
+    // Temps kept alive by ClaimOwnedPtrTempsUnder; cleared with the statement's ledgers.
+    std::vector<llvm::Value*> addrClaimedPtrTemps_;
+    std::vector<llvm::Value*> addrIntoTempValues_;
+    std::vector<std::pair<llvm::Value*, llvm::Value*>> ptrToIntOfTemps_;   // (int, pointer)
 
     // Per-function noalias metadata for T[] views. Proves pairwise disjointness for span<T> fields
     // where the noalias parameter attribute cannot reach. Reset in createFunctionBlock.
@@ -2830,6 +2838,21 @@ private:
         llvm::WeakVH Site;
     };
     std::vector<OwnReleaseGate> ownReleaseGates_;
+    /*
+     * One per owning `new` temp passed to a C++ callee that is still a declaration during the
+     * walk (its body arrives with the companion link). The temp's free sits behind an entry-block
+     * i1 stored false; ResolveCxxThisEscapeGates patches it true after LinkCxxCompanionModules
+     * when the linked body provably does not retain the argument. Keyed by NAME: IRMover replaces
+     * the declaration, so its Function* does not survive the link.
+     */
+    struct CxxThisEscapeGate
+    {
+        llvm::WeakVH Init;
+        std::string Callee;
+        unsigned ArgIndex = 0;
+    };
+    std::vector<CxxThisEscapeGate> cxxThisEscapeGates_;
+    void ResolveCxxThisEscapeGates();
     // One per adoption of a block from another local slot (`b = a`, `b = move a`): an entry-block
     // i1 stored false (the adopter does not own), patched true after the walk when no alias of the
     // source slot (or of a slot the source itself adopted from) can reach the transferring load.
@@ -3030,6 +3053,8 @@ private:
     std::unordered_map<std::string, ProgramData> programTable;
     std::unordered_map<std::string, std::string> enumBackingTypes;
     std::unordered_set<std::string> scopedEnumTypes_;
+    // Unscoped C++ enum -> CFlat name of its integral promotion type ([conv.prom]/3-4).
+    std::unordered_map<std::string, std::string> enumPromotedTypes_;
     // Declaration sites (file:line:col) an enum key was registered from. Both passes and a
     // re-import replay the same site, which is the no-op; a second, different site is a
     // redefinition. Transient per compile, never serialized.
@@ -3520,6 +3545,7 @@ private:
         std::string name;
         std::string enumType;
         std::string underlyingType;
+        std::string promotedType;
         bool isScoped = false;
         long long value = 0;
         int line = 1;
@@ -4203,7 +4229,7 @@ private:
      * sink invariant (no caller-side free may remain registered for an argument a callee took
      * ownership of).
      */
-    void RegisterOwnedPtrTemp(llvm::Value* value);
+    void RegisterOwnedPtrTemp(llvm::Value* value, llvm::Value* releaseGate = nullptr);
 
     // True when `value` is a still-unadopted owning-POINTER temp: an owning-RETURN call result or
     // a raw `new` result. Exactly the set RegisterOwnedPtrTemp accepts.
@@ -4214,7 +4240,14 @@ private:
      * provably does not RETAIN it, so the caller frees it at end-of-full-expression instead of
      * leaking it. Everything not proven safe is left alone (a bounded leak beats a use-after-free).
      */
-    void RegisterNonEscapingOwningPtrArgs(llvm::Value* callResult);
+    // `calleeIsCxx`: a declared C++ callee gets a release gate resolved after the companion link.
+    void RegisterNonEscapingOwningPtrArgs(llvm::Value* callResult, bool calleeIsCxx = false);
+    // Pre-call form for a direct C++ call, so a landing pad of that very call already frees
+    // the gated temp on unwind. False (nothing registered) when the callee does not qualify.
+    bool RegisterCxxOwningPtrArgsBeforeCall(const llvm::Function* callee,
+                                            llvm::ArrayRef<llvm::Value*> args);
+    void RegisterCxxGatedOwningPtrArg(llvm::Value* argVal, const llvm::Function& callee,
+                                      unsigned argIndex);
 
     // Drop every escape-analysis answer recorded for `fn`. Must run before the function is
     // erased: the memo is keyed on the raw pointer, which LLVM may reuse for a new function.
@@ -4752,6 +4785,24 @@ private:
 
     void UnregisterOwnedPtrTemp(llvm::Value* value);
 
+    /*
+     * Addresses INTO an owning pointer temp (`&(new T(x))->f`, a `?:` join of one, a pointer the
+     * program turned into an integer). `includeSelf` also matches the temp pointer itself; else
+     * a GEP must lie between `v` and the temp. `fromIndex` limits the search to the ledger tail.
+     */
+    bool PointsIntoOwnedPtrTemp(llvm::Value* v, bool includeSelf, size_t fromIndex = 0) const;
+    // Never free early: drop matching temps from the ledger (a bounded leak) and remember them
+    // until the statement ends, so a store of the address can still be refused.
+    void ClaimOwnedPtrTempsUnder(llvm::Value* v, bool includeSelf, size_t fromIndex = 0);
+    // True when `v` is an address into an owning temp of the current statement, pending or claimed.
+    bool AddressIntoStatementPtrTemp(llvm::Value* v) const;
+    // A join the walk cannot follow (the `??` result slot) carries the fact forward by identity.
+    void RegisterAddressIntoTempValue(llvm::Value* v) { if (v != nullptr) addrIntoTempValues_.push_back(v); }
+    // A pointer turned into an integer (CreateCast): its temp is claimed at the flush only when
+    // the integer escapes - reaches `keep` or any use other than a compare (see IntAddressEscapes).
+    void RecordPtrToIntOfTemp(llvm::Value* intValue, llvm::Value* ptrOperand);
+    void ClaimIntLaunderedPtrTemps(size_t fromIndex, llvm::Value* keep);
+
     // True when the insert block is active (non-null, no terminator yet).
     // Guards the Flush* functions: emitting into a terminated block is illegal IR.
     bool IsInsertBlockLive() const;
@@ -4802,7 +4853,8 @@ private:
     // deallocator. Value-based twin of EmitOwningPtrCleanup (which loads from a named local's
     // storage); the temp is a bare SSA pointer with no slot to load from or null out.
     void EmitOwnedPtrTempFree(llvm::Value* ptrVal, const std::string& typeName,
-                              uint64_t allocAlign, llvm::Value* rawArrayCount = nullptr);
+                              uint64_t allocAlign, llvm::Value* rawArrayCount = nullptr,
+                              llvm::Value* releaseGate = nullptr);
 
     // Free every owning-pointer temp nothing adopted. Each free opens new blocks, so the insert
     // block and the dominator tree are recomputed per temp instead of hoisted out of the loop.
@@ -4839,6 +4891,7 @@ private:
         size_t Closures = 0;
         size_t Structs  = 0;
         size_t Ptrs     = 0;
+        size_t NewPtrs  = 0;
     };
 
     // Drop the ledger entries added since index `from`, preserving only the entry for `keep`.
@@ -4852,6 +4905,8 @@ private:
     }
 
     OwnedTempMark MarkOwnedTemps() const;
+    void HoistOwnedPtrTempsForAddress(const OwnedTempMark& mark, llvm::Value* address,
+                                      llvm::BasicBlock* hoistTo, bool includeBareNew = false);
 
     /*
      * Free every owned temp registered since `mark` at the CURRENT insert point, except `keep`
@@ -4865,8 +4920,8 @@ private:
      * to it, so the end-of-statement flush destructs it AFTER the joined value is consumed, and
      * the zeroed record makes that destructor a no-op on the path where the arm did not run.
      * Freeing them in the arm is a use-after-free whenever the join yields a pointer INTO the
-     * temp. The string / closure / ptr ledgers hold SSA values that the resume block cannot name,
-     * so they always take the early free.
+     * temp. String and closure temps always take the early free. Call-argument pointer temps
+     * whose address reaches the join use null-initialized slots and stay for full-expression cleanup.
      */
     void FlushOwnedTempsSince(const OwnedTempMark& mark, llvm::Value* keep,
                               llvm::BasicBlock* hoistTo = nullptr);
@@ -4884,6 +4939,7 @@ private:
     // which OPENS BLOCKS - after one, the caller must re-read the insert block and drop any
     // cached dominator tree before judging the next temp.
     void EmitOwnedStructTempFree(const PendingOwnedStructTemp& temp);
+    void EmitOwnedConditionalPtrTempFree(const PendingOwnedPtrTemp& temp);
 
     // Drop the ledger entries registered since `mark` WITHOUT emitting any free. For an aborted
     // region (an arm whose lowering threw): those entries are keyed to blocks that no longer
@@ -8594,7 +8650,7 @@ public:
         const std::vector<LLVMBackend::TypeAndValue>& arguments, bool varargs,
         std::string* originFile, size_t* originLine);
 
-    llvm::Function* CreateFunctionDefinition(const std::string& functionName, const LLVMBackend::TypeAndValue& returnType, const std::vector<LLVMBackend::TypeAndValue>& arguments, bool external = false, bool varargs = false, size_t line = 0, bool returnsOwned = false, bool isMethod = false, CallingConv callConv = CallingConv::Default, size_t scopeLine = 0);
+    llvm::Function* CreateFunctionDefinition(const std::string& functionName, const LLVMBackend::TypeAndValue& returnType, const std::vector<LLVMBackend::TypeAndValue>& arguments, bool external = false, bool varargs = false, size_t line = 0, bool returnsOwned = false, bool isMethod = false, CallingConv callConv = CallingConv::Default, size_t scopeLine = 0, const std::string& linkageName = {});
 
     // True when 'name' resolves to a type in the current compilation: a scalar
     // keyword, an enum, a type alias, an interface, or a registered struct. Used by
@@ -8977,6 +9033,13 @@ public:
         bool cxxViable = false;
         std::vector<std::string> ambiguousOperators;
         std::string from;   // the argument's type as ranked, for diagnostics
+        // Same-rank tie-breakers ([over.ics.rank] 3.2.5 / 3.2.6 / 4.4): a reference or pointer
+        // binding to `cvBase` itself, `cv` 1 when const-qualified; a derived-to-base (or to
+        // `void*`) conversion from `from` to `toClass`; an implicit object's ref-qualifier.
+        std::string cvBase;
+        int cv = 0;
+        std::string toClass;
+        int objectRef = 0;
     };
     // The candidate C++ would call when CFlat's call rules refuse it (see ComputeOverloadFunction).
     struct CxxPreferredOverload
@@ -8994,12 +9057,24 @@ public:
     std::pair<std::vector<NamedVariable>, FunctionSymbol> ComputeOverloadFunction(
         const std::vector<std::pair<std::vector<NamedVariable>, FunctionSymbol>>& candidates,
         std::vector<FunctionSymbol>* tiedOut = nullptr, CxxPreferredOverload* preferredOut = nullptr);
+    std::vector<std::string> CxxClassConversionTies(const std::string& source,
+                                                    const std::string& target) const;
+    struct CxxClassConversionPair
+    {
+        int operatorConst = 0;
+        int ctorConst = 0;
+        std::string targetSpelling;
+        std::string ctorParam;
+    };
+    bool FindCxxClassConversionPair(const std::string& source, const std::string& target,
+                                    CxxClassConversionPair& out) const;
+    bool CxxConversionOperatorBindsBetter(const std::string& source, const std::string& target) const;
     std::vector<CxxConversionRank> RankCxxConversionSequences(
-        const std::vector<NamedVariable>& arguments, const FunctionSymbol& candidate) const;
+        const std::vector<NamedVariable>& arguments, const FunctionSymbol& candidate);
     // [over.match.best] per-argument comparison: -1 `a` better, 1 `b` better, 0 neither
     // (indistinguishable, or `crossing` when each is better somewhere), 2 not judged.
-    static int CompareCxxConversionRanks(const std::vector<CxxConversionRank>& a,
-                                         const std::vector<CxxConversionRank>& b, bool& crossing);
+    int CompareCxxConversionRanks(const std::vector<CxxConversionRank>& a,
+                                  const std::vector<CxxConversionRank>& b, bool& crossing) const;
     std::string IntegerParameterIdentity(const TypeAndValue& param) const;
     static int RankIntegerConversion(const std::string& argIdentity, const std::string& paramIdentity);
 
@@ -10121,7 +10196,8 @@ public:
      * wrote it.
      */
     // 96: generated [cpp] member helpers now expose non-override methods to C++ templates.
-    static constexpr int kCHeaderCacheVersion = 96;
+    // 97: default-argument wrappers skip ambiguous shortened calls, dedupe, move by-value args.
+    static constexpr int kCHeaderCacheVersion = 100;
     static std::string CompilerBuildStamp();
 
     static std::string GetCHeaderCacheDir();

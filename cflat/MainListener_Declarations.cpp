@@ -3281,7 +3281,10 @@ void MainListener::ParseFunctionDefinition(CFlatParser::FunctionDefinitionContex
         size_t bodyLine = 0;
         if (auto* body = func->compoundStatement())
             bodyLine = body->getStart()->getLine();
-        auto fn = compiler->CreateFunctionDefinition(name, returnType, allParams, returnType.external, varargs, line, returnsOwned, !structName.empty(), returnType.CallConv, bodyLine);
+        const std::string linkageName = returnType.external && structName.empty() && !namespaceName.empty()
+            ? ::getFunctionName(func, compiler) : std::string();
+        auto fn = compiler->CreateFunctionDefinition(name, returnType, allParams, returnType.external,
+            varargs, line, returnsOwned, !structName.empty(), returnType.CallConv, bodyLine, linkageName);
 
         // CreateFunctionDefinition returns the existing function (without setting up
         // a fresh entry block) when a matching definition was already emitted by a
@@ -8491,7 +8494,17 @@ void MainListener::RejectOwningTempUniqueFieldEscape(const LLVMBackend::NamedVar
 
 void MainListener::GuardOwningTempUniqueFieldEscape(const LLVMBackend::NamedVariable& nv,
                                            const std::string& destDesc,
-                                           antlr4::ParserRuleContext* ctx) {
+                                           antlr4::ParserRuleContext* ctx,
+                                           bool storeSite) {
+        // `&(new T(x))->f` stored anywhere: the temp is freed at the end of this statement.
+        if (storeSite && compilerLLVM != nullptr && !nv.TypeAndValue.IsMove
+            && compilerLLVM->AddressIntoStatementPtrTemp(nv.Primary))
+            LogErrorContext(ctx, std::format(
+                "cannot store an address inside a temporary 'new' object (such as "
+                "'&(new T(x))->field') into {} - the object is freed at the end of this "
+                "statement, leaving the stored address dangling. Bind the 'new' result to a "
+                "local first and take the address from that local.",
+                destDesc));
         if (IsOwningTempUniqueFieldEscape(nv))
         {
             RejectOwningTempUniqueFieldEscape(nv, destDesc, ctx);

@@ -3654,8 +3654,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 callArgs[1]->assignmentExpression());
                             auto sourceValue = sourceNV.Primary
                                 ? sourceNV.Primary : LoadNamedVariable(sourceNV);
-                            const bool consumesInferredSink = compiler->IsForeignNontrivialCxxClass(
-                                    destType.TypeName)
+                            const bool consumesInferredSink = !destType.Pointer
+                                && compiler->IsForeignNontrivialCxxClass(destType.TypeName)
                                 && sourceNV.TypeAndValue.IsOwningSink
                                 && compiler->OwningSinkConsumesConcrete(sourceNV.TypeAndValue);
                             sourceNV.IsRvalue = sourceNV.IsRvalue || sourceNV.IsExplicitMove
@@ -3682,7 +3682,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                         slotNV.CallerName, slotNV.FieldName);
                             };
 
-                            if (compiler->IsForeignNontrivialCxxClass(destType.TypeName))
+                            if (!destType.Pointer
+                                && compiler->IsForeignNontrivialCxxClass(destType.TypeName))
                             {
                                 EmitForeignCxxValueIntoSlot(destType, slotValue, sourceNV, sourceValue,
                                     ownedTempMark, "into construct_at storage", ctx);
@@ -6614,6 +6615,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     && (functionName.starts_with("std.")
                                         || !compiler->HasCxxFunctionTemplate(functionName));
                                 bool isTemplate = false;
+                                bool templateBesideNonTemplate = false;
                                 if (!receiverType.empty()
                                     && compiler->HasCxxFunctionTemplateMember(receiverType, functionName))
                                 {
@@ -6680,6 +6682,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                                     const auto& argument = arguments[i];
                                                     std::string argumentType = argument.TypeAndValue.TypeName;
                                                     if (argumentType.empty()) argumentType = argument.InferSourceTypeName;
+                                                    if (argumentType.empty()) argumentType = argument.LiteralIdentity;
                                                     const auto& parameter = symbol.Parameters[i];
                                                     exact = exact && !argumentType.empty()
                                                         && parameter.TypeName == argumentType
@@ -6704,11 +6707,16 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                                 break;
                                             }
                                     }
+                                    // A free function template joins its non-template overloads
+                                    // unless one matches exactly: its specialization may rank better.
+                                    templateBesideNonTemplate = hasNonWrapper && isTemplate
+                                        && owner.empty() && !hasExactNonWrapper;
                                     if (hasNonWrapper
                                         && (!cxxFreeFunction || !functionName.starts_with("std.")
                                             || hasExactNonWrapper)
                                         && !(hasForwardingReferenceTemplate
-                                             && hasForwardingReferenceLvalue)) return;
+                                             && hasForwardingReferenceLvalue)
+                                        && !templateBesideNonTemplate) return;
                                 }
                                 if (!isTemplate && owner.empty() && cxxBraceArguments.empty())
                                 {
@@ -6762,7 +6770,9 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 }
                                 if (!requested)
                                 {
-                                    if (!templateError.empty()) LogErrorContext(primaryCtx, templateError);
+                                    // No specialization: the non-template overloads still resolve the call.
+                                    if (!templateError.empty() && !templateBesideNonTemplate)
+                                        LogErrorContext(primaryCtx, templateError);
                                     compiler->DiscardCxxBraceArguments(arguments, cxxBraceArguments);
                                     cxxBraceArguments.clear();
                                     return;

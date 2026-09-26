@@ -18,7 +18,9 @@
 #include "llvm/Support/Error.h"
 #include "llvm/Support/TargetSelect.h"
 #include "llvm/IR/Module.h"
+#include "llvm/Bitcode/BitcodeReader.h"
 #include "llvm/Bitcode/BitcodeWriter.h"
+#include "llvm/IR/LLVMContext.h"
 #include "llvm/Linker/Linker.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/raw_ostream.h"
@@ -977,13 +979,21 @@ bool CxxIncrementalGroup::ParseRequest(const cflat_cinterop::ExtractRequest& req
         renamedWrappers.emplace_back(fresh, name);
         return true;
     };
-    if (!wrapperName.empty())
+    clang::ASTContext& context = impl_->interpreter->getCompilerInstance()->getASTContext();
+    std::set<std::string> chunkWrappers;
+    for (size_t pos = 0; (pos = chunk.find("__cflat_dflt_", pos)) != std::string::npos;)
     {
-        clang::ASTContext& context = impl_->interpreter->getCompilerInstance()->getASTContext();
-        if (!context.getTranslationUnitDecl()->lookup(
-                clang::DeclarationName(&context.Idents.get(wrapperName))).empty())
-            renameWrapper(wrapperName);
+        size_t end = pos;
+        while (end < chunk.size() && identChar(chunk[end])) ++end;
+        std::string name = chunk.substr(pos, end - pos);
+        if (name.ends_with("_cpp")) name.resize(name.size() - 4);
+        chunkWrappers.insert(std::move(name));
+        pos = end;
     }
+    for (const std::string& name : chunkWrappers)
+        if (!context.getTranslationUnitDecl()->lookup(
+                clang::DeclarationName(&context.Idents.get(name))).empty())
+            renameWrapper(name);
     clang::TranslationUnitDecl* preludeRoot = nullptr;
     {
         /*
@@ -1067,6 +1077,7 @@ bool CxxIncrementalGroup::ParseRequest(const cflat_cinterop::ExtractRequest& req
          * emitted it while its member was refused). Parse the repeat under a fresh name.
          */
         static const std::string kRedefinition = "redefinition of '__cflat_";
+        if (!wrapperBatch && error.starts_with(kRedefinition)) return false;
         if (wrapperBatch && attempt < 16 && error.starts_with(kRedefinition))
         {
             const size_t start = kRedefinition.size() - std::string("__cflat_").size();
@@ -1111,6 +1122,19 @@ bool CxxIncrementalGroup::ParseRequest(const cflat_cinterop::ExtractRequest& req
             std::cout << std::format("[verbose] incremental request dropped declarations after "
                                      "'{}':\n{}", error, dropped);
         chunk = PrepareRetryChunk(kept, attempt + 1);
+        // The failed attempt's default-argument wrappers stay emitted in CodeGen's module too;
+        // a kept one re-defined under its old name fails CodeGen and crashes GenModule.
+        for (const std::string& name : chunkWrappers)
+            if (std::none_of(renamedWrappers.begin(), renamedWrappers.end(),
+                             [&](const auto& entry) { return entry.second == name; }))
+                renameWrapper(name);
+        for (auto& [renamed, original] : renamedWrappers)
+        {
+            const std::string next =
+                std::format("{}__cflat_again{}", original, impl_->wrapperRenames++);
+            rewrite(renamed, next);
+            renamed = next;
+        }
     }
     error.clear();
     cflat_cinterop::ExtractRequest effective = req;
@@ -1160,11 +1184,25 @@ bool CxxIncrementalGroup::ParseRequest(const cflat_cinterop::ExtractRequest& req
                 if (llvm::GlobalValue* value = module->getNamedValue(renamed))
                     value->setName(original);
         }
-        if (module != nullptr && !out.bitcode.empty())
+        // The harvested bitcode also holds what the extractor emitted itself beyond the chunk's
+        // PTU module, so rename inside it rather than re-serializing the PTU module.
+        if (!out.bitcode.empty())
         {
+            llvm::LLVMContext bitcodeContext;
+            auto parsedBitcode = llvm::parseBitcodeFile(
+                llvm::MemoryBufferRef(out.bitcode, "cflat-incremental-request"), bitcodeContext);
+            if (!parsedBitcode)
+            {
+                error = "renaming default-argument wrappers: "
+                    + ErrorText(parsedBitcode.takeError());
+                return false;
+            }
+            for (const auto& [renamed, original] : renamedWrappers)
+                if (llvm::GlobalValue* value = (*parsedBitcode)->getNamedValue(renamed))
+                    value->setName(original);
             out.bitcode.clear();
             llvm::raw_string_ostream os(out.bitcode);
-            llvm::WriteBitcodeToFile(*module, os);
+            llvm::WriteBitcodeToFile(**parsedBitcode, os);
             os.flush();
         }
     }

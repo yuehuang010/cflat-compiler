@@ -20,6 +20,10 @@
       "'alignas(0, 32)'",
       "64"
     ],
+    "ambiguouscalltoarg0n...achelperthatpicksone1dc49999f19f6b0a": [
+      "cpppa.rk_qn",
+      "cpppa.rk_qn(cpppa.RkW*), cpppa.rk_qn(const cpppa.RkW*)"
+    ],
     "ambiguouscalltoarg0n...parametertypeyoumean6524b093d1fa9da7": [
       "tieLit",
       "tieLit(u8), tieLit(u16)"
@@ -626,6 +630,12 @@
       "void*(char*, char*)",
       "int(int)"
     ],
+    "conversionfromarg0to...loneofthemexplicitlyab9b302918f3f24b": [
+      "cpppa.RkSrc",
+      "cpppa.RkTgt",
+      "operator cpppa::RkTgt()",
+      "cpppa::RkTgt(const cpppa::RkSrc &)"
+    ],
     "conversionfromarg0to...versionsowntypefirst7a5cfbd608174216": [
       "Both",
       "double",
@@ -669,6 +679,12 @@
       "u16"
     ],
     "enumvaluemustbeacons...antintegerexpression27ab0d73ff8c6d18": [],
+    "externarg0definesthe...nameinsideanamespacebbf447ff0a6c2ca8": [
+      "nb.Dup",
+      "Dup",
+      "err_namespaced_extern_c_symbol_collision.cb",
+      "5"
+    ],
     "extraneousinputarg0expectingarg1": [
       "'}'",
       "<EOF>"
@@ -1811,6 +1827,7 @@
     "alignasisnotsupporte...htheplaindeallocator2beff51adb78c9c4": "'alignas' is not supported on a 'new T[n]' stored into 'array<T>': the array frees its buffer through the plain deallocator",
     "alignmentmismatchini...ntthevaluealreadyhas5a4ed9c3ad1bf980": "alignment mismatch initializing '{0}': the declared type allocates at {1}, but the value was allocated {2}. Allocate the value with the matching 'alignas(0, {3})' clause, or declare the receiver with the alignment the value already has.",
     "alignmentmismatchmov...hthecorrectalignmenta5e59547dcfd5ec4": "alignment mismatch moving into the 'move' parameter of '{0}': the parameter is declared 'alignas(0, {1})' but the argument was allocated 'alignas(0, {2})'. The two must agree so the callee frees with the correct alignment.",
+    "ambiguouscalltoarg0n...achelperthatpicksone1dc49999f19f6b0a": "ambiguous call to '{0}': no candidate ranks better than the others: {1}. They differ only in const, which a CFlat argument does not carry; call it through a C++ helper that picks one.",
     "ambiguouscalltoarg0n...parametertypeyoumean6524b093d1fa9da7": "ambiguous call to '{0}': no candidate ranks better than the others: {1}. Cast the argument to the parameter type you mean.",
     "arg0": "{0}",
     "arg0arg1mustbearg2or...obeexecutedinprocess28e30d1abeb98a2b": "{0}: '{1}' must be '{2}' or '{3}' to be executed in-process.",
@@ -1960,6 +1977,7 @@
     "conflictingdeclarati...amebindsonesignature5cc1d51c1609eaad": "conflicting declaration of extern '{0}' from C import '{1}': the linkage name is already declared as '{2}', but the C prototype is '{3}'. Remove or correct one of them - a linkage name binds one signature.",
     "conflictingdeclarati...orcalltheexistingone48bd3125877b9b29": "conflicting declaration of extern '{0}': the linkage name is already declared as '{1}', but this declaration is '{2}'. Rename your extern, or call the existing one.",
     "conflictingdeclarati...penfreadfwritefclosec74614431b9da0db": "conflicting declaration of extern '{0}': the linkage name is already declared as '{1}', but this declaration is '{2}'. Rename your extern, or call the existing one - for file I/O use os.windows.fopen/fread/fwrite/fclose.",
+    "conversionfromarg0to...loneofthemexplicitlyab9b302918f3f24b": "conversion from '{0}' to '{1}' is ambiguous: '{2}' and '{3}' bind the argument equally well. Call one of them explicitly.",
     "conversionfromarg0to...versionsowntypefirst7a5cfbd608174216": "conversion from '{0}' to '{1}' is ambiguous: {2} each reach it through one standard conversion. Cast to the conversion's own type first.",
     "cppstructarg0hasanun...fieldarg1useapointer9576d7fd975b25ee": "[cpp] struct '{0}' has an unsized field '{1}'; use a pointer",
     "cppstructcannotbeaunion": "[cpp] struct cannot be a union",
@@ -1981,6 +1999,7 @@
     "enumvaluearg0doesnot...itthebackingtypearg126f3d97db475a557": "enum value '{0}' does not fit the backing type '{1}'",
     "enumvaluemustbeacons...antintegerexpression27ab0d73ff8c6d18": "enum value must be a constant integer expression",
     "expectedatype": "expected a type",
+    "externarg0definesthe...nameinsideanamespacebbf447ff0a6c2ca8": "extern '{0}' defines the C symbol '{1}', which is already defined at {2}({3}); an extern function keeps its unqualified C name inside a namespace",
     "extraneousinputarg0expectingarg1": "extraneous input {0} expecting {1}",
     "failedtodeploypriarg0toarg1arg2": "failed to deploy pri '{0}' to '{1}': {2}",
     "failedtodeployprisou...cearg0nolongerexistscc21702a8363e3dc": "failed to deploy pri: source '{0}' no longer exists",

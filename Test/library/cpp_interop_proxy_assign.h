@@ -148,4 +148,76 @@ struct RankM {
     int g(int a, double b) { return 7; }
     int g(long a, float b) { return 8; }
 };
+// Same-rank [over.ics.rank] tie-breakers: qualification and reference cv (3.2.5 / 3.2.6),
+// derived-to-base distance and base over void* (4.4), the implicit object parameter; and the
+// cells clang calls ambiguous because nothing tells the candidates apart.
+struct RkW { int v; RkW() : v(1) {} };
+struct RkBase { int b; RkBase() : b(1) {} };
+struct RkMid : RkBase { int m; RkMid() : m(2) {} };
+struct RkBottom : RkMid { int t; RkBottom() : t(3) {} };
+inline int rk_qp(int* p) { return 31; }
+inline int rk_qp(const int* p) { return 32; }
+inline int rk_pv(void* p) { return 95; }
+inline int rk_pv(const RkW* p) { return 96; }
+inline int rk_bv(RkBase* p) { return 97; }
+inline int rk_bv(void* p) { return 98; }
+inline int rk_ul(unsigned x) { return 1; }
+inline int rk_ul(long x) { return 2; }
+inline int rk_wc(RkW& a, const RkW& b) { return 13; }
+inline int rk_wc(const RkW& a, RkW& b) { return 14; }
+inline int rk_dx(RkBase* a, RkMid* b) { return 25; }
+inline int rk_dx(RkMid* a, RkBase* b) { return 26; }
+inline int rk_qc(int* a, const int* b) { return 33; }
+inline int rk_qc(const int* a, int* b) { return 34; }
+inline int rk_qn(RkW* p) { return 35; }
+inline int rk_qn(const RkW* p) { return 36; }
+inline int rk_us(long x) { return 41; }
+inline int rk_us(double x) { return 42; }
+inline int rk_dflt(int, int = 0) { return 81; }
+inline int rk_dflt(int, int = 0, int = 0) { return 82; }
+struct RkObj {
+    int f(int x) const { return 51; }
+    int f(long x) { return 52; }
+};
+struct RkHB {
+    int h(unsigned x) { return 61; }
+    int h(long x) { return 62; }
+};
+struct RkHD : RkHB { int own; RkHD() : own(0) {} };
+struct RkTgt;
+struct RkSrc { int v; RkSrc() : v(0) {} operator RkTgt() const; };
+struct RkTgt { int t; RkTgt() : t(0) {} RkTgt(const RkSrc&) : t(1) {} };
+inline RkSrc::operator RkTgt() const { return {}; }
+inline int rk_conv(RkTgt t) { return 71 + t.t; }
+inline int rk_conv_ref(const RkTgt& t) { return 73 + t.t; }
+// Qualification on conversion sequences: T* -> void* vs T* -> const void*, and derived-to-base
+// into Base* / const Base* or Base& / const Base&; the less qualified target wins (3.2.5 / 3.2.6).
+inline int rk_vp(void* p) { return 21; }
+inline int rk_vp(const void* p) { return 22; }
+inline int rk_bc(RkBase* p) { return 50; }
+inline int rk_bc(const RkBase* p) { return 51; }
+inline int rk_br(RkBase& b) { return 52; }
+inline int rk_br(const RkBase& b) { return 53; }
+// Remaining pick cells: string literal, unscoped enum promotion, member name hiding, template
+// vs non-template, non-const conversion operator vs const-reference converting constructor.
+inline int rk_cc(char* p) { return 5; }
+inline int rk_cc(const char* p) { return 6; }
+enum RkE { RK_EA, RK_EB };
+enum RkSmall : unsigned char { RK_SA };
+inline int rk_en(int x) { return 9; }
+inline int rk_en(long x) { return 10; }
+inline int rk_sm(unsigned char x) { return 11; }
+inline int rk_sm(int x) { return 12; }
+struct RkHideBase { int f(int) { return 60; } int f(double) { return 61; } int g(int) { return 62; } };
+struct RkHide : RkHideBase { int f(long) { return 63; } };
+struct RkHideMore : RkHide { int h() { return 64; } };
+struct RkUsing : RkHideBase { using RkHideBase::f; int f(long) { return 65; } };
+template <typename T> inline int rk_tp(T x) { return 70; }
+inline int rk_tp(long x) { return 71; }
+template <typename T> inline int rk_tn(T x) { return 72; }
+inline int rk_tn(int x) { return 73; }
+struct RkSource;
+struct RkTarget { int k; RkTarget() : k(0) {} RkTarget(const RkSource&) : k(74) {} };
+struct RkSource { int s; RkSource() : s(0) {} operator RkTarget() { RkTarget t; t.k = 75; return t; } };
+inline int rk_take(RkTarget t) { return t.k; }
 }

@@ -1032,6 +1032,8 @@ namespace sysapi.libc
     int area(Box2* b) { return b->w * b->h; }
 }
 
+namespace nsx { extern int LaterNs(int x); }
+
 using Math = MathUtils;          // global alias for top-level namespace
 using MathAdv = MathUtils.Advanced;  // global alias for nested namespace
 
@@ -1066,6 +1068,7 @@ bool testNamespace()
     result &= Test("namespace_global_outer_from_nested", MathUtils.Advanced.readOuterBase(), 120);
     // Dotted namespace declaration + extern with bare linkage inside a namespace.
     result &= Test("dotted_ns_extern", sysapi.libc.toupper('a'), 'A');
+    result &= Test("namespaced_extern_body", nsx.LaterNs(4), 10);
     sysapi.libc.Box2 bx;
     bx.w = 3; bx.h = 5;
     result &= Test("dotted_ns_struct_sibling_sig", sysapi.libc.area(&bx), 15);
@@ -1080,6 +1083,8 @@ bool testLocalUsing()
     result &= Test("local_using_multiply", M.multiply(2, 3), 6);
     return result;
 }
+
+namespace nsx { extern int LaterNs(int x) { return x + 6; } }
 
 bool testNestedNamespace()
 {

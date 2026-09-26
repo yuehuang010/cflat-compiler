@@ -6203,6 +6203,8 @@ void MainListener::FinishTernaryArm(LLVMBackend* compiler, llvm::Value*& value,
                           const LLVMBackend::OwnedTempMark& mark, bool& deepCopied,
                           llvm::BasicBlock* hoistTo) {
         value = AdoptTernaryStringArm(compiler, value, deepCopied);
+        if (inCallArgument_ && !deepCopied)
+            compiler->HoistOwnedPtrTempsForAddress(mark, value, hoistTo);
         compiler->FlushOwnedTempsSince(mark, deepCopied ? nullptr : value, hoistTo);
     }
 
@@ -7290,6 +7292,7 @@ LLVMBackend::TypedValue MainListener::ParseConditionalExpression(
             bool rhsUniqueFieldRead = false;
             size_t rhsOcc = compiler->CurrentCastOccurrence();
             LLVMBackend::OwnedTempMark rhsMark = compiler->MarkOwnedTemps();
+            bool rhsAddrIntoTemp = false;
             llvm::UncondBrInst* rhsBr = nullptr;
             try
             {
@@ -7342,6 +7345,12 @@ LLVMBackend::TypedValue MainListener::ParseConditionalExpression(
                 // `nullcoal_null` does not dominate the resume block, so the end-of-statement flush
                 // would skip its temps; mirror FinishTernaryArm and keep the yielded value. The
                 // branch block does dominate the resume, so struct temps hoist there instead.
+                // The join below is a load off a slot, which the address walk cannot follow.
+                rhsAddrIntoTemp = compiler->AddressIntoStatementPtrTemp(rhs);
+                if (inCallArgument_)
+                    compiler->HoistOwnedPtrTempsForAddress(rhsMark, rhs,
+                                                           nullBlock->getSinglePredecessor(),
+                                                           /*includeBareNew*/ true);
                 compiler->FlushOwnedTempsSince(rhsMark, rhs, nullBlock->getSinglePredecessor());
                 compiler->CreateAssignment(rhs, resultAlloca);
                 if (rhsUniqueFieldRead)
@@ -7373,6 +7382,8 @@ LLVMBackend::TypedValue MainListener::ParseConditionalExpression(
 
             compiler->SwitchToBlock(resumeBlock);
             auto* joined = compiler->CreateLoad(resultAlloca);
+            if (rhsAddrIntoTemp || compiler->AddressIntoStatementPtrTemp(lhs))
+                compiler->RegisterAddressIntoTempValue(joined);
             if (joined != nullptr && pointerJoinDest.Pointer)
                 compiler->RegisterValueElementTypeName(joined, pointerJoinDest.TypeName);
             if (lhsAlias || rhsAlias) compiler->RegisterAliasValue(joined);
@@ -7388,6 +7399,9 @@ LLVMBackend::TypedValue MainListener::ParseConditionalExpression(
             {
                 compiler->RegisterNullCoalesceJoin(
                     joined, { { lhs, lhsBr->getParent() }, { rhs, rhsBr->getParent() } });
+                if (!inCallArgument_ && JoinArmIsProvablyNull(lhs)
+                    && compiler->IsOwnedNewTemp(rhs))
+                    compiler->PropagateOwnedNewTemp(rhs, joined);
                 compiler->PropagateAliasValue(lhs, rhs, joined);
                 compiler->PropagateBondedValue(lhs, rhs, joined);
                 compiler->RegisterJoinArmCastOccurrence(joined, 0, lhsOcc);
@@ -12760,9 +12774,11 @@ bool MainListener::EmitOneFieldInit(
         {
             bool braceDestOwns = braceDestOwnsPointee || braceDestOwnsValue
                 || IsOwningUniqueInterfaceField(fieldType);
+            // A brace temporary passed as a call argument dies with the statement, like its field.
             GuardOwningTempUniqueFieldEscape(
                 rightNV, std::format("{}field '{}.{}'", braceDestOwns ? "unique " : "",
-                                     displayTypeName, fieldName), errCtx);
+                                     displayTypeName, fieldName), errCtx,
+                /*storeSite*/ !inCallArgument_);
         }
 
         if (rightNV.IsBonded || rightNV.ContainsBondedClosure || compiler->lastCallIsBonded)
@@ -15221,8 +15237,8 @@ LLVMBackend::NamedVariable MainListener::ParseNewExpression(CFlatParser::NewExpr
             }
             return std::nullopt;
         };
-        auto allocAccess = selectedAllocAccess(allocOperator);
-        auto deleteAccess = selectedAllocAccess(deleteOperator);
+        auto allocAccess = typeIsPtr ? std::optional<int>{} : selectedAllocAccess(allocOperator);
+        auto deleteAccess = typeIsPtr ? std::optional<int>{} : selectedAllocAccess(deleteOperator);
         const std::string denied = allocAccess && *allocAccess != cflat_cinterop::AccessPublic
             ? allocOperator
             : deleteAccess && *deleteAccess != cflat_cinterop::AccessPublic
@@ -15336,6 +15352,7 @@ LLVMBackend::NamedVariable MainListener::ParseNewExpression(CFlatParser::NewExpr
             result.Primary = block;
             result.BaseType = block->getType();
             compiler->lastOwningResult = true;
+            compiler->RegisterOwnedNewTemp(block, typeName, 0);
             return result;
         }
 
@@ -15421,7 +15438,7 @@ LLVMBackend::NamedVariable MainListener::ParseNewExpression(CFlatParser::NewExpr
             compiler->builder->CreateMemSet(rawPtr, compiler->builder->getInt8(0), sizeVal,
                                             llvm::MaybeAlign(1));
         }
-        else if (!typeName.empty() && compiler->GetFunction(opNewName))
+        else if (!typeIsPtr && !typeName.empty() && compiler->GetFunction(opNewName))
         {
             rawPtr = compiler->CreateOverloadedFunctionCall(opNewName, newArgs);
         }
@@ -15739,7 +15756,7 @@ LLVMBackend::NamedVariable MainListener::ParseDeleteExpression(CFlatParser::Dele
             // `delete w->get();` - an unbound call result, so nothing classified it as a borrow.
             ApplyCallResultBorrowProvenance(compiler, namedVar);
             typeName  = namedVar.TypeAndValue.TypeName;
-            elemIsPtr = namedVar.TypeAndValue.ElemPointer;
+            elemIsPtr = namedVar.TypeAndValue.ValuePointerDepth() >= 2;
             // A DECLARED 'alignas(0, N)' clause counts as well as a tracked block alignment: the
             // scope-exit path (EmitOwningPtrCleanup) already frees on the max of the two, so an
             // explicit 'delete' of the same local must reach the same deallocator.
@@ -16409,7 +16426,7 @@ LLVMBackend::NamedVariable MainListener::ParseDeleteExpression(CFlatParser::Dele
         {
             compiler->EmitCxxHeapFreeCounted(typeName, voidPtr, cxxArrayCount, operandAllocAlign);
         }
-        else if (!typeName.empty() && compiler->GetFunction(opDelName))
+        else if (!elemIsPtr && !typeName.empty() && compiler->GetFunction(opDelName))
         {
             compiler->CreateOverloadedFunctionCall(opDelName, { ptrArg });
         }

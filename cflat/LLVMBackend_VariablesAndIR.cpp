@@ -935,7 +935,13 @@ llvm::Value* LLVMBackend::CreateCast(llvm::Value* value, llvm::Type* destType, b
 
         // Pointer -> Integer
         if (srcType->isPointerTy() && destType->isIntegerTy())
-            return builder->CreatePtrToInt(value, destType);
+        {
+            // An integer hides provenance from every later check: the flush keeps the temp alive
+            // when the integer escapes (see ClaimIntLaunderedPtrTemps).
+            llvm::Value* asInt = builder->CreatePtrToInt(value, destType);
+            RecordPtrToIntOfTemp(asInt, value);
+            return asInt;
+        }
 
         // Integer -> Pointer
         if (srcType->isIntegerTy() && destType->isPointerTy())

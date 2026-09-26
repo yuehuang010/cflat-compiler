@@ -30,6 +30,7 @@ struct Cls
     static void* operator new(std::size_t n) { ++Cnt::clsNew; return std::malloc(n); }
     static void operator delete(void* p) { ++Cnt::clsDel; std::free(p); }
 };
+inline Cls* makeBorrowedCls(int x) { return new Cls(x); }
 // Inherits Cls's operators through name lookup.
 struct ClsDerived : Cls { ClsDerived(int x) : Cls(x) {} };
 // Only the SIZED class delete: the size must be sizeof(Sized), else the count jumps by 100.
@@ -106,6 +107,41 @@ struct alignas(64) Wide
     Wide() : v(6) { ++Cnt::live; }
     ~Wide() { --Cnt::live; ++Cnt::dtors; }
     int get() const { return v; }
+};
+// `this` escape (legs 3613-3619): an unclaimed `(new Esc(x))->m()` receiver is freed at the end
+// of the full expression only when m's body provably does not retain `this`.
+struct Esc;
+inline Esc* escKept = nullptr;
+inline int escRead(const Esc* p) noexcept;
+int escOpaque(const Esc* p);   // defined in cpp_interop_unwind.cpp: no body visible here
+struct Esc
+{
+    int v;
+    Esc(int x) : v(x) { ++Cnt::live; }
+    ~Esc() { --Cnt::live; ++Cnt::dtors; }
+    static void* operator new(std::size_t n) { ++Cnt::clsNew; return std::malloc(n); }
+    static void operator delete(void* p) { ++Cnt::clsDel; std::free(p); }
+    int get() const { return v; }
+    int bump() { v += 1; return v; }
+    int keep() { escKept = this; return v; }
+    Esc* self() { return this; }
+    int viaHelper() const { return get() + escRead(this); }
+    int viaKeep() { return keep() + 1; }
+    int outOfLine() const { return escOpaque(this); }
+};
+inline int escRead(const Esc* p) noexcept { return p->v; }
+inline int escThrow(Esc* p, int value) { if (value != 0) throw value; return p->v; }
+inline int escThrowKeep(Esc* p, int value)
+{ if (p != nullptr) escKept = p; throw value; }
+inline Esc* escTake() noexcept { Esc* p = escKept; escKept = nullptr; return p; }
+struct EscPoly
+{
+    int v;
+    EscPoly(int x) : v(x) { ++Cnt::live; }
+    virtual ~EscPoly() { --Cnt::live; ++Cnt::dtors; }
+    virtual int vget() const { return v; }
+    static void* operator new(std::size_t n) { ++Cnt::clsNew; return std::malloc(n); }
+    static void operator delete(void* p) { ++Cnt::clsDel; std::free(p); }
 };
 inline void reset() noexcept
 { Cnt::clsNew = Cnt::clsDel = Cnt::clsNewArr = Cnt::clsDelArr = Cnt::live = Cnt::dtors = 0; }

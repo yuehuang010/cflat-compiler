@@ -2387,6 +2387,8 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
     // C++ definitions Clang emitted for imported headers join the module BEFORE verification and
     // optimization, so they are optimized (and inlined) with the rest of the program.
     if (!LinkCxxCompanionModules()) return false;
+    // The C++ bodies are in the module now: answer the `this`-escape gates left false.
+    ResolveCxxThisEscapeGates();
 
     // Clang's own initializers are in llvm.global_ctors only after the link above, so the
     // single-driver rewrite that fixes construction order has to run here, not earlier.
@@ -4483,6 +4485,7 @@ void LLVMBackend::ResetForReanalysis()
 {
     EndActiveRoot();
     ownReleaseGates_.clear();
+    cxxThisEscapeGates_.clear();
     ownAdoptGates_.clear();
     ownSlotLeavingLoads_.clear();
     analyzeDebugInfo_ = false;
@@ -4718,6 +4721,7 @@ void LLVMBackend::ResetForReanalysis()
     programTable.clear();
     enumBackingTypes.clear();
     scopedEnumTypes_.clear();
+    enumPromotedTypes_.clear();
     enumDeclSites_.clear();
     typeAliases.clear();
     aliasScopeStack_.clear();
@@ -4797,6 +4801,9 @@ void LLVMBackend::ResetForReanalysis()
     cflatExternBodyNames_.clear();
     moveTransferConsumedTemps_.clear();
     pendingOwnedPtrTemps.clear();
+    addrClaimedPtrTemps_.clear();
+    addrIntoTempValues_.clear();
+    ptrToIntOfTemps_.clear();
     ownedReturnTemps_.clear();
     ownedReturnReleaseTemps_.clear();
     ownedNewTemps_.clear();
@@ -7649,6 +7656,7 @@ bool LLVMBackend::LoadCoreBitcodeIfFresh(const std::string& cacheDir, const std:
     manglingPointerAliases_.clear();
     enumBackingTypes.clear();
     scopedEnumTypes_.clear();
+    enumPromotedTypes_.clear();
     enumDeclSites_.clear();
     // strConcatRegistered / stringDtorRegistered: will be set below after deserialization
     // verifies the functions are present in the bitcode.

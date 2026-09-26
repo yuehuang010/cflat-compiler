@@ -2358,6 +2358,16 @@ void LLVMBackend::DiagnoseDuplicateFunctionBody(const std::string& functionName,
         const std::string& firstFile = it->second.first;
         size_t firstLine = it->second.second;
         if (line == 0 || firstLine == 0 || firstLine == line) return;
+        // A namespaced extern keeps its bare C symbol, so two namespaces can collide on it.
+        if (functionName != mangledName && functionName.find('.') != std::string::npos
+            && mangledName.find_first_of(".$") == std::string::npos)
+        {
+            LogErrorMessage("extern '{}' defines the C symbol '{}', which is already defined at {}({}); "
+                "an extern function keeps its unqualified C name inside a namespace",
+                { SpellFunctionSymbol(*this, functionName), mangledName, firstFile,
+                  std::to_string(firstLine) });
+            return;
+        }
         LogErrorMessage("redefinition of '{}' - the same overload is already defined at "
             "{}({}). Two parameter lists that differ only in a SPELLING of one type ('int' and "
             "'i32' name the same type) are one overload, not two.",
@@ -2377,7 +2387,7 @@ bool LLVMBackend::OverloadSlotIsDefined(const std::string& functionName, const L
         return true;
     }
 
-llvm::Function* LLVMBackend::CreateFunctionDefinition(const std::string& functionName, const LLVMBackend::TypeAndValue& returnType, const std::vector<LLVMBackend::TypeAndValue>& arguments, bool external, bool varargs, size_t line, bool returnsOwned, bool isMethod, CallingConv callConv, size_t scopeLine)
+llvm::Function* LLVMBackend::CreateFunctionDefinition(const std::string& functionName, const LLVMBackend::TypeAndValue& returnType, const std::vector<LLVMBackend::TypeAndValue>& arguments, bool external, bool varargs, size_t line, bool returnsOwned, bool isMethod, CallingConv callConv, size_t scopeLine, const std::string& linkageName)
 {
         // A signature parked during the scan must reach the function table before this body
         // (and its call sites) are emitted.
@@ -2417,7 +2427,8 @@ llvm::Function* LLVMBackend::CreateFunctionDefinition(const std::string& functio
         // an imported library's own `main` must mangle normally or it collides with the app's.
         bool entryMain = !external && currentSourceFilePath_ == analyzedRootPath_
             && IsImplicitEntryMain(functionName, returnType, arguments, isMethod, varargs);
-        std::string mangledName = (external || entryMain) ? functionName
+        std::string mangledName = external && !linkageName.empty() ? linkageName
+                                : (external || entryMain) ? functionName
                                 : ComputeMangledName(functionName, returnType, arguments, varargs);
 
         if (functionType == nullptr)

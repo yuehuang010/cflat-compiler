@@ -73,5 +73,67 @@ extern int main()
         int r = m->g(i, f);
         delete m;
     }
+
+    // Nothing tells the candidates apart (each was a silent pick before). int -> unsigned and
+    // int -> long are both conversions.
+    expect_error("ambiguous call to 'cpppa.rk_ul': no candidate ranks better") {
+        int i = 1;
+        int r = cpppa.rk_ul(i);
+    }
+    // One operator int feeding int -> long and int -> double: equal second conversions.
+    expect_error("ambiguous call to 'cpppa.rk_us': no candidate ranks better") {
+        cpppa.RankP p = cpppa.RankP();
+        int r = cpppa.rk_us(p);
+    }
+    // f(int, int = 0) vs f(int, int = 0, int = 0) with one argument.
+    expect_error("ambiguous call to 'cpppa.rk_dflt': no candidate ranks better") {
+        int r = cpppa.rk_dflt(1);
+    }
+    // nullptr converts to either pointer at the same rank.
+    expect_error("ambiguous call to 'cpppa.rk_qn': no candidate ranks better") {
+        int r = cpppa.rk_qn(nullptr);
+    }
+    // Crossings through a tie-breaker: W& over const W& ([over.ics.rank] 3.2.6) ...
+    expect_error("ambiguous call to 'cpppa.rk_wc': no candidate ranks better") {
+        cpppa.RkW a = cpppa.RkW();
+        cpppa.RkW b = cpppa.RkW();
+        int r = cpppa.rk_wc(a, b);
+    }
+    // ... int* over const int* (3.2.5) ...
+    expect_error("ambiguous call to 'cpppa.rk_qc': no candidate ranks better") {
+        int x = 1;
+        int r = cpppa.rk_qc(&x, &x);
+    }
+    // ... Bottom* -> Mid* over Bottom* -> Base* (4.4) ...
+    expect_error("ambiguous call to 'cpppa.rk_dx': no candidate ranks better") {
+        cpppa.RkBottom b = cpppa.RkBottom();
+        int r = cpppa.rk_dx(&b, &b);
+    }
+    // ... and the non-const implicit object over the const one, value and pointer receivers.
+    expect_error("ambiguous call to 'f': no candidate ranks better") {
+        cpppa.RkObj o = cpppa.RkObj();
+        int r = o.f(1);
+    }
+    expect_error("ambiguous call to 'f': no candidate ranks better") {
+        cpppa.RkObj* o = new cpppa.RkObj();
+        int r = o->f(1);
+        delete o;
+    }
+    // A member overload set inherited from a base class is ranked like a declared one.
+    expect_error("ambiguous call to 'h': no candidate ranks better") {
+        cpppa.RkHD d = cpppa.RkHD();
+        int i = 1;
+        int r = d.h(i);
+    }
+    // `operator RkTgt() const` and `RkTgt(const RkSrc&)` convert equally well, by value and
+    // into a const reference.
+    expect_error("conversion from 'cpppa.RkSrc' to 'cpppa.RkTgt' is ambiguous: 'operator cpppa::RkTgt() const' and 'cpppa::RkTgt(const cpppa::RkSrc &)' bind the argument equally well") {
+        cpppa.RkSrc s = cpppa.RkSrc();
+        int r = cpppa.rk_conv(s);
+    }
+    expect_error("conversion from 'cpppa.RkSrc' to 'cpppa.RkTgt' is ambiguous") {
+        cpppa.RkSrc s = cpppa.RkSrc();
+        int r = cpppa.rk_conv_ref(s);
+    }
     return 0;
 }

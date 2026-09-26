@@ -1,0 +1,12 @@
+// An extern function keeps its unqualified C symbol inside a namespace (so a namespaced
+// prototype binds its later body), which means two namespaces defining the same extern
+// name collide on one symbol - reported as such, not as a same-overload redefinition.
+expect_error("defines the C symbol 'Dup', which is already defined at") {
+    namespace na { extern int Dup(int x) { return x + 1; } }
+    namespace nb { extern int Dup(int x) { return x + 2; } }
+}
+
+extern int main()
+{
+    return 0;
+}

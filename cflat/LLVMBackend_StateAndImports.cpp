@@ -2303,6 +2303,7 @@ nlohmann::json LLVMBackend::EnumToJson(const CEnumEntry& e)
         nlohmann::json j = {{"n", e.name}, {"v", e.value}, {"ln", e.line}, {"co", e.col}};
         if (!e.enumType.empty()) j["et"] = e.enumType;
         if (!e.underlyingType.empty()) j["ut"] = e.underlyingType;
+        if (!e.promotedType.empty()) j["pt"] = e.promotedType;
         if (e.isScoped) j["sc"] = true;
         return j;
     }
@@ -2316,6 +2317,7 @@ LLVMBackend::CEnumEntry LLVMBackend::EnumFromJson(const SjVal& j)
         e.col = j.value("co", 0);
         e.enumType = j.value("et", std::string{});
         e.underlyingType = j.value("ut", std::string{});
+        e.promotedType = j.value("pt", std::string{});
         e.isScoped = j.value("sc", false);
         return e;
     }
@@ -2973,6 +2975,12 @@ bool LLVMBackend::TryLoadCHeaderDiskCache(
         // v93 exports non-special user operator= overloads and member templates for assignment calls.
         // v94 caps each serialized C++ member refusal cause at 4 KB on a line boundary.
         // v95 refuses a member whose signature contains clang error nodes instead of mangling it.
+        // v97 default-argument wrappers: none for a shortened call C++ finds ambiguous (recorded
+        // as unsupported), one per name, and by-value arguments moved on (move-only types).
+        // v98 no default-argument wrapper for a member whose signature or receiver names a
+        // non-public member type (recorded as unsupported).
+        // v99 carries an unscoped enum's integral promotion type for C++ overload ranking.
+        // v100 emits out-of-line non-inline members of implicit template instantiations locally.
         if (version != kCHeaderCacheVersion) return cacheMiss("cache version");
 
         if (!expectedRequestKey.empty()
@@ -3401,6 +3409,12 @@ void LLVMBackend::WriteCHeaderDiskCache(
         // v93 exports non-special user operator= overloads and member templates for assignment calls.
         // v94 caps each serialized C++ member refusal cause at 4 KB on a line boundary.
         // v95 refuses a member whose signature contains clang error nodes instead of mangling it.
+        // v97 default-argument wrappers: none for a shortened call C++ finds ambiguous (recorded
+        // as unsupported), one per name, and by-value arguments moved on (move-only types).
+        // v98 no default-argument wrapper for a member whose signature or receiver names a
+        // non-public member type (recorded as unsupported).
+        // v99 carries an unscoped enum's integral promotion type for C++ overload ranking.
+        // v100 emits out-of-line non-inline members of implicit template instantiations locally.
         j["version"] = kCHeaderCacheVersion;
         j["mtime"]   = (int64_t)mtime.time_since_epoch().count();
         j["hash"]    = contentHash;

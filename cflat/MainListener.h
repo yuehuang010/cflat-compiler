@@ -4619,9 +4619,11 @@ public:
      * proves the escape, and otherwise records the SITE when the value is a CANDIDATE launder (a
      * callee defined below its call site), for the end-of-module resolve to answer.
      */
+    // `storeSite`: a store (not a return) also refuses an address into an owning pointer temp.
     void GuardOwningTempUniqueFieldEscape(const LLVMBackend::NamedVariable& nv,
                                           const std::string& destDesc,
-                                          antlr4::ParserRuleContext* ctx);
+                                          antlr4::ParserRuleContext* ctx,
+                                          bool storeSite = true);
 
     /*
      * True when a destination field PROVABLY owns a raw pointer whose synthesized destructor

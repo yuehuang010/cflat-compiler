@@ -1,0 +1,72 @@
+// An address INTO an owning pointer temporary (`&(new T(x))->field`) must not be stored anywhere
+// that outlives the statement: the temporary is freed at the end of the full expression, so the
+// stored pointer dangles. Every store shape is refused ('?:' and '??' joins included); a brace
+// temporary passed as a call argument dies with the statement and stays accepted. A RETURNED
+// address (direct, through a '?:' arm, or laundered through an integer) is kept alive instead - value legs 3631-3636 in
+// Test/test_cpp_interop.cb and testAddressIntoNewTemp in Test/test_move.cb. Each leg is scoped.
+
+struct Cell { int v = 0; int arr[4]; Cell(int x) { v = x; } ~Cell() { } };
+struct Ref { int* p = nullptr; };
+int* gAddr = nullptr;
+
+expect_error("temporary 'new' object (such as '&(new T(x))->field') into a local") {
+    void declLocal() { int* g = &(new Cell(1))->v; }
+}
+
+expect_error("temporary 'new' object (such as '&(new T(x))->field') into a longer-lived location") {
+    void assignLocal() { int* g = nullptr; g = &(new Cell(2))->v; }
+}
+
+expect_error("temporary 'new' object (such as '&(new T(x))->field') into a longer-lived location") {
+    void assignField() { Ref r; r.p = &(new Cell(3))->v; }
+}
+
+expect_error("temporary 'new' object (such as '&(new T(x))->field') into a longer-lived location") {
+    void assignGlobal() { gAddr = &(new Cell(4))->v; }
+}
+
+expect_error("temporary 'new' object (such as '&(new T(x))->field') into a longer-lived location") {
+    Ref returnedStruct(int x) { Ref r; r.p = &(new Cell(x))->v; return r; }
+}
+
+expect_error("temporary 'new' object (such as '&(new T(x))->field') into a local") {
+    void ternaryDecl(int c) { int* g = c > 0 ? &(new Cell(c))->v : nullptr; }
+}
+
+expect_error("temporary 'new' object (such as '&(new T(x))->field') into a longer-lived location") {
+    void ternaryAssign(int c) { int y = 0; int* g = nullptr; g = c > 0 ? &(new Cell(c))->v : &y; }
+}
+
+expect_error("temporary 'new' object (such as '&(new T(x))->field') into field 'Ref.p'") {
+    void braceInit() { Ref r = { p = &(new Cell(5))->v }; }
+}
+
+expect_error("temporary 'new' object (such as '&(new T(x))->field') into a longer-lived location") {
+    void throughPointer() { Ref* rp = new Ref(); rp->p = &(new Cell(6))->v; delete rp; }
+}
+
+expect_error("temporary 'new' object (such as '&(new T(x))->field') into a longer-lived location") {
+    void arrayElement() { int* a[2]; a[0] = &(new Cell(7))->v; }
+}
+
+expect_error("temporary 'new' object (such as '&(new T(x))->field') into a local") {
+    void castDecl() { void* g = (int*)&(new Cell(8))->v; }
+}
+
+expect_error("temporary 'new' object (such as '&(new T(x))->field') into a longer-lived location") {
+    void genericGlobal<T>(int x) { gAddr = &(new T(x))->v; }
+    void genericGlobalUse() { genericGlobal<Cell>(9); }
+}
+
+expect_error("temporary 'new' object (such as '&(new T(x))->field') into a local") {
+    void nullCoalesceDecl(int* g) { int* h = g ?? &(new Cell(10))->v; }
+}
+
+expect_error("temporary 'new' object (such as '&(new T(x))->field') into a longer-lived location") {
+    void nullCoalesceAssign(int* g) { int* h = nullptr; h = g ?? &(new Cell(11))->v; }
+}
+
+extern int main()
+{
+    return 0;
+}

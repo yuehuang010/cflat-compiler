@@ -44,3 +44,6 @@ void operator delete[](void* p) noexcept
     std::free(p);
 }
 void operator delete[](void* p, std::size_t) noexcept { operator delete[](p); }
+
+// Declared in cpp_interop_opnew.h (leg 3617): an out-of-line body cflat cannot see.
+namespace cppon { struct Esc; int escOpaque(const Esc* p) { return p != nullptr ? 9 : 0; } }

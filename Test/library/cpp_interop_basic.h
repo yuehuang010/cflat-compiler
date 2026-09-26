@@ -1162,6 +1162,17 @@ namespace cppi
     inline HoldsStdVector make_holds_std_vector() { return HoldsStdVector(); }
     inline HoldsStdVector holds_std_vector_global;
 
+    class HoldsStdFunction
+    {
+    public:
+        std::function<int()> f;
+        std::function<int(int, int)> add;
+        HoldsStdFunction()
+            : f([] { return 23; }), add([](int a, int b) { return a + b; }) {}
+    };
+    inline int invoke(std::function<int()>& f) noexcept { return f(); }
+    inline HoldsStdFunction make_holds_std_function() { return HoldsStdFunction(); }
+
     struct StatefulLess
     {
         bool operator()(int a, int b) const noexcept { return a < b; }

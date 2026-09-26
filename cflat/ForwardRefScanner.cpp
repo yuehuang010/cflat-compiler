@@ -626,9 +626,12 @@ void ForwardRefScanner::ScanFunctionDefinition(CFlatParser::FunctionDefinitionCo
 
         bool returnsOwned = ComputeReturnsOwned(returnType, name, allParams);
 
-        compiler->CreateFunctionDeclaration(name, returnType, allParams, returnType.external, varargs, returnsOwned, false, returnType.CallConv);
+        const std::string linkageName = returnType.external && !namespaceName.empty()
+            ? rawFuncName : std::string();
+        compiler->CreateFunctionDeclaration(name, returnType, allParams, returnType.external, varargs,
+                                            returnsOwned, false, returnType.CallConv, linkageName);
         if (returnType.external)
-            compiler->NoteCFlatExternBody(name, name);
+            compiler->NoteCFlatExternBody(name, linkageName.empty() ? name : linkageName);
 
         // An unannotated by-value struct return whose every path hands back a borrowed
         // parameter is an 'alias' (borrow) return - queue the inference so callers do not

@@ -400,6 +400,52 @@ namespace cflat_cinterop
             }
         }
 
+        /*
+         * Whether a type names a class member that is not public (a protected / private nested
+         * class, or a specialization over one). Code at namespace scope cannot spell it, so a
+         * generated default-argument wrapper over it does not compile.
+         */
+        bool NamesNonPublicMember(QualType type, unsigned depth = 0)
+        {
+            if (type.isNull() || depth > 16) return false;
+            type = type.getCanonicalType();
+            if (const auto* ref = type->getAs<ReferenceType>())
+                return NamesNonPublicMember(ref->getPointeeType(), depth + 1);
+            if (!type->getPointeeType().isNull())
+                return NamesNonPublicMember(type->getPointeeType(), depth + 1);
+            if (const auto* array = type->getAsArrayTypeUnsafe())
+                return NamesNonPublicMember(array->getElementType(), depth + 1);
+            if (const auto* proto = type->getAs<FunctionProtoType>())
+            {
+                if (NamesNonPublicMember(proto->getReturnType(), depth + 1)) return true;
+                for (QualType param : proto->getParamTypes())
+                    if (NamesNonPublicMember(param, depth + 1)) return true;
+                return false;
+            }
+            const TagDecl* tag = type->getAsTagDecl();
+            for (const Decl* decl = tag; decl != nullptr;
+                 decl = llvm::dyn_cast<TagDecl>(decl->getDeclContext()))
+            {
+                if (llvm::isa<RecordDecl>(decl->getDeclContext())
+                    && (decl->getAccess() == AS_private || decl->getAccess() == AS_protected))
+                    return true;
+                const auto* spec = llvm::dyn_cast<ClassTemplateSpecializationDecl>(decl);
+                if (spec == nullptr) continue;
+                for (const TemplateArgument& arg : spec->getTemplateArgs().asArray())
+                {
+                    if (arg.getKind() == TemplateArgument::Type
+                        && NamesNonPublicMember(arg.getAsType(), depth + 1))
+                        return true;
+                    if (arg.getKind() == TemplateArgument::Pack)
+                        for (const TemplateArgument& inner : arg.pack_elements())
+                            if (inner.getKind() == TemplateArgument::Type
+                                && NamesNonPublicMember(inner.getAsType(), depth + 1))
+                                return true;
+                }
+            }
+            return false;
+        }
+
         RawDefaultArg DefaultArgumentOf(const ParmVarDecl* p, ASTContext& ctx)
         {
             RawDefaultArg result;
@@ -1397,6 +1443,8 @@ namespace cflat_cinterop
                     {
                         e.enumType = CxxQualifiedName(ed);
                         e.underlyingType = CanonicalSpelling(ctx, ed->getIntegerType());
+                        if (!ed->isScoped() && !ed->getPromotionType().isNull())
+                            e.promotedType = CanonicalSpelling(ctx, ed->getPromotionType());
                         e.isScoped = ed->isScoped();
                     }
                 }
@@ -1926,8 +1974,15 @@ namespace cflat_cinterop
                     // compiled library; emitting its body is Clang-CodeGen work (M5). Trivial
                     // operations need no call at all, which the backend handles from the
                     // triviality bits above.
+                    // A member of an IMPLICIT class-template instantiation whose pattern the header
+                    // defines (out of line, without `inline`) has no guaranteed library symbol.
+                    const FunctionDecl* pattern =
+                        md->getTemplateSpecializationKind() == clang::TSK_ImplicitInstantiation
+                            && !md->isPureVirtual()
+                        ? md->getTemplateInstantiationPattern() : nullptr;
                     m.needsLocalDefinition = md->isImplicit() || md->isDefaulted()
-                                          || md->isInlined();
+                                          || md->isInlined()
+                                          || (pattern != nullptr && pattern->isDefined());
                     // Structors on Itanium/Darwin hand 'this' back; the caller ignores it, so the
                     // declaration carries a void* result rather than a mistyped void.
                     if (ctor != nullptr || dtor != nullptr)
@@ -1957,6 +2012,15 @@ namespace cflat_cinterop
                         QueueIncompleteCxxType(st, ctx, p->getType());
                     }
                     QueueIncompleteCxxType(st, ctx, md->getReturnType());
+                    // A default-argument wrapper spells the receiver, result and parameters at
+                    // namespace scope; one naming a non-public member type cannot be built.
+                    bool wrapperUnspellable = NamesNonPublicMember(ctx.getCanonicalTagType(cxx))
+                        || NamesNonPublicMember(md->getReturnType());
+                    for (const ParmVarDecl* p : md->parameters())
+                        wrapperUnspellable = wrapperUnspellable || NamesNonPublicMember(p->getType());
+                    if (wrapperUnspellable)
+                        for (RawDefaultArg& d : m.defaultArgs)
+                            if (!d.kind.empty()) { d.kind = "unsupported"; d.value.clear(); }
                     // Refuse before any arrangement: an incomplete by-value type has no layout.
                     for (const ParmVarDecl* p : md->parameters())
                     {
@@ -4341,7 +4405,15 @@ namespace cflat_cinterop
                 bool VisitCXXRewrittenBinaryOperator(CXXRewrittenBinaryOperator* op)
                 {
                     if (op == nullptr) return true;
-                    auto* call = llvm::dyn_cast<CallExpr>(op->getSemanticForm());
+                    // `a != b` is `!(a == b)` and `a < b` is `(a <=> b) < 0`: the call sits
+                    // under the negation or the comparison against zero.
+                    const Expr* form = op->getSemanticForm()->IgnoreImplicit();
+                    if (const auto* un = llvm::dyn_cast<UnaryOperator>(form))
+                        form = un->getSubExpr()->IgnoreImplicit();
+                    else if (const auto* bin = llvm::dyn_cast<BinaryOperator>(form))
+                        form = llvm::isa<CallExpr>(bin->getLHS()->IgnoreImplicit())
+                            ? bin->getLHS()->IgnoreImplicit() : bin->getRHS()->IgnoreImplicit();
+                    auto* call = llvm::dyn_cast<CallExpr>(const_cast<Expr*>(form));
                     return call == nullptr || VisitCallExpr(call);
                 }
                 bool VisitCXXConstructExpr(CXXConstructExpr* ce)

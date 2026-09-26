@@ -8,6 +8,26 @@ import "diagnostic/heap_audit.cb";
 import "test_helper.cb";
 
 int dtorCount = 0;
+int conditionalNewCount = 0;
+int conditionalDtorCount = 0;
+
+struct CS
+{
+    int pad = 0;
+    int v = 0;
+    CS(int value) { v = value; conditionalNewCount = conditionalNewCount + 1; }
+    ~CS() { conditionalDtorCount = conditionalDtorCount + 1; }
+};
+
+int useCS(int* value) { return value == nullptr ? -1 : *value; }
+int lookCS(CS* p) { return p == nullptr ? -1 : p->v; }
+CS* conditionalKeep = nullptr;
+int takeConditionalCS(move CS* p)
+{
+    int value = p == nullptr ? -1 : p->v;
+    conditionalKeep = move p;
+    return value;
+}
 
 struct Resource
 {
@@ -4017,6 +4037,16 @@ struct AtTab { AtRow r = default; alias AtRow at() { return r; } };
 // `alias T*` keeps the manual override even with a local arm; only the param arm is read.
 alias AtRow* atPickAliasLocal(AtTab* t, bool c) { AtTab local; return c ? &local.at() : &t.at(); }
 
+AtTab atGlobalAddressTab = default;
+AtRow* atPickCallerField(AtTab* a, AtTab* b, bool c) { return c ? &a->r : &b->r; }
+AtRow* atPickGlobalField() { return &atGlobalAddressTab.r; }
+AtRow* atPickStaticField() { static AtTab local = default; return &local.r; }
+AtRow* atPickPointerValue(AtTab* t, bool c)
+{
+    AtRow* p = &t->r;
+    return c ? p : &t->r;
+}
+
 // A `move Resource*` sink for the re-bound-borrow legs: it adopts the pointee and frees it.
 void sinkBoxItem(move Resource* p) { }
 
@@ -4289,6 +4319,13 @@ int testOwningStructTernaryJoin()
     AtTab atT;
     atT.r.v = 7;
     passed += Test("alias_ternary_return_alias_type", atPickAliasLocal(&atT, false).v, 7);
+    passed += Test("raw_pointer_return_caller_field",
+        atPickCallerField(&atT, &atT, true).v, 7);
+    atGlobalAddressTab.r.v = 8;
+    passed += Test("raw_pointer_return_global_field", atPickGlobalField().v, 8);
+    passed += Test("raw_pointer_return_static_field", atPickStaticField() != nullptr ? 1 : 0, 1);
+    passed += Test("raw_pointer_return_local_pointer_value",
+        atPickPointerValue(&atT, true).v, 7);
 
     // The guards sit in front of the owning-value MOVE and `move`-argument paths, so the plain
     // OWNER spellings they share a site with must still transfer: `dest = ownedLocal` releases the
@@ -12582,7 +12619,7 @@ extern int main()
     total += 22;
 
     passed += testOwningStructTernaryJoin();
-    total += 115;
+    total += 119;
 
     passed += testBucketAExpressionOwnership();
     total += 109;
@@ -12696,6 +12733,91 @@ extern int main()
 
     passed += testChainedPointerAssignment();
     total += 37;
+    passed += testAddressIntoNewTemp();
+    total += 8;
+
+    int c = 1;
+    conditionalNewCount = 0;
+    conditionalDtorCount = 0;
+    int ternaryRead = useCS(c > 0 ? &(new CS(c))->v : nullptr);
+    passed += Test("conditional_new_ternary_call",
+        ternaryRead == 1 && conditionalNewCount == 1 && conditionalDtorCount == 1 ? 1 : 0, 1);
+    total++;
+
+    int* g = nullptr;
+    conditionalNewCount = 0;
+    conditionalDtorCount = 0;
+    int coalesceRead = useCS(g ?? &(new CS(4))->v);
+    passed += Test("conditional_new_coalesce_call",
+        coalesceRead == 4 && conditionalNewCount == 1 && conditionalDtorCount == 1 ? 1 : 0, 1);
+    total++;
+
+    c = 0;
+    conditionalNewCount = 0;
+    conditionalDtorCount = 0;
+    int untakenRead = useCS(c > 0 ? &(new CS(c))->v : nullptr);
+    bool untakenClean = untakenRead == -1 && conditionalNewCount == 0 && conditionalDtorCount == 0;
+    c = 1;
+    int takenAfterUntaken = useCS(c > 0 ? &(new CS(c))->v : nullptr);
+    passed += Test("conditional_new_untaken_and_taken_arm",
+        untakenClean && takenAfterUntaken == 1 && conditionalNewCount == 1
+            && conditionalDtorCount == 1 ? 1 : 0, 1);
+    total++;
+
+    c = 1;
+    conditionalNewCount = 0;
+    conditionalDtorCount = 0;
+    int nestedRead = useCS(c > 0 ? (c == 1 ? &(new CS(5))->v : nullptr) : nullptr);
+    passed += Test("conditional_new_nested_ternary_call",
+        nestedRead == 5 && conditionalNewCount == 1 && conditionalDtorCount == 1 ? 1 : 0, 1);
+    total++;
+
+    conditionalNewCount = 0;
+    conditionalDtorCount = 0;
+    int loopSum = 0;
+    int loopIndex = 0;
+    while (loopIndex < 100)
+    {
+        loopSum = loopSum + useCS(c > 0 ? &(new CS(loopIndex))->v : nullptr);
+        loopIndex = loopIndex + 1;
+    }
+    passed += Test("conditional_new_loop_100_calls",
+        loopSum == 4950 && conditionalNewCount == 100 && conditionalDtorCount == 100 ? 1 : 0, 1);
+    total++;
+
+    conditionalNewCount = 0;
+    conditionalDtorCount = 0;
+    CS* borrowNull = nullptr;
+    int borrowRead = lookCS(borrowNull ?? new CS(6));
+    passed += Test("conditional_new_coalesce_bare_new_borrow_call",
+        borrowRead == 6 && conditionalNewCount == 1 && conditionalDtorCount == 1 ? 1 : 0, 1);
+    total++;
+
+    conditionalKeep = nullptr;
+    conditionalNewCount = 0;
+    conditionalDtorCount = 0;
+    CS* sinkNull = nullptr;
+    int sinkValue = takeConditionalCS(sinkNull ?? new CS(6));
+    bool sinkKept = sinkValue == 6 && conditionalKeep != nullptr
+        && conditionalKeep->v == 6 && conditionalNewCount == 1 && conditionalDtorCount == 0;
+    delete conditionalKeep;
+    conditionalKeep = nullptr;
+    passed += Test("conditional_new_coalesce_sink_transfer",
+        sinkKept && conditionalDtorCount == 1 ? 1 : 0, 1);
+    total++;
+
+    conditionalNewCount = 0;
+    conditionalDtorCount = 0;
+    bool coalesceStoreClean = false;
+    {
+        CS* cg = nullptr;
+        CS* q = cg ?? new CS(7);
+        coalesceStoreClean = q != nullptr && q->v == 7
+            && conditionalNewCount == 1 && conditionalDtorCount == 0;
+    }
+    passed += Test("conditional_new_coalesce_store_owns_value",
+        coalesceStoreClean && conditionalDtorCount == 1 ? 1 : 0, 1);
+    total++;
 
     printf("\n%d / %d tests passed.\n", passed, total);
     return passed == total ? 0 : 1;
@@ -12907,4 +13029,43 @@ int setAndReadChainedAssign(Resource* value)
 {
     value->id = 85;
     return value->id;
+}
+
+// An address into a `new` temporary that leaves the full expression keeps it alive: returned
+// through a '?:' arm, laundered through an integer, or fed to a call through a '?:' arm.
+int* addrTempTernary(int c) { return c > 0 ? &(new Resource())->id : nullptr; }
+int* addrTempLaundered() { return (int*)(long)&(new Resource())->id; }
+// Frees seen while the callee reads: an arm that already freed its temp reads 1, not 0.
+int addrTempDtorsAtRead(int* p) { return *p + dtorCount; }
+struct AddrTempRef { int* p = nullptr; };
+int addrTempRefDtorsAtRead(AddrTempRef r) { return *r.p + dtorCount; }
+
+int testAddressIntoNewTemp()
+{
+    int passed = 0;
+    int pick = 1;
+    dtorCount = 0;
+    int* tern = addrTempTernary(pick);
+    passed += Test("amt_ternary_return_no_early_free", tern != nullptr && *tern == 0 ? dtorCount : -1, 0);
+    int* laundered = addrTempLaundered();
+    passed += Test("amt_laundered_return_no_early_free", *laundered + dtorCount, 0);
+    passed += Test("amt_ternary_arg_no_early_free",
+        addrTempDtorsAtRead(pick > 0 ? &(new Resource())->id : nullptr), 0);
+    // Accept set (passes on the prefix too): no address escapes, each temp is freed exactly once.
+    dtorCount = 0;
+    int byValue = (new Resource())->id;
+    passed += Test("amt_by_value_freed", byValue + dtorCount, 1);
+    int viaArg = addrTempDtorsAtRead(&(new Resource())->id);
+    passed += Test("amt_arg_read_then_freed", viaArg * 10 + dtorCount, 12);
+    bool nonNull = &(new Resource())->id != nullptr;
+    passed += Test("amt_compare_freed", nonNull ? dtorCount : -1, 3);
+    // Brace temporary argument: accepted, read before the free (round-1 binary refused it).
+    dtorCount = 0;
+    int braceRead = addrTempRefDtorsAtRead({ p = &(new Resource())->id });
+    passed += Test("amt_brace_arg_read_then_freed", braceRead * 10 + dtorCount, 1);
+    // Integer address used only by a compare: freed, not kept alive.
+    dtorCount = 0;
+    bool intNonZero = (long)&(new Resource())->id != 0;
+    passed += Test("amt_int_compare_freed", intNonZero ? dtorCount : -1, 1);
+    return passed;
 }

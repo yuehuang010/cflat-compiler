@@ -217,6 +217,14 @@
 //     conditional returns, while alias returns retain their override (3560-3569).
 //   Variadic and inherited C++ constructors preserve mutable lvalue references without copies
 //     across variadic reference packs and mixed by-value arguments (3580-3583).
+//   Lazy std::function fields support closure identity, invocation and pointer receivers
+//     for zero-argument and parameterized signatures (3590-3594).
+//   Statement temporaries of a C++ `new` (3595-3599): an unclaimed owning C++ pointer is released
+//     at end of full expression wherever a CFlat struct's is, through the paired class operator
+//     delete, the global pair or the deleting destructor; retained and alias results are kept.
+//   Owning temporaries passed to list<T*>.add are retained by the emitted slot store (3600-3601).
+//   C++ class pointers keep pointer semantics through generic storage (3602-3605): borrowed
+//     list/dictionary values are not destroyed, unique list values are, and Box<T> stores T*.
 
 import cpp "library/cpp_interop_basic.h";
 import cpp "library/cpp_interop_refgate.h";
@@ -257,6 +265,7 @@ import cpp "string";
 import cpp "vector";
 import cpp "library/cpp_interop_strop.h";
 import "list.cb";
+import "dictionary.cb";
 import "thread.cb";
 import "malloc_allocator.cb";
 import "unique.cb";
@@ -283,6 +292,7 @@ void take<T>(list<T>* values, int expectedCount)
         cppListTakeValue = values->get(0).value;
 }
 struct CppListBox<T> { list<T> values; };
+struct NewTempBox<T> { T value; };
 struct CppListHolder { cpplist.Plain item = default; int tag = 0; };
 struct CppListValue { int value = 0; };
 struct CppAssignHost { cppas.Life l = cppas.Life(1); std.string s; };
@@ -717,6 +727,12 @@ int UnwFwdExternTr(int x)
     cppunw.Tr t = cppunw.Tr(1);
     return UnwLaterExtern(x) + 1;
 }
+namespace unw_nsx { extern int UnwLaterNsExtern(int x); }
+int UnwFwdExternNsTr(int x)
+{
+    cppunw.Tr t = cppunw.Tr(1);
+    return unw_nsx.UnwLaterNsExtern(x) + 1;
+}
 int UnwFwdExternOwn(int x)
 {
     UnwOwn o = default;
@@ -852,6 +868,38 @@ int OnUniqueCls(int x) { unique cppon.Cls* p = new cppon.Cls(x); return p->get()
 int OnUniqueLib(int x) { unique<cppon.Cls> p = new cppon.Cls(x); return p->get(); }
 int OnViewScope(int x) { cppon.Plain[] p = new cppon.Plain[3]; return p[2].get() + x; }
 int OnClsCtorThrows(int x) { cppon.Cls* p = new cppon.Cls(-x); int v = p->get(); delete p; return v; }
+// list<T*>.add invoke regressions (legs 3600-3601).
+int tempListBdtors = 0;
+struct TempListB
+{
+    int v = 12;
+    ~TempListB() { tempListBdtors = tempListBdtors + 1; }
+};
+int AddTempCppListWithUnwind()
+{
+    cppunw.Tr t = default;
+    list<cppon.Cls*> values = default;
+    values.add(new cppon.Cls(13));
+    if (values.count() != 1 || values[0]->v != 13) return 99;
+    cppon.Cls* p = values.take(0);
+    delete p;
+    return cppon.live();
+}
+int AddTempListBWithUnwind()
+{
+    cppunw.Tr t = default;
+    list<TempListB*> values = default;
+    values.add(new TempListB());
+    if (values[0]->v != 12 || tempListBdtors != 0) return 99;
+    TempListB* p = values.take(0);
+    delete p;
+    return tempListBdtors == 1 ? 0 : 98;
+}
+cppon.Cls* onKept = nullptr;
+int OnReadCls(cppon.Cls* p) { return p->v; }
+int OnKeepCls(cppon.Cls* p) { onKept = p; return p->v; }
+alias cppon.Cls* OnPassCls(cppon.Cls* p) { return p; }
+move cppon.Poly* OnMakePoly(int x) { return new cppon.PolyDerived(x); }
 int onArrN = 4;
 // Owning array-view reassignment (legs 3400-3420). VrS counts CFlat element destructors; vrZero
 // keeps the branch legs' conditions opaque to the optimizer.
@@ -1087,6 +1135,9 @@ int testLongDoubleNativeInterop()
     if (typeof(ldReturned) != "long double" || cppsop.typeCodeOf(ldReturned) != 19) return 3506;
     return 0;
 }
+
+// Brace temporary argument carrying an address into a `new` temporary (leg 3635).
+struct EscAddrRef { int* p = nullptr; };
 
 extern int main()
 {
@@ -3352,6 +3403,23 @@ extern int main()
     // ACCEPT SET: a CFlat struct argument is not on the C++ conversion path at all.
     ExcPlain excPlain = { a = 5 };
     if (ExcTakePlain(excPlain) != 5)                                           return 2220;
+    // The libtorch Adam shape: a defaulted `OptDef(double = 1e-3)` reached through a defaulted
+    // by-value owner parameter, with the double given and with the parameter left out.
+    cppexp.OptimDef excOptimDef = cppexp.OptimDef(excParams, 0.5);
+    if (excOptimDef.v != 3500)                                                 return 2223;
+    cppexp.OptimDef excOptimDef2 = cppexp.OptimDef(excParams);
+    if (excOptimDef2.v != 3001)                                                return 2224;
+    // An overload pair whose shortened call is ambiguous in C++ gets no default wrapper; the
+    // header still binds, the spelled-out call picks its overload, and a sibling's wrapper works.
+    int excAmbOut = 1;
+    if (cppexp.amb_pick(excAmbOut, 2, 0.25) != 453)                            return 2225;
+    if (cppexp.amb_sibling(4) != 34)                                           return 2226;
+    cppexp.AmbHost excAmbHost = cppexp.AmbHost(1000);
+    if (excAmbHost.sibling(4) != 1064)                                         return 2227;
+    if (excAmbHost.pick(4, 0.25, 7) != 1261)                                   return 2228;
+    // The header batch emits this member wrapper before the later CFlat type request reaches it.
+    cppexp.LateMemberWrapper excLate = cppexp.LateMemberWrapper();
+    if (excLate.add() != 10)                                                   return 2229;
 
     // ---- C++ using-directive own-member lookup (3050-3059) -------------------------------
     // A real nominating namespace keeps precedence over its using-directive for every member
@@ -4045,6 +4113,9 @@ extern int main()
         cppunw.reset();
         r = cppunw.guarded(UnwCoreOverridden, 0);
         if (r != 42 || cppunw.live() != 0 || cppunw.dtors() != 1) return 3287;
+        cppunw.reset();
+        r = cppunw.guarded(UnwFwdExternNsTr, 5);
+        if (r != -5 || cppunw.live() != 0 || cppunw.dtors() != 1) return 3288;
     }
     // Trivially-copyable imported C++ classes still need their user constructors on `new` (3220-3226).
     {
@@ -5509,8 +5580,321 @@ extern int main()
     cppi.HoldsStdVector* holdsStdVectorPtr = &holdsStdVector;
     holdsStdVectorPtr->v[0] = 11;
     if (holdsStdVector.v[0] != 11 || holdsStdVectorPtr->v[1] != 10) return 3576;
+
+    // ---- Lazy std::function fields bind by their closure identity (3590-3594) ----
+    cppi.HoldsStdFunction z = cppi.HoldsStdFunction();
+    if (cppi.invoke(z.f) != 23) return 3590;
+    if (z.f() != 23) return 3591;
+    if (z.add(8, 9) != 17) return 3592;
+    cppi.HoldsStdFunction* zptr = &z;
+    if (zptr->f() != 23) return 3593;
+    if (zptr->add(13, 14) != 27) return 3594;
+    // ---- Statement temporaries of a C++ `new` (3595-3599) ------------------------------------
+    // Released at end of full expression exactly where a CFlat struct's owning temp is (scalar
+    // field receiver, owning-return receiver, non-retaining CFlat parameter, comparison, '?:'
+    // into an owning local). Pre-fix every `new` temp leaked, and an owning-return temp ran the
+    // non-virtual dtor and CFlat's operator delete instead of the deleting destructor.
+    {
+        cppunw.reset();
+        cppon.reset();
+        int tv = (new cppon.PolyDerived(3))->v;
+        if (tv != 3 || cppon.clsNew() != 1 || cppon.clsDel() != 1 || cppon.dtors() != 2
+            || cppon.live() != 0 || cppunw.deletes() != 0) return 3595;      // deleting dtor
+        cppon.reset();
+        tv = (new cppon.Sized(4))->v + (new cppon.Plain())->v;
+        if (tv != 11 || cppon.clsNew() != 1 || cppon.clsDel() != 1 || cppunw.news() != 1
+            || cppunw.deletes() != 1 || cppon.live() != 0) return 3596;    // sized; global pair
+        cppon.reset();
+        tv = OnMakePoly(5)->v;
+        if (tv != 5 || cppon.clsNew() != 1 || cppon.clsDel() != 1 || cppon.dtors() != 2
+            || cppon.live() != 0) return 3597;
+        cppon.reset();
+        tv = OnReadCls(new cppon.Cls(6));
+        if (tv != 6 || cppon.clsDel() != 1 || cppon.live() != 0) return 3598;
+        tv = OnKeepCls(new cppon.Cls(7));                                  // retained: kept
+        if (tv != 7 || cppon.clsDel() != 1 || onKept->v != 7) return 3598;
+        delete onKept;
+        onKept = nullptr;
+        if (cppon.clsNew() != 2 || cppon.clsDel() != 2 || cppon.live() != 0) return 3598;
+        cppon.reset();
+        {
+            cppon.Cls* tc = tv > 0 ? new cppon.Cls(9) : nullptr;
+            cppon.Cls* ta = OnPassCls(new cppon.Cls(8));                   // alias return: kept
+            bool made = new cppon.Cls(10) != nullptr;
+            if (!made || tc->v + ta->v != 17 || cppon.clsDel() != 1) return 3599;
+            delete ta;
+        }
+        if (cppon.clsNew() != 3 || cppon.clsDel() != 3 || cppon.live() != 0) return 3599;
+    }
+    // The emitted slot store proves this invoke retains its pointer argument.
+    {
+        cppon.reset();
+        if (AddTempCppListWithUnwind() != 0 || cppon.dtors() != 1 || cppon.live() != 0
+            || cppon.clsNew() != 1 || cppon.clsDel() != 1)
+            return 3600;
+        cppon.reset();
+        tempListBdtors = 0;
+        if (AddTempListBWithUnwind() != 0 || tempListBdtors != 1) return 3601;
+    }
+    // Pointer-to-C++-class substitutions remain pointers in construction, growth, and cleanup.
+    {
+        cppon.reset();
+        {
+            list<cppon.Cls*> values = default;
+            cppon.Cls* p0 = new cppon.Cls(20);
+            cppon.Cls* p1 = new cppon.Cls(21);
+            cppon.Cls* p2 = new cppon.Cls(22);
+            cppon.Cls* p3 = new cppon.Cls(23);
+            cppon.Cls* p4 = new cppon.Cls(24);
+            cppon.Cls* p5 = new cppon.Cls(25);
+            values.add(move p0); values.add(move p1); values.add(move p2);
+            values.add(move p3); values.add(move p4); values.add(move p5);
+            if (values.count() != 6 || values[0]->v != 20 || values[5]->v != 25
+                || cppon.dtors() != 0 || cppon.live() != 6) return 3602;
+            cppon.Cls* taken = values.take(2);
+            if (taken->v != 22 || values.count() != 5) return 3602;
+            delete taken;
+            cppon.Cls* removed = values[1];
+            values.removeAt(1);
+            if (cppon.dtors() != 1 || cppon.clsDel() != 1) return 3602;
+            delete removed;
+            while (values.count() > 0)
+            {
+                cppon.Cls* item = values.take(0);
+                delete item;
+            }
+        }
+        if (cppon.clsNew() != 6 || cppon.clsDel() != 6 || cppon.dtors() != 6
+            || cppon.live() != 0) return 3602;
+    }
+    {
+        cppon.reset();
+        {
+            list<unique cppon.Cls*> values = default;
+            values.add(new cppon.Cls(31));
+            values.add(new cppon.Cls(32));
+            if (values.count() != 2 || cppon.live() != 2 || cppon.dtors() != 0) return 3603;
+            values.removeAt(0);
+            if (cppon.live() != 1 || cppon.dtors() != 1 || cppon.clsDel() != 1) return 3603;
+        }
+        if (cppon.clsNew() != 2 || cppon.clsDel() != 2 || cppon.dtors() != 2
+            || cppon.live() != 0) return 3603;
+    }
+    {
+        cppon.reset();
+        cppon.Cls* p = cppon.makeBorrowedCls(41);
+        {
+            dictionary<int, cppon.Cls*> values = default;
+            bool added = values.add(4, p);
+            int got = values.get(4)->v;
+            if (!added || got != 41 || cppon.dtors() != 0) return 3604;
+        }
+        delete p;
+        if (cppon.clsNew() != 1 || cppon.clsDel() != 1 || cppon.dtors() != 1
+            || cppon.live() != 0) return 3604;
+    }
+    {
+        cppon.reset();
+        NewTempBox<cppon.Cls*> box = default;
+        box.value = new cppon.Cls(51);
+        if (box.value->v != 51 || cppon.dtors() != 0) return 3605;
+        cppon.Cls* p = move box.value;
+        delete p;
+        if (cppon.clsNew() != 1 || cppon.clsDel() != 1 || cppon.dtors() != 1
+            || cppon.live() != 0) return 3605;
+    }
+    // `(new T(x))->m()` on a C++ class: freed at the end of the full expression only when the
+    // linked body of m provably does not retain `this` (legs 3613-3619). Pre-fix every one leaked.
+    {
+        cppon.reset();
+        int ev = (new cppon.Esc(3))->get();
+        if (ev != 3 || cppon.clsNew() != 1 || cppon.clsDel() != 1 || cppon.dtors() != 1
+            || cppon.live() != 0) return 3613;
+        cppon.reset();
+        ev = (new cppon.Esc(3))->bump() * 100 + (new cppon.Esc(4))->viaHelper()
+            + cppon.escRead(new cppon.Esc(5)) * 1000;
+        if (ev != 5408 || cppon.clsNew() != 3 || cppon.clsDel() != 3 || cppon.dtors() != 3
+            || cppon.live() != 0) return 3614;                    // field write, helpers
+        cppon.reset();
+        ev = (new cppon.Esc(6))->keep();                        // `this` stored in a global
+        cppon.Esc* ek = cppon.escTake();
+        ev = ev * 10 + (new cppon.Esc(7))->viaKeep();            // ... by a callee
+        cppon.Esc* ek2 = cppon.escTake();
+        if (ev != 68 || ek == nullptr || ek->v != 6 || ek2 == nullptr || ek2->v != 7
+            || cppon.clsDel() != 0 || cppon.live() != 2) return 3615;
+        delete ek;
+        delete ek2;
+        if (cppon.clsDel() != 2 || cppon.live() != 0) return 3615;
+        cppon.reset();
+        cppon.Esc* es = (new cppon.Esc(8))->self();              // returns `this`: kept
+        if (es->v != 8 || cppon.clsDel() != 0 || cppon.live() != 1) return 3616;
+        delete es;
+        if (cppon.clsDel() != 1 || cppon.dtors() != 1 || cppon.live() != 0) return 3616;
+        cppon.reset();
+        ev = (new cppon.Esc(9))->outOfLine();                    // reaches an opaque body: kept
+        if (ev != 9 || cppon.clsDel() != 0 || cppon.live() != 1) return 3617;
+        ev = cppon.escOpaque(new cppon.Esc(9));                   // callee itself out of line
+        if (ev != 9 || cppon.clsDel() != 0 || cppon.live() != 2) return 3617;
+        cppon.reset();
+        ev = (new cppon.EscPoly(10))->vget();                    // virtual dispatch: kept
+        if (ev != 10 || cppon.clsDel() != 0 || cppon.live() != 1) return 3618;
+        cppon.reset();
+        ev = cppunw.guarded(EscFreedOnUnwind, 2);
+        if (ev != -2 || cppon.clsDel() != 1 || cppon.live() != 0) return 3619;
+        ev = cppunw.guarded(EscKeptOnUnwind, 2);
+        ek = cppon.escTake();
+        if (ev != -2 || ek == nullptr || cppon.clsDel() != 1 || cppon.live() != 1) return 3619;
+        delete ek;
+        if (cppon.clsNew() != 2 || cppon.clsDel() != 2 || cppon.live() != 0) return 3619;
+    }
+    // ---- C++ constructor conversion ranks below standard conversions (3606-3612) ----
+    cppexp.MemRankHost rankHost = cppexp.MemRankHost();
+    if (rankHost.pick(1, 0.25) != 3606) return 3606;
+    if (cppexp.memrank_free(1, 0.25) != 3607) return 3607;
+    cppexp.MemRankNoTail rankNoTail = cppexp.MemRankNoTail();
+    if (rankNoTail.pick(1, 0.25) != 3608) return 3608;
+    cppexp.MemRankLong rankLong = cppexp.MemRankLong();
+    if (rankLong.pick(1, 1) != 3609) return 3609;
+    cppexp.MemRankOptionalDouble rankOptionalDouble = cppexp.MemRankOptionalDouble();
+    if (rankOptionalDouble.pick(1, 1.0) != 3610) return 3610;
+    cppexp.MemRankNonTemplate rankNonTemplate = cppexp.MemRankNonTemplate();
+    if (rankNonTemplate.pick(1, 1.0) != 3611) return 3611;
+    if (memrank_native(1) != 3612) return 3612;
+    // Full-expression temporaries in return operands and throwing C++ arguments (3620-3625).
+    {
+        cppon.reset();
+        int ev = EscGenericReturn<cppon.Esc>(20);
+        if (ev != 20 || cppon.clsNew() != 1 || cppon.clsDel() != 1
+            || cppon.dtors() != 1 || cppon.live() != 0) return 3620;
+        cppon.reset();
+        ev = EscGenericReturn<cppon.Cls>(21);
+        if (ev != 21 || cppon.clsNew() != 1 || cppon.clsDel() != 1
+            || cppon.dtors() != 1 || cppon.live() != 0) return 3621;
+        cppon.reset();
+        ev = EscGenericKeep<cppon.Esc>(22);
+        cppon.Esc* kept = cppon.escTake();
+        if (ev != 22 || kept == nullptr || kept->v != 22 || cppon.clsDel() != 0
+            || cppon.live() != 1) return 3622;
+        delete kept;
+        if (cppon.clsDel() != 1 || cppon.dtors() != 1 || cppon.live() != 0) return 3622;
+        cppon.reset();
+        ev = EscDirectReturn(23);
+        if (ev != 23 || cppon.clsNew() != 1 || cppon.clsDel() != 1
+            || cppon.dtors() != 1 || cppon.live() != 0) return 3623;
+        // A returned pointer to or into the temp keeps it alive (no early free).
+        cppon.reset();
+        cppon.Esc* self = EscReturnSelf(26);
+        int* field = EscReturnFieldAddr(27);
+        if (self->v != 26 || *field != 27 || cppon.clsDel() != 0 || cppon.live() != 2) return 3623;
+        delete self;
+        if (cppon.clsDel() != 1 || cppon.live() != 1) return 3623;
+        cppon.reset();
+        ev = cppunw.guarded(EscThrowingArg, 24);
+        if (ev != -29 || cppon.clsNew() != 1 || cppon.clsDel() != 1
+            || cppon.dtors() != 1 || cppon.live() != 0) return 3624;
+        cppon.reset();
+        ev = cppunw.guarded(EscThrowingConditionalArg, 24);
+        if (ev != -29 || cppon.clsNew() != 1 || cppon.clsDel() != 1
+            || cppon.dtors() != 1 || cppon.live() != 0) return 3642;
+        // Same call, normal path: the earlier registration still frees exactly once.
+        cppon.reset();
+        ev = EscNonThrowingArg(28);
+        if (ev != 28 || cppon.clsNew() != 1 || cppon.clsDel() != 1
+            || cppon.dtors() != 1 || cppon.live() != 0) return 3624;
+        cppon.reset();
+        ev = cppunw.guarded(EscThrowingKeepArg, 25);
+        kept = cppon.escTake();
+        if (ev != -30 || kept == nullptr || kept->v != 25 || cppon.clsDel() != 0
+            || cppon.live() != 1) return 3625;
+        delete kept;
+        if (cppon.clsNew() != 1 || cppon.clsDel() != 1 || cppon.dtors() != 1
+            || cppon.live() != 0) return 3625;
+    }
+    // An address into a `new` temporary that leaves the full expression keeps it alive (3631-3634).
+    {
+        cppon.reset();
+        int* tern = EscTernFieldAddr(31);
+        if (tern == nullptr || *tern != 31 || cppon.clsDel() != 0 || cppon.live() != 1) return 3631;
+        cppon.reset();
+        int* laundered = EscLaunderedFieldAddr(32);
+        if (*laundered != 32 || cppon.clsDel() != 0 || cppon.live() != 1) return 3632;
+        // A '?:' arm feeding a call: the arm flush must not free the temp before the callee reads.
+        cppon.reset();
+        int armPick = 1;
+        int armRead = EscReadAndFrees(armPick > 0 ? &(new cppon.Esc(33))->v : nullptr);
+        if (armRead != 3300) return 3633;
+        // Accept set (passes on the prefix too): no address escapes, so each is freed exactly once.
+        cppon.reset();
+        int byValue = (new cppon.Esc(34))->v;
+        int viaArg = EscReadAndFrees(&(new cppon.Esc(34))->v);
+        bool nonNull = &(new cppon.Esc(34))->v != nullptr;
+        if (byValue != 34 || viaArg != 3401 || !nonNull || cppon.clsNew() != 3
+            || cppon.clsDel() != 3 || cppon.live() != 0) return 3634;
+        // A brace temporary argument carrying the address dies with the statement: freed after the read.
+        cppon.reset();
+        int braceRead = EscReadRefAndFrees({ p = &(new cppon.Esc(35))->v });
+        if (braceRead != 3500 || cppon.clsDel() != 1 || cppon.live() != 0) return 3635;
+        // An integer address used only by a compare escapes nothing: the temp is still freed.
+        cppon.reset();
+        bool intNonZero = (long)&(new cppon.Esc(36))->v != 0;
+        if (!intNonZero || cppon.clsNew() != 1 || cppon.clsDel() != 1 || cppon.live() != 0) return 3636;
+    }
+    // A member template specialized over a protected nested type gets no default wrapper; the
+    // request still binds, the sibling field's and the owner's wrappers work, and the member body
+    // that pops the queue links (legs 3637-3639).
+    cppexp.PrivLoader<int> excPrivLoader = cppexp.PrivLoader<int>();
+    if (excPrivLoader.next() != 11)                                            return 3637;
+    if (excPrivLoader.peek() != 5)                                             return 3638;
+    if (excPrivLoader.box.get() != 9)                                          return 3639;
+
+    int cppConditionalLegFailed = 0;
+    cppon.reset();
+    int cppArmPick = 1;
+    int cppArmRead = EscReadAndFrees(cppArmPick > 0
+        ? &(new cppon.Esc(40))->v : nullptr);
+    if (cppArmRead != 4000 || cppon.clsNew() != 1 || cppon.clsDel() != 1
+        || cppon.dtors() != 1 || cppon.live() != 0) {
+        printf("FAIL conditional C++ ternary leg 3640\n");
+        cppConditionalLegFailed = 1;
+    }
+    cppon.reset();
+    int* cppNull = nullptr;
+    int cppCoalesceRead = EscReadAndFrees(cppNull ?? &(new cppon.Esc(41))->v);
+    if (cppCoalesceRead != 4100 || cppon.clsNew() != 1 || cppon.clsDel() != 1
+        || cppon.dtors() != 1 || cppon.live() != 0) {
+        printf("FAIL conditional C++ coalesce leg 3641\n");
+        cppConditionalLegFailed = 1;
+    }
+    if (cppConditionalLegFailed != 0) return 3640;
     return 0;
 }
+
+int* EscTernFieldAddr(int x) { return x > 0 ? &(new cppon.Esc(x))->v : nullptr; }
+int* EscLaunderedFieldAddr(int x) { return (int*)(long)&(new cppon.Esc(x))->v; }
+// Value * 100 + frees so far: a temp freed before the read shows up in the low digits.
+int EscReadAndFrees(int* p) { return *p * 100 + cppon.clsDel(); }
+int EscReadRefAndFrees(EscAddrRef r) { return *r.p * 100 + cppon.clsDel(); }
+
+int EscGenericReturn<T>(int x) { return (new T(x))->get(); }
+int EscGenericKeep<T>(int x) { return (new T(x))->keep(); }
+int EscDirectReturn(int x) { return (new cppon.Esc(x))->get(); }
+int EscThrowingArg(int x) { return cppon.escThrow(new cppon.Esc(x), x + 5); }
+int EscThrowingConditionalArg(int x)
+{
+    return cppon.escThrow(x > 0 ? new cppon.Esc(x) : nullptr, x + 5);
+}
+int EscNonThrowingArg(int x) { int r = cppon.escThrow(new cppon.Esc(x), 0); return r; }
+cppon.Esc* EscReturnSelf(int x) { return (new cppon.Esc(x))->self(); }
+int* EscReturnFieldAddr(int x) { return &(new cppon.Esc(x))->v; }
+int EscThrowingKeepArg(int x) { return cppon.escThrowKeep(new cppon.Esc(x), x + 5); }
+
+// Leg 3619: a later throw in the same full expression still runs the proven free (and only it).
+int EscFreedOnUnwind(int x) { return (new cppon.Esc(3))->get() + cppunw.thrower(x); }
+int EscKeptOnUnwind(int x) { return (new cppon.Esc(3))->keep() + cppunw.thrower(x); }
+
+
+int memrank_native(int x) { return 3612; }
+int memrank_native(double x) { return 0; }
 
 // A CFlat body for a C name core relies on (legs 3286-3287): core's toLong binds to it here.
 int unwAtollArm = 0;
@@ -5535,4 +5919,11 @@ int UnwCoreOverridden(int x)
 extern int UnwLaterExtern(int x)
 {
     return cppunw.thrower(x);
+}
+namespace unw_nsx
+{
+    extern int UnwLaterNsExtern(int x)
+    {
+        return cppunw.thrower(x);
+    }
 }

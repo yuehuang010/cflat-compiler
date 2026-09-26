@@ -207,6 +207,7 @@ namespace cflat_cinterop
         std::string name;
         std::string enumType;
         std::string underlyingType;
+        std::string promotedType;   // integral promotion target of an unscoped enum
         bool isScoped = false;
         long long value = 0;
         std::string file;

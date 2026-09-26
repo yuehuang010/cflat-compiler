@@ -1,4 +1,5 @@
 #include "MainListener.h"
+#include <llvm/Analysis/ValueTracking.h>
 
 MainListener::RangeForContext* MainListener::FindActiveRangeForVariable(
         const LLVMBackend::NamedVariable& nv) {
@@ -544,6 +545,7 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
                                         const std::string& retText,
                                         bool defaultValue) {
         auto* compiler = Compiler(errCtx);
+        const auto returnOwnedTempMark = compiler->MarkOwnedTemps();
         // Evaluate via NV path so we can inspect bond info alongside ownership.
         LLVMBackend::NamedVariable returnNV;
         // Thread a function<> return type into a returned lambda literal so the
@@ -1131,16 +1133,16 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
             }
         }
         /*
-         * A '?:' of CFlat-native alias results (`c ? &t.at() : nullptr`) drops the
-         * PointsToAliasBorrow provenance the direct form is refused on, for every root. Walk the
-         * join's arms (nested joins, through GEPs) and refuse when any arm is a CFlat alias call
-         * result. C++ reference results are the gate above's; `alias T*` keeps the override.
+         * Address-of a frame local must not escape through a raw pointer return. A PHI/select
+         * obscures the arm from PointsIntoStackFrame, so inspect nested joins before testing each
+         * address. Loaded pointer values and caller/global/static storage do not root here.
          */
+        bool frameLocalPointerReturn = false;
         bool cflatAliasJoinArm = false;
         if (!aliasRefReturn && assignExpr != nullptr && cxxRefReturnAddr == nullptr
-            && !cxxReferenceResultTernaryJoin && !compiler->currentFunctionReturnTV.IsAlias
-            && compiler->currentFunctionReturnTV.Pointer)
+            && !cxxReferenceResultTernaryJoin && compiler->currentFunctionReturnTV.Pointer)
         {
+            std::unordered_set<llvm::Value*> visitedArms;
             auto isCflatAliasCall = [&](llvm::Value* value) -> bool {
                 auto* call = llvm::dyn_cast<llvm::CallBase>(value);
                 if (call == nullptr || !compiler->IsAliasValue(call)) return false;
@@ -1150,10 +1152,9 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
                 return sym != nullptr && !sym->IsCxx && !sym->ReturnType.Pointer
                     && (sym->ReturnType.IsAlias || sym->ReturnsAlias);
             };
-            std::unordered_set<llvm::Value*> visitedArms;
             std::function<void(llvm::Value*, bool)> walkJoinArms;
             walkJoinArms = [&](llvm::Value* value, bool underJoin) {
-                if (value == nullptr || cflatAliasJoinArm) return;
+                if (value == nullptr || frameLocalPointerReturn || cflatAliasJoinArm) return;
                 value = value->stripPointerCasts();
                 if (!visitedArms.insert(value).second) return;
                 if (auto* phi = llvm::dyn_cast<llvm::PHINode>(value))
@@ -1173,13 +1174,11 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
                     walkJoinArms(gep->getPointerOperand(), underJoin);
                     return;
                 }
-                // Only a join's arms: a direct return is the PointsToAliasBorrow check's.
-                if (underJoin && isCflatAliasCall(value))
+                frameLocalPointerReturn = PointsIntoStackFrame(value);
+                if (!frameLocalPointerReturn && underJoin && isCflatAliasCall(value))
                     cflatAliasJoinArm = true;
             };
-            // Only an unnamed '?:' result; a named local (`Row* p = c ? ...; return p;`) is not.
-            if (returnNV.CallerName.empty())
-                walkJoinArms(returnNV.Primary, false);
+            walkJoinArms(returnNV.Primary, false);
         }
         bool coreUniqueRawReturn = !aliasRefReturn && cxxRefReturnAddr == nullptr
             && compiler->IsCoreUniqueToRawPointer(returnNV, compiler->currentFunctionReturnTV);
@@ -1716,7 +1715,8 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
 
         // Same escape with a dtor-LESS pointee, which the type-name gate above
         // cannot see. After it, so a dtor-bearing pointee keeps its wording.
-        GuardOwningTempUniqueFieldEscape(returnNV, "the return value", errCtx);
+        // A returned address into an owning temp is claimed instead (see EmitReturnExpression).
+        GuardOwningTempUniqueFieldEscape(returnNV, "the return value", errCtx, /*storeSite*/ false);
 
         // Returning a whole `alias` (borrow) value from a non-`alias` function hands
         // the caller a value whose always-run destructor frees a buffer the real owner
@@ -1743,7 +1743,16 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
                     && !returnNV.FromOwningTempField
                     && !returnNV.IsClosureValueCapture
                     && ReturnSourceIsIndirectOwningLvalue(returnNV, right)));
-        if (!compiler->currentFunctionReturnTV.IsAlias && !cxxReferenceResultTernaryJoin
+        if (frameLocalPointerReturn)
+        {
+            const std::string what = returnNV.CallerName.empty()
+                ? std::string("a '?:' arm") : "'" + returnNV.CallerName + "'";
+            LogErrorContext(errCtx, std::format("cannot return the address of {}: it points into "
+                "this function's own frame and would dangle once the function returns (an 'alias' "
+                "return does not change that). Return a pointer into caller-owned, global or heap "
+                "storage instead.", what));
+        }
+        else if (!compiler->currentFunctionReturnTV.IsAlias && !cxxReferenceResultTernaryJoin
             && (((SourceIsDanglingAliasBorrow(compiler, returnNV)
                     || returnNV.PointsToAliasBorrow)
                  && !aliasBorrowRootExcused)
@@ -2195,6 +2204,22 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
                 rawCountOut);
         }
 
+        {
+            // Pointer temps the operand consumed (`(new T(x))->m()`) die before the ret, after the
+            // value is computed; the other ledgers were flushed above. `right` itself is kept.
+            auto ptrMark = compiler->MarkOwnedTemps();
+            ptrMark.Ptrs = returnOwnedTempMark.Ptrs;
+            ptrMark.NewPtrs = returnOwnedTempMark.NewPtrs;
+            // A returned address INTO a temp (`return &(new T(x))->f;`) keeps that temp alive.
+            if (right != nullptr && right->getType()->isPointerTy())
+            {
+                llvm::SmallVector<const llvm::Value*, 4> bases;
+                llvm::getUnderlyingObjects(right, bases);
+                for (const llvm::Value* base : bases)
+                    compiler->UnregisterOwnedPtrTemp(const_cast<llvm::Value*>(base));
+            }
+            compiler->FlushOwnedTempsSince(ptrMark, right);
+        }
         compiler->CreateReturnCall(right, retStorage, interfaceReturnStructName,
                                    returnNV.TypeAndValue.IsUnsignedInteger() != -1);
     }

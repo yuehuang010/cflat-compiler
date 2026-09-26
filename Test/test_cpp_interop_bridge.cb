@@ -77,7 +77,7 @@
 //     and destruction, with exact C++ destructor counts (3600-3609).
 //   C++ overload resolution compares each argument's conversion sequence on its own: equal
 //     user conversions defer to the next argument, and an unsuffixed literal is a double, for
-//     free functions and for members of an imported class (3620-3629).
+//     free functions and for members of an imported class, same-rank tie-breakers (3620-3630).
 //   Moving core and C++ unique owners of a derived class into a C++ base-pointer sink adjusts
 //     after release and destroys once; the exact-base owner remains unchanged (3610-3619).
 
@@ -3634,8 +3634,7 @@ extern int main(int argc, char** argv)
 
     // A CONSTRUCTOR parameter spelled `const&` keeps the pointer shape its C++ symbol declares;
     // binding it by value emitted "Call parameter type does not match function signature!".
-    // The `&&` constructor form and the nested-spelling refusals are in
-    // Test/errors/err_cpp_std_function_nested.cb.
+    // The nested-spelling refusals are in Test/errors/err_cpp_std_function_nested.cb.
     cppfn.CtorRef stdfnCr = cppfn.CtorRef(std.function<int(int)>(stdfn_twice));
     if (stdfnCr.v() != 4)                                                 return 1925;
 
@@ -5368,6 +5367,80 @@ extern int main(int argc, char** argv)
         if (bridge_passed - bridgeRankStartPassed != bridge_checks - bridgeRankStartChecks)
             return 3624;
     }
+    // Same-rank tie-breakers, [over.ics.rank] (legs 3625-3630; ambiguous cells in the err file).
+    {
+        int qx = 1;
+        int* qptr = &qx;
+        // int* -> int* beats the qualification int* -> const int* (was 32 through a named pointer).
+        bridge_check("per-arg rank pointer qualification", cpppa.rk_qp(qptr) * 100 + cpppa.rk_qp(&qx), 3131);
+        if (bridge_passed - bridgeRankStartPassed != bridge_checks - bridgeRankStartChecks)
+            return 3625;
+        // W* -> const W* is an exact-match rank, W* -> void* a conversion (was 95).
+        cpppa.RkW pw = cpppa.RkW();
+        bridge_check("per-arg rank const pointer over void*", cpppa.rk_pv(&pw), 96);
+        if (bridge_passed - bridgeRankStartPassed != bridge_checks - bridgeRankStartChecks)
+            return 3626;
+        // Derived* -> Base* beats Derived* -> void* (was 98).
+        cpppa.RkBottom pb = cpppa.RkBottom();
+        bridge_check("per-arg rank base pointer over void*", cpppa.rk_bv(&pb), 97);
+        if (bridge_passed - bridgeRankStartPassed != bridge_checks - bridgeRankStartChecks)
+            return 3627;
+        // T* -> void* beats T* -> const void* through &obj, &int and a named pointer (a refusal
+        // guard: the pick itself was already right).
+        cpppa.RkW* pwp = &pw;
+        bridge_check("per-arg rank void* over const void*",
+                     cpppa.rk_vp(&pw) * 10000 + cpppa.rk_vp(&qx) * 100 + cpppa.rk_vp(pwp), 212121);
+        if (bridge_passed - bridgeRankStartPassed != bridge_checks - bridgeRankStartChecks)
+            return 3628;
+        // Derived-to-base keeps the qualification tie-break: Base* over const Base* (was 51) ...
+        cpppa.RkMid pm = cpppa.RkMid();
+        bridge_check("per-arg rank derived to base pointer over const", cpppa.rk_bc(&pm), 50);
+        if (bridge_passed - bridgeRankStartPassed != bridge_checks - bridgeRankStartChecks)
+            return 3629;
+        // ... and Base& over const Base& for a derived lvalue (was 53).
+        bridge_check("per-arg rank derived to base reference over const", cpppa.rk_br(pm), 52);
+        if (bridge_passed - bridgeRankStartPassed != bridge_checks - bridgeRankStartChecks)
+            return 3630;
+    }
+    // Remaining picks clang makes differently (legs 3640-3644).
+    {
+        // A string literal is const char[N]: const char* over char* (was 5); a char* stays 5.
+        char* named = "ab";
+        bridge_check("pick string literal const char*", cpppa.rk_cc("ab") * 10 + cpppa.rk_cc(named), 65);
+        if (bridge_passed - bridgeRankStartPassed != bridge_checks - bridgeRankStartChecks)
+            return 3640;
+        // An unscoped enum promotes to int, not long (was 10); a fixed narrow underlying type
+        // is the better promotion.
+        bridge_check("pick enum integral promotion",
+                     cpppa.rk_en(cpppa.RK_EA) * 100 + cpppa.rk_sm(cpppa.RK_SA), 911);
+        if (bridge_passed - bridgeRankStartPassed != bridge_checks - bridgeRankStartChecks)
+            return 3641;
+        // A derived f hides every base f, also one class further down (was 60); an unrelated
+        // base name stays visible, and a using-declaration re-exposes the base overloads.
+        int hi = 1;
+        long hl = 2;
+        cpppa.RkHide hd = cpppa.RkHide();
+        cpppa.RkHideMore hm = cpppa.RkHideMore();
+        cpppa.RkUsing hu = cpppa.RkUsing();
+        bridge_check("pick member name hiding",
+                     hd.f(hi) * 1000000 + hm.f(hi) * 10000 + hm.g(hi) * 100 + hu.f(hi), 63636260);
+        bridge_check("pick member using-declaration", hu.f(hl), 65);
+        if (bridge_passed - bridgeRankStartPassed != bridge_checks - bridgeRankStartChecks)
+            return 3642;
+        // An exact template specialization beats a non-template conversion (was 71); on a tie
+        // the non-template wins.
+        bridge_check("pick template exact over conversion",
+                     cpppa.rk_tp(1) * 10000 + cpppa.rk_tp(hi) * 100 + cpppa.rk_tp(hl), 707071);
+        bridge_check("pick non-template on tie", cpppa.rk_tn(1) * 100 + cpppa.rk_tn(hi), 7373);
+        if (bridge_passed - bridgeRankStartPassed != bridge_checks - bridgeRankStartChecks)
+            return 3643;
+        // A non-const operator RkTarget() binds the lvalue better than RkTarget(const RkSource&)
+        // (was 74).
+        cpppa.RkSource src = cpppa.RkSource();
+        bridge_check("pick non-const conversion operator over const ctor", cpppa.rk_take(src), 75);
+        if (bridge_passed - bridgeRankStartPassed != bridge_checks - bridgeRankStartChecks)
+            return 3644;
+    }
     int bridgeUniqueDerivedStartChecks = bridge_checks;
     int bridgeUniqueDerivedStartPassed = bridge_passed;
     cpppoly.reset_poly_counts();
@@ -5422,6 +5495,48 @@ extern int main(int argc, char** argv)
     if (bridge_passed - bridgeUniqueDerivedStartPassed
         != bridge_checks - bridgeUniqueDerivedStartChecks)
         return 3610;
+
+    // libtorch t26: temporaries into an inherited forwarding variadic constructor stay rvalues
+    // through the constructor wrapper (was refused as a non-const reference; clang: rv=3, c=m=0).
+    int bridgeFwdStartChecks = bridge_checks;
+    int bridgeFwdStartPassed = bridge_passed;
+    cplv.reset_fwd();
+    {
+        cplv.PartSeq seq = cplv.PartSeq(cplv.Part(2), cplv.Part(30), cplv.Part(400));
+        bridge_check("forwarding variadic ctor sum", seq.sum(), 432);
+        bridge_check("forwarding variadic ctor rvalues", cplv.fwd_rvalues(), 3);
+        bridge_check("forwarding variadic ctor copies", cplv.fwd_copies(), 0);
+        bridge_check("forwarding variadic ctor moves", cplv.fwd_moves(), 0);
+        bridge_check("forwarding variadic ctor temporaries destroyed", cplv.fwd_dtors(), 3);
+    }
+    if (bridge_passed - bridgeFwdStartPassed != bridge_checks - bridgeFwdStartChecks)
+        return 3645;
+    // A temporary into a C++ `T&&` constructor parameter through the same wrapper (clang accepts
+    // it; was refused as "no constructor whose parameter types match"): f(3) + 1.
+    cppfn.CtorRef stdfnCrR = cppfn.CtorRef(std.function<int(int)>(stdfn_twice), 1);
+    if (stdfnCrR.v() != 7)
+        return 3649;
+
+    // libtorch t25: a member operator refused for a not-yet-registered nested Item is rebound at
+    // the operator use site (was "no overload of 'operator[]'").
+    int bridgeDictStartChecks = bridge_checks;
+    int bridgeDictStartPassed = bridge_passed;
+    cplv.Net dictNet = cplv.Net();
+    cplv.NamedDict<std.string, cplv.Weight> dict = dictNet.named();
+    bridge_check("refused operator[] rebound value", dict[1].value().v, 9);
+    bridge_check("refused operator[] rebound key", (int)dict[1].key().size(), 4);
+    if (bridge_passed - bridgeDictStartPassed != bridge_checks - bridgeDictStartChecks)
+        return 3646;
+    // A non-inline out-of-line member of an implicit instantiation has no library symbol: its
+    // body is emitted locally (was an undefined symbol at link).
+    bridge_check("implicit instantiation member body", (int)dict.size(), 2);
+    if (bridge_passed - bridgeDictStartPassed != bridge_checks - bridgeDictStartChecks)
+        return 3647;
+    // A member template body whose `it != end()` is a rewritten `!(it == end())` pulls in the
+    // operator== it calls (was an undefined libc++ operator== at link).
+    bridge_check("member template rewritten != callee", dictNet.forward(5), 30);
+    if (bridge_passed - bridgeDictStartPassed != bridge_checks - bridgeDictStartChecks)
+        return 3648;
 
     return 0;
 }

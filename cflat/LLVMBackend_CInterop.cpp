@@ -2865,12 +2865,44 @@ static std::string CxxNameFromCflat(const std::string& name)
         return "::" + out;
 }
 
+/*
+ * Whether the shortened call a default-argument wrapper makes (the first `kept` parameters of
+ * one overload) is ambiguous in C++: another overload of the same name takes the same leading
+ * parameter types and defaults all the rest, so both are exact matches. Such a wrapper never
+ * compiles; it is dropped up front, as the request-TU path drops a wrapper whose body failed.
+ */
+template <class Overload, class SameShape>
+static bool CxxDefaultWrapperCallAmbiguous(const Overload& self,
+                                           const std::vector<const Overload*>& overloads,
+                                           size_t kept, SameShape sameShape)
+{
+        for (const Overload* other : overloads)
+        {
+            // A redeclaration harvested twice is the same function, not a rival overload.
+            if (other == &self || other->linkageName == self.linkageName
+                || !sameShape(*other) || other->paramTypes.size() < kept
+                || other->defaultArgs.size() != other->paramTypes.size())
+                continue;
+            bool viable = true;
+            for (size_t i = 0; i < kept && viable; ++i)
+                viable = other->paramTypes[i] == self.paramTypes[i];
+            // An "unsupported" default still exists in C++, so it still makes the call viable.
+            for (size_t i = kept; i < other->paramTypes.size() && viable; ++i)
+                viable = !other->defaultArgs[i].kind.empty();
+            if (viable) return true;
+        }
+        return false;
+}
+
 static std::string BuildCxxDefaultWrappers(
     const std::vector<cflat_cinterop::RawSig>& sigs,
-    const std::vector<cflat_cinterop::RawRecord>& records)
+    const std::vector<cflat_cinterop::RawRecord>& records,
+    std::vector<std::string>* ambiguousWrappers = nullptr)
 {
         std::string source;
         bool emitted = false;
+        // One definition per wrapper name: a signature harvested twice must not define it twice.
+        std::unordered_set<std::string> emittedWrappers;
         auto appendWrapper = [&](const std::string& base,
                                  const std::string& retType,
                                  const std::vector<std::string>& paramTypes,
@@ -2881,6 +2913,7 @@ static std::string BuildCxxDefaultWrappers(
                                  bool isConst,
                                  bool isNoexcept,
                                  int refQualifier) {
+            if (!emittedWrappers.insert(base).second) return;
             if (!emitted)
             {
                 source += kCxxWrapperPidDecl;
@@ -2901,9 +2934,14 @@ static std::string BuildCxxDefaultWrappers(
                 if (!args.empty()) args += ", ";
                 const std::string& type = paramTypes[i];
                 params += "typename __cflat_pid<" + type + ">::type a" + std::to_string(i);
+                // A by-value parameter is the wrapper's own copy: move it on, so a move-only
+                // type (std::unique_ptr) forwards as C++'s own shortened call would.
                 args += type.ends_with("&&")
                     ? "static_cast<" + type + ">(a" + std::to_string(i) + ")"
-                    : "a" + std::to_string(i);
+                    : !type.ends_with("&")
+                        ? "static_cast<typename __cflat_pid<" + type + ">::type&&>(a"
+                            + std::to_string(i) + ")"
+                        : "a" + std::to_string(i);
             }
             const std::string receiver = instance
                 ? (refQualifier == cflat_cinterop::CxxRefQualifierRValue
@@ -2929,6 +2967,11 @@ static std::string BuildCxxDefaultWrappers(
             else source += "return " + cppName + "(" + weakArgs + ");";
             source += " }\n";
         };
+        std::unordered_map<std::string, std::vector<const cflat_cinterop::RawSig*>> freeOverloads;
+        for (const auto& sig : sigs)
+            if (sig.isCxx && !sig.variadic)
+                freeOverloads[sig.qualifiedName.empty() ? sig.name : sig.qualifiedName]
+                    .push_back(&sig);
         for (const auto& sig : sigs)
         {
             if (!sig.isCxx || sig.variadic || sig.linkageName.empty()
@@ -2936,10 +2979,18 @@ static std::string BuildCxxDefaultWrappers(
                 continue;
             const std::string target = CxxNameFromCflat(
                 sig.qualifiedName.empty() ? sig.name : sig.qualifiedName);
+            const auto& overloads =
+                freeOverloads[sig.qualifiedName.empty() ? sig.name : sig.qualifiedName];
             for (size_t n = 0; n < sig.paramTypes.size(); ++n)
             {
                 if (!HasNonConstDefaultSuffix(sig.defaultArgs, n)) continue;
                 const std::string base = CxxDefaultWrapperName(sig.linkageName, n);
+                if (CxxDefaultWrapperCallAmbiguous(sig, overloads, n,
+                                                   [](const cflat_cinterop::RawSig&) { return true; }))
+                {
+                    if (ambiguousWrappers != nullptr) ambiguousWrappers->push_back(base);
+                    continue;
+                }
                 appendWrapper(base, sig.retType, sig.paramTypes, n, target,
                               /*instance*/ false, {}, false, sig.isNoexcept,
                               cflat_cinterop::CxxRefQualifierNone);
@@ -2950,6 +3001,12 @@ static std::string BuildCxxDefaultWrappers(
             const std::string owner = record.canonicalCtype.empty()
                 ? CxxNameFromCflat(record.name) : "::" + record.canonicalCtype;
             if (owner == "::" || record.name.empty()) continue;
+            std::unordered_map<std::string, std::vector<const cflat_cinterop::RawCxxMember*>>
+                memberOverloads;
+            for (const auto& member : record.members)
+                if (member.kind == cflat_cinterop::RawCxxMember::Instance
+                    || member.kind == cflat_cinterop::RawCxxMember::StaticMethod)
+                    memberOverloads[member.name].push_back(&member);
             for (const auto& member : record.members)
             {
                 if ((member.kind != cflat_cinterop::RawCxxMember::Instance
@@ -2965,6 +3022,19 @@ static std::string BuildCxxDefaultWrappers(
                     if (member.defaultArgs[n].kind == "unsupported"
                         || !HasNonConstDefaultSuffix(member.defaultArgs, n))
                         continue;
+                    // The receiver is part of the call: a const / ref-qualifier split decides it.
+                    if (CxxDefaultWrapperCallAmbiguous(member, memberOverloads[member.name], n,
+                            [&](const cflat_cinterop::RawCxxMember& other) {
+                                return other.kind == member.kind
+                                    && other.isConst == member.isConst
+                                    && other.refQualifier == member.refQualifier;
+                            }))
+                    {
+                        if (ambiguousWrappers != nullptr)
+                            ambiguousWrappers->push_back(
+                                CxxDefaultWrapperName(member.linkageName, n));
+                        continue;
+                    }
                     appendWrapper(CxxDefaultWrapperName(member.linkageName, n), member.retType,
                                   member.paramTypes, n, target, instance, member.name,
                                   member.isConst, member.isNoexcept, member.refQualifier);
@@ -3999,10 +4069,45 @@ bool LLVMBackend::ExtractCHeaderClang(const std::vector<std::string>& headerPath
         if (cxxMode && req.emitDefinitions)
         {
             std::string wrappers;
+            std::vector<std::string> ambiguousWrappers;
             {
                 CxxExtractionStageTimer wrapperStage(verbose, "default-wrapper generation");
-                wrappers = BuildCxxDefaultWrappers(raw.sigs, raw.records);
+                wrappers = BuildCxxDefaultWrappers(raw.sigs, raw.records, &ambiguousWrappers);
             }
+            // Marks a wrapper that was never emitted, or whose body failed, as unsupported.
+            auto markDroppedWrapper = [&](const std::string& dropped) {
+                bool matched = false;
+                for (auto& sig : raw.sigs)
+                {
+                    for (size_t n = 0; n < sig.defaultArgs.size(); ++n)
+                    {
+                        if (CxxDefaultWrapperName(sig.linkageName, n) != dropped) continue;
+                        sig.defaultArgs[n].kind = "unsupported";
+                        sig.defaultArgs[n].value.clear();
+                        matched = true;
+                        if (verbose)
+                            std::cout << std::format(
+                                "[verbose]   dropped C++ default wrapper for '{}' ({})\n",
+                                sig.qualifiedName.empty() ? sig.name : sig.qualifiedName, dropped);
+                    }
+                }
+                for (auto& record : raw.records)
+                    for (auto& member : record.members)
+                        for (size_t n = 0; n < member.defaultArgs.size(); ++n)
+                            if (CxxDefaultWrapperName(member.linkageName, n) == dropped)
+                            {
+                                member.defaultArgs[n].kind = "unsupported";
+                                member.defaultArgs[n].value.clear();
+                                matched = true;
+                                if (verbose)
+                                    std::cout << std::format(
+                                        "[verbose]   dropped C++ default wrapper for '{}.{}' ({})\n",
+                                        record.name, member.name, dropped);
+                            }
+                if (!matched && verbose)
+                    std::cout << std::format("[verbose]   dropped C++ default wrapper '{}'\n", dropped);
+            };
+            for (const std::string& dropped : ambiguousWrappers) markDroppedWrapper(dropped);
             if (!wrappers.empty())
             {
                 cflat_cinterop::ExtractRequest wrappedReq = req;
@@ -4046,38 +4151,7 @@ bool LLVMBackend::ExtractCHeaderClang(const std::vector<std::string>& headerPath
                     return false;
                 }
                 for (const std::string& dropped : wrapped.droppedCxxDefaultWrappers)
-                {
-                    bool matched = false;
-                    for (auto& sig : raw.sigs)
-                    {
-                        for (size_t n = 0; n < sig.defaultArgs.size(); ++n)
-                        {
-                            if (CxxDefaultWrapperName(sig.linkageName, n) != dropped) continue;
-                            sig.defaultArgs[n].kind = "unsupported";
-                            sig.defaultArgs[n].value.clear();
-                            matched = true;
-                            if (verbose)
-                                std::cout << std::format(
-                                    "[verbose]   dropped C++ default wrapper for '{}' ({})\n",
-                                    sig.qualifiedName.empty() ? sig.name : sig.qualifiedName, dropped);
-                        }
-                    }
-                    for (auto& record : raw.records)
-                        for (auto& member : record.members)
-                            for (size_t n = 0; n < member.defaultArgs.size(); ++n)
-                                if (CxxDefaultWrapperName(member.linkageName, n) == dropped)
-                                {
-                                    member.defaultArgs[n].kind = "unsupported";
-                                    member.defaultArgs[n].value.clear();
-                                    matched = true;
-                                    if (verbose)
-                                        std::cout << std::format(
-                                            "[verbose]   dropped C++ default wrapper for '{}.{}' ({})\n",
-                                            record.name, member.name, dropped);
-                                }
-                    if (!matched && verbose)
-                        std::cout << std::format("[verbose]   dropped C++ default wrapper '{}'\n", dropped);
-                }
+                    markDroppedWrapper(dropped);
                 std::string merged;
                 if (raw.bitcode.empty())
                     raw.bitcode = std::move(wrapped.bitcode);
@@ -4128,6 +4202,9 @@ bool LLVMBackend::ExtractCHeaderClang(const std::vector<std::string>& headerPath
             TypeAndValue backing;
             if (MapCTypeToTypeAndValue(re.underlyingType, backing, cxxMode))
                 RegisterEnumBackingType(re.enumType, backing.TypeName);
+            if (TypeAndValue promoted; !re.promotedType.empty()
+                && MapCTypeToTypeAndValue(re.promotedType, promoted, cxxMode))
+                enumPromotedTypes_[re.enumType] = promoted.TypeName;
         }
 
         // Companion module: adopt it for this compile and hand it back so the header cache can
@@ -4209,6 +4286,7 @@ bool LLVMBackend::ExtractCHeaderClang(const std::vector<std::string>& headerPath
         {
                 CEnumEntry e;
                 e.name = re.name; e.enumType = re.enumType; e.underlyingType = re.underlyingType;
+                e.promotedType = re.promotedType;
                 e.isScoped = re.isScoped;
                 e.value = re.value;
                 e.line = re.line ? re.line : 1; e.col = re.col < 0 ? 0 : re.col;
@@ -9024,12 +9102,23 @@ bool LLVMBackend::RequestCxxVariadicConstructor(
             }
             const bool namedLvalue = arg.Storage != nullptr
                 || (!arg.CallerName.empty() && FindVariableStorage(arg.CallerName).Storage != nullptr);
+            std::string callArgument = "p" + std::to_string(i + 1);
             if (!arg.TypeAndValue.Pointer && IsCxxRecord(arg.TypeAndValue.TypeName)
                      && ((namedLvalue)
                          || IsForeignNontrivialCxxClass(arg.TypeAndValue.TypeName)))
-                spelling += " &";
+            {
+                // A temporary stays an rvalue through the wrapper (`Seq(Lin(2, 3))` into a
+                // forwarding `H&&`); an lvalue `T &` could not bind it at the call.
+                if (!namedLvalue && IsCxxRvalueReferenceArgument(arg))
+                {
+                    callArgument = "static_cast<" + spelling + " &&>(" + callArgument + ")";
+                    spelling += " &&";
+                }
+                else
+                    spelling += " &";
+            }
             parameterSpellings.push_back(std::move(spelling));
-            callArguments.push_back("p" + std::to_string(i + 1));
+            callArguments.push_back(std::move(callArgument));
         }
 
         std::string targetCall = ownerSpelling + "(";
@@ -9726,6 +9815,8 @@ bool LLVMBackend::RequestCxxForeignType(const std::string& cflatName, const std:
             }
 
             cflat_cinterop::ExtractResult raw;
+            // Member default wrappers whose shortened call is ambiguous in C++, never emitted.
+            std::vector<std::string> ambiguousMemberWrappers;
             if (needDefinitions)
             {
             /*
@@ -9772,7 +9863,7 @@ bool LLVMBackend::RequestCxxForeignType(const std::string& cflatName, const std:
                                                       "__cflat_req_0", "",
                                                       incrementalRequests && incrementalSpellingSafe)
                     + BuildStdFunctionCtorUse(cxxSpelling, "__cflat_req_0")
-                    + BuildCxxDefaultWrappers({}, probe.records)
+                    + BuildCxxDefaultWrappers({}, probe.records, &ambiguousMemberWrappers)
                     + BuildCxxVirtualThunks(probe.records)
                     + freeTemplateUses;
                 const std::string stage2CacheExtra =
@@ -9857,6 +9948,9 @@ bool LLVMBackend::RequestCxxForeignType(const std::string& cflatName, const std:
             }
             if (!finalCached)
             {
+                raw.droppedCxxDefaultWrappers.insert(raw.droppedCxxDefaultWrappers.end(),
+                                                     ambiguousMemberWrappers.begin(),
+                                                     ambiguousMemberWrappers.end());
                 for (const std::string& dropped : raw.droppedCxxDefaultWrappers)
                     for (auto& record : raw.records)
                         for (auto& member : record.members)
@@ -10265,9 +10359,9 @@ void LLVMBackend::CollectCxxMemberRequestItems(const std::vector<CRecordEntry>& 
 /*
  * A by-value `std::` specialization field of an imported C++ record is laid out as opaque bytes
  * of clang's size and alignment (RegisterCRecords). The first member access through such a field
- * requests the specialization under its default-trimmed CFlat identity and returns the field's
- * class type; the owner's layout never changes, so a program that never touches the field issues
- * no request. False (field stays opaque) when it is not such a field or the request fails.
+ * requests the specialization under its resolved CFlat identity (the closure identity for
+ * std::function) and returns the field's class type; the owner's layout never changes, so a
+ * program that never touches the field issues no request. False when it is not such a field.
  */
 bool LLVMBackend::BindLazyCxxStdField(llvm::StructType* owner, const TypeAndValue& stored,
                                       TypeAndValue& bound)
@@ -10306,11 +10400,50 @@ bool LLVMBackend::BindLazyCxxStdField(llvm::StructType* owner, const TypeAndValu
             else if (ch == '>' && angleDepth > 0) --angleDepth;
             else if (angleDepth == 0 && (ch == '*' || ch == '&' || ch == '[')) return false;
         }
-        const std::string identity = cflat_cinterop::CxxForeignIdentity(
-            CxxFieldIdentitySpelling(spelling));
-        if (identity.empty()) return false;
+        std::string className;
+        const bool isStdFunction = IsTopLevelStdFunctionSpelling(spelling);
+        std::string identity;
+        if (isStdFunction)
+        {
+            auto ownerIt = cxxTypeOwnerGroup_.find(ownerName);
+            if (ownerIt == cxxTypeOwnerGroup_.end())
+            {
+                LogErrorMessage("cannot bind C++ field '{}' of '{}' with type '{}': "
+                                "no owning header request group",
+                                { field->name, DisplayCxxClassName(ownerName), spelling });
+                return false;
+            }
+            CxxRequestGroup group = MakeCxxRequestGroup(ownerIt->second, {});
+            if (group.headers.empty())
+            {
+                LogErrorMessage("cannot bind C++ field '{}' of '{}' with type '{}': "
+                                "no header is available to request the specialization",
+                                { field->name, DisplayCxxClassName(ownerName), spelling });
+                return false;
+            }
+            CxxRequestGroupScope groupScope(*this, &group);
+            std::string requestError;
+            className = StdFunctionSpecializationForSpelling(spelling, &requestError);
+            if (className.empty())
+            {
+                LogErrorMessage("cannot bind C++ field '{}' of '{}' with type '{}': {}",
+                                { field->name, DisplayCxxClassName(ownerName), spelling,
+                                  requestError.empty() ? "unrecognized std::function signature"
+                                                       : requestError });
+                return false;
+            }
+            identity = className;
+        }
+        else
+        {
+            identity = cflat_cinterop::CxxForeignIdentity(
+                CxxFieldIdentitySpelling(spelling));
+            if (identity.empty()) return false;
+        }
 
-        if (cxxForeignRequests_.count(identity) == 0 || cxxForeignDefinitions_.count(identity) == 0)
+        if (!isStdFunction
+            && (cxxForeignRequests_.count(identity) == 0
+                || cxxForeignDefinitions_.count(identity) == 0))
         {
             auto ownerIt = cxxTypeOwnerGroup_.find(ownerName);
             if (ownerIt == cxxTypeOwnerGroup_.end()) return false;
@@ -10322,25 +10455,45 @@ bool LLVMBackend::BindLazyCxxStdField(llvm::StructType* owner, const TypeAndValu
                                        /*explicitInstantiation*/ true))
                 return false;
         }
-        else if (!cxxForeignRequests_[identity].empty())
+        else if (!isStdFunction && !cxxForeignRequests_[identity].empty())
+        {
             return false;
+        }
 
         TypeAndValue mapped;
-        if (!MapCTypeToTypeAndValue(spelling, mapped, /*cxxBoundary*/ true) || mapped.Pointer
+        if (isStdFunction)
+            mapped.TypeName = className;
+        else if (!MapCTypeToTypeAndValue(spelling, mapped, /*cxxBoundary*/ true)) return false;
+        if (mapped.Pointer
             || mapped.ConstArraySize != 0 || cxxRecords_.count(mapped.TypeName) == 0)
+        {
+            if (!isStdFunction) return false;
+            LogErrorMessage("cannot bind C++ field '{}' of '{}' with type '{}': "
+                            "the requested CFlat specialization is unavailable",
+                            { field->name, DisplayCxxClassName(ownerName), spelling });
             return false;
+        }
         auto* classTy = GetType(mapped);
-        if (classTy == nullptr || !classTy->isSized()) return false;
+        if (classTy == nullptr || !classTy->isSized())
+        {
+            if (!isStdFunction) return false;
+            LogErrorMessage("cannot bind C++ field '{}' of '{}' with type '{}': "
+                            "the requested CFlat specialization has no usable layout",
+                            { field->name, DisplayCxxClassName(ownerName), spelling });
+            return false;
+        }
         const llvm::DataLayout& dl = module->getDataLayout();
         const uint64_t size = (uint64_t)dl.getTypeAllocSize(classTy);
         const uint64_t align = (uint64_t)dl.getABITypeAlign(classTy).value();
         if (size != field->sizeBytes || align > field->alignBytes)
         {
-            LogError(std::format("C++ field '{}' of '{}' has type '{}' whose CFlat layout "
-                                 "({} bytes, align {}) differs from C++ ({} bytes, align {}); "
-                                 "it stays opaque storage",
-                                 field->name, DisplayCxxClassName(ownerName), spelling, size, align,
-                                 field->sizeBytes, field->alignBytes));
+            if (!isStdFunction) return false;
+            LogErrorMessage("C++ field '{}' of '{}' has type '{}' whose CFlat layout "
+                            "({} bytes, align {}) differs from C++ ({} bytes, align {}); "
+                            "it stays opaque storage",
+                            { field->name, DisplayCxxClassName(ownerName), spelling,
+                              std::to_string(size), std::to_string(align),
+                              std::to_string(field->sizeBytes), std::to_string(field->alignBytes) });
             return false;
         }
         bound = mapped;
@@ -11043,6 +11196,9 @@ void LLVMBackend::RegisterCEnums(const std::vector<CEnumEntry>& enums, const std
                 TypeAndValue backing;
                 if (MapCTypeToTypeAndValue(e.underlyingType, backing, cxxBoundary))
                     RegisterEnumBackingType(e.enumType, backing.TypeName);
+                if (TypeAndValue promoted; !e.promotedType.empty()
+                    && MapCTypeToTypeAndValue(e.promotedType, promoted, cxxBoundary))
+                    enumPromotedTypes_[e.enumType] = promoted.TypeName;
             }
             if (!e.enumType.empty() && GetEnumBackingType(e.enumType).empty())
             {
@@ -14040,6 +14196,15 @@ bool LLVMBackend::RegisterCxxInheritedMembers(const CRecordEntry& r)
                 self->second.memberAccess[mn] = access;
         };
 
+        // [class.member.lookup]: a name this class declares hides every base member of that name;
+        // a using-declaration lists the base overloads among the class's own members.
+        std::set<std::string> declaredNames;
+        for (const auto& m : r.members)
+            if ((m.kind == cflat_cinterop::RawCxxMember::Instance
+                 || m.kind == cflat_cinterop::RawCxxMember::StaticMethod)
+                && !m.isConversion && !m.isImplicit)
+                declaredNames.insert(m.name);
+
         std::set<std::string> present;
         for (const std::string& mn : self->second.instanceMethodNames)
         {
@@ -14078,7 +14243,8 @@ bool LLVMBackend::RegisterCxxInheritedMembers(const CRecordEntry& r)
                         present.insert(sigKey(mn, sym.Parameters, sym.CxxRefQualifier));
                         noteMethodName(mn);
                     }
-                    if (sym.IsCxx && sym.Parameters[0].TypeName == baseName)
+                    if (sym.IsCxx && sym.Parameters[0].TypeName == baseName
+                        && declaredNames.count(mn) == 0)
                         fromBase.push_back(sym);
                 }
                 for (FunctionSymbol sym : fromBase)
@@ -16515,9 +16681,15 @@ bool LLVMBackend::MaterializeImplicitCxxClassArgument(NamedVariable& arg,
         source.TypeAndValue = argType;
         source.TypeAndValue.VariableName.clear();
         const auto* info = GetCxxClassInfo(param.TypeName);
-        const bool wrapped = (ctor == nullptr || clangResolves) && info != nullptr
-            && (info->constructors.empty()
-                || (info->hasCtorTemplate && !IsCxxRecord(argType.TypeName)))
+        // A non-const `operator T()` beats `T(const S&)` on an lvalue; copy-initialization
+        // in the wrapper lets clang make that pick.
+        const bool operatorBindsBetter = !argType.Pointer && !slicesToBase
+            && CxxConversionOperatorBindsBetter(argType.TypeName, param.TypeName);
+        const bool wrapped = info != nullptr
+            && (operatorBindsBetter
+                || ((ctor == nullptr || clangResolves)
+                    && (info->constructors.empty()
+                        || (info->hasCtorTemplate && !IsCxxRecord(argType.TypeName)))))
             && RequestCxxVariadicConstructor(param.TypeName, { source }, wrapperName,
                                              wrapperError, /*copyInit*/ true);
         if (!wrapped && (ctor == nullptr || ctor->params.size() < 2)) return false;

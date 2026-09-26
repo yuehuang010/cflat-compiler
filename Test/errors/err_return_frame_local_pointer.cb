@@ -1,0 +1,62 @@
+// A frame-local address must not escape through a raw pointer return, directly or through a join.
+struct FrameRow { int value = default; };
+struct FrameTab { FrameRow row = default; };
+FrameTab frameGlobal = default;
+
+expect_error("cannot return the address of 'local': it points into this function's own frame") {
+    alias FrameRow* aliasDirectLocal() { FrameTab local; return &local.row; }
+}
+
+expect_error("cannot return the address of 'local': it points into this function's own frame") {
+    FrameRow* directLocal() { FrameTab local; return &local.row; }
+}
+
+expect_error("cannot return the address of a '?:' arm: it points into this function's own frame") {
+    FrameRow* bothLocal(bool c) { FrameTab a; FrameTab b; return c ? &a.row : &b.row; }
+}
+
+expect_error("cannot return the address of a '?:' arm: it points into this function's own frame") {
+    FrameRow* localTrueArm(FrameTab* t, bool c)
+    {
+        FrameTab local;
+        return c ? &local.row : &t->row;
+    }
+}
+
+expect_error("cannot return the address of a '?:' arm: it points into this function's own frame") {
+    FrameRow* localFalseArm(FrameTab* t, bool c)
+    {
+        FrameTab local;
+        return c ? &t->row : &local.row;
+    }
+}
+
+expect_error("cannot return the address of a '?:' arm: it points into this function's own frame") {
+    FrameRow* nestedLocal(FrameTab* t, bool c, bool d)
+    {
+        FrameTab local;
+        return c ? &t->row : (d ? &frameGlobal.row : &local.row);
+    }
+}
+
+expect_error("cannot return the address of a '?:' arm: it points into this function's own frame") {
+    int* localArrayElement(bool c)
+    {
+        int[2] local = {1, 2};
+        return c ? &local[1] : &frameGlobal.row.value;
+    }
+}
+
+expect_error("cannot return the address of 'arr': it points into this function's own frame") {
+    int* directArrayElement() { int[2] arr = {1, 2}; return &arr[1]; }
+}
+
+expect_error("cannot return the address of 'x': it points into this function's own frame") {
+    int* localScalar() { int x = 1; return &x; }
+}
+
+expect_error("cannot return the address of 'value': it points into this function's own frame") {
+    int* byValueParameter(int value) { return &value; }
+}
+
+extern int main() { return 0; }

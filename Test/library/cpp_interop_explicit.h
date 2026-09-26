@@ -3,6 +3,8 @@
 // it; the spelled form `cppexp.Ex(5)` stays legal. The non-explicit `Options(double)` shapes
 // below are the ACCEPT set: they must keep converting at every parameter kind C++ allows.
 #pragma once
+#include <memory>
+#include <optional>
 #include <type_traits>
 #include <vector>
 
@@ -70,6 +72,85 @@ struct Optim {
 struct OptimCref {
     int v;
     OptimCref(std::vector<int> p, const Options& o) : v((int)p.size() * 2000 + (int)(o.lr * 100)) {}
+};
+
+// The libtorch Adam shape: the options class converts from a DEFAULTED double, and the owner
+// takes it as a defaulted by-value parameter.
+struct OptDef { double lr; OptDef(double l = 1e-3) : lr(l) {} };
+struct OptimDef {
+    int v;
+    OptimDef(std::vector<int> p, OptDef o = {}) : v((int)p.size() * 3000 + (int)(o.lr * 1000)) {}
+};
+// Two overloads that both accept the same shortened call (libtorch's bernoulli_out): the call
+// `amb_pick(o, s)` is ambiguous in C++, so its default wrapper cannot be built. The spelled-out
+// calls and every other default wrapper in the header must still bind.
+inline int amb_pick(int& out, int self, std::optional<int> g = std::nullopt)
+{ return out + self + (g ? *g : 100); }
+inline int amb_pick(int& out, int self, double p = 0.5, std::optional<int> g = std::nullopt)
+{ return out + self + (int)(p * 1000) + (g ? *g : 200); }
+inline int amb_sibling(int x, std::optional<int> g = std::nullopt) { return x + (g ? *g : 30); }
+// A move-only by-value parameter ahead of a default: its wrapper must move the argument on,
+// or the header's whole default-wrapper batch fails to compile.
+inline int amb_moveonly(std::unique_ptr<int> p, std::optional<int> g = std::nullopt)
+{ return p ? *p : -1; }
+struct AmbHost {
+    int base;
+    AmbHost(int b) : base(b) {}
+    int pick(int a, std::optional<int> g = std::nullopt) const { return base + a + (g ? *g : 40); }
+    int pick(int a, double p = 0.5, std::optional<int> g = std::nullopt) const
+    { return base + a + (int)(p * 1000) + (g ? *g : 50); }
+    int sibling(int a, std::optional<int> g = std::nullopt) const { return base + a + (g ? *g : 60); }
+};
+
+// Overload-ranking probes for converting constructors against standard conversions.
+struct MemRankHost {
+    int pick(int, std::optional<int> = std::nullopt) const { return 1; }
+    int pick(int, double = 0.5, std::optional<int> = std::nullopt) const { return 3606; }
+};
+inline int memrank_free(int, std::optional<int> = std::nullopt) { return 1; }
+inline int memrank_free(int, double = 0.5, std::optional<int> = std::nullopt) { return 3607; }
+struct MemRankNoTail {
+    int pick(int, std::optional<int> = std::nullopt) const { return 1; }
+    int pick(int, double = 0.5) const { return 3608; }
+};
+struct MemRankLong {
+    int pick(int, std::optional<int>) const { return 1; }
+    int pick(int, long) const { return 3609; }
+};
+struct MemRankOptionalDouble {
+    int pick(int, std::optional<double>) const { return 1; }
+    int pick(int, float) const { return 3610; }
+};
+struct MemRankOpt { MemRankOpt(double) {} };
+struct MemRankNonTemplate {
+    int pick(int, MemRankOpt) const { return 1; }
+    int pick(int, double) const { return 3611; }
+};
+
+struct LateMemberWrapper {
+    int add(int n = 9) const { return n + 1; }
+};
+
+// The libtorch DataLoader shape: a class template's field specializes another template over its
+// PROTECTED nested type, and both carry defaulted members. No default-argument wrapper can spell
+// `PrivLoader<int>::Job` at namespace scope; an earlier field's wrapper must still bind.
+template <typename T> struct PrivQueue {
+    int ahead(std::optional<int> g = std::nullopt) const { return g ? *g : 3; }
+    T slot{};
+    T pop(std::optional<int> timeout = std::nullopt) { return slot; }
+};
+template <typename T> struct PrivBox {
+    T v{};
+    int get(std::optional<int> g = std::nullopt) const { return g ? *g : 9; }
+};
+template <typename D> class PrivLoader {
+protected:
+    struct Job { int id = 7; };
+public:
+    PrivBox<D> box;
+    PrivQueue<Job> jobs;
+    int peek(std::optional<int> g = std::nullopt) const { return g ? *g : 5; }
+    int next() { return jobs.pop().id + (int)sizeof(D); }
 };
 
 struct NewPlain {

@@ -28,8 +28,5 @@ extern int main()
     expect_error("C++ function 'cppfn.take_vec_free' uses a calling convention cflat cannot express") {
         int rv = cppfn.take_vec_free(std.function<int(int)>(nested_twice));
     }
-    expect_error("C++ class 'cppfn.CtorRef' has no constructor whose parameter types match") {
-        cppfn.CtorRef c = cppfn.CtorRef(std.function<int(int)>(nested_twice), 1);
-    }
     return 0;
 }

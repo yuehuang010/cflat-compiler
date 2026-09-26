@@ -1607,6 +1607,9 @@ void LLVMBackend::EmitOwningPtrDestructor(const NamedVariable& namedVar, llvm::V
                                           const std::string& typeName,
                                           llvm::Value* rawArrayCount)
 {
+        // TypeName names the C++ pointee even when this allocation is an array of pointers.
+        // Pointer elements have no C++ object destructor; only release the backing allocation.
+        if (namedVar.TypeAndValue.ValuePointerDepth() >= 2) return;
         auto* dtor = GetFullDestructorForDelete(typeName);
         if (dtor == nullptr) return;
 
@@ -1669,7 +1672,7 @@ void LLVMBackend::EmitOwningPtrCleanup(const NamedVariable& namedVar, llvm::Valu
         // A C++ class `new T[n]` block (a view, or a constant raw array count) is an array: never
         // the deleting destructor of element 0.
         const std::string& ownTypeName = namedVar.TypeAndValue.TypeName;
-        const bool cxxAllocator = !namedVar.TypeAndValue.ElemPointer
+        const bool cxxAllocator = namedVar.TypeAndValue.ValuePointerDepth() < 2
             && CxxClassUsesCxxAllocator(ownTypeName);
         llvm::Value* cxxArrayCount = nullptr;
         if (cxxAllocator
@@ -1978,7 +1981,7 @@ const std::string* LLVMBackend::FindOwnedReturnTemp(llvm::Value* value) const
         return e == nullptr ? nullptr : &e->FnName;
     }
 
-void LLVMBackend::RegisterOwnedPtrTemp(llvm::Value* value)
+void LLVMBackend::RegisterOwnedPtrTemp(llvm::Value* value, llvm::Value* releaseGate)
 {
         std::string typeName;
         llvm::Value* rawArrayCount = RawArrayCountOf(value);
@@ -1994,10 +1997,17 @@ void LLVMBackend::RegisterOwnedPtrTemp(llvm::Value* value)
             allocAlign = n->AllocAlign;
         }
         else return;
-        for (const auto& p : pendingOwnedPtrTemps)
-            if (p.Value == value) return;   // idempotent: one buffer, one free
+        for (auto it = pendingOwnedPtrTemps.begin(); it != pendingOwnedPtrTemps.end(); ++it)
+        {
+            if (it->Value != value) continue;   // idempotent: one buffer, one free
+            // An unproven C++ use gates the free; two different gates cannot both be honoured.
+            if (releaseGate == nullptr || it->ReleaseGate == releaseGate) return;
+            if (it->ReleaseGate == nullptr) it->ReleaseGate = releaseGate;
+            else pendingOwnedPtrTemps.erase(it);
+            return;
+        }
         pendingOwnedPtrTemps.push_back(
-            { value, rawArrayCount, typeName, allocAlign, builder->GetInsertBlock() });
+            { value, rawArrayCount, typeName, allocAlign, builder->GetInsertBlock(), releaseGate });
     }
 
 bool LLVMBackend::IsOwningPtrTempValue(llvm::Value* value) const
@@ -2009,18 +2019,76 @@ bool LLVMBackend::IsOwningPtrTempValue(llvm::Value* value) const
         return n != nullptr && !n->TypeName.empty();
     }
 
-void LLVMBackend::RegisterNonEscapingOwningPtrArgs(llvm::Value* callResult)
+void LLVMBackend::RegisterNonEscapingOwningPtrArgs(llvm::Value* callResult, bool calleeIsCxx)
 {
-        auto* call = llvm::dyn_cast_or_null<llvm::CallInst>(callResult);
+        auto* call = llvm::dyn_cast_or_null<llvm::CallBase>(callResult);
         if (call == nullptr) return;
         const llvm::Function* callee = call->getCalledFunction();
-        if (callee == nullptr || callee->isDeclaration()) return;
+        if (callee == nullptr) return;   // virtual / indirect dispatch: no body to prove
+        if (callee->isDeclaration())
+        {
+            // A C++ body (inline method, wrapper) is linked in after the walk: free behind a gate
+            // that ResolveCxxThisEscapeGates opens only on a proof over that body.
+            if (!calleeIsCxx || !callee->hasName() || callee->isVarArg()) return;
+            for (unsigned i = 0; i < call->arg_size(); ++i)
+                RegisterCxxGatedOwningPtrArg(call->getArgOperand(i), *callee, i);
+            return;
+        }
         for (unsigned i = 0; i < call->arg_size(); ++i)
         {
             llvm::Value* argVal = call->getArgOperand(i);
             if (!IsOwningPtrTempValue(argVal)) continue;
             if (ParameterRetainsArgument(callee, i)) continue;
             RegisterOwnedPtrTemp(argVal);
+        }
+    }
+
+void LLVMBackend::RegisterCxxGatedOwningPtrArg(llvm::Value* argVal, const llvm::Function& callee,
+                                               unsigned argIndex)
+{
+        if (!IsOwningPtrTempValue(argVal)) return;
+        auto* gateSlot = AllocaAtEntry(builder->getInt1Ty(), nullptr, "cxx.this.release");
+        llvm::StoreInst* init = nullptr;
+        {
+            llvm::IRBuilderBase::InsertPointGuard guard(*builder);
+            builder->SetInsertPoint(gateSlot->getParent(), std::next(gateSlot->getIterator()));
+            init = builder->CreateStore(builder->getInt1(false), gateSlot);
+        }
+        cxxThisEscapeGates_.push_back({ init, callee.getName().str(), argIndex });
+        RegisterOwnedPtrTemp(argVal, gateSlot);
+    }
+
+bool LLVMBackend::RegisterCxxOwningPtrArgsBeforeCall(const llvm::Function* callee,
+                                                     llvm::ArrayRef<llvm::Value*> args)
+{
+        // Same filter as the declaration branch of RegisterNonEscapingOwningPtrArgs; `args` must
+        // map 1:1 onto the callee's parameters (a direct, non-lowered call).
+        if (callee == nullptr || !callee->isDeclaration() || !callee->hasName() || callee->isVarArg())
+            return false;
+        for (unsigned i = 0; i < args.size(); ++i)
+            RegisterCxxGatedOwningPtrArg(args[i], *callee, i);
+        return true;
+    }
+
+void LLVMBackend::ResolveCxxThisEscapeGates()
+{
+        if (cxxThisEscapeGates_.empty()) return;
+        std::vector<CxxThisEscapeGate> pending;
+        pending.swap(cxxThisEscapeGates_);
+        // The link replaced declarations with new Function objects: a memo keyed on a pointer
+        // from before it could answer for a stranger at a recycled address.
+        paramRetainsMemo_.clear();
+        paramRetainsPastCallMemo_.clear();
+        NoCurrentFunctionScope noCurrent(this);
+        for (const auto& gate : pending)
+        {
+            auto* init = llvm::dyn_cast_or_null<llvm::StoreInst>(gate.Init);
+            if (init == nullptr) continue;
+            const llvm::Function* fn = module->getFunction(gate.Callee);
+            // Still a declaration (out-of-line member, library symbol): no proof, keep the leak.
+            if (fn == nullptr || fn->isDeclaration() || gate.ArgIndex >= fn->arg_size()) continue;
+            if (ParameterRetainsArgument(fn, gate.ArgIndex)) continue;
+            init->setOperand(0, llvm::ConstantInt::getTrue(init->getContext()));
         }
     }
 
@@ -2337,11 +2405,10 @@ bool LLVMBackend::ParameterRetainsArgument(const llvm::Function* fn, unsigned ar
         if (fn == nullptr) return true;
         if (fn->isVarArg() && argIndex >= fn->arg_size()) return false;
         if (argIndex >= fn->arg_size() || depth > kMaxRetainDepth) return true;
+        // Gate before consulting the memo: a half-emitted body can later grow an escaping use.
+        if (!FunctionBodyIsComplete(fn)) return true;
         auto key = std::make_pair(fn, argIndex);
         if (auto it = paramRetainsMemo_.find(key); it != paramRetainsMemo_.end()) return it->second;
-        // Gate the ANSWER, not just the cache: a half-emitted body has not yet grown the store
-        // that escapes, so trusting it would free a pointer the callee goes on to retain.
-        if (!FunctionBodyIsComplete(fn)) return true;
         if (!paramRetainsInProgress_.insert(key).second) return true;   // cycle: assume retaining
         bool retains = OwningPtrEscapes(fn->getArg(argIndex), depth);
         paramRetainsInProgress_.erase(key);
@@ -3791,9 +3858,145 @@ void LLVMBackend::ConsumeOwnedNewTemp(llvm::Value* value)
 
 void LLVMBackend::UnregisterOwnedPtrTemp(llvm::Value* value)
 {
-        if (value == nullptr) return;
-        std::erase_if(pendingOwnedPtrTemps,
-            [&](const PendingOwnedPtrTemp& p) { return p.Value == value; });
+        llvm::SmallVector<llvm::Value*, 8> work{ value };
+        llvm::SmallPtrSet<llvm::Value*, 16> seen;
+        while (!work.empty())
+        {
+            llvm::Value* current = work.pop_back_val();
+            if (current == nullptr || !seen.insert(current).second) continue;
+            std::erase_if(pendingOwnedPtrTemps,
+                [&](const PendingOwnedPtrTemp& p) { return p.Value == current; });
+            if (const auto* join = FindNullCoalesceJoin(current))
+                for (const auto& arm : join->Arms) work.push_back(arm.Value);
+        }
+}
+
+/*
+ * Walks `v` back through GEPs, pointer casts, selects and PHIs to the objects it addresses and
+ * asks `isTemp` of each. Without `includeSelf`, only an object reached through a GEP counts: the
+ * temp pointer itself is an ownership question the adopting sites already answer.
+ */
+static bool AddressDerivesFromTemp(llvm::Value* v, bool includeSelf,
+                                   const std::function<bool(llvm::Value*)>& isTemp)
+{
+        if (v == nullptr || !v->getType()->isPointerTy()) return false;
+        llvm::SmallVector<std::pair<llvm::Value*, bool>, 8> work{ { v, includeSelf } };
+        llvm::SmallPtrSet<llvm::Value*, 16> seen;
+        while (!work.empty() && seen.size() < 64)
+        {
+            auto [cur, interior] = work.pop_back_val();
+            if (!seen.insert(cur).second) continue;
+            if (interior && isTemp(cur)) return true;
+            if (auto* gep = llvm::dyn_cast<llvm::GEPOperator>(cur))
+                work.push_back({ gep->getPointerOperand(), true });
+            else if (auto* sel = llvm::dyn_cast<llvm::SelectInst>(cur))
+            {
+                work.push_back({ sel->getTrueValue(), interior });
+                work.push_back({ sel->getFalseValue(), interior });
+            }
+            else if (auto* phi = llvm::dyn_cast<llvm::PHINode>(cur))
+            {
+                for (llvm::Value* in : phi->incoming_values()) work.push_back({ in, interior });
+            }
+            else if (auto* op = llvm::dyn_cast<llvm::Operator>(cur);
+                     op != nullptr && (op->getOpcode() == llvm::Instruction::BitCast
+                                       || op->getOpcode() == llvm::Instruction::AddrSpaceCast))
+                work.push_back({ op->getOperand(0), interior });
+        }
+        return false;
+    }
+
+bool LLVMBackend::PointsIntoOwnedPtrTemp(llvm::Value* v, bool includeSelf, size_t fromIndex) const
+{
+        return AddressDerivesFromTemp(v, includeSelf, [&](llvm::Value* base) {
+            for (size_t i = fromIndex; i < pendingOwnedPtrTemps.size(); ++i)
+                if (pendingOwnedPtrTemps[i].Value == base) return true;
+            return false;
+        });
+    }
+
+void LLVMBackend::RecordPtrToIntOfTemp(llvm::Value* intValue, llvm::Value* ptrOperand)
+{
+        if (intValue == nullptr || ptrOperand == nullptr) return;
+        if (AddressDerivesFromTemp(ptrOperand, /*includeSelf*/ true, [&](llvm::Value* base) {
+                for (const auto& p : pendingOwnedPtrTemps)
+                    if (p.Value == base) return true;
+                return false;
+            }))
+            ptrToIntOfTemps_.push_back({ intValue, ptrOperand });
+    }
+
+/*
+ * An integer address escapes unless every use is a compare, possibly after integer widening or
+ * narrowing. Reaching `keep` (the value a return or a join carries on) is an escape too.
+ */
+static bool IntAddressEscapes(llvm::Value* intValue, llvm::Value* keep)
+{
+        llvm::SmallVector<llvm::Value*, 8> work{ intValue };
+        llvm::SmallPtrSet<llvm::Value*, 16> seen;
+        while (!work.empty())
+        {
+            llvm::Value* cur = work.pop_back_val();
+            if (!seen.insert(cur).second) continue;
+            if (cur == keep || seen.size() > 64) return true;
+            for (llvm::User* user : cur->users())
+            {
+                if (llvm::isa<llvm::ICmpInst>(user)) continue;
+                auto* cast = llvm::dyn_cast<llvm::CastInst>(user);
+                if (cast != nullptr && cast->getType()->isIntegerTy()
+                    && (llvm::isa<llvm::TruncInst>(cast) || llvm::isa<llvm::ZExtInst>(cast)
+                        || llvm::isa<llvm::SExtInst>(cast)))
+                {
+                    work.push_back(cast);
+                    continue;
+                }
+                return true;
+            }
+        }
+        return false;
+    }
+
+void LLVMBackend::ClaimIntLaunderedPtrTemps(size_t fromIndex, llvm::Value* keep)
+{
+        for (const auto& [intValue, ptr] : ptrToIntOfTemps_)
+            if (IntAddressEscapes(intValue, keep))
+                ClaimOwnedPtrTempsUnder(ptr, /*includeSelf*/ true, fromIndex);
+    }
+
+void LLVMBackend::ClaimOwnedPtrTempsUnder(llvm::Value* v, bool includeSelf, size_t fromIndex)
+{
+        if (v == nullptr || !v->getType()->isPointerTy()) return;
+        for (size_t i = fromIndex; i < pendingOwnedPtrTemps.size(); )
+        {
+            llvm::Value* temp = pendingOwnedPtrTemps[i].Value;
+            if (pendingOwnedPtrTemps[i].ConditionalSlot == nullptr && temp != nullptr
+                && AddressDerivesFromTemp(v, includeSelf,
+                    [&](llvm::Value* base) { return base == temp; }))
+            {
+                addrClaimedPtrTemps_.push_back(temp);
+                pendingOwnedPtrTemps.erase(pendingOwnedPtrTemps.begin() + i);
+                continue;
+            }
+            ++i;
+        }
+    }
+
+bool LLVMBackend::AddressIntoStatementPtrTemp(llvm::Value* v) const
+{
+        if (v != nullptr && std::find(addrIntoTempValues_.begin(), addrIntoTempValues_.end(), v)
+            != addrIntoTempValues_.end())
+            return true;
+        return AddressDerivesFromTemp(v, /*includeSelf*/ false, [&](llvm::Value* base) {
+            if (std::find(addrIntoTempValues_.begin(), addrIntoTempValues_.end(), base)
+                != addrIntoTempValues_.end())
+                return true;
+            if (std::find(addrClaimedPtrTemps_.begin(), addrClaimedPtrTemps_.end(), base)
+                != addrClaimedPtrTemps_.end())
+                return true;
+            for (const auto& p : pendingOwnedPtrTemps)
+                if (p.Value == base) return true;
+            return false;
+        });
     }
 
 bool LLVMBackend::IsInsertBlockLive() const
@@ -3980,10 +4183,39 @@ void LLVMBackend::FlushOwnedStructTemps()
     }
 
 void LLVMBackend::EmitOwnedPtrTempFree(llvm::Value* ptrVal, const std::string& typeName,
-                                       uint64_t allocAlign, llvm::Value* rawArrayCount)
+                                       uint64_t allocAlign, llvm::Value* rawArrayCount,
+                                       llvm::Value* releaseGate)
 {
         auto* ptrTy = llvm::dyn_cast<llvm::PointerType>(ptrVal->getType());
         if (ptrTy == nullptr) return;
+        if (releaseGate != nullptr)
+        {
+            // Skipped unless the post-link proof stored true into the gate slot.
+            auto* fn = builder->GetInsertBlock()->getParent();
+            auto* open = builder->CreateLoad(builder->getInt1Ty(), releaseGate, "tmpptr.gate");
+            auto* freeBB = llvm::BasicBlock::Create(*context, "tmpptr.gated", fn);
+            auto* doneBB = llvm::BasicBlock::Create(*context, "tmpptr.gate.done", fn);
+            builder->CreateCondBr(open, freeBB, doneBB);
+            builder->SetInsertPoint(freeBB);
+            EmitOwnedPtrTempFree(ptrVal, typeName, allocAlign, rawArrayCount);
+            if (IsInsertBlockLive()) builder->CreateBr(doneBB);
+            builder->SetInsertPoint(doneBB);
+            return;
+        }
+        // A C++-allocated pointee is released exactly as an owning slot at scope exit is (virtual
+        // deleting dtor, or dtor + the paired class / global operator delete), so spill and reuse it.
+        if (CxxClassUsesCxxAllocator(typeName))
+        {
+            NamedVariable slotVar;
+            slotVar.TypeAndValue = TypeAndValue{ .TypeName = typeName, .Pointer = true };
+            slotVar.BaseType = ptrTy;
+            slotVar.Storage = AllocaAtEntry(ptrTy, nullptr, "tmpptr.cxx");
+            slotVar.RawArrayLength = rawArrayCount;
+            slotVar.AllocAlignment = allocAlign;
+            builder->CreateStore(ptrVal, slotVar.Storage);
+            EmitOwningPtrCleanup(slotVar);
+            return;
+        }
         auto* isNull = builder->CreateICmpEQ(ptrVal, llvm::ConstantPointerNull::get(ptrTy));
         auto* cleanupBB = llvm::BasicBlock::Create(*context, "tmpptr.cleanup", builder->GetInsertBlock()->getParent());
         auto* afterBB   = llvm::BasicBlock::Create(*context, "tmpptr.after",   builder->GetInsertBlock()->getParent());
@@ -4016,6 +4248,7 @@ void LLVMBackend::EmitOwnedPtrTempFree(llvm::Value* ptrVal, const std::string& t
 void LLVMBackend::FlushOwnedPtrTemps()
 {
         if (pendingOwnedPtrTemps.empty()) return;
+        ClaimIntLaunderedPtrTemps(0, nullptr);
 
         auto temps = std::move(pendingOwnedPtrTemps);
         pendingOwnedPtrTemps.clear();
@@ -4024,7 +4257,8 @@ void LLVMBackend::FlushOwnedPtrTemps()
             if (t.Value == nullptr || !IsInsertBlockLive()) continue;
             std::optional<llvm::DominatorTree> domTree;
             if (!OwnedTempDominatesHere(t.Block, builder->GetInsertBlock(), domTree)) continue; // dominance safety
-            EmitOwnedPtrTempFree(t.Value, t.TypeName, t.AllocAlign, t.RawArrayCount);
+            if (t.ConditionalSlot != nullptr) EmitOwnedConditionalPtrTempFree(t);
+            else EmitOwnedPtrTempFree(t.Value, t.TypeName, t.AllocAlign, t.RawArrayCount, t.ReleaseGate);
         }
     }
 
@@ -4063,7 +4297,57 @@ void LLVMBackend::RegisterBorrowedOwningStructTempAt(const NamedVariable& arg, l
 LLVMBackend::OwnedTempMark LLVMBackend::MarkOwnedTemps() const
 {
         return { pendingOwnedStringTemps.size(), pendingOwnedClosureTemps.size(),
-                 pendingOwnedStructTemps.size(), pendingOwnedPtrTemps.size() };
+                 pendingOwnedStructTemps.size(), pendingOwnedPtrTemps.size(), ownedNewTemps_.size() };
+    }
+
+void LLVMBackend::HoistOwnedPtrTempsForAddress(const OwnedTempMark& mark, llvm::Value* address,
+                                                llvm::BasicBlock* hoistTo, bool includeBareNew)
+{
+        if (address == nullptr || hoistTo == nullptr) return;
+        for (size_t i = includeBareNew ? mark.NewPtrs : ownedNewTemps_.size();
+             i < ownedNewTemps_.size(); ++i)
+        {
+            llvm::Value* value = ownedNewTemps_[i].Value;
+            if (AddressDerivesFromTemp(address, /*includeSelf*/ true,
+                    [&](llvm::Value* base) { return base == value; }))
+                RegisterOwnedPtrTemp(value);
+        }
+        for (size_t i = mark.Ptrs; i < pendingOwnedPtrTemps.size(); )
+        {
+            auto temp = pendingOwnedPtrTemps[i];
+            if (temp.Value == nullptr
+                || !AddressDerivesFromTemp(address, /*includeSelf*/ true,
+                    [&](llvm::Value* base) { return base == temp.Value; }))
+            {
+                ++i;
+                continue;
+            }
+            auto* ptrTy = llvm::dyn_cast<llvm::PointerType>(temp.Value->getType());
+            if (ptrTy == nullptr) { ++i; continue; }
+            const bool wasHoisted = temp.ConditionalSlot != nullptr;
+            if (!wasHoisted)
+                temp.ConditionalSlot = AllocaAtEntry(ptrTy, nullptr, "tmpptr.arm");
+            {
+                llvm::IRBuilderBase::InsertPointGuard guard(*builder);
+                builder->SetInsertPoint(cflat_llvm::GetTerminatorOrNull(hoistTo));
+                builder->CreateStore(llvm::ConstantPointerNull::get(ptrTy), temp.ConditionalSlot);
+            }
+            if (!wasHoisted) builder->CreateStore(temp.Value, temp.ConditionalSlot);
+            temp.Block = hoistTo;
+            pendingOwnedPtrTemps[i] = temp;
+            ++i;
+        }
+    }
+
+void LLVMBackend::EmitOwnedConditionalPtrTempFree(const PendingOwnedPtrTemp& temp)
+{
+        if (temp.ConditionalSlot == nullptr || !IsInsertBlockLive()) return;
+        auto* slot = llvm::cast<llvm::AllocaInst>(temp.ConditionalSlot);
+        auto* ptrTy = llvm::cast<llvm::PointerType>(slot->getAllocatedType());
+        auto* value = builder->CreateLoad(ptrTy, temp.ConditionalSlot, "tmpptr.arm.value");
+        builder->CreateStore(llvm::ConstantPointerNull::get(ptrTy), temp.ConditionalSlot);
+        EmitOwnedPtrTempFree(value, temp.TypeName, temp.AllocAlign, temp.RawArrayCount,
+                             temp.ReleaseGate);
     }
 
 void LLVMBackend::EmitOwnedStructTempFree(const PendingOwnedStructTemp& temp)
@@ -4218,21 +4502,32 @@ void LLVMBackend::FlushOwnedTempsSince(const OwnedTempMark& mark, llvm::Value* k
 
         // Collect the pointer temps before trimming: each free opens blocks, so the insert block
         // and dominator tree are recomputed per temp - exactly as FlushOwnedPtrTemps does.
+        // A kept pointer INTO a temp (a `?:` arm `&(new T(x))->f`) outlives this range: claim it.
+        ClaimOwnedPtrTempsUnder(keep, /*includeSelf*/ false, mark.Ptrs);
+        ClaimIntLaunderedPtrTemps(mark.Ptrs, keep);
         std::vector<PendingOwnedPtrTemp> ptrTemps;
         for (size_t i = mark.Ptrs; i < pendingOwnedPtrTemps.size(); ++i)
-            if (pendingOwnedPtrTemps[i].Value != keep) ptrTemps.push_back(pendingOwnedPtrTemps[i]);
+            if (pendingOwnedPtrTemps[i].ConditionalSlot == nullptr
+                && pendingOwnedPtrTemps[i].Value != keep)
+                ptrTemps.push_back(pendingOwnedPtrTemps[i]);
 
         TrimOwnedTempsSince(pendingOwnedStringTemps,  mark.Strings,  keep, pairValue);
         TrimOwnedTempsSince(pendingOwnedClosureTemps, mark.Closures, keep, pairValue);
         TrimOwnedTempsSince(pendingOwnedStructTemps,  mark.Structs,  keep, structValue);
-        TrimOwnedTempsSince(pendingOwnedPtrTemps,     mark.Ptrs,     keep, ptrValue);
+        size_t ptrWrite = mark.Ptrs;
+        for (size_t i = mark.Ptrs; i < pendingOwnedPtrTemps.size(); ++i)
+            if (pendingOwnedPtrTemps[i].ConditionalSlot != nullptr
+                || ptrValue(pendingOwnedPtrTemps[i]) == keep)
+                pendingOwnedPtrTemps[ptrWrite++] = pendingOwnedPtrTemps[i];
+        pendingOwnedPtrTemps.resize(ptrWrite);
 
         for (auto& t : ptrTemps)
         {
             if (t.Value == nullptr || !IsInsertBlockLive()) continue;
             std::optional<llvm::DominatorTree> domTree;
             if (!OwnedTempDominatesHere(t.Block, builder->GetInsertBlock(), domTree)) continue;
-            EmitOwnedPtrTempFree(t.Value, t.TypeName, t.AllocAlign, t.RawArrayCount);
+            if (t.ConditionalSlot != nullptr) EmitOwnedConditionalPtrTempFree(t);
+            else EmitOwnedPtrTempFree(t.Value, t.TypeName, t.AllocAlign, t.RawArrayCount, t.ReleaseGate);
         }
 
         // Back on the ledger, now keyed to a dominating block: the end-of-statement flush frees
@@ -4255,6 +4550,9 @@ void LLVMBackend::DiscardOwnedTempsSince(const OwnedTempMark& mark)
         ownedReturnTemps_.clear();
         ownedReturnReleaseTemps_.clear();
         ownedNewTemps_.clear();
+        addrClaimedPtrTemps_.clear();
+        addrIntoTempValues_.clear();
+        ptrToIntOfTemps_.clear();
         nullConditionalTempResults_.clear();
         rawArrayResults_.clear();
         valueElementTypeNames_.clear();
@@ -4279,6 +4577,9 @@ void LLVMBackend::FlushOwnedTemps()
         ownedReturnTemps_.clear();
         ownedReturnReleaseTemps_.clear();
         ownedNewTemps_.clear();
+        addrClaimedPtrTemps_.clear();
+        addrIntoTempValues_.clear();
+        ptrToIntOfTemps_.clear();
         nullConditionalTempResults_.clear();
         rawArrayResults_.clear();
         valueElementTypeNames_.clear();
@@ -4941,7 +5242,8 @@ llvm::CallBase* LLVMBackend::CreateCallOrInvoke(llvm::FunctionType* fnTy, llvm::
                 if (t.Value == nullptr || !IsInsertBlockLive() || UnwindTempConsumedByCall(t.Value))
                     continue;
                 if (!OwnedTempDominatesHere(t.Block, invokeBlock, domTree)) continue;
-                EmitOwnedPtrTempFree(t.Value, t.TypeName, t.AllocAlign, t.RawArrayCount);
+                if (t.ConditionalSlot != nullptr) EmitOwnedConditionalPtrTempFree(t);
+                else EmitOwnedPtrTempFree(t.Value, t.TypeName, t.AllocAlign, t.RawArrayCount, t.ReleaseGate);
             }
             for (auto it = stackNamedVariable.rbegin(); it != stackNamedVariable.rend(); ++it)
             {
