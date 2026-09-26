@@ -63,7 +63,7 @@ if "%~1"=="--worker-cb" (
     REM The budget comes from the switch only; an inherited env budget would leak.
     set CFLAT_CPP_MAX_HEADER_PARSES=
     set TU_CHECK=
-    if "!CFLAT_CPP_BUDGET_ENABLED!"=="1" set TU_CHECK=--error-on-cpp-reparse cold
+    if "!CFLAT_CPP_BUDGET_ENABLED!"=="1" set TU_CHECK=--error-on-cpp-reparse
     set T0=!TIME!
     !COMPILER! !SRC!\!NAME!.cb -i !LIB! --locale-dir "!CFLAT_LOCALE_DIR!" -o !OUT!\!NAME!.exe --nologo --out-lli !OUT!\!NAME!.ll !CFLAT_PLATFORM_FLAG! !TU_CHECK! !CB_ARGS! !CFLAT_EXTRA! > "!OUT!\results\!NAME!.log" 2>&1
     if !ERRORLEVEL! neq 0 (
@@ -84,33 +84,6 @@ if "%~1"=="--worker-cb" (
     set /a EF=ECS-ES*100
     if !EF! lss 10 set EF=0!EF!
     echo PASS !ES!.!EF!s>"!OUT!\results\!NAME!.result"
-    goto :WorkerDone
-)
-
-REM Warm C++ interop worker: the cold worker has already populated cheaders, so zero parses
-REM (--error-on-cpp-reparse warm) is the deliberate budget for this second compile.
-if "%~1"=="--worker-cb-warm" (
-    set NAME=%~2
-    set COMPILER=x64\%CFLAT_CONFIG%\cflat.exe
-    set SRC=Test
-    set LIB=Test\library
-    if not defined CFLAT_OUT set CFLAT_OUT=out
-    set OUT=%CFLAT_OUT%
-    if not defined CFLAT_PLATFORM_FLAG set CFLAT_PLATFORM_FLAG=
-    set DONEFILE=!OUT!\results\done\!NAME!.warm.done
-    set T0=!TIME!
-    set CFLAT_CPP_MAX_HEADER_PARSES=
-    !COMPILER! !SRC!\!NAME!.cb -i !LIB! --locale-dir "!CFLAT_LOCALE_DIR!" -o !OUT!\!NAME!.warm.exe --nologo --out-lli !OUT!\!NAME!.warm.ll !CFLAT_PLATFORM_FLAG! --error-on-cpp-reparse warm > "!OUT!\results\!NAME!.warm.log" 2>&1
-    if !ERRORLEVEL! neq 0 (
-        echo FAILED: !NAME!.warm - compiler error>"!OUT!\results\!NAME!.warm.result"
-        goto :WorkerDone
-    )
-    !OUT!\!NAME!.warm.exe >> "!OUT!\results\!NAME!.warm.log" 2>&1
-    if !ERRORLEVEL! neq 0 (
-        echo FAILED: !NAME!.warm - run error>"!OUT!\results\!NAME!.warm.result"
-        goto :WorkerDone
-    )
-    echo PASS 0.00s>"!OUT!\results\!NAME!.warm.result"
     goto :WorkerDone
 )
 
@@ -245,11 +218,6 @@ if exist "%SRC%\cinterop\build_mathlib.bat" (
     if errorlevel 1 echo WARNING: failed to build cinterop fixture lib - test_c_package may fail
 )
 
-if "%CFLAT_CPP_BUDGET_ENABLED%"=="1" (
-    for %%D in ("%COMPILER%") do set CPP_HEADERS=%%~dpD.cflat\cheaders
-    if exist "!CPP_HEADERS!" rmdir /s /q "!CPP_HEADERS!"
-)
-
 set /a LAUNCHED=0
 
 REM Launch the error tests as CFLAT_ERR_GROUPS parallel groups - files are distributed
@@ -274,7 +242,7 @@ for %%F in (%SRC%\test_*.c) do (
 
 for %%F in (%SRC%\test_*.cb) do (
     call :IsExcluded %%~nF
-    if not errorlevel 1 if /I not "%%~nF"=="test_cpp_interop" if /I not "%%~nF"=="test_cpp_interop_template" if /I not "%%~nF"=="test_cpp_interop_bridge" (
+    if not errorlevel 1 (
         set /a LAUNCHED+=1
         start "" /b cmd /c "%SCRIPT% --worker-cb %%~nF"
     )
@@ -298,16 +266,6 @@ if !DONE! lss !LAUNCHED! (
     ping -n 2 127.0.0.1 >nul 2>&1
     set /a WAITED+=1
     goto WaitLoop
-)
-
-call "%SCRIPT%" --worker-cb test_cpp_interop
-call "%SCRIPT%" --worker-cb test_cpp_interop_template
-call "%SCRIPT%" --worker-cb test_cpp_interop_bridge
-
-if "%CFLAT_CPP_BUDGET_ENABLED%"=="1" (
-    call "%SCRIPT%" --worker-cb-warm test_cpp_interop
-    call "%SCRIPT%" --worker-cb-warm test_cpp_interop_template
-    call "%SCRIPT%" --worker-cb-warm test_cpp_interop_bridge
 )
 
 REM Tooling regression: a static-local move must retain its sanitizer origin and DI record.

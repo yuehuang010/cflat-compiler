@@ -39,7 +39,7 @@ struct -> 1/28-bit fields). Constraint: transparency needs an addressable base.
 
 Schema version lives in TWO places in LLVMBackend.h (read guard ~11116, writer
 ~11175). Bump it whenever the serialized record shape changes (v5->6 anon
-synthesis, v6->7 array-of-unnamed). Delete `%USERPROFILE%\.cflat\cheaders\`
+synthesis, v6->7 array-of-unnamed). Delete `%USERPROFILE%\.cflat\cheaders\` (entries live in `cheaders\v<version>\`)
 when testing extractor changes - the key is header/defines-based, NOT compiler-
 binary-based, so a stale entry can mask a fix even across rebuilds. Prove
 round-trips with a cold (writes) + warm (reads) run of test_windows_cache.cb.

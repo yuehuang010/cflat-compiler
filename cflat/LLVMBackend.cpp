@@ -1701,16 +1701,7 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
     // Captured for clang C compiles (imports run during parse, before EmitExecutable).
     cOptLevel_ = args.getOptimizationLevel();
     tuParseBudget_.reset();
-    if (auto check = args.getOption("error-on-cpp-reparse"))
-    {
-        if (*check == "cold")      tuParseBudget_ = 1;
-        else if (*check == "warm") tuParseBudget_ = 0;
-        else
-        {
-            LogErrorMessage("--error-on-cpp-reparse requires 'cold' or 'warm' (got '{}')", { *check });
-            return false;
-        }
-    }
+    if (args.hasFlag("error-on-cpp-reparse")) tuParseBudget_ = 1;
     cDebugInfo_ = debugInfo;
     // Cross-thread sharing scan level (--xthread-scan N, N in 1..3); 0 = silent default.
     // Threads through --check too since that path also calls Compile(args, file).

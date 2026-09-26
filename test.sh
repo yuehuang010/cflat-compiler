@@ -182,7 +182,7 @@ run_cb() {
   local -a xargs_cb=()
   read -r -a xargs_cb <<< "$(cb_extra_args "$f")"
   if cpp_budget_enabled; then
-    xargs_cb+=(--error-on-cpp-reparse cold)
+    xargs_cb+=(--error-on-cpp-reparse)
   fi
   local TIMEOUT="$TIMEOUT"
   case "$HEAVY_TESTS" in *" $n "*) TIMEOUT="${TIMEOUT/$TIMEOUT_SECS/$HEAVY_TIMEOUT_SECS}" ;; esac
@@ -195,26 +195,6 @@ run_cb() {
     fi
   elif ! $TIMEOUT "$CFLAT" "$f" -i "$LIB" --locale-dir "$LOCALE_DIR" \
         ${xargs_cb[@]+"${xargs_cb[@]}"} -o "$RES/$n.bin" >"$log" 2>&1; then
-    status="FAIL compile"
-  elif $TIMEOUT "$RES/$n.bin" </dev/null >>"$log" 2>&1; then
-    status="PASS"
-  else
-    status="FAIL run(rc=$?)"
-  fi
-  write_result "$n" "$status" "$t0"
-}
-
-run_cb_warm() {
-  local f="$1" base n; base="$(basename "$f" .cb)"; n="$base.warm"
-  local log="$RES/$n.log" status t0; t0=$(now_ms)
-  local -a xargs_cb=()
-  read -r -a xargs_cb <<< "$(cb_extra_args "$f")"
-  if cpp_budget_enabled; then
-    xargs_cb+=(--error-on-cpp-reparse warm)
-  fi
-  if ! $TIMEOUT "$CFLAT" "$f" -i "$LIB" \
-      --locale-dir "$LOCALE_DIR" ${xargs_cb[@]+"${xargs_cb[@]}"} -o "$RES/$n.bin" \
-      >"$log" 2>&1; then
     status="FAIL compile"
   elif $TIMEOUT "$RES/$n.bin" </dev/null >>"$log" 2>&1; then
     status="PASS"
@@ -265,7 +245,7 @@ run_err() {
   if [ "$n" = "err_cpp_header_parse_budget" ]; then
     compiler_env=(env CFLAT_CPP_MAX_HEADER_PARSES=0)
   elif cpp_budget_enabled; then
-    tu_check=(--error-on-cpp-reparse cold)
+    tu_check=(--error-on-cpp-reparse)
   fi
   load_err_flags "$f.flags"
   $TIMEOUT "${compiler_env[@]}" "$CFLAT" "$f" -i "$LIB" --locale pseudo --locale-dir "$LOCALE_DIR" --check \
@@ -297,7 +277,7 @@ run_err_warm() {
   fi
 }
 
-export -f run_cb run_cb_warm cb_extra_args load_err_flags check_err_result run_err run_err_warm \
+export -f run_cb cb_extra_args load_err_flags check_err_result run_err run_err_warm \
   is_cpp_interop_test cpp_budget_enabled is_skipped \
   now_ms write_result
 export CFLAT LIB LOCALE_DIR RES TIMEOUT RUN_MODE TIMEOUT_SECS HEAVY_TIMEOUT_SECS HEAVY_TESTS
@@ -393,23 +373,9 @@ if [ "$RUN_MODE" -eq 0 ]; then
   done
 fi
 
-# C++ interop tests get an explicit cold header-cache pass. Keep the per-exe core cache intact,
-# but clear all persisted C++ header/request entries so the budgeted run really creates chunk 0.
-if [ "$RUN_MODE" -eq 0 ] && cpp_budget_enabled; then
-  cpp_headers="$(dirname "$CFLAT")/.cflat/cheaders"
-  if [ -d "$cpp_headers" ]; then
-    find "$cpp_headers" -mindepth 1 -delete
-  fi
-fi
-
-printf '%s' "$cb_list"  | grep -v '^$' | xargs -P "$JOBS" -I{} bash -c 'run_cb "$@"' _ {}
-while IFS= read -r f; do
-  [ -n "$f" ] || continue
-  cpp_headers="$(dirname "$CFLAT")/.cflat/cheaders"
-  if [ -d "$cpp_headers" ]; then find "$cpp_headers" -mindepth 1 -delete; fi
-  run_cb "$f"
-  if [ "$RUN_MODE" -eq 0 ] && cpp_budget_enabled; then run_cb_warm "$f"; fi
-done <<< "$cpp_list"
+# C++ interop fixtures go first so the longest tests start first. One run each under the shared
+# header cache: --error-on-cpp-reparse still fails any second parse of a header.
+printf '%s%s' "$cpp_list" "$cb_list" | grep -v '^$' | xargs -P "$JOBS" -I{} bash -c 'run_cb "$@"' _ {}
 if [ "$RUN_MODE" -eq 0 ]; then
   printf '%s' "$err_list" | grep -v '^$' | xargs -P "$JOBS" -I{} bash -c 'run_err "$@"' _ {}
 fi

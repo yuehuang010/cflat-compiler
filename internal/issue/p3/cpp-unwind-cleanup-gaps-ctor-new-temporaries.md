@@ -12,11 +12,8 @@ added index-aware partial construction of arrays (fixed-array locals and fields,
 `class`, `program` and the `[cpp] struct` constructor thunk, and interface method calls as invokes.
 Still open:
 
-1. A CFlat `extern` function called before its body is emitted is treated as a C prototype, so calls
-   to it stay plain `call`.
-2. Cost: in a module that imports C++, every call to a CFlat function from a frame with pending
-   cleanup becomes an `invoke`, including core helpers (`string +`, `length()`). -O2 folds most of it;
-   -O0 code size grows. Measure before optimizing (e.g. mark core helpers nounwind).
+1-2. (fixed de195f61) extern CFlat bodies defined later now invoke; core functions proven non-unwinding
+   at --init stay plain calls (dropped when the program overrides a C extern they rely on).
 3. Windows not exercised: Win64 emits cleanuppad/cleanupret under __C_specific_handler; whether
    clang-cl exceptions run them, whether drop-flag branches survive funclet outlining, and how a pad
    interacts with the `program` catch-all on a hardware fault are unverified; the array-prefix pad

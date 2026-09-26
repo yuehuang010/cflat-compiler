@@ -3426,7 +3426,7 @@ public:
     void FinalizeGlobalConstructorOrder();
 private:
     std::string cppStandard_ = "c++20";
-    // --error-on-cpp-reparse: 1 (cold) or 0 (warm) clang parses allowed per translation unit.
+    // --error-on-cpp-reparse: at most 1 clang parse (or cache load in its place) per translation unit.
     std::optional<unsigned> tuParseBudget_;
     // Parses per non-header-group TU in this compile, keyed "<kind>|<key>".
     std::unordered_map<std::string, unsigned> tuParseCounts_;
@@ -5430,8 +5430,8 @@ private:
                             const std::string& prefixSource = {});
     bool CountCxxHeaderParse(const CxxRequestGroup& group, const char* stage);
     /*
-     * Per-compile clang parse budget of one translation unit: --error-on-cpp-reparse cold (1) or
-     * warm (0), else CFLAT_CPP_MAX_HEADER_PARSES. C++ header groups count on their
+     * Per-compile clang parse budget of one translation unit: --error-on-cpp-reparse (1), else
+     * CFLAT_CPP_MAX_HEADER_PARSES. C++ header groups count on their
      * CxxImportGroup; every other TU (C header, .c/.cpp extraction, .c/.cpp object compile)
      * counts here under `kind` + `key`.
      */

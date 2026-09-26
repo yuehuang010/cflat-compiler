@@ -5,14 +5,15 @@ Bucket: p3 (C++ interop; follow-ups left by fix/cpp-class-operator-new, 2026-09-
 Measured before and after fix/cpp-class-operator-new (Test/library/cpp_interop_opnew.h,
 legs 3350-3366 of Test/test_cpp_interop.cb):
 
-1. A C++ `new` used as a statement temporary (`(new T(x))->get();`) is never freed.
-2. `f = new CppClass(x)` into a `unique T*` FIELD is refused "from a borrowed value".
-3. A pointer to a polymorphic class whose array count is only known at runtime (`delete[n] p`
-   with a runtime n on a `T*`, not a view) still runs element 0's deleting destructor only.
-   Views and constant counts are correct.
-4. A private class-level `operator new` / `operator delete` is not bound, so lookup falls back
-   to the base or global operator where C++ rejects the `new` expression. Placement, aligned
-   and destroying forms are not exported either.
+1. (fixed 2026-09-25, a31f4a72 + 843a9f8c) `(new T(x))->m()` is freed when the linked body of `m`
+   provably does not retain `this`, in any function including returns and generic instantiations,
+   and on the unwind path. Virtual / unlinked / escaping methods keep the bounded leak. Remaining
+   dangling-address shapes live in p2/address-of-new-temp-member-dangles.md.
+2. (not reproduced 2026-09-24: a CFlat struct field `unique CppClass*` assigned `new CppClass(...)` twice
+   compiles with exact counts; re-probe the original shape before working on it)
+3. (fixed 767ae268) runtime-count delete of a polymorphic C++ raw pointer.
+4. (fixed 767ae268) private/protected class operator new/delete refused. Placement, aligned and
+   destroying forms are still not exported.
 5. Windows: the MS-ABI names for `operator new[]` / `delete[]` (`??_U@YAPEAX_K@Z`,
    `??_V@YAXPEAX@Z` and the aligned forms) are written but unexercised on macOS.
 

@@ -11,7 +11,7 @@ if not defined CFLAT_OUT set CFLAT_OUT=out
 set OUT=%CFLAT_OUT%
 if not defined CFLAT_POLICY_SUPPORTED set CFLAT_POLICY_SUPPORTED=1
 REM Every check parses each C/C++ TU at most once (legacy C++ mode reparses by design).
-set "TU_CHECK=--error-on-cpp-reparse cold"
+set "TU_CHECK=--error-on-cpp-reparse"
 if /I "%CFLAT_CPP_INCREMENTAL%"=="0" set "TU_CHECK="
 if /I "%CFLAT_CPP_INCREMENTAL%"=="off" set "TU_CHECK="
 if /I "%CFLAT_CPP_INCREMENTAL%"=="false" set "TU_CHECK="

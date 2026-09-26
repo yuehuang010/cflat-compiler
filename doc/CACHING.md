@@ -231,8 +231,12 @@ import package "curl/curl.h" lib "libcurl.lib";
 The extracted declarations (functions, enums, records, macros, globals) are serialized to:
 
 ```
-%USERPROFILE%\.cflat\cheaders\<key>.json
+%USERPROFILE%\.cflat\cheaders\v<version>\<key>.json
 ```
+
+`<version>` is the cache schema version (`kCHeaderCacheVersion`). A version bump starts a new,
+empty folder; folders of other versions are never read or scanned, so nothing prunes them -
+delete them by hand, or with `--init-clear` / `--init-clear-local`.
 
 When a C++ import emits a companion module, its bitcode is stored as the raw
 `<key>.bc` sidecar next to the JSON; the JSON records the sidecar name, byte length, and FNV-1a
