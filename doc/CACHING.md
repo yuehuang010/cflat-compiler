@@ -280,11 +280,17 @@ inside a synthesized member body (the body is emptied and the request still succ
 block the write, because replay reproduces exactly what the in-process path used. A candidate
 probe that succeeds in a non-final header group is persisted like any other accepted request;
 probes that fail, retrying incomplete-type requests, `--run`, batch prewarm, and LSP analysis
-are read-only. The owning group of each template base is also memoized on disk in
-`cxx-owner-groups.json` (header list, defines, compiler build stamp), so a warm compile tries
-the owner first instead of re-probing every candidate group; a stale or missing memo only
-restores the default probe order. Request entries are pruned with the owning header entry, and
-changing the cache format invalidates both together. With `-v`, each request reports a hit or a
+are read-only. Candidate groups are probed in import order within each priority tier, never in
+an order another compile that shared the cache left behind (the tiers themselves still depend on
+what the compile's earlier requests registered, so a warm compile can pick a different owner than
+the cold one did). The incremental executor shares one clang TU per primary group, so a request
+can see headers an earlier request's dependency groups fed in. The TU records its include graph;
+before a result is stored, every declaration whose real file (where its text, or the macro that
+produced it, was expanded; a `#line` name does not count) the request's own includes - its headers
+plus the prologue's `<new>` - do not reach is dropped, so a type-request entry holds only what its
+key's headers declare.
+Request entries are pruned with the owning header entry, and changing the cache format
+invalidates both together. With `-v`, each request reports a hit or a
 miss and the miss reason.
 
 ## macOS

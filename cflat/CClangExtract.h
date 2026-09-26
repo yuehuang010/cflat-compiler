@@ -167,6 +167,7 @@ namespace cflat_cinterop
         // Clang's ABI arrangement for this declaration. Filled only in cxxMode.
         RawAbi abi;
         std::string file;
+        std::string physicalFile;  // real file if `#line` / a macro expansion differs from `file`
         int line = 1;
         int col = 0;
     };
@@ -198,6 +199,7 @@ namespace cflat_cinterop
         bool isNoexcept = false;
         int access = 0; // AccessPublic
         std::string file;
+        std::string physicalFile;  // real file if `#line` / a macro expansion differs from `file`
         int line = 1;
         int col = 0;
     };
@@ -211,6 +213,7 @@ namespace cflat_cinterop
         bool isScoped = false;
         long long value = 0;
         std::string file;
+        std::string physicalFile;  // real file if `#line` / a macro expansion differs from `file`
         int line = 1;
         int col = 0;
     };
@@ -401,6 +404,7 @@ namespace cflat_cinterop
         std::string uuid;
         std::vector<RawField> fields;
         std::string file;
+        std::string physicalFile;  // real file if `#line` / a macro expansion differs from `file`
         int line = 1;
         int col = 0;
         // True when the record's definition is under the in-scope dirs (the bound header's own

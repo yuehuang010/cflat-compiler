@@ -301,14 +301,26 @@ namespace
         }
     };
 
+    // Every header an #include named, and who named it. A header an include guard skips
+    // still gets its edge, so a later chunk's includes reach what an earlier chunk parsed.
+    struct IncludeGraph
+    {
+        std::unordered_map<const clang::FileEntry*, std::vector<const clang::FileEntry*>> edges;
+        std::unordered_set<const clang::FileEntry*> targets;
+        // `<name>` -> the header the first `#include <name>` found; resolves a root such as the
+        // request prologue's `<new>`.
+        std::unordered_map<std::string, const clang::FileEntry*> angled;
+    };
+
     class IncludeCollector : public clang::PPCallbacks
     {
     public:
         clang::Preprocessor& pp;
         std::vector<std::string>& files;
+        IncludeGraph& graph;
 
-        IncludeCollector(clang::Preprocessor& p, std::vector<std::string>& f)
-            : pp(p), files(f) {}
+        IncludeCollector(clang::Preprocessor& p, std::vector<std::string>& f, IncludeGraph& g)
+            : pp(p), files(f), graph(g) {}
 
         void FileChanged(clang::SourceLocation loc, FileChangeReason reason,
                          clang::SrcMgr::CharacteristicKind, clang::FileID) override
@@ -316,6 +328,21 @@ namespace
             if (reason != EnterFile) return;
             llvm::StringRef file = pp.getSourceManager().getFilename(loc);
             if (!file.empty()) files.push_back(file.str());
+        }
+
+        void InclusionDirective(clang::SourceLocation hashLoc, const clang::Token&,
+                                llvm::StringRef spelled, bool angled, clang::CharSourceRange,
+                                clang::OptionalFileEntryRef file, llvm::StringRef,
+                                llvm::StringRef, const clang::Module*, bool,
+                                clang::SrcMgr::CharacteristicKind) override
+        {
+            if (!file) return;
+            const clang::FileEntry* target = &file->getFileEntry();
+            graph.targets.insert(target);
+            clang::SourceManager& sm = pp.getSourceManager();
+            if (auto includer = sm.getFileEntryRefForID(sm.getFileID(sm.getExpansionLoc(hashLoc))))
+                graph.edges[&includer->getFileEntry()].push_back(target);
+            if (angled) graph.angled.emplace("<" + spelled.str() + ">", target);
         }
     };
 
@@ -710,6 +737,7 @@ struct CxxIncrementalGroup::Impl
     clang::TranslationUnitDecl* headerRoot = nullptr;
     llvm::Module* headerModule = nullptr;
     std::vector<std::string> includedFiles;
+    IncludeGraph includeGraph;
     std::unordered_set<std::string> prefixSources;
     bool verbose = false;
     std::unordered_map<std::string, cflat_cinterop::ExtractResult> wrapperResults;
@@ -799,7 +827,7 @@ std::unique_ptr<CxxIncrementalGroup> CxxIncrementalGroup::Create(
         impl->interpreter->getCompilerInstance()->getPreprocessor().addPPCallbacks(
             std::make_unique<IncludeCollector>(
                 impl->interpreter->getCompilerInstance()->getPreprocessor(),
-                impl->includedFiles));
+                impl->includedFiles, impl->includeGraph));
         auto ptu = impl->interpreter->Parse(headerSource);
         impl->headerHadDiagnostics = diagnostics.consumer.errors != 0;
         if (!ptu)
@@ -1286,4 +1314,55 @@ bool CxxIncrementalGroup::ParseRequest(const cflat_cinterop::ExtractRequest& req
 const std::string& CxxIncrementalGroup::LastRequestDiagnostics() const
 {
     return impl_->lastDiagnostics;
+}
+
+namespace
+{
+    // Every file `roots` reach in `graph`; false when a root is not a header of the TU.
+    bool ReachFromRoots(const IncludeGraph& graph, clang::FileManager& fm,
+                        const std::vector<std::string>& roots,
+                        std::unordered_set<const clang::FileEntry*>& reached)
+    {
+        std::vector<const clang::FileEntry*> work;
+        for (const std::string& root : roots)
+        {
+            const clang::FileEntry* entry = nullptr;
+            if (root.starts_with("<"))
+            {
+                auto found = graph.angled.find(root);
+                if (found != graph.angled.end()) entry = found->second;
+            }
+            else if (auto ref = fm.getOptionalFileRef(root))
+                entry = &ref->getFileEntry();
+            if (entry == nullptr || graph.targets.count(entry) == 0) return false;
+            if (reached.insert(entry).second) work.push_back(entry);
+        }
+        while (!work.empty())
+        {
+            const clang::FileEntry* current = work.back();
+            work.pop_back();
+            auto found = graph.edges.find(current);
+            if (found == graph.edges.end()) continue;
+            for (const clang::FileEntry* child : found->second)
+                if (reached.insert(child).second) work.push_back(child);
+        }
+        return true;
+    }
+}
+
+std::unordered_set<std::string> CxxIncrementalGroup::UnreachableFiles(
+    const std::vector<std::string>& roots, const std::vector<std::string>& files) const
+{
+    std::unordered_set<std::string> result;
+    clang::FileManager& fm = impl_->interpreter->getCompilerInstance()->getFileManager();
+    std::unordered_set<const clang::FileEntry*> reached;
+    if (!ReachFromRoots(impl_->includeGraph, fm, roots, reached)) return result;
+    for (const std::string& file : files)
+    {
+        auto ref = fm.getOptionalFileRef(file);
+        if (ref && impl_->includeGraph.targets.count(&ref->getFileEntry()) != 0
+            && reached.count(&ref->getFileEntry()) == 0)
+            result.insert(file);
+    }
+    return result;
 }

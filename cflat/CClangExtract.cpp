@@ -980,8 +980,30 @@ namespace cflat_cinterop
             // false only on an invalid/unknown location.
             bool LocOfRaw(const Decl* d, std::string& file, int& line, int& col) const
             {
-                SourceLocation loc = d->getLocation();
+                SourceLocation loc = DeclFileLoc(d);
                 if (loc.isInvalid()) return false;
+                PresumedLoc pl = sm.getPresumedLoc(loc);
+                if (pl.isInvalid()) return false;
+                file = pl.getFilename() ? pl.getFilename() : "";
+                line = (int)pl.getLine();
+                col = (int)pl.getColumn();
+                return true;
+            }
+
+            // The real file whose text produced `d` - a macro's expansion site, not its definition -
+            // when that is not `presumed` (a `#line` name, or the macro's defining header).
+            std::string PhysicalFileOf(const Decl* d, const std::string& presumed) const
+            {
+                SourceLocation loc = d->getLocation();
+                if (loc.isInvalid()) return {};
+                std::string physical = sm.getFilename(sm.getExpansionLoc(loc)).str();
+                return physical == presumed ? std::string() : physical;
+            }
+
+            SourceLocation DeclFileLoc(const Decl* d) const
+            {
+                SourceLocation loc = d->getLocation();
+                if (loc.isInvalid()) return loc;
                 // Macro-generated declarations (for example ATen's Tensor operators) normally
                 // have a spelling location in the defining header. Macro arguments can instead
                 // resolve to a pseudo-file such as `<scratch space>`; use the expansion header
@@ -994,12 +1016,7 @@ namespace cflat_cinterop
                     loc = spellingFile != nullptr && spellingFile[0] != '<'
                         ? spelling : sm.getExpansionLoc(loc);
                 }
-                PresumedLoc pl = sm.getPresumedLoc(loc);
-                if (pl.isInvalid()) return false;
-                file = pl.getFilename() ? pl.getFilename() : "";
-                line = (int)pl.getLine();
-                col = (int)pl.getColumn();
-                return true;
+                return loc;
             }
 
             // Location plus the in-scope gate: used by functions/enums/globals where an
@@ -1160,6 +1177,7 @@ namespace cflat_cinterop
                 result.isNoexcept = DeclIsNoexcept(fd);
                 result.access = md == nullptr ? AccessPublic : MapAccess(md->getAccess());
                 result.file = file;
+                result.physicalFile = PhysicalFileOf(fd, file);
                 result.line = line;
                 result.col = col;
                 st.out.functionTemplates.push_back(std::move(result));
@@ -1265,6 +1283,7 @@ namespace cflat_cinterop
                     || fd->getExceptionSpecType() == EST_NoexceptTrue
                     || fd->getExceptionSpecType() == EST_NoThrow;
                 sig.file = file; sig.line = line; sig.col = col;
+                sig.physicalFile = PhysicalFileOf(fd, file);
                 QueueIncompleteCxxType(st, ctx, fd->getReturnType());
                 for (const ParmVarDecl* p : fd->parameters())
                 {
@@ -1450,6 +1469,7 @@ namespace cflat_cinterop
                 }
                 e.value = ApsIntToLongLong(ec->getInitVal());
                 e.file = file; e.line = line; e.col = col;
+                e.physicalFile = PhysicalFileOf(ec, file);
                 // C++ mode also publishes the QUALIFIED spelling, so a scoped or class-nested
                 // enumerator is reachable as it is written in C++ ("ns.Cls.Kind.One") rather than
                 // only under a bare name that could collide across namespaces. The unqualified
@@ -1536,7 +1556,11 @@ namespace cflat_cinterop
                             // "struct <tag>__anon<N>" field reference the closure walk follows).
                             nested.inScope = false;
                             std::string nf; int nl = 1, nc = 0;
-                            if (LocOfRaw(anon, nf, nl, nc)) { nested.file = nf; nested.line = nl; nested.col = nc; }
+                            if (LocOfRaw(anon, nf, nl, nc))
+                            {
+                                nested.file = nf; nested.line = nl; nested.col = nc;
+                                nested.physicalFile = PhysicalFileOf(anon, nf);
+                            }
                             CollectFields(anon, synTag, nested);
                             st.out.records.push_back(std::move(nested));
 
@@ -1595,7 +1619,11 @@ namespace cflat_cinterop
                         nested.isUnion = isUnion;
                         nested.inScope = false;
                         std::string nf; int nl = 1, nc = 0;
-                        if (LocOfRaw(nrd, nf, nl, nc)) { nested.file = nf; nested.line = nl; nested.col = nc; }
+                        if (LocOfRaw(nrd, nf, nl, nc))
+                        {
+                            nested.file = nf; nested.line = nl; nested.col = nc;
+                            nested.physicalFile = PhysicalFileOf(nrd, nf);
+                        }
                         CollectFields(nrd, synTag, nested);
                         st.out.records.push_back(std::move(nested));
 
@@ -2278,6 +2306,7 @@ namespace cflat_cinterop
                     rec.name = std::move(tag);
                     rec.isUnion = rd->isUnion();
                     rec.file = ofile; rec.line = oline; rec.col = ocol;
+                    rec.physicalFile = PhysicalFileOf(rd, ofile);
                     rec.inScope = true;  // gated above; empty fields -> opaque shell downstream
                     st.out.records.push_back(std::move(rec));
                     return true;
@@ -2416,6 +2445,7 @@ namespace cflat_cinterop
                 rec.isUnion = rd->isUnion();
                 rec.isCxx = st.req.cxxMode;
                 rec.file = file; rec.line = line; rec.col = col;
+                rec.physicalFile = PhysicalFileOf(rd, file);
                 rec.inScope = forcedBase || !nameOverride.empty() || !st.req.requireInScope
                            || PathInScope(file, st.normDirs);
                 if (st.req.cxxMode && llvm::isa<CXXRecordDecl>(rd))

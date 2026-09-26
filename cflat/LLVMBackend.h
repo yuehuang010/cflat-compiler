@@ -3323,16 +3323,8 @@ private:
     const CxxRequestGroup* activeCxxRequestGroup_ = nullptr;
     std::unordered_map<std::string, std::unique_ptr<CxxIncrementalGroup>>
         cxxIncrementalGroups_;
-    struct CxxOwnerGroupMemo
-    {
-        std::vector<std::string> headers;
-        std::vector<std::string> defines;
-    };
-    // Base C++ spelling ("std::vector") -> the import group index that answered for it.
+    // Base C++ spelling -> the import group that answered in this compile.
     std::unordered_map<std::string, size_t> cxxTemplateOwnerGroup_;
-    // Disk memo identities survive process resets; stale identities only affect probe order.
-    std::unordered_map<std::string, CxxOwnerGroupMemo> cxxTemplateOwnerMemo_;
-    bool cxxTemplateOwnerMemoLoaded_ = false;
     std::unordered_map<std::string, std::vector<cflat_cinterop::RawFunctionTemplate>>
         cxxFunctionTemplates_;
     std::unordered_map<std::string, size_t> cxxFunctionTemplateOwnerGroup_;
@@ -5469,9 +5461,6 @@ private:
                                   CFileSigCacheEntry&& entry,
                                   bool allowDisk,
                                   const char* allowDiskReason = nullptr);
-    void LoadCxxTemplateOwnerMemo();
-    void StoreCxxTemplateOwnerMemo(const std::string& cxxBase, size_t group);
-
     // Import-group plumbing for the request layer.
     size_t FindOrAddCxxImportGroup(const std::vector<std::string>& headers,
                                    const std::vector<std::string>& defines);
@@ -5550,6 +5539,11 @@ private:
         ~CxxRequestGroupScope() { backend.activeCxxRequestGroup_ = previous; }
     };
     bool CxxDeclaringFileBelongsToOtherImportGroup(const std::string& declaringFile) const;
+    // Drops what a request harvested from headers its own headers do not include.
+    void DropCxxDeclarationsOutsideRequestGroup(const CxxRequestGroup& group,
+                                                const std::vector<CxxRequestItem>& items,
+                                                const CxxIncrementalGroup& incremental,
+                                                cflat_cinterop::ExtractResult& raw) const;
     void RememberCxxGroupReachableFiles(size_t group, const std::vector<std::string>& files);
 
     bool RequestCxxForeignType(const std::string& cflatName, const std::string& cxxSpelling,
@@ -10197,7 +10191,8 @@ public:
      */
     // 96: generated [cpp] member helpers now expose non-override methods to C++ templates.
     // 97: default-argument wrappers skip ambiguous shortened calls, dedupe, move by-value args.
-    static constexpr int kCHeaderCacheVersion = 100;
+    // 101: an incremental request drops declarations its own includes do not reach.
+    static constexpr int kCHeaderCacheVersion = 101;
     static std::string CompilerBuildStamp();
 
     static std::string GetCHeaderCacheDir();

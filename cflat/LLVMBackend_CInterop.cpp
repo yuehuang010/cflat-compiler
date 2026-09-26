@@ -5495,6 +5495,7 @@ bool LLVMBackend::RunCxxTypeRequests(const CxxRequestGroup& group,
             {
                 incremental->RememberPrefixSource(prefixSource);
                 RememberGeneratedCxxRecords(*incremental, prefixSource);
+                DropCxxDeclarationsOutsideRequestGroup(group, items, *incremental, raw);
                 return true;
             }
             return requestFailed();
@@ -6062,6 +6063,15 @@ bool LLVMBackend::HasCxxForwardingReferenceTemplateMember(const std::string& own
         const std::string resolved = ResolveCxxFunctionTemplateName(owner, memberName);
         if (resolved.empty()) return false;
         return HasCxxForwardingReferenceTemplate(resolved);
+}
+
+// The headers a request's TU includes itself: the prologue's `#include <new>`
+// (BuildCxxRequestIncludes) and the group's headers.
+static std::vector<std::string> CxxRequestIncludeRoots(const std::vector<std::string>& headers)
+{
+    std::vector<std::string> roots{ "<new>" };
+    roots.insert(roots.end(), headers.begin(), headers.end());
+    return roots;
 }
 
 static std::string FirstCxxErrorLine(const std::string& text)
@@ -8123,10 +8133,7 @@ bool LLVMBackend::RequestCxxFreeFunction(const std::string& functionName,
                     {
                         registeredName = bindName;
                         if (!infix)
-                        {
                             cxxTemplateOwnerGroup_[cxxBase] = primary;
-                            StoreCxxTemplateOwnerMemo(cxxBase, primary);
-                        }
                         return true;
                     }
             lastError = "the generated wrapper could not be registered";
@@ -9276,14 +9283,16 @@ bool LLVMBackend::RequestCxxOperatorArrow(const std::string& typeName, std::stri
 }
 
 /*
- * Import groups that could own a C++ base name, best first: the group that already answered for it,
- * then groups that published the name, then a system group whose header IS the name
+ * Import groups that could own a C++ base name, best first: groups that published the name,
+ * then a system group whose header IS the name
  * (`std::vector` from `import cpp "vector"`), then groups that seeded the leading namespace, then
- * every other C++ group. Only the first candidate that actually declares the name is used.
+ * every other C++ group; import order within each tier. Only the first candidate that actually
+ * declares the name is used.
  */
 std::vector<size_t> LLVMBackend::CandidateCxxGroupsFor(const std::string& cxxBase)
 {
-        if (auto known = cxxTemplateOwnerGroup_.find(cxxBase); known != cxxTemplateOwnerGroup_.end())
+        if (auto known = cxxTemplateOwnerGroup_.find(cxxBase);
+            known != cxxTemplateOwnerGroup_.end())
             return { known->second };
         const size_t lastSep = cxxBase.rfind("::");
         const std::string leaf = lastSep == std::string::npos ? cxxBase : cxxBase.substr(lastSep + 2);
@@ -9307,22 +9316,6 @@ std::vector<size_t> LLVMBackend::CandidateCxxGroupsFor(const std::string& cxxBas
         order.insert(order.end(), byName.begin(), byName.end());
         order.insert(order.end(), byNamespace.begin(), byNamespace.end());
         order.insert(order.end(), rest.begin(), rest.end());
-        LoadCxxTemplateOwnerMemo();
-        if (auto memo = cxxTemplateOwnerMemo_.find(cxxBase);
-            memo != cxxTemplateOwnerMemo_.end())
-        {
-            auto owner = std::find_if(order.begin(), order.end(), [&](size_t index) {
-                const auto& group = cxxImportGroups_[index];
-                return group.headers == memo->second.headers
-                    && group.defines == memo->second.defines;
-            });
-            if (owner != order.end() && owner != order.begin())
-            {
-                const size_t group = *owner;
-                order.erase(owner);
-                order.insert(order.begin(), group);
-            }
-        }
         return order;
     }
 
@@ -9551,6 +9544,81 @@ bool LLVMBackend::CxxDeclaringFileBelongsToOtherImportGroup(
             return true;
         }
         return false;
+}
+
+/*
+ * The incremental executor keeps ONE clang TU per primary group, and a request that brings in
+ * dependency headers leaves them there. A later request of that primary group then sees
+ * declarations its own headers never include, and its result is cached under ITS headers only - a
+ * compile that never imported the other header replays them (a `<map>` request answering
+ * `cppt::Tagged<long>`, member signatures naming another header's `std::function`). Drop every
+ * record, signature, function template and enum whose file no header of the request reaches in
+ * the TU's include graph: what a TU of the request's own headers would not have declared.
+ */
+void LLVMBackend::DropCxxDeclarationsOutsideRequestGroup(const CxxRequestGroup& group,
+                                                          const std::vector<CxxRequestItem>& items,
+                                                          const CxxIncrementalGroup& incremental,
+                                                          cflat_cinterop::ExtractResult& raw) const
+{
+        // A `#line` renames `file`; reachability is a property of the real file.
+        auto fileOf = [](const auto& entry) -> const std::string& {
+            return entry.physicalFile.empty() ? entry.file : entry.physicalFile;
+        };
+        std::vector<std::string> files;
+        std::unordered_set<std::string> seen;
+        auto collect = [&](const auto& list) {
+            for (const auto& entry : list)
+                if (!fileOf(entry).empty() && seen.insert(fileOf(entry)).second)
+                    files.push_back(fileOf(entry));
+        };
+        collect(raw.records);
+        collect(raw.sigs);
+        collect(raw.functionTemplates);
+        collect(raw.enums);
+        const std::unordered_set<std::string> foreign =
+            incremental.UnreachableFiles(CxxRequestIncludeRoots(group.headers), files);
+        if (foreign.empty()) return;
+        const std::string identity = items.size() == 1
+            ? cflat_cinterop::CxxForeignIdentity(items.front().cxxSpelling) : std::string();
+        auto isRequested = [&](const cflat_cinterop::RawRecord& r) {
+            return r.name == items.front().cflatName || r.qualifiedName == items.front().cflatName
+                || (!identity.empty() && (r.name == identity
+                    || (!r.canonicalCtype.empty()
+                        && cflat_cinterop::CxxForeignIdentity(r.canonicalCtype) == identity)));
+        };
+        // The requested type itself is foreign: answer as the group's own TU would, with nothing,
+        // so the caller's cached negative fires however much else the shared TU had instantiated.
+        if (items.size() == 1
+            && std::any_of(raw.records.begin(), raw.records.end(), [&](const auto& r) {
+                   return isRequested(r) && foreign.count(fileOf(r)) != 0;
+               }))
+        {
+            if (verbose)
+                std::cout << std::format("[verbose] C++ request in '{}': '{}' is declared only by "
+                                         "headers outside its import groups\n",
+                                         group.label, items.front().cxxSpelling);
+            cflat_cinterop::ExtractResult none;
+            none.longDoubleWidth = raw.longDoubleWidth;
+            none.longDoubleIsIEEEDouble = raw.longDoubleIsIEEEDouble;
+            none.targetTriple = std::move(raw.targetTriple);
+            none.firstError = std::move(raw.firstError);
+            raw = std::move(none);
+            return;
+        }
+        size_t dropped = 0;
+        auto drop = [&](auto& list) {
+            const size_t before = list.size();
+            std::erase_if(list, [&](const auto& entry) { return foreign.count(fileOf(entry)) != 0; });
+            dropped += before - list.size();
+        };
+        drop(raw.records);
+        drop(raw.sigs);
+        drop(raw.functionTemplates);
+        drop(raw.enums);
+        if (verbose)
+            std::cout << std::format("[verbose] C++ request in '{}' dropped {} declaration(s) "
+                                     "from headers outside its import groups\n",
+                                     group.label, dropped);
 }
 
 bool LLVMBackend::RequestCxxForeignType(const std::string& cflatName, const std::string& cxxSpelling,
@@ -10900,7 +10968,6 @@ bool LLVMBackend::RequestCxxTypeInOwningGroup(const std::string& cxxBase,
             {
                 cxxTemplateOwnerGroup_[cxxBase] = order[k];
                 cxxTypeOwnerGroup_[cflatName] = order[k];
-                StoreCxxTemplateOwnerMemo(cxxBase, order[k]);
                 return true;
             }
             tried.push_back(group.label);
