@@ -2017,6 +2017,27 @@ bool LLVMBackend::CxxSignatureTypesRegistered(const CSigEntry& e)
         return true;
 }
 
+// A C interop declaration of `sig`'s linkage symbol is in the function table under `regName`
+// with the same parameter and return types.
+bool LLVMBackend::IsCxxDeclarationRegistered(const std::string& regName, const CSigEntry& sig) const
+{
+        auto it = functionTable.find(regName);
+        if (it == functionTable.end()) return false;
+        auto sameType = [](const TypeAndValue& a, const TypeAndValue& b) {
+            return a.TypeName == b.TypeName && a.Pointer == b.Pointer
+                && a.PointerDepth == b.PointerDepth && a.IsAlias == b.IsAlias;
+        };
+        return std::any_of(it->second.begin(), it->second.end(), [&](const FunctionSymbol& sym) {
+            if (!sym.IsCInteropDeclaration || sym.UniqueName != sig.linkageName) return false;
+            if (!sameType(sym.ReturnType, sig.ret)
+                || sym.Parameters.size() != sig.params.size())
+                return false;
+            for (size_t i = 0; i < sig.params.size(); ++i)
+                if (!sameType(sym.Parameters[i], sig.params[i])) return false;
+            return true;
+        });
+}
+
 /*
  * Register every namespace prefix of a dotted C++ declaration name, and note its leading segment
  * as a foreign namespace of the active import group. Used by the sites that DROP a declaration:
@@ -2289,6 +2310,19 @@ void LLVMBackend::RegisterCSignatures(const std::vector<CSigEntry>& sigs, const 
                 sigp = &retypedEntry;
             }
             const CSigEntry& sig = *sigp;
+            /*
+             * Every C++ type request hands back its group's whole free-function surface, so one
+             * declaration arrives here once per request. One this loop already bound, still in
+             * the table with this exact (retyped) signature, has nothing left to register.
+             */
+            std::string boundKey;
+            if (e.isCxx && !e.linkageName.empty() && programAlias.empty())
+            {
+                boundKey = e.name + '\x1f' + e.linkageName;
+                if (cxxBoundSignatureKeys_.count(boundKey) != 0
+                    && IsCxxDeclarationRegistered(regName, sig))
+                    continue;
+            }
             if (e.isCxx)
             {
                 // Prototype boundary: the C++ path carries primitives and bare pointers only.
@@ -2434,6 +2468,7 @@ void LLVMBackend::RegisterCSignatures(const std::vector<CSigEntry>& sigs, const 
                     }
             }
 
+            if (!boundKey.empty()) cxxBoundSignatureKeys_.insert(std::move(boundKey));
             if (isProgMain)
             {
                 programTable[programAlias].MainFunction     = module->getFunction(regName);
@@ -5831,6 +5866,13 @@ bool LLVMBackend::TryLoadCxxTypeRequestCache(const CxxRequestGroup& group,
                 return false;
             }
         }
+        /*
+         * Only a process that analyzes again (a --check batch, symbol queries, the LSP) can hit
+         * this entry in memory later. A one-shot compile would copy every loaded entry - the
+         * group's whole signature surface - to serve a handful of repeats, which cost less
+         * re-read from disk.
+         */
+        if (batchMode_ || symbolSink_ != nullptr)
         {
             std::lock_guard<std::mutex> lock(cFileSigCacheMutex_);
             InsertCFileSigEntry(requestKey, CFileSigCacheEntry(diskEntry), verbose);
@@ -6448,14 +6490,23 @@ bool LLVMBackend::RequestGeneratedCxxWrapper(const CxxRequestGroup& group,
                                              bool allowIncremental)
 {
         const bool emitDefinitions = symbolSink_ == nullptr;
+        const std::string negativeSource = BuildCxxRequestPrologue(group, {}, false) + wrapperSource;
+        const std::vector<std::string> negativeArgs = BuildCxxRequestClangArgs(group);
         const std::string negativeKey = CxxTypeRequestCacheKey(
-            group, wrapperName, BuildCxxRequestPrologue(group, {}, false) + wrapperSource,
-            BuildCxxRequestClangArgs(group), emitDefinitions) + "|" + cacheTag + "|NEG";
+            group, wrapperName, negativeSource, negativeArgs, emitDefinitions)
+            + "|" + cacheTag + "|NEG";
         {
             CFileSigCacheEntry negative;
             std::string missReason;
-            if (TryLoadCxxTypeRequestCache(group, negativeKey, /*emitDefinitions*/ false, negative,
-                                           missReason, /*allowDisk*/ true)
+            // LSP analysis also answers from a compile's remembered failure (see the positive key).
+            if ((TryLoadCxxTypeRequestCache(group, negativeKey, /*emitDefinitions*/ false,
+                                            negative, missReason, /*allowDisk*/ true)
+                 || (!emitDefinitions
+                     && TryLoadCxxTypeRequestCache(
+                            group, CxxTypeRequestCacheKey(group, wrapperName, negativeSource,
+                                                          negativeArgs, /*emitDefinitions*/ true)
+                                       + "|" + cacheTag + "|NEG",
+                            /*emitDefinitions*/ false, negative, missReason, /*allowDisk*/ true)))
                 && negative.macros.size() == 1
                 && negative.macros.front().name == kNegativeCxxRequestMarker)
             {
@@ -6520,7 +6571,19 @@ bool LLVMBackend::RequestGeneratedCxxWrapperUncached(const CxxRequestGroup& grou
             + "|" + cacheTag + "|FULL";
         CFileSigCacheEntry cachedEntry;
         std::string missReason;
-        if (TryLoadCxxTypeRequestCache(group, requestKey, emitDefinitions, cachedEntry, missReason))
+        /*
+         * LSP analysis never stores to disk, so its own key only hits memory. It then reads the
+         * entry a compile stored for the same wrapper - the signature the compiler binds; the
+         * companion bitcode is dropped below.
+         */
+        if (TryLoadCxxTypeRequestCache(group, requestKey, emitDefinitions, cachedEntry, missReason)
+            || (!emitDefinitions
+                && TryLoadCxxTypeRequestCache(
+                       group,
+                       CxxTypeRequestCacheKey(group, wrapperName, requestSource, requestArgs,
+                                              /*emitDefinitions*/ true)
+                           + "|" + cacheTag + "|FULL",
+                       /*emitDefinitions*/ false, cachedEntry, missReason)))
         {
             requestSigs = cachedEntry.sigs;
             requestBitcode = cachedEntry.cxxBitcode;
@@ -10256,11 +10319,17 @@ bool LLVMBackend::RequestCxxForeignType(const std::string& cflatName, const std:
         // their signatures can map the self-reference; RegisterCRecords fills this shell below.
         if (dataStructures.find(cflatName) == dataStructures.end())
             CreateStructType(cflatName, {});
-        RequestCxxMemberTypes(records, effectivePrefixSource, incompletePrefix);
+        {
+            llvm::TimeTraceScope memberTypesScope("CxxRequestMemberTypes", cxxSpelling);
+            RequestCxxMemberTypes(records, effectivePrefixSource, incompletePrefix);
+        }
         if (!requestBitcode.empty() && symbolSink_ == nullptr) AdoptCxxCompanionBitcode(requestBitcode);
         // Registered BEFORE the records so a member signature naming the type itself
         // (`operator=(const vector<int>&)`, `push_back` on a nested element) maps to the CFlat name.
-        RegisterCRecords(records, fileForCxxRequest);
+        {
+            llvm::TimeTraceScope recordScope("CxxRequestRegisterRecords", cxxSpelling);
+            RegisterCRecords(records, fileForCxxRequest);
+        }
         if (upgradingTentative)
         {
             const CRecordEntry* refreshed = nullptr;
@@ -10395,8 +10464,16 @@ bool LLVMBackend::RequestCxxForeignType(const std::string& cflatName, const std:
             }
         }
         if (requestCacheReplay) RebindCxxCachedSignatures(requestSigs);
-        RegisterCSignatures(requestSigs, fileForCxxRequest);
-        RegisterCxxFunctionTemplates(requestTemplates, group.primary, fileForCxxRequest);
+        {
+            llvm::TimeTraceScope sigScope("CxxRequestRegisterSignatures",
+                                          std::to_string(requestSigs.size()));
+            RegisterCSignatures(requestSigs, fileForCxxRequest);
+        }
+        {
+            llvm::TimeTraceScope templateScope("CxxRequestRegisterTemplates",
+                                               std::to_string(requestTemplates.size()));
+            RegisterCxxFunctionTemplates(requestTemplates, group.primary, fileForCxxRequest);
+        }
         if (dataStructures.find(cflatName) == dataStructures.end())
         {
             cxxCflatToCxxSpelling_.erase(cflatName);
@@ -15053,6 +15130,16 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
             cxxGroup = MakeCxxRequestGroup(cxxGroupIndex, {});
         }
         CxxRequestGroupScope cxxGroupGuard(*this, cppMode ? &cxxGroup : nullptr);
+        // A cache hit skips extraction, which is what seeds the group's namespaces; replay the
+        // stored ones so group candidate order - and so request attribution - matches cold.
+        auto replayCxxGroupNamespaces = [&](const std::vector<std::string>& names) {
+            if (!cppMode || cxxGroupIndex >= cxxImportGroups_.size()) return;
+            for (const auto& name : names)
+            {
+                cxxForeignNamespaces_.insert(name);
+                cxxImportGroups_[cxxGroupIndex].namespaces.insert(name);
+            }
+        };
 
         // Best-effort alias retry: a macro that still cannot be resolved is dropped, exactly as
         // the first registration pass drops it. A real header carries many such macros.
@@ -15300,6 +15387,7 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
         std::vector<std::pair<std::string, std::string>> hitNamespaceAliases;
         std::vector<cflat_cinterop::RawFunctionTemplate> hitFunctionTemplates;
         std::vector<std::string> hitClassTemplateNames;
+        std::vector<std::string> hitGroupNamespaces;
         std::vector<cflat_cinterop::RawFunctionPointerAbi> hitFunctionPointerAbis;
         std::string hitCxxBitcode;
         bool hit = false;
@@ -15323,6 +15411,7 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
                     hitNamespaceAliases = entry.namespaceAliases;
                     hitFunctionTemplates = entry.functionTemplates;
                     hitClassTemplateNames = entry.classTemplateNames;
+                    hitGroupNamespaces = entry.cxxGroupNamespaces;
                     hitFunctionPointerAbis = entry.functionPointerAbis;
                     hitCxxBitcode = entry.cxxBitcode;
                     for (const auto& dep : entry.deps) hitDepPaths.push_back(dep.path);
@@ -15342,6 +15431,7 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
                     hitNamespaceAliases = entry.namespaceAliases;
                     hitFunctionTemplates = entry.functionTemplates;
                     hitClassTemplateNames = entry.classTemplateNames;
+                    hitGroupNamespaces = entry.cxxGroupNamespaces;
                     hitFunctionPointerAbis = entry.functionPointerAbis;
                     hitCxxBitcode = entry.cxxBitcode;
                     for (const auto& dep : entry.deps) hitDepPaths.push_back(dep.path);
@@ -15354,6 +15444,7 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
             // on registration exactly like a disk hit does.
             for (CSigEntry& sig : hitSigs) sig.needsCxxRebind = sig.isCxx;
             if (cppMode) RememberCxxGroupReachableFiles(cxxGroupIndex, hitDepPaths);
+            replayCxxGroupNamespaces(hitGroupNamespaces);
             // The C++ definitions this header needed were emitted on the cold run; relink the very
             // same bitcode instead of running CodeGen again.
             AdoptCxxCompanionBitcode(hitCxxBitcode);
@@ -15407,14 +15498,31 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
         // registers decls, skipping the clang header parse entirely.
         std::filesystem::path cHeaderCacheDir = GetCHeaderCacheDir();
         const uint64_t diskKey = refusalGroupKey;
+        /*
+         * LSP analysis never writes a C++ header entry, so its own key is never on disk. It reads
+         * the entry a compile stored instead - the surface the compiler binds - without the
+         * companion bitcode, and never deletes it: a compile owns that file.
+         */
+        const bool readCompiledEntry = cppMode && !cxxDefinitionsEmitted;
+        const uint64_t loadKey = readCompiledEntry
+            ? CHeaderDiskCacheKey(realPaths, cIncludeDirs_, cDefines_, extraDefines,
+                                  targetWindows_, CInteropTargetTriple(), cppMode,
+                                  /*cxxDefinitionsEmitted*/ true, cppStandard_,
+                                  ProgramTargetCPUFeatures().first,
+                                  ProgramTargetCPUFeatures().second)
+            : diskKey;
         if (!mtEc && !cHeaderCacheDir.empty())
         {
             CFileSigCacheEntry diskEntry;
             bool diskHit;
             {
                 llvm::TimeTraceScope loadScope("CHeaderJsonLoad", fileForLsp);
-                diskHit = TryLoadCHeaderDiskCache(cHeaderCacheDir, diskKey, currentMtime, hashNow(), diskEntry);
+                diskHit = TryLoadCHeaderDiskCache(cHeaderCacheDir, loadKey, currentMtime, hashNow(),
+                                                  diskEntry, /*expectedRequestKey*/ {},
+                                                  /*requireBitcode*/ false, /*missReason*/ nullptr,
+                                                  /*removeOnMiss*/ !readCompiledEntry);
             }
+            if (diskHit && readCompiledEntry) diskEntry.cxxBitcode.clear();
             if (diskHit)
             {
                 // The output's up-to-date check must see the transitive includes on a hit too.
@@ -15425,6 +15533,7 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
                     diskDepPaths.push_back(dep.path);
                 }
                 if (cppMode) RememberCxxGroupReachableFiles(cxxGroupIndex, diskDepPaths);
+                replayCxxGroupNamespaces(diskEntry.cxxGroupNamespaces);
                 if (verbose) std::cout << std::format("[verbose] C header disk cache hit for {}\n", fileForLsp);
                 {
                     std::lock_guard<std::mutex> lock(cFileSigCacheMutex_);
@@ -15521,6 +15630,7 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
         if (!cppMode && !CountTuParse("C header", std::format("{:016x}", refusalGroupKey), fileForLsp,
                                     "header extraction"))
             return false;
+        std::unordered_set<std::string> namespacesBeforeExtract;
         {
             // All C entities are extracted in one full parse (plus a cheap preprocess-only prepass
             // for macro names). Uses clang C++ API, not clang-cl or libclang.
@@ -15528,6 +15638,8 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
             bool prereqFailure = false;
             bool headerFailure = false;
             std::string prereqMsg;
+            if (cppMode && cxxGroupIndex < cxxImportGroups_.size())
+                namespacesBeforeExtract = cxxImportGroups_[cxxGroupIndex].namespaces;
             if (!ExtractCHeaderClang(realPaths, sigs, enums, records, macros, funcMacros, globals,
                                      aliases, typeAliases, extraDefines, &includes,
                                      &prereqFailure, &prereqMsg, &headerFailure, cppMode, &cxxBitcode,
@@ -15549,6 +15661,13 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
             }
         }
         if (cppMode) RememberCxxGroupReachableFiles(cxxGroupIndex, includes);
+        std::vector<std::string> seededGroupNamespaces;
+        if (cppMode && cxxGroupIndex < cxxImportGroups_.size())
+        {
+            for (const auto& name : cxxImportGroups_[cxxGroupIndex].namespaces)
+                if (namespacesBeforeExtract.count(name) == 0) seededGroupNamespaces.push_back(name);
+            std::sort(seededGroupNamespaces.begin(), seededGroupNamespaces.end());
+        }
 
         if (!mtEc)
         {
@@ -15561,6 +15680,7 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
             entry.sigs  = sigs;
             entry.functionTemplates = functionTemplates;
             entry.classTemplateNames = classTemplateNames;
+            entry.cxxGroupNamespaces = seededGroupNamespaces;
             entry.enums = enums;
             entry.records = records;
             entry.macros = macros;

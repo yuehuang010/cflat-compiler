@@ -2927,6 +2927,8 @@ bool LLVMBackend::TryLoadCHeaderDiskCache(
                     entry.functionTemplates.push_back(FunctionTemplateFromJson(t, files));
             if (j.contains("classTemplateNames"))
                 entry.classTemplateNames = j["classTemplateNames"].to_string_vector();
+            if (j.contains("cxxGroupNamespaces"))
+                entry.cxxGroupNamespaces = j["cxxGroupNamespaces"].to_string_vector();
             if (j.contains("enums"))      for (const auto& e : j["enums"])      entry.enums.push_back(EnumFromJson(e));
             if (j.contains("records"))    for (const auto& r : j["records"])    entry.records.push_back(RecordFromJson(r, files));
             if (j.contains("macros"))     for (const auto& m : j["macros"])     entry.macros.push_back(MacroFromJson(m, files));
@@ -3274,6 +3276,7 @@ void LLVMBackend::WriteCHeaderDiskCache(
             functionTemplates.push_back(FunctionTemplateToJson(t, &files));
         j["functionTemplates"] = functionTemplates;
         j["classTemplateNames"] = entry.classTemplateNames;
+        if (!entry.cxxGroupNamespaces.empty()) j["cxxGroupNamespaces"] = entry.cxxGroupNamespaces;
         nlohmann::json enums = nlohmann::json::array();
         for (const auto& e : entry.enums) enums.push_back(EnumToJson(e));
         j["enums"] = enums;

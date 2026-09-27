@@ -4498,6 +4498,7 @@ void LLVMBackend::ResetForReanalysis()
     cxxFunctionSignatures_.clear();
     cxxFunctionBindAttempts_.clear();
     cxxFunctionOwnerGroup_.clear();
+    cxxBoundSignatureKeys_.clear();
     cxxTypeOwnerGroup_.clear();
     cxxForeignNamespaces_.clear();
     cxxNestedNamespaceNames_.clear();

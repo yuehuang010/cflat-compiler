@@ -3329,6 +3329,8 @@ private:
         cxxFunctionTemplates_;
     std::unordered_map<std::string, size_t> cxxFunctionTemplateOwnerGroup_;
     std::unordered_map<std::string, size_t> cxxFunctionOwnerGroup_;
+    // "<name>\x1f<linkage>" of every C++ free declaration RegisterCSignatures fully bound.
+    std::unordered_set<std::string> cxxBoundSignatureKeys_;
     // CFlat foreign type name -> the import group index whose request registered it.
     std::unordered_map<std::string, size_t> cxxTypeOwnerGroup_;
     /*
@@ -3703,6 +3705,9 @@ private:
         std::vector<CSigEntry> sigs;
         std::vector<cflat_cinterop::RawFunctionTemplate> functionTemplates;
         std::vector<std::string> classTemplateNames;
+        // Namespace leads a C++ header extraction seeded into its import group (signature
+        // spellings, included headers). A hit replays them: they order owner-group candidates.
+        std::vector<std::string> cxxGroupNamespaces;
         std::vector<cflat_cinterop::RawFunctionPointerAbi> functionPointerAbis;
         std::vector<CEnumEntry> enums;
         std::vector<CRecordEntry> records;
@@ -3746,7 +3751,7 @@ private:
     static size_t CFileSigEntryRows(const CFileSigCacheEntry& entry)
     {
         return entry.sigs.size() + entry.functionTemplates.size() + entry.classTemplateNames.size()
-             + entry.enums.size() + entry.records.size()
+             + entry.cxxGroupNamespaces.size() + entry.enums.size() + entry.records.size()
              + entry.macros.size() + entry.funcMacros.size() + entry.globals.size()
              + entry.recordAliases.size() + entry.typeAliases.size()
              + entry.usingDirectives.size() + entry.namespaceAliases.size()
@@ -5523,6 +5528,7 @@ private:
     bool TryBindCxxFunction(const std::string& functionName);
     void RememberCxxMangledArity(const std::string& cflatName, const std::string& cxxSpelling) const;
     bool CxxSignatureTypesRegistered(const CSigEntry& entry);
+    bool IsCxxDeclarationRegistered(const std::string& regName, const CSigEntry& sig) const;
     void SeedCxxNamespacesOfDottedName(const std::string& dottedName);
     bool RequestCxxTypeInOwningGroup(const std::string& cxxBase, const std::string& cflatName,
                                      const std::string& spelling,
@@ -10194,7 +10200,8 @@ public:
     // 97: default-argument wrappers skip ambiguous shortened calls, dedupe, move by-value args.
     // 101: an incremental request drops declarations its own includes do not reach.
     // 102: MS ABI implicit dtors bind to the emitted base dtor; MSVC unique_ptr move members.
-    static constexpr int kCHeaderCacheVersion = 102;
+    // 103: header entries carry the namespaces their extraction seeded into the import group.
+    static constexpr int kCHeaderCacheVersion = 103;
     static std::string CompilerBuildStamp();
 
     static std::string GetCHeaderCacheDir();

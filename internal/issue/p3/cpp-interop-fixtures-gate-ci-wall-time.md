@@ -30,13 +30,27 @@ registration, signature rebinding, nested requests), LinkCxxCompanion 4.9 s, Cod
    program. Note llvm::Linker drops an unreferenced linkonce definition when the destination
    does not name it - the scratch module pre-declares every linkonce definition before its blob
    (`DeclareLinkOnceDefinitions`) or later blobs' calls stay unresolved.
-3. Replay cost: 290 x 34 ms after a cache hit. Profile inside the replay scope (record
-   registration vs `RebindCxxCachedSignatures` vs nested requests) before touching it.
+3. PARTLY DONE 2026-09-26 (night). Profiled: the replay cost was `RegisterCSignatures` - every
+   request hands back its group's whole free-function surface (~3.3k sigs, 952k across the
+   fixture). A declaration already bound with the identical retyped signature is now skipped
+   (`cxxBoundSignatureKeys_` + `IsCxxDeclarationRegistered`): 8.8 s -> 4.3 s self. A one-shot
+   compile no longer copies disk-hit request entries into the memory cache (~2.5 s). Bridge warm
+   standalone 31 s -> 25 s; test.bat warm ~125 s -> 113 s. Remaining (self): LinkCxxCompanion
+   4.9 s, CxxRequestRegisterSignatures 4.3 s, CodeGeneration 3.1 s, Rebind 2.9 s,
+   CHeaderJsonConvert 2.6 s. Next: stop returning the whole group surface per request (register
+   only signatures the request's own records/namespaces need), which would cut Rebind too.
 4. Make the request cache carry the merged per-group companion instead of 290 sidecars.
 5. `test.bat` scheduling is a non-item: every worker starts at once, so order does not matter;
    the in-suite cost is core contention.
 
-## Observation 2026-09-26 (request cache converges on the SECOND run, not the first)
+## FIXED 2026-09-26 (night): request cache converges on the SECOND run, not the first
+
+Root cause: `ExtractCHeaderClang` seeds the import group's namespaces (signature spellings +
+included headers, e.g. `std`); a header-cache hit skipped that, so `CandidateCxxGroupsFor` ordered
+groups differently and `std::shared_ptr<...>` went to another group. Header cache entries now
+store the namespaces extraction seeded (`cxxGroupNamespaces`, cache v103) and both hit paths
+replay them. Verified: wipe -> cold stores 678, next run stores 0, candidate order identical.
+Original observation kept below.
 
 Bridge fixture: cold run stores its entries; the next run still STORES 83 entries (4.6 s in
 `StoreCxxTypeRequestCache`, 204 files rewritten under `cheaders/v102`); the third run stores
@@ -48,6 +62,17 @@ from cache. Steady-state CI (cache persisted across runs) is unaffected; a fresh
 cache pays it once. Fix direction: make the owning group of a type request independent of
 cache state (attribute by the header that declares the record, not by the request that first
 reached it).
+## LANDED 2026-09-27: LSP analysis reads the compile's |EDEF entries (read-only)
+
+Type requests were already mode-independent (stage 2 keys EDEF in both modes). The LSP-only
+cost was C++ header imports (15 cold clang parses, 8.4 s) and generated wrappers (98 clang runs,
+3.5 s): both keyed EDECL, which nothing stores. LSP mode now loads the EDEF header entry and, on
+an EDECL miss, the EDEF wrapper entry (positive and |NEG), drops the companion bitcode, and never
+writes or deletes on disk. It binds exactly what the compiler binds, the stated design goal.
+Bridge `--symbol` run 32.6 s -> 21.2 s; LSP sweep 146 s -> 129 s (fixtures 50/59/80 s ->
+30/39/51 s). Needs a prior compile to populate the cache (buildci runs test.bat first); a fresh
+cache falls back to parsing as before.
+
 ## Tried and rejected 2026-09-26: letting LSP analysis write its |EDECL request-cache entries
 
 The LSP sweep (buildci's second-largest block, 144 s warm) never hits the request cache: LSP
