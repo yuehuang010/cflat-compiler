@@ -4414,16 +4414,18 @@ namespace cflat_cinterop
                 }
             }
             /*
-             * An inline static data member is not a top-level decl, and unlike a member FUNCTION
-             * there is no lexically-in-a-record fallback that finds it later - CodeGen only knows
-             * about a variable it was handed. Hand each one over explicitly so the request below
-             * has a deferred definition to promote instead of just a declaration.
-            */
+             * An inline static data member is not a top-level decl, and unlike a member function
+             * there is no lexical fallback that finds it later. Hand each one to CodeGen so an
+             * emitted body can resolve it when needed.
+             */
+            // Initial entries are global or static data variables cflat binds directly. Later
+            // entries are inline or constexpr members reached only through emitted C++ bodies.
+            const size_t boundStaticVarCount = st.varEmitWork.size();
             // A requested template can instantiate an inline or constexpr static data member
             // transitively (nlohmann::detail::static_const<T>::value is one example). Those
             // specializations are not top-level declarations and are not members of the
-            // requested record, but an emitted body can still odr-use them. Queue the used
-            // definitions explicitly so CodeGen emits their linkonce_odr storage.
+            // requested record, but an emitted body can still odr-use them. Register them so
+            // CodeGen emits their linkonce_odr storage only when referenced.
             struct UsedStaticVarVisitor : RecursiveASTVisitor<UsedStaticVarVisitor>
             {
                 std::vector<const VarDecl*>& work;
@@ -4486,11 +4488,14 @@ namespace cflat_cinterop
                 if (w.md != nullptr && !declHasErrors(w.md) && w.md->hasBody()
                     && !isDependentCodeGenDecl(w.md))
                     request(MemberGlobalDecl(w.md));
-            for (const VarDecl* vd : st.varEmitWork)
+            for (size_t i = 0; i < boundStaticVarCount; ++i)
+            {
+                const VarDecl* vd = st.varEmitWork[i];
                 if (vd != nullptr && !declHasErrors(vd) && !isDependentCodeGenDecl(vd))
                     request(GlobalDecl(vd));
-            // Promote concrete free-function helpers that a requested inline body uses. Clang
-            // defers these internal inline definitions independently of their caller.
+            }
+            // Register concrete free-function helpers that emitted C++ bodies may use. Clang
+            // emits each deferred definition only when a Phase 2 root references it.
             std::vector<const FunctionDecl*> usedFunctionWork;
             struct UsedFunctionVisitor : RecursiveASTVisitor<UsedFunctionVisitor>
             {
@@ -4636,8 +4641,6 @@ namespace cflat_cinterop
             {
                 if (overInvalidRecord(fd)) continue;
                 cg.HandleTopLevelDecl(DeclGroupRef(const_cast<FunctionDecl*>(fd)));
-                cg.GetAddrOfGlobal(GlobalDecl(const_cast<FunctionDecl*>(fd)),
-                                   /*isForDefinition*/ true);
             }
             /*
              * A live Interpreter: every specialization an EARLIER chunk instantiated hangs off

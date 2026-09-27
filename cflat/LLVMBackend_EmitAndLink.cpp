@@ -2738,6 +2738,36 @@ void LLVMBackend::FinalizeGlobalConstructorOrder()
  * llvm.global_ctors entries are merged into the main module's list, which is what makes a
  * header-defined static object initialize under --run as well as in a linked executable.
  */
+/*
+ * llvm::Linker links a linkonce definition only when the destination already names it. The
+ * program always did (cflat declares what it binds), so linking a companion straight into it
+ * kept every body cflat calls; the scratch module that collects the companions first names
+ * nothing, so each linkonce definition is declared there ahead of its blob or the merge silently
+ * drops it and a later blob's call to it stays unresolved.
+ */
+static void DeclareLinkOnceDefinitions(llvm::Module& destination, const llvm::Module& source)
+{
+    for (const llvm::Function& f : source.functions())
+        if (!f.isDeclaration() && f.hasLinkOnceLinkage()
+            && destination.getNamedValue(f.getName()) == nullptr)
+            llvm::Function::Create(f.getFunctionType(), llvm::GlobalValue::ExternalLinkage,
+                                   f.getAddressSpace(), f.getName(), &destination);
+    for (const llvm::GlobalVariable& gv : source.globals())
+        if (!gv.isDeclaration() && gv.hasLinkOnceLinkage()
+            && destination.getNamedValue(gv.getName()) == nullptr)
+            new llvm::GlobalVariable(destination, gv.getValueType(), gv.isConstant(),
+                                     llvm::GlobalValue::ExternalLinkage, nullptr, gv.getName(),
+                                     nullptr, gv.getThreadLocalMode(), gv.getAddressSpace());
+}
+
+static size_t CountDefinitions(const llvm::Module& m)
+{
+    size_t count = 0;
+    for (const llvm::GlobalValue& gv : m.global_values())
+        if (!gv.isDeclaration()) ++count;
+    return count;
+}
+
 bool LLVMBackend::LinkCxxCompanionModules()
 {
     if (cxxCompanionBitcode_.empty()) return true;
@@ -2750,6 +2780,17 @@ bool LLVMBackend::LinkCxxCompanionModules()
     for (const llvm::GlobalValue& gv : module->global_values())
         if (!gv.isDeclaration() && gv.hasName()) programOrigin.insert(gv.getName().str());
 
+    /*
+     * The companions are merged into one scratch module first and that module is linked into
+     * the program ONCE with LinkOnlyNeeded: IRMover's work per blob is then proportional to the
+     * blobs, not to the program, and only the definitions the program reaches (transitively,
+     * across blobs) move over. A per-blob LinkOnlyNeeded link cannot do that: a blob's callee
+     * defined in a later blob is not "needed" yet when the earlier one links, and iterating to a
+     * fixed point re-links the appending globals every pass (see internal/fix-issue-lessons.md).
+     */
+    auto companions = std::make_unique<llvm::Module>("cflat_cxx_companions", *context);
+    companions->setTargetTriple(module->getTargetTriple());
+    companions->setDataLayout(module->getDataLayout());
     std::vector<std::string> blobs;
     blobs.swap(cxxCompanionBitcode_);
     for (const std::string& blob : blobs)
@@ -2816,7 +2857,8 @@ bool LLVMBackend::LinkCxxCompanionModules()
         if (verbose)
             std::cout << std::format("[verbose] linking C++ companion module ({} bytes of bitcode)\n",
                                      blob.size());
-        if (llvm::Linker::linkModules(*module, std::move(companion), llvm::Linker::Flags::None))
+        DeclareLinkOnceDefinitions(*companions, *companion);
+        if (llvm::Linker::linkModules(*companions, std::move(companion), llvm::Linker::Flags::None))
         {
             LogErrorMessage("{}: the C++ definitions emitted for an imported header could not be "
                             "linked into this program (conflicting module flags or symbols).",
@@ -2824,6 +2866,22 @@ bool LLVMBackend::LinkCxxCompanionModules()
             return false;
         }
     }
+
+    const size_t companionDefinitions = CountDefinitions(*companions);
+    const size_t programDefinitionsBefore = CountDefinitions(*module);
+    if (llvm::Linker::linkModules(*module, std::move(companions),
+                                  llvm::Linker::Flags::LinkOnlyNeeded))
+    {
+        LogErrorMessage("{}: the C++ definitions emitted for an imported header could not be "
+                        "linked into this program (conflicting module flags or symbols).",
+                        { "import cpp" });
+        return false;
+    }
+    if (verbose)
+        std::cout << std::format("[verbose] C++ companion link: {} blob(s), {} merged "
+                                 "definition(s), {} linked into the program\n",
+                                 blobs.size(), companionDefinitions,
+                                 CountDefinitions(*module) - programDefinitionsBefore);
 
     // Companion TUs are emitted at Clang's O1 with LLVM passes disabled, so frontend attributes
     // retain source intent while the unoptimized bodies remain reusable at every cflat level.
