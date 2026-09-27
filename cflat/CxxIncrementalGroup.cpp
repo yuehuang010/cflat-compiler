@@ -796,6 +796,9 @@ std::unique_ptr<CxxIncrementalGroup> CxxIncrementalGroup::Create(
         error = ErrorText(compiler.takeError());
         return nullptr;
     }
+    // Same reason as the extractor invocation: a forwarding destructor must stay a symbol
+    // of its own (see CXXCtorDtorAliases in CClangExtract.cpp).
+    (*compiler)->getCodeGenOpts().CXXCtorDtorAliases = false;
     auto executorBuilder = std::make_unique<clang::IncrementalExecutorBuilder>();
     executorBuilder->IE = std::make_unique<ParseOnlyExecutor>();
     auto interpreter = clang::Interpreter::create(std::move(*compiler), std::move(executorBuilder));

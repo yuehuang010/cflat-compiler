@@ -10203,6 +10203,50 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
                        llvm::ConstantInt::get(eq->getType(), 0));
         };
 
+        auto tryBoolComparisonConversion = [&]() -> llvm::Value* {
+            if (op != "==" && op != "!=" && op != "&&" && op != "||") return nullptr;
+            if (lvalue == nullptr || rvalue == nullptr) return nullptr;
+            // Only a class with an `operator bool` takes part (the way a condition converts it);
+            // a class whose conversions are `operator int` / `operator double` is not a bool
+            // comparison and must keep resolving through its own operators.
+            auto convertClassToBool = [&](llvm::Value* value, const std::string& name) {
+                if (name.empty() || (!compiler->IsCxxRecord(name)
+                    && compiler->generatedCxxRecords_.count(name) == 0))
+                    return value;
+                EnsureOperatorBoolForValue(value);
+                if (!compiler->HasOperatorBoolForType(value->getType())) return value;
+                return compiler->CoerceToBoolCondition(value);
+            };
+            llvm::Value* left = convertClassToBool(lvalue, lhsTypeName);
+            llvm::Value* right = convertClassToBool(rvalue, rhsTypeName);
+            if (left == nullptr || right == nullptr || (left == lvalue && right == rvalue))
+                return nullptr;
+            if (op == "&&" || op == "||")
+            {
+                auto toBool = [&](llvm::Value* value) -> llvm::Value* {
+                    if (value->getType()->isIntegerTy(1)) return value;
+                    if (value->getType()->isIntegerTy())
+                        return compiler->builder->CreateICmpNE(
+                            value, llvm::ConstantInt::get(value->getType(), 0));
+                    return nullptr;
+                };
+                left = toBool(left);
+                right = toBool(right);
+                if (left == nullptr || right == nullptr) return nullptr;
+                return compiler->CreateOperation(op == "&&" ? LLVMBackend::Operation::LogicalAnd
+                                                            : LLVMBackend::Operation::LogicalOr,
+                                                 left, right);
+            }
+            else if (left->getType()->isIntegerTy(1) && right->getType()->isIntegerTy()
+                     && !right->getType()->isIntegerTy(1))
+                left = compiler->builder->CreateZExt(left, right->getType());
+            else if (right->getType()->isIntegerTy(1) && left->getType()->isIntegerTy()
+                     && !left->getType()->isIntegerTy(1))
+                right = compiler->builder->CreateZExt(right, left->getType());
+            if (left->getType() != right->getType()) return nullptr;
+            return compiler->CreateOperation(op, left, right, false, false);
+        };
+
         // C++ free operators are registered under a private namespace-qualified alias. Trigger
         // deferred binding for the namespaces of both class operands, then call the matching free
         // function through the normal overload/ABI path. The raw spelling is consulted only to
@@ -10288,6 +10332,7 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
                                                          registeredName, templateError, op)
                     || registeredName.empty())
                 {
+                    if (llvm::Value* converted = tryBoolComparisonConversion()) return converted;
                     std::string rvalueSide;
                     for (size_t i = 0; i < templateArgs.size(); ++i)
                         if (templateArgs[i].IsRvalue && !templateArgs[i].TypeAndValue.Pointer)
@@ -10357,7 +10402,8 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
                 {
                     for (const auto& candidate : fit->second)
                     {
-                        if (candidate.IsMethod || candidate.Parameters.size() < 2) continue;
+                        if (candidate.IsMethod || candidate.Parameters.size() < 2
+                            || candidate.SourceName != sourceName) continue;
                         if (!leftInfo.second.empty()
                             && candidate.Parameters[0].TypeName != leftInfo.second)
                             continue;
@@ -10696,7 +10742,8 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
         bool receiverConsumes = false;
         if (auto it = compiler->functionTable.find(opName); it != compiler->functionTable.end())
             for (const auto& candidate : it->second)
-                if (!candidate.Parameters.empty() && candidate.Parameters[0].TypeName == typeName)
+                if (candidate.SourceName == opName && !candidate.Parameters.empty()
+                    && candidate.Parameters[0].TypeName == typeName)
                 {
                     receiverFound = true;
                     if (!candidate.Parameters[0].Pointer && candidate.Parameters[0].IsMove)
@@ -10706,6 +10753,7 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
         {
             llvm::Value* freeResult = tryFreeOperator();
             if (freeResult != nullptr) return freeResult;
+            if (llvm::Value* converted = tryBoolComparisonConversion()) return converted;
             if (llvm::Value* rewritten = tryRewrites()) return rewritten;
             return reportNoOperator(typeName);
         }
@@ -10738,7 +10786,7 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
             {
                 for (const auto& candidate : funcSym->second)
                 {
-                    if (!candidate.Parameters.empty()
+                    if (candidate.SourceName == opName && !candidate.Parameters.empty()
                         && candidate.Parameters[0].TypeName == typeName
                         && candidate.Parameters[0].Pointer)
                     {
@@ -10755,7 +10803,7 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
         {
             for (const auto& candidate : it->second)
             {
-                if (candidate.Parameters.size() < 2
+                if (candidate.SourceName != opName || candidate.Parameters.size() < 2
                     || candidate.Parameters[0].TypeName != typeName
                     || candidate.Parameters[0].Pointer != usePointer)
                     continue;
@@ -10772,6 +10820,22 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
                 else rhsBindsRvalue = true;
             }
         }
+
+        // A class that declares this operator for its own receiver resolves through it, as in
+        // C++; only a class WITHOUT one (the vector<bool> proxy) compares through operator bool.
+        bool declaresOperator = false;
+        if (auto it = compiler->functionTable.find(opName); it != compiler->functionTable.end())
+            for (const auto& candidate : it->second)
+                if (candidate.SourceName == opName && candidate.Parameters.size() >= 2
+                    && candidate.Parameters[0].TypeName == typeName
+                    && candidate.Parameters[0].Pointer == usePointer)
+                {
+                    declaresOperator = true;
+                    break;
+                }
+
+        if (!declaresOperator)
+            if (llvm::Value* converted = tryBoolComparisonConversion()) return converted;
 
         if (lhsIsRvalue && lhsMutableReference && !lhsBindsRvalue)
             LogErrorContext(ctx, std::format(
@@ -15261,7 +15325,19 @@ LLVMBackend::NamedVariable MainListener::ParseNewExpression(CFlatParser::NewExpr
         {
             if (compiler->RejectUnsupportedCxxLayout(typeName)) return {};
             if (compiler->RejectAbstractCxxClass(typeName, "allocate")) return {};
+            std::set<std::string> visitedDestructorBases;
+            auto hasInheritedVirtualDestructor = [&](auto&& self,
+                                                      const std::string& current) -> bool {
+                if (!visitedDestructorBases.insert(current).second) return false;
+                if (compiler->CxxHasVirtualDestructor(current)) return true;
+                const auto* info = compiler->GetCxxClassInfo(current);
+                if (info == nullptr) return false;
+                for (const auto& base : info->bases)
+                    if (!base.isVirtual && self(self, base.name)) return true;
+                return false;
+            };
             if (!compiler->HasTrivialCxxDtor(typeName)
+                && !hasInheritedVirtualDestructor(hasInheritedVirtualDestructor, typeName)
                 && compiler->GetOrCreateCxxClassDestructor(typeName) == nullptr)
             {
                 LogErrorContext(ctx, std::format(

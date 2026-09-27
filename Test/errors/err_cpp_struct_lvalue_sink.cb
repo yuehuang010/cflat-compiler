@@ -11,21 +11,45 @@ import cpp "cpp_interop_sink_cause.h";
 
 extern int main()
 {
+    if const (__WINDOWS__) {
+        expect_error("cannot copy C++ class 'SinkCheck' into parameter '_Val' of 'push_back': its copy constructor is deleted - pass 'move x' or a temporary") {
+            std.vector<SinkCheck> values = default;
+            SinkCheck local = SinkCheck(4);
+            values.push_back(local);
+        }
+    } else {
     expect_error("into parameter '__x' of 'push_back': its copy constructor is deleted - pass 'move x' or a temporary") {
         std.vector<SinkCheck> values = default;
         SinkCheck local = SinkCheck(4);
         values.push_back(local);
     }
+    }
     // assign copy-ASSIGNS the element; clang names operator=, not the copy constructor.
+    if const (__WINDOWS__) {
+        expect_error("member 'assign' of C++ class 'std.vector<SinkCheck>' cannot be instantiated for these template arguments (clang reported an error inside the body it generated) (clang: no matching function for call to 'fill')") {
+            std.vector<SinkCheck> values = default;
+            SinkCheck local = SinkCheck(5);
+            values.assign(3, local);
+        }
+    } else {
     expect_error("clang: overload resolution selected deleted operator '='") {
         std.vector<SinkCheck> values = default;
         SinkCheck local = SinkCheck(5);
         values.assign(3, local);
     }
+    }
+    if const (__WINDOWS__) {
+        expect_error("cannot copy C++ class 'SinkCheck' into parameter '_Val' of 'resize': its copy constructor is deleted") {
+            std.vector<SinkCheck> values = default;
+            SinkCheck local = SinkCheck(6);
+            values.resize(3, local);
+        }
+    } else {
     expect_error("into parameter '__x' of 'resize': its copy constructor is deleted") {
         std.vector<SinkCheck> values = default;
         SinkCheck local = SinkCheck(6);
         values.resize(3, local);
+    }
     }
     // Same-name same-arity overloads: each refusal names its own copy, never the sibling's cause.
     expect_error("cannot copy C++ class 'cplv.Key' into parameter 'value' of 'add'") {

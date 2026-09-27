@@ -573,6 +573,40 @@ namespace cflat_cinterop
             return GlobalDecl(md);
         }
 
+        // Treat same-class `T&&` overloads as move members when Clang does not flag templates.
+        bool IsSameClassRvalueParameter(const CXXMethodDecl* md)
+        {
+            if (md == nullptr || md->getNumParams() != 1) return false;
+            QualType param = md->getParamDecl(0)->getType();
+            if (!param->isRValueReferenceType()) return false;
+            const auto* rhs = param->getPointeeType()->getAsCXXRecordDecl();
+            return rhs != nullptr
+                && rhs->getCanonicalDecl() == md->getParent()->getCanonicalDecl();
+        }
+
+        /*
+         * The bound library owns a member's symbol in two cases, and Clang then deliberately
+         * emits a reference rather than a body. An EXPLICIT INSTANTIATION DECLARATION
+         * (`extern template class basic_string<char>;`) says so for a template member - but
+         * only when the library really exports it: isExternallyVisible() is about LINKAGE, so a
+         * _LIBCPP_HIDE_FROM_ABI member (hidden, excluded from the instantiation, absent from
+         * libc++.dylib) satisfies it while having no symbol anywhere, which would turn a
+         * compile-time refusal into a link-time "undefined symbol". A DLLIMPORT member of an
+         * exported MSVC class (`ios_base::good`) is the Microsoft counterpart: MSVC exports every
+         * member of a dllexport class, inline ones included, and Clang never emits a dllimport
+         * body, so the import library's thunk is the only definition.
+         */
+        static bool LibraryOwnsMemberSymbol(const CXXMethodDecl* md)
+        {
+            if (md->hasAttr<clang::DLLImportAttr>()
+                && md->getASTContext().getTargetInfo().getCXXABI().isMicrosoft())
+                return true;
+            return md->getTemplateSpecializationKind() == clang::TSK_ExplicitInstantiationDeclaration
+                && md->isExternallyVisible()
+                && md->getVisibility() == clang::DefaultVisibility
+                && !md->hasAttr<clang::ExcludeFromExplicitInstantiationAttr>();
+        }
+
         // APSInt -> long long. Signed values sign-extend (they always fit in int64); unsigned
         // values may exceed INT64_MAX (e.g. ~0ULL), so zero-extend and bit-reinterpret rather
         // than call getSExtValue, which asserts isRepresentableByInt64 for those.
@@ -735,6 +769,19 @@ namespace cflat_cinterop
              * definitions were never emitted and the link fails on them.
              */
             std::vector<Decl*> announcedDecls;
+            /*
+             * The subset of announcedDecls this request itself produced: its own chunk and what
+             * Sema instantiated while parsing it. In a live Interpreter announcedDecls also
+             * replays the shared header and prelude roots, and every specialization any EARLIER
+             * request instantiated hangs off those templates with its used-bit set. Promotion
+             * of used helpers walks only this list, or each request's module would carry every
+             * body the group ever emitted - and a cache entry keyed on one request would then
+             * link another program's thunks.
+             */
+            std::vector<Decl*> requestDecls;
+            // The rest of announcedDecls: the shared header and prelude roots of a live
+            // Interpreter. Their used helpers are registered lazily, never forced.
+            std::vector<Decl*> sharedDecls;
             // emitDefinitions only: polymorphic classes whose vtable/RTTI Clang must emit, and
             // inline / constexpr static data members whose storage lives in the companion module.
             std::vector<const CXXRecordDecl*> vtableWork;
@@ -1810,6 +1857,9 @@ namespace cflat_cinterop
                     if (md->getPrimaryTemplate() != nullptr && !templateExtra) continue;
                     const auto* ctor = llvm::dyn_cast<CXXConstructorDecl>(md);
                     const auto* dtor = llvm::dyn_cast<CXXDestructorDecl>(md);
+                    // A trivial destructor does nothing and clang never emits one (CodeGen asserts
+                    // on a non-exported trivial dtor); the record's hasTrivialDtor already says so.
+                    if (dtor != nullptr && dtor->isTrivial()) continue;
                     // Operators and conversion functions are M5; they have no plain identifier.
                     // Copy and move ASSIGNMENT are the exception: they are special members that
                     // nontrivial-class lifetime needs (M4b), so they are exported under the name
@@ -1907,6 +1957,7 @@ namespace cflat_cinterop
                         m.isDefaultCtor = ctor->isDefaultConstructor();
                         m.isCopyCtor = ctor->isCopyConstructor();
                         m.isMoveCtor = ctor->isMoveConstructor();
+                        if (!m.isMoveCtor) m.isMoveCtor = IsSameClassRvalueParameter(md);
                         m.isExplicit = ctor->isExplicit();
                     }
                     else if (dtor != nullptr)
@@ -1923,6 +1974,8 @@ namespace cflat_cinterop
                         m.name = isBindableBoolConversion ? "operator bool" : md->getNameAsString();
                         m.isCopyAssign = md->isCopyAssignmentOperator();
                         m.isMoveAssign = md->isMoveAssignmentOperator();
+                        if (!m.isMoveAssign && m.name == "operator=")
+                            m.isMoveAssign = IsSameClassRvalueParameter(md);
                         if (m.name.empty()) m.name = "operator=";
                     }
                     m.isConst = !md->isStatic() && md->isConst();
@@ -2108,11 +2161,33 @@ namespace cflat_cinterop
                     rec.members.push_back(std::move(m));
                 }
 
-                for (const Decl* d : cxx->decls())
+                // A static data member of a PUBLIC base is nameable on the derived class in C++
+                // (`ios_base::failbit` lives in MSVC's `_Iosb<int>` base), so the base chain
+                // contributes every member the class itself does not shadow.
+                std::vector<const VarDecl*> staticDataMembers;
+                std::set<std::string> staticDataMemberNames;
+                auto collectStaticDataMembers = [&](const CXXRecordDecl* rd, auto&& self) -> void {
+                    for (const Decl* d : rd->decls())
+                    {
+                        const auto* vd = llvm::dyn_cast<VarDecl>(d);
+                        if (vd == nullptr || !vd->isStaticDataMember()
+                            || vd->getIdentifier() == nullptr)
+                            continue;
+                        if (staticDataMemberNames.insert(vd->getNameAsString()).second)
+                            staticDataMembers.push_back(vd);
+                    }
+                    for (const CXXBaseSpecifier& base : rd->bases())
+                    {
+                        if (base.getAccessSpecifier() != clang::AS_public) continue;
+                        const CXXRecordDecl* baseDecl = base.getType()->getAsCXXRecordDecl();
+                        if (baseDecl == nullptr || baseDecl->getDefinition() == nullptr) continue;
+                        self(baseDecl->getDefinition(), self);
+                    }
+                };
+                collectStaticDataMembers(cxx, collectStaticDataMembers);
+
+                for (const VarDecl* vd : staticDataMembers)
                 {
-                    const auto* vd = llvm::dyn_cast<VarDecl>(d);
-                    if (vd == nullptr || !vd->isStaticDataMember()) continue;
-                    if (vd->getIdentifier() == nullptr) continue;
                     // A non-constexpr `static const T k = 41;` initialized IN CLASS has no symbol
                     // to link against (odr-use is ill-formed), so fold it exactly like constexpr.
                     const bool foldsFromInClassInit =
@@ -3876,9 +3951,12 @@ namespace cflat_cinterop
                         const clang::MethodVFTableLocation loc =
                             microsoft->getMethodVFTableLocation(
                                 dd != nullptr ? GlobalDecl(dd, deleting) : GlobalDecl(md));
-                        if (loc.VBase == nullptr && loc.VFPtrOffset.isZero())
+                        // Mirror MicrosoftCXXABI::adjustThisArgumentForVirtualFunctionCall.
+                        // Virtual bases stay refused because their vfptr offset is not constant.
+                        if (loc.VBase == nullptr)
                         {
                             m.vtableIndex = (int)loc.Index;
+                            m.vtableOffsetBytes = loc.VFPtrOffset.getQuantity();
                             if (dd != nullptr) m.vtableIndexDeleting = (int)loc.Index;
                         }
                     }
@@ -4025,6 +4103,37 @@ namespace cflat_cinterop
                     return def;
                 }
 
+                static bool InvalidRecord(const CXXRecordDecl* rd)
+                {
+                    if (rd == nullptr) return false;
+                    const CXXRecordDecl* def = rd->getDefinition();
+                    return rd->isInvalidDecl() || (def != nullptr && def->isInvalidDecl());
+                }
+
+                /*
+                 * An expression can be error-free and still name an INVALID record: a class
+                 * template instantiated while a template argument was incomplete (the earlier
+                 * chunk's `std::map<int, Leaf>` with `Leaf` forward-declared) is marked invalid
+                 * and keeps its members' bodies, but CodeGen asserts the moment one of those
+                 * bodies asks for its layout. Such a body must stay unrequested like an error body.
+                 */
+                static bool TouchesInvalidRecord(const Expr* expr)
+                {
+                    if (expr->containsErrors()) return true;
+                    QualType type = expr->getType();
+                    if (type.isNull()) return false;
+                    if (InvalidRecord(type->getAsCXXRecordDecl())) return true;
+                    if (InvalidRecord(type->getPointeeCXXRecordDecl())) return true;
+                    if (const auto* member = llvm::dyn_cast<MemberExpr>(expr))
+                    {
+                        const ValueDecl* vd = member->getMemberDecl();
+                        if (vd->isInvalidDecl()) return true;
+                        if (InvalidRecord(llvm::dyn_cast<CXXRecordDecl>(vd->getDeclContext())))
+                            return true;
+                    }
+                    return false;
+                }
+
                 std::string OwnCause(const FunctionDecl* def) const
                 {
                     if (poisoned != nullptr)
@@ -4064,7 +4173,7 @@ namespace cflat_cinterop
                         bool found = false;
                         bool VisitExpr(Expr* expr)
                         {
-                            found = found || expr->containsErrors();
+                            found = found || TouchesInvalidRecord(expr);
                             return !found;
                         }
                     } visitor;
@@ -4092,7 +4201,7 @@ namespace cflat_cinterop
 
                         bool VisitExpr(Expr* expr)
                         {
-                            found = found || expr->containsErrors();
+                            found = found || TouchesInvalidRecord(expr);
                             return !found;
                         }
                         bool VisitCallExpr(CallExpr* call)
@@ -4317,12 +4426,12 @@ namespace cflat_cinterop
             // definitions explicitly so CodeGen emits their linkonce_odr storage.
             struct UsedStaticVarVisitor : RecursiveASTVisitor<UsedStaticVarVisitor>
             {
-                ExtractState& state;
+                std::vector<const VarDecl*>& work;
                 std::unordered_set<const VarDecl*> seen;
 
-                explicit UsedStaticVarVisitor(ExtractState& s) : state(s)
+                explicit UsedStaticVarVisitor(std::vector<const VarDecl*>& w) : work(w)
                 {
-                    for (const VarDecl* vd : state.varEmitWork) seen.insert(vd);
+                    for (const VarDecl* vd : work) seen.insert(vd);
                 }
 
                 bool shouldVisitTemplateInstantiations() const { return true; }
@@ -4334,26 +4443,36 @@ namespace cflat_cinterop
                         return true;
                     const VarDecl* definition = vd->getDefinition();
                     if (definition == nullptr) definition = vd;
-                    if (seen.insert(definition).second)
-                        state.varEmitWork.push_back(definition);
+                    if (seen.insert(definition).second) work.push_back(definition);
                     return true;
                 }
-            } usedStaticVars(st);
+            } usedStaticVars(st.varEmitWork);
             usedStaticVars.TraverseDecl(root);
-            for (Decl* d : st.announcedDecls) usedStaticVars.TraverseDecl(d);
+            for (Decl* d : st.requestDecls) usedStaticVars.TraverseDecl(d);
 
-            for (const VarDecl* vd : st.varEmitWork)
-                if (vd != nullptr && !declHasErrors(vd))
+            auto handOverStaticVar = [&](const VarDecl* vd) {
+                if (vd == nullptr || declHasErrors(vd)) return;
+                if (st.req.emitDefinitions && isDependentCodeGenDecl(vd))
                 {
-                    if (st.req.emitDefinitions && isDependentCodeGenDecl(vd))
-                    {
-                        if (st.req.verbose)
-                            std::cout << "[verbose]   skipped dependent C++ static variable "
-                                      << vd->getQualifiedNameAsString() << "\n";
-                        continue;
-                    }
-                    cg.HandleTopLevelDecl(DeclGroupRef(const_cast<VarDecl*>(vd)));
+                    if (st.req.verbose)
+                        std::cout << "[verbose]   skipped dependent C++ static variable "
+                                  << vd->getQualifiedNameAsString() << "\n";
+                    return;
                 }
+                cg.HandleTopLevelDecl(DeclGroupRef(const_cast<VarDecl*>(vd)));
+            };
+            for (const VarDecl* vd : st.varEmitWork) handOverStaticVar(vd);
+            /*
+             * A live Interpreter: a static data member an EARLIER chunk used sits in the shared
+             * roots with its used-bit set. Hand it to CodeGen so a body emitted here can still
+             * reach its storage, but do not request it (Phase 2 below): only what this module
+             * references gets emitted.
+             */
+            std::vector<const VarDecl*> sharedVarWork(st.varEmitWork);
+            UsedStaticVarVisitor sharedStaticVars(sharedVarWork);
+            for (Decl* d : st.sharedDecls) sharedStaticVars.TraverseDecl(d);
+            for (size_t i = st.varEmitWork.size(); i < sharedVarWork.size(); ++i)
+                handOverStaticVar(sharedVarWork[i]);
 
             // Phase 2: reference what cflat binds so the deferred bodies become emission work.
             auto request = [&](GlobalDecl gd) { cg.GetAddrOfGlobal(gd, /*isForDefinition*/ false); };
@@ -4480,7 +4599,16 @@ namespace cflat_cinterop
                 }
             } usedFunctions(usedFunctionWork);
             usedFunctions.TraverseDecl(root);
-            for (Decl* d : st.announcedDecls) usedFunctions.TraverseDecl(d);
+            for (Decl* d : st.requestDecls) usedFunctions.TraverseDecl(d);
+            // Members resolved by an earlier chunk are emitted through Phase 2, not announced
+            // now; their bodies still seed the reach closure below.
+            for (const auto& w : st.memberAbiWork)
+            {
+                const FunctionDecl* body = nullptr;
+                if (w.md != nullptr && w.md->hasBody(body) && body != nullptr
+                    && !isDependentCodeGenDecl(w.md))
+                    usedFunctions.TraverseDecl(const_cast<FunctionDecl*>(body));
+            }
             /*
              * The TU walk never enters a member of an `extern template` specialization, yet its
              * hidden inline members (libc++ basic_string::__grow_by_without_replace) are lowered
@@ -4497,17 +4625,38 @@ namespace cflat_cinterop
                 if (linkage != GVA_DiscardableODR && linkage != GVA_Internal) continue;
                 usedFunctions.TraverseStmt(body->getBody());
             }
-            for (const FunctionDecl* fd : usedFunctionWork)
-            {
-                // A prototype or class over an invalid record has no layout to arrange.
+            // A prototype or class over an invalid record has no layout to arrange.
+            auto overInvalidRecord = [](const FunctionDecl* fd) {
                 const auto* method = llvm::dyn_cast<CXXMethodDecl>(fd);
                 const auto* proto = fd->getType()->getAs<FunctionProtoType>();
-                if ((method != nullptr && method->getParent()->isInvalidDecl())
-                    || (proto != nullptr && ProtoHasInvalidRecord(proto)))
-                    continue;
+                return (method != nullptr && method->getParent()->isInvalidDecl())
+                    || (proto != nullptr && ProtoHasInvalidRecord(proto));
+            };
+            for (const FunctionDecl* fd : usedFunctionWork)
+            {
+                if (overInvalidRecord(fd)) continue;
                 cg.HandleTopLevelDecl(DeclGroupRef(const_cast<FunctionDecl*>(fd)));
                 cg.GetAddrOfGlobal(GlobalDecl(const_cast<FunctionDecl*>(fd)),
                                    /*isForDefinition*/ true);
+            }
+            /*
+             * A live Interpreter: every specialization an EARLIER chunk instantiated hangs off
+             * the shared header templates with its used-bit set, and CodeGen emits a free
+             * function only if it was handed the declaration. Register each one lazily - no
+             * address request - so it is emitted only when a body in THIS module calls it.
+             * Requesting them all is what made each request's module carry every body the
+             * group ever emitted (and a cache entry keyed on one request link another
+             * program's thunks).
+             */
+            if (!st.sharedDecls.empty())
+            {
+                std::vector<const FunctionDecl*> sharedWork;
+                UsedFunctionVisitor sharedFunctions(sharedWork);
+                sharedFunctions.seen = usedFunctions.seen;
+                for (Decl* d : st.sharedDecls) sharedFunctions.TraverseDecl(d);
+                for (const FunctionDecl* fd : sharedWork)
+                    if (!overInvalidRecord(fd))
+                        cg.HandleTopLevelDecl(DeclGroupRef(const_cast<FunctionDecl*>(fd)));
             }
             /*
              * A vtable belongs to exactly ONE translation unit: the Itanium ABI anchors it in the
@@ -4581,12 +4730,7 @@ namespace cflat_cinterop
                         continue;
                     RawCxxMember& m = st.out.records[w.recordIdx].members[w.memberIdx];
                     if (!m.needsLocalDefinition || w.md == nullptr) continue;
-                    if (w.md->getTemplateSpecializationKind()
-                            == clang::TSK_ExplicitInstantiationDeclaration
-                        && w.md->isExternallyVisible()
-                        && w.md->getVisibility() == clang::DefaultVisibility
-                        && !w.md->hasAttr<clang::ExcludeFromExplicitInstantiationAttr>())
-                        m.needsLocalDefinition = false;
+                    if (LibraryOwnsMemberSymbol(w.md)) m.needsLocalDefinition = false;
                 }
                 return;
             }
@@ -4620,7 +4764,10 @@ namespace cflat_cinterop
                     m.abi = RawAbi{};
                     continue;
                 }
-                if (!m.needsLocalDefinition || m.linkageName.empty()) continue;
+                if (!m.needsLocalDefinition) continue;
+                if (m.linkageName.empty() && w.md != nullptr)
+                    m.linkageName = CxxLinkageName(ctx, MemberGlobalDecl(w.md));
+                if (m.linkageName.empty()) continue;
                 /*
                  * getNamedValue, not getFunction: on Itanium the COMPLETE-object destructor (D1) of
                  * a class with no virtual bases is emitted as a GlobalAlias onto the base-object
@@ -4633,22 +4780,7 @@ namespace cflat_cinterop
                 const auto* fn = llvm::dyn_cast_or_null<llvm::Function>(gv);
                 if (fn != nullptr && !fn->isDeclaration())
                     m.needsLocalDefinition = false;   // the companion module carries the body
-                /*
-                 * An EXPLICIT INSTANTIATION DECLARATION (`extern template class basic_string<char>;`
-                 * in libc++) says the bound library owns this specialization's symbols: Clang
-                 * deliberately emits a reference rather than a body, and a real C++ translation unit
-                 * links against the library's copy. Trust it the same way - but only when the
-                 * library really does export it. isExternallyVisible() is about LINKAGE, so a
-                 * _LIBCPP_HIDE_FROM_ABI member (hidden visibility, excluded from the explicit
-                 * instantiation, deliberately absent from libc++.dylib) satisfies it while having no
-                 * symbol anywhere. Trusting that turns a compile-time refusal into a link-time
-                 * "undefined symbol", so require default visibility and no exclusion attribute.
-                 */
-                else if (w.md->getTemplateSpecializationKind()
-                             == clang::TSK_ExplicitInstantiationDeclaration
-                         && w.md->isExternallyVisible()
-                         && w.md->getVisibility() == clang::DefaultVisibility
-                         && !w.md->hasAttr<clang::ExcludeFromExplicitInstantiationAttr>())
+                else if (LibraryOwnsMemberSymbol(w.md))
                     m.needsLocalDefinition = false;
                 else
                 {
@@ -4812,6 +4944,7 @@ namespace cflat_cinterop
                             if (pl.isInvalid() || !PathInScope(pl.getFilename(), st.normDirs)) continue;
                         }
                         st.announcedDecls.push_back(d);
+                        st.requestDecls.push_back(d);
                     }
                 return true;
             }
@@ -4941,6 +5074,11 @@ namespace cflat_cinterop
                 // windows.h parse. The CLI batch and the LSP re-extract on every signature-cache
                 // eviction, so this must free (clangd resets the same flag).
                 invocationUP->getFrontendOpts().DisableFree = false;
+                // A destructor whose body only forwards to its single base is normally folded
+                // into that base destructor (-mconstructor-aliases): Clang replaces every use and
+                // erases the symbol, so a companion module ends up with NO symbol for a class
+                // whose destructor cflat binds by name. Emit the forwarding body instead.
+                invocationUP->getCodeGenOpts().CXXCtorDtorAliases = false;
                 invocation.reset(invocationUP.release());
             }
 
@@ -5000,20 +5138,34 @@ namespace cflat_cinterop
             &target.getLongDoubleFormat() == &llvm::APFloat::IEEEdouble();
         out.targetTriple = target.getTriple().str();
         if (req.emitDefinitions && headerRoot != nullptr)
-        {
-            for (clang::Decl* decl : headerRoot->decls()) st.announcedDecls.push_back(decl);
-        }
+            for (clang::Decl* decl : headerRoot->decls())
+            {
+                st.announcedDecls.push_back(decl);
+                st.sharedDecls.push_back(decl);
+            }
         if (req.emitDefinitions && root != headerRoot)
-            for (clang::Decl* decl : root->decls()) st.announcedDecls.push_back(decl);
+            for (clang::Decl* decl : root->decls())
+            {
+                st.announcedDecls.push_back(decl);
+                st.requestDecls.push_back(decl);
+            }
         // The includes this request committed as their own chunk; a request TU parses them
         // inline, so their decls are announced like the request's own.
         if (req.emitDefinitions && preludeRoot != nullptr && preludeRoot != headerRoot)
-            for (clang::Decl* decl : preludeRoot->decls()) st.announcedDecls.push_back(decl);
+            for (clang::Decl* decl : preludeRoot->decls())
+            {
+                st.announcedDecls.push_back(decl);
+                st.sharedDecls.push_back(decl);
+            }
         // What Sema announced while parsing this chunk: implicit instantiations and the members
         // an explicit instantiation defines, none of which are children of the chunk's root.
         if (req.emitDefinitions && announcedDecls != nullptr)
+        {
             st.announcedDecls.insert(st.announcedDecls.end(), announcedDecls->begin(),
                                      announcedDecls->end());
+            st.requestDecls.insert(st.requestDecls.end(), announcedDecls->begin(),
+                                   announcedDecls->end());
+        }
         if (preludeRoot != nullptr && preludeRoot != headerRoot && preludeRoot != root)
             HarvestTranslationUnit(st, ci.getASTContext(), preludeRoot, false, false);
         if (headerRoot != nullptr && headerRoot != root)

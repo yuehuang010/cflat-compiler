@@ -13034,7 +13034,7 @@ int setAndReadChainedAssign(Resource* value)
 // An address into a `new` temporary that leaves the full expression keeps it alive: returned
 // through a '?:' arm, laundered through an integer, or fed to a call through a '?:' arm.
 int* addrTempTernary(int c) { return c > 0 ? &(new Resource())->id : nullptr; }
-int* addrTempLaundered() { return (int*)(long)&(new Resource())->id; }
+int* addrTempLaundered() { return (int*)(i64)&(new Resource())->id; }
 // Frees seen while the callee reads: an arm that already freed its temp reads 1, not 0.
 int addrTempDtorsAtRead(int* p) { return *p + dtorCount; }
 struct AddrTempRef { int* p = nullptr; };
@@ -13065,7 +13065,7 @@ int testAddressIntoNewTemp()
     passed += Test("amt_brace_arg_read_then_freed", braceRead * 10 + dtorCount, 1);
     // Integer address used only by a compare: freed, not kept alive.
     dtorCount = 0;
-    bool intNonZero = (long)&(new Resource())->id != 0;
+    bool intNonZero = (i64)&(new Resource())->id != 0;
     passed += Test("amt_int_compare_freed", intNonZero ? dtorCount : -1, 1);
     return passed;
 }

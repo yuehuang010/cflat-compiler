@@ -313,6 +313,7 @@ namespace cflat_cinterop
          */
         int vtableIndex = -1;
         int vtableIndexDeleting = -1;
+        int64_t vtableOffsetBytes = 0;
         int access = AccessPublic;
         RawAbi abi;
         std::string file;

@@ -748,9 +748,18 @@ bool LLVMBackend::CxxReferenceArgumentMatches(const TypeAndValue& param,
             referent.IsRvalueRef = false;
             return arg.BaseType != nullptr && GetType(referent) == arg.BaseType;
         }
-        if (!arg.TypeAndValue.Pointer && arg.TypeAndValue.TypeName == "std.string"
-            && (param.TypeName == "string" || param.TypeName == "void"))
-            return true;
+        // A C++ signature can expand a typedef while the CFlat argument keeps the alias identity.
+        // Compare their canonical foreign spellings so the same specialization matches either way.
+        if (!arg.TypeAndValue.Pointer && !arg.TypeAndValue.TypeName.empty()
+            && !param.TypeName.empty())
+        {
+            std::string paramSpelling;
+            std::string argSpelling;
+            if (CxxSpellingForCflatType(param.TypeName, paramSpelling)
+                && CxxSpellingForCflatType(arg.TypeAndValue.TypeName, argSpelling)
+                && SqueezeCxxSpelling(paramSpelling) == SqueezeCxxSpelling(argSpelling))
+                return true;
+        }
         if (arg.Storage == nullptr && arg.BaseType != nullptr
             && !arg.BaseType->isStructTy()
             && !IsForeignCxxClassWithConstructors(param.TypeName)

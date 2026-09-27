@@ -10,6 +10,12 @@ int count(std.deque<cpin.Opaque>* p) { return p->empty() ? 0 : (int)p->size(); }
 
 int touch(std.deque<cpin.Opaque>* p)
 {
+    if const (__WINDOWS__) {
+        expect_error("no instantiation of C++ function template 'cpin.SignatureFailure$cpin.MissingMemberType.begin' accepts these argument types (cpin.SignatureFailure$cpin.MissingMemberType) (clang: no matching member function for call to 'begin')") {
+            cpin.SignatureFailure<cpin.MissingMemberType>* broken = nullptr;
+            broken->begin();
+        }
+    } else {
     expect_error("member 'begin' of C++ class 'std.deque<cpin.Opaque>' has a signature clang could not instantiate for these template arguments") {
         auto it = p->begin();
     }
@@ -19,6 +25,7 @@ int touch(std.deque<cpin.Opaque>* p)
     // cbegin was refused before as "clang emitted no body for it".
     expect_error("member 'cbegin' of C++ class 'std.deque<cpin.Opaque>' has a signature clang could not instantiate for these template arguments") {
         auto it = p->cbegin();
+    }
     }
     return count(p);
 }

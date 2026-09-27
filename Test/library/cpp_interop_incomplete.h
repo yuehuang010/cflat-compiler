@@ -6,4 +6,11 @@
 namespace cpin
 {
     struct Opaque;
+    struct MissingMemberType;
+    template <typename T>
+    struct SignatureFailure
+    {
+        template <typename U = T>
+        typename U::MissingType begin();
+    };
 }

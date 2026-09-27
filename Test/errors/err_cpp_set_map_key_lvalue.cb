@@ -15,10 +15,18 @@ import cpp "cpp_interop_lvalue_sink.h";
 extern int main()
 {
     // clang's copy diagnostic arises in the header harvest, where it is not captured.
+    if const (__WINDOWS__) {
+        expect_error("parameter '_Val' of 'insert' is an rvalue reference") {
+            std.set<cplv.Key> keys = default;
+            cplv.Key local = cplv.Key(4);
+            keys.insert(local);
+        }
+    } else {
     expect_error("parameter '__v' of 'insert' is an rvalue reference; pass 'move <arg>' or a temporary") {
         std.set<cplv.Key> keys = default;
         cplv.Key local = cplv.Key(4);
         keys.insert(local);
+    }
     }
     // clang rejects insert<P> on is_constructible and never names a copy constructor.
     expect_error("no instantiation of C++ function template 'std.map$cplv.Key$int.insert' accepts these argument types (std.map$cplv.Key$int, std.pair$cplv.Key$int) (clang: no matching member function for call to 'insert')") {
@@ -26,9 +34,16 @@ extern int main()
         std.pair<cplv.Key, int> entry = std.make_pair(cplv.Key(4), 7);
         table.insert(entry);
     }
+    if const (__WINDOWS__) {
+    expect_error("cannot copy C++ class 'KeyCheck' into constructor parameter '_Val'") {
+        KeyCheck local = KeyCheck(4);
+        std.vector<KeyCheck> values = std.vector<KeyCheck>(3, local);
+    }
+    } else {
     expect_error("cannot copy C++ class 'KeyCheck' into constructor parameter '__x'") {
         KeyCheck local = KeyCheck(4);
         std.vector<KeyCheck> values = std.vector<KeyCheck>(3, local);
+    }
     }
     return 0;
 }

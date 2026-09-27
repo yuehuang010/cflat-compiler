@@ -2338,6 +2338,7 @@ nlohmann::json LLVMBackend::CxxMemberToJson(
         // member as a DIRECT call, which silently skips every override.
         if (m.vtableIndex >= 0)         j["vti"] = m.vtableIndex;
         if (m.vtableIndexDeleting >= 0) j["vtd"] = m.vtableIndexDeleting;
+        if (m.vtableOffsetBytes != 0) j["vto"] = m.vtableOffsetBytes;
         if (m.access != 0)          j["ac"] = m.access;
         if (m.abi.valid)            j["abi"] = AbiToJson(m.abi);
         if (!m.defaultArgs.empty())
@@ -2389,6 +2390,7 @@ cflat_cinterop::RawCxxMember LLVMBackend::CxxMemberFromJson(
         m.covariantReturnNeedsAdjust = j.value("cra", false);
         m.vtableIndex          = j.value("vti", -1);
         m.vtableIndexDeleting  = j.value("vtd", -1);
+        m.vtableOffsetBytes    = j.value("vto", int64_t{0});
         m.access               = j.value("ac", 0);
         if (j.contains("abi")) m.abi = AbiFromJson(j["abi"]);
         if (j.contains("defaults"))

@@ -29,6 +29,7 @@
 #include <llvm/Support/JSON.h>
 #include <llvm/IR/DiagnosticInfo.h>
 #include <llvm/IR/DiagnosticHandler.h>
+#include <llvm/ADT/SmallVector.h>
 #pragma warning(pop)
 #include <antlr4-runtime.h>
 
@@ -5208,6 +5209,16 @@ llvm::CallBase* LLVMBackend::CreateCallOrInvoke(llvm::FunctionType* fnTy, llvm::
             auto* lp = builder->CreateLandingPad(lpTy, 0, "unwind.lp");
             lp->setCleanup(true);
             pad = lp;
+        }
+        llvm::IRBuilderBase::OperandBundlesGuard operandBundlesGuard(*builder);
+        llvm::SmallVector<llvm::Value*, 1> funcletInputs;
+        llvm::SmallVector<llvm::OperandBundleDef, 1> funcletBundles;
+        if (auto* cleanupPad = llvm::dyn_cast<llvm::CleanupPadInst>(pad))
+        {
+            // Calls in a Windows cleanup funclet must name its token; landingpads have none.
+            funcletInputs.push_back(cleanupPad);
+            funcletBundles.emplace_back("funclet", funcletInputs);
+            builder->setDefaultOperandBundles(funcletBundles);
         }
         // The object under construction first (newest entry first), as C++ unwinds a
         // constructor's finished subobjects before the full-expression's temporaries.

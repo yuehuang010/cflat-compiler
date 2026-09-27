@@ -229,7 +229,8 @@ REM Top-level fixtures with a `.cb.flags` sidecar are discovered one at a time, 
 for %%F in (%SRC%\errors\err_*.cb) do if exist "%%F.flags" (
     call :LoadPolicyFlags "%%F"
     %COMPILER% --locale pseudo --update-locale en-pseudo --locale-dir "%CFLAT_LOCALE_DIR%" --check -i %LIB% --nologo !POLICY_FLAGS! "%%F"
-    if errorlevel 1 exit /b 1
+    REM A fixture declaring expect_exit=nonzero (e.g. a rejected CLI flag) fails by design.
+    if errorlevel 1 if /I not "!POLICY_EXPECT_EXIT!"=="nonzero" exit /b 1
 )
 if /I "!CFLAT_POLICY_SUPPORTED!"=="0" (
     for %%F in (%SRC%\errors\policy\err_*.cb) do if exist "%%F" echo SKIP: policy\%%~nF.cb - --isolated is not supported on this host

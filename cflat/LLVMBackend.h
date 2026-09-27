@@ -5283,8 +5283,8 @@ private:
     // whether by call or by function pointer. By default such a call is allowed and unwinds
     // through CFlat frames via CreateCallOrInvoke's cleanup landing pads.
     void RejectThrowingCxxFunction(const FunctionSymbol& symbol, const std::string& displayName) const;
-    // The target's EH personality: __C_specific_handler on Win64 (the SEH routine the `program`
-    // trampoline also installs), __gxx_personality_v0 on Itanium targets, null on Win32.
+    // The target's EH personality: C++ handler for Windows cleanup frames, otherwise the SEH or
+    // Itanium handler used by the target's other cleanup scopes; null on Win32.
     llvm::Function* GetTargetEhPersonality();
     // True when a call to `symbol` can unwind: a C++ declaration without noexcept, or any CFlat
     // function (it may reach one transitively). C declarations and body-less externs cannot.
@@ -5374,6 +5374,7 @@ private:
     bool UnwindTempConsumedByCall(llvm::Value* v) const;
     llvm::Function* EnsureCxxProgramEhGuard(const std::string& programName);
     static std::string SqueezeCxxSpelling(const std::string& spelling);
+    std::string CanonicalizeCxxUniquePtrSpelling(const std::string& spelling) const;
     // `iterator -> const_iterator`: same template, `const` added to a pointer template argument.
     bool IsCxxConstAddedPointerSpecialization(const std::string& argSpelling,
                                               const std::string& paramSpelling) const;
@@ -8125,9 +8126,8 @@ public:
      * CFlat interface table - dispatch is an explicit vptr load plus an index Clang computed.
      */
 
-    // Linkage name of a VIRTUAL C++ member -> its Itanium vtable slot. A resolved callee found
-    // here is dispatched through the receiver's vptr instead of called by symbol.
-    std::map<std::string, int> cxxVirtualSlotByLinkage_;
+    // Linkage name of a VIRTUAL C++ member -> {vtable slot, vfptr offset in its class}.
+    std::map<std::string, std::pair<int, int64_t>> cxxVirtualSlotByLinkage_;
     // "<receiver CFlat type>#<callee linkage name>" -> bytes to add to `this` before the call,
     // for a member INHERITED from a base whose subobject is not at offset 0.
     std::map<std::string, uint64_t> cxxThisAdjust_;
@@ -8152,12 +8152,11 @@ public:
     // null-preserving, and Clang emits exactly this select.
     llvm::Value* EmitCxxBaseAdjust(llvm::Value* ptr, uint64_t offsetBytes);
     /*
-     * The callee for one virtual call: load the vptr from `thisPtr` (which the caller has already
-     * adjusted to the subobject that declares the member), index it by the member's slot, and
-     * load the function pointer. Returns null when `candidate` is not virtual, i.e. the direct
-     * symbol call stands.
+     * Load a virtual member's function pointer and return its vfptr-subobject `this` through
+     * adjustedThis. Mirrors MicrosoftCXXABI::adjustThisArgumentForVirtualFunctionCall.
      */
-    llvm::Value* EmitCxxVirtualCallee(const FunctionSymbol& candidate, llvm::Value* thisPtr);
+    llvm::Value* EmitCxxVirtualCallee(const FunctionSymbol& candidate, llvm::Value* thisPtr,
+                                      llvm::Value** adjustedThis);
     /*
      * Implicit derived-to-base conversion on a STORE (declaration initializer or `=`): when `src`
      * is a pointer to a class that publicly derives from `dest`'s class, shift it to that base
@@ -9070,6 +9069,8 @@ public:
     int CompareCxxConversionRanks(const std::vector<CxxConversionRank>& a,
                                   const std::vector<CxxConversionRank>& b, bool& crossing) const;
     std::string IntegerParameterIdentity(const TypeAndValue& param) const;
+    std::string CxxIntegerParameterIdentity(const FunctionSymbol& candidate, size_t index,
+                                             const TypeAndValue& param) const;
     static int RankIntegerConversion(const std::string& argIdentity, const std::string& paramIdentity);
 
     // How a call site's arguments bind to declared parameter slots (see ComputeArgumentPositions).
@@ -10192,7 +10193,8 @@ public:
     // 96: generated [cpp] member helpers now expose non-override methods to C++ templates.
     // 97: default-argument wrappers skip ambiguous shortened calls, dedupe, move by-value args.
     // 101: an incremental request drops declarations its own includes do not reach.
-    static constexpr int kCHeaderCacheVersion = 101;
+    // 102: MS ABI implicit dtors bind to the emitted base dtor; MSVC unique_ptr move members.
+    static constexpr int kCHeaderCacheVersion = 102;
     static std::string CompilerBuildStamp();
 
     static std::string GetCHeaderCacheDir();

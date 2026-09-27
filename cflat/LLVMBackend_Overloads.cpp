@@ -247,6 +247,49 @@ std::string LLVMBackend::IntegerParameterIdentity(const TypeAndValue& param) con
         return name;
 }
 
+// C++ member ranking needs declared integer identity, which widths cannot distinguish on Windows.
+std::string LLVMBackend::CxxIntegerParameterIdentity(const FunctionSymbol& candidate, size_t index,
+                                                      const TypeAndValue& param) const
+{
+        if (param.Pointer || param.IsArrayView || param.ConstArraySize > 0 || param.IsSimd
+            || param.IsFunctionPointer || param.IsInterface || param.IsCxxRefToPointer)
+            return "";
+        static const std::pair<const char*, const char*> identities[] = {
+            {"char", "char"}, {"signedchar", "i8"}, {"unsignedchar", "u8"},
+            {"short", "short"}, {"shortint", "short"}, {"signedshort", "short"},
+            {"signedshortint", "short"}, {"unsignedshort", "u16"},
+            {"unsignedshortint", "u16"}, {"int", "int"}, {"signed", "int"},
+            {"signedint", "int"}, {"unsigned", "uint"}, {"unsignedint", "uint"},
+            {"long", "long"}, {"longint", "long"}, {"signedlong", "long"},
+            {"signedlongint", "long"}, {"unsignedlong", "ulong"},
+            {"unsignedlongint", "ulong"}, {"longlong", "i64"},
+            {"longlongint", "i64"}, {"signedlonglong", "i64"},
+            {"signedlonglongint", "i64"}, {"unsignedlonglong", "u64"},
+            {"unsignedlonglongint", "u64"}
+        };
+        auto identityFromSpelling = [&](const std::string& spelling) -> std::string {
+            std::string compact;
+            compact.reserve(spelling.size());
+            for (char c : spelling)
+                if (!std::isspace((unsigned char)c)) compact += c;
+            while (compact.ends_with("&&") || compact.ends_with('&'))
+                compact.resize(compact.size() - (compact.ends_with("&&") ? 2 : 1));
+            if (compact.starts_with("const")) compact.erase(0, 5);
+            if (compact.starts_with("volatile")) compact.erase(0, 8);
+            if (compact.find('*') != std::string::npos) return {};
+            for (const auto& [spelling, identity] : identities)
+                if (compact == spelling) return identity;
+            return {};
+        };
+        const std::string declaredSpelling = CxxReferenceParameterSpelling(candidate, index);
+        if (declaredSpelling.find('*') != std::string::npos) return "";
+        if (std::string identity = identityFromSpelling(declaredSpelling); !identity.empty())
+            return identity;
+
+        const std::string integerIdentity = IntegerParameterIdentity(param);
+        return integerIdentity.empty() ? param.TypeName : integerIdentity;
+}
+
 /*
  * A call argument keeps its integer identity in one of three places: TypeName (unsigned values and
  * enums keep it), InferSourceTypeName (the call site drops a signed primitive's TypeName on
@@ -320,8 +363,7 @@ int LLVMBackend::RankIntegerConversion(const std::string& argIdentity, const std
  * other class binding stay -1, so a candidate carrying one is never compared. Rank -2 marks the
  * implicit object parameter of a member, equal only to another member's.
  */
-// The declaration a default-argument wrapper (`__cflat_dflt_<linkage>_<omitted>`) forwards
-// to; any other name is returned unchanged.
+// Recover the original decorated declaration name from a generated default-argument wrapper.
 static std::string CxxDeclarationLinkageName(std::string name)
 {
         constexpr std::string_view prefix = "__cflat_dflt_";
@@ -333,7 +375,29 @@ static std::string CxxDeclarationLinkageName(std::string name)
                    return c >= '0' && c <= '9'; }))
             return name;
         name.resize(suffix);
-        return name;
+        std::string linkage;
+        linkage.reserve(name.size());
+        auto hexValue = [](char c) -> int {
+            if (c >= '0' && c <= '9') return c - '0';
+            if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+            return -1;
+        };
+        for (size_t i = 0; i < name.size(); ++i)
+        {
+            if (name[i] == '_' && i + 2 < name.size())
+            {
+                const int high = hexValue(name[i + 1]);
+                const int low = hexValue(name[i + 2]);
+                if (high >= 0 && low >= 0)
+                {
+                    linkage += (char)((high << 4) | low);
+                    i += 2;
+                    continue;
+                }
+            }
+            linkage += name[i];
+        }
+        return linkage;
 }
 
 /*
@@ -454,22 +518,23 @@ std::vector<LLVMBackend::CxxConversionRank> LLVMBackend::RankCxxConversionSequen
             const NamedVariable& arg = arguments[i];
             const TypeAndValue& param = candidate.Parameters[i];
             CxxConversionRank& out = ranks[i];
-            // The implicit object parameter (`this` on an imported C++ member); its cv-qualifier
-            // comes from the Itanium mangling, and a name that does not show it stays unjudged.
+            // Rank the implicit object parameter for imported C++ members.
             if (candidate.IsMethod && i == 0
                 && (param.VariableName.ends_with("__") || (candidate.IsCxx && param.VariableName == "this")))
             {
                 // Judged for a receiver of the member's class or of a class derived from it; a
                 // default-argument wrapper carries its declaration's qualifiers.
-                const std::string declared = CxxDeclarationLinkageName(candidate.UniqueName);
                 const std::string& receiver = arg.TypeAndValue.TypeName;
-                if (declared.starts_with("_ZN")
-                    && (receiver == param.TypeName
-                        || (IsCxxRecord(receiver) && IsCxxRecord(param.TypeName)
-                            && IsCxxBaseOf(param.TypeName, receiver))))
+                if (receiver == param.TypeName
+                    || (IsCxxRecord(receiver) && IsCxxRecord(param.TypeName)
+                        && IsCxxBaseOf(param.TypeName, receiver)))
                 {
                     out.rank = -2;
-                    out.second = declared.starts_with("_ZNK") ? 1 : 0;
+                    const std::string linkage = CxxDeclarationLinkageName(candidate.UniqueName);
+                    out.second = linkage.starts_with("_ZNK")
+                            || linkage.find("@@QEBA") != std::string::npos
+                            || linkage.find("@@UEBA") != std::string::npos
+                        ? 1 : 0;
                     out.objectRef = candidate.CxxRefQualifier;
                     out.from = param.TypeName;
                     out.cxxViable = true;
@@ -636,7 +701,8 @@ std::vector<LLVMBackend::CxxConversionRank> LLVMBackend::RankCxxConversionSequen
 
             if (reference && !constReference)
                 continue;
-            const std::string to = arithmeticName(param.TypeName);
+            const std::string to = arithmeticName(
+                CxxIntegerParameterIdentity(candidate, i, param));
             // An unscoped enum promotes to its promotion type; every other arithmetic target is a
             // conversion. A fixed underlying type narrower than int is a better promotion (4.2),
             // ranked 0 here since no other candidate can match an enum argument exactly.
@@ -1410,7 +1476,9 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                     // A reference parameter has no identity of its own; the arms above supply the
                     // referent's, so `const int&` outranks `const long long&` for an int literal.
                     const std::string paramIdentity = constRefReferentIdentity.empty()
-                        ? IntegerParameterIdentity(*candidateParamItr)
+                        ? (candidate.IsCxx
+                            ? CxxIntegerParameterIdentity(candidate, paramIndex, *candidateParamItr)
+                            : IntegerParameterIdentity(*candidateParamItr))
                         : constRefReferentIdentity;
                     if (!argIdentity.empty() && !paramIdentity.empty())
                     {
@@ -1592,6 +1660,7 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
             auto isTemplateCandidate = [](const FunctionSymbol& f) {
                 if (f.UniqueName.starts_with("__cflat_tpl_")) return true;
                 const std::string declared = CxxDeclarationLinkageName(f.UniqueName);
+                if (declared.starts_with('?')) return declared.starts_with("??$");
                 if (!declared.starts_with("_Z")) return false;
                 llvm::ItaniumPartialDemangler demangler;
                 if (demangler.partialDemangle(declared.c_str())) return false;
@@ -1648,6 +1717,7 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                 return false;
             };
             auto isTemplateSpecialization = [](const std::string& linkage) {
+                if (linkage.starts_with('?')) return linkage.starts_with("??$");
                 llvm::ItaniumPartialDemangler demangler;
                 if (demangler.partialDemangle(linkage.c_str())) return true;
                 char* name = demangler.getFunctionName(nullptr, nullptr);
@@ -4371,7 +4441,9 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                     CxxThisAdjustKey(candidate.Parameters[0].TypeName, candidate.UniqueName));
                 if (adj != cxxThisAdjust_.end())
                     argList[0] = EmitCxxBaseAdjust(argList[0], adj->second);
-                cxxVirtualCallee = EmitCxxVirtualCallee(candidate, argList[0]);
+                llvm::Value* adjustedThis = argList[0];
+                cxxVirtualCallee = EmitCxxVirtualCallee(candidate, argList[0], &adjustedThis);
+                if (cxxVirtualCallee != nullptr) argList[0] = adjustedThis;
             }
         }
 

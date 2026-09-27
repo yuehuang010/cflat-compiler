@@ -3706,6 +3706,14 @@ bool LLVMBackend::EmitExecutable(const std::string& exePath, const std::string& 
             }
         }
 
+        // Objects go BEFORE every archive. lld-link extracts an archive member the moment an
+        // object leaves its symbol undefined, so an archive named earlier than a later object
+        // that defines the same symbol (a C++ file replacing ::operator new, which msvcrt.lib
+        // carries as a plain object) would be a duplicate-symbol link error.
+        linkArgStrs.push_back(objPath);
+        // Merge any C/C++ objects compiled by clang-cl from .c/.cpp inputs.
+        for (auto& cObj : cObjectFiles_) linkArgStrs.push_back(cObj);
+
         // ucrt.lib is always needed - it is the import lib for the OS-resident Universal CRT.
         linkArgStrs.push_back("ucrt.lib");
         if (keepVcRuntime)
@@ -3747,9 +3755,6 @@ bool LLVMBackend::EmitExecutable(const std::string& exePath, const std::string& 
         // advapi32.lib provides OpenProcessToken/LookupPrivilegeValueA/AdjustTokenPrivileges
         // (core/os.windows.cb's huge-page privilege dance). Harmless when unreferenced.
         linkArgStrs.push_back("advapi32.lib");
-        linkArgStrs.push_back(objPath);
-        // Merge any C objects compiled by clang-cl from .c inputs.
-        for (auto& cObj : cObjectFiles_) linkArgStrs.push_back(cObj);
         // Prebuilt C import libraries (--c-lib): add each lib's dir as libpath, then name.
         // Keeps behavior uniform with system libs above.
         for (const auto& lib : cLinkLibs_)
