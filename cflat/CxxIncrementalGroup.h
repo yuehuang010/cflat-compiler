@@ -12,7 +12,9 @@ class CxxIncrementalGroup
 public:
     static std::unique_ptr<CxxIncrementalGroup> Create(
         const std::vector<std::string>& args, const std::string& headerSource,
-        bool verbose, std::string& error, bool tolerateDiagnostics = false);
+        bool verbose, std::string& error, bool tolerateDiagnostics = false,
+        const cflat_cinterop::ExtractRequest* macroReq = nullptr,
+        cflat_cinterop::ExtractResult* macroOut = nullptr);
 
     ~CxxIncrementalGroup();
 

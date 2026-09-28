@@ -27,6 +27,7 @@ namespace clang
     class Decl;
     class FunctionDecl;
     class CXXRecordDecl;
+    class Preprocessor;
 }
 
 namespace llvm
@@ -753,6 +754,12 @@ namespace cflat_cinterop
         unsigned headerErrors = 0;
         std::string firstHeaderError;            // "message at file:line" for the first such error
     };
+
+    // Attach the header-only macro collector to a live incremental preprocessor. The returned
+    // closure disables collection after the initial header chunk has been parsed.
+    std::function<void()> AttachCxxMacroPrepass(clang::Preprocessor& pp,
+                                                const ExtractRequest& req,
+                                                ExtractResult& out);
 
     // Parse the TU once and fill `out`. Returns false only on a hard failure to build a TU;
     // a TU produced with diagnostics still returns true (per-decl error recovery, like the

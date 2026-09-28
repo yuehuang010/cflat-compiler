@@ -26,6 +26,21 @@ uses), stage-2 per-request codegen re-emitting the group's whole free-function s
 
 **Idle-ish baseline (load 4.4, parity.sh N=1, 14:5x):** clang++ 3.67 s | warm 16.26 s (4.4x) | cold 86.12 s (23.5x).
 
+**Status 2026-09-28 12:25 (master bd1def8e, perf timebox 3, 09:40 -> 15:40).** parity.sh N=3, quiet
+machine: clang++ 3.26 s | cflat warm 0.46 s (0.15x, met) | cflat cold 5.26 s plain LLVM (1.6x) /
+4.29 s with a PGO-built LLVM (1.3x, scratch/pgo_llvm_notes.md, install llvm-23.1.0-pgo, ruling R2 in
+scratch/rulings_2026-09-28.md). Sibling programs (a different torch program after a cold one) 4.3-4.5 s
+(replay 33-40 chunks, was 111-124). Landed: 37f2c948 by-value gate projects only dtor + copy/move ctors
+(393 -> 111 request chunks, cold -1.05 s, warm -0.36 s), 20101f74 macro prepass folded into the chunk-0
+parse (cold -0.54 s), 53ac9fef emission walks (-25 ms), bd1def8e callback-ABI by-value slice (-0.04 s,
+62 fewer request files). Not landed: error-body sweep seeded by reachability (branch perf/error-sweep-reach,
+~45-70 ms; root set is a syntactic closure the review could not prove complete against CodeGen's implicit
+edges, and no discriminating test exists - see scratch/briefs/review_errsweep_report.md). Remaining cold budget (PGO exe, -ftime-trace): chunk-0 parse ~2.0 s (clang++ pays
+it too), eager Define* passes ~0.75 s (shared cost, any one pass alone saves nothing - ruling R1 demand-only
+surface; Codex lazy attempt scratch/lazy_defs_codex.patch changed 376 cache members and is NOT landable),
+definition emission ~0.35 s, harvest/self ~0.7 s, default-wrapper batch ~0.4 s (ruling R3). Path to 1.1x
+(3.6 s) = PGO + R1; R3 is the margin.
+
 **Status 2026-09-28 04:00 (master 85dfb8cc, perf timebox 2026-09-27 22:00 -> 2026-09-28 07:00).**
 parity.sh median of 5 (04:52): clang++ 3.32 s | cflat warm 0.55 s (0.17x, TARGET MET, ~6x faster
 than clang++) | cflat cold 6.80 s (2.05x, NOT met) | warm-edit (train_relu after train, new

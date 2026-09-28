@@ -681,11 +681,19 @@ bool LLVMBackend::RejectCxxRecordByValue(const CSigEntry& sig)
                 sig.name, typeName);
         };
         auto projectingReject = [&]() {
+        auto hasProjectedCopyMoveCtor = [&](const std::string& typeName) {
+            auto info = cxxClasses_.find(typeName);
+            return info != cxxClasses_.end()
+                && std::any_of(info->second.constructors.begin(), info->second.constructors.end(),
+                    [](const CxxClassInfo::Structor& ctor) {
+                        return ctor.isCopyCtor || ctor.isMoveCtor;
+                    });
+        };
         auto refuse = [&](const TypeAndValue& tv, bool isReturn) {
             // A `T&` return or parameter is `alias T`: it crosses by address, never by value.
             if (tv.IsAlias) return false;
             if (cxxRecords_.count(tv.TypeName) != 0)
-                EnsureCxxRecordProjected(tv.TypeName, false);
+                EnsureCxxRecordProjected(tv.TypeName, false, true);
             if (!IsByValueStructTV(tv)) return false;
             if (cxxTriviallyCopyableRecords_.count(tv.TypeName) != 0) return false;
             if (cxxRecords_.count(tv.TypeName) == 0) return false;  // not a C++ record: C rules apply
@@ -702,8 +710,7 @@ bool LLVMBackend::RejectCxxRecordByValue(const CSigEntry& sig)
             // is still refused here rather than at a call site that could not fix it.
             if (cxxNontrivialRecords_.count(tv.TypeName) != 0
                 && HasBindableCxxDestructor(tv.TypeName)
-                && (isReturn || FindCxxCopyCtor(tv.TypeName) != nullptr
-                    || FindCxxMoveCtor(tv.TypeName) != nullptr))
+                && (isReturn || hasProjectedCopyMoveCtor(tv.TypeName)))
                 return false;
             // Refuse THIS signature only, with the reason replayed if CFlat ever calls it. A
             // library header carries many such helpers the program never names.
@@ -3569,11 +3576,13 @@ void LLVMBackend::RegisterCxxFunctionPointerAbis(
                 plan.params.push_back(std::move(p));
             }
             if (plan.params.size() != raw.paramTypes.size()) continue;
+            // A callback plan only needs the by-value ABI of these records (destructor, copy/move),
+            // the same slice the by-value signature gate projects; the full ctor set stays lazy.
             if (!plan.ret.Pointer && IsCxxRecord(plan.ret.TypeName))
-                EnsureCxxRecordProjected(plan.ret.TypeName, false);
+                EnsureCxxRecordProjected(plan.ret.TypeName, false, true);
             for (const auto& param : plan.params)
                 if (!param.Pointer && IsCxxRecord(param.TypeName))
-                    EnsureCxxRecordProjected(param.TypeName, false);
+                    EnsureCxxRecordProjected(param.TypeName, false, true);
             // A callback ABI plan describes a function POINTER type, not a declaration a CFlat
             // call site can name, so there is nothing to attach a refusal to. Route the refusal
             // into a local sink: the unsupported plan stays out of the registry and the import
@@ -4264,24 +4273,22 @@ bool LLVMBackend::ExtractCHeaderClang(const std::vector<std::string>& headerPath
         bool extracted = false;
         if (incrementalHeader)
         {
-            cflat_cinterop::ExtractResult prepass;
             cflat_cinterop::ExtractRequest macroReq = req;
             macroReq.source = source;
-            // A header that leaves a scope open would swallow every later chunk; clang's
-            // incremental parser corrupts its AST on it. Only the full parse may report it.
-            const bool prepassed = cflat_cinterop::ExtractCxxMacroPrepass(macroReq, prepass, err);
-            if (prepassed && prepass.headerScopeOpen)
-                err = "header leaves a namespace or brace scope open";
-            else if (prepassed)
+            cflat_cinterop::ExtractRequest incrementalReq = req;
+            incrementalReq.checkHeaderScope = false;
+            std::string headerChunk = BuildCxxRequestIncludes(*activeCxxRequestGroup_);
+            headerChunk += "typedef int __cflat_header_scope_sentinel;\n";
+            CxxIncrementalGroup* incremental = GetCxxIncrementalGroup(
+                *activeCxxRequestGroup_, err, headerChunk, /*tolerateDiagnostics*/ true,
+                &macroReq, &raw);
+            if (incremental != nullptr && raw.headerScopeOpen)
             {
-                cflat_cinterop::ExtractRequest incrementalReq = req;
-                incrementalReq.cxxMacroProbes = prepass.macroProbes;
-                incrementalReq.checkHeaderScope = false;
-                std::string headerChunk = BuildCxxRequestIncludes(*activeCxxRequestGroup_);
-                headerChunk += "typedef int __cflat_header_scope_sentinel;\n";
-                raw = prepass;
-                CxxIncrementalGroup* incremental = GetCxxIncrementalGroup(
-                    *activeCxxRequestGroup_, err, headerChunk, /*tolerateDiagnostics*/ true);
+                err = "header leaves a namespace or brace scope open";
+                cxxIncrementalGroups_.erase(CxxIncrementalGroupKey(*activeCxxRequestGroup_));
+            }
+            else
+            {
                 extracted = incremental != nullptr
                     && incremental->HarvestHeader(incrementalReq, raw, err);
                 if (extracted && raw.demandRecorded)
@@ -4293,23 +4300,24 @@ bool LLVMBackend::ExtractCHeaderClang(const std::vector<std::string>& headerPath
                     replay.source = incrementalReq.source;
                     replay.scopeHeaderPath = incrementalReq.scopeHeaderPath;
                     replay.inScopeDirs = incrementalReq.inScopeDirs;
-                    replay.macroProbes = incrementalReq.cxxMacroProbes;
+                    replay.macroProbes = raw.macroProbes;
                     replay.wantMacros = incrementalReq.wantMacros;
                     replay.requireInScope = incrementalReq.requireInScope;
                     replay.checkHeaderScope = incrementalReq.checkHeaderScope;
                 }
-                if (extracted && !prepass.macroProbes.empty())
+                if (extracted && !raw.macroProbes.empty())
                 {
                     std::string probes;
-                    for (size_t i = 0; i < prepass.macroProbes.size(); ++i)
+                    for (size_t i = 0; i < raw.macroProbes.size(); ++i)
                     {
                         probes += "static const __auto_type __cflat_macro_";
                         probes += std::to_string(i);
                         probes += " = ";
-                        probes += prepass.macroProbes[i].name;
+                        probes += raw.macroProbes[i].name;
                         probes += ";\n";
                     }
                     cflat_cinterop::ExtractRequest probeReq = incrementalReq;
+                    probeReq.cxxMacroProbes = raw.macroProbes;
                     probeReq.cxxWrapperBatch = true;
                     probeReq.emitDefinitions = false;
                     probeReq.assumeInlineDefinitions = true;
@@ -5523,7 +5531,9 @@ bool LLVMBackend::ReplayCxxDemandChunks(const std::string& groupKey, std::string
 CxxIncrementalGroup* LLVMBackend::GetCxxIncrementalGroup(const CxxRequestGroup& group,
                                                           std::string& error,
                                                           const std::string& initialSource,
-                                                          bool tolerateDiagnostics)
+                                                          bool tolerateDiagnostics,
+                                                          const cflat_cinterop::ExtractRequest* macroReq,
+                                                          cflat_cinterop::ExtractResult* macroOut)
 {
         std::string key = CxxIncrementalGroupKey(group);
         auto found = cxxIncrementalGroups_.find(key);
@@ -5534,7 +5544,8 @@ CxxIncrementalGroup* LLVMBackend::GetCxxIncrementalGroup(const CxxRequestGroup& 
         if (!CountCxxHeaderParse(group, "incremental chunk 0"))
             return nullptr;
         std::unique_ptr<CxxIncrementalGroup> created = CxxIncrementalGroup::Create(
-            BuildCxxRequestClangArgs(group), source, verbose, error, tolerateDiagnostics);
+            BuildCxxRequestClangArgs(group), source, verbose, error, tolerateDiagnostics,
+            macroReq, macroOut);
         if (!created) return nullptr;
         if (initialSource.empty()) gCxxIncrementalChunk.fetch_add(3);
         CxxIncrementalGroup* result = created.get();
@@ -10563,7 +10574,7 @@ bool LLVMBackend::RequestCxxBraceConstructor(
 bool LLVMBackend::CxxCtorForwardsScalarReference(const std::string& typeName,
                                                  const std::vector<TypeAndValue>& argTypes) const
 {
-        const CxxClassInfo* info = GetCxxClassInfo(typeName);
+        const CxxClassInfo* info = GetCxxClassInfoWithConstructors(typeName);
         if (info == nullptr || argTypes.empty()) return false;
         auto scalar = [&](const TypeAndValue& t) {
             return !t.ElemPointer && !IsCxxRecord(t.TypeName) && !t.IsScopedEnum
@@ -13918,6 +13929,7 @@ void LLVMBackend::EnsureCxxRecordLayoutsForMemberSignatures(const CRecordEntry& 
                 || pendingCxxMemberProjections_.count(type.TypeName) != 0)
                 EnsureCxxRecordProjected(type.TypeName, false);
             if (memberFilter != "__ctor" && memberFilter != "__dtor"
+                && memberFilter != "__copy_move_ctor"
                 && pendingCxxMemberProjections_.count(type.TypeName) != 0)
                 EnsureCxxMemberProjected(type.TypeName, "__ctor");
         };
@@ -13926,6 +13938,9 @@ void LLVMBackend::EnsureCxxRecordLayoutsForMemberSignatures(const CRecordEntry& 
             if (!memberFilter.empty()
                 && !((memberFilter == "__ctor"
                       && member.kind == cflat_cinterop::RawCxxMember::Constructor)
+                     || (memberFilter == "__copy_move_ctor"
+                         && member.kind == cflat_cinterop::RawCxxMember::Constructor
+                         && (member.isCopyCtor || member.isMoveCtor))
                      || (memberFilter == "__dtor"
                          && member.kind == cflat_cinterop::RawCxxMember::Destructor)
                      || member.name == memberFilter))
@@ -14053,10 +14068,11 @@ void LLVMBackend::ProjectCxxByValueFieldRecord(const std::string& ctype)
         if (MapCTypeToTypeAndValue(element, fieldType, true)
             && !fieldType.Pointer && !fieldType.ElemPointer
             && pendingCxxRecordProjections_.count(fieldType.TypeName) != 0)
-            EnsureCxxRecordProjected(fieldType.TypeName, false);
+            EnsureCxxRecordProjected(fieldType.TypeName, false, true);
 }
 
-bool LLVMBackend::EnsureCxxRecordProjected(const std::string& typeName, bool includeMembers)
+bool LLVMBackend::EnsureCxxRecordProjected(const std::string& typeName, bool includeMembers,
+                                           bool gateSpecialMembersOnly)
 {
         auto pending = pendingCxxRecordProjections_.find(typeName);
         if (pending == pendingCxxRecordProjections_.end())
@@ -14069,7 +14085,7 @@ bool LLVMBackend::EnsureCxxRecordProjected(const std::string& typeName, bool inc
         CRecordEntry record = entry->second;
         const std::string file = pending->second;
         for (const auto& base : record.bases)
-            EnsureCxxRecordProjected(base.name, includeMembers);
+            EnsureCxxRecordProjected(base.name, includeMembers, gateSpecialMembersOnly);
         for (const auto& field : record.fields) ProjectCxxByValueFieldRecord(field.ctype);
         if (includeMembers) EnsureCxxRecordLayoutsForMemberSignatures(record);
         const bool oldRegistering = registeringCxxProjection_;
@@ -14088,22 +14104,27 @@ bool LLVMBackend::EnsureCxxRecordProjected(const std::string& typeName, bool inc
         if (includeMembers) return true;
         pendingCxxMemberProjections_[stableTypeName] = file;
 
-        /*
-         * Constructors and the destructor are part of the layout projection, as the eager path
-         * registered them at import. Lifetime queries (HasNonTrivialDestructor, FindCxxCopyCtor,
-         * GetOrCreateFullDestructor) run deep inside codegen while callers hold references into
-         * CxxClassInfo and functionTable; a lazy special-member registration there would replace
-         * the CxxClassInfo those references point into. The class entry is new here, so nothing
-         * can hold a reference into it yet.
-         */
-        EnsureCxxMemberProjected(stableTypeName, "__dtor");
-        EnsureCxxMemberProjected(stableTypeName, "__ctor");
+        // Install lifetime members during the initial projection, before codegen can retain them.
+        // The gate path requests only dtor/copy/move; other callers keep the full ctor projection.
+        if (gateSpecialMembersOnly)
+            EnsureCxxGateSpecialMembersProjected(stableTypeName);
+        else
+        {
+            EnsureCxxMemberProjected(stableTypeName, "__dtor");
+            EnsureCxxMemberProjected(stableTypeName, "__ctor");
+        }
         const auto layout = dataStructures.find(stableTypeName);
         if (cxxNontrivialRecords_.count(stableTypeName) != 0 && layout != dataStructures.end()
             && layout->second.StructType != nullptr && !layout->second.StructType->isOpaque()
             && layout->second.StructType->isSized())
             GetOrCreateCxxClassDestructor(stableTypeName);
         return true;
+}
+
+void LLVMBackend::EnsureCxxGateSpecialMembersProjected(const std::string& typeName)
+{
+        EnsureCxxMemberProjected(typeName, "__dtor");
+        EnsureCxxMemberProjected(typeName, "__copy_move_ctor");
 }
 
 void LLVMBackend::RegisterCRecords(std::vector<CRecordEntry>& records, const std::string& fileForLsp)
@@ -15440,7 +15461,7 @@ void LLVMBackend::RegisterCxxClassMembers(const CRecordEntry& r, const std::stri
             auto existing = cxxClasses_.find(r.name);
             if (existing == cxxClasses_.end()) return;
             info = existing->second;
-            if (memberFilter == "__ctor")
+            if (memberFilter == "__ctor" || memberFilter == "__copy_move_ctor")
                 for (const auto& ctor : info.constructors)
                     alreadyRegisteredConstructorLinkages.insert(ctor.linkageName);
         }
@@ -15707,7 +15728,11 @@ void LLVMBackend::RegisterCxxClassMembers(const CRecordEntry& r, const std::stri
             // Settled BEFORE the refusal checks so a private, deleted or otherwise unbindable
             // conversion is recorded under the same key the cast site will ask for.
             const std::string cflatName = memberRegName(m);
-            if (memberFilter == "__ctor" && m.kind == Member::Constructor
+            if (memberFilter == "__copy_move_ctor" && m.kind == Member::Constructor
+                && !m.isCopyCtor && !m.isMoveCtor)
+                continue;
+            if ((memberFilter == "__ctor" || memberFilter == "__copy_move_ctor")
+                && m.kind == Member::Constructor
                 && alreadyRegisteredConstructorLinkages.count(m.linkageName) != 0)
                 continue;
             const bool registerConstViewData = m.kind == Member::Instance
@@ -15716,7 +15741,9 @@ void LLVMBackend::RegisterCxxClassMembers(const CRecordEntry& r, const std::stri
             if (m.isConversion && m.isExplicit
                 && implicitConversionNames.count(cflatName) == 0)
                 info.explicitConversions.insert(cflatName);
-            if (!memberFilter.empty() && cflatName != memberFilter) continue;
+            if (!memberFilter.empty() && cflatName != memberFilter
+                && !(memberFilter == "__copy_move_ctor"
+                     && m.kind == Member::Constructor)) continue;
             if (m.kind == Member::Instance && generatedCxxRecords_.count(r.name) != 0)
             {
                 const auto generated = generatedCxxRecords_.find(r.name);
@@ -19800,7 +19827,7 @@ LLVMBackend::CxxArgConversion LLVMBackend::ClassifyCxxImplicitArgument(
         // Only for a class with NO listed constructor, or a constructor TEMPLATE fed a non-class
         // argument (a class argument keeps the C++-side call path) - a speculative clang request
         // re-registers the class. The probe copy-initializes: an explicit ctor never converts.
-        const auto* info = GetCxxClassInfo(param.TypeName);
+        const auto* info = GetCxxClassInfoWithConstructors(param.TypeName);
         if (info == nullptr || (!info->constructors.empty()
                                 && !(info->hasCtorTemplate && !IsCxxRecord(argType.TypeName))))
             return CxxArgConversion::NotApplicable;
@@ -20125,7 +20152,7 @@ bool LLVMBackend::MaterializeImplicitCxxClassArgument(NamedVariable& arg,
         NamedVariable source = arg;
         source.TypeAndValue = argType;
         source.TypeAndValue.VariableName.clear();
-        const auto* info = GetCxxClassInfo(param.TypeName);
+        const auto* info = GetCxxClassInfoWithConstructors(param.TypeName);
         // A non-const `operator T()` beats `T(const S&)` on an lvalue; copy-initialization
         // in the wrapper lets clang make that pick.
         const bool operatorBindsBetter = !argType.Pointer && !slicesToBase

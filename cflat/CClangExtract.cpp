@@ -881,11 +881,22 @@ namespace cflat_cinterop
         struct MacroCollector : public PPCallbacks
         {
             Preprocessor& pp;
+            std::unique_ptr<ExtractRequest> ownedReq;
+            std::unique_ptr<ExtractState> ownedState;
             ExtractState& st;
-            MacroCollector(Preprocessor& p, ExtractState& s) : pp(p), st(s) {}
+            std::shared_ptr<bool> active;
+            MacroCollector(Preprocessor& p, ExtractState& s,
+                           std::shared_ptr<bool> enabled = {})
+                : pp(p), st(s), active(std::move(enabled)) {}
+            MacroCollector(Preprocessor& p, const ExtractRequest& req, ExtractResult& out,
+                           std::shared_ptr<bool> enabled)
+                : pp(p), ownedReq(std::make_unique<ExtractRequest>(req)),
+                  ownedState(std::make_unique<ExtractState>(*ownedReq, out)),
+                  st(*ownedState), active(std::move(enabled)) {}
 
             void MacroDefined(const Token& nameTok, const MacroDirective* md) override
             {
+                if (active && !*active) return;
                 if (!md) return;
                 const MacroInfo* mi = md->getMacroInfo();
                 if (!mi || mi->isBuiltinMacro()) return;
@@ -950,6 +961,20 @@ namespace cflat_cinterop
                 mp.name = name; mp.file = file; mp.line = line; mp.col = col;
                 mp.aliasTarget = aliasTarget;
                 st.probes.push_back(std::move(mp));
+                if (ownedState) st.out.macroProbes.push_back(st.probes.back());
+            }
+        };
+
+        struct IncrementalMacroPrepassAction : public PPCallbacks
+        {
+            MacroCollector collector;
+            IncrementalMacroPrepassAction(Preprocessor& pp, const ExtractRequest& req,
+                                          ExtractResult& out,
+                                          std::shared_ptr<bool> active)
+                : collector(pp, req, out, std::move(active)) {}
+            void MacroDefined(const Token& nameTok, const MacroDirective* md) override
+            {
+                collector.MacroDefined(nameTok, md);
             }
         };
 
@@ -4668,18 +4693,24 @@ namespace cflat_cinterop
                     return true;
                 }
             } errorBodies(*errorReach);
-            errorBodies.TraverseDecl(root);
-            for (Decl* d : st.announcedDecls) errorBodies.TraverseDecl(d);
-            for (FunctionDecl* fd : errorBodies.direct)
             {
-                if (st.req.verbose)
-                    std::cout << "[verbose]   C++ body emptied, its instantiation reported an "
-                                 "error: " << fd->getQualifiedNameAsString() << "\n";
-                fd->setBody(CompoundStmt::CreateEmpty(ctx, /*NumStmts*/ 0, /*HasFPFeatures*/ false));
-                // A live Interpreter keeps this specialization; a later chunk must not see it clean.
-                if (st.req.poisonedFunctions != nullptr)
-                    st.req.poisonedFunctions->emplace(fd, "clang reported an error inside the "
-                        "body it generated for '" + fd->getQualifiedNameAsString() + "'");
+                llvm::TimeTraceScope scope("CxxErrorBodySweep");
+                if (errorReach->active)
+                {
+                    errorBodies.TraverseDecl(root);
+                    for (Decl* d : st.announcedDecls) errorBodies.TraverseDecl(d);
+                    for (FunctionDecl* fd : errorBodies.direct)
+                    {
+                        if (st.req.verbose)
+                            std::cout << "[verbose]   C++ body emptied, its instantiation reported an "
+                                         "error: " << fd->getQualifiedNameAsString() << "\n";
+                        fd->setBody(CompoundStmt::CreateEmpty(ctx, /*NumStmts*/ 0, /*HasFPFeatures*/ false));
+                        // A live Interpreter keeps this specialization; a later chunk must not see it clean.
+                        if (st.req.poisonedFunctions != nullptr)
+                            st.req.poisonedFunctions->emplace(fd, "clang reported an error inside the "
+                                "body it generated for '" + fd->getQualifiedNameAsString() + "'");
+                    }
+                }
             }
 
             // Phase 1: show Clang the whole translation unit. Inline definitions stay deferred.
@@ -4740,6 +4771,12 @@ namespace cflat_cinterop
                 // a local class (C++ forbids that), so function bodies and initializers are skipped.
                 bool shouldWalkTypesOfTypeLocs() const { return false; }
                 bool TraverseStmt(Stmt*, DataRecursionQueue* = nullptr) { return true; }
+                bool TraverseFunctionDecl(FunctionDecl*) { return true; }
+                bool TraverseCXXMethodDecl(CXXMethodDecl*) { return true; }
+                bool TraverseCXXConstructorDecl(CXXConstructorDecl*) { return true; }
+                bool TraverseCXXDestructorDecl(CXXDestructorDecl*) { return true; }
+                bool TraverseCXXConversionDecl(CXXConversionDecl*) { return true; }
+                bool TraverseCXXDeductionGuideDecl(CXXDeductionGuideDecl*) { return true; }
 
                 bool VisitVarDecl(VarDecl* vd)
                 {
@@ -4752,8 +4789,11 @@ namespace cflat_cinterop
                     return true;
                 }
             } usedStaticVars(st.varEmitWork);
-            usedStaticVars.TraverseDecl(root);
-            for (Decl* d : st.requestDecls) usedStaticVars.TraverseDecl(d);
+            {
+                llvm::TimeTraceScope scope("CxxUsedStaticVars");
+                usedStaticVars.TraverseDecl(root);
+                for (Decl* d : st.requestDecls) usedStaticVars.TraverseDecl(d);
+            }
 
             auto handOverStaticVar = [&](const VarDecl* vd) {
                 if (vd == nullptr || declHasErrors(vd)) return;
@@ -5549,6 +5589,16 @@ namespace cflat_cinterop
             return true;
         }
     } // namespace
+
+    std::function<void()> AttachCxxMacroPrepass(clang::Preprocessor& pp,
+                                                const ExtractRequest& req,
+                                                ExtractResult& out)
+    {
+        auto active = std::make_shared<bool>(true);
+        pp.addPPCallbacks(std::make_unique<IncrementalMacroPrepassAction>(
+            pp, req, out, active));
+        return [active] { *active = false; };
+    }
 
     bool ExtractCxxIncremental(const ExtractRequest& req, clang::CompilerInstance& ci,
                                clang::TranslationUnitDecl* root,

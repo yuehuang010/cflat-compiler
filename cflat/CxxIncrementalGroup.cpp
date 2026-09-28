@@ -15,6 +15,7 @@
 #include "clang/Interpreter/PartialTranslationUnit.h"
 #include "clang/Lex/PPCallbacks.h"
 #include "clang/Lex/Preprocessor.h"
+#include "clang/Lex/Token.h"
 #include "clang/Parse/Parser.h"
 #include "clang/Sema/Sema.h"
 #include "llvm/Support/Error.h"
@@ -1092,7 +1093,9 @@ CxxIncrementalGroup::~CxxIncrementalGroup() = default;
 
 std::unique_ptr<CxxIncrementalGroup> CxxIncrementalGroup::Create(
     const std::vector<std::string>& args, const std::string& headerSource,
-    bool verbose, std::string& error, bool tolerateDiagnostics)
+    bool verbose, std::string& error, bool tolerateDiagnostics,
+    const cflat_cinterop::ExtractRequest* macroReq,
+    cflat_cinterop::ExtractResult* macroOut)
 {
     std::vector<std::string> storage = InterpreterArgs(args);
     std::vector<const char*> cargs;
@@ -1163,23 +1166,62 @@ std::unique_ptr<CxxIncrementalGroup> CxxIncrementalGroup::Create(
         clang::CompilerInstance& ci = *impl->interpreter->getCompilerInstance();
         clang::Preprocessor& pp = ci.getPreprocessor();
         LazyBodies& lazy = impl->lazy;
+        const bool trackHeaderScope = macroReq != nullptr && macroOut != nullptr
+            && macroReq->cxxMode;
+        std::function<void()> stopMacroCollector;
+        if (macroReq != nullptr && macroOut != nullptr)
+            stopMacroCollector = cflat_cinterop::AttachCxxMacroPrepass(pp, *macroReq, *macroOut);
         lazy.parser = static_cast<clang::Parser*>(pp.getCodeCompletionHandler());
         lazy.sema = &ci.getSema();
         // CFLAT_CXX_EAGER_BODIES=1 parses every body up front (A/B and bisecting a late body).
         if (lazy.parser != nullptr && !cflat_cinterop::CxxEagerBodies())
         {
             lazy.parser->*AccessPrivate(ParserSkipBodiesTag{}) = true;
-            pp.setTokenWatcher([&lazy](const clang::Token& token) { lazy.Observe(token); });
             lazy.active = true;
         }
+        int headerBraceDepth = 0;
+        const bool watchTokens = lazy.active || trackHeaderScope;
+        if (watchTokens)
+            pp.setTokenWatcher([&lazy, &pp, &headerBraceDepth, macroOut, trackHeaderScope,
+                                injectedHeaderClosers = false]
+                               (const clang::Token& token) mutable {
+                if (lazy.active) lazy.Observe(token);
+                if (!trackHeaderScope) return;
+                if (token.is(clang::tok::l_brace)) ++headerBraceDepth;
+                else if (token.is(clang::tok::r_brace)) --headerBraceDepth;
+                else if (!injectedHeaderClosers && headerBraceDepth != 0
+                         && token.is(clang::tok::identifier)
+                         && token.getIdentifierInfo() != nullptr
+                         && token.getIdentifierInfo()->getName()
+                            == "__cflat_header_scope_sentinel")
+                {
+                    macroOut->headerScopeOpen = true;
+                    injectedHeaderClosers = true;
+                    // A stray extra `}` (depth < 0) needs no closers: clang recovers from it.
+                    if (headerBraceDepth < 0) return;
+                    const unsigned count = static_cast<unsigned>(headerBraceDepth);
+                    auto closers = std::make_unique<clang::Token[]>(count);
+                    for (unsigned i = 0; i < count; ++i)
+                    {
+                        closers[i].startToken();
+                        closers[i].setKind(clang::tok::r_brace);
+                        closers[i].setLength(1);
+                        closers[i].setLocation(token.getLocation());
+                    }
+                    pp.EnterTokenStream(std::move(closers), count,
+                                       /*DisableMacroExpansion*/ true,
+                                       /*IsReinject*/ false);
+                }
+            });
         auto ptu = [&] {
             llvm::TimeTraceScope parseScope("CxxGroupHeaderParse");
             return impl->interpreter->Parse(headerSource);
         }();
+        if (stopMacroCollector) stopMacroCollector();
+        if (watchTokens) pp.setTokenWatcher(nullptr);
         if (lazy.active)
         {
             lazy.active = false;
-            pp.setTokenWatcher(nullptr);
             lazy.parser->*AccessPrivate(ParserSkipBodiesTag{}) = false;
             lazy.recent.clear();
             // An unterminated capture cannot be replayed; that function stays declared only.

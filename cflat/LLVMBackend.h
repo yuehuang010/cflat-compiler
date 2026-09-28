@@ -5538,7 +5538,9 @@ private:
     CxxIncrementalGroup* GetCxxIncrementalGroup(const CxxRequestGroup& group,
                                                 std::string& error,
                                                 const std::string& initialSource = {},
-                                                bool tolerateDiagnostics = false);
+                                                bool tolerateDiagnostics = false,
+                                                const cflat_cinterop::ExtractRequest* macroReq = nullptr,
+                                                cflat_cinterop::ExtractResult* macroOut = nullptr);
     // Cache identity of one C++ type request; see the definition for what it folds in.
     std::string CxxTypeRequestCacheKey(const CxxRequestGroup& group,
                                        const std::string& cxxSpelling,
@@ -8222,6 +8224,14 @@ public:
         auto it = cxxClasses_.find(typeName);
         return it == cxxClasses_.end() ? nullptr : &it->second;
     }
+    // A decision over the constructor SET (empty? forwards a scalar reference?) must see the
+    // full set: the by-value gate projects only the destructor and copy/move constructors.
+    const CxxClassInfo* GetCxxClassInfoWithConstructors(const std::string& typeName) const
+    {
+        if (pendingCxxMemberProjections_.count(typeName) != 0)
+            const_cast<LLVMBackend*>(this)->EnsureCxxMemberProjected(typeName, "__ctor");
+        return GetCxxClassInfo(typeName);
+    }
     // Every member name CFlat saw on a C++ class or its bases - bound, refused or inaccessible.
     // Feeds the "no member of that name" diagnostic, which must never fall back to CFlat's own
     // same-named free functions (core's atomic<T> load/store were reported for std.atomic<int>).
@@ -8424,6 +8434,8 @@ public:
     {
         if (pendingCxxRecordProjections_.count(typeName) != 0)
             const_cast<LLVMBackend*>(this)->EnsureCxxRecordProjected(typeName, false);
+        if (pendingCxxMemberProjections_.count(typeName) != 0)
+            const_cast<LLVMBackend*>(this)->EnsureCxxMemberProjected(typeName, "__ctor");
         auto it = cxxClasses_.find(typeName);
         auto record = cxxRecordEntries_.find(typeName);
         const bool hasUserDeclaredCtor = record != cxxRecordEntries_.end()
@@ -8727,9 +8739,11 @@ public:
     std::set<std::string> projectingCxxRecords_;
     bool registeringCxxProjection_ = false;
     bool registeringCxxProjectionMembers_ = true;
-    bool EnsureCxxRecordProjected(const std::string& typeName, bool includeMembers = true);
+    bool EnsureCxxRecordProjected(const std::string& typeName, bool includeMembers = true,
+                                 bool gateSpecialMembersOnly = false);
     bool RegisterCxxMembersForProjectedRecord(const std::string& typeName);
     bool EnsureCxxMemberProjected(const std::string& typeName, const std::string& memberName);
+    void EnsureCxxGateSpecialMembersProjected(const std::string& typeName);
     void EnsureCxxConversionOperatorsProjected(const std::string& typeName);
     void StoreCxxRecordEntry(const std::string& name, const CRecordEntry& record);
     void EnsureCxxRecordLayoutsForMemberSignatures(const CRecordEntry& record,

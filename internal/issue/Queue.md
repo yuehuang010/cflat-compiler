@@ -31,8 +31,8 @@ are ~2 GB each). Only the main session runs torch, at `-j 1`, one run at a time.
 ## Bucket 0 - PRIORITY: C++ import compile time parity (p1, 2026-09-27)
 
 Target: cflat within 10% of clang++ compiling the equivalent C++ program, cold AND warm.
-Issue p1/cpp-import-compile-time-parity-with-clang. Today: warm 4.2x, cold 23x (torch benchmark,
-scratch/cmp/parity.sh). Staging: (a) warm - one pre-linked companion + one bound-surface snapshot per
+Issue p1/cpp-import-compile-time-parity-with-clang. 2026-09-28 (master bd1def8e): warm 0.15x (met),
+cold 1.3x with the PGO LLVM / 1.6x with the plain LLVM (torch benchmark, scratch/cmp/parity.sh). Staging: (a) warm - one pre-linked companion + one bound-surface snapshot per
 import group; (b) cold - spike + plan for one clang parse per import group (persistent Sema), then build.
 Gate adds scratch/cmp/parity.sh before/after numbers on an idle machine. One sample at a time:
 sample 1 = torch training benchmark (scratch/cmp/train.cb); next samples only after sample 1 is at parity.
@@ -171,6 +171,10 @@ At most 3 implementers at once. Rows touching the same function (2a/2b, 4/Bucket
 | be21a0f8 | AV | p3/cpp-free-wrapper-returns-reference-into-own-frame |
 | 3b3df77d | AY | p2/eigen07-warm-cache-inline-asm-fatal (untracked issue, deleted) |
 | 3c0b5e78 | AT | bucket 2a: 5 pointer-argument issues (p2 x4, p3 template-bool) |
+| 37f2c948 | PB | p1 parity: by-value gate projects only dtor + copy/move ctors (393 -> 111 request chunks, cold -1.05 s, warm -0.36 s) |
+| 20101f74 | PP | p1 parity: macro prepass folded into the chunk-0 parse, synthetic closers for an unbalanced header (cold -0.54 s) |
+| 53ac9fef | PE | p1 parity: definition-emission walks trimmed (error sweep gated, static-member walk skips functions; -25 ms, trace scopes) |
+| bd1def8e | PF | p1 parity: callback ABI plans project only the by-value slice of their records (-0.04 s, 62 fewer request files) |
 | 72e9b223 | AZ | p2/cpp-free-template-operator-std-function-temporary-bitwise-copy (untracked, deleted) |
 | d4fa2eaa | AM | p3/cpp-inherited-static-members-and-member-operators-not-found |
 | 0d1386fa | AU | p3/cpp-variadic-ctor-wrapper-from-expression-template-not-registered (untracked, deleted); eigen_03/04/05 enabled, tier 2 20/0/0 |
