@@ -151,59 +151,70 @@ namespace movedf
         // scoped-block expect_error carry stale moved-state that must not leak into a use.
         std::unordered_map<llvm::BasicBlock*, int> rpo = ComputeRpoIndex(F);
 
-        std::unordered_map<llvm::BasicBlock*, MovedSet> blockOut;
-        for (auto& BB : *F) if (rpo.count(&BB)) blockOut[&BB]; // default-empty OUT
-
-        llvm::BasicBlock* entry = &F->getEntryBlock();
-
-        // Round-robin until no OUT changes. Finite path set => terminates.
-        bool changed = true;
-        while (changed)
+        // Dense RPO-indexed CFG (entry = 0): reachable predecessors, successors, events.
+        const int n = (int)rpo.size();
+        std::vector<llvm::BasicBlock*> order(n);
+        for (const auto& [bb, idx] : rpo) order[idx] = bb;
+        std::vector<std::vector<int>> preds(n), succs(n);
+        std::vector<const std::vector<const Event*>*> blockEvents(n, nullptr);
+        for (int i = 0; i < n; ++i)
         {
-            changed = false;
-            for (auto& BB : *F)
-            {
-                if (!rpo.count(&BB)) continue;
-                MovedSet in;
-                if (&BB != entry)
-                    for (llvm::BasicBlock* pred : llvm::predecessors(&BB))
-                    {
-                        if (!rpo.count(pred)) continue;
-                        const MovedSet& po = blockOut[pred];
-                        in.insert(po.begin(), po.end());
-                    }
-
-                MovedSet result = in;
-                if (auto it = byBlock.find(&BB); it != byBlock.end())
-                    for (const Event* e : it->second)
-                        ApplyEvent(result, *e);
-
-                if (result != blockOut[&BB])
+            for (llvm::BasicBlock* pred : llvm::predecessors(order[i]))
+                if (auto it = rpo.find(pred); it != rpo.end())
                 {
-                    blockOut[&BB] = std::move(result);
-                    changed = true;
+                    preds[i].push_back(it->second);
+                    succs[it->second].push_back(i);
+                }
+            if (auto it = byBlock.find(order[i]); it != byBlock.end())
+                blockEvents[i] = &it->second;
+        }
+
+        auto transfer = [&](int i, MovedSet& s) {
+            if (blockEvents[i])
+                for (const Event* e : *blockEvents[i])
+                    ApplyEvent(s, *e);
+        };
+
+        // Least fixpoint of a monotone gen/kill union problem, so visit order cannot change the
+        // result. RPO sweeps recompute only blocks whose predecessor OUT changed (depth+2 sweeps).
+        std::vector<MovedSet> blockOut(n);
+        std::vector<char> dirty(n, 1);
+        bool anyDirty = true;
+        while (anyDirty)
+        {
+            anyDirty = false;
+            for (int i = 0; i < n; ++i)
+            {
+                if (!dirty[i]) continue;
+                dirty[i] = 0;
+                MovedSet result;
+                if (i != 0)
+                    for (int p : preds[i])
+                        result.insert(blockOut[p].begin(), blockOut[p].end());
+                transfer(i, result);
+                if (result != blockOut[i])
+                {
+                    blockOut[i] = std::move(result);
+                    for (int s : succs[i])
+                    {
+                        dirty[s] = 1;
+                        if (s <= i) anyDirty = true;   // retreating edge: needs another sweep
+                    }
                 }
             }
         }
 
         // Acyclic OUT: single pass in RPO taking only FORWARD-edge predecessors (rpo<current).
         // This reproduces the inline checker's linear + if/else merge view (no back-edges).
-        std::vector<llvm::BasicBlock*> rpoOrder;
-        for (auto& BB : *F) if (rpo.count(&BB)) rpoOrder.push_back(&BB);
-        std::sort(rpoOrder.begin(), rpoOrder.end(),
-                  [&](llvm::BasicBlock* a, llvm::BasicBlock* b){ return rpo[a] < rpo[b]; });
-        std::unordered_map<llvm::BasicBlock*, MovedSet> acyclicOut;
-        for (llvm::BasicBlock* bb : rpoOrder)
+        std::vector<MovedSet> acyclicOut(n);
+        for (int i = 0; i < n; ++i)
         {
-            MovedSet in;
-            for (llvm::BasicBlock* pred : llvm::predecessors(bb))
-                if (rpo.count(pred) && rpo[pred] < rpo[bb])
-                    in.insert(acyclicOut[pred].begin(), acyclicOut[pred].end());
-            MovedSet result = in;
-            if (auto it = byBlock.find(bb); it != byBlock.end())
-                for (const Event* e : it->second)
-                    ApplyEvent(result, *e);
-            acyclicOut[bb] = std::move(result);
+            MovedSet result;
+            for (int p : preds[i])
+                if (p < i)
+                    result.insert(acyclicOut[p].begin(), acyclicOut[p].end());
+            transfer(i, result);
+            acyclicOut[i] = std::move(result);
         }
 
         // Diagnose: replay each block's events against BOTH its fixpoint IN and its acyclic IN.
@@ -211,21 +222,20 @@ namespace movedf
         std::unordered_set<std::string> seen; // dedup identical path+location report keys
         for (auto& BB : *F)
         {
-            if (!rpo.count(&BB)) continue;
-            MovedSet in, acyclicIn;
-            if (&BB != entry)
-                for (llvm::BasicBlock* pred : llvm::predecessors(&BB))
+            auto rit = rpo.find(&BB);
+            if (rit == rpo.end()) continue;
+            const int i = rit->second;
+            if (!blockEvents[i]) continue;
+            MovedSet running, acyclicRunning;
+            if (i != 0)
+                for (int p : preds[i])
                 {
-                    if (!rpo.count(pred)) continue;
-                    in.insert(blockOut[pred].begin(), blockOut[pred].end());
-                    if (rpo[pred] < rpo[&BB])
-                        acyclicIn.insert(acyclicOut[pred].begin(), acyclicOut[pred].end());
+                    running.insert(blockOut[p].begin(), blockOut[p].end());
+                    if (p < i)
+                        acyclicRunning.insert(acyclicOut[p].begin(), acyclicOut[p].end());
                 }
 
-            auto it = byBlock.find(&BB);
-            if (it == byBlock.end()) continue;
-            MovedSet running = in, acyclicRunning = acyclicIn;
-            for (const Event* e : it->second)
+            for (const Event* e : *blockEvents[i])
             {
                 if (e->kind == EventKind::Use)
                 {

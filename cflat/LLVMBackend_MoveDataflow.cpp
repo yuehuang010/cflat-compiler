@@ -781,6 +781,7 @@ void LLVMBackend::RunNullIfaceGlobalCheck()
 
 void LLVMBackend::RunMoveDataflow()
 {
+        llvm::TimeTraceScope moveDfScope("MoveDataflow");
         // Module end: no aggregate body will appear after this point.
         ReportUnresolvedProvisionalDeclarations();
 
