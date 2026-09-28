@@ -129,6 +129,7 @@ cold + warm torch run in the gate.
 
 | Issue | Mode |
 |-------|------|
+| p2/cpp-libs-cache-intermittent-alias-miss-after-rebuild | full; intermittent (1 in 10 nightly-shaped runs, 2026-09-28) - cross-process entry rewrite after a build-stamp change under -j 4 |
 | p3/cpp-request-cache-not-keyed-on-compiler-build | batch candidate (CxxTypeRequestCacheKey) |
 | p3/cpp-wrapper-request-group-omits-type-dependencies | batch candidate (RequestGeneratedCxxWrapperUncached) |
 | p3/cpp-candidate-tier-differs-cold-vs-warm | batch candidate (CandidateCxxGroupsFor) |
