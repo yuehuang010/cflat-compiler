@@ -1880,6 +1880,7 @@ uint64_t LLVMBackend::CHeaderDiskCacheKey(const std::vector<std::string>& header
         // result again, and never a substitute for a compile's. Nothing writes such an entry to
         // disk today; keying it apart means an older entry can never be mistaken for one either.
         if (cxxMode) fold(cxxDefinitionsEmitted ? "|EDEF" : "|EDECL");
+        if (cxxMode && cflat_cinterop::CxxEagerBodies()) fold("|BEAGER");
         // C++ request and header-body bitcode uses O1 with LLVM passes disabled.
         if (cxxMode)
         {
@@ -2785,6 +2786,57 @@ bool LLVMBackend::CHeaderDepFresh(const CHeaderDep& dep)
         return HashFileFnv1a(dep.path, h) && h == dep.hash;
     }
 
+void LLVMBackend::JoinCHeaderDiskCacheWriters()
+{
+        for (auto& writer : cHeaderDiskCacheWriters_)
+            if (writer.thread.joinable()) writer.thread.join();
+        cHeaderDiskCacheWriters_.clear();
+    }
+
+// Waits only for a pending write of `target`. Other entries are independent files published by
+// rename, and the shared signature baselines they reference are content-addressed and
+// mutex-guarded (gSigBaselineMutex), so a read never needs an unrelated write to finish.
+void LLVMBackend::JoinCHeaderDiskCacheWritersFor(const std::filesystem::path& target)
+{
+        const std::filesystem::path wanted = target.lexically_normal();
+        for (auto it = cHeaderDiskCacheWriters_.begin(); it != cHeaderDiskCacheWriters_.end();)
+        {
+            if (it->target != wanted) { ++it; continue; }
+            if (it->thread.joinable()) it->thread.join();
+            it = cHeaderDiskCacheWriters_.erase(it);
+        }
+    }
+
+void LLVMBackend::ScheduleCHeaderDiskCacheWrite(
+        const std::filesystem::path& cacheDir,
+        uint64_t diskKey,
+        std::filesystem::file_time_type mtime,
+        uint64_t contentHash,
+        CFileSigCacheEntry&& entry,
+        const std::string& requestKey,
+        const CxxRequestGroup* requestGroup)
+{
+        CxxRequestGroup ownedGroup;
+        const bool haveGroup = requestGroup != nullptr;
+        if (haveGroup) ownedGroup = *requestGroup;
+        CHeaderDiskCacheWriter& writer = cHeaderDiskCacheWriters_.emplace_back();
+        writer.target = (cacheDir / std::format("{:016x}.json", diskKey)).lexically_normal();
+        writer.thread = std::thread(
+            [cacheDir, diskKey, mtime, contentHash, entry = std::move(entry),
+             requestKey, ownedGroup = std::move(ownedGroup), haveGroup]() mutable {
+                try
+                {
+                    WriteCHeaderDiskCache(cacheDir, diskKey, mtime, contentHash, entry,
+                                          requestKey, haveGroup ? &ownedGroup : nullptr);
+                }
+                catch (...)
+                {
+                    // Disk cache writes are best-effort; never let a worker exception terminate
+                    // the compiler process.
+                }
+            });
+    }
+
 bool LLVMBackend::TryLoadCHeaderDiskCache(
         const std::filesystem::path& cacheDir,
         uint64_t diskKey,
@@ -2799,6 +2851,7 @@ bool LLVMBackend::TryLoadCHeaderDiskCache(
         namespace fs = std::filesystem;
         std::error_code ec;
         auto cachePath = cacheDir / std::format("{:016x}.json", diskKey);
+        JoinCHeaderDiskCacheWritersFor(cachePath);
         auto cacheMiss = [&](const char* reason) {
             if (missReason != nullptr) *missReason = reason;
             // Cache files are shared by concurrent compilers; a miss must not unlink a writer's entry.
@@ -3059,6 +3112,51 @@ bool LLVMBackend::TryLoadCHeaderDiskCache(
                     if (p.contains("abi")) plan.abi = AbiFromJson(p["abi"]);
                     entry.functionPointerAbis.push_back(std::move(plan));
                 }
+            entry.cxxDemandGroupKey = j.value("cxxdemand", std::string{});
+            auto readReplayChunk = [](const SjVal& replay,
+                                      cflat_cinterop::ExtractResult::DemandReplayChunk& chunk) {
+                chunk.order = replay.value("order", uint64_t{0});
+                chunk.source = replay.value("source", std::string{});
+                chunk.prefixSource = replay.value("prefix", std::string{});
+                chunk.markerPrefix = replay.value("marker", std::string{});
+                chunk.thunkSuffix = replay.value("thunk", std::string{});
+                chunk.wrapperBatch = replay.value("batch", false);
+                chunk.autoInstantiate = replay.value("auto", true);
+                chunk.headerHarvest = replay.value("header", false);
+                chunk.wantMacros = replay.value("wantmacros", false);
+                chunk.requireInScope = replay.value("inscope", false);
+                chunk.checkHeaderScope = replay.value("checkscope", false);
+                chunk.scopeHeaderPath = replay.value("scopeheader", std::string{});
+                if (replay.contains("scopedirs"))
+                    chunk.inScopeDirs = replay["scopedirs"].to_string_vector();
+                if (replay.contains("probes"))
+                    for (const SjVal probe : replay["probes"])
+                    {
+                        cflat_cinterop::CxxMacroProbe item;
+                        item.name = probe.value("name", std::string{});
+                        item.file = probe.value("file", std::string{});
+                        item.aliasTarget = probe.value("alias", std::string{});
+                        item.line = probe.value("line", 1);
+                        item.col = probe.value("col", 0);
+                        chunk.macroProbes.push_back(std::move(item));
+                    }
+                if (replay.contains("wrappers"))
+                    chunk.wrapperNames = replay["wrappers"].to_string_vector();
+                if (replay.contains("types"))
+                    for (const SjVal type : replay["types"])
+                        chunk.typeRequests.push_back({
+                            type.value("cxx", std::string{}),
+                            type.value("cflat", std::string{})});
+            };
+            if (j.contains("cxxreplay"))
+            {
+                const SjVal replay = j["cxxreplay"];
+                readReplayChunk(replay, entry.cxxDemandReplayChunk);
+                if (replay.contains("follow"))
+                    for (const SjVal follow : replay["follow"])
+                        readReplayChunk(follow,
+                                        entry.cxxDemandReplayChunk.follow.emplace_back());
+            }
             // Companion module bitcode lives in a validated raw sidecar next to the JSON entry.
             if (j.contains("cxxbc"))
             {
@@ -3103,7 +3201,7 @@ bool LLVMBackend::TryLoadCHeaderDiskCache(
                     return cacheMiss("sidecar hash");
                 entry.cxxBitcode.assign((*sidecar)->getBuffer().data(), (*sidecar)->getBuffer().size());
             }
-            else if (requireBitcode)
+            else if (requireBitcode && entry.cxxDemandGroupKey.empty())
                 return cacheMiss("missing sidecar");
 
             // A deep (transitive) entry is only fresh if every recorded include is unchanged.
@@ -3248,7 +3346,9 @@ std::shared_ptr<LLVMBackend::CSigBaseline> LLVMBackend::AcquireSigBaseline(
         const auto path = cacheDir / std::format("sigbase.{}.json", id);
         if (!fs::exists(path, ec))
         {
-            const auto temp = cacheDir / std::format("sigbase.{}.{}.tmp", id, _getpid());
+            // Unique per write: concurrent LSP backends' cache workers share this process id.
+            const uint64_t tempId = gCHeaderDiskCacheTempCounter.fetch_add(1, std::memory_order_relaxed);
+            const auto temp = cacheDir / std::format("sigbase.{}.{}.{}.tmp", id, _getpid(), tempId);
             {
                 std::ofstream out(temp, std::ios::binary | std::ios::trunc);
                 if (!out.is_open()) return nullptr;
@@ -3261,7 +3361,9 @@ std::shared_ptr<LLVMBackend::CSigBaseline> LLVMBackend::AcquireSigBaseline(
             if (ec) { ec.clear(); fs::remove(temp, ec); }
         }
         {
-            const auto temp = cacheDir / std::format("sigbase.{}.{}.ptr.tmp", groupKey, _getpid());
+            const uint64_t tempId = gCHeaderDiskCacheTempCounter.fetch_add(1, std::memory_order_relaxed);
+            const auto temp = cacheDir / std::format("sigbase.{}.{}.{}.ptr.tmp", groupKey, _getpid(),
+                                                     tempId);
             std::ofstream out(temp, std::ios::binary | std::ios::trunc);
             if (out.is_open())
             {
@@ -3457,6 +3559,40 @@ void LLVMBackend::WriteCHeaderDiskCache(
             j["cxxbc"] = {{"file", sidecarPath.filename().string()},
                            {"len", static_cast<uint64_t>(entry.cxxBitcode.size())},
                            {"hash", sidecarHash}};
+        }
+        if (!entry.cxxDemandGroupKey.empty()) j["cxxdemand"] = entry.cxxDemandGroupKey;
+        if (entry.cxxDemandReplayChunk.headerHarvest
+            || !entry.cxxDemandReplayChunk.source.empty())
+        {
+            auto writeReplayChunk = [](const cflat_cinterop::ExtractResult::DemandReplayChunk& chunk) {
+                nlohmann::json types = nlohmann::json::array();
+                for (const auto& type : chunk.typeRequests)
+                    types.push_back({{"cxx", type.cxxSpelling}, {"cflat", type.cflatName}});
+                nlohmann::json probes = nlohmann::json::array();
+                for (const auto& probe : chunk.macroProbes)
+                    probes.push_back({{"name", probe.name}, {"file", probe.file},
+                                      {"alias", probe.aliasTarget}, {"line", probe.line},
+                                      {"col", probe.col}});
+                return nlohmann::json{
+                    {"order", chunk.order}, {"source", chunk.source},
+                    {"prefix", chunk.prefixSource}, {"marker", chunk.markerPrefix},
+                    {"thunk", chunk.thunkSuffix}, {"wrappers", chunk.wrapperNames},
+                    {"batch", chunk.wrapperBatch}, {"auto", chunk.autoInstantiate},
+                    {"types", std::move(types)}, {"header", chunk.headerHarvest},
+                    {"wantmacros", chunk.wantMacros}, {"inscope", chunk.requireInScope},
+                    {"checkscope", chunk.checkHeaderScope},
+                    {"scopeheader", chunk.scopeHeaderPath}, {"scopedirs", chunk.inScopeDirs},
+                    {"probes", std::move(probes)}};
+            };
+            nlohmann::json replay = writeReplayChunk(entry.cxxDemandReplayChunk);
+            if (!entry.cxxDemandReplayChunk.follow.empty())
+            {
+                nlohmann::json follow = nlohmann::json::array();
+                for (const auto& chunk : entry.cxxDemandReplayChunk.follow)
+                    follow.push_back(writeReplayChunk(chunk));
+                replay["follow"] = std::move(follow);
+            }
+            j["cxxreplay"] = std::move(replay);
         }
 
         // The transitive include set (header imports) for transitive validation.
@@ -3712,7 +3848,8 @@ bool LLVMBackend::BindCanonicalCHeader(const std::filesystem::path& headerCanon,
                 if (it != cFileSigCache_.end()) { entryToWrite = it->second; haveEntry = true; }
             }
             if (haveEntry)
-                WriteCHeaderDiskCache(pkgCacheDir, diskKey, headerMtime, contentHash, entryToWrite);
+                ScheduleCHeaderDiskCacheWrite(pkgCacheDir, diskKey, headerMtime, contentHash,
+                                              std::move(entryToWrite));
         }
 
         if (ok) ProcessPendingMacroSources();

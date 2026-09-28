@@ -1105,6 +1105,7 @@ LLVMBackend::CompileTimeMacro LLVMBackend::GetCompileTimeMacro(const std::string
 
 LLVMBackend::StructData LLVMBackend::GetDataStructure(const std::string& structName)
 {
+        EnsureCxxRecordProjected(structName, false);
         auto result = dataStructures.find(structName);
         if (result != dataStructures.end())
         {

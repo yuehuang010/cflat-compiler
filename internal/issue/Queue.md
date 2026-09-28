@@ -26,11 +26,18 @@ are ~2 GB each). Only the main session runs torch, at `-j 1`, one run at a time.
 
 | Row | Branch | Issue(s) | Notes |
 |-----|--------|----------|-------|
-| AM3 | fix/inherited-static | p3/cpp-inherited-static-members-and-member-operators-not-found | Codex x2 stalled; opus finishing (segfault regression in err_cpp_struct_tpl_arg_incomplete_list, eigen_03 Identity). Unblocks eigen_03, and part of eigen_04 |
-| AP | fix/union-bitfield | p2/c-bitfield-union-access-and-enum-bitfield | in review (2410ac11, cache 114) |
-| AQ | fix/mt-nontpl | p2/cpp-member-template-vs-nontemplate-overload-ranking | wrong overload when a member template sits beside a non-template |
+| BE | spike | p1 cold trace on P3 build | done: scratch/cold_trace_p3.md (parse 4.65 s vs clang frontend 4.04; RegisterCRecords 2.74 s for 5,656 records / 33,941 members, 5 used) |
 
-## Bucket 1 - test_libs blockers (first)
+## Bucket 0 - PRIORITY: C++ import compile time parity (p1, 2026-09-27)
+
+Target: cflat within 10% of clang++ compiling the equivalent C++ program, cold AND warm.
+Issue p1/cpp-import-compile-time-parity-with-clang. Today: warm 4.2x, cold 23x (torch benchmark,
+scratch/cmp/parity.sh). Staging: (a) warm - one pre-linked companion + one bound-surface snapshot per
+import group; (b) cold - spike + plan for one clang parse per import group (persistent Sema), then build.
+Gate adds scratch/cmp/parity.sh before/after numbers on an idle machine. One sample at a time:
+sample 1 = torch training benchmark (scratch/cmp/train.cb); next samples only after sample 1 is at parity.
+
+## Bucket 1 - test_libs blockers
 
 The remaining DISABLED cases in `test_libs/`. Each landing removes its DISABLED marker.
 
@@ -48,11 +55,6 @@ or mis-score a pointer argument against a non-pointer C++ parameter. Governed by
 
 | Run | Issue | Kind |
 |-----|-------|------|
-| 2a | p2/cpp-pointer-argument-binds-bool-reference-directly | wrong value |
-| 2a | p2/cpp-primitive-pointer-binds-class-reference-by-reinterpretation | wrong value |
-| 2a | p2/cpp-pointer-argument-into-int-parameter-fails-verification | verifier failure -> compile error |
-| 2a | p2/cpp-spelled-constructor-ignores-argument-pointer-depth | wrong value (2 sites) |
-| 2a | p3/cpp-template-bool-parameter-accepts-pointer | wrong acceptance |
 | 2b | p3/cpp-pointer-argument-prefers-char-pointer-over-converting-ctor | wrong overload |
 | 2b | p3/cpp-single-level-pointer-unproven-at-call-argument | refusal gap (3 shapes) |
 | 2b | p3/cpp-operator-address-of-operand-not-converted | refusal gap |
@@ -132,7 +134,6 @@ cold + warm torch run in the gate.
 | p3/cpp-candidate-tier-differs-cold-vs-warm | batch candidate (CandidateCxxGroupsFor) |
 | p3/cpp-check-mode-cannot-repopulate-type-request-cache | full (design: --check writing the cache) |
 | p3/cpp-noinc-mode-std-map-lookup-fails | full (root cause not established) |
-| p3/cpp-interop-fixtures-gate-ci-wall-time | perf; profile first, no fix before a measurement |
 
 ## Bucket 8 - std library coverage
 
@@ -165,3 +166,28 @@ At most 3 implementers at once. Rows touching the same function (2a/2b, 4/Bucket
 
 | Hash | Row | Issue(s) |
 |------|-----|----------|
+| 77a7134b | AP | p2/c-bitfield-union-access-and-enum-bitfield (cache 114) |
+| e6c60220 | AQ | p2/cpp-member-template-vs-nontemplate-overload-ranking (cache 115) |
+| be21a0f8 | AV | p3/cpp-free-wrapper-returns-reference-into-own-frame |
+| 3b3df77d | AY | p2/eigen07-warm-cache-inline-asm-fatal (untracked issue, deleted) |
+| 3c0b5e78 | AT | bucket 2a: 5 pointer-argument issues (p2 x4, p3 template-bool) |
+| 72e9b223 | AZ | p2/cpp-free-template-operator-std-function-temporary-bitwise-copy (untracked, deleted) |
+| d4fa2eaa | AM | p3/cpp-inherited-static-members-and-member-operators-not-found |
+| 0d1386fa | AU | p3/cpp-variadic-ctor-wrapper-from-expression-template-not-registered (untracked, deleted); eigen_03/04/05 enabled, tier 2 20/0/0 |
+| d9da1ee6 | BA | p2/cpp-template-wrapper-string-literal-const-ref-returns-wrapper-local (untracked, deleted) |
+| 7ecfac3f | AX | p3/cpp-ctor-thunk-brace-argument-backing-array-dangles (Fable-advised; remaining shapes -> p3/cpp-brace-argument-backing-remaining-shapes) |
+| 82370cc5 | AS+AW+BD | p1 parity: P1+P2+P3 (lazy std::function binds, demand-driven companion per group, cache 117); torch warm 0.9x, cold 3.5x |
+| 4a4636b6 | BF | move dataflow RPO worklist: test_cpp_interop main 163 s -> 0.27 s; test.sh ~279 -> ~126-159 s |
+| 4920585a | BH | C++ import: skip unneeded inline bodies in initial group parse, late-parse demanded ones (group parse 3.88 -> 2.43 s, torch cold 11.5 -> 10.4 s); header cache v119 |
+| 2a0a0d58 | DI | C++ default-wrapper drop: name index built once instead of O(n^2) rescan (torch cold -0.7 s) |
+| bda8b836 | BJ | C++ import cold glue: namespace scan once per header; C header disk cache written on a joined worker thread (torch cold ~-0.5-1 s) |
+| e95d8a0c | BK | C++ type requests: free-operator candidate index per header root, owned by the group (was whole-TU walk per request) |
+| 7b1755eb | BG | C++ import: lazy record projection (shells, layout on demand, exact member projection) + [over.ics.rank] 3.2.3 T&& vs const T& unblock; torch warm 3.26 -> 1.33 s (0.4x), cold 10.0 -> 8.0 s |
+| 02ae6de0 | CJ | C header disk cache: read joins only the pending write of its own entry (torch cold -0.44 s) |
+| 2aa9ed2e | BL | C++ harvest visitor pruning (DeclVisitor skips bodies/TypeLocs; ErrorBodySweep no double descent) |
+| e8bd177b | BN | C++ by-value gate decides from raw cached record data; pending by-value layouts bind on first use (torch cold -0.35 s) |
+| 92149b7f | BQ | C++ reverse spelling index no longer rebuilt after every member projection; SqueezeCxxSpelling no-whitespace fast path (torch warm ~1.5 -> ~0.85 s) |
+| 56311538 | DS | Dependency recording: memoized canonical directory + listing, one lstat per file; manifest reuses recorded paths (+ 649c8ba3 case-insensitive leaf fix) (torch warm ~-0.3 s) |
+| 6f221fce | UV | C++ definitions plan: UsedStaticVarVisitor skips statements and TypeLocs |
+| edc89a47 | BP | C++ warm-edit demand replay (cache v124); linker output held back after replay, failed link -> cold retry (torch warm-edit 7.6 -> 6.0 s) |
+| 85dfb8cc | NS | Header namespace scan: bulk read + up to 4 workers (cold ~-0.1 s) |

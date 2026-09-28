@@ -35,7 +35,34 @@ done
 START_TIME=$SECONDS
 OVERALL_ERRORS=0
 
+# Per-stage wall time: each banner closes the previous stage. The table prints at the end and one
+# CSV line per run goes to scratch/buildci_timings.csv so runtimes can be tracked across runs.
+STAGE_NAMES=()
+STAGE_SECS=()
+STAGE_NAME=""
+STAGE_START=$SECONDS
+stage_close() {
+    if [ -n "$STAGE_NAME" ]; then
+        STAGE_NAMES+=("$STAGE_NAME")
+        STAGE_SECS+=($((SECONDS - STAGE_START)))
+    fi
+    STAGE_NAME="$1"
+    STAGE_START=$SECONDS
+}
+timing_report() {
+    stage_close ""
+    echo "Stage timings:"
+    local i csv="$(date '+%Y-%m-%d %H:%M'),$(git -C "$SCRIPT_DIR" rev-parse --short HEAD 2>/dev/null),tier$LIBS_TIER"
+    for i in "${!STAGE_NAMES[@]}"; do
+        printf '  %-45s %5ss\n' "${STAGE_NAMES[$i]}" "${STAGE_SECS[$i]}"
+        csv="$csv,${STAGE_NAMES[$i]}=${STAGE_SECS[$i]}"
+    done
+    printf '  %-45s %5ss\n' "TOTAL" "$((SECONDS - START_TIME))"
+    mkdir -p "$SCRIPT_DIR/scratch" && echo "$csv,total=$((SECONDS - START_TIME))" >> "$SCRIPT_DIR/scratch/buildci_timings.csv"
+}
+
 banner() {
+    [ -n "$1" ] && stage_close "$1"
     echo
     echo "========================================================================="
     echo "$1"
@@ -50,6 +77,7 @@ if ! bash "$SCRIPT_DIR/cmake_build.sh" release; then
     echo "BUILD FAILED: Release"
     OVERALL_ERRORS=$((OVERALL_ERRORS + 1))
     banner ""
+    timing_report
     echo "Elapsed: $((SECONDS - START_TIME))s"
     echo "CI FAILED: $OVERALL_ERRORS stages failed."
     exit 1
@@ -94,6 +122,7 @@ if ! bash "$SCRIPT_DIR/package_release.sh"; then
 fi
 
 banner ""
+timing_report
 echo "Elapsed: $((SECONDS - START_TIME))s"
 if [ "$OVERALL_ERRORS" -eq 0 ]; then
     echo "CI PASSED."

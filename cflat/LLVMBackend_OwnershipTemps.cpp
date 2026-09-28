@@ -907,6 +907,8 @@ void LLVMBackend::EmitError(std::string message, std::string sourceMessage) cons
 {
         if (batchMode_)
             throw CompilerAbortException{ message, sourceFileName, currentLine, currentColumn };
+        // exit() skips ~LLVMBackend; a disk-cache worker must not outlive static teardown.
+        const_cast<LLVMBackend*>(this)->JoinCHeaderDiskCacheWriters();
         exit(1);
     }
 
@@ -5442,6 +5444,7 @@ int LLVMBackend::GetOrMintViewScope(const std::string& originKey)
 
 LLVMBackend::~LLVMBackend()
 {
+        JoinCHeaderDiskCacheWriters();
         CompilerManager::Instance().Unregister(this);
         // An LSP slot replaced after a crash skipped its analysis' scope guards (SEH unwinds no
         // destructors): release its header-cache root or it stays in progress forever.

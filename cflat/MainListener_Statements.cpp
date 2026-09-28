@@ -2881,6 +2881,11 @@ void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {
                     // Imported C++ containers use the C++ range protocol directly. In
                     // particular, do not route them through CFlat's count()/get() protocol:
                     // begin/end also covers containers whose only indexing shape is an iterator.
+                    if (compiler->IsCxxRecord(collNV.TypeAndValue.TypeName))
+                    {
+                        compiler->EnsureCxxMemberProjected(collNV.TypeAndValue.TypeName, "begin");
+                        compiler->EnsureCxxMemberProjected(collNV.TypeAndValue.TypeName, "end");
+                    }
                     const auto* foreignInfo = compiler->GetCxxClassInfo(collNV.TypeAndValue.TypeName);
                     const bool hasBegin = foreignInfo != nullptr
                         && std::find(foreignInfo->instanceMethodNames.begin(),
@@ -3024,6 +3029,11 @@ void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {
 
                         auto beginNV = materializeIterator("__cflat_range_begin", "begin");
                         auto endNV = materializeIterator("__cflat_range_end", "end");
+                        // The loop calls the iterator's operators by name; project them first.
+                        if (!beginNV.TypeAndValue.Pointer
+                            && compiler->IsCxxRecord(beginNV.TypeAndValue.TypeName))
+                            for (const char* op : { "operator*", "operator++", "operator!=" })
+                                compiler->EnsureCxxMemberProjected(beginNV.TypeAndValue.TypeName, op);
 
                         // Keep loop control in an empty frame. The iterator and collection locals
                         // live in the outer init frame, so break reaches resume without cleaning

@@ -126,6 +126,15 @@ struct MemRankNonTemplate {
     int pick(int, MemRankOpt) const { return 1; }
     int pick(int, double) const { return 3611; }
 };
+// A converting-constructor temporary binds `T&&` over `const T&` ([over.ics.rank] 3.2.3).
+struct MemRankBox { int v; MemRankBox(int x) : v(x) {} };
+struct MemRankRref {
+    int n = 0;
+    void push(MemRankBox&& b) { n = 3700 + b.v; }
+    void push(const MemRankBox& b) { n = 1; }
+};
+inline int memrank_rref(MemRankBox&& b) { return 3700 + b.v; }
+inline int memrank_rref(const MemRankBox& b) { return 1; }
 
 struct LateMemberWrapper {
     int add(int n = 9) const { return n + 1; }

@@ -68,6 +68,7 @@
 #include <set>
 #include <array>
 #include <algorithm>
+#include <mutex>
 #include <cctype>
 #include <chrono>
 #include <string_view>
@@ -524,6 +525,17 @@ namespace cflat_cinterop
             llvm::SmallString<128> storage;
             llvm::raw_svector_ostream os(storage);
             mangle->mangleName(gd, os);
+            return os.str().str();
+        }
+
+        // The symbol CodeGen gives GD: its mangled name, or the plain name for C linkage.
+        std::string DemandSymbolName(MangleContext& mangle, GlobalDecl gd)
+        {
+            const auto* named = llvm::cast<NamedDecl>(gd.getDecl());
+            if (!mangle.shouldMangleDeclName(named)) return named->getNameAsString();
+            llvm::SmallString<128> storage;
+            llvm::raw_svector_ostream os(storage);
+            mangle.mangleName(gd, os);
             return os.str().str();
         }
 
@@ -1015,8 +1027,30 @@ namespace cflat_cinterop
             ASTContext& ctx;
             SourceManager& sm;
             ExtractState& st;
+            const Stmt* skippedBody = nullptr;
 
             DeclVisitor(ASTContext& c, ExtractState& s) : ctx(c), sm(c.getSourceManager()), st(s) {}
+
+            // Harvested API data comes from declarations, not function statements.
+            bool shouldWalkTypesOfTypeLocs() const { return false; }
+
+            bool TraverseFunctionDecl(FunctionDecl* fd)
+            {
+                if (fd == nullptr || fd->getBody() == nullptr)
+                    return RecursiveASTVisitor<DeclVisitor>::TraverseFunctionDecl(fd);
+                const Stmt* previous = skippedBody;
+                skippedBody = fd->getBody();
+                const bool result = RecursiveASTVisitor<DeclVisitor>::TraverseFunctionDecl(fd);
+                skippedBody = previous;
+                return result;
+            }
+
+            bool TraverseStmt(
+                Stmt* stmt, RecursiveASTVisitor<DeclVisitor>::DataRecursionQueue* queue = nullptr)
+            {
+                if (stmt == skippedBody) return true;
+                return RecursiveASTVisitor<DeclVisitor>::TraverseStmt(stmt, queue);
+            }
 
             void PrepareHeaderSpecialMembers(const CXXRecordDecl* cxx);
             std::string InvalidDefinitionRefusal(const CXXRecordDecl* def) const;
@@ -2375,15 +2409,18 @@ namespace cflat_cinterop
                             continue;
                         }
                     }
-                    // An inline / constexpr static member is emitted per-TU on demand, so the
-                    // bound library need not contain it. Only an out-of-line definition is a
-                    // symbol CFlat may read.
+                    // Inline, constexpr and implicit template static members are emitted into
+                    // the request companion; other out-of-line definitions remain library-owned.
                     // With definition emission on the storage is emitted into the companion module
                     // (linkonce_odr, so several importers merge), which makes it a real symbol.
+                    const bool isImplicitTemplateDefinition =
+                        vd->getTemplateSpecializationKind() == clang::TSK_ImplicitInstantiation
+                        && vd->getDefinition() != nullptr;
                     const bool emitLocal =
                         (st.req.emitDefinitions || st.req.assumeInlineDefinitions)
-                        && (vd->isConstexpr() || vd->isInline())
-                        && vd->getDefinition() != nullptr;
+                        && ((vd->isConstexpr() || vd->isInline()
+                             || isImplicitTemplateDefinition)
+                            && vd->getDefinition() != nullptr);
                     // Why a static data member was left out is invisible at the use site
                     // ("'count' does not name a value"), so name the reason under -v.
                     auto skipStaticVar = [&](const char* why) {
@@ -2847,6 +2884,70 @@ namespace cflat_cinterop
              */
             bool ProcessTypeRequests(TranslationUnitDecl* root)
             {
+                std::vector<Decl*> operatorCandidates;
+                auto isComparisonOperator = [](OverloadedOperatorKind op) {
+                    switch (op)
+                    {
+                        case OO_EqualEqual: case OO_ExclaimEqual:
+                        case OO_Less: case OO_Greater:
+                        case OO_LessEqual: case OO_GreaterEqual:
+                            return true;
+                        default: return false;
+                    }
+                };
+                auto collectCandidates = [&](auto&& self, Decl* decl,
+                                             std::vector<Decl*>& candidates) -> void {
+                    if (auto* fd = llvm::dyn_cast<FunctionDecl>(decl))
+                    {
+                        bool concreteFunction = !fd->getReturnType()->isDependentType();
+                        if (concreteFunction)
+                            for (const ParmVarDecl* p : fd->parameters())
+                                concreteFunction = concreteFunction
+                                    && !p->getType()->isDependentType();
+                        const bool instantiatedFriend = !llvm::isa<CXXMethodDecl>(fd)
+                            && concreteFunction;
+                        const bool specialization = fd->isFunctionTemplateSpecialization()
+                            || (fd->getPrimaryTemplate() != nullptr
+                                && fd->getDescribedFunctionTemplate() == nullptr);
+                        if (!llvm::isa<CXXMethodDecl>(fd)
+                            && (specialization || instantiatedFriend)
+                            && isComparisonOperator(fd->getOverloadedOperator()))
+                            candidates.push_back(decl);
+                        return;
+                    }
+                    if (auto* ftd = llvm::dyn_cast<FunctionTemplateDecl>(decl))
+                    {
+                        const FunctionDecl* pattern = ftd->getTemplatedDecl();
+                        if (pattern != nullptr && !llvm::isa<CXXMethodDecl>(pattern)
+                            && pattern->getNumParams() == 2
+                            && IsBindableFreeBinaryOperator(pattern->getOverloadedOperator()))
+                            candidates.push_back(decl);
+                    }
+                    if (auto* dc = llvm::dyn_cast<DeclContext>(decl))
+                        for (Decl* child : dc->decls()) self(self, child, candidates);
+                };
+                TranslationUnitDecl* indexRoot = st.contextRoot != nullptr
+                    ? st.contextRoot : root;
+                const DeclContext* cacheRoot = indexRoot;
+                std::vector<Decl*> contextCandidates;
+                if (st.req.operatorIndex != nullptr)
+                {
+                    auto& index = *st.req.operatorIndex;
+                    auto found = index.find(indexRoot);
+                    if (found == index.end())
+                    {
+                        std::vector<Decl*> indexed;
+                        collectCandidates(collectCandidates, indexRoot, indexed);
+                        found = index.emplace(indexRoot, std::move(indexed)).first;
+                    }
+                    contextCandidates = found->second;
+                }
+                else
+                    collectCandidates(collectCandidates, indexRoot, contextCandidates);
+                if (cacheRoot != root)
+                    collectCandidates(collectCandidates, root, operatorCandidates);
+                operatorCandidates.insert(operatorCandidates.end(), contextCandidates.begin(),
+                                          contextCandidates.end());
                 for (size_t i = 0; i < st.req.cxxTypeRequests.size(); ++i)
                 {
                     const std::string marker = st.req.cxxRequestMarkerPrefix
@@ -2864,8 +2965,10 @@ namespace cflat_cinterop
                     CXXRecordDecl* def = cxx->getDefinition();
                     // A request spelled as a plain ALIAS carries no explicit instantiation and a
                     // typedef never requires completeness, so complete it silently through Sema.
+                    // A member class of a specialization (NamedDict<K, V>::Item) instantiates too.
                     if (def == nullptr && st.ci != nullptr && st.ci->hasSema()
-                        && llvm::isa<ClassTemplateSpecializationDecl>(cxx))
+                        && (llvm::isa<ClassTemplateSpecializationDecl>(cxx)
+                            || cxx->getInstantiatedFromMemberClass() != nullptr))
                     {
                         st.ci->getSema().isCompleteType(td->getLocation(), canon);
                         def = cxx->getDefinition();
@@ -2934,20 +3037,8 @@ namespace cflat_cinterop
                         }
                         return false;
                     };
-                    auto collectOperatorTemplate = [&](Decl* decl) {
-                        auto* ftd = llvm::dyn_cast<FunctionTemplateDecl>(decl);
-                        if (ftd == nullptr) return;
-                        const FunctionDecl* pattern = ftd->getTemplatedDecl();
-                        if (pattern == nullptr || llvm::isa<CXXMethodDecl>(pattern)
-                            || pattern->getNumParams() != 2
-                            || !IsBindableFreeBinaryOperator(pattern->getOverloadedOperator()))
-                            return;
-                        bool matches = false;
-                        for (const ParmVarDecl* p : pattern->parameters())
-                            matches = matches || mentionsRequestedTemplate(p->getType());
-                        if (matches) VisitFunctionTemplateDecl(ftd);
-                    };
                     std::unordered_set<const FunctionDecl*> seenOperators;
+                    std::vector<Decl*> matchedOperatorDecls;
                     auto collectOperator = [&](Decl* decl) {
                         const auto* fd = llvm::dyn_cast<FunctionDecl>(decl);
                         bool concreteFunction = fd != nullptr && !fd->getReturnType()->isDependentType();
@@ -2965,34 +3056,49 @@ namespace cflat_cinterop
                         if ((!specialization && !instantiatedFriend) || llvm::isa<CXXMethodDecl>(fd)
                             || !seenOperators.insert(fd).second)
                             return;
-                        switch (fd->getOverloadedOperator())
-                        {
-                            case OO_EqualEqual: case OO_ExclaimEqual:
-                            case OO_Less: case OO_Greater:
-                            case OO_LessEqual: case OO_GreaterEqual:
-                                break;
-                            default: return;
-                        }
+                        if (!isComparisonOperator(fd->getOverloadedOperator())) return;
                         bool matches = false;
                         for (const ParmVarDecl* p : fd->parameters())
                             matches = matches || mentionsRequested(p->getType());
-                        if (matches) VisitFunctionDecl(const_cast<FunctionDecl*>(fd));
+                        if (matches) matchedOperatorDecls.push_back(const_cast<FunctionDecl*>(fd));
                     };
-                    std::function<void(Decl*)> walkOperators;
-                    walkOperators = [&](Decl* decl) {
-                        collectOperator(decl);
-                        collectOperatorTemplate(decl);
-                        if (llvm::isa<FunctionDecl>(decl)) return;
-                        if (auto* dc = llvm::dyn_cast<DeclContext>(decl))
-                            for (Decl* child : dc->decls()) walkOperators(child);
+                    auto collectOperatorTemplate = [&](Decl* decl) {
+                        auto* ftd = llvm::dyn_cast<FunctionTemplateDecl>(decl);
+                        if (ftd == nullptr) return;
+                        const FunctionDecl* pattern = ftd->getTemplatedDecl();
+                        if (pattern == nullptr || llvm::isa<CXXMethodDecl>(pattern)
+                            || pattern->getNumParams() != 2
+                            || !IsBindableFreeBinaryOperator(pattern->getOverloadedOperator()))
+                            return;
+                        bool matches = false;
+                        for (const ParmVarDecl* p : pattern->parameters())
+                            matches = matches || mentionsRequestedTemplate(p->getType());
+                        if (matches) matchedOperatorDecls.push_back(ftd);
                     };
-                    walkOperators(root);
-                    if (st.contextRoot != nullptr && st.contextRoot != root)
-                        walkOperators(st.contextRoot);
-                    for (Decl* d : st.announcedDecls)
+                    auto collectFrom = [&](const std::vector<Decl*>& decls) {
+                        seenOperators.clear();
+                        matchedOperatorDecls.clear();
+                        for (Decl* decl : decls)
+                        {
+                            collectOperator(decl);
+                            collectOperatorTemplate(decl);
+                        }
+                    };
+                    /*
+                     * Requested specializations and their instantiated friends are reached
+                     * through the context walk, but only a small fraction are operators. Index
+                     * the cheap-filtered declarations once and keep their original walk order.
+                     */
+                    std::vector<Decl*> candidates = operatorCandidates;
+                    candidates.insert(candidates.end(), st.announcedDecls.begin(),
+                                      st.announcedDecls.end());
+                    collectFrom(candidates);
+                    for (Decl* decl : matchedOperatorDecls)
                     {
-                        collectOperator(d);
-                        collectOperatorTemplate(d);
+                        if (auto* fd = llvm::dyn_cast<FunctionDecl>(decl))
+                            VisitFunctionDecl(fd);
+                        else if (auto* ftd = llvm::dyn_cast<FunctionTemplateDecl>(decl))
+                            VisitFunctionTemplateDecl(ftd);
                     }
                     std::string ret;
                     std::string params;
@@ -4460,6 +4566,12 @@ namespace cflat_cinterop
                 const auto* value = llvm::dyn_cast<ValueDecl>(d);
                 return value != nullptr && value->getType()->isDependentType();
             };
+            // A live group records CodeGen work for its one demand pass instead of emitting now.
+            CxxDemandPlan* const plan = st.req.demandPlan;
+            auto hand = [&](Decl* d) {
+                if (plan != nullptr) plan->Add(d);
+                else cg.HandleTopLevelDecl(DeclGroupRef(d));
+            };
             auto emitDecl = [&](Decl* d, auto&& emitDeclRef) -> void {
                 if (d == nullptr || !inScopeDecl(d)) return;
                 if (const auto* linkage = llvm::dyn_cast<LinkageSpecDecl>(d))
@@ -4505,7 +4617,7 @@ namespace cflat_cinterop
                     }
                     return;
                 }
-                cg.HandleTopLevelDecl(DeclGroupRef(d));
+                hand(d);
             };
 
             /*
@@ -4523,10 +4635,29 @@ namespace cflat_cinterop
             struct ErrorBodySweep : RecursiveASTVisitor<ErrorBodySweep>
             {
                 ErrorReachScan& scan;
+                const Stmt* skippedBody = nullptr;
                 std::vector<FunctionDecl*> direct;
 
                 explicit ErrorBodySweep(ErrorReachScan& s) : scan(s) {}
                 bool shouldVisitTemplateInstantiations() const { return true; }
+                // VisitFunctionDecl scans its own body through ErrorReachScan when needed.
+                bool shouldWalkTypesOfTypeLocs() const { return false; }
+                bool TraverseFunctionDecl(FunctionDecl* fd)
+                {
+                    if (fd == nullptr || fd->getBody() == nullptr)
+                        return RecursiveASTVisitor<ErrorBodySweep>::TraverseFunctionDecl(fd);
+                    const Stmt* previous = skippedBody;
+                    skippedBody = fd->getBody();
+                    const bool result = RecursiveASTVisitor<ErrorBodySweep>::TraverseFunctionDecl(fd);
+                    skippedBody = previous;
+                    return result;
+                }
+                bool TraverseStmt(Stmt* stmt,
+                                  RecursiveASTVisitor<ErrorBodySweep>::DataRecursionQueue* queue = nullptr)
+                {
+                    if (stmt == skippedBody) return true;
+                    return RecursiveASTVisitor<ErrorBodySweep>::TraverseStmt(stmt, queue);
+                }
                 bool VisitFunctionDecl(FunctionDecl* fd)
                 {
                     if (fd == nullptr || !fd->doesThisDeclarationHaveABody()) return true;
@@ -4577,7 +4708,7 @@ namespace cflat_cinterop
                         if (!md->doesThisDeclarationHaveABody() || md->isInvalidDecl()
                             || isDependentCodeGenDecl(md) || !methods.insert(md).second)
                             continue;
-                        cg.HandleTopLevelDecl(DeclGroupRef(const_cast<CXXMethodDecl*>(md)));
+                        hand(const_cast<CXXMethodDecl*>(md));
                     }
                 }
             }
@@ -4605,6 +4736,10 @@ namespace cflat_cinterop
                 }
 
                 bool shouldVisitTemplateInstantiations() const { return true; }
+                // A static data member is declared only in a class body, never in a statement or
+                // a local class (C++ forbids that), so function bodies and initializers are skipped.
+                bool shouldWalkTypesOfTypeLocs() const { return false; }
+                bool TraverseStmt(Stmt*, DataRecursionQueue* = nullptr) { return true; }
 
                 bool VisitVarDecl(VarDecl* vd)
                 {
@@ -4629,7 +4764,7 @@ namespace cflat_cinterop
                                   << vd->getQualifiedNameAsString() << "\n";
                     return;
                 }
-                cg.HandleTopLevelDecl(DeclGroupRef(const_cast<VarDecl*>(vd)));
+                hand(const_cast<VarDecl*>(vd));
             };
             for (const VarDecl* vd : st.varEmitWork) handOverStaticVar(vd);
             /*
@@ -4638,14 +4773,28 @@ namespace cflat_cinterop
              * reach its storage, but do not request it (Phase 2 below): only what this module
              * references gets emitted.
              */
+            // A demand plan already holds what earlier chunks handed over, so the whole-header
+            // re-walk (the old per-request floor) is skipped there.
             std::vector<const VarDecl*> sharedVarWork(st.varEmitWork);
-            UsedStaticVarVisitor sharedStaticVars(sharedVarWork);
-            for (Decl* d : st.sharedDecls) sharedStaticVars.TraverseDecl(d);
-            for (size_t i = st.varEmitWork.size(); i < sharedVarWork.size(); ++i)
-                handOverStaticVar(sharedVarWork[i]);
+            if (plan == nullptr)
+            {
+                UsedStaticVarVisitor sharedStaticVars(sharedVarWork);
+                for (Decl* d : st.sharedDecls) sharedStaticVars.TraverseDecl(d);
+                for (size_t i = st.varEmitWork.size(); i < sharedVarWork.size(); ++i)
+                    handOverStaticVar(sharedVarWork[i]);
+            }
 
             // Phase 2: reference what cflat binds so the deferred bodies become emission work.
-            auto request = [&](GlobalDecl gd) { cg.GetAddrOfGlobal(gd, /*isForDefinition*/ false); };
+            std::unique_ptr<MangleContext> planMangler(
+                plan != nullptr ? ctx.createMangleContext() : nullptr);
+            auto request = [&](GlobalDecl gd) {
+                if (plan == nullptr)
+                {
+                    cg.GetAddrOfGlobal(gd, /*isForDefinition*/ false);
+                    return;
+                }
+                plan->bound[DemandSymbolName(*planMangler, gd)] = gd.getAsOpaquePtr();
+            };
             // hasBody(), not getDefinition(): a defaulted or deleted member is already "a
             // definition" in the AST, and only a real body is something CodeGen can emit.
             for (const auto& [idx, fd] : st.abiWork)
@@ -4851,7 +5000,7 @@ namespace cflat_cinterop
             for (const FunctionDecl* fd : usedFunctionWork)
             {
                 if (overInvalidRecord(fd)) continue;
-                cg.HandleTopLevelDecl(DeclGroupRef(const_cast<FunctionDecl*>(fd)));
+                hand(const_cast<FunctionDecl*>(fd));
             }
             // Registered lazily, like the shared static members above: CodeGen emits the storage
             // only when a body in this module references it.
@@ -4870,7 +5019,7 @@ namespace cflat_cinterop
              * group ever emitted (and a cache entry keyed on one request link another
              * program's thunks).
              */
-            if (!st.sharedDecls.empty())
+            if (!st.sharedDecls.empty() && plan == nullptr)
             {
                 std::vector<const FunctionDecl*> sharedWork;
                 UsedFunctionVisitor sharedFunctions(sharedWork);
@@ -4913,7 +5062,71 @@ namespace cflat_cinterop
                                   << "' is an explicit instantiation declaration\n";
                     continue;
                 }
-                cg.HandleVTable(const_cast<CXXRecordDecl*>(def));
+                if (plan == nullptr)
+                {
+                    cg.HandleVTable(const_cast<CXXRecordDecl*>(def));
+                    continue;
+                }
+                // The Microsoft ABI names no single vftable symbol; the demand pass hands those
+                // over unconditionally.
+                std::string vtableName = "vftable:" + def->getQualifiedNameAsString();
+                if (!ctx.getTargetInfo().getCXXABI().isMicrosoft())
+                {
+                    vtableName.clear();
+                    llvm::raw_string_ostream os(vtableName);
+                    planMangler->mangleCXXVTable(def, os);
+                }
+                plan->vtables.emplace(std::move(vtableName), def);
+            }
+
+            if (plan != nullptr)
+            {
+                /*
+                 * No module to inspect: a member binds locally when the demand pass WILL emit
+                 * its body - it has one, reaches no error and is not dependent - or a generated
+                 * thunk stands in for it (BindCxxVirtualThunk proved that body). Otherwise the
+                 * library must own the symbol, or the member is refused at the use site.
+                 */
+                for (const auto& w : st.memberAbiWork)
+                {
+                    if (w.recordIdx >= st.out.records.size()) continue;
+                    RawRecord& rec = st.out.records[w.recordIdx];
+                    if (w.memberIdx >= rec.members.size()) continue;
+                    RawCxxMember& m = rec.members[w.memberIdx];
+                    if (w.md != nullptr && errorReach->Reaches(w.md))
+                    {
+                        if (m.bindRefusal.empty())
+                        {
+                            m.bindRefusal = "cannot be instantiated for these template arguments "
+                                            "(clang reported an error inside the body it generated)";
+                            m.refusalCause = errorReach->CauseOf(w.md);
+                        }
+                        m.linkageName.clear();
+                        m.abi = RawAbi{};
+                        continue;
+                    }
+                    if (!m.needsLocalDefinition) continue;
+                    if (m.linkageName.empty() && w.md != nullptr)
+                        m.linkageName = CxxLinkageName(ctx, MemberGlobalDecl(w.md));
+                    if (m.linkageName.empty()) continue;
+                    const FunctionDecl* body = nullptr;
+                    const bool emitted = m.linkageName.starts_with("__cflat_")
+                        || (w.md != nullptr && w.md->hasBody(body) && body != nullptr
+                            && !isDependentCodeGenDecl(w.md));
+                    if (emitted || (w.md != nullptr && LibraryOwnsMemberSymbol(w.md)))
+                        m.needsLocalDefinition = false;
+                    else
+                    {
+                        m.linkageName.clear();
+                        m.abi = RawAbi{};
+                    }
+                }
+                plan->weakPromoteSymbols.insert(plan->weakPromoteSymbols.end(),
+                                                st.out.weakPromoteSymbols.begin(),
+                                                st.out.weakPromoteSymbols.end());
+                ++plan->recordedChunks;
+                st.out.demandRecorded = true;
+                return;
             }
 
             // Phase 3: flush. This emits the deferred definitions and finalizes the module.
@@ -5363,7 +5576,9 @@ namespace cflat_cinterop
         if (req.emitDefinitions && headerRoot != nullptr)
             for (clang::Decl* decl : headerRoot->decls())
             {
-                st.announcedDecls.push_back(decl);
+                // The full header walk belongs to chunk 0. Requests keep the shared decls
+                // available for on-demand helper emission, but do not replay them as announced.
+                if (root == headerRoot) st.announcedDecls.push_back(decl);
                 st.sharedDecls.push_back(decl);
             }
         if (req.emitDefinitions && root != headerRoot)
@@ -5372,12 +5587,11 @@ namespace cflat_cinterop
                 st.announcedDecls.push_back(decl);
                 st.requestDecls.push_back(decl);
             }
-        // The includes this request committed as their own chunk; a request TU parses them
-        // inline, so their decls are announced like the request's own.
+        // Includes committed in a separate chunk are shared roots too. Keep their declarations
+        // available to CodeGen for helper references, but do not harvest them per request.
         if (req.emitDefinitions && preludeRoot != nullptr && preludeRoot != headerRoot)
             for (clang::Decl* decl : preludeRoot->decls())
             {
-                st.announcedDecls.push_back(decl);
                 st.sharedDecls.push_back(decl);
             }
         // What Sema announced while parsing this chunk: implicit instantiations and the members
@@ -5389,10 +5603,10 @@ namespace cflat_cinterop
             st.requestDecls.insert(st.requestDecls.end(), announcedDecls->begin(),
                                    announcedDecls->end());
         }
-        if (preludeRoot != nullptr && preludeRoot != headerRoot && preludeRoot != root)
+        // Chunk 0 (root == headerRoot) harvests the group and committed-prelude surfaces. A
+        // request only harvests its own root and the request's earlier stage-1 root, if present.
+        if (root == headerRoot && preludeRoot != nullptr && preludeRoot != headerRoot)
             HarvestTranslationUnit(st, ci.getASTContext(), preludeRoot, false, false);
-        if (headerRoot != nullptr && headerRoot != root)
-            HarvestTranslationUnit(st, ci.getASTContext(), headerRoot, false, false);
         for (clang::TranslationUnitDecl* extra : extraRoots)
             if (extra != nullptr && extra != root && extra != headerRoot)
                 HarvestTranslationUnit(st, ci.getASTContext(), extra, false, false);
@@ -5576,5 +5790,268 @@ namespace cflat_cinterop
             }
             return ok;
         }
+    }
+
+    /*
+     * One CodeGenerator over the whole group. Deferrable recorded declarations are handed over
+     * as a real TU would hand them (emitted only when referenced); a declaration CodeGen must
+     * emit on sight (strong, explicit instantiation, `used` helper) is held back and handed
+     * only once something needs its symbol. What is needed is found by CodeGen itself: after a
+     * round, any held symbol the module still only declares joins the demand and the round
+     * reruns. Rounds are few - an explicit instantiation's out-of-line member reached through
+     * an inline body is the typical addition.
+     */
+    bool EmitCxxDemandCompanion(clang::CompilerInstance& ci, CxxDemandPlan& plan,
+                                const std::vector<std::string>& demand,
+                                const std::unordered_map<const clang::FunctionDecl*, std::string>* poisoned,
+                                bool verbose, std::string& bitcode, CxxDemandStats& stats,
+                                std::string& err)
+    {
+        llvm::TimeTraceScope scope("CxxDemandCompanion");
+        (void)poisoned;
+        bitcode.clear();
+        stats = CxxDemandStats{};
+        ASTContext& ctx = ci.getASTContext();
+        std::unique_ptr<MangleContext> mangle(ctx.createMangleContext());
+
+        std::vector<Decl*> lazy;
+        std::unordered_map<std::string, GlobalDecl> held;
+        size_t splitDone = 0;
+        // Plan decls split into deferrable (handed wholesale) and must-emit (handed on demand).
+        // Re-run as the plan grows: instantiations in the closure below are announced into it.
+        auto splitPlan = [&]() {
+            llvm::TimeTraceScope splitScope("CxxDemandSplit");
+            auto holdName = [&](GlobalDecl gd) { held.emplace(DemandSymbolName(*mangle, gd), gd); };
+            for (; splitDone < plan.decls.size(); ++splitDone)
+            {
+                Decl* d = plan.decls[splitDone];
+                if (d == nullptr || d->isInvalidDecl()) continue;
+                const bool codeDecl = llvm::isa<FunctionDecl>(d) || llvm::isa<VarDecl>(d);
+                if (!codeDecl || !ctx.DeclMustBeEmitted(d))
+                {
+                    lazy.push_back(d);
+                    continue;
+                }
+                if (const auto* ctor = llvm::dyn_cast<CXXConstructorDecl>(d))
+                {
+                    holdName(GlobalDecl(ctor, Ctor_Complete));
+                    holdName(GlobalDecl(ctor, Ctor_Base));
+                }
+                else if (const auto* dtor = llvm::dyn_cast<CXXDestructorDecl>(d))
+                {
+                    holdName(GlobalDecl(dtor, Dtor_Complete));
+                    holdName(GlobalDecl(dtor, Dtor_Base));
+                    if (dtor->isVirtual()) holdName(GlobalDecl(dtor, Dtor_Deleting));
+                }
+                else if (const auto* fd = llvm::dyn_cast<FunctionDecl>(d))
+                    holdName(GlobalDecl(fd));
+                else
+                    holdName(GlobalDecl(llvm::cast<VarDecl>(d)));
+            }
+        };
+        splitPlan();
+
+        std::set<std::string> want;
+        std::unordered_map<std::string, std::string> restore;   // emitted -> program name
+        for (const std::string& programName : demand)
+        {
+            std::string name = programName;
+            if (auto it = plan.renamed.find(programName); it != plan.renamed.end())
+            {
+                name = it->second;
+                restore[name] = programName;
+            }
+            if (plan.bound.count(name) != 0 || held.count(name) != 0
+                || plan.vtables.count(name) != 0)
+                want.insert(name);
+        }
+        stats.demanded = (unsigned)want.size();
+        if (want.empty()) return true;
+
+        clang::DiagnosticsEngine& diagnostics = ci.getDiagnostics();
+        if (plan.materializeReachable)
+        {
+            llvm::TimeTraceScope lateScope("CxxDemandLateBodies");
+            std::string failedBody;
+            std::string bodyDiagnostic;
+            std::vector<const FunctionDecl*> roots;
+            for (const std::string& name : want)
+            {
+                if (auto it = held.find(name); it != held.end())
+                    roots.push_back(llvm::dyn_cast<FunctionDecl>(it->second.getDecl()));
+                if (auto it = plan.bound.find(name); it != plan.bound.end())
+                    roots.push_back(llvm::dyn_cast<FunctionDecl>(
+                        GlobalDecl::getFromOpaquePtr(it->second).getDecl()));
+            }
+            plan.materializeReachable(std::move(roots), failedBody, bodyDiagnostic);
+            if (!failedBody.empty())
+            {
+                err = "clang: failed to compile inline body '" + failedBody
+                    + "' required by this program: " + bodyDiagnostic;
+                return false;
+            }
+        }
+        std::unordered_set<const FunctionDecl*> closureTried;
+        for (unsigned round = 0; round < 16; ++round)
+        {
+            splitPlan();
+            llvm::TimeTraceScope roundScope("CxxDemandRound", std::to_string(round));
+            llvm::LLVMContext llvmCtx;
+            std::unique_ptr<CodeGenerator> cg(
+                clang::CreateLLVMCodeGen(ci, "cflat_cxx_demand", llvmCtx));
+            if (!cg)
+            {
+                err = "could not create the C++ code generator";
+                return false;
+            }
+            // Earlier chunks' recovered errors are not CodeGen errors; ModuleBuilder would
+            // discard the module over them.
+            diagnostics.Reset(/*soft*/ true);
+            cg->Initialize(ctx);
+            {
+                llvm::TimeTraceScope handScope("CxxDemandHand", std::to_string(lazy.size()));
+                for (Decl* d : lazy) cg->HandleTopLevelDecl(DeclGroupRef(d));
+            }
+            for (const std::string& name : want)
+            {
+                if (auto it = held.find(name); it != held.end())
+                {
+                    cg->HandleTopLevelDecl(DeclGroupRef(const_cast<Decl*>(it->second.getDecl())));
+                    cg->GetAddrOfGlobal(it->second, /*isForDefinition*/ false);
+                }
+                if (auto it = plan.bound.find(name); it != plan.bound.end())
+                    cg->GetAddrOfGlobal(GlobalDecl::getFromOpaquePtr(it->second),
+                                        /*isForDefinition*/ false);
+                if (auto it = plan.vtables.find(name); it != plan.vtables.end())
+                    cg->HandleVTable(const_cast<CXXRecordDecl*>(it->second));
+            }
+            for (const auto& [name, record] : plan.vtables)
+                if (name.starts_with("vftable:"))
+                    cg->HandleVTable(const_cast<CXXRecordDecl*>(record));
+            {
+                llvm::TimeTraceScope flushScope("CxxDemandFlush");
+                cg->HandleTranslationUnit(ctx);
+            }
+            llvm::Module* mod = cg->GetModule();
+            if (mod == nullptr)
+            {
+                err = "clang reported an error while generating the C++ definitions this "
+                      "program uses";
+                return false;
+            }
+            // Held symbols the module reaches but only declares: hand them over next round.
+            bool grew = false;
+            for (const llvm::GlobalValue& gv : mod->global_values())
+                if (gv.isDeclaration() && gv.hasName() && held.count(gv.getName().str()) != 0
+                    && want.insert(gv.getName().str()).second)
+                    grew = true;
+            if (grew) continue;
+            /*
+             * ODR-use closure, as clang++ would finish the TU: a used function the module only
+             * declares whose body the AST has (or can instantiate) was never handed. Hand it, or
+             * instantiate it first; library symbols (no body, not instantiable) stay external.
+             */
+            {
+                llvm::TimeTraceScope closureScope("CxxDemandClosure");
+                std::vector<std::pair<std::string, FunctionDecl*>> pulled;
+                for (const llvm::Function& fn : mod->functions())
+                {
+                    // A demanded symbol has no use in this module; its body may still be skipped.
+                    if (!fn.isDeclaration() || fn.isIntrinsic() || !fn.hasName()
+                        || (fn.use_empty() && want.count(fn.getName().str()) == 0))
+                        continue;
+                    const auto* found = llvm::dyn_cast_or_null<FunctionDecl>(
+                        cg->GetDeclForMangledName(fn.getName()));
+                    if (found == nullptr || !closureTried.insert(found).second) continue;
+                    pulled.emplace_back(fn.getName().str(), const_cast<FunctionDecl*>(found));
+                }
+                clang::Sema& sema = ci.getSema();
+                for (auto& [name, fd] : pulled)
+                {
+                    if (fd->isInvalidDecl() || fd->isDependentContext()) continue;
+                    const FunctionDecl* definition = nullptr;
+                    if (!fd->isDefined(definition)
+                        && fd->getTemplateSpecializationKindForInstantiation()
+                               == TSK_ImplicitInstantiation
+                        && fd->isImplicitlyInstantiable())
+                    {
+                        sema.InstantiateFunctionDefinition(fd->getLocation(), fd,
+                                                           /*Recursive*/ true,
+                                                           /*DefinitionRequired*/ false,
+                                                           /*AtEndOfTU*/ true);
+                        sema.PerformPendingInstantiations();
+                    }
+                    if (!fd->isDefined(definition) || definition->isInvalidDecl()) continue;
+                    FunctionDecl* body = const_cast<FunctionDecl*>(definition);
+                    // The group's header parse deferred this body; parse it now (see LazyBodies).
+                    const bool materialized = body->hasSkippedBody();
+                    if (materialized
+                        && (!plan.materializeBody || !plan.materializeBody(body)))
+                        continue;
+                    if (plan.declSeen.count(body) == 0 && plan.declSeen.count(fd) == 0)
+                    {
+                        plan.Add(body);
+                        want.insert(name);
+                        grew = true;
+                    }
+                    else if (materialized || splitDone < plan.decls.size())
+                        grew = true;
+                }
+                // Same for storage: a variable a late-parsed body names (libc++'s inline
+                // __digits_base_10) is known only once that body exists.
+                for (const llvm::GlobalVariable& gv : mod->globals())
+                {
+                    if (!gv.isDeclaration() || !gv.hasName() || gv.use_empty()) continue;
+                    const auto* var = llvm::dyn_cast_or_null<VarDecl>(
+                        cg->GetDeclForMangledName(gv.getName()));
+                    const VarDecl* definition = var != nullptr ? var->getDefinition() : nullptr;
+                    if (definition == nullptr || definition->isInvalidDecl()
+                        || plan.declSeen.count(definition) != 0)
+                        continue;
+                    plan.Add(const_cast<VarDecl*>(definition));
+                    grew = true;
+                }
+                if (splitDone < plan.decls.size()) grew = true;
+            }
+            if (grew) continue;
+
+            for (const std::string& sym : plan.weakPromoteSymbols)
+            {
+                llvm::GlobalVariable* gv = mod->getGlobalVariable(sym, /*AllowInternal*/ true);
+                if (gv == nullptr || gv->isDeclaration() || !gv->hasLocalLinkage()) continue;
+                gv->setLinkage(llvm::GlobalValue::WeakODRLinkage);
+                gv->setVisibility(llvm::GlobalValue::DefaultVisibility);
+            }
+            for (const llvm::GlobalValue& gv : mod->global_values())
+                if (!gv.isDeclaration()) ++stats.definitions;
+            for (const std::string& name : want)
+                if (const llvm::GlobalValue* gv = mod->getNamedValue(name);
+                    gv == nullptr || gv->isDeclaration())
+                {
+                    ++stats.unresolved;
+                    if (verbose)
+                        std::cout << "[verbose]   C++ demand pass: '" << name
+                                  << "' is still only declared\n";
+                }
+            for (const auto& [emitted, programName] : restore)
+                if (llvm::GlobalValue* gv = mod->getNamedValue(emitted);
+                    gv != nullptr && mod->getNamedValue(programName) == nullptr)
+                    gv->setName(programName);
+            {
+                llvm::TimeTraceScope serializeScope("CxxDemandSerialize");
+                llvm::raw_string_ostream os(bitcode);
+                llvm::WriteBitcodeToFile(*mod, os);
+                os.flush();
+            }
+            if (verbose)
+                std::cout << std::format("[verbose] C++ demand pass: {} demanded symbol(s), {} "
+                                         "round(s), {} definition(s), {} recorded decl(s)\n",
+                                         stats.demanded, round + 1, stats.definitions,
+                                         plan.decls.size());
+            diagnostics.Reset(/*soft*/ true);
+            return true;
+        }
+        err = "the C++ definitions this program uses did not converge";
+        return false;
     }
 }

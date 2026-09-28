@@ -884,6 +884,9 @@ std::string LLVMBackend::OperatorBoolFunctionNameForType(llvm::Type* type) const
 {
         auto* st = llvm::dyn_cast_or_null<llvm::StructType>(type);
         if (st == nullptr || st->isLiteral() || !st->hasName()) return {};
+        if (IsCxxRecord(st->getName().str()))
+            const_cast<LLVMBackend*>(this)->EnsureCxxMemberProjected(st->getName().str(),
+                                                                     "operator bool");
 
         auto matches = [&](const std::string& name, bool allowCxxReceiver) {
             auto it = functionTable.find(name);

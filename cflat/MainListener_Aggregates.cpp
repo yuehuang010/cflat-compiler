@@ -308,6 +308,7 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
                     "base '{}' of struct '{}' is not a C++ class", { baseSpelling, structName });
                 return;
             }
+            compiler->EnsureCxxRecordProjected(cppBaseName, true);
             const auto* baseInfo = compiler->GetCxxClassInfo(cppBaseName);
             if (baseInfo == nullptr || !baseInfo->layoutRefusal.empty()
                 || baseInfo->hasVirtualBases)

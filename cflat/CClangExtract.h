@@ -12,9 +12,11 @@
 #pragma once
 
 #include <cstdint>
+#include <cstdlib>
 #include <functional>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -24,6 +26,7 @@ namespace clang
     class TranslationUnitDecl;
     class Decl;
     class FunctionDecl;
+    class CXXRecordDecl;
 }
 
 namespace llvm
@@ -33,6 +36,9 @@ namespace llvm
 
 namespace cflat_cinterop
 {
+    // CFLAT_CXX_EAGER_BODIES selects a different C++ group parse, so it is part of cache identity.
+    inline bool CxxEagerBodies() { return std::getenv("CFLAT_CXX_EAGER_BODIES") != nullptr; }
+
     // One CFlat identity for every canonical C++ spelling used by extraction and backend lookup.
     std::string CxxForeignIdentity(const std::string& spelling);
 
@@ -519,6 +525,46 @@ namespace cflat_cinterop
         int col = 0;
     };
 
+    /*
+     * One demand-driven companion per live C++ import group. While a chunk is harvested with
+     * emitDefinitions, the extractor records here what it would have handed Clang's CodeGen,
+     * and emits nothing. After CFlat code generation the group replays the record ONCE through
+     * one CodeGenerator, for only the symbols the program actually uses
+     * (EmitCxxDemandCompanion). Pointers stay valid while the group's Interpreter lives.
+     */
+    struct CxxDemandPlan
+    {
+        // Declarations to show CodeGen (HandleTopLevelDecl), deduplicated, in first-seen order.
+        std::vector<clang::Decl*> decls;
+        std::unordered_set<const clang::Decl*> declSeen;
+        // Bound entities by mangled name, as opaque clang::GlobalDecl values.
+        std::unordered_map<std::string, void*> bound;
+        // Records whose vtable a request would have emitted, by vtable symbol name.
+        std::unordered_map<std::string, const clang::CXXRecordDecl*> vtables;
+        std::vector<std::string> weakPromoteSymbols;
+        // Retry-renamed generated wrappers: program-visible name -> name clang emits.
+        std::unordered_map<std::string, std::string> renamed;
+        unsigned recordedChunks = 0;
+        // Set by the group for its demand pass: parse a body the header parse skipped (and the
+        // skipped bodies it names). False when there is none or it does not compile.
+        std::function<bool(clang::FunctionDecl*)> materializeBody;
+        // Same, for everything CodeGen can reach from the demanded functions (one walk up front).
+        std::function<void(std::vector<const clang::FunctionDecl*>, std::string&, std::string&)>
+            materializeReachable;
+
+        void Add(clang::Decl* decl)
+        {
+            if (decl != nullptr && declSeen.insert(decl).second) decls.push_back(decl);
+        }
+    };
+
+    struct CxxDemandStats
+    {
+        unsigned demanded = 0;       // program symbols this group can define
+        unsigned definitions = 0;    // definitions in the emitted module
+        unsigned unresolved = 0;     // demanded symbols the module still only declares
+    };
+
     struct ExtractRequest
     {
         // Called immediately before a full frontend parse that includes the C++ header group.
@@ -580,6 +626,8 @@ namespace cflat_cinterop
         };
         std::vector<CxxTypeRequest> cxxTypeRequests;
         std::string cxxRequestMarkerPrefix = "__cflat_req_";
+        // Original generated prefix source, retained with demand chunks for cache replay.
+        std::string demandPrefixSource;
         // Appended to every virtual / vbase-constructor thunk name. An incremental group's chunks
         // share one scope, so a thunk that a later request repeats needs a name of its own.
         std::string cxxThunkSuffix;
@@ -592,6 +640,12 @@ namespace cflat_cinterop
         std::unordered_map<const clang::FunctionDecl*, std::string>* poisonedFunctions = nullptr;
         // Per failed instantiation, the clang error group that named it (error plus notes).
         const std::unordered_map<const clang::FunctionDecl*, std::string>* errorCauses = nullptr;
+        // A live group's demand plan: with emitDefinitions set, CodeGen work is recorded here
+        // instead of emitted, and ExtractResult::bitcode stays empty (see CxxDemandPlan).
+        CxxDemandPlan* demandPlan = nullptr;
+        // A live group's free-operator candidate index, keyed by header TU root. Owned by the
+        // group so its Decl pointers die with the Interpreter; null = index per call, no cache.
+        std::unordered_map<const clang::Decl*, std::vector<clang::Decl*>>* operatorIndex = nullptr;
         // Header extraction may need one retry after forcing a named specialization complete.
         bool autoInstantiateCxxTypes = true;
         /*
@@ -647,6 +701,31 @@ namespace cflat_cinterop
         // when nothing needed emitting. Plain bytes, so it round-trips through the disk cache.
         std::string bitcode;
         unsigned emittedDefinitions = 0;   // number of definitions in `bitcode`, for -v
+        // Definitions were recorded into a group demand plan instead of emitted into `bitcode`.
+        bool demandRecorded = false;
+        struct DemandReplayChunk
+        {
+            uint64_t order = 0;
+            std::string source;
+            std::string prefixSource;
+            std::vector<ExtractRequest::CxxTypeRequest> typeRequests;
+            std::string markerPrefix;
+            std::string thunkSuffix;
+            std::vector<std::string> wrapperNames;
+            std::vector<std::string> inScopeDirs;
+            std::vector<CxxMacroProbe> macroProbes;
+            std::string scopeHeaderPath;
+            bool headerHarvest = false;
+            bool wantMacros = false;
+            bool requireInScope = false;
+            bool checkHeaderScope = false;
+            bool wrapperBatch = false;
+            bool autoInstantiate = true;
+            // Chunks parsed right after this one by the same step (a header harvest's
+            // default-argument wrapper batch); stored with it, replayed after it.
+            std::vector<DemandReplayChunk> follow;
+        };
+        DemandReplayChunk demandReplayChunk;
 
         // Count of "unknown type name" errors raised inside an #included header (not the
         // in-memory stub itself). This is the signature of a non-self-contained header that
@@ -692,4 +771,16 @@ namespace cflat_cinterop
                                bool checkHeader = false,
                                clang::TranslationUnitDecl* preludeRoot = nullptr,
                                const std::vector<clang::Decl*>* announcedDecls = nullptr);
+
+    /*
+     * The group's single demand CodeGen pass: replay `plan` through one CodeGenerator, request
+     * exactly the recorded entities named in `demand` (the program's used-but-undefined
+     * symbols), and return the finalized module as bitcode. Empty bitcode with true means the
+     * program needs nothing from this group.
+     */
+    bool EmitCxxDemandCompanion(clang::CompilerInstance& ci, CxxDemandPlan& plan,
+                                const std::vector<std::string>& demand,
+                                const std::unordered_map<const clang::FunctionDecl*, std::string>* poisoned,
+                                bool verbose, std::string& bitcode, CxxDemandStats& stats,
+                                std::string& err);
 }

@@ -284,6 +284,11 @@ llvm::Type* LLVMBackend::GetType(const LLVMBackend::TypeAndValue& typeAndValue, 
                 resolvedTypeName = nsResolved;
         }
 
+        // Type lookup needs imported layout, while members are demanded at their use sites.
+        if (!registeringCxxProjection_ && !typeAndValue.Pointer && !typeAndValue.ElemPointer
+            && aliasPtrDepth == 0
+            && dataStructures.find(resolvedTypeName) != dataStructures.end())
+            const_cast<LLVMBackend*>(this)->EnsureCxxRecordProjected(resolvedTypeName, false);
         // resolvedTypeName is final; hoist the struct/interface map lookups once.
         auto dsIt = dataStructures.find(resolvedTypeName);
         // A generic interface instantiation lowers to a fat pointer even before its interfaceTable

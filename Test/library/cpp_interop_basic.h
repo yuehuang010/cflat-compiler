@@ -1427,6 +1427,17 @@ namespace cppi
     inline int invoke(std::function<int()>& f) noexcept { return f(); }
     inline HoldsStdFunction make_holds_std_function() { return HoldsStdFunction(); }
 
+    class LazyStdFunctionMember
+    {
+    public:
+        int apply(std::function<int(int)> fn, int value) const noexcept
+        {
+            return fn(value);
+        }
+        int select(std::function<int(int)> fn) const noexcept { return fn(1) + 40; }
+        int select(std::function<int(double)> fn) const noexcept { return fn(1.0) + 50; }
+    };
+
     struct StatefulLess
     {
         bool operator()(int a, int b) const noexcept { return a < b; }

@@ -39,6 +39,7 @@
 #include <filesystem>
 #include <map>
 #include <mutex>
+#include <thread>
 #include <optional>
 #if defined(_WIN32)
 #include <io.h>
@@ -3330,6 +3331,41 @@ private:
     const CxxRequestGroup* activeCxxRequestGroup_ = nullptr;
     std::unordered_map<std::string, std::unique_ptr<CxxIncrementalGroup>>
         cxxIncrementalGroups_;
+    /*
+     * Demand groups this compile used, with the hashes of their entries (the companion cache
+     * key) and whether any entry came from a cache instead of this compile's live group.
+     */
+    struct CxxDemandGroupUse
+    {
+        std::set<uint64_t> hashes;   // content hash x full cache key of every entry noted
+        std::vector<cflat_cinterop::ExtractResult::DemandReplayChunk> replayChunks;
+        bool replayIncomplete = false;   // a served demand entry carried no replay chunk
+        bool served = false;
+        bool demand = false;   // an entry's definitions belong to the group companion
+    };
+    std::map<std::string, CxxDemandGroupUse> cxxDemandGroups_;
+    std::unordered_map<std::string, CxxRequestGroup> cxxDemandRequestGroups_;
+    std::unordered_set<std::string> cxxDemandLiveKeys_;   // entries this compile stored
+    std::string pendingCxxDemandGroupKey_;                 // set by a recorded header harvest
+    cflat_cinterop::ExtractResult::DemandReplayChunk pendingCxxDemandReplayChunk_;
+    bool cxxDemandBypass_ = false;   // retry: every C++ cache entry is a miss
+    bool cxxDemandRetry_ = false;    // companion missing for a cache-served group
+    bool cxxDemandReplayInProgress_ = false;
+    // This compile links its C++ companions (not --check, a batch, or an LSP analysis); only
+    // then does a new live request replay the served chunks ahead of itself.
+    bool cxxDemandLinks_ = false;
+    // After an early replay, live chunks are numbered from their content (see RunCxxTypeRequests).
+    bool cxxDemandContentChunkNumbers_ = false;
+    std::unordered_set<unsigned> cxxDemandUsedChunkNumbers_;
+    std::string CxxIncrementalGroupKey(const CxxRequestGroup& group) const;
+    // `entryKey` is the entry's full cache key (clang args, -I/-D, source, std, target), so a
+    // companion never outlives the inputs of any entry it was generated beside.
+    void NoteCxxDemandEntry(const std::string& groupKey, uint64_t hash, uint64_t entryKey,
+                            bool served, bool demand = true);
+    void NoteCxxDemandReplayChunk(
+        const CxxRequestGroup& group,
+        const cflat_cinterop::ExtractResult::DemandReplayChunk& chunk);
+    bool ReplayCxxDemandChunks(const std::string& groupKey, std::string& error);
     // Base C++ spelling -> the import group that answered in this compile.
     std::unordered_map<std::string, size_t> cxxTemplateOwnerGroup_;
     std::unordered_map<std::string, std::vector<cflat_cinterop::RawFunctionTemplate>>
@@ -3418,6 +3454,8 @@ private:
     // ones runs whatever -O level the program is built at.
     bool cxxCompanionInternalized_ = false;
     void AdoptCxxCompanionBitcode(const std::string& bitcode);
+    std::vector<std::string> CxxProgramDemand() const;
+    bool EmitCxxDemandCompanions();
     bool LinkCxxCompanionModules();
 public:
     /*
@@ -3487,6 +3525,8 @@ private:
     std::vector<std::string> cDefines_;
     std::vector<std::string> dependencyFiles_;
     std::unordered_map<std::string, std::string> dependencyPathMemo_;
+    struct DependencyDir { std::string canonical; std::unordered_set<std::string> names; };
+    std::unordered_map<std::string, DependencyDir> dependencyDirMemo_;
     std::unordered_set<std::string> dependencyFileSet_;
     // Assets folded in by `embed("...")`, in first-seen order. Cleared per compile and per
     // re-analysis alongside the dependency lists.
@@ -3545,6 +3585,8 @@ private:
     std::map<std::string, std::vector<CSigEntry>> cxxFunctionSignatures_;
     // One deferred bind attempt per C++ free function name; see TryBindCxxFunction.
     std::set<std::string> cxxFunctionBindAttempts_;
+    // std::function member signatures are requested only when that member name is first looked up.
+    std::set<std::string> cxxLazyStdFunctionMemberBinds_;
     struct CEnumEntry
     {
         std::string name;
@@ -3741,9 +3783,17 @@ private:
         // import group (inline bodies, vtables/RTTI, inline static members). Cached with the
         // bindings so a warm run links the very same definitions instead of re-running CodeGen.
         std::string cxxBitcode;
+        // Incremental group key when the definitions were recorded for the group's demand pass
+        // (cxxBitcode empty); the companion is then cached per group and demand, not per entry.
+        std::string cxxDemandGroupKey;
+        cflat_cinterop::ExtractResult::DemandReplayChunk cxxDemandReplayChunk;
         uint64_t lastUse = 0;  // cFileSigCacheClock_ stamp of the last hit or insert
         size_t rows = 0;       // summed size of every vector above, for the row budget
     };
+    // The retry compiles C++ fully cold: a served shape-only entry skips a parse the live
+    // group's later chunks may depend on.
+    // Pure-C header entries never join a demand group, so the retry keeps them.
+    bool CxxDemandEntryUsable(bool cxxEntry) const { return !cxxEntry || !cxxDemandBypass_; }
     // Unresolved object-like aliases are retried after later C imports. Unknown aliases stay
     // here until the compile ends and are intentionally never diagnosed.
     std::vector<CMacroEntry> pendingCInteropAliases_;
@@ -8167,6 +8217,8 @@ public:
     };
     const CxxClassInfo* GetCxxClassInfo(const std::string& typeName) const
     {
+        if (pendingCxxRecordProjections_.count(typeName) != 0)
+            const_cast<LLVMBackend*>(this)->EnsureCxxRecordProjected(typeName, false);
         auto it = cxxClasses_.find(typeName);
         return it == cxxClasses_.end() ? nullptr : &it->second;
     }
@@ -8220,6 +8272,8 @@ public:
                                    std::string* deducedElementType = nullptr) const;
     bool IsCxxTriviallyCopyableRecord(const std::string& typeName) const
     {
+        if (pendingCxxRecordProjections_.count(typeName) != 0)
+            const_cast<LLVMBackend*>(this)->EnsureCxxRecordProjected(typeName, false);
         return cxxTriviallyCopyableRecords_.count(typeName) != 0;
     }
     // A C++ alias of a specialization that is still unrequested (`c10.IntArrayRef` before any use).
@@ -8339,6 +8393,8 @@ public:
     std::set<std::string> cxxNontrivialRecords_;
     bool IsForeignNontrivialCxxClass(const std::string& typeName) const
     {
+        if (pendingCxxRecordProjections_.count(typeName) != 0)
+            const_cast<LLVMBackend*>(this)->EnsureCxxRecordProjected(typeName, false);
         return cxxNontrivialRecords_.count(typeName) != 0;
     }
     bool HasForeignNontrivialCxxFieldForAnalysis(const std::string& typeName) const
@@ -8366,6 +8422,8 @@ public:
     bool IsForeignCxxClassWithConstructors(const std::string& typeName,
                                            bool countCtorTemplates = true) const
     {
+        if (pendingCxxRecordProjections_.count(typeName) != 0)
+            const_cast<LLVMBackend*>(this)->EnsureCxxRecordProjected(typeName, false);
         auto it = cxxClasses_.find(typeName);
         auto record = cxxRecordEntries_.find(typeName);
         const bool hasUserDeclaredCtor = record != cxxRecordEntries_.end()
@@ -8394,7 +8452,7 @@ public:
             || (cxxRecords_.count(typeName) != 0 && it != cxxClasses_.end()
                 && (!it->second.constructors.empty()
                     || it->second.refusedMembers.count("__ctor") != 0))
-            || missingCtor || hasPublicImplicitDefaultCtor
+            || hasUserDeclaredCtor || missingCtor || hasPublicImplicitDefaultCtor
             || (countCtorTemplates && record != cxxRecordEntries_.end()
                 && record->second.hasCtorTemplate);
         return result;
@@ -8576,6 +8634,7 @@ public:
     }
     bool HasBindableCxxDestructor(const std::string& typeName) const
     {
+        const_cast<LLVMBackend*>(this)->EnsureCxxMemberProjected(typeName, "__dtor");
         const CxxClassInfo* info = GetCxxClassInfo(typeName);
         return info != nullptr && info->hasDtor && !info->destructor.linkageName.empty();
     }
@@ -8613,7 +8672,7 @@ public:
      * been implicit. Empty when none exists. Drives the diagnostic at a call argument.
      */
     std::string ExplicitCxxConstructorBlocking(const std::string& typeName,
-                                               const std::vector<TypeAndValue>& argTypes) const;
+                                               const std::vector<TypeAndValue>& argTypes);
     // Verdict of the one implicit user-defined conversion at a C++ call argument. The two
     // refusal codes are the only ones the failure note may name.
     enum class CxxArgConversion { NotApplicable, Convertible, ExplicitCtor, NonConstLvalueRef };
@@ -8661,13 +8720,31 @@ public:
     std::map<std::string, std::string> cppStructOverrideNames_;
     // Retained extractor records let a refused member be rebound when its specialization is used.
     std::map<std::string, CRecordEntry> cxxRecordEntries_;
+    std::map<std::string, std::string> pendingCxxRecordProjections_;
+    std::map<std::string, std::string> pendingCxxMemberProjections_;
+    std::map<std::string, std::set<std::string>> projectedCxxMemberNames_;
+    std::set<std::string> projectingCxxMemberNames_;
+    std::set<std::string> projectingCxxRecords_;
+    bool registeringCxxProjection_ = false;
+    bool registeringCxxProjectionMembers_ = true;
+    bool EnsureCxxRecordProjected(const std::string& typeName, bool includeMembers = true);
+    bool RegisterCxxMembersForProjectedRecord(const std::string& typeName);
+    bool EnsureCxxMemberProjected(const std::string& typeName, const std::string& memberName);
+    void EnsureCxxConversionOperatorsProjected(const std::string& typeName);
+    void StoreCxxRecordEntry(const std::string& name, const CRecordEntry& record);
+    void EnsureCxxRecordLayoutsForMemberSignatures(const CRecordEntry& record,
+                                                    const std::string& memberFilter = {});
+    void RegisterCxxRecordShell(const CRecordEntry& record, const std::string& fileForLsp);
+    void RememberCxxRecordSpellings(const CRecordEntry& record);
+    void ProjectCxxByValueFieldRecord(const std::string& ctype);
     // C++ records laid out with an opaque-bytes field, keyed by LLVM type (BindLazyCxxStdField).
     std::unordered_map<llvm::StructType*, std::string> cxxOpaqueFieldOwners_;
     // Register the callable surface of one imported C++ class: instance methods, static methods,
     // static data members, and the constructor/destructor table used by lifetime codegen.
     void RegisterCxxClassMembers(const CRecordEntry& r, const std::string& fileForLsp,
                                  const std::string& memberFilter = {});
-    bool TryBindRefusedCxxMember(const std::string& typeName, const std::string& memberName);
+    bool TryBindRefusedCxxMember(const std::string& typeName, const std::string& memberName,
+                                 size_t constructorArgumentCount = static_cast<size_t>(-1));
     // A by-value std specialization field kept as opaque bytes: request its class at first member
     // access and return the field typed as that class (owner layout unchanged).
     bool BindLazyCxxStdField(llvm::StructType* owner, const TypeAndValue& stored,
@@ -9188,6 +9265,10 @@ public:
         int cv = 0;
         std::string toClass;
         int objectRef = 0;
+        // [over.ics.rank] 3.2.3: a converting-ctor temporary bound to `refTarget&&` (1)
+        // beats one bound to `const refTarget&` (2).
+        std::string refTarget;
+        int refBind = 0;
     };
     // The candidate C++ would call when CFlat's call rules refuse it (see ComputeOverloadFunction).
     struct CxxPreferredOverload
@@ -10234,6 +10315,18 @@ public:
     int  GetJitExitCode() const;
     void SetBatchMode(bool v);
     void SetNoCache(bool v);
+    // Retry after a companion miss: rebuild every demand-group entry from clang.
+    void SetCxxDemandCacheBypass(bool v) { cxxDemandBypass_ = v; }
+    bool CxxDemandRetryRequested() const { return cxxDemandRetry_; }
+    // Called once the retry's companions are in: output from there on is new, not a repeat.
+    void SetCxxDemandRetryResume(std::function<void()> resume) { cxxDemandResume_ = std::move(resume); }
+    // Cached demand chunks were replayed into a group this compile. The only failure that can
+    // cost is at link (a symbol the cold compile would have defined), so the link output is held
+    // back and a failing link requests the cold retry (RunLinkerProcess).
+    bool cxxDemandReplayed_ = false;
+    int RunLinkerProcess(llvm::StringRef program, llvm::ArrayRef<llvm::StringRef> args,
+                         std::string& error);
+    std::function<void()> cxxDemandResume_;
     bool LoadIsolatedPolicy(const std::string& path);
     void SetIsolatedPolicy(const IsolatedPolicy& policy);
     std::optional<IsolatedPolicy> GetIsolatedPolicy() const;
@@ -10295,6 +10388,7 @@ public:
 
     void SetSymbolSink(LspSymbolIndex* sink);
     LspSymbolIndex* GetSymbolSink() const;
+    void BindPendingCxxMembersForSymbolIndex();
 
     // LSP-only: grays unreachable/unused code spans. Null during real compiles.
     using HintRegionSink = std::function<void(int startLine, int startCol,
@@ -10365,7 +10459,11 @@ public:
     // 114: C-mode enum records (named, or typedef-named anonymous) carry their clang-selected
     //      underlying integer type.
     // 115: C++ const lvalue-reference returns retain receiver constness.
-    static constexpr int kCHeaderCacheVersion = 115;
+    // 116: incremental C++ request companions no longer replay the shared header surface.
+    // 117: demand-group entries carry no bitcode; the group companion is cached per demand.
+    // 119: group header parse defers inline non-template bodies; fewer incidental instantiations.
+    // 124: demand entries store their request chunks (header wrapper batch included) for replay.
+    static constexpr int kCHeaderCacheVersion = 124;
     static std::string CompilerBuildStamp();
 
     static std::string GetCHeaderCacheDir();
@@ -10609,7 +10707,7 @@ public:
 
     static bool CHeaderDepFresh(const CHeaderDep& dep);
 
-    static bool TryLoadCHeaderDiskCache(
+    bool TryLoadCHeaderDiskCache(
         const std::filesystem::path& cacheDir,
         uint64_t diskKey,
         std::filesystem::file_time_type mtime,
@@ -10619,6 +10717,17 @@ public:
         bool requireBitcode = false,
         std::string* missReason = nullptr,
         bool removeOnMiss = true);
+
+    void JoinCHeaderDiskCacheWriters();
+    void JoinCHeaderDiskCacheWritersFor(const std::filesystem::path& target);
+    void ScheduleCHeaderDiskCacheWrite(
+        const std::filesystem::path& cacheDir,
+        uint64_t diskKey,
+        std::filesystem::file_time_type mtime,
+        uint64_t contentHash,
+        CFileSigCacheEntry&& entry,
+        const std::string& requestKey = {},
+        const CxxRequestGroup* requestGroup = nullptr);
 
     static void WriteCHeaderDiskCache(
         const std::filesystem::path& cacheDir,
@@ -10631,6 +10740,14 @@ public:
 
     static void PruneCxxTypeRequestDiskCache(const std::filesystem::path& cacheDir,
                                              const CxxRequestGroup& group);
+
+    // Each pending write knows its entry path, so a read waits only for the file it opens.
+    struct CHeaderDiskCacheWriter
+    {
+        std::filesystem::path target;
+        std::thread thread;
+    };
+    std::vector<CHeaderDiskCacheWriter> cHeaderDiskCacheWriters_;
 
 
     // Handle `import package-vcpkg "header" from "port[features]";`. Resolves the port

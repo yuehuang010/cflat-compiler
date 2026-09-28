@@ -3,6 +3,7 @@
 #include "clang/AST/ASTContext.h"
 #include "clang/AST/Decl.h"
 #include "clang/AST/DeclCXX.h"
+#include "clang/AST/DeclContextInternals.h"
 #include "clang/AST/DeclTemplate.h"
 #include "clang/AST/RecursiveASTVisitor.h"
 #include "clang/AST/Stmt.h"
@@ -14,9 +15,11 @@
 #include "clang/Interpreter/PartialTranslationUnit.h"
 #include "clang/Lex/PPCallbacks.h"
 #include "clang/Lex/Preprocessor.h"
+#include "clang/Parse/Parser.h"
 #include "clang/Sema/Sema.h"
 #include "llvm/Support/Error.h"
 #include "llvm/Support/TargetSelect.h"
+#include "llvm/Support/TimeProfiler.h"
 #include "llvm/IR/Module.h"
 #include "llvm/Bitcode/BitcodeReader.h"
 #include "llvm/Bitcode/BitcodeWriter.h"
@@ -27,6 +30,8 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstdlib>
+#include <deque>
 #include <format>
 #include <iostream>
 #include <memory>
@@ -36,6 +41,32 @@
 
 namespace
 {
+    /*
+     * A failed Parse erases every TU lookup entry whose visible declaration the failed chunk
+     * made. A chunk that reopens a namespace replaces the earlier redeclaration there, so the
+     * whole namespace (and every type an earlier chunk declared in it) would drop out of name
+     * lookup. Snapshot the visible namespaces first; restore the ones the failure erased.
+     */
+    std::vector<clang::NamespaceDecl*> VisibleTopLevelNamespaces(clang::ASTContext& context)
+    {
+        std::vector<clang::NamespaceDecl*> out;
+        clang::DeclContext* tu = context.getTranslationUnitDecl()->getPrimaryContext();
+        if (clang::StoredDeclsMap* map = tu->getLookupPtr())
+            for (auto& entry : *map)
+                for (clang::NamedDecl* decl : entry.second.getLookupResult())
+                    if (auto* ns = llvm::dyn_cast<clang::NamespaceDecl>(decl))
+                        out.push_back(ns);
+        return out;
+    }
+
+    void RestoreTopLevelNamespaces(clang::ASTContext& context,
+                                   const std::vector<clang::NamespaceDecl*>& saved)
+    {
+        clang::DeclContext* tu = context.getTranslationUnitDecl()->getPrimaryContext();
+        for (clang::NamespaceDecl* ns : saved)
+            if (tu->lookup(ns->getDeclName()).empty()) tu->makeDeclVisibleInContext(ns);
+    }
+
     /*
      * The interpreter is used only to parse and emit bitcode; nothing it produces is ever run.
      * Clang's default executor is an in-process LLJIT for the TU's triple, which under a cross
@@ -137,6 +168,7 @@ namespace
         std::string firstError;
         // First error naming a not-yet-defined CFlat record: no retry can complete that record.
         std::string incompleteRecordError;
+        std::string firstErrorLocation;
         // Some error names a type built over a not-yet-defined CFlat record.
         bool incompleteRecordInvolved = false;
         // Lines of the newest interpreter input buffer that an error or its notes point at.
@@ -176,7 +208,18 @@ namespace
                 if (incompleteRecordError.empty()
                     && message.find("incomplete type '__cflat_user::") != std::string::npos)
                     incompleteRecordError = message;
-                if (firstError.empty()) firstError = std::move(message);
+                if (firstError.empty())
+                {
+                    firstError = std::move(message);
+                    if (info.getLocation().isValid() && info.hasSourceManager())
+                    {
+                        const clang::PresumedLoc presumed = info.getSourceManager().getPresumedLoc(
+                            info.getSourceManager().getExpansionLoc(info.getLocation()));
+                        if (presumed.isValid())
+                            firstErrorLocation = std::format("{}:{}: {}", presumed.getFilename(),
+                                                             presumed.getLine(), firstError);
+                    }
+                }
             }
         }
 
@@ -456,6 +499,251 @@ namespace
         return result;
     }
 
+    /*
+     * Private Parser members the lazy-body scheme needs. An explicit instantiation may name a
+     * private member (access is not checked there); the friend hands the pointer out.
+     */
+    struct ParserSkipBodiesTag { using type = bool clang::Parser::*; };
+    struct ParserLateParseTag { using type = void (*)(void*, clang::LateParsedTemplate&); };
+    template <typename Tag, typename Tag::type Member>
+    struct PrivateMember
+    {
+        friend typename Tag::type AccessPrivate(Tag) { return Member; }
+    };
+    ParserSkipBodiesTag::type AccessPrivate(ParserSkipBodiesTag);
+    ParserLateParseTag::type AccessPrivate(ParserLateParseTag);
+    template struct PrivateMember<ParserSkipBodiesTag, &clang::Parser::SkipFunctionBodies>;
+    template struct PrivateMember<ParserLateParseTag, &clang::Parser::LateTemplateParserCallback>;
+
+    /*
+     * Bodies of inline non-template functions skipped by the group's header parse, kept as the
+     * preprocessed tokens the parser saw so the demand pass can parse only the bodies it emits.
+     * The parser skips a body by lexing it fresh, and the token watcher reports each fresh token
+     * once in stream order, so a skipped body is the balanced '{' ... '}' run after its '{'.
+     */
+    struct LazyBodies
+    {
+        struct Body
+        {
+            std::vector<clang::Token> tokens;
+            clang::FPOptions fpo;
+        };
+        bool active = false;                 // only during the group's header Parse
+        clang::Parser* parser = nullptr;
+        clang::Sema* sema = nullptr;
+        std::deque<clang::Token> recent;     // locates the '{' the parser already consumed
+        Body* capturing = nullptr;
+        unsigned depth = 0;
+        std::unordered_map<clang::FunctionDecl*, Body> bodies;
+        cflat_cinterop::CxxDemandPlan* plan = nullptr;   // the group's, for the demand pass
+        std::unordered_set<const clang::FunctionDecl*> walked;
+        std::unordered_set<const clang::CXXRecordDecl*> vtableRecords;
+
+        void Observe(const clang::Token& token)
+        {
+            if (capturing != nullptr)
+            {
+                capturing->tokens.push_back(token);
+                if (token.is(clang::tok::l_brace)) ++depth;
+                else if (token.is(clang::tok::r_brace) && --depth == 0) capturing = nullptr;
+                return;
+            }
+            recent.push_back(token);
+            if (recent.size() > 64) recent.pop_front();
+        }
+
+        bool Skip(clang::Decl* decl)
+        {
+            if (!active || capturing != nullptr || parser == nullptr) return false;
+            auto* fd = llvm::dyn_cast<clang::FunctionDecl>(decl);
+            if (fd == nullptr || fd->isTemplated() || !fd->isInlined()
+                || fd->getTemplateSpecializationKind() != clang::TSK_Undeclared
+                || fd->getParentFunctionOrMethod() != nullptr || fd->hasAttr<clang::UsedAttr>()
+                || fd->isMultiVersion())
+                return false;
+            // A ctor-initializer or function-try-block is not a plain brace run; parse those.
+            const clang::Token& open = parser->getCurToken();
+            if (!open.is(clang::tok::l_brace)) return false;
+            size_t at = recent.size();
+            while (at > 0 && !(recent[at - 1].is(clang::tok::l_brace)
+                               && recent[at - 1].getLocation() == open.getLocation()))
+                --at;
+            if (at == 0) return false;
+            // hasInlineBody() (the key-function choice, so vtable linkage) must not change.
+            fd->setWillHaveBody(true);
+            Body& body = bodies[fd];
+            body.tokens.assign(recent.begin() + (at - 1), recent.end());
+            body.fpo = sema->getCurFPFeatures();
+            recent.clear();
+            depth = 0;
+            for (const clang::Token& token : body.tokens)
+            {
+                if (token.is(clang::tok::l_brace)) ++depth;
+                else if (token.is(clang::tok::r_brace)) --depth;
+            }
+            if (depth != 0) capturing = &body;
+            return true;
+        }
+
+        // A still-skipped function's lazy body, or null.
+        Body* Find(const clang::FunctionDecl* fd)
+        {
+            const clang::FunctionDecl* definition = nullptr;
+            if (fd == nullptr || !fd->isDefined(definition)) return nullptr;
+            auto it = bodies.find(const_cast<clang::FunctionDecl*>(definition));
+            return it == bodies.end() ? nullptr : &it->second;
+        }
+
+        /*
+         * For the demand pass: CodeGen treats a skipped body as a declaration, but would emit a
+         * late-parsed one with no body. Outside it every predicate must see "defined", as it did.
+         */
+        void MarkPending(bool forCodeGen)
+        {
+            for (auto& [fd, body] : bodies)
+            {
+                fd->setLateTemplateParsed(!forCodeGen);
+                fd->setHasSkippedBody(forCodeGen);
+                fd->setWillHaveBody(true);
+            }
+        }
+
+        // Callees a parsed body names directly; their skipped bodies are parsed with it.
+        struct CalleeWalk : clang::RecursiveASTVisitor<CalleeWalk>
+        {
+            std::vector<const clang::FunctionDecl*> found;
+            bool shouldVisitImplicitCode() const { return true; }
+            void Note(const clang::FunctionDecl* fd) { if (fd != nullptr) found.push_back(fd); }
+            std::vector<clang::VarDecl*> storage;
+            bool VisitDeclRefExpr(clang::DeclRefExpr* e)
+            {
+                Note(llvm::dyn_cast<clang::FunctionDecl>(e->getDecl()));
+                if (auto* var = llvm::dyn_cast<clang::VarDecl>(e->getDecl());
+                    var != nullptr && var->hasGlobalStorage() && !var->isStaticLocal())
+                    storage.push_back(var);
+                return true;
+            }
+            bool VisitMemberExpr(clang::MemberExpr* e)
+            {
+                Note(llvm::dyn_cast<clang::FunctionDecl>(e->getMemberDecl()));
+                return true;
+            }
+            std::vector<const clang::CXXRecordDecl*> constructed;
+            bool VisitCXXConstructExpr(clang::CXXConstructExpr* e)
+            {
+                Note(e->getConstructor());
+                if (e->getConstructor() != nullptr)
+                    constructed.push_back(e->getConstructor()->getParent());
+                return true;
+            }
+            bool VisitCXXBindTemporaryExpr(clang::CXXBindTemporaryExpr* e)
+            {
+                Note(e->getTemporary()->getDestructor());
+                return true;
+            }
+            bool VisitVarDecl(clang::VarDecl* var)
+            {
+                if (const auto* record = var->getType()->getAsCXXRecordDecl())
+                    if (record->hasDefinition()) Note(record->getDestructor());
+                return true;
+            }
+        };
+
+        // Parse one skipped body where it was written (clang's MS late-parse entry re-enters
+        // its lexical scopes). A body that does not compile leaves `fd` declared only.
+        bool ParseOne(clang::FunctionDecl* fd, std::string& failure)
+        {
+            auto it = bodies.find(fd);
+            if (it == bodies.end()) return false;
+            Body body = std::move(it->second);
+            bodies.erase(it);
+            clang::LateParsedTemplate late;
+            late.D = fd;
+            late.FPO = body.fpo;
+            late.Toks.append(body.tokens.begin(), body.tokens.end());
+            clang::DiagnosticErrorTrap trap(sema->getDiagnostics());
+            fd->setHasSkippedBody(false);
+            fd->setLateTemplateParsed(true);
+            AccessPrivate(ParserLateParseTag{})(parser, late);
+            sema->PerformPendingInstantiations();
+            fd->setLateTemplateParsed(false);
+            if (!trap.hasErrorOccurred() && fd->getBody() != nullptr) return true;
+            fd->setBody(nullptr);
+            fd->setHasSkippedBody(true);
+            fd->setInvalidDecl();
+            if (failure.empty()) failure = fd->getQualifiedNameAsString();
+            return false;
+        }
+
+        /*
+         * Parse every skipped body CodeGen can reach from `work`: walk each reached body (skipped
+         * or not) for callees, destructors a destructor runs implicitly, and the virtual members
+         * of a record whose vtable this module defines. The demand pass's ODR-use closure
+         * still catches anything this misses, one round later. Returns bodies parsed.
+         */
+        unsigned MaterializeReachable(std::vector<const clang::FunctionDecl*> work,
+                                      std::string& failure)
+        {
+            unsigned parsed = 0;
+            clang::ASTContext& ctx = sema->getASTContext();
+            auto addRecord = [&](const clang::CXXRecordDecl* record, bool forVTable) {
+                if (record == nullptr || !record->hasDefinition()) return;
+                record = record->getDefinition();
+                if (!forVTable)
+                {
+                    work.push_back(record->getDestructor());
+                    return;
+                }
+                if (!record->isDynamicClass() || !vtableRecords.insert(record).second) return;
+                const clang::CXXMethodDecl* key = ctx.getCurrentKeyFunction(record);
+                const clang::FunctionDecl* keyDef = nullptr;
+                if (key != nullptr && !key->isDefined(keyDef)) return;   // the library's vtable
+                for (const clang::CXXMethodDecl* method : record->methods())
+                    if (method->isVirtual()) work.push_back(method);
+            };
+            while (!work.empty())
+            {
+                const clang::FunctionDecl* next = work.back();
+                work.pop_back();
+                const clang::FunctionDecl* definition = nullptr;
+                if (next == nullptr || !next->isDefined(definition)) continue;
+                auto* target = const_cast<clang::FunctionDecl*>(definition);
+                if (bodies.count(target) != 0 && ParseOne(target, failure)) ++parsed;
+                if (target->getBody() == nullptr || !walked.insert(target).second) continue;
+                CalleeWalk walk;
+                walk.TraverseStmt(target->getBody());
+                work.insert(work.end(), walk.found.begin(), walk.found.end());
+                // A variable that body names must be shown to CodeGen, or it stays external.
+                for (clang::VarDecl* var : walk.storage)
+                    if (clang::VarDecl* def = var->getDefinition(); def != nullptr && plan != nullptr)
+                        plan->Add(def);
+                for (const clang::CXXRecordDecl* record : walk.constructed)
+                    addRecord(record, true);
+                if (const auto* ctor = llvm::dyn_cast<clang::CXXConstructorDecl>(target))
+                {
+                    for (const clang::CXXCtorInitializer* init : ctor->inits())
+                    {
+                        CalleeWalk inits;
+                        inits.TraverseStmt(init->getInit());
+                        work.insert(work.end(), inits.found.begin(), inits.found.end());
+                    }
+                    addRecord(ctor->getParent(), true);
+                }
+                if (const auto* dtor = llvm::dyn_cast<clang::CXXDestructorDecl>(target))
+                {
+                    const clang::CXXRecordDecl* record = dtor->getParent();
+                    addRecord(record, true);
+                    for (const clang::CXXBaseSpecifier& base : record->bases())
+                        addRecord(base.getType()->getAsCXXRecordDecl(), false);
+                    for (const clang::FieldDecl* field : record->fields())
+                        addRecord(ctx.getBaseElementType(field->getType())->getAsCXXRecordDecl(),
+                                  false);
+                }
+            }
+            return parsed;
+        }
+    };
+
     struct ContainsErrors : clang::RecursiveASTVisitor<ContainsErrors>
     {
         bool found = false;
@@ -478,6 +766,9 @@ namespace
     {
     public:
         std::vector<clang::Decl*>* sink = nullptr;
+        // Always on: every announced decl, whoever triggered it (a chunk or the extractor's own
+        // instantiations), is a candidate for the group's demand pass.
+        cflat_cinterop::CxxDemandPlan* plan = nullptr;
         clang::ASTContext* context = nullptr;
         std::vector<std::string> neutralized;
         std::unordered_map<const clang::FunctionDecl*, std::string>* poisoned = nullptr;
@@ -489,8 +780,27 @@ namespace
             {
                 Neutralize(decl);
                 if (sink != nullptr) sink->push_back(decl);
+                // Functions and variables only: a namespace or linkage block would hand every
+                // strong definition inside it; chunks hand those through their own harvest.
+                if (plan != nullptr
+                    && (llvm::isa<clang::FunctionDecl>(decl) || llvm::isa<clang::VarDecl>(decl)))
+                    plan->Add(decl);
             }
             return true;
+        }
+
+        LazyBodies* lazyBodies = nullptr;
+        bool shouldSkipFunctionBody(clang::Decl* decl) override
+        {
+            return lazyBodies != nullptr && lazyBodies->Skip(decl);
+        }
+
+        // An implicitly instantiated static data member never reaches HandleTopLevelDecl; the
+        // demand pass still needs it to emit the storage a request ODR-uses.
+        void HandleCXXStaticMemberVarInstantiation(clang::VarDecl* var) override
+        {
+            if (sink != nullptr) sink->push_back(var);
+            if (plan != nullptr) plan->Add(var);
         }
 
     private:
@@ -754,6 +1064,13 @@ struct CxxIncrementalGroup::Impl
     // Every error and note the newest ParseRequest reported, across its recovery attempts.
     std::string lastDiagnostics;
     bool headerHadDiagnostics = false;
+    // Everything a definitions harvest would have handed CodeGen, for the one demand pass.
+    cflat_cinterop::CxxDemandPlan plan;
+    std::vector<std::string> demandChunkSources;
+    bool demandHeaderHarvested = false;
+    // Free-operator candidates per header TU root (ExtractRequest::operatorIndex).
+    std::unordered_map<const clang::Decl*, std::vector<clang::Decl*>> operatorIndex;
+    LazyBodies lazy;
 
     ~Impl()
     {
@@ -799,6 +1116,12 @@ std::unique_ptr<CxxIncrementalGroup> CxxIncrementalGroup::Create(
     // Same reason as the extractor invocation: a forwarding destructor must stay a symbol
     // of its own (see CXXCtorDtorAliases in CClangExtract.cpp).
     (*compiler)->getCodeGenOpts().CXXCtorDtorAliases = false;
+    /*
+     * Parse only: the Interpreter would code-generate (and run its backend pipeline over) every
+     * chunk, and cflat never uses those modules. Companion code comes from the group's one
+     * demand pass (EmitCxxDemandCompanion) instead.
+     */
+    (*compiler)->getFrontendOpts().ProgramAction = clang::frontend::ParseSyntaxOnly;
     auto executorBuilder = std::make_unique<clang::IncrementalExecutorBuilder>();
     executorBuilder->IE = std::make_unique<ParseOnlyExecutor>();
     auto interpreter = clang::Interpreter::create(std::move(*compiler), std::move(executorBuilder));
@@ -818,6 +1141,8 @@ std::unique_ptr<CxxIncrementalGroup> CxxIncrementalGroup::Create(
         recorder->context = &impl->interpreter->getCompilerInstance()->getASTContext();
         recorder->poisoned = &impl->poisoned;
         recorder->causes = &impl->causes;
+        recorder->plan = &impl->plan;
+        recorder->lazyBodies = &impl->lazy;
         impl->announcer = recorder.get();
         auto& consumers = MultiplexAccess::ListOf(*multiplex);
         auto guarded = std::make_unique<StaticMemberGuard>(std::move(consumers));
@@ -831,7 +1156,46 @@ std::unique_ptr<CxxIncrementalGroup> CxxIncrementalGroup::Create(
             std::make_unique<IncludeCollector>(
                 impl->interpreter->getCompilerInstance()->getPreprocessor(),
                 impl->includedFiles, impl->includeGraph));
-        auto ptu = impl->interpreter->Parse(headerSource);
+        /*
+         * Skip the bodies of inline non-template functions, keeping their tokens: the demand
+         * pass parses only the ones the program reaches (LazyBodies). Request chunks parse all.
+         */
+        clang::CompilerInstance& ci = *impl->interpreter->getCompilerInstance();
+        clang::Preprocessor& pp = ci.getPreprocessor();
+        LazyBodies& lazy = impl->lazy;
+        lazy.parser = static_cast<clang::Parser*>(pp.getCodeCompletionHandler());
+        lazy.sema = &ci.getSema();
+        // CFLAT_CXX_EAGER_BODIES=1 parses every body up front (A/B and bisecting a late body).
+        if (lazy.parser != nullptr && !cflat_cinterop::CxxEagerBodies())
+        {
+            lazy.parser->*AccessPrivate(ParserSkipBodiesTag{}) = true;
+            pp.setTokenWatcher([&lazy](const clang::Token& token) { lazy.Observe(token); });
+            lazy.active = true;
+        }
+        auto ptu = [&] {
+            llvm::TimeTraceScope parseScope("CxxGroupHeaderParse");
+            return impl->interpreter->Parse(headerSource);
+        }();
+        if (lazy.active)
+        {
+            lazy.active = false;
+            pp.setTokenWatcher(nullptr);
+            lazy.parser->*AccessPrivate(ParserSkipBodiesTag{}) = false;
+            lazy.recent.clear();
+            // An unterminated capture cannot be replayed; that function stays declared only.
+            if (lazy.capturing != nullptr)
+                for (auto it = lazy.bodies.begin(); it != lazy.bodies.end(); ++it)
+                    if (&it->second == lazy.capturing)
+                    {
+                        lazy.bodies.erase(it);
+                        break;
+                    }
+            lazy.capturing = nullptr;
+            lazy.MarkPending(/*forCodeGen*/ false);
+            if (verbose)
+                std::cout << std::format("[verbose] C++ header parse: {} inline bod(ies) "
+                                         "deferred\n", lazy.bodies.size());
+        }
         impl->headerHadDiagnostics = diagnostics.consumer.errors != 0;
         if (!ptu)
         {
@@ -862,20 +1226,15 @@ bool CxxIncrementalGroup::HarvestHeader(const cflat_cinterop::ExtractRequest& re
     }
     DiagnosticScope diagnostics(impl_->interpreter->getCompilerInstance()->getDiagnostics());
     diagnostics.consumer.causes = &impl_->causes;
+    cflat_cinterop::ExtractRequest effective = req;
+    if (effective.emitDefinitions) effective.demandPlan = &impl_->plan;
+    effective.operatorIndex = &impl_->operatorIndex;
     const bool harvested = cflat_cinterop::ExtractCxxIncremental(
-        req, *impl_->interpreter->getCompilerInstance(), impl_->headerRoot,
+        effective, *impl_->interpreter->getCompilerInstance(), impl_->headerRoot,
         impl_->headerRoot, {}, impl_->headerModule, out, error, true);
+    if (harvested && effective.demandPlan != nullptr) out.demandRecorded = true;
+    if (harvested && out.demandRecorded) impl_->demandHeaderHarvested = true;
     out.includedFiles = impl_->includedFiles;
-    if (harvested && impl_->headerModule != nullptr)
-    {
-        std::string headerBitcode = SerializeModule(*impl_->headerModule);
-        if (!headerBitcode.empty() && !out.bitcode.empty())
-        {
-            std::string merged;
-            if (MergeBitcode(headerBitcode, out.bitcode, merged)) out.bitcode = std::move(merged);
-        }
-        else if (!headerBitcode.empty()) out.bitcode = std::move(headerBitcode);
-    }
     return harvested;
 }
 
@@ -917,6 +1276,17 @@ bool CxxIncrementalGroup::PrecheckSpelling(const std::string& spelling, std::str
 bool CxxIncrementalGroup::HasPrefixSource(const std::string& source) const
 {
     return !source.empty() && impl_->prefixSources.count(source) != 0;
+}
+
+bool CxxIncrementalGroup::HasDemandChunkSource(const std::string& source) const
+{
+    return std::find(impl_->demandChunkSources.begin(), impl_->demandChunkSources.end(), source)
+        != impl_->demandChunkSources.end();
+}
+
+bool CxxIncrementalGroup::HasDemandHeaderHarvest() const
+{
+    return impl_->demandHeaderHarvested;
 }
 
 std::string CxxIncrementalGroup::UnseenPrefixSource(const std::string& source) const
@@ -1074,8 +1444,13 @@ bool CxxIncrementalGroup::ParseRequest(const cflat_cinterop::ExtractRequest& req
         const bool explicitInstantiation = chunk.starts_with("template class ")
             || chunk.find("\ntemplate class ") != std::string::npos;
         announced.clear();
+        clang::ASTContext& astContext = impl_->interpreter->getCompilerInstance()->getASTContext();
+        std::vector<clang::NamespaceDecl*> namespaces;
+        if (chunk.find("namespace ") != std::string::npos)
+            namespaces = VisibleTopLevelNamespaces(astContext);
         if (impl_->announcer != nullptr) impl_->announcer->sink = &announced;
         auto ptu = impl_->interpreter->Parse(chunk);
+        if (!ptu && !namespaces.empty()) RestoreTopLevelNamespaces(astContext, namespaces);
         if (impl_->announcer != nullptr) impl_->announcer->sink = nullptr;
         if (impl_->verbose && impl_->announcer != nullptr)
             for (const std::string& name : impl_->announcer->neutralized)
@@ -1171,6 +1546,8 @@ bool CxxIncrementalGroup::ParseRequest(const cflat_cinterop::ExtractRequest& req
     cflat_cinterop::ExtractRequest effective = req;
     effective.poisonedFunctions = &impl_->poisoned;
     effective.errorCauses = &impl_->causes;
+    if (effective.emitDefinitions || wrapperBatch) effective.demandPlan = &impl_->plan;
+    effective.operatorIndex = &impl_->operatorIndex;
     // A retry renamed the thunks with its tag; the extractor looks them up by that name.
     if (parsedAttempt > 0 && !effective.cxxThunkSuffix.empty())
         effective.cxxThunkSuffix = PrepareRetryChunk(effective.cxxThunkSuffix, parsedAttempt);
@@ -1198,9 +1575,28 @@ bool CxxIncrementalGroup::ParseRequest(const cflat_cinterop::ExtractRequest& req
         wrapperBatch ? nullptr : impl_->headerRoot, extraRoots,
         parsed->TheModule.get(), out, error, false, wrapperBatch ? nullptr : preludeRoot,
         &announced);
+    if (harvested && effective.emitDefinitions && effective.demandPlan != nullptr)
+        out.demandRecorded = true;
+    if (harvested && out.demandRecorded)
+    {
+        auto& replay = out.demandReplayChunk;
+        replay.order = impl_->demandChunkSources.size() + 1;
+        replay.source = source;
+        replay.prefixSource = req.demandPrefixSource;
+        replay.typeRequests = req.cxxTypeRequests;
+        replay.markerPrefix = req.cxxRequestMarkerPrefix;
+        replay.thunkSuffix = req.cxxThunkSuffix;
+        replay.wrapperNames = req.cxxFunctionWrapperNames;
+        replay.wrapperBatch = req.cxxWrapperBatch;
+        replay.autoInstantiate = req.autoInstantiateCxxTypes;
+        impl_->demandChunkSources.push_back(source);
+    }
     if (harvested && out.firstError.empty()) out.firstError = recoveredError;
     if (harvested && !renamedWrappers.empty())
     {
+        if (out.demandRecorded)
+            for (const auto& [renamed, original] : renamedWrappers)
+                impl_->plan.renamed[original] = renamed;
         llvm::Module* module = parsed->TheModule.get();
         for (const auto& [renamed, original] : renamedWrappers)
         {
@@ -1298,6 +1694,8 @@ bool CxxIncrementalGroup::ParseRequest(const cflat_cinterop::ExtractRequest& req
             appendTemplates(out.functionTemplates);
             merged.bitcode = std::move(out.bitcode);
             merged.emittedDefinitions = out.emittedDefinitions;
+            merged.demandRecorded = out.demandRecorded;
+            merged.demandReplayChunk = std::move(out.demandReplayChunk);
             if (!out.firstError.empty()) merged.firstError = std::move(out.firstError);
             if (!out.invalidCxxTypeRequestError.empty())
                 merged.invalidCxxTypeRequestError = std::move(out.invalidCxxTypeRequestError);
@@ -1317,6 +1715,60 @@ bool CxxIncrementalGroup::ParseRequest(const cflat_cinterop::ExtractRequest& req
 const std::string& CxxIncrementalGroup::LastRequestDiagnostics() const
 {
     return impl_->lastDiagnostics;
+}
+
+unsigned CxxIncrementalGroup::DemandChunks() const
+{
+    return impl_->plan.recordedChunks;
+}
+
+bool CxxIncrementalGroup::EmitDemandCompanion(const std::vector<std::string>& demand,
+                                              std::string& bitcode,
+                                              cflat_cinterop::CxxDemandStats& stats,
+                                              std::string& error)
+{
+    DiagnosticScope diagnostics(impl_->interpreter->getCompilerInstance()->getDiagnostics());
+    LazyBodies& lazy = impl_->lazy;
+    lazy.plan = &impl_->plan;
+    unsigned parsed = 0;
+    std::string failure;
+    impl_->plan.materializeBody = [&](clang::FunctionDecl* fd) {
+        if (lazy.Find(fd) == nullptr) return false;
+        parsed += lazy.MaterializeReachable({fd}, failure);
+        return lazy.Find(fd) == nullptr && !fd->isInvalidDecl();
+    };
+    impl_->plan.materializeReachable = [&](std::vector<const clang::FunctionDecl*> roots,
+                                           std::string& bodyFailure,
+                                           std::string& bodyDiagnostic) {
+        parsed += lazy.MaterializeReachable(std::move(roots), failure);
+        bodyFailure = failure;
+        if (!failure.empty())
+            bodyDiagnostic = diagnostics.consumer.firstErrorLocation.empty()
+                ? diagnostics.consumer.firstError : diagnostics.consumer.firstErrorLocation;
+    };
+    lazy.MarkPending(/*forCodeGen*/ true);
+    const auto companionStart = std::chrono::steady_clock::now();
+    const bool ok = cflat_cinterop::EmitCxxDemandCompanion(
+        *impl_->interpreter->getCompilerInstance(), impl_->plan, demand, &impl_->poisoned,
+        impl_->verbose, bitcode, stats, error);
+    lazy.MarkPending(/*forCodeGen*/ false);
+    impl_->plan.materializeBody = nullptr;
+    impl_->plan.materializeReachable = nullptr;
+    if (impl_->verbose)
+    {
+        const double companionMs = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - companionStart).count();
+        std::cout << std::format("[verbose] C++ demand companion elapsed: {:.3f} ms\n",
+                                 companionMs);
+        std::cout << std::format("[verbose] C++ demand pass: {} deferred inline bod(ies) parsed, "
+                                 "{} still deferred{}\n", parsed, lazy.bodies.size(),
+                                 failure.empty() ? "" : ", '" + failure + "' did not compile");
+    }
+    if (!ok && error.empty()) error = diagnostics.consumer.firstError;
+    else if (!ok && !diagnostics.consumer.firstError.empty()
+             && error.find(diagnostics.consumer.firstError) == std::string::npos)
+        error += ": " + diagnostics.consumer.firstError;
+    return ok;
 }
 
 namespace

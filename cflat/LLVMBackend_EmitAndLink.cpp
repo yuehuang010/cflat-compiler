@@ -1,6 +1,7 @@
 #pragma warning(push)
 #pragma warning(disable: 4244 4267)
 #include <llvm/IR/IRBuilder.h>
+#include "CxxIncrementalGroup.h"
 #include "llvm/Transforms/Utils/ModuleUtils.h"
 #include <llvm/IR/LLVMContext.h>
 #include <llvm/IR/AssemblyAnnotationWriter.h>
@@ -2809,8 +2810,281 @@ bool LLVMBackend::UpgradeCxxAssumedBodyOwners(const llvm::Module& companions)
     return cxxCompanionBitcode_.size() != adoptedBefore;
 }
 
+/*
+ * What the program module uses but does not define, sorted: the demand every live C++ import
+ * group answers with its one companion module.
+ */
+std::vector<std::string> LLVMBackend::CxxProgramDemand() const
+{
+    std::vector<std::string> names;
+    for (const llvm::Function& f : module->functions())
+        if (f.isDeclaration() && f.hasName() && !f.isIntrinsic() && !f.use_empty())
+            names.push_back(f.getName().str());
+    for (const llvm::GlobalVariable& g : module->globals())
+        if (g.isDeclaration() && g.hasName() && !g.use_empty())
+            names.push_back(g.getName().str());
+    std::sort(names.begin(), names.end());
+    names.erase(std::unique(names.begin(), names.end()), names.end());
+    return names;
+}
+
+/*
+ * P3: each live C++ import group recorded, rather than emitted, the definitions its harvests
+ * would have produced. Now that CFlat code generation is done the demand is known: one CodeGen
+ * pass per group emits exactly what the program reaches, adopted as the group's one companion.
+ */
+// A group's companion is replaced whenever its demand or an entry key changes. Remove that
+// group's other companions once nothing has hit them for a while, as the .rq pruning does.
+static void PruneStaleCxxDemandCompanions(const std::filesystem::path& current,
+                                          const std::string& groupPrefix)
+{
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    const auto now = fs::file_time_type::clock::now();
+    constexpr auto grace = std::chrono::minutes(10);
+    for (const auto& file : fs::directory_iterator(current.parent_path(), ec))
+    {
+        if (ec) return;
+        const std::string name = file.path().filename().string();
+        if (file.path() == current || !name.starts_with(groupPrefix)
+            || !name.ends_with(".cxxdemand.bc"))
+            continue;
+        const auto written = fs::last_write_time(file.path(), ec);
+        if (ec) { ec.clear(); continue; }
+        if (now - written >= grace) fs::remove(file.path(), ec);
+        ec.clear();
+    }
+}
+
+/*
+ * One companion per demand group: the group's recorded plan emitted for the program's demand.
+ * A group whose entries all came from this compile emits live and caches the companion under
+ * group + entry hashes + demand; a group served from cache loads that companion, or asks main
+ * for one retry with the demand-group caches bypassed.
+ */
+bool LLVMBackend::EmitCxxDemandCompanions()
+{
+    if (cxxDemandRetry_) return false;
+    auto anyGroup = [&]() {
+        for (const auto& [key, group] : cxxIncrementalGroups_)
+            if (group != nullptr && group->DemandChunks() > 0) return true;
+        return !cxxDemandGroups_.empty();
+    };
+    if (!anyGroup()) return true;
+    llvm::TimeTraceScope scope("CxxDemandCompanions");
+    // A body the program calls that only a layout-only request bound: its owner is requested
+    // again with definitions, which records into the same plans before they are emitted.
+    if (!cxxAssumedBodyOwners_.empty())
+    {
+        llvm::Module none("cflat_cxx_no_companion", *context);
+        UpgradeCxxAssumedBodyOwners(none);
+    }
+    std::set<std::string> keys;
+    for (const auto& [key, use] : cxxDemandGroups_) keys.insert(key);
+    for (const auto& [key, group] : cxxIncrementalGroups_)
+        if (group != nullptr && group->DemandChunks() > 0) keys.insert(key);
+    const std::vector<std::string> demand = CxxProgramDemand();
+    const std::string cacheDir = noCache_ ? std::string{} : GetCHeaderCacheDir();
+    for (const std::string& key : keys)
+    {
+        const auto useIt = cxxDemandGroups_.find(key);
+        const auto groupIt = cxxIncrementalGroups_.find(key);
+        CxxIncrementalGroup* group = groupIt != cxxIncrementalGroups_.end()
+            ? groupIt->second.get() : nullptr;
+        const bool served = useIt != cxxDemandGroups_.end() && useIt->second.served;
+        const bool demanded = (useIt != cxxDemandGroups_.end() && useIt->second.demand)
+            || (group != nullptr && group->DemandChunks() > 0);
+        if (!demanded) continue;
+        bool live = group != nullptr && !served;
+
+        uint64_t companionKey = 14695981039346656037ULL;
+        auto mix = [&](const std::string& text) {
+            for (unsigned char byte : text)
+            {
+                companionKey ^= byte;
+                companionKey *= 1099511628211ULL;
+            }
+            companionKey ^= 0xff;
+            companionKey *= 1099511628211ULL;
+        };
+        // Keyed like its entries (cache version, not build stamp): they survive a rebuild, so
+        // must the companion, or every served group would miss and retry cold.
+        mix(std::to_string(kCHeaderCacheVersion));
+        if (cflat_cinterop::CxxEagerBodies()) mix("|BEAGER");
+        mix(CInteropTargetTriple());
+        mix(cppStandard_);
+        mix(ProgramTargetCPUFeatures().first);
+        mix(ProgramTargetCPUFeatures().second);
+        for (const std::string& dir : cIncludeDirs_) mix("I" + dir);
+        for (const std::string& define : cDefines_) mix("D" + define);
+        mix(key);
+        if (useIt != cxxDemandGroups_.end())
+            for (uint64_t hash : useIt->second.hashes) mix(std::to_string(hash));
+        for (const std::string& name : demand) mix(name);
+        uint64_t groupHash = 14695981039346656037ULL;
+        for (unsigned char byte : key)
+        {
+            groupHash ^= byte;
+            groupHash *= 1099511628211ULL;
+        }
+        const std::string groupPrefix = std::format("{:016x}-", groupHash);
+        const std::filesystem::path companionPath = cacheDir.empty()
+            ? std::filesystem::path{}
+            : std::filesystem::path(cacheDir)
+                / std::format("{}{:016x}.cxxdemand.bc", groupPrefix, companionKey);
+
+        if (!live)
+        {
+            if (!companionPath.empty())
+                if (auto buffer = llvm::MemoryBuffer::getFile(companionPath.string()))
+                {
+                    if (verbose)
+                        std::cout << std::format("[verbose] C++ demand companion cache hit: {} "
+                                                 "bytes\n", (*buffer)->getBufferSize());
+                    AdoptCxxCompanionBitcode(std::string((*buffer)->getBuffer()));
+                    // A hit refreshes the age the pruning below reads.
+                    std::error_code touchEc;
+                    std::filesystem::last_write_time(
+                        companionPath, std::filesystem::file_time_type::clock::now(), touchEc);
+                    continue;
+                }
+            // A check-only batch emits nothing; the bodies only sharpen codegen-side gates.
+            if (batchMode_)
+            {
+                if (verbose)
+                    std::cout << "[verbose] C++ demand companion cache miss in a check-only "
+                                 "batch: definitions skipped\n";
+                continue;
+            }
+            if (!cxxDemandBypass_)
+            {
+                std::string replayError;
+                const bool replayed = ReplayCxxDemandChunks(key, replayError);
+                auto replayedGroup = cxxIncrementalGroups_.find(key);
+                if (replayed && replayedGroup != cxxIncrementalGroups_.end()
+                    && replayedGroup->second->DemandChunks() > 0)
+                {
+                    group = replayedGroup->second.get();
+                    live = true;
+                    if (verbose)
+                        std::cout << std::format(
+                            "[verbose] C++ demand companion cache miss: replayed {} cached chunk(s)\n",
+                            cxxDemandGroups_[key].replayChunks.size());
+                }
+                else
+                {
+                    if (verbose)
+                        std::cout << std::format(
+                            "[verbose] C++ demand replay failed ({}); retrying with C++ caches bypassed\n",
+                            replayError.empty() ? "no replayed demand" : replayError);
+                    cxxDemandRetry_ = true;
+                    return false;
+                }
+            }
+            else
+            {
+                LogErrorMessage("{}: the C++ definitions this program uses could not be "
+                                "generated: {}", { "import cpp", "no live import group" });
+                return false;
+            }
+        }
+        // A check-only batch links nothing; generating the bodies would be discarded work.
+        if (batchMode_)
+        {
+            if (verbose)
+                std::cout << "[verbose] C++ demand companion skipped in a check-only batch\n";
+            continue;
+        }
+        std::string bitcode, error;
+        cflat_cinterop::CxxDemandStats stats;
+        // Nothing recorded: the empty companion is still cached so a warm run finds it.
+        if (group->DemandChunks() > 0 && !group->EmitDemandCompanion(demand, bitcode, stats, error))
+        {
+            LogErrorMessage("{}: the C++ definitions this program uses could not be "
+                            "generated: {}", { "import cpp", error });
+            return false;
+        }
+        if (verbose)
+            std::cout << std::format("[verbose] C++ demand companion: {} of {} program "
+                                     "symbol(s) demanded, {} definition(s), {} unresolved, "
+                                     "{} bytes\n", stats.demanded, demand.size(),
+                                     stats.definitions, stats.unresolved, bitcode.size());
+        if (!companionPath.empty() && !runMode_ && !batchMode_ && symbolSink_ == nullptr)
+        {
+            std::error_code ec;
+            std::filesystem::create_directories(companionPath.parent_path(), ec);
+            const std::filesystem::path tmpPath = companionPath.string()
+                + std::format(".{}.tmp", _getpid());
+            bool written = false;
+            {
+                std::ofstream f(tmpPath, std::ios::binary | std::ios::trunc);
+                if (f.is_open())
+                {
+                    f.write(bitcode.data(), static_cast<std::streamsize>(bitcode.size()));
+                    written = static_cast<bool>(f);
+                }
+            }
+            if (written) std::filesystem::rename(tmpPath, companionPath, ec);
+            if (!written || ec) std::filesystem::remove(tmpPath, ec);
+            PruneStaleCxxDemandCompanions(companionPath, groupPrefix);
+        }
+        AdoptCxxCompanionBitcode(bitcode);
+    }
+    return true;
+}
+
+/*
+ * Runs a linker. After a demand replay its output is held back: stdout and stderr go to their
+ * own temporary files and reach their streams only when the link succeeds. A failing link then
+ * requests the whole-compile cold retry instead of reporting symbols the cold compile defines.
+ */
+int LLVMBackend::RunLinkerProcess(llvm::StringRef program, llvm::ArrayRef<llvm::StringRef> args,
+                                  std::string& error)
+{
+    if (!cxxDemandReplayed_ || cxxDemandBypass_)
+        return llvm::sys::ExecuteAndWait(program, args, std::nullopt, {}, 0, 0, &error);
+    llvm::SmallString<256> outPath, errPath;
+    if (llvm::sys::fs::createTemporaryFile("cflat-link", "out", outPath)
+        || llvm::sys::fs::createTemporaryFile("cflat-link", "err", errPath))
+    {
+        // Output cannot be held back, so do not link the replayed module at all: the cold
+        // retry links without a replay.
+        if (!outPath.empty()) llvm::sys::fs::remove(outPath);
+        if (!errPath.empty()) llvm::sys::fs::remove(errPath);
+        if (verbose)
+            std::cout << "[verbose] cannot hold back linker output after a C++ demand replay: "
+                         "retrying with C++ caches bypassed\n";
+        cxxDemandRetry_ = true;
+        error = "linker output capture unavailable";
+        return 1;
+    }
+    const std::optional<llvm::StringRef> redirects[] = {
+        std::nullopt, llvm::StringRef(outPath), llvm::StringRef(errPath) };
+    std::cout.flush();
+    const int rc = llvm::sys::ExecuteAndWait(program, args, std::nullopt, redirects, 0, 0, &error);
+    if (rc == 0)
+    {
+        if (auto out = llvm::MemoryBuffer::getFile(outPath))
+            std::cout << (*out)->getBuffer().str() << std::flush;
+        if (auto err = llvm::MemoryBuffer::getFile(errPath))
+            std::cerr << (*err)->getBuffer().str() << std::flush;
+    }
+    else
+    {
+        if (verbose)
+            std::cout << "[verbose] link failed after a C++ demand replay: retrying with C++ "
+                         "caches bypassed\n";
+        cxxDemandRetry_ = true;
+    }
+    llvm::sys::fs::remove(outPath);
+    llvm::sys::fs::remove(errPath);
+    return rc;
+}
+
 bool LLVMBackend::LinkCxxCompanionModules()
 {
+    if (!EmitCxxDemandCompanions()) return false;
+    if (cxxDemandResume_) std::exchange(cxxDemandResume_, nullptr)();
     if (cxxCompanionBitcode_.empty() && cxxAssumedBodyOwners_.empty()) return true;
     llvm::TimeTraceScope scope("LinkCxxCompanion");
 
@@ -3123,12 +3397,13 @@ bool LLVMBackend::EmitExecutableElf(const std::string& exePath, bool debugInfo,
 
         std::cout << std::format("Linking (elf): {}\n", exePath);
         std::string linkErr;
-        int rc = llvm::sys::ExecuteAndWait(cc, args, std::nullopt, {}, 0, 0, &linkErr);
+        int rc = RunLinkerProcess(cc, args, linkErr);
         llvm::sys::fs::remove(objPath);
         for (auto& cObj : cObjectFiles_) llvm::sys::fs::remove(cObj);
         if (rc != 0)
         {
-            std::cout << std::format("Error: linking failed (exit {}): {}\n", rc, linkErr);
+            if (!cxxDemandRetry_)
+                std::cout << std::format("Error: linking failed (exit {}): {}\n", rc, linkErr);
             return false;
         }
         return true;
@@ -3414,12 +3689,13 @@ bool LLVMBackend::EmitExecutableMachO(const std::string& exePath, bool debugInfo
                 std::cout << std::format("Linking (ld64.lld{}): {}\n",
                                          stubRoot.empty() ? "" : ", SDK-free", exePath);
                 std::string linkErr;
-                int rc = llvm::sys::ExecuteAndWait(ld64, args, std::nullopt, {}, 0, 0, &linkErr);
+                int rc = RunLinkerProcess(ld64, args, linkErr);
                 if (rc != 0)
                 {
                     llvm::sys::fs::remove(objPath);
                     for (auto& cObj : cObjectFiles_) llvm::sys::fs::remove(cObj);
-                    std::cout << std::format("Error: linking failed (exit {}): {}\n", rc, linkErr);
+                    if (!cxxDemandRetry_)
+                        std::cout << std::format("Error: linking failed (exit {}): {}\n", rc, linkErr);
                     return false;
                 }
                 const bool keepObjects = debugInfo && !EmitMacDebugInfo(exePath);
@@ -3472,12 +3748,13 @@ bool LLVMBackend::EmitExecutableMachO(const std::string& exePath, bool debugInfo
 
         std::cout << std::format("Linking (mach-o): {}\n", exePath);
         std::string linkErr;
-        int rc = llvm::sys::ExecuteAndWait(cc, args, std::nullopt, {}, 0, 0, &linkErr);
+        int rc = RunLinkerProcess(cc, args, linkErr);
         if (rc != 0)
         {
             llvm::sys::fs::remove(objPath);
             for (auto& cObj : cObjectFiles_) llvm::sys::fs::remove(cObj);
-            std::cout << std::format("Error: linking failed (exit {}): {}\n", rc, linkErr);
+            if (!cxxDemandRetry_)
+                std::cout << std::format("Error: linking failed (exit {}): {}\n", rc, linkErr);
             return false;
         }
         bool keepObjects = false;
@@ -3962,14 +4239,15 @@ bool LLVMBackend::EmitExecutable(const std::string& exePath, const std::string& 
         {
             llvm::TimeTraceScope linkScope("Link", exePath);
             std::string linkErr;
-            int rc = llvm::sys::ExecuteAndWait(lldLinkPath, linkArgs, std::nullopt, {}, 0, 0, &linkErr);
+            int rc = RunLinkerProcess(lldLinkPath, linkArgs, linkErr);
             llvm::sys::fs::remove(objPath);
             for (auto& cObj : cObjectFiles_) llvm::sys::fs::remove(cObj);
             cleanupResourceFiles();
 
             if (rc != 0)
             {
-                std::cout << std::format("Error: linking failed (exit {}): {}\n", rc, linkErr);
+                if (!cxxDemandRetry_)
+                    std::cout << std::format("Error: linking failed (exit {}): {}\n", rc, linkErr);
                 return false;
             }
         }

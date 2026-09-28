@@ -1,4 +1,72 @@
-# The three C++ interop fixtures gate CI wall time (buildci warm 372 s vs 300 s target)
+# C++ import compile time: within 10% of clang++, cold AND warm (p1, maintainer target 2026-09-27)
+
+**Target (maintainer, 2026-09-27).** A CFlat program that imports a C++ header must compile within
+10% of `clang++ -std=c++20` compiling the equivalent C++ program (compile + link), both with an empty
+cache (cold) and with a populated cache (warm). Bumped from p3 (was "The three C++ interop fixtures
+gate CI wall time"); the fixture/CI history below still applies.
+
+**Benchmark (2026-09-27, master 9163cbb7, macOS arm64 Release).** Same program both ways: libtorch
+`nn::Linear(2,1)` + SGD, 200 steps (C++: scratch/cmp/train.cpp, CFlat: scratch/cmp/train.cb, flags in
+scratch/cmp/flags.txt; script scratch/cmp/parity.sh). Measured under load 7-21 (buildci running):
+
+| | time | vs clang++ |
+|---|---|---|
+| clang++ compile + link | 4.2 s | 1.0x |
+| cflat warm | 17.6 s | 4.2x |
+| cflat cold (empty CFLAT_CACHE_DIR) | 98 s | 23x |
+
+`--check` warm = 18.6 s, so none of it is codegen or link. Warm `-ftime-trace` (19.4 s span):
+LinkCxxCompanion 10.0 s (60 companion bitcode modules, CxxCompanionBitcodeParse 5.9 s of it),
+CHeaderRegister / CxxTypeRequestReplay 7.3-7.8 s (55 replayed requests), CxxRequestRegisterRecords
+3.1 s. Cold (spike 2026-09-27, 94 s): the header IS parsed once (CxxIncrementalGroup keeps one Sema); the
+111 "clang parse" lines are 1 macro pass + 1 full parse (4.3 s) + 109 incremental chunks. The time is
+after the parse: record registration 51.5 s (eager std::function member requests the program never
+uses), stage-2 per-request codegen re-emitting the group's whole free-function surface (~950 ms each),
+61 companions / 410 MB bitcode linked (8.9 s).
+
+**Idle-ish baseline (load 4.4, parity.sh N=1, 14:5x):** clang++ 3.67 s | warm 16.26 s (4.4x) | cold 86.12 s (23.5x).
+
+**Status 2026-09-28 04:00 (master 85dfb8cc, perf timebox 2026-09-27 22:00 -> 2026-09-28 07:00).**
+parity.sh median of 5 (04:52): clang++ 3.32 s | cflat warm 0.55 s (0.17x, TARGET MET, ~6x faster
+than clang++) | cflat cold 6.80 s (2.05x, NOT met) | warm-edit (train_relu after train, new
+C++ demand) 6.0 s via demand-chunk replay (edc89a47) instead of a whole-compile cold retry. torch
+tier 226 s -> 81-85 s. Landed: BF BH DI BJ BK BG CJ BL BN BQ DS UV BP NS (Queue.md LANDED rows;
+report scratch/perf_timebox_report_2026-09-28.md). Cold -v budget (~6.9 s): group Interpreter parse
+~2.0 s, harvest (ComputeCxxAbi: pending instantiations, implicit defs, EmitCxxDefinitions) ~1.3 s,
+type-request chunks ~0.8 s (335-390 chunks), default-wrapper second parse ~0.45 s, record
+registration ~0.33 s, macro prepass ~0.25 s, re-harvest ~0.15 s, CFlat + companion + link ~0.5-1 s.
+Our LLVM (plain Release, no PGO/LTO) runs `clang++ -fsyntax-only train.cpp` ~20% slower than Apple
+clang, and ~4.5 s of the cold budget is clang work.
+
+**Status 2026-09-27 21:00 (commit 82370cc5, P1+P2+P3 squashed: lazy std::function member binds; no
+per-request surface harvest; one demand-driven companion per import group, cache 117).** parity.sh
+median of 3, load ~4: clang++ 3.24-3.53 s | cflat warm 3.0-3.3 s (0.9x, TARGET MET) | cflat cold
+11.4-12.4 s (3.5x). Edit-then-warm 3.6 s (companion reused). test_libs torch tier: 447 s -> 232 s cold,
+49 s warm. Cold floor left (P4/P5): chunk-0 header parse 3.9 s (clang++ pays this too), RegisterCRecords
+2.3 s, harvest glue ~1.8 s, CxxAbiArrange 1.2 s; plan: batch requests (P4), lazy record projection +
+overlap chunk 0 with CFlat parsing (P5). Warm gap: a demand change (new C++ symbol used) still retries
+the whole compile cold; design for an in-link chunk replay is in scratch/p3_notes.md ("remaining").
+Spikes: scratch/extract_spike.md (cold breakdown), scratch/warm_spike.md (pre-P3 warm breakdown).
+
+**Order (maintainer, 2026-09-27): cold to parity first, then warm.**
+
+**Parity budget.** Warm must do no C++ parsing, so warm parity needs the replay + companion link to
+be near-free: one pre-linked companion per import group loaded as one module, and one serialized
+bound-surface snapshot per group instead of N request replays. Cold plan: internal/plan/cpp-import-compile-parity.md
+(P1 lazy member types -> P2 no surface re-emit -> P3 one codegen per group -> P4 batched requests ->
+P5 overlap/lazy mapping; expected 94 -> 43 -> 24 -> 11 -> 8 -> <=4.6 s).
+
+**Method (maintainer, 2026-09-27).** Build times differ vastly across samples, so work ONE sample to
+parity (cold and warm) before moving to the next. Sample 1 = the torch training benchmark above. Next
+samples after it lands: simdjson, fmt, then the three C++ fixtures.
+
+**Acceptance.** scratch/cmp/parity.sh (moved into the repo as a perf gate when the plan lands) on
+torch, simdjson and fmt: cflat cold <= 1.1x and warm <= 1.1x clang++, measured on an idle machine,
+3 runs, median. No regression in test.sh / test_libs.
+
+---
+
+## History: the three C++ interop fixtures gate CI wall time (buildci warm 372 s vs 300 s target)
 
 **Summary.** `buildci.bat` Release, warm request cache, 2026-09-26: 372 s green. test.bat 144 s
 and the LSP sweep 150 s are both bounded by `test_cpp_interop_bridge.cb` / `_template.cb` /
@@ -86,3 +154,21 @@ not carry. Reverted. Any future attempt must first make the LSP request key carr
 prefix (or key the |EDECL entry on the same request source a compile would build) and must
 throttle writes across pool slots.
 
+
+## Next investigations (ranked, 2026-09-28)
+
+Items 1-6 of the 2026-09-27 list, the test_cpp_interop move analysis (BF: 163 s -> 0.27 s) and the
+in-link demand replay (BP) are done. Remaining cold levers, all needing a ruling or large work:
+1. Background cache warmer (RULING): cold does demand-only work (lazy harvest, est. ~4 s = ~1.2x)
+   and a detached `--warm-cache` process fills the eager harvest for siblings afterwards. Changes
+   warm = 0 from "always" to "eventually". Lazy harvest alone breaks warm-0 on 10/10 sibling torch
+   fixtures (scratch/lazy_harvest_spike.md).
+2. PGO + ThinLTO build of the pinned LLVM (maintainer-owned bootstrap change): est. -0.7..-1.0 s
+   cold, scales every clang stage.
+3. PCH / ExternalASTSource-aware harvest (scratch/pch_spike.md): clang+PCH compiles train in
+   1.22 s; Interpreter sees only 1 decl from a PCH today. Attacks the ~2 s group parse.
+4. Small: re-harvest after completing incomplete specializations (~150 ms); C records holding C++
+   records by value project eagerly at registration (~3%).
+Dropped (do not retry as-is): BI lazy implicit defs (ABI/linkage drift on 2044 records), dependent
+spelling request filter (no gain), wrapper direct param spellings (no gain), BR speculative
+Interpreter parse of scope-open headers (hangs).

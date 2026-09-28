@@ -4297,6 +4297,7 @@ cxx_dtor_ready:
                 return true;
             }
             std::string why;
+            compiler->TryBindRefusedCxxMember(typeName, "__ctor", argTypes.size());
             const auto* ctor = compiler->SelectCxxConstructor(typeName, argTypes, why, false,
                                                              &ctorArgumentAddresses);
             // A scalar-reference overload set is clang's to resolve: no listed refusal is final.
@@ -4306,7 +4307,7 @@ cxx_dtor_ready:
                 && (why.starts_with("constructor '") || why.starts_with("no overload of '"));
             if (ctor == nullptr && !hardReferenceRejection)
             {
-                compiler->TryBindRefusedCxxMember(typeName, "__ctor");
+                compiler->TryBindRefusedCxxMember(typeName, "__ctor", argTypes.size());
                 ctor = compiler->SelectCxxConstructor(typeName, argTypes, why, false,
                                                       &ctorArgumentAddresses);
                 hardReferenceRejection = !scalarReferenceSet

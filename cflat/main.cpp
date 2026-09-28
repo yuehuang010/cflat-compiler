@@ -16,6 +16,20 @@
 #include <cstring>
 #include <algorithm>
 #include <cctype>
+#include <cstdio>
+#ifdef _WIN32
+#include <io.h>
+#define CFLAT_DUP _dup
+#define CFLAT_DUP2 _dup2
+#define CFLAT_FILENO _fileno
+#define CFLAT_CLOSE _close
+#else
+#include <unistd.h>
+#define CFLAT_DUP dup
+#define CFLAT_DUP2 dup2
+#define CFLAT_FILENO fileno
+#define CFLAT_CLOSE close
+#endif
 
 #pragma warning(push)
 #pragma warning(disable: 4244 4267)
@@ -621,58 +635,124 @@ int main(int argc, char* argv[])
         return failures == 0 ? 0 : 1;
     }
 
-    LLVMBackend compiler;
-    compiler.SetRuntimeDir(runtimeDir);
-    compiler.SetVerbose(args.hasFlag("verbose"));
-    compiler.SetLocale(diagnosticLocale);
-    compiler.SetLocaleDirectory(diagnosticLocaleDir);
-    compiler.LoadLocale(args.hasFlag("verbose"));
-    compiler.SetLocaleTemplateCollection(updateLocale.has_value());
-    compiler.SetSkipRuntimeImport(args.hasFlag("no-runtime"));
-    auto isolatedPolicy = ConfigureIsolatedMode(compiler, args);
-    compiler.SetNoCache(args.hasFlag("no-cache") || isolatedPolicy.has_value());
-    compiler.SetCppStrictNoexcept(args.hasFlag("cpp-strict-noexcept"));
-    if (!compiler.SetCppStandard(args.getOption("cpp-std").value_or("c++20"))) return 1;
-    if (auto sub = args.getOption("subsystem"))
+    // Setup for the single compile, repeatable: a C++ demand-companion miss retries once.
+    auto configureCompiler = [&](LLVMBackend& compiler) -> int
     {
-        if (*sub != "console" && *sub != "windows")
+        compiler.SetRuntimeDir(runtimeDir);
+        compiler.SetVerbose(args.hasFlag("verbose"));
+        compiler.SetLocale(diagnosticLocale);
+        compiler.SetLocaleDirectory(diagnosticLocaleDir);
+        compiler.LoadLocale(args.hasFlag("verbose"));
+        compiler.SetLocaleTemplateCollection(updateLocale.has_value());
+        compiler.SetSkipRuntimeImport(args.hasFlag("no-runtime"));
+        auto isolatedPolicy = ConfigureIsolatedMode(compiler, args);
+        compiler.SetNoCache(args.hasFlag("no-cache") || isolatedPolicy.has_value());
+        compiler.SetCppStrictNoexcept(args.hasFlag("cpp-strict-noexcept"));
+        if (!compiler.SetCppStandard(args.getOption("cpp-std").value_or("c++20"))) return 1;
+        if (auto sub = args.getOption("subsystem"))
         {
-            std::cout << "Error: --subsystem must be 'console' or 'windows' (got '" << *sub << "').\n";
+            if (*sub != "console" && *sub != "windows")
+            {
+                std::cout << "Error: --subsystem must be 'console' or 'windows' (got '" << *sub << "').\n";
+                return 1;
+            }
+            compiler.SetWindowsSubsystem(*sub);
+        }
+        compiler.SetAsan(args.hasFlag("asan"));
+        compiler.SetSanitizeOwnership(args.hasFlag("sanitize-ownership"));
+
+        bool heapAudit = args.hasFlag("heap-audit");
+        if (heapAudit && !args.getOption("output"))
+        {
+            std::cout << "Error: --heap-audit requires -o; it links a C diagnostic object that the "
+                         "HeapAudit oracle needs (it cannot run with --run or IR-only output).\n";
             return 1;
         }
-        compiler.SetWindowsSubsystem(*sub);
-    }
-    compiler.SetAsan(args.hasFlag("asan"));
-    compiler.SetSanitizeOwnership(args.hasFlag("sanitize-ownership"));
+        compiler.SetHeapAudit(heapAudit);
 
-    bool heapAudit = args.hasFlag("heap-audit");
-    if (heapAudit && !args.getOption("output"))
-    {
-        std::cout << "Error: --heap-audit requires -o; it links a C diagnostic object that the "
-                     "HeapAudit oracle needs (it cannot run with --run or IR-only output).\n";
-        return 1;
-    }
-    compiler.SetHeapAudit(heapAudit);
+        bool runMode = args.hasFlag("run");
+        if (runMode && (args.getOption("output") || args.getOption("out-lli")
+                        || args.getOption("out-asm") || args.getOption("bitcode")))
+        {
+            std::cout << "Error: --run is read-only and writes nothing to disk; it cannot be combined "
+                         "with -o, -l/--out-lli, --out-asm, or -b/--bitcode.\n";
+            return 1;
+        }
+        // Program arguments after a bare "--" are only meaningful when JIT-executing with --run;
+        // in any other mode they would silently go nowhere, so reject them up front.
+        if (!args.passthrough().empty() && !runMode)
+        {
+            std::cout << "Error: program arguments after '--' are only valid with --run.\n";
+            return 1;
+        }
+        compiler.SetRunMode(runMode);
+        compiler.SetRunArgs(args.passthrough());
 
-    bool runMode = args.hasFlag("run");
-    if (runMode && (args.getOption("output") || args.getOption("out-lli")
-                    || args.getOption("out-asm") || args.getOption("bitcode")))
+        return -1;
+    };
+    auto compilerHolder = std::make_unique<LLVMBackend>();
+    if (int rc = configureCompiler(*compilerHolder); rc >= 0) return rc;
+    bool ok = compilerHolder->Compile(args);
+    if (!ok && compilerHolder->CxxDemandRetryRequested())
     {
-        std::cout << "Error: --run is read-only and writes nothing to disk; it cannot be combined "
-                     "with -o, -l/--out-lli, --out-asm, or -b/--bitcode.\n";
-        return 1;
+        /*
+         * The first attempt already printed everything the program's analysis reports (it
+         * failed only at the C++ companion link step), so the cold retry runs with stdout and
+         * stderr captured up to its companions: shown only if the retry fails before them. The
+         * time trace restarts so it describes the compile that produced the output.
+         */
+        compilerHolder = std::make_unique<LLVMBackend>();
+        if (int rc = configureCompiler(*compilerHolder); rc >= 0) return rc;
+        compilerHolder->SetCxxDemandCacheBypass(true);
+        if (ftimeTrace)
+        {
+            llvm::timeTraceProfilerCleanup();
+            llvm::timeTraceProfilerInitialize(500, "cflat");
+        }
+        std::cout.flush();
+        llvm::outs().flush();
+        std::fflush(stdout);
+        std::fflush(stderr);
+        std::FILE* capture = std::tmpfile();
+        const int savedOut = capture != nullptr ? CFLAT_DUP(1) : -1;
+        const int savedErr = capture != nullptr ? CFLAT_DUP(2) : -1;
+        const bool captured = savedOut >= 0 && savedErr >= 0
+            && CFLAT_DUP2(CFLAT_FILENO(capture), 1) >= 0
+            && CFLAT_DUP2(CFLAT_FILENO(capture), 2) >= 0;
+        bool resumed = false;
+        auto resume = [&]() {
+            if (!captured || resumed) return;
+            resumed = true;
+            std::cout.flush();
+            llvm::outs().flush();
+            std::fflush(stdout);
+            std::fflush(stderr);
+            CFLAT_DUP2(savedOut, 1);
+            CFLAT_DUP2(savedErr, 2);
+        };
+        // Past the companions the retry reports new things (linking), so show them live.
+        compilerHolder->SetCxxDemandRetryResume(resume);
+        ok = compilerHolder->Compile(args);
+        compilerHolder->SetCxxDemandRetryResume(nullptr);
+        const bool replay = captured && !resumed;
+        resume();
+        if (replay)
+        {
+            if (!ok)
+            {
+                std::rewind(capture);
+                char buffer[4096];
+                size_t n = 0;
+                while ((n = std::fread(buffer, 1, sizeof(buffer), capture)) > 0)
+                    std::fwrite(buffer, 1, n, stdout);
+                std::fflush(stdout);
+            }
+        }
+        if (savedOut >= 0) CFLAT_CLOSE(savedOut);
+        if (savedErr >= 0) CFLAT_CLOSE(savedErr);
+        if (capture != nullptr) std::fclose(capture);
     }
-    // Program arguments after a bare "--" are only meaningful when JIT-executing with --run;
-    // in any other mode they would silently go nowhere, so reject them up front.
-    if (!args.passthrough().empty() && !runMode)
-    {
-        std::cout << "Error: program arguments after '--' are only valid with --run.\n";
-        return 1;
-    }
-    compiler.SetRunMode(runMode);
-    compiler.SetRunArgs(args.passthrough());
-
-    bool ok = compiler.Compile(args);
+    LLVMBackend& compiler = *compilerHolder;
 
     if (updateLocale && !compiler.WriteCollectedLocale(*updateLocale, args.hasFlag("verbose")))
         return 1;
@@ -705,7 +785,7 @@ int main(int argc, char* argv[])
 
     // --run: the process exit code is the JIT'd program's exit code, and the output is
     // exactly what the program itself printed.
-    if (runMode)
+    if (args.hasFlag("run"))
         return compiler.GetJitExitCode();
 
     // --emit-winmd: after a successful compile, write the [winrt] surface to a .winmd. The

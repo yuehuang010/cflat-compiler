@@ -1721,6 +1721,8 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                 bool userDeclared = false;
                 if (!methodName.empty())
                 {
+                    if (compiler->IsCxxRecord(prvalueTypeName))
+                        compiler->EnsureCxxMemberProjected(prvalueTypeName, methodName);
                     if (const auto* info = compiler->GetCxxClassInfo(prvalueTypeName))
                         userDeclared = std::any_of(info->directMethods.begin(),
                             info->directMethods.end(), [&](const auto& method) {
@@ -1898,6 +1900,7 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                         && namedVar.ConditionalDropFlag == nullptr;
                     const bool destinationConditional = namedVar.ConditionalDropFlag != nullptr;
                     const bool destinationGlobalConditional = destinationGlobalLiveFlag != nullptr;
+                    compiler->EnsureCxxMemberProjected(tn, "operator=");
                     const auto* info = compiler->GetCxxClassInfo(tn);
                     auto lvalueReceiverAssignment = [](const auto& overloads,
                                                         const auto& fallback)
@@ -9579,6 +9582,7 @@ void MainListener::EmitProgramToProgramStreamWire(const std::string& producerNam
 
 bool MainListener::HasOperatorOverloadForFirstParam(const std::string& opName, const std::string& typeName) {
         auto* compiler = Compiler();
+        if (compiler->IsCxxRecord(typeName)) compiler->EnsureCxxMemberProjected(typeName, opName);
         auto it = compiler->functionTable.find(opName);
         if (it == compiler->functionTable.end()) return false;
         for (const auto& sym : it->second)
@@ -10472,6 +10476,8 @@ llvm::Value* MainListener::TryUnaryOperatorOverload(
         if (typeName == "__iface_fat_ptr") return nullptr;
 
         std::string opName = "operator" + op;
+        if (compiler->IsCxxRecord(typeName))
+            compiler->EnsureCxxMemberProjected(typeName, opName);
         if (!compiler->GetFunction(opName)) return nullptr;
 
         bool receiverFound = false;
@@ -10576,6 +10582,7 @@ llvm::Value* MainListener::TryPointerLhsOperatorOverload(
 
         std::string opName = "operator" + op;
         std::string pointee = ConcreteStructNameFromElemType(lhsElemType, compiler);
+        if (!pointee.empty()) compiler->EnsureCxxMemberProjected(pointee, opName);
 
         if (!pointee.empty() && compiler->GetFunction(opName))
         {
@@ -11194,6 +11201,7 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
                         ? ScalarTypeNameForValue(other->getType()) : otherName;
                     if (targetName.empty() || !LLVMBackend::IsPrimitiveTypeName(targetName))
                         return nullptr;
+                    compiler->EnsureCxxConversionOperatorsProjected(sourceName);
                     if (const auto* info = compiler->GetCxxClassInfo(sourceName))
                     {
                         std::vector<std::string> conversions;
@@ -11310,6 +11318,10 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
         if (typeName == "__iface_fat_ptr" || typeName == "__closure_fat_ptr") return nullptr;
 
         std::string opName = "operator" + op;
+        if (compiler->IsCxxRecord(typeName))
+            compiler->EnsureCxxMemberProjected(typeName, opName);
+        if (compiler->IsCxxRecord(rhsTypeName))
+            compiler->EnsureCxxMemberProjected(rhsTypeName, opName);
         if (compiler->IsCxxRecord(typeName))
             compiler->TryBindRefusedCxxBaseMember(typeName, opName);
         auto isMutableReferenceParam = [&](const LLVMBackend::FunctionSymbol& candidate,
@@ -16896,6 +16908,7 @@ LLVMBackend::NamedVariable MainListener::ParseNewExpression(CFlatParser::NewExpr
                 compiler->TryBindCxxImplicitDefaultCtor(typeName, defaultCtorError);
             }
             std::string why;
+            compiler->TryBindRefusedCxxMember(typeName, "__ctor", ctorArgTypes.size());
             const auto* ctor = compiler->SelectCxxConstructor(typeName, ctorArgTypes, why, false,
                                                              &ctorArgVars);
             // A constructor template can outrank the listed pick: clang resolves it then.

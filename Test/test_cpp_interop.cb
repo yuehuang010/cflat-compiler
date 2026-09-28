@@ -1035,6 +1035,7 @@ int RpUnwind(int x)
     return p.v + cppunw.thrower(x);
 }
 int fnptr_add_one(int x) { return x + 1; }
+int fnptr_add_two_double(double x) { return (int)x + 2; }
 int apply_fnptr(function<int(int)> f, int x) { return f(x); }
 void fnptr_noop() {}
 // A C++ reference return and a derived pointer at a RETURN statement (3370-3389). Each helper
@@ -6868,6 +6869,13 @@ extern int main()
     cppi.HoldsStdFunction* zptr = &z;
     if (zptr->f() != 23) return 3593;
     if (zptr->add(13, 14) != 27) return 3594;
+    // C++ member std::function signatures bind only when the member name is first used.
+    cppi.LazyStdFunctionMember lazyStdFunctionMember = default;
+    if (lazyStdFunctionMember.apply(std.function<int(int)>(fnptr_add_one), 8) != 9) return 3680;
+    if (lazyStdFunctionMember.apply(std.function<int(int)>(fnptr_add_one), 10) != 11) return 3681;
+    if (lazyStdFunctionMember.select(std.function<int(int)>(fnptr_add_one)) != 42) return 3682;
+    if (lazyStdFunctionMember.select(std.function<int(double)>(fnptr_add_two_double)) != 53)
+        return 3683;
     // ---- Statement temporaries of a C++ `new` (3595-3599) ------------------------------------
     // Released at end of full expression exactly where a CFlat struct's owning temp is (scalar
     // field receiver, owning-return receiver, non-retaining CFlat parameter, comparison, '?:'
@@ -7026,7 +7034,7 @@ extern int main()
         delete ek;
         if (cppon.clsNew() != 2 || cppon.clsDel() != 2 || cppon.live() != 0) return 3619;
     }
-    // ---- C++ constructor conversion ranks below standard conversions (3606-3612) ----
+    // ---- C++ constructor conversion ranks below standard conversions (3606-3612, 3710-3711) ----
     cppexp.MemRankHost rankHost = cppexp.MemRankHost();
     if (rankHost.pick(1, 0.25) != 3606) return 3606;
     if (cppexp.memrank_free(1, 0.25) != 3607) return 3607;
@@ -7039,6 +7047,10 @@ extern int main()
     cppexp.MemRankNonTemplate rankNonTemplate = cppexp.MemRankNonTemplate();
     if (rankNonTemplate.pick(1, 1.0) != 3611) return 3611;
     if (memrank_native(1) != 3612) return 3612;
+    cppexp.MemRankRref rankRref = cppexp.MemRankRref();
+    rankRref.push(10);
+    if (rankRref.n != 3710) return 3710;
+    if (cppexp.memrank_rref(11) != 3711) return 3711;
     // Full-expression temporaries in return operands and throwing C++ arguments (3620-3625).
     {
         cppon.reset();

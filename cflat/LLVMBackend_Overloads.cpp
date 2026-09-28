@@ -664,6 +664,11 @@ std::vector<LLVMBackend::CxxConversionRank> LLVMBackend::RankCxxConversionSequen
                 out.rank = 3;
                 out.cxxViable = true;
                 out.from = argumentIdentity(arg);
+                if (reference)
+                {
+                    out.refTarget = param.TypeName;
+                    out.refBind = param.IsRvalueRef ? 1 : constReference ? 2 : 0;
+                }
                 if (((!reference && !param.Pointer) || constReference) && !at.Pointer
                     && IsCxxRecord(at.TypeName))
                     out.ambiguousOperators = CxxClassConversionTies(at.TypeName, param.TypeName);
@@ -792,6 +797,11 @@ int LLVMBackend::CompareCxxConversionRanks(const std::vector<CxxConversionRank>&
             // conversion; different functions (or an ambiguous one) are indistinguishable.
             else if (!x.userFunction.empty() && x.userFunction == y.userFunction)
                 order = x.second - y.second;
+            // One converting constructor to one class: only the reference binding differs.
+            else if (x.userFunction.empty() && y.userFunction.empty() && !x.refTarget.empty()
+                     && x.refTarget == y.refTarget && x.from == y.from && x.refBind != 0
+                     && y.refBind != 0)
+                order = x.refBind - y.refBind;
             aBetter |= order < 0;
             bBetter |= order > 0;
         }
@@ -1268,6 +1278,12 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                             }
                         }
                     }
+                    // A TYPED class pointer binding 'void*' is a pointer conversion in C++, never
+                    // an exact match, so the overload spelling the pointee wins the tie.
+                    if (result == 0 && candidates.size() > 1 && candidateParamItr->Pointer
+                        && !candidateParamItr->ElemPointer && candidateParamItr->TypeName == "void"
+                        && tmpArg.Pointer && !tmpArg.ElemPointer && IsDataStructure(tmpArg.TypeName))
+                        result = 1;
                 }
                 else
                 {
@@ -2605,6 +2621,9 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
             if (auto* receiverStruct = llvm::dyn_cast<llvm::StructType>(
                     arguments.front().BaseType))
                 receiverType = receiverStruct->getName().str();
+        // Compiler-synthesized member calls (view decay size/data) name lazy C++ members too.
+        if ((postfixMemberCall || !cxxMemberReceiver.empty()) && IsCxxRecord(receiverType))
+            EnsureCxxMemberProjected(receiverType, bareMemberName);
         const bool receiverHasCxxMember = (postfixMemberCall || !cxxMemberReceiver.empty())
             && !receiverType.empty()
             && CxxClassHasMemberNamed(receiverType, bareMemberName);
@@ -3647,6 +3666,8 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
             const std::string receiverType = arg.TypeAndValue.TypeName;
             bool useConstData = false;
             IsCxxContiguousViewSource(arg, param, &useConstData);
+            // The const twin registers under a synthetic name only when 'data' is projected.
+            if (IsCxxRecord(receiverType)) EnsureCxxMemberProjected(receiverType, "data");
             llvm::Value* count = CreateOverloadedFunctionCall(
                 "size", { arg }, false, "size", receiverType, true, enclosingFunctionName);
             llvm::Value* data = CreateOverloadedFunctionCall(
@@ -5522,6 +5543,8 @@ llvm::Value* LLVMBackend::CreateCoreUniqueRawPointerCall(
         receiver.TypeAndValue.Pointer = true;
         receiver.TypeAndValue.VariableName.clear();
         receiver.IsExplicitMove = false;
+        EnsureCxxMemberProjected(arg.TypeAndValue.TypeName,
+                                 consumesCoreUnique ? "release" : "get");
         auto* result = CreateOverloadedFunctionCall(consumesCoreUnique ? "release" : "get", { receiver });
         // The getter is an ABI adapter, not a new ownership boundary. Preserve the temporary
         // field ledger across it so a later call/return still rejects the escaping raw pointer.

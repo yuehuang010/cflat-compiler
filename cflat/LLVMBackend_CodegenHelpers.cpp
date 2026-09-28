@@ -1222,10 +1222,16 @@ llvm::Function* LLVMBackend::GetOrCreateFullDestructor(const std::string& typeNa
          */
         if (IsCxxRecord(typeName))
         {
-            if (generatedCxxRecords_.contains(typeName) && dsIt->second.Destructor == nullptr)
+            // A lazily imported record binds its destructor when its layout is projected, as
+            // the eager import did; the projection may grow dataStructures, so look it up again.
+            const std::string cxxTypeName = typeName;
+            EnsureCxxRecordProjected(cxxTypeName, false);
+            auto cxxIt = dataStructures.find(cxxTypeName);
+            llvm::Function* cxxDtor = cxxIt == dataStructures.end() ? nullptr : cxxIt->second.Destructor;
+            if (generatedCxxRecords_.contains(cxxTypeName) && cxxDtor == nullptr)
                 LogErrorMessage("generated C++ struct '{}' has no bound destructor",
-                                { DisplayCxxClassName(typeName) });
-            return dsIt->second.Destructor;
+                                { DisplayCxxClassName(cxxTypeName) });
+            return cxxDtor;
         }
 
         // C++-style raw union semantics: the union has no hidden active-member tag, so the
@@ -1878,6 +1884,8 @@ bool LLVMBackend::StructSynthCopyUnsafe(const std::string& typeName) const
 
 bool LLVMBackend::HasArrowOverloadFor(const std::string& typeName) const
 {
+        if (IsCxxRecord(typeName))
+            const_cast<LLVMBackend*>(this)->EnsureCxxMemberProjected(typeName, "operator->");
         auto it = functionTable.find("operator->");
         if (it == functionTable.end()) return false;
         for (const auto& sym : it->second)
@@ -1902,6 +1910,7 @@ bool LLVMBackend::MemberIsScalarField(const std::string& typeName, const std::st
 
 bool LLVMBackend::TypeHasMember(const std::string& typeName, const std::string& memberName) const
 {
+        const_cast<LLVMBackend*>(this)->EnsureCxxMemberProjected(typeName, memberName);
         if (auto ds = dataStructures.find(typeName); ds != dataStructures.end())
         {
             for (const auto& f : ds->second.StructFields)

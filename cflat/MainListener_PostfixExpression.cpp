@@ -846,6 +846,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
             {
                 if (namedVar.TypeAndValue.Pointer || namedVar.TypeAndValue.TypeName.empty()) return false;
                 auto* compiler = Compiler(ctx);
+                compiler->EnsureCxxMemberProjected(namedVar.TypeAndValue.TypeName, opName);
                 auto structData = compiler->GetDataStructure(namedVar.TypeAndValue.TypeName);
                 if (structData.StructType == nullptr) return false;
 
@@ -1885,6 +1886,10 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                         else if (structVar.BaseType)
                         {
                             primaryIdentifier = terminal->getText();
+                            if (structVar.TypeAndValue.TypeName.size() != 0
+                                && Compiler(ctx)->IsCxxRecord(structVar.TypeAndValue.TypeName))
+                                Compiler(ctx)->EnsureCxxMemberProjected(
+                                    structVar.TypeAndValue.TypeName, primaryIdentifier);
                             auto dataStructure = Compiler(ctx)->GetDataStructure(llvm::dyn_cast<llvm::StructType>(structVar.BaseType));
 
                             // [PFX-2c] Access control on an imported C++ class. A private or
@@ -3032,6 +3037,9 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
 
                         // If the base is a struct value with a user-defined operator[],
                         // dispatch to it (member call with 'this' as first arg).
+                        if (!namedVar.TypeAndValue.TypeName.empty())
+                            Compiler(ctx)->EnsureCxxMemberProjected(
+                                namedVar.TypeAndValue.TypeName, "operator[]");
                         if (rvalue && !namedVar.TypeAndValue.Pointer
                             && structVar.BaseType && structVar.BaseType->isStructTy()
                             && Compiler(ctx)->GetFunction("operator[]"))
@@ -6988,6 +6996,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                         arg.TypeAndValue.TypeName = ctorTypes.back().TypeName;
                                 }
                                 std::string why;
+                                compiler->TryBindRefusedCxxMember(
+                                    functionName, "__ctor", ctorTypes.size());
                                 const auto* ctor = compiler->SelectCxxConstructor(
                                     functionName, ctorTypes, why, false, &arguments);
                                 // A scalar-reference overload set is clang's to resolve.
@@ -6998,7 +7008,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                         || why.starts_with("no overload of '"));
                                 if (ctor == nullptr && !hardReferenceRejection)
                                 {
-                                    compiler->TryBindRefusedCxxMember(functionName, "__ctor");
+                                    compiler->TryBindRefusedCxxMember(
+                                        functionName, "__ctor", ctorTypes.size());
                                     ctor = compiler->SelectCxxConstructor(
                                         functionName, ctorTypes, why, false, &arguments);
                                     hardReferenceRejection = !scalarReferenceSet

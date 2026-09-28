@@ -195,11 +195,43 @@ void LLVMBackend::RecordDependency(const std::string& path)
     }
 
     std::error_code ec;
-    auto absolute = ExistingAbsolutePath(path, ec);
-    if (ec || !std::filesystem::is_regular_file(absolute, ec) || ec)
+    const std::filesystem::path given(path);
+    const std::filesystem::path leaf = given.filename();
+    std::filesystem::path absolute;
+    // A regular, non-symlink file canonicalizes to its canonical directory plus its own name:
+    // one realpath and one listing per directory, one lstat per file. The name must appear
+    // verbatim in the listing - a case-insensitive volume otherwise hands back the on-disk case.
+    if (!leaf.empty() && leaf != "." && leaf != ".." && given.has_parent_path()
+        && std::filesystem::is_regular_file(std::filesystem::symlink_status(given, ec)) && !ec)
     {
-        dependencyPathMemo_.emplace(path, "");
-        return;
+        const std::string parent = given.parent_path().string();
+        auto dir = dependencyDirMemo_.find(parent);
+        if (dir == dependencyDirMemo_.end())
+        {
+            DependencyDir info;
+            std::error_code dirEc;
+            auto canonicalDir = ExistingAbsolutePath(given.parent_path(), dirEc);
+            if (!dirEc)
+            {
+                for (std::filesystem::directory_iterator it(canonicalDir, dirEc), end;
+                     !dirEc && it != end; it.increment(dirEc))
+                    info.names.insert(it->path().filename().string());
+                if (!dirEc) info.canonical = canonicalDir.string();
+            }
+            dir = dependencyDirMemo_.emplace(parent, std::move(info)).first;
+        }
+        if (!dir->second.canonical.empty() && dir->second.names.count(leaf.string()) != 0)
+            absolute = std::filesystem::path(dir->second.canonical) / leaf;
+    }
+    if (absolute.empty())
+    {
+        ec.clear();
+        absolute = ExistingAbsolutePath(path, ec);
+        if (ec || !std::filesystem::is_regular_file(absolute, ec) || ec)
+        {
+            dependencyPathMemo_.emplace(path, "");
+            return;
+        }
     }
     auto text = absolute.string();
     dependencyPathMemo_.emplace(path, text);
@@ -287,8 +319,13 @@ bool LLVMBackend::WriteDependencyManifest(const std::string& outputPath,
     manifest["inputs"] = nlohmann::json::array();
     for (const auto& dependency : dependencyFiles)
     {
-        auto path = ExistingAbsolutePath(dependency, ec);
-        if (ec) return false;
+        // RecordDependency already stored the absolute canonical path.
+        std::filesystem::path path(dependency);
+        if (!path.is_absolute())
+        {
+            path = ExistingAbsolutePath(dependency, ec);
+            if (ec) return false;
+        }
         int64_t mtime = 0, size = 0;
         if (!ReadFileStamp(path, mtime, size)) return false;
         manifest["inputs"].push_back({ {"path", path.string()},
@@ -1607,9 +1644,11 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
 {
     // --check: parse and codegen for diagnostics only, emitting no outputs.
     bool checkOnly = args.hasFlag("check");
+    cxxDemandLinks_ = !checkOnly && !batchMode_;
     auto filename = inputOverride.empty() ? args.getPositional(0).value_or("") : inputOverride;
     dependencyFiles_.clear();
     dependencyPathMemo_.clear();
+    dependencyDirMemo_.clear();
     dependencyFileSet_.clear();
     embeddedAssets_.clear();
     embedFileCache_.clear();
@@ -2586,7 +2625,9 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
         if (verbose) std::cout << std::format("[verbose] emitting executable to {}\n", emitPath);
         if (!EmitExecutable(emitPath, platformOption, debugInfo, lliPath))
         {
-            std::cout << std::format("Error: failed to emit executable '{}'.\n", *exePath);
+            // A link failing after a demand replay retries cold (RunLinkerProcess); stay quiet.
+            if (!cxxDemandRetry_)
+                std::cout << std::format("Error: failed to emit executable '{}'.\n", *exePath);
             return false;
         }
         if (isolatedOutput)
@@ -4464,7 +4505,43 @@ bool LLVMBackend::Analyze(const std::string& filePath,
     if (debugInfo)
         FinalizeDebugInfo();
 
+    if (symbolSink_ != nullptr)
+        BindPendingCxxMembersForSymbolIndex();
+
     return true;
+}
+
+// Symbol queries list every member: bind the std::function members a compile leaves deferred.
+void LLVMBackend::BindPendingCxxMembersForSymbolIndex()
+{
+    if (symbolSink_ == nullptr) return;
+
+    std::vector<std::string> pendingRecords;
+    pendingRecords.reserve(pendingCxxRecordProjections_.size());
+    for (const auto& [name, _] : pendingCxxRecordProjections_)
+        pendingRecords.push_back(name);
+    for (const auto& [name, _] : pendingCxxMemberProjections_)
+        pendingRecords.push_back(name);
+    for (const auto& name : pendingRecords)
+        EnsureCxxRecordProjected(name);
+
+    std::vector<std::pair<std::string, std::string>> pending;
+    for (const auto& [typeName, info] : cxxClasses_)
+        for (const auto& [memberName, refusal] : info.refusedMembers)
+            if (refusal == "has a std::function signature that could not be bound")
+                pending.emplace_back(typeName, memberName);
+
+    // The analysis already succeeded: a bind that aborts leaves that member unlisted, never
+    // unwinds through the caller. Requests hit the cache after the first analysis.
+    for (const auto& [typeName, memberName] : pending)
+    {
+        try
+        {
+            TryBindRefusedCxxMember(typeName, memberName);
+        }
+        catch (const CompilerAbortException&) {}
+        catch (const ExpectedErrorReceived&) {}
+    }
 }
 
 bool LLVMBackend::LastOptimizedViewWasIncremental() const
@@ -4474,6 +4551,7 @@ bool LLVMBackend::LastOptimizedViewWasIncremental() const
 
 void LLVMBackend::ResetForReanalysis()
 {
+    JoinCHeaderDiskCacheWriters();
     EndActiveRoot();
     ownReleaseGates_.clear();
     cxxThisEscapeGates_.clear();
@@ -4484,6 +4562,7 @@ void LLVMBackend::ResetForReanalysis()
     // Core hashes are per-analysis so LSP notices edits; batch mode keeps one process-wide hash.
     if (!batchMode_) coreHashCache_.clear();
     dependencyPathMemo_.clear();
+    dependencyDirMemo_.clear();
     for (const auto& obj : cObjectFiles_) llvm::sys::fs::remove(obj);
     cObjectFiles_.clear();
     cppInteropUsed_ = false;
@@ -4491,12 +4570,24 @@ void LLVMBackend::ResetForReanalysis()
     cxxImportGroups_.clear();
     tuParseCounts_.clear();
     cxxIncrementalGroups_.clear();
+    cxxDemandGroups_.clear();
+    cxxDemandRequestGroups_.clear();
+    cxxDemandLiveKeys_.clear();
+    pendingCxxDemandGroupKey_.clear();
+    pendingCxxDemandReplayChunk_ = {};
+    cxxDemandRetry_ = false;
+    cxxDemandReplayInProgress_ = false;
+    cxxDemandLinks_ = false;
+    cxxDemandContentChunkNumbers_ = false;
+    cxxDemandUsedChunkNumbers_.clear();
+    cxxDemandReplayed_ = false;
     activeCxxRequestGroup_ = nullptr;
     cxxTemplateOwnerGroup_.clear();
     cxxFunctionTemplates_.clear();
     cxxFunctionTemplateOwnerGroup_.clear();
     cxxFunctionSignatures_.clear();
     cxxFunctionBindAttempts_.clear();
+    cxxLazyStdFunctionMemberBinds_.clear();
     cxxNamespaceEntities_.clear();
     cxxFunctionOwnerGroup_.clear();
     cxxBoundSignatureKeys_.clear();
@@ -4638,6 +4729,13 @@ void LLVMBackend::ResetForReanalysis()
     cxxNontrivialRecords_.clear();
     cxxClasses_.clear();
     cxxRecordEntries_.clear();
+    pendingCxxRecordProjections_.clear();
+    pendingCxxMemberProjections_.clear();
+    projectedCxxMemberNames_.clear();
+    projectingCxxMemberNames_.clear();
+    projectingCxxRecords_.clear();
+    registeringCxxProjection_ = false;
+    registeringCxxProjectionMembers_ = true;
     cxxOpaqueFieldOwners_.clear();
     cxxRecordSpellingIndex_.clear();
     cxxRecordSpellingIndexDirty_ = true;
