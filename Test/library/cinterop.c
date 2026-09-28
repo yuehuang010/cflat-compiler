@@ -1,3 +1,4 @@
+#include <stddef.h>
 /* Real C (clang-compilable) fixture for the C-interop test.
    Compiled by clang-cl when imported from a .cb; the object is linked by lld. */
 
@@ -127,6 +128,12 @@ int cbf_nested_check(struct CBF_Nested v)
     return v.c * 1000 + v.in.d * 100 + v.in.e * 10 + v.f;
 }
 
+/* Verbose C spellings: signed short int / signed long long int must bind as short / i64. */
+signed long long int cbf_verbose_spellings(signed short int a, signed long long int b)
+{
+    return b + a;
+}
+
 int cbf_mixed_size(void) { return (int)sizeof(struct CBF_Mixed); }
 struct CBF_Mixed cbf_mixed_make(unsigned a, unsigned b, int c,
                                 unsigned long long d)
@@ -158,3 +165,12 @@ int cbf_char_short_check(struct CBF_CharShort v)
 {
     return (unsigned char)v.c * 10000 + v.a * 1000 + v.s * 10 + v.b;
 }
+
+int cbf_pack1_size(void) { return (int)sizeof(struct CBF_Pack1); }
+int cbf_pack1_align(void) { return (int)_Alignof(struct CBF_Pack1); }
+int cbf_pack1_n_offset(void) { return (int)offsetof(struct CBF_Pack1, n); }
+int cbf_pack1_check(struct CBF_Pack1* v) { return v->c * 1000 + v->a * 100 + v->b * 10 + v->n; }
+int cbf_pack2_size(void) { return (int)sizeof(struct CBF_Pack2); }
+int cbf_pack2_align(void) { return (int)_Alignof(struct CBF_Pack2); }
+int cbf_pack2_n_offset(void) { return (int)offsetof(struct CBF_Pack2, n); }
+int cbf_pack2_check(struct CBF_Pack2* v) { return v->c * 1000 + v->n * 10 + v->s; }

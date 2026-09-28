@@ -7036,6 +7036,7 @@ static llvm::json::Object SerializeFuncSym(const std::string& key, const FS& s)
     if (s.IsCxx)        o["cxx"] = true;
     if (s.CxxRefQualifier != cflat_cinterop::CxxRefQualifierNone)
         o["cxxrq"] = s.CxxRefQualifier;
+    if (s.CxxVolatile)  o["cxxvol"] = true;
     if (!s.IsNoexcept)  o["nx"] = true;
     if (s.ReturnsAlias) o["ra"] = true;
     if (s.HasCFlatBody) o["cb"] = true;
@@ -7863,6 +7864,7 @@ bool LLVMBackend::LoadCoreBitcodeIfFresh(const std::string& cacheDir, const std:
             if (auto v = fo->getBoolean("ro")) sym.ReturnsOwned = *v;
             if (auto v = fo->getBoolean("cxx")) sym.IsCxx = *v;
             if (auto v = fo->getInteger("cxxrq")) sym.CxxRefQualifier = (int)*v;
+            if (auto v = fo->getBoolean("cxxvol")) sym.CxxVolatile = *v;
             if (auto v = fo->getBoolean("nx")) sym.IsNoexcept = !*v;
             if (auto* ab = fo->getObject("cxxabi")) sym.CxxAbi = DeserializeCxxAbi(*ab);
             if (auto v = fo->getBoolean("ra")) sym.ReturnsAlias = *v;

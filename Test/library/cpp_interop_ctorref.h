@@ -3,6 +3,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <sys/types.h>
+#ifdef _WIN32
+typedef ptrdiff_t ssize_t;
+#endif
 // Section M102: a C++ CONSTRUCTOR parameter declared `T&` must bind the ARGUMENT's address.
 // Every class here proves it by writing through the reference after the ctor returned.
 namespace cppcr {

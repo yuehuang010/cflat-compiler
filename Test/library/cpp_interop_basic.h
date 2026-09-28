@@ -1450,6 +1450,17 @@ namespace cppi
     };
 }
 
+// A volatile member and a non-volatile twin with a default argument: CFlat has no volatile objects,
+// so a one-argument call must take the non-volatile overload (MSVC <atomic> fetch_add shape).
+namespace cppi
+{
+    struct VolatilePick
+    {
+        int pick(int) volatile { return 1; }
+        int pick(int, int = 0) { return 2; }
+    };
+}
+
 extern int cppi_nsobj_global;   // global-scope C++ object: no mangling at all
 
 extern "C" int cppi_c_linkage(int v) noexcept;

@@ -1702,7 +1702,7 @@ llvm::StructType* LLVMBackend::CreateStructType(std::string name,
 
 llvm::StructType* LLVMBackend::CreateUnionType(std::string name,
         std::vector<DeclTypeAndValue> typeAndValues, uint64_t userAlign,
-        std::vector<BitfieldInfo>* bitfields)
+        std::vector<BitfieldInfo>* bitfields, bool capAlignToUserAlign)
 {
         uint64_t maxSize = 1;
         llvm::Align maxAlign(1);
@@ -1721,6 +1721,9 @@ llvm::StructType* LLVMBackend::CreateUnionType(std::string name,
         }
         if (userAlign > 1)
             maxSize = (maxSize + userAlign - 1) / userAlign * userAlign;
+        // Imported C union whose clang alignment is below its members' natural alignment.
+        if (capAlignToUserAlign && userAlign >= 1 && maxAlign.value() > userAlign)
+            maxAlign = llvm::Align(userAlign);
 
         // Pick an integer element type that satisfies maxAlign so the LLVM struct
         // inherits the correct ABI alignment (LLVM sets struct align = max(element aligns)).

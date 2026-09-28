@@ -2373,6 +2373,7 @@ nlohmann::json LLVMBackend::CxxMemberToJson(
         if (m.variadic)             j["va"] = true;
         if (m.requiresConstructorWrapper) j["cw"] = true;
         if (m.isConst)              j["cn"] = true;
+        if (m.isVolatile)           j["vl"] = true;
         if (m.refQualifier != cflat_cinterop::CxxRefQualifierNone) j["rq"] = m.refQualifier;
         if (m.isVirtual)            j["vi"] = true;
         if (m.isNoexcept)           j["nx"] = true;
@@ -2432,6 +2433,7 @@ cflat_cinterop::RawCxxMember LLVMBackend::CxxMemberFromJson(
         m.variadic             = j.value("va", false);
         m.requiresConstructorWrapper = j.value("cw", false);
         m.isConst              = j.value("cn", false);
+        m.isVolatile           = j.value("vl", false);
         m.refQualifier         = j.value("rq", (int)cflat_cinterop::CxxRefQualifierNone);
         m.isVirtual            = j.value("vi", false);
         m.isNoexcept           = j.value("nx", false);

@@ -240,7 +240,7 @@ static bool CanonicalizePrimitiveTypeWords(const std::vector<std::string>& words
         { "unsigned int", "u32" }, { "long int", "long" },
         { "signed long", "long" }, { "signed long int", "long" },
         { "unsigned long", "ulong" }, { "unsigned long int", "ulong" },
-        { "uint", "u32" },
+        { "uint", "u32" }, { "longlong", "i64" }, { "ulonglong", "u64" },
         { "long long", "i64" }, { "long long int", "i64" },
         { "signed long long", "i64" }, { "signed long long int", "i64" },
         { "unsigned long long", "u64" }, { "unsigned long long int", "u64" },

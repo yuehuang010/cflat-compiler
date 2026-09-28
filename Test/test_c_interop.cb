@@ -570,6 +570,20 @@ extern int main()
     if (cs.c != 2 || cs.a != 5 || cs.s != 17 || cs.b != 9) return 278;
     if (cbf_char_short_check(cs) != 25179)        return 279;
 
+    // #pragma pack(N) records: size, alignment and field offsets follow clang, not natural rules.
+    if ((int)sizeof(CBF_Pack1) != cbf_pack1_size()) return 302;
+    if ((int)alignof(CBF_Pack1) != cbf_pack1_align()) return 303;
+    CBF_Pack1 pk1 = default;
+    pk1.c = 2; pk1.a = 3; pk1.b = 4; pk1.n = 5;
+    if (cbf_pack1_check(&pk1) != 2345) return 304;
+    if ((int)((char*)&pk1.n - (char*)&pk1) != cbf_pack1_n_offset()) return 305;
+    if ((int)sizeof(CBF_Pack2) != cbf_pack2_size()) return 306;
+    if ((int)alignof(CBF_Pack2) != cbf_pack2_align()) return 307;
+    CBF_Pack2 pk2 = default;
+    pk2.c = 2; pk2.n = 5; pk2.s = 7;
+    if (cbf_pack2_check(&pk2) != 2057) return 308;
+    if ((int)((char*)&pk2.n - (char*)&pk2) != cbf_pack2_n_offset()) return 309;
+
     // Anonymous and named C unions retain their bitfield members and clang layout.
     if ((int)sizeof(CBF_AnonUnion) != cbf_anon_union_size()) return 282;
     if ((int)alignof(CBF_AnonUnion) != cbf_anon_union_align()) return 283;
@@ -605,15 +619,26 @@ extern int main()
     eb.neighbor = 5;
     eb.u = 2;
     eb.s = -2;
-    if (eb.u != 2 || eb.s != -2 || eb.neighbor != 5 || eb.tail != 9) return 297;
-    if (cbf_enum_bits_check(&eb) != 1859) return 298;
+    // MSVC gives every enum an int backing, so its 2-bit enum field sign-extends: 2 reads back as -2.
+    if const (__WINDOWS__) {
+        if ((int)eb.u != -2 || eb.s != -2 || eb.neighbor != 5 || eb.tail != 9) return 297;
+        if (cbf_enum_bits_check(&eb) != -2141) return 298;
+    } else {
+        if (eb.u != 2 || eb.s != -2 || eb.neighbor != 5 || eb.tail != 9) return 297;
+        if (cbf_enum_bits_check(&eb) != 1859) return 298;
+    }
 
     CBF_WordUnion wu = default;
     wu.word = 0xffffffffu;
     wu.nib = 2;
     if (wu.word != 0xfffffff2u) return 299;
     wu.t = CBF_TypedefEnum5;
-    if (wu.t != CBF_TypedefEnum5 || (int)wu.t != 5 || wu.word != 0xfffffff5u) return 300;
+    // MSVC: the 3-bit enum field holding 5 (0b101) sign-extends to -3.
+    if const (__WINDOWS__) {
+        if ((int)wu.t != -3 || wu.word != 0xfffffff5u) return 300;
+    } else {
+        if (wu.t != CBF_TypedefEnum5 || (int)wu.t != 5 || wu.word != 0xfffffff5u) return 300;
+    }
     CBF_WordUnion wi = { nib = 9 };
     if (wi.nib != 9 || (int)wi.t != 1) return 301;
 
@@ -735,6 +760,9 @@ extern int main()
     if (CAA_GroupLateAlias(7) != 1507)           return 259;
     // The later target uses a different parameter signature and must still be retried.
     if (CAA_DiffAlias(7.5) != 1607)              return 260;
+
+    // Verbose signed spellings bind as short / i64 (a wide value proves the 64-bit path).
+    if (cbf_verbose_spellings(-2, (i64)5000000000) != (i64)4999999998) return 261;
 
     return 0;
 }

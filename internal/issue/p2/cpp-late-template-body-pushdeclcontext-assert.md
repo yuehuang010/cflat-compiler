@@ -21,3 +21,5 @@ function's lexical DeclContext, or parse late bodies through `Sema::PerformPendi
 style entry that sets up the context) before calling ParseLateTemplatedFuncDef; then re-run the Debug
 sweep of Test/errors/err_cpp_*.cb (main-session baseline set: 23 fixtures exit 134) to zero.
 Per CLAUDE.md an LLVM assert reached from user input also needs a proper LogError once root-caused.
+
+Root cause confirmed 2026-09-28 (Windows Debug, g1 repro): the function/namespace were declared in an EARLIER incremental PTU, so their lexical parent is that PTU's TranslationUnitDecl, while ParseLateTemplatedFuncDef's ContextRAII pushes ASTContext::getTranslationUnitDecl() (always the NEWEST PTU TU). PushDeclContext(namespace) then compares old-TU vs new-TU. A Sema::ContextRAII in ParseOne cannot help (the RAII inside clang overrides it); needs the TU redecl chain reconciled or a local reimplementation of the reenter loop.

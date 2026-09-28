@@ -104,13 +104,13 @@ same function. The trailing `int` is optional where C allows it (`unsigned long 
 | `signed char` | `i8` |
 | `unsigned char` | `u8` |
 | `short int`, `signed short`, `signed short int` | `short` |
-| `unsigned short` | `u16` |
+| `unsigned short`, `unsigned short int` | `u16` |
 | `signed`, `signed int` | `int` |
 | `unsigned`, `unsigned int` | `u32` (or `uint`) |
 | `long int`, `signed long`, `signed long int` | `long` |
-| `unsigned long` | `ulong` |
-| `long long`, `long long int`, `signed long long`, `signed long long int` | `i64` |
-| `unsigned long long`, `unsigned long long int` | `u64` |
+| `unsigned long`, `unsigned long int` | `ulong` |
+| `long long`, `long long int`, `signed long long`, `signed long long int` | `i64` (or `longlong`) |
+| `unsigned long long`, `unsigned long long int` | `u64` (or `ulonglong`) |
 | `long double` | `longdouble` |
 
 The C++ character spellings `char8_t`, `char16_t`, `char32_t`, and `wchar_t` are accepted as

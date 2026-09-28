@@ -1519,18 +1519,30 @@ int sizeofUnevaluatedLegs()
     passed += Test("sizeof tuple type spelling", (int)sizeof((int, double)), 16);
     passed += Test("alignof tuple type spelling", (int)alignof((int, double)), 8);
     passed += Test("typeof tuple variable", typeof(tupleValue), "tuple<int, double>");
-    passed += Test("sizeof completed forward struct", (int)sizeof(SzoForward), 24);
-    passed += Test("alignof completed forward struct", (int)alignof(SzoForward), 8);
-    passed += Test("sizeof completed struct in generic", (int)szoGenericTypeSize<SzoForward>(), 24);
-    passed += Test("sizeof completed nested struct", (int)sizeof(SzoOuter), 16);
-    passed += Test("alignof completed nested struct", (int)alignof(SzoOuter), 8);
+    if const (__WINDOWS__) {
+        // LLP64: 'long' is 4 bytes on Windows.
+        passed += Test("sizeof completed forward struct", (int)sizeof(SzoForward), 12);
+        passed += Test("alignof completed forward struct", (int)alignof(SzoForward), 4);
+        passed += Test("sizeof completed struct in generic", (int)szoGenericTypeSize<SzoForward>(), 12);
+        passed += Test("sizeof completed nested struct", (int)sizeof(SzoOuter), 8);
+        passed += Test("alignof completed nested struct", (int)alignof(SzoOuter), 4);
+    } else {
+        passed += Test("sizeof completed forward struct", (int)sizeof(SzoForward), 24);
+        passed += Test("alignof completed forward struct", (int)alignof(SzoForward), 8);
+        passed += Test("sizeof completed struct in generic", (int)szoGenericTypeSize<SzoForward>(), 24);
+        passed += Test("sizeof completed nested struct", (int)sizeof(SzoOuter), 16);
+        passed += Test("alignof completed nested struct", (int)alignof(SzoOuter), 8);
+    }
     passed += Test("sizeof(MyStruct) remains a type", (int)sizeof(SzoPair), 8);
     passed += Test("sizeof(ns.Type) remains a type", (int)sizeof(SzoNs.Type) > 0, true);
     passed += Test("sizeof(Generic<int>) remains a type", (int)sizeof(SzoGeneric<int>) == 4, true);
     passed += Test("sizeof(int[4]) remains a type", (int)sizeof(int[4]), 16);
     passed += Test("sizeof(simd<float, 4>) remains a type", (int)sizeof(simd<float, 4>), 16);
-    passed += Test("sizeof(Generic<T>) in its namespace remains a type", (int)SzoNs.pairSize(), 16);
-    passed += Test("sizeof(alias) remains a type", (int)sizeof(SzoPairAlias), 8);
+    if const (__WINDOWS__) {
+        passed += Test("sizeof(Generic<T>) in its namespace remains a type", (int)SzoNs.pairSize(), 8);
+    } else {
+        passed += Test("sizeof(Generic<T>) in its namespace remains a type", (int)SzoNs.pairSize(), 16);
+    }    passed += Test("sizeof(alias) remains a type", (int)sizeof(SzoPairAlias), 8);
     int SzoPair = 5;
     passed += Test("sizeof shadowing local measures variable", (int)sizeof(SzoPair), 4);
     value = alignof(szoFirst(sxeX, sxeY));

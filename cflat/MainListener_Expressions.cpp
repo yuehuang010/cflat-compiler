@@ -13238,7 +13238,7 @@ LLVMBackend::NamedVariable MainListener::ParseUnaryExpressionImpl(CFlatParser::U
                             static const std::unordered_set<std::string> primitiveWords = {
                                 "void", "char", "i8", "u8", "c8", "short", "i16", "u16", "c16",
                                 "int", "i32", "u32", "uint", "c32", "long", "ulong", "i64", "u64",
-                                "i128", "u128", "wchar", "float", "double", "longdouble", "bool",
+                                "longlong", "ulonglong", "i128", "u128", "wchar", "float", "double", "longdouble", "bool",
                                 "signed", "unsigned" };
                             if (primitiveWords.count(typeSpec->getText()) != 0
                                 || compiler->IsTypeArgTypeKey(typeSpec->getText())

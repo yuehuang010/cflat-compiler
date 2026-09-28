@@ -273,19 +273,6 @@ std::string LLVMBackend::CxxIntegerParameterIdentity(const FunctionSymbol& candi
         if (param.Pointer || param.IsArrayView || param.ConstArraySize > 0 || param.IsSimd
             || param.IsFunctionPointer || param.IsInterface || param.IsCxxRefToPointer)
             return "";
-        static const std::pair<const char*, const char*> identities[] = {
-            {"char", "char"}, {"signedchar", "i8"}, {"unsignedchar", "u8"},
-            {"short", "short"}, {"shortint", "short"}, {"signedshort", "short"},
-            {"signedshortint", "short"}, {"unsignedshort", "u16"},
-            {"unsignedshortint", "u16"}, {"int", "int"}, {"signed", "int"},
-            {"signedint", "int"}, {"unsigned", "u32"}, {"unsignedint", "u32"},
-            {"long", "long"}, {"longint", "long"}, {"signedlong", "long"},
-            {"signedlongint", "long"}, {"unsignedlong", "ulong"},
-            {"unsignedlongint", "ulong"}, {"longlong", "i64"},
-            {"longlongint", "i64"}, {"signedlonglong", "i64"},
-            {"signedlonglongint", "i64"}, {"unsignedlonglong", "u64"},
-            {"unsignedlonglongint", "u64"}
-        };
         auto identityFromSpelling = [&](const std::string& spelling) -> std::string {
             std::string compact;
             compact.reserve(spelling.size());
@@ -296,8 +283,7 @@ std::string LLVMBackend::CxxIntegerParameterIdentity(const FunctionSymbol& candi
             if (compact.starts_with("const")) compact.erase(0, 5);
             if (compact.starts_with("volatile")) compact.erase(0, 8);
             if (compact.find('*') != std::string::npos) return {};
-            for (const auto& [spelling, identity] : identities)
-                if (compact == spelling) return identity;
+            if (const char* identity = CxxCompactIntegerSpellingToCflat(compact)) return identity;
             return {};
         };
         const std::string declaredSpelling = CxxReferenceParameterSpelling(candidate, index);
@@ -1812,9 +1798,12 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                     if (a == b) continue;
                     const int order = CompareCxxConversionRanks(cxxRanks[a->pair], cxxRanks[b->pair],
                                                                 crossing);
+                    // CFlat has no volatile objects: a non-volatile member beats its volatile twin.
                     if (order == -1
                         || (order == 0 && !crossing && isTemplateCandidate(b->pair->second)
-                            && !isTemplateCandidate(a->pair->second)))
+                            && !isTemplateCandidate(a->pair->second))
+                        || (order == 0 && !crossing && b->pair->second.CxxVolatile
+                            && !a->pair->second.CxxVolatile))
                         dominated.insert(b->pair);
                 }
             std::vector<const Ranked*> survivors;
@@ -1977,6 +1966,7 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                 best.push_back(&r);
             keepLowest(best, [](const Ranked& r) { return r.refPtrConstMismatches; });
             keepLowest(best, [](const Ranked& r) { return -r.moveScore; });
+            keepLowest(best, [](const Ranked& r) { return (int)r.pair->second.CxxVolatile; });
             preferCxxDefaultWrapperForSameDeclaration(best);
             return finish(settle(best, /*legacyLastWins=*/false));
         }
@@ -2020,6 +2010,8 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
             // Dominance only compares positions both sides judged, so it can cycle; keep the set then.
             if (!undominated.empty())
                 best = std::move(undominated);
+            // CFlat has no volatile objects: a non-volatile member beats its volatile twin.
+            keepLowest(best, [](const Ranked& r) { return (int)r.pair->second.CxxVolatile; });
             preferCxxDefaultWrapperForSameDeclaration(best);
             // Ruling: at the SAME conversion a by-value or rvalue-ref bind beats materializing a
             // temporary for a `const T&`. After dominance, so an identity match still wins first.

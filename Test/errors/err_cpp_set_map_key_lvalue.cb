@@ -16,7 +16,7 @@ extern int main()
 {
     // clang's copy diagnostic arises in the header harvest, where it is not captured.
     if const (__WINDOWS__) {
-        expect_error("parameter '_Val' of 'insert' is an rvalue reference") {
+        expect_error("cannot copy C++ class 'cplv.Key' into parameter '_Val' of 'insert': its copy constructor is deleted - pass 'move x' or a temporary") {
             std.set<cplv.Key> keys = default;
             cplv.Key local = cplv.Key(4);
             keys.insert(local);

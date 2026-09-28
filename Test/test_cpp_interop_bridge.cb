@@ -4970,6 +4970,16 @@ extern int main(int argc, char** argv)
         int[] existingView = nativeInt2;
         bridge_check("VD inferred vector int", bridge_view_inferred(values), 47);
         bridge_check("VD inferred vector long", bridge_view_inferred(longValues), 58);
+        // unsigned long long / long long element spellings (clang prints them in full).
+        std.vector<unsigned long long> ullValues = default;
+        ullValues.push_back(6); ullValues.push_back(9);
+        std.vector<ulonglong> ullAliasValues = default;
+        ullAliasValues.push_back(3); ullAliasValues.push_back(4);
+        std.vector<longlong> llValues = default;
+        llValues.push_back(2); llValues.push_back(5);
+        bridge_check("VD inferred vector unsigned long long", bridge_view_inferred(ullValues), 69);
+        bridge_check("VD inferred vector ulonglong", bridge_view_inferred(ullAliasValues), 34);
+        bridge_check("VD inferred vector longlong", bridge_view_inferred(llValues), 25);
         bridge_check("VD inferred vector plus native array", bridge_view_pair(values, nativeInt2), 49);
         bridge_check("VD inferred existing view", bridge_view_inferred(existingView), 29);
         bridge_check("VD inferred scalar deduction", bridge_view_scale(values, 3), 12);

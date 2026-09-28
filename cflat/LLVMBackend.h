@@ -54,12 +54,36 @@ inline std::string CanonicalPrimitiveTypeName(std::string_view type)
     if (type == "i16") return "short";
     if (type == "i32") return "int";
     if (type == "uint") return "u32";
+    if (type == "longlong") return "i64";
+    if (type == "ulonglong") return "u64";
     return std::string(type);
+}
+
+// Whitespace-free C++ integer spelling (e.g. "unsignedlonglong") -> CFlat type name, or nullptr.
+// Shared by member ranking and contiguous-view element deduction so the two cannot drift.
+inline const char* CxxCompactIntegerSpellingToCflat(std::string_view compact)
+{
+    static const std::pair<std::string_view, const char*> identities[] = {
+        {"char", "char"}, {"signedchar", "i8"}, {"unsignedchar", "u8"},
+        {"short", "short"}, {"shortint", "short"}, {"signedshort", "short"},
+        {"signedshortint", "short"}, {"unsignedshort", "u16"},
+        {"unsignedshortint", "u16"}, {"int", "int"}, {"signed", "int"},
+        {"signedint", "int"}, {"unsigned", "u32"}, {"unsignedint", "u32"},
+        {"long", "long"}, {"longint", "long"}, {"signedlong", "long"},
+        {"signedlongint", "long"}, {"unsignedlong", "ulong"},
+        {"unsignedlongint", "ulong"}, {"longlong", "i64"},
+        {"longlongint", "i64"}, {"signedlonglong", "i64"},
+        {"signedlonglongint", "i64"}, {"unsignedlonglong", "u64"},
+        {"unsignedlonglongint", "u64"}
+    };
+    for (const auto& [spelling, identity] : identities)
+        if (compact == spelling) return identity;
+    return nullptr;
 }
 
 #pragma warning(push)
 #pragma warning(disable: 4244 4267)
-#include <llvm/ADT/DenseSet.h>    // llvm::DenseSet (identity-keyed value ledgers)
+#include <llvm/ADT/DenseSet.h>   // llvm::DenseSet (identity-keyed value ledgers)
 #include <llvm/IR/CFG.h>          // llvm::pred_empty (MarkUnreachableIfNoPredecessors)
 #include <llvm/Analysis/TargetLibraryInfo.h>  // stdio-safe TLI for ELF codegen (no chk->plain fold)
 #include <llvm/IR/IRBuilder.h>
@@ -1915,6 +1939,7 @@ public:
         bool IsMethod = false;     // true when registered as a struct/class method (has implicit self pointer)
         bool IsCxx = false;        // declaration came from a C++ header
         int CxxRefQualifier = cflat_cinterop::CxxRefQualifierNone;
+        bool CxxVolatile = false;  // volatile-qualified C++ member; loses to a non-volatile twin
         bool IsNoexcept = true;    // potentially throwing C++ calls are gated until EH support
         bool IsCInteropAlias = false;
         bool IsCInteropDeclaration = false;
@@ -7816,9 +7841,12 @@ public:
     // same value (all union members start at offset 0, so an over-aligned member simply raises
     // the union's alignment - no padding slot, which a union body could not carry anyway).
     // The body is then grown to a multiple of it so getTypeAllocSize matches the padded sizeof.
+    // `capAlignToUserAlign` lowers the union's alignment to `userAlign` when clang packs it
+    // below its members' natural alignment (#pragma pack, bitfield-only MS unions).
     llvm::StructType* CreateUnionType(std::string name, std::vector<DeclTypeAndValue> typeAndValues,
                                       uint64_t userAlign = 0,
-                                      std::vector<BitfieldInfo>* bitfields = nullptr);
+                                      std::vector<BitfieldInfo>* bitfields = nullptr,
+                                      bool capAlignToUserAlign = false);
 
     llvm::Value* CreateConstant(ConstantVariant constantVariant);
 
@@ -10477,7 +10505,7 @@ public:
     // 117: demand-group entries carry no bitcode; the group companion is cached per demand.
     // 119: group header parse defers inline non-template bodies; fewer incidental instantiations.
     // 124: demand entries store their request chunks (header wrapper batch included) for replay.
-    static constexpr int kCHeaderCacheVersion = 124;
+    static constexpr int kCHeaderCacheVersion = 126;
     static std::string CompilerBuildStamp();
 
     static std::string GetCHeaderCacheDir();

@@ -4507,6 +4507,15 @@ bool testAliasAndStaticResolution()
     return result;
 }
 
+// Forward-declared with the fixed-width name, defined with the single-word C name: the two must
+// be the same type or the definition would be an unrelated overload.
+i64 longLongAliasEcho(i64 v);
+u64 ulongLongAliasEcho(u64 v);
+i64 longLongAliasEcho(longlong v) { return v; }
+u64 ulongLongAliasEcho(ulonglong v) { return v; }
+
+T longLongAliasGeneric<T>(T v) { return v; }
+
 bool testCSpellingsAndCharTypes()
 {
     signed char signedCharValue = 1;
@@ -4562,6 +4571,17 @@ bool testCSpellingsAndCharTypes()
     // No variable named c16 is visible here, so `(c16)` is a cast: 65541 wraps to 5.
     int castSource = 65541;
     result &= (c16)castSource == 5;
+    longlong longlongValue = -23;
+    ulonglong ulonglongValue = 24;
+    unsigned short int unsignedShortIntValue = 25;
+    unsigned long int unsignedLongIntValue = 26;
+    signed short int signedShortIntValue = -27;
+    result &= longlongValue == -23 && ulonglongValue == 24 && unsignedShortIntValue == 25;
+    result &= unsignedLongIntValue == 26 && signedShortIntValue == -27;
+    result &= sizeof(longlong) == 8 && sizeof(ulonglong) == 8;
+    result &= strcmp(typeof(longlong), "i64") == 0 && strcmp(typeof(ulonglong), "u64") == 0;
+    result &= longLongAliasEcho(longlongValue) == -23 && ulongLongAliasEcho(ulonglongValue) == 24;
+    result &= longLongAliasGeneric(longlongValue) == -23 && longLongAliasGeneric((i64)-23) == -23;
     uint uintValue = 22;
     result &= uintValue == 22 && strcmp(typeof(char16_t), "c16") == 0
         && strcmp(typeof(c32), "c32") == 0;

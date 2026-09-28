@@ -3346,6 +3346,9 @@ extern int main()
         for (int uk = 0; uk < 3; uk++)
             if (cpptrr.read_late_cstr(cpptrr.first_of("lop", uk))[uk] != ulp[uk])   return 2766;
         if (cpptrr.rank_cr("x") != 1)                                       return 2767;
+        cppi.VolatilePick volPick = default;
+        if (volPick.pick(5) != 2)                                           return 2768;
+
     }
 
     // ---- min/max template deduction from literals (section 2620-2639, 2660) --------------------------

@@ -2085,14 +2085,18 @@ bool LLVMBackend::MapCTypeToTypeAndValueImpl(std::string ctype, TypeAndValue& ou
         }
         else
         {
+            // C-boundary table: differs from CxxCompactIntegerSpellingToCflat because the
+            // char*_t words map to plain unsigned widths and `long` is target-dependent below.
             static const std::unordered_map<std::string, std::string> scalarMap = {
                 { "void", "void" }, { "_Bool", "bool" }, { "bool", "bool" },
                 { "char", "char" }, { "signed char", "i8" }, { "unsigned char", "u8" },
                 { "short", "short" }, { "short int", "short" }, { "signed short", "short" },
+                { "signed short int", "short" },
                 { "unsigned short", "u16" }, { "unsigned short int", "u16" },
                 { "int", "int" }, { "signed", "int" }, { "signed int", "int" },
                 { "unsigned", "u32" }, { "unsigned int", "u32" },
                 { "long long", "i64" }, { "long long int", "i64" }, { "signed long long", "i64" },
+                { "signed long long int", "i64" },
                 { "unsigned long long", "u64" }, { "unsigned long long int", "u64" },
                 { "__int128", "i128" }, { "unsigned __int128", "u128" },
                 { "float", "float" }, { "double", "double" },
@@ -3818,9 +3822,8 @@ void LLVMBackend::RegisterTypeAliasSymbols(const std::vector<CTypeAliasEntry>& a
                         args.push_back(arg);
                         hasNonTypeArgument = true;
                     }
-                    else if (arg == "unsigned int") args.push_back("u32");
-                    else if (arg == "long long") args.push_back("i64");
-                    else if (arg == "unsigned long long") args.push_back("u64");
+                    else if (const char* integer = CxxCompactIntegerSpellingToCflat(SqueezeCxxSpelling(arg)))
+                        args.push_back(integer);
                     else
                     {
                         auto it = cxxForeignTypeSpellings_.find(SqueezeCxxSpelling(arg));
@@ -13786,7 +13789,9 @@ bool LLVMBackend::InsertCBitfieldLayoutPadding(const CRecordEntry& r,
         {
             llvm::Type* ft = GetType(fields[i]);
             if (ft == nullptr || !ft->isSized()) return false;
-            const uint64_t natural = llvm::alignTo(at, GetFieldSlotAlignment(fields[i], ft));
+            const uint64_t natural = r.isPacked
+                ? at
+                : llvm::alignTo(at, GetFieldSlotAlignment(fields[i], ft));
             if (desired[i] < natural) return false;
             if (desired[i] > natural)
             {
@@ -14661,18 +14666,21 @@ void LLVMBackend::RegisterCRecords(std::vector<CRecordEntry>& records, const std
             // A C++ record's layout is clang's, not CFlat's: insert explicit padding wherever
             // clang put a field further along than CFlat's natural packing would (over-aligned
             // members, empty-member slots), so field offsets agree before the type is built.
-            if (r.isCxx && !generated && !r.isUnion && !anyBitfields && !hasZeroSizeFields)
+            if ((r.isCxx || r.isPacked) && !generated && !r.isUnion && !anyBitfields && !hasZeroSizeFields)
                 InsertCxxLayoutPadding(r, fields);
             if (r.isUnion)
-                CreateUnionType(r.name, fields, r.isCxx ? r.alignBytes : 0,
-                                anyBitfields ? &packedBitfields : nullptr);
+            {
+                const bool cUnionClangAlign = !r.isCxx && (r.isPacked || anyBitfields);
+                CreateUnionType(r.name, fields, r.isCxx || cUnionClangAlign ? r.alignBytes : 0,
+                                anyBitfields ? &packedBitfields : nullptr, cUnionClangAlign);
+            }
             else
             {
                 CreateStructType(r.name, fields,
-                    r.isCxx || clangZeroSizeLayout || cBitfieldOffsetLayout ? r.alignBytes : 0,
+                    r.isCxx || r.isPacked || clangZeroSizeLayout || cBitfieldOffsetLayout ? r.alignBytes : 0,
                     anyBitfields ? &packedBitfields : nullptr,
-                    r.isCxx && r.isPacked,
-                    cBitfieldOffsetLayout ? r.alignBytes : 0);
+                    r.isPacked,
+                    cBitfieldOffsetLayout && !r.isPacked ? r.alignBytes : 0);
                 if (zeroSizeBitfields)
                 {
                     auto it = dataStructures.find(r.name);
@@ -15710,6 +15718,7 @@ void LLVMBackend::RegisterCxxClassMembers(const CRecordEntry& r, const std::stri
             const bool mineBindable = hasReachableSymbol(m);
             if (keptBindable != mineBindable)         { if (mineBindable) it->second = i; }
             else if (kept.isConst && !m.isConst)      it->second = i;
+            else if (kept.isVolatile && !m.isVolatile) it->second = i;
             else if (keptRvalue && !mineRvalue)       it->second = i;
         }
 
@@ -16088,6 +16097,7 @@ void LLVMBackend::RegisterCxxClassMembers(const CRecordEntry& r, const std::stri
                             sym.IsCInteropDeclaration = true;
                             sym.DefaultArguments.clear();
                             sym.CxxRefQualifier = m.refQualifier;
+                            sym.CxxVolatile = m.isVolatile;
                         }
                 return true;
             };
@@ -16195,6 +16205,7 @@ void LLVMBackend::RegisterCxxClassMembers(const CRecordEntry& r, const std::stri
                         sym.IsCInteropDeclaration = true;
                         sym.DefaultArguments = m.defaultArgs;
                         sym.CxxRefQualifier = m.refQualifier;
+                        sym.CxxVolatile = m.isVolatile;
                     }
             // A member whose omitted suffix contains a non-constant default gets an exact-arity
             // receiver-prefixed overload backed by a C++ forwarding body. The generated body is
@@ -19922,19 +19933,16 @@ bool LLVMBackend::IsCxxContiguousViewSource(const NamedVariable& arg,
                 if (deduceElement && deducedElementType != nullptr && stars == expectedStars)
                 {
                     static const std::unordered_map<std::string, std::string> primitives = {
-                        { "bool", "bool" }, { "char", "char" }, { "signedchar", "i8" },
-                        { "unsignedchar", "u8" }, { "short", "short" },
-                        { "shortint", "short" }, { "unsignedshort", "u16" },
-                        { "unsignedshortint", "u16" }, { "int", "int" },
-                        { "unsigned", "uint" }, { "unsignedint", "uint" },
-                        { "long", "long" }, { "longint", "long" },
-                        { "unsignedlong", "ulong" }, { "unsignedlongint", "ulong" },
-                        { "longlong", "i64" }, { "longlongint", "i64" },
+                        { "bool", "bool" },
                         { "float", "float" }, { "double", "double" },
                         { "longdouble", "longdouble" }, { "wchar_t", "wchar" },
                         { "char8_t", "c8" }, { "char16_t", "c16" }, { "char32_t", "c32" }
                     };
-                    if (auto it = primitives.find(returned); it != primitives.end())
+                    if (const char* integer = CxxCompactIntegerSpellingToCflat(returned))
+                    {
+                        candidateElementType = integer;
+                    }
+                    else if (auto it = primitives.find(returned); it != primitives.end())
                     {
                         candidateElementType = it->second;
                     }
@@ -19969,14 +19977,9 @@ bool LLVMBackend::IsCxxContiguousViewSource(const NamedVariable& arg,
             {
                 std::string result = compact(raw.retType);
                 if (result.rfind("const", 0) == 0) result.erase(0, 5);
-                static const std::set<std::string> integerTypes = {
-                    "char", "signedchar", "unsignedchar", "short", "shortint",
-                    "unsignedshort", "unsignedshortint", "int", "unsigned",
-                    "unsignedint", "long", "longint", "unsignedlong",
-                    "unsignedlongint", "longlong", "longlongint",
-                    "unsignedlonglong", "unsignedlonglongint", "size_t", "std::size_t"
-                };
-                if (integerTypes.count(result)) hasSize = true;
+                if (CxxCompactIntegerSpellingToCflat(result) != nullptr
+                    || result == "size_t" || result == "std::size_t")
+                    hasSize = true;
             }
         };
         if (info != nullptr)

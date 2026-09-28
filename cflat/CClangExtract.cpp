@@ -91,24 +91,23 @@ namespace cflat_cinterop
                 normalized.erase(0, std::strlen(tag));
                 break;
             }
-        for (const auto& [from, to] : std::array<std::pair<std::string_view, std::string_view>, 17>{
-                 std::pair{ "unsigned long long", "u64" },
-                 std::pair{ "signed long long", "i64" },
-                 std::pair{ "unsigned long", "ulong" },
-                 std::pair{ "signed long", "long" },
-                 std::pair{ "long double", "longdouble" },
-                 std::pair{ "unsigned short", "u16" },
-                 std::pair{ "signed short", "short" },
-                 std::pair{ "unsigned int", "u32" },
-                 std::pair{ "signed int", "int" },
-                 std::pair{ "unsigned char", "u8" },
-                 std::pair{ "signed char", "i8" },
-                 std::pair{ "unsigned", "u32" },
-                 std::pair{ "long long", "i64" },
-                 std::pair{ "char8_t", "c8" },
-                 std::pair{ "char16_t", "c16" },
-                 std::pair{ "char32_t", "c32" },
-                 std::pair{ "wchar_t", "wchar" } })
+        // Longer spellings first: this is a substring replace, so a prefix must not win.
+        static constexpr std::pair<std::string_view, std::string_view> spellings[] = {
+            { "unsigned long long int", "u64" }, { "signed long long int", "i64" },
+            { "unsigned long long", "u64" }, { "signed long long", "i64" },
+            { "long long int", "i64" }, { "long long", "i64" },
+            { "unsigned long int", "ulong" }, { "signed long int", "long" },
+            { "unsigned long", "ulong" }, { "signed long", "long" },
+            { "long int", "long" }, { "long double", "longdouble" },
+            { "unsigned short int", "u16" }, { "signed short int", "short" },
+            { "unsigned short", "u16" }, { "signed short", "short" },
+            { "short int", "short" },
+            { "unsigned int", "u32" }, { "signed int", "int" },
+            { "unsigned char", "u8" }, { "signed char", "i8" },
+            { "unsigned", "u32" }, { "signed", "int" },
+            { "char8_t", "c8" }, { "char16_t", "c16" },
+            { "char32_t", "c32" }, { "wchar_t", "wchar" } };
+        for (const auto& [from, to] : spellings)
         {
             for (size_t pos = 0; (pos = normalized.find(from, pos)) != std::string::npos; )
             {
@@ -1798,7 +1797,12 @@ namespace cflat_cinterop
                     RawField rf;
                     rf.name = f->getNameAsString();
                     rf.access = MapAccess(f->getAccess());
-                    rf.isZeroSize = f->isZeroSize(ctx);
+                    // A zero-length or flexible array occupies no bytes; cflat has no 0-extent
+                    // array, so it must ride the zero-size layout path.
+                    const auto* constArr = ctx.getAsConstantArrayType(f->getType());
+                    rf.isZeroSize = f->isZeroSize(ctx)
+                        || (constArr != nullptr && constArr->isZeroSize())
+                        || ctx.getAsIncompleteArrayType(f->getType()) != nullptr;
                     rf.offsetBytes = layout.getFieldOffset(f->getFieldIndex()) / 8;
                     RecordRawFieldLayout(f->getType(), rf);
                     // A reference member is a pointer-sized slot in every ABI cflat targets, and
@@ -2178,6 +2182,7 @@ namespace cflat_cinterop
                         if (m.name.empty()) m.name = "operator=";
                     }
                     m.isConst = !md->isStatic() && md->isConst();
+                    m.isVolatile = !md->isStatic() && md->isVolatile();
                     switch (md->getRefQualifier())
                     {
                         case RQ_LValue: m.refQualifier = CxxRefQualifierLValue; break;
@@ -2752,7 +2757,8 @@ namespace cflat_cinterop
                 const ASTRecordLayout& layout = ctx.getASTRecordLayout(rd);
                 rec.sizeBytes = layout.getSize().getQuantity();
                 rec.alignBytes = layout.getAlignment().getQuantity();
-                rec.isPacked = rd->hasAttr<PackedAttr>();
+                // #pragma pack(N) yields MaxFieldAlignmentAttr, not PackedAttr.
+                rec.isPacked = rd->hasAttr<PackedAttr>() || rd->hasAttr<MaxFieldAlignmentAttr>();
                 std::vector<const CXXMethodDecl*> memberDecls;
                 bool flattened = false;
                 if (const auto* cxx = llvm::dyn_cast<CXXRecordDecl>(rd))
@@ -5938,6 +5944,28 @@ namespace cflat_cinterop
             {
                 err = "clang: failed to compile inline body '" + failedBody
                     + "' required by this program: " + bodyDiagnostic;
+                return false;
+            }
+        }
+        /*
+         * The Microsoft ABI's vftables are handed unconditionally below, and each one emits its
+         * deleting destructor. Sema resolves that destructor's operator delete only when it
+         * finishes the destructor body, which a skipped inline body never did; CodeGen would
+         * dereference the null.
+         */
+        for (const auto& [name, record] : plan.vtables)
+        {
+            if (!name.starts_with("vftable:")) continue;
+            auto* dtor = record->getDestructor();
+            if (dtor == nullptr || !dtor->isVirtual() || dtor->isDeleted()
+                || dtor->getOperatorDelete() != nullptr)
+                continue;
+            clang::Sema& sema = ci.getSema();
+            clang::Sema::ContextRAII inDtor(sema, dtor);
+            if (sema.CheckDestructor(dtor) || dtor->getOperatorDelete() == nullptr)
+            {
+                err = "clang could not resolve operator delete for the virtual destructor of '"
+                    + record->getQualifiedNameAsString() + "'";
                 return false;
             }
         }

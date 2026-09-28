@@ -278,6 +278,7 @@ namespace cflat_cinterop
         // placement-new wrapper instead of a direct constructor symbol.
         bool requiresConstructorWrapper = false;
         bool isConst = false;          // const-qualified instance method
+    bool isVolatile = false;       // volatile-qualified instance method
         int refQualifier = CxxRefQualifierNone;
         bool isVirtual = false;
         bool isNoexcept = false;

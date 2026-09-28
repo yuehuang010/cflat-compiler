@@ -32,6 +32,34 @@ struct CBF_CharShort
     unsigned int b : 4;
 };
 
+/* #pragma pack records: clang lays these out with MaxFieldAlignmentAttr, not PackedAttr. */
+#pragma pack(push, 1)
+struct CBF_Pack1
+{
+    char c;
+    unsigned int a : 3;
+    unsigned int b : 5;
+    int n;
+};
+#pragma pack(pop)
+
+#pragma pack(push, 2)
+struct CBF_Pack2
+{
+    char c;
+    int n;
+    short s;
+};
+#pragma pack(pop)
+
+int cbf_pack1_size(void);
+int cbf_pack1_align(void);
+int cbf_pack1_n_offset(void);
+int cbf_pack1_check(struct CBF_Pack1* v);
+int cbf_pack2_size(void);
+int cbf_pack2_align(void);
+int cbf_pack2_n_offset(void);
+int cbf_pack2_check(struct CBF_Pack2* v);
 int cbf_zero_size(void);
 struct CBF_Zero cbf_zero_make(int c, int d);
 int cbf_zero_check(struct CBF_Zero v);

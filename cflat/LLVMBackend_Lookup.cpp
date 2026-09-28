@@ -57,7 +57,7 @@ bool LLVMBackend::IsKnownTypeName(const std::string& name) const
 {
         static const std::unordered_set<std::string> scalars = {
             "void", "char", "i8", "u8", "c8", "short", "i16", "u16", "c16", "int", "i32", "u32", "uint", "c32",
-            "long", "ulong", "i64", "u64", "i128", "u128", "wchar", "float", "double", "longdouble", "bool", "va_list", "auto" };
+            "long", "ulong", "i64", "u64", "longlong", "ulonglong", "i128", "u128", "wchar", "float", "double", "longdouble", "bool", "va_list", "auto" };
         if (scalars.count(name)) return true;
         std::string resolved = ResolveTypeAlias(name);
         return enumBackingTypes.count(resolved) > 0 || resolved != name

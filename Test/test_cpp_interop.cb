@@ -1278,9 +1278,8 @@ extern int main()
     if (intrinsicNames.__popcount(5) != 96) return 642;
     if (TestIsCppClass<cppi.IntrinsicMemberNames>() != 1) return 643;
     if (TestIsCppClass<EscAddrRef>() != 0) return 644;
-    expect_error("layout is not representable") {
-        cppi.NuaPackedGuard packedGuard = default;
-    }
+    // #pragma pack(2) is representable (packed layout), so the record binds with clang's size.
+    if ((int)sizeof(cppi.NuaPackedGuard) != 6 || (int)alignof(cppi.NuaPackedGuard) != 2) return 3999;
 
     // ---- C++ exceptions at the program boundary -------------------------------------------------
     // Win64 keeps the existing SEH trampoline and does not emit the C++ guard.
@@ -3059,6 +3058,9 @@ extern int main()
     std.vector<unsigned long> primitiveUnsignedLong = default;
     primitiveUnsignedLong.push_back((ulong)13);
     if (primitiveUnsignedLong[0] != (ulong)13) return 1008;
+    std.vector<unsigned long long> primitiveUnsignedLongLong = default;
+    primitiveUnsignedLongLong.push_back((u64)14);
+    if (primitiveUnsignedLongLong[0] != (u64)14) return 4000;
 
     // ---- C++ subobject destruction and extern-template vtable ownership -------------------------
     // A bound C++ destructor destroys the class's own members, so CFlat must not add a member
