@@ -1417,6 +1417,51 @@ bool testIsPointerIntrinsic()
     return result;
 }
 
+struct IntrinsicMemberNames
+{
+    bool is_string() { return true; }
+    int __popcount(int value) { return value + 73; }
+};
+
+struct GenericIntrinsicMemberNames<T>
+{
+    bool is_string() { return true; }
+    int __popcount(int value) { return value + 101; }
+};
+
+interface IntrinsicMemberStringInterface { bool is_string(); };
+
+class IntrinsicMemberStringImpl : IntrinsicMemberStringInterface
+{
+    bool is_string() { return true; }
+};
+
+struct IntrinsicMemberStringChain
+{
+    GenericIntrinsicMemberNames<int> y() { return default; }
+};
+
+bool testIntrinsicMemberNames()
+{
+    IntrinsicMemberNames value = default;
+    bool result = true;
+    result &= Test("member is_string", value.is_string(), true);
+    result &= Test("member __popcount", value.__popcount(5), 78);
+    GenericIntrinsicMemberNames<int> genericValue = default;
+    result &= Test("generic member is_string", genericValue.is_string(), true);
+    result &= Test("generic member __popcount", genericValue.__popcount(5), 106);
+    IntrinsicMemberNames* pointer = &value;
+    result &= Test("pointer member is_string", pointer->is_string(), true);
+    IntrinsicMemberNames? nullable = &value;
+    result &= Test("nullable member is_string", nullable?.is_string(), true);
+    IntrinsicMemberStringChain chain = default;
+    result &= Test("chained member is_string", chain.y().is_string(), true);
+    IntrinsicMemberStringImpl implementation = default;
+    IntrinsicMemberStringInterface iface = implementation;
+    result &= Test("interface member is_string", iface.is_string(), true);
+    return result;
+}
+
 // --- Templated global function (explicit type args) ---
 T ShadowPick<T>(T a, T b) { return a > b ? a : b; }
 
@@ -5226,6 +5271,7 @@ extern int main()
     total++; passed += testMultiLayerGeneric()           ? 1 : 0;
     total++; passed += testMixedGenericFields()          ? 1 : 0;
     total++; passed += testIsPointerIntrinsic()          ? 1 : 0;
+    total++; passed += testIntrinsicMemberNames()        ? 1 : 0;
     total++; passed += testTemplateFunctions()           ? 1 : 0;
     total++; passed += testNewPrimitiveInitializers()    ? 1 : 0;
     total++; passed += testGenericInstanceMethods()      ? 1 : 0;

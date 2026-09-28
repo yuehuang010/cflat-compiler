@@ -472,16 +472,32 @@ llvm::DIType* LLVMBackend::GetDIType(const TypeAndValue& tv)
 
             std::vector<llvm::Metadata*> members;
             const auto& fields = sdIt->second.StructFields;
-            unsigned n = st->getNumElements();
-            for (size_t i = 0; i < fields.size() && i < n; ++i)
+            for (size_t i = 0; i < fields.size(); ++i)
             {
                 const auto& f = fields[i];
                 if (f.IsPadding) continue;   // synthetic alignment slot: not a member
-                auto* fieldTy = st->getElementType((unsigned)i);
-                uint64_t fSize = DL.getTypeAllocSizeInBits(fieldTy);
-                uint64_t fAlign = (uint64_t)DL.getABITypeAlign(fieldTy).value() * 8;
-                uint64_t fOffset = SL->getElementOffsetInBits((unsigned)i);
+                const unsigned element = CxxFieldElementIndex(sdIt->second, (unsigned)i);
+                if (element != std::numeric_limits<unsigned>::max()
+                    && element >= st->getNumElements()) continue;
                 auto* fDI = GetDIType(f);
+                uint64_t fSize = 0;
+                uint64_t fAlign = 0;
+                uint64_t fOffset = 0;
+                if (element == std::numeric_limits<unsigned>::max())
+                {
+                    // Clang retains zero-storage [[no_unique_address]] members in DWARF
+                    // with the member type's size and the record's semantic field offset.
+                    fSize = fDI->getSizeInBits();
+                    fAlign = fDI->getAlignInBits();
+                    fOffset = sdIt->second.CxxFieldOffsets[i] * 8;
+                }
+                else
+                {
+                    auto* fieldTy = st->getElementType(element);
+                    fSize = DL.getTypeAllocSizeInBits(fieldTy);
+                    fAlign = (uint64_t)DL.getABITypeAlign(fieldTy).value() * 8;
+                    fOffset = SL->getElementOffsetInBits(element);
+                }
                 members.push_back(diBuilder->createMemberType(
                     fwd, f.VariableName, diFile, 0,
                     fSize, (uint32_t)fAlign, fOffset, llvm::DINode::FlagZero, fDI));
@@ -959,6 +975,8 @@ llvm::Value* LLVMBackend::ClearStructOwnedBits(llvm::Value* value, const std::st
         for (unsigned i = 0; i < dsIt->second.StructFields.size(); ++i)
         {
             const auto& f = dsIt->second.StructFields[i];
+            const unsigned element = CxxFieldElementIndex(dsIt->second, i);
+            if (element == std::numeric_limits<unsigned>::max()) continue;
             if (f.Pointer || f.ElemPointer || f.IsArrayView || f.IsSimd || f.IsBitfield || f.IsPadding)
                 continue;
             if (f.ConstArraySize > 0)
@@ -969,11 +987,11 @@ llvm::Value* LLVMBackend::ClearStructOwnedBits(llvm::Value* value, const std::st
                 // would need constant per-dimension indices and could not loop).
                 if (f.TypeName != "string" && !IsOwningValueType(f.TypeName))
                     continue;
-                llvm::Type* fieldTy = structTy->getElementType(i);
+                llvm::Type* fieldTy = structTy->getElementType(element);
                 llvm::Type* elemTy = nullptr;
                 uint64_t n = PeelFixedArrayType(fieldTy, elemTy);
                 auto* slot = AllocaAtEntry(fieldTy, nullptr, "fbarr.slot");
-                builder->CreateStore(builder->CreateExtractValue(value, { i }, "fbarr.fld"), slot);
+                builder->CreateStore(builder->CreateExtractValue(value, { element }, "fbarr.fld"), slot);
                 EmitFixedArrayElementWalk(*builder, slot, elemTy, n, [&](llvm::Value* elemPtr) {
                     if (f.TypeName == "string")
                     {
@@ -990,20 +1008,20 @@ llvm::Value* LLVMBackend::ClearStructOwnedBits(llvm::Value* value, const std::st
                     }
                 });
                 auto* reloaded = builder->CreateLoad(fieldTy, slot, "fbarr.reload");
-                value = builder->CreateInsertValue(value, reloaded, { i }, "fbarr.set");
+                value = builder->CreateInsertValue(value, reloaded, { element }, "fbarr.set");
                 continue;
             }
             if (f.TypeName == "string")
             {
-                auto* len    = builder->CreateExtractValue(value, { i, 1u }, "fborrow.len");
+                auto* len    = builder->CreateExtractValue(value, { element, 1u }, "fborrow.len");
                 auto* masked = builder->CreateAnd(len, builder->getInt32(0x7FFFFFFF), "fborrow.noown");
-                value = builder->CreateInsertValue(value, masked, { i, 1u }, "fborrow.str");
+                value = builder->CreateInsertValue(value, masked, { element, 1u }, "fborrow.str");
             }
             else if (IsOwningValueType(f.TypeName))
             {
-                auto* sub = builder->CreateExtractValue(value, { i }, "fborrow.sub");
+                auto* sub = builder->CreateExtractValue(value, { element }, "fborrow.sub");
                 sub = ClearStructOwnedBits(sub, f.TypeName);
-                value = builder->CreateInsertValue(value, sub, { i }, "fborrow.subset");
+                value = builder->CreateInsertValue(value, sub, { element }, "fborrow.subset");
             }
         }
         return value;
@@ -1314,8 +1332,11 @@ llvm::Function* LLVMBackend::GetOrCreateFullDestructor(const std::string& typeNa
 
         for (const auto& w : work)
         {
-            auto* fieldPtr = b.CreateStructGEP(structTy, self, w.Index, "fld");
-            auto* fieldTy  = structTy->getElementType(w.Index);
+            const unsigned element = CxxFieldElementIndex(dsIt->second, w.Index);
+            auto* fieldPtr = CreateCxxFieldGEP(b, dsIt->second, self, w.Index, "fld");
+            auto* fieldTy = element == std::numeric_limits<unsigned>::max()
+                ? GetType(dsIt->second.StructFields[w.Index])
+                : structTy->getElementType(element);
             if (w.IsUniqueIface)
                 EmitUniqueInterfaceFieldRelease(b, fieldPtr, w.TypeName);
             else if (w.IsUniqueArray)
@@ -1343,8 +1364,10 @@ void LLVMBackend::EmitCflatOwnedFieldsDestruction(llvm::IRBuilder<>& b,
         {
             const auto& f = dsIt->second.StructFields[i];
             if (!f.IsCflatOwned || f.IsAlias || f.IsPadding || f.IsBitfield) continue;
-            auto* fieldPtr = b.CreateStructGEP(structTy, self, i, "cflat_field");
-            auto* fieldTy = structTy->getElementType(i);
+            const unsigned element = CxxFieldElementIndex(dsIt->second, i);
+            if (element == std::numeric_limits<unsigned>::max()) continue;
+            auto* fieldPtr = CreateCxxFieldGEP(b, dsIt->second, self, i, "cflat_field");
+            auto* fieldTy = structTy->getElementType(element);
             if (f.IsUnique && f.Pointer && !f.ElemPointer && !f.IsArrayView
                 && f.ConstArraySize == 0)
             {
@@ -1946,6 +1969,7 @@ llvm::Function* LLVMBackend::GetOrCreateMemberwiseCopy(const std::string& typeNa
         // result = self  (shallow copy of every field; managed fields are fixed up below)
         auto* resultSlot = builder->CreateAlloca(structTy, nullptr, "result");
         builder->CreateStore(&*fn->arg_begin(), resultSlot);
+        llvm::Value* sourceSlot = nullptr;
 
         // An unwind out of a field copy destroys the fields already deep-copied; the rest still
         // alias `self` and must not be touched.
@@ -1954,6 +1978,24 @@ llvm::Function* LLVMBackend::GetOrCreateMemberwiseCopy(const std::string& typeNa
         for (unsigned i = 0; i < dsIt->second.StructFields.size(); ++i)
         {
             const auto& f = dsIt->second.StructFields[i];
+            const unsigned element = CxxFieldElementIndex(dsIt->second, i);
+            if (element == std::numeric_limits<unsigned>::max())
+            {
+                if (IsForeignNontrivialCxxClass(f.TypeName))
+                {
+                    if (sourceSlot == nullptr)
+                    {
+                        sourceSlot = builder->CreateAlloca(structTy, nullptr, "source");
+                        builder->CreateStore(&*fn->arg_begin(), sourceSlot);
+                    }
+                    auto* fieldPtr = CreateCxxFieldGEP(dsIt->second, resultSlot, i, "fld");
+                    auto* sourceFieldPtr = CreateCxxFieldGEP(dsIt->second, sourceSlot, i, "fldsrc");
+                    if (EmitCxxCopyOrMoveConstruct(f.TypeName, fieldPtr, sourceFieldPtr,
+                            /*useMove*/ false, "in synthesized struct copy"))
+                        NoteUnwindPartial(UnwindPartialEntry::Kind::Slot, fieldPtr, f.TypeName);
+                }
+                continue;
+            }
             if (f.Pointer || f.ElemPointer || f.IsArrayView || f.IsSimd || f.IsBitfield || f.IsPadding)
                 continue;                       // pointer/view/simd/bitfield/pad: shallow (pointee shared)
             if (f.ConstArraySize > 0)
@@ -1964,8 +2006,8 @@ llvm::Function* LLVMBackend::GetOrCreateMemberwiseCopy(const std::string& typeNa
                     && !IsForeignNontrivialCxxClass(f.TypeName))
                     continue;                   // POD element array: the shallow copy is correct
                 llvm::Type* elemTy = nullptr;
-                uint64_t n = PeelFixedArrayType(structTy->getElementType(i), elemTy);
-                auto* base = builder->CreateStructGEP(structTy, resultSlot, i, "fldarr");
+                uint64_t n = PeelFixedArrayType(structTy->getElementType(element), elemTy);
+                auto* base = CreateCxxFieldGEP(dsIt->second, resultSlot, i, "fldarr");
                 EmitArrayConstructionWalk(base, elemTy, n, f.TypeName, [&](llvm::Value* elemPtr) {
                     if (IsForeignNontrivialCxxClass(f.TypeName))
                     {
@@ -1989,12 +2031,12 @@ llvm::Function* LLVMBackend::GetOrCreateMemberwiseCopy(const std::string& typeNa
             if (!HasCopyOverloadFor(f.TypeName) && !IsOwningValueType(f.TypeName)
                 && !IsForeignNontrivialCxxClass(f.TypeName))
                 continue;                       // POD field: the shallow copy is already correct
-            auto* fieldPtr = builder->CreateStructGEP(structTy, resultSlot, i, "fld");
+            auto* fieldPtr = CreateCxxFieldGEP(dsIt->second, resultSlot, i, "fld");
             if (IsForeignNontrivialCxxClass(f.TypeName))
             {
-                auto* sourceSlot = AllocaAtEntry(structTy->getElementType(i), nullptr, "fldsrc");
+                auto* sourceSlot = AllocaAtEntry(structTy->getElementType(element), nullptr, "fldsrc");
                 builder->CreateStore(
-                    builder->CreateLoad(structTy->getElementType(i), fieldPtr), sourceSlot);
+                    builder->CreateLoad(structTy->getElementType(element), fieldPtr), sourceSlot);
                 EmitCxxCopyOrMoveConstruct(f.TypeName, fieldPtr, sourceSlot,
                                            /*useMove*/ false, "in synthesized struct copy");
                 NoteUnwindPartial(UnwindPartialEntry::Kind::Slot, fieldPtr, f.TypeName);
@@ -2002,7 +2044,7 @@ llvm::Function* LLVMBackend::GetOrCreateMemberwiseCopy(const std::string& typeNa
             }
             NamedVariable argNV;
             argNV.Storage  = fieldPtr;
-            argNV.BaseType = structTy->getElementType(i);
+            argNV.BaseType = structTy->getElementType(element);
             argNV.TypeAndValue.TypeName = f.TypeName;
             if (auto* copied = CreateOverloadedFunctionCall("copy", { argNV }))
             {

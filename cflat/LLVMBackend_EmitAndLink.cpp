@@ -445,6 +445,8 @@ std::unique_ptr<llvm::TargetMachine> LLVMBackend::CreateOptTargetMachine(int opt
         llvm::InitializeAllTargets();
         llvm::InitializeAllTargetMCs();
         llvm::InitializeAllAsmPrinters();
+        // Inline asm in cached companion IR needs the MC asm parser; clang only registers it on a cold run.
+        llvm::InitializeAllAsmParsers();
 
         std::string triple = targetMacOS_
             ? std::string("arm64-apple-macosx")
@@ -2768,17 +2770,49 @@ static size_t CountDefinitions(const llvm::Module& m)
     return count;
 }
 
+/*
+ * A layout-only request (a type exposed through operator* / operator->) binds inline members
+ * without emitting their bodies. When the program calls one that no merged companion defines,
+ * request its owner again WITH definitions, the upgrade an explicit spelling of the type gets.
+ * True when that adopted new companion bitcode.
+ */
+bool LLVMBackend::UpgradeCxxAssumedBodyOwners(const llvm::Module& companions)
+{
+    std::set<std::string> owners;
+    for (const llvm::Function& fn : module->functions())
+    {
+        if (!fn.isDeclaration() || fn.use_empty() || !fn.hasName()) continue;
+        auto owner = cxxAssumedBodyOwners_.find(fn.getName().str());
+        if (owner == cxxAssumedBodyOwners_.end()) continue;
+        const llvm::Function* provided = companions.getFunction(fn.getName());
+        if (provided == nullptr || provided->isDeclaration()) owners.insert(owner->second);
+    }
+    const size_t adoptedBefore = cxxCompanionBitcode_.size();
+    for (const std::string& owner : owners)
+    {
+        // One attempt per owner, whatever it yields.
+        std::erase_if(cxxAssumedBodyOwners_,
+                      [&](const auto& entry) { return entry.second == owner; });
+        const std::string target = ResolveTypeAlias(owner);
+        if (cxxForeignDefinitions_.count(target) != 0) continue;
+        auto spellingIt = cxxCflatToCxxSpelling_.find(target);
+        auto groupIt = cxxTypeOwnerGroup_.find(target);
+        if (spellingIt == cxxCflatToCxxSpelling_.end() || groupIt == cxxTypeOwnerGroup_.end())
+            continue;
+        CxxRequestGroup group = MakeCxxRequestGroup(groupIt->second, {});
+        if (group.headers.empty()) continue;
+        CxxRequestGroupScope groupScope(*this, &group);
+        std::string error;
+        RequestCxxForeignType(target, spellingIt->second, error, /*needDefinitions*/ true,
+                              /*explicitInstantiation*/ true);
+    }
+    return cxxCompanionBitcode_.size() != adoptedBefore;
+}
+
 bool LLVMBackend::LinkCxxCompanionModules()
 {
-    if (cxxCompanionBitcode_.empty()) return true;
+    if (cxxCompanionBitcode_.empty() && cxxAssumedBodyOwners_.empty()) return true;
     llvm::TimeTraceScope scope("LinkCxxCompanion");
-
-    // Everything defined right now is PROGRAM-origin: cflat's own code plus whatever earlier
-    // companions contributed. What the link below adds on top is companion-origin, and only
-    // those get the internalize treatment (see the loop after the link).
-    std::unordered_set<std::string> programOrigin;
-    for (const llvm::GlobalValue& gv : module->global_values())
-        if (!gv.isDeclaration() && gv.hasName()) programOrigin.insert(gv.getName().str());
 
     /*
      * The companions are merged into one scratch module first and that module is linked into
@@ -2791,81 +2825,98 @@ bool LLVMBackend::LinkCxxCompanionModules()
     auto companions = std::make_unique<llvm::Module>("cflat_cxx_companions", *context);
     companions->setTargetTriple(module->getTargetTriple());
     companions->setDataLayout(module->getDataLayout());
-    std::vector<std::string> blobs;
-    blobs.swap(cxxCompanionBitcode_);
-    for (const std::string& blob : blobs)
-    {
-        llvm::MemoryBufferRef buffer(blob, "cflat_cxx_companion");
-        auto parsed = [&] {
-            llvm::TimeTraceScope parseScope("CxxCompanionBitcodeParse",
-                                             std::to_string(blob.size()));
-            return llvm::parseBitcodeFile(buffer, *context);
-        }();
-        if (!parsed)
+    size_t blobCount = 0;
+    auto mergeAdoptedBlobs = [&]() -> bool {
+        std::vector<std::string> blobs;
+        blobs.swap(cxxCompanionBitcode_);
+        blobCount += blobs.size();
+        for (const std::string& blob : blobs)
         {
-            LogErrorMessage("{}: the C++ definitions emitted for an imported header could not be "
-                            "read back: {}",
-                            { "import cpp", llvm::toString(parsed.takeError()) });
-            return false;
-        }
-        std::unique_ptr<llvm::Module> companion = std::move(*parsed);
-
-        /*
-         * Same target, spelled with more precision on Clang's side (an OS version, extra pointer
-         * specs). Adopting the destination's spelling keeps IRMover from warning about it; a
-         * genuinely different architecture or OS is an error, not something to paper over.
-         * Compared against the triple this compile has CHOSEN, not module->getTargetTriple(): the
-         * main module carries no triple until native emission, which happens long after this link,
-         * so the old comparison never ran on the normal -o path.
-         */
-        const llvm::Triple want(CInteropTargetTriple());
-        const llvm::Triple& have = companion->getTargetTriple();
-        if (have.getArch() != want.getArch() || have.getOS() != want.getOS())
-        {
-            LogErrorMessage("{}: the C++ definitions emitted for an imported header target "
-                            "'{}', but this program targets '{}'.",
-                            { "import cpp", have.str(), want.str() });
-            return false;
-        }
-        if (!module->getTargetTriple().str().empty()) companion->setTargetTriple(module->getTargetTriple());
-        /*
-         * The data layout is a CHECK, not an override. The main module's Darwin layout is a short
-         * hand-written string and Clang's is the full arm64-apple one, so a textual difference is
-         * expected; what must agree is the machine contract the two modules were built against.
-         * Adopting the destination's spelling afterwards keeps IRMover quiet.
-         */
-        if (!module->getDataLayoutStr().empty())
-        {
-            const llvm::DataLayout& mine = module->getDataLayout();
-            const llvm::DataLayout& theirs = companion->getDataLayout();
-            if (mine.isLittleEndian() != theirs.isLittleEndian()
-                || mine.getPointerSizeInBits() != theirs.getPointerSizeInBits()
-                || mine.getIndexSizeInBits(0) != theirs.getIndexSizeInBits(0))
+            llvm::MemoryBufferRef buffer(blob, "cflat_cxx_companion");
+            auto parsed = [&] {
+                llvm::TimeTraceScope parseScope("CxxCompanionBitcodeParse",
+                                                 std::to_string(blob.size()));
+                return llvm::parseBitcodeFile(buffer, *context);
+            }();
+            if (!parsed)
             {
-                LogErrorMessage("{}: the C++ definitions emitted for an imported header were built "
-                                "for data layout '{}', which does not match this program's '{}'.",
-                                { "import cpp", companion->getDataLayoutStr(),
-                                  module->getDataLayoutStr() });
+                LogErrorMessage("{}: the C++ definitions emitted for an imported header could not be "
+                                "read back: {}",
+                                { "import cpp", llvm::toString(parsed.takeError()) });
                 return false;
             }
-            if (verbose && companion->getDataLayoutStr() != module->getDataLayoutStr())
-                std::cout << std::format("[verbose] C++ companion data layout '{}' adopted as '{}'\n",
-                                         companion->getDataLayoutStr(), module->getDataLayoutStr());
-            companion->setDataLayout(module->getDataLayout());
-        }
+            std::unique_ptr<llvm::Module> companion = std::move(*parsed);
 
-        if (verbose)
-            std::cout << std::format("[verbose] linking C++ companion module ({} bytes of bitcode)\n",
-                                     blob.size());
-        DeclareLinkOnceDefinitions(*companions, *companion);
-        if (llvm::Linker::linkModules(*companions, std::move(companion), llvm::Linker::Flags::None))
-        {
-            LogErrorMessage("{}: the C++ definitions emitted for an imported header could not be "
-                            "linked into this program (conflicting module flags or symbols).",
-                            { "import cpp" });
-            return false;
+            /*
+             * Same target, spelled with more precision on Clang's side (an OS version, extra pointer
+             * specs). Adopting the destination's spelling keeps IRMover from warning about it; a
+             * genuinely different architecture or OS is an error, not something to paper over.
+             * Compared against the triple this compile has CHOSEN, not module->getTargetTriple(): the
+             * main module carries no triple until native emission, which happens long after this link,
+             * so the old comparison never ran on the normal -o path.
+             */
+            const llvm::Triple want(CInteropTargetTriple());
+            const llvm::Triple& have = companion->getTargetTriple();
+            if (have.getArch() != want.getArch() || have.getOS() != want.getOS())
+            {
+                LogErrorMessage("{}: the C++ definitions emitted for an imported header target "
+                                "'{}', but this program targets '{}'.",
+                                { "import cpp", have.str(), want.str() });
+                return false;
+            }
+            if (!module->getTargetTriple().str().empty()) companion->setTargetTriple(module->getTargetTriple());
+            /*
+             * The data layout is a CHECK, not an override. The main module's Darwin layout is a short
+             * hand-written string and Clang's is the full arm64-apple one, so a textual difference is
+             * expected; what must agree is the machine contract the two modules were built against.
+             * Adopting the destination's spelling afterwards keeps IRMover quiet.
+             */
+            if (!module->getDataLayoutStr().empty())
+            {
+                const llvm::DataLayout& mine = module->getDataLayout();
+                const llvm::DataLayout& theirs = companion->getDataLayout();
+                if (mine.isLittleEndian() != theirs.isLittleEndian()
+                    || mine.getPointerSizeInBits() != theirs.getPointerSizeInBits()
+                    || mine.getIndexSizeInBits(0) != theirs.getIndexSizeInBits(0))
+                {
+                    LogErrorMessage("{}: the C++ definitions emitted for an imported header were built "
+                                    "for data layout '{}', which does not match this program's '{}'.",
+                                    { "import cpp", companion->getDataLayoutStr(),
+                                      module->getDataLayoutStr() });
+                    return false;
+                }
+                if (verbose && companion->getDataLayoutStr() != module->getDataLayoutStr())
+                    std::cout << std::format("[verbose] C++ companion data layout '{}' adopted as '{}'\n",
+                                             companion->getDataLayoutStr(), module->getDataLayoutStr());
+                companion->setDataLayout(module->getDataLayout());
+            }
+
+            if (verbose)
+                std::cout << std::format("[verbose] linking C++ companion module ({} bytes of bitcode)\n",
+                                         blob.size());
+            DeclareLinkOnceDefinitions(*companions, *companion);
+            if (llvm::Linker::linkModules(*companions, std::move(companion), llvm::Linker::Flags::None))
+            {
+                LogErrorMessage("{}: the C++ definitions emitted for an imported header could not be "
+                                "linked into this program (conflicting module flags or symbols).",
+                                { "import cpp" });
+                return false;
+            }
         }
-    }
+        return true;
+    };
+    if (!mergeAdoptedBlobs()) return false;
+    // A body the program calls that only a layout-only request bound: upgrade its owner.
+    while (UpgradeCxxAssumedBodyOwners(*companions))
+        if (!mergeAdoptedBlobs()) return false;
+    if (blobCount == 0) return true;
+
+    // Everything defined right now is PROGRAM-origin: cflat's own code plus whatever earlier
+    // companions contributed. What the link below adds on top is companion-origin, and only
+    // those get the internalize treatment (see the loop after the link).
+    std::unordered_set<std::string> programOrigin;
+    for (const llvm::GlobalValue& gv : module->global_values())
+        if (!gv.isDeclaration() && gv.hasName()) programOrigin.insert(gv.getName().str());
 
     const size_t companionDefinitions = CountDefinitions(*companions);
     const size_t programDefinitionsBefore = CountDefinitions(*module);
@@ -2880,7 +2931,7 @@ bool LLVMBackend::LinkCxxCompanionModules()
     if (verbose)
         std::cout << std::format("[verbose] C++ companion link: {} blob(s), {} merged "
                                  "definition(s), {} linked into the program\n",
-                                 blobs.size(), companionDefinitions,
+                                 blobCount, companionDefinitions,
                                  CountDefinitions(*module) - programDefinitionsBefore);
 
     // Companion TUs are emitted at Clang's O1 with LLVM passes disabled, so frontend attributes
@@ -2957,6 +3008,8 @@ bool LLVMBackend::EmitExecutableElf(const std::string& exePath, bool debugInfo,
         llvm::InitializeAllTargets();
         llvm::InitializeAllTargetMCs();
         llvm::InitializeAllAsmPrinters();
+        // Inline asm in cached companion IR needs the MC asm parser; clang only registers it on a cold run.
+        llvm::InitializeAllAsmParsers();
 
         const std::string triple = llvm::sys::getProcessTriple(); // e.g. x86_64-unknown-linux-gnu
         module->setTargetTriple(llvm::Triple(triple));
@@ -3190,6 +3243,8 @@ bool LLVMBackend::EmitExecutableMachO(const std::string& exePath, bool debugInfo
         llvm::InitializeAllTargets();
         llvm::InitializeAllTargetMCs();
         llvm::InitializeAllAsmPrinters();
+        // Inline asm in cached companion IR needs the MC asm parser; clang only registers it on a cold run.
+        llvm::InitializeAllAsmParsers();
 
         // Versioned triple (min macOS 11.0, the Apple Silicon baseline) so the
         // emitted Mach-O carries an LC_BUILD_VERSION load command; without a
@@ -3554,6 +3609,8 @@ bool LLVMBackend::EmitExecutable(const std::string& exePath, const std::string& 
         llvm::InitializeAllTargets();
         llvm::InitializeAllTargetMCs();
         llvm::InitializeAllAsmPrinters();
+        // Inline asm in cached companion IR needs the MC asm parser; clang only registers it on a cold run.
+        llvm::InitializeAllAsmParsers();
 
         module->setTargetTriple(llvm::Triple(triple));
 
@@ -4061,6 +4118,7 @@ bool LLVMBackend::JitRun(int& runExitCode)
         // targets for cross-codegen; for in-process JIT only the host target is required).
         llvm::InitializeNativeTarget();
         llvm::InitializeNativeTargetAsmPrinter();
+        llvm::InitializeNativeTargetAsmParser();
 
         if (!module->getFunction("main"))
         {

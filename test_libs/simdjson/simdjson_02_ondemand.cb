@@ -1,6 +1,5 @@
 // GUARDS: simdjson On-Demand overload and result specialization bindings
 // FROM: scratch/simdjson_spike/o1.cb scratch/simdjson_spike/o2.cb scratch/simdjson_spike/o3.cb scratch/simdjson_spike/o4.cb scratch/simdjson_spike/o5.cb scratch/simdjson_spike/o6.cb scratch/simdjson_spike/o7.cb scratch/simdjson_spike/o8.cb
-// DISABLED: internal/issue/p3/cpp-type-spelled-through-namespace-alias-is-a-different-type.md internal/issue/p3/cpp-simdjson-result-member-at-binds-wrong-specialization.md
 import cpp "simdjson.h";
 extern int printf(const char* fmt, ...);
 extern int main()
@@ -50,7 +49,7 @@ extern int main()
     if (r7.value() != 42) { printf("FAIL o7: got %lld want 42\n", r7.value()); failures |= 64; }
 
     simdjson.ondemand.parser p8 = default;
-    simdjson.padded_string j8 = simdjson.padded_string("{\"k\":[1,2,42]}", 14);
+    simdjson.padded_string j8 = simdjson.padded_string("{{\"k\":[1,2,42]}}", 14);
     simdjson.padded_string_view v8 = (simdjson.padded_string_view)j8;
     simdjson.simdjson_result<simdjson.ondemand.document> d8 = p8.iterate(v8);
     simdjson.simdjson_result<i64> r8 = d8.find_field("k").at(2).get_int64();

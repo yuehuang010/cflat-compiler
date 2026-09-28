@@ -1,6 +1,5 @@
 // GUARDS: nlohmann JSON object construction by keyed assignment
 // FROM: scratch/probe3/j03_assign_key.cb
-// DISABLED: internal/plan/converting-constructors.md
 import cpp "nlohmann/json.hpp";
 extern int printf(const char* fmt, ...);
 extern int main()

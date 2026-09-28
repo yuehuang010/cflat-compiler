@@ -19,5 +19,38 @@ extern int main()
         int x = 4;
         cppcr.RRefPair bad = cppcr.RRefPair(c, x);
     }
+    // A different scalar type is clang's refusal through the forwarding thunk.
+    expect_error("has no constructor that binds these arguments (clang: no matching constructor") {
+        char c = 7;
+        cppcr.SignedCharRef bad = cppcr.SignedCharRef(c);
+    }
+    expect_error("has no constructor that binds these arguments (clang: no matching constructor") {
+        int i = 7;
+        cppcr.LongRef bad = cppcr.LongRef(i);
+    }
+    // Expression position: a `long` lvalue is not a `long long` lvalue (clang refuses it too).
+    expect_error("has no constructor that binds these arguments (clang: no matching constructor") {
+        long l = 5;
+        int v = cppcr.LongLongRefOnly(l).v;
+    }
+    // A deleted, private or protected constructor stays in clang's candidate set: the `int&`
+    // pick is refused with clang's own diagnostic, never replaced by `const long&`.
+    expect_error("has no constructor that binds these arguments (clang: call to deleted constructor") {
+        int i = 5;
+        int v = cppcr.DelOrConst(i).chosen;
+    }
+    expect_error("has no constructor that binds these arguments (clang: calling a private constructor") {
+        int i = 5;
+        int v = cppcr.PrivOrConst(i).chosen;
+    }
+    expect_error("has no constructor that binds these arguments (clang: calling a protected constructor") {
+        int i = 5;
+        int v = cppcr.ProtOrConst(i).chosen;
+    }
+    expect_error("no overload of 'take' matches") {
+        cppcr.OrdinarySignedCharCall call = cppcr.OrdinarySignedCharCall();
+        char c = 7;
+        call.take(c);
+    }
     return 0;
 }

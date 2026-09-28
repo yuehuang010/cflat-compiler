@@ -21,7 +21,152 @@
 
 namespace cppi
 {
+    struct IntrinsicMemberNames
+    {
+        bool is_string() const noexcept { return true; }
+        int __popcount(int value) const noexcept { return value + 91; }
+    };
+
     inline long cpp_std() noexcept { return __cplusplus; }
+
+    struct NuaEmpty {};
+    struct NuaOtherEmpty {};
+    struct NuaMiddle
+    {
+        char prefix;
+        [[no_unique_address]] NuaEmpty empty;
+        int later;
+    };
+    struct NuaBitfield
+    {
+        [[no_unique_address]] NuaEmpty empty;
+        unsigned bits : 3;
+        int later;
+    };
+    struct NuaFirst
+    {
+        [[no_unique_address]] NuaEmpty empty;
+        int later;
+    };
+    struct NuaLast
+    {
+        int later;
+        [[no_unique_address]] NuaEmpty empty;
+    };
+    struct NuaSame
+    {
+        [[no_unique_address]] NuaEmpty first;
+        [[no_unique_address]] NuaEmpty second;
+        int later;
+    };
+    struct NuaDifferent
+    {
+        [[no_unique_address]] NuaEmpty first;
+        [[no_unique_address]] NuaOtherEmpty second;
+        int later;
+    };
+#pragma pack(push, 2)
+    struct NuaPackedGuard
+    {
+        char lead;
+        int later;
+    };
+#pragma pack(pop)
+    struct NuaBase
+    {
+        [[no_unique_address]] NuaEmpty empty;
+        int base_later;
+    };
+    struct NuaDerived : NuaBase
+    {
+        int later;
+    };
+    template<class T> struct NuaBox
+    {
+        [[no_unique_address]] T alloc;
+        int later;
+    };
+    using NuaTemplate = NuaBox<NuaEmpty>;
+    inline int nua_read_middle(const NuaMiddle* value) noexcept { return value->later; }
+    inline int nua_read_same(const NuaSame* value) noexcept
+    {
+        return &value->first != &value->second ? value->later : -1;
+    }
+    inline int nua_read_different(const NuaDifferent* value) noexcept { return value->later; }
+    inline int nua_read_derived(const NuaDerived* value) noexcept
+    {
+        return value->base_later + value->later;
+    }
+    inline int nua_read_template(const NuaTemplate* value) noexcept { return value->later; }
+    inline long nua_size_middle() noexcept { return sizeof(NuaMiddle); }
+    inline long nua_size_first() noexcept { return sizeof(NuaFirst); }
+    inline long nua_size_last() noexcept { return sizeof(NuaLast); }
+    inline long nua_size_same() noexcept { return sizeof(NuaSame); }
+    inline long nua_size_different() noexcept { return sizeof(NuaDifferent); }
+    inline long nua_size_derived() noexcept { return sizeof(NuaDerived); }
+    inline long nua_size_template() noexcept { return sizeof(NuaTemplate); }
+    inline NuaMiddle nua_return_middle(int later) noexcept
+    {
+        NuaMiddle value{};
+        value.later = later;
+        return value;
+    }
+    // [[no_unique_address]] next to bitfields and inside anonymous members.
+    struct NuaBitUnits
+    {
+        [[no_unique_address]] NuaEmpty empty;
+        unsigned a : 20;
+        unsigned b : 20;
+        int g;
+        [[no_unique_address]] NuaOtherEmpty tail;
+        unsigned c : 7;
+    };
+    struct NuaAnon
+    {
+        int x;
+        struct { [[no_unique_address]] NuaEmpty e; int y; };
+        union { [[no_unique_address]] NuaEmpty u; short s; };
+        int z;
+    };
+    struct NuaAnonBits
+    {
+        int x;
+        struct { [[no_unique_address]] NuaEmpty e; unsigned a : 5; };
+        int z;
+    };
+    // Still refused: the NUA member ends the bitfield run, so `b` starts a byte later.
+    struct NuaBitBetween
+    {
+        unsigned a : 3;
+        [[no_unique_address]] NuaEmpty empty;
+        unsigned b : 3;
+        int y;
+    };
+    inline long nua_read_bitfield(const NuaBitfield* v) noexcept { return v->bits * 1000L + v->later; }
+    inline long nua_bitfield_by_value(NuaBitfield v) noexcept { return v.bits * 1000L + v.later; }
+    inline NuaBitfield nua_make_bitfield(unsigned bits, int later) noexcept
+    {
+        NuaBitfield v{};
+        v.bits = bits;
+        v.later = later;
+        return v;
+    }
+    inline long nua_bit_units(NuaBitUnits v) noexcept
+    {
+        return (long)v.a * 10000 + v.b * 1000 + v.g * 10 + v.c;
+    }
+    inline NuaBitUnits nua_make_bit_units() noexcept
+    {
+        NuaBitUnits v{};
+        v.a = 999999; v.b = 7; v.g = -2; v.c = 100;
+        return v;
+    }
+    inline long nua_anon(NuaAnon v) noexcept { return v.x * 1000000L + v.y * 10000 + v.s * 100 + v.z; }
+    inline long nua_anon_bits(NuaAnonBits v) noexcept { return v.x * 10000L + v.a * 100 + v.z; }
+    inline long nua_size_bitfield() noexcept { return sizeof(NuaBitfield); }
+    inline long nua_size_bit_units() noexcept { return sizeof(NuaBitUnits); }
+    inline long nua_size_anon() noexcept { return sizeof(NuaAnon); }
+    inline long nua_size_anon_bits() noexcept { return sizeof(NuaAnonBits); }
 
     // Overload pair. The double leg adds 1000 so the SELECTED overload is observable
     // from the return value alone.
@@ -108,6 +253,31 @@ namespace cppi
         long v;
         NullDefaulted(std::nullptr_t = nullptr) noexcept : v(7) {}
         long get() const noexcept { return v; }
+    };
+
+    // Default constructors callable with no arguments only through a C++ default argument
+    // cflat cannot pass: an unmappable parameter type, or a non-constant default expression.
+    template <class A = std::allocator<char>>
+    struct DefArgAlloc
+    {
+        long v;
+        explicit DefArgAlloc(const A& a = A()) noexcept : v(31) {}
+        long get() const noexcept { return v; }
+    };
+    using DefArgBuf = DefArgAlloc<>;
+    inline int defarg_seven() noexcept { return 7; }
+    struct DefArgNonConst
+    {
+        long v;
+        DefArgNonConst(int x = defarg_seven()) noexcept : v(x + 10) {}
+        long get() const noexcept { return v; }
+    };
+    struct DefArgOwned
+    {
+        std::unique_ptr<long> p;
+        DefArgOwned(const std::allocator<char>& a = {}, const std::allocator<int>& b = {})
+            : p(new long(33)) {}
+        long get() const noexcept { return p ? *p : -1; }
     };
 
     struct IntPick
@@ -297,6 +467,49 @@ namespace cppi
     };
     inline Later Earlier::to_later() const noexcept { return Later{a, a + 1, a + 2}; }
     inline Earlier::operator Later() const noexcept { return Later{a, a, a}; }
+
+    // simdjson's `parser.iterate(padded_string&)`: the argument reaches the parameter only through
+    // `operator UdcView()`, and the callee returns a class that is NOT trivially copyable but has a
+    // trivial destructor (no destructor symbol). The generated conversion wrapper must still bind.
+    class UdcView;
+    struct UdcStr { const char* p = "abc"; unsigned long n = 3; operator UdcView() const noexcept; };
+    class UdcView : public std::string_view
+    {
+    public:
+        UdcView() noexcept = default;
+        UdcView(const char* s, unsigned long n) noexcept : std::string_view(s, n) {}
+        UdcView(int k) noexcept : std::string_view("abcdefg", (unsigned long)k) {}
+    };
+    inline UdcStr::operator UdcView() const noexcept { return UdcView(p, n); }
+    // User operator= only.
+    struct UdcResA { int first = 0; UdcResA() = default; UdcResA(const UdcResA&) = default;
+                     UdcResA& operator=(const UdcResA& o) { first = o.first; return *this; } };
+    // Nontrivial std base: libc++ std::pair has a user-provided operator= (simdjson_result_base).
+    struct UdcResB : protected std::pair<int, int>
+    {
+        UdcResB() : std::pair<int, int>(0, 0) {}
+        int get() const { return first; }
+        void set(int v) { first = v; }
+    };
+    // User copy constructor that marks a copy: an unelided copy reads first + 100.
+    struct UdcResC { int first = 0; UdcResC() = default; UdcResC(const UdcResC& o) : first(o.first + 100) {} };
+    // Polymorphic, implicit (trivial) destructor.
+    struct UdcResV { int first = 0; virtual int kind() const { return 7; } };
+    // Private destructor, befriended by the parser only: the conversion wrapper cannot return it.
+    struct UdcParser;
+    struct UdcResP { int first = 0; friend struct UdcParser; private: ~UdcResP() {} };
+    struct UdcParser
+    {
+        UdcResA a(UdcView v) { UdcResA r; r.first = (int)v.size(); return r; }
+        UdcResB b(UdcView v) { UdcResB r; r.set((int)v.size()); return r; }
+        UdcResC c(UdcView v) { UdcResC r; r.first = (int)v.size(); return r; }
+        UdcResV v(UdcView x) { UdcResV r; r.first = (int)x.size(); return r; }
+        UdcResP p(UdcView x);
+    };
+    inline UdcResP UdcParser::p(UdcView x) { UdcResP r; r.first = (int)x.size(); return r; }
+    inline UdcResA udc_fa(UdcView v) { UdcResA r; r.first = (int)v.size(); return r; }
+    inline UdcResB udc_fb(UdcView v) { UdcResB r; r.set((int)v.size()); return r; }
+    inline UdcResV udc_fv(UdcView v) { UdcResV r; r.first = (int)v.size(); return r; }
 
     class PrivateDefaultArg
     {
@@ -561,11 +774,17 @@ namespace cppi
         int value() const noexcept;
         // Lets a class template over Tracked instantiate an equality member (M5b).
         bool operator==(const Tracked& other) const noexcept;
+        // `?:` arm shapes: a chained call and an operator returning the class by value.
+        Tracked twice() const noexcept { return Tracked(payload * 2); }
 
         int payload;
 
     private:
     };
+    inline Tracked operator+(const Tracked& a, const Tracked& b) noexcept
+    {
+        return Tracked(a.payload + b.payload);
+    }
 
     class TrackedBase
     {
@@ -683,6 +902,41 @@ namespace cppi
     int take_rvalue(Tracked&& t) noexcept;
     int take_ref(const Tracked& t) noexcept;
     const Tracked& tracked_ref() noexcept;
+    // `auto x = <lvalue>` sources (7300-7329): a mutable reference return, and a holder whose
+    // field is reached directly, through a pointer and through reference accessors.
+    inline Tracked& tracked_mut_ref() noexcept { static Tracked value(813); return value; }
+    // A vector of a nontrivial class returned by value (7363-7365).
+    inline std::vector<Tracked> make_tracked_vec() noexcept
+    {
+        std::vector<Tracked> v;
+        v.reserve(2);
+        v.emplace_back(130);
+        v.emplace_back(131);
+        return v;
+    }
+    // Implicit copy constructors (7350-7353): a user destructor alone leaves the copy implicit
+    // and trivial (no symbol to call); `= default` spells the same.
+    inline int implicit_copy_dtors = 0;
+    struct ImplicitCopy
+    {
+        int v;
+        explicit ImplicitCopy(int x) noexcept : v(x) {}
+        ~ImplicitCopy() { implicit_copy_dtors++; }
+    };
+    struct DefaultedCopy
+    {
+        int v;
+        explicit DefaultedCopy(int x) noexcept : v(x) {}
+        DefaultedCopy(const DefaultedCopy&) = default;
+        ~DefaultedCopy() { implicit_copy_dtors++; }
+    };
+    struct TrackedHolder
+    {
+        Tracked t;
+        explicit TrackedHolder(int v) noexcept : t(v) {}
+        Tracked& get() noexcept { return t; }
+        const Tracked& cget() const noexcept { return t; }
+    };
     // A MUTABLE class reference return. A CFlat pointer local binds to the REFERENT, so a write
     // through that pointer is visible to the next call - a copy would hide it.
     struct RefCell { int v; };
@@ -1188,3 +1442,404 @@ namespace cppi
 extern int cppi_nsobj_global;   // global-scope C++ object: no mangling at all
 
 extern "C" int cppi_c_linkage(int v) noexcept;
+
+namespace cppi
+{
+    inline long rrefLongValue = 101;
+    inline int rrefIntValue = 23;
+    inline size_t rrefSizeValue = 31;
+    inline double rrefDoubleValue = 4.5;
+    inline bool rrefBoolValue = false;
+    inline char rrefCharValue = 'Q';
+    inline int rrefPointerTarget = 29;
+    inline int* rrefPointerValue = &rrefPointerTarget;
+    enum class RrefEnum : int { Value = 17 };
+    inline RrefEnum rrefEnumValue = RrefEnum::Value;
+
+    inline long&& rref_long() { return std::move(rrefLongValue); }
+    inline int&& rref_int() { return std::move(rrefIntValue); }
+    inline size_t&& rref_size() { return std::move(rrefSizeValue); }
+    inline double&& rref_double() { return std::move(rrefDoubleValue); }
+    inline bool&& rref_bool() { return std::move(rrefBoolValue); }
+    inline char&& rref_char() { return std::move(rrefCharValue); }
+    inline int*&& rref_pointer() { return std::move(rrefPointerValue); }
+    inline RrefEnum&& rref_enum() { return std::move(rrefEnumValue); }
+    inline const long&& rref_const_long() { return std::move(rrefLongValue); }
+    inline long& rref_lvalue_long() { return rrefLongValue; }
+    inline long rref_by_value(long value) { return value + 3; }
+
+    template <class U> inline U&& rref_move_impl(U& value) { return std::move(value); }
+    template <class U> inline U&& rref_forward_impl(U&& value) { return std::forward<U>(value); }
+    inline long&& rref_template_move() { return rref_move_impl(rrefLongValue); }
+    inline long&& rref_template_forward()
+    { return rref_forward_impl(std::move(rrefLongValue)); }
+    inline std::optional<size_t> rref_optional()
+    { return std::optional<size_t>(rrefSizeValue); }
+
+    struct RrefScalar
+    {
+        long value = 41;
+        long&& member_long() { return std::move(value); }
+        long&& qualified_long() && { return std::move(value); }
+        const long&& const_member_long() const { return std::move(value); }
+        static long staticValue;
+        static long&& static_long() { return std::move(staticValue); }
+    };
+    inline long RrefScalar::staticValue = 53;
+    inline RrefScalar rref_make_scalar() { return RrefScalar(); }
+}
+
+namespace cppi_inh
+{
+    struct StaticGrand
+    {
+        static int K() { return 71; }
+    };
+    struct StaticBase : StaticGrand {};
+    struct StaticDerived : StaticBase {};
+    struct StaticHidden : StaticBase
+    {
+        static int K() { return 83; }
+    };
+    struct StaticPrivateBase
+    {
+    private:
+        static int K() { return 97; }
+    };
+    struct StaticPrivateDerived : StaticPrivateBase {};
+    struct StaticProtectedBase
+    {
+    protected:
+        static int K() { return 101; }
+    };
+    struct StaticProtectedDerived : StaticProtectedBase {};
+
+    template <class D> struct StaticCrtpBase
+    {
+        static int Identity() { return 109; }
+    };
+    template <class T, int N> struct StaticMat : StaticCrtpBase<StaticMat<T, N>> {};
+    using StaticMat3 = StaticMat<double, 3>;
+
+    // Eigen shape: the static lives two CRTP levels up and returns a specialization nothing
+    // requested at import, so the base refuses it until the derived-name use retries it.
+    template <class D> struct StaticExprResult
+    {
+        int value = 0;
+        int get() const { return value; }
+    };
+    template <class D> struct StaticExprMatBase
+    {
+        static StaticExprResult<D> Identity() { StaticExprResult<D> r; r.value = 127; return r; }
+    };
+    template <class D> struct StaticExprPlain : StaticExprMatBase<D> {};
+    struct StaticExprLeaf : StaticExprPlain<StaticExprLeaf> { int x = 0; };
+
+    template <class D> struct OperatorBase
+    {
+        D operator+(const D& rhs) const
+        {
+            D result;
+            result.value = static_cast<const D*>(this)->value + rhs.value;
+            return result;
+        }
+        bool operator==(const D& rhs) const
+        { return static_cast<const D*>(this)->value == rhs.value; }
+        int operator[](int index) const
+        { return static_cast<const D*>(this)->value + index; }
+        D& operator+=(int amount)
+        {
+            static_cast<D*>(this)->value += amount;
+            return *static_cast<D*>(this);
+        }
+    };
+    struct OperatorValue : OperatorBase<OperatorValue>
+    {
+        int value = 0;
+        OperatorValue() = default;
+        OperatorValue(int v) : value(v) {}
+    };
+    struct OperatorPadding { long pad = 0; };
+    struct OperatorNonFirst : OperatorPadding, OperatorBase<OperatorNonFirst>
+    {
+        int value = 0;
+        OperatorNonFirst() = default;
+        OperatorNonFirst(int v) : value(v) {}
+    };
+    struct OperatorHidden : OperatorBase<OperatorHidden>
+    {
+        int value = 0;
+        OperatorHidden() = default;
+        OperatorHidden(int v) : value(v) {}
+        OperatorHidden operator+(const OperatorHidden& rhs) const
+        { return OperatorHidden(value + rhs.value + 1000); }
+    };
+    struct OperatorHidingBase
+    {
+        int value = 0;
+        OperatorHidingBase operator+(const OperatorHidingBase& rhs) const
+        { return OperatorHidingBase{value + rhs.value}; }
+    };
+    struct OperatorHiddenDifferent : OperatorHidingBase
+    {
+        OperatorHiddenDifferent() = default;
+        OperatorHiddenDifferent(int v) { value = v; }
+        OperatorHiddenDifferent operator+(int rhs) const
+        {
+            OperatorHiddenDifferent result;
+            result.value = value + rhs + 1000;
+            return result;
+        }
+    };
+    struct OperatorNameHidingBase
+    {
+        int value = 0;
+        OperatorNameHidingBase operator+(const OperatorNameHidingBase& rhs) const
+        { return OperatorNameHidingBase{value + rhs.value}; }
+    };
+    struct OperatorNameHiding : OperatorNameHidingBase
+    {
+        OperatorNameHiding operator+(int rhs) const
+        {
+            OperatorNameHiding result;
+            result.value = value + rhs;
+            return result;
+        }
+    };
+    struct OperatorNameUsing : OperatorNameHidingBase
+    {
+        using OperatorNameHidingBase::operator+;
+        OperatorNameUsing operator+(int rhs) const
+        {
+            OperatorNameUsing result;
+            result.value = value + rhs + 1000;
+            return result;
+        }
+    };
+    template <class D> struct OtherOperatorBase
+    {
+        D operator+(const D& rhs) const
+        {
+            D result;
+            result.value = static_cast<const D*>(this)->value + rhs.value + 2000;
+            return result;
+        }
+    };
+    struct OperatorAmbiguous : OperatorBase<OperatorAmbiguous>, OtherOperatorBase<OperatorAmbiguous>
+    {
+        int value = 0;
+        OperatorAmbiguous() = default;
+        OperatorAmbiguous(int v) : value(v) {}
+    };
+}
+
+// Eigen shape: a CRTP base whose operator+ and static return expression templates (with a user
+// copy constructor, so they never cross by value), and nontrivially-copyable targets that take
+// them through a `const Base<D>&` constructor TEMPLATE - converting, or explicit-only.
+namespace cppi_expr
+{
+    template <class L, class R> struct SumExpr;
+    template <class D> struct FillExpr;
+    template <class D> struct VecBase
+    {
+        const D& derived() const { return *static_cast<const D*>(this); }
+        SumExpr<D, D> operator+(const D& rhs) const { return SumExpr<D, D>(derived(), rhs); }
+        static FillExpr<D> Ones() { return FillExpr<D>(1.0); }
+    };
+    template <class L, class R> struct SumExpr : VecBase<SumExpr<L, R>>
+    {
+        const L& lhs;
+        const R& rhs;
+        SumExpr(const L& l, const R& r) : lhs(l), rhs(r) {}
+        SumExpr(const SumExpr& other) : lhs(other.lhs), rhs(other.rhs) {}
+        double coeff(int i) const { return lhs.coeff(i) + rhs.coeff(i); }
+    };
+    template <class D> struct FillExpr : VecBase<FillExpr<D>>
+    {
+        double fill;
+        explicit FillExpr(double f) : fill(f) {}
+        FillExpr(const FillExpr& other) : fill(other.fill) {}
+        double coeff(int) const { return fill; }
+    };
+    struct Vec3 : VecBase<Vec3>
+    {
+        double v[3] = { 0.0, 0.0, 0.0 };
+        Vec3() = default;
+        Vec3(double a, double b, double c) : v{ a, b, c } {}
+        Vec3(const Vec3& other) : v{ other.v[0], other.v[1], other.v[2] } {}
+        Vec3& operator=(const Vec3& other)
+        {
+            for (int i = 0; i < 3; ++i) v[i] = other.v[i];
+            return *this;
+        }
+        template <class D> Vec3(const VecBase<D>& other)
+        {
+            for (int i = 0; i < 3; ++i) v[i] = other.derived().coeff(i);
+        }
+        double coeff(int i) const { return v[i]; }
+        double sum() const { return v[0] + v[1] + v[2]; }
+    };
+    struct ExplicitVec3
+    {
+        double total = 0.0;
+        ExplicitVec3(const ExplicitVec3& other) : total(other.total) {}
+        template <class D> explicit ExplicitVec3(const VecBase<D>& other)
+        {
+            for (int i = 0; i < 3; ++i) total += other.derived().coeff(i);
+        }
+        double sum() const { return total; }
+    };
+}
+
+// A function template body odr-uses static constexpr members of an explicit specialization that
+// nothing binds, so only that reference can get their storage emitted into the companion module
+// (libc++ std::format's __bool_strings<char>::__true linked undefined the same way).
+namespace cppi
+{
+    struct PtrArgClass
+    {
+        int value = 0;
+        PtrArgClass(const int* p) : value(p == nullptr ? 44 : *p + 20) {}
+    };
+    inline int ptrarg_int(int value) noexcept { return value; }
+    inline int ptrarg_int_ref(int& value) noexcept { return value; }
+    inline int ptrarg_const_int_ref(const int& value) noexcept { return value; }
+    inline int ptrarg_bool(bool value) noexcept { return value ? 9700 : 9701; }
+    inline int ptrarg_bool_ref(bool& value) noexcept { value = true; return 9702; }
+    inline int ptrarg_const_bool_ref(const bool& value) noexcept { return value ? 9703 : 9704; }
+    inline int ptrarg_class_ref(PtrArgClass& value) noexcept { return value.value; }
+    inline int ptrarg_const_class_ref(const PtrArgClass& value) noexcept { return value.value; }
+    inline int ptrarg_class_value(PtrArgClass value) noexcept { return value.value; }
+    inline int ptrarg_class_or_bool(PtrArgClass value) noexcept { return value.value; }
+    inline int ptrarg_class_or_bool(bool& value) noexcept { value = true; return 9717; }
+    struct PtrArgHost
+    {
+        int ptrarg_int(int value) const noexcept { return value; }
+        int ptrarg_bool_ref(bool& value) const noexcept { value = true; return 9705; }
+    };
+    template <class T> inline int ptrarg_template_bool(bool value, T) noexcept
+    { return value ? 9706 : 9707; }
+
+    template <class T> struct IvStrings;
+    template <> struct IvStrings<char>
+    {
+        static constexpr long yes = 5;
+        static constexpr long no = 6;
+    };
+    template <class T> inline long iv_pick(T flag)
+    {
+        const long* picked = flag ? &IvStrings<char>::yes : &IvStrings<char>::no;
+        return *picked;
+    }
+}
+
+// Eigen `block` shape: member templates over the count types, with inline users recording the
+// <int, long> and <long, int> specializations. An int-literal call still deduces <int, int>.
+namespace cppi
+{
+    struct MtBlk { long r; long c; };
+    template <class T> struct MtWidth { static const int v = sizeof(T); };
+    template <class T> struct MtMat
+    {
+        T k = 0;
+        template <class R, class C> MtBlk block(long i, long j, R rows, C cols)
+        { return MtBlk{ (long)rows * 10 + MtWidth<R>::v, (long)cols * 10 + MtWidth<C>::v }; }
+        template <class R, class C> MtBlk block(long i, long j, R rows, C cols) const
+        { return MtBlk{ -1, -1 }; }
+        template <int NR, int NC> MtBlk block(long i, long j) { return MtBlk{ NR, NC }; }
+        MtBlk useA() { return block(0, 0, 1, 2L); }
+        MtBlk useB() { return block(0, 0, 1L, 2); }
+        long use() { return useA().r + useB().c; }
+    };
+    typedef MtMat<double> MtMatD;
+}
+
+namespace cppi
+{
+    struct MtRankBase
+    {
+        template<class A, class B> long pick(A, B) { return 5000 + sizeof(A) * 10 + sizeof(B); }
+        long pick(int, int) { return 5007; }
+    };
+    struct MtRankDerived : MtRankBase {};
+    struct MtRank
+    {
+        template<class A> long f(A) { return 100 + sizeof(A); }
+        long f(int) { return 1; }
+        long f(long) { return 2; }
+        template<class A> long h(A) { return 200 + sizeof(A); }
+        long h(double) { return 3; }
+        template<class A, class B> long n(A, B) { return sizeof(A) * 10 + sizeof(B); }
+        long n(int, int) { return 7; }
+        template<class A, class B> static long staticPair(A, B)
+        { return 1000 + sizeof(A) * 10 + sizeof(B); }
+        static long staticPair(int, int) { return 1007; }
+        template<class A> long explicitPick(A) { return 6000 + sizeof(A); }
+        long explicitPick(int) { return 6001; }
+        template<class A> long constrained(A) requires (sizeof(A) == 1)
+        {
+            static_assert(sizeof(A) == 0, "requires-excluded template must not instantiate");
+            return 7000;
+        }
+        long constrained(int) { return 7001; }
+        template<class A> long assertTie(A)
+        {
+            static_assert(sizeof(A) == 0, "non-template exact match should win");
+            return 8000;
+        }
+        long assertTie(int) { return 8001; }
+        template<class T> long body(T value) { return value.invalid(); }
+        long body(int) { return 9001; }
+        template<class T> long deleted(T) = delete;
+        long deleted(int) { return 9002; }
+        template<class T> long ambiguous(T, int) { return 9003; }
+        template<class T> long ambiguous(int, T) { return 9004; }
+        long ambiguous(int, int) { return 9005; }
+        template<class T> long cv(T&) { return 9006; }
+        long cv(const int&) { return 9007; }
+        template<class T> long self(T) { return 9008; }
+        long self(int) const { return 9009; }
+        template<class T> long constReverse(T) const { return 9010; }
+        long constReverse(int) { return 9011; }
+        template<class T> long refPick(T) { return 9020; }
+        long refPick(int& value) { value = 9; return 9021; }
+        template<class T> long constArg(T&) { return 9030; }
+        long constArg(int&) { return 9031; }
+        template<class T> long ptrWrite(T* p) { *p = 5; return 9040; }
+        long ptrWrite(long) { return 9041; }
+        template<class T> long nullPick(T*) { return 9050; }
+        long nullPick(int*) { return 9051; }
+        template<class T> long arrPick(T) { return 9060 + sizeof(T); }
+        long arrPick(int*) { return 9061; }
+        template<class T> long charArrPick(T) { return 9070 + sizeof(T); }
+        long charArrPick(const char*) { return 9071; }
+        // A fixed array reaches a reference parameter as the array itself, not a pointer.
+        template<class T> long arrRef(const T&) { return 9080 + sizeof(T); }
+        long arrRef(long) { return 9081; }
+        template<class T, std::size_t N> long arrExtent(T (&)[N]) { return 9090 + N; }
+        long arrExtent(long) { return 9099; }
+    };
+    inline const MtRank& mt_rank_const_ref(MtRank& value) { return value; }
+    inline const int& mt_rank_const_arg() { static const int value = 1; return value; }
+    // A refused `put(int, const T&)` must not turn an arity miss of the template into a verdict.
+    struct MtNoCopy
+    {
+        MtNoCopy() = default;
+        MtNoCopy(const MtNoCopy&) = delete;
+        MtNoCopy(MtNoCopy&&) = default;
+    };
+    template<class T> struct MtSink
+    {
+        long put(int, const T& value) { T copy = value; return 1; }
+        long put(int, T&&) { return 2; }
+        template<class It> long put(int, It, It) { return 3; }
+    };
+    using MtSinkNoCopy = MtSink<MtNoCopy>;
+    // Member `T *const &` returns: IsCxxConstRef there marks the pointer, not the pointee.
+    struct MtRankPtrs
+    {
+        int* const& intPtr() const { static int value = 1; static int* p = &value; return p; }
+        MtRank* const& rank(MtRank& value) const
+        { static MtRank* p = nullptr; p = &value; return p; }
+    };
+}

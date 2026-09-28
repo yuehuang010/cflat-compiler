@@ -121,6 +121,10 @@ int myFunction(int x, int y, int z)
     return (pair_xy + z) * (pair_xy + z + 1) / 2 + z;
 }
 
+struct AsaPt { int x = 0; int y = 0; };
+int asaPtSum(AsaPt p) { return p.x * 10 + p.y; }
+int asaApply(function<int(int)> fn, int v) { return fn(v); }
+
 bool testNamedParameters()
 {
     bool result = true;
@@ -129,6 +133,21 @@ bool testNamedParameters()
     result &= Test("OutOfOrderName", myFunction(y:2, z : 3, x : 1), expected);
     result &= Test("MixedInOrder", myFunction(x:1, y : 2, 3), expected);
     result &= Test("MixedOutOfOrder", myFunction(z:3, 1, 2), expected);
+
+    // Accept-set for ruling 2026-09-27 (an assignment used directly as a call argument is
+    // refused): these neighbours hold no assignment in argument position and stay legal.
+    int asaK = 3;
+    result &= Test("asa_eq_compare_arg", myFunction(asaK == 3 ? 1 : 0, asaK != 3 ? 0 : 2, 3), expected);
+    result &= Test("asa_le_ge_arg", myFunction(asaK <= 3 ? 1 : 0, asaK >= 4 ? 0 : 2, 3), expected);
+    result &= Test("asa_named_arg_expr", myFunction(z: asaK, y: asaK - 1, x: asaK - 2), expected);
+    result &= Test("asa_postinc_arg", myFunction(asaK++ - 2, 2, 3), expected);
+    result &= Test("asa_postinc_arg_after", asaK, 4);
+    result &= Test("asa_lambda_body_assign", asaApply((int v) => { int w = 0; w += v; return w * 2; }, 4), 8);
+    result &= Test("asa_brace_field_init", asaPtSum({x = 4, y = 5}), 45);
+    result &= Test("asa_named_brace_field_init", asaPtSum(p: {x = 6, y = 7}), 67);
+    int asaSum = 0;
+    for (int k = asaPtSum({x = 0, y = 1}); k < 3; k += 1) asaSum = asaSum + k;
+    result &= Test("asa_for_header_call", asaSum, 3);
 
     return result;
 }
@@ -4665,6 +4684,9 @@ extern int main()
     total++; passed += testStaticLocals()                  ? 1 : 0;
     total++; passed += testDirectVoidCallDiscarded()       ? 1 : 0;
     total++; passed += testParenLvalueStore()              ? 1 : 0;
+    total++; passed += testPostfixInDeclaration()          ? 1 : 0;
+    total++; passed += testPostfixConditional()            ? 1 : 0;
+    total++; passed += testPostfixGenericInstantiation()   ? 1 : 0;
     printf("%d/%d tests passed.\n", passed, total);
     return passed == total ? 0 : 1;
 }
@@ -6484,5 +6506,123 @@ bool testParenLvalueStore()
     int* vdIdxTyped = (int*)vdIdxBack;
     result &= Test("plv_void_double_ptr_index", (*vdIdxTyped), 71);
 
+    return result;
+}
+
+/*
+ * Postfix ++/-- side effects land at the end of their FULL EXPRESSION, as in C. Pre-fix a
+ * declaration initializer never flushed them: `int r = f(c++); int d = c;` read d == 1 (the store
+ * landed at the next expression statement or scope end), and `(c++)` flushed BEFORE its value was
+ * read (yielded 2). Every leg reads the operand in a LATER declaration, the shape that discriminates.
+ */
+int pfaId(int x) { return x; }
+T pfaGid<T>(T x) { return x; }
+int pfaApply(int x, function<int(int)> f) { return f(x); }
+struct PfaBox { int n = default; };
+(int, int) pfaPair(int a) { return (a, a + 10); }
+int pfaRetDecl(int c) { int r = pfaId(c++); return r * 100 + c; }
+
+bool testPostfixInDeclaration()
+{
+    bool result = true;
+    { int c = 1; int r = c++; int d = c; result &= Test("pfa_plain_decl", d * 10 + r, 21); }
+    { int c = 1; int r = pfaId(c++); int d = c; result &= Test("pfa_call_arg_decl", d * 10 + r, 21); }
+    { int c = 1; int r = pfaId(c--); int d = c; result &= Test("pfa_call_arg_dec", d * 10 + r, 1); }
+    { int c = 1; int r = pfaId(pfaId(c++)); int d = c; result &= Test("pfa_nested_call", d * 10 + r, 21); }
+    { int c = 1; auto r = pfaId(c++); int d = c; result &= Test("pfa_auto_decl", d * 10 + r, 21); }
+    { int c = 1; int r = pfaGid<int>(c++); int d = c; result &= Test("pfa_generic_call", d * 10 + r, 21); }
+    { PfaBox b; b.n = 3; int r = pfaId(b.n++); int d = b.n; result &= Test("pfa_field", d * 10 + r, 43); }
+    { int[3] a = {7, 8, 9}; int* p = &a[0]; int r = *p++; int d = *p; result &= Test("pfa_ptr_star", d * 10 + r, 87); }
+    { int c = 1; int a = pfaId(c++), b = c; result &= Test("pfa_multi_declarator", b * 10 + a, 21); }
+    { int c = 1; int r = c < 0 ? 0 : c++; int d = c; result &= Test("pfa_ternary_false_arm", d * 10 + r, 21); }
+    { int c = 1; int n = 0; for (int k = pfaId(c++); k < 2; k++) { n = c; } result &= Test("pfa_for_init", n, 2); }
+    result &= Test("pfa_return_after_decl", pfaRetDecl(1), 102);
+    { int c = 1; (int x, int y) = pfaPair(c++); int d = c; result &= Test("pfa_destructuring", d * 100 + y * 10 + x, 311); }
+    // Parenthesized postfix yields the OLD value, also through a storage-re-reading consumer.
+    { int c = 1; int r = (c++); int d = c; result &= Test("pfa_paren", d * 10 + r, 21); }
+    { int c = 1; int r = (c++) + (c++); int d = c; result &= Test("pfa_paren_twice", d * 10 + r, 32); }
+    { int[3] a = {7, 8, 9}; int* q = &a[0]; int r = *(q++); int d = *q; result &= Test("pfa_paren_deref", d * 10 + r, 87); }
+    // Pre-fix the lambda body's statement flush emitted the outer `c++` into the invoker
+    // (module verification failed: "Referring to an instruction in another function").
+    { int c = 1; int r = pfaApply(c++, (int v) => { int w = v + 1; return w; }); int d = c; result &= Test("pfa_lambda_arg", d * 10 + r, 22); }
+    return result;
+}
+
+/*
+ * A CONDITIONALLY evaluated operand's postfix ++/-- lands inside its own branch, and a `&&` / `||`
+ * / `?:` condition ends at a sequence point. np = bare `c++`, p = `(c++)`. Legs fail on 9bfb4641
+ * (queued work flushed after the rejoin: an untaken branch still incremented) and/or c7d09afe.
+ */
+int* pfaPick(int* b, int k) { return b; }
+struct PfaQ { int v = default; int get(int k) { return v + k; } };
+
+bool testPostfixConditional()
+{
+    bool result = true;
+    int x = 5;
+    { int c = 1; bool b = false && (c++ > 0); int d = c; result &= Test("pfc_and_np", d, 1); }
+    { int c = 1; bool b = false && ((c++) > 0); int d = c; result &= Test("pfc_and_p", d, 1); }
+    { int c = 1; bool b = true || (c++ > 0); int d = c; result &= Test("pfc_or_np", d, 1); }
+    { int c = 1; bool b = true || ((c++) > 0); int d = c; result &= Test("pfc_or_p", d, 1); }
+    { int c = 1; bool b = true && false && (c++ > 0); int d = c; result &= Test("pfc_and_chain", d, 1); }
+    { int c = 1; int k = 0; if (false && c++ > 0) { k = 1; } int d = c; result &= Test("pfc_if_and_np", d, 1); }
+    { int c = 1; int k = 0; if (true || (c++) > 0) { k = 1; } int d = c; result &= Test("pfc_if_or_p", d, 1); }
+    { int c = 1; bool b = c++ > 0 && c == 2; int d = c; result &= Test("pfc_and_seq_point", d * 10 + (b ? 1 : 0), 21); }
+    { int c = 1; int r = x > 0 ? 0 : c++; int d = c; result &= Test("pfc_tern_false_np", d * 10 + r, 10); }
+    { int c = 1; int r = x > 0 ? 0 : (c++); int d = c; result &= Test("pfc_tern_false_p", d * 10 + r, 10); }
+    { int c = 1; int r = x > 0 ? (c++) : 0; int d = c; result &= Test("pfc_tern_taken_p", d * 10 + r, 21); }
+    { int c = 1; int r = x > 0 ? (x > 9 ? c++ : 0) : c++; int d = c; result &= Test("pfc_tern_nested", d * 10 + r, 10); }
+    { int c = 1; int r = (c++ > 5) ? 1 : 2; int d = c; result &= Test("pfc_tern_cond_p", d * 10 + r, 22); }
+    { int c = 1; int r = c++ > 5 ? 1 : 2; int d = c; result &= Test("pfc_tern_cond_np", d * 10 + r, 22); }
+    { int c = 1; int r = c++ > 0 ? c : 9; int d = c; result &= Test("pfc_tern_seq_point", d * 10 + r, 22); }
+    { int c = 1; int* r = &x ?? pfaPick(&x, c++); int d = c; result &= Test("pfc_coalesce_np", d, 1); }
+    { int c = 1; int* r = &x ?? pfaPick(&x, (c++)); int d = c; result &= Test("pfc_coalesce_p", d, 1); }
+    { int c = 1; int* r = &x; r ??= pfaPick(&x, c++); int d = c; result &= Test("pfc_coalesce_assign_np", d, 1); }
+    { int c = 1; int* r = &x; r ??= pfaPick(&x, (c++)); int d = c; result &= Test("pfc_coalesce_assign_p", d, 1); }
+    { int c = 1; PfaQ* q = nullptr; q?.get(c++); int d = c; result &= Test("pfc_null_cond_np", d, 1); }
+    { int c = 1; PfaQ* q = nullptr; q?.get((c++)); int d = c; result &= Test("pfc_null_cond_p", d, 1); }
+    { int c = 1; PfaQ* q = nullptr; int r = q?.get(c++); int d = c; result &= Test("pfc_null_cond_decl", d * 10 + r, 10); }
+    { int c = 1; PfaQ qq; qq.v = 10; PfaQ* q = &qq; int r = q?.get(c++); int d = c; result &= Test("pfc_null_cond_taken", d * 100 + r, 211); }
+    return result;
+}
+
+/*
+ * A function body compiled mid-expression (a generic's FIRST instantiation) must not flush the
+ * enclosing expression's pending postfix ++/--. Pre-fix (24a56848) its statement flushes emitted
+ * the outer `c++` into the instantiated body: a local failed module verification ("Referring to
+ * an instruction in another function"); a global compiled but incremented on EVERY later call.
+ * Each generic below is instantiated for the first time by its own leg - keep them single-use.
+ */
+T pfgGenDecl<T>(T x) { T k = x; return k; }
+T pfgGenAssign<T>(T x) { T k = x; return k; }
+T pfgGenInfer<T>(T x) { T k = x; return k; }
+T pfgGenRet<T>(T x) { T k = x; return k; }
+T pfgGenInner<T>(T x) { T k = x; return k; }
+T pfgGenOuter<T>(T x) { T k = pfgGenInner<T>(x); return k; }
+T pfgGenGlobal<T>(T x) { T k = x; return k; }
+T pfgGenField<T>(T x) { T k = x; return k; }
+struct PfgS { int b = default; T add<T>(T x) { T k = x; return k; } };
+struct PfgBox<T> { T v = default; U conv<U>() { U k = (U)v; return k; } };
+struct PfgDef<T> { T v = pfgGenField<T>(3); T w = default; };
+PfgDef<T> pfgMkDef<T>(T x) { PfgDef<T> d; d.w = x; return d; }
+int gPfgCounter = 1;
+int pfgRetUse(int c) { return c++ + pfgGenRet<int>(5); }
+
+bool testPostfixGenericInstantiation()
+{
+    bool result = true;
+    { int c = 1; int r = c++ + pfgGenDecl<int>(5); int d = c; result &= Test("pfg_fn_decl", r * 10 + d, 62); }
+    { int c = 1; int r = 0; r = c++ + pfgGenAssign<int>(5); int d = c; result &= Test("pfg_fn_assign", r * 10 + d, 62); }
+    { int c = 1; int r = c++ + pfgGenInfer(5); int d = c; result &= Test("pfg_fn_inferred", r * 10 + d, 62); }
+    result &= Test("pfg_fn_return", pfgRetUse(1), 6);
+    { int c = 3; int r = c-- + pfgGenOuter<int>(5); int d = c; result &= Test("pfg_fn_nested_dec", r * 10 + d, 82); }
+    // Global destination: pre-fix compiled clean but the increment ran inside pfgGenGlobal<int>,
+    // so the second call bumped it again (read 6273).
+    { int r = gPfgCounter++ + pfgGenGlobal<int>(5); int d = gPfgCounter; int r2 = pfgGenGlobal<int>(7); int d2 = gPfgCounter;
+      result &= Test("pfg_fn_global", r * 1000 + d * 100 + r2 * 10 + d2, 6272); }
+    { PfgS s; int c = 1; int r = c++ + s.add<int>(5); int d = c; result &= Test("pfg_generic_method", r * 10 + d, 62); }
+    { PfgBox<int> b; b.v = 5; int c = 1; long r = c++ + b.conv<long>(); int d = c; result &= Test("pfg_generic_struct_generic_method", (int)r * 10 + d, 62); }
+    // The field default `pfgGenField<T>(3)` is itself instantiated inside the struct's instantiation.
+    { int c = 1; int r = c++ + pfgMkDef<int>(5).v; int d = c; result &= Test("pfg_field_default_generic", r * 10 + d, 42); }
     return result;
 }

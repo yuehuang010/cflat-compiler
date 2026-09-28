@@ -1,10 +1,21 @@
 import cpp "cpp_interop_twin.h";
 
+// A C++ class in an inline array field of a temporary: `move` would read a shallow spill copy.
+struct TwinSpillBox { cpptw.Twin[1] values = { cpptw.Twin(90) }; };
+TwinSpillBox make_twin_spill_box()
+{
+    TwinSpillBox box = default;
+    return box;
+}
+
 extern int main()
 {
     expect_error("operator* returns 'cpptw.Twin' by value") {
         cpptw.PrvalueTwinRange values = default;
         for (alias cpptw.Twin x in values) x.set(0);
+    }
+    expect_error("inline array field of a temporary") {
+        cpptw.Twin spilled = move make_twin_spill_box().values[0];
     }
     return 0;
 }

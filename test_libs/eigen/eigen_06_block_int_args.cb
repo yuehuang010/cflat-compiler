@@ -1,6 +1,5 @@
 // GUARDS: overload choice among member-template instantiations called with int literals
 // FROM: scratch/probe3/e10_block.cb
-// DISABLED: internal/issue/p3/cpp-member-template-overloads-ambiguous-on-int-literal-args.md
 import cpp "Eigen/Dense";
 extern int printf(const char* fmt, ...);
 extern int main()

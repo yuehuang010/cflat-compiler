@@ -1,6 +1,5 @@
 // GUARDS: Eigen inherited static Identity and Zero members
 // FROM: scratch/probe3/e02_elem_paren.cb
-// DISABLED: internal/issue/p3/cpp-inherited-static-members-and-member-operators-not-found.md
 import cpp "Eigen/Dense";
 extern int printf(const char* fmt, ...);
 extern int main()

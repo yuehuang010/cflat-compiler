@@ -1,5 +1,6 @@
 #ifndef MATHLIB_H
 #define MATHLIB_H
+#include <stddef.h>
 
 /* A tiny prebuilt-library fixture for the `import package` binding path.
  * cflat does NOT compile this header; it AST-dumps it to extract the
@@ -219,5 +220,75 @@ typedef struct ML_Opaque ML_Opaque;
  * pointer type (ML_OpaqueRef = ML_Opaque*); it previously dropped, so the name did
  * not resolve at all and callers had to spell the handle void*. Purely a type. */
 typedef struct ML_Opaque *ML_OpaqueRef;
+
+/* C-mode header-binding coverage for union and enum bitfields. */
+enum CBF_UnsignedEnum
+{
+    CBF_UnsignedEnum0 = 0,
+    CBF_UnsignedEnum1 = 1,
+    CBF_UnsignedEnum2 = 2,
+    CBF_UnsignedEnumMax = 0xffffffffu
+};
+
+enum CBF_SignedEnum
+{
+    CBF_SignedEnumNeg = -1,
+    CBF_SignedEnumZero = 0,
+    CBF_SignedEnumPos = 1
+};
+
+struct CBF_AnonUnion
+{
+    char head;
+    union
+    {
+        unsigned int a : 1;
+        unsigned int b : 7;
+        unsigned long long c : 40;
+        signed int s : 5;
+    };
+    char tail;
+};
+
+union CBF_NamedUnion
+{
+    unsigned int a : 1;
+    unsigned int b : 7;
+    unsigned long long c : 40;
+    signed int s : 5;
+};
+
+struct CBF_EnumBits
+{
+    enum CBF_UnsignedEnum u : 2;
+    enum CBF_SignedEnum s : 3;
+    unsigned int neighbor : 3;
+    char tail;
+};
+
+int cbf_anon_union_size(void);
+int cbf_anon_union_align(void);
+int cbf_anon_union_tail_offset(void);
+int cbf_anon_union_check(const struct CBF_AnonUnion* v);
+int cbf_named_union_size(void);
+int cbf_named_union_align(void);
+int cbf_named_union_check_a(const union CBF_NamedUnion* v);
+int cbf_named_union_check_b(const union CBF_NamedUnion* v);
+int cbf_named_union_check_c(const union CBF_NamedUnion* v);
+int cbf_named_union_check_s(const union CBF_NamedUnion* v);
+int cbf_enum_bits_size(void);
+int cbf_enum_bits_align(void);
+int cbf_enum_bits_tail_offset(void);
+int cbf_enum_bits_check(const struct CBF_EnumBits* v);
+
+/* A typedef-named anonymous enum keeps clang's unsigned backing; a union bitfield write keeps
+   the other bits of the shared word. */
+typedef enum { CBF_TypedefEnum0 = 0, CBF_TypedefEnum5 = 5 } CBF_TypedefEnum;
+union CBF_WordUnion
+{
+    CBF_TypedefEnum t : 3;
+    unsigned int nib : 4;
+    unsigned int word;
+};
 
 #endif /* MATHLIB_H */

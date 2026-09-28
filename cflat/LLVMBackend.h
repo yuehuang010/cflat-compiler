@@ -790,8 +790,7 @@ public:
         bool IsAlias = false;    // return/decl declared with 'alias' - borrowed reference; caller must not free the interior
         bool IsRvalueRef = false; // C++ T&& parameter: borrowed address, but only rvalues bind
         bool IsCxxRefToPointer = false; // C++ T*&: the value is the address of a T* slot
-        // C++ `const T&` parameter: an rvalue binds it by materializing a temporary. Set from
-        // the canonical parameter spelling; CFlat itself carries no const qualifier.
+        // C++ `const T&` parameter or return: preserve binding and receiver constness.
         bool IsCxxConstRef = false;
         // Set by the ForwardRefScanner body-scan on a plain by-value parameter the callee body
         // UNCONDITIONALLY moves (top-level `move <param>`): a synthesized move-sink whose caller
@@ -1442,6 +1441,10 @@ public:
         // Set by the front-end when this expression is the last proven use of a foreign C++
         // by-value parameter. Transient call-site metadata; never cache-serialized.
         bool CxxParamLastUse = false;
+        // Syntactic category of a call argument, set by the front end for C++ reference binding:
+        // -1 unknown, 0 not an lvalue, 1 lvalue designator, 2 call (lvalue only via a T& result),
+        // 3 assignment (`i = 3`, `i += 3`). Transient call-site metadata; never cache-serialized.
+        int8_t CxxLvalueKind = -1;
         // Non-null when Primary is the POINTER a C++ operator returned for a `T&` result: the
         // referenced value type, carried through a parenthesized sub-expression.
         llvm::Type* CxxRefValueType = nullptr;
@@ -1776,6 +1779,9 @@ public:
     {
         llvm::StructType* StructType;
         std::vector<DeclTypeAndValue> StructFields;
+        bool CxxOffsetLayout = false;
+        std::vector<uint64_t> CxxFieldOffsets;
+        std::vector<unsigned> CxxFieldElements;
         llvm::Function* Destructor = nullptr;
         std::vector<std::string> Interfaces;      // Only used by classes (structs have empty list)
         // Statically-conformed interfaces from [Capability(...)]. The shape is checked at compile
@@ -1896,6 +1902,7 @@ public:
     public:
         std::string UniqueName;
         std::string SourceName;
+        std::string CxxInheritedOwner;
         llvm::Function* Function;
         TypeAndValue ReturnType;
         std::vector<TypeAndValue> Parameters;
@@ -3389,6 +3396,10 @@ private:
     std::unordered_set<std::string> cppStructNames_;
     // A layout-only nested type may be upgraded later when CFlat calls one of its methods.
     std::unordered_set<std::string> cxxForeignDefinitions_;
+    // Linkage name of an inline member a layout-only request bound without a body -> the CFlat
+    // identity whose definition request emits it (LinkCxxCompanionModules upgrades on demand).
+    std::unordered_map<std::string, std::string> cxxAssumedBodyOwners_;
+    bool UpgradeCxxAssumedBodyOwners(const llvm::Module& companions);
     // Class-template requests made against a generated struct's forward declaration are retried
     // when that struct's definition becomes available.
     std::unordered_set<std::string> cxxTentativeTypes_;
@@ -3603,6 +3614,7 @@ private:
         // CFlat replicates MSVC ABI layout itself; bitOffset is NOT taken from clang's
         // reported offset - RegisterCRecords computes it from MSVC ABI rules.
         bool isBitfield = false;
+        bool isZeroSize = false;
         unsigned bitWidth = 0;
         uint64_t offsetBytes = 0;
         uint64_t sizeBytes = 0;    // clang's size/alignment of the field type (0 for a bitfield)
@@ -3646,6 +3658,7 @@ private:
         bool hasCopyCtor = false;
         bool hasCtorTemplate = false;
         bool isAggregate = false;
+        std::vector<cflat_cinterop::RawCxxCtorTemplate> ctorTemplates;
         std::vector<cflat_cinterop::RawCxxMember> members;
         std::vector<cflat_cinterop::RawCxxStaticVar> staticVars;
         std::vector<CRecordFieldEntry> fields;
@@ -3721,6 +3734,8 @@ private:
         std::vector<std::pair<std::string, std::string>> usingDirectives;
         // C++ namespace aliases (`namespace a = b;`), replayed on cache hits.
         std::vector<std::pair<std::string, std::string>> namespaceAliases;
+        // C++ `using ns::C;` of a class (alias, target), replayed for the conflict check.
+        std::vector<std::pair<std::string, std::string>> classUsings;
         std::vector<CHeaderDep> deps;
         // M5 companion module: LLVM bitcode holding the C++ definitions Clang emitted for this
         // import group (inline bodies, vtables/RTTI, inline static members). Cached with the
@@ -3755,6 +3770,7 @@ private:
              + entry.macros.size() + entry.funcMacros.size() + entry.globals.size()
              + entry.recordAliases.size() + entry.typeAliases.size()
              + entry.usingDirectives.size() + entry.namespaceAliases.size()
+             + entry.classUsings.size()
              + entry.functionPointerAbis.size() + entry.deps.size()
              + entry.cxxBitcode.size() / kCFileSigBitcodeBytesPerRow;
     }
@@ -4239,6 +4255,9 @@ private:
      */
     // `calleeIsCxx`: a declared C++ callee gets a release gate resolved after the companion link.
     void RegisterNonEscapingOwningPtrArgs(llvm::Value* callResult, bool calleeIsCxx = false);
+    // A `?:` / `??` arm `new` ledgered while the argument was parsed stays unfreed when the callee
+    // keeps the joined argument (or has no body to prove it), same as a bare `new` argument.
+    void DropRetainedJoinArmPtrTemps(llvm::Value* callResult);
     // Pre-call form for a direct C++ call, so a landing pad of that very call already frees
     // the gated temp on unwind. False (nothing registered) when the callee does not qualify.
     bool RegisterCxxOwningPtrArgsBeforeCall(const llvm::Function* callee,
@@ -4780,7 +4799,8 @@ private:
     // A named owner adopted the value; retire the entry so nothing else claims it.
     void ConsumeOwnedNewTemp(llvm::Value* value);
 
-    void UnregisterOwnedPtrTemp(llvm::Value* value);
+    // `throughPhis`: a sink adopting a `?:` join adopts every arm's hoisted temp too.
+    void UnregisterOwnedPtrTemp(llvm::Value* value, bool throughPhis = false);
 
     /*
      * Addresses INTO an owning pointer temp (`&(new T(x))->f`, a `?:` join of one, a pointer the
@@ -4937,11 +4957,35 @@ private:
     // cached dominator tree before judging the next temp.
     void EmitOwnedStructTempFree(const PendingOwnedStructTemp& temp);
     void EmitOwnedConditionalPtrTempFree(const PendingOwnedPtrTemp& temp);
+    // Free the conditional-slot arm temps ledgered since `from` (a `return` has no statement end).
+    void FlushConditionalPtrTempsSince(size_t from);
 
     // Drop the ledger entries registered since `mark` WITHOUT emitting any free. For an aborted
     // region (an arm whose lowering threw): those entries are keyed to blocks that no longer
     // reach the join, so leaving them would carry a stale key past this expression.
     void DiscardOwnedTempsSince(const OwnedTempMark& mark);
+    // The detection-only ledgers DiscardOwnedTempsSince clears wholesale; a speculative region
+    // snapshots them first so facts recorded before it survive an aborted attempt.
+    struct DetectionLedgerSnapshot {
+        decltype(ownedReturnTemps_) ownedReturnTemps_;
+        decltype(ownedReturnReleaseTemps_) ownedReturnReleaseTemps_;
+        decltype(ownedNewTemps_) ownedNewTemps_;
+        decltype(addrClaimedPtrTemps_) addrClaimedPtrTemps_;
+        decltype(addrIntoTempValues_) addrIntoTempValues_;
+        decltype(ptrToIntOfTemps_) ptrToIntOfTemps_;
+        decltype(nullConditionalTempResults_) nullConditionalTempResults_;
+        decltype(rawArrayResults_) rawArrayResults_;
+        decltype(valueElementTypeNames_) valueElementTypeNames_;
+        decltype(fatInterfaceValueTypeNames_) fatInterfaceValueTypeNames_;
+        decltype(viewJoinTypes_) viewJoinTypes_;
+        decltype(movedOutPtrValues_) movedOutPtrValues_;
+        decltype(movedBorrowedPtrValues_) movedBorrowedPtrValues_;
+        decltype(movedBorrowedThroughFieldValues_) movedBorrowedThroughFieldValues_;
+        decltype(aliasValues_) aliasValues_;
+        decltype(tempFieldValues_) tempFieldValues_;
+    };
+    DetectionLedgerSnapshot SnapshotDetectionLedgers() const;
+    void RestoreDetectionLedgers(DetectionLedgerSnapshot snapshot);
 
     void FlushOwnedTemps();
 
@@ -5480,10 +5524,16 @@ private:
     bool IsCxxNamespace(const std::string& name) const;
     bool HasCxxFunctionTemplateMember(const std::string& owner,
                                       const std::string& memberName) const;
+    // A bound C++ symbol that is a recorded specialization of a function template.
+    bool IsCxxTemplateSpecializationSymbol(const FunctionSymbol& symbol) const;
     bool HasCxxForwardingReferenceTemplateMember(const std::string& owner,
                                                  const std::string& memberName) const;
     std::string ResolveCxxFunctionTemplateName(const std::string& owner,
                                                const std::string& memberName) const;
+    bool CxxStringLiteralSpelling(const NamedVariable& arg, std::string& spelling) const;
+    // True when the newest failed RequestCxxFunctionTemplate / RequestCxxFreeFunction error is
+    // clang's own rejection of the call (its wrapper compiled the full C++ overload set).
+    bool LastCxxRequestClangRejected() const { return lastCxxRequestClangRejected_; }
     bool RequestCxxFunctionTemplate(const std::string& functionName,
                                     const std::string& ownerType,
                                     const std::vector<std::string>& explicitArgs,
@@ -5491,10 +5541,11 @@ private:
                                     const std::vector<CxxBraceArgument>& braceArguments,
                                     std::string& registeredName,
                                     std::string& error,
-                                    const std::string& infixOperator = {});
+                                    const std::string& infixOperator = {},
+                                    bool uniqueRegistration = false);
     bool RequestCxxFreeFunction(const std::string& functionName,
                                 const std::vector<std::string>& explicitArgs,
-                                const std::vector<NamedVariable>& arguments,
+                                std::vector<NamedVariable>& arguments,
                                 std::string& registeredName,
                                 std::string& error,
                                 const std::string& infixOperator = {},
@@ -5506,13 +5557,21 @@ private:
                                  std::vector<NamedVariable>& arguments,
                                  std::vector<CxxBraceArgument>& braceArguments,
                                  std::string& error);
+    std::string CxxBraceSelectorElement(const NamedVariable& element,
+                                        const std::vector<std::string>& candidateElements);
     bool RequestCxxBraceConstructor(const std::string& typeName,
                                     std::vector<NamedVariable>& arguments,
-                                    const std::vector<CxxBraceArgument>& braceArguments,
+                                    std::vector<CxxBraceArgument>& braceArguments,
                                     std::string& wrapperName,
                                     std::string& error);
     // copyInit: the wrapper copy-initializes (`T t = arg;`), so an explicit constructor is
     // never a candidate - the form every IMPLICIT conversion site must use.
+    // Converts each scalar argument of a generated constructor thunk call into the thunk's own
+    // parameter type (clang's pick), so the caller materializes the converted temporary a
+    // reference pick binds. The wrapper's parameter is the pick; the general call-site
+    // narrowing rule does not apply to this compiler-internal call.
+    void ConvertCxxCtorThunkArguments(const std::string& wrapperName,
+                                      std::vector<NamedVariable>& arguments);
     bool RequestCxxVariadicConstructor(const std::string& typeName,
                                        const std::vector<NamedVariable>& arguments,
                                        std::string& wrapperName,
@@ -5929,7 +5988,8 @@ private:
                              std::vector<cflat_cinterop::RawFunctionTemplate>* outFunctionTemplates = nullptr,
                              std::vector<std::pair<std::string, std::string>>* outUsingDirectives = nullptr,
                              std::vector<std::pair<std::string, std::string>>* outNamespaceAliases = nullptr,
-                             std::vector<std::string>* outClassTemplateNames = nullptr);
+                             std::vector<std::string>* outClassTemplateNames = nullptr,
+                             std::vector<std::pair<std::string, std::string>>* outClassUsings = nullptr);
 
     // Extract externally-linkable functions a .c file DEFINES, via the clang C++ API. Records
     // are registered up front (struct-by-value). Used by the .c auto-extern path.
@@ -5952,6 +6012,26 @@ private:
 
     void RegisterCEnums(const std::vector<CEnumEntry>& enums, const std::string& fileForLsp,
                         bool cxxBoundary);
+    // One C++ namespace-member name as bound by an import: what it denotes and which header
+    // bound it. Separately imported headers are separate TUs, so clang never sees a cross-header
+    // `using` conflict; CheckCxxNamespaceConflicts diagnoses it at registration instead.
+    struct CxxNamespaceEntity
+    {
+        bool isType = false;
+        std::string kind;       // "function", "enumerator", "variable", "enum", "alias", "class"
+        std::string identity;   // equal identity = same entity; empty = not comparable
+        std::string describe;
+        std::string file;
+    };
+    std::unordered_map<std::string, CxxNamespaceEntity> cxxNamespaceEntities_;
+    void CheckCxxNamespaceConflicts(const std::vector<CSigEntry>& sigs,
+                                    const std::vector<CEnumEntry>& enums,
+                                    const std::vector<CTypeAliasEntry>& aliases,
+                                    const std::vector<CGlobalEntry>& globals,
+                                    const std::vector<CRecordEntry>& records,
+                                    const std::vector<std::string>& classTemplateNames,
+                                    const std::vector<std::pair<std::string, std::string>>& classUsings,
+                                    const std::string& fileForLsp);
     bool MakeOpaqueFieldBlob(const CRecordFieldEntry& f, DeclTypeAndValue& out) const;
 
     void RegisterCGlobals(const std::vector<CGlobalEntry>& globals, const std::string& fileForLsp);
@@ -7340,7 +7420,8 @@ public:
 
     // Address handed to a non-pointer `alias T` parameter: the caller's own slot when the
     // shapes match exactly, otherwise a materialized temp (a converted value has no slot).
-    llvm::Value* LowerAliasByPointerArg(const NamedVariable& arg, const TypeAndValue& param);
+    llvm::Value* LowerAliasByPointerArg(const NamedVariable& arg, const TypeAndValue& param,
+                                        bool strictCxxScalarType = false);
     llvm::Value* LowerRvalueRefArg(const NamedVariable& arg, const TypeAndValue& param, bool cxxCallee = false);
 
     /*
@@ -7530,6 +7611,11 @@ public:
     llvm::Value* CreateInsertValue(llvm::Value* structInstance, llvm::Value* newValue, unsigned int index);
 
     llvm::Value* CreateStructGEP(llvm::Type* structType, llvm::Value* structAlloc, unsigned int index, std::string variableName = "");
+    llvm::Value* CreateCxxFieldGEP(const StructData& data, llvm::Value* object, unsigned index,
+                                   std::string name = "");
+    llvm::Value* CreateCxxFieldGEP(llvm::IRBuilder<>& irBuilder, const StructData& data,
+                                   llvm::Value* object, unsigned index, std::string name = "");
+    unsigned CxxFieldElementIndex(const StructData& data, unsigned index) const;
 
     llvm::Value* CreateGEP(llvm::Type* type, llvm::Value* ptr, llvm::Value* offset, std::string name = "");
 
@@ -7609,7 +7695,8 @@ public:
     std::vector<DeclTypeAndValue> PackBitfields(
         const std::vector<DeclTypeAndValue>& in,
         std::vector<BitfieldInfo>& outBitfields,
-        bool itaniumPacking = false);
+        bool itaniumPacking = false,
+        bool unionPacking = false);
 
     // Effective alignment of a struct FIELD's slot: the max of the type's ABI alignment,
     // the field's own `alignas(N)`, and the field TYPE's `alignas` (an over-aligned struct
@@ -7663,7 +7750,11 @@ public:
     // side-table delivered via `bitfields`. CreateStructType itself does NOT
     // pack - the default-ctor path needs the packed list before this call to
     // emit one initializer per LLVM struct element.
-    llvm::StructType* CreateStructType(std::string name, std::vector<LLVMBackend::DeclTypeAndValue> typeAndValues, uint64_t userAlign = 0, std::vector<BitfieldInfo>* bitfields = nullptr, bool isPacked = false);
+    // physicalAlignment adds a zero-size tail member so LLVM honors clang's ABI alignment.
+    llvm::StructType* CreateStructType(std::string name,
+        std::vector<LLVMBackend::DeclTypeAndValue> typeAndValues, uint64_t userAlign = 0,
+        std::vector<BitfieldInfo>* bitfields = nullptr, bool isPacked = false,
+        uint64_t physicalAlignment = 0);
 
     // Creates a union type as a struct with a single [N x alignTy] body, where N and alignTy
     // are chosen to match the size and alignment of the largest/most-aligned member.
@@ -7673,7 +7764,9 @@ public:
     // same value (all union members start at offset 0, so an over-aligned member simply raises
     // the union's alignment - no padding slot, which a union body could not carry anyway).
     // The body is then grown to a multiple of it so getTypeAllocSize matches the padded sizeof.
-    llvm::StructType* CreateUnionType(std::string name, std::vector<DeclTypeAndValue> typeAndValues, uint64_t userAlign = 0);
+    llvm::StructType* CreateUnionType(std::string name, std::vector<DeclTypeAndValue> typeAndValues,
+                                      uint64_t userAlign = 0,
+                                      std::vector<BitfieldInfo>* bitfields = nullptr);
 
     llvm::Value* CreateConstant(ConstantVariant constantVariant);
 
@@ -7944,11 +8037,15 @@ public:
                                      const std::vector<TypeAndValue>& params,
                                      AbiRecipe& out);
 
-    // C++ record layout gate: compare the LLVM struct CFlat built against clang's own size,
-    // alignment and field offsets. LogError on any difference - a silent mismatch would corrupt
-    // every by-value exchange of that record.
+    // Imported record layout gate: compare the LLVM struct against clang's size, alignment,
+    // and field offsets. LogError on any difference to prevent silent by-value corruption.
     // Empty when cflat reproduced clang's layout; otherwise the mismatch, for a per-record refusal.
-    std::string VerifyCxxRecordLayout(const CRecordEntry& r);
+    std::string VerifyImportedRecordLayout(const CRecordEntry& r);
+
+    // Lay out imported C bitfield storage at clang's byte offsets with explicit byte gaps.
+    bool InsertCBitfieldLayoutPadding(const CRecordEntry& r,
+                                      std::vector<DeclTypeAndValue>& fields,
+                                      std::vector<BitfieldInfo>& bitfields);
 
     // Insert unnamed filler fields so the LLVM struct reproduces clang's field offsets.
     void InsertCxxLayoutPadding(const CRecordEntry& r, std::vector<DeclTypeAndValue>& fields);
@@ -7957,7 +8054,13 @@ public:
     // set may still be used through a pointer; only by-value crossings consult it.
     std::set<std::string> cxxTriviallyCopyableRecords_;
     std::set<std::string> cxxRecords_;
+    // Synthetic anonymous-member records whose clang-offset layout failed verification;
+    // the enclosing C++ record refuses with the detail.
+    std::map<std::string, std::string> cxxAnonLayoutRefusals_;
     std::map<std::string, std::string> cxxBindingRefusals_;
+    // Registration refusal of the LAST implicit-conversion wrapper attempted by the current
+    // TryBindCxxImplicitArgumentConversions call; cleared on entry, taken by the caller.
+    std::string cxxImplicitConversionRefusal_;
     std::string cppStructAccessContext_;
 
     /*
@@ -7988,6 +8091,8 @@ public:
         // Every instance method name callable on this class, own and inherited. Used to clone a
         // base's methods onto a derived class.
         std::vector<std::string> instanceMethodNames;
+        // Public static methods callable through this class name, own and inherited.
+        std::vector<std::string> staticMethodNames;
         // Itanium vtable slots of a VIRTUAL destructor: D1 (complete object) and D0 (deleting,
         // which also releases the storage). Both -1 when the destructor is not virtual.
         int dtorVtableIndex = -1;
@@ -8248,7 +8353,12 @@ public:
     {
         // CFlat-defined [cpp] structs have generated C++ special members but keep their existing
         // direct CFlat ABI; only imported classes need the foreign sret convention here.
-        return IsForeignNontrivialCxxClass(typeName)
+        const auto* info = GetCxxClassInfo(typeName);
+        // A deleted copy constructor can still leave a record trivially copyable according to
+        // the language trait. Its C++17 prvalue return still needs caller-owned sret storage.
+        const bool returnNeedsSret = cxxRecords_.count(typeName) != 0
+            && info != nullptr && info->hasDeletedCopyCtor;
+        return (IsForeignNontrivialCxxClass(typeName) || returnNeedsSret)
             && generatedCxxRecords_.count(typeName) == 0;
     }
     // countCtorTemplates=false answers as if constructor templates were invisible, the surface
@@ -8330,11 +8440,43 @@ public:
     llvm::Value* ConvertAggregateViaImplicitConversionOperator(llvm::Value* value,
                                                                llvm::Type* destType);
     static const std::vector<std::string>& ScalarConversionSpellings();
+    // A `bool` / `const bool&` parameter: a pointer reaches it by C++'s standard conversion.
+    // A non-const `bool&` cannot bind the converted temporary, so it never shadows.
+    static bool IsCxxBoolSiblingParameter(const TypeAndValue& param)
+    {
+        if (param.TypeName != "bool" || param.IsArrayView || param.IsInterface
+            || param.ElemPointer)
+            return false;
+        if (param.IsAlias || param.IsRvalueRef)
+            return param.IsCxxConstRef || param.IsRvalueRef;
+        return !param.Pointer;
+    }
     bool CanImplicitlyConstructCxxClass(const NamedVariable& arg,
                                          const TypeAndValue& param,
                                          bool cxxByValueParam = false);
+    // `intoSlot` non-null: construct straight into that slot (a declared local, a return slot)
+    // instead of an owned end-of-statement temporary.
     bool MaterializeImplicitCxxClassArgument(NamedVariable& arg,
-                                             const TypeAndValue& param);
+                                             const TypeAndValue& param,
+                                             llvm::Value* intoSlot = nullptr);
+    // Construct `targetType` through the generated C++ constructor wrapper `wrapperName` fed
+    // `source`; `arg` becomes the built object (an owned temporary, or `intoSlot` when given).
+    void ConstructThroughCxxCtorWrapper(NamedVariable& arg, const NamedVariable& source,
+                                        const std::string& targetType,
+                                        const std::string& wrapperName, llvm::Value* intoSlot);
+    /*
+     * The shared converting-constructor resolver (internal/plan/converting-constructors.md,
+     * phase 1): ONE implicit user-defined conversion `T(source)` into C++ class `targetType`,
+     * decided by the same classifier as the call-argument position. NotApplicable: no
+     * converting constructor applies (same type, pointer, no viable or chained). Refused:
+     * `refusal` names why (explicit constructor, ambiguous overloads). Converted: `source` is
+     * now the T - an owned temporary, or `intoSlot` when given.
+     */
+    enum class CxxConvertingCtorResult { NotApplicable, Converted, Refused };
+    CxxConvertingCtorResult ConvertThroughCxxConvertingCtor(NamedVariable& source,
+                                                            const std::string& targetType,
+                                                            llvm::Value* intoSlot,
+                                                            std::string& refusal);
     // Materialize (once per module) the llvm::Function for one structor / assignment operator,
     // typed from clang's own arrangement. Returns null after LogError when the plan is
     // inexpressible. `recipeOut` receives the recipe the call site must lower with.
@@ -8462,6 +8604,10 @@ public:
     bool CxxConstructorNeedsClangResolution(const std::string& typeName,
                                             const CxxClassInfo::Structor* selected,
                                             const std::vector<TypeAndValue>& argTypes) const;
+    // True when a scalar argument meets a constructor overload set holding a scalar reference
+    // parameter: clang resolves it through the forwarding thunk, never the listed pick.
+    bool CxxCtorForwardsScalarReference(const std::string& typeName,
+                                        const std::vector<TypeAndValue>& argTypes) const;
     /*
      * Name of the `explicit` constructor of `typeName` that WOULD have taken `argTypes` had it
      * been implicit. Empty when none exists. Drives the diagnostic at a call argument.
@@ -8675,6 +8821,7 @@ public:
      */
     int ScoreMoveAgreement(const std::vector<NamedVariable>& arguments, const FunctionSymbol& candidate) const;
     bool IsRvalueReferenceArgument(const NamedVariable& arg) const;
+    bool IsProvenCxxScalarLvalue(const NamedVariable& arg) const;
     std::string CxxReferenceParameterSpelling(const FunctionSymbol& candidate, size_t index) const;
     bool IsCxxReferenceParameter(const FunctionSymbol& candidate, size_t index) const;
     // C++ calls also classify address-less literals and expression results as rvalues. Keep this
@@ -8695,6 +8842,8 @@ public:
     // The clang errors and notes behind the newest failed RequestGeneratedCxxWrapper.
     std::string lastCxxWrapperCause_;
     std::string pendingCxxWrapperCause_;
+    // Set only where a generated call wrapper failed under clang; CFlat-side refusals leave it off.
+    bool lastCxxRequestClangRejected_ = false;
     // True when one line of `diagnostics` names the copy constructor of the class spelled
     // `cxxSpelling` (or a deleted constructor of it): the failure really was that copy.
     bool CxxDiagnosticBlamesCopyOf(const std::string& diagnostics,
@@ -9935,6 +10084,9 @@ public:
     void RegisterScopedEnumType(const std::string& enumName);
     bool IsScopedEnumTypeName(const std::string& name) const;
     bool IsScopedEnumMatch(const TypeAndValue& from, const TypeAndValue& to) const;
+    // C++ has no implicit integer -> enumeration conversion; see the definition for the proof.
+    bool CxxEnumParameterRefusesArgument(const NamedVariable& arg, const TypeAndValue& argType,
+                                         const TypeAndValue& param) const;
     // Renders '<enum>.<member>' as a C++ template argument; see the definition for the two rules.
     std::string CxxEnumeratorArgumentSpelling(const std::string& enumSpelled, int64_t value) const;
     /*
@@ -10200,8 +10352,20 @@ public:
     // 97: default-argument wrappers skip ambiguous shortened calls, dedupe, move by-value args.
     // 101: an incremental request drops declarations its own includes do not reach.
     // 102: MS ABI implicit dtors bind to the emitted base dtor; MSVC unique_ptr move members.
-    // 103: header entries carry the namespaces their extraction seeded into the import group.
-    static constexpr int kCHeaderCacheVersion = 103;
+    // 103 (1405f9f7, parallel line; superseded numerically by the local 103+): header entries carry the namespaces their extraction seeded into the import group.
+    // 103: C++ record fields carry Clang's zero-size [[no_unique_address]] classification.
+    // 104: explicit full specializations keep their full foreign identity in general traversal.
+    // 105: members record definitionAssumed (inline body assumed by a declaration-only pass).
+    // 108: namespace-scope using-declarations of enums, typedefs, enumerators, variables.
+    // 109: C++ anonymous-member records carry clang's size and alignment.
+    // 110: namespace-scope using-declarations of classes (conflict check only).
+    // 111: namespace-scope class templates recorded (conflict check only).
+    // 112: records carry their constructor templates (ctorTemplates).
+    // 113: C-mode bitfield records carry clang's field offsets.
+    // 114: C-mode enum records (named, or typedef-named anonymous) carry their clang-selected
+    //      underlying integer type.
+    // 115: C++ const lvalue-reference returns retain receiver constness.
+    static constexpr int kCHeaderCacheVersion = 115;
     static std::string CompilerBuildStamp();
 
     static std::string GetCHeaderCacheDir();

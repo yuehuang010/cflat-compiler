@@ -1,9 +1,20 @@
 // Grouped C++ import: the group form accepts lib/define clauses like the single form.
 import cpp { "cpp_interop_tpl.h", "vector" };
+import cpp "cpp_interop_ctorref.h";
 
 expect_error("no instantiation of C++ function template 'cppt.twice' accepts these argument types") {
     extern int main()
     {
         return (int)cppt.twice({1, 2});
+    }
+}
+
+// A braced list backed in the caller frame still obeys C++ narrowing: a non-constant long
+// into std::initializer_list<double> is ill-formed, as clang rejects it.
+expect_error("brace-list element 1 of 'cppcr.BrcIlD' narrows to the C++ constructor's 'double'") {
+    double narrow_probe(long a, long b)
+    {
+        cppcr.BrcIlD d = cppcr.BrcIlD({a, b});
+        return d.d[0];
     }
 }

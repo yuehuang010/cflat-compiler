@@ -1,5 +1,51 @@
 #pragma once
 
+/* Plain C bitfield layouts checked by test_c_interop.cb. */
+struct CBF_Zero
+{
+    char c;
+    unsigned int : 0;
+    char d;
+};
+
+struct CBF_Nested
+{
+    char c;
+    struct { char d; int e : 5; } in;
+    short f;
+};
+
+struct CBF_Mixed
+{
+    unsigned int a : 3;
+    unsigned int : 0;
+    unsigned int b : 4;
+    char c;
+    unsigned long long d : 40;
+};
+
+struct CBF_CharShort
+{
+    char c;
+    unsigned int a : 3;
+    short s;
+    unsigned int b : 4;
+};
+
+int cbf_zero_size(void);
+struct CBF_Zero cbf_zero_make(int c, int d);
+int cbf_zero_check(struct CBF_Zero v);
+int cbf_nested_size(void);
+struct CBF_Nested cbf_nested_make(int c, int d, int e, int f);
+int cbf_nested_check(struct CBF_Nested v);
+int cbf_mixed_size(void);
+struct CBF_Mixed cbf_mixed_make(unsigned a, unsigned b, int c,
+                                unsigned long long d);
+int cbf_mixed_check(struct CBF_Mixed v);
+int cbf_char_short_size(void);
+struct CBF_CharShort cbf_char_short_make(int c, unsigned a, int s, unsigned b);
+int cbf_char_short_check(struct CBF_CharShort v);
+
 // Function-like macros exercised by test_c_function_macros.cb. The compiler
 // translates each into an auto generic function and rejects bodies that use
 // calls, strings, member access, or other unsupported tokens (the last three

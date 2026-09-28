@@ -1865,7 +1865,7 @@ void LLVMBackend::ApplyMoveParamTransfer(const std::string& functionName,
 
                     // Invariant guard: a sink parameter owns its argument, so no caller-side
                     // end-of-expression free may remain registered for it.
-                    UnregisterOwnedPtrTemp(args[i].Primary);
+                    UnregisterOwnedPtrTemp(args[i].Primary, /*throughPhis*/ true);
                 }
 
                 // An interface fat-ptr param built from a caller STRUCT VALUE points AT the caller's
@@ -2161,9 +2161,32 @@ llvm::Value* LLVMBackend::LowerClosureFatToThinFnPtr(llvm::Value* val, llvm::Typ
         return nullptr;   // unreachable: LogError above does not return
     }
 
-llvm::Value* LLVMBackend::LowerAliasByPointerArg(const NamedVariable& arg, const TypeAndValue& param)
+llvm::Value* LLVMBackend::LowerAliasByPointerArg(const NamedVariable& arg,
+                                                 const TypeAndValue& param,
+                                                 bool strictCxxScalarType)
 {
         auto* paramTy = GetType(param);
+        std::string sourceSpelling;
+        std::string paramSpelling;
+        auto cxxValueSpelling = [&](std::string typeName, std::string& spelling) {
+            auto removePrefix = [&](std::string_view prefix) {
+                if (!typeName.starts_with(prefix)) return;
+                typeName.erase(0, prefix.size());
+                while (!typeName.empty() && typeName.front() == ' ') typeName.erase(0, 1);
+            };
+            removePrefix("const");
+            removePrefix("volatile");
+            for (std::string_view suffix : { std::string_view(" const"),
+                                             std::string_view(" volatile") })
+                if (typeName.ends_with(suffix)) typeName.erase(typeName.size() - suffix.size());
+            return CxxSpellingForCflatType(typeName, spelling);
+        };
+        const bool sameReferentType = !arg.TypeAndValue.Pointer && !param.Pointer
+            && (strictCxxScalarType
+                ? (cxxValueSpelling(arg.TypeAndValue.TypeName, sourceSpelling)
+                    && cxxValueSpelling(param.TypeName, paramSpelling)
+                    && SqueezeCxxSpelling(sourceSpelling) == SqueezeCxxSpelling(paramSpelling))
+                : arg.BaseType == paramTy);
         if (param.IsCxxRefToPointer)
         {
             // C++ T*& borrows the caller's T* slot. A plain pointer local already
@@ -2191,7 +2214,7 @@ llvm::Value* LLVMBackend::LowerAliasByPointerArg(const NamedVariable& arg, const
                                   offset, inaccessible))
                 return EmitCxxBaseAdjust(arg.Storage, offset);
         }
-        if (arg.Storage != nullptr && arg.BaseType == paramTy && !arg.TypeAndValue.Pointer
+        if (arg.Storage != nullptr && arg.BaseType == paramTy && sameReferentType
             && !arg.TypeAndValue.IsInterface)
             return arg.Storage;
         llvm::Value* value = arg.Primary != nullptr ? arg.Primary : LoadArgStorage(arg);
@@ -2980,6 +3003,8 @@ llvm::Value* LLVMBackend::CallInterfaceMethod(llvm::Value* ifacePtr, const std::
         moveTransferConsumedTemps_.clear();
         auto* callResult = CreateCallOrInvoke(fnTy, fnPtr, callArgs, /*mayUnwind=*/true);
         unwindCallConsumedTemps_.clear();
+        // Dispatch has no body to prove the callee borrows; keep retained join-arm temps.
+        DropRetainedJoinArmPtrTemps(callResult);
         if (cxxSretRecipe.hasLowering)
             ApplyAbiCallAttributes(callResult, cxxSretRecipe);
         llvm::Value* resultValue = callResult;
@@ -3374,7 +3399,7 @@ llvm::Function* LLVMBackend::SynthesizeReflectFunction(const std::string& struct
             std::string displayName = field.VariableName;
 
             // GEP to field
-            auto* gep = compiler->builder->CreateStructGEP(sd.StructType, objPtr, (unsigned)i,
+            auto* gep = compiler->CreateCxxFieldGEP(sd, objPtr, (unsigned)i,
                 field.VariableName + "_ptr");
 
             // Dispatch on field type

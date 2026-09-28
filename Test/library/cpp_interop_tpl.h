@@ -715,9 +715,7 @@ namespace cppt
         int tag() const noexcept { return 2; }
     };
 
-    // M53: a move-only nontrivial result by value. Its counted members make the result's contents
-    // observable, and the caller must move-construct its auto local before the sret temporary is
-    // destroyed.
+    // M53: a move-only nontrivial result by value. C++17 constructs the auto local in its sret slot.
     inline int autosret_dtor_counter = 0;
     inline void autosret_reset() noexcept { autosret_dtor_counter = 0; }
     inline int autosret_dtor_count() noexcept { return autosret_dtor_counter; }
@@ -1880,4 +1878,182 @@ namespace cppfwd
             return value;
         }
     };
+}
+
+// A class reached through a NESTED namespace alias (simdjson's `namespace simdjson { namespace
+// ondemand = arm64::ondemand; }`), whose method returns an explicit specialization declared
+// AFTER a sibling explicit specialization of the same template.
+namespace cppt_nsa
+{
+    template <class T> struct Res { T first; int err = 0; };
+    struct Elem { int e = 3; };
+    template <> struct Res<Elem> { Elem first; int err = 0; };
+    namespace impl { namespace od {
+        struct Doc
+        {
+            int v = 0;
+            Doc() = default;
+            explicit Doc(int x) : v(x) {}
+            Doc(const Doc&) = delete;
+            Doc& operator=(const Doc&) = delete;
+            Doc(Doc&&) = default;
+            Doc& operator=(Doc&&) = default;
+        };
+        struct Parser { int k = 5; Res<Doc> iterate(int n); };
+    } }
+    template <> struct Res<impl::od::Doc>
+    {
+        impl::od::Doc first;
+        int err = 0;
+        Res() noexcept = default;
+        Res(impl::od::Doc&& v) noexcept : first(std::move(v)) {}
+        Res(Res&&) noexcept = default;
+        operator int() const { return first.v; }
+    };
+    namespace builtin = impl;
+    namespace od = builtin::od;
+    namespace od2 = od;
+    inline Res<impl::od::Doc> impl::od::Parser::iterate(int n)
+    {
+        return Res<impl::od::Doc>(impl::od::Doc(n + k));
+    }
+}
+
+namespace cppt_rev2_a { namespace x { struct Item { int value() { return 11; } }; } }
+namespace cppt_rev2_b { namespace x = cppt_rev2_a::x; }
+namespace x { struct Top { int value() { return 22; } }; }
+
+namespace cppt_rev2_target { struct Thing { int value() { return 31; } }; }
+namespace cppt_rev2_al1 = cppt_rev2_target;
+namespace cppt_rev2_al2 = cppt_rev2_al1;
+namespace cppt_rev2_al3 = cppt_rev2_al2;
+namespace cppt_rev2_al4 = cppt_rev2_al3;
+namespace cppt_rev2_al5 = cppt_rev2_al4;
+namespace cppt_rev2_al6 = cppt_rev2_al5;
+namespace cppt_rev2_al7 = cppt_rev2_al6;
+namespace cppt_rev2_al8 = cppt_rev2_al7;
+namespace cppt_rev2_al9 = cppt_rev2_al8;
+namespace cppt_rev2_al10 = cppt_rev2_al9;
+namespace cppt_rev2_al11 = cppt_rev2_al10;
+namespace cppt_rev2_al12 = cppt_rev2_al11;
+namespace cppt_rev2_al13 = cppt_rev2_al12;
+namespace cppt_rev2_al14 = cppt_rev2_al13;
+namespace cppt_rev2_al15 = cppt_rev2_al14;
+namespace cppt_rev2_al16 = cppt_rev2_al15;
+namespace cppt_rev2_al17 = cppt_rev2_al16;
+inline int cppt_rev2_scope_alias_probe()
+{ namespace cppt_rev2_local = cppt_rev2_target; return 1; }
+
+namespace cppt_rev2_specs
+{
+    struct A {};
+    struct B {};
+    struct Outer { template <class T> struct Inner; };
+    template <> struct Outer::Inner<A> { int value() { return 51; } };
+    template <> struct Outer::Inner<B> { int value() { return 52; } };
+}
+
+namespace cppt_rev2_left
+{
+    struct A {};
+    template <class T> struct Same;
+    template <> struct Same<A> { int value() { return 71; } };
+}
+namespace cppt_rev2_right
+{
+    struct A {};
+    template <class T> struct Same;
+    template <> struct Same<A> { int value() { return 72; } };
+}
+
+namespace cppt_rev2_cflat
+{
+    struct A { int value() { return 43; } };
+    template <class T> struct Same;
+    template <> struct Same<A> { int value() { return 73; } };
+    inline int readSameA(Same<A> value) { return value.value(); }
+}
+// A full specialization reached ONLY through a layout-only request (the pointee of a template
+// iterator's operator*) and then as a by-value result that is never spelled. Its inline member
+// bodies were never emitted. Declared plain in class, defined inline out of class in a LATER part
+// of the header, the way simdjson's -inl section does it.
+namespace cppt_lo
+{
+    struct Tag {};
+    template <class T> struct Res;
+    template <> struct Res<Tag>
+    {
+        int w;
+        int get();
+        int inc() { return w + 1; }
+        int operator+(int x) const;
+        int operator-() const;
+        int chain();
+    };
+    namespace deep
+    {
+        template <class T> struct Nest;
+        template <> struct Nest<Tag> { int w; int nget(); };
+    }
+    template <class T> struct Box { T v; int get(); };
+    template <class T> inline int Box<T>::get() { return (int)v * 2; }
+    template <class T> struct It { int k; Res<Tag> operator*() { return Res<Tag>{ k }; } };
+    template <class T> struct ItN { int k; deep::Nest<Tag> operator*() { return deep::Nest<Tag>{ k }; } };
+    template <class T> struct ItB { long k; Box<long> operator*() { return Box<long>{ k }; } };
+    struct Holder
+    {
+        int k = 21;
+        Res<Tag> at() { return Res<Tag>{ k }; }
+        deep::Nest<Tag> atN() { return deep::Nest<Tag>{ k }; }
+        Box<long> atB() { return Box<long>{ k }; }
+    };
+}
+namespace cppt_lo
+{
+    inline int Res<Tag>::get() { return w * 4; }
+    inline int Res<Tag>::operator+(int x) const { return w + x; }
+    inline int Res<Tag>::operator-() const { return -w; }
+    inline int Res<Tag>::chain() { return get() + 1; }
+    inline int deep::Nest<Tag>::nget() { return w * 6; }
+}
+
+// A template's non-const `U&` parameter binds the CALLER's object; a temporary goes to C++ as an
+// rvalue, so an overload that can take one (`const U&`, a non-template sibling) wins.
+namespace cpptrr
+{
+    template <class U> int bump(U& x) { x = x + 1; return (int)x; }
+    template <class U> int bumpc(const U& x) { return (int)x + 1000; }
+    template <class U> int fwd(U&& x) { return (int)x + 2000; }
+    inline int f(int v) { return v; }
+    inline int& ref_ret() { static int s = 40; return s; }
+    struct M { int base = 0; template <class U> int bump(U& x) { x = x + 1; return (int)x + base; } };
+    template <class U> int ov(U& x) { x = 7; return 1; }
+    template <class U> int ov(const U& x) { return 2 + (int)x; }
+    template <class... A> int pk(A&... a) { int n = 0; ((a = a + 1, n += (int)a), ...); return n; }
+    template <class U> int outp(U v, int& out) { out = (int)v * 2; return 5; }
+    template <class U> int mix(U& x) { x = x + 1; return (int)x; }
+    inline int mix(long v) { return (int)v + 500; }
+    struct Sink { int t = 0; };
+    template <class U> int operator+(Sink& s, U& x) { s.t += (int)x; x = 0; return s.t; }
+    template <class U> int operator<<(Sink& s, U& x) { s.t += (int)x * 10; x = 0; return s.t; }
+    template <class U> int which(U& x) { return 1; }
+    template <class U> int which(const U& x) { return 2; }
+    template <class U> int fwd_kind(U&& x) { return std::is_lvalue_reference<U>::value ? 1 : 2; }
+    // A `const U&` result read only after a deeper frame reused the stack: it must point at a
+    // temporary in the CALLER's frame, not at a dead wrapper parameter.
+    __attribute__((noinline)) inline int scrub()
+    { volatile int pad[256]; for (int k = 0; k < 256; k++) pad[k] = -7000 - k; return pad[3]; }
+    __attribute__((noinline)) inline int read_late(const int& r) { scrub(); return r; }
+    __attribute__((noinline)) inline int* read_late_ptr(int* const& r) { scrub(); return r; }
+    __attribute__((noinline)) inline const char* read_late_cstr(const char* const& r) { scrub(); return r; }
+    template <class U> const U& lesser(const U& a, const U& b) { return b < a ? b : a; }
+    template <class U> const U& first_of(const U& a, int) { return a; }
+    template <class U, class V> const U& pair_first(const U& a, const V&) { return a; }
+    inline const char* lit_tail() { return "tail"; }
+    template <class... R> decltype(auto) pack_first(const R&... r) { return std::get<0>(std::forward_as_tuple(r...)); }
+    template <class U> int rank_cr(const U&) { return 1; }
+    template <class U> int rank_cr(const U&&) { return 9; }
+    template <size_t N> int lit_len(const char (&)[N]) { return (int)N; }
+    struct Pk { int base = 0; template <class U> const U& pick(const U& a, const U& b) const { return b < a ? b : a; }
+                template <class U> const U& first_of(const U& a, int) const { return a; } };
 }

@@ -9,5 +9,10 @@ extern int main()
         cppi.NoCopy a = cppi.NoCopy(1);
         cppi.NoCopy b = a;
     }
+    // `auto` copy-initializes exactly like the spelled type (pre-fix: accepted, bits copied).
+    expect_error("its copy constructor is deleted") {
+        cppi.NoCopy c = cppi.NoCopy(2);
+        auto d = c;
+    }
     return 0;
 }

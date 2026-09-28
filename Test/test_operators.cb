@@ -282,6 +282,7 @@ bool operator!=(PtrNode* a, PtrKey b) { return a->v != b.v; }
 import "test_helper.cb";
 import "list.cb";
 import "string.cb";
+import "tuple.cb";
 
 // Unsigned-literal regression support: field defaults, a global, and an indirect callee.
 struct UDefaults { u64 wide = 4294967295u; double asDouble = 4294967295u; };
@@ -907,18 +908,65 @@ extern int main()
     int narrowPromoPassed = narrowUnaryAndTernaryPromotionLegs();
     int i128Passed = i128FeatureLegs();
     int reversedPassed = reversedAndZeroArgOverloadLegs();
+    int sizeofUnevalPassed = sizeofUnevaluatedLegs();
+    int boolFpPassed = boolToFloatingLegs();
 
     return (callPassed == 12 && terPassed == 23 && ptrOpPassed == 8 && uPassed == 3
         && unsignedLiteralPassed == 8 && unsignedAcceptPassed == 7
         && chainPassed == 11 && softPassed == 1 && promoPassed == 11
         && signednessPassed == 38 && autoNarrowPassed == 4 && joinAcceptPassed == 5
         && narrowPromoPassed == 46 && i128Passed == 29
-        && reversedPassed == 3) ? 0 : 1;
+        && reversedPassed == 3 && sizeofUnevalPassed == 67
+        && boolFpPassed == 20) ? 0 : 1;
 }
 
 // C integer promotion for equal-width sub-int operands, plus the two literal-unsignedness
 // sites (ternary arm, default parameter) that used to sign-extend a u-suffixed literal.
 i64 unsignedDefaultParam(i64 v = 4294967295u) { return v; }
+
+// bool -> floating point is unsigned: true is 1.0, never the -1.0 a signed i1 conversion gives.
+double g_boolFpScalar = true;
+double[2] g_boolFpArray = {true, false};
+double boolFpReturn(bool b) { return b; }
+T boolFpGeneric<T>(T x) { return x; }
+
+int boolToFloatingLegs()
+{
+    int p = 0;
+    bool b = true;
+    bool f = false;
+    p += Test("bool to double cast", (double)b == 1.0, true);
+    p += Test("bool to float cast", (float)b == 1.0f, true);
+    p += Test("bool to longdouble cast", (double)(longdouble)b == 1.0, true);
+    double di = b;
+    float fi = b;
+    p += Test("bool to double init", di == 1.0, true);
+    p += Test("bool to float init", fi == 1.0f, true);
+    double da = 0.0;
+    da = b;
+    p += Test("bool to double assignment", da == 1.0, true);
+    p += Test("bool to double return", boolFpReturn(b) == 1.0, true);
+    p += Test("bool plus double", b + 0.5 == 1.5, true);
+    p += Test("bool plus float", b + 0.5f == 1.5f, true);
+    bool c = true;
+    p += Test("bool ternary arm with double", (c ? b : 0.5) == 1.0, true);
+    double dc = 1.0;
+    dc += b;
+    p += Test("double compound add bool", dc == 2.0, true);
+    simd<double, 2> v = b;
+    p += Test("bool simd splat", v[1] == 1.0, true);
+    p += Test("bool generic double", boolFpGeneric<double>((double)b) == 1.0, true);
+    p += Test("bool generic bool", (double)boolFpGeneric<bool>(b) == 1.0, true);
+    p += Test("bool global double init", g_boolFpScalar == 1.0, true);
+    p += Test("bool global array element", g_boolFpArray[0] == 1.0, true);
+    double[2] la = {true, false};
+    p += Test("bool local array element", la[0] == 1.0, true);
+    p += Test("false to double", (double)f == 0.0, true);
+    p += Test("signed negative to double", (double)-7 == -7.0, true);
+    int ii = b;
+    p += Test("bool to int stays 1", ii, 1);
+    return p;
+}
 
 int promotionAndLiteralLegs()
 {
@@ -1321,5 +1369,176 @@ int stringLiteralJoinAcceptLegs()
     SljPoint* reinterpreted = t ? (SljPoint*)runtimeA : (SljPoint*)runtimeB;
     passed += Test("join of casts on a runtime 'char*' reinterprets the bytes",
         reinterpreted.x, 1633771873);
+    return passed;
+}
+
+// The operand of sizeof / typeof is UNEVALUATED (C): no call runs, no store or postfix ++
+// lands, no owning temporary is made. Each leg's master value was the operand's own VALUE
+// (sizeof((c++)) == 1 with c left at 2, sizeof(f()) == 7 with the call run).
+int szoCalls = 0;
+int szoCount() { szoCalls++; return 7; }
+string szoMakeString() { szoCalls++; return "hello"; }
+struct SzoPair { int a = default; int b = default; };
+struct SzoField { long n = sizeof(szoCount()); };
+long szoGlobalSize = sizeof(szoCount());
+long szoGenericSize<T>(T v) { T w = v; return sizeof(w + v); }
+namespace SzoNs {
+    struct Type { int value = default; };
+    struct Pair<T> { T a = default; T b = default; };
+    long pairSize() { return sizeof(Pair<long>); }
+}
+struct SzoGeneric<T> { T value = default; };
+using SzoPairAlias = SzoPair;
+int szoFirst<T>(T x, T y) { szoCalls++; return x; }
+
+struct SzoOwned { int v = default; };
+int szoSink(move SzoOwned* p) { szoCalls++; delete p; return 1; }
+
+expect_error("is incomplete") {
+    long szoEarlyForwardSize() { return sizeof(SzoForward); }
+}
+expect_error("is incomplete") {
+    long szoEarlyForwardAlign() { return alignof(SzoForward); }
+}
+expect_error("is incomplete") {
+    long szoEarlyForwardGlobalSize = sizeof(SzoForward);
+}
+expect_error("is incomplete") {
+    long szoEarlyForwardArraySize() {
+        char[sizeof(SzoForward)] values = default;
+        return sizeof(values);
+    }
+}
+expect_error("is incomplete") {
+    long szoEarlyNestedSize() { return sizeof(SzoOuter); }
+}
+struct SzoForward { long a = default; long b = default; long c = default; };
+struct SzoOuter { SzoInner inner = default; };
+struct SzoInner { char c = default; long x = default; };
+long szoGenericTypeSize<T>() { return sizeof(T); }
+
+// Two sizeof operands reading a default (null) interface local: the erased operand IR must
+// take its pending null-interface checks with it (a stale anchor reported 'pv' as a null
+// member access with a warm core cache).
+interface SzoTagged { int tag; int kind(); };
+class SzoTaggedImpl : SzoTagged { int tag = default; int kind() { return 1; } };
+int szoIfaceSizes() { SzoTagged pv = default; long a = sizeof(pv.tag + 0); long b = sizeof(pv.kind()); return (int)(a + b); }
+
+int sizeofUnevaluatedLegs()
+{
+    int passed = 0;
+    int c = 1;
+    long s = sizeof((c++));
+    passed += Test("sizeof((c++)) measures int", (int)s, 4);
+    passed += Test("sizeof((c++)) leaves c", c, 1);
+    s = sizeof c++;
+    passed += Test("sizeof c++ (no parens) leaves c", c, 1);
+    s = sizeof -(c++);
+    passed += Test("sizeof -(c++) measures int", (int)s, 4);
+    passed += Test("sizeof -(c++) leaves c", c, 1);
+    s = sizeof(c = 5);
+    passed += Test("sizeof(c = 5) measures int", (int)s, 4);
+    passed += Test("sizeof(c = 5) does not store", c, 1);
+    s = sizeof(szoCount());
+    passed += Test("sizeof(f()) measures the return type", (int)s, 4);
+    s = sizeof szoCount();
+    passed += Test("sizeof f() measures the return type", (int)s, 4);
+    double d = 2.5;
+    s = sizeof(d + szoCount());
+    passed += Test("sizeof(double + f()) measures double", (int)s, 8);
+    s = sizeof(new SzoPair());
+    passed += Test("sizeof(new T()) measures the pointer", (int)s, 8);
+    s = sizeof(szoMakeString());
+    passed += Test("sizeof(owning temp) measures string", (int)s, (int)sizeof(string));
+    SzoPair* p = new SzoPair();
+    p->a = 3;
+    passed += Test("sizeof(p->a) measures the field", (int)sizeof(p->a), 4);
+    delete p;
+    int callsBeforeTypeof = szoCalls;
+    string t = typeof(szoCount());
+    passed += Test("typeof(f()) names the type without calling f",
+        t == "int" && szoCalls == callsBeforeTypeof, true);
+    passed += Test("sizeof(generic w + v) int", (int)szoGenericSize<int>(3), 4);
+    passed += Test("sizeof(generic w + v) double", (int)szoGenericSize<double>(3.0), 8);
+    SzoField field;
+    passed += Test("sizeof(f()) field default", (int)field.n, 4);
+    passed += Test("sizeof(f()) global initializer", (int)szoGlobalSize, 4);
+    // A move inside the operand is not a move: master rejected the read below as
+    // "use of moved variable 'owned'".
+    SzoOwned* owned = new SzoOwned();
+    owned->v = 6;
+    s = sizeof(szoSink(move owned));
+    passed += Test("sizeof(sink(move x)) leaves x owned", owned->v, 6);
+    delete owned;
+    // auto locals measure their stored type (master: "cannot find the type 'auto'").
+    auto autoPtr = new SzoPair();
+    auto autoPair = SzoPair();
+    passed += Test("sizeof(auto pointer local)", (int)sizeof(autoPtr), 8);
+    passed += Test("sizeof auto struct local", (int)sizeof autoPair, 8);
+    delete autoPtr;
+    passed += Test("sizeof of null interface member reads", szoIfaceSizes(), 8);
+    passed += Test("no sizeof/typeof operand call ran", szoCalls, 0);
+    int sxeX = 1;
+    int sxeY = 2;
+    SzoPair sxeS = default;
+    SzoPair* sxeP = new SzoPair();
+    SzoPair sxeT = default;
+    int [4] arr = {1, 2, 3, 4};
+    int*[3] ptrArray = default;
+    char*[2][3] ptrGrid = default;
+    (int, double) tupleValue = default;
+    int sxeI = 0;
+    long value = sizeof(szoFirst(sxeX, sxeY));
+    passed += Test("sizeof(first(x, y)) measures result type", (int)value, 4);
+    value = sizeof(szoFirst<int>(sxeX, sxeX));
+    passed += Test("sizeof(first<int>(x, x)) measures result type", (int)value, 4);
+    passed += Test("sizeof(s.b) measures field", (int)sizeof(sxeS.b), 4);
+    passed += Test("sizeof(arr[i]) measures element", (int)sizeof(arr[sxeI]), 4);
+    passed += Test("sizeof(t.a) measures field", (int)sizeof(sxeT.a), 4);
+    SzoOwned* moved = new SzoOwned();
+    moved->v = 17;
+    passed += Test("sizeof(move a) measures owning pointer", (int)sizeof(move moved), 8);
+    passed += Test("sizeof(move a) leaves value owned", moved->v, 17);
+    passed += Test("typeof(first(x, y)) names result type", typeof(szoFirst(sxeX, sxeY)), "int");
+    passed += Test("typeof(first<int>(x, x)) names result type", typeof(szoFirst<int>(sxeX, sxeX)), "int");
+    passed += Test("typeof(s.b) names field type", typeof(sxeS.b), "int");
+    passed += Test("typeof(p->b) names field type", typeof(sxeP->b), "int");
+    passed += Test("typeof(arr[i]) names element type", typeof(arr[sxeI]), "int");
+    passed += Test("typeof(t.a) names field type", typeof(sxeT.a), "int");
+    passed += Test("typeof(move a) preserves owning type", typeof(move moved), typeof(moved));
+    passed += Test("sizeof(int) remains a type", (int)sizeof(int), 4);
+    passed += Test("sizeof(int*) remains a type", (int)sizeof(int*), 8);
+    passed += Test("sizeof(int*[3]) preserves pointer elements", (int)sizeof(int*[3]), 24);
+    passed += Test("sizeof(char*[2][3]) preserves pointer elements", (int)sizeof(char*[2][3]), 48);
+    passed += Test("sizeof(int**[2]) preserves pointer depth", (int)sizeof(int**[2]), 16);
+    passed += Test("alignof(int*[3]) preserves pointer elements", (int)alignof(int*[3]), 8);
+    passed += Test("alignof(char*[2][3]) preserves pointer elements", (int)alignof(char*[2][3]), 8);
+    passed += Test("alignof(int**[2]) preserves pointer depth", (int)alignof(int**[2]), 8);
+    passed += Test("sizeof pointer array variable", (int)sizeof(ptrArray), 24);
+    passed += Test("sizeof multidimensional pointer array variable", (int)sizeof(ptrGrid), 48);
+    passed += Test("sizeof tuple type spelling", (int)sizeof((int, double)), 16);
+    passed += Test("alignof tuple type spelling", (int)alignof((int, double)), 8);
+    passed += Test("typeof tuple variable", typeof(tupleValue), "tuple<int, double>");
+    passed += Test("sizeof completed forward struct", (int)sizeof(SzoForward), 24);
+    passed += Test("alignof completed forward struct", (int)alignof(SzoForward), 8);
+    passed += Test("sizeof completed struct in generic", (int)szoGenericTypeSize<SzoForward>(), 24);
+    passed += Test("sizeof completed nested struct", (int)sizeof(SzoOuter), 16);
+    passed += Test("alignof completed nested struct", (int)alignof(SzoOuter), 8);
+    passed += Test("sizeof(MyStruct) remains a type", (int)sizeof(SzoPair), 8);
+    passed += Test("sizeof(ns.Type) remains a type", (int)sizeof(SzoNs.Type) > 0, true);
+    passed += Test("sizeof(Generic<int>) remains a type", (int)sizeof(SzoGeneric<int>) == 4, true);
+    passed += Test("sizeof(int[4]) remains a type", (int)sizeof(int[4]), 16);
+    passed += Test("sizeof(simd<float, 4>) remains a type", (int)sizeof(simd<float, 4>), 16);
+    passed += Test("sizeof(Generic<T>) in its namespace remains a type", (int)SzoNs.pairSize(), 16);
+    passed += Test("sizeof(alias) remains a type", (int)sizeof(SzoPairAlias), 8);
+    int SzoPair = 5;
+    passed += Test("sizeof shadowing local measures variable", (int)sizeof(SzoPair), 4);
+    value = alignof(szoFirst(sxeX, sxeY));
+    passed += Test("alignof(first(x, y)) measures result alignment", (int)value, 4);
+    passed += Test("alignof(s.b) measures field alignment", (int)alignof(sxeS.b), 4);
+    passed += Test("alignof(arr[i]) measures element alignment", (int)alignof(arr[sxeI]), 4);
+    passed += Test("sizeof expression calls stay unevaluated", szoCalls, 0);
+    delete moved;
+    delete sxeP;
     return passed;
 }

@@ -8,5 +8,17 @@ extern int main()
     expect_error("cannot initialize C++ class 'cppi.Tracked' from this expression") {
         cppi.Tracked bad = cppi.add(1, 2);
     }
+    // An explicit-only constructor template never converts an expression template implicitly.
+    cppi_expr.Vec3 exprA = cppi_expr.Vec3(1.0, 2.0, 3.0);
+    expect_error("cannot initialize C++ class 'cppi_expr.ExplicitVec3' from this expression") {
+        cppi_expr.ExplicitVec3 initExplicit = exprA + exprA;
+    }
+    expect_error("cannot initialize C++ class 'cppi_expr.ExplicitVec3' from this expression") {
+        cppi_expr.ExplicitVec3 staticExplicit = cppi_expr.Vec3.Ones();
+    }
+    expect_error("cannot assign to C++ class 'cppi_expr.ExplicitVec3' from this expression") {
+        cppi_expr.ExplicitVec3 assignExplicit = cppi_expr.ExplicitVec3(exprA + exprA);
+        assignExplicit = exprA + exprA;
+    }
     return 0;
 }

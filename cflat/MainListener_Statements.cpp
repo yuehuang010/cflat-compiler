@@ -116,8 +116,9 @@ void MainListener::ParseBlockItemList(CFlatParser::BlockItemListContext* ctx) {
                 ParseDestructuringDeclaration(destructuring);
             }
 
-            // End of a full expression / statement: free owned temporaries not claimed by a named
-            // local or move parameter (e.g. the unnamed `a + b` of a chained concat). Like C++.
+            // End of a full expression: land pending postfix ++/-- (destructuring has no own flush),
+            // free owned temps no named local or move param claimed (e.g. a chained concat's `a + b`).
+            ProcessPlusPlus();
             compiler->FlushOwnedTemps();
         }
     }
@@ -789,6 +790,30 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
                         "use 'new', a move source, or a move-returning call",
                         borrowed.empty() ? std::string("expression") : borrowed,
                         SpellType(*compiler, LLVMBackend::TypeAndValue{ .TypeName = typeName })));
+                    return;
+                }
+            }
+            // Plan converting-constructors.md point 1: `return u;` is `return T(u);`, built
+            // straight into the return slot.
+            if (!explicitMove && (source.Storage == nullptr || source.TypeAndValue.Pointer
+                                  || source.TypeAndValue.TypeName != typeName))
+            {
+                std::string refusal;
+                LLVMBackend::NamedVariable converted = returnNV;
+                compiler->SetCurrentDebugLocation(errCtx->getStart()->getLine());
+                const auto verdict = compiler->ConvertThroughCxxConvertingCtor(
+                    converted, typeName, cxxSretDest, refusal);
+                if (verdict == LLVMBackend::CxxConvertingCtorResult::Converted)
+                {
+                    finishCxxSretReturn();
+                    return;
+                }
+                if (verdict == LLVMBackend::CxxConvertingCtorResult::Refused)
+                {
+                    LogErrorContext(errCtx, std::format(
+                        "cannot return C++ class '{}' from this expression; {}",
+                        compiler->DisplayCxxClassName(CurrentReturnTypeSpelling(compiler)),
+                        refusal));
                     return;
                 }
             }
@@ -2219,6 +2244,7 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
                     compiler->UnregisterOwnedPtrTemp(const_cast<llvm::Value*>(base));
             }
             compiler->FlushOwnedTempsSince(ptrMark, right);
+            compiler->FlushConditionalPtrTempsSince(returnOwnedTempMark.Ptrs);
         }
         compiler->CreateReturnCall(right, retStorage, interfaceReturnStructName,
                                    returnNV.TypeAndValue.IsUnsignedInteger() != -1);

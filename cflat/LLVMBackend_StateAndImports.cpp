@@ -887,6 +887,47 @@ bool LLVMBackend::IsScopedEnumMatch(const TypeAndValue& from, const TypeAndValue
         return !from.Pointer && to.Pointer && to.IsAlias && !to.ElemPointer;
 }
 
+/*
+ * C++ converts an enumeration TO an integer, never back ([conv.integral], [dcl.enum]): neither an
+ * `enum class` nor an unscoped enum parameter of a C++ callee binds an integer, bool or floating
+ * argument. The parameter must be a C++ enum by value or by reference, and the argument a scalar
+ * with no enum identity (enumerators, enum-typed values, `?:` joins of one enum and explicit
+ * casts to the enum all carry it).
+ */
+bool LLVMBackend::CxxEnumParameterRefusesArgument(const NamedVariable& arg,
+                                                  const TypeAndValue& argType,
+                                                  const TypeAndValue& param) const
+{
+        if (param.ElemPointer || param.IsArrayView || param.IsFunctionPointer) return false;
+        if (param.Pointer && !(param.IsAlias || param.IsRvalueRef || param.IsCxxConstRef))
+            return false;
+        const bool paramIsEnum = param.IsScopedEnum || !param.EnumBacking.empty()
+            || IsScopedEnumTypeName(param.TypeName) || !ResolveEnumTypeName(param.TypeName).empty();
+        if (!paramIsEnum) return false;
+
+        auto enumIdentity = [&](const TypeAndValue& tv) {
+            return tv.IsScopedEnum || !tv.EnumBacking.empty() || IsScopedEnumTypeName(tv.TypeName)
+                || !ResolveEnumTypeName(tv.TypeName).empty();
+        };
+        const TypeAndValue& own = arg.TypeAndValue;
+        if (own.Pointer || argType.Pointer || own.ElemPointer || argType.ElemPointer) return false;
+        if (enumIdentity(own) || enumIdentity(argType)
+            || !ResolveEnumTypeName(arg.InferSourceTypeName).empty()
+            || IsScopedEnumTypeName(arg.InferSourceTypeName))
+            return false;
+        auto primitiveName = [&](const std::string& name) {
+            return !name.empty() && name != "void" && IsPrimitiveTypeName(ResolveTypeAlias(name));
+        };
+        if (!arg.LiteralIdentity.empty()) return true;
+        // Any other scalar with no enum identity: a primitive-typed value, or an unnamed
+        // integer / floating value (`1 + 2`, an operator's literal right operand).
+        if (!own.TypeName.empty() || !argType.TypeName.empty())
+            return primitiveName(!own.TypeName.empty() ? own.TypeName : argType.TypeName);
+        if (!arg.InferSourceTypeName.empty()) return primitiveName(arg.InferSourceTypeName);
+        return arg.BaseType != nullptr
+            && (arg.BaseType->isIntegerTy() || arg.BaseType->isFloatingPointTy());
+}
+
 std::string LLVMBackend::GetEnumBackingType(const std::string& enumName) const
 {
         auto it = enumBackingTypes.find(enumName);
@@ -1437,6 +1478,27 @@ std::string LLVMBackend::ResolveQualifiedName(const std::string& name, bool forc
             std::string resolvedFirst = ResolveNamespace(firstComp);
             if (resolvedFirst != firstComp)
                 nsPrefix = restComp.empty() ? resolvedFirst : resolvedFirst + "." + restComp;
+        }
+        /*
+         * A nested alias (`namespace simdjson { namespace ondemand = arm64::ondemand; }`) names a
+         * namespace under a dotted spelling. Rewrite the longest aliased prefix to its target so
+         * both spellings of a type share one key; repeat for an alias of an alias.
+         */
+        for (int hop = 0; hop < 16; ++hop)
+        {
+            bool rewrote = false;
+            for (size_t end = nsPrefix.size(); end != std::string::npos && end > 0;
+                 end = nsPrefix.rfind('.', end - 1))
+            {
+                const std::string head = nsPrefix.substr(0, end);
+                if (head.find('.') == std::string::npos) break;   // first component handled above
+                const std::string target = ResolveNamespaceAliasExact(head);
+                if (target == head) continue;
+                nsPrefix = target + nsPrefix.substr(end);
+                rewrote = true;
+                break;
+            }
+            if (!rewrote) break;
         }
 
         // "$global$:<alias>" sentinel: file-scoped import alias (import "x.cb" as Alias).
@@ -2260,6 +2322,7 @@ nlohmann::json LLVMBackend::FieldToJson(const CRecordFieldEntry& f)
 {
         nlohmann::json j = {{"n", f.name}, {"ct", f.ctype}};
         if (f.isBitfield) { j["bf"] = true; j["bw"] = f.bitWidth; }
+        if (f.isZeroSize) j["zs"] = true;
         if (f.offsetBytes != 0) j["ob"] = f.offsetBytes;
         if (f.sizeBytes != 0) j["sz"] = f.sizeBytes;
         if (f.alignBytes != 0) j["al"] = f.alignBytes;
@@ -2274,6 +2337,7 @@ LLVMBackend::CRecordFieldEntry LLVMBackend::FieldFromJson(const SjVal& j)
         f.name      = j.value("n",  std::string{});
         f.ctype     = j.value("ct", std::string{});
         f.isBitfield = j.value("bf", false);
+        f.isZeroSize = j.value("zs", false);
         f.bitWidth   = j.value("bw", 0u);
         f.offsetBytes = j.value("ob", (uint64_t)0);
         f.sizeBytes = j.value("sz", (uint64_t)0);
@@ -2316,6 +2380,7 @@ nlohmann::json LLVMBackend::CxxMemberToJson(
         if (m.isImplicit)           j["im"] = true;
         if (m.isTemplateSpecialization) j["ts"] = true;
         if (m.needsLocalDefinition) j["nd"] = true;
+        if (m.definitionAssumed)    j["da"] = true;
         if (!m.bindRefusal.empty()) j["br"] = m.bindRefusal;
         if (!m.refusalCause.empty())
         {
@@ -2374,6 +2439,7 @@ cflat_cinterop::RawCxxMember LLVMBackend::CxxMemberFromJson(
         m.isImplicit           = j.value("im", false);
         m.isTemplateSpecialization = j.value("ts", false);
         m.needsLocalDefinition = j.value("nd", false);
+        m.definitionAssumed = j.value("da", false);
         m.bindRefusal = j.value("br", std::string());
         m.refusalCause = j.value("rcs", std::string());
         m.returnsThis          = j.value("rth", false);
@@ -2515,6 +2581,20 @@ nlohmann::json LLVMBackend::RecordToJson(const CRecordEntry& r, CCachePathTable*
             for (const auto& m : r.members) ms.push_back(CxxMemberToJson(m, files));
             j["mb"] = ms;
         }
+        if (!r.ctorTemplates.empty())
+        {
+            nlohmann::json ts = nlohmann::json::array();
+            for (const auto& t : r.ctorTemplates)
+            {
+                nlohmann::json tj = {{"h", t.head}, {"pt", t.paramTypes}, {"df", t.defaulted}};
+                if (t.variadic) tj["va"] = true;
+                if (t.isDeleted) tj["dl"] = true;
+                if (t.isExplicit) tj["ex"] = true;
+                if (t.access != 0) tj["ac"] = t.access;
+                ts.push_back(std::move(tj));
+            }
+            j["ctt"] = ts;
+        }
         if (!r.staticVars.empty())
         {
             nlohmann::json vs = nlohmann::json::array();
@@ -2580,6 +2660,18 @@ LLVMBackend::CRecordEntry LLVMBackend::RecordFromJson(const SjVal& j, const CCac
                 r.virtualBases.push_back(std::move(rb));
             }
         if (j.contains("mb")) for (const auto& m : j["mb"]) r.members.push_back(CxxMemberFromJson(m, files));
+        if (j.contains("ctt")) for (const auto& t : j["ctt"])
+        {
+            cflat_cinterop::RawCxxCtorTemplate ct;
+            ct.head = t.value("h", std::string{});
+            ct.paramTypes = t["pt"].to_string_vector();
+            for (uint64_t value : t["df"].to_u64_vector()) ct.defaulted.push_back(value != 0 ? 1 : 0);
+            ct.variadic = t.value("va", false);
+            ct.isDeleted = t.value("dl", false);
+            ct.isExplicit = t.value("ex", false);
+            ct.access = t.value("ac", 0);
+            r.ctorTemplates.push_back(std::move(ct));
+        }
         if (j.contains("sv")) for (const auto& v : j["sv"]) r.staticVars.push_back(CxxStaticVarFromJson(v, files));
         if (j.contains("fs")) for (const auto& f : j["fs"]) r.fields.push_back(FieldFromJson(f));
         return r;
@@ -2871,6 +2963,11 @@ bool LLVMBackend::TryLoadCHeaderDiskCache(
         // non-public member type (recorded as unsupported).
         // v99 carries an unscoped enum's integral promotion type for C++ overload ranking.
         // v100 emits out-of-line non-inline members of implicit template instantiations locally.
+        // v106 maps scalar C++ T&& returns as aliases so callers load the referenced value.
+        // v107 companions emit inline variables and ctor-initializer callees their bodies reach.
+        // v108 publishes `using ns::X;` of an enum / typedef / enumerator / variable under ns.
+        // v110 records `using ns::C;` of a class for the cross-import conflict check.
+        // v111 records namespace-scope class templates for the same check.
         if (version != kCHeaderCacheVersion) return cacheMiss("cache version");
 
         if (!expectedRequestKey.empty()
@@ -2947,6 +3044,10 @@ bool LLVMBackend::TryLoadCHeaderDiskCache(
             if (j.contains("namespaceAliases"))
                 for (const auto& a : j["namespaceAliases"])
                     entry.namespaceAliases.emplace_back(
+                        a.value("from", std::string{}), a.value("to", std::string{}));
+            if (j.contains("classUsings"))
+                for (const auto& a : j["classUsings"])
+                    entry.classUsings.emplace_back(
                         a.value("from", std::string{}), a.value("to", std::string{}));
             if (j.contains("functionPointerAbis"))
                 for (const auto& p : j["functionPointerAbis"])
@@ -3223,6 +3324,11 @@ void LLVMBackend::WriteCHeaderDiskCache(
         // non-public member type (recorded as unsupported).
         // v99 carries an unscoped enum's integral promotion type for C++ overload ranking.
         // v100 emits out-of-line non-inline members of implicit template instantiations locally.
+        // v106 maps scalar C++ T&& returns as aliases so callers load the referenced value.
+        // v107 companions emit inline variables and ctor-initializer callees their bodies reach.
+        // v108 publishes `using ns::X;` of an enum / typedef / enumerator / variable under ns.
+        // v110 records `using ns::C;` of a class for the cross-import conflict check.
+        // v111 records namespace-scope class templates for the same check.
         j["version"] = kCHeaderCacheVersion;
         j["mtime"]   = (int64_t)mtime.time_since_epoch().count();
         j["hash"]    = contentHash;
@@ -3308,6 +3414,10 @@ void LLVMBackend::WriteCHeaderDiskCache(
         for (const auto& a : entry.namespaceAliases)
             namespaceAliases.push_back({{"from", a.first}, {"to", a.second}});
         j["namespaceAliases"] = namespaceAliases;
+        nlohmann::json classUsings = nlohmann::json::array();
+        for (const auto& a : entry.classUsings)
+            classUsings.push_back({{"from", a.first}, {"to", a.second}});
+        j["classUsings"] = classUsings;
         nlohmann::json functionPointerAbis = nlohmann::json::array();
         for (const auto& p : entry.functionPointerAbis)
             functionPointerAbis.push_back({{"sig", p.signature}, {"rt", p.retType},

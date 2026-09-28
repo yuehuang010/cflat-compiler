@@ -15,5 +15,11 @@ extern int main()
         cppi.PrivBoxDerived priv = default;
         cppi.BaseBox<int>* sneak = &priv;
     }
+    expect_error("member 'K' of C++ class 'cppi_inh.StaticPrivateDerived' is private") {
+        cppi_inh.StaticPrivateDerived.K();
+    }
+    expect_error("member 'K' of C++ class 'cppi_inh.StaticProtectedDerived' is protected") {
+        cppi_inh.StaticProtectedDerived.K();
+    }
     return 0;
 }

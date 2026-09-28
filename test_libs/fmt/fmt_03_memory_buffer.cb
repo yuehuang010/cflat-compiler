@@ -1,6 +1,5 @@
 // GUARDS: fmt memory_buffer layout and format_to
 // FROM: scratch/probe3/f04_memory_buffer.cb
-// DISABLED: internal/issue/p3/cpp-no-unique-address-member-layout-mismatch.md
 import cpp "fmt/format.h";
 extern int printf(const char* fmt, ...);
 extern int main()

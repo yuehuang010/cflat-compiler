@@ -105,3 +105,32 @@ namespace cppu_shadow_chain_c
     inline int own_c() { return 3057; }
     namespace nested { inline int own_c_nested() { return 3059; } }
 }
+
+// A USING-DECLARATION (`namespace a { using b::X; }`) makes `a::X` a second spelling of the SAME
+// entity, so an enum, enumerator, typedef or variable reached through `a` must stay one with `b`'s.
+// cppu_decl_twin.EC is the same-named unrelated enum: its values must never leak into the alias.
+namespace cppu_decl_b
+{
+    enum class EC { Lo = 3, Hi = 9 };
+    enum EU { EU_A = 4, EU_B = 11 };
+    using ECT = EC;
+    struct Box { int v; };
+    template<class T> struct TBox { T v; };
+    inline int decl_counter = 55;
+    inline int ec_val(EC e) noexcept { return (int)e * 10; }
+    inline int eu_val(EU e) noexcept { return (int)e * 10; }
+    inline int ov(EC) noexcept { return 1; }
+    inline int ov(int) noexcept { return 2; }
+}
+namespace cppu_decl_a
+{
+    using cppu_decl_b::EC;
+    using cppu_decl_b::EU;
+    using cppu_decl_b::EU_A;
+    using cppu_decl_b::ECT;
+    using cppu_decl_b::Box;
+    using cppu_decl_b::TBox;
+    using cppu_decl_b::decl_counter;
+}
+namespace cppu_decl_e { using enum cppu_decl_b::EC; }
+namespace cppu_decl_twin { enum class EC { Lo = 1000, Hi = 2000 }; inline int twin_val(EC e) noexcept { return (int)e; } }

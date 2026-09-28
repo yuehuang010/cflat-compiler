@@ -1,7 +1,26 @@
 # Implicit converting constructors (native CFlat + C++ bridge)
 
-Status: RULED 2026-09-26, not started. Replaces the p4 issue
-`cpp-converting-constructor-at-copy-init-and-assignment.md` (deleted; its repro is below).
+Status: RULED 2026-09-26. Phases 1 + 3 landed (shared resolver
+`LLVMBackend::ConvertThroughCxxConvertingCtor`, C++ class targets at init, assignment, field /
+element store, return, brace element); phase 2 (native CFlat positions) and phase 4 (docs) open.
+Replaces the p4 issue `cpp-converting-constructor-at-copy-init-and-assignment.md` (deleted; its
+repro is below).
+
+Phase 3 leftovers, for phase 2 to pick up: a TRIVIALLY-COPYABLE C++ class (`std.optional<int>`,
+a POD with a one-arg ctor) takes the native value path, not the C++ construct-into-slot path, so
+it converts only once phase 2 wires that path; a `?:` of scalars into a C++ class local or
+return (`T t = c ? 1 : 2;`, `return c ? 1 : 2;` - refused cleanly) and a global initializer are
+still refused. A pointer source converts at init, return and a call argument (`P p = &k;`, `take(&k)`
+into `P(const int*)`) for a proven single-level primitive pointer; a pointer to a class is not
+offered, and the address-of operand of a binary operator is issue
+`p3/cpp-operator-address-of-operand-not-converted.md`. Assignment follows C++ ranking: an exact
+`operator=(U)`, then a template
+`operator=<U>`, then any other direct `operator=` beats the converting constructor, each tried as
+the real call with diagnostics suppressed (a probe and the call cannot disagree). When no direct
+one is callable but C++ would call an arithmetic `operator=(U)` that CFlat's call rules refuse
+(`int` into `operator=(double)`), the assignment is refused naming it, never silently rerouted. Direct `operator=(U)` is used only for a provably live destination; conditionally-live locals and all globals take `T(u)` + move-assign (operator= on a possibly unconstructed object is UB). A C++ target converts through
+the call-argument classifier, so it accepts what a C++ call argument accepts today - including a
+narrowing `double -> int` constructor argument, which point 4 refuses; ruling needed.
 
 ## Ruling (maintainer, 2026-09-26)
 
@@ -30,8 +49,7 @@ the spec; anything that behaves differently from the explicit form is a bug.
    `std::string::operator=(const char*)`), that overload wins, as in C++ overload resolution.
    Otherwise build `T(u)` and assign it as a moved temporary (the normal owning-temporary path).
 3. **One user-defined conversion.** No chaining: `char*` -> `std.string` -> `Wrapper` is refused;
-   a converting constructor never combines with an `operator T` conversion (native `operator T`
-   stays explicit-cast-only).
+   a converting constructor never combines with an `operator T` conversion.
 4. **The source must pass the constructor's parameter under CFlat CALL rules** - no implicit
    narrowing (2026-09-04), pointer is not a number (2026-09-26), int -> bool the one exception.
    So `Meters m = 3;` works iff `Meters(3)` works.

@@ -122,6 +122,7 @@ unaryExpression
     | postfixExpression
     | unaryOperator castExpression
     | 'alignof' '(' typeName ')'
+    | 'alignof' '(' unaryExpression ')'
     | newExpression
     | deleteExpression
     | moveExpression

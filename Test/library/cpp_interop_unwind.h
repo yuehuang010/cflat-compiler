@@ -55,6 +55,7 @@ inline void reset() noexcept
 inline int live() noexcept { return Tr::live; }
 inline int dtors() noexcept { return Tr::dtors; }
 inline int thrower(int v) { if (v > 0) throw v; return v; }
+inline Tr makeTr(int v) { if (v > 0) throw v; return Tr(v); }
 inline int safe(int v) noexcept { return v + 1; }
 typedef int (*Cb)(int);
 inline int guarded(Cb f, int x) { try { return f(x); } catch (int e) { return -e; } }

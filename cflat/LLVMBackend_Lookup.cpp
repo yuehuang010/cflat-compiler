@@ -703,6 +703,34 @@ bool LLVMBackend::IsCxxRvalueReferenceArgument(const NamedVariable& arg) const
         return load == nullptr || load->getPointerOperand() != storage;
 }
 
+/*
+ * POSITIVE proof that a scalar call argument is an lvalue a C++ `T&` may bind: the front end
+ * classified it as an lvalue designator (or a call returning `T&`), it is not flagged rvalue, and
+ * its value was loaded from its own storage in this very expression. No name lookup.
+ */
+bool LLVMBackend::IsProvenCxxScalarLvalue(const NamedVariable& arg) const
+{
+        if (arg.CxxLvalueKind == 0 || arg.CxxLvalueKind == 3 || arg.IsExplicitMove) return false;
+        if (IsRvalueReferenceArgument(arg)) return false;
+        /*
+         * A call is an lvalue only through a `T&` result (its IsRvalue marks the call itself):
+         * an alias, or a value loaded from the very pointer the call returned.
+         */
+        if (arg.CxxLvalueKind == 2)
+        {
+            if (arg.TypeAndValue.IsAlias) return true;
+            auto* load = llvm::dyn_cast_or_null<llvm::LoadInst>(arg.Primary);
+            return load != nullptr && llvm::isa<llvm::CallBase>(load->getPointerOperand())
+                && (arg.Storage == nullptr || arg.Storage == load->getPointerOperand());
+        }
+        if (arg.IsRvalue) return false;
+        if (arg.TypeAndValue.IsAlias) return true;
+        if (arg.Storage == nullptr) return false;
+        if (llvm::isa<llvm::PHINode>(arg.Storage)) return true;   // a '?:' join of addresses
+        auto* load = llvm::dyn_cast_or_null<llvm::LoadInst>(arg.Primary);
+        return load != nullptr && load->getPointerOperand() == arg.Storage;
+}
+
 bool LLVMBackend::IsCxxReferenceParameter(const FunctionSymbol& candidate, size_t index) const
 {
         if (!candidate.IsCxx || candidate.UniqueName.starts_with("__cflat_udc_")) return false;

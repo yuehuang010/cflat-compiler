@@ -37,10 +37,28 @@ namespace cppinl
         inline Box(int start) noexcept : value_(start) { ++ctors; }
         inline ~Box() noexcept { ++dtors; }
         inline int get() const noexcept { return value_; }
+        inline Box make(int start) const noexcept { return Box(start); }
         inline void add(int v) noexcept { value_ += v; }
         inline int scaled() const noexcept { return helper(value_); }
         int value_;
     };
+
+    inline int self_return_ctors = 0;
+    class SelfReturn
+    {
+    public:
+        SelfReturn* self;
+        int value;
+        explicit SelfReturn(int v = 0) noexcept : self(this), value(v)
+        {
+            ++self_return_ctors;
+        }
+        SelfReturn(const SelfReturn&) = delete;
+        SelfReturn(SelfReturn&&) = delete;
+        inline bool self_ok() const noexcept { return self == this; }
+    };
+    inline SelfReturn make_self_return(int value) noexcept { return SelfReturn(value); }
+    inline int self_return_ctor_count() noexcept { return self_return_ctors; }
 
     // All-inline polymorphic hierarchy: no key function, so the vtable of each class must be
     // emitted here (linkonce_odr, COMDAT) or virtual dispatch has nothing to read.

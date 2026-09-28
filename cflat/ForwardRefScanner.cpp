@@ -1784,14 +1784,24 @@ void ForwardRefScanner::ScanGenericTypeUses(antlr4::RuleContext* ctx) {
                         if (tts->tupleTypePackEntry() == nullptr)
                         {
                             std::vector<std::string> typeArgs;
+                            bool allArgsResolveAsTypes = true;
                             for (auto* entry : tts->tupleTypeEntry())
                             {
                                 auto* compiler = Compiler(tts);
                                 PrimitiveTypeError argError;
-                                typeArgs.push_back(TupleEntryArgName(compiler, entry, &argError));
+                                std::string argName = TupleEntryArgName(compiler, entry, &argError);
                                 if (HasPrimitiveTypeError(argError))
                                     compiler->LogError(LocalizePrimitiveTypeError(compiler, argError));
+                                if (entry->typeSpecifier()->simdTypeSpecifier() == nullptr
+                                    && !compiler->IsKnownTypeName(argName)
+                                    && !compiler->IsTypeArgTypeKey(argName))
+                                    allArgsResolveAsTypes = false;
+                                typeArgs.push_back(std::move(argName));
                             }
+                            // A parenthesized expression inside `sizeof` can parse as tuple type
+                            // sugar here. Do not predeclare tuple<x,y> unless each entry resolves.
+                            if (!allArgsResolveAsTypes)
+                                continue;
                             auto* c = Compiler(tts);
                             std::string mangledName = MangleGenericInstance(*c, "tuple", typeArgs);
                             c->CreateStructType(mangledName, {});

@@ -4497,6 +4497,7 @@ void LLVMBackend::ResetForReanalysis()
     cxxFunctionTemplateOwnerGroup_.clear();
     cxxFunctionSignatures_.clear();
     cxxFunctionBindAttempts_.clear();
+    cxxNamespaceEntities_.clear();
     cxxFunctionOwnerGroup_.clear();
     cxxBoundSignatureKeys_.clear();
     cxxTypeOwnerGroup_.clear();
@@ -4518,6 +4519,7 @@ void LLVMBackend::ResetForReanalysis()
     cppStructBases_.clear();
     cppStructOverrideNames_.clear();
     cxxForeignDefinitions_.clear();
+    cxxAssumedBodyOwners_.clear();
     cxxTentativeTypes_.clear();
     // Per-analysis emitted IR: the next analysis re-adopts whatever its own imports produce (from
     // the extractor or the header cache). No Clang pointer is retained, only bitcode bytes.
@@ -4629,7 +4631,9 @@ void LLVMBackend::ResetForReanalysis()
     // C++ record identity/triviality follows dataStructures: a survivor would let the next file
     // pass a record by value on the strength of a registration that no longer exists.
     cxxRecords_.clear();
+    cxxAnonLayoutRefusals_.clear();
     cxxBindingRefusals_.clear();
+    cxxImplicitConversionRefusal_.clear();
     cxxTriviallyCopyableRecords_.clear();
     cxxNontrivialRecords_.clear();
     cxxClasses_.clear();
@@ -4837,6 +4841,7 @@ void LLVMBackend::ResetForReanalysis()
     pendingInitAllocAlign = 0;
     lastCallReturnsAllocAlign = 0;
     lastCallIsBonded = false;
+    lastCxxRequestClangRejected_ = false;
     // Left non-zero by an aborted compile mid-ternary, this would wrongly suppress the deref
     // guard for the next file's straight-line code.
     suppressExplicitNullDerefGuard_ = 0;
@@ -7213,6 +7218,15 @@ bool LLVMBackend::SaveCoreBitcode(const std::string& cacheDir, const std::string
             so["name"]      = name;
             so["llvm_type"] = sd.StructType ? std::string(sd.StructType->getName()) : "";
             so["is_union"]  = sd.IsUnion;
+            if (sd.CxxOffsetLayout)
+            {
+                so["cxx_offset_layout"] = true;
+                llvm::json::Array offsets, elements;
+                for (uint64_t offset : sd.CxxFieldOffsets) offsets.push_back(static_cast<int64_t>(offset));
+                for (unsigned element : sd.CxxFieldElements) elements.push_back(static_cast<int64_t>(element));
+                so["cxx_field_offsets"] = std::move(offsets);
+                so["cxx_field_elements"] = std::move(elements);
+            }
             if (sd.UserRequestedAlignment > 0)
                 so["user_align"] = static_cast<int64_t>(sd.UserRequestedAlignment);
             if (sd.Destructor)
@@ -7784,6 +7798,13 @@ bool LLVMBackend::LoadCoreBitcodeIfFresh(const std::string& cacheDir, const std:
                 sd.StructType = llvm::StructType::getTypeByName(*context, v->str());
             if (!sd.StructType) continue;
             if (auto v = so->getBoolean("is_union"))    sd.IsUnion = *v;
+            if (auto v = so->getBoolean("cxx_offset_layout")) sd.CxxOffsetLayout = *v;
+            if (auto* offsets = so->getArray("cxx_field_offsets"))
+                for (auto& offset : *offsets)
+                    if (auto n = offset.getAsInteger()) sd.CxxFieldOffsets.push_back(static_cast<uint64_t>(*n));
+            if (auto* elements = so->getArray("cxx_field_elements"))
+                for (auto& element : *elements)
+                    if (auto n = element.getAsInteger()) sd.CxxFieldElements.push_back(static_cast<unsigned>(*n));
             if (auto v = so->getInteger("user_align"))  sd.UserRequestedAlignment = static_cast<uint64_t>(*v);
             if (auto v = so->getString("destructor"))   sd.Destructor = module->getFunction(v->str());
             if (auto v = so->getString("type_desc"))    sd.typeDescriptor = module->getNamedGlobal(v->str());

@@ -1,7 +1,7 @@
 // GUARDS: Eigen transpose, inverse, block, and column access through explicit spellings
 // FROM: scratch/probe3/e08_transpose_inverse.cb scratch/probe3/e10_block.cb
 // NOTE: explicit Matrix(...) wraps and (long) block arguments are workarounds; the natural forms
-//       are covered by the DISABLED eigen_05/eigen_06 cases. QR solve lives in eigen_07.
+//       are covered by eigen_05 and eigen_06. QR solve lives in eigen_07.
 import cpp "Eigen/Dense";
 extern int printf(const char* fmt, ...);
 extern int main()

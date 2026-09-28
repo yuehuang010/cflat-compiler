@@ -26,3 +26,8 @@ A. A CFlat struct containing a non-trivially-relocatable C++ field is constructe
 B. Refuse such a field with a diagnostic until design A exists.
 
 Neither option is selected in this issue.
+
+## Ruling (maintainer, 2026-09-27)
+
+Design A, as C++ does it. Tracked in internal/plan/cflat-struct-nontrivial-cxx-fields.md; phase 0 there
+is the option-B refusal as a stopgap until the lowering lands.

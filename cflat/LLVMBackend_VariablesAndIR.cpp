@@ -69,7 +69,7 @@ llvm::GlobalVariable* LLVMBackend::CreateGlobalVariable(TypeAndValue typeValue, 
                 // the int path below asks a non-integer type for its bit width.
                 if (destinationType->isFloatingPointTy())
                 {
-                    double converted = srcIsUnsigned
+                    double converted = srcIsUnsigned || intValue->getBitWidth() == 1
                         ? static_cast<double>(intValue->getZExtValue())
                         : static_cast<double>(intValue->getSExtValue());
                     initValue = llvm::ConstantFP::get(destinationType, converted);
@@ -599,7 +599,54 @@ llvm::Value* LLVMBackend::CreateStructGEP(llvm::Type* structType, llvm::Value* s
             return gep;
         }
         return builder->CreateStructGEP(structType, structAlloc, index, variableName);
-    }
+}
+
+llvm::Value* LLVMBackend::CreateCxxFieldGEP(const StructData& data, llvm::Value* object,
+                                             unsigned index, std::string name)
+{
+        return CreateCxxFieldGEP(*builder, data, object, index, std::move(name));
+}
+
+llvm::Value* LLVMBackend::CreateCxxFieldGEP(llvm::IRBuilder<>& irBuilder, const StructData& data,
+                                             llvm::Value* object, unsigned index, std::string name)
+{
+        if (!data.CxxOffsetLayout || index >= data.CxxFieldOffsets.size())
+        {
+            if (llvm::isa<llvm::GlobalVariable>(object))
+            {
+                llvm::Value* idxs[] = { irBuilder.getInt32(0), irBuilder.getInt32(index) };
+                auto* gep = llvm::GetElementPtrInst::CreateInBounds(data.StructType, object, idxs);
+                irBuilder.Insert(gep, name);
+                return gep;
+            }
+            return irBuilder.CreateStructGEP(data.StructType, object, index, name);
+        }
+        llvm::GetElementPtrInst* gep = nullptr;
+        if (llvm::isa<llvm::GlobalVariable>(object))
+        {
+            // Keep the explicit instruction form used by CreateStructGEP: folding a global
+            // field address into a ConstantExpr can assert in opaque-pointer mode.
+            llvm::Value* idxs[] = { irBuilder.getInt64(data.CxxFieldOffsets[index]) };
+            auto* inst = llvm::GetElementPtrInst::CreateInBounds(irBuilder.getInt8Ty(), object, idxs);
+            irBuilder.Insert(inst, name);
+            gep = inst;
+        }
+        else
+            gep = llvm::cast<llvm::GetElementPtrInst>(irBuilder.CreateInBoundsGEP(
+                irBuilder.getInt8Ty(), object, irBuilder.getInt64(data.CxxFieldOffsets[index]), name));
+        llvm::Metadata* operands[] = {
+            llvm::MDString::get(*context, data.StructType->getName()),
+            llvm::ConstantAsMetadata::get(builder->getInt32(index))
+        };
+        gep->setMetadata("cflat.cxx.field", llvm::MDNode::get(*context, operands));
+        return gep;
+}
+
+unsigned LLVMBackend::CxxFieldElementIndex(const StructData& data, unsigned index) const
+{
+        if (!data.CxxOffsetLayout || index >= data.CxxFieldElements.size()) return index;
+        return data.CxxFieldElements[index];
+}
 
 llvm::Value* LLVMBackend::CreateGEP(llvm::Type* type, llvm::Value* ptr, llvm::Value* offset, std::string name)
 {
@@ -727,6 +774,8 @@ llvm::Value* LLVMBackend::Upconvert(llvm::Value* value, llvm::Type* destType, bo
         }
         else if (srcType->isIntegerTy() && destType->isFloatingPointTy())
         {
+            // bool (i1) is unsigned: true -> 1.0, never -1.0.
+            srcIsUnsigned = srcIsUnsigned || srcType->isIntegerTy(1);
             // Integer literal initializer for a float/double field (e.g. float x = 0)
             if (auto* constInt = llvm::dyn_cast<llvm::ConstantInt>(value))
             {
@@ -819,6 +868,11 @@ int LLVMBackend::CompareUpconvert(llvm::Type* srcType, llvm::Type* destType) con
 llvm::Type* LLVMBackend::GetTypeFromStorage(llvm::Value* value) const
 {
         llvm::Type* type = nullptr;
+
+        if (auto* gep = llvm::dyn_cast_or_null<llvm::GetElementPtrInst>(value);
+            gep != nullptr && gep->getMetadata("cflat.cxx.field") != nullptr)
+            if (const auto* field = FindDeclaredFieldTypeAndValueForStorage(value))
+                return GetType(*field);
 
         if (auto* allocaInst = llvm::dyn_cast<llvm::AllocaInst>(value))
         {
@@ -920,10 +974,10 @@ llvm::Value* LLVMBackend::CreateCast(llvm::Value* value, llvm::Type* destType, b
                 return builder->CreateFPExt(value, destType);
         }
 
-        // Integer -> Float
+        // Integer -> Float; bool (i1) is unsigned: true -> 1.0, never -1.0.
         if (srcType->isIntegerTy() && destType->isFloatingPointTy())
         {
-            return isSigned ? builder->CreateSIToFP(value, destType)
+            return isSigned && !srcType->isIntegerTy(1) ? builder->CreateSIToFP(value, destType)
                             : builder->CreateUIToFP(value, destType);
         }
 
@@ -1088,6 +1142,7 @@ LLVMBackend::NamedVariable LLVMBackend::EmitBitfieldRead(
 
         DeclTypeAndValue bfType{};
         bfType.TypeName = bf.TypeName;
+        bfType.EnumBacking = GetEnumBackingType(bf.TypeName);
         bfType.VariableName = bf.Name;
         bfType.IsBitfield = true;
         bfType.BitWidth = bf.BitWidth;
@@ -1130,11 +1185,70 @@ unsigned LLVMBackend::BitfieldStorageBits(const std::string& typeName)
 std::vector<LLVMBackend::DeclTypeAndValue> LLVMBackend::PackBitfields(
         const std::vector<DeclTypeAndValue>& in,
         std::vector<BitfieldInfo>& outBitfields,
-        bool itaniumPacking)
+        bool itaniumPacking,
+        bool unionPacking)
 {
         std::vector<DeclTypeAndValue> out;
         outBitfields.clear();
         int synthIdx = 0;
+        if (unionPacking)
+        {
+            for (const auto& field : in)
+            {
+                if (!field.IsBitfield)
+                {
+                    out.push_back(field);
+                    continue;
+                }
+                const std::string& storageType = field.IntegralSpelling();
+                const unsigned storageBits = BitfieldStorageBits(storageType);
+                if (storageBits == 0)
+                {
+                    LogError("bitfield '" + field.VariableName + "' has unsupported underlying type '"
+                             + SpellType(*this, field) + "' (must be an integer or bool type)");
+                    continue;
+                }
+                if (field.BitWidth > storageBits)
+                {
+                    LogError("bitfield '" + field.VariableName + "' width " + std::to_string(field.BitWidth)
+                           + " exceeds underlying type '" + SpellType(*this, field) + "' width "
+                           + std::to_string(storageBits));
+                    continue;
+                }
+                if (field.BitWidth == 0) continue;
+
+                DeclTypeAndValue storage = field;
+                storage.TypeName = storageType;
+                storage.EnumBacking.clear();
+                storage.VariableName = "__bf" + std::to_string(synthIdx++);
+                storage.IsBitfield = false;
+                storage.IsBitfieldStorage = true;
+                storage.BitWidth = 0;
+                storage.BitOffset = 0;
+                storage.StorageFieldIndex = 0;
+                storage.Initializer = nullptr;
+                storage.BraceInitializer = nullptr;
+                storage.Annotations.clear();
+                storage.GuardedBy.clear();
+                const unsigned index = static_cast<unsigned>(out.size());
+                out.push_back(std::move(storage));
+
+                if (!field.VariableName.empty())
+                {
+                    BitfieldInfo info;
+                    info.Name = field.VariableName;
+                    info.TypeName = field.TypeName;
+                    info.IsUnsigned = field.IsUnsignedInteger() != -1 || field.TypeName == "bool";
+                    info.StorageFieldIndex = index;
+                    info.BitOffset = 0;
+                    info.BitWidth = field.BitWidth;
+                    info.GuardedBy = field.GuardedBy;
+                    info.Annotations = field.Annotations;
+                    outBitfields.push_back(std::move(info));
+                }
+            }
+            return out;
+        }
         size_t i = 0;
         while (i < in.size())
         {
@@ -1146,7 +1260,7 @@ std::vector<LLVMBackend::DeclTypeAndValue> LLVMBackend::PackBitfields(
                 continue;
             }
 
-            unsigned storageBits = BitfieldStorageBits(cur.TypeName);
+            unsigned storageBits = BitfieldStorageBits(cur.IntegralSpelling());
             if (storageBits == 0)
             {
                 LogError("bitfield '" + cur.VariableName + "' has unsupported underlying type '"
@@ -1177,6 +1291,8 @@ std::vector<LLVMBackend::DeclTypeAndValue> LLVMBackend::PackBitfields(
             unsigned bitOffset = 0;
             unsigned currentStorageBits = storageBits;
             DeclTypeAndValue storage = cur;
+            storage.TypeName = cur.IntegralSpelling();
+            storage.EnumBacking.clear();
             // C++ bool bitfields share a byte-sized allocation unit. Keep the semantic
             // bitfield type as bool in BitfieldInfo, but make the synthetic ABI slot a byte so
             // by-value aggregate coercion preserves flags above bit 0.
@@ -1198,7 +1314,7 @@ std::vector<LLVMBackend::DeclTypeAndValue> LLVMBackend::PackBitfields(
             // and its allocation unit grows to the widest participating base type. MSVC
             // closes the unit only when the declared type SIZE changes (int/unsigned share).
             while (i < in.size() && in[i].IsBitfield
-                   && (itaniumPacking || BitfieldStorageBits(in[i].TypeName) == storageBits))
+                   && (itaniumPacking || BitfieldStorageBits(in[i].IntegralSpelling()) == storageBits))
             {
                 const auto& bf = in[i];
                 if (bf.BitWidth == 0)
@@ -1207,7 +1323,7 @@ std::vector<LLVMBackend::DeclTypeAndValue> LLVMBackend::PackBitfields(
                     i++;
                     break;
                 }
-                const unsigned bfStorageBits = BitfieldStorageBits(bf.TypeName);
+                const unsigned bfStorageBits = BitfieldStorageBits(bf.IntegralSpelling());
                 if (bfStorageBits == 0)
                 {
                     LogError("bitfield '" + bf.VariableName + "' has unsupported underlying type '"
@@ -1233,7 +1349,8 @@ std::vector<LLVMBackend::DeclTypeAndValue> LLVMBackend::PackBitfields(
                 if (itaniumPacking && bfStorageBits > currentStorageBits)
                 {
                     currentStorageBits = bfStorageBits;
-                    storage.TypeName = bf.TypeName == "bool" ? "u8" : bf.TypeName;
+                    storage.TypeName = bf.TypeName == "bool" ? "u8" : bf.IntegralSpelling();
+                    storage.EnumBacking.clear();
                     out[storageIdx].TypeName = storage.TypeName;
                 }
                 if (!bf.VariableName.empty())
@@ -1470,7 +1587,9 @@ void LLVMBackend::RejectByValueContainmentCycles(const std::string& name,
         visit(name);
     }
 
-llvm::StructType* LLVMBackend::CreateStructType(std::string name, std::vector<LLVMBackend::DeclTypeAndValue> typeAndValues, uint64_t userAlign, std::vector<BitfieldInfo>* bitfields, bool isPacked)
+llvm::StructType* LLVMBackend::CreateStructType(std::string name,
+        std::vector<LLVMBackend::DeclTypeAndValue> typeAndValues, uint64_t userAlign,
+        std::vector<BitfieldInfo>* bitfields, bool isPacked, uint64_t physicalAlignment)
 {
 
         if (typeAndValues.size() > 0)
@@ -1519,6 +1638,15 @@ llvm::StructType* LLVMBackend::CreateStructType(std::string name, std::vector<LL
                 uint64_t padded = (natural + userAlign - 1) / userAlign * userAlign;
                 if (padded > natural)
                     types.push_back(llvm::ArrayType::get(builder->getInt8Ty(), padded - natural));
+            }
+            if (physicalAlignment > 1)
+            {
+                llvm::IntegerType* alignTy = physicalAlignment >= 16 ? builder->getInt128Ty()
+                    : physicalAlignment >= 8 ? builder->getInt64Ty()
+                    : physicalAlignment >= 4 ? builder->getInt32Ty()
+                    : physicalAlignment >= 2 ? builder->getInt16Ty()
+                    : builder->getInt8Ty();
+                types.push_back(llvm::ArrayType::get(alignTy, 0));
             }
 
             auto mystuct = dataStructures.find(name);
@@ -1572,7 +1700,9 @@ llvm::StructType* LLVMBackend::CreateStructType(std::string name, std::vector<LL
         }
     }
 
-llvm::StructType* LLVMBackend::CreateUnionType(std::string name, std::vector<DeclTypeAndValue> typeAndValues, uint64_t userAlign)
+llvm::StructType* LLVMBackend::CreateUnionType(std::string name,
+        std::vector<DeclTypeAndValue> typeAndValues, uint64_t userAlign,
+        std::vector<BitfieldInfo>* bitfields)
 {
         uint64_t maxSize = 1;
         llvm::Align maxAlign(1);
@@ -1623,6 +1753,8 @@ llvm::StructType* LLVMBackend::CreateUnionType(std::string name, std::vector<Dec
         sd.StructType = unionTy;
         sd.StructFields = typeAndValues;
         sd.IsUnion = true;
+        if (bitfields != nullptr)
+            sd.Bitfields = *bitfields;
         if (userAlign > 1)
             sd.UserRequestedAlignment = userAlign;
         if (sd.typeDescriptor == nullptr)

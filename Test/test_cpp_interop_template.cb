@@ -55,8 +55,7 @@
 //     vector element is registered.
 //   Homogeneous C++ class brace arguments materialized as contiguous copies/moves for
 //     std::vector and pointer-pair SpanOf parameters.
-//   auto locals move-construct nontrivial C++ sret returns before the temporary is nulled,
-//     both directly and through operator-> forwarding.
+//   auto locals extend nontrivial C++ sret returns in place, including operator-> forwarding.
 //   Namespace-scope C++ using-directives resolve free functions, types, and function
 //     templates through a lookup-time namespace fallback.
 //   A nontrivial C++ class built from `call() * s` and `(a + s) * t` moves the outermost
@@ -210,6 +209,18 @@ import cpp "library/cpp_interop_nest2.h";
 import cpp "library/cpp_interop_tmplctor.h";
 import cpp "library/cpp_interop_global_scope.h";
 import cpp "library/cpp_interop_global_collision.h";
+
+// Defaulted-argument default constructors (section 2701-2711): a field and a global of a class
+// whose only default constructor needs a C++ default argument cflat cannot pass.
+struct DefArgHolder { int tag = 4; cppi.DefArgBuf buf = default; };
+cppi.DefArgNonConst defArgGlobal = default;
+
+expect_error("cppt_rev2_local.Thing") {
+    cppt_rev2_local.Thing invisible = default;
+}
+
+namespace cppt_rev2_al1.deep { struct Thing { int value() { return 33; } }; }
+namespace cppt_rev2_cflat { struct Same<T> { T value; }; }
 
 // Keep these collision names local to this test program; the C++ fixture declares the same
 // CollisionBox template, while the CFlat template owns its ordinary instantiation.
@@ -441,6 +452,12 @@ namespace uas_alias_ns
 // two operand shapes the C++ template wrapper has to spell as `char` and not `signed char`.
 struct ChsCharBox { char ch; };
 char chs_char_source() { return 67; }
+
+// std::function target for the operator-template temporary leg (2145).
+int fopTwice(int v) { return v * 2; }
+
+struct TrrHolder { int f = default; };
+int trrGeneric<T>(T v) { return cpptrr.bump(v); }
 
 extern int main()
 {
@@ -859,6 +876,35 @@ extern int main()
     if (lazyAnon.get() != 5)                          return 766;
     cppi.NullDefaulted lazyNull = default;
     if (lazyNull.get() != 7)                         return 767;
+    // Pre-fix: the local/global/array/`new` forms were refused "no default constructor cflat can
+    // call"; the field and `x = default` forms compiled but skipped the constructor (v == 0).
+    {
+        cppi.DefArgAlloc<std.allocator<char>> defArgTpl = default;
+        if (defArgTpl.get() != 31)                                          return 2701;
+        cppi.DefArgBuf defArgAlias = default;
+        if (defArgAlias.get() != 31)                                        return 2702;
+        cppi.DefArgBuf defArgBare;
+        if (defArgBare.get() != 31)                                         return 2703;
+        cppi.DefArgNonConst defArgNc = default;
+        if (defArgNc.get() != 17)                                           return 2704;
+        cppi.DefArgOwned defArgOwned = default;
+        if (defArgOwned.get() != 33)                                        return 2705;
+        DefArgHolder defArgHolder = default;
+        if (defArgHolder.tag != 4 || defArgHolder.buf.get() != 31)          return 2706;
+        if (defArgGlobal.get() != 17)                                       return 2707;
+        cppi.DefArgNonConst[2] defArgArr = default;
+        if (defArgArr[0].get() + defArgArr[1].get() != 34)                  return 2708;
+        cppi.DefArgOwned* defArgHeap = new cppi.DefArgOwned();
+        const long defArgHeapValue = defArgHeap->get();
+        delete defArgHeap;
+        if (defArgHeapValue != 33)                                          return 2709;
+        defArgAlias.v = 2;
+        defArgAlias = default;
+        if (defArgAlias.get() != 31)                                        return 2710;
+        cppi.DefArgOwned defArgReset = cppi.DefArgOwned();
+        defArgReset = default;
+        if (defArgReset.get() != 33)                                        return 2711;
+    }
     cppi.IntPick lazyInt = cppi.IntPick(42);
     if (lazyInt.which != 1)                          return 768;
     i64 lazyLongArg = 42;
@@ -1135,9 +1181,9 @@ extern int main()
         auto autosretValues = autosretDataset.tracked_values();
         if ((int)autosretValues.size() != 2) return 1160;
         if (autosretValues.first() != 31) return 1161;
-        if (cppt.autosret_dtor_count() != 1) return 1162;
+        if (cppt.autosret_dtor_count() != 0) return 1162;
     }
-    if (cppt.autosret_dtor_count() != 2) return 1163;
+    if (cppt.autosret_dtor_count() != 1) return 1163;
 
     cppt.autosret_reset();
     {
@@ -1146,9 +1192,9 @@ extern int main()
         auto autosretForwarded = autosretHolder->tracked_values();
         if ((int)autosretForwarded.size() != 2) return 1164;
         if (autosretForwarded.second() != 47) return 1165;
-        if (cppt.autosret_dtor_count() != 1) return 1166;
+        if (cppt.autosret_dtor_count() != 0) return 1166;
     }
-    if (cppt.autosret_dtor_count() != 2) return 1167;
+    if (cppt.autosret_dtor_count() != 1) return 1167;
 
     // ---- namespace-scope using-directive lookup -------------------------------------------------
     if (cppt.via_directive(4) != 12) return 1130;
@@ -2073,6 +2119,69 @@ extern int main()
         if (tplPubBase->bget() != 13)                                        return 2304;
         if (tplPubDer.tag != 9)                                              return 2305;
     }
+    {
+        // A class spelled through a NESTED namespace alias (`cppt_nsa.od` = impl.od, itself via
+        // `builtin`). Pre-fix only the first component was de-aliased, so `cppt_nsa.od.Parser`
+        // was requested under the alias identity; that re-bound iterate() before Res<Doc> was
+        // requested, typing its result as the sibling specialization. 2661 failed to compile:
+        // "cannot cast an aggregate value". 2662 (alias of an alias, result moved into the
+        // alias spelling) failed the same way; 2663 is the real-spelling ACCEPT half.
+        cppt_nsa.od.Parser nsaP = default;
+        cppt_nsa.Res<cppt_nsa.impl.od.Doc> nsaR = nsaP.iterate(1);
+        if (nsaR.first.v != 6)                                               return 2661;
+        cppt_nsa.od2.Parser nsaP2 = default;
+        cppt_nsa.Res<cppt_nsa.od.Doc> nsaR2 = nsaP2.iterate(2);
+        cppt_nsa.Res<cppt_nsa.impl.od.Doc> nsaR3 = move nsaR2;
+        if (nsaR3.first.v != 7)                                              return 2662;
+        cppt_nsa.impl.od.Parser nsaP4 = default;
+        cppt_nsa.Res<cppt_nsa.impl.od.Doc> nsaR4 = nsaP4.iterate(3);
+        if (nsaR4.first.v != 8)                                              return 2663;
+    }
+    {
+        // A nested alias named x must not capture the separate real namespace x.
+        cppt_rev2_b.x.Item rev2Alias = default;
+        cppt_rev2_a.x.Item rev2Target = default;
+        x.Top rev2Real = default;
+        if (rev2Alias.value() != 11 || rev2Target.value() != 11 || rev2Real.value() != 22)
+            return 2670;
+
+        // A CFlat dotted namespace beginning with a C++ alias name stays a CFlat namespace.
+        cppt_rev2_al1.deep.Thing rev2Cflat = default;
+        if (rev2Cflat.value() != 33)                                        return 2671;
+
+        // Three-hop and over-cap alias chains must resolve to the final namespace identity.
+        cppt_rev2_al3.Thing rev2Three = default;
+        cppt_rev2_al17.Thing rev2Long = default;
+        if (rev2Three.value() != 31 || rev2Long.value() != 31)                return 2672;
+
+        // Member-template specializations and same-shaped foreign specializations keep identity.
+        cppt_rev2_specs.Outer.Inner<cppt_rev2_specs.A> rev2InnerA = default;
+        cppt_rev2_specs.Outer.Inner<cppt_rev2_specs.B> rev2InnerB = default;
+        cppt_rev2_left.Same<cppt_rev2_left.A> rev2Left = default;
+        cppt_rev2_right.Same<cppt_rev2_right.A> rev2Right = default;
+        cppt_rev2_cflat.Same<cppt_rev2_cflat.A> rev2Collision = default;
+        if (rev2InnerA.value() != 51 || rev2InnerB.value() != 52
+            || rev2Left.value() != 71 || rev2Right.value() != 72
+            || rev2Collision.value.value() != 43
+            || cppt_rev2_cflat.readSameA(rev2Collision) != 73)
+            return 2673;
+        // Inline members of a layout-only full specialization, reached as an unspelled result:
+        // pre-fix each leg failed to link. 2726 = primary-template neighbour that already worked.
+        cppt_lo.It<int> loIt = default;
+        cppt_lo.ItN<int> loItN = default;
+        cppt_lo.ItB<int> loItB = default;
+        cppt_lo.Holder loH = default;
+        auto loR = loH.at();
+        if (loR.get() != 84)                                                 return 2720;
+        if (loH.at().get() != 84)                                            return 2721;
+        if (loR.inc() != 22)                                                 return 2722;
+        if (loR + 5 != 26 || -loR != -21)                                    return 2723;
+        if (loR.chain() != 85)                                               return 2724;
+        auto loN = loH.atN();
+        if (loN.nget() != 126)                                               return 2725;
+        auto loB = loH.atB();
+        if (loB.get() != 42)                                                 return 2726;
+    }
 
     {
         // C++ ALIAS TEMPLATE PATTERNS. An alias template names its target with its OWN argument
@@ -2643,6 +2752,30 @@ extern int main()
         if (mutValue.v() != 5 || mutCopy.v() != 5)                                return 2392;
     }
 
+    // ---- free operator templates over a class TEMPORARY operand (2142-2147) -------------------
+    // The temporary is passed from its own slot: a bitwise re-spill hands C++ a second object
+    // (FopSelfRef flags it; a self-referential std::function frees a stack buffer and aborts).
+    {
+        cppfop.FopSink tmpSink = default;
+        cppfop.selfref_reset();
+        int fopPlus = tmpSink + cppfop.FopSelfRef(7);
+        if (fopPlus != 7 || !cppfop.selfref_clean())                                return 2142;
+        cppfop.selfref_reset();
+        int fopConstRef = tmpSink - cppfop.FopSelfRef(7);
+        if (fopConstRef != 7 || !cppfop.selfref_clean())                            return 2143;
+        cppfop.selfref_reset();
+        bool fopEqual = tmpSink == cppfop.FopSelfRef(7);
+        if (!fopEqual || !cppfop.selfref_clean())                                   return 2144;
+        if ((tmpSink % std.function<int(int)>(fopTwice)) != 80)                    return 2145;
+        // A '?:' operand: the selected arm's own slot (storage phi), built and destroyed once.
+        bool fopPick = false;
+        cppfop.selfref_reset();
+        int fopTernary = tmpSink + (fopPick ? cppfop.FopSelfRef(5) : cppfop.FopSelfRef(6));
+        if (fopTernary != 6 || !cppfop.selfref_clean())                             return 2146;
+        if ((tmpSink % (fopPick ? std.function<int(int)>(fopTwice)
+                                : std.function<int(int)>(fopTwice))) != 80)         return 2147;
+    }
+
     // ---- CFlat using aliases naming C++ specializations (2420-2439) ---------------------------
     // Each value leg has a distinct discriminator; the pre-fix alias arm rejects the declaration
     // before the value is observed. The list<V> and C++ by-value return/copy shapes stay out of
@@ -3128,6 +3261,91 @@ extern int main()
         std.vector<int> globalVector = default;
         globalVector.push_back(31);
         if ((int)globalVector.size() != 1 || globalVector[0] != 31)       return 2651;
+    }
+
+    // ---- non-const U& binds the caller's lvalue; a temporary reaches C++ as an rvalue (2727-2751) --
+    // Pre-fix every scalar went to the generated wrapper BY VALUE: `U&` bound a wrapper copy, so
+    // the caller never saw the write, and a `const U&` / non-template sibling lost to it.
+    // 2732, 2733 and 2736 passed pre-fix too: accept-set guards against a false rejection.
+    {
+        int ti = 1;
+        if (cpptrr.bump(ti) != 2 || ti != 2)                                return 2727;
+        TrrHolder th; th.f = 5;
+        if (cpptrr.bump(th.f) != 6 || th.f != 6)                            return 2728;
+        int[3] ta = {1, 2, 3};
+        if (cpptrr.bump(ta[1]) != 3 || ta[1] != 3)                          return 2729;
+        int* tp = &ti;
+        if (cpptrr.bump(*tp) != 3 || ti != 3)                               return 2730;
+        if (cpptrr.bump(cpptrr.ref_ret()) != 41 || cpptrr.ref_ret() != 41)  return 2731;
+        if (cpptrr.bumpc(cpptrr.f(7)) != 1007 || cpptrr.bumpc(7) != 1007)   return 2732;
+        if (cpptrr.fwd(cpptrr.f(8)) != 2008 || cpptrr.fwd(ti) != 2003)      return 2733;
+        cpptrr.M tm; tm.base = 10;
+        if (tm.bump(ti) != 14 || ti != 4)                                   return 2734;
+        int tx = 1; int ty = 2;
+        std.swap(tx, ty);
+        if (tx != 2 || ty != 1)                                             return 2735;
+        if (trrGeneric(9) != 10)                                            return 2736;
+        if (cpptrr.ov(ti) != 1 || ti != 7)                                  return 2737;
+        if (cpptrr.ov(ti + 3) != 12)                                        return 2738;
+        int tj = 2;
+        if (cpptrr.pk(ti, tj) != 11 || ti != 8 || tj != 3)                  return 2739;
+        int to = 0;
+        if (cpptrr.outp(4, to) != 5 || to != 8)                             return 2740;
+        if (cpptrr.mix(ti) != 9 || ti != 9)                                 return 2741;
+        if (cpptrr.mix(ti + 1) != 510)                                      return 2742;
+        cpptrr.Sink ts;
+        if (ts + ti != 9 || ti != 0)                                        return 2743;
+        ti = 4;
+        if ((ts << ti) != 49 || ti != 0)                                    return 2744;
+        // Only PROVEN lvalues bind `U&`: a unary/cast/increment result that still names its
+        // source variable is an rvalue (pre-fix of round 2: `-i` passed as an address).
+        // 2745 passed pre-fix too (accept guard; round 1 failed module verification on it).
+        int tn = 1; int tm5 = 5;
+        if (std.min(-tn, tm5) != -1)                                        return 2745;
+        if (cpptrr.which(-tn) != 2 || cpptrr.which(tn) != 1)                return 2746;
+        if (cpptrr.fwd_kind(-tn) != 2 || cpptrr.fwd_kind(tn) != 1)          return 2747;
+        if (cpptrr.fwd(-tn) != 1999 || tn != 1)                             return 2748;
+        std.swap(cpptrr.ref_ret(), tm5);
+        if (cpptrr.ref_ret() != 5 || tm5 != 41)                             return 2749;
+        int te = 1; int tf = 7;
+        int ea = std.exchange(te, 5); int eb = std.exchange(te, tf); int ec = std.exchange(te, 9);
+        if (ea != 1 || eb != 5 || ec != 7 || te != 9)                       return 2750;
+        int[2] tarr = {4, 5};
+        if ((ts << tarr[1]) != 99 || tarr[1] != 0)                          return 2751;
+        // A scalar temporary at a `const T&` position lives in the CALLER's frame and a returned
+        // reference points at it; an lvalue binds the caller's own object (2752-2755, 2757, 2758
+        // failed pre-fix, 2756 failed module verification; 2759 is an accept guard).
+        int ua = 1; int ub = 5;
+        if (cpptrr.read_late(std.min(-ua, ub)) != -1)                       return 2752;
+        if (cpptrr.read_late(std.max(ua + 10, ub + 20)) != 25)              return 2753;
+        if (cpptrr.read_late(cpptrr.lesser(-ua, ub)) != -1)                 return 2754;
+        cpptrr.Pk upk;
+        if (cpptrr.read_late(upk.pick(ua + 30, ub + 40)) != 31)             return 2755;
+        if (cpptrr.read_late(std.min(ub, -ua)) != -1)                       return 2756;
+        alias int uam = std.max(ua, ub);
+        if (&std.min(ua, ub) != &ua || &uam != &ub)                        return 2757;
+        if (&cpptrr.lesser(ua, ub) != &ua || &upk.pick(ub, ua) != &ua)     return 2758;
+        std.string us = std.string("pear");
+        if (std.min(std.string("kiwi"), us) != std.string("kiwi")
+            || &std.max(us, std.string("apple")) != &us)                    return 2759;
+        // A pointer temporary at a `const U&` template position lives in the caller's frame too.
+        if (cpptrr.read_late_ptr(cpptrr.lesser(&tarr[1], &tarr[0])) != &tarr[0])  return 2760;
+        // So does a string literal; a `char*` lvalue binds the caller's variable, a `char*` result
+        // gets a caller slot, `const char (&)[N]` still deduces the literal's array (2764 guard).
+        if (cpptrr.read_late_cstr(cpptrr.first_of("xyz", 0))[2] != (char)122)   return 2761;
+        char* ucs = "abc";
+        if (cpptrr.read_late_cstr(cpptrr.pair_first("mno", ua + 2))[2] != (char)111)  return 2762;
+        if (cpptrr.read_late_cstr(upk.first_of("qrs", ua))[1] != (char)114)     return 2763;
+        if (&cpptrr.first_of(ucs, 0) != &ucs || cpptrr.lit_len("hello") != 6
+            || cpptrr.read_late_cstr(cpptrr.first_of(cpptrr.lit_tail(), 0))[1] != (char)97)
+                                                                            return 2764;
+        // A literal in a `const R&...` pack and one at `const U&` in a loop live in the caller
+        // too; ranking is master's, `const U&` over `const U&&` as clang picks (2767 guard).
+        if (cpptrr.read_late_cstr(cpptrr.pack_first("pk", ua))[1] != (char)107) return 2765;
+        char* ulp = "lop";
+        for (int uk = 0; uk < 3; uk++)
+            if (cpptrr.read_late_cstr(cpptrr.first_of("lop", uk))[uk] != ulp[uk])   return 2766;
+        if (cpptrr.rank_cr("x") != 1)                                       return 2767;
     }
 
     // ---- min/max template deduction from literals (section 2620-2639, 2660) --------------------------

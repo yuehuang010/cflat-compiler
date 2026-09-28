@@ -1,7 +1,16 @@
 import cpp "../library/cpp_interop_tpl.h";
+import cpp "../library/cpp_interop_freeoptpl.h";
 
 extern int main()
 {
+    expect_error("call to consteval function") {
+        char* format = "runtime";
+        cppceval.first(format, 7);
+    }
+    expect_error("argument type cannot be spelled in C++") {
+        int value = 7;
+        cppceval.first("value {value}", 7);
+    }
     expect_error("no instantiation of C++ function template 'cppt.twice' accepts these argument types") {
         cppt.twice("hello");
     }

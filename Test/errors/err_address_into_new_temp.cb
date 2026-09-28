@@ -33,6 +33,22 @@ expect_error("temporary 'new' object (such as '&(new T(x))->field') into a local
     void ternaryDecl(int c) { int* g = c > 0 ? &(new Cell(c))->v : nullptr; }
 }
 
+expect_error("temporary 'new' object (such as '&(new T(x))->field') into a local") {
+    void ternaryCoalesceDecl(int c) { int* g = c > 0 ? &(new Cell(c))->v ?? nullptr : nullptr; }
+}
+
+expect_error("temporary 'new' object (such as '&(new T(x))->field') into a local") {
+    void ternaryCoalesceRhsDecl(int c, int* p) { int* r = c > 0 ? p ?? &(new Cell(c))->v : p; }
+}
+
+expect_error("temporary 'new' object (such as '&(new T(x))->field') into a longer-lived location") {
+    void ternaryCoalesceGlobal(int c, int* p) { gAddr = c > 0 ? &(new Cell(c))->v ?? p : p; }
+}
+
+expect_error("temporary 'new' object (such as '&(new T(x))->field') into a longer-lived location") {
+    void ternaryCoalesceAssign(int c, int* p) { int* r = p; r = c > 0 ? &(new Cell(c))->v ?? p : p; }
+}
+
 expect_error("temporary 'new' object (such as '&(new T(x))->field') into a longer-lived location") {
     void ternaryAssign(int c) { int y = 0; int* g = nullptr; g = c > 0 ? &(new Cell(c))->v : &y; }
 }

@@ -2020,6 +2020,38 @@ bool LLVMBackend::IsOwningPtrTempValue(llvm::Value* value) const
         return n != nullptr && !n->TypeName.empty();
     }
 
+void LLVMBackend::DropRetainedJoinArmPtrTemps(llvm::Value* callResult)
+{
+        auto* call = llvm::dyn_cast_or_null<llvm::CallBase>(callResult);
+        if (call == nullptr) return;
+        const llvm::Function* callee = call->getCalledFunction();
+        const bool unproven = callee == nullptr || callee->isDeclaration();
+        for (unsigned i = 0; i < call->arg_size(); ++i)
+        {
+            llvm::Value* argVal = call->getArgOperand(i);
+            if (!argVal->getType()->isPointerTy() || IsOwningPtrTempValue(argVal)) continue;
+            if (!unproven && !ParameterRetainsArgument(callee, i)) continue;
+            llvm::SmallVector<llvm::Value*, 8> work{ argVal };
+            llvm::SmallPtrSet<llvm::Value*, 16> seen;
+            while (!work.empty())
+            {
+                llvm::Value* cur = work.pop_back_val();
+                if (cur == nullptr || !seen.insert(cur).second) continue;
+                std::erase_if(pendingOwnedPtrTemps,
+                    [&](const PendingOwnedPtrTemp& p) { return p.Value == cur; });
+                if (const auto* join = FindNullCoalesceJoin(cur))
+                    for (const auto& arm : join->Arms) work.push_back(arm.Value);
+                else if (auto* phi = llvm::dyn_cast<llvm::PHINode>(cur))
+                    for (llvm::Value* in : phi->incoming_values()) work.push_back(in);
+                else if (auto* sel = llvm::dyn_cast<llvm::SelectInst>(cur))
+                {
+                    work.push_back(sel->getTrueValue());
+                    work.push_back(sel->getFalseValue());
+                }
+            }
+        }
+    }
+
 void LLVMBackend::RegisterNonEscapingOwningPtrArgs(llvm::Value* callResult, bool calleeIsCxx)
 {
         auto* call = llvm::dyn_cast_or_null<llvm::CallBase>(callResult);
@@ -3708,7 +3740,12 @@ const LLVMBackend::TypeAndValue* LLVMBackend::FindDeclaredFieldOfStructType(
         auto entry = dataStructures.find(structType->getName().str());
         if (entry == dataStructures.end()) return nullptr;
         const auto& fields = entry->second.StructFields;
-        if (entry->second.IsUnion || fields.size() != structType->getNumElements()) return nullptr;
+        if (entry->second.IsUnion
+            || (!entry->second.CxxOffsetLayout && fields.size() != structType->getNumElements())) return nullptr;
+        if (entry->second.CxxOffsetLayout)
+            for (size_t semantic = 0; semantic < entry->second.CxxFieldElements.size(); ++semantic)
+                if (entry->second.CxxFieldElements[semantic] == index) return &fields[semantic];
+        if (entry->second.CxxOffsetLayout) return nullptr;
         if (index >= fields.size()) return nullptr;
         return &fields[index];
 }
@@ -3723,7 +3760,20 @@ const LLVMBackend::TypeAndValue* LLVMBackend::FindDeclaredFieldTypeAndValueForSt
         const llvm::Value* storage) const
 {
         const auto* gep = llvm::dyn_cast_or_null<llvm::GetElementPtrInst>(storage);
-        if (gep == nullptr || gep->getNumIndices() != 2) return nullptr;
+        if (gep == nullptr) return nullptr;
+        if (const llvm::MDNode* field = gep->getMetadata("cflat.cxx.field"))
+        {
+            if (field->getNumOperands() != 2) return nullptr;
+            auto* typeName = llvm::dyn_cast<llvm::MDString>(field->getOperand(0));
+            auto* index = llvm::mdconst::dyn_extract<llvm::ConstantInt>(field->getOperand(1));
+            if (typeName == nullptr || index == nullptr) return nullptr;
+            auto it = dataStructures.find(typeName->getString().str());
+            if (it == dataStructures.end()) return nullptr;
+            const auto& fields = it->second.StructFields;
+            if (!it->second.CxxOffsetLayout || index->getZExtValue() >= fields.size()) return nullptr;
+            return &fields[index->getZExtValue()];
+        }
+        if (gep->getNumIndices() != 2) return nullptr;
         auto* first = llvm::dyn_cast<llvm::ConstantInt>(gep->getOperand(1));
         auto* second = llvm::dyn_cast<llvm::ConstantInt>(gep->getOperand(2));
         if (first == nullptr || second == nullptr || !first->isZero()) return nullptr;
@@ -3857,7 +3907,7 @@ void LLVMBackend::ConsumeOwnedNewTemp(llvm::Value* value)
         UnregisterOwnedPtrTemp(value);
     }
 
-void LLVMBackend::UnregisterOwnedPtrTemp(llvm::Value* value)
+void LLVMBackend::UnregisterOwnedPtrTemp(llvm::Value* value, bool throughPhis)
 {
         llvm::SmallVector<llvm::Value*, 8> work{ value };
         llvm::SmallPtrSet<llvm::Value*, 16> seen;
@@ -3869,7 +3919,15 @@ void LLVMBackend::UnregisterOwnedPtrTemp(llvm::Value* value)
                 [&](const PendingOwnedPtrTemp& p) { return p.Value == current; });
             if (const auto* join = FindNullCoalesceJoin(current))
                 for (const auto& arm : join->Arms) work.push_back(arm.Value);
+            else if (auto* phi = llvm::dyn_cast<llvm::PHINode>(current); phi && throughPhis)
+                for (llvm::Value* in : phi->incoming_values()) work.push_back(in);
         }
+}
+
+static const LLVMBackend::NullCoalesceJoin* FindJoinOf(const LLVMBackend* self,
+                                                      const llvm::Value* value)
+{
+        return self->FindNullCoalesceJoin(value);
 }
 
 /*
@@ -3878,7 +3936,10 @@ void LLVMBackend::UnregisterOwnedPtrTemp(llvm::Value* value)
  * temp pointer itself is an ownership question the adopting sites already answer.
  */
 static bool AddressDerivesFromTemp(llvm::Value* v, bool includeSelf,
-                                   const std::function<bool(llvm::Value*)>& isTemp)
+                                   const std::function<bool(llvm::Value*)>& isTemp,
+                                   const LLVMBackend::NullCoalesceJoin* (*findJoin)(
+                                       const LLVMBackend*, const llvm::Value*) = nullptr,
+                                   const LLVMBackend* backend = nullptr)
 {
         if (v == nullptr || !v->getType()->isPointerTy()) return false;
         llvm::SmallVector<std::pair<llvm::Value*, bool>, 8> work{ { v, includeSelf } };
@@ -3888,6 +3949,13 @@ static bool AddressDerivesFromTemp(llvm::Value* v, bool includeSelf,
             auto [cur, interior] = work.pop_back_val();
             if (!seen.insert(cur).second) continue;
             if (interior && isTemp(cur)) return true;
+            // A `??` join is a load off its result slot; its ledgered arms are what it addresses.
+            if (findJoin != nullptr)
+                if (const auto* join = findJoin(backend, cur))
+                {
+                    for (const auto& arm : join->Arms) work.push_back({ arm.Value, interior });
+                    continue;
+                }
             if (auto* gep = llvm::dyn_cast<llvm::GEPOperator>(cur))
                 work.push_back({ gep->getPointerOperand(), true });
             else if (auto* sel = llvm::dyn_cast<llvm::SelectInst>(cur))
@@ -3972,7 +4040,7 @@ void LLVMBackend::ClaimOwnedPtrTempsUnder(llvm::Value* v, bool includeSelf, size
             llvm::Value* temp = pendingOwnedPtrTemps[i].Value;
             if (pendingOwnedPtrTemps[i].ConditionalSlot == nullptr && temp != nullptr
                 && AddressDerivesFromTemp(v, includeSelf,
-                    [&](llvm::Value* base) { return base == temp; }))
+                    [&](llvm::Value* base) { return base == temp; }, FindJoinOf, this))
             {
                 addrClaimedPtrTemps_.push_back(temp);
                 pendingOwnedPtrTemps.erase(pendingOwnedPtrTemps.begin() + i);
@@ -3997,7 +4065,7 @@ bool LLVMBackend::AddressIntoStatementPtrTemp(llvm::Value* v) const
             for (const auto& p : pendingOwnedPtrTemps)
                 if (p.Value == base) return true;
             return false;
-        });
+        }, FindJoinOf, this);
     }
 
 bool LLVMBackend::IsInsertBlockLive() const
@@ -4310,7 +4378,7 @@ void LLVMBackend::HoistOwnedPtrTempsForAddress(const OwnedTempMark& mark, llvm::
         {
             llvm::Value* value = ownedNewTemps_[i].Value;
             if (AddressDerivesFromTemp(address, /*includeSelf*/ true,
-                    [&](llvm::Value* base) { return base == value; }))
+                    [&](llvm::Value* base) { return base == value; }, FindJoinOf, this))
                 RegisterOwnedPtrTemp(value);
         }
         for (size_t i = mark.Ptrs; i < pendingOwnedPtrTemps.size(); )
@@ -4318,7 +4386,7 @@ void LLVMBackend::HoistOwnedPtrTempsForAddress(const OwnedTempMark& mark, llvm::
             auto temp = pendingOwnedPtrTemps[i];
             if (temp.Value == nullptr
                 || !AddressDerivesFromTemp(address, /*includeSelf*/ true,
-                    [&](llvm::Value* base) { return base == temp.Value; }))
+                    [&](llvm::Value* base) { return base == temp.Value; }, FindJoinOf, this))
             {
                 ++i;
                 continue;
@@ -4536,6 +4604,25 @@ void LLVMBackend::FlushOwnedTempsSince(const OwnedTempMark& mark, llvm::Value* k
         for (auto& h : hoisted) pendingOwnedStructTemps.push_back(h);
     }
 
+void LLVMBackend::FlushConditionalPtrTempsSince(size_t from)
+{
+        std::vector<PendingOwnedPtrTemp> temps;
+        size_t write = from;
+        for (size_t i = from; i < pendingOwnedPtrTemps.size(); ++i)
+            if (pendingOwnedPtrTemps[i].ConditionalSlot != nullptr)
+                temps.push_back(pendingOwnedPtrTemps[i]);
+            else
+                pendingOwnedPtrTemps[write++] = pendingOwnedPtrTemps[i];
+        if (from < pendingOwnedPtrTemps.size()) pendingOwnedPtrTemps.resize(write);
+        for (auto& t : temps)
+        {
+            std::optional<llvm::DominatorTree> domTree;
+            if (!IsInsertBlockLive()
+                || !OwnedTempDominatesHere(t.Block, builder->GetInsertBlock(), domTree)) continue;
+            EmitOwnedConditionalPtrTempFree(t);
+        }
+    }
+
 void LLVMBackend::DiscardOwnedTempsSince(const OwnedTempMark& mark)
 {
         auto pairValue   = [](const std::pair<llvm::Value*, llvm::BasicBlock*>& e) { return e.first; };
@@ -4565,6 +4652,48 @@ void LLVMBackend::DiscardOwnedTempsSince(const OwnedTempMark& mark)
         aliasValues_.clear();
         tempFieldValues_.clear();
     }
+
+LLVMBackend::DetectionLedgerSnapshot LLVMBackend::SnapshotDetectionLedgers() const
+{
+        DetectionLedgerSnapshot snapshot;
+        snapshot.ownedReturnTemps_ = ownedReturnTemps_;
+        snapshot.ownedReturnReleaseTemps_ = ownedReturnReleaseTemps_;
+        snapshot.ownedNewTemps_ = ownedNewTemps_;
+        snapshot.addrClaimedPtrTemps_ = addrClaimedPtrTemps_;
+        snapshot.addrIntoTempValues_ = addrIntoTempValues_;
+        snapshot.ptrToIntOfTemps_ = ptrToIntOfTemps_;
+        snapshot.nullConditionalTempResults_ = nullConditionalTempResults_;
+        snapshot.rawArrayResults_ = rawArrayResults_;
+        snapshot.valueElementTypeNames_ = valueElementTypeNames_;
+        snapshot.fatInterfaceValueTypeNames_ = fatInterfaceValueTypeNames_;
+        snapshot.viewJoinTypes_ = viewJoinTypes_;
+        snapshot.movedOutPtrValues_ = movedOutPtrValues_;
+        snapshot.movedBorrowedPtrValues_ = movedBorrowedPtrValues_;
+        snapshot.movedBorrowedThroughFieldValues_ = movedBorrowedThroughFieldValues_;
+        snapshot.aliasValues_ = aliasValues_;
+        snapshot.tempFieldValues_ = tempFieldValues_;
+        return snapshot;
+}
+
+void LLVMBackend::RestoreDetectionLedgers(DetectionLedgerSnapshot snapshot)
+{
+        ownedReturnTemps_ = std::move(snapshot.ownedReturnTemps_);
+        ownedReturnReleaseTemps_ = std::move(snapshot.ownedReturnReleaseTemps_);
+        ownedNewTemps_ = std::move(snapshot.ownedNewTemps_);
+        addrClaimedPtrTemps_ = std::move(snapshot.addrClaimedPtrTemps_);
+        addrIntoTempValues_ = std::move(snapshot.addrIntoTempValues_);
+        ptrToIntOfTemps_ = std::move(snapshot.ptrToIntOfTemps_);
+        nullConditionalTempResults_ = std::move(snapshot.nullConditionalTempResults_);
+        rawArrayResults_ = std::move(snapshot.rawArrayResults_);
+        valueElementTypeNames_ = std::move(snapshot.valueElementTypeNames_);
+        fatInterfaceValueTypeNames_ = std::move(snapshot.fatInterfaceValueTypeNames_);
+        viewJoinTypes_ = std::move(snapshot.viewJoinTypes_);
+        movedOutPtrValues_ = std::move(snapshot.movedOutPtrValues_);
+        movedBorrowedPtrValues_ = std::move(snapshot.movedBorrowedPtrValues_);
+        movedBorrowedThroughFieldValues_ = std::move(snapshot.movedBorrowedThroughFieldValues_);
+        aliasValues_ = std::move(snapshot.aliasValues_);
+        tempFieldValues_ = std::move(snapshot.tempFieldValues_);
+}
 
 void LLVMBackend::FlushOwnedTemps()
 {

@@ -1,6 +1,5 @@
 // GUARDS: Eigen expression, matrix-vector, and scalar multiplication operators
 // FROM: scratch/probe3/e04_add_expr.cb scratch/probe3/e05_matvec.cb scratch/probe3/e07_scalar_mul.cb
-// DISABLED: internal/issue/p3/cpp-inherited-static-members-and-member-operators-not-found.md internal/issue/p3/cpp-operator-returning-unrequested-specialization-not-bound.md
 import cpp "Eigen/Dense";
 extern int printf(const char* fmt, ...);
 extern int main()

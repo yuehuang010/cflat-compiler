@@ -22,4 +22,18 @@ inline Ex& ref_ex()
 
 struct RefOwner { int v; RefOwner(Ex& e) : v(++e.v) {} };
 
+// Function templates with a non-const `U&` parameter: the same rule as the non-template form.
+template <class U> int tbump(U& x) { x = x + 1; return (int)x; }
+template <class U> int tbump_ex(U& x) { return ++x.v; }
+template <class U> int tout(U v, int& out) { out = (int)v; return 1; }
+template <class... A> int tpack(A&... a) { return (int)sizeof...(a); }
+inline int tval(int v) { return v; }
+struct TMember { template <class U> int bump(U& x) { x = x + 1; return (int)x; } };
+// Own namespace: no non-template operator+ sibling (Ex's) that could take the rvalue instead.
+namespace tsink {
+struct TSink { int t = 0; };
+template <class U> int operator+(TSink& s, U& x) { return s.t += (int)x; }
+template <class U> int operator<<(TSink& s, U& x) { return s.t += (int)x; }
+}
+
 }

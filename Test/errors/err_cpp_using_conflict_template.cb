@@ -1,0 +1,8 @@
+// `using cppuc_src::TT;` (a class template) in one import and `template<class T> struct TT` in the
+// same namespace in another: two templates under one name. Import-time error, like
+// err_cpp_using_conflict_class.cb for plain classes.
+expect_error("'cppuc.TT' is an alias of 'cppuc_src.TT' in 'cpp_interop_using_conflict_template.h' but a class template in 'cpp_interop_using_conflict_own.h'");
+import cpp "cpp_interop_using_conflict_own.h";
+import cpp "cpp_interop_using_conflict_template.h";
+
+extern int main() { return 0; }

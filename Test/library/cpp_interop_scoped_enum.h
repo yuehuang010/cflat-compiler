@@ -94,4 +94,32 @@ namespace cppi_scope
     }
 
     inline int takeGreenBox(HueBox<Hue::Green> b) { return b.get() + 500; }
+
+    // Integer -> enumeration is never an implicit conversion in C++ (scoped or unscoped), so an
+    // integer argument must pick the integer or converting-constructor overload, never the enum.
+    inline int enumOrLong(A a) { return 11000 + (int)a; }
+    inline int enumOrLong(long long v) { return 11100 + (int)v; }
+    template <typename T> struct RefLike
+    {
+        const T* data; size_t len;
+        RefLike(const T& one) : data(&one), len(1) {}
+        template <size_t N> RefLike(const T (&arr)[N]) : data(arr), len(N) {}
+    };
+    struct Viewer
+    {
+        long long view(RefLike<long long> s) const { return 12000 + (long long)s.len * 100 + s.data[0]; }
+        long long view(A a) const { return 12500 + (int)a; }
+    };
+    inline int takeU2(U2 u) { return 13000 + (int)u; }
+    struct HoldA { A a = A::x; U2 u = w; };
+    inline int u2OrLong(U2 u) { return 14000 + (int)u; }
+    inline int u2OrLong(long long v) { return 14100 + (int)v; }
+    // A free operator overloaded on int and on an enum class: an int operand binds the int one.
+    struct OpFoo { int v = 1; };
+    inline int operator+(const OpFoo&, int i) { return 15000 + i; }
+    inline int operator+(const OpFoo&, A a) { return 15500 + (int)a; }
+    // Enum LEFT operands of free operators: scoped and unscoped.
+    inline int operator-(A a, const OpFoo&) { return 16000 + (int)a; }
+    inline int operator*(U2 u, const OpFoo&) { return 16500 + (int)u; }
+    constexpr A kA = A::x;
 }

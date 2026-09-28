@@ -343,10 +343,12 @@ LLVMBackend::NamedVariable MainListener::ParseAssignmentExpressionNamed(CFlatPar
         // recover the isUnsigned flag from TypedValue and synthesize the TypeName for Upconvert.
         {
             LLVMBackend::NamedVariable result;
+            LLVMBackend::TypedValue joinShape;  // a `?:` join's pointer shape, filled below
             auto* condCtx = ctx->conditionalExpression();
             if (condCtx && !ctx->assignmentOperator())
             {
                 auto tv = ParseConditionalExpression(condCtx, use);
+                joinShape = tv;
                 result.Primary = tv.value;
                 result.TypeAndValue.IsAlias = tv.isAlias;
                 result.IsRvalue = tv.isRvalue;
@@ -369,6 +371,14 @@ LLVMBackend::NamedVariable MainListener::ParseAssignmentExpressionNamed(CFlatPar
                         else if (bits == 32) result.TypeAndValue.TypeName = isUnsigned ? "u32" : "int";
                         else if (bits == 64) result.TypeAndValue.TypeName = isUnsigned ? "u64" : "i64";
                         else if (bits == 128) result.TypeAndValue.TypeName = isUnsigned ? "u128" : "i128";
+                        // A `?:` whose two arms are one enum type is that enum, as in C++.
+                        if (std::string enumKey = compilerLLVM->ResolveEnumTypeName(tv.sourceTypeName);
+                            !enumKey.empty() && (condCtx->Question() != nullptr))
+                        {
+                            result.TypeAndValue.TypeName = enumKey;
+                            result.TypeAndValue.EnumBacking = compilerLLVM->GetEnumBackingType(enumKey);
+                            result.TypeAndValue.IsScopedEnum = compilerLLVM->IsScopedEnumTypeName(enumKey);
+                        }
                     }
                     // A '?:' join of two interface values yields a phi/select with no NamedVariable
                     // of its own to carry IsInterface/TypeName - it is a bare fat {vtable,data}
@@ -454,6 +464,15 @@ LLVMBackend::NamedVariable MainListener::ParseAssignmentExpressionNamed(CFlatPar
                     result.TypeAndValue.ElemPointer = viewJoin->ElemPointer;
                     result.TypeAndValue.IsArrayView = true;
                     result.TypeAndValue.IsInterface = viewJoin->IsInterface;
+                }
+                // Both arms named one pointer shape: that proves pointee AND depth.
+                else if (joinShape.value == result.Primary && joinShape.pointerDepth >= 1
+                         && !joinShape.sourceTypeName.empty())
+                {
+                    result.TypeAndValue.TypeName = joinShape.sourceTypeName;
+                    result.TypeAndValue.Pointer = true;
+                    result.TypeAndValue.PointerDepth = joinShape.pointerDepth;
+                    result.TypeAndValue.ElemPointer = joinShape.elemPointer;
                 }
                 else
                 {
@@ -1591,6 +1610,7 @@ llvm::Value* MainListener::ParseAssignmentExpression(
         }
         else if (assignmentOp != nullptr)
         {
+            CallPostfixScope assignmentOperatorPostfix(this);
             auto operatorText = ctx->assignmentOperator()->getText();
             auto assignCtx = ctx->assignmentExpression();
             // `_ = expr` is an explicit discard: evaluate the RHS for its side effects, drop the
@@ -1819,7 +1839,10 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                                 && declaredLinkages.count(candidate.UniqueName) == 0
                                 && !candidate.UniqueName.starts_with("__cflat_tpl_");
                         }), candidates->second.end());
-                    auto restore = [&]() { candidates->second = std::move(original); };
+                    // Restored by key: the overload call may insert and rehash the table.
+                    auto restore = [&]() {
+                        compiler->functionTable[lookupName] = std::move(original);
+                    };
                     try
                     {
                         auto* result = TryBinaryOperatorOverload(
@@ -1935,7 +1958,12 @@ llvm::Value* MainListener::ParseAssignmentExpression(
 
                     auto* returnedTemp = compiler->lastCxxRetTemp_;
                     auto* returnedValue = compiler->lastCxxRetValue_;
-                    const bool outermostTemp = returnedTemp != nullptr
+                    // A returned temp of ANOTHER class (Eigen's `a + b` expression template) is a
+                    // conversion source, never the T to move-assign from.
+                    auto* returnedSlot = llvm::dyn_cast_or_null<llvm::AllocaInst>(returnedTemp);
+                    const bool returnedHoldsTarget = returnedSlot == nullptr
+                        || returnedSlot->getAllocatedType() == compiler->GetType(tempType);
+                    const bool outermostTemp = returnedTemp != nullptr && returnedHoldsTarget
                         && ((rhsNV.Primary != nullptr && rhsNV.Primary == returnedValue)
                             || rhsNV.Storage == returnedTemp);
                     const bool forcedTempProduced = forcedTemp != nullptr
@@ -1999,7 +2027,82 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                             adoptedRaw = true;
                         }
                     }
-                    if (useMove && !adoptedRaw)
+                    /*
+                     * Plan converting-constructors.md point 2: `t = u;` with a non-T source. A
+                     * declared `operator=(U)` wins; otherwise `T(u)` is built and assigned as a
+                     * moved temporary, exactly as the spelled `t = T(u);`.
+                     */
+                    std::string conversionRefusal;
+                    const bool convertibleSource = !useMove && !adoptedRaw && rhsTemp == nullptr
+                        && !rhsDefault
+                        && (rhsNV.TypeAndValue.Pointer || rhsNV.TypeAndValue.TypeName != tn);
+                    // Direct operator=(U) only for a provably live destination: on a possibly
+                    // unconstructed one it is UB, so those take T(u) + move-assign.
+                    if (convertibleSource && !destinationReleased && !destinationConditional
+                        && !destinationGlobalConditional)
+                        if (auto* direct = TryDirectCxxAssignOperator(ctx, namedVar, tn, rhsNV,
+                                                                      conversionRefusal);
+                            direct != nullptr || !conversionRefusal.empty())
+                        {
+                            if (direct == nullptr)
+                            {
+                                LogErrorContext(ctx, std::format(
+                                    "cannot assign to C++ class '{}' from this expression; {}",
+                                    compiler->DisplayCxxClassName(tn), conversionRefusal));
+                                return nullptr;
+                            }
+                            if (namedVar.FieldName.empty() && !namedVar.CallerName.empty())
+                            {
+                                compiler->MarkVariableUnmoved(namedVar.CallerName);
+                                compiler->MarkVariableNotExplicitlyMovedNull(namedVar.CallerName);
+                            }
+                            return nullptr;
+                        }
+                    // `t = move u;` with a class source is `t = T(move u)`: the source binds as
+                    // an rvalue (T(U&&) wins) and is consumed like any moved C++ local.
+                    bool movedConversion = false;
+                    if (useMove && !adoptedRaw && rhsTemp == nullptr && IsBareIdentifierText(srcName))
+                        if (auto* srcNV = compiler->FindLiveNamedVariable(srcName);
+                            srcNV != nullptr && srcNV->Storage != nullptr
+                            && !srcNV->TypeAndValue.Pointer && srcNV->TypeAndValue.TypeName != tn
+                            && !srcNV->IsMoved && !srcNV->ExplicitlyMovedNull)
+                        {
+                            LLVMBackend::NamedVariable converted = *srcNV;
+                            converted.Primary = nullptr;
+                            converted.IsExplicitMove = true;
+                            converted.CallerName = srcName;
+                            compiler->SetCurrentDebugLocation(ctx->getStart()->getLine());
+                            if (compiler->ConvertThroughCxxConvertingCtor(converted, tn, nullptr,
+                                    conversionRefusal)
+                                == LLVMBackend::CxxConvertingCtorResult::Converted)
+                            {
+                                rhsNV = converted;
+                                rhsTemp = converted.Storage;
+                                movedConversion = true;
+                            }
+                        }
+                    if (convertibleSource)
+                    {
+                        LLVMBackend::NamedVariable converted = rhsNV;
+                        compiler->SetCurrentDebugLocation(ctx->getStart()->getLine());
+                        switch (compiler->ConvertThroughCxxConvertingCtor(converted, tn, nullptr,
+                                                                          conversionRefusal))
+                        {
+                        case LLVMBackend::CxxConvertingCtorResult::Converted:
+                            rhsNV = converted;
+                            rhsTemp = converted.Storage;
+                            break;
+                        default:
+                            break;
+                        }
+                    }
+                    if (useMove && !adoptedRaw && !movedConversion && !conversionRefusal.empty())
+                    {
+                        LogErrorContext(ctx, std::format(
+                            "cannot assign to C++ class '{}' from this expression; {}",
+                            compiler->DisplayCxxClassName(tn), conversionRefusal));
+                    }
+                    else if (useMove && !adoptedRaw && !movedConversion)
                     {
                         if (!IsBareIdentifierText(srcName))
                             LogErrorContext(ctx, std::format(
@@ -2015,6 +2118,12 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                         if (srcNV->IsMoved || srcNV->ExplicitlyMovedNull)
                             LogErrorContext(ctx, std::format("use of moved variable '{}'", srcName));
                         sourceStorage = srcNV->Storage;
+                    }
+                    else if (rhsTemp == nullptr && !conversionRefusal.empty())
+                    {
+                        LogErrorContext(ctx, std::format(
+                            "cannot assign to C++ class '{}' from this expression; {}",
+                            compiler->DisplayCxxClassName(tn), conversionRefusal));
                     }
                     else if (rhsTemp == nullptr
                         && (rhsNV.TypeAndValue.Pointer || rhsNV.TypeAndValue.TypeName != tn
@@ -2084,7 +2193,20 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                             LogErrorContext(ctx, std::format(
                                 "cannot assign to C++ class '{}' from this expression",
                                 compiler->DisplayCxxClassName(tn)));
-                        compiler->EmitCxxStructorCall(tn, *op, destination, { source });
+                        // `operator=(T other)` takes its parameter BY VALUE: it must be copy- or
+                        // move-constructed from the source's address, never handed the address.
+                        std::vector<LLVMBackend::NamedVariable> byValueSource;
+                        if (op != nullptr && op->params.size() == 2 && !op->params[1].Pointer
+                            && compiler->IsForeignNontrivialCxxClass(op->params[1].TypeName))
+                        {
+                            LLVMBackend::NamedVariable sourceVar;
+                            sourceVar.Storage = source;
+                            sourceVar.TypeAndValue.TypeName = tn;
+                            sourceVar.IsExplicitMove = useMove || sourceIsTemporary;
+                            byValueSource.push_back(std::move(sourceVar));
+                        }
+                        compiler->EmitCxxStructorCall(tn, *op, destination, { source },
+                            byValueSource.empty() ? nullptr : &byValueSource);
                     };
 
                     if (destinationGlobalConditional)
@@ -2386,6 +2508,7 @@ llvm::Value* MainListener::ParseAssignmentExpression(
              * borrow refreshes and the thin-function<> provenance gate the tail runs.
              */
             llvm::BasicBlock* coalesceResume = nullptr;
+            std::optional<BranchPostfixScope> coalescePostfix;  // `??=` RHS runs only on null
             std::string coalesceLhsOwner;
             if (operatorText == "?" "?=")
             {
@@ -2414,6 +2537,7 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                 // Jump to the assign block only when lhs is null/zero.
                 compiler->CreateConditionJump(lhs, coalesceResume, assignBlock);
                 compiler->SwitchToBlock(assignBlock);
+                coalescePostfix.emplace(this);
                 operatorText = "=";  // the tail IS the store path from here on
             }
             // Closes the '??=' assign arm and yields the destination's value at the join. Identity
@@ -2427,6 +2551,7 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                 }
                 else
                 {
+                    if (coalescePostfix.has_value()) coalescePostfix->Flush();
                     compiler->CreateJump(coalesceResume);
                     compiler->SwitchToBlock(coalesceResume);
                     resultValue = derefLoad();
@@ -6225,6 +6350,34 @@ llvm::Value* MainListener::CloneTernaryClosureValue(
         return cloned;
     }
 
+/*
+ * A `?:` over two pointers of ONE primitive shape (same pointee, same depth) has that shape too,
+ * so `s + (c ? a : b)` binds like `s + a`. Arms that disagree leave the join unrecorded; class
+ * and interface joins keep their own inference (InferTernaryArmType, interface boxing).
+ */
+void MainListener::JoinTernaryPointerShape(LLVMBackend::TypedValue& result,
+                                           const LLVMBackend::TypedValue& trueArm,
+                                           const LLVMBackend::TypedValue& falseArm) {
+        // Two integer arms naming one non-primitive type (an enum) keep it; the reader resolves it.
+        if (result.value != nullptr && result.value->getType()->isIntegerTy()
+            && trueArm.pointerDepth == 0 && falseArm.pointerDepth == 0
+            && !trueArm.sourceTypeName.empty() && trueArm.sourceTypeName == falseArm.sourceTypeName
+            && !LLVMBackend::IsPrimitiveTypeName(trueArm.sourceTypeName))
+        {
+            result.sourceTypeName = trueArm.sourceTypeName;
+            return;
+        }
+        if (result.value == nullptr || !result.value->getType()->isPointerTy()) return;
+        if (trueArm.pointerDepth < 1 || !LLVMBackend::IsPrimitiveTypeName(trueArm.sourceTypeName)
+            || trueArm.sourceTypeName == "void") return;
+        if (trueArm.pointerDepth != falseArm.pointerDepth
+            || trueArm.elemPointer != falseArm.elemPointer
+            || trueArm.sourceTypeName != falseArm.sourceTypeName) return;
+        result.pointerDepth = trueArm.pointerDepth;
+        result.elemPointer = trueArm.elemPointer;
+        result.sourceTypeName = trueArm.sourceTypeName;
+    }
+
 LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
         CFlatParser::ConditionalExpressionContext* ctx,
         const LLVMBackend::TypedValue& condTv,
@@ -6234,6 +6387,7 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
         const std::string& cxxTernaryDeclType, bool collapseLvalueArms,
         bool collapseLvalueSink) {
         auto* compiler = Compiler(ctx);
+        const bool autoDeclTernary = std::exchange(autoDeclTernaryActive_, false);
         LLVMBackend::TypeAndValue pointerJoinDest;
         if (outerExpected.Pointer && compiler->IsCxxRecord(outerExpected.TypeName))
             pointerJoinDest = outerExpected;
@@ -6313,6 +6467,43 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
             ++cxxTernaryDeclArmsMoved;
         };
 
+        /*
+         * C++17: the selected prvalue initializes the result object. An arm whose VALUE is the
+         * outermost call's sret temporary (any shape: `f()`, `(f())`, `a + b`, `f().m()`) is
+         * retargeted after the fact - every use of that fresh temporary becomes `dest`, so the
+         * call built there and nothing is moved or destroyed. Inner temporaries are untouched.
+         */
+        auto retargetCxxArmTemp = [&](llvm::Value* armValue, llvm::Value* armStorage,
+                                      llvm::Value* dest, llvm::Type* destType) {
+            auto* temp = llvm::dyn_cast_or_null<llvm::AllocaInst>(armStorage);
+            if (temp == nullptr || dest == nullptr || temp == dest || armValue == nullptr
+                || temp != compiler->lastCxxRetTemp_ || destType == nullptr
+                || temp->getAllocatedType() != destType || armValue->getType() != destType)
+                return false;
+            compiler->UnregisterOwnedStructTemp(temp);
+            temp->replaceAllUsesWith(dest);
+            compiler->lastCxxRetTemp_ = nullptr;
+            return true;
+        };
+        auto cxxTernaryDeclLlvmType = [&]() -> llvm::Type* {
+            auto* declSlot = llvm::dyn_cast_or_null<llvm::AllocaInst>(cxxTernaryDeclDest);
+            return declSlot != nullptr ? declSlot->getAllocatedType()
+                : compiler->GetType(LLVMBackend::TypeAndValue{ .TypeName = cxxTernaryDeclType });
+        };
+        auto cxxTernaryArmBuiltInPlace = [&](llvm::Value* armValue, llvm::Value* armStorage) {
+            if (!cxxTernaryDecl
+                || !retargetCxxArmTemp(armValue, armStorage, cxxTernaryDeclDest, cxxTernaryDeclLlvmType()))
+                return false;
+            ++cxxTernaryDeclArmsMoved;
+            return true;
+        };
+
+        // Outside a declaration, a single-call false arm constructs into the true arm's C++
+        // return temporary, so the join is ONE prvalue temporary a declaration can adopt.
+        llvm::Value* trueCxxRetTemp = nullptr;
+        llvm::Value* sharedCxxRetTemp = nullptr;
+        std::string sharedCxxRetType;
+
         struct TernaryCallArgumentDepthScope
         {
             int& depth;
@@ -6337,6 +6528,8 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
 
         llvm::Value* trueValue  = nullptr;
         llvm::Value* falseValue = nullptr;
+        // Each arm's pointer shape (pointee name + depth), joined onto the result when both agree.
+        LLVMBackend::TypedValue trueShape, falseShape;
         llvm::UncondBrInst* trueBr  = nullptr;
         llvm::UncondBrInst* falseBr = nullptr;
         llvm::BasicBlock* trueEnd = nullptr;
@@ -6407,8 +6600,31 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
             const std::string sourceName = compiler->FindVariableNameByStorage(storage);
             if (!sourceName.empty()) compiler->MarkVariableMoved(sourceName);
         };
+        /*
+         * `T(args)` builds an owned temporary that is no call's sret slot. In an `auto`
+         * declaration's arms it joins exactly like one, so publish it as the arm's C++ return
+         * temporary: the lvalue-arm copy and the declaration's elision then treat it alike.
+         */
+        auto publishCxxCtorTemp = [&](llvm::Value* value, llvm::Value* storage) {
+            if (!autoDeclTernary || cxxTernaryDecl || value == nullptr
+                || !llvm::isa_and_nonnull<llvm::AllocaInst>(storage)
+                || storage == compiler->lastCxxRetTemp_)
+                return;
+            auto* st = llvm::dyn_cast<llvm::StructType>(value->getType());
+            if (st == nullptr || !st->hasName()
+                || !compiler->IsForeignNontrivialCxxReturnClass(st->getName().str()))
+                return;
+            LLVMBackend::NamedVariable probe;
+            probe.Primary = value;
+            probe.Storage = storage;
+            probe.TypeAndValue.TypeName = st->getName().str();
+            if (!compiler->IsOwnedTempValue(probe)) return;
+            compiler->lastCxxRetTemp_ = storage;
+            compiler->lastCxxRetValue_ = value;
+        };
         auto parseTrueArm = [&]() {
             compiler->SwitchToBlock(trueBlock);
+            BranchPostfixScope armPostfix(this);  // this arm's postfix ++/-- land in this arm only
             trueMark = compiler->MarkOwnedTemps();
             if (cxxTernaryDecl)
             {
@@ -6437,6 +6653,7 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
             {
                 auto trueTv = ParseTernaryArmExpression(expressionTrueCtx);
                 trueValue = trueTv.value;
+                trueShape = trueTv;
                 trueStorage = trueTv.storage;
                 // A NESTED `?:` arm publishes its own storage join on receiverStorage: a PHI
                 // beside the value PHI names the selected object, so seed this arm from it.
@@ -6451,7 +6668,19 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
                     trueStorage = load->getPointerOperand();
             trueAlias = trueAlias || compiler->IsAliasValue(trueValue);
             trueTempField = compiler->IsTempFieldValue(trueValue);
-            moveCxxTernaryArmIntoDecl(trueValue, trueStorage, trueMark);
+            publishCxxCtorTemp(trueValue, trueStorage);
+            if (!cxxTernaryDecl && use != ResultUse::Discard && trueStorage != nullptr
+                && trueStorage == compiler->lastCxxRetTemp_
+                && llvm::isa<llvm::AllocaInst>(trueStorage) && trueValue != nullptr)
+                if (auto* st = llvm::dyn_cast<llvm::StructType>(trueValue->getType());
+                    st != nullptr && st->hasName()
+                    && compiler->IsForeignNontrivialCxxReturnClass(st->getName().str()))
+                {
+                    trueCxxRetTemp = trueStorage;
+                    sharedCxxRetType = st->getName().str();
+                }
+            if (!cxxTernaryArmBuiltInPlace(trueValue, trueStorage))
+                moveCxxTernaryArmIntoDecl(trueValue, trueStorage, trueMark);
             if (ternaryDepth.IsOutermost() && !TernaryIsBinaryOperand(ctx)
                 && trueValue != nullptr && !outerExpected.IsMove
                 && !(outerExpected.IsOwningSink && compiler->OwningSinkConsumesConcrete(outerExpected)))
@@ -6472,10 +6701,68 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
                 compiler->FlushOwnedTempsSince(trueMark, nullptr, branchBlock);
             else
                 FinishTernaryArm(compiler, trueValue, trueMark, trueOwnedString, branchBlock);
+            armPostfix.Flush();
             trueEnd = compiler->builder->GetInsertBlock();
+        };
+        /*
+         * C++: `c ? lvalue : prvalue` of one class is a prvalue - the lvalue arm COPY-constructs
+         * the other arm's return temporary, which then joins as one slot a declaration adopts.
+         * Only for an `auto` declaration (a typed one copies in moveCxxTernaryArmIntoDecl);
+         * other sinks keep the mixed-ownership rejection.
+         */
+        // A reference-returning C++ call is an alias arm with real storage, so it copies too.
+        auto isCopyableCxxLvalueArm = [&](llvm::Value* value, llvm::Value* storage,
+                                          llvm::Type* joinType) {
+            return !cxxTernaryDecl && use != ResultUse::Discard && !trueDefault
+                && autoDeclTernary && !outerExpected.IsAlias && !compiler->currentFunctionReturnTV.IsAlias
+                && value != nullptr && value->getType() == joinType
+                && isAddressableLvalue(value, storage) && !compiler->IsTempFieldValue(value);
+        };
+        auto materializeCxxLvalueArm = [&]() {
+            if (sharedCxxRetTemp != nullptr || trueValue == nullptr || falseValue == nullptr)
+                return;
+            if (trueCxxRetTemp != nullptr
+                && isCopyableCxxLvalueArm(falseValue, falseStorage, trueValue->getType()))
+            {
+                if (!compiler->EmitCxxCopyOrMoveConstruct(sharedCxxRetType, trueCxxRetTemp,
+                        falseStorage, /*useMove*/ false, "into a conditional expression"))
+                    return;
+                sharedCxxRetTemp = trueCxxRetTemp;
+                compiler->RegisterOwnedStructTemp(sharedCxxRetTemp, sharedCxxRetType);
+                falseStorage = sharedCxxRetTemp;
+                falseValue = compiler->builder->CreateLoad(trueValue->getType(), sharedCxxRetTemp);
+                falseAlias = false;   // now the copy in the temporary, no longer the referent
+                return;
+            }
+            // The mirror: the FALSE arm is the temporary, so the copy goes at the true arm's end.
+            auto* falseTemp = llvm::dyn_cast_or_null<llvm::AllocaInst>(falseStorage);
+            auto* st = llvm::dyn_cast<llvm::StructType>(falseValue->getType());
+            if (trueCxxRetTemp != nullptr || falseTemp == nullptr
+                || falseStorage != compiler->lastCxxRetTemp_ || st == nullptr || !st->hasName()
+                || !compiler->IsForeignNontrivialCxxReturnClass(st->getName().str())
+                || !isCopyableCxxLvalueArm(trueValue, trueStorage, st)
+                || trueEnd == nullptr || cflat_llvm::GetTerminatorOrNull(trueEnd) != nullptr)
+                return;
+            const std::string typeName = st->getName().str();
+            auto savedIP = compiler->builder->saveIP();
+            compiler->builder->SetInsertPoint(trueEnd);
+            const auto mark = compiler->MarkOwnedTemps();
+            if (compiler->EmitCxxCopyOrMoveConstruct(typeName, falseTemp, trueStorage,
+                    /*useMove*/ false, "into a conditional expression"))
+            {
+                sharedCxxRetTemp = falseTemp;
+                compiler->RegisterOwnedStructTemp(falseTemp, typeName);
+                trueStorage = falseTemp;
+                trueValue = compiler->builder->CreateLoad(st, falseTemp);
+                trueAlias = false;
+                compiler->FlushOwnedTempsSince(mark, nullptr, branchBlock);
+                trueEnd = compiler->builder->GetInsertBlock();
+            }
+            compiler->builder->restoreIP(savedIP);
         };
         auto parseFalseArm = [&]() {
             compiler->SwitchToBlock(falseBlock);
+            BranchPostfixScope armPostfix(this);  // this arm's postfix ++/-- land in this arm only
             falseMark = compiler->MarkOwnedTemps();
             if (cxxTernaryDecl)
             {
@@ -6492,6 +6779,7 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
             }
             auto falseTv = ParseConditionalExpression(expressionFalseCtx, use);
             falseValue = falseTv.value;
+            falseShape = falseTv;
             falseUnsigned = falseTv.isUnsigned;
             falseStorage = falseTv.storage;
             // A NESTED `?:` arm publishes its own storage join on receiverStorage: a PHI
@@ -6504,7 +6792,19 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
                     falseStorage = load->getPointerOperand();
             falseAlias = falseAlias || compiler->IsAliasValue(falseValue);
             falseTempField = compiler->IsTempFieldValue(falseValue);
-            moveCxxTernaryArmIntoDecl(falseValue, falseStorage, falseMark);
+            publishCxxCtorTemp(falseValue, falseStorage);
+            // Outside a declaration the false arm's temporary becomes the true arm's, so the
+            // join is ONE prvalue temporary; its own live flag guards the shared destructor.
+            if (trueCxxRetTemp != nullptr && !trueDefault && trueValue != nullptr
+                && retargetCxxArmTemp(falseValue, falseStorage, trueCxxRetTemp, trueValue->getType()))
+            {
+                sharedCxxRetTemp = trueCxxRetTemp;
+                falseStorage = sharedCxxRetTemp;
+                compiler->RegisterOwnedStructTemp(sharedCxxRetTemp, sharedCxxRetType);
+            }
+            materializeCxxLvalueArm();
+            if (!cxxTernaryArmBuiltInPlace(falseValue, falseStorage))
+                moveCxxTernaryArmIntoDecl(falseValue, falseStorage, falseMark);
             if (ternaryDepth.IsOutermost() && !TernaryIsBinaryOperand(ctx)
                 && falseValue != nullptr && !outerExpected.IsMove
                 && !(outerExpected.IsOwningSink && compiler->OwningSinkConsumesConcrete(outerExpected)))
@@ -6525,6 +6825,7 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
                 compiler->FlushOwnedTempsSince(falseMark, nullptr, branchBlock);
             else
                 FinishTernaryArm(compiler, falseValue, falseMark, falseOwnedString, branchBlock);
+            armPostfix.Flush();
             falseEnd = compiler->builder->GetInsertBlock();
         };
         try
@@ -6664,6 +6965,8 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
             LLVMBackend::TypedValue result{ only, trueBr != nullptr ? trueUnsigned : falseUnsigned };
             result.isAlias = trueBr != nullptr ? trueAlias : falseAlias;
             result.storage = trueBr != nullptr ? trueStorage : falseStorage;
+            JoinTernaryPointerShape(result, trueBr != nullptr ? trueShape : falseShape,
+                                    trueBr != nullptr ? trueShape : falseShape);
             return result;
         }
 
@@ -7015,7 +7318,10 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
             && !trueValue->getType()->isPointerTy()
             && trueStorage != nullptr && falseStorage != nullptr
             && !isBorrowedTernaryArm(trueStorage) && !isBorrowedTernaryArm(falseStorage);
-        if ((cxxRecordJoin || scalarLvalueJoin || valueLvalueJoin)
+        if (sharedCxxRetTemp != nullptr && trueStorage == sharedCxxRetTemp
+            && falseStorage == sharedCxxRetTemp)
+            cxxLvalueStorageJoin = sharedCxxRetTemp;
+        else if ((cxxRecordJoin || scalarLvalueJoin || valueLvalueJoin)
             && trueStorage != nullptr && falseStorage != nullptr)
         {
             auto* cxxStoragePhi = compiler->builder->CreatePHI(
@@ -7121,6 +7427,12 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
         result.receiverStorage = cxxLvalueStorageJoin;
         result.isRvalue = cxxRecordJoin
             && (cxxLvalueStorageJoin == nullptr || bothOwnedCxxTempArms);
+        JoinTernaryPointerShape(result, trueShape, falseShape);
+        if (sharedCxxRetTemp != nullptr && cxxLvalueStorageJoin == sharedCxxRetTemp)
+        {
+            compiler->lastCxxRetTemp_ = sharedCxxRetTemp;
+            compiler->lastCxxRetValue_ = resultValue;
+        }
         return result;
     }
 
@@ -7128,6 +7440,7 @@ LLVMBackend::TypedValue MainListener::ParseConditionalExpression(
         CFlatParser::ConditionalExpressionContext* ctx, ResultUse use) {
         LLVMBackend::TypeAndValue outerExpected = declExpectedType;
         auto* compiler = Compiler(ctx);
+        const bool autoDeclTernary = std::exchange(autoDeclTernaryInit_, false);
         DeclExpectedTypeGate declExpectedGate(&declExpectedType,
             ctx->children.size() == 1
                 || (declExpectedType.Pointer && compiler->IsCxxRecord(declExpectedType.TypeName)));
@@ -7248,6 +7561,9 @@ LLVMBackend::TypedValue MainListener::ParseConditionalExpression(
             auto* notNullBlock = compiler->CreateBasicBlock("nullcoal_notnull");
             auto* resumeBlock = compiler->CreateBasicBlock("nullcoal_resume");
 
+            // A bare `new` LHS runs on both paths; ledger it here so the after-call cleanup frees it.
+            if (inCallArgument_ && compiler->IsOwnedNewTemp(lhs))
+                compiler->RegisterOwnedPtrTemp(lhs);
             compiler->CreateConditionJump(conditionValue, notNullBlock, nullBlock);
             // insert point is now notNullBlock (lhs is not null)
             if (moveUniquePointerJoin)
@@ -7296,6 +7612,7 @@ LLVMBackend::TypedValue MainListener::ParseConditionalExpression(
             llvm::UncondBrInst* rhsBr = nullptr;
             try
             {
+                BranchPostfixScope rhsPostfix(this);  // the RHS runs only when the LHS is null
                 {
                     LLVMBackend::CastOccurrenceScope armScope(compiler);
                     rhsOcc = armScope.Id;
@@ -7360,6 +7677,7 @@ LLVMBackend::TypedValue MainListener::ParseConditionalExpression(
                         ? compiler->Upconvert(compiler->RawArrayCountOf(rhs), compiler->builder->getInt64Ty())
                         : compiler->builder->getInt64(-1),
                     rawCountAlloca);
+                rhsPostfix.Flush();
                 rhsBr = compiler->CreateJump(resumeBlock);
             }
             catch (...)
@@ -7475,8 +7793,16 @@ LLVMBackend::TypedValue MainListener::ParseConditionalExpression(
 
         if (logicCtx != nullptr)
         {
+            // A `?:` condition ends at a sequence point: its postfix ++/-- land before either arm.
+            std::optional<BranchPostfixScope> condPostfix;
+            if (expressionTrueCtx != nullptr) condPostfix.emplace(this);
             auto condTv = ParseLogicalOrExpression(
                 logicCtx, expressionTrueCtx != nullptr ? ResultUse::Value : use);
+            if (condPostfix.has_value())
+            {
+                condPostfix->Flush();
+                condPostfix.reset();
+            }
 
             // Both expression should exist or not exist.
             if ((expressionFalseCtx != nullptr) != (expressionTrueCtx != nullptr))
@@ -7494,6 +7820,7 @@ LLVMBackend::TypedValue MainListener::ParseConditionalExpression(
                     && compiler->currentFunction != nullptr
                     && insertBB->getParent() == compiler->currentFunction)
                 {
+                    autoDeclTernaryActive_ = autoDeclTernary;
                     return ParseTernaryBranches(ctx, condTv, expressionTrueCtx, expressionFalseCtx,
                         use, outerExpected, cxxTernaryDeclDest, cxxTernaryDeclType,
                         collapseLvalueArms, collapseLvalueSink);
@@ -7506,6 +7833,7 @@ LLVMBackend::TypedValue MainListener::ParseConditionalExpression(
                 llvm::Value* falseValue = nullptr;
                 bool trueUnsigned = false;
                 bool falseUnsigned = false;
+                LLVMBackend::TypedValue trueShape, falseShape;
                 bool trueDefault = IsDefaultOnlyExpression(expressionTrueCtx);
                 bool falseDefault = IsDefaultOnlyExpression(expressionFalseCtx);
                 auto expectedForDefault = [&](llvm::Value* otherValue, bool otherIsDefault) {
@@ -7535,6 +7863,7 @@ LLVMBackend::TypedValue MainListener::ParseConditionalExpression(
                     {
                         auto trueTv = ParseTernaryArmExpression(expressionTrueCtx);
                         trueValue = trueTv.value;
+                        trueShape = trueTv;
                         trueUnsigned = trueTv.isUnsigned;
                     }
                 };
@@ -7549,6 +7878,7 @@ LLVMBackend::TypedValue MainListener::ParseConditionalExpression(
                     }
                     auto falseTv = ParseConditionalExpression(expressionFalseCtx, use);
                     falseValue = falseTv.value;
+                    falseShape = falseTv;
                     falseUnsigned = falseTv.isUnsigned;
                 };
                 {
@@ -7627,6 +7957,7 @@ LLVMBackend::TypedValue MainListener::ParseConditionalExpression(
                 selectValue = CloneTernaryClosureValue(selectValue, ctx);
                 LLVMBackend::TypedValue result{ selectValue, joinUnsigned };
                 result.isAlias = compiler->IsAliasValue(selectValue);
+                JoinTernaryPointerShape(result, trueShape, falseShape);
                 return result;
             }
 
@@ -7716,7 +8047,11 @@ LLVMBackend::TypedValue MainListener::ParseLogicalOrExpression(CFlatParser::Logi
             // Always use resultStorage path. The elseBlock optimization was broken:
             // when the first || operand is true it jumped to blockFalse instead of blockTrue,
             // because only the false-destination is stored in the block context.
+            // Sequence point after each operand: its postfix ++/-- land before the next is tested.
+            std::optional<BranchPostfixScope> firstPostfix(std::in_place, this);
             auto firstOperand = ParseLogicalAndExpression(logicCtxs[0], ResultUse::Value);
+            firstPostfix->Flush();
+            firstPostfix.reset();
             if (llvm::Value* classChain = TryClassLogicalOperatorChain(
                     "||", ctx, firstOperand,
                     [&](size_t i) { return ParseLogicalAndExpression(logicCtxs[i], ResultUse::Value); },
@@ -7743,9 +8078,11 @@ LLVMBackend::TypedValue MainListener::ParseLogicalOrExpression(CFlatParser::Logi
 
                     compiler->InitializeBlock(falseBlock, false);
                     LLVMBackend::OwnedTempMark rhsMark = compiler->MarkOwnedTemps();
+                    BranchPostfixScope rhsPostfix(this);  // runs only when the left side is false
                     llvm::Value* right = ParseLogicalAndExpression(logicCtx, ResultUse::Value);
                     EnsureOperatorBoolForValue(right);
                     right = compiler->CoerceToBoolCondition(right);
+                    rhsPostfix.Flush();
                     left = compiler->CreateOperation(LLVMBackend::Operation::LogicalOr, left, right);
                     // The short-circuit block does not dominate resumeOR, so the end-of-statement
                     // flush would skip its temps; the operands are already reduced to a bool here.
@@ -7781,7 +8118,11 @@ LLVMBackend::TypedValue MainListener::ParseLogicalAndExpression(CFlatParser::Log
             // in non-condition contexts (e.g. bool x = a && b inside a loop body) the
             // elseBlock from an enclosing scope (loop exit) was incorrectly used as the
             // false-branch target, causing the loop to exit instead of continuing.
+            // Sequence point after each operand: its postfix ++/-- land before the next is tested.
+            std::optional<BranchPostfixScope> firstPostfix(std::in_place, this);
             auto firstOperand = ParseInclusiveOrExpression(inclusiveCtxs[0], ResultUse::Value);
+            firstPostfix->Flush();
+            firstPostfix.reset();
             if (llvm::Value* classChain = TryClassLogicalOperatorChain(
                     "&&", ctx, firstOperand,
                     [&](size_t i) { return ParseInclusiveOrExpression(inclusiveCtxs[i], ResultUse::Value); },
@@ -7808,9 +8149,11 @@ LLVMBackend::TypedValue MainListener::ParseLogicalAndExpression(CFlatParser::Log
 
                     compiler->InitializeBlock(trueBlock, false);
                     LLVMBackend::OwnedTempMark rhsMark = compiler->MarkOwnedTemps();
+                    BranchPostfixScope rhsPostfix(this);  // runs only when the left side is true
                     llvm::Value* right = ParseInclusiveOrExpression(inclusiveCtx, ResultUse::Value);
                     EnsureOperatorBoolForValue(right);
                     right = compiler->CoerceToBoolCondition(right);
+                    rhsPostfix.Flush();
                     left = compiler->CreateOperation(LLVMBackend::Operation::LogicalAnd, left, right);
                     // The short-circuit block does not dominate resumeAND, so the end-of-statement
                     // flush would skip its temps; the operands are already reduced to a bool here.
@@ -7830,6 +8173,7 @@ LLVMBackend::TypedValue MainListener::ParseLogicalAndExpression(CFlatParser::Log
     }
 
 LLVMBackend::TypedValue MainListener::ParseInclusiveOrExpression(CFlatParser::InclusiveOrExpressionContext* ctx, ResultUse use) {
+        CallPostfixScope operatorPostfix(this);
         DeclExpectedTypeGate declExpectedGate(&declExpectedType, ctx->children.size() == 1);
         auto exclusiveCtxs = ctx->exclusiveOrExpression();
         if (exclusiveCtxs.size() == 1)
@@ -7906,6 +8250,7 @@ LLVMBackend::TypedValue MainListener::ParseInclusiveOrExpression(CFlatParser::In
     }
 
 LLVMBackend::TypedValue MainListener::ParseExclusiveOrExpression(CFlatParser::ExclusiveOrExpressionContext* ctx, ResultUse use) {
+        CallPostfixScope operatorPostfix(this);
         DeclExpectedTypeGate declExpectedGate(&declExpectedType, ctx->children.size() == 1);
         auto andCtxs = ctx->andExpression();
         if (andCtxs.size() == 1)
@@ -7982,6 +8327,7 @@ LLVMBackend::TypedValue MainListener::ParseExclusiveOrExpression(CFlatParser::Ex
     }
 
 LLVMBackend::TypedValue MainListener::ParseAndExpression(CFlatParser::AndExpressionContext* ctx, ResultUse use) {
+        CallPostfixScope operatorPostfix(this);
         DeclExpectedTypeGate declExpectedGate(&declExpectedType, ctx->children.size() == 1);
         auto nextCtxs = ctx->equalityExpression();
         if (nextCtxs.size() == 1)
@@ -8078,6 +8424,7 @@ void MainListener::LowerInterfaceNullCompare(antlr4::ParserRuleContext* ctx,
     }
 
 LLVMBackend::TypedValue MainListener::ParseEqualityExpression(CFlatParser::EqualityExpressionContext* ctx, ResultUse use) {
+        CallPostfixScope operatorPostfix(this);
         DeclExpectedTypeGate declExpectedGate(&declExpectedType, ctx->children.size() == 1);
         auto nextCtxs = ctx->typeCheckExpression();
         if (nextCtxs.size() == 1)
@@ -8231,14 +8578,41 @@ LLVMBackend::TypedValue MainListener::TypedValueOfNamedOperand(LLVMBackend::Name
         result.elemType = elemType;
         result.isArrayView = namedVar.TypeAndValue.IsArrayView;
         result.sourceTypeName = namedVar.TypeAndValue.TypeName;
-        // Carry the depth so an operator's right operand keeps a claim the raw llvm::Value loses.
-        // Only a depth that is about THIS value is carried; everything else stays unrecorded.
-        if (namedVar.TypeAndValue.DepthIsAboutThisValue())
-        {
-            result.pointerDepth = namedVar.TypeAndValue.PointerDepth;
-            result.elemPointer  = namedVar.TypeAndValue.ElemPointer;
-        }
+        OperandPointerDepth(namedVar, result.value, result.pointerDepth, result.elemPointer);
         return result;
+    }
+
+/*
+ * The pointer depth an operand's VALUE is proven to have, for an operator's right operand whose
+ * raw llvm::Value has lost it. 0 = unrecorded; -1 = a pointer no depth describes (`T(*)[N]`).
+ */
+void MainListener::OperandPointerDepth(const LLVMBackend::NamedVariable& namedVar, llvm::Value* value,
+                                       int& depth, bool& elemPointer) {
+        const auto& tv = namedVar.TypeAndValue;
+        const bool isPointerValue = value != nullptr && value->getType()->isPointerTy();
+        // A fixed array - or a row of one (`m[1]` of `char[4][4]`) - decays to a pointer to its
+        // element: element stars + 1. A row of rows decays to `T(*)[N]` instead.
+        if (auto* arrTy = llvm::dyn_cast_or_null<llvm::ArrayType>(namedVar.BaseType);
+            arrTy != nullptr && isPointerValue && !tv.IsArrayView && !tv.IsSimd
+            && LLVMBackend::IsPrimitiveTypeName(tv.TypeName) && tv.TypeName != "void")
+        {
+            depth = arrTy->getElementType()->isArrayTy() ? -1 : FixedArrayElementStars(tv) + 1;
+            elemPointer = depth >= 2;
+            return;
+        }
+        // Only a depth that is about THIS value is carried; everything else stays unrecorded.
+        if (tv.DepthIsAboutThisValue())
+        {
+            depth = tv.PointerDepth;
+            elemPointer = tv.ElemPointer;
+            // No recorded depth: the Pointer / ElemPointer bits still name it (`&c`, `u.c_str()`).
+            if (depth == 0 && isPointerValue) depth = tv.ValuePointerDepth();
+        }
+        // A fixed 1-D `T[N]` of a primitive decays to a `T*` value: the depth is PROVEN at 1.
+        else if (tv.ConstArraySize > 0 && tv.ConstInnerDimensions.empty() && !tv.Pointer
+                 && !tv.ElemPointer && !tv.IsArrayView && !tv.IsSimd && isPointerValue
+                 && LLVMBackend::IsPrimitiveTypeName(tv.TypeName) && tv.TypeName != "void")
+            depth = 1;
     }
 
 CFlatParser::CastExpressionContext* MainListener::SoleCastOperandOf(CFlatParser::RelationalExpressionContext* relCtx) {
@@ -8869,6 +9243,7 @@ llvm::Value* MainListener::GenerateSafeCast(llvm::Value* interfaceValue, const s
     }
 
 LLVMBackend::TypedValue MainListener::ParseRelationalExpression(CFlatParser::RelationalExpressionContext* ctx, ResultUse use) {
+        CallPostfixScope operatorPostfix(this);
         DeclExpectedTypeGate declExpectedGate(&declExpectedType, ctx->children.size() == 1);
         auto nextCtxs = ctx->shiftExpression();
         if (nextCtxs.size() == 1)
@@ -9212,6 +9587,87 @@ bool MainListener::HasOperatorOverloadForFirstParam(const std::string& opName, c
         return false;
     }
 
+
+/*
+ * Syntactic category of a call argument for C++ reference binding (NamedVariable::CxxLvalueKind):
+ * 1 = lvalue designator (name, field, element, `*p`, parenthesised lvalue, `?:` of two lvalues),
+ * 2 = call (an lvalue only through a `T&` result), 3 = assignment (plain or compound; refused
+ * by ruling 2026-09-27), 0 = anything else: unary/binary arithmetic, casts, `x++`, literals,
+ * `move`, `?.`.
+ */
+int8_t MainListener::CxxArgumentLvalueKind(antlr4::tree::ParseTree* tree)
+{
+        while (tree != nullptr)
+        {
+            if (auto* a = dynamic_cast<CFlatParser::AssignmentExpressionContext*>(tree))
+            {
+                if (a->assignmentOperator() != nullptr) return 3;
+                if (a->conditionalExpression() == nullptr) return 0;
+                tree = a->conditionalExpression();
+                continue;
+            }
+            if (auto* c = dynamic_cast<CFlatParser::ConditionalExpressionContext*>(tree))
+            {
+                if (c->children.size() == 1) { tree = c->logicalOrExpression(); continue; }
+                if (c->expression() == nullptr || c->conditionalExpression() == nullptr) return 0;
+                return CxxArgumentLvalueKind(c->expression()) == 1
+                    && CxxArgumentLvalueKind(c->conditionalExpression()) == 1 ? 1 : 0;
+            }
+            if (auto* e = dynamic_cast<CFlatParser::ExpressionContext*>(tree))
+            {
+                tree = e->assignmentExpression();
+                continue;
+            }
+            if (auto* cast = dynamic_cast<CFlatParser::CastExpressionContext*>(tree))
+            {
+                if (cast->unaryExpression() == nullptr) return 0;
+                tree = cast->unaryExpression();
+                continue;
+            }
+            if (auto* u = dynamic_cast<CFlatParser::UnaryExpressionContext*>(tree))
+            {
+                if (u->postfixExpression() != nullptr && u->children.size() == 1)
+                {
+                    tree = u->postfixExpression();
+                    continue;
+                }
+                return u->unaryOperator() != nullptr && u->children.size() == 2
+                    && u->unaryOperator()->getText() == "*" ? 1 : 0;
+            }
+            if (auto* p = dynamic_cast<CFlatParser::PostfixExpressionContext*>(tree))
+            {
+                if (p->children.size() == 1) { tree = p->primaryExpression(); continue; }
+                const std::string last = p->children.back()->getText();
+                if (last == "++" || last == "--") return 0;
+                if (last == "]") return 1;
+                if (last == ")")
+                    return p->children.size() >= 3
+                        && p->children[p->children.size() - 3]->getText() == "~" ? 0 : 2;
+                // A member access: the nearest accessor token decides ('?.' yields a value).
+                for (auto it = p->children.rbegin(); it != p->children.rend(); ++it)
+                    if (dynamic_cast<antlr4::tree::TerminalNode*>(*it) != nullptr)
+                        return (*it)->getText() == "?." ? 0 : 1;
+                return 0;
+            }
+            if (auto* pr = dynamic_cast<CFlatParser::PrimaryExpressionContext*>(tree))
+            {
+                if (pr->genericIdentifier() != nullptr && pr->children.size() == 1) return 1;
+                if (pr->expression() != nullptr && pr->children.size() == 3
+                    && pr->children.front()->getText() == "(")
+                {
+                    tree = pr->expression();
+                    continue;
+                }
+                return 0;
+            }
+            // logicalOr ... multiplicative: an lvalue only as a lone operand.
+            auto* rule = dynamic_cast<antlr4::ParserRuleContext*>(tree);
+            if (rule == nullptr || rule->children.size() != 1) return 0;
+            tree = rule->children.front();
+        }
+        return 0;
+}
+
 /*
  * `a << b` / `a >> b` with a C++ class on the left is a C++ expression, so C++ resolves it: a
  * generated `decltype(auto) w(A& p0, B p1) { return p0 << p1; }` sees the members, the free
@@ -9270,6 +9726,12 @@ llvm::Value* MainListener::TryCxxInfixShift(CFlatParser::ShiftExpressionContext*
             arg.Storage = o.value.isRvalue && isClass ? nullptr : storage;
             if (!isClass && o.named.Storage == nullptr) arg.Storage = nullptr;
             arg.IsRvalue = isClass && arg.Storage == nullptr;
+            arg.CxxLvalueKind = o.expr != nullptr ? CxxArgumentLvalueKind(o.expr) : -1;
+            // A scalar lvalue designator that is no simple name (`h.f`, `a[1]`, `*p`): its
+            // address is the slot this expression loaded from.
+            if (!isClass && arg.CxxLvalueKind == 1 && arg.Storage == nullptr)
+                if (auto* load = llvm::dyn_cast<llvm::LoadInst>(arg.Primary))
+                    arg.Storage = load->getPointerOperand();
             if (arg.IsRvalue)
             {
                 auto* temp = compiler->CreateAlloca(arg.BaseType);
@@ -9298,9 +9760,39 @@ llvm::Value* MainListener::TryCxxInfixShift(CFlatParser::ShiftExpressionContext*
                 LogErrorContext(ctx, std::format("C++ expression '{} {} {}' could not be bound ({})",
                                                  shown(lhs, lhsClass), op, shown(rhs, rhsClass),
                                                  error));
+                return nullptr;
+            }
+            /*
+             * The wrapper hands C++ a scalar temporary as an rvalue. When the SAME operands bind
+             * once that temporary is an lvalue, the refusal was a non-const `T&` parameter.
+             */
+            for (size_t i = 0; i < args.size(); ++i)
+            {
+                const auto& a = args[i];
+                if (a.TypeAndValue.Pointer || compiler->IsCxxRecord(a.TypeAndValue.TypeName)
+                    || a.BaseType == nullptr || !compiler->IsCxxRvalueReferenceArgument(a))
+                    continue;
+                std::vector<LLVMBackend::NamedVariable> retry = args;
+                auto* slot = compiler->CreateAlloca(a.BaseType);
+                compiler->CreateAssignment(a.Primary, slot);
+                retry[i].Storage = slot;
+                retry[i].IsRvalue = false;
+                retry[i].Primary = compiler->builder->CreateLoad(a.BaseType, slot);
+                retry[i].CxxLvalueKind = 1;
+                std::string retryName, retryError;
+                if (!compiler->RequestCxxFreeFunction(sourceName, {}, retry, retryName, retryError,
+                                                      op, lhs.cxxName, rhs.cxxName)
+                    || retryName.empty())
+                    continue;
+                LogErrorContext(ctx, std::format(
+                    "parameter '{}' of '{}' is a non-const lvalue reference and cannot bind an "
+                    "rvalue; pass an lvalue", i == 1 ? "right operand" : "left operand",
+                    sourceName));
+                return nullptr;
             }
             return nullptr;
         }
+        FlushCallPostfix();
         return compiler->CreateOverloadedFunctionCall(registeredName, args, true);
 }
 
@@ -9457,6 +9949,7 @@ MainListener::ShiftPairResult MainListener::ParseShiftPair(
                 ra.Primary      = rv.value;
                 ra.BaseType     = rv.value ? rv.value->getType() : nullptr;
                 ra.CallerName   = rhsName;
+                FlushCallPostfix();
                 auto* res = compiler->CreateOverloadedFunctionCall(opName, { la, ra });
                 LLVMBackend::NamedVariable resultNV;
                 resultNV.Primary = res;
@@ -9479,6 +9972,7 @@ MainListener::ShiftPairResult MainListener::ParseShiftPair(
     }
 
 LLVMBackend::TypedValue MainListener::ParseShiftExpression(CFlatParser::ShiftExpressionContext* ctx, ResultUse use) {
+        CallPostfixScope operatorPostfix(this);
         DeclExpectedTypeGate declExpectedGate(&declExpectedType, ctx->children.size() == 1);
         auto nextCtxs = ctx->additiveExpression();
         if (nextCtxs.empty())
@@ -9565,6 +10059,7 @@ LLVMBackend::TypedValue MainListener::ParseShiftExpression(CFlatParser::ShiftExp
             lhs.name = TryGetSimpleIdentifier(nextCtxs[0]);
             lhs.named = lookup(lhs.name);
             lhs.literalType = literalTypeOf(nextCtxs[0], lhs.value);
+            lhs.expr = nextCtxs[0];
         }
         for (size_t i = 1; i < nextCtxs.size(); ++i)
         {
@@ -9577,6 +10072,7 @@ LLVMBackend::TypedValue MainListener::ParseShiftExpression(CFlatParser::ShiftExp
                 rhs.name = TryGetSimpleIdentifier(nextCtxs[i]);
                 rhs.named = lookup(rhs.name);
                 rhs.literalType = literalTypeOf(nextCtxs[i], rhs.value);
+                rhs.expr = nextCtxs[i];
             }
             auto pair = ParseShiftPair(lhs, rhs, operators[i - 1], ctx,
                                        i + 1 == nextCtxs.size() ? use : ResultUse::Value);
@@ -9585,6 +10081,7 @@ LLVMBackend::TypedValue MainListener::ParseShiftExpression(CFlatParser::ShiftExp
             lhs.named = pair.named;
             lhs.name = pair.name;
             lhs.accumulated = true;
+            lhs.expr = nullptr;
             lhs.cxxName.clear();
             lhs.literalType.clear();
             // The pair returned a reference: reload the referenced object so the next operand
@@ -9601,6 +10098,7 @@ LLVMBackend::TypedValue MainListener::ParseShiftExpression(CFlatParser::ShiftExp
     }
 
 LLVMBackend::TypedValue MainListener::ParseAdditiveExpression(CFlatParser::AdditiveExpressionContext* ctx, ResultUse use) {
+        CallPostfixScope operatorPostfix(this);
         DeclExpectedTypeGate declExpectedGate(&declExpectedType, ctx->children.size() == 1);
         auto nextCtxs = ctx->multiplicativeExpression();
 
@@ -9706,6 +10204,7 @@ LLVMBackend::TypedValue MainListener::ParseAdditiveExpression(CFlatParser::Addit
                         rightNV.BaseType = rvalue->getType();
                         rightNV.TypeAndValue.TypeName = "char";
                         rightNV.TypeAndValue.Pointer  = true;
+                        FlushCallPostfix();
                         overload = Compiler(ctx)->CreateOverloadedFunctionCall("operator+", { leftNV, rightNV });
                         // Owned result: track it as an end-of-expression temporary so a
                         // bare `a + b` or a chained intermediate is freed (it is unregistered
@@ -10030,6 +10529,7 @@ llvm::Value* MainListener::TryUnaryOperatorOverload(
             thisNV.Primary = tempAlloca;
             thisNV.TernaryTempAlreadyRegistered = receiverTempAlreadyRegistered;
 
+            FlushCallPostfix();
             return compiler->CreateOverloadedFunctionCall(opName, { thisNV });
         }
         else
@@ -10041,6 +10541,7 @@ llvm::Value* MainListener::TryUnaryOperatorOverload(
             thisNV.BaseType = structTy;
             thisNV.TernaryTempAlreadyRegistered = receiverTempAlreadyRegistered;
 
+            FlushCallPostfix();
             return compiler->CreateOverloadedFunctionCall(opName, { thisNV });
         }
     }
@@ -10185,6 +10686,35 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
 
         auto* ty = lvalue->getType();
         /*
+         * A right operand that is a pointer no depth describes (`T(*)[N]` from an array of
+         * arrays, depth -1) or with no identity at all must never satisfy a C++ `U*` parameter of
+         * a specific depth: clang refuses it, and a guess binds `char*` data to a `char**` slot.
+         * Null and string literals convert to any pointer and stay exempt.
+         */
+        const bool rhsDepthUnproven = rvalue != nullptr && rvalue->getType()->isPointerTy()
+            && (rhsPointerDepth < 0 || (rhsPointerDepth == 0 && rhsTypeName.empty()))
+            && !llvm::isa<llvm::ConstantPointerNull>(rvalue)
+            && !(llvm::isa<llvm::Constant>(rvalue)
+                 && compiler->stringLiteralLenByPtr.count(llvm::cast<llvm::Constant>(rvalue)));
+        auto isTypedPointerParam = [&](const LLVMBackend::FunctionSymbol& candidate, size_t index) {
+            if (!candidate.IsCxx || index >= candidate.Parameters.size()) return false;
+            auto rawIt = compiler->cxxFunctionSignatures_.find(candidate.SourceName);
+            if (rawIt != compiler->cxxFunctionSignatures_.end())
+                for (const auto& raw : rawIt->second)
+                    if (raw.linkageName == candidate.UniqueName && index < raw.paramSpellings.size())
+                        return raw.paramSpellings[index].find('*') != std::string::npos
+                            && raw.paramSpellings[index].find("void") == std::string::npos;
+            // No recorded spelling: the mapped shape, where a reference is a pointer too.
+            const auto& param = candidate.Parameters[index];
+            return param.Pointer && !param.IsAlias && !param.IsCxxConstRef && !param.IsRvalueRef
+                && !param.TypeName.empty() && param.TypeName != "void";
+        };
+        auto refuseUnprovenPointer = [&](const std::string& operatorName) {
+            LogErrorContext(ctx, std::format(
+                "C++ '{}' cannot bind its right operand: the pointer's pointee type is not known here (a pointer to an array does not convert to a typed pointer parameter).",
+                operatorName));
+        };
+        /*
          * C++20 REWRITES 'a != b' as '!(a == b)', so a class compiled at that standard (every
          * libc++ iterator, for one) declares only operator==. Bind the equality and negate it
          * when the type has no operator!= of its own; a bound '==' that does not yield an
@@ -10299,9 +10829,11 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
                 if (lvalue == nullptr || rvalue == nullptr) return nullptr;
                 if (!compiler->HasCxxFunctionTemplate(sourceName)) return nullptr;
                 auto templateArgument = [&](llvm::Value* value, llvm::Value* storage,
+                                            llvm::Value* ownSlot,
                                             llvm::StructType* structType,
                                             const std::string& typeName,
-                                            const std::string& sourceTypeName) {
+                                            const std::string& sourceTypeName,
+                                            int pointerDepth, bool elemPointer) {
                     LLVMBackend::NamedVariable arg;
                     arg.Primary = value;
                     arg.Storage = storage;
@@ -10310,10 +10842,28 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
                     // A SCALAR operand has no struct name; its declared name is the only thing
                     // that tells a C++ template `char` from `i8` or `long` from `i64`.
                     if (typeName.empty()) arg.InferSourceTypeName = sourceTypeName;
+                    // A pointer's declared name is its POINTEE: stamp the recorded depth or `s + p` binds the
+                    // `char` overload. An unrecorded depth withholds the name, never guessed.
+                    if (typeName.empty() && value != nullptr && value->getType()->isPointerTy())
+                    {
+                        if (pointerDepth >= 1)
+                        {
+                            arg.TypeAndValue.Pointer = true;
+                            arg.TypeAndValue.PointerDepth = pointerDepth;
+                            arg.TypeAndValue.ElemPointer = elemPointer;
+                        }
+                        else arg.InferSourceTypeName.clear();
+                    }
                     arg.IsRvalue = structType != nullptr && storage == nullptr;
-                    // A class operand is spelled `T &` in the generated wrapper, so it needs an
-                    // address; a temporary operand has no storage and is materialized here.
-                    if (structType != nullptr && arg.Storage == nullptr)
+                    // A temporary read from its own slot (or a '?:' slot join) passes that slot;
+                    // a bitwise re-spill is a second object no ctor built.
+                    auto* load = llvm::dyn_cast_or_null<llvm::LoadInst>(value);
+                    const bool ownValue = ownSlot != nullptr
+                        && ((load != nullptr && load->getPointerOperand() == ownSlot)
+                            || isParallelStorageJoin(value, ownSlot));
+                    if (structType != nullptr && arg.Storage == nullptr && arg.IsRvalue && ownValue)
+                        arg.Storage = ownSlot;
+                    else if (structType != nullptr && arg.Storage == nullptr)
                     {
                         auto* temp = compiler->CreateAlloca(structType);
                         compiler->CreateAssignment(value, temp);
@@ -10322,10 +10872,19 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
                     return arg;
                 };
                 std::vector<LLVMBackend::NamedVariable> templateArgs;
-                templateArgs.push_back(templateArgument(lvalue, freeLhsStorage, leftInfo.first,
-                                                       leftInfo.second, lhsTypeName));
-                templateArgs.push_back(templateArgument(rvalue, freeRhsStorage, rightInfo.first,
-                                                        rightInfo.second, rhsTypeName));
+                templateArgs.push_back(templateArgument(lvalue, freeLhsStorage, lhsStorage,
+                                                       leftInfo.first, leftInfo.second, lhsTypeName, 0, false));
+                templateArgs.push_back(templateArgument(rvalue, freeRhsStorage, rhsStorage,
+                                                        rightInfo.first, rightInfo.second, rhsTypeName,
+                                                        rhsPointerDepth, rhsElemPointer));
+                // `a OP b` with exactly two operands: their syntax decides lvalue-ness.
+                std::vector<antlr4::ParserRuleContext*> operands;
+                for (auto* child : ctx->children)
+                    if (auto* rule = dynamic_cast<antlr4::ParserRuleContext*>(child))
+                        operands.push_back(rule);
+                if (operands.size() == 2)
+                    for (size_t side = 0; side < 2; ++side)
+                        templateArgs[side].CxxLvalueKind = CxxArgumentLvalueKind(operands[side]);
                 std::string registeredName;
                 std::string templateError;
                 if (!compiler->RequestCxxFunctionTemplate(sourceName, {}, {}, templateArgs, {},
@@ -10344,8 +10903,13 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
                         LogErrorContext(ctx, std::format(
                             "C++ '{}' cannot bind its {} operand because the CFlat expression is an rvalue and the parameter is a non-const reference.",
                             opName, rvalueSide));
+                    // A scalar temporary refused by the template's non-const `U&` parameter.
+                    else if (templateError.find("is a non-const lvalue reference and cannot bind")
+                             != std::string::npos)
+                        LogErrorContext(ctx, templateError);
                     return nullptr;
                 }
+                FlushCallPostfix();
                 llvm::Value* result = compiler->CreateOverloadedFunctionCall(
                     registeredName, templateArgs, true);
                 if (result != nullptr) TrackOwnedStringOperatorResult(compiler, result);
@@ -10390,6 +10954,7 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
                 };
 
                 bool candidateFound = false;
+                bool rightTypedPointer = false;
                 bool leftReference = false;
                 bool rightReference = false;
                 bool leftMutableReference = false;
@@ -10411,6 +10976,7 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
                             && candidate.Parameters[1].TypeName != rightInfo.second)
                             continue;
                         candidateFound = true;
+                        rightTypedPointer = rightTypedPointer || isTypedPointerParam(candidate, 1);
                         // Both operands reach this path as struct VALUES, so a parameter of pointer
                         // shape - `const T&` or `T&` - is passed as the address of that value. The
                         // raw spelling is the first source; the mapped shape is the fallback for a
@@ -10484,6 +11050,40 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
                                              leftInfo.second, leftReference);
                 auto rightArg = makeArgument(rvalue, freeRhsStorage, rightInfo.first,
                                               rightInfo.second, rightReference);
+                // An enum left operand is its enum type too (`E::B / obj` binds operator/(E, T)).
+                if (leftInfo.second.empty() && lvalue != nullptr && lvalue->getType()->isIntegerTy())
+                {
+                    if (compiler->IsScopedEnumTypeName(lhsTypeName))
+                        leftArg.TypeAndValue.TypeName = lhsTypeName;
+                    else if (std::string enumKey = compiler->ResolveEnumTypeName(lhsTypeName);
+                             !enumKey.empty())
+                    {
+                        leftArg.TypeAndValue.TypeName = enumKey;
+                        leftArg.TypeAndValue.EnumBacking = compiler->GetEnumBackingType(enumKey);
+                    }
+                }
+                if (rightInfo.second.empty() && rvalue != nullptr)
+                {
+                    // A scalar pointer names its pointee by its recorded depth, like a call argument.
+                    if (rvalue->getType()->isPointerTy() && rhsPointerDepth >= 1)
+                    {
+                        rightArg.TypeAndValue.Pointer = true;
+                        rightArg.TypeAndValue.PointerDepth = rhsPointerDepth;
+                        rightArg.TypeAndValue.ElemPointer = rhsElemPointer;
+                        if (LLVMBackend::IsPrimitiveTypeName(rhsTypeName))
+                            rightArg.InferSourceTypeName = rhsTypeName;
+                    }
+                    else if (rhsDepthUnproven && rightTypedPointer)
+                    {
+                        refuseUnprovenPointer(opName);
+                        return nullptr;
+                    }
+                    // An enum class operand is its enum type, never the `int` it lowers to.
+                    else if (rvalue->getType()->isIntegerTy()
+                             && compiler->IsScopedEnumTypeName(rhsTypeName))
+                        rightArg.TypeAndValue.TypeName = rhsTypeName;
+                }
+                FlushCallPostfix();
                 if (auto* result = compiler->CreateOverloadedFunctionCall(
                         lookupName, { leftArg, rightArg }, true))
                 {
@@ -10710,6 +11310,8 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
         if (typeName == "__iface_fat_ptr" || typeName == "__closure_fat_ptr") return nullptr;
 
         std::string opName = "operator" + op;
+        if (compiler->IsCxxRecord(typeName))
+            compiler->TryBindRefusedCxxBaseMember(typeName, opName);
         auto isMutableReferenceParam = [&](const LLVMBackend::FunctionSymbol& candidate,
                                            size_t index) {
             if (!candidate.IsCxx) return false;
@@ -10901,6 +11503,27 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
                     rightNV.TypeAndValue.Pointer      = true;
                     rightNV.TypeAndValue.PointerDepth = rhsPointerDepth;
                     rightNV.TypeAndValue.ElemPointer  = rhsElemPointer;
+                    // Keep a primitive pointee aside, as a call argument does (`int*` into P(int*)).
+                    if (LLVMBackend::IsPrimitiveTypeName(rhsTypeName))
+                        rightNV.InferSourceTypeName = rhsTypeName;
+                }
+            }
+            else if (rvalue && rhsStorage != nullptr && !rhsIsRvalue && rhsIsAlias)
+            {
+                // A scalar lvalue keeps its storage, so a reference parameter binds it as an lvalue.
+                rightNV.Storage = rhsStorage;
+            }
+            // An enum operand is its enum type, never the `int` it lowers to; without one the
+            // unnamed integer cannot bind a C++ enum parameter (CxxEnumParameterRefusesArgument).
+            if (rvalue && rvalue->getType()->isIntegerTy() && rightNV.TypeAndValue.TypeName.empty())
+            {
+                if (compiler->IsScopedEnumTypeName(rhsTypeName))
+                    rightNV.TypeAndValue.TypeName = rhsTypeName;
+                else if (std::string enumKey = compiler->ResolveEnumTypeName(rhsTypeName);
+                         !enumKey.empty())
+                {
+                    rightNV.TypeAndValue.TypeName = enumKey;
+                    rightNV.TypeAndValue.EnumBacking = compiler->GetEnumBackingType(enumKey);
                 }
             }
             rightNV.TernaryTempAlreadyRegistered = inCallArgument_
@@ -10910,6 +11533,16 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
         };
 
         auto rightNV = makeRightNV();
+        if (rhsDepthUnproven && rightNV.TypeAndValue.TypeName.empty() && !rightNV.IsStringLiteral)
+            if (auto it = compiler->functionTable.find(opName); it != compiler->functionTable.end())
+                for (const auto& candidate : it->second)
+                    if (candidate.SourceName == opName && candidate.Parameters.size() >= 2
+                        && candidate.Parameters[0].TypeName == typeName
+                        && isTypedPointerParam(candidate, 1))
+                    {
+                        refuseUnprovenPointer(opName);
+                        return nullptr;
+                    }
         if (!rhsConsumes && !rhsIsAlias && llvm::isa<llvm::PHINode>(rvalue)
             && !rightNV.TernaryTempAlreadyRegistered)
         {
@@ -10944,6 +11577,7 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
             thisNV.Primary = tempAlloca;
             thisNV.TernaryTempAlreadyRegistered = receiverTempAlreadyRegistered;
 
+            FlushCallPostfix();
             auto* result = compiler->CreateOverloadedFunctionCall(opName, { thisNV, rightNV });
             TrackOwnedStringOperatorResult(compiler, result);
             return result;
@@ -10959,6 +11593,7 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
             thisNV.BaseType = structTy;
             thisNV.TernaryTempAlreadyRegistered = receiverTempAlreadyRegistered;
 
+            FlushCallPostfix();
             auto* result = compiler->CreateOverloadedFunctionCall(opName, { thisNV, rightNV });
             TrackOwnedStringOperatorResult(compiler, result);
             return result;
@@ -10968,6 +11603,7 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
     }
 
 LLVMBackend::TypedValue MainListener::ParseMultiplicativeExpression(CFlatParser::MultiplicativeExpressionContext* ctx, ResultUse use) {
+        CallPostfixScope operatorPostfix(this);
         DeclExpectedTypeGate declExpectedGate(&declExpectedType, ctx->children.size() == 1);
         auto nextCtxs = ctx->castExpression();
 
@@ -10997,10 +11633,11 @@ LLVMBackend::TypedValue MainListener::ParseMultiplicativeExpression(CFlatParser:
                 unsigned rightBits = BinaryOperandBits(rvalue);
                 std::string op = ctx->children[i * 2 - 1]->getText();
 
+                int rightDepth = 0;
+                bool rightElemPointer = false;
+                OperandPointerDepth(rightNV, rvalue, rightDepth, rightElemPointer);
                 auto* overload = TryBinaryOperatorOverload(lvalue, op, rvalue, ctx, nullptr,
-                                                              rightNV.TypeAndValue.DepthIsAboutThisValue()
-                                                                  ? rightNV.TypeAndValue.PointerDepth : 0,
-                                                              rightNV.TypeAndValue.ElemPointer,
+                                                              rightDepth, rightElemPointer,
                                                               lhsStorage, rightNV.Storage,
                                                               true, true, lhsIsRvalue,
                                                               rightNV.IsRvalue,
@@ -11458,6 +12095,18 @@ LLVMBackend::NamedVariable MainListener::ParseCastExpression(CFlatParser::CastEx
                 namedVar.TypeAndValue.ParentVariableName = redundantCastSource.TypeAndValue.ParentVariableName;
                 AdoptWrapperProvenance(namedVar, redundantCastSource);
             }
+            if (!destTypeName.Pointer && namedVar.Primary != nullptr
+                && (namedVar.Primary->getType()->isIntegerTy()
+                    || namedVar.Primary->getType()->isFloatingPointTy()))
+            {
+                // A scalar cast is a prvalue of the cast type, redundant or not: it keeps
+                // neither the operand's slot and variable identity (a C++ `T&` must not bind,
+                // nor write, the operand) nor the operand literal's identity.
+                namedVar.Storage = nullptr;
+                namedVar.CallerName.clear();
+                namedVar.LiteralIdentity.clear();
+                namedVar.CxxLvalueKind = 0;
+            }
             return namedVar;
         }
 
@@ -11481,7 +12130,37 @@ LLVMBackend::TypeAndValue MainListener::ParseTypeName(CFlatParser::TypeNameConte
                 auto* typeSpec = typeSpecs[0];
                 std::string baseName;
                 auto* genParams = GenericSpecOf(typeSpec, baseName);
-                if (auto* fpSpec = typeSpec->functionPointerSpecifier())
+                if (auto* tupleSpec = typeSpec->tupleTypeSpecifier())
+                {
+                    std::vector<std::string> typeArgs;
+                    if (tupleSpec->tupleTypePackEntry() != nullptr)
+                    {
+                        auto* packEntry = tupleSpec->tupleTypePackEntry();
+                        PrimitiveTypeError packError;
+                        std::string packName = CanonicalTypeSpecifierText(
+                            packEntry->typeSpecifier(), packEntry->multiWordTypeSuffix(), false, &packError);
+                        if (HasPrimitiveTypeError(packError))
+                            LogErrorContext(packEntry, LocalizePrimitiveTypeError(compilerLLVM, packError));
+                        auto packIt = activePackSubstitutions.find(packName);
+                        if (packIt != activePackSubstitutions.end()) typeArgs = packIt->second;
+                        else typeArgs.push_back(compilerLLVM->ResolveTypeArgBaseName(packName));
+                    }
+                    else
+                    {
+                        for (auto* entry : tupleSpec->tupleTypeEntry())
+                        {
+                            PrimitiveTypeError argError;
+                            std::string argName = TupleEntryArgName(compilerLLVM, entry, &argError);
+                            if (HasPrimitiveTypeError(argError))
+                                LogErrorContext(entry, LocalizePrimitiveTypeError(compilerLLVM, argError));
+                            typeArgs.push_back(std::move(argName));
+                        }
+                    }
+                    typeValue.TypeName = MangledGenericName("tuple", typeArgs);
+                    tupleTypeArgs[typeValue.TypeName] = typeArgs;
+                    EnsureTupleInstantiated(typeValue.TypeName);
+                }
+                else if (auto* fpSpec = typeSpec->functionPointerSpecifier())
                 {
                     // Cast target `(function<R(Args)>)addr` / `(Lambda<...>)x`: build the
                     // resolved closure type so a raw code address can be reinterpreted as a
@@ -11579,188 +12258,548 @@ LLVMBackend::TypeAndValue MainListener::ParseTypeName(CFlatParser::TypeNameConte
         return typeValue;
     }
 
+LLVMBackend::NamedVariable MainListener::SizeOrAlignOfType(const LLVMBackend::TypeAndValue& typeValue,
+                                                           llvm::Type* llvmType, bool isSizeof) {
+        auto* compiler = Compiler();
+        if (llvmType == nullptr || !llvmType->isSized())
+        {
+            compiler->LogError(std::format("sizeof/alignof: type '{}' is incomplete",
+                typeValue.TypeName.empty() ? "<unknown>" : typeValue.TypeName));
+            return {};
+        }
+        uint64_t effAlign = typeValue.Pointer
+            ? 0
+            : compiler->GetEffectiveAlignmentForType(typeValue.TypeName, llvmType);
+        llvm::Value* result;
+        if (isSizeof)
+            result = effAlign > 1
+                ? llvm::ConstantInt::get(llvm::Type::getInt64Ty(*compiler->context),
+                                         compiler->GetEffectiveAllocSize(llvmType, effAlign))
+                : compiler->GetTypeSizeBytes(llvmType);
+        else
+            result = effAlign > 1
+                ? llvm::ConstantInt::get(llvm::Type::getInt64Ty(*compiler->context), effAlign)
+                : compiler->GetTypeAlignBytes(llvmType);
+        LLVMBackend::NamedVariable namedVar;
+        namedVar.Primary = result;
+        namedVar.TypeAndValue.TypeName = "i64";
+        return namedVar;
+    }
+
+// `sizeof` + a postfix operand that spells a TYPE (`sizeof(Point)`, `sizeof(int[4])`,
+// `sizeof(buf)` naming a variable): its size, or an empty NamedVariable when the text is not a type.
+LLVMBackend::NamedVariable MainListener::TrySizeofPostfixAsType(CFlatParser::UnaryExpressionContext* ctx,
+                                                                CFlatParser::PostfixExpressionContext* postFixCtx) {
+        auto* compiler = Compiler(ctx);
+        const bool prefixSizeof = true;
+        // The parser matched sizeof as a prefix on a postfixExpression.
+        // Extract the type name from the text (e.g., "sizeof(Point)" -> "Point")
+        std::string postfixText = postFixCtx->getText();
+
+        // Remove outer parentheses if present
+        if (!postfixText.empty() && postfixText[0] == '(' && postfixText.back() == ')')
+        {
+            postfixText = postfixText.substr(1, postfixText.length() - 2);
+        }
+
+        // Does this look like a type name? '(' ')' ',' count as type text only INSIDE
+        // balanced generic brackets (Pair<int,float>, Box<function<int(int)>>).
+        bool likelyType = !postfixText.empty() && (std::isalpha(postfixText[0]) || postfixText[0] == '_');
+        std::vector<uint64_t> rawArrayDims;
+        auto firstBracket = postfixText.find('[');
+        if (firstBracket != std::string::npos)
+        {
+            std::string baseText = postfixText.substr(0, firstBracket);
+            size_t pos = firstBracket;
+            while (pos < postfixText.size())
+            {
+                if (postfixText[pos] != '[') { likelyType = false; break; }
+                size_t close = postfixText.find(']', pos + 1);
+                if (close == std::string::npos || close == pos + 1) { likelyType = false; break; }
+                std::string dimText = postfixText.substr(pos + 1, close - pos - 1);
+                size_t consumed = 0;
+                unsigned long long dim = 0;
+                try { dim = std::stoull(dimText, &consumed); }
+                catch (...) { consumed = 0; }
+                if (consumed != dimText.size() || dim == 0) { likelyType = false; break; }
+                rawArrayDims.push_back(static_cast<uint64_t>(dim));
+                pos = close + 1;
+            }
+            if (pos != postfixText.size() || rawArrayDims.empty()) likelyType = false;
+            else postfixText = baseText;
+        }
+        int angleDepth = 0;
+        bool usedBracketPunct = false;
+        for (char c : postfixText)
+        {
+            if (c == '<') { angleDepth++; continue; }
+            if (c == '>') { angleDepth--; continue; }
+            if (std::isalnum(c) || c == '_' || c == '.' || c == '*')
+                continue;
+            if (angleDepth > 0 && (c == '(' || c == ')' || c == ','))
+            {
+                usedBracketPunct = true;
+                continue;
+            }
+            likelyType = false;
+            break;
+        }
+        // Only the newly-admitted punctuation demands balanced brackets; an unbalanced
+        // spelling like 'a<b' keeps its existing (bracket-free) classification.
+        if (usedBracketPunct && angleDepth != 0)
+            likelyType = false;
+        bool knownGenericType = false;
+        if (likelyType && postfixText.find('<') != std::string::npos)
+        {
+            std::string genericBase = postfixText.substr(0, postfixText.find('<'));
+            knownGenericType = compiler->AnyGenericTypeTemplateNamed(genericBase)
+                || genericBase == "function" || genericBase == "Lambda";
+            // A qualified foreign C++ template is not in the CFlat template registries.
+            // Request it only when the parsed postfix has generic arguments but no call/index
+            // suffix; TryRequestCxxType reports failure through its out parameter, not LogError.
+            if (!knownGenericType && postFixCtx->argumentExpressionList().empty()
+                && postFixCtx->expression().empty())
+            {
+                const auto open = postfixText.find('<');
+                const auto close = postfixText.rfind('>');
+                if (close != std::string::npos && close > open + 1
+                    && close + 1 == postfixText.size())
+                {
+                    std::vector<std::string> typeArgs;
+                    std::string current;
+                    int nestedAngles = 0;
+                    int nestedParens = 0;
+                    bool validArgs = true;
+                    for (size_t i = open + 1; i < close; i++)
+                    {
+                        const char c = postfixText[i];
+                        if (c == '<') nestedAngles++;
+                        else if (c == '>') nestedAngles--;
+                        else if (c == '(') nestedParens++;
+                        else if (c == ')') nestedParens--;
+                        if (nestedAngles < 0 || nestedParens < 0)
+                        {
+                            validArgs = false;
+                            break;
+                        }
+                        if (c == ',' && nestedAngles == 0 && nestedParens == 0)
+                        {
+                            if (current.empty()) { validArgs = false; break; }
+                            typeArgs.push_back(current);
+                            current.clear();
+                        }
+                        else current.push_back(c);
+                    }
+                    if (current.empty() || nestedAngles != 0 || nestedParens != 0) validArgs = false;
+                    if (validArgs) typeArgs.push_back(current);
+                    else typeArgs.clear();
+                    if (!typeArgs.empty())
+                    {
+                    std::string resolvedBase = genericBase;
+                    compiler->ResolveGenericAliasSpelling(resolvedBase, typeArgs);
+                    std::string candidate = MangledGenericName(resolvedBase, typeArgs);
+                    std::string cxxError;
+                    knownGenericType = compiler->TryRequestCxxType(
+                        genericBase, typeArgs, candidate, cxxError);
+                    if (knownGenericType) postfixText = candidate;
+                    }
+                }
+            }
+            if (!knownGenericType) likelyType = false;
+        }
+
+        if (likelyType)
+        {
+            // Try to parse as a type
+            LLVMBackend::TypeAndValue typeValue;
+            typeValue.TypeName = postfixText;
+            std::string rawTypeName = typeValue.TypeName;
+
+            // Check for trailing * (pointer)
+            if (!typeValue.TypeName.empty() && typeValue.TypeName.back() == '*')
+            {
+                typeValue.Pointer = true;
+                typeValue.TypeName.pop_back();
+            }
+
+            // Apply active type-parameter substitutions (e.g. sizeof(T) inside a generic function body).
+            {
+                auto substIt = activeTypeSubstitutions.find(typeValue.TypeName);
+                if (substIt != activeTypeSubstitutions.end())
+                {
+                    typeValue.TypeName = substIt->second;
+                    while (!typeValue.TypeName.empty() && typeValue.TypeName.back() == '*')
+                    {
+                        typeValue.TypeName.pop_back();
+                        typeValue.Pointer = true;
+                    }
+                }
+            }
+
+            if (knownGenericType && typeValue.TypeName.find('<') != std::string::npos)
+            {
+                const auto open = typeValue.TypeName.find('<');
+                const auto close = typeValue.TypeName.rfind('>');
+                if (close != std::string::npos && close > open + 1
+                    && close + 1 == typeValue.TypeName.size())
+                {
+                    std::string base = typeValue.TypeName.substr(0, open);
+                    std::vector<std::string> args;
+                    std::string current;
+                    int angleDepth = 0;
+                    int parenDepth = 0;
+                    bool validArgs = true;
+                    for (size_t i = open + 1; i < close; i++)
+                    {
+                        const char c = typeValue.TypeName[i];
+                        if (c == '<') angleDepth++;
+                        else if (c == '>') angleDepth--;
+                        else if (c == '(') parenDepth++;
+                        else if (c == ')') parenDepth--;
+                        if (angleDepth < 0 || parenDepth < 0)
+                        {
+                            validArgs = false;
+                            break;
+                        }
+                        if (c == ',' && angleDepth == 0 && parenDepth == 0)
+                        {
+                            if (current.empty()) { validArgs = false; break; }
+                            args.push_back(current);
+                            current.clear();
+                        }
+                        else current.push_back(c);
+                    }
+                    if (current.empty() || angleDepth != 0 || parenDepth != 0) validArgs = false;
+                    if (validArgs && base != "function" && base != "Lambda")
+                    {
+                        args.push_back(current);
+                        compiler->ResolveGenericAliasSpelling(base, args);
+                        typeValue.TypeName = MangledGenericName(base, args);
+                    }
+                }
+            }
+
+            // sizeof(T) where T is a pack param returns the element count
+            if (prefixSizeof)
+            {
+                auto packIt = activePackSubstitutions.find(rawTypeName);
+                if (packIt != activePackSubstitutions.end())
+                {
+                    LLVMBackend::NamedVariable namedVar;
+                    namedVar.Primary = llvm::ConstantInt::get(
+                        llvm::Type::getInt32Ty(*compiler->context),
+                        (int)packIt->second.size());
+                    namedVar.TypeAndValue.TypeName = "int";
+                    return namedVar;
+                }
+            }
+
+            // sizeof(var) / alignof(var): a bare identifier that names a visible
+            // variable measures the variable's declared storage - most useful for
+            // fixed arrays, where sizeof(buf) on 'char[128] buf' is 128. The variable
+            // wins over a same-named type, as in C, where an ordinary identifier in
+            // scope hides a type name. Adopting its TypeAndValue here lets the normal
+            // type path below compute the (padded) size or alignment.
+            if (!typeValue.Pointer
+                && postfixText.find('.') == std::string::npos
+                && postfixText.find('<') == std::string::npos
+                && NamesVisibleVariable(compiler, postfixText))
+            {
+                typeValue = VisibleVariableType(compiler, postfixText);
+                if (typeValue.TypeName == "auto" && rawArrayDims.empty())
+                    return SizeOrAlignOfAutoVariable(postfixText, prefixSizeof);
+            }
+
+            // The grammar can interpret expression-shaped postfix text as a type name.
+            // Only ask GetType to resolve spellings already known to the type system;
+            // its unknown-type path emits a diagnostic and blocks expression fallback.
+            if (!compiler->IsKnownTypeName(typeValue.TypeName)
+                && !compiler->IsTypeArgTypeKey(typeValue.TypeName)
+                && !knownGenericType)
+                return {};
+
+            llvm::Type* llvmType = compiler->GetType(typeValue, nullptr, true);
+            for (auto it = rawArrayDims.rbegin();
+                 it != rawArrayDims.rend() && llvmType != nullptr; ++it)
+                llvmType = llvm::ArrayType::get(llvmType, *it);
+            if (llvmType && llvmType->isSized() && !llvmType->isVoidTy())
+            {
+                return SizeOrAlignOfType(typeValue, llvmType, prefixSizeof);
+            }
+            else if (llvmType != nullptr && !llvmType->isSized())
+            {
+                compiler->LogError(std::format("sizeof/alignof: type '{}' is incomplete",
+                    typeValue.TypeName.empty() ? "<unknown>" : typeValue.TypeName));
+            }
+        }
+        return {};
+    }
+
+// An `auto` local carries no declared TypeName; measure the storage it was actually given.
+LLVMBackend::NamedVariable MainListener::SizeOrAlignOfAutoVariable(const std::string& name, bool isSizeof) {
+        auto* compiler = Compiler();
+        auto nv = compiler->GetScopedLocalOrArgument(name);
+        llvm::Type* llvmType = nullptr;
+        if (auto* slot = llvm::dyn_cast_or_null<llvm::AllocaInst>(nv.Storage))
+            llvmType = slot->getAllocatedType();
+        else if (nv.Primary != nullptr)
+            llvmType = nv.Primary->getType();
+        if (llvmType == nullptr || llvmType->isVoidTy())
+        {
+            compiler->LogError(std::format("sizeof/alignof: could not determine the type of '{}'", name));
+            return {};
+        }
+        LLVMBackend::TypeAndValue typeValue;
+        typeValue.Pointer = llvmType->isPointerTy();
+        typeValue.TypeName = typeValue.Pointer ? "void" : LLVMTypeToTypeName(llvmType);
+        return SizeOrAlignOfType(typeValue, llvmType, isSizeof);
+    }
+
+MainListener::UnevaluatedOperandType MainListener::EvaluateOperandTypeOnly(
+    const std::function<LLVMBackend::NamedVariable()>& emit) {
+        auto* compiler = Compiler();
+        std::unordered_map<llvm::Value*, IncrementWork> savedPostfix;
+        savedPostfix.swap(PlusPlus);
+        auto* savedRetTemp = compiler->lastCxxRetTemp_;
+        auto* savedRetValue = compiler->lastCxxRetValue_;
+        const bool savedBonded = compiler->lastCallIsBonded;
+        // Every ledger holding a Value* / block of the region is restored or trimmed (stale = dangling
+        // or recycled); SaveBuilderState parks owned-temp / join / alias ledgers, the rest are copied.
+        auto detection = compiler->SnapshotDetectionLedgers();
+        auto bondedValues = compiler->bondedValues_;
+        auto deferredTempEscapes = compiler->deferredTempUniqueFieldEscapes_;
+        auto tempUniqueFieldArgs = compiler->tempUniqueFieldArgs_;
+        auto coreUniqueGetterSource = compiler->coreUniqueGetterSource_;
+        auto ownSlotLeavingLoads = compiler->ownSlotLeavingLoads_;
+        auto globalAssignBorrowOrigin = compiler->globalAssignBorrowOrigin_;
+        auto globalAssignBorrowedAddress = compiler->globalAssignBorrowedAddress_;
+        auto ownOriginSlots = compiler->ownOriginSlots_;
+        auto uniqueFieldBorrowResults = compiler->uniqueFieldBorrowResults_;
+        auto pendingAliasReturns = compiler->pendingAliasReturnInference;
+        auto unwindPartial = compiler->unwindPartial_;
+        auto unwindCallConsumedTemps = compiler->unwindCallConsumedTemps_;
+        auto moveTransferConsumedTemps = compiler->moveTransferConsumedTemps_;
+        const size_t nullIfaceGlobals = compiler->pendingNullIfaceGlobal_.size();
+        const auto savedParenType = lastParenExprType;
+        auto* const savedParenStorage = lastParenExprStorage;
+        const bool savedParenFromTempField = lastParenExprFromOwningTempField;
+        const bool savedParenTempParent = lastParenExprOwningTempParent;
+        const auto savedParenStructName = lastParenExprOwningStructName;
+        const auto savedParenFieldName = lastParenExprFieldName;
+        auto state = compiler->SaveBuilderState();
+        llvm::Function* host = compiler->currentFunction;
+        llvm::Function* tmpFn = nullptr;
+        if (host == nullptr || !compiler->IsInsertBlockLive())
+        {
+            // No live body (file / member scope): a private throwaway function, as if-const does.
+            tmpFn = llvm::Function::Create(llvm::FunctionType::get(compiler->builder->getVoidTy(), false),
+                llvm::Function::PrivateLinkage, "__unevaluated_tmp", compiler->module.get());
+            host = tmpFn;
+            compiler->currentFunction = tmpFn;
+        }
+        std::unordered_set<llvm::BasicBlock*> existing;
+        for (auto& block : *host) existing.insert(&block);
+        auto* scratch = llvm::BasicBlock::Create(*compiler->context, "unevaluated", host);
+        compiler->builder->SetInsertPoint(scratch);
+        // Flow-sensitive per-variable state (IsMoved / MovedFields, explicit-move null, address
+        // escape, string-borrow and declaration blocks) lives on the scope stack: nothing moved.
+        auto savedScopes = compiler->stackNamedVariable;
+        auto savedLockSet = currentLockSet;
+        // Dataflow events are tagged with the blocks about to be erased; drop them with the IR.
+        auto logSize = [](auto& log, llvm::Function* fn) -> size_t {
+            auto it = log.find(fn);
+            return it == log.end() ? 0 : it->second.size();
+        };
+        const size_t moveEvents = logSize(compiler->moveEventLog_, host);
+        // Null events, return-dangle checks and null-interface dispatches (whose Anchor is an
+        // instruction of the region): the same rewind a scoped expect_error block uses.
+        const auto pendingMark = compiler->MarkPendingAnalyses(host);
+        // The destination's type describes the sizeof / typeof result, never its operand.
+        DeclExpectedTypeScope noExpectedType(&declExpectedType, LLVMBackend::TypeAndValue{});
+        CallArgumentSuspendScope noCallArgument(inCallArgument_, ternaryCallArgumentDepth_);
+        const bool savedAutoTernaryInit = autoDeclTernaryInit_;
+        autoDeclTernaryInit_ = false;
+
+        auto discard = [&]() {
+            auto trimLog = [&](auto& log, size_t keep) {
+                auto it = log.find(host);
+                if (it == log.end()) return;
+                if (tmpFn != nullptr || keep == 0) log.erase(it);
+                else if (it->second.size() > keep) it->second.resize(keep);
+            };
+            trimLog(compiler->moveEventLog_, moveEvents);
+            if (tmpFn != nullptr)
+            {
+                compiler->nullEventLog_.erase(tmpFn);
+                compiler->pendingReturnDangleChecks_.erase(tmpFn);
+                compiler->pendingNullIfaceDispatch_.erase(tmpFn);
+                compiler->uniqueFieldBorrowReturns_.erase(tmpFn);
+                std::erase_if(compiler->paramRetainsMemo_, [&](const auto& e) { return e.first.first == tmpFn; });
+                std::erase_if(compiler->paramRetainsPastCallMemo_, [&](const auto& e) { return e.first.first == tmpFn; });
+            }
+            else
+                compiler->RewindPendingAnalyses(host, pendingMark);
+            if (compiler->pendingNullIfaceGlobal_.size() > nullIfaceGlobals)
+                compiler->pendingNullIfaceGlobal_.resize(nullIfaceGlobals);
+            compiler->stackNamedVariable = std::move(savedScopes);
+            currentLockSet = std::move(savedLockSet);
+            autoDeclTernaryInit_ = savedAutoTernaryInit;
+            if (tmpFn != nullptr)
+            {
+                for (auto& block : *tmpFn)
+                    for (auto& inst : block)
+                        if (!inst.use_empty()) inst.replaceAllUsesWith(llvm::PoisonValue::get(inst.getType()));
+                tmpFn->eraseFromParent();
+            }
+            else
+            {
+                std::vector<llvm::BasicBlock*> created;
+                for (auto& block : *host)
+                    if (existing.count(&block) == 0) created.push_back(&block);
+                // A use left in a surviving block (an entry-block store, say) must not dangle.
+                for (auto* block : created)
+                    for (auto& inst : *block)
+                        if (!inst.use_empty()) inst.replaceAllUsesWith(llvm::PoisonValue::get(inst.getType()));
+                for (auto* block : created) block->dropAllReferences();
+                for (auto* block : created) block->eraseFromParent();
+            }
+            compiler->RestoreBuilderState(state);
+            compiler->RestoreDetectionLedgers(std::move(detection));
+            compiler->bondedValues_ = std::move(bondedValues);
+            compiler->deferredTempUniqueFieldEscapes_ = std::move(deferredTempEscapes);
+            compiler->tempUniqueFieldArgs_ = std::move(tempUniqueFieldArgs);
+            compiler->coreUniqueGetterSource_ = std::move(coreUniqueGetterSource);
+            compiler->ownSlotLeavingLoads_ = std::move(ownSlotLeavingLoads);
+            compiler->globalAssignBorrowOrigin_ = std::move(globalAssignBorrowOrigin);
+            compiler->globalAssignBorrowedAddress_ = std::move(globalAssignBorrowedAddress);
+            compiler->ownOriginSlots_ = std::move(ownOriginSlots);
+            compiler->uniqueFieldBorrowResults_ = std::move(uniqueFieldBorrowResults);
+            compiler->pendingAliasReturnInference = std::move(pendingAliasReturns);
+            compiler->unwindPartial_ = std::move(unwindPartial);
+            compiler->unwindCallConsumedTemps_ = std::move(unwindCallConsumedTemps);
+            compiler->moveTransferConsumedTemps_ = std::move(moveTransferConsumedTemps);
+            lastParenExprType = savedParenType;
+            lastParenExprStorage = savedParenStorage;
+            lastParenExprFromOwningTempField = savedParenFromTempField;
+            lastParenExprOwningTempParent = savedParenTempParent;
+            lastParenExprOwningStructName = savedParenStructName;
+            lastParenExprFieldName = savedParenFieldName;
+            PlusPlus = std::move(savedPostfix);
+            compiler->lastCxxRetTemp_ = savedRetTemp;
+            compiler->lastCxxRetValue_ = savedRetValue;
+            compiler->lastCallIsBonded = savedBonded;
+        };
+
+        UnevaluatedOperandType out;
+        try
+        {
+            auto nv = emit();
+            out.Type = nv.TypeAndValue;
+            out.BaseType = nv.BaseType;
+            if (nv.Primary != nullptr)
+            {
+                out.ValueType = nv.Primary->getType();
+                out.HasValue = true;
+            }
+            else if (nv.Storage != nullptr)
+                out.HasValue = true;
+        }
+        catch (...)
+        {
+            discard();
+            throw;
+        }
+        discard();
+        return out;
+    }
+
 LLVMBackend::NamedVariable MainListener::ParseUnaryExpression(CFlatParser::UnaryExpressionContext* ctx,
                                                     ResultUse use) {
+        return ParseUnaryExpressionImpl(ctx, use, ctx->Sizeof().size());
+    }
+
+LLVMBackend::NamedVariable MainListener::ParseUnaryExpressionImpl(CFlatParser::UnaryExpressionContext* ctx,
+                                                    ResultUse use, size_t sizeofs) {
         auto* compiler = Compiler(ctx);
+        CallPostfixScope unaryOperatorPostfix(this);
         auto postFixCtx = ctx->postfixExpression();
         auto castExpCtx = ctx->castExpression();
         auto unaryOperator = ctx->unaryOperator();
         auto typeNameCtx = ctx->typeName();
 
-        // Handle sizeof/alignof as prefix: the parser may match "sizeof" and "(TypeName)"
-        // separately, where the "(TypeName)" becomes a postfixExpression (function call syntax)
+        if (ctx->getStart()->getText() == "alignof" && ctx->unaryExpression() != nullptr)
+        {
+            auto operand = EvaluateOperandTypeOnly([&]() {
+                return ParseUnaryExpression(ctx->unaryExpression(), ResultUse::Value);
+            });
+            if (!operand.HasValue)
+            {
+                LogErrorContext(ctx, "sizeof/alignof: could not determine type");
+                return {};
+            }
+            auto typeValue = operand.Type;
+            if ((typeValue.TypeName == "auto" || typeValue.TypeName.empty()) && operand.ValueType != nullptr)
+            {
+                typeValue = {};
+                typeValue.Pointer = operand.ValueType->isPointerTy();
+                typeValue.TypeName = typeValue.Pointer ? "void" : LLVMTypeToTypeName(operand.ValueType);
+                if (operand.ValueType->isVoidTy()) typeValue.TypeName.clear();
+            }
+            llvm::Type* llvmType = typeValue.TypeName.empty()
+                ? nullptr : compiler->GetType(typeValue, nullptr, true);
+            if (llvmType == nullptr || llvmType->isVoidTy())
+                llvmType = operand.ValueType;
+            if (llvmType == nullptr || llvmType->isVoidTy())
+            {
+                LogErrorContext(ctx, "sizeof/alignof: could not resolve type to LLVM type");
+                return {};
+            }
+            return SizeOrAlignOfType(typeValue, llvmType, false);
+        }
+
+        // Only `sizeof '(' typeName ')'` has a type operand; every other prefix (`sizeof x`,
+        // `sizeof(expr)`, `sizeof -x`, `sizeof alignof(T)`) takes an unevaluated expression.
+        const bool sizeofTypeNameForm = typeNameCtx != nullptr && ctx->children.size() == 4
+            && !ctx->Sizeof().empty();
+        if (sizeofs > 0 && !sizeofTypeNameForm)
+        {
+            if (sizeofs == 1 && postFixCtx != nullptr)
+            {
+                // `sizeof(T)` may still reach here with the type parsed as an expression.
+                auto asType = TrySizeofPostfixAsType(ctx, postFixCtx);
+                if (asType.Primary != nullptr) return asType;
+            }
+            auto operand = EvaluateOperandTypeOnly([&]() {
+                return ParseUnaryExpressionImpl(ctx, ResultUse::Value, sizeofs - 1);
+            });
+            if (!operand.HasValue)
+            {
+                LogErrorContext(ctx, "sizeof/alignof: could not determine type");
+                return {};
+            }
+            auto typeValue = operand.Type;
+            if ((typeValue.TypeName == "auto" || typeValue.TypeName.empty()) && operand.ValueType != nullptr)
+            {
+                // No declared type: the operand value's own LLVM type is exact (a pointer stays one).
+                typeValue = {};
+                typeValue.Pointer = operand.ValueType->isPointerTy();
+                typeValue.TypeName = typeValue.Pointer ? "void" : LLVMTypeToTypeName(operand.ValueType);
+                if (operand.ValueType->isVoidTy()) typeValue.TypeName.clear();
+            }
+            llvm::Type* llvmType = typeValue.TypeName.empty()
+                ? nullptr : compiler->GetType(typeValue, nullptr, true);
+            if (llvmType == nullptr || llvmType->isVoidTy())
+                llvmType = operand.ValueType;
+            if (llvmType == nullptr || llvmType->isVoidTy())
+            {
+                LogErrorContext(ctx, "sizeof/alignof: could not resolve type to LLVM type");
+                return {};
+            }
+            return SizeOrAlignOfType(typeValue, llvmType, true);
+        }
+
         if (postFixCtx != nullptr)
         {
-            std::string text = ctx->getText();
-            bool prefixSizeof = text.find("sizeof(") == 0;
-            bool prefixAlignof = text.find("alignof(") == 0;
-
-            if ((prefixSizeof || prefixAlignof) && typeNameCtx == nullptr)
-            {
-                // The parser matched sizeof/alignof as a prefix on a postfixExpression.
-                // Extract the type name from the text (e.g., "sizeof(Point)" -> "Point")
-                std::string postfixText = postFixCtx->getText();
-
-                // Remove outer parentheses if present
-                if (!postfixText.empty() && postfixText[0] == '(' && postfixText.back() == ')')
-                {
-                    postfixText = postfixText.substr(1, postfixText.length() - 2);
-                }
-
-                // Does this look like a type name? '(' ')' ',' count as type text only INSIDE
-                // balanced generic brackets (Pair<int,float>, Box<function<int(int)>>).
-                bool likelyType = !postfixText.empty() && (std::isalpha(postfixText[0]) || postfixText[0] == '_');
-                std::vector<uint64_t> rawArrayDims;
-                auto firstBracket = postfixText.find('[');
-                if (firstBracket != std::string::npos)
-                {
-                    std::string baseText = postfixText.substr(0, firstBracket);
-                    size_t pos = firstBracket;
-                    while (pos < postfixText.size())
-                    {
-                        if (postfixText[pos] != '[') { likelyType = false; break; }
-                        size_t close = postfixText.find(']', pos + 1);
-                        if (close == std::string::npos || close == pos + 1) { likelyType = false; break; }
-                        std::string dimText = postfixText.substr(pos + 1, close - pos - 1);
-                        size_t consumed = 0;
-                        unsigned long long dim = 0;
-                        try { dim = std::stoull(dimText, &consumed); }
-                        catch (...) { consumed = 0; }
-                        if (consumed != dimText.size() || dim == 0) { likelyType = false; break; }
-                        rawArrayDims.push_back(static_cast<uint64_t>(dim));
-                        pos = close + 1;
-                    }
-                    if (pos != postfixText.size() || rawArrayDims.empty()) likelyType = false;
-                    else postfixText = baseText;
-                }
-                int angleDepth = 0;
-                bool usedBracketPunct = false;
-                for (char c : postfixText)
-                {
-                    if (c == '<') { angleDepth++; continue; }
-                    if (c == '>') { angleDepth--; continue; }
-                    if (std::isalnum(c) || c == '_' || c == '.' || c == '*')
-                        continue;
-                    if (angleDepth > 0 && (c == '(' || c == ')' || c == ','))
-                    {
-                        usedBracketPunct = true;
-                        continue;
-                    }
-                    likelyType = false;
-                    break;
-                }
-                // Only the newly-admitted punctuation demands balanced brackets; an unbalanced
-                // spelling like 'a<b' keeps its existing (bracket-free) classification.
-                if (usedBracketPunct && angleDepth != 0)
-                    likelyType = false;
-                if (likelyType && postfixText.find('<') != std::string::npos)
-                {
-                    std::string genericBase = postfixText.substr(0, postfixText.find('<'));
-                    bool knownGeneric = compiler->IsKnownTypeName(genericBase)
-                        || genericStructTemplates.count(genericBase) != 0
-                        || genericClassTemplates.count(genericBase) != 0
-                        || genericInterfaceTemplates.count(genericBase) != 0
-                        || genericBase == "function" || genericBase == "Lambda";
-                    if (!knownGeneric) likelyType = false;
-                }
-
-                if (likelyType)
-                {
-                    // Try to parse as a type
-                    LLVMBackend::TypeAndValue typeValue;
-                    typeValue.TypeName = postfixText;
-                    std::string rawTypeName = typeValue.TypeName;
-
-                    // Check for trailing * (pointer)
-                    if (!typeValue.TypeName.empty() && typeValue.TypeName.back() == '*')
-                    {
-                        typeValue.Pointer = true;
-                        typeValue.TypeName.pop_back();
-                    }
-
-                    // Apply active type-parameter substitutions (e.g. sizeof(T) inside a generic function body).
-                    {
-                        auto substIt = activeTypeSubstitutions.find(typeValue.TypeName);
-                        if (substIt != activeTypeSubstitutions.end())
-                        {
-                            typeValue.TypeName = substIt->second;
-                            while (!typeValue.TypeName.empty() && typeValue.TypeName.back() == '*')
-                            {
-                                typeValue.TypeName.pop_back();
-                                typeValue.Pointer = true;
-                            }
-                        }
-                    }
-
-                    // sizeof(T) where T is a pack param returns the element count
-                    if (prefixSizeof)
-                    {
-                        auto packIt = activePackSubstitutions.find(rawTypeName);
-                        if (packIt != activePackSubstitutions.end())
-                        {
-                            LLVMBackend::NamedVariable namedVar;
-                            namedVar.Primary = llvm::ConstantInt::get(
-                                llvm::Type::getInt32Ty(*compiler->context),
-                                (int)packIt->second.size());
-                            namedVar.TypeAndValue.TypeName = "int";
-                            return namedVar;
-                        }
-                    }
-
-                    // sizeof(var) / alignof(var): a bare identifier that names a visible
-                    // variable measures the variable's declared storage - most useful for
-                    // fixed arrays, where sizeof(buf) on 'char[128] buf' is 128. The variable
-                    // wins over a same-named type, as in C, where an ordinary identifier in
-                    // scope hides a type name. Adopting its TypeAndValue here lets the normal
-                    // type path below compute the (padded) size or alignment.
-                    if (!typeValue.Pointer
-                        && postfixText.find('.') == std::string::npos
-                        && postfixText.find('<') == std::string::npos
-                        && NamesVisibleVariable(compiler, postfixText))
-                        typeValue = VisibleVariableType(compiler, postfixText);
-
-                    llvm::Type* llvmType = compiler->GetType(typeValue, nullptr, true);
-                    for (auto it = rawArrayDims.rbegin();
-                         it != rawArrayDims.rend() && llvmType != nullptr; ++it)
-                        llvmType = llvm::ArrayType::get(llvmType, *it);
-                    if (llvmType && !llvmType->isVoidTy())  // Void is a valid type but let's use basic validity check
-                    {
-                        llvm::Value* result;
-                        uint64_t effAlign = typeValue.Pointer
-                            ? 0
-                            : compiler->GetEffectiveAlignmentForType(typeValue.TypeName, llvmType);
-                        if (prefixSizeof)
-                        {
-                            if (effAlign > 1)
-                            {
-                                uint64_t paddedSize = compiler->GetEffectiveAllocSize(llvmType, effAlign);
-                                result = llvm::ConstantInt::get(llvm::Type::getInt64Ty(*compiler->context), paddedSize);
-                            }
-                            else
-                            {
-                                result = compiler->GetTypeSizeBytes(llvmType);
-                            }
-                        }
-                        else
-                        {
-                            if (effAlign > 1)
-                                result = llvm::ConstantInt::get(llvm::Type::getInt64Ty(*compiler->context), effAlign);
-                            else
-                                result = compiler->GetTypeAlignBytes(llvmType);
-                        }
-
-                        if (result)
-                        {
-                            LLVMBackend::NamedVariable namedVar;
-                            namedVar.Primary = result;
-                            namedVar.TypeAndValue.TypeName = "i64";
-                            namedVar.Storage = nullptr;
-                            return namedVar;
-                        }
-                    }
-                }
-            }
-
             // Single-child passthrough: forward the use unchanged.
             return ParsePostfixExpression(postFixCtx, false, 0, use);
         }
@@ -12009,6 +13048,10 @@ LLVMBackend::NamedVariable MainListener::ParseUnaryExpression(CFlatParser::Unary
                         "dereference of moved variable '{}' (it is null after the move)",
                         namedVar.CallerName));
                 llvm::Value* loadedPtr = compiler->CreateLoad(namedVar.Storage);
+                // The pointee is an lvalue, never a call's sret temporary: a stale one (an earlier
+                // `?:` arm, a sibling argument) must not be adopted as its storage below.
+                compiler->lastCxxRetTemp_ = nullptr;
+                compiler->lastCxxRetValue_ = nullptr;
                 // --sanitize=ownership (M1): guard `*p` deref of a moved-from local.
                 compiler->EmitOwnDerefGuard(baseStorage, loadedPtr,
                     ctx->getStart()->getLine(), ctx->getStart()->getCharPositionInLine());
@@ -12152,12 +13195,164 @@ LLVMBackend::NamedVariable MainListener::ParseUnaryExpression(CFlatParser::Unary
 
             if (isSizeof || isAlignof)
             {
+                if (isSizeof || isAlignof)
+                {
+                    auto* bareName = BareTypeNameIdentifier(typeNameCtx);
+                    auto* specList = typeNameCtx->specifierQualifierList();
+                    bool resolvesAsType = false;
+                    if (specList != nullptr)
+                    {
+                        const std::string spelling = specList->getText();
+                        resolvesAsType = spelling.find('<') == std::string::npos
+                            && (compiler->IsKnownTypeName(spelling)
+                                || compiler->IsTypeArgTypeKey(spelling)
+                                || activeTypeSubstitutions.count(spelling) != 0
+                                || activePackSubstitutions.count(spelling) != 0);
+                        if (!resolvesAsType && bareName != nullptr
+                            && specList->getText() == bareName->getText()
+                            && typeNameCtx->abstractDeclarator() == nullptr
+                            && NamesVisibleVariable(compiler, bareName->getText()))
+                            resolvesAsType = true;
+                        // A bare identifier in a declaration type position can be forward-declared
+                        // or hidden behind a conditional scan; preserve type parsing unless shadowed.
+                        if (!resolvesAsType && bareName != nullptr
+                            && specList->getText() == bareName->getText()
+                            && typeNameCtx->getText() == bareName->getText()
+                            && typeNameCtx->abstractDeclarator() == nullptr
+                            && !NamesVisibleVariable(compiler, bareName->getText()))
+                            resolvesAsType = true;
+                        for (auto* typeSpec : specList->typeSpecifier())
+                        {
+                            static const std::unordered_set<std::string> primitiveWords = {
+                                "void", "char", "i8", "u8", "c8", "short", "i16", "u16", "c16",
+                                "int", "i32", "u32", "uint", "c32", "long", "ulong", "i64", "u64",
+                                "i128", "u128", "wchar", "float", "double", "longdouble", "bool",
+                                "signed", "unsigned" };
+                            if (primitiveWords.count(typeSpec->getText()) != 0
+                                || compiler->IsTypeArgTypeKey(typeSpec->getText())
+                                || activeTypeSubstitutions.count(typeSpec->getText()) != 0
+                                || activePackSubstitutions.count(typeSpec->getText()) != 0)
+                            {
+                                resolvesAsType = true;
+                                break;
+                            }
+                            if (typeSpec->simdTypeSpecifier() != nullptr)
+                            {
+                                resolvesAsType = true;
+                                break;
+                            }
+                            std::string genericBase;
+                            auto* genericSpec = GenericSpecOf(typeSpec, genericBase);
+                            if (genericSpec == nullptr) continue;
+                            resolvesAsType = compiler->AnyGenericTypeTemplateNamed(genericBase)
+                                || genericBase == "function" || genericBase == "Lambda";
+                            if (!resolvesAsType)
+                            {
+                                std::vector<std::string> typeArgs;
+                                for (auto* entry : genericSpec->typeParameterList()->typeParameterEntry())
+                                    typeArgs.push_back(ResolveTypeArgEntry(entry));
+                                std::string candidateBase = genericBase;
+                                compiler->ResolveGenericAliasSpelling(candidateBase, typeArgs);
+                                std::string candidate = MangledGenericName(candidateBase, typeArgs);
+                                std::string cxxError;
+                                resolvesAsType = compiler->TryRequestCxxType(
+                                    genericBase, typeArgs, candidate, cxxError);
+                            }
+                            if (resolvesAsType) break;
+                        }
+                    }
+
+                    const std::string written = typeNameCtx->getText();
+                    const auto firstParen = written.find('(');
+                    int angleDepthAtParen = 0;
+                    if (firstParen != std::string::npos)
+                        for (size_t i = 0; i < firstParen; i++)
+                        {
+                            if (written[i] == '<') angleDepthAtParen++;
+                            else if (written[i] == '>') angleDepthAtParen--;
+                        }
+                    if (firstParen != std::string::npos && angleDepthAtParen <= 0)
+                        resolvesAsType = false;
+                    const auto firstAngle = written.find('<');
+                    const auto closeAngle = written.rfind('>');
+                    const bool ambiguousTemplateComparison = firstAngle != std::string::npos
+                        && written.find(',', firstAngle) != std::string::npos
+                        && closeAngle != std::string::npos && closeAngle + 1 < written.size()
+                        && (std::isalnum(static_cast<unsigned char>(written[closeAngle + 1]))
+                            || written[closeAngle + 1] == '_');
+                    // Keep the diagnosed `sizeof(a<b,c>d)` case on the type diagnostic path;
+                    // its earlier expression fallback produced invalid IR.
+                    resolvesAsType = resolvesAsType || ambiguousTemplateComparison;
+
+                    // The grammar can read an expression such as `s.field` or `arr[i]` as a
+                    // typeName. Reparse only unresolved spellings as an expression; type probes
+                    // above are registry checks and never emit diagnostics.
+                    if (!resolvesAsType)
+                    {
+                        auto* start = typeNameCtx->getStart();
+                        auto* stop = typeNameCtx->getStop();
+                        auto* source = start != nullptr ? start->getInputStream() : nullptr;
+                        std::string expressionText = source != nullptr && stop != nullptr
+                            ? source->getText(antlr4::misc::Interval(
+                                start->getStartIndex(), stop->getStopIndex()))
+                            : typeNameCtx->getText();
+                        antlr4::ANTLRInputStream exprInput(expressionText);
+                        CFlatLexer exprLexer(&exprInput);
+                        // Reparsed tokens keep the operand's source position for diagnostics.
+                        if (start != nullptr)
+                        {
+                            exprLexer.setLine(start->getLine());
+                            exprLexer.setCharPositionInLine(start->getCharPositionInLine());
+                        }
+                        antlr4::CommonTokenStream exprTokens(&exprLexer);
+                        CFlatParser exprParser(&exprTokens);
+                        exprParser.removeErrorListeners();
+                        auto localizeMessage = compiler->MakeDiagnosticLocalizer();
+                        exprParser.setErrorHandler(std::make_shared<CFlatErrorStrategy>(localizeMessage));
+                        auto* exprCtx = exprParser.unaryExpression();
+                        if (exprParser.getNumberOfSyntaxErrors() == 0
+                            && exprParser.getCurrentToken()->getType() == cflat::kTokenEOF)
+                        {
+                            auto operand = EvaluateOperandTypeOnly([&]() {
+                                return ParseUnaryExpressionImpl(exprCtx, ResultUse::Value, 0);
+                            });
+                            if (!operand.HasValue)
+                            {
+                                LogErrorContext(ctx, "sizeof/alignof: could not determine type");
+                                return {};
+                            }
+                            auto typeValue = operand.Type;
+                            if ((typeValue.TypeName == "auto" || typeValue.TypeName.empty())
+                                && operand.ValueType != nullptr)
+                            {
+                                typeValue = {};
+                                typeValue.Pointer = operand.ValueType->isPointerTy();
+                                typeValue.TypeName = typeValue.Pointer
+                                    ? "void" : LLVMTypeToTypeName(operand.ValueType);
+                                if (operand.ValueType->isVoidTy()) typeValue.TypeName.clear();
+                            }
+                            llvm::Type* llvmType = typeValue.TypeName.empty()
+                                ? nullptr : compiler->GetType(typeValue, nullptr, true);
+                            if (llvmType == nullptr || llvmType->isVoidTy())
+                                llvmType = operand.ValueType;
+                            if (llvmType == nullptr || llvmType->isVoidTy())
+                            {
+                                LogErrorContext(ctx, "sizeof/alignof: could not resolve type to LLVM type");
+                                return {};
+                            }
+                            return SizeOrAlignOfType(typeValue, llvmType, isSizeof);
+                        }
+                    }
+                }
+
                 // A bare name that is a visible variable measures the variable, even when it also
                 // names a type: in C an ordinary identifier in scope hides a type name (so typeof).
                 auto* bareName = BareTypeNameIdentifier(typeNameCtx);
                 auto typeValue = bareName != nullptr && NamesVisibleVariable(compiler, bareName->getText())
                     ? VisibleVariableType(compiler, bareName->getText())
                     : ParseTypeName(typeNameCtx, true);
+                if (bareName != nullptr && typeValue.TypeName == "auto")
+                    return SizeOrAlignOfAutoVariable(bareName->getText(), isSizeof);
                 if (typeValue.TypeName.empty())
                 {
                     LogErrorContext(ctx, "sizeof/alignof: could not determine type");
@@ -12225,7 +13420,6 @@ LLVMBackend::NamedVariable MainListener::ParseUnaryExpression(CFlatParser::Unary
                 llvm::Type* llvmType = nullptr;
                 if (!arrayDims.empty())
                 {
-                    elementTV.Pointer = false;
                     elementTV.IsArrayView = false;
                     llvmType = compiler->GetType(elementTV, nullptr, true);
                     for (auto it = arrayDims.rbegin(); it != arrayDims.rend() && llvmType != nullptr; ++it)
@@ -12263,6 +13457,12 @@ LLVMBackend::NamedVariable MainListener::ParseUnaryExpression(CFlatParser::Unary
                 if (!llvmType)
                 {
                     LogErrorContext(ctx, "sizeof/alignof: could not resolve type to LLVM type");
+                    return {};
+                }
+                if (!llvmType->isSized())
+                {
+                    LogErrorContext(ctx, std::format("sizeof/alignof: type '{}' is incomplete",
+                        typeValue.TypeName.empty() ? "<unknown>" : typeValue.TypeName));
                     return {};
                 }
 
@@ -12500,6 +13700,274 @@ bool MainListener::RejectValueIntoArrayViewField(
         return true;
     }
 
+/*
+ * Plan converting-constructors.md point 2: a C++ class's own `operator=(U)` for a non-T source
+ * beats building `T(u)` - a standard conversion into U outranks the user-defined one into T.
+ * Candidates are the declared overloads whose U is not a class (a class U would be a second
+ * user-defined conversion) and an `operator=` template instantiated for this source, offered in
+ * C++'s order: a non-template taking exactly the source type, else the template instantiation
+ * (an exact deduction), else the non-templates needing a conversion. Viability is decided by
+ * the REAL overload call run speculatively (errors suppressed, IR into a throwaway function), so
+ * the probe and the call cannot disagree; a null result never leaves a diagnostic behind.
+ */
+llvm::Value* MainListener::TryDirectCxxAssignOperator(
+        antlr4::ParserRuleContext* ctx, const LLVMBackend::NamedVariable& destination,
+        const std::string& typeName, const LLVMBackend::NamedVariable& rhsNV,
+        std::string& refusal) {
+        auto* compiler = Compiler(ctx);
+        refusal.clear();
+        if (destination.Storage == nullptr || destination.BaseType == nullptr) return nullptr;
+        const std::string opName = "operator=";
+        const std::string resolved = compiler->ResolveTypeAlias(typeName);
+        LLVMBackend::NamedVariable source = rhsNV;
+        auto* right = LoadNamedVariable(source);
+        if (right == nullptr) return nullptr;
+        LLVMBackend::NamedVariable probeArg = rhsNV;
+        probeArg.Primary = right;
+        if (probeArg.BaseType == nullptr) probeArg.BaseType = right->getType();
+        // The source's own type; an unnamed literal carries it only in the lowered type.
+        LLVMBackend::TypeAndValue sourceType = probeArg.TypeAndValue;
+        if (sourceType.TypeName.empty() && !sourceType.Pointer && probeArg.BaseType != nullptr)
+            sourceType.TypeName = probeArg.BaseType->isFloatingPointTy()
+                ? (probeArg.BaseType->isFloatTy() ? "float" : "double")
+                : probeArg.BaseType->isIntegerTy(1) ? "bool"
+                : probeArg.BaseType->isIntegerTy(8) ? "char"
+                : probeArg.BaseType->isIntegerTy() ? "int" : "";
+
+        auto isThisClass = [&](const LLVMBackend::FunctionSymbol& candidate) {
+            return !candidate.Parameters.empty()
+                && compiler->ResolveTypeAlias(candidate.Parameters[0].TypeName) == resolved;
+        };
+        auto classParameter = [&](const LLVMBackend::TypeAndValue& param) {
+            const bool byReference = param.Pointer && (param.IsAlias || param.IsRvalueRef)
+                && !param.ElemPointer;
+            return (!param.Pointer || byReference)
+                && (compiler->IsCxxRecord(param.TypeName)
+                    || compiler->dataStructures.count(param.TypeName) != 0);
+        };
+        // U is exactly the source type (a by-value or const-reference U).
+        auto exactParameter = [&](const LLVMBackend::TypeAndValue& param) {
+            const bool byReference = param.Pointer && (param.IsAlias || param.IsRvalueRef)
+                && !param.ElemPointer;
+            const bool pointer = byReference ? false : param.Pointer;
+            return !sourceType.TypeName.empty()
+                && compiler->ResolveTypeAlias(param.TypeName)
+                       == compiler->ResolveTypeAlias(sourceType.TypeName)
+                && pointer == sourceType.Pointer
+                && (byReference ? false : param.ElemPointer) == sourceType.ElemPointer;
+        };
+        auto arithmetic = [](const LLVMBackend::TypeAndValue& tv) {
+            return !tv.Pointer
+                && (tv.IsInteger() != -1 || tv.IsFloatingPoint() != -1 || tv.TypeName == "bool");
+        };
+        // The direct candidates, by kind: declared non-templates, or template instantiations.
+        // Copies: offering a subset rebuilds the table, so pointers into it would dangle.
+        auto collect = [&](bool templates) {
+            std::vector<LLVMBackend::FunctionSymbol> found;
+            std::set<std::string> declaredLinkages;
+            if (auto record = compiler->cxxRecordEntries_.find(typeName);
+                record != compiler->cxxRecordEntries_.end())
+                for (const auto& member : record->second.members)
+                    if (member.name == opName && !member.isImplicit && !member.isDeleted
+                        && member.bindRefusal.empty())
+                        declaredLinkages.insert(member.linkageName);
+            auto candidates = compiler->functionTable.find(opName);
+            if (candidates == compiler->functionTable.end()) return found;
+            for (const auto& candidate : candidates->second)
+            {
+                const bool isTemplate = candidate.UniqueName.starts_with("__cflat_tpl_");
+                if (!candidate.IsCxx || !isThisClass(candidate) || candidate.Parameters.size() != 2
+                    || isTemplate != templates
+                    || (!isTemplate && declaredLinkages.count(candidate.UniqueName) == 0)
+                    || compiler->ResolveTypeAlias(candidate.Parameters[1].TypeName) == resolved
+                    || classParameter(candidate.Parameters[1]))
+                    continue;
+                found.push_back(candidate);
+            }
+            return found;
+        };
+
+        /*
+         * Offer ONLY `offered` for the duration of `body`. The restore re-inserts just the hidden
+         * candidates at their original positions, by key: the call may insert into the table or
+         * update an entry it binds, and neither change may be rolled back.
+         */
+        auto withOffered = [&](const std::set<std::string>& offered, auto&& body) {
+            std::vector<std::pair<size_t, LLVMBackend::FunctionSymbol>> hidden;
+            {
+                auto& table = compiler->functionTable[opName];
+                std::vector<LLVMBackend::FunctionSymbol> kept;
+                for (size_t i = 0; i < table.size(); ++i)
+                    if (isThisClass(table[i]) && offered.count(table[i].UniqueName) == 0)
+                        hidden.emplace_back(i, table[i]);
+                    else
+                        kept.push_back(table[i]);
+                table = std::move(kept);
+            }
+            auto restore = [&]() {
+                auto& table = compiler->functionTable[opName];
+                for (auto& [index, symbol] : hidden)
+                    table.insert(table.begin() + std::min(index, table.size()), std::move(symbol));
+            };
+            try
+            {
+                auto result = body();
+                restore();
+                return result;
+            }
+            catch (...)
+            {
+                restore();
+                throw;
+            }
+        };
+        auto emitCall = [&]() -> llvm::Value* {
+            auto* left = compiler->CreateLoad(destination.BaseType, destination.Storage);
+            return TryBinaryOperatorOverload(
+                left, "=", right, ctx, destination.BaseType,
+                rhsNV.TypeAndValue.DepthIsAboutThisValue() ? rhsNV.TypeAndValue.PointerDepth : 0,
+                rhsNV.TypeAndValue.ElemPointer, destination.Storage, rhsNV.Storage,
+                /*reportMissing*/ false, /*allowReversed*/ false, /*lhsIsRvalue*/ false,
+                rhsNV.IsRvalue, typeName, rhsNV.TypeAndValue.TypeName);
+        };
+        /*
+         * The real call, run once under suppressed diagnostics into a detached block. Success
+         * keeps it: the block is spliced in at the insertion point (or branched to when the call
+         * split it). Failure deletes every block it created, so probe and call never diverge.
+         */
+        auto speculate = [&](const std::set<std::string>& offered) -> llvm::Value* {
+            auto savedIP = compiler->builder->saveIP();
+            auto savedDebugLoc = compiler->builder->getCurrentDebugLocation();
+            auto* savedRetTemp = compiler->lastCxxRetTemp_;
+            auto* savedRetValue = compiler->lastCxxRetValue_;
+            const bool savedSuppress = compiler->suppressErrors_;
+            auto* origin = savedIP.getBlock();
+            if (origin == nullptr || compiler->currentFunction == nullptr) return nullptr;
+            auto* scratch = llvm::BasicBlock::Create(*compiler->context, "cxx.assign",
+                                                     compiler->currentFunction);
+            compiler->builder->SetInsertPoint(scratch);
+            compiler->suppressErrors_ = true;
+            auto ledgers = compiler->SnapshotDetectionLedgers();
+            const auto mark = compiler->MarkOwnedTemps();
+            auto createdBlocks = [&]() {
+                std::vector<llvm::BasicBlock*> created;
+                bool after = false;
+                for (auto& block : *compiler->currentFunction)
+                {
+                    if (&block == scratch) after = true;
+                    if (after) created.push_back(&block);
+                }
+                return created;
+            };
+            auto discard = [&]() {
+                compiler->DiscardOwnedTempsSince(mark);
+                compiler->RestoreDetectionLedgers(ledgers);
+                compiler->suppressErrors_ = savedSuppress;
+                compiler->lastCxxRetTemp_ = savedRetTemp;
+                compiler->lastCxxRetValue_ = savedRetValue;
+                compiler->builder->restoreIP(savedIP);
+                compiler->builder->SetCurrentDebugLocation(savedDebugLoc);
+                const auto created = createdBlocks();
+                for (auto* block : created) block->dropAllReferences();
+                for (auto* block : created) block->eraseFromParent();
+            };
+            llvm::Value* result = nullptr;
+            try
+            {
+                result = withOffered(offered, emitCall);
+            }
+            catch (const SpeculativeEvalAbort&) { result = nullptr; }
+            catch (...)
+            {
+                discard();
+                throw;
+            }
+            if (result == nullptr)
+            {
+                discard();
+                return nullptr;
+            }
+            compiler->suppressErrors_ = savedSuppress;
+            const auto created = createdBlocks();
+            if (created.size() == 1 && scratch->getTerminator() == nullptr)
+            {
+                // One straight-line block: move its instructions to the insertion point.
+                origin->splice(savedIP.getPoint(), scratch);
+                scratch->eraseFromParent();
+                compiler->builder->restoreIP(savedIP);
+                return result;
+            }
+            if (savedIP.getPoint() == origin->end() && origin->getTerminator() == nullptr)
+            {
+                // The call split its block: enter it from the insertion point, stay at its end.
+                llvm::BranchInst::Create(scratch, origin);
+                return result;
+            }
+            discard();
+            return withOffered(offered, emitCall);
+        };
+        auto names = [](const std::vector<LLVMBackend::FunctionSymbol>& symbols) {
+            std::set<std::string> out;
+            for (const auto& symbol : symbols) out.insert(symbol.UniqueName);
+            return out;
+        };
+
+        const auto nonTemplates = collect(/*templates*/ false);
+        std::vector<LLVMBackend::FunctionSymbol> exact;
+        for (const auto& candidate : nonTemplates)
+            if (exactParameter(candidate.Parameters[1])) exact.push_back(candidate);
+
+        if (!exact.empty())
+            if (auto* result = speculate(names(exact))) return result;
+        bool templateInstantiated = false;
+        if (compiler->IsCxxRecord(typeName)
+            && compiler->HasCxxFunctionTemplateMember(typeName, opName))
+        {
+            LLVMBackend::NamedVariable receiver;
+            receiver.Primary = destination.Storage;
+            receiver.Storage = destination.Storage;
+            receiver.BaseType = destination.Storage->getType();
+            receiver.TypeAndValue.TypeName = typeName;
+            receiver.TypeAndValue.Pointer = true;
+            std::vector<LLVMBackend::NamedVariable> templateArguments = { receiver, probeArg };
+            templateArguments[1].TypeAndValue.VariableName.clear();
+            std::string registeredName, templateError;
+            if (compiler->RequestCxxFunctionTemplate(opName, typeName, {}, templateArguments, {},
+                                                     registeredName, templateError))
+            {
+                const auto instantiated = names(collect(/*templates*/ true));
+                templateInstantiated = !instantiated.empty();
+                if (templateInstantiated)
+                    if (auto* result = speculate(instantiated)) return result;
+            }
+        }
+        if (!nonTemplates.empty())
+            if (auto* result = speculate(names(nonTemplates))) return result;
+
+        // C++ would call an arithmetic `operator=(U)` for an arithmetic source (a standard
+        // conversion) that CFlat's call rules refuse: say so rather than reroute through T(u).
+        if (!templateInstantiated && arithmetic(sourceType))
+            for (const auto& candidate : nonTemplates)
+            {
+                const auto& p = candidate.Parameters[1];
+                if (!arithmetic(p)) continue;
+                // A mutable reference takes no converted source in C++ either: not a refusal.
+                const std::string spelling = compiler->CxxReferenceParameterSpelling(candidate, 1);
+                if (p.IsRvalueRef || p.IsCxxRefToPointer
+                    || (p.IsAlias && !p.IsCxxConstRef && !spelling.starts_with("const ")))
+                    continue;
+                const std::string to = spelling.empty() ? SpellType(*compiler, p) : spelling;
+                refusal = std::format(
+                    "C++ resolves this assignment to '{}.operator=({})', which needs a "
+                    "conversion CFlat does not make implicitly ('{}' to '{}'); cast the source to "
+                    "'{}' to call it, or spell the conversion out as '{}(<source>)'",
+                    compiler->DisplayCxxClassName(typeName), to, sourceType.TypeName, to, to,
+                    compiler->DisplayCxxClassName(typeName));
+                break;
+            }
+        return nullptr;
+}
+
 bool MainListener::EmitForeignCxxValueIntoSlot(
         const LLVMBackend::TypeAndValue& destType,
         llvm::Value* destination,
@@ -12607,6 +14075,31 @@ bool MainListener::EmitForeignCxxValueIntoSlot(
                 && compiler->TryAdoptRawPointerIntoCxxUniquePtr(destType.TypeName, destination,
                                                                 adoptSource, context, &destType))
                 return true;
+        }
+        // Plan converting-constructors.md point 1: a brace element / slot initializer `u` is
+        // `T(u)`.
+        if (!sameClass)
+        {
+            std::string refusal;
+            LLVMBackend::NamedVariable converted = sourceNV;
+            if (converted.Primary == nullptr) converted.Primary = sourceValue;
+            // Built as the owned temporary the spelled `T(u)` element makes, then moved in.
+            switch (compiler->ConvertThroughCxxConvertingCtor(converted, destType.TypeName,
+                                                              nullptr, refusal))
+            {
+            case LLVMBackend::CxxConvertingCtorResult::Converted:
+                compiler->EmitCxxCopyOrMoveConstruct(destType.TypeName, destination,
+                                                     converted.Storage, /*useMove*/ true, context);
+                compiler->FlushOwnedTempsSince(ownedTempMark, nullptr, nullptr);
+                return true;
+            case LLVMBackend::CxxConvertingCtorResult::Refused:
+                LogErrorContext(errCtx, std::format(
+                    "cannot initialize C++ class '{}' from this expression; {}",
+                    compiler->DisplayCxxClassName(destType.TypeName), refusal));
+                return true;
+            default:
+                break;
+            }
         }
 
         LogErrorContext(errCtx, std::format(
@@ -13122,7 +14615,7 @@ bool MainListener::EmitOneFieldInit(
         }
         else
         {
-            auto* gep = compiler->builder->CreateStructGEP(sd.StructType, structPtr, (unsigned)fieldIdx, fieldName + "_init");
+            auto* gep = compiler->CreateCxxFieldGEP(sd, structPtr, (unsigned)fieldIdx, fieldName + "_init");
             // The aggregate seed already constructed this field. Release that value before the
             // named override replaces it, matching the ordinary assignment drop-old path.
             if (fieldType.IsUnique
@@ -13139,8 +14632,11 @@ bool MainListener::EmitOneFieldInit(
             else if (!fieldType.Pointer
                      && (fieldType.TypeName == "string"
                          || compiler->IsOwningValueType(fieldType.TypeName))
-                     && val->getType()->isStructTy())
+                     && (val->getType()->isStructTy()
+                         || (isForeignCxxField && rightNV.TypeAndValue.TypeName != fieldType.TypeName)))
             {
+                // A converting-constructor source (plan converting-constructors.md) is scalar
+                // but still replaces the seed object, so the seed is released first too.
                 if (auto* dtor = compiler->GetOrCreateFullDestructor(fieldType.TypeName))
                     compiler->builder->CreateCall(dtor->getFunctionType(), dtor, { gep });
             }
@@ -13820,7 +15316,7 @@ void MainListener::EmitFieldInitializer(
 
                 llvm::Value* nestedDestination = sd.IsUnion
                     ? structPtr
-                    : compiler->builder->CreateStructGEP(sd.StructType, structPtr,
+                    : compiler->CreateCxxFieldGEP(sd, structPtr,
                         (unsigned)nestedFieldIndex, fieldName + "_nested_init");
                 if (nestedField.ConstArraySize > 0)
                 {
@@ -13902,7 +15398,8 @@ void MainListener::EmitFieldInitializer(
 
                 const auto& storageField = sd.StructFields[bfHit->StorageFieldIndex];
                 auto* storageTy = compiler->GetType(storageField);
-                auto* storagePtr = compiler->builder->CreateStructGEP(
+                // Union bitfield storage words all alias the union's offset 0.
+                auto* storagePtr = sd.IsUnion ? structPtr : compiler->builder->CreateStructGEP(
                     sd.StructType, structPtr, bfHit->StorageFieldIndex, fieldName + "_bf");
 
                 unsigned w = bfHit->BitWidth;
@@ -14613,7 +16110,8 @@ llvm::Constant* MainListener::CoerceConstantToArrayElement(
             if (elemTy->isIntegerTy())
                 return llvm::ConstantInt::get(elemTy, ci->getZExtValue());
             if (elemTy->isFloatingPointTy())
-                return llvm::ConstantFP::get(elemTy, (double)ci->getSExtValue());
+                return llvm::ConstantFP::get(elemTy, ci->getBitWidth() == 1
+                    ? (double)ci->getZExtValue() : (double)ci->getSExtValue());
         }
         else if (auto* cf = llvm::dyn_cast<llvm::ConstantFP>(c))
         {
@@ -15047,6 +16545,7 @@ bool MainListener::TryEmitContainerInitializer(
         const LLVMBackend::TypeAndValue& tv,
         CFlatParser::InitializerListContext* initList) {
         auto* compiler = Compiler(initList);
+        CallPostfixScope initializerPostfix(this);
         const std::string& typeName = tv.TypeName;
         const std::string displayTypeName = SpellType(*compiler, tv);
 
@@ -15120,6 +16619,7 @@ bool MainListener::TryEmitContainerInitializer(
                 LLVMBackend::NamedVariable keyNV, valNV;
                 if (!parseElement(fi->assignmentExpression(0), keyType, keyNV)) continue;
                 if (!parseElement(fi->assignmentExpression(1), valType, valNV)) continue;
+                initializerPostfix.Flush();
                 compiler->CreateOverloadedFunctionCall("set", { makeSelf(), keyNV, valNV });
             }
             return true;
@@ -15158,6 +16658,7 @@ bool MainListener::TryEmitContainerInitializer(
                 LLVMBackend::NamedVariable idxNV;
                 idxNV.Primary = compiler->builder->getInt32((uint32_t)i);
                 idxNV.TypeAndValue.TypeName = "int";
+                initializerPostfix.Flush();
                 compiler->CreateOverloadedFunctionCall("set", { makeSelf(), idxNV, elemNV });
             }
             return true;
@@ -15168,6 +16669,7 @@ bool MainListener::TryEmitContainerInitializer(
         {
             LLVMBackend::NamedVariable elemNV;
             if (!parseElement(fi->assignmentExpression(0), elemType, elemNV)) continue;
+            initializerPostfix.Flush();
             compiler->CreateOverloadedFunctionCall("add", { makeSelf(), elemNV });
         }
         return true;
@@ -15199,12 +16701,14 @@ void MainListener::ArmArrayNewDesugar(antlr4::tree::ParseTree* rhs, const LLVMBa
 
 LLVMBackend::NamedVariable MainListener::ParseNewExpression(CFlatParser::NewExpressionContext* ctx) {
         auto* compiler = Compiler(ctx);
+        CallPostfixScope newCallPostfix(this);
         const bool desugarToArray = ctx == arrayNewDesugarCtx;
         arrayNewDesugarCtx = nullptr;  // one-shot
         // The destination of `new T` is the allocated pointer, not its array count or
         // constructor arguments. Those child expressions have their own types and must not
         // inherit an enclosing initializer/return destination.
         DeclExpectedTypeScope newExpectedScope(&declExpectedType, {});
+        DiagnoseAssignmentArguments(ctx->argumentExpressionList());
         std::string typeName = ParseTypeSpecifierName(ctx->typeSpecifier(), ctx->multiWordTypeSuffix());
         bool isArray = ctx->assignmentExpression() != nullptr;
         const auto spellNewType = [&]() {
@@ -15370,11 +16874,27 @@ LLVMBackend::NamedVariable MainListener::ParseNewExpression(CFlatParser::NewExpr
                         return {};
                     }
                     auto nv = ParseAssignmentExpressionNamed(argAssign);
+                    // Same literal identity the call-argument builder records (integer -> enum refusal).
+                    if (nv.LiteralIdentity.empty())
+                        nv.LiteralIdentity = LLVMBackend::LiteralIdentityForOverload(argAssign->getText());
                     ctorArgs.push_back(LoadNamedVariable(nv));
                     ctorArgTypes.push_back(nv.TypeAndValue);
                     TypeUntypedCtorArg(ctorArgTypes.back(), ctorArgs.back());
+                    // The forwarding thunk spells the argument's exact type and category: give
+                    // a blank primitive its typed twin, and mark an address-less constant rvalue.
+                    if (nv.TypeAndValue.TypeName.empty() && !nv.TypeAndValue.Pointer)
+                        nv.TypeAndValue.TypeName = ctorArgTypes.back().TypeName;
+                    if (llvm::isa_and_nonnull<llvm::Constant>(ctorArgs.back())
+                        && nv.Storage == nullptr && !nv.TypeAndValue.IsAlias)
+                        nv.IsRvalue = true;
                     ctorArgVars.push_back(std::move(nv));
                 }
+            // `new T()` needs the default constructor bound when clang must apply its defaults.
+            if (ctorArgTypes.empty())
+            {
+                std::string defaultCtorError;
+                compiler->TryBindCxxImplicitDefaultCtor(typeName, defaultCtorError);
+            }
             std::string why;
             const auto* ctor = compiler->SelectCxxConstructor(typeName, ctorArgTypes, why, false,
                                                              &ctorArgVars);
@@ -15385,13 +16905,17 @@ LLVMBackend::NamedVariable MainListener::ParseNewExpression(CFlatParser::NewExpr
                 compiler->CxxConstructorNeedsClangResolution(typeName, ctor, ctorArgTypes)
                 && compiler->RequestCxxVariadicConstructor(typeName, ctorArgVars, wrapperName,
                                                            wrapperError);
-            if (ctor == nullptr && !wrapped)
+            // A scalar-reference overload set has no listed fallback: clang's refusal stands.
+            if (!wrapped && (ctor == nullptr
+                             || compiler->CxxCtorForwardsScalarReference(typeName, ctorArgTypes)))
             {
+                if (!wrapperError.empty() && !why.starts_with("constructor '")) why = wrapperError;
                 LogErrorContext(ctx, why.starts_with("no overload of '")
                     ? why : std::format("C++ class '{}' {}",
                         compiler->DisplayCxxClassName(typeName), why));
                 return {};
             }
+            newCallPostfix.Flush();
             llvm::Value* block = compiler->EmitCxxHeapAllocate(typeName);
             if (block == nullptr)
             {
@@ -15419,7 +16943,9 @@ LLVMBackend::NamedVariable MainListener::ParseNewExpression(CFlatParser::NewExpr
                     argVar.TypeAndValue.VariableName.clear();
                     wrapperArguments.push_back(std::move(argVar));
                 }
-                compiler->CreateOverloadedFunctionCall(wrapperName, wrapperArguments);
+                compiler->ConvertCxxCtorThunkArguments(wrapperName, wrapperArguments);
+                compiler->CreateOverloadedFunctionCall(wrapperName, wrapperArguments, false,
+                                                      compiler->DisplayCxxClassName(typeName));
             }
             else
                 compiler->EmitCxxStructorCall(typeName, *ctor, block, ctorArgs, &ctorArgVars);
@@ -15642,6 +17168,7 @@ LLVMBackend::NamedVariable MainListener::ParseNewExpression(CFlatParser::NewExpr
                     ctorArgs.push_back(argVar);
                 }
             }
+            newCallPostfix.Flush();
             llvm::Value* structVal = compiler->CreateOverloadedFunctionCall(typeName, ctorArgs);
             newBlockScope.Release();
             // The constructed value is about to land in a HEAP block that outlives the statement.
@@ -16890,6 +18417,17 @@ LLVMBackend::NamedVariable MainListener::ParseMoveExpression(CFlatParser::MoveEx
             LogErrorContext(ctx,
                 "cannot move a holder containing a bonded closure - the closure would outlive its captured local");
 
+        // Moving a foreign C++ object moves its value, not its ownership. Its real owner still
+        // destroys the moved-from object, so alias-owner checks for pointer transfers do not apply.
+        if (!argNV.TypeAndValue.Pointer && argNV.Storage != nullptr
+            && !argNV.IsTempSpillStorage
+            && compiler->IsForeignNontrivialCxxReturnClass(argNV.TypeAndValue.TypeName))
+        {
+            argNV.IsExplicitMove = true;
+            argNV.IsRvalue = true;
+            return argNV;
+        }
+
         // Reject 'move' through a temp spill (`move mk().vals[i]`): the subscript spilled a SHALLOW
         // copy of the extracted array, so nulling a slot there leaves the original temporary still
         // holding the pointer - a leak or a double free. Reads of the spill stay legal.
@@ -17106,17 +18644,6 @@ LLVMBackend::NamedVariable MainListener::ParseMoveExpression(CFlatParser::MoveEx
         }
 
         llvm::Value* ptrVal = LoadNamedVariable(argNV);
-
-        // A foreign nontrivial C++ object must stay constructed while its move constructor reads
-        // it. The return/assignment/argument consumer performs that construction and owns the
-        // moved-from destructor; zeroing the bytes here would bypass the C++ move contract.
-        if (!argNV.TypeAndValue.Pointer && argNV.Storage != nullptr
-            && compiler->IsForeignNontrivialCxxReturnClass(argNV.TypeAndValue.TypeName))
-        {
-            argNV.IsExplicitMove = true;
-            argNV.IsRvalue = true;
-            return argNV;
-        }
 
         // move on a named struct value type: capture the value, then zero the source storage
         // to leave it in a "moved-from" (default) state - enables safe delete[n] on the source.
@@ -17397,6 +18924,7 @@ LLVMBackend::NamedVariable MainListener::ParseMoveExpression(CFlatParser::MoveEx
 LLVMBackend::NamedVariable MainListener::ParseOperatorStringExpression(CFlatParser::OperatorStringExpressionContext* ctx) {
         auto* compiler = Compiler(ctx);
         DeclExpectedTypeScope operatorStringExpectedScope(&declExpectedType, {});
+        DiagnoseAssignmentArguments(ctx->argumentExpressionList());
 
         // Collect arguments passed to operator string(...)
         std::vector<LLVMBackend::NamedVariable> arguments;
@@ -17874,7 +19402,7 @@ bool MainListener::ResolveTransparentAnonField(
         {
             const auto& anonField = curSd.StructFields[chain[k]];
             if (!curSd.IsUnion)
-                ptr = compiler->CreateStructGEP(curType, ptr, (unsigned)chain[k]);
+                ptr = compiler->CreateCxxFieldGEP(curSd, ptr, (unsigned)chain[k]);
             curType = compiler->GetType(anonField);
             curSd = compiler->GetDataStructure(anonField.TypeName);
         }
@@ -17918,7 +19446,7 @@ bool MainListener::ResolveTransparentAnonField(
         }
         else
         {
-            out.Storage = compiler->CreateStructGEP(curType, ptr, (unsigned)chain.back());
+            out.Storage = compiler->CreateCxxFieldGEP(curSd, ptr, (unsigned)chain.back());
             if (llvm::isa<llvm::ArrayType>(leafLLVMType))
             {
                 out.Primary = nullptr;
@@ -17926,7 +19454,7 @@ bool MainListener::ResolveTransparentAnonField(
             }
             else
             {
-                out.Primary = compiler->CreateLoad(out.Storage);
+                out.Primary = compiler->CreateLoad(leafLLVMType, out.Storage);
                 out.BaseType = out.Primary->getType();
             }
         }
@@ -18047,7 +19575,7 @@ void MainListener::PrepareAliasCallResult(
         if (!result.TypeAndValue.Pointer && !result.TypeAndValue.IsAlias
             && result.TypeAndValue.TypeName.size() > 0
             && compiler->lastCxxRetTemp_ != nullptr
-            && compiler->IsForeignNontrivialCxxClass(result.TypeAndValue.TypeName))
+            && compiler->IsForeignNontrivialCxxReturnClass(result.TypeAndValue.TypeName))
         {
             result.Storage = compiler->lastCxxRetTemp_;
             result.BaseType = compiler->GetType(result.TypeAndValue);

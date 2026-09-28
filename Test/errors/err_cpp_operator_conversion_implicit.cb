@@ -11,5 +11,12 @@ extern int main()
         cppi.ConvDeleted d = cppi.ConvDeleted(1);
         float g = (float)d;
     }
+    // A call reachable only through a conversion operator whose generated wrapper clang
+    // refuses names that refusal in the "no overload" error, not only under -v.
+    expect_error("implicit argument conversion refused: clang rejected the call through") {
+        cppi.UdcParser udcP = default;
+        cppi.UdcStr udcS = default;
+        auto udcR = udcP.p(udcS);
+    }
     return 0;
 }

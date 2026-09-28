@@ -1,6 +1,5 @@
 // GUARDS: fmt runtime formatting with a CFlat string argument
 // FROM: scratch/probe3/f05_format_string_arg.cb
-// DISABLED: internal/plan/converting-constructors.md
 import cpp "fmt/format.h";
 extern int printf(const char* fmt, ...);
 extern int main()

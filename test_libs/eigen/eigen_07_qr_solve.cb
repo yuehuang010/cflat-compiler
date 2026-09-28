@@ -1,6 +1,5 @@
 // GUARDS: calling a member function template (QR solve) on a decomposition object
 // FROM: scratch/probe3/e09_solve.cb
-// DISABLED: internal/issue/p3/cpp-eigen-qr-solve-wrapper-not-registered.md
 import cpp "Eigen/Dense";
 extern int printf(const char* fmt, ...);
 extern int main()

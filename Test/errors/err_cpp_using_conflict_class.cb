@@ -1,0 +1,7 @@
+// `using cppuc_src::S;` (a class) in one import and `struct S` in the same namespace in another:
+// two classes under one name. Import-time error, like err_cpp_using_conflict_type.cb for enums.
+expect_error("'cppuc.S' is an alias of 'cppuc_src.S' in 'cpp_interop_using_conflict_class.h' but a class in 'cpp_interop_using_conflict_own.h'");
+import cpp "cpp_interop_using_conflict_own.h";
+import cpp "cpp_interop_using_conflict_class.h";
+
+extern int main() { return 0; }

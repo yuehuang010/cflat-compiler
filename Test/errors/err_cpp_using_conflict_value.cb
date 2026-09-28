@@ -1,0 +1,7 @@
+// `using cppuc_src::Red;` (an enumerator) imported BEFORE the header declaring function
+// cppuc::Red: the later import must be refused, not silently hidden by the first-registered name.
+expect_error("'cppuc.Red' is a function in 'cpp_interop_using_conflict_own.h' but an enumerator of 'cppuc_src.Col' in 'cpp_interop_using_conflict_value.h'");
+import cpp "cpp_interop_using_conflict_value.h";
+import cpp "cpp_interop_using_conflict_own.h";
+
+extern int main() { return 0; }

@@ -1,6 +1,5 @@
 // GUARDS: torch::data TensorDataset size and Example<Tensor, NoTarget> field access.
 // FROM: scratch/ladder/torch/t13.cb
-// DISABLED: internal/issue/p2/cpp-scalar-rvalue-reference-return-reads-address.md
 import cpp "torch/torch.h";
 extern int printf(const char* fmt, ...);
 int leg_t13()

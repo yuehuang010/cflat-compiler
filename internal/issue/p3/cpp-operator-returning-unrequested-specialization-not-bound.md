@@ -11,9 +11,10 @@ At import, `-v` shows the member refused (`C++ member op.W.operator* not bound: 
 type 'op::Expr<op::W>'`); the method `mul` is refused the same way at import but recovers on use.
 
 Found 2026-09-26 probing Eigen: every arithmetic operator returns an expression template
-(`CwiseBinaryOp<...>`, `Product<...>`), so `a * 2.0` and `m * v` fail. (`a + b` additionally hits
-`cpp-inherited-static-members-and-member-operators-not-found.md`, because Eigen declares its
-operators on the `MatrixBase` CRTP base.)
+(`CwiseBinaryOp<...>`, `Product<...>`). Eigen itself is no longer blocked by this: its operators
+live on the `MatrixBase` CRTP base, and the inherited-member retry binds `(a + b).sum()`,
+`(m * v).sum()` and `(a * 2.0).sum()`. A refused operator declared on the class itself (`op3.W`
+below) still fails.
 
 ## Repro (standalone, ~1 s)
 

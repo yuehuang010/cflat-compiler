@@ -109,3 +109,35 @@ ML_BinaryOp ml_pick_op(int which)
     if (which == 1) return ml_op_mul;
     return ml_op_sub;
 }
+
+int cbf_anon_union_size(void) { return (int)sizeof(struct CBF_AnonUnion); }
+int cbf_anon_union_align(void) { return (int)_Alignof(struct CBF_AnonUnion); }
+int cbf_anon_union_tail_offset(void)
+{
+    return (int)offsetof(struct CBF_AnonUnion, tail);
+}
+int cbf_anon_union_check(const struct CBF_AnonUnion* v)
+{
+    return (int)v->a * 100 + (int)v->tail;
+}
+
+int cbf_named_union_size(void) { return (int)sizeof(union CBF_NamedUnion); }
+int cbf_named_union_align(void) { return (int)_Alignof(union CBF_NamedUnion); }
+int cbf_named_union_check_a(const union CBF_NamedUnion* v) { return (int)v->a; }
+int cbf_named_union_check_b(const union CBF_NamedUnion* v) { return (int)v->b; }
+int cbf_named_union_check_c(const union CBF_NamedUnion* v)
+{
+    return (int)(v->c & 0xffffu);
+}
+int cbf_named_union_check_s(const union CBF_NamedUnion* v) { return (int)v->s; }
+
+int cbf_enum_bits_size(void) { return (int)sizeof(struct CBF_EnumBits); }
+int cbf_enum_bits_align(void) { return (int)_Alignof(struct CBF_EnumBits); }
+int cbf_enum_bits_tail_offset(void)
+{
+    return (int)offsetof(struct CBF_EnumBits, tail);
+}
+int cbf_enum_bits_check(const struct CBF_EnumBits* v)
+{
+    return (int)v->u * 1000 + v->s * 100 + (int)v->neighbor * 10 + v->tail;
+}

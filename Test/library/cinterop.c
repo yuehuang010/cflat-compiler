@@ -101,3 +101,60 @@ int CAA_DiffTarget(double value) { return 1600 + (int)value; }
 int c_quad(int x)   { return x * 4; }
 int c_alias_victim(int x) { return x * 10; }
 int c_negate(int x)       { return -x; }
+
+#include "c_macro_helpers.h"
+
+int cbf_zero_size(void) { return (int)sizeof(struct CBF_Zero); }
+struct CBF_Zero cbf_zero_make(int c, int d)
+{
+    struct CBF_Zero v = { (char)c, (char)d };
+    return v;
+}
+int cbf_zero_check(struct CBF_Zero v) { return v.c * 100 + v.d; }
+
+int cbf_nested_size(void) { return (int)sizeof(struct CBF_Nested); }
+struct CBF_Nested cbf_nested_make(int c, int d, int e, int f)
+{
+    struct CBF_Nested v = { 0 };
+    v.c = (char)c;
+    v.in.d = (char)d;
+    v.in.e = e;
+    v.f = (short)f;
+    return v;
+}
+int cbf_nested_check(struct CBF_Nested v)
+{
+    return v.c * 1000 + v.in.d * 100 + v.in.e * 10 + v.f;
+}
+
+int cbf_mixed_size(void) { return (int)sizeof(struct CBF_Mixed); }
+struct CBF_Mixed cbf_mixed_make(unsigned a, unsigned b, int c,
+                                unsigned long long d)
+{
+    struct CBF_Mixed v = { 0 };
+    v.a = a;
+    v.b = b;
+    v.c = (char)c;
+    v.d = d;
+    return v;
+}
+int cbf_mixed_check(struct CBF_Mixed v)
+{
+    return (int)(v.a * 1000000u + v.b * 10000u + (unsigned char)v.c * 100u
+                 + (unsigned)(v.d & 0xFFFFu));
+}
+
+int cbf_char_short_size(void) { return (int)sizeof(struct CBF_CharShort); }
+struct CBF_CharShort cbf_char_short_make(int c, unsigned a, int s, unsigned b)
+{
+    struct CBF_CharShort v = { 0 };
+    v.c = (char)c;
+    v.a = a;
+    v.s = (short)s;
+    v.b = b;
+    return v;
+}
+int cbf_char_short_check(struct CBF_CharShort v)
+{
+    return (unsigned char)v.c * 10000 + v.a * 1000 + v.s * 10 + v.b;
+}

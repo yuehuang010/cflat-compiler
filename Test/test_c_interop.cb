@@ -546,6 +546,77 @@ extern int main()
     ml_flags_set_count(&qg, 8675309);
     if (qg.count != 8675309)                    return 176;
 
+    // ---- Section Q2: clang-offset C bitfield records -----------------------
+    // These records cover zero-width alignment, nesting, mixed base types, and
+    // bitfields after ordinary char/short members. Constructors and by-value
+    // checks cross the C ABI in both directions.
+    if ((int)sizeof(CBF_Zero) != cbf_zero_size()) return 270;
+    CBF_Zero za = cbf_zero_make(11, 22);
+    if (za.c != 11 || za.d != 22)               return 271;
+    if (cbf_zero_check(za) != 1122)              return 272;
+
+    if ((int)sizeof(CBF_Nested) != cbf_nested_size()) return 280;
+    CBF_Nested nb = cbf_nested_make(3, 4, 7, 9);
+    if (nb.c != 3 || nb.in.d != 4 || nb.in.e != 7 || nb.f != 9) return 273;
+    if (cbf_nested_check(nb) != 3479)            return 274;
+
+    if ((int)sizeof(CBF_Mixed) != cbf_mixed_size()) return 281;
+    CBF_Mixed bfm = cbf_mixed_make(5, 11, 13, 0x123456789a);
+    if (bfm.a != 5 || bfm.b != 11 || bfm.c != 13 || bfm.d != 0x123456789a) return 275;
+    if (cbf_mixed_check(bfm) != 5142174)         return 276;
+
+    if ((int)sizeof(CBF_CharShort) != cbf_char_short_size()) return 277;
+    CBF_CharShort cs = cbf_char_short_make(2, 5, 17, 9);
+    if (cs.c != 2 || cs.a != 5 || cs.s != 17 || cs.b != 9) return 278;
+    if (cbf_char_short_check(cs) != 25179)        return 279;
+
+    // Anonymous and named C unions retain their bitfield members and clang layout.
+    if ((int)sizeof(CBF_AnonUnion) != cbf_anon_union_size()) return 282;
+    if ((int)alignof(CBF_AnonUnion) != cbf_anon_union_align()) return 283;
+    CBF_AnonUnion au = default;
+    au.head = 3;
+    au.tail = 9;
+    au.a = 1;
+    if (au.a != 1 || au.__anon0.a != 1 || au.tail != 9) return 284;
+    if (cbf_anon_union_check(&au) != 109) return 285;
+    au.__anon0.b = 85;
+    if (au.b != 85 || au.__anon0.b != 85 || au.tail != 9) return 286;
+    au.c = 0x123456789a;
+    if (au.c != 0x123456789a) return 287;
+    au.s = -7;
+    if (au.s != -7) return 288;
+
+    if ((int)sizeof(CBF_NamedUnion) != cbf_named_union_size()) return 289;
+    if ((int)alignof(CBF_NamedUnion) != cbf_named_union_align()) return 290;
+    CBF_NamedUnion nu = default;
+    nu.a = 1;
+    if (nu.a != 1 || cbf_named_union_check_a(&nu) != 1) return 291;
+    nu.b = 85;
+    if (nu.b != 85 || cbf_named_union_check_b(&nu) != 85) return 292;
+    nu.c = 0x123456789a;
+    if (nu.c != 0x123456789a || cbf_named_union_check_c(&nu) != 0x789a) return 293;
+    nu.s = -7;
+    if (nu.s != -7 || cbf_named_union_check_s(&nu) != -7) return 294;
+
+    if ((int)sizeof(CBF_EnumBits) != cbf_enum_bits_size()) return 295;
+    if ((int)alignof(CBF_EnumBits) != cbf_enum_bits_align()) return 296;
+    CBF_EnumBits eb = default;
+    eb.tail = 9;
+    eb.neighbor = 5;
+    eb.u = 2;
+    eb.s = -2;
+    if (eb.u != 2 || eb.s != -2 || eb.neighbor != 5 || eb.tail != 9) return 297;
+    if (cbf_enum_bits_check(&eb) != 1859) return 298;
+
+    CBF_WordUnion wu = default;
+    wu.word = 0xffffffffu;
+    wu.nib = 2;
+    if (wu.word != 0xfffffff2u) return 299;
+    wu.t = CBF_TypedefEnum5;
+    if (wu.t != CBF_TypedefEnum5 || (int)wu.t != 5 || wu.word != 0xfffffff5u) return 300;
+    CBF_WordUnion wi = { nib = 9 };
+    if (wi.nib != 9 || (int)wi.t != 1) return 301;
+
     // ---- Section R: extern global variables (header-bind + .c auto-extern) ---
     // mathlib.h declares `extern int/double/const char*` globals; the import-package
     // path binds them as declaration-only, mutable CFlat globals resolved against

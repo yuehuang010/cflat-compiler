@@ -1,5 +1,6 @@
 // A C++ non-const lvalue reference accepts named lvalues but cannot bind a temporary.
 import cpp "cpp_interop_refbinding.h";
+import cpp "algorithm";
 
 extern int main()
 {
@@ -18,6 +19,138 @@ extern int main()
     }
     expect_error("is a non-const lvalue reference and cannot bind an rvalue") {
         cppref.RefOwner owner = cppref.RefOwner(cppref.Ex(5));
+    }
+    // Function templates: every rvalue spelling to a non-const `U&` (pre-fix: bound a wrapper copy).
+    expect_error("is a non-const lvalue reference and cannot bind an rvalue") { // call result
+        cppref.tbump(cppref.tval(1));
+    }
+    expect_error("is a non-const lvalue reference and cannot bind an rvalue") { // literal
+        cppref.tbump(1);
+    }
+    expect_error("is a non-const lvalue reference and cannot bind an rvalue") { // arithmetic
+        int i = 1;
+        cppref.tbump(i + 1);
+    }
+    expect_error("is a non-const lvalue reference and cannot bind an rvalue") { // cast
+        double d = 2.5;
+        cppref.tbump((int)d);
+    }
+    expect_error("is a non-const lvalue reference and cannot bind an rvalue") { // move of a scalar
+        int i = 1;
+        cppref.tbump(move i);
+    }
+    expect_error("is a non-const lvalue reference and cannot bind an rvalue") { // class temporary
+        cppref.tbump_ex(cppref.Ex(5));
+    }
+    expect_error("is a non-const lvalue reference and cannot bind an rvalue") { // class call result
+        cppref.tbump_ex(cppref.make_ex(5));
+    }
+    // Passed pre-fix too (the explicit-move path already refused it): a tripwire, not a regression leg.
+    expect_error("is a non-const lvalue reference and cannot bind an rvalue") { // move of a class
+        cppref.Ex value = cppref.Ex(5);
+        cppref.tbump_ex(move value);
+    }
+    expect_error("is a non-const lvalue reference and cannot bind an rvalue") { // non-deduced int& beside a deduced U
+        cppref.tout(4, cppref.tval(1));
+    }
+    expect_error("is a non-const lvalue reference and cannot bind an rvalue") { // pack element
+        int i = 1;
+        cppref.tpack(i, i + 1);
+    }
+    expect_error("is a non-const lvalue reference and cannot bind an rvalue") { // member template
+        cppref.TMember m;
+        m.bump(cppref.tval(1));
+    }
+    // The binary-operator template path keeps its own operand-side wording (err_cpp_freeop_rvalue).
+    expect_error("the CFlat expression is an rvalue and the parameter is a non-const reference") { // operator template, template path
+        cppref.tsink.TSink s;
+        int r = s + cppref.tval(1);
+    }
+    expect_error("is a non-const lvalue reference and cannot bind an rvalue") { // operator template, shift path
+        cppref.tsink.TSink s;
+        int r = s << cppref.tval(1);
+    }
+    // Syntactic rvalues that still carry their source variable's name (round 2).
+    expect_error("is a non-const lvalue reference and cannot bind an rvalue") { // unary minus of a named variable
+        int i = 1;
+        cppref.tbump(-i);
+    }
+    expect_error("is a non-const lvalue reference and cannot bind an rvalue") { // unary plus
+        int i = 1;
+        cppref.tbump(+i);
+    }
+    expect_error("is a non-const lvalue reference and cannot bind an rvalue") { // logical not
+        bool c = true;
+        cppref.tbump(!c);
+    }
+    expect_error("is a non-const lvalue reference and cannot bind an rvalue") { // post-increment
+        int i = 1;
+        cppref.tbump(i++);
+    }
+    expect_error("is a non-const lvalue reference and cannot bind an rvalue") { // same-type cast (int) on int
+        int i = 1;
+        cppref.tbump((int)i);
+    }
+    expect_error("is a non-const lvalue reference and cannot bind an rvalue") { // same-type cast (long) on long
+        long l = 2;
+        cppref.tbump((long)l);
+    }
+    // Ruling 2026-09-27: C++ accepts an assignment argument; CFlat refuses it for every callee
+    // and parameter kind with one diagnostic (pre-fix the non-U& legs compiled and ran).
+    expect_error("an assignment cannot be used as a call argument; assign first, then pass 'i'") { // plain assignment
+        int i = 1;
+        cppref.tbump(i = 3);
+    }
+    expect_error("an assignment cannot be used as a call argument; assign first, then pass 'i'") { // compound assignment
+        int i = 1;
+        cppref.tbump(i += 3);
+    }
+    expect_error("an assignment cannot be used as a call argument; assign first, then pass 'i'") { // template non-const U& member
+        int i = 1;
+        cppref.TMember tm = cppref.TMember();
+        tm.bump(i = 3);
+    }
+    expect_error("an assignment cannot be used as a call argument; assign first, then pass 'i'") { // free by value
+        int i = 1;
+        int r = cppref.tval(i = 3);
+    }
+    expect_error("an assignment cannot be used as a call argument; assign first, then pass 'i'") { // free by value, parenthesised
+        int i = 1;
+        int r = cppref.tval((i *= 3));
+    }
+    expect_error("an assignment cannot be used as a call argument; assign first, then pass 'i'") { // template by value U
+        int i = 1;
+        int o = 0;
+        int r = cppref.tout(i = 11, o);
+    }
+    expect_error("an assignment cannot be used as a call argument; assign first, then pass 'i'") { // variadic template pack
+        int i = 1;
+        int j = 2;
+        int r = cppref.tpack(j, i = 4);
+    }
+    expect_error("an assignment cannot be used as a call argument; assign first, then pass 'i'") { // std template by const ref
+        int i = 1;
+        int r = std.max(i = 10, 2);
+    }
+    expect_error("an assignment cannot be used as a call argument; assign first, then pass 'i'") { // constructor
+        int i = 1;
+        cppref.Ex e = cppref.Ex(i = 7);
+    }
+    expect_error("an assignment cannot be used as a call argument; assign first, then pass 'i'") { // new
+        int i = 1;
+        cppref.Ex* e = new cppref.Ex(i = 7);
+    }
+    expect_error("an assignment cannot be used as a call argument; assign first, then pass 'e'") { // const ref (class assignment)
+        cppref.Ex e = cppref.Ex(1);
+        int r = cppref.take_cref(e = cppref.Ex(6));
+    }
+    expect_error("an assignment cannot be used as a call argument; assign first, then pass 'e'") { // rvalue ref Ex&&
+        cppref.Ex e = cppref.Ex(1);
+        int r = cppref.take_rref(e = cppref.Ex(6));
+    }
+    expect_error("an assignment cannot be used as a call argument; assign first, then pass 'e'") { // constructor taking Ex&
+        cppref.Ex e = cppref.Ex(1);
+        cppref.RefOwner owner = cppref.RefOwner(e = cppref.Ex(6));
     }
     return 0;
 }

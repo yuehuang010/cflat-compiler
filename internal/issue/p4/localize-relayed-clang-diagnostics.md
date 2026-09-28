@@ -66,3 +66,11 @@ detail and should not be chosen just to make the locale files look complete.
 - `test.bat` Release, `test_lsp.bat`, `test_example.bat` stay green.
   `Test/errors/err_cpp_broken_header.cb` and `err_orphan_header.cb` cover both messages;
   keep their `expect_error` substrings on the localizable half.
+
+## Ruling (maintainer, 2026-09-27)
+
+No translation of clang text. Every message whose text comes from clang (or clang-cl / the linker it
+drives) carries a `clang: ` prefix so the user can tell it did not come from cflat. The work left is
+coverage: find every relay site that forwards clang/tool text without the prefix (the clang-cl
+compile/link stderr relays in LLVMBackend_CInterop.cpp and LLVMBackend.cpp are the known ones) and
+prefix it. The cflat sentence around a quoted clause stays localized as today.

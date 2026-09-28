@@ -1,6 +1,5 @@
 // GUARDS: cross entropy, tensor data access, and an SGD training loop.
 // FROM: scratch/ladder/torch/t23.cb
-// DISABLED: internal/issue/p2/cpp-class-initializer-evaluated-twice-with-array-element-arg.md
 import cpp "torch/torch.h";
 extern int printf(const char* fmt, ...);
 int leg_t23()

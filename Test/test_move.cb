@@ -21,6 +21,21 @@ struct CS
 
 int useCS(int* value) { return value == nullptr ? -1 : *value; }
 int lookCS(CS* p) { return p == nullptr ? -1 : p->v; }
+// -10 when the argument's temporary was already destructed before the call ran.
+int useCSLive(int* value) { if (conditionalDtorCount != 0) return -10; return useCS(value); }
+int lookCSLive(CS* p) { if (conditionalDtorCount != 0) return -10; return lookCS(p); }
+CS* conditionalStored = nullptr;
+void storeCS(CS* p) { conditionalStored = p; }
+int conditionalGate = 1;
+// A `?:` arm temp in a call argument of a `return` is freed before the function returns.
+int returnCoalesceArm(int* fallback)
+{
+    return useCSLive(conditionalGate > 0 ? &(new CS(20))->v ?? fallback : fallback);
+}
+int returnTernaryArm(int* fallback)
+{
+    return useCSLive(conditionalGate > 0 ? &(new CS(21))->v : fallback);
+}
 CS* conditionalKeep = nullptr;
 int takeConditionalCS(move CS* p)
 {
@@ -12819,6 +12834,100 @@ extern int main()
         coalesceStoreClean && conditionalDtorCount == 1 ? 1 : 0, 1);
     total++;
 
+    // A `??` LHS temp inside a `?:` arm lives until the call returns, whichever arm runs.
+    int armLhsOk = 1;
+    for (int arm = 0; arm < 2; arm++)
+    {
+        conditionalNewCount = 0;
+        conditionalDtorCount = 0;
+        int armRead = useCSLive(arm > 0 ? &(new CS(8))->v ?? nullptr : &(new CS(9))->v);
+        if (armRead != (arm > 0 ? 8 : 9) || conditionalNewCount != 1 || conditionalDtorCount != 1)
+            armLhsOk = 0;
+        conditionalNewCount = 0;
+        conditionalDtorCount = 0;
+        armRead = useCSLive(arm > 0 ? nullptr : &(new CS(10))->v ?? g);
+        if (armRead != (arm > 0 ? -1 : 10) || conditionalDtorCount != conditionalNewCount)
+            armLhsOk = 0;
+    }
+    passed += Test("conditional_new_coalesce_lhs_in_ternary_arm", armLhsOk, 1);
+    total++;
+
+    // A `??` RHS (or nested `?:`) temp inside a `?:` arm is freed after the call, not leaked.
+    conditionalNewCount = 0;
+    conditionalDtorCount = 0;
+    int armRhsRead = useCSLive(c > 0 ? (g ?? &(new CS(11))->v) : nullptr);
+    bool armRhsClean = armRhsRead == 11 && conditionalNewCount == 1 && conditionalDtorCount == 1;
+    conditionalNewCount = 0;
+    conditionalDtorCount = 0;
+    int armNestedRead = useCSLive(c > 0
+        ? ((c == 1 ? &(new CS(12))->v : nullptr) ?? &(new CS(13))->v) : nullptr);
+    passed += Test("conditional_new_coalesce_rhs_in_ternary_arm",
+        armRhsClean && armNestedRead == 12 && conditionalNewCount == 1
+            && conditionalDtorCount == 1 ? 1 : 0, 1);
+    total++;
+
+    // A bare `new` LHS of `??` is freed after a borrowing call; a sink still takes it.
+    conditionalNewCount = 0;
+    conditionalDtorCount = 0;
+    int bareLhsRead = lookCSLive(new CS(14) ?? borrowNull);
+    bool bareLhsClean = bareLhsRead == 14 && conditionalNewCount == 1 && conditionalDtorCount == 1;
+    conditionalNewCount = 0;
+    conditionalDtorCount = 0;
+    int bareArmRead = lookCSLive(c > 0 ? new CS(15) ?? borrowNull : nullptr);
+    bareLhsClean = bareLhsClean && bareArmRead == 15 && conditionalDtorCount == 1;
+    conditionalNewCount = 0;
+    conditionalDtorCount = 0;
+    conditionalKeep = nullptr;
+    int bareSinkValue = takeConditionalCS(c > 0 ? new CS(16) ?? sinkNull : nullptr);
+    bareLhsClean = bareLhsClean && bareSinkValue == 16 && conditionalKeep != nullptr
+        && conditionalDtorCount == 0;
+    delete conditionalKeep;
+    conditionalKeep = nullptr;
+    passed += Test("conditional_new_coalesce_bare_new_lhs",
+        bareLhsClean && conditionalNewCount == 1 && conditionalDtorCount == 1 ? 1 : 0, 1);
+    total++;
+
+    // A callee that keeps the joined pointer keeps every arm's `new` alive, as for a bare `new`.
+    conditionalNewCount = 0;
+    conditionalDtorCount = 0;
+    bool keptClean = true;
+    int keptValue = 17;
+    function<void(CS*)> storeCSPtr = storeCS;
+    while (keptValue <= 21)
+    {
+        conditionalDtorCount = 0;
+        if (keptValue == 17) storeCS(new CS(17) ?? borrowNull);
+        else if (keptValue == 18) storeCS(c > 0 ? new CS(18) ?? borrowNull : borrowNull);
+        else if (keptValue == 19) storeCS(borrowNull ?? new CS(19));
+        // An indirect call has no body to prove a borrow either.
+        else if (keptValue == 20) storeCSPtr(c > 0 ? new CS(20) ?? borrowNull : borrowNull);
+        else storeCSPtr(new CS(21) ?? borrowNull);
+        // Freed by the caller: the stored pointer dangles, so skip the delete.
+        if (conditionalDtorCount != 0) keptClean = false;
+        else
+        {
+            keptClean = keptClean && conditionalStored->v == keptValue;
+            delete conditionalStored;
+        }
+        keptValue = keptValue + 1;
+    }
+    conditionalStored = nullptr;
+    passed += Test("conditional_new_coalesce_escaping_callee_keeps_arm",
+        keptClean && conditionalNewCount == 5 ? 1 : 0, 1);
+    total++;
+
+    conditionalNewCount = 0;
+    conditionalDtorCount = 0;
+    int returnFallback = 0;
+    int returnCoalesceRead = returnCoalesceArm(&returnFallback);
+    bool returnCoalesceClean = returnCoalesceRead == 20 && conditionalDtorCount == 1;
+    conditionalDtorCount = 0;
+    int returnTernaryRead = returnTernaryArm(&returnFallback);
+    passed += Test("conditional_new_arm_in_return_call_freed",
+        returnCoalesceClean && returnTernaryRead == 21 && conditionalNewCount == 2
+            && conditionalDtorCount == 1 ? 1 : 0, 1);
+    total++;
+
     printf("\n%d / %d tests passed.\n", passed, total);
     return passed == total ? 0 : 1;
 }
@@ -12944,7 +13053,9 @@ int testChainedPointerAssignment()
     dtorCount = 0;
     {
         Resource* p = nullptr;
-        int got = setAndReadChainedAssign(p = new Resource());
+        // Assign first: an assignment as a call argument is refused (ruling 2026-09-27).
+        p = new Resource();
+        int got = setAndReadChainedAssign(p);
         passed += Test("cpa_call_argument_value", got, 85);
         passed += Test("cpa_call_argument_no_early_dtor", dtorCount, 0);
     }

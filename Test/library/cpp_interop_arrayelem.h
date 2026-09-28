@@ -12,6 +12,16 @@ inline void reset() { ctor_slot() = 0; dtor_slot() = 0; }
 inline int ctor_count() { return ctor_slot(); }
 inline int dtor_count() { return dtor_slot(); }
 
+inline int& itw_make_slot() { static int n = 0; return n; }
+inline int& itw_arg_slot() { static int n = 0; return n; }
+inline void itw_reset() { itw_make_slot() = 0; itw_arg_slot() = 0; }
+inline int itw_make_count() { return itw_make_slot(); }
+inline int itw_arg_count() { return itw_arg_slot(); }
+struct ItwArg { int v; ItwArg(long n) : v((int)n) {} };
+struct ItwResult { int v; ItwResult(int n) : v(n) {} ~ItwResult() {} };
+inline ItwArg itw_arg(long n) { ++itw_arg_slot(); return ItwArg(n); }
+inline ItwResult itw_make(ItwArg arg) { ++itw_make_slot(); return ItwResult(arg.v); }
+
 // Nontrivial default constructor AND destructor - the construct/destroy asymmetry.
 struct Trk { int v; Trk() : v(7) { ++ctor_slot(); } ~Trk() { ++dtor_slot(); } };
 

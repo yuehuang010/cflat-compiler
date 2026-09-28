@@ -8,6 +8,17 @@ class N : IF { int f(int a, int b) { return a * 10 + b; } };
 
 int freeFn(int a, int b) { return a * 10 + b; }
 
+// Ruling 2026-09-27: an assignment used directly as a call argument is refused for every
+// callee kind (pre-fix every leg below compiled and ran, passing the assigned value).
+extern int abs(int v);
+int asaOne(int a) { return a * 10; }
+T asaGen<T>(T a) { return a + 1; }
+struct AsaBox { int v = 0; AsaBox(int x) { v = x; } int m(int a) { return a + v; } int gm<U>(U a) { return (int)a + v; } };
+struct AsaPt { int x = 0; int y = 0; };
+int asaPtSum(AsaPt p) { return p.x * 10 + p.y; }
+struct AsaP { int v = 0; AsaP(int x) { v = x; } AsaP operator+(AsaP o) { return AsaP(v + o.v); } };
+namespace asans { int nf(int a) { return a + 7; } }
+
 extern int main()
 {
     N n;
@@ -21,6 +32,140 @@ extern int main()
     // Direct call: the same rejection, from the same place.
     expect_error("duplicate named argument 'b'") {
         int viaDirect = freeFn(b: 1, b: 2);
+    }
+
+    expect_error("an assignment cannot be used as a call argument; assign first, then pass 'i'") { // free
+        int i = 1;
+        int r = asaOne(i = 3);
+    }
+    expect_error("an assignment cannot be used as a call argument; assign first, then pass 'i'") { // +=
+        int i = 1;
+        int r = asaOne(i += 3);
+    }
+    expect_error("an assignment cannot be used as a call argument; assign first, then pass 'i'") { // <<=
+        int i = 1;
+        int r = asaOne(i <<= 2);
+    }
+    expect_error("an assignment cannot be used as a call argument; assign first, then pass 'i'") { // parenthesised
+        int i = 1;
+        int r = asaOne((i = 4));
+    }
+    expect_error("an assignment cannot be used as a call argument; assign first, then pass 'i'") { // double parens
+        int i = 1;
+        int r = asaOne(((i -= 4)));
+    }
+    expect_error("an assignment cannot be used as a call argument; assign first, then pass 'j'") { // chained
+        int i = 1;
+        int j = 0;
+        int r = asaOne(j = i = 5);
+    }
+    expect_error("an assignment cannot be used as a call argument; assign first, then pass 'i'") { // generic
+        int i = 1;
+        int r = asaGen<int>(i = 6);
+    }
+    expect_error("an assignment cannot be used as a call argument; assign first, then pass 'i'") { // method
+        int i = 1;
+        AsaBox b = AsaBox(2);
+        int r = b.m(i = 7);
+    }
+    expect_error("an assignment cannot be used as a call argument; assign first, then pass 'i'") { // interface
+        int i = 1;
+        int r = io.f(i = 7, 2);
+    }
+    expect_error("an assignment cannot be used as a call argument; assign first, then pass 'i'") { // constructor
+        int i = 1;
+        AsaBox b = AsaBox(i = 8);
+    }
+    expect_error("an assignment cannot be used as a call argument; assign first, then pass 'i'") { // new
+        int i = 1;
+        AsaBox* h = new AsaBox(i = 9);
+    }
+    expect_error("an assignment cannot be used as a call argument; assign first, then pass 'i'") { // funcptr
+        int i = 1;
+        function<int(int)> fp = asaOne;
+        int r = fp(i = 10);
+    }
+    expect_error("an assignment cannot be used as a call argument; assign first, then pass 'i'") { // operator operand ctor
+        int i = 1;
+        AsaP a = AsaP(1);
+        AsaP r = a + AsaP(i = 11);
+    }
+    expect_error("an assignment cannot be used as a call argument; assign first, then pass 'i'") { // operator string
+        int i = 1;
+        string os = operator string(i = 21);
+    }
+    expect_error("an assignment cannot be used as a call argument; assign first, then pass 'i'") { // namespaced
+        int i = 1;
+        int r = asans.nf(i = 12);
+    }
+    expect_error("an assignment cannot be used as a call argument; assign first, then pass 'i'") { // named argument
+        int i = 1;
+        int r = freeFn(b: i = 13, a: 1);
+    }
+    expect_error("an assignment cannot be used as a call argument; assign first, then pass 'i'") { // extern C
+        int i = 1;
+        int r = abs(i = -3);
+    }
+    expect_error("an assignment cannot be used as a call argument; assign first, then pass 'i'") { // builtin printf
+        int i = 1;
+        printf("%d\n", i = 14);
+    }
+    expect_error("an assignment cannot be used as a call argument; assign first, then pass 'i'") { // pointer call p->m
+        int i = 1;
+        AsaBox* p = new AsaBox(2);
+        int r = p->m(i = 3);
+    }
+    expect_error("an assignment cannot be used as a call argument; assign first, then pass 'i'") { // null-conditional p?.m
+        int i = 1;
+        AsaBox* p = new AsaBox(2);
+        int r = p?.m(i = 3) ?? 0;
+    }
+    expect_error("an assignment cannot be used as a call argument; assign first, then pass 'i'") { // generic method o.gm<int>
+        int i = 1;
+        AsaBox b = AsaBox(2);
+        int r = b.gm<int>(i = 3);
+    }
+    expect_error("an assignment cannot be used as a call argument; assign first, then pass 'i'") { // lambda local invocation
+        int i = 1;
+        Lambda<int(int)> fn = (int x) => x + 1;
+        int r = fn(i = 3);
+    }
+    expect_error("an assignment cannot be used as a call argument; assign first, then pass 'i'") { // under a cast
+        int i = 1;
+        int r = asaOne((int)(i = 3));
+    }
+    expect_error("an assignment cannot be used as a call argument; assign first, then pass 'i'") { // ternary arm
+        int i = 1;
+        bool c = true;
+        int r = asaOne(c ? (i = 4) : 0);
+    }
+    expect_error("an assignment cannot be used as a call argument; assign first, then pass 'i'") { // arithmetic operand
+        int i = 1;
+        int a = 2;
+        int r = asaOne(a + (i = 2));
+    }
+    expect_error("an assignment cannot be used as a call argument; assign first, then pass 'i'") { // array index
+        int i = 1;
+        int[3] arr = {1, 2, 3};
+        int r = asaOne(arr[i = 1]);
+    }
+    expect_error("an assignment cannot be used as a call argument; assign first, then pass 'p'") { // member access on assignment result
+        int i = 1;
+        AsaBox* p = nullptr;
+        AsaBox* q = new AsaBox(5);
+        int r = asaOne((p = q)->v);
+    }
+    expect_error("an assignment cannot be used as a call argument; assign first, then pass 'i'") { // brace-init argument field
+        int i = 1;
+        int r = asaPtSum({x = (i = 3), y = 1});
+    }
+    expect_error("an assignment cannot be used as a call argument; assign first, then pass 'i'") { // new-expression argument, nested
+        int i = 1;
+        AsaBox* h = new AsaBox(asaOne(i += 1) + 1);
+    }
+    expect_error("an assignment cannot be used as a call argument; assign first, then pass 'i'") { // nested call arg
+        int i = 1;
+        int r = asaOne(asaOne(i *= 2));
     }
 
     return 0;

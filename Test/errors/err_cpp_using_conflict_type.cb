@@ -1,0 +1,8 @@
+// `using cppuc_src::E;` in one import and `enum class E` in the same namespace in another: two
+// entities under one name. Import-time error, either import order (value half:
+// err_cpp_using_conflict_value.cb, which imports the other way round).
+expect_error("'cppuc.E' is an alias of 'cppuc_src.E' in 'cpp_interop_using_conflict_type.h' but an enum in 'cpp_interop_using_conflict_own.h'");
+import cpp "cpp_interop_using_conflict_own.h";
+import cpp "cpp_interop_using_conflict_type.h";
+
+extern int main() { return 0; }

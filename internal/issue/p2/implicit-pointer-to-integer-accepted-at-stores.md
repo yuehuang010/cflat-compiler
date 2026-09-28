@@ -7,6 +7,9 @@ integer -> pointer direction is enforced everywhere (`IsImplicitPrimitiveToPoint
 returns - but pointer -> integer compiles silently at every store position. Maintainer ruling
 2026-09-26: an oversight, an explicit cast is required.
 
+Correction: a C++ `int` call parameter does NOT reject an `int*` argument - it fails module
+verification instead; see `cpp-pointer-argument-into-int-parameter-fails-verification.md`.
+
 This is what let `internal/issue/p2/cpp-scalar-rvalue-reference-return-reads-address.md` produce a
 stack address as a `long` with no diagnostic: the `long&&` C++ return maps to `long*`, and
 `long n = s.take();` took the pointer as a number.

@@ -132,3 +132,17 @@ inline int stropTail(const std::string& s)
 { return s.empty() ? -1 : (int)(unsigned char)s[s.size() - 1]; }
 
 }
+
+// Free operators whose right operand is a pointer of a SPECIFIC depth (`char**` vs `const char*`)
+// or an enum class beside `int`: the operand's own depth / enum type picks the overload.
+namespace cppsopd {
+struct Tally { int v = 0; };
+enum class Pick { A = 1, B = 2 };
+inline int operator-(const Tally& t, char** pp) { return t.v - (int)(*pp)[0]; }
+inline int operator-(const Tally& t, const char* p) { return t.v - (int)p[0] + 100000; }
+inline int operator+(const Tally& t, int x) { return t.v + x + 1000; }
+inline int operator+(const Tally& t, Pick p) { return t.v + (int)p * 10; }
+// Only a `char**` overload: a `char*` row must be refused, as clang does.
+struct Deep { int v = 0; };
+inline int operator-(const Deep& d, char** pp) { return d.v - (int)(*pp)[0]; }
+}

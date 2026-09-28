@@ -1,6 +1,5 @@
 // GUARDS: functional tensor operations, NoGradGuard, serialization, and tensor utilities.
 // FROM: scratch/ladder/torch/t17.cb
-// DISABLED: internal/issue/p2/cpp-ctor-thunk-binds-const-ref-to-by-value-param.md
 import cpp "torch/torch.h";
 extern int printf(const char* fmt, ...);
 int leg_t17()
@@ -39,6 +38,11 @@ int leg_t17()
     if (msum != 8.0) { printf("FAIL t17 msum: got %f want 8.0\n", msum); failures++; }
     if (vsize != 4) { printf("FAIL t17 vsize: got %ld want 4\n", vsize); failures++; }
     if (udim != 3) { printf("FAIL t17 udim: got %ld want 3\n", udim); failures++; }
+    // A named local reaches IntArrayRef through the ctor thunk; its view must not dangle.
+    long four = 4;
+    at.Tensor vl = o.view(four);
+    long vlsize = vl.size(0);
+    if (vlsize != 4) { printf("FAIL t17 vlsize: got %ld want 4\n", vlsize); failures++; }
 
     at.Tensor w = torch.ones(sq2) * 4.0;
     torch.save(w, "t17.pt");

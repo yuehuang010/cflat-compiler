@@ -734,7 +734,7 @@ namespace cflat_cinterop
             std::vector<CxxMacroProbe> probes;   // index == probe slot
             std::unordered_set<unsigned> emittedProbes;  // probe slots that produced a RawMacro
             std::unordered_set<std::string> emittedGlobals;  // dedup global var redeclarations by name
-            std::unordered_set<const UsingDecl*> emittedUsingDecls;
+            std::unordered_set<const BaseUsingDecl*> emittedUsingDecls;
             std::unordered_set<std::string> emittedOpaqueForward;  // dedup opaque forward-decl records by tag
             std::unordered_set<const RecordDecl*> emittedDefinedRecords;
             std::unordered_set<std::string> emittedRequestedRecords;
@@ -1233,8 +1233,10 @@ namespace cflat_cinterop
 
             bool VisitClassTemplateDecl(ClassTemplateDecl* ctd)
             {
-                if (!st.req.cxxMode || ctd == nullptr
-                    || !ctd->getDeclContext()->isTranslationUnit())
+                // Namespace-scope templates too: a dotted name only feeds the backend's
+                // cross-import conflict check, a TU-scope one is also a published group name.
+                if (!st.req.cxxMode || ctd == nullptr || ctd->isInvalidDecl()
+                    || !ctd->getDeclContext()->isFileContext())
                     return true;
                 std::string file;
                 int line = 1, col = 0;
@@ -1367,6 +1369,10 @@ namespace cflat_cinterop
             {
                 if (!st.req.cxxMode || usd == nullptr || usd->isInvalidDecl()) return true;
                 if (usd->getDeclContext()->isRecord()) return true;
+                // A function-request walk harvests only functions, so the type and value
+                // publishers below would add entries that walk never otherwise produces.
+                if (st.req.cxxFunctionWrapperNames.empty() && PublishUsingShadowAlias(usd))
+                    return true;
                 auto* target = llvm::dyn_cast<FunctionDecl>(usd->getTargetDecl());
                 if (target == nullptr || llvm::isa<CXXMethodDecl>(target)) return true;
                 const std::string aliasName = CxxQualifiedName(usd);
@@ -1427,9 +1433,97 @@ namespace cflat_cinterop
                 return true;
             }
 
-            // The shadows a using-declaration introduces are IMPLICIT decls, which the recursive
-            // visitor skips; reach them from the explicit UsingDecl instead.
+            /*
+             * `namespace a { using b::E; }` makes `a::E` a second spelling of `b::E`, never a new
+             * entity. Publish it the way the equivalent alias declaration would be: an enum or a
+             * typedef-name as a typedef `a.E` of the original type (so `a.E.Member` and `b.E`
+             * stay one type), an enumerator (`using b::Red;`, `using enum b::E;`) as a second
+             * constant spelling, a variable as a second name for the same linkage symbol.
+             * Records are not bound: `a.S` already resolves to the original record through the
+             * type-request path; the pair is only recorded in classUsings for the backend's
+             * cross-import conflict check. Returns true when the shadow was a kind handled here.
+             */
+            bool PublishUsingShadowAlias(UsingShadowDecl* usd)
+            {
+                NamedDecl* target = usd->getTargetDecl();
+                const bool isType = llvm::isa<EnumDecl>(target)
+                    || (llvm::isa<TypedefNameDecl>(target)
+                        && !(llvm::isa<TypeAliasDecl>(target)
+                             && llvm::cast<TypeAliasDecl>(target)->getDescribedAliasTemplate()));
+                const bool isValue = llvm::isa<EnumConstantDecl>(target) || llvm::isa<VarDecl>(target);
+                const bool isClass = llvm::isa<RecordDecl>(target) || llvm::isa<ClassTemplateDecl>(target);
+                if (!isType && !isValue && !isClass) return false;
+                const std::string aliasName = CxxQualifiedName(usd);
+                if (!IsValidDottedName(aliasName) || target->isInvalidDecl()) return true;
+                if (aliasName == CxxQualifiedName(target)) return true;
+                for (const DeclContext* dc = usd->getDeclContext(); dc != nullptr; dc = dc->getParent())
+                {
+                    if (dc->isFunctionOrMethod()) return true;
+                    if (const auto* ns = llvm::dyn_cast<NamespaceDecl>(dc);
+                        ns != nullptr && ns->isAnonymousNamespace())
+                        return true;
+                }
+                if (isClass)
+                {
+                    // `a.S` already resolves to the original record; record the pair so the
+                    // backend can diagnose a different `a.S` bound by another import.
+                    const NamedDecl* t = target;
+                    if (const auto* ctd = llvm::dyn_cast<ClassTemplateDecl>(target))
+                        t = ctd->getTemplatedDecl();
+                    const std::string targetName = CxxQualifiedName(t);
+                    if (IsValidDottedName(targetName))
+                        st.out.classUsings.emplace_back(aliasName, targetName);
+                    return true;
+                }
+                if (isType)
+                {
+                    QualType u = ctx.getTypeDeclType(llvm::cast<TypeDecl>(target));
+                    if (u.isNull() || u->isDependentType()) return true;
+                    RawTypedef t;
+                    t.name = usd->getNameAsString();
+                    t.qualifiedName = aliasName;
+                    if (!LocOf(usd, t.file, t.line, t.col)) return true;
+                    FillTypedefUnderlying(u, t);
+                    st.out.typedefs.push_back(std::move(t));
+                    return true;
+                }
+                if (auto* ec = llvm::dyn_cast<EnumConstantDecl>(target))
+                {
+                    std::string file; int line = 1, col = 0;
+                    if (!LocOf(usd, file, line, col)) return true;
+                    RawEnum e;
+                    if (!FillRawEnum(ec, e)) return true;
+                    e.name = aliasName;
+                    st.out.enums.push_back(std::move(e));
+                    return true;
+                }
+                auto* vd = llvm::cast<VarDecl>(target);
+                if (!vd->isFileVarDecl() || vd->isStaticDataMember()) return true;
+                const std::string targetName = CxxQualifiedName(vd);
+                auto findTarget = [&]() -> const RawGlobalVar* {
+                    for (const RawGlobalVar& g : st.out.globals)
+                        if (g.qualifiedName == targetName) return &g;
+                    return nullptr;
+                };
+                if (findTarget() == nullptr) HarvestCxxNamespaceVar(vd);
+                const RawGlobalVar* original = findTarget();
+                if (original == nullptr || !st.emittedGlobals.insert(aliasName).second) return true;
+                RawGlobalVar g = *original;
+                g.qualifiedName = aliasName;
+                st.out.globals.push_back(std::move(g));
+                return true;
+            }
+
+            // The shadows a using-declaration (or C++20 `using enum`) introduces are IMPLICIT
+            // decls, which the recursive visitor skips; reach them from the explicit decl instead.
             bool VisitUsingDecl(UsingDecl* ud)
+            {
+                if (ud == nullptr || !st.emittedUsingDecls.insert(ud).second) return true;
+                for (UsingShadowDecl* shadow : ud->shadows()) VisitUsingShadowDecl(shadow);
+                return true;
+            }
+
+            bool VisitUsingEnumDecl(UsingEnumDecl* ud)
             {
                 if (ud == nullptr || !st.emittedUsingDecls.insert(ud).second) return true;
                 for (UsingShadowDecl* shadow : ud->shadows()) VisitUsingShadowDecl(shadow);
@@ -1492,13 +1586,12 @@ namespace cflat_cinterop
                 return true;
             }
 
-            bool VisitEnumConstantDecl(EnumConstantDecl* ec)
+            // The enumerator's own record (type, value, source position) under its bare name.
+            bool FillRawEnum(EnumConstantDecl* ec, RawEnum& e)
             {
-                if (!ec->getIdentifier()) return true;
+                if (!ec->getIdentifier()) return false;
                 std::string file; int line = 1, col = 0;
-                if (!LocOf(ec, file, line, col)) return true;
-
-                RawEnum e;
+                if (!LocOf(ec, file, line, col)) return false;
                 e.name = ec->getNameAsString();
                 const auto* ed = llvm::dyn_cast<EnumDecl>(ec->getDeclContext());
                 if (st.req.cxxMode)
@@ -1514,9 +1607,28 @@ namespace cflat_cinterop
                         e.isScoped = ed->isScoped();
                     }
                 }
+                else if (ed != nullptr && ed->getIdentifier())
+                {
+                    e.enumType = ed->getNameAsString();
+                    e.underlyingType = CanonicalSpelling(ctx, ed->getIntegerType());
+                }
+                // `typedef enum { ... } Name;` - clang spells the anonymous enum by its typedef name.
+                else if (const auto* td = ed != nullptr ? ed->getTypedefNameForAnonDecl() : nullptr)
+                {
+                    e.enumType = td->getNameAsString();
+                    e.underlyingType = CanonicalSpelling(ctx, ed->getIntegerType());
+                }
                 e.value = ApsIntToLongLong(ec->getInitVal());
                 e.file = file; e.line = line; e.col = col;
                 e.physicalFile = PhysicalFileOf(ec, file);
+                return true;
+            }
+
+            bool VisitEnumConstantDecl(EnumConstantDecl* ec)
+            {
+                RawEnum e;
+                if (!FillRawEnum(ec, e)) return true;
+                const auto* ed = llvm::dyn_cast<EnumDecl>(ec->getDeclContext());
                 // C++ mode also publishes the QUALIFIED spelling, so a scoped or class-nested
                 // enumerator is reachable as it is written in C++ ("ns.Cls.Kind.One") rather than
                 // only under a bare name that could collide across namespaces. The unqualified
@@ -1609,6 +1721,9 @@ namespace cflat_cinterop
                                 nested.physicalFile = PhysicalFileOf(anon, nf);
                             }
                             CollectFields(anon, synTag, nested);
+                            const ASTRecordLayout& nestedLayout = ctx.getASTRecordLayout(anon);
+                            nested.sizeBytes = nestedLayout.getSize().getQuantity();
+                            nested.alignBytes = nestedLayout.getAlignment().getQuantity();
                             st.out.records.push_back(std::move(nested));
 
                             RawField fe;
@@ -1624,6 +1739,7 @@ namespace cflat_cinterop
                     RawField rf;
                     rf.name = f->getNameAsString();
                     rf.access = MapAccess(f->getAccess());
+                    rf.isZeroSize = f->isZeroSize(ctx);
                     rf.offsetBytes = layout.getFieldOffset(f->getFieldIndex()) / 8;
                     RecordRawFieldLayout(f->getType(), rf);
                     // A reference member is a pointer-sized slot in every ABI cflat targets, and
@@ -1672,6 +1788,9 @@ namespace cflat_cinterop
                             nested.physicalFile = PhysicalFileOf(nrd, nf);
                         }
                         CollectFields(nrd, synTag, nested);
+                        const ASTRecordLayout& nestedLayout = ctx.getASTRecordLayout(nrd);
+                        nested.sizeBytes = nestedLayout.getSize().getQuantity();
+                        nested.alignBytes = nestedLayout.getAlignment().getQuantity();
                         st.out.records.push_back(std::move(nested));
 
                         rf.ctype = (isUnion ? "union " : "struct ") + synTag
@@ -1723,11 +1842,32 @@ namespace cflat_cinterop
                                || cxx->needsImplicitCopyConstructor()
                                || cxx->hasUserDeclaredCopyConstructor();
                 for (const Decl* d : cxx->decls())
-                    if (const auto* ftd = llvm::dyn_cast<FunctionTemplateDecl>(d);
-                        ftd != nullptr && ftd->getAccess() == AS_public
-                        && llvm::isa<CXXConstructorDecl>(ftd->getTemplatedDecl())
-                        && !ftd->getTemplatedDecl()->isDeleted())
+                {
+                    const auto* ftd = llvm::dyn_cast<FunctionTemplateDecl>(d);
+                    const auto* ctor = ftd != nullptr
+                        ? llvm::dyn_cast<CXXConstructorDecl>(ftd->getTemplatedDecl()) : nullptr;
+                    if (ctor == nullptr) continue;
+                    if (ftd->getAccess() == AS_public && !ctor->isDeleted())
                         rec.hasCtorTemplate = true;
+                    // Every constructor template, as written, for the overload mirror.
+                    RawCxxCtorTemplate ct;
+                    PrintingPolicy pp = ctx.getPrintingPolicy();
+                    pp.FullyQualifiedName = true;
+                    pp.SuppressScope = false;
+                    llvm::raw_string_ostream head(ct.head);
+                    ftd->getTemplateParameters()->print(head, ctx, pp);
+                    head.flush();
+                    for (const ParmVarDecl* p : ctor->parameters())
+                    {
+                        ct.paramTypes.push_back(p->getType().getAsString(pp));
+                        ct.defaulted.push_back(p->hasDefaultArg() ? 1 : 0);
+                    }
+                    ct.variadic = ctor->isVariadic();
+                    ct.isDeleted = ctor->isDeleted();
+                    ct.isExplicit = ctor->isExplicit();
+                    ct.access = MapAccess(ftd->getAccess());
+                    rec.ctorTemplates.push_back(std::move(ct));
+                }
                 rec.isAggregate = cxx->isAggregate();
 
                 /*
@@ -2061,8 +2201,13 @@ namespace cflat_cinterop
                         md->getTemplateSpecializationKind() == clang::TSK_ImplicitInstantiation
                             && !md->isPureVirtual()
                         ? md->getTemplateInstantiationPattern() : nullptr;
+                    // `inline` may sit only on a later out-of-class definition (simdjson's -inl
+                    // section): the in-class declaration alone does not say so.
+                    const FunctionDecl* memberDefinition = md->getDefinition();
+                    const bool inlineMember = md->isInlined()
+                        || (memberDefinition != nullptr && memberDefinition->isInlined());
                     m.needsLocalDefinition = md->isImplicit() || md->isDefaulted()
-                                          || md->isInlined()
+                                          || inlineMember
                                           || (pattern != nullptr && pattern->isDefined());
                     // Structors on Itanium/Darwin hand 'this' back; the caller ignores it, so the
                     // declaration carries a void* result rather than a mistyped void.
@@ -2138,8 +2283,11 @@ namespace cflat_cinterop
                     // LSP has no CodeGen module, so assume every header-defined member has a
                     // callable declaration. A real compile still proves the body below.
                     if (st.req.assumeInlineDefinitions && !st.req.emitDefinitions
-                        && (md->isInlined() || md->isImplicit() || md->isDefaulted()))
+                        && (inlineMember || md->isImplicit() || md->isDefaulted()))
+                    {
+                        m.definitionAssumed = m.needsLocalDefinition;
                         m.needsLocalDefinition = false;
+                    }
                     // A template PATTERN is not a symbol: it exists only so the type request's
                     // stub can name the signature. Leave it with no linkage name (refused at any
                     // use site) - stage 2 replaces it with the instantiated specialization.
@@ -2318,6 +2466,7 @@ namespace cflat_cinterop
                     RawField rf;
                     rf.name = f->getNameAsString();
                     rf.ctype = CanonicalSpelling(ctx, f->getType());
+                    rf.isZeroSize = f->isZeroSize(ctx);
                     rf.offsetBytes = baseOff + layout.getFieldOffset(idx) / 8;
                     RecordRawFieldLayout(f->getType(), rf);
                     rf.access = MapAccess(f->getAccess());
@@ -2352,8 +2501,10 @@ namespace cflat_cinterop
                 int synth = 0;
                 if (!FlattenCxxLayout(cxx, 0, true, ownNames, /*isOutermost*/ true, taken, synth, rec))
                     return false;
-                std::stable_sort(rec.fields.begin(), rec.fields.end(),
-                    [](const RawField& a, const RawField& b) { return a.offsetBytes < b.offsetBytes; });
+                if (std::none_of(rec.fields.begin(), rec.fields.end(),
+                        [](const RawField& f) { return f.isZeroSize; }))
+                    std::stable_sort(rec.fields.begin(), rec.fields.end(),
+                        [](const RawField& a, const RawField& b) { return a.offsetBytes < b.offsetBytes; });
                 return true;
             }
 
@@ -2513,7 +2664,18 @@ namespace cflat_cinterop
                 else if (st.req.cxxMode && !rec.name.empty())
                 {
                     if (rd->isInAnonymousNamespace()) return;
-                    rec.qualifiedName = CxxQualifiedName(rd);
+                    if (const auto* cxx = llvm::dyn_cast<CXXRecordDecl>(rd))
+                    {
+                        if (const auto* spec = llvm::dyn_cast<ClassTemplateSpecializationDecl>(cxx);
+                            spec != nullptr
+                            && spec->getSpecializationKind() == TSK_ExplicitSpecialization)
+                            rec.qualifiedName = CxxForeignIdentity(CanonicalSpelling(
+                                ctx, ctx.getCanonicalTagType(rd)));
+                        else
+                            rec.qualifiedName = CxxQualifiedName(rd);
+                    }
+                    else
+                        rec.qualifiedName = CxxQualifiedName(rd);
                     if (!IsValidDottedName(rec.qualifiedName)) return;
                     rec.name = rec.qualifiedName;
                 }
@@ -2889,12 +3051,6 @@ namespace cflat_cinterop
                     return true;
                 std::string name = td->getNameAsString();
                 QualType u = td->getUnderlyingType();
-                std::string sugared = u.getAsString(ctx.getPrintingPolicy());
-                std::string canon = u.getCanonicalType().getAsString(ctx.getPrintingPolicy());
-                // Prefer the canonical underlying (chases HANDLE -> void *); but for the
-                // `typedef enum {} X;` self-referential shape clang canonicalizes to the typedef
-                // name itself ("ML_Mode"), so fall back to the sugared spelling ("enum ML_Mode")
-                // which the mapper strips to int. Mirrors the old CollectCTypedefsLibclang.
                 RawTypedef t;
                 t.name = name;
                 t.qualifiedName = st.req.cxxMode ? CxxQualifiedName(td) : name;
@@ -2906,6 +3062,21 @@ namespace cflat_cinterop
                     t.isAnonymousRecord = rd->isStruct() && !rd->getIdentifier()
                                        && rd->getTypedefNameForAnonDecl() == td;
                 }
+                FillTypedefUnderlying(u, t);
+                st.out.typedefs.push_back(std::move(t));
+                QueueFunctionPointerAbi(st, ctx, u);
+                return true;
+            }
+
+            void FillTypedefUnderlying(QualType u, RawTypedef& t)
+            {
+                const std::string& name = t.name;
+                std::string sugared = u.getAsString(ctx.getPrintingPolicy());
+                std::string canon = u.getCanonicalType().getAsString(ctx.getPrintingPolicy());
+                // Prefer the canonical underlying (chases HANDLE -> void *); but for the
+                // `typedef enum {} X;` self-referential shape clang canonicalizes to the typedef
+                // name itself ("ML_Mode"), so fall back to the sugared spelling ("enum ML_Mode")
+                // which the mapper strips to int. Mirrors the old CollectCTypedefsLibclang.
                 if (!canon.empty() && canon != name) t.underlying = canon;
                 else if (!sugared.empty())           t.underlying = sugared;
                 else                                  t.underlying = canon;
@@ -2916,9 +3087,6 @@ namespace cflat_cinterop
                         if (t.cxxSpecialization.rfind(prefix, 0) == 0)
                             t.cxxSpecialization.erase(0, std::strlen(prefix));
                 }
-                st.out.typedefs.push_back(std::move(t));
-                QueueFunctionPointerAbi(st, ctx, u);
-                return true;
             }
 
             /*
@@ -4503,6 +4671,34 @@ namespace cflat_cinterop
                 std::unordered_set<const FunctionDecl*> seen;
 
                 explicit UsedFunctionVisitor(std::vector<const FunctionDecl*>& w) : work(w) {}
+                // Track referenced variables whose storage this module provides (inline,
+                // static constexpr and instantiated members); strong definitions stay library-owned.
+                const ASTContext* astContext = nullptr;
+                std::vector<const VarDecl*> vars;
+                std::unordered_set<const VarDecl*> varSeen;
+                void AddVariable(const ValueDecl* decl)
+                {
+                    const auto* vd = llvm::dyn_cast_or_null<VarDecl>(decl);
+                    if (vd == nullptr || astContext == nullptr || !vd->hasGlobalStorage()
+                        || vd->isStaticLocal())
+                        return;
+                    const VarDecl* definition = vd->getDefinition();
+                    if (definition == nullptr || definition->isInvalidDecl()
+                        || definition->getType()->isDependentType()
+                        || definition->getDeclContext()->isDependentContext()
+                        || definition->isTemplated())
+                        return;
+                    // A strong definition is exported by the bound library; emitting it here
+                    // would duplicate the symbol.
+                    const GVALinkage linkage = astContext->GetGVALinkageForVariable(definition);
+                    if (linkage != GVA_DiscardableODR && linkage != GVA_Internal) return;
+                    if (varSeen.insert(definition).second) vars.push_back(definition);
+                }
+                bool VisitMemberExpr(MemberExpr* member)
+                {
+                    if (member != nullptr) AddVariable(member->getMemberDecl());
+                    return true;
+                }
                 bool shouldVisitTemplateInstantiations() const { return true; }
                 /*
                  * Clang finds a member body defined INSIDE its class on first reference, so only an
@@ -4552,8 +4748,9 @@ namespace cflat_cinterop
                 }
                 bool VisitDeclRefExpr(DeclRefExpr* ref)
                 {
-                    if (ref != nullptr)
-                        AddFunction(llvm::dyn_cast<FunctionDecl>(ref->getDecl()));
+                    if (ref == nullptr) return true;
+                    AddFunction(llvm::dyn_cast<FunctionDecl>(ref->getDecl()));
+                    AddVariable(ref->getDecl());
                     return true;
                 }
                 bool VisitCXXRewrittenBinaryOperator(CXXRewrittenBinaryOperator* op)
@@ -4603,6 +4800,7 @@ namespace cflat_cinterop
                     return true;
                 }
             } usedFunctions(usedFunctionWork);
+            usedFunctions.astContext = &ctx;
             usedFunctions.TraverseDecl(root);
             for (Decl* d : st.requestDecls) usedFunctions.TraverseDecl(d);
             // Members resolved by an earlier chunk are emitted through Phase 2, not announced
@@ -4619,15 +4817,28 @@ namespace cflat_cinterop
              * hidden inline members (libc++ basic_string::__grow_by_without_replace) are lowered
              * here and call further helpers. Close over every reached body clang emits locally.
              */
-            for (size_t i = 0; i < usedFunctions.reach.size(); ++i)
+            // Also walk constructor initializers (not in getBody(): libc++ string_view calls
+            // std::to_address there) and referenced variables' initializers, to a fixpoint.
+            for (size_t i = 0, v = 0;
+                 i < usedFunctions.reach.size() || v < usedFunctions.vars.size();)
             {
+                if (i >= usedFunctions.reach.size())
+                {
+                    const VarDecl* var = usedFunctions.vars[v++];
+                    if (const Expr* init = var->getInit())
+                        usedFunctions.TraverseStmt(const_cast<Expr*>(init));
+                    continue;
+                }
                 const FunctionDecl* body = nullptr;
-                if (!usedFunctions.reach[i]->hasBody(body) || body == nullptr
+                if (!usedFunctions.reach[i++]->hasBody(body) || body == nullptr
                     || body->getType()->isDependentType() || body->isDependentContext()
                     || !usedFunctions.walked.insert(body).second)
                     continue;
                 const GVALinkage linkage = ctx.GetGVALinkageForFunction(body);
                 if (linkage != GVA_DiscardableODR && linkage != GVA_Internal) continue;
+                if (const auto* ctor = llvm::dyn_cast<CXXConstructorDecl>(body))
+                    for (CXXCtorInitializer* init : ctor->inits())
+                        usedFunctions.TraverseConstructorInitializer(init);
                 usedFunctions.TraverseStmt(body->getBody());
             }
             // A prototype or class over an invalid record has no layout to arrange.
@@ -4641,6 +4852,14 @@ namespace cflat_cinterop
             {
                 if (overInvalidRecord(fd)) continue;
                 cg.HandleTopLevelDecl(DeclGroupRef(const_cast<FunctionDecl*>(fd)));
+            }
+            // Registered lazily, like the shared static members above: CodeGen emits the storage
+            // only when a body in this module references it.
+            {
+                std::unordered_set<const VarDecl*> handed(sharedVarWork.begin(),
+                                                          sharedVarWork.end());
+                for (const VarDecl* vd : usedFunctions.vars)
+                    if (handed.insert(vd).second) handOverStaticVar(vd);
             }
             /*
              * A live Interpreter: every specialization an EARLIER chunk instantiated hangs off
@@ -4818,6 +5037,7 @@ namespace cflat_cinterop
             st.out.funcMacros.clear();
             st.out.usingDirectives.clear();
             st.out.namespaceAliases.clear();
+            st.out.classUsings.clear();
             st.out.weakPromoteSymbols.clear();
 
             st.emittedProbes.clear();

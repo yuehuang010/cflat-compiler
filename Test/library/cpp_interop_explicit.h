@@ -204,4 +204,211 @@ struct NewNarrow {
     int v;
     NewNarrow(int x) : v(x) {}
 };
+
+// Converting constructors at the copy-initialization positions (init, assignment, return, field,
+// element, brace element): `T t = u;` means `T t = T(u);` (plan converting-constructors.md).
+// ConvCnt counts constructions and destructions so a double destroy or a leak shows.
+inline int conv_ctors = 0;
+inline int conv_dtors = 0;
+inline void conv_reset() { conv_ctors = 0; conv_dtors = 0; }
+inline int conv_ctor_count() { return conv_ctors; }
+inline int conv_dtor_count() { return conv_dtors; }
+struct ConvCnt {
+    int v = 0;
+    ConvCnt() { ++conv_ctors; }
+    ConvCnt(int x) : v(x) { ++conv_ctors; }
+    ConvCnt(const ConvCnt& o) : v(o.v + 100) { ++conv_ctors; }
+    ConvCnt(ConvCnt&& o) : v(o.v + 1000) { ++conv_ctors; }
+    ConvCnt& operator=(const ConvCnt& o) { v = o.v + 10000; return *this; }
+    ConvCnt& operator=(ConvCnt&& o) { v = o.v + 20000; return *this; }
+    ~ConvCnt() { ++conv_dtors; }
+};
+// A `const char*` converting constructor: a string literal passes its constant pointer.
+struct ConvStr {
+    const char* p = nullptr;
+    int n = 0;
+    ConvStr() = default;
+    ConvStr(const char* s) : p(s) { while (s[n]) ++n; }
+    ConvStr(const ConvStr& o) : p(o.p), n(o.n) {}
+    ConvStr& operator=(const ConvStr& o) { p = o.p; n = o.n + 100; return *this; }
+    ~ConvStr() {}
+};
+// A converting constructor TEMPLATE plus `operator=(ConvVal)` taking its parameter BY VALUE.
+struct ConvVal {
+    long v = 0;
+    ConvVal() = default;
+    template <class T> ConvVal(T x) : v((long)x * 10) {}
+    ConvVal(const ConvVal& o) : v(o.v + 1) {}
+    ConvVal& operator=(ConvVal o) { v = o.v; return *this; }
+    ~ConvVal() {}
+};
+// A direct `operator=(int)` wins over building ConvDirect(int).
+struct ConvDirect {
+    int v = 0;
+    int via = 0;
+    ConvDirect() = default;
+    ConvDirect(int x) : v(x), via(1) {}
+    ConvDirect(const ConvDirect& o) : v(o.v), via(o.via) {}
+    ConvDirect& operator=(const ConvDirect& o) { v = o.v; via = 2; return *this; }
+    ConvDirect& operator=(int x) { v = x; via = 3; return *this; }
+    ~ConvDirect() {}
+};
+// Refusal shapes: explicit, two equal-rank converting constructors, and a chain of two
+// user-defined conversions (const char* -> ConvStr -> ConvChain).
+struct ConvExplicit { int v = 0; ConvExplicit() = default; explicit ConvExplicit(int a) : v(a) {} ~ConvExplicit() {} };
+struct ConvAmb { int v = 0; ConvAmb() = default; ConvAmb(long) : v(1) {} ConvAmb(unsigned long) : v(2) {} ~ConvAmb() {} };
+struct ConvChain { int n = 0; ConvChain() = default; ConvChain(ConvStr s) : n(s.n) {} ~ConvChain() {} };
+// A TEMPLATE `operator=(U)` is an exact match for any source, so it beats T1(int) + copy.
+struct ConvTplAssign {
+    long v = 0;
+    int via = 0;
+    ConvTplAssign() = default;
+    ConvTplAssign(int x) : v(x), via(1) {}
+    ConvTplAssign(const ConvTplAssign& o) : v(o.v), via(o.via) {}
+    ConvTplAssign& operator=(const ConvTplAssign& o) { v = o.v; via = 2; return *this; }
+    template <class U> ConvTplAssign& operator=(U u) { v = (long)u * 3; via = 3; return *this; }
+    ~ConvTplAssign() {}
+};
+// `operator=(double)` is what C++ calls for an int source (standard conversion); CFlat's call
+// rules refuse int -> double, so the int source is refused rather than silently rerouted.
+struct ConvDblAssign {
+    long v = 0;
+    int via = 0;
+    ConvDblAssign() = default;
+    ConvDblAssign(int x) : v(x), via(1) {}
+    ConvDblAssign(const ConvDblAssign& o) : v(o.v), via(o.via) {}
+    ConvDblAssign& operator=(const ConvDblAssign& o) { v = o.v; via = 2; return *this; }
+    ConvDblAssign& operator=(double d) { v = (long)(d * 2); via = 3; return *this; }
+    ~ConvDblAssign() {}
+};
+// Next to a template `operator=(U)`, C++ picks operator=<int> for an int source (an exact
+// match) over `operator=(double)`; that is what runs, no refusal.
+struct ConvDblTplAssign {
+    long v = 0;
+    int via = 0;
+    ConvDblTplAssign() = default;
+    ConvDblTplAssign(int x) : v(x), via(1) {}
+    ConvDblTplAssign(const ConvDblTplAssign& o) : v(o.v), via(o.via) {}
+    ConvDblTplAssign& operator=(const ConvDblTplAssign& o) { v = o.v; via = 2; return *this; }
+    ConvDblTplAssign& operator=(double d) { v = (long)d; via = 3; return *this; }
+    template <class U> ConvDblTplAssign& operator=(U u) { v = (long)u * 5; via = 5; return *this; }
+    ~ConvDblTplAssign() {}
+};
+// `operator=(const char*)` is not viable for an int source, so C++ assigns through
+// ConvPtrAssign(int) + copy-assign.
+struct ConvPtrAssign {
+    long v = 0;
+    int via = 0;
+    ConvPtrAssign() = default;
+    ConvPtrAssign(int x) : v(x), via(1) {}
+    ConvPtrAssign(const ConvPtrAssign& o) : v(o.v), via(o.via) {}
+    ConvPtrAssign& operator=(const ConvPtrAssign& o) { v = o.v * 10; via = 2; return *this; }
+    ConvPtrAssign& operator=(const char* s) { v = 0; via = 3; return *this; }
+    ~ConvPtrAssign() {}
+};
+// `operator=(int&)` binds an int lvalue only; an rvalue int falls back to ConvRefAssign(int) +
+// assignment. ConvRefLongAssign adds `operator=(long)`, which C++ picks for an rvalue.
+struct ConvRefAssign {
+    long v = 0;
+    int via = 0;
+    ConvRefAssign() {}
+    ConvRefAssign(int x) : v(x), via(1) {}
+    ConvRefAssign& operator=(const ConvRefAssign& o) { v = o.v; via = 2; return *this; }
+    ConvRefAssign& operator=(int& x) { v = x; via = 6; return *this; }
+    ConvRefAssign& operator+=(int& x) { v += x; via = 8; return *this; }
+};
+struct ConvRefLongAssign {
+    long v = 0;
+    int via = 0;
+    ConvRefLongAssign() {}
+    ConvRefLongAssign(int x) : v(x), via(1) {}
+    ConvRefLongAssign(const ConvRefLongAssign& o) : v(o.v), via(o.via) {}
+    ConvRefLongAssign& operator=(const ConvRefLongAssign& o) { v = o.v; via = 2; return *this; }
+    ConvRefLongAssign& operator=(int& x) { v = x; via = 6; return *this; }
+    ConvRefLongAssign& operator=(long x) { v = x; via = 7; return *this; }
+    ~ConvRefLongAssign() {}
+};
+// Class-to-class: a moved source binds ConvDstB(ConvSrcA&&) and is modified IN PLACE.
+struct ConvSrcA {
+    int v = 0;
+    ConvSrcA() { ++conv_ctors; }
+    ConvSrcA(int x) : v(x) { ++conv_ctors; }
+    ConvSrcA(const ConvSrcA& o) : v(o.v) { ++conv_ctors; }
+    ConvSrcA(ConvSrcA&& o) : v(o.v) { o.v = -1; ++conv_ctors; }
+    ~ConvSrcA() { ++conv_dtors; }
+};
+struct ConvDstB {
+    int v = 0;
+    int via = 0;
+    ConvDstB() { ++conv_ctors; }
+    ConvDstB(const ConvSrcA& a) : v(a.v), via(1) { ++conv_ctors; }
+    ConvDstB(ConvSrcA&& a) : v(a.v), via(2) { a.v = -7; ++conv_ctors; }
+    ConvDstB(const ConvDstB& o) : v(o.v), via(o.via) { ++conv_ctors; }
+    ConvDstB(ConvDstB&& o) : v(o.v), via(o.via) { ++conv_ctors; }
+    ConvDstB& operator=(const ConvDstB& o) { v = o.v; via = o.via + 10; return *this; }
+    ConvDstB& operator=(ConvDstB&& o) { v = o.v; via = o.via + 20; return *this; }
+    ~ConvDstB() { ++conv_dtors; }
+};
+inline int conv_take_dst(ConvDstB b) { return b.via; }
+// A pointer source into a constructor taking a pointer to a non-class pointee.
+struct ConvPtr { const int* p = nullptr; int set = 0; ConvPtr() = default; ConvPtr(const int* q) : p(q), set(1) {} ~ConvPtr() {} };
+// A pointer ARGUMENT into a class parameter whose converting constructor takes it.
+struct ConvIp { int v = 0; ConvIp(const int* p) : v(*p) {} };
+struct ConvIpB { int v = 0; ConvIpB(const int* p) : v(*p) {} };
+struct ConvIpE { int v = 0; explicit ConvIpE(const int* p) : v(*p) {} };
+struct ConvCp { int n = 0; ConvCp(const char* s) { while (s[n]) ++n; } };
+inline int conv_ip_val(ConvIp c) { return c.v + 100; }
+inline int conv_ip_two(ConvIp a, ConvIp b) { return a.v * 10 + b.v; }
+inline int conv_ip_cref(const ConvPtr& c) { return c.set * 100 + *c.p; }
+inline int conv_ip_exact(ConvIp c) { return 1; }
+inline int conv_ip_exact(const int* p) { return 2; }
+inline int conv_ip_amb(ConvIp c) { return 1; }
+inline int conv_ip_amb(ConvIpB c) { return 2; }
+inline int conv_ip_explicit(ConvIpE c) { return c.v; }
+inline int conv_cp_val(ConvCp c) { return c.n; }
+// A `bool` sibling: C++ takes pointer -> bool (standard) over ConvIp(const int*) (user-defined).
+inline int conv_ip_bool(ConvIp c) { return 1; }
+inline int conv_ip_bool(bool b) { return 2; }
+inline int conv_ip_bool_cref(const ConvPtr& c) { return 1; }
+inline int conv_ip_bool_cref(bool b) { return 2; }
+// The bool sibling is NOT viable on its second argument, so C++ calls the ConvIp overload.
+struct ConvIpOther { int v = 0; };
+inline int conv_ip_oa(ConvIp c, int n) { return c.v + n; }
+inline int conv_ip_oa(bool b, ConvIpOther* o) { return 99; }
+struct ConvIpHost {
+    int base = 1000;
+    ConvIpHost() = default;
+    ConvIpHost(ConvIp c) : base(c.v) {}
+    int add(ConvIp c) const { return base + c.v; }
+    int operator-(ConvIp c) const { return base - c.v; }
+    int pick(ConvIp c) const { return 1; }
+    int pick(bool b) const { return 2; }
+};
+template <class T> struct ConvBox {
+    T v{};
+    int tag = 0;
+    ConvBox() = default;
+    ConvBox(T x) : v(x), tag(1) {}
+    ConvBox(const ConvBox& o) : v(o.v), tag(o.tag) {}
+    ConvBox& operator=(const ConvBox& o) { v = o.v; tag = o.tag + 10; return *this; }
+    ~ConvBox() {}
+};
+
+// Explicit full specializations are harvested by the general record walk. Keep their canonical
+// identities distinct so members and by-value boundaries cannot collapse onto the primary name.
+namespace cppresult {
+struct First {};
+struct Middle {};
+struct Last {};
+template <class T> struct Result;
+template <> struct Result<Last> { int value; Result() : value(303) {} int get() const { return value; } };
+template <> struct Result<Middle> { int value; Result() : value(202) {} int get() const { return value; } };
+template <> struct Result<First> { int value; Result() : value(101) {} int get() const { return value; } };
+struct Factory { Result<Middle> middle() const { return Result<Middle>(); } };
+inline Result<First> first() { return Result<First>(); }
+inline Result<Last> last() { return Result<Last>(); }
+inline int take_first(Result<First> value) { return value.get(); }
+inline int take_middle(Result<Middle> value) { return value.get(); }
+inline int take_last(Result<Last> value) { return value.get(); }
+}
 }

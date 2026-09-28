@@ -693,6 +693,8 @@ llvm::Value* LLVMBackend::CreateIndirectCall(const TypeAndValue& funcPtrType, ll
             }
             lastCallReturnType = retTV;
             auto* result = CreateCallOrInvoke(cFnTy, fnPtr, abiArgs, /*mayUnwind=*/true);
+            // No body to prove the callee borrows: keep `?:` / `??` arm temps it may retain.
+            DropRetainedJoinArmPtrTemps(result);
             if (cxxSretRecipe.hasLowering)
                 ApplyAbiCallAttributes(result, cxxSretRecipe);
             llvm::Value* value = cxxSretReturn
@@ -811,6 +813,7 @@ llvm::Value* LLVMBackend::CreateIndirectCall(const TypeAndValue& funcPtrType, ll
 
         lastCallReturnType = retTV;
         auto* result = CreateCallOrInvoke(invokerTy, fnPtr, fullArgs, /*mayUnwind=*/true);
+        DropRetainedJoinArmPtrTemps(result);
         if (cxxSretRecipe.hasLowering)
             ApplyAbiCallAttributes(result, cxxSretRecipe);
         llvm::Value* value = cxxSretReturn

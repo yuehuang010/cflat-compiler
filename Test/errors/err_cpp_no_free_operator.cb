@@ -1,4 +1,5 @@
 import cpp "cpp_interop_basic.h";
+import cpp "cpp_interop_strop.h";
 
 extern int main()
 {
@@ -6,6 +7,21 @@ extern int main()
         cppi.Pair a = default;
         cppi.Pair b = default;
         cppi.Pair c = a + b;
+    }
+    expect_error("ambiguous") {
+        cppi_inh.OperatorAmbiguous a = cppi_inh.OperatorAmbiguous(1);
+        cppi_inh.OperatorAmbiguous b = cppi_inh.OperatorAmbiguous(2);
+        cppi_inh.OperatorAmbiguous c = a + b;
+    }
+    expect_error("implicit argument conversion refused") {
+        cppi_inh.OperatorHiddenDifferent a = cppi_inh.OperatorHiddenDifferent(1);
+        cppi_inh.OperatorHiddenDifferent b = cppi_inh.OperatorHiddenDifferent(2);
+        cppi_inh.OperatorHidingBase c = a + b;
+    }
+    expect_error("no overload of 'operator+' matches") {
+        cppi_inh.OperatorNameHiding a = default;
+        cppi_inh.OperatorNameHiding b = default;
+        cppi_inh.OperatorNameHidingBase c = a + b;
     }
     // A class with neither operator< nor operator<=> has no rewritten relational candidate.
     expect_error("no operator '<'") {
@@ -23,6 +39,18 @@ extern int main()
     expect_error("has no 'operator++'") {
         cppi.Pair h = default;
         h++;
+    }
+    // A `char*` row never binds a `char**` parameter (clang: invalid operands).
+    expect_error("no overload of 'operator-' matches") {
+        char[4][4] rowsOnly = default;
+        cppsopd.Deep deep;
+        int viaRow = deep - rowsOnly[1];
+    }
+    // A whole `char[4][4]` decays to `char(*)[4]`: neither `char**` nor `const char*` accepts it.
+    expect_error("cannot bind its right operand: the pointer's pointee type is not known here") {
+        char[4][4] rowsAll = default;
+        cppsopd.Tally tally;
+        int viaAll = tally - rowsAll;
     }
     return 0;
 }

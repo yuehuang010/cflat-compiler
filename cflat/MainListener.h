@@ -892,6 +892,8 @@ static std::optional<int64_t> FoldCompileTimeIntLeaf(LLVMBackend* compiler, antl
                     return std::nullopt;
                 return InScannerInt32Range(bytes) ? std::optional<int64_t>(bytes) : std::nullopt;
             }
+            // Any other `sizeof` measures its operand; folding the operand's VALUE would be wrong.
+            if (!n->Sizeof().empty()) return std::nullopt;
             if (n->postfixExpression() != nullptr) return FoldCompileTimeIntLeaf(compiler, n->postfixExpression());
             if (n->unaryOperator() != nullptr && n->castExpression() != nullptr)
             {
@@ -3377,6 +3379,71 @@ private:
     // storage as - a union member's Storage is the union alloca, so the inferred type is wrong.
     struct IncrementWork { int Amount = 0; llvm::Type* ElemType = nullptr; llvm::Type* LoadType = nullptr; };
     std::unordered_map<llvm::Value*, IncrementWork> PlusPlus;
+    /*
+     * Isolates postfix work created while lowering a conditional operand or user call arguments.
+     * Flush() emits only the isolated entries; the outer pending work is restored on exit.
+     */
+    struct BranchPostfixScope
+    {
+        MainListener* self;
+        std::unordered_map<llvm::Value*, IncrementWork> saved;
+        BranchPostfixScope* previousCallScope = nullptr;
+        explicit BranchPostfixScope(MainListener* s)
+            : self(s), previousCallScope(s->activeCallPostfixScope_)
+        {
+            saved.swap(s->PlusPlus);
+            s->activeCallPostfixScope_ = this;
+        }
+        BranchPostfixScope(const BranchPostfixScope&) = delete;
+        BranchPostfixScope& operator=(const BranchPostfixScope&) = delete;
+        void Flush() { self->ProcessPlusPlus(); }
+        ~BranchPostfixScope()
+        {
+            self->activeCallPostfixScope_ = previousCallScope;
+            saved.swap(self->PlusPlus);
+            for (auto& [destination, w] : saved)
+            {
+                auto& outer = self->PlusPlus[destination];
+                outer.Amount += w.Amount;
+                if (outer.ElemType == nullptr) outer.ElemType = w.ElemType;
+                if (outer.LoadType == nullptr) outer.LoadType = w.LoadType;
+            }
+        }
+    };
+    using CallPostfixScope = BranchPostfixScope;
+    BranchPostfixScope* activeCallPostfixScope_ = nullptr;
+    void FlushCallPostfix()
+    {
+        if (activeCallPostfixScope_ != nullptr)
+            activeCallPostfixScope_->Flush();
+        else
+            ProcessPlusPlus();
+    }
+    /*
+     * Isolates the pending postfix ++/-- of the expression being lowered from a function BODY
+     * compiled mid-expression (lambda, first-use generic instantiation, pending struct/method
+     * instantiation): the body's statement flushes must not emit the outer work into it. The
+     * outer work is restored untouched on exit; the body's own leftovers are dropped.
+     */
+    struct PendingPostfixScope
+    {
+        MainListener* self;
+        std::unordered_map<llvm::Value*, IncrementWork> saved;
+        BranchPostfixScope* savedCallScope = nullptr;
+        explicit PendingPostfixScope(MainListener* s)
+            : self(s), savedCallScope(s->activeCallPostfixScope_)
+        {
+            saved.swap(s->PlusPlus);
+            s->activeCallPostfixScope_ = nullptr;
+        }
+        PendingPostfixScope(const PendingPostfixScope&) = delete;
+        PendingPostfixScope& operator=(const PendingPostfixScope&) = delete;
+        ~PendingPostfixScope()
+        {
+            self->PlusPlus.swap(saved);
+            self->activeCallPostfixScope_ = savedCallScope;
+        }
+    };
     bool global_scope = true; // true when parsing an entity in the global scope.
 
     struct PendingGlobalDefaultConstruction
@@ -3676,6 +3743,10 @@ private:
     // before its value is joined with a borrowed consumer.
     bool inCallArgument_ = false;
     int ternaryCallArgumentDepth_ = 0;
+    // Set by an `auto` declaration whose whole initializer is a `?:`; the top conditional takes
+    // it (and clears it) before any operand is parsed, so no nested expression sees it.
+    bool autoDeclTernaryInit_ = false;
+    bool autoDeclTernaryActive_ = false;
     struct CallArgumentScope {
         bool& slot;
         int& ternaryDepth;
@@ -4432,6 +4503,19 @@ public:
                                    const LLVMBackend::DeclTypeAndValue& declType,
                                    const std::string& name, size_t line,
                                    std::vector<std::pair<std::string, llvm::AllocaInst*>>& allocList);
+    /*
+     * `auto x = <lvalue of foreign nontrivial C++ class T>` after the initializer is evaluated:
+     * behaves as `T x = <lvalue>` - a slot of T, copy-constructed (move-constructed for `move`,
+     * a by-value parameter's last use, or an rvalue reference to a move-only class). False
+     * leaves every other source (prvalues keep the sret elision path) to the ordinary path.
+     */
+    bool TryDeclareForeignCxxAutoLocal(CFlatParser::DirectDeclaratorContext* direct,
+                                       CFlatParser::AssignmentExpressionContext* assign,
+                                       const LLVMBackend::DeclTypeAndValue& autoType,
+                                       LLVMBackend::NamedVariable& sourceNV,
+                                       llvm::Value* sourceCxxRetTemp,
+                                       const std::string& name, size_t line,
+                                       std::vector<std::pair<std::string, llvm::AllocaInst*>>& allocList);
     // The `T(args)` construction form: the argument list of a postfix call whose callee spelling
     // names the declared foreign class itself. Null for every other expression shape.
     // Not static: the class-template form re-mangles the callee spelling through the backend.
@@ -5543,6 +5627,11 @@ public:
      * in the resume block. Only the selected arm's code runs, so a `move` or a dereference in the
      * other arm has no effect - the eager CreateSelect form executed both unconditionally.
      */
+    static void OperandPointerDepth(const LLVMBackend::NamedVariable& namedVar, llvm::Value* value,
+                                    int& depth, bool& elemPointer);
+    static void JoinTernaryPointerShape(LLVMBackend::TypedValue& result,
+                                        const LLVMBackend::TypedValue& trueArm,
+                                        const LLVMBackend::TypedValue& falseArm);
     LLVMBackend::TypedValue ParseTernaryBranches(
         CFlatParser::ConditionalExpressionContext* ctx,
         const LLVMBackend::TypedValue& condTv,
@@ -5679,6 +5768,7 @@ public:
     // Walk a single-child expression chain to the leaf Identifier terminal.
     // Returns the identifier name, or "" if the expression is complex (e.g., arithmetic, member access).
     std::string TryGetSimpleIdentifier(antlr4::ParserRuleContext* ctx);
+    static int8_t CxxArgumentLvalueKind(antlr4::tree::ParseTree* tree);
 
     // Find the llvm::Function* for a method named `methodName` whose first parameter is `stream`.
     llvm::Function* FindStreamMethodFn(LLVMBackend* compiler, const std::string& methodName);
@@ -5741,6 +5831,8 @@ public:
         // A dotted name in an imported C++ namespace that is no CFlat value (`std.cout`,
         // `std.endl`): spelled into the C++ infix expression instead of being evaluated.
         std::string cxxName;
+        // The operand's own syntax (null once accumulated): proves a scalar lvalue.
+        antlr4::ParserRuleContext* expr = nullptr;
     };
     llvm::Value* TryCxxInfixShift(CFlatParser::ShiftExpressionContext* ctx, const std::string& op,
                                   const ShiftOperand& lhs, const std::string& lhsClass,
@@ -5917,6 +6009,30 @@ public:
 
     LLVMBackend::NamedVariable ParseUnaryExpression(CFlatParser::UnaryExpressionContext* ctx,
                                                     ResultUse use = ResultUse::Value);
+    // `sizeofs` = leading `sizeof` prefixes still to apply to the operand (0 = plain operand).
+    LLVMBackend::NamedVariable ParseUnaryExpressionImpl(CFlatParser::UnaryExpressionContext* ctx,
+                                                        ResultUse use, size_t sizeofs);
+    LLVMBackend::NamedVariable TrySizeofPostfixAsType(CFlatParser::UnaryExpressionContext* ctx,
+                                                      CFlatParser::PostfixExpressionContext* postFixCtx);
+
+    /*
+     * The operand of sizeof / alignof / typeof is UNEVALUATED (C): lower it into a throwaway block only to
+     * learn its type, then erase every instruction it emitted and drop the owned temps, pending
+     * postfix ++/-- and detection ledgers it registered. Diagnostics still fire. Returned values
+     * are types only - no llvm::Value from the region survives.
+     */
+    struct UnevaluatedOperandType
+    {
+        LLVMBackend::TypeAndValue Type;
+        llvm::Type* ValueType = nullptr;  // type of the operand's value (Primary), if any
+        llvm::Type* BaseType = nullptr;
+        bool HasValue = false;
+    };
+    UnevaluatedOperandType EvaluateOperandTypeOnly(const std::function<LLVMBackend::NamedVariable()>& emit);
+    // sizeof (isSizeof) or alignof of a resolved type, honoring struct-level alignas; i64 result.
+    LLVMBackend::NamedVariable SizeOrAlignOfAutoVariable(const std::string& name, bool isSizeof);
+    LLVMBackend::NamedVariable SizeOrAlignOfType(const LLVMBackend::TypeAndValue& typeValue,
+                                                 llvm::Type* llvmType, bool isSizeof);
 
     std::string ParseTypeSpecifierName(CFlatParser::TypeSpecifierContext* ctx,
                                        CFlatParser::MultiWordTypeSuffixContext* suffix = nullptr);
@@ -5971,6 +6087,14 @@ public:
         LLVMBackend::NamedVariable& rightNV,
         const LLVMBackend::OwnedTempMark& ownedTempMark,
         antlr4::ParserRuleContext* errCtx);
+
+    // A C++ `operator=(U)` on `typeName` for a non-T source; null when none binds. `refusal` is
+    // set when C++ would call one that CFlat's call rules refuse.
+    llvm::Value* TryDirectCxxAssignOperator(antlr4::ParserRuleContext* ctx,
+                                            const LLVMBackend::NamedVariable& destination,
+                                            const std::string& typeName,
+                                            const LLVMBackend::NamedVariable& rhsNV,
+                                            std::string& refusal);
 
     // Construct one foreign nontrivial C++ value into a fresh or replacement slot. This is
     // shared by scalar struct fields and fixed-array elements so their copy/move decisions agree.
@@ -6533,6 +6657,9 @@ public:
     // call, where the position is still known, rather than at each consumer.
     void DiagnoseVoidResultConsumed(antlr4::ParserRuleContext* ctx, const LLVMBackend::NamedVariable& nv,
                                     ResultUse use, const std::string& subject);
+
+    // Ruling 2026-09-27: an assignment anywhere inside a call argument is refused, any callee.
+    void DiagnoseAssignmentArguments(CFlatParser::ArgumentExpressionListContext* list);
 
     // Walk down single-child rule nodes to find a UnaryExpressionContext.
     // Returns nullptr if the path branches or never reaches a unaryExpression.

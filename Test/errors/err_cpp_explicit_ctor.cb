@@ -4,8 +4,53 @@
 // spelled form of each of these calls is a value leg in Test/test_cpp_interop.cb (2200-2220).
 import cpp "cpp_interop_explicit.h";
 
+// Converting constructors at the copy-initialization positions (plan converting-constructors.md)
+// refuse the same candidates. Each leg names the position in its message prefix.
+struct ConvExplicitHolder { cppexp.ConvExplicit e = default; int k = 0; };
+expect_error("cannot return C++ class 'cppexp.ConvExplicit' from this expression; C++ constructor 'cppexp.ConvExplicit(int)' is declared explicit") {
+    cppexp.ConvExplicit ConvExplicitReturn() { return 5; }
+}
+
 extern int main()
 {
+    expect_error("cannot initialize C++ class 'cppexp.ConvExplicit' from this expression; C++ constructor 'cppexp.ConvExplicit(int)' is declared explicit") {
+        cppexp.ConvExplicit initExplicit = 5;
+    }
+    expect_error("cannot assign to C++ class 'cppexp.ConvExplicit' from this expression; C++ constructor 'cppexp.ConvExplicit(int)' is declared explicit") {
+        cppexp.ConvExplicit assignExplicit = default;
+        assignExplicit = 5;
+    }
+    expect_error("cannot initialize C++ class 'cppexp.ConvExplicit' from this expression; C++ constructor 'cppexp.ConvExplicit(int)' is declared explicit") {
+        ConvExplicitHolder braceExplicit = { e = 5, k = 1 };
+    }
+    // Two converting constructors of equal rank (long, unsigned long) for an int source.
+    expect_error("cannot initialize C++ class 'cppexp.ConvAmb' from this expression; the implicit conversion from 'int' is ambiguous: C++ class 'cppexp.ConvAmb' has more than one converting constructor of equal rank (cppexp.ConvAmb(long), cppexp.ConvAmb(ulong))") {
+        cppexp.ConvAmb initAmb = 5;
+    }
+    expect_error("cannot assign to C++ class 'cppexp.ConvAmb' from this expression; the implicit conversion from 'int' is ambiguous") {
+        cppexp.ConvAmb assignAmb = default;
+        assignAmb = 5;
+    }
+    // Two user-defined conversions (char* -> ConvStr -> ConvChain) are never chained, and a
+    // pointer never reaches an integer-taking constructor. Both keep the generic refusal.
+    expect_error("cannot initialize C++ class 'cppexp.ConvChain' from this expression; use 'cppexp.ConvChain(args)'") {
+        cppexp.ConvChain initChain = "abc";
+    }
+    expect_error("cannot assign to C++ class 'cppexp.ConvChain' from this expression; the source must be") {
+        cppexp.ConvChain assignChain = default;
+        assignChain = "abc";
+    }
+    // C++ would call `operator=(double)` for an int source; CFlat's call rules refuse int ->
+    // double, so the assignment is refused and NOT rerouted through ConvDblAssign(int).
+    expect_error("C++ resolves this assignment to 'cppexp.ConvDblAssign.operator=(double)', which needs a conversion CFlat does not make implicitly ('int' to 'double')") {
+        cppexp.ConvDblAssign assignDouble = default;
+        int assignInt = 5;
+        assignDouble = assignInt;
+    }
+    expect_error("cannot initialize C++ class 'cppexp.ConvCnt' from this expression; use 'cppexp.ConvCnt(args)'") {
+        int pointee = 0;
+        cppexp.ConvCnt initPointer = &pointee;
+    }
     // A free function, parameter by VALUE.
     expect_error("[cppexp.take_ex] argument 0: C++ constructor 'cppexp.Ex(int)' is declared explicit") {
         int byValue = cppexp.take_ex(5);
@@ -54,6 +99,23 @@ extern int main()
     expect_error("[member_lref] argument 1: a user-defined conversion cannot bind to the non-const reference parameter 'cppexp.Options&'") {
         cppexp.OptHost lrefHost = cppexp.OptHost(4);
         int byMemberLref = lrefHost.member_lref(0.5);
+    }
+    // A POINTER argument into a class parameter: an explicit constructor stays refused and is
+    // named; two classes each constructible from it are ambiguous, never a silent pick.
+    expect_error("[cppexp.conv_ip_explicit] argument 0: C++ constructor 'cppexp.ConvIpE(int*)' is declared explicit") {
+        int ipExplicitK = 1;
+        int byPointerExplicit = cppexp.conv_ip_explicit(&ipExplicitK);
+    }
+    expect_error("ambiguous call to 'cppexp.conv_ip_amb': no candidate ranks better") {
+        int ipAmbK = 1;
+        int byPointerAmb = cppexp.conv_ip_amb(&ipAmbK);
+    }
+    // A proven `int**` is not the `const int*` the constructor takes.
+    expect_error("no overload of 'cppexp.conv_ip_val' matches the given arguments") {
+        int ipDeepK = 1;
+        int* ipDeepP = &ipDeepK;
+        int** ipDeepPP = &ipDeepP;
+        int byPointerDeep = cppexp.conv_ip_val(ipDeepPP);
     }
     return 0;
 }

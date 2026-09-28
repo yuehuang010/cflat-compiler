@@ -227,6 +227,7 @@ namespace cflat_cinterop
         std::string name;
         std::string ctype;          // canonical C spelling of the field type
         bool isBitfield = false;
+        bool isZeroSize = false;     // C++ [[no_unique_address]] field has no storage in this record
         unsigned bitWidth = 0;
         uint64_t offsetBytes = 0;
         // Clang's size and alignment of the field type in bytes (0 for a bitfield). Lets the
@@ -235,6 +236,19 @@ namespace cflat_cinterop
         uint64_t alignBytes = 0;
         uint64_t bitOffset = 0;     // bitfield only: Clang's absolute bit offset in the record
         int access = AccessPublic;  // C++ only; C records are all public
+    };
+
+    // A constructor TEMPLATE, as declared: the template head and the parameter types as
+    // written (dependent), so a clang-resolved overload mirror can redeclare it faithfully.
+    struct RawCxxCtorTemplate
+    {
+        std::string head;                  // "template <class T, unsigned long N>"
+        std::vector<std::string> paramTypes;
+        std::vector<uint8_t> defaulted;    // aligned with paramTypes
+        bool variadic = false;
+        bool isDeleted = false;
+        bool isExplicit = false;
+        int access = 0;                    // RawAccess
     };
 
     // One exported member function of a C++ class: an instance method, a static method, a
@@ -269,6 +283,9 @@ namespace cflat_cinterop
         // (ExtractRequest::emitDefinitions) does produce the body, this is cleared - the symbol
         // then exists in the companion bitcode the backend links in.
         bool needsLocalDefinition = false;
+        // needsLocalDefinition was cleared only because the extraction ASSUMED an inline body
+        // (assumeInlineDefinitions): no module carries it until a definition request emits it.
+        bool definitionAssumed = false;
         bool returnsThis = false;      // structor ABI hands 'this' back; the result is ignored
         /*
          * Non-empty when the member cannot be bound for a reason only the extractor can see, and
@@ -389,6 +406,7 @@ namespace cflat_cinterop
         // members, so only a clang-resolved `T(args)` wrapper can reach them.
         bool hasCtorTemplate = false;
         bool isAggregate = false;
+        std::vector<RawCxxCtorTemplate> ctorTemplates;
         std::vector<RawCxxMember> members;
         std::vector<RawCxxStaticVar> staticVars;
         std::string qualifiedName;
@@ -613,6 +631,9 @@ namespace cflat_cinterop
         // Namespace aliases (`namespace a = b::c;`), as CFlat dotted (alias, target) pairs. The
         // backend registers them as namespace aliases so a use through the alias resolves.
         std::vector<std::pair<std::string, std::string>> namespaceAliases;
+        // Namespace-scope `using ns::C;` of a class or class template, as CFlat dotted (alias,
+        // target) pairs. Not bound; the backend only checks them for cross-import conflicts.
+        std::vector<std::pair<std::string, std::string>> classUsings;
         // Names of generated default-argument wrappers whose declarations or bodies carried
         // parse/Sema errors and were therefore withheld from CodeGen.
         std::vector<std::string> droppedCxxDefaultWrappers;

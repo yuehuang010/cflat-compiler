@@ -17,5 +17,58 @@ extern int main()
     expect_error("no overload") {
         m.only(cppi_scope.A.x);
     }
+    // The reverse direction: C++ has no implicit integer -> enum conversion, scoped or unscoped,
+    // for a literal or a named int, by value or by const reference. Each leg names the enum.
+    int n = 7;
+    expect_error("C++ has no implicit conversion to enum 'cppi_scope.B'") {
+        cppi_scope.onlyB(7);
+    }
+    expect_error("C++ has no implicit conversion to enum 'cppi_scope.B'") {
+        cppi_scope.onlyB(n);
+    }
+    expect_error("C++ has no implicit conversion to enum 'cppi_scope.B'") {
+        m.onlyB(7);
+    }
+    expect_error("C++ has no implicit conversion to enum 'cppi_scope.A'") {
+        cppi_scope.ref(7);
+    }
+    expect_error("C++ has no implicit conversion to enum 'cppi_scope.U2'") {
+        cppi_scope.unscopedOther(7);
+    }
+    expect_error("C++ has no implicit conversion to enum 'cppi_scope.U2'") {
+        cppi_scope.unscopedOther(n);
+    }
+    // Any integer expression without enum identity: arithmetic, bool, a cast to int, a mixed `?:`.
+    expect_error("C++ has no implicit conversion to enum 'cppi_scope.B'") {
+        cppi_scope.onlyB(1 + 2);
+    }
+    expect_error("C++ has no implicit conversion to enum 'cppi_scope.B'") {
+        cppi_scope.onlyB(n * 2);
+    }
+    expect_error("C++ has no implicit conversion to enum 'cppi_scope.B'") {
+        cppi_scope.onlyB(true);
+    }
+    expect_error("C++ has no implicit conversion to enum 'cppi_scope.B'") {
+        cppi_scope.onlyB((int)cppi_scope.B.y);
+    }
+    expect_error("C++ has no implicit conversion to enum 'cppi_scope.B'") {
+        cppi_scope.onlyB(n > 0 ? cppi_scope.B.y : 7);
+    }
+    expect_error("C++ has no implicit conversion to enum 'cppi_scope.U2'") {
+        cppi_scope.unscopedOther(1 + 2);
+    }
+    expect_error("has no constructor whose parameter types match these arguments") {
+        cppi_scope.Dev* d4 = new cppi_scope.Dev(n + 1);
+    }
+    // Constructor paths: `T(args)` initializer, `new T(args)`, and a named int.
+    expect_error("has no constructor whose parameter types match these arguments") {
+        cppi_scope.Dev d1 = cppi_scope.Dev(7);
+    }
+    expect_error("has no constructor whose parameter types match these arguments") {
+        cppi_scope.Dev* d2 = new cppi_scope.Dev(7);
+    }
+    expect_error("has no constructor whose parameter types match these arguments") {
+        cppi_scope.Dev d3 = cppi_scope.Dev(n);
+    }
     return 0;
 }
