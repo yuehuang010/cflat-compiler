@@ -1,0 +1,14 @@
+// GUARDS: Eigen inherited static Identity and Zero members
+// FROM: scratch/probe3/e02_elem_paren.cb
+// DISABLED: internal/issue/p3/cpp-inherited-static-members-and-member-operators-not-found.md
+import cpp "Eigen/Dense";
+extern int printf(const char* fmt, ...);
+extern int main()
+{
+    int failures = 0;
+    Eigen.Matrix3d m = Eigen.Matrix3d.Identity();
+    m(0, 1) = 5.0;
+    if (m(0, 1) != 5.0 || m(0, 0) != 1.0) { printf("FAIL e02: got %f %f want 5 1\n", m(0, 1), m(0, 0)); failures |= 1; }
+    if (failures == 0) printf("PASS eigen_03_statics\n");
+    return failures;
+}

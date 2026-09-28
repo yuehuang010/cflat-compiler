@@ -1,0 +1,24 @@
+// GUARDS: Eigen transpose, inverse, block, and column access through explicit spellings
+// FROM: scratch/probe3/e08_transpose_inverse.cb scratch/probe3/e10_block.cb
+// NOTE: explicit Matrix(...) wraps and (long) block arguments are workarounds; the natural forms
+//       are covered by the DISABLED eigen_05/eigen_06 cases. QR solve lives in eigen_07.
+import cpp "Eigen/Dense";
+extern int printf(const char* fmt, ...);
+extern int main()
+{
+    int failures = 0;
+    Eigen.Matrix2d m = default;
+    m.setZero();
+    m(0, 0) = 2.0; m(1, 1) = 4.0; m(0, 1) = 1.0;
+    Eigen.Matrix2d transposed = Eigen.Matrix2d(m.transpose());
+    Eigen.Matrix2d inverse = Eigen.Matrix2d(m.inverse());
+    if (transposed(1, 0) != 1.0 || inverse(0, 0) != 0.5 || inverse(1, 1) != 0.25) {
+        printf("FAIL e08: got %f %f %f want 1 .5 .25\n", transposed(1, 0), inverse(0, 0), inverse(1, 1)); failures |= 1;
+    }
+    Eigen.Matrix3d block_matrix = default; block_matrix.setIdentity();
+    double block_sum = block_matrix.block((long)0, (long)0, (long)2, (long)2).sum();
+    Eigen.Vector3d column = Eigen.Vector3d(block_matrix.col(1));
+    if (block_sum != 2.0 || column(1) != 1.0) { printf("FAIL e10: got %f %f want 2 1\n", block_sum, column(1)); failures |= 4; }
+    if (failures == 0) printf("PASS eigen_02_decomp\n");
+    return failures;
+}

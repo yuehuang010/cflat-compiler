@@ -4,10 +4,14 @@
 # Stages:
 #   1. BUILD Release        (cmake_build.sh release)
 #   2. TESTS                (test.sh Release)
-#   3. EXAMPLES             (test_example.sh - Release-only, takes JOBS not a config)
-#   4. LSP TESTS            (test_lsp.sh Release)
-#   5. BUILD vscode-extension (vscode-extension/build.sh)
-#   6. PACKAGE              (package_release.sh -> out/cflat-macos-arm64-v<ver>.tar.gz)
+#   3. LIBS [Release]       (test_libs.sh - tier 1; tiers 1-3 with --nightly)
+#   4. EXAMPLES             (test_example.sh - Release-only, takes JOBS not a config)
+#   5. LSP TESTS            (test_lsp.sh Release)
+#   6. BUILD vscode-extension (vscode-extension/build.sh)
+#   7. PACKAGE              (package_release.sh -> out/cflat-macos-arm64-v<ver>.tar.gz)
+#
+# --nightly: LIBS runs tiers 1-3 (adds Eigen and libtorch, ~6 min at -j3 on a warm
+# out/libs-cache) instead of tier 1 only. Every other stage is unchanged.
 #
 # A failed BUILD (stage 1) aborts; test/package failures are counted and CI
 # continues, mirroring buildci.bat. Exits 0 only if every stage passed.
@@ -19,6 +23,14 @@ cd "$SCRIPT_DIR"
 # Homebrew tools (cmake, ninja, antlr, coreutils) and the keg-only openjdk
 # must be on PATH even when invoked from a bare shell (launchd, cron, CI).
 export PATH="/opt/homebrew/bin:/opt/homebrew/opt/openjdk/bin:$PATH"
+
+LIBS_TIER=1
+for arg in "$@"; do
+    case "$arg" in
+        --nightly) LIBS_TIER=3 ;;
+        *) echo "buildci.sh: unknown argument '$arg' (only --nightly)"; exit 2 ;;
+    esac
+done
 
 START_TIME=$SECONDS
 OVERALL_ERRORS=0
@@ -46,6 +58,12 @@ fi
 banner "TESTS [Release]: test.sh"
 if ! bash "$SCRIPT_DIR/test.sh" Release; then
     echo "TESTS FAILED: Release test.sh"
+    OVERALL_ERRORS=$((OVERALL_ERRORS + 1))
+fi
+
+banner "LIBS [Release]: test_libs.sh (tiers 1-$LIBS_TIER)"
+if ! bash "$SCRIPT_DIR/test_libs.sh" Release -t "$LIBS_TIER"; then
+    echo "LIBS FAILED: Release test_libs.sh"
     OVERALL_ERRORS=$((OVERALL_ERRORS + 1))
 fi
 

@@ -1,0 +1,14 @@
+// GUARDS: calling a member function template (QR solve) on a decomposition object
+// FROM: scratch/probe3/e09_solve.cb
+// DISABLED: internal/issue/p3/cpp-eigen-qr-solve-wrapper-not-registered.md
+import cpp "Eigen/Dense";
+extern int printf(const char* fmt, ...);
+extern int main()
+{
+    Eigen.Matrix2d a = default; a.setZero(); a(0, 0) = 2.0; a(1, 1) = 4.0;
+    Eigen.Vector2d b = Eigen.Vector2d(2.0, 8.0);
+    Eigen.Vector2d x = Eigen.Vector2d(a.colPivHouseholderQr().solve(b));
+    if (x(0) < 0.999 || x(0) > 1.001 || x(1) < 1.999 || x(1) > 2.001) { printf("FAIL solve: got %f %f want 1 2\n", x(0), x(1)); return 1; }
+    printf("PASS eigen_07_qr_solve\n");
+    return 0;
+}

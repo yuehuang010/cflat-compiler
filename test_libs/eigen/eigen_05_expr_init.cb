@@ -1,0 +1,21 @@
+// GUARDS: initializing an Eigen matrix from an expression result (implicit converting constructor)
+// FROM: scratch/probe3/e08_transpose_inverse.cb scratch/probe3/e10_block.cb
+// DISABLED: internal/plan/converting-constructors.md
+import cpp "Eigen/Dense";
+extern int printf(const char* fmt, ...);
+extern int main()
+{
+    int failures = 0;
+    Eigen.Matrix2d m = default;
+    m.setZero();
+    m(0, 0) = 2.0; m(1, 1) = 4.0; m(0, 1) = 1.0;
+    Eigen.Matrix2d transposed = m.transpose();
+    Eigen.Matrix2d inverse = m.inverse();
+    if (transposed(1, 0) != 1.0) { printf("FAIL transpose: got %f want 1\n", transposed(1, 0)); failures |= 1; }
+    if (inverse(0, 0) != 0.5 || inverse(1, 1) != 0.25) { printf("FAIL inverse: got %f %f want .5 .25\n", inverse(0, 0), inverse(1, 1)); failures |= 2; }
+    Eigen.Matrix3d id = default; id.setIdentity();
+    Eigen.Vector3d column = id.col(1);
+    if (column(1) != 1.0) { printf("FAIL col: got %f want 1\n", column(1)); failures |= 4; }
+    if (failures == 0) printf("PASS eigen_05_expr_init\n");
+    return failures;
+}

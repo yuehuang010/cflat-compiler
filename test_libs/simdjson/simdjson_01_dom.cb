@@ -1,0 +1,17 @@
+// GUARDS: simdjson DOM parser and int64 result ABI
+// FROM: scratch/simdjson_spike/s1_i64.cb
+import cpp "simdjson.h";
+extern int printf(const char* fmt, ...);
+extern int main()
+{
+    int failures = 0;
+    simdjson.dom.parser parser = default;
+    simdjson.simdjson_result<simdjson.dom.element> result = parser.parse("[1,2,42]", 8, true);
+    int parse_error = (int)result.error();
+    if (parse_error != 0) { printf("FAIL parse: got %d want 0\n", parse_error); failures |= 1; }
+    simdjson.simdjson_result<i64> third = result.at(2).get_int64();
+    i64 value = third.value();
+    if (value != 42) { printf("FAIL value: got %lld want 42\n", value); failures |= 2; }
+    if (failures == 0) printf("PASS simdjson_01_dom\n");
+    return failures;
+}

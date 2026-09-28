@@ -1,0 +1,15 @@
+// GUARDS: fmt memory_buffer layout and format_to
+// FROM: scratch/probe3/f04_memory_buffer.cb
+// DISABLED: internal/issue/p3/cpp-no-unique-address-member-layout-mismatch.md
+import cpp "fmt/format.h";
+extern int printf(const char* fmt, ...);
+extern int main()
+{
+    int failures = 0;
+    fmt.memory_buffer buf = default;
+    fmt.format_to(fmt.appender(buf), fmt.runtime("{{}}"), 42);
+    int size = (int)buf.size();
+    if (size != 2) { printf("FAIL size: got %d want 2\n", size); failures |= 1; }
+    if (failures == 0) printf("PASS fmt_03_memory_buffer\n");
+    return failures;
+}

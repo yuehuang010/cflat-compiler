@@ -1,0 +1,5 @@
+// GUARDS: simdjson header ingestion
+// FROM: scratch/simdjson_spike/s0.cb
+// MODE: check
+import cpp "simdjson.h";
+extern int main() { return 0; }

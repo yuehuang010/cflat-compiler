@@ -1,0 +1,8 @@
+// GUARDS: fmt/format.h header ingestion
+// FROM: new import-only case
+// MODE: check
+import cpp "fmt/format.h";
+extern int main()
+{
+    return 0;
+}

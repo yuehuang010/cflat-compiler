@@ -10753,8 +10753,9 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
         {
             llvm::Value* freeResult = tryFreeOperator();
             if (freeResult != nullptr) return freeResult;
-            if (llvm::Value* converted = tryBoolComparisonConversion()) return converted;
+            // A C++20 rewrite (`a != b` -> `!(a == b)`) is a declared operator; it beats operator bool.
             if (llvm::Value* rewritten = tryRewrites()) return rewritten;
+            if (llvm::Value* converted = tryBoolComparisonConversion()) return converted;
             return reportNoOperator(typeName);
         }
         // A ternary PHI inside a call argument is either covered per arm or by this operator;

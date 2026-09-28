@@ -1,0 +1,19 @@
+// GUARDS: Eigen fixed and dynamic vectors/matrices, dot, and norm
+// FROM: scratch/probe3/e01_fixed_ctor.cb scratch/probe3/e03_dynamic.cb scratch/probe3/e06_dot_norm.cb
+import cpp "Eigen/Dense";
+extern int printf(const char* fmt, ...);
+extern int main()
+{
+    int failures = 0;
+    Eigen.Vector3d v = Eigen.Vector3d(1.0, 2.0, 3.0);
+    if (v.x() != 1.0 || v.z() != 3.0) { printf("FAIL e01: got %f %f want 1 3\n", v.x(), v.z()); failures |= 1; }
+    Eigen.MatrixXd m = Eigen.MatrixXd(2, 3);
+    m.setOnes();
+    int rows = (int)m.rows(); int cols = (int)m.cols(); double sum = m.sum();
+    if (rows != 2 || cols != 3 || sum != 6.0) { printf("FAIL e03: got %d %d %f want 2 3 6\n", rows, cols, sum); failures |= 2; }
+    Eigen.Vector3d a = Eigen.Vector3d(3.0, 4.0, 0.0);
+    double norm = a.norm(); double dot = a.dot(a);
+    if (norm != 5.0 || dot != 25.0) { printf("FAIL e06: got %f %f want 5 25\n", norm, dot); failures |= 4; }
+    if (failures == 0) printf("PASS eigen_01_basics\n");
+    return failures;
+}

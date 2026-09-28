@@ -1,0 +1,13 @@
+// GUARDS: fmt compile-time format string binding
+// FROM: scratch/probe3/f02_format_consteval.cb
+// DISABLED: internal/issue/p3/cpp-consteval-format-string-from-literal-not-constant.md
+import cpp "fmt/format.h";
+extern int printf(const char* fmt, ...);
+extern int main()
+{
+    int failures = 0;
+    std.string s = fmt.format("{{}}-{{}}", 7, 3.5);
+    if (s.size() != 5) { printf("FAIL format: got %d want 5\n", (int)s.size()); failures |= 1; }
+    if (failures == 0) printf("PASS fmt_02_consteval\n");
+    return failures;
+}

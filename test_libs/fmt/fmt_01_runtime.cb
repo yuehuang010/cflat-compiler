@@ -1,0 +1,17 @@
+// GUARDS: fmt runtime formatting, integer conversion, and print ABI
+// FROM: scratch/probe3/f01_format_runtime.cb scratch/probe3/f03_to_string.cb scratch/probe3/f06_print.cb
+import cpp "fmt/format.h";
+extern int printf(const char* fmt, ...);
+extern int main()
+{
+    int failures = 0;
+    std.string s = fmt.format(fmt.runtime("{{}}-{{}}"), 7, 3.5);
+    if (s != "7-3.5") { printf("FAIL format: got length %d want 5\n", (int)s.size()); failures |= 1; }
+    std.string converted = fmt.to_string(42);
+    if (converted.size() != 2) { printf("FAIL to_string: got %d want 2\n", (int)converted.size()); failures |= 2; }
+    std.string printed = fmt.format(fmt.runtime("v={{}}\n"), 5);
+    if (printed != "v=5\n") { printf("FAIL print: got length %d want 4\n", (int)printed.size()); failures |= 4; }
+    fmt.print(fmt.runtime("v={{}}\n"), 5);
+    if (failures == 0) printf("PASS fmt_01_runtime\n");
+    return failures;
+}

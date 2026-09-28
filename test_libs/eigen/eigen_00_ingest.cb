@@ -1,0 +1,5 @@
+// GUARDS: Eigen Dense header ingestion
+// FROM: new import-only case
+// MODE: check
+import cpp "Eigen/Dense";
+extern int main() { return 0; }

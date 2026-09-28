@@ -1,0 +1,21 @@
+// GUARDS: Eigen expression, matrix-vector, and scalar multiplication operators
+// FROM: scratch/probe3/e04_add_expr.cb scratch/probe3/e05_matvec.cb scratch/probe3/e07_scalar_mul.cb
+// DISABLED: internal/issue/p3/cpp-inherited-static-members-and-member-operators-not-found.md internal/issue/p3/cpp-operator-returning-unrequested-specialization-not-bound.md
+import cpp "Eigen/Dense";
+extern int printf(const char* fmt, ...);
+extern int main()
+{
+    int failures = 0;
+    Eigen.Vector3d a = Eigen.Vector3d(1.0, 2.0, 3.0);
+    Eigen.Vector3d b = Eigen.Vector3d(4.0, 5.0, 6.0);
+    Eigen.Vector3d c = a + b;
+    if (c.sum() != 21.0) { printf("FAIL e04: got %f want 21\n", c.sum()); failures |= 1; }
+    Eigen.Matrix3d m = default; m.setIdentity(); m(0, 0) = 2.0;
+    Eigen.Vector3d v = Eigen.Vector3d(1.0, 1.0, 1.0);
+    Eigen.Vector3d result = m * v;
+    if (result.sum() != 4.0) { printf("FAIL e05: got %f want 4\n", result.sum()); failures |= 2; }
+    Eigen.Vector3d scaled = a * 2.0;
+    if (scaled.sum() != 12.0) { printf("FAIL e07: got %f want 12\n", scaled.sum()); failures |= 4; }
+    if (failures == 0) printf("PASS eigen_04_operators\n");
+    return failures;
+}

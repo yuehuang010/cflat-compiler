@@ -259,7 +259,7 @@ std::string LLVMBackend::CxxIntegerParameterIdentity(const FunctionSymbol& candi
             {"short", "short"}, {"shortint", "short"}, {"signedshort", "short"},
             {"signedshortint", "short"}, {"unsignedshort", "u16"},
             {"unsignedshortint", "u16"}, {"int", "int"}, {"signed", "int"},
-            {"signedint", "int"}, {"unsigned", "uint"}, {"unsignedint", "uint"},
+            {"signedint", "int"}, {"unsigned", "u32"}, {"unsignedint", "u32"},
             {"long", "long"}, {"longint", "long"}, {"signedlong", "long"},
             {"signedlongint", "long"}, {"unsignedlong", "ulong"},
             {"unsignedlongint", "ulong"}, {"longlong", "i64"},

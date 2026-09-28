@@ -1,0 +1,22 @@
+// GUARDS: nlohmann JSON value type predicates
+// FROM: scratch/probe3/j09_type_checks.cb
+// DISABLED: internal/issue/p2/intrinsic-names-hijack-member-method-calls.md
+import cpp "nlohmann/json.hpp";
+extern int printf(const char* fmt, ...);
+extern int main()
+{
+    int failures = 0;
+    nlohmann.json j = nlohmann.json.parse("{{\"n\":1.5,\"s\":\"x\",\"z\":null}}");
+    int number = j["n"].is_number() ? 1 : 0;
+    int string = j["s"].is_string() ? 1 : 0;
+    int null_value = j["z"].is_null() ? 1 : 0;
+    int object = j.is_object() ? 1 : 0;
+    double number_value = j["n"].get<double>();
+    if (number != 1) { printf("FAIL is_number: got %d want 1\n", number); failures |= 1; }
+    if (string != 1) { printf("FAIL is_string: got %d want 1\n", string); failures |= 2; }
+    if (null_value != 1) { printf("FAIL is_null: got %d want 1\n", null_value); failures |= 4; }
+    if (object != 1) { printf("FAIL is_object: got %d want 1\n", object); failures |= 8; }
+    if (number_value != 1.5) { printf("FAIL number value: got %f want 1.5\n", number_value); failures |= 16; }
+    if (failures == 0) printf("PASS json_02_type_checks\n");
+    return failures;
+}

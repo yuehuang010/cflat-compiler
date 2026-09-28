@@ -1,0 +1,25 @@
+// GUARDS: torch::data TensorDataset size and Example<Tensor, NoTarget> field access.
+// FROM: scratch/ladder/torch/t13.cb
+// DISABLED: internal/issue/p2/cpp-scalar-rvalue-reference-return-reads-address.md
+import cpp "torch/torch.h";
+extern int printf(const char* fmt, ...);
+int leg_t13()
+{
+    int failures = 0;
+    long[2] d = {4, 2};
+    c10.IntArrayRef s = c10.IntArrayRef(&d[0], 2);
+    at.Tensor x = torch.randn(s);
+    torch.data.datasets.TensorDataset ds = torch.data.datasets.TensorDataset(x);
+    long n = (long)ds.size().value();
+    torch.data.TensorExample ex = ds.get(1);
+    printf("n=%ld ex0=%ld\n", n, ex.data.size(0));
+    if (n != 4) { printf("FAIL t13 n: got %ld want 4\n", n); failures++; }
+    if (ex.data.size(0) != 2) { printf("FAIL t13 ex0: got %ld want 2\n", ex.data.size(0)); failures++; }
+    return failures;
+}
+extern int main()
+{
+    int failures = leg_t13();
+    if (failures == 0) printf("PASS torch_91_data_example\n");
+    return failures;
+}

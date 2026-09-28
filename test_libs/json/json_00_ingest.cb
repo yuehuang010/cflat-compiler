@@ -1,0 +1,9 @@
+// GUARDS: nlohmann/json.hpp header ingestion
+// FROM: new import-only case
+// MODE: check
+import cpp "nlohmann/json.hpp";
+extern int main()
+{
+    nlohmann.json j = default;
+    return j.is_null() ? 0 : 1;
+}

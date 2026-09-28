@@ -1,0 +1,14 @@
+// GUARDS: fmt runtime formatting with a CFlat string argument
+// FROM: scratch/probe3/f05_format_string_arg.cb
+// DISABLED: internal/plan/converting-constructors.md
+import cpp "fmt/format.h";
+extern int printf(const char* fmt, ...);
+extern int main()
+{
+    int failures = 0;
+    std.string name = "world";
+    std.string s = fmt.format(fmt.runtime("hello {{}}"), name);
+    if (s.size() != 11) { printf("FAIL size: got %d want 11\n", (int)s.size()); failures |= 1; }
+    if (failures == 0) printf("PASS fmt_04_string_arg\n");
+    return failures;
+}

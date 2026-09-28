@@ -1,0 +1,16 @@
+// GUARDS: nlohmann JSON object construction by keyed assignment
+// FROM: scratch/probe3/j03_assign_key.cb
+// DISABLED: internal/plan/converting-constructors.md
+import cpp "nlohmann/json.hpp";
+extern int printf(const char* fmt, ...);
+extern int main()
+{
+    int failures = 0;
+    nlohmann.json j = default;
+    j["x"] = 3;
+    j["name"] = "bob";
+    int size = (int)j.size();
+    if (size != 2) { printf("FAIL size: got %d want 2\n", size); failures |= 1; }
+    if (failures == 0) printf("PASS json_03_build\n");
+    return failures;
+}

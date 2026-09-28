@@ -4,6 +4,10 @@ setlocal EnableDelayedExpansion
 set START_TIME=%TIME%
 set /a OVERALL_ERRORS=0
 
+REM --nightly: LIBS runs tiers 1-3 (adds Eigen and libtorch) instead of tier 1 only.
+set LIBS_TIER=1
+if /I "%~1"=="--nightly" set LIBS_TIER=3
+
 REM ===========================================================================
 REM Build and test a single configuration
 REM Usage: call :RunConfig Debug|Release
@@ -31,6 +35,17 @@ set CFLAT_CONFIG=%CFG%
 call "%~dp0test.bat"
 if errorlevel 1 (
     echo TESTS FAILED: %CFG% test.bat
+    set /a OVERALL_ERRORS+=1
+)
+
+echo.
+echo =========================================================================
+echo LIBS [%CFG%]: test_libs.bat (tiers 1-%LIBS_TIER%)
+echo =========================================================================
+set CFLAT_CONFIG=%CFG%
+call "%~dp0test_libs.bat" %CFG% -t %LIBS_TIER%
+if errorlevel 1 (
+    echo LIBS FAILED: %CFG% test_libs.bat
     set /a OVERALL_ERRORS+=1
 )
 
