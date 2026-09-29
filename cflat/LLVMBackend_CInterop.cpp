@@ -43,9 +43,11 @@
 #include <algorithm>
 #include <cctype>
 #include <atomic>
+#include <mutex>
 #include <chrono>
 #include <fstream>
 #include <map>
+#include <unordered_map>
 #include <set>
 
 #if defined(__APPLE__)
@@ -6223,14 +6225,48 @@ bool LLVMBackend::CxxGroupHeaderStamp(const CxxRequestGroup& group,
         return true;
     }
 
+/*
+ * Content hash of each header, memoized per process on (path, mtime, size): the type-request
+ * cache asks on every load/store, and a multi-MB umbrella header costs milliseconds per hash. A
+ * changed stamp re-hashes (LSP edits between analyses). An unreadable file hashes to 0, uncached.
+ */
 uint64_t LLVMBackend::CxxGroupHeaderHash(const CxxRequestGroup& group) const
 {
+        struct StampedHash
+        {
+            std::filesystem::file_time_type mtime;
+            uintmax_t size = 0;
+            uint64_t hash = 0;
+        };
+        static std::mutex mutex;
+        static std::unordered_map<std::string, StampedHash> hashes;
+
+        auto contentHash = [](const std::string& path) -> uint64_t {
+            std::error_code timeError, sizeError;
+            const auto mtime = std::filesystem::last_write_time(path, timeError);
+            const uintmax_t size = std::filesystem::file_size(path, sizeError);
+            const bool stamped = !timeError && !sizeError;
+            if (stamped)
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                auto it = hashes.find(path);
+                if (it != hashes.end() && it->second.mtime == mtime && it->second.size == size)
+                    return it->second.hash;
+            }
+            uint64_t hash = 0;
+            if (!HashFileFnv1a(path, hash)) return 0;
+            if (stamped)
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                hashes[path] = StampedHash{ mtime, size, hash };
+            }
+            return hash;
+        };
+
         uint64_t combined = 14695981039346656037ULL;
         for (const auto& h : group.headers)
         {
-            uint64_t one = 0;
-            HashFileContents(h, one);
-            combined ^= one; combined *= 1099511628211ULL;
+            combined ^= contentHash(h); combined *= 1099511628211ULL;
         }
         return combined;
     }
@@ -20021,6 +20057,9 @@ bool LLVMBackend::IsCxxSharedPtrUpcast(const TypeAndValue& from,
                                        const TypeAndValue& to) const
 {
         if (from.Pointer || from.TypeName.empty() || to.TypeName.empty()) return false;
+        // Cheap shape reject first: this runs per overload candidate, and demangling is not free.
+        if (MangledBase(from.TypeName) != "std.shared_ptr"
+            || MangledBase(to.TypeName) != "std.shared_ptr") return false;
         TypeSpelling fromSpelling;
         TypeSpelling toSpelling;
         if (!DemangleType(*this, from.TypeName, fromSpelling)

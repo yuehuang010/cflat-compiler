@@ -137,8 +137,16 @@ struct TypeParseCandidate
 
 using TypeParseCandidates = std::vector<TypeParseCandidate>;
 
-TypeParseCandidates ParseMangledCandidates(const LLVMBackend& compiler,
-                                            std::string_view text, size_t position);
+/*
+ * Candidate lists already parsed at a position of ONE text. Without it, an argument list of
+ * unknown arity re-parses the same suffix once per enclosing choice (exponential on deep
+ * template names). The parse only reads compiler state, so a position's list is fixed per text.
+ */
+using TypeParseMemo = std::unordered_map<size_t, TypeParseCandidates>;
+
+const TypeParseCandidates& ParseMangledCandidates(const LLVMBackend& compiler,
+                                                  std::string_view text, size_t position,
+                                                  TypeParseMemo& memo);
 
 struct TypePrefix
 {
@@ -207,7 +215,7 @@ static void AddTypeCandidate(TypeSpelling spelling, size_t position,
 void ParseMangledArguments(const LLVMBackend& compiler, std::string_view text,
                            size_t position, size_t remaining,
                            std::vector<TypeSpelling> args, TypeParseCandidates& out,
-                           std::string_view base, const TypePrefix& prefix)
+                           std::string_view base, const TypePrefix& prefix, TypeParseMemo& memo)
 {
     if (remaining == 0)
     {
@@ -219,7 +227,7 @@ void ParseMangledArguments(const LLVMBackend& compiler, std::string_view text,
         return;
     }
 
-    auto candidates = ParseMangledCandidates(compiler, text, position);
+    const auto& candidates = ParseMangledCandidates(compiler, text, position, memo);
     for (auto it = candidates.rbegin(); it != candidates.rend(); ++it)
     {
         size_t nextPosition = it->position;
@@ -229,15 +237,15 @@ void ParseMangledArguments(const LLVMBackend& compiler, std::string_view text,
             nextPosition++;
         }
         auto nextArgs = args;
-        nextArgs.push_back(std::move(it->spelling));
+        nextArgs.push_back(it->spelling);
         ParseMangledArguments(compiler, text, nextPosition, remaining - 1,
-                              std::move(nextArgs), out, base, prefix);
+                              std::move(nextArgs), out, base, prefix, memo);
     }
 }
 
 void ParseClosureCandidates(const LLVMBackend& compiler, std::string_view text,
                             size_t start, const TypePrefix& prefix,
-                            TypeParseCandidates& out)
+                            TypeParseCandidates& out, TypeParseMemo& memo)
 {
     size_t baseEnd = text.find('$', start);
     std::string_view base = baseEnd == std::string_view::npos
@@ -262,8 +270,8 @@ void ParseClosureCandidates(const LLVMBackend& compiler, std::string_view text,
         size_t position = 0;
     };
     std::vector<ClosureCandidate> partials;
-    for (auto& ret : ParseMangledCandidates(compiler, text, position))
-        partials.push_back({ { std::move(ret.spelling) }, ret.position });
+    for (const auto& ret : ParseMangledCandidates(compiler, text, position, memo))
+        partials.push_back({ { ret.spelling }, ret.position });
 
     for (size_t i = 0; i < parameterCount; i++)
     {
@@ -277,16 +285,16 @@ void ParseClosureCandidates(const LLVMBackend& compiler, std::string_view text,
             if (moveEnd != std::string_view::npos
                 && text.substr(parameterStart, moveEnd - parameterStart) == ".m")
                 parameterStart = moveEnd + 1;
-            auto candidates = ParseMangledCandidates(compiler, text, parameterStart);
+            const auto& candidates = ParseMangledCandidates(compiler, text, parameterStart, memo);
             for (auto it = candidates.rbegin(); it != candidates.rend(); ++it)
             {
                 auto components = partial.components;
                 bool isMove = moveEnd != std::string_view::npos
                     && text.substr(partial.position + 1, moveEnd - partial.position - 1) == ".m";
-                size_t paramPosition = it->position;
-                it->spelling.move = isMove;
-                components.push_back(std::move(it->spelling));
-                next.push_back({ std::move(components), paramPosition });
+                TypeSpelling parameter = it->spelling;
+                parameter.move = isMove;
+                components.push_back(std::move(parameter));
+                next.push_back({ std::move(components), it->position });
             }
         }
         partials = std::move(next);
@@ -303,8 +311,9 @@ void ParseClosureCandidates(const LLVMBackend& compiler, std::string_view text,
     }
 }
 
-TypeParseCandidates ParseMangledCandidates(const LLVMBackend& compiler,
-                                            std::string_view text, size_t position)
+TypeParseCandidates ComputeMangledCandidates(const LLVMBackend& compiler,
+                                             std::string_view text, size_t position,
+                                             TypeParseMemo& memo)
 {
     TypeParseCandidates out;
     if (position >= text.size()) return out;
@@ -341,7 +350,7 @@ TypeParseCandidates ParseMangledCandidates(const LLVMBackend& compiler,
     if (!ParseTypePrefix(text, basePosition, prefix)) return out;
     if (basePosition >= text.size()) return out;
 
-    ParseClosureCandidates(compiler, text, basePosition, prefix, out);
+    ParseClosureCandidates(compiler, text, basePosition, prefix, out, memo);
     if (!out.empty()) return out;
 
     size_t separator = text.find('$', basePosition);
@@ -363,7 +372,7 @@ TypeParseCandidates ParseMangledCandidates(const LLVMBackend& compiler,
         std::vector<TypeSpelling> args;
         if (separator == std::string_view::npos) return out;
         ParseMangledArguments(compiler, text, separator + 1, *arity,
-                              std::move(args), out, simple.base, prefix);
+                              std::move(args), out, simple.base, prefix, memo);
         return out;
     }
 
@@ -374,13 +383,24 @@ TypeParseCandidates ParseMangledCandidates(const LLVMBackend& compiler,
     {
         std::vector<TypeSpelling> args;
         ParseMangledArguments(compiler, text, separator + 1, 1,
-                              std::move(args), out, simple.base, prefix);
+                              std::move(args), out, simple.base, prefix, memo);
     }
     if (separator == std::string_view::npos)
         AddTypeCandidate(std::move(simple), text.size(), prefix, out);
     else
         AddTypeCandidate(std::move(simple), separator, prefix, out);
     return out;
+}
+
+// Every nested parse starts strictly after `position`, so filling the memo never recurses into
+// the entry being computed; unordered_map keeps references to earlier entries valid.
+const TypeParseCandidates& ParseMangledCandidates(const LLVMBackend& compiler,
+                                                  std::string_view text, size_t position,
+                                                  TypeParseMemo& memo)
+{
+    if (auto it = memo.find(position); it != memo.end()) return it->second;
+    TypeParseCandidates candidates = ComputeMangledCandidates(compiler, text, position, memo);
+    return memo.emplace(position, std::move(candidates)).first->second;
 }
 
 std::string MangleTypeArgument(const LLVMBackend& compiler, std::string_view typeName)
@@ -683,11 +703,12 @@ bool DemangleType(const LLVMBackend& compiler, std::string_view mangled, TypeSpe
         return true;
     }
 
-    for (auto& candidate : ParseMangledCandidates(compiler, mangled, 0))
+    TypeParseMemo memo;
+    for (const auto& candidate : ParseMangledCandidates(compiler, mangled, 0, memo))
     {
         if (candidate.position == mangled.size())
         {
-            out = std::move(candidate.spelling);
+            out = candidate.spelling;
             return true;
         }
     }
@@ -772,11 +793,12 @@ bool DemangleFunctionSymbol(const LLVMBackend& compiler, std::string_view symbol
     if (symbol.size() < 3 || symbol.front() != '_') return false;
     size_t nameEnd = symbol.find('$', 1);
     if (nameEnd == std::string_view::npos) return false;
+    TypeParseMemo memo;
     for (; nameEnd != std::string_view::npos;
          nameEnd = symbol.find('$', nameEnd + 1))
     {
         std::string candidateName(symbol.substr(1, nameEnd - 1));
-        for (auto& ret : ParseMangledCandidates(compiler, symbol, nameEnd + 1))
+        for (const auto& ret : ParseMangledCandidates(compiler, symbol, nameEnd + 1, memo))
         {
             if (ret.position >= symbol.size() || symbol[ret.position] != '$') continue;
             size_t countStart = ret.position + 1;
@@ -788,7 +810,7 @@ bool DemangleFunctionSymbol(const LLVMBackend& compiler, std::string_view symbol
 
             FunctionSymbolSpelling candidate;
             candidate.name = candidateName;
-            candidate.returnType = std::move(ret.spelling);
+            candidate.returnType = ret.spelling;
             std::vector<TypeSpelling> params;
             std::vector<bool> moves;
             std::function<bool(size_t, size_t)> parseParams =
@@ -820,9 +842,10 @@ bool DemangleFunctionSymbol(const LLVMBackend& compiler, std::string_view symbol
                         isMove = true;
                         parameterStart = moveEnd + 1;
                     }
-                    for (auto& param : ParseMangledCandidates(compiler, symbol, parameterStart))
+                    for (const auto& param : ParseMangledCandidates(compiler, symbol, parameterStart,
+                                                                    memo))
                     {
-                        params.push_back(std::move(param.spelling));
+                        params.push_back(param.spelling);
                         moves.push_back(isMove);
                         if (parseParams(index + 1, param.position)) return true;
                         params.pop_back();

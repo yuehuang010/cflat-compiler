@@ -26,6 +26,87 @@ uses), stage-2 per-request codegen re-emitting the group's whole free-function s
 
 **Idle-ish baseline (load 4.4, parity.sh N=1, 14:5x):** clang++ 3.67 s | warm 16.26 s (4.4x) | cold 86.12 s (23.5x).
 
+**Windows baseline 2026-09-28 18:14 (master 1f4090f7, FIRST Windows measurement; MSVC STL headers, MS ABI,
+lld-link; Ryzen AI 9 365, idle).** Harness `test_libs_parity.ps1` (C++ twins `test_libs/<lib>/<case>.cpp` next to
+the RUN-mode tier-1 cases, csv in out/parity/). Method: median of 3, fresh process pinned to affinity 0x55 (Zen5
+CPUs 0/2/4/6), inside vcvars64; clang++ = `-std=c++20 -O0 -fuse-ld=lld` (cflat `-o` default is -O0) with the CRT each
+lib needs (json/fmt /MD, simdjson.lib is /MT); cold = fresh empty `CFLAT_CACHE_DIR` + untimed `cflat --init` (20 files:
+core bitcode + linker paths, no `cheaders/`), warm = same cache, different `-o`.
+
+| case | clang++ | cold | cold/clang++ | warm | warm/clang++ |
+|---|---|---|---|---|---|
+| fmt_01_runtime | 0.69 | 0.90 | 1.31 | 0.18 | 0.26 |
+| fmt_02_consteval | 0.67 | 0.89 | 1.34 | 0.16 | 0.25 |
+| fmt_03_memory_buffer | 0.68 | 0.82 | 1.21 | 0.17 | 0.25 |
+| fmt_04_string_arg | 0.69 | 0.89 | 1.29 | 0.17 | 0.25 |
+| json_01_read | 2.06 | 4.74 | 2.30 | 1.29 | 0.62 |
+| json_02_type_checks | 1.94 | 3.66 | 1.89 | 0.42 | 0.21 |
+| json_03_build | 1.88 | 3.30 | 1.76 | 0.31 | 0.16 |
+| simdjson_01_dom | 1.30 | 1.65 | 1.27 | 0.35 | 0.27 |
+| simdjson_02_ondemand | 1.39 | 2.37 | 1.71 | 0.74 | 0.53 |
+
+Worst cold: json_01_read (2.30x). Its `-ftime-trace` cold run (5.18 s span; clang time-trace
+scopes are inlined into the same trace): CodeGeneration 2.82 s incl, ProcessImports 1.47 s (CHeaderExtract 1.38 s,
+CxxGroupHeaderParse 1.22 s), RunCxxTypeRequests 1.93 s (CxxRequestStage2 1.85 s). Top self time: CodeGeneration 807 ms,
+CheckConstraintSatisfaction 803 ms (x77), InstantiateFunction 661 ms (x821),
+ParseDeclarationOrFunctionDefinition 413 ms, ParseClass 282 ms, InstantiateClass 278 ms, CxxGroupHeaderParse 274 ms,
+RunCxxTypeRequests 221 ms, CxxDemandFlush 193 ms, CxxDemandHand 181 ms, CxxDefinitionEmit 131 ms, CHeaderExtract 110 ms,
+OptModule 109 ms. Scale: `clang++ -fsyntax-only` on the same .cpp = 1.63 s, `-c` = 1.96 s, compile+link 2.06 s.
+
+Observations: (1) fmt (header + prebuilt dll, small instantiation set) and simdjson_01 are already 1.2-1.35x cold;
+the 1.7-2.3x cases are the template-heavy ones (nlohmann json, simdjson ondemand), where clang instantiation work
+(CheckConstraintSatisfaction, InstantiateFunction/Class ~2 s of the cold span) is done in cflat's type-request
+stages on top of the header group parse, i.e. the same work clang++ does once inline. (2) Warm meets the target
+everywhere (0.16-0.62x); json_01_read warm is the outlier (1.29 s vs 0.3-0.4 for its siblings), and its warm trace
+shows CodeGeneration 820 ms of 1.26 s (companion/cache load is only ~0.15 s), so warm cost there is cflat-side
+codegen of the many instantiated json members, not cache replay. (3) Windows cold is closer to the 1.1x goal than
+mac was at the start (1.7-2.3x here vs 23x), but still not met for json/simdjson-ondemand.
+
+**Windows fixes 2026-09-28 (perf only; cheaders/ tree byte-identical to a pre-change cold run, no cache version
+bump).** (1) Demangler: `ParseMangledCandidates` re-parsed the same suffix once per enclosing choice when a template
+arity was unknown (exponential on `pair<const string, basic_json<...>>`), uncached, per overload candidate. Now a
+per-call position memo (`TypeParseMemo` in TypeMangling.cpp; state is read-only during one parse, so no
+invalidation question), plus a `MangledBase` shape reject in `IsCxxSharedPtrUpcast` before it demangles.
+(2) `CxxGroupHeaderHash` hashed the whole header (simdjson.h 6.4 MB) on every type-request cache load/store; now
+memoized per process on (path, mtime, size), same hash value. N=3, pinned 0x55:
+
+| case | clang++ | cold before | cold after | warm before | warm after |
+|---|---|---|---|---|---|
+| fmt_01_runtime | 0.70 | 0.90 | 0.92 | 0.18 | 0.17 |
+| json_01_read | 2.09 | 4.85 | 4.11 (1.97x) | 1.31 | 0.56 (0.27x) |
+| simdjson_02_ondemand | 1.39 | 2.36 | 1.59 (1.15x) | 0.75 | 0.29 (0.21x) |
+
+**Windows front-end baseline 2026-09-28 19:19 (same tree as the fixes above; `test_libs_parity.ps1 -Mode Syntax`
+or default `Both`).** Method: `clang++ -std=c++20 -fsyntax-only` (same -I, no codegen/link) vs `cflat <case>.cb
+--check` (same --c-include/--c-lib), median of 3, pinned 0x55, inside vcvars64, cold = fresh `--init`'d cache (its
+own dir, not the `-o` cold's), warm = a second `--check` on that cache. `--check` runs the whole import path (header
+bind, stage-1/stage-2 type requests, explicit instantiations, ODR-use helpers, in-process codegen of the request TU)
+but is a batch-mode compile: it skips the demand-companion definition rounds (`cxxDemandLinks_` off, companion
+refused "batch mode"), the module optimizer/baseline passes, and object emission/linking. Quirk (the 5L-style
+divergence): `--check` only READS the C++ type-request disk cache, it never writes one (the cache ends with the
+header entry alone, 4.8-5.5 MB, every run logs "cache MISS (missing entry)"), so its "warm" only saves the
+header parse and is not comparable to the `-o` warm. Read the check-cold column as the pure front-end cost.
+
+| case | clang++ -fsyntax-only | --check cold | cold/clang++ | --check "warm" | warm/clang++ |
+|---|---|---|---|---|---|
+| fmt_01_runtime | 0.55 | 0.79 | 1.44 | 0.70 | 1.28 |
+| fmt_02_consteval | 0.56 | 0.79 | 1.43 | 0.71 | 1.27 |
+| fmt_03_memory_buffer | 0.55 | 0.73 | 1.33 | 0.64 | 1.16 |
+| fmt_04_string_arg | 0.55 | 0.79 | 1.44 | 0.73 | 1.31 |
+| json_01_read | 1.69 | 3.24 | 1.91 | 3.12 | 1.84 |
+| json_02_type_checks | 1.64 | 2.99 | 1.83 | 2.91 | 1.78 |
+| json_03_build | 1.63 | 3.04 | 1.86 | 2.93 | 1.79 |
+| simdjson_01_dom | 1.10 | 1.24 | 1.13 | 1.07 | 0.97 |
+| simdjson_02_ondemand | 1.11 | 1.40 | 1.26 | 1.22 | 1.10 |
+
+Same run, compile+link baseline (Release; matches the table above): json_01 cold 4.06 (1.91x) warm 0.55 (0.26x),
+json_02 3.64 (1.83x) / 0.41 (0.20x), json_03 3.35 (1.77x) / 0.29 (0.15x), simdjson_01 1.39 (1.06x) / 0.22 (0.16x),
+simdjson_02 1.60 (1.15x) / 0.29 (0.21x), fmt_01..04 0.83-0.91 (1.23-1.34x) / 0.16-0.18 (0.24-0.25x). Reading: the
+cold ratio is almost the same against either baseline (json ~1.8-1.9x), i.e. the gap is front-end work
+(header group parse + type-request instantiation), not codegen/link. Cold cache after a `-o` compile:
+fmt 48-56 files / 4.8-5.2 MB, json_01 154 files / 11.0 MB (134 cheaders/), json_02 90 / 9.1, json_03 106 / 8.9,
+simdjson_01 48 / 5.5, simdjson_02 98 / 6.5.
+
 **Status 2026-09-28 12:25 (master bd1def8e, perf timebox 3, 09:40 -> 15:40).** parity.sh N=3, quiet
 machine: clang++ 3.26 s | cflat warm 0.46 s (0.15x, met) | cflat cold 5.26 s plain LLVM (1.6x) /
 4.29 s with a PGO-built LLVM (1.3x, scratch/pgo_llvm_notes.md, install llvm-23.1.0-pgo, ruling R2 in
