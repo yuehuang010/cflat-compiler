@@ -34,3 +34,7 @@ step, (2) a Debug-only IR invariant violated when the target triple differs from
 
 Root-cause each independently when the deferral lifts. Item 2 needs a proper compiler error
 once root-caused (LLVM assert rule). Consider an `-p` suite leg so cross targets stay covered.
+
+Cache note (A8 round-2 review, 2026-09-28): the request-cache prune scope (the `.rq` line 3) records only Windows vs
+non-Windows, not the full target triple. Two non-Windows targets sharing one cache would treat each other's live
+entries as dead and delete them. It is a one-line fix (fold the triple into line 3); do it when `-p` cross-target returns.

@@ -3390,3 +3390,21 @@ An inherited virtual dtor slot can authorize `new Derived` so owning conversion 
 - 2026-09-26: A class that declares `operator&&` / `operator==` for its own receiver resolves through it, as in C++; the bool-conversion shortcut is only for a class WITHOUT one (vector<bool> proxy). The string overload of `CreateOperation` does not know `&&`/`||`; use the `Operation` enum.
 - 2026-09-26: `Linker::Flags::LinkOnlyNeeded` cannot be iterated to a fixed point: appending globals (`llvm.global_ctors`) always link and drag their private initializer thunks in again on every pass, so the definition count never stops growing and static initializers duplicate. Merge first, then one LinkOnlyNeeded pass (see internal/issue/p3/cpp-interop-fixtures-gate-ci-wall-time.md).
 - 2026-09-26: llvm::Linker links a linkonce definition only when the destination already NAMES it (`linkIfNeeded` returns early for an unreferenced linkonce). Linking companions into the program worked because cflat declares what it binds; merging them into an empty scratch module first silently drops every linkonce body a LATER blob calls, and the symptom is an lld `undefined symbol` for a plain inline ctor. Pre-declare the linkonce definitions in the destination before each blob.
+
+## Lesson 2026-09-29: a fix that widens a shared route regresses the neighbours it did not name
+
+Three landings in one timebox had the same round-1 defect. A fix routed MORE inputs through a path
+built for the one shape the issue named, and reviewers found neighbours that had worked on master
+and now broke:
+- B17: the suffix identity (`1UL` -> `unsigned long`) was applied to every overload. Native
+  same-width pairs such as `f(long)`/`f(u64)` then tied and were refused. Fix: gate it on
+  `candidate.IsCxx`.
+- B18: stripping parens sent every `(c ? a : b)` down the ternary route. Scalar arms into a
+  converting ctor, and nested mixed arms, went from working to refused. Fix: parens take the route
+  only when an arm is an assignment.
+- B20: the const-twin lookup accepted a BASE class's twin (hiding broke), and the twin skip ran
+  before the virtual-slot record (static dispatch, pure-virtual link failure).
+Rule for briefs and reviews: when a fix changes WHICH path an input takes, name the old path's
+other clients. The brief lists them as the accept set, and the review runs a master-vs-branch diff
+over them (B17's 1056-cell native matrix, B18's 129 probes). A "0 diff vs master" line in the
+report is what makes such a fix landable.
