@@ -129,6 +129,9 @@ static std::optional<IsolatedPolicy> ConfigureIsolatedMode(LLVMBackend& compiler
 
 int main(int argc, char* argv[])
 {
+    // Pin the build stamp to the binary that is running: a long-lived process (the LSP server)
+    // must not stamp its harvests with a later rebuild's stamp read on first use.
+    if (LLVMBackend::CacheBuildStampEnabled()) LLVMBackend::CompilerBuildStamp();
     if (argc >= 2 && std::string_view(argv[1]) == "lsp")
         return RunLspServer(argc - 2, argv + 2);
 

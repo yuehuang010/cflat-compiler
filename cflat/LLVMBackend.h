@@ -3348,6 +3348,11 @@ private:
         // Own headers plus their transitive includes, normalized: what a probe may claim to own.
         std::unordered_set<std::string> reachableFiles;
         unsigned headerParseCount = 0;
+        // Content hash per closure file (normalized path -> FNV-1a), taken from the harvest
+        // entry's dependency list; folded by CxxGroupClosureHash, memoized until it grows.
+        std::map<std::string, uint64_t> closureContent;
+        mutable uint64_t closureHash = 0;
+        mutable size_t closureHashFiles = static_cast<size_t>(-1);
     };
     std::vector<CxxImportGroup> cxxImportGroups_;
     /*
@@ -3365,6 +3370,10 @@ private:
         std::vector<std::string> ownerDefines;
         std::string label;
         size_t primary = static_cast<size_t>(-1);   // index into cxxImportGroups_
+        std::vector<size_t> dependencyGroups;       // indices into cxxImportGroups_, sorted
+        // Which entries a request-cache prune may judge against this group's validity: the
+        // whole header/define composition plus the include dirs, -D defines and C++ standard.
+        std::string pruneScope;
         bool diskCache = false;
     };
     const CxxRequestGroup* activeCxxRequestGroup_ = nullptr;
@@ -3393,8 +3402,7 @@ private:
     // This compile links its C++ companions (not --check, a batch, or an LSP analysis); only
     // then does a new live request replay the served chunks ahead of itself.
     bool cxxDemandLinks_ = false;
-    // After an early replay, live chunks are numbered from their content (see RunCxxTypeRequests).
-    bool cxxDemandContentChunkNumbers_ = false;
+    // Chunk numbers taken in this compile, live or replayed (see RunCxxTypeRequests).
     std::unordered_set<unsigned> cxxDemandUsedChunkNumbers_;
     std::string CxxIncrementalGroupKey(const CxxRequestGroup& group) const;
     // `entryKey` is the entry's full cache key (clang args, -I/-D, source, std, target), so a
@@ -5706,6 +5714,8 @@ private:
                                                 const CxxIncrementalGroup& incremental,
                                                 cflat_cinterop::ExtractResult& raw) const;
     void RememberCxxGroupReachableFiles(size_t group, const std::vector<std::string>& files);
+    void RememberCxxGroupClosureContent(size_t group, const std::vector<CHeaderDep>& deps);
+    uint64_t CxxGroupClosureHash(const CxxRequestGroup& group) const;
 
     bool RequestCxxForeignType(const std::string& cflatName, const std::string& cxxSpelling,
                                std::string& error, bool needDefinitions = true,
@@ -10519,11 +10529,11 @@ public:
      * is ENCODED (a signature baseline is keyed on this version, so entries and the baseline they
      * index into can never disagree about the encoding). The numbered history above
      * TryLoadCFileSigCache says what each bump was for. It is the ONLY
-     * guard on entry compatibility for the type-request cache: that cache is deliberately not
-     * keyed on the compiler build stamp, so entries survive a cflat rebuild (CI rebuilds every
-     * run, and re-harvesting a cold cache is what put test_cpp_interop_template over test.bat's
-     * timeout). The PCH key still folds the build stamp, since a PCH belongs to the clang that
-     * wrote it.
+     * guard on entry compatibility for the type-request cache by default: entries are checked
+     * against the compiler build stamp only under CacheBuildStampEnabled(), so otherwise they
+     * survive a cflat rebuild (CI rebuilds every run, and re-harvesting a cold cache is what put
+     * test_cpp_interop_template over test.bat's timeout). The PCH key still folds the build
+     * stamp, since a PCH belongs to the clang that wrote it.
      */
     // 96: generated [cpp] member helpers now expose non-override methods to C++ templates.
     // 97: default-argument wrappers skip ambiguous shortened calls, dedupe, move by-value args.
@@ -10549,8 +10559,15 @@ public:
     // 127: out-of-line inline and implicit-template static data members emit into the companion.
     // 128: C++ pointer results record pointee const (IsCxxPointeeConst); free `T *const &`
     //      returns record IsCxxConstRef like member ones.
-    static constexpr int kCHeaderCacheVersion = 128;
+    // 129: request markers record entry validity (entries also carry the build stamp when
+    //      CFLAT_CACHE_BUILD_STAMP=1).
+    static constexpr int kCHeaderCacheVersion = 129;
     static std::string CompilerBuildStamp();
+    // THE switch for "the compiler build is part of cache entry validity": header/request
+    // entries record and check "cstamp", and demand companion keys fold the stamp. OFF by
+    // default (nothing reads or writes the stamp); CFLAT_CACHE_BUILD_STAMP=1 turns it on. The
+    // default flips to ON once cflat cold is within 1.1x of clang++ cold (p1 target).
+    static bool CacheBuildStampEnabled();
 
     static std::string GetCHeaderCacheDir();
 
@@ -10825,7 +10842,9 @@ public:
         const CxxRequestGroup* requestGroup = nullptr);
 
     static void PruneCxxTypeRequestDiskCache(const std::filesystem::path& cacheDir,
-                                             const CxxRequestGroup& group);
+                                             const CxxRequestGroup& group,
+                                             std::filesystem::file_time_type mtime,
+                                             uint64_t contentHash);
 
     // Each pending write knows its entry path, so a read waits only for the file it opens.
     struct CHeaderDiskCacheWriter

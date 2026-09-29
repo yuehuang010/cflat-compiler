@@ -4578,7 +4578,6 @@ void LLVMBackend::ResetForReanalysis()
     cxxDemandRetry_ = false;
     cxxDemandReplayInProgress_ = false;
     cxxDemandLinks_ = false;
-    cxxDemandContentChunkNumbers_ = false;
     cxxDemandUsedChunkNumbers_.clear();
     cxxDemandReplayed_ = false;
     activeCxxRequestGroup_ = nullptr;

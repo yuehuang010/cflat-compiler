@@ -270,9 +270,17 @@ is stored as a validated raw `<key>.bc` sidecar. Registration state is always re
 current process, so identities, using-directives, and spelling maps do not cross compilations.
 
 The request key includes the complete generated request source without the PCH, the owning
-group's header stamp, clang driver arguments, compiler build stamp, and whether definitions are
-emitted. A changed header, argument set, compiler, or emit mode is therefore a miss. Missing,
-truncated, or hash-mismatched sidecars are misses and are rewritten with the request entry.
+group's header stamp, clang driver arguments, the cache schema version, and whether definitions
+are emitted. A changed header, argument set, cache format, or emit mode is therefore a miss.
+Missing, truncated, or hash-mismatched sidecars are misses and are rewritten with the request entry.
+
+By default neither header nor request entries depend on the cflat build: they survive a rebuild,
+so `kCHeaderCacheVersion` must be bumped with any change to what the extractor harvests. With
+`CFLAT_CACHE_BUILD_STAMP=1`, every entry records the build that wrote it (`cstamp`, the cflat
+binary's mtime and size) and a load by another build is a `compiler build` miss that rewrites the
+entry in place; demand companions are then keyed per build too. The default flips to ON once a
+cold cflat compile is within 1.1x of clang++ cold (the p1 target); until then a rebuild must not
+make every header cold. The switch is `LLVMBackend::CacheBuildStampEnabled()`.
 
 Request entries are written whenever the request is accepted: the records are non-empty and, for
 a request carrying a generated prefix source, clang reported no error. A tolerated clang error
@@ -289,8 +297,14 @@ before a result is stored, every declaration whose real file (where its text, or
 produced it, was expanded; a `#line` name does not count) the request's own includes - its headers
 plus the prologue's `<new>` - do not reach is dropped, so a type-request entry holds only what its
 key's headers declare.
-Request entries are pruned with the owning header entry, and changing the cache format
-invalidates both together. With `-v`, each request reports a hit or a
+Each request entry has a `<key>.rq` marker naming its owner group and what the entry is valid
+for (header mtime and content hash). Storing a request prunes only the group's entries that no
+compile could load any more - other header contents - and only once their marker is ten minutes
+old, so a live entry is never deleted under a concurrent compile reading it, whichever cflat
+build that compile runs (an LSP server on the pre-rebuild binary, Debug beside Release). The
+build is never a prune reason; with the stamp switch on, a stale-build entry is rewritten in
+place by the next load of the current build.
+Changing the cache format invalidates every entry together. With `-v`, each request reports a hit or a
 miss and the miss reason.
 
 ## macOS

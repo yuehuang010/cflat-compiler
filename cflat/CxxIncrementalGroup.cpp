@@ -1682,13 +1682,27 @@ bool CxxIncrementalGroup::ParseRequest(const cflat_cinterop::ExtractRequest& req
         replay.order = impl_->demandChunkSources.size() + 1;
         replay.source = source;
         replay.prefixSource = req.demandPrefixSource;
+        // Store the whole prefix, not this group's unseen part of it: a replay re-strips it
+        // against its own group, which may not have parsed this compile's earlier chunks.
+        const size_t prefixAt = req.demandPrefixOffset;
+        if (!req.demandPrefixSource.empty() && prefixAt != std::string::npos
+            && prefixAt <= source.size())
+        {
+            const std::string unseen = UnseenPrefixSource(req.demandPrefixSource);
+            if (source.compare(prefixAt, unseen.size(), unseen) == 0)
+            {
+                replay.source = source.substr(0, prefixAt) + req.demandPrefixSource
+                    + source.substr(prefixAt + unseen.size());
+                replay.prefixOffset = prefixAt;
+            }
+        }
         replay.typeRequests = req.cxxTypeRequests;
         replay.markerPrefix = req.cxxRequestMarkerPrefix;
         replay.thunkSuffix = req.cxxThunkSuffix;
         replay.wrapperNames = req.cxxFunctionWrapperNames;
         replay.wrapperBatch = req.cxxWrapperBatch;
         replay.autoInstantiate = req.autoInstantiateCxxTypes;
-        impl_->demandChunkSources.push_back(source);
+        impl_->demandChunkSources.push_back(replay.source);
     }
     if (harvested && out.firstError.empty()) out.firstError = recoveredError;
     if (harvested && !renamedWrappers.empty())

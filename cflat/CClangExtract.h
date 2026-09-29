@@ -630,6 +630,9 @@ namespace cflat_cinterop
         std::string cxxRequestMarkerPrefix = "__cflat_req_";
         // Original generated prefix source, retained with demand chunks for cache replay.
         std::string demandPrefixSource;
+        // Byte offset in the parsed source where the prefix (less what this group has already
+        // seen) starts; npos when the source does not follow that layout.
+        size_t demandPrefixOffset = std::string::npos;
         // Appended to every virtual / vbase-constructor thunk name. An incremental group's chunks
         // share one scope, so a thunk that a later request repeats needs a name of its own.
         std::string cxxThunkSuffix;
@@ -708,8 +711,12 @@ namespace cflat_cinterop
         struct DemandReplayChunk
         {
             uint64_t order = 0;
+            // With prefixOffset set, `source` holds the WHOLE prefix at that offset: the parsing
+            // group strips what it has seen, which differs between the storing and replaying
+            // compile (a replay of a subset of one compile's chunks lacks earlier declarations).
             std::string source;
             std::string prefixSource;
+            size_t prefixOffset = std::string::npos;
             std::vector<ExtractRequest::CxxTypeRequest> typeRequests;
             std::string markerPrefix;
             std::string thunkSuffix;

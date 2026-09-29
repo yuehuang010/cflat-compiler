@@ -445,6 +445,243 @@ if [ "$RUN_MODE" -eq 0 ]; then
   fi
 fi
 
+# C++ request cache consistency across compiles sharing one cache. (1) A store for program b
+# must not prune program a's still-valid entries once their markers are past the prune grace
+# (the prune used to delete by age alone, under concurrent readers). (2) An entry stamped by
+# another compiler build must be a miss ("compiler build"), and the compile still succeeds.
+# (3)/(4) demand replay across compiles; (5) a store by ANOTHER build must not prune either;
+# (6) with CFLAT_CACHE_BUILD_STAMP unset (default) entries survive a rebuild. Only (2) and (5)
+# set the switch. (7) an edit to a header reached only through another import's #include misses
+# that import's entries and demand companion, repeated edits do not grow the request entries,
+# and a touch-only change still hits.
+if [ "$RUN_MODE" -eq 0 ]; then
+  cc_name="cxx_request_cache_consistency"
+  cc_dir="$RES/$cc_name.d"
+  cc_log="$RES/$cc_name.log"
+  cc_t0=$(now_ms)
+  rm -rf "$cc_dir"; mkdir -p "$cc_dir/cache"
+  [ -d "$(dirname "$CFLAT")/.cflat/runtime" ] && cp -R "$(dirname "$CFLAT")/.cflat/runtime" "$cc_dir/cache/"
+  printf '%s\n' 'import cpp "vector";' 'int main()' '{' '    std.vector<int> v = default;' \
+    '    v.push_back(40);' '    v.push_back(2);' '    return v[0] + v[1] == 42 ? 0 : 1;' '}' \
+    >"$cc_dir/a.cb"
+  printf '%s\n' 'import cpp "vector";' 'int main()' '{' '    std.vector<double> v = default;' \
+    '    v.push_back(40.0);' '    v.push_back(2.0);' '    return (int)(v[0] + v[1]) == 42 ? 0 : 1;' '}' \
+    >"$cc_dir/b.cb"
+  cc_compile() {
+    CFLAT_CACHE_DIR="$cc_dir/cache" $TIMEOUT "$CFLAT" "$cc_dir/$1.cb" -B -o "$cc_dir/$1.bin" "${@:3}" \
+      >"$cc_dir/$2.log" 2>&1 && "$cc_dir/$1.bin"
+  }
+  cc_fail=""
+  if ! cc_compile a a_cold || ! cc_compile a a_ctl -v; then cc_fail="compile of a failed"
+  else
+    # Probes that are never stored miss on every run; the control counts them.
+    cc_ctl="$(grep -c "request cache MISS" "$cc_dir/a_ctl.log")/$(grep -c "request cache HIT" "$cc_dir/a_ctl.log")"
+    perl -e 'my $t = time - 1200; utime $t, $t, @ARGV' "$cc_dir"/cache/cheaders/v*/*.rq
+    if ! cc_compile b b_store; then cc_fail="compile of b failed"
+    elif ! cc_compile a a_warm -v; then cc_fail="warm compile of a failed"
+    else
+      cc_now="$(grep -c "request cache MISS" "$cc_dir/a_warm.log")/$(grep -c "request cache HIT" "$cc_dir/a_warm.log")"
+      if [ "$cc_now" != "$cc_ctl" ] || [ "${cc_ctl#*/}" = 0 ]; then
+        cc_fail="b's store pruned a's live entries (a warm misses/hits: $cc_now, control $cc_ctl)"
+      else
+        # (2) runs with the build-stamp switch on (default off): restamp every entry, then forge one.
+        if ! CFLAT_CACHE_BUILD_STAMP=1 cc_compile a a_stamped; then cc_fail="compile of a with the build stamp on failed"
+        else
+          cc_entry=$(grep -l '"cxxRequestKey":"|RQstd::vector<int>' "$cc_dir"/cache/cheaders/v*/*.json | head -n 1)
+          perl -pi -e 's/"cstamp":"[^"]*"/"cstamp":"another-build"/' "$cc_entry"
+        fi
+        if [ -n "$cc_fail" ]; then :
+        elif ! CFLAT_CACHE_BUILD_STAMP=1 cc_compile a a_mixed -v; then cc_fail="compile of a over a foreign-build entry failed"
+        elif [ "$(grep -c 'request cache MISS for std::vector<int>.*(compiler build)' "$cc_dir/a_mixed.log")" != 1 ]; then
+          cc_fail="an entry stamped by another build was not exactly one 'compiler build' miss"
+        else
+          # (3) Entries stored by two cold compiles (separate caches, merged) replay into one
+          # interpreter for a program needing both: their chunk names must not collide.
+          mkdir -p "$cc_dir/m1" "$cc_dir/m2"
+          [ -d "$cc_dir/cache/runtime" ] && cp -R "$cc_dir/cache/runtime" "$cc_dir/m1/" \
+            && cp -R "$cc_dir/cache/runtime" "$cc_dir/m2/"
+          printf '%s\n' 'import cpp "vector";' 'int main()' '{' '    std.vector<int> v = default;' \
+            '    v.push_back(40);' '    v.push_back(2);' '    std.vector<double> w = default;' \
+            '    w.push_back(40.0);' '    w.push_back(2.0);' \
+            '    return v[0] + v[1] == 42 && (int)(w[0] + w[1]) == 42 ? 0 : 1;' '}' >"$cc_dir/ab.cb"
+          if ! (CFLAT_CACHE_DIR="$cc_dir/m1" $TIMEOUT "$CFLAT" "$cc_dir/a.cb" -B -o "$cc_dir/a.bin" \
+                  >"$cc_dir/m1.log" 2>&1 \
+                && CFLAT_CACHE_DIR="$cc_dir/m2" $TIMEOUT "$CFLAT" "$cc_dir/b.cb" -B -o "$cc_dir/b.bin" \
+                  >"$cc_dir/m2.log" 2>&1); then
+            cc_fail="cold compile into a separate cache failed"
+          else
+            for cc_f in "$cc_dir"/m2/cheaders/*/*.json "$cc_dir"/m2/cheaders/*/*.rq; do
+              cc_t="$cc_dir/m1/cheaders/${cc_f#"$cc_dir"/m2/cheaders/}"
+              [ -e "$cc_t" ] || cp "$cc_f" "$cc_t"
+            done
+            if ! CFLAT_CACHE_DIR="$cc_dir/m1" $TIMEOUT "$CFLAT" "$cc_dir/ab.cb" -B -o "$cc_dir/ab.bin" -v \
+                >"$cc_dir/ab.log" 2>&1 || ! "$cc_dir/ab.bin"; then
+              cc_fail="program over merged entries failed"
+            elif grep -q "demand replay failed" "$cc_dir/ab.log"; then
+              cc_fail="replaying two compiles' entries failed: $(grep -o 'demand replay failed ([^)]*' "$cc_dir/ab.log" | head -n 1)"
+            elif ! grep -q "replayed [0-9]* cached chunk" "$cc_dir/ab.log"; then
+              cc_fail="program over merged entries did not replay (leg is vacuous)"
+            else
+              # (4) p1 stores two requests sharing a [cpp] struct prefix (the second chunk parsed
+              # with that prefix already seen); p2 needs only the second. Its replay must still
+              # declare the struct ('undeclared identifier __cflat_user' before the fix).
+              mkdir -p "$cc_dir/m3"
+              [ -d "$cc_dir/cache/runtime" ] && cp -R "$cc_dir/cache/runtime" "$cc_dir/m3/"
+              printf '%s\n' 'import cpp "vector";' '[cpp] struct Leaf' '{' '    int v = 0;' '};' \
+                'int main()' '{' '    std.vector<Leaf> a = default;' '    Leaf one = default;' \
+                '    one.v = 40;' '    Leaf two = default;' '    two.v = 40;' '    a.push_back(move two);' \
+                '    std.vector<Leaf*> b = default;' '    b.push_back(&one);' \
+                '    return a[0].v + 2 == 42 && b[0].v == 40 && b.size() == 1 ? 0 : 1;' '}' >"$cc_dir/p1.cb"
+              printf '%s\n' 'import cpp "vector";' '[cpp] struct Leaf' '{' '    int v = 0;' '};' \
+                'int main()' '{' '    Leaf one = default;' '    one.v = 40;' \
+                '    std.vector<Leaf*> b = default;' '    b.push_back(&one);' \
+                '    return b[0].v + 2 == 42 && b.size() == 1 ? 0 : 1;' '}' >"$cc_dir/p2.cb"
+              if ! CFLAT_CACHE_DIR="$cc_dir/m3" $TIMEOUT "$CFLAT" "$cc_dir/p1.cb" -B -o "$cc_dir/p1.bin" \
+                  >"$cc_dir/p1.log" 2>&1 || ! "$cc_dir/p1.bin"; then
+                cc_fail="cold compile of p1 failed"
+              elif ! CFLAT_CACHE_DIR="$cc_dir/m3" $TIMEOUT "$CFLAT" "$cc_dir/p2.cb" -B -o "$cc_dir/p2.bin" -v \
+                  >"$cc_dir/p2.log" 2>&1 || ! "$cc_dir/p2.bin"; then
+                cc_fail="p2 over p1's entries failed"
+              elif grep -q "demand replay failed" "$cc_dir/p2.log"; then
+                cc_fail="replaying a subset of p1's chunks failed: $(grep -o 'demand replay failed ([^)]*' "$cc_dir/p2.log" | head -n 1)"
+              elif ! grep -q "replayed [0-9]* cached chunk" "$cc_dir/p2.log"; then
+                cc_fail="p2 did not replay p1's chunks (leg is vacuous)"
+              else
+                # (5) A second cflat build (a copy of the exe: new mtime, so a new build stamp)
+                # stores into the group with the stamp switch on; a's aged, still-valid entries
+                # must survive its prune. (6) With the switch off (default), a's entries must
+                # survive a rebuild: the second build compiles a warm.
+                mkdir -p "$cc_dir/alt" "$cc_dir/m4" "$cc_dir/m5"
+                for cc_f in "$(dirname "$CFLAT")"/*; do
+                  [ "$cc_f" = "$CFLAT" ] || ln -s "$cc_f" "$cc_dir/alt/"
+                done
+                cp -c "$CFLAT" "$cc_dir/alt/" 2>/dev/null || cp "$CFLAT" "$cc_dir/alt/"
+                touch "$cc_dir/alt/$(basename "$CFLAT")"
+                cc_alt="$cc_dir/alt/$(basename "$CFLAT")"
+                # A private copy for build A: a rebuild or touch of $CFLAT mid-check would restamp A.
+                mkdir -p "$cc_dir/prim"
+                for cc_f in "$(dirname "$CFLAT")"/*; do
+                  [ "$cc_f" = "$CFLAT" ] || ln -s "$cc_f" "$cc_dir/prim/"
+                done
+                cp -p "$CFLAT" "$cc_dir/prim/"; cc_prim="$cc_dir/prim/$(basename "$CFLAT")"
+                [ -d "$cc_dir/cache/runtime" ] && cp -R "$cc_dir/cache/runtime" "$cc_dir/m4/" \
+                  && cp -R "$cc_dir/cache/runtime" "$cc_dir/m5/"
+                cc_run() { # <cache> <exe> <program> <log> [args]
+                  CFLAT_CACHE_DIR="$cc_dir/$1" $TIMEOUT "$2" "$cc_dir/$3.cb" -B -o "$cc_dir/$3.bin" "${@:5}" \
+                    >"$cc_dir/$4.log" 2>&1 && "$cc_dir/$3.bin"
+                }
+                cc_counts() { echo "$(grep -c "request cache MISS" "$cc_dir/$1.log")/$(grep -c "request cache HIT" "$cc_dir/$1.log")"; }
+                export CFLAT_CACHE_BUILD_STAMP=1
+                if ! cc_run m4 "$cc_prim" a x_cold || ! cc_run m4 "$cc_prim" a x_ctl -v; then
+                  cc_fail="compile of a into the cross-build cache failed"
+                else
+                  cc_ctl=$(cc_counts x_ctl)
+                  perl -e 'my $t = time - 1200; utime $t, $t, @ARGV' "$cc_dir"/m4/cheaders/v*/*.rq
+                  if ! cc_run m4 "$cc_alt" b x_store; then
+                    cc_fail="compile of b by a second build failed"
+                  elif ! cc_run m4 "$cc_prim" a x_warm -v; then
+                    cc_fail="warm compile of a after the second build's store failed"
+                  else
+                    cc_now=$(cc_counts x_warm)
+                    if [ "$cc_now" != "$cc_ctl" ] || [ "${cc_ctl#*/}" = 0 ]; then
+                      cc_fail="another build's store pruned a's live entries (a warm misses/hits: $cc_now, control $cc_ctl)"
+                    fi
+                  fi
+                fi
+                unset CFLAT_CACHE_BUILD_STAMP
+                if [ -n "$cc_fail" ]; then :
+                elif ! cc_run m5 "$CFLAT" a y_cold || ! cc_run m5 "$CFLAT" a y_ctl -v; then
+                  cc_fail="compile of a with the build stamp off failed"
+                elif ! cc_run m5 "$cc_alt" a y_rebuilt -v; then
+                  cc_fail="compile of a by a rebuilt cflat failed"
+                else
+                  cc_ctl=$(cc_counts y_ctl); cc_now=$(cc_counts y_rebuilt)
+                  if [ "$cc_now" != "$cc_ctl" ] || [ "${cc_ctl#*/}" = 0 ] \
+                      || grep -q "compiler build" "$cc_dir/y_rebuilt.log"; then
+                    cc_fail="with the build stamp off a rebuild went cold (misses/hits: $cc_now, control $cc_ctl)"
+                  fi
+                fi
+                # (7) An edit to a header the import only INCLUDES (a.h, under h2.h / h3.h) must
+                # miss the requests and demand companions keyed on the importing groups. Keyed on
+                # the top-level headers only, a warm compile replayed the old bodies: (7a) a stale
+                # value, (7b) a definition strong before the edit colliding with the one now
+                # emitted inline ("symbol multiply defined").
+                cc_hdr() { # <dir> <inline|""> <bump>
+                  printf '%s\n' '#pragma once' 'namespace ccinc' '{' \
+                    '    struct R { int v = 0; R() = default; R(int x) : v(x) {} };' \
+                    "    $2 R& operator*=(R& a, int k) { a.v = a.v * k + $3; return a; }" '}' >"$cc_dir/$1/a.h"
+                }
+                if [ -n "$cc_fail" ]; then :
+                else
+                  for cc_s in m6 m7; do
+                    mkdir -p "$cc_dir/$cc_s"
+                    [ -d "$cc_dir/cache/runtime" ] && cp -R "$cc_dir/cache/runtime" "$cc_dir/$cc_s/"
+                    printf '%s\n' '#pragma once' '#include "a.h"' \
+                      'namespace ccinc2 { template <class T> struct P2 { T v; P2(T x) : v(x) {} T get() const { return v * 2; } }; }' \
+                      >"$cc_dir/$cc_s/h2.h"
+                    printf '%s\n' '#pragma once' '#include "a.h"' \
+                      'namespace ccinc3 { template <class T> struct P3 { T v; P3(T x) : v(x) {} T get() const { return v * 3; } }; }' \
+                      >"$cc_dir/$cc_s/h3.h"
+                  done
+                  cc_inc() { # <dir> <expected r.v> <log> [-v]
+                    printf '%s\n' 'import cpp "h2.h";' 'import cpp "h3.h";' 'int main()' '{' \
+                      '    ccinc2.P2<int> p2 = ccinc2.P2<int>(1);' '    ccinc3.P3<int> p3 = ccinc3.P3<int>(1);' \
+                      '    ccinc.R r = ccinc.R(10);' '    r *= 4;' \
+                      "    return p2.get() + p3.get() == 5 && r.v == $2 ? 0 : 1;" '}' >"$cc_dir/$1/inc.cb"
+                    CFLAT_CACHE_DIR="$cc_dir/$1" $TIMEOUT "$CFLAT" "$cc_dir/$1/inc.cb" -B -o "$cc_dir/$1/inc.bin" \
+                      ${4:-} >"$cc_dir/$3.log" 2>&1 && "$cc_dir/$1/inc.bin"
+                  }
+                  cc_rq() { ls "$cc_dir"/m6/cheaders/v*/*.rq 2>/dev/null | wc -l | tr -d ' '; }
+                  cc_age() { perl -e 'my $t = time - 1200; utime $t, $t, @ARGV' "$cc_dir"/m6/cheaders/v*/*.rq "$cc_dir"/m6/cheaders/v*/*.json; }
+                  cc_req() { grep -c "request cache $1" "$cc_dir/$2.log"; }
+                  cc_hdr m6 inline 1
+                  if ! cc_inc m6 41 z_seed; then cc_fail="(7a) cold compile over an included header failed"
+                  else
+                    sleep 1; cc_hdr m6 inline 2
+                    if ! cc_inc m6 42 z_edit; then
+                      cc_fail="(7a) a warm compile ignored an edit to an included header (stale value or compile failure)"
+                    # Past the prune grace, further included-header edits rewrite the same request
+                    # entries (the closure is keyed on content) or prune the dead ones: no growth.
+                    elif cc_n=$(cc_rq); cc_age; sleep 1; cc_hdr m6 inline 3; ! cc_inc m6 43 z_edit2; then
+                      cc_fail="(7a) second included-header edit gave a stale value or failed"
+                    elif cc_age; sleep 1; cc_hdr m6 inline 4; ! cc_inc m6 44 z_edit3; then
+                      cc_fail="(7a) third included-header edit gave a stale value or failed"
+                    elif [ "$(cc_rq)" -gt "$cc_n" ]; then
+                      cc_fail="(7a) request entries grew across included-header edits ($cc_n -> $(cc_rq) .rq)"
+                    # A touch that leaves the content alone must hit exactly like an unchanged run.
+                    elif ! cc_inc m6 44 z_same -v || { sleep 1; touch "$cc_dir/m6/a.h"; ! cc_inc m6 44 z_touch -v; }; then
+                      cc_fail="(7a) warm or touch-only compile failed"
+                    elif [ "$(cc_req HIT z_same)" -eq 0 ] || [ "$(cc_req HIT z_touch)" -ne "$(cc_req HIT z_same)" ] \
+                         || [ "$(cc_req MISS z_touch)" -ne "$(cc_req MISS z_same)" ]; then
+                      cc_fail="(7a) touching an included header missed the request cache (hit $(cc_req HIT z_touch) vs $(cc_req HIT z_same))"
+                    else
+                      # The strong seed does not link (one TU per import line); it only stores.
+                      cc_hdr m7 "" 1; cc_inc m7 41 z_strong
+                      sleep 1; cc_hdr m7 inline 1
+                      if ! cc_inc m7 41 z_inline; then
+                        cc_fail="(7b) strong -> inline edit of an included header failed warm: $(grep -o 'Linking globals[^!]*!' "$cc_dir/z_inline.log" | head -n 1)"
+                      elif ! grep -q "multiply defined" "$cc_dir/z_strong.log"; then
+                        cc_fail="(7b) the strong seed linked, so it stored no strong body (leg is vacuous)"
+                      fi
+                    fi
+                  fi
+                fi
+              fi
+            fi
+          fi
+        fi
+      fi
+    fi
+  fi
+  cat "$cc_dir"/*.log >"$cc_log" 2>/dev/null
+  if [ -z "$cc_fail" ]; then
+    write_result "$cc_name" "PASS" "$cc_t0"
+    rm -rf "$cc_dir"
+  else
+    write_result "$cc_name" "FAIL: $cc_fail" "$cc_t0"
+  fi
+fi
+
 # Tooling regression: compile the existing function-pointer fixture with the ownership
 # sanitizer, then verify a static-local move keeps both its runtime origin and DI record.
 if [ "$RUN_MODE" -eq 0 ]; then
@@ -580,6 +817,44 @@ elif $TIMEOUT "$CFLAT" "$SRC/cli_defines_fixture.cb" -i "$LIB" --locale-dir "$LO
 else
   write_result "$defines_name" "PASS" "$defines_t0"
 fi
+fi
+
+# Header cache: a dead cheaders/v<M> directory whose newest mtime is over 7 days old is removed on
+# the first header import of a process; a fresh one, a non-numeric name, a symlink (and its target)
+# and the live version stay. Private cache dir; fake dirs back-dated with touch -t.
+if [ "$RUN_MODE" -eq 0 ]; then
+  pv_name="cheader_version_prune"
+  pv_dir="$RES/$pv_name.d"
+  pv_log="$RES/$pv_name.log"
+  pv_t0=$(now_ms)
+  rm -rf "$pv_dir"; mkdir -p "$pv_dir/cache/cheaders/v1" "$pv_dir/cache/cheaders/v2" \
+    "$pv_dir/cache/cheaders/vX" "$pv_dir/outside"
+  [ -d "$(dirname "$CFLAT")/.cflat" ] && cp -R "$(dirname "$CFLAT")/.cflat/." "$pv_dir/cache/"
+  touch "$pv_dir/cache/cheaders/v1/f" "$pv_dir/cache/cheaders/v2/f" "$pv_dir/cache/cheaders/vX/f" \
+    "$pv_dir/outside/f"
+  ln -s "$pv_dir/outside" "$pv_dir/cache/cheaders/v3"
+  pv_old=$(date -v-30d +%Y%m%d%H%M 2>/dev/null || date -d '30 days ago' +%Y%m%d%H%M)
+  touch -t "$pv_old" "$pv_dir/cache/cheaders/v1/f" "$pv_dir/cache/cheaders/v1" \
+    "$pv_dir/cache/cheaders/vX/f" "$pv_dir/cache/cheaders/vX" "$pv_dir/outside/f" "$pv_dir/outside"
+  printf '%s\n' 'import "c_macro_helpers.h";' 'int main()' '{' '    return 0;' '}' >"$pv_dir/p.cb"
+  if ! CFLAT_CACHE_DIR="$pv_dir/cache" $TIMEOUT "$CFLAT" "$pv_dir/p.cb" -i "$LIB" -B -o "$pv_dir/p.bin" \
+      >"$pv_log" 2>&1; then
+    write_result "$pv_name" "FAIL: header import did not compile" "$pv_t0"
+  elif [ -e "$pv_dir/cache/cheaders/v1" ]; then
+    write_result "$pv_name" "FAIL: a dead version directory older than 7 days survived" "$pv_t0"
+  elif [ ! -e "$pv_dir/cache/cheaders/v2/f" ]; then
+    write_result "$pv_name" "FAIL: a fresh version directory was removed" "$pv_t0"
+  elif [ ! -e "$pv_dir/cache/cheaders/vX/f" ]; then
+    write_result "$pv_name" "FAIL: a non-numeric directory was removed" "$pv_t0"
+  elif [ ! -L "$pv_dir/cache/cheaders/v3" ] || [ ! -e "$pv_dir/outside/f" ]; then
+    write_result "$pv_name" "FAIL: a symlinked version directory or its target was removed" "$pv_t0"
+  elif [ -z "$(find "$pv_dir/cache/cheaders" -mindepth 1 -maxdepth 1 -type d -name 'v[0-9]*' \
+      ! -name v2 ! -name v1 | head -n 1)" ]; then
+    write_result "$pv_name" "FAIL: the live version directory is missing (leg is vacuous)" "$pv_t0"
+  else
+    write_result "$pv_name" "PASS" "$pv_t0"
+  fi
+  rm -rf "$pv_dir"
 fi
 
 # Collect. Matches test.bat's per-test output: "PASSED: <name>  [<elapsed>]".

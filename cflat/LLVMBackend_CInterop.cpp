@@ -222,7 +222,6 @@ static bool IsSystemCxxHeaderPath(const std::string& path)
 }
 
 static bool UseCxxIncrementalRequests();
-static std::atomic<unsigned> gCxxIncrementalChunk;
 
 static std::string CxxDefaultWrapperName(const std::string& linkageName, size_t omittedArity);
 static bool HasNonConstDefaultSuffix(const std::vector<cflat_cinterop::RawDefaultArg>& defaults,
@@ -5470,7 +5469,7 @@ bool LLVMBackend::ReplayCxxDemandChunks(const std::string& groupKey, std::string
             std::chrono::steady_clock::now() - createStart).count();
         // Chunk-scoped names (__cflat_inc_<n>_) of a later live request must not repeat one a
         // replayed chunk already declared in this Interpreter.
-        auto reserveChunkNumber = [](const std::string& text) {
+        auto reserveChunkNumber = [this](const std::string& text) {
             static const std::string kChunk = "__cflat_inc_";
             size_t pos = 0;
             while ((pos = text.find(kChunk, pos)) != std::string::npos)
@@ -5483,11 +5482,7 @@ bool LLVMBackend::ReplayCxxDemandChunks(const std::string& groupKey, std::string
                     number = number * 10 + unsigned(text[pos++] - '0');
                     digits = true;
                 }
-                unsigned current = gCxxIncrementalChunk.load();
-                while (digits && current <= number
-                       && !gCxxIncrementalChunk.compare_exchange_weak(current, number + 1))
-                {
-                }
+                if (digits) cxxDemandUsedChunkNumbers_.insert(number);
             }
         };
         for (const auto& chunk : chunks)
@@ -5531,7 +5526,19 @@ bool LLVMBackend::ReplayCxxDemandChunks(const std::string& groupKey, std::string
                 req.cxxFunctionWrapperNames = chunk.wrapperNames;
                 req.cxxWrapperBatch = chunk.wrapperBatch;
                 req.autoInstantiateCxxTypes = chunk.autoInstantiate;
-                parsed = incremental->ParseRequest(req, chunk.source, raw, error);
+                // Strip the stored whole prefix against THIS group, as the live path does: it
+                // may lack declarations the storing compile's earlier chunks made.
+                std::string text = chunk.source;
+                const size_t at = chunk.prefixOffset;
+                if (at != std::string::npos && !chunk.prefixSource.empty()
+                    && chunk.source.compare(at, chunk.prefixSource.size(), chunk.prefixSource) == 0)
+                {
+                    text = chunk.source.substr(0, at)
+                        + incremental->UnseenPrefixSource(chunk.prefixSource)
+                        + chunk.source.substr(at + chunk.prefixSource.size());
+                    req.demandPrefixOffset = at;
+                }
+                parsed = incremental->ParseRequest(req, text, raw, error);
             }
             if (!parsed || !raw.demandRecorded)
             {
@@ -5588,7 +5595,6 @@ CxxIncrementalGroup* LLVMBackend::GetCxxIncrementalGroup(const CxxRequestGroup& 
             BuildCxxRequestClangArgs(group), source, verbose, error, tolerateDiagnostics,
             macroReq, macroOut);
         if (!created) return nullptr;
-        if (initialSource.empty()) gCxxIncrementalChunk.fetch_add(3);
         CxxIncrementalGroup* result = created.get();
         result->RememberPrefixSource(BuildCxxRequestIncludes(group));
         cxxIncrementalGroups_.emplace(std::move(key), std::move(created));
@@ -5602,12 +5608,6 @@ CxxIncrementalGroup* LLVMBackend::GetCxxIncrementalGroup(const CxxRequestGroup& 
         {
             std::string replayError;
             const bool replayed = ReplayCxxDemandChunks(groupKey, replayError);
-            /*
-             * Served entries noted after this point replay at link, after this compile's live
-             * chunks, and carry chunk numbers from the compile that stored them; a counter
-             * number could repeat one. Live chunks number from their content instead.
-             */
-            cxxDemandContentChunkNumbers_ = true;
             if (!replayed)
             {
                 cxxDemandRetry_ = true;
@@ -6103,18 +6103,20 @@ bool LLVMBackend::RunCxxTypeRequests(const CxxRequestGroup& group,
             CxxIncrementalGroup* incremental = GetCxxIncrementalGroup(group, error);
             if (incremental == nullptr) return false;
             const bool instantiateAll = !emitDefinitions;
-            unsigned chunkNumber = 0;
-            if (cxxDemandContentChunkNumbers_)
-            {
-                // Above any counter number; deterministic, so a rerun names chunks the same.
-                uint64_t hash = 14695981039346656037ULL;
-                for (unsigned char c : req.source + (emitDefinitions ? "|D" : "|S"))
-                    hash = (hash ^ c) * 1099511628211ULL;
-                chunkNumber = 100000u + unsigned(hash % 4000000000ULL);
-                while (!cxxDemandUsedChunkNumbers_.insert(chunkNumber).second) ++chunkNumber;
-            }
-            else
-                chunkNumber = gCxxIncrementalChunk.fetch_add(1);
+            /*
+             * Numbered from the content, never from a process counter: a replay serves chunks
+             * stored by several compiles into one interpreter, and two concurrent cold compiles
+             * counting from the same start gave different chunks one name (a typedef redefinition
+             * on replay, then a whole-compile cold retry). Deterministic, so a rerun names chunks
+             * the same and its demand companion key is stable.
+             */
+            uint64_t chunkHash = 14695981039346656037ULL;
+            for (unsigned char c : req.source + (emitDefinitions ? "|D" : "|S"))
+                chunkHash = (chunkHash ^ c) * 1099511628211ULL;
+            unsigned chunkNumber = 100000u + unsigned(chunkHash % 4000000000ULL);
+            // Residual: two requests of one group colliding mod 4e9 in DIFFERENT compiles still clash
+            // on replay (bypass retry); odds ~n^2/8e9 per group, accepted.
+            while (!cxxDemandUsedChunkNumbers_.insert(chunkNumber).second) ++chunkNumber;
             const std::string chunkPrefix = "__cflat_inc_" + std::to_string(chunkNumber) + "_";
             const std::string markerPrefix = chunkPrefix + "req_";
             req.cxxRequestMarkerPrefix = markerPrefix;
@@ -6127,12 +6129,14 @@ bool LLVMBackend::RunCxxTypeRequests(const CxxRequestGroup& group,
             ReplaceCxxRequestText(incrementalExtra, "__cflat_vthk_recv",
                                   chunkPrefix + "vthk_recv");
             AppendCxxThunkSuffix(incrementalExtra, req.cxxThunkSuffix);
-            const std::string incrementalPrefix = BuildCxxRequestIncludes(group)
+            const std::string incrementalIncludes = BuildCxxRequestIncludes(group);
+            const std::string incrementalPrefix = incrementalIncludes
                 + incremental->UnseenPrefixSource(prefixSource);
             const bool includeExplicitInstantiation = emitDefinitions;
             req.source = incrementalPrefix + BuildCxxRequestMarkers(
                 items, instantiateAll, markerPrefix, includeExplicitInstantiation) + incrementalExtra;
             req.demandPrefixSource = prefixSource;
+            req.demandPrefixOffset = incrementalIncludes.size();
             raw = cflat_cinterop::ExtractResult();
             CxxExtractionStageTimer parseStage(verbose, "clang parse stage incremental");
             if (incremental->ParseRequest(req, req.source, raw, error))
@@ -6193,9 +6197,9 @@ bool LLVMBackend::RunCxxTypeRequests(const CxxRequestGroup& group,
  * Identity of a C++ type request: the OWNING import group's headers and defines (never every C++
  * header imported so far), the C++ include dirs, the CFlat and C++ instantiation spellings, the
  * emit mode (an LSP bind carries no bodies and an empty companion module, which a compile must
- * never reuse), the bitfield packing mode of the resolved target, and the
- * compiler build stamp. Shares the C header signature cache, so it shares its row budget and its
- * LRU/root pinning.
+ * never reuse), the bitfield packing mode of the resolved target, and the cache schema version.
+ * The compiler build stamp is never keyed; CacheBuildStampEnabled() checks it inside the stored
+ * entry. Shares the C header signature cache, so it shares its row budget and its LRU/root pinning.
  */
 std::string LLVMBackend::CxxTypeRequestCacheKey(const CxxRequestGroup& group,
                                                 const std::string& cxxSpelling,
@@ -6212,6 +6216,7 @@ std::string LLVMBackend::CxxTypeRequestCacheKey(const CxxRequestGroup& group,
         std::filesystem::file_time_type stamp{};
         if (CxxGroupHeaderStamp(group, stamp))
             key += "|T" + std::to_string((long long)stamp.time_since_epoch().count());
+        key += std::format("|C{:016x}", CxxGroupClosureHash(group));
         key += emitDefinitions ? "|EDEF" : "|EDECL";
         // Imported records pack bitfields by the MSVC rule on a Windows target and the Itanium
         // rule elsewhere, so a cached layout from the other target is not reusable.
@@ -6227,7 +6232,8 @@ std::string LLVMBackend::CxxTypeRequestCacheKey(const CxxRequestGroup& group,
         // Schema version, NOT the compiler build stamp: a rebuilt cflat that harvests the same
         // way must reuse these entries. CI rebuilds on every run, and re-harvesting from cold is
         // what costs the C++ interop tests their wall clock. kCHeaderCacheVersion is what makes
-        // an incompatible entry miss - bump it whenever the harvest changes.
+        // an incompatible entry miss - bump it whenever the harvest changes. (CacheBuildStampEnabled
+        // checks the stamp inside the entry instead, so a rebuild rewrites this key's file.)
         key += "|V" + std::to_string(kCHeaderCacheVersion);
         if (cflat_cinterop::CxxEagerBodies()) key += "|BEAGER";
         return key;
@@ -6259,6 +6265,42 @@ bool LLVMBackend::CxxGroupHeaderStamp(const CxxRequestGroup& group,
             if (mt > newest) newest = mt;
         }
         return true;
+    }
+
+/*
+ * Content of everything the request group's import groups transitively include (`|C` in the
+ * request key, and folded into the entry's content hash). A request's entry and the group's
+ * cached demand companion carry bodies from included headers too (a struct defined in `a.h`,
+ * requested through `import cpp "b.h"` that includes it), so an edit to `a.h` alone must miss
+ * them - keyed on the top-level headers only, a warm compile replayed the old bodies: stale
+ * values, or a definition that was strong before the edit colliding with the one now emitted
+ * inline. Content, not mtime: a touch keeps hitting, and an edit rewrites the key's entry
+ * instead of stranding it. The per-file hashes are the harvest entry's dependency hashes,
+ * already checked fresh (mtime equal, else content equal) when the harvest loaded, so this
+ * stats and reads nothing. 0 for a group whose closure is unknown (no cache directory).
+ */
+uint64_t LLVMBackend::CxxGroupClosureHash(const CxxRequestGroup& group) const
+{
+        uint64_t combined = 14695981039346656037ULL;
+        auto fold = [&](size_t index) {
+            if (index >= cxxImportGroups_.size()) return;
+            const CxxImportGroup& g = cxxImportGroups_[index];
+            if (g.closureHashFiles != g.closureContent.size())
+            {
+                uint64_t h = 14695981039346656037ULL;
+                for (const auto& [path, content] : g.closureContent)
+                {
+                    for (unsigned char byte : path) { h ^= byte; h *= 1099511628211ULL; }
+                    h ^= content; h *= 1099511628211ULL;
+                }
+                g.closureHash = h;
+                g.closureHashFiles = g.closureContent.size();
+            }
+            combined ^= g.closureHash; combined *= 1099511628211ULL;
+        };
+        fold(group.primary);
+        for (size_t d : group.dependencyGroups) fold(d);
+        return combined;
     }
 
 /*
@@ -6304,6 +6346,7 @@ uint64_t LLVMBackend::CxxGroupHeaderHash(const CxxRequestGroup& group) const
         {
             combined ^= contentHash(h); combined *= 1099511628211ULL;
         }
+        combined ^= CxxGroupClosureHash(group); combined *= 1099511628211ULL;
         return combined;
     }
 
@@ -6598,6 +6641,7 @@ LLVMBackend::CxxRequestGroup LLVMBackend::MakeCxxRequestGroup(size_t primary,
             if (ha.empty() || hb.empty()) return hb.empty() && !ha.empty();
             return ha.front() < hb.front();
         });
+        out.dependencyGroups = sorted;
         for (size_t d : sorted)
         {
             hasDependencyGroup = true;
@@ -6614,6 +6658,11 @@ LLVMBackend::CxxRequestGroup LLVMBackend::MakeCxxRequestGroup(size_t primary,
         out.diskCache = primaryHasHeaders || hasDependencyGroup
             || std::any_of(cxxImportGroups_.begin(), cxxImportGroups_.end(),
                            [](const CxxImportGroup& g) { return !g.headers.empty(); });
+        out.pruneScope = "STD" + cppStandard_ + (targetWindows_ ? "|W" : "|N");
+        for (const auto& h : out.headers)     out.pruneScope += "|H" + h;
+        for (const auto& def : out.defines)   out.pruneScope += "|d" + def;
+        for (const auto& inc : cIncludeDirs_) out.pruneScope += "|I" + inc;
+        for (const auto& def : cDefines_)     out.pruneScope += "|D" + def;
         out.label = out.headers.empty()
             ? std::string("<no header>")
             : std::filesystem::path(out.headers.front()).filename().string();
@@ -7515,9 +7564,10 @@ bool LLVMBackend::RequestGeneratedCxxWrapperUncached(const CxxRequestGroup& grou
                 {
                     CxxIncrementalGroup* incremental = GetCxxIncrementalGroup(group, runError);
                     if (incremental == nullptr) return false;
-                    req.source = BuildCxxRequestIncludes(group)
-                        + incremental->UnseenPrefixSource(wrapperSource);
+                    const std::string wrapperIncludes = BuildCxxRequestIncludes(group);
+                    req.source = wrapperIncludes + incremental->UnseenPrefixSource(wrapperSource);
                     req.demandPrefixSource = wrapperSource;
+                    req.demandPrefixOffset = wrapperIncludes.size();
                     out = cflat_cinterop::ExtractResult();
                     const bool parsed = incremental->ParseRequest(req, req.source, out, runError);
                     requestDiagnostics = incremental->LastRequestDiagnostics();
@@ -11873,6 +11923,16 @@ void LLVMBackend::RememberCxxGroupReachableFiles(size_t group,
             g.reachableFiles.insert(NormalizeCxxOwnershipPath(header));
         for (const std::string& file : files)
             g.reachableFiles.insert(NormalizeCxxOwnershipPath(file));
+}
+
+// The closure's per-file content hashes (see CxxGroupClosureHash); same files as above.
+void LLVMBackend::RememberCxxGroupClosureContent(size_t group, const std::vector<CHeaderDep>& deps)
+{
+        if (group >= cxxImportGroups_.size()) return;
+        CxxImportGroup& g = cxxImportGroups_[group];
+        for (const CHeaderDep& dep : deps)
+            g.closureContent[NormalizeCxxOwnershipPath(dep.path)] = dep.hash;
+        g.closureHashFiles = static_cast<size_t>(-1);
 }
 
 /*
@@ -18785,6 +18845,7 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
 
         std::vector<CSigEntry> hitSigs;
         std::vector<std::string> hitDepPaths;
+        std::vector<CHeaderDep> hitDeps;
         std::vector<CEnumEntry> hitEnums;
         std::vector<CRecordEntry> hitRecords;
         std::vector<CMacroEntry> hitMacros;
@@ -18832,6 +18893,7 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
                     hitFunctionPointerAbis = entry.functionPointerAbis;
                     hitCxxBitcode = entry.cxxBitcode;
                     for (const auto& dep : entry.deps) hitDepPaths.push_back(dep.path);
+                    hitDeps = entry.deps;
                 }
                 else if (hashNow() == entry.hash)
                 {
@@ -18853,6 +18915,7 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
                     hitFunctionPointerAbis = entry.functionPointerAbis;
                     hitCxxBitcode = entry.cxxBitcode;
                     for (const auto& dep : entry.deps) hitDepPaths.push_back(dep.path);
+                    hitDeps = entry.deps;
                 }
             }
         }
@@ -18866,6 +18929,7 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
             if (!hitDemandKey.empty() && activeCxxRequestGroup_ != nullptr)
                 NoteCxxDemandReplayChunk(*activeCxxRequestGroup_, hitDemandReplayChunk);
             if (cppMode) RememberCxxGroupReachableFiles(cxxGroupIndex, hitDepPaths);
+            if (cppMode) RememberCxxGroupClosureContent(cxxGroupIndex, hitDeps);
             replayCxxGroupNamespaces(hitGroupNamespaces);
             // The C++ definitions this header needed were emitted on the cold run; relink the very
             // same bitcode instead of running CodeGen again.
@@ -18940,14 +19004,18 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
         if (!mtEc && !cHeaderCacheDir.empty())
         {
             CFileSigCacheEntry diskEntry;
+            std::string diskMissReason;
             bool diskHit;
             {
                 llvm::TimeTraceScope loadScope("CHeaderJsonLoad", fileForLsp);
                 diskHit = TryLoadCHeaderDiskCache(cHeaderCacheDir, loadKey, currentMtime, hashNow(),
                                                   diskEntry, /*expectedRequestKey*/ {},
-                                                  /*requireBitcode*/ false, /*missReason*/ nullptr,
+                                                  /*requireBitcode*/ false, &diskMissReason,
                                                   /*removeOnMiss*/ !readCompiledEntry);
             }
+            if (!diskHit && verbose && diskMissReason != "missing entry")
+                std::cout << std::format("[verbose] C header disk cache miss for {} ({})\n",
+                                         fileForLsp, diskMissReason);
             if (diskHit && readCompiledEntry) diskEntry.cxxBitcode.clear();
             if (diskHit && !CxxDemandEntryUsable(cppMode)) diskHit = false;
             if (diskHit)
@@ -18965,6 +19033,7 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
                     diskDepPaths.push_back(dep.path);
                 }
                 if (cppMode) RememberCxxGroupReachableFiles(cxxGroupIndex, diskDepPaths);
+                if (cppMode) RememberCxxGroupClosureContent(cxxGroupIndex, diskEntry.deps);
                 replayCxxGroupNamespaces(diskEntry.cxxGroupNamespaces);
                 if (verbose) std::cout << std::format("[verbose] C header disk cache hit for {}\n", fileForLsp);
                 {
@@ -19162,6 +19231,7 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
                     HashFileFnv1a(inc, dep.hash);
                     entry.deps.push_back(std::move(dep));
                 }
+                if (cppMode) RememberCxxGroupClosureContent(cxxGroupIndex, entry.deps);
             }
             // --run is read-only: never persist the header cache to disk.
             // The in-memory entry still serves this compile.

@@ -41,6 +41,7 @@
 #include <set>
 #include <atomic>
 #include <mutex>
+#include <chrono>
 
 static std::mutex gCHeaderDiskCachePublishMutex;
 static std::atomic<uint64_t> gCHeaderDiskCacheTempCounter{0};
@@ -1827,10 +1828,62 @@ std::string LLVMBackend::CompilerBuildStamp()
         return stamp;
     }
 
+bool LLVMBackend::CacheBuildStampEnabled()
+{
+        static const bool enabled = []() {
+            const char* value = std::getenv("CFLAT_CACHE_BUILD_STAMP");
+            return value != nullptr && std::string_view(value) == "1";
+        }();
+        return enabled;
+    }
+
+// Removes sibling cheaders/v<M> (M != current) directories whose newest mtime, over the directory
+// and its immediate children, is older than 7 days. One listing of cheaders/ plus a stat per
+// sibling; only stale candidates are opened. Symlinks and non-"v<digits>" names are never touched;
+// every error is ignored (another process may be pruning the same directory).
+static void PruneOldCHeaderVersions(const std::filesystem::path& cheadersRoot, const std::string& keepName)
+{
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    const auto cutoff = fs::file_time_type::clock::now() - std::chrono::hours(24 * 7);
+    fs::directory_iterator it(cheadersRoot, ec), end;
+    if (ec) return;
+    for (; it != end; it.increment(ec))
+    {
+        if (ec) return;
+        std::error_code e;
+        const std::string name = it->path().filename().string();
+        if (name.size() < 2 || name[0] != 'v' || name == keepName) continue;
+        bool digits = true;
+        for (size_t i = 1; i < name.size(); ++i)
+            if (name[i] < '0' || name[i] > '9') { digits = false; break; }
+        if (!digits) continue;
+        if (it->is_symlink(e) || e || !it->is_directory(e) || e) continue;
+        auto newest = fs::last_write_time(it->path(), e);
+        if (e || newest >= cutoff) continue;
+        bool stale = true;
+        fs::directory_iterator child(it->path(), e), cend;
+        for (; !e && child != cend; child.increment(e))
+        {
+            std::error_code te;
+            auto t = fs::last_write_time(child->path(), te);
+            if (!te && t >= cutoff) { stale = false; break; }
+        }
+        if (!stale) continue;
+        fs::remove_all(it->path(), e);
+    }
+}
+
 std::string LLVMBackend::GetCHeaderCacheDir()
 {
         std::string base = GetCflatCacheDir();
         if (base.empty()) return {};
+        // First use of this version in the process: drop long-dead sibling version directories.
+        static std::once_flag pruneOnce;
+        std::call_once(pruneOnce, [&]() {
+            PruneOldCHeaderVersions(std::filesystem::path(base) / "cheaders",
+                                    "v" + std::to_string(kCHeaderCacheVersion));
+        });
         // One folder per cache version: a version bump starts an empty folder, so no entry of
         // another version is ever opened or scanned. Forward slash: POSIX takes '\\' as a name char.
         return base + "/cheaders/v" + std::to_string(kCHeaderCacheVersion);
@@ -3025,7 +3078,12 @@ bool LLVMBackend::TryLoadCHeaderDiskCache(
         // v108 publishes `using ns::X;` of an enum / typedef / enumerator / variable under ns.
         // v110 records `using ns::C;` of a class for the cross-import conflict check.
         // v111 records namespace-scope class templates for the same check.
+        // v129 stamps every entry with the compiler build that wrote it ("cstamp").
         if (version != kCHeaderCacheVersion) return cacheMiss("cache version");
+        // Under CacheBuildStampEnabled() an entry is the output of the build that wrote it. The
+        // disk key leaves the stamp out so a rebuild overwrites entries in place.
+        if (CacheBuildStampEnabled() && j.value("cstamp", std::string{}) != CompilerBuildStamp())
+            return cacheMiss("compiler build");
 
         if (!expectedRequestKey.empty()
             && j.value("cxxRequestKey", std::string{}) != expectedRequestKey)
@@ -3122,6 +3180,8 @@ bool LLVMBackend::TryLoadCHeaderDiskCache(
                 chunk.order = replay.value("order", uint64_t{0});
                 chunk.source = replay.value("source", std::string{});
                 chunk.prefixSource = replay.value("prefix", std::string{});
+                const int64_t prefixAt = replay.value("prefixat", int64_t{-1});
+                chunk.prefixOffset = prefixAt < 0 ? std::string::npos : size_t(prefixAt);
                 chunk.markerPrefix = replay.value("marker", std::string{});
                 chunk.thunkSuffix = replay.value("thunk", std::string{});
                 chunk.wrapperBatch = replay.value("batch", false);
@@ -3246,6 +3306,9 @@ static uint64_t SigBaselineHash(const std::string& text)
 
 static std::string CxxRequestGroupMarker(const std::vector<std::string>& headers,
                                          const std::vector<std::string>& defines);
+static std::string CxxRequestEntryValidity(std::filesystem::file_time_type mtime,
+                                           uint64_t contentHash);
+static std::string CxxRequestPruneScope(const std::string& pruneScope);
 
 std::string LLVMBackend::SigBaselineGroupKey(uint64_t headerHash,
                                              std::filesystem::file_time_type mtime,
@@ -3435,7 +3498,9 @@ void LLVMBackend::WriteCHeaderDiskCache(
         // v108 publishes `using ns::X;` of an enum / typedef / enumerator / variable under ns.
         // v110 records `using ns::C;` of a class for the cross-import conflict check.
         // v111 records namespace-scope class templates for the same check.
+        // v129 stamps every entry with the compiler build that wrote it ("cstamp").
         j["version"] = kCHeaderCacheVersion;
+        if (CacheBuildStampEnabled()) j["cstamp"] = CompilerBuildStamp();
         j["mtime"]   = (int64_t)mtime.time_since_epoch().count();
         j["hash"]    = contentHash;
         j["ldw"]     = entry.longDoubleWidth;
@@ -3580,6 +3645,8 @@ void LLVMBackend::WriteCHeaderDiskCache(
                 return nlohmann::json{
                     {"order", chunk.order}, {"source", chunk.source},
                     {"prefix", chunk.prefixSource}, {"marker", chunk.markerPrefix},
+                    {"prefixat", chunk.prefixOffset == std::string::npos
+                                     ? int64_t{-1} : int64_t(chunk.prefixOffset)},
                     {"thunk", chunk.thunkSuffix}, {"wrappers", chunk.wrapperNames},
                     {"batch", chunk.wrapperBatch}, {"auto", chunk.autoInstantiate},
                     {"types", std::move(types)}, {"header", chunk.headerHarvest},
@@ -3644,8 +3711,12 @@ void LLVMBackend::WriteCHeaderDiskCache(
         }
         if (!requestKey.empty() && requestGroup != nullptr)
         {
+            // Line 2 is what the entry is valid for and line 3 what it may be compared with, so
+            // a prune can tell a dead entry from a live one (PruneCxxTypeRequestDiskCache).
             const std::string marker = CxxRequestGroupMarker(requestGroup->ownerHeaders,
-                                                              requestGroup->ownerDefines);
+                                                              requestGroup->ownerDefines)
+                + "\n" + CxxRequestEntryValidity(mtime, contentHash)
+                + "\n" + CxxRequestPruneScope(requestGroup->pruneScope);
             const auto markerPath = cacheDir / std::format("{:016x}.rq", diskKey);
             const auto markerTmpPath = cacheDir
                 / std::format("{:016x}.{}.{}.rq.tmp", diskKey, _getpid(), tempId);
@@ -3665,7 +3736,7 @@ void LLVMBackend::WriteCHeaderDiskCache(
                 else { fs::remove(markerTmpPath, ec); ec.clear(); }
             }
             std::lock_guard<std::mutex> publishLock(gCHeaderDiskCachePublishMutex);
-            PruneCxxTypeRequestDiskCache(cacheDir, *requestGroup);
+            PruneCxxTypeRequestDiskCache(cacheDir, *requestGroup, mtime, contentHash);
         }
     }
 
@@ -3681,13 +3752,46 @@ static std::string CxxRequestGroupMarker(const std::vector<std::string>& headers
         return marker;
     }
 
+// What a request entry is valid for: the group's header mtime and its content hash over the
+// headers and their include closure. The compiler build is deliberately not part of it (see the
+// prune).
+static std::string CxxRequestEntryValidity(std::filesystem::file_time_type mtime,
+                                           uint64_t contentHash)
+{
+        return std::format("S{}:{:016x}", (long long)mtime.time_since_epoch().count(), contentHash);
+    }
+
+// Hashed CxxRequestGroup::pruneScope: entries written under another composition or config
+// (other template-argument groups, -I dirs, defines) have their own validity.
+static std::string CxxRequestPruneScope(const std::string& pruneScope)
+{
+        uint64_t h = 14695981039346656037ULL;
+        for (unsigned char byte : pruneScope) { h ^= byte; h *= 1099511628211ULL; }
+        return std::format("P{:016x}", h);
+    }
+
+/*
+ * Removes the owner group's request entries that no compile can hit any more: written in the
+ * same prune scope for another header stamp or other contents of the headers or their include
+ * closure (both are in the request key), or before markers recorded validity and scope
+ * (legacy, keyed without the closure). An entry of another scope is never judged. An entry the
+ * current headers would load is never removed, whichever build wrote it: another build (a
+ * still-running LSP server, Debug beside Release on one cache) may be reading it, and a
+ * stale-build entry is rewritten in place by its own key on load. Hits do not refresh a marker, so age alone is no
+ * evidence: deleting by age emptied a group's cache under its siblings on the first store after
+ * ten idle minutes. The grace still spares a racing writer's fresh file.
+ */
 void LLVMBackend::PruneCxxTypeRequestDiskCache(const std::filesystem::path& cacheDir,
-                                                const CxxRequestGroup& group)
+                                                const CxxRequestGroup& group,
+                                                std::filesystem::file_time_type mtime,
+                                                uint64_t contentHash)
 {
         namespace fs = std::filesystem;
         std::error_code ec;
         if (!fs::is_directory(cacheDir, ec)) return;
         const std::string owner = CxxRequestGroupMarker(group.ownerHeaders, group.ownerDefines);
+        const std::string current = CxxRequestEntryValidity(mtime, contentHash);
+        const std::string scope = CxxRequestPruneScope(group.pruneScope);
         const auto now = fs::file_time_type::clock::now();
         constexpr auto grace = std::chrono::minutes(10);
         for (const auto& file : fs::directory_iterator(cacheDir, ec))
@@ -3700,6 +3804,12 @@ void LLVMBackend::PruneCxxTypeRequestDiskCache(const std::filesystem::path& cach
             std::ifstream input(file.path(), std::ios::binary);
             std::string marker;
             if (!input.is_open() || !std::getline(input, marker) || marker != owner) continue;
+            std::string validity, entryScope;
+            std::getline(input, validity);
+            std::getline(input, entryScope);
+            if (!entryScope.empty() && entryScope != scope) continue;
+            // Live: the stamp and content it was written for are the current ones.
+            if (!entryScope.empty() && validity == current) continue;
             auto jsonPath = file.path();
             jsonPath.replace_extension(".json");
             fs::remove(jsonPath, ec); ec.clear();
