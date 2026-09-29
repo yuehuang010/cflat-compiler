@@ -140,16 +140,24 @@ public:
     static inline int moves = 0;
     static inline int dtors = 0;
     static inline int assigns = 0;
-    static inline void reset() noexcept { copies = 0; moves = 0; dtors = 0; assigns = 0; }
+    static inline int copy_assigns = 0;
+    static inline int move_assigns = 0;
+    static inline void reset() noexcept
+    {
+        copies = 0; moves = 0; dtors = 0; assigns = 0; copy_assigns = 0; move_assigns = 0;
+    }
     inline TallyByValue() noexcept : v_(0) {}
     inline TallyByValue(const TallyByValue& o) noexcept : v_(o.v_) { ++copies; }
     inline TallyByValue(TallyByValue&& o) noexcept : v_(o.v_) { o.v_ = -1; ++moves; }
     inline ~TallyByValue() noexcept { v_ = -99; ++dtors; }
     inline TallyByValue operator=(int x) noexcept { v_ = x; ++assigns; return *this; }
     inline TallyByValue operator+=(int x) noexcept { v_ += x; ++assigns; return *this; }
-    inline TallyByValue& operator=(const TallyByValue& o) noexcept { v_ = o.v_; return *this; }
+    inline TallyByValue& operator=(const TallyByValue& o) noexcept { v_ = o.v_; ++copy_assigns; return *this; }
+    inline TallyByValue& operator=(TallyByValue&& o) noexcept { v_ = o.v_; o.v_ = -1; ++move_assigns; return *this; }
     int v_;
 };
+inline TallyByValue make_tbv(int v) noexcept { TallyByValue t; t.v_ = v; return t; }
+inline int peek_tbv(const TallyByValue& t) noexcept { return t.v_; }
 
 // `operator bool` / conversion operators must run on the OBJECT, not a bitwise copy (codes 31600+).
 // Every class records its own address (`self_`), so a call on a copy reads false / -7; hits,

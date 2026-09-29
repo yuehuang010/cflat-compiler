@@ -607,8 +607,7 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
             cxxSretDest = compiler->currentFunction->getArg(sretIndex);
         }
         const bool cxxReturnTernary = cxxSretReturn && assignExpr != nullptr
-            && assignExpr->conditionalExpression() != nullptr
-            && assignExpr->conditionalExpression()->Question() != nullptr;
+            && SoleTernaryExpression(assignExpr) != nullptr;
         if (cxxSretReturn && assignExpr != nullptr && !cxxReturnTernary)
         {
             compiler->pendingCxxSretDest_ = cxxSretDest;

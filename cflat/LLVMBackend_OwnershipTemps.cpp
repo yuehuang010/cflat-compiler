@@ -4625,6 +4625,19 @@ void LLVMBackend::FlushConditionalPtrTempsSince(size_t from)
         }
     }
 
+void LLVMBackend::RekeyOwnedTempsSince(const OwnedTempMark& mark, llvm::BasicBlock* from,
+                                       llvm::BasicBlock* to)
+{
+        for (size_t i = mark.Strings; i < pendingOwnedStringTemps.size(); ++i)
+            if (pendingOwnedStringTemps[i].second == from) pendingOwnedStringTemps[i].second = to;
+        for (size_t i = mark.Closures; i < pendingOwnedClosureTemps.size(); ++i)
+            if (pendingOwnedClosureTemps[i].second == from) pendingOwnedClosureTemps[i].second = to;
+        for (size_t i = mark.Structs; i < pendingOwnedStructTemps.size(); ++i)
+            if (pendingOwnedStructTemps[i].Block == from) pendingOwnedStructTemps[i].Block = to;
+        for (size_t i = mark.Ptrs; i < pendingOwnedPtrTemps.size(); ++i)
+            if (pendingOwnedPtrTemps[i].Block == from) pendingOwnedPtrTemps[i].Block = to;
+    }
+
 void LLVMBackend::DiscardOwnedTempsSince(const OwnedTempMark& mark)
 {
         auto pairValue   = [](const std::pair<llvm::Value*, llvm::BasicBlock*>& e) { return e.first; };

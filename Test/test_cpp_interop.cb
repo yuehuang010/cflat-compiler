@@ -7846,6 +7846,138 @@ extern int main()
                 || cppas.Tally.move_assigns != 1) return 7488;
         }
     }
+    // A by-value operator= / op= result is a prvalue (counts from a clang++ oracle). Unconsumed, it
+    // is destroyed at the end of the full expression (31850/31851: the `=` temp leaked); consumed,
+    // it builds the declared object in place or is moved from - never re-copied from the destination.
+    {
+        cppas.TallyByValue va = default;
+        cppas.TallyByValue vc = default;
+        cppas.TallyByValue.reset();
+        {
+            va = 3;
+            (va = 4);
+            va = CbOne(4);
+            va += 1;
+        }
+        if (va.v_ != 6 || cppas.TallyByValue.copies != 4 || cppas.TallyByValue.dtors != 4) return 31850;
+        cppas.TallyByValue.reset();
+        {
+            int i = 0;
+            for (va = 0; i < 2; va += 1) i++;
+            if (va.v_ != 2 || cppas.TallyByValue.copies != 3 || cppas.TallyByValue.dtors != 3) return 31851;
+        }
+        // Nested calls in the right-hand side no longer disarm the declarator (a second copy).
+        cppas.TallyByValue.reset();
+        {
+            cppas.TallyByValue b = (va = CbOne(5));
+            cppas.TallyByValue d = va = CbOne(CbOne(6));
+            cppas.TallyByValue e = (va += CbOne(1));
+            if (b.v_ != 6 || d.v_ != 8 || e.v_ != 10 || cppas.TallyByValue.copies != 3
+                || cppas.TallyByValue.dtors != 0 || cppas.TallyByValue.moves != 0) return 31852;
+        }
+        cppas.TallyByValue.reset();
+        {
+            cppas.TallyByValue b = (va = cppas.peek_tbv(cppas.make_tbv(6)));
+            if (b.v_ != 6 || cppas.TallyByValue.copies != 1 || cppas.TallyByValue.dtors != 1) return 31853;
+        }
+        // A chained assignment move-assigns from the inner prvalue (was copy-assign from `va`).
+        cppas.TallyByValue.reset();
+        {
+            vc = (va = 3);
+            if (vc.v_ != 3 || cppas.TallyByValue.move_assigns != 1 || cppas.TallyByValue.copy_assigns != 0
+                || cppas.TallyByValue.dtors != 1) return 31854;
+            cppas.TallyByValue b = (vc = (va += 2));
+            if (b.v_ != 5 || cppas.TallyByValue.copies != 3 || cppas.TallyByValue.move_assigns != 2
+                || cppas.TallyByValue.dtors != 2) return 31855;
+        }
+        // Mixed `=` / `op=` ternary arms, as an initializer and as a return value (both refused).
+        cppas.TallyByValue.reset();
+        {
+            int f = 1;
+            cppas.TallyByValue b = f != 0 ? (va = 3) : (vc += 4);
+            f = 0;
+            cppas.TallyByValue d = f != 0 ? (va = 3) : (vc += 4);
+            if (b.v_ != 3 || d.v_ != 9 || cppas.TallyByValue.copies != 2 || cppas.TallyByValue.dtors != 0)
+                return 31856;
+        }
+        cppas.TallyByValue.reset();
+        {
+            cppas.TallyByValue b = ByValueTernReturn(1, &va, &vc);
+            cppas.TallyByValue d = ByValueTernReturn(0, &va, &vc);
+            if (b.v_ != 3 || d.v_ != 14 || cppas.TallyByValue.copies != 2 || cppas.TallyByValue.dtors != 0)
+                return 31857;
+        }
+        cppas.TallyByValue.reset();
+        {
+            cppas.TallyByValue[2] cells = { (va = CbOne(1)), (va += CbOne(2)) };
+            if (cells[0].v_ != 2 || cells[1].v_ != 5 || cppas.TallyByValue.copies != 2
+                || cppas.TallyByValue.moves != 0 || cppas.TallyByValue.dtors != 0) return 31862;
+        }
+        cppas.TallyByValue.reset();
+        {
+            auto b = (va = 3);
+            int x = (va = 6).v_;
+            if (b.v_ != 3 || x != 6 || cppas.TallyByValue.copies != 2 || cppas.TallyByValue.dtors != 1)
+                return 31858;
+        }
+        // A parenthesized ternary of assignment arms, as a return (31863, double parens 31864)
+        // and as an initializer (31865, double parens 31866): 3/5 and 3/4, copies == 2, no dtor.
+        {
+            cppas.TallyByValue xa = default; cppas.TallyByValue xc = default;
+            cppas.TallyByValue.reset();
+            {
+                cppas.TallyByValue b = ByValueParenTernReturn(1, &xa, &xc);
+                cppas.TallyByValue d = ByValueParenTernReturn(0, &xa, &xc);
+                if (b.v_ != 3 || d.v_ != 5 || cppas.TallyByValue.copies != 2
+                    || cppas.TallyByValue.moves != 0 || cppas.TallyByValue.dtors != 0) return 31863;
+            }
+        }
+        {
+            cppas.TallyByValue xa = default; cppas.TallyByValue xc = default;
+            cppas.TallyByValue.reset();
+            {
+                cppas.TallyByValue b = ByValueParenTernReturn2(1, &xa, &xc);
+                cppas.TallyByValue d = ByValueParenTernReturn2(0, &xa, &xc);
+                if (b.v_ != 3 || d.v_ != 5 || cppas.TallyByValue.copies != 2
+                    || cppas.TallyByValue.moves != 0 || cppas.TallyByValue.dtors != 0) return 31864;
+            }
+        }
+        {
+            cppas.TallyByValue xa = default; cppas.TallyByValue xc = default;
+            cppas.TallyByValue.reset();
+            {
+                int f = 1;
+                cppas.TallyByValue b = (f != 0 ? (xa = 3) : (xc += 4));
+                f = 0;
+                cppas.TallyByValue d = (f != 0 ? (xa = 3) : (xc += 4));
+                if (b.v_ != 3 || d.v_ != 4 || cppas.TallyByValue.copies != 2
+                    || cppas.TallyByValue.moves != 0 || cppas.TallyByValue.dtors != 0) return 31865;
+            }
+        }
+        {
+            cppas.TallyByValue xa = default; cppas.TallyByValue xc = default;
+            cppas.TallyByValue.reset();
+            {
+                int f = 1;
+                cppas.TallyByValue b = ((f != 0 ? (xa = 3) : (xc += 4)));
+                f = 0;
+                cppas.TallyByValue d = ((f != 0 ? (xa = 3) : (xc += 4)));
+                if (b.v_ != 3 || d.v_ != 4 || cppas.TallyByValue.copies != 2
+                    || cppas.TallyByValue.moves != 0 || cppas.TallyByValue.dtors != 0) return 31866;
+            }
+        }
+        // A `T&` compound result is the destination lvalue: copied, not bitwise-stored (31859),
+        // and a constructible return source (31860, was refused).
+        cppas.Tally a = default;
+        cppas.Tally.reset();
+        {
+            cppas.Tally b = a += 3;
+            if (b.v_ != 3 || cppas.Tally.copies != 1) return 31859;
+            cppas.Tally d = TallyCompoundReturnBare(&a);
+            if (d.v_ != 6 || a.v_ != 6 || cppas.Tally.copies != 2) return 31860;
+        }
+        if (cppas.Tally.dtors != 2) return 31861;
+    }
     // Operators returning a class-template specialization nothing requested yet: the on-use retry
     // requests it, for member operators (legs 7551, 7553 and 7554 are the compound forms that used to fail
     // with "no overload for compound assignment"), inherited ones, and free ones.
@@ -8213,6 +8345,20 @@ T TallyAssignGeneric<T>(T* a, T* b) { return (*a = *b); }
 cppas.TallyByValue ByValueAssignReturn(cppas.TallyByValue* a) { return (*a = 5); }
 cppas.TallyByValue ByValueAssignReturnBare(cppas.TallyByValue* a) { return *a = 6; }
 cppas.TallyByValue ByValueCompoundReturn(cppas.TallyByValue* a) { return (*a += 2); }
+int CbOne(int x) { return x + 1; }
+cppas.Tally TallyCompoundReturnBare(cppas.Tally* a) { return *a += 3; }
+cppas.TallyByValue ByValueTernReturn(int f, cppas.TallyByValue* a, cppas.TallyByValue* c)
+{
+    return f != 0 ? (*a = 3) : (*c += 5);
+}
+cppas.TallyByValue ByValueParenTernReturn(int f, cppas.TallyByValue* a, cppas.TallyByValue* c)
+{
+    return (f != 0 ? (*a = 3) : (*c += 5));
+}
+cppas.TallyByValue ByValueParenTernReturn2(int f, cppas.TallyByValue* a, cppas.TallyByValue* c)
+{
+    return ((f != 0 ? (*a = 3) : (*c += 5)));
+}
 int ObAliasParam(alias cppas.ObSelf p) { if (p) return 1; return 2; }
 int ObPtrParam(cppas.ObSelf* p) { if (*p) return 1; return 2; }
 int* EscTernFieldAddr(int x) { return x > 0 ? &(new cppon.Esc(x))->v : nullptr; }

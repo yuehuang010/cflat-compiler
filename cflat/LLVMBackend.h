@@ -5090,6 +5090,10 @@ private:
     // region (an arm whose lowering threw): those entries are keyed to blocks that no longer
     // reach the join, so leaving them would carry a stale key past this expression.
     void DiscardOwnedTempsSince(const OwnedTempMark& mark);
+    // Re-key the entries registered since `mark` in block `from` to `to`, for a region emitted into
+    // a detached block whose instructions are then spliced into `to` (and `from` erased).
+    void RekeyOwnedTempsSince(const OwnedTempMark& mark, llvm::BasicBlock* from,
+                              llvm::BasicBlock* to);
     // The detection-only ledgers DiscardOwnedTempsSince clears wholesale; a speculative region
     // snapshots them first so facts recorded before it survive an aborted attempt.
     struct DetectionLedgerSnapshot {

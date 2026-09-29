@@ -4525,6 +4525,14 @@ public:
     // is the entire expression. Returns null when any operator (binary, unary, sizeof, cast) sits
     // above the move, since then the move is not the whole RHS.
     static CFlatParser::MoveExpressionContext* TopLevelMoveExpression(antlr4::tree::ParseTree* node);
+    // The assignment an initializer is, through a single-child chain and plain parentheses
+    // (`T b = a = x;`, `T b = (a += f(x));`), or null. Shape probe only.
+    static CFlatParser::AssignmentExpressionContext* SoleAssignmentExpression(
+        antlr4::tree::ParseTree* node);
+    // The `c ? a : b` an expression is, through a single-child chain and plain parentheses
+    // (`return (f ? x : y);`), or null. Shape probe only.
+    static CFlatParser::ConditionalExpressionContext* SoleTernaryExpression(
+        antlr4::tree::ParseTree* node);
 
     /*
      * M4b - declare a local of a foreign NONTRIVIAL C++ class by CONSTRUCTING INTO ITS SLOT.

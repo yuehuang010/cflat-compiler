@@ -1991,6 +1991,34 @@ llvm::Value* MainListener::ParseAssignmentExpression(
             }
 
             /*
+             * A by-value (`T`) operator result the enclosing slot did not take is the prvalue
+             * instead: its temp (already on the owned-temp ledger, destroyed at the end of the full
+             * expression) is exposed as the outermost C++ return temporary, so a chained
+             * `c = (a = 3)` move-assigns from it and a declarator / return moves from it.
+             */
+            auto cxxPrvalueAssignResult = [&](llvm::Value* opTemp) -> llvm::Value* {
+                auto* slot = llvm::dyn_cast_or_null<llvm::AllocaInst>(opTemp);
+                if (assignmentResult == nullptr || slot == nullptr
+                    || namedVar.TypeAndValue.TypeName.empty())
+                    return nullptr;
+                LLVMBackend::TypeAndValue classType;
+                classType.TypeName = namedVar.TypeAndValue.TypeName;
+                if (slot->getAllocatedType() != compiler->GetType(classType)) return nullptr;
+                llvm::Value* loaded = compiler->CreateLoad(slot->getAllocatedType(), slot);
+                *assignmentResult = {};
+                assignmentResult->TypeAndValue = namedVar.TypeAndValue;
+                assignmentResult->TypeAndValue.VariableName.clear();
+                assignmentResult->TypeAndValue.IsMove = false;
+                assignmentResult->TypeAndValue.IsAlias = false;
+                assignmentResult->Primary = loaded;
+                assignmentResult->BaseType = loaded->getType();
+                assignmentResult->Storage = slot;
+                assignmentResult->IsRvalue = true;
+                compiler->lastCxxRetTemp_ = slot;
+                compiler->lastCxxRetValue_ = loaded;
+                return loaded;
+            };
+            /*
              * M4b - assignment to a foreign NONTRIVIAL C++ object runs the C++ assignment
              * operator. The generic path would store bytes over a live object, which for a class
              * with a user copy/move assignment (or a destructor that owns something) corrupts it.
@@ -2001,8 +2029,11 @@ llvm::Value* MainListener::ParseAssignmentExpression(
             // The class branch below emits the call and yields no IR value, so a value-position
             // caller (`||`, `&&`, `!`, `?:`, `if`, `bool b = ...`) would otherwise meet a null
             // operand. Discard-position statements pass no assignmentResult and stay null.
-            auto classAssignValue = [&]() -> llvm::Value* {
+            auto classAssignValue = [&](bool byValueOperator = false) -> llvm::Value* {
                 if (assignmentResult == nullptr || destination == nullptr) return nullptr;
+                if (byValueOperator)
+                    if (auto* prvalue = cxxPrvalueAssignResult(compiler->lastCxxRetTemp_))
+                        return prvalue;
                 // The operator's own `T&` result is no owned temporary a declarator could adopt.
                 compiler->lastCxxRetTemp_ = nullptr;
                 compiler->lastCxxRetValue_ = nullptr;
@@ -2208,7 +2239,7 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                                 compiler->MarkVariableUnmoved(namedVar.CallerName);
                                 compiler->MarkVariableNotExplicitlyMovedNull(namedVar.CallerName);
                             }
-                            return classAssignValue();
+                            return classAssignValue(/*byValueOperator*/ true);
                         }
                     // `t = move u;` with a class source is `t = T(move u)`: the source binds as
                     // an rvalue (T(U&&) wins) and is consumed like any moved C++ local.
@@ -4246,10 +4277,15 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                         };
                         // Only a C++ in-place compound may take an enclosing slot; a CFlat
                         // compound's result is stored back into the destination instead.
-                        if (compoundOverloadExists)
-                            overload = cxxCompoundInPlace
-                                ? CxxAssignSretScope::EmitOperatorCall(compiler, emitCompound)
-                                : emitCompound();
+                        if (compoundOverloadExists && cxxCompoundInPlace)
+                        {
+                            // Only this call's by-value result may be read back as the prvalue.
+                            compiler->lastCxxRetTemp_ = nullptr;
+                            compiler->lastCxxRetValue_ = nullptr;
+                            overload = CxxAssignSretScope::EmitOperatorCall(compiler, emitCompound);
+                        }
+                        else if (compoundOverloadExists)
+                            overload = emitCompound();
                     }
                     if (overload == nullptr && !compoundOverloadExists && !binaryOp.empty())
                         overload = TryBinaryOperatorOverload(
@@ -4280,7 +4316,25 @@ llvm::Value* MainListener::ParseAssignmentExpression(
 
             // The C++ operator mutated the receiver through its own reference parameter;
             // re-read the slot and stop - storing its `T&` result would clobber the object.
-            if (cxxCompoundInPlace && usedCompoundOverload) return finishStore(derefLoad());
+            if (cxxCompoundInPlace && usedCompoundOverload)
+            {
+                auto* opTemp = compiler->lastCxxRetTemp_;
+                auto* stored = finishStore(derefLoad());
+                if (assignmentResult == nullptr || coalesceResume != nullptr
+                    || namedVar.TypeAndValue.Pointer || destination == nullptr)
+                    return stored;
+                if (auto* prvalue = cxxPrvalueAssignResult(opTemp)) return prvalue;
+                // A `T&` result is the destination lvalue (C++): a by-value consumer copies it.
+                compiler->lastCxxRetTemp_ = nullptr;
+                compiler->lastCxxRetValue_ = nullptr;
+                if (compiler->IsForeignNontrivialCxxClass(namedVar.TypeAndValue.TypeName))
+                {
+                    assignmentResult->Storage = destination;
+                    assignmentResult->CallerName = namedVar.CallerName;
+                    assignmentResult->FieldName = namedVar.FieldName;
+                }
+                return stored;
+            }
 
             // An overloaded compound assignment replaces the live LHS with its returned value.
             // Release the old owner first; this covers locals, fields, arrays and dereferences.
@@ -14472,6 +14526,8 @@ llvm::Value* MainListener::TryDirectCxxAssignOperator(
             {
                 // One straight-line block: move its instructions to the insertion point.
                 origin->splice(savedIP.getPoint(), scratch);
+                // Temps the call registered (a by-value result) were keyed to `scratch`.
+                compiler->RekeyOwnedTempsSince(mark, scratch, origin);
                 scratch->eraseFromParent();
                 compiler->builder->restoreIP(savedIP);
                 return result;
@@ -16339,8 +16395,10 @@ void MainListener::EmitPositionalFixedArrayIntoSlot(
             if (cxxElement && moveExpr == nullptr)
             {
                 const std::string text = assignment->getText();
-                const bool singleCall = !text.empty() && text.back() == ')'
-                    && std::count(text.begin(), text.end(), '(') == 1;
+                // An assignment shows the slot only to its own operator call (CxxAssignSretScope).
+                const bool singleCall = (!text.empty() && text.back() == ')'
+                        && std::count(text.begin(), text.end(), '(') == 1)
+                    || SoleAssignmentExpression(assignment) != nullptr;
                 if (singleCall)
                 {
                     compiler->pendingCxxSretDest_ = elemPtr;

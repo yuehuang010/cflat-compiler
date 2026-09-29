@@ -3959,6 +3959,47 @@ static CFlatParser::PostfixExpressionContext* SolePostfixExpression(antlr4::tree
         return nullptr;
     }
 
+CFlatParser::AssignmentExpressionContext* MainListener::SoleAssignmentExpression(
+    antlr4::tree::ParseTree* node)
+{
+        if (auto* assign = dynamic_cast<CFlatParser::AssignmentExpressionContext*>(node);
+            assign != nullptr && assign->assignmentOperator() != nullptr)
+            return assign;
+        auto* ctx = dynamic_cast<antlr4::ParserRuleContext*>(node);
+        if (ctx == nullptr) return nullptr;
+        if (ctx->children.size() == 1) return SoleAssignmentExpression(ctx->children[0]);
+        if (auto* primary = dynamic_cast<CFlatParser::PrimaryExpressionContext*>(ctx);
+            primary != nullptr && primary->expression() != nullptr && primary->children.size() == 3
+            && primary->children[0]->getText() == "(")
+            return SoleAssignmentExpression(primary->expression());
+        return nullptr;
+    }
+
+CFlatParser::ConditionalExpressionContext* MainListener::SoleTernaryExpression(
+    antlr4::tree::ParseTree* node)
+{
+        if (auto* cond = dynamic_cast<CFlatParser::ConditionalExpressionContext*>(node);
+            cond != nullptr && cond->Question() != nullptr)
+            return cond;
+        auto* ctx = dynamic_cast<antlr4::ParserRuleContext*>(node);
+        if (ctx == nullptr) return nullptr;
+        if (ctx->children.size() == 1) return SoleTernaryExpression(ctx->children[0]);
+        if (auto* primary = dynamic_cast<CFlatParser::PrimaryExpressionContext*>(ctx);
+            primary != nullptr && primary->expression() != nullptr && primary->children.size() == 3
+            && primary->children[0]->getText() == "(")
+        {
+            // Through parens only for assignment arms: other arms (scalars for a converting ctor,
+            // nested mixed ternaries) keep the call/convert route that already handles them.
+            auto* inner = SoleTernaryExpression(primary->expression());
+            if (inner == nullptr || inner->expression() == nullptr || inner->conditionalExpression() == nullptr)
+                return nullptr;
+            return SoleAssignmentExpression(inner->expression()) != nullptr
+                    || SoleAssignmentExpression(inner->conditionalExpression()) != nullptr
+                ? inner : nullptr;
+        }
+        return nullptr;
+    }
+
 CFlatParser::ArgumentExpressionListContext* MainListener::ForeignCxxConstructArgs(
         antlr4::tree::ParseTree* node, const std::string& typeName)
 {
@@ -4615,10 +4656,16 @@ cxx_dtor_ready:
         const std::string pfText = pf != nullptr ? pf->getText() : std::string();
         // `(T)expr` invoking a C++ conversion operator produces T exactly like a call does.
         const bool castInit = pf == nullptr && assign->getText().starts_with("(" + typeName + ")");
-        if ((!pfText.empty() && pfText.back() == ')') || castInit)
+        // A parenthesized ternary is a single postfix expression ending in ')': it is not a call,
+        // so it takes the ternary route below like the bare spelling.
+        if (((!pfText.empty() && pfText.back() == ')') && SoleTernaryExpression(assign) == nullptr)
+            || castInit)
         {
+            // An assignment hides the slot from its operands and shows it only to its own
+            // operator call (CxxAssignSretScope), so nested calls cannot take it.
             const bool armed = !hasParsedArrayInitializer && !castInit
-                && std::count(pfText.begin(), pfText.end(), '(') == 1;
+                && (std::count(pfText.begin(), pfText.end(), '(') == 1
+                    || SoleAssignmentExpression(assign) != nullptr);
             compiler->SetCurrentDebugLocation(line);
             compiler->lastCxxRetTemp_ = nullptr;
             compiler->lastCxxRetValue_ = nullptr;
@@ -4687,9 +4734,10 @@ cxx_dtor_ready:
         // spellings take the temporary-then-move path below instead.
         // A ternary has two independent control-flow arms. Do not arm the ordinary first-call
         // slot for it: ParseTernaryBranches moves each arm's own return temporary into the slot.
-        const bool ternaryInit = assign->conditionalExpression() != nullptr
-            && assign->conditionalExpression()->Question() != nullptr;
-        const bool armedOperator = !ternaryInit && assign->getText().find('(') == std::string::npos;
+        const bool ternaryInit = SoleTernaryExpression(assign) != nullptr;
+        const bool armedOperator = !ternaryInit
+            && (assign->getText().find('(') == std::string::npos
+                || SoleAssignmentExpression(assign) != nullptr);
         compiler->lastCxxRetTemp_ = nullptr;
         compiler->lastCxxRetValue_ = nullptr;
         compiler->pendingCxxTernaryDeclConsumed_ = false;
