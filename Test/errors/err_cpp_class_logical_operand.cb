@@ -1,0 +1,47 @@
+// A C++ class assignment (or any class value) with no bool conversion used as an operand of
+// `||`, `&&`, `!`, `?:`, `if`, `while` or a bool initializer is refused like clang refuses it.
+// The `||` / `&&` right-operand shapes used to segfault the compiler (the assignment expression
+// yielded no value); the accept set (classes WITH operator bool) is Test/test_cpp_interop.cb
+// 7466-7478.
+import cpp "cpp_interop_assign.h";
+
+int noneSink(int x) { return x; }
+
+extern int main()
+{
+    cppas.TruthNone a = default;
+    cppas.TruthNone b = default;
+    cppas.Life l = default;
+    cppas.Life m = default;
+    expect_error("condition must be a scalar") {
+        if (noneSink(1) > 0 || (a = 9)) {}
+    }
+    expect_error("condition must be a scalar") {
+        if (noneSink(1) > 0 && (a = 9)) {}
+    }
+    expect_error("condition must be a scalar") {
+        if ((a = 9) || noneSink(1) > 0) {}
+    }
+    expect_error("condition must be a scalar") {
+        if ((a = 9) && noneSink(1) > 0) {}
+    }
+    expect_error("condition must be a scalar") {
+        if (noneSink(0) > 0 || (l = m)) {}
+    }
+    expect_error("needs a bool, number or pointer operand") {
+        if (!(a = 9)) {}
+    }
+    expect_error("condition must be a scalar") {
+        int r = (a = 9) ? 1 : 2;
+    }
+    expect_error("condition must be a scalar") {
+        if ((a = 9)) {}
+    }
+    expect_error("condition must be a scalar") {
+        while ((a = 9)) { break; }
+    }
+    expect_error("cannot convert value of type") {
+        bool flag = (a = 9);
+    }
+    return 0;
+}

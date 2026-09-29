@@ -461,6 +461,9 @@
       "300",
       "i8"
     ],
+    "cclassarg0hasnodefau...structorcflatcancall132fe1d487ee5686": [
+      "cppexp.PrivateDefault"
+    ],
     "cdeclarationconflict...1inarg2butarg3inarg4289c088a69b49680": [
       "cppuc.E",
       "an alias of 'cppuc_src.E'",
@@ -1958,6 +1961,7 @@
     "cannotstoreathatjoin...ndependentownedvalue71d560cf28a01507": "cannot store a '?:' that joins two borrowed '{0}' arms into {1}; the destination's destructor would free a value its existing owner still frees. Assign each arm in its own branch, 'move' each arm into a fresh owned value, declare the function 'alias' to hand the borrow through, or write a 'copy()' method for '{2}' and copy the arm into an independent owned value.",
     "cannotstorenewarg0ni...heelementtypesdiffer50877848c28b7c8c": "cannot store 'new {0}[n]' into '{1}': the element types differ",
     "caselabelarg0doesnot...witchoperandtypearg173c0ac994b6f333f": "case label '{0}' does not fit the switch operand type '{1}'",
+    "cclassarg0hasnodefau...structorcflatcancall132fe1d487ee5686": "C++ class '{0}' has no default constructor cflat can call",
     "cdeclarationconflict...1inarg2butarg3inarg4289c088a69b49680": "C++ declaration conflicts with a declaration already in scope: '{0}' is {1} in '{2}' but {3} in '{4}'",
     "cheadergrouparg0wasp...atcppmaxheaderparses6e18d1ff4cf3c9e3": "C++ header group '{0}' was parsed {1} times in one compile; the budget is {2} (set CFLAT_CPP_MAX_HEADER_PARSES)",
     "cheaderimporttargeti...nshowsdkpathresolves750eacee18ce6665": "C header import targeting macOS requires an SDK: set $SDKROOT or install Xcode / Command Line Tools so 'xcrun --show-sdk-path' resolves",

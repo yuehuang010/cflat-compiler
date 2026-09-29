@@ -302,6 +302,7 @@ struct CppResultHolder { cppexp.cppresult.Result<cppexp.cppresult.Middle> item =
 struct CppResultBox<T> { T item = default; };
 struct CppListValue { int value = 0; };
 struct CppAssignHost { cppas.Life l = cppas.Life(1); std.string s; };
+struct CppTallyHost { cppas.Tally t = default; };
 import cpp "library/cpp_interop_fnptr.h";
 
 // A C++ exception unwinding THROUGH CFlat frames (the C++ `guarded` catch sits above them): every
@@ -7679,9 +7680,158 @@ extern int main()
     if (cppi_expr.Vec3(exprA + exprB).sum() != 21.0) return 7464;
     exprSum = exprA + exprA;
     if (exprSum.sum() != 12.0) return 7465;
+    // A C++ class assignment used as a `||` / `&&` / `!` / `?:` / `if` / `while` operand is the
+    // destination itself and is tested through the class's bool conversion (used to segfault).
+    {
+        cppas.TruthImplicit ti = default;
+        cppas.TruthImplicit.assigns = 0;
+        bool short1 = truthSink(1) > 0 || (ti = 9);
+        if (!short1 || cppas.TruthImplicit.assigns != 0 || ti.v_ != 0) return 7466;
+        bool rhs1 = truthSink(0) > 0 || (ti = 9);
+        if (!rhs1 || cppas.TruthImplicit.assigns != 1 || ti.v_ != 9) return 7467;
+        bool and1 = truthSink(1) > 0 && (ti = 0);
+        if (and1 || cppas.TruthImplicit.assigns != 2 || ti.v_ != 0) return 7468;
+        bool left1 = (ti = 5) && truthSink(1) > 0;
+        if (!left1 || cppas.TruthImplicit.assigns != 3 || ti.v_ != 5) return 7469;
+        if (!(ti = 0) == false) return 7470;
+        int arm = (ti = 4) ? 1 : 2;
+        if (arm != 1 || ti.v_ != 4) return 7471;
+        int viaIf = 0;
+        if ((ti = 0)) viaIf = 1; else viaIf = 2;
+        if (viaIf != 2) return 7472;
+        int whileN = 3;
+        int whileRuns = 0;
+        while ((ti = whileN)) { whileN = whileN - 1; whileRuns = whileRuns + 1; }
+        if (whileRuns != 3) return 7473;
+        cppas.TruthImplicit tj = default;
+        tj.v_ = 8;
+        cppas.TruthImplicit.assigns = 0;
+        if (!(truthSink(0) > 0 || (ti = tj)) || cppas.TruthImplicit.assigns != 100 || ti.v_ != 8)
+            return 7474;
+    }
+    {
+        cppas.TruthExplicit te = default;
+        cppas.TruthExplicit.assigns = 0;
+        bool r1 = truthSink(0) > 0 || (te = 9);
+        if (!r1 || cppas.TruthExplicit.assigns != 1 || te.v_ != 9) return 7475;
+        bool r2 = truthSink(1) > 0 && (te = 0);
+        if (r2 || cppas.TruthExplicit.assigns != 2) return 7476;
+        bool r3 = !(te = 3);
+        if (r3 || te.v_ != 3) return 7477;
+        if (((te = 0) ? 1 : 2) != 2) return 7478;
+    }
+    // A C++ class assignment used as an initializer or return value is the destination lvalue
+    // (C++ `T&`): the consumer copy-constructs from it (clang: copies == 1). The declarator's /
+    // return's armed construction slot used to be taken by the assignment, leaving it unbuilt.
+    {
+        cppas.Tally a = default;
+        cppas.Tally c = cppas.Tally(4);
+        cppas.Tally.reset();
+        {
+            cppas.Tally b = (a = 9);
+            if (b.v_ != 9 || a.v_ != 9 || cppas.Tally.copies != 1 || cppas.Tally.assigns != 1
+                || cppas.Tally.ctors != 0 || cppas.Tally.moves != 0) return 7479;
+        }
+        if (cppas.Tally.dtors != 1) return 7480;
+        cppas.Tally.reset();
+        {
+            cppas.Tally b = (a = c);
+            if (b.v_ != 4 || cppas.Tally.copies != 1 || cppas.Tally.copy_assigns != 1) return 7481;
+        }
+        cppas.Tally* p = &a;
+        cppas.Tally.reset();
+        {
+            cppas.Tally b = (*p = 5);
+            if (b.v_ != 5 || a.v_ != 5 || cppas.Tally.copies != 1) return 7482;
+        }
+        CppTallyHost host = default;
+        CppTallyHost* hp = &host;
+        cppas.Tally.reset();
+        {
+            cppas.Tally b = (hp->t = 6);
+            if (b.v_ != 6 || host.t.v_ != 6 || cppas.Tally.copies != 1) return 7483;
+        }
+        cppas.Tally.reset();
+        {
+            cppas.Tally[2] cells = { (a = 2), (a = 3) };
+            if (cells[0].v_ != 2 || cells[1].v_ != 3 || cppas.Tally.copies != 2) return 7484;
+        }
+        cppas.Tally.reset();
+        {
+            cppas.Tally b = TallyAssignReturn(&a);
+            if (b.v_ != 9 || a.v_ != 9 || cppas.Tally.copies != 1 || cppas.Tally.moves != 0)
+                return 7485;
+        }
+        cppas.Tally.reset();
+        {
+            cppas.Tally b = TallyAssignLocalReturn();
+            if (b.v_ != 7 || cppas.Tally.ctors != 1 || cppas.Tally.copies != 1
+                || cppas.Tally.dtors != 1) return 7486;
+        }
+        cppas.Tally.reset();
+        {
+            cppas.Tally b = TallyAssignGeneric<cppas.Tally>(&a, &c);
+            if (b.v_ != 4 || a.v_ != 4 || cppas.Tally.copies != 1 || cppas.Tally.copy_assigns != 1)
+                return 7487;
+        }
+        cppas.Tally.reset();
+        {
+            cppas.Tally b = a = 3;
+            if (b.v_ != 3 || a.v_ != 3 || cppas.Tally.copies != 1) return 7489;
+        }
+        // By-value operators: the prvalue result builds the declared object / return value in
+        // place (copies == 1 from `return *this;`, nothing else constructed or destroyed).
+        cppas.TallyByValue va = default;
+        cppas.TallyByValue.reset();
+        {
+            cppas.TallyByValue b = (va = 3);
+            if (b.v_ != 3 || cppas.TallyByValue.copies != 1 || cppas.TallyByValue.dtors != 0) return 7490;
+        }
+        cppas.TallyByValue.reset();
+        {
+            cppas.TallyByValue b = va = 4;
+            if (b.v_ != 4 || cppas.TallyByValue.copies != 1 || cppas.TallyByValue.dtors != 0) return 7491;
+        }
+        cppas.TallyByValue.reset();
+        {
+            cppas.TallyByValue b = (va += 3);
+            cppas.TallyByValue d = va += 1;
+            if (b.v_ != 7 || d.v_ != 8 || cppas.TallyByValue.copies != 2
+                || cppas.TallyByValue.moves != 0 || cppas.TallyByValue.dtors != 0) return 7492;
+        }
+        cppas.TallyByValue.reset();
+        {
+            cppas.TallyByValue b = ByValueAssignReturn(&va);
+            cppas.TallyByValue d = ByValueAssignReturnBare(&va);
+            if (b.v_ != 5 || d.v_ != 6 || cppas.TallyByValue.copies != 2
+                || cppas.TallyByValue.moves != 0 || cppas.TallyByValue.dtors != 0) return 7493;
+        }
+        cppas.TallyByValue.reset();
+        {
+            cppas.TallyByValue b = ByValueCompoundReturn(&va);
+            if (b.v_ != 8 || cppas.TallyByValue.copies != 1 || cppas.TallyByValue.dtors != 0) return 7494;
+        }
+        if (cppas.TallyByValue.dtors != 1 || va.v_ != 8) return 7495;
+        // Already correct before the fix; must stay so.
+        cppas.Tally.reset();
+        {
+            auto b = (a = 8);
+            cppas.Tally d = (a += 1);
+            cppas.Tally e = (a = cppas.make_tally(5));
+            if (b.v_ != 8 || d.v_ != 9 || e.v_ != 5 || cppas.Tally.copies != 3
+                || cppas.Tally.move_assigns != 1) return 7488;
+        }
+    }
     return 0;
 }
 
+int truthSink(int x) { return x; }
+cppas.Tally TallyAssignReturn(cppas.Tally* a) { return (*a = 9); }
+cppas.Tally TallyAssignLocalReturn() { cppas.Tally a = default; return (a = 7); }
+T TallyAssignGeneric<T>(T* a, T* b) { return (*a = *b); }
+cppas.TallyByValue ByValueAssignReturn(cppas.TallyByValue* a) { return (*a = 5); }
+cppas.TallyByValue ByValueAssignReturnBare(cppas.TallyByValue* a) { return *a = 6; }
+cppas.TallyByValue ByValueCompoundReturn(cppas.TallyByValue* a) { return (*a += 2); }
 int* EscTernFieldAddr(int x) { return x > 0 ? &(new cppon.Esc(x))->v : nullptr; }
 int* EscLaunderedFieldAddr(int x) { return (int*)(long)&(new cppon.Esc(x))->v; }
 // Value * 100 + frees so far: a temp freed before the read shows up in the low digits.

@@ -32,5 +32,14 @@ extern int main()
     expect_error("cannot copy-assign C++ class 'cppas.MoveOnly': it has no copy assignment operator") {
         host.m = a;
     }
+    // An assignment's result is the destination LVALUE: initializing from it copies (clang
+    // refuses, copy ctor deleted). It used to leave the local / return slot unconstructed.
+    expect_error("cannot copy C++ class 'cppas.MoveOnly' into local 'd': its copy constructor is deleted") {
+        cppas.MoveOnly d = (t = move a);
+    }
     return 0;
+}
+
+expect_error("cannot copy C++ class 'cppas.MoveOnly' into the return slot: its copy constructor is deleted") {
+    cppas.MoveOnly MoveOnlyAssignReturn(cppas.MoveOnly* p) { return (*p = cppas.MoveOnly(5)); }
 }

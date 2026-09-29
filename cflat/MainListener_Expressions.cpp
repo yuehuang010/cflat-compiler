@@ -29,6 +29,69 @@ public:
 };
 
 /*
+ * A slot armed by an enclosing declarator / return / array element (`T b = (a = 9);`) while an
+ * assignment is compiled. The operand parse never sees it, so no RHS call constructs into it.
+ * Only the assignment's own C++ operator call is shown the slot (EmitOperatorCall): a by-value
+ * (prvalue) result constructs straight into it, a `T&` result leaves it, and the caller then
+ * copies from the destination lvalue. The LAST emission decides, since a speculative call can be
+ * discarded and re-emitted. Scopes nest per thread; a generic instantiated mid-expression pushes
+ * and pops its own.
+ */
+class CxxAssignSretScope
+{
+    LLVMBackend* compiler_;
+    CxxAssignSretScope* outer_;
+    llvm::Value* savedDest_;
+    std::string savedType_;
+    bool consumed_ = false;
+    static inline thread_local CxxAssignSretScope* current_ = nullptr;
+public:
+    explicit CxxAssignSretScope(LLVMBackend* compiler)
+        : compiler_(compiler), outer_(current_), savedDest_(compiler->pendingCxxSretDest_),
+          savedType_(compiler->pendingCxxSretTypeName_)
+    {
+        compiler_->pendingCxxSretDest_ = nullptr;
+        compiler_->pendingCxxSretTypeName_.clear();
+        current_ = this;
+    }
+    ~CxxAssignSretScope()
+    {
+        current_ = outer_;
+        if (consumed_) return;
+        compiler_->pendingCxxSretDest_ = savedDest_;
+        compiler_->pendingCxxSretTypeName_ = std::move(savedType_);
+    }
+    CxxAssignSretScope(const CxxAssignSretScope&) = delete;
+    CxxAssignSretScope& operator=(const CxxAssignSretScope&) = delete;
+
+    template <typename Emit>
+    static llvm::Value* EmitOperatorCall(LLVMBackend* compiler, Emit&& emit)
+    {
+        auto* scope = current_;
+        if (scope == nullptr || scope->compiler_ != compiler || scope->savedDest_ == nullptr)
+            return emit();
+        compiler->pendingCxxSretDest_ = scope->savedDest_;
+        compiler->pendingCxxSretTypeName_ = scope->savedType_;
+        llvm::Value* result = nullptr;
+        try
+        {
+            result = emit();
+        }
+        catch (...)
+        {
+            scope->consumed_ = false;
+            compiler->pendingCxxSretDest_ = nullptr;
+            compiler->pendingCxxSretTypeName_.clear();
+            throw;
+        }
+        scope->consumed_ = result != nullptr && compiler->pendingCxxSretDest_ == nullptr;
+        compiler->pendingCxxSretDest_ = nullptr;
+        compiler->pendingCxxSretTypeName_.clear();
+        return result;
+    }
+};
+
+/*
  * The compound assignment operators, each paired with the binary operator it falls back to when
  * no compound overload exists. One table drives the assignment path's fallback, the C++
  * "this operator writes through its receiver" test, and the operator-form diagnostics.
@@ -1640,6 +1703,9 @@ llvm::Value* MainListener::ParseAssignmentExpression(
         else if (assignmentOp != nullptr)
         {
             CallPostfixScope assignmentOperatorPostfix(this);
+            // An enclosing declarator's / return's armed slot is hidden from the operand parse and
+            // shown only to this assignment's own operator call (CxxAssignSretScope).
+            CxxAssignSretScope enclosingSret(compiler);
             auto operatorText = ctx->assignmentOperator()->getText();
             auto assignCtx = ctx->assignmentExpression();
             // `_ = expr` is an explicit discard: evaluate the RHS for its side effects, drop the
@@ -1928,6 +1994,29 @@ llvm::Value* MainListener::ParseAssignmentExpression(
              * `y = move x` prefers move assignment and consumes x; the moved-from object is still
              * destroyed at scope exit (M4b ruling 3).
              */
+            // `(a = x)` used as a value is the destination itself (C++: the operator's `T&`).
+            // The class branch below emits the call and yields no IR value, so a value-position
+            // caller (`||`, `&&`, `!`, `?:`, `if`, `bool b = ...`) would otherwise meet a null
+            // operand. Discard-position statements pass no assignmentResult and stay null.
+            auto classAssignValue = [&]() -> llvm::Value* {
+                if (assignmentResult == nullptr || destination == nullptr) return nullptr;
+                // The operator's own `T&` result is no owned temporary a declarator could adopt.
+                compiler->lastCxxRetTemp_ = nullptr;
+                compiler->lastCxxRetValue_ = nullptr;
+                llvm::Value* loaded = namedVar.BaseType != nullptr
+                    ? compiler->CreateLoad(namedVar.BaseType, destination)
+                    : compiler->CreateLoad(destination);
+                *assignmentResult = {};
+                assignmentResult->TypeAndValue = namedVar.TypeAndValue;
+                assignmentResult->TypeAndValue.VariableName.clear();
+                assignmentResult->TypeAndValue.IsMove = false;
+                assignmentResult->Primary = loaded;
+                assignmentResult->BaseType = loaded->getType();
+                assignmentResult->Storage = destination;
+                assignmentResult->CallerName = namedVar.CallerName;
+                assignmentResult->FieldName = namedVar.FieldName;
+                return loaded;
+            };
             if (operatorText == "=" && destination != nullptr
                 && !namedVar.TypeAndValue.Pointer
                 && compiler->IsForeignNontrivialCxxClass(namedVar.TypeAndValue.TypeName))
@@ -2116,7 +2205,7 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                                 compiler->MarkVariableUnmoved(namedVar.CallerName);
                                 compiler->MarkVariableNotExplicitlyMovedNull(namedVar.CallerName);
                             }
-                            return nullptr;
+                            return classAssignValue();
                         }
                     // `t = move u;` with a class source is `t = T(move u)`: the source binds as
                     // an rvalue (T(U&&) wins) and is consumed like any moved C++ local.
@@ -2320,7 +2409,7 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                         compiler->MarkVariableUnmoved(namedVar.CallerName);
                         compiler->MarkVariableNotExplicitlyMovedNull(namedVar.CallerName);
                     }
-                    return nullptr;
+                    return classAssignValue();
                 }
             }
 
@@ -4127,8 +4216,8 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                         cxxCompoundInPlace = cxxClass
                             && (compoundOverloadExists || compoundTemplateExists);
                         compoundOverloadExists = compoundOverloadExists || compoundTemplateExists;
-                        if (compoundOverloadExists)
-                            overload = TryBinaryOperatorOverload(
+                        auto emitCompound = [&]() {
+                            return TryBinaryOperatorOverload(
                                 left, operatorText, right, ctx, namedVar.BaseType,
                                 rightNV.TypeAndValue.DepthIsAboutThisValue()
                                     ? rightNV.TypeAndValue.PointerDepth : 0,
@@ -4136,6 +4225,13 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                                 rightNV.Storage, false, true, false, rightNV.IsRvalue,
                                 namedVar.TypeAndValue.TypeName,
                                 rightNV.TypeAndValue.TypeName);
+                        };
+                        // Only a C++ in-place compound may take an enclosing slot; a CFlat
+                        // compound's result is stored back into the destination instead.
+                        if (compoundOverloadExists)
+                            overload = cxxCompoundInPlace
+                                ? CxxAssignSretScope::EmitOperatorCall(compiler, emitCompound)
+                                : emitCompound();
                     }
                     if (overload == nullptr && !compoundOverloadExists && !binaryOp.empty())
                         overload = TryBinaryOperatorOverload(
@@ -13950,12 +14046,14 @@ llvm::Value* MainListener::TryDirectCxxAssignOperator(
         };
         auto emitCall = [&]() -> llvm::Value* {
             auto* left = compiler->CreateLoad(destination.BaseType, destination.Storage);
-            return TryBinaryOperatorOverload(
-                left, "=", right, ctx, destination.BaseType,
-                rhsNV.TypeAndValue.DepthIsAboutThisValue() ? rhsNV.TypeAndValue.PointerDepth : 0,
-                rhsNV.TypeAndValue.ElemPointer, destination.Storage, rhsNV.Storage,
-                /*reportMissing*/ false, /*allowReversed*/ false, /*lhsIsRvalue*/ false,
-                rhsNV.IsRvalue, typeName, rhsNV.TypeAndValue.TypeName);
+            return CxxAssignSretScope::EmitOperatorCall(compiler, [&]() {
+                return TryBinaryOperatorOverload(
+                    left, "=", right, ctx, destination.BaseType,
+                    rhsNV.TypeAndValue.DepthIsAboutThisValue() ? rhsNV.TypeAndValue.PointerDepth : 0,
+                    rhsNV.TypeAndValue.ElemPointer, destination.Storage, rhsNV.Storage,
+                    /*reportMissing*/ false, /*allowReversed*/ false, /*lhsIsRvalue*/ false,
+                    rhsNV.IsRvalue, typeName, rhsNV.TypeAndValue.TypeName);
+            });
         };
         /*
          * The real call, run once under suppressed diagnostics into a detached block. Success
