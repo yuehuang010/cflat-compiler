@@ -7,6 +7,11 @@ extern int main()
     expect_error("constructor 'cppcr.IntRef' parameter 'x'") {
         cppcr.IntRef bad = cppcr.IntRef(5);
     }
+    // A bare `nullptr` never binds a non-const `std::nullptr_t&` (clang refuses; pre-fix it
+    // picked `long` and failed module verification).
+    expect_error("C++ class 'cppcr.NpMutRef' has no constructor whose parameter types match") {
+        int v = cppcr.NpMutRef(nullptr).chosen;
+    }
     expect_error("constructor 'cppcr.LRef' parameter 'c'") {
         cppcr.LRef bad = cppcr.LRef(cppcr.make_cnt(3), 4);
     }
@@ -51,6 +56,24 @@ extern int main()
         cppcr.OrdinarySignedCharCall call = cppcr.OrdinarySignedCharCall();
         char c = 7;
         call.take(c);
+    }
+    // Equal conversion categories are ambiguous; an omitted default is not a tie-breaker.
+    expect_error("is ambiguous") {
+        int v = cppcr.RkAmb(3).chosen;
+    }
+    // int -> long and int -> double are both conversions.
+    expect_error("is ambiguous") {
+        int rkInt = 3;
+        int v = cppcr.RkLD(rkInt).chosen;
+    }
+    // Two arguments, each candidate better on one: ambiguous.
+    expect_error("is ambiguous") {
+        int rkInt = 3;
+        int v = cppcr.RkTwo(rkInt, rkInt).chosen;
+    }
+    // nullptr converts to a function pointer and to `int*` alike.
+    expect_error("more than one constructor overload") {
+        int v = cppcr.RkFnPtr(nullptr).chosen;
     }
     return 0;
 }

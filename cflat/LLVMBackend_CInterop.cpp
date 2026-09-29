@@ -2871,6 +2871,38 @@ static bool CxxParamIsConstRefToPointer(const std::string& spelling)
         return !s.empty() && s.back() == '*';
 }
 
+/*
+ * True when a C++ pointer spelling has a const INNERMOST pointee: `const T *`, `T const *&`,
+ * `const T *const &`, `const T *const *`. Template arguments and function-pointer spellings are
+ * not looked into; `T *const &` (const pointer slot only) is false.
+ */
+static bool CxxSpellingHasConstPointee(const std::string& spelling)
+{
+        if (spelling.find('(') != std::string::npos) return false;
+        std::string head;
+        int depth = 0;
+        bool sawStar = false;
+        for (char c : spelling)
+        {
+            if (c == '<') ++depth;
+            else if (c == '>') --depth;
+            else if (depth == 0 && c == '*') { sawStar = true; break; }
+            else if (depth == 0) head += c;
+        }
+        if (!sawStar) return false;
+        for (size_t at = head.find("const"); at != std::string::npos;
+             at = head.find("const", at + 1))
+        {
+            const bool leftOk = at == 0 || !(std::isalnum((unsigned char)head[at - 1])
+                                             || head[at - 1] == '_' || head[at - 1] == ':');
+            const size_t end = at + 5;
+            const bool rightOk = end >= head.size()
+                || !(std::isalnum((unsigned char)head[end]) || head[end] == '_');
+            if (leftOk && rightOk) return true;
+        }
+        return false;
+}
+
 bool LLVMBackend::MapRawSig(const cflat_cinterop::RawSig& r, CSigEntry& e)
 {
         e = CSigEntry();
@@ -2933,9 +2965,13 @@ bool LLVMBackend::MapRawSig(const cflat_cinterop::RawSig& r, CSigEntry& e)
             e.ret.IsAlias = true;
             if (CxxParamIsConstLvalueReference(r.retType)
                 || (cxxScalarRvalueReferenceReturn
-                    && CxxRvalueReferenceIsConst(r.retType)))
+                    && CxxRvalueReferenceIsConst(r.retType))
+                || (e.ret.IsCxxRefToPointer && CxxParamIsConstRefToPointer(r.retType)))
                 e.ret.IsCxxConstRef = true;
         }
+        if (r.isCxx && e.ret.Pointer && !e.ret.IsFunctionPointer
+            && CxxSpellingHasConstPointee(r.retType))
+            e.ret.IsCxxPointeeConst = true;
         for (size_t i = 0; i < r.paramTypes.size(); ++i)
         {
             if (r.isCxx && r.paramTypes[i].find("::*") != std::string::npos)
@@ -8596,13 +8632,18 @@ bool LLVMBackend::RequestCxxFunctionTemplate(const std::string& functionName,
         std::vector<std::string> callArguments;
         // (call argument index, C++ literal spelling) for the literal retry below.
         std::vector<std::pair<size_t, std::string>> literalCallArguments;
+        // A `const` CFlat's types cannot show was spelled into the wrapper: see uniqueForConst.
+        bool constSpelled = false;
         if (selected->kind == cflat_cinterop::RawFunctionTemplate::InstanceMember)
         {
             const NamedVariable& receiver = arguments.front();
             std::string receiverSpelling = ownerSpelling;
-            // On a `T *const &` IsCxxConstRef marks the pointer level, not the pointee.
-            const bool receiverIsConst = receiver.TypeAndValue.IsCxxConstRef
-                && !receiver.TypeAndValue.Pointer && !receiver.TypeAndValue.IsCxxRefToPointer;
+            // `p->` keeps p's flags on the object: pointee const makes it const, while
+            // IsCxxConstRef on a pointer shape (`T *const &`) is the slot, not the object.
+            const bool receiverIsConst = receiver.TypeAndValue.IsCxxPointeeConst
+                || (receiver.TypeAndValue.IsCxxConstRef && !receiver.TypeAndValue.Pointer
+                    && !receiver.TypeAndValue.IsCxxRefToPointer);
+            constSpelled = receiverIsConst;
             const bool receiverIsRvalue = IsCxxRvalueReferenceArgument(receiver);
             const std::string receiverReference = receiverIsRvalue ? " &&" : " &";
             if (receiver.TypeAndValue.Pointer)
@@ -8782,7 +8823,17 @@ bool LLVMBackend::RequestCxxFunctionTemplate(const std::string& functionName,
                 return noMatch("an argument type cannot be spelled in C++");
             if (arg.TypeAndValue.IsCxxConstRef && !arg.TypeAndValue.Pointer
                 && !arg.TypeAndValue.IsCxxRefToPointer)
+            {
                 spelling = "const " + spelling;
+                constSpelled = true;
+            }
+            else if (arg.TypeAndValue.IsCxxPointeeConst && arg.TypeAndValue.Pointer
+                     && !arg.TypeAndValue.IsFunctionPointer && spelling.ends_with("*")
+                     && !spelling.starts_with("const "))
+            {
+                spelling = "const " + spelling;
+                constSpelled = true;
+            }
             const bool classRvalue = classArgument && arg.IsRvalue;
             /*
              * The wrapper takes the first-element pointer and rebuilds the caller's array lvalue,
@@ -9013,7 +9064,12 @@ bool LLVMBackend::RequestCxxFunctionTemplate(const std::string& functionName,
         const bool uniqueForCategory = categorySensitive && infixOperator.empty()
             && !functionName.starts_with("operator")
             && functionName.find(".operator") == std::string::npos;
-        if (!explicitArgs.empty() || infixForm || uniqueForCategory || uniqueRegistration)
+        // So does one with a spelled `const`: its CFlat signature equals the non-const sibling's.
+        const bool uniqueForConst = constSpelled && infixOperator.empty()
+            && !functionName.starts_with("operator")
+            && functionName.find(".operator") == std::string::npos;
+        if (!explicitArgs.empty() || infixForm || uniqueForCategory || uniqueForConst
+            || uniqueRegistration)
         {
             registeredName = wrapperName;
             if (functionTable.find(wrapperName) != functionTable.end())
@@ -16367,6 +16423,8 @@ void LLVMBackend::RegisterCxxClassMembers(const CRecordEntry& r, const std::stri
                     || (tv.IsCxxRefToPointer && CxxParamIsConstRefToPointer(spelling));
             };
             if (aliasRefs) asAliasIfRef(m.retType, ret, true);
+            if (ret.Pointer && !ret.IsFunctionPointer && CxxSpellingHasConstPointee(m.retType))
+                ret.IsCxxPointeeConst = true;
             std::vector<TypeAndValue> params;
             bool paramsOk = true;
             size_t unmappableParam = m.paramTypes.size();
@@ -19818,6 +19876,45 @@ const LLVMBackend::CxxClassInfo::Structor* LLVMBackend::SelectCxxConstructor(
             return true;
         };
 
+        auto isNullptrArgument = [&](size_t index) {
+            if (argVars == nullptr || index >= argVars->size()) return false;
+            const NamedVariable& arg = (*argVars)[index];
+            return !arg.TypeAndValue.Pointer && arg.TypeAndValue.TypeName.empty()
+                && llvm::isa_and_nonnull<llvm::ConstantPointerNull>(arg.Primary);
+        };
+        // `std::nullptr_t` maps to `void*`; only the harvested spelling tells the two apart.
+        // Kind: 0 not nullptr_t, 1 by value (any top-level cv), 2 binds a prvalue exactly, 3 other ref.
+        auto spelledNullptrT = [&](const CxxClassInfo::Structor& c, size_t paramIndex) {
+            auto record = cxxRecordEntries_.find(typeName);
+            if (record == cxxRecordEntries_.end()) return 0;
+            for (const auto& member : record->second.members)
+                if (member.linkageName == c.linkageName && paramIndex < member.paramTypes.size()
+                    && member.paramTypes.size() == c.params.size())
+                {
+                    std::string spelled = SqueezeCxxSpelling(member.paramTypes[paramIndex]);
+                    const bool rvalueRef = spelled.ends_with("&&");
+                    const bool reference = spelled.ends_with('&');
+                    while (spelled.ends_with('&')) spelled.pop_back();
+                    bool isConst = false, isVolatile = false;
+                    for (bool again = true; again;)
+                    {
+                        again = false;
+                        if (spelled.starts_with("const")) { spelled.erase(0, 5); isConst = again = true; }
+                        if (spelled.ends_with("const")) { spelled.resize(spelled.size() - 5); isConst = again = true; }
+                        if (spelled.starts_with("volatile")) { spelled.erase(0, 8); isVolatile = again = true; }
+                        if (spelled.ends_with("volatile")) { spelled.resize(spelled.size() - 8); isVolatile = again = true; }
+                    }
+                    if (spelled.starts_with("::")) spelled.erase(0, 2);
+                    if (spelled != "std::nullptr_t" && spelled != "nullptr_t"
+                        && spelled != "decltype(nullptr)")
+                        return 0;
+                    if (!reference) return 1;
+                    // A prvalue binds any rvalue reference, or a const non-volatile lvalue reference.
+                    return rvalueRef || (isConst && !isVolatile) ? 2 : 3;
+                }
+            return 0;
+        };
+
         const CxxClassInfo::Structor* found = nullptr;
         size_t candidates = 0;
         auto sameBoundaryType = [](const TypeAndValue& a, const TypeAndValue& b) {
@@ -19840,6 +19937,19 @@ const LLVMBackend::CxxClassInfo::Structor* LLVMBackend::SelectCxxConstructor(
             if (!param.IsAlias) return size_t(0);
             return param.IsCxxConstRef ? size_t(1) : (rvalue ? size_t(0) : size_t(2));
         };
+        struct Viable
+        {
+            const CxxClassInfo::Structor* ctor;
+            size_t omitted;
+            size_t exact;
+            size_t referencePreference;
+            bool blocked;
+            bool numeric;   // blocked by an integer <-> floating argument, not by a default
+            std::vector<CxxConversionRank> ranks;
+            bool ranked;
+        };
+        std::vector<Viable> viable;
+        std::string blockedWhy;
         // A tie is only final once every candidate has been seen: a later exact match wins.
         bool ambiguous = false;
         std::vector<const CxxClassInfo::Structor*> tied;   // the equal-rank candidates, for the note
@@ -19852,8 +19962,19 @@ const LLVMBackend::CxxClassInfo::Structor* LLVMBackend::SelectCxxConstructor(
             // conversion; an explicit one stays reachable through the spelled form `T(x)`.
             if (!allowExplicit && c.isExplicit) continue;
             const size_t omitted = c.params.size() - argTypes.size() - 1;
-            if (omitted != 0 && !CxxConstantDefaultsFrom(c, argTypes.size() + 1)) continue;
-            ++candidates;
+            // A candidate whose omitted defaults are not constants cannot be CALLED here, but C++
+            // still ranks it: it is kept as `blocked` so a better one is refused, not skipped.
+            const bool blocked = omitted != 0 && !CxxConstantDefaultsFrom(c, argTypes.size() + 1);
+            if (blocked)
+            {
+                // Viable in C++ only when EVERY omitted parameter has some default at all.
+                bool everyDefaulted = c.defaultArgs.size() == c.params.size();
+                for (size_t i = argTypes.size() + 1; everyDefaulted && i < c.params.size(); ++i)
+                    everyDefaulted = !c.defaultArgs[i].kind.empty();
+                if (!everyDefaulted) continue;
+            }
+            if (!blocked) ++candidates;
+            bool softRefused = false;
             bool ok = true;
             size_t exact = 0;
             size_t currentReferencePreference = 0;
@@ -19861,6 +19982,19 @@ const LLVMBackend::CxxClassInfo::Structor* LLVMBackend::SelectCxxConstructor(
             {
                 const auto& want = c.params[i + 1];
                 const auto& got = argTypes[i];
+                // A bare `nullptr` has no CFlat type: it binds a by-value pointer or function
+                // pointer (a null pointer conversion), or exactly a `std::nullptr_t` by value or
+                // by const lvalue reference, and nothing else.
+                if (isNullptrArgument(i))
+                {
+                    const int nullptrKind = spelledNullptrT(c, i + 1);
+                    if (nullptrKind == 2) { ++exact; continue; }
+                    if ((!want.Pointer && !want.IsFunctionPointer) || want.IsAlias
+                        || want.IsRvalueRef || want.IsCxxRefToPointer)
+                    { ok = false; break; }
+                    if (nullptrKind == 1) ++exact;
+                    continue;
+                }
                 if (want.IsFunctionPointer && !got.IsFunctionPointer && got.IsInteger() != -1)
                 {
                     bool nullPointerConstant = false;
@@ -19872,7 +20006,7 @@ const LLVMBackend::CxxClassInfo::Structor* LLVMBackend::SelectCxxConstructor(
                     }
                     if (!nullPointerConstant)
                     {
-                        rejectedIntegerFunctionPointer = true;
+                        if (!blocked && !softRefused) rejectedIntegerFunctionPointer = true;
                         ok = false;
                         break;
                     }
@@ -19890,7 +20024,7 @@ const LLVMBackend::CxxClassInfo::Structor* LLVMBackend::SelectCxxConstructor(
                 if (sameReferenceReferent
                     && want.Pointer && want.IsRvalueRef && !rvalue)
                 {
-                    if (!c.needsLocalDefinition && referenceRejection.empty())
+                    if (!blocked && !softRefused && !c.needsLocalDefinition && referenceRejection.empty())
                         referenceRejection = std::format(
                             "constructor '{}' parameter '{}' is an rvalue reference; "
                             "pass 'move <argument>' or a temporary value",
@@ -19902,7 +20036,7 @@ const LLVMBackend::CxxClassInfo::Structor* LLVMBackend::SelectCxxConstructor(
                     && !want.IsRvalueRef && !want.IsCxxConstRef && !want.IsCxxRefToPointer
                     && rvalue)
                 {
-                    if (!c.needsLocalDefinition && referenceRejection.empty())
+                    if (!blocked && !softRefused && !c.needsLocalDefinition && referenceRejection.empty())
                         referenceRejection = std::format(
                             "constructor '{}' parameter '{}' is a non-const lvalue "
                             "reference and cannot bind an rvalue; pass an lvalue",
@@ -19918,6 +20052,7 @@ const LLVMBackend::CxxClassInfo::Structor* LLVMBackend::SelectCxxConstructor(
                 if (got.TypeName == "__closure_fat_ptr" && want.IsFunctionPointer
                     && want.IsThinFnPtr())
                 {
+                    if (blocked || softRefused) { ok = false; break; }
                     why = "a capturing closure cannot be passed to C++; pass a plain function";
                     return nullptr;
                 }
@@ -19931,7 +20066,20 @@ const LLVMBackend::CxxClassInfo::Structor* LLVMBackend::SelectCxxConstructor(
                 const bool scalarRvalueRef = scalarRvalueReference(want, got, rvalue);
                 const bool compatibleArg = compatible(want, got);
                 if (!copyRef && !scalarRvalueRef && !compatibleArg)
-                { ok = false; break; }
+                {
+                    // An integer <-> floating argument is refused as a CALL here, but C++ still
+                    // ranks that overload: keep it as `blocked` so ranking can see it.
+                    const bool numericMismatch = !allowNumericConversions
+                        && !want.Pointer && !got.Pointer && !want.IsAlias && !want.IsRvalueRef
+                        && ((want.IsFloatingPoint() != -1
+                                && (got.IsInteger() != -1 || enumBackingTypes.count(got.TypeName) != 0))
+                            || (want.IsInteger() != -1 && got.IsFloatingPoint() != -1))
+                        && dataStructures.count(want.TypeName) == 0
+                        && dataStructures.count(got.TypeName) == 0;
+                    if (!numericMismatch) { ok = false; break; }
+                    softRefused = true;
+                    continue;
+                }
                 // No implicit integer -> enum conversion; needs the argument to prove it.
                 if (argVars != nullptr && i < argVars->size()
                     && CxxEnumParameterRefusesArgument((*argVars)[i], got, want))
@@ -19950,7 +20098,7 @@ const LLVMBackend::CxxClassInfo::Structor* LLVMBackend::SelectCxxConstructor(
                     // rvalue is refused by a non-const lvalue reference.
                     if (!want.IsCxxConstRef && !want.IsRvalueRef && rvalue)
                     {
-                        if (!c.needsLocalDefinition && referenceRejection.empty())
+                        if (!blocked && !softRefused && !c.needsLocalDefinition && referenceRejection.empty())
                             referenceRejection = std::format(
                                 "constructor '{}' parameter '{}' is a non-const lvalue "
                                 "reference and cannot bind an rvalue; pass an lvalue",
@@ -19968,38 +20116,33 @@ const LLVMBackend::CxxClassInfo::Structor* LLVMBackend::SelectCxxConstructor(
                     shape += (i > 1 ? ", " : "") + c.params[i].TypeName + (c.params[i].Pointer ? "*" : "");
                 std::string got;
                 for (const auto& a : argTypes) got += (got.empty() ? "" : ", ") + a.TypeName + (a.Pointer ? "*" : "");
-                std::cout << std::format("[verbose]   ctor candidate {}({}) for ({}): exact={} omitted={}\n",
-                                         typeName, shape, got, exact, omitted);
+                std::cout << std::format("[verbose]   ctor candidate {}({}) for ({}): exact={} omitted={} linkage={} blocked={}\n",
+                                         typeName, shape, got, exact, omitted, c.linkageName, blocked || softRefused);
             }
-            if (found != nullptr)
+            viable.push_back({ &c, omitted, exact, currentReferencePreference, blocked || softRefused,
+                               softRefused, {}, false });
+        }
+        // Legacy pick over `pool` (in declaration order). C++ ranks only the PASSED arguments:
+        // more exactly-typed parameters beat same-family conversions (`format_int(42)` picks the int
+        // constructor over unsigned and long long), then reference binding; filled-in defaults only
+        // break what is left, and only where per-argument ranking could not judge the pair.
+        auto legacyPick = [&](const std::vector<const Viable*>& pool) {
+            found = nullptr; ambiguous = false; tied.clear();
+            for (const Viable* v : pool)
             {
-                // An exact-arity overload beats one that fills defaults in, like C++ does, and
-                // more exactly-typed parameters beat same-family conversions (`format_int(42)`
-                // picks the int constructor over unsigned and long long).
-                if (omitted > foundOmitted) continue;
-                if (omitted < foundOmitted)
-                {
-                    found = &c; foundOmitted = omitted; foundExact = exact;
-                    foundReferencePreference = currentReferencePreference;
+                const auto& c = *v->ctor;
+                auto take = [&] {
+                    found = &c; foundOmitted = v->omitted; foundExact = v->exact;
+                    foundReferencePreference = v->referencePreference;
                     ambiguous = false; tied.clear();
-                    continue;
-                }
-                if (exact < foundExact) continue;
-                if (exact > foundExact)
-                {
-                    found = &c; foundExact = exact;
-                    foundReferencePreference = currentReferencePreference;
-                    ambiguous = false; tied.clear();
-                    continue;
-                }
-                if (currentReferencePreference < foundReferencePreference) continue;
-                if (currentReferencePreference > foundReferencePreference)
-                {
-                    found = &c;
-                    foundReferencePreference = currentReferencePreference;
-                    ambiguous = false; tied.clear();
-                    continue;
-                }
+                };
+                if (found == nullptr) { take(); continue; }
+                if (v->exact < foundExact) continue;
+                if (v->exact > foundExact) { take(); continue; }
+                if (v->referencePreference < foundReferencePreference) continue;
+                if (v->referencePreference > foundReferencePreference) { take(); continue; }
+                if (v->omitted > foundOmitted) continue;
+                if (v->omitted < foundOmitted) { take(); continue; }
                 bool sameShape = c.params.size() == found->params.size();
                 for (size_t i = 0; sameShape && i < c.params.size(); ++i)
                     sameShape = sameBoundaryType(c.params[i], found->params[i]);
@@ -20009,12 +20152,145 @@ const LLVMBackend::CxxClassInfo::Structor* LLVMBackend::SelectCxxConstructor(
                     if (tied.empty()) tied.push_back(found);
                     tied.push_back(&c);
                 }
-                continue;
             }
-            found = &c;
-            foundOmitted = omitted;
-            foundExact = exact;
-            foundReferencePreference = currentReferencePreference;
+        };
+        {
+            // A synthesized `__cflat_*` constructor (an implicit default ctor for a defaulted
+            // declaration) stands for a blocked candidate: clang already resolved it.
+            if (std::any_of(viable.begin(), viable.end(), [](const Viable& v) {
+                    return !v.blocked && v.ctor->linkageName.starts_with("__cflat_"); }))
+                std::erase_if(viable, [](const Viable& v) { return v.blocked; });
+            std::vector<const Viable*> pool;
+            for (const Viable& v : viable)
+                if (!v.blocked) pool.push_back(&v);
+            /*
+             * [over.match.best] per argument, through the same conversion-sequence ranking the
+             * free-function and method path uses: a candidate no worse everywhere and better
+             * somewhere removes the other, and survivors no argument tells apart are ambiguous
+             * (an omitted default is NOT a tie-breaker). Pairs the ranking cannot judge (a
+             * non-const reference, an rvalue reference, a scalar-to-class) keep the legacy pick.
+             */
+            if (viable.size() > 1 && argVars != nullptr && argVars->size() == argTypes.size())
+            {
+                auto* self = const_cast<LLVMBackend*>(this);
+                for (Viable& v : viable)
+                {
+                    FunctionSymbol sym;
+                    sym.IsCxx = true;
+                    sym.IsMethod = true;
+                    sym.UniqueName = v.ctor->linkageName;
+                    sym.Parameters = v.ctor->params;
+                    sym.Parameters[0].VariableName = "this";
+                    sym.Parameters[0].TypeName = typeName;
+                    std::vector<NamedVariable> args(1);
+                    args[0].TypeAndValue.TypeName = typeName;
+                    args.insert(args.end(), argVars->begin(), argVars->end());
+                    std::vector<CxxConversionRank> ranks = self->RankCxxConversionSequences(args, sym);
+                    ranks.erase(ranks.begin());   // the implicit object is common to every candidate
+                    for (size_t i = 0; i < argTypes.size() && i < ranks.size(); ++i)
+                    {
+                        if (!isNullptrArgument(i)) continue;
+                        // nullptr: exactly a spelled std::nullptr_t (0), else a null pointer
+                        // conversion to a by-value pointer or function pointer (conversion, 2).
+                        const int kind = spelledNullptrT(*v.ctor, i + 1);
+                        const auto& want = v.ctor->params[i + 1];
+                        CxxConversionRank fresh;
+                        if (kind == 1 || kind == 2) fresh.rank = 0;
+                        else if ((want.Pointer || want.IsFunctionPointer) && !want.IsAlias
+                                 && !want.IsRvalueRef && !want.IsCxxRefToPointer) fresh.rank = 2;
+                        else continue;
+                        fresh.cxxViable = true;
+                        fresh.from = "nullptr";
+                        ranks[i] = fresh;
+                    }
+                    v.ranks = std::move(ranks);
+                    v.ranked = true;
+                }
+                auto fullyRanked = [](const Viable& v) {
+                    return v.ranked && std::none_of(v.ranks.begin(), v.ranks.end(),
+                        [](const CxxConversionRank& r) { return r.rank < 0; });
+                };
+                std::set<const Viable*> dominated;
+                for (const Viable& x : viable)
+                    for (const Viable& y : viable)
+                    {
+                        bool crossing = false;
+                        if (&x == &y) continue;
+                        if (CompareCxxConversionRanks(x.ranks, y.ranks, crossing) == -1)
+                            dominated.insert(&y);
+                    }
+                std::vector<const Viable*> survivors;
+                for (const Viable& v : viable)
+                    if (dominated.count(&v) == 0) survivors.push_back(&v);
+                bool allJudged = !survivors.empty();
+                for (const Viable* v : survivors) allJudged = allJudged && fullyRanked(*v);
+                // The one C++ would call cannot be called from here: pick nothing, and say why
+                // (a caller may still hand the whole call to clang).
+                bool refusedByBlocked = false;
+                if (allJudged)
+                    for (const Viable* v : survivors)
+                        if (v->blocked && !refusedByBlocked)
+                        {
+                            refusedByBlocked = true;
+                            std::string shape = DisplayCxxClassName(typeName) + "(";
+                            for (size_t i = 1; i < v->ctor->params.size(); ++i)
+                            {
+                                if (i > 1) shape += ", ";
+                                shape += v->ctor->params[i].TypeName;
+                                if (v->ctor->params[i].Pointer)
+                                    shape += v->ctor->params[i].IsAlias ? "&" : "*";
+                            }
+                            blockedWhy = "the overload C++ selects, " + shape + "), "
+                                + (v->numeric ? "needs an implicit integer <-> floating conversion"
+                                              : "has a default argument that is not a constant");
+                        }
+                if (refusedByBlocked) pool.clear();
+                else if (!survivors.empty())
+                {
+                    pool.clear();
+                    for (const Viable* v : survivors)
+                        if (!v->blocked) pool.push_back(v);
+                }
+                // Distinct declarations no argument separates: C++ finds no best function.
+                std::vector<const Viable*> distinct;
+                for (const Viable* v : pool)
+                {
+                    bool duplicate = false;
+                    for (const Viable* d : distinct)
+                    {
+                        bool same = d->ctor->params.size() == v->ctor->params.size();
+                        for (size_t i = 0; same && i < v->ctor->params.size(); ++i)
+                            same = sameBoundaryType(d->ctor->params[i], v->ctor->params[i]);
+                        duplicate = duplicate || same;
+                    }
+                    if (!duplicate) distinct.push_back(v);
+                }
+                auto referenceMix = [](const CxxClassInfo::Structor& x, const CxxClassInfo::Structor& y) {
+                    for (size_t k = 1; k < x.params.size() && k < y.params.size(); ++k)
+                        if ((x.params[k].IsAlias || x.params[k].IsRvalueRef)
+                            != (y.params[k].IsAlias || y.params[k].IsRvalueRef))
+                            return true;
+                    return false;
+                };
+                bool indistinguishable = distinct.size() > 1;
+                for (size_t i = 0; indistinguishable && i < distinct.size(); ++i)
+                {
+                    indistinguishable = fullyRanked(*distinct[i]);
+                    for (size_t j = i + 1; indistinguishable && j < distinct.size(); ++j)
+                    {
+                        bool crossing = false;
+                        indistinguishable = CompareCxxConversionRanks(
+                                distinct[i]->ranks, distinct[j]->ranks, crossing) == 0
+                            && !referenceMix(*distinct[i]->ctor, *distinct[j]->ctor);
+                    }
+                }
+                if (indistinguishable)
+                {
+                    ambiguous = true;
+                    for (const Viable* v : distinct) tied.push_back(v->ctor);
+                }
+            }
+            if (!ambiguous) legacyPick(pool);
         }
         if (ambiguous)
         {
@@ -20107,6 +20383,11 @@ const LLVMBackend::CxxClassInfo::Structor* LLVMBackend::SelectCxxConstructor(
         if (!referenceRejection.empty())
         {
             why = referenceRejection;
+            return nullptr;
+        }
+        if (!blockedWhy.empty())
+        {
+            why = blockedWhy;
             return nullptr;
         }
         // Name the argument types: with several same-arity overloads, "no match" alone does not say

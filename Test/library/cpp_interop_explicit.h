@@ -451,3 +451,19 @@ inline int take_middle(Result<Middle> value) { return value.get(); }
 inline int take_last(Result<Last> value) { return value.get(); }
 }
 }
+
+// Suffixed integer literal arguments rank as their exact C++ type ([lex.icon]): 1UL is unsigned
+// long, 1L long, 1LL long long, 1U unsigned. Each overload returns its own tag.
+namespace cppsfx {
+#define CPPSFX_SET(N, A, B) \
+    struct M##N { int p(A) { return 1; } int p(B) { return 2; } }; \
+    inline int f##N(A) { return 1; } inline int f##N(B) { return 2; } \
+    struct C##N { int k; C##N(A) : k(1) {} C##N(B) : k(2) {} };
+CPPSFX_SET(1, int, unsigned long)
+CPPSFX_SET(2, long, unsigned long)
+CPPSFX_SET(3, unsigned long, int)
+CPPSFX_SET(4, unsigned, long)
+CPPSFX_SET(5, long long, unsigned long)
+CPPSFX_SET(6, int, long)
+#undef CPPSFX_SET
+}

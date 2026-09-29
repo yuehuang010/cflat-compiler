@@ -2710,6 +2710,11 @@ int oiCharA(u16 x) { return 1; }
 int oiCharA(c16 x) { return 2; }
 int oiCharB(c16 x) { return 2; }
 int oiCharB(u16 x) { return 1; }
+// Native same-width pairs: a suffixed literal ranks by its lowered name, not its C++ suffix type.
+int oiSufA(long x) { return 1; }
+int oiSufA(u64 x)  { return 2; }
+int oiSufB(long x) { return 1; }
+int oiSufB(ulong x) { return 2; }
 // A lone 'wchar' parameter still takes a 'c16' (a same-width conversion on Windows).
 int oiWide(wchar x) { return 7; }
 
@@ -2919,6 +2924,8 @@ bool testOverloadResolution()
     // Too big for 'int': the first of 'long', 'i64' that holds it on the target.
     int oiBigWant = sizeof(long) == 8 ? 2 : 3;
     result &= Test("oi_big_literal_a", oiPickA(5000000000), oiBigWant);
+    result &= Test("oi_suffix_ul_native", oiSufA(1UL), 2);
+    result &= Test("oi_suffix_ll_native", oiSufB(1LL), 1);
     result &= Test("oi_big_literal_b", oiPickB(5000000000), oiBigWant);
     if const (__WINDOWS__)
     {

@@ -515,4 +515,34 @@ template <class T> struct BrcDfOnly {
     ~BrcDfOnly() {}
 };
 inline int brc_use(BrcTplInh<long>*, BrcNt<long>*, BrcPack<long>*, BrcDfOnly<long>*) { return 0; }
+// A bare `nullptr` constructor argument: exactly `std::nullptr_t`, else a null pointer conversion
+// to a by-value (function) pointer parameter; never a scalar or a reference.
+struct Np { int chosen; Np(std::nullptr_t) : chosen(1) {} Np(const long&) : chosen(2) {} };
+struct NpPtr { int chosen; NpPtr(std::nullptr_t) : chosen(1) {} NpPtr(int* p) : chosen(p ? 2 : 3) {} };
+struct NpLong { int chosen; NpLong(std::nullptr_t) : chosen(1) {} NpLong(long) : chosen(2) {} };
+struct NpOnlyPtr { int chosen; NpOnlyPtr(int* p) : chosen(p ? 2 : 1) {} };
+struct NpPair { int chosen; NpPair(int* a, std::nullptr_t) : chosen(a ? 3 : 1) {} };
+// Only the PASSED arguments rank; a filled-in default never beats a better conversion.
+struct NpDflt { int chosen; NpDflt(std::nullptr_t, int k = 5) : chosen(k) {} NpDflt(int*) : chosen(2) {} };
+struct NpDfltVoid { int chosen; NpDfltVoid(std::nullptr_t, int k = 5) : chosen(k) {} NpDfltVoid(void*) : chosen(2) {} };
+struct IntDflt { int chosen; IntDflt(int, int k = 5) : chosen(k) {} IntDflt(long) : chosen(2) {} };
+// Top-level const and a const lvalue reference are still exactly `std::nullptr_t`.
+struct NpConst { int chosen; NpConst(const std::nullptr_t) : chosen(1) {} NpConst(int*) : chosen(2) {} };
+struct NpConstRef { int chosen; NpConstRef(const std::nullptr_t& p) : chosen(p == nullptr ? 1 : 3) {} NpConstRef(long) : chosen(2) {} };
+struct NpMutRef { int chosen; NpMutRef(std::nullptr_t&) : chosen(1) {} NpMutRef(long) : chosen(2) {} };
+struct NpRvalRef { int chosen; NpRvalRef(std::nullptr_t&& p) : chosen(p == nullptr ? 1 : 3) {} NpRvalRef(int*) : chosen(2) {} };
+// Constructor ranking is per argument by conversion category (identity, promotion, conversion,
+// user-defined); a filled-in default never breaks a tie, and equal categories are ambiguous.
+enum RkE { RkA = 1, RkB = 2 };
+inline int rk_five() { return 5; }
+struct RkConv { operator int() const { return 4; } };
+struct RkDflt { int chosen; RkDflt(int, int k = 5) : chosen(k) {} RkDflt(long) : chosen(2) {} };
+struct RkQual { int chosen; RkQual(int*, int k = 5) : chosen(k) {} RkQual(const int*) : chosen(2) {} };
+struct RkNonConst { int chosen; RkNonConst(int, int k = rk_five()) : chosen(k) {} RkNonConst(long) : chosen(2) {} };
+struct RkLD { int chosen; RkLD(long) : chosen(1) {} RkLD(double) : chosen(2) {} };
+struct RkID { int chosen; RkID(int) : chosen(1) {} RkID(double) : chosen(2) {} };
+struct RkCvIL { int chosen; RkCvIL(int) : chosen(1) {} RkCvIL(long) : chosen(2) {} };
+struct RkTwo { int chosen; RkTwo(int, long) : chosen(1) {} RkTwo(long, int) : chosen(2) {} };
+struct RkAmb { int chosen; RkAmb(int, int k = 5) : chosen(1) {} RkAmb(int) : chosen(2) {} };
+struct RkFnPtr { int chosen; RkFnPtr(void (*)(), int k = 5) : chosen(k) {} RkFnPtr(int*) : chosen(2) {} };
 }

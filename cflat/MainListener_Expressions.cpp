@@ -511,6 +511,8 @@ LLVMBackend::NamedVariable MainListener::ParseAssignmentExpressionNamed(CFlatPar
                         result.TypeAndValue.IsInterface = inferred.IsInterface;
                     }
                 }
+                result.TypeAndValue.IsCxxPointeeConst = joinShape.value == result.Primary
+                    && joinShape.cxxPointeeConst && result.TypeAndValue.Pointer;
             }
             if (result.Primary != nullptr && compilerLLVM->IsTempFieldValue(result.Primary))
             {
@@ -1734,6 +1736,7 @@ llvm::Value* MainListener::ParseAssignmentExpression(
 
             auto namedVar = ParseUnaryExpression(unaryCtx);
             auto destination = namedVar.Storage;
+            RefuseCxxConstReferentWrite(unaryCtx, destination, "assign to");
 
             // `value = default` default-constructs a C++ temporary even when this class does not
             // enter the nontrivial special-member assignment path below.
@@ -6423,6 +6426,10 @@ llvm::Value* MainListener::CloneTernaryClosureValue(
 void MainListener::JoinTernaryPointerShape(LLVMBackend::TypedValue& result,
                                            const LLVMBackend::TypedValue& trueArm,
                                            const LLVMBackend::TypedValue& falseArm) {
+        // C++'s composite pointer type of `const T*` and `T*` is `const T*`.
+        if (result.value != nullptr && result.value->getType()->isPointerTy()
+            && (trueArm.cxxPointeeConst || falseArm.cxxPointeeConst))
+            result.cxxPointeeConst = true;
         // Two integer arms naming one non-primitive type (an enum) keep it; the reader resolves it.
         if (result.value != nullptr && result.value->getType()->isIntegerTy()
             && trueArm.pointerDepth == 0 && falseArm.pointerDepth == 0
@@ -8648,6 +8655,8 @@ LLVMBackend::TypedValue MainListener::TypedValueOfNamedOperand(LLVMBackend::Name
         result.elemType = elemType;
         result.isArrayView = namedVar.TypeAndValue.IsArrayView;
         result.sourceTypeName = namedVar.TypeAndValue.TypeName;
+        result.cxxPointeeConst = namedVar.TypeAndValue.IsCxxPointeeConst
+            && namedVar.TypeAndValue.Pointer;
         OperandPointerDepth(namedVar, result.value, result.pointerDepth, result.elemPointer);
         return result;
     }
@@ -17010,11 +17019,14 @@ LLVMBackend::NamedVariable MainListener::ParseNewExpression(CFlatParser::NewExpr
                     }
                     auto nv = ParseAssignmentExpressionNamed(argAssign);
                     // Same literal identity the call-argument builder records (integer -> enum refusal).
+                    bool suffixedLiteral = false;
                     if (nv.LiteralIdentity.empty())
-                        nv.LiteralIdentity = LLVMBackend::LiteralIdentityForOverload(argAssign->getText());
+                        nv.LiteralIdentity = LLVMBackend::LiteralIdentityForOverload(
+                            argAssign->getText(), &suffixedLiteral);
                     ctorArgs.push_back(LoadNamedVariable(nv));
                     ctorArgTypes.push_back(nv.TypeAndValue);
-                    TypeUntypedCtorArg(ctorArgTypes.back(), ctorArgs.back());
+                    TypeUntypedCtorArg(ctorArgTypes.back(), ctorArgs.back(),
+                                       suffixedLiteral ? nv.LiteralIdentity : std::string());
                     // The forwarding thunk spells the argument's exact type and category: give
                     // a blank primitive its typed twin, and mark an address-less constant rvalue.
                     if (nv.TypeAndValue.TypeName.empty() && !nv.TypeAndValue.Pointer)
@@ -19775,6 +19787,30 @@ void MainListener::PrepareAliasCallResult(
         result.BaseType = valueType;
         result.Storage = result.Primary;
         result.Primary = nullptr;
+        // `const T&`, `const T&&`, `T *const &`: the referent is read-only (ruling 2026-09-27).
+        if (result.TypeAndValue.IsCxxConstRef)
+            compiler->MarkCxxConstReferent(result.Storage);
+}
+
+void MainListener::RefuseCxxConstReferentWrite(antlr4::ParserRuleContext* ctx,
+                                               llvm::Value* destination,
+                                               const std::string& operation) {
+        if (destination == nullptr) return;
+        auto* compiler = Compiler(ctx);
+        std::string target = ctx != nullptr ? ctx->getText() : std::string();
+        if (target.ends_with("++") || target.ends_with("--")) target.resize(target.size() - 2);
+        if (compiler->IsCxxConstReferent(destination))
+            LogErrorContext(ctx, std::format(
+                "cannot {} '{}': it is reached through a C++ const reference result, so it is "
+                "read-only. Copy it into a local and modify that instead.", operation, target));
+        // `++` / `--` on a const namespace object; `=` has its own check in the assignment path.
+        auto* constGlobal = operation == "assign to" ? nullptr
+            : llvm::dyn_cast<llvm::GlobalVariable>(llvm::getUnderlyingObject(destination));
+        if (constGlobal != nullptr
+            && compiler->cxxConstGlobalSymbols_.count(constGlobal->getName().str()) != 0)
+            LogErrorContext(ctx, std::format(
+                "cannot {} '{}': it is a const C++ object, so its storage is read-only. "
+                "Copy it into a local and modify that instead.", operation, target));
 }
 
 std::string MainListener::NextMemberName(CFlatParser::PostfixExpressionContext* ctx,

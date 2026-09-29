@@ -6707,6 +6707,7 @@ static llvm::json::Object SerializeTav(const TAV& t)
     if (s.IsRvalueRef)             o["rr"]  = true;
     if (s.IsCxxRefToPointer)      o["crp"] = true;
     if (s.IsCxxConstRef)          o["ccr"] = true;
+    if (s.IsCxxPointeeConst)      o["cpc"] = true;
     if (s.IsOwningSink)           o["osk"] = true;
     if (s.IsConsumeInferredSink)  o["cis"] = true;
     if (s.IsBorrowOfAliasElement) o["bae"] = true;
@@ -6783,6 +6784,7 @@ static TAV DeserializeTav(const llvm::json::Object& o)
     if (auto v = o.getBoolean("rr")) s.IsRvalueRef = *v;
     if (auto v = o.getBoolean("crp")) s.IsCxxRefToPointer = *v;
     if (auto v = o.getBoolean("ccr")) s.IsCxxConstRef = *v;
+    if (auto v = o.getBoolean("cpc")) s.IsCxxPointeeConst = *v;
     if (auto v = o.getBoolean("osk")) s.IsOwningSink = *v;
     if (auto v = o.getBoolean("cis")) s.IsConsumeInferredSink = *v;
     if (auto v = o.getBoolean("bae")) s.IsBorrowOfAliasElement = *v;

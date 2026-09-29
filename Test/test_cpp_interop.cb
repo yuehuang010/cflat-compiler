@@ -1255,6 +1255,10 @@ cppa.ItwResult itw_cflat_make(cppa.ItwArg arg)
 // Takes the re-exported spelling; 7604/7605 pass the original spelling to it.
 int CppuDeclTakesAliasEC(cppu_decl_a.EC e) { return (int)e; }
 
+// CFlat-spelled types carry no const: a const C++ result passed through these ranks as `T*`.
+cppi.MtConstObj* mtConstPass(cppi.MtConstObj* p) { return p; }
+T mtConstIdent<T>(T value) { return value; }
+
 extern int main()
 {
     // Explicit C++ full specializations keep distinct identities through member/free returns and
@@ -2752,6 +2756,17 @@ extern int main()
     // wrapper - and the wrapper returns a record by value.
     cppi.DefaultPair synptr = cppi.default_pair(4);
     if (synptr.a != 4 || synptr.b != cppi.default_extra()) return 794;
+    // A string literal argument next to an omitted non-constant default binds the wrapper, as a
+    // `const char*` local does (pre-fix: "call to 'cppi.dflt_label' is missing parameter 'size'").
+    {
+        const char* dfltText = "y";
+        cppi.DefLabeler dfltLabeler = default;
+        if (cppi.dflt_label("x") != 120)                             return 31501;
+        if (cppi.dflt_label(dfltText) != 121)                        return 31502;
+        if (cppi.dflt_label("x", cppi.DefSize(2, 0)) != 122)         return 31503;
+        if (dfltLabeler.label("x") != 125)                           return 31504;
+        if (dfltLabeler.label("x", cppi.DefSize(3, 0)) != 128)       return 31505;
+    }
 
     // cppi.calls_missing_symbol is an inline body whose callee is declared and
     // never defined; nothing here calls it, so it must not reach the linker. Its neighbour,
@@ -3115,6 +3130,12 @@ extern int main()
     if (cppi.nsobj.gTracker.doubled() != 42)          return 1604;
     cppi.nsobj.gTracker.seed = 4;
     if (cppi.nsobj.gTracker.doubled() != 8)           return 1605;
+    cppi.nsobj.gTracker.seed = 21;
+    // `++` / `--` on a MUTABLE object keep working; a const one is refused (errors test).
+    cppi.nsobj.counter++;
+    cppi.nsobj.gTracker.seed--;
+    if (cppi.nsobj.counter != 11 || cppi.nsobj.gTracker.seed != 20) return 1641;
+    cppi.nsobj.counter = 10;
     cppi.nsobj.gTracker.seed = 21;
     if (cppi.nsobj.kLinkedColor.r != 7)               return 1606;
     if (cppi.nsobj.kLinkedColor.b != 9)               return 1607;
@@ -5067,6 +5088,63 @@ extern int main()
         if (api.member_l(refKindProbeGlobal) != 4 || refKindProbeGlobal != 4) return 31483;
     }
     {
+        // A bare `nullptr` constructor argument, checked against clang++ (value = the overload
+        // C++ runs). Pre-fix every one was refused ("... match these arguments ('')") except
+        // NpLong / NpConstRef, which picked `long` and failed module verification, and IntDflt,
+        // whose fewer-defaults tie-break silently picked `long` (2).
+        long npLong = 4;
+        int npInt = 1;
+        if (cppcr.Np(nullptr).chosen != 1)                           return 31511;
+        if (cppcr.Np(npLong).chosen != 2)                            return 31512;
+        if (cppcr.NpPtr(nullptr).chosen != 1)                        return 31513;
+        if (cppcr.NpPtr(&npInt).chosen != 2)                         return 31514;
+        if (cppcr.NpLong(nullptr).chosen != 1)                       return 31515;
+        if (cppcr.NpLong(npLong).chosen != 2)                        return 31516;
+        if (cppcr.NpOnlyPtr(nullptr).chosen != 1)                    return 31517;
+        if (cppcr.NpPair(&npInt, nullptr).chosen != 3)               return 31518;
+        if (cppcr.NpDflt(nullptr).chosen != 5)                       return 31519;
+        if (cppcr.NpDfltVoid(nullptr).chosen != 5)                   return 31520;
+        if (cppcr.IntDflt(npInt).chosen != 5)                        return 31521;
+        if (cppcr.IntDflt(npLong).chosen != 2)                       return 31522;
+        if (cppcr.NpConst(nullptr).chosen != 1)                      return 31523;
+        if (cppcr.NpConstRef(nullptr).chosen != 1)                   return 31524;
+        if (cppcr.NpConstRef(npLong).chosen != 2)                    return 31525;
+        if (cppcr.NpRvalRef(nullptr).chosen != 1)                    return 31526;
+    }
+    {
+        // Constructor ranking is per argument by conversion category, like clang. A promotion
+        // (short, char, enum -> int) beats a conversion (-> long); `int, k = 5` is not preferred
+        // to `long` just because the default is omitted.
+        short rkShort = 3;
+        char rkChar = 3;
+        int rkInt = 3;
+        long rkLong = 3;
+        double rkDouble = 3.0;
+        if (cppcr.RkDflt(rkShort).chosen != 5)                       return 31800;
+        if (cppcr.RkDflt(rkChar).chosen != 5)                        return 31801;
+        if (cppcr.RkDflt(cppcr.RkA).chosen != 5)                     return 31802;
+        if (cppcr.RkDflt(rkLong).chosen != 2)                        return 31803;
+        if (cppcr.RkDflt(rkInt).chosen != 5)                         return 31804;
+        // Qualification: `int*` prefers `int*` over `const int*`, not the default-free one.
+        int rkTarget = 1;
+        int* rkPtr = &rkTarget;
+        if (cppcr.RkQual(rkPtr).chosen != 5)                         return 31805;
+        // A default CFlat cannot materialize still takes part: clang calls RkNonConst(int, k).
+        if (cppcr.RkNonConst(rkInt).chosen != 5)                     return 31806;
+        if (cppcr.RkNonConst(rkLong).chosen != 2)                    return 31807;
+        // Identity beats conversion in each family.
+        if (cppcr.RkLD(rkLong).chosen != 1)                          return 31808;
+        if (cppcr.RkLD(rkDouble).chosen != 2)                        return 31809;
+        if (cppcr.RkID(rkInt).chosen != 1)                           return 31810;
+        if (cppcr.RkID(rkDouble).chosen != 2)                        return 31811;
+        // A class with operator int converts through it; int identity beats int -> long.
+        cppcr.RkConv rkConv = default;
+        if (cppcr.RkCvIL(rkConv).chosen != 1)                        return 31812;
+        // Two arguments: better on one and no worse on the other wins.
+        if (cppcr.RkTwo(rkInt, rkLong).chosen != 1)                  return 31813;
+        if (cppcr.RkTwo(rkLong, rkInt).chosen != 2)                  return 31814;
+    }
+    {
         // A function PARAMETER is an lvalue inside the callee.
         if (RefKindProbeThroughParam(5) != 66) return 3149;
     }
@@ -6755,6 +6833,41 @@ extern int main()
     if (!(intOnly[1] < 2)) return 3537;
     if (intOnly[1] != 1) return 3538;
 
+    // Subscript overload ranking (legs 31760-31769, 31766 unused): per-argument ranking like a
+    // member call, never the last-declared operator[]. Each value checked against clang++ -std=c++20.
+    {
+        cpppa.SubIL subIL = default;
+        cpppa.SubLI subLI = default;
+        cpppa.SubIU subIU = default;
+        cpppa.SubSZ subSZ = default;
+        cpppa.SubSL subSL = default;
+        cpppa.SubLC subLC = default;
+        cpppa.SubDIL subDIL = default;
+        cpppa.SubDLI subDLI = default;
+        cpppa.SubConv subConv = default;
+        subConv.v = 3;
+        int si = 3;
+        long sl = 3;
+        short ss = 3;
+        char sc = 3;
+        bool sb = true;
+        uint su = 3;
+        cpppa.SubE se = cpppa.SubE3;
+        if (subIL[si] != 1 || subLI[si] != 1 || subIL[sl] != 2 || subLI[sl] != 2) return 31760;
+        if (subIL[ss] != 1 || subLI[ss] != 1 || subIL[sc] != 1 || subLI[sc] != 1) return 31761;
+        if (subIL[3] != 1 || subLI[3] != 1 || subIL[sb] != 1 || subLI[sb] != 1) return 31762;
+        if (subIL[se] != 1 || subLI[se] != 1 || subIL[subConv] != 1 || subLI[subConv] != 1) return 31763;
+        if (subIU[si] != 1 || subIU[sc] != 1 || subIU[su] != 3 || subIU[3] != 1) return 31764;
+        // A lone size_t operator[] still takes every signed index (the accept-set half).
+        if (subSL[ss] != 9 || subSL[sl] != 2
+            || subSZ[si] != 4 || subSZ[sc] != 4 || subSZ[sl] != 4 || subSZ[su] != 4) return 31765;
+        // A non-const receiver: identity on the object parameter beats `const` on it.
+        if (subLC[su] != 8 || subLC[sl] != 8) return 31767;
+        // Inherited operator[] sets rank the same way.
+        if (subDIL[si] != 1 || subDLI[si] != 1 || subDIL[ss] != 1 || subDLI[sl] != 2) return 31768;
+        if (subDIL[3] != 1 || subDIL[se] != 1 || subDIL[sb] != 1 || subDLI[se] != 1) return 31769;
+    }
+
     // Reference arms carry the selected referent's address through each pointer sink.
     bool trDeclChoice = true;
     ternref.C* trDecl = trDeclChoice ? ternref.ref_a() : ternref.ref_b();
@@ -7206,6 +7319,38 @@ extern int main()
     if (excPrivLoader.peek() != 5)                                             return 3638;
     if (excPrivLoader.box.get() != 9)                                          return 3639;
 
+    // Suffixed integer literals take their exact C++ type at every call form (legs 31950-31979).
+    // Set 1 {int, ulong}, 2 {long, ulong}, 3 {ulong, int}, 4 {uint, long}, 5 {long long, ulong}.
+    {
+        cppsfx.M1 sm1 = cppsfx.M1(); cppsfx.M2 sm2 = cppsfx.M2(); cppsfx.M3 sm3 = cppsfx.M3();
+        cppsfx.M4 sm4 = cppsfx.M4(); cppsfx.M5 sm5 = cppsfx.M5();
+        if (sm1.p(1UL) != 2 || sm1.p(1) != 1)             return 31950;
+        if (cppsfx.f1(1UL) != 2 || cppsfx.f1(1) != 1)     return 31951;
+        cppsfx.C1 sc1 = cppsfx.C1(1UL);
+        if (sc1.k != 2 || cppsfx.C1(1UL).k != 2)          return 31952;
+        if (cppsfx.C1(1).k != 1)                          return 31953;
+        if (sm2.p(1UL) != 2 || sm2.p(1L) != 1)           return 31954;
+        if (cppsfx.f2(1UL) != 2 || cppsfx.f2(1L) != 1)   return 31955;
+        cppsfx.C2 sc2 = cppsfx.C2(1UL);
+        if (sc2.k != 2 || cppsfx.C2(1UL).k != 2)          return 31956;
+        if (cppsfx.C2(1L).k != 1)                         return 31957;
+        if (sm3.p(1UL) != 1 || sm3.p(1) != 2)            return 31958;
+        if (cppsfx.f3(1UL) != 1 || cppsfx.f3(1) != 2)    return 31959;
+        cppsfx.C3 sc3 = cppsfx.C3(1UL);
+        if (sc3.k != 1 || cppsfx.C3(1UL).k != 1)          return 31960;
+        if (cppsfx.C3(1).k != 2)                          return 31961;
+        if (sm4.p(1U) != 1 || sm4.p(1L) != 2)            return 31962;
+        if (cppsfx.f4(1U) != 1 || cppsfx.f4(1L) != 2)    return 31963;
+        if (sm5.p(1LL) != 1 || sm5.p(1UL) != 2)          return 31964;
+        if (cppsfx.f5(1LL) != 1 || cppsfx.f5(1UL) != 2)  return 31965;
+        cppsfx.C5 sc5 = cppsfx.C5(1LL);
+        if (sc5.k != 1 || cppsfx.C5(1UL).k != 2)          return 31966;
+        // The smallest type of the suffix's list that holds the value ([lex.icon]).
+        if (sm1.p(5000000000UL) != 2)                     return 31967;
+        if (sm4.p(3000000000U) != 1)                      return 31968;
+        if (sm5.p(3000000000LL) != 1)                     return 31969;
+        if (cppsfx.f2(0x7fffffffUL) != 2)                 return 31970;
+    }
     int cppConditionalLegFailed = 0;
     cppon.reset();
     int cppArmPick = 1;
@@ -7326,6 +7471,88 @@ extern int main()
     if (mtRank.arrRef(mtInts) != 9092) return 7928;
     if (mtRank.arrRef(mtGrid) != 9096) return 7929;
     if (mtRank.arrExtent(mtInts) != 9093) return 7930;
+    // Pointee const of a C++ result reaches clang: `g(short) const` wins only on a const
+    // receiver, kind(const T*) only for a const pointee (master: 102 / 1 / 60 - const dropped).
+    // `T *const &` is a const SLOT: its pointee stays mutable (102 / 1 on both binaries).
+    cppi.MtConstHolder mtcH = cppi.MtConstHolder();
+    cppi.MtConstKind mtcK = cppi.MtConstKind();
+    if (mtcH.cpr()->g(mtShort) != 2) return 7932;
+    if (mtcH.ccpr()->g(mtShort) != 2) return 7933;
+    if (mtcH.eccpr()->g(mtShort) != 2) return 7934;
+    if (mtcH.cpv()->g(mtShort) != 2) return 7935;
+    auto mtcPP = mtcH.cpptr();
+    if ((*mtcPP)->g(mtShort) != 2) return 7936;
+    if (mtcH.mcr()->g(mtShort) != 102 || mtcH.sr().g(mtShort) != 102) return 7937;
+    if (mtcH.csr().g(mtShort) != 2) return 7938;
+    if (mtcK.kind(mtcH.cpr()) != 2) return 7939;
+    if (mtcK.kind(mtcH.ccpr()) != 2) return 7940;
+    if (mtcK.kind(mtcH.eccpr()) != 2) return 7941;
+    if (mtcK.kind(mtcH.cpv()) != 2) return 7942;
+    if (mtcK.kind(*mtcPP) != 2) return 7943;
+    if (mtcK.kind(mtcH.mcr()) != 1 || mtcK.kind(mtcH.mr()) != 1) return 7944;
+    if (mtcK.tk(mtcH.cpr()) != 61 || mtcK.tk(mtcH.cpv()) != 61) return 7945;
+    if (mtcK.tk(mtcH.mcr()) != 60) return 7946;
+    // A const-spelled wrapper registers apart from its same-signature non-const sibling, in
+    // either order (master: the second request reused the first wrapper - 2 / 2 / 60).
+    if (mtcH.sr().t2(mtShort) != 2 || mtcH.csr().t2(mtShort) != 1) return 7957;
+    if (mtcH.mr()->t2(mtShort) != 2 || mtcH.cpv()->t2(mtShort) != 1) return 7958;
+    if (cppi.mt_const_cpv()->g(mtShort) != 2 || cppi.mt_const_mcr()->g(mtShort) != 102) return 7947;
+    if (mtcK.kind(cppi.mt_const_cpv()) != 2 || mtcK.kind(cppi.mt_const_mcr()) != 1) return 7948;
+    // Flow: `auto` deduces `const T*` as C++ does; a `?:` join takes the composite `const T*`;
+    // a CFlat-spelled type (local, function, generic) has no const, so it ranks as `T*`.
+    auto mtcAuto = mtcH.cpv();
+    if (mtcK.kind(mtcAuto) != 2 || mtcAuto->g(mtShort) != 2) return 7949;
+    if (mtcK.tk(mtcAuto) != 61) return 7950;
+    auto mtcDeref = *mtcPP;
+    if (mtcK.kind(mtcDeref) != 2) return 7951;
+    bool mtcPick = true;
+    if (mtcK.kind(mtcPick ? mtcH.cpv() : mtcH.mr()) != 2) return 7952;
+    cppi.MtConstObj* mtcSpelled = mtcH.cpv();
+    if (mtcK.kind(mtcSpelled) != 1 || mtcSpelled->g(mtShort) != 102) return 7953;
+    if (mtcK.kind(mtConstPass(mtcH.cpv())) != 1) return 7954;
+    if (mtcK.kind(mtConstIdent(mtcH.cpv())) != 1) return 7955;
+    auto mtcCopy = *mtcAuto;
+    if (mtcCopy.g(mtShort) != 102) return 7956;
+    // Accept-set of the const-referent write refusal: every write here compiles on master
+    // and must keep its value. Refusals live in errors/err_cpp_namespace_const_assign.cb.
+    *cppi.mt_const_ipcr() = 5;
+    mtcH.mcr()->v = 4;
+    if (cppi.mtConstInt != 5 || mtcH.s.v != 4) return 7960;
+    mtcH.lr() = 9;
+    mtcH.lr() += 1;
+    mtcH.lr()++;
+    if (mtcH.lv != 11) return 7961;
+    mtcH.rr() = 1;
+    if (mtcH.lv != 1) return 7962;
+    mtcH.sr().v = 13;
+    if (mtcH.s.v != 13) return 7963;
+    cppi.MtConstObj mtcOther = cppi.MtConstObj();
+    mtcOther.v = 40;
+    mtcH.mr() = &mtcOther;
+    mtcH.mr()->v = 41;
+    if (mtcH.mp->v != 41 || mtcOther.v != 41) return 7964;
+    mtcH.mr() = &mtcH.s;
+    mtcH.lv = 5;
+    long mtcCopyL = mtcH.clr();
+    mtcCopyL = 55;
+    auto mtcAutoL = mtcH.clr();
+    mtcAutoL = 6;
+    mtcAutoL++;
+    if (mtcCopyL != 55 || mtcAutoL != 7 || mtcH.lv != 5) return 7965;
+    mtcH.cpr() = mtcH.cpv();
+    auto mtcAutoP = mtcH.cpr();
+    mtcAutoP->v = 18;
+    if (mtcH.s.v != 18) return 7966;
+    cppi.MtConstObj mtcNine = cppi.MtConstObj();
+    mtcNine.v = 99;
+    mtcH.sr() = mtcNine;
+    auto mtcRecCopy = mtcH.csr();
+    mtcRecCopy.v = 19;
+    if (mtcH.s.v != 99 || mtcRecCopy.v != 19) return 7967;
+    long mtcSum = 0;
+    mtcSum += mtcH.clr();
+    mtcH.lr() = mtcH.clr() + cppi.mt_const_crr();
+    if (mtcSum != 5 || mtcH.lv != 10) return 7968;
     cppi.MtSinkNoCopy mtSink = cppi.MtSinkNoCopy();
     cppi.MtNoCopy mtNoCopy = cppi.MtNoCopy();
     if (mtSink.put(1, move mtNoCopy) != 2) return 7931;

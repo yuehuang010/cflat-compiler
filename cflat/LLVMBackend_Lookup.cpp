@@ -750,17 +750,24 @@ std::string LLVMBackend::CxxReferenceParameterSpelling(const FunctionSymbol& can
                                                        size_t index) const
 {
         if (!candidate.IsCxx || candidate.UniqueName.starts_with("__cflat_udc_")) return {};
-        if (auto rawIt = cxxFunctionSignatures_.find(candidate.SourceName);
-            rawIt != cxxFunctionSignatures_.end())
-            for (const auto& raw : rawIt->second)
-                if (raw.linkageName == candidate.UniqueName
-                    && index < raw.paramSpellings.size())
-                    return raw.paramSpellings[index];
-        for (const auto& [className, record] : cxxRecordEntries_)
-            for (const auto& method : record.members)
-                if (method.linkageName == candidate.UniqueName
-                    && index < method.paramTypes.size())
-                    return method.paramTypes[index];
+        // A default-argument wrapper takes a PREFIX of its declaration's parameters: same spelling.
+        const std::string declared = candidate.UniqueName.starts_with("__cflat_dflt_")
+            ? CxxDeclarationLinkageName(candidate.UniqueName) : candidate.UniqueName;
+        for (const std::string* linkage : { &candidate.UniqueName, &declared })
+        {
+            if (auto rawIt = cxxFunctionSignatures_.find(candidate.SourceName);
+                rawIt != cxxFunctionSignatures_.end())
+                for (const auto& raw : rawIt->second)
+                    if (raw.linkageName == *linkage
+                        && index < raw.paramSpellings.size())
+                        return raw.paramSpellings[index];
+            for (const auto& [className, record] : cxxRecordEntries_)
+                for (const auto& method : record.members)
+                    if (method.linkageName == *linkage
+                        && index < method.paramTypes.size())
+                        return method.paramTypes[index];
+            if (declared == candidate.UniqueName) break;
+        }
         return {};
 }
 

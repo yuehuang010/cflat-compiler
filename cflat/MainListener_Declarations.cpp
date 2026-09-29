@@ -4235,8 +4235,10 @@ cxx_dtor_ready:
                 compiler->lastCxxRetTemp_ = nullptr;
                 auto nv = ParseAssignmentExpressionNamed(argAssign);
                 // Same literal identity the call-argument builder records (integer -> enum refusal).
+                bool suffixedLiteral = false;
                 if (nv.LiteralIdentity.empty())
-                    nv.LiteralIdentity = LLVMBackend::LiteralIdentityForOverload(argAssign->getText());
+                    nv.LiteralIdentity = LLVMBackend::LiteralIdentityForOverload(
+                        argAssign->getText(), &suffixedLiteral);
                 // A nontrivial C++ result was constructed into a caller-owned sret temp whose
                 // address only lives here; the NamedVariable itself carries the loaded struct.
                 llvm::Value* cxxRetTemp = compiler->lastCxxRetTemp_;
@@ -4245,7 +4247,8 @@ cxx_dtor_ready:
                 llvm::Value* argValue = LoadNamedVariable(nv);
                 argValues.push_back(argValue);
                 argTypes.push_back(nv.TypeAndValue);
-                TypeUntypedCtorArg(argTypes.back(), argValue);
+                TypeUntypedCtorArg(argTypes.back(), argValue,
+                                   suffixedLiteral ? nv.LiteralIdentity : std::string());
                 if (nv.TypeAndValue.TypeName.empty() && !nv.TypeAndValue.Pointer
                     && compiler->IsCxxRecord(argTypes.back().TypeName))
                     nv.TypeAndValue.TypeName = argTypes.back().TypeName;
@@ -5682,6 +5685,9 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                 std::string srcInferredTypeName;
                 bool srcInferredPointer = false;
                 bool srcInferredElemPointer = false;
+                // C++ pointee const of a pointer initializer: `auto p = constPtrResult();` keeps it
+                // for C++ overload ranking, as C++ deduces `const T*`.
+                bool srcCxxPointeeConst = false;
                 // Fixed-array shape of the initializer (`int[3] a` -> 3). Drives the `auto`
                 // array-view deduction and the fixed-array-to-fixed-array copy below.
                 uint64_t srcConstArraySize = 0;
@@ -6533,6 +6539,8 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                 srcInferredTypeName = rightNV.TypeAndValue.TypeName;
                                 srcInferredPointer = rightNV.TypeAndValue.Pointer;
                                 srcInferredElemPointer = rightNV.TypeAndValue.ElemPointer;
+                                srcCxxPointeeConst = rightNV.TypeAndValue.IsCxxPointeeConst
+                                    && rightNV.TypeAndValue.Pointer;
                                 srcConstArraySize = rightNV.TypeAndValue.ConstArraySize;
                                 srcConstInnerDimensions = rightNV.TypeAndValue.ConstInnerDimensions;
                                 srcIsArrayView = rightNV.TypeAndValue.IsArrayView;
@@ -7222,6 +7230,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                         typeAndValue.TypeName = srcInferredTypeName;
                         typeAndValue.Pointer = srcInferredPointer;
                         typeAndValue.ElemPointer = srcInferredElemPointer;
+                        typeAndValue.IsCxxPointeeConst = srcCxxPointeeConst && srcInferredPointer;
                     }
                 }
 
@@ -9909,8 +9918,21 @@ LLVMBackend::NamedVariable MainListener::FinishAssignmentExpressionNamed(
  * the shape from the value the callee will actually receive: `char *` is the spelling every
  * `const char *` parameter maps to (const is dropped at the boundary).
  */
-void MainListener::TypeUntypedCtorArg(LLVMBackend::TypeAndValue& argType, llvm::Value* argValue)
+void MainListener::TypeUntypedCtorArg(LLVMBackend::TypeAndValue& argType, llvm::Value* argValue,
+                                      const std::string& suffixedLiteralIdentity)
 {
+    // A suffixed integer literal (1L, 1UL, 1LL) has its exact C++ type, not its lowered width's name.
+    if (!suffixedLiteralIdentity.empty() && !argType.Pointer
+        && llvm::isa_and_nonnull<llvm::ConstantInt>(argValue))
+    {
+        LLVMBackend::TypeAndValue probe;
+        probe.TypeName = suffixedLiteralIdentity;
+        if (probe.IsInteger() == (int)argValue->getType()->getIntegerBitWidth())
+        {
+            argType.TypeName = suffixedLiteralIdentity;
+            return;
+        }
+    }
     if (!argType.TypeName.empty() || argType.Pointer) return;
     // A C++ operator result (Eigen's `a + b`) can arrive with only its record struct type.
     if (auto* record = llvm::dyn_cast_or_null<llvm::StructType>(

@@ -1,0 +1,23 @@
+import cpp "cpp_interop_explicit.h";
+
+// clang refuses each of these as ambiguous: a suffixed literal has one exact C++ type, and here
+// no overload takes it exactly (long long or long against int / unsigned long).
+extern int main()
+{
+    cppsfx.M1 m1 = cppsfx.M1();
+    cppsfx.M6 m6 = cppsfx.M6();
+    expect_error("no candidate ranks better than the others") {
+        return m1.p(1LL);
+    }
+    expect_error("no candidate ranks better than the others") {
+        return cppsfx.f6(1LL);
+    }
+    expect_error("call to constructor of 'cppsfx::C5' is ambiguous") {
+        cppsfx.C5 c = cppsfx.C5(1L);
+        return c.k;
+    }
+    expect_error("call to constructor of 'cppsfx::C5' is ambiguous") {
+        return cppsfx.C5(1L).k;
+    }
+    return 0;
+}

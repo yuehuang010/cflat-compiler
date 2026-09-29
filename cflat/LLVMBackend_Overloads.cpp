@@ -169,8 +169,9 @@ bool LLVMBackend::ArgumentConvertsToBoolParameter(const NamedVariable& arg, cons
 }
 
 // Record C++ identities before literal values lose source spelling and narrow during lowering.
-std::string LLVMBackend::LiteralIdentityForOverload(std::string_view text)
+std::string LLVMBackend::LiteralIdentityForOverload(std::string_view text, bool* suffixedInteger)
 {
+        if (suffixedInteger != nullptr) *suffixedInteger = false;
         if (text.size() >= 3 && text.back() == '\'')
         {
             if (text.front() == '\'') return "char";
@@ -202,12 +203,31 @@ std::string LLVMBackend::LiteralIdentityForOverload(std::string_view text)
             return hasLongFloatSuffix ? "" : hasFloatSuffix ? "float" : "double";
         if (hasFloatSuffix)
             return "";
-        bool explicitLong = false;
-        if (!digits.empty() && (digits.back() == 'l' || digits.back() == 'L'))
+        // Integer suffix (u/U, l/L, ll/LL in the grammar's orders): only a canonical spelling has one.
+        bool unsignedSuffix = false;
+        int longSuffix = 0;
         {
-            explicitLong = true;
-            digits.remove_suffix(1);
+            char firstL = 0;
+            while (!digits.empty())
+            {
+                const char c = digits.back();
+                if (c == 'u' || c == 'U')
+                {
+                    if (unsignedSuffix) return "";
+                    unsignedSuffix = true;
+                }
+                else if (c == 'l' || c == 'L')
+                {
+                    if (longSuffix > 0 && c != firstL) return "";
+                    if (++longSuffix > 2) return "";
+                    firstL = c;
+                }
+                else
+                    break;
+                digits.remove_suffix(1);
+            }
         }
+        const bool suffixed = unsignedSuffix || longSuffix > 0;
         int base = 10;
         bool hex = false;
         if (digits.size() > 2 && digits[0] == '0' && (digits[1] == 'x' || digits[1] == 'X'))
@@ -234,8 +254,39 @@ std::string LLVMBackend::LiteralIdentityForOverload(std::string_view text)
         if (parsed.ec != std::errc() || parsed.ptr != digits.data() + digits.size())
             return "";   // an unsupported suffix, an operator, or out of u64 range
 
-        if (explicitLong)
-            return "long";
+        if (suffixed)
+        {
+            // C++ [lex.icon]: the first type of the suffix's list that holds the value. A decimal
+            // literal without `u` never takes an unsigned type; the sign of `-1L` is an operator.
+            struct Candidate { const char* name; int valueBits; bool isUnsigned; };
+            const int longValueBits = longBits_ - 1;
+            const Candidate intType{ "int", 31, false }, uintType{ "u32", 32, true };
+            const Candidate longType{ "long", longValueBits, false };
+            const Candidate ulongType{ "ulong", longBits_, true };
+            const Candidate llType{ "i64", 63, false }, ullType{ "u64", 64, true };
+            const bool decimal = base == 10;
+            std::vector<Candidate> list;
+            if (unsignedSuffix)
+            {
+                if (longSuffix == 0) list = { uintType, ulongType, ullType };
+                else if (longSuffix == 1) list = { ulongType, ullType };
+                else list = { ullType };
+            }
+            else if (decimal)
+                list = longSuffix == 1 ? std::vector<Candidate>{ longType, llType }
+                                       : std::vector<Candidate>{ llType };
+            else
+                list = longSuffix == 1
+                    ? std::vector<Candidate>{ longType, ulongType, llType, ullType }
+                    : std::vector<Candidate>{ llType, ullType };
+            for (const Candidate& candidate : list)
+                if (candidate.valueBits >= 64 || value < (uint64_t(1) << candidate.valueBits))
+                {
+                    if (suffixedInteger != nullptr) *suffixedInteger = true;
+                    return candidate.name;
+                }
+            return "";
+        }
 
         const uint64_t intMax = (uint64_t)std::numeric_limits<int32_t>::max();
         if (negative ? value <= intMax + 1 : value <= intMax)
@@ -301,9 +352,12 @@ std::string LLVMBackend::CxxIntegerParameterIdentity(const FunctionSymbol& candi
  * purpose), or LiteralIdentity (an unsuffixed literal). A recorded name must agree with the
  * lowered width - a literal may lower narrower than the identity it ranks as, never wider.
  */
-std::string LLVMBackend::IntegerArgumentIdentity(const NamedVariable& arg) const
+std::string LLVMBackend::IntegerArgumentIdentity(const NamedVariable& arg, bool cxxCandidate) const
 {
         const TypeAndValue& tv = arg.TypeAndValue;
+        // Native ulong/u64 and long/i64 are distinct names of one width: a C++ suffix identity would tie them.
+        const std::string& literalIdentity = !cxxCandidate && arg.LiteralIdentitySuffixed
+            && arg.LiteralIdentity != "long" ? std::string() : arg.LiteralIdentity;
         if (tv.Pointer || tv.IsArrayView || tv.ConstArraySize > 0 || tv.IsSimd
             || tv.IsFunctionPointer || tv.IsInterface)
             return "";
@@ -321,6 +375,11 @@ std::string LLVMBackend::IntegerArgumentIdentity(const NamedVariable& arg) const
             return name == "bool" ? -1 : probe.IsInteger();
         };
 
+        // A suffixed unsigned literal carries a lowered name (`1UL` -> u64) that is not its C++
+        // type (`unsigned long`); the exact spelling recorded from the source wins at equal width.
+        if (cxxCandidate && !literalIdentity.empty() && (!tv.TypeName.empty() || !arg.InferSourceTypeName.empty())
+            && integerBits(literalIdentity) == loweredBits)
+            return literalIdentity;
         for (const std::string* recorded : { &tv.TypeName, &arg.InferSourceTypeName })
         {
             if (recorded->empty())
@@ -328,8 +387,8 @@ std::string LLVMBackend::IntegerArgumentIdentity(const NamedVariable& arg) const
             std::string name = resolved(*recorded);
             return integerBits(name) == loweredBits ? name : "";
         }
-        if (!arg.LiteralIdentity.empty() && integerBits(arg.LiteralIdentity) >= loweredBits)
-            return arg.LiteralIdentity;
+        if (!literalIdentity.empty() && integerBits(literalIdentity) >= loweredBits)
+            return literalIdentity;
         return "";
 }
 
@@ -369,7 +428,7 @@ int LLVMBackend::RankIntegerConversion(const std::string& argIdentity, const std
  * implicit object parameter of a member, equal only to another member's.
  */
 // Recover the original decorated declaration name from a generated default-argument wrapper.
-static std::string CxxDeclarationLinkageName(std::string name)
+std::string LLVMBackend::CxxDeclarationLinkageName(std::string name)
 {
         constexpr std::string_view prefix = "__cflat_dflt_";
         if (!name.starts_with(prefix)) return name;
@@ -1586,7 +1645,7 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                 int integerCost = -1;
                 if (result >= 0)
                 {
-                    const std::string argIdentity = IntegerArgumentIdentity(arg);
+                    const std::string argIdentity = IntegerArgumentIdentity(arg, candidate.IsCxx);
                     // A reference parameter has no identity of its own; the arms above supply the
                     // referent's, so `const int&` outranks `const long long&` for an int literal.
                     const std::string paramIdentity = constRefReferentIdentity.empty()
@@ -2739,9 +2798,16 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                 };
                 return reachesOwner(operatorReceiver);
             };
+            const bool cxxOperatorReceiver = IsCxxRecord(operatorReceiver);
             for (const FunctionSymbol& candidate : *candidateSet)
             {
                 if (candidate.IsCxx && candidate.IsMethod && !candidate.Parameters.empty()
+                    && candidate.Parameters.front().TypeName != operatorReceiver)
+                    continue;
+                // A native member operator of another type is never a C++ receiver's operator; left
+                // in, it still matched (list<string>::operator[]) and switched off the all-C++ ranking.
+                if (cxxOperatorReceiver && !candidate.IsCxx && candidate.IsMethod
+                    && !candidate.Parameters.empty()
                     && candidate.Parameters.front().TypeName != operatorReceiver)
                     continue;
                 if (candidate.IsCxx && candidate.IsMethod

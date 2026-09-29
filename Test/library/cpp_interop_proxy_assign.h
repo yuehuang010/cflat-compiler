@@ -220,4 +220,20 @@ struct RkSource;
 struct RkTarget { int k; RkTarget() : k(0) {} RkTarget(const RkSource&) : k(74) {} };
 struct RkSource { int s; RkSource() : s(0) {} operator RkTarget() { RkTarget t; t.k = 75; return t; } };
 inline int rk_take(RkTarget t) { return t.k; }
+
+// Subscript overload ranking: operator[] candidates are ranked per argument like any member call,
+// never picked by declaration order. Value legs 31760-31769 in Test/test_cpp_interop.cb, the
+// ambiguous shapes in Test/errors/err_cpp_overload_ambiguous_per_arg.cb.
+enum SubE { SubE3 = 3 };
+enum class SubS { A = 3 };
+struct SubConv { int v; operator int() const { return v; } };
+struct SubIL { int operator[](int) { return 1; } int operator[](long) { return 2; } };
+struct SubLI { int operator[](long) { return 2; } int operator[](int) { return 1; } };
+struct SubIU { int operator[](int) { return 1; } int operator[](unsigned) { return 3; } };
+struct SubSZ { int operator[](unsigned long) { return 4; } };
+struct SubSL { int operator[](short) { return 9; } int operator[](long) { return 2; } };
+struct SubCL { int operator[](int) const { return 7; } int operator[](long) { return 8; } };
+struct SubLC { int operator[](long) { return 8; } int operator[](int) const { return 7; } };
+struct SubDIL : SubIL {};
+struct SubDLI : SubLI {};
 }

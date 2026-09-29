@@ -10,6 +10,7 @@
 #include <llvm/Linker/Linker.h>
 #include <llvm/Passes/PassBuilder.h>
 #include <llvm/Analysis/TargetLibraryInfo.h>
+#include <llvm/Analysis/ValueTracking.h>
 #include <llvm/Transforms/Utils/Mem2Reg.h>
 #include <llvm/Transforms/Scalar/SROA.h>
 #include <llvm/Transforms/InstCombine/InstCombine.h>
@@ -640,6 +641,19 @@ llvm::Value* LLVMBackend::CreateCxxFieldGEP(llvm::IRBuilder<>& irBuilder, const 
         };
         gep->setMetadata("cflat.cxx.field", llvm::MDNode::get(*context, operands));
         return gep;
+}
+
+void LLVMBackend::MarkCxxConstReferent(llvm::Value* referenceResult)
+{
+        if (auto* call = llvm::dyn_cast_or_null<llvm::CallBase>(referenceResult))
+            call->setMetadata("cflat.cxx.constref", llvm::MDNode::get(*context, {}));
+}
+
+bool LLVMBackend::IsCxxConstReferent(llvm::Value* destination) const
+{
+        if (destination == nullptr) return false;
+        auto* call = llvm::dyn_cast<llvm::CallBase>(llvm::getUnderlyingObject(destination));
+        return call != nullptr && call->getMetadata("cflat.cxx.constref") != nullptr;
 }
 
 unsigned LLVMBackend::CxxFieldElementIndex(const StructData& data, unsigned index) const

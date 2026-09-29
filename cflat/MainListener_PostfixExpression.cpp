@@ -1439,6 +1439,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                         CheckGuardedWrite(ctx, namedVar);
                         llvm::Value* incrementStorage = namedVar.Storage
                             ? namedVar.Storage : parenthesizedPostfixStorage;
+                        RefuseCxxConstReferentWrite(ctx, incrementStorage, "increment");
                         if (incrementStorage)
                         {
                             llvm::Type* et = nullptr;
@@ -1474,6 +1475,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                         CheckGuardedWrite(ctx, namedVar);
                         llvm::Value* decrementStorage = namedVar.Storage
                             ? namedVar.Storage : parenthesizedPostfixStorage;
+                        RefuseCxxConstReferentWrite(ctx, decrementStorage, "decrement");
                         if (decrementStorage)
                         {
                             llvm::Type* et = nullptr;
@@ -2773,7 +2775,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 {
                                     namedVar.TypeAndValue = literalType;
                                     namedVar.LiteralIdentity = LLVMBackend::LiteralIdentityForOverload(
-                                        literal->getText());
+                                        literal->getText(), &namedVar.LiteralIdentitySuffixed);
                                 }
                                 namedVar.IsRvalue = true;
                             }
@@ -3069,6 +3071,24 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 idxNV.BaseType = rvalue->getType();
                                 // A non-empty VariableName is a NAMED-argument request.
                                 idxNV.TypeAndValue.VariableName = "";
+                            }
+                            // An INTEGER index carries the identity a call argument does (declared
+                            // name, literal spelling, unsigned / scoped-enum TypeName), or the
+                            // per-argument ranking cannot tell operator[](int) from operator[](long).
+                            else if (rvalue->getType()->isIntegerTy() && !idxNamed.TypeAndValue.Pointer)
+                            {
+                                idxNV.InferSourceTypeName = idxNamed.TypeAndValue.TypeName;
+                                idxNV.LiteralIdentity = LLVMBackend::LiteralIdentityForOverload(
+                                    expressCtx->assignmentExpression()->getText());
+                                if (idxNamed.TypeAndValue.IsScopedEnum
+                                    || Compiler(ctx)->IsScopedEnumTypeName(idxNamed.TypeAndValue.TypeName))
+                                {
+                                    idxNV.TypeAndValue.TypeName = idxNamed.TypeAndValue.TypeName;
+                                    idxNV.TypeAndValue.EnumBacking = idxNamed.TypeAndValue.EnumBacking;
+                                    idxNV.TypeAndValue.IsScopedEnum = true;
+                                }
+                                if (idxIsUnsigned)
+                                    idxNV.TypeAndValue.TypeName = idxNamed.TypeAndValue.TypeName;
                             }
 
                             CheckMovedReceiver(structVar);
@@ -5677,6 +5697,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     argVar.AllocAlignment = argNV.AllocAlignment;
                                     argVar.TypeAndValue.Pointer = argNV.TypeAndValue.Pointer;
                                     argVar.TypeAndValue.IsCxxConstRef = argNV.TypeAndValue.IsCxxConstRef;
+                                    argVar.TypeAndValue.IsCxxPointeeConst =
+                                        argNV.TypeAndValue.IsCxxPointeeConst;
                                     argVar.TypeAndValue.DiagnosticTypeName =
                                         argNV.TypeAndValue.DiagnosticTypeName;
                                     argVar.TypeAndValue.IsMove = argNV.TypeAndValue.IsMove;
@@ -6468,6 +6490,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     argVar.AllocAlignment = argNV.AllocAlignment;
                                     argVar.TypeAndValue.Pointer = argNV.TypeAndValue.Pointer;
                                     argVar.TypeAndValue.IsCxxConstRef = argNV.TypeAndValue.IsCxxConstRef;
+                                    argVar.TypeAndValue.IsCxxPointeeConst =
+                                        argNV.TypeAndValue.IsCxxPointeeConst;
                                     argVar.TypeAndValue.IsMove = argNV.TypeAndValue.IsMove;
                                     argVar.TypeAndValue.IsUnique = argNV.TypeAndValue.IsUnique;
                                     // Propagate the array-view flag so a `T[]` argument is still seen
@@ -6534,7 +6558,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     }
                                     // Preserve source literal identity across lowered-width inference.
                                     argVar.LiteralIdentity = LLVMBackend::LiteralIdentityForOverload(
-                                        namedArgument->assignmentExpression()->getText());
+                                        namedArgument->assignmentExpression()->getText(),
+                                        &argVar.LiteralIdentitySuffixed);
                                     // Preserve unsigned-integer TypeName so Upconvert can choose ZExt over SExt.
                                     if (argNV.TypeAndValue.IsUnsignedInteger() != -1)
                                         argVar.TypeAndValue.TypeName = argNV.TypeAndValue.TypeName;
@@ -6994,7 +7019,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                         && !ctorTypes.back().IsProvenDecayedDoublePointer()
                                         && !arg.InferSourceTypeName.empty())
                                         ctorTypes.back().TypeName = arg.InferSourceTypeName;
-                                    TypeUntypedCtorArg(ctorTypes.back(), value);
+                                    TypeUntypedCtorArg(ctorTypes.back(), value,
+                                        arg.LiteralIdentitySuffixed ? arg.LiteralIdentity : std::string());
                                     if (arg.TypeAndValue.TypeName.empty() && !arg.TypeAndValue.Pointer
                                         && compiler->IsCxxRecord(ctorTypes.back().TypeName))
                                         arg.TypeAndValue.TypeName = ctorTypes.back().TypeName;

@@ -1937,6 +1937,7 @@ nlohmann::json LLVMBackend::TvToJson(const TypeAndValue& tv)
         if (s.IsRvalueRef)    j["rr"]  = true;
         if (s.IsCxxRefToPointer) j["crp"] = true;
         if (s.IsCxxConstRef) j["ccr"] = true;
+        if (s.IsCxxPointeeConst) j["cpc"] = true;
         if (s.IsOwningSink)   j["osk"] = true;
         if (s.IsConsumeInferredSink) j["cis"] = true;
         if (s.IsBorrowOfAliasElement) j["bae"] = true;
@@ -1999,6 +2000,7 @@ LLVMBackend::TypeAndValue LLVMBackend::TvFromJson(const SjVal& j)
         s.IsRvalueRef = j.value("rr", false);
         s.IsCxxRefToPointer = j.value("crp", false);
         s.IsCxxConstRef = j.value("ccr", false);
+        s.IsCxxPointeeConst = j.value("cpc", false);
         s.IsOwningSink = j.value("osk", false);
         s.IsConsumeInferredSink = j.value("cis", false);
         s.IsBorrowOfAliasElement = j.value("bae", false);

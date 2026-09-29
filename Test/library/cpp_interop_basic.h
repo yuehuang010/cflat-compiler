@@ -406,6 +406,18 @@ namespace cppi
     struct DefaultPair { int a; int b; };
     DefaultPair default_pair(int a, int extra = default_extra()) noexcept;
 
+    // A non-constant class default beside a `const char*` parameter: the wrapper ranks a string
+    // literal argument exactly like its declaration does (it takes a PREFIX of its parameters).
+    struct DefSize { float x, y; constexpr DefSize(float a, float b) : x(a), y(b) {} };
+    inline int dflt_label(const char* label, const DefSize& size = DefSize(0, 0)) noexcept
+    { return label[0] + (int)size.x; }
+    struct DefLabeler
+    {
+        int k = 5;
+        int label(const char* text, const DefSize& size = DefSize(0, 0)) const noexcept
+        { return text[0] + (int)size.x + k; }
+    };
+
     struct IndexLike
     {
         IndexLike(int value) noexcept : value(value) {}
@@ -1923,11 +1935,58 @@ namespace cppi
         template<class It> long put(int, It, It) { return 3; }
     };
     using MtSinkNoCopy = MtSink<MtNoCopy>;
-    // Member `T *const &` returns: IsCxxConstRef there marks the pointer, not the pointee.
+    // Member `T *const &` returns: the const is the pointer slot, not the pointee.
     struct MtRankPtrs
     {
         int* const& intPtr() const { static int value = 1; static int* p = &value; return p; }
         MtRank* const& rank(MtRank& value) const
         { static MtRank* p = nullptr; p = &value; return p; }
     };
+    // Pointee const of a C++ result reaches clang ranking, and const referents refuse writes.
+    struct MtConstObj
+    {
+        int v = 7;
+        template<class A> long g(A) { return 100 + sizeof(A); }
+        long g(short) const { return 2; }
+        // Templates only: the const and non-const wrappers share one CFlat signature.
+        template<class A> long t2(A) const { return 1; }
+        template<class A> long t2(A) { return 2; }
+    };
+    struct MtConstKind
+    {
+        template<class A> long kind(A) { return 50; }
+        long kind(MtConstObj*) { return 1; }
+        long kind(const MtConstObj*) { return 2; }
+        template<class A> long tk(A*) { return 60; }
+        template<class A> long tk(const A*) { return 61; }
+    };
+    struct MtConstHolder
+    {
+        MtConstObj s;
+        const MtConstObj* cp = &s;
+        MtConstObj* mp = &s;
+        const MtConstObj* const* cpp = &cp;
+        long lv = 5;
+        const MtConstObj*& cpr() { return cp; }
+        const MtConstObj* const& ccpr() { return cp; }
+        MtConstObj const* const& eccpr() { return cp; }
+        const MtConstObj* const* cpptr() { return cpp; }
+        const MtConstObj* cpv() { return cp; }
+        MtConstObj* const& mcr() { return mp; }
+        MtConstObj*& mr() { return mp; }
+        const long& clr() { return lv; }
+        long& lr() { return lv; }
+        const long&& crr() { return static_cast<const long&&>(lv); }
+        long&& rr() { return static_cast<long&&>(lv); }
+        const MtConstObj& csr() { return s; }
+        MtConstObj& sr() { return s; }
+    };
+    inline MtConstHolder mtConstHolder;
+    inline const MtConstObj* mt_const_cpv() { return mtConstHolder.cp; }
+    inline MtConstObj* const& mt_const_mcr() { return mtConstHolder.mp; }
+    inline const long& mt_const_clr() { return mtConstHolder.lv; }
+    inline const long&& mt_const_crr() { return static_cast<const long&&>(mtConstHolder.lv); }
+    inline const MtConstObj& mt_const_csr() { return mtConstHolder.s; }
+    inline int mtConstInt = 3;
+    inline int* const& mt_const_ipcr() { static int* p = &mtConstInt; return p; }
 }

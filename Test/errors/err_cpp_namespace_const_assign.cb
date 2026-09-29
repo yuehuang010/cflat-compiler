@@ -19,4 +19,75 @@ extern int main()
     expect_error("cannot assign to 'cppi.nsobj.kRed.g': it is a const C++ object") {
         cppi.nsobj.kRed.g = 1;
     }
+
+    // `++` / `--` reach the same storage as `=` (master accepted both).
+    expect_error("cannot increment 'cppi.nsobj.kLinked': it is a const C++ object") {
+        cppi.nsobj.kLinked++;
+    }
+    expect_error("cannot decrement 'cppi.nsobj.kRed.g': it is a const C++ object") {
+        cppi.nsobj.kRed.g--;
+    }
+
+    // A write through a C++ `const T&` / `const T&&` RESULT, free or member, is refused too
+    // (ruling 2026-09-27): `=`, compound assignment, `++` / `--`, a field of a const class
+    // referent, and the pointer SLOT of `T *const &`. Master accepted every one. Its pointee,
+    // and every non-const reference result, stay writable (test_cpp_interop.cb 7960-7968).
+    expect_error("cannot assign to 'h.clr()': it is reached through a C++ const reference result") {
+        cppi.MtConstHolder h = cppi.MtConstHolder();
+        h.clr() = 32;
+    }
+    expect_error("cannot assign to 'h.clr()': it is reached through a C++ const reference result") {
+        cppi.MtConstHolder h = cppi.MtConstHolder();
+        h.clr() += 1;
+    }
+    expect_error("cannot increment 'h.clr()': it is reached through a C++ const reference result") {
+        cppi.MtConstHolder h = cppi.MtConstHolder();
+        h.clr()++;
+    }
+    expect_error("cannot decrement 'h.crr()': it is reached through a C++ const reference result") {
+        cppi.MtConstHolder h = cppi.MtConstHolder();
+        h.crr()--;
+    }
+    expect_error("cannot assign to 'o.const_member_long()': it is reached through a C++ const reference result") {
+        cppi.RrefScalar o = cppi.RrefScalar();
+        o.const_member_long() = 1;
+    }
+    expect_error("cannot assign to 'cppi.rref_const_long()': it is reached through a C++ const reference result") {
+        cppi.rref_const_long() = 1;
+    }
+    expect_error("cannot assign to 'cppi.mt_const_clr()': it is reached through a C++ const reference result") {
+        cppi.mt_const_clr() -= 1;
+    }
+    expect_error("cannot assign to 'cppi.mt_const_crr()': it is reached through a C++ const reference result") {
+        cppi.mt_const_crr() = 1;
+    }
+    expect_error("cannot assign to 'h.csr().v': it is reached through a C++ const reference result") {
+        cppi.MtConstHolder h = cppi.MtConstHolder();
+        h.csr().v = 3;
+    }
+    expect_error("cannot increment 'cppi.mt_const_csr().v': it is reached through a C++ const reference result") {
+        cppi.mt_const_csr().v++;
+    }
+    expect_error("cannot assign to 'h.csr()': it is reached through a C++ const reference result") {
+        cppi.MtConstHolder h = cppi.MtConstHolder();
+        h.csr() = cppi.MtConstObj();
+    }
+    expect_error("cannot assign to 'h.mcr()': it is reached through a C++ const reference result") {
+        cppi.MtConstHolder h = cppi.MtConstHolder();
+        h.mcr() = h.mr();
+    }
+    expect_error("cannot assign to 'cppi.mt_const_ipcr()': it is reached through a C++ const reference result") {
+        cppi.mt_const_ipcr() = nullptr;
+    }
+
+    // An `alias` local bound to the result, and a parenthesized result, are the same referent.
+    expect_error("cannot assign to 'r': it is reached through a C++ const reference result") {
+        cppi.MtConstHolder h = cppi.MtConstHolder();
+        alias long r = h.clr();
+        r = 3;
+    }
+    expect_error("cannot assign to '(h.clr())': it is reached through a C++ const reference result") {
+        cppi.MtConstHolder h = cppi.MtConstHolder();
+        (h.clr()) = 3;
+    }
 }

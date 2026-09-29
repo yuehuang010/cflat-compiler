@@ -135,5 +135,40 @@ extern int main()
         cpppa.RkSrc s = cpppa.RkSrc();
         int r = cpppa.rk_conv_ref(s);
     }
+    // Subscript: operator[] ranks per argument like a call, so the shapes clang refuses are
+    // refused here too (the last-declared overload was picked before). Both declaration orders.
+    expect_error("ambiguous call to 'operator[]': no candidate ranks better") {
+        cpppa.SubIL a = default;
+        uint u = 3;
+        int r = a[u];
+    }
+    expect_error("ambiguous call to 'operator[]': no candidate ranks better") {
+        cpppa.SubLI a = default;
+        uint u = 3;
+        int r = a[u];
+    }
+    // int -> short and int -> long are both conversions.
+    expect_error("ambiguous call to 'operator[]': no candidate ranks better") {
+        cpppa.SubSL a = default;
+        int i = 3;
+        int r = a[i];
+    }
+    // Better on the object parameter (non-const) vs better on the index (int identity).
+    expect_error("ambiguous call to 'operator[]': no candidate ranks better") {
+        cpppa.SubLC a = default;
+        int i = 3;
+        int r = a[i];
+    }
+    expect_error("ambiguous call to 'operator[]': no candidate ranks better") {
+        cpppa.SubDIL a = default;
+        ulong u = 3;
+        int r = a[u];
+    }
+    // A scoped enum index never converts to an integer parameter.
+    expect_error("argument 1 is scoped C++ enum 'cpppa.SubS' and cannot be implicitly converted to 'int'") {
+        cpppa.SubIL a = default;
+        cpppa.SubS e = cpppa.SubS.A;
+        int r = a[e];
+    }
     return 0;
 }

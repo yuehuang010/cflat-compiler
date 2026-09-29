@@ -5917,7 +5917,8 @@ public:
     void CheckMovedReceiver(const LLVMBackend::NamedVariable& receiver);
 
     // Give an untyped literal argument the shape a C++ constructor overload can match on.
-    void TypeUntypedCtorArg(LLVMBackend::TypeAndValue& argType, llvm::Value* argValue);
+    void TypeUntypedCtorArg(LLVMBackend::TypeAndValue& argType, llvm::Value* argValue,
+                            const std::string& suffixedLiteralIdentity = {});
 
     llvm::Value* LoadNamedVariableImpl(LLVMBackend::NamedVariable& namedVar);
 
@@ -6930,6 +6931,10 @@ public:
     // (its body must be side-effect free or the version validation means nothing).
     // No-ops when the guard is not held: the read-side check has already reported that.
     void CheckGuardedWrite(antlr4::ParserRuleContext* ctx, const LLVMBackend::NamedVariable& target);
+    // Refuses a store whose target is reached through a C++ const reference result or, for
+    // `++` / `--`, is a const C++ namespace object.
+    void RefuseCxxConstReferentWrite(antlr4::ParserRuleContext* ctx, llvm::Value* destination,
+                                     const std::string& operation);
 
     // Verify that the current lock-set satisfies the RequiredLocks of the function just called.
     // Called immediately after CreateOverloadedFunctionCall; reads lastCallRequiredLocks and

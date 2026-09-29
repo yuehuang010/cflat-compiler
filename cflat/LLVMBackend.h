@@ -815,8 +815,15 @@ public:
         bool IsAlias = false;    // return/decl declared with 'alias' - borrowed reference; caller must not free the interior
         bool IsRvalueRef = false; // C++ T&& parameter: borrowed address, but only rvalues bind
         bool IsCxxRefToPointer = false; // C++ T*&: the value is the address of a T* slot
-        // C++ `const T&` parameter or return: preserve binding and receiver constness.
+        /*
+         * C++ reference whose REFERENT is const (`const T&`, `const T&&`, `T *const &`): an rvalue
+         * may bind it, and a write through it is refused. On a pointer shape the referent is the
+         * pointer slot, never the pointee - pointee const is IsCxxPointeeConst.
+         */
         bool IsCxxConstRef = false;
+        // C++ pointer result whose innermost POINTEE is const (`const T*`, `const T*&`,
+        // `T const *const &`, `const T *const *`). Internal only: overload ranking and receivers.
+        bool IsCxxPointeeConst = false;
         // Set by the ForwardRefScanner body-scan on a plain by-value parameter the callee body
         // UNCONDITIONALLY moves (top-level `move <param>`): a synthesized move-sink whose caller
         // source is nulled at the call site. Consumers still gate on the concrete type owning a
@@ -1200,6 +1207,7 @@ public:
         bool IsRvalueRef = false;
         bool IsCxxRefToPointer = false;
         bool IsCxxConstRef = false;
+        bool IsCxxPointeeConst = false;
         bool IsOwningSink = false;
         bool IsConsumeInferredSink = false;
         bool IsBorrowOfAliasElement = false;
@@ -1258,6 +1266,7 @@ public:
             s.IsRvalueRef = t.IsRvalueRef;
             s.IsCxxRefToPointer = t.IsCxxRefToPointer;
             s.IsCxxConstRef = t.IsCxxConstRef;
+            s.IsCxxPointeeConst = t.IsCxxPointeeConst;
             s.IsOwningSink = t.IsOwningSink;
             s.IsConsumeInferredSink = t.IsConsumeInferredSink;
             s.IsBorrowOfAliasElement = t.IsBorrowOfAliasElement;
@@ -1317,6 +1326,7 @@ public:
             t.IsRvalueRef = IsRvalueRef;
             t.IsCxxRefToPointer = IsCxxRefToPointer;
             t.IsCxxConstRef = IsCxxConstRef;
+            t.IsCxxPointeeConst = IsCxxPointeeConst;
             t.IsOwningSink = IsOwningSink;
             t.IsConsumeInferredSink = IsConsumeInferredSink;
             t.IsBorrowOfAliasElement = IsBorrowOfAliasElement;
@@ -1456,6 +1466,8 @@ public:
         // compile-time: the C++ literal identity before lowering narrows it (including int and
         // double for suffix-less literals). Not part of the --init cache round-trip.
         std::string LiteralIdentity;
+        // compile-time: LiteralIdentity came from an integer suffix (1UL). Not part of the cache round-trip.
+        bool LiteralIdentitySuffixed = false;
         // compile-time: this argument was written 'move x' at a call site and is a VALUE type
         // (string/owning struct/closure). Zeroing is deferred to ApplyMoveParamTransfer so the
         // callee's parameter move-ness is known first. Not part of the --init cache round-trip.
@@ -1775,6 +1787,8 @@ public:
         // Declared source type name of the operand. Carried for C++ IDENTITY only (a `char`
         // operand must not reach a C++ template as `signed char`); no other path reads it.
         std::string  sourceTypeName;
+        // TypeAndValue::IsCxxPointeeConst of a pointer operand, so a `?:` join keeps it.
+        bool         cxxPointeeConst = false;
 
         TypedValue() = default;
         TypedValue(llvm::Value* v, bool u = false) : value(v), isUnsigned(u) {}
@@ -3415,6 +3429,10 @@ private:
     // Emitted symbol names of bound C++ const/constexpr namespace-scope objects. Their storage is
     // read-only, so a store through one traps at run time; the assignment site rejects it instead.
     std::unordered_set<std::string> cxxConstGlobalSymbols_;
+    // Tags / tests the C++ call whose result is a reference to a const referent; a store whose
+    // underlying object is that call writes through it.
+    void MarkCxxConstReferent(llvm::Value* referenceResult);
+    bool IsCxxConstReferent(llvm::Value* destination) const;
     // Leading segment of a dotted name a C++ import registered, noted as a foreign namespace.
     void NoteCxxForeignNamespace(const std::string& dottedName)
     {
@@ -8960,6 +8978,8 @@ public:
     int ScoreMoveAgreement(const std::vector<NamedVariable>& arguments, const FunctionSymbol& candidate) const;
     bool IsRvalueReferenceArgument(const NamedVariable& arg) const;
     bool IsProvenCxxScalarLvalue(const NamedVariable& arg) const;
+    // The declaration a generated `__cflat_dflt_*` wrapper forwards to; other names unchanged.
+    static std::string CxxDeclarationLinkageName(std::string name);
     std::string CxxReferenceParameterSpelling(const FunctionSymbol& candidate, size_t index) const;
     bool IsCxxReferenceParameter(const FunctionSymbol& candidate, size_t index) const;
     // C++ calls also classify address-less literals and expression results as rvalues. Keep this
@@ -9301,8 +9321,10 @@ public:
 
 
     // Integer identity ranking for overload resolution (C++ order, ruling 2026-09-10).
-    static std::string LiteralIdentityForOverload(std::string_view text);
-    std::string IntegerArgumentIdentity(const NamedVariable& arg) const;
+    // `suffixedInteger` (optional) is set when the identity comes from an integer suffix (1UL, 2LL).
+    static std::string LiteralIdentityForOverload(std::string_view text, bool* suffixedInteger = nullptr);
+    // `cxxCandidate` false: a suffixed literal keeps master's native identity (only a lone L is `long`).
+    std::string IntegerArgumentIdentity(const NamedVariable& arg, bool cxxCandidate = true) const;
 
     /*
      * One argument's C++ implicit conversion sequence ([over.ics.rank]) against an imported C++
@@ -10525,7 +10547,9 @@ public:
     // 119: group header parse defers inline non-template bodies; fewer incidental instantiations.
     // 124: demand entries store their request chunks (header wrapper batch included) for replay.
     // 127: out-of-line inline and implicit-template static data members emit into the companion.
-    static constexpr int kCHeaderCacheVersion = 127;
+    // 128: C++ pointer results record pointee const (IsCxxPointeeConst); free `T *const &`
+    //      returns record IsCxxConstRef like member ones.
+    static constexpr int kCHeaderCacheVersion = 128;
     static std::string CompilerBuildStamp();
 
     static std::string GetCHeaderCacheDir();
