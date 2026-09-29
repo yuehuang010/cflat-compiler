@@ -1989,6 +1989,53 @@ namespace cppi
     inline const MtConstObj& mt_const_csr() { return mtConstHolder.s; }
     inline int mtConstInt = 3;
     inline int* const& mt_const_ipcr() { static int* p = &mtConstInt; return p; }
+    // A const receiver (const namespace object, const& result, const T* result) takes the const
+    // member of a const/non-const pair, never the non-const one on read-only storage.
+    struct CrPair
+    {
+        int v = 3;
+        int get() const { return v; }
+        int get() { v += 10; return v; }
+        int add(int k) const { return v + k; }
+        int add(int k) { v += 10; return v + k; }
+        int operator+(int k) const { return v + k + 100; }
+        int operator+(int k) { v += 10; return v + k; }
+        int only() { v += 1; return v; }
+        int conly() const { return v + 1000; }
+        int operator-() const { return v; }
+        int operator-() { v += 10; return v; }
+    };
+    // The most-derived class declaring the name decides: CrHideConst hides the base pair with a
+    // lone const get(), CrInherit inherits the pair unhidden.
+    struct CrHideConst : CrPair { int get() const { return v + 900; } };
+    struct CrInherit : CrPair {};
+    inline const CrHideConst crHide{};
+    inline const CrInherit crInherit{};
+    // A const receiver ranks the whole const-callable set, twins plus unique-signature const members.
+    struct CrMixed
+    {
+        int v = 3;
+        int f(int) const { return 1; }
+        int f(int) { v += 10; return 2; }
+        int f(double) const { return 3; }
+    };
+    inline const CrMixed crMixed{};
+    inline const CrPair crConst{};
+    constexpr CrPair crConstexpr{};
+    inline CrPair crMutable{};
+    inline const CrPair& cr_const_ref() { return crConst; }
+    inline const CrPair* cr_const_ptr() { return &crMutable; }
+    // Virtual const/non-const pairs: a const receiver dispatches the const overload virtually.
+    struct CrVB { int v = 3; virtual int get() const { return v; } virtual int get() { v += 10; return v; }
+        virtual ~CrVB() = default; };
+    struct CrVD : CrVB { int get() const override { return v + 60; } int get() override { v += 20; return v; } };
+    struct CrAbs { virtual int get() const = 0; virtual int get() = 0; virtual ~CrAbs() = default; };
+    struct CrImpl : CrAbs { int v = 3; int get() const override { return v + 70; } int get() override { v += 10; return v; } };
+    inline CrVD crVd{};
+    inline CrImpl crImpl{};
+    inline const CrVB& cr_vb_ref() { return crVd; }
+    inline const CrVB* cr_vb_ptr() { return &crVd; }
+    inline const CrAbs& cr_abs_ref() { return crImpl; }
 }
 
 // Member and free operators whose return type is a class-template specialization nothing has

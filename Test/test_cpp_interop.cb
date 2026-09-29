@@ -7554,6 +7554,24 @@ extern int main()
     mtcSum += mtcH.clr();
     mtcH.lr() = mtcH.clr() + cppi.mt_const_crr();
     if (mtcSum != 5 || mtcH.lv != 10) return 7968;
+    // Const receivers pick the const overload (clang: 3 3 3 4 5 104 105 1003 3, then 13 24 on
+    // the mutable object); master ran the non-const one in place (SIGBUS on read-only storage).
+    if (cppi.crConst.get() != 3 || cppi.crConstexpr.get() != 3 || cppi.cr_const_ref().get() != 3)
+        return 7969;
+    if (cppi.crConst.add(1) != 4 || cppi.cr_const_ref().add(2) != 5) return 7970;
+    if (cppi.crConst + 1 != 104 || cppi.cr_const_ref() + 2 != 105 || cppi.crConst.conly() != 1003)
+        return 7971;
+    if (cppi.cr_const_ptr()->get() != 3 || cppi.crMutable.v != 3) return 7972;
+    if (cppi.crMutable.get() != 13 || cppi.crMutable + 1 != 24 || cppi.crConst.v != 3) return 7973;
+    // clang: 903 3 4 (derived hides / inherits the pair), 3 1 (mixed set), 3 3 (unary member
+    // operator on a const object / const& result runs the const overload in place).
+    if (cppi.crHide.get() != 903 || cppi.crInherit.get() != 3 || cppi.crInherit.add(1) != 4)
+        return 7974;
+    if (cppi.crMixed.f(2.0) != 3 || cppi.crMixed.f(1) != 1 || cppi.crMixed.v != 3) return 7975;
+    if (-cppi.crConst != 3 || -cppi.cr_const_ref() != 3 || cppi.crConst.v != 3) return 7976;
+    // clang: 63 63 73 3 3 (virtual const overload through const& / const* / pure-virtual base).
+    if (cppi.cr_vb_ref().get() != 63 || cppi.cr_vb_ptr()->get() != 63 || cppi.cr_abs_ref().get() != 73
+        || cppi.crVd.v != 3 || cppi.crImpl.v != 3) return 7977;
     cppi.MtSinkNoCopy mtSink = cppi.MtSinkNoCopy();
     cppi.MtNoCopy mtNoCopy = cppi.MtNoCopy();
     if (mtSink.put(1, move mtNoCopy) != 2) return 7931;

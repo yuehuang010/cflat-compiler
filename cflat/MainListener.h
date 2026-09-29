@@ -6989,6 +6989,12 @@ public:
     // `++` / `--`, is a const C++ namespace object.
     void RefuseCxxConstReferentWrite(antlr4::ParserRuleContext* ctx, llvm::Value* destination,
                                      const std::string& operation);
+    // Refuses `obj.f()` when obj is read-only C++ storage (const namespace object, const
+    // reference result) and every overload of f is non-const. True when it refused.
+    bool RefuseCxxConstReceiverCall(antlr4::ParserRuleContext* ctx,
+                                    const std::vector<LLVMBackend::NamedVariable>& arguments,
+                                    const std::string& receiverType, const std::string& member,
+                                    const std::string& receiverText);
 
     // Verify that the current lock-set satisfies the RequiredLocks of the function just called.
     // Called immediately after CreateOverloadedFunctionCall; reads lastCallRequiredLocks and

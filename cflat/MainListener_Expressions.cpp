@@ -10680,12 +10680,16 @@ llvm::Value* MainListener::TryUnaryOperatorOverload(
                 operandStorage = nullptr;
         }
         // Read-only objects (const C++ global, const& result) keep the copy: a non-const operator would write them.
+        llvm::Value* readOnlyStorage = nullptr;
         if (operandStorage != nullptr)
         {
             auto* constGlobal = llvm::dyn_cast<llvm::GlobalVariable>(llvm::getUnderlyingObject(operandStorage));
             if (compiler->IsCxxConstReferent(operandStorage)
                 || (constGlobal != nullptr && compiler->cxxConstGlobalSymbols_.count(constGlobal->getName().str()) != 0))
+            {
+                readOnlyStorage = operandStorage;
                 operandStorage = nullptr;
+            }
         }
 
         std::string opName = "operator" + op;
@@ -10744,6 +10748,17 @@ llvm::Value* MainListener::TryUnaryOperatorOverload(
             const bool cxxClass = compiler->IsCxxRecord(typeName)
                 || compiler->generatedCxxRecords_.count(typeName) != 0;
             llvm::Value* tempAlloca = operandStorage != nullptr && cxxClass ? operandStorage : nullptr;
+            // A read-only object whose class has a const twin of the operator calls that const
+            // overload on the object itself (clang's pick); CreateOverloadedFunctionCall redirects.
+            if (tempAlloca == nullptr && readOnlyStorage != nullptr && cxxClass)
+                if (auto twin = compiler->functionTable.find(LLVMBackend::CxxConstTwinName(opName));
+                    twin != compiler->functionTable.end()
+                    && std::any_of(twin->second.begin(), twin->second.end(),
+                           [&](const LLVMBackend::FunctionSymbol& c) {
+                               return c.IsMethod && !c.Parameters.empty()
+                                   && c.Parameters[0].TypeName == typeName;
+                           }))
+                    operandStorage = tempAlloca = readOnlyStorage;
             if (tempAlloca == nullptr)
             {
                 tempAlloca = compiler->CreateAlloca(structTy);
@@ -20247,6 +20262,26 @@ void MainListener::RefuseCxxConstReferentWrite(antlr4::ParserRuleContext* ctx,
             LogErrorContext(ctx, std::format(
                 "cannot {} '{}': it is a const C++ object, so its storage is read-only. "
                 "Copy it into a local and modify that instead.", operation, target));
+}
+
+bool MainListener::RefuseCxxConstReceiverCall(antlr4::ParserRuleContext* ctx,
+                                              const std::vector<LLVMBackend::NamedVariable>& arguments,
+                                              const std::string& receiverType,
+                                              const std::string& member,
+                                              const std::string& receiverText) {
+        if (arguments.empty() || receiverType.empty()) return false;
+        auto* compiler = Compiler(ctx);
+        const int constKind = compiler->CxxConstReceiverKind(arguments.front());
+        if (constKind < 2 || !compiler->CxxMemberIsOnlyNonConst(receiverType, member))
+            return false;
+        const std::string object = receiverText.empty()
+            ? arguments.front().TypeAndValue.VariableName : receiverText;
+        LogErrorContext(ctx, std::format(
+            "cannot call non-const member '{}' on '{}': {}, so it is read-only and only a const "
+            "member function may be called on it. Copy it into a local and call it on that instead.",
+            member, object, constKind == 2 ? "it is a const C++ object"
+                                           : "it is reached through a C++ const reference result"));
+        return true;
 }
 
 std::string MainListener::NextMemberName(CFlatParser::PostfixExpressionContext* ctx,

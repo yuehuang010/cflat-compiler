@@ -656,6 +656,22 @@ bool LLVMBackend::IsCxxConstReferent(llvm::Value* destination) const
         return call != nullptr && call->getMetadata("cflat.cxx.constref") != nullptr;
 }
 
+int LLVMBackend::CxxConstReceiverKind(const NamedVariable& receiver) const
+{
+        for (llvm::Value* v : { receiver.Storage, receiver.Primary })
+        {
+            if (v == nullptr || !v->getType()->isPointerTy()) continue;
+            if (IsCxxConstReferent(v)) return 3;
+            auto* global = llvm::dyn_cast<llvm::GlobalVariable>(llvm::getUnderlyingObject(v));
+            if (global != nullptr && cxxConstGlobalSymbols_.count(global->getName().str()) != 0)
+                return 2;
+        }
+        const TypeAndValue& t = receiver.TypeAndValue;
+        if (t.IsCxxPointeeConst && !t.IsFunctionPointer) return 1;
+        if (t.IsCxxConstRef && !t.Pointer && !t.IsCxxRefToPointer) return 1;
+        return 0;
+}
+
 unsigned LLVMBackend::CxxFieldElementIndex(const StructData& data, unsigned index) const
 {
         if (!data.CxxOffsetLayout || index >= data.CxxFieldElements.size()) return index;

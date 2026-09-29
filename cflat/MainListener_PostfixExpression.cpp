@@ -7340,7 +7340,11 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 requestCxxTemplate(resolvedFuncName);
 
                                 callArgumentPostfix.Flush();
-                                namedVar.Primary = Compiler(ctx)->CreateOverloadedFunctionCall(
+                                namedVar.Primary = RefuseCxxConstReceiverCall(ctx, arguments,
+                                        cxxMemberReceiverType(), resolvedFuncName,
+                                        lastMemberReceiverPath)
+                                    ? nullptr
+                                    : Compiler(ctx)->CreateOverloadedFunctionCall(
                                     resolvedFuncName, arguments, globalScopeCall, callDisplayName,
                                     cxxMemberReceiverType(),
                                     isPostfixMemberCall && !callHasCxxBraceArguments,
@@ -7407,7 +7411,11 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 }
                                 requestCxxTemplate(resolvedFuncName);
                                 callArgumentPostfix.Flush();
-                                namedVar.Primary = Compiler(primaryCtx)->CreateOverloadedFunctionCall(
+                                namedVar.Primary = RefuseCxxConstReceiverCall(ctx, arguments,
+                                        cxxMemberReceiverType(), resolvedFuncName,
+                                        lastMemberReceiverPath)
+                                    ? nullptr
+                                    : Compiler(primaryCtx)->CreateOverloadedFunctionCall(
                                     resolvedFuncName, arguments, globalScopeCall, callDisplayName,
                                     cxxMemberReceiverType(),
                                     isPostfixMemberCall && !callHasCxxBraceArguments,

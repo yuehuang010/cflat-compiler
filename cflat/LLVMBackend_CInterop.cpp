@@ -16283,6 +16283,9 @@ void LLVMBackend::RegisterCxxClassMembers(const CRecordEntry& r, const std::stri
             const bool registerConstViewData = m.kind == Member::Instance
                 && m.name == "data" && m.isConst;
             bool constViewDataTwin = false;
+            // A const member whose non-const twin took the CFlat name: registered under
+            // CxxConstTwinName so a const receiver still reaches it (clang's pick).
+            bool constOverloadTwin = false;
             if (m.isConversion && m.isExplicit
                 && implicitConversionNames.count(cflatName) == 0)
                 info.explicitConversions.insert(cflatName);
@@ -16418,7 +16421,13 @@ void LLVMBackend::RegisterCxxClassMembers(const CRecordEntry& r, const std::stri
                 auto it = instanceBySig.find(cflatSigKey(m));
                 constViewDataTwin = it != instanceBySig.end() && it->second != i;
                 if (constViewDataTwin && !registerConstViewData)
-                    continue;
+                {
+                    const Member& kept = r.members[it->second];
+                    constOverloadTwin = m.isConst && !kept.isConst
+                        && m.isVolatile == kept.isVolatile && !m.isConversion;
+                    if (!constOverloadTwin)
+                        continue;
+                }
             }
 
             TypeAndValue ret;
@@ -16588,7 +16597,8 @@ void LLVMBackend::RegisterCxxClassMembers(const CRecordEntry& r, const std::stri
                 // Same spelling the full-arity registration below uses; computed here because the
                 // unmappable-parameter path reaches this lambda before that declaration.
                 const std::string wrapperRegName = m.kind == Member::StaticMethod
-                    ? r.name + "." + cflatName : cflatName;
+                    ? r.name + "." + cflatName
+                    : constOverloadTwin ? CxxConstTwinName(cflatName) : cflatName;
                 if (m.kind == Member::StaticMethod)
                 {
                     NoteCxxForeignNamespace(wrapperRegName);
@@ -16636,6 +16646,7 @@ void LLVMBackend::RegisterCxxClassMembers(const CRecordEntry& r, const std::stri
                             sym.DefaultArguments.clear();
                             sym.CxxRefQualifier = m.refQualifier;
                             sym.CxxVolatile = m.isVolatile;
+                            sym.CxxConst = m.isConst;
                         }
                 return true;
             };
@@ -16715,6 +16726,7 @@ void LLVMBackend::RegisterCxxClassMembers(const CRecordEntry& r, const std::stri
 
             const std::string regName = registerConstViewData && constViewDataTwin
                 ? "__cflat_view_decay_const_data"
+                : constOverloadTwin ? CxxConstTwinName(cflatName)
                 : m.kind == Member::StaticMethod ? r.name + "." + cflatName : cflatName;
             if (m.kind == Member::StaticMethod)
             {
@@ -16744,6 +16756,7 @@ void LLVMBackend::RegisterCxxClassMembers(const CRecordEntry& r, const std::stri
                         sym.DefaultArguments = m.defaultArgs;
                         sym.CxxRefQualifier = m.refQualifier;
                         sym.CxxVolatile = m.isVolatile;
+                        sym.CxxConst = m.isConst;
                     }
             // A member whose omitted suffix contains a non-constant default gets an exact-arity
             // receiver-prefixed overload backed by a C++ forwarding body. The generated body is
@@ -16754,15 +16767,14 @@ void LLVMBackend::RegisterCxxClassMembers(const CRecordEntry& r, const std::stri
                 std::vector<TypeAndValue> prefix(params.begin(), params.begin() + n);
                 registerDefaultArityWrapper(prefix, n);
             }
+            // A virtual member is called through the receiver's vptr at this slot; the
+            // declaration above exists only to carry clang's arrangement and to keep the
+            // callee's LLVM type available. A const twin dispatches the same way.
+            if (m.kind == Member::Instance && m.isVirtual)
+                cxxVirtualSlotByLinkage_[m.linkageName] = { m.vtableIndex, m.vtableOffsetBytes };
+            if (constOverloadTwin) continue;
             if (m.kind == Member::Instance)
-            {
                 info.instanceMethodNames.push_back(cflatName);
-                // A virtual member is called through the receiver's vptr at this slot; the
-                // declaration above exists only to carry clang's arrangement and to keep the
-                // callee's LLVM type available.
-                if (m.isVirtual)
-                    cxxVirtualSlotByLinkage_[m.linkageName] = { m.vtableIndex, m.vtableOffsetBytes };
-            }
             else if (m.kind == Member::StaticMethod
                      && std::find(info.staticMethodNames.begin(), info.staticMethodNames.end(),
                                   cflatName) == info.staticMethodNames.end())
@@ -18020,6 +18032,46 @@ bool LLVMBackend::RegisterCxxInheritedMembers(const CRecordEntry& r)
                         accessIt != bit->second.memberAccess.end())
                         access = accessIt->second;
                     noteMethodName(mn, access);
+                    added = true;
+                }
+            }
+            /*
+             * Const twins (CxxConstTwinName) of an inherited, unhidden const/non-const pair are
+             * cloned onto this class too, so a const derived receiver calls the base's const
+             * member like clang. A name this class declares hides the base pair entirely.
+             */
+            for (const std::string& mn : baseMethodNames)
+            {
+                if (declaredNames.count(mn) != 0) continue;
+                auto tit = functionTable.find(CxxConstTwinName(mn));
+                if (tit == functionTable.end()) continue;
+                std::vector<FunctionSymbol> fromBase;
+                for (const FunctionSymbol& sym : tit->second)
+                    if (sym.IsCxx && sym.IsMethod && !sym.Parameters.empty()
+                        && sym.Parameters[0].TypeName == baseName
+                        && std::none_of(tit->second.begin(), tit->second.end(),
+                               [&](const FunctionSymbol& other) {
+                                   return !other.Parameters.empty()
+                                       && other.Parameters[0].TypeName == r.name
+                                       && other.UniqueName == sym.UniqueName;
+                               }))
+                        fromBase.push_back(sym);
+                for (FunctionSymbol sym : fromBase)
+                {
+                    // Virtual-base placement is re-resolved per class; keep the plain call there.
+                    if (b.isVirtual
+                        || cxxThisVirtualBase_.count(CxxThisAdjustKey(baseName, sym.UniqueName)) != 0)
+                        continue;
+                    const uint64_t inherited = [&] {
+                        auto a = cxxThisAdjust_.find(CxxThisAdjustKey(baseName, sym.UniqueName));
+                        return a == cxxThisAdjust_.end() ? 0ull : a->second;
+                    }();
+                    const uint64_t adjust = b.offsetBytes + inherited;
+                    sym.Parameters[0].TypeName = r.name;
+                    if (sym.CxxInheritedOwner.empty()) sym.CxxInheritedOwner = baseName;
+                    if (adjust != 0)
+                        cxxThisAdjust_[CxxThisAdjustKey(r.name, sym.UniqueName)] = adjust;
+                    functionTable[CxxConstTwinName(mn)].push_back(std::move(sym));
                     added = true;
                 }
             }

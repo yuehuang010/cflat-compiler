@@ -1959,6 +1959,7 @@ public:
         bool IsCxx = false;        // declaration came from a C++ header
         int CxxRefQualifier = cflat_cinterop::CxxRefQualifierNone;
         bool CxxVolatile = false;  // volatile-qualified C++ member; loses to a non-volatile twin
+        bool CxxConst = false;     // const-qualified C++ instance member
         bool IsNoexcept = true;    // potentially throwing C++ calls are gated until EH support
         bool IsCInteropAlias = false;
         bool IsCInteropDeclaration = false;
@@ -3446,6 +3447,25 @@ private:
     // underlying object is that call writes through it.
     void MarkCxxConstReferent(llvm::Value* referenceResult);
     bool IsCxxConstReferent(llvm::Value* destination) const;
+    // A const C++ member whose non-const twin owns the CFlat name registers under this name.
+    static std::string CxxConstTwinName(const std::string& member)
+    {
+        return "__cflat_const_twin_" + member;
+    }
+    // User-facing spelling of a registered name: drops the const-twin prefix.
+    static std::string StripCxxConstTwin(const std::string& name)
+    {
+        const std::string prefix = CxxConstTwinName("");
+        return name.starts_with(prefix) ? name.substr(prefix.size()) : name;
+    }
+    /*
+     * 0 = the receiver of a member call is not known const; 1 = it is const through its type
+     * (pointee-const pointer, const reference); 2 = a const namespace object; 3 = reached
+     * through a C++ const reference result. 2 and 3 are read-only storage.
+     */
+    int CxxConstReceiverKind(const NamedVariable& receiver) const;
+    // True when every instance member `memberName` of C++ record `recordName` is non-const.
+    bool CxxMemberIsOnlyNonConst(const std::string& recordName, const std::string& memberName) const;
     // Leading segment of a dotted name a C++ import registered, noted as a foreign namespace.
     void NoteCxxForeignNamespace(const std::string& dottedName)
     {

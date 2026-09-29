@@ -2559,6 +2559,17 @@ bool LLVMBackend::IsCxxTemplateSpecializationSymbol(const FunctionSymbol& symbol
         return templated;
 }
 
+bool LLVMBackend::CxxMemberIsOnlyNonConst(const std::string& recordName,
+                                          const std::string& memberName) const
+{
+        bool hasConst = false, hasNonConst = false;
+        if (auto record = cxxRecordEntries_.find(recordName); record != cxxRecordEntries_.end())
+            for (const auto& member : record->second.members)
+                if (member.kind == cflat_cinterop::RawCxxMember::Instance && member.name == memberName)
+                    (member.isConst ? hasConst : hasNonConst) = true;
+        return hasNonConst && !hasConst;
+}
+
 llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functionNameIn, const std::vector<LLVMBackend::NamedVariable>& arguments, bool forceRoot,
         const std::string& displayName, const std::string& cxxMemberReceiver,
         bool postfixMemberCall, const std::string& enclosingFunctionName)
@@ -2675,6 +2686,60 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
         // Compiler-synthesized member calls (view decay size/data) name lazy C++ members too.
         if ((postfixMemberCall || !cxxMemberReceiver.empty()) && IsCxxRecord(receiverType))
             EnsureCxxMemberProjected(receiverType, bareMemberName);
+        /*
+         * A const receiver (const namespace object, const reference result, pointee-const
+         * pointer) calls the const twin of a const/non-const member pair like clang; the
+         * non-const one would write read-only storage. MainListener::RefuseCxxConstReceiverCall
+         * refuses a named call with no const overload at all.
+         */
+        const std::string constTwinPrefix = CxxConstTwinName("");
+        if (!arguments.empty() && !bareMemberName.starts_with(constTwinPrefix)
+            && IsCxxRecord(receiverType))
+        {
+            const int constKind = CxxConstReceiverKind(arguments.front());
+            if (constKind != 0)
+            {
+                EnsureCxxMemberProjected(receiverType, bareMemberName);
+                const std::string twinName = CxxConstTwinName(bareMemberName);
+                /*
+                 * Twins are registered (or cloned by inheritance) per owning class, and a class
+                 * declaring the name hides the base's, so only the receiver's own twin counts.
+                 * The const receiver ranks the whole const-callable set: its twins plus the
+                 * receiver's unique-signature const members registered under the plain name.
+                 */
+                bool twinFits = false;
+                if (auto twin = functionTable.find(twinName); twin != functionTable.end())
+                {
+                    for (const auto& candidate : twin->second)
+                        if (candidate.IsMethod && !candidate.Parameters.empty()
+                            && candidate.Parameters.front().TypeName == receiverType)
+                            twinFits = true;
+                    if (twinFits)
+                        if (auto plain = functionTable.find(bareMemberName);
+                            plain != functionTable.end())
+                        {
+                            std::vector<FunctionSymbol> constPlain;
+                            for (const auto& candidate : plain->second)
+                                if (candidate.IsCxx && candidate.IsMethod && candidate.CxxConst
+                                    && !candidate.Parameters.empty()
+                                    && candidate.Parameters.front().TypeName == receiverType
+                                    && std::none_of(twin->second.begin(), twin->second.end(),
+                                           [&](const FunctionSymbol& t) {
+                                               return t.UniqueName == candidate.UniqueName
+                                                   && !t.Parameters.empty()
+                                                   && t.Parameters.front().TypeName == receiverType;
+                                           }))
+                                    constPlain.push_back(candidate);
+                            for (auto& candidate : constPlain)
+                                twin->second.push_back(std::move(candidate));
+                        }
+                }
+                if (twinFits)
+                    return CreateOverloadedFunctionCall(twinName, arguments, forceRoot,
+                        displayName.empty() ? shownFunctionName : displayName,
+                        cxxMemberReceiver, postfixMemberCall, enclosingFunctionName);
+            }
+        }
         const bool receiverHasCxxMember = (postfixMemberCall || !cxxMemberReceiver.empty())
             && !receiverType.empty()
             && CxxClassHasMemberNamed(receiverType, bareMemberName);
@@ -2916,7 +2981,8 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                     spelled = "const " + spelled;
                 paramList += (paramList.empty() ? "" : ", ") + spelled;
             }
-            const std::string name = c.SourceName.empty() ? shownFunctionName : c.SourceName;
+            const std::string name = StripCxxConstTwin(
+                c.SourceName.empty() ? shownFunctionName : c.SourceName);
             return std::format("{}({})", name, paramList);
         };
 
@@ -3341,7 +3407,9 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                 {
                     bool isThis = i == 0 && !candidates.empty() &&
                                   !candidates[0].Parameters.empty() &&
-                                  candidates[0].Parameters[0].VariableName.ends_with("__");
+                                  (candidates[0].Parameters[0].VariableName.ends_with("__")
+                                   || (candidates[0].IsCxx && candidates[0].IsMethod
+                                       && candidates[0].Parameters[0].VariableName == "this"));
                     name = isThis ? "<this>" : "<unnamed>";
                 }
                 else
@@ -3392,7 +3460,8 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                     if (p.IsMove) paramList += "move ";
                     paramList += parameterType;
                 }
-                const std::string candidateName = c.SourceName.empty() ? shownFunctionName : c.SourceName;
+                const std::string candidateName = StripCxxConstTwin(
+                    c.SourceName.empty() ? shownFunctionName : c.SourceName);
                 msg += std::format("    {}({})\n", candidateName, paramList);
             }
 
@@ -3403,9 +3472,9 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                 // A C++ candidate's UniqueName is its mangled linkage name (_ZN4cppi8pick_refERi),
                 // which names nothing the user wrote. The registered lookup name is the dotted
                 // spelling (cppi.pick_ref), so prefer it whenever it exists.
-                std::string resolvedShown = !resolvedSym.SourceName.empty()
+                std::string resolvedShown = StripCxxConstTwin(!resolvedSym.SourceName.empty()
                     ? resolvedSym.SourceName
-                    : SpellFunctionSymbol(*this, resolvedSym.UniqueName);
+                    : SpellFunctionSymbol(*this, resolvedSym.UniqueName));
                 msg += std::format("  Argument mismatch detail (single resolved candidate: {}):\n",
                     displayName.empty() ? resolvedShown : shownFunctionName);
                 size_t count = std::max(resolvedArgs.size(), resolvedSym.Parameters.size());
@@ -3451,7 +3520,8 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                         arguments[i], *pi, byValueParam || indirectValueParam);
                     if (note.empty()) continue;
                     msg += std::format("  [{}] argument {}: {}\n",
-                        c.SourceName.empty() ? shownFunctionName : c.SourceName, i, note);
+                        StripCxxConstTwin(c.SourceName.empty() ? shownFunctionName : c.SourceName),
+                        i, note);
                     named = true;
                     break;
                 }
@@ -3485,7 +3555,8 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                     }
                     if (why.empty()) continue;
                     msg += std::format("  [{}] {}\n",
-                        c.SourceName.empty() ? SpellFunctionSymbol(*this, c.UniqueName) : c.SourceName,
+                        StripCxxConstTwin(c.SourceName.empty()
+                            ? SpellFunctionSymbol(*this, c.UniqueName) : c.SourceName),
                         why);
                     break;
                 }
