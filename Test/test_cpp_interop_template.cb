@@ -1819,6 +1819,57 @@ extern int main()
     if (strlitA.tag() != 3) return 1794;
     if (strlitA.n() != 6) return 1795;
 
+    // A typed pointer on the left keeps the free std::string operator candidates reachable.
+    char* pointerLeft = "abc";
+    std.string pointerRight = std.string("abd");
+    std.string pointerSum = pointerLeft + pointerRight;
+    if ((int)pointerSum.size() != 6) return 1798;
+    if (!(pointerLeft < pointerRight)) return 1799;
+    char[4] arrayLeft = { 'c', 'd', 0, 0 };
+    std.string arraySum = arrayLeft + pointerRight;
+    if ((int)arraySum.size() != 5) return 1801;
+    char* equalPointer = "same";
+    std.string equalString = std.string("same");
+    if (!(equalPointer == equalString)) return 1800;
+
+    // Each final value comes from the last sret fold, not the first destination slot.
+    std.string chainLiteral = pointerRight + "cd" + "ef";
+    if (!(chainLiteral == "abdcdef")) return 1802;
+    std.string chainString = pointerRight + pointerRight + pointerRight;
+    if (!(chainString == "abdabdabd")) return 1803;
+    char* chainPointer = "cd";
+    std.string chainPointerResult = pointerRight + chainPointer + chainPointer;
+    if (!(chainPointerResult == "abdcdcd")) return 1804;
+
+    cppfop.FoldBox boxPlus = cppfop.FoldBox(1) + cppfop.FoldBox(2) + cppfop.FoldBox(3);
+    if (boxPlus.v != 6) return 1805;
+    int scalarPlus = cppfop.FoldScalar(3) + cppfop.FoldScalar(4) + cppfop.FoldScalar(5);
+    if (scalarPlus != 12) return 1806;
+    cppfop.FoldBox boxTimes = cppfop.FoldBox(1) * cppfop.FoldBox(2) * cppfop.FoldBox(3);
+    if (boxTimes.v != 6) return 1807;
+    int scalarTimes = cppfop.FoldScalar(2) * cppfop.FoldScalar(3) * cppfop.FoldScalar(4);
+    if (scalarTimes != 24) return 1808;
+    cppfop.FoldBox boxOr = cppfop.FoldBox(1) | cppfop.FoldBox(2) | cppfop.FoldBox(4);
+    if (boxOr.v != 7) return 1809;
+    int scalarOr = cppfop.FoldScalar(1) | cppfop.FoldScalar(2) | cppfop.FoldScalar(4);
+    if (scalarOr != 7) return 1810;
+    cppfop.FoldBox boxXor = cppfop.FoldBox(7) ^ cppfop.FoldBox(3) ^ cppfop.FoldBox(1);
+    if (boxXor.v != 5) return 1811;
+    int scalarXor = cppfop.FoldScalar(7) ^ cppfop.FoldScalar(3) ^ cppfop.FoldScalar(1);
+    if (scalarXor != 5) return 1812;
+    cppfop.FoldBox boxAnd = cppfop.FoldBox(7) & cppfop.FoldBox(3) & cppfop.FoldBox(1);
+    if (boxAnd.v != 1) return 1813;
+    int scalarAnd = cppfop.FoldScalar(7) & cppfop.FoldScalar(3) & cppfop.FoldScalar(1);
+    if (scalarAnd != 1) return 1814;
+    cppfop.FoldBox boxLogicalAnd = cppfop.FoldBox(1) && cppfop.FoldBox(1) && cppfop.FoldBox(0);
+    if (boxLogicalAnd.v != 0) return 1815;
+    bool scalarLogicalAnd = cppfop.FoldScalar(1) && cppfop.FoldScalar(1) && cppfop.FoldScalar(0);
+    if (scalarLogicalAnd) return 1816;
+    cppfop.FoldBox boxLogicalOr = cppfop.FoldBox(1) || cppfop.FoldBox(0) || cppfop.FoldBox(0);
+    if (boxLogicalOr.v != 1) return 1817;
+    bool scalarLogicalOr = cppfop.FoldScalar(0) || cppfop.FoldScalar(0) || cppfop.FoldScalar(1);
+    if (!scalarLogicalOr) return 1818;
+
     cppsop.CharOnly strlitC = cppsop.CharOnly();
     strlitC += "abc";
     if (strlitC.n() != 3) return 1796;
@@ -2774,6 +2825,10 @@ extern int main()
         if (fopTernary != 6 || !cppfop.selfref_clean())                             return 2146;
         if ((tmpSink % (fopPick ? std.function<int(int)>(fopTwice)
                                 : std.function<int(int)>(fopTwice))) != 80)         return 2147;
+        cppfop.FopCompound compound;
+        cppfop.selfref_reset();
+        compound += cppfop.FopSelfRef(7);
+        if (compound.value != 7 || !cppfop.selfref_clean())                       return 2148;
     }
 
     // ---- CFlat using aliases naming C++ specializations (2420-2439) ---------------------------

@@ -5989,7 +5989,8 @@ public:
         bool reportMissing = true, bool allowReversed = true,
         bool lhsIsRvalue = false, bool rhsIsRvalue = false,
         const std::string& lhsTypeName = std::string(),
-        const std::string& rhsTypeName = std::string());
+        const std::string& rhsTypeName = std::string(),
+        int lhsPointerDepth = 0, bool lhsElemPointer = false);
 
     LLVMBackend::TypedValue ParseMultiplicativeExpression(CFlatParser::MultiplicativeExpressionContext* ctx,
                                                            ResultUse use = ResultUse::Value);

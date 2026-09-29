@@ -378,11 +378,8 @@ namespace cflat_cinterop
         }
 
         /*
-         * The BINARY operators CFlat has a spelling for, as a free (non-member) function. This
-         * mirrors the member operator set in the record walk: the binary-operator overload path
-         * looks a free operator up by its C++ source name ("operator+", "operator=="), so a
-         * published template is reachable with no new registration surface. Unary, subscript,
-         * call and conversion forms are member-only in CFlat and stay out.
+         * The infix and compound-assignment operators CFlat has a spelling for, as a free
+         * function. Unary, subscript, call and conversion forms stay out.
          */
         bool IsBindableFreeBinaryOperator(OverloadedOperatorKind kind)
         {
@@ -395,6 +392,10 @@ namespace cflat_cinterop
                 case OO_LessLess: case OO_GreaterGreater:
                 case OO_Amp: case OO_Pipe: case OO_Caret:
                 case OO_AmpAmp: case OO_PipePipe:
+                case OO_PlusEqual: case OO_MinusEqual: case OO_StarEqual:
+                case OO_SlashEqual: case OO_PercentEqual:
+                case OO_LessLessEqual: case OO_GreaterGreaterEqual:
+                case OO_AmpEqual: case OO_PipeEqual: case OO_CaretEqual:
                     return true;
                 default: return false;
             }

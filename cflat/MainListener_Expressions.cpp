@@ -1,6 +1,33 @@
 #include "MainListener.h"
 #include <llvm/Analysis/ValueTracking.h>
 
+class CxxFoldSretScope
+{
+    LLVMBackend* compiler_;
+    llvm::Value* savedDest_;
+    std::string savedType_;
+public:
+    CxxFoldSretScope(LLVMBackend* compiler, bool intermediate)
+        : compiler_(intermediate ? compiler : nullptr),
+          savedDest_(intermediate ? compiler->pendingCxxSretDest_ : nullptr),
+          savedType_(intermediate ? compiler->pendingCxxSretTypeName_ : std::string())
+    {
+        if (compiler_ != nullptr)
+        {
+            compiler_->pendingCxxSretDest_ = nullptr;
+            compiler_->pendingCxxSretTypeName_.clear();
+        }
+    }
+    ~CxxFoldSretScope()
+    {
+        if (compiler_ != nullptr)
+        {
+            compiler_->pendingCxxSretDest_ = savedDest_;
+            compiler_->pendingCxxSretTypeName_ = std::move(savedType_);
+        }
+    }
+};
+
 /*
  * The compound assignment operators, each paired with the binary operator it falls back to when
  * no compound overload exists. One table drives the assignment path's fallback, the C++
@@ -4084,11 +4111,19 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                         std::string leftType = namedVar.TypeAndValue.TypeName;
                         if (leftType.empty())
                             leftType = llvm::cast<llvm::StructType>(left->getType())->getName().str();
+                        const bool cxxClass = compiler->IsCxxRecord(leftType)
+                            || compiler->generatedCxxRecords_.count(leftType) != 0;
+                        const size_t typeSep = leftType.rfind('.');
+                        const std::string operatorTemplateName = typeSep == std::string::npos
+                            ? "operator" + operatorText
+                            : leftType.substr(0, typeSep + 1) + "operator" + operatorText;
+                        const bool compoundTemplateExists = cxxClass
+                            && compiler->HasCxxFunctionTemplate(operatorTemplateName);
                         compoundOverloadExists = HasOperatorOverloadForFirstParam(
                             "operator" + operatorText, leftType);
-                        cxxCompoundInPlace = compoundOverloadExists
-                            && (compiler->IsCxxRecord(leftType)
-                                || compiler->generatedCxxRecords_.count(leftType) != 0);
+                        cxxCompoundInPlace = cxxClass
+                            && (compoundOverloadExists || compoundTemplateExists);
+                        compoundOverloadExists = compoundOverloadExists || compoundTemplateExists;
                         if (compoundOverloadExists)
                             overload = TryBinaryOperatorOverload(
                                 left, operatorText, right, ctx, namedVar.BaseType,
@@ -8028,6 +8063,7 @@ llvm::Value* MainListener::TryClassLogicalOperatorChain(
         {
             auto rv = parseOperand(i);
             NormalizeCxxReferenceOperand(ctx, rv);
+            CxxFoldSretScope foldSret(compiler, i + 1 < operandCount);
             llvm::Value* folded = accumulator != nullptr && accumulator->getType()->isStructTy()
                 ? TryBinaryOperatorOverload(accumulator, op, rv.value, ctx, first.elemType,
                                             rv.pointerDepth, rv.elemPointer, accumulatorStorage,
@@ -8229,6 +8265,7 @@ LLVMBackend::TypedValue MainListener::ParseInclusiveOrExpression(CFlatParser::In
                 NormalizeCxxReferenceOperand(ctx, rv);
                 RegisterBorrowedStringOperandTemp(compiler, rv.value);
                 compiler->RegisterOwnedPtrTemp(rv.value);
+                CxxFoldSretScope foldSret(compiler, i + 1 < exclusiveCtxs.size());
                 // A struct operand routes to 'operator|' the way the shift/relational paths do;
                 // without it an overloaded receiver reaches the raw integer op and fails the verifier.
                 auto* overload = TryBinaryOperatorOverload(acc, "|", rv.value, ctx, lv.elemType,
@@ -8306,6 +8343,7 @@ LLVMBackend::TypedValue MainListener::ParseExclusiveOrExpression(CFlatParser::Ex
                 NormalizeCxxReferenceOperand(ctx, rv);
                 RegisterBorrowedStringOperandTemp(compiler, rv.value);
                 compiler->RegisterOwnedPtrTemp(rv.value);
+                CxxFoldSretScope foldSret(compiler, i + 1 < andCtxs.size());
                 // A struct operand routes to 'operator^' the way the shift/relational paths do;
                 // without it an overloaded receiver reaches the raw integer op and fails the verifier.
                 auto* overload = TryBinaryOperatorOverload(acc, "^", rv.value, ctx, lv.elemType,
@@ -8383,6 +8421,7 @@ LLVMBackend::TypedValue MainListener::ParseAndExpression(CFlatParser::AndExpress
                 NormalizeCxxReferenceOperand(ctx, rv);
                 RegisterBorrowedStringOperandTemp(compiler, rv.value);
                 compiler->RegisterOwnedPtrTemp(rv.value);
+                CxxFoldSretScope foldSret(compiler, i + 1 < nextCtxs.size());
                 // A struct operand routes to 'operator&' the way the shift/relational paths do;
                 // without it an overloaded receiver reaches the raw integer op and fails the verifier.
                 auto* overload = TryBinaryOperatorOverload(acc, "&", rv.value, ctx, lv.elemType,
@@ -8569,7 +8608,8 @@ LLVMBackend::TypedValue MainListener::ParseEqualityExpression(CFlatParser::Equal
                                                        rv.pointerDepth, rv.elemPointer,
                                                        lv.receiverStorage, rv.receiverStorage,
                                                        true, true, lv.isRvalue, rv.isRvalue,
-                                                       lv.sourceTypeName, rv.sourceTypeName);
+                                                       lv.sourceTypeName, rv.sourceTypeName,
+                                                       lv.pointerDepth, lv.elemPointer);
             if (overload)
             {
                 LLVMBackend::NamedVariable resultNV;
@@ -9303,7 +9343,8 @@ LLVMBackend::TypedValue MainListener::ParseRelationalExpression(CFlatParser::Rel
                                                        rv.pointerDepth, rv.elemPointer,
                                                        lv.receiverStorage, rv.receiverStorage,
                                                        true, true, lv.isRvalue, rv.isRvalue,
-                                                       lv.sourceTypeName, rv.sourceTypeName);
+                                                       lv.sourceTypeName, rv.sourceTypeName,
+                                                       lv.pointerDepth, lv.elemPointer);
             if (overload)
             {
                 LLVMBackend::NamedVariable resultNV;
@@ -10204,14 +10245,17 @@ LLVMBackend::TypedValue MainListener::ParseAdditiveExpression(CFlatParser::Addit
                 {
                     unsigned leftBits = BinaryOperandBits(lvalue);
                     unsigned rightBits = BinaryOperandBits(rvalue);
+                    CxxFoldSretScope foldSret(Compiler(ctx), i + 1 < nextCtxs.size());
                     auto* overload = TryBinaryOperatorOverload(lvalue, op, rvalue, ctx, nullptr,
-                                                              rv.pointerDepth, rv.elemPointer,
-                                                              lhsStorage, rv.receiverStorage,
-                                                              true, true, lhsIsRvalue, rv.isRvalue,
-                                                              lvalue == lv.value
-                                                                  ? lv.sourceTypeName
-                                                                  : std::string(),
-                                                              rv.sourceTypeName);
+                                                               rv.pointerDepth, rv.elemPointer,
+                                                               lhsStorage, rv.receiverStorage,
+                                                               true, true, lhsIsRvalue, rv.isRvalue,
+                                                               lvalue == lv.value
+                                                                   ? lv.sourceTypeName
+                                                                   : std::string(),
+                                                               rv.sourceTypeName,
+                                                               lvalue == lv.value ? lv.pointerDepth : 0,
+                                                               lvalue == lv.value && lv.elemPointer);
 
                 // char* + char* concatenation: TryBinaryOperatorOverload dispatches off a struct lvalue
                     // and can't reach raw i8*; both must qualify as c-strings so int* + int* still errors.
@@ -10678,7 +10722,8 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
         int rhsPointerDepth, bool rhsElemPointer, llvm::Value* lhsStorage,
         llvm::Value* rhsStorage, bool reportMissing, bool allowReversed,
         bool lhsIsRvalue, bool rhsIsRvalue,
-        const std::string& lhsTypeName, const std::string& rhsTypeName) {
+        const std::string& lhsTypeName, const std::string& rhsTypeName,
+        int lhsPointerDepth, bool lhsElemPointer) {
         auto* compiler = Compiler(ctx);
         if (!lvalue) return nullptr;
 
@@ -10774,8 +10819,8 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
             llvm::Value* eq = TryBinaryOperatorOverload(lvalue, "==", rvalue, ctx, lhsElemType,
                                                         rhsPointerDepth, rhsElemPointer, lhsStorage,
                                                         rhsStorage, false, allowReversed,
-                                                        lhsIsRvalue, rhsIsRvalue,
-                                                        lhsTypeName, rhsTypeName);
+                lhsIsRvalue, rhsIsRvalue,
+                lhsTypeName, rhsTypeName, lhsPointerDepth, lhsElemPointer);
             if (eq == nullptr || !eq->getType()->isIntegerTy()) return nullptr;
             if (eq->getType()->isIntegerTy(1)) return compiler->builder->CreateNot(eq);
             return compiler->builder->CreateICmpEQ(eq,
@@ -10893,7 +10938,7 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
                     if (typeName.empty()) arg.InferSourceTypeName = sourceTypeName;
                     // A pointer's declared name is its POINTEE: stamp the recorded depth or `s + p` binds the
                     // `char` overload. An unrecorded depth withholds the name, never guessed.
-                    if (typeName.empty() && value != nullptr && value->getType()->isPointerTy())
+                    if (value != nullptr && value->getType()->isPointerTy())
                     {
                         if (pointerDepth >= 1)
                         {
@@ -10901,7 +10946,7 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
                             arg.TypeAndValue.PointerDepth = pointerDepth;
                             arg.TypeAndValue.ElemPointer = elemPointer;
                         }
-                        else arg.InferSourceTypeName.clear();
+                        else if (typeName.empty()) arg.InferSourceTypeName.clear();
                     }
                     arg.IsRvalue = structType != nullptr && storage == nullptr;
                     // A temporary read from its own slot (or a '?:' slot join) passes that slot;
@@ -10922,7 +10967,8 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
                 };
                 std::vector<LLVMBackend::NamedVariable> templateArgs;
                 templateArgs.push_back(templateArgument(lvalue, freeLhsStorage, lhsStorage,
-                                                       leftInfo.first, leftInfo.second, lhsTypeName, 0, false));
+                                                       leftInfo.first, leftInfo.second, lhsTypeName,
+                                                       lhsPointerDepth, lhsElemPointer));
                 templateArgs.push_back(templateArgument(rvalue, freeRhsStorage, rhsStorage,
                                                         rightInfo.first, rightInfo.second, rhsTypeName,
                                                         rhsPointerDepth, rhsElemPointer));
@@ -11139,6 +11185,9 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
                     TrackOwnedStringOperatorResult(compiler, result);
                     return result;
                 }
+                if (compiler->HasCxxFunctionTemplate(sourceName))
+                    if (llvm::Value* templated = callOperatorTemplate(sourceName))
+                        return templated;
             }
             return nullptr;
         };
@@ -11160,7 +11209,7 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
             llvm::Value* ordering = TryBinaryOperatorOverload(
                 lvalue, "<=>", rvalue, ctx, lhsElemType, rhsPointerDepth, rhsElemPointer,
                 lhsStorage, rhsStorage, false, allowReversed, lhsIsRvalue, rhsIsRvalue,
-                lhsTypeName, rhsTypeName);
+                lhsTypeName, rhsTypeName, lhsPointerDepth, lhsElemPointer);
             if (ordering == nullptr) return nullptr;
             // The type mapper lowers every comparison category to that single signed byte; a
             // one-field wrapper is unwrapped here for a `<=>` that returns something else. An
@@ -11205,10 +11254,12 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
                 return compiler->IsCxxRecord(st->getName().str());
             };
             if (!isCxxOperand(lvalue) && !isCxxOperand(rvalue)) return nullptr;
-            return TryBinaryOperatorOverload(rvalue, op, lvalue, ctx, nullptr, 0, false,
+            return TryBinaryOperatorOverload(rvalue, op, lvalue, ctx, nullptr,
+                                             lhsPointerDepth, lhsElemPointer,
                                              rhsStorage, lhsStorage, false, false,
                                              rhsIsRvalue, lhsIsRvalue,
-                                             rhsTypeName, lhsTypeName);
+                                             rhsTypeName, lhsTypeName,
+                                             rhsPointerDepth, rhsElemPointer);
         };
 
         // Every C++20 rewrite, in the order the standard considers them.
@@ -11330,8 +11381,11 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
                 return TryBinaryOperatorOverload(
                     compiler->WrapStringLiteralAsString(lvalue), op, rvalue, ctx, lhsElemType,
                     rhsPointerDepth, rhsElemPointer, lhsStorage, rhsStorage, reportMissing,
-                    allowReversed, lhsIsRvalue, rhsIsRvalue, lhsTypeName, rhsTypeName);
+                    allowReversed, lhsIsRvalue, rhsIsRvalue, lhsTypeName, rhsTypeName,
+                    lhsPointerDepth, lhsElemPointer);
             }
+            if (isCxxRecordValue(rvalue))
+                if (llvm::Value* freeResult = tryFreeOperator()) return freeResult;
             if (auto* bound = TryPointerLhsOperatorOverload(lvalue, op, rvalue, ctx, lhsElemType))
                 return bound;
             if (llvm::Value* rewritten = tryRewrites()) return rewritten;
@@ -11360,6 +11414,11 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
         if (typeName == "__iface_fat_ptr" || typeName == "__closure_fat_ptr") return nullptr;
 
         std::string opName = "operator" + op;
+        if ((op == "+=" || op == "-=" || op == "*=" || op == "/=" || op == "%="
+             || op == "<<=" || op == ">>=" || op == "&=" || op == "|=" || op == "^=")
+            && compiler->IsCxxRecord(typeName)
+            && !HasOperatorOverloadForFirstParam(opName, typeName))
+            if (llvm::Value* freeResult = tryFreeOperator()) return freeResult;
         if (compiler->IsCxxRecord(typeName))
             compiler->EnsureCxxMemberProjected(typeName, opName);
         if (compiler->IsCxxRecord(rhsTypeName))
@@ -11683,6 +11742,7 @@ LLVMBackend::TypedValue MainListener::ParseMultiplicativeExpression(CFlatParser:
                 NormalizeCxxReferenceNamed(ctx, rightNV);
                 bool ru = rightNV.TypeAndValue.IsUnsignedInteger() != -1;
                 llvm::Value* rvalue = LoadNamedVariable(rightNV);
+                CxxFoldSretScope foldSret(Compiler(ctx), i + 1 < nextCtxs.size());
                 unsigned leftBits = BinaryOperandBits(lvalue);
                 unsigned rightBits = BinaryOperandBits(rvalue);
                 std::string op = ctx->children[i * 2 - 1]->getText();
@@ -19591,6 +19651,39 @@ void MainListener::CarryCxxOperatorResult(
         accIsRvalue = !returnType.IsAlias;
         accRefType = nullptr;
         if (result == nullptr) return;
+        if (moreOperands && result->getType()->isPointerTy())
+        {
+            llvm::Value* storage = compiler->lastCxxRetTemp_ != nullptr
+                ? compiler->lastCxxRetTemp_ : result;
+            auto* allocation = llvm::dyn_cast<llvm::AllocaInst>(storage);
+            auto* storedType = allocation != nullptr
+                ? llvm::dyn_cast<llvm::StructType>(allocation->getAllocatedType()) : nullptr;
+            if (storedType != nullptr && storedType->hasName()
+                && compiler->IsCxxRecord(storedType->getName().str()))
+            {
+                accStorage = storage;
+                accValue = compiler->CreateLoad(storedType, storage);
+                accIsRvalue = false;
+                return;
+            }
+        }
+        if (moreOperands && result->getType()->isPointerTy()
+            && !returnType.TypeName.empty() && compiler->IsCxxRecord(returnType.TypeName)
+            && (returnType.IsAlias || compiler->lastCxxRetTemp_ != nullptr))
+        {
+            auto valueTypeInfo = returnType;
+            valueTypeInfo.Pointer = false;
+            valueTypeInfo.PointerDepth = 0;
+            valueTypeInfo.ElemPointer = false;
+            auto* valueType = compiler->GetType(valueTypeInfo);
+            if (valueType != nullptr && valueType->isStructTy())
+            {
+                accStorage = returnType.IsAlias ? result : compiler->lastCxxRetTemp_;
+                accValue = compiler->CreateLoad(valueType, accStorage);
+                accIsRvalue = false;
+                return;
+            }
+        }
         // A by-value C++ class return lives in its sret temporary; that slot is the operand's
         // storage for a following operator, exactly as the additive path already carried it.
         if (!returnType.IsAlias)

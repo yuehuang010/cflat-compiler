@@ -148,4 +148,39 @@ template<class F> int operator+(const FopSink&, F f) { return f.ok(); }
 template<class F> int operator-(const FopSink&, const F& f) { return f.ok(); }
 template<class F> bool operator==(const FopSink&, F f) { return f.ok() == 7; }
 template<class F> int operator%(const FopSink&, F f) { return f(40); }
+struct FopCompound { int value; FopCompound() : value(0) {} };
+template<class F> FopCompound& operator+=(FopCompound& o, F f) { o.value += f.ok(); return o; }
+
+// Three-operand fold probes: non-trivial by-value results use sret; scalar results exercise
+// the same fold handoff when the first overloaded operation returns an integer or bool.
+struct FoldBox {
+    int v;
+    FoldBox(int x = 0) : v(x) {}
+    ~FoldBox() {}
+};
+inline FoldBox operator+(const FoldBox& a, const FoldBox& b) { return FoldBox(a.v + b.v); }
+inline FoldBox operator*(const FoldBox& a, const FoldBox& b) { return FoldBox(a.v * b.v); }
+inline FoldBox operator|(const FoldBox& a, const FoldBox& b) { return FoldBox(a.v | b.v); }
+inline FoldBox operator^(const FoldBox& a, const FoldBox& b) { return FoldBox(a.v ^ b.v); }
+inline FoldBox operator&(const FoldBox& a, const FoldBox& b) { return FoldBox(a.v & b.v); }
+inline FoldBox operator&&(const FoldBox& a, const FoldBox& b) { return FoldBox((a.v != 0) && (b.v != 0)); }
+inline FoldBox operator||(const FoldBox& a, const FoldBox& b) { return FoldBox((a.v != 0) || (b.v != 0)); }
+
+struct FoldScalar {
+    int v;
+    explicit FoldScalar(int x = 0) : v(x) {}
+    operator bool() const { return v != 0; }
+};
+inline int operator+(FoldScalar a, FoldScalar b) { return a.v + b.v; }
+inline int operator+(int a, FoldScalar b) { return a + b.v; }
+inline int operator*(FoldScalar a, FoldScalar b) { return a.v * b.v; }
+inline int operator*(int a, FoldScalar b) { return a * b.v; }
+inline int operator|(FoldScalar a, FoldScalar b) { return a.v | b.v; }
+inline int operator|(int a, FoldScalar b) { return a | b.v; }
+inline int operator^(FoldScalar a, FoldScalar b) { return a.v ^ b.v; }
+inline int operator^(int a, FoldScalar b) { return a ^ b.v; }
+inline int operator&(FoldScalar a, FoldScalar b) { return a.v & b.v; }
+inline int operator&(int a, FoldScalar b) { return a & b.v; }
+inline bool operator&&(FoldScalar a, FoldScalar b) { return bool(a) && bool(b); }
+inline bool operator||(FoldScalar a, FoldScalar b) { return bool(a) || bool(b); }
 }
