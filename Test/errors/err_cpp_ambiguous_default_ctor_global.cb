@@ -1,0 +1,8 @@
+import cpp "cpp_interop_explicit.h";
+
+// A file-scope global is diagnosed when its initializer is emitted, after the declaration, so the
+// expectation is the bare form. `= default` and no-initializer globals take the same path.
+expect_error("C++ class 'cppexp.AmbiguousDefault' has ambiguous default construction");
+cppexp.AmbiguousDefault globalBraced = {};
+
+extern int main() { return 0; }

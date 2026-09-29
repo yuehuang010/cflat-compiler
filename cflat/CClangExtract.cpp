@@ -770,6 +770,9 @@ namespace cflat_cinterop
             std::vector<const CXXRecordDecl*> headerSpecialMemberWork;
             // Hidden friend operators of a requested record, published after the walk.
             std::vector<FunctionDecl*> pendingFriendOps;
+            // Bound static data members of an implicit class-template specialization whose
+            // definition Sema has not instantiated yet; instantiated and emitted after the walk.
+            std::vector<VarDecl*> pendingStaticVarDefs;
             std::unordered_set<const CXXRecordDecl*> headerSpecialMemberSeen;
             /*
              * Every decl Sema ANNOUNCED to the consumer, in order. This is the set a real compile's
@@ -1328,6 +1331,27 @@ namespace cflat_cinterop
                 }
                 for (FunctionDecl* fn : pending)
                     if (fn->hasBody() && !fn->isInvalidDecl()) VisitFunctionDecl(fn);
+            }
+
+            /*
+             * `template <class T> int TB<T>::K = 9;` is instantiated only on odr-use, which the
+             * request chunk never writes, so a bound `TB<int>::K` had no definition to emit and
+             * failed at link. Instantiate the queued ones after the walk (Sema appends decls).
+             */
+            void PublishPendingStaticVarDefs()
+            {
+                if (st.pendingStaticVarDefs.empty()) return;
+                std::vector<VarDecl*> pending;
+                pending.swap(st.pendingStaticVarDefs);
+                if (st.ci == nullptr || !st.ci->hasSema()) return;
+                Sema& sema = st.ci->getSema();
+                for (VarDecl* vd : pending)
+                    if (vd->getDefinition() == nullptr && !vd->isInvalidDecl())
+                        sema.MarkVariableReferenced(vd->getLocation(), vd);
+                sema.PerformPendingInstantiations();
+                for (VarDecl* vd : pending)
+                    if (const VarDecl* def = vd->getDefinition(); def != nullptr && !def->isInvalidDecl())
+                        st.varEmitWork.push_back(def);
             }
 
             bool VisitFunctionDecl(FunctionDecl* fd)
@@ -2443,14 +2467,31 @@ namespace cflat_cinterop
                     // the request companion; other out-of-line definitions remain library-owned.
                     // With definition emission on the storage is emitted into the companion module
                     // (linkonce_odr, so several importers merge), which makes it a real symbol.
-                    const bool isImplicitTemplateDefinition =
-                        vd->getTemplateSpecializationKind() == clang::TSK_ImplicitInstantiation
-                        && vd->getDefinition() != nullptr;
+                    const VarDecl* definition = vd->getDefinition();
+                    const bool isImplicitTemplateMember =
+                        vd->getTemplateSpecializationKind() == clang::TSK_ImplicitInstantiation;
+                    // An out-of-line `inline int C::k = 17;` marks only the DEFINITION inline; the
+                    // in-class declaration reached here is not.
+                    const bool isInlineVar =
+                        vd->isInline() || (definition != nullptr && definition->isInline());
                     const bool emitLocal =
                         (st.req.emitDefinitions || st.req.assumeInlineDefinitions)
-                        && ((vd->isConstexpr() || vd->isInline()
-                             || isImplicitTemplateDefinition)
-                            && vd->getDefinition() != nullptr);
+                        && ((vd->isConstexpr() || isInlineVar || isImplicitTemplateMember)
+                            && definition != nullptr);
+                    // Not instantiated yet: bind the symbol now, emit the definition after the walk.
+                    if (definition == nullptr && isImplicitTemplateMember && st.req.emitDefinitions
+                        && !vd->getType()->isDependentType())
+                    {
+                        st.pendingStaticVarDefs.push_back(const_cast<VarDecl*>(vd));
+                        RawCxxStaticVar sv;
+                        sv.name = vd->getNameAsString();
+                        sv.ctype = CanonicalSpelling(ctx, vd->getType());
+                        sv.access = MapAccess(vd->getAccess());
+                        sv.linkageName = CxxLinkageName(ctx, vd);
+                        LocOfRaw(vd, sv.file, sv.line, sv.col);
+                        rec.staticVars.push_back(std::move(sv));
+                        continue;
+                    }
                     // Why a static data member was left out is invisible at the use site
                     // ("'count' does not name a value"), so name the reason under -v.
                     auto skipStaticVar = [&](const char* why) {
@@ -2459,12 +2500,12 @@ namespace cflat_cinterop
                                       << vd->getQualifiedNameAsString()
                                       << " not bound: " << why << "\n";
                     };
-                    if (!emitLocal && (vd->isConstexpr() || vd->isInline()))
+                    if (!emitLocal && (vd->isConstexpr() || isInlineVar))
                     { skipStaticVar("inline or constexpr storage is emitted per TU"); continue; }
                     if (!emitLocal && vd->hasInit())
                     { skipStaticVar("its initializer lives in the header, so it has no library symbol"); continue; }
                     if (emitLocal && st.req.emitDefinitions)
-                        st.varEmitWork.push_back(vd->getDefinition());
+                        st.varEmitWork.push_back(definition);
                     RawCxxStaticVar sv;
                     sv.name = vd->getNameAsString();
                     sv.ctype = CanonicalSpelling(ctx, vd->getType());
@@ -3402,7 +3443,9 @@ namespace cflat_cinterop
                 }
 
                 // Anything else needs a real symbol. Decide who provides it.
-                const bool headerOnly = vd->isInline() || vd->isConstexpr()
+                // `extern int g; inline int g = 3;` marks only the definition inline.
+                const bool headerOnly = vd->isInline() || (def != nullptr && def->isInline())
+                    || vd->isConstexpr()
                     || !vd->hasExternalFormalLinkage() || vd->getStorageClass() == SC_Static;
                 const bool canEmit = st.req.emitDefinitions || st.req.assumeInlineDefinitions;
                 if (headerOnly)
@@ -5314,6 +5357,7 @@ namespace cflat_cinterop
             st.headerSpecialMemberSeen.clear();
             st.vtableWork.clear();
             st.varEmitWork.clear();
+            st.pendingStaticVarDefs.clear();
         }
 
         size_t CompleteIncompleteCxxTypes(ExtractState& st)
@@ -5372,6 +5416,7 @@ namespace cflat_cinterop
                 else if (!st.req.cxxTypeRequests.empty() && !v.ProcessTypeRequests(root)) return;
                 else v.ProcessFunctionRequests(root);
                 v.PublishPendingFriendOperators();
+                v.PublishPendingStaticVarDefs();
             }
             if (st.req.cxxMode && st.req.autoInstantiateCxxTypes
                 && !st.incompleteCxxTypes.empty())
@@ -5394,6 +5439,7 @@ namespace cflat_cinterop
                              && !refreshed.ProcessTypeRequests(root)) return;
                     else refreshed.ProcessFunctionRequests(root);
                     refreshed.PublishPendingFriendOperators();
+                    refreshed.PublishPendingStaticVarDefs();
                 }
             }
             st.stillIncompleteSpellings.clear();

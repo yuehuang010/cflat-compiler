@@ -4789,10 +4789,10 @@ void LLVMBackend::EnsureConditionalDropFlag(NamedVariable& namedVar)
             builder->getInt1Ty(), nullptr, namedVar.TypeAndValue.VariableName + ".dropflag");
 
         auto* declarationBlock = namedVar.DeclarationBlock;
-        if (declarationBlock != nullptr && declarationBlock != savedBlock
-            && declarationBlock->getTerminator() != nullptr)
+        if (auto* terminator = declarationBlock != nullptr && declarationBlock != savedBlock
+                ? cflat_llvm::GetTerminatorOrNull(declarationBlock) : nullptr)
         {
-            builder->SetInsertPoint(declarationBlock, declarationBlock->getTerminator()->getIterator());
+            builder->SetInsertPoint(declarationBlock, terminator->getIterator());
         }
         else if (declarationBlock != nullptr && declarationBlock != savedBlock)
         {

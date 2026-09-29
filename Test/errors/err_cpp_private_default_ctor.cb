@@ -1,0 +1,24 @@
+import cpp "cpp_interop_explicit.h";
+
+expect_error("C++ class 'cppexp.PrivateDefault' has no default constructor cflat can call") {
+    extern int main()
+    {
+        cppexp.PrivateDefault value = default;
+        return value.get();
+    }
+}
+
+expect_error("C++ class 'cppexp.PrivateDefault' has no default constructor cflat can call") {
+    int makePrivateBrace() {
+        cppexp.PrivateDefault value = {};
+        return value.get();
+    }
+}
+
+expect_error("C++ class 'cppexp.PrivateDefault' has no default constructor cflat can call") {
+    struct PrivateFieldHolder { cppexp.PrivateDefault value = default; };
+    int makePrivateField() {
+        PrivateFieldHolder value = default;
+        return value.value.get();
+    }
+}

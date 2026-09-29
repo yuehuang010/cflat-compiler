@@ -255,12 +255,42 @@ struct ConvVal {
 struct ConvDirect {
     int v = 0;
     int via = 0;
+    int calls = 0;
     ConvDirect() = default;
     ConvDirect(int x) : v(x), via(1) {}
     ConvDirect(const ConvDirect& o) : v(o.v), via(o.via) {}
     ConvDirect& operator=(const ConvDirect& o) { v = o.v; via = 2; return *this; }
-    ConvDirect& operator=(int x) { v = x; via = 3; return *this; }
+    ConvDirect& operator=(int x) { v = x; via = 3; ++calls; return *this; }
     ~ConvDirect() {}
+};
+// The same with a noexcept `operator=(int)`: the call stays in one block (no invoke split).
+struct ConvDirectNx {
+    int v = 0;
+    int via = 0;
+    int calls = 0;
+    ConvDirectNx() = default;
+    ConvDirectNx(int x) noexcept : v(x), via(1) {}
+    ConvDirectNx& operator=(const ConvDirectNx& o) noexcept { v = o.v; via = 2; return *this; }
+    ConvDirectNx& operator=(int x) noexcept { v = x; via = 3; ++calls; return *this; }
+};
+struct AmbiguousDefault {
+    int v;
+    AmbiguousDefault() : v(19) {}
+    AmbiguousDefault(int x = 5) : v(x) {}
+};
+struct InheritedDefaultBase {
+    int v;
+    InheritedDefaultBase(int x = 25) : v(x) {}
+};
+struct InheritedDefault : InheritedDefaultBase {
+    using InheritedDefaultBase::InheritedDefaultBase;
+    int w = 3;
+};
+class PrivateDefault {
+public:
+    int get() const { return 20; }
+private:
+    PrivateDefault() = default;
 };
 // Refusal shapes: explicit, two equal-rank converting constructors, and a chain of two
 // user-defined conversions (const char* -> ConvStr -> ConvChain).

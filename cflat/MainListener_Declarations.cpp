@@ -2030,10 +2030,11 @@ llvm::Value* MainListener::GenerateDefaultValue(const LLVMBackend::DeclTypeAndVa
         if (!resolved.Pointer && llvmType->isStructTy())
         {
             auto structData = compiler->GetDataStructure(resolved.TypeName);
-            if (compiler->IsForeignCxxClassWithConstructors(resolved.TypeName) && !global_scope)
+            if (compiler->IsCxxRecord(resolved.TypeName) && !global_scope)
             {
                 std::string ctorError;
                 compiler->TryBindCxxImplicitDefaultCtor(resolved.TypeName, ctorError);
+                if (!ctorError.empty()) compiler->LogErrorMessage("{}", { ctorError });
                 const auto* ctor = compiler->FindCxxDefaultCtor(resolved.TypeName);
                 if (ctor != nullptr)
                 {
@@ -2041,6 +2042,13 @@ llvm::Value* MainListener::GenerateDefaultValue(const LLVMBackend::DeclTypeAndVa
                     if (compiler->EmitCxxStructorCall(resolved.TypeName, *ctor, slot, {}))
                         return compiler->CreateLoad(llvmType, slot);
                 }
+                std::string ambiguityError;
+                if (compiler->CxxDefaultCtorAmbiguityError(resolved.TypeName, ambiguityError))
+                    compiler->LogErrorMessage("{}", { ambiguityError });
+                const auto* info = compiler->GetCxxClassInfo(resolved.TypeName);
+                if (info == nullptr || !info->hasDeletedDefaultCtor)
+                    compiler->LogErrorMessage("C++ class '{}' has no default constructor cflat can call",
+                        { compiler->DisplayCxxClassName(resolved.TypeName) });
             }
             // forceRoot: the guards above are EXACT-key lookups, so the default ctor must be the
             // one of that exact type - a namespace walk here would call a same-named sibling's.
@@ -4022,13 +4030,7 @@ bool MainListener::TryDeclareForeignCxxLocal(CFlatParser::InitDeclaratorContext*
         auto* ctorArgs = assign != nullptr ? ForeignCxxConstructArgs(assign, typeName) : nullptr;
         auto* moveExpr = assign != nullptr ? TopLevelMoveExpression(assign) : nullptr;
 
-        /*
-         * A trivially-copyable record can be stored from a value or reference result without a
-         * C++ copy-constructor symbol. Preserve the fully-trivial fast path, including `default`
-         * and no-initializer forms. A record with default member initializers can have a nontrivial
-         * default constructor while its copy remains a legal bitwise copy, so its non-default,
-         * non-direct-`T(args)` initializers use the ordinary value path too.
-         */
+        // A trivial record can skip construction only when its default constructor is public.
         auto* directCall = assign != nullptr ? SolePostfixExpression(assign) : nullptr;
         const std::string directCallText = directCall != nullptr
             ? directCall->getText() : std::string();
@@ -4043,7 +4045,8 @@ bool MainListener::TryDeclareForeignCxxLocal(CFlatParser::InitDeclaratorContext*
             const auto* trivial = compiler->GetCxxClassInfo(typeName);
             const bool fullyTrivial = trivial != nullptr && trivial->hasTrivialDefaultCtor
                 && trivial->hasTrivialCopyCtor && trivial->hasTrivialDtor
-                && !trivial->hasDeletedDefaultCtor;
+                && !trivial->hasDeletedDefaultCtor
+                && !compiler->HasNonPublicCxxDefaultCtor(typeName);
             if (fullyTrivial || (initializer != nullptr && !isDefaultForm))
                 return false;
         }
@@ -4128,6 +4131,9 @@ cxx_dtor_ready:
             const auto* ctor = compiler->FindCxxDefaultCtor(typeName);
             if (ctor == nullptr)
             {
+                std::string ambiguityError;
+                if (compiler->CxxDefaultCtorAmbiguityError(typeName, ambiguityError))
+                    LogErrorContext(direct, ambiguityError);
                 const auto* info = compiler->GetCxxClassInfo(typeName);
                 LogErrorContext(direct, std::format(
                     "C++ class '{}' has no default constructor cflat can call{} - initialize it "
@@ -4997,8 +5003,15 @@ bool MainListener::EmitNontrivialCxxDefaultAt(
         return false;
     std::string error;
     compiler->TryBindCxxImplicitDefaultCtor(typeValue.TypeName, error);
+    if (!error.empty()) compiler->LogErrorMessage("{}", { error });
     const auto* ctor = compiler->FindCxxDefaultCtor(typeValue.TypeName);
-    if (ctor == nullptr) return false;
+    if (ctor == nullptr)
+    {
+        std::string ambiguityError;
+        if (compiler->CxxDefaultCtorAmbiguityError(typeValue.TypeName, ambiguityError))
+            compiler->LogErrorMessage("{}", { ambiguityError });
+        return false;
+    }
     return compiler->EmitCxxStructorCall(typeValue.TypeName, *ctor, destination, {});
 }
 

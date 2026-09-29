@@ -5922,6 +5922,8 @@ public:
     llvm::Value* LoadNamedVariableImpl(LLVMBackend::NamedVariable& namedVar);
 
     // If lvalue is a struct type with a user-defined operator, dispatch to it.
+    bool ReportMissingUnaryStructOperator(antlr4::ParserRuleContext* ctx, llvm::Value* operand,
+                                          const std::string& op);
     // Returns the result Value*, or nullptr to fall back to built-in CreateOperation.
     // Returns a non-null value if a user-defined operator overload was found and called,
     // nullptr if the operand type has no matching operator (fall back to primitive handling).

@@ -546,6 +546,22 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
                                         const std::string& retText,
                                         bool defaultValue) {
         auto* compiler = Compiler(errCtx);
+        if (defaultValue && !compiler->currentFunctionReturnTV.Pointer
+            && compiler->IsCxxRecord(compiler->currentFunctionReturnTypeName))
+        {
+            const auto& typeName = compiler->currentFunctionReturnTypeName;
+            std::string ctorError;
+            compiler->TryBindCxxImplicitDefaultCtor(typeName, ctorError);
+            if (!ctorError.empty()) LogErrorContext(errCtx, ctorError);
+            if (compiler->FindCxxDefaultCtor(typeName) == nullptr)
+            {
+                std::string ambiguityError;
+                if (compiler->CxxDefaultCtorAmbiguityError(typeName, ambiguityError))
+                    LogErrorContext(errCtx, ambiguityError);
+                LogErrorContext(errCtx, std::format("C++ class '{}' has no default constructor cflat can call",
+                    compiler->DisplayCxxClassName(typeName)));
+            }
+        }
         const auto returnOwnedTempMark = compiler->MarkOwnedTemps();
         // Evaluate via NV path so we can inspect bond info alongside ownership.
         LLVMBackend::NamedVariable returnNV;
@@ -672,6 +688,10 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
                     compiler->currentFunctionReturnTypeName);
                 if (ctor == nullptr)
                 {
+                    std::string ambiguityError;
+                    if (compiler->CxxDefaultCtorAmbiguityError(
+                            compiler->currentFunctionReturnTypeName, ambiguityError))
+                        LogErrorContext(errCtx, ambiguityError);
                     LogErrorContext(errCtx, ctorError.empty()
                         ? std::format("C++ class '{}' has no default constructor cflat can call",
                             compiler->DisplayCxxClassName(CurrentReturnTypeSpelling(compiler)))

@@ -1653,6 +1653,72 @@ namespace cppi_inh
         OperatorAmbiguous() = default;
         OperatorAmbiguous(int v) : value(v) {}
     };
+
+    // Inherited static DATA members with no library symbol: only the out-of-line DEFINITION is
+    // `inline`, or the storage is an implicit template instantiation. Nothing in the companion
+    // .cpp odr-uses them, so the request companion must emit them or the link fails.
+    struct DataGrand { static int K; };
+    inline int DataGrand::K = 17;
+    struct DataBase : DataGrand {};
+    struct DataDerived : DataBase {};
+    struct DataUsing : DataGrand { using DataGrand::K; };
+    struct DataConstGrand { static const int K; };
+    inline const int DataConstGrand::K = 21;
+    struct DataConstDerived : DataConstGrand {};
+    template <class T> struct DataTplBase { static int K; };
+    template <class T> int DataTplBase<T>::K = 9;
+    struct DataTplDerived : DataTplBase<int> {};
+    template <class T> struct DataTplInline { inline static int K = 10; };
+    struct DataTplInlineDerived : DataTplInline<int> {};
+    // Same shape at namespace scope: only the redeclaring definition is `inline`.
+    extern int DataNsRedecl;
+    inline int DataNsRedecl = 23;
+    // A public member of a private/protected base exists but is inaccessible.
+    struct DataViaPrivateBase : private DataGrand {};
+    struct StaticViaPrivateBase : private StaticGrand {};
+    struct StaticViaProtectedBase : protected StaticGrand {};
+
+    // Operator hiding past one level, `using` in a middle class, unary vs binary hiding, and an
+    // operator behind a private base.
+    struct OpBase
+    {
+        int value = 0;
+        OpBase() = default;
+        OpBase(int v) : value(v) {}
+        OpBase operator+(const OpBase& rhs) const { return OpBase(value + rhs.value); }
+        OpBase operator-() const { return OpBase(-value - 1000); }
+        OpBase operator-(const OpBase& rhs) const { return OpBase(value - rhs.value + 2000); }
+    };
+    struct OpMid : OpBase
+    {
+        OpMid() = default;
+        OpMid(int v) : OpBase(v) {}
+        OpMid operator+(int rhs) const { return OpMid(value + rhs + 100); }
+    };
+    struct OpLeaf : OpMid { OpLeaf() = default; OpLeaf(int v) : OpMid(v) {} };
+    struct OpMidUsing : OpBase
+    {
+        OpMidUsing() = default;
+        OpMidUsing(int v) : OpBase(v) {}
+        using OpBase::operator+;
+        OpMidUsing operator+(int rhs) const { return OpMidUsing(value + rhs + 300); }
+    };
+    struct OpLeafUsing : OpMidUsing { OpLeafUsing() = default; OpLeafUsing(int v) : OpMidUsing(v) {} };
+    struct OpHideBinary : OpBase
+    {
+        OpHideBinary() = default;
+        OpHideBinary(int v) : OpBase(v) {}
+        OpHideBinary operator-(int rhs) const { return OpHideBinary(value - rhs + 500); }
+    };
+    struct OpHideUnary : OpBase
+    {
+        OpHideUnary() = default;
+        OpHideUnary(int v) : OpBase(v) {}
+        OpHideUnary operator-() const { return OpHideUnary(-value - 700); }
+    };
+    struct OpPlain : OpBase { OpPlain() = default; OpPlain(int v) : OpBase(v) {} };
+    struct OpLeafPlain : OpPlain { OpLeafPlain() = default; OpLeafPlain(int v) : OpPlain(v) {} };
+    struct OpPrivate : private OpBase { OpPrivate() = default; OpPrivate(int v) : OpBase(v) {} };
 }
 
 // Eigen shape: a CRTP base whose operator+ and static return expression templates (with a user

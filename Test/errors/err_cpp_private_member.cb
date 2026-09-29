@@ -21,5 +21,15 @@ extern int main()
     expect_error("member 'K' of C++ class 'cppi_inh.StaticProtectedDerived' is protected") {
         cppi_inh.StaticProtectedDerived.K();
     }
+    // A PUBLIC member of a private/protected base: found, but inaccessible through that base.
+    expect_error("member 'K' of C++ class 'cppi_inh.StaticViaPrivateBase' is inaccessible: 'cppi_inh.StaticGrand' is a private base of 'cppi_inh.StaticViaPrivateBase'") {
+        cppi_inh.StaticViaPrivateBase.K();
+    }
+    expect_error("member 'K' of C++ class 'cppi_inh.StaticViaProtectedBase' is inaccessible: 'cppi_inh.StaticGrand' is a protected base of 'cppi_inh.StaticViaProtectedBase'") {
+        cppi_inh.StaticViaProtectedBase.K();
+    }
+    expect_error("member 'K' of C++ class 'cppi_inh.DataViaPrivateBase' is inaccessible: 'cppi_inh.DataGrand' is a private base of 'cppi_inh.DataViaPrivateBase'") {
+        int leak = cppi_inh.DataViaPrivateBase.K;
+    }
     return 0;
 }

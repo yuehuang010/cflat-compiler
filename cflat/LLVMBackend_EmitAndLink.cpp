@@ -2733,6 +2733,16 @@ void LLVMBackend::FinalizeGlobalConstructorOrder()
     llvm::appendToGlobalCtors(*module, driver, 65535);
 }
 
+// True when `type` is or contains a named (identified) struct type.
+static bool ContainsIdentifiedStruct(const llvm::Type* type)
+{
+    if (auto* st = llvm::dyn_cast<llvm::StructType>(type); st != nullptr && !st->isLiteral())
+        return true;
+    for (const llvm::Type* contained : type->subtypes())
+        if (ContainsIdentifiedStruct(contained)) return true;
+    return false;
+}
+
 /*
  * Link every C++ companion module into the main module, before optimization so the inline bodies
  * can inline into cflat call sites and so --out-lli, the native object, and --run all see the same
@@ -2747,20 +2757,33 @@ void LLVMBackend::FinalizeGlobalConstructorOrder()
  * kept every body cflat calls; the scratch module that collects the companions first names
  * nothing, so each linkonce definition is declared there ahead of its blob or the merge silently
  * drops it and a later blob's call to it stays unresolved.
+ *
+ * The placeholder must not name one of the source's identified struct types: both modules live
+ * in one LLVMContext, so it would put a SOURCE type into the destination, and IRMover requires
+ * the two type sets to be disjoint (a source struct of the same body maps onto it; Debug asserts
+ * "mapping to a source type", e.g. on `std::piecewise_construct`). The declaration is replaced
+ * by the definition the link brings over, so a neutral placeholder type changes nothing else.
  */
 static void DeclareLinkOnceDefinitions(llvm::Module& destination, const llvm::Module& source)
 {
+    auto& context = destination.getContext();
     for (const llvm::Function& f : source.functions())
         if (!f.isDeclaration() && f.hasLinkOnceLinkage()
             && destination.getNamedValue(f.getName()) == nullptr)
-            llvm::Function::Create(f.getFunctionType(), llvm::GlobalValue::ExternalLinkage,
-                                   f.getAddressSpace(), f.getName(), &destination);
+            llvm::Function::Create(ContainsIdentifiedStruct(f.getFunctionType())
+                                       ? llvm::FunctionType::get(llvm::Type::getVoidTy(context), false)
+                                       : f.getFunctionType(),
+                                   llvm::GlobalValue::ExternalLinkage, f.getAddressSpace(),
+                                   f.getName(), &destination);
     for (const llvm::GlobalVariable& gv : source.globals())
         if (!gv.isDeclaration() && gv.hasLinkOnceLinkage()
             && destination.getNamedValue(gv.getName()) == nullptr)
-            new llvm::GlobalVariable(destination, gv.getValueType(), gv.isConstant(),
-                                     llvm::GlobalValue::ExternalLinkage, nullptr, gv.getName(),
-                                     nullptr, gv.getThreadLocalMode(), gv.getAddressSpace());
+            new llvm::GlobalVariable(destination,
+                                     ContainsIdentifiedStruct(gv.getValueType())
+                                         ? llvm::Type::getInt8Ty(context) : gv.getValueType(),
+                                     gv.isConstant(), llvm::GlobalValue::ExternalLinkage, nullptr,
+                                     gv.getName(), nullptr, gv.getThreadLocalMode(),
+                                     gv.getAddressSpace());
 }
 
 static size_t CountDefinitions(const llvm::Module& m)

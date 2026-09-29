@@ -1,4 +1,4 @@
-# C++ constructor call arguments accept implicit narrowing (function calls refuse it)
+Bucket: C (ruling needed: scalar conversion table at C++ calls)
 
 Full mode (adds a rejection). `T(2.5)` into a C++ constructor taking `int` compiles and truncates;
 the same argument into a C++ free function taking `int` is refused ("no overload ... matches").
@@ -31,3 +31,7 @@ Apply the CFlat call-argument conversion rules (the ones `nar.take` uses) to C++
 overload selection, including template constructors after deduction. Accept-set first: every
 constructor call in `Test/` and `test_libs/` that passes an exact or widening argument must keep
 compiling. Native CFlat constructors: check whether they have the same hole and cover both.
+
+## 2026-09-28 C1 findings
+
+See `scratch/c1_matrix_r3.md` in the main checkout. Measured on all 160 cells: master constructor/free acceptance differs in 80/160 source/parameter/form cells. The free-function path refuses widening cells: `bool -> float/double` (variable and literal), `char -> float/double` (variable and literal), `short -> float/double` (variable and literal), `u8 -> float/double` (variable and literal), `u32 -> double` (variable and literal), and `int -> double` (variable and literal). Needs a maintainer ruling on the scalar conversion table at C++ call arguments (constructors + free functions) before any fix.

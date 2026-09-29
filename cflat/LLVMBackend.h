@@ -5769,6 +5769,20 @@ private:
     std::string CxxBraceElementSpelling(const CxxBraceArgument& brace,
                                         const std::string& targetParameter) const;
     std::string CxxBraceContainerElementSpelling(const std::string& parameter);
+    bool IsCxxScalarBraceElement(const std::string& element);
+    // The scalar E of a class parameter whose own std::initializer_list<E> constructor a braced
+    // list copy-list-initializes; empty unless exactly one such E is declared.
+    std::string CxxClassBraceListElement(const std::string& parameter);
+    // Stores a braced scalar list into a CALLER-frame `E[N]` (C++ keeps the list to the end of
+    // the caller's full-expression) and yields its data pointer as the thunk argument.
+    // False (with the C++ narrowing diagnostic) when a scalar element of the list narrows to
+    // `element`; true when it does not or the element is not a scalar.
+    bool CheckCxxBraceNarrowing(const CxxBraceArgument& brace, const std::string& element,
+                                const std::string& owner, const char* role, std::string& error);
+    bool EmitCxxBraceBacking(const CxxBraceArgument& brace, const TypeAndValue& elementType,
+                             llvm::Type* elementTy, const TypeAndValue& dataParameter,
+                             const std::string& owner, const char* role, NamedVariable& data,
+                             std::string& error);
     static void ExpandCxxBraceArguments(std::vector<NamedVariable>& arguments,
                                         const std::vector<CxxBraceArgument>& braceArguments);
     static void DiscardCxxBraceArguments(std::vector<NamedVariable>& arguments,
@@ -8411,6 +8425,8 @@ public:
      * RegisterCxxClassMembers refused, so the diagnostic says why instead of "unknown identifier".
      * Returns true when it reported; a name the class does not have is left alone.
      */
+    bool ReportCxxMemberThroughNonPublicBase(const std::string& typeName,
+                                             const std::string& memberName);
     bool RejectInaccessibleCxxMember(const std::string& typeName, const std::string& memberName,
                                      bool accessedThroughCurrentObject = false,
                                      bool deferElementCopySink = false);
@@ -8679,6 +8695,9 @@ public:
         return info != nullptr && info->hasDtor && !info->destructor.linkageName.empty();
     }
     const CxxClassInfo::Structor* FindCxxDefaultCtor(const std::string& typeName) const;
+    bool HasNonPublicCxxDefaultCtor(const std::string& typeName) const;
+    bool CxxDefaultCtorAmbiguous(const std::string& typeName) const;
+    bool CxxDefaultCtorAmbiguityError(const std::string& typeName, std::string& error);
     const CxxClassInfo::Structor* FindCxxCopyCtor(const std::string& typeName) const;
     const CxxClassInfo::Structor* FindCxxMoveCtor(const std::string& typeName) const;
     const CxxClassInfo::Structor* TryBindCxxGeneratedMoveCtor(const std::string& typeName);
@@ -10505,7 +10524,8 @@ public:
     // 117: demand-group entries carry no bitcode; the group companion is cached per demand.
     // 119: group header parse defers inline non-template bodies; fewer incidental instantiations.
     // 124: demand entries store their request chunks (header wrapper batch included) for replay.
-    static constexpr int kCHeaderCacheVersion = 126;
+    // 127: out-of-line inline and implicit-template static data members emit into the companion.
+    static constexpr int kCHeaderCacheVersion = 127;
     static std::string CompilerBuildStamp();
 
     static std::string GetCHeaderCacheDir();

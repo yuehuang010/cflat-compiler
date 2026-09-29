@@ -1281,6 +1281,10 @@ extern int main()
     // #pragma pack(2) is representable (packed layout), so the record binds with clang's size.
     if ((int)sizeof(cppi.NuaPackedGuard) != 6 || (int)alignof(cppi.NuaPackedGuard) != 2) return 3999;
 
+    cppexp.InheritedDefault inheritedDefault = default;
+    if (inheritedDefault.v != 25 || inheritedDefault.w != 3
+        || inheritedDefault.v + inheritedDefault.w != 28) return 3621;
+
     // ---- C++ exceptions at the program boundary -------------------------------------------------
     // Win64 keeps the existing SEH trampoline and does not emit the C++ guard.
     if const (__WINDOWS__) {
@@ -3970,6 +3974,63 @@ extern int main()
     if (brcTplU.probe() != 51)                                             return 7167;
     cppcr.BrcTpl<long> brcTplD = cppcr.BrcTpl<long>(1, {brcD, 2.5});
     if (brcTplD.probe() != 22)                                             return 7168;
+    // The remaining shapes are caller-backed too (clang values below). An inherited list ctor
+    // (`using Base::Base`) already took the backed path (63, 52).
+    if (cppcr.brc_il(cppcr.BrcIlInh({4, 9, 6})) != 63)                      return 7169;
+    if (cppcr.BrcTplInh<long>({brcA, brcB}).probe() != 52)                  return 7170;
+    // A list reaching a CLASS parameter through that class's own initializer_list ctor: the
+    // thunk built the view's list itself, so the kept view read -7 garbage (32, 73, 152, 52).
+    // 7172 also pins the mixed `{long, long, int}` list, refused before as "one type".
+    int brcOwnerMade = cppcr.brc_owner_made;
+    int brcOwnerGone = cppcr.brc_owner_gone;
+    if (cppcr.BrcOwner({2, 3}).probe() != 32)                               return 7171;
+    if (cppcr.BrcOwner({brcA, brcB, 7}).probe() != 73)                      return 7172;
+    if (cppcr.BrcOwnerA(1, {brcA, brcB}).probe() != 152)                    return 7173;
+    {
+        cppcr.BrcOwner brcOwnDecl = cppcr.BrcOwner({brcA, brcB});
+        if (brcOwnDecl.probe() != 52)                                      return 7174;
+    }
+    // Each owner constructed once and destroyed once (clang: 2 made, 2 gone for 7171-7172).
+    if (cppcr.brc_owner_made - brcOwnerMade != 3
+        || cppcr.brc_owner_gone - brcOwnerGone != 3)                       return 7185;
+    // Function-call lists whose view the callee returns or keeps (clang: 32 42 46 35 35 93 12);
+    // the brace wrapper built them inside its thunk. 7176 is the mixed `{v, v + 1}` list.
+    if (cppcr.brc_read(cppcr.brc_keep({2, 3})) != 32)                       return 7175;
+    if (cppcr.brc_read_a(cppcr.brc_keep_a({brcA, brcA + 1})) != 42)         return 7176;
+    if (cppcr.brc_read_p(cppcr.brc_first({4, 6})) != 46)                    return 7177;
+    if (cppcr.brc_read_p(cppcr.brc_first_r({brcA, brcB})) != 35)            return 7178;
+    if (cppcr.brc_read_p(cppcr.brc_first_rr({brcA, brcB})) != 35)           return 7179;
+    cppcr.BrcKeeper brcKeeper = cppcr.BrcKeeper(0);
+    brcKeeper.set({brcA, brcB, 9});
+    if (brcKeeper.probe() != 93)                                           return 7180;
+    if (cppcr.brc_read_a(cppcr.BrcKeeper.skeep({6, 1})) != 12)              return 7181;
+    // An `initializer_list&&` constructor binds the backed list (clang: 35); it was refused.
+    if (cppcr.BrcOwnerR({brcA, brcB}).probe() != 35)                        return 7182;
+    // A non-type (K) or pack ctor template beside the list ctors is ranked (clang: 1, 2 1); the
+    // selector spelled `value-parameter-0-0` / skipped the pack and refused both.
+    if (cppcr.BrcNt<long>(1, {2, 3}).which != 1)                            return 7183;
+    if (cppcr.BrcPack<long>({brcA, brcB}).which != 2
+        || cppcr.BrcPack<long>({2.5, 1.5}).which != 1)                      return 7184;
+    // Integer literals into a backed double list, and a copying list (clang: 12, 23).
+    if (cppcr.brc_ild_sum({1, 2}) != 12.0 || cppcr.brc_vec({2, 3}) != 23)   return 7186;
+    // Brace backing in loop and ternary control flow stays in the caller entry block. The nested
+    // call keeps the view and clobbers its own frame before reading (clang: 156, 32, 42).
+    long brcLoopBacking = 0;
+    for (long brcI = 1; brcI <= 3; brcI += 1)
+        brcLoopBacking += cppcr.brc_read_a(cppcr.brc_keep_a({brcA + brcI, brcB}));
+    if (brcLoopBacking != 156)                                             return 7187;
+    long brcTernaryThen = 1 ? cppcr.brc_read_a(cppcr.brc_keep_a({2, 3}))
+                            : cppcr.brc_read_a(cppcr.brc_keep_a({4, 4}));
+    long brcTernaryElse = 0 ? cppcr.brc_read_a(cppcr.brc_keep_a({2, 3}))
+                            : cppcr.brc_read_a(cppcr.brc_keep_a({4, 4}));
+    if (brcTernaryThen != 32 || brcTernaryElse != 42)                     return 7188;
+    if (cppcr.brc_two_sum({1, 2}, {3, 4}) != 1234)                         return 7189;
+    // Different class list targets collide as cache neighbours; clang: 225 in either order.
+    if (cppcr.brc_two_diff({1, 2}, {1.5, 2.5}) != 225)                    return 7190;
+    if (cppcr.brc_two_diff_rev({1.5, 2.5}, {1, 2}) != 225)                return 7191;
+    // Same class template with different arguments; clang: 1217 in either order.
+    if (cppcr.brc_two_tpl({1, 2}, {1.5, 2.5}) != 1217)                    return 7192;
+    if (cppcr.brc_two_tpl_rev({1.5, 2.5}, {1, 2}) != 1217)                return 7193;
 
     // A C++ reference RETURN binds a CFlat pointer with no '&': the call's result already IS the
     // referent's address. 1970-1972 (no '&') failed to COMPILE before, with a message that printed
@@ -4410,7 +4471,12 @@ extern int main()
     // A declared `operator=(int)` wins over building ConvDirect(int) (via 3, not 2).
     cppexp.ConvDirect convD = default;
     convD = 7;
-    if (convD.v != 7 || convD.via != 3)                                        return 2236;
+    if (convD.v != 7 || convD.via != 3 || convD.calls != 1)                    return 2236;
+    // Both shapes of the kept direct call (Debug asserted in getTerminator on each): the
+    // invoke above splits its block, a noexcept operator=(int) stays straight-line.
+    cppexp.ConvDirectNx convDn = default;
+    convDn = 8;
+    if (convDn.v != 8 || convDn.via != 3 || convDn.calls != 1)                 return 22361;
     // Assignment: temp ctor + move assign (20000 + 5), temp destroyed at the statement end.
     cppexp.conv_reset();
     { cppexp.ConvCnt convA = default; convA = 5; convOut = convA.v; }
@@ -7309,6 +7375,69 @@ extern int main()
     usingB.value = 3;
     cppi_inh.OperatorNameHidingBase usingSum = usingA + usingB;
     if (usingSum.value != 5) return 7242;
+    // Inherited static data members whose storage only the companion can emit.
+    if (cppi_inh.DataDerived.K != 17 || cppi_inh.DataBase.K != 17) return 7243;
+    if (cppi_inh.DataUsing.K != 17) return 7244;
+    cppi_inh.DataDerived.K = 30;
+    if (cppi_inh.DataGrand.K != 30) return 7245;
+    int* inhDataPtr = &cppi_inh.DataBase.K;
+    *inhDataPtr = 31;
+    if (cppi_inh.DataGrand.K != 31) return 7246;
+    if (cppi_inh.DataConstDerived.K != 21) return 7247;
+    if (cppi_inh.DataTplDerived.K != 9) return 7248;
+    cppi_inh.DataTplDerived.K = 12;
+    if (cppi_inh.DataTplBase<int>.K != 12) return 7249;
+    if (cppi_inh.DataTplInlineDerived.K != 10) return 7250;
+    if (cppi_inh.DataNsRedecl != 23) return 7258;
+    // Operators (clang++ oracle values): the nearest declaration hides, `using` re-exposes.
+    cppi_inh.OpLeaf opLeaf = cppi_inh.OpLeaf(2);
+    cppi_inh.OpMid opLeafSum = opLeaf + 5;
+    if (opLeafSum.value != 107) return 7251;
+    cppi_inh.OpLeafUsing opUsingA = cppi_inh.OpLeafUsing(2);
+    cppi_inh.OpLeafUsing opUsingB = cppi_inh.OpLeafUsing(3);
+    cppi_inh.OpBase opUsingSum = opUsingA + opUsingB;
+    if (opUsingSum.value != 5) return 7252;
+    cppi_inh.OpMidUsing opUsingInt = opUsingA + 5;
+    if (opUsingInt.value != 307) return 7253;
+    cppi_inh.OpHideBinary opHideBinary = cppi_inh.OpHideBinary(4);
+    cppi_inh.OpHideBinary opHideBinaryDiff = opHideBinary - 1;
+    if (opHideBinaryDiff.value != 503) return 7254;
+    cppi_inh.OpHideUnary opHideUnary = cppi_inh.OpHideUnary(4);
+    cppi_inh.OpHideUnary opHideUnaryNeg = -opHideUnary;
+    if (opHideUnaryNeg.value != -704) return 7255;
+    cppi_inh.OpLeafPlain opPlain = cppi_inh.OpLeafPlain(4);
+    cppi_inh.OpLeafPlain opPlainB = cppi_inh.OpLeafPlain(1);
+    cppi_inh.OpBase opPlainNeg = -opPlain;
+    if (opPlainNeg.value != -1004) return 7256;
+    cppi_inh.OpBase opPlainDiff = opPlain - opPlainB;
+    if (opPlainDiff.value != 2003) return 7257;
+    expect_error("no overload of 'operator+' matches the given arguments") {
+        cppi_inh.OpLeaf hiddenA = cppi_inh.OpLeaf(1);
+        cppi_inh.OpLeaf hiddenB = cppi_inh.OpLeaf(2);
+        cppi_inh.OpBase hiddenSum = hiddenA + hiddenB;
+    }
+    expect_error("no overload of 'operator-' matches the given arguments") {
+        cppi_inh.OpHideBinary hiddenUnary = cppi_inh.OpHideBinary(1);
+        cppi_inh.OpBase hiddenNeg = -hiddenUnary;
+    }
+    expect_error("no overload of 'operator-' matches the given arguments") {
+        cppi_inh.OpHideUnary hiddenBinaryA = cppi_inh.OpHideUnary(1);
+        cppi_inh.OpHideUnary hiddenBinaryB = cppi_inh.OpHideUnary(2);
+        cppi_inh.OpBase hiddenDiff = hiddenBinaryA - hiddenBinaryB;
+    }
+    expect_error("no operator '+' for type 'cppi_inh.OpPrivate'") {
+        cppi_inh.OpPrivate privateA = cppi_inh.OpPrivate(1);
+        cppi_inh.OpPrivate privateB = cppi_inh.OpPrivate(2);
+        cppi_inh.OpPrivate privateSum = privateA + privateB;
+    }
+    expect_error("no operator '-' for type 'cppi_inh.OpPrivate'") {
+        cppi_inh.OpPrivate privateNeg = cppi_inh.OpPrivate(1);
+        cppi_inh.OpPrivate privateNegated = -privateNeg;
+    }
+    expect_error("no operator '~' for type 'cppi_inh.OpPrivate'") {
+        cppi_inh.OpPrivate privateCompl = cppi_inh.OpPrivate(1);
+        cppi_inh.OpPrivate privateComplemented = ~privateCompl;
+    }
     // Eigen shape: an expression template reaches a `const VecBase<D>&` constructor template.
     cppi_expr.Vec3 exprOnes = cppi_expr.Vec3.Ones();
     if (exprOnes.sum() != 3.0) return 7460;

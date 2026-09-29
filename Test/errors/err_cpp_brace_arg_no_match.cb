@@ -18,3 +18,43 @@ expect_error("brace-list element 1 of 'cppcr.BrcIlD' narrows to the C++ construc
         return d.d[0];
     }
 }
+
+// A function-call list backed in the caller frame obeys the same rule (clang: double -> long).
+expect_error("brace-list element 2 of 'cppcr.brc_keep' narrows to the C++ parameter's 'long'") {
+    long narrow_call_probe(long a)
+    {
+        return cppcr.brc_keep({a, 2.5}).n;
+    }
+}
+
+// A copying (non-backed) list names the element and target too; it read "no overload ... matches".
+expect_error("brace-list element 1 of 'cppcr.brc_vec' narrows to the C++ parameter's 'int'") {
+    long narrow_copy_probe(long a)
+    {
+        return cppcr.brc_vec({a, 2});
+    }
+}
+
+// Same-width unsigned -> int is narrowing in a C++ list (clang rejects it too).
+expect_error("brace-list element 1 of 'cppcr.brc_vec' narrows to the C++ parameter's 'int'") {
+    long narrow_unsigned_probe(uint u)
+    {
+        return cppcr.brc_vec({u, 2});
+    }
+}
+
+// C++ never deduces a template parameter from a default argument (clang: no viable constructor).
+expect_error("no C++ constructor of 'cppcr.BrcDfOnly<long>' accepts this brace list: a template parameter named only by a default argument is never deduced") {
+    int default_deduce_probe()
+    {
+        return cppcr.BrcDfOnly<long>({2, 3}).which;
+    }
+}
+
+// An argument reaching a constructor's parameter pack is not mirrored in the overload selector.
+expect_error("a C++ constructor of 'cppcr.BrcPack<long>' passes an argument into a parameter pack beside its brace-list constructors") {
+    int pack_argument_probe()
+    {
+        return cppcr.BrcPack<long>({2, 3}, 5).which;
+    }
+}

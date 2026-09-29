@@ -650,6 +650,44 @@ namespace
             }
         };
 
+        /*
+         * clang's late-parse entry resets CurContext to ASTContext's TU, which in the Interpreter
+         * is the NEWEST partial TU, then re-pushes the body's lexical scopes outermost first. A
+         * scope opened in an older chunk hangs off that chunk's TU, so the first push is out of
+         * order. For the parse, the outermost scope is re-homed to the current TU; both TUs share
+         * one primary context, and lookup walks semantic parents, so only the push check sees it.
+         */
+        struct LexicalTuRehome
+        {
+            clang::Decl* outer = nullptr;
+            clang::DeclContext* writtenTU = nullptr;
+            bool wasSemantic = false;
+            clang::Decl::ModuleOwnershipKind ownership{};
+
+            LexicalTuRehome(clang::FunctionDecl* fd, clang::DeclContext* currentTU)
+            {
+                clang::Decl* top = nullptr;
+                for (clang::DeclContext* dc = fd->getLexicalDeclContext();
+                     dc != nullptr && !dc->isTranslationUnit(); dc = dc->getLexicalParent())
+                    top = clang::Decl::castFromDeclContext(dc);
+                if (top == nullptr || top->getLexicalDeclContext() == currentTU) return;
+                outer = top;
+                writtenTU = top->getLexicalDeclContext();
+                wasSemantic = top->getDeclContext() == writtenTU;
+                ownership = top->getModuleOwnershipKind();
+                outer->setLexicalDeclContext(currentTU);
+            }
+            ~LexicalTuRehome()
+            {
+                if (outer == nullptr) return;
+                // setDeclContext drops the lexical/semantic split the re-home allocated.
+                if (wasSemantic) outer->setDeclContext(writtenTU);
+                else outer->setLexicalDeclContext(writtenTU);
+                if (outer->getModuleOwnershipKind() != ownership)
+                    outer->setModuleOwnershipKind(ownership);
+            }
+        };
+
         // Parse one skipped body where it was written (clang's MS late-parse entry re-enters
         // its lexical scopes). A body that does not compile leaves `fd` declared only.
         bool ParseOne(clang::FunctionDecl* fd, std::string& failure)
@@ -674,7 +712,14 @@ namespace
             clang::DiagnosticErrorTrap trap(sema->getDiagnostics());
             fd->setHasSkippedBody(false);
             fd->setLateTemplateParsed(true);
-            AccessPrivate(ParserLateParseTag{})(parser, late);
+            // A namespace-scope body was skipped after ActOnStartOfFunctionDef added the params to
+            // fd; the late parse re-adds them, so take them out first (else the decl list cycles).
+            for (clang::ParmVarDecl* param : fd->parameters())
+                if (fd->containsDecl(param)) fd->removeDecl(param);
+            {
+                LexicalTuRehome rehome(fd, sema->getASTContext().getTranslationUnitDecl());
+                AccessPrivate(ParserLateParseTag{})(parser, late);
+            }
             sema->PerformPendingInstantiations();
             fd->setLateTemplateParsed(false);
             if (!trap.hasErrorOccurred() && fd->getBody() != nullptr) return true;

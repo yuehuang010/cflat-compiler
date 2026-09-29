@@ -2691,7 +2691,8 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                 candidateSet = &receiverMemberCandidates;
         }
         std::vector<FunctionSymbol> cxxOperatorCandidates;
-        if (functionName.starts_with("operator") && arguments.size() >= 2
+        // Unary operators too: a derived `operator-(int)` hides the base's unary `operator-()`.
+        if (functionName.starts_with("operator") && !arguments.empty()
             && !arguments.front().TypeAndValue.TypeName.empty())
         {
             const std::string& operatorReceiver = arguments.front().TypeAndValue.TypeName;

@@ -406,3 +406,113 @@ __attribute__((noinline)) inline long brc_two(BrcTwo a)
     return a.d[0] * 10 + a.d[1] + a.k;
 }
 }
+
+// The same caller-frame backing for the remaining shapes (2026-09-28): a list reaching a CLASS
+// parameter through that class's own initializer_list<E> constructor (an ArrayRef-like view), a
+// function-call list whose view the callee returns or keeps, and an inherited list constructor.
+// Each reader overwrites its own frame first, so a list built inside the thunk reads -7 garbage.
+#include <type_traits>
+#define CPPCR_BRC_CLOBBER volatile long junk[128]; for (int i = 0; i < 128; ++i) junk[i] = -7
+namespace cppcr {
+inline int brc_owner_made = 0;
+inline int brc_owner_gone = 0;
+struct BrcIlInh : BrcIl { using BrcIl::BrcIl; };
+template <class T> struct BrcTplBase {
+    const T* d; size_t n;
+    BrcTplBase(std::initializer_list<T> l) : d(l.begin()), n(l.size()) {}
+    ~BrcTplBase() {}
+    __attribute__((noinline)) long probe() const { CPPCR_BRC_CLOBBER; return (long)d[n - 1] * 10 + (long)n; }
+};
+template <class T> struct BrcTplInh : BrcTplBase<T> { using BrcTplBase<T>::BrcTplBase; };
+struct BrcRef {
+    const long* d; size_t n;
+    BrcRef(std::initializer_list<long> l) : d(l.begin()), n(l.size()) {}
+    BrcRef(const long* p, size_t c) : d(p), n(c) {}
+};
+template <class T> struct BrcArrayRef {
+    const T* d; size_t n;
+    BrcArrayRef(std::initializer_list<T> l) : d(l.begin()), n(l.size()) {}
+    BrcArrayRef(const T* p, size_t c) : d(p), n(c) {}
+};
+// Copies its list: a non-backed target, where only the narrowing rule applies.
+template <class T> struct BrcVector {
+    T a[4]; size_t n;
+    BrcVector(std::initializer_list<T> l) : n(l.size()) { for (size_t i = 0; i < n; ++i) a[i] = l.begin()[i]; }
+};
+struct BrcOwner {
+    BrcRef r;
+    BrcOwner(BrcRef r_) : r(r_) { ++brc_owner_made; }
+    BrcOwner(const BrcOwner& o) : r(o.r) { ++brc_owner_made; }
+    ~BrcOwner() { ++brc_owner_gone; }
+    __attribute__((noinline)) long probe() const { CPPCR_BRC_CLOBBER; return r.d[r.n - 1] * 10 + (long)r.n; }
+};
+struct BrcOwnerA {
+    BrcArrayRef<long> r; int k;
+    BrcOwnerA(int k_, BrcArrayRef<long> r_) : r(r_), k(k_) {}
+    ~BrcOwnerA() {}
+    __attribute__((noinline)) long probe() const { CPPCR_BRC_CLOBBER; return r.d[r.n - 1] * 10 + (long)r.n + k * 100; }
+};
+struct BrcOwnerR {
+    const long* p;
+    BrcOwnerR(std::initializer_list<long>&& l) : p(l.begin()) {}
+    ~BrcOwnerR() {}
+    __attribute__((noinline)) long probe() const { CPPCR_BRC_CLOBBER; return p[0] * 10 + p[1]; }
+};
+inline BrcRef brc_keep(BrcRef r) { return r; }
+inline BrcArrayRef<long> brc_keep_a(BrcArrayRef<long> r) { return r; }
+inline const long* brc_first(std::initializer_list<long> l) { return l.begin(); }
+inline const long* brc_first_r(const std::initializer_list<long>& l) { return l.begin(); }
+inline const long* brc_first_rr(std::initializer_list<long>&& l) { return l.begin(); }
+inline double brc_ild_sum(std::initializer_list<double> l) { return *l.begin() * 10 + *(l.end() - 1); }
+inline long brc_vec(BrcVector<int> v) { return v.a[0] * 10 + v.a[v.n - 1]; }
+__attribute__((noinline)) inline long brc_read(BrcRef r) { CPPCR_BRC_CLOBBER; return r.d[r.n - 1] * 10 + (long)r.n; }
+__attribute__((noinline)) inline long brc_read_a(BrcArrayRef<long> r) { CPPCR_BRC_CLOBBER; return r.d[r.n - 1] * 10 + (long)r.n; }
+__attribute__((noinline)) inline long brc_read_p(const long* p) { CPPCR_BRC_CLOBBER; return p[0] * 10 + p[1]; }
+__attribute__((noinline)) inline long brc_two_sum(BrcRef a, BrcRef b) {
+    CPPCR_BRC_CLOBBER;
+    return (a.d[0] * 10 + a.d[1]) * 100 + b.d[0] * 10 + b.d[1];
+}
+__attribute__((noinline)) inline long brc_two_diff(BrcIl a, BrcIlD b) {
+    CPPCR_BRC_CLOBBER;
+    return a.d[1] * 100 + (long)(b.d[1] * 10);
+}
+__attribute__((noinline)) inline long brc_two_diff_rev(BrcIlD a, BrcIl b) {
+    CPPCR_BRC_CLOBBER;
+    return b.d[1] * 100 + (long)(a.d[1] * 10);
+}
+__attribute__((noinline)) inline long brc_two_tpl(BrcArrayRef<int> a, BrcArrayRef<double> b) {
+    CPPCR_BRC_CLOBBER;
+    return (a.d[0] * 10 + a.d[1]) * 100 + (long)(b.d[0] * 10 + b.d[1]);
+}
+__attribute__((noinline)) inline long brc_two_tpl_rev(BrcArrayRef<double> a, BrcArrayRef<int> b) {
+    CPPCR_BRC_CLOBBER;
+    return (b.d[0] * 10 + b.d[1]) * 100 + (long)(a.d[0] * 10 + a.d[1]);
+}
+struct BrcKeeper {
+    BrcArrayRef<long> kept{nullptr, 0};
+    BrcKeeper(int) {}
+    void set(BrcArrayRef<long> r) { kept = r; }
+    __attribute__((noinline)) long probe() const { CPPCR_BRC_CLOBBER; return kept.d[kept.n - 1] * 10 + (long)kept.n; }
+    static BrcArrayRef<long> skeep(BrcArrayRef<long> r) { return r; }
+};
+// A constructor template with a NON-TYPE parameter, and one with a trailing parameter pack,
+// beside the list constructors: both are ranked by the selector as clang ranks them.
+template <class T> struct BrcNt {
+    int which;
+    BrcNt(int, std::initializer_list<T>) : which(1) {}
+    template <int K> BrcNt(std::integral_constant<int, K>, std::initializer_list<T>) : which(K) {}
+    ~BrcNt() {}
+};
+template <class T> struct BrcPack {
+    int which;
+    BrcPack(std::initializer_list<double>) : which(1) {}
+    template <class... A> BrcPack(std::initializer_list<T>, A...) : which(2) {}
+    ~BrcPack() {}
+};
+template <class T> struct BrcDfOnly {
+    int which;
+    template <class U> BrcDfOnly(std::initializer_list<T>, U = U()) : which(2) {}
+    ~BrcDfOnly() {}
+};
+inline int brc_use(BrcTplInh<long>*, BrcNt<long>*, BrcPack<long>*, BrcDfOnly<long>*) { return 0; }
+}

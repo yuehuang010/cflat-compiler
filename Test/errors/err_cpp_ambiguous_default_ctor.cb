@@ -1,0 +1,62 @@
+import cpp "cpp_interop_explicit.h";
+
+extern int main()
+{
+    expect_error("C++ class 'cppexp.AmbiguousDefault' has ambiguous default construction") {
+        cppexp.AmbiguousDefault value = default;
+        if (value.v != 0) return 1;
+    }
+    expect_error("C++ class 'cppexp.AmbiguousDefault' has ambiguous default construction") {
+        cppexp.AmbiguousDefault[2] values = default;
+        if (values[0].v != 0) return 2;
+    }
+    expect_error("C++ class 'cppexp.AmbiguousDefault' has ambiguous default construction") {
+        cppexp.AmbiguousDefault value = {};
+        if (value.v != 0) return 3;
+    }
+    expect_error("C++ class 'cppexp.AmbiguousDefault' has ambiguous default construction") {
+        cppexp.AmbiguousDefault value {};
+        if (value.v != 0) return 4;
+    }
+    expect_error("C++ class 'cppexp.AmbiguousDefault' has ambiguous default construction") {
+        cppexp.AmbiguousDefault value;
+        if (value.v != 0) return 5;
+    }
+    expect_error("C++ class 'cppexp.AmbiguousDefault' has ambiguous default construction") {
+        auto value = new cppexp.AmbiguousDefault();
+        return value.v;
+    }
+    expect_error("C++ class 'cppexp.AmbiguousDefault' has ambiguous default construction") {
+        auto value = new cppexp.AmbiguousDefault;
+        return value.v;
+    }
+    expect_error("C++ class 'cppexp.AmbiguousDefault' has ambiguous default construction") {
+        cppexp.AmbiguousDefault target = {v = 10};
+        target = default;
+        return target.v;
+    }
+    return 0;
+}
+
+expect_error("C++ class 'cppexp.AmbiguousDefault' has ambiguous default construction") {
+    cppexp.AmbiguousDefault makeAmbiguousDefault() { return default; }
+}
+
+expect_error("C++ class 'cppexp.AmbiguousDefault' has ambiguous default construction") {
+    struct AmbiguousFieldHolder { cppexp.AmbiguousDefault value = default; };
+    int makeAmbiguousFieldHolder() {
+        AmbiguousFieldHolder holder = default;
+        return holder.value.v;
+    }
+}
+
+expect_error("C++ class 'cppexp.AmbiguousDefault' has ambiguous default construction") {
+    extern int makeAmbiguousArray() {
+        cppexp.AmbiguousDefault[2] values = {};
+        return values[0].v;
+    }
+}
+
+expect_error("C++ class 'cppexp.AmbiguousDefault' has ambiguous default construction") {
+    cppexp.AmbiguousDefault[2] globalValues = {};
+}

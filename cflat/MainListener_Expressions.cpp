@@ -1708,6 +1708,28 @@ llvm::Value* MainListener::ParseAssignmentExpression(
             auto namedVar = ParseUnaryExpression(unaryCtx);
             auto destination = namedVar.Storage;
 
+            // `value = default` default-constructs a C++ temporary even when this class does not
+            // enter the nontrivial special-member assignment path below.
+            auto* assignedExpr = ctx->assignmentExpression();
+            if (operatorText == "=" && assignedExpr != nullptr
+                && assignedExpr->getText() == "default"
+                && !namedVar.TypeAndValue.Pointer
+                && compiler->IsCxxRecord(namedVar.TypeAndValue.TypeName))
+            {
+                const auto& typeName = namedVar.TypeAndValue.TypeName;
+                std::string defaultCtorError;
+                compiler->TryBindCxxImplicitDefaultCtor(typeName, defaultCtorError);
+                if (!defaultCtorError.empty()) LogErrorContext(ctx, defaultCtorError);
+                if (compiler->FindCxxDefaultCtor(typeName) == nullptr)
+                {
+                    std::string ambiguityError;
+                    if (compiler->CxxDefaultCtorAmbiguityError(typeName, ambiguityError))
+                        LogErrorContext(ctx, ambiguityError);
+                    LogErrorContext(ctx, std::format("C++ class '{}' has no default constructor cflat can call",
+                        compiler->DisplayCxxClassName(typeName)));
+                }
+            }
+
             // An imported C++ call may already have an sret slot for its prvalue. Route every
             // such assignment before the ordinary lvalue and special-member assignment paths.
             const std::string prvalueTypeName = namedVar.TypeAndValue.TypeName;
@@ -1931,9 +1953,14 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                         if (!defaultError.empty()) LogErrorContext(ctx, defaultError);
                         const auto* ctor = compiler->FindCxxDefaultCtor(tn);
                         if (ctor == nullptr)
+                        {
+                            std::string ambiguityError;
+                            if (compiler->CxxDefaultCtorAmbiguityError(tn, ambiguityError))
+                                LogErrorContext(ctx, ambiguityError);
                             LogErrorContext(ctx, std::format(
                                 "C++ class '{}' has no default constructor cflat can call",
                                 compiler->DisplayCxxClassName(tn)));
+                        }
                         forcedTemp = compiler->AllocaAtEntry(
                             compiler->GetType(tempType), nullptr, "cxx.assign.temp",
                             namedVar.TypeAndValue.AllocAlignValue);
@@ -10552,6 +10579,21 @@ llvm::Value* MainListener::TryUnaryOperatorOverload(
         }
     }
 
+// A first-class struct operand with no operator overload cannot be negated or complemented:
+// report it instead of emitting integer IR on a struct (a module verification failure).
+bool MainListener::ReportMissingUnaryStructOperator(antlr4::ParserRuleContext* ctx,
+                                                    llvm::Value* operand, const std::string& op)
+{
+        if (operand == nullptr || !operand->getType()->isStructTy()) return false;
+        auto* structTy = llvm::cast<llvm::StructType>(operand->getType());
+        std::string typeName = structTy->hasName() ? structTy->getName().str() : std::string();
+        std::string shown = typeName.empty() ? std::string() : SpellType(*Compiler(ctx),
+            LLVMBackend::TypeAndValue{ .TypeName = typeName });
+        if (shown.empty()) shown = typeName;
+        LogErrorContext(ctx, std::format("no operator '{}' for type '{}'", op, shown));
+        return true;
+    }
+
 void MainListener::TrackOwnedStringOperatorResult(LLVMBackend* compiler, llvm::Value* result) {
         if (result == nullptr || !compiler->lastCallReturnsOwned) return;
         auto* strTy = llvm::StructType::getTypeByName(*compiler->context, "string");
@@ -13121,6 +13163,8 @@ LLVMBackend::NamedVariable MainListener::ParseUnaryExpressionImpl(CFlatParser::U
                     namedVar.TypeAndValue = compiler->lastCallReturnType;
                     namedVar.Storage = nullptr;
                 }
+                else if (ReportMissingUnaryStructOperator(ctx, newValue, "-"))
+                    return namedVar;
                 else if (PromoteNarrowUnaryOperand(compiler, newValue, namedVar))
                 {
                     namedVar.Primary = compiler->CreateNeg(newValue);
@@ -13177,6 +13221,8 @@ LLVMBackend::NamedVariable MainListener::ParseUnaryExpressionImpl(CFlatParser::U
                     namedVar.Primary = overload;
                     namedVar.TypeAndValue = compiler->lastCallReturnType;
                 }
+                else if (ReportMissingUnaryStructOperator(ctx, newValue, "~"))
+                    return namedVar;
                 else
                 {
                     PromoteNarrowUnaryOperand(compiler, newValue, namedVar);
@@ -13901,7 +13947,8 @@ llvm::Value* MainListener::TryDirectCxxAssignOperator(
             }
             compiler->suppressErrors_ = savedSuppress;
             const auto created = createdBlocks();
-            if (created.size() == 1 && scratch->getTerminator() == nullptr)
+            // getTerminator() asserts on an open block; these ask whether one is still open.
+            if (created.size() == 1 && cflat_llvm::GetTerminatorOrNull(scratch) == nullptr)
             {
                 // One straight-line block: move its instructions to the insertion point.
                 origin->splice(savedIP.getPoint(), scratch);
@@ -13909,7 +13956,8 @@ llvm::Value* MainListener::TryDirectCxxAssignOperator(
                 compiler->builder->restoreIP(savedIP);
                 return result;
             }
-            if (savedIP.getPoint() == origin->end() && origin->getTerminator() == nullptr)
+            if (savedIP.getPoint() == origin->end()
+                && cflat_llvm::GetTerminatorOrNull(origin) == nullptr)
             {
                 // The call split its block: enter it from the insertion point, stay at its end.
                 llvm::BranchInst::Create(scratch, origin);
@@ -16161,6 +16209,21 @@ void MainListener::EmitGlobalFixedArrayInit(
 
         if (emptyInit)
         {
+            if (compiler->IsCxxRecord(tv.TypeName))
+            {
+                std::string ctorError;
+                compiler->TryBindCxxImplicitDefaultCtor(tv.TypeName, ctorError);
+                if (!ctorError.empty()) LogErrorContext(errCtx, ctorError);
+                if (compiler->FindCxxDefaultCtor(tv.TypeName) == nullptr)
+                {
+                    std::string ambiguityError;
+                    if (compiler->CxxDefaultCtorAmbiguityError(tv.TypeName, ambiguityError))
+                        LogErrorContext(errCtx, ambiguityError);
+                    LogErrorContext(errCtx, std::format(
+                        "C++ class '{}' has no default constructor cflat can call",
+                        compiler->DisplayCxxClassName(tv.TypeName)));
+                }
+            }
             // Empty `{}` -> zero-init, same as `= default`.
             arrConst = llvm::Constant::getNullValue(arrTy);
         }
@@ -16906,6 +16969,15 @@ LLVMBackend::NamedVariable MainListener::ParseNewExpression(CFlatParser::NewExpr
             {
                 std::string defaultCtorError;
                 compiler->TryBindCxxImplicitDefaultCtor(typeName, defaultCtorError);
+                if (!defaultCtorError.empty()) LogErrorContext(ctx, defaultCtorError);
+                if (compiler->FindCxxDefaultCtor(typeName) == nullptr)
+                {
+                    std::string ambiguityError;
+                    if (compiler->CxxDefaultCtorAmbiguityError(typeName, ambiguityError))
+                        LogErrorContext(ctx, ambiguityError);
+                    LogErrorContext(ctx, std::format("C++ class '{}' has no default constructor cflat can call",
+                        compiler->DisplayCxxClassName(typeName)));
+                }
             }
             std::string why;
             compiler->TryBindRefusedCxxMember(typeName, "__ctor", ctorArgTypes.size());

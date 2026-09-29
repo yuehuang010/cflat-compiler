@@ -1770,7 +1770,11 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                             if (std::string refusal = Compiler(ctx)->GetCxxBindingRefusal(qualifiedName);
                                                 !refusal.empty())
                                                 LogErrorContext(ctx, refusal);
-                                            else
+                                            // A member of a private/protected base exists
+                                            // but is inaccessible; the helper says so.
+                                            else if (!Compiler(ctx)->IsDataStructure(namespaceName)
+                                                     || !Compiler(ctx)->ReportCxxMemberThroughNonPublicBase(
+                                                         namespaceName, memberName))
                                                 // The owner may be a C++ class-template
                                                 // specialization; name it in source spelling.
                                                 LogErrorContext(ctx, std::format(
