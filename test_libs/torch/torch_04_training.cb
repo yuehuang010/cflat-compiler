@@ -8,8 +8,8 @@ int leg_t7()
 {
     float[6] xs = {1.0f, 0.0f, 0.0f, 1.0f, 1.0f, 1.0f};
     float[3] ys = {2.0f, 3.0f, 5.0f};
-    long[2] dx = {3, 2};
-    long[2] dy = {3, 1};
+    i64[2] dx = {3, 2};
+    i64[2] dy = {3, 1};
     c10.IntArrayRef sx = c10.IntArrayRef(&dx[0], 2);
     c10.IntArrayRef sy = c10.IntArrayRef(&dy[0], 2);
     at.Tensor x = torch.from_blob(&xs[0], sx);
@@ -39,8 +39,8 @@ int leg_t9()
     torch.manual_seed(1);
     float[8] xs = {0.0f, 0.0f, 0.0f, 1.0f, 1.0f, 0.0f, 1.0f, 1.0f};
     float[4] ys = {0.0f, 1.0f, 1.0f, 0.0f};
-    long[2] dx = {4, 2};
-    long[2] dy = {4, 1};
+    i64[2] dx = {4, 2};
+    i64[2] dy = {4, 1};
     c10.IntArrayRef sx = c10.IntArrayRef(&dx[0], 2);
     c10.IntArrayRef sy = c10.IntArrayRef(&dy[0], 2);
     at.Tensor x = torch.from_blob(&xs[0], sx);
@@ -78,8 +78,8 @@ int leg_t12()
     torch.manual_seed(1);
     float[8] xs = {0.0f, 0.0f, 0.0f, 1.0f, 1.0f, 0.0f, 1.0f, 1.0f};
     float[4] ys = {0.0f, 1.0f, 1.0f, 0.0f};
-    long[2] dx = {4, 2};
-    long[2] dy = {4, 1};
+    i64[2] dx = {4, 2};
+    i64[2] dy = {4, 1};
     c10.IntArrayRef sx = c10.IntArrayRef(&dx[0], 2);
     c10.IntArrayRef sy = c10.IntArrayRef(&dy[0], 2);
     at.Tensor x = torch.from_blob(&xs[0], sx);
@@ -117,7 +117,7 @@ int leg_t22()
     seq->push_back("act", torch.nn.ReLU());
     seq->push_back("fc2", torch.nn.Linear(4, 1));
     torch.OrderedDict<std.string, at.Tensor> np = seq->named_parameters();
-    long[2] shape = {3, 2};
+    i64[2] shape = {3, 2};
     c10.IntArrayRef sizes = c10.IntArrayRef(&shape[0], 2);
     at.Tensor y = seq->forward(torch.ones(sizes));
     const char* key = np.front().key().c_str();
@@ -137,7 +137,7 @@ int leg_t25()
     seq->push_back("act", torch.nn.ReLU());
     seq->push_back("fc2", torch.nn.Linear(4, 1));
     torch.OrderedDict<std.string, at.Tensor> np = seq->named_parameters();
-    long[2] shape = {3, 2};
+    i64[2] shape = {3, 2};
     c10.IntArrayRef sizes = c10.IntArrayRef(&shape[0], 2);
     at.Tensor y = seq->forward(torch.ones(sizes));
     const char* key = np[0].key().c_str();
@@ -155,7 +155,7 @@ int leg_t28()
     torch.nn.Module m = torch.nn.Module("root");
     std.shared_ptr<torch.nn.LinearImpl> fc = m.register_module("fc", torch.nn.Linear(4, 2));
     std.shared_ptr<torch.nn.ReLUImpl> act = m.register_module("act", torch.nn.ReLU());
-    long[2] shape = {3, 4};
+    i64[2] shape = {3, 4};
     c10.IntArrayRef sizes = c10.IntArrayRef(&shape[0], 2);
     at.Tensor y = act->forward(fc->forward(torch.ones(sizes)));
     std.vector<at.Tensor> ps = m.parameters();

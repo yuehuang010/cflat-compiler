@@ -54,6 +54,8 @@ $outRoot = Join-Path $repo 'out\parity'
 $scratch = Join-Path $repo 'scratch\parity'
 $staticRoot = Join-Path $deps 'vcpkg_installed\x64-windows-static'
 $fmtRoot = Join-Path $repo 'test_libs\vcpkg_installed\x64-windows'
+# libtorch has its own manifest (test_libs\torch\vcpkg.json); CFLAT_TESTLIB_LIBTORCH wins, as in test_libs.bat.
+$torchRoot = if ($env:CFLAT_TESTLIB_LIBTORCH) { $env:CFLAT_TESTLIB_LIBTORCH } else { Join-Path $repo 'test_libs\torch\vcpkg_installed\x64-windows' }
 
 foreach ($p in @($clangxx, $cflat, $vcvars)) {
     if (-not (Test-Path -LiteralPath $p)) { throw "missing: $p" }
@@ -74,6 +76,8 @@ $libs = @{
     json     = @{ Root = $staticRoot; Include = @('include'); Lib = @();                 RunPath = $null; Crt = 'dll' }
     simdjson = @{ Root = $staticRoot; Include = @('include'); Lib = @('lib\simdjson.lib'); RunPath = $null; Crt = 'static' }
     fmt      = @{ Root = $fmtRoot;    Include = @('include'); Lib = @('lib\fmt.lib');     RunPath = 'bin'; Crt = 'dll' }
+    torch    = @{ Root = $torchRoot;  Include = @('include', 'include\torch\csrc\api\include')
+                  Lib = @('lib\torch.lib', 'lib\torch_cpu.lib', 'lib\c10.lib'); RunPath = 'bin'; Crt = 'dll' }
 }
 
 New-Item -ItemType Directory -Force -Path $outRoot, $scratch, (Join-Path $outRoot 'trace') | Out-Null

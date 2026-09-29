@@ -5,15 +5,15 @@ extern int printf(const char* fmt, ...);
 int leg_t13()
 {
     int failures = 0;
-    long[2] d = {4, 2};
+    i64[2] d = {4, 2};
     c10.IntArrayRef s = c10.IntArrayRef(&d[0], 2);
     at.Tensor x = torch.randn(s);
     torch.data.datasets.TensorDataset ds = torch.data.datasets.TensorDataset(x);
-    long n = (long)ds.size().value();
+    i64 n = (i64)ds.size().value();
     torch.data.TensorExample ex = ds.get(1);
-    printf("n=%ld ex0=%ld\n", n, ex.data.size(0));
-    if (n != 4) { printf("FAIL t13 n: got %ld want 4\n", n); failures++; }
-    if (ex.data.size(0) != 2) { printf("FAIL t13 ex0: got %ld want 2\n", ex.data.size(0)); failures++; }
+    printf("n=%lld ex0=%lld\n", n, ex.data.size(0));
+    if (n != 4) { printf("FAIL t13 n: got %lld want 4\n", n); failures++; }
+    if (ex.data.size(0) != 2) { printf("FAIL t13 ex0: got %lld want 2\n", ex.data.size(0)); failures++; }
     return failures;
 }
 extern int main()

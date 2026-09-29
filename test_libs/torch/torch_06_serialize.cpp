@@ -1,0 +1,112 @@
+// C++20 equivalent of torch_06_serialize.cb (clang++ parity baseline)
+#include <cstdint>
+#include <cstdio>
+#include <torch/torch.h>
+
+using i64 = int64_t;
+
+int leg_t8()
+{
+    i64 dims[2] = {2, 2};
+    c10::IntArrayRef s22 = c10::IntArrayRef(&dims[0], 2);
+    at::Tensor a = at::mul(torch::ones(s22), c10::Scalar(2.5));
+    torch::save(a, "t8.pt");
+    at::Tensor b;
+    torch::load(b, "t8.pt");
+    double directTotal = at::sum(b).item().toDouble();
+    torch::serialize::OutputArchive oa;
+    oa.write("a", a);
+    oa.save_to("t8_archive.pt");
+    at::Tensor archived;
+    torch::serialize::InputArchive ia;
+    ia.load_from("t8_archive.pt");
+    ia.read("a", archived);
+    double archivedTotal = at::sum(archived).item().toDouble();
+    std::printf("direct=%f archived=%f size0=%lld\n", directTotal, archivedTotal, b.size(0));
+    int failures = 0;
+    if (directTotal != 10.0) { std::printf("FAIL t8 direct sum: got %f want 10\n", directTotal); failures++; }
+    if (archivedTotal != directTotal || archivedTotal != 10.0) { std::printf("FAIL t8 archive sum: got %f want %f\n", archivedTotal, directTotal); failures++; }
+    if (b.size(0) != 2 || b.size(1) != 2) { std::printf("FAIL t8 loaded size: got %lldx%lld want 2x2\n", b.size(0), b.size(1)); failures++; }
+    if (archived.size(0) != 2 || archived.size(1) != 2) { std::printf("FAIL t8 archive size: got %lldx%lld want 2x2\n", archived.size(0), archived.size(1)); failures++; }
+    return failures;
+}
+
+int leg_t18()
+{
+    torch::nn::Embedding emb = torch::nn::Embedding(10, 3);
+    i64 ids[4] = {1, 2, 4, 5};
+    i64 shape[1] = {4};
+    c10::IntArrayRef sizes = c10::IntArrayRef(&shape[0], 1);
+    c10::TensorOptions opts = c10::TensorOptions(c10::ScalarType::Long);
+    at::Tensor idx = torch::from_blob(&ids[0], sizes, opts);
+    at::Tensor e = emb->forward(idx);
+    at::Tensor c = e.clone();
+    at::Tensor d = e.detach();
+    at::Tensor s = c.sum();
+    s.backward();
+    at::Tensor g = emb->weight.grad();
+    int failures = 0;
+    if (e.size(0) != 4 || e.size(1) != 3) { std::printf("FAIL t18 embedding shape: got %lldx%lld want 4x3\n", e.size(0), e.size(1)); failures++; }
+    if (!g.defined()) { std::printf("FAIL t18 grad: got undefined want defined\n"); failures++; }
+    double gsum = g.sum().item<double>();
+    if (gsum != 12.0) { std::printf("FAIL t18 grad sum: got %f want 12\n", gsum); failures++; }
+    int detachedRequiresGrad = d.requires_grad() ? 1 : 0;
+    if (detachedRequiresGrad != 0) { std::printf("FAIL t18 detach: got requires_grad=%d want 0\n", detachedRequiresGrad); failures++; }
+    torch::nn::Linear l1 = torch::nn::Linear(2, 2);
+    {
+        torch::NoGradGuard ng;
+        l1->weight.fill_(0.5);
+        l1->bias.fill_(0.25);
+    }
+    torch::save(l1, "t18_module.pt");
+    torch::nn::Linear l2 = torch::nn::Linear(2, 2);
+    torch::load(l2, "t18_module.pt");
+    double w = l2->weight.sum().item<double>();
+    double b = l2->bias.sum().item<double>();
+    std::printf("e=%dx%d gsum=%f w=%f b=%f\n", (int)e.size(0), (int)e.size(1), gsum, w, b);
+    if (w != 2.0) { std::printf("FAIL t18 weight sum: got %f want 2\n", w); failures++; }
+    if (b != 0.5) { std::printf("FAIL t18 bias sum: got %f want 0.5\n", b); failures++; }
+    return failures;
+}
+
+int leg_t21()
+{
+    torch::manual_seed(1);
+    i64 shape[2] = {4, 3};
+    c10::IntArrayRef sizes = c10::IntArrayRef(&shape[0], 2);
+    at::Tensor logits = torch::randn(sizes);
+    i64 ids[4] = {0, 1, 2, 1};
+    i64 s1[1] = {4};
+    c10::IntArrayRef sz1 = c10::IntArrayRef(&s1[0], 1);
+    c10::TensorOptions lopts = c10::TensorOptions(c10::ScalarType::Long);
+    at::Tensor target = torch::from_blob(&ids[0], sz1, lopts);
+    torch::nn::CrossEntropyLoss ce = torch::nn::CrossEntropyLoss();
+    at::Tensor loss = ce->forward(logits, target);
+    torch::nn::Linear l1 = torch::nn::Linear(3, 3);
+    torch::nn::init::xavier_uniform_(l1->weight);
+    torch::optim::AdamOptions aopt = torch::optim::AdamOptions(0.01).weight_decay(0.0001);
+    torch::optim::Adam opt = torch::optim::Adam(l1->parameters(), aopt);
+    at::Tensor sm = torch::softmax(logits, 1);
+    at::Tensor am = sm.argmax(1);
+    double lossValue = loss.item<double>();
+    double wd = aopt.weight_decay();
+    double smrow = sm[0].sum().item<double>();
+    int am0 = (int)am[0].item<int>();
+    std::printf("loss=%f wd=%f smrow=%f am0=%d\n", lossValue, wd, smrow, am0);
+    int failures = 0;
+    if (!(lossValue > 0.0)) { std::printf("FAIL t21 loss: got %f want > 0\n", lossValue); failures++; }
+    if (wd != 0.0001) { std::printf("FAIL t21 weight decay: got %f want 0.0001\n", wd); failures++; }
+    if (smrow < 0.999 || smrow > 1.001) { std::printf("FAIL t21 softmax row sum: got %f want 1 +/- 0.001\n", smrow); failures++; }
+    if (am0 < 0 || am0 >= 3) { std::printf("FAIL t21 argmax: got %d want 0..2\n", am0); failures++; }
+    return failures;
+}
+
+int main()
+{
+    int failures = 0;
+    failures += leg_t8();
+    failures += leg_t18();
+    failures += leg_t21();
+    if (failures == 0) std::printf("PASS torch_06_serialize\n");
+    return failures;
+}

@@ -1,0 +1,8 @@
+{
+  "name": "cflat-test-libs-torch",
+  "version-string": "0.0.1",
+  "dependencies": [
+    { "name": "libtorch", "default-features": false }
+  ],
+  "builtin-baseline": "58845ed63eb19aff55e896ea1f5d51f2a0df5b66"
+}

@@ -5528,13 +5528,16 @@ extern int main(int argc, char** argv)
         return 3649;
 
     // libtorch t25: a member operator refused for a not-yet-registered nested Item is rebound at
-    // the operator use site (was "no overload of 'operator[]'").
+    // the operator use site (was "no overload of 'operator[]'"), even when its key-taking sibling
+    // overload bound first (that used to clear the per-name refusal the retry needs).
     int bridgeDictStartChecks = bridge_checks;
     int bridgeDictStartPassed = bridge_passed;
     cplv.Net dictNet = cplv.Net();
     cplv.NamedDict<std.string, cplv.Weight> dict = dictNet.named();
     bridge_check("refused operator[] rebound value", dict[1].value().v, 9);
     bridge_check("refused operator[] rebound key", (int)dict[1].key().size(), 4);
+    std.string dictKey = std.string("w1");
+    bridge_check("sibling operator[] by key", dict[dictKey].v, 4);
     if (bridge_passed - bridgeDictStartPassed != bridge_checks - bridgeDictStartChecks)
         return 3646;
     // A non-inline out-of-line member of an implicit instantiation has no library symbol: its

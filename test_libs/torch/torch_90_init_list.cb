@@ -6,9 +6,9 @@ extern int printf(const char* fmt, ...);
 int leg_t4()
 {
     int failures = 0;
-    long[2] dims2 = {2, 3};
+    i64[2] dims2 = {2, 3};
     c10.IntArrayRef s23 = c10.IntArrayRef(&dims2[0], 2);
-    long[2] dims3 = {3, 1};
+    i64[2] dims3 = {3, 1};
     c10.IntArrayRef s31 = c10.IntArrayRef(&dims3[0], 2);
     at.Tensor a = torch.ones(s23);
     at.Tensor w = torch.ones(s31);
@@ -19,10 +19,10 @@ int leg_t4()
     at.Tensor g = wg.grad();
     double lv = loss.item().toDouble();
     double g0 = g.index({0, 0}).item().toDouble();
-    printf("loss=%f g0=%f dim=%ld\n", lv, g0, g.dim());
+    printf("loss=%f g0=%f dim=%lld\n", lv, g0, g.dim());
     if (lv != 6.0) { printf("FAIL t4 loss: got %f want 6.0\n", lv); failures++; }
     if (g0 != 2.0) { printf("FAIL t4 g0: got %f want 2.0\n", g0); failures++; }
-    if (g.dim() != 2) { printf("FAIL t4 dim: got %ld want 2\n", g.dim()); failures++; }
+    if (g.dim() != 2) { printf("FAIL t4 dim: got %lld want 2\n", g.dim()); failures++; }
     return failures;
 }
 // 2026-09-26: t4's {0, 0} linked in the suite run while this braced Slice form did not.
@@ -34,10 +34,10 @@ int leg_t27_braced()
     at.Tensor row = x.index({0});
     at.Tensor sub = x.index({torch.indexing.Slice(0, 2), torch.indexing.Slice(1, 3)});
     i64 s = sub.sum().item<i64>();
-    if (col.size(0) != 3) { printf("FAIL t27 col: got %ld want 3\n", (long)col.size(0)); failures++; }
-    if (row.size(0) != 4) { printf("FAIL t27 row: got %ld want 4\n", (long)row.size(0)); failures++; }
-    if (sub.size(0) != 2 || sub.size(1) != 2) { printf("FAIL t27 sub: got %ldx%ld want 2x2\n", (long)sub.size(0), (long)sub.size(1)); failures++; }
-    if (s != 14) { printf("FAIL t27 sum: got %ld want 14\n", (long)s); failures++; }
+    if (col.size(0) != 3) { printf("FAIL t27 col: got %lld want 3\n", (i64)col.size(0)); failures++; }
+    if (row.size(0) != 4) { printf("FAIL t27 row: got %lld want 4\n", (i64)row.size(0)); failures++; }
+    if (sub.size(0) != 2 || sub.size(1) != 2) { printf("FAIL t27 sub: got %lldx%lld want 2x2\n", (i64)sub.size(0), (i64)sub.size(1)); failures++; }
+    if (s != 14) { printf("FAIL t27 sum: got %lld want 14\n", (i64)s); failures++; }
     return failures;
 }
 extern int main()

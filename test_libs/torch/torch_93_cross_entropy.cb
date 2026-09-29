@@ -14,7 +14,7 @@ int leg_t23()
     if (p0 < -0.146796 || p0 > -0.146794) { printf("FAIL t23 p0: got %f want -0.146795\n", p0); failures++; }
     if (item < -0.146796 || item > -0.146794) { printf("FAIL t23 item: got %f want -0.146795\n", item); failures++; }
     at.Tensor logits = torch.randn({4, 5});
-    long[1] tsz = {4};
+    i64[1] tsz = {4};
     at.Tensor target = torch.randint(0, 5, c10.IntArrayRef(&tsz[0], 1));
     at.Tensor loss = torch.nn.functional.cross_entropy(logits, target);
     double ce = loss.item<double>();

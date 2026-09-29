@@ -107,6 +107,39 @@ cold ratio is almost the same against either baseline (json ~1.8-1.9x), i.e. the
 fmt 48-56 files / 4.8-5.2 MB, json_01 154 files / 11.0 MB (134 cheaders/), json_02 90 / 9.1, json_03 106 / 8.9,
 simdjson_01 48 / 5.5, simdjson_02 98 / 6.5.
 
+**Windows full baseline incl. libtorch 2026-09-29 01:23 (master 79804a83 + torch integration: OrderedDict
+operator[] refusal fix, incremental-group ParmVarDecl cycle fix, std::function helper rename; libtorch 2.13.0 from
+test_libs\torch\vcpkg.json, /MD, OMP_NUM_THREADS=1).** `test_libs_parity.ps1 -N 3` (Both), idle machine, pinned
+0x55; CSV out\parity\parity_20260929_012310.csv. Twins: every C++-interop case (fmt/json/simdjson/torch); C-import
+libs (curl/openblas/sdl3/sqlite3/zlib) are out of scope. Seconds, ratio vs clang++:
+
+| case | clang++ link | cold | warm | clang++ syntax | check cold | check "warm" |
+|---|---|---|---|---|---|---|
+| fmt_01_runtime | 0.68 | 0.91 (1.33x) | 0.17 (0.25x) | 0.55 | 0.78 (1.41x) | 0.69 (1.24x) |
+| fmt_02_consteval | 0.67 | 0.92 (1.38x) | 0.16 (0.24x) | 0.56 | 0.78 (1.41x) | 0.73 (1.31x) |
+| fmt_03_memory_buffer | 0.67 | 0.82 (1.22x) | 0.17 (0.25x) | 0.55 | 0.73 (1.32x) | 0.63 (1.14x) |
+| fmt_04_string_arg | 0.67 | 0.89 (1.33x) | 0.17 (0.25x) | 0.56 | 0.79 (1.41x) | 0.70 (1.25x) |
+| json_01_read | 2.11 | 4.22 (2.00x) | 0.56 (0.26x) | 1.69 | 3.24 (1.92x) | 3.10 (1.84x) |
+| json_02_type_checks | 2.00 | 3.73 (1.86x) | 0.40 (0.20x) | 1.70 | 2.98 (1.76x) | 2.85 (1.68x) |
+| json_03_build | 1.98 | 3.29 (1.66x) | 0.29 (0.15x) | 1.64 | 3.03 (1.84x) | 3.05 (1.86x) |
+| simdjson_01_dom | 1.33 | 1.39 (1.05x) | 0.22 (0.16x) | 1.11 | 1.25 (1.12x) | 1.07 (0.96x) |
+| simdjson_02_ondemand | 1.40 | 1.67 (1.19x) | 0.29 (0.21x) | 1.12 | 1.40 (1.26x) | 1.23 (1.10x) |
+| torch_01_tensor | 9.64 | 16.77 (1.74x) | 2.12 (0.22x) | 8.62 | 14.22 (1.65x) | 8.41 (0.98x) |
+| torch_02_autograd | 9.81 | 16.49 (1.68x) | 2.08 (0.21x) | 8.66 | 14.14 (1.63x) | 8.02 (0.93x) |
+| torch_03_modules | 9.62 | 16.55 (1.72x) | 2.09 (0.22x) | 8.66 | 14.14 (1.63x) | 8.15 (0.94x) |
+| torch_04_training | 9.72 | 17.03 (1.75x) | 2.40 (0.25x) | 8.72 | 15.33 (1.76x) | 8.98 (1.03x) |
+| torch_05_data | 10.69 | 17.58 (1.65x) | 2.48 (0.23x) | 8.93 | 14.90 (1.67x) | 9.13 (1.02x) |
+| torch_06_serialize | 9.68 | 17.59 (1.82x) | 2.23 (0.23x) | 8.75 | 14.92 (1.71x) | 8.80 (1.01x) |
+| torch_07_cpp_struct | 9.63 | 17.56 (1.82x) | 2.35 (0.24x) | 8.68 | 15.02 (1.73x) | 9.05 (1.04x) |
+| torch_90_init_list | 9.57 | 16.21 (1.69x) | 1.93 (0.20x) | 8.66 | 14.18 (1.64x) | 7.95 (0.92x) |
+| torch_91_data_example | 9.59 | 15.68 (1.64x) | 1.82 (0.19x) | 8.70 | 14.16 (1.63x) | 7.55 (0.87x) |
+| torch_92_functional | 9.65 | 16.77 (1.74x) | 2.04 (0.21x) | 8.70 | 14.28 (1.64x) | 8.35 (0.96x) |
+| torch_93_cross_entropy | 9.61 | 16.30 (1.70x) | 1.96 (0.20x) | 8.70 | 14.41 (1.66x) | 7.98 (0.92x) |
+
+Reading: warm met everywhere (0.15-0.26x). Cold: simdjson ~1.05-1.19x, fmt ~1.3x, torch ~1.65-1.8x, json ~1.7-2.0x;
+torch's check-cold ratio (~1.65x) again tracks its link-cold ratio, so the torch gap is front-end/interop too.
+Windows torch cold 1.74x vs macOS 1.6x (plain LLVM). fmt/json/simdjson rows match the 2026-09-28 tables (noise).
+
 **Status 2026-09-28 12:25 (master bd1def8e, perf timebox 3, 09:40 -> 15:40).** parity.sh N=3, quiet
 machine: clang++ 3.26 s | cflat warm 0.46 s (0.15x, met) | cflat cold 5.26 s plain LLVM (1.6x) /
 4.29 s with a PGO-built LLVM (1.3x, scratch/pgo_llvm_notes.md, install llvm-23.1.0-pgo, ruling R2 in

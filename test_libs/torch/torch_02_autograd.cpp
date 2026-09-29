@@ -1,0 +1,77 @@
+// C++20 equivalent of torch_02_autograd.cb (clang++ parity baseline)
+#include <cstdint>
+#include <cstdio>
+#include <vector>
+#include <torch/torch.h>
+
+using i64 = int64_t;
+
+int leg_t5()
+{
+    i64 dims2[2] = {2, 3};
+    c10::IntArrayRef s23 = c10::IntArrayRef(&dims2[0], 2);
+    i64 dims3[2] = {3, 1};
+    c10::IntArrayRef s31 = c10::IntArrayRef(&dims3[0], 2);
+    at::Tensor a = torch::ones(s23);
+    at::Tensor w = torch::ones(s31).requires_grad_(true);
+    double lr = 0.1;
+    double last = 0.0;
+    int fail = 0;
+    for (int step = 0; step < 2; step++)
+    {
+        at::Tensor loss = at::sum(at::matmul(a, w));
+        loss.backward();
+        last = loss.item().toDouble();
+        {
+            torch::NoGradGuard guard;
+            at::Tensor g = w.grad();
+            at::Tensor upd = at::mul(g, c10::Scalar(lr));
+            w.sub_(upd);
+            w.mutable_grad().zero_();
+        }
+        std::printf("t5 step=%d loss=%f\n", step, last);
+        double want = step == 0 ? 6.0 : 4.8;
+        if (last < want - 0.001 || last > want + 0.001) { std::printf("FAIL t5 step %d: got %f want %f +/- 0.001\n", step, last, want); fail++; }
+    }
+    return fail;
+}
+
+int leg_t26()
+{
+    torch::manual_seed(1);
+    torch::nn::Sequential seq = torch::nn::Sequential(torch::nn::Linear(2, 3), torch::nn::Tanh(), torch::nn::Linear(3, 1));
+    std::vector<at::Tensor> ps = seq->parameters();
+    torch::nn::init::xavier_uniform_(ps[0]);
+    torch::nn::init::zeros_(ps[1]);
+    at::Tensor x = torch::ones({4, 2});
+    at::Tensor y = seq->forward(x);
+    y.sum().backward();
+    double norm = torch::nn::utils::clip_grad_norm_(ps, 0.5);
+    int n = (int)ps.size();
+    i64 y0 = y.size(0);
+    i64 y1 = y.size(1);
+    std::printf("t26 n=%d norm=%f y=%dx%d\n", n, norm, (int)y0, (int)y1);
+    torch::nn::Sequential seq2 = torch::nn::Sequential(torch::nn::Linear(2, 3), torch::nn::Tanh(), torch::nn::Linear(3, 1));
+    torch::save(seq, "seq.pt");
+    torch::load(seq2, "seq.pt");
+    at::Tensor y2 = seq2->forward(x);
+    int same = (int)torch::allclose(y, y2);
+    int children = (int)seq->children().size();
+    std::printf("t26 same=%d children=%d\n", same, children);
+    int fail = 0;
+    if (n != 4) { std::printf("FAIL t26 parameter count: got %d want 4\n", n); fail++; }
+    if (!(norm > 0.0 && norm < 1000000.0)) { std::printf("FAIL t26 norm: got %f want > 0 and < 1000000\n", norm); fail++; }
+    if (y0 != 4 || y1 != 1) { std::printf("FAIL t26 output shape: got %lldx%lld want 4x1\n", y0, y1); fail++; }
+    if (same != 1) { std::printf("FAIL t26 roundtrip: got %d want 1\n", same); fail++; }
+    if (children != 3) { std::printf("FAIL t26 child count: got %d want 3\n", children); fail++; }
+    return fail;
+}
+
+int main()
+{
+    int fail = 0;
+    fail += leg_t5();
+    fail += leg_t26();
+    if (!fail) std::printf("PASS torch_02_autograd\n");
+    return fail;
+}

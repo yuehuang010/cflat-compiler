@@ -12185,27 +12185,17 @@ bool LLVMBackend::RequestCxxForeignType(const std::string& cflatName, const std:
                             rebindable.push_back(m.name);
                     if (!rebindable.empty() && !requestBitcode.empty() && symbolSink_ == nullptr)
                         AdoptCxxCompanionBitcode(requestBitcode);
+                    /*
+                     * Refusals are kept per member NAME. Clear the stale one BEFORE the rebind so
+                     * an overload still refused (a sibling's unrequested return type) records its
+                     * fresh, retryable refusal; one bound sibling must not erase it afterwards.
+                     */
                     for (const auto& memberName : rebindable)
                     {
-                        RegisterCxxClassMembers(rebound, fileForCxxRequest, memberName);
-                        bool bound = false;
                         if (auto updated = cxxClasses_.find(known->second);
                             updated != cxxClasses_.end())
-                            bound = std::find(updated->second.instanceMethodNames.begin(),
-                                              updated->second.instanceMethodNames.end(), memberName)
-                                != updated->second.instanceMethodNames.end();
-                        if (auto functions = functionTable.find(memberName);
-                            functions != functionTable.end())
-                            bound = bound || std::any_of(functions->second.begin(),
-                                functions->second.end(), [&](const FunctionSymbol& symbol) {
-                                    return symbol.IsCxx && symbol.IsCInteropDeclaration
-                                        && symbol.IsMethod && !symbol.Parameters.empty()
-                                        && symbol.Parameters.front().TypeName == known->second;
-                                });
-                        if (bound)
-                            if (auto updated = cxxClasses_.find(known->second);
-                                updated != cxxClasses_.end())
-                                updated->second.refusedMembers.erase(memberName);
+                            updated->second.refusedMembers.erase(memberName);
+                        RegisterCxxClassMembers(rebound, fileForCxxRequest, memberName);
                     }
                     cxxRecordEntries_[known->second] = rebound;
                 }
@@ -12304,9 +12294,10 @@ bool LLVMBackend::RequestCxxForeignType(const std::string& cflatName, const std:
                                            }),
                             functions->second.end());
                     }
-                    RegisterCxxClassMembers(*refreshed, fileForCxxRequest, memberName);
+                    // Clear before re-registering, so a still-refused overload keeps its refusal.
                     if (auto updated = cxxClasses_.find(cflatName); updated != cxxClasses_.end())
                         updated->second.refusedMembers.erase(memberName);
+                    RegisterCxxClassMembers(*refreshed, fileForCxxRequest, memberName);
                 }
             }
         }
@@ -16570,6 +16561,14 @@ bool LLVMBackend::TryBindRefusedCxxMember(const std::string& typeName,
                     }
                 }
             }
+            auto instanceBound = [&]() {
+                auto info = cxxClasses_.find(typeName);
+                return info != cxxClasses_.end()
+                    && std::find(info->second.instanceMethodNames.begin(),
+                                 info->second.instanceMethodNames.end(), memberName)
+                           != info->second.instanceMethodNames.end();
+            };
+            const bool wasBound = instanceBound();
             std::string error;
             const bool requested = RequestCxxForeignType(typeName, spellingIt->second, error,
                                                          /*needDefinitions*/ true,
@@ -16577,12 +16576,21 @@ bool LLVMBackend::TryBindRefusedCxxMember(const std::string& typeName,
             if (!requested)
                 return false;
             auto updated = cxxClasses_.find(typeName);
-            const bool rebound = updated != cxxClasses_.end()
-                && std::find(updated->second.instanceMethodNames.begin(),
-                             updated->second.instanceMethodNames.end(), memberName)
-                       != updated->second.instanceMethodNames.end();
-            if (rebound) return true;
             if (updated == cxxClasses_.end()) return false;
+            /*
+             * One bound overload does not make the name bound: a sibling may now be refused for
+             * a type no request registered yet (OrderedDict's operator[](size_t) returning its
+             * nested Item &). Retry on that fresh refusal before reporting the name as rebound.
+             */
+            if (auto still = updated->second.refusedMembers.find(memberName);
+                still != updated->second.refusedMembers.end()
+                && !still->second.starts_with("has no definition cflat can reach:")
+                && TryBindRefusedCxxMember(typeName, memberName, constructorArgumentCount))
+                return true;
+            updated = cxxClasses_.find(typeName);
+            if (updated == cxxClasses_.end()) return false;
+            if (instanceBound())
+                return !wasBound || updated->second.refusedMembers.count(memberName) == 0;
             if (auto statics = functionTable.find(typeName + "." + memberName);
                 statics != functionTable.end()
                 && std::any_of(statics->second.begin(), statics->second.end(),

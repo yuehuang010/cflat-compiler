@@ -662,6 +662,15 @@ namespace
             late.D = fd;
             late.FPO = body.fpo;
             late.Toks.append(body.tokens.begin(), body.tokens.end());
+            /*
+             * A namespace-scope definition is skipped only after ActOnStartOfFunctionDef added its
+             * named parameters to fd's decls; the late parse adds them again. Re-adding a listed
+             * decl links the chain into a cycle (Release has no assert), and any decls() walk of
+             * fd - MS ABI CodeGen's dllimport inlining check - then never ends.
+             */
+            for (clang::ParmVarDecl* param : fd->parameters())
+                if (param->getIdentifier() != nullptr && fd->containsDecl(param))
+                    fd->removeDecl(param);
             clang::DiagnosticErrorTrap trap(sema->getDiagnostics());
             fd->setHasSkippedBody(false);
             fd->setLateTemplateParsed(true);
@@ -1378,8 +1387,8 @@ bool CxxIncrementalGroup::ParseRequest(const cflat_cinterop::ExtractRequest& req
     std::string chunk = source;
     /*
      * An earlier batch chunk may already define this wrapper (a default-argument wrapper whose
-     * member was refused at the time). Parse under a fresh name, then restore the requested name
-     * in the result; both definitions are weak and identical.
+     * member was refused at the time, or a std::function bridge ctor). Parse under a fresh name,
+     * then restore the requested name in the result; both definitions are weak and identical.
      */
     // Wrapper names re-spelled in this chunk, fresh name -> requested name.
     std::vector<std::pair<std::string, std::string>> renamedWrappers;
@@ -1424,15 +1433,18 @@ bool CxxIncrementalGroup::ParseRequest(const cflat_cinterop::ExtractRequest& req
     };
     clang::ASTContext& context = impl_->interpreter->getCompilerInstance()->getASTContext();
     std::set<std::string> chunkWrappers;
-    for (size_t pos = 0; (pos = chunk.find("__cflat_dflt_", pos)) != std::string::npos;)
-    {
-        size_t end = pos;
-        while (end < chunk.size() && identChar(chunk[end])) ++end;
-        std::string name = chunk.substr(pos, end - pos);
-        if (name.ends_with("_cpp")) name.resize(name.size() - 4);
-        chunkWrappers.insert(std::move(name));
-        pos = end;
-    }
+    // A std::function bridge ctor is the same kind of weak helper: a second request for the
+    // spelling (its first came from a cache hit that a demand replay re-parsed) re-defines it.
+    for (const char* helperPrefix : { "__cflat_dflt_", "__cflat_std_function_ctor_" })
+        for (size_t pos = 0; (pos = chunk.find(helperPrefix, pos)) != std::string::npos;)
+        {
+            size_t end = pos;
+            while (end < chunk.size() && identChar(chunk[end])) ++end;
+            std::string name = chunk.substr(pos, end - pos);
+            if (name.ends_with("_cpp")) name.resize(name.size() - 4);
+            chunkWrappers.insert(std::move(name));
+            pos = end;
+        }
     for (const std::string& name : chunkWrappers)
         if (!context.getTranslationUnitDecl()->lookup(
                 clang::DeclarationName(&context.Idents.get(name))).empty())

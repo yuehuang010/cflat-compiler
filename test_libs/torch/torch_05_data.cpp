@@ -1,0 +1,120 @@
+// C++20 equivalent of torch_05_data.cb (clang++ parity baseline)
+#include <cstdint>
+#include <cstdio>
+#include <memory>
+#include <vector>
+#include <torch/torch.h>
+
+using i64 = int64_t;
+
+int leg_t14()
+{
+    i64 d[2] = {4, 2};
+    c10::IntArrayRef s = c10::IntArrayRef(&d[0], 2);
+    at::Tensor x = torch::randn(s);
+    torch::data::datasets::TensorDataset ds = torch::data::datasets::TensorDataset(x);
+    std::unique_ptr<torch::data::StatelessDataLoader<torch::data::datasets::TensorDataset, torch::data::samplers::SequentialSampler>> loader =
+        torch::data::make_data_loader<torch::data::samplers::SequentialSampler>(ds, 2);
+    torch::data::Iterator<std::vector<torch::data::Example<at::Tensor, void>>> it = loader->begin();
+    torch::data::Iterator<std::vector<torch::data::Example<at::Tensor, void>>> end = loader->end();
+    std::vector<torch::data::Example<at::Tensor, void>>& batch0 = *it;
+    int failures = 0;
+    if (batch0.size() != 2) { std::printf("FAIL t14 batch0 size: got %d want 2\n", (int)batch0.size()); failures++; }
+    if (batch0[0].data.size(0) != 2) { std::printf("FAIL t14 batch0 rows: got %lld want 2\n", batch0[0].data.size(0)); failures++; }
+    ++it;
+    std::vector<torch::data::Example<at::Tensor, void>>& batch1 = *it;
+    if (batch1.size() != 2) { std::printf("FAIL t14 batch1 size: got %d want 2\n", (int)batch1.size()); failures++; }
+    if (batch1[0].data.size(0) != 2) { std::printf("FAIL t14 batch1 rows: got %lld want 2\n", batch1[0].data.size(0)); failures++; }
+    ++it;
+    if (it != end) { std::printf("FAIL t14 exhausted: got 0 want 1\n"); failures++; }
+    return failures;
+}
+
+int leg_t15()
+{
+    i64 shape[2] = {4, 2};
+    c10::IntArrayRef sizes = c10::IntArrayRef(&shape[0], 2);
+    at::Tensor input = torch::randn(sizes);
+    torch::data::datasets::TensorDataset ds = torch::data::datasets::TensorDataset(input);
+    auto mapped = ds.map(torch::data::transforms::Stack<torch::data::TensorExample>());
+    std::unique_ptr<torch::data::StatelessDataLoader<
+        torch::data::datasets::MapDataset<torch::data::datasets::TensorDataset,
+        torch::data::transforms::Stack<torch::data::TensorExample>>,
+        torch::data::samplers::SequentialSampler>> loader =
+        torch::data::make_data_loader<torch::data::samplers::SequentialSampler>(mapped, 2);
+    torch::data::Iterator<torch::data::Example<at::Tensor, void>> it = loader->begin();
+    torch::data::Iterator<torch::data::Example<at::Tensor, void>> end = loader->end();
+    auto& batch0 = *it;
+    int failures = 0;
+    if (batch0.data.size(0) != 2) { std::printf("FAIL t15 batch0 rows: got %lld want 2\n", batch0.data.size(0)); failures++; }
+    ++it;
+    auto& batch1 = *it;
+    if (batch1.data.size(0) != 2) { std::printf("FAIL t15 batch1 rows: got %lld want 2\n", batch1.data.size(0)); failures++; }
+    ++it;
+    if (it != end) { std::printf("FAIL t15 exhausted: got 0 want 1\n"); failures++; }
+    return failures;
+}
+
+int leg_t16()
+{
+    torch::manual_seed(1);
+    float rows[24] = {0.0f, 0.0f, 0.0f,  0.0f, 1.0f, 1.0f,  1.0f, 0.0f, 1.0f,  1.0f, 1.0f, 0.0f,
+                      0.0f, 0.0f, 0.0f,  0.0f, 1.0f, 1.0f,  1.0f, 0.0f, 1.0f,  1.0f, 1.0f, 0.0f};
+    i64 d83[2] = {8, 3};
+    c10::IntArrayRef s83 = c10::IntArrayRef(&d83[0], 2);
+    at::Tensor table = torch::from_blob(&rows[0], s83);
+    torch::data::datasets::TensorDataset ds = torch::data::datasets::TensorDataset(table);
+    std::unique_ptr<torch::data::StatelessDataLoader<torch::data::datasets::TensorDataset, torch::data::samplers::SequentialSampler>> loader =
+        torch::data::make_data_loader<torch::data::samplers::SequentialSampler>(ds, 2);
+    torch::nn::Linear l1 = torch::nn::Linear(2, 8);
+    torch::nn::ReLU relu = torch::nn::ReLU();
+    torch::nn::Linear l2 = torch::nn::Linear(8, 1);
+    torch::nn::Sequential net = torch::nn::Sequential(l1, relu, l2);
+    std::vector<at::Tensor> params = net->parameters();
+    torch::optim::AdamOptions aopt = torch::optim::AdamOptions(0.02);
+    torch::optim::Adam opt = torch::optim::Adam(params, aopt);
+    double first = -1.0;
+    double last = 0.0;
+    int batchesPerEpoch = 0;
+    for (int epoch = 0; epoch < 60; epoch++) {
+        int batches = 0;
+        double epochLoss = 0.0;
+        torch::data::Iterator<std::vector<torch::data::Example<at::Tensor, void>>> it = loader->begin();
+        torch::data::Iterator<std::vector<torch::data::Example<at::Tensor, void>>> end = loader->end();
+        while (it != end) {
+            std::vector<torch::data::Example<at::Tensor, void>>& batch = *it;
+            std::vector<at::Tensor> parts;
+            for (int i = 0; i < (int)batch.size(); i++) parts.push_back(batch[i].data);
+            c10::ArrayRef<at::Tensor> tl = c10::ArrayRef<at::Tensor>(parts.data(), parts.size());
+            at::Tensor b = at::stack(tl, (i64)0);
+            at::Tensor x = b.slice(1, 0, 2);
+            at::Tensor y = b.slice(1, 2, 3);
+            opt.zero_grad();
+            at::Tensor loss = at::mse_loss(net->forward(x), y);
+            loss.backward();
+            opt.step();
+            epochLoss = epochLoss + loss.item().toDouble();
+            batches++;
+            ++it;
+        }
+        batchesPerEpoch = batches;
+        last = epochLoss / batches;
+        if (first < 0.0) first = last;
+    }
+    std::printf("batches=%d first=%f last=%g\n", batchesPerEpoch, first, last);
+    int failures = 0;
+    if (batchesPerEpoch != 4) { std::printf("FAIL t16 batches: got %d want 4\n", batchesPerEpoch); failures++; }
+    if (!(last < first)) { std::printf("FAIL t16 loss: got %g want < first (%f)\n", last, first); failures++; }
+    if (!(last < 0.05)) { std::printf("FAIL t16 final loss: got %g want < 0.05\n", last); failures++; }
+    return failures;
+}
+
+int main()
+{
+    int failures = 0;
+    failures += leg_t14();
+    failures += leg_t15();
+    failures += leg_t16();
+    if (failures == 0) std::printf("PASS torch_05_data\n");
+    return failures;
+}

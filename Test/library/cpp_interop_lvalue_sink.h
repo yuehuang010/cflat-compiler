@@ -79,6 +79,8 @@ namespace cplv
         class Item;
         NamedDict() = default;
         Item& operator[](std::size_t index);
+        // A sibling overload that binds first must not hide the refused size_t one.
+        V& operator[](const K& key);
         std::size_t size() const;
         void insert(K k, V v);
     private:
@@ -95,6 +97,12 @@ namespace cplv
     };
     template<class K, class V>
     typename NamedDict<K, V>::Item& NamedDict<K, V>::operator[](std::size_t index) { return items_[index]; }
+    template<class K, class V> V& NamedDict<K, V>::operator[](const K& key)
+    {
+        for (Item& item : items_)
+            if (item.key() == key) return item.value();
+        return items_.front().value();
+    }
     template<class K, class V> std::size_t NamedDict<K, V>::size() const { return items_.size(); }
     template<class K, class V> void NamedDict<K, V>::insert(K k, V v) { items_.emplace_back(std::move(k), std::move(v)); }
     struct Weight { int v; };

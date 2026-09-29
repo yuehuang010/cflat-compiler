@@ -50,7 +50,8 @@ if not "%LIST%"=="1" (
 )
 
 set /a PASS=0,FAIL=0,SKIP=0,DISABLED=0,XPASS=0,XFAIL=0
-for /r "%REPO%test_libs" %%C in (*.cb) do call :check_stale "%%~fC"
+REM Cases live flat in test_libs\<lib>\; never descend into vcpkg_installed trees (shared or per-lib).
+for /d %%L in ("%REPO%test_libs\*") do if /I not "%%~nxL"=="vcpkg_installed" for %%C in ("%%~fL\*.cb") do call :check_stale "%%~fC"
 for /d %%L in ("%REPO%test_libs\*") do if /I not "%%~nxL"=="vcpkg_installed" call :library "%%~fL"
 echo.
 echo Summary: !PASS! PASS, !FAIL! FAIL, !SKIP! SKIP, !DISABLED! DISABLED, !XPASS! XPASS, !XFAIL! XFAIL
@@ -70,7 +71,7 @@ if not exist "%LIBDIR%\lib.cfg" (
     exit /b 0
 )
 REM Keys get a CFG_ prefix: bare names (include, lib, ...) would clobber MSVC's INCLUDE / LIB.
-for %%K in (tier root_win env_win probe include lib_win runpath_win version_win hint_win args timeout) do set "CFG_%%K="
+for %%K in (tier root_win env_win probe include lib_win runpath_win runenv_win version_win hint_win args timeout) do set "CFG_%%K="
 for /f "usebackq eol=# tokens=1,* delims==" %%A in ("%LIBDIR%\lib.cfg") do set "CFG_%%A=%%B"
 if not defined CFG_tier set "CFG_tier=1"
 if !CFG_tier! gtr !MAX_TIER! exit /b 0
@@ -81,11 +82,11 @@ if "%LIST%"=="1" (
 set "WARM_CASES=;"
 set "ROOT="
 if /I "!CFG_root_win!"=="testlibs" (
-    call :vcpkg_preflight
     set "ENV_NAME=!CFG_env_win!"
     if not defined ENV_NAME set "ENV_NAME=CFLAT_TESTLIB_!LIBNAME!"
     call set "ROOT=%%!ENV_NAME!%%"
-    if not defined ROOT set "ROOT=%REPO%test_libs\vcpkg_installed\%VCPKG_TRIPLET%"
+    if not defined ROOT call :testlibs_root
+    if not defined ROOT exit /b 0
 ) else if /I "!CFG_root_win!"=="deps" (
     if defined CFLAT_VCPKG_INSTALLED (set "ROOT=%CFLAT_VCPKG_INSTALLED%") else set "ROOT=%USERPROFILE%\.cflat-compiler-deps\vcpkg_installed"
     set "ROOT=!ROOT!\x64-windows-static"
@@ -112,6 +113,21 @@ if "%WARM%"=="1" (
         if not errorlevel 1 call :case "%%~fC" 1
     )
 )
+exit /b 0
+
+:testlibs_root
+REM A lib dir with its own vcpkg.json (torch: hours to build) owns a separate tree that it installs by hand;
+REM never auto-install it. Everything else shares test_libs\vcpkg.json, installed by :vcpkg_preflight.
+if exist "%LIBDIR%\vcpkg.json" (
+    if not exist "%LIBDIR%\vcpkg_installed\%VCPKG_TRIPLET%" (
+        call :missing_lib "own vcpkg tree not installed: %LIBDIR%\vcpkg_installed\%VCPKG_TRIPLET%"
+        exit /b 0
+    )
+    set "ROOT=%LIBDIR%\vcpkg_installed\%VCPKG_TRIPLET%"
+    exit /b 0
+)
+call :vcpkg_preflight
+set "ROOT=%REPO%test_libs\vcpkg_installed\%VCPKG_TRIPLET%"
 exit /b 0
 
 :vcpkg_preflight
@@ -193,8 +209,13 @@ if errorlevel 1 (
     exit /b 0
 )
 if "!MODE!"=="run" (
+    REM runenv_win=NAME=VALUE applies to the run only; a value the caller already set wins.
+    set "RUNENV_SET="
+    if defined CFG_runenv_win for /f "tokens=1,* delims==" %%E in ("!CFG_runenv_win!") do if not defined %%E (set "%%E=%%F"& set "RUNENV_SET=%%E")
     ".\!CASE!.exe" !CASE_ARGS! >"run.log" 2>&1
-    if errorlevel 1 (
+    set "RUN_RC=!errorlevel!"
+    if defined RUNENV_SET set "!RUNENV_SET!="
+    if !RUN_RC! neq 0 (
         if defined DISABLED_PATHS (echo XFAIL !CASE!& set /a XFAIL+=1) else (echo FAIL !CASE! run& set /a FAIL+=1)
         call :tail5 "run.log"
         set "PATH=!CASE_PATH!"

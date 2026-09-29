@@ -1,0 +1,177 @@
+// C++20 equivalent of torch_01_tensor.cb (clang++ parity baseline)
+#include <cstdint>
+#include <cstdio>
+#include <vector>
+#include <torch/torch.h>
+
+using i64 = int64_t;
+
+int leg_t1()
+{
+    i64 dims = 3;
+    c10::IntArrayRef shape = c10::IntArrayRef(&dims, 1);
+    at::Tensor t = torch::ones(shape);
+    i64 n = t.numel();
+    std::printf("t1 numel=%lld\n", n);
+    int fail = 0;
+    if (n != 3) { std::printf("FAIL t1 numel: got %lld want 3\n", n); fail++; }
+    return fail;
+}
+
+int leg_t2()
+{
+    i64 dims = 6;
+    c10::IntArrayRef shape = c10::IntArrayRef(&dims, 1);
+    at::Tensor t = torch::ones(shape);
+    at::Tensor s = at::sum(t);
+    double d = s.item().toDouble();
+    std::printf("t2 sum=%f\n", d);
+    int fail = 0;
+    if (d != 6.0) { std::printf("FAIL t2 sum: got %f want 6\n", d); fail++; }
+    return fail;
+}
+
+int leg_t3()
+{
+    i64 dims = 3;
+    c10::IntArrayRef shape = c10::IntArrayRef(&dims, 1);
+    at::Tensor t = torch::ones(shape);
+    at::Tensor u = t + t;
+    i64 n = u.numel();
+    std::printf("t3 numel=%lld\n", n);
+    int fail = 0;
+    if (n != 3) { std::printf("FAIL t3 numel: got %lld want 3\n", n); fail++; }
+    return fail;
+}
+
+int leg_t10()
+{
+    torch::manual_seed(7);
+    i64 d23[2] = {2, 3};
+    i64 d6[1] = {6};
+    i64 d32[2] = {3, 2};
+    c10::IntArrayRef s23 = c10::IntArrayRef(&d23[0], 2);
+    c10::IntArrayRef s6 = c10::IntArrayRef(&d6[0], 1);
+    c10::IntArrayRef s32 = c10::IntArrayRef(&d32[0], 2);
+    at::Tensor r = torch::randn(s23);
+    c10::IntArrayRef rs = r.sizes();
+    int rank = (int)rs.size();
+    i64 rs0 = rs[0];
+    i64 rs1 = rs[1];
+    float data[6] = {1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f};
+    at::Tensor x = torch::from_blob(&data[0], s23);
+    at::Tensor flat = x.view(s6);
+    at::Tensor tall = x.view(s32);
+    std::vector<at::Tensor> parts;
+    parts.push_back(x);
+    parts.push_back(x);
+    c10::ArrayRef<at::Tensor> tl = c10::ArrayRef<at::Tensor>(parts.data(), parts.size());
+    at::Tensor stacked = at::stack(tl, (i64)0);
+    double stackSum = at::sum(stacked).item().toDouble();
+    at::Tensor sm = at::softmax(x, 1);
+    double smSum = at::sum(sm).item().toDouble();
+    double amax = at::argmax(x).item().toDouble();
+    at::Tensor sliced = x.slice((i64)0);
+    double sliceSum = at::sum(sliced).item().toDouble();
+    at::Tensor row1 = at::narrow(x, (i64)0, (i64)1, (i64)1);
+    double rowSum = at::sum(row1).item().toDouble();
+    at::Tensor sliced13 = x.slice(0, 1, 3, 1);
+    double slice13Sum = at::sum(sliced13).item().toDouble();
+    at::Tensor catted = at::cat(tl, (i64)0);
+    double catSum = at::sum(catted).item().toDouble();
+    i64 cat0 = catted.size(0);
+    i64 cat1 = catted.size(1);
+    std::printf("t10 catSum=%f dims=%lldx%lld\n", catSum, cat0, cat1);
+    at::Tensor row0 = x[0];
+    double row0Sum = at::sum(row0).item().toDouble();
+    int itemBytes = (int)x.dtype().itemsize();
+    i64 flat0 = flat.size(0);
+    i64 flatDim = flat.dim();
+    i64 tall0 = tall.size(0);
+    i64 tall1 = tall.size(1);
+    int stackDim = (int)stacked.dim();
+    i64 stack0 = stacked.size(0);
+    i64 sliced0 = sliced.size(0);
+    i64 sliced1 = sliced.size(1);
+    i64 sliced130 = sliced13.size(0);
+    i64 sliced131 = sliced13.size(1);
+    std::printf("t10 rank=%d rs=%lldx%lld flat=%lld tall=%lldx%lld stackSum=%f smSum=%f amax=%f sliceSum=%f rowSum=%f row0Sum=%f bytes=%d\n", rank, rs0, rs1, flat0, tall0, tall1, stackSum, smSum, amax, sliceSum, rowSum, row0Sum, itemBytes);
+    std::printf("t10 slice13Sum=%f\n", slice13Sum);
+    int fail = 0;
+    if (catSum != 42.0) { std::printf("FAIL t10 catSum: got %f want 42\n", catSum); fail++; }
+    if (cat0 != 4 || cat1 != 3) { std::printf("FAIL t10 cat shape: got %lldx%lld want 4x3\n", cat0, cat1); fail++; }
+    if (rank != 2 || rs0 != 2 || rs1 != 3) { std::printf("FAIL t10 randn shape: got rank=%d %lldx%lld want 2 2x3\n", rank, rs0, rs1); fail++; }
+    if (flat0 != 6 || flatDim != 1) { std::printf("FAIL t10 flat: got dim=%lld size=%lld want 1 and 6\n", flatDim, flat0); fail++; }
+    if (tall0 != 3 || tall1 != 2) { std::printf("FAIL t10 tall: got %lldx%lld want 3x2\n", tall0, tall1); fail++; }
+    if (stackDim != 3 || stack0 != 2 || stackSum != 42.0) { std::printf("FAIL t10 stack: got dim=%d size0=%lld sum=%f want 3 2 42\n", stackDim, stack0, stackSum); fail++; }
+    if (smSum < 1.999 || smSum > 2.001) { std::printf("FAIL t10 softmax sum: got %f want 2 +/- 0.001\n", smSum); fail++; }
+    if (amax != 5.0) { std::printf("FAIL t10 argmax: got %f want 5\n", amax); fail++; }
+    if (sliceSum != 21.0 || sliced0 != 2 || sliced1 != 3) { std::printf("FAIL t10 slice: got sum=%f shape=%lldx%lld want 21 2x3\n", sliceSum, sliced0, sliced1); fail++; }
+    if (rowSum != 15.0) { std::printf("FAIL t10 row sum: got %f want 15\n", rowSum); fail++; }
+    if (slice13Sum != 15.0 || sliced130 != 1 || sliced131 != 3) { std::printf("FAIL t10 slice13: got sum=%f shape=%lldx%lld want 15 1x3\n", slice13Sum, sliced130, sliced131); fail++; }
+    if (row0Sum != 6.0) { std::printf("FAIL t10 row0 sum: got %f want 6\n", row0Sum); fail++; }
+    if (itemBytes != 4) { std::printf("FAIL t10 item bytes: got %d want 4\n", itemBytes); fail++; }
+    return fail;
+}
+
+int leg_t20()
+{
+    at::Tensor x = torch::ones({2, 3});
+    at::Tensor z = torch::zeros_like(x);
+    z.fill_(3.0);
+    at::Tensor cat = torch::cat({x, z}, 0);
+    i64 cat0 = cat.size(0);
+    at::Tensor stacked = torch::stack({x, z});
+    i64 stack0 = stacked.size(0);
+    double sum = cat.sum().item<double>();
+    std::printf("t20 cat=%d stack=%d sum=%f\n", (int)cat0, (int)stack0, sum);
+    int fail = 0;
+    if (cat0 != 4) { std::printf("FAIL t20 cat size: got %lld want 4\n", cat0); fail++; }
+    if (stack0 != 2) { std::printf("FAIL t20 stack size: got %lld want 2\n", stack0); fail++; }
+    if (sum != 24.0) { std::printf("FAIL t20 sum: got %f want 24\n", sum); fail++; }
+    return fail;
+}
+
+int leg_t27()
+{
+    at::Tensor x = torch::arange(12).reshape({3, 4});
+    std::vector<torch::indexing::TensorIndex> colIdx;
+    colIdx.push_back(torch::indexing::TensorIndex(torch::indexing::Slice()));
+    colIdx.push_back(torch::indexing::TensorIndex(1));
+    c10::ArrayRef<torch::indexing::TensorIndex> colRef = c10::ArrayRef<torch::indexing::TensorIndex>(colIdx.data(), colIdx.size());
+    at::Tensor col = x.index(colRef);
+    std::vector<torch::indexing::TensorIndex> rowIdx;
+    rowIdx.push_back(torch::indexing::TensorIndex(0));
+    c10::ArrayRef<torch::indexing::TensorIndex> rowRef = c10::ArrayRef<torch::indexing::TensorIndex>(rowIdx.data(), rowIdx.size());
+    at::Tensor row = x.index(rowRef);
+    std::vector<torch::indexing::TensorIndex> subIdx;
+    subIdx.push_back(torch::indexing::TensorIndex(torch::indexing::Slice(0, 2)));
+    subIdx.push_back(torch::indexing::TensorIndex(torch::indexing::Slice(1, 3)));
+    c10::ArrayRef<torch::indexing::TensorIndex> subRef = c10::ArrayRef<torch::indexing::TensorIndex>(subIdx.data(), subIdx.size());
+    at::Tensor sub = x.index(subRef);
+    i64 col0 = col.size(0);
+    i64 row0 = row.size(0);
+    i64 sub0 = sub.size(0);
+    i64 sub1 = sub.size(1);
+    i64 subSum = sub.sum().item<i64>();
+    std::printf("t27 col=%d row=%d sub=%dx%d s=%d\n", (int)col0, (int)row0, (int)sub0, (int)sub1, (int)subSum);
+    int fail = 0;
+    if (col0 != 3) { std::printf("FAIL t27 column rows: got %lld want 3\n", col0); fail++; }
+    if (row0 != 4) { std::printf("FAIL t27 row columns: got %lld want 4\n", row0); fail++; }
+    if (sub0 != 2 || sub1 != 2) { std::printf("FAIL t27 sub shape: got %lldx%lld want 2x2\n", sub0, sub1); fail++; }
+    if (subSum != 14) { std::printf("FAIL t27 sub sum: got %d want 14\n", (int)subSum); fail++; }
+    return fail;
+}
+
+int main()
+{
+    int fail = 0;
+    fail += leg_t1();
+    fail += leg_t2();
+    fail += leg_t3();
+    fail += leg_t10();
+    fail += leg_t20();
+    fail += leg_t27();
+    if (!fail) std::printf("PASS torch_01_tensor\n");
+    return fail;
+}

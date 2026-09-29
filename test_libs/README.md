@@ -22,6 +22,7 @@ Each library directory has a plain `lib.cfg`, with one `key=value` per line. Lin
 - `probe=<relative path>` must exist below the root or the library is skipped (or failed with `--strict`).
 - `include=<dirs>` lists include directories below the root. `lib_mac=<files>` and `lib_win=<files>` list libraries below it.
 - `runpath_mac=<dir>` and `runpath_win=<dir>` add a runtime library directory when needed.
+- `runenv_win=NAME=VALUE` sets one environment variable for the case run (not the compile); a value already set by the caller wins.
 - `version_mac=<command>` and `version_win=<command>` print the installed library version. `hint_mac=<text>` and `hint_win=<text>` explain how to install a missing library.
 - `args=<args>` are passed to the built case when it runs; `@REPO@` expands to the repository root.
 - `timeout=<seconds>` records the per-case timeout; the current Windows runner does not enforce it.

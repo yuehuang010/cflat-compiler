@@ -1,0 +1,185 @@
+// C++20 equivalent of torch_04_training.cb (clang++ parity baseline)
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include <memory>
+#include <string>
+#include <vector>
+#include <torch/torch.h>
+
+using i64 = int64_t;
+
+int leg_t7()
+{
+    float xs[6] = {1.0f, 0.0f, 0.0f, 1.0f, 1.0f, 1.0f};
+    float ys[3] = {2.0f, 3.0f, 5.0f};
+    i64 dx[2] = {3, 2};
+    i64 dy[2] = {3, 1};
+    c10::IntArrayRef sx = c10::IntArrayRef(&dx[0], 2);
+    c10::IntArrayRef sy = c10::IntArrayRef(&dy[0], 2);
+    at::Tensor x = torch::from_blob(&xs[0], sx);
+    at::Tensor y = torch::from_blob(&ys[0], sy);
+    torch::nn::Linear lin = torch::nn::Linear(2, 1);
+    torch::optim::SGDOptions sopt = torch::optim::SGDOptions(0.1);
+    torch::optim::SGD opt = torch::optim::SGD(lin->parameters(), sopt);
+    double first = 0.0;
+    double last = 0.0;
+    for (int step = 0; step < 200; step++) {
+        opt.zero_grad();
+        at::Tensor pred = lin->forward(x);
+        at::Tensor loss = at::mse_loss(pred, y);
+        loss.backward();
+        opt.step();
+        last = loss.item().toDouble();
+        if (step == 0) first = last;
+    }
+    std::printf("first=%f last=%f\n", first, last);
+    int failures = 0;
+    if (!(last < first && last < 0.05)) { std::printf("FAIL t7: got %f want < first and < 0.05\n", last); failures++; }
+    return failures;
+}
+
+int leg_t9()
+{
+    torch::manual_seed(1);
+    float xs[8] = {0.0f, 0.0f, 0.0f, 1.0f, 1.0f, 0.0f, 1.0f, 1.0f};
+    float ys[4] = {0.0f, 1.0f, 1.0f, 0.0f};
+    i64 dx[2] = {4, 2};
+    i64 dy[2] = {4, 1};
+    c10::IntArrayRef sx = c10::IntArrayRef(&dx[0], 2);
+    c10::IntArrayRef sy = c10::IntArrayRef(&dy[0], 2);
+    at::Tensor x = torch::from_blob(&xs[0], sx);
+    at::Tensor y = torch::from_blob(&ys[0], sy);
+    torch::nn::Linear l1 = torch::nn::Linear(2, 8);
+    torch::nn::Linear l2 = torch::nn::Linear(8, 1);
+    std::vector<at::Tensor> params;
+    std::vector<at::Tensor> p1 = l1->parameters();
+    std::vector<at::Tensor> p2 = l2->parameters();
+    for (int i = 0; i < (int)p1.size(); i++) params.push_back(p1[i]);
+    for (int i = 0; i < (int)p2.size(); i++) params.push_back(p2[i]);
+    torch::optim::AdamOptions aopt = torch::optim::AdamOptions(0.01);
+    torch::optim::Adam opt = torch::optim::Adam(params, aopt);
+    double first = 0.0;
+    double last = 0.0;
+    for (int step = 0; step < 500; step++) {
+        opt.zero_grad();
+        at::Tensor h = at::relu(l1->forward(x));
+        at::Tensor pred = l2->forward(h);
+        at::Tensor loss = at::mse_loss(pred, y);
+        loss.backward();
+        opt.step();
+        last = loss.item().toDouble();
+        if (step == 0) first = last;
+    }
+    std::printf("nparams=%d first=%f last=%g\n", (int)params.size(), first, last);
+    int failures = 0;
+    if (params.size() != 4) { std::printf("FAIL t9 params: got %d want 4\n", (int)params.size()); failures++; }
+    if (!(last < first && last < 0.05)) { std::printf("FAIL t9 loss: got %g want < first and < 0.05\n", last); failures++; }
+    return failures;
+}
+
+int leg_t12()
+{
+    torch::manual_seed(1);
+    float xs[8] = {0.0f, 0.0f, 0.0f, 1.0f, 1.0f, 0.0f, 1.0f, 1.0f};
+    float ys[4] = {0.0f, 1.0f, 1.0f, 0.0f};
+    i64 dx[2] = {4, 2};
+    i64 dy[2] = {4, 1};
+    c10::IntArrayRef sx = c10::IntArrayRef(&dx[0], 2);
+    c10::IntArrayRef sy = c10::IntArrayRef(&dy[0], 2);
+    at::Tensor x = torch::from_blob(&xs[0], sx);
+    at::Tensor y = torch::from_blob(&ys[0], sy);
+    torch::nn::Linear l1 = torch::nn::Linear(2, 8);
+    torch::nn::ReLU relu = torch::nn::ReLU();
+    torch::nn::Linear l2 = torch::nn::Linear(8, 1);
+    torch::nn::Sequential seq = torch::nn::Sequential(l1, relu, l2);
+    std::vector<at::Tensor> params = seq->parameters();
+    torch::optim::AdamOptions aopt = torch::optim::AdamOptions(0.01);
+    torch::optim::Adam opt = torch::optim::Adam(params, aopt);
+    double first = 0.0;
+    double last = 0.0;
+    for (int step = 0; step < 500; step++) {
+        opt.zero_grad();
+        at::Tensor pred = seq->forward(x);
+        at::Tensor loss = at::mse_loss(pred, y);
+        loss.backward();
+        opt.step();
+        last = loss.item().toDouble();
+        if (step == 0) first = last;
+    }
+    std::printf("modules=%d nparams=%d first=%f last=%g\n", (int)seq->size(), (int)params.size(), first, last);
+    int failures = 0;
+    if (seq->size() != 3) { std::printf("FAIL t12 modules: got %d want 3\n", (int)seq->size()); failures++; }
+    if (params.size() != 4) { std::printf("FAIL t12 params: got %d want 4\n", (int)params.size()); failures++; }
+    if (!(last < first && last < 0.05)) { std::printf("FAIL t12 loss: got %g want < first and < 0.05\n", last); failures++; }
+    return failures;
+}
+
+int leg_t22()
+{
+    torch::nn::Sequential seq = torch::nn::Sequential();
+    seq->push_back("fc1", torch::nn::Linear(2, 4));
+    seq->push_back("act", torch::nn::ReLU());
+    seq->push_back("fc2", torch::nn::Linear(4, 1));
+    torch::OrderedDict<std::string, at::Tensor> np = seq->named_parameters();
+    i64 shape[2] = {3, 2};
+    c10::IntArrayRef sizes = c10::IntArrayRef(&shape[0], 2);
+    at::Tensor y = seq->forward(torch::ones(sizes));
+    const char* key = np.front().key().c_str();
+    std::printf("n=%d k0=%s\n", (int)np.size(), key);
+    std::printf("y=%dx%d\n", (int)y.size(0), (int)y.size(1));
+    int failures = 0;
+    if (np.size() != 4) { std::printf("FAIL t22 count: got %d want 4\n", (int)np.size()); failures++; }
+    if (std::strcmp(key, "fc1.weight") != 0) { std::printf("FAIL t22 key: got %s want fc1.weight\n", key); failures++; }
+    if (y.size(0) != 3 || y.size(1) != 1) { std::printf("FAIL t22 shape: got %dx%d want 3x1\n", (int)y.size(0), (int)y.size(1)); failures++; }
+    return failures;
+}
+
+int leg_t25()
+{
+    torch::nn::Sequential seq = torch::nn::Sequential();
+    seq->push_back("fc1", torch::nn::Linear(2, 4));
+    seq->push_back("act", torch::nn::ReLU());
+    seq->push_back("fc2", torch::nn::Linear(4, 1));
+    torch::OrderedDict<std::string, at::Tensor> np = seq->named_parameters();
+    i64 shape[2] = {3, 2};
+    c10::IntArrayRef sizes = c10::IntArrayRef(&shape[0], 2);
+    at::Tensor y = seq->forward(torch::ones(sizes));
+    const char* key = np[0].key().c_str();
+    std::printf("n=%d k0=%s\n", (int)np.size(), key);
+    std::printf("y=%dx%d\n", (int)y.size(0), (int)y.size(1));
+    int failures = 0;
+    if (np.size() != 4) { std::printf("FAIL t25 count: got %d want 4\n", (int)np.size()); failures++; }
+    if (std::strcmp(key, "fc1.weight") != 0) { std::printf("FAIL t25 key: got %s want fc1.weight\n", key); failures++; }
+    if (y.size(0) != 3 || y.size(1) != 1) { std::printf("FAIL t25 shape: got %dx%d want 3x1\n", (int)y.size(0), (int)y.size(1)); failures++; }
+    return failures;
+}
+
+int leg_t28()
+{
+    torch::nn::Module m = torch::nn::Module("root");
+    std::shared_ptr<torch::nn::LinearImpl> fc = m.register_module("fc", torch::nn::Linear(4, 2));
+    std::shared_ptr<torch::nn::ReLUImpl> act = m.register_module("act", torch::nn::ReLU());
+    i64 shape[2] = {3, 4};
+    c10::IntArrayRef sizes = c10::IntArrayRef(&shape[0], 2);
+    at::Tensor y = act->forward(fc->forward(torch::ones(sizes)));
+    std::vector<at::Tensor> ps = m.parameters();
+    std::printf("n=%d y=%dx%d\n", (int)ps.size(), (int)y.size(0), (int)y.size(1));
+    int failures = 0;
+    if (ps.size() != 2) { std::printf("FAIL t28 params: got %d want 2\n", (int)ps.size()); failures++; }
+    if (y.size(0) != 3 || y.size(1) != 2) { std::printf("FAIL t28 shape: got %dx%d want 3x2\n", (int)y.size(0), (int)y.size(1)); failures++; }
+    return failures;
+}
+
+int main()
+{
+    int failures = 0;
+    failures += leg_t7();
+    failures += leg_t9();
+    failures += leg_t12();
+    failures += leg_t22();
+    failures += leg_t25();
+    failures += leg_t28();
+    if (failures == 0) std::printf("PASS torch_04_training\n");
+    return failures;
+}

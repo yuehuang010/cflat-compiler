@@ -6,7 +6,7 @@ int leg_t17()
 {
     int failures = 0;
     torch.manual_seed(7);
-    long[2] shape = {2, 3};
+    i64[2] shape = {2, 3};
     c10.IntArrayRef sizes = c10.IntArrayRef(&shape[0], 2);
     at.Tensor x = torch.randn(sizes);
     at.Tensor r = torch.nn.functional.relu(x);
@@ -23,7 +23,7 @@ int leg_t17()
     }
     if (req != 0) { printf("FAIL t17 req: got %d want 0\n", req); failures++; }
 
-    long[2] sq = {2, 2};
+    i64[2] sq = {2, 2};
     c10.IntArrayRef sq2 = c10.IntArrayRef(&sq[0], 2);
     at.Tensor o = torch.ones(sq2);
     at.Tensor d = o.to(c10.ScalarType.Double);
@@ -32,17 +32,17 @@ int leg_t17()
     at.Tensor u = o.unsqueeze(0);
     int dtype = (int)d.scalar_type();
     double msum = m.sum().item<double>();
-    long vsize = v.size(0);
-    long udim = u.dim();
+    i64 vsize = v.size(0);
+    i64 udim = u.dim();
     if (dtype != 7) { printf("FAIL t17 dtype: got %d want 7\n", dtype); failures++; }
     if (msum != 8.0) { printf("FAIL t17 msum: got %f want 8.0\n", msum); failures++; }
-    if (vsize != 4) { printf("FAIL t17 vsize: got %ld want 4\n", vsize); failures++; }
-    if (udim != 3) { printf("FAIL t17 udim: got %ld want 3\n", udim); failures++; }
+    if (vsize != 4) { printf("FAIL t17 vsize: got %lld want 4\n", vsize); failures++; }
+    if (udim != 3) { printf("FAIL t17 udim: got %lld want 3\n", udim); failures++; }
     // A named local reaches IntArrayRef through the ctor thunk; its view must not dangle.
-    long four = 4;
+    i64 four = 4;
     at.Tensor vl = o.view(four);
-    long vlsize = vl.size(0);
-    if (vlsize != 4) { printf("FAIL t17 vlsize: got %ld want 4\n", vlsize); failures++; }
+    i64 vlsize = vl.size(0);
+    if (vlsize != 4) { printf("FAIL t17 vlsize: got %lld want 4\n", vlsize); failures++; }
 
     at.Tensor w = torch.ones(sq2) * 4.0;
     torch.save(w, "t17.pt");
