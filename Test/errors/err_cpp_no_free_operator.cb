@@ -1,5 +1,8 @@
 import cpp "cpp_interop_basic.h";
 import cpp "cpp_interop_strop.h";
+import cpp "cpp_interop_freeoptpl.h";
+
+struct NativeNoPlus { int v; };
 
 extern int main()
 {
@@ -51,6 +54,48 @@ extern int main()
         char[4][4] rowsAll = default;
         cppsopd.Tally tally;
         int viaAll = tally - rowsAll;
+    }
+    // Unary operators: nothing binds - no member, no free operator, no implicit conversion
+    // function to an arithmetic type. clang: "invalid argument type to unary expression".
+    expect_error("no operator '+' for type 'cppfopun.N'") {
+        cppfopun.N u = default;
+        auto r = +u;
+    }
+    expect_error("no operator '-' for type 'cppfopun.N'") {
+        cppfopun.N u = default;
+        auto r = -u;
+    }
+    // An `explicit operator int` / `explicit operator bool` is no implicit conversion.
+    expect_error("no operator '+' for type 'cppfopun.E'") {
+        cppfopun.E u = default;
+        auto r = +u;
+    }
+    expect_error("no operator '+' for type 'cppfopun.EB'") {
+        cppfopun.EB u = default;
+        auto r = +u;
+    }
+    expect_error("no operator '~' for type 'cppfopun.EB'") {
+        cppfopun.EB u = default;
+        auto r = ~u;
+    }
+    // `~` has no floating-point built-in, whatever the conversion function returns.
+    expect_error("no operator '~' for type 'cppfopun.Dbl'") {
+        cppfopun.Dbl u = default;
+        auto r = ~u;
+    }
+    // A CFlat struct with no unary operator+ is refused like `-` and `~` were, not passed through.
+    expect_error("no operator '+' for type 'NativeNoPlus'") {
+        NativeNoPlus n = { v = 4 };
+        NativeNoPlus r = +n;
+    }
+    // Two implicit conversion functions to arithmetic types: clang reports the operator ambiguous.
+    expect_error("ambiguous implicit conversion for built-in operator '+'") {
+        cppfopun.Two u = default;
+        auto r = +u;
+    }
+    expect_error("ambiguous implicit conversion for built-in operator '-'") {
+        cppfopun.Two u = default;
+        auto r = -u;
     }
     return 0;
 }

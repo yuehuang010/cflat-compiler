@@ -7828,6 +7828,363 @@ extern int main()
                 || cppas.Tally.move_assigns != 1) return 7488;
         }
     }
+    // Operators returning a class-template specialization nothing requested yet: the on-use retry
+    // requests it, for member operators (legs 7551, 7553 and 7554 are the compound forms that used to fail
+    // with "no overload for compound assignment"), inherited ones, and free ones.
+    cppi_opspec.OsW osA = cppi_opspec.OsW(2.0);
+    if ((osA * 3.0).eval() != 6.0) return 7545;
+    if (((osA * 3.0) * 2.0).eval() != 12.0) return 7546;
+    if ((osA / 4.0).eval() != 8.0) return 7547;
+    cppi_opspec.OsNamed<cppi_opspec.OsW> osNamed = osA - 1.0;
+    if (osNamed.get() != 1.0) return 7548;
+    if (!(osA == 2.0).ok() || (osA == 5.0).ok()) return 7549;
+    if ((-osA).eval() != -2.0 || osA[3].get() != 5.0 || osA(4.0).get() != 8.0) return 7550;
+    cppi_opspec.OsW osB = cppi_opspec.OsW(3.0);
+    osB *= 2.0;
+    if (osB.v != 6.0) return 7551;
+    cppi_opspec.OsDerived osD = cppi_opspec.OsDerived(5.0);
+    if ((osD * 2.0).eval() != 10.0 || (-osD).eval() != -5.0
+        || osD[1].get() != 6.0 || osD(2.0).get() != 10.0) return 7552;
+    osD += 4.0;
+    if (osD.v != 9.0) return 7553;
+    cppi_opspec.OsFw osF = cppi_opspec.OsFw(2.0);
+    osF *= 4.0;
+    cppi_opspec.OsFv osV = cppi_opspec.OsFv(2.0);
+    if (osF.v != 8.0 || (osV * 8.0).get() != 16.0) return 7554;
+    // `c op= move d` binds the rvalue-reference parameter to the moved value, spec or plain return
+    // (the source is dead after `move`; the callee stealing from it is oracle-checked in scratch, not readable here).
+    cppi_opspec.OsMv osMc = cppi_opspec.OsMv(1.0);
+    cppi_opspec.OsMv osMd = cppi_opspec.OsMv(4.0);
+    osMc &= move osMd;
+    if (osMc.v != 5.0) return 7555;
+    cppi_opspec.OsMv2 osM2c = cppi_opspec.OsMv2(1.0);
+    cppi_opspec.OsMv2 osM2d = cppi_opspec.OsMv2(4.0);
+    osM2c &= move osM2d;
+    if (osM2c.v != 5.0) return 7556;
+    cppi_opspec.OsMv2 osM2e = cppi_opspec.OsMv2(2.0);
+    cppi_opspec.OsMv2 osM2f = cppi_opspec.OsMv2(3.0);
+    cppi_opspec.OsMv2 osM2g = osM2e & move osM2f;
+    if (osM2g.v != 5.0 || osM2e.v != 2.0) return 7557;
+    // Postfix ++ / -- on a class whose prefix operator returns an unrequested specialization.
+    cppi_opspec.OsInc osZ = cppi_opspec.OsInc(2.0);
+    osZ++;
+    if (osZ.v != 3.0) return 7558;
+    osZ--;
+    osZ--;
+    if (osZ.v != 1.0) return 7559;
+    // A refusal for another reason (pointer-to-member parameter) keeps its old answer.
+    expect_error("no overload for compound assignment '%=' on type 'cppi_opspec.OsW'") {
+        osA %= 2.0;
+    }
+    {
+        // `operator bool` / conversion operators run on the OBJECT (a self-pointer or mutating one
+        // sees a bitwise copy otherwise), in every condition context and lvalue kind; a prvalue
+        // temporary is destroyed exactly once. Counts match a clang++ -std=c++20 oracle.
+        { cppas.obReset(); cppas.ObSelf p = default; int r = 0; if (p) r = 1; if (!(r == 1 && cppas.obHits == 1)) return 31600; }
+        { cppas.obReset(); cppas.ObSelf p = default; int r = 0; int n = 0; while (p) { n++; if (n == 2) break; } r = n == 2 ? 1 : 0; if (!(r == 1 && cppas.obHits == 2)) return 31601; }
+        { cppas.obReset(); cppas.ObSelf p = default; int r = 0; for (int i = 0; p && i < 2; i++) r++; r = r == 2 ? 1 : 0; if (!(r == 1 && cppas.obHits == 3)) return 31602; }
+        { cppas.obReset(); cppas.ObSelf p = default; int r = p ? 1 : 2; if (!(r == 1 && cppas.obHits == 1)) return 31603; }
+        { cppas.obReset(); cppas.ObSelf p = default; int r = !p ? 0 : 1; if (!(r == 1 && cppas.obHits == 1)) return 31604; }
+        { cppas.obReset(); cppas.ObSelf p = default; int r = (false || p) ? 1 : 0; if (!(r == 1 && cppas.obHits == 1)) return 31605; }
+        { cppas.obReset(); cppas.ObSelf p = default; int r = (true && p) ? 1 : 0; if (!(r == 1 && cppas.obHits == 1)) return 31606; }
+        { cppas.obReset(); cppas.ObSelf p = default; bool b = p; int r = b ? 1 : 0; if (!(r == 1 && cppas.obHits == 1)) return 31607; }
+        { cppas.obReset(); cppas.ObSelf p = default; bool b = false; b = p; int r = b ? 1 : 0; if (!(r == 1 && cppas.obHits == 1)) return 31608; }
+        { cppas.obReset(); cppas.ObSelfX p = default; int r = 0; if (p) r = 1; if (!(r == 1 && cppas.obHits == 1)) return 31609; }
+        { cppas.obReset(); cppas.ObSelfX p = default; int r = 0; int n = 0; while (p) { n++; if (n == 2) break; } r = n == 2 ? 1 : 0; if (!(r == 1 && cppas.obHits == 2)) return 31610; }
+        { cppas.obReset(); cppas.ObSelfX p = default; int r = p ? 1 : 2; if (!(r == 1 && cppas.obHits == 1)) return 31611; }
+        { cppas.obReset(); cppas.ObSelfX p = default; int r = !p ? 0 : 1; if (!(r == 1 && cppas.obHits == 1)) return 31612; }
+        { cppas.obReset(); cppas.ObSelfX p = default; int r = (false || p) ? 1 : 0; if (!(r == 1 && cppas.obHits == 1)) return 31613; }
+        { cppas.obReset(); cppas.ObSelfX p = default; int r = (true && p) ? 1 : 0; if (!(r == 1 && cppas.obHits == 1)) return 31614; }
+        { cppas.obReset(); cppas.ObSelfX p = default; bool b = (bool)p; int r = b ? 1 : 0; if (!(r == 1 && cppas.obHits == 1)) return 31615; }
+        { cppas.obReset(); cppas.ObConstSelf p = default; int r = 0; if (p) r = 1; if (!(r == 1 && cppas.obHits == 1)) return 31616; }
+        { cppas.obReset(); cppas.ObConstSelf p = default; int r = p ? 1 : 2; if (!(r == 1 && cppas.obHits == 1)) return 31617; }
+        { cppas.obReset(); cppas.ObConstSelf p = default; int r = !p ? 0 : 1; if (!(r == 1 && cppas.obHits == 1)) return 31618; }
+        { cppas.obReset(); cppas.ObConstSelf p = default; int r = (false || p) ? 1 : 0; if (!(r == 1 && cppas.obHits == 1)) return 31619; }
+        { cppas.obReset(); cppas.ObConstSelf p = default; bool b = p; int r = b ? 1 : 0; if (!(r == 1 && cppas.obHits == 1)) return 31620; }
+        { cppas.obReset(); cppas.ObConstSelfX p = default; int r = 0; if (p) r = 1; if (!(r == 1 && cppas.obHits == 1)) return 31621; }
+        { cppas.obReset(); cppas.ObConstSelfX p = default; int r = !p ? 0 : 1; if (!(r == 1 && cppas.obHits == 1)) return 31622; }
+        { cppas.obReset(); cppas.ObConstSelfX p = default; int r = (true && p) ? 1 : 0; if (!(r == 1 && cppas.obHits == 1)) return 31623; }
+        { cppas.obReset(); cppas.ObHolder h = default; int r = 0; if (h.f) r = 1; if (!(r == 1 && cppas.obHits == 1)) return 31624; }
+        { cppas.obReset(); cppas.ObHolder h = default; int r = h.c ? 1 : 2; if (!(r == 1 && cppas.obHits == 1)) return 31625; }
+        { cppas.obReset(); cppas.ObSelf p = default; cppas.ObSelf* q = &p; int r = 0; if (*q) r = 1; if (!(r == 1 && cppas.obHits == 1)) return 31626; }
+        { cppas.obReset(); cppas.ObHolder h = default; cppas.ObHolder* q = &h; int r = 0; if (q->f) r = 1; if (!(r == 1 && cppas.obHits == 1)) return 31627; }
+        { cppas.obReset(); cppas.ObSelf[2] a = default; int i = 1; int r = 0; if (a[i]) r = 1; if (!(r == 1 && cppas.obHits == 1)) return 31628; }
+        { cppas.obReset();  int r = 0; if (cppas.obGlobal) r = 1; if (!(r == 1 && cppas.obHits == 1)) return 31629; }
+        { cppas.obReset(); cppas.ObSelf p = default; int r = ObAliasParam(p); if (!(r == 1 && cppas.obHits == 1)) return 31630; }
+        { cppas.obReset(); cppas.ObSelf p = default; int r = ObPtrParam(&p); if (!(r == 1 && cppas.obHits == 1)) return 31631; }
+        { cppas.obReset();  int r = 0; if (cppas.obMkSelf(3)) r = 1; if (!(r == 1 && cppas.obHits == 1 && cppas.obDtors == 1)) return 31632; }
+        { cppas.obReset();  int r = cppas.obMkSelf(3) ? 1 : 2; if (!(r == 1 && cppas.obHits == 1 && cppas.obDtors == 1)) return 31633; }
+        { cppas.obReset();  int r = (false || cppas.obMkSelf(3)) ? 1 : 0; if (!(r == 1 && cppas.obHits == 1 && cppas.obDtors == 1)) return 31634; }
+        { cppas.obReset();  int r = !cppas.obMkSelf(3) ? 0 : 1; if (!(r == 1 && cppas.obHits == 1 && cppas.obDtors == 1)) return 31635; }
+        { cppas.obReset();  bool b = cppas.obMkSelf(3); int r = b ? 1 : 0; if (!(r == 1 && cppas.obHits == 1 && cppas.obDtors == 1)) return 31636; }
+        { cppas.obReset();  int r = cppas.obMkConst(3) ? 1 : 2; if (!(r == 1 && cppas.obHits == 1 && cppas.obDtors == 1)) return 31637; }
+        { cppas.obReset(); cppas.ObSelf p = default; int r = (false || (p = 4)) ? 1 : 0; if (!(r == 1 && cppas.obHits == 1 && p.v == 104)) return 31638; }
+        { cppas.obReset(); cppas.ObSelf p = default; int r = (p = 4) ? 1 : 2; if (!(r == 1 && cppas.obHits == 1)) return 31639; }
+        { cppas.obReset(); cppas.ObSelf p = default; int r = 0; if ((p = 4)) r = 1; if (!(r == 1 && cppas.obHits == 1)) return 31640; }
+        { cppas.obReset(); cppas.ObSelfX p = default; int r = !(p = 4) ? 0 : 1; if (!(r == 1 && cppas.obHits == 1)) return 31641; }
+        { cppas.obReset(); cppas.ObMove m = default; int r = 0; if (m) r = 1; if (!(r == 1 && cppas.obHits == 1)) return 31642; }
+        { cppas.obReset(); cppas.ObMove m = default; int r = m ? 1 : 2; if (!(r == 1 && cppas.obHits == 1)) return 31643; }
+        { cppas.obReset(); cppas.ObMove m = default; int r = (false || m) ? 1 : 0; if (!(r == 1 && cppas.obHits == 1)) return 31644; }
+        { cppas.obReset();  int r = 0; if (cppas.obMkMove(2)) r = 1; if (!(r == 1 && cppas.obHits == 1 && cppas.obDtors == 1)) return 31645; }
+        { cppas.obReset(); cppas.ObMove m = default; int r = (m = 4) ? 1 : 2; if (!(r == 1 && cppas.obHits == 1)) return 31646; }
+        { cppas.obReset(); cppas.ObCvtImpl p = default; long x = p; int r = x == 7 ? 1 : 0; if (!(r == 1 && cppas.obHits == 1)) return 31647; }
+        { cppas.obReset(); cppas.ObCvtInt p = default; int x = (int)p; int r = x == 8 ? 1 : 0; if (!(r == 1 && cppas.obHits == 1)) return 31648; }
+        { cppas.obReset(); cppas.ObCvtLong p = default; long x = (long)p; int r = x == 7 ? 1 : 0; if (!(r == 1 && cppas.obHits == 1)) return 31649; }
+        { cppas.obReset(); cppas.ObConv p = default; long x = 0; x = p; int r = x == 7 ? 1 : 0; if (!(r == 1 && cppas.obHits == 1)) return 31650; }
+        { cppas.obReset();  long x = (long)cppas.obMkCvt(); int r = x == 7 ? 1 : 0; if (!(r == 1 && cppas.obHits == 1 && cppas.obDtors == 1)) return 31651; }
+        { cppas.obReset(); cppas.ObSelf a = default; cppas.ObSelf b = default; bool f = true; int r = 0; if (f ? a : b) r = 1; if (!(r == 1 && cppas.obHits == 1)) return 31652; }
+        { cppas.obReset(); cppas.ObSelf a = default; cppas.ObSelf b = default; bool f = false; int r = (f ? a : b) ? 1 : 2; if (!(r == 1 && cppas.obHits == 1)) return 31653; }
+        { cppas.obReset(); cppas.ObSelf a = default; bool f = true; int r = (f ? cppas.obMkSelf(3) : a) ? 1 : 2; if (!(r == 1 && cppas.obHits == 1)) return 31654; }
+        { cppas.obReset(); cppas.ObSelfX a = default; cppas.ObSelfX b = default; bool f = false; int r = (f ? a : b) ? 1 : 2; if (!(r == 1 && cppas.obHits == 1)) return 31655; }
+        { cppas.obReset(); cppas.ObSelf a = default; cppas.ObSelf b = default; cppas.ObSelf c = default; bool f = false; bool g = false; int r = 0; if (f ? a : g ? b : c) r = 1; if (!(r == 1 && cppas.obHits == 1)) return 31656; }
+    }
+    // Unary - + ! ~ on a C++ class (legs 31900-31929; header cpp_interop_freeoptpl.h, cppfopun).
+    // FREE operators bind in the class's namespace like the binary ones (31900-31911, 31922);
+    // built-in operators go through ONE implicit arithmetic conversion function (31912-31917).
+    // ACCEPT SET that master already answered, kept as value legs: 31902, 31913, 31918-31921,
+    // 31923-31926 (refusals: Test/errors/err_cpp_no_free_operator.cb).
+    {
+        cppfopun.F f = default;
+        if ((-f).v != -51) return 31900;
+        if ((+f).v != 52) return 31901;
+        if (!f != 205) return 31902;
+        if ((~f).v != 54) return 31903;
+        cppfopun.G<int> g = default;
+        if ((-g).v != -52) return 31904;
+        if ((+g).v != 53) return 31905;
+        if (!g != 305) return 31906;
+        if ((~g).v != 55) return 31907;
+        cppfopun.FB fb = default;
+        if ((-fb).v != -51 || (+fb).v != 52 || !fb != 205 || (~fb).v != 54) return 31908;
+        cppfopun.V va = default;
+        cppfopun.V vb = -va;
+        if (vb.v != -14) return 31909;
+        cppfopun.MR mr = default;
+        int mrv = ~mr;
+        if (mrv != 13 || mr.v != 13) return 31910;
+        cppfopun.MM mm = default;
+        int mma = -mm;
+        int mmb = ~mm;
+        if (mma != 13 || mmb != 33 || mm.v != 33) return 31911;
+        cppfopun.I ci = default;
+        int inv = -ci;
+        int ic = ~ci;
+        if (inv != -7 || ic != -8 || (int)!ci != 0) return 31912;
+        int ip = +ci;
+        if (ip != 7 || +ci + 1 != 8) return 31913;
+        cppfopun.B cb = default;
+        int bn = -cb;
+        int bp = +cb;
+        int bc = ~cb;
+        if (bn != -1 || bp != 1 || bc != -2 || (int)!cb != 0) return 31914;
+        cppfopun.S cs = default;
+        int sn = -cs;
+        int sp = +cs;
+        int sc = ~cs;
+        if (sn != -5 || sp != 5 || sc != -6 || (int)!cs != 0) return 31915;
+        cppfopun.Dbl cd = default;
+        double dn = -cd;
+        double dp = +cd;
+        if (dn != -2.5 || dp != 2.5 || (int)!cd != 0) return 31916;
+        cppfopun.Fl cf = default;
+        float fn = -cf;
+        float fp = +cf;
+        if (fn != -1.5f || fp != 1.5f || (int)!cf != 0) return 31917;
+        cppfopun.EB eb = default;
+        if ((int)!eb != 0) return 31918;
+        int five = 5;
+        int* five_p = &five;
+        if (+five != 5 || +*five_p != 5 || -five != -5) return 31919;
+        cppfopun.M cm = default;
+        cppfopun.D cdm = default;
+        if ((-cm).v != -50 || (+cm).v != 51 || !cm != 105 || (~cm).v != 53) return 31920;
+        if ((-cdm).v != -50 || (+cdm).v != 51 || !cdm != 105 || (~cdm).v != 53) return 31921;
+        cppfopun.FC fc = default;
+        if ((-(-fc)).v != 5 || (-fc).v != -5) return 31922;
+        cppfopun.NT nt = default;
+        int liveBefore = cppfopun.liveNT();
+        { cppfopun.NT r = -nt; if (r.v != -6 || cppfopun.liveNT() != liveBefore + 1) return 31923; }
+        if (cppfopun.liveNT() != liveBefore) return 31924;
+        int ntTemp = (-cppfopun.mkNT()).v;
+        if (ntTemp != -9 || cppfopun.liveNT() != liveBefore) return 31925;
+        FopunGlobal fg = default;
+        if ((-fg).v != -12 || !fg != 1004) return 31926;
+        // Const global / const& operand: runs on a copy (was a store into read-only storage, SIGBUS).
+        int ng = -cppfopun.gcm2;
+        int nr = -cppfopun.refcm2();
+        int bg = !cppfopun.gcm2;
+        if (cppfopun.gcm2.v != 3) return 31927;
+    }
+    int opMoveRc = OpMoveNontrivialLegs();
+    if (opMoveRc != 0) return opMoveRc;
+    return 0;
+}
+
+// Legs 31700-31721: explicit `move` of a NON-trivial C++ class (move-only, user dtor, user copy
+// ctor, user move ctor) into a `T&&` operator parameter, member and free, compound and binary.
+// The parameter binds the source in place (callee zeroes it, no temp: counts match clang).
+int OpMoveNontrivialLegs()
+{
+    cppi_opmv.MO.reset();
+    {
+        cppi_opmv.MO c = cppi_opmv.MO(1); cppi_opmv.MO d = cppi_opmv.MO(4); cppi_opmv.MO* pd = &d;
+        c &= move d;
+        if (c.v != 5 || pd->v != 0) return 31700;
+    }
+    if (cppi_opmv.MO.CP() != 0 || cppi_opmv.MO.MV() != 0 || cppi_opmv.MO.DT() != 2) return 31700;
+    cppi_opmv.MO.reset();
+    {
+        cppi_opmv.MO c = cppi_opmv.MO(2); cppi_opmv.MO d = cppi_opmv.MO(3); cppi_opmv.MO* pd = &d;
+        cppi_opmv.MO e = c & move d;
+        if (e.v != 5 || c.v != 2 || pd->v != 0) return 31701;
+    }
+    if (cppi_opmv.MO.CP() != 0 || cppi_opmv.MO.MV() != 0 || cppi_opmv.MO.DT() != 3) return 31701;
+    cppi_opmv.UD.reset();
+    {
+        cppi_opmv.UD c = cppi_opmv.UD(1); cppi_opmv.UD d = cppi_opmv.UD(4); cppi_opmv.UD* pd = &d;
+        c &= move d;
+        if (c.v != 5 || pd->v != 0) return 31702;
+    }
+    if (cppi_opmv.UD.CP() != 0 || cppi_opmv.UD.MV() != 0 || cppi_opmv.UD.DT() != 2) return 31702;
+    cppi_opmv.UD.reset();
+    {
+        cppi_opmv.UD c = cppi_opmv.UD(2); cppi_opmv.UD d = cppi_opmv.UD(3); cppi_opmv.UD* pd = &d;
+        cppi_opmv.UD e = c & move d;
+        if (e.v != 5 || c.v != 2 || pd->v != 0) return 31703;
+    }
+    if (cppi_opmv.UD.CP() != 0 || cppi_opmv.UD.MV() != 0 || cppi_opmv.UD.DT() != 3) return 31703;
+    cppi_opmv.UC.reset();
+    {
+        cppi_opmv.UC c = cppi_opmv.UC(1); cppi_opmv.UC d = cppi_opmv.UC(4); cppi_opmv.UC* pd = &d;
+        c &= move d;
+        if (c.v != 5 || pd->v != 0) return 31704;
+    }
+    if (cppi_opmv.UC.CP() != 0 || cppi_opmv.UC.MV() != 0 || cppi_opmv.UC.DT() != 0) return 31704;
+    cppi_opmv.UC.reset();
+    {
+        cppi_opmv.UC c = cppi_opmv.UC(2); cppi_opmv.UC d = cppi_opmv.UC(3); cppi_opmv.UC* pd = &d;
+        cppi_opmv.UC e = c & move d;
+        if (e.v != 5 || c.v != 2 || pd->v != 0) return 31705;
+    }
+    if (cppi_opmv.UC.CP() != 0 || cppi_opmv.UC.MV() != 0 || cppi_opmv.UC.DT() != 0) return 31705;
+    cppi_opmv.UM.reset();
+    {
+        cppi_opmv.UM c = cppi_opmv.UM(1); cppi_opmv.UM d = cppi_opmv.UM(4); cppi_opmv.UM* pd = &d;
+        c &= move d;
+        if (c.v != 5 || pd->v != 0) return 31706;
+    }
+    if (cppi_opmv.UM.CP() != 0 || cppi_opmv.UM.MV() != 0 || cppi_opmv.UM.DT() != 0) return 31706;
+    cppi_opmv.UM.reset();
+    {
+        cppi_opmv.UM c = cppi_opmv.UM(2); cppi_opmv.UM d = cppi_opmv.UM(3); cppi_opmv.UM* pd = &d;
+        cppi_opmv.UM e = c & move d;
+        if (e.v != 5 || c.v != 2 || pd->v != 0) return 31707;
+    }
+    if (cppi_opmv.UM.CP() != 0 || cppi_opmv.UM.MV() != 0 || cppi_opmv.UM.DT() != 0) return 31707;
+    cppi_opmv.FMO.reset();
+    {
+        cppi_opmv.FMO c = cppi_opmv.FMO(1); cppi_opmv.FMO d = cppi_opmv.FMO(4); cppi_opmv.FMO* pd = &d;
+        c &= move d;
+        if (c.v != 5 || pd->v != 0) return 31708;
+    }
+    if (cppi_opmv.FMO.CP() != 0 || cppi_opmv.FMO.MV() != 0 || cppi_opmv.FMO.DT() != 2) return 31708;
+    cppi_opmv.FMO.reset();
+    {
+        cppi_opmv.FMO c = cppi_opmv.FMO(2); cppi_opmv.FMO d = cppi_opmv.FMO(3); cppi_opmv.FMO* pd = &d;
+        cppi_opmv.FMO e = c & move d;
+        if (e.v != 5 || c.v != 2 || pd->v != 0) return 31709;
+    }
+    if (cppi_opmv.FMO.CP() != 0 || cppi_opmv.FMO.MV() != 0 || cppi_opmv.FMO.DT() != 3) return 31709;
+    cppi_opmv.FUD.reset();
+    {
+        cppi_opmv.FUD c = cppi_opmv.FUD(1); cppi_opmv.FUD d = cppi_opmv.FUD(4); cppi_opmv.FUD* pd = &d;
+        c &= move d;
+        if (c.v != 5 || pd->v != 0) return 31710;
+    }
+    if (cppi_opmv.FUD.CP() != 0 || cppi_opmv.FUD.MV() != 0 || cppi_opmv.FUD.DT() != 2) return 31710;
+    cppi_opmv.FUD.reset();
+    {
+        cppi_opmv.FUD c = cppi_opmv.FUD(2); cppi_opmv.FUD d = cppi_opmv.FUD(3); cppi_opmv.FUD* pd = &d;
+        cppi_opmv.FUD e = c & move d;
+        if (e.v != 5 || c.v != 2 || pd->v != 0) return 31711;
+    }
+    if (cppi_opmv.FUD.CP() != 0 || cppi_opmv.FUD.MV() != 0 || cppi_opmv.FUD.DT() != 3) return 31711;
+    cppi_opmv.FUC.reset();
+    {
+        cppi_opmv.FUC c = cppi_opmv.FUC(1); cppi_opmv.FUC d = cppi_opmv.FUC(4); cppi_opmv.FUC* pd = &d;
+        c &= move d;
+        if (c.v != 5 || pd->v != 0) return 31712;
+    }
+    if (cppi_opmv.FUC.CP() != 0 || cppi_opmv.FUC.MV() != 0 || cppi_opmv.FUC.DT() != 0) return 31712;
+    cppi_opmv.FUC.reset();
+    {
+        cppi_opmv.FUC c = cppi_opmv.FUC(2); cppi_opmv.FUC d = cppi_opmv.FUC(3); cppi_opmv.FUC* pd = &d;
+        cppi_opmv.FUC e = c & move d;
+        if (e.v != 5 || c.v != 2 || pd->v != 0) return 31713;
+    }
+    if (cppi_opmv.FUC.CP() != 0 || cppi_opmv.FUC.MV() != 0 || cppi_opmv.FUC.DT() != 0) return 31713;
+    cppi_opmv.FUM.reset();
+    {
+        cppi_opmv.FUM c = cppi_opmv.FUM(1); cppi_opmv.FUM d = cppi_opmv.FUM(4); cppi_opmv.FUM* pd = &d;
+        c &= move d;
+        if (c.v != 5 || pd->v != 0) return 31714;
+    }
+    if (cppi_opmv.FUM.CP() != 0 || cppi_opmv.FUM.MV() != 0 || cppi_opmv.FUM.DT() != 0) return 31714;
+    cppi_opmv.FUM.reset();
+    {
+        cppi_opmv.FUM c = cppi_opmv.FUM(2); cppi_opmv.FUM d = cppi_opmv.FUM(3); cppi_opmv.FUM* pd = &d;
+        cppi_opmv.FUM e = c & move d;
+        if (e.v != 5 || c.v != 2 || pd->v != 0) return 31715;
+    }
+    if (cppi_opmv.FUM.CP() != 0 || cppi_opmv.FUM.MV() != 0 || cppi_opmv.FUM.DT() != 0) return 31715;
+    // `T&&` beside `const T&`: the move picks `T&&` (x100), the lvalue `const T&`.
+    cppi_opmv.OV.reset();
+    {
+        cppi_opmv.OV c = cppi_opmv.OV(1); cppi_opmv.OV d = cppi_opmv.OV(4); cppi_opmv.OV* pd = &d;
+        cppi_opmv.OV k = cppi_opmv.OV(3);
+        c &= k;
+        c &= move d;
+        if (c.v != 404 || pd->v != 0) return 31716;
+        cppi_opmv.OV d2 = cppi_opmv.OV(2);
+        cppi_opmv.OV e = c & k;
+        cppi_opmv.OV f = c & move d2;
+        if (e.v != 407 || f.v != 604) return 31717;
+    }
+    if (cppi_opmv.OV.DT() != 6) return 31717;
+    cppi_opmv.FOV.reset();
+    {
+        cppi_opmv.FOV c = cppi_opmv.FOV(1); cppi_opmv.FOV d = cppi_opmv.FOV(4);
+        cppi_opmv.FOV* pd = &d; cppi_opmv.FOV k = cppi_opmv.FOV(3);
+        c &= k;
+        c &= move d;
+        if (c.v != 404 || pd->v != 0) return 31718;
+    }
+    if (cppi_opmv.FOV.DT() != 3) return 31718;
+    // A by-value parameter is move-constructed from `move d` (member and free), never copied.
+    cppi_opmv.BV.reset();
+    {
+        cppi_opmv.BV c = cppi_opmv.BV(1); cppi_opmv.BV d = cppi_opmv.BV(4); cppi_opmv.BV* pd = &d;
+        c &= move d;
+        if (c.v != 5 || pd->v != 0) return 31719;
+    }
+    if (cppi_opmv.BV.CP() != 0 || cppi_opmv.BV.MV() != 1 || cppi_opmv.BV.DT() != 3) return 31719;
+    cppi_opmv.FBV.reset();
+    {
+        cppi_opmv.FBV c = cppi_opmv.FBV(1); cppi_opmv.FBV d = cppi_opmv.FBV(4); cppi_opmv.FBV* pd = &d;
+        c &= move d;
+        if (c.v != 5 || pd->v != 0) return 31720;
+    }
+    if (cppi_opmv.FBV.CP() != 0 || cppi_opmv.FBV.MV() != 1 || cppi_opmv.FBV.DT() != 3) return 31720;
+    // A constructor-call prvalue binds `T&&`.
+    cppi_opmv.TQ q = cppi_opmv.TQ(1);
+    q &= cppi_opmv.TQ(2);
+    if (q.v != 3) return 31721;
+    // The moved source is dead afterwards, exactly as after `f(move d)`.
+    expect_error("use of moved variable 'dUse'") {
+        cppi_opmv.UD cUse = cppi_opmv.UD(1); cppi_opmv.UD dUse = cppi_opmv.UD(4);
+        cUse &= move dUse;
+        int after = dUse.v;
+    }
     return 0;
 }
 
@@ -7838,6 +8195,8 @@ T TallyAssignGeneric<T>(T* a, T* b) { return (*a = *b); }
 cppas.TallyByValue ByValueAssignReturn(cppas.TallyByValue* a) { return (*a = 5); }
 cppas.TallyByValue ByValueAssignReturnBare(cppas.TallyByValue* a) { return *a = 6; }
 cppas.TallyByValue ByValueCompoundReturn(cppas.TallyByValue* a) { return (*a += 2); }
+int ObAliasParam(alias cppas.ObSelf p) { if (p) return 1; return 2; }
+int ObPtrParam(cppas.ObSelf* p) { if (*p) return 1; return 2; }
 int* EscTernFieldAddr(int x) { return x > 0 ? &(new cppon.Esc(x))->v : nullptr; }
 int* EscLaunderedFieldAddr(int x) { return (int*)(long)&(new cppon.Esc(x))->v; }
 // Value * 100 + frees so far: a temp freed before the read shows up in the low digits.

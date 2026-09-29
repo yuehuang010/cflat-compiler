@@ -401,6 +401,20 @@ namespace cflat_cinterop
             }
         }
 
+        // The unary operators CFlat spells `- + ! ~`, as a free function of ONE parameter.
+        bool IsBindableFreeUnaryOperator(OverloadedOperatorKind kind)
+        {
+            return kind == OO_Plus || kind == OO_Minus || kind == OO_Exclaim || kind == OO_Tilde;
+        }
+
+        // A free operator function TEMPLATE the operator lookup can bind: binary or unary.
+        bool IsBindableFreeOperatorTemplate(const FunctionDecl* fd)
+        {
+            if (fd == nullptr || llvm::isa<CXXMethodDecl>(fd)) return false;
+            return (fd->getNumParams() == 2 && IsBindableFreeBinaryOperator(fd->getOverloadedOperator()))
+                || (fd->getNumParams() == 1 && IsBindableFreeUnaryOperator(fd->getOverloadedOperator()));
+        }
+
         /*
          * Whether a type names a class member that is not public (a protected / private nested
          * class, or a specialization over one). Code at namespace scope cannot spell it, so a
@@ -1165,9 +1179,7 @@ namespace cflat_cinterop
                     return true;
                 // A FREE binary operator template has no identifier, so the ordinary gate below
                 // drops it; libc++ declares every basic_string operator that way.
-                const bool isFreeBinaryOperatorTemplate =
-                    !llvm::isa<CXXMethodDecl>(fd) && fd->getNumParams() == 2
-                    && IsBindableFreeBinaryOperator(fd->getOverloadedOperator());
+                const bool isFreeBinaryOperatorTemplate = IsBindableFreeOperatorTemplate(fd);
                 const auto* md = llvm::dyn_cast<CXXMethodDecl>(fd);
                 if (md != nullptr && md->getAccess() != AS_public) return true;
                 if (md == nullptr && fd->getStorageClass() == SC_Static) return true;
@@ -2991,9 +3003,7 @@ namespace cflat_cinterop
                     if (auto* ftd = llvm::dyn_cast<FunctionTemplateDecl>(decl))
                     {
                         const FunctionDecl* pattern = ftd->getTemplatedDecl();
-                        if (pattern != nullptr && !llvm::isa<CXXMethodDecl>(pattern)
-                            && pattern->getNumParams() == 2
-                            && IsBindableFreeBinaryOperator(pattern->getOverloadedOperator()))
+                        if (IsBindableFreeOperatorTemplate(pattern))
                             candidates.push_back(decl);
                     }
                     if (auto* dc = llvm::dyn_cast<DeclContext>(decl))
@@ -3139,10 +3149,7 @@ namespace cflat_cinterop
                         auto* ftd = llvm::dyn_cast<FunctionTemplateDecl>(decl);
                         if (ftd == nullptr) return;
                         const FunctionDecl* pattern = ftd->getTemplatedDecl();
-                        if (pattern == nullptr || llvm::isa<CXXMethodDecl>(pattern)
-                            || pattern->getNumParams() != 2
-                            || !IsBindableFreeBinaryOperator(pattern->getOverloadedOperator()))
-                            return;
+                        if (!IsBindableFreeOperatorTemplate(pattern)) return;
                         bool matches = false;
                         for (const ParmVarDecl* p : pattern->parameters())
                             matches = matches || mentionsRequestedTemplate(p->getType());

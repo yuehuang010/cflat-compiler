@@ -8582,6 +8582,7 @@ public:
                                       const std::vector<std::string>& candidates) const;
     bool ApplyCxxConversionOperator(NamedVariable& nv, const TypeAndValue& dest,
                                     bool allowExplicit);
+    llvm::Value* StorageOfLoadedCxxObject(llvm::Value* value) const;
     llvm::Value* ConvertViaImplicitConversionOperator(llvm::Value* value,
                                                       const TypeAndValue& dest);
     llvm::Value* ConvertAggregateViaImplicitConversionOperator(llvm::Value* value,
@@ -10577,7 +10578,8 @@ public:
     // 129: request markers record entry validity (entries also carry the build stamp when
     //      CFLAT_CACHE_BUILD_STAMP=1).
     // 130: flexible / zero-length array record members carry their provenance (IsFlexibleArrayMember).
-    static constexpr int kCHeaderCacheVersion = 130;
+    // 131: free UNARY operator templates (`- + ! ~`) over a requested class template are published.
+    static constexpr int kCHeaderCacheVersion = 131;
     static std::string CompilerBuildStamp();
     // THE switch for "the compiler build is part of cache entry validity": header/request
     // entries record and check "cstamp", and demand companion keys fold the stamp. OFF by

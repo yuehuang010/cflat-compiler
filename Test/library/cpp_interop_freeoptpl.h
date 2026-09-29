@@ -184,3 +184,75 @@ inline int operator&(int a, FoldScalar b) { return a & b.v; }
 inline bool operator&&(FoldScalar a, FoldScalar b) { return bool(a) && bool(b); }
 inline bool operator||(FoldScalar a, FoldScalar b) { return bool(a) || bool(b); }
 }
+
+// Unary `- + ! ~` lookup on a class (return codes 31900-31929): free operators (plain, function
+// templates, through a base), built-in operators reached through ONE implicit arithmetic
+// conversion function, and the classes clang refuses. Every operator adds a distinct tag to its
+// result so a leg can tell which overload C++ selected. The values are clang++ -std=c++20's.
+namespace cppfopun {
+struct R { int v = 0; R() = default; R(int x) : v(x) {} };
+
+// Free operators, NOT inline: bound on first lookup in the class's namespace.
+struct F { int v = 5; };
+R operator-(const F& a) { return R(-a.v * 10 - 1); }
+R operator+(const F& a) { return R(a.v * 10 + 2); }
+int operator!(const F& a) { return a.v + 200; }
+R operator~(const F& a) { return R(a.v * 10 + 4); }
+// The same through a base class.
+struct FB : F { };
+
+// Free operator TEMPLATES over a class template.
+template <class T> struct G { T v = 5; };
+template <class T> R operator-(const G<T>& a) { return R((int)a.v * -10 - 2); }
+template <class T> R operator+(const G<T>& a) { return R((int)a.v * 10 + 3); }
+template <class T> int operator!(const G<T>& a) { return (int)a.v + 300; }
+template <class T> R operator~(const G<T>& a) { return R((int)a.v * 10 + 5); }
+
+// A free operator taking its operand by value, one taking it by mutable reference.
+struct V { int v = 2; };
+inline V operator-(V a) { return V{-a.v * 7}; }
+struct MR { int v = 3; };
+inline int operator~(MR& a) { a.v += 10; return a.v; }
+// A free operator returning the operand's own type (chains).
+struct FC { int v = 5; };
+inline FC operator-(const FC& a) { return FC{-a.v}; }
+// Nontrivial: live() counts constructed minus destroyed objects.
+struct NT { static inline int live_ = 0; int v = 6;
+    NT() { ++live_; } NT(const NT& o) : v(o.v) { ++live_; } ~NT() { --live_; } };
+inline NT operator-(const NT& a) { NT r; r.v = -a.v; return r; }
+inline NT mkNT() { NT r; r.v = 9; return r; }
+inline int liveNT() { return NT::live_; }
+
+// Member operators, own and inherited; a member operator that mutates the object.
+struct M { int v = 5;
+    R operator-() const { return R(-v * 10); }
+    R operator+() const { return R(v * 10 + 1); }
+    int operator!() const { return v + 100; }
+    R operator~() const { return R(v * 10 + 3); } };
+struct D : M { };
+struct MM { int v = 3; int operator-() { v += 10; return v; } int operator~() { v += 20; return v; } };
+
+// No unary operator at all, and conversions clang does not use for a built-in operator.
+struct N { int v = 5; };
+struct E { int v = 7; explicit operator int() const { return v; } };
+struct EB { bool v = true; explicit operator bool() const { return v; } };
+struct Two { int q = 0; operator int() const { return 1; } operator double() const { return 2.5; } };
+
+// ONE implicit conversion function: C++ applies the built-in operator after it (with integral
+// promotion for `- + ~`).
+struct I { int v = 7; operator int() const { return v; } };
+struct B { bool v = true; operator bool() const { return v; } };
+struct S { short v = 5; operator short() const { return v; } };
+struct Dbl { double v = 2.5; operator double() const { return v; } };
+struct Fl { float v = 1.5f; operator float() const { return v; } };
+
+// Read-only operands: a const global and a const& result must never be written by a non-const operator.
+struct CM2 { int v = 3; int operator-() const { return v; } int operator-() { v += 10; return v; }
+    int operator!() const { return 50; } int operator!() { v += 20; return 60; } };
+inline const CM2 gcm2{};
+inline const CM2& refcm2() { return gcm2; }
+}
+// Global namespace: a free operator with no namespace prefix.
+struct FopunGlobal { int v = 4; };
+inline FopunGlobal operator-(const FopunGlobal& a) { return FopunGlobal{-a.v * 3}; }
+inline int operator!(const FopunGlobal& a) { return a.v + 1000; }

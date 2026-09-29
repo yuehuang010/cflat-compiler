@@ -894,6 +894,10 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                 // namespace when no member declares one. The prefix form `operator@(T&)` is the
                 // one bound, matching the ruling that CFlat's only ++ spelling is postfix.
                 std::string callName = opName;
+                // A member `RefZ<Z>& operator++()` refused only for its unrequested return-type
+                // specialization binds on use, as the compound and call paths do.
+                if (!receiverMatches(callName) && compiler->IsCxxRecord(receiverType))
+                    compiler->TryBindRefusedCxxMember(receiverType, opName);
                 if (!receiverMatches(callName))
                 {
                     const size_t dot = receiverType.rfind('.');

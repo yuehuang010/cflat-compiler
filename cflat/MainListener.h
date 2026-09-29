@@ -5971,7 +5971,16 @@ public:
     // nullptr if the operand type has no matching operator (fall back to primitive handling).
     llvm::Value* TryUnaryOperatorOverload(
         llvm::Value* operand, const std::string& op,
+        antlr4::ParserRuleContext* ctx, llvm::Value* operandStorage = nullptr);
+    // Built-in unary operator on a C++ class through one implicit arithmetic conversion function.
+    // 0 = not applicable, 1 = converted (value / namedVar updated), 2 = error reported.
+    int ConvertUnaryOperandViaImplicitConversion(
+        llvm::Value*& value, LLVMBackend::NamedVariable& namedVar, const std::string& op,
         antlr4::ParserRuleContext* ctx);
+    // Free `operator@(const T&)` / free operator template on an imported C++ class.
+    llvm::Value* TryUnaryFreeOperatorOverload(
+        llvm::Value* operand, const std::string& op,
+        antlr4::ParserRuleContext* ctx, llvm::Value* operandStorage);
 
     // If an operator overload (e.g. operator+) just returned an owned heap string as an
     // unnamed SSA temporary, register it for end-of-full-expression cleanup. This is the

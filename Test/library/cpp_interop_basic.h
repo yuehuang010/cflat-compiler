@@ -1990,3 +1990,139 @@ namespace cppi
     inline int mtConstInt = 3;
     inline int* const& mt_const_ipcr() { static int* p = &mtConstInt; return p; }
 }
+
+// Member and free operators whose return type is a class-template specialization nothing has
+// requested yet. Each result template is used by exactly one operator so the on-use retry is what
+// requests it; a shared template would be requested by the first leg and hide the rest.
+namespace cppi_opspec
+{
+    template <class L> struct OsMul { const L& l; double k; double eval() const { return l.v * k; }
+                                      OsMul<L> operator*(double k2) const { return OsMul<L>{ l, k * k2 }; } };
+    template <class L> struct OsNamed { double x; double get() const { return x; } };
+    template <class L> struct OsEq { bool r; bool ok() const { return r; } };
+    template <class L> struct OsRef { L* p; double get() const { return p->v; } };
+    template <class L> struct OsNeg { const L& l; double eval() const { return -l.v; } };
+    template <class L> struct OsIdx { double x; double get() const { return x; } };
+    template <class L> struct OsCall { double x; double get() const { return x; } };
+    template <class L> struct OsBad { double x; };
+    struct OsOther { double v = 0.0; };
+    struct OsW
+    {
+        double v = 0.0;
+        OsOther other;
+        OsW() = default;
+        OsW(double x) : v(x) { other.v = x; }
+        OsMul<OsW> operator*(double k) const { return OsMul<OsW>{ *this, k }; }
+        OsMul<OsOther> operator/(double k) const { return OsMul<OsOther>{ other, k }; }
+        OsNamed<OsW> operator-(double k) const { return OsNamed<OsW>{ v - k }; }
+        OsEq<OsW> operator==(double k) const { return OsEq<OsW>{ v == k }; }
+        OsRef<OsW>& operator*=(double k) { v *= k; static OsRef<OsW> r; r.p = this; return r; }
+        OsNeg<OsW> operator-() const { return OsNeg<OsW>{ *this }; }
+        OsIdx<OsW> operator[](int i) const { return OsIdx<OsW>{ v + i }; }
+        OsCall<OsW> operator()(double d) const { return OsCall<OsW>{ v * d }; }
+        // Refused for a reason other than the specialization: a pointer-to-member parameter.
+        OsBad<OsW>& operator%=(double OsW::* p) { static OsBad<OsW> b; b.x = v; return b; }
+    };
+    // The operators sit on a base the legs never use directly, so a derived receiver is the only
+    // way their result templates get requested.
+    template <class L> struct OsDMul { const L& l; double k; double eval() const { return l.v * k; } };
+    template <class L> struct OsDNeg { const L& l; double eval() const { return -l.v; } };
+    template <class L> struct OsDIdx { double x; double get() const { return x; } };
+    template <class L> struct OsDCall { double x; double get() const { return x; } };
+    template <class L> struct OsDRef { L* p; double get() const { return p->v; } };
+    struct OsBase
+    {
+        double v = 0.0;
+        OsBase() = default;
+        OsBase(double x) : v(x) {}
+        OsDMul<OsBase> operator*(double k) const { return OsDMul<OsBase>{ *this, k }; }
+        OsDNeg<OsBase> operator-() const { return OsDNeg<OsBase>{ *this }; }
+        OsDIdx<OsBase> operator[](int i) const { return OsDIdx<OsBase>{ v + i }; }
+        OsDCall<OsBase> operator()(double d) const { return OsDCall<OsBase>{ v * d }; }
+        OsDRef<OsBase>& operator+=(double k) { v += k; static OsDRef<OsBase> r; r.p = this; return r; }
+    };
+    struct OsDerived : OsBase { OsDerived(double x) : OsBase(x) {} };
+    // Free operators: a compound one returning a reference to a specialization, and a binary one.
+    template <class L> struct OsFreeRef { L* p; double get() const { return p->v; } };
+    template <class L> struct OsFreeMul { double x; double get() const { return x; } };
+    struct OsFw { double v = 0.0; OsFw() = default; OsFw(double x) : v(x) {} };
+    struct OsFv { double v = 0.0; OsFv() = default; OsFv(double x) : v(x) {} };
+    inline OsFreeRef<OsFw>& operator*=(OsFw& a, double k) { a.v *= k; static OsFreeRef<OsFw> r; r.p = &a; return r; }
+    inline OsFreeMul<OsFv> operator*(const OsFv& a, double k) { return OsFreeMul<OsFv>{ a.v * k }; }
+    // An rvalue-reference operand: the operator steals from the moved source (v -> 0).
+    template <class L> struct OsMvRef { L* p; double get() const { return p->v; } };
+    struct OsMv
+    {
+        double v = 0.0;
+        OsMv() = default;
+        OsMv(double x) : v(x) {}
+        OsMvRef<OsMv>& operator&=(OsMv&& o) { v += o.v; o.v = 0.0; static OsMvRef<OsMv> r; r.p = this; return r; }
+    };
+    struct OsMv2
+    {
+        double v = 0.0;
+        OsMv2() = default;
+        OsMv2(double x) : v(x) {}
+        OsMv2& operator&=(OsMv2&& o) { v += o.v; o.v = 0.0; return *this; }
+        OsMv2 operator&(OsMv2&& o) const { OsMv2 r(v + o.v); o.v = 0.0; return r; }
+    };
+    // Prefix ++/-- returning an unrequested specialization; postfix `z++` binds the prefix form.
+    template <class L> struct OsIncRef { L* p; double get() const { return p->v; } };
+    struct OsInc
+    {
+        double v = 0.0;
+        OsInc() = default;
+        OsInc(double x) : v(x) {}
+        OsIncRef<OsInc>& operator++() { v += 1.0; static OsIncRef<OsInc> r; r.p = this; return r; }
+        OsIncRef<OsInc>& operator--() { v -= 1.0; static OsIncRef<OsInc> r; r.p = this; return r; }
+    };
+}
+// Explicit `move` of a NON-trivial class into a `T&&` / by-value operator parameter (legs 31700+).
+namespace cppi_opmv
+{
+#define CPPI_OPMV_COUNTS int v; static inline int cp = 0, mv = 0, dt = 0; \
+    static void reset() { cp = 0; mv = 0; dt = 0; } \
+    static int CP() { return cp; } static int MV() { return mv; } static int DT() { return dt; }
+#define CPPI_OPMV_MEMBER(N) \
+    N& operator&=(N&& o) { v += o.v; o.v = 0; return *this; } \
+    N operator&(N&& o) const { N r(v + o.v); o.v = 0; return r; }
+#define CPPI_OPMV_FREE(N) \
+    inline N& operator&=(N& a, N&& o) { a.v += o.v; o.v = 0; return a; } \
+    inline N operator&(const N& a, N&& o) { N r(a.v + o.v); o.v = 0; return r; }
+    struct MO { CPPI_OPMV_COUNTS MO(int x = 0) : v(x) {} MO(const MO&) = delete;
+        MO(MO&& o) noexcept : v(o.v) { o.v = 0; ++mv; } ~MO() { ++dt; } CPPI_OPMV_MEMBER(MO) };
+    struct UD { CPPI_OPMV_COUNTS UD(int x = 0) : v(x) {} ~UD() { ++dt; } CPPI_OPMV_MEMBER(UD) };
+    struct UC { CPPI_OPMV_COUNTS UC(int x = 0) : v(x) {} UC(const UC& o) : v(o.v) { ++cp; }
+        UC& operator=(const UC&) = default; CPPI_OPMV_MEMBER(UC) };
+    struct UM { CPPI_OPMV_COUNTS UM(int x = 0) : v(x) {} UM(const UM&) = default;
+        UM(UM&& o) noexcept : v(o.v) { o.v = 0; ++mv; } CPPI_OPMV_MEMBER(UM) };
+    struct FMO { CPPI_OPMV_COUNTS FMO(int x = 0) : v(x) {} FMO(const FMO&) = delete;
+        FMO(FMO&& o) noexcept : v(o.v) { o.v = 0; ++mv; } ~FMO() { ++dt; } };
+    struct FUD { CPPI_OPMV_COUNTS FUD(int x = 0) : v(x) {} ~FUD() { ++dt; } };
+    struct FUC { CPPI_OPMV_COUNTS FUC(int x = 0) : v(x) {} FUC(const FUC& o) : v(o.v) { ++cp; }
+        FUC& operator=(const FUC&) = default; };
+    struct FUM { CPPI_OPMV_COUNTS FUM(int x = 0) : v(x) {} FUM(const FUM&) = default;
+        FUM(FUM&& o) noexcept : v(o.v) { o.v = 0; ++mv; } };
+    CPPI_OPMV_FREE(FMO) CPPI_OPMV_FREE(FUD) CPPI_OPMV_FREE(FUC) CPPI_OPMV_FREE(FUM)
+    // `T&&` beside `const T&`: an explicit move picks `T&&` (x100), an lvalue `const T&`.
+    struct OV { CPPI_OPMV_COUNTS OV(int x = 0) : v(x) {} ~OV() { ++dt; }
+        OV& operator&=(OV&& o) { v += 100 * o.v; o.v = 0; return *this; }
+        OV& operator&=(const OV& o) { v += o.v; return *this; }
+        OV operator&(OV&& o) const { return OV(v + 100 * o.v); }
+        OV operator&(const OV& o) const { return OV(v + o.v); } };
+    struct FOV { CPPI_OPMV_COUNTS FOV(int x = 0) : v(x) {} ~FOV() { ++dt; } };
+    inline FOV& operator&=(FOV& a, FOV&& o) { a.v += 100 * o.v; o.v = 0; return a; }
+    inline FOV& operator&=(FOV& a, const FOV& o) { a.v += o.v; return a; }
+    // By-value operand: `move d` move-constructs the parameter (clang), never copies.
+    struct BV { CPPI_OPMV_COUNTS BV(int x = 0) : v(x) {} BV(const BV& o) : v(o.v) { ++cp; }
+        BV(BV&& o) noexcept : v(o.v) { o.v = 0; ++mv; } ~BV() { ++dt; }
+        BV& operator&=(BV o) { v += o.v; return *this; } };
+    struct FBV { CPPI_OPMV_COUNTS FBV(int x = 0) : v(x) {} FBV(const FBV& o) : v(o.v) { ++cp; }
+        FBV(FBV&& o) noexcept : v(o.v) { o.v = 0; ++mv; } ~FBV() { ++dt; } };
+    inline FBV& operator&=(FBV& a, FBV o) { a.v += o.v; return a; }
+    // A constructor-call prvalue binds `T&&` (trivial class).
+    struct TQ { int v; TQ(int x = 0) : v(x) {} TQ& operator&=(TQ&& o) { v += o.v; o.v = 0; return *this; } };
+#undef CPPI_OPMV_COUNTS
+#undef CPPI_OPMV_MEMBER
+#undef CPPI_OPMV_FREE
+}

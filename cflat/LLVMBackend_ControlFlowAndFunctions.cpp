@@ -909,6 +909,55 @@ std::string LLVMBackend::OperatorBoolFunctionNameForType(llvm::Type* type) const
         return matches(memberName, true) ? memberName : std::string{};
 }
 
+/*
+ * A C++ class value that was loaded from an object's storage: returns that storage, else null.
+ * A conversion (`operator bool`, `operator int`) must run on the object itself - a self-pointer
+ * or mutating one sees the wrong object on a bitwise copy. A prvalue reaches here loaded from
+ * its own temporary, so the temporary is the receiver and keeps its single destruction.
+ */
+llvm::Value* LLVMBackend::StorageOfLoadedCxxObject(llvm::Value* value) const
+{
+        auto* st = llvm::dyn_cast_or_null<llvm::StructType>(
+            value != nullptr ? value->getType() : nullptr);
+        if (st == nullptr || st->isLiteral() || !st->hasName() || !IsCxxRecord(st->getName().str()))
+            return nullptr;
+        auto plainLoad = [&](llvm::Value* v) -> llvm::LoadInst* {
+            auto* l = llvm::dyn_cast<llvm::LoadInst>(v);
+            return (l != nullptr && !l->isVolatile() && l->getType() == st) ? l : nullptr;
+        };
+        // `c ? a : b` (nested too) joins loads of the same class; the receiver is the joined
+        // storage. Check the whole tree first so a partial match inserts nothing.
+        std::function<bool(llvm::Value*, int)> joinable = [&](llvm::Value* v, int depth) {
+            if (plainLoad(v) != nullptr) return true;
+            if (depth == 0) return false;
+            if (auto* sel = llvm::dyn_cast<llvm::SelectInst>(v))
+                return joinable(sel->getTrueValue(), depth - 1) && joinable(sel->getFalseValue(), depth - 1);
+            auto* phi = llvm::dyn_cast<llvm::PHINode>(v);
+            if (phi == nullptr || phi->getNumIncomingValues() < 2) return false;
+            for (llvm::Value* in : phi->incoming_values())
+                if (!joinable(in, depth - 1)) return false;
+            return true;
+        };
+        std::function<llvm::Value*(llvm::Value*)> join = [&](llvm::Value* v) -> llvm::Value* {
+            if (auto* load = plainLoad(v)) return load->getPointerOperand();
+            if (auto* sel = llvm::dyn_cast<llvm::SelectInst>(v))
+            {
+                llvm::Value* t = join(sel->getTrueValue());
+                llvm::Value* f = join(sel->getFalseValue());
+                return llvm::SelectInst::Create(sel->getCondition(), t, f, "cxx_recv", sel->getIterator());
+            }
+            auto* phi = llvm::cast<llvm::PHINode>(v);
+            std::vector<llvm::Value*> ins;
+            for (llvm::Value* in : phi->incoming_values()) ins.push_back(join(in));
+            auto* p = llvm::PHINode::Create(ins[0]->getType(), (unsigned)ins.size(), "cxx_recv",
+                                            phi->getIterator());
+            for (unsigned i = 0; i < ins.size(); ++i) p->addIncoming(ins[i], phi->getIncomingBlock(i));
+            return p;
+        };
+        constexpr int kMaxJoinDepth = 8;
+        return joinable(value, kMaxJoinDepth) ? join(value) : nullptr;
+    }
+
 llvm::Value* LLVMBackend::CoerceToBoolCondition(llvm::Value* cond, bool allowOperatorBool)
 {
         if (cond == nullptr || cond->getType()->isIntegerTy(1))
@@ -942,6 +991,7 @@ llvm::Value* LLVMBackend::CoerceToBoolCondition(llvm::Value* cond, bool allowOpe
                 arg.Primary = cond;
                 arg.BaseType = cond->getType();
                 arg.TypeAndValue.TypeName = llvm::cast<llvm::StructType>(cond->getType())->getName().str();
+                arg.Storage = StorageOfLoadedCxxObject(cond);
                 auto savedReturnType = lastCallReturnType;
                 bool savedReturnsOwned = lastCallReturnsOwned;
                 bool savedOwningResult = lastOwningResult;

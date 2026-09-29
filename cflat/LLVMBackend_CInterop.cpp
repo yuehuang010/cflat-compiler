@@ -21745,6 +21745,7 @@ llvm::Value* LLVMBackend::ConvertViaImplicitConversionOperator(llvm::Value* valu
         nv.Primary = value;
         nv.BaseType = value->getType();
         nv.TypeAndValue.TypeName = st->getName().str();
+        nv.Storage = StorageOfLoadedCxxObject(value);
         if (!ApplyCxxConversionOperator(nv, dest, /*allowExplicit*/ false)) return nullptr;
         return nv.Primary;
 }
