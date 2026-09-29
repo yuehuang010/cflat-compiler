@@ -3929,6 +3929,25 @@ bool LLVMBackend::EmitExecutable(const std::string& exePath, const std::string& 
             }
         }
 
+        // UCRT headers define printf/sprintf/... as inline functions, so any static lib built
+        // against them carries COMDAT (select-any) copies. cflat's own strong definitions would
+        // make lld-link report duplicate symbols; emit them as COMDAT-any too so the linker
+        // dedupes and cflat's copy (this object is first on the command line) wins.
+        {
+            static const char* const kUcrtInlineStdio[] = {
+                "printf", "fprintf", "sprintf", "snprintf", "vprintf", "vfprintf",
+                "vsprintf", "vsnprintf", "scanf", "fscanf", "sscanf"};
+            for (const char* name : kUcrtInlineStdio)
+            {
+                llvm::Function* fn = module->getFunction(name);
+                if (!fn || fn->isDeclaration() || fn->hasLocalLinkage()) continue;
+                fn->setLinkage(llvm::GlobalValue::LinkOnceODRLinkage);
+                llvm::Comdat* comdat = module->getOrInsertComdat(name);
+                comdat->setSelectionKind(llvm::Comdat::Any);
+                fn->setComdat(comdat);
+            }
+        }
+
         auto objPath = exePath + ".obj";
         std::error_code EC;
         llvm::raw_fd_ostream dest(objPath, EC, llvm::sys::fs::OF_None);

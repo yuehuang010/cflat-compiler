@@ -3,7 +3,7 @@
 #
 # Covers the platform-portable subset of example/*.cb on an Apple Silicon Mac.
 # Windows-only examples (COM/WinRT, Win32 GUI, WinUI3, os.windows.* content,
-# winsock/windows.h imports) and vcpkg-package demos are SKIPped - compile those
+# winsock/windows.h imports) are SKIPped - compile those
 # on their native platform instead. Three tiers, mirroring test_example.bat:
 #
 #   1. GUI/editor self-tests  - compile, run "<bin> --selftest", expect a PASS

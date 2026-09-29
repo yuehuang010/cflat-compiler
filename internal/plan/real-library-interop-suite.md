@@ -121,7 +121,7 @@ Cost numbers are Release, macOS arm64, measured 2026-09-26 (cold per case).
 | nlohmann-json | C++ header-only | vcpkg tree (always present) | 10 probes: 9 pass, j03 XFAIL (converting ctors) | templates, operator[], iterators, exceptions, ADL |
 | fmt 12 | C++ prebuilt lib | brew `fmt` | 6 probes: 3 pass; f02/f04/f05 XFAIL | variadic templates, consteval, [[no_unique_address]], std::string |
 | simdjson 4 | C++ prebuilt lib | brew `simdjson` | s0/s1 pass; o1-o8 fail (issues filed) | simdjson_result<T>, namespace aliases, arch-specific namespaces |
-| sqlite3 | C | brew `sqlite` | not probed on macOS (Windows example/vcpkg/sqlite_demo.cb exists) | callbacks with void*, char**, opaque handles |
+| sqlite3 | C | brew `sqlite` | not probed on macOS (Windows: test_libs/sqlite3, via vcpkg) | callbacks with void*, char**, opaque handles |
 | zstd / lz4 | C | brew | not probed | size_t APIs, macro constants, buffers |
 
 ### Tier 2 - template and API-surface stress (per review batch / before ff-merge of interop work; target < 10 min)
@@ -144,7 +144,7 @@ Cost numbers are Release, macOS arm64, measured 2026-09-26 (cold per case).
 ### Tier 4 - candidates, not yet probed (probe before promoting)
 
 OpenSSL 3 (macro-defined functions, opaque structs), SDL3 (big C header; init/version only,
-headless), OpenBLAS / CBLAS (Windows example/vcpkg/blas_gemm.cb exists), harfbuzz / freetype
+headless), OpenBLAS / CBLAS (Windows: test_libs/openblas, via vcpkg), harfbuzz / freetype
 (callback-heavy C), mimalloc; protobuf (needs protoc-generated code checked into the case's
 `support/`). Measured 2026-09-26:
 - Halide 21 (brew): headers are ONE amalgamated `Halide.h` (35.6k lines, std headers only, no

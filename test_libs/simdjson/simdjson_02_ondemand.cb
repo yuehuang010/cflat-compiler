@@ -1,6 +1,15 @@
 // GUARDS: simdjson On-Demand overload and result specialization bindings
 // FROM: scratch/simdjson_spike/o1.cb scratch/simdjson_spike/o2.cb scratch/simdjson_spike/o3.cb scratch/simdjson_spike/o4.cb scratch/simdjson_spike/o5.cb scratch/simdjson_spike/o6.cb scratch/simdjson_spike/o7.cb scratch/simdjson_spike/o8.cb
 import cpp "simdjson.h";
+// simdjson::ondemand aliases simdjson::<builtin implementation>::ondemand; the concrete
+// namespace is arm64 on Apple Silicon and fallback on x64 with cflat's baseline clang flags.
+if const (__ARM64__) {
+    using SjImplParser = simdjson.arm64.ondemand.parser;
+    using SjImplDocument = simdjson.arm64.ondemand.document;
+} else {
+    using SjImplParser = simdjson.fallback.ondemand.parser;
+    using SjImplDocument = simdjson.fallback.ondemand.document;
+}
 extern int printf(const char* fmt, ...);
 extern int main()
 {
@@ -11,40 +20,40 @@ extern int main()
     simdjson.simdjson_result<i64> r1 = d1.at(2).get_int64();
     if (r1.value() != 42) { printf("FAIL o1: got %lld want 42\n", r1.value()); failures |= 1; }
 
-    simdjson.arm64.ondemand.parser p2 = default;
+    SjImplParser p2 = default;
     simdjson.padded_string j2 = simdjson.padded_string("[1,2,42]", 8);
-    simdjson.simdjson_result<simdjson.arm64.ondemand.document> d2 = p2.iterate(j2);
+    simdjson.simdjson_result<SjImplDocument> d2 = p2.iterate(j2);
     simdjson.simdjson_result<i64> r2 = d2.at(2).get_int64();
     if (r2.value() != 42) { printf("FAIL o2: got %lld want 42\n", r2.value()); failures |= 2; }
 
-    simdjson.arm64.ondemand.parser p3 = default;
+    SjImplParser p3 = default;
     simdjson.padded_string j3 = simdjson.padded_string("[1,2,42]", 8);
-    simdjson.simdjson_result<simdjson.arm64.ondemand.document> d3 = p3.iterate((simdjson.padded_string_view)j3);
+    simdjson.simdjson_result<SjImplDocument> d3 = p3.iterate((simdjson.padded_string_view)j3);
     simdjson.simdjson_result<i64> r3 = d3.at(2).get_int64();
     if (r3.value() != 42) { printf("FAIL o3: got %lld want 42\n", r3.value()); failures |= 4; }
 
-    simdjson.arm64.ondemand.parser p4 = default;
+    SjImplParser p4 = default;
     simdjson.padded_string j4 = simdjson.padded_string("[1,2,42]", 8);
-    simdjson.simdjson_result<simdjson.arm64.ondemand.document> d4 = p4.iterate(j4.data(), j4.length(), j4.length() + 64);
+    simdjson.simdjson_result<SjImplDocument> d4 = p4.iterate(j4.data(), j4.length(), j4.length() + 64);
     simdjson.simdjson_result<i64> r4 = d4.at(2).get_int64();
     if (r4.value() != 42) { printf("FAIL o4: got %lld want 42\n", r4.value()); failures |= 8; }
 
     simdjson.ondemand.parser p5 = default;
     simdjson.padded_string j5 = simdjson.padded_string("[1,2,42]", 8);
-    simdjson.simdjson_result<simdjson.arm64.ondemand.document> d5 = p5.iterate(j5.data(), j5.length(), j5.length() + 64);
+    simdjson.simdjson_result<SjImplDocument> d5 = p5.iterate(j5.data(), j5.length(), j5.length() + 64);
     simdjson.simdjson_result<i64> r5 = d5.at(2).get_int64();
     if (r5.value() != 42) { printf("FAIL o5: got %lld want 42\n", r5.value()); failures |= 16; }
 
     simdjson.ondemand.parser p6 = default;
     simdjson.padded_string j6 = simdjson.padded_string("[1,2,42]", 8);
     simdjson.padded_string_view v6 = (simdjson.padded_string_view)j6;
-    simdjson.simdjson_result<simdjson.arm64.ondemand.document> d6 = p6.iterate(v6);
+    simdjson.simdjson_result<SjImplDocument> d6 = p6.iterate(v6);
     simdjson.simdjson_result<i64> r6 = d6.at(2).get_int64();
     if (r6.value() != 42) { printf("FAIL o6: got %lld want 42\n", r6.value()); failures |= 32; }
 
     simdjson.ondemand.parser p7 = default;
     simdjson.padded_string j7 = simdjson.padded_string("[1,2,42]", 8);
-    simdjson.simdjson_result<simdjson.arm64.ondemand.document> d7 = p7.iterate((simdjson.padded_string_view)j7);
+    simdjson.simdjson_result<SjImplDocument> d7 = p7.iterate((simdjson.padded_string_view)j7);
     simdjson.simdjson_result<i64> r7 = d7.at(2).get_int64();
     if (r7.value() != 42) { printf("FAIL o7: got %lld want 42\n", r7.value()); failures |= 64; }
 

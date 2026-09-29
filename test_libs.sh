@@ -40,7 +40,7 @@ export CFLAT_CACHE_DIR="$ROOT/out/libs-cache"
 
 declare -a LIBS CASES
 for dir in "$ROOT"/test_libs/*; do
-  [ -d "$dir" ] || continue
+  [ -f "$dir/lib.cfg" ] || continue
   lib="${dir##*/}"
   if [ ${#LIB_FILTER[@]} -gt 0 ]; then
     matched=0; for wanted in "${LIB_FILTER[@]}"; do [ "$wanted" = "$lib" ] && matched=1; done
@@ -56,14 +56,14 @@ if [ "$LIST" -eq 0 ]; then
 fi
 
 read_cfg() {
-  CFG_TIER=1; CFG_ROOT_MAC=deps; CFG_ROOT_WIN=deps; CFG_PROBE=; CFG_INCLUDE=; CFG_LIB_MAC=; CFG_LIB_WIN=; CFG_RUNPATH_MAC=; CFG_RUNPATH_WIN=; CFG_VERSION_MAC=; CFG_VERSION_WIN=; CFG_HINT_MAC=; CFG_HINT_WIN=; CFG_TIMEOUT=300
+  CFG_TIER=1; CFG_ROOT_MAC=deps; CFG_ROOT_WIN=deps; CFG_PROBE=; CFG_INCLUDE=; CFG_LIB_MAC=; CFG_LIB_WIN=; CFG_RUNPATH_MAC=; CFG_RUNPATH_WIN=; CFG_VERSION_MAC=; CFG_VERSION_WIN=; CFG_HINT_MAC=; CFG_HINT_WIN=; CFG_ARGS=; CFG_TIMEOUT=300
   while IFS='=' read -r key value || [ -n "$key" ]; do
     case "$key" in ''|\#*) continue ;; esac
     case "$key" in
       tier) CFG_TIER="$value" ;; root_mac) CFG_ROOT_MAC="$value" ;; root_win) CFG_ROOT_WIN="$value" ;;
       probe) CFG_PROBE="$value" ;; include) CFG_INCLUDE="$value" ;; lib_mac) CFG_LIB_MAC="$value" ;; lib_win) CFG_LIB_WIN="$value" ;;
       runpath_mac) CFG_RUNPATH_MAC="$value" ;; runpath_win) CFG_RUNPATH_WIN="$value" ;; version_mac) CFG_VERSION_MAC="$value" ;; version_win) CFG_VERSION_WIN="$value" ;;
-      hint_mac) CFG_HINT_MAC="$value" ;; hint_win) CFG_HINT_WIN="$value" ;; timeout) CFG_TIMEOUT="$value" ;;
+      hint_mac) CFG_HINT_MAC="$value" ;; hint_win) CFG_HINT_WIN="$value" ;; args) CFG_ARGS="$value" ;; timeout) CFG_TIMEOUT="$value" ;;
     esac
   done < "$1"
 }
@@ -71,6 +71,7 @@ read_cfg() {
 resolve_root() {
   spec="$1"
   case "$spec" in
+    none) printf '' ;;
     deps) printf '%s/arm64-osx' "${CFLAT_VCPKG_INSTALLED:-$HOME/.cflat-compiler-deps/vcpkg_installed}" ;;
     brew:*) brew --prefix "${spec#brew:}" 2>/dev/null ;;
     env:*) printenv "${spec#env:}" 2>/dev/null || true ;;
@@ -91,7 +92,7 @@ run_case() {
   else
     "${cmd_timeout[@]}" "$CFLAT" "$casefile" "${args[@]}" -o "$case_dir/$name" >"$case_dir/compile.log" 2>&1; rc=$?
     if [ "$rc" -eq 0 ]; then
-      (cd "$case_dir" && env DYLD_LIBRARY_PATH="$root/${CFG_RUNPATH_MAC:-lib}${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}" "./$name") >"$case_dir/run.log" 2>&1; rc=$?
+      (cd "$case_dir" && env DYLD_LIBRARY_PATH="$root/${CFG_RUNPATH_MAC:-lib}${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}" "./$name" ${CFG_ARGS//@REPO@/$ROOT}) >"$case_dir/run.log" 2>&1; rc=$?
     fi
   fi
   end=$(date +%s); elapsed=$((end - start))
@@ -128,7 +129,8 @@ for lib in "${LIBS[@]}"; do
     case_dir="$OUT/$lib/$name"; statusfile="$RESULTS/$lib-$name.status"
     if [ "$disabled" -eq 1 ] && [ "$INCLUDE_DISABLED" -eq 0 ]; then echo "DISABLED $lib/$name"; disabled_count=$((disabled_count + 1)); continue; fi
     if [ "$probe_ok" -eq 0 ]; then
-      if [ "$STRICT" -eq 1 ]; then echo "FAIL $lib/$name: missing probe $root/$CFG_PROBE${hint:+; $hint}"; failures=$((failures + 1)); else echo "SKIP $lib/$name: missing probe $root/$CFG_PROBE${hint:+; $hint}"; skip_count=$((skip_count + 1)); fi
+      reason="missing probe $root/$CFG_PROBE"; [ -n "$root" ] || reason="no root for this platform"
+      if [ "$STRICT" -eq 1 ]; then echo "FAIL $lib/$name: $reason${hint:+; $hint}"; failures=$((failures + 1)); else echo "SKIP $lib/$name: $reason${hint:+; $hint}"; skip_count=$((skip_count + 1)); fi
       continue
     fi
     rm -rf "$case_dir"; mkdir -p "$case_dir"

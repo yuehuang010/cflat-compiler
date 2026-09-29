@@ -1,5 +1,7 @@
+// GUARDS: vcpkg-resolved zlib compress/uncompress round trip
+// FROM: the former vcpkg example zlib_demo.cb
 // zlib over vcpkg. The `import package-vcpkg` form lets cflat run
-// `vcpkg install` itself (against the sibling vcpkg.json) and auto-resolve the
+// `vcpkg install` itself (against test_libs/vcpkg.json) and auto-resolve the
 // include dir, link lib, and runtime DLL (zlib1.dll) for the declared port.
 // No manual build.bat, no manual lib paths.
 //
@@ -8,9 +10,9 @@
 // bytes against the original to verify the round trip succeeded.
 //
 // Build:
-//   x64/Debug/cflat.exe example/vcpkg/zlib_demo.cb -o out/zlib_demo.exe
+//   x64/Debug/cflat.exe test_libs/zlib/zlib_01_demo.cb -o out/zlib_01_demo.exe
 // Run (pass the source path, or rely on the default relative path):
-//   out\zlib_demo.exe example/vcpkg/zlib_demo.cb
+//   out\zlib_01_demo.exe test_libs/zlib/zlib_01_demo.cb
 import package-vcpkg "zlib.h" from "zlib";
 import "filesystem.cb";
 import "string.cb";
@@ -26,7 +28,7 @@ import "string.cb";
 extern int main(int argc, char** argv)
 {
     // Default to this file's path relative to the repo root; allow override.
-    char* path = "example/vcpkg/zlib_demo.cb";
+    char* path = "test_libs/zlib/zlib_01_demo.cb";
     if (argc > 1) { path = argv[1]; }
 
     File* f = new File;

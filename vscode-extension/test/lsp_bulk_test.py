@@ -121,12 +121,12 @@ HOST_IS_WINDOWS = os.name == "nt"
 HOST_IS_MACOS = sys.platform == "darwin"
 
 # Windows/environment-only sources that cannot analyze clean on a non-Windows host:
-# they import windows.h/winsock2.h/COM headers, use os.windows.* or WinRT (.winmd),
-# or need a vcpkg package installed. The sweep runs the locally-built native cflat,
+# they import windows.h/winsock2.h/COM headers or use os.windows.* or WinRT (.winmd).
+# The sweep runs the locally-built native cflat,
 # so the host OS is the analysis target. Mirrors test.sh's SKIP-list rationale; the
 # Windows CI run (test_lsp.bat) still sweeps every one of these. Skipped only off
 # Windows - keep in sync with the same-named content in test.sh when files move.
-_WIN_ONLY_DIRS = ("example/windows", "example/COM", "example/vcpkg")
+_WIN_ONLY_DIRS = ("example/windows", "example/COM")
 _WIN_ONLY_FILES = {
     # Test/: windows.h binding or WinMD. Keep this HONEST, exactly like test.sh's list:
     # test_crt.cb, test_stream.cb and test_threadpool.cb used to sit here for an
@@ -190,20 +190,6 @@ def is_macos_only(path: Path) -> bool:
     return path.name in _MAC_ONLY_FILES
 
 
-# example/vcpkg/*.cb bind headers out of the ports vcpkg installs under
-# example/vcpkg/vcpkg_installed/<triplet>/include. LSP analysis deliberately never runs
-# `vcpkg install` (it would build ports from source on a keystroke), so until the first CLI
-# build of those examples that tree is absent, the header binding degrades to a silent skip,
-# and every C symbol in the file then reports as an undefined variable. test_example.bat is what
-# populates it; skip them here until it has.
-VCPKG_EXAMPLE_DIR = "example/vcpkg"
-
-
-def vcpkg_example_ports_installed() -> bool:
-    installed = REPO_ROOT / "example" / "vcpkg" / "vcpkg_installed"
-    return any(d.joinpath("include").is_dir() for d in installed.glob("*")) if installed.is_dir() else False
-
-
 # Sweep exclusions, as data rather than as a chain of list rebuilds. Each entry carries the
 # reason it cannot be analyzed standalone, so adding one is a table row and the "why" travels
 # with it. Matched against the REPO_ROOT-relative posix path, computed once per file.
@@ -254,23 +240,14 @@ def collect_files(include_win32_demo: bool) -> list[Path]:
     by_prefix = dict(_SKIP_BY_PREFIX)
     if not include_win32_demo:
         by_relpath[WIN32_METADATA_DEMO] = "Win32 metadata demo; WinMetadata not installed"
-    vcpkg_missing = not vcpkg_example_ports_installed()
-    if vcpkg_missing:
-        by_prefix[VCPKG_EXAMPLE_DIR + "/"] = "vcpkg example ports not installed"
-
     kept: list[Path] = []
-    vcpkg_skipped = 0
     for f in files:
         rel = f.relative_to(REPO_ROOT).as_posix()
         if rel in by_relpath or f.name in _SKIP_BY_NAME:
             continue
         if any(rel.startswith(prefix) for prefix in by_prefix):
-            if vcpkg_missing and rel.startswith(VCPKG_EXAMPLE_DIR + "/"):
-                vcpkg_skipped += 1
             continue
         kept.append(f)
-    if vcpkg_missing:
-        print(f"vcpkg example ports: not installed - skipping {vcpkg_skipped} {VCPKG_EXAMPLE_DIR}/ source(s)")
     return kept
 
 

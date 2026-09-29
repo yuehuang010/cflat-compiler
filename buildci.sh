@@ -95,8 +95,6 @@ if ! bash "$SCRIPT_DIR/test_libs.sh" Release -t "$LIBS_TIER"; then
     OVERALL_ERRORS=$((OVERALL_ERRORS + 1))
 fi
 
-# Ahead of test_lsp.sh on purpose, as in buildci.bat: this is the only stage that
-# CLI-compiles example/vcpkg, which is what installs the ports its LSP sweep reads.
 banner "EXAMPLES [Release]: test_example.sh"
 if ! bash "$SCRIPT_DIR/test_example.sh"; then
     echo "EXAMPLES FAILED: Release test_example.sh"

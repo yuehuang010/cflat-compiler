@@ -18,14 +18,17 @@ The Windows runner does not enforce the per-case `timeout` value: cmd.exe has no
 Each library directory has a plain `lib.cfg`, with one `key=value` per line. Lines beginning with `#` are comments; do not add spaces around `=` or quotes. Values may contain space-separated paths.
 
 - `tier=1|2|3` selects the test cadence.
-- `root_mac=deps` uses `${CFLAT_VCPKG_INSTALLED:-$HOME/.cflat-compiler-deps/vcpkg_installed}/arm64-osx`; `root_mac=brew:<formula>` uses `brew --prefix <formula>`. `root_win=deps` uses `%CFLAT_VCPKG_INSTALLED%` (or `%USERPROFILE%\.cflat-compiler-deps\vcpkg_installed`) plus `x64-windows-static`; `root_win=env:<VAR>` uses that environment variable, and an unset variable skips the library.
+- `root_mac=deps` uses `${CFLAT_VCPKG_INSTALLED:-$HOME/.cflat-compiler-deps/vcpkg_installed}/arm64-osx`; `root_mac=brew:<formula>` uses `brew --prefix <formula>`. `root_win=deps` uses `%CFLAT_VCPKG_INSTALLED%` (or `%USERPROFILE%\.cflat-compiler-deps\vcpkg_installed`) plus `x64-windows-static`; `root_win=env:<VAR>` uses that environment variable, and an unset variable skips the library. `root_win=testlibs` uses `test_libs/vcpkg_installed/x64-windows`, installed from `test_libs/vcpkg.json`; `CFLAT_TESTLIB_<LIBNAME>` (or the variable named by `env_win=<VAR>`) overrides that root when set. `root_mac=none` marks a library that has no macOS root (it skips).
 - `probe=<relative path>` must exist below the root or the library is skipped (or failed with `--strict`).
 - `include=<dirs>` lists include directories below the root. `lib_mac=<files>` and `lib_win=<files>` list libraries below it.
 - `runpath_mac=<dir>` and `runpath_win=<dir>` add a runtime library directory when needed.
 - `version_mac=<command>` and `version_win=<command>` print the installed library version. `hint_mac=<text>` and `hint_win=<text>` explain how to install a missing library.
+- `args=<args>` are passed to the built case when it runs; `@REPO@` expands to the repository root.
 - `timeout=<seconds>` records the per-case timeout; the current Windows runner does not enforce it.
 
-On Windows, json and simdjson use the shared vcpkg dependencies at `%USERPROFILE%\.cflat-compiler-deps\vcpkg_installed\x64-windows-static` by default (override with `CFLAT_VCPKG_INSTALLED`). Other libraries use `CFLAT_TESTLIB_FMT`, `CFLAT_TESTLIB_EIGEN`, or the matching `CFLAT_TESTLIB_<LIB>` variable to point at an installation root. Install hints appear when a root or probe is unavailable.
+`test_libs.bat` installs `test_libs/vcpkg.json` once (fmt, eigen3, curl, openblas, sdl3, sqlite3, zlib) before the first library that uses `root_win=testlibs`, by having cflat check one `package-vcpkg` case; a failed install is reported as FAIL with the log tail (`out/libs/vcpkg-install.log`). The `curl`, `openblas`, `sdl3`, `sqlite3`, and `zlib` cases use `import package-vcpkg`, so their `lib.cfg` sets only the root, probe, and runtime path. libtorch is the manifest feature `torch` (source build, hours) and is not installed by default.
+
+On Windows, json and simdjson use the shared vcpkg dependencies at `%USERPROFILE%\.cflat-compiler-deps\vcpkg_installed\x64-windows-static` by default (override with `CFLAT_VCPKG_INSTALLED`). fmt and eigen use the vcpkg tree above unless `CFLAT_TESTLIB_FMT` / `CFLAT_TESTLIB_EIGEN` point at another installation root; torch uses `CFLAT_TESTLIB_LIBTORCH` or the `torch` feature's tree. Install hints appear when a root or probe is unavailable.
 
 ## Cases
 
@@ -51,6 +54,6 @@ When a fix lands for a disabled case, remove its `DISABLED` marker in the same c
 
 | Tier | Cadence | Libraries |
 | --- | --- | --- |
-| 1 | Smoke: required before landing, runs in `buildci.sh` / `buildci.bat`; not in the dev loop | json, fmt, simdjson |
+| 1 | Smoke: required before landing, runs in `buildci.sh` / `buildci.bat`; not in the dev loop | json, fmt, simdjson, and the Windows-only vcpkg libraries curl, openblas, sdl3, sqlite3, zlib |
 | 2 | On request (`-t 2`); cadence not decided yet | eigen |
 | 3 | On request (`-t 3`); giant, minutes per case | torch |

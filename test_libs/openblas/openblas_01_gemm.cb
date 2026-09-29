@@ -1,4 +1,6 @@
-// blas_gemm.cb - worked example of binding a vendor BLAS (OpenBLAS) through
+// GUARDS: vcpkg-resolved OpenBLAS cblas_dgemm vs core Mat.gemm
+// FROM: the former vcpkg example blas_gemm.cb
+// openblas_01_gemm.cb - worked example of binding a vendor BLAS (OpenBLAS) through
 // CFlat's vcpkg-package import machinery, and benchmarking its cblas_dgemm
 // against the dependency-free core kernel Mat.gemm (cflat/core/hpc/densemat.cb).
 //
@@ -6,16 +8,16 @@
 // binds OpenBLAS's real C header - cblas_dgemm, the CBLAS_ORDER / CBLAS_TRANSPOSE
 // enums and their constants (CblasRowMajor, CblasNoTrans, ...) all come straight
 // from the header, no hand-written prototypes. OpenBLAS is resolved through vcpkg
-// via the sibling example/vcpkg/vcpkg.json - cflat runs `vcpkg install` itself and
+// via test_libs/vcpkg.json - cflat runs `vcpkg install` itself and
 // auto-resolves the include dir, link lib, and runtime DLL. No manual paths, no
 // external SDK:
 //
-//   x64\Release\cflat.exe example\vcpkg\blas_gemm.cb -o out\blas_gemm.exe -O2 ^
+//   x64\Release\cflat.exe test_libs\openblas\openblas_01_gemm.cb -o out\openblas_01_gemm.exe -O2 ^
 //       --cpu x86-64-v3 -i cflat\core
 //
 // See performance/hpc/README.md for the benchmark table.
 //
-// Run:  out\blas_gemm.exe [N]        (square N x N x N GEMM; default 512)
+// Run:  out\openblas_01_gemm.exe [N]        (square N x N x N GEMM; default 512)
 // It fills two deterministic N x N double matrices, computes C = A*B with BOTH
 // cblas_dgemm (row-major, no-transpose) and Mat.gemm, checks a handful of output
 // elements against a naive triple-loop reference (and cross-checks the two GEMMs

@@ -1,3 +1,5 @@
+// GUARDS: vcpkg-resolved SDL3 window, renderer loop, and event pump
+// FROM: the former vcpkg example sdl3_demo.cb
 // SDL3 bouncing-rectangle demo, driven entirely from CFlat via C interop.
 //
 // Opens a window, runs a 2D-renderer loop that clears to an animated
@@ -5,18 +7,18 @@
 // Quits on window-close, on Escape, or after a frame cap so it can run
 // head-less / self-terminate. Pass a frame cap as argv[1] (default 600).
 //
-// SDL3 is resolved through vcpkg via the sibling vcpkg.json - cflat runs
+// SDL3 is resolved through vcpkg via test_libs/vcpkg.json - cflat runs
 // `vcpkg install` itself and auto-resolves the include dir, link lib, and
 // runtime DLL (SDL3.dll, auto-copied next to the exe). No manual paths. The
 // first build runs `vcpkg install sdl3`, which can take a few minutes;
 // subsequent builds are fast.
 //
 // Build:
-//   x64/Debug/cflat.exe example/vcpkg/sdl3_demo.cb -o out/sdl3_demo.exe
+//   x64/Debug/cflat.exe test_libs/sdl3/sdl3_01_demo.cb -o out/sdl3_01_demo.exe
 // Run (windowed, auto-quits after 600 frames):
-//   out\sdl3_demo.exe
+//   out/sdl3_01_demo.exe
 // Run a short self-test (30 frames then exit):
-//   out\sdl3_demo.exe 30
+//   out/sdl3_01_demo.exe 30
 import package-vcpkg "SDL3/SDL.h" from "sdl3";
 
 // Auto-extern does not pick up the SDL_main.h helpers (SDL_SetMainReady):

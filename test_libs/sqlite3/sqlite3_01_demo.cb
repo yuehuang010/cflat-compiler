@@ -1,3 +1,5 @@
+// GUARDS: vcpkg-resolved SQLite3 open, prepared statements, and callbacks
+// FROM: the former vcpkg example sqlite_demo.cb
 // SQLite3 via vcpkg. Uses `import package-vcpkg` to auto-resolve the include
 // dir, link lib, and runtime DLL. No manual paths needed.
 import package-vcpkg "sqlite3.h" from "sqlite3";

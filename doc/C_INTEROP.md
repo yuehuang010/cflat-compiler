@@ -308,7 +308,7 @@ caller's object - so write the `(i64)&ctx` / `(T*)slot` pair directly, where it 
 `import package-vcpkg "<header>" from "<port>";` lets cflat do the machine-specific bookkeeping itself: it walks up from the importing `.cb` for a `vcpkg.json`, runs `vcpkg install` once, and pushes the resolved include dir, import libs, and runtime DLLs into the same accumulators the manual flags use. No `--c-include` / `--c-lib`, no sibling `build.bat`.
 
 ```c
-// example/vcpkg/get.cb
+// test_libs/curl/curl_01_get.cb
 import package-vcpkg "curl/curl.h" from "curl";
 
 extern int main()
@@ -321,11 +321,11 @@ extern int main()
 }
 ```
 
-The sibling `vcpkg.json` is the source of truth for what is allowed to be imported:
+The nearest `vcpkg.json` (`test_libs/vcpkg.json` for the samples above) is the source of truth for what is allowed to be imported:
 
 ```json
 {
-  "name": "cflat-vcpkg-example",
+  "name": "cflat-test-libs",
   "version-string": "0.0.1",
   "dependencies": [ "curl" ],
   "builtin-baseline": "d015e31e90838a4c9dfa3eed45979bc70d9357fc"

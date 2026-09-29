@@ -92,20 +92,20 @@ confirming the inner loop is genuinely SIMD.
 ## External BLAS: OpenBLAS `cblas_dgemm` vs `Mat.gemm`
 
 `Mat.gemm` (above) is a self-contained, dependency-free kernel. The other end of the spectrum
-is a hand-tuned vendor BLAS. [`example/vcpkg/blas_gemm.cb`](../../example/vcpkg/blas_gemm.cb) binds
+is a hand-tuned vendor BLAS. [`test_libs/openblas/openblas_01_gemm.cb`](../../test_libs/openblas/openblas_01_gemm.cb) binds
 **OpenBLAS** straight from its C header with CFlat's `import package-vcpkg` machinery and
 benchmarks `cblas_dgemm` against `Mat.gemm` at three sizes - a worked example of "call the vendor
 library when you want peak, keep the core kernel when you want a self-contained build."
 
-### Getting OpenBLAS (via the example-local vcpkg manifest)
+### Getting OpenBLAS (via the test_libs vcpkg manifest)
 
-The demo sources OpenBLAS through vcpkg, the same way `example/vcpkg/sqlite_demo.cb`,
-`sdl3_demo.cb`, and `zlib_demo.cb` source their packages: `openblas` is a dependency in
-[`example/vcpkg/vcpkg.json`](../../example/vcpkg/vcpkg.json) (the repo's root `vcpkg.json` stays
+The demo sources OpenBLAS through vcpkg, the same way `test_libs/sqlite3/sqlite3_01_demo.cb`,
+`sdl3_01_demo.cb`, and `zlib_01_demo.cb` source their packages: `openblas` is a dependency in
+[`test_libs/vcpkg.json`](../../test_libs/vcpkg.json) (the repo's root `vcpkg.json` stays
 untouched). No download, no `%BLAS_SDK%` env var, no CLI paths - `cflat.exe` invokes
 `vcpkg install` itself against that manifest on first compile and resolves the include dir, link
-lib, and runtime DLL automatically. `test_example.bat` builds `blas_gemm.cb` unconditionally as part of
-the `example/vcpkg/` sweep (there is no SDK-discovery gate to skip).
+lib, and runtime DLL automatically. `test_libs.bat` builds `openblas_01_gemm.cb` unconditionally as part of
+the tier-1 sweep (there is no SDK-discovery gate to skip).
 
 The first compile triggers a **source build** of OpenBLAS (vcpkg has no prebuilt binary cache for
 it here) - expect it to take 10-30 minutes once; subsequent compiles reuse the installed package.
@@ -131,12 +131,12 @@ cblas_dgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, m, n, k,
 ```
 
 ```bat
-x64\Release\cflat.exe example\vcpkg\blas_gemm.cb -o out\hpc\blas_gemm.exe -O2 --cpu x86-64-v3
+x64\Release\cflat.exe test_libs\openblas\openblas_01_gemm.cb -o out\hpc\blas_gemm.exe -O2 --cpu x86-64-v3
 out\hpc\blas_gemm.exe            REM square 512 (default); pass an N for another size
 ```
 
 `cblas_dgemm`, `CblasRowMajor`, and `CblasNoTrans` all come straight from `cblas.h` (installed at
-`example/vcpkg/vcpkg_installed/x64-windows/include/openblas/cblas.h`) - no hand-written prototype,
+`test_libs/vcpkg_installed/x64-windows/include/openblas/cblas.h`) - no hand-written prototype,
 no manual enum values. The `core/hpc` import (`hpc/densemat.cb`) resolves against the deployed
 `core/` tree next to `cflat.exe`, so no `-i` is needed. **Runtime DLL:** after the link the
 compiler auto-copies `openblas.dll` next to the exe, so it launches with nothing extra on `PATH`.
@@ -154,7 +154,7 @@ this host); `Mat.gemm (pool)` is the core kernel fanned out over 8 pinned worker
 | 512  | 1.094 ms / **245.3** GFLOP/s | 9.642 ms / 27.8 GFLOP/s | 2.631 ms / 102.0 GFLOP/s |
 | 1024 | 6.992 ms / **307.2** GFLOP/s | 67.49 ms / 31.8 GFLOP/s | 21.65 ms / 99.2 GFLOP/s |
 
-The demo now sources OpenBLAS from vcpkg (`example/vcpkg/vcpkg.json`) instead of that prebuilt
+The demo now sources OpenBLAS from vcpkg (`test_libs/vcpkg.json`) instead of that prebuilt
 package. Two vcpkg port features affect performance; both were measured honestly, and a third
 (`dynamic-arch`, to try to close the remaining gap to the prebuilt release) was attempted and
 turned out to be blocked on this triplet - see below.

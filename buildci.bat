@@ -49,8 +49,7 @@ if errorlevel 1 (
     set /a OVERALL_ERRORS+=1
 )
 
-REM Ahead of test_lsp.bat on purpose: this is the only stage that CLI-compiles
-REM example/vcpkg, which is what installs the ports its LSP sweep reads.
+REM The LIBS stage above installs the test_libs vcpkg ports (test_libs/vcpkg.json).
 echo.
 echo =========================================================================
 echo EXAMPLES [%CFG%]: test_example.bat

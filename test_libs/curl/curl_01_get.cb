@@ -1,5 +1,7 @@
+// GUARDS: vcpkg-resolved libcurl (package-vcpkg) easy-handle GET
+// FROM: the former vcpkg example get.cb
 // libcurl over vcpkg. The new `import package-vcpkg` form lets cflat run
-// `vcpkg install` itself (against sibling vcpkg.json) and auto-resolve the
+// `vcpkg install` itself (against test_libs/vcpkg.json) and auto-resolve the
 // include dir, link libs, and runtime DLLs (libcurl.dll, z.dll, etc.) for the
 // declared port plus its transitive deps. No manual build.bat, no manual lib
 // paths.

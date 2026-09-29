@@ -28,7 +28,6 @@ x64/Release/cflat.exe example/graphics/raytracer.cb -o out/raytracer.exe
 | [shell/](#shell) | Console utilities, an interactive shell, and terminal games | Any |
 | [tools/](#tools) | Self-contained tools: compression, an interpreter, JSON config | Any |
 | [ui/](#ui) | The `ui_native` UI framework tutorial (has its own README) | Any |
-| [vcpkg/](#vcpkg) | Binding third-party C libraries through vcpkg | Windows |
 | [windows/](#windows) | Win32 C interop: GUI, processes, files, sockets, registry | Windows |
 
 ## COM
@@ -116,17 +115,6 @@ The `ui_native` framework tutorial, in numbered chapters that build on each othe
 model, terminal host, Win32 canvas, native OS controls, the widget gallery, WinUI 3,
 automated UI testing, the `fedit` editor, and an interactive map. Read
 [`ui/README.md`](ui/README.md); the reference is [`doc/UI.md`](../doc/UI.md).
-
-## vcpkg
-
-Binding prebuilt C libraries with `import package-vcpkg`, which runs `vcpkg install` against
-the sibling `vcpkg.json` and resolves include dirs, link libs, and runtime DLLs itself.
-
-- `zlib_demo.cb` - compress and decompress with zlib.
-- `sqlite_demo.cb` - create, insert, and query a SQLite database.
-- `get.cb` - an HTTP GET with libcurl.
-- `sdl3_demo.cb` - an SDL3 window with a bouncing rectangle.
-- `blas_gemm.cb` - OpenBLAS `cblas_dgemm` benchmarked against the core `Mat.gemm` kernel.
 
 ## windows
 
