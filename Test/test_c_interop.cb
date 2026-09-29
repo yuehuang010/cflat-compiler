@@ -1,3 +1,4 @@
+// cflat-args: -O2
 // End-to-end C-interop coverage. Each section exercises one path of the C-interop
 // pipeline; on failure the section's exit code identifies which one regressed.
 //
@@ -135,6 +136,15 @@ static bool testFloatMacros()
     r &= FM_INT_CAST_OF_FLOAT == 3;
     return r;
 }
+
+// CFlat extern DEFINITION reached through an indirect call (no call-site attributes).
+extern i64 cbf_ext_callee(short x) { return (i64)x; }
+extern short cbf_ext_def_ret(int x) { return (short)x; }
+extern u8 cbf_ext_def_retu(int x) { return (u8)x; }
+
+// Enum-typed params of a C function pointer extend per the enum BACKING type (u8 zero, i8 sign).
+enum CbfExtE8 : u8 { Hi = 200, Lo = 7 };
+enum CbfExtS8 : i8 { Neg = -3, Pos = 5 };
 
 extern int main()
 {
@@ -763,6 +773,121 @@ extern int main()
 
     // Verbose signed spellings bind as short / i64 (a wide value proves the 64-bit path).
     if (cbf_verbose_spellings(-2, (i64)5000000000) != (i64)4999999998) return 261;
+
+    // Flexible and zero-length array fields are address-based tail arrays. The C helpers
+    // independently check C layout and cross-language reads/writes.
+    if ((int)sizeof(CBF_FlexInt) != cbf_flex_int_size()) return 320;
+    if (cbf_flex_int_size() != 4 || cbf_flex_int_offset() != 4) return 321;
+    CBF_FlexInt* flex = (CBF_FlexInt*)malloc((i64)sizeof(CBF_FlexInt) + 3 * (i64)sizeof(int));
+    flex->count = 3;
+    flex->data[0] = 10;
+    flex->data[1] = 20;
+    (*flex).data[2] = 30;
+    cbf_flex_int_write(flex, 2, 30);
+    if (flex->data[0] + flex->data[1] + cbf_flex_int_read(flex, 2) != 60) return 322;
+    if ((int)sizeof(flex->data[0]) != (int)sizeof(int)) return 337;
+    int* flexDecay = flex->data;
+    if (flexDecay[1] != 20) return 323;
+    int* flexAddress = &flex->data[0];
+    if (flexAddress != flexDecay) return 324;
+    // C decay rules: `&m` is a pointer, `*m` reads element 0, `auto` keeps the decayed pointer.
+    if ((int)sizeof(&flex->data) != 8) return 339;
+    if ((int)sizeof(*flex->data) != 4) return 340;
+    if (*flex->data != 10) return 341;
+    auto flexAuto = flex->data;
+    if (flexAuto[2] != 30) return 342;
+    free(flex);
+
+    CBF_FlexInt* flexLoop = (CBF_FlexInt*)malloc((i64)sizeof(CBF_FlexInt) + 10 * (i64)sizeof(int));
+    int flexLoopSum = 0;
+    for (int i = 0; i < 10; i++)
+    {
+        flexLoop->data[i] = i + 1;
+        flexLoopSum += flexLoop->data[i];
+    }
+    if (flexLoopSum != 55) return 336;
+    free(flexLoop);
+
+    if ((int)sizeof(CBF_ZeroInt) != cbf_flex_zero_size() || cbf_flex_zero_size() != 4) return 325;
+    CBF_ZeroInt* zeroTail = (CBF_ZeroInt*)malloc((i64)sizeof(CBF_ZeroInt) + 2 * (i64)sizeof(int));
+    zeroTail->data[0] = 41;
+    zeroTail->data[1] = 42;
+    if (zeroTail->data[0] + zeroTail->data[1] != 83) return 326;
+    free(zeroTail);
+
+    if ((int)sizeof(CBF_FlexByte) != cbf_flex_byte_size() || cbf_flex_byte_size() != 1) return 334;
+    CBF_FlexByte* byteTail = (CBF_FlexByte*)malloc((i64)sizeof(CBF_FlexByte) + 2);
+    byteTail->data[0] = (u8)5;
+    cbf_flex_byte_tail_write(byteTail, 1, (u8)8);
+    if (byteTail->data[0] + cbf_flex_byte_tail_read(byteTail, 1) != 13) return 335;
+    free(byteTail);
+
+    if ((int)sizeof(CBF_FlexPacked) != cbf_flex_packed_size()
+        || cbf_flex_packed_size() != 1 || cbf_flex_packed_offset() != 1) return 327;
+    CBF_FlexPacked* packedTail = (CBF_FlexPacked*)malloc((i64)sizeof(CBF_FlexPacked) + 2);
+    packedTail->data[0] = (u8)7;
+    cbf_flex_byte_write(packedTail, 1, (u8)9);
+    if (packedTail->data[0] + cbf_flex_byte_read(packedTail, 1) != 16) return 328;
+    free(packedTail);
+
+    CBF_FlexItem* itemTail = (CBF_FlexItem*)malloc((i64)sizeof(CBF_FlexItem) + 2 * (i64)sizeof(CBF_FlexItemElement));
+    itemTail->data[0].value = 51;
+    cbf_flex_item_write(itemTail, 1, 52);
+    if (itemTail->data[0].value + cbf_flex_item_read(itemTail, 1) != 103) return 329;
+    free(itemTail);
+
+    CBF_ZeroItem* zeroItemTail = (CBF_ZeroItem*)malloc((i64)sizeof(CBF_ZeroItem) + (i64)sizeof(CBF_FlexItemElement));
+    cbf_flex_zero_item_write(zeroItemTail, 0, 53);
+    if (zeroItemTail->data[0].value != 53 || cbf_flex_zero_item_read(zeroItemTail, 0) != 53) return 332;
+    free(zeroItemTail);
+
+    int pointedValue = 61;
+    CBF_FlexPointer* pointerTail = (CBF_FlexPointer*)malloc((i64)sizeof(CBF_FlexPointer) + (i64)sizeof(int*));
+    pointerTail->data[0] = &pointedValue;
+    if (cbf_flex_ptr_read(pointerTail, 0) != 61) return 330;
+    free(pointerTail);
+
+    int zeroPointedValue = 62;
+    CBF_ZeroPointer* zeroPointerTail = (CBF_ZeroPointer*)malloc((i64)sizeof(CBF_ZeroPointer) + (i64)sizeof(int*));
+    zeroPointerTail->data[0] = &zeroPointedValue;
+    if (cbf_flex_zero_ptr_read(zeroPointerTail, 0) != 62) return 333;
+    free(zeroPointerTail);
+
+    CBF_FlexNested* nestedTail = (CBF_FlexNested*)malloc((i64)sizeof(CBF_FlexNested) + 2 * (i64)sizeof(int));
+    nestedTail->nested.data[0] = 71;
+    nestedTail->nested.data[1] = 72;
+    if (nestedTail->nested.data[0] + nestedTail->nested.data[1] != 143) return 331;
+    free(nestedTail);
+
+    // Sub-32-bit integer args/returns carry signext/zeroext (fails at -O2 without it, arm64).
+    if (cbf_ext_s8((char)-2, (i64)1000) != 998)   return 262;
+    if (cbf_ext_u8((u8)200, (i64)1000) != 1200)   return 263;
+    if (cbf_ext_u16((u16)60000, (i64)1000) != 61000) return 264;
+    if ((int)cbf_ext_ret_s16(-5) != -5)           return 265;
+    CBF_Big3 big3 = { a = -7, b = 20, c = 300 };
+    if (cbf_ext_sv(big3, (short)-2) != 311)       return 266;
+    if ((int)cbf_ext_sv_ret(big3) != -7)          return 267;
+    CBF_Two two = { a = 40, b = 500 };
+    if (cbf_ext_two(two, (char)-3) != 537)        return 269;
+    function<i64(short)> extCb = cbf_ext_ident(cbf_ext_callee);
+    short extArg = (short)(-3 + 65536 * (int)sizeof(CBF_Big3));
+    if (extCb(extArg) != -3)                      return 268;
+    // C function pointers (returned by C, or stored in a C struct field): call-site extension.
+    function<i64(u8, char)> extFb = cbf_ext_getfb();
+    if (extFb((u8)200, (char)-2) != 199998)       return 350;
+    CBF_ExtHolder extHolder = { f = nullptr };
+    cbf_ext_fill(&extHolder);
+    if (extHolder.f((short)-3) != -3)             return 351;
+    // CFlat extern definitions keep the return extension for C callers, and a function<> caller
+    // (no call-site attribute) still works.
+    if (cbf_ext_call_def(32768) != -32768)        return 352;
+    if (cbf_ext_call_defu(456) != 200)            return 353;
+    function<short(int)> extDef = cbf_ext_identr(cbf_ext_def_ret);
+    if (extDef(32768) != -32768)                  return 354;
+    function<i64(CbfExtE8)> extEnumU = cbf_ext_get_u8();
+    if (extEnumU(CbfExtE8.Hi) != 200)             return 355;
+    function<i64(CbfExtS8)> extEnumS = cbf_ext_get_s8();
+    if (extEnumS(CbfExtS8.Neg) != -3)             return 356;
 
     return 0;
 }

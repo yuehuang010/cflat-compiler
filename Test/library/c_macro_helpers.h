@@ -52,6 +52,20 @@ struct CBF_Pack2
 };
 #pragma pack(pop)
 
+/* Flexible and zero-length tails are typed views at a zero-storage field offset. */
+struct CBF_FlexInt { int count; int data[]; };
+struct CBF_ZeroInt { int count; int data[0]; };
+struct CBF_FlexByte { unsigned char count; unsigned char data[]; };
+struct CBF_FlexItemElement { int value; };
+struct CBF_FlexItem { int count; struct CBF_FlexItemElement data[]; };
+struct CBF_ZeroItem { int count; struct CBF_FlexItemElement data[0]; };
+struct CBF_FlexPointer { int count; int* data[]; };
+struct CBF_ZeroPointer { int count; int* data[0]; };
+struct CBF_FlexNested { int tag; struct { unsigned char count; int data[]; } nested; };
+#pragma pack(push, 1)
+struct CBF_FlexPacked { unsigned char count; unsigned char data[0]; };
+#pragma pack(pop)
+
 int cbf_pack1_size(void);
 int cbf_pack1_align(void);
 int cbf_pack1_n_offset(void);
@@ -73,6 +87,24 @@ int cbf_mixed_check(struct CBF_Mixed v);
 int cbf_char_short_size(void);
 struct CBF_CharShort cbf_char_short_make(int c, unsigned a, int s, unsigned b);
 int cbf_char_short_check(struct CBF_CharShort v);
+int cbf_flex_int_size(void);
+int cbf_flex_int_offset(void);
+int cbf_flex_zero_size(void);
+int cbf_flex_byte_size(void);
+int cbf_flex_packed_size(void);
+int cbf_flex_packed_offset(void);
+int cbf_flex_int_read(struct CBF_FlexInt* v, int i);
+void cbf_flex_int_write(struct CBF_FlexInt* v, int i, int n);
+int cbf_flex_byte_read(struct CBF_FlexPacked* v, int i);
+void cbf_flex_byte_write(struct CBF_FlexPacked* v, int i, unsigned char n);
+int cbf_flex_byte_tail_read(struct CBF_FlexByte* v, int i);
+void cbf_flex_byte_tail_write(struct CBF_FlexByte* v, int i, unsigned char n);
+int cbf_flex_item_read(struct CBF_FlexItem* v, int i);
+void cbf_flex_item_write(struct CBF_FlexItem* v, int i, int n);
+int cbf_flex_zero_item_read(struct CBF_ZeroItem* v, int i);
+void cbf_flex_zero_item_write(struct CBF_ZeroItem* v, int i, int n);
+int cbf_flex_ptr_read(struct CBF_FlexPointer* v, int i);
+int cbf_flex_zero_ptr_read(struct CBF_ZeroPointer* v, int i);
 
 // Function-like macros exercised by test_c_function_macros.cb. The compiler
 // translates each into an auto generic function and rejects bodies that use

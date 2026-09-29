@@ -6395,6 +6395,7 @@ uint64_t LLVMBackend::CxxGroupHeaderHash(const CxxRequestGroup& group) const
             rawField.ctype = field.ctype;
             rawField.access = field.access;
             rawField.isBitfield = field.isBitfield;
+            rawField.isZeroSize = field.isZeroSize;
             rawField.bitWidth = field.bitWidth;
             rawField.offsetBytes = field.offsetBytes;
             rawField.sizeBytes = field.sizeBytes;
@@ -14782,7 +14783,15 @@ void LLVMBackend::RegisterCRecords(std::vector<CRecordEntry>& records, const std
                         DeclTypeAndValue d;
                         TypeAndValue tv;
                         std::vector<uint64_t> arrDims;
-                        std::string elemSpelling = StripFixedArrayDims(f.ctype, arrDims);
+                        std::string fieldSpelling = f.ctype;
+                        if (f.isZeroSize)
+                            if (size_t incomplete = fieldSpelling.find("[]"); incomplete != std::string::npos)
+                                fieldSpelling.replace(incomplete, 2, "[0]");
+                        std::string elemSpelling = StripFixedArrayDims(fieldSpelling, arrDims);
+                        // Keep a typed element view for a flexible or zero-length member; its
+                        // field address comes from the clang offset map, with no record storage.
+                        if (f.isZeroSize && !arrDims.empty() && arrDims.front() == 0)
+                            arrDims.front() = 1;
                         if (!MapCTypeToTypeAndValue(elemSpelling, tv, r.isCxx))
                         {
                             if (r.isCxx && !f.isBitfield && arrDims.empty()
@@ -14801,6 +14810,7 @@ void LLVMBackend::RegisterCRecords(std::vector<CRecordEntry>& records, const std
                             tv.ConstArraySize = arrDims[0];
                             tv.ConstInnerDimensions.assign(arrDims.begin() + 1, arrDims.end());
                         }
+                        tv.IsFlexibleArrayMember = f.isZeroSize && !arrDims.empty();
                         static_cast<TypeAndValue&>(d) = tv;
                         d.VariableName = f.name;
                         if (f.isBitfield)
@@ -14907,7 +14917,15 @@ void LLVMBackend::RegisterCRecords(std::vector<CRecordEntry>& records, const std
                 // Strip fixed-array dims before mapping: the shared mapper decays `[N]` to a
                 // pointer (right for params, wrong for fields), so peel them here first.
                 std::vector<uint64_t> arrDims;
-                std::string elemSpelling = StripFixedArrayDims(f.ctype, arrDims);
+                std::string fieldSpelling = f.ctype;
+                if (f.isZeroSize)
+                    if (size_t incomplete = fieldSpelling.find("[]"); incomplete != std::string::npos)
+                        fieldSpelling.replace(incomplete, 2, "[0]");
+                std::string elemSpelling = StripFixedArrayDims(fieldSpelling, arrDims);
+                // Keep a typed element view for a flexible or zero-length member; its field
+                // address comes from the clang offset map, with no record storage.
+                if (f.isZeroSize && !arrDims.empty() && arrDims.front() == 0)
+                    arrDims.front() = 1;
                 if (!MapCTypeToTypeAndValue(elemSpelling, tv, r.isCxx))
                 {
                     // A C++ field whose TYPE has no CFlat mapping yet (a class-template
@@ -14936,6 +14954,7 @@ void LLVMBackend::RegisterCRecords(std::vector<CRecordEntry>& records, const std
                     tv.ConstArraySize = arrDims[0];
                     tv.ConstInnerDimensions.assign(arrDims.begin() + 1, arrDims.end());
                 }
+                tv.IsFlexibleArrayMember = f.isZeroSize && !arrDims.empty();
                 // A C fn-ptr field maps to a THIN function<T> ("__c_fn_ptr") - a bare,
                 // pointer-sized C function pointer, same size as the void* it replaces, so the
                 // struct layout is unchanged. Keeping the real signature makes MIDL COM vtable

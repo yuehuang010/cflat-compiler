@@ -40,6 +40,44 @@
 #include "TypeMangling.h"
 #include "LspSymbolIndex.h"
 
+static std::string FlexibleArrayMemberLengthError(const LLVMBackend::TypeAndValue& type)
+{
+    if (!type.IsFlexibleArrayMember) return {};
+    const std::string member = type.VariableName.empty() ? "<unknown>" : type.VariableName;
+    return std::format("flexible array member '{}' has no known length", member);
+}
+
+// Every postfix expression that IS the operand of `sizeof` / `&`: the outer one and each
+// parenthesised layer down to the member expression. Empty when the operand is anything more
+// than that, e.g. `*m` or `m + 1`.
+static std::vector<antlr4::ParserRuleContext*> DirectOperandPostfixes(antlr4::tree::ParseTree* node)
+{
+    std::vector<antlr4::ParserRuleContext*> layers;
+    while (node != nullptr)
+    {
+        if (auto* postfix = dynamic_cast<CFlatParser::PostfixExpressionContext*>(node))
+        {
+            layers.push_back(postfix);
+            auto* primary = postfix->primaryExpression();
+            if (postfix->children.size() == 1 && primary != nullptr && primary->children.size() == 3
+                && primary->expression() != nullptr && primary->children[0]->getText() == "(")
+            {
+                node = primary->expression();
+                continue;
+            }
+            return layers;
+        }
+        if (auto* unary = dynamic_cast<CFlatParser::UnaryExpressionContext*>(node))
+        {
+            node = unary->postfixExpression();
+            continue;
+        }
+        if (node->children.size() != 1) return layers;
+        node = node->children[0];
+    }
+    return layers;
+}
+
 static bool HasSoftDeclarationSpecifier(CFlatParser::DeclarationSpecifiersContext* specs,
                                         const std::string& name)
 {
@@ -3742,6 +3780,9 @@ private:
     // Marks an expression position where a ternary owning temp may need per-arm cleanup
     // before its value is joined with a borrowed consumer.
     bool inCallArgument_ = false;
+    // The one postfix expression whose flexible-array member stays an array (the direct operand
+    // of `sizeof` or unary `&`); every other value context decays it to `T*`, as C does.
+    std::vector<antlr4::ParserRuleContext*> flexibleArrayKeep_;
     int ternaryCallArgumentDepth_ = 0;
     // Set by an `auto` declaration whose whole initializer is a `?:`; the top conditional takes
     // it (and clears it) before any operand is parsed, so no nested expression sees it.
@@ -6650,6 +6691,10 @@ public:
     LLVMBackend::NamedVariable ParsePostfixExpression(CFlatParser::PostfixExpressionContext* ctx, bool lValue = false,
                                                        size_t dropTrailingChildren = 0,
                                                        ResultUse use = ResultUse::Value);
+
+    // Flexible / zero-length record member in a value context: decays to a pointer to its first
+    // element (C semantics), so every downstream site sees a plain `T*`.
+    void DecayFlexibleArrayMember(LLVMBackend::NamedVariable& namedVar);
 
     // The body of ParsePostfixExpression. The public entry is a thin wrapper that funnels
     // every exit through the void-result gate below.

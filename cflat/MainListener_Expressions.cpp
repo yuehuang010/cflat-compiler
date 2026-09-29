@@ -1800,7 +1800,10 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                 return rhsNV.Primary;
             }
 
+            // The target of an assignment stays an array so a whole-member store is refused below.
+            flexibleArrayKeep_ = DirectOperandPostfixes(unaryCtx);
             auto namedVar = ParseUnaryExpression(unaryCtx);
+            flexibleArrayKeep_.clear();
             auto destination = namedVar.Storage;
             RefuseCxxConstReferentWrite(unaryCtx, destination, "assign to");
 
@@ -2499,6 +2502,9 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                 && !namedVar.TypeAndValue.IsArrayView
                 && namedVar.BaseType != nullptr && llvm::isa<llvm::ArrayType>(namedVar.BaseType))
             {
+                if (std::string error = FlexibleArrayMemberLengthError(namedVar.TypeAndValue);
+                    !error.empty())
+                    LogErrorContext(unaryCtx, error);
                 std::string rhsText = assignCtx != nullptr ? assignCtx->getText() : std::string();
                 // The LHS as written, not CallerName - on a field receiver ('u.a') CallerName is
                 // just the base variable, and the suggested remedy would name the wrong thing.
@@ -12988,9 +12994,17 @@ LLVMBackend::NamedVariable MainListener::ParseUnaryExpressionImpl(CFlatParser::U
                 auto asType = TrySizeofPostfixAsType(ctx, postFixCtx);
                 if (asType.Primary != nullptr) return asType;
             }
+            flexibleArrayKeep_ = DirectOperandPostfixes(ctx);
             auto operand = EvaluateOperandTypeOnly([&]() {
                 return ParseUnaryExpressionImpl(ctx, ResultUse::Value, sizeofs - 1);
             });
+            flexibleArrayKeep_.clear();
+            if (std::string error = FlexibleArrayMemberLengthError(operand.Type);
+                !error.empty())
+            {
+                LogErrorContext(ctx, error);
+                return {};
+            }
             if (!operand.HasValue)
             {
                 LogErrorContext(ctx, "sizeof/alignof: could not determine type");
@@ -13059,7 +13073,9 @@ LLVMBackend::NamedVariable MainListener::ParseUnaryExpressionImpl(CFlatParser::U
             if (opText == "!")
                 savedElse = compiler->ExchangeElseBlock(nullptr);
 
+            if (opText == "&") flexibleArrayKeep_ = DirectOperandPostfixes(castExpCtx);
             auto namedVar = ParseCastExpression(castExpCtx);
+            flexibleArrayKeep_.clear();
             const bool cxxReferenceResult = namedVar.TypeAndValue.IsAlias
                 && !namedVar.TypeAndValue.Pointer
                 && compiler->IsCxxRecord(namedVar.TypeAndValue.TypeName)
@@ -13148,6 +13164,13 @@ LLVMBackend::NamedVariable MainListener::ParseUnaryExpressionImpl(CFlatParser::U
                 // the noalias contract must keep one-way). Mark a scalar operand's address as a
                 // pointer so the array-view bind gate sees `&a[i]` as the raw `int*` it is.
                 namedVar.TypeAndValue.IsArrayView = false;
+                // `&flexible` is a pointer to its first element, never a sized array.
+                if (namedVar.TypeAndValue.IsFlexibleArrayMember)
+                {
+                    namedVar.TypeAndValue.IsFlexibleArrayMember = false;
+                    namedVar.TypeAndValue.ConstArraySize = 0;
+                    namedVar.TypeAndValue.ConstInnerDimensions.clear();
+                }
                 /*
                  * Depth: `&` adds one level to an ALREADY-RECORDED depth. An operand whose depth
                  * was never recorded stays unrecorded - `&` cannot invent a claim. An operand

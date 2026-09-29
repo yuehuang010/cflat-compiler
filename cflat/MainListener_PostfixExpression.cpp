@@ -584,6 +584,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpression(CFlatParser::Pos
         for (auto* argumentList : ctx->argumentExpressionList())
             DiagnoseAssignmentArguments(argumentList);
         auto namedVar = ParsePostfixExpressionInner(ctx, lValue, dropTrailingChildren, use);
+        if (namedVar.TypeAndValue.IsFlexibleArrayMember && !lValue && std::find(flexibleArrayKeep_.begin(), flexibleArrayKeep_.end(), ctx) == flexibleArrayKeep_.end())
+            DecayFlexibleArrayMember(namedVar);
         if (namedVar.FromOwningTempField && !namedVar.OwningTempParent)
             Compiler(ctx)->RegisterTempFieldValue(namedVar.Primary);
         // Name the callee from the spelling: the chain up to its LAST top-level '(', so a call
@@ -605,6 +607,32 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpression(CFlatParser::Pos
             ? std::string("the call") : std::format("'{}'", name);
         DiagnoseVoidResultConsumed(ctx, namedVar, use, subject);
         return namedVar;
+    }
+
+/*
+ * A flexible or zero-length record member is an incomplete array: in a value context it decays
+ * to `T*`, the address of its first element, exactly as in C. After that auto, return, ternary,
+ * `T[]` binding, foreach and count need no gate - each treats it like any raw pointer. Only the
+ * direct operand of `sizeof` / `&` (flexibleArrayKeep_) and an assignment target stay arrays.
+ */
+void MainListener::DecayFlexibleArrayMember(LLVMBackend::NamedVariable& namedVar) {
+        auto& tv = namedVar.TypeAndValue;
+        tv.IsFlexibleArrayMember = false;
+        if (namedVar.Storage == nullptr) return;
+        // Held in a pointer slot like any `T*` local, so `*m`, `m[i]` and `auto` see a pointer.
+        auto* address = namedVar.Storage;
+        auto* slot = Compiler()->CreateAlloca(address->getType());
+        Compiler()->CreateAssignment(address, slot);
+        namedVar.Storage = slot;
+        namedVar.Primary = nullptr;
+        namedVar.BaseType = address->getType();
+        namedVar.UnionFieldType = nullptr;
+        tv.ConstArraySize = 0;
+        tv.ConstInnerDimensions.clear();
+        tv.IsArrayView = false;
+        if (tv.Pointer) tv.ElemPointer = true;
+        tv.Pointer = true;
+        if (tv.PointerDepth >= 1) tv.PointerDepth = tv.PointerDepth >= 2 ? 2 : tv.PointerDepth + 1;
     }
 
 /*
@@ -1431,6 +1459,14 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             break;
                         if (namedVar.TypeAndValue.IsArrayView)
                             LogErrorContext(ctx, "'++' is not allowed on an array-view 'T[]' - it has no pointer arithmetic; index it with 'a[i]' instead");
+                        // A sized, zero-length or flexible array is not a modifiable lvalue (C: cannot increment 'int[]').
+                        if (!namedVar.TypeAndValue.IsArrayView && !namedVar.TypeAndValue.Pointer
+                            && (namedVar.TypeAndValue.IsFlexibleArrayMember
+                                || (namedVar.BaseType != nullptr && llvm::isa<llvm::ArrayType>(namedVar.BaseType))))
+                        {
+                            LogErrorContext(ctx, "'++' is not allowed on an array; increment an element 'a[i]++' or a pointer to it instead");
+                            break;
+                        }
                         if (ncChainNullBlock != nullptr)
                         {
                             LogErrorContext(ctx, NullConditionalNotWritable("++"));
@@ -1467,6 +1503,14 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             break;
                         if (namedVar.TypeAndValue.IsArrayView)
                             LogErrorContext(ctx, "'--' is not allowed on an array-view 'T[]' - it has no pointer arithmetic; index it with 'a[i]' instead");
+                        // A sized, zero-length or flexible array is not a modifiable lvalue (C: cannot decrement 'int[]').
+                        if (!namedVar.TypeAndValue.IsArrayView && !namedVar.TypeAndValue.Pointer
+                            && (namedVar.TypeAndValue.IsFlexibleArrayMember
+                                || (namedVar.BaseType != nullptr && llvm::isa<llvm::ArrayType>(namedVar.BaseType))))
+                        {
+                            LogErrorContext(ctx, "'--' is not allowed on an array; decrement an element 'a[i]--' or a pointer to it instead");
+                            break;
+                        }
                         if (ncChainNullBlock != nullptr)
                         {
                             LogErrorContext(ctx, NullConditionalNotWritable("--"));
@@ -3245,6 +3289,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             namedVar.Storage = elemPtr;
                             namedVar.BaseType = arrTy->getElementType();
                             namedVar.TypeAndValue.ConstArraySize = 0;
+                            namedVar.TypeAndValue.IsFlexibleArrayMember = false;
                             namedVar.FieldPathThroughPointer = true;
                             // The GEP above already resolved the union reinterpret; leaving the
                             // whole FIELD type set would load/store the element as the whole array.

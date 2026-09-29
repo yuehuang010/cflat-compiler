@@ -6759,6 +6759,7 @@ static llvm::json::Object SerializeTav(const TAV& t)
         o["sdl"] = static_cast<int64_t>(s.SimdLanes);
     }
     if (s.IsArrayView) o["av"] = true;
+    if (s.IsFlexibleArrayMember) o["fam"] = true;
     if (s.AllocAlignValue > 0) o["aa"] = static_cast<int64_t>(s.AllocAlignValue);
     return o;
 }
@@ -6828,6 +6829,7 @@ static TAV DeserializeTav(const llvm::json::Object& o)
     if (auto v = o.getBoolean("sd")) s.IsSimd = *v;
     if (auto v = o.getInteger("sdl")) s.SimdLanes = static_cast<uint64_t>(*v);
     if (auto v = o.getBoolean("av")) s.IsArrayView = *v;
+    if (auto v = o.getBoolean("fam")) s.IsFlexibleArrayMember = *v;
     if (auto v = o.getInteger("aa")) s.AllocAlignValue = static_cast<uint64_t>(*v);
     return s.ToTypeAndValue();
 }

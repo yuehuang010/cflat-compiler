@@ -5,6 +5,8 @@
 
 namespace cppf {
 
+struct Flex { int count; int data[]; };
+
 // Field of a NAMED top-level class - the shape that already worked; kept as the accept-set anchor.
 struct Plain { int p; Plain() : p(3) {} int dbl() const { return p * 2; } };
 struct Named { Plain pl; Named() {} int get() const { return pl.p; } };

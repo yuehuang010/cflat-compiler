@@ -7678,6 +7678,12 @@ extern int main()
     cppi_expr.ExplicitVec3 exprExplicit = cppi_expr.ExplicitVec3(exprA + exprB);
     if (exprExplicit.sum() != 21.0) return 7463;
     if (cppi_expr.Vec3(exprA + exprB).sum() != 21.0) return 7464;
+    cppf.Flex* flexTail = (cppf.Flex*)malloc((i64)sizeof(cppf.Flex) + 2 * (i64)sizeof(int));
+    flexTail->data[0] = 73;
+    flexTail->data[1] = 74;
+    int* flexDecay = flexTail->data;
+    if (flexTail->data[0] + flexDecay[1] != 147) return 7470;
+    free(flexTail);
     exprSum = exprA + exprA;
     if (exprSum.sum() != 12.0) return 7465;
     // A C++ class assignment used as a `||` / `&&` / `!` / `?:` / `if` / `while` operand is the

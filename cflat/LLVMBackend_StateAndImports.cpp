@@ -2030,6 +2030,7 @@ nlohmann::json LLVMBackend::TvToJson(const TypeAndValue& tv)
         if (!s.ConstInnerDimensions.empty()) j["aid"] = s.ConstInnerDimensions;
         if (s.IsSimd) { j["sd"] = true; j["sdl"] = s.SimdLanes; }
         if (s.IsArrayView) j["av"] = true;
+        if (s.IsFlexibleArrayMember) j["fam"] = true;
         if (s.AllocAlignValue > 0) j["aa"] = s.AllocAlignValue;
         return j;
     }
@@ -2093,6 +2094,7 @@ LLVMBackend::TypeAndValue LLVMBackend::TvFromJson(const SjVal& j)
         s.IsSimd = j.value("sd", false);
         s.SimdLanes = j.value("sdl", uint64_t{0});
         s.IsArrayView = j.value("av", false);
+        s.IsFlexibleArrayMember = j.value("fam", false);
         s.AllocAlignValue = j.value("aa", uint64_t{0});
         return s.ToTypeAndValue();
     }

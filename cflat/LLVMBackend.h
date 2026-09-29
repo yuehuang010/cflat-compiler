@@ -921,6 +921,8 @@ public:
         // Thin `int[]` array-view: like `int*` but carries a noalias contract. Pointer arithmetic
         // and `int* -> int[]` casts are forbidden so sub-views are unconstructible. See doc/LANGUAGE.md.
         bool IsArrayView = false;
+        // Foreign flexible/zero-length member: typed for indexing, but no extent is known.
+        bool IsFlexibleArrayMember = false;
 
         // Allocation-alignment clause: arg2 of `alignas(slot, alloc)`. Records that the heap BLOCK
         // this pointer/array-view owns is N-aligned so a field/param/return and the matching
@@ -1242,6 +1244,7 @@ public:
         bool IsSimd = false;
         uint64_t SimdLanes = 0;
         bool IsArrayView = false;
+        bool IsFlexibleArrayMember = false;
         uint64_t AllocAlignValue = 0;
         std::string EnumBacking;
         bool IsScopedEnum = false;
@@ -1302,6 +1305,7 @@ public:
             s.IsSimd = t.IsSimd;
             s.SimdLanes = t.SimdLanes;
             s.IsArrayView = t.IsArrayView;
+            s.IsFlexibleArrayMember = t.IsFlexibleArrayMember;
             s.AllocAlignValue = t.AllocAlignValue;
             return s;
         }
@@ -1362,6 +1366,7 @@ public:
             t.IsSimd = IsSimd;
             t.SimdLanes = SimdLanes;
             t.IsArrayView = IsArrayView;
+            t.IsFlexibleArrayMember = IsFlexibleArrayMember;
             t.AllocAlignValue = AllocAlignValue;
             return t;
         }
@@ -8878,6 +8883,16 @@ public:
     // These are LLVM-level hints required for correct ABI lowering (the x86/x64 backend
     // uses them to decide register vs stack placement, byval copies, and sret semantics).
     void ApplyAbiAttributes(llvm::Function* fn, const AbiRecipe& recipe);
+    // signext/zeroext on narrow-int params/return of a body-less C declaration, per target ABI.
+    void ApplyNarrowIntExtAttrs(llvm::Function* fn, const TypeAndValue& returnType,
+                                const std::vector<TypeAndValue>& arguments, const AbiRecipe* recipe);
+    // Which sub-32-bit integers the target ABI makes the caller extend (clang parity).
+    enum class NarrowIntExtPolicy { None, BoolOnly, All };
+    NarrowIntExtPolicy GetNarrowIntExtPolicy() const;
+    // Call-site signext/zeroext on an indirect (thin function<>) call; `params` pairs an LLVM
+    // argument index with its CFlat parameter type.
+    void ApplyNarrowIntExtCallAttrs(llvm::CallBase* call,
+                                    const std::vector<std::pair<unsigned, TypeAndValue>>& params);
 
     // Number of LLVM params a param slot lowers to (CoercePair -> 2, everything else -> 1).
     static unsigned SlotLLVMParamCount(const AbiSlot& s);
@@ -10561,7 +10576,8 @@ public:
     //      returns record IsCxxConstRef like member ones.
     // 129: request markers record entry validity (entries also carry the build stamp when
     //      CFLAT_CACHE_BUILD_STAMP=1).
-    static constexpr int kCHeaderCacheVersion = 129;
+    // 130: flexible / zero-length array record members carry their provenance (IsFlexibleArrayMember).
+    static constexpr int kCHeaderCacheVersion = 130;
     static std::string CompilerBuildStamp();
     // THE switch for "the compiler build is part of cache entry validity": header/request
     // entries record and check "cstamp", and demand companion keys fold the stamp. OFF by

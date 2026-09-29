@@ -105,6 +105,25 @@ int c_negate(int x)       { return -x; }
 
 #include "c_macro_helpers.h"
 
+int cbf_flex_int_size(void) { return (int)sizeof(struct CBF_FlexInt); }
+int cbf_flex_int_offset(void) { return (int)offsetof(struct CBF_FlexInt, data); }
+int cbf_flex_zero_size(void) { return (int)sizeof(struct CBF_ZeroInt); }
+int cbf_flex_byte_size(void) { return (int)sizeof(struct CBF_FlexByte); }
+int cbf_flex_packed_size(void) { return (int)sizeof(struct CBF_FlexPacked); }
+int cbf_flex_packed_offset(void) { return (int)offsetof(struct CBF_FlexPacked, data); }
+int cbf_flex_int_read(struct CBF_FlexInt* v, int i) { return v->data[i]; }
+void cbf_flex_int_write(struct CBF_FlexInt* v, int i, int n) { v->data[i] = n; }
+int cbf_flex_byte_read(struct CBF_FlexPacked* v, int i) { return v->data[i]; }
+void cbf_flex_byte_write(struct CBF_FlexPacked* v, int i, unsigned char n) { v->data[i] = n; }
+int cbf_flex_byte_tail_read(struct CBF_FlexByte* v, int i) { return v->data[i]; }
+void cbf_flex_byte_tail_write(struct CBF_FlexByte* v, int i, unsigned char n) { v->data[i] = n; }
+int cbf_flex_item_read(struct CBF_FlexItem* v, int i) { return v->data[i].value; }
+void cbf_flex_item_write(struct CBF_FlexItem* v, int i, int n) { v->data[i].value = n; }
+int cbf_flex_zero_item_read(struct CBF_ZeroItem* v, int i) { return v->data[i].value; }
+void cbf_flex_zero_item_write(struct CBF_ZeroItem* v, int i, int n) { v->data[i].value = n; }
+int cbf_flex_ptr_read(struct CBF_FlexPointer* v, int i) { return *v->data[i]; }
+int cbf_flex_zero_ptr_read(struct CBF_ZeroPointer* v, int i) { return *v->data[i]; }
+
 int cbf_zero_size(void) { return (int)sizeof(struct CBF_Zero); }
 struct CBF_Zero cbf_zero_make(int c, int d)
 {
@@ -174,3 +193,40 @@ int cbf_pack2_size(void) { return (int)sizeof(struct CBF_Pack2); }
 int cbf_pack2_align(void) { return (int)_Alignof(struct CBF_Pack2); }
 int cbf_pack2_n_offset(void) { return (int)offsetof(struct CBF_Pack2, n); }
 int cbf_pack2_check(struct CBF_Pack2* v) { return v->c * 1000 + v->n * 10 + v->s; }
+
+/* Sub-32-bit integer arguments / return: the caller must extend (Apple arm64; -O2 exposes it). */
+long long cbf_ext_s8(signed char a, long long b) { return b + a; }
+long long cbf_ext_u8(unsigned char a, long long b) { return b + a; }
+long long cbf_ext_u16(unsigned short a, long long b) { return b + a; }
+short cbf_ext_ret_s16(int x) { return (short)x; }
+/* Struct by value (an ABI recipe with byval) next to narrow ints: the narrow ints still extend. */
+struct CBF_Big3 { long long a, b, c; };
+long long cbf_ext_sv(struct CBF_Big3 s, short a) { return s.a + s.b + s.c + a; }
+short cbf_ext_sv_ret(struct CBF_Big3 s) { return (short)s.a; }
+struct CBF_Two { long long a, b; };
+long long cbf_ext_two(struct CBF_Two s, signed char c) { return s.a + s.b + c; }
+/* Indirect call of a CFlat extern definition: the call carries no attributes, so the definition
+   must not assume extended arguments. */
+typedef long long (*cbf_ext_fp)(short);
+cbf_ext_fp cbf_ext_ident(cbf_ext_fp p) { return p; }
+
+/* Indirect calls through C function pointers: the call site must extend narrow arguments (the
+   callee is clang -O2 code that trusts them). Also a pointer stored in a struct field. */
+typedef long long (*cbf_ext_fpb)(unsigned char, signed char);
+__attribute__((noinline)) static long long cbf_ext_innerb(unsigned char a, signed char b) { return (long long)a * 1000 + b; }
+cbf_ext_fpb cbf_ext_getfb(void) { return cbf_ext_innerb; }
+typedef long long (*cbf_ext_fpu8)(unsigned char);
+typedef long long (*cbf_ext_fps8)(signed char);
+__attribute__((noinline)) static long long cbf_ext_inner_u8(unsigned char a) { return a; }
+__attribute__((noinline)) static long long cbf_ext_inner_s8(signed char a) { return a; }
+cbf_ext_fpu8 cbf_ext_get_u8(void) { return cbf_ext_inner_u8; }
+cbf_ext_fps8 cbf_ext_get_s8(void) { return cbf_ext_inner_s8; }
+struct CBF_ExtHolder { long long (*f)(short); };
+__attribute__((noinline)) static long long cbf_ext_inner16(short a) { return a; }
+void cbf_ext_fill(struct CBF_ExtHolder* h) { h->f = cbf_ext_inner16; }
+/* CFlat extern DEFINITIONS returning narrow ints: the definition extends the return value and
+   this -O2 C caller trusts it (block-scope prototypes: not auto-registered as C declarations). */
+long long cbf_ext_call_def(int v) { extern short cbf_ext_def_ret(int); volatile int vv = v; return cbf_ext_def_ret(vv); }
+long long cbf_ext_call_defu(int v) { extern unsigned char cbf_ext_def_retu(int); volatile int vv = v; return cbf_ext_def_retu(vv); }
+typedef short (*cbf_ext_fpr)(int);
+cbf_ext_fpr cbf_ext_identr(cbf_ext_fpr p) { return p; }

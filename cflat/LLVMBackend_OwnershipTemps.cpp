@@ -5108,7 +5108,19 @@ void LLVMBackend::NoteCFlatExternBody(const std::string& functionName, const std
         for (auto& sym : it->second)
             if (sym.External && !sym.IsCxx && !sym.IsCInteropDeclaration && sym.Function != nullptr
                 && sym.Function->getName() == linkageName)
+            {
                 sym.HasCFlatBody = true;
+                // Param ext attributes belong to declarations of C functions only: a CFlat
+                // caller through function<> may not extend, and a signext param would trust
+                // garbage. The RETURN attribute stays: the definition itself extends, so a C
+                // caller may trust it and a function<> caller (no call-site attr) is unaffected.
+                llvm::Function* fn = sym.Function;
+                for (unsigned i = 0; i < fn->arg_size(); ++i)
+                {
+                    fn->removeParamAttr(i, llvm::Attribute::SExt);
+                    fn->removeParamAttr(i, llvm::Attribute::ZExt);
+                }
+            }
 }
 
 uint64_t LLVMBackend::UnwindInitFloorForDepth(size_t depth) const

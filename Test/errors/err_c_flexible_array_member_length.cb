@@ -1,0 +1,112 @@
+import cpp "../library/cpp_interop_field.h";
+import "../library/c_macro_helpers.h";
+
+// A flexible or zero-length member decays to `T*` in every value context, exactly as in C, so
+// it is refused wherever a raw pointer is; only `sizeof` and a whole-member store name the member.
+void TakeSizedView(int[] data) {}
+
+expect_error("cannot return a raw pointer") {
+    int[] ReturnFlexibleAsView(CBF_FlexInt* p) { return p->data; }
+}
+
+int main()
+{
+    expect_error("no overload of 'count'") {
+        CBF_FlexInt* p = (CBF_FlexInt*)malloc((i64)sizeof(CBF_FlexInt) + 3 * (i64)sizeof(int));
+        int total = 0;
+        for (int x in p->data) total += x;
+    }
+
+    expect_error("no overload of 'count'") {
+        CBF_FlexInt* p = (CBF_FlexInt*)malloc((i64)sizeof(CBF_FlexInt) + 3 * (i64)sizeof(int));
+        auto v = p->data;
+        int total = 0;
+        for (int x in v) total += x;
+    }
+
+    expect_error("flexible array member 'data' has no known length") {
+        CBF_FlexInt* p = (CBF_FlexInt*)malloc((i64)sizeof(CBF_FlexInt) + 3 * (i64)sizeof(int));
+        i64 n = sizeof(p->data);
+    }
+
+    expect_error("flexible array member 'data' has no known length") {
+        CBF_FlexInt* p = (CBF_FlexInt*)malloc((i64)sizeof(CBF_FlexInt) + 3 * (i64)sizeof(int));
+        i64 n = sizeof((p->data));
+    }
+
+    expect_error("cannot bind a raw pointer 'T*' to an array-view 'T[]'") {
+        CBF_FlexInt* p = (CBF_FlexInt*)malloc((i64)sizeof(CBF_FlexInt) + 3 * (i64)sizeof(int));
+        int[] view = p->data;
+    }
+
+    expect_error("cannot bind a raw pointer 'T*' to an array-view 'T[]'") {
+        CBF_FlexInt* p = (CBF_FlexInt*)malloc((i64)sizeof(CBF_FlexInt) + 3 * (i64)sizeof(int));
+        auto v = p->data;
+        int[] view = v;
+    }
+
+    expect_error("flexible array member 'data' has no known length") {
+        CBF_FlexInt* p = (CBF_FlexInt*)malloc((i64)sizeof(CBF_FlexInt) + 3 * (i64)sizeof(int));
+        p->data = p->data;
+    }
+
+    expect_error("flexible array member 'data' has no known length") {
+        CBF_ZeroInt* p = (CBF_ZeroInt*)malloc((i64)sizeof(CBF_ZeroInt) + 3 * (i64)sizeof(int));
+        i64 n = sizeof(p->data);
+    }
+
+    expect_error("cannot pass a raw pointer 'int*' as array-view parameter") {
+        CBF_FlexInt* p = (CBF_FlexInt*)malloc((i64)sizeof(CBF_FlexInt) + 3 * (i64)sizeof(int));
+        TakeSizedView(p->data);
+    }
+
+    expect_error("cannot bind a raw pointer 'T*' to an array-view 'T[]'") {
+        CBF_FlexInt* p = (CBF_FlexInt*)malloc((i64)sizeof(CBF_FlexInt) + 3 * (i64)sizeof(int));
+        int[] view = true ? p->data : p->data;
+    }
+
+    expect_error("cannot pass a raw pointer 'int*' as array-view parameter") {
+        CBF_FlexInt* p = (CBF_FlexInt*)malloc((i64)sizeof(CBF_FlexInt) + 3 * (i64)sizeof(int));
+        TakeSizedView(true ? p->data : p->data);
+    }
+
+    expect_error("cannot bind a raw pointer 'T*' to an array-view 'T[]'") {
+        CBF_FlexInt* p = (CBF_FlexInt*)malloc((i64)sizeof(CBF_FlexInt) + 3 * (i64)sizeof(int));
+        int[] view;
+        view = true ? p->data : p->data;
+    }
+
+    expect_error("no overload of 'count'") {
+        cppf.Flex* p = (cppf.Flex*)malloc((i64)sizeof(cppf.Flex) + 3 * (i64)sizeof(int));
+        int total = 0;
+        for (int x in p->data) total += x;
+    }
+
+    expect_error("flexible array member 'data' has no known length") {
+        cppf.Flex* p = (cppf.Flex*)malloc((i64)sizeof(cppf.Flex) + 3 * (i64)sizeof(int));
+        i64 n = sizeof(p->data);
+    }
+
+    expect_error("cannot pass a raw pointer 'int*' as array-view parameter") {
+        cppf.Flex* p = (cppf.Flex*)malloc((i64)sizeof(cppf.Flex) + 3 * (i64)sizeof(int));
+        TakeSizedView(p->data);
+    }
+
+    expect_error("'++' is not allowed on an array") {
+        CBF_FlexInt* p = (CBF_FlexInt*)malloc((i64)sizeof(CBF_FlexInt) + 3 * (i64)sizeof(int));
+        p->data++;
+    }
+
+    expect_error("'--' is not allowed on an array") {
+        CBF_FlexInt* p = (CBF_FlexInt*)malloc((i64)sizeof(CBF_FlexInt) + 3 * (i64)sizeof(int));
+        int* q = p->data--;
+    }
+
+    // A sized array is not a modifiable lvalue either (master failed module verification).
+    expect_error("'++' is not allowed on an array") {
+        int[4] d = default;
+        d++;
+    }
+
+    return 0;
+}

@@ -635,6 +635,7 @@ llvm::Value* LLVMBackend::CreateIndirectCall(const TypeAndValue& funcPtrType, ll
             auto* cFnTy   = llvm::FunctionType::get(retTy, paramTypes, false);
             auto* fnPtr   = builder->CreateBitCast(funcPtr, cflat_llvm::PointerTo(cFnTy), "cfn_ptr");
             std::vector<llvm::Value*> abiArgs;
+            std::vector<std::pair<unsigned, TypeAndValue>> extParams;
             if (cxxSretReturn) abiArgs.push_back(cxxSret.second);
             std::vector<llvm::Value*> cxxIndirectArgs;
             materializeCxxIndirectArgs(funcPtrType.FuncPtrParams, cxxIndirectArgs);
@@ -674,6 +675,7 @@ llvm::Value* LLVMBackend::CreateIndirectCall(const TypeAndValue& funcPtrType, ll
                 pTV.TypeName = funcPtrType.FuncPtrParams[i].TypeName;
                 pTV.Pointer = funcPtrType.FuncPtrParams[i].Pointer;
                 pTV.IsMove = funcPtrType.FuncPtrParams[i].IsMove;
+                extParams.emplace_back((unsigned)(abiArgs.size() - 1), pTV);
                 if (ParameterCarriesRawArrayCount(pTV))
                 {
                     llvm::Value* count = rawArrayCounts != nullptr && i < rawArrayCounts->size()
@@ -693,6 +695,9 @@ llvm::Value* LLVMBackend::CreateIndirectCall(const TypeAndValue& funcPtrType, ll
             }
             lastCallReturnType = retTV;
             auto* result = CreateCallOrInvoke(cFnTy, fnPtr, abiArgs, /*mayUnwind=*/true);
+            // thin function<> = bare C pointer: the callee may be clang -O2 C code (see the helper).
+            if (auto* callBase = llvm::dyn_cast_or_null<llvm::CallBase>(result))
+                ApplyNarrowIntExtCallAttrs(callBase, extParams);
             // No body to prove the callee borrows: keep `?:` / `??` arm temps it may retain.
             DropRetainedJoinArmPtrTemps(result);
             if (cxxSretRecipe.hasLowering)
@@ -1234,7 +1239,12 @@ std::vector<llvm::Type*> LLVMBackend::ClassifyAArch64Struct(llvm::StructType* st
 
 LLVMBackend::AbiSlot LLVMBackend::ClassifyAArch64Param(llvm::StructType* st, uint64_t align)
 {
-        return MakeCoerceSlot(st, align, ClassifyAArch64Struct(st), AbiSlot::ByVal);
+        AbiSlot slot = MakeCoerceSlot(st, align, ClassifyAArch64Struct(st), AbiSlot::ByVal);
+        // AAPCS64 passes a composite over 16 bytes as a bare pointer to a caller-made copy (clang:
+        // `ptr noundef`); LLVM's byval would copy it onto the stack and shift every later argument.
+        if (slot.kind == AbiSlot::ByVal)
+            slot.indirectByVal = false;
+        return slot;
     }
 
 LLVMBackend::AbiSlot LLVMBackend::ClassifyAArch64Return(llvm::StructType* st, uint64_t align)
@@ -1753,6 +1763,94 @@ void LLVMBackend::ApplyAbiAttributes(llvm::Function* fn, const AbiRecipe& recipe
         }
     }
 
+// C ABI: the CALLER extends a sub-32-bit integer argument and a clang -O2 callee relies on it
+// (Apple arm64: no re-extend; a `short` -2 would be read as 65534 without signext). Mirrors clang
+// per target: Darwin and x86_64 non-Windows extend everything, Windows only bool, aarch64 Linux
+// nothing. Body-less declarations get params + return; a CFlat extern DEFINITION keeps only the
+// return attribute (see NoteCFlatExternBody: its params stay plain for function<> callers).
+LLVMBackend::NarrowIntExtPolicy LLVMBackend::GetNarrowIntExtPolicy() const
+{
+        if (targetWindows_)
+            return NarrowIntExtPolicy::BoolOnly;
+        if (!targetMacOS_)
+        {
+            llvm::Triple triple = module->getTargetTriple().str().empty()
+                ? llvm::Triple(llvm::sys::getProcessTriple()) : llvm::Triple(module->getTargetTriple());
+            if (triple.isAArch64())
+                return NarrowIntExtPolicy::None;
+        }
+        return NarrowIntExtPolicy::All;
+}
+
+// Call-site signext/zeroext for an INDIRECT call through a thin `function<>`. A function pointer
+// carries no callee attributes, so a clang -O2 C callee that trusts caller-extended arguments
+// would read garbage without them. Only params get the attribute: extending an argument is
+// always safe for a CFlat callee too, whereas a call-site RETURN attribute would assert an
+// extension a CFlat callee never performs. `paramLlvmIndex` pairs an LLVM argument index with
+// its CFlat parameter type.
+void LLVMBackend::ApplyNarrowIntExtCallAttrs(llvm::CallBase* call,
+        const std::vector<std::pair<unsigned, TypeAndValue>>& params)
+{
+        const NarrowIntExtPolicy policy = GetNarrowIntExtPolicy();
+        if (policy == NarrowIntExtPolicy::None)
+            return;
+        for (auto [idx, t] : params)
+        {
+            if (t.Pointer || t.IsAlias || idx >= call->arg_size()) continue;
+            // A function-pointer param records only the enum's name; its signedness is the backing's.
+            if (t.EnumBacking.empty()) t.EnumBacking = GetEnumBackingType(t.TypeName);
+            llvm::Type* ty = call->getArgOperand(idx)->getType();
+            if (!ty->isIntegerTy() || ty->getIntegerBitWidth() >= 32) continue;
+            if (policy == NarrowIntExtPolicy::BoolOnly && t.TypeName != "bool") continue;
+            call->addParamAttr(idx, (t.IsUnsignedInteger() != -1 || t.TypeName == "bool")
+                ? llvm::Attribute::ZExt : llvm::Attribute::SExt);
+        }
+}
+
+void LLVMBackend::ApplyNarrowIntExtAttrs(llvm::Function* fn, const TypeAndValue& returnType,
+                                         const std::vector<TypeAndValue>& arguments,
+                                         const AbiRecipe* recipe)
+{
+        const NarrowIntExtPolicy policy = GetNarrowIntExtPolicy();
+        if (policy == NarrowIntExtPolicy::None)
+            return;
+        auto* fnType = fn->getFunctionType();
+        auto extAttr = [](const TypeAndValue& t) {
+            return (t.IsUnsignedInteger() != -1 || t.TypeName == "bool")
+                ? llvm::Attribute::ZExt : llvm::Attribute::SExt;
+        };
+        auto wanted = [&](llvm::Type* ty, const TypeAndValue& t) {
+            if (t.Pointer || t.IsAlias || !ty->isIntegerTy() || ty->getIntegerBitWidth() >= 32)
+                return false;
+            return policy == NarrowIntExtPolicy::All || t.TypeName == "bool";
+        };
+        const bool retDirect = recipe == nullptr || recipe->retSlot.kind == AbiSlot::Direct;
+        if (retDirect && wanted(fnType->getReturnType(), returnType))
+            fn->addRetAttr(extAttr(returnType));
+        if (recipe == nullptr)
+        {
+            if (fnType->getNumParams() == arguments.size())
+                for (size_t i = 0; i < arguments.size(); ++i)
+                    if (wanted(fnType->getParamType((unsigned)i), arguments[i]))
+                        fn->addParamAttr((unsigned)i, extAttr(arguments[i]));
+            return;
+        }
+        if (recipe->paramSlots.size() != arguments.size())
+            return;
+        // Same LLVM parameter index walk as ApplyAbiAttributes.
+        unsigned attrIdx = 0;
+        if (recipe->retSlot.kind == AbiSlot::SRetReturn && SRetArgIndex(*recipe) == 0) ++attrIdx;
+        for (size_t i = 0; i < recipe->paramSlots.size(); ++i)
+        {
+            const AbiSlot& s = recipe->paramSlots[i];
+            if (i == 1 && SRetArgIndex(*recipe) == 1) ++attrIdx;
+            if (s.kind == AbiSlot::Direct && !s.signExt && !s.zeroExt
+                && attrIdx < fnType->getNumParams() && wanted(fnType->getParamType(attrIdx), arguments[i]))
+                fn->addParamAttr(attrIdx, extAttr(arguments[i]));
+            attrIdx += SlotLLVMParamCount(s);
+        }
+}
+
 unsigned LLVMBackend::SlotLLVMParamCount(const AbiSlot& s)
 {
         if (s.kind == AbiSlot::CoercePair) return 2u;
@@ -2088,6 +2186,9 @@ void LLVMBackend::CreateFunctionDeclaration(const std::string& functionName, con
 
             if (useRecipe)
                 ApplyAbiAttributes(fn, recipe);
+            // A valid C++ plan already carries clang's exact ext attributes (or none).
+            if (external && !(cxxPlan != nullptr && cxxPlan->valid))
+                ApplyNarrowIntExtAttrs(fn, returnType, arguments, useRecipe ? &recipe : nullptr);
 
             auto& symList = functionTable[functionName];
             FunctionSymbol funcSym = {
