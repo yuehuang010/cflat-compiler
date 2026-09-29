@@ -279,6 +279,44 @@ residual risks are the ~3 s of CHeaderExtract self time (mapping the 88k-definit
 records/sigs), which must also become lazy in P5, and the demand chunk's instantiation cost (bounded
 by clang++'s own 0.86 s PerformPendingInstantiations for the same program).
 
+### Status: Windows baseline, all C++-interop samples (2026-09-29, master c4fda05a)
+
+Harness: `test_libs_parity.ps1 -N 3` (repo root; Windows counterpart of parity.sh). It covers every test_libs
+C++-interop case with a `<case>.cpp` twin: fmt (4), json (3), simdjson (2) and torch (11). Both baselines:
+clang++ -O0 compile+link vs cflat `-o` cold/warm, and clang++ -fsyntax-only vs `cflat --check`. Idle machine,
+pinned 0x55. Full per-case table + method: internal/issue/p1/cpp-import-compile-time-parity-with-clang.md
+("Windows full baseline incl. libtorch").
+
+| sample | clang++ link | cold (x clang++) | warm (x clang++) | check cold vs -fsyntax-only |
+|---|---|---|---|---|
+| simdjson | 1.33-1.40 s | 1.05-1.19x | 0.16-0.21x | 1.12-1.26x |
+| fmt | 0.67-0.68 s | 1.22-1.38x | 0.24-0.25x | 1.32-1.41x |
+| torch (11 cases) | 9.6-10.7 s | 1.64-1.82x | 0.19-0.25x | 1.63-1.76x |
+| json | 1.98-2.11 s | 1.66-2.00x | 0.15-0.26x | 1.76-1.92x |
+
+- **Warm target met on every sample.**
+- **Cold is <= 1.1x only for simdjson_01.**
+- **Front-end/interop gap.** The syntax-only ratio tracks the link ratio, so the remaining cold gap is
+  front-end/interop work, not codegen/link.
+- **Windows torch vs macOS.** Windows torch cold is 1.74x vs 1.6x on macOS train.cb (plain LLVM).
+Perf changes landed on master (newest first; torch train.cb = macOS sample, others = Windows test_libs):
+
+| commit | change | effect |
+|---|---|---|
+| c4fda05a | incremental group: drop already-listed ParmVarDecls before late body parse; `__cflat_std_function_ctor_` rename-on-redefine | fixes a Windows hang (decl-chain cycle) and a cache-replay redefinition; torch tier 3 enabled |
+| 79804a83 | per-call memo in the mangled-type parser (was exponential on unknown template arity); IsCxxSharedPtrUpcast shape reject before demangling; CxxGroupHeaderHash memo on (path, mtime, size) | json_01 warm 1.31 -> 0.56 s; simdjson_02 cold 1.72x -> 1.15x |
+| 1898482a | round 3: by-value gate projects only dtor + copy/move ctors; macro prepass folded into chunk 0; error-body sweep only when an error can exist; callback ABI by-value slice | train.cb cold 6.54 -> 5.26 s (1.6x; 1.2x with PGO+ThinLTO LLVM), warm 0.47 s |
+| 3e0d5d8e | rounds 1-2 (P1-P3): one demand-driven companion per group; lazy std::function binds; parse-only requests; lazy record projection; skipped/late-parsed inline bodies; warm-edit demand replay; cold glue | train.cb cold 98 -> 6.5 s, warm 17.6 -> 0.55 s |
+| 1405f9f7 | skip rebound signatures, replay seeded namespaces, LSP reads the compile cache | - |
+| 1f2f3f7e | lazy companion promotion, merge-then-LinkOnlyNeeded companion link | - |
+| cfdbeca4 | request cache entry holds only what its key's headers include | - |
+| 62c21233 | unified C++ reparse switch, versioned header cache | test suite 413 -> ~125 s |
+| 9b825a07 | C++ incremental requests on by default (one Interpreter TU per import line) | cold budget 1 / warm 0 enforced |
+| 75617db5 | header extraction is chunk 0 of the group Interpreter | simdjson cold 4.7 -> 2.8 s |
+
+- **Next lever to measure:** gate the `__cflat_use*` ODR-use helpers to used members.
+- **Last step:** a PGO-built LLVM.
+
 ---
 
 ## 6. Prior art: keeping one Sema alive
