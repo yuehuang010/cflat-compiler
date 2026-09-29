@@ -876,6 +876,8 @@ void LLVMBackend::UnpackFuncPtrSignature(const TypeAndValue& fpTV, TypeAndValue&
             tv.IsMove = p.IsMove;
             tv.IsOwningSink = p.IsOwningSink;
             tv.IsConsumeInferredSink = p.IsConsumeInferredSink;
+            tv.IsReturnInferredSink = p.IsReturnInferredSink;
+            tv.IsWriteInferredSink = p.IsWriteInferredSink;
             tv.IsRvalueRef = p.IsRvalueRef;
             params.push_back(std::move(tv));
         }

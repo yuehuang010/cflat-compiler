@@ -1993,6 +1993,8 @@ nlohmann::json LLVMBackend::TvToJson(const TypeAndValue& tv)
         if (s.IsCxxPointeeConst) j["cpc"] = true;
         if (s.IsOwningSink)   j["osk"] = true;
         if (s.IsConsumeInferredSink) j["cis"] = true;
+        if (s.IsReturnInferredSink) j["ris"] = true;
+        if (s.IsWriteInferredSink) j["wis"] = true;
         if (s.IsBorrowOfAliasElement) j["bae"] = true;
         if (s.IsBond)          j["bd"] = true;
         if (s.IsUnique)        j["uq"] = true;
@@ -2019,6 +2021,8 @@ nlohmann::json LLVMBackend::TvToJson(const TypeAndValue& tv)
                 if (p.IsMove)  pj["mv"] = true;
                 if (p.IsOwningSink) pj["osk"] = true;
                 if (p.IsConsumeInferredSink) pj["cis"] = true;
+                if (p.IsReturnInferredSink) pj["ris"] = true;
+                if (p.IsWriteInferredSink) pj["wis"] = true;
                 if (p.IsRvalueRef) pj["rr"] = true;
                 if (p.PointerDepth > 1) pj["pd"] = p.PointerDepth;
                 if (!p.ResolvedTypeKey.empty()) pj["rk"] = p.ResolvedTypeKey;
@@ -2057,6 +2061,8 @@ LLVMBackend::TypeAndValue LLVMBackend::TvFromJson(const SjVal& j)
         s.IsCxxPointeeConst = j.value("cpc", false);
         s.IsOwningSink = j.value("osk", false);
         s.IsConsumeInferredSink = j.value("cis", false);
+        s.IsReturnInferredSink = j.value("ris", false);
+        s.IsWriteInferredSink = j.value("wis", false);
         s.IsBorrowOfAliasElement = j.value("bae", false);
         s.IsBond = j.value("bd", false);
         s.IsUnique = j.value("uq", false);
@@ -2083,6 +2089,8 @@ LLVMBackend::TypeAndValue LLVMBackend::TvFromJson(const SjVal& j)
                     p.IsMove = pj.value("mv", false);
                     p.IsOwningSink = pj.value("osk", false);
                     p.IsConsumeInferredSink = pj.value("cis", false);
+                    p.IsReturnInferredSink = pj.value("ris", false);
+                    p.IsWriteInferredSink = pj.value("wis", false);
                     p.IsRvalueRef = pj.value("rr", false);
                     p.PointerDepth = pj.value("pd", p.PointerDepth);
                     p.ResolvedTypeKey = pj.value("rk", std::string{});

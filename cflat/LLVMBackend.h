@@ -839,6 +839,13 @@ public:
         // COPY, so the param stays a borrow and the caller keeps its value. An unconditional-`move`
         // sink leaves this false and consumes any owner, exactly as before.
         bool IsConsumeInferredSink = false;
+        // Set with IsConsumeInferredSink when `return p` is the ONLY consume: a unique-owning type
+        // then stays a borrow (its passthrough is an inferred 'alias' return), others consume.
+        bool IsReturnInferredSink = false;
+        // Set with IsConsumeInferredSink when a whole-name write (`p = v`, `p += k`) is a trigger
+        // and no store/move consumes p: nothing escapes, so a bonded argument is refused only
+        // when the concrete type is consumed (OwningSinkConsumesConcrete).
+        bool IsWriteInferredSink = false;
         // Pure-borrow element (list<alias T*>) whose owner lives elsewhere; a later delete of a
         // local bound to this accessor result double-frees when the real owner releases it.
         bool IsBorrowOfAliasElement = false;
@@ -899,6 +906,8 @@ public:
             // ApplyMoveParamTransfer. OwningSinkConsumesConcrete filters the structural half.
             bool IsOwningSink = false;
             bool IsConsumeInferredSink = false;
+            bool IsReturnInferredSink = false;
+            bool IsWriteInferredSink = false;
             bool IsRvalueRef = false;
             int PointerDepth = 0;   // 0 = not recorded; see FuncPtrReturnPointerDepth
             std::string ResolvedTypeKey;  // "" = not recorded; see FuncPtrReturnResolvedKey
@@ -1212,6 +1221,8 @@ public:
         bool IsCxxPointeeConst = false;
         bool IsOwningSink = false;
         bool IsConsumeInferredSink = false;
+        bool IsReturnInferredSink = false;
+        bool IsWriteInferredSink = false;
         bool IsBorrowOfAliasElement = false;
         bool IsBond = false;
         bool IsUnique = false;
@@ -1234,6 +1245,8 @@ public:
             bool IsMove = false;
             bool IsOwningSink = false;
             bool IsConsumeInferredSink = false;
+            bool IsReturnInferredSink = false;
+            bool IsWriteInferredSink = false;
             bool IsRvalueRef = false;
             int PointerDepth = 0;
             std::string ResolvedTypeKey;
@@ -1272,6 +1285,8 @@ public:
             s.IsCxxPointeeConst = t.IsCxxPointeeConst;
             s.IsOwningSink = t.IsOwningSink;
             s.IsConsumeInferredSink = t.IsConsumeInferredSink;
+            s.IsReturnInferredSink = t.IsReturnInferredSink;
+            s.IsWriteInferredSink = t.IsWriteInferredSink;
             s.IsBorrowOfAliasElement = t.IsBorrowOfAliasElement;
             s.IsBond = t.IsBond;
             s.IsUnique = t.IsUnique;
@@ -1295,6 +1310,8 @@ public:
                 q.IsMove = p.IsMove;
                 q.IsOwningSink = p.IsOwningSink;
                 q.IsConsumeInferredSink = p.IsConsumeInferredSink;
+                q.IsReturnInferredSink = p.IsReturnInferredSink;
+                q.IsWriteInferredSink = p.IsWriteInferredSink;
                 q.IsRvalueRef = p.IsRvalueRef;
                 q.PointerDepth = p.PointerDepth;
                 q.ResolvedTypeKey = p.ResolvedTypeKey;
@@ -1333,6 +1350,8 @@ public:
             t.IsCxxPointeeConst = IsCxxPointeeConst;
             t.IsOwningSink = IsOwningSink;
             t.IsConsumeInferredSink = IsConsumeInferredSink;
+            t.IsReturnInferredSink = IsReturnInferredSink;
+            t.IsWriteInferredSink = IsWriteInferredSink;
             t.IsBorrowOfAliasElement = IsBorrowOfAliasElement;
             t.IsBond = IsBond;
             t.IsUnique = IsUnique;
@@ -1356,6 +1375,8 @@ public:
                 q.IsMove = p.IsMove;
                 q.IsOwningSink = p.IsOwningSink;
                 q.IsConsumeInferredSink = p.IsConsumeInferredSink;
+                q.IsReturnInferredSink = p.IsReturnInferredSink;
+                q.IsWriteInferredSink = p.IsWriteInferredSink;
                 q.IsRvalueRef = p.IsRvalueRef;
                 q.PointerDepth = p.PointerDepth;
                 q.ResolvedTypeKey = p.ResolvedTypeKey;

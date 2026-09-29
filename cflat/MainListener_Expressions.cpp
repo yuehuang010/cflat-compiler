@@ -497,11 +497,8 @@ LLVMBackend::NamedVariable MainListener::ParseAssignmentExpressionNamed(CFlatPar
                     result.BaseType = result.Primary->getType();
                     result.TypeAndValue = assignmentResult.TypeAndValue;
                     result.Storage = assignmentResult.Storage;
-                    result.CallerName = assignmentResult.CallerName;
-                    result.FieldName = assignmentResult.FieldName;
-                    result.IsOwning = assignmentResult.IsOwning;
-                    result.IsBorrowed = assignmentResult.IsBorrowed;
-                    result.BorrowedOrigin = assignmentResult.BorrowedOrigin;
+                    // All of it: an owning struct destination carries its borrow provenance.
+                    AdoptWrapperProvenance(result, assignmentResult);
                 }
             }
             if (const auto* raw = compilerLLVM->FindRawArrayResult(result.Primary))
@@ -2753,14 +2750,25 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                     assignmentResult->Primary = resultValue;
                     assignmentResult->BaseType = resultValue != nullptr
                         ? resultValue->getType() : namedVar.BaseType;
+                    // An owning struct destination is named too: `T x = (w += 2)` / `return (w = y)`
+                    // then consume `w` exactly as `T x = w` does, instead of adopting its bytes twice.
+                    const bool ownedStructDest = !namedVar.TypeAndValue.Pointer
+                        && !namedVar.TypeAndValue.IsInterface
+                        && resultValue != nullptr && resultValue->getType()->isStructTy()
+                        && !compiler->IsForeignNontrivialCxxClass(namedVar.TypeAndValue.TypeName)
+                        && compiler->IsOwningValueType(namedVar.TypeAndValue.TypeName);
                     if (coalesceResume == nullptr
-                        && (namedVar.TypeAndValue.IsUnique
+                        && (namedVar.TypeAndValue.IsUnique || ownedStructDest
                             || compiler->IsCoreUniqueType(namedVar.TypeAndValue.TypeName)))
                     {
                         assignmentResult->Storage = destination;
                         assignmentResult->CallerName = namedVar.CallerName;
                         assignmentResult->FieldName = namedVar.FieldName;
                         assignmentResult->IsOwning = true;
+                        // Same provenance `T x = w` would see, so the borrow guards refuse
+                        // `(h->f += 2)` exactly where they refuse `h->f`.
+                        if (ownedStructDest)
+                            AdoptWrapperProvenance(*assignmentResult, namedVar);
                     }
                     else if (namedVar.TypeAndValue.Pointer)
                     {
@@ -4209,6 +4217,9 @@ llvm::Value* MainListener::ParseAssignmentExpression(
             bool cxxCompoundInPlace = false;
             if (operatorText != "=")
             {
+                // `w += k` READS w; derefLoad bypasses LoadNamedVariable, so log the move use it
+                // would have (a compound on a moved owner otherwise runs on a nulled value).
+                CheckMovedReceiver(namedVar);
                 auto left = derefLoad();
                 bool lhsUnsigned = namedVar.TypeAndValue.IsUnsignedInteger() != -1;
 
@@ -4348,6 +4359,12 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                 // derefAssign, not CreateAssignment: a '*p op= x' destination is a raw loaded
                 // pointer whose storage type cannot be inferred (it stores through BaseType).
                 derefAssign(right, rhsUnsigned);
+                // A consuming operator took the destination as its operand; the store makes it live again.
+                if (!namedVar.CallerName.empty() && namedVar.FieldName.empty())
+                {
+                    compiler->MarkVariableUnmoved(namedVar.CallerName);
+                    compiler->MarkVariableNotExplicitlyMovedNull(namedVar.CallerName);
+                }
                 // Return the stored value so a call argument cannot register the produced result twice.
                 return finishStore(derefLoad());
             }
@@ -11899,6 +11916,7 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
 
         bool receiverFound = false;
         bool receiverConsumes = false;
+        bool receiverSinkConsumes = false;
         if (auto it = compiler->functionTable.find(opName); it != compiler->functionTable.end())
             for (const auto& candidate : it->second)
                 if (candidate.SourceName == opName && !candidate.Parameters.empty()
@@ -11907,6 +11925,11 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
                     receiverFound = true;
                     if (!candidate.Parameters[0].Pointer && candidate.Parameters[0].IsMove)
                         receiverConsumes = true;
+                    // A by-value left operand the body consumes (an inferred sink, `return x;`).
+                    if (!candidate.Parameters[0].Pointer
+                        && compiler->OwningSinkConsumesConcrete(candidate.Parameters[0])
+                        && compiler->IsOwningValueType(candidate.Parameters[0].TypeName))
+                        receiverSinkConsumes = true;
                 }
         if (!receiverFound)
         {
@@ -11921,16 +11944,6 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
         // keep the receiver's cleanup identity single-source.
         bool receiverArmsAlreadyRegistered = inCallArgument_ && llvm::isa<llvm::PHINode>(lvalue)
             && !ParseTreeContainsTernary(ctx);
-        bool receiverTempAlreadyRegistered = receiverArmsAlreadyRegistered;
-        if (!receiverConsumes && !receiverArmsAlreadyRegistered)
-        {
-            LLVMBackend::NamedVariable receiverNV;
-            receiverNV.Primary = lvalue;
-            receiverNV.BaseType = structTy;
-            receiverNV.TypeAndValue.TypeName = typeName;
-            compiler->RegisterBorrowedOwningStructTemp(receiverNV, true);
-            receiverTempAlreadyRegistered = true;
-        }
 
         // Determine whether to pass lvalue by pointer or by value by inspecting the
         // registered candidates - check if any candidate's first param is a pointer to
@@ -11955,6 +11968,19 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
                     }
                 }
             }
+        }
+        bool receiverTempAlreadyRegistered = receiverArmsAlreadyRegistered;
+        // A by-VALUE receiver that is not a ternary join is registered by the call itself
+        // (CreateOverloadedFunctionCall); registering it here too destroyed a temp twice.
+        if (!receiverConsumes && !receiverSinkConsumes && !receiverArmsAlreadyRegistered
+            && (usePointer || llvm::isa<llvm::PHINode>(lvalue)))
+        {
+            LLVMBackend::NamedVariable receiverNV;
+            receiverNV.Primary = lvalue;
+            receiverNV.BaseType = structTy;
+            receiverNV.TypeAndValue.TypeName = typeName;
+            compiler->RegisterBorrowedOwningStructTemp(receiverNV, true);
+            receiverTempAlreadyRegistered = true;
         }
 
         bool rhsConsumes = false;
@@ -12102,6 +12128,19 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
             rightNV.TernaryTempAlreadyRegistered = inCallArgument_
                 && rvalue != nullptr && llvm::isa<llvm::PHINode>(rvalue)
                 && !ParseTreeContainsTernary(ctx);
+            // A named native owner into a consuming by-value operand (`O operator+(O o) { return
+            // o; }`) is surrendered like `f(b)`: name the source so the call nulls and retires it.
+            if (rhsConsumes && !rhsIsRvalue && rhsStorage != nullptr && rightNV.CallerName.empty()
+                && rvalue != nullptr && rvalue->getType()->isStructTy()
+                && !compiler->IsCxxRecord(rightNV.TypeAndValue.TypeName))
+            {
+                std::string source = compiler->FindVariableNameByStorage(rhsStorage);
+                if (!source.empty())
+                {
+                    rightNV.Storage = rhsStorage;
+                    rightNV.CallerName = source;
+                }
+            }
             return rightNV;
         };
 
@@ -12165,6 +12204,18 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
             thisNV.Primary  = lvalue;
             thisNV.BaseType = structTy;
             thisNV.TernaryTempAlreadyRegistered = receiverTempAlreadyRegistered;
+            // A named native owner into a consuming by-value left operand is surrendered like
+            // `f(a)`: name the source so the call nulls and retires it.
+            if (receiverSinkConsumes && !lhsIsRvalue && lhsStorage != nullptr
+                && !llvm::isa<llvm::PHINode>(lvalue) && !compiler->IsCxxRecord(typeName))
+            {
+                std::string source = compiler->FindVariableNameByStorage(lhsStorage);
+                if (!source.empty())
+                {
+                    thisNV.Storage = lhsStorage;
+                    thisNV.CallerName = source;
+                }
+            }
 
             FlushCallPostfix();
             auto* result = compiler->CreateOverloadedFunctionCall(opName, { thisNV, rightNV });
@@ -15217,16 +15268,21 @@ bool MainListener::EmitOneFieldInit(
                     std::format("'{}.{}'", SpellType(*compiler, LLVMBackend::TypeAndValue{ .TypeName = typeName }), fieldName));
         }
 
-        // Numeric field brace-init: widen the source to the field's own type. A raw store of a
-        // narrower integer would leave the rest of a wider field holding stale bytes.
+        // Numeric field brace-init: convert the source to the field's own type with the `=` path's
+        // conversion (widen, then cast), so a float source into a double slot is extended and a
+        // wider source into a narrower slot is truncated. A raw store of a mismatched width leaves
+        // the rest of a wider field stale, or writes past a narrower one. A bool field is excluded:
+        // it is a truth test, handled just below.
         bool rightIsUnsigned = rightNV.TypeAndValue.IsUnsignedInteger() != -1;
-        if (val != nullptr && val->getType()->isIntegerTy() && !val->getType()->isIntegerTy(1)
+        if (val != nullptr && !val->getType()->isIntegerTy(1)
+            && (val->getType()->isIntegerTy() || val->getType()->isFloatingPointTy())
             && !fieldType.Pointer && fieldType.ConstArraySize == 0)
         {
             auto* fieldLLVMType = compiler->GetType(fieldType);
             if (fieldLLVMType != nullptr && fieldLLVMType != val->getType()
+                && !fieldLLVMType->isIntegerTy(1)
                 && (fieldLLVMType->isIntegerTy() || fieldLLVMType->isFloatingPointTy()))
-                val = compiler->Upconvert(val, fieldLLVMType, rightIsUnsigned);
+                val = compiler->ConvertScalarToType(val, fieldLLVMType, rightIsUnsigned);
         }
 
         // A 'bool' field brace-init is a truth test like the '=' and cast paths. Upconvert only

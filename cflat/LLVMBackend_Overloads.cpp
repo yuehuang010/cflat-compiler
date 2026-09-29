@@ -4574,7 +4574,9 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                 LogErrorMessage("parameter '{}': cannot pass bonded value to '{}' parameter - bonded values cannot be transferred out of their source's scope",
                     { candidate.Parameters[i].VariableName, "move" });
             if ((OwningSinkConsumesConcrete(candidate.Parameters[i])
-                    || candidate.Parameters[i].IsConsumeInferredSink)
+                    || (candidate.Parameters[i].IsConsumeInferredSink
+                        && !candidate.Parameters[i].IsReturnInferredSink
+                        && !candidate.Parameters[i].IsWriteInferredSink))
                 && matched[i].IsBonded)
                 LogErrorMessage("parameter '{}': cannot pass bonded value to '{}' parameter - bonded values cannot be transferred out of their source's scope",
                     { candidate.Parameters[i].VariableName, "consuming" });

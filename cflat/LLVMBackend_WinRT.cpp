@@ -1586,7 +1586,7 @@ void LLVMBackend::DiagnoseExplicitMoveToBorrowParam(const std::string& functionN
         // An inferred owning-value sink (body unconditionally moves the param, owning concrete
         // type) is likewise a real sink, so `move` into it transfers rather than "nothing".
         bool inferredSinkConsumes = param.IsConsumeInferredSink
-            && !IsCopyableType(param.TypeName);
+            && OwningSinkConsumesConcrete(param);
         bool foreignCxxPointerSink = foreignCxxCallee && param.Pointer && !param.IsAlias
             && !param.IsRvalueRef && !param.IsCxxRefToPointer && !param.IsCxxConstRef;
         bool paramIsSink = param.IsMove
@@ -1635,6 +1635,8 @@ LLVMBackend::TypeAndValue LLVMBackend::FuncPtrParamAsTypeAndValue(const TypeAndV
         tv.AllocAlignValue = p.AllocAlignValue;
         tv.IsOwningSink = p.IsOwningSink;
         tv.IsConsumeInferredSink = p.IsConsumeInferredSink;
+        tv.IsReturnInferredSink = p.IsReturnInferredSink;
+        tv.IsWriteInferredSink = p.IsWriteInferredSink;
         // A param whose funcptr TYPE spells `move` takes the DECLARED move path, exactly as a
         // direct call does. An INFERRED sink leaves IsMove false - see ApplyFuncPtrSinkTransfer.
         tv.IsMove = p.IsMove;
@@ -1718,7 +1720,7 @@ void LLVMBackend::ApplyMoveParamTransfer(const std::string& functionName,
                 && !params[i].IsRvalueRef && !params[i].IsCxxRefToPointer
                 && !params[i].IsCxxConstRef;
             bool inferredSinkConsumes = params[i].IsConsumeInferredSink
-                && !IsCopyableType(params[i].TypeName);
+                && OwningSinkConsumesConcrete(params[i]);
             // A borrow/alias arg has no ownership to transfer - nulling it would orphan a value
             // the caller still relies on.
             bool argIsBorrow = args[i].IsBorrowed || args[i].IsAliasBorrow

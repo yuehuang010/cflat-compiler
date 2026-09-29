@@ -8105,6 +8105,8 @@ LLVMBackend::NamedVariable MainListener::ParseLambdaExpression(CFlatParser::Lamb
             {
                 params[i].IsOwningSink = sinkParams[i].IsOwningSink;
                 params[i].IsConsumeInferredSink = sinkParams[i].IsConsumeInferredSink;
+                params[i].IsReturnInferredSink = sinkParams[i].IsReturnInferredSink;
+                params[i].IsWriteInferredSink = sinkParams[i].IsWriteInferredSink;
             }
         }
 
@@ -8528,6 +8530,8 @@ LLVMBackend::NamedVariable MainListener::ParseLambdaExpression(CFlatParser::Lamb
             // caller's source; a declared Lambda<...> spelling never sets these.
             fp.IsOwningSink = p.IsOwningSink;
             fp.IsConsumeInferredSink = p.IsConsumeInferredSink;
+            fp.IsReturnInferredSink = p.IsReturnInferredSink;
+            fp.IsWriteInferredSink = p.IsWriteInferredSink;
             // A SPELLED `move` param rides the type, exactly as a named function's does.
             fp.IsMove = p.IsMove;
             tv.FuncPtrParams.push_back(fp);

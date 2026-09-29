@@ -910,6 +910,8 @@ extern int main()
     int reversedPassed = reversedAndZeroArgOverloadLegs();
     int sizeofUnevalPassed = sizeofUnevaluatedLegs();
     int boolFpPassed = boolToFloatingLegs();
+    if (compoundResultOwnershipLegs() != 26) return 57;
+    if (byValueParamOwnershipLegs() != 33) return 58;
 
     return (callPassed == 12 && terPassed == 23 && ptrOpPassed == 8 && uPassed == 3
         && unsignedLiteralPassed == 8 && unsignedAcceptPassed == 7
@@ -1552,5 +1554,273 @@ int sizeofUnevaluatedLegs()
     passed += Test("sizeof expression calls stay unevaluated", szoCalls, 0);
     delete moved;
     delete sxeP;
+    return passed;
+}
+
+// -- By-value compound / plain assignment used as a value on an owning struct ------------------
+// CFlat `w += k` stores the operator's by-value result INTO w, so `(w += k)` names w itself.
+// Initializing, returning or assigning from it consumes w exactly as `T x = w` does; master
+// adopted w's bytes as a fresh temporary instead, so w and x freed one pointer twice (rc 133).
+int crCtor = 0;
+int crDtor = 0;
+struct CrOwned
+{
+    int* p = nullptr;
+    CrOwned() { p = new int; *p = 1; crCtor++; }
+    ~CrOwned() { if (p != nullptr) { delete p; } crDtor++; }
+    CrOwned operator+=(int k) { *p = *p + k; CrOwned r; *r.p = *p * 10; return r; }
+    int get() { return *p; }
+};
+struct CrHolder { CrOwned f = default; };
+struct CrBox
+{
+    int value = 0;
+    CrBox operator+=(int k) { CrBox r; r.value = value * 10 + k; return r; }
+};
+struct CrUniqueHolder
+{
+    unique<int> u = default;
+    CrUniqueHolder operator+=(int k) { CrUniqueHolder r; r.u = new int(*u + k); return r; }
+};
+int crValue(CrOwned* o) { return o->p == nullptr ? -1 : *o->p; }
+CrOwned crReturnCompound(int k) { CrOwned w; return (w += k); }
+CrOwned crMake() { CrOwned r; *r.p = 5; return r; }
+
+int compoundResultOwnershipLegs()
+{
+    int passed = 0;
+    crCtor = 0; crDtor = 0;
+    { CrOwned w; CrOwned x = (w += 2); passed += Test("owning (w += k) init value", *x.p, 30); }
+    passed += Test("owning (w += k) init ctor/dtor", crCtor * 10 + crDtor, 23);
+    crCtor = 0; crDtor = 0;
+    { CrOwned w; CrOwned x = w += 2; passed += Test("owning bare w += k init value", *x.p, 30); }
+    passed += Test("owning bare w += k init ctor/dtor", crCtor * 10 + crDtor, 23);
+    crCtor = 0; crDtor = 0;
+    { CrOwned x = crReturnCompound(3); passed += Test("owning return (w += k) value", *x.p, 40); }
+    passed += Test("owning return (w += k) ctor/dtor", crCtor * 10 + crDtor, 22);
+    crCtor = 0; crDtor = 0;
+    {
+        CrOwned w; CrOwned y; *y.p = 7;
+        CrOwned x = (w = y);
+        passed += Test("owning (w = y) init value", *x.p, 7);
+    }
+    passed += Test("owning (w = y) init ctor/dtor", crCtor * 10 + crDtor, 24);
+    crCtor = 0; crDtor = 0;
+    {
+        CrHolder h; CrOwned x = (h.f += 2);
+        passed += Test("owning (h.f += k) init value", *x.p * 10 + crValue(&h.f), 299);
+    }
+    passed += Test("owning (h.f += k) init ctor/dtor", crCtor * 10 + crDtor, 23);
+    crCtor = 0; crDtor = 0;
+    {
+        CrOwned w; CrOwned* pw = &w; CrOwned x = (*pw += 2);
+        passed += Test("owning (*pw += k) init value", *x.p * 10 + crValue(&w), 299);
+    }
+    passed += Test("owning (*pw += k) init ctor/dtor", crCtor * 10 + crDtor, 23);
+    crCtor = 0; crDtor = 0;
+    { CrOwned w; CrOwned x; x = (w += 2); passed += Test("owning x = (w += k) value", *x.p, 30); }
+    passed += Test("owning x = (w += k) ctor/dtor", crCtor * 10 + crDtor, 34);
+    {
+        CrUniqueHolder a; a.u = new int(1);
+        CrUniqueHolder b = (a += 2);
+        passed += Test("unique-field (a += k) init value", *b.u, 3);
+    }
+    {
+        // `string` is an owning value too: master left x empty and freed the buffer twice.
+        string s = "ab"; string t = "cd" + "ef";
+        string x = (s = t);
+        string y = (s += "g");
+        passed += Test("string (s = t) init value", x.data(), "cdef");
+        passed += Test("string (s += k) init value", y.data(), "cdefg");
+    }
+    // Neighbours master already got right: statement form, borrowed receiver, trivial struct.
+    crCtor = 0; crDtor = 0;
+    { CrOwned w; w += 2; w += 3; passed += Test("owning statement += value", *w.p, 330); }
+    passed += Test("owning statement += ctor/dtor", crCtor * 10 + crDtor, 33);
+    crCtor = 0; crDtor = 0;
+    {
+        CrOwned w; int g = (w += 2).get();
+        passed += Test("owning (w += k).get() borrows", g * 100 + *w.p, 3030);
+    }
+    passed += Test("owning (w += k).get() ctor/dtor", crCtor * 10 + crDtor, 22);
+    // A compound READS its destination, so it is refused after a move; a re-assigned owner is live
+    // again and stays accepted, straight-line and loop-carried.
+    crCtor = 0; crDtor = 0;
+    {
+        CrOwned w; CrOwned x = w; w = crMake(); w += 1;
+        passed += Test("owning += after move + re-assign", *x.p * 100 + *w.p, 160);
+    }
+    passed += Test("owning += after move + re-assign ctor/dtor", crCtor * 10 + crDtor, 34);
+    crCtor = 0; crDtor = 0;
+    {
+        CrOwned w;
+        for (int i = 0; i < 3; i++) { CrOwned x = w; w = crMake(); w += 1; }
+        passed += Test("owning loop move + re-assign + +=", *w.p, 60);
+    }
+    passed += Test("owning loop move + re-assign + += ctor/dtor", crCtor * 10 + crDtor, 80);
+    CrBox a; a.value = 1;
+    CrBox b = (a += 2);
+    CrBox c = a += 3;
+    passed += Test("trivial (a += k) init values", a.value * 10000 + b.value * 100 + c.value % 100, 1231223);
+    return passed;
+}
+
+// -- A by-value owning parameter the body returns or stores into as a whole --------------------
+// `return w`, `w += k`, `w = v` and `T x = (w += k)` take the caller's value over, like the split
+// `T t = w;` (a non-copyable owner's param is an inferred sink); master bit-copied or overwrote the
+// borrowed value and the caller freed it again (rc 133). A copyable owner stays a borrow and the
+// callee writes a copy of it; master leaked the value written into the borrowed slot.
+int crSeen = 0;
+CrOwned crByvReturn(CrOwned w) { return w; }
+void crByvCompound(CrOwned w) { w += 1; crSeen = *w.p; }
+void crByvCompoundInit(CrOwned w) { CrOwned x = (w += 2); crSeen = *x.p; }
+void crByvAssign(CrOwned w) { w = crMake(); crSeen = *w.p; }
+void crByvUnique(CrUniqueHolder h) { h += 2; crSeen = *h.u; }
+// Written, then returned: an owned return, not the inferred 'alias' of a return-only passthrough.
+CrUniqueHolder crByvUniqueReturn(CrUniqueHolder h) { h += 2; return h; }
+struct CrStrHolder
+{
+    string s = default;
+    int n = 0;
+    CrStrHolder() { s = "a"; n = 1; crCtor++; }
+    ~CrStrHolder() { crDtor++; }
+    CrStrHolder operator+=(int k) { n = n + k; CrStrHolder r; r.n = n * 10; r.s = s + "b"; return r; }
+};
+void crByvStrCompound(CrStrHolder w) { w += 1; crSeen = w.n * 100 + w.s.length(); }
+void crByvStrAssign(CrStrHolder w) { CrStrHolder t; t.n = 5; w = t; crSeen = w.n; }
+// `return w` of a copyable owner returns a COPY, like `T t = w; return t;` (master bit-copied it:
+// the caller's heap string / list buffer had two owners, rc 133).
+CrStrHolder crByvStrReturn(CrStrHolder w) { return w; }
+list<int> crByvListReturn(list<int> w) { return w; }
+// A local SHADOWING the parameter is not the parameter: its writes consume nothing (round 1 of
+// the fix counted them by name and refused the caller's later read as a use after move).
+int crByvShadowWrite(CrOwned w) { int r = 0; { CrOwned w = crMake(); w = crMake(); r = *w.p; } return r + *w.p; }
+// A whole write into a param whose type owns nothing moves nothing, so a bonded argument is fine.
+struct CrSpan { int* p = nullptr; int n = 0; };
+CrSpan crView(bond int* src) { CrSpan s; s.p = src; s.n = 1; return s; }
+int crSpanFirst(CrSpan s) { if (s.n == 0) { s = default; } return s.n; }
+// Binary operators consume an inferred-sink operand exactly as a call does (master: rc 133), and a
+// temporary left operand of a free by-value operator is destroyed once (master: twice, rc 133).
+// The destructor counts real frees only, so every allocation must be freed exactly once.
+struct CrOpOwned
+{
+    int* p = nullptr;
+    CrOpOwned() { p = new int; *p = 1; crCtor++; }
+    ~CrOpOwned() { if (p != nullptr) { delete p; crDtor++; } }
+    CrOpOwned operator+(CrOpOwned other) { *other.p = *other.p + *p; return other; }
+};
+CrOpOwned crOpMake(int v) { CrOpOwned r; *r.p = v; return r; }
+CrOpOwned operator-(CrOpOwned x, CrOpOwned y) { *x.p = *x.p - *y.p; return x; }
+int operator*(CrOpOwned x, CrOpOwned y) { return *x.p * *y.p; }
+
+int byValueParamOwnershipLegs()
+{
+    int passed = 0;
+    crCtor = 0; crDtor = 0;
+    { CrOwned x = crByvReturn(crMake()); passed += Test("by-value param return w value", *x.p, 5); }
+    passed += Test("by-value param return w ctor/dtor", crCtor * 10 + crDtor, 12);
+    crCtor = 0; crDtor = 0;
+    { CrOwned a; CrOwned x = crByvReturn(move a); passed += Test("by-value param return w (move a) value", *x.p, 1); }
+    passed += Test("by-value param return w (move a) ctor/dtor", crCtor * 10 + crDtor, 13);
+    crCtor = 0; crDtor = 0;
+    crByvCompound(crMake());
+    passed += Test("by-value param w += k value", crSeen, 60);
+    passed += Test("by-value param w += k ctor/dtor", crCtor * 10 + crDtor, 22);
+    crCtor = 0; crDtor = 0;
+    { CrOwned a; crByvCompound(move a); }
+    passed += Test("by-value param w += k (move a) value", crSeen, 20);
+    passed += Test("by-value param w += k (move a) ctor/dtor", crCtor * 10 + crDtor, 23);
+    crCtor = 0; crDtor = 0;
+    crByvCompoundInit(crMake());
+    passed += Test("by-value param T x = (w += k) value", crSeen, 70);
+    passed += Test("by-value param T x = (w += k) ctor/dtor", crCtor * 10 + crDtor, 23);
+    crCtor = 0; crDtor = 0;
+    crByvAssign(crMake());
+    passed += Test("by-value param w = v value", crSeen, 5);
+    passed += Test("by-value param w = v ctor/dtor", crCtor * 10 + crDtor, 22);
+    {
+        CrUniqueHolder a; a.u = new int(1);
+        crByvUnique(move a);
+        passed += Test("unique-field by-value param h += k value", crSeen, 3);
+    }
+    {
+        CrUniqueHolder a; a.u = new int(4);
+        CrUniqueHolder x = crByvUniqueReturn(move a);
+        passed += Test("unique-field by-value param h += k; return h value", *x.u, 6);
+    }
+    // Copyable owner: the caller keeps its value and every object is destroyed exactly once.
+    crCtor = 0; crDtor = 0;
+    {
+        CrStrHolder a; string t = "x"; a.s = t + "y";
+        crByvStrCompound(a);
+        passed += Test("copyable by-value param w += k value", crSeen, 2003);
+        passed += Test("copyable by-value param w += k keeps caller", a.n * 100 + a.s.length(), 102);
+    }
+    passed += Test("copyable by-value param w += k ctor/dtor", crCtor * 10 + crDtor, 23);
+    crCtor = 0; crDtor = 0;
+    {
+        CrStrHolder a;
+        crByvStrAssign(a);
+        passed += Test("copyable by-value param w = v value", crSeen * 10 + a.n, 51);
+    }
+    passed += Test("copyable by-value param w = v ctor/dtor", crCtor * 10 + crDtor, 24);
+    crCtor = 0; crDtor = 0;
+    {
+        CrStrHolder a;
+        crByvStrCompound(a); crByvStrCompound(a);
+        passed += Test("copyable by-value param twice keeps caller", a.n, 1);
+    }
+    passed += Test("copyable by-value param twice ctor/dtor", crCtor * 10 + crDtor, 35);
+    crCtor = 0; crDtor = 0;
+    {
+        CrStrHolder a; string t = "x"; a.s = t + "yz";
+        CrStrHolder x = crByvStrReturn(a);
+        x.s = x.s + "w";
+        passed += Test("copyable heap-string return w", x.s.length() * 10 + a.s.length(), 43);
+    }
+    passed += Test("copyable heap-string return w ctor/dtor", crCtor * 10 + crDtor, 12);
+    {
+        list<int> l; l.add(1); l.add(2);
+        list<int> m = crByvListReturn(l);
+        m.add(3);
+        passed += Test("list<int> return w", m.count() * 10 + l.count(), 32);
+    }
+    crCtor = 0; crDtor = 0;
+    {
+        CrOwned a = crMake();
+        int r = crByvShadowWrite(a);
+        passed += Test("shadowing local write keeps caller", r * 100 + *a.p, 1005);
+    }
+    passed += Test("shadowing local write ctor/dtor", crCtor * 10 + crDtor, 33);
+    {
+        int v = 10;
+        CrSpan sp = crView(&v);
+        passed += Test("bonded arg into whole-written trivial param", crSpanFirst(sp), 1);
+    }
+    crCtor = 0; crDtor = 0;
+    {
+        CrOpOwned a = crOpMake(5); CrOpOwned b = crOpMake(7);
+        CrOpOwned x = a + b;
+        passed += Test("member operator consumes inferred-sink operand", *x.p * 100 + *a.p, 1205);
+    }
+    {
+        CrOpOwned b = crOpMake(7);
+        CrOpOwned x = crOpMake(5) - b;
+        CrOpOwned y = x - crOpMake(1);
+        passed += Test("free operator consumes inferred-sink left operand", *y.p, -3);
+    }
+    {
+        CrOpOwned b = crOpMake(2);
+        passed += Test("free operator temporary left operand", crOpMake(9) * b, 18);
+    }
+    passed += Test("operator operands ctor/frees", crCtor * 10 + crDtor, 77);
+    crCtor = 0; crDtor = 0;
+    {
+        // `a -= b` with a left-consuming operator: the store-back makes `a` live again.
+        CrOpOwned a = crOpMake(9); CrOpOwned b = crOpMake(2);
+        a -= b; a -= b;
+        passed += Test("compound on consuming left operand revives destination", *a.p * 100 + *b.p, 502);
+    }
+    passed += Test("compound on consuming left operand ctor/frees", crCtor * 10 + crDtor, 22);
     return passed;
 }

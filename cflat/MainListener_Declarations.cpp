@@ -3373,6 +3373,8 @@ void MainListener::ParseFunctionDefinition(CFlatParser::FunctionDefinitionContex
         // Used to identify bare-semicolon expect_error that was set inside this function.
         size_t funcDepth = compilerLLVM->stackNamedVariable.size();
 
+        CopyWrittenCopyableParams(func, allParams);
+
         auto blockItemList = func->compoundStatement()->blockItemList();
 
         bool expectErrorHandled = false;
@@ -9382,6 +9384,39 @@ llvm::Value* MainListener::CloneClosureFromNamedSource(
             return cloned;
         return right;
     }
+
+void MainListener::CopyWrittenCopyableParams(CFlatParser::FunctionDefinitionContext* func,
+        const std::vector<LLVMBackend::TypeAndValue>& params)
+{
+    auto* compiler = compilerLLVM;
+    if (func == nullptr || func->compoundStatement() == nullptr || compiler->stackNamedVariable.empty())
+        return;
+    std::unordered_set<std::string> written;
+    CollectWholeNameStoreDestinations(func->compoundStatement(), written);
+    if (written.empty()) return;
+    auto& args = compiler->stackNamedVariable.back().functionArgument;
+    for (const auto& p : params)
+    {
+        if (p.VariableName.empty() || written.count(p.VariableName) == 0) continue;
+        if (p.Pointer || p.ElemPointer || p.IsMove || p.IsAlias || p.TypeName == "string") continue;
+        if (!compiler->IsDataStructure(p.TypeName) || !compiler->IsOwningValueType(p.TypeName)
+            || !compiler->IsCopyableType(p.TypeName)
+            || compiler->IsForeignNontrivialCxxClass(p.TypeName))
+            continue;
+        auto it = args.find(p.VariableName);
+        if (it == args.end() || !it->second.IsBorrowedOwningValue || it->second.Storage == nullptr)
+            continue;
+        llvm::Type* ty = compiler->GetType(it->second.TypeAndValue);
+        if (ty == nullptr || !ty->isStructTy() || !ty->isSized()) continue;
+        // `w = v` / `w += k` drops what w holds, and the caller still owns that: write a copy.
+        llvm::Value* current = compiler->builder->CreateLoad(ty, it->second.Storage);
+        llvm::Value* copy = EmitCopyableOwnerCopy(it->second, current, func);
+        if (copy == nullptr) continue;
+        compiler->builder->CreateStore(copy, it->second.Storage);
+        it->second.IsBorrowedOwningValue = false;
+        it->second.IsOwningStruct = true;
+    }
+}
 
 llvm::Value* MainListener::EmitCopyableOwnerCopy(
         const LLVMBackend::NamedVariable& rightNV,

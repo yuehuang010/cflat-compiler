@@ -6709,6 +6709,8 @@ static llvm::json::Object SerializeTav(const TAV& t)
     if (s.IsCxxPointeeConst)      o["cpc"] = true;
     if (s.IsOwningSink)           o["osk"] = true;
     if (s.IsConsumeInferredSink)  o["cis"] = true;
+    if (s.IsReturnInferredSink)  o["ris"] = true;
+    if (s.IsWriteInferredSink)  o["wis"] = true;
     if (s.IsBorrowOfAliasElement) o["bae"] = true;
     if (s.IsBond)                 o["bd"]  = true;
     if (s.IsUnique)               o["uq"]  = true;
@@ -6736,6 +6738,8 @@ static llvm::json::Object SerializeTav(const TAV& t)
             if (p.IsMove)  po["mv"] = true;
             if (p.IsOwningSink) po["osk"] = true;
             if (p.IsConsumeInferredSink) po["cis"] = true;
+            if (p.IsReturnInferredSink) po["ris"] = true;
+            if (p.IsWriteInferredSink) po["wis"] = true;
             if (p.IsRvalueRef) po["rr"] = true;
             if (p.PointerDepth > 1) po["pd"] = static_cast<int64_t>(p.PointerDepth);
             if (!p.ResolvedTypeKey.empty()) po["rk"] = p.ResolvedTypeKey;
@@ -6787,6 +6791,8 @@ static TAV DeserializeTav(const llvm::json::Object& o)
     if (auto v = o.getBoolean("cpc")) s.IsCxxPointeeConst = *v;
     if (auto v = o.getBoolean("osk")) s.IsOwningSink = *v;
     if (auto v = o.getBoolean("cis")) s.IsConsumeInferredSink = *v;
+    if (auto v = o.getBoolean("ris")) s.IsReturnInferredSink = *v;
+    if (auto v = o.getBoolean("wis")) s.IsWriteInferredSink = *v;
     if (auto v = o.getBoolean("bae")) s.IsBorrowOfAliasElement = *v;
     if (auto v = o.getBoolean("bd")) s.IsBond = *v;
     if (auto v = o.getBoolean("uq")) s.IsUnique = *v;
@@ -6815,6 +6821,8 @@ static TAV DeserializeTav(const llvm::json::Object& o)
                     if (auto v = po->getBoolean("mv"))p.IsMove = *v;
                     if (auto v = po->getBoolean("osk")) p.IsOwningSink = *v;
                     if (auto v = po->getBoolean("cis")) p.IsConsumeInferredSink = *v;
+                    if (auto v = po->getBoolean("ris")) p.IsReturnInferredSink = *v;
+                    if (auto v = po->getBoolean("wis")) p.IsWriteInferredSink = *v;
                     if (auto v = po->getBoolean("rr")) p.IsRvalueRef = *v;
                     if (p.Pointer) p.PointerDepth = 1;
                     if (auto v = po->getInteger("pd")) p.PointerDepth = static_cast<int>(*v);

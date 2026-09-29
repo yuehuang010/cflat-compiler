@@ -33,3 +33,40 @@ expect_error("use of moved variable 'operatorSource'") {
         return operatorSource->id;
     }
 }
+
+// A compound assignment READS its destination: `w += 1` on a moved owner ran operator+= on the
+// nulled value (rc 139). Straight-line, loop-carried, and the value-used form.
+struct CrMovedOwned
+{
+    int* p = nullptr;
+    CrMovedOwned() { p = new int; *p = 1; }
+    ~CrMovedOwned() { if (p != nullptr) { delete p; } }
+    CrMovedOwned operator+=(int k) { *p = *p + k; CrMovedOwned r; return r; }
+};
+
+expect_error("use of moved variable 'compoundSource'") {
+    void movedCompoundReceiver()
+    {
+        CrMovedOwned compoundSource;
+        CrMovedOwned compoundDest = compoundSource;
+        compoundSource += 1;
+    }
+}
+
+expect_error("use of moved variable 'twiceSource'") {
+    void movedCompoundResultTwice()
+    {
+        CrMovedOwned twiceSource;
+        CrMovedOwned first = (twiceSource += 1);
+        CrMovedOwned second = (twiceSource += 1);
+    }
+}
+
+// The loop-carried report comes from the function-end dataflow, after a scoped block closes, so
+// this last leg uses the bare file-scope form.
+expect_error("use of moved variable 'loopSource' (moved on an earlier loop iteration)");
+void movedCompoundInLoop()
+{
+    CrMovedOwned loopSource;
+    for (int i = 0; i < 2; i++) { CrMovedOwned x = (loopSource += 1); }
+}

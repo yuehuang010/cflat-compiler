@@ -1784,6 +1784,7 @@ bool LLVMBackend::IsCopyableType(const std::string& typeNameIn) const
 bool LLVMBackend::OwningSinkConsumesConcrete(const TypeAndValue& p)
 {
         if (!p.IsOwningSink) return false;
+        if (p.IsReturnInferredSink && TypeOwnsUniquePointer(p.TypeName)) return false;
         if (p.IsConsumeInferredSink) return !IsCopyableType(p.TypeName);
         return true;
     }

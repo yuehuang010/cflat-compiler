@@ -203,6 +203,18 @@ struct EbaPoint { int x = default; int y = default; };
 int ebaTake(EbaPoint p) { return p.x * 10 + p.y; }
 int ebaTakeNamed(EbaPoint p, int scale) { return (p.x * 10 + p.y) + scale; }
 
+// ===== Numeric brace-init converts to the FIELD's type like '=' does =====
+// PRE, `{ a = 1.5 }` on a double field stored a `float` into the 8-byte slot (reads 0.0), a float
+// or double VARIABLE into a mismatched field did the same, and a double into an int field stored
+// the raw bits. POST every source is widened or cast exactly as `h.a = v` does.
+struct BnD    { double a = default; double b = default; };
+struct BnF    { float a = default; float b = default; };
+struct BnI    { int a = default; long b = default; };
+struct BnL    { long double a = default; };
+struct BnN    { BnD d = default; int k = default; };
+struct BnG<T> { T a = default; T b = default; };
+double bnSum(BnD x) { return x.a + x.b; }
+
 extern int main()
 {
     int passed = 0;
@@ -866,6 +878,40 @@ extern int main()
     total++; passed += Test("a filled brace argument still applies its fields", ebaTake(ebaFilled), 34);
     total++; passed += Test("named empty brace argument is default-initialized",
                             ebaTakeNamed(p: {}, scale: 7), 7);
+    {
+        double bnDv = 3.25; float bnFv = 4.5f; int bnIv = 7; long bnLv = 9;
+        BnD bd1 = { a = 1.5, b = 2.5 };
+        total++; passed += Test("double fields from float-exact literals", bd1.a == 1.5 && bd1.b == 2.5, true);
+        BnD bd2 = { a = bnFv, b = bnIv };
+        total++; passed += Test("double fields from a float and an int variable", bd2.a == 4.5 && bd2.b == 7.0, true);
+        BnD bd3 = { a = bnDv, b = bnLv };
+        total++; passed += Test("double fields from a double and a long variable", bd3.a == 3.25 && bd3.b == 9.0, true);
+        BnD bd4 = { a = 0.1, b = 0.3 };
+        BnD bd5; bd5.a = 0.1; bd5.b = 0.3;
+        total++; passed += Test("brace literal equals the '=' literal bit for bit", bd4.a == bd5.a && bd4.b == bd5.b, true);
+        BnD* bnHeap = new BnD { a = 1.5, b = bnFv };
+        total++; passed += Test("new with a braced double field", bnHeap.a == 1.5 && bnHeap.b == 4.5, true);
+        delete bnHeap;
+        BnF bf1 = { a = bnDv, b = 1.5 };
+        total++; passed += Test("float field from a double variable narrows like '='", bf1.a == 3.25f && bf1.b == 1.5f, true);
+        BnI bi1 = { a = bnDv, b = bnDv };
+        total++; passed += Test("integer fields from a double variable truncate like '='", bi1.a == 3 && bi1.b == 3, true);
+        BnI bi2 = { a = 1.5, b = 7.9 };
+        total++; passed += Test("integer fields from a float literal truncate like '='", bi2.a == 1 && bi2.b == 7, true);
+        BnL bl1 = { a = 1.5 };
+        BnL bl2 = { a = bnDv };
+        total++; passed += Test("long double field from a literal and a double variable", bl1.a == 1.5 && bl2.a == 3.25, true);
+        BnN bn1 = { d = { a = 1.5, b = 2.5 }, k = 3 };
+        total++; passed += Test("nested struct double fields", bn1.d.a == 1.5 && bn1.d.b == 2.5 && bn1.k == 3, true);
+        BnD[2] bnArr = { { a = 1.5, b = 2.5 }, { a = bnFv, b = bnDv } };
+        total++; passed += Test("array-of-struct double fields",
+                                bnArr[0].a == 1.5 && bnArr[0].b == 2.5 && bnArr[1].a == 4.5 && bnArr[1].b == 3.25, true);
+        total++; passed += Test("braced struct argument with double fields", bnSum({ a = 1.5, b = bnFv }) == 6.0, true);
+        BnG<double> bg1 = { a = 1.5, b = bnFv };
+        total++; passed += Test("generic S<double> fields", bg1.a == 1.5 && bg1.b == 4.5, true);
+        BnG<float> bg2 = { a = bnDv, b = 1.5 };
+        total++; passed += Test("generic S<float> field from a double variable", bg2.a == 3.25f && bg2.b == 1.5f, true);
+    }
     if (passed == total)
     {
         printf("ALL %d initializer-list tests passed.\n", total);

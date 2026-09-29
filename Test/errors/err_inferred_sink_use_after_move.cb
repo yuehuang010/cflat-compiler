@@ -7,6 +7,29 @@ class Res { int id = default; };
 class Holder { unique Res* r = default; };
 Holder g_slot = default;
 void store(Holder h) { g_slot = h; }
+// `return w` and a store INTO the whole parameter (`w += k`, `w = v`) consume it the same way:
+// master bit-copied or overwrote the borrowed value and the caller freed it again (rc 133).
+struct RawOwner
+{
+    int* p = nullptr;
+    RawOwner() { p = new int; *p = 1; }
+    ~RawOwner() { if (p != nullptr) { delete p; } }
+    RawOwner operator+=(int k) { RawOwner r; *r.p = *p + k; return r; }
+};
+RawOwner makeRaw() { RawOwner r; return r; }
+RawOwner passBack(RawOwner w) { return w; }
+void bump(RawOwner w) { w += 1; }
+void reset(RawOwner w) { w = makeRaw(); }
+void bumpInit(RawOwner w) { RawOwner x = (w += 2); }
+int useAfterParamConsume()
+{
+    int k = 0;
+    expect_error("use of moved variable 'b'") { RawOwner b; RawOwner x = passBack(b); k = *b.p; }
+    expect_error("use of moved variable 'c'") { RawOwner c; bump(c); k = *c.p; }
+    expect_error("use of moved variable 'd'") { RawOwner d; reset(d); k = *d.p; }
+    expect_error("use of moved variable 'e'") { RawOwner e; bumpInit(e); k = *e.p; }
+    return k;
+}
 expect_error("use of moved variable 'a'");
 extern int main()
 {

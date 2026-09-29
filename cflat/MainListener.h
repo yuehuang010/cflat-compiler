@@ -2531,6 +2531,9 @@ static ValueStructReturnKind ClassifyValueStructReturns(
             if (p.VariableName != text) continue;
             if (p.TypeName != returnType.TypeName) continue;
             if (p.Pointer || p.ElemPointer || p.IsMove || p.IsAlias) continue;
+            // A param the body also consumes (`w += k; return w;`) is owned by the callee, so its
+            // return hands out that value; only a return-only sink is still a borrow here.
+            if (p.IsOwningSink && !p.IsReturnInferredSink) continue;
             isBorrowedParam = true;
             if (outBorrowedParamName && outBorrowedParamName->empty()) *outBorrowedParamName = p.VariableName;
             break;
@@ -2750,24 +2753,97 @@ inline void CollectPositionalBraceElementNames(CFlatParser::InitializerListConte
             RecordConsumeSourceName(fi->assignmentExpression(0), out, wrapped);
 }
 
+// True when `name` at `use` names a LOCAL declared earlier in an enclosing block (or a `for`
+// header) of the same function / lambda body, not the parameter of that name. The consume scans
+// are name-based; the write / return triggers must not claim a shadowing local's use.
+inline bool NameShadowedByEnclosingLocal(antlr4::tree::ParseTree* use, const std::string& name)
+{
+    auto* useCtx = dynamic_cast<antlr4::ParserRuleContext*>(use);
+    if (useCtx == nullptr || useCtx->getStart() == nullptr || name.empty()) return false;
+    const size_t token = (size_t)useCtx->getStart()->getTokenIndex();
+    auto declares = [&](CFlatParser::InitDeclaratorListContext* list) {
+        if (list == nullptr) return false;
+        for (auto* init : list->initDeclarator())
+        {
+            auto* declarator = init->declarator();
+            auto* direct = declarator != nullptr ? declarator->directDeclarator() : nullptr;
+            if (direct != nullptr && direct->Identifier() != nullptr
+                && direct->Identifier()->getText() == name)
+                return true;
+        }
+        return false;
+    };
+    for (auto* parent = use->parent; parent != nullptr; parent = parent->parent)
+    {
+        if (dynamic_cast<CFlatParser::LambdaExpressionContext*>(parent) != nullptr
+            || dynamic_cast<CFlatParser::FunctionDefinitionContext*>(parent) != nullptr)
+            break;
+        if (auto* loop = dynamic_cast<CFlatParser::IterationStatementContext*>(parent))
+        {
+            if (loop->Identifier() != nullptr && loop->Identifier()->getText() == name)
+                return true;
+            if (auto* cond = loop->forCondition())
+                if (cond->forDeclaration() != nullptr
+                    && declares(cond->forDeclaration()->initDeclaratorList()))
+                    return true;
+            continue;
+        }
+        auto* block = dynamic_cast<CFlatParser::CompoundStatementContext*>(parent);
+        if (block == nullptr || block->blockItemList() == nullptr) continue;
+        for (auto* item : block->blockItemList()->blockItem())
+        {
+            if (item->getStart() == nullptr || (size_t)item->getStart()->getTokenIndex() >= token)
+                continue;
+            if (auto* declaration = item->declaration())
+                if (declares(declaration->initDeclaratorList()))
+                    return true;
+            if (auto* destructuring = item->destructuringDeclaration())
+                for (auto* entry : destructuring->destructuringEntry())
+                    if (entry->Identifier() != nullptr && entry->Identifier()->getText() == name)
+                        return true;
+        }
+    }
+    return false;
+}
+
 // Collect bare source names CONSUMED by a plain store ANYWHERE in the body (at-least-one-path):
 // the RHS of a plain `=` assignment (`X = value`, incl. a slot store `_data[i] = value`), a decl
-// initializer (`T x = value`, incl. its brace-list form `T[N] d = { p };` / `T[N] d { p };`), or a
-// `move <name>` (conditional too). Unlike
+// initializer (`T x = value`, incl. its brace-list form `T[N] d = { p };` / `T[N] d { p };`), a
+// `move <name>` (conditional too), a `return <name>`, or the whole-name DESTINATION of `=` / `+=`. Unlike
 // CollectUnconditionalMovedNames this DESCENDS into runtime conditionals/loops - 8a's total
 // scope-exit drop makes a not-taken path sound. Lambdas / nested functions are a different scope
 // and are not descended into. The caller intersects with the param list; a non-bare RHS (`v.f`,
 // `v + 1`) never equals a param name, so it is naturally excluded (only a whole-value move counts).
 inline void CollectConsumedStoreNames(antlr4::tree::ParseTree* node, std::unordered_set<std::string>& out,
-                                      WrappedSourceNames* wrapped = nullptr)
+                                      WrappedSourceNames* wrapped = nullptr,
+                                      std::unordered_set<std::string>* returned = nullptr,
+                                      WrappedSourceNames* returnedWrapped = nullptr,
+                                      std::unordered_set<std::string>* written = nullptr)
 {
     if (node == nullptr) return;
     if (AsRuleCtx<CFlatParser::LambdaExpressionContext>(node)) return;
     if (AsRuleCtx<CFlatParser::FunctionDefinitionContext>(node)) return;
     if (auto* asn = AsRuleCtx<CFlatParser::AssignmentExpressionContext>(node))
-        if (asn->assignmentOperator() != nullptr && asn->assignmentOperator()->getText() == "="
-            && asn->assignmentExpression() != nullptr)
-            RecordConsumeSourceName(asn->assignmentExpression(), out, wrapped);
+        if (asn->assignmentOperator() != nullptr && asn->assignmentExpression() != nullptr)
+        {
+            if (asn->assignmentOperator()->getText() == "=")
+                RecordConsumeSourceName(asn->assignmentExpression(), out, wrapped);
+            // A store INTO the whole name (`w = v`, `w += k`) drops the value it held, so the body
+            // takes that value over exactly as `T t = w; t = v;` does. A shadowing local is not w.
+            if (asn->unaryExpression() != nullptr)
+            {
+                std::string dest = BareSourceText(asn->unaryExpression());
+                if (!NameShadowedByEnclosingLocal(asn, dest))
+                    (written != nullptr ? *written : out).insert(dest);
+            }
+        }
+    // `return w;` hands the whole value to the caller - the same consume as `T t = w; return t;`.
+    // Kept apart when asked: a unique-owning passthrough is an inferred 'alias' return instead.
+    if (auto* jump = AsRuleCtx<CFlatParser::JumpStatementContext>(node))
+        if (jump->expression() != nullptr
+            && !NameShadowedByEnclosingLocal(jump, BareSourceText(jump->expression())))
+            RecordConsumeSourceName(jump->expression(), returned != nullptr ? *returned : out,
+                                    returned != nullptr ? returnedWrapped : wrapped);
     // `construct_at(slot, value)` is the explicit raw-slot spelling of the same native
     // owning sink as `_data[i] = value`; its second argument must participate in inference.
     if (auto* call = dynamic_cast<CFlatParser::PostfixExpressionContext*>(node))
@@ -2794,7 +2870,26 @@ inline void CollectConsumedStoreNames(antlr4::tree::ParseTree* node, std::unorde
         if (auto* u = mv->unaryExpression())
             out.insert(BareSourceText(u));
     for (auto* child : node->children)
-        CollectConsumedStoreNames(child, out, wrapped);
+        CollectConsumedStoreNames(child, out, wrapped, returned, returnedWrapped, written);
+}
+
+// Collect the bare names a body stores INTO as a whole (`w = v`, `w += k`). Lambdas and nested
+// functions are a different scope. Drives the copy-on-entry of a written copyable parameter.
+inline void CollectWholeNameStoreDestinations(antlr4::tree::ParseTree* node,
+                                              std::unordered_set<std::string>& out)
+{
+    if (node == nullptr) return;
+    if (AsRuleCtx<CFlatParser::LambdaExpressionContext>(node)) return;
+    if (AsRuleCtx<CFlatParser::FunctionDefinitionContext>(node)) return;
+    if (auto* asn = AsRuleCtx<CFlatParser::AssignmentExpressionContext>(node))
+        if (asn->assignmentOperator() != nullptr && asn->unaryExpression() != nullptr)
+        {
+            std::string dest = BareSourceText(asn->unaryExpression());
+            if (!NameShadowedByEnclosingLocal(asn, dest))
+                out.insert(dest);
+        }
+    for (auto* child : node->children)
+        CollectWholeNameStoreDestinations(child, out);
 }
 
 // A parameter shape that can carry an owning VALUE (a value struct or `string`). Excludes
@@ -2843,21 +2938,50 @@ inline void ApplyOwningSinkInferenceToBody(const LLVMBackend* compiler,
     CollectUnconditionalMovedNames(body, movedNames, evalIfConst, &returnScanMemo);
     std::unordered_set<std::string> consumedNames;
     WrappedSourceNames wrappedConsumed;
-    CollectConsumedStoreNames(body, consumedNames, &wrappedConsumed);
+    std::unordered_set<std::string> returnedNames;
+    WrappedSourceNames wrappedReturned;
+    std::unordered_set<std::string> writtenNames;
+    CollectConsumedStoreNames(body, consumedNames, &wrappedConsumed, &returnedNames, &wrappedReturned,
+                              &writtenNames);
     for (auto& p : allParams)
     {
         if (p.VariableName.empty() || !ParamIsOwningSinkEligible(p)) continue;
+        // An imported C++ class param follows the C++ by-value rule (the caller copy- or
+        // move-constructs it), so a write or return in the body never consumes the caller.
+        const bool cxxClass = compiler != nullptr
+            && (compiler->IsCxxRecord(p.TypeName) || compiler->IsForeignNontrivialCxxClass(p.TypeName));
         // A cast-wrapped source counts only when every peeled wrapper names the parameter's own
         // type - a TYPE-CHANGING cast is not a whole-value consume of the parameter.
         bool wrappedConsume = false;
         if (auto it = wrappedConsumed.find(p.VariableName); it != wrappedConsumed.end())
             wrappedConsume = AllWrapperTypesName(compiler, it->second, p.TypeName);
+        bool wrappedReturn = false;
+        if (auto it = wrappedReturned.find(p.VariableName); it != wrappedReturned.end())
+            wrappedReturn = AllWrapperTypesName(compiler, it->second, p.TypeName);
         if (movedNames.count(p.VariableName))
             p.IsOwningSink = true;
         else if (consumedNames.count(p.VariableName) || wrappedConsume)
         {
             p.IsOwningSink = true;
             p.IsConsumeInferredSink = true;
+        }
+        else if (cxxClass)
+            continue;
+        else if (writtenNames.count(p.VariableName))
+        {
+            // A whole write drops the caller's value; nothing escapes, so a bonded argument is
+            // refused only when the concrete type is consumed (IsWriteInferredSink).
+            p.IsOwningSink = true;
+            p.IsConsumeInferredSink = true;
+            p.IsWriteInferredSink = true;
+        }
+        else if (returnedNames.count(p.VariableName) || wrappedReturn)
+        {
+            // Only `return p` consumes it: OwningSinkConsumesConcrete leaves a unique-owning
+            // type to the inferred 'alias' return (ClassifyValueStructReturns) as before.
+            p.IsOwningSink = true;
+            p.IsConsumeInferredSink = true;
+            p.IsReturnInferredSink = true;
         }
     }
 }
@@ -2872,12 +2996,19 @@ inline void AdoptInferredParamSinks(LLVMBackend::TypeAndValue& dest,
     if (dest.FuncPtrParams.size() != src.size()) return;
     for (size_t i = 0; i < src.size(); i++)
     {
-        if (dest.FuncPtrParams[i].AllocAlignValue == 0)
-            dest.FuncPtrParams[i].AllocAlignValue = src[i].AllocAlignValue;
-        dest.FuncPtrParams[i].IsOwningSink =
-            dest.FuncPtrParams[i].IsOwningSink || src[i].IsOwningSink;
-        dest.FuncPtrParams[i].IsConsumeInferredSink =
-            dest.FuncPtrParams[i].IsConsumeInferredSink || src[i].IsConsumeInferredSink;
+        auto& d = dest.FuncPtrParams[i];
+        if (d.AllocAlignValue == 0)
+            d.AllocAlignValue = src[i].AllocAlignValue;
+        // Return-only survives only when every sink claim being merged is return-only; the
+        // no-store flag (write and/or return) only when no claim is a store/move consume.
+        const bool returnOnly = (!d.IsOwningSink || d.IsReturnInferredSink)
+            && (!src[i].IsOwningSink || src[i].IsReturnInferredSink);
+        const bool noStore = (!d.IsOwningSink || d.IsReturnInferredSink || d.IsWriteInferredSink)
+            && (!src[i].IsOwningSink || src[i].IsReturnInferredSink || src[i].IsWriteInferredSink);
+        d.IsOwningSink = d.IsOwningSink || src[i].IsOwningSink;
+        d.IsConsumeInferredSink = d.IsConsumeInferredSink || src[i].IsConsumeInferredSink;
+        d.IsReturnInferredSink = d.IsOwningSink && returnOnly;
+        d.IsWriteInferredSink = d.IsOwningSink && noStore && !returnOnly;
     }
 }
 
@@ -6559,6 +6690,10 @@ public:
 
     // The same question asked of a RESOLVED binding rather than a name. Storage identity is what
     // separates the parameter from an inner local declared with the parameter's name.
+    // Copy-on-entry for a COPYABLE owning by-value parameter the body writes as a whole: the
+    // caller keeps its value (a copyable owner is never consumed), so the callee owns a copy.
+    void CopyWrittenCopyableParams(CFlatParser::FunctionDefinitionContext* func,
+                                   const std::vector<LLVMBackend::TypeAndValue>& params);
     bool IsBorrowedByValueParamBinding(
         LLVMBackend* compiler, const LLVMBackend::NamedVariable& nv);
 

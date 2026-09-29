@@ -1064,6 +1064,8 @@ LLVMBackend::TypeAndValue LLVMBackend::FuncPtrSigOfSymbol(const FunctionSymbol& 
             // honour at the indirect call; a declared spelling cannot restate them.
             fp.IsOwningSink = p.IsOwningSink;
             fp.IsConsumeInferredSink = p.IsConsumeInferredSink;
+            fp.IsReturnInferredSink = p.IsReturnInferredSink;
+            fp.IsWriteInferredSink = p.IsWriteInferredSink;
             fp.PointerDepth = p.ValuePointerDepth();
             sig.FuncPtrParams.push_back(fp);
         }

@@ -5,6 +5,9 @@
 import cpp "cpp_interop_assign.h";
 
 struct MoveOnlyHost { cppas.MoveOnly m = cppas.MoveOnly(1); };
+// A whole write into a C++ class by-value parameter does not make it a consuming sink: the C++
+// by-value rule still copy-constructs the argument, so an lvalue is refused (not silently moved).
+void assignParam(cppas.MoveOnly w) { w = cppas.MoveOnly(7); }
 
 extern int main()
 {
@@ -14,6 +17,9 @@ extern int main()
     MoveOnlyHost host = { m = cppas.MoveOnly(1) };
     cppas.MoveOnly* p = &a;
     int c = 1;
+    expect_error("cannot copy C++ class 'cppas.MoveOnly' into parameter 'w' of 'assignParam': its copy constructor is deleted - pass 'move x' or a temporary") {
+        assignParam(a);
+    }
     expect_error("cannot copy-assign C++ class 'cppas.MoveOnly': it has no copy assignment operator") {
         t = a;
     }

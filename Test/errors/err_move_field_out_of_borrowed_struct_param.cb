@@ -159,4 +159,35 @@ expect_error("cannot consume field 'Mid.b' out of borrowed parameter 'w'") {
     int badNestedPathParen(Nest w) { UBox o = (w.a.b); return o.item->id; }
 }
 
+/*
+ * A by-value compound assignment whose destination is a borrowed field, used as a VALUE. The
+ * result names the destination, so it is refused exactly where the split form
+ * `h->f += 2; CrOwned x = h->f;` is, with the same message. Each compiled and double-freed
+ * (rc 133) before: the assignment result dropped the destination's borrow provenance.
+ */
+struct CrOwned
+{
+    int* p = nullptr;
+    CrOwned() { p = new int; *p = 1; }
+    ~CrOwned() { if (p != nullptr) { delete p; } }
+    CrOwned operator+=(int k) { *p = *p + k; CrOwned r; return r; }
+};
+struct CrHolder { CrOwned f = default; };
+
+expect_error("cannot consume field 'CrHolder.f' through borrowed parameter 'h'") {
+    void badCompoundDecl(CrHolder* h) { CrOwned x = (h->f += 2); }
+}
+
+expect_error("cannot consume field 'CrHolder.f' through borrowed parameter 'h'") {
+    CrOwned badCompoundReturn(CrHolder* h) { return (h->f += 2); }
+}
+
+expect_error("cannot consume field 'CrHolder.f' through borrowed parameter 'h'") {
+    void badCompoundAssign(CrHolder* h) { CrOwned x; x = (h->f += 2); }
+}
+
+expect_error("cannot consume field 'CrHolder.f' out of borrowed parameter 'h'") {
+    void badCompoundByValue(CrHolder h) { CrOwned x = (h.f += 2); }
+}
+
 extern int main() { return 0; }

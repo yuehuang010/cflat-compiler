@@ -1980,6 +1980,30 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
             clearReturnedStructBorrowBits = false;
         }
 
+        // `return w;` of a borrowed by-value COPYABLE owner param: the caller keeps its value, so
+        // hand out a copy exactly like `T t = w; return t;` (a bit-copy had two owners, rc 133).
+        if (right != nullptr && right->getType()->isStructTy()
+            && !compiler->currentFunctionReturnTV.IsAlias
+            && !NamedVarIsString(returnNV)
+            && returnNV.FieldName.empty()
+            && !returnNV.TypeAndValue.Pointer && !returnNV.TypeAndValue.IsMove
+            && !returnNV.CallerName.empty()
+            && returnNV.TypeAndValue.TypeName == compiler->currentFunctionReturnTypeName
+            && returnNV.TypeAndValue.TypeName != "__closure_fat_ptr"
+            && !compiler->IsEncodedClosureType(returnNV.TypeAndValue.TypeName)
+            && compiler->IsDataStructure(returnNV.TypeAndValue.TypeName)
+            && compiler->IsOwningValueType(returnNV.TypeAndValue.TypeName)
+            && compiler->IsCopyableType(returnNV.TypeAndValue.TypeName)
+            && !compiler->IsCxxRecord(returnNV.TypeAndValue.TypeName)
+            && !compiler->IsForeignNontrivialCxxClass(returnNV.TypeAndValue.TypeName)
+            && IsBorrowedStructParameter(compiler, returnNV.CallerName)
+            && returnNV.Storage != nullptr
+            && returnNV.Storage == compiler->GetScopedLocalOrArgument(returnNV.CallerName).Storage)
+        {
+            right = EmitCopyableOwnerCopy(returnNV, right, errCtx);
+            clearReturnedStructBorrowBits = false;
+        }
+
         /*
          * Returning an owning FIELD PATH or fixed-array ELEMENT (`return w.b;`). The six store
          * arms consume such a source through ClassifyOwningAssignSource; the return path had no
