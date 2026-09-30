@@ -169,6 +169,18 @@
 import cpp "library/cpp_interop_basic.h";
 import cpp "library/cpp_interop_basic.cpp";
 import cpp "library/cpp_interop_freeoptpl.h";
+
+cppfop.FoldRef d5_return_fold_ref(cppfop.FoldRef* a, cppfop.FoldRef* b,
+                                 cppfop.FoldRef* c)
+{
+    return *a | *b | *c;
+}
+int d5_consume_counted_fold(cppfop.FoldRef value) { return value.get(); }
+cppfop.FoldRef d5_return_temporary_fold(cppfop.FoldRef* a, cppfop.FoldRef* b,
+                                       cppfop.FoldRef* c)
+{
+    return *c + *c & *a & *b;
+}
 // One header-only CLASS TEMPLATE pattern. No specialization has a symbol anywhere until a
 // CFlat declaration asks for one, so every class-template assertion also proves the
 // instantiation path emitted the bodies. The libc++ checks need no fixture at all - the
@@ -1869,6 +1881,136 @@ extern int main()
     if (boxLogicalOr.v != 1) return 1817;
     bool scalarLogicalOr = cppfop.FoldScalar(0) || cppfop.FoldScalar(0) || cppfop.FoldScalar(1);
     if (!scalarLogicalOr) return 1818;
+
+    // Reference-result folds are values at declaration/call sites; count the C++ copy ctor.
+    {
+        cppfop.FoldRef a = cppfop.FoldRef(1);
+        cppfop.FoldRef b = cppfop.FoldRef(2);
+        cppfop.FoldRef c = cppfop.FoldRef(4);
+
+        cppfop.fold_ref_reset();
+        cppfop.FoldRef ref3 = a | b | c;
+        if (ref3.get() != 7 || cppfop.fold_ref_copies() != 1) return 2460;
+        cppfop.FoldRef ref4A = cppfop.FoldRef(1);
+        cppfop.FoldRef ref4B = cppfop.FoldRef(2);
+        cppfop.FoldRef ref4C = cppfop.FoldRef(4);
+        cppfop.FoldRef ref4D = cppfop.FoldRef(8);
+        cppfop.fold_ref_reset();
+        cppfop.FoldRef ref4 = ref4A | ref4B | ref4C | ref4D;
+        if (ref4.get() != 15 || cppfop.fold_ref_copies() != 1) return 2461;
+
+        cppfop.Box<int> assigned = cppfop.Box<int>(0);
+        cppfop.Box<int> assignA = cppfop.Box<int>(1);
+        cppfop.Box<int> assignB = cppfop.Box<int>(2);
+        cppfop.Box<int> assignC = cppfop.Box<int>(4);
+        assigned = assignA | assignB | assignC;
+        if (assigned.v() != 7) return 2462;
+
+        cppfop.FoldRef memberA = cppfop.FoldRef(1);
+        cppfop.FoldRef memberB = cppfop.FoldRef(2);
+        cppfop.FoldRef memberC = cppfop.FoldRef(4);
+        cppfop.fold_ref_reset();
+        int member = (memberA | memberB | memberC).get();
+        if (member != 7 || cppfop.fold_ref_copies() != 0) return 2464;
+        cppfop.FoldRef autoA = cppfop.FoldRef(1);
+        cppfop.FoldRef autoB = cppfop.FoldRef(2);
+        cppfop.FoldRef autoC = cppfop.FoldRef(4);
+        cppfop.fold_ref_reset();
+        auto inferred = autoA | autoB | autoC;
+        if (inferred.get() != 7 || cppfop.fold_ref_copies() != 1) return 2465;
+
+        cppfop.FoldRef mixedA = cppfop.FoldRef(1);
+        cppfop.FoldRef mixedB = cppfop.FoldRef(2);
+        cppfop.FoldRef mixedC = cppfop.FoldRef(4);
+        cppfop.fold_ref_reset();
+        cppfop.FoldRef mixed = mixedA | mixedB & mixedC;
+        if (mixed.get() != 7 || cppfop.fold_ref_copies() != 1) return 2466;
+
+        cppfop.FoldRef orderA = cppfop.FoldRef(1);
+        cppfop.FoldRef orderB = cppfop.FoldRef(2);
+        cppfop.FoldRef orderC = cppfop.FoldRef(4);
+        cppfop.fold_ref_reset();
+        cppfop.FoldRef valueThenRef = orderA + orderB | orderC;
+        if (valueThenRef.get() != 7 || cppfop.fold_ref_copies() != 1
+            || cppfop.fold_ref_dtors() != 1) return 2467;
+        cppfop.FoldRefThenValue refA = cppfop.FoldRefThenValue(1);
+        cppfop.FoldRefThenValue refB = cppfop.FoldRefThenValue(2);
+        cppfop.FoldRefThenValue refC = cppfop.FoldRefThenValue(4);
+        cppfop.fold_ref_then_value_reset();
+        cppfop.FoldRefThenValue refThenValue = refA & refB | refC;
+        if (refThenValue.get() != 7 || cppfop.fold_ref_then_value_copies() != 0) return 2468;
+
+        cppfop.MemberFoldRef memberPlainA = cppfop.MemberFoldRef(1);
+        cppfop.MemberFoldRef memberPlainB = cppfop.MemberFoldRef(2);
+        cppfop.MemberFoldRef memberPlainC = cppfop.MemberFoldRef(4);
+        cppfop.member_fold_ref_reset();
+        cppfop.MemberFoldRef memberPlain = memberPlainA | memberPlainB | memberPlainC;
+        if (memberPlain.get() != 7 || cppfop.member_fold_ref_copies() != 1) return 2472;
+        // A non-const member operator| on a by-value temporary (clang: copy 1, temp dtor 1).
+        cppfop.MemberFoldRef memberTempA = cppfop.MemberFoldRef(1);
+        cppfop.MemberFoldRef memberTempB = cppfop.MemberFoldRef(2);
+        cppfop.MemberFoldRef memberTempC = cppfop.MemberFoldRef(4);
+        cppfop.member_fold_ref_reset();
+        {
+            cppfop.MemberFoldRef memberTemp = memberTempA + memberTempB | memberTempC;
+            if (memberTemp.get() != 7 || memberTempA.get() != 1
+                || cppfop.member_fold_ref_copies() != 1 || cppfop.member_fold_ref_dtors() != 1) return 24990;
+        }
+        if (cppfop.member_fold_ref_dtors() != 2) return 24990;
+        cppfop.member_fold_ref_reset();
+        int memberTempGet = (memberTempA + memberTempB | memberTempC).get();
+        if (memberTempGet != 7 || cppfop.member_fold_ref_copies() != 0
+            || cppfop.member_fold_ref_dtors() != 1) return 24991;
+
+        cppfop.MemberFold<int> memberTemplateA = cppfop.MemberFold<int>(1);
+        cppfop.MemberFold<int> memberTemplateB = cppfop.MemberFold<int>(2);
+        cppfop.MemberFold<int> memberTemplateC = cppfop.MemberFold<int>(4);
+        cppfop.member_fold_reset<int>();
+        cppfop.MemberFold<int> memberTemplate =
+            memberTemplateA | memberTemplateB | memberTemplateC;
+        if (memberTemplate.get() != 7 || cppfop.member_fold_copies<int>() != 1) return 2473;
+
+        cppfop.FoldRef retA = cppfop.FoldRef(1);
+        cppfop.FoldRef retB = cppfop.FoldRef(2);
+        cppfop.FoldRef retC = cppfop.FoldRef(4);
+        cppfop.fold_ref_reset();
+        cppfop.FoldRef returned = d5_return_fold_ref(&retA, &retB, &retC);
+        if (returned.get() != 7 || cppfop.fold_ref_copies() != 1) return 2469;
+
+        cppfop.FoldRef tempA = cppfop.FoldRef(10);
+        cppfop.FoldRef tempB = cppfop.FoldRef(20);
+        cppfop.FoldRef tempC = cppfop.FoldRef(1);
+        cppfop.fold_ref_reset();
+        for (int i = 0; i < 3; i = i + 1)
+        {
+            cppfop.FoldRef returnedTemp = d5_return_temporary_fold(&tempA, &tempB, &tempC);
+            if (returnedTemp.get() != 32) return 2476;
+        }
+        if (cppfop.fold_ref_copies() != 3 || cppfop.fold_ref_dtors() != 6) return 2477;
+
+        cppfop.FoldRef argRefA = cppfop.FoldRef(1);
+        cppfop.FoldRef argRefB = cppfop.FoldRef(2);
+        cppfop.FoldRef argRefC = cppfop.FoldRef(4);
+        cppfop.fold_ref_reset();
+        int countedArgument = d5_consume_counted_fold(argRefA | argRefB | argRefC);
+        if (countedArgument != 7 || cppfop.fold_ref_copies() != 1) return 2475;
+
+        cppfop.Box<int> freeA = cppfop.Box<int>(1);
+        cppfop.Box<int> freeB = cppfop.Box<int>(2);
+        cppfop.Box<int> freeC = cppfop.Box<int>(4);
+        cppfop.Box<int> freeTemplate = freeA | freeB | freeC;
+        if (freeTemplate.v() != 7) return 2470;
+        cppfop.Box<int> free4A = cppfop.Box<int>(1);
+        cppfop.Box<int> free4B = cppfop.Box<int>(2);
+        cppfop.Box<int> free4C = cppfop.Box<int>(4);
+        cppfop.Box<int> free4D = cppfop.Box<int>(8);
+        cppfop.Box<int> freeTemplate4 = free4A | free4B | free4C | free4D;
+        if (freeTemplate4.v() != 15) return 2474;
+        cppfop.Box<int> argA = cppfop.Box<int>(1);
+        cppfop.Box<int> argB = cppfop.Box<int>(2);
+        cppfop.Box<int> argC = cppfop.Box<int>(4);
+        if (cppfop.fold_box_value(argA | argB | argC) != 7) return 2471;
+    }
 
     cppsop.CharOnly strlitC = cppsop.CharOnly();
     strlitC += "abc";

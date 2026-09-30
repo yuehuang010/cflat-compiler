@@ -36,6 +36,60 @@ int returnTernaryArm(int* fallback)
 {
     return useCSLive(conditionalGate > 0 ? &(new CS(21))->v : fallback);
 }
+int returnAddressFallback = 6;
+int* returnAddressIdentity(int* p) { return p; }
+int* returnUnusedPointerArg(int* first, int* second) { return second; }
+int* returnUnusedPointerArg(CS* first, int* second) { return second; }
+CS* conditionalNullCS = nullptr;
+int* returnUnusedJoinArg(int c)
+{
+    return returnUnusedPointerArg(
+        c > 0 ? &(new CS(26))->v : &returnAddressFallback, &returnAddressFallback);
+}
+int* returnUnusedCoalesceArg()
+{
+    return returnUnusedPointerArg(new CS(27) ?? conditionalNullCS, &returnAddressFallback);
+}
+int* returnAddressThroughJoin(int c)
+{
+    return returnAddressIdentity(c > 0 ? &(new CS(22))->v : &returnAddressFallback);
+}
+struct ConditionalAggregateTemp
+{
+    int v = 0;
+    ConditionalAggregateTemp(int value)
+    {
+        v = value;
+        conditionalNewCount = conditionalNewCount + 1;
+    }
+    ~ConditionalAggregateTemp() { conditionalDtorCount = conditionalDtorCount + 1; }
+};
+struct ConditionalAddressHolder { int* p = nullptr; };
+ConditionalAddressHolder makeConditionalAddressHolder(int* p)
+{
+    ConditionalAddressHolder holder;
+    holder.p = p;
+    return holder;
+}
+ConditionalAddressHolder returnConditionalAddressHolder(int c)
+{
+    return makeConditionalAddressHolder(
+        c > 0 ? &(new ConditionalAggregateTemp(25))->v : &returnAddressFallback);
+}
+int nestedArmReturn(int c)
+{
+    return c > 0
+        ? useCSLive(c > 0 ? &(new CS(23))->v ?? &returnAddressFallback
+                          : &returnAddressFallback)
+        : useCSLive(&returnAddressFallback);
+}
+int nestedArmDeclStatement(int c)
+{
+    int r = c > 0
+        ? useCSLive(c > 0 ? &(new CS(24))->v : &returnAddressFallback)
+        : useCSLive(&returnAddressFallback);
+    return r;
+}
 CS* conditionalKeep = nullptr;
 int takeConditionalCS(move CS* p)
 {
@@ -12926,6 +12980,57 @@ extern int main()
     passed += Test("conditional_new_arm_in_return_call_freed",
         returnCoalesceClean && returnTernaryRead == 21 && conditionalNewCount == 2
             && conditionalDtorCount == 1 ? 1 : 0, 1);
+    total++;
+
+    conditionalNewCount = 0;
+    conditionalDtorCount = 0;
+    int* returnedArmAddress = returnAddressThroughJoin(1);
+    passed += Test("conditional_new_returned_join_address_kept",
+        returnedArmAddress != nullptr && *returnedArmAddress == 22
+            && conditionalNewCount == 1 && conditionalDtorCount == 0 ? 1 : 0, 1);
+    total++;
+
+    conditionalNewCount = 0;
+    conditionalDtorCount = 0;
+    int* unusedJoinedArg = returnUnusedJoinArg(1);
+    passed += Test("conditional_new_unused_join_call_arg_freed",
+        unusedJoinedArg != nullptr && *unusedJoinedArg == 6
+            && conditionalNewCount == 1 && conditionalDtorCount == 1 ? 1 : 0, 1);
+    total++;
+
+    conditionalNewCount = 0;
+    conditionalDtorCount = 0;
+    int* unusedCoalesceArg = returnUnusedCoalesceArg();
+    passed += Test("conditional_new_unused_coalesce_call_arg_freed",
+        unusedCoalesceArg != nullptr && *unusedCoalesceArg == 6
+            && conditionalNewCount == 1 && conditionalDtorCount == 1 ? 1 : 0, 1);
+    total++;
+
+    conditionalNewCount = 0;
+    conditionalDtorCount = 0;
+    ConditionalAddressHolder returnedHolder = returnConditionalAddressHolder(1);
+    bool holderKeptTemp = returnedHolder.p != nullptr && *returnedHolder.p == 25
+        && conditionalNewCount == 1 && conditionalDtorCount == 0;
+    int* returnedHolderAddress = move returnedHolder.p;
+    if (returnedHolderAddress != nullptr) delete (ConditionalAggregateTemp*)returnedHolderAddress;
+    passed += Test("conditional_new_returned_aggregate_address_kept_and_freed_once",
+        holderKeptTemp && conditionalDtorCount == 1 ? 1 : 0, 1);
+    total++;
+
+    conditionalNewCount = 0;
+    conditionalDtorCount = 0;
+    int nestedArmValue = nestedArmReturn(1);
+    passed += Test("conditional_new_nested_return_nonpointer_freed",
+        nestedArmValue == 23 && conditionalNewCount == 1 && conditionalDtorCount == 1 ? 1 : 0, 1);
+    total++;
+
+    // The inner arm's conditional slot is re-keyed to the outer branch block, so the
+    // statement end frees it (was a leak: the inner arm block does not dominate the join).
+    conditionalNewCount = 0;
+    conditionalDtorCount = 0;
+    int nestedDeclValue = nestedArmDeclStatement(1);
+    passed += Test("conditional_new_nested_decl_arm_freed",
+        nestedDeclValue == 24 && conditionalNewCount == 1 && conditionalDtorCount == 1 ? 1 : 0, 1);
     total++;
 
     printf("\n%d / %d tests passed.\n", passed, total);

@@ -887,6 +887,9 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
             // Arguments bound by materializing a temporary for a C++ `const T&` scalar parameter.
             // A materialization is strictly worse than a by-value or rvalue-ref bind (ruling).
             int constRefMaterializations = 0;
+            // In a C++ overload set containing the same T& and const T& parameter, an
+            // lvalue binds to T&. Count only this exact sibling comparison.
+            int mutableRefPreference = 0;
             // Per argument: RankIntegerConversion cost, or -1 where no integer identity judged it.
             std::vector<int> integerCosts;
             // Per argument: standard conversion cost, including a literal zero to a pointer.
@@ -1005,6 +1008,7 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
             // Arguments bound to a 'bool' parameter through the integer -> bool coercion.
             int boolCoercions = 0;
             int constRefMaterializations = 0;
+            int mutableRefPreference = 0;
             std::vector<int> standardCosts;
             int nullPointerConversions = 0;
             // Arguments bound through the `iterator -> const_iterator` conversion.
@@ -1040,6 +1044,22 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                 const bool argIsCxxRvalue = candidate.IsCxx
                     && IsCxxRvalueReferenceArgument(arg);
                 const size_t paramIndex = std::distance(candidate.Parameters.begin(), candidateParamItr);
+                if (candidate.IsCxx && candidateParamItr->IsCxxConstRef
+                    && !IsCxxRvalueReferenceArgument(arg))
+                {
+                    const bool hasMutableSibling = std::any_of(candidates.begin(), candidates.end(),
+                        [&](const auto& sibling) {
+                            const auto& symbol = sibling.second;
+                            return symbol.IsCxx && symbol.SourceName == candidate.SourceName
+                                && paramIndex < symbol.Parameters.size()
+                                && symbol.Parameters.size() == candidate.Parameters.size()
+                                && symbol.Parameters[paramIndex].TypeName == candidateParamItr->TypeName
+                                && symbol.Parameters[paramIndex].IsAlias
+                                && !symbol.Parameters[paramIndex].IsCxxConstRef
+                                && !symbol.Parameters[paramIndex].IsRvalueRef;
+                        });
+                    if (hasMutableSibling) ++mutableRefPreference;
+                }
                 const bool cxxIndirectValueParam = candidate.IsCxx
                     && candidate.CxxAbi.valid
                     && paramIndex < candidate.CxxAbi.params.size()
@@ -1065,6 +1085,7 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                     && !(cxxIndirectValueParam && !cxxConstReference && !cxxRvalueReference)
                     && !cxxRvalueReference
                     && !cxxConstReference
+                    && !(arg.CxxLvalueKind == 0 && IsCxxAddressOfObjectArgument(arg))
                     && IsCxxReferenceParameter(candidate, paramIndex)
                     && (!arg.BaseType || !arg.BaseType->isStructTy()
                         || candidateParamItr->TypeName == arg.TypeAndValue.TypeName
@@ -1168,7 +1189,7 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                     else if (bool needsStandard = false;
                         !cxxReceiverParam && !arg.TypeAndValue.Pointer
                         && !ScoreCxxConversionOperatorArgument(
-                                arg, *candidateParamItr, needsStandard, userConversions,
+                                arg, *candidateParamItr, !candidate.IsCxx, needsStandard, userConversions,
                                 userConversionCost, userConversionNames).empty())
                         result = 1;
                     else if (coreUniqueValueReceiver || rawPointerToCoreUnique || coreUniqueToRawPointer
@@ -1461,7 +1482,7 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                     else if (bool needsStandard = false;
                         !cxxReceiverParam && !arg.TypeAndValue.Pointer
                         && !ScoreCxxConversionOperatorArgument(
-                                arg, *candidateParamItr, needsStandard, userConversions,
+                                arg, *candidateParamItr, !candidate.IsCxx, needsStandard, userConversions,
                                 userConversionCost, userConversionNames).empty())
                         result = 1;
 
@@ -1702,6 +1723,7 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                 ranked.shapeMismatches = shapeMismatches;
                 ranked.boolCoercions = boolCoercions;
                 ranked.constRefMaterializations = constRefMaterializations;
+                ranked.mutableRefPreference = mutableRefPreference;
                 ranked.omitted = omitted;
                 ranked.constAddedConversions = constAddedConversions;
                 ranked.refPtrConstMismatches = refPtrConstMismatches;
@@ -2024,6 +2046,7 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
             for (const Ranked& r : perfect)
                 best.push_back(&r);
             keepLowest(best, [](const Ranked& r) { return r.refPtrConstMismatches; });
+            keepLowest(best, [](const Ranked& r) { return r.mutableRefPreference; });
             keepLowest(best, [](const Ranked& r) { return -r.moveScore; });
             keepLowest(best, [](const Ranked& r) { return (int)r.pair->second.CxxVolatile; });
             preferCxxDefaultWrapperForSameDeclaration(best);
@@ -2047,6 +2070,7 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
             keepLowest(best, [](const Ranked& r) { return r.boolCoercions; });
             // An overload over the argument's own specialization beats a const-added one.
             keepLowest(best, [](const Ranked& r) { return r.constAddedConversions; });
+            keepLowest(best, [](const Ranked& r) { return r.mutableRefPreference; });
             // `T*&` over `T*const&` for a modifiable lvalue pointer, and the reverse for a
             // pointer rvalue - the C++ ranking of the two reference bindings.
             keepLowest(best, [](const Ranked& r) { return r.refPtrConstMismatches; });
@@ -2560,14 +2584,72 @@ bool LLVMBackend::IsCxxTemplateSpecializationSymbol(const FunctionSymbol& symbol
 }
 
 bool LLVMBackend::CxxMemberIsOnlyNonConst(const std::string& recordName,
-                                          const std::string& memberName) const
+                                          const std::string& memberName,
+                                          size_t argumentCount) const
 {
-        bool hasConst = false, hasNonConst = false;
-        if (auto record = cxxRecordEntries_.find(recordName); record != cxxRecordEntries_.end())
+        if (argumentCount == 0) return false;
+        std::set<std::string> visited;
+        auto inspect = [&](auto&& self, const std::string& typeName, bool& hasMember) -> bool {
+            if (!visited.insert(typeName).second) return false;
+            auto record = cxxRecordEntries_.find(typeName);
+            if (record == cxxRecordEntries_.end()) return false;
+            bool declaresName = false;
+            bool hasConst = false, hasNonConst = false;
             for (const auto& member : record->second.members)
-                if (member.kind == cflat_cinterop::RawCxxMember::Instance && member.name == memberName)
+            {
+                if (member.kind != cflat_cinterop::RawCxxMember::Instance
+                    || member.name != memberName)
+                    continue;
+                declaresName = true;
+                if (member.access != cflat_cinterop::AccessPublic) continue;
+                if (member.paramTypes.size() < 1) continue;
+                const size_t required = [&] {
+                    size_t count = member.paramTypes.size();
+                    while (count > 1 && member.defaultArgs.size() >= count
+                           && !member.defaultArgs[count - 1].kind.empty())
+                        --count;
+                    return count;
+                }();
+                const bool arityFits = argumentCount >= required
+                    && (member.variadic || argumentCount <= member.paramTypes.size());
+                if (!arityFits) continue;
+                (member.isConst ? hasConst : hasNonConst) = true;
+            }
+            const size_t explicitArgumentCount = argumentCount - 1;
+            for (const auto& [templateName, templates] : cxxFunctionTemplates_)
+                for (const auto& member : templates)
+                {
+                    if (member.kind != cflat_cinterop::RawFunctionTemplate::InstanceMember
+                        || member.owner != typeName || member.memberName != memberName
+                        || explicitArgumentCount < member.minArity
+                        || explicitArgumentCount > member.maxArity)
+                        continue;
+                    declaresName = true;
                     (member.isConst ? hasConst : hasNonConst) = true;
-        return hasNonConst && !hasConst;
+                }
+            if (declaresName)
+            {
+                hasMember = true;
+                return hasNonConst && !hasConst;
+            }
+            bool inheritedOnlyNonConst = false;
+            size_t inheritedMatches = 0;
+            for (const auto& base : record->second.bases)
+            {
+                if (base.access != cflat_cinterop::AccessPublic || base.isVirtual) continue;
+                bool baseHasMember = false;
+                const bool baseOnlyNonConst = self(self, base.name, baseHasMember);
+                if (baseHasMember)
+                {
+                    ++inheritedMatches;
+                    inheritedOnlyNonConst = baseOnlyNonConst;
+                }
+            }
+            hasMember = inheritedMatches != 0;
+            return inheritedMatches == 1 && inheritedOnlyNonConst;
+        };
+        bool hasMember = false;
+        return inspect(inspect, recordName, hasMember);
 }
 
 llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functionNameIn, const std::vector<LLVMBackend::NamedVariable>& arguments, bool forceRoot,
@@ -2959,6 +3041,27 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
         CxxPreferredOverload cxxPreferred;
         auto [matched, candidate] = ComputeOverloadFunction(resolvedCandidate, &tiedCandidates,
                                                             &cxxPreferred);
+
+        // A C++ reference-returning operator carries its referent address until the consumer is
+        // known. For a selected by-value C++ parameter, pass the loaded class value with its
+        // source address so the ordinary copy path can construct the argument.
+        if (candidate.IsCxx)
+            for (size_t i = 0; i < matched.size() && i < candidate.Parameters.size(); ++i)
+            {
+                auto& argument = matched[i];
+                const auto& parameter = candidate.Parameters[i];
+                if (argument.CxxRefValueType == nullptr || argument.Primary == nullptr
+                    || !argument.Primary->getType()->isPointerTy()
+                    || parameter.TypeName != argument.TypeAndValue.TypeName
+                    || parameter.Pointer || parameter.IsAlias || parameter.IsRvalueRef)
+                    continue;
+                argument.Storage = argument.Primary;
+                argument.BaseType = argument.CxxRefValueType;
+                argument.Primary = CreateLoad(argument.CxxRefValueType, argument.Storage);
+                argument.CxxRefValueType = nullptr;
+                argument.TypeAndValue.IsAlias = false;
+                argument.IsRvalue = false;
+            }
 
         auto spellCandidate = [&](const FunctionSymbol& c) {
             std::string paramList;
@@ -4362,7 +4465,9 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                     // AND this end-of-expr flush both free the temp -> double-free.
                     // A CONSUME-inferred sink of a copyable owner does NOT take ownership (its store
                     // is a copy), so an rvalue temp must still be registered for end-of-expr freeing.
-                    bool paramTakesOwnership = candParamItr->IsMove
+                    bool aliasReturnConsumes = aliasSlotParam
+                        && !IsCopyableType(candParamItr->TypeName);
+                    bool paramTakesOwnership = candParamItr->IsMove || aliasReturnConsumes
                         || (OwningSinkConsumesConcrete(*candParamItr)
                             && (candParamItr->TypeName == "string" || IsOwningValueType(candParamItr->TypeName)));
                     if (aliasSlotParam)

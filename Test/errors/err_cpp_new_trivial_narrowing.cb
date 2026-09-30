@@ -1,10 +1,25 @@
 import cpp "cpp_interop_explicit.h";
 
-expect_error("parameter types match these arguments") {
-    extern int main()
-    {
-        double narrowArg = 40000.0;
+extern int main()
+{
+    double narrowArg = 40000.0;
+    expect_error("parameter types match these arguments") {
         cppexp.NewNarrow* p = new cppexp.NewNarrow(narrowArg);
-        return p != nullptr;
     }
+    expect_error("parameter types match these arguments") {
+        c6r3.E* p = new c6r3.E(narrowArg);
+    }
+    expect_error("parameter types match these arguments") {
+        c6r3.Ee* p = new c6r3.Ee(narrowArg);
+    }
+    expect_error("parameter types match these arguments") {
+        c6r3.D* p = new c6r3.D(narrowArg);
+    }
+    expect_error("parameter types match these arguments") {
+        c6r3.Pp* p = new c6r3.Pp(narrowArg);
+    }
+    expect_error("parameter types match these arguments") {
+        c6r3.Dd* p = new c6r3.Dd(narrowArg);
+    }
+    return 0;
 }

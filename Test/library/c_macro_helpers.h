@@ -61,6 +61,8 @@ struct CBF_FlexItem { int count; struct CBF_FlexItemElement data[]; };
 struct CBF_ZeroItem { int count; struct CBF_FlexItemElement data[0]; };
 struct CBF_FlexPointer { int count; int* data[]; };
 struct CBF_ZeroPointer { int count; int* data[0]; };
+struct CBF_AnonFlex { int n; struct { int k; int data[]; }; };
+struct CBF_AnonUnionFlex { int n; union { struct { int k; int data[]; }; int other; }; };
 struct CBF_FlexNested { int tag; struct { unsigned char count; int data[]; } nested; };
 #pragma pack(push, 1)
 struct CBF_FlexPacked { unsigned char count; unsigned char data[0]; };

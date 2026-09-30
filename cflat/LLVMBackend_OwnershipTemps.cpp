@@ -2035,6 +2035,11 @@ void LLVMBackend::DropRetainedJoinArmPtrTemps(llvm::Value* callResult)
         if (call == nullptr) return;
         const llvm::Function* callee = call->getCalledFunction();
         const bool unproven = callee == nullptr || callee->isDeclaration();
+        const FunctionSymbol* calleeSymbol = callee != nullptr
+            ? FindSymbolForFunction(callee) : nullptr;
+        const bool cxxDeclaration = callee != nullptr && callee->isDeclaration()
+            && calleeSymbol != nullptr && calleeSymbol->IsCxx
+            && callee->hasName() && !callee->isVarArg();
         for (unsigned i = 0; i < call->arg_size(); ++i)
         {
             llvm::Value* argVal = call->getArgOperand(i);
@@ -2046,8 +2051,14 @@ void LLVMBackend::DropRetainedJoinArmPtrTemps(llvm::Value* callResult)
             {
                 llvm::Value* cur = work.pop_back_val();
                 if (cur == nullptr || !seen.insert(cur).second) continue;
-                std::erase_if(pendingOwnedPtrTemps,
+                const bool hasPendingTemp = std::any_of(
+                    pendingOwnedPtrTemps.begin(), pendingOwnedPtrTemps.end(),
                     [&](const PendingOwnedPtrTemp& p) { return p.Value == cur; });
+                if (cxxDeclaration && hasPendingTemp)
+                    RegisterCxxGatedOwningPtrArg(cur, *callee, i);
+                else
+                    std::erase_if(pendingOwnedPtrTemps,
+                        [&](const PendingOwnedPtrTemp& p) { return p.Value == cur; });
                 if (const auto* join = FindNullCoalesceJoin(cur))
                     for (const auto& arm : join->Arms) work.push_back(arm.Value);
                 else if (auto* phi = llvm::dyn_cast<llvm::PHINode>(cur))
@@ -2908,7 +2919,9 @@ bool LLVMBackend::ValueMayReachBorrowingContainerSink(const llvm::Value* root, i
         return false;
     }
 
-bool LLVMBackend::ValueMayReachReturn(const llvm::Value* root, int depth)
+bool LLVMBackend::ValueMayReachReturn(const llvm::Value* root, int depth,
+                                      bool unknownPointerResultMayReach,
+                                      const llvm::Value* pendingReturnValue)
 {
         llvm::SmallPtrSet<const llvm::Value*, 16> visited;
         llvm::SmallVector<const llvm::Value*, 16> work;
@@ -2916,12 +2929,25 @@ bool LLVMBackend::ValueMayReachReturn(const llvm::Value* root, int depth)
         work.push_back(root);
         while (!work.empty())
         {
-            if (visited.size() > kMaxRetainUses) return false;   // gave up: no proof
+            if (visited.size() > kMaxRetainUses) return unknownPointerResultMayReach;
             const llvm::Value* v = work.pop_back_val();
             for (const llvm::User* u : v->users())
             {
                 const auto* inst = llvm::dyn_cast<llvm::Instruction>(u);
                 if (inst == nullptr) continue;
+                if (inst == pendingReturnValue && TypeHoldsPointer(inst->getType()))
+                {
+                    if (const auto* call = llvm::dyn_cast<llvm::CallBase>(inst))
+                    {
+                        const llvm::Function* callee = call->getCalledFunction();
+                        for (unsigned i = 0; i < call->arg_size(); ++i)
+                            if (call->getArgOperand(i) == v
+                                && ParameterMayReachReturn(callee, i, depth + 1)) return true;
+                        if (unknownPointerResultMayReach
+                            && (!callee || callee->isDeclaration())) return true;
+                    }
+                    else return true;
+                }
                 if (const auto* ret = llvm::dyn_cast<llvm::ReturnInst>(inst))
                 {
                     if (ret->getReturnValue() == v) return true;
@@ -2953,18 +2979,31 @@ bool LLVMBackend::ValueMayReachReturn(const llvm::Value* root, int depth)
                     if (visited.insert(iv).second) work.push_back(iv);
                     continue;
                 }
+                if (llvm::isa<llvm::ICmpInst>(inst)) continue;
                 if (const auto* call = llvm::dyn_cast<llvm::CallBase>(inst))
                 {
                     const llvm::Function* callee = call->getCalledFunction();
-                    if (callee == nullptr) continue;                 // indirect / virtual: no proof
+                    if (callee == nullptr)
+                    {
+                        if (unknownPointerResultMayReach && TypeHoldsPointer(call->getType()))
+                            return true;
+                        continue;
+                    }
                     if (CallIsPointerOpaqueIntrinsic(callee)) continue;
+                    bool passedTrackedValue = false;
                     for (unsigned i = 0; i < call->arg_size(); ++i)
-                        if (call->getArgOperand(i) == v
-                            && ParameterMayReachReturn(callee, i, depth + 1))
+                        if (call->getArgOperand(i) == v)
                         {
-                            if (visited.insert(call).second) work.push_back(call);
-                            break;
+                            passedTrackedValue = true;
+                            if (ParameterMayReachReturn(callee, i, depth + 1))
+                            {
+                                if (visited.insert(call).second) work.push_back(call);
+                                break;
+                            }
                         }
+                    if (unknownPointerResultMayReach && passedTrackedValue
+                        && (!callee || callee->isDeclaration())
+                        && TypeHoldsPointer(call->getType())) return true;
                     continue;
                 }
                 if (llvm::isa<llvm::GetElementPtrInst>(inst) || llvm::isa<llvm::BitCastInst>(inst)
@@ -2974,7 +3013,8 @@ bool LLVMBackend::ValueMayReachReturn(const llvm::Value* root, int depth)
                     if (visited.insert(inst).second) work.push_back(inst);
                     continue;
                 }
-                continue;   // ptrtoint, a read, anything unmodelled: no proof, so accept
+                if (unknownPointerResultMayReach) return true;
+                continue;
             }
         }
         return false;
@@ -4531,8 +4571,26 @@ bool LLVMBackend::HoistOwnedStringTempTo(llvm::Value* value, llvm::BasicBlock* h
     }
 
 void LLVMBackend::FlushOwnedTempsSince(const OwnedTempMark& mark, llvm::Value* keep,
-                                       llvm::BasicBlock* hoistTo)
+                                       llvm::BasicBlock* hoistTo,
+                                       bool preserveReturnedPtrTemps)
 {
+        // Conditional-slot arm temps of a nested join are keyed to the arm they were born in, which
+        // does not dominate the outer join: re-key them (null-initialized) to `hoistTo`.
+        if (hoistTo != nullptr)
+            if (auto* hoistTerm = cflat_llvm::GetTerminatorOrNull(hoistTo))
+                for (size_t i = mark.Ptrs; i < pendingOwnedPtrTemps.size(); ++i)
+                {
+                    auto& t = pendingOwnedPtrTemps[i];
+                    if (t.ConditionalSlot == nullptr || t.Block == hoistTo) continue;
+                    auto* slot = llvm::dyn_cast<llvm::AllocaInst>(t.ConditionalSlot);
+                    if (slot == nullptr || slot->getParent() != &slot->getFunction()->getEntryBlock())
+                        continue;
+                    llvm::IRBuilderBase::InsertPointGuard guard(*builder);
+                    builder->SetInsertPoint(hoistTerm);
+                    builder->CreateStore(llvm::ConstantPointerNull::get(
+                        llvm::cast<llvm::PointerType>(slot->getAllocatedType())), slot);
+                    t.Block = hoistTo;
+                }
         // String temps registered in the branch are SSA values the join cannot name; re-home them
         // to `hoistTo` as alloca-backed struct temps so a joined value derived from one (a
         // `.data()` pointer) is not left dangling by an early free.
@@ -4612,7 +4670,10 @@ void LLVMBackend::FlushOwnedTempsSince(const OwnedTempMark& mark, llvm::Value* k
         std::vector<PendingOwnedPtrTemp> ptrTemps;
         for (size_t i = mark.Ptrs; i < pendingOwnedPtrTemps.size(); ++i)
             if (pendingOwnedPtrTemps[i].ConditionalSlot == nullptr
-                && pendingOwnedPtrTemps[i].Value != keep)
+                && pendingOwnedPtrTemps[i].Value != keep
+                && !(preserveReturnedPtrTemps
+                    && ValueMayReachReturn(pendingOwnedPtrTemps[i].Value, 0,
+                                           /*unknownPointerResultMayReach=*/true, keep)))
                 ptrTemps.push_back(pendingOwnedPtrTemps[i]);
 
         TrimOwnedTempsSince(pendingOwnedStringTemps,  mark.Strings,  keep, pairValue);
@@ -4639,13 +4700,21 @@ void LLVMBackend::FlushOwnedTempsSince(const OwnedTempMark& mark, llvm::Value* k
         for (auto& h : hoisted) pendingOwnedStructTemps.push_back(h);
     }
 
-void LLVMBackend::FlushConditionalPtrTempsSince(size_t from)
+void LLVMBackend::FlushConditionalPtrTempsSince(size_t from,
+                                               bool preserveReturnedPtrTemps,
+                                               llvm::Value* pendingReturnValue)
 {
         std::vector<PendingOwnedPtrTemp> temps;
         size_t write = from;
         for (size_t i = from; i < pendingOwnedPtrTemps.size(); ++i)
             if (pendingOwnedPtrTemps[i].ConditionalSlot != nullptr)
-                temps.push_back(pendingOwnedPtrTemps[i]);
+            {
+                if (!(preserveReturnedPtrTemps
+                    && ValueMayReachReturn(pendingOwnedPtrTemps[i].Value, 0,
+                                           /*unknownPointerResultMayReach=*/true,
+                                           pendingReturnValue)))
+                    temps.push_back(pendingOwnedPtrTemps[i]);
+            }
             else
                 pendingOwnedPtrTemps[write++] = pendingOwnedPtrTemps[i];
         if (from < pendingOwnedPtrTemps.size()) pendingOwnedPtrTemps.resize(write);

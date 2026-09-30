@@ -1819,14 +1819,24 @@ namespace cflat_cinterop
                             const ASTRecordLayout& nestedLayout = ctx.getASTRecordLayout(anon);
                             nested.sizeBytes = nestedLayout.getSize().getQuantity();
                             nested.alignBytes = nestedLayout.getAlignment().getQuantity();
-                            st.out.records.push_back(std::move(nested));
-
                             RawField fe;
                             fe.name = "__anon" + std::to_string(idx);
                             fe.ctype = (isUnion ? "union " : "struct ") + synTag;
                             fe.offsetBytes = layout.getFieldOffset(f->getFieldIndex()) / 8;
                             RecordRawFieldLayout(f->getType(), fe);
                             rec.fields.push_back(std::move(fe));
+                            const uint64_t anonOffset = layout.getFieldOffset(f->getFieldIndex()) / 8;
+                            for (const RawField& child : nested.fields)
+                            {
+                                if (child.name.empty() || !child.isZeroSize
+                                    || (child.ctype.find("[]") == std::string::npos
+                                        && child.ctype.find("[0]") == std::string::npos))
+                                    continue;
+                                RawField promoted = child;
+                                promoted.offsetBytes += anonOffset;
+                                rec.fields.push_back(std::move(promoted));
+                            }
+                            st.out.records.push_back(std::move(nested));
                         }
                         continue;  // unnamed non-bitfield non-anon: nothing to record
                     }
@@ -1834,6 +1844,8 @@ namespace cflat_cinterop
                     RawField rf;
                     rf.name = f->getNameAsString();
                     rf.access = MapAccess(f->getAccess());
+                    rf.isConst = f->getType().isConstQualified();
+                    rf.isMutable = f->isMutable();
                     // A zero-length or flexible array occupies no bytes; cflat has no 0-extent
                     // array, so it must ride the zero-size layout path.
                     const auto* constArr = ctx.getAsConstantArrayType(f->getType());

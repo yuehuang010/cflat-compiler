@@ -227,6 +227,7 @@
 //     list/dictionary values are not destroyed, unique list values are, and Box<T> stores T*.
 
 import cpp "library/cpp_interop_basic.h";
+import cpp "library/cpp_interop_explicit.h";
 import cpp "library/cpp_interop_refgate.h";
 import cpp "library/cpp_interop_basic.cpp";
 import cpp "library/cpp_interop_member_shadow.h";
@@ -256,6 +257,13 @@ import "library/cpp_interop_globals.cb";
 import cpp "library/cpp_interop_usingns.h";
 // The same using-declarations again from a second header: same entity, no conflict.
 import cpp "library/cpp_interop_usingns_again.h";
+// Forward/definition, template redeclaration, and specialization forms accepted by clang.
+// Separate lines: a grouped import registers one file and never reaches the conflict check.
+import cpp "library/cpp_interop_c2_accept_a.h";
+import cpp "library/cpp_interop_c2_accept_b.h";
+// Importing the exact same header twice must retain the existing entity.
+import cpp "library/cpp_interop_c2_repeat.h";
+import cpp "library/cpp_interop_c2_repeat.h";
 // A C++ CONSTRUCTOR parameter declared `T&` binds the argument's address.
 import cpp "library/cpp_interop_ctorref.h";
 import cpp "library/cpp_interop_varctor.h";
@@ -303,6 +311,23 @@ struct CppResultBox<T> { T item = default; };
 struct CppListValue { int value = 0; };
 struct CppAssignHost { cppas.Life l = cppas.Life(1); std.string s; };
 struct CppTallyHost { cppas.Tally t = default; };
+struct CppAssignRouteHost { cppas.AssignRouteTrivial item; };
+cppas.AssignRouteTrivial cppAssignRouteGlobal = default;
+cppas.Tally cppAssignTallyGlobal = default;
+cppas.AssignRouteNontrivial cppAssignNontrivialGlobal = default;
+cppas.AssignRouteByValue cppAssignByValueGlobal = default;
+cppas.AssignRouteOther cppAssignOtherGlobal = default;
+cppas.AssignRouteOtherRef cppAssignOtherRefGlobal = default;
+cppas.AssignRouteRegister cppAssignRegisterGlobal = default;
+cppas.AssignRoutePair16 cppAssignPair16Global = default;
+cppas.AssignRoutePairDouble cppAssignPairDoubleGlobal = default;
+cppas.AssignRouteLarge cppAssignLargeGlobal = default;
+cppas.AssignRouteVoid cppAssignVoidGlobal = default;
+cppas.AssignRouteScalarReturn cppAssignScalarReturnGlobal = default;
+cppas.AssignRouteRegister cppAssignRegisterReturn()
+{
+    return (cppAssignRegisterGlobal = 7);
+}
 import cpp "library/cpp_interop_fnptr.h";
 
 // A C++ exception unwinding THROUGH CFlat frames (the C++ `guarded` catch sits above them): every
@@ -1259,6 +1284,10 @@ int CppuDeclTakesAliasEC(cppu_decl_a.EC e) { return (int)e; }
 // CFlat-spelled types carry no const: a const C++ result passed through these ranks as `T*`.
 cppi.MtConstObj* mtConstPass(cppi.MtConstObj* p) { return p; }
 T mtConstIdent<T>(T value) { return value; }
+int crCallGet(cppi.CrPair* p) { return p->get(); }
+cppi.MtNoCopy mtNoCopyReturn(cppi.MtNoCopy value)
+{ return value; }
+long CtorExprReturn(long* p) { return cppcr.ExprConstRW(*p, p).v; }
 
 extern int main()
 {
@@ -1378,6 +1407,13 @@ extern int main()
     if (sizeof(cppi.NuaBitfield) != cppi.nua_size_bitfield())           return 7873;
     nuaBits = cppi.nua_make_bitfield(6, 77);
     if (nuaBits.bits != 6 || nuaBits.later != 77)                       return 7874;
+    cppi.NuaBitBetween nuaBetween = default;
+    nuaBetween.a = 5; nuaBetween.b = 6; nuaBetween.y = 321;
+    if (cppi.nua_bit_between_read(&nuaBetween) != 56321
+        || (int)sizeof(cppi.NuaBitBetween) != cppi.nua_bit_between_size()
+        || (int)((char*)&nuaBetween.y - (char*)&nuaBetween) != cppi.nua_bit_between_y_offset()) return 7880;
+    nuaBetween = cppi.nua_make_bit_between();
+    if (nuaBetween.a != 5 || nuaBetween.b != 6 || nuaBetween.y != 321) return 7881;
     cppi.NuaBitUnits nuaUnits = cppi.nua_make_bit_units();
     if (nuaUnits.a != 999999 || nuaUnits.b != 7 || nuaUnits.g != -2
         || nuaUnits.c != 100)                                           return 7875;
@@ -3260,6 +3296,83 @@ extern int main()
     if (bitsSame.second != cppi.bits_same_second(&bitsSame)) return 1677;
     if (bitsSame.third != cppi.bits_same_third(&bitsSame)) return 1678;
 
+    cppi.BytePackAfterChar bytePackChar = cppi.byte_pack_after_char_make();
+    if (bytePackChar.a != 5 || bytePackChar.b != 6000 || bytePackChar.c != 71 || bytePackChar.d != 101
+        || cppi.byte_pack_after_char_read(&bytePackChar) != 56000811
+        || (int)sizeof(cppi.BytePackAfterChar) != cppi.byte_pack_after_char_size()
+        || (int)alignof(cppi.BytePackAfterChar) != cppi.byte_pack_after_char_align()
+        || (int)((char*)&bytePackChar.c - (char*)&bytePackChar) != cppi.byte_pack_after_char_c_offset()) return 1686;
+    bytePackChar.a = 2; bytePackChar.b = 100; bytePackChar.c = 41; bytePackChar.d = 55;
+    if (cppi.byte_pack_after_char_read(&bytePackChar) != 20100465) return 1687;
+
+    cppi.BytePackBeforeShort bytePackShort = cppi.byte_pack_before_short_make();
+    if (bytePackShort.x != 77 || bytePackShort.a != 5 || bytePackShort.b != 99 || bytePackShort.s != 1234
+        || cppi.byte_pack_before_short_read(&bytePackShort) != 77600234
+        || (int)sizeof(cppi.BytePackBeforeShort) != cppi.byte_pack_before_short_size()
+        || (int)alignof(cppi.BytePackBeforeShort) != cppi.byte_pack_before_short_align()
+        || (int)((char*)&bytePackShort.s - (char*)&bytePackShort) != cppi.byte_pack_before_short_s_offset()) return 1688;
+    bytePackShort.a = 1; bytePackShort.b = 2; bytePackShort.s = 300;
+    if (cppi.byte_pack_before_short_read(&bytePackShort) != 77102300) return 1689;
+
+    cppi.BytePackAfterCharOnly bytePackOnly = cppi.byte_pack_after_char_only_make();
+    if (bytePackOnly.c != 71 || bytePackOnly.a != 3
+        || cppi.byte_pack_after_char_only_read(&bytePackOnly) != 713
+        || (int)sizeof(cppi.BytePackAfterCharOnly) != cppi.byte_pack_after_char_only_size()
+        || (int)alignof(cppi.BytePackAfterCharOnly) != cppi.byte_pack_after_char_only_align()
+        || (int)((char*)&bytePackOnly.c - (char*)&bytePackOnly) != cppi.byte_pack_after_char_only_c_offset()) return 1690;
+    bytePackOnly.c = 12; bytePackOnly.a = 1;
+    if (cppi.byte_pack_after_char_only_read(&bytePackOnly) != 121) return 1691;
+
+    cppi.ByteRun24After byteRun24 = cppi.byte_run24_make();
+    if (byteRun24.a != 0x654321 || byteRun24.c != 71
+        || cppi.byte_run24_read(&byteRun24) != 0x654321 * 100 + 71
+        || cppi.byte_run24_byval(byteRun24) != 0x654321 * 100 + 71
+        || (int)sizeof(cppi.ByteRun24After) != cppi.byte_run24_size()
+        || (int)alignof(cppi.ByteRun24After) != cppi.byte_run24_align()
+        || (int)((char*)&byteRun24.c - (char*)&byteRun24) != cppi.byte_run24_c_offset()) return 1692;
+    byteRun24.a = 0x123456; byteRun24.c = 42;
+    if (cppi.byte_run24_read(&byteRun24) != 0x123456 * 100 + 42) return 1693;
+
+    cppi.ByteRun40After byteRun40 = cppi.byte_run40_make();
+    if (byteRun40.a != 123456789 || byteRun40.c != 71
+        || cppi.byte_run40_read(&byteRun40) != 123456789L * 100 + 71
+        || cppi.byte_run40_byval(byteRun40) != 123456789L * 100 + 71
+        || (int)sizeof(cppi.ByteRun40After) != cppi.byte_run40_size()
+        || (int)alignof(cppi.ByteRun40After) != cppi.byte_run40_align()
+        || (int)((char*)&byteRun40.c - (char*)&byteRun40) != cppi.byte_run40_c_offset()) return 1694;
+    byteRun40.a = 76543210; byteRun40.c = 42;
+    if (cppi.byte_run40_read(&byteRun40) != 76543210L * 100 + 42) return 1695;
+
+    cppi.ByteRun12AfterChar byteRun12 = cppi.byte_run12_make();
+    if (byteRun12.c != 71 || byteRun12.a != 3000
+        || cppi.byte_run12_read(&byteRun12) != 71 * 10000 + 3000
+        || cppi.byte_run12_byval(byteRun12) != 71 * 10000 + 3000
+        || (int)sizeof(cppi.ByteRun12AfterChar) != cppi.byte_run12_size()
+        || (int)alignof(cppi.ByteRun12AfterChar) != cppi.byte_run12_align()) return 1696;
+    byteRun12.c = 42; byteRun12.a = 1234;
+    if (cppi.byte_run12_read(&byteRun12) != 42 * 10000 + 1234) return 1697;
+
+    cppi.ByteRun20AfterChar byteRun20 = cppi.byte_run20_make();
+    if (byteRun20.c != 71 || byteRun20.a != 500000
+        || cppi.byte_run20_read(&byteRun20) != 71 * 10000000 + 500000
+        || cppi.byte_run20_byval(byteRun20) != 71 * 10000000 + 500000
+        || (int)sizeof(cppi.ByteRun20AfterChar) != cppi.byte_run20_size()
+        || (int)alignof(cppi.ByteRun20AfterChar) != cppi.byte_run20_align()) return 1698;
+    byteRun20.c = 42; byteRun20.a = 123456;
+    if (cppi.byte_run20_read(&byteRun20) != 42 * 10000000 + 123456) return 1699;
+
+    cppi.ByteRun40WithTail byteRunTail = cppi.byte_run40_tail_make();
+    if (byteRunTail.a != 123456789 || byteRunTail.c != 71 || byteRunTail.x != 55 || byteRunTail.d != 2.5
+        || cppi.byte_run40_tail_read(&byteRunTail) != 123456789L * 1000000 + 71 * 10000 + 55 * 100 + 25
+        || cppi.byte_run40_tail_byval(byteRunTail) != 123456789L * 1000000 + 71 * 10000 + 55 * 100 + 25
+        || (int)sizeof(cppi.ByteRun40WithTail) != cppi.byte_run40_tail_size()
+        || (int)alignof(cppi.ByteRun40WithTail) != cppi.byte_run40_tail_align()
+        || (int)((char*)&byteRunTail.c - (char*)&byteRunTail) != cppi.byte_run40_tail_c_offset()
+        || (int)((char*)&byteRunTail.x - (char*)&byteRunTail) != cppi.byte_run40_tail_x_offset()
+        || (int)((char*)&byteRunTail.d - (char*)&byteRunTail) != cppi.byte_run40_tail_d_offset()) return 1700;
+    byteRunTail.a = 76543210; byteRunTail.c = 42; byteRunTail.x = 33; byteRunTail.d = 1.5;
+    if (cppi.byte_run40_tail_read(&byteRunTail) != 76543210L * 1000000 + 42 * 10000 + 33 * 100 + 15) return 1701;
+
     // ---- unnamed zero-width bitfields close the allocation unit ---------------------------------
     cppi.ZeroWidthSame zerowidthSame = default;
     zerowidthSame.first = 5;
@@ -3658,6 +3771,13 @@ extern int main()
     if (cppu_decl_a.decl_counter != 61)                           return 7852;
     if (cppu_decl_a.ov(2.5) != 3)                                 return 7853;
     if (cppu_decl_a.ov(7) != 2)                                   return 7854;
+    if (c2accept.forward_class_value() != 41)                      return 7990;
+    if (c2accept.forward_template_value() != 42)                    return 7991;
+    if (c2accept.redeclared_template_value() != 43)                  return 7992;
+    if (c2accept.specialization_value() != 44)                       return 7993;
+    if (c2accept.identical_template_value() != 46)                   return 7995;
+    if (c2accept.partial_specialization_value() != 47)                return 7996;
+    if (c2repeat.value() != 45)                                      return 7994;
     // A class re-exported by both imports is one entity too: no conflict, one type.
     cppu_decl_a.Box againBox = default;
     againBox.v = 7;
@@ -3893,6 +4013,34 @@ extern int main()
     long ctorrefExprL = 5;
     int ctorrefExprV = cppcr.ExprLongRef(ctorrefExprL).v;
     if (ctorrefExprV != 5 || ctorrefExprL != 99) return 7134;
+    // Expression-position constructor thunks keep an exact scalar lvalue's address. Fields,
+    // dereferences, and array elements all discriminate aliasing by the constructor's write.
+    long ctorrefExprField = 5;
+    if (cppcr.ExprConstRW(ctorrefExprField, &ctorrefExprField).v != 9
+        || ctorrefExprField != 9) return 7170;
+    long ctorrefExprDerefValue = 5;
+    long* ctorrefExprDeref = &ctorrefExprDerefValue;
+    if (cppcr.ExprConstRW(*ctorrefExprDeref, ctorrefExprDeref).v != 9
+        || ctorrefExprDerefValue != 9) return 7171;
+    long[2] ctorrefExprArray = { 3, 5 };
+    if (cppcr.ExprConstRW(ctorrefExprArray[1], &ctorrefExprArray[1]).v != 9
+        || ctorrefExprArray[1] != 9 || ctorrefExprArray[0] != 3) return 7172;
+    long ctorrefExprMut = 5;
+    if (cppcr.ExprMutRW(ctorrefExprMut, &ctorrefExprMut).v != 9
+        || ctorrefExprMut != 12) return 7173;
+    long ctorrefExprCall = 5;
+    if (cppcr.expr_arg_seen(cppcr.ExprConstRW(ctorrefExprCall, &ctorrefExprCall)) != 9
+        || ctorrefExprCall != 9) return 7174;
+    long ctorrefExprReturn = 5;
+    if (CtorExprReturn(&ctorrefExprReturn) != 9 || ctorrefExprReturn != 9) return 7177;
+    int ctorrefExprNarrow = 5;
+    long ctorrefExprMarker = 5;
+    if (cppcr.ExprConvertedRef(ctorrefExprNarrow, &ctorrefExprMarker).v != 5
+        || ctorrefExprMarker != 9
+        || ctorrefExprNarrow != 5) return 7175;
+    // An integer literal is a prvalue for rvalue-reference binding.
+    cppcr.ExprIntRvalue ctorrefExprInt = cppcr.ExprIntRvalue(23);
+    if (ctorrefExprInt.chosen != 1 || ctorrefExprInt.value != 23) return 7176;
     // `long` is not `long long`: the reference candidate drops and `double` wins (the wrapper
     // converts a by-value pick, as it always did); the pre-fix listed pick bound `long long&`.
     long ctorrefLL = 15;
@@ -4033,6 +4181,30 @@ extern int main()
     if (cppcr.BrcNt<long>(1, {2, 3}).which != 1)                            return 7183;
     if (cppcr.BrcPack<long>({brcA, brcB}).which != 2
         || cppcr.BrcPack<long>({2.5, 1.5}).which != 1)                      return 7184;
+    long brcPackLong = 5;
+    if (cppcr.BrcPackConstRef<long>({2, 3}, brcPackLong).which != 2)      return 7299;
+    // Forwarding and non-const lvalue packs stay refused until generated wrappers can preserve
+    // their category; const A&... remains rankable from its declared parameter pattern.
+    int brcPackArg = 5;
+    expect_error("passes an argument into a parameter pack") {
+        cppcr.BrcPackFwd<long>({2, 3}, brcPackArg);
+    }
+    expect_error("passes an argument into a parameter pack") {
+        cppcr.BrcPackFwd<long>({2, 3}, 5);
+    }
+    // The A&... pack cannot bind this temporary; clang picks the long overload.
+    expect_error("passes an argument into a parameter pack") {
+        cppcr.BrcPackLRef<long>({2, 3}, 5);
+    }
+    // clang picks the pair<U, A>... template (2); refused, never the silent sibling pick (1).
+    expect_error("passes an argument into a parameter pack") {
+        auto brcPair = cppcr.brc_pack_pair();
+        cppcr.BrcPackPair<long>({2, 3}, 7, brcPair);
+    }
+    expect_error("passes an argument into a parameter pack") {
+        auto brcArr = cppcr.brc_pack_arr();
+        cppcr.BrcPackArr<long>({2, 3}, brcArr);
+    }
     // Integer literals into a backed double list, and a copying list (clang: 12, 23).
     if (cppcr.brc_ild_sum({1, 2}) != 12.0 || cppcr.brc_vec({2, 3}) != 23)   return 7186;
     // Brace backing in loop and ternary control flow stays in the caller entry block. The nested
@@ -4047,6 +4219,69 @@ extern int main()
                             : cppcr.brc_read_a(cppcr.brc_keep_a({4, 4}));
     if (brcTernaryThen != 32 || brcTernaryElse != 42)                     return 7188;
     if (cppcr.brc_two_sum({1, 2}, {3, 4}) != 1234)                         return 7189;
+    // Function-template initializer_list deduction keeps its array in the CFlat caller frame.
+    if (cppcr.brc_read_p(cppcr.brc_template_keep({brcA, brcB})) != 35)     return 7220;
+    if (cppcr.brc_read_one(cppcr.brc_template_keep({brcB})) != 5)         return 7221;
+    if (cppcr.brc_template_copy({brcA, brcB}) != 35
+        || cppcr.brc_template_copy({2, 3}) != 23
+        || cppcr.brc_template_copy({brcB}) != 55)                          return 7222;
+    cppcr.BrcTemplateElement brcTplElemA = cppcr.BrcTemplateElement(4);
+    cppcr.BrcTemplateElement brcTplElemB = cppcr.BrcTemplateElement(6);
+    int brcTplElemMade = cppcr.brc_template_element_made();
+    int brcTplElemGone = cppcr.brc_template_element_gone();
+    int brcTplElemValue = cppcr.brc_template_class_read(
+        cppcr.brc_template_keep({brcTplElemA, brcTplElemB}));
+    if (brcTplElemValue != 46
+        || cppcr.brc_template_element_made() - brcTplElemMade != 2
+        || cppcr.brc_template_element_gone() - brcTplElemGone != 2)         return 7226;
+    if (cppcr.brc_template_class_copy({brcTplElemA, brcTplElemB}) != 46)  return 7228;
+    int brcConvertSourceMade = cppcr.brc_convert_source_made();
+    int brcConvertSourceGone = cppcr.brc_convert_source_gone();
+    int brcConvertTargetMade = cppcr.brc_convert_target_made();
+    int brcConvertTargetGone = cppcr.brc_convert_target_gone();
+    int brcConvertKeep = 0;
+    {
+        brcConvertKeep = cppcr.brc_convert_read(cppcr.brc_convert_keep({
+            cppcr.BrcConvertSource(4), cppcr.BrcConvertSource(6)}));
+    }
+    if (brcConvertKeep != 156
+        || cppcr.brc_convert_source_made() - brcConvertSourceMade != 2
+        || cppcr.brc_convert_source_gone() - brcConvertSourceGone != 2
+        || cppcr.brc_convert_target_made() - brcConvertTargetMade != 2
+        || cppcr.brc_convert_target_gone() - brcConvertTargetGone != 2)      return 7223;
+    brcConvertSourceMade = cppcr.brc_convert_source_made();
+    brcConvertSourceGone = cppcr.brc_convert_source_gone();
+    brcConvertTargetMade = cppcr.brc_convert_target_made();
+    brcConvertTargetGone = cppcr.brc_convert_target_gone();
+    int brcConvertCopy = 0;
+    {
+        brcConvertCopy = cppcr.brc_convert_copy({cppcr.BrcConvertSource(4),
+                                                  cppcr.BrcConvertSource(6)});
+    }
+    if (brcConvertCopy != 16
+        || cppcr.brc_convert_source_made() - brcConvertSourceMade != 2
+        || cppcr.brc_convert_source_gone() - brcConvertSourceGone != 2
+        || cppcr.brc_convert_target_made() - brcConvertTargetMade != 2
+        || cppcr.brc_convert_target_gone() - brcConvertTargetGone != 2)  return 7224;
+    brcConvertSourceMade = cppcr.brc_convert_source_made();
+    brcConvertSourceGone = cppcr.brc_convert_source_gone();
+    brcConvertTargetMade = cppcr.brc_convert_target_made();
+    brcConvertTargetGone = cppcr.brc_convert_target_gone();
+    int brcConvertOne = 0;
+    {
+        brcConvertOne = cppcr.brc_convert_read_one(cppcr.brc_convert_keep({
+            cppcr.BrcConvertSource(7)}));
+    }
+    if (brcConvertOne != 17
+        || cppcr.brc_convert_source_made() - brcConvertSourceMade != 1
+        || cppcr.brc_convert_source_gone() - brcConvertSourceGone != 1
+        || cppcr.brc_convert_target_made() - brcConvertTargetMade != 1
+        || cppcr.brc_convert_target_gone() - brcConvertTargetGone != 1)   return 7229;
+    if (cppcr.BrcPack<long>({2, 3}, 5).which != 2)                         return 7225;
+    if (cppcr.BrcPackView<long>({2, 3}, 5).probe() != 25
+        || cppcr.BrcPackCopy<long>({2, 3}, 5).probe() != 23
+        || cppcr.BrcPackView<long>({2}, 5).probe_one() != 4
+        || cppcr.BrcPackCopy<long>({2}, 5).probe() != 2)                  return 7227;
     // Different class list targets collide as cache neighbours; clang: 225 in either order.
     if (cppcr.brc_two_diff({1, 2}, {1.5, 2.5}) != 225)                    return 7190;
     if (cppcr.brc_two_diff_rev({1.5, 2.5}, {1, 2}) != 225)                return 7191;
@@ -4499,6 +4734,158 @@ extern int main()
     cppexp.ConvDirectNx convDn = default;
     convDn = 8;
     if (convDn.v != 8 || convDn.via != 3 || convDn.calls != 1)                 return 22361;
+    // Declared operator=(int) must win before trivial-record aggregate storage, at every
+    // addressable destination spelling covered by the shared assignment path.
+    cppas.AssignRouteTrivial.assigns = 0;
+    cppas.AssignRouteTrivial routeLocal = default;
+    routeLocal = 11;
+    if (routeLocal.v_ != 11 || cppas.AssignRouteTrivial.assigns != 1)           return 22362;
+    cppAssignRouteGlobal = 12;
+    if (cppAssignRouteGlobal.v_ != 12 || cppas.AssignRouteTrivial.assigns != 2) return 22363;
+    cppas.assignRouteNamespaceGlobal = 13;
+    if (cppas.assignRouteNamespaceGlobal.v_ != 13
+        || cppas.AssignRouteTrivial.assigns != 3)                               return 22364;
+    CppAssignRouteHost routeHost = default;
+    routeHost.item = 14;
+    CppAssignRouteHost* routeHostPtr = &routeHost;
+    routeHostPtr->item = 15;
+    if (routeHost.item.v_ != 15 || cppas.AssignRouteTrivial.assigns != 5)       return 22365;
+    cppas.AssignRouteTrivial* routePtr = &routeLocal;
+    *routePtr = 16;
+    cppas.AssignRouteTrivial[2] routeArray = default;
+    routeArray[1] = 17;
+    if (routeLocal.v_ != 16 || routeArray[1].v_ != 17
+        || cppas.AssignRouteTrivial.assigns != 7)                               return 22366;
+    int routeValueResult = (routeLocal = 18).v_;
+    if (routeValueResult != 18 || routeLocal.v_ != 18
+        || cppas.AssignRouteTrivial.assigns != 8)                               return 22367;
+    long routeLong = 5;
+    expect_error("cast the source to 'int' to call it") { routeLocal = routeLong; }
+    // A global nontrivial class with both overloads must call operator=(int), with no temp/copy.
+    cppas.Tally.reset();
+    cppAssignTallyGlobal = 9;
+    if (cppAssignTallyGlobal.value() != 9 || cppas.Tally.assigns != 1
+        || cppas.Tally.copy_assigns != 0 || cppas.Tally.ctors != 0
+        || cppas.Tally.copies != 0 || cppas.Tally.moves != 0 || cppas.Tally.dtors != 0)
+        return 22368;
+    _ = move cppAssignTallyGlobal;
+    cppas.Tally.reset();
+    cppAssignTallyGlobal = 10;
+    if (cppAssignTallyGlobal.value() != 10 || cppas.Tally.assigns != 1
+        || cppas.Tally.copy_assigns != 0 || cppas.Tally.ctors != 1
+        || cppas.Tally.copies != 0 || cppas.Tally.moves != 0 || cppas.Tally.dtors != 0)
+        return 223681;
+    cppas.AssignRouteNontrivial.reset();
+    cppAssignNontrivialGlobal = 19;
+    if (cppAssignNontrivialGlobal.value() != 19
+        || cppas.AssignRouteNontrivial.assigns != 1
+        || cppas.AssignRouteNontrivial.copy_assigns != 0
+        || cppas.AssignRouteNontrivial.ctors != 0
+        || cppas.AssignRouteNontrivial.copies != 0
+        || cppas.AssignRouteNontrivial.dtors != 0)                                 return 22369;
+    cppas.AssignRouteNontrivial.reset();
+    int routeAssignExpression = (cppAssignNontrivialGlobal = 20).value();
+    if (routeAssignExpression != 20 || cppas.AssignRouteNontrivial.assigns != 1
+        || cppas.AssignRouteNontrivial.copy_assigns != 0
+        || cppas.AssignRouteNontrivial.ctors != 0
+        || cppas.AssignRouteNontrivial.copies != 0
+        || cppas.AssignRouteNontrivial.dtors != 0)                                 return 22370;
+    _ = move cppAssignNontrivialGlobal;
+    cppas.AssignRouteNontrivial.reset();
+    cppAssignNontrivialGlobal = 21;
+    if (cppAssignNontrivialGlobal.value() != 21
+        || cppas.AssignRouteNontrivial.ctors != 1
+        || cppas.AssignRouteNontrivial.assigns != 0
+        || cppas.AssignRouteNontrivial.copy_assigns != 0
+        || cppas.AssignRouteNontrivial.dtors != 0)                                 return 22371;
+    // A global by-value operator= result is destroyed on its live branch for statements and loops.
+    cppas.AssignRouteByValue.reset();
+    cppAssignByValueGlobal = 6;
+    if (cppAssignByValueGlobal.value() != 6 || cppas.AssignRouteByValue.int_assigns != 1
+        || cppas.AssignRouteByValue.copies != 1 || cppas.AssignRouteByValue.dtors != 1
+        || cppas.AssignRouteByValue.ctors != 0)                                    return 22372;
+    cppas.AssignRouteByValue.reset();
+    for (int i = 0; i < 3; i++) cppAssignByValueGlobal = i;
+    if (cppAssignByValueGlobal.value() != 2 || cppas.AssignRouteByValue.int_assigns != 3
+        || cppas.AssignRouteByValue.copies != 3 || cppas.AssignRouteByValue.dtors != 3)
+        return 22373;
+    // The value form uses operator=(int) and retires the returned copy exactly once.
+    cppas.AssignRouteByValue.reset();
+    int byValueGlobalResult = (cppAssignByValueGlobal = 5).value();
+    if (byValueGlobalResult != 5 || cppas.AssignRouteByValue.int_assigns != 1
+        || cppas.AssignRouteByValue.copies != 1 || cppas.AssignRouteByValue.dtors != 1)
+        return 22374;
+    // A never-released global needs no default ctor on the unreachable reconstruction path.
+    cppas.AssignRouteNoDefault.int_assigns = 0;
+    cppas.assignRouteNoDefaultGlobal = 5;
+    if (cppas.assignRouteNoDefaultGlobal.v_ != 5
+        || cppas.AssignRouteNoDefault.int_assigns != 1)
+        return 22375;
+    // A global's value form yields the operator's own result, here a separate object: the
+    // by-value one is constructed once and destroyed once at the full-expression end (clang).
+    cppas.AssignRouteOther.reset();
+    int otherGlobalResult = (cppAssignOtherGlobal = 5).value();
+    if (otherGlobalResult != 95 || cppAssignOtherGlobal.value() != 5
+        || cppas.AssignRouteOther.int_assigns != 1 || cppas.AssignRouteOther.ctors != 1
+        || cppas.AssignRouteOther.copies != 0 || cppas.AssignRouteOther.dtors != 1)
+        return 22376;
+    // Released in a loop: default-constructed then assigned, each result destroyed once.
+    cppas.AssignRouteOther.reset();
+    int otherLoopSum = 0;
+    for (int i = 0; i < 3; i++)
+    {
+        if (i != 1) _ = move cppAssignOtherGlobal;
+        otherLoopSum += (cppAssignOtherGlobal = i).value();
+    }
+    if (otherLoopSum != 273 || cppAssignOtherGlobal.value() != 2
+        || cppas.AssignRouteOther.int_assigns != 3 || cppas.AssignRouteOther.ctors != 5
+        || cppas.AssignRouteOther.copies != 0 || cppas.AssignRouteOther.dtors != 5)
+        return 223761;
+    // A `T&` result that is not the receiver is the value, not the global.
+    int otherRefResult = (cppAssignOtherRefGlobal = 5).value();
+    if (otherRefResult != 95 || cppAssignOtherRefGlobal.value() != 5)             return 22377;
+    cppas.AssignRouteRegister regLocal = default;
+    if ((regLocal = 1).v_ != 99 || (cppAssignRegisterGlobal = 2).v_ != 99)
+        return 22378;
+    cppas.AssignRouteRegister regDeclared = (cppAssignRegisterGlobal = 3);
+    cppas.AssignRouteRegister regReturned = cppAssignRegisterReturn();
+    cppas.AssignRouteRegister regChainA = default, regChainB = default;
+    if (regDeclared.v_ != 99 || regReturned.v_ != 99
+        || (regChainA = (regChainB = 5)).v_ != 99
+        || !((cppAssignRegisterGlobal = 5).v_ == 99))
+        return 22379;
+    cppas.AssignRoutePair16 pair16Local = default;
+    if ((pair16Local = 5).a_ != 96 || (cppAssignPair16Global = 5).a_ != 96)
+        return 223791;
+    cppas.AssignRoutePairDouble pairDoubleLocal = default;
+    if ((pairDoubleLocal = 5).a_ != 95 || (cppAssignPairDoubleGlobal = 5).a_ != 95)
+        return 223792;
+    cppas.AssignRouteLarge largeLocal = default;
+    if ((largeLocal = 5).a_ != 97 || (cppAssignLargeGlobal = 5).a_ != 97)
+        return 223793;
+    cppas.AssignRouteOtherRef refLocal = default;
+    cppas.AssignRouteOtherRef.reset();
+    if ((refLocal = 5).value() != 95 || cppas.AssignRouteOtherRef.copies != 0)
+        return 223794;
+    cppas.AssignRouteOtherRef refDeclared = (refLocal = 6);
+    if (refDeclared.value() != 96 || cppas.AssignRouteOtherRef.copies != 1)
+        return 223795;
+    cppas.AssignRouteOtherRef.reset();
+    cppas.AssignRouteOtherRef refGlobalDeclared = (cppAssignOtherRefGlobal = 8);
+    if (refGlobalDeclared.value() != 98 || cppas.AssignRouteOtherRef.copies != 1)
+        return 223797;
+    cppAssignVoidGlobal = 4;
+    cppas.AssignRouteVoid voidLocal = default;
+    voidLocal = 5;
+    cppAssignScalarReturnGlobal = 6;
+    // Released GVI value construction prefers the converting constructor over operator=.
+    _ = move cppAssignByValueGlobal;
+    cppas.AssignRouteByValue.reset();
+    int releasedByValue = (cppAssignByValueGlobal = 7).value();
+    if (releasedByValue != 7 || cppas.AssignRouteByValue.ctors != 1
+        || cppas.AssignRouteByValue.copies != 1 || cppas.AssignRouteByValue.dtors != 1
+        || cppas.AssignRouteByValue.int_assigns != 0)
+        return 223796;
     // Assignment: temp ctor + move assign (20000 + 5), temp destroyed at the statement end.
     cppexp.conv_reset();
     { cppexp.ConvCnt convA = default; convA = 5; convOut = convA.v; }
@@ -5133,6 +5520,92 @@ extern int main()
         // A default CFlat cannot materialize still takes part: clang calls RkNonConst(int, k).
         if (cppcr.RkNonConst(rkInt).chosen != 5)                     return 31806;
         if (cppcr.RkNonConst(rkLong).chosen != 2)                    return 31807;
+        // Direct declaration ranking keeps the source literal identity; expression ranking is
+        // the same C++ overload set, including an unsuffixed double literal.
+        cppcr.RkNonConst rkDeclared = cppcr.RkNonConst(1);
+        if (rkDeclared.chosen != 5 || cppcr.RkNonConst(1).chosen != 5) return 31815;
+        cppcr.RkFloat rkFloatDeclared = cppcr.RkFloat(1.5);
+        if (rkFloatDeclared.chosen != 1 || cppcr.RkFloat(1.5).chosen != 1) return 31816;
+        if (cppcr.RkFloat(1.5f).chosen != 2)                        return 31817;
+        cppcr.RkNonConst* rkAllocated = new cppcr.RkNonConst(rkInt);
+        if (rkAllocated->chosen != 5)                               return 31818;
+        delete rkAllocated;
+        cppcr.RkNonConst* rkLiteralAllocated = new cppcr.RkNonConst(1);
+        if (rkLiteralAllocated->chosen != 5)                        return 31820;
+        delete rkLiteralAllocated;
+        cppcr.RkFloat* rkFloatAllocated = new cppcr.RkFloat(1.5);
+        if (rkFloatAllocated->chosen != 1)                          return 31819;
+        delete rkFloatAllocated;
+        // `new` must keep literal source identity and ask clang when a listed pick is blocked.
+        cppcr.c6_reset();
+        cppcr.C6N* c6True = new cppcr.C6N(true);
+        cppcr.C6N* c6False = new cppcr.C6N(false);
+        bool c6Bool = true;
+        cppcr.C6N* c6BoolLocal = new cppcr.C6N(c6Bool);
+        if (c6True->chosen != 7 || c6False->chosen != 7 || c6BoolLocal->chosen != 7
+            || cppcr.c6_ctor_calls != 3) return 31821;
+        delete c6True;
+        delete c6False;
+        delete c6BoolLocal;
+        cppcr.c6_reset();
+        cppcr.C6D1* c6D1 = new cppcr.C6D1(3);
+        if (c6D1->chosen != 5 || cppcr.c6_default_calls != 1 || cppcr.c6_ctor_calls != 1)
+            return 31822;
+        delete c6D1;
+        cppcr.c6_reset();
+        cppcr.C6Big c6Big = cppcr.C6Big(7);
+        cppcr.C6H* c6H = new cppcr.C6H(c6Big);
+        if (c6H->chosen != 5 || c6H->value != 7 || cppcr.c6_copy_calls != 0
+            || cppcr.c6_move_calls != 0 || cppcr.c6_default_calls != 1
+            || cppcr.c6_ctor_calls != 1) return 31823;
+        delete c6H;
+        cppcr.c6_reset();
+        cppcr.C6H* c6HTmp = new cppcr.C6H(cppcr.C6Big(8));
+        if (c6HTmp->chosen != 5 || c6HTmp->value != 8 || cppcr.c6_copy_calls != 0
+            || cppcr.c6_move_calls != 0 || cppcr.c6_default_calls != 1
+            || cppcr.c6_ctor_calls != 1) return 31824;
+        delete c6HTmp;
+        cppcr.c6_reset();
+        cppcr.C6NF* c6NF = new cppcr.C6NF(1.5);
+        if (c6NF->chosen != 5 || cppcr.c6_default_calls != 1 || cppcr.c6_ctor_calls != 1)
+            return 31825;
+        delete c6NF;
+        cppcr.c6_reset();
+        double c6Double = 1.5;
+        cppcr.C6NF* c6NFD = new cppcr.C6NF(c6Double);
+        if (c6NFD->chosen != 5 || cppcr.c6_default_calls != 1 || cppcr.c6_ctor_calls != 1)
+            return 31826;
+        delete c6NFD;
+        cppcr.c6_reset();
+        int c6Int = 3;
+        cppcr.C6NF2* c6NF2 = new cppcr.C6NF2(c6Int);
+        if (c6NF2->chosen != 1 || cppcr.c6_ctor_calls != 1) return 31827;
+        delete c6NF2;
+        rv.TT* c6TT = new rv.TT(1.5);
+        double c6TemplateDouble = 1.5;
+        r2.Tm* c6Tm = new r2.Tm(c6TemplateDouble);
+        if (c6TT->chosen != 1 || c6Tm->c != 2) return 31828;
+        delete c6TT;
+        delete c6Tm;
+        // An int argument still picks the int ctor beside a pointer overload.
+        int c6IntAccept = 7;
+        c6r3.D* c6D = new c6r3.D(c6IntAccept);
+        c6r3.Pp* c6Pp = new c6r3.Pp(c6IntAccept);
+        c6r3.Dd* c6Dd = new c6r3.Dd(c6IntAccept);
+        c6r3.Rf* c6Rf = new c6r3.Rf(c6IntAccept);
+        if (c6D->c != 1 || c6Pp->c != 1 || c6Dd->c != 5 || c6Rf->c != 1)
+            return 31829;
+        delete c6D;
+        delete c6Pp;
+        delete c6Dd;
+        delete c6Rf;
+        // Scalar-reference sets resolve through clang (a converted temporary binds).
+        double c6DoubleRef = 1.5;
+        c6r3.Rf* c6Rfd = new c6r3.Rf(c6DoubleRef);
+        c6r3.Rr* c6Rrd = new c6r3.Rr(c6DoubleRef);
+        if (c6Rfd->c != 1 || c6Rrd->c != 1) return 31830;
+        delete c6Rfd;
+        delete c6Rrd;
         // Identity beats conversion in each family.
         if (cppcr.RkLD(rkLong).chosen != 1)                          return 31808;
         if (cppcr.RkLD(rkDouble).chosen != 2)                        return 31809;
@@ -7370,6 +7843,52 @@ extern int main()
         printf("FAIL conditional C++ coalesce leg 3641\n");
         cppConditionalLegFailed = 1;
     }
+    // A C++ const-pointer borrow releases each owning join arm, matching the direct `new` path.
+    cppon.reset();
+    cppon.Esc* cppEscNull = nullptr;
+    int cppBorrowLhs = cppon.escRead(new cppon.Esc(42) ?? cppEscNull);
+    if (cppBorrowLhs != 42 || cppon.clsNew() != 1 || cppon.clsDel() != 1
+        || cppon.dtors() != 1 || cppon.live() != 0) return 3646;
+    cppon.reset();
+    int cppBorrowRhs = cppon.escRead(cppEscNull ?? new cppon.Esc(43));
+    if (cppBorrowRhs != 43 || cppon.clsNew() != 1 || cppon.clsDel() != 1
+        || cppon.dtors() != 1 || cppon.live() != 0) return 3647;
+    cppon.reset();
+    int cppBorrowTern = cppon.escRead(cppArmPick > 0
+        ? new cppon.Esc(44) ?? cppEscNull : cppEscNull);
+    if (cppBorrowTern != 44 || cppon.clsNew() != 1 || cppon.clsDel() != 1
+        || cppon.dtors() != 1 || cppon.live() != 0) return 3648;
+    // A non-const C++ parameter that stores the arm keeps it alive until the caller deletes it.
+    cppon.reset();
+    int cppKeepArm = cppon.escKeepArg(cppArmPick > 0
+        ? new cppon.Esc(45) ?? cppEscNull : cppEscNull);
+    cppon.Esc* cppKeptArm = cppon.escTake();
+    if (cppKeepArm != 45 || cppKeptArm == nullptr || cppKeptArm->v != 45
+        || cppon.clsNew() != 1 || cppon.clsDel() != 0 || cppon.live() != 1) return 3649;
+    delete cppKeptArm;
+    if (cppon.clsDel() != 1 || cppon.dtors() != 1 || cppon.live() != 0) return 3649;
+    // A plain ?: arm has no conditional-slot entry; a C++ borrow must not gate the PHI arm value.
+    // Pins the bare-new arm leak (live 2) filed as p3 mixed-ternary-bare-new-call-arg-leaks.
+    cppon.reset();
+    cppon.Esc* cppPlainFallback = new cppon.Esc(46);
+    int cppPlainBorrow = cppon.escRead(cppArmPick > 0
+        ? new cppon.Esc(47) : cppPlainFallback);
+    if (cppPlainBorrow != 47 || cppon.clsNew() != 2 || cppon.clsDel() != 0
+        || cppon.dtors() != 0 || cppon.live() != 2) return 3650;
+    delete cppPlainFallback;
+    if (cppon.clsDel() != 1 || cppon.dtors() != 1 || cppon.live() != 1) return 3650;
+    // A retaining C++ parameter keeps the selected plain ?: arm until the caller deletes it.
+    cppon.reset();
+    cppPlainFallback = new cppon.Esc(48);
+    int cppPlainKeep = cppon.escKeepArg(cppArmPick > 0
+        ? new cppon.Esc(49) : cppPlainFallback);
+    cppon.Esc* cppPlainKept = cppon.escTake();
+    if (cppPlainKeep != 49 || cppPlainKept == nullptr || cppPlainKept->v != 49
+        || cppon.clsNew() != 2 || cppon.clsDel() != 0 || cppon.dtors() != 0
+        || cppon.live() != 2) return 3651;
+    delete cppPlainKept;
+    delete cppPlainFallback;
+    if (cppon.clsDel() != 2 || cppon.dtors() != 2 || cppon.live() != 0) return 3651;
     if (cppConditionalLegFailed != 0) return 3640;
     // A C++ return of a nontrivially-copyable class with a trivial destructor binds on every call
     // path: the conversion-operator wrapper (UdcStr -> UdcView), the converting-ctor argument
@@ -7502,8 +8021,8 @@ extern int main()
     if (mtcH.mr()->t2(mtShort) != 2 || mtcH.cpv()->t2(mtShort) != 1) return 7958;
     if (cppi.mt_const_cpv()->g(mtShort) != 2 || cppi.mt_const_mcr()->g(mtShort) != 102) return 7947;
     if (mtcK.kind(cppi.mt_const_cpv()) != 2 || mtcK.kind(cppi.mt_const_mcr()) != 1) return 7948;
-    // Flow: `auto` deduces `const T*` as C++ does; a `?:` join takes the composite `const T*`;
-    // a CFlat-spelled type (local, function, generic) has no const, so it ranks as `T*`.
+    // `auto` and a pointer local both retain pointee const; CFlat function and generic
+    // parameters still have no const spelling, so their bodies rank the pointer as `T*`.
     auto mtcAuto = mtcH.cpv();
     if (mtcK.kind(mtcAuto) != 2 || mtcAuto->g(mtShort) != 2) return 7949;
     if (mtcK.tk(mtcAuto) != 61) return 7950;
@@ -7512,7 +8031,7 @@ extern int main()
     bool mtcPick = true;
     if (mtcK.kind(mtcPick ? mtcH.cpv() : mtcH.mr()) != 2) return 7952;
     cppi.MtConstObj* mtcSpelled = mtcH.cpv();
-    if (mtcK.kind(mtcSpelled) != 1 || mtcSpelled->g(mtShort) != 102) return 7953;
+    if (mtcK.kind(mtcSpelled) != 2 || mtcSpelled->g(mtShort) != 2) return 7953;
     if (mtcK.kind(mtConstPass(mtcH.cpv())) != 1) return 7954;
     if (mtcK.kind(mtConstIdent(mtcH.cpv())) != 1) return 7955;
     auto mtcCopy = *mtcAuto;
@@ -7572,12 +8091,71 @@ extern int main()
         return 7974;
     if (cppi.crMixed.f(2.0) != 3 || cppi.crMixed.f(1) != 1 || cppi.crMixed.v != 3) return 7975;
     if (-cppi.crConst != 3 || -cppi.cr_const_ref() != 3 || cppi.crConst.v != 3) return 7976;
+    // A const subobject keeps its own receiver constness even when its parent is mutable.
+    if (-cppi.hcMutable.c != 3 || !cppi.hcMutable.c || cppi.hcMutable.c + 1 != 101
+        || cppi.hcMutable.c.get() != 3) return 7978;
+    const cppi.HC hcLocalConst = default;
+    if (-hcLocalConst.c != 3 || !hcLocalConst.c || hcLocalConst.c + 1 != 101
+        || hcLocalConst.c.get() != 3) return 7982;
+    if (-cppi.hc_ref().c != 3 || !cppi.hc_ref().c || cppi.hc_ref().c + 1 != 101
+        || cppi.hc_ref().c.get() != 3) return 7983;
+    auto hcConstPointer = cppi.hc_ptr();
+    if (-hcConstPointer->c != 3 || !hcConstPointer->c || hcConstPointer->c + 1 != 101
+        || hcConstPointer->c.get() != 3) return 7984;
+    // A const parent does not const-qualify a pointer field's pointee; mutable fields ignore it.
+    const cppi.CrFieldHolder cfhLocal = default;
+    if (cfhLocal.p->only() != 7 || cfhLocal.p->get() != 13
+        || cfhLocal.pc->only() != 7 || cfhLocal.pc->get() != 13
+        || cfhLocal.mu.only() != 7 || cfhLocal.mu.get() != 13 || -cfhLocal.mu != 13)
+        return 7985;
+    if (cppi.crFieldConst.p->only() != 7 || cppi.crFieldConst.p->get() != 13
+        || cppi.crFieldConst.pc->only() != 7 || cppi.crFieldConst.pc->get() != 13
+        || cppi.crFieldConst.mu.only() != 7 || cppi.crFieldConst.mu.get() != 13)
+        return 7986;
+    if (cppi.cr_field_ref().p->only() != 7 || cppi.cr_field_ref().p->get() != 13
+        || cppi.cr_field_ref().pc->only() != 7 || cppi.cr_field_ref().pc->get() != 13
+        || cppi.cr_field_ref().mu.only() != 7 || cppi.cr_field_ref().mu.get() != 13)
+        return 7987;
+    if (cppi.crFieldMutable.p->only() != 7 || cppi.crFieldMutable.p->get() != 13
+        || cppi.crFieldMutable.pc->only() != 7 || cppi.crFieldMutable.pc->get() != 13
+        || cppi.crFieldMutable.mu.only() != 7 || cppi.crFieldMutable.mu.get() != 13)
+        return 7988;
+    auto crAddress = &cppi.crMutable;
+    crAddress = &cppi.cr_const_ref();
+    if (crAddress->get() != 3) return 7979;
+    cppi.crMutable.v = 3;
+    crAddress = cppi.cr_const_ptr();
+    if (crAddress->get() != 3 || cppi.crMutable.v != 3) return 7980;
     // clang: 63 63 73 3 3 (virtual const overload through const& / const* / pure-virtual base).
     if (cppi.cr_vb_ref().get() != 63 || cppi.cr_vb_ptr()->get() != 63 || cppi.cr_abs_ref().get() != 73
         || cppi.crVd.v != 3 || cppi.crImpl.v != 3) return 7977;
+    cppi.crMutable.v = 3;
+    cppi.CrPair* crLocalConstPointee = cppi.cr_const_ptr();
+    auto crCopiedConstPointee = crLocalConstPointee;
+    cppi.CrPair* crAssignedConstPointee = &cppi.crMutable;
+    crAssignedConstPointee = crLocalConstPointee;
+    if (crLocalConstPointee->get() != 3 || crCopiedConstPointee->get() != 3
+        || crAssignedConstPointee->get() != 3 || cppi.crMutable.v != 3) return 7978;
+    crAssignedConstPointee = &cppi.crMutable;
+    // Pointee const is sticky (a C++ `const P*` stays const after reassignment): const pick.
+    if (crAssignedConstPointee->get() != 3 || cppi.crMutable.v != 3) return 7980;
+    // A mutable reassignment on a branch that never runs must not clear the const pick (SIGBUS).
+    auto crBranchConstPointee = cppi.cr_const_ptr();
+    if (cppi.crMutable.v > 100) { crBranchConstPointee = &cppi.crMutable; }
+    if (crBranchConstPointee->get() != 3 || cppi.crMutable.v != 3) return 7981;
+    cppi.crMutable.v = 3;
+    if (crCallGet(crCopiedConstPointee) != 13 || cppi.crMutable.v != 13) return 7979;
     cppi.MtSinkNoCopy mtSink = cppi.MtSinkNoCopy();
     cppi.MtNoCopy mtNoCopy = cppi.MtNoCopy();
     if (mtSink.put(1, move mtNoCopy) != 2) return 7931;
+    cppi.b22ResetMoveCounts();
+    {
+        cppi.MtNoCopy source = cppi.MtNoCopy(17);
+        cppi.MtNoCopy result = mtNoCopyReturn(move source);
+        if (result.value() != 17) return 7932;
+        if (cppi.b22MoveCounts() != 121) return 7933;
+    }
+    if (cppi.b22MoveCounts() != 123) return 7934;
     if (cppi.MtRank.staticPair(mtShort, mtChar) != 1021) return 7909;
     cppi.MtRankDerived mtDerived = cppi.MtRankDerived();
     if (mtDerived.pick(mtShort, mtChar) != 5021) return 7910;
@@ -8004,6 +8582,13 @@ extern int main()
     osF *= 4.0;
     cppi_opspec.OsFv osV = cppi_opspec.OsFv(2.0);
     if (osF.v != 8.0 || (osV * 8.0).get() != 16.0) return 7554;
+    // On-use retries must request the pointee specialization of pointer returns.
+    cppi_retryptr.PtrOwner ptrOwner = cppi_retryptr.PtrOwner(13.0);
+    if (ptrOwner.ptr().get() != 13.0) return 7560;
+    cppi_retryptr.ArrowOwner arrowOwner = cppi_retryptr.ArrowOwner(17.0);
+    if (arrowOwner.get() != 17.0) return 7561;
+    cppi_retryptr.CompoundOwner compoundOwner = cppi_retryptr.CompoundOwner(5.0);
+    if ((compoundOwner *= 3.0).get() != 15.0 || compoundOwner.v != 15.0) return 7562;
     // `c op= move d` binds the rvalue-reference parameter to the moved value, spec or plain return
     // (the source is dead after `move`; the callee stealing from it is oracle-checked in scratch, not readable here).
     cppi_opspec.OsMv osMc = cppi_opspec.OsMv(1.0);
@@ -8090,6 +8675,16 @@ extern int main()
         { cppas.obReset(); cppas.ObSelf a = default; bool f = true; int r = (f ? cppas.obMkSelf(3) : a) ? 1 : 2; if (!(r == 1 && cppas.obHits == 1)) return 31654; }
         { cppas.obReset(); cppas.ObSelfX a = default; cppas.ObSelfX b = default; bool f = false; int r = (f ? a : b) ? 1 : 2; if (!(r == 1 && cppas.obHits == 1)) return 31655; }
         { cppas.obReset(); cppas.ObSelf a = default; cppas.ObSelf b = default; cppas.ObSelf c = default; bool f = false; bool g = false; int r = 0; if (f ? a : g ? b : c) r = 1; if (!(r == 1 && cppas.obHits == 1)) return 31656; }
+        { cppas.obRankLast = 0; cppas.ObRank p = default; long x = p; if (!(x == 9 && cppas.obRankLast == 2)) return 31657; }
+        { cppas.obRankLast = 0; cppas.ObRank p = default; int x = p; if (!(x == 1 && cppas.obRankLast == 1)) return 31658; }
+        { cppas.obRankLast = 0; cppas.ObRank p = default; int r = 0; if (p) r = 1; if (!(r == 1 && cppas.obRankLast == 1)) return 31659; }
+        { cppas.obRankLast = 0; long x = cppas.obRankGlobal; if (!(x == 9 && cppas.obRankLast == 2)) return 31660; }
+        { cppas.obRankLast = 0; cppas.ObRank p = default; long x = cppas.obRankRef(p); if (!(x == 9 && cppas.obRankLast == 2)) return 31661; }
+        { cppas.obRankLast = 0; long x = cppas.obRankMake(); if (!(x == 9 && cppas.obRankLast == 2)) return 31662; }
+        { cppas.obRankLast = 0; bool f = true; long x = f ? cppas.obRankMake() : cppas.obRankMake(); if (!(x == 9 && cppas.obRankLast == 2)) return 31663; }
+        // i32 is the C++ int: operator int is the exact match, never a tie with operator long.
+        { cppas.obRankLast = 0; cppas.ObRankIntLong p = default; i32 x = p; if (!(x == 3 && cppas.obRankLast == 3)) return 31664; }
+        { cppas.obRankLast = 0; cppas.ObRankIntLong p = default; i32 x = 0; x = p; if (!(x == 3 && cppas.obRankLast == 3)) return 31665; }
     }
     // Unary - + ! ~ on a C++ class (legs 31900-31929; header cpp_interop_freeoptpl.h, cppfopun).
     // FREE operators bind in the class's namespace like the binary ones (31900-31911, 31922);
@@ -8166,7 +8761,42 @@ extern int main()
         int ng = -cppfopun.gcm2;
         int nr = -cppfopun.refcm2();
         int bg = !cppfopun.gcm2;
-        if (cppfopun.gcm2.v != 3) return 31927;
+        cppfopun.RV rv = default;
+        int nrCallRef = -rv.crefCN();
+        int trCallRef = ~rv.crefCN();
+        if (nr != 3 || nrCallRef != 1 || trCallRef != 11 || rv.n.v != 3
+            || cppfopun.gcm2.v != 3) return 31927;
+        // Same-type T& / const T& free candidates follow C++ value-category ranking.
+        cppfopun.FRPair pair = default; pair.v = 1;
+        int pairNeg = -pair;
+        if (pairNeg != 102 || pair.v != 2) return 31928;
+        if (-cppfopun.gPairConst != 204) return 31936;
+        int pairTemp = -cppfopun.mkFRPair(3);
+        if (pairTemp != 203) return 31929;
+        cppfopun.FRPair* pairPtr = &pair;
+        int pairDeref = -*pairPtr;
+        if (pairDeref != 103 || pair.v != 3) return 31931;
+        cppfopun.FRPair pairRight = default; pairRight.v = 4;
+        int pairBinary = pair + pairRight;
+        if (pairBinary != 404 || pair.v != 4) return 31932;
+        if (cppfopun.mkFRPair(3) + pairRight != 3004) return 31937;
+        if (cppfopun.gPairConst + pairRight != 4004) return 31938;
+        if (-cppfoputpl.gT != 21 || -cppfoputpl.crefT() != 21) return 31939;
+        cppfopun.B2 b2 = default; cppfopun.B2* b2p = &b2;
+        int b2Paren = -(b2);
+        if (b2Paren != 1 || b2.v != 11) return 31940;
+        b2.v = 1;
+        int b2Deref = -(*b2p);
+        if (b2Deref != 1 || b2.v != 11) return 31941;
+        cppfopun.SQ sq = default; cppfopun.SR sr = default;
+        if (sq + 1 != 101 || sq.v != 11 || sr + 1 != 101 || sr.v != 11) return 31942;
+        if (cppfopun.mkSQ() + 1 != 201 || cppfopun.mkSR() + 1 != 201) return 31943;
+        if (cppfopun.gSQ + 1 != 201 || cppfopun.gSR + 1 != 201) return 31944;
+        cppfopun.BoolBang bang = default;
+        if (!bang != 77) return 31933;
+        cppfopun.MR* mrp = &mr;
+        int mrpResult = ~*mrp;
+        if (mrpResult != 23 || mr.v != 23) return 31935;
     }
     int opMoveRc = OpMoveNontrivialLegs();
     if (opMoveRc != 0) return opMoveRc;

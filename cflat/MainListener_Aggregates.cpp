@@ -1061,7 +1061,7 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
             size_t ctorIndex = 0;
             if (hasGeneratedNoArgCtor)
             {
-                source += "void __cflat_ctor_" + shortName + "_0(" + cxxName + "* dst) noexcept;\n";
+                source += "void __cflat_ctor_" + shortName + "_0(" + cxxName + "* dst);\n";
                 ctorIndex = 1;
             }
             for (auto* func : functionList)
@@ -1095,7 +1095,8 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
                            + (params[i].VariableName.empty()
                               ? "p" + std::to_string(i) : params[i].VariableName);
                 }
-                source += ") noexcept;\n";
+                // Not noexcept: a CFlat constructor body can let a C++ exception through.
+                source += ");\n";
                 if (!valid) break;
                 std::string baseInitializer;
                 if (!baseInitializerFor(func, params, baseInitializer)) break;

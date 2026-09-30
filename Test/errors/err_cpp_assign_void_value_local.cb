@@ -1,0 +1,9 @@
+import cpp "cpp_interop_assign.h";
+extern int main()
+{
+    cppas.AssignRouteVoid a = default;
+    expect_error("returns void, so the assignment has no value") {
+        int value = (a = 1).v_;
+    }
+    return 0;
+}

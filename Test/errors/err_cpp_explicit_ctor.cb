@@ -86,7 +86,7 @@ extern int main()
         int byBoth = cppexp.take_both(5);
     }
     // A free OPERATOR's operand is an argument like any other.
-    expect_error("[operator-] argument 1: C++ constructor 'cppexp.Ex(int)' is declared explicit") {
+    expect_error("[cppexp.operator-] argument 1: C++ constructor 'cppexp.Ex(int)' is declared explicit") {
         cppexp.Ex nine = cppexp.Ex(9);
         int byOperator = nine - 5;
     }

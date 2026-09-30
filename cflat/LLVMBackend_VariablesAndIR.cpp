@@ -656,19 +656,37 @@ bool LLVMBackend::IsCxxConstReferent(llvm::Value* destination) const
         return call != nullptr && call->getMetadata("cflat.cxx.constref") != nullptr;
 }
 
+void LLVMBackend::MarkCxxConstFieldAccess(llvm::Value* fieldAddress)
+{
+        if (auto* inst = llvm::dyn_cast_or_null<llvm::Instruction>(fieldAddress))
+            inst->setMetadata("cflat.cxx.constfield", llvm::MDNode::get(*context, {}));
+}
+
+bool LLVMBackend::IsCxxConstFieldAccess(llvm::Value* fieldAddress) const
+{
+        auto* inst = llvm::dyn_cast_or_null<llvm::Instruction>(fieldAddress);
+        return inst != nullptr && inst->getMetadata("cflat.cxx.constfield") != nullptr;
+}
+
 int LLVMBackend::CxxConstReceiverKind(const NamedVariable& receiver) const
 {
+        const TypeAndValue& t = receiver.TypeAndValue;
+        if (t.IsCxxMutableField && !t.Pointer && !t.IsCxxRefToPointer) return 0;
         for (llvm::Value* v : { receiver.Storage, receiver.Primary })
         {
             if (v == nullptr || !v->getType()->isPointerTy()) continue;
-            if (IsCxxConstReferent(v)) return 3;
-            auto* global = llvm::dyn_cast<llvm::GlobalVariable>(llvm::getUnderlyingObject(v));
-            if (global != nullptr && cxxConstGlobalSymbols_.count(global->getName().str()) != 0)
-                return 2;
+            if (IsCxxConstFieldAccess(v)) return 1;
+            if (receiver.TypeAndValue.ParentVariableName.empty())
+            {
+                if (IsCxxConstReferent(v)) return 3;
+                auto* global = llvm::dyn_cast<llvm::GlobalVariable>(llvm::getUnderlyingObject(v));
+                if (global != nullptr && cxxConstGlobalSymbols_.count(global->getName().str()) != 0)
+                    return 2;
+            }
         }
-        const TypeAndValue& t = receiver.TypeAndValue;
         if (t.IsCxxPointeeConst && !t.IsFunctionPointer) return 1;
         if (t.IsCxxConstRef && !t.Pointer && !t.IsCxxRefToPointer) return 1;
+        if (t.IsCxxConstField && !t.Pointer && !t.IsCxxRefToPointer) return 1;
         return 0;
 }
 
@@ -1149,7 +1167,8 @@ LLVMBackend::NamedVariable LLVMBackend::EmitBitfieldRead(
         const std::string& parentVariableName,
         const std::string& owningStructName)
 {
-        auto* word = CreateLoad(storageTy, storagePtr);
+        auto* wordTy = GetBitfieldWordType(storageTy);
+        auto* word = LoadBitfieldWord(storagePtr, storageTy);
         unsigned w = bf.BitWidth;
         unsigned off = bf.BitOffset;
         unsigned storageBits = (unsigned)word->getType()->getIntegerBitWidth();
@@ -1196,6 +1215,32 @@ LLVMBackend::NamedVariable LLVMBackend::EmitBitfieldRead(
         nv.BitfieldWidth = bf.BitWidth;
         nv.BitfieldUnsigned = isUnsigned;
         return nv;
+    }
+
+llvm::Type* LLVMBackend::GetBitfieldWordType(llvm::Type* storageTy) const
+{
+        auto* arrayTy = llvm::dyn_cast<llvm::ArrayType>(storageTy);
+        if (arrayTy && arrayTy->getElementType()->isIntegerTy(8))
+            return llvm::IntegerType::get(*context, static_cast<unsigned>(arrayTy->getNumElements() * 8));
+        return storageTy;
+    }
+
+llvm::Value* LLVMBackend::LoadBitfieldWord(llvm::Value* storagePtr, llvm::Type* storageTy)
+{
+        auto* wordTy = GetBitfieldWordType(storageTy);
+        auto* wordPtr = builder->CreatePointerCast(storagePtr, llvm::PointerType::get(*context, 0));
+        auto* load = builder->CreateLoad(wordTy, wordPtr);
+        // Only a byte run ([N x i8], placed by clang at any byte) needs unaligned access.
+        if (wordTy != storageTy) load->setAlignment(llvm::Align(1));
+        return load;
+    }
+
+void LLVMBackend::StoreBitfieldWord(llvm::Value* storagePtr, llvm::Type* storageTy, llvm::Value* word)
+{
+        auto* wordTy = GetBitfieldWordType(storageTy);
+        auto* wordPtr = builder->CreatePointerCast(storagePtr, llvm::PointerType::get(*context, 0));
+        auto* store = builder->CreateStore(word, wordPtr);
+        if (wordTy != storageTy) store->setAlignment(llvm::Align(1));
     }
 
 unsigned LLVMBackend::BitfieldStorageBits(const std::string& typeName)
@@ -2617,7 +2662,10 @@ llvm::Value* LLVMBackend::CreateLogicalNot(llvm::Value* value)
 
 llvm::Value* LLVMBackend::CreateNeg(llvm::Value* value)
 {
-        if (value->getType()->isFloatingPointTy())
+        auto* type = value->getType();
+        if (type->isFloatingPointTy()
+            || (type->isVectorTy()
+                && type->getScalarType()->isFloatingPointTy()))
             return builder->CreateFNeg(value);
         return builder->CreateNeg(value);
     }

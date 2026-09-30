@@ -35,3 +35,5 @@ compiling. Native CFlat constructors: check whether they have the same hole and 
 ## 2026-09-28 C1 findings
 
 See `scratch/c1_matrix_r3.md` in the main checkout. Measured on all 160 cells: master constructor/free acceptance differs in 80/160 source/parameter/form cells. The free-function path refuses widening cells: `bool -> float/double` (variable and literal), `char -> float/double` (variable and literal), `short -> float/double` (variable and literal), `u8 -> float/double` (variable and literal), `u32 -> double` (variable and literal), and `int -> double` (variable and literal). Needs a maintainer ruling on the scalar conversion table at C++ call arguments (constructors + free functions) before any fix.
+
+- (C6 review 4, 2026-09-29) Integer narrowing at `new` is accepted on master and after C6: long -> int, int -> char, int -> short, long -> short (probes cflat-fix-c6 scratch/rev4/, kept in scratch/repro_keep/c6). Falls under the no-implicit-narrowing-at-calls ruling.

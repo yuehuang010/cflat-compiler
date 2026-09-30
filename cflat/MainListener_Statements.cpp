@@ -721,7 +721,8 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
                 && compiler->IsFunctionParameter(retText)
                 && !returnNV.TypeAndValue.Pointer
                 && compiler->IsForeignNontrivialCxxClass(returnNV.TypeAndValue.TypeName)
-                && IsLastUseOfForeignCxxParam(compiler, assignExpr, returnNV))
+                && IsLastUseOfForeignCxxParam(compiler, assignExpr, returnNV,
+                                              /*allowMoveOnlyReturn=*/true))
             {
                 source = compiler->GetScopedLocalOrArgument(retText);
                 sourceName = retText;
@@ -2286,8 +2287,12 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
                 for (const llvm::Value* base : bases)
                     compiler->UnregisterOwnedPtrTemp(const_cast<llvm::Value*>(base));
             }
-            compiler->FlushOwnedTempsSince(ptrMark, right);
-            compiler->FlushConditionalPtrTempsSince(returnOwnedTempMark.Ptrs);
+            // A scalar result can never carry a temp's address, so only a pointer-bearing
+            // result keeps the temps whose address may flow into it.
+            const bool preserveReturned = right != nullptr
+                && compiler->TypeHoldsPointer(right->getType());
+            compiler->FlushOwnedTempsSince(ptrMark, right, nullptr, preserveReturned);
+            compiler->FlushConditionalPtrTempsSince(returnOwnedTempMark.Ptrs, preserveReturned, right);
         }
         compiler->CreateReturnCall(right, retStorage, interfaceReturnStructName,
                                    returnNV.TypeAndValue.IsUnsignedInteger() != -1);

@@ -5,6 +5,190 @@
 
 namespace cppas {
 
+// Trivial apart from the declared scalar assignment operator.
+class AssignRouteTrivial
+{
+public:
+    static inline int assigns = 0;
+    inline AssignRouteTrivial& operator=(int x) noexcept { v_ = x; ++assigns; return *this; }
+    int v_ = 0;
+};
+inline AssignRouteTrivial assignRouteNamespaceGlobal{};
+
+class AssignRouteTrivialBoth
+{
+public:
+    static inline int int_assigns = 0;
+    inline AssignRouteTrivialBoth& operator=(int x) noexcept
+    { v_ = x; ++int_assigns; return *this; }
+    inline AssignRouteTrivialBoth& operator=(const AssignRouteTrivialBoth&) noexcept = default;
+    int v_ = 0;
+};
+
+class AssignRouteImplicitCopy
+{
+public:
+    int v_ = 0;
+};
+
+class AssignRouteLong
+{
+public:
+    static inline int long_assigns = 0;
+    inline AssignRouteLong& operator=(long x) noexcept
+    { v_ = (int)x + 100; ++long_assigns; return *this; }
+    int v_ = 0;
+};
+
+class AssignRouteDeleted
+{
+public:
+    inline AssignRouteDeleted& operator=(int) = delete;
+    int v_ = 0;
+};
+inline AssignRouteTrivialBoth assignRouteTrivialBothNamespaceGlobal{};
+inline AssignRouteImplicitCopy assignRouteImplicitCopyNamespaceGlobal{};
+inline AssignRouteLong assignRouteLongNamespaceGlobal{};
+inline AssignRouteDeleted assignRouteDeletedNamespaceGlobal{};
+
+class AssignRouteRegister
+{
+public:
+    inline AssignRouteRegister() noexcept : v_(0) {}
+    inline AssignRouteRegister operator=(int) noexcept
+    { AssignRouteRegister r; r.v_ = 99; return r; }
+    int v_;
+};
+class AssignRoutePair16
+{
+public:
+    inline AssignRoutePair16() noexcept : a_(0), b_(0) {}
+    inline AssignRoutePair16 operator=(int) noexcept
+    { AssignRoutePair16 r; r.a_ = 96; return r; }
+    long a_, b_;
+};
+class AssignRoutePairDouble
+{
+public:
+    inline AssignRoutePairDouble() noexcept : a_(0), b_(0) {}
+    inline AssignRoutePairDouble operator=(int) noexcept
+    { AssignRoutePairDouble r; r.a_ = 95; return r; }
+    double a_, b_;
+};
+class AssignRouteLarge
+{
+public:
+    inline AssignRouteLarge() noexcept : a_(0) {}
+    inline AssignRouteLarge operator=(int) noexcept
+    { AssignRouteLarge r; r.a_ = 97; return r; }
+    int a_, b_, c_, d_, e_, f_, g_, h_, i_, j_, k_, l_, m_, n_, o_, p_;
+};
+inline AssignRouteRegister assignRouteRegisterGlobal{};
+inline AssignRoutePair16 assignRoutePair16Global{};
+inline AssignRoutePairDouble assignRoutePairDoubleGlobal{};
+inline AssignRouteLarge assignRouteLargeGlobal{};
+
+class AssignRouteNontrivial
+{
+public:
+    static inline int ctors = 0, copies = 0, dtors = 0, assigns = 0, copy_assigns = 0;
+    static inline void reset() noexcept
+    { ctors = 0; copies = 0; dtors = 0; assigns = 0; copy_assigns = 0; }
+    inline AssignRouteNontrivial() noexcept : v_(0) { ++ctors; }
+    inline AssignRouteNontrivial(int x) noexcept : v_(x) { ++ctors; }
+    inline AssignRouteNontrivial(const AssignRouteNontrivial& o) noexcept : v_(o.v_) { ++copies; }
+    inline ~AssignRouteNontrivial() noexcept { ++dtors; }
+    inline AssignRouteNontrivial& operator=(int x) noexcept
+    { v_ = x; ++assigns; return *this; }
+    inline AssignRouteNontrivial& operator=(const AssignRouteNontrivial& o) noexcept
+    { v_ = o.v_; copy_assigns += 10; return *this; }
+    inline int value() const noexcept { return v_; }
+    int v_;
+};
+inline AssignRouteNontrivial assignRouteNontrivialNamespaceGlobal{};
+
+class AssignRouteByValue
+{
+public:
+    static inline int ctors = 0, copies = 0, dtors = 0, int_assigns = 0;
+    static inline void reset() noexcept { ctors = copies = dtors = int_assigns = 0; }
+    inline AssignRouteByValue() noexcept : v_(0) { ++ctors; }
+    inline AssignRouteByValue(int x) noexcept : v_(x) { ++ctors; }
+    inline AssignRouteByValue(int a, int b) noexcept : v_(a + b) { ++ctors; }
+    inline AssignRouteByValue(const AssignRouteByValue& o) noexcept : v_(o.v_) { ++copies; }
+    inline ~AssignRouteByValue() noexcept { ++dtors; }
+    inline AssignRouteByValue operator=(int x) noexcept
+    { v_ = x; ++int_assigns; return *this; }
+    inline int value() const noexcept { return v_; }
+    int v_;
+};
+inline AssignRouteByValue assignRouteByValueGlobal{};
+
+// operator=(int) whose result is a separate object, not the receiver (by value and by T&).
+class AssignRouteOther
+{
+public:
+    static inline int ctors = 0, copies = 0, dtors = 0, int_assigns = 0;
+    static inline void reset() noexcept { ctors = copies = dtors = int_assigns = 0; }
+    inline AssignRouteOther() noexcept : v_(0) { ++ctors; }
+    inline AssignRouteOther(const AssignRouteOther& o) noexcept : v_(o.v_) { ++copies; }
+    inline ~AssignRouteOther() noexcept { ++dtors; }
+    inline AssignRouteOther operator=(int x) noexcept
+    { v_ = x; ++int_assigns; AssignRouteOther r; r.v_ = x + 90; return r; }
+    inline int value() const noexcept { return v_; }
+    int v_;
+};
+class AssignRouteOtherRef
+{
+public:
+    static inline int copies = 0;
+    static inline void reset() noexcept { copies = 0; }
+    static AssignRouteOtherRef other;
+    inline AssignRouteOtherRef() noexcept : v_(0) {}
+    inline AssignRouteOtherRef(const AssignRouteOtherRef& o) noexcept : v_(o.v_) { ++copies; }
+    inline ~AssignRouteOtherRef() noexcept {}
+    inline AssignRouteOtherRef& operator=(int x) noexcept
+    { v_ = x; other.v_ = x + 90; return other; }
+    inline int value() const noexcept { return v_; }
+    int v_;
+};
+inline AssignRouteOtherRef AssignRouteOtherRef::other{};
+
+class AssignRouteVoid
+{
+public:
+    inline AssignRouteVoid() noexcept : v_(0) {}
+    inline ~AssignRouteVoid() noexcept {}
+    inline void operator=(int x) noexcept { v_ = x; }
+    int v_;
+};
+class AssignRouteTrivialVoid
+{
+public:
+    inline void operator=(int x) noexcept { v_ = x; }
+    int v_ = 0;
+};
+class AssignRouteScalarReturn
+{
+public:
+    inline AssignRouteScalarReturn() noexcept : v_(0) {}
+    inline int operator=(int x) noexcept { v_ = x; return 123; }
+    int v_;
+};
+inline AssignRouteVoid assignRouteVoidGlobal{};
+inline AssignRouteScalarReturn assignRouteScalarReturnGlobal{};
+
+class AssignRouteNoDefault
+{
+public:
+    static inline int int_assigns = 0;
+    inline AssignRouteNoDefault(int a, int b) noexcept : v_(a + b) {}
+    inline AssignRouteNoDefault& operator=(int x) noexcept
+    { v_ = x; ++int_assigns; return *this; }
+    int v_;
+};
+inline AssignRouteNoDefault assignRouteNoDefaultGlobal{1, 2};
+
 class Life
 {
 public:
@@ -265,5 +449,34 @@ inline ObConstSelf obMkConst(int x) { ObConstSelf b; b.v = x; return b; }
 inline ObMove obMkMove(int x) { ObMove b; b.v = x; return b; }
 inline ObConv obMkConv() { ObConv c; return c; }
 inline bool obViaRef(ObSelf& r) { return r ? true : false; }
+
+inline int obRankLast = 0;
+class ObRank {
+public:
+    operator bool() const noexcept { obRankLast = 1; return true; }
+    operator long() const noexcept { obRankLast = 2; return 9; }
+    int pad[3] = {};
+};
+class ObRankIntLong {
+public:
+    operator int() const noexcept { obRankLast = 3; return 3; }
+    operator long() const noexcept { obRankLast = 2; return 9; }
+    int pad = 0;
+};
+class ObRankBoolChar {
+public:
+    operator bool() const noexcept { obRankLast = 1; return true; }
+    operator char() const noexcept { obRankLast = 6; return 'A'; }
+    int pad = 0;
+};
+class ObRankFloatInt {
+public:
+    operator float() const noexcept { obRankLast = 8; return 1.5f; }
+    operator int() const noexcept { obRankLast = 3; return 3; }
+    int pad = 0;
+};
+inline ObRank obRankGlobal;
+inline ObRank obRankMake() { return ObRank(); }
+inline const ObRank& obRankRef(const ObRank& value) { return value; }
 
 } // namespace cppas

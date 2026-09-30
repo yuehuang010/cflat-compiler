@@ -6709,6 +6709,8 @@ static llvm::json::Object SerializeTav(const TAV& t)
     if (s.IsCxxRefToPointer)      o["crp"] = true;
     if (s.IsCxxConstRef)          o["ccr"] = true;
     if (s.IsCxxPointeeConst)      o["cpc"] = true;
+    if (s.IsCxxConstField)        o["ccf"] = true;
+    if (s.IsCxxMutableField)      o["cmf"] = true;
     if (s.IsOwningSink)           o["osk"] = true;
     if (s.IsConsumeInferredSink)  o["cis"] = true;
     if (s.IsReturnInferredSink)  o["ris"] = true;
@@ -6766,6 +6768,7 @@ static llvm::json::Object SerializeTav(const TAV& t)
     }
     if (s.IsArrayView) o["av"] = true;
     if (s.IsFlexibleArrayMember) o["fam"] = true;
+    if (s.IsZeroLengthArrayMember) o["zfam"] = true;
     if (s.AllocAlignValue > 0) o["aa"] = static_cast<int64_t>(s.AllocAlignValue);
     return o;
 }
@@ -6791,6 +6794,8 @@ static TAV DeserializeTav(const llvm::json::Object& o)
     if (auto v = o.getBoolean("crp")) s.IsCxxRefToPointer = *v;
     if (auto v = o.getBoolean("ccr")) s.IsCxxConstRef = *v;
     if (auto v = o.getBoolean("cpc")) s.IsCxxPointeeConst = *v;
+    if (auto v = o.getBoolean("ccf")) s.IsCxxConstField = *v;
+    if (auto v = o.getBoolean("cmf")) s.IsCxxMutableField = *v;
     if (auto v = o.getBoolean("osk")) s.IsOwningSink = *v;
     if (auto v = o.getBoolean("cis")) s.IsConsumeInferredSink = *v;
     if (auto v = o.getBoolean("ris")) s.IsReturnInferredSink = *v;
@@ -6840,6 +6845,7 @@ static TAV DeserializeTav(const llvm::json::Object& o)
     if (auto v = o.getInteger("sdl")) s.SimdLanes = static_cast<uint64_t>(*v);
     if (auto v = o.getBoolean("av")) s.IsArrayView = *v;
     if (auto v = o.getBoolean("fam")) s.IsFlexibleArrayMember = *v;
+    if (auto v = o.getBoolean("zfam")) s.IsZeroLengthArrayMember = *v;
     if (auto v = o.getInteger("aa")) s.AllocAlignValue = static_cast<uint64_t>(*v);
     return s.ToTypeAndValue();
 }

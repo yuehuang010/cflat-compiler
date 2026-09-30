@@ -1714,7 +1714,8 @@ void LLVMBackend::ApplyMoveParamTransfer(const std::string& functionName,
             // A fat closure (Lambda<...>) is an OWNING VALUE like string: it owns its captured env.
             // Admit __closure_fat_ptr and any encoded closure element type; a thin C fn ptr owns
             // nothing and never reaches here as a sink (ParamIsOwningSinkEligible rejects it).
-            bool paramOwnsResource = IsOwningValueOrClosureType(params[i].TypeName);
+            bool paramOwnsResource = IsOwningValueOrClosureType(params[i].TypeName)
+                || IsCoreUniqueType(params[i].TypeName);
             bool foreignCxxPointerSink = calleeIsCxx && args[i].IsExplicitMove
                 && params[i].Pointer && !params[i].IsAlias
                 && !params[i].IsRvalueRef && !params[i].IsCxxRefToPointer
@@ -1735,9 +1736,14 @@ void LLVMBackend::ApplyMoveParamTransfer(const std::string& functionName,
                 && (args[i].IsOwning || args[i].IsOwningString || args[i].IsOwningStruct
                     || IsVariableOwning(sourceName) || IsVariableOwningString(sourceName)
                     || IsOwnedClosureTemp(args[i].Primary)
+                    || !args[i].ConditionalMoveSources.empty()
+                    || IsCoreUniqueType(args[i].TypeAndValue.TypeName)
                     || (!sourceName.empty() && paramOwnsResource));
-            bool isOwningSink = (OwningSinkConsumesConcrete(params[i]) || inferredSinkConsumes
-                                 || foreignCxxPointerSink)
+            bool forcedOperatorConsume = args[i].ForceOperatorConsume && argIsOwner && paramOwnsResource;
+            bool sinkConsumes = OwningSinkConsumesConcrete(params[i]) || inferredSinkConsumes;
+            bool isOwningSink = (sinkConsumes || foreignCxxPointerSink || forcedOperatorConsume
+                    || (!params[i].Pointer && !params[i].IsAlias
+                        && IsCoreUniqueType(params[i].TypeName)))
                 && argIsOwner && (paramOwnsResource || foreignCxxPointerSink);
             // Ownership-laundering guard: the arg is a value this function only BORROWS (a plain
             // by-value owning-value param of the current function) but the callee's param CONSUMES
@@ -1745,9 +1751,9 @@ void LLVMBackend::ApplyMoveParamTransfer(const std::string& functionName,
             // TRUE owner (a caller further up) still frees the resource - a silent double-free.
             bool paramConsumesOwningValue = paramOwnsResource
                 && (params[i].IsMove
-                    || (!params[i].Pointer && !params[i].IsAlias
+                || (!params[i].Pointer && !params[i].IsAlias
                         && IsCoreUniqueType(params[i].TypeName))
-                    || OwningSinkConsumesConcrete(params[i]) || inferredSinkConsumes);
+                || sinkConsumes || forcedOperatorConsume);
             if (paramConsumesOwningValue
                 && IsVariableBorrowedOwningValue(sourceName))
             {
@@ -1894,6 +1900,31 @@ void LLVMBackend::ApplyMoveParamTransfer(const std::string& functionName,
                     if (srcBaseTy == nullptr) srcBaseTy = ref.BaseType;
                 }
 
+                if (!args[i].ConditionalMoveSources.empty() && isOwningSink)
+                {
+                    for (const auto& source : args[i].ConditionalMoveSources)
+                    {
+                        if (beforeCall)
+                        {
+                            if (source.Storage == nullptr || source.ValueType == nullptr
+                                || source.ArmBlock == nullptr
+                                || cflat_llvm::GetTerminatorOrNull(source.ArmBlock) == nullptr)
+                                continue;
+                            llvm::IRBuilder<> armBuilder(source.ArmBlock->getTerminator());
+                            armBuilder.CreateStore(llvm::Constant::getNullValue(source.ValueType),
+                                                   source.Storage);
+                        }
+                        else if (!source.CallerName.empty())
+                        {
+                            if (!source.FieldName.empty())
+                                MarkVariableFieldMoved(source.CallerName, source.FieldName);
+                            else if (!source.IsElementAccess)
+                                MarkVariableMoved(source.CallerName);
+                        }
+                    }
+                    continue;
+                }
+
                 if (beforeCall)
                 {
                     // A unique<T> wrapper releases its pointee while lowering the raw-pointer
@@ -1962,13 +1993,13 @@ void LLVMBackend::ApplyMoveParamTransfer(const std::string& functionName,
                     && (args[i].IsOwning || IsVariableOwning(sourceName))
                     && srcStorage != nullptr)
                 {
-                    if (!sourceName.empty() && !isFieldAccess)
+                    if (!args[i].DeferMovedMark && !sourceName.empty() && !isFieldAccess)
                         MarkVariableMoved(sourceName);
                 }
                 // Compile-time: mark the caller's storage as moved so subsequent reads are rejected.
                 // Covers pointer, owning-string, and struct move params - all cases where caller storage was zeroed.
                 // Moving a FIELD (`node->left`) marks only that field, not the whole base variable.
-                if (!sourceName.empty() && srcStorage != nullptr &&
+                if (!args[i].DeferMovedMark && !sourceName.empty() && srcStorage != nullptr &&
                     !isInterfaceBorrow && srcBaseTy != nullptr)
                 {
                     bool isPtr = llvm::isa<llvm::PointerType>(srcBaseTy);
@@ -3535,7 +3566,7 @@ llvm::Function* LLVMBackend::SynthesizeReflectFunction(const std::string& struct
             auto* storageTy = compiler->GetType(storageField);
             auto* storagePtr = compiler->builder->CreateStructGEP(sd.StructType, objPtr,
                 bf.StorageFieldIndex, bf.Name + "_bf_ptr");
-            auto* word = compiler->builder->CreateLoad(storageTy, storagePtr);
+            auto* word = compiler->LoadBitfieldWord(storagePtr, storageTy);
 
             unsigned w = bf.BitWidth;
             unsigned off = bf.BitOffset;

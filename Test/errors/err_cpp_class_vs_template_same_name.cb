@@ -1,0 +1,3 @@
+expect_error("C++ declaration conflicts with a declaration already in scope");
+import cpp "cpp_interop_c2_conflict_a.h";
+import cpp "cpp_interop_c2_conflict_b.h";

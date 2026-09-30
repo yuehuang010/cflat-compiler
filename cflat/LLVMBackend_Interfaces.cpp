@@ -1010,7 +1010,8 @@ llvm::Function* LLVMBackend::GetOrCreateReverseAbiFunctionThunk(
                                                            : llvm::Function::InternalLinkage,
                                            key, *module);
         }
-        thunk->addFnAttr(llvm::Attribute::NoUnwind);
+        // A C++ exception thrown by the CFlat body must unwind through the thunk to a C++ catch.
+        thunk->setUWTableKind(llvm::UWTableKind::Default);
         ApplyAbiAttributes(thunk, plan.recipe);
 
         auto* entry = llvm::BasicBlock::Create(*context, "entry", thunk);

@@ -824,6 +824,9 @@ public:
         // C++ pointer result whose innermost POINTEE is const (`const T*`, `const T*&`,
         // `T const *const &`, `const T *const *`). Internal only: overload ranking and receivers.
         bool IsCxxPointeeConst = false;
+        bool IsCxxConstField = false;
+        // C++ mutable field; the member object ignores constness of its parent.
+        bool IsCxxMutableField = false;
         // Set by the ForwardRefScanner body-scan on a plain by-value parameter the callee body
         // UNCONDITIONALLY moves (top-level `move <param>`): a synthesized move-sink whose caller
         // source is nulled at the call site. Consumers still gate on the concrete type owning a
@@ -932,6 +935,8 @@ public:
         bool IsArrayView = false;
         // Foreign flexible/zero-length member: typed for indexing, but no extent is known.
         bool IsFlexibleArrayMember = false;
+        // C's `T field[0]` permits sizeof(field)==0; `T field[]` remains incomplete.
+        bool IsZeroLengthArrayMember = false;
 
         // Allocation-alignment clause: arg2 of `alignas(slot, alloc)`. Records that the heap BLOCK
         // this pointer/array-view owns is N-aligned so a field/param/return and the matching
@@ -1219,6 +1224,8 @@ public:
         bool IsCxxRefToPointer = false;
         bool IsCxxConstRef = false;
         bool IsCxxPointeeConst = false;
+        bool IsCxxConstField = false;
+        bool IsCxxMutableField = false;
         bool IsOwningSink = false;
         bool IsConsumeInferredSink = false;
         bool IsReturnInferredSink = false;
@@ -1258,6 +1265,7 @@ public:
         uint64_t SimdLanes = 0;
         bool IsArrayView = false;
         bool IsFlexibleArrayMember = false;
+        bool IsZeroLengthArrayMember = false;
         uint64_t AllocAlignValue = 0;
         std::string EnumBacking;
         bool IsScopedEnum = false;
@@ -1283,6 +1291,8 @@ public:
             s.IsCxxRefToPointer = t.IsCxxRefToPointer;
             s.IsCxxConstRef = t.IsCxxConstRef;
             s.IsCxxPointeeConst = t.IsCxxPointeeConst;
+            s.IsCxxConstField = t.IsCxxConstField;
+            s.IsCxxMutableField = t.IsCxxMutableField;
             s.IsOwningSink = t.IsOwningSink;
             s.IsConsumeInferredSink = t.IsConsumeInferredSink;
             s.IsReturnInferredSink = t.IsReturnInferredSink;
@@ -1323,6 +1333,7 @@ public:
             s.SimdLanes = t.SimdLanes;
             s.IsArrayView = t.IsArrayView;
             s.IsFlexibleArrayMember = t.IsFlexibleArrayMember;
+            s.IsZeroLengthArrayMember = t.IsZeroLengthArrayMember;
             s.AllocAlignValue = t.AllocAlignValue;
             return s;
         }
@@ -1348,6 +1359,8 @@ public:
             t.IsCxxRefToPointer = IsCxxRefToPointer;
             t.IsCxxConstRef = IsCxxConstRef;
             t.IsCxxPointeeConst = IsCxxPointeeConst;
+            t.IsCxxConstField = IsCxxConstField;
+            t.IsCxxMutableField = IsCxxMutableField;
             t.IsOwningSink = IsOwningSink;
             t.IsConsumeInferredSink = IsConsumeInferredSink;
             t.IsReturnInferredSink = IsReturnInferredSink;
@@ -1388,6 +1401,7 @@ public:
             t.SimdLanes = SimdLanes;
             t.IsArrayView = IsArrayView;
             t.IsFlexibleArrayMember = IsFlexibleArrayMember;
+            t.IsZeroLengthArrayMember = IsZeroLengthArrayMember;
             t.AllocAlignValue = AllocAlignValue;
             return t;
         }
@@ -1452,6 +1466,16 @@ public:
             size_t Line = 0;
         };
         std::vector<Leaf> Leaves;
+    };
+
+    struct ConditionalMoveSource
+    {
+        llvm::Value* Storage = nullptr;
+        llvm::Type* ValueType = nullptr;
+        llvm::BasicBlock* ArmBlock = nullptr;
+        std::string CallerName;
+        std::string FieldName;
+        bool IsElementAccess = false;
     };
 
     struct NamedVariable
@@ -1677,6 +1701,9 @@ public:
         bool OwningLocalBorrowAfterRebind = false;
         llvm::Value* RefCountStorage = nullptr; // lazy i32 alloca at function entry; non-null only when pointer escaped to a field
         std::string CallerName;          // the variable's name at the call site, for move tracking
+        bool DeferMovedMark = false;     // operator lowering applies the move after result formation
+        bool ForceOperatorConsume = false;
+        std::vector<ConditionalMoveSource> ConditionalMoveSources;
         // Canonical lock path of the argument spelling ('&o.inner' -> 'o.inner'), empty when the
         // spelling is not a plain path. Read only by CheckCallSiteLocks; not cached by --init.
         std::string CallerLockPath;
@@ -1738,7 +1765,7 @@ public:
         // Bitfield access: non-null BitfieldStorage means this is a bitfield view onto a storage word.
         // Reads compute shift+mask; writes do a read-modify-write on BitfieldStorage.
         llvm::Value* BitfieldStorage = nullptr;   // GEP'd pointer to the storage word
-        llvm::Type*  BitfieldStorageType = nullptr; // the storage word's LLVM type (e.g. i32)
+        llvm::Type*  BitfieldStorageType = nullptr; // the storage field's LLVM type (i32, or [N x i8] for a byte run)
         unsigned BitfieldOffset = 0;
         unsigned BitfieldWidth  = 0;
         bool BitfieldUnsigned   = false;
@@ -1815,6 +1842,11 @@ public:
         std::string  sourceTypeName;
         // TypeAndValue::IsCxxPointeeConst of a pointer operand, so a `?:` join keeps it.
         bool         cxxPointeeConst = false;
+        // Source identity retained while operator reductions carry values without their NamedVariable.
+        std::string  sourceCallerName;
+        std::string  sourceFieldName;
+        bool         sourceIsElementAccess = false;
+        std::vector<ConditionalMoveSource> conditionalMoveSources;
 
         TypedValue() = default;
         TypedValue(llvm::Value* v, bool u = false) : value(v), isUnsigned(u) {}
@@ -3475,6 +3507,8 @@ private:
     // underlying object is that call writes through it.
     void MarkCxxConstReferent(llvm::Value* referenceResult);
     bool IsCxxConstReferent(llvm::Value* destination) const;
+    void MarkCxxConstFieldAccess(llvm::Value* fieldAddress);
+    bool IsCxxConstFieldAccess(llvm::Value* fieldAddress) const;
     // A const C++ member whose non-const twin owns the CFlat name registers under this name.
     static std::string CxxConstTwinName(const std::string& member)
     {
@@ -3492,8 +3526,10 @@ private:
      * through a C++ const reference result. 2 and 3 are read-only storage.
      */
     int CxxConstReceiverKind(const NamedVariable& receiver) const;
-    // True when every instance member `memberName` of C++ record `recordName` is non-const.
-    bool CxxMemberIsOnlyNonConst(const std::string& recordName, const std::string& memberName) const;
+    // True when this call shape has only a public non-const member, including one inherited
+    // from a single public non-virtual base.
+    bool CxxMemberIsOnlyNonConst(const std::string& recordName, const std::string& memberName,
+                                 size_t argumentCount) const;
     // Leading segment of a dotted name a C++ import registered, noted as a foreign namespace.
     void NoteCxxForeignNamespace(const std::string& dottedName)
     {
@@ -3673,6 +3709,9 @@ private:
         bool isCxx = false;
         bool isNoexcept = true;
         bool needsCxxRebind = false;
+        // A generated wrapper for an INSTANCE member template: p0 is the receiver, so the
+        // symbol is a member call although it is registered like a free function (IsMethod off).
+        bool isInstanceTemplateWrapper = false;
         std::string bindRefusal;
         // Refusal reported by clang extraction, before backend type mapping. A cached C++
         // signature remaps its types from the preserved spellings and retains this reason.
@@ -3761,6 +3800,8 @@ private:
         // reported offset - RegisterCRecords computes it from MSVC ABI rules.
         bool isBitfield = false;
         bool isZeroSize = false;
+        bool isConst = false;
+        bool isMutable = false;
         unsigned bitWidth = 0;
         uint64_t offsetBytes = 0;
         uint64_t sizeBytes = 0;    // clang's size/alignment of the field type (0 for a bitfield)
@@ -4671,7 +4712,9 @@ private:
 
     // Worklist half of ParameterMayReachReturn. Not memoized, for the same reason
     // OwningPtrProvablyEscapes is not: the query is rare and a body may still be growing.
-    bool ValueMayReachReturn(const llvm::Value* root, int depth);
+    bool ValueMayReachReturn(const llvm::Value* root, int depth,
+                             bool unknownPointerResultMayReach = false,
+                             const llvm::Value* pendingReturnValue = nullptr);
 
     /*
      * The RETURN-IDENTITY ALIAS PROOF: strictly stronger than ParameterMayReachReturn ("one path
@@ -5100,7 +5143,8 @@ private:
      * whose address reaches the join use null-initialized slots and stay for full-expression cleanup.
      */
     void FlushOwnedTempsSince(const OwnedTempMark& mark, llvm::Value* keep,
-                              llvm::BasicBlock* hoistTo = nullptr);
+                              llvm::BasicBlock* hoistTo = nullptr,
+                              bool preserveReturnedPtrTemps = false);
 
     // Zero `temp`'s storage in `hoistTo` (before its terminator) and re-key it there. False when
     // the temp is not an entry-block alloca of that function, i.e. cannot be hoisted.
@@ -5117,7 +5161,8 @@ private:
     void EmitOwnedStructTempFree(const PendingOwnedStructTemp& temp);
     void EmitOwnedConditionalPtrTempFree(const PendingOwnedPtrTemp& temp);
     // Free the conditional-slot arm temps ledgered since `from` (a `return` has no statement end).
-    void FlushConditionalPtrTempsSince(size_t from);
+    void FlushConditionalPtrTempsSince(size_t from, bool preserveReturnedPtrTemps = false,
+                                       llvm::Value* pendingReturnValue = nullptr);
 
     // Drop the ledger entries registered since `mark` WITHOUT emitting any free. For an aborted
     // region (an arm whose lowering threw): those entries are keyed to blocks that no longer
@@ -7881,6 +7926,9 @@ public:
                                    const BitfieldInfo& bf,
                                    const std::string& parentVariableName,
                                    const std::string& owningStructName);
+    llvm::Type* GetBitfieldWordType(llvm::Type* storageTy) const;
+    llvm::Value* LoadBitfieldWord(llvm::Value* storagePtr, llvm::Type* storageTy);
+    void StoreBitfieldWord(llvm::Value* storagePtr, llvm::Type* storageTy, llvm::Value* word);
 
     // Target-aware LSB-first bitfield packing. Consumes the user's declList;
     // groups bitfields into storage slots, populates outBitfields, and returns
@@ -8253,10 +8301,13 @@ public:
     // Empty when cflat reproduced clang's layout; otherwise the mismatch, for a per-record refusal.
     std::string VerifyImportedRecordLayout(const CRecordEntry& r);
 
-    // Lay out imported C bitfield storage at clang's byte offsets with explicit byte gaps.
+    // Lay out imported C/C++ bitfield storage at clang's byte offsets with byte-sized runs.
     bool InsertCBitfieldLayoutPadding(const CRecordEntry& r,
-                                      std::vector<DeclTypeAndValue>& fields,
-                                      std::vector<BitfieldInfo>& bitfields);
+                                     std::vector<DeclTypeAndValue>& fields,
+                                     std::vector<BitfieldInfo>& bitfields);
+    bool TryInsertCBitfieldLayoutPadding(const CRecordEntry& r,
+                                         std::vector<DeclTypeAndValue>& fields,
+                                         std::vector<BitfieldInfo>& bitfields);
 
     // Insert unnamed filler fields so the LLVM struct reproduces clang's field offsets.
     void InsertCxxLayoutPadding(const CRecordEntry& r, std::vector<DeclTypeAndValue>& fields);
@@ -8657,6 +8708,7 @@ public:
                                         std::vector<std::string>* ambiguousCandidates = nullptr) const;
     std::string ScoreCxxConversionOperatorArgument(const NamedVariable& arg,
                                                    const TypeAndValue& param,
+                                                   bool preserveAmbiguous,
                                                    bool& needsStandardConversion,
                                                    int& userConversions,
                                                    int& userConversionCost,
@@ -8840,6 +8892,10 @@ public:
     bool CxxConstructorNeedsClangResolution(const std::string& typeName,
                                             const CxxClassInfo::Structor* selected,
                                             const std::vector<TypeAndValue>& argTypes) const;
+    // Preserve CFlat's explicit single-float to integer refusal when every arity-compatible ctor
+    // requires that conversion. Other unresolved constructor sets may be delegated to clang.
+    bool CxxCtorSetRequiresFloatToInteger(const std::string& typeName,
+                                          const std::vector<TypeAndValue>& argTypes) const;
     // True when a scalar argument meets a constructor overload set holding a scalar reference
     // parameter: clang resolves it through the forwarding thunk, never the listed pick.
     bool CxxCtorForwardsScalarReference(const std::string& typeName,
@@ -10663,7 +10719,10 @@ public:
     //      CFLAT_CACHE_BUILD_STAMP=1).
     // 130: flexible / zero-length array record members carry their provenance (IsFlexibleArrayMember).
     // 131: free UNARY operator templates (`- + ! ~`) over a requested class template are published.
-    static constexpr int kCHeaderCacheVersion = 131;
+    // 132: zero-length `[0]` members are told apart from `[]` (IsZeroLengthArrayMember); anonymous
+    //      struct/union flexible tails are promoted into the containing record.
+    // 133: C++ record fields retain field-level const qualification.
+    static constexpr int kCHeaderCacheVersion = 133;
     static std::string CompilerBuildStamp();
     // THE switch for "the compiler build is part of cache entry validity": header/request
     // entries record and check "cstamp", and demand companion keys fold the stamp. OFF by

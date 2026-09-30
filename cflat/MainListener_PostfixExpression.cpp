@@ -618,6 +618,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpression(CFlatParser::Pos
 void MainListener::DecayFlexibleArrayMember(LLVMBackend::NamedVariable& namedVar) {
         auto& tv = namedVar.TypeAndValue;
         tv.IsFlexibleArrayMember = false;
+        tv.IsZeroLengthArrayMember = false;
         if (namedVar.Storage == nullptr) return;
         // Held in a pointer slot like any `T*` local, so `*m`, `m[i]` and `auto` see a pointer.
         auto* address = namedVar.Storage;
@@ -2120,6 +2121,12 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                         namedVar.UnionFieldType = nullptr;
                                         namedVar.Storage = Compiler(ctx)->CreateCxxFieldGEP(dataStructure, structVar.Storage, fieldIndex);
                                         if (lazyStdField) namedVar.Storage = lazyStdFieldAddress(namedVar.Storage);
+                                        if (fieldType.IsCxxConstField
+                                            || (!fieldType.Pointer && !fieldType.IsCxxRefToPointer
+                                                && !fieldType.IsCxxMutableField
+                                                && Compiler(ctx)->IsCxxRecord(fieldType.TypeName)
+                                                && Compiler(ctx)->CxxConstReceiverKind(structVar) != 0))
+                                            Compiler(ctx)->MarkCxxConstFieldAccess(namedVar.Storage);
                                         if (llvm::isa<llvm::ArrayType>(fieldLLVMType))
                                         {
                                             namedVar.Primary = nullptr;
@@ -2132,6 +2139,15 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                         }
                                     }
                                     namedVar.TypeAndValue = fieldType;
+                                    if (fieldType.IsCxxConstField
+                                        || (!fieldType.Pointer && !fieldType.IsCxxRefToPointer
+                                            && !fieldType.IsCxxMutableField
+                                            && Compiler(ctx)->IsCxxRecord(fieldType.TypeName)
+                                            && Compiler(ctx)->CxxConstReceiverKind(structVar) != 0))
+                                    {
+                                        Compiler(ctx)->MarkCxxConstFieldAccess(namedVar.Storage);
+                                        Compiler(ctx)->MarkCxxConstFieldAccess(namedVar.Primary);
+                                    }
                                     namedVar.TypeAndValue.ParentVariableName = structVar.TypeAndValue.VariableName;
                                     namedVar.GuardLockKey = guardLockKeyHeld;
                                     namedVar.ContainsBondedClosure = structVar.ContainsBondedClosure
@@ -2185,6 +2201,12 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                             namedVar.UnionFieldType = nullptr;
                                             namedVar.Storage = Compiler(ctx)->CreateCxxFieldGEP(dataStructure, structVar.Storage, fieldIndex);
                                             if (lazyStdField) namedVar.Storage = lazyStdFieldAddress(namedVar.Storage);
+                                            if (fieldType.IsCxxConstField
+                                                || (!fieldType.Pointer && !fieldType.IsCxxRefToPointer
+                                                    && !fieldType.IsCxxMutableField
+                                                    && Compiler(ctx)->IsCxxRecord(fieldType.TypeName)
+                                                    && Compiler(ctx)->CxxConstReceiverKind(structVar) != 0))
+                                                Compiler(ctx)->MarkCxxConstFieldAccess(namedVar.Storage);
                                             if (llvm::isa<llvm::ArrayType>(fieldLLVMType))
                                             {
                                                 // Array field: keep GEP pointer; don't load the whole array
@@ -2263,6 +2285,15 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                         }
                                     }
                                     namedVar.TypeAndValue = fieldType;
+                                    if (fieldType.IsCxxConstField
+                                        || (!fieldType.Pointer && !fieldType.IsCxxRefToPointer
+                                            && !fieldType.IsCxxMutableField
+                                            && Compiler(ctx)->IsCxxRecord(fieldType.TypeName)
+                                            && Compiler(ctx)->CxxConstReceiverKind(structVar) != 0))
+                                    {
+                                        Compiler(ctx)->MarkCxxConstFieldAccess(namedVar.Storage);
+                                        Compiler(ctx)->MarkCxxConstFieldAccess(namedVar.Primary);
+                                    }
                                     namedVar.TypeAndValue.ParentVariableName = structVar.TypeAndValue.VariableName;
                                     namedVar.GuardLockKey = guardLockKeyHeld;
                                     namedVar.ContainsBondedClosure = structVar.ContainsBondedClosure
@@ -2976,6 +3007,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 namedVar.IsParenthesizedProducedTemp = true;
                                 namedVar.TernaryTempAlreadyRegistered = parenInnerNamed.TernaryTempAlreadyRegistered;
                             }
+                            namedVar.ConditionalMoveSources = parenInnerNamed.ConditionalMoveSources;
                             // A parenthesized POINTER lvalue keeps its element type too: the
                             // delete-retire null store pairs Storage with BaseType, and without it
                             // `delete (r)` left the local live and freed it a second time at exit.
@@ -3294,6 +3326,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             namedVar.BaseType = arrTy->getElementType();
                             namedVar.TypeAndValue.ConstArraySize = 0;
                             namedVar.TypeAndValue.IsFlexibleArrayMember = false;
+                            namedVar.TypeAndValue.IsZeroLengthArrayMember = false;
                             namedVar.FieldPathThroughPointer = true;
                             // The GEP above already resolved the union reinterpret; leaving the
                             // whole FIELD type set would load/store the element as the whole array.
@@ -4288,7 +4321,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     auto* storageTy = compiler->GetType(storageField);
                                     auto* storagePtr = compiler->builder->CreateStructGEP(sd.StructType, objPtr,
                                         bf.StorageFieldIndex, bf.Name + "_bf_ptr");
-                                    auto* word = compiler->builder->CreateLoad(storageTy, storagePtr);
+                                    auto* word = compiler->LoadBitfieldWord(storagePtr, storageTy);
 
                                     unsigned w = bf.BitWidth;
                                     unsigned off = bf.BitOffset;
@@ -5721,6 +5754,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     argVar.Primary = argValue;
                                     argVar.BaseType = argValue->getType();
                                     argVar.TernaryTempAlreadyRegistered = argNV.TernaryTempAlreadyRegistered;
+                                    argVar.ConditionalMoveSources = argNV.ConditionalMoveSources;
                                     argVar.Storage = argNV.Storage;
                                     argVar.IsOwning = argNV.IsOwning;
                                     argVar.OwnsInterfaceBox = argNV.OwnsInterfaceBox;
@@ -6506,6 +6540,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     argVar.Primary = argValue;
                                     argVar.BaseType = argValue->getType();
                                     argVar.TernaryTempAlreadyRegistered = argNV.TernaryTempAlreadyRegistered;
+                                    argVar.ConditionalMoveSources = argNV.ConditionalMoveSources;
                                     // Propagate caller variable name for compile-time move tracking.
                                     argVar.CallerName = argNV.CallerName;
                                     // Propagate the field name (and inherited per-field move set) so that
@@ -7071,8 +7106,12 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     TypeUntypedCtorArg(ctorTypes.back(), value,
                                         arg.LiteralIdentitySuffixed ? arg.LiteralIdentity : std::string());
                                     if (arg.TypeAndValue.TypeName.empty() && !arg.TypeAndValue.Pointer
-                                        && compiler->IsCxxRecord(ctorTypes.back().TypeName))
-                                        arg.TypeAndValue.TypeName = ctorTypes.back().TypeName;
+                                        && arg.Storage != nullptr && !arg.IsRvalue
+                                        && arg.CxxLvalueKind == 1
+                                        && (!arg.InferSourceTypeName.empty()
+                                            || !ctorTypes.back().TypeName.empty()))
+                                        arg.TypeAndValue.TypeName = !arg.InferSourceTypeName.empty()
+                                            ? arg.InferSourceTypeName : ctorTypes.back().TypeName;
                                 }
                                 std::string why;
                                 compiler->TryBindRefusedCxxMember(
@@ -7338,7 +7377,6 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 }
 
                                 requestCxxTemplate(resolvedFuncName);
-
                                 callArgumentPostfix.Flush();
                                 namedVar.Primary = RefuseCxxConstReceiverCall(ctx, arguments,
                                         cxxMemberReceiverType(), resolvedFuncName,

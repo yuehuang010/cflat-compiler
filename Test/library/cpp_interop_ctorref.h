@@ -322,6 +322,8 @@ struct ThkUser {
 // the array / initializer_list itself, so a kept view dangled; each reader overwrites its OWN
 // frame (the depth the thunk ran at) before reading.
 #include <initializer_list>
+#include <utility>
+#include <array>
 namespace cppcr {
 struct BrcIl {
     const long* d; size_t n;
@@ -468,6 +470,7 @@ inline long brc_vec(BrcVector<int> v) { return v.a[0] * 10 + v.a[v.n - 1]; }
 __attribute__((noinline)) inline long brc_read(BrcRef r) { CPPCR_BRC_CLOBBER; return r.d[r.n - 1] * 10 + (long)r.n; }
 __attribute__((noinline)) inline long brc_read_a(BrcArrayRef<long> r) { CPPCR_BRC_CLOBBER; return r.d[r.n - 1] * 10 + (long)r.n; }
 __attribute__((noinline)) inline long brc_read_p(const long* p) { CPPCR_BRC_CLOBBER; return p[0] * 10 + p[1]; }
+__attribute__((noinline)) inline long brc_read_one(const long* p) { CPPCR_BRC_CLOBBER; return p[0]; }
 __attribute__((noinline)) inline long brc_two_sum(BrcRef a, BrcRef b) {
     CPPCR_BRC_CLOBBER;
     return (a.d[0] * 10 + a.d[1]) * 100 + b.d[0] * 10 + b.d[1];
@@ -509,12 +512,124 @@ template <class T> struct BrcPack {
     template <class... A> BrcPack(std::initializer_list<T>, A...) : which(2) {}
     ~BrcPack() {}
 };
+template <class T> struct BrcPackFwd {
+    int which;
+    BrcPackFwd(std::initializer_list<T>, const int&) : which(1) {}
+    template <class... A> BrcPackFwd(std::initializer_list<T>, A&&...) : which(2) {}
+};
+template <class T> struct BrcPackLRef {
+    int which;
+    BrcPackLRef(std::initializer_list<T>, long) : which(1) {}
+    template <class... A> BrcPackLRef(std::initializer_list<T>, A&...) : which(2) {}
+};
+template <class T> struct BrcPackConstRef {
+    int which;
+    BrcPackConstRef(std::initializer_list<T>, const int&) : which(1) {}
+    template <class... A> BrcPackConstRef(std::initializer_list<T>, const A&...) : which(2) {}
+};
+// A pack pattern naming a second template parameter (pair<U, A>) cannot be mirrored per element.
+inline std::pair<int, long> brc_pack_pair() { return {1, 2L}; }
+template <class T> struct BrcPackPair {
+    int which;
+    BrcPackPair(std::initializer_list<T>, long, const std::pair<int, long>&) : which(1) {}
+    template <class U, class... A> BrcPackPair(std::initializer_list<T>, U, const std::pair<U, A>&...) : which(2) {}
+};
+// A non-type pack (array<int, N>&...) beside a converting sibling: clang picks 2.
+inline std::array<int, 2> brc_pack_arr() { return {1, 2}; }
+struct BrcPackArrW { int w; BrcPackArrW(std::array<int, 2> a) : w(a[0]) {} };
+template <class T> struct BrcPackArr {
+    int which;
+    BrcPackArr(std::initializer_list<T>, BrcPackArrW) : which(1) {}
+    template <std::size_t... N> BrcPackArr(std::initializer_list<T>, const std::array<int, N>&...) : which(2) {}
+};
+template <class T> struct BrcPackView {
+    const T* p; int which;
+    BrcPackView(std::initializer_list<double>) : p(nullptr), which(1) {}
+    template <class... A> BrcPackView(std::initializer_list<T> l, A...) : p(l.begin()), which(2) {}
+    __attribute__((noinline)) long probe() const { CPPCR_BRC_CLOBBER; return p[0] * 10 + p[1] + which; }
+    __attribute__((noinline)) long probe_one() const { CPPCR_BRC_CLOBBER; return p[0] + which; }
+};
+template <class T> struct BrcPackCopy {
+    T a[4]; size_t n; int which;
+    BrcPackCopy(std::initializer_list<double> l) : n(l.size()), which(1) { size_t i = 0; for (double x : l) a[i++] = (T)x; }
+    template <class... A> BrcPackCopy(std::initializer_list<T> l, A...) : n(l.size()), which(2) { size_t i = 0; for (T x : l) a[i++] = x; }
+    __attribute__((noinline)) long probe() const { CPPCR_BRC_CLOBBER; return n == 0 ? 0 : n == 1 ? a[0] : a[0] * 10 + a[1]; }
+};
 template <class T> struct BrcDfOnly {
     int which;
     template <class U> BrcDfOnly(std::initializer_list<T>, U = U()) : which(2) {}
     ~BrcDfOnly() {}
 };
 inline int brc_use(BrcTplInh<long>*, BrcNt<long>*, BrcPack<long>*, BrcDfOnly<long>*) { return 0; }
+template <class T> __attribute__((noinline)) inline const T* brc_template_keep(std::initializer_list<T> l)
+{
+    CPPCR_BRC_CLOBBER;
+    return l.begin();
+}
+template <class T> inline long brc_template_copy(std::initializer_list<T> l)
+{
+    return l.size() == 0 ? 0 : (long)l.begin()[0] * 10 + (long)l.begin()[l.size() - 1];
+}
+struct BrcTemplateElement {
+    int v;
+    inline static int made = 0;
+    inline static int gone = 0;
+    explicit BrcTemplateElement(int value) : v(value) { ++made; }
+    BrcTemplateElement(const BrcTemplateElement& other) : v(other.v) { ++made; }
+    ~BrcTemplateElement() { ++gone; }
+};
+__attribute__((noinline)) inline long brc_template_class_read(const BrcTemplateElement* p)
+{
+    CPPCR_BRC_CLOBBER;
+    return p[0].v * 10 + p[1].v;
+}
+template <class T> inline long brc_template_class_copy(std::initializer_list<T> l)
+{
+    return l.size() == 0 ? 0 : l.begin()[0].v * 10 + l.begin()[l.size() - 1].v;
+}
+inline int brc_template_element_made() { return BrcTemplateElement::made; }
+inline int brc_template_element_gone() { return BrcTemplateElement::gone; }
+struct BrcConvertSource {
+    int v;
+    inline static int made = 0;
+    inline static int gone = 0;
+    explicit BrcConvertSource(int value) : v(value) { ++made; }
+    BrcConvertSource(const BrcConvertSource& other) : v(other.v) { ++made; }
+    ~BrcConvertSource() { ++gone; }
+};
+struct BrcConvertTarget {
+    int v;
+    inline static int made = 0;
+    inline static int gone = 0;
+    BrcConvertTarget(const BrcConvertSource& source) : v(source.v + 10) { ++made; }
+    BrcConvertTarget(const BrcConvertTarget& other) : v(other.v) { ++made; }
+    ~BrcConvertTarget() { ++gone; }
+};
+__attribute__((noinline)) inline const BrcConvertTarget* brc_convert_keep(
+    std::initializer_list<BrcConvertTarget> l)
+{
+    CPPCR_BRC_CLOBBER;
+    return l.begin();
+}
+__attribute__((noinline)) inline int brc_convert_read(const BrcConvertTarget* p)
+{
+    CPPCR_BRC_CLOBBER;
+    return p[0].v * 10 + p[1].v;
+}
+__attribute__((noinline)) inline int brc_convert_read_one(const BrcConvertTarget* p)
+{
+    CPPCR_BRC_CLOBBER;
+    return p[0].v;
+}
+__attribute__((noinline)) inline int brc_convert_copy(std::initializer_list<BrcConvertTarget> l)
+{
+    CPPCR_BRC_CLOBBER;
+    return l.size() == 0 ? 0 : l.begin()[l.size() - 1].v;
+}
+inline int brc_convert_source_made() { return BrcConvertSource::made; }
+inline int brc_convert_source_gone() { return BrcConvertSource::gone; }
+inline int brc_convert_target_made() { return BrcConvertTarget::made; }
+inline int brc_convert_target_gone() { return BrcConvertTarget::gone; }
 // A bare `nullptr` constructor argument: exactly `std::nullptr_t`, else a null pointer conversion
 // to a by-value (function) pointer parameter; never a scalar or a reference.
 struct Np { int chosen; Np(std::nullptr_t) : chosen(1) {} Np(const long&) : chosen(2) {} };
@@ -539,10 +654,46 @@ struct RkConv { operator int() const { return 4; } };
 struct RkDflt { int chosen; RkDflt(int, int k = 5) : chosen(k) {} RkDflt(long) : chosen(2) {} };
 struct RkQual { int chosen; RkQual(int*, int k = 5) : chosen(k) {} RkQual(const int*) : chosen(2) {} };
 struct RkNonConst { int chosen; RkNonConst(int, int k = rk_five()) : chosen(k) {} RkNonConst(long) : chosen(2) {} };
+struct RkFloat { int chosen; RkFloat(double) : chosen(1) {} RkFloat(float) : chosen(2) {} };
+// C6 round 2: `new` delegates when the listed overload set cannot rank defaults.
+inline int c6_ctor_calls = 0;
+inline int c6_default_calls = 0;
+inline int c6_copy_calls = 0;
+inline int c6_move_calls = 0;
+inline int c6_default() { return ++c6_default_calls + 4; }
+inline void c6_reset() { c6_ctor_calls = c6_default_calls = c6_copy_calls = c6_move_calls = 0; }
+struct C6N { int chosen; C6N(int) : chosen(1) { ++c6_ctor_calls; }
+    C6N(bool) : chosen(7) { ++c6_ctor_calls; } };
+struct C6D1 { int chosen; C6D1(int, int k = c6_default()) : chosen(k) { ++c6_ctor_calls; } };
+struct C6Big { int value; C6Big(int v) : value(v) {} C6Big(const C6Big& b) : value(b.value) { ++c6_copy_calls; }
+    C6Big(C6Big&& b) : value(b.value) { ++c6_move_calls; } };
+struct C6H { int chosen; int value; C6H(const C6Big& b, int k = c6_default())
+    : chosen(k), value(b.value) { ++c6_ctor_calls; } C6H(long) : chosen(2), value(0) { ++c6_ctor_calls; } };
+struct C6NF { int chosen; C6NF(double, int k = c6_default()) : chosen(k) { ++c6_ctor_calls; }
+    C6NF(const char*) : chosen(2) { ++c6_ctor_calls; } };
+struct C6NF2 { int chosen; C6NF2(double) : chosen(1) { ++c6_ctor_calls; }
+    C6NF2(const char*) : chosen(2) { ++c6_ctor_calls; } };
 struct RkLD { int chosen; RkLD(long) : chosen(1) {} RkLD(double) : chosen(2) {} };
 struct RkID { int chosen; RkID(int) : chosen(1) {} RkID(double) : chosen(2) {} };
 struct RkCvIL { int chosen; RkCvIL(int) : chosen(1) {} RkCvIL(long) : chosen(2) {} };
 struct RkTwo { int chosen; RkTwo(int, long) : chosen(1) {} RkTwo(long, int) : chosen(2) {} };
 struct RkAmb { int chosen; RkAmb(int, int k = 5) : chosen(1) {} RkAmb(int) : chosen(2) {} };
 struct RkFnPtr { int chosen; RkFnPtr(void (*)(), int k = 5) : chosen(k) {} RkFnPtr(int*) : chosen(2) {} };
+// Expression-position constructor thunks must preserve exact scalar lvalue addresses.
+struct ExprConstRW { long v; ExprConstRW(const long& x, long* p) { *p = 9; v = x; } };
+struct ExprMutRW { long v; ExprMutRW(long& x, long* p) { *p = 9; v = x; x = 12; } };
+struct ExprConvertedRef { long v; ExprConvertedRef(const long& x, long* p) { *p = 9; v = x; } };
+inline int expr_arg_seen(ExprConstRW x) { return (int)x.v; }
+enum ExprUnscoped { ExprEnumValue = 17 };
+enum class ExprScoped : long { Value = 19 };
+struct ExprEnumPick {
+    int chosen; long value;
+    ExprEnumPick(ExprUnscoped&& x) : chosen(1), value((long)x) {}
+    ExprEnumPick(const long& x) : chosen(2), value(x) {}
+    ExprEnumPick(ExprScoped&& x) : chosen(3), value((long)x) {}
+};
+struct ExprIntRvalue { int chosen; int value;
+    ExprIntRvalue(int&& x) : chosen(1), value(x) {}
+    ExprIntRvalue(const long& x) : chosen(2), value((int)x) {}
+};
 }

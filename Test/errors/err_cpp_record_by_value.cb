@@ -9,15 +9,5 @@ extern int main()
     expect_error("takes or returns nontrivial type 'cppbv.Owner' by value") {
         cppbv.sum_owner(default);
     }
-    // The MS ABI ignores [[no_unique_address]], so the layout is representable there.
-    if const (__WINDOWS__) {
-        cppi.NuaBitBetween representable = default;
-        representable.b = 5;
-        representable.y = representable.b;
-    } else {
-        expect_error("layout is not representable") {
-            cppi.NuaBitBetween unsupported = default;
-        }
-    }
     return 0;
 }

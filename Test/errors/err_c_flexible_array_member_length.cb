@@ -26,11 +26,6 @@ int main()
 
     expect_error("flexible array member 'data' has no known length") {
         CBF_FlexInt* p = (CBF_FlexInt*)malloc((i64)sizeof(CBF_FlexInt) + 3 * (i64)sizeof(int));
-        i64 n = sizeof(p->data);
-    }
-
-    expect_error("flexible array member 'data' has no known length") {
-        CBF_FlexInt* p = (CBF_FlexInt*)malloc((i64)sizeof(CBF_FlexInt) + 3 * (i64)sizeof(int));
         i64 n = sizeof((p->data));
     }
 
@@ -51,8 +46,23 @@ int main()
     }
 
     expect_error("flexible array member 'data' has no known length") {
-        CBF_ZeroInt* p = (CBF_ZeroInt*)malloc((i64)sizeof(CBF_ZeroInt) + 3 * (i64)sizeof(int));
+        CBF_FlexInt* p = (CBF_FlexInt*)malloc((i64)sizeof(CBF_FlexInt) + 3 * (i64)sizeof(int));
         i64 n = sizeof(p->data);
+    }
+
+    expect_error("flexible array member 'data' has no known length") {
+        CBF_FlexInt* p = (CBF_FlexInt*)malloc((i64)sizeof(CBF_FlexInt) + 3 * (i64)sizeof(int));
+        i64 n = sizeof((*p).data);
+    }
+
+    expect_error("flexible array member 'data' has no known length") {
+        CBF_FlexInt t = {};
+        i64 n = sizeof(t.data);
+    }
+
+    expect_error("flexible array member 'data' has no known length") {
+        CBF_FlexInt* p = (CBF_FlexInt*)malloc((i64)sizeof(CBF_FlexInt) + 3 * (i64)sizeof(int));
+        (*p).data = p->data;
     }
 
     expect_error("cannot pass a raw pointer 'int*' as array-view parameter") {

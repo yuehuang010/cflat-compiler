@@ -235,6 +235,8 @@ namespace cflat_cinterop
         std::string ctype;          // canonical C spelling of the field type
         bool isBitfield = false;
         bool isZeroSize = false;     // C++ [[no_unique_address]] field has no storage in this record
+        bool isConst = false;        // the field itself is const-qualified
+        bool isMutable = false;      // C++ mutable field; ignores constness of its parent
         unsigned bitWidth = 0;
         uint64_t offsetBytes = 0;
         // Clang's size and alignment of the field type in bytes (0 for a bitfield). Lets the

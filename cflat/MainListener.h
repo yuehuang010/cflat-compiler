@@ -78,6 +78,26 @@ static std::vector<antlr4::ParserRuleContext*> DirectOperandPostfixes(antlr4::tr
     return layers;
 }
 
+// Installs the keep list for ONE operand and restores the enclosing list afterwards (also on a
+// LogError throw), so a nested `*p` / `&x` / assignment cannot wipe `sizeof((*p).data)`'s list.
+struct FlexibleArrayKeepScope
+{
+    std::vector<antlr4::ParserRuleContext*>& slot;
+    std::vector<antlr4::ParserRuleContext*> saved;
+    FlexibleArrayKeepScope(std::vector<antlr4::ParserRuleContext*>& keep,
+                           std::vector<antlr4::ParserRuleContext*> next)
+        : slot(keep), saved(std::move(keep)) { slot = std::move(next); }
+    ~FlexibleArrayKeepScope() { slot = std::move(saved); }
+    FlexibleArrayKeepScope(const FlexibleArrayKeepScope&) = delete;
+    FlexibleArrayKeepScope& operator=(const FlexibleArrayKeepScope&) = delete;
+};
+
+// A zero-length member (`T m[0]`) still undecayed: the one operand `sizeof` measures as 0.
+static bool IsZeroLengthArrayMemberOperand(const LLVMBackend::TypeAndValue& type)
+{
+    return type.IsFlexibleArrayMember && type.IsZeroLengthArrayMember;
+}
+
 static bool HasSoftDeclarationSpecifier(CFlatParser::DeclarationSpecifiersContext* specs,
                                         const std::string& name)
 {
@@ -2357,7 +2377,7 @@ inline Ctx* AsRuleCtx(antlr4::tree::ParseTree* node)
 // Unknown or deleted copy constructors also keep the established copy diagnostic.
 inline bool IsLastUseOfForeignCxxParam(
     LLVMBackend* compiler, antlr4::ParserRuleContext* useCtx,
-    const LLVMBackend::NamedVariable& source)
+    const LLVMBackend::NamedVariable& source, bool allowMoveOnlyReturn = false)
 {
     if (compiler == nullptr || useCtx == nullptr || source.FieldName.size() != 0
         || source.TypeAndValue.Pointer || source.TypeAndValue.IsAlias
@@ -2368,7 +2388,10 @@ inline bool IsLastUseOfForeignCxxParam(
     if (compiler->IsForeignNontrivialCxxClass(source.TypeAndValue.TypeName))
     {
         if (const auto* info = compiler->GetCxxClassInfo(source.TypeAndValue.TypeName);
-            info == nullptr || !info->hasCopyCtor || info->hasDeletedCopyCtor)
+            info == nullptr
+            || ((!info->hasCopyCtor || info->hasDeletedCopyCtor)
+                && !(allowMoveOnlyReturn
+                     && compiler->FindCxxMoveCtor(source.TypeAndValue.TypeName) != nullptr)))
             return false;
     }
     else if (!compiler->IsCopyableTypeForAnalysis(source.TypeAndValue.TypeName)) return false;
@@ -3907,6 +3930,7 @@ private:
         }
         ~DeclExpectedTypeScope() { *slot = saved; }
     };
+
 
     // Marks an expression position where a ternary owning temp may need per-arm cleanup
     // before its value is joined with a borrowed consumer.
@@ -6044,7 +6068,7 @@ public:
     void CarryCxxOperatorResult(antlr4::ParserRuleContext* ctx, llvm::Value* result,
                                 bool moreOperands, llvm::Value*& accValue,
                                 llvm::Value*& accStorage, bool& accIsRvalue,
-                                llvm::Type*& accRefType);
+                                llvm::Type*& accRefType, std::string& accSourceTypeName);
 
     void NormalizeCxxReferenceOperand(antlr4::ParserRuleContext* ctx,
                                       LLVMBackend::TypedValue& operand);
@@ -6117,7 +6141,9 @@ public:
     // nullptr if the operand type has no matching operator (fall back to primitive handling).
     llvm::Value* TryUnaryOperatorOverload(
         llvm::Value* operand, const std::string& op,
-        antlr4::ParserRuleContext* ctx, llvm::Value* operandStorage = nullptr);
+        antlr4::ParserRuleContext* ctx, llvm::Value* operandStorage = nullptr,
+        const LLVMBackend::NamedVariable* operandSource = nullptr,
+        bool operandIsConst = false);
     // Built-in unary operator on a C++ class through one implicit arithmetic conversion function.
     // 0 = not applicable, 1 = converted (value / namedVar updated), 2 = error reported.
     int ConvertUnaryOperandViaImplicitConversion(
@@ -6126,7 +6152,8 @@ public:
     // Free `operator@(const T&)` / free operator template on an imported C++ class.
     llvm::Value* TryUnaryFreeOperatorOverload(
         llvm::Value* operand, const std::string& op,
-        antlr4::ParserRuleContext* ctx, llvm::Value* operandStorage);
+        antlr4::ParserRuleContext* ctx, llvm::Value* operandStorage,
+        bool operandIsConst = false);
 
     // If an operator overload (e.g. operator+) just returned an owned heap string as an
     // unnamed SSA temporary, register it for end-of-full-expression cleanup. This is the
@@ -6187,7 +6214,13 @@ public:
         bool lhsIsRvalue = false, bool rhsIsRvalue = false,
         const std::string& lhsTypeName = std::string(),
         const std::string& rhsTypeName = std::string(),
-        int lhsPointerDepth = 0, bool lhsElemPointer = false);
+        int lhsPointerDepth = 0, bool lhsElemPointer = false,
+        const std::string& lhsCallerName = std::string(),
+        const std::string& lhsFieldName = std::string(), bool lhsIsElementAccess = false,
+        const std::string& rhsCallerName = std::string(),
+        const std::string& rhsFieldName = std::string(), bool rhsIsElementAccess = false,
+        const std::vector<LLVMBackend::ConditionalMoveSource>& lhsConditionalMoves = {},
+        const std::vector<LLVMBackend::ConditionalMoveSource>& rhsConditionalMoves = {});
 
     LLVMBackend::TypedValue ParseMultiplicativeExpression(CFlatParser::MultiplicativeExpressionContext* ctx,
                                                            ResultUse use = ResultUse::Value);
@@ -6294,7 +6327,23 @@ public:
                                             const LLVMBackend::NamedVariable& destination,
                                             const std::string& typeName,
                                             const LLVMBackend::NamedVariable& rhsNV,
-                                            std::string& refusal);
+                                            std::string& refusal,
+                                            bool probeOnly = false,
+                                            LLVMBackend::TypeAndValue* selectedReturn = nullptr);
+
+    enum class CxxAssignReturnKind { Void, ByValue, Reference, Unsupported };
+    CxxAssignReturnKind GetCxxAssignReturnKind(
+        antlr4::ParserRuleContext* ctx,
+        const std::string& typeName,
+        const LLVMBackend::TypeAndValue& selectedReturn);
+    llvm::Value* CxxAssignOperatorValue(
+        antlr4::ParserRuleContext* ctx,
+        const LLVMBackend::NamedVariable& namedVar,
+        const std::string& typeName,
+        llvm::Value* direct,
+        const LLVMBackend::TypeAndValue& selectedReturn,
+        LLVMBackend::NamedVariable* assignmentResult,
+        llvm::AllocaInst* slot = nullptr);
 
     // Construct one foreign nontrivial C++ value into a fresh or replacement slot. This is
     // shared by scalar struct fields and fixed-array elements so their copy/move decisions agree.

@@ -40,6 +40,7 @@ template <class T> bool operator<(const Box<T>& a, const Box<T>& b) { return a.v
 template <class T> bool operator>(const Box<T>& a, const Box<T>& b) { return a.v_ > b.v_; }
 template <class T> bool operator<=(const Box<T>& a, const Box<T>& b) { return a.v_ <= b.v_; }
 template <class T> bool operator>=(const Box<T>& a, const Box<T>& b) { return a.v_ >= b.v_; }
+inline int fold_box_value(Box<int> value) { return value.v_; }
 
 // A second class template that declares only == and <=> as free templates, the C++20 shape
 // libc++ uses for basic_string: the four relational operators exist only as REWRITES.
@@ -166,6 +167,68 @@ inline FoldBox operator&(const FoldBox& a, const FoldBox& b) { return FoldBox(a.
 inline FoldBox operator&&(const FoldBox& a, const FoldBox& b) { return FoldBox((a.v != 0) && (b.v != 0)); }
 inline FoldBox operator||(const FoldBox& a, const FoldBox& b) { return FoldBox((a.v != 0) || (b.v != 0)); }
 
+// Plain member/free reference operators make copy construction observable across a fold.
+struct FoldRef {
+    static inline int copies = 0;
+    static inline int dtors = 0;
+    int v_;
+    FoldRef(int v = 0) : v_(v) {}
+    FoldRef(const FoldRef& other) : v_(other.v_) { ++copies; }
+    ~FoldRef() { ++dtors; }
+    FoldRef operator+(const FoldRef& other) const { return FoldRef(v_ + other.v_); }
+    int get() const { return v_; }
+};
+inline FoldRef& operator&(FoldRef& a, const FoldRef& b) { a.v_ += b.v_; return a; }
+inline FoldRef& operator&(FoldRef&& a, const FoldRef& b) { a.v_ += b.v_; return a; }
+inline FoldRef& operator|(FoldRef& a, const FoldRef& b) { a.v_ += b.v_; return a; }
+inline FoldRef& operator|(FoldRef&& a, const FoldRef& b) { a.v_ += b.v_; return a; }
+inline FoldRef fold_ref_return(FoldRef& a, const FoldRef& b, const FoldRef& c)
+{ return a | b | c; }
+inline FoldRef fold_ref_return_temp(FoldRef& a, const FoldRef& b, const FoldRef& c)
+{ return c + c & a & b; }
+inline void fold_ref_reset() { FoldRef::copies = FoldRef::dtors = 0; }
+inline int fold_ref_copies() { return FoldRef::copies; }
+inline int fold_ref_dtors() { return FoldRef::dtors; }
+struct FoldRefThenValue {
+    static inline int copies = 0;
+    int v_;
+    FoldRefThenValue(int v = 0) : v_(v) {}
+    FoldRefThenValue(const FoldRefThenValue& other) : v_(other.v_) { ++copies; }
+    FoldRefThenValue& operator&(const FoldRefThenValue& other)
+    { v_ += other.v_; return *this; }
+    FoldRefThenValue operator|(const FoldRefThenValue& other) const
+    { return FoldRefThenValue(v_ + other.v_); }
+    int get() const { return v_; }
+};
+inline void fold_ref_then_value_reset() { FoldRefThenValue::copies = 0; }
+inline int fold_ref_then_value_copies() { return FoldRefThenValue::copies; }
+struct MemberFoldRef {
+    static inline int copies = 0;
+    static inline int dtors = 0;
+    int v_;
+    MemberFoldRef(int v = 0) : v_(v) {}
+    MemberFoldRef(const MemberFoldRef& other) : v_(other.v_) { ++copies; }
+    ~MemberFoldRef() { ++dtors; }
+    MemberFoldRef operator+(const MemberFoldRef& other) const { return MemberFoldRef(v_ + other.v_); }
+    MemberFoldRef& operator|(const MemberFoldRef& other)
+    { v_ += other.v_; return *this; }
+    int get() const { return v_; }
+};
+inline void member_fold_ref_reset() { MemberFoldRef::copies = MemberFoldRef::dtors = 0; }
+inline int member_fold_ref_copies() { return MemberFoldRef::copies; }
+inline int member_fold_ref_dtors() { return MemberFoldRef::dtors; }
+template<class T> struct MemberFold {
+    static inline int copies = 0;
+    int v_;
+    MemberFold(int v = 0) : v_(v) {}
+    MemberFold(const MemberFold& other) : v_(other.v_) { ++copies; }
+    MemberFold& operator|(const MemberFold& other)
+    { v_ += other.v_; return *this; }
+    int get() const { return v_; }
+};
+template<class T> void member_fold_reset() { MemberFold<T>::copies = 0; }
+template<class T> int member_fold_copies() { return MemberFold<T>::copies; }
+
 struct FoldScalar {
     int v;
     explicit FoldScalar(int x = 0) : v(x) {}
@@ -213,6 +276,16 @@ struct V { int v = 2; };
 inline V operator-(V a) { return V{-a.v * 7}; }
 struct MR { int v = 3; };
 inline int operator~(MR& a) { a.v += 10; return a.v; }
+inline MR mkMR() { MR r; r.v = 4; return r; }
+struct FRPair { int v = 0; };
+inline const FRPair gPairConst{4};
+inline FRPair mkFRPair(int v) { FRPair r; r.v = v; return r; }
+inline int operator-(FRPair& a) { ++a.v; return 100 + a.v; }
+inline int operator-(const FRPair& a) { return 200 + a.v; }
+inline int operator+(FRPair& a, FRPair& b) { ++a.v; return a.v * 100 + b.v; }
+inline int operator+(const FRPair& a, const FRPair& b) { return a.v * 1000 + b.v; }
+struct BoolBang { operator bool() const { return false; } int operator!() const { return 77; } };
+struct PtrConv { int v = 8; operator int*() { return &v; } };
 // A free operator returning the operand's own type (chains).
 struct FC { int v = 5; };
 inline FC operator-(const FC& a) { return FC{-a.v}; }
@@ -249,8 +322,37 @@ struct Fl { float v = 1.5f; operator float() const { return v; } };
 // Read-only operands: a const global and a const& result must never be written by a non-const operator.
 struct CM2 { int v = 3; int operator-() const { return v; } int operator-() { v += 10; return v; }
     int operator!() const { return 50; } int operator!() { v += 20; return 60; } };
+struct CN { int v = 3; };
+inline int operator-(CN& a) { a.v += 10; return 2; }
+inline int operator-(const CN& a) { return 1; }
+inline int operator~(CN& a) { a.v += 10; return 12; }
+inline int operator~(const CN& a) { return 11; }
 inline const CM2 gcm2{};
 inline const CM2& refcm2() { return gcm2; }
+struct RV { CN n; const CN& crefCN() { return n; } };
+struct B2 { int v = 1; };
+inline int operator-(B2& a) { a.v += 10; return 1; }
+inline int operator-(const B2& a) { return 2; }
+// Free binary operators with a SCALAR right operand, in both declaration orders: the left
+// operand's constness and value category pick the overload, as for a class right operand.
+struct SQ { int v = 1; };
+inline int operator+(SQ& a, int b) { a.v += 10; return 100 + b; }
+inline int operator+(const SQ& a, int b) { return 200 + b; }
+inline const SQ gSQ{};
+inline SQ mkSQ() { return SQ{}; }
+struct SR { int v = 1; };
+inline int operator+(const SR& a, int b) { return 200 + b; }
+inline int operator+(SR& a, int b) { a.v += 10; return 100 + b; }
+inline const SR gSR{};
+inline SR mkSR() { return SR{}; }
+}
+
+namespace cppfoputpl {
+struct T1 { int v = 1; };
+template<class T> int operator-(const T& a) { return 20 + a.v; }
+template<class T> int operator-(T& a) { a.v += 1; return 10 + a.v; }
+inline const T1 gT{};
+inline const T1& crefT() { return gT; }
 }
 // Global namespace: a free operator with no namespace prefix.
 struct FopunGlobal { int v = 4; };

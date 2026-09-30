@@ -59,6 +59,14 @@ inline Tr makeTr(int v) { if (v > 0) throw v; return Tr(v); }
 inline int safe(int v) noexcept { return v + 1; }
 typedef int (*Cb)(int);
 inline int guarded(Cb f, int x) { try { return f(x); } catch (int e) { return -e; } }
+// Callbacks returning a struct reach CFlat through a reverse ABI thunk (16 bytes in registers,
+// 24 bytes through sret); a throw from the CFlat body must unwind through that thunk.
+struct S16 { long long a; long long b; };
+struct S24 { long long a; long long b; long long c; };
+typedef S16 (*Cb16)(int);
+typedef S24 (*Cb24)(int);
+inline int guarded16(Cb16 f, int x) { try { return (int)f(x).a; } catch (int e) { return -e; } }
+inline int guarded24(Cb24 f, int x) { try { return (int)f(x).a; } catch (int e) { return -e; } }
 // Also catches std::bad_alloc (as -100).
 int guardedAlloc(Cb f, int x);
 }

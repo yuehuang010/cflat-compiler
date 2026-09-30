@@ -44,7 +44,7 @@ extern int main()
         h++;
     }
     // A `char*` row never binds a `char**` parameter (clang: invalid operands).
-    expect_error("no overload of 'operator-' matches") {
+    expect_error("no overload of 'cppsopd.operator-' matches") {
         char[4][4] rowsOnly = default;
         cppsopd.Deep deep;
         int viaRow = deep - rowsOnly[1];
@@ -60,6 +60,15 @@ extern int main()
     expect_error("no operator '+' for type 'cppfopun.N'") {
         cppfopun.N u = default;
         auto r = +u;
+    }
+    // A free unary operator taking T& cannot bind a returned temporary, including an sret result.
+    expect_error("C++ 'operator~' cannot bind its operand because the CFlat expression is an rvalue") {
+        int rejected = ~cppfopun.mkMR();
+    }
+    // Pointer-conversion dereference is rejected cleanly until the converted pointer can be carried as storage.
+    expect_error("cannot dereference C++ value of type 'cppfopun.PtrConv'") {
+        cppfopun.PtrConv p = default;
+        int value = *p;
     }
     expect_error("no operator '-' for type 'cppfopun.N'") {
         cppfopun.N u = default;

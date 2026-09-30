@@ -810,13 +810,34 @@ extern int main()
 
     if ((int)sizeof(CBF_ZeroInt) != cbf_flex_zero_size() || cbf_flex_zero_size() != 4) return 325;
     CBF_ZeroInt* zeroTail = (CBF_ZeroInt*)malloc((i64)sizeof(CBF_ZeroInt) + 2 * (i64)sizeof(int));
+    if ((int)sizeof(zeroTail->data) != 0 || (int)sizeof((*zeroTail).data) != 0) return 343;
+    // Only the bare member measures 0; an expression over it sizes normally, as in C11.
+    if ((int)sizeof(*zeroTail->data) != 4 || (int)sizeof(zeroTail->data[0]) != 4
+        || (int)sizeof(zeroTail->data + 1) != 8) return 348;
+    CBF_ZeroInt zeroLocal = {};
+    if ((int)sizeof(zeroLocal.data) != 0 || (int)alignof(zeroLocal.data) != 4) return 349;
     zeroTail->data[0] = 41;
     zeroTail->data[1] = 42;
     if (zeroTail->data[0] + zeroTail->data[1] != 83) return 326;
     free(zeroTail);
 
+    CBF_AnonFlex* anonFlex = (CBF_AnonFlex*)malloc(64);
+    anonFlex->k = 43;
+    anonFlex->data[0] = 44;
+    if (anonFlex->k != 43 || anonFlex->data[0] != 44) return 346;
+    CBF_AnonUnionFlex* anonUnionFlex = (CBF_AnonUnionFlex*)malloc(64);
+    anonUnionFlex->k = 45;
+    anonUnionFlex->data[0] = 46;
+    if (anonUnionFlex->k != 45 || anonUnionFlex->data[0] != 46) return 347;
+    free(anonFlex);
+    free(anonUnionFlex);
+    if ((int)alignof(flex->data) != 4) return 344;
+    CBF_FlexInt flexLocal = {};
+    if ((int)alignof(flexLocal.data) != 4 || (int)sizeof(*flexLocal.data) != 4) return 357;
+
     if ((int)sizeof(CBF_FlexByte) != cbf_flex_byte_size() || cbf_flex_byte_size() != 1) return 334;
     CBF_FlexByte* byteTail = (CBF_FlexByte*)malloc((i64)sizeof(CBF_FlexByte) + 2);
+    if ((int)alignof(byteTail->data) != 1) return 345;
     byteTail->data[0] = (u8)5;
     cbf_flex_byte_tail_write(byteTail, 1, (u8)8);
     if (byteTail->data[0] + cbf_flex_byte_tail_read(byteTail, 1) != 13) return 335;

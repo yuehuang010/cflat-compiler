@@ -4148,6 +4148,8 @@ void LLVMBackend::MapRawRecords(const cflat_cinterop::ExtractResult& raw, std::v
                 fe.access = f.access;
                 fe.isBitfield = f.isBitfield; fe.bitWidth = f.bitWidth;
                 fe.isZeroSize = f.isZeroSize;
+                fe.isConst = f.isConst;
+                fe.isMutable = f.isMutable;
                 fe.offsetBytes = f.offsetBytes;
                 fe.sizeBytes = f.sizeBytes; fe.alignBytes = f.alignBytes;
                 fe.bitOffset = f.bitOffset;
@@ -6418,6 +6420,8 @@ uint64_t LLVMBackend::CxxGroupHeaderHash(const CxxRequestGroup& group) const
             rawField.access = field.access;
             rawField.isBitfield = field.isBitfield;
             rawField.isZeroSize = field.isZeroSize;
+            rawField.isConst = field.isConst;
+            rawField.isMutable = field.isMutable;
             rawField.bitWidth = field.bitWidth;
             rawField.offsetBytes = field.offsetBytes;
             rawField.sizeBytes = field.sizeBytes;
@@ -8775,6 +8779,10 @@ bool LLVMBackend::RequestCxxFunctionTemplate(const std::string& functionName,
         // A scalar at a reference position is spelled by value category; see the registration.
         bool categorySensitive = false;
         size_t flatParameterIndex = parameterSpellings.size();
+        std::map<size_t, std::pair<size_t, std::string>> scalarBackedParams;
+        std::map<size_t, std::pair<size_t, std::string>> classBackedParams;
+        std::string wrapperBodyPrefix;
+        bool wrapperNeedsInitializerList = false;
         for (size_t i = selected->kind == cflat_cinterop::RawFunctionTemplate::InstanceMember ? 1u : 0u;
              i < arguments.size(); ++i)
         {
@@ -8861,6 +8869,39 @@ bool LLVMBackend::RequestCxxFunctionTemplate(const std::string& functionName,
             }
             if (const auto* brace = braceForArgument(i))
             {
+                const std::string* rawParameter = templateParameterAt(*selected, declaredIndex);
+                if (rawParameter != nullptr
+                    && rawParameter->find("initializer_list") != std::string::npos
+                    && !brace->elements.empty())
+                {
+                    const bool classElements = brace->hasCxxClassElements
+                        && !brace->hasMixedElements && !brace->cxxElementType.empty();
+                    std::string element;
+                    if (classElements)
+                    {
+                        if (!CxxSpellingForCflatType(brace->cxxElementType, element))
+                            return noMatch("a C++ brace-list class element has no C++ spelling");
+                    }
+                    else element = braceElementSpelling(*brace, {});
+                    if (element.empty())
+                        return noMatch("brace arguments must contain scalar values of one type");
+                    if (!classElements
+                        && !CheckCxxBraceNarrowing(*brace, element, lookupName, "parameter", error))
+                        return false;
+                    const size_t dataIndex = flatParameterIndex++;
+                    const std::string il = "__cflat_tpl_il_" + std::to_string(i);
+                    const std::string listType = "std::initializer_list<" + element + ">";
+                    parameterSpellings.push_back("const " + element + " *");
+                    wrapperBodyPrefix += CxxInitializerListOverStorage(
+                        listType, il, "p" + std::to_string(dataIndex), brace->elements.size());
+                    callArguments.push_back(listType + "(" + il + ")");
+                    if (classElements)
+                        classBackedParams[brace->argumentIndex] = {
+                            dataIndex, brace->cxxElementType };
+                    else scalarBackedParams[brace->argumentIndex] = { dataIndex, element };
+                    wrapperNeedsInitializerList = true;
+                    continue;
+                }
                 std::string braceType = braceElementSpelling(*brace, {});
                 if (brace->elements.empty())
                 {
@@ -9114,7 +9155,9 @@ bool LLVMBackend::RequestCxxFunctionTemplate(const std::string& functionName,
             return std::format("__cflat_tpl_{:016x}", HashWrapperKey(hashKey));
         };
         auto makeWrapperInput = [&](const std::string& name, const std::vector<std::string>& calls) {
-            std::string wrapperSource = "extern \"C\" __attribute__((weak)) decltype(auto) " + name + "(";
+            std::string wrapperSource = wrapperNeedsInitializerList
+                ? "#include <initializer_list>\n" : std::string();
+            wrapperSource += "extern \"C\" __attribute__((weak)) decltype(auto) " + name + "(";
             for (size_t i = 0; i < parameterSpellings.size(); ++i)
             {
                 if (i != 0) wrapperSource += ", ";
@@ -9122,7 +9165,7 @@ bool LLVMBackend::RequestCxxFunctionTemplate(const std::string& functionName,
             }
             wrapperSource += ")";
             if (selected->isNoexcept && !infixForm) wrapperSource += " noexcept";
-            wrapperSource += " { return " + makeTargetCall(calls) + "; }\n";
+            wrapperSource += " { " + wrapperBodyPrefix + "return " + makeTargetCall(calls) + "; }\n";
             return generatedTypeSource + wrapperSource;
         };
         std::string wrapperName = makeWrapperName(callArguments);
@@ -9141,11 +9184,13 @@ bool LLVMBackend::RequestCxxFunctionTemplate(const std::string& functionName,
         const bool uniqueForConst = constSpelled && infixOperator.empty()
             && !functionName.starts_with("operator")
             && functionName.find(".operator") == std::string::npos;
+        const bool uniqueForBraceBacking = !scalarBackedParams.empty() || !classBackedParams.empty();
         if (!explicitArgs.empty() || infixForm || uniqueForCategory || uniqueForConst
-            || uniqueRegistration)
+            || uniqueForBraceBacking || uniqueRegistration)
         {
             registeredName = wrapperName;
-            if (functionTable.find(wrapperName) != functionTable.end())
+            if (functionTable.find(wrapperName) != functionTable.end()
+                && scalarBackedParams.empty() && classBackedParams.empty())
             {
                 ExpandCxxBraceArguments(arguments, braceArguments);
                 return true;
@@ -9300,6 +9345,7 @@ bool LLVMBackend::RequestCxxFunctionTemplate(const std::string& functionName,
         const std::string defaultRegisteredName = instanceWrapper ? functionName : lookupName;
         if (registeredName.empty()) registeredName = defaultRegisteredName;
         bound.name = registeredName;
+        bound.isInstanceTemplateWrapper = instanceWrapper;
         RegisterCSignatures({ bound }, selected->file.empty() ? group.headers.front() : selected->file);
         bool registered = false;
         if (auto it = functionTable.find(registeredName); it != functionTable.end())
@@ -9312,7 +9358,91 @@ bool LLVMBackend::RequestCxxFunctionTemplate(const std::string& functionName,
                            selected->file.empty() ? group.headers.front() : selected->file,
                            selected->line, selected->col < 0 ? 0 : selected->col,
                            "template <...> " + selected->name + "(...)");
-        ExpandCxxBraceArguments(arguments, braceArguments);
+        std::vector<CxxBraceArgument> backedBraceArguments = braceArguments;
+        for (auto& brace : backedBraceArguments)
+        {
+            auto backed = scalarBackedParams.find(brace.argumentIndex);
+            if (backed == scalarBackedParams.end()) continue;
+            TypeAndValue elementType;
+            llvm::Type* elementTy = MapCTypeToTypeAndValue(backed->second.second, elementType, true)
+                ? GetType(elementType) : nullptr;
+            if (elementTy == nullptr || (!elementTy->isIntegerTy() && !elementTy->isFloatingPointTy())
+                || backed->second.first >= bound.params.size())
+            {
+                error = std::format("C++ brace-list element type '{}' has no scalar layout",
+                                    backed->second.second);
+                return false;
+            }
+            NamedVariable data;
+            if (!EmitCxxBraceBacking(brace, elementType, elementTy, bound.params[backed->second.first],
+                                     lookupName, "parameter", data, error))
+                return false;
+            brace.wrapperArguments.clear();
+            brace.wrapperArguments.push_back(std::move(data));
+        }
+        for (auto& brace : backedBraceArguments)
+        {
+            auto backed = classBackedParams.find(brace.argumentIndex);
+            if (backed == classBackedParams.end()) continue;
+            TypeAndValue elementType;
+            elementType.TypeName = backed->second.second;
+            llvm::Type* elementTy = GetType(elementType);
+            if (elementTy == nullptr || !elementTy->isSized()
+                || backed->second.first >= bound.params.size())
+            {
+                error = std::format("C++ brace-list element type '{}' has no class layout",
+                                    backed->second.second);
+                return false;
+            }
+            const uint64_t align = GetEffectiveAlignmentForType(backed->second.second, elementTy);
+            auto* arrayTy = llvm::ArrayType::get(elementTy, brace.elements.size());
+            auto* array = AllocaAtEntry(arrayTy, nullptr, "cxx.tpl.brace.array", align);
+            std::vector<llvm::Value*> slots;
+            slots.reserve(brace.elements.size());
+            for (size_t index = 0; index < brace.elements.size(); ++index)
+            {
+                auto* dst = builder->CreateInBoundsGEP(
+                    arrayTy, array, { builder->getInt64(0), builder->getInt64(index) },
+                    "cxx.tpl.brace.element");
+                NamedVariable& source = brace.elements[index];
+                auto* src = source.Storage;
+                if (src == nullptr && source.IsRvalue && source.Primary != nullptr
+                    && source.Primary->getType() == elementTy && elementTy->isStructTy()
+                    && HasTrivialCxxDtor(backed->second.second))
+                {
+                    src = AllocaAtEntry(elementTy, nullptr, "cxx.tpl.brace.source", align);
+                    builder->CreateStore(source.Primary, src);
+                }
+                if (src == nullptr
+                    || !EmitCxxCopyOrMoveConstruct(
+                        backed->second.second, dst, src, source.IsExplicitMove || source.IsRvalue,
+                        "into a function-template initializer_list element"))
+                {
+                    if (src == nullptr)
+                        error = std::format("cannot copy C++ class '{}' into a brace-list element: "
+                                            "the element is not addressable",
+                                            DisplayCxxClassName(backed->second.second));
+                    return false;
+                }
+                slots.push_back(dst);
+            }
+            if (IsForeignNontrivialCxxClass(backed->second.second))
+                for (auto it = slots.rbegin(); it != slots.rend(); ++it)
+                    RegisterOwnedStructTemp(*it, backed->second.second);
+            auto* dataPtr = builder->CreateInBoundsGEP(
+                arrayTy, array, { builder->getInt64(0), builder->getInt64(0) },
+                "cxx.tpl.brace.data");
+            NamedVariable data;
+            data.TypeAndValue = bound.params[backed->second.first];
+            data.TypeAndValue.VariableName.clear();
+            data.Primary = dataPtr;
+            data.BaseType = dataPtr->getType();
+            data.Storage = nullptr;
+            data.IsRvalue = true;
+            brace.wrapperArguments.clear();
+            brace.wrapperArguments.push_back(std::move(data));
+        }
+        ExpandCxxBraceArguments(arguments, backedBraceArguments);
         return true;
 }
 
@@ -10020,7 +10150,7 @@ bool LLVMBackend::RequestCxxBraceFunction(const std::string& functionName,
             if (!element.TypeAndValue.Pointer && IsCxxRecord(element.TypeAndValue.TypeName))
             {
                 if (!element.IsRvalue) return "const " + spelling + " &";
-                return spelling;
+                return spelling + " &&";
             }
             return spelling;
         };
@@ -10029,8 +10159,11 @@ bool LLVMBackend::RequestCxxBraceFunction(const std::string& functionName,
         std::map<size_t, std::pair<size_t, size_t>> classWrapperParams;
         // Backed scalar lists: argument index -> (thunk parameter index, element spelling).
         std::map<size_t, std::pair<size_t, std::string>> scalarBackedParams;
+        // Converted class lists: argument index -> (caller array parameter index, element type).
+        std::map<size_t, std::pair<size_t, std::string>> convertedClassBackedParams;
         std::string wrapperBodyPrefix;
         bool wrapperNeedsInitializerList = false;
+        bool wrapperNeedsPlacementNew = false;
         size_t flatParameterIndex = 0;
         if (selected.instance)
         {
@@ -10086,6 +10219,20 @@ bool LLVMBackend::RequestCxxBraceFunction(const std::string& functionName,
                                 braceContainer.pop_back();
                         }
                         std::string convertedElements;
+                        std::string callerArray;
+                        size_t callerArrayIndex = static_cast<size_t>(-1);
+                        const bool callerBacked = effectiveKind == CxxBraceContainerKind::InitializerList
+                            || effectiveKind == CxxBraceContainerKind::ArrayRef
+                            || effectiveKind == CxxBraceContainerKind::PointerPairClass;
+                        if (callerBacked)
+                        {
+                            wrapperNeedsPlacementNew = true;
+                            callerArrayIndex = flatParameterIndex++;
+                            callerArray = "p" + std::to_string(callerArrayIndex);
+                            parameterSpellings.push_back(elementType + " *");
+                            convertedClassBackedParams[brace->argumentIndex] = {
+                                callerArrayIndex, elementType };
+                        }
                         for (size_t element = 0; element < brace->elements.size(); ++element)
                         {
                             const auto& source = brace->elements[element];
@@ -10112,14 +10259,30 @@ bool LLVMBackend::RequestCxxBraceFunction(const std::string& functionName,
                             if (!source.TypeAndValue.Pointer && IsCxxRecord(cflatTypeOf(source))
                                 && source.IsRvalue)
                                 expression = "static_cast<" + sourceType + " &&>(" + expression + ")";
-                            if (!convertedElements.empty()) convertedElements += ", ";
-                            convertedElements += elementType + "(" + expression + ")";
+                            if (callerBacked)
+                                wrapperBodyPrefix += "::new (" + callerArray + " + "
+                                    + std::to_string(element) + ") " + elementType + "(" + expression
+                                    + "); ";
+                            else
+                            {
+                                if (!convertedElements.empty()) convertedElements += ", ";
+                                convertedElements += elementType + "(" + expression + ")";
+                            }
                         }
                         if (effectiveKind == CxxBraceContainerKind::InitializerList)
                         {
                             wrapperNeedsInitializerList = true;
-                            callArguments.push_back("std::initializer_list<" + elementType + ">{"
-                                                    + convertedElements + "}");
+                            const std::string listType = "std::initializer_list<" + elementType + ">";
+                            if (callerBacked)
+                            {
+                                const std::string il = "__cflat_converted_il_"
+                                    + std::to_string(brace->argumentIndex);
+                                wrapperBodyPrefix += CxxInitializerListOverStorage(
+                                    listType, il, callerArray, brace->elements.size());
+                                callArguments.push_back(listType + "(" + il + ")");
+                            }
+                            else
+                                callArguments.push_back(listType + "{" + convertedElements + "}");
                         }
                         else if (effectiveKind == CxxBraceContainerKind::Vector)
                         {
@@ -10127,10 +10290,11 @@ bool LLVMBackend::RequestCxxBraceFunction(const std::string& functionName,
                         }
                         else
                         {
-                            const std::string arrayName = "__cflat_brace_array_"
-                                + std::to_string(brace->argumentIndex);
-                            wrapperBodyPrefix += elementType + " " + arrayName + "[] = {"
-                                + convertedElements + "}; ";
+                            const std::string arrayName = callerBacked ? callerArray
+                                : "__cflat_brace_array_" + std::to_string(brace->argumentIndex);
+                            if (!callerBacked)
+                                wrapperBodyPrefix += elementType + " " + arrayName + "[] = {"
+                                    + convertedElements + "}; ";
                             callArguments.push_back(braceContainer + "(" + arrayName + ", "
                                                     + std::to_string(brace->elements.size()) + ")");
                         }
@@ -10274,10 +10438,11 @@ bool LLVMBackend::RequestCxxBraceFunction(const std::string& functionName,
         }
         const std::string wrapperName = std::format("__cflat_tpl_{:016x}", HashWrapperKey(hashKey));
         std::string wrapperSource = classWrapperParams.empty() && wrapperBodyPrefix.empty()
-            && !wrapperNeedsInitializerList
+            && !wrapperNeedsInitializerList && !wrapperNeedsPlacementNew
             ? std::string() : "#include <cstddef>\n";
-        if (wrapperNeedsInitializerList)
+        if (wrapperNeedsInitializerList || wrapperNeedsPlacementNew)
             wrapperSource = "#include <cstddef>\n#include <initializer_list>\n";
+        if (wrapperNeedsPlacementNew) wrapperSource += "#include <new>\n";
         const bool returnsVoid = TrimCxxBraceType(selected.retType) == "void";
         wrapperSource += "extern \"C\" " + std::string(returnsVoid ? "void" : "auto")
             + " " + wrapperName + "(";
@@ -10454,6 +10619,55 @@ bool LLVMBackend::RequestCxxBraceFunction(const std::string& functionName,
             brace.wrapperArguments.push_back(std::move(data));
             brace.wrapperArguments.push_back(std::move(count));
         }
+        for (auto& brace : braceArguments)
+        {
+            auto backed = convertedClassBackedParams.find(brace.argumentIndex);
+            if (backed == convertedClassBackedParams.end()) continue;
+            TypeAndValue elementType;
+            if (!MapCTypeToTypeAndValue(backed->second.second, elementType, true))
+            {
+                error = std::format("C++ brace-list element type '{}' has no class layout",
+                                    backed->second.second);
+                return false;
+            }
+            llvm::Type* elementTy = GetType(elementType);
+            if (elementTy == nullptr || !elementTy->isSized()
+                || backed->second.first >= bound.params.size())
+            {
+                error = std::format("C++ brace-list element type '{}' has no class layout",
+                                    backed->second.second);
+                return false;
+            }
+            const uint64_t align = GetEffectiveAlignmentForType(backed->second.second, elementTy);
+            auto* arrayTy = llvm::ArrayType::get(elementTy, brace.elements.size());
+            auto* array = AllocaAtEntry(arrayTy, nullptr, "cxx.brace.converted", align);
+            std::vector<llvm::Value*> slots;
+            slots.reserve(brace.elements.size());
+            for (size_t element = 0; element < brace.elements.size(); ++element)
+            {
+                auto* dst = builder->CreateInBoundsGEP(
+                    arrayTy, array, { builder->getInt64(0), builder->getInt64(element) },
+                    "cxx.brace.converted.element");
+                slots.push_back(dst);
+            }
+            if (IsForeignNontrivialCxxClass(elementType.TypeName))
+                for (auto it = slots.rbegin(); it != slots.rend(); ++it)
+                    RegisterOwnedStructTemp(*it, elementType.TypeName);
+            auto* dataPtr = builder->CreateInBoundsGEP(
+                arrayTy, array, { builder->getInt64(0), builder->getInt64(0) },
+                "cxx.brace.converted.data");
+            NamedVariable data;
+            data.TypeAndValue = bound.params[backed->second.first];
+            data.TypeAndValue.VariableName.clear();
+            data.Primary = dataPtr;
+            data.BaseType = dataPtr->getType();
+            data.Storage = nullptr;
+            data.IsRvalue = true;
+            brace.wrapperArguments.clear();
+            brace.wrapperArguments.push_back(std::move(data));
+            brace.wrapperArguments.insert(brace.wrapperArguments.end(), brace.elements.begin(),
+                                          brace.elements.end());
+        }
         ExpandCxxBraceArguments(arguments, braceArguments);
         return true;
 }
@@ -10577,7 +10791,6 @@ bool LLVMBackend::RequestCxxBraceConstructor(
             // so the candidate is not viable.
             bool undeducible = false;
         };
-        bool unrankablePack = false;
         std::vector<SelectorCandidate> selectorCandidates;
         std::string selectorNs;
         if (!backedList.empty())
@@ -10596,10 +10809,71 @@ bool LLVMBackend::RequestCxxBraceConstructor(
                     std::string parameter = member.paramTypes[n];
                     if (parameter.ends_with("..."))
                     {
-                        // An empty trailing pack takes no part; a pack an argument reaches is
-                        // not mirrored.
                         if (n > arguments.size()) break;
-                        unrankablePack = true;
+                        std::string packPattern = parameter.substr(0, parameter.size() - 3);
+                        const bool constLvaluePack = packPattern.starts_with("const ")
+                            && packPattern.find('*') == std::string::npos
+                            && packPattern.ends_with('&');
+                        if (packPattern.find('&') != std::string::npos && !constLvaluePack)
+                        {
+                            error = std::format("a C++ constructor of '{}' passes an argument into a "
+                                                "parameter pack beside its brace-list constructors; "
+                                                "CFlat cannot rank that call",
+                                                DisplayCxxClassName(typeName));
+                            return false;
+                        }
+                        // A pattern naming another template parameter too (`pair<U, A>&...`), or only a
+                        // non-type one (`array<int, N>&...`), cannot be mirrored per element; refuse as
+                        // master did rather than drop the candidate (a sibling would win silently).
+                        std::set<std::string> patternParams;
+                        for (const std::string_view prefix : { "type-parameter-", "value-parameter-" })
+                            for (size_t at = packPattern.find(prefix); at != std::string::npos;
+                                 at = packPattern.find(prefix, at + 1))
+                            {
+                                size_t end = at + prefix.size();
+                                while (end < packPattern.size()
+                                       && (std::isdigit((unsigned char)packPattern[end]) != 0
+                                           || packPattern[end] == '-'))
+                                    ++end;
+                                patternParams.insert(packPattern.substr(at, end - at));
+                            }
+                        if (patternParams.size() > 1
+                            || packPattern.find("type-parameter-") == std::string::npos)
+                        {
+                            error = std::format("a C++ constructor of '{}' passes an argument into a "
+                                                "parameter pack beside its brace-list constructors; "
+                                                "CFlat cannot rank that call",
+                                                DisplayCxxClassName(typeName));
+                            return false;
+                        }
+                        for (size_t packed = n - 1; packed < arguments.size(); ++packed)
+                        {
+                            const std::string name = "packarg_" + std::to_string(packed);
+                            candidate.templateParams.push_back(name);
+                            candidate.templateDeclarators.push_back("class " + name);
+                            std::string expanded = packPattern;
+                            bool substituted = false;
+                            for (size_t at = expanded.find("type-parameter-"); at != std::string::npos;
+                                 at = expanded.find("type-parameter-", at + name.size()))
+                            {
+                                size_t end = at + std::string_view("type-parameter-").size();
+                                while (end < expanded.size()
+                                       && (std::isdigit((unsigned char)expanded[end]) != 0
+                                           || expanded[end] == '-'))
+                                    ++end;
+                                expanded.replace(at, end - at, name);
+                                substituted = true;
+                            }
+                            if (!substituted)
+                            {
+                                viable = false;
+                                break;
+                            }
+                            candidate.params.push_back(expanded);
+                            key += expanded + "|";
+                        }
+                        if (!viable) break;
+                        break;
                     }
                     if (auto kind = backedList.find(n - 1); kind != backedList.end())
                     {
@@ -10642,13 +10916,6 @@ bool LLVMBackend::RequestCxxBraceConstructor(
                 if (viable && seen.insert(key).second) selectorCandidates.push_back(std::move(candidate));
             }
             if (selectorCandidates.empty()) backedList.clear();
-            if (unrankablePack)
-            {
-                error = std::format("a C++ constructor of '{}' passes an argument into a parameter "
-                                    "pack beside its brace-list constructors; CFlat cannot rank "
-                                    "that call", DisplayCxxClassName(typeName));
-                return false;
-            }
             if (!selectorCandidates.empty()
                 && std::all_of(selectorCandidates.begin(), selectorCandidates.end(),
                                [](const SelectorCandidate& c) { return c.undeducible; }))
@@ -10918,10 +11185,13 @@ bool LLVMBackend::RequestCxxBraceConstructor(
                 if (!backedList.empty())
                 {
                     // The chosen constructor's own parameter (clang's pick among several).
-                    parameterSpellings.push_back(useSelector
+                    const std::string selectedParameter = useSelector
                         ? selectorNs + "::R::p" + std::to_string(i)
-                        : selectorCandidates.front().params[i]);
-                    callArguments.push_back("p" + std::to_string(flatParameterIndex++));
+                        : selectorCandidates.front().params[i];
+                    parameterSpellings.push_back(selectedParameter);
+                    const std::string argument = "p" + std::to_string(flatParameterIndex++);
+                    callArguments.push_back("static_cast<" + selectedParameter + ">("
+                                            + argument + ")");
                     continue;
                 }
                 if (rawIndex >= selected->paramTypes.size())
@@ -10955,7 +11225,7 @@ bool LLVMBackend::RequestCxxBraceConstructor(
         hashKey += selectorSource + wrapperBodyPrefix;
         wrapperName = std::format("__cflat_tpl_{:016x}", HashWrapperKey(hashKey));
         std::string wrapperSource = wrapperNeedsInitializerList
-            ? "#include <initializer_list>\n" : std::string();
+            ? "#include <initializer_list>\n#include <new>\n" : std::string();
         wrapperSource += selectorSource;
         wrapperSource += "extern \"C\" __attribute__((weak)) void " + wrapperName + "(";
         for (size_t i = 0; i < parameterSpellings.size(); ++i)
@@ -11098,6 +11368,43 @@ bool LLVMBackend::CxxConstructorNeedsClangResolution(
             return true;
         }
         return false;
+}
+
+bool LLVMBackend::CxxCtorSetRequiresFloatToInteger(
+        const std::string& typeName, const std::vector<TypeAndValue>& argTypes) const
+{
+        if (argTypes.size() != 1 || argTypes.front().IsFloatingPoint() == -1) return false;
+
+        const CxxClassInfo* info = GetCxxClassInfoWithConstructors(typeName);
+        if (info == nullptr || info->hasCtorTemplate) return false;
+        bool sawCandidate = false;
+        for (const CxxClassInfo::Structor& ctor : info->constructors)
+        {
+            if (ctor.isDeleted || ctor.params.empty()) continue;
+            if (ctor.isCopyCtor || ctor.isMoveCtor) continue;
+            const size_t paramCount = ctor.params.size() - 1;
+            if (argTypes.size() > paramCount) continue;
+            bool defaultsAvailable = true;
+            for (size_t i = argTypes.size(); i < paramCount; ++i)
+                if (i + 1 >= ctor.defaultArgs.size() || ctor.defaultArgs[i + 1].kind.empty())
+                    defaultsAvailable = false;
+            if (!defaultsAvailable) continue;
+
+            const TypeAndValue& param = ctor.params[1];
+            const bool reference = param.Pointer && !param.ElemPointer
+                && (param.IsAlias || param.IsRvalueRef || param.IsCxxConstRef);
+            // A floating argument never reaches a pointer parameter, nor a non-const lvalue
+            // reference; `const T&` and `T&&` bind a converted temporary like `T`.
+            if (param.Pointer && !reference) continue;
+            if (reference && !param.IsCxxConstRef && !param.IsRvalueRef) continue;
+            TypeAndValue arithmetic = param;
+            arithmetic.Pointer = false;
+            arithmetic.IsAlias = arithmetic.IsRvalueRef = arithmetic.IsCxxConstRef = false;
+            if (arithmetic.IsInteger() == -1 && arithmetic.IsFloatingPoint() == -1) continue;
+            if (arithmetic.IsFloatingPoint() != -1) return false;
+            sawCandidate = true;
+        }
+        return sawCandidate;
 }
 
 void LLVMBackend::ConvertCxxCtorThunkArguments(const std::string& wrapperName,
@@ -13888,12 +14195,15 @@ void LLVMBackend::CheckCxxNamespaceConflicts(const std::vector<CSigEntry>& sigs,
         for (const CRecordEntry& r : records)
         {
             batchClasses.insert(r.name);
-            note(r.name, { true, "class", "class:" + r.name, "a class", "" });
+            const bool isTemplateSpecialization = r.canonicalCtype.find('<') != std::string::npos;
+            note(r.name, { true, "class",
+                           (isTemplateSpecialization ? "class-template:" : "class:") + r.name,
+                           "a class", "" });
         }
         for (const std::string& t : classTemplateNames)
         {
             batchClasses.insert(t);
-            note(t, { true, "class", "class:" + t, "a class template", "" });
+            note(t, { true, "class", "class-template:" + t, "a class template", "" });
         }
         for (const auto& [alias, target] : classUsings)
             note(alias, { true, "alias", "class:" + target, "an alias of '" + target + "'", "" });
@@ -14192,6 +14502,18 @@ bool LLVMBackend::InsertCBitfieldLayoutPadding(const CRecordEntry& r,
                                                std::vector<DeclTypeAndValue>& fields,
                                                std::vector<BitfieldInfo>& bitfields)
 {
+        auto candidateFields = fields;
+        auto candidateBitfields = bitfields;
+        if (!TryInsertCBitfieldLayoutPadding(r, candidateFields, candidateBitfields)) return false;
+        fields.swap(candidateFields);
+        bitfields.swap(candidateBitfields);
+        return true;
+    }
+
+bool LLVMBackend::TryInsertCBitfieldLayoutPadding(const CRecordEntry& r,
+                                                  std::vector<DeclTypeAndValue>& fields,
+                                                  std::vector<BitfieldInfo>& bitfields)
+{
         if (r.isUnion || fields.empty()) return false;
         const llvm::DataLayout& dl = module->getDataLayout();
         std::vector<uint64_t> desired(fields.size());
@@ -14239,8 +14561,18 @@ bool LLVMBackend::InsertCBitfieldLayoutPadding(const CRecordEntry& r,
                     static_cast<unsigned>(cf->bitOffset - storageStart[i] * 8) + cf->bitWidth);
             }
             if (usedBits != 0)
-                fields[i].TypeName = usedBits <= 8 ? "u8" : usedBits <= 16 ? "u16"
-                    : usedBits <= 32 ? "u32" : usedBits <= 64 ? "u64" : fields[i].TypeName;
+            {
+                if (r.isCxx && !r.isPacked)
+                {
+                    fields[i].TypeName = "u8";
+                    fields[i].ConstArraySize = (usedBits + 7) / 8;
+                }
+                else
+                {
+                    fields[i].TypeName = usedBits <= 8 ? "u8" : usedBits <= 16 ? "u16"
+                        : usedBits <= 32 ? "u32" : usedBits <= 64 ? "u64" : fields[i].TypeName;
+                }
+            }
         }
 
         for (size_t i = 0; i < fields.size(); ++i)
@@ -14377,16 +14709,77 @@ void LLVMBackend::RegisterCxxRecordShell(const CRecordEntry& r, const std::strin
 void LLVMBackend::EnsureCxxRecordLayoutsForMemberSignatures(const CRecordEntry& record,
                                                              const std::string& memberFilter)
 {
-        auto ensure = [&](const std::string& spelling) {
+        auto ensure = [&](const std::string& spelling, bool allowPointerRequest) {
             TypeAndValue type;
             bool mapped = MapCTypeToTypeAndValue(spelling, type, true);
             // std::function specializations are requested by the lazy std::function bind under
             // their closure identity; a spelling-derived identity here would be a second type.
-            if (!mapped && !memberFilter.empty() && !IsTopLevelStdFunctionSpelling(spelling)
-                && spelling.find('*') == std::string::npos
-                && spelling.find('&') == std::string::npos)
+            const size_t templateClose = spelling.rfind('>');
+            auto pointerCvRefSuffixOnly = [&]() {
+                if (templateClose == std::string::npos) return false;
+                for (size_t i = templateClose + 1; i < spelling.size(); ++i)
+                    if (spelling[i] != '*' && spelling[i] != '&'
+                        && !std::isspace((unsigned char)spelling[i]))
+                    {
+                        // cv qualifiers are accepted as complete words only.
+                        const std::string_view tail(spelling.data() + i, spelling.size() - i);
+                        if (!tail.starts_with("const") && !tail.starts_with("volatile")) return false;
+                        if (tail.starts_with("const") && tail.size() > 5
+                            && !std::isspace((unsigned char)tail[5]) && tail[5] != '*' && tail[5] != '&')
+                            return false;
+                        if (tail.starts_with("volatile") && tail.size() > 8
+                            && !std::isspace((unsigned char)tail[8]) && tail[8] != '*' && tail[8] != '&')
+                            return false;
+                        i += tail.starts_with("const") ? 4 : 7;
+                    }
+                return true;
+            };
+            const bool pointerToTemplateSpecialization = templateClose != std::string::npos
+                && spelling.find('<') != std::string::npos
+                && spelling.find('*', templateClose) != std::string::npos
+                && pointerCvRefSuffixOnly();
+            const bool mappedAsOpaquePointer = mapped && type.Pointer
+                && (type.TypeName.empty() || type.TypeName == "void");
+            const bool pointerSpelling = spelling.find('*') != std::string::npos;
+            const std::string valueSpelling = CxxMemberValueSpelling(spelling);
+            std::string stdFunctionIdentitySpelling = spelling;
+            for (bool changed = true; changed; )
             {
-                const std::string valueSpelling = CxxMemberValueSpelling(spelling);
+                changed = false;
+                while (!stdFunctionIdentitySpelling.empty()
+                       && std::isspace((unsigned char)stdFunctionIdentitySpelling.back()))
+                    stdFunctionIdentitySpelling.pop_back();
+                if (!stdFunctionIdentitySpelling.empty()
+                    && (stdFunctionIdentitySpelling.back() == '*'
+                        || stdFunctionIdentitySpelling.back() == '&'))
+                {
+                    stdFunctionIdentitySpelling.pop_back();
+                    changed = true;
+                    continue;
+                }
+                for (const char* cv : { "const", "volatile" })
+                {
+                    const size_t n = std::strlen(cv);
+                    if (stdFunctionIdentitySpelling.size() > n
+                        && stdFunctionIdentitySpelling.compare(
+                            stdFunctionIdentitySpelling.size() - n, n, cv) == 0
+                        && std::isspace((unsigned char)stdFunctionIdentitySpelling[
+                            stdFunctionIdentitySpelling.size() - n - 1]))
+                    {
+                        stdFunctionIdentitySpelling.erase(stdFunctionIdentitySpelling.size() - n);
+                        changed = true;
+                        break;
+                    }
+                }
+            }
+            const bool stdFunctionIdentity = IsTopLevelStdFunctionSpelling(stdFunctionIdentitySpelling);
+            const bool canRequest = allowPointerRequest || !pointerSpelling;
+            if (canRequest && (!mapped || (pointerToTemplateSpecialization && mappedAsOpaquePointer))
+                && !memberFilter.empty() && !stdFunctionIdentity
+                && (spelling.find('*') == std::string::npos
+                    && spelling.find('&') == std::string::npos
+                    || pointerToTemplateSpecialization))
+            {
                 const std::string identity = cflat_cinterop::CxxForeignIdentity(valueSpelling);
                 auto owner = cxxTypeOwnerGroup_.find(record.name);
                 if (valueSpelling.find('<') != std::string::npos && !identity.empty()
@@ -14427,12 +14820,12 @@ void LLVMBackend::EnsureCxxRecordLayoutsForMemberSignatures(const CRecordEntry& 
                          && member.kind == cflat_cinterop::RawCxxMember::Destructor)
                      || member.name == memberFilter))
                 continue;
-            ensure(member.retType);
-            for (const auto& param : member.paramTypes) ensure(param);
+            ensure(member.retType, !memberFilter.empty());
+            for (const auto& param : member.paramTypes) ensure(param, false);
         }
         if (memberFilter.empty() || memberFilter == "__ctor")
             for (const auto& ctor : record.ctorTemplates)
-                for (const auto& param : ctor.paramTypes) ensure(param);
+                for (const auto& param : ctor.paramTypes) ensure(param, false);
 }
 
 bool LLVMBackend::RegisterCxxMembersForProjectedRecord(const std::string& typeName)
@@ -14827,12 +15220,15 @@ void LLVMBackend::RegisterCRecords(std::vector<CRecordEntry>& records, const std
                                 "generated C++ field '{}' has unsupported type '{}'", f.name, f.ctype);
                             return false;
                         }
+                        const bool incompleteArray = f.ctype.find("[]") != std::string::npos;
+                        const bool zeroLengthArray = f.ctype.find("[0]") != std::string::npos;
                         if (!arrDims.empty())
                         {
-                            tv.ConstArraySize = arrDims[0];
+                            tv.ConstArraySize = (incompleteArray || zeroLengthArray) ? 1 : arrDims[0];
                             tv.ConstInnerDimensions.assign(arrDims.begin() + 1, arrDims.end());
                         }
                         tv.IsFlexibleArrayMember = f.isZeroSize && !arrDims.empty();
+                        tv.IsZeroLengthArrayMember = tv.IsFlexibleArrayMember && zeroLengthArray;
                         static_cast<TypeAndValue&>(d) = tv;
                         d.VariableName = f.name;
                         if (f.isBitfield)
@@ -14971,12 +15367,18 @@ void LLVMBackend::RegisterCRecords(std::vector<CRecordEntry>& records, const std
                     ok = false;
                     break;
                 }
+                tv.IsCxxMutableField = f.isMutable;
+                tv.IsCxxConstField = f.isConst && !f.isMutable && !tv.Pointer
+                    && !tv.IsCxxRefToPointer && IsCxxRecord(tv.TypeName);
+                const bool incompleteArray = f.ctype.find("[]") != std::string::npos;
+                const bool zeroLengthArray = f.ctype.find("[0]") != std::string::npos;
                 if (!arrDims.empty())
                 {
-                    tv.ConstArraySize = arrDims[0];
+                    tv.ConstArraySize = (incompleteArray || zeroLengthArray) ? 1 : arrDims[0];
                     tv.ConstInnerDimensions.assign(arrDims.begin() + 1, arrDims.end());
                 }
                 tv.IsFlexibleArrayMember = f.isZeroSize && !arrDims.empty();
+                tv.IsZeroLengthArrayMember = tv.IsFlexibleArrayMember && zeroLengthArray;
                 // A C fn-ptr field maps to a THIN function<T> ("__c_fn_ptr") - a bare,
                 // pointer-sized C function pointer, same size as the void* it replaces, so the
                 // struct layout is unchanged. Keeping the real signature makes MIDL COM vtable
@@ -15156,7 +15558,10 @@ void LLVMBackend::RegisterCRecords(std::vector<CRecordEntry>& records, const std
                 fields = PackBitfields(fields, packedBitfields, !targetWindows_, r.isUnion);
             }
             bool cBitfieldOffsetLayout = false;
-            if (!r.isCxx && !r.isUnion && (anyBitfields || zeroSizeBitfields))
+            // C records and Itanium C++ records use Clang's byte-granular bitfield
+            // offsets. Keep the Windows C++ path on its established MS-ABI packing.
+            if (!r.isUnion && (!r.isCxx || (!targetWindows_ && !r.isPacked))
+                && (anyBitfields || zeroSizeBitfields))
                 cBitfieldOffsetLayout = InsertCBitfieldLayoutPadding(r, fields, packedBitfields);
             // A C++ record's layout is clang's, not CFlat's: insert explicit padding wherever
             // clang put a field further along than CFlat's natural packing would (over-aligned
@@ -19502,7 +19907,7 @@ bool LLVMBackend::EmitCxxStructorCall(const std::string& typeName,
                 // A C++ reference parameter takes the ARGUMENT's address, the same binding the
                 // free and member call paths use; a copy loses every write the callee makes.
                 else if (!source.TypeAndValue.Pointer && param->Pointer && !param->ElemPointer
-                         && (param->IsAlias || param->IsRvalueRef)
+                         && (param->IsAlias || param->IsRvalueRef || param->IsCxxConstRef)
                          && source.Storage != nullptr
                          && (param->TypeName == source.TypeAndValue.TypeName
                              || (param->TypeName == "void"
@@ -19536,13 +19941,15 @@ bool LLVMBackend::EmitCxxStructorCall(const std::string& typeName,
             if (param != nullptr && param->Pointer && a != nullptr
                 && !a->getType()->isPointerTy()
                 && (a->getType()->isStructTy()
-                    || ((param->IsAlias || param->IsRvalueRef) && !param->ElemPointer
+                    || ((param->IsAlias || param->IsRvalueRef || param->IsCxxConstRef)
+                        && !param->ElemPointer
                         && llvm::FunctionType::isValidArgumentType(a->getType()))))
             {
                 // The temporary holds the REFERENT, not the argument: a CFlat integer literal
                 // arrives as i8, and a 1-byte buffer read back as `int` is garbage.
                 llvm::Type* refTy = a->getType();
-                if ((param->IsAlias || param->IsRvalueRef) && !param->ElemPointer)
+                if ((param->IsAlias || param->IsRvalueRef || param->IsCxxConstRef)
+                    && !param->ElemPointer)
                 {
                     TypeAndValue referent = *param;
                     referent.Pointer = false;
@@ -21653,6 +22060,7 @@ std::string LLVMBackend::CxxConversionOperatorTo(const std::string& sourceTypeNa
         if (needsStandardConversion != nullptr) *needsStandardConversion = false;
         if (ambiguous != nullptr) *ambiguous = false;
         if (sourceTypeName.empty() || dest.TypeName.empty() || dest.TypeName == "void") return {};
+        if (sourceTypeName == dest.TypeName) return {};
         if (dest.Pointer || dest.ElemPointer || dest.IsArrayView || dest.IsInterface
             || dest.IsFunctionPointer)
             return {};
@@ -21699,11 +22107,23 @@ std::string LLVMBackend::CxxConversionOperatorTo(const std::string& sourceTypeNa
             return false;
         };
 
-        // An EXACT operator for the destination spelling wins with no standard conversion.
+        // Built-in spellings of ONE C++ type (i32 = int, i16 = short, uint = u32) are the same type.
+        auto canonical = [this](const std::string& name) {
+            const std::string resolved = ResolveTypeAlias(name);
+            if (resolved == "i32") return std::string("int");
+            if (resolved == "i16") return std::string("short");
+            if (resolved == "uint") return std::string("u32");
+            return resolved;
+        };
+        const std::string resolvedDestType = canonical(dest.TypeName);
+        // Exactness is CFlat type identity after alias resolution, not LLVM representation.
         std::string returnTypeName;
         for (const std::string& name : candidateNames(dest.TypeName))
-            if (usable(name, returnTypeName) && returnTypeName == dest.TypeName)
-                return name;
+            if (usable(name, returnTypeName))
+            {
+                if (canonical(returnTypeName) == resolvedDestType)
+                    return name;
+            }
 
         /*
          * No exact operator: ONE standard conversion may sit on top of the user-defined one.
@@ -21712,28 +22132,46 @@ std::string LLVMBackend::CxxConversionOperatorTo(const std::string& sourceTypeNa
          * class declares both `operator int` and `operator bool`) - collect, never take first.
          */
         if (info == nullptr) return {};
-        std::vector<std::string> viable;
+        std::vector<std::pair<std::string, int>> viable;
         std::set<std::string> tried;
         for (const std::string& spelling : ScalarConversionSpellings())
         {
-            if (spelling == dest.TypeName) continue;
+            if (ResolveTypeAlias(spelling) == ResolveTypeAlias(dest.TypeName)) continue;
             for (const std::string& name : candidateNames(spelling))
             {
                 if (!tried.insert(name).second) continue;
                 if (!usable(name, returnTypeName)) continue;
-                viable.push_back(name);
+                int rank = 2;
+                const std::string resolvedReturnType = canonical(returnTypeName);
+                if (resolvedReturnType == resolvedDestType)
+                    rank = 0;
+                else if (resolvedDestType == "int"
+                         && (resolvedReturnType == "bool" || resolvedReturnType == "char"
+                             || resolvedReturnType == "i8" || resolvedReturnType == "u8"
+                             || resolvedReturnType == "short" || resolvedReturnType == "i16"
+                             || resolvedReturnType == "u16"))
+                    rank = 1;
+                else if (resolvedReturnType == "float" && resolvedDestType == "double")
+                    rank = 1;
+                viable.emplace_back(name, rank);
                 break;   // the two spellings of ONE operator are the same candidate
             }
         }
         if (viable.empty()) return {};
+        const int bestRank = std::min_element(viable.begin(), viable.end(),
+            [](const auto& a, const auto& b) { return a.second < b.second; })->second;
+        viable.erase(std::remove_if(viable.begin(), viable.end(), [bestRank](const auto& v) {
+            return v.second != bestRank;
+        }), viable.end());
         if (viable.size() > 1)
         {
             if (ambiguous != nullptr) *ambiguous = true;
-            if (ambiguousCandidates != nullptr) *ambiguousCandidates = viable;
+            if (ambiguousCandidates != nullptr)
+                for (const auto& candidate : viable) ambiguousCandidates->push_back(candidate.first);
             return {};
         }
         if (needsStandardConversion != nullptr) *needsStandardConversion = true;
-        return viable.front();
+        return viable.front().first;
 }
 
 /*
@@ -21850,19 +22288,34 @@ llvm::Value* LLVMBackend::ConvertAggregateViaImplicitConversionOperator(llvm::Va
 /*
  * Ranking helper for the conversion-OPERATOR branch of overload scoring: reports the operator
  * that binds `arg` to `param` and accumulates this candidate's user-defined-conversion cost.
- * Silent by construction - an ambiguity makes the candidate non-viable here and is reported
- * only at the materialization site.
+ * Preserve ambiguous sequences as distinct candidates so overload ranking cannot pick one.
  */
 std::string LLVMBackend::ScoreCxxConversionOperatorArgument(const NamedVariable& arg,
                                                             const TypeAndValue& param,
+                                                            bool preserveAmbiguous,
                                                             bool& needsStandardConversion,
                                                             int& userConversions,
                                                             int& userConversionCost,
                                                             std::string& userConversionNames) const
 {
         needsStandardConversion = false;
+        bool ambiguous = false;
+        std::vector<std::string> ambiguousCandidates;
         const std::string opName = CxxConversionOperatorTo(arg.TypeAndValue.TypeName, param,
-                                                           false, &needsStandardConversion);
+                                                           false, &needsStandardConversion,
+                                                           &ambiguous, &ambiguousCandidates);
+        if (ambiguous)
+        {
+            if (!preserveAmbiguous) return {};
+            needsStandardConversion = true;
+            ++userConversions;
+            ++userConversionCost;
+            userConversionNames += "ambiguous{" + param.TypeName + ":";
+            for (const auto& candidate : ambiguousCandidates)
+                userConversionNames += candidate + ",";
+            userConversionNames += "}|";
+            return "ambiguous conversion";
+        }
         if (opName.empty()) return {};
         ++userConversions;
         if (needsStandardConversion) ++userConversionCost;

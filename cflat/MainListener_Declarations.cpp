@@ -4310,6 +4310,10 @@ cxx_dtor_ready:
                     && compiler->IsCxxRecord(argTypes.back().TypeName))
                     nv.TypeAndValue.TypeName = argTypes.back().TypeName;
                 LLVMBackend::NamedVariable addressVar = nv;
+                // Keep the loaded value and its type on this address/category twin so ranking
+                // sees the literal identity carried by nv.
+                addressVar.Primary = argValue;
+                addressVar.BaseType = argValue ? argValue->getType() : nullptr;
                 // Only an address-less constant is provably a temporary here; a nameless
                 // expression with storage (ternary, reference-returning call) stays an lvalue.
                 if (llvm::isa_and_nonnull<llvm::Constant>(argValue) && nv.Storage == nullptr
@@ -4783,6 +4787,16 @@ cxx_dtor_ready:
             compiler->lastCxxRetTemp_ = nullptr;
             compiler->lastCxxRetValue_ = nullptr;
             badInit(assign);
+            return true;
+        }
+        if (rightNV.CxxRefValueType != nullptr && rightNV.Primary != nullptr
+            && rightNV.Primary->getType()->isPointerTy()
+            && rightNV.TypeAndValue.TypeName == typeName)
+        {
+            compiler->EmitCxxCopyOrMoveConstruct(typeName, slot, rightNV.Primary,
+                                                 /*useMove*/ false,
+                                                 std::format("into local '{}'", name).c_str(),
+                                                 declType.DiagnosticTypeName);
             return true;
         }
         if (consumed || ternaryConsumed)
@@ -5343,6 +5357,9 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                 !global_scope && IsFunctionBodyDeclaration(declSpec));
             return ParseDeclarationSpecifiers(declSpec);
         }();
+        if (!global_scope && DeclSpecHasConst(declSpec) && !typeAndValue.Pointer
+            && compiler->IsCxxRecord(typeAndValue.TypeName))
+            typeAndValue.IsCxxConstRef = true;
         // A generic parameter can itself be bound to a core unique wrapper. It is already a
         // concrete value type, but its ordinary copy-shaped helper bodies must not be mistaken
         // for a direct `unique` declaration diagnostic.
@@ -7301,6 +7318,8 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                         typeAndValue.IsCxxPointeeConst = srcCxxPointeeConst && srcInferredPointer;
                     }
                 }
+                if (typeAndValue.Pointer && srcCxxPointeeConst)
+                    typeAndValue.IsCxxPointeeConst = true;
 
                 if (global_scope)
                 {
@@ -8061,10 +8080,15 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                     && (destType->isIntegerTy() || destType->isFloatingPointTy());
                                 bool hasImplicitConversion = false;
                                 bool ambiguousConversion = false;
+                                std::vector<std::string> ambiguousConversionCandidates;
                                 if (cxxAggregate && scalarDestination)
                                     hasImplicitConversion = !compiler->CxxConversionOperatorTo(
                                         sourceType.TypeName, typeAndValue, false, nullptr,
-                                        &ambiguousConversion).empty();
+                                        &ambiguousConversion, &ambiguousConversionCandidates).empty();
+                                if (ambiguousConversion)
+                                    compiler->ReportAmbiguousCxxConversion(
+                                        sourceType.TypeName, typeAndValue,
+                                        ambiguousConversionCandidates);
                                 const bool hasExplicitBoolConversion = cxxAggregate
                                     && destType != nullptr && destType->isIntegerTy(1)
                                     && !hasImplicitConversion
@@ -8076,6 +8100,13 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                         "cannot convert value of type '{}' to '{}'",
                                         SpellDiagnosticType(*compiler, sourceType),
                                         SpellDiagnosticType(*compiler, typeAndValue)));
+                                if (cxxAggregate && scalarDestination && hasImplicitConversion)
+                                {
+                                    auto convertedNV = initializerSourceNV;
+                                    if (compiler->ApplyCxxConversionOperator(
+                                            convertedNV, typeAndValue, false))
+                                        right = convertedNV.Primary;
+                                }
                             }
                             auto* initStore = movedCxxReturn
                                 ? nullptr : compiler->CreateAssignment(right, alloc, srcIsUnsigned);
@@ -9958,6 +9989,18 @@ bool MainListener::FieldPathRootIsFrameLocal(llvm::Value* storage) {
 
 LLVMBackend::NamedVariable MainListener::FinishAssignmentExpressionNamed(
         LLVMBackend::NamedVariable nv, bool savedOwned) {
+        if (nv.CxxRefValueType != nullptr && nv.Primary != nullptr
+            && nv.Primary->getType()->isPointerTy()
+            && declExpectedType.TypeName == nv.TypeAndValue.TypeName
+            && !declExpectedType.Pointer)
+        {
+            nv.Storage = nv.Primary;
+            nv.BaseType = nv.CxxRefValueType;
+            nv.Primary = compilerLLVM->CreateLoad(nv.CxxRefValueType, nv.Storage);
+            nv.CxxRefValueType = nullptr;
+            nv.TypeAndValue.IsAlias = false;
+            nv.IsRvalue = false;
+        }
         if (nv.TypeAndValue.TypeName == "char"
             && (PointsIntoStackFrame(nv.Primary)
                 || (nv.TypeAndValue.ConstArraySize > 0

@@ -14,10 +14,15 @@ struct RawOwner
     int* p = nullptr;
     RawOwner() { p = new int; *p = 1; }
     ~RawOwner() { if (p != nullptr) { delete p; } }
+    int val() { return p == nullptr ? -1 : *p; }
     RawOwner operator+=(int k) { RawOwner r; *r.p = *p + k; return r; }
 };
 RawOwner makeRaw() { RawOwner r; return r; }
 RawOwner passBack(RawOwner w) { return w; }
+RawOwner operator-(RawOwner w) { return w; }
+int two(RawOwner x, RawOwner y) { return x.val() + y.val(); }
+RawOwner operator+(RawOwner w, RawOwner other) { return w; }
+RawOwner rawPass(RawOwner w) { return w; }
 void bump(RawOwner w) { w += 1; }
 void reset(RawOwner w) { w = makeRaw(); }
 void bumpInit(RawOwner w) { RawOwner x = (w += 2); }
@@ -28,14 +33,52 @@ int useAfterParamConsume()
     expect_error("use of moved variable 'c'") { RawOwner c; bump(c); k = *c.p; }
     expect_error("use of moved variable 'd'") { RawOwner d; reset(d); k = *d.p; }
     expect_error("use of moved variable 'e'") { RawOwner e; bumpInit(e); k = *e.p; }
+    expect_error("use of moved variable 'f'") { RawOwner f; RawOwner x = -f; k = *f.p; }
     return k;
 }
-expect_error("use of moved variable 'a'");
+// Unary consuming overloads must mark the source immediately after the call, in every
+// expression context. Each body reaches the post-call read named by its diagnostic.
+expect_error("use of moved variable 'a'") {
+    int unaryThenRead() { RawOwner a; int k = (-a).val() + *a.p; return k; }
+}
+expect_error("use of moved variable 'a'") {
+    int unaryFirstArgument() { RawOwner a; RawOwner b; return two(-a, a); }
+}
+expect_error("use of moved variable 'a'") {
+    int unaryInIfCondition() { RawOwner a; if ((-a).val() < 0) { return *a.p; } return 0; }
+}
+expect_error("use of moved variable 'a'") {
+    int unaryInWhileCondition() { RawOwner a; int k = 0; while ((-a).val() < 0) { k = *a.p; } return k; }
+}
+expect_error("use of moved variable 'a'") {
+    int unaryReturnRead() { RawOwner a; return (-a).val() + *a.p; }
+}
+expect_error("use of moved variable 'a'") {
+    int unaryTwiceSameExpression() { RawOwner a; return (-a).val() + (-a).val(); }
+}
+expect_error("use of moved variable 'a'") {
+    int holderConsume() { Holder a = default; a.r = new Res(); store(a); return a.r == nullptr ? 0 : 1; }
+}
+expect_error("use of moved variable 'ta'") {
+    int ternaryCallReadTrue() { RawOwner ta; RawOwner tb; bool pick = true;
+        RawOwner r = rawPass(pick ? ta : tb); return *ta.p; }
+}
+expect_error("use of moved variable 'tb'") {
+    int ternaryCallReadFalse() { RawOwner ta; RawOwner tb; bool pick = false;
+        RawOwner r = rawPass(pick ? ta : tb); return *tb.p; }
+}
+expect_error("use of moved variable 'oa'") {
+    int ternaryOperatorReadTrue() { RawOwner oa; RawOwner ob; RawOwner rhs; bool pick = true;
+        RawOwner r = (pick ? oa : ob) + rhs; return *oa.p; }
+}
+expect_error("use of moved variable 'ob'") {
+    int ternaryOperatorReadFalse() { RawOwner oa; RawOwner ob; RawOwner rhs; bool pick = false;
+        RawOwner r = (pick ? oa : ob) + rhs; return *ob.p; }
+}
+expect_error("use of moved variable 'a' (moved on an earlier loop iteration)");
 extern int main()
 {
-    Holder a = default;
-    a.r = new Res();
-    store(a);
-    int k = a.r == nullptr ? 0 : 1;
-    return k;
+    RawOwner a; RawOwner n;
+    for (int i = 0; i < 2; i++) n = -a;
+    return n.val();
 }

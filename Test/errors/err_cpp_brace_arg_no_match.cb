@@ -9,6 +9,14 @@ expect_error("no instantiation of C++ function template 'cppt.twice' accepts the
     }
 }
 
+// An empty braced list provides no T for initializer_list<T> deduction (clang rejects it too).
+expect_error("no instantiation of C++ function template 'cppcr.brc_template_copy' accepts these argument types") {
+    int empty_template_probe()
+    {
+        return cppcr.brc_template_copy({});
+    }
+}
+
 // A braced list backed in the caller frame still obeys C++ narrowing: a non-constant long
 // into std::initializer_list<double> is ill-formed, as clang rejects it.
 expect_error("brace-list element 1 of 'cppcr.BrcIlD' narrows to the C++ constructor's 'double'") {
@@ -48,13 +56,5 @@ expect_error("no C++ constructor of 'cppcr.BrcDfOnly<long>' accepts this brace l
     int default_deduce_probe()
     {
         return cppcr.BrcDfOnly<long>({2, 3}).which;
-    }
-}
-
-// An argument reaching a constructor's parameter pack is not mirrored in the overload selector.
-expect_error("a C++ constructor of 'cppcr.BrcPack<long>' passes an argument into a parameter pack beside its brace-list constructors") {
-    int pack_argument_probe()
-    {
-        return cppcr.BrcPack<long>({2, 3}, 5).which;
     }
 }

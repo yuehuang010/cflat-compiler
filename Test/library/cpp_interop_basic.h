@@ -134,7 +134,7 @@ namespace cppi
         struct { [[no_unique_address]] NuaEmpty e; unsigned a : 5; };
         int z;
     };
-    // Still refused: the NUA member ends the bitfield run, so `b` starts a byte later.
+    // The NUA member ends the bitfield run, so `b` starts at its Clang byte offset.
     struct NuaBitBetween
     {
         unsigned a : 3;
@@ -142,6 +142,70 @@ namespace cppi
         unsigned b : 3;
         int y;
     };
+    struct BytePackAfterChar
+    {
+        unsigned a : 3;
+        unsigned b : 13;
+        char c;
+        int d : 9;
+    };
+    struct BytePackBeforeShort
+    {
+        int x;
+        unsigned a : 3;
+        unsigned b : 7;
+        short s;
+    };
+    struct BytePackAfterCharOnly
+    {
+        char c;
+        unsigned a : 2;
+    };
+    struct ByteRun24After { unsigned a : 24; char c; };
+    struct ByteRun40After { long long a : 40; char c; };
+    struct ByteRun12AfterChar { char c; unsigned a : 12; };
+    struct ByteRun20AfterChar { char c; unsigned a : 20; };
+    struct ByteRun40WithTail { long long a : 40; char c; int x; double d; };
+    inline ByteRun24After byte_run24_make() noexcept
+    { ByteRun24After v{}; v.a = 0x654321; v.c = 71; return v; }
+    inline long long byte_run24_read(const ByteRun24After* v) noexcept
+    { return (long long)v->a * 100 + v->c; }
+    inline long long byte_run24_byval(ByteRun24After v) noexcept { return byte_run24_read(&v); }
+    inline int byte_run24_size() noexcept { return (int)sizeof(ByteRun24After); }
+    inline int byte_run24_align() noexcept { return (int)alignof(ByteRun24After); }
+    inline int byte_run24_c_offset() noexcept { return (int)offsetof(ByteRun24After, c); }
+    inline ByteRun40After byte_run40_make() noexcept
+    { ByteRun40After v{}; v.a = 123456789; v.c = 71; return v; }
+    inline long long byte_run40_read(const ByteRun40After* v) noexcept
+    { return v->a * 100 + v->c; }
+    inline long long byte_run40_byval(ByteRun40After v) noexcept { return byte_run40_read(&v); }
+    inline int byte_run40_size() noexcept { return (int)sizeof(ByteRun40After); }
+    inline int byte_run40_align() noexcept { return (int)alignof(ByteRun40After); }
+    inline int byte_run40_c_offset() noexcept { return (int)offsetof(ByteRun40After, c); }
+    inline ByteRun12AfterChar byte_run12_make() noexcept
+    { ByteRun12AfterChar v{}; v.c = 71; v.a = 3000; return v; }
+    inline long long byte_run12_read(const ByteRun12AfterChar* v) noexcept
+    { return (long long)v->c * 10000 + v->a; }
+    inline long long byte_run12_byval(ByteRun12AfterChar v) noexcept { return byte_run12_read(&v); }
+    inline int byte_run12_size() noexcept { return (int)sizeof(ByteRun12AfterChar); }
+    inline int byte_run12_align() noexcept { return (int)alignof(ByteRun12AfterChar); }
+    inline ByteRun20AfterChar byte_run20_make() noexcept
+    { ByteRun20AfterChar v{}; v.c = 71; v.a = 500000; return v; }
+    inline long long byte_run20_read(const ByteRun20AfterChar* v) noexcept
+    { return (long long)v->c * 10000000 + v->a; }
+    inline long long byte_run20_byval(ByteRun20AfterChar v) noexcept { return byte_run20_read(&v); }
+    inline int byte_run20_size() noexcept { return (int)sizeof(ByteRun20AfterChar); }
+    inline int byte_run20_align() noexcept { return (int)alignof(ByteRun20AfterChar); }
+    inline ByteRun40WithTail byte_run40_tail_make() noexcept
+    { ByteRun40WithTail v{}; v.a = 123456789; v.c = 71; v.x = 55; v.d = 2.5; return v; }
+    inline long long byte_run40_tail_read(const ByteRun40WithTail* v) noexcept
+    { return v->a * 1000000 + (long long)v->c * 10000 + (long long)v->x * 100 + (long long)(v->d * 10); }
+    inline long long byte_run40_tail_byval(ByteRun40WithTail v) noexcept { return byte_run40_tail_read(&v); }
+    inline int byte_run40_tail_size() noexcept { return (int)sizeof(ByteRun40WithTail); }
+    inline int byte_run40_tail_align() noexcept { return (int)alignof(ByteRun40WithTail); }
+    inline int byte_run40_tail_c_offset() noexcept { return (int)offsetof(ByteRun40WithTail, c); }
+    inline int byte_run40_tail_x_offset() noexcept { return (int)offsetof(ByteRun40WithTail, x); }
+    inline int byte_run40_tail_d_offset() noexcept { return (int)offsetof(ByteRun40WithTail, d); }
     inline long nua_read_bitfield(const NuaBitfield* v) noexcept { return v->bits * 1000L + v->later; }
     inline long nua_bitfield_by_value(NuaBitfield v) noexcept { return v.bits * 1000L + v.later; }
     inline NuaBitfield nua_make_bitfield(unsigned bits, int later) noexcept
@@ -167,6 +231,49 @@ namespace cppi
     inline long nua_size_bit_units() noexcept { return sizeof(NuaBitUnits); }
     inline long nua_size_anon() noexcept { return sizeof(NuaAnon); }
     inline long nua_size_anon_bits() noexcept { return sizeof(NuaAnonBits); }
+    inline NuaBitBetween nua_make_bit_between() noexcept
+    {
+        NuaBitBetween v{}; v.a = 5; v.b = 6; v.y = 321; return v;
+    }
+    inline int nua_bit_between_read(const NuaBitBetween* v) noexcept
+    {
+        return (int)v->a * 10000 + (int)v->b * 1000 + v->y;
+    }
+    inline int nua_bit_between_size() noexcept { return (int)sizeof(NuaBitBetween); }
+    inline int nua_bit_between_y_offset() noexcept { return (int)offsetof(NuaBitBetween, y); }
+    inline BytePackAfterChar byte_pack_after_char_make() noexcept
+    {
+        BytePackAfterChar v{}; v.a = 5; v.b = 6000; v.c = 71; v.d = 101; return v;
+    }
+    inline int byte_pack_after_char_read(const BytePackAfterChar* v) noexcept
+    {
+        return (int)v->a * 10000000 + (int)v->b * 1000 + v->c * 10 + v->d;
+    }
+    inline int byte_pack_after_char_size() noexcept { return (int)sizeof(BytePackAfterChar); }
+    inline int byte_pack_after_char_align() noexcept { return (int)alignof(BytePackAfterChar); }
+    inline int byte_pack_after_char_c_offset() noexcept { return (int)offsetof(BytePackAfterChar, c); }
+    inline BytePackBeforeShort byte_pack_before_short_make() noexcept
+    {
+        BytePackBeforeShort v{}; v.x = 77; v.a = 5; v.b = 99; v.s = 1234; return v;
+    }
+    inline int byte_pack_before_short_read(const BytePackBeforeShort* v) noexcept
+    {
+        return v->x * 1000000 + (int)v->a * 100000 + (int)v->b * 1000 + v->s;
+    }
+    inline int byte_pack_before_short_size() noexcept { return (int)sizeof(BytePackBeforeShort); }
+    inline int byte_pack_before_short_align() noexcept { return (int)alignof(BytePackBeforeShort); }
+    inline int byte_pack_before_short_s_offset() noexcept { return (int)offsetof(BytePackBeforeShort, s); }
+    inline BytePackAfterCharOnly byte_pack_after_char_only_make() noexcept
+    {
+        BytePackAfterCharOnly v{}; v.c = 71; v.a = 3; return v;
+    }
+    inline int byte_pack_after_char_only_read(const BytePackAfterCharOnly* v) noexcept
+    {
+        return v->c * 10 + (int)v->a;
+    }
+    inline int byte_pack_after_char_only_size() noexcept { return (int)sizeof(BytePackAfterCharOnly); }
+    inline int byte_pack_after_char_only_align() noexcept { return (int)alignof(BytePackAfterCharOnly); }
+    inline int byte_pack_after_char_only_c_offset() noexcept { return (int)offsetof(BytePackAfterCharOnly, c); }
 
     // Overload pair. The double leg adds 1000 so the SELECTED overload is observable
     // from the return value alone.
@@ -1922,12 +2029,24 @@ namespace cppi
     inline const MtRank& mt_rank_const_ref(MtRank& value) { return value; }
     inline const int& mt_rank_const_arg() { static const int value = 1; return value; }
     // A refused `put(int, const T&)` must not turn an arity miss of the template into a verdict.
+    inline int b22MoveCtorCount = 0;
+    inline int b22MoveMoveCount = 0;
+    inline int b22MoveDtorCount = 0;
     struct MtNoCopy
     {
-        MtNoCopy() = default;
+        int v = 0;
+        MtNoCopy() { ++b22MoveCtorCount; }
+        explicit MtNoCopy(int value) : v(value) { ++b22MoveCtorCount; }
         MtNoCopy(const MtNoCopy&) = delete;
-        MtNoCopy(MtNoCopy&&) = default;
+        MtNoCopy(MtNoCopy&& other) noexcept : v(other.v)
+        { other.v = -1; ++b22MoveMoveCount; }
+        ~MtNoCopy() { ++b22MoveDtorCount; }
+        int value() const { return v; }
     };
+    inline void b22ResetMoveCounts()
+    { b22MoveCtorCount = b22MoveMoveCount = b22MoveDtorCount = 0; }
+    inline int b22MoveCounts()
+    { return b22MoveCtorCount * 100 + b22MoveMoveCount * 10 + b22MoveDtorCount; }
     template<class T> struct MtSink
     {
         long put(int, const T& value) { T copy = value; return 1; }
@@ -2020,11 +2139,20 @@ namespace cppi
         int f(double) const { return 3; }
     };
     inline const CrMixed crMixed{};
+    struct CrMixedGet
+    {
+        int v = 3;
+        int get() const { return v; }
+        int get() { v += 10; return v; }
+        int get(int) { v += 20; return v; }
+    };
+    inline const CrMixedGet crMixedGet{};
     inline const CrPair crConst{};
     constexpr CrPair crConstexpr{};
     inline CrPair crMutable{};
     inline const CrPair& cr_const_ref() { return crConst; }
     inline const CrPair* cr_const_ptr() { return &crMutable; }
+    inline const std::vector<int>& cr_cvec() { static std::vector<int> values; return values; }
     // Virtual const/non-const pairs: a const receiver dispatches the const overload virtually.
     struct CrVB { int v = 3; virtual int get() const { return v; } virtual int get() { v += 10; return v; }
         virtual ~CrVB() = default; };
@@ -2036,6 +2164,62 @@ namespace cppi
     inline const CrVB& cr_vb_ref() { return crVd; }
     inline const CrVB* cr_vb_ptr() { return &crVd; }
     inline const CrAbs& cr_abs_ref() { return crImpl; }
+    struct Cm2
+    {
+        int get() const { return 3; }
+        int get() { return 13; }
+        int operator-() const { return 3; }
+        int operator-() { return 13; }
+        int operator+(int k) const { return 100 + k; }
+        int operator+(int k) { return 10 + k; }
+        bool operator!() const { return false; }
+        bool operator!() { return true; }
+    };
+    struct HC { const Cm2 c{}; };
+    inline const HC hcGlobal{};
+    inline HC hcMutable{};
+    inline const HC& hc_ref() { return hcGlobal; }
+    inline const HC* hc_ptr() { return &hcGlobal; }
+    struct CrReceiverValue
+    {
+        int get() const { return 3; }
+        int get() { return 13; }
+        int only() { return 7; }
+        int operator-() const { return 3; }
+        int operator-() { return 13; }
+    };
+    inline CrReceiverValue crReceiverGlobal{};
+    struct CrFieldHolder
+    {
+        CrReceiverValue* p = &crReceiverGlobal;
+        CrReceiverValue* const pc = &crReceiverGlobal;
+        mutable CrReceiverValue mu{};
+    };
+    inline CrFieldHolder crFieldMutable{};
+    inline const CrFieldHolder crFieldConst{};
+    inline const CrFieldHolder& cr_field_ref() { return crFieldConst; }
+    struct Tm { template<class T> int f(T) { return 41; } };
+    inline const Tm tmGlobal{};
+    inline const Tm& tm_ref() { return tmGlobal; }
+    inline const Tm* tm_ptr() { return &tmGlobal; }
+    struct MaL
+    {
+        int only() const { return 7; }
+        int only() { return 17; }
+        int operator-() const { return 7; }
+        int operator-() { return 17; }
+    };
+    struct MaR
+    {
+        int only() const { return 8; }
+        int only() { return 18; }
+        int operator-() const { return 8; }
+        int operator-() { return 18; }
+    };
+    struct Ma : MaL, MaR {};
+    inline const Ma maGlobal{};
+    inline const Ma& ma_ref() { return maGlobal; }
+    inline const Ma* ma_ptr() { return &maGlobal; }
 }
 
 // Member and free operators whose return type is a class-template specialization nothing has
@@ -2122,6 +2306,42 @@ namespace cppi_opspec
         OsInc(double x) : v(x) {}
         OsIncRef<OsInc>& operator++() { v += 1.0; static OsIncRef<OsInc> r; r.p = this; return r; }
         OsIncRef<OsInc>& operator--() { v -= 1.0; static OsIncRef<OsInc> r; r.p = this; return r; }
+    };
+}
+
+// Pointer returns to unrequested class-template specializations are requested only when the
+// member is used, so the opaque pointer cannot hide the pointee type from a chained access.
+namespace cppi_retryptr
+{
+    template <class T> struct PtrResult { T* p; double get() const { return p->v; } };
+    template <class T> struct ArrowResult { T* p; double get() const { return p->v; } };
+    template <class T> struct CompoundResult { T* p; double get() const { return p->v; } };
+    struct PtrOwner
+    {
+        double v = 0.0;
+        PtrOwner() = default;
+        PtrOwner(double x) : v(x) {}
+        PtrResult<PtrOwner>* ptr() { static PtrResult<PtrOwner> r; r.p = this; return &r; }
+    };
+    struct ArrowOwner
+    {
+        double v = 0.0;
+        ArrowOwner() = default;
+        ArrowOwner(double x) : v(x) {}
+        ArrowResult<ArrowOwner>* operator->() { static ArrowResult<ArrowOwner> r; r.p = this; return &r; }
+    };
+    struct CompoundOwner
+    {
+        double v = 0.0;
+        CompoundOwner() = default;
+        CompoundOwner(double x) : v(x) {}
+        CompoundResult<CompoundOwner>* operator*=(double k)
+        {
+            v *= k;
+            static CompoundResult<CompoundOwner> r;
+            r.p = this;
+            return &r;
+        }
     };
 }
 // Explicit `move` of a NON-trivial class into a `T&&` / by-value operator parameter (legs 31700+).

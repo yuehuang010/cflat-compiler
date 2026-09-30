@@ -4,6 +4,12 @@
 // Test/test_cpp_interop_template.cb; only an `explicit` one is cast-and-condition only,
 // which Test/errors/err_cpp_proxy_conversion.cb pins.)
 import cpp "cpp_interop_basic.h";
+import cpp "cpp_interop_assign.h";
+
+int obRankIntOrDouble(int v) { return 1; }
+int obRankIntOrDouble(double v) { return 2; }
+int obRankLongOrDouble(long v) { return 1; }
+int obRankLongOrDouble(double v) { return 2; }
 
 extern int main()
 {
@@ -17,6 +23,38 @@ extern int main()
         cppi.UdcParser udcP = default;
         cppi.UdcStr udcS = default;
         auto udcR = udcP.p(udcS);
+    }
+    expect_error("is ambiguous:") {
+        cppas.ObRank p = default;
+        u32 u = p;
+    }
+    expect_error("is ambiguous:") {
+        cppas.ObRank q = default;
+        double d = q;
+    }
+    expect_error("is ambiguous:") {
+        cppas.ObRank q = default;
+        i64 v = q;
+    }
+    expect_error("is ambiguous:") {
+        cppas.ObRankIntLong q = default;
+        u32 v = q;
+    }
+    expect_error("is ambiguous:") {
+        cppas.ObRankBoolChar q = default;
+        int v = q;
+    }
+    expect_error("ambiguous") {
+        cppas.ObRank q = default;
+        int v = obRankIntOrDouble(q);
+    }
+    expect_error("ambiguous") {
+        cppas.ObRankBoolChar q = default;
+        int v = obRankIntOrDouble(q);
+    }
+    expect_error("ambiguous") {
+        cppas.ObRankFloatInt q = default;
+        int v = obRankLongOrDouble(q);
     }
     return 0;
 }

@@ -1,6 +1,5 @@
-// A member with only a non-const overload cannot be called on read-only C++ storage (a const
-// namespace object or a const reference result): clang refuses it, and running it in place
-// would write read-only memory. Each leg is a separate scoped block.
+// A non-const-only member cannot be called on const C++ storage or through a const pointer.
+// Each leg is scoped so one expected error cannot satisfy another.
 import cpp "cpp_interop_basic.h";
 import cpp "cpp_interop_basic.cpp";
 
@@ -14,6 +13,47 @@ extern int main()
     }
     expect_error("cannot call non-const member 'only' on 'cppi.cr_const_ref()': it is reached through a C++ const reference result") {
         int a = cppi.cr_const_ref().only();
+    }
+    expect_error("cannot call non-const member 'only' on 'q': it is a const C++ object") {
+        auto q = cppi.cr_const_ptr();
+        int a = q->only();
+    }
+    // Pointee const is sticky: a mutable reassignment on a branch does not clear it (was SIGBUS).
+    expect_error("cannot call non-const member 'only' on 'q': it is a const C++ object") {
+        auto q = cppi.cr_const_ptr();
+        if (cppi.crMutable.v > 100) { q = &cppi.crMutable; }
+        int a = q->only();
+    }
+    expect_error("cannot call non-const member 'only' on 'cppi.cr_const_ptr()': it is a const C++ object") {
+        int a = cppi.cr_const_ptr()->only();
+    }
+    expect_error("Copy the pointee into a local ('auto c = *q;')") {
+        auto q = cppi.cr_const_ptr();
+        int a = q->only();
+    }
+    expect_error("cannot call non-const member 'only' on 'cppi.crInherit': it is a const C++ object") {
+        int a = cppi.crInherit.only();
+    }
+    expect_error("cannot call non-const member 'get' on 'cppi.crMixedGet': it is a const C++ object") {
+        int a = cppi.crMixedGet.get(5);
+    }
+    expect_error("cannot call non-const member 'f' on 'cppi.tmGlobal'") {
+        int a = cppi.tmGlobal.f(2);
+    }
+    expect_error("no candidate ranks better than the others") {
+        const cppi.Ma ma = default;
+        int a = ma.only();
+    }
+    expect_error("no candidate ranks better than the others") {
+        int a = cppi.ma_ref().only();
+    }
+    expect_error("no matching member function for call to 'f'") {
+        const cppi.Tm t = default;
+        int a = t.f(2);
+    }
+    expect_error("cannot call non-const member 'push_back' on 'vp'") {
+        auto vp = &cppi.cr_cvec();
+        vp->push_back(4);
     }
     // The const twin a const receiver resolves through is listed under the member's own name.
     expect_error("Candidates (1):\n    add(cppi.CrPair*, int)") {

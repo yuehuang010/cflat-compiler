@@ -1991,6 +1991,8 @@ nlohmann::json LLVMBackend::TvToJson(const TypeAndValue& tv)
         if (s.IsCxxRefToPointer) j["crp"] = true;
         if (s.IsCxxConstRef) j["ccr"] = true;
         if (s.IsCxxPointeeConst) j["cpc"] = true;
+        if (s.IsCxxConstField) j["ccf"] = true;
+        if (s.IsCxxMutableField) j["cmf"] = true;
         if (s.IsOwningSink)   j["osk"] = true;
         if (s.IsConsumeInferredSink) j["cis"] = true;
         if (s.IsReturnInferredSink) j["ris"] = true;
@@ -2035,6 +2037,7 @@ nlohmann::json LLVMBackend::TvToJson(const TypeAndValue& tv)
         if (s.IsSimd) { j["sd"] = true; j["sdl"] = s.SimdLanes; }
         if (s.IsArrayView) j["av"] = true;
         if (s.IsFlexibleArrayMember) j["fam"] = true;
+        if (s.IsZeroLengthArrayMember) j["zfam"] = true;
         if (s.AllocAlignValue > 0) j["aa"] = s.AllocAlignValue;
         return j;
     }
@@ -2059,6 +2062,8 @@ LLVMBackend::TypeAndValue LLVMBackend::TvFromJson(const SjVal& j)
         s.IsCxxRefToPointer = j.value("crp", false);
         s.IsCxxConstRef = j.value("ccr", false);
         s.IsCxxPointeeConst = j.value("cpc", false);
+        s.IsCxxConstField = j.value("ccf", false);
+        s.IsCxxMutableField = j.value("cmf", false);
         s.IsOwningSink = j.value("osk", false);
         s.IsConsumeInferredSink = j.value("cis", false);
         s.IsReturnInferredSink = j.value("ris", false);
@@ -2103,6 +2108,7 @@ LLVMBackend::TypeAndValue LLVMBackend::TvFromJson(const SjVal& j)
         s.SimdLanes = j.value("sdl", uint64_t{0});
         s.IsArrayView = j.value("av", false);
         s.IsFlexibleArrayMember = j.value("fam", false);
+        s.IsZeroLengthArrayMember = j.value("zfam", false);
         s.AllocAlignValue = j.value("aa", uint64_t{0});
         return s.ToTypeAndValue();
     }
@@ -2389,6 +2395,8 @@ nlohmann::json LLVMBackend::FieldToJson(const CRecordFieldEntry& f)
         nlohmann::json j = {{"n", f.name}, {"ct", f.ctype}};
         if (f.isBitfield) { j["bf"] = true; j["bw"] = f.bitWidth; }
         if (f.isZeroSize) j["zs"] = true;
+        if (f.isConst) j["c"] = true;
+        if (f.isMutable) j["mu"] = true;
         if (f.offsetBytes != 0) j["ob"] = f.offsetBytes;
         if (f.sizeBytes != 0) j["sz"] = f.sizeBytes;
         if (f.alignBytes != 0) j["al"] = f.alignBytes;
@@ -2404,6 +2412,8 @@ LLVMBackend::CRecordFieldEntry LLVMBackend::FieldFromJson(const SjVal& j)
         f.ctype     = j.value("ct", std::string{});
         f.isBitfield = j.value("bf", false);
         f.isZeroSize = j.value("zs", false);
+        f.isConst = j.value("c", false);
+        f.isMutable = j.value("mu", false);
         f.bitWidth   = j.value("bw", 0u);
         f.offsetBytes = j.value("ob", (uint64_t)0);
         f.sizeBytes = j.value("sz", (uint64_t)0);

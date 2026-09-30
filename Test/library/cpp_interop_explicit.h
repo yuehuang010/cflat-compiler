@@ -467,3 +467,15 @@ CPPSFX_SET(5, long long, unsigned long)
 CPPSFX_SET(6, int, long)
 #undef CPPSFX_SET
 }
+
+namespace c6r3 {
+struct E { int c; E(int) : c(1) {} E(const E& o) : c(o.c) {} };
+struct Ee { int c; Ee(int) : c(1) {} Ee(Ee&& o) : c(o.c) {} };
+struct D { int c; D(int) : c(1) {} D(const char*) : c(2) {} };
+struct Dd { int c; Dd(int, int k = 5) : c(k) {} Dd(const char*) : c(2) {} };
+struct Pp { int c; Pp(int) : c(1) {} Pp(int*) : c(2) {} };
+struct Rf { int c; Rf(const int&) : c(1) {} };
+struct Rr { int c; Rr(int&&) : c(1) {} };
+}
+namespace r2 { struct Tm { int c; Tm(int) : c(1) {} template <class U> Tm(U) : c(2) {} }; }
+namespace rv { struct TT { int chosen; template <class U> TT(U) : chosen(1) {} TT(int) : chosen(2) {} }; }

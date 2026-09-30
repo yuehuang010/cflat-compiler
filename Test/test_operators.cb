@@ -16,6 +16,15 @@ struct Vec2
     Vec2 operator-()  { Vec2 r; r.x = -x;  r.y = -y;  return r; }
 };
 
+int unaryMutDtorCount = 0;
+struct UnaryMut
+{
+    int value = 0;
+    int operator-() { value++; return value; }
+    ~UnaryMut() { unaryMutDtorCount++; }
+};
+UnaryMut makeUnaryMut(int value) { UnaryMut result = default; result.value = value; return result; }
+
 // ── BoolBox: logical NOT overload ────────────────────────────────────────────
 
 struct BoolBox
@@ -372,6 +381,57 @@ int i128FeatureLegs()
     return passed;
 }
 
+// A C++ exception thrown by a field's C++ constructor unwinds through a [cpp] struct's generated
+// constructor helper up to the C++ catch in cppunw.guarded (test_cpp_interop legs 3276-3277, kept
+// here for this file's -O2 twin run: a noexcept helper declaration terminated once inlined).
+import cpp "library/cpp_interop_unwind.h";
+import cpp "library/cpp_interop_unwind.cpp";
+[cpp] struct OpUnwFields { cppunw.Tx f1 = default; cppunw.Tx f2 = default; };
+[cpp] struct OpUnwFieldsCtor { cppunw.Tx f1 = default; cppunw.Tx f2 = default; OpUnwFieldsCtor(int v) { } };
+int OpUnwStructFields(int x)
+{
+    cppunw.Tr a = default;
+    cppunw.setArm(2);
+    OpUnwFields s = default;
+    return s.f1.get();
+}
+int OpUnwStructCtorFields(int x)
+{
+    cppunw.setArm(2);
+    OpUnwFieldsCtor s = OpUnwFieldsCtor(1);
+    return s.f1.get();
+}
+// Override helpers and struct-returning callbacks run behind a reverse ABI thunk that must
+// stay unwindable (it was nounwind: the throw terminated even at -O0).
+import cpp "library/cpp_interop_override_abi.h";
+[cpp] struct OpUnwOverride : cppoa.Base
+{
+    int k = 0;
+    override int integer() { return cppunw.thrower(k); }
+    override cppoa.Small16 small16() { cppoa.Small16 r = default; r.a = cppunw.thrower(k); return r; }
+    override cppoa.Large24 large24() { cppoa.Large24 r = default; r.a = cppunw.thrower(k); return r; }
+};
+int OpUnwOverrideInt(int x) { cppunw.Tr t = default; OpUnwOverride d = default; d.k = x; cppoa.Base* b = &d; return cppoa.call_integer(b); }
+int OpUnwOverride16(int x) { cppunw.Tr t = default; OpUnwOverride d = default; d.k = x; cppoa.Base* b = &d; return cppoa.call_small16(b); }
+int OpUnwOverride24(int x) { cppunw.Tr t = default; OpUnwOverride d = default; d.k = x; cppoa.Base* b = &d; return cppoa.call_large24(b); }
+cppunw.S16 OpUnwCb16(int x) { cppunw.Tr t = default; cppunw.S16 r = default; r.a = cppunw.thrower(x); return r; }
+cppunw.S24 OpUnwCb24(int x) { cppunw.Tr t = default; cppunw.S24 r = default; r.a = cppunw.thrower(x); return r; }
+int cppUnwindThroughHelperLegs()
+{
+    cppunw.reset();
+    int r = cppunw.guarded(OpUnwStructFields, 5);
+    if (r != -5 || cppunw.live() != 0 || cppunw.dtors() != 2) return 1;
+    cppunw.reset();
+    r = cppunw.guarded(OpUnwStructCtorFields, 5);
+    if (r != -5 || cppunw.live() != 0 || cppunw.dtors() != 1) return 2;
+    cppunw.reset(); r = cppunw.guarded(OpUnwOverrideInt, 5); if (r != -5 || cppunw.live() != 0) return 3;
+    cppunw.reset(); r = cppunw.guarded(OpUnwOverride16, 5); if (r != -5 || cppunw.live() != 0) return 4;
+    cppunw.reset(); r = cppunw.guarded(OpUnwOverride24, 5); if (r != -5 || cppunw.live() != 0) return 5;
+    cppunw.reset(); r = cppunw.guarded16(OpUnwCb16, 5); if (r != -5 || cppunw.live() != 0) return 6;
+    cppunw.reset(); r = cppunw.guarded24(OpUnwCb24, 5); if (r != -5 || cppunw.live() != 0) return 7;
+    return 0;
+}
+
 // ── Main ─────────────────────────────────────────────────────────────────────
 
 extern int main()
@@ -494,6 +554,21 @@ extern int main()
     Test("Vec2 unary- x", neg.x, -1.0f);
     Test("Vec2 unary- y", neg.y, -2.0f);
 
+    unaryMutDtorCount = 0;
+    {
+        UnaryMut mut = default; mut.value = 1;
+        Test("native unary- mutates lvalue", -mut, 2);
+        Test("native unary- keeps lvalue receiver", mut.value, 2);
+        UnaryMut* mutPtr = &mut;
+        Test("native unary- mutates pointer deref", -(*mutPtr), 3);
+        Test("native unary- pointer receiver value", mut.value, 3);
+        Test("native unary- has no receiver copy dtors", unaryMutDtorCount, 0);
+    }
+    Test("native unary- lvalue destroyed once", unaryMutDtorCount, 1);
+    unaryMutDtorCount = 0;
+    Test("native unary- on temporary", -makeUnaryMut(9), 10);
+    Test("native unary- temporary destroyed once", unaryMutDtorCount, 1);
+
     // Ensure binary operator- still works alongside unary
     Vec2 bsub = b - a;         // (3,4)-(1,2) = (2,2)
     Test("Vec2 binary- after unary- x", bsub.x, 2.0f);
@@ -504,6 +579,39 @@ extern int main()
     BoolBox bf; bf.value = false;
     Test("BoolBox !true",  !bt, false);
     Test("BoolBox !false", !bf, true);
+
+    bool unaryBool = true;
+    Test("C bool unary minus promotes to -1", -unaryBool, -1);
+    Test("C bool unary plus promotes to 1", +unaryBool, 1);
+    Test("C bool unary complement promotes to -2", ~unaryBool, -2);
+    const bool unaryBoolConst = true;
+    bool* unaryBoolPtr = &unaryBool;
+    Test("C bool temporary unary minus", -true, -1);
+    Test("C bool temporary unary plus", +true, 1);
+    Test("C bool temporary unary complement", ~true, -2);
+    Test("C const bool unary minus", -unaryBoolConst, -1);
+    Test("C const bool unary plus", +unaryBoolConst, 1);
+    Test("C const bool unary complement", ~unaryBoolConst, -2);
+    Test("C bool pointer unary minus", -*unaryBoolPtr, -1);
+    Test("C bool pointer unary plus", +*unaryBoolPtr, 1);
+    Test("C bool pointer unary complement", ~*unaryBoolPtr, -2);
+
+    float[4] unarySimdInput = {1.0f, -2.0f, 3.5f, -4.5f};
+    simd<float, 4> unarySimdValue = simd<float, 4>.load(unarySimdInput, 0);
+    const simd<float, 4> unarySimdConst = unarySimdValue;
+    simd<float, 4>* unarySimdPtr = &unarySimdValue;
+    float[4] unarySimdOutput = default;
+    simd<float, 4>.store(-unarySimdValue, unarySimdOutput, 0);
+    Test("simd float unary minus lane 0", unarySimdOutput[0], -1.0f);
+    Test("simd float unary minus lane 1", unarySimdOutput[1], 2.0f);
+    Test("simd float unary minus lane 2", unarySimdOutput[2], -3.5f);
+    Test("simd float unary minus lane 3", unarySimdOutput[3], 4.5f);
+    simd<float, 4>.store(-simd<float, 4>.load(unarySimdInput, 0), unarySimdOutput, 0);
+    Test("simd float temporary unary minus lane 0", unarySimdOutput[0], -1.0f);
+    simd<float, 4>.store(-unarySimdConst, unarySimdOutput, 0);
+    Test("simd float const unary minus lane 0", unarySimdOutput[0], -1.0f);
+    simd<float, 4>.store(-*unarySimdPtr, unarySimdOutput, 0);
+    Test("simd float pointer unary minus lane 0", unarySimdOutput[0], -1.0f);
 
     // -- operator(): callable struct values, pointers, aliases, and overloads --
     int callPassed = 0;
@@ -912,8 +1020,10 @@ extern int main()
     int sizeofUnevalPassed = sizeofUnevaluatedLegs();
     int boolFpPassed = boolToFloatingLegs();
     if (compoundResultOwnershipLegs() != 26) return 57;
-    if (byValueParamOwnershipLegs() != 33) return 58;
+    if (byValueParamOwnershipLegs() != 66) return 58;
     if (byValueAliasTempLegs() != 28) return 59;
+    if (byValueAliasOperatorLegs() != 11) return 61;
+    if (cppUnwindThroughHelperLegs() != 0) return 60;
 
     return (callPassed == 12 && terPassed == 23 && ptrOpPassed == 8 && uPassed == 3
         && unsignedLiteralPassed == 8 && unsignedAcceptPassed == 7
@@ -1714,6 +1824,22 @@ struct CrOpOwned
 CrOpOwned crOpMake(int v) { CrOpOwned r; *r.p = v; return r; }
 CrOpOwned operator-(CrOpOwned x, CrOpOwned y) { *x.p = *x.p - *y.p; return x; }
 int operator*(CrOpOwned x, CrOpOwned y) { return *x.p * *y.p; }
+CrOpOwned operator-(CrOpOwned x) { *x.p = 0 - *x.p; return x; }
+CrOpOwned crOpPass(CrOpOwned x) { return x; }
+CrOpOwned crOpCombine(CrOpOwned x, CrOpOwned y) { *x.p = *x.p + *y.p; return x; }
+struct CrOpHolder { CrOpOwned o = default; };
+struct CrOpUnique
+{
+    unique<int> p = default;
+    CrOpUnique() { p = new int; *p = 1; crCtor++; }
+    ~CrOpUnique() { crDtor++; }
+    int val() { return p.get() == nullptr ? -1 : *p; }
+};
+unique<int> crUniquePass(unique<int> value) { return move value; }
+int crUniqueTake(unique<int> value) { return *value; }
+CrOpUnique crOpUniqueMake(int v) { CrOpUnique r; *r.p = v; return r; }
+CrOpUnique operator-(CrOpUnique x) { *x.p = 0 - *x.p; return x; }
+string operator-(string x) { return x; }
 
 int byValueParamOwnershipLegs()
 {
@@ -1821,9 +1947,86 @@ int byValueParamOwnershipLegs()
         // `a -= b` with a left-consuming operator: the store-back makes `a` live again.
         CrOpOwned a = crOpMake(9); CrOpOwned b = crOpMake(2);
         a -= b; a -= b;
-        passed += Test("compound on consuming left operand revives destination", *a.p * 100 + *b.p, 502);
+    passed += Test("compound on consuming left operand revives destination", *a.p * 100 + *b.p, 502);
     }
     passed += Test("compound on consuming left operand ctor/frees", crCtor * 10 + crDtor, 22);
+    crCtor = 0; crDtor = 0;
+    { CrOpOwned a = crOpMake(5); CrOpOwned n = -a;
+        passed += Test("unary consuming operand value", *n.p, -5); }
+    passed += Test("unary consuming operand ctor/dtor", crCtor * 10 + crDtor, 11);
+    crCtor = 0; crDtor = 0;
+    { CrOpOwned n = -crOpMake(3);
+        passed += Test("unary temporary operand value", *n.p, -3); }
+    passed += Test("unary temporary operand ctor/dtor", crCtor * 10 + crDtor, 11);
+    crCtor = 0; crDtor = 0;
+    { CrOpHolder h = default; h.o = crOpMake(5); CrOpOwned b = crOpMake(2);
+        CrOpOwned r = h.o + b;
+        passed += Test("field consuming operator value", *r.p, 7); }
+    passed += Test("field consuming operator ctor/dtor", crCtor * 10 + crDtor, 33);
+    crCtor = 0; crDtor = 0;
+    { CrOpHolder h = default; h.o = crOpMake(5); CrOpOwned b = crOpMake(2);
+        CrOpOwned r = crOpCombine(h.o, b);
+        passed += Test("field consuming call value", *r.p, 7); }
+    passed += Test("field consuming call ctor/dtor", crCtor * 10 + crDtor, 33);
+    crCtor = 0; crDtor = 0;
+    { CrOpOwned a = crOpMake(5); CrOpOwned b = crOpMake(2); CrOpOwned* pa = &a;
+        CrOpOwned r = *pa + b;
+        passed += Test("deref consuming operator value", *r.p, 7); }
+    passed += Test("deref consuming operator ctor/dtor", crCtor * 10 + crDtor, 22);
+    crCtor = 0; crDtor = 0;
+    { CrOpOwned a = crOpMake(5); CrOpOwned b = crOpMake(2); CrOpOwned* pa = &a;
+        CrOpOwned r = crOpCombine(*pa, b);
+        passed += Test("deref consuming call value", *r.p, 7); }
+    passed += Test("deref consuming call ctor/dtor", crCtor * 10 + crDtor, 22);
+    crCtor = 0; crDtor = 0;
+    { CrOpOwned a = crOpMake(5); CrOpOwned c = crOpMake(8); bool pick = true;
+        CrOpOwned r = crOpPass(pick ? a : c);
+        passed += Test("call consuming ternary value", *r.p, 5); }
+    passed += Test("call consuming ternary ctor/dtor", crCtor * 10 + crDtor, 22);
+    crCtor = 0; crDtor = 0;
+    { CrOpOwned a = crOpMake(5); CrOpOwned c = crOpMake(8); CrOpOwned b = crOpMake(2);
+        bool pick = false; CrOpOwned r = (pick ? a : c) + b;
+        passed += Test("operator consuming ternary value", *r.p, 10); }
+    passed += Test("operator consuming ternary ctor/dtor", crCtor * 10 + crDtor, 33);
+    crCtor = 0; crDtor = 0;
+    { CrOpOwned a = crOpMake(5); CrOpOwned c = crOpMake(8); CrOpOwned b = crOpMake(2);
+        bool pick = false; CrOpOwned r = crOpCombine(pick ? a : c, b);
+        passed += Test("call consuming ternary operator-peer value", *r.p, 10); }
+    passed += Test("call consuming ternary operator-peer ctor/dtor", crCtor * 10 + crDtor, 33);
+    crCtor = 0; crDtor = 0;
+    { string a = "copy"; string n = -a;
+        passed += Test("copyable unary owner keeps caller", n.length() * 100 + a.length(), 404); }
+    crCtor = 0; crDtor = 0;
+    { CrOpUnique a = crOpUniqueMake(5); CrOpUnique n = -a;
+        passed += Test("unique-field unary value", n.val(), -5); }
+    passed += Test("unique-field unary ctor/dtor", crCtor * 10 + crDtor, 11);
+    crCtor = 0; crDtor = 0;
+    { CrOpUnique n = -crOpUniqueMake(3);
+        passed += Test("unique-field unary temporary value", n.val(), -3); }
+    passed += Test("unique-field unary temporary ctor/dtor", crCtor * 10 + crDtor, 11);
+    crCtor = 0; crDtor = 0;
+    { CrOpHolder h = default; h.o = crOpMake(5); CrOpOwned n = -h.o;
+        passed += Test("unary consuming field value", *n.p, -5); }
+    passed += Test("unary consuming field ctor/dtor", crCtor * 10 + crDtor, 22);
+    crCtor = 0; crDtor = 0;
+    { CrOpOwned a = crOpMake(5); CrOpOwned* pa = &a; CrOpOwned n = -*pa;
+        passed += Test("unary consuming dereference value", *n.p, -5); }
+    passed += Test("unary consuming dereference ctor/dtor", crCtor * 10 + crDtor, 11);
+    crCtor = 0; crDtor = 0;
+    { CrOpOwned a = crOpMake(5); CrOpOwned b = crOpMake(8); bool pick = false;
+        CrOpOwned n = -(pick ? a : b);
+        passed += Test("unary consuming ternary value", *n.p, -8); }
+    passed += Test("unary consuming ternary ctor/dtor", crCtor * 10 + crDtor, 22);
+    crCtor = 0; crDtor = 0;
+    { CrOpUnique a = crOpUniqueMake(5); CrOpUnique b = crOpUniqueMake(8); bool pick = true;
+        CrOpUnique n = -(pick ? a : b);
+        passed += Test("unique-field unary ternary value", n.val(), -5); }
+    passed += Test("unique-field unary ternary ctor/dtor", crCtor * 10 + crDtor, 22);
+    { unique<int> a = new int(5); unique<int> b = new int(8); bool pick = false;
+        unique<int> r = crUniquePass(pick ? a : b);
+        passed += Test("unique value param ternary return", *r, 8); }
+    { unique<int> a = new int(5); unique<int> b = new int(8); bool pick = true;
+        passed += Test("unique value param ternary take", crUniqueTake(pick ? a : b), 5); }
     return passed;
 }
 
@@ -1860,6 +2063,65 @@ BaT baTRet() { return baTPass(baTMk(14)); }
 struct BaTHolder { BaT v = default; };
 BaT baTPick(BaT a, BaT b, bool first) { if (first) return a; return b; }
 alias BaT baTSpelled(BaT w) { return w; }
+BaT operator~(BaT w) { return w; }
+alias BaT operator!(BaT w) { return w; }
+BaT operator-(BaT w) { return w; }
+int baTOperatorSignature(int which, bool directCall)
+{
+    baCtor = 0; baDtor = 0;
+    int value = 0;
+    if (which == 0)
+    {
+        BaT a = baTMk(5);
+        if (directCall) { BaT r = baTPass(a); value = r.val() * 100 + a.val(); }
+        else { BaT r = ~a; value = r.val() * 100 + a.val(); }
+    }
+    else if (which == 1)
+    {
+        BaT a = baTMk(5);
+        if (directCall) { BaT r = baTSpelled(a); value = r.val() * 100 + a.val(); }
+        else { BaT r = !a; value = r.val() * 100 + a.val(); }
+    }
+    else if (which == 2)
+    {
+        BaTHolder h = { v = baTMk(5) };
+        if (directCall) { BaT r = baTPass(h.v); value = r.val() * 100 + h.v.val(); }
+        else { BaT r = ~h.v; value = r.val() * 100 + h.v.val(); }
+    }
+    else if (which == 3)
+    {
+        BaT a = baTMk(6); BaT* p = &a;
+        if (directCall) { BaT r = baTPass(*p); value = r.val() * 100 + a.val(); }
+        else { BaT r = !(*p); value = r.val() * 100 + a.val(); }
+    }
+    else if (which == 4)
+    {
+        BaT a = baTMk(5);
+        if (directCall) { BaT r = baTPass(a); value = r.val() * 100 + a.val(); }
+        else { BaT r = -a; value = r.val() * 100 + a.val(); }
+    }
+    else
+    {
+        BaT r = ~baTMk(17); value = r.val();
+    }
+    return value * 10000 + baCtor * 100 + baDtor;
+}
+int byValueAliasOperatorLegs()
+{
+    int passed = 0;
+    passed += Test("alias unary named matches direct call", baTOperatorSignature(0, false), baTOperatorSignature(0, true));
+    passed += Test("alias unary named signature", baTOperatorSignature(0, false), 5050101);
+    passed += Test("spelled alias unary named matches direct call", baTOperatorSignature(1, false), baTOperatorSignature(1, true));
+    passed += Test("spelled alias unary named signature", baTOperatorSignature(1, false), 5050101);
+    passed += Test("alias unary field matches direct call", baTOperatorSignature(2, false), baTOperatorSignature(2, true));
+    passed += Test("alias unary field signature", baTOperatorSignature(2, false), 5050202);
+    passed += Test("alias unary dereference matches direct call", baTOperatorSignature(3, false), baTOperatorSignature(3, true));
+    passed += Test("alias unary dereference signature", baTOperatorSignature(3, false), 6060101);
+    passed += Test("alias minus named matches direct call", baTOperatorSignature(4, false), baTOperatorSignature(4, true));
+    passed += Test("alias minus named signature", baTOperatorSignature(4, false), 5050101);
+    passed += Test("alias unary temporary exact counts", baTOperatorSignature(5, false), 170101);
+    return passed;
+}
 int byValueAliasTempLegs()
 {
     int passed = 0;

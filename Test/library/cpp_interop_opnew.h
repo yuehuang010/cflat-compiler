@@ -130,6 +130,7 @@ struct Esc
     int outOfLine() const { return escOpaque(this); }
 };
 inline int escRead(const Esc* p) noexcept { return p->v; }
+inline int escKeepArg(Esc* p) noexcept { escKept = p; return p->v; }
 inline int escThrow(Esc* p, int value) { if (value != 0) throw value; return p->v; }
 inline int escThrowKeep(Esc* p, int value)
 { if (p != nullptr) escKept = p; throw value; }

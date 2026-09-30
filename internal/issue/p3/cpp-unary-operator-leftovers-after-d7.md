@@ -1,28 +1,26 @@
 # Unary operator leftovers after D7+C3
 
-Summary: out-of-scope gaps found by the D7+C3 implementer (2026-09-29); probes are in cflat-fix-d7 scratch/d7/.
-1. A const/non-const FREE overload pair for one class, `operator-(const T&)` beside `operator-(T&)`: an lvalue operand picks the first declared, while clang picks the non-const one.
-   - The binary operators have the same gap; it is a ranking gap in ComputeOverloadFunction.
-2. C++ conversion operators to unsigned or long long are not bound at all; `unsigned u = obj;` is refused on master.
-   - As a result, unsigned promotion in ConvertUnaryOperandViaImplicitConversion is untested.
-3. A native CFlat struct member `operator-()` applied to an lvalue still runs on a copy. D7 fixed this for C++ receivers only, so a mutating native unary operator leaves the source unchanged.
+Summary: selected unary follow-ups from D7+C3. This round fixes items 1, 3, 4, 7, 8a, 8b and 9. Remaining items are listed at the end.
 
-From the D7 review round 1 (scratch/repro_keep/d7r1/d7_review1.md, all non-regressions):
-4. The free-path rvalue refusal never fires for call results. `~rw.mkFR2()` with `int operator~(FR2&)` gives 4, where clang says "invalid argument type". The sret temp passes the plain-load test.
-5. Conversion-step gaps:
-   - a conversion inherited from a base: DerI, and `-a` on std::atomic<int>;
-   - reference-returning conversions: `operator int&()`, `operator const int&() const`;
-   - targets signed/unsigned char, long long, unsigned, and unscoped enum;
-   - pointer conversion `+cp`.
-6. Pointer conversions are not counted as candidates. `struct IP { operator int() const; operator int*(); }` with `+ip`: clang reports ambiguity, cflat gives 3.
-7. `*cp` through `operator int*()` fails with "Module verification failed". Pre-existing verifier trap.
-8. C++ ranking mismatches:
-   - `!nb` with both a member operator! and operator bool gives 0; clang 77. The operator-bool shortcut runs before operator lookup.
-   - `-rv.crefCN()` on a const& result picks the non-const overload.
-   - free and member operators both declared: cflat picks the free one; clang reports ambiguity.
-   - by-value vs const& free pair: cflat picks const&.
-   - a ternary lvalue operand `-(f ? m : n)` with a mutating operator runs on a copy.
-9. Native:
-   - `-s` on simd<float,4> fails verification ("Integer arithmetic operators only work with integral types").
-   - `-bb` on bool gives 1; C gives -1.
-Const receiver overload pick and const fields: see p2/cpp-const-object-nonconst-member-call-writes-readonly.md.
+## Fixed in this round
+
+1. A free C++ `operator-(T&)` / `operator-(const T&)` pair now ranks `T&` for mutable lvalues and `const T&` for const lvalues and rvalues. The same `ComputeOverloadFunction` ranking applies to the matching binary free-operator pair.
+3. A native CFlat member unary operator that mutates `this` now receives the lvalue slot itself. Pointer dereference mutates its pointee; temporaries stay temporary. Regression legs check value and exact destructor counts.
+4. A free C++ unary operator taking non-const `T&` rejects a call-result temporary with the free-path rvalue-reference diagnostic. Lvalue and pointer-dereference acceptance are pinned.
+7. Unary dereference of a C++ value with an `operator int*()` reports a `LogError` when the converted pointer cannot be lowered, instead of reaching module verification.
+8a. Unary `!` operator lookup runs before the operator-bool shortcut, so a member `operator!` wins in `!nb` when both are present.
+8b. A const-reference call result uses the `const T&` free unary overload and preserves the referent.
+9. Unary minus for floating SIMD vectors emits floating negation. Unary `-`, `+` and `~` promote bool to signed int, matching C integer promotions.
+
+## Still open
+
+2. C++ conversion operators to unsigned or long long are not bound; unsigned promotion in the unary implicit-conversion step remains untested.
+
+5. Unary conversion-step gaps remain: inherited conversions (including `std::atomic<int>`), reference-returning conversions, conversions to signed/unsigned char, long long, unsigned and unscoped enum, and pointer conversion `+cp`.
+
+6. Pointer conversions are not counted as unary candidates. `IP { operator int() const; operator int*(); }` with `+ip` still needs to report ambiguity like clang.
+
+8. Three C++ ranking cases remain open: free and member operators both declared (clang reports ambiguity); by-value versus `const T&` free pairs; and a ternary lvalue operand with a mutating operator running on a copy.
+
+10. (b19 review 2, probes scratch/repro_keep/b19/rev2/) A refusal after the const/rvalue filter erases every candidate prints "Candidates (0):" (`wd.crefM() % 1` with only free `operator%(M&, int)`); it should name the dropped `M&` candidate and the const/rvalue reason. Same shape on the unary filter.
+11. Pre-existing on master (b19 review 2): reversed free `one == c` with `operator==(const C&, int)` refused (clang accepts); a non-const member `operator+(int)` on a const global picked over a free `const&` (clang picks the free one); `mkV() + 1` with a by-value `V` free operator param refused as not addressable in one route; `inline const W<int> gW` not bound ("not a member").

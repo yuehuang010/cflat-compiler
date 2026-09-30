@@ -1,16 +1,29 @@
-# C++ method / operator-> returning a POINTER to an unrequested specialization is never retried
+# P3: Remaining C++ free-operator and converting-constructor retry gaps
 
-Found 2026-09-28 by run D3. Reference and by-value returns of an unrequested class-template
-specialization bind on use through the refused-member retry (d8d21f18); pointer returns do not:
-`R2<C2>* ptr()` -> "no overload of ptr matches", and `R1<C1>* operator->()` -> `a.get()` "function a is not
-known". Repro: scratch/repro_keep/d3/opa.h + a1.cb / a2.cb (main checkout).
-Fix direction: the refusal reason for a pointer-to-specialization return must be recorded as retryable like
-the by-value case (find where the retry decides eligibility), plus legs for a method and for operator->.
+This file now tracks only the D3 review findings not fixed in D6. The original pointer-return
+method and `operator->` retry gap is fixed in D6 by requesting an opaque pointer's unrequested
+class-template pointee when that member is projected on use. Pointer-returning member `operator*=`
+expressions now preserve their declared pointer result type. See `scratch/d6_matrix.md` and
+`scratch/briefs/d6_report.md` for measured probes and legs.
 
-More gaps in the same family, from the D3 review (2026-09-28, probes in cflat-fix-d3 scratch/rv2/, copied to scratch/repro_keep/d3rv2/). All are pre-existing and outside D3's matrix:
-- A global-namespace class whose free operator returns a specialization is refused, for both `*=` and binary `*`.
-- A free operator on a base class is refused for a derived receiver. The plain-return control is refused on master too.
-- `(a *= x).get()` fails because the compound expression ignores the operator's declared return type.
-- A pointer-returning `operator*=` is never retried; this is the original item above.
-- `op3.W d = a * 3.0;`, which converts through a template converting ctor, fails with the wrong diagnostic "cannot cast an aggregate value - a fixed array decays...". `W(a * 3.0)` works.
-- A class with only a binary `@` (or a deleted or private `@=` beside a public binary `@`) silently falls back to `a = a @ b`, while clang refuses. That is a CFlat compound-fallback design question for C++ classes: needs a ruling before it is changed.
+## Remaining findings
+
+- A global-namespace class with a free operator returning a class-template specialization is still
+  refused for both `*=` and binary `*`. D6 probes `global_compound.cb` and `c_GB.cb` still fail on
+  the post-fix compiler with the same errors as master. The issue is in global free-operator lookup
+  and binding, outside the member-signature lazy retry path.
+- A free operator declared on a base class was reported refused for a derived receiver, including
+  a plain-return control on master. The copied D3 fixture's analogous specialization-return and
+  plain-return compound operators (`base_free_compound.cb`, `c_KD2.cb`) both pass on master and
+  post-fix; the exact failing D3 spelling still needs a focused repro before changing overload
+  candidate selection.
+- A free or member compound-assignment expression such as `(a *= x).get()` can use the wrong
+  declared result type for reference returns. D6 fixed pointer-return member `operator*=` result
+  propagation (leg 7562), but `ok_Aexpr.cb` and `ns_free_compound.cb` still fail for reference
+  result types. This expression-result path needs separate review.
+- `op3.W d = a * 3.0` still reports the incorrect `cannot cast an aggregate value` diagnostic while
+  explicit `op3.W(a * 3.0)` succeeds. D6 measured the pair in `op3_convert.cb` and `op3_direct.cb`;
+  aggregate converting-constructor resolution is a separate path.
+- A C++ class with only a binary `@` operator, or a deleted/private `@=` beside a public binary
+  `@`, can silently fall back to `a = a @ b` although `clang++ -std=c++20` rejects it. This is a
+  compound-fallback design question and remains unchanged pending a maintainer ruling.

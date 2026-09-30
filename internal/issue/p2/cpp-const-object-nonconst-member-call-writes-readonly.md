@@ -1,12 +1,38 @@
-# Const C++ receiver leftovers after B20
+# P2: Remaining const C++ receiver gaps
 
-Summary: B20 landed in 44d3321c (2026-09-29). Member calls, member binary operators and member unary operators on a const namespace global, a const& result, or a const T* reached through -> now pick the const overload like clang. A named call with no const overload is refused. Probes are in scratch/repro_keep/b20rv2/ and scratch/repro_keep/d7r1/. Still open:
-1. Const member FIELDS are not tracked. The clang record carries no field-const flag. Adding one needs a flag in the extraction, a header-cache version bump, and a marker on field access.
-   - Example: `-h.c` / `!h.c` on `struct HC { const CM2 c{}; }` gives 13 / 60, and mutates the field; clang gives 3 / 50.
-   - `h.c.get()` gives 13.
-2. A local `const T*` loses its pointee constness: `rv.A2* q = rv.a2p(); q->add(1);` SIGBUSes on master and on the branch. clang refuses the declaration.
-3. A non-const-only member called through a const T* result or a type-const receiver still runs; clang refuses. The refusal covers only const globals and const& results.
-4. An inherited non-const-only member on a const global crashes instead of being refused.
-5. A virtual base does not resolve the twin.
-6. A mutable object whose two bases both define the pair is not flagged as ambiguous.
-7. A mixed set such as `get()` const/non-const plus a non-const-only `get(int)`, called as `get(5)` on a const object, gives a generic no-match error instead of clang's const-specific one.
+The member-overload tracking fixes in B20, B20c, and B20d cover local const objects,
+const namespace objects, const references, and const pointees for the resolved shapes below.
+These are the remaining independently reproduced gaps.
+
+## 2. Pointee const through non-local CFlat storage
+
+Const pointee metadata is lost after a pointer is stored in a CFlat field, a CFlat global, or
+a list element. Examples: `s.p = rv.pcp(); s.p->only();`, `g = rv.pcp(); g->only();`, and
+`l[0]->get()`. Calls to a non-const-only member can then be accepted on a const pointee.
+
+## 4. Loop back-edge const-pointer dataflow
+
+The receiver analysis sees the call before a const-pointer assignment on a loop back-edge:
+`rv.P* q = rv.pmm(); for (2x) { q->only(); q = rv.pcp(); }`. Clang rejects the assignment
+from `const P*` into `P*`; CFlat currently misses it on this path.
+
+## 6. Virtual-base const/non-const twin resolution
+
+Member lookup does not find the const/non-const overload twin through a virtual base path.
+The existing non-virtual base coverage does not exercise this lookup.
+
+## Review leftovers
+
+- Array elements of a const parent's non-const array field remain mutable (`ch.arr[0].only()`
+  is accepted and `ch.arr[1].get()` selects 13; clang rejects and selects 3 respectively).
+- Taking the address of a const field does not carry pointee const (`auto q = &h.c; q->get()`
+  selects 13; clang selects 3).
+- Calling a static member template through an object (`ch.ts(2)`, `rv.gcH.ts(2)`) fails to
+  bind, while the class-qualified call succeeds.
+
+Current related coverage is in `Test/test_cpp_interop.cb` with C++ fixtures in
+`Test/library/cpp_interop_basic.h` and `scratch/repro_keep/b20d/rv1/rv.h` (main checkout).
+
+Also open (b20d review 2, same on master; probes scratch/repro_keep/b20d/rv2/):
+- A `const auto` copy of a C++ record is not a const receiver: `get()` picks the non-const overload (13) and `only()` is accepted; clang picks const (3) and refuses.
+- A pointer declared to const, `const rv.C* pm; pm->get()`, picks 13; clang 3.
