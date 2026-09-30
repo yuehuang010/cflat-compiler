@@ -1,6 +1,88 @@
 #include "MainListener.h"
 #include <llvm/Support/SaveAndRestore.h>
 
+static uint32_t DecodeLiteralScalar(std::string::const_iterator& it,
+                                    const std::string::const_iterator& end)
+{
+    if (it == end) return 0;
+    if (*it == '\\')
+    {
+        ++it;
+        if (it == end) return '\\';
+        char esc = *it++;
+        if (esc == 'u' || esc == 'U' || esc == 'x')
+        {
+            int digits = esc == 'u' ? 4 : (esc == 'U' ? 8 : 0);
+            uint32_t value = 0;
+            while (it != end && (digits == 0 || digits-- > 0))
+            {
+                char c = *it;
+                unsigned d = c >= '0' && c <= '9' ? c - '0' :
+                    c >= 'a' && c <= 'f' ? c - 'a' + 10 :
+                    c >= 'A' && c <= 'F' ? c - 'A' + 10 : 16;
+                if (d == 16) break;
+                value = value * 16 + d;
+                ++it;
+            }
+            return value;
+        }
+        if (esc >= '0' && esc <= '7')
+        {
+            uint32_t value = esc - '0';
+            for (int n = 0; n < 2 && it != end && *it >= '0' && *it <= '7'; ++n)
+                value = value * 8 + (*it++ - '0');
+            return value;
+        }
+        switch (esc)
+        {
+        case 'a': return '\a'; case 'b': return '\b'; case 'f': return '\f';
+        case 'n': return '\n'; case 'r': return '\r'; case 't': return '\t';
+        case 'v': return '\v'; default: return static_cast<unsigned char>(esc);
+        }
+    }
+    unsigned char first = static_cast<unsigned char>(*it++);
+    if (first < 0x80) return first;
+    unsigned count = first >= 0xF0 ? 3 : first >= 0xE0 ? 2 : 1;
+    uint32_t value = first & (count == 3 ? 0x07 : count == 2 ? 0x0F : 0x1F);
+    for (unsigned n = 0; n < count && it != end; ++n)
+        value = (value << 6) | (static_cast<unsigned char>(*it++) & 0x3F);
+    return value;
+}
+
+static void AppendEncodedScalar(std::vector<uint32_t>& out, uint32_t scalar, unsigned width)
+{
+    if (width == 16 && scalar > 0xFFFF && scalar <= 0x10FFFF)
+    {
+        scalar -= 0x10000;
+        out.push_back(0xD800 + (scalar >> 10));
+        out.push_back(0xDC00 + (scalar & 0x3FF));
+    }
+    else out.push_back(scalar);
+}
+
+static void AppendUtf8Scalar(std::string& out, uint32_t scalar)
+{
+    if (scalar <= 0x7F) out.push_back(static_cast<char>(scalar));
+    else if (scalar <= 0x7FF)
+    {
+        out.push_back(static_cast<char>(0xC0 | (scalar >> 6)));
+        out.push_back(static_cast<char>(0x80 | (scalar & 0x3F)));
+    }
+    else if (scalar <= 0xFFFF)
+    {
+        out.push_back(static_cast<char>(0xE0 | (scalar >> 12)));
+        out.push_back(static_cast<char>(0x80 | ((scalar >> 6) & 0x3F)));
+        out.push_back(static_cast<char>(0x80 | (scalar & 0x3F)));
+    }
+    else if (scalar <= 0x10FFFF)
+    {
+        out.push_back(static_cast<char>(0xF0 | (scalar >> 18)));
+        out.push_back(static_cast<char>(0x80 | ((scalar >> 12) & 0x3F)));
+        out.push_back(static_cast<char>(0x80 | ((scalar >> 6) & 0x3F)));
+        out.push_back(static_cast<char>(0x80 | (scalar & 0x3F)));
+    }
+}
+
 // The only postfix suffixes that may follow a member and still STORE to it: `obj.r++`.
 static bool IsIncrementSuffix(antlr4::tree::ParseTree* node)
 {
@@ -2103,7 +2185,12 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     auto* fieldLLVMType = Compiler(ctx)->GetType(fieldType);
                                     if (dataStructure.IsUnion)
                                     {
-                                        namedVar.Storage = structVar.Storage;  // union: all fields at offset 0
+                                        namedVar.Storage = dataStructure.CxxOffsetLayout
+                                            && fieldIndex < dataStructure.CxxFieldOffsets.size()
+                                            && dataStructure.CxxFieldOffsets[fieldIndex] != 0
+                                            ? Compiler(ctx)->CreateCxxFieldGEP(
+                                                dataStructure, structVar.Storage, fieldIndex)
+                                            : structVar.Storage;
                                         namedVar.UnionFieldType = fieldLLVMType;
                                         if (llvm::isa<llvm::ArrayType>(fieldLLVMType))
                                         {
@@ -2179,9 +2266,14 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                         auto* fieldLLVMType = Compiler(ctx)->GetType(fieldType);
                                         if (dataStructure.IsUnion)
                                         {
-                                            // Union: all fields alias at offset 0. Store raw alloca pointer
-                                            // and record the field type so derefLoad/derefAssign use it.
-                                            namedVar.Storage = structVar.Storage;
+                                            // Most union members start at offset 0. C++ promoted
+                                            // members can start inside an anonymous struct member.
+                                            namedVar.Storage = dataStructure.CxxOffsetLayout
+                                                && fieldIndex < dataStructure.CxxFieldOffsets.size()
+                                                && dataStructure.CxxFieldOffsets[fieldIndex] != 0
+                                                ? Compiler(ctx)->CreateCxxFieldGEP(
+                                                    dataStructure, structVar.Storage, fieldIndex)
+                                                : structVar.Storage;
                                             namedVar.UnionFieldType = fieldLLVMType;
                                             if (llvm::isa<llvm::ArrayType>(fieldLLVMType))
                                             {
@@ -2859,7 +2951,21 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 namedVar.IsRvalue = true;
                             }
                             if (!prevPrimary->StringLiteral().empty())
+                            {
                                 namedVar.IsRvalue = true;
+                                for (auto* literal : prevPrimary->StringLiteral())
+                                {
+                                    const std::string literalText = literal->getText();
+                                    const size_t quote = literalText.find('"');
+                                    if (quote == std::string::npos || quote == 0) continue;
+                                    std::string prefix = literalText.substr(0, quote);
+                                    if (prefix == "L") namedVar.TypeAndValue.TypeName = "wchar";
+                                    else if (prefix == "u") namedVar.TypeAndValue.TypeName = "c16";
+                                    else if (prefix == "U") namedVar.TypeAndValue.TypeName = "c32";
+                                }
+                                if (!namedVar.TypeAndValue.TypeName.empty())
+                                    namedVar.TypeAndValue.Pointer = true;
+                            }
                             // `default` takes the destination's type - publish it so a following
                             // suffix and the caller both see the right type, not an empty one.
                             if (prevPrimary->Default() != nullptr && !declExpectedType.TypeName.empty())
@@ -9156,12 +9262,31 @@ llvm::Value* MainListener::ParsePrimaryExpression(CFlatParser::PrimaryExpression
                     "operator, e.g. \"a\" + \"b\".");
                 return nullptr;
             }
-            // TODO handle encoding u8,u,U,L
             std::string rawText = ctx->getText();
+            const size_t quote = rawText.find('"');
+            const std::string encoding = quote == std::string::npos ? "" : rawText.substr(0, quote);
+            // u8 stays a narrow UTF-8 string; u / U / L lower to NUL-terminated c16 / c32 / wchar.
+            if (encoding.empty() || encoding == "u8")
+            {
+                if (HasInterpolation(rawText))
+                    return ParseFormatString(ctx, rawText);
+                std::string processed = ProcessRawText(rawText, /*foldBraces=*/true);
+                return compiler->CreateGlobalString("", processed);
+            }
             if (HasInterpolation(rawText))
-                return ParseFormatString(ctx, rawText);
-            std::string processed = ProcessRawText(rawText, /*foldBraces=*/true);
-            return compiler->CreateGlobalString("", processed);
+            {
+                LogErrorContext(ctx, "string interpolation is not supported in a prefixed string literal");
+                return nullptr;
+            }
+            const unsigned width = encoding == "U" ? 32 : encoding == "u" ? 16
+                : static_cast<unsigned>(compiler->wcharBits_);
+            std::vector<uint32_t> values;
+            auto it = rawText.cbegin() + quote + 1;
+            auto end = rawText.cend() - 1;
+            while (it != end)
+                AppendEncodedScalar(values, DecodeLiteralScalar(it, end), width);
+            values.push_back(0);
+            return compiler->CreateGlobalEncodedString(".wide.str", values, width);
         }
         else if (constant)
         {
@@ -9183,11 +9308,11 @@ llvm::Value* MainListener::ParsePrimaryExpression(CFlatParser::PrimaryExpression
                     (constantText[0] == 'L' || constantText[0] == 'u' || constantText[0] == 'U') &&
                     constantText[1] == '\''))
             {
-                char c = ParseCharLiteral(constantText);
+                uint32_t c = ParseCharLiteral(constantText);
                 auto literalType = ParseLiteralTypeAndValue(constantText);
                 if (!literalType.TypeName.empty())
                     return compiler->CreateConstant(literalType.TypeName,
-                        std::to_string(static_cast<unsigned char>(c)));
+                        std::to_string(c));
                 return compiler->CreateConstant(LLVMBackend::ConstantVariant(c));
             }
             else
@@ -9428,22 +9553,10 @@ char MainListener::ProcessEscapeChar(std::string::const_iterator& itr, const std
         }
     }
 
-char MainListener::ParseCharLiteral(const std::string& text) {
-        auto itr = text.cbegin();
-
-        // Skip encoding prefix (L, u, U)
-        if (*itr == 'L' || *itr == 'u' || *itr == 'U')
-            ++itr;
-
-        ++itr; // skip opening '
-
-        if (*itr == '\\')
-        {
-            ++itr;
-            return ProcessEscapeChar(itr, text.cend());
-        }
-
-        return *itr;
+uint32_t MainListener::ParseCharLiteral(const std::string& text) {
+        auto begin = text.begin() + text.find('\'') + 1;
+        auto end = text.end() - 1;
+        return DecodeLiteralScalar(begin, end);
     }
 
 std::string MainListener::ProcessRawText(const std::string& rawText, bool foldBraces) {
@@ -9463,7 +9576,13 @@ std::string MainListener::ProcessRawText(const std::string& rawText, bool foldBr
             if (*itr == '\\')
             {
                 ++itr;
-                output += ProcessEscapeChar(itr, rawText.cend());
+                if (itr != rawText.cend() && (*itr == 'u' || *itr == 'U'))
+                {
+                    auto escape = itr - 1;
+                    AppendUtf8Scalar(output, DecodeLiteralScalar(escape, rawText.cend()));
+                    itr = escape;
+                }
+                else output += ProcessEscapeChar(itr, rawText.cend());
             }
             else if (foldBraces && (*itr == '{' || *itr == '}') && (itr + 1) != rawText.cend() && *(itr + 1) == *itr)
             {

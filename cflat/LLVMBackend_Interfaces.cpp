@@ -219,6 +219,9 @@ std::string LLVMBackend::ResolveTypeAlias(const std::string& name) const
             if (it != frame.typeAliases.end()) return it->second;
         }
         if (const std::string* found = FindFirstVisibleScoped(typeAliases, name)) return *found;
+        if (!cxxLazyGlobalTypedefs_.empty() && cxxLazyGlobalTypedefs_.count(name) != 0
+            && const_cast<LLVMBackend*>(this)->MaterializeCxxGlobalTypedef(name))
+            if (const std::string* found = FindFirstVisibleScoped(typeAliases, name)) return *found;
         return name;
     }
 
@@ -229,7 +232,11 @@ const LLVMBackend::TypeAndValue* LLVMBackend::FindFunctionTypeAlias(const std::s
             auto it = frame.functionTypeAliases.find(name);
             if (it != frame.functionTypeAliases.end()) return &it->second;
         }
-        return FindFirstVisibleScoped(functionTypeAliases, name);
+        if (const TypeAndValue* found = FindFirstVisibleScoped(functionTypeAliases, name)) return found;
+        if (!cxxLazyGlobalTypedefs_.empty() && cxxLazyGlobalTypedefs_.count(name) != 0
+            && const_cast<LLVMBackend*>(this)->MaterializeCxxGlobalTypedef(name))
+            return FindFirstVisibleScoped(functionTypeAliases, name);
+        return nullptr;
     }
 
 void LLVMBackend::PushAliasScope()

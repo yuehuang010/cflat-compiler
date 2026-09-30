@@ -37,7 +37,18 @@ import "wstring.cb";
 // and tlhelp32.h extracted alone, failing as an orphan. The assertions below (the toolhelp
 // walk and sizeof(PROCESSENTRY32) == 304) prove tlhelp32 still binds correctly.
 import "windows.h";
+import cpp "windows.h";
 import {"windows.h", "tlhelp32.h"} lib { "user32.lib", "gdi32.lib" };
+
+using LONG = long;
+using LONG64 = long long;
+
+struct InterlockedIntGuarded { int counter; int guard; };
+struct InterlockedLongGuarded { long counter; LONG guard; };
+struct InterlockedLONGGuarded { LONG counter; LONG guard; };
+struct InterlockedUnsignedGuarded { unsigned counter; unsigned guard; };
+struct InterlockedLongLongGuarded { long long counter; long long guard; };
+struct InterlockedLONG64Guarded { LONG64 counter; LONG64 guard; };
 
 manifest ManifestDoc appManifest = { assembly = {
     dependency = { { dependentAssembly = { assemblyIdentity = {
@@ -67,6 +78,55 @@ extern int main(int argc, char** argv)
 {
     int passed = 0;
     int total = 0;
+
+    InterlockedIntGuarded interlockedInt = default;
+    interlockedInt.counter = 5;
+    interlockedInt.guard = 0x12345678;
+    total++; passed += Test("Interlocked int compare exchange",
+        InterlockedCompareExchange(&interlockedInt.counter, 9, 5) == 5
+            && interlockedInt.counter == 9 && interlockedInt.guard == 0x12345678, true);
+    total++; passed += Test("Interlocked int exchange guard",
+        InterlockedExchange(&interlockedInt.counter, 12) == 9
+            && interlockedInt.counter == 12 && interlockedInt.guard == 0x12345678, true);
+
+    InterlockedLongGuarded interlockedLong = default;
+    interlockedLong.counter = 5;
+    interlockedLong.guard = 0x23456789;
+    total++; passed += Test("Interlocked long compare exchange",
+        InterlockedCompareExchange(&interlockedLong.counter, 9, 5) == 5
+            && interlockedLong.counter == 9 && interlockedLong.guard == 0x23456789, true);
+
+    InterlockedLONGGuarded interlockedLONG = default;
+    interlockedLONG.counter = 5;
+    interlockedLONG.guard = 0x3456789A;
+    total++; passed += Test("Interlocked LONG compare exchange",
+        InterlockedCompareExchange(&interlockedLONG.counter, 9, 5) == 5
+            && interlockedLONG.counter == 9 && interlockedLONG.guard == 0x3456789A, true);
+
+    InterlockedUnsignedGuarded interlockedUnsigned = default;
+    interlockedUnsigned.counter = 5;
+    interlockedUnsigned.guard = 0x456789AB;
+    total++; passed += Test("Interlocked unsigned compare exchange",
+        InterlockedCompareExchange(&interlockedUnsigned.counter, 9, 5) == 5
+            && interlockedUnsigned.counter == 9 && interlockedUnsigned.guard == 0x456789AB, true);
+
+    total++; passed += Test("InterlockedIncrement", InterlockedIncrement(&interlockedLONG.counter), 10);
+    total++; passed += Test("InterlockedDecrement", InterlockedDecrement(&interlockedLONG.counter), 9);
+    total++; passed += Test("InterlockedExchangeAdd", InterlockedExchangeAdd(&interlockedLONG.counter, 3), 9);
+    total++; passed += Test("Interlocked final value", interlockedLONG.counter, 12);
+
+    InterlockedLongLongGuarded interlocked64 = default;
+    interlocked64.counter = 17;
+    interlocked64.guard = 0x123456789ABCDEF;
+    total++; passed += Test("InterlockedExchangeAdd64", InterlockedExchangeAdd64(&interlocked64.counter, 4), 17);
+    total++; passed += Test("Interlocked 64-bit guard", interlocked64.guard, 0x123456789ABCDEF);
+    InterlockedLONG64Guarded interlockedLONG64 = default;
+    interlockedLONG64.counter = 21;
+    interlockedLONG64.guard = 0x23456789ABCDEF;
+    total++; passed += Test("InterlockedCompareExchange64 LONG64",
+        InterlockedCompareExchange64(&interlockedLONG64.counter, 25, 21) == 21
+            && interlockedLONG64.counter == 25
+            && interlockedLONG64.guard == 0x23456789ABCDEF, true);
 
     total++; passed += Test("application name", Application.name() == "CFlat Windows Test", true);
     // version.product is unset, so version() reports version.file.
@@ -105,7 +165,7 @@ extern int main(int argc, char** argv)
     total++; passed += Test("HKEY_LOCAL_MACHINE folds to pointer", HKEY_LOCAL_MACHINE != nullptr, true);
 
     u32 tick1 = GetTickCount();
-    Sleep(1);
+    Sleep((u32)1);
     u32 tick2 = GetTickCount();
     total++; passed += Test("GetTickCount monotonic", tick2 >= tick1, true);
 

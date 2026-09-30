@@ -2396,6 +2396,7 @@ nlohmann::json LLVMBackend::FieldToJson(const CRecordFieldEntry& f)
 {
         nlohmann::json j = {{"n", f.name}, {"ct", f.ctype}};
         if (f.isBitfield) { j["bf"] = true; j["bw"] = f.bitWidth; }
+        if (f.isPromoted) j["pr"] = true;
         if (f.isZeroSize) j["zs"] = true;
         if (f.isConst) j["c"] = true;
         if (f.isMutable) j["mu"] = true;
@@ -2413,6 +2414,7 @@ LLVMBackend::CRecordFieldEntry LLVMBackend::FieldFromJson(const SjVal& j)
         f.name      = j.value("n",  std::string{});
         f.ctype     = j.value("ct", std::string{});
         f.isBitfield = j.value("bf", false);
+        f.isPromoted = j.value("pr", false);
         f.isZeroSize = j.value("zs", false);
         f.isConst = j.value("c", false);
         f.isMutable = j.value("mu", false);

@@ -750,6 +750,18 @@ namespace
                 LexicalTuRehome rehome(fd, sema->getASTContext().getTranslationUnitDecl());
                 AccessPrivate(ParserLateParseTag{})(parser, late);
             }
+            /*
+             * The late parse leaves its token stream (pointing into `late`) as the current token
+             * lexer; the next Interpreter::Parse would enter its file inside it. Drain to the
+             * input end the way IncrementalParser does after a DelayedTemplateParsing parse.
+             */
+            if (!active)
+            {
+                clang::Token drained;
+                do parser->getPreprocessor().Lex(drained);
+                while (drained.isNot(clang::tok::annot_repl_input_end)
+                       && drained.isNot(clang::tok::eof));
+            }
             sema->PerformPendingInstantiations();
             fd->setLateTemplateParsed(false);
             if (!trap.hasErrorOccurred() && fd->getBody() != nullptr) return true;
@@ -1556,7 +1568,8 @@ bool CxxIncrementalGroup::ParseRequest(const cflat_cinterop::ExtractRequest& req
         }
     }
     // Type requests recover per declaration like a request TU; a wrapper request is all or nothing.
-    const bool recoverDeclarations = !typeKey.empty() && !wrapperBatch;
+    // Macro probes are one independent line each: a body that is no expression drops only itself.
+    const bool recoverDeclarations = (!typeKey.empty() && !wrapperBatch) || !req.cxxMacroProbes.empty();
     std::string chunk = source;
     /*
      * An earlier batch chunk may already define this wrapper (a default-argument wrapper whose
@@ -1760,9 +1773,12 @@ bool CxxIncrementalGroup::ParseRequest(const cflat_cinterop::ExtractRequest& req
         }
         emptyFailedFunctions();
         if (recoveredError.empty()) recoveredError = diagnostics.consumer.incompleteRecordError;
-        if (impl_->verbose)
+        if (impl_->verbose && req.cxxMacroProbes.empty())
             std::cout << std::format("[verbose] incremental request dropped declarations after "
                                      "'{}':\n{}", error, dropped);
+        else if (impl_->verbose)
+            std::cout << std::format("[verbose] macro probe batch dropped {} probe(s) that are no "
+                                     "expression\n", std::count(dropped.begin(), dropped.end(), '\n'));
         chunk = PrepareRetryChunk(kept, attempt + 1);
         // The failed attempt's default-argument wrappers stay emitted in CodeGen's module too;
         // a kept one re-defined under its old name fails CodeGen and crashes GenModule.

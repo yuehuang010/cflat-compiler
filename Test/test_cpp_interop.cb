@@ -227,6 +227,7 @@
 //     list/dictionary values are not destroyed, unique list values are, and Box<T> stores T*.
 
 import cpp "library/cpp_interop_basic.h";
+import cpp "library/cpp_interop_anon.h";
 import cpp "library/cpp_interop_explicit.h";
 import cpp "library/cpp_interop_refgate.h";
 import cpp "library/cpp_interop_basic.cpp";
@@ -329,6 +330,10 @@ cppas.AssignRouteRegister cppAssignRegisterReturn()
     return (cppAssignRegisterGlobal = 7);
 }
 import cpp "library/cpp_interop_fnptr.h";
+import cpp "library/cpp_interop_cglobals.h";
+import cpp "library/c_macro_helpers.h";
+import cpp "cstdint";
+int cppcg_add(int a, int b) { return a + b; }
 
 // A C++ exception unwinding THROUGH CFlat frames (the C++ `guarded` catch sits above them): every
 // destructor each frame owes runs exactly once and the catch still sees the thrown value.
@@ -1291,6 +1296,21 @@ long CtorExprReturn(long* p) { return cppcr.ExprConstRW(*p, p).v; }
 
 extern int main()
 {
+    cppanon.U anonUnion = default;
+    anonUnion.lo = 0x11223344u;
+    if (anonUnion.lo != 0x11223344u) return 3790;
+    anonUnion.u.lo = 0x55667788u;
+    anonUnion.u.hi = 0x99AABBCCu;
+    if (anonUnion.lo != 0x55667788u || anonUnion.hi != 0x99AABBCCu
+        || anonUnion.u.lo != 0x55667788u || anonUnion.u.hi != 0x99AABBCCu
+        || (int)sizeof(cppanon.U) != 8) return 3791;
+    cppanon.Holder anonHolder = default;
+    anonHolder.lo = 0xAABBCCDDu;
+    if (anonHolder.lo != 0xAABBCCDDu || (int)sizeof(cppanon.Holder) != 16) return 3792;
+    cppanon.Wrap anonWrap = default;
+    anonWrap.v.u.hi = 7u;
+    if (anonWrap.v.hi != 7u || anonWrap.v.q != 0x700000000u || (int)sizeof(cppanon.Wrap) != 16) return 3793;
+
     // Explicit C++ full specializations keep distinct identities through member/free returns and
     // by-value arguments, including the first, middle, and last member sets.
     auto resultFirst = cppexp.cppresult.first();
@@ -4762,7 +4782,7 @@ extern int main()
     int routeValueResult = (routeLocal = 18).v_;
     if (routeValueResult != 18 || routeLocal.v_ != 18
         || cppas.AssignRouteTrivial.assigns != 8)                               return 22367;
-    long routeLong = 5;
+    i64 routeLong = 5;
     expect_error("cast the source to 'int' to call it") { routeLocal = routeLong; }
     // A global nontrivial class with both overloads must call operator=(int), with no temp/copy.
     cppas.Tally.reset();
@@ -6120,6 +6140,32 @@ extern int main()
         if (nullptrSink.value != -1) return 3303;
         cppfnptr.Sink memberSink = default;
         if (memberSink.member(0) != 0) return 3302;
+    }
+    // ---- Global C typedefs and macros through `import cpp` ---------------------------------------
+    {
+        cppcg_u32 u = (cppcg_u32)7;
+        cppcg_i64 big = 5000000000;
+        if ((int)u + (int)(big / 1000000000) != 12) return 3720;
+        cppcg_binop op = cppcg_add;
+        if (cppcg_apply(op, 2, 3) != 5) return 3721;
+        // uint32_t is not bound by either header: it resolves by plain name, as clang sees it.
+        uint32_t w = 3;
+        int64_t w64 = -2;
+        if ((int)w + (int)w64 != 1) return 3722;
+        if (CPPCG_FLAG != 64 || CPPCG_LIMIT != 257) return 3723;
+        if (CPPCG_LOWORD(0x12345) != 0x2345) return 3724;
+        if (CPPCG_TWICE(4) != 8) return 3725;
+        if (CB_CAST_LOWORD(0x12345678) != 0x5678) return 3730;
+        if (CB_CAST_FAILED(-1) != true || CB_CAST_FAILED(0) != false) return 3731;
+        if (CB_CAST_SUCCEEDED(0) != true || CB_CAST_SUCCEEDED(-1) != false) return 3732;
+        if ((u32)CB_CAST_HRESULT_FROM_WIN32(5) != 0x80070005) return 3733;
+        if ((i64)CB_CAST_MAKEINTRESOURCEA(65) != 65) return 3734;
+        cppi.IntOp iop = nullptr;
+        if (iop != nullptr) return 3726;
+        iop = cppcg_add;
+        if (cppi.apply_int(iop, 4, 5) != 9) return 3727;
+        cppfnptr.CbAlias cb = fnptr_add_one;
+        if (cppfnptr.callback_call(cb, 1) != 2) return 3728;
     }
     if (cppi.cpp_std() != 202002L) return 3212;
 
@@ -7823,7 +7869,11 @@ extern int main()
         cppsfx.C5 sc5 = cppsfx.C5(1LL);
         if (sc5.k != 1 || cppsfx.C5(1UL).k != 2)          return 31966;
         // The smallest type of the suffix's list that holds the value ([lex.icon]).
-        if (sm1.p(5000000000UL) != 2)                     return 31967;
+        // LP64 only: on LLP64 5000000000UL is unsigned long long, ambiguous for {int, ulong}.
+        if const (!__WINDOWS__)
+        {
+            if (sm1.p(5000000000UL) != 2)                 return 31967;
+        }
         if (sm4.p(3000000000U) != 1)                      return 31968;
         if (sm5.p(3000000000LL) != 1)                     return 31969;
         if (cppsfx.f2(0x7fffffffUL) != 2)                 return 31970;

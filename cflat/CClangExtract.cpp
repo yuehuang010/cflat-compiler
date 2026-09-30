@@ -1848,17 +1848,23 @@ namespace cflat_cinterop
                             RawField fe;
                             fe.name = "__anon" + std::to_string(idx);
                             fe.ctype = (isUnion ? "union " : "struct ") + synTag;
+                            fe.access = MapAccess(f->getAccess());
                             fe.offsetBytes = layout.getFieldOffset(f->getFieldIndex()) / 8;
                             RecordRawFieldLayout(f->getType(), fe);
                             rec.fields.push_back(std::move(fe));
                             const uint64_t anonOffset = layout.getFieldOffset(f->getFieldIndex()) / 8;
                             for (const RawField& child : nested.fields)
                             {
-                                if (child.name.empty() || !child.isZeroSize
+                                if (child.name.empty() || child.name.starts_with("__anon")
+                                    || child.isBitfield) continue;
+                                const bool promoteAll = st.req.cxxMode
+                                    && MapAccess(f->getAccess()) == AccessPublic;
+                                if (!promoteAll && (!child.isZeroSize
                                     || (child.ctype.find("[]") == std::string::npos
-                                        && child.ctype.find("[0]") == std::string::npos))
+                                        && child.ctype.find("[0]") == std::string::npos)))
                                     continue;
                                 RawField promoted = child;
+                                promoted.isPromoted = promoteAll;
                                 promoted.offsetBytes += anonOffset;
                                 rec.fields.push_back(std::move(promoted));
                             }
@@ -1909,7 +1915,7 @@ namespace cflat_cinterop
                     const RecordType* nrt = elemTy->getAs<RecordType>();
                     const RecordDecl* nrd = nrt ? nrt->getDecl()->getDefinition() : nullptr;
                     if (nrd && !nrd->getIdentifier() && !nrd->getTypedefNameForAnonDecl()
-                        && !nrd->isAnonymousStructOrUnion())
+                        && (st.req.cxxMode || !nrd->isAnonymousStructOrUnion()))
                     {
                         const int idx = anonIdx++;
                         const std::string synTag = tag + "__anon" + std::to_string(idx);
@@ -3123,7 +3129,21 @@ namespace cflat_cinterop
                     if (td == nullptr) continue;
                     QualType canon = td->getUnderlyingType().getCanonicalType();
                     auto* cxx = canon->getAsCXXRecordDecl();
-                    if (cxx == nullptr) continue;
+                    if (cxx == nullptr)
+                    {
+                        // A typedef of a builtin or a pointer to one (::uint32_t, ::intptr_t):
+                        // return clang's canonical spelling for the caller to map.
+                        QualType leaf = canon;
+                        while (leaf->isPointerType()) leaf = leaf->getPointeeType().getCanonicalType();
+                        if (!canon->isDependentType() && leaf->isBuiltinType())
+                        {
+                            RawTypedef t;
+                            t.name = marker;
+                            FillTypedefUnderlying(td->getUnderlyingType(), t);
+                            st.out.typedefs.push_back(std::move(t));
+                        }
+                        continue;
+                    }
                     CXXRecordDecl* def = cxx->getDefinition();
                     // A request spelled as a plain ALIAS carries no explicit instantiation and a
                     // typedef never requires completeness, so complete it silently through Sema.
@@ -6309,15 +6329,23 @@ namespace cflat_cinterop
          * The Microsoft ABI's vftables are handed unconditionally below, and each one emits its
          * deleting destructor. Sema resolves that destructor's operator delete only when it
          * finishes the destructor body, which a skipped inline body never did; CodeGen would
-         * dereference the null.
+         * dereference the null. Likewise the destructor's exception spec: Sema resolves an
+         * unevaluated one only on odr-use, and CodeGen's EH-spec query on it is unreachable.
          */
         for (const auto& [name, record] : plan.vtables)
         {
             if (!name.starts_with("vftable:")) continue;
             auto* dtor = record->getDestructor();
-            if (dtor == nullptr || !dtor->isVirtual() || dtor->isDeleted()
-                || dtor->getOperatorDelete() != nullptr)
-                continue;
+            if (dtor == nullptr || !dtor->isVirtual() || dtor->isDeleted()) continue;
+            if (const auto* fpt = dtor->getType()->getAs<clang::FunctionProtoType>();
+                fpt != nullptr && clang::isUnresolvedExceptionSpec(fpt->getExceptionSpecType())
+                && ci.getSema().ResolveExceptionSpec(dtor->getLocation(), fpt) == nullptr)
+            {
+                err = "clang could not resolve the exception specification of the virtual "
+                      "destructor of '" + record->getQualifiedNameAsString() + "'";
+                return false;
+            }
+            if (dtor->getOperatorDelete() != nullptr) continue;
             clang::Sema& sema = ci.getSema();
             clang::Sema::ContextRAII inDtor(sema, dtor);
             if (sema.CheckDestructor(dtor) || dtor->getOperatorDelete() == nullptr)

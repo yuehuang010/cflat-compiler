@@ -37,7 +37,7 @@ expect_error("brace-list element 2 of 'cppcr.brc_keep' narrows to the C++ parame
 
 // A copying (non-backed) list names the element and target too; it read "no overload ... matches".
 expect_error("brace-list element 1 of 'cppcr.brc_vec' narrows to the C++ parameter's 'int'") {
-    long narrow_copy_probe(long a)
+    long narrow_copy_probe(i64 a)
     {
         return cppcr.brc_vec({a, 2});
     }

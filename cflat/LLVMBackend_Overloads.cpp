@@ -397,7 +397,8 @@ std::string LLVMBackend::IntegerArgumentIdentity(const NamedVariable& arg, bool 
 // destination), then conversion (same width different identity, sign change, narrowing).
 static constexpr int kIntegerConversionCost = 1000;   // above every promotion cost (1 + bits)
 
-int LLVMBackend::RankIntegerConversion(const std::string& argIdentity, const std::string& paramIdentity)
+int LLVMBackend::RankIntegerConversion(const std::string& argIdentity, const std::string& paramIdentity,
+                                       bool cxxCandidate)
 {
         if (CanonicalPrimitiveTypeName(argIdentity) == CanonicalPrimitiveTypeName(paramIdentity))
             return 0;
@@ -417,6 +418,10 @@ int LLVMBackend::RankIntegerConversion(const std::string& argIdentity, const std
             return kIntegerConversionCost;
         if (CanonicalPrimitiveTypeName(paramIdentity) == "int")
             return 1;
+        // C++ [conv.prom] promotes only to int: any other widening into a C++ parameter is a
+        // conversion (LLP64 'long' -> 'long long' ties with 'long' -> 'unsigned long', as in clang).
+        if (cxxCandidate)
+            return kIntegerConversionCost;
         return 1 + paramBits;
 }
 
@@ -1666,6 +1671,41 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                 int integerCost = -1;
                 if (result >= 0)
                 {
+                    // LLVM opaque pointers erase primitive pointee types. Preserve that identity
+                    // for overload ranking so an exact T* beats other integer pointers, and a
+                    // same-width mismatch beats a different-width mismatch. Binding remains
+                    // viable: this only moves mismatches out of the perfect tier. C++ candidates
+                    // only; native overloads keep CFlat's own pointer rules (i8* into char*).
+                    const TypeAndValue& pointerParam = *candidateParamItr;
+                    const TypeAndValue& pointerArg = arg.TypeAndValue;
+                    const std::string pointerArgName = !pointerArg.TypeName.empty()
+                        ? pointerArg.TypeName : arg.InferSourceTypeName;
+                    if (candidate.IsCxx && pointerArg.Pointer && !pointerArg.ElemPointer
+                        && pointerArg.PointerDepth <= 1
+                        && pointerParam.Pointer && !pointerParam.ElemPointer
+                        && !pointerParam.IsAlias && !pointerParam.IsRvalueRef
+                        && !pointerParam.IsCxxRefToPointer && pointerParam.PointerDepth <= 1
+                        && !pointerArgName.empty() && !pointerParam.TypeName.empty())
+                    {
+                        TypeAndValue argPointee;
+                        argPointee.TypeName = pointerArgName;
+                        TypeAndValue paramPointee;
+                        paramPointee.TypeName = pointerParam.TypeName;
+                        const int argBits = argPointee.IsInteger();
+                        const int paramBits = paramPointee.IsInteger();
+                        if (argBits > 0 && paramBits > 0)
+                        {
+                            const bool samePointee = CanonicalPrimitiveTypeName(pointerArgName)
+                                == CanonicalPrimitiveTypeName(pointerParam.TypeName);
+                            const bool sameSignedness = (argPointee.IsUnsignedInteger() != -1)
+                                == (paramPointee.IsUnsignedInteger() != -1);
+                            integerCost = samePointee ? 0
+                                : argBits != paramBits ? kIntegerConversionCost
+                                : sameSignedness ? 1 : 2;
+                            if (integerCost != 0 && result == 0)
+                                result = 1;
+                        }
+                    }
                     const std::string argIdentity = IntegerArgumentIdentity(arg, candidate.IsCxx);
                     // A reference parameter has no identity of its own; the arms above supply the
                     // referent's, so `const int&` outranks `const long long&` for an int literal.
@@ -1676,7 +1716,7 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                         : constRefReferentIdentity;
                     if (!argIdentity.empty() && !paramIdentity.empty())
                     {
-                        integerCost = RankIntegerConversion(argIdentity, paramIdentity);
+                        integerCost = RankIntegerConversion(argIdentity, paramIdentity, candidate.IsCxx);
                         result = integerCost == 0 ? 0 : 1;
                     }
                 }
@@ -2271,6 +2311,90 @@ llvm::Value* LLVMBackend::TryEmitAtomicBuiltin(const std::string& name, const st
 {
         using namespace llvm;
         auto& ctx = *context;
+
+        // MSVC's _Interlocked* names are clang builtins with no linkable library symbol.
+        // Lower the Windows API's seq_cst operations directly to the equivalent LLVM atomic.
+        if (name.starts_with("_Interlocked"))
+        {
+            if (args.empty() || args[0] == nullptr) return nullptr;
+            // Exact <op><width> spellings only: _InterlockedCompareExchange128 (a 16-byte CAS with
+            // four operands), _Interlockedbittestandset and friends keep the plain extern path.
+            const std::string_view rest = std::string_view(name).substr(std::string_view("_Interlocked").size());
+            std::string_view opName, suffix;
+            for (std::string_view candidate : {"CompareExchange", "ExchangeAdd", "Exchange", "Increment",
+                                               "Decrement", "And", "Or", "Xor"})
+            {
+                if (rest.starts_with(candidate)) { opName = candidate; suffix = rest.substr(candidate.size()); break; }
+            }
+            const bool pointer = suffix == "Pointer";
+            const bool incDec = opName == "Increment" || opName == "Decrement";
+            const bool exchangeOp = opName == "Exchange" || opName == "CompareExchange";
+            unsigned width = 32;
+            if (suffix == "8" && !incDec) width = 8;
+            else if (suffix == "16") width = 16;
+            else if (suffix == "64") width = 64;
+            else if (opName.empty() || !(suffix.empty() || (pointer && exchangeOp))) return nullptr;
+            if (pointer && args.size() < 2) return nullptr;
+            Type* valueType = pointer ? args[1]->getType() : IntegerType::get(ctx, width);
+            auto integerArg = [&](size_t i) -> Value* {
+                if (i >= args.size()) return nullptr;
+                if (args[i]->getType() == valueType) return args[i];
+                return builder->CreateIntCast(args[i], valueType, true, "interlocked_arg");
+            };
+            const AtomicOrdering order = AtomicOrdering::SequentiallyConsistent;
+            AtomicRMWInst::BinOp op;
+            Value* operand = nullptr;
+            bool returnsNew = false;
+            const bool increment = opName == "Increment";
+            const bool decrement = opName == "Decrement";
+            if (increment || decrement)
+            {
+                op = AtomicRMWInst::Add;
+                operand = ConstantInt::get(valueType, increment ? 1 : -1, true);
+                returnsNew = true;
+            }
+            else if (opName == "ExchangeAdd")
+            {
+                op = AtomicRMWInst::Add;
+                operand = integerArg(1);
+            }
+            else if (opName == "Exchange")
+            {
+                op = AtomicRMWInst::Xchg;
+                operand = pointer ? args[1] : integerArg(1);
+            }
+            else if (opName == "And")
+            {
+                op = AtomicRMWInst::And;
+                operand = integerArg(1);
+            }
+            else if (opName == "Or")
+            {
+                op = AtomicRMWInst::Or;
+                operand = integerArg(1);
+            }
+            else if (opName == "Xor")
+            {
+                op = AtomicRMWInst::Xor;
+                operand = integerArg(1);
+            }
+            else if (opName == "CompareExchange")
+            {
+                if (args.size() < 3) return nullptr;
+                Value* exchange = pointer ? args[1] : integerArg(1);
+                Value* comparand = pointer ? args[2] : integerArg(2);
+                auto* pair = builder->CreateAtomicCmpXchg(args[0], comparand, exchange,
+                    MaybeAlign(), order, order, SyncScope::System);
+                return builder->CreateExtractValue(pair, 0, "interlocked_old");
+            }
+            else return nullptr;
+
+            if (operand == nullptr) return nullptr;
+            Value* old = builder->CreateAtomicRMW(op, args[0], operand, MaybeAlign(), order,
+                                                   SyncScope::System);
+            return returnsNew
+                ? builder->CreateAdd(old, operand, "interlocked_new") : old;
+        }
 
         // arg[0] is always the pointer to the _value field (i64* or i32*)
         if (name == "__atomic_counter_increment" || name == "__atomic_counter_decrement" ||
@@ -4606,7 +4730,8 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
         }
 
         // Intercept __atomic_* stubs: emit LLVM atomic IR directly.
-        if (candidate.Function->getName().starts_with("__atomic_"))
+        if (candidate.Function->getName().starts_with("__atomic_")
+            || candidate.Function->getName().starts_with("_Interlocked"))
         {
             auto* atomicResult = TryEmitAtomicBuiltin(candidate.Function->getName().str(), argList);
             if (atomicResult != nullptr)
@@ -5614,10 +5739,13 @@ LLVMBackend::NamedVariable LLVMBackend::GetMemberVariable(const std::string& nam
         auto* fieldLLVMType = GetType(structField);
         if (sd.IsUnion)
         {
-            // Union: all fields alias at offset 0; load with explicit field type.
-            namedVar.Storage = memberStructInstance;
+            // Promoted fields from an anonymous struct can sit beyond offset zero.
+            namedVar.Storage = sd.CxxOffsetLayout && (unsigned)count < sd.CxxFieldOffsets.size()
+                && sd.CxxFieldOffsets[count] != 0
+                ? CreateCxxFieldGEP(sd, memberStructInstance, (unsigned)count)
+                : memberStructInstance;
             namedVar.UnionFieldType = fieldLLVMType;
-            namedVar.Primary = CreateLoad(fieldLLVMType, memberStructInstance);
+            namedVar.Primary = CreateLoad(fieldLLVMType, namedVar.Storage);
         }
         else
         {

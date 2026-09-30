@@ -130,6 +130,17 @@ int cbf_flex_zero_ptr_read(struct CBF_ZeroPointer* v, int i);
 #define CB_IS_DIGIT(c)   ((c) >= '0' && (c) <= '9')
 #define CB_CALL_ADD(a,b) (c_add(a, b))
 
+/* Cast-heavy Windows macro shapes. Typedef spellings must resolve through the importing header. */
+typedef unsigned short CB_WORD;
+typedef unsigned long CB_DWORD_PTR;
+typedef int CB_HRESULT;
+typedef char* CB_LPSTR;
+#define CB_CAST_LOWORD(x) ((CB_WORD)(((CB_DWORD_PTR)(x)) & 0xffff))
+#define CB_CAST_FAILED(hr) (((CB_HRESULT)(hr)) < 0)
+#define CB_CAST_SUCCEEDED(hr) (((CB_HRESULT)(hr)) >= 0)
+#define CB_CAST_HRESULT_FROM_WIN32(x) ((CB_HRESULT)(x) <= 0 ? ((CB_HRESULT)(x)) : ((CB_HRESULT)(((x) & 0x0000FFFF) | (7 << 16) | 0x80000000)))
+#define CB_CAST_MAKEINTRESOURCEA(i) ((CB_LPSTR)((CB_DWORD_PTR)((CB_WORD)(i))))
+
 /* Pointer-sentinel macro. Pass B's __typeof__ probe recovers the type as
    CB_HANDLE -> void*, so the macro registers as a void* global rather than
    an i64 integer constant. The cflat side compares it directly against a

@@ -3581,6 +3581,10 @@ private:
     // A C++ alias of a specialization CFlat cannot spell itself (`using json = basic_json<>;`):
     // alias name -> the C++ spelling, requested under the alias's own name on first use.
     std::unordered_map<std::string, std::string> cxxLazyAliasSpecializations_;
+    // A global-scope C++-import typedef of a non-record type (DWORD, a function pointer): name ->
+    // clang's canonical spelling, mapped and bound as an alias on first lookup of the name.
+    std::unordered_map<std::string, std::string> cxxLazyGlobalTypedefs_;
+    bool MaterializeCxxGlobalTypedef(const std::string& name);
     /*
      * While non-null, a C++ external declaration whose lowering does not match clang's own
      * arrangement is DROPPED and the reason written here instead of raising a compile error. The
@@ -3854,6 +3858,7 @@ private:
         // CFlat replicates MSVC ABI layout itself; bitOffset is NOT taken from clang's
         // reported offset - RegisterCRecords computes it from MSVC ABI rules.
         bool isBitfield = false;
+        bool isPromoted = false;
         bool isZeroSize = false;
         bool isConst = false;
         bool isMutable = false;
@@ -6381,7 +6386,7 @@ private:
                                const std::vector<CFunctionMacroEntry>& funcMacros,
                                const std::string& fileForLsp);
 
-    bool TranslateMacroBody(const CFunctionMacroEntry& m, std::string& out) const;
+    bool TranslateMacroBody(const CFunctionMacroEntry& m, std::string& out);
 
     void RegisterCFunctionMacros(const std::vector<CFunctionMacroEntry>& funcMacros,
                                  const std::string& fileForLsp,
@@ -8128,6 +8133,7 @@ public:
     llvm::Constant* CreateConstant(std::string typeName, std::string initialValue);
 
     llvm::Value* CreateGlobalString(std::string name, std::string text);
+    llvm::Value* CreateGlobalEncodedString(std::string name, const std::vector<uint32_t>& values, unsigned width);
 
     // Element-wise arithmetic and comparison on simd<T,N> values. Either operand may be a scalar,
     // which is splatted across all lanes (with element-type conversion). Both vector operands must
@@ -9082,6 +9088,17 @@ public:
     void RegisterCxxRecordShell(const CRecordEntry& record, const std::string& fileForLsp);
     void RememberCxxRecordSpellings(const CRecordEntry& record);
     void ProjectCxxByValueFieldRecord(const std::string& ctype);
+    // Synthetic anonymous-member C records of the eager RegisterCRecords batch in flight. A C++
+    // record projected mid-batch registers the ones its fields name first, or they lay out opaque.
+    struct SyntheticCRecordBatch
+    {
+        const std::vector<CRecordEntry>* records = nullptr;
+        std::vector<bool> registered;
+        std::unordered_map<std::string, size_t> index;   // ValueFieldRecordKey spelling -> record
+        std::string file;
+    };
+    SyntheticCRecordBatch* syntheticCRecordBatch_ = nullptr;
+    void RegisterPendingSyntheticCRecord(const std::string& ctype);
     // C++ records laid out with an opaque-bytes field, keyed by LLVM type (BindLazyCxxStdField).
     std::unordered_map<llvm::StructType*, std::string> cxxOpaqueFieldOwners_;
     // Register the callable surface of one imported C++ class: instance methods, static methods,
@@ -9666,7 +9683,8 @@ public:
     std::string IntegerParameterIdentity(const TypeAndValue& param) const;
     std::string CxxIntegerParameterIdentity(const FunctionSymbol& candidate, size_t index,
                                              const TypeAndValue& param) const;
-    static int RankIntegerConversion(const std::string& argIdentity, const std::string& paramIdentity);
+    static int RankIntegerConversion(const std::string& argIdentity, const std::string& paramIdentity,
+                                     bool cxxCandidate = false);
 
     // How a call site's arguments bind to declared parameter slots (see ComputeArgumentPositions).
     struct ArgumentBinding
@@ -10875,7 +10893,10 @@ public:
     // 138: managed body verdicts also persist against the complete import cohort.
     // 140: body verdicts persist as one file per group / cohort and generated-record source.
     // 141: incremental header harvest defers import-time body diagnostics to demand checks.
-    static constexpr int kCHeaderCacheVersion = 141;
+    // 142: C++ anonymous record members retain transparent promoted field aliases.
+    // 143: promoted aliases exclude bitfields, whose packed storage stays in their synthetic record.
+    // 144: named C++ members of anonymous struct/union types get synthetic nested records.
+    static constexpr int kCHeaderCacheVersion = 145;
     static std::string CompilerBuildStamp();
     // THE switch for "the compiler build is part of cache entry validity": header/request
     // entries record and check "cstamp", and demand companion keys fold the stamp. OFF by

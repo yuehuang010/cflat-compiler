@@ -1,0 +1,44 @@
+// windows.h through import cpp: functions, SDK typedefs and structs (anonymous members
+// included), object-like and function-like macros, Interlocked intrinsics, wide literals.
+import cpp "windows.h" lib { "user32.lib" };
+
+extern int main()
+{
+    if (GetCurrentProcessId() == 0) return 1;
+    if (lstrlenW(L"abcd") != 4) return 2;
+    wchar_t* wide = L"xyz";
+    if (sizeof(wide[0]) != 2 || wide[2] != (wchar_t)'z') return 3;
+
+    LARGE_INTEGER freq = default;
+    LARGE_INTEGER t0 = default;
+    if (QueryPerformanceFrequency(&freq) == 0 || freq.QuadPart <= 0) return 4;
+    if (QueryPerformanceCounter(&t0) == 0) return 5;
+    ULARGE_INTEGER ul = default;
+    ul.u.LowPart = 1;
+    ul.HighPart = 2;
+    if (ul.QuadPart != 0x200000001) return 13;
+
+    SYSTEMTIME now = default;
+    GetLocalTime(&now);
+    if (now.wYear < 2000 || now.wMonth < 1 || now.wMonth > 12) return 6;
+
+    // Object-like macros, including a handle constant typed as a pointer like the C import.
+    if (MAX_PATH != 260 || WM_QUIT != 0x0012 || MEM_COMMIT != 0x1000) return 8;
+    if (HKEY_LOCAL_MACHINE == nullptr) return 9;
+    DWORD pid = GetCurrentProcessId();
+    if (pid != GetCurrentProcessId()) return 10;
+
+    // Function-like macros whose bodies cast through SDK typedefs.
+    if (LOWORD(0x12345678) != 0x5678 || HIWORD(0x12345678) != 0x1234) return 14;
+    if (FAILED(S_OK) || !SUCCEEDED(S_OK) || !FAILED(E_FAIL)) return 15;
+    if (MAKEINTRESOURCEA(5) == nullptr) return 16;
+
+    LONG counter = 5;
+    if (InterlockedIncrement(&counter) != 6 || InterlockedCompareExchange(&counter, 9, 6) != 6) return 11;
+    if (InterlockedExchangeAdd(&counter, 3) != 9 || counter != 12) return 12;
+
+    char[64] buf;
+    int n = wsprintfA(&buf[0], "%d-%s", 42, "ok");
+    if (n != 5 || lstrcmpA(&buf[0], "42-ok") != 0) return 7;
+    return 0;
+}

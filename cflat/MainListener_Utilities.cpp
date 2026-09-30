@@ -298,6 +298,20 @@ LLVMBackend::ConstantVariant MainListener::ParseNumberConstant(std::string rawNu
         // If a long/long long suffix is present, prefer 64-bit result.
         if (lCount >= 1)
         {
+            // LLP64: a literal whose [lex.icon] type is 'long'/'ulong' lowers at that 32-bit width,
+            // so its value type agrees with the identity overload ranking reads.
+            if (LLVMBackend::longBits_ == 32)
+            {
+                const std::string identity = LLVMBackend::LiteralIdentityForOverload(rawNumber);
+                if (identity == "long" || identity == "ulong")
+                {
+                    if (negative)
+                        return static_cast<int>(-static_cast<long long>(uval));
+                    if (identity == "ulong")
+                        return static_cast<unsigned int>(static_cast<uint32_t>(uval));
+                    return static_cast<int>(uval);
+                }
+            }
             if (negative)
             {
                 long long sval = -static_cast<long long>(uval);

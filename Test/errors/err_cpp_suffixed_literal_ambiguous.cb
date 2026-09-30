@@ -6,11 +6,22 @@ extern int main()
 {
     cppsfx.M1 m1 = cppsfx.M1();
     cppsfx.M6 m6 = cppsfx.M6();
-    expect_error("no candidate ranks better than the others") {
-        return m1.p(1LL);
-    }
-    expect_error("no candidate ranks better than the others") {
-        return cppsfx.f6(1LL);
+    if const (__WINDOWS__) {
+        // LLP64: both overloads are 32-bit, so each narrows the 'long long' and CFlat refuses them
+        // before ranking (clang-cl calls them ambiguous).
+        expect_error("no overload of 'p' matches the given arguments") {
+            return m1.p(1LL);
+        }
+        expect_error("no overload of 'cppsfx.f6' matches the given arguments") {
+            return cppsfx.f6(1LL);
+        }
+    } else {
+        expect_error("no candidate ranks better than the others") {
+            return m1.p(1LL);
+        }
+        expect_error("no candidate ranks better than the others") {
+            return cppsfx.f6(1LL);
+        }
     }
     expect_error("call to constructor of 'cppsfx::C5' is ambiguous") {
         cppsfx.C5 c = cppsfx.C5(1L);

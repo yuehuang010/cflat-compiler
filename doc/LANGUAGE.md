@@ -199,6 +199,15 @@ returns `128` for `x == 128`).
 
 `string` is a built-in value type with layout `{ i8* _ptr, i32 _len }`. String literals are automatically wrapped into a `string` when assigned to a `string` variable or passed to a `string` parameter.
 
+String literal encoding prefixes follow C conventions: `u8"..."` is a narrow UTF-8 byte
+string, `u"..."` is a NUL-terminated `c16` UTF-16 sequence, and `U"..."` is a
+NUL-terminated `c32` UTF-32 sequence. `L"..."` is a NUL-terminated `wchar` sequence;
+`wchar` is 16-bit on Windows and 32-bit elsewhere. Non-BMP characters use UTF-16 surrogate
+pairs in 16-bit sequences. Prefixed literals decay to pointers to their element type, so they
+can be passed to matching C and C++ character-pointer parameters. Adjacent literals are not
+concatenated, prefixed or not; join them with `+`. Interpolation is supported only in unprefixed
+and `u8` string literals.
+
 ```c
 string s = "hello";
 s.length();   // 5

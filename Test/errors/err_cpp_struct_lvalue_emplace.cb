@@ -27,18 +27,10 @@ extern int main()
     }
     }
     // A mid-vector emplace copy-assigns; clang's own text names the deleted operator=.
-    if const (__WINDOWS__) {
-        expect_error("no instantiation of C++ function template 'std.vector$EmplaceCheck.emplace' accepts these argument types (std.vector$EmplaceCheck, std._Vector_iterator$std._Vector_val$std._Simple_types$__cflat_user.EmplaceCheck, EmplaceCheck) (clang: no matching function for call to '_Move_backward_unchecked')") {
-            std.vector<EmplaceCheck> values = default;
-            EmplaceCheck local = EmplaceCheck(5);
-            values.emplace(values.begin(), local);
-        }
-    } else {
     expect_error("(clang: overload resolution selected deleted operator '=')") {
         std.vector<EmplaceCheck> values = default;
         EmplaceCheck local = EmplaceCheck(5);
         values.emplace(values.begin(), local);
-    }
     }
     if const (__WINDOWS__) {
         expect_error("cannot copy C++ class 'EmplaceCheck' into parameter '_Val' of 'emplace_front': its copy constructor is deleted") {

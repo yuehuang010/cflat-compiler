@@ -2028,6 +2028,24 @@ llvm::Value* LLVMBackend::CreateGlobalString(std::string name, std::string text)
         return gv;
     }
 
+llvm::Value* LLVMBackend::CreateGlobalEncodedString(std::string name,
+                                                    const std::vector<uint32_t>& values,
+                                                    unsigned width)
+{
+        auto* elementType = llvm::IntegerType::get(*context, width);
+        std::vector<llvm::Constant*> elements;
+        elements.reserve(values.size());
+        for (uint32_t value : values)
+            elements.push_back(llvm::ConstantInt::get(elementType, value));
+        auto* arrayType = llvm::ArrayType::get(elementType, elements.size());
+        auto* initializer = llvm::ConstantArray::get(arrayType, elements);
+        auto* global = new llvm::GlobalVariable(*module, arrayType, true,
+            llvm::GlobalValue::PrivateLinkage, initializer, name);
+        global->setUnnamedAddr(llvm::GlobalValue::UnnamedAddr::Global);
+        return builder->CreateInBoundsGEP(arrayType, global,
+            { builder->getInt32(0), builder->getInt32(0) });
+    }
+
 llvm::Value* LLVMBackend::CreateVectorOperation(Operation op, llvm::Value* left, llvm::Value* right,
                                        bool leftIsUnsigned, bool rightIsUnsigned)
 {

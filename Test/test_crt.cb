@@ -59,11 +59,13 @@ extern int main()
     i16 kwP = default; kwP.x = 3; kwP.y = 4;
     u16 kwC = KW_RED;
     i32 kwZ = 9;
-    long kwL = KW_BC;
+    // The MSVC ABI keeps every C enum 'int', so KW_BC wraps there, as clang-cl reports it.
+    i64 kwL = KW_BC;
+    i64 kwBcWant = sizeof(KW_BC) == 8 ? 5000000000 : 705032704;
     total++; passed += Test("C typedef u8 / i16 struct", (int)kwA == 255 && kwP.x + kwP.y == 7, true);
     total++; passed += Test("C typedef u16 enum / i32", (int)kwC == 200 && kwZ == 9, true);
     total++; passed += Test("C enums beside keyword typedefs",
-        kwL == 5000000000 && (int)KW_BB == -3 && (int)KW_SB == 250 && KW_ANON2 == 12, true);
+        kwL == kwBcWant &&(int)KW_BB == -3 && (int)KW_SB == 250 && KW_ANON2 == 12, true);
 
     printf("\n%d / %d tests passed.\n", passed, total);
     return passed == total ? 0 : 1;

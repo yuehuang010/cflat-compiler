@@ -1,0 +1,6 @@
+extern int main()
+{
+    expect_error("string interpolation is not supported in a prefixed string literal");
+    wchar* s = L"value {1 + 2}";
+    return 0;
+}

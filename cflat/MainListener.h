@@ -7011,7 +7011,7 @@ public:
     // Advances itr past the consumed character(s) and returns the decoded char.
     char ProcessEscapeChar(std::string::const_iterator& itr, const std::string::const_iterator& end);
 
-    char ParseCharLiteral(const std::string& text);
+    uint32_t ParseCharLiteral(const std::string& text);
 
     // foldBraces: when true, {{ -> { and }} -> } (source-level escape for non-interpolated strings).
     // Pass false when decoding accumulated literal content inside ParseFormatString, because

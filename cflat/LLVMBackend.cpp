@@ -3674,8 +3674,11 @@ void LLVMBackend::ProcessPendingMacroSources()
     std::vector<PendingMacroSource> drain;
     drain.swap(pendingMacroSources_);
 
-    for (auto& p : drain)
+    // Index loop: a buffer with syntax errors is split in half and both halves re-queued
+    // (one generated declaration per line), so a malformed one cannot swallow its neighbours.
+    for (size_t di = 0; di < drain.size(); ++di)
     {
+        PendingMacroSource p = std::move(drain[di]);
         SyntheticParseState state;
         state.label  = p.label;
         state.input  = std::make_unique<antlr4::ANTLRInputStream>(p.source);
@@ -3701,6 +3704,20 @@ void LLVMBackend::ProcessPendingMacroSources()
             continue;
         }
         if (!cu) continue;
+        if (state.parser->getNumberOfSyntaxErrors() > 0)
+        {
+            const size_t lines = static_cast<size_t>(std::count(p.source.begin(), p.source.end(), '\n'));
+            if (lines <= 1)
+            {
+                if (verbose) std::cout << std::format("[verbose]   dropping malformed generated macro from {}: {}", state.label, p.source);
+                continue;
+            }
+            size_t cut = 0;
+            for (size_t seen = 0; seen < lines / 2; ++seen) cut = p.source.find('\n', cut) + 1;
+            drain.push_back({ p.label, p.source.substr(0, cut) });
+            drain.push_back({ p.label, p.source.substr(cut) });
+            continue;
+        }
         auto* tu = cu->translationUnit();
         if (!tu) { syntheticParseStates_.push_back(std::move(state)); continue; }
 
@@ -4678,6 +4695,7 @@ void LLVMBackend::ResetForReanalysis()
     cflatGlobalCxxInitFns_.clear();
     cxxCflatToCxxSpelling_.clear();
     cxxLazyAliasSpecializations_.clear();
+    cxxLazyGlobalTypedefs_.clear();
     cxxForeignRequests_.clear();
     generatedCxxRecords_.clear();
     cppStructNames_.clear();

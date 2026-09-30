@@ -321,8 +321,9 @@ if(MSVC)
     ${ANTLR_GEN_DIR}/CFlatParser.cpp
     PROPERTIES COMPILE_OPTIONS "/bigobj")
   # /permissive- matched ConformanceMode=true; /wd4251 quiets antlr's dll-iface
-  # warnings on the generated sources.
-  target_compile_options(cflat PRIVATE /permissive- /MP)
+  # warnings on the generated sources. /Zc:preprocessor matches LLVM's own build: the
+  # OptTable macros in clang/Options/Options.inc need conforming __VA_ARGS__ expansion.
+  target_compile_options(cflat PRIVATE /permissive- /MP /Zc:preprocessor)
   set_source_files_properties(${ANTLR_GEN_SOURCES}
     PROPERTIES COMPILE_OPTIONS "/wd4251")
 endif()

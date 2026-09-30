@@ -1922,6 +1922,33 @@ bool testStringLiteral()
     string t3 = base.length() == 0 ? base : "fallback";  // reversed: string then char*
     result &= Test("ternary_str_reversed",     t3.data(), "fallback");
 
+    // Encoding prefixes retain their element type and terminate the encoded array.
+    wchar* wide = L"abcd";
+    int wideLength = 0;
+    while (wide[wideLength] != 0) wideLength++;
+    result &= Test("wide_literal_size", sizeof(wchar), sizeof(wide[0]));
+    result &= Test("wide_literal_element", wide[1], (wchar)'b');
+    result &= Test("wide_literal_length", wideLength, 4);
+    if const (__WINDOWS__)
+        result &= Test("wide_literal_width", sizeof(wchar), 2);
+    else
+        result &= Test("wide_literal_width", sizeof(wchar), 4);
+    c16* utf16 = u"A\u263a";
+    c32* utf32 = U"A\U0001f600";
+    c16* utf16Pair = u"\U0001f600";
+    string narrowUcn = "\u263a";
+    char* utf8Ucn = u8"\u263a";
+    result &= Test("utf16_literal_smile", utf16[1], (c16)0x263a);
+    result &= Test("utf32_literal_non_bmp", utf32[1], (c32)0x1f600);
+    result &= Test("utf16_literal_surrogate_high", utf16Pair[0], (c16)0xd83d);
+    result &= Test("utf16_literal_surrogate_low", utf16Pair[1], (c16)0xde00);
+    result &= Test("narrow_ucn_utf8_length", narrowUcn.length(), 3);
+    result &= (u8)narrowUcn.data()[0] == (u8)0xe2;
+    result &= (u8)utf8Ucn[0] == (u8)0xe2;
+    result &= Test("wide_character_literal", (wchar)L'b', (wchar)'b');
+    result &= Test("utf16_character_literal", (c16)u'\u263a', (c16)0x263a);
+    result &= Test("utf32_character_literal", (c32)U'\U0001f600', (c32)0x1f600);
+
     return result;
 }
 
@@ -2939,7 +2966,11 @@ bool testOverloadResolution()
     int oiBigWant = sizeof(long) == 8 ? 2 : 3;
     result &= Test("oi_big_literal_a", oiPickA(5000000000), oiBigWant);
     result &= Test("oi_suffix_ul_native", oiSufA(1UL), 2);
-    result &= Test("oi_suffix_ll_native", oiSufB(1LL), 1);
+    if const (!__WINDOWS__)
+    {
+        // LP64 only: on LLP64 'i64' is wider than both 'long' and 'ulong', so neither matches.
+        result &= Test("oi_suffix_ll_native", oiSufB(1LL), 1);
+    }
     result &= Test("oi_big_literal_b", oiPickB(5000000000), oiBigWant);
     if const (__WINDOWS__)
     {

@@ -446,6 +446,13 @@ extern int main()
     if (CB_CALL_ADD(40, 2) != 42)        return 214;
     if (CB_CALL_ADD(100, -1) != 99)      return 215;
 
+    // Cast-heavy Windows macro shapes resolve typedef and pointer casts from the header.
+    if (CB_CAST_LOWORD(0x12345678) != 0x5678) return 216;
+    if (CB_CAST_FAILED(-1) != true || CB_CAST_FAILED(0) != false) return 217;
+    if (CB_CAST_SUCCEEDED(0) != true || CB_CAST_SUCCEEDED(-1) != false) return 218;
+    if ((u32)CB_CAST_HRESULT_FROM_WIN32(5) != 0x80070005) return 219;
+    if ((i64)CB_CAST_MAKEINTRESOURCEA(65) != 65) return 220;
+
     // ---- Section K: typedef chain resolution --------------------------------
     // c_get_handle returns C_HANDLE (typedef void* C_HANDLE). Before this fix
     // the function was skipped with "unsupported return type 'C_HANDLE'".

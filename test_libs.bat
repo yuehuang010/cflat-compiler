@@ -90,6 +90,8 @@ if /I "!CFG_root_win!"=="testlibs" (
 ) else if /I "!CFG_root_win!"=="deps" (
     if defined CFLAT_VCPKG_INSTALLED (set "ROOT=%CFLAT_VCPKG_INSTALLED%") else set "ROOT=%USERPROFILE%\.cflat-compiler-deps\vcpkg_installed"
     set "ROOT=!ROOT!\x64-windows-static"
+) else if /I "!CFG_root_win!"=="sdk" (
+    call :sdk_root
 ) else if /I "!CFG_root_win:~0,4!"=="env:" (
     set "ENV_NAME=!CFG_root_win:~4!"
     call set "ROOT=%%!ENV_NAME!%%"
@@ -128,6 +130,16 @@ if exist "%LIBDIR%\vcpkg.json" (
 )
 call :vcpkg_preflight
 set "ROOT=%REPO%test_libs\vcpkg_installed\%VCPKG_TRIPLET%"
+exit /b 0
+
+:sdk_root
+REM Newest Windows 10/11 SDK include dir (Include\<version>), from the installed-roots registry key.
+REM The 32-bit view names the full SDK; the 64-bit view can point at a kit without headers.
+for %%R in (32 64) do if not defined ROOT (
+    set "KITS="
+    for /f "tokens=2,*" %%A in ('reg query "HKLM\SOFTWARE\Microsoft\Windows Kits\Installed Roots" /v KitsRoot10 /reg:%%R 2^>nul ^| findstr /i KitsRoot10') do set "KITS=%%B"
+    if defined KITS for /d %%V in ("!KITS!Include\10.*") do if exist "%%~fV\um\windows.h" set "ROOT=%%~fV"
+)
 exit /b 0
 
 :vcpkg_preflight
@@ -195,7 +207,8 @@ if "!MODE!"=="check" (
 ) else (
     "%COMPILER%" "%CASE_FILE%" !FLAGS! -o "!CASE!.exe" >"compile.log" 2>&1
 )
-if errorlevel 1 (
+REM A crash exits with a negative NTSTATUS, which 'if errorlevel 1' reads as success.
+if !errorlevel! neq 0 (
     if defined DISABLED_PATHS (
         echo XFAIL !CASE!
         set /a XFAIL+=1

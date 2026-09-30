@@ -25,18 +25,10 @@ extern int main()
     }
     }
     // assign copy-ASSIGNS the element; clang names operator=, not the copy constructor.
-    if const (__WINDOWS__) {
-        expect_error("member 'assign' of C++ class 'std.vector<SinkCheck>' cannot be instantiated for these template arguments (clang reported an error inside the body it generated) (clang: no matching function for call to 'fill')") {
-            std.vector<SinkCheck> values = default;
-            SinkCheck local = SinkCheck(5);
-            values.assign(3, local);
-        }
-    } else {
     expect_error("clang: overload resolution selected deleted operator '='") {
         std.vector<SinkCheck> values = default;
         SinkCheck local = SinkCheck(5);
         values.assign(3, local);
-    }
     }
     if const (__WINDOWS__) {
         expect_error("cannot copy C++ class 'SinkCheck' into parameter '_Val' of 'resize': its copy constructor is deleted") {
