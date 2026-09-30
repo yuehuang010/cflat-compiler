@@ -1,6 +1,7 @@
 // C++20 equivalent of simdjson_01_dom.cb (compile-time parity baseline)
 #include <cstdint>
 #include <cstdio>
+#include <string>
 #include <simdjson.h>
 
 int main()

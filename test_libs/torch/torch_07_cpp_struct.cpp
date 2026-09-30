@@ -1,6 +1,7 @@
 // C++20 equivalent of torch_07_cpp_struct.cb (clang++ parity baseline)
 #include <cstdint>
 #include <cstdio>
+#include <string>
 #include <memory>
 #include <vector>
 #include <torch/torch.h>

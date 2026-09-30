@@ -39,6 +39,17 @@ so they are now `-DLLVM_ENABLE_RTTI=ON`, `-DLLVM_TARGETS_TO_BUILD="X86;AArch64"`
 `-DLLVM_ENABLE_PROJECTS="clang;lld"` on the source build. See
 [llvm-from-source-build.md](llvm-from-source-build.md).
 
+## Release links a PGO-built LLVM (2026-09-29)
+
+The `macos-arm64-release` preset points at `~/.cflat-compiler-deps/llvm-23.1.0-pgo`, the same
+23.1.0 source and flags as the plain install plus a clang profile trained on cflat's own C++ import
+invocations (torch, simdjson, fmt, json, Eigen, std and Test/library headers). Every clang stage
+inside a C++ import (group parse, harvest Sema, request chunks) runs ~20-25% faster; torch cold
+compile ~1.0 s shorter. Debug stays on the plain `-assert` tree. Build it once with
+`utilities/llvm_pgo_macos.sh` (instrumented clang -> training -> `xcrun llvm-profdata merge` ->
+final Release build + install, ~10 min on an M-series machine); it needs the LLVM source at
+`~/llvm-src/llvm-project-23.1.0.src` and the Homebrew packages named at the top of the script.
+
 ## One-time Mac toolchain
 
 `brew install cmake ninja openjdk antlr pkg-config coreutils` (openjdk keg-only at

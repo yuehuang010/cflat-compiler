@@ -656,6 +656,9 @@
       "double",
       "'operator bool' and 'operator int'"
     ],
+    "couldnotcompletethes...uestreturnednorecord0006623b57858e8d": [
+      "cppi_expr.VecBase$cppi_expr.Vec3"
+    ],
     "cppstructarg0hasanun...fieldarg1useapointer9576d7fd975b25ee": [
       "Bad",
       "value"
@@ -1997,6 +2000,7 @@
     "conflictingdeclarati...penfreadfwritefclosec74614431b9da0db": "conflicting declaration of extern '{0}': the linkage name is already declared as '{1}', but this declaration is '{2}'. Rename your extern, or call the existing one - for file I/O use os.windows.fopen/fread/fwrite/fclose.",
     "conversionfromarg0to...loneofthemexplicitlyab9b302918f3f24b": "conversion from '{0}' to '{1}' is ambiguous: '{2}' and '{3}' bind the argument equally well. Call one of them explicitly.",
     "conversionfromarg0to...versionsowntypefirst7a5cfbd608174216": "conversion from '{0}' to '{1}' is ambiguous: {2} each reach it through one standard conversion. Cast to the conversion's own type first.",
+    "couldnotcompletethes...uestreturnednorecord0006623b57858e8d": "could not complete the special members of C++ record '{0}' for its first use: the completion request returned no record",
     "cppstructarg0hasanun...fieldarg1useapointer9576d7fd975b25ee": "[cpp] struct '{0}' has an unsized field '{1}'; use a pointer",
     "cppstructcannotbeaunion": "[cpp] struct cannot be a union",
     "cppstructconstructor...erarg0hasnocspelling21dc1cbbde141cfe": "[cpp] struct constructor parameter '{0}' has no C++ spelling",

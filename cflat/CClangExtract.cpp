@@ -765,6 +765,25 @@ namespace cflat_cinterop
             std::unordered_set<const RecordDecl*> emittedDefinedRecords;
             std::unordered_set<std::string> emittedRequestedRecords;
             std::vector<std::string> normDirs; // req.inScopeDirs normalized once (NormPath + trailing-/ stripped)
+            // PathInScope is a pure function of the path (normDirs is fixed once the state is built),
+            // and a header walk asks about the same few files once per declaration.
+            struct PathHash
+            {
+                using is_transparent = void;
+                size_t operator()(std::string_view v) const { return std::hash<std::string_view>{}(v); }
+            };
+            std::unordered_map<std::string, bool, PathHash, std::equal_to<>> scopeMemo;
+            bool InScope(std::string_view path)
+            {
+                if (normDirs.empty()) return true;
+                auto it = scopeMemo.find(path);
+                if (it != scopeMemo.end()) return it->second;
+                const std::string owned(path);
+                const bool in = PathInScope(owned, normDirs);
+                scopeMemo.emplace(owned, in);
+                return in;
+            }
+            bool InScope(const char* path) { return InScope(std::string_view(path != nullptr ? path : "")); }
             const NamedDecl* scopeSentinel = nullptr;
             // Set in BeginSourceFileAction so the ABI pass can build a CodeGenerator against the
             // very invocation that produced the AST (same triple, same target features).
@@ -780,6 +799,8 @@ namespace cflat_cinterop
             // cxxMode only: (index into out.records, index into that record's members, decl).
             struct MemberAbiWork { size_t recordIdx; size_t memberIdx; const CXXMethodDecl* md; };
             std::vector<MemberAbiWork> memberAbiWork;
+            // R1 completion: methods already defined before it ran (their facts stay the harvest's).
+            std::unordered_set<const FunctionDecl*> completionPredefined;
             // Plain C++ header records whose implicit special members must be materialized before
             // CollectCxxMembers walks the record's methods.
             std::vector<const CXXRecordDecl*> headerSpecialMemberWork;
@@ -856,9 +877,7 @@ namespace cflat_cinterop
         void QueueIncompleteCxxType(ExtractState& st, ASTContext& ctx, QualType qt)
         {
             if (!st.req.cxxMode) return;
-            // Stage 2 already emits the requested ODR-uses; replaying explicit instantiation for
-            // private libc++ helper records can make assertion-enabled Clang see a placeholder.
-            if (st.req.emitDefinitions && !st.req.cxxTypeRequests.empty()) return;
+            // Complete by-value signature types without instantiating their member bodies.
             qt = qt.getCanonicalType();
             if (!qt->isRecordType() || !qt->isIncompleteType()) return;
             const auto* cxx = qt->getAsCXXRecordDecl();
@@ -928,7 +947,7 @@ namespace cflat_cinterop
                 std::string file = (pl.isValid() && pl.getFilename()) ? pl.getFilename() : "";
                 int line = pl.isValid() ? (int)pl.getLine() : 1;
                 int col = pl.isValid() ? (int)pl.getColumn() : 0;
-                if (st.req.requireInScope && !PathInScope(file, st.normDirs)) return;
+                if (st.req.requireInScope && !st.InScope(file)) return;
 
                 if (mi->isFunctionLike())
                 {
@@ -1064,6 +1083,13 @@ namespace cflat_cinterop
             return def;
         }
 
+        bool DeferHeaderSpecialMembers(const ExtractState& st);
+        bool HasDeferredSpecialMemberWork(ASTContext& ctx, const CXXRecordDecl* cxx);
+        void CompleteRequestedSpecialMembers(ExtractState& st, ASTContext& ctx,
+                                             const CXXRecordDecl* record);
+        void IndexSpecialMemberRecords(ASTContext& ctx, const DeclContext* dc,
+            std::unordered_map<std::string, const CXXRecordDecl*>& index);
+
         struct DeclVisitor : public RecursiveASTVisitor<DeclVisitor>
         {
             ASTContext& ctx;
@@ -1094,7 +1120,7 @@ namespace cflat_cinterop
                 return RecursiveASTVisitor<DeclVisitor>::TraverseStmt(stmt, queue);
             }
 
-            void PrepareHeaderSpecialMembers(const CXXRecordDecl* cxx);
+            void PrepareHeaderSpecialMembers(const CXXRecordDecl* cxx, bool completing = false);
             std::string InvalidDefinitionRefusal(const CXXRecordDecl* def) const;
             std::string InvalidTypeRequestRefusal(const CXXRecordDecl* def,
                                                   const std::string& spelling) const;
@@ -1147,7 +1173,7 @@ namespace cflat_cinterop
             bool LocOf(const Decl* d, std::string& file, int& line, int& col) const
             {
                 if (!LocOfRaw(d, file, line, col)) return false;
-                if (st.req.requireInScope && !PathInScope(file, st.normDirs)) return false;
+                if (st.req.requireInScope && !st.InScope(file)) return false;
                 return true;
             }
 
@@ -1315,7 +1341,7 @@ namespace cflat_cinterop
                 std::string file;
                 int line = 1, col = 0;
                 LocOfRaw(ctd, file, line, col);
-                if (st.req.requireInScope && !PathInScope(file, st.normDirs)) return true;
+                if (st.req.requireInScope && !st.InScope(file)) return true;
                 const std::string name = CxxQualifiedName(ctd->getTemplatedDecl());
                 if (!name.empty() && st.emittedClassTemplateNames.insert(name).second)
                     st.out.classTemplateNames.push_back(name);
@@ -1501,7 +1527,7 @@ namespace cflat_cinterop
                     int col = 0;
                     if (!LocOfRaw(target, file, line, col))
                         return std::string("target has no valid source location");
-                    if (st.req.requireInScope && !PathInScope(file, st.normDirs))
+                    if (st.req.requireInScope && !st.InScope(file))
                         return std::string("target is outside the requested scope");
                     const std::string targetName = CxxQualifiedName(target);
                     if (target->isInAnonymousNamespace() || !IsValidDottedName(targetName))
@@ -1940,7 +1966,8 @@ namespace cflat_cinterop
                 // A polymorphic class needs a vtable. Clang decides whether this translation unit
                 // owns it (all-inline: linkonce_odr here) or whether a key function anchors it in
                 // the bound library (external declaration); asking is always safe.
-                if (st.req.emitDefinitions && cxx->isPolymorphic() && cxx->getNumVBases() == 0)
+                if (st.req.RecordsDefinitionDemand() && cxx->isPolymorphic()
+                    && cxx->getNumVBases() == 0)
                     st.vtableWork.push_back(cxx);
                 rec.hasBases = cxx->getNumBases() > 0 || cxx->getNumVBases() > 0;
                 rec.hasVirtualBases = cxx->getNumVBases() > 0;
@@ -2043,12 +2070,12 @@ namespace cflat_cinterop
                         bool dependent = pattern->getReturnType()->isDependentType();
                         for (const ParmVarDecl* p : pattern->parameters())
                             dependent = dependent || p->getType()->isDependentType();
-                        if (st.req.emitDefinitions)
+                        if (st.req.RecordsDefinitionDemand())
                         {
                             for (const FunctionDecl* spec : ftd->specializations())
                             {
                                 const auto* smd = llvm::dyn_cast<CXXMethodDecl>(spec);
-                                if (smd == nullptr || !smd->hasBody()) continue;
+                                if (smd == nullptr || smd->isInvalidDecl()) continue;
                                 templateExtras.insert(smd);
                                 if (listedMethods.insert(smd).second) methodList.push_back(smd);
                             }
@@ -2060,9 +2087,10 @@ namespace cflat_cinterop
                                 if (listedMethods.insert(pattern).second) methodList.push_back(pattern);
                             }
                         }
-                        if (!st.req.emitDefinitions && (!allDefaulted && !constructorTemplate))
+                        if (!st.req.RecordsDefinitionDemand()
+                            && (!allDefaulted && !constructorTemplate))
                             continue;
-                        if (!st.req.emitDefinitions && dependent)
+                        if (dependent)
                         {
                             if (!allDefaulted || st.ci == nullptr || !st.ci->hasSema()) continue;
                             Sema& sema = st.ci->getSema();
@@ -2093,7 +2121,7 @@ namespace cflat_cinterop
                             if (listedMethods.insert(smd).second) methodList.push_back(smd);
                             continue;
                         }
-                        if (!st.req.emitDefinitions)
+                        if (!st.req.RecordsDefinitionDemand())
                         {
                             templateExtras.insert(pattern);
                             methodList.push_back(pattern);
@@ -2391,11 +2419,11 @@ namespace cflat_cinterop
                     // CANDIDATE: the linkage name and the ABI arrangement are produced here, and
                     // the emission pass clears needsLocalDefinition only for the ones Clang really
                     // emitted. Without it the member stays declaration-only, as before.
-                    const bool emitCandidate = st.req.emitDefinitions
+                    const bool emitCandidate = st.req.RecordsDefinitionDemand()
                                             || st.req.assumeInlineDefinitions;
                     // LSP has no CodeGen module, so assume every header-defined member has a
                     // callable declaration. A real compile still proves the body below.
-                    if (st.req.assumeInlineDefinitions && !st.req.emitDefinitions
+                    if (st.req.assumeInlineDefinitions && !st.req.RecordsDefinitionDemand()
                         && (inlineMember || md->isImplicit() || md->isDefaulted()))
                     {
                         m.definitionAssumed = m.needsLocalDefinition;
@@ -2500,11 +2528,12 @@ namespace cflat_cinterop
                     const bool isInlineVar =
                         vd->isInline() || (definition != nullptr && definition->isInline());
                     const bool emitLocal =
-                        (st.req.emitDefinitions || st.req.assumeInlineDefinitions)
+                        (st.req.RecordsDefinitionDemand() || st.req.assumeInlineDefinitions)
                         && ((vd->isConstexpr() || isInlineVar || isImplicitTemplateMember)
                             && definition != nullptr);
                     // Not instantiated yet: bind the symbol now, emit the definition after the walk.
-                    if (definition == nullptr && isImplicitTemplateMember && st.req.emitDefinitions
+                    if (definition == nullptr && isImplicitTemplateMember
+                        && st.req.RecordsDefinitionDemand()
                         && !vd->getType()->isDependentType())
                     {
                         st.pendingStaticVarDefs.push_back(const_cast<VarDecl*>(vd));
@@ -2529,7 +2558,7 @@ namespace cflat_cinterop
                     { skipStaticVar("inline or constexpr storage is emitted per TU"); continue; }
                     if (!emitLocal && vd->hasInit())
                     { skipStaticVar("its initializer lives in the header, so it has no library symbol"); continue; }
-                    if (emitLocal && st.req.emitDefinitions)
+                    if (emitLocal && st.req.RecordsDefinitionDemand())
                         st.varEmitWork.push_back(definition);
                     RawCxxStaticVar sv;
                     sv.name = vd->getNameAsString();
@@ -2658,7 +2687,7 @@ namespace cflat_cinterop
                     if (rd->getDefinition() != nullptr) return true;
                     std::string ofile; int oline = 1, ocol = 0;
                     if (!LocOfRaw(rd, ofile, oline, ocol)) return true;
-                    if (!PathInScope(ofile, st.normDirs)) return true;
+                    if (!st.InScope(ofile)) return true;
                     std::string tag = rd->getNameAsString();
                     if (!st.emittedOpaqueForward.insert(tag).second) return true;
                     RawRecord rec;
@@ -2712,7 +2741,7 @@ namespace cflat_cinterop
                     std::string defFile; int defLine = 1, defCol = 0;
                     if (st.req.requireInScope
                         && (!LocOfRaw(def, defFile, defLine, defCol)
-                            || !PathInScope(defFile, st.normDirs)))
+                            || !st.InScope(defFile)))
                         continue;
                     const std::string identity = CxxForeignIdentity(CanonicalSpelling(ctx, qt));
                     if (identity.empty()) continue;
@@ -2744,7 +2773,7 @@ namespace cflat_cinterop
                 if (!LocOfRaw(rd, file, line, col)) return;
                 // Do not walk standard-library template catalogs as transitive C++ layout.
                 if (st.req.requireInScope && nameOverride.empty() && !forcedBase
-                    && llvm::isa<CXXRecordDecl>(rd) && !PathInScope(file, st.normDirs)) return;
+                    && llvm::isa<CXXRecordDecl>(rd) && !st.InScope(file)) return;
                 if (nameOverride.empty()
                     && !st.emittedDefinedRecords.insert(rd).second)
                     return;
@@ -2817,7 +2846,7 @@ namespace cflat_cinterop
                 rec.file = file; rec.line = line; rec.col = col;
                 rec.physicalFile = PhysicalFileOf(rd, file);
                 rec.inScope = forcedBase || !nameOverride.empty() || !st.req.requireInScope
-                           || PathInScope(file, st.normDirs);
+                           || st.InScope(file);
                 if (st.req.cxxMode && llvm::isa<CXXRecordDecl>(rd))
                     rec.canonicalCtype = CanonicalSpelling(ctx, ctx.getCanonicalTagType(rd));
                 const ASTRecordLayout& layout = ctx.getASTRecordLayout(rd);
@@ -2839,7 +2868,14 @@ namespace cflat_cinterop
                         if (rec.inScope && nameOverride.empty())
                             PrepareHeaderSpecialMembers(cxx);
                         if (rec.inScope || !st.req.requireInScope || !nameOverride.empty())
+                        {
                             CollectCxxMembers(cxx, rec, memberDecls);
+                            rec.specialMembersPending = DeferHeaderSpecialMembers(st)
+                                && HasDeferredSpecialMemberWork(ctx, cxx);
+                            if (rec.specialMembersPending && st.req.specialMemberRecords != nullptr)
+                                (*st.req.specialMemberRecords)[rec.name] =
+                                    CompleteNonDependentCxxRecord(cxx);
+                        }
                         for (const CXXBaseSpecifier& b : cxx->bases())
                         {
                             const auto* brd = b.getType()->getAsCXXRecordDecl();
@@ -2981,6 +3017,37 @@ namespace cflat_cinterop
              */
             bool ProcessTypeRequests(TranslationUnitDecl* root)
             {
+                // A completion request names header records by CFlat identity; its markers are
+                // placeholders. Define what the header harvest deferred, then harvest the record.
+                if (st.req.completeCxxSpecialMembers)
+                {
+                    std::vector<std::pair<const CXXRecordDecl*, std::string>> batch;
+                    for (const auto& request : st.req.cxxTypeRequests)
+                    {
+                        if (st.req.specialMemberRecords == nullptr) break;
+                        auto& index = *st.req.specialMemberRecords;
+                        auto found = index.find(request.cflatName);
+                        // A group opened without a live harvest (warm cache) has no index yet.
+                        if (found == index.end() && index.emplace("#indexed", nullptr).second)
+                        {
+                            // Each incremental chunk has its own TU decl; walk the chain.
+                            for (const TranslationUnitDecl* tu : root->redecls())
+                                IndexSpecialMemberRecords(ctx, tu, index);
+                            found = index.find(request.cflatName);
+                        }
+                        if (found == index.end() || found->second == nullptr) continue;
+                        // Snapshot the whole batch first: one record's completion can define
+                        // another's members, and those count as defined by the completion.
+                        for (const CXXMethodDecl* md : found->second->methods())
+                            if (md->isDefined()) st.completionPredefined.insert(md);
+                        batch.emplace_back(found->second, request.cflatName);
+                    }
+                    for (const auto& [decl, name] : batch)
+                        CompleteRequestedSpecialMembers(st, ctx, decl);
+                    for (const auto& [decl, name] : batch)
+                        EmitDefinedRecord(const_cast<CXXRecordDecl*>(decl), name);
+                    return true;
+                }
                 std::vector<Decl*> operatorCandidates;
                 auto isComparisonOperator = [](OverloadedOperatorKind op) {
                     switch (op)
@@ -3253,7 +3320,7 @@ namespace cflat_cinterop
                 t.name = name;
                 t.qualifiedName = st.req.cxxMode ? CxxQualifiedName(td) : name;
                 LocOfRaw(td, t.file, t.line, t.col);
-                if (st.req.requireInScope && !PathInScope(t.file, st.normDirs)) return true;
+                if (st.req.requireInScope && !st.InScope(t.file)) return true;
                 if (const RecordType* rt = u->getAs<RecordType>())
                 {
                     const RecordDecl* rd = rt->getDecl();
@@ -3374,7 +3441,7 @@ namespace cflat_cinterop
                 t.name = alias->getNameAsString();
                 t.qualifiedName = CxxQualifiedName(alias);
                 LocOfRaw(atd, t.file, t.line, t.col);
-                if (st.req.requireInScope && !PathInScope(t.file, st.normDirs)) return true;
+                if (st.req.requireInScope && !st.InScope(t.file)) return true;
                 if (atd->getDeclContext()->isTranslationUnit() && !t.qualifiedName.empty()
                     && st.emittedClassTemplateNames.insert(t.qualifiedName).second)
                     st.out.classTemplateNames.push_back(t.qualifiedName);
@@ -3467,7 +3534,8 @@ namespace cflat_cinterop
                 const bool headerOnly = vd->isInline() || (def != nullptr && def->isInline())
                     || vd->isConstexpr()
                     || !vd->hasExternalFormalLinkage() || vd->getStorageClass() == SC_Static;
-                const bool canEmit = st.req.emitDefinitions || st.req.assumeInlineDefinitions;
+                const bool canEmit = st.req.RecordsDefinitionDemand()
+                                  || st.req.assumeInlineDefinitions;
                 if (headerOnly)
                 {
                     if (def == nullptr || init == nullptr)
@@ -3477,7 +3545,7 @@ namespace cflat_cinterop
                     if (def->getType()->isDependentType()
                         || def->getDeclContext()->isDependentContext())
                     { skipVar("its type or initializer is dependent"); return true; }
-                    if (st.req.emitDefinitions) st.varEmitWork.push_back(def);
+                    if (st.req.RecordsDefinitionDemand()) st.varEmitWork.push_back(def);
                     g.linkageName = CxxLinkageName(ctx, vd);
                     // An internal-linkage definition is invisible outside the companion module.
                     if (!vd->hasExternalFormalLinkage() || vd->getStorageClass() == SC_Static)
@@ -3825,11 +3893,11 @@ namespace cflat_cinterop
             return std::format("C++ type '{}' could not be instantiated: {}", spelling, detail);
         }
 
-        void DeclVisitor::PrepareHeaderSpecialMembers(const CXXRecordDecl* cxx)
+        void DeclVisitor::PrepareHeaderSpecialMembers(const CXXRecordDecl* cxx, bool completing)
         {
             const CXXRecordDecl* def = CompleteNonDependentCxxRecord(cxx);
-            if ((!st.req.emitDefinitions && !st.req.assumeInlineDefinitions)
-                || !st.req.requireInScope
+            if ((!st.req.RecordsDefinitionDemand() && !st.req.assumeInlineDefinitions)
+                || (!st.req.requireInScope && !completing)
                 || def == nullptr
                 || !st.headerSpecialMemberSeen.insert(def).second)
                 return;
@@ -4023,7 +4091,7 @@ namespace cflat_cinterop
          */
         void DefineEmittedVTableMembers(ExtractState& st, ASTContext& ctx)
         {
-            if (!st.ci->hasSema() || !st.req.emitDefinitions
+            if (!st.ci->hasSema() || !st.req.RecordsDefinitionDemand()
                 || ctx.getTargetInfo().getCXXABI().isMicrosoft())
                 return;
             Sema& sema = st.ci->getSema();
@@ -4125,7 +4193,7 @@ namespace cflat_cinterop
                 // parse; a wrapper whose forwarded call fails is dropped by the error-body sweep,
                 // not a reason to refuse the header.
                 if (e.inMainFile) continue;
-                if (e.file.empty() || !PathInScope(e.file, st.normDirs)) continue;
+                if (e.file.empty() || !st.InScope(e.file)) continue;
                 ++st.out.headerErrors;
                 if (st.out.firstHeaderError.empty())
                     st.out.firstHeaderError =
@@ -4133,15 +4201,231 @@ namespace cflat_cinterop
             }
         }
 
-        void ComputeCxxAbi(ExtractState& st, ASTContext& ctx, TranslationUnitDecl* root)
+        /*
+         * Names every complete, non-dependent record of the TU the way the header harvest does,
+         * so a completion request in a group that never ran the harvest still finds its record.
+         */
+        void IndexSpecialMemberRecords(ASTContext& ctx, const DeclContext* dc,
+            std::unordered_map<std::string, const CXXRecordDecl*>& index)
         {
-            if (st.ci == nullptr) return;
+            auto add = [&](const CXXRecordDecl* rd) {
+                const CXXRecordDecl* def = CompleteNonDependentCxxRecord(rd);
+                if (def == nullptr || def->getIdentifier() == nullptr
+                    || def->isInAnonymousNamespace())
+                    return;
+                const auto* spec = llvm::dyn_cast<ClassTemplateSpecializationDecl>(def);
+                // The harvest names implicit specializations and records nested in them by
+                // foreign identity (typedef, base and field paths); index that name as well.
+                if (const std::string identity = CxxForeignIdentity(
+                        CanonicalSpelling(ctx, ctx.getCanonicalTagType(def)));
+                    !identity.empty())
+                    index.emplace(identity, def);
+                const std::string name = spec != nullptr
+                        && spec->getSpecializationKind() == TSK_ExplicitSpecialization
+                    ? CxxForeignIdentity(CanonicalSpelling(ctx, ctx.getCanonicalTagType(def)))
+                    : CxxQualifiedName(def);
+                if (IsValidDottedName(name)) index.emplace(name, def);
+                IndexSpecialMemberRecords(ctx, def, index);
+            };
+            for (const Decl* d : dc->decls())
+            {
+                if (const auto* ns = llvm::dyn_cast<NamespaceDecl>(d))
+                    IndexSpecialMemberRecords(ctx, ns, index);
+                else if (const auto* ls = llvm::dyn_cast<LinkageSpecDecl>(d))
+                    IndexSpecialMemberRecords(ctx, ls, index);
+                else if (const auto* ex = llvm::dyn_cast<ExportDecl>(d))
+                    IndexSpecialMemberRecords(ctx, ex, index);
+                else if (const auto* ct = llvm::dyn_cast<ClassTemplateDecl>(d))
+                {
+                    for (const auto* spec : ct->specializations()) add(spec);
+                }
+                else if (const auto* rd = llvm::dyn_cast<CXXRecordDecl>(d);
+                         rd != nullptr && !llvm::isa<ClassTemplateSpecializationDecl>(rd))
+                    add(rd);
+            }
+        }
+
+        /*
+         * R1: a live group's header harvest (chunk 0) defines no implicit / defaulted special
+         * member and no inline-vtable virtual. Those definitions are the transitive instantiation
+         * of every field and base special member of every harvested record, most of which the
+         * program never constructs; a record that needs them is completed by a later request
+         * (CompleteRequestedSpecialMembers) when the program first projects it. A one-shot TU
+         * (a .cpp import, LSP) has no later request to complete in, so it stays eager.
+         */
+        bool DeferHeaderSpecialMembers(const ExtractState& st)
+        {
+            return st.req.cxxMode && st.req.requireInScope && st.req.RecordsDefinitionDemand()
+                && st.req.demandPlan != nullptr && !st.req.completeCxxSpecialMembers;
+        }
+
+        /*
+         * The user-declared special members of an implicit class-template specialization whose
+         * bodies are not instantiated yet. The eager passes instantiated these through every
+         * record holding the specialization by value or as a base (a container's implicit copy
+         * constructor calls the element's), so a completion instantiates them for the record.
+         */
+        std::vector<CXXMethodDecl*> UninstantiatedSpecialMembers(const CXXRecordDecl* def)
+        {
+            std::vector<CXXMethodDecl*> out;
+            if (def->getTemplateSpecializationKind() != clang::TSK_ImplicitInstantiation)
+                return out;
+            for (CXXMethodDecl* md : def->methods())
+            {
+                if (md->isImplicit() || md->isDefaulted() || md->hasBody() || md->isDeleted()
+                    || md->isInvalidDecl() || md->getType()->isDependentType())
+                    continue;
+                const auto* ctor = llvm::dyn_cast<CXXConstructorDecl>(md);
+                const bool special = llvm::isa<CXXDestructorDecl>(md)
+                    || (ctor != nullptr && (ctor->isDefaultConstructor()
+                                            || ctor->isCopyOrMoveConstructor()))
+                    || md->isCopyAssignmentOperator() || md->isMoveAssignmentOperator();
+                if (!special) continue;
+                const FunctionDecl* pattern = md->getTemplateInstantiationPattern();
+                if (pattern == nullptr || !pattern->isDefined()) continue;
+                out.push_back(md);
+            }
+            return out;
+        }
+
+        // True when one of the four definition passes would define something of this record:
+        // a defaulted (implicit or `= default`) member without a body that Sema would define on
+        // odr-use, the virtual members of a vtable the companion emits, or an uninstantiated
+        // user-declared special member of a class-template specialization.
+        bool HasDeferredSpecialMemberWork(ASTContext& ctx, const CXXRecordDecl* cxx)
+        {
+            const CXXRecordDecl* def = CompleteNonDependentCxxRecord(cxx);
+            if (def == nullptr || def->isInvalidDecl()) return false;
+            if (!UninstantiatedSpecialMembers(def).empty()) return true;
+            for (const CXXMethodDecl* md : def->methods())
+            {
+                if (!md->isDefaulted() || md->hasBody() || md->isDeleted() || md->isInvalidDecl()
+                    || md->getType()->isDependentType())
+                    continue;
+                // Sema never defines a trivial default constructor or destructor.
+                const auto* ctor = llvm::dyn_cast<CXXConstructorDecl>(md);
+                if (md->isTrivial() && ((ctor != nullptr && ctor->isDefaultConstructor())
+                                        || llvm::isa<CXXDestructorDecl>(md)))
+                    continue;
+                return true;
+            }
+            if (!def->isDynamicClass()) return false;
+            if (ctx.getTargetInfo().getCXXABI().isMicrosoft()) return true;
+            return def->isPolymorphic() && def->getNumVBases() == 0
+                && ctx.getCurrentKeyFunction(def) == nullptr
+                && def->getTemplateSpecializationKind()
+                    != clang::TSK_ExplicitInstantiationDeclaration;
+        }
+
+        /*
+         * Completion request: run the four definition passes for one header record exactly as
+         * the header harvest would have run them over it, before its members are harvested. The
+         * work lists are swapped in so only this record is defined here.
+         */
+        void CompleteRequestedSpecialMembers(ExtractState& st, ASTContext& ctx,
+                                             const CXXRecordDecl* record)
+        {
+            const CXXRecordDecl* rd = CompleteNonDependentCxxRecord(record);
+            if (st.ci == nullptr || !st.ci->hasSema() || rd == nullptr) return;
+            llvm::TimeTraceScope scope("CxxCompleteSpecialMembers");
+            auto savedHeaderWork = std::move(st.headerSpecialMemberWork);
+            auto savedMembers = std::move(st.memberAbiWork);
+            auto savedVtables = std::move(st.vtableWork);
+            st.headerSpecialMemberWork.clear();
+            st.memberAbiWork.clear();
+            st.vtableWork.clear();
+            DeclVisitor visitor(ctx, st);
+            visitor.PrepareHeaderSpecialMembers(rd, true);
+            if (st.headerSpecialMemberWork.empty()) st.headerSpecialMemberWork.push_back(rd);
+            for (const CXXMethodDecl* md : rd->methods())
+                st.memberAbiWork.push_back({SIZE_MAX, SIZE_MAX, md});
+            if (rd->isPolymorphic() && rd->getNumVBases() == 0) st.vtableWork.push_back(rd);
+            if (const auto instantiate = UninstantiatedSpecialMembers(rd); !instantiate.empty())
+            {
+                Sema& sema = st.ci->getSema();
+                clang::Scope tuScope(nullptr, clang::Scope::DeclScope, st.ci->getDiagnostics());
+                const bool lendScope = sema.TUScope == nullptr;
+                if (lendScope) sema.TUScope = &tuScope;
+                for (CXXMethodDecl* md : instantiate)
+                    sema.MarkFunctionReferenced(md->getLocation(), md, /*MightBeOdrUse*/ true);
+                sema.PerformPendingInstantiations();
+                if (lendScope) sema.TUScope = nullptr;
+            }
             DefineHeaderImplicitSpecialMembers(st);
             DefineDefaultedSpecialMembers(st);
             DefineMicrosoftVTableMembers(st, ctx);
             DefineEmittedVTableMembers(st, ctx);
+            st.headerSpecialMemberWork = std::move(savedHeaderWork);
+            st.memberAbiWork = std::move(savedMembers);
+            st.vtableWork = std::move(savedVtables);
+        }
+
+        /*
+         * A completion reports only what the deferred passes changed: the special members and
+         * virtuals, plus any other member whose body those passes instantiated. A member that was
+         * already defined (by the harvest or a later request) keeps the harvest's facts, as the
+         * eager passes would have left them.
+         */
+        void StripPredefinedCompletionMembers(ExtractState& st)
+        {
+            using Member = RawCxxMember;
+            std::map<size_t, std::vector<size_t>> strip;
+            for (const auto& w : st.memberAbiWork)
+            {
+                if (w.md == nullptr || st.completionPredefined.count(w.md) == 0
+                    || w.recordIdx >= st.out.records.size()
+                    || w.memberIdx >= st.out.records[w.recordIdx].members.size())
+                    continue;
+                const Member& m = st.out.records[w.recordIdx].members[w.memberIdx];
+                if (m.kind == Member::Destructor || m.isDefaultCtor || m.isCopyCtor
+                    || m.isMoveCtor || m.isCopyAssign || m.isMoveAssign || m.isVirtual)
+                    continue;
+                strip[w.recordIdx].push_back(w.memberIdx);
+            }
+            for (auto& [recordIdx, members] : strip)
+            {
+                std::sort(members.begin(), members.end());
+                members.erase(std::unique(members.begin(), members.end()), members.end());
+                auto& list = st.out.records[recordIdx].members;
+                for (auto it = members.rbegin(); it != members.rend(); ++it)
+                    list.erase(list.begin() + static_cast<std::ptrdiff_t>(*it));
+            }
+        }
+
+        void ComputeCxxAbi(ExtractState& st, ASTContext& ctx, TranslationUnitDecl* root)
+        {
+            if (st.ci == nullptr) return;
+            bool deferred = DeferHeaderSpecialMembers(st);
+            if (deferred)
+            {
+                /*
+                 * Small-harvest cutoff (maintainer ruling 2026-09-29). A completion chunk has a
+                 * fixed cost the eager passes do not. With few records to complete (nlohmann/json
+                 * 13, simdjson 37, fmt 24; torch 2331) the passes are cheaper than the chunks the
+                 * program would ask for: deferring measured +1.1% cold instructions on simdjson and
+                 * +0.5% on json. Eager also suits the cache better: every record's facts land in
+                 * the header entry, so a sibling program using a record the first one never touched
+                 * needs no completion chunk. Deferral pays off only on large harvests like torch.
+                 * The value is a tuning constant; a later perf review may make it adjustable.
+                 */
+                constexpr size_t kMinDeferredRecords = 64;
+                size_t pending = 0;
+                for (const RawRecord& rec : st.out.records) pending += rec.specialMembersPending;
+                if (pending < kMinDeferredRecords)
+                {
+                    deferred = false;
+                    for (RawRecord& rec : st.out.records) rec.specialMembersPending = false;
+                }
+            }
+            if (!deferred)
+            {
+                DefineHeaderImplicitSpecialMembers(st);
+                DefineDefaultedSpecialMembers(st);
+                DefineMicrosoftVTableMembers(st, ctx);
+                DefineEmittedVTableMembers(st, ctx);
+            }
             if (st.abiWork.empty() && st.functionPointerAbiWork.empty()
-                && st.memberAbiWork.empty() && !st.req.emitDefinitions) return;
+                && st.memberAbiWork.empty() && !st.req.RecordsDefinitionDemand()) return;
             using namespace clang::CodeGen;
 
             llvm::LLVMContext llvmCtx;
@@ -4211,11 +4495,12 @@ namespace cflat_cinterop
 
             ComputeCxxMemberAbi(st, ctx, root, cgm, *cg);
 
-            if (st.req.emitDefinitions)
+            if (st.req.RecordsDefinitionDemand())
             {
                 llvm::TimeTraceScope emitScope("CxxDefinitionEmit");
                 EmitCxxDefinitions(st, ctx, root, *cg);
             }
+            if (st.req.completeCxxSpecialMembers) StripPredefinedCompletionMembers(st);
             (void)cg->ReleaseModule();
         }
 
@@ -4425,7 +4710,7 @@ namespace cflat_cinterop
             auto inScopeDecl = [&](const Decl* d) {
                 if (!st.req.requireInScope) return true;
                 PresumedLoc pl = st.ci->getSourceManager().getPresumedLoc(d->getLocation());
-                return pl.isValid() && PathInScope(pl.getFilename(), st.normDirs);
+                return pl.isValid() && st.InScope(pl.getFilename());
             };
 
             auto rememberDroppedWrapper = [&](const FunctionDecl* fd) {
@@ -4764,7 +5049,7 @@ namespace cflat_cinterop
             } errorBodies(*errorReach);
             {
                 llvm::TimeTraceScope scope("CxxErrorBodySweep");
-                if (errorReach->active)
+                if (errorReach->active && !st.req.demandOnlyDefinitions)
                 {
                     errorBodies.TraverseDecl(root);
                     for (Decl* d : st.announcedDecls) errorBodies.TraverseDecl(d);
@@ -4911,7 +5196,7 @@ namespace cflat_cinterop
                     && fd->hasBody())
                     request(GlobalDecl(fd));
             for (const auto& w : st.memberAbiWork)
-                if (w.md != nullptr && !declHasErrors(w.md) && w.md->hasBody()
+                if (w.md != nullptr && !declHasErrors(w.md)
                     && !isDependentCodeGenDecl(w.md))
                     request(MemberGlobalDecl(w.md));
             for (size_t i = 0; i < boundStaticVarCount; ++i)
@@ -5220,8 +5505,11 @@ namespace cflat_cinterop
                     if (m.linkageName.empty()) continue;
                     const FunctionDecl* body = nullptr;
                     const bool emitted = m.linkageName.starts_with("__cflat_")
-                        || (w.md != nullptr && w.md->hasBody(body) && body != nullptr
-                            && !isDependentCodeGenDecl(w.md));
+                        || (w.md != nullptr && !isDependentCodeGenDecl(w.md)
+                            // Sema never defines a trivial defaulted member; nothing emits it.
+                            && !(w.md->isDefaulted() && w.md->isTrivial())
+                            && ((w.md->hasBody(body) && body != nullptr)
+                                || w.md->isImplicitlyInstantiable() || w.md->isDefaulted()));
                     if (emitted || (w.md != nullptr && LibraryOwnsMemberSymbol(w.md)))
                         m.needsLocalDefinition = false;
                     else
@@ -5337,6 +5625,7 @@ namespace cflat_cinterop
             // not evidence that the library symbol is absent; preserve the mangled name.
 
             {
+                llvm::TimeTraceScope serializeScope("CxxBitcodeSerialize");
                 llvm::raw_string_ostream os(st.out.bitcode);
                 CxxExtractionStageTimer serialize(st.req.verbose && st.req.cxxMode,
                                                   "bitcode serialization");
@@ -5429,6 +5718,7 @@ namespace cflat_cinterop
             }
             DeclVisitor v(ctx, st);
             {
+                llvm::TimeTraceScope harvestScope("CxxHarvestWalk");
                 CxxExtractionStageTimer harvest(st.req.verbose && st.req.cxxMode,
                                                  "record/sig harvest");
                 if (st.req.cxxTypeRequests.empty() && st.req.cxxFunctionWrapperNames.empty())
@@ -5449,6 +5739,7 @@ namespace cflat_cinterop
                 if (completed != 0)
                 {
                     ResetHarvestState(st);
+                    llvm::TimeTraceScope reharvestScope("CxxReharvestWalk");
                     CxxExtractionStageTimer reharvest(st.req.verbose,
                                                        "record/sig re-harvest");
                     DeclVisitor refreshed(ctx, st);
@@ -5483,13 +5774,13 @@ namespace cflat_cinterop
             // the finished AST). Only the definition-emission path replays this list.
             bool HandleTopLevelDecl(DeclGroupRef dg) override
             {
-                if (st.req.emitDefinitions)
+                if (st.req.RecordsDefinitionDemand())
                     for (Decl* d : dg)
                     {
                         if (st.req.requireInScope && st.ci != nullptr)
                         {
                             PresumedLoc pl = st.ci->getSourceManager().getPresumedLoc(d->getLocation());
-                            if (pl.isInvalid() || !PathInScope(pl.getFilename(), st.normDirs)) continue;
+                            if (pl.isInvalid() || !st.InScope(pl.getFilename())) continue;
                         }
                         st.announcedDecls.push_back(d);
                         st.requestDecls.push_back(d);
@@ -5695,7 +5986,7 @@ namespace cflat_cinterop
         out.longDoubleIsIEEEDouble =
             &target.getLongDoubleFormat() == &llvm::APFloat::IEEEdouble();
         out.targetTriple = target.getTriple().str();
-        if (req.emitDefinitions && headerRoot != nullptr)
+        if (req.RecordsDefinitionDemand() && headerRoot != nullptr)
             for (clang::Decl* decl : headerRoot->decls())
             {
                 // The full header walk belongs to chunk 0. Requests keep the shared decls
@@ -5703,7 +5994,7 @@ namespace cflat_cinterop
                 if (root == headerRoot) st.announcedDecls.push_back(decl);
                 st.sharedDecls.push_back(decl);
             }
-        if (req.emitDefinitions && root != headerRoot)
+        if (req.RecordsDefinitionDemand() && root != headerRoot)
             for (clang::Decl* decl : root->decls())
             {
                 st.announcedDecls.push_back(decl);
@@ -5711,14 +6002,15 @@ namespace cflat_cinterop
             }
         // Includes committed in a separate chunk are shared roots too. Keep their declarations
         // available to CodeGen for helper references, but do not harvest them per request.
-        if (req.emitDefinitions && preludeRoot != nullptr && preludeRoot != headerRoot)
+        if (req.RecordsDefinitionDemand() && preludeRoot != nullptr
+            && preludeRoot != headerRoot)
             for (clang::Decl* decl : preludeRoot->decls())
             {
                 st.sharedDecls.push_back(decl);
             }
         // What Sema announced while parsing this chunk: implicit instantiations and the members
         // an explicit instantiation defines, none of which are children of the chunk's root.
-        if (req.emitDefinitions && announcedDecls != nullptr)
+        if (req.RecordsDefinitionDemand() && announcedDecls != nullptr)
         {
             st.announcedDecls.insert(st.announcedDecls.end(), announcedDecls->begin(),
                                      announcedDecls->end());

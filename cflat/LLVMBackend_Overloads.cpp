@@ -1983,18 +1983,33 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
             const auto& won = cxxRanks[winner->pair];
             for (const auto& pair : candidates)
             {
-                if (cxxRanks.count(&pair) != 0 || !receiverRefQualifierMatches(pair.second, pair.first))
+                const auto defaultRequest = cxxDefaultWrapperRequests_.find(pair.second.UniqueName);
+                const bool failedDefault = defaultRequest != cxxDefaultWrapperRequests_.end()
+                    && defaultRequest->second.result < 0;
+                if ((!failedDefault && cxxRanks.count(&pair) != 0)
+                    || !receiverRefQualifierMatches(pair.second, pair.first))
                     continue;
-                // A second registration of the winner itself (another receiver shape) is no rival.
-                if (pair.second.UniqueName == winner->pair->second.UniqueName)
+                // A failed default remains viable even when CFlat's fallback ranks a rival first.
+                // Its full declaration and its exact-arity wrapper are the same candidate.
+                if (pair.second.UniqueName == winner->pair->second.UniqueName
+                    || (failedDefault && CxxDeclarationLinkageName(pair.second.UniqueName)
+                        == CxxDeclarationLinkageName(winner->pair->second.UniqueName)))
                     continue;
                 const auto ranks = RankCxxConversionSequences(pair.first, pair.second);
-                if (!std::all_of(ranks.begin(), ranks.end(),
-                                 [](const CxxConversionRank& r) { return r.cxxViable; }))
+                // A ranked by-value class parameter is viable even though cxxViable only proves
+                // const-reference bindings for candidates CFlat could not itself match.
+                if (failedDefault && cxxRanks.count(&pair) != 0 ? !fullyRanked(ranks)
+                    : !std::all_of(ranks.begin(), ranks.end(),
+                                  [](const CxxConversionRank& r) { return r.cxxViable; }))
                     continue;
                 bool crossing = false;
                 const int order = CompareCxxConversionRanks(won, ranks, crossing);
                 if (order == -1 || order == 2)
+                    continue;
+                if (failedDefault && order == 0 && !crossing
+                    && ((IsCxxTemplateSpecializationSymbol(pair.second)
+                         && !IsCxxTemplateSpecializationSymbol(winner->pair->second))
+                        || (pair.second.CxxVolatile && !winner->pair->second.CxxVolatile)))
                     continue;
                 // Strictly better in C++: report it by name at the first argument CFlat refuses.
                 if (order == 1 && preferredOut != nullptr)
@@ -2964,6 +2979,18 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
             }
             candidateSet = &cxxOperatorCandidates;
         }
+        std::vector<FunctionSymbol> defaultCandidates;
+        if (!cxxDefaultWrapperRequests_.empty()
+            && std::any_of(candidateSet->begin(), candidateSet->end(), [&](const auto& candidate) {
+                return candidate.UniqueName.starts_with("__cflat_dflt_")
+                    || (candidate.IsCxx && !candidate.DefaultArguments.empty()
+                        && candidate.Parameters.size() > arguments.size());
+            }))
+        {
+            defaultCandidates = *candidateSet;
+            PrepareCxxDefaultCandidates(defaultCandidates, arguments.size());
+            candidateSet = &defaultCandidates;
+        }
         const auto& candidates = *candidateSet;
 
         std::vector<std::pair<std::vector<NamedVariable>, FunctionSymbol>> resolvedCandidate;
@@ -3041,6 +3068,21 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
         CxxPreferredOverload cxxPreferred;
         auto [matched, candidate] = ComputeOverloadFunction(resolvedCandidate, &tiedCandidates,
                                                             &cxxPreferred);
+
+        if (candidate.IsCxx && candidate.Function != nullptr && tiedCandidates.empty()
+            && !cxxPreferred.set)
+            if (std::string error = CheckCxxDemand(candidate.Function->getName().str());
+                !error.empty())
+            {
+                RefuseCxxDemandMember(candidate.Function->getName().str(), error);
+                auto saved = std::exchange(cxxDemandRefusalRelay_,
+                                           std::pair{functionName, error});
+                llvm::Value* retried = CreateOverloadedFunctionCall(functionName, arguments,
+                    forceRoot, displayName, cxxMemberReceiver, postfixMemberCall,
+                    enclosingFunctionName);
+                cxxDemandRefusalRelay_ = std::move(saved);
+                return retried;
+            }
 
         // A C++ reference-returning operator carries its referent address until the consumer is
         // known. For a selected by-value C++ parameter, pass the loaded class value with its
@@ -3131,6 +3173,8 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
             return nullptr;
         }
 
+        RejectFailedCxxDefaultCandidate(candidate, arguments.size());
+
         // The picked C++ candidate reaches a class parameter through a conversion operator and a
         // converting constructor that bind equally well: C++ refuses the conversion itself.
         if (candidate.IsCxx && !matched.empty())
@@ -3192,6 +3236,7 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                                                               : functionName.substr(dot + 1);
             for (const auto& member : record->second.members)
                 if (member.name == bare && !member.bindRefusal.empty()
+                    && !member.refusalCause.starts_with("clang reported an error inside the body")
                     && member.paramTypes.size() == args.size()
                     && member.paramTypes[index] == "const " + spelling + " &")
                     return std::format("member '{}' of C++ class '{}' {}", bare,
@@ -3200,6 +3245,12 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
         };
         if (candidate.Function == nullptr)
         {
+            if (candidates.empty() && !cxxMemberReceiver.empty())
+                if (auto info = cxxClasses_.find(cxxMemberReceiver); info != cxxClasses_.end())
+                    if (auto refusal = info->second.refusedMembers.find(bareMemberName);
+                        refusal != info->second.refusedMembers.end())
+                        LogError(std::format("member '{}' of C++ class '{}' {}", bareMemberName,
+                            DisplayCxxClassName(cxxMemberReceiver), refusal->second));
             for (const auto& c : candidates)
             {
                 const bool arityFits = c.Variadic ? arguments.size() >= c.Parameters.size()
@@ -3398,7 +3449,7 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                 {
                     // Suggest 'move x' only when a bound T&& or by-value overload takes it.
                     const std::string& sinkType = userArgs[sinkIndex].TypeAndValue.TypeName;
-                    const bool moveRemedy = std::any_of(candidates.begin(), candidates.end(),
+                    bool moveRemedy = std::any_of(candidates.begin(), candidates.end(),
                         [&](const auto& c) {
                             if (!c.IsCxx || c.Parameters.size() != arguments.size()) return false;
                             const auto& p = c.Parameters[sinkIndex + 1];
@@ -3406,6 +3457,20 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                                 || (!p.IsAlias && !p.IsCxxConstRef && !p.Pointer
                                     && p.TypeName == sinkType);
                         });
+                    if (!moveRemedy)
+                    {
+                        std::string spelling;
+                        if (CxxSpellingForCflatType(sinkType, spelling))
+                            if (auto record = cxxRecordEntries_.find(cxxMemberReceiver);
+                                record != cxxRecordEntries_.end())
+                                moveRemedy = std::any_of(record->second.members.begin(),
+                                    record->second.members.end(), [&](const auto& member) {
+                                        return member.name == bareMemberName && member.bindRefusal.empty()
+                                            && !member.linkageName.empty()
+                                            && member.paramTypes.size() == arguments.size()
+                                            && member.paramTypes[sinkIndex + 1] == spelling;
+                                    });
+                    }
                     std::string message = CxxDeletedCopyMessage(userArgs[sinkIndex], sinkParam,
                                                                 shownFunctionName, moveRemedy);
                     const std::string causeLine = CxxFirstDiagnosticLine(sinkCause);
@@ -3438,6 +3503,13 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                         }
                 }
 
+            // The best candidate's body failed and no sibling matches: relay clang's text.
+            if (!cxxDemandRefusalRelay_.second.empty()
+                && cxxDemandRefusalRelay_.first == functionNameIn)
+            {
+                LogError(cxxDemandRefusalRelay_.second);
+                return nullptr;
+            }
             std::string msg = std::format("no overload of '{}' matches the given arguments.\n", shownFunctionName);
 
             // Recover a named-argument diagnostic only from candidates whose parameter names
@@ -4759,6 +4831,8 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
         // Refuse before any argument is committed: a potentially throwing C++ callee has no
         // landing pad on the CFlat side.
         RejectThrowingCxxFunction(candidate, diagnosticFunctionName);
+        if (candidate.IsCxx && candidate.Function != nullptr)
+            ValidateCxxDemand(candidate.Function->getName().str());
 
         if (candidate.Function != nullptr)
             firstCallLocation_.emplace(candidate.Function->getName().str(),
@@ -5354,6 +5428,8 @@ llvm::Function* LLVMBackend::GetFunctionForFuncPtr(std::string functionName, int
             // Taking the address is as unsafe as calling it - the eventual indirect call has
             // no landing pad either.
             if (bindingFuncPtr) RejectThrowingCxxFunction(*sym, functionName);
+            if (bindingFuncPtr && sym->IsCxx && sym->Function != nullptr)
+                ValidateCxxDemand(sym->Function->getName().str());
             return sym->Function;
         };
         if (overloads.size() == 1)

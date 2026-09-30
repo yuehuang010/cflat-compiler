@@ -9,13 +9,10 @@
 #include <optional>
 #include <string>
 #include <vector>
+#include "platform/MacDeploymentTarget.h"
 
 namespace cflat::appres
 {
-    // Deployment target every macOS link stamps (triple arm64-apple-macosx11.0.0), reused as
-    // LSMinimumSystemVersion so the plist and the load command cannot disagree.
-    inline constexpr const char* kMacMinimumSystemVersion = "11.0";
-
     enum class AppFileType : int { Application = 1, Dll = 2, Driver = 3 };
 
     struct AppVersionData

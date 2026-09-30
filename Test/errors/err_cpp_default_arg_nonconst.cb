@@ -5,5 +5,17 @@ extern int main()
     expect_error("call to 'cppi.PrivateDefaultArg.call' omits parameter 'value' whose default argument is not a constant expression") {
         cppi.PrivateDefaultArg.call();
     }
+    cppi.DefaultRankOnly value = cppi.DefaultRankOnly();
+    expect_error("ambiguous call to 'cppi.default_rank'") {
+        cppi.default_rank(value);
+    }
+    cppi.DefaultRankHost host = cppi.DefaultRankHost();
+    expect_error("ambiguous call to 'rank'") {
+        host.rank(value);
+    }
+    cppi.DefaultRankTemplateOnly box = cppi.DefaultRankTemplateOnly();
+    expect_error("ambiguous call to 'rank'") {
+        box.rank(value);
+    }
     return 0;
 }

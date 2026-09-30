@@ -1,5 +1,6 @@
 // C++20 equivalent of json_02_type_checks.cb (compile-time parity baseline)
 #include <cstdio>
+#include <string>
 #include <nlohmann/json.hpp>
 
 int main()

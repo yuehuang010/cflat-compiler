@@ -202,7 +202,6 @@ llvm::GlobalVariable* LLVMBackend::CreateGlobalVariable(TypeAndValue typeValue, 
             typeValue.GuardedBy = pendingGlobalGuardedBy;
 
         globalNamedVariable[typeValue.VariableName] = gVar;
-        globalVariableTypes[typeValue.VariableName] = typeValue;
 
         // q11 ruling point 4: a global / `static` owner is NEVER destructed - its lifetime cannot
         // be proven, so no exit-time teardown is synthesized. Core globals, externs and
@@ -222,6 +221,9 @@ llvm::GlobalVariable* LLVMBackend::CreateGlobalVariable(TypeAndValue typeValue, 
                 compileUnit, false});
         }
 
+        // Last use of typeValue: a header import registers thousands of these, so move it in.
+        auto& recordedType = globalVariableTypes[typeValue.VariableName];
+        recordedType = std::move(typeValue);
         return gVar;
     }
 

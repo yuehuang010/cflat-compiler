@@ -1207,8 +1207,10 @@ std::string LLVMBackend::ResolveEnumTypeName(const std::string& spelled) const
         std::string cur = spelled;
         for (int hop = 0; hop < 2; hop++)
         {
-            for (const auto& candidate : ScopedNameCandidates(cur))
-                if (enumBackingTypes.count(candidate)) return candidate;
+            if (const std::string enumKey = FirstVisibleScopedKey(cur,
+                    [this](const std::string& c) { return enumBackingTypes.count(c) != 0; });
+                !enumKey.empty())
+                return enumKey;
             std::string aliased = ResolveTypeAlias(cur);
             if (aliased == cur) break;
             cur = aliased;
@@ -2604,6 +2606,7 @@ nlohmann::json LLVMBackend::RecordToJson(const CRecordEntry& r, CCachePathTable*
         if (r.isPacked) j["pk"] = true;
         if (r.isTrivial) j["tv"] = true;
         if (r.isTriviallyCopyable) j["tc"] = true;
+        if (r.specialMembersPending) j["smp"] = true;
         if (r.sizeBytes != 0)  j["sz"] = r.sizeBytes;
         if (r.alignBytes != 0) j["al"] = r.alignBytes;
         // M4 class surface. Same rule as the ABI arrangement above: the warm path never rebuilds
@@ -2697,6 +2700,7 @@ LLVMBackend::CRecordEntry LLVMBackend::RecordFromJson(const SjVal& j, const CCac
         r.isPacked = j.value("pk", false);
         r.isTrivial = j.value("tv", false);
         r.isTriviallyCopyable = j.value("tc", false);
+        r.specialMembersPending = j.value("smp", false);
         r.sizeBytes  = j.value("sz", (uint64_t)0);
         r.alignBytes = j.value("al", (uint64_t)0);
         r.isPolymorphic         = j.value("po", false);
@@ -2865,6 +2869,8 @@ bool LLVMBackend::CHeaderDepFresh(const CHeaderDep& dep)
 
 void LLVMBackend::JoinCHeaderDiskCacheWriters()
 {
+        FlushCxxDemandVerdicts();
+        llvm::TimeTraceScope waitScope("CHeaderCacheWriterWait");
         for (auto& writer : cHeaderDiskCacheWriters_)
             if (writer.thread.joinable()) writer.thread.join();
         cHeaderDiskCacheWriters_.clear();
@@ -2898,9 +2904,11 @@ void LLVMBackend::ScheduleCHeaderDiskCacheWrite(
         if (haveGroup) ownedGroup = *requestGroup;
         CHeaderDiskCacheWriter& writer = cHeaderDiskCacheWriters_.emplace_back();
         writer.target = (cacheDir / std::format("{:016x}.json", diskKey)).lexically_normal();
+        const bool traceEnabled = llvm::timeTraceProfilerEnabled();
         writer.thread = std::thread(
-            [cacheDir, diskKey, mtime, contentHash, entry = std::move(entry),
+            [traceEnabled, cacheDir, diskKey, mtime, contentHash, entry = std::move(entry),
              requestKey, ownedGroup = std::move(ownedGroup), haveGroup]() mutable {
+                if (traceEnabled) llvm::timeTraceProfilerInitialize(500, "cflat-cache");
                 try
                 {
                     WriteCHeaderDiskCache(cacheDir, diskKey, mtime, contentHash, entry,
@@ -2911,6 +2919,7 @@ void LLVMBackend::ScheduleCHeaderDiskCacheWrite(
                     // Disk cache writes are best-effort; never let a worker exception terminate
                     // the compiler process.
                 }
+                if (traceEnabled) llvm::timeTraceProfilerFinishThread();
             });
     }
 
@@ -2918,7 +2927,7 @@ bool LLVMBackend::TryLoadCHeaderDiskCache(
         const std::filesystem::path& cacheDir,
         uint64_t diskKey,
         std::filesystem::file_time_type mtime,
-        uint64_t contentHash,
+        llvm::function_ref<uint64_t()> contentHash,
         CFileSigCacheEntry& out,
         const std::string& expectedRequestKey,
         bool requireBitcode,
@@ -3113,14 +3122,15 @@ bool LLVMBackend::TryLoadCHeaderDiskCache(
         auto storedMtime = j.value("mtime", int64_t{-1});
         auto storedHash  = j.value("hash",  uint64_t{0});
         bool mtimeOk = (storedMtime == (int64_t)mtime.time_since_epoch().count());
-        bool hashOk  = (storedHash  == contentHash);
+        const uint64_t currentHash = contentHash();
+        bool hashOk  = (storedHash  == currentHash);
         if (!mtimeOk && !hashOk) return cacheMiss("header stamp");
 
         // Any malformed/incompatible field must degrade to a cache miss (reparse), never abort
         // the compiler: the nlohmann accessors throw on a type mismatch, so guard the whole build.
         CFileSigCacheEntry entry;
         entry.mtime = mtime;
-        entry.hash  = contentHash;
+        entry.hash  = currentHash;
         entry.longDoubleWidth = j.value("ldw", (uint64_t)0);
         entry.longDoubleIsIEEEDouble = j.value("ldieee", false);
         entry.targetTriple = j.value("triple", std::string{});
@@ -3195,17 +3205,26 @@ bool LLVMBackend::TryLoadCHeaderDiskCache(
                     entry.functionPointerAbis.push_back(std::move(plan));
                 }
             entry.cxxDemandGroupKey = j.value("cxxdemand", std::string{});
+            if (j.contains("cxxbodies"))
+                for (const auto& body : j["cxxbodies"])
+                    entry.cxxBodyChecks.emplace_back(body.value("symbol", std::string{}),
+                                                     body.value("verdict", std::string{}));
             auto readReplayChunk = [](const SjVal& replay,
                                       cflat_cinterop::ExtractResult::DemandReplayChunk& chunk) {
                 chunk.order = replay.value("order", uint64_t{0});
                 chunk.source = replay.value("source", std::string{});
                 chunk.prefixSource = replay.value("prefix", std::string{});
+                if (replay.contains("poisoned"))
+                    for (const auto& body : replay["poisoned"])
+                        chunk.poisonedBodies.emplace_back(body.value("key", std::string{}),
+                                                         body.value("verdict", std::string{}));
                 const int64_t prefixAt = replay.value("prefixat", int64_t{-1});
                 chunk.prefixOffset = prefixAt < 0 ? std::string::npos : size_t(prefixAt);
                 chunk.markerPrefix = replay.value("marker", std::string{});
                 chunk.thunkSuffix = replay.value("thunk", std::string{});
                 chunk.wrapperBatch = replay.value("batch", false);
                 chunk.autoInstantiate = replay.value("auto", true);
+                chunk.completeSpecialMembers = replay.value("smc", false);
                 chunk.headerHarvest = replay.value("header", false);
                 chunk.wantMacros = replay.value("wantmacros", false);
                 chunk.requireInScope = replay.value("inscope", false);
@@ -3298,9 +3317,16 @@ bool LLVMBackend::TryLoadCHeaderDiskCache(
                     dep.path  = dj.value("f", std::string{});
                     dep.mtime = dj.value("mt", int64_t{0});
                     dep.hash  = dj.value("h",  uint64_t{0});
-                    if (!CHeaderDepFresh(dep)) return cacheMiss("dependency stamp");
                     entry.deps.push_back(std::move(dep));
                 }
+                // One stat per include (a hash only on mtime drift), so a few workers share them.
+                std::atomic<bool> stale{false};
+                RunParallel(entry.deps.size(), entry.deps.size() < 64 ? 1u : 4u,
+                            [&](size_t i, unsigned) {
+                    if (!stale.load(std::memory_order_relaxed) && !CHeaderDepFresh(entry.deps[i]))
+                        stale.store(true, std::memory_order_relaxed);
+                });
+                if (stale.load()) return cacheMiss("dependency stamp");
             }
         }
         catch (...) { return cacheMiss("incompatible entry"); }
@@ -3427,7 +3453,7 @@ std::shared_ptr<LLVMBackend::CSigBaseline> LLVMBackend::AcquireSigBaseline(
         for (const auto& s : sigs) body.push_back(SigToJson(s, &files));
         nlohmann::json doc;
         doc["files"] = files.paths;
-        doc["sigs"]  = body;
+        doc["sigs"]  = std::move(body);
         const std::string text = doc.dump();
         const std::string id = std::format("{:016x}", SigBaselineHash(text));
         const auto path = cacheDir / std::format("sigbase.{}.json", id);
@@ -3478,6 +3504,9 @@ void LLVMBackend::WriteCHeaderDiskCache(
         fs::create_directories(cacheDir, ec);
         if (ec) return;
 
+        llvm::TimeTraceScope storeScope("CHeaderCacheStore");
+        std::optional<llvm::TimeTraceScope> buildScope;
+        buildScope.emplace("CHeaderCacheJsonBuild");
         nlohmann::json j;
         // v69 makes cached C++ signature payloads key-pure by remapping foreign types on replay.
         // v70 maps a std::function return to its std.function specialization.
@@ -3567,53 +3596,53 @@ void LLVMBackend::WriteCHeaderDiskCache(
             }
             sigs.push_back(std::move(one));
         }
-        j["sigs"] = sigs;
+        j["sigs"] = std::move(sigs);
         nlohmann::json functionTemplates = nlohmann::json::array();
         for (const auto& t : entry.functionTemplates)
             functionTemplates.push_back(FunctionTemplateToJson(t, &files));
-        j["functionTemplates"] = functionTemplates;
+        j["functionTemplates"] = std::move(functionTemplates);
         j["classTemplateNames"] = entry.classTemplateNames;
         if (!entry.cxxGroupNamespaces.empty()) j["cxxGroupNamespaces"] = entry.cxxGroupNamespaces;
         nlohmann::json enums = nlohmann::json::array();
         for (const auto& e : entry.enums) enums.push_back(EnumToJson(e));
-        j["enums"] = enums;
+        j["enums"] = std::move(enums);
         nlohmann::json records = nlohmann::json::array();
         for (const auto& r : entry.records) records.push_back(RecordToJson(r, &files));
-        j["records"] = records;
+        j["records"] = std::move(records);
         nlohmann::json macros = nlohmann::json::array();
         for (const auto& m : entry.macros) macros.push_back(MacroToJson(m, &files));
-        j["macros"] = macros;
+        j["macros"] = std::move(macros);
         nlohmann::json funcMacros = nlohmann::json::array();
         for (const auto& m : entry.funcMacros) funcMacros.push_back(FuncMacroToJson(m, &files));
-        j["funcMacros"] = funcMacros;
+        j["funcMacros"] = std::move(funcMacros);
         nlohmann::json globals = nlohmann::json::array();
         for (const auto& g : entry.globals) globals.push_back(GlobalToJson(g));
-        j["globals"] = globals;
+        j["globals"] = std::move(globals);
         nlohmann::json recordAliases = nlohmann::json::array();
         for (const auto& a : entry.recordAliases)
             recordAliases.push_back({{"a", a.first}, {"t", a.second}});
-        j["recordAliases"] = recordAliases;
+        j["recordAliases"] = std::move(recordAliases);
         nlohmann::json typeAliases = nlohmann::json::array();
         for (const auto& a : entry.typeAliases)
             typeAliases.push_back(TypeAliasToJson(a, &files));
-        j["typeAliases"] = typeAliases;
+        j["typeAliases"] = std::move(typeAliases);
         nlohmann::json usingDirectives = nlohmann::json::array();
         for (const auto& d : entry.usingDirectives)
             usingDirectives.push_back({{"from", d.first}, {"to", d.second}});
-        j["usingDirectives"] = usingDirectives;
+        j["usingDirectives"] = std::move(usingDirectives);
         nlohmann::json namespaceAliases = nlohmann::json::array();
         for (const auto& a : entry.namespaceAliases)
             namespaceAliases.push_back({{"from", a.first}, {"to", a.second}});
-        j["namespaceAliases"] = namespaceAliases;
+        j["namespaceAliases"] = std::move(namespaceAliases);
         nlohmann::json classUsings = nlohmann::json::array();
         for (const auto& a : entry.classUsings)
             classUsings.push_back({{"from", a.first}, {"to", a.second}});
-        j["classUsings"] = classUsings;
+        j["classUsings"] = std::move(classUsings);
         nlohmann::json functionPointerAbis = nlohmann::json::array();
         for (const auto& p : entry.functionPointerAbis)
             functionPointerAbis.push_back({{"sig", p.signature}, {"rt", p.retType},
                                            {"pt", p.paramTypes}, {"abi", AbiToJson(p.abi)}});
-        j["functionPointerAbis"] = functionPointerAbis;
+        j["functionPointerAbis"] = std::move(functionPointerAbis);
         // Only the paths this entry added: the reader rebuilds the table as the baseline's paths
         // followed by these, which is the order they were interned in.
         j["files"] = std::vector<std::string>(files.paths.begin() + sharedPathCount,
@@ -3650,10 +3679,19 @@ void LLVMBackend::WriteCHeaderDiskCache(
                            {"hash", sidecarHash}};
         }
         if (!entry.cxxDemandGroupKey.empty()) j["cxxdemand"] = entry.cxxDemandGroupKey;
+        if (!entry.cxxBodyChecks.empty())
+        {
+            j["cxxbodies"] = nlohmann::json::array();
+            for (const auto& [symbol, verdict] : entry.cxxBodyChecks)
+                j["cxxbodies"].push_back({{"symbol", symbol}, {"verdict", verdict}});
+        }
         if (entry.cxxDemandReplayChunk.headerHarvest
             || !entry.cxxDemandReplayChunk.source.empty())
         {
             auto writeReplayChunk = [](const cflat_cinterop::ExtractResult::DemandReplayChunk& chunk) {
+                nlohmann::json poisoned = nlohmann::json::array();
+                for (const auto& [key, verdict] : chunk.poisonedBodies)
+                    poisoned.push_back({{"key", key}, {"verdict", verdict}});
                 nlohmann::json types = nlohmann::json::array();
                 for (const auto& type : chunk.typeRequests)
                     types.push_back({{"cxx", type.cxxSpelling}, {"cflat", type.cflatName}});
@@ -3664,11 +3702,13 @@ void LLVMBackend::WriteCHeaderDiskCache(
                                       {"col", probe.col}});
                 return nlohmann::json{
                     {"order", chunk.order}, {"source", chunk.source},
+                    {"poisoned", std::move(poisoned)},
                     {"prefix", chunk.prefixSource}, {"marker", chunk.markerPrefix},
                     {"prefixat", chunk.prefixOffset == std::string::npos
                                      ? int64_t{-1} : int64_t(chunk.prefixOffset)},
                     {"thunk", chunk.thunkSuffix}, {"wrappers", chunk.wrapperNames},
                     {"batch", chunk.wrapperBatch}, {"auto", chunk.autoInstantiate},
+                    {"smc", chunk.completeSpecialMembers},
                     {"types", std::move(types)}, {"header", chunk.headerHarvest},
                     {"wantmacros", chunk.wantMacros}, {"inscope", chunk.requireInScope},
                     {"checkscope", chunk.checkHeaderScope},
@@ -3692,17 +3732,20 @@ void LLVMBackend::WriteCHeaderDiskCache(
             nlohmann::json deps = nlohmann::json::array();
             for (const auto& d : entry.deps)
                 deps.push_back({{"f", d.path}, {"mt", d.mtime}, {"h", d.hash}});
-            j["deps"] = deps;
+            j["deps"] = std::move(deps);
         }
 
         // The content-addressed sidecar is committed first; this JSON file is the entry index.
+        buildScope.reset();
+        llvm::TimeTraceScope writeScope("CHeaderCacheJsonWritePublish");
         {
             std::ofstream f(tmpPath);
             if (!f.is_open())
             {
                 return;
             }
-            f << j;
+            const std::string text = j.dump();
+            f.write(text.data(), static_cast<std::streamsize>(text.size()));
             if (!f)
             {
                 f.close();
@@ -3958,7 +4001,8 @@ bool LLVMBackend::BindCanonicalCHeader(const std::filesystem::path& headerCanon,
         if (haveHash && !mtEc)
         {
             CFileSigCacheEntry diskEntry;
-            if (TryLoadCHeaderDiskCache(pkgCacheDir, diskKey, headerMtime, contentHash, diskEntry))
+            if (TryLoadCHeaderDiskCache(pkgCacheDir, diskKey, headerMtime,
+                                        [&] { return contentHash; }, diskEntry))
             {
                 std::lock_guard<std::mutex> lock(cFileSigCacheMutex_);
                 InsertCFileSigEntry(inMemKey, std::move(diskEntry), verbose);

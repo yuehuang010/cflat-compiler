@@ -77,9 +77,9 @@
         "VCPKG_HOST_TRIPLET": "arm64-osx",
         "VCPKG_INSTALLED_DIR": "$env{HOME}/.cflat-compiler-deps/vcpkg_installed",
         "ANTLR4_JAR": "/opt/homebrew/opt/antlr/antlr-4.13.2-complete.jar",
-        "LLVM_DIR": "$env{HOME}/.cflat-compiler-deps/llvm-23.1.0/lib/cmake/llvm",
-        "Clang_DIR": "$env{HOME}/.cflat-compiler-deps/llvm-23.1.0/lib/cmake/clang",
-        "CFLAT_LLD_BIN_DIR": "$env{HOME}/.cflat-compiler-deps/llvm-23.1.0/bin"
+        "LLVM_DIR": "$env{HOME}/.cflat-compiler-deps/llvm-23.1.0-pgo/lib/cmake/llvm",
+        "Clang_DIR": "$env{HOME}/.cflat-compiler-deps/llvm-23.1.0-pgo/lib/cmake/clang",
+        "CFLAT_LLD_BIN_DIR": "$env{HOME}/.cflat-compiler-deps/llvm-23.1.0-pgo/bin"
       },
       "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Darwin" }
     },

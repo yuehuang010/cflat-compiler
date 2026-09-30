@@ -1,11 +1,18 @@
 // C++20 equivalent of simdjson_02_ondemand.cb (compile-time parity baseline)
 #include <cstdint>
 #include <cstdio>
+#include <string>
 #include <simdjson.h>
 
-// The cflat case names the concrete x64 implementation (fallback) types; mirror that here.
+// The cflat case names the concrete implementation types (arm64 on Apple Silicon, fallback on x64);
+// mirror that here.
+#if defined(__aarch64__)
+using SjImplParser = simdjson::arm64::ondemand::parser;
+using SjImplDocument = simdjson::arm64::ondemand::document;
+#else
 using SjImplParser = simdjson::fallback::ondemand::parser;
 using SjImplDocument = simdjson::fallback::ondemand::document;
+#endif
 
 int main()
 {

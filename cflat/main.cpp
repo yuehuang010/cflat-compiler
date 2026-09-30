@@ -9,6 +9,7 @@
 #endif
 
 #include <iostream>
+#include <fstream>
 #include <filesystem>
 #include <stdlib.h>
 #include <vector>
@@ -125,6 +126,25 @@ static std::optional<IsolatedPolicy> ConfigureIsolatedMode(LLVMBackend& compiler
         reject("policy-restricted-language", "--isolated cannot be combined with native interop options");
 
     return compiler.GetIsolatedPolicy();
+}
+
+// Cheap text hint (not a parse): does this source have an `import` line naming a C/C++ header?
+// Only used to decide whether to start the macOS SDK lookup early; a miss just leaves the lookup
+// synchronous, so a wrong answer costs time, never correctness.
+static bool SourceImportsHeader(const std::string& path)
+{
+    std::ifstream in(path, std::ios::binary);
+    if (!in) return false;
+    std::string line;
+    for (size_t n = 0; n < 4096 && std::getline(in, line); ++n)
+    {
+        const size_t at = line.find("import");
+        if (at == std::string::npos) continue;
+        static const char* const kExt[] = { ".h\"", ".hpp\"", ".hh\"", ".hxx\"" };
+        for (const char* ext : kExt)
+            if (line.find(ext, at) != std::string::npos) return true;
+    }
+    return false;
 }
 
 int main(int argc, char* argv[])
@@ -536,7 +556,13 @@ int main(int argc, char* argv[])
     // at the matching exit. The TimeTraceScope annotations inside Compile feed it.
     bool ftimeTrace = args.hasFlag("ftime-trace");
     if (ftimeTrace)
-        llvm::timeTraceProfilerInitialize(500, "cflat");
+    {
+        // CFLAT_TIME_TRACE_GRANULARITY_US: drop scopes shorter than this (default 500 us).
+        unsigned granularityUs = 500;
+        if (const char* g = std::getenv("CFLAT_TIME_TRACE_GRANULARITY_US"); g && *g)
+            granularityUs = static_cast<unsigned>(std::strtoul(g, nullptr, 10));
+        llvm::timeTraceProfilerInitialize(granularityUs, "cflat");
+    }
     auto writeTimeTrace = [&](const std::string& tracePath)
     {
         if (!ftimeTrace) return;
@@ -634,6 +660,7 @@ int main(int argc, char* argv[])
         if (updateLocale && !compiler.WriteCollectedLocale(*updateLocale, args.hasFlag("verbose")))
             return 1;
 
+        if (ftimeTrace) compiler.JoinCHeaderDiskCacheWriters();
         writeTimeTrace("check.time-trace.json");
         return failures == 0 ? 0 : 1;
     }
@@ -693,6 +720,13 @@ int main(int argc, char* argv[])
 
         return -1;
     };
+    for (size_t i = 0; i < args.positionalCount(); ++i)
+        if (std::filesystem::path(*args.getPositional(i)).extension() == ".cb"
+            && SourceImportsHeader(*args.getPositional(i)))
+        {
+            PrefetchMacSdkPath();
+            break;
+        }
     auto compilerHolder = std::make_unique<LLVMBackend>();
     if (int rc = configureCompiler(*compilerHolder); rc >= 0) return rc;
     bool ok = compilerHolder->Compile(args);
@@ -760,6 +794,7 @@ int main(int argc, char* argv[])
     if (updateLocale && !compiler.WriteCollectedLocale(*updateLocale, args.hasFlag("verbose")))
         return 1;
 
+    if (ftimeTrace) compiler.JoinCHeaderDiskCacheWriters();
     writeTimeTrace(std::filesystem::path(*filename).stem().string() + ".time-trace.json");
 
     if (!ok)

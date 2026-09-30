@@ -4692,12 +4692,15 @@ extern int main()
     // An overload pair whose shortened call is ambiguous in C++ gets no default wrapper; the
     // header still binds, the spelled-out call picks its overload, and a sibling's wrapper works.
     int excAmbOut = 1;
+    expect_error("ambiguous call to 'cppexp.amb_pick': without its default arguments") {
+        cppexp.amb_pick(excAmbOut, 2);
+    }
     if (cppexp.amb_pick(excAmbOut, 2, 0.25) != 453)                            return 2225;
     if (cppexp.amb_sibling(4) != 34)                                           return 2226;
     cppexp.AmbHost excAmbHost = cppexp.AmbHost(1000);
     if (excAmbHost.sibling(4) != 1064)                                         return 2227;
     if (excAmbHost.pick(4, 0.25, 7) != 1261)                                   return 2228;
-    // The header batch emits this member wrapper before the later CFlat type request reaches it.
+    // An imported member wrapper remains available when a later type request refreshes its record.
     cppexp.LateMemberWrapper excLate = cppexp.LateMemberWrapper();
     if (excLate.add() != 10)                                                   return 2229;
 

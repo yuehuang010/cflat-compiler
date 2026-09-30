@@ -26,6 +26,14 @@ template<class T> struct Obs
     int n = 0;
     int observe(const T& k) { return one(k, 1); }
 };
+// Two members reach one failing helper; each use is refused at its own call.
+template<class T> struct Shared
+{
+    int n = 0;
+    int h() { return helper() + 1; }
+    int h2() { return helper() + 2; }
+    int helper() { return T::nope; }
+};
 // The const T& overload fails for an unrelated reason while the T&& one binds.
 template<class T> struct Obs3
 {
@@ -52,5 +60,24 @@ template<class T> struct ByVal
     void add(const T& t) { items.push_back(t); }
     void add(T t) { items.push_back(std::move(t)); }
     int size() const { return (int)items.size(); }
+};
+
+// Invalid virtual member of a class template the program constructs: the failure surfaces at the
+// member's use, directly or through a helper template (no import-time sweep).
+template <class T> struct VBad { static_assert(sizeof(T) == 3, "sbl vbad"); static const int value = 1; };
+template <class T> int vhelperT(T) { return VBad<T>::value; }
+template <class T> struct VirtBad
+{
+    int k = 6;
+    virtual ~VirtBad() {}
+    virtual int good() { return k; }
+    virtual int bad() { return VBad<T>::value; }
+};
+template <class T> struct VirtBad2
+{
+    int k = 6;
+    virtual ~VirtBad2() {}
+    virtual int good() { return k; }
+    virtual int bad() { return vhelperT<T>(T()); }
 };
 }

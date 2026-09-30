@@ -1,5 +1,6 @@
 // C++20 equivalent of json_03_build.cb (compile-time parity baseline)
 #include <cstdio>
+#include <string>
 #include <nlohmann/json.hpp>
 
 int main()

@@ -1,6 +1,7 @@
 // C++20 equivalent of torch_91_data_example.cb (clang++ parity baseline)
 #include <cstdint>
 #include <cstdio>
+#include <string>
 #include <torch/torch.h>
 
 using i64 = int64_t;

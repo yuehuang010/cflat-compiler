@@ -1,6 +1,7 @@
 // C++20 equivalent of torch_03_modules.cb (clang++ parity baseline)
 #include <cstdint>
 #include <cstdio>
+#include <string>
 #include <tuple>
 #include <torch/torch.h>
 

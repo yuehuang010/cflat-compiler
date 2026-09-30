@@ -474,7 +474,9 @@ fi
 # (6) with CFLAT_CACHE_BUILD_STAMP unset (default) entries survive a rebuild. Only (2) and (5)
 # set the switch. (7) an edit to a header reached only through another import's #include misses
 # that import's entries and demand companion, repeated edits do not grow the request entries,
-# and a touch-only change still hits.
+# and a touch-only change still hits. (8) a same-stamp primary-header edit invalidates the
+# demand companion even when no type request independently hashes the header. (9) a poisoned
+# body verdict from one program does not leak into another through a shared request entry.
 if [ "$RUN_MODE" -eq 0 ]; then
   cc_name="cxx_request_cache_consistency"
   cc_dir="$RES/$cc_name.d"
@@ -692,6 +694,59 @@ if [ "$RUN_MODE" -eq 0 ]; then
           fi
         fi
       fi
+    fi
+  fi
+  if [ -z "$cc_fail" ]; then
+    mkdir -p "$cc_dir/free/cache"
+    [ -d "$cc_dir/cache/runtime" ] && cp -R "$cc_dir/cache/runtime" "$cc_dir/free/cache/"
+    printf '%s\n' '#pragma once' 'namespace ccfree { inline int value() { return 1; } }' \
+      >"$cc_dir/free/free.h"
+    printf '%s\n' 'import cpp "free.h";' 'int main() { return ccfree.value(); }' \
+      >"$cc_dir/free/free.cb"
+    cc_free() {
+      CFLAT_CACHE_DIR="$cc_dir/free/cache" $TIMEOUT "$CFLAT" "$cc_dir/free/free.cb" -B -v \
+        -o "$cc_dir/free/free.bin" >"$cc_dir/free_$1.log" 2>&1 || return 1
+      "$cc_dir/free/free.bin"
+      local cc_rc="$?"
+      [ "$cc_rc" -eq "$2" ]
+    }
+    if ! cc_free seed 1 || ! cc_free warm 1; then
+      cc_fail="(8) free-function demand companion seed or warm compile failed"
+    elif ! grep -q 'full header parse count: 0' "$cc_dir/free_warm.log"; then
+      cc_fail="(8) the unchanged free-function compile reparsed (leg is vacuous)"
+    elif ! python3 -c 'import os,sys; p=sys.argv[1]; s=os.stat(p); b=open(p,"rb").read(); b=b.replace(b"return 1;",b"return 2;"); assert len(b)==s.st_size; open(p,"wb").write(b); os.utime(p,ns=(s.st_atime_ns,s.st_mtime_ns))' \
+        "$cc_dir/free/free.h"; then
+      cc_fail="(8) could not preserve the edited header stamp"
+    elif ! cc_free edited 2; then
+      cc_fail="(8) a same-size, same-mtime primary-header edit replayed a stale free-function body"
+    fi
+  fi
+  # (9) A body that failed for program a's [cpp] Key must not be replayed as poisoned into
+  # program b (a different Key) through an unrelated request entry both programs share.
+  if [ -z "$cc_fail" ]; then
+    mkdir -p "$cc_dir/pz/cache"
+    [ -d "$cc_dir/cache/runtime" ] && cp -R "$cc_dir/cache/runtime" "$cc_dir/pz/cache/"
+    printf '%s\n' '#pragma once' 'namespace pz {' 'struct HasV { int v_ = 4; };' \
+      'struct NoV { int w_ = 4; };' \
+      'template<class T> struct Obs { int n = 0; int observe(const T& k) { return k.v_ + 1; } };' \
+      'struct Foo { int x = 3; int get() { return x; } };' '}' >"$cc_dir/pz/pz.h"
+    printf '%s\n' 'import cpp "pz.h";' '[cpp] struct Key : pz.NoV { };' 'extern int main()' '{' \
+      '    pz.Obs<Key> o = default;' '    Key k = default;' \
+      '    expect_error("cannot be instantiated") {' '        int r = o.observe(k);' '    }' \
+      '    pz.Foo f = default;' '    return f.get();' '}' >"$cc_dir/pz/a.cb"
+    printf '%s\n' 'import cpp "pz.h";' '[cpp] struct Key : pz.HasV { };' 'extern int main()' '{' \
+      '    pz.Obs<Key> o = default;' '    Key k = default;' '    pz.Foo f = default;' \
+      '    int r = o.observe(k);' '    return f.get() + r;' '}' >"$cc_dir/pz/b.cb"
+    cc_pz() {
+      CFLAT_CACHE_DIR="$cc_dir/pz/cache" $TIMEOUT "$CFLAT" "$cc_dir/pz/$1.cb" -B \
+        -o "$cc_dir/pz/$1.bin" >"$cc_dir/pz_$1.log" 2>&1 || return 1
+      "$cc_dir/pz/$1.bin"
+      local cc_rc="$?"
+      [ "$cc_rc" -eq "$2" ]
+    }
+    if ! cc_pz a 3; then cc_fail="(9) program a (failing body under expect_error) failed"
+    elif ! cc_pz b 8; then
+      cc_fail="(9) program b replayed program a's poisoned body verdict from a shared entry"
     fi
   fi
   cat "$cc_dir"/*.log >"$cc_log" 2>/dev/null

@@ -4,6 +4,10 @@ import cpp "cpp_interop_sink_blame.h";
 // constructor; any other instantiation failure keeps its own text.
 extern int main()
 {
+    // Invalid unused bodies stay on the surface; only an actual call instantiates them.
+    sbl.Obs<int> unused = default;
+    sbl.Obs3<sbl.Key> unused3 = default;
+    if (unused.n != 0 || unused3.n != 0) return 1;
     expect_error("member 'observe' of C++ class 'sbl.Obs<int>' cannot be instantiated for these template arguments") {
         sbl.Obs<int> o = default;
         int l = 4;
@@ -13,6 +17,14 @@ extern int main()
         sbl.Obs3<sbl.Key> o = default;
         sbl.Key l = sbl.Key(4);
         int r = o.observe(l);
+    }
+    expect_error("member 'h' of C++ class 'sbl.Shared<int>' cannot be instantiated") {
+        sbl.Shared<int> s = default;
+        int a = s.h();
+    }
+    expect_error("member 'h2' of C++ class 'sbl.Shared<int>' cannot be instantiated") {
+        sbl.Shared<int> s = default;
+        int b = s.h2();
     }
     expect_error("(clang: call to implicitly-deleted copy constructor of 'struct Hold')") {
         sbl.Reg<sbl.Key> r = default;
@@ -28,6 +40,14 @@ extern int main()
         sbl.ByVal<sbl.Key> b = default;
         sbl.Key l = sbl.Key(4);
         b.add(l);
+    }
+    expect_error("clang reported an error inside the body it generated for 'sbl::VirtBad<int>::bad'") {
+        sbl.VirtBad<int> v = default;
+        int r = v.bad();
+    }
+    expect_error("failed to instantiate 'sbl::vhelperT'") {
+        sbl.VirtBad2<int> v = default;
+        int r = v.bad();
     }
     return 0;
 }

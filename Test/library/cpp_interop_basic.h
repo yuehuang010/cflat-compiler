@@ -630,6 +630,24 @@ namespace cppi
     inline UdcResB udc_fb(UdcView v) { UdcResB r; r.set((int)v.size()); return r; }
     inline UdcResV udc_fv(UdcView v) { UdcResV r; r.first = (int)v.size(); return r; }
 
+    // A failed default wrapper must still compete with a reference overload.
+    struct DefaultRankOnly { int value = 7; };
+    struct DefaultRankArg { int value = 9; DefaultRankArg() {} };
+    inline int default_rank(DefaultRankOnly v, DefaultRankArg a = DefaultRankArg())
+    { return v.value + a.value; }
+    inline int default_rank(const DefaultRankOnly&) { return 20; }
+    struct DefaultRankHost {
+        int rank(DefaultRankOnly v, DefaultRankArg a = DefaultRankArg()) const
+        { return v.value + a.value; }
+        int rank(const DefaultRankOnly&) const { return 30; }
+    };
+    template<class T> struct DefaultRankTemplate {
+        int rank(T v, DefaultRankArg a = DefaultRankArg()) const
+        { return v.value + a.value; }
+        int rank(const T&) const { return 20; }
+    };
+    using DefaultRankTemplateOnly = DefaultRankTemplate<DefaultRankOnly>;
+
     class PrivateDefaultArg
     {
     private:

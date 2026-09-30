@@ -389,6 +389,7 @@ namespace cflat_cinterop
         // by-value boundary as raw bytes; isTrivial additionally demands trivial default
         // construction, which the ABI does not care about.
         bool isTriviallyCopyable = false;
+        bool specialMembersPending = false;
         // M4 class surface. Every flag is Clang's own answer, never derived from the member list.
         bool isPolymorphic = false;         // has a virtual function or a virtual base
         bool hasBases = false;              // any base class
@@ -608,6 +609,9 @@ namespace cflat_cinterop
          * set skipFunctionBodies). Never set in LSP analysis - CodeGen is emit-only work.
          */
         bool emitDefinitions = false;
+        // Record the demand plan while keeping import-time body emission disabled.
+        bool demandOnlyDefinitions = false;
+        bool RecordsDefinitionDemand() const { return emitDefinitions || demandOnlyDefinitions; }
         /*
          * Bind inline definitions as callable WITHOUT running CodeGen. Set in LSP analysis, which
          * emits no IR and links nothing: the surface it reports must match what a real compile
@@ -655,6 +659,18 @@ namespace cflat_cinterop
         std::unordered_map<const clang::Decl*, std::vector<clang::Decl*>>* operatorIndex = nullptr;
         // Header extraction may need one retry after forcing a named specialization complete.
         bool autoInstantiateCxxTypes = true;
+        /*
+         * R1 demand-only special members. A live group's header harvest leaves the implicit /
+         * defaulted special members and inline-vtable virtuals of its records undefined and flags
+         * each record that has such work (RawRecord::specialMembersPending). A completion request
+         * (this flag on a type request) defines them for its marker records - and the in-scope
+         * bases and by-value fields those reach - before the members are harvested.
+         */
+        bool completeCxxSpecialMembers = false;
+        // A live group's records with deferred special members, by CFlat name: filled by the
+        // header harvest, read by a completion request (whose markers are placeholders, so a
+        // private nested record completes too).
+        std::unordered_map<std::string, const clang::CXXRecordDecl*>* specialMemberRecords = nullptr;
         /*
          * Destination for a PCH built from `source` (an include-only prologue) instead of an
          * extraction. The caller supplies driver args selecting `-x c++-header`; the output path
@@ -725,6 +741,8 @@ namespace cflat_cinterop
             std::vector<std::string> wrapperNames;
             std::vector<std::string> inScopeDirs;
             std::vector<CxxMacroProbe> macroProbes;
+            // Failed helper bodies from this request must keep their original replay verdict.
+            std::vector<std::pair<std::string, std::string>> poisonedBodies;
             std::string scopeHeaderPath;
             bool headerHarvest = false;
             bool wantMacros = false;
@@ -732,6 +750,7 @@ namespace cflat_cinterop
             bool checkHeaderScope = false;
             bool wrapperBatch = false;
             bool autoInstantiate = true;
+            bool completeSpecialMembers = false;
             // Chunks parsed right after this one by the same step (a header harvest's
             // default-argument wrapper batch); stored with it, replayed after it.
             std::vector<DemandReplayChunk> follow;

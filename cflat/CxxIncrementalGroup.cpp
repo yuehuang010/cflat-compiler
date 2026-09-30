@@ -16,6 +16,7 @@
 #include "clang/Lex/PPCallbacks.h"
 #include "clang/Lex/Preprocessor.h"
 #include "clang/Lex/Token.h"
+#include "clang/Options/Options.h"
 #include "clang/Parse/Parser.h"
 #include "clang/Sema/Sema.h"
 #include "llvm/Support/Error.h"
@@ -26,6 +27,7 @@
 #include "llvm/Bitcode/BitcodeWriter.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/Linker/Linker.h"
+#include "llvm/Option/ArgList.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/raw_ostream.h"
 
@@ -42,6 +44,23 @@
 
 namespace
 {
+    std::string BodyVerdictKey(const clang::FunctionDecl* function)
+    {
+        std::string key = function->getQualifiedNameAsString() + "|"
+            + function->getType().getCanonicalType().getAsString();
+        if (const auto* args = function->getTemplateSpecializationArgs())
+        {
+            llvm::raw_string_ostream out(key);
+            const auto& policy = function->getASTContext().getPrintingPolicy();
+            for (const auto& arg : args->asArray())
+            {
+                out << '|';
+                arg.print(policy, out, true);
+            }
+        }
+        return key;
+    }
+
     /*
      * A failed Parse erases every TU lookup entry whose visible declaration the failed chunk
      * made. A chunk that reopens a namespace replaces the earlier redeclaration there, so the
@@ -361,17 +380,22 @@ namespace
     public:
         clang::Preprocessor& pp;
         std::vector<std::string>& files;
+        std::vector<clang::FileID>& fileIds;
         IncludeGraph& graph;
 
-        IncludeCollector(clang::Preprocessor& p, std::vector<std::string>& f, IncludeGraph& g)
-            : pp(p), files(f), graph(g) {}
+        IncludeCollector(clang::Preprocessor& p, std::vector<std::string>& f,
+                         std::vector<clang::FileID>& ids, IncludeGraph& g)
+            : pp(p), files(f), fileIds(ids), graph(g) {}
 
         void FileChanged(clang::SourceLocation loc, FileChangeReason reason,
                          clang::SrcMgr::CharacteristicKind, clang::FileID) override
         {
             if (reason != EnterFile) return;
-            llvm::StringRef file = pp.getSourceManager().getFilename(loc);
-            if (!file.empty()) files.push_back(file.str());
+            clang::SourceManager& sm = pp.getSourceManager();
+            llvm::StringRef file = sm.getFilename(loc);
+            if (file.empty()) return;
+            files.push_back(file.str());
+            fileIds.push_back(sm.getFileID(loc));
         }
 
         void InclusionDirective(clang::SourceLocation hashLoc, const clang::Token&,
@@ -529,6 +553,7 @@ namespace
             std::vector<clang::Token> tokens;
             clang::FPOptions fpo;
         };
+        std::unordered_map<std::string, std::string> replayedPoison;
         bool active = false;                 // only during the group's header Parse
         clang::Parser* parser = nullptr;
         clang::Sema* sema = nullptr;
@@ -537,6 +562,8 @@ namespace
         unsigned depth = 0;
         std::unordered_map<clang::FunctionDecl*, Body> bodies;
         cflat_cinterop::CxxDemandPlan* plan = nullptr;   // the group's, for the demand pass
+        const std::unordered_map<const clang::FunctionDecl*, std::string>* poisoned = nullptr;
+        std::string poisonDiagnostic;
         std::unordered_set<const clang::FunctionDecl*> walked;
         std::unordered_set<const clang::CXXRecordDecl*> vtableRecords;
 
@@ -557,7 +584,8 @@ namespace
         {
             if (!active || capturing != nullptr || parser == nullptr) return false;
             auto* fd = llvm::dyn_cast<clang::FunctionDecl>(decl);
-            if (fd == nullptr || fd->isTemplated() || !fd->isInlined()
+            if (fd == nullptr) return false;
+            if (fd->isTemplated() || !fd->isInlined() || fd->getReturnType()->isUndeducedType()
                 || fd->getTemplateSpecializationKind() != clang::TSK_Undeclared
                 || fd->getParentFunctionOrMethod() != nullptr || fd->hasAttr<clang::UsedAttr>()
                 || fd->isMultiVersion())
@@ -642,6 +670,8 @@ namespace
                 Note(e->getTemporary()->getDestructor());
                 return true;
             }
+            bool recovery = false;
+            bool VisitRecoveryExpr(clang::RecoveryExpr*) { recovery = true; return true; }
             bool VisitVarDecl(clang::VarDecl* var)
             {
                 if (const auto* record = var->getType()->getAsCXXRecordDecl())
@@ -740,6 +770,15 @@ namespace
                                       std::string& failure)
         {
             unsigned parsed = 0;
+            poisonDiagnostic.clear();
+            clang::Scope tuScope(nullptr, clang::Scope::DeclScope, sema->getDiagnostics());
+            const bool lendScope = sema->TUScope == nullptr;
+            if (lendScope) sema->TUScope = &tuScope;
+            struct ScopeReset
+            {
+                clang::Sema& sema; bool active;
+                ~ScopeReset() { if (active) sema.TUScope = nullptr; }
+            } scopeReset{*sema, lendScope};
             clang::ASTContext& ctx = sema->getASTContext();
             auto addRecord = [&](const clang::CXXRecordDecl* record, bool forVTable) {
                 if (record == nullptr || !record->hasDefinition()) return;
@@ -761,12 +800,47 @@ namespace
                 const clang::FunctionDecl* next = work.back();
                 work.pop_back();
                 const clang::FunctionDecl* definition = nullptr;
-                if (next == nullptr || !next->isDefined(definition)) continue;
+                if (next == nullptr) continue;
+                if (auto bad = replayedPoison.find(BodyVerdictKey(next)); bad != replayedPoison.end())
+                {
+                    if (failure.empty()) failure = next->getQualifiedNameAsString();
+                    if (poisonDiagnostic.empty()) poisonDiagnostic = bad->second;
+                    continue;
+                }
+                if (poisoned != nullptr)
+                    if (auto bad = poisoned->find(next); bad != poisoned->end())
+                    {
+                        if (failure.empty()) failure = next->getQualifiedNameAsString();
+                        if (poisonDiagnostic.empty()) poisonDiagnostic = bad->second;
+                        continue;
+                    }
+                clang::DiagnosticErrorTrap trap(sema->getDiagnostics());
+                sema->MarkFunctionReferenced(next->getLocation(),
+                                             const_cast<clang::FunctionDecl*>(next));
+                sema->PerformPendingInstantiations();
+                if (trap.hasErrorOccurred())
+                {
+                    if (failure.empty()) failure = next->getQualifiedNameAsString();
+                    continue;
+                }
+                // An instantiation that failed in an earlier check stays invalid; its trap fired then.
+                if (next->isInvalidDecl())
+                {
+                    if (failure.empty()) failure = next->getQualifiedNameAsString();
+                    continue;
+                }
+                if (!next->isDefined(definition)) continue;
                 auto* target = const_cast<clang::FunctionDecl*>(definition);
                 if (bodies.count(target) != 0 && ParseOne(target, failure)) ++parsed;
                 if (target->getBody() == nullptr || !walked.insert(target).second) continue;
                 CalleeWalk walk;
                 walk.TraverseStmt(target->getBody());
+                // Error nodes mean clang diagnosed this body earlier, where no check listened.
+                if (walk.recovery)
+                {
+                    if (failure.empty()) failure = target->getQualifiedNameAsString();
+                    continue;
+                }
                 work.insert(work.end(), walk.found.begin(), walk.found.end());
                 // A variable that body names must be shown to CodeGen, or it stays external.
                 for (clang::VarDecl* var : walk.storage)
@@ -1069,6 +1143,33 @@ namespace
         return result;
     }
 
+    /*
+     * A cc1-only flag that reaches the driver without -Xclang is unknown to it and dropped - but
+     * the driver first ranks every option spelling for a "did you mean" hint, ~0.3 ms per flag.
+     * Drop them here with the driver's own table and visibility. That error also skipped the
+     * default config-file search, so --no-default-config keeps the driver's input identical.
+     */
+    void DropDriverUnknownArgs(std::vector<std::string>& args)
+    {
+        std::vector<const char*> argv;
+        argv.reserve(args.size());
+        for (const std::string& arg : args) argv.push_back(arg.c_str());
+        unsigned missingIndex = 0, missingCount = 0;
+        const llvm::opt::InputArgList parsed = clang::getDriverOptTable().ParseArgs(
+            argv, missingIndex, missingCount, llvm::opt::Visibility(clang::options::ClangOption));
+        std::vector<char> unknown(args.size(), 0);
+        bool any = false;
+        for (const llvm::opt::Arg* arg : parsed.filtered(clang::options::OPT_UNKNOWN))
+            if (arg->getIndex() < unknown.size()) { unknown[arg->getIndex()] = 1; any = true; }
+        if (!any) return;
+        std::vector<std::string> kept;
+        kept.reserve(args.size() + 1);
+        for (size_t i = 0; i < args.size(); ++i)
+            if (unknown[i] == 0) kept.push_back(std::move(args[i]));
+        kept.push_back("--no-default-config");
+        args = std::move(kept);
+    }
+
     bool MergeBitcode(const std::string& first, const std::string& second,
                       std::string& merged)
     {
@@ -1102,6 +1203,7 @@ struct CxxIncrementalGroup::Impl
     clang::TranslationUnitDecl* headerRoot = nullptr;
     llvm::Module* headerModule = nullptr;
     std::vector<std::string> includedFiles;
+    std::vector<clang::FileID> includedFileIds;   // parallel to includedFiles
     IncludeGraph includeGraph;
     std::unordered_set<std::string> prefixSources;
     bool verbose = false;
@@ -1125,6 +1227,8 @@ struct CxxIncrementalGroup::Impl
     bool demandHeaderHarvested = false;
     // Free-operator candidates per header TU root (ExtractRequest::operatorIndex).
     std::unordered_map<const clang::Decl*, std::vector<clang::Decl*>> operatorIndex;
+    // Header records whose special members the harvest deferred (ExtractRequest).
+    std::unordered_map<std::string, const clang::CXXRecordDecl*> specialMemberRecords;
     LazyBodies lazy;
 
     ~Impl()
@@ -1151,7 +1255,10 @@ std::unique_ptr<CxxIncrementalGroup> CxxIncrementalGroup::Create(
     const cflat_cinterop::ExtractRequest* macroReq,
     cflat_cinterop::ExtractResult* macroOut)
 {
+    std::optional<llvm::TimeTraceScope> setupScope;
+    setupScope.emplace("CxxGroupSetup");
     std::vector<std::string> storage = InterpreterArgs(args);
+    DropDriverUnknownArgs(storage);
     std::vector<const char*> cargs;
     cargs.reserve(storage.size());
     for (const std::string& arg : storage) cargs.push_back(arg.c_str());
@@ -1207,12 +1314,14 @@ std::unique_ptr<CxxIncrementalGroup> CxxIncrementalGroup::Create(
         consumers.push_back(std::move(recorder));
         consumers.push_back(std::move(guarded));
     }
+    setupScope.reset();
+    llvm::TimeTraceScope finalizeScope("CxxGroupHeaderFinalize");
     {
         DiagnosticScope diagnostics(impl->interpreter->getCompilerInstance()->getDiagnostics());
         impl->interpreter->getCompilerInstance()->getPreprocessor().addPPCallbacks(
             std::make_unique<IncludeCollector>(
                 impl->interpreter->getCompilerInstance()->getPreprocessor(),
-                impl->includedFiles, impl->includeGraph));
+                impl->includedFiles, impl->includedFileIds, impl->includeGraph));
         /*
          * Skip the bodies of inline non-template functions, keeping their tokens: the demand
          * pass parses only the ones the program reaches (LazyBodies). Request chunks parse all.
@@ -1227,6 +1336,7 @@ std::unique_ptr<CxxIncrementalGroup> CxxIncrementalGroup::Create(
             stopMacroCollector = cflat_cinterop::AttachCxxMacroPrepass(pp, *macroReq, *macroOut);
         lazy.parser = static_cast<clang::Parser*>(pp.getCodeCompletionHandler());
         lazy.sema = &ci.getSema();
+        lazy.poisoned = &impl->poisoned;
         // CFLAT_CXX_EAGER_BODIES=1 parses every body up front (A/B and bisecting a late body).
         if (lazy.parser != nullptr && !cflat_cinterop::CxxEagerBodies())
         {
@@ -1323,8 +1433,9 @@ bool CxxIncrementalGroup::HarvestHeader(const cflat_cinterop::ExtractRequest& re
     DiagnosticScope diagnostics(impl_->interpreter->getCompilerInstance()->getDiagnostics());
     diagnostics.consumer.causes = &impl_->causes;
     cflat_cinterop::ExtractRequest effective = req;
-    if (effective.emitDefinitions) effective.demandPlan = &impl_->plan;
+    if (effective.RecordsDefinitionDemand()) effective.demandPlan = &impl_->plan;
     effective.operatorIndex = &impl_->operatorIndex;
+    effective.specialMemberRecords = &impl_->specialMemberRecords;
     const bool harvested = cflat_cinterop::ExtractCxxIncremental(
         effective, *impl_->interpreter->getCompilerInstance(), impl_->headerRoot,
         impl_->headerRoot, {}, impl_->headerModule, out, error, true);
@@ -1332,6 +1443,20 @@ bool CxxIncrementalGroup::HarvestHeader(const cflat_cinterop::ExtractRequest& re
     if (harvested && out.demandRecorded) impl_->demandHeaderHarvested = true;
     out.includedFiles = impl_->includedFiles;
     return harvested;
+}
+
+std::vector<std::string_view> CxxIncrementalGroup::IncludedFileBuffers() const
+{
+    std::vector<std::string_view> buffers;
+    if (impl_ == nullptr) return buffers;
+    const clang::SourceManager& sm = impl_->interpreter->getCompilerInstance()->getSourceManager();
+    buffers.reserve(impl_->includedFileIds.size());
+    for (clang::FileID id : impl_->includedFileIds)
+    {
+        std::optional<llvm::StringRef> data = sm.getBufferDataOrNone(id);
+        buffers.push_back(data ? std::string_view(data->data(), data->size()) : std::string_view());
+    }
+    return buffers;
 }
 
 bool CxxIncrementalGroup::PrecheckSpelling(const std::string& spelling, std::string& error)
@@ -1412,6 +1537,9 @@ bool CxxIncrementalGroup::ParseRequest(const cflat_cinterop::ExtractRequest& req
                                        std::string& error)
 {
     impl_->lastDiagnostics.clear();
+    // Bodies already poisoned before this parse; the replay entry records only this parse's own.
+    std::unordered_set<const clang::FunctionDecl*> poisonedBefore;
+    for (const auto& [function, verdict] : impl_->poisoned) poisonedBefore.insert(function);
     std::string typeKey;
     for (const auto& request : req.cxxTypeRequests)
         typeKey += request.cflatName + "\n";
@@ -1620,7 +1748,16 @@ bool CxxIncrementalGroup::ParseRequest(const cflat_cinterop::ExtractRequest& req
         if (!recoverDeclarations || attempt >= 3
             || !DropBlamedDeclarations(chunk, diagnostics.consumer.blamedLines,
                                        diagnostics.consumer.failedMembers, kept, dropped))
+        {
+            // A later chunk's use raises no error again; the demand check must still see it.
+            for (clang::FunctionDecl* function : diagnostics.consumer.failedFunctions)
+            {
+                auto cause = impl_->causes.find(function);
+                impl_->poisoned.emplace(function, cause != impl_->causes.end()
+                                                      ? cause->second : error);
+            }
             return false;
+        }
         emptyFailedFunctions();
         if (recoveredError.empty()) recoveredError = diagnostics.consumer.incompleteRecordError;
         if (impl_->verbose)
@@ -1647,6 +1784,7 @@ bool CxxIncrementalGroup::ParseRequest(const cflat_cinterop::ExtractRequest& req
     effective.errorCauses = &impl_->causes;
     if (effective.emitDefinitions || wrapperBatch) effective.demandPlan = &impl_->plan;
     effective.operatorIndex = &impl_->operatorIndex;
+    effective.specialMemberRecords = &impl_->specialMemberRecords;
     // A retry renamed the thunks with its tag; the extractor looks them up by that name.
     if (parsedAttempt > 0 && !effective.cxxThunkSuffix.empty())
         effective.cxxThunkSuffix = PrepareRetryChunk(effective.cxxThunkSuffix, parsedAttempt);
@@ -1702,6 +1840,15 @@ bool CxxIncrementalGroup::ParseRequest(const cflat_cinterop::ExtractRequest& req
         replay.wrapperNames = req.cxxFunctionWrapperNames;
         replay.wrapperBatch = req.cxxWrapperBatch;
         replay.autoInstantiate = req.autoInstantiateCxxTypes;
+        replay.completeSpecialMembers = req.completeCxxSpecialMembers;
+        /*
+         * Only bodies that failed in THIS chunk's parse: a verdict from an earlier chunk or a
+         * demand check belongs to another request (possibly another program's [cpp] source).
+         */
+        for (const auto& [function, verdict] : impl_->poisoned)
+            if (!poisonedBefore.contains(function))
+                replay.poisonedBodies.emplace_back(BodyVerdictKey(function), verdict);
+        std::sort(replay.poisonedBodies.begin(), replay.poisonedBodies.end());
         impl_->demandChunkSources.push_back(replay.source);
     }
     if (harvested && out.firstError.empty()) out.firstError = recoveredError;
@@ -1833,6 +1980,58 @@ const std::string& CxxIncrementalGroup::LastRequestDiagnostics() const
 unsigned CxxIncrementalGroup::DemandChunks() const
 {
     return impl_->plan.recordedChunks;
+}
+
+void CxxIncrementalGroup::RestorePoisonedBodies(
+    const std::vector<std::pair<std::string, std::string>>& verdicts)
+{
+    for (const auto& [key, verdict] : verdicts) impl_->lazy.replayedPoison.emplace(key, verdict);
+}
+
+int CxxIncrementalGroup::CheckDemand(const std::string& symbol, std::string& error)
+{
+    std::string name = symbol;
+    if (auto it = impl_->plan.renamed.find(name); it != impl_->plan.renamed.end())
+        name = it->second;
+    auto it = impl_->plan.bound.find(name);
+    if (it == impl_->plan.bound.end()) return 0;
+    auto* fd = llvm::dyn_cast<clang::FunctionDecl>(
+        clang::GlobalDecl::getFromOpaquePtr(it->second).getDecl());
+    if (fd == nullptr) return 1;
+    if (auto poisoned = impl_->poisoned.find(fd); poisoned != impl_->poisoned.end())
+    {
+        error = "clang: " + poisoned->second;
+        return -1;
+    }
+    DiagnosticScope diagnostics(impl_->interpreter->getCompilerInstance()->getDiagnostics());
+    diagnostics.consumer.causes = &impl_->causes;
+    llvm::TimeTraceScope scope("CxxDemandCheck", name);
+    std::string failure;
+    impl_->lazy.plan = &impl_->plan;
+    impl_->lazy.MaterializeReachable({fd}, failure);
+    if (failure.empty() && diagnostics.consumer.firstError.empty()) return 1;
+    // Sema can instantiate a helper before the callee walk reaches it. Keep its cold verdict.
+    if (impl_->lazy.poisonDiagnostic.empty())
+        for (const auto* failed : diagnostics.consumer.failedFunctions)
+            if (auto original = impl_->lazy.replayedPoison.find(BodyVerdictKey(failed));
+                original != impl_->lazy.replayedPoison.end())
+            {
+                impl_->lazy.poisonDiagnostic = original->second;
+                break;
+            }
+    error = "clang: " + (!impl_->lazy.poisonDiagnostic.empty() ? impl_->lazy.poisonDiagnostic
+        : diagnostics.consumer.allText.empty()
+        ? (impl_->lazy.poisonDiagnostic.empty() ? "failed to instantiate '" + failure + "'"
+                                               : impl_->lazy.poisonDiagnostic)
+        : diagnostics.consumer.allText);
+    for (const auto* failed : diagnostics.consumer.failedFunctions)
+    {
+        auto cause = impl_->causes.find(failed);
+        impl_->poisoned.emplace(failed, cause == impl_->causes.end() ? error.substr(7)
+                                                                  : cause->second);
+    }
+    impl_->poisoned.emplace(fd, error.substr(7));
+    return -1;
 }
 
 bool CxxIncrementalGroup::EmitDemandCompanion(const std::vector<std::string>& demand,

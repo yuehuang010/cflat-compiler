@@ -194,6 +194,16 @@ bool LLVMBackend::ArrayViewElementMismatch(const LLVMBackend::TypeAndValue& dest
         return true;
     }
 
+// Spellings the grammar reserves as primitive type keywords: no user declaration can carry them.
+static bool IsKeywordPrimitiveSpelling(const std::string& name)
+{
+    static const std::unordered_set<std::string_view> keywords = {
+        "void", "char", "short", "int", "long", "float", "double",
+        "i8", "i16", "i32", "i64", "i128", "u8", "u16", "u32", "u64", "u128",
+    };
+    return name.size() <= 6 && keywords.count(std::string_view(name)) != 0;
+}
+
 llvm::Type* LLVMBackend::GetType(const LLVMBackend::TypeAndValue& typeAndValue, llvm::Type* autoType, bool allowPointer) const
 {
         if (typeAndValue.IsFunctionPointer)
@@ -222,7 +232,26 @@ llvm::Type* LLVMBackend::GetType(const LLVMBackend::TypeAndValue& typeAndValue, 
         // through an alias (`using D = Dir;`) or spelled unqualified from inside its namespace,
         // so go through the scoped/alias walk rather than a bare exact-key lookup.
         std::string resolvedTypeName = typeName;
-        if (!resolvedTypeName.empty())
+        // A keyword primitive spelling (int, double, u8, i64, ...) that no enum, alias, struct
+        // or interface registered under that exact name at file scope resolves to itself: skip
+        // the scoped alias / enum / interface walks, which allocate candidate lists per call.
+        bool plainPrimitive = false;
+        if (currentNamespace_.empty() && IsKeywordPrimitiveSpelling(typeName))
+        {
+            plainPrimitive = enumBackingTypes.find(typeName) == enumBackingTypes.end()
+                && typeAliases.find(typeName) == typeAliases.end()
+                && dataStructures.find(typeName) == dataStructures.end()
+                && interfaceTable.find(typeName) == interfaceTable.end()
+                && gts.genericInterfaceInstances.count(typeName) == 0;
+            if (plainPrimitive)
+                for (const auto& frame : aliasScopeStack_)
+                    if (frame.typeAliases.find(typeName) != frame.typeAliases.end())
+                    {
+                        plainPrimitive = false;
+                        break;
+                    }
+        }
+        if (!resolvedTypeName.empty() && !plainPrimitive)
         {
             auto it = enumBackingTypes.find(resolvedTypeName);
             if (it != enumBackingTypes.end())
@@ -236,7 +265,8 @@ llvm::Type* LLVMBackend::GetType(const LLVMBackend::TypeAndValue& typeAndValue, 
         // lambda parameter and a tuple/signature component lower exactly as a declaration does.
         bool simdFromSpelling = false;
         uint64_t simdSpellingLanes = 0;
-        if (std::string simdElem; DecodeSimdSpelling(resolvedTypeName, simdElem, simdSpellingLanes))
+        if (std::string simdElem;
+            !plainPrimitive && DecodeSimdSpelling(resolvedTypeName, simdElem, simdSpellingLanes))
         {
             resolvedTypeName = simdElem;
             simdFromSpelling = true;
@@ -246,7 +276,7 @@ llvm::Type* LLVMBackend::GetType(const LLVMBackend::TypeAndValue& typeAndValue, 
         // OR it onto the typeAndValue pointer flags below (storage stays string-shaped).
         int aliasPtrDepth = 0;
         std::vector<uint64_t> aliasArrayDims;  // outer dimension first, from an array alias
-        if (!resolvedTypeName.empty())
+        if (!resolvedTypeName.empty() && !plainPrimitive)
         {
             std::string aliasedName = ResolveTypeAlias(resolvedTypeName);
             if (aliasedName != resolvedTypeName)
@@ -274,14 +304,22 @@ llvm::Type* LLVMBackend::GetType(const LLVMBackend::TypeAndValue& typeAndValue, 
         // Namespace-relative type reference: a bare "_SystemInfo" inside namespace
         // os.windows resolves to "os.windows._SystemInfo". Only accept a resolution
         // that names a type, so a sibling function never hijacks a type name.
-        if (!resolvedTypeName.empty()
-            && dataStructures.find(resolvedTypeName) == dataStructures.end()
-            && !HasInterface(resolvedTypeName))
+        // -1 = unknown; else HasInterface(resolvedTypeName) for the current spelling.
+        int resolvedIsInterface = -1;
+        if (!resolvedTypeName.empty() && !plainPrimitive
+            && dataStructures.find(resolvedTypeName) == dataStructures.end())
         {
-            std::string nsResolved = ResolveQualifiedName(resolvedTypeName);
-            if (nsResolved != resolvedTypeName
-                && (dataStructures.count(nsResolved) || HasInterface(nsResolved)))
-                resolvedTypeName = nsResolved;
+            resolvedIsInterface = HasInterface(resolvedTypeName) ? 1 : 0;
+            if (resolvedIsInterface == 0)
+            {
+                std::string nsResolved = ResolveQualifiedName(resolvedTypeName);
+                if (nsResolved != resolvedTypeName
+                    && (dataStructures.count(nsResolved) || HasInterface(nsResolved)))
+                {
+                    resolvedTypeName = nsResolved;
+                    resolvedIsInterface = -1;
+                }
+            }
         }
 
         // Type lookup needs imported layout, while members are demanded at their use sites.
@@ -293,8 +331,10 @@ llvm::Type* LLVMBackend::GetType(const LLVMBackend::TypeAndValue& typeAndValue, 
         auto dsIt = dataStructures.find(resolvedTypeName);
         // A generic interface instantiation lowers to a fat pointer even before its interfaceTable
         // entry exists (the forward-ref scan materializes signatures first).
-        bool isInterface = HasInterface(resolvedTypeName)
-                        || gts.genericInterfaceInstances.count(resolvedTypeName) > 0;
+        bool isInterface = !plainPrimitive
+                        && ((resolvedIsInterface >= 0 ? resolvedIsInterface == 1
+                                                      : HasInterface(resolvedTypeName))
+                            || gts.genericInterfaceInstances.count(resolvedTypeName) > 0);
         bool skipPointerWrap = false;
 
         if (resolvedTypeName == "void") { type = builder->getVoidTy(); }

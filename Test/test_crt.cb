@@ -15,6 +15,7 @@ import "test_helper.cb";
 import "math.h";
 import "stdlib.h";
 import "time.h";
+import "library/c_keyword_typedefs.h";
 
 // qsort comparator: ascending integer order. Receives pointers to two array elements.
 int int_cmp(const void* a, const void* b)
@@ -52,6 +53,17 @@ extern int main()
     bool sorted = nums[0] == 1 && nums[1] == 2 && nums[2] == 5
                && nums[3] == 8 && nums[4] == 9;
     total++; passed += Test("qsort ascending order", sorted, true);
+
+    // C typedefs / enums spelled like keyword primitives (u8 / i16 struct / u16 enum / i32) win over the builtin.
+    u8 kwA = (u8)255;
+    i16 kwP = default; kwP.x = 3; kwP.y = 4;
+    u16 kwC = KW_RED;
+    i32 kwZ = 9;
+    long kwL = KW_BC;
+    total++; passed += Test("C typedef u8 / i16 struct", (int)kwA == 255 && kwP.x + kwP.y == 7, true);
+    total++; passed += Test("C typedef u16 enum / i32", (int)kwC == 200 && kwZ == 9, true);
+    total++; passed += Test("C enums beside keyword typedefs",
+        kwL == 5000000000 && (int)KW_BB == -3 && (int)KW_SB == 250 && KW_ANON2 == 12, true);
 
     printf("\n%d / %d tests passed.\n", passed, total);
     return passed == total ? 0 : 1;

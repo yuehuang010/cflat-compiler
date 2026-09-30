@@ -2887,6 +2887,8 @@ static void PruneStaleCxxDemandCompanions(const std::filesystem::path& current,
  */
 bool LLVMBackend::EmitCxxDemandCompanions()
 {
+    // Every body verdict is known once code generation ends; write them while the companions emit.
+    FlushCxxDemandVerdicts();
     if (cxxDemandRetry_) return false;
     auto anyGroup = [&]() {
         for (const auto& [key, group] : cxxIncrementalGroups_)
@@ -3066,6 +3068,7 @@ bool LLVMBackend::EmitCxxDemandCompanions()
 int LLVMBackend::RunLinkerProcess(llvm::StringRef program, llvm::ArrayRef<llvm::StringRef> args,
                                   std::string& error)
 {
+    llvm::TimeTraceScope linkScope("LinkerProcess", program);
     if (!cxxDemandReplayed_ || cxxDemandBypass_)
         return llvm::sys::ExecuteAndWait(program, args, std::nullopt, {}, 0, 0, &error);
     llvm::SmallString<256> outPath, errPath;
@@ -3450,7 +3453,7 @@ void LLVMBackend::EmitMacInfoPlistSection(const std::string& executableName, boo
 {
     if (!applicationInfo_ || module == nullptr) return;
     const std::string xml = cflat::appres::BuildInfoPlist(*applicationInfo_, executableName,
-        cflat::appres::kMacMinimumSystemVersion, bundleIcon);
+        cflat::platform::MacDeploymentVersion(), bundleIcon);
     auto* bytes = llvm::ConstantDataArray::getString(*context, xml, false);
     auto* global = new llvm::GlobalVariable(*module, bytes->getType(), true,
         llvm::GlobalValue::PrivateLinkage, bytes, "__cflat_info_plist");
@@ -3472,7 +3475,7 @@ bool LLVMBackend::WriteMacBundleMetadata(const std::string& bundlePath, const st
         ? cflat::appres::BuildIcns(*applicationInfo_) : std::vector<uint8_t>();
     const bool hasIcon = !icns.empty();
     const std::string plist = cflat::appres::BuildInfoPlist(info, stem,
-        cflat::appres::kMacMinimumSystemVersion, hasIcon);
+        cflat::platform::MacDeploymentVersion(), hasIcon);
 
     auto writeFile = [&](const fs::path& path, const char* data, size_t size) {
         std::ofstream out(path, std::ios::binary | std::ios::trunc);
@@ -3546,10 +3549,10 @@ bool LLVMBackend::EmitExecutableMachO(const std::string& exePath, bool debugInfo
         // Inline asm in cached companion IR needs the MC asm parser; clang only registers it on a cold run.
         llvm::InitializeAllAsmParsers();
 
-        // Versioned triple (min macOS 11.0, the Apple Silicon baseline) so the
+        // Versioned triple matching the native deployment target so the
         // emitted Mach-O carries an LC_BUILD_VERSION load command; without a
         // version ld64 warns "no platform load command found" on every link.
-        const std::string triple = "arm64-apple-macosx11.0.0";
+        const std::string triple = ("arm64-apple-macosx" + cflat::platform::MacDeploymentVersion());
         module->setTargetTriple(llvm::Triple(triple));
 
         std::string err;
@@ -3592,6 +3595,7 @@ bool LLVMBackend::EmitExecutableMachO(const std::string& exePath, bool debugInfo
             return false;
         }
         {
+            llvm::TimeTraceScope codegenScope("ObjectCodegen", exePath);
             llvm::legacy::PassManager pass;
             // Same stdio-safe TLI as EmitExecutableElf: codegen runs its own libcall
             // simplification, which would fortify-fold our __vsnprintf_chk call back
@@ -3615,10 +3619,9 @@ bool LLVMBackend::EmitExecutableMachO(const std::string& exePath, bool debugInfo
             llvm::Triple(llvm::sys::getProcessTriple()).isOSDarwin();
 
 #if defined(__APPLE__)
-        // Prefer the bundled ld64.lld (deployed next to cflat), invoked directly -
-        // mirroring the Windows lld-link path. The SDK still supplies libSystem via
-        // -syslibroot; harvesting our own libSystem.tbd (step 3) is what drops that.
-        if (darwinHost)
+        // Prefer bundled ld64.lld for native CFlat; C++ needs the clang driver below.
+        // Skip direct-linker SDK discovery when that route cannot be used.
+        if (darwinHost && !cppInteropUsed_)
         {
             const std::string ld64 = FindBundledLd64Lld();
             // Prefer the SDK-free stub harvested by `cflat --init` (no CLT needed);
@@ -3644,14 +3647,11 @@ bool LLVMBackend::EmitExecutableMachO(const std::string& exePath, bool debugInfo
             }
             sdkVer = TwoComponentVersion(sdkVer);
             if (sdkVer.empty()) sdkVer = "11.0";
-            // C++ interop needs the selected C++ standard library and its startup/runtime
-            // objects. The SDK-free direct ld64 path intentionally links only libSystem, so
-            // route C++ programs through clang++ below where the driver supplies libc++.
-            if (!ld64.empty() && !sdk.empty() && !cppInteropUsed_)
+            if (!ld64.empty() && !sdk.empty())
             {
                 std::vector<std::string> argStrs = {
                     ld64, "-arch", "arm64",
-                    "-platform_version", "macos", "11.0.0", sdkVer,
+                    "-platform_version", "macos", cflat::platform::MacDeploymentVersion(), sdkVer,
                     "-syslibroot", sdk, "-o", exePath, objPath };
                 for (auto& cObj : cObjectFiles_) argStrs.push_back(cObj);
                 for (const auto& lib : cLinkLibs_) argStrs.push_back(lib);
@@ -3750,7 +3750,7 @@ bool LLVMBackend::EmitExecutableMachO(const std::string& exePath, bool debugInfo
             return true;
         }
 
-        std::vector<std::string> argStrs = { cc, "-target", "arm64-apple-macosx11.0.0",
+        std::vector<std::string> argStrs = { cc, "-target", ("arm64-apple-macosx" + cflat::platform::MacDeploymentVersion()),
                                              objPath, "-o", exePath };
         if (cppInteropUsed_)
         {

@@ -4,6 +4,7 @@
 
 #include <memory>
 #include <string>
+#include <string_view>
 #include <unordered_set>
 #include <vector>
 
@@ -35,9 +36,15 @@ public:
     const std::string& LastRequestDiagnostics() const;
     // Definitions harvests this group recorded for its one demand pass (0: nothing to emit).
     unsigned DemandChunks() const;
+    // 0: another group owns the symbol, 1: valid demand, -1: clang body error.
+    int CheckDemand(const std::string& symbol, std::string& error);
+    void RestorePoisonedBodies(const std::vector<std::pair<std::string, std::string>>& verdicts);
     // The group's demand pass: bitcode defining what of `demand` this group can provide.
     bool EmitDemandCompanion(const std::vector<std::string>& demand, std::string& bitcode,
                              cflat_cinterop::CxxDemandStats& stats, std::string& error);
+    // The bytes clang read for each entry of the harvested includedFiles, same order; a null
+    // data() marks a file whose buffer is unavailable. Valid while this group lives.
+    std::vector<std::string_view> IncludedFileBuffers() const;
     // Of `files`, those an #include in this TU brought in that no header in `roots` reaches: what
     // a TU of `roots` alone would not declare. A root is a path, or `<name>` for an angled
     // include (the request prologue's `<new>`). Empty when a root is not a header of this TU.

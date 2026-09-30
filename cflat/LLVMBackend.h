@@ -40,6 +40,7 @@
 #include <map>
 #include <mutex>
 #include <thread>
+#include <future>
 #include <optional>
 #if defined(_WIN32)
 #include <io.h>
@@ -524,6 +525,7 @@ inline std::string TruncateDiagnosticText(std::string text, size_t limit)
 // Used for xcrun SDK discovery and the clang compiler-rt resource dir.
 inline std::string CaptureToolLine(const char* cmd)
 {
+    llvm::TimeTraceScope toolScope("ToolDiscovery", cmd);
     std::string out;
     if (FILE* p = popen(cmd, "r"))
     {
@@ -552,13 +554,41 @@ inline std::string TwoComponentVersion(const std::string& v)
 // The harvested ~/.cflat/macsdk carries link stubs but no headers, so it is never used here.
 // Empty when no SDK is available (no Xcode / Command Line Tools and no $SDKROOT). Defined on
 // every host because cross-targeting macOS is allowed; off Darwin only $SDKROOT can answer.
+#if defined(__APPLE__)
+// Slot for an `xcrun --show-sdk-path` started early on a helper thread (PrefetchMacSdkPath), so its
+// ~8 ms process spawn overlaps the core-bitcode load and .cb parse instead of stalling the first
+// C++/C header import. Empty until prefetched; MacSdkPathCached() falls back to a synchronous call.
+inline std::shared_future<std::string>& MacSdkPrefetchSlot()
+{
+    static std::shared_future<std::string> slot;
+    return slot;
+}
+#endif
+
+// Start the SDK lookup in the background. Call once, early, only when the compile will import a
+// header; a no-op when $SDKROOT answers, off Darwin, or when already started.
+inline void PrefetchMacSdkPath()
+{
+#if defined(__APPLE__)
+    auto& slot = MacSdkPrefetchSlot();
+    if (slot.valid()) return;
+    if (const char* env = std::getenv("SDKROOT")) if (env[0]) return;
+    slot = std::async(std::launch::async,
+                      [] { return CaptureToolLine("xcrun --show-sdk-path 2>/dev/null"); }).share();
+#endif
+}
+
 inline const std::string& MacSdkPathCached()
 {
     static const std::string sdk = [] {
         std::string s;
         if (const char* env = std::getenv("SDKROOT")) if (env[0]) s = env;
 #if defined(__APPLE__)
-        if (s.empty()) s = CaptureToolLine("xcrun --show-sdk-path 2>/dev/null");
+        if (s.empty())
+        {
+            auto& slot = MacSdkPrefetchSlot();
+            s = slot.valid() ? slot.get() : CaptureToolLine("xcrun --show-sdk-path 2>/dev/null");
+        }
 #endif
         return s;
     }();
@@ -3462,6 +3492,9 @@ private:
     std::unordered_set<std::string> cxxDemandLiveKeys_;   // entries this compile stored
     std::string pendingCxxDemandGroupKey_;                 // set by a recorded header harvest
     cflat_cinterop::ExtractResult::DemandReplayChunk pendingCxxDemandReplayChunk_;
+    // Set by CompileCHeaderGroup around its one extraction: the C++ namespace scan adds the
+    // content hash of each included file from clang's buffers, so dependency stamps skip a read.
+    std::unordered_map<std::string, uint64_t>* includeHashSink_ = nullptr;
     bool cxxDemandBypass_ = false;   // retry: every C++ cache entry is a miss
     bool cxxDemandRetry_ = false;    // companion missing for a cache-served group
     bool cxxDemandReplayInProgress_ = false;
@@ -3675,6 +3708,11 @@ private:
     // sites is read once. Cleared with embeddedAssets_.
     std::unordered_map<std::string, std::vector<uint8_t>> embedFileCache_;
     void RecordDependency(const std::string& path);
+    // Lists, a few directories at a time, every directory RecordDependency would list for
+    // `paths` and has not memoized yet; RecordDependency then only reads the memo.
+    void PrefetchDependencyDirs(const std::vector<std::string>& paths);
+    static DependencyDir ListDependencyDir(const std::filesystem::path& dir);
+
     // A positional `.c` input, noted at arg-parse time because clang is only invoked for it
     // AFTER the module-end analyses run. Read by RunNullIfaceGlobalCheck.
     bool positionalCSource_ = false;
@@ -3726,6 +3764,23 @@ private:
     // Raw C++ free-function signatures are retained because a brace-capable wrapper may be
     // needed even when the ordinary CFlat signature was refused as unmappable.
     std::map<std::string, std::vector<CSigEntry>> cxxFunctionSignatures_;
+    struct CxxDefaultWrapperRequest
+    {
+        std::string owner;
+        std::string linkage;
+        size_t arity = 0;
+        bool member = false;
+        CxxRequestGroup group;
+        int result = 0; // 0 pending, 1 available, -1 unsupported
+        bool ambiguous = false; // the shortened call is ambiguous in C++
+        std::string error;
+    };
+    std::unordered_map<std::string, CxxDefaultWrapperRequest> cxxDefaultWrapperRequests_;
+    void RememberCxxDefaultWrapper(const std::string& owner, const std::string& linkage,
+                                  size_t arity, bool member);
+    bool EnsureCxxDefaultWrapper(const std::string& name);
+    void PrepareCxxDefaultCandidates(std::vector<FunctionSymbol>& candidates, size_t arity);
+    void RejectFailedCxxDefaultCandidate(const FunctionSymbol& candidate, size_t arity);
     // One deferred bind attempt per C++ free function name; see TryBindCxxFunction.
     std::set<std::string> cxxFunctionBindAttempts_;
     // std::function member signatures are requested only when that member name is first looked up.
@@ -3818,6 +3873,7 @@ private:
         uint64_t alignBytes = 0;
         bool isTrivial = false;
         bool isTriviallyCopyable = false;
+        bool specialMembersPending = false;
         // M4 class surface, carried verbatim from the extractor (see CClangExtract.h). Kept as
         // the raw spellings so the member types are resolved after every record in the batch is
         // registered, exactly like CRecordFieldEntry::ctype.
@@ -3895,6 +3951,8 @@ private:
         int64_t  mtime = 0;  // file_time_type::time_since_epoch().count()
         uint64_t hash  = 0;  // FNV-1a of file contents (checked only on mtime drift)
     };
+    // Closure deps hashed during a cold header extraction, before its records register.
+    std::vector<CHeaderDep> cxxEarlyClosureDeps_;
     struct CFileSigCacheEntry
     {
         std::filesystem::file_time_type mtime{};
@@ -3932,6 +3990,7 @@ private:
         // (cxxBitcode empty); the companion is then cached per group and demand, not per entry.
         std::string cxxDemandGroupKey;
         cflat_cinterop::ExtractResult::DemandReplayChunk cxxDemandReplayChunk;
+        std::vector<std::pair<std::string, std::string>> cxxBodyChecks;
         uint64_t lastUse = 0;  // cFileSigCacheClock_ stamp of the last hit or insert
         size_t rows = 0;       // summed size of every vector above, for the row budget
     };
@@ -5555,6 +5614,30 @@ private:
     // --cpp-strict-noexcept: refuse to bind a C++ declaration without a noexcept specification,
     // whether by call or by function pointer. By default such a call is allowed and unwinds
     // through CFlat frames via CreateCallOrInvoke's cleanup landing pads.
+    std::string CheckCxxDemand(const std::string& symbol);
+    void ValidateCxxDemand(const std::string& symbol);
+    void RefuseCxxDemandMember(const std::string& symbol, const std::string& error);
+    std::unordered_map<std::string, std::string> cxxBodyChecks_;
+    // Body verdicts persisted per request group and per import cohort. One file each holds every
+    // verdict of a compile (keys carry no symbol) and is written once by FlushCxxDemandVerdicts.
+    struct CxxVerdictFile
+    {
+        std::string requestKey;
+        uint64_t diskKey = 0;
+        uint64_t hash = 0;
+        std::filesystem::file_time_type stamp{};
+        CxxRequestGroup group;
+        std::map<std::string, std::string> known;   // loaded from disk plus this compile's
+        bool dirty = false;
+    };
+    std::map<std::string, CxxVerdictFile> cxxVerdictFiles_;                     // by request key
+    std::unordered_map<std::string, CxxVerdictFile*> cxxVerdictFileMemo_;        // by group shape
+    CxxVerdictFile* GetCxxVerdictFile(const CxxRequestGroup& group, bool cohortFile,
+                                      const std::string& groupKey,
+                                      const std::string& generatedSource);
+    void FlushCxxDemandVerdicts();
+    // Function name + clang text of a body refused at this call; relayed if no sibling matches.
+    std::pair<std::string, std::string> cxxDemandRefusalRelay_;
     void RejectThrowingCxxFunction(const FunctionSymbol& symbol, const std::string& displayName) const;
     // The target's EH personality: C++ handler for Windows cleanup frames, otherwise the SEH or
     // Itanium handler used by the target's other cleanup scopes; null on Win32.
@@ -5663,7 +5746,11 @@ private:
         std::string cxxSpelling;
         bool needDefinitions = true;
         bool explicitInstantiation = true;
+        // An incomplete [cpp] struct argument: full explicit instantiation surfaces it.
+        bool instantiateMembers = false;
     };
+    // Spelling of the specialization RequestCxxType is requesting over an incomplete argument.
+    std::string cxxIncompleteArgumentSpelling_;
     std::string BuildCxxRequestIncludes(const CxxRequestGroup& group) const;
     std::vector<std::string> BuildCxxRequestClangArgs(const CxxRequestGroup& group) const;
     std::string BuildCxxRequestMarkers(const std::vector<CxxRequestItem>& items,
@@ -6137,8 +6224,16 @@ private:
                                     std::unordered_set<std::string>& visited,
                                     bool cxxBoundary);
 
+    void CollectCHeaderDependencies(const std::vector<std::string>& paths,
+                                    const std::unordered_map<std::string, uint64_t>& known,
+                                    std::vector<CHeaderDep>& deps);
+    // Fills each dep's content hash: from `known` when it holds the path, else reads the file.
+    static void HashCHeaderDependencies(std::vector<CHeaderDep>& deps,
+                                        const std::unordered_map<std::string, uint64_t>& known);
     // FNV-1a 64-bit hash of a file's bytes. Returns false if the file can't be read.
     static bool HashFileFnv1a(const std::string& path, uint64_t& outHash);
+    static bool HashCxxHeaderFileContents(const std::string& path, uint64_t& outHash,
+                                         bool force = false);
     bool HashFileContents(const std::string& path, uint64_t& outHash) const;
 
     void RegisterCSignatures(const std::vector<CSigEntry>& sigs, const std::string& fileForLsp,
@@ -6263,9 +6358,10 @@ private:
         std::string kind;       // "function", "enumerator", "variable", "enum", "alias", "class"
         std::string identity;   // equal identity = same entity; empty = not comparable
         std::string describe;
-        std::string file;
+        const std::string* file = nullptr;   // interned in cxxNamespaceFiles_
     };
     std::unordered_map<std::string, CxxNamespaceEntity> cxxNamespaceEntities_;
+    std::unordered_set<std::string> cxxNamespaceFiles_;
     void CheckCxxNamespaceConflicts(const std::vector<CSigEntry>& sigs,
                                     const std::vector<CEnumEntry>& enums,
                                     const std::vector<CTypeAliasEntry>& aliases,
@@ -8882,6 +8978,12 @@ public:
                                                        bool allowNumericConversions = false,
                                                        const std::vector<NamedVariable>* argVars = nullptr,
                                                        bool allowExplicit = true) const;
+    const CxxClassInfo::Structor* SelectCxxConstructorListed(const std::string& typeName,
+                                                             const std::vector<TypeAndValue>& argTypes,
+                                                             std::string& why,
+                                                             bool allowNumericConversions,
+                                                             const std::vector<NamedVariable>* argVars,
+                                                             bool allowExplicit) const;
     /*
      * True when `T(args)` must be resolved by clang rather than by SelectCxxConstructor: the
      * class declares a constructor TEMPLATE (never listed as a member), and the listed pick
@@ -8965,6 +9067,14 @@ public:
     bool RegisterCxxMembersForProjectedRecord(const std::string& typeName);
     bool EnsureCxxMemberProjected(const std::string& typeName, const std::string& memberName);
     void EnsureCxxGateSpecialMembersProjected(const std::string& typeName);
+    // R1: define the deferred special members of a header record (and its pending bases) in
+    // its group's live Interpreter, then fold the member facts into the retained record.
+    void CompleteCxxRecordSpecialMembers(const std::string& typeName);
+    bool completingCxxSpecialMembers_ = false;
+    // Pending records: the group whose header harvest deferred them, and their by-value
+    // field spelling (ValueFieldRecordKey) -> CFlat name, for batching a record's closure.
+    std::map<std::string, size_t> cxxSpecialMemberOwner_;
+    std::unordered_map<std::string, std::string> cxxPendingSpecialBySpelling_;
     void EnsureCxxConversionOperatorsProjected(const std::string& typeName);
     void StoreCxxRecordEntry(const std::string& name, const CRecordEntry& record);
     void EnsureCxxRecordLayoutsForMemberSignatures(const CRecordEntry& record,
@@ -10473,10 +10583,27 @@ public:
     }
 
     // First candidate satisfying `pred`, or "" when the name is not visible from here.
+    // At file scope (or ForceRoot) the candidate list is just the name plus, for a dotted name,
+    // its first-component alias hop: probe those directly instead of building the list.
+    bool ScopedLookupIsRootOnly(const ScopedLookupOptions& opts) const
+    {
+        return opts.ForceRoot || currentNamespace_.empty();
+    }
     template <typename Pred>
     std::string FirstVisibleScopedKey(const std::string& name, Pred pred,
                                       ScopedLookupOptions opts = {}) const
     {
+        if (ScopedLookupIsRootOnly(opts))
+        {
+            if (pred(name)) return name;
+            if (opts.ResolveFirstComponentAlias)
+                if (const size_t dot = name.find('.'); dot != std::string::npos)
+                {
+                    std::string alt = ResolveNamespace(name.substr(0, dot)) + "." + name.substr(dot + 1);
+                    if (alt != name && pred(alt)) return alt;
+                }
+            return {};
+        }
         for (const auto& candidate : ScopedNameCandidates(name, opts))
             if (pred(candidate)) return candidate;
         return {};
@@ -10496,6 +10623,19 @@ public:
     const typename MapT::mapped_type* FindFirstVisibleScoped(const MapT& map, const std::string& name,
                                                              ScopedLookupOptions opts = {}) const
     {
+        if (ScopedLookupIsRootOnly(opts))
+        {
+            auto it = map.find(name);
+            if (it != map.end()) return &it->second;
+            if (opts.ResolveFirstComponentAlias)
+                if (const size_t dot = name.find('.'); dot != std::string::npos)
+                {
+                    const std::string alt = ResolveNamespace(name.substr(0, dot)) + "." + name.substr(dot + 1);
+                    if (alt != name)
+                        if (auto altIt = map.find(alt); altIt != map.end()) return &altIt->second;
+                }
+            return nullptr;
+        }
         for (const auto& candidate : ScopedNameCandidates(name, opts))
         {
             auto it = map.find(candidate);
@@ -10598,6 +10738,10 @@ public:
     void SetWindowsSubsystem(const std::string& v);
 
     const std::vector<std::string>& GetDependencyFiles() const { return dependencyFiles_; }
+    // fn(index, worker) for every index in [0, count) on up to maxWorkers threads (the caller's
+    // included); worker < maxWorkers. The first exception a call throws is rethrown after all join.
+    static void RunParallel(size_t count, unsigned maxWorkers,
+                            llvm::function_ref<void(size_t index, unsigned worker)> fn);
 
     /*
      * Read an asset named by an `embed("...")` literal. The path resolves against the DIRECTORY
@@ -10722,7 +10866,16 @@ public:
     // 132: zero-length `[0]` members are told apart from `[]` (IsZeroLengthArrayMember); anonymous
     //      struct/union flexible tails are promoted into the containing record.
     // 133: C++ record fields retain field-level const qualification.
-    static constexpr int kCHeaderCacheVersion = 133;
+    // 134: C++ default-argument wrappers are requested on demand.
+    // 135: a live group's header harvest defers special members; records carry "smp" and
+    //      completion requests (|RQSPECIAL_MEMBERS) carry the completed member facts.
+    // 136: ordinary C++ member bodies are checked on ODR-use, not type request; demand refusals
+    //      keep overload diagnostics; body verdicts persist for live and cached groups.
+    // 137: demand-group identities and request pruning scopes include the deployment triple.
+    // 138: managed body verdicts also persist against the complete import cohort.
+    // 140: body verdicts persist as one file per group / cohort and generated-record source.
+    // 141: incremental header harvest defers import-time body diagnostics to demand checks.
+    static constexpr int kCHeaderCacheVersion = 141;
     static std::string CompilerBuildStamp();
     // THE switch for "the compiler build is part of cache entry validity": header/request
     // entries record and check "cstamp", and demand companion keys fold the stamp. OFF by
@@ -10971,11 +11124,12 @@ public:
 
     static bool CHeaderDepFresh(const CHeaderDep& dep);
 
+    // `contentHash` yields the current hash after the entry's format has been validated.
     bool TryLoadCHeaderDiskCache(
         const std::filesystem::path& cacheDir,
         uint64_t diskKey,
         std::filesystem::file_time_type mtime,
-        uint64_t contentHash,
+        llvm::function_ref<uint64_t()> contentHash,
         CFileSigCacheEntry& out,
         const std::string& expectedRequestKey = {},
         bool requireBitcode = false,

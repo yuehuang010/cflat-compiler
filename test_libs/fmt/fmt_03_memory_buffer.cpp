@@ -1,5 +1,6 @@
 // C++20 equivalent of fmt_03_memory_buffer.cb (compile-time parity baseline)
 #include <cstdio>
+#include <string>
 #include <fmt/format.h>
 
 int main()

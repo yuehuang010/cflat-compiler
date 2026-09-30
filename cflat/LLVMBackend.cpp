@@ -1,5 +1,6 @@
 #pragma warning(push)
 #pragma warning(disable: 4244 4267)
+#include <atomic>
 #include <llvm/IR/IRBuilder.h>
 #include <llvm/TargetParser/AArch64TargetParser.h>  // AArch64::CpuAliases + StrTab (--print-supported-cpus)
 #include <llvm/IR/LLVMContext.h>
@@ -181,6 +182,79 @@ bool ReadFileStamp(const std::filesystem::path& path, int64_t& mtime, int64_t& s
 
 } // namespace
 
+LLVMBackend::DependencyDir LLVMBackend::ListDependencyDir(const std::filesystem::path& dir)
+{
+    DependencyDir info;
+    std::error_code dirEc;
+    auto canonicalDir = ExistingAbsolutePath(dir, dirEc);
+    if (!dirEc)
+    {
+        for (std::filesystem::directory_iterator it(canonicalDir, dirEc), end;
+             !dirEc && it != end; it.increment(dirEc))
+            info.names.insert(it->path().filename().string());
+        if (!dirEc) info.canonical = canonicalDir.string();
+    }
+    return info;
+}
+
+void LLVMBackend::RunParallel(size_t count, unsigned maxWorkers,
+                              llvm::function_ref<void(size_t index, unsigned worker)> fn)
+{
+    const unsigned hardware = std::max(1u, std::thread::hardware_concurrency());
+    const unsigned workers = static_cast<unsigned>(
+        std::min<size_t>(count, std::min(std::max(1u, maxWorkers), hardware)));
+    if (workers <= 1)
+    {
+        for (size_t i = 0; i < count; ++i) fn(i, 0);
+        return;
+    }
+    std::atomic<size_t> next{0};
+    std::vector<std::exception_ptr> failures(workers);
+    auto run = [&](unsigned worker) {
+        try
+        {
+            for (size_t i; (i = next.fetch_add(1, std::memory_order_relaxed)) < count;)
+                fn(i, worker);
+        }
+        catch (...) { failures[worker] = std::current_exception(); }
+    };
+    // Every started worker is joined before anything propagates; a worker that could not be
+    // started leaves its share to the others.
+    std::vector<std::thread> threads;
+    threads.reserve(workers - 1);
+    for (unsigned worker = 1; worker < workers; ++worker)
+    {
+        try { threads.emplace_back(run, worker); }
+        catch (...) {}
+    }
+    run(0);
+    for (auto& thread : threads) thread.join();
+    for (const auto& failure : failures)
+        if (failure) std::rethrow_exception(failure);
+}
+
+void LLVMBackend::PrefetchDependencyDirs(const std::vector<std::string>& paths)
+{
+    std::vector<std::string> parents;
+    std::unordered_set<std::string> queued;
+    for (const auto& path : paths)
+    {
+        if (path.empty() || dependencyPathMemo_.count(path) != 0) continue;
+        const std::filesystem::path given(path);
+        const std::filesystem::path leaf = given.filename();
+        if (leaf.empty() || leaf == "." || leaf == ".." || !given.has_parent_path()) continue;
+        std::string parent = given.parent_path().string();
+        if (dependencyDirMemo_.count(parent) != 0 || !queued.insert(parent).second) continue;
+        parents.push_back(std::move(parent));
+    }
+    std::vector<DependencyDir> listed(parents.size());
+    RunParallel(parents.size(), 4, [&](size_t i, unsigned) {
+        listed[i] = ListDependencyDir(std::filesystem::path(parents[i]));
+    });
+    for (size_t i = 0; i < parents.size(); ++i)
+        dependencyDirMemo_.emplace(std::move(parents[i]), std::move(listed[i]));
+}
+
 void LLVMBackend::RecordDependency(const std::string& path)
 {
     if (path.empty()) return;
@@ -207,19 +281,7 @@ void LLVMBackend::RecordDependency(const std::string& path)
         const std::string parent = given.parent_path().string();
         auto dir = dependencyDirMemo_.find(parent);
         if (dir == dependencyDirMemo_.end())
-        {
-            DependencyDir info;
-            std::error_code dirEc;
-            auto canonicalDir = ExistingAbsolutePath(given.parent_path(), dirEc);
-            if (!dirEc)
-            {
-                for (std::filesystem::directory_iterator it(canonicalDir, dirEc), end;
-                     !dirEc && it != end; it.increment(dirEc))
-                    info.names.insert(it->path().filename().string());
-                if (!dirEc) info.canonical = canonicalDir.string();
-            }
-            dir = dependencyDirMemo_.emplace(parent, std::move(info)).first;
-        }
+            dir = dependencyDirMemo_.emplace(parent, ListDependencyDir(given.parent_path())).first;
         if (!dir->second.canonical.empty() && dir->second.names.count(leaf.string()) != 0)
             absolute = std::filesystem::path(dir->second.canonical) / leaf;
     }
@@ -1456,7 +1518,7 @@ bool LLVMBackend::WriteIsolatedManifest(const std::string& manifestPath, const s
     manifest["llvm_major"] = LLVM_VERSION_MAJOR;
     std::string targetTriple = module->getTargetTriple().str();
     if (targetTriple.empty())
-        targetTriple = targetMacOS_ ? "arm64-apple-macosx11.0.0"
+        targetTriple = targetMacOS_ ? ("arm64-apple-macosx" + cflat::platform::MacDeploymentVersion())
             : targetWindows_ ? (platformValue == 32 ? "i686-pc-windows-msvc"
                                                    : "x86_64-pc-windows-msvc")
                              : llvm::sys::getProcessTriple();
@@ -1837,6 +1899,8 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
     // triple, struct ABI, and va_list lowering off targetArm64_.
     targetMacOS_ = (platformOption == "macos" || platformOption == "macos-arm64");
     targetArm64_ = targetMacOS_;
+    if (targetMacOS_ && !cflat::platform::MacDeploymentInfo().error.empty())
+        LogError(cflat::platform::MacDeploymentInfo().error);
     // `long` follows the target's C ABI: 32-bit on Windows (LLP64) / win32, 64-bit on LP64.
     SetTargetLongWidth(targetWindows_, platformValue, targetArm64_, targetMacOS_);
     if (verbose) std::cout << std::format("[verbose] __PLATFORM__ = {}, __WINDOWS__ = {}, __MACOS__ = {}, arm64 = {}\n",
@@ -2436,13 +2500,13 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
         }
     }
 
-    // A companion link internalized the inline definitions nothing in the program reaches; delete
-    // them here so their undefined references never reach the linker, at any -O level and with
-    // --no-opt too. What the program does reach is referenced, so GlobalDCE keeps it.
-    if (cxxCompanionInternalized_ && !checkOnly)
+    // Drop unreachable core before the O0 baseline passes, rather than optimizing it first.
+    // Companions also need DCE with --no-opt so unused inline references cannot reach the linker.
+    if (!checkOnly && (cxxCompanionInternalized_
+        || (!args.hasFlag("no-opt") && args.getOptimizationLevel() == 0)))
     {
-        llvm::TimeTraceScope dceScope("GlobalDCE", "cxx-companion");
-        if (verbose) std::cout << "[verbose] dropping unreached C++ companion definitions\n";
+        llvm::TimeTraceScope dceScope("GlobalDCE", "pre-baseline");
+        if (verbose) std::cout << "[verbose] dropping unreached definitions before baseline passes\n";
         RunGlobalDCE();
     }
 
@@ -2468,10 +2532,8 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
         }
         else if (!args.hasFlag("no-opt"))
         {
-            // -O0 (no asan): OptimizeModule was skipped, so nothing pruned the unreachable
-            // internal functions the whole core library contributes. Run GlobalDCE alone so
-            // codegen does not instruction-select dead core. Before the --out-lli write below
-            // so the dumped IR still matches what lands in the object.
+            // Baseline passes can make more internal functions unreachable. At O0,
+            // prune them before IR and object output without the full optimization pipeline.
             llvm::TimeTraceScope dceScope("GlobalDCE", "O0");
             if (verbose) std::cout << "[verbose] running -O0 global dead-code elimination\n";
             RunGlobalDCE();
@@ -2701,7 +2763,7 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
                 const bool bundle = exePath && std::filesystem::path(*exePath).extension() == ".app";
                 std::string stem = std::filesystem::path(outputName).stem().string();
                 document += cflat::appres::BuildInfoPlist(*applicationInfo_,
-                    bundle ? stem : outputName, cflat::appres::kMacMinimumSystemVersion,
+                    bundle ? stem : outputName, cflat::platform::MacDeploymentVersion(),
                     bundle && !cflat::appres::BuildIcns(*applicationInfo_).empty());
             }
         }
@@ -2999,9 +3061,7 @@ static const std::vector<std::string>& PosixSystemIncludeDirs()
 #if defined(__APPLE__)
         // macOS has no top-level /usr/include; C system headers live in the active
         // SDK. Prefer $SDKROOT, else `xcrun --show-sdk-path`, then <sdk>/usr/include.
-        std::string sdk;
-        if (const char* env = std::getenv("SDKROOT")) sdk = env;
-        if (sdk.empty()) sdk = CaptureToolLine("xcrun --show-sdk-path 2>/dev/null");
+        const std::string& sdk = MacSdkPathCached();
         if (!sdk.empty())
         {
             std::string inc = sdk + "/usr/include";
@@ -3086,15 +3146,18 @@ bool LLVMBackend::ResolveImportPath(const std::string& importingFilePath, const 
         // System headers (e.g. windows.h) live in the Windows SDK include dirs. Fall back to the
         // detected SDK include dirs so `import "windows.h"` resolves with no --c-include flag; the
         // header's own dir then becomes an in-scope root automatically (see ExtractCHeaderClang).
-        for (const auto& inc : WindowsSdkIncludeDirs()) tryDir(inc);
+        if (ec)
+            for (const auto& inc : WindowsSdkIncludeDirs()) tryDir(inc);
         // C++ standard library headers (e.g. `import cpp "vector";`) live in the MSVC toolset
         // include dir, which the SDK dirs above do not cover.
-        for (const auto& inc : MsvcToolsetIncludeDirs()) tryDir(inc);
+        if (ec)
+            for (const auto& inc : MsvcToolsetIncludeDirs()) tryDir(inc);
         // POSIX system headers (e.g. math.h) live under /usr/include et al. Fall back to them
         // so `import "math.h";` resolves with no --c-include flag on Linux/macOS.
-        for (const auto& inc : PosixSystemIncludeDirs()) tryDir(inc);
+        if (ec)
+            for (const auto& inc : PosixSystemIncludeDirs()) tryDir(inc);
         // System WinRT metadata: let `import "Windows.Foundation.winmd";` resolve by bare name.
-        tryDir(WinMetadataDir());
+        if (ec) tryDir(WinMetadataDir());
 #if defined(__APPLE__)
         // macOS framework headers use a non-flat layout: `<Foo/Bar.h>` lives at
         // <sdk>/System/Library/Frameworks/Foo.framework/Headers/Bar.h. Map that shape so
@@ -3930,7 +3993,7 @@ void LLVMBackend::OptimizeModule(int optimizationLevel)
         // triple / ELF-shaped defaults it already worked with).
         if (targetMacOS_)
         {
-            module->setTargetTriple(llvm::Triple("arm64-apple-macosx11.0.0"));
+            module->setTargetTriple(llvm::Triple(("arm64-apple-macosx" + cflat::platform::MacDeploymentVersion())));
 
             // Apple's asan runtime self-verifies interception at startup by
             // dlsym-ing "puts" and checking it resolves into the asan dylib.
@@ -4572,6 +4635,11 @@ void LLVMBackend::ResetForReanalysis()
     tuParseCounts_.clear();
     cxxIncrementalGroups_.clear();
     cxxDemandGroups_.clear();
+    cxxBodyChecks_.clear();
+    cxxVerdictFileMemo_.clear();
+    cxxVerdictFiles_.clear();
+    cxxDemandRefusalRelay_ = {};
+    cxxIncompleteArgumentSpelling_.clear();
     cxxDemandRequestGroups_.clear();
     cxxDemandLiveKeys_.clear();
     pendingCxxDemandGroupKey_.clear();
@@ -4586,12 +4654,18 @@ void LLVMBackend::ResetForReanalysis()
     cxxFunctionTemplates_.clear();
     cxxFunctionTemplateOwnerGroup_.clear();
     cxxFunctionSignatures_.clear();
+    cxxDefaultWrapperRequests_.clear();
     cxxFunctionBindAttempts_.clear();
     cxxLazyStdFunctionMemberBinds_.clear();
     cxxNamespaceEntities_.clear();
+    cxxNamespaceFiles_.clear();
     cxxFunctionOwnerGroup_.clear();
     cxxBoundSignatureKeys_.clear();
     cxxTypeOwnerGroup_.clear();
+    cxxSpecialMemberOwner_.clear();
+    cxxEarlyClosureDeps_.clear();
+    completingCxxSpecialMembers_ = false;
+    cxxPendingSpecialBySpelling_.clear();
     cxxForeignNamespaces_.clear();
     cxxNestedNamespaceNames_.clear();
     cxxConstGlobalSymbols_.clear();
@@ -6634,6 +6708,7 @@ static uint64_t FnvHash64(const void* data, size_t len)
 // Returns a 16-hex-char string. Returns "" if the core dir is inaccessible.
 std::string LLVMBackend::ComputeCoreHash(const std::string& runtimeDir) const
 {
+    llvm::TimeTraceScope hashScope("CoreCacheHash", runtimeDir);
     auto cached = coreHashCache_.find(runtimeDir);
     if (cached != coreHashCache_.end()) return cached->second.hash;
 
@@ -7136,6 +7211,8 @@ bool LLVMBackend::CompileCoreOnly(const std::string& platform)
     // macos / macos-arm64 mirror the normal-compile setup in Init(): POSIX, arm64.
     targetMacOS_ = (platform == "macos" || platform == "macos-arm64");
     targetArm64_ = targetMacOS_;
+    if (targetMacOS_ && !cflat::platform::MacDeploymentInfo().error.empty())
+        LogError(cflat::platform::MacDeploymentInfo().error);
     // Core bitcode is per-platform (core_<platform>.bc), so `long` must use this target's width.
     SetTargetLongWidth(targetWindows_, platformValue, targetArm64_, targetMacOS_);
 
@@ -7159,7 +7236,7 @@ bool LLVMBackend::CompileCoreOnly(const std::string& platform)
         ? "e-m:o-i64:64-i128:128-n32:64-S128"
         : PlatformDataLayout(platformValue);
     module->setDataLayout(llvm::DataLayout(dl));
-    module->setTargetTriple(llvm::Triple(targetMacOS_ ? "arm64-apple-macosx"
+    module->setTargetTriple(llvm::Triple(targetMacOS_ ? ("arm64-apple-macosx" + cflat::platform::MacDeploymentVersion())
                             : (platformValue == 32) ? "i686-pc-windows-msvc"
                                                     : "x86_64-pc-windows-msvc"));
     RegisterBuiltinString();
@@ -7237,6 +7314,9 @@ bool LLVMBackend::SaveCoreBitcode(const std::string& cacheDir, const std::string
     root["version"]   = 10;
     root["platform"]  = platform;
     root["core_hash"] = ComputeCoreHash(runtimeDir);
+#if defined(__APPLE__)
+    if (targetMacOS_) root["macos_deployment"] = cflat::platform::MacDeploymentVersion();
+#endif
 
     // importedFiles - store paths relative to runtimeDir so the cache is
     // portable between Debug and Release builds that share core/*.cb files.
@@ -7704,6 +7784,13 @@ bool LLVMBackend::LoadCoreBitcodeIfFresh(const std::string& cacheDir, const std:
     if (!ver || *ver != 10) return false;  // v9 used the pre-dollar type and function mangling
     if (!storedPl || storedPl->str() != platform) return false;
     if (!storedH || storedH->str() != coreHash) return false;
+#if defined(__APPLE__)
+    if (targetMacOS_)
+    {
+        auto deployment = root->getString("macos_deployment");
+        if (!deployment || deployment->str() != cflat::platform::MacDeploymentVersion()) return false;
+    }
+#endif
     if (!std::filesystem::exists(symbolsPath)) return false;
 
     // Read the LSP symbol sidecar here, BEFORE the context swap below, and only when a consumer
@@ -8248,6 +8335,7 @@ bool LLVMBackend::LoadCoreBitcodeIfFresh(const std::string& cacheDir, const std:
 void LLVMBackend::MaterializeCoreIfLazy()
 {
     if (!module || !coreBitcodeBuffer_ || module->isMaterialized()) return;
+    llvm::TimeTraceScope materializeScope("CoreCacheMaterialize");
     if (auto error = module->materializeAll())
         LogError("failed to materialize cached core bitcode: " + llvm::toString(std::move(error)));
     coreBitcodeBuffer_.reset();
