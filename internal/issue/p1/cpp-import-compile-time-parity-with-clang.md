@@ -195,6 +195,50 @@ torch, simdjson and fmt: cflat cold <= 1.1x and warm <= 1.1x clang++, measured o
 
 ---
 
+## Status 2026-09-30 and remaining ideas (ranked)
+
+All twins now include <string> (ruling 2026-09-30, fair baseline). Full libs_parity N=3 on master 26b8647e
+(2026-09-30 01:16): geomean cold 1.09x, warm 0.24x. Met: fmt 0.91-1.00x, json_03 1.10x, simdjson_01 1.09x,
+torch_01/02/90/91/92/93 0.98-1.10x. Open: json_01 1.28x, json_02 1.21x, simdjson_02 1.21x, torch_05 1.20x,
+torch_06 1.20x, torch_07 1.16x, torch_03 1.14x, torch_04 1.11x. Torch train.cb ~53.4-53.7G instructions.
+Stage profile and per-case top events: scratch/bench_2026-09-30/SUMMARY.md. Headline: header parse is
+below clang's frontend everywhere. Torch's fixed costs (register ~355, abi ~290 ms) are the same in met
+and open cases. What separates the open ones is CodeGeneration (410-718 vs 86 ms on torch_91) and demand
+companions (184-325 vs 125 ms).
+The 2026-09-29d timebox landed four changes (all in 93b361f6): N35 verdict batching, T2 path-scope memo +
+SDK prefetch, D2 registration trims, D8 no import-time body emission. Together torch cold went from
+~56.2G to ~53.9G instructions.
+Dropped, do not retry as-is (reports in scratch/repro_keep/<id>/):
+- J1 delayed template parsing: rejected by ruling.
+- D1 demand delta rounds: always abandon on torch.
+- D3 request prologue reuse: no gain.
+- D7 stage-1 request batching: the gain was truncated payloads.
+- D9 registration without special-member completion: breaks lifetime diagnostics.
+D4 lazy declarations is shelved (see idea 2). D5 and F2 were profile-only.
+
+Remaining ideas, ranked:
+1. Demand set up front (torch). The slow cases take 2-3 demand-companion rounds. Every extra round
+   builds a new CodeGenerator, re-hands all lazy decls (~53 ms) and re-emits the module (~34 ms).
+   Compute the closure before round 1. D1's between-round delta failed; an up-front closure is
+   untried. Estimate: -3..-5% on torch_02..07.
+2. Retry D4 lazy C++ declarations after p3/cpp-signature-registration-projects-records (N37).
+   Registration projects every record a signature names, and that projection also sets
+   member-operator overload order. D4 measured -3.6% torch instructions only by skipping it, so
+   that is the upper bound. Separate the operator ordering from projection first.
+3. Lazy ABI recipes: RegisterCSignatures takes ~308 ms per torch case. BuildAbiRecipeFromClangPlan
+   -> GetType -> EnsureCxxRecordProjected -> CompleteCxxRecordSpecialMembers runs for every harvested
+   function at import. This probably overlaps idea 2.
+4. CxxAbiArrange is still ~353 ms per torch case, with DefinitionEmit at 166 ms after D8. D5 found no
+   safe ABI cut, but D8 showed that moving emission to demand pays; look for more of it.
+5. Fresh json profile: json is now the worst family and has no single lever.
+   json_01 spends InstantiateFunction ~130 ms, AbiArrange ~77, DemandCompanions ~71. Start with a
+   -ftime-trace A/B against clang++ -ftime-trace.
+6. Speculative, spike first: overlap CFlat-side work (parse, CodeGen of non-C++ code) with the
+   clang header-group parse on another thread. The compile is almost entirely main-thread and cold
+   parity is wall time. Risks: shared backend state, diagnostic order. The only overlap so far is
+   T2's SDK-path prefetch.
+Still open from the 2026-09-28 list below: background cache warmer (ruling) and PCH-aware harvest.
+
 ## Status 2026-09-29 evening (perf timebox, master 93b361f6, macOS arm64, PGO LLVM 23.1.0)
 
 scratch/cmp/libs_parity.sh N=3, cold = fresh header cache with warm core, `-B -o`:
