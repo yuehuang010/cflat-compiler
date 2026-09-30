@@ -35,3 +35,16 @@ if (pkg.version === version) {
     pkg.version = version;
     fs.writeFileSync(packageJsonPath, JSON.stringify(pkg, null, 2) + "\n");
 }
+
+// package-lock.json carries the root version twice (top level and packages[""]).
+const lockPath = path.join(__dirname, "package-lock.json");
+if (fs.existsSync(lockPath)) {
+    const lock = JSON.parse(fs.readFileSync(lockPath, "utf8"));
+    const root = lock.packages && lock.packages[""];
+    if (lock.version !== version || (root && root.version !== version)) {
+        lock.version = version;
+        if (root) root.version = version;
+        fs.writeFileSync(lockPath, JSON.stringify(lock, null, 2) + "\n");
+        console.log(`sync-version: package-lock.json -> ${version}`);
+    }
+}
