@@ -282,8 +282,13 @@ void LLVMBackend::createFunctionBlock(llvm::Function* fn, const std::string& fri
                 // Same unsized-shell handling as the move-struct arm above.
                 bool unsizedShell = structTy != nullptr && structTy->isStructTy() && !structTy->isSized();
                 auto* slotTy = unsizedShell ? (llvm::Type*)builder->getInt8Ty() : structTy;
-                auto* alloc = builder->CreateAlloca(slotTy, nullptr, itr_nameArg->VariableName);
-                if (!unsizedShell)
+                // An alias-return source param arrives as the caller's copy slot
+                // (ParamIsAliasReturnSlot): that slot IS the parameter, so `return w` names it.
+                const bool callerSlot = abiSlot == nullptr && !unsizedShell
+                    && argValue->getType()->isPointerTy();
+                llvm::Value* alloc = callerSlot ? argValue
+                    : builder->CreateAlloca(slotTy, nullptr, itr_nameArg->VariableName);
+                if (!unsizedShell && !callerSlot)
                     builder->CreateStore(argValue, alloc);
                 NamedVariable namedVar{
                     .TypeAndValue = *itr_nameArg,
@@ -1504,6 +1509,7 @@ void LLVMBackend::ResolvePendingAliasReturnInference()
                     { same = false; break; }
                 if (!same) continue;
                 sym.ReturnsAlias = true;
+                sym.ReturnsAliasOfByValueParam = true;
                 sym.ReturnType.IsAlias = true;
                 // The forward-ref pass may have emitted this declaration before the
                 // struct fields were known well enough to infer the borrow return. Keep
@@ -1649,6 +1655,49 @@ std::string LLVMBackend::DescribeImplicitPrimitiveToPointer(
         action, destination, targetType, sourceType, targetType);
 }
 
+bool LLVMBackend::IsImplicitPointerToNumber(const TypeAndValue& destTV,
+                                            const NamedVariable& sourceNV,
+                                            llvm::Value* value) const
+{
+    // A fixed-array destination (`char[8] c = ...`) has its own array-init guards.
+    if (destTV.Pointer || destTV.IsArrayView || destTV.IsFunctionPointer || value == nullptr
+        || destTV.ConstArraySize != 0)
+        return false;
+    if ((sourceNV.Primary != nullptr && llvm::isa<llvm::Function>(sourceNV.Primary))
+        || (sourceNV.BaseType != nullptr && sourceNV.BaseType->isFunctionTy()))
+        return false;
+
+    std::string resolved = ResolveTypeAlias(destTV.TypeName);
+    if (resolved == "bool") return false;
+    const bool isEnum = destTV.IsScopedEnum || !ResolveEnumTypeName(resolved).empty()
+        || !destTV.EnumBacking.empty();
+    if (!isEnum && (!IsPrimitiveTypeName(resolved) || resolved == "void")) return false;
+
+    const auto& sourceTV = sourceNV.TypeAndValue;
+    if (sourceNV.IsStringLiteral) return true;
+    const std::string sourceType = ResolveTypeAlias(sourceTV.TypeName);
+    if (!sourceTV.Pointer && !sourceTV.IsFunctionPointer && sourceType == resolved
+        && (sourceTV.ConstArraySize != 0 || !value->getType()->isPointerTy()))
+        return false;
+    if (sourceTV.IsArrayView) return true;
+    return value->getType()->isPointerTy();
+}
+
+std::string LLVMBackend::DescribeImplicitPointerToNumber(
+    const TypeAndValue& destTV, const NamedVariable& sourceNV, llvm::Value* value,
+    const std::string& action, const std::string& destination) const
+{
+    std::string sourceType = sourceNV.IsStringLiteral
+        ? "const char*" : SpellType(*this, sourceNV.TypeAndValue);
+    if (sourceType.empty() && value != nullptr && value->getType()->isPointerTy())
+        sourceType = "pointer";
+    return std::format(
+        "cannot {} {} of type '{}' from a value of type '{}' - a pointer is not a number; "
+        "use an explicit cast '({})p' to convert '{}' to '{}'",
+        action, destination, SpellType(*this, destTV), sourceType,
+        SpellType(*this, destTV), sourceType, SpellType(*this, destTV));
+}
+
 std::string LLVMBackend::DescribeStringLiteralIntoStructPointer(const TypeAndValue& destTV,
                                                    const std::string& destDesc) const
 {
@@ -1779,6 +1828,27 @@ bool LLVMBackend::IsCopyableType(const std::string& typeNameIn) const
             return false;
         if (HasCopyOverloadFor(base)) return true;
         return !TypeOwnsUniquePointer(base);
+    }
+
+bool LLVMBackend::ParamIsAliasReturnSlot(const TypeAndValue& ret, const TypeAndValue& p) const
+{
+        if (!ret.IsAlias || ret.Pointer || ret.ElemPointer || ret.IsArrayView || ret.IsFunctionPointer
+            || ret.IsInterface || ret.IsCxxRefToPointer || ret.TypeName.empty())
+            return false;
+        if (!p.IsReturnInferredSink || p.Pointer || p.ElemPointer || p.IsAlias || p.IsMove
+            || p.IsArrayView || p.IsInterface || p.IsFunctionPointer || p.IsCxxRefToPointer)
+            return false;
+        if (ResolveTypeAlias(p.TypeName) != ResolveTypeAlias(ret.TypeName)) return false;
+        auto* valueType = GetType(p);
+        return valueType != nullptr && valueType->isStructTy();
+    }
+
+std::string LLVMBackend::AliasReturnSlotParamName(const TypeAndValue& ret,
+                                                  const std::vector<TypeAndValue>& params) const
+{
+        for (const auto& p : params)
+            if (ParamIsAliasReturnSlot(ret, p)) return p.VariableName.empty() ? "?" : p.VariableName;
+        return {};
     }
 
 bool LLVMBackend::OwningSinkConsumesConcrete(const TypeAndValue& p)

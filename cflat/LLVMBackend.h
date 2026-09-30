@@ -1976,6 +1976,9 @@ public:
         bool External = false;
         bool ReturnsOwned = false; // true when the function returns an owned value (heap string or owned pointer) - caller must free
         bool ReturnsAlias = false; // true when the function returns an 'alias' reference - caller must not free the interior
+        // Inferred 'alias': every return hands back a by-value parameter (ClassifyValueStructReturns),
+        // so the result is always one of the caller's alias-return copy slots.
+        bool ReturnsAliasOfByValueParam = false;
         bool IsMethod = false;     // true when registered as a struct/class method (has implicit self pointer)
         bool IsCxx = false;        // declaration came from a C++ header
         int CxxRefQualifier = cflat_cinterop::CxxRefQualifierNone;
@@ -2254,6 +2257,7 @@ public:
     std::vector<std::pair<const llvm::Value*, UniqueFieldReadSource>> uniqueFieldReadValues_;
     std::vector<UniqueFieldReadJoin> uniqueFieldReadJoins_;
     std::vector<llvm::Value*> aliasValues_;
+    std::vector<llvm::Value*> aliasTransferResults_;
     std::vector<llvm::Value*> tempFieldValues_;
     std::unordered_map<const llvm::Value*, std::vector<std::string>> bondedValues_;
 
@@ -2272,6 +2276,9 @@ public:
 
     void RegisterAliasValue(llvm::Value* value);
     bool IsAliasValue(const llvm::Value* value) const;
+    // An alias call result that took over its temporary argument (B21): it owns, but a discarded
+    // one is destroyed rather than refused - the callee never promised an owned result.
+    bool IsAliasTransferResult(const llvm::Value* value) const;
     void PropagateAliasValue(llvm::Value* trueValue, llvm::Value* falseValue,
                              llvm::Value* joined);
     void RegisterTempFieldValue(llvm::Value* value);
@@ -5036,6 +5043,11 @@ private:
     // fields of an already-registered owning temp (FromOwningTempField) run their own paths.
     void RegisterBorrowedOwningStructTemp(const NamedVariable& arg, bool fromTernaryArm = false);
 
+    // A `?:` argument whose arms each registered an owning struct temp (TernaryTempAlreadyRegistered)
+    // is moving into an alias-return copy slot: drop those arm entries so the slot is the one owner.
+    // True only when every incoming value of the join had its own entry.
+    bool AdoptTernaryArmStructTemps(llvm::PHINode* join);
+
     // Shared gate: true when `arg` is an unowned produced rvalue of an owning struct type, i.e.
     // one that a borrowing parameter will not free and no named local will either.
     bool BorrowedOwningStructTempQualifies(const NamedVariable& arg, bool fromTernaryArm = false);
@@ -5133,6 +5145,7 @@ private:
         decltype(movedBorrowedPtrValues_) movedBorrowedPtrValues_;
         decltype(movedBorrowedThroughFieldValues_) movedBorrowedThroughFieldValues_;
         decltype(aliasValues_) aliasValues_;
+        decltype(aliasTransferResults_) aliasTransferResults_;
         decltype(tempFieldValues_) tempFieldValues_;
     };
     DetectionLedgerSnapshot SnapshotDetectionLedgers() const;
@@ -5368,6 +5381,17 @@ private:
     // ownership) consults, so the structural scanner flag and the full-info decision stay in sync.
     bool OwningSinkConsumesConcrete(const TypeAndValue& p);
 
+    // A by-value parameter an 'alias' return can hand back (`U f(U w) { return w; }`, inferred
+    // or spelled): the ABI passes it as a pointer to a CALLER-owned copy slot, so the returned
+    // address lives in the caller's frame (the callee binds the slot as `w`). Keyed on the return's
+    // IsAlias plus the param's IsReturnInferredSink, both already carried by symbols, funcptr
+    // signatures and the --init cache.
+    bool ParamIsAliasReturnSlot(const TypeAndValue& returnType, const TypeAndValue& param) const;
+    // Name of the first alias-return slot parameter, or empty. Taking such a function's address
+    // is refused: the indirect-call shapes do not build the slot.
+    std::string AliasReturnSlotParamName(const TypeAndValue& returnType,
+                                         const std::vector<TypeAndValue>& params) const;
+
     // Per-parameter 'move' agreement between a funcptr DESTINATION and its source. A literal that
     // INFERRED an owning sink satisfies a declared `move` - it already consumes - which is the one
     // way a lambda literal could not previously state the sink.
@@ -5478,6 +5502,10 @@ private:
     // call (a CallBase user). A vtable slot references the function without calling it, so a mere
     // declaration of a unique-element list (whose copy() is poisoned) stays legal.
     void CheckPoisonedFunctionCalls();
+    // A function with an alias-return copy-slot parameter (ParamIsAliasReturnSlot) may only be
+    // called directly: a function pointer, closure, thunk or vtable would call it with the plain
+    // by-value ABI. Any other use of its address is refused.
+    void CheckAliasReturnSlotAddressTaken();
 
     // --cpp-strict-noexcept: refuse to bind a C++ declaration without a noexcept specification,
     // whether by call or by function pointer. By default such a call is allowed and unwinds
@@ -6396,6 +6424,7 @@ public:
         std::vector<std::pair<const llvm::Value*, UniqueFieldReadSource>> uniqueFieldReadValues;
         std::vector<UniqueFieldReadJoin> uniqueFieldReadJoins;
         std::vector<llvm::Value*> aliasValues;
+        std::vector<llvm::Value*> aliasTransferResults;
         std::vector<llvm::Value*> tempFieldValues;
     };
 
@@ -7383,6 +7412,16 @@ public:
                                                    llvm::Value* value,
                                                    const std::string& action,
                                                    const std::string& destination) const;
+
+    // Reject a pointer-shaped value stored as a numeric primitive; bool remains a null test.
+    bool IsImplicitPointerToNumber(const TypeAndValue& destTV,
+                                   const NamedVariable& sourceNV,
+                                   llvm::Value* value) const;
+    std::string DescribeImplicitPointerToNumber(const TypeAndValue& destTV,
+                                                const NamedVariable& sourceNV,
+                                                llvm::Value* value,
+                                                const std::string& action,
+                                                const std::string& destination) const;
 
     // One ARM of the string-literal question: 1 = proven string literal, 0 = neutral (a null
     // constant carries no data), -1 = unproven, which alone leaves the whole join unproven.

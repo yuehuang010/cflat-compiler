@@ -2328,6 +2328,7 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
         // called (e.g. copy() on a list of unique elements). Inside the try + before the
         // did-not-occur check so a file-scope expect_error catches it.
         CheckPoisonedFunctionCalls();
+        CheckAliasReturnSlotAddressTaken();
 
         // Every callee body is complete now, so a call whose callee was still a declaration
         // during the walk can finally be answered (record-then-resolve; see tempUniqueFieldArgs_).
@@ -4924,6 +4925,7 @@ void LLVMBackend::ResetForReanalysis()
     uniqueFieldReadValues_.clear();
     uniqueFieldReadJoins_.clear();
     aliasValues_.clear();
+    aliasTransferResults_.clear();
     tempFieldValues_.clear();
     bondedValues_.clear();
     // Keyed by llvm::Function*, which a rebuilt module invalidates.
@@ -7051,6 +7053,7 @@ static llvm::json::Object SerializeFuncSym(const std::string& key, const FS& s)
     if (s.CxxConst)     o["cxxconst"] = true;
     if (!s.IsNoexcept)  o["nx"] = true;
     if (s.ReturnsAlias) o["ra"] = true;
+    if (s.ReturnsAliasOfByValueParam) o["rabv"] = true;
     if (s.HasCFlatBody) o["cb"] = true;
     if (s.CannotUnwind) o["nu"] = true;
     if (!s.NoUnwindExternDeps.empty())
@@ -7881,6 +7884,7 @@ bool LLVMBackend::LoadCoreBitcodeIfFresh(const std::string& cacheDir, const std:
             if (auto v = fo->getBoolean("nx")) sym.IsNoexcept = !*v;
             if (auto* ab = fo->getObject("cxxabi")) sym.CxxAbi = DeserializeCxxAbi(*ab);
             if (auto v = fo->getBoolean("ra")) sym.ReturnsAlias = *v;
+            if (auto v = fo->getBoolean("rabv")) sym.ReturnsAliasOfByValueParam = *v;
             if (auto v = fo->getBoolean("cb")) sym.HasCFlatBody = *v;
             if (auto v = fo->getBoolean("nu")) sym.CannotUnwind = *v;
             if (auto* nd = fo->getArray("nud"))

@@ -641,6 +641,20 @@ void ForwardRefScanner::ScanFunctionDefinition(CFlatParser::FunctionDefinitionCo
             if (ClassifyValueStructReturns(compiler, func, returnType, allParams, &borrowedParam)
                 == ValueStructReturnKind::AllBorrowedParam)
                 compiler->QueueAliasReturnInference(name, returnType.TypeName, allParams);
+            // A spelled `alias T f(T w) { return w; }`: mark it now so calls emitted before the
+            // body still hand a temporary argument over (ReturnsAliasOfByValueParam).
+            auto probe = returnType;
+            probe.IsAlias = false;
+            if (returnType.IsAlias
+                && ClassifyValueStructReturns(compiler, func, probe, allParams, &borrowedParam)
+                    == ValueStructReturnKind::AllBorrowedParam)
+                if (auto it = compiler->functionTable.find(name); it != compiler->functionTable.end())
+                    for (auto& sym : it->second)
+                        if (sym.ReturnType.IsAlias && sym.Parameters.size() == allParams.size()
+                            && std::equal(allParams.begin(), allParams.end(), sym.Parameters.begin(),
+                                [](const auto& a, const auto& b) { return a.TypeName == b.TypeName
+                                    && a.Pointer == b.Pointer; }))
+                            sym.ReturnsAliasOfByValueParam = true;
         }
 
         // Populate RequiredLocks from the function's lock clause and any extra locks

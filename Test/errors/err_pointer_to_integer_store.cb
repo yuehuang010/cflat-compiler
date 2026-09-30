@@ -1,0 +1,56 @@
+// Every pointer-to-number store must name its explicit conversion.
+struct P2iField { long value = 0; };
+struct P2iDesignated { long value = 0; };
+enum P2iEnum : int { P2I_ZERO = 0, P2I_ONE = 1 };
+int p2iFunction() { return 1; }
+extern void* malloc(i64 size);
+expect_error("a pointer is not a number") {
+    struct P2iStringDefault { long value = "abc"; };
+}
+expect_error("cannot return a value") {
+    long p2iBadReturn() { long n = 5; long* p = &n; return p; }
+}
+extern int main()
+{
+    long n = 5; long* p = &n; long* q = &n;
+    expect_error("a pointer is not a number") { long x = p; }
+    expect_error("a pointer is not a number") { long x = 0; x = p; }
+    expect_error("a pointer is not a number") { long x = p + 1; }
+    expect_error("a pointer is not a number") { long x = p - 1; }
+    expect_error("a pointer is not a number") { char** argv = nullptr; int n = argv[0] + 1; }
+    expect_error("a pointer is not a number") { P2iField s = default; s.value = p + 1; }
+    expect_error("a pointer is not a number") { P2iDesignated s = {value = p + 1}; }
+    expect_error("a pointer is not a number") { long x = "abc"; }
+    expect_error("a pointer is not a number") { long x = 0; x = "abc"; }
+    expect_error("a pointer is not a number") { char x = "a"; }
+    expect_error("a pointer is not a number") { long x = q ?? p; }
+    expect_error("a pointer is not a number") { long x = 0; x = q ?? p; }
+    expect_error("a pointer is not a number") { bool c = true; long x = c ? p : nullptr; }
+    expect_error("a pointer is not a number") { bool c = true; long x = 0; x = c ? p : nullptr; }
+    expect_error("a pointer is not a number") { P2iField s = default; s.value = p; }
+    expect_error("a pointer is not a number") { P2iDesignated s = {value = p}; }
+    expect_error("a pointer is not a number") { long[1] a = {p}; }
+    expect_error("a pointer is not a number") { long[1] a = default; a[0] = p; }
+    expect_error("a pointer is not a number") { long x = 0; x += p; }
+    expect_error("a pointer is not a number") { long x = 0; x -= p; }
+    expect_error("a pointer is not a number") { long x = 0; x |= p; }
+    expect_error("a pointer is not a number") { bool c = true; long x = c ? p : q; }
+    expect_error("a pointer is not a number") { int* ip = &n; char x = ip; }
+    expect_error("a pointer is not a number") { int* ip = &n; double x = ip; }
+    expect_error("a pointer is not a number") { P2iEnum x = p; }
+    expect_error("a pointer is not a number") { function<int()>* fp = p2iFunction; long x = fp; }
+    expect_error("a pointer is not a number") { int[1] a = {5}; int[] view = a; long x = view; }
+    expect_error("a pointer is not a number") { long x = malloc(8); }
+    expect_error("a pointer is not a number") { i8 x = p; }
+    expect_error("a pointer is not a number") { u8 x = p; }
+    expect_error("a pointer is not a number") { i16 x = p; }
+    expect_error("a pointer is not a number") { u16 x = p; }
+    expect_error("a pointer is not a number") { i32 x = p; }
+    expect_error("a pointer is not a number") { u32 x = p; }
+    expect_error("a pointer is not a number") { i64 x = p; }
+    expect_error("a pointer is not a number") { u64 x = p; }
+    expect_error("a pointer is not a number") { float x = p; }
+    expect_error("no overload of") { p2iTakeLong(p); }
+    return 0;
+}
+int p2iTakeLong(long value) { return (int)value; }

@@ -9520,6 +9520,7 @@ void MainListener::RegisterDiscardedOwningStructTemp(const LLVMBackend::NamedVar
 
 void MainListener::DiagnoseDiscardedOwningReturn(antlr4::ParserRuleContext* ctx, const LLVMBackend::NamedVariable& nv) {
         auto* compiler = Compiler(ctx);
+        if (compiler->IsAliasTransferResult(nv.Primary)) return;
         std::string fnName;
         if (const std::string* fn = compiler->FindOwnedReturnTemp(nv.Primary))
             fnName = *fn;                             // string / pointer / interface owning return

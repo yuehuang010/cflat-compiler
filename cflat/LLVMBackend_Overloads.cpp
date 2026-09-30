@@ -3887,6 +3887,11 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
 
         // convert parameter to vector of llvm::value*
         std::vector<llvm::Value*> argList;
+        // A by-value param an 'alias' return can hand back is passed as a pointer to a caller-owned
+        // copy slot (ParamIsAliasReturnSlot), so the result points into this frame. A slot holding
+        // a temporary is that temporary's only owner; the post-call handoff settles who frees it.
+        struct AliasSlotArg { llvm::Value* Slot; std::string TypeName; bool Temp; };
+        std::vector<AliasSlotArg> aliasSlots;
         auto candParamItr = candidate.Parameters.begin();
         size_t argIndex = 0;
         for (const auto& arg : matched)
@@ -4328,6 +4333,8 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
             else
             {
                 llvm::Value* value = nullptr;
+                const bool aliasSlotParam = !inVariadicRange && !candidate.IsCxx
+                    && ParamIsAliasReturnSlot(candidate.ReturnType, *candParamItr);
                 if (arg.Primary == nullptr)
                 {
                     value = LoadArgStorage(arg);
@@ -4358,7 +4365,21 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                     bool paramTakesOwnership = candParamItr->IsMove
                         || (OwningSinkConsumesConcrete(*candParamItr)
                             && (candParamItr->TypeName == "string" || IsOwningValueType(candParamItr->TypeName)));
-                    if (!paramTakesOwnership)
+                    if (aliasSlotParam)
+                    {
+                        const bool phiArg = arg.Primary != nullptr && llvm::isa<llvm::PHINode>(arg.Primary);
+                        bool temp = BorrowedOwningStructTempQualifies(
+                            arg, phiArg && !arg.TernaryTempAlreadyRegistered);
+                        // `f(c ? mk(1) : mk(2))`: each arm registered its own temp; the joined value
+                        // moves into the slot, so the slot takes those entries over.
+                        if (!temp && phiArg && arg.TernaryTempAlreadyRegistered)
+                            temp = AdoptTernaryArmStructTemps(llvm::cast<llvm::PHINode>(arg.Primary));
+                        auto* slot = AllocaAtEntry(value->getType(), nullptr, "aliasslot");
+                        builder->CreateStore(value, slot);
+                        aliasSlots.push_back({ slot, candParamItr->TypeName, temp });
+                        value = slot;
+                    }
+                    else if (!paramTakesOwnership)
                     {
                         bool ternaryJoinNeedsRegistration = arg.Primary != nullptr
                             && llvm::isa<llvm::PHINode>(arg.Primary)
@@ -4866,6 +4887,35 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                                                    cxxVirtualCallee, argList, calleeMayUnwind)
                 : CreateFunctionCall(candidate.Function, argList, calleeMayUnwind));
         unwindCallConsumedTemps_.clear();
+        // Settle the copy slots of an alias-return call. When every possible source slot holds a
+        // temporary, the result is one of them: it owns that value, and a slot the result does not
+        // name is destroyed at the end of the full expression (runtime-compared with several).
+        // A named source keeps today's non-owning alias; a mixed call frees its temps as before.
+        bool resultIsAlias = candidate.ReturnsAlias;
+        if (!aliasSlots.empty() && result != nullptr && result->getType()->isPointerTy())
+        {
+            const bool allTemps = std::all_of(aliasSlots.begin(), aliasSlots.end(),
+                [](const AliasSlotArg& s) { return s.Temp; });
+            if (allTemps && candidate.ReturnsAliasOfByValueParam)
+            {
+                auto* owned = builder->CreateLoad(GetType(candidate.ReturnType), result, "aliasret.owned");
+                if (aliasSlots.size() > 1)
+                    for (const auto& s : aliasSlots)
+                    {
+                        auto* live = AllocaAtEntry(builder->getInt1Ty(), nullptr, "aliasslot.live");
+                        builder->CreateStore(builder->CreateICmpNE(result, s.Slot), live);
+                        pendingOwnedStructTemps.push_back(
+                            { s.Slot, s.TypeName, builder->GetInsertBlock(), live });
+                    }
+                PropagateProducedTempValue(result, owned);
+                aliasTransferResults_.push_back(owned);
+                result = owned;
+                resultIsAlias = false;
+            }
+            else
+                for (const auto& s : aliasSlots)
+                    if (s.Temp) RegisterOwnedStructTemp(s.Slot, s.TypeName);
+        }
         if (cxxRetTemp != nullptr)
         {
             RegisterOwnedStructTemp(cxxRetTemp, candidate.ReturnType.TypeName);
@@ -4958,8 +5008,8 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
 
         // Cache the resolved return type so callers can populate TypeAndValue after the call.
         lastCallReturnType = candidate.ReturnType;
-        lastCallReturnType.IsAlias = candidate.ReturnsAlias; // mark borrow-return result; inert until consumed
-        if (candidate.ReturnsAlias) RegisterAliasValue(result);
+        lastCallReturnType.IsAlias = resultIsAlias; // mark borrow-return result; inert until consumed
+        if (resultIsAlias) RegisterAliasValue(result);
         // The call RESULT is now the current expression value, so a `new`/`move` that ran only in
         // the ARGUMENT list describes a different value: retire its sticky channels here.
         lastOwningResult = false;
@@ -4967,11 +5017,11 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
         // A core unique return owns like `move`.
         lastCallReturnsOwned = uniqueFieldBorrow == nullptr
             && (candidate.ReturnsOwned
-                || (!candidate.ReturnsAlias && !candidate.ReturnType.Pointer
+                || (!resultIsAlias && !candidate.ReturnType.Pointer
                     && IsCoreUniqueType(candidate.ReturnType.TypeName)));
         // Ledger the owning-return result by value for the no-discard check: string / pointer /
         // interface via lastCallReturnsOwned, plus a by-value owning-value STRUCT return (move S).
-        bool ownedValueStructReturn = uniqueFieldBorrow == nullptr && !candidate.ReturnsAlias
+        bool ownedValueStructReturn = uniqueFieldBorrow == nullptr && !resultIsAlias
             && !candidate.ReturnType.Pointer
             && candidate.ReturnType.TypeName != "string"
             && IsOwningValueType(candidate.ReturnType.TypeName);
@@ -4981,7 +5031,7 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
             // An `alias` return hands back a BORROW the callee still owns. Keep the entry VISIBLE
             // to the no-discard check, but never let it answer an ownership question - otherwise a
             // '?:' arm scores it owning and the receiving local destroys the callee's live value.
-            if (candidate.ReturnsAlias) SuppressCallerRelease(result);
+            if (resultIsAlias) SuppressCallerRelease(result);
         }
         // Return-type `alignas(_, N)`: the callee hands back an N-aligned heap block. Stamp the
         // side-channel so the receiving local frees via __delete_aligned (consumed in ParseDeclaration).
@@ -5082,7 +5132,7 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
         // borrowed env would double-free the slot the container still owns.
         if (result != nullptr
             && functionName != "copy"
-            && !candidate.ReturnsAlias
+            && !resultIsAlias
             && result->getType() == GetClosureFatPtrType())
             RegisterOwnedClosureTemp(result);
 

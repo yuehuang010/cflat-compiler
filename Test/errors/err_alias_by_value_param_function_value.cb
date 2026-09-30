@@ -1,0 +1,16 @@
+// An inferred 'alias' result that can be a by-value parameter is passed through a
+// caller-owned slot, which only a direct call provides - a function value is refused.
+struct AbvU { unique<int> u = default; int n = 0; };
+
+AbvU abvPass(AbvU w) { return w; }
+
+expect_error("cannot use 'abvPass' as a function value");
+
+extern int main()
+{
+    AbvU a;
+    a.n = 3;
+    function fp = abvPass;
+    AbvU x = fp(a);
+    return x.n;
+}

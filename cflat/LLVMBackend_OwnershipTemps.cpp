@@ -150,6 +150,13 @@ bool LLVMBackend::IsAliasValue(const llvm::Value* value) const
             && std::find(aliasValues_.begin(), aliasValues_.end(), value) != aliasValues_.end();
     }
 
+bool LLVMBackend::IsAliasTransferResult(const llvm::Value* value) const
+{
+        return value != nullptr
+            && std::find(aliasTransferResults_.begin(), aliasTransferResults_.end(), value)
+                != aliasTransferResults_.end();
+    }
+
 void LLVMBackend::PropagateAliasValue(llvm::Value* trueValue, llvm::Value* falseValue,
                                       llvm::Value* joined)
 {
@@ -4356,6 +4363,32 @@ void LLVMBackend::RegisterBorrowedOwningStructTemp(const NamedVariable& arg, boo
         RegisterOwnedStructTemp(tempAlloca, arg.TypeAndValue.TypeName);
     }
 
+bool LLVMBackend::AdoptTernaryArmStructTemps(llvm::PHINode* join)
+{
+        if (join == nullptr) return false;
+        std::vector<size_t> armEntries;
+        for (llvm::Value* incoming : join->incoming_values())
+        {
+            bool found = false;
+            for (size_t i = 0; i < pendingOwnedStructTemps.size() && !found; ++i)
+                for (auto* user : pendingOwnedStructTemps[i].Alloca->users())
+                    if (auto* store = llvm::dyn_cast<llvm::StoreInst>(user);
+                        store != nullptr && store->getValueOperand() == incoming
+                        && store->getPointerOperand() == pendingOwnedStructTemps[i].Alloca)
+                    {
+                        armEntries.push_back(i);
+                        found = true;
+                        break;
+                    }
+            if (!found) return false;
+        }
+        std::sort(armEntries.begin(), armEntries.end());
+        armEntries.erase(std::unique(armEntries.begin(), armEntries.end()), armEntries.end());
+        for (auto it = armEntries.rbegin(); it != armEntries.rend(); ++it)
+            pendingOwnedStructTemps.erase(pendingOwnedStructTemps.begin() + static_cast<long>(*it));
+        return true;
+    }
+
 void LLVMBackend::RegisterBorrowedOwningStructTempAt(const NamedVariable& arg, llvm::Value* slot,
                                                      bool fromTernaryArm)
 {
@@ -4665,6 +4698,7 @@ void LLVMBackend::DiscardOwnedTempsSince(const OwnedTempMark& mark)
         movedBorrowedPtrValues_.clear();
         movedBorrowedThroughFieldValues_.clear();
         aliasValues_.clear();
+        aliasTransferResults_.clear();
         tempFieldValues_.clear();
     }
 
@@ -4686,6 +4720,7 @@ LLVMBackend::DetectionLedgerSnapshot LLVMBackend::SnapshotDetectionLedgers() con
         snapshot.movedBorrowedPtrValues_ = movedBorrowedPtrValues_;
         snapshot.movedBorrowedThroughFieldValues_ = movedBorrowedThroughFieldValues_;
         snapshot.aliasValues_ = aliasValues_;
+        snapshot.aliasTransferResults_ = aliasTransferResults_;
         snapshot.tempFieldValues_ = tempFieldValues_;
         return snapshot;
 }
@@ -4707,6 +4742,7 @@ void LLVMBackend::RestoreDetectionLedgers(DetectionLedgerSnapshot snapshot)
         movedBorrowedPtrValues_ = std::move(snapshot.movedBorrowedPtrValues_);
         movedBorrowedThroughFieldValues_ = std::move(snapshot.movedBorrowedThroughFieldValues_);
         aliasValues_ = std::move(snapshot.aliasValues_);
+        aliasTransferResults_ = std::move(snapshot.aliasTransferResults_);
         tempFieldValues_ = std::move(snapshot.tempFieldValues_);
 }
 
@@ -4748,6 +4784,7 @@ void LLVMBackend::FlushOwnedTemps()
         uniqueFieldReadValues_.clear();
         uniqueFieldReadJoins_.clear();
         aliasValues_.clear();
+        aliasTransferResults_.clear();
         tempFieldValues_.clear();
     }
 

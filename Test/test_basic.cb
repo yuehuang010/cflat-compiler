@@ -52,6 +52,20 @@ bool testBuiltinIdentifiers()
     return result;
 }
 
+bool testPointerToIntegerAccepts()
+{
+    int[2] values = {13, 29};
+    int* first = &values[0];
+    bool nonNull = first;
+    auto inferred = first;
+    long explicitValue = (long)first;
+    long difference = &values[1] - first;
+    return Test("pointer_to_bool_null_test", nonNull, true)
+        && Test("pointer_to_integer_explicit_cast", explicitValue, (long)first)
+        && Test("pointer_auto_remains_pointer", inferred == first, true)
+        && Test("pointer_difference_is_integer", difference, 1);
+}
+
 // Raw-union lifetime policy: no hidden active-member tag means member destruction is explicit.
 int unionDtorCount = 0;
 int unionNodeDtors = 0;
@@ -4603,6 +4617,7 @@ extern int main()
 
     int passed = 0;
     int total  = 0;
+    total++; passed += testPointerToIntegerAccepts() ? 1 : 0;
     total++; passed += Test("testArray", testArray(), 435);
     total++; passed += testNamedParameters()             ? 1 : 0;
     total++; passed += Test("testTotalByValue", my.TotalByValue(), 5);
@@ -4756,6 +4771,24 @@ bool testPointerArithmetic()
     // p-- decrements by sizeof(int)
     p--;
     result &= Test("int* p-- elem", *p, 20);
+
+    // Pointer-shaped expression results stay pointers at integer destinations.
+    long ptrDiff = p2 - arr;
+    result &= Test("pointer difference remains integer", ptrDiff, 2);
+    char literalA = 'a';
+    result &= Test("character literal remains character", literalA, 'a');
+    bool boolFromArithmetic = arr + 1;
+    bool boolFromString = "abc";
+    int* nullPointer = nullptr;
+    bool boolFromCoalesce = nullPointer ?? arr;
+    bool boolFromTernary = true ? arr : nullptr;
+    result &= Test("bool from pointer arithmetic", boolFromArithmetic, true);
+    result &= Test("bool from string literal", boolFromString, true);
+    result &= Test("bool from null coalesce", boolFromCoalesce, true);
+    result &= Test("bool from nullptr ternary", boolFromTernary, true);
+    int* postfixNeighbor = arr;
+    postfixNeighbor++;
+    result &= Test("pointer postfix increment remains pointer", *postfixNeighbor, 20);
 
     // Assignment to an existing plain pointer borrows the owning source.
     int* assigned = arr + 1;

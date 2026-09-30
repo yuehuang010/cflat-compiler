@@ -762,6 +762,28 @@ void LLVMBackend::CheckPoisonedFunctionCalls()
         }
     }
 
+void LLVMBackend::CheckAliasReturnSlotAddressTaken()
+{
+        for (const auto& [name, symbols] : functionTable)
+            for (const auto& sym : symbols)
+            {
+                if (sym.Function == nullptr || sym.IsCxx || sym.External) continue;
+                const std::string param = AliasReturnSlotParamName(sym.ReturnType, sym.Parameters);
+                if (param.empty()) continue;
+                for (auto* u : sym.Function->materialized_users())
+                {
+                    auto* call = llvm::dyn_cast<llvm::CallBase>(u);
+                    if (call != nullptr && call->getCalledOperand() == sym.Function) continue;
+                    const std::string shown = sym.SourceName.empty() ? name : sym.SourceName;
+                    LogErrorMessage(
+                        "cannot use '{}' as a function value: its 'alias' result can be its by-value "
+                        "parameter '{}', which only a direct call passes correctly. Call '{}' directly, "
+                        "or declare the parameter 'move' so the result is owned.", { shown, param, shown });
+                    break;
+                }
+            }
+    }
+
 bool LLVMBackend::VerifyModule()
 {
         std::string errors;

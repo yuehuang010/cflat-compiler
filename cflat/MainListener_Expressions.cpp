@@ -4195,6 +4195,15 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                     : std::format("'{}.{}'", namedVar.CallerName, namedVar.FieldName)))
                 return finishStore(right);
 
+            if (right && !(namedVar.BaseType && namedVar.BaseType->isArrayTy())
+                && RejectImplicitPointerToNumber(
+                    ctx, namedVar.TypeAndValue, rightNV, right,
+                    operatorText == "=" ? "assign" : "use in compound assignment",
+                    namedVar.CallerName.empty() ? std::string("this location")
+                    : namedVar.FieldName.empty() ? std::format("'{}'", namedVar.CallerName)
+                    : std::format("'{}.{}'", namedVar.CallerName, namedVar.FieldName)))
+                return finishStore(right);
+
             // Pointer variable assigned a struct value: catch the mismatch here
             // with a clear message rather than letting LLVM assert inside CreateCast.
             // Interface targets are exempt: an interface slot legitimately holds a fat-ptr
@@ -15096,6 +15105,10 @@ bool MainListener::EmitOneFieldInit(
                 errCtx, fieldType, rightNV, val, "brace-initialize",
                 std::format("field '{}.{}'", displayTypeName, fieldName)))
             return false;
+        if (RejectImplicitPointerToNumber(
+                errCtx, fieldType, rightNV, val, "brace-initialize",
+                std::format("field '{}.{}'", displayTypeName, fieldName)))
+            return false;
 
         // `{ f = cppRefCall() }` binds the referent and `{ f = derivedPtr }` shifts to the base
         // subobject: the brace twin of the declaration-initializer and `=` legs.
@@ -15497,6 +15510,10 @@ llvm::Value* MainListener::ParseFieldDefaultInitializer(
             *srcIsUnsigned = nv.TypeAndValue.IsUnsignedInteger() != -1;
         if (RejectImplicitPrimitiveToPointer(
                 ae, field, nv, val, "default-initialize",
+                std::format("field '{}.{}'", structName, field.VariableName)))
+            return val;
+        if (RejectImplicitPointerToNumber(
+                ae, field, nv, nv.Primary, "default-initialize",
                 std::format("field '{}.{}'", structName, field.VariableName)))
             return val;
         RejectCodeValueIntoDataSlot(ae, nv, field, "default-initialize",
@@ -15907,6 +15924,17 @@ bool MainListener::RejectImplicitPrimitiveToPointer(
         auto* compiler = Compiler(ctx);
         if (!compiler->IsImplicitPrimitiveToPointer(target, rhsNV, value)) return false;
         LogErrorContext(ctx, compiler->DescribeImplicitPrimitiveToPointer(
+            target, rhsNV, value, action, destination));
+        return true;
+    }
+
+bool MainListener::RejectImplicitPointerToNumber(
+    antlr4::ParserRuleContext* ctx, const LLVMBackend::TypeAndValue& target,
+    const LLVMBackend::NamedVariable& rhsNV, llvm::Value* value, const std::string& action,
+    const std::string& destination) {
+        auto* compiler = Compiler(ctx);
+        if (!compiler->IsImplicitPointerToNumber(target, rhsNV, value)) return false;
+        LogErrorContext(ctx, compiler->DescribeImplicitPointerToNumber(
             target, rhsNV, value, action, destination));
         return true;
     }
@@ -16478,6 +16506,11 @@ void MainListener::EmitPositionalFixedArrayIntoSlot(
             if (!val) continue;
 
             if (RejectImplicitPrimitiveToPointer(
+                    fi, fixedElemTV, nv, val, "brace-initialize",
+                    std::format("element {} of '{}'", i, name)))
+                continue;
+
+            if (RejectImplicitPointerToNumber(
                     fi, fixedElemTV, nv, val, "brace-initialize",
                     std::format("element {} of '{}'", i, name)))
                 continue;
@@ -17197,6 +17230,11 @@ void MainListener::EmitArrayViewInferredInit(
             if (!val) continue;
 
             if (RejectImplicitPrimitiveToPointer(
+                    fi, elemTV, nv, val, "brace-initialize",
+                    std::format("element {} of '{}'", i, name)))
+                continue;
+
+            if (RejectImplicitPointerToNumber(
                     fi, elemTV, nv, val, "brace-initialize",
                     std::format("element {} of '{}'", i, name)))
                 continue;

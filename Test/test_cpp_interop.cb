@@ -7405,6 +7405,9 @@ extern int main()
     bool rrefBool = cppi.rref_bool();
     char rrefChar = cppi.rref_char();
     int* rrefPointer = cppi.rref_pointer();
+    expect_error("a pointer is not a number") {
+        long rrefPointerAsNumber = cppi.rref_pointer();
+    }
     int rrefEnum = (int)cppi.rref_enum();
     long rrefConst = cppi.rref_const_long();
     long rrefLvalue = cppi.rref_lvalue_long();

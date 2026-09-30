@@ -3228,6 +3228,7 @@ void MainListener::ParseFunctionDefinition(CFlatParser::FunctionDefinitionContex
         // pointer. All paths returning a borrowed parameter means the result is a borrow, so
         // infer 'alias'; paths that disagree give the caller no answer at all, so reject.
         // Copyable returns are untouched - a copy duplicates no ownership.
+        bool aliasOfByValueParam = false;
         if (compiler->TypeOwnsUniquePointer(returnType.TypeName))
         {
             std::string borrowedParam;
@@ -3245,7 +3246,19 @@ void MainListener::ParseFunctionDefinition(CFlatParser::FunctionDefinitionContex
                 return;
             }
             if (returnKind == ValueStructReturnKind::AllBorrowedParam)
+            {
                 returnType.IsAlias = true;
+                aliasOfByValueParam = true;
+            }
+        }
+        if (returnType.IsAlias && !aliasOfByValueParam)
+        {
+            // A spelled `alias T f(T w) { return w; }` hands back a by-value param just the same.
+            auto probe = returnType;
+            probe.IsAlias = false;
+            std::string unused;
+            aliasOfByValueParam = ClassifyValueStructReturns(Compiler(), func, probe, allParams, &unused)
+                == ValueStructReturnKind::AllBorrowedParam;
         }
 
         bool returnsOwned = ComputeReturnsOwned(returnType, name, allParams);
@@ -3468,6 +3481,7 @@ void MainListener::ParseFunctionDefinition(CFlatParser::FunctionDefinitionContex
                     sym.ReturnType = returnType;
                     sym.ReturnsOwned = returnsOwned;
                     sym.ReturnsAlias = returnType.IsAlias;
+                    sym.ReturnsAliasOfByValueParam = aliasOfByValueParam;
                     break;
                 }
             }
@@ -6679,6 +6693,10 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                 // int[] v = runtimeInt; reinterprets a number as an address.
                                 RejectPrimitiveValueIntoArrayView(assignmentExpression, typeAndValue, rightNV);
                                 if (RejectImplicitPrimitiveToPointer(
+                                        assignmentExpression, typeAndValue, rightNV, right,
+                                        "initialize", std::format("variable '{}'", name)))
+                                    right = nullptr;
+                                if (RejectImplicitPointerToNumber(
                                         assignmentExpression, typeAndValue, rightNV, right,
                                         "initialize", std::format("variable '{}'", name)))
                                     right = nullptr;

@@ -175,6 +175,15 @@ cb_extra_args() {
   esac
 }
 
+# A FIRST line `// cflat-twin-args: <flags>` keeps the default compile and runs the test a second
+# time with those flags (e.g. -O2), so one file is covered at both optimization levels.
+cb_twin_args() {
+  local first; first="$(head -n 1 "$1" 2>/dev/null)"
+  case "$first" in
+    '// cflat-twin-args:'*) printf '%s' "${first#'// cflat-twin-args:'}" ;;
+  esac
+}
+
 # Worker: compile (and for .cb run) one test, writing a one-line .result file.
 run_cb() {
   local f="$1" n; n="$(basename "$f" .cb)"
@@ -200,6 +209,18 @@ run_cb() {
     status="PASS"
   else
     status="FAIL run(rc=$?)"
+  fi
+  local -a twin_cb=()
+  read -r -a twin_cb <<< "$(cb_twin_args "$f")"
+  if [ "$status" = "PASS" ] && [ "$RUN_MODE" -eq 0 ] && [ "${#twin_cb[@]}" -gt 0 ]; then
+    if ! $TIMEOUT "$CFLAT" "$f" -i "$LIB" --locale-dir "$LOCALE_DIR" \
+          ${xargs_cb[@]+"${xargs_cb[@]}"} "${twin_cb[@]}" -o "$RES/$n.twin.bin" >>"$log" 2>&1; then
+      status="FAIL compile(${twin_cb[*]})"
+    else
+      $TIMEOUT "$RES/$n.twin.bin" </dev/null >>"$log" 2>&1
+      local twin_rc=$?
+      [ "$twin_rc" -eq 0 ] || status="FAIL run(${twin_cb[*]}, rc=$twin_rc)"
+    fi
   fi
   write_result "$n" "$status" "$t0"
 }
@@ -277,7 +298,7 @@ run_err_warm() {
   fi
 }
 
-export -f run_cb cb_extra_args load_err_flags check_err_result run_err run_err_warm \
+export -f run_cb cb_extra_args cb_twin_args load_err_flags check_err_result run_err run_err_warm \
   is_cpp_interop_test cpp_budget_enabled is_skipped \
   now_ms write_result
 export CFLAT LIB LOCALE_DIR RES TIMEOUT RUN_MODE TIMEOUT_SECS HEAVY_TIMEOUT_SECS HEAVY_TESTS

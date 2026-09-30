@@ -202,6 +202,7 @@ LLVMBackend::BuilderState LLVMBackend::SaveBuilderState()
         s.uniqueFieldReadValues = std::move(uniqueFieldReadValues_);
         s.uniqueFieldReadJoins = std::move(uniqueFieldReadJoins_);
         s.aliasValues = std::move(aliasValues_);
+        s.aliasTransferResults = std::move(aliasTransferResults_);
         s.tempFieldValues = std::move(tempFieldValues_);
         // Mark the function we are leaving mid-body INCOMPLETE for the escape analysis
         // (see FunctionBodyIsComplete); RestoreBuilderState pops it back off.
@@ -235,6 +236,7 @@ LLVMBackend::BuilderState LLVMBackend::SaveBuilderState()
         uniqueFieldReadValues_.clear();
         uniqueFieldReadJoins_.clear();
         aliasValues_.clear();
+        aliasTransferResults_.clear();
         tempFieldValues_.clear();
         return s;
     }
@@ -286,6 +288,7 @@ void LLVMBackend::RestoreBuilderState(const BuilderState& state)
         uniqueFieldReadValues_   = state.uniqueFieldReadValues;
         uniqueFieldReadJoins_    = state.uniqueFieldReadJoins;
         aliasValues_             = state.aliasValues;
+        aliasTransferResults_    = state.aliasTransferResults;
         tempFieldValues_         = state.tempFieldValues;
     }
 
@@ -2428,7 +2431,7 @@ llvm::FunctionType* LLVMBackend::GetFunctionType(const LLVMBackend::TypeAndValue
 
         for (const LLVMBackend::TypeAndValue& arg : arguments)
         {
-            if (!externC && ParameterIsAliasByPointer(arg))
+            if (!externC && (ParameterIsAliasByPointer(arg) || ParamIsAliasReturnSlot(returnType, arg)))
                 types.emplace_back(cflat_llvm::PointerTo(GetType(arg)));
             else
                 types.emplace_back(sized(externC ? GetCCompatibleType(arg) : GetType(arg)));

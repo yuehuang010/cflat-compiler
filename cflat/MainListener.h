@@ -5728,6 +5728,13 @@ public:
                                      const std::string& action,
                                      const std::string& destination);
 
+    bool RejectImplicitPointerToNumber(antlr4::ParserRuleContext* ctx,
+                                       const LLVMBackend::TypeAndValue& target,
+                                       const LLVMBackend::NamedVariable& rhsNV,
+                                       llvm::Value* value,
+                                       const std::string& action,
+                                       const std::string& destination);
+
     // Element identity of a view read out of a struct FIELD, however the field was addressed.
     bool ViewFieldElementForRead(llvm::Value* value, llvm::Value* storage,
                                  LLVMBackend::TypeAndValue& out) const;

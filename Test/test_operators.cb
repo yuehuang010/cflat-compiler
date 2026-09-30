@@ -1,3 +1,4 @@
+// cflat-twin-args: -O2
 
 // ── Vec2: 2D vector with full arithmetic ────────────────────────────────────
 
@@ -912,6 +913,7 @@ extern int main()
     int boolFpPassed = boolToFloatingLegs();
     if (compoundResultOwnershipLegs() != 26) return 57;
     if (byValueParamOwnershipLegs() != 33) return 58;
+    if (byValueAliasTempLegs() != 28) return 59;
 
     return (callPassed == 12 && terPassed == 23 && ptrOpPassed == 8 && uPassed == 3
         && unsignedLiteralPassed == 8 && unsignedAcceptPassed == 7
@@ -1822,5 +1824,84 @@ int byValueParamOwnershipLegs()
         passed += Test("compound on consuming left operand revives destination", *a.p * 100 + *b.p, 502);
     }
     passed += Test("compound on consuming left operand ctor/frees", crCtor * 10 + crDtor, 22);
+    return passed;
+}
+
+// -- An 'alias' return of a by-value parameter, called with a temporary ----------------------------
+// `BaU baPass(BaU w) { return w; }` is an inferred 'alias' return: the result is the argument. A
+// temporary argument has no other owner, so the result takes it over. Master destroyed the
+// temporary at the end of the full expression, so the result read freed memory (the next
+// allocation, `y`, reused the block), or refused the spelling ("cannot store an 'alias' value",
+// "the '?:' arms handle ownership differently"). The argument now lives in a caller-owned slot the
+// callee uses as `w`, so the result never points into a dead callee frame (at -O2 master hit
+// `unreachable`). A named argument keeps its borrow; a borrow of the result survives a later call
+// (master read the clobbered frame). With several sources the caller keeps the one returned.
+struct BaU { unique<int> u = default; int n = 0; int val() { return u.get() == nullptr ? -1 : *u; } };
+BaU baMk(int v) { BaU r; r.u = new int(v); r.n = v; return r; }
+BaU baPass(BaU w) { return w; }
+int baSee(alias BaU w) { return w.val(); }
+BaU baRet() { return baPass(baMk(14)); }
+struct BaHolder { BaU v = default; };
+Q baGen<Q>(Q w) { return w; }
+int baClobber(int k) { int[64] t = default; for (int i = 0; i < 64; i++) t[i] = k + i; return t[k]; }
+int baSeeAfterCall(alias BaU w) { int c = baClobber(3); return w.n + c - 6; }
+int baCtor = 0; int baDtor = 0;
+struct BaT
+{
+    unique<int> u = default;
+    BaT() { baCtor++; }
+    ~BaT() { baDtor++; }
+    int val() { return u.get() == nullptr ? -1 : *u; }
+};
+BaT baTMk(int v) { BaT r; r.u = new int(v); return r; }
+BaT baTPass(BaT w) { return w; }
+int baTSee(alias BaT w) { return w.val(); }
+BaT baTRet() { return baTPass(baTMk(14)); }
+struct BaTHolder { BaT v = default; };
+BaT baTPick(BaT a, BaT b, bool first) { if (first) return a; return b; }
+alias BaT baTSpelled(BaT w) { return w; }
+int byValueAliasTempLegs()
+{
+    int passed = 0;
+    { BaU x = baPass(baMk(5)); BaU y = baMk(77); passed += Test("alias temp decl", x.val() * 100 + y.val(), 577); }
+    { auto x = baPass(baMk(6)); BaU y = baMk(78); passed += Test("alias temp auto", x.val() * 100 + y.val(), 678); }
+    { BaU x = baMk(1); x = baPass(baMk(7)); BaU y = baMk(79); passed += Test("alias temp assign over live", x.val() * 100 + y.val(), 779); }
+    { BaU x = baRet(); BaU y = baMk(80); passed += Test("alias temp return", x.val() * 100 + y.val(), 1480); }
+    passed += Test("alias temp by-value arg", baSee(baPass(baPass(baMk(8)))), 8);
+    passed += Test("alias temp borrow arg", baSee(baPass(baMk(9))), 9);
+    { BaU x = true ? baPass(baMk(10)) : baMk(11); BaU y = baMk(81); passed += Test("alias temp ternary arm", x.val() * 100 + y.val(), 1081); }
+    { BaHolder h = { v = baPass(baMk(12)) }; BaU y = baMk(82); passed += Test("alias temp field init", h.v.val() * 100 + y.val(), 1282); }
+    {
+        int sum = 0;
+        for (int i = 0; i < 10; i++) { BaU x = baPass(baMk(i)); BaU y = baMk(100); sum += x.val(); }
+        passed += Test("alias temp loop", sum, 45);
+    }
+    { BaU x = baPass(baPass(baMk(13))); BaU y = baMk(83); passed += Test("alias temp nested", x.val() * 100 + y.val(), 1383); }
+    { BaU x = baGen<BaU>(baMk(15)); BaU y = baMk(84); passed += Test("alias temp generic", x.val() * 100 + y.val(), 1584); }
+    { BaU a = baMk(16); passed += Test("alias named borrow after call", baSeeAfterCall(baPass(a)) * 100 + a.val(), 1616); }
+    // Counted payload: every constructed object is destroyed exactly once, the result included.
+    baCtor = 0; baDtor = 0;
+    { BaT x = baTPass(baTMk(5)); BaT y = baTMk(77); passed += Test("alias temp counted decl", x.val() * 100 + y.val(), 577); }
+    { auto x = baTPass(baTMk(6)); BaT y = baTMk(78); passed += Test("alias temp counted auto", x.val() * 100 + y.val(), 678); }
+    { BaT x = baTMk(1); x = baTPass(baTMk(7)); BaT y = baTMk(79); passed += Test("alias temp counted assign", x.val() * 100 + y.val(), 779); }
+    { BaT x = baTRet(); BaT y = baTMk(80); passed += Test("alias temp counted return", x.val() * 100 + y.val(), 1480); }
+    passed += Test("alias temp counted by-value arg", baTSee(baTPass(baTPass(baTMk(8)))), 8);
+    passed += Test("alias temp counted borrow arg", baTSee(baTPass(baTMk(9))), 9);
+    { BaT x = true ? baTPass(baTMk(10)) : baTMk(11); BaT y = baTMk(81); passed += Test("alias temp counted ternary", x.val() * 100 + y.val(), 1081); }
+    { BaTHolder h = { v = baTPass(baTMk(12)) }; BaT y = baTMk(82); passed += Test("alias temp counted field", h.v.val() * 100 + y.val(), 1282); }
+    {
+        int sum = 0;
+        for (int i = 0; i < 10; i++) { BaT x = baTPass(baTMk(i)); BaT y = baTMk(100); sum += x.val(); }
+        passed += Test("alias temp counted loop", sum, 45);
+    }
+    { BaT x = baTPass(baTPass(baTMk(13))); BaT y = baTMk(83); passed += Test("alias temp counted nested", x.val() * 100 + y.val(), 1383); }
+    { baTPass(baTMk(17)); }
+    passed += Test("alias temp counted ctor/dtor", baCtor * 100 + baDtor, 3939);
+    baCtor = 0; baDtor = 0;
+    { BaT x = baTPick(baTMk(1), baTMk(2), true); BaT y = baTMk(77); passed += Test("alias temp two-source first", x.val() * 100 + y.val(), 177); }
+    { BaT x = baTPick(baTMk(1), baTMk(2), false); BaT y = baTMk(78); passed += Test("alias temp two-source second", x.val() * 100 + y.val(), 278); }
+    { bool c = true; BaT x = baTPass(c ? baTMk(3) : baTMk(4)); BaT y = baTMk(79); passed += Test("alias temp ternary argument", x.val() * 100 + y.val(), 379); }
+    { BaT x = baTSpelled(baTMk(15)); BaT y = baTMk(84); passed += Test("alias temp spelled alias", x.val() * 100 + y.val(), 1584); }
+    passed += Test("alias temp multi-source ctor/dtor", baCtor * 100 + baDtor, 1010);
     return passed;
 }
