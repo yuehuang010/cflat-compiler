@@ -195,6 +195,29 @@ torch, simdjson and fmt: cflat cold <= 1.1x and warm <= 1.1x clang++, measured o
 
 ---
 
+## Status 2026-09-29 evening (perf timebox, master 93b361f6, macOS arm64, PGO LLVM 23.1.0)
+
+scratch/cmp/libs_parity.sh N=3, cold = fresh header cache with warm core, `-B -o`:
+
+| case | clang++ | cold | ratio | warm ratio |
+|---|---|---|---|---|
+| fmt_01 / 02 / 04 | 0.22-0.23 | 0.23-0.24 | 1.04-1.05x | 0.41-0.45x |
+| fmt_03_memory_buffer | 0.16 | 0.22 | 1.38x | 0.62x |
+| json_01 / 02 / 03 | 0.52-0.62 | 0.61-0.81 | 1.17-1.31x | 0.27-0.37x |
+| simdjson_01 / 02 | 0.48 / 0.51 | 0.53 / 0.61 | 1.10x / 1.20x | 0.25 / 0.29x |
+| torch_01..93 (13 cases) | 3.2-3.5 | 3.3-4.2 | 1.02-1.20x | 0.14-0.20x |
+
+Geomean cold 1.14x (1.75x at 377ce83c this morning), warm 0.24x. Landed: 93b361f6 PGO LLVM preset (R2),
+93b361f6 F1 per-compile floor, 93b361f6 R3 on-demand default wrappers, 93b361f6 R1 demand-only special
+members (>= 64 pending records), 93b361f6 H1 import floor, 93b361f6 R4 member bodies on call (json -28%,
+torch +4.4% instructions, filed p3/cpp-demand-bodies-torch-cold-cost).
+Residual on fmt_03 (200 vs 130 ms) and simdjson_02 (640 vs 480 ms): header parse is already below clang's
+frontend; the extra is spread over harvest (6 / 18 ms), re-harvest (4 / 12), ABI arrangement + body
+CodeGen (8 / 33), type requests (4 / 49), demand companion (2 / 16); link 26 ms equals warm
+(scratch/repro_keep/t1/t1_profile.md). No single mechanical item left; next levers are merging harvest
+and re-harvest, batching stage-1/2 requests, and the torch_05-07 cases (1.20x).
+Dropped: S4 re-harvest projection replay (no torch gain), PCH (clang++ uses none, cannot count).
+
 ## History: the three C++ interop fixtures gate CI wall time (buildci warm 372 s vs 300 s target)
 
 **Summary.** `buildci.bat` Release, warm request cache, 2026-09-26: 372 s green. test.bat 144 s

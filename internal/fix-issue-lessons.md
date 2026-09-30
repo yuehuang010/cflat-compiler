@@ -390,6 +390,16 @@ The recurring failure mode of this whole family, stated once:
 - Escalation and cleanup both look at git state; git state alone cannot distinguish "not started"
   from "in progress."
 
+## On squashing a branch onto master
+
+- **`git reset --soft master` on a branch NOT based on current master reverts whatever master
+  gained since the branch point.** Soft reset keeps the branch's TREE and moves HEAD, so the
+  squash commit's diff is "master -> branch tree" - every file master changed after the branch
+  forked is silently rolled back. 2026-09-29: D5 was based on the pre-E2 master; after E2 landed,
+  the squash produced a commit that deleted E2 and still ff-merged cleanly (it IS a descendant).
+  Caught only by reading `--stat`. **Rebase, then `git merge-base --is-ancestor master HEAD`,
+  then squash - in the SAME command**, so a failed or skipped rebase stops the squash.
+
 ## On deciding whether a deferral was correct
 
 - **A deferred item is often two sub-cases with different answers.** A fix agent deferred a

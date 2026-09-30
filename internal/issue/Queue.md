@@ -63,7 +63,6 @@ concurrent runs on the same function). Run ids are new for this regroup; old ids
 
 | Run | Issue(s) | Site | Notes |
 |-----|----------|------|-------|
-| C4 | p3/cpp-trivial-class-operator-assign-int-rejected-as-scalar-store | trivial-class assignment path vs declared operator= | NEW 2026-09-28 (A7) |
 | A3 | p3/cpp-incremental-retry-after-failed-parse-crashes | ModuleBuilder / IncrementalAction GenModule | latent (t14-t16, t31 cold retries); known trigger closed. Same subsystem as A1 - run AFTER A1 lands |
 
 ## B - wrong value / wrong overload pick
@@ -71,47 +70,33 @@ concurrent runs on the same function). Run ids are new for this regroup; old ids
 | Run | Issue(s) | Site | Notes |
 |-----|----------|------|-------|
 | B5 | p3/cpp-const-twin-overloads-collapse | C++ class member registration (const / non-const twins share one CFlat signature) | NEW 2026-09-28 (B1 matrix, OUT cells C1/C4, E1-E5, F1/F4, H1/H4/H9, L10) |
-| B6 | p3/cpp-global-class-assignment-picks-copy-assign-over-converting-assign | global-destination assignment path | NEW 2026-09-28 (A7 review) |
 | B12 | p3/cflat-extern-definition-abi-leftovers | function<> to >16B-struct C fn crossing C: reverse-thunk design (RULING) | OPEN (return-ext part landed 2cd2bb58) |
 | B13 | p2/owning-struct-borrowed-deref-and-byvalue-param-double-free | `return *o` through a borrowed pointer: refuse like h->f or move like T t = *o | PARKED (RULING); by-value part landed 059d1f42 |
-| B14 | p3/c-flexible-array-member-leftovers | sizeof/alignof/move on flexible members | NEW 2026-09-28 (A6 review 3) |
-| B23 | p3/c-anonymous-record-member-flexible-array-not-promoted | C anonymous struct member with a flexible array tail unreachable | NEW 2026-09-28 (A6 r2) |
-| B15 | p3/cpp-conversion-operator-receiver-leftovers | rvalue-member arms, const pick, ambiguity | NEW 2026-09-28 (A9b reviews) |
+| B14 | p3/c-flexible-array-member-leftovers | move a->data (RULING: explicit move of a raw pointer) + 3 pre-existing P3 | OPEN (sizeof/alignof landed 118c2769) |
 | B16 | p3/cpp-operator-move-operand-leftovers | template U&&, elision, move into const&-only ruling | NEW 2026-09-28 (D8 report) |
-| C6 | p3/cpp-ctor-ranking-leftovers | decl-form literal retyping; new T() blocked survivor | NEW 2026-09-29 (C5 review) |
 | B18 | p3/cpp-assignment-result-leftovers-after-b9 | extra copies (paren call arms, arr elem init) + bare scalar/nested ternary refusals + 3 unrelated | OPEN (P2 landed 1955bd95) |
-| B19 | p3/cpp-unary-operator-leftovers-after-d7 | const/non-const free pair rank, unsigned/ll conversions unbound, native member unary on copy | NEW 2026-09-29 (D7 report) |
-| B20 | p2/cpp-const-object-nonconst-member-call-writes-readonly | const receiver leftovers: const fields, const T* local, kind-1 refusal, virtual base, ambiguity | OPEN (main part landed 44d3321c) |
-| B21 | p2/alias-return-from-temporary-use-after-free | `U x = f(mk(5))` with alias-return f reads freed temp | NEW 2026-09-29 (B13 review) |
-| B22 | p2/byvalue-param-owning-leftovers-after-b13 | closure param return rc138, unary by-value consume rc133, lambda/&w writes, C++ move-only return w | NEW 2026-09-29 (B13 r2) |
+| B21b | p2/alias-return-byvalue-param-leftovers-after-b21 | mixed named+temp arg UAF, C-linkage definitions, refusal location, prototype link error, fn-value support (ruling) | NEW 2026-09-29 (B21 review) |
 | G6 | p3/header-cache-residual-growth | in-version prune age rule (sigbase, dead request configs, cxxdemand) | NEW 2026-09-29 (split from G5) |
 | B2 | PARKED 2026-09-28 after 3 Codex rounds (scratch/b2_parked.patch): p3/cpp-string-literal-template-deduction-and-unspellable-char-args + p3/cpp-std-min-long-and-pointer-arguments-refused. Free-array issue closed (premise disproved, [over.ics.rank]/3.2.1). Restart from master on opus with the narrower design in the issue files | RequestCxxFunctionTemplate argument spelling (CxxStringLiteralSpelling, InferImplicitCxxArgumentType) | NEW. One mechanism: spell array / literal lvalues as `*reinterpret_cast<E (*)[N]>(p)` like the member path (e6c60220); give `long` arithmetic, `char*` and pointer-arithmetic rvalues a C++ spelling |
 | B2b | p2/l-suffix-incoherent-on-llp64 | literal `L` typing vs C++ `long` identity | NEW 2026-09-28 (Windows). Same family as B2 (long spelling); may need a ruling on what `5L` means on LLP64 - ask before starting |
 | B3 | p3/cpp-pointer-argument-prefers-char-pointer-over-converting-ctor + p3/cpp-single-level-pointer-unproven-at-call-argument + p3/cpp-operator-address-of-operand-not-converted | IsProvenPrimitiveSinglePointerArg / CompareUpconvert | old bucket 2b (2a landed as AT). Pointer-is-not-a-number ruling |
-| B4 | p3/cpp-ctor-expression-position-const-ref-copies-lvalue | SelectCxxConstructor, expression-position ctor | 2 bugs; run after C1 (same function) |
 
 ## C - wrongly accepted (adds a rejection)
 
 | Run | Issue(s) | Site | Notes |
 |-----|----------|------|-------|
-| C2 | p3/cpp-class-vs-class-template-same-name-conflict-not-diagnosed | CheckCxxNamespaceConflicts | one site |
 
 ## D - wrongly refused (acceptance gaps)
 
 | Run | Issue(s) | Site | Mode |
 |-----|----------|------|------|
 | D1b | p3/cpp-nullptr-t-free-function-and-void-pointer-gaps + p3/cpp-unguarded-header-class-template-lookup-fails-cold (cold-cache only) | free-function selection; incremental request units | NEW 2026-09-28 (D1 leftovers) |
-| D5 | p3/cpp-operator-chain-reference-result-refused | fold carry (after D2) | NEW 2026-09-28 (D2 review); batch candidate |
-| D6 | p3/cpp-pointer-return-unrequested-specialization-not-retried | refused-member retry eligibility | NEW 2026-09-28 (D3) |
-| D4 | p3/cpp-no-unique-address-with-bitfields-or-anonymous-member-refused | PackBitfields | full (AP landed, unblocked) |
 | - | p3/cpp-converting-ctor-raw-array-source-refused-implicit, p3/cpp-expression-template-to-cflat-byvalue-class-param-refused (NEW) | converting-ctor path | absorbed by P1 (converting constructors); land there |
 
 ## E - temporary lifetime, leak, dangle (one issue per run, opus-tier area)
 
 | Run | Issue | Notes |
 |-----|-------|-------|
-| E1b | p3/cpp-brace-argument-backing-remaining-shapes (4 open shapes after 86ccc218) | RequestCxxFunctionTemplate, convertElements, ctor-template packs | follow-up; item 1 (function template list reads garbage) is the user-visible one |
-| E2 | p3/coalesce-arm-temp-cxx-borrow-and-return-flush-gaps | leak + early free, 3 sub-bugs near DropRetainedJoinArmPtrTemps |
 | E3 | p3/cpp-unwind-cleanup-gaps-ctor-new-temporaries | follow-up list after d59df39b / cpp-unwind2 |
 | E4 | p3/cpp-new-remaining-allocator-gaps | follow-up list after cpp-class-operator-new (5 items) |
 
@@ -139,12 +124,55 @@ concurrent runs on the same function). Run ids are new for this regroup; old ids
 
 | Id | Item | Notes |
 |----|------|-------|
-| P0 | p1/cpp-import-compile-time-parity-with-clang | master: warm 0.15x (met), cold 1.6x plain / 1.2x PGO+ThinLTO. Remaining cold cost is the eager define passes (0.75 s) = ruling item (demand-only bindable surface) + chunk-0 parse; see memory cpp-header-cost-model. Not in the fix timebox unless ruled |
+| P0 | p1/cpp-import-compile-time-parity-with-clang | master 93b361f6 (perf timebox 2026-09-29c, PGO LLVM): test_libs geomean cold 1.14x (was 1.75x), warm 0.24x; worst fmt_03 1.38x, json_01 1.31x, simdjson_02 1.20x, torch 1.02-1.20x. Rulings R1/R3/R4 landed. Next: fmt_03 / simdjson_02 residual (profile scratch/repro_keep/t1/t1_profile.md), json stage-2 remainder, N28 / N35 costs; resume notes scratch/resume_2026-09-29c.md |
 | P1 | plan converting-constructors (`internal/plan/converting-constructors.md`) | ruled 2026-09-26; eigen_05; absorbs D-row converting-ctor-raw-array + expression-template-to-cflat-byvalue-param. Largest item, own staging |
 | P2 | plan cflat-struct-nontrivial-cxx-fields (`internal/plan/cflat-struct-nontrivial-cxx-fields.md`) | ruled A 2026-09-27. Phase 0 (stopgap refusal) is small and can go early; phases 1-4 one per branch. Absorbs p2/cpp-struct-list-field-relocated-bitwise, p3/cpp-prvalue-to-cflat-byvalue-param-extra-copy, p3/cpp-typed-local-extra-copy-from-param-and-ctor-arms |
 | P3 | std library coverage: cppinterop/stream-classes-no-callable-destructor, cppinterop/stream-open-instantiation-error, cppinterop/std-header-coverage-spike | re-run the survey after B-E land to refresh the gap list |
 | P5 | p3/debug-assert-setvisibility-cross-target-elf | cross-target (-p win64) only; fold into p3/cross-target-compile-gaps work |
 | P4 | virtual-base layout (item 2 of p3/cpp-inherited-member-access-and-virtual-base-diagnostics) | refused today ("layout cannot be reproduced", CInterop ~14229); needs a plan |
+
+## New or rewritten 2026-09-29 (leftovers from landed rows; group at the next queue build)
+
+| Run | Issue | Summary | Status |
+|---|---|---|---|
+| N1 | p2/byvalue-param-owning-leftovers-after-b13 | By-value owning param leftovers after B13 | NEW 2026-09-29 |
+| N2 | p2/cpp-arm-temp-stored-then-throw-freed-on-unwind | [P2] C++ arm temp stored then throw is freed during unwind | NEW 2026-09-29 |
+| N3 | p2/cpp-const-object-nonconst-member-call-writes-readonly | Remaining const C++ receiver gaps | NEW 2026-09-29 |
+| N4 | p2/cpp-conversion-operator-multiword-silent-mispick | C++ multi-word conversion operators (`operator unsigned`, `long long`, `signed char`, `long double`) silently  | NEW 2026-09-29 |
+| N5 | p2/cpp-conversion-operator-on-destroyed-ternary-temporary | C++ conversion operator runs after ternary temporary destruction | NEW 2026-09-29 |
+| N6 | p2/cpp-explicit-specialization-separate-import-gets-primary-layout | Explicit specialization in a separately imported header gets the primary template's layout | NEW 2026-09-29 |
+| N7 | p2/o2-builtin-folding-overrides-cflat-definitions | test_cpp_interop.cb still fails at -O2 (non-unwind leftovers) | NEW 2026-09-29 |
+| N8 | p3/coalesce-nested-ternary-arm-new-verifier-failure | [P3] Coalesce containing nested ternary arm new fails verification | NEW 2026-09-29 |
+| N9 | p3/cpp-assign-operator-route-leftovers | C++ assignment operator route leftovers | NEW 2026-09-29 |
+| N10 | p3/cpp-brace-argument-backing-remaining-shapes | Brace-list backing: optional constructor parameter case remains | NEW 2026-09-29 |
+| N11 | p3/cpp-constructor-call-accepts-implicit-narrowing | Bucket: C (ruling needed: scalar conversion table at C++ calls) | NEW 2026-09-29 |
+| N12 | p3/cpp-conversion-operator-receiver-leftovers | C++ conversion-operator receiver and class-result leftovers | NEW 2026-09-29 |
+| N13 | p3/cpp-ctor-expression-position-const-ref-copies-lvalue | C++ ctor in expression position - remaining `const T&` copies and enum `T&&` refusal | NEW 2026-09-29 |
+| N14 | p3/cpp-ctor-ranking-leftovers | P3 C++ constructor ranking leftovers after C6 round 2 | NEW 2026-09-29 |
+| N15 | p3/cpp-default-wrapper-batch-chunk-stores-stripped-prefix | C++ header default-wrapper batch chunk stores a stripped prefix (latent replay failure) | NEW 2026-09-29 |
+| N16 | p3/cpp-float-ctor-double-verifier | P3 | NEW 2026-09-29 |
+| N17 | p3/cpp-namespace-conflict-check-leftovers | C++ namespace conflict check leftovers (after C2) | NEW 2026-09-29 |
+| N18 | p3/cpp-pointer-return-unrequested-specialization-not-retried | Remaining C++ free-operator and converting-constructor retry gaps | NEW 2026-09-29 |
+| N19 | p3/cpp-private-base-instance-member-diagnostics | Instance members and operators behind a private/protected base: generic refusal text | NEW 2026-09-29 |
+| N20 | p3/cpp-reference-returning-shift-and-logical-operators-refused | Bucket: p3 (C++ interop operators; found by the D5 round-2 review, 2026-09-29) | NEW 2026-09-29 |
+| N21 | p3/cpp-static-data-member-use-forms | C++ static data members: chained field access and instance-receiver access refused | NEW 2026-09-29 |
+| N22 | p3/cpp-template-ctor-deduction-enum-and-arith-rvalue | C++ template constructor deduction - enum lvalue and arithmetic rvalue deduce the wrong T | NEW 2026-09-29 |
+| N23 | p3/cpp-unary-operator-leftovers-after-d7 | Unary operator leftovers after D7+C3 | NEW 2026-09-29 |
+| N24 | p3/cpp-unrequested-specialization-pointer-eager-request | Bucket: p3 (C++ interop compile time; left by D6, fix/unrequested-spec-pointer-retry, 2026-09-29) | NEW 2026-09-29 |
+| N25 | p3/pointer-to-number-diagnostic-hint-leftovers | Pointer -> number store refusal: diagnostic hint leftovers | NEW 2026-09-29 |
+| N26 | p3/return-keep-rule-later-defined-callee-leaks | Bucket: p3 (ownership temporaries; left by E2, fix/coalesce-arm-temp-gaps, 2026-09-29) | NEW 2026-09-29 |
+| N27 | p3/cpp-default-wrapper-tie-list-shows-wrapper-shape | Ambiguous call through a default-argument wrapper lists wrapper shapes, not declarations (R3 review) | NEW 2026-09-29 perf |
+| N28 | p3/cpp-deferred-special-members-mid-size-harvest-cost | R1 deferral costs +1-2% cold on 64..~500-record harvests (interop fixtures); cutoff adjustable later (maintainer) | NEW 2026-09-29 perf |
+| N29 | p2/cpp-copy-of-class-with-ill-formed-copy-ctor-compiles | Copy of a C++ class whose implicit copy ctor is ill-formed compiles; now exit 139 in clang CodeGen, implicit or defaulted (pre-existing, R1 + D8 reviews) | NEW 2026-09-29 perf |
+| N30 | p2/cpp-import-transitive-syntax-error-hangs | Syntax error in a transitively included C++ header hangs the compile (pre-existing, H1 review) | NEW 2026-09-29 perf |
+| N31 | p3/cpp-interpreter-drops-cc1-only-flags | -Xclang cc1-only flags silently dropped by the Interpreter driver (pre-existing, H1 review) | NEW 2026-09-29 perf |
+| N32 | p2/cpp-body-failure-silently-picks-other-overload | Body failure of the winning C++ overload retries a different overload (pre-existing, R4 review) | NEW 2026-09-29 perf |
+| N33 | p3/cpp-invalid-virtual-body-link-failure | Invalid virtual body of a C++ class template = link failure, not a use-site error (pre-existing, R4 review) | NEW 2026-09-29 perf |
+| N34 | p3/cpp-deployment-target-env-core-cache-miss | Non-default MACOSX_DEPLOYMENT_TARGET misses the core bitcode cache every compile (R4 review) | NEW 2026-09-29 perf |
+| N35 | p3/cpp-demand-bodies-torch-cold-cost | R4 costs +4.4% cold instructions on torch (json -28%); verdict writes batched in 93b361f6 (-0.55%), rest is clang instantiation | PART 2026-09-29d |
+| N36 | p3/cpp-demand-second-use-of-failed-helper-generic-text | Second use through an already-failed helper refused without clang's text (R4 review) | NEW 2026-09-29 perf |
+| N37 | p3/cpp-signature-registration-projects-records | Registration projects every record a signature names; -3.6% torch only by skipping projection, which breaks overload order (D4) | NEW 2026-09-30 perf |
+| N38 | p2/cpp-static-inline-member-failed-initializer-reads-zero | Static inline member whose initializer fails static_assert reads 0 silently (pre-existing, D8 review) | NEW 2026-09-30 perf |
 
 ## Parked - needs a maintainer ruling before any work
 
@@ -193,6 +221,34 @@ box untouched. Main-session review cadence: batch ready branches into one review
 
 | Hash | Row | Issue(s) |
 |------|-----|----------|
+| 93b361f6 | D8 (perf) | p1/cpp-import-compile-time-parity-with-clang (part), N38 filed | incremental C++ imports record the demand plan without import-time body emission / error sweep; torch -1.4% instr |
+| 93b361f6 | D2 (perf) | p1/cpp-import-compile-time-parity-with-clang (part) | registration per-entry trims + CHR trace scopes + CFLAT_TIME_TRACE_GRANULARITY_US; torch -0.4% instr |
+| 93b361f6 | T2 (perf) | p1/cpp-import-compile-time-parity-with-clang (part) | PathInScope memo + xcrun SDK prefetch; torch ~-1.8% instr, fmt_03 warm ~-12% |
+| 93b361f6 | N35 (perf, part) | p3/cpp-demand-bodies-torch-cold-cost (part) | demand verdicts flushed once per file per compile, merged with disk; torch -0.55% instr, json_01 -2.5% |
+| 93b361f6 | R4 (perf) | p1/cpp-import-compile-time-parity-with-clang (part), N32-N36 filed | member bodies instantiate on call; macOS deployment target follows clang++; json cold 1.87x -> 1.35x, torch +4.4% instr |
+| 93b361f6 | H1 (perf) | p1/cpp-import-compile-time-parity-with-clang (part), N30-N31 filed | cold import floor: group setup, namespace scan, dep stamping, cheaders JSON; fmt / simdjson -0.1..-0.15x, torch -7% instr |
+| 93b361f6 | R1 (perf) | p1/cpp-import-compile-time-parity-with-clang (part), N28-N29 filed | implicit special members defined on first use (>= 64 pending records); torch -7.6% instr |
+| 93b361f6 | R3 (perf) | p1/cpp-import-compile-time-parity-with-clang (part), N27 filed | default-argument wrappers built on demand; torch -9% instr |
+| 93b361f6 | F1 (perf) | p1/cpp-import-compile-time-parity-with-clang (part) | fixed per-compile floor on macOS (tool discovery once, core pruning before O0 passes) |
+| 93b361f6 | R2 (perf) | - | macOS Release links the PGO-built LLVM 23.1.0 |
+| 118c2769 | E1b | p3/cpp-brace-argument-backing-remaining-shapes (rewritten to leftovers) | brace-list args beside by-value / const A&... ctor packs ranked from the declared pattern; unmirrorable packs keep master refusal |
+| 118c2769 | B4 | p3/cpp-ctor-expression-position-const-ref-copies-lvalue (rewritten to leftovers), p3 template-ctor deduction filed | expression-position ctor binds exact-type lvalue to const T& |
+| 118c2769 | B15 | p3/cpp-conversion-operator-receiver-leftovers (rewritten), p2 destroyed-ternary-temp + p2 multiword-silent-mispick filed | implicit conversion-operator ranking exact/promotion/standard + ambiguity, overload ranking same |
+| 118c2769 | B20d | p2/cpp-const-object-nonconst-member-call-writes-readonly (rewritten to leftovers) | const record fields (mutable/pointer excluded, cache v133), &const& result sticky const, const-object template member refused, base ambiguity |
+| 118c2769 | D5 | p3/cpp-operator-chain-reference-result-refused (filed p3/cpp-reference-returning-shift-and-logical-operators-refused) | reference-result fold carry, outermost-only decl/return slot |
+| 118c2769 | E2 | p3/coalesce-arm-temp-cxx-borrow-and-return-flush-gaps (filed p2/cpp-arm-temp-stored-then-throw-freed-on-unwind, p3/coalesce-nested-ternary-arm-new-verifier-failure, p3/return-keep-rule-later-defined-callee-leaks) | C++ borrow frees join arms, return keep rule for pointer-bearing results, nested arm slot re-key |
+| 118c2769 | D4 | p3/cpp-no-unique-address-with-bitfields-or-anonymous-member-refused | Itanium C++ bitfield runs reconciled with clang offsets, [N x i8] byte runs + align-1 access only there; 9 refused shapes now bind |
+| 118c2769 | D6 | p3/cpp-pointer-return-unrequested-specialization-not-retried (rewritten to leftovers; filed p3/cpp-unrequested-specialization-pointer-eager-request) | pointer-to-unrequested-specialization member results request the pointee on projection; std::function identity + suffix guards |
+| 118c2769 | B19 | p3/cpp-unary-operator-leftovers-after-d7 (rewritten to leftovers) | free-operator const/category ranking like clang (unary+binary, any decl order), C++ free binary ops via free path, member unary on lvalue slot, operator! before bool |
+| 118c2769 | B22 | p2/byvalue-param-owning-leftovers-after-b13 (rewritten to leftovers) | unary/binary by-value owning operand consume = direct call, alias-return operand borrow, C++ move-only implicit-move return |
+| 118c2769 | C2 | p3/cpp-class-vs-class-template-same-name-conflict-not-diagnosed (filed p2/cpp-explicit-specialization-separate-import-gets-primary-layout, p3/cpp-namespace-conflict-check-leftovers) |
+| 118c2769 | C6 | p3/cpp-ctor-ranking-leftovers (rewritten to leftovers) | decl-form literal ranking, new scalar identity + clang delegation, float->int refusal = master set; new p3/cpp-float-ctor-double-verifier |
+| 118c2769 | C4+B6 | p3/cpp-trivial-class-operator-assign-int-rejected-as-scalar-store, p3/cpp-global-class-assignment-picks-copy-assign-over-converting-assign | direct operator= on trivial/global/released routes; assignment value from the selected operator's declared return (4 review rounds + Fable advisor design); leftovers -> p3/cpp-assign-operator-route-leftovers |
+| 118c2769 | O2X | (new, found 2026-09-29) C++ exception through CFlat frames uncaught at -O2 | [cpp] struct ctor helpers no longer noexcept, reverse ABI thunk unwindable (even -O0); test_operators -O2 twin legs; leftovers -> p2/o2-builtin-folding-overrides-cflat-definitions |
+| ab51bb41 | P2I | p2/implicit-pointer-to-integer-accepted-at-stores | pointer -> number refused at every store position (ruling 2026-09-26), bool exempt; hint leftovers -> p3/pointer-to-number-diagnostic-hint-leftovers |
+| 118c2769 | B14+B23 | p3/c-flexible-array-member-leftovers (sizeof/alignof), p3/c-anonymous-record-member-flexible-array-not-promoted | zero-length sizeof 0, flexible sizeof refused in every spelling, alignof = element, per-operand keep scope, anonymous flex tail promoted; cache v132 |
+| ab51bb41 | B21 | p2/alias-return-from-temporary-use-after-free | alias-source by-value params passed as caller-owned copy slot; temp transfers to result; -O2 correct; function-value use refused; test.sh cflat-twin-args |
+| 118c2769 | B20c | p2/cpp-const-object-nonconst-member-call-writes-readonly (items 2,3,4,7) | typed pointer local keeps sticky hidden pointee const; non-const-only refusal for every const receiver kind; inherited member on const global refused (was SIGBUS); mixed-set const refusal |
 | 44d3321c | B20 | p2/cpp-const-object-nonconst-member-call-writes-readonly (main) | const twin overloads for const receivers (methods, binary + unary member ops), refusal for non-const-only named calls |
 | 1955bd95 | B18 | p3/cpp-assignment-result-leftovers-after-b9 (P2) | parenthesized ternary of assignment arms takes the ternary route (return + decl) |
 | 059d1f42 | B13 | p2/owning-struct-borrowed-deref-and-byvalue-param-double-free (by-value part) | by-value owning param return/whole-write -> consume-inferred sink or copy; binary op operand consume; leftovers B21, B22 |
