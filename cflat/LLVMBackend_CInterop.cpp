@@ -16051,8 +16051,8 @@ void LLVMBackend::RegisterCRecords(std::vector<CRecordEntry>& records, const std
                     // A C++ field whose TYPE has no CFlat mapping yet (a class-template
                     // specialization such as `ImVector<T>`) still has a size and alignment
                     // from Clang: embed it as an opaque blob so the record and its other
-                    // fields stay usable. Typed access to the blob is the request layer's
-                    // follow-up (internal/issue/cppinterop/template-typed-field-drops-record.md).
+                    // fields stay usable. Typed access to the blob goes through the request
+                    // layer.
                     DeclTypeAndValue blob;
                     if (r.isCxx && !f.isBitfield && arrDims.empty() && MakeOpaqueFieldBlob(f, blob))
                     {

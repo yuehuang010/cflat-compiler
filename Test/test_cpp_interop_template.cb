@@ -1069,7 +1069,7 @@ extern int main()
     if (batchUnsigned[0] < 2000000000) return 988;
 
     // Compile/link assertion only: default count() is zero for every specialization; nonzero
-    // construction remains open in cppinterop/constrained-template-constructor-overload-resolution.md.
+    // construction (duration<long long>(5)) is covered by constructor-template resolution.
     std.chrono.duration<long long> batchDuration = default;
     if (batchDuration.count() != 0) return 986;
 
