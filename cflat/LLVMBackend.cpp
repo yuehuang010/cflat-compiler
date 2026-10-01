@@ -4653,6 +4653,7 @@ void LLVMBackend::ResetForReanalysis()
     cxxIncrementalGroups_.clear();
     cxxDemandGroups_.clear();
     cxxBodyChecks_.clear();
+    cxxConstructorBodyRefusals_.clear();
     cxxVerdictFileMemo_.clear();
     cxxVerdictFiles_.clear();
     cxxDemandRefusalRelay_ = {};

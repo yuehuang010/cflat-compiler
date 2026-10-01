@@ -1,0 +1,2 @@
+expect_error("clang:");
+import cpp "cpp_transitive_syntax_outer.h";

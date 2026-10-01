@@ -1,6 +1,8 @@
 #include "CxxIncrementalGroup.h"
 
 #include "clang/AST/ASTContext.h"
+#include "clang/AST/Attr.h"
+#include "clang/AST/Mangle.h"
 #include "clang/AST/Decl.h"
 #include "clang/AST/DeclCXX.h"
 #include "clang/AST/DeclContextInternals.h"
@@ -44,6 +46,59 @@
 
 namespace
 {
+    // The complete-object linkage symbol, the key the extractor stores a constructor under.
+    std::string ConstructorLinkageSymbol(const clang::CXXConstructorDecl* ctor)
+    {
+        clang::ASTContext& context = ctor->getASTContext();
+        std::unique_ptr<clang::MangleContext> mangle(context.createMangleContext());
+        std::string symbol;
+        llvm::raw_string_ostream out(symbol);
+        mangle->mangleName(clang::GlobalDecl(ctor, clang::Ctor_Complete), out);
+        out.flush();
+        return symbol;
+    }
+
+    /*
+     * Sema marks an instantiation whose body failed invalid, and constructor overload resolution
+     * skips invalid constructors (SemaInit): a later `T(args)` in this incremental TU would then
+     * silently pick another one, and a trait (is_constructible) would answer for the sibling. A
+     * single C++ TU ranks a declared constructor whether or not its body compiles, so make the
+     * constructor valid again with an empty body. Its poison entry refuses whatever selects it.
+     */
+    bool RevalidateFailedConstructor(const clang::FunctionDecl* function)
+    {
+        auto* ctor = const_cast<clang::CXXConstructorDecl*>(
+            llvm::dyn_cast_or_null<clang::CXXConstructorDecl>(function));
+        if (ctor == nullptr || !ctor->isInvalidDecl()) return false;
+        clang::ASTContext& context = ctor->getASTContext();
+        // Emptied body and initializers keep CodeGen off the error nodes once a chunk selects
+        // it (a failed mem-initializer crashes EmitCtorPrologue); poisoning refuses reaching it.
+        if (ctor->doesThisDeclarationHaveABody())
+            ctor->setBody(clang::CompoundStmt::CreateEmpty(context, /*NumStmts*/ 0,
+                                                           /*HasFPFeatures*/ false));
+        ctor->setNumCtorInitializers(0);
+        ctor->setInvalidDecl(false);
+        return true;
+    }
+
+    // First poisoned constructor a `__cflat_` helper body constructs, with its cause.
+    struct ConstructedWalk : clang::RecursiveASTVisitor<ConstructedWalk>
+    {
+        std::vector<const clang::CXXConstructorDecl*> found;
+        bool shouldVisitImplicitCode() const { return true; }
+        bool VisitCXXConstructExpr(clang::CXXConstructExpr* e)
+        {
+            if (e->getConstructor() != nullptr) found.push_back(e->getConstructor());
+            return true;
+        }
+        // An inheriting constructor calls its base through this node, not a CXXConstructExpr.
+        bool VisitCXXInheritedCtorInitExpr(clang::CXXInheritedCtorInitExpr* e)
+        {
+            if (e->getConstructor() != nullptr) found.push_back(e->getConstructor());
+            return true;
+        }
+    };
+
     std::string BodyVerdictKey(const clang::FunctionDecl* function)
     {
         std::string key = function->getQualifiedNameAsString() + "|"
@@ -194,6 +249,7 @@ namespace
         // Lines of the newest interpreter input buffer that an error or its notes point at.
         std::string blamedBuffer;
         std::set<unsigned> blamedLines;
+        std::function<void()> onParseError;
 
         void HandleDiagnostic(clang::DiagnosticsEngine::Level level,
                               const clang::Diagnostic& info) override
@@ -210,6 +266,9 @@ namespace
             }
             inErrorGroup = level >= clang::DiagnosticsEngine::Error;
             if (!inErrorGroup) return;
+            if (info.getID() >= clang::diag::DIAG_START_PARSE
+                && info.getID() < clang::diag::DIAG_START_AST && onParseError)
+                onParseError();
             groupFunctions.clear();
             groupText.clear();
             AppendGroupLine(info);
@@ -262,11 +321,15 @@ namespace
             llvm::SmallString<256> text;
             info.FormatDiagnostic(text);
             const std::string line = text.str().str();
-            groupText += (groupText.empty() ? "" : "\n") + line;
+            if (groupText.size() < 65536)
+                groupText += (groupText.empty() ? "" : "\n") + line;
             if (allText.size() < 65536) allText += (allText.empty() ? "" : "\n") + line;
             if (causes != nullptr)
                 for (const clang::FunctionDecl* function : groupFunctions)
-                    (*causes)[function] += "\n" + line;
+                {
+                    std::string& cause = (*causes)[function];
+                    if (cause.size() < 65536) cause += "\n" + line;
+                }
         }
 
         void RecordFailedInstantiation(const clang::Diagnostic& info)
@@ -563,7 +626,9 @@ namespace
         std::unordered_map<clang::FunctionDecl*, Body> bodies;
         cflat_cinterop::CxxDemandPlan* plan = nullptr;   // the group's, for the demand pass
         const std::unordered_map<const clang::FunctionDecl*, std::string>* poisoned = nullptr;
+        const std::unordered_map<const clang::FunctionDecl*, std::string>* causes = nullptr;
         std::string poisonDiagnostic;
+        const clang::FunctionDecl* poisonedDecl = nullptr;   // the poisoned body the walk reached
         std::unordered_set<const clang::FunctionDecl*> walked;
         std::unordered_set<const clang::CXXRecordDecl*> vtableRecords;
 
@@ -663,6 +728,12 @@ namespace
                 Note(e->getConstructor());
                 if (e->getConstructor() != nullptr)
                     constructed.push_back(e->getConstructor()->getParent());
+                return true;
+            }
+            // An inheriting constructor calls its base through this node, not a CXXConstructExpr.
+            bool VisitCXXInheritedCtorInitExpr(clang::CXXInheritedCtorInitExpr* e)
+            {
+                Note(e->getConstructor());
                 return true;
             }
             bool VisitCXXBindTemporaryExpr(clang::CXXBindTemporaryExpr* e)
@@ -783,6 +854,10 @@ namespace
         {
             unsigned parsed = 0;
             poisonDiagnostic.clear();
+            poisonedDecl = nullptr;
+            // Bodies this walk reaches before failing: forgotten, so a later walk through
+            // them (another wrapper into the same inheriting constructor) fails again.
+            std::vector<const clang::FunctionDecl*> walkedNow;
             clang::Scope tuScope(nullptr, clang::Scope::DeclScope, sema->getDiagnostics());
             const bool lendScope = sema->TUScope == nullptr;
             if (lendScope) sema->TUScope = &tuScope;
@@ -817,6 +892,7 @@ namespace
                 {
                     if (failure.empty()) failure = next->getQualifiedNameAsString();
                     if (poisonDiagnostic.empty()) poisonDiagnostic = bad->second;
+                    if (poisonedDecl == nullptr) poisonedDecl = next;
                     continue;
                 }
                 if (poisoned != nullptr)
@@ -824,6 +900,7 @@ namespace
                     {
                         if (failure.empty()) failure = next->getQualifiedNameAsString();
                         if (poisonDiagnostic.empty()) poisonDiagnostic = bad->second;
+                        if (poisonedDecl == nullptr) poisonedDecl = next;
                         continue;
                     }
                 clang::DiagnosticErrorTrap trap(sema->getDiagnostics());
@@ -839,27 +916,43 @@ namespace
                 if (next->isInvalidDecl())
                 {
                     if (failure.empty()) failure = next->getQualifiedNameAsString();
+                    if (poisonDiagnostic.empty() && poisoned != nullptr)
+                        if (auto bad = poisoned->find(next); bad != poisoned->end())
+                            poisonDiagnostic = bad->second;
+                    if (poisonDiagnostic.empty() && causes != nullptr)
+                        if (auto cause = causes->find(next); cause != causes->end())
+                            poisonDiagnostic = cause->second;
                     continue;
                 }
                 if (!next->isDefined(definition)) continue;
                 auto* target = const_cast<clang::FunctionDecl*>(definition);
                 if (bodies.count(target) != 0 && ParseOne(target, failure)) ++parsed;
-                if (target->getBody() == nullptr || !walked.insert(target).second) continue;
-                CalleeWalk walk;
-                walk.TraverseStmt(target->getBody());
-                // Error nodes mean clang diagnosed this body earlier, where no check listened.
-                if (walk.recovery)
+                if (!walked.insert(target).second) continue;
+                walkedNow.push_back(target);
+                if (clang::Stmt* body = target->getBody())
                 {
-                    if (failure.empty()) failure = target->getQualifiedNameAsString();
-                    continue;
+                    CalleeWalk walk;
+                    walk.TraverseStmt(body);
+                    // Error nodes mean clang diagnosed this body earlier, where no check listened.
+                    if (walk.recovery)
+                    {
+                        if (failure.empty()) failure = target->getQualifiedNameAsString();
+                        if (poisonDiagnostic.empty() && poisoned != nullptr)
+                            if (auto bad = poisoned->find(target); bad != poisoned->end())
+                                poisonDiagnostic = bad->second;
+                        if (poisonDiagnostic.empty() && causes != nullptr)
+                            if (auto cause = causes->find(target); cause != causes->end())
+                                poisonDiagnostic = cause->second;
+                        continue;
+                    }
+                    work.insert(work.end(), walk.found.begin(), walk.found.end());
+                    // A variable that body names must be shown to CodeGen, or it stays external.
+                    for (clang::VarDecl* var : walk.storage)
+                        if (clang::VarDecl* def = var->getDefinition(); def != nullptr && plan != nullptr)
+                            plan->Add(def);
+                    for (const clang::CXXRecordDecl* record : walk.constructed)
+                        addRecord(record, true);
                 }
-                work.insert(work.end(), walk.found.begin(), walk.found.end());
-                // A variable that body names must be shown to CodeGen, or it stays external.
-                for (clang::VarDecl* var : walk.storage)
-                    if (clang::VarDecl* def = var->getDefinition(); def != nullptr && plan != nullptr)
-                        plan->Add(def);
-                for (const clang::CXXRecordDecl* record : walk.constructed)
-                    addRecord(record, true);
                 if (const auto* ctor = llvm::dyn_cast<clang::CXXConstructorDecl>(target))
                 {
                     for (const clang::CXXCtorInitializer* init : ctor->inits())
@@ -867,6 +960,11 @@ namespace
                         CalleeWalk inits;
                         inits.TraverseStmt(init->getInit());
                         work.insert(work.end(), inits.found.begin(), inits.found.end());
+                        if (inits.recovery && failure.empty())
+                            failure = target->getQualifiedNameAsString();
+                        if (inits.recovery && poisonDiagnostic.empty() && causes != nullptr)
+                            if (auto cause = causes->find(target); cause != causes->end())
+                                poisonDiagnostic = cause->second;
                     }
                     addRecord(ctor->getParent(), true);
                 }
@@ -881,6 +979,8 @@ namespace
                                   false);
                 }
             }
+            if (!failure.empty())
+                for (const clang::FunctionDecl* fd : walkedNow) walked.erase(fd);
             return parsed;
         }
     };
@@ -1111,8 +1211,14 @@ namespace
      */
     class StaticMemberGuard : public clang::MultiplexConsumer
     {
+        clang::DiagnosticsEngine& diagnostics_;
+        std::unordered_map<const clang::VarDecl*, std::string>& failedInitializers_;
     public:
-        using clang::MultiplexConsumer::MultiplexConsumer;
+        StaticMemberGuard(std::vector<std::unique_ptr<clang::ASTConsumer>> consumers,
+                          clang::DiagnosticsEngine& diagnostics,
+                          std::unordered_map<const clang::VarDecl*, std::string>& failures)
+            : clang::MultiplexConsumer(std::move(consumers)), diagnostics_(diagnostics),
+              failedInitializers_(failures) {}
 
         void HandleCXXStaticMemberVarInstantiation(clang::VarDecl* var) override
         {
@@ -1122,6 +1228,15 @@ namespace
                 clang::MultiplexConsumer::HandleCXXStaticMemberVarInstantiation(var);
                 return;
             }
+            std::string failure;
+            if (brokenInit)
+                if (auto* capture = dynamic_cast<CountingDiagnosticConsumer*>(
+                        diagnostics_.getClient()); capture != nullptr)
+                    failure = capture->allText;
+            if (failure.empty())
+                failure = "initializer of '" + var->getQualifiedNameAsString()
+                    + "' failed to instantiate";
+            failedInitializers_[var] = std::move(failure);
             // A surviving use still takes its address. Without an initializer that is a plain
             // external declaration, not a constant CodeGen cannot evaluate.
             if (var->getInit() != nullptr) var->setInit(nullptr);
@@ -1230,8 +1345,48 @@ struct CxxIncrementalGroup::Impl
     std::unordered_map<const clang::FunctionDecl*, std::string> poisoned;
     // Per failed instantiation, the clang error group (error plus notes) that named it.
     std::unordered_map<const clang::FunctionDecl*, std::string> causes;
+    std::unordered_map<const clang::VarDecl*, std::string> failedStaticInitializers;
     // Every error and note the newest ParseRequest reported, across its recovery attempts.
     std::string lastDiagnostics;
+    // Linkage symbols of body-refused constructors the newest ParseRequest / CheckDemand selected.
+    std::vector<std::string> refusedConstructors;
+
+    void NoteRefusedConstructor(const clang::FunctionDecl* function)
+    {
+        const auto* ctor = llvm::dyn_cast_or_null<clang::CXXConstructorDecl>(function);
+        if (ctor == nullptr || poisoned.find(ctor) == poisoned.end()) return;
+        std::string symbol = ConstructorLinkageSymbol(ctor);
+        if (std::find(refusedConstructors.begin(), refusedConstructors.end(), symbol)
+            == refusedConstructors.end())
+            refusedConstructors.push_back(std::move(symbol));
+    }
+
+    // The cause of the first poisoned constructor a `__cflat_` helper constructs, else empty.
+    std::string SelectedPoisonedConstructor(clang::Decl* decl)
+    {
+        // An `extern "C"` wrapper is announced inside its linkage block.
+        if (auto* linkage = llvm::dyn_cast<clang::LinkageSpecDecl>(decl))
+        {
+            for (clang::Decl* inner : linkage->decls())
+                if (std::string cause = SelectedPoisonedConstructor(inner); !cause.empty())
+                    return cause;
+            return {};
+        }
+        auto* function = llvm::dyn_cast<clang::FunctionDecl>(decl);
+        if (function == nullptr || !function->doesThisDeclarationHaveABody()
+            || function->getIdentifier() == nullptr
+            || !function->getIdentifier()->getName().starts_with("__cflat_"))
+            return {};
+        ConstructedWalk walk;
+        walk.TraverseStmt(function->getBody());
+        for (const clang::CXXConstructorDecl* ctor : walk.found)
+            if (auto bad = poisoned.find(ctor); bad != poisoned.end())
+            {
+                NoteRefusedConstructor(ctor);
+                return bad->second;
+            }
+        return {};
+    }
     bool headerHadDiagnostics = false;
     // Everything a definitions harvest would have handed CodeGen, for the one demand pass.
     cflat_cinterop::CxxDemandPlan plan;
@@ -1321,7 +1476,9 @@ std::unique_ptr<CxxIncrementalGroup> CxxIncrementalGroup::Create(
         recorder->lazyBodies = &impl->lazy;
         impl->announcer = recorder.get();
         auto& consumers = MultiplexAccess::ListOf(*multiplex);
-        auto guarded = std::make_unique<StaticMemberGuard>(std::move(consumers));
+        auto guarded = std::make_unique<StaticMemberGuard>(std::move(consumers),
+            impl->interpreter->getCompilerInstance()->getDiagnostics(),
+            impl->failedStaticInitializers);
         consumers.clear();
         consumers.push_back(std::move(recorder));
         consumers.push_back(std::move(guarded));
@@ -1340,6 +1497,8 @@ std::unique_ptr<CxxIncrementalGroup> CxxIncrementalGroup::Create(
          */
         clang::CompilerInstance& ci = *impl->interpreter->getCompilerInstance();
         clang::Preprocessor& pp = ci.getPreprocessor();
+        clang::LangOptions& langOpts = ci.getLangOpts();
+        const bool incrementalExtensions = langOpts.IncrementalExtensions;
         LazyBodies& lazy = impl->lazy;
         const bool trackHeaderScope = macroReq != nullptr && macroOut != nullptr
             && macroReq->cxxMode;
@@ -1349,6 +1508,7 @@ std::unique_ptr<CxxIncrementalGroup> CxxIncrementalGroup::Create(
         lazy.parser = static_cast<clang::Parser*>(pp.getCodeCompletionHandler());
         lazy.sema = &ci.getSema();
         lazy.poisoned = &impl->poisoned;
+        lazy.causes = &impl->causes;
         // CFLAT_CXX_EAGER_BODIES=1 parses every body up front (A/B and bisecting a late body).
         if (lazy.parser != nullptr && !cflat_cinterop::CxxEagerBodies())
         {
@@ -1391,7 +1551,13 @@ std::unique_ptr<CxxIncrementalGroup> CxxIncrementalGroup::Create(
             });
         auto ptu = [&] {
             llvm::TimeTraceScope parseScope("CxxGroupHeaderParse");
-            return impl->interpreter->Parse(headerSource);
+            // A parse error fails the whole header parse and discards this interpreter, so the
+            // non-incremental fallback never reaches a request parse; restored after Parse anyway.
+            diagnostics.consumer.onParseError = [&] { langOpts.IncrementalExtensions = false; };
+            auto parsed = impl->interpreter->Parse(headerSource);
+            diagnostics.consumer.onParseError = {};
+            langOpts.IncrementalExtensions = incrementalExtensions;
+            return parsed;
         }();
         if (stopMacroCollector) stopMacroCollector();
         if (watchTokens) pp.setTokenWatcher(nullptr);
@@ -1549,6 +1715,7 @@ bool CxxIncrementalGroup::ParseRequest(const cflat_cinterop::ExtractRequest& req
                                        std::string& error)
 {
     impl_->lastDiagnostics.clear();
+    impl_->refusedConstructors.clear();
     // Bodies already poisoned before this parse; the replay entry records only this parse's own.
     std::unordered_set<const clang::FunctionDecl*> poisonedBefore;
     for (const auto& [function, verdict] : impl_->poisoned) poisonedBefore.insert(function);
@@ -1691,7 +1858,27 @@ bool CxxIncrementalGroup::ParseRequest(const cflat_cinterop::ExtractRequest& req
         if (impl_->announcer != nullptr) impl_->announcer->sink = &announced;
         auto ptu = impl_->interpreter->Parse(chunk);
         if (!ptu && !namespaces.empty()) RestoreTopLevelNamespaces(astContext, namespaces);
+        // No longer invalid, so it must be poisoned for a body that already reaches it.
+        for (clang::FunctionDecl* failed : diagnostics.consumer.failedFunctions)
+        {
+            if (RevalidateFailedConstructor(failed))
+            {
+                auto cause = impl_->causes.find(failed);
+                impl_->poisoned.emplace(failed, cause != impl_->causes.end() ? cause->second
+                    : diagnostics.consumer.firstError);
+            }
+            impl_->NoteRefusedConstructor(failed);
+        }
         if (impl_->announcer != nullptr) impl_->announcer->sink = nullptr;
+        // A revalidated constructor parses clean: a helper that selected it is refused here.
+        if (ptu && wrapperBatch && !impl_->poisoned.empty())
+            for (clang::Decl* decl : announced)
+                if (const std::string cause = impl_->SelectedPoisonedConstructor(decl); !cause.empty())
+                {
+                    error = cause;
+                    impl_->lastDiagnostics += (impl_->lastDiagnostics.empty() ? "" : "\n") + cause;
+                    return false;
+                }
         if (impl_->verbose && impl_->announcer != nullptr)
             for (const std::string& name : impl_->announcer->neutralized)
                 std::cout << "[verbose] incremental request helper " << name
@@ -1993,6 +2180,11 @@ const std::string& CxxIncrementalGroup::LastRequestDiagnostics() const
     return impl_->lastDiagnostics;
 }
 
+const std::vector<std::string>& CxxIncrementalGroup::LastRefusedConstructors() const
+{
+    return impl_->refusedConstructors;
+}
+
 unsigned CxxIncrementalGroup::DemandChunks() const
 {
     return impl_->plan.recordedChunks;
@@ -2006,17 +2198,29 @@ void CxxIncrementalGroup::RestorePoisonedBodies(
 
 int CxxIncrementalGroup::CheckDemand(const std::string& symbol, std::string& error)
 {
+    impl_->refusedConstructors.clear();
     std::string name = symbol;
     if (auto it = impl_->plan.renamed.find(name); it != impl_->plan.renamed.end())
         name = it->second;
     auto it = impl_->plan.bound.find(name);
     if (it == impl_->plan.bound.end()) return 0;
-    auto* fd = llvm::dyn_cast<clang::FunctionDecl>(
-        clang::GlobalDecl::getFromOpaquePtr(it->second).getDecl());
+    clang::GlobalDecl global = clang::GlobalDecl::getFromOpaquePtr(it->second);
+    if (auto* var = llvm::dyn_cast<clang::VarDecl>(global.getDecl()))
+        if (auto failure = impl_->failedStaticInitializers.find(var);
+            failure != impl_->failedStaticInitializers.end())
+        {
+            error = "clang: " + failure->second;
+            return -1;
+        }
+    auto* fd = llvm::dyn_cast<clang::FunctionDecl>(global.getDecl());
     if (fd == nullptr) return 1;
     if (auto poisoned = impl_->poisoned.find(fd); poisoned != impl_->poisoned.end())
     {
-        error = "clang: " + poisoned->second;
+        RevalidateFailedConstructor(fd);
+        impl_->NoteRefusedConstructor(fd);
+        auto cause = impl_->causes.find(fd);
+        error = "clang: " + (cause == impl_->causes.end() || cause->second.empty()
+            ? poisoned->second : cause->second);
         return -1;
     }
     DiagnosticScope diagnostics(impl_->interpreter->getCompilerInstance()->getDiagnostics());
@@ -2047,6 +2251,13 @@ int CxxIncrementalGroup::CheckDemand(const std::string& symbol, std::string& err
                                                                   : cause->second);
     }
     impl_->poisoned.emplace(fd, error.substr(7));
+    for (const auto* failed : diagnostics.consumer.failedFunctions)
+        RevalidateFailedConstructor(failed);
+    RevalidateFailedConstructor(fd);
+    impl_->NoteRefusedConstructor(impl_->lazy.poisonedDecl);
+    for (const auto* failed : diagnostics.consumer.failedFunctions)
+        impl_->NoteRefusedConstructor(failed);
+    impl_->NoteRefusedConstructor(fd);
     return -1;
 }
 
@@ -2073,6 +2284,14 @@ bool CxxIncrementalGroup::EmitDemandCompanion(const std::vector<std::string>& de
         if (!failure.empty())
             bodyDiagnostic = diagnostics.consumer.firstErrorLocation.empty()
                 ? diagnostics.consumer.firstError : diagnostics.consumer.firstErrorLocation;
+        if (bodyDiagnostic.empty()) bodyDiagnostic = lazy.poisonDiagnostic;
+        if (bodyDiagnostic.empty())
+            for (const auto& [function, cause] : impl_->causes)
+                if (function->getQualifiedNameAsString() == failure && !cause.empty())
+                {
+                    bodyDiagnostic = cause;
+                    break;
+                }
     };
     lazy.MarkPending(/*forCodeGen*/ true);
     const auto companionStart = std::chrono::steady_clock::now();

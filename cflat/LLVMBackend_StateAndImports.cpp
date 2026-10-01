@@ -2567,6 +2567,7 @@ nlohmann::json LLVMBackend::CxxStaticVarToJson(
         }
         PathToJson(j, v.file, files);
         if (v.access != 0)   j["ac"] = v.access;
+        if (!v.initializerFailure.empty()) j["if"] = v.initializerFailure;
         return j;
     }
 
@@ -2589,6 +2590,7 @@ cflat_cinterop::RawCxxStaticVar LLVMBackend::CxxStaticVarFromJson(
         v.line        = j.value("ln", 1);
         v.col         = j.value("co", 0);
         v.access      = j.value("ac", 0);
+        v.initializerFailure = j.value("if", std::string{});
         return v;
     }
 
@@ -3171,6 +3173,8 @@ bool LLVMBackend::TryLoadCHeaderDiskCache(
                     entry.functionTemplates.push_back(FunctionTemplateFromJson(t, files));
             if (j.contains("classTemplateNames"))
                 entry.classTemplateNames = j["classTemplateNames"].to_string_vector();
+            if (j.contains("classTemplateSpecializations"))
+                entry.classTemplateSpecializations = j["classTemplateSpecializations"].to_string_vector();
             if (j.contains("cxxGroupNamespaces"))
                 entry.cxxGroupNamespaces = j["cxxGroupNamespaces"].to_string_vector();
             if (j.contains("enums"))      for (const auto& e : j["enums"])      entry.enums.push_back(EnumFromJson(e));
@@ -3604,6 +3608,7 @@ void LLVMBackend::WriteCHeaderDiskCache(
             functionTemplates.push_back(FunctionTemplateToJson(t, &files));
         j["functionTemplates"] = std::move(functionTemplates);
         j["classTemplateNames"] = entry.classTemplateNames;
+        j["classTemplateSpecializations"] = entry.classTemplateSpecializations;
         if (!entry.cxxGroupNamespaces.empty()) j["cxxGroupNamespaces"] = entry.cxxGroupNamespaces;
         nlohmann::json enums = nlohmann::json::array();
         for (const auto& e : entry.enums) enums.push_back(EnumToJson(e));

@@ -534,6 +534,13 @@ LLVMBackend::DeclTypeAndValue ForwardRefScanner::ParseDeclarationSpecifiers(CFla
         // generic argument back onto AllocAlignValue so both spellings register the same type.
         if (declType.AllocAlignValue == 0)
             declType.AllocAlignValue = CoreUniqueDeclaredAllocAlign(compiler, declType.TypeName);
+        bool hasConstQualifier = false;
+        for (auto* spec : declSpecs->declarationSpecifier())
+            if (auto* qualifier = spec->typeQualifier();
+                qualifier != nullptr && qualifier->getText() == "const")
+                hasConstQualifier = true;
+        if (hasConstQualifier && declType.Pointer && compiler->IsCxxRecord(declType.TypeName))
+            declType.IsCxxPointeeConst = true;
         return declType;
     }
 

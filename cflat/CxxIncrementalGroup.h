@@ -34,6 +34,9 @@ public:
                       std::string& error);
     // Every clang error and note the newest ParseRequest reported (empty on a clean parse).
     const std::string& LastRequestDiagnostics() const;
+    // Linkage symbols of the constructors whose failed body refused the newest ParseRequest or
+    // CheckDemand (the helper selected one), the extractor's key for the member.
+    const std::vector<std::string>& LastRefusedConstructors() const;
     // Definitions harvests this group recorded for its one demand pass (0: nothing to emit).
     unsigned DemandChunks() const;
     // 0: another group owns the symbol, 1: valid demand, -1: clang body error.

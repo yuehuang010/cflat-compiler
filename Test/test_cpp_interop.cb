@@ -227,6 +227,7 @@
 //     list/dictionary values are not destroyed, unique list values are, and Box<T> stores T*.
 
 import cpp "library/cpp_interop_basic.h";
+import cpp "library/cpp_interop_demand_fail.h";
 import cpp "library/cpp_interop_anon.h";
 import cpp "library/cpp_interop_explicit.h";
 import cpp "library/cpp_interop_refgate.h";
@@ -234,6 +235,7 @@ import cpp "library/cpp_interop_basic.cpp";
 import cpp "library/cpp_interop_member_shadow.h";
 import cpp "library/cpp_interop_twin.h";
 import cpp "library/cpp_interop_lastuse.h";
+import cpp "library/cpp_interop_demand_fail.h";
 // Inheritance and virtual dispatch. Definitions are out-of-line on purpose - every
 // virtual function needs a real symbol and the vtable needs a key function.
 import cpp "library/cpp_interop_poly.h";
@@ -1290,6 +1292,12 @@ int CppuDeclTakesAliasEC(cppu_decl_a.EC e) { return (int)e; }
 cppi.MtConstObj* mtConstPass(cppi.MtConstObj* p) { return p; }
 T mtConstIdent<T>(T value) { return value; }
 int crCallGet(cppi.CrPair* p) { return p->get(); }
+struct CrConstPointerHolder
+{
+    const cppi.CrReceiverValue* pc = default;
+    cppi.CrReceiverValue* pm = default;
+};
+int crConstPointerParam(const cppi.CrReceiverValue* p) { return p->get(); }
 cppi.MtNoCopy mtNoCopyReturn(cppi.MtNoCopy value)
 { return value; }
 long CtorExprReturn(long* p) { return cppcr.ExprConstRW(*p, p).v; }
@@ -1325,8 +1333,36 @@ int W10KeepTernary(int value)
     return W10CflatKeep(choose ? new cppon.Esc(value) ?? empty : empty, value);
 }
 
+const cppi.CrReceiverValue w13ConstGlobal = default;
+const cppi.CrReceiverValue[2] w13ConstGlobalArray;
+int W11OrderProbe(w11round3.Q<int> q, char* s) { return 100; }
+int W11OrderProbe(long x, int y) { return 1; }
+
 extern int main()
 {
+    w1demand.Q<int> ctorBodyAccept = w1demand.Q<int>(2.5);
+    if (ctorBodyAccept.v != 11) return 7890;
+
+    float w11Float = 1.5f;
+    if (w11round3.takeB(w11Float) != 5) return 7891;
+    int w11Int = 3;
+    if (w11round3.C<int>(w11Int).v != 6) return 7892;
+    w11round3.C<int> w11C = w11round3.C<int>(w11Int);
+    if (w11C.v != 6) return 7893;
+    w11round3.C<int>* w11HeapC = new w11round3.C<int>(w11Int);
+    if (w11HeapC.v != 6) return 7894;
+    delete w11HeapC;
+    if (w11round3.takeC(w11Int) != 6) return 7895;
+    int w11OrderFirst = W11OrderProbe(w11Int, 2);
+    w11round3.Q<int> w11QAfterOrder = w11round3.Q<int>(2.5);
+    if (w11OrderFirst != 1 || w11QAfterOrder.v != 11) return 7896;
+    w11round3.Q<int> w11QBeforeOrder = w11round3.Q<int>(2.5);
+    int w11OrderSecond = W11OrderProbe(w11Int, 2);
+    if (w11OrderSecond != 1 || w11QBeforeOrder.v != 11) return 7897;
+    if (w11round3.qIntConstructible() != 1) return 7899;
+    long w11Long = 4;
+    if (w11round3.E<int>(w11Int).v + w11round3.E<int>(w11Long).v != 16) return 7898;
+
     cppanon.U anonUnion = default;
     anonUnion.lo = 0x11223344u;
     if (anonUnion.lo != 0x11223344u) return 3790;
@@ -1419,6 +1455,47 @@ extern int main()
     // proves WHICH overload was selected.
     if (cppi.add(40, 2) != 42)                   return 270;
     if (cppi.add(40.5, 2.0) != 1042)             return 271;
+    cppi.ConstPointerRankValue constRankValue = default;
+    const cppi.ConstPointerRankValue* constRankPointer = &constRankValue;
+    cppi.ConstPointerRankValue* mutableRankPointer = &constRankValue;
+    if (cppi.const_pointer_rank(constRankPointer) != 2) return 9001;
+    if (cppi.const_pointer_rank(mutableRankPointer) != 1) return 9002;
+    cppi.ConstPointerRank constRankObject = default;
+    if (constRankObject.pick(constRankPointer) != 2) return 9003;
+    if (constRankObject.pick(mutableRankPointer) != 1) return 9004;
+    // const Derived* never binds a mutable pointer parameter while const P* is viable.
+    cppi.ConstPointerRankDerived constRankDerived = default;
+    const cppi.ConstPointerRankDerived* constDerivedPointer = &constRankDerived;
+    cppi.ConstPointerRankDerived* mutableDerivedPointer = &constRankDerived;
+    auto constDerivedCopy = constDerivedPointer;
+    if (cppi.const_derived_rank(constDerivedPointer) != 71) return 9005;
+    if (cppi.const_derived_rank(mutableDerivedPointer) != 70) return 9006;
+    if (cppi.const_base_rank(constDerivedPointer) != 81) return 9007;
+    if (cppi.const_base_rank(constDerivedCopy) != 81) return 9008;
+    if (cppi.const_base_rank(mutableDerivedPointer) != 80) return 9009;
+    // T** and const T** pick the overload with the same inner const, free and member.
+    const cppi.ConstPointerRankValue** constRankPP = &constRankPointer;
+    cppi.ConstPointerRankValue** mutableRankPP = &mutableRankPointer;
+    if (cppi.const_pp_rank(constRankPP) != 2 || cppi.const_pp_rank(mutableRankPP) != 1) return 9010;
+    cppi.ConstPointerPointerRank constRankPPObject = default;
+    if (constRankPPObject.pick(constRankPP) != 40 || constRankPPObject.pick(mutableRankPP) != 41)
+        return 9011;
+    // Operators: member `<<` and free `+` siblings rank on pointee const (declaration order
+    // never decides).
+    cppi.ConstPointerRankShift constRankShift = default;
+    if ((constRankShift << constRankPointer) != 2) return 9012;
+    if ((constRankShift << mutableRankPointer) != 1) return 9013;
+    if ((constRankShift + constRankPointer) != 6) return 9014;
+    if ((constRankShift + mutableRankPointer) != 5) return 9015;
+    // A const-dropping variadic sibling loses to the const-correct overload.
+    if (cppi.const_variadic_rank(constRankPointer, 1) != 2) return 9016;
+    // Unused ellipsis: the variadic's declared `int` is exact and beats `long`, either order.
+    if (cppi.variadic_exact_rank(1) != 1 || cppi.variadic_exact_rank_rev(1) != 1) return 9021;
+    // Template beside non-template: const pointer deduces T = const Rec / takes const T*.
+    if (cppi.const_tpl_rank(constRankPointer) != 1) return 9017;
+    if (cppi.const_tpl_rank(mutableRankPointer) != 2) return 9018;
+    if (cppi.const_tpl_crank(constRankPointer) != 3) return 9019;
+    if (cppi.const_tpl_crank(mutableRankPointer) != 4) return 9020;
     cppi.NuaMiddle nuaMiddle = default;
     nuaMiddle.prefix = 7;
     nuaMiddle.later = 0x123456;
@@ -2587,6 +2664,8 @@ extern int main()
     // static local above keeps counting rather than starting over.
     if (cppinl2.twice_plus(5) != 31)             return 464;
     if (cppinl.next_id() != 103)                 return 465;
+    // A valid inline static member beside a poisoned sibling still resolves and keeps its value.
+    if (w1demand.StaticValue<int>.good != 8)      return 476;
 
     // All-inline nontrivial class. The counters are inline static data members, so reading them
     // proves the companion module supplied their storage as well as the constructor body.
@@ -2809,6 +2888,38 @@ extern int main()
     if ((int)opcallB != 43)                            return 736;
     cppi.Convertible* opcallCp = &opcallC;
     if ((int)(*opcallCp) != 42)                        return 737;
+
+    // Multiword C++ operator spellings must match CFlat destinations in implicit and cast paths.
+    {
+        cppas.CvtU32 a = default; cppas.cvLast = 0; u32 a1 = a;
+        if (cppas.cvLast != 2 || a1 != 8) return 31680;
+        cppas.cvLast = 0; u32 a2 = (u32)a;
+        if (cppas.cvLast != 2 || a2 != 8) return 31681;
+        cppas.CvtU8 b = default; cppas.cvLast = 0; u8 b1 = b;
+        if (cppas.cvLast != 2 || b1 != 8) return 31682;
+        cppas.cvLast = 0; u8 b2 = (u8)b;
+        if (cppas.cvLast != 2 || b2 != 8) return 31683;
+        cppas.CvtU16 c = default; cppas.cvLast = 0; u16 c1 = c;
+        if (cppas.cvLast != 2 || c1 != 16) return 31684;
+        cppas.cvLast = 0; u16 c2 = (u16)c;
+        if (cppas.cvLast != 2 || c2 != 16) return 31685;
+        cppas.CvtI64 d = default; cppas.cvLast = 0; i64 d1 = d;
+        if (cppas.cvLast != 2 || d1 != 64) return 31686;
+        cppas.cvLast = 0; i64 d2 = (i64)d;
+        if (cppas.cvLast != 2 || d2 != 64) return 31687;
+        cppas.CvtU64 e = default; cppas.cvLast = 0; u64 e1 = e;
+        if (cppas.cvLast != 2 || e1 != 64) return 31688;
+        cppas.cvLast = 0; u64 e2 = (u64)e;
+        if (cppas.cvLast != 2 || e2 != 64) return 31689;
+        cppas.CvtI8 f = default; cppas.cvLast = 0; i8 f1 = f;
+        if (cppas.cvLast != 2 || f1 != 8) return 31690;
+        cppas.cvLast = 0; i8 f2 = (i8)f;
+        if (cppas.cvLast != 2 || f2 != 8) return 31691;
+        cppas.CvtLongDouble g = default; cppas.cvLast = 0; longdouble g1 = g;
+        if (cppas.cvLast != 2 || (int)g1 != 2) return 31692;
+        cppas.cvLast = 0; longdouble g2 = (longdouble)g;
+        if (cppas.cvLast != 2 || (int)g2 != 2) return 31693;
+    }
 
     // A conversion whose target has no cflat spelling (pointer to member) is refused per
     // member; the class itself still binds and its ordinary members keep working.
@@ -3826,8 +3937,17 @@ extern int main()
     if (c2accept.forward_template_value() != 42)                    return 7991;
     if (c2accept.redeclared_template_value() != 43)                  return 7992;
     if (c2accept.specialization_value() != 44)                       return 7993;
+    c2accept.Specialized<long> explicitLayout = default;
+    explicitLayout.value = 52;
+    if (c2accept.specialization_long_value(&explicitLayout) != 52
+        || c2accept.specialization_long_size() != sizeof(c2accept.Specialized<long>)) return 7997;
     if (c2accept.identical_template_value() != 46)                   return 7995;
     if (c2accept.partial_specialization_value() != 47)                return 7996;
+    int partialPointee = 53;
+    c2accept.PartialSpecialized<int*> partialLayout = default;
+    partialLayout.value = &partialPointee;
+    if (c2accept.partial_specialization_read(&partialLayout) != 53
+        || c2accept.partial_specialization_size() != sizeof(c2accept.PartialSpecialized<int*>)) return 7998;
     if (c2repeat.value() != 45)                                      return 7994;
     // A class re-exported by both imports is one entity too: no conflict, one type.
     cppu_decl_a.Box againBox = default;
@@ -8256,6 +8376,55 @@ extern int main()
         || cppi.crFieldMutable.pc->only() != 7 || cppi.crFieldMutable.pc->get() != 13
         || cppi.crFieldMutable.mu.only() != 7 || cppi.crFieldMutable.mu.get() != 13)
         return 7988;
+    // Template members use the same const receiver classifier as ordinary overloads.
+    const auto crTemplateElided = cppi.cr_template_make();
+    if (crTemplateElided.it(1) != 45) return 7995;
+    cppi.CrTemplateReceiver crTemplateLocal = default;
+    if (crTemplateLocal.it(1) != 44) return 7996;
+    const auto crTemplateCopy = crTemplateLocal;
+    if (crTemplateCopy.it(1) != 45) return 8002;
+    if (crTemplateLocal.mix(1, 2) != 51) return 7997;
+    // CFlat file-scope const C++ records and array elements select const overloads.
+    if (w13ConstGlobal.get() != 3 || w13ConstGlobalArray[0].get() != 3
+        || w13ConstGlobalArray[1].get() != 3) return 8003;
+    // A mutable pointer still binds to P*, and a const pointer binds to const P*.
+    cppi.CrReceiverValue* w13MutablePointer = &crTemplateLocal;
+    const cppi.CrReceiverValue* w13ConstPointer = &crTemplateLocal;
+    if (cppi.cr_take_mut(w13MutablePointer) != 7
+        || cppi.cr_take_const(w13ConstPointer) != 3) return 8004;
+    // CFlat const on a scalar is not C++ const: the template deduces int*, not const int*.
+    const int crPlainConst = 3;
+    if (cppi.cr_template_store(&crPlainConst) != 5) return 8001;
+    // Taking an address from a const slot and a const array element carries pointee const.
+    const auto crConstSlot = cppi.crFieldMutable.mu;
+    auto crConstSlotAddress = &crConstSlot;
+    if (crConstSlotAddress->get() != 3) return 7998;
+    auto crConstArrayAddress = &cppi.crArrayConst.arr[1];
+    if (crConstArrayAddress->get() != 3) return 7999;
+    // CFlat declarations preserve const pointees on parameters and aggregate fields.
+    CrConstPointerHolder crConstHolder = default;
+    crConstHolder.pc = &cppi.crReceiverGlobal;
+    crConstHolder.pm = &cppi.crReceiverGlobal;
+    if (crConstHolder.pc->get() != 3 || crConstHolder.pm->get() != 13
+        || crConstPointerParam(&cppi.crReceiverGlobal) != 3) return 8000;
+    // Const inferred copies, declared const pointees, addresses of const fields, and array
+    // elements of a const parent all retain the C++ const receiver overload.
+    const auto crConstAuto = cppi.crFieldMutable.mu;
+    if (crConstAuto.get() != 3) return 7989;
+    const cppi.CrReceiverValue* crConstPointee = &cppi.crFieldMutable.mu;
+    if (crConstPointee->get() != 3) return 7990;
+    auto crConstFieldAddress = &hcLocalConst.c;
+    if (crConstFieldAddress->get() != 3) return 7991;
+    if (cppi.crArrayConst.arr[1].get() != 3) return 7992;
+    // Mutable controls: inferred copy and pointer/array/address receivers still use mutable twins.
+    auto crMutableAuto = cppi.crFieldMutable.mu;
+    cppi.CrReceiverValue* crMutablePointee = &cppi.crFieldMutable.mu;
+    auto crMutableFieldAddress = &cppi.crFieldMutable.mu;
+    if (crMutableAuto.get() != 13 || crMutablePointee->get() != 13
+        || cppi.crFieldMutable.mu.get() != 13 || crMutableFieldAddress->get() != 13)
+        return 7993;
+    const cppi.Tm tmConstObject = default;
+    if (tmConstObject.ts(2) != 43 || cppi.Tm.ts(2) != 43) return 7994;
     auto crAddress = &cppi.crMutable;
     crAddress = &cppi.cr_const_ref();
     if (crAddress->get() != 3) return 7979;
@@ -8787,6 +8956,10 @@ extern int main()
         { cppas.obReset(); cppas.ObSelf p = default; int r = ObAliasParam(p); if (!(r == 1 && cppas.obHits == 1)) return 31630; }
         { cppas.obReset(); cppas.ObSelf p = default; int r = ObPtrParam(&p); if (!(r == 1 && cppas.obHits == 1)) return 31631; }
         { cppas.obReset();  int r = 0; if (cppas.obMkSelf(3)) r = 1; if (!(r == 1 && cppas.obHits == 1 && cppas.obDtors == 1)) return 31632; }
+        { cppas.obReset(); int r = 0; if (cppas.obMkHolder(3).f) r = 1; if (!(r == 1 && cppas.obHits == 1 && cppas.obDtors == 1 && cppas.obDtorsAtCall == 0)) return 31665; }
+        { cppas.obReset(); int r = 0; if (false ? cppas.obMkHolder(3).f : cppas.obMkHolder(4).f) r = 1; if (!(r == 1 && cppas.obHits == 1 && cppas.obDtors == 1 && cppas.obDtorsAtCall == 0)) return 31666; }
+        { cppas.obReset(); int r = 0; if (true ? cppas.obMkHolder(3).f : cppas.obMkHolder(4).f) r = 1; if (!(r == 1 && cppas.obHits == 1 && cppas.obDtors == 1 && cppas.obDtorsAtCall == 0)) return 31667; }
+        { cppas.obReset(); int r = 0; if (0 ?? cppas.obMkHolder(3).f) r = 1; if (!(r == 1 && cppas.obHits == 1 && cppas.obDtors == 1 && cppas.obDtorsAtCall == 0)) return 31668; }
         { cppas.obReset();  int r = cppas.obMkSelf(3) ? 1 : 2; if (!(r == 1 && cppas.obHits == 1 && cppas.obDtors == 1)) return 31633; }
         { cppas.obReset();  int r = (false || cppas.obMkSelf(3)) ? 1 : 0; if (!(r == 1 && cppas.obHits == 1 && cppas.obDtors == 1)) return 31634; }
         { cppas.obReset();  int r = !cppas.obMkSelf(3) ? 0 : 1; if (!(r == 1 && cppas.obHits == 1 && cppas.obDtors == 1)) return 31635; }

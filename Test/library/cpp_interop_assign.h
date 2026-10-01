@@ -347,8 +347,8 @@ inline int peek_tbv(const TallyByValue& t) noexcept { return t.v_; }
 // Every class records its own address (`self_`), so a call on a copy reads false / -7; hits,
 // copies and dtors are exact counts a leg pins.
 
-inline int obHits = 0, obCopies = 0, obDtors = 0;
-inline void obReset() { obHits = 0; obCopies = 0; obDtors = 0; }
+inline int obHits = 0, obCopies = 0, obDtors = 0, obDtorsAtCall = -1;
+inline void obReset() { obHits = 0; obCopies = 0; obDtors = 0; obDtorsAtCall = -1; }
 // implicit, non-const, mutating + self-pointer
 class ObSelf {
 public:
@@ -356,7 +356,7 @@ public:
     ObSelf(const ObSelf& o) noexcept : self_(this), v(o.v) { ++obCopies; }
     ~ObSelf() noexcept { ++obDtors; }
     ObSelf& operator=(int x) noexcept { v = x; return *this; }
-    operator bool() noexcept { ++obHits; v += 100; return self_ == this; }
+    operator bool() noexcept { ++obHits; obDtorsAtCall = obDtors; v += 100; return self_ == this; }
     ObSelf* self_; int v;
 };
 class ObSelfX {
@@ -443,14 +443,27 @@ public:
 };
 inline ObCvtMk obMkCvt() { ObCvtMk c; return c; }
 struct ObHolder { ObSelf f; ObConstSelf c; };
+struct ObHolderTemp { ObSelf f; };
 inline ObSelf obGlobal;
 inline ObSelf obMkSelf(int x) { ObSelf b; b.v = x; return b; }
+inline ObHolderTemp obMkHolder(int x) { ObHolderTemp h; h.f.v = x; return h; }
 inline ObConstSelf obMkConst(int x) { ObConstSelf b; b.v = x; return b; }
 inline ObMove obMkMove(int x) { ObMove b; b.v = x; return b; }
 inline ObConv obMkConv() { ObConv c; return c; }
 inline bool obViaRef(ObSelf& r) { return r ? true : false; }
 
 inline int obRankLast = 0;
+
+// Multiword C++ scalar spellings used by conversion-operator lookup (W2).
+inline int cvLast = 0;
+struct CvtU32 { operator bool() const { cvLast = 1; return true; } operator unsigned int() const { cvLast = 2; return 8u; } int pad = 0; };
+struct CvtU8 { operator bool() const { cvLast = 1; return true; } operator unsigned char() const { cvLast = 2; return 8; } int pad = 0; };
+struct CvtU16 { operator bool() const { cvLast = 1; return true; } operator unsigned short() const { cvLast = 2; return 16; } int pad = 0; };
+struct CvtI64 { operator bool() const { cvLast = 1; return true; } operator long long() const { cvLast = 2; return 64; } int pad = 0; };
+struct CvtU64 { operator bool() const { cvLast = 1; return true; } operator unsigned long long() const { cvLast = 2; return 64; } int pad = 0; };
+struct CvtI8 { operator bool() const { cvLast = 1; return true; } operator signed char() const { cvLast = 2; return 8; } int pad = 0; };
+struct CvtLongDouble { operator bool() const { cvLast = 1; return true; } operator long double() const { cvLast = 2; return 2.5L; } int pad = 0; };
+struct CvtAmb { operator bool() const { cvLast = 1; return true; } operator long() const { cvLast = 2; return 3; } int pad = 0; };
 class ObRank {
 public:
     operator bool() const noexcept { obRankLast = 1; return true; }

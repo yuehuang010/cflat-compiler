@@ -1348,6 +1348,25 @@ namespace cflat_cinterop
                 return true;
             }
 
+            bool VisitClassTemplateSpecializationDecl(ClassTemplateSpecializationDecl* spec)
+            {
+                if (!st.req.cxxMode || spec == nullptr || spec->isInvalidDecl()
+                    || (spec->getSpecializationKind() != TSK_ExplicitSpecialization
+                        && !llvm::isa<ClassTemplatePartialSpecializationDecl>(spec)))
+                    return true;
+                std::string file;
+                int line = 1, col = 0;
+                LocOfRaw(spec, file, line, col);
+                if (st.req.requireInScope && !st.InScope(file)) return true;
+                const std::string name = CxxQualifiedName(spec->getSpecializedTemplate());
+                if (!name.empty()
+                    && std::find(st.out.classTemplateSpecializations.begin(),
+                                 st.out.classTemplateSpecializations.end(), name)
+                           == st.out.classTemplateSpecializations.end())
+                    st.out.classTemplateSpecializations.push_back(name);
+                return true;
+            }
+
             /*
              * A hidden friend operator is reachable only through its own class, and its body is
              * instantiated only on odr-use: an incremental request chunk never writes such a use,
@@ -2483,6 +2502,11 @@ namespace cflat_cinterop
 
                 for (const VarDecl* vd : staticDataMembers)
                 {
+                    auto rememberInitializerFailure = [&](RawCxxStaticVar& sv) {
+                        if (vd->isInvalidDecl()
+                            || (vd->getInit() != nullptr && vd->getInit()->containsErrors()))
+                            sv.initializerFailure = "pending:" + vd->getQualifiedNameAsString();
+                    };
                     // A non-constexpr `static const T k = 41;` initialized IN CLASS has no symbol
                     // to link against (odr-use is ill-formed), so fold it exactly like constexpr.
                     const bool foldsFromInClassInit =
@@ -2499,6 +2523,7 @@ namespace cflat_cinterop
                             sv.isCompileTimeConstant = true;
                             sv.constantValue = ApsIntToLongLong(result.Val.getInt());
                             sv.access = MapAccess(vd->getAccess());
+                            rememberInitializerFailure(sv);
                             LocOfRaw(vd, sv.file, sv.line, sv.col);
                             rec.staticVars.push_back(std::move(sv));
                             continue;
@@ -2517,6 +2542,7 @@ namespace cflat_cinterop
                                           << vd->getQualifiedNameAsString()
                                           << " rounded long double to double (loss of precision)\n";
                             sv.access = MapAccess(vd->getAccess());
+                            rememberInitializerFailure(sv);
                             LocOfRaw(vd, sv.file, sv.line, sv.col);
                             rec.staticVars.push_back(std::move(sv));
                             continue;
@@ -2548,6 +2574,7 @@ namespace cflat_cinterop
                         sv.ctype = CanonicalSpelling(ctx, vd->getType());
                         sv.access = MapAccess(vd->getAccess());
                         sv.linkageName = CxxLinkageName(ctx, vd);
+                        rememberInitializerFailure(sv);
                         LocOfRaw(vd, sv.file, sv.line, sv.col);
                         rec.staticVars.push_back(std::move(sv));
                         continue;
@@ -2571,6 +2598,7 @@ namespace cflat_cinterop
                     sv.ctype = CanonicalSpelling(ctx, vd->getType());
                     sv.access = MapAccess(vd->getAccess());
                     sv.linkageName = CxxLinkageName(ctx, vd);
+                    rememberInitializerFailure(sv);
                     LocOfRaw(vd, sv.file, sv.line, sv.col);
                     rec.staticVars.push_back(std::move(sv));
                 }
@@ -6141,6 +6169,10 @@ namespace cflat_cinterop
             ExtractAction extract(st);
             bool ok = RunAction(req, fullSource, extract, err, &out.prereqErrors,
                                 &out.firstPrereqError, &out);
+            for (auto& record : out.records)
+                for (auto& variable : record.staticVars)
+                    if (variable.initializerFailure.starts_with("pending:") && !out.firstError.empty())
+                        variable.initializerFailure = out.firstError;
 
             if (ok && req.cxxMode && req.autoInstantiateCxxTypes
                 && !st.incompleteCxxTypes.empty())
@@ -6321,7 +6353,9 @@ namespace cflat_cinterop
             if (!failedBody.empty())
             {
                 err = "clang: failed to compile inline body '" + failedBody
-                    + "' required by this program: " + bodyDiagnostic;
+                    + "' required by this program";
+                if (llvm::StringRef detail = llvm::StringRef(bodyDiagnostic).trim(); !detail.empty())
+                    err += ": " + detail.str();
                 return false;
             }
         }

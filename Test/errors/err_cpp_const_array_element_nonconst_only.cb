@@ -1,0 +1,6 @@
+import cpp "cpp_interop_basic.h";
+extern int main()
+{
+    expect_error("cannot call non-const member 'only'") { cppi.crArrayConst.arr[0].only(); }
+    return 0;
+}

@@ -636,6 +636,8 @@ extern int main()
     Test("operator bool in &&", truth && true, true);
     Test("operator bool in ||", false || truth, true);
     Test("operator bool explicit cast", (bool)truth, true);
+    double truthScalar = 2.5;
+    Test("scalar bool cast ignores struct operator bool", (bool)truthScalar, true);
     Test("operator bool in !", !truth, false);
     while (truth) truth.value = 0;
     Test("operator bool terminates while", truth.value, 0);

@@ -1,0 +1,32 @@
+import cpp "cpp_interop_basic.h";
+
+expect_error("cannot pass C++ const pointer argument 1 ('p')") {
+    int passConstParameter(const cppi.CrReceiverValue* p) {
+        return cppi.cr_take_mut(p);
+    }
+}
+
+extern int main()
+{
+    cppi.CrReceiverValue value = default;
+    const cppi.CrReceiverValue* pointer = &value;
+    expect_error("cannot pass C++ const pointer argument") {
+        cppi.cr_take_mut(pointer);
+    }
+    const cppi.CrReceiverValue** pointerPointer = &pointer;
+    expect_error("cannot pass C++ const pointer argument 1 ('pointerPointer')") {
+        cppi.cr_take_mut_pp(pointerPointer);
+    }
+    // A lone mutable-pointer member operator refuses a const pointer operand.
+    cppi.ConstPointerRankValue rankValue = default;
+    const cppi.ConstPointerRankValue* rankPointer = &rankValue;
+    cppi.ConstPointerRankShiftMut shiftMut = default;
+    expect_error("cannot pass C++ const pointer argument 2 ('rankPointer')") {
+        int shifted = shiftMut << rankPointer;
+    }
+    // A constructor with only a mutable pointer parameter refuses it too.
+    expect_error("is a mutable C++ pointer and argument 1 points to a const C++ object") {
+        cppi.ConstPointerRankCtor built = cppi.ConstPointerRankCtor(rankPointer);
+    }
+    return 0;
+}

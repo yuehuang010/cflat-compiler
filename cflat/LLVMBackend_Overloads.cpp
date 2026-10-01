@@ -645,8 +645,27 @@ std::vector<LLVMBackend::CxxConversionRank> LLVMBackend::RankCxxConversionSequen
                     !pt.TypeName.empty() ? pt.TypeName : arg.InferSourceTypeName);
                 if (!pt.Pointer || pt.ElemPointer || pt.IsArrayView || pt.ConstArraySize > 0
                     || pt.IsFunctionPointer || pt.IsInterface || pt.PointerDepth > 1
-                    || pointee.empty() || param.TypeName.empty() || pointee == "void"
+                    || param.TypeName.empty() || pointee == "void"
                     || IsNullPointerConstantArgument(arg))
+                    continue;
+                if (IsCxxRecord(pt.TypeName) && IsCxxRecord(param.TypeName)
+                    && (pt.TypeName == param.TypeName
+                        || IsCxxBaseOf(param.TypeName, pt.TypeName)))
+                {
+                    const bool derivedToBase = pt.TypeName != param.TypeName;
+                    const bool addsOrDropsPointeeConst =
+                        pt.IsCxxPointeeConst != param.IsCxxPointeeConst;
+                    // Dropping pointee const is not viable in C++; ranked only so a lone such
+                    // candidate reaches the lowering diagnostic that refuses it.
+                    const bool dropsPointeeConst = pt.IsCxxPointeeConst && !param.IsCxxPointeeConst;
+                    out.rank = dropsPointeeConst
+                        ? 2 : (derivedToBase ? 2 : 0) + (addsOrDropsPointeeConst ? 1 : 0);
+                    out.cxxViable = pt.PointerDepth == 1 && !dropsPointeeConst;
+                    out.from = pt.TypeName;
+                    out.toClass = param.TypeName;
+                    continue;
+                }
+                if (pointee.empty())
                     continue;
                 if (pointee == CanonicalPrimitiveTypeName(param.TypeName))
                 {
@@ -892,6 +911,11 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
             // Arguments bound by materializing a temporary for a C++ `const T&` scalar parameter.
             // A materialization is strictly worse than a by-value or rvalue-ref bind (ruling).
             int constRefMaterializations = 0;
+            // Prefer matching C++ record-pointer pointee constness (adding const ranks worse).
+            int cxxPointeeConstMismatches = 0;
+            // Not viable in C++ (dropped pointee const); removed while any other candidate is
+            // viable, else kept so the selected-candidate guard refuses it.
+            bool cxxPointeeConstNotViable = false;
             // In a C++ overload set containing the same T& and const T& parameter, an
             // lvalue binds to T&. Count only this exact sibling comparison.
             int mutableRefPreference = 0;
@@ -904,6 +928,9 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
         std::vector<Ranked> perfect;
         std::vector<Ranked> possible;   // the promotion/implicit tier
         const std::pair<std::vector<NamedVariable>, FunctionSymbol>* variadicFallback = nullptr;
+        // A variadic candidate that drops a record pointee const: C++ keeps it only when
+        // nothing else is viable, so it never displaces the tiers (see cxxPointeeConstNotViable).
+        const std::pair<std::vector<NamedVariable>, FunctionSymbol>* variadicConstDropFallback = nullptr;
         auto isStringLiteralValue = [&](llvm::Value* value) {
             auto* constant = llvm::dyn_cast_or_null<llvm::Constant>(
                 value == nullptr ? nullptr : value->stripPointerCasts());
@@ -983,6 +1010,7 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                  * cleanly, so only this arm needs the wider question.
                  */
                 bool declaredParamRefuses = false;
+                bool variadicDropsPointeeConst = false;
                 auto varParamItr = candidate.Parameters.begin();
                 for (const auto& arg : arguments)
                 {
@@ -993,16 +1021,32 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                     // narrowing into it has no conversion and reached the module verifier.
                     if (ArgumentNarrowsParameter(arg, *varParamItr))
                         declaredParamRefuses = true;
+                    if (candidate.IsCxx
+                        && CxxRecordPointeeConstRelation(arg.TypeAndValue, *varParamItr)
+                               == CxxPointeeConstRelation::Drops)
+                        variadicDropsPointeeConst = true;
                     ++varParamItr;
                 }
                 if (declaredParamRefuses)
                     continue;
-
-                // Variadic is a fallback: prefer any exact non-variadic match over it. It replaces
-                // the promotion tier seen so far; a later non-variadic candidate overrides it.
-                variadicFallback = &pair;
-                possible.clear();
-                continue;
+                // C++ [over.ics.ellipsis]: only an argument the ellipsis receives has the worst
+                // conversion. With none, the candidate ranks on its declared parameters below.
+                const bool ellipsisUnused = candidate.IsCxx
+                    && arguments.size() <= candidate.Parameters.size();
+                if (!ellipsisUnused)
+                {
+                    if (variadicDropsPointeeConst)
+                    {
+                        if (variadicConstDropFallback == nullptr) variadicConstDropFallback = &pair;
+                        continue;
+                    }
+                    // Variadic is a fallback: prefer any exact non-variadic match over it. For a
+                    // native set it replaces the promotion tier seen so far; a later non-variadic
+                    // candidate overrides it. A C++ ellipsis loses to every viable sibling.
+                    variadicFallback = &pair;
+                    if (!candidate.IsCxx) possible.clear();
+                    continue;
+                }
             }
 
             bool perfectMatch = true;
@@ -1019,6 +1063,8 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
             // Arguments bound through the `iterator -> const_iterator` conversion.
             int constAddedConversions = 0;
             int refPtrConstMismatches = 0;
+            int cxxPointeeConstMismatches = 0;
+            bool cxxPointeeConstNotViable = false;
             // Arguments bound through a user-defined conversion; the extra fields describe
             // conversion operators (see Ranked for the aggregate fallback).
             int userConversions = 0;
@@ -1031,6 +1077,20 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
             for (const auto& arg : arguments)
             {
                 int result = -1;
+                if (candidate.IsCxx && candidateParamItr != candidate.Parameters.end())
+                {
+                    const auto relation =
+                        CxxRecordPointeeConstRelation(arg.TypeAndValue, *candidateParamItr);
+                    if (relation == CxxPointeeConstRelation::Drops)
+                        cxxPointeeConstMismatches += 2;
+                    else if (relation == CxxPointeeConstRelation::Adds)
+                        cxxPointeeConstMismatches += 1;
+                    // Not viable in C++: a dropped pointee const, or any inner-const change at **.
+                    if (relation == CxxPointeeConstRelation::Drops
+                        || (relation == CxxPointeeConstRelation::Adds
+                            && arg.TypeAndValue.ElemPointer))
+                        cxxPointeeConstNotViable = true;
+                }
                 // Set ONLY by the two `const T&` scalar arms below, so the integer-identity
                 // ranking reads the REFERENT for candidates only those arms make viable.
                 std::string constRefReferentIdentity;
@@ -1728,6 +1788,15 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                     if (integerCost >= 0) integerCost += 1;
                     if (result >= 0) constRefMaterializations++;
                 }
+                if (result >= 0 && candidate.IsCxx
+                    && candidateParamItr != candidate.Parameters.end())
+                {
+                    const auto relation =
+                        CxxRecordPointeeConstRelation(arg.TypeAndValue, *candidateParamItr);
+                    if (relation == CxxPointeeConstRelation::Adds
+                        || relation == CxxPointeeConstRelation::Drops)
+                        result = std::max(result, 1);
+                }
                 integerCosts.push_back(integerCost);
                 standardCosts.push_back(integerCost);
                 if (standardCosts.back() < 0 && IsNullPointerConstantArgument(arg)
@@ -1767,6 +1836,8 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                 ranked.omitted = omitted;
                 ranked.constAddedConversions = constAddedConversions;
                 ranked.refPtrConstMismatches = refPtrConstMismatches;
+                ranked.cxxPointeeConstMismatches = cxxPointeeConstMismatches;
+                ranked.cxxPointeeConstNotViable = cxxPointeeConstNotViable;
                 ranked.userConversions = userConversions;
                 ranked.userConversionCost = userConversionCost;
                 ranked.userConversionNames = userConversionNames;
@@ -1776,6 +1847,15 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                 ranked.nullPointerConversions = nullPointerConversions;
                 (perfectMatch ? perfect : possible).push_back(std::move(ranked));
             }
+        }
+
+        // C++ viability: a const-dropping candidate leaves the set while any other is viable.
+        auto cxxConstViable = [](const Ranked& r) { return !r.cxxPointeeConstNotViable; };
+        if (std::any_of(perfect.begin(), perfect.end(), cxxConstViable)
+            || std::any_of(possible.begin(), possible.end(), cxxConstViable))
+        {
+            std::erase_if(perfect, [](const Ranked& r) { return r.cxxPointeeConstNotViable; });
+            std::erase_if(possible, [](const Ranked& r) { return r.cxxPointeeConstNotViable; });
         }
 
         using Result = std::pair<std::vector<NamedVariable>, FunctionSymbol>;
@@ -2043,7 +2123,10 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                                   [](const CxxConversionRank& r) { return r.cxxViable; }))
                     continue;
                 bool crossing = false;
-                const int order = CompareCxxConversionRanks(won, ranks, crossing);
+                // A winner kept only because no tier member was C++-viable (it drops a record
+                // pointee const) loses to any candidate C++ can call.
+                const int order = winner->cxxPointeeConstNotViable
+                    ? 1 : CompareCxxConversionRanks(won, ranks, crossing);
                 if (order == -1 || order == 2)
                     continue;
                 if (failedDefault && order == 0 && !crossing
@@ -2100,6 +2183,7 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
             std::vector<const Ranked*> best;
             for (const Ranked& r : perfect)
                 best.push_back(&r);
+            keepLowest(best, [](const Ranked& r) { return r.cxxPointeeConstMismatches; });
             keepLowest(best, [](const Ranked& r) { return r.refPtrConstMismatches; });
             keepLowest(best, [](const Ranked& r) { return r.mutableRefPreference; });
             keepLowest(best, [](const Ranked& r) { return -r.moveScore; });
@@ -2113,6 +2197,7 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
             std::vector<const Ranked*> best;
             for (const Ranked& r : possible)
                 best.push_back(&r);
+            keepLowest(best, [](const Ranked& r) { return r.cxxPointeeConstMismatches; });
             // Non-C++ sets keep the conversion-operator score; C++ sets use the per-argument
             // [over.match.best] sequences above, including converting constructors.
             if (!cxxRanking)
@@ -2173,6 +2258,9 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
 
         if (variadicFallback != nullptr)
             return *variadicFallback;
+        // Nothing viable: the const-dropping variadic reaches the selected-candidate guard.
+        if (variadicConstDropFallback != nullptr)
+            return *variadicConstDropFallback;
         return {};
     }
 
@@ -3133,7 +3221,9 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                 if (matched.size() > 0)
                 {
                     resolvedCandidate.emplace_back(std::move(matched), candidate);
-                    break;
+                    // A C++ variadic is one candidate of its overload set: its non-variadic
+                    // siblings still score (ComputeOverloadFunction ranks the variadic last).
+                    if (!candidate.IsCxx) break;
                 }
             }
             else if (arguments.size() == 0)
@@ -3198,6 +3288,8 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
             if (std::string error = CheckCxxDemand(candidate.Function->getName().str());
                 !error.empty())
             {
+                // R4: the retry only sharpens the refusal (e.g. an rvalue sibling asking for
+                // `move`); if it silently binds another overload, report the winner's body error.
                 RefuseCxxDemandMember(candidate.Function->getName().str(), error);
                 auto saved = std::exchange(cxxDemandRefusalRelay_,
                                            std::pair{functionName, error});
@@ -3205,6 +3297,8 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                     forceRoot, displayName, cxxMemberReceiver, postfixMemberCall,
                     enclosingFunctionName);
                 cxxDemandRefusalRelay_ = std::move(saved);
+                // EmitError does not return: reaching here means the retry bound a sibling.
+                LogError(error);
                 return retried;
             }
 
@@ -4225,6 +4319,24 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
             // param, which for printf is 'ptr %fmt' - causing all variadic args to be
             // pushed as storage/GEP addresses instead of loaded values).
             bool inVariadicRange = candidate.Variadic && argIndex >= candidate.Parameters.size();
+            if (candidate.IsCxx && !inVariadicRange
+                && !(candidate.IsMethod && argIndex == 0 && candidate.CxxConst)
+                && argIndex < candidate.Parameters.size())
+            {
+                const TypeAndValue& param = candidate.Parameters[argIndex];
+                const TypeAndValue& source = arg.TypeAndValue;
+                if (CxxRecordPointeeConstRelation(source, param) == CxxPointeeConstRelation::Drops)
+                {
+                    const std::string sourceName = !arg.CallerName.empty()
+                        ? arg.CallerName : source.VariableName.empty()
+                            ? "<argument>" : source.VariableName;
+                    LogError(std::format(
+                        "cannot pass C++ const pointer argument {} ('{}') to mutable C++ pointer "
+                        "parameter '{}': it points to a const C++ object, so the parameter could "
+                        "write through read-only storage",
+                        argIndex + 1, sourceName, param.VariableName));
+                }
+            }
 
             // An owning value rvalue has no named owner that can survive the C vararg boundary.
             // The pointer ledger covers owning pointer returns/new; by-value owning returns use

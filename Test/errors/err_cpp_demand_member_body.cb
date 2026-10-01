@@ -1,0 +1,34 @@
+import cpp "cpp_interop_demand_fail.h";
+int take_ctor(w1demand.Q<int> q) { return q.v; }
+extern int main()
+{
+    w1demand.P<int> p = default;
+    int i = 3;
+    expect_error("clang: type 'int' cannot be used prior to '::'") {
+        p.f(i);
+    }
+    expect_error("clang: type 'int' cannot be used prior to '::'") {
+        int value = w1demand.Q<int>(i).v;
+    }
+    expect_error("clang: type 'int' cannot be used prior to '::'") {
+        w1demand.Q<int> q = w1demand.Q<int>(i);
+    }
+    expect_error("clang: type 'int' cannot be used prior to '::'") {
+        w1demand.Q<int>* q = new w1demand.Q<int>(i);
+    }
+    expect_error("clang: type 'int' cannot be used prior to '::'") {
+        take_ctor(i);
+    }
+    expect_error("clang: type 'int' cannot be used prior to '::'") {
+        w11round3.D<int> tieBreak = w11round3.D<int>(i);
+    }
+    expect_error("clang: type 'int' cannot be used prior to '::'") {
+        int inherited = w11round3.G<int>(i).v;
+    }
+    // The copy-sink verdict outranks the fill constructor's own body refusal.
+    expect_error("cannot copy C++ class 'w11fill.KeyCheck' into constructor parameter 'v'") {
+        w11fill.KeyCheck local = w11fill.KeyCheck(4);
+        w11fill.Fill<w11fill.KeyCheck> values = w11fill.Fill<w11fill.KeyCheck>(3, local);
+    }
+    return 0;
+}

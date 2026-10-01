@@ -3463,6 +3463,7 @@ private:
         std::vector<std::string> defines;
         std::unordered_set<std::string> namespaces;
         std::unordered_set<std::string> publishedNames;
+        std::unordered_set<std::string> specializedTemplates;
         // Own headers plus their transitive includes, normalized: what a probe may claim to own.
         std::unordered_set<std::string> reachableFiles;
         unsigned headerParseCount = 0;
@@ -3990,6 +3991,7 @@ private:
         std::vector<CSigEntry> sigs;
         std::vector<cflat_cinterop::RawFunctionTemplate> functionTemplates;
         std::vector<std::string> classTemplateNames;
+        std::vector<std::string> classTemplateSpecializations;
         // Namespace leads a C++ header extraction seeded into its import group (signature
         // spellings, included headers). A hit replays them: they order owner-group candidates.
         std::vector<std::string> cxxGroupNamespaces;
@@ -4047,6 +4049,7 @@ private:
     static size_t CFileSigEntryRows(const CFileSigCacheEntry& entry)
     {
         return entry.sigs.size() + entry.functionTemplates.size() + entry.classTemplateNames.size()
+             + entry.classTemplateSpecializations.size()
              + entry.cxxGroupNamespaces.size() + entry.enums.size() + entry.records.size()
              + entry.macros.size() + entry.funcMacros.size() + entry.globals.size()
              + entry.recordAliases.size() + entry.typeAliases.size()
@@ -5655,8 +5658,10 @@ private:
     // through CFlat frames via CreateCallOrInvoke's cleanup landing pads.
     std::string CheckCxxDemand(const std::string& symbol);
     void ValidateCxxDemand(const std::string& symbol);
+    void ValidateCxxStaticMemberDemandAtUseSite(const std::string& symbol);
     void RefuseCxxDemandMember(const std::string& symbol, const std::string& error);
     std::unordered_map<std::string, std::string> cxxBodyChecks_;
+    std::unordered_set<std::string> cxxStaticMemberSymbols_;
     // Body verdicts persisted per request group and per import cohort. One file each holds every
     // verdict of a compile (keys carry no symbol) and is written once by FlushCxxDemandVerdicts.
     struct CxxVerdictFile
@@ -5876,6 +5881,8 @@ private:
     bool IsCxxNamespace(const std::string& name) const;
     bool HasCxxFunctionTemplateMember(const std::string& owner,
                                       const std::string& memberName) const;
+    bool IsCxxStaticOnlyFunctionTemplateMember(const std::string& owner,
+                                               const std::string& memberName) const;
     // A bound C++ symbol that is a recorded specialization of a function template.
     bool IsCxxTemplateSpecializationSymbol(const FunctionSymbol& symbol) const;
     bool HasCxxForwardingReferenceTemplateMember(const std::string& owner,
@@ -6365,7 +6372,8 @@ private:
                              std::vector<std::pair<std::string, std::string>>* outUsingDirectives = nullptr,
                              std::vector<std::pair<std::string, std::string>>* outNamespaceAliases = nullptr,
                              std::vector<std::string>* outClassTemplateNames = nullptr,
-                             std::vector<std::pair<std::string, std::string>>* outClassUsings = nullptr);
+                             std::vector<std::pair<std::string, std::string>>* outClassUsings = nullptr,
+                             std::vector<std::string>* outClassTemplateSpecializations = nullptr);
 
     // Extract externally-linkable functions a .c file DEFINES, via the clang C++ API. Records
     // are registered up front (struct-by-value). Used by the .c auto-extern path.
@@ -8564,6 +8572,7 @@ public:
         std::vector<Structor> copyAssignOverloads;
         std::vector<Structor> moveAssignOverloads;
     };
+    std::unordered_map<std::string, std::string> cxxConstructorBodyRefusals_;
     const CxxClassInfo* GetCxxClassInfo(const std::string& typeName) const
     {
         if (pendingCxxRecordProjections_.count(typeName) != 0)
@@ -9047,6 +9056,18 @@ public:
      * Name of the `explicit` constructor of `typeName` that WOULD have taken `argTypes` had it
      * been implicit. Empty when none exists. Drives the diagnostic at a call argument.
      */
+    // R4: a body failure of the constructor or member picked for a real use is reported at that
+    // use with clang's text. Never called from convertibility probes.
+    void ValidateCxxDemandAtUseSite(const std::string& symbol);
+    // The stored body refusal ("clang: ...") of a constructor the newest wrapper request of
+    // `group` selected, recording it first; empty when no body-refused constructor was selected.
+    std::string CxxBodyRefusedWrapperError(const CxxRequestGroup& group,
+                                           const std::string& cacheTag);
+    std::string CxxConstructorBodyRefusalError(
+        const CxxClassInfo::Structor* selected) const;
+    std::string CxxConstructorCopySinkError(
+        const CxxClassInfo::Structor* selected,
+        const std::vector<NamedVariable>& arguments) const;
     std::string ExplicitCxxConstructorBlocking(const std::string& typeName,
                                                const std::vector<TypeAndValue>& argTypes);
     // Verdict of the one implicit user-defined conversion at a C++ call argument. The two
@@ -10355,6 +10376,28 @@ public:
         if (!IsCxxRecord(from.TypeName) || !IsCxxRecord(to.TypeName)) return false;
         return IsCxxBaseOf(to.TypeName, from.TypeName);
     }
+    /*
+     * Pointee-const relation of a C++ record pointer argument to a C++ record pointer parameter
+     * at the level IsCxxPointeeConst describes. Single level: same class or derived-to-base.
+     * Pointer-to-pointer: same class only; C++ forbids adding or dropping the inner const there.
+     */
+    enum class CxxPointeeConstRelation { Unrelated, Same, Adds, Drops };
+    CxxPointeeConstRelation CxxRecordPointeeConstRelation(const TypeAndValue& from,
+                                                          const TypeAndValue& to) const
+    {
+        if (!from.Pointer || !to.Pointer || from.ElemPointer != to.ElemPointer
+            || from.IsFunctionPointer || to.IsFunctionPointer || from.IsArrayView || to.IsArrayView
+            || from.PointerDepth > 2 || to.PointerDepth > 2
+            || !IsCxxRecord(from.TypeName) || !IsCxxRecord(to.TypeName))
+            return CxxPointeeConstRelation::Unrelated;
+        if (from.TypeName != to.TypeName
+            && (from.ElemPointer || !IsCxxBaseOf(to.TypeName, from.TypeName)))
+            return CxxPointeeConstRelation::Unrelated;
+        if (from.IsCxxPointeeConst == to.IsCxxPointeeConst)
+            return CxxPointeeConstRelation::Same;
+        return from.IsCxxPointeeConst ? CxxPointeeConstRelation::Drops
+                                      : CxxPointeeConstRelation::Adds;
+    }
 
     // Load a value of type coerceTy from byte offset byteOff within an alloca'd struct slot,
     // reinterpreting the underlying bytes (used to read SysV eightbytes out of a struct).
@@ -10931,7 +10974,8 @@ public:
     // 142: C++ anonymous record members retain transparent promoted field aliases.
     // 143: promoted aliases exclude bitfields, whose packed storage stays in their synthetic record.
     // 144: named C++ members of anonymous struct/union types get synthetic nested records.
-    static constexpr int kCHeaderCacheVersion = 145;
+    // 151: a body-refused constructor is a plain valid candidate again; wrappers re-resolve.
+    static constexpr int kCHeaderCacheVersion = 151;
     static std::string CompilerBuildStamp();
     // THE switch for "the compiler build is part of cache entry validity": header/request
     // entries record and check "cstamp", and demand companion keys fold the stamp. OFF by

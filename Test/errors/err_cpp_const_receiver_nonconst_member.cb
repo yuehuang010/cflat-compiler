@@ -47,7 +47,7 @@ extern int main()
     expect_error("no candidate ranks better than the others") {
         int a = cppi.ma_ref().only();
     }
-    expect_error("no matching member function for call to 'f'") {
+    expect_error("cannot call non-const member 'f' on 't'") {
         const cppi.Tm t = default;
         int a = t.f(2);
     }

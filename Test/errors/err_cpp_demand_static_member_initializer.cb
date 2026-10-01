@@ -1,0 +1,10 @@
+import cpp "cpp_interop_demand_fail.h";
+extern int main()
+{
+    // Either clang's own static_assert text (names the member in its instantiation note) or the
+    // generic fallback when the shared dependency was diagnosed earlier.
+    expect_error("w1demand::StaticValue<int>::bad'") {
+        printf("%d\n", w1demand.StaticValue<int>.bad);
+    }
+    return 0;
+}

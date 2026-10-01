@@ -1,0 +1,9 @@
+import cpp "cpp_interop_demand_fail.h";
+extern int main()
+{
+    w1demand.DefaultedHolder h = default;
+    expect_error("clang: static assertion failed") {
+        w1demand.DefaultedHolder c = h;
+    }
+    return 0;
+}

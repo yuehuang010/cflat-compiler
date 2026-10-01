@@ -125,6 +125,10 @@ namespace cppi
     }
     std::string_view take_string_view(std::string_view value) noexcept { return value; }
     std::string_view return_string_view(std::string_view value) noexcept { return value; }
+    int variadic_exact_rank(int x, ...) noexcept { return 1; }
+    int variadic_exact_rank(long x) noexcept { return 2; }
+    int variadic_exact_rank_rev(long x) noexcept { return 2; }
+    int variadic_exact_rank_rev(int x, ...) noexcept { return 1; }
     int sum_varargs(int count, ...) noexcept
     {
         va_list args;

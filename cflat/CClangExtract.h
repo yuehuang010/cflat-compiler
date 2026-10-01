@@ -360,6 +360,7 @@ namespace cflat_cinterop
         bool isFloatConstant = false;
         double floatValue = 0.0;
         int access = AccessPublic;
+        std::string initializerFailure;
         std::string file;
         int line = 1;
         int col = 0;
@@ -693,6 +694,7 @@ namespace cflat_cinterop
         std::vector<RawSig> sigs;
         std::vector<RawFunctionTemplate> functionTemplates;
         std::vector<std::string> classTemplateNames;
+        std::vector<std::string> classTemplateSpecializations;
         std::vector<RawEnum> enums;
         std::vector<RawRecord> records;
         std::vector<RawTypedef> typedefs;

@@ -4859,6 +4859,7 @@ public:
                                        const LLVMBackend::DeclTypeAndValue& autoType,
                                        LLVMBackend::NamedVariable& sourceNV,
                                        llvm::Value* sourceCxxRetTemp,
+                                       bool constQualified,
                                        const std::string& name, size_t line,
                                        std::vector<std::pair<std::string, llvm::AllocaInst*>>& allocList);
     // The `T(args)` construction form: the argument list of a postfix call whose callee spelling
@@ -6361,7 +6362,8 @@ public:
         const std::string& rhsCallerName = std::string(),
         const std::string& rhsFieldName = std::string(), bool rhsIsElementAccess = false,
         const std::vector<LLVMBackend::ConditionalMoveSource>& lhsConditionalMoves = {},
-        const std::vector<LLVMBackend::ConditionalMoveSource>& rhsConditionalMoves = {});
+        const std::vector<LLVMBackend::ConditionalMoveSource>& rhsConditionalMoves = {},
+        bool rhsCxxPointeeConst = false);
 
     LLVMBackend::TypedValue ParseMultiplicativeExpression(CFlatParser::MultiplicativeExpressionContext* ctx,
                                                            ResultUse use = ResultUse::Value);

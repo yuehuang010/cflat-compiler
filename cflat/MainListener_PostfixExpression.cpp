@@ -1852,6 +1852,9 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 auto globalNV = Compiler(ctx)->GetGlobalVariableNV(primaryIdentifier);
                                 if (globalNV.Storage != nullptr)
                                 {
+                                    if (auto* global = llvm::dyn_cast<llvm::GlobalVariable>(globalNV.Storage))
+                                        Compiler(ctx)->ValidateCxxStaticMemberDemandAtUseSite(
+                                            global->getName().str());
                                     int64_t constValue = 0;
                                     if (Compiler(ctx)->TryGetConstGlobalInt(primaryIdentifier, constValue)
                                         || (llvm::isa<llvm::GlobalVariable>(globalNV.Storage)
@@ -2714,6 +2717,9 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             auto globalNV = compiler->GetGlobalVariableNV(rootName);
                             if (globalNV.Storage != nullptr)
                             {
+                                if (auto* global = llvm::dyn_cast<llvm::GlobalVariable>(globalNV.Storage))
+                                    compiler->ValidateCxxStaticMemberDemandAtUseSite(
+                                        global->getName().str());
                                 namedVar = globalNV;
                             }
                             else if (compiler->GetFunction(rootName))
@@ -3444,6 +3450,9 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             llvm::Value* zero = Compiler(ctx)->builder->getInt64(0);
                             llvm::Value* elemPtr = Compiler(ctx)->builder->CreateGEP(
                                 arrTy, namedVar.Storage, {zero, rvalue}, "arrayelemptr");
+                            const bool constArraySlot = Compiler(ctx)->CxxConstReceiverKind(namedVar) != 0;
+                            if (constArraySlot)
+                                Compiler(ctx)->MarkCxxConstFieldAccess(elemPtr);
                             // When the array lives in a GLOBAL, the base pointer is a constant, so a
                             // constant index (e.g. g[0], whose all-zero GEP is a no-op) folds the GEP
                             // back into a Constant - the GlobalVariable itself or a ConstantExpr. Such
@@ -3456,6 +3465,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 elemPtr = Compiler(ctx)->builder->Insert(
                                     llvm::GetElementPtrInst::CreateInBounds(
                                         arrTy, namedVar.Storage, {zero, rvalue}, "arrayelemptr"));
+                            if (constArraySlot)
+                                Compiler(ctx)->MarkCxxConstFieldAccess(elemPtr);
                             namedVar.Storage = elemPtr;
                             namedVar.BaseType = arrTy->getElementType();
                             namedVar.TypeAndValue.ConstArraySize = 0;
@@ -6917,6 +6928,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                                                                   : std::string();
                             };
                             const bool isPostfixMemberCall = postfixMemberCallPending;
+                            bool isStaticTemplateThroughObject = false;
                             postfixMemberCallPending = false;
                             const bool callHasCxxBraceArguments = !cxxBraceArguments.empty();
                             std::string enclosingFunctionName;
@@ -6948,7 +6960,26 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 bool isTemplate = false;
                                 bool templateBesideNonTemplate = false;
                                 bool deduceBesideSpecializations = false;
-                                if (!receiverType.empty()
+                                const size_t memberDot = functionName.rfind('.');
+                                const std::string memberOwner = memberDot == std::string::npos
+                                    ? std::string() : functionName.substr(0, memberDot);
+                                const std::string simpleMemberName = memberDot == std::string::npos
+                                    ? functionName : functionName.substr(memberDot + 1);
+                                const bool staticTemplate = isPostfixMemberCall
+                                    && !receiverType.empty()
+                                    && (memberOwner.empty() || memberOwner == receiverType)
+                                    && compiler->IsCxxStaticOnlyFunctionTemplateMember(
+                                        receiverType, simpleMemberName);
+                                if (staticTemplate && !arguments.empty())
+                                {
+                                    owner = receiverType;
+                                    memberName = simpleMemberName;
+                                    functionName = receiverType + "." + memberName;
+                                    arguments.erase(arguments.begin());
+                                    isTemplate = true;
+                                    isStaticTemplateThroughObject = true;
+                                }
+                                else if (!receiverType.empty()
                                     && compiler->HasCxxFunctionTemplateMember(receiverType, functionName))
                                 {
                                     owner = receiverType;
@@ -7025,7 +7056,13 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                                         && parameter.TypeName == argumentType
                                                         && (valueReceiver
                                                             || parameter.Pointer == argument.TypeAndValue.Pointer)
-                                                        && parameter.ElemPointer == argument.TypeAndValue.ElemPointer;
+                                                        && parameter.ElemPointer == argument.TypeAndValue.ElemPointer
+                                                        // `const T*` into `T*` is no identity: a template
+                                                        // sibling may deduce `T = const Rec` instead.
+                                                        && (!parameter.Pointer || valueReceiver
+                                                            || !compiler->IsCxxRecord(parameter.TypeName)
+                                                            || parameter.IsCxxPointeeConst
+                                                                   == argument.TypeAndValue.IsCxxPointeeConst);
                                                 }
                                                 hasExactNonWrapper = hasExactNonWrapper || exact;
                                             }
@@ -7124,6 +7161,10 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 }
                                 if (!requested)
                                 {
+                                    if (isTemplate && !owner.empty()
+                                        && RefuseCxxConstReceiverCall(primaryCtx, arguments,
+                                            owner, memberName, lastMemberReceiverPath))
+                                        return;
                                     // No specialization: the non-template overloads still resolve the call.
                                     if (!templateError.empty()
                                         && (!templateBesideNonTemplate || clangRejected))
@@ -7138,6 +7179,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                         || registeredName.starts_with("__cflat_tpl_")
                                         || registeredName.starts_with("__cflat_free_")))
                                     resolvedName = registeredName;
+                                else if (isStaticTemplateThroughObject)
+                                    resolvedName = owner + "." + memberName;
                                 else if (isTemplate && !owner.empty()
                                          && !structVar.TypeAndValue.TypeName.empty())
                                     resolvedName = memberName;
@@ -7269,15 +7312,26 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 // resolves `T(args)`, the listed pick stays the fallback.
                                 const bool clangResolves = compiler->CxxConstructorNeedsClangResolution(
                                     functionName, ctor, ctorTypes);
+                                if (const std::string sink =
+                                        compiler->CxxConstructorCopySinkError(ctor, arguments);
+                                    !sink.empty())
+                                    LogErrorContext(ctx, sink);
                                 std::string wrapperName;
                                 std::string wrapperError;
                                 const bool wrapped = ((ctor == nullptr && !hardReferenceRejection)
                                         || clangResolves)
                                     && compiler->RequestCxxVariadicConstructor(
                                         functionName, arguments, wrapperName, wrapperError);
-                                // A scalar-reference overload set has no listed fallback.
+                                // The copy-sink verdict names the parameter and the remedy: it
+                                // outranks the body refusal of clang's pick (MSVC fill ctor).
+                                if (wrapperError.starts_with("clang: ")
+                                    && why.starts_with("cannot copy C++ class"))
+                                    wrapperError.clear();
+                                // A scalar-reference overload set has no listed fallback, nor
+                                // does clang's pick of a body-refused constructor.
+                                const bool bodyRefused = wrapperError.starts_with("clang: ");
                                 if (wrapped || (ctor == nullptr && !hardReferenceRejection)
-                                    || scalarReferenceSet)
+                                    || scalarReferenceSet || bodyRefused)
                                 {
                                     // Some foreign class constructors are templates or inherited
                                     // variadics, so use the declaration initializer's wrapper path.
@@ -7326,6 +7380,11 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                         namedVar.IsRvalue = true;
                                         compiler->lastOwningResult = true;
                                     }
+                                    else if (bodyRefused)
+                                    {
+                                        LogErrorContext(ctx, wrapperError);
+                                        namedVar = {};
+                                    }
                                     else
                                     {
                                         if (!wrapperError.empty() && !why.starts_with("constructor '"))
@@ -7341,6 +7400,14 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     LogErrorContext(primaryCtx, why.starts_with("no overload of '")
                                         ? why : std::format("C++ class '{}' {}",
                                             compiler->DisplayCxxClassName(functionName), why));
+                                    namedVar = {};
+                                }
+                                else if (const std::string refusal =
+                                             compiler->CxxConstructorBodyRefusalError(ctor);
+                                         !refusal.empty())
+                                {
+                                    // The listed pick is called directly and its body failed.
+                                    LogErrorContext(ctx, refusal);
                                     namedVar = {};
                                 }
                                 else
@@ -7516,7 +7583,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     : Compiler(ctx)->CreateOverloadedFunctionCall(
                                     resolvedFuncName, arguments, globalScopeCall, callDisplayName,
                                     cxxMemberReceiverType(),
-                                    isPostfixMemberCall && !callHasCxxBraceArguments,
+                                    isPostfixMemberCall && !isStaticTemplateThroughObject
+                                        && !callHasCxxBraceArguments,
                                     enclosingFunctionName);
                                 globalScopeCall = false;
                                 {
@@ -7587,7 +7655,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     : Compiler(primaryCtx)->CreateOverloadedFunctionCall(
                                     resolvedFuncName, arguments, globalScopeCall, callDisplayName,
                                     cxxMemberReceiverType(),
-                                    isPostfixMemberCall && !callHasCxxBraceArguments,
+                                    isPostfixMemberCall && !isStaticTemplateThroughObject
+                                        && !callHasCxxBraceArguments,
                                     enclosingFunctionName);
                                 globalScopeCall = false;
                                 {
@@ -9446,6 +9515,8 @@ LLVMBackend::NamedVariable MainListener::ParseIdentifier(antlr4::tree::TerminalN
             auto globalNV = compiler->GetGlobalVariableNV(name);
             if (globalNV.Storage != nullptr)
             {
+                if (auto* global = llvm::dyn_cast<llvm::GlobalVariable>(globalNV.Storage))
+                    compiler->ValidateCxxStaticMemberDemandAtUseSite(global->getName().str());
                 int64_t constValue = 0;
                 if (compiler->TryGetConstGlobalInt(name, constValue)
                     || (llvm::isa<llvm::GlobalVariable>(globalNV.Storage)
@@ -9511,6 +9582,8 @@ LLVMBackend::NamedVariable MainListener::ParseIdentifier(antlr4::tree::TerminalN
             auto nsGlobalNV = compiler->GetGlobalVariableNV(nsQualified);
             if (nsGlobalNV.Storage != nullptr)
             {
+                if (auto* global = llvm::dyn_cast<llvm::GlobalVariable>(nsGlobalNV.Storage))
+                    compiler->ValidateCxxStaticMemberDemandAtUseSite(global->getName().str());
                 CheckGlobalGuard(node, name, nsGlobalNV);
                 nsGlobalNV.IdentifierLine = (int)node->getSymbol()->getLine();
                 nsGlobalNV.IdentifierColumn = (int)node->getSymbol()->getCharPositionInLine();

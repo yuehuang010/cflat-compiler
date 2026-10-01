@@ -2577,6 +2577,7 @@ void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {
 
                 compiler->InitializeBlock(blockCondition, false);
                 auto condition = ParseExpression(expression);
+                condition = compiler->CoerceToBoolCondition(condition);
                 // Free owned-string temps produced inside the condition (e.g. `do {...} while
                 // (s.toString() != "x")`) here, in the condition block. The block-item flush runs
                 // in the post-loop block, where the dominance guard would drop them and leak.
@@ -2603,6 +2604,7 @@ void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {
 
                 compiler->InitializeBlock(blockCondition, true, blockCondition, blockResume, blockResume);
                 auto condition = ParseExpression(expression);
+                condition = compiler->CoerceToBoolCondition(condition);
                 // Free owned-string temps from the condition in the condition block (see do-while).
                 // Runs each iteration after the guard is evaluated.
                 compiler->FlushOwnedTemps();
@@ -2692,6 +2694,7 @@ void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {
                     // Condition
                     compiler->InitializeBlock(blockCondition, false);
                     auto condition = ParseAssignmentExpression(compareCtx);
+                    condition = compiler->CoerceToBoolCondition(condition);
                     // Free owned-string temps from the condition in the condition block (see do-while).
                     compiler->FlushOwnedTemps();
                     compiler->CreateConditionJump(condition, blockInner, blockResume);
@@ -3538,6 +3541,7 @@ void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {
 
                 compiler->InitializeBlock(blockCondition, true, nullptr, nullptr, blockFalse);
                 auto condition = ParseExpression(expression);
+                condition = compiler->CoerceToBoolCondition(condition);
                 // Free owned-string temps produced inside the condition (e.g. `if (s.toString()
                 // == x)`) here, while still in the condition block. The block-item flush runs in
                 // the post-if merge block, where the dominance guard would drop them and leak.

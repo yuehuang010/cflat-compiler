@@ -1335,6 +1335,13 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
         // allocation-alignment channel and a direct `new` on the explicit spelling is rejected.
         if (declType.AllocAlignValue == 0)
             declType.AllocAlignValue = CoreUniqueDeclaredAllocAlign(Compiler(), declType.TypeName);
+        bool hasConstQualifier = false;
+        for (auto* spec : declSpecs->declarationSpecifier())
+            if (auto* qualifier = spec->typeQualifier();
+                qualifier != nullptr && qualifier->getText() == "const")
+                hasConstQualifier = true;
+        if (hasConstQualifier && declType.Pointer && Compiler(declSpecs)->IsCxxRecord(declType.TypeName))
+            declType.IsCxxPointeeConst = true;
 
         return declType;
     }
@@ -4387,6 +4394,10 @@ cxx_dtor_ready:
             // clang resolve `T(args)` over every constructor, and keep the listed pick otherwise.
             const bool clangResolves =
                 compiler->CxxConstructorNeedsClangResolution(typeName, ctor, argTypes);
+            if (const std::string sink =
+                    compiler->CxxConstructorCopySinkError(ctor, ctorArguments);
+                !sink.empty())
+                LogErrorContext(direct, sink);
             if ((ctor == nullptr && !hardReferenceRejection) || clangResolves)
             {
                 std::string wrapperName;
@@ -4429,6 +4440,15 @@ cxx_dtor_ready:
                                                           compiler->DisplayCxxClassName(typeName));
                     return true;
                 }
+                // The copy-sink verdict names the parameter and the remedy: it outranks the
+                // body refusal of the constructor clang selected (MSVC's fill constructor).
+                if (wrapperError.starts_with("clang: ") && why.starts_with("cannot copy C++ class"))
+                    wrapperError.clear();
+                if (wrapperError.starts_with("clang: "))
+                {
+                    LogErrorContext(direct, wrapperError);
+                    return true;
+                }
                 if (ctor == nullptr || scalarReferenceSet)
                 {
                     // The listed refusal names the parameter; clang's line stands otherwise.
@@ -4444,6 +4464,13 @@ cxx_dtor_ready:
                 LogErrorContext(direct, why.starts_with("no overload of '")
                     ? why : std::format("C++ class '{}' {}",
                         compiler->DisplayCxxClassName(typeName), why));
+                return true;
+            }
+            // The listed pick is called directly: a body clang failed to instantiate is refused.
+            if (const std::string refusal = compiler->CxxConstructorBodyRefusalError(ctor);
+                !refusal.empty())
+            {
+                LogErrorContext(direct, refusal);
                 return true;
             }
             compiler->SetCurrentDebugLocation(line);
@@ -4859,6 +4886,7 @@ bool MainListener::TryDeclareForeignCxxAutoLocal(CFlatParser::DirectDeclaratorCo
                                                  const LLVMBackend::DeclTypeAndValue& autoType,
                                                  LLVMBackend::NamedVariable& sourceNV,
                                                  llvm::Value* sourceCxxRetTemp,
+                                                 bool constQualified,
                                                  const std::string& name, size_t line,
                                                  std::vector<std::pair<std::string, llvm::AllocaInst*>>& allocList)
 {
@@ -4900,6 +4928,8 @@ bool MainListener::TryDeclareForeignCxxAutoLocal(CFlatParser::DirectDeclaratorCo
         auto* slot = llvm::dyn_cast_or_null<llvm::AllocaInst>(slotValue);
         allocList.push_back(std::pair(name, slot));
         if (slot == nullptr) return true;
+        if (constQualified && compiler->IsCxxRecord(typeName))
+            compiler->MarkCxxConstFieldAccess(slot);
 
         const std::string srcText = assign != nullptr ? assign->getText() : std::string();
         const bool explicitMove = sourceNV.TypeAndValue.IsMove || sourceNV.IsExplicitMove;
@@ -5357,9 +5387,12 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                 !global_scope && IsFunctionBodyDeclaration(declSpec));
             return ParseDeclarationSpecifiers(declSpec);
         }();
-        if (!global_scope && DeclSpecHasConst(declSpec) && !typeAndValue.Pointer
+        if (DeclSpecHasConst(declSpec) && !typeAndValue.Pointer
             && compiler->IsCxxRecord(typeAndValue.TypeName))
             typeAndValue.IsCxxConstRef = true;
+        if (DeclSpecHasConst(declSpec) && typeAndValue.Pointer
+            && compiler->IsCxxRecord(typeAndValue.TypeName))
+            typeAndValue.IsCxxPointeeConst = true;
         // A generic parameter can itself be bound to a core unique wrapper. It is already a
         // concrete value type, but its ordinary copy-shaped helper bodies must not be mistaken
         // for a direct `unique` declaration diagnostic.
@@ -6222,7 +6255,8 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                 // `auto x = <C++ class lvalue>` copy-constructs like `T x = ...`.
                                 if (!global_scope && typeAndValue.TypeName == "auto"
                                     && TryDeclareForeignCxxAutoLocal(direct, assignmentExpression,
-                                           typeAndValue, rightNV, srcCxxRetTemp, name, line,
+                                           typeAndValue, rightNV, srcCxxRetTemp,
+                                           DeclSpecHasConst(declSpec), name, line,
                                            allocList))
                                     continue;
                                 if (!global_scope && typeAndValue.IsAlias && !typeAndValue.Pointer
@@ -7503,6 +7537,9 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                     auto* global = compiler->CreateGlobalVariable(typeAndValue, constant,
                         typeAndValue.threadLocal, typeAndValue.UserAlignValue, externDeclOnly,
                         srcIsUnsigned);
+                    if (DeclSpecHasConst(declSpec) && !typeAndValue.Pointer
+                        && compiler->IsCxxRecord(typeAndValue.TypeName))
+                        compiler->MarkCxxConstFieldAccess(global);
                     if (pendingGlobalDefaultConstruction && !externDeclOnly)
                         pendingGlobalDefaultConstructions_.push_back({global, typeAndValue, direct});
                     /*
@@ -7600,6 +7637,12 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                         compiler->GetOrCreateStackVariable(name).Storage = alloc;
                         compiler->UnregisterOwnedStructTemp(srcCxxRetTemp);
                     }
+                    // `auto` resolves to the C++ record only after its initializer is parsed.
+                    // Preserve an explicit const on the local slot (after return elision picks it) for receiver lookup.
+                    // C++ records only: CFlat const itself stays unenforced (scalars, CFlat structs).
+                    if (DeclSpecHasConst(declSpec) && !typeAndValue.Pointer
+                        && compiler->IsCxxRecord(typeAndValue.TypeName))
+                        compiler->MarkCxxConstFieldAccess(alloc);
                     allocList.push_back(std::pair(name, llvm::dyn_cast<llvm::AllocaInst>(alloc)));
                     if (!typeAndValue.Pointer && compiler->IsCoreUniqueType(typeAndValue.TypeName))
                         compiler->GetOrCreateStackVariable(name).IsOwning = true;

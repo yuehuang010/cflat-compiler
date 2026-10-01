@@ -4804,6 +4804,12 @@ void LLVMBackend::FlushOwnedTempsSince(const OwnedTempMark& mark, llvm::Value* k
                                        llvm::BasicBlock* hoistTo,
                                        bool preserveReturnedPtrTemps)
 {
+        llvm::Value* keepStructStorage = keep;
+        if (auto* load = llvm::dyn_cast_or_null<llvm::LoadInst>(keep))
+            keepStructStorage = llvm::getUnderlyingObject(load->getPointerOperand());
+        auto isKeptStructTemp = [&](const PendingOwnedStructTemp& temp) {
+            return temp.Alloca == keep || temp.Alloca == keepStructStorage;
+        };
         // Conditional-slot arm temps of a nested join are keyed to the arm they were born in, which
         // does not dominate the outer join: re-key them (null-initialized) to `hoistTo`.
         if (hoistTo != nullptr)
@@ -4881,7 +4887,7 @@ void LLVMBackend::FlushOwnedTempsSince(const OwnedTempMark& mark, llvm::Value* k
             for (size_t i = mark.Structs; live && i < pendingOwnedStructTemps.size(); ++i)
             {
                 auto& t = pendingOwnedStructTemps[i];
-                if (t.Alloca == nullptr || t.Alloca == keep) continue;
+                if (t.Alloca == nullptr || isKeptStructTemp(t)) continue;
                 if (!IsInsertBlockLive()) break;
                 if (!OwnedTempDominatesHere(t.Block, builder->GetInsertBlock(), domTree)) continue;
                 EmitOwnedStructTempFree(t);
@@ -4889,7 +4895,6 @@ void LLVMBackend::FlushOwnedTempsSince(const OwnedTempMark& mark, llvm::Value* k
             }
         }
         auto pairValue   = [](const std::pair<llvm::Value*, llvm::BasicBlock*>& e) { return e.first; };
-        auto structValue = [](const PendingOwnedStructTemp& e) { return e.Alloca; };
         auto ptrValue    = [](const PendingOwnedPtrTemp& e) { return e.Value; };
 
         // Collect the pointer temps before trimming: each free opens blocks, so the insert block
@@ -4908,7 +4913,11 @@ void LLVMBackend::FlushOwnedTempsSince(const OwnedTempMark& mark, llvm::Value* k
 
         TrimOwnedTempsSince(pendingOwnedStringTemps,  mark.Strings,  keep, pairValue);
         TrimOwnedTempsSince(pendingOwnedClosureTemps, mark.Closures, keep, pairValue);
-        TrimOwnedTempsSince(pendingOwnedStructTemps,  mark.Structs,  keep, structValue);
+        size_t structWrite = mark.Structs;
+        for (size_t i = mark.Structs; i < pendingOwnedStructTemps.size(); ++i)
+            if (isKeptStructTemp(pendingOwnedStructTemps[i]))
+                pendingOwnedStructTemps[structWrite++] = pendingOwnedStructTemps[i];
+        pendingOwnedStructTemps.resize(structWrite);
         size_t ptrWrite = mark.Ptrs;
         for (size_t i = mark.Ptrs; i < pendingOwnedPtrTemps.size(); ++i)
             if (pendingOwnedPtrTemps[i].ConditionalSlot != nullptr

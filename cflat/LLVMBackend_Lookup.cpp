@@ -575,7 +575,8 @@ bool LLVMBackend::FindRefusedCxxCopySink(const std::string& receiverType,
             for (const auto& member : record->second.members)
             {
                 if (member.name != memberName
-                    || (requireRefusal && !member.bindRefusal.starts_with("cannot be instantiated"))
+                    || (requireRefusal && !member.bindRefusal.starts_with("cannot be instantiated")
+                        && !cxxConstructorBodyRefusals_.contains(member.linkageName))
                     || member.paramTypes.size() != args.size() + 1
                     || member.paramTypes[i + 1] != wanted
                     || !CxxDiagnosticBlamesCopyOf(member.refusalCause, argSpelling))

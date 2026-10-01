@@ -280,6 +280,54 @@ namespace cppi
     int add(int a, int b) noexcept;
     int add(double a, double b) noexcept;
 
+    struct ConstPointerRankValue {};
+    struct ConstPointerRank
+    {
+        int pick(ConstPointerRankValue* value) const noexcept { return 1; }
+        int pick(const ConstPointerRankValue* value) const noexcept { return 2; }
+    };
+    inline int const_pointer_rank(ConstPointerRankValue* value) noexcept { return 1; }
+    inline int const_pointer_rank(const ConstPointerRankValue* value) noexcept { return 2; }
+    // Dropping pointee const is not viable: const Derived* skips D* / P* for const P*.
+    struct ConstPointerRankDerived : ConstPointerRankValue {};
+    inline int const_derived_rank(ConstPointerRankDerived* value) noexcept { return 70; }
+    inline int const_derived_rank(const ConstPointerRankValue* value) noexcept { return 71; }
+    inline int const_base_rank(ConstPointerRankValue* value) noexcept { return 80; }
+    inline int const_base_rank(const ConstPointerRankValue* value) noexcept { return 81; }
+    // Pointer-to-pointer: the inner const must match exactly.
+    inline int const_pp_rank(ConstPointerRankValue** value) noexcept { return 1; }
+    inline int const_pp_rank(const ConstPointerRankValue** value) noexcept { return 2; }
+    struct ConstPointerPointerRank
+    {
+        int pick(const ConstPointerRankValue** value) noexcept { return 40; }
+        int pick(ConstPointerRankValue** value) noexcept { return 41; }
+    };
+    // Member and free operator siblings rank on pointee const like a call argument.
+    struct ConstPointerRankShift
+    {
+        int k = 0;
+        int operator<<(const ConstPointerRankValue* value) noexcept { return 2; }
+        int operator<<(ConstPointerRankValue* value) noexcept { return 1; }
+    };
+    inline int operator+(const ConstPointerRankShift& s, ConstPointerRankValue* value) noexcept { return 5; }
+    inline int operator+(const ConstPointerRankShift& s, const ConstPointerRankValue* value) noexcept { return 6; }
+    // Lone mutable operator: a const pointer operand is refused.
+    struct ConstPointerRankShiftMut
+    {
+        int k = 0;
+        int operator<<(ConstPointerRankValue* value) noexcept { return 9; }
+    };
+    // Variadic sibling that drops const never displaces the const-correct overload.
+    inline int const_variadic_rank(ConstPointerRankValue* value, ...) noexcept { return 1; }
+    inline int const_variadic_rank(const ConstPointerRankValue* value, int a) noexcept { return 2; }
+    // Function template beside a non-template: clang deduces T = const Rec for a const pointer.
+    template<class T> int const_tpl_rank(T* value) noexcept { return 1; }
+    inline int const_tpl_rank(ConstPointerRankValue* value) noexcept { return 2; }
+    template<class T> int const_tpl_crank(const T* value) noexcept { return 3; }
+    inline int const_tpl_crank(ConstPointerRankValue* value) noexcept { return 4; }
+    // Constructor with only a mutable pointer parameter: a const pointer argument is refused.
+    struct ConstPointerRankCtor { int k; ConstPointerRankCtor(ConstPointerRankValue* value) : k(3) {} };
+
     // Reference parameters: same machine representation as a pointer at the boundary.
     int pick_ref(int& x) noexcept;
     int read_cref(const int& x) noexcept;
@@ -669,6 +717,12 @@ namespace cppi
     std::string_view take_string_view(std::string_view value) noexcept;
     std::string_view return_string_view(std::string_view value) noexcept;
     int sum_varargs(int count, ...) noexcept;
+    // Variadic beside a non-variadic sibling: with nothing in the ellipsis the variadic ranks
+    // on its declared parameter (int exact beats int -> long), in either declaration order.
+    int variadic_exact_rank(int x, ...) noexcept;
+    int variadic_exact_rank(long x) noexcept;
+    int variadic_exact_rank_rev(long x) noexcept;
+    int variadic_exact_rank_rev(int x, ...) noexcept;
 
     class Counter
     {
@@ -2206,6 +2260,19 @@ namespace cppi
         int operator-() const { return 3; }
         int operator-() { return 13; }
     };
+    inline int cr_take_mut(CrReceiverValue* p) { return p->only(); }
+    inline int cr_take_mut_pp(CrReceiverValue** p) { return (*p)->only(); }
+    inline int cr_take_const(const CrReceiverValue* p) { return p->get(); }
+    struct CrTemplateReceiver
+    {
+        template<class T> int it(T) { return 44; }
+        template<class T> int it(T) const { return 45; }
+        template<class T> static int mix(T) { return 50; }
+        template<class T> int mix(T, int) { return 51; }
+        ~CrTemplateReceiver() {}
+    };
+    inline CrTemplateReceiver cr_template_make() { return CrTemplateReceiver{}; }
+    template<class T> int cr_template_store(T* p) { *p = 5; return 5; }
     inline CrReceiverValue crReceiverGlobal{};
     struct CrFieldHolder
     {
@@ -2213,10 +2280,16 @@ namespace cppi
         CrReceiverValue* const pc = &crReceiverGlobal;
         mutable CrReceiverValue mu{};
     };
+    struct CrArrayHolder { CrReceiverValue arr[2]{}; };
+    inline const CrArrayHolder crArrayConst{};
     inline CrFieldHolder crFieldMutable{};
     inline const CrFieldHolder crFieldConst{};
     inline const CrFieldHolder& cr_field_ref() { return crFieldConst; }
-    struct Tm { template<class T> int f(T) { return 41; } };
+    struct Tm
+    {
+        template<class T> int f(T) { return 41; }
+        template<class T> static int ts(T) { return 43; }
+    };
     inline const Tm tmGlobal{};
     inline const Tm& tm_ref() { return tmGlobal; }
     inline const Tm* tm_ptr() { return &tmGlobal; }

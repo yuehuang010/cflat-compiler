@@ -660,6 +660,11 @@ bool LLVMBackend::IsCxxConstReferent(llvm::Value* destination) const
 
 void LLVMBackend::MarkCxxConstFieldAccess(llvm::Value* fieldAddress)
 {
+        if (auto* global = llvm::dyn_cast_or_null<llvm::GlobalVariable>(fieldAddress))
+        {
+            cxxConstGlobalSymbols_.insert(global->getName().str());
+            return;
+        }
         if (auto* inst = llvm::dyn_cast_or_null<llvm::Instruction>(fieldAddress))
             inst->setMetadata("cflat.cxx.constfield", llvm::MDNode::get(*context, {}));
 }
