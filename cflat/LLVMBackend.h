@@ -11385,7 +11385,13 @@ private:
 // Defined here so LLVMBackend is fully declared before DumpState() is called.
 inline void CompilerManager::DumpAllState() const
 {
-    std::lock_guard<std::mutex> lock(mutex_);
+    // try_lock: the crashing thread may already own mutex_.
+    std::unique_lock<std::mutex> lock(mutex_, std::try_to_lock);
+    if (!lock.owns_lock())
+    {
+        std::cout << "  (compiler registry is locked; state not dumped)\n";
+        return;
+    }
     if (compilers_.empty())
     {
         std::cout << "  (no compiler instances registered)\n";

@@ -39,22 +39,12 @@ public:
             compilers_.erase(it);
     }
 
-    void InstallAssertHook()
-    {
-#if defined(_WIN32)
-        // _CrtSetReportHook2 only intercepts asserts from this module's CRT instance.
-        // LLVM is a DLL with its own CRT, so its asserts won't reach this hook.
-        // On POSIX there is no CRT assert hook; assert() routes through abort() ->
-        // SIGABRT, which the handler below already catches.
-        _CrtSetReportHook2(_CRT_RPTHOOK_INSTALL, &CompilerManager::AssertHook);
-#endif
-
-        // SIGABRT is process-wide - catches abort() from any module including LLVM DLLs.
-        signal(SIGABRT, &CompilerManager::AbortHandler);
-
-        // LLVM fatal errors (llvm_unreachable etc.) that go through LLVM's own handler.
-        llvm::install_fatal_error_handler(&CompilerManager::LLVMFatalHandler, nullptr);
-    }
+    // Installs the crash reporters (CompilerManager.cpp): fatal signals / unhandled SEH
+    // exceptions, abort(), CRT asserts and LLVM fatal errors. Each prints ONE bug-report
+    // block to stderr - version, host, command line, cause, top kCrashReportFrames frames -
+    // then the compiler state dump. argv is copied for the report's command line.
+    void InstallCrashHandlers(int argc, char** argv);
+    static constexpr int kCrashReportFrames = 10;
 
     void DumpAllState() const; // defined after LLVMBackend is fully declared
 
@@ -66,34 +56,4 @@ private:
 
     std::vector<LLVMBackend*> compilers_;
     mutable std::mutex mutex_;
-
-    static void AbortHandler(int)
-    {
-        std::cout << "\n=== abort() called - compiler state dump ===\n";
-        Instance().DumpAllState();
-        std::cout << "============================================\n\n";
-        // Restore default and re-raise so the process exits with the correct signal.
-        signal(SIGABRT, SIG_DFL);
-        raise(SIGABRT);
-    }
-
-    static void LLVMFatalHandler(void*, const char* reason, bool)
-    {
-        std::cout << std::format("\n=== LLVM fatal error: {} ===\n", reason);
-        Instance().DumpAllState();
-        std::cout << "===============================================\n\n";
-    }
-
-#if defined(_WIN32)
-    static int __cdecl AssertHook(int reportType, char* message, int* returnValue)
-    {
-        if (reportType == _CRT_ASSERT)
-        {
-            std::cout << "\n=== LLVM Assert fired - compiler state dump ===\n";
-            Instance().DumpAllState();
-            std::cout << "===============================================\n\n";
-        }
-        return 0; // let CRT proceed to abort
-    }
-#endif
 };

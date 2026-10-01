@@ -155,7 +155,15 @@ int main(int argc, char* argv[])
     if (argc >= 2 && std::string_view(argv[1]) == "lsp")
         return RunLspServer(argc - 2, argv + 2);
 
-    CompilerManager::Instance().InstallAssertHook();
+    CompilerManager::Instance().InstallCrashHandlers(argc, argv);
+    // Deliberate crash to check the bug-report block by hand: segv | abort | fatal.
+    if (const char* crash = std::getenv("CFLAT_DEBUG_CRASH"))
+    {
+        const std::string_view kind = crash;
+        if (kind == "segv") { volatile int* p = nullptr; *p = 1; }
+        if (kind == "abort") std::abort();
+        if (kind == "fatal") llvm::report_fatal_error("CFLAT_DEBUG_CRASH=fatal");
+    }
 
 #if defined(_WIN32)
     // Route CRT assert/error/warning reports to stderr instead of a popup dialog.

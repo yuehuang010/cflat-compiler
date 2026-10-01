@@ -154,6 +154,7 @@ add_custom_command(
 # ---------------------------------------------------------------------------
 set(CFLAT_SOURCES
   ${CFLAT_DIR}/main.cpp
+  ${CFLAT_DIR}/CompilerManager.cpp
   ${CFLAT_DIR}/IsolatedPolicy.cpp
   ${CFLAT_DIR}/DiagnosticLocalization.cpp
   ${CFLAT_DIR}/TypeMangling.cpp
@@ -357,6 +358,11 @@ if(WIN32)
   target_link_libraries(cflat PRIVATE ws2_32 version advapi32 ole32)
   # 64 MB stack: the recursive-descent codegen walk has very large frames.
   target_link_options(cflat PRIVATE /STACK:67108864 /ignore:4099)
+  # Release PDB so crash reports (CompilerManager.cpp) name frames with file:line. /Z7 keeps
+  # debug info per object (no shared compile PDB under parallel Ninja); /DEBUG turns
+  # /OPT:REF and /OPT:ICF off by default, so they are restored.
+  target_compile_options(cflat PRIVATE $<$<CONFIG:Release>:/Z7>)
+  target_link_options(cflat PRIVATE "$<$<CONFIG:Release>:/DEBUG;/OPT:REF;/OPT:ICF>")
 elseif(UNIX)
   # Linux/macOS host: LLVM needs the dynamic linker, threads, zlib, etc.
   # find_package(Threads) + LLVM's interface libs cover most; filled in Stage 2.
