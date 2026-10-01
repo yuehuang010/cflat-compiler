@@ -3781,6 +3781,12 @@ private:
         std::vector<cflat_cinterop::RawDefaultArg> defaultArgs;
         bool variadic = false;
         bool isCxx = false;
+        bool isInline = false;
+        bool isStaticInline = false;
+        std::vector<std::string> inlineDefines;
+        std::vector<std::string> inlineHeaders;
+        // Shared by every inline signature of one header group (never copied per signature).
+        std::shared_ptr<const std::vector<std::string>> inlineHashFiles;
         bool isNoexcept = true;
         bool needsCxxRebind = false;
         // A generated wrapper for an INSTANCE member template: p0 is the receiver, so the
@@ -3797,6 +3803,16 @@ private:
         int line = 1;
         int col = 0;
     };
+    struct CInlineBodyRequest
+    {
+        std::string header;
+        std::string name;
+        std::vector<std::string> defines;
+        std::vector<std::string> headers;
+        std::shared_ptr<const std::vector<std::string>> hashFiles;
+        bool isStatic = false;
+    };
+    std::map<std::string, CInlineBodyRequest> cInlineBodyRequests_;
     // Raw C++ free-function signatures are retained because a brace-capable wrapper may be
     // needed even when the ordinary CFlat signature was refused as unmappable.
     std::map<std::string, std::vector<CSigEntry>> cxxFunctionSignatures_;
@@ -3930,6 +3946,8 @@ private:
         bool inScope = true;
         bool hasTrivialDefaultCtor = false;
         bool hasTrivialCopyCtor = false;
+        bool hasTrivialCopyAssign = false;
+        bool hasTrivialMoveAssign = false;
         bool hasTrivialDtor = true;
         bool isTriviallyRelocatable = false;
         bool paramDestroyedInCallee = false;   // MS ABI: the callee destroys a by-value param
@@ -6098,6 +6116,9 @@ private:
     void RequestCxxSignatureTypes(const std::vector<CSigEntry>& sigs);
     bool RequestCxxType(const std::string& baseName, const std::vector<std::string>& typeArgs,
                         const std::string& cflatName, std::string& error);
+    bool CxxTemplateDefineMismatch(const std::string& cxxBase, const std::string& spelling,
+                                   const std::string& cflatName, size_t ownerGroup,
+                                   const std::vector<size_t>& deps, std::string& error);
     // True when the spelling IS a std::function (cv/reference decoration aside), not merely one
     // that contains a std::function somewhere inside it.
     static bool IsTopLevelStdFunctionSpelling(const std::string& spelling);
@@ -6463,6 +6484,7 @@ private:
     bool CompileCHeaderGroup(const std::vector<std::string>& headerPaths,
                              const std::vector<std::string>& extraDefines = {},
                              bool cppMode = false);
+    bool LinkCInlineDemandBodies();
 
     // Build a TargetMachine for the current target so the optimizer's PassBuilder
     // has TargetTransformInfo. Without a TM the loop vectorizer cannot cost vector
@@ -8524,6 +8546,8 @@ public:
         int dtorDeletingVtableIndex = -1;
         bool hasTrivialDefaultCtor = false;
         bool hasTrivialCopyCtor = false;
+        bool hasTrivialCopyAssign = false;
+        bool hasTrivialMoveAssign = false;
         bool hasTrivialDtor = true;
         bool isTriviallyRelocatable = false;
         bool paramDestroyedInCallee = false;   // MS ABI: the callee destroys a by-value param
@@ -9171,6 +9195,12 @@ public:
     bool EmitLoweredMemberwiseMove(const std::string& typeName, llvm::Type* valueType,
                                    llvm::Value* dest, llvm::Value* src, const char* context,
                                    uint64_t skipBefore = 0, uint64_t skipAfter = UINT64_MAX);
+    bool EmitLoweredMemberwiseCopy(const std::string& typeName, llvm::Type* valueType,
+                                   llvm::Value* dest, llvm::Value* src, const char* context);
+    llvm::AllocaInst* LoweredSretTempOf(llvm::Value* value, llvm::Type* type) const;
+    bool EmitLoweredMemberwiseAssign(const std::string& typeName, llvm::Type* valueType,
+                                     llvm::Value* dest, llvm::Value* src, bool useMove,
+                                     const char* context);
     /*
      * Destination slot that a foreign nontrivial C++ result must be constructed INTO, armed by
      * the declaration site for the duration of one initializer and consumed by the first call
@@ -11094,7 +11124,19 @@ public:
     // 144: named C++ members of anonymous struct/union types get synthetic nested records.
     // 151: a body-refused constructor is a plain valid candidate again; wrappers re-resolve.
     // 152: records carry clang's standard trivially-relocatable answer ("tr").
-    static constexpr int kCHeaderCacheVersion = 152;
+    // 158 (153-157 were used by dev builds of this change): C header harvesting includes static
+    //      inline signatures with inline kind, import defines, imported headers and transitive
+    //      hash-file paths for demand body compilation; C++ static inline functions bind a
+    //      body-keyed program name (__cflat_sl_<odr>_...).
+    // 159: the C++ static inline program-name key folds the internal functions its body reaches.
+    // 160: C inline demand inputs (defines, headers, hash files) are derived per group at load,
+    //      never stored per signature (a C++ group stored every include per inline function).
+    // 161: records carry clang's trivial, non-deleted implicit copy/move assignment ("tca"/"tma").
+    // 162: internal-linkage C++ namespace variables bind a per-import-group name
+    //      (__cflat_sv_<group>_...); static inline body keys fold reached statics.
+    // 163: C++ demand companions translate per-group internal variable names back to Clang names
+    //      when selecting definitions, then emit storage under the matching group alias.
+    static constexpr int kCHeaderCacheVersion = 163;
     static std::string CompilerBuildStamp();
     // THE switch for "the compiler build is part of cache entry validity": header/request
     // entries record and check "cstamp", and demand companion keys fold the stamp. OFF by

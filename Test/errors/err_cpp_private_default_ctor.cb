@@ -1,4 +1,13 @@
 import cpp "cpp_interop_explicit.h";
+import cpp "cpp_interop_arrayelem.h";
+
+expect_error("C++ class 'cppa.NoDef' has no default constructor cflat can call (it is deleted)") {
+    struct DeletedDefaultFieldHolder { cppa.NoDef d; int k = 0; };
+    int makeDeletedDefaultField() {
+        DeletedDefaultFieldHolder value;
+        return value.k;
+    }
+}
 
 expect_error("C++ class 'cppexp.PrivateDefault' has no default constructor cflat can call") {
     extern int main()
@@ -21,4 +30,28 @@ expect_error("C++ class 'cppexp.PrivateDefault' has no default constructor cflat
         PrivateFieldHolder value = default;
         return value.value.get();
     }
+}
+
+expect_error("C++ class 'cppexp.PrivateDefault' has no default constructor cflat can call") {
+    struct PrivateNoInitFieldHolder { cppexp.PrivateDefault value; };
+    int makePrivateNoInitField() {
+        PrivateNoInitFieldHolder value = default;
+        return value.value.get();
+    }
+}
+
+expect_error("C++ class 'cppa.NoDef' has no default constructor cflat can call (it is deleted)") {
+    struct NestedNoDefaultLeaf { cppa.NoDef d; int k = 0; };
+    struct NestedNoDefaultWrap { NestedNoDefaultLeaf items[2]; int z = 0; };
+    int makeNestedNoDefault() {
+        NestedNoDefaultWrap value;
+        return value.z;
+    }
+}
+
+struct ExplicitNoDefaultLeaf { cppa.NoDef d; int k = 0; };
+struct ExplicitNoDefaultWrap { ExplicitNoDefaultLeaf h; int z = 0; };
+int makeExplicitNoDefault() {
+    ExplicitNoDefaultWrap value = { h = { d = cppa.NoDef(3) } };
+    return value.z;
 }

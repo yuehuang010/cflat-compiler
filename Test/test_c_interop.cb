@@ -49,6 +49,10 @@ import "library/cinterop.c";
 import "library/struct_byval_util.c";
 import package "cinterop/mathlib.h" lib "cinterop/mathlib.lib" define "ML_EXTRA";
 import "library/c_macro_helpers.h";
+import "library/c_inline_demand_a.h";
+import "library/c_inline_demand_b.h";
+import "library/c_inline_demand_transitive.h";
+import "library/c_inline_demand_source.c";
 import "library/float_macros.h";
 // Accept side of the conflicting-declaration check: prototypes identical to ones already
 // bound (core putn/printf, and c_add from cinterop.c above) must be a silent no-op.
@@ -151,6 +155,17 @@ extern int main()
     // ---- Section A: auto-extern of .c source ---------------------------------
     if (c_add(40, 2) != 42)             return 1;
     if (c_square(7) != 49)              return 2;
+    if (c_inline_a(1) != 11 || c_inline_b(1) != 21) return 3;
+    if (c_inline_outer(1) != 8 || c_inline_source(1) != 11) return 4;
+    // -O2: a directly called plain C99 inline with no external definition links via a private copy.
+    if (c_inline_plain_only(2) != 14) return 6;
+    // The body TU sees the harvest's macro view (__OPTIMIZE__ matches the bound macro).
+    if (c_inline_opt_view() != C_INLINE_OPT_MACRO) return 7;
+    // gnu_inline stays a declaration and binds the .c external definition.
+    if (c_inline_gnu_user(1) != 8 || c_inline_gnu(1) != 4) return 8;
+    if (labs((long)-17) != 17) return 5;
+    // A weak definition reached from a demanded body still yields to the .c strong one.
+    if (c_inline_use_hook() != 42) return 9;
 
     // ---- Section B: hand-written extern (same calls, validates coexistence) --
     if (c_add(1, 2) != 3)               return 10;
@@ -450,6 +465,22 @@ extern int main()
     if (CB_CAST_LOWORD(0x12345678) != 0x5678) return 216;
     if (CB_CAST_FAILED(-1) != true || CB_CAST_FAILED(0) != false) return 217;
     if (CB_CAST_SUCCEEDED(0) != true || CB_CAST_SUCCEEDED(-1) != false) return 218;
+
+    if (add3(1) != 4) return 222;
+    if (add4(1) != 5) return 223;
+    // Calls use the inline body; the address stays the external definition's (equal across TUs).
+    if (c_inline_is_add4(add4) != 1) return 226;
+    // The address taken inside a static inline body of a plain inline the program never names
+    // is the external definition's too (only its calls take the private copy).
+    if (c_inline_is_add6(c_inline_sget_add6()) != 1) return 227;
+    if (c_inline_hdr_only(4) != 5 || c_inline_hdr_only_call(1) != 20) return 228;
+    // Address of a header-only plain inline with no external definition: clang-cl's linkonce_odr
+    // comdat body links on Windows; clang on macOS/Linux reports an undefined symbol (matched).
+    if const (__WINDOWS__) {
+        function<int(int)> hdrOnly = c_inline_hdr_only;
+        if (hdrOnly(1) != 2) return 229;
+    }
+    if (ADD5(1) != 6) return 224;
     if ((u32)CB_CAST_HRESULT_FROM_WIN32(5) != 0x80070005) return 219;
     if ((i64)CB_CAST_MAKEINTRESOURCEA(65) != 65) return 220;
 

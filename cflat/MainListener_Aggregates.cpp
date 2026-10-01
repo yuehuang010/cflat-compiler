@@ -2,6 +2,16 @@
 
 namespace
 {
+// A field initializer may build straight into the field slot only when it is one call: in a
+// conditional, the first-emitted arm would take the slot even when the other arm is selected.
+bool FieldInitializerIsSingleCall(CFlatParser::AssignmentExpressionContext* expr)
+{
+    if (expr == nullptr) return true;
+    const std::string text = expr->getText();
+    return !text.empty() && text.back() == ')' && text.find('?') == std::string::npos
+        && std::count(text.begin(), text.end(), '(') == 1;
+}
+
 bool ShouldWarnImplicitFieldNarrowing(llvm::Value* value, llvm::Type* destinationType,
                                       const std::string& destinationTypeName)
 {
@@ -40,6 +50,33 @@ std::string CppStructThunkStem(const std::string& name)
     }
     return out;
 }
+}
+
+bool MainListener::HasUnavailableNestedCxxDefault(const std::string& typeName)
+{
+    auto* compiler = Compiler();
+    if (compiler->IsCxxRecord(typeName) || compiler->GetFunction(typeName) == nullptr)
+        return false;
+    for (const auto& field : compiler->GetDataStructure(typeName).StructFields)
+    {
+        if (field.Pointer || field.BraceInitializer != nullptr
+            || (field.Initializer != nullptr && field.Initializer->Default() == nullptr))
+            continue;
+        if (compiler->IsCxxRecord(field.TypeName))
+        {
+            if (field.ConstArraySize != 0
+                || !(compiler->CxxElementNeedsDefaultConstruction(field.TypeName)
+                    || compiler->HasNonPublicCxxDefaultCtor(field.TypeName)))
+                continue;
+            std::string error;
+            compiler->TryBindCxxImplicitDefaultCtor(field.TypeName, error);
+            if (!error.empty() || compiler->FindCxxDefaultCtor(field.TypeName) == nullptr)
+                return true;
+        }
+        else if (HasUnavailableNestedCxxDefault(field.TypeName))
+            return true;
+    }
+    return false;
 }
 
 void MainListener::PrepareLaterCppStructDefinitions(
@@ -112,7 +149,10 @@ llvm::Value* MainListener::EmitAggregateFieldInitialization(
                 structType, destination, (unsigned)fieldIndex, field.VariableName);
         const bool armFieldSret = fieldDestination != nullptr && !field.Pointer
             && !field.IsAlias && !field.IsArrayView && field.ConstArraySize == 0
-            && compiler->ReturnsViaCxxSret(field.TypeName);
+            && compiler->ReturnsViaCxxSret(field.TypeName)
+            && (FieldDefaultBraceList(field) != nullptr || field.Initializer == nullptr
+                || FieldInitializerIsSingleCall(field.Initializer->assignmentExpression()));
+        bool initializedArrayInPlace = false;
         if (armFieldSret)
         {
             compiler->pendingCxxSretDest_ = fieldDestination;
@@ -149,14 +189,49 @@ llvm::Value* MainListener::EmitAggregateFieldInitialization(
         if (rvalue == nullptr)
         {
             auto* fieldType = compiler->GetType(field);
-            if (fieldType != nullptr && fieldType->isArrayTy())
+            if (field.Initializer == nullptr && FieldDefaultBraceList(field) == nullptr
+                && fieldDestination != nullptr && fieldType != nullptr && fieldType->isArrayTy())
+            {
+                if (fieldCount != SIZE_MAX
+                    || !HasUnavailableNestedCxxDefault(field.TypeName))
+                {
+                    GlobalScopeGuard fieldInitScope(global_scope);
+                    EmitFixedArrayDefaultInit(fieldDestination, field);
+                    initializedArrayInPlace = true;
+                }
+            }
+            else if (field.Initializer == nullptr && FieldDefaultBraceList(field) == nullptr
+                && !field.Pointer && fieldType != nullptr && fieldType->isStructTy()
+                && compiler->IsCxxRecord(field.TypeName)
+                && (compiler->CxxElementNeedsDefaultConstruction(field.TypeName)
+                    || compiler->HasNonPublicCxxDefaultCtor(field.TypeName)))
+            {
+                // C++ default-initializes a class member even when the field has no `= default`.
+                // A SIZE_MAX fieldCount is the synthesized ctor body, emitted at declaration time;
+                // leave an unavailable member zeroed there and diagnose at a real construction.
+                if (compiler->FindCxxDefaultCtor(field.TypeName) != nullptr)
+                {
+                    GlobalScopeGuard defaultCtorScope(global_scope);
+                    rvalue = GenerateDefaultValue(field);
+                }
+                else if (fieldCount != SIZE_MAX)
+                {
+                    const auto* cxxInfo = compiler->GetCxxClassInfo(field.TypeName);
+                    compiler->LogErrorMessage(
+                        "C++ class '{}' has no default constructor cflat can call{}",
+                        { compiler->DisplayCxxClassName(field.TypeName),
+                          cxxInfo != nullptr && cxxInfo->hasDeletedDefaultCtor
+                              ? " (it is deleted)" : "" });
+                }
+            }
+            else if (fieldType != nullptr && fieldType->isArrayTy())
             {
                 GlobalScopeGuard fieldInitScope(global_scope);
                 rvalue = GenerateDefaultValue(field);
             }
         }
-        const bool initializedDirectly = armFieldSret
-            && compiler->pendingCxxSretDest_ == nullptr;
+        const bool initializedDirectly = initializedArrayInPlace
+            || (armFieldSret && compiler->pendingCxxSretDest_ == nullptr);
         if (armFieldSret)
         {
             compiler->pendingCxxSretDest_ = nullptr;
@@ -168,8 +243,19 @@ llvm::Value* MainListener::EmitAggregateFieldInitialization(
         initializerUnsigned.push_back(fieldSrcUnsigned ? 1 : 0);
         initializedInPlace.push_back(initializedDirectly ? 1 : 0);
         if (initializedDirectly)
-            compiler->NoteUnwindPartial(LLVMBackend::UnwindPartialEntry::Kind::Slot,
-                                        fieldDestination, field.TypeName);
+        {
+            if (initializedArrayInPlace)
+            {
+                llvm::Type* elemTy = nullptr;
+                const uint64_t n = compiler->PeelFixedArrayType(
+                    compiler->GetType(field), elemTy);
+                compiler->NoteUnwindArrayPrefix(fieldDestination, elemTy,
+                    compiler->builder->getInt64(n), field.TypeName);
+            }
+            else
+                compiler->NoteUnwindPartial(LLVMBackend::UnwindPartialEntry::Kind::Slot,
+                                            fieldDestination, field.TypeName);
+        }
         if (!initializedDirectly)
             compiler->NoteUnwindPartial(LLVMBackend::UnwindPartialEntry::Kind::Value, rvalue,
                                         field.TypeName);
@@ -192,8 +278,12 @@ llvm::Value* MainListener::EmitAggregateFieldInitialization(
                 structType, destination, index, field.VariableName);
         if (rvalue == nullptr && (destType->isStructTy() || destType->isArrayTy()))
         {
-            if (destType->isArrayTy())
+            if (destType->isArrayTy()
+                && (fieldCount != SIZE_MAX
+                    || !HasUnavailableNestedCxxDefault(field.TypeName)))
                 rvalue = GenerateDefaultValue(field);
+            else if (destType->isArrayTy())
+                continue;
             else if (compiler->GetFunction(field.TypeName))
             {
                 const bool armFieldSret = fieldDestination != nullptr && !field.Pointer
@@ -1399,10 +1489,26 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
                             rvalue = GenerateDefaultValue(typeValue);
                         }
                     }
-                    if (rvalue == nullptr && compiler->GetType(typeValue)->isArrayTy())
+                    if (rvalue == nullptr && compiler->GetType(typeValue)->isArrayTy()
+                        && !HasUnavailableNestedCxxDefault(typeValue.TypeName))
                     {
                         GlobalScopeGuard defaultCtorScope(global_scope);
                         rvalue = GenerateDefaultValue(typeValue);
+                    }
+                    if (rvalue == nullptr && typeValue.Initializer == nullptr
+                        && FieldDefaultBraceList(typeValue) == nullptr && !typeValue.Pointer
+                        && compiler->IsCxxRecord(typeValue.TypeName)
+                        && (compiler->CxxElementNeedsDefaultConstruction(typeValue.TypeName)
+                            || compiler->HasNonPublicCxxDefaultCtor(typeValue.TypeName)))
+                    {
+                        // The synthesized constructor is emitted at the type declaration, even
+                        // when nobody ever default-constructs this type. Defer missing-ctor errors
+                        // to GenerateDefaultValue's call site; valid members still get built here.
+                        if (compiler->FindCxxDefaultCtor(typeValue.TypeName) != nullptr)
+                        {
+                            GlobalScopeGuard defaultCtorScope(global_scope);
+                            rvalue = GenerateDefaultValue(typeValue);
+                        }
                     }
                     initializers.push_back(rvalue);
                     initializerUnsigned.push_back(fieldSrcUnsigned ? 1 : 0);
@@ -5007,9 +5113,12 @@ void MainListener::ParseConstructorDefinition(CFlatParser::FunctionDefinitionCon
                 if (fieldIdx >= structLLVMType->getNumElements())
                     break;
                 auto* destType = structLLVMType->getTypeAtIndex(fieldIdx);
+                auto* fieldPtr = compiler->builder->CreateStructGEP(
+                    structLLVMType, thisAlloca, fieldIdx, field.VariableName);
                 llvm::Value* fieldVal = nullptr;
                 bool fieldValSrcUnsigned = false;
                 bool fromBraceList = false;
+                bool fieldInitializedInPlace = false;
                 if (auto* braceList = FieldDefaultBraceList(field))
                 {
                     // Same brace-list field default the synthesized ctors honour; a user-written
@@ -5022,24 +5131,73 @@ void MainListener::ParseConstructorDefinition(CFlatParser::FunctionDefinitionCon
                     auto* assignExpr = field.Initializer->assignmentExpression();
                     if (assignExpr != nullptr)
                     {
+                        const bool armFieldSret = fieldPtr != nullptr && !field.Pointer
+                            && !field.IsAlias && !field.IsArrayView && field.ConstArraySize == 0
+                            && compiler->ReturnsViaCxxSret(field.TypeName)
+                            && FieldInitializerIsSingleCall(assignExpr);
+                        if (armFieldSret)
+                        {
+                            compiler->pendingCxxSretDest_ = fieldPtr;
+                            compiler->pendingCxxSretTypeName_ = field.TypeName;
+                            compiler->pendingCxxSretReturn_ = true;
+                            compiler->pendingCxxSretForFixedArray_ = true;
+                        }
                         fieldVal = ParseFieldDefaultInitializer(structName, field, assignExpr,
                             &fieldValSrcUnsigned);
+                        fieldInitializedInPlace = armFieldSret
+                            && compiler->pendingCxxSretDest_ == nullptr;
+                        if (armFieldSret)
+                        {
+                            compiler->pendingCxxSretDest_ = nullptr;
+                            compiler->pendingCxxSretTypeName_.clear();
+                            compiler->pendingCxxSretReturn_ = false;
+                            compiler->pendingCxxSretForFixedArray_ = false;
+                        }
+                        if (fieldInitializedInPlace)
+                        {
+                            compiler->NoteUnwindPartial(
+                                LLVMBackend::UnwindPartialEntry::Kind::Slot,
+                                fieldPtr, field.TypeName);
+                            fieldVal = nullptr;
+                        }
                     }
                     else if (field.Initializer->Default() != nullptr)
                     {
                         // `= default` on a struct-typed field runs that field type's own default
                         // constructor (its field initializers), exactly as the synthetic ctor does.
-                        fieldVal = GenerateDefaultValue(field);
+                        const bool unavailableCxxDefault = !field.Pointer
+                            && compiler->IsCxxRecord(field.TypeName)
+                            && compiler->FindCxxDefaultCtor(field.TypeName) == nullptr
+                            && (compiler->CxxElementNeedsDefaultConstruction(field.TypeName)
+                                || compiler->HasNonPublicCxxDefaultCtor(field.TypeName));
+                        if (!unavailableCxxDefault)
+                            fieldVal = GenerateDefaultValue(field);
                     }
                 }
                 // No initializer at all on a struct-typed field - call its default ctor, matching
                 // the synthetic default-ctor path.
-                if (fieldVal == nullptr && (destType->isStructTy() || destType->isArrayTy()))
+                if (!fieldInitializedInPlace && fieldVal == nullptr
+                    && (destType->isStructTy() || destType->isArrayTy()))
                 {
                     // forceRoot: the GetFunction guard is an exact-key lookup, so a namespace walk
                     // here would call a same-named sibling type's ctor (layer 3).
-                    if (destType->isArrayTy())
+                    if (destType->isArrayTy()
+                        && !HasUnavailableNestedCxxDefault(field.TypeName))
                         fieldVal = GenerateDefaultValue(field);
+                    else if (destType->isArrayTy())
+                        fieldVal = nullptr;
+                    else if (compiler->IsCxxRecord(field.TypeName)
+                        && (compiler->CxxElementNeedsDefaultConstruction(field.TypeName)
+                            || compiler->HasNonPublicCxxDefaultCtor(field.TypeName)))
+                    {
+                        EmitNontrivialCxxDefaultAt(fieldPtr, field);
+                        if (compiler->FindCxxDefaultCtor(field.TypeName) != nullptr)
+                        {
+                            compiler->NoteUnwindPartial(
+                                LLVMBackend::UnwindPartialEntry::Kind::Slot,
+                                fieldPtr, field.TypeName);
+                        }
+                    }
                     else if (compiler->GetFunction(field.TypeName))
                         fieldVal = compiler->CreateOverloadedFunctionCall(field.TypeName, {}, true);
                 }
@@ -5074,8 +5232,6 @@ void MainListener::ParseConstructorDefinition(CFlatParser::FunctionDefinitionCon
                     }
                     if (fieldVal->getType() == destType)
                     {
-                        auto* fieldPtr = compiler->builder->CreateStructGEP(
-                            structLLVMType, thisAlloca, fieldIdx, field.VariableName);
                         compiler->builder->CreateStore(fieldVal, fieldPtr);
                         compiler->NoteUnwindPartial(LLVMBackend::UnwindPartialEntry::Kind::Value,
                                                     fieldVal, field.TypeName);
@@ -5095,7 +5251,7 @@ void MainListener::ParseConstructorDefinition(CFlatParser::FunctionDefinitionCon
         else
         {
             // With no user no-arg ctor, the synthesized ctor remains the field-init path.
-            auto* defaultVal = compiler->CreateOverloadedFunctionCall(structName, {});
+            auto* defaultVal = compiler->CreateOverloadedFunctionCall(structName, {}, true);
             if (defaultVal)
                 compiler->builder->CreateStore(defaultVal, thisAlloca);
         }

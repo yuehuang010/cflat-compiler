@@ -2199,6 +2199,8 @@ nlohmann::json LLVMBackend::SigToJson(const CSigEntry& e, CCachePathTable* files
         // silently drops the throwing-call gate.
         if (!e.linkageName.empty()) j["lk"] = e.linkageName;
         if (e.isCxx)      j["cx"] = true;
+        if (e.isInline)   j["inl"] = true;
+        if (e.isStaticInline) j["sinl"] = true;
         if (!e.isNoexcept) j["nx"] = true;
         // Clang's arrangement must round-trip: rebuilding it needs the clang session the warm
         // path deliberately skips, and re-deriving it from CFlat's size heuristic would pass a
@@ -2248,6 +2250,8 @@ LLVMBackend::CSigEntry LLVMBackend::SigFromJson(const SjVal& j, const CCachePath
         e.variadic = j.value("va", false);
         e.linkageName = j.value("lk", std::string{});
         e.isCxx    = j.value("cx", false);
+        e.isInline = j.value("inl", false);
+        e.isStaticInline = j.value("sinl", false);
         e.isNoexcept = !j.value("nx", false);
         e.file     = PathFromJson(j, files);
         e.bindRefusal = j.value("br", std::string{});
@@ -2620,6 +2624,8 @@ nlohmann::json LLVMBackend::RecordToJson(const CRecordEntry& r, CCachePathTable*
         if (r.hasBases)              j["hb"] = true;
         if (r.hasTrivialDefaultCtor) j["tdc"] = true;
         if (r.hasTrivialCopyCtor)    j["tcc"] = true;
+        if (r.hasTrivialCopyAssign)  j["tca"] = true;
+        if (r.hasTrivialMoveAssign)  j["tma"] = true;
         if (!r.hasTrivialDtor)       j["ntd"] = true;
         if (r.paramDestroyedInCallee) j["pdc"] = true;
         if (r.hasDeletedDefaultCtor) j["ddc"] = true;
@@ -2713,6 +2719,8 @@ LLVMBackend::CRecordEntry LLVMBackend::RecordFromJson(const SjVal& j, const CCac
         r.hasBases              = j.value("hb", false);
         r.hasTrivialDefaultCtor = j.value("tdc", false);
         r.hasTrivialCopyCtor    = j.value("tcc", false);
+        r.hasTrivialCopyAssign  = j.value("tca", false);
+        r.hasTrivialMoveAssign  = j.value("tma", false);
         r.hasTrivialDtor        = !j.value("ntd", false);
         r.paramDestroyedInCallee = j.value("pdc", false);
         r.hasDeletedDefaultCtor = j.value("ddc", false);

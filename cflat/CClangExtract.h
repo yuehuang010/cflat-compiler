@@ -167,6 +167,8 @@ namespace cflat_cinterop
         std::vector<RawDefaultArg> defaultArgs;
         bool variadic = false;
         bool isCxx = false;
+        bool isInline = false;
+        bool isStaticInline = false;
         bool isNoexcept = false;
         std::string bindRefusal;
         // The clang diagnostic lines behind a refusal, when one is known (never displayed).
@@ -408,6 +410,9 @@ namespace cflat_cinterop
         std::string layoutRefusal;
         bool hasTrivialDefaultCtor = false;
         bool hasTrivialCopyCtor = false;
+        // Clang's implicit copy/move assignment is trivial AND not deleted: a byte copy, no symbol.
+        bool hasTrivialCopyAssign = false;
+        bool hasTrivialMoveAssign = false;
         bool hasTrivialDtor = true;
         // MS ABI: a by-value parameter of this class is destroyed by the CALLEE, so the caller
         // must not destroy the copy it passed (Itanium: caller-destroyed).
@@ -550,6 +555,8 @@ namespace cflat_cinterop
         // Records whose vtable a request would have emitted, by vtable symbol name.
         std::unordered_map<std::string, const clang::CXXRecordDecl*> vtables;
         std::vector<std::string> weakPromoteSymbols;
+        std::vector<std::string> weakPromotePerGroupSymbols;
+        std::string cxxImportGroupKey;
         // Retry-renamed generated wrappers: program-visible name -> name clang emits.
         std::unordered_map<std::string, std::string> renamed;
         unsigned recordedChunks = 0;
@@ -596,6 +603,9 @@ namespace cflat_cinterop
         bool definitionsOnly = false;       // .c auto-extern: only functions defined in this TU
         bool wantIncludes = false;          // deep header-cache: record every transitively included file
         bool skipFunctionBodies = false;    // header bind: parse declarations only, skip function bodies
+        // C inline bodies: emit referenced C99 inline definitions (available_externally, as
+        // clang does above -O0) without running LLVM passes, so one parse covers transitive demand.
+        bool emitReferencedInlineDefinitions = false;
         bool verbose = false;               // emit extractor diagnostics and skip traces
         // C++ uuid-harvest pass: parse the header(s) as C++ and collect only record name -> uuid
         // (from __declspec(uuid)/MIDL_INTERFACE). No macros/sigs/enums are produced. The caller
@@ -645,6 +655,8 @@ namespace cflat_cinterop
         // Appended to every virtual / vbase-constructor thunk name. An incremental group's chunks
         // share one scope, so a thunk that a later request repeats needs a name of its own.
         std::string cxxThunkSuffix;
+        // Stable identity of the C++ import TU, shared by every request and cache replay.
+        std::string cxxImportGroupKey;
         // Request mode for a generated deduction wrapper. Only these ordinary free wrapper
         // declarations are exported; the included header remains available to CodeGen.
         std::vector<std::string> cxxFunctionWrapperNames;
@@ -721,6 +733,11 @@ namespace cflat_cinterop
         // Mangled names of internal-linkage namespace-scope objects whose storage the companion
         // module emits; promoted to weak_odr after codegen so the program module can bind them.
         std::vector<std::string> weakPromoteSymbols;
+        // Mutable statics keep a per-import-group name when their local linkage is promoted.
+        std::vector<std::string> weakPromotePerGroupSymbols;
+        // Internal-linkage (static) inline functions the program binds: (mangled, program name).
+        // The program name folds the body's ODR hash, so distinct bodies never merge.
+        std::vector<std::pair<std::string, std::string>> localInlineAliases;
 
         // Companion module produced when req.emitDefinitions is set: raw LLVM bitcode bytes
         // holding the C++ definitions Clang emitted for the bound surface (linkonce_odr inline
@@ -798,6 +815,10 @@ namespace cflat_cinterop
     // a TU produced with diagnostics still returns true (per-decl error recovery, like the
     // old -ferror-limit=0 path). `err` carries a human-readable reason on hard failure.
     bool ExtractCInterop(const ExtractRequest& req, ExtractResult& out, std::string& err);
+    bool EmitCInlineBodies(const std::vector<std::string>& args,
+                          const std::vector<std::string>& headers,
+                          const std::vector<std::pair<std::string, bool>>& functions,
+                          std::string& bitcode, std::string& err);
 
     bool ExtractCxxMacroPrepass(const ExtractRequest& req, ExtractResult& out, std::string& err);
 

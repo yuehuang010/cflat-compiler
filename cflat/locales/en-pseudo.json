@@ -472,6 +472,10 @@
       "300",
       "i8"
     ],
+    "cclassarg0hasnodefau...ctorcflatcancallarg1c2e882f7cd471d85": [
+      "cppa.NoDef",
+      " (it is deleted)"
+    ],
     "cclassarg0hasnodefau...structorcflatcancall132fe1d487ee5686": [
       "cppexp.PrivateDefault"
     ],
@@ -1985,6 +1989,7 @@
     "cannotstorenewarg0ni...heelementtypesdiffer50877848c28b7c8c": "cannot store 'new {0}[n]' into '{1}': the element types differ",
     "cannotusearg0asafunc...vesotheresultisownedc2a66f1a67947cad": "cannot use '{0}' as a function value: its 'alias' result can be its by-value parameter '{1}', which only a direct call passes correctly. Call '{2}' directly, or declare the parameter 'move' so the result is owned.",
     "caselabelarg0doesnot...witchoperandtypearg173c0ac994b6f333f": "case label '{0}' does not fit the switch operand type '{1}'",
+    "cclassarg0hasnodefau...ctorcflatcancallarg1c2e882f7cd471d85": "C++ class '{0}' has no default constructor cflat can call{1}",
     "cclassarg0hasnodefau...structorcflatcancall132fe1d487ee5686": "C++ class '{0}' has no default constructor cflat can call",
     "cdeclarationconflict...1inarg2butarg3inarg4289c088a69b49680": "C++ declaration conflicts with a declaration already in scope: '{0}' is {1} in '{2}' but {3} in '{4}'",
     "cheadergrouparg0wasp...atcppmaxheaderparses6e18d1ff4cf3c9e3": "C++ header group '{0}' was parsed {1} times in one compile; the budget is {2} (set CFLAT_CPP_MAX_HEADER_PARSES)",

@@ -3,6 +3,13 @@
     int value = 1;
 };
 
+import cpp "cpp_interop_basic.h";
+
+struct PlainCopyBad
+{
+    cppi.NoCopy item = cppi.NoCopy(1);
+};
+
 // The refusal text comes from the generated class's deleted C++ copy constructor, not CFlat's
 // own copy analysis.
 
@@ -11,6 +18,10 @@ extern int main()
     expect_error("its copy constructor is deleted") {
         CopyBad a = default;
         CopyBad b = a;
+    }
+    expect_error("cannot copy C++ class 'cppi.NoCopy' in synthesized copy of struct 'PlainCopyBad', field 'item': its copy constructor is deleted") {
+        PlainCopyBad a = PlainCopyBad();
+        PlainCopyBad b = a;
     }
     return 0;
 }

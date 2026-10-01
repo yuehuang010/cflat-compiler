@@ -1,0 +1,2 @@
+expect_error("clang:");
+import cpp "cpp_interop_namespace_stmt.h";

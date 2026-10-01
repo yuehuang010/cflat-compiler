@@ -1,5 +1,7 @@
 import cpp "../library/cpp_interop_tpl.h";
 import cpp "../library/cpp_interop_freeoptpl.h";
+import cpp "../library/cpp_interop_define_primary.h";
+import cpp "../library/cpp_interop_define_special.h" define "CFLAT_DEFINE_SPECIAL";
 
 extern int main()
 {
@@ -20,6 +22,12 @@ extern int main()
     expect_error("cannot pass non-trivial C++ class 'cppt.Box<int>' to the variadic '...' slot") {
         cppt.Box<int> box = cppt.Box<int>(7);
         printf("%d", box);
+    }
+    expect_error("violates the C++ ODR") {
+        cppd.Layout<long> value = default;
+    }
+    expect_error("violates the C++ ODR") {
+        cppd.PointerLayout<int*> value = default;
     }
     // The `iterator -> const_iterator` conversion is the SAME template with 'const' added on a
     // pointer argument, bound by reinterpreting the argument's storage. These three must refuse.

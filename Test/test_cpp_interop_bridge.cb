@@ -107,6 +107,7 @@ import cpp "array";
 import cpp "library/cpp_interop_view_decay.h";
 import cpp "library/cpp_interop_lvalue_sink.h";
 import cpp "library/cpp_interop_assign.h";
+import cpp "library/cpp_interop_arrayelem.h";
 import cpp "library/cpp_interop_proxy_assign.h";
 import cpp "library/cpp_interop_uniqueptr.h";
 import cpp "library/cpp_interop_own_method.h";
@@ -135,6 +136,40 @@ struct PlainListRelocHolder
     std.list<int> values = default;
 };
 
+struct NoInitListRelocHolder
+{
+    std.list<int> values;
+    int k = 0;
+};
+
+struct UserCtorListRelocHolder
+{
+    std.list<int> values;
+    int k = 0;
+    UserCtorListRelocHolder() { k = 4; }
+};
+
+struct LazyDeletedFieldHolder
+{
+    cppa.NoDef d;
+    int k = 0;
+};
+
+struct PlainNestedListRelocHolder
+{
+    NoInitListRelocHolder inner;
+};
+
+struct PlainArrayListRelocHolder
+{
+    NoInitListRelocHolder[2] items;
+};
+
+struct PlainGenericListRelocHolder<T>
+{
+    T value;
+};
+
 PlainListRelocHolder make_plain_list_reloc_holder()
 {
     PlainListRelocHolder result = PlainListRelocHolder();
@@ -150,6 +185,20 @@ struct PlainTrackedRelocHolder
     std.list<int> values = default;
     cppi.Tracked tracked = cppi.Tracked(4);
     int tag = 7;
+};
+
+struct BridgeTrackedNoArgField
+{
+    cppi.Tracked tracked = cppi.Tracked(23);
+    int tag = 0;
+    BridgeTrackedNoArgField() { tag = 1; }
+};
+
+bool bridgeNoArgFieldPick = false;
+struct BridgeTrackedNoArgTernaryField
+{
+    cppi.Tracked tracked = bridgeNoArgFieldPick ? cppi.Tracked(1) : cppi.Tracked(2);
+    BridgeTrackedNoArgTernaryField() { }
 };
 
 PlainTrackedRelocHolder make_plain_tracked_reloc_holder()
@@ -168,6 +217,11 @@ PlainTrackedRelocHolder make_plain_tracked_prvalue()
 PlainTrackedRelocHolder make_plain_tracked_pick(bool first)
 {
     return first ? make_plain_tracked_prvalue() : default;
+}
+
+int read_plain_tracked(PlainTrackedRelocHolder value)
+{
+    return value.tracked.value() + value.tag;
 }
 
 int g_plain_tracked_udtor = 0;
@@ -700,6 +754,195 @@ int bridge_enclosing_nested_copy<T>()
     source.inner.value.set(7);
     BridgeNestedCopyFieldHolder<T> copy = source;
     return copy.inner.value.value();
+}
+
+// A struct holding a C++ field that is not trivially relocatable is lowered like C++: assignment
+// runs the field's operator=, list storage and returns construct from the source address.
+int bridge_lowered_move_assign()
+{
+    BridgeCopyFieldHolder<cpptw.Twin> a = default; a.value.set(7);
+    BridgeCopyFieldHolder<cpptw.Twin> b = default; b.value.set(3);
+    b = move a;
+    return b.value.value();
+}
+
+int bridge_lowered_self_assign()
+{
+    BridgeCopyFieldHolder<cpptw.Twin> a = default; a.value.set(7);
+    a = a;
+    return a.value.value();
+}
+
+int bridge_lowered_field_store()
+{
+    BridgeNestedCopyFieldHolder<cpptw.Twin> o = default;
+    BridgeCopyFieldHolder<cpptw.Twin> a = default; a.value.set(5);
+    o.inner = a;
+    return o.inner.value.value() * 10 + a.value.value();
+}
+
+int bridge_lowered_list_add()
+{
+    list<BridgeCopyFieldHolder<cpptw.Twin>> xs = default;
+    BridgeCopyFieldHolder<cpptw.Twin> a = default;
+    int i = 0;
+    while (i < 5) { a.value.set(10 + i); xs.add(a); i++; }
+    int sum = 0;
+    i = 0;
+    while (i < xs.count()) { sum = sum + xs[i].value.value(); i++; }
+    return sum;
+}
+
+int bridge_lowered_array_element_assign()
+{
+    BridgeCopyFieldHolder<cpptw.Twin> a = default; a.value.set(8);
+    BridgeCopyFieldHolder<cpptw.Twin>[2] arr;
+    arr[0] = a;
+    return arr[0].value.value() * 10 + arr[1].value.value();
+}
+
+BridgeCopyFieldHolder<cpptw.Twin> bridge_lowered_mk(int v)
+{
+    BridgeCopyFieldHolder<cpptw.Twin> r = default;
+    r.value.set(v);
+    return r;
+}
+
+int bridge_lowered_two(BridgeCopyFieldHolder<cpptw.Twin> a, BridgeCopyFieldHolder<cpptw.Twin> b)
+{
+    return a.value.value() * 10 + b.value.value();
+}
+
+int bridge_lowered_take(BridgeCopyFieldHolder<cpptw.Twin> p) { return p.value.value(); }
+
+int bridge_lowered_ternary_arg(bool choose)
+{
+    BridgeCopyFieldHolder<cpptw.Twin> a = bridge_lowered_mk(2);
+    BridgeCopyFieldHolder<cpptw.Twin> b = bridge_lowered_mk(3);
+    return bridge_lowered_take(choose ? a : b);
+}
+
+BridgeCopyFieldHolder<cpptw.Twin> bridge_lowered_get(BridgeNestedCopyFieldHolder<cpptw.Twin>* o)
+{
+    return o.inner;
+}
+
+int bridge_lowered_return_field()
+{
+    BridgeNestedCopyFieldHolder<cpptw.Twin> o = default; o.inner.value.set(6);
+    BridgeCopyFieldHolder<cpptw.Twin> x = bridge_lowered_get(&o);
+    return x.value.value() * 10 + o.inner.value.value();
+}
+
+BridgeCopyFieldHolder<cpptw.Twin> bridge_lowered_pass(BridgeCopyFieldHolder<cpptw.Twin> p)
+{
+    return p;
+}
+
+int bridge_lowered_return_param()
+{
+    BridgeCopyFieldHolder<cpptw.Twin> a = default; a.value.set(4);
+    BridgeCopyFieldHolder<cpptw.Twin> b = bridge_lowered_pass(a);
+    return b.value.value() * 10 + a.value.value();
+}
+
+struct BridgeLoweredUserCopy
+{
+    cpptw.Twin t = default;
+    int copies = 0;
+    BridgeLoweredUserCopy copy()
+    {
+        BridgeLoweredUserCopy c = default;
+        c.t.set(t.value());
+        c.copies = copies + 1;
+        return move c;
+    }
+};
+
+int bridge_lowered_user_copy()
+{
+    BridgeLoweredUserCopy a = default; a.t.set(4);
+    BridgeLoweredUserCopy b = a;
+    BridgeLoweredUserCopy c = default;
+    c = a;
+    return b.copies * 1000 + c.copies * 100 + c.t.value() * 10 + b.t.value();
+}
+
+struct BridgeLoweredNode { int v = 0; };
+int bridge_lowered_owner_freed = 0;
+struct BridgeLoweredOwner
+{
+    cpptw.Twin t = default;
+    BridgeLoweredNode* node = default;
+    ~BridgeLoweredOwner()
+    {
+        if (node != nullptr) { bridge_lowered_owner_freed++; delete node; }
+    }
+};
+
+int bridge_lowered_owner_moves()
+{
+    int seen = 0;
+    {
+        BridgeLoweredOwner x = default; x.node = new BridgeLoweredNode(); x.node.v = 3;
+        BridgeLoweredOwner y = x;
+        BridgeLoweredOwner z = default; z.node = new BridgeLoweredNode();
+        z = y;
+        seen = z.node.v;
+    }
+    return seen * 10 + bridge_lowered_owner_freed;
+}
+
+// Assignment into a RELEASED lowered struct (`_ = move a;`) constructs the value: the release
+// destroyed its C++ fields, so operator= on them would be use-after-destroy. A release inside one
+// branch decides at runtime through the drop flag; afterwards the destination is live again.
+int bridge_lowered_assign_after_release()
+{
+    BridgeCopyFieldHolder<cpptw.Twin> a = default; a.value.set(7);
+    BridgeCopyFieldHolder<cpptw.Twin> b = default; b.value.set(3);
+    _ = move a;
+    a = b;
+    return a.value.value() * 10 + b.value.value();
+}
+
+int bridge_lowered_move_assign_after_release()
+{
+    BridgeCopyFieldHolder<cpptw.Twin> a = default; a.value.set(7);
+    BridgeCopyFieldHolder<cpptw.Twin> b = default; b.value.set(3);
+    _ = move a;
+    a = move b;
+    return a.value.value();
+}
+
+int bridge_lowered_assign_after_cond_release(bool release)
+{
+    BridgeCopyFieldHolder<cpptw.Twin> a = default; a.value.set(7);
+    BridgeCopyFieldHolder<cpptw.Twin> b = default; b.value.set(3);
+    if (release) { _ = move a; }
+    a = b;
+    return a.value.value() * 10 + b.value.value();
+}
+
+int bridge_lowered_move_assign_after_cond_release(bool release)
+{
+    BridgeCopyFieldHolder<cpptw.Twin> a = default; a.value.set(7);
+    BridgeCopyFieldHolder<cpptw.Twin> b = default; b.value.set(3);
+    if (release) { _ = move a; }
+    a = move b;
+    return a.value.value();
+}
+
+// A field type with a user copy constructor and destructor but clang's implicit TRIVIAL
+// operator= (no symbol): lowered assignment byte-copies that field, copy and move alike.
+int bridge_lowered_trivial_assign_field()
+{
+    BridgeCopyFieldHolder<cpptw.TrivialAssignTwin> a = default; a.value.set(7);
+    BridgeCopyFieldHolder<cpptw.TrivialAssignTwin> b = default; b.value.set(3);
+    a = b;
+    int copied = a.value.value();
+    BridgeCopyFieldHolder<cpptw.TrivialAssignTwin> c = default; c.value.set(9);
+    a = move c;
+    return copied * 10 + a.value.value();
 }
 
 int bridge_enclosing_move<T>()
@@ -2650,7 +2893,8 @@ extern int main(int argc, char** argv)
     bridge_conditional_value = 1;
     cpptw.reset_counts();
     bridge_conditional_box_move(bridge_conditional_value != 0);
-    bridge_check("conditional C++ field box taken dtor", cpptw.dtor_count(), 1);
+    // A lowered struct moves like C++: the moved-from source is still destroyed.
+    bridge_check("conditional C++ field box taken dtor", cpptw.dtor_count(), 2);
     bridge_check("conditional C++ field box taken live", cpptw.live_allocations(), 0);
 
     bridge_conditional_value = 0;
@@ -2662,7 +2906,7 @@ extern int main(int argc, char** argv)
     bridge_conditional_value = 1;
     cpptw.reset_counts();
     bridge_conditional_outer_move(bridge_conditional_value != 0);
-    bridge_check("conditional nested C++ field taken dtor", cpptw.dtor_count(), 1);
+    bridge_check("conditional nested C++ field taken dtor", cpptw.dtor_count(), 2);
     bridge_check("conditional nested C++ field taken live", cpptw.live_allocations(), 0);
 
     bridge_conditional_value = 0;
@@ -2691,8 +2935,8 @@ extern int main(int argc, char** argv)
     cpptw.reset_counts();
     bridge_reinit_box(bridge_conditional_value != 0);
     bridge_check("reinit released Box made", cpptw.ctor_count() + cpptw.copy_count()
-        + cpptw.move_count(), 2);
-    bridge_check("reinit released Box dtor", cpptw.dtor_count(), 2);
+        + cpptw.move_count(), 3);
+    bridge_check("reinit released Box dtor", cpptw.dtor_count(), 3);
     bridge_check("reinit released Box live", cpptw.live_allocations(), 0);
 
     bridge_conditional_value = 0;
@@ -4029,8 +4273,10 @@ extern int main(int argc, char** argv)
     int bridgeEnclosingAssignCpp = bridge_enclosing_assign<cpptw.Twin>();
     bridge_check("bridge enclosing assignment C++ value", bridgeEnclosingAssignCpp, 7);
     bridge_check("bridge enclosing assignment C++ ctor", cpptw.ctor_count(), 2);
-    bridge_check("bridge enclosing assignment C++ copy", cpptw.copy_count(), 1);
-    bridge_check("bridge enclosing assignment C++ dtor", cpptw.dtor_count(), 3);
+    // A lowered struct assigns like C++: the C++ field runs its copy-assignment operator.
+    bridge_check("bridge enclosing assignment C++ copy", cpptw.copy_count(), 0);
+    bridge_check("bridge enclosing assignment C++ copy-assign", cpptw.copy_assign_count(), 1);
+    bridge_check("bridge enclosing assignment C++ dtor", cpptw.dtor_count(), 2);
     bridge_check("bridge enclosing assignment C++ live", cpptw.live_allocations(), 0);
 
     bridge_reset_cf();
@@ -4049,6 +4295,115 @@ extern int main(int argc, char** argv)
     bridge_check("bridge nested enclosing copy C++ dtor", cpptw.dtor_count(), 2);
     bridge_check("bridge nested enclosing copy C++ live", cpptw.live_allocations(), 0);
 
+    cpptw.reset_counts();
+    bridge_check("bridge lowered move-assign value", bridge_lowered_move_assign(), 7);
+    bridge_check("bridge lowered move-assign C++ move-assign", cpptw.move_assign_count(), 1);
+    bridge_check("bridge lowered move-assign C++ copy", cpptw.copy_count() + cpptw.move_count(), 0);
+    bridge_check("bridge lowered move-assign C++ dtor", cpptw.dtor_count(), 2);
+    bridge_check("bridge lowered move-assign C++ live", cpptw.live_allocations(), 0);
+
+    cpptw.reset_counts();
+    bridge_check("bridge lowered self-assign value", bridge_lowered_self_assign(), 7);
+    bridge_check("bridge lowered self-assign C++ copy-assign", cpptw.copy_assign_count(), 1);
+    bridge_check("bridge lowered self-assign C++ dtor", cpptw.dtor_count(), 1);
+    bridge_check("bridge lowered self-assign C++ live", cpptw.live_allocations(), 0);
+
+    cpptw.reset_counts();
+    bridge_check("bridge lowered field store value", bridge_lowered_field_store(), 55);
+    bridge_check("bridge lowered field store C++ copy-assign", cpptw.copy_assign_count(), 1);
+    bridge_check("bridge lowered field store C++ copy", cpptw.copy_count(), 0);
+    bridge_check("bridge lowered field store C++ dtor", cpptw.dtor_count(), 2);
+    bridge_check("bridge lowered field store C++ live", cpptw.live_allocations(), 0);
+
+    cpptw.reset_counts();
+    bridge_check("bridge lowered list add value", bridge_lowered_list_add(), 60);
+    bridge_check("bridge lowered list add C++ grow moves", cpptw.move_count(), 4);
+    bridge_check("bridge lowered list add C++ balanced",
+        cpptw.ctor_count() + cpptw.copy_count() + cpptw.move_count() - cpptw.dtor_count(), 0);
+    bridge_check("bridge lowered list add C++ live", cpptw.live_allocations(), 0);
+
+    cpptw.reset_counts();
+    bridge_check("bridge lowered array element assign value", bridge_lowered_array_element_assign(), 80);
+    bridge_check("bridge lowered array element assign C++ ctor", cpptw.ctor_count(), 3);
+    bridge_check("bridge lowered array element assign C++ copy-assign", cpptw.copy_assign_count(), 1);
+    bridge_check("bridge lowered array element assign C++ moves", cpptw.copy_count() + cpptw.move_count(), 0);
+    bridge_check("bridge lowered array element assign C++ dtor", cpptw.dtor_count(), 3);
+    bridge_check("bridge lowered array element assign C++ live", cpptw.live_allocations(), 0);
+
+    cpptw.reset_counts();
+    bridge_check("bridge lowered two prvalue args value",
+        bridge_lowered_two(bridge_lowered_mk(2), bridge_lowered_mk(3)), 23);
+    bridge_check("bridge lowered two prvalue args C++ copy", cpptw.copy_count(), 0);
+    bridge_check("bridge lowered two prvalue args C++ balanced",
+        cpptw.ctor_count() + cpptw.copy_count() + cpptw.move_count() - cpptw.dtor_count(), 0);
+    bridge_check("bridge lowered two prvalue args C++ live", cpptw.live_allocations(), 0);
+
+    cpptw.reset_counts();
+    bridge_check("bridge lowered ternary arg true", bridge_lowered_ternary_arg(true), 2);
+    bridge_check("bridge lowered ternary arg false", bridge_lowered_ternary_arg(false), 3);
+    bridge_check("bridge lowered ternary arg C++ copy", cpptw.copy_count(), 2);
+    bridge_check("bridge lowered ternary arg C++ balanced",
+        cpptw.ctor_count() + cpptw.copy_count() + cpptw.move_count() - cpptw.dtor_count(), 0);
+    bridge_check("bridge lowered ternary arg C++ live", cpptw.live_allocations(), 0);
+
+    cpptw.reset_counts();
+    bridge_check("bridge lowered return field value", bridge_lowered_return_field(), 66);
+    bridge_check("bridge lowered return field C++ copy", cpptw.copy_count(), 1);
+    bridge_check("bridge lowered return field C++ live", cpptw.live_allocations(), 0);
+
+    cpptw.reset_counts();
+    bridge_check("bridge lowered return param value", bridge_lowered_return_param(), 44);
+    bridge_check("bridge lowered return param C++ copy", cpptw.copy_count(), 1);
+    bridge_check("bridge lowered return param C++ move", cpptw.move_count(), 1);
+    bridge_check("bridge lowered return param C++ dtor", cpptw.dtor_count(), 3);
+    bridge_check("bridge lowered return param C++ live", cpptw.live_allocations(), 0);
+
+    cpptw.reset_counts();
+    bridge_check("bridge lowered user copy()", bridge_lowered_user_copy(), 1144);
+    bridge_check("bridge lowered user copy() C++ live", cpptw.live_allocations(), 0);
+    bridge_check("bridge lowered non-copyable owner moves", bridge_lowered_owner_moves(), 32);
+    bridge_check("bridge lowered non-copyable owner C++ live", cpptw.live_allocations(), 0);
+
+    cpptw.reset_counts();
+    bridge_check("bridge lowered assign after release value", bridge_lowered_assign_after_release(), 33);
+    bridge_check("bridge lowered assign after release C++ copy", cpptw.copy_count(), 1);
+    bridge_check("bridge lowered assign after release C++ copy-assign", cpptw.copy_assign_count(), 0);
+    bridge_check("bridge lowered assign after release C++ dtor", cpptw.dtor_count(), 3);
+    bridge_check("bridge lowered assign after release C++ live", cpptw.live_allocations(), 0);
+    cpptw.reset_counts();
+    bridge_check("bridge lowered move-assign after release value", bridge_lowered_move_assign_after_release(), 3);
+    bridge_check("bridge lowered move-assign after release C++ move", cpptw.move_count(), 1);
+    bridge_check("bridge lowered move-assign after release C++ move-assign", cpptw.move_assign_count(), 0);
+    bridge_check("bridge lowered move-assign after release C++ dtor", cpptw.dtor_count(), 3);
+    bridge_check("bridge lowered move-assign after release C++ live", cpptw.live_allocations(), 0);
+    cpptw.reset_counts();
+    bridge_check("bridge lowered assign after cond release value", bridge_lowered_assign_after_cond_release(true), 33);
+    bridge_check("bridge lowered assign after cond release C++ copy", cpptw.copy_count(), 1);
+    bridge_check("bridge lowered assign after cond release C++ copy-assign", cpptw.copy_assign_count(), 0);
+    bridge_check("bridge lowered assign after cond release C++ dtor", cpptw.dtor_count(), 3);
+    bridge_check("bridge lowered assign after cond release C++ live", cpptw.live_allocations(), 0);
+    cpptw.reset_counts();
+    bridge_check("bridge lowered assign without cond release value", bridge_lowered_assign_after_cond_release(false), 33);
+    bridge_check("bridge lowered assign without cond release C++ copy", cpptw.copy_count(), 0);
+    bridge_check("bridge lowered assign without cond release C++ copy-assign", cpptw.copy_assign_count(), 1);
+    bridge_check("bridge lowered assign without cond release C++ dtor", cpptw.dtor_count(), 2);
+    bridge_check("bridge lowered assign without cond release C++ live", cpptw.live_allocations(), 0);
+    cpptw.reset_counts();
+    bridge_check("bridge lowered move-assign after cond release value", bridge_lowered_move_assign_after_cond_release(true), 3);
+    bridge_check("bridge lowered move-assign after cond release C++ move", cpptw.move_count(), 1);
+    bridge_check("bridge lowered move-assign after cond release C++ move-assign", cpptw.move_assign_count(), 0);
+    bridge_check("bridge lowered move-assign after cond release C++ dtor", cpptw.dtor_count(), 3);
+    bridge_check("bridge lowered move-assign after cond release C++ live", cpptw.live_allocations(), 0);
+    cpptw.reset_counts();
+    bridge_check("bridge lowered move-assign without cond release value", bridge_lowered_move_assign_after_cond_release(false), 3);
+    bridge_check("bridge lowered move-assign without cond release C++ move", cpptw.move_count(), 0);
+    bridge_check("bridge lowered move-assign without cond release C++ move-assign", cpptw.move_assign_count(), 1);
+    bridge_check("bridge lowered move-assign without cond release C++ dtor", cpptw.dtor_count(), 2);
+    bridge_check("bridge lowered move-assign without cond release C++ live", cpptw.live_allocations(), 0);
+    bridge_check("bridge lowered trivial operator= field value", bridge_lowered_trivial_assign_field(), 39);
+    bridge_check("bridge lowered trivial operator= field C++ copy", cpptw.trivial_assign_copy_count(), 0);
+    bridge_check("bridge lowered trivial operator= field C++ dtor", cpptw.trivial_assign_dtor_count(), 3);
+
     bridge_reset_cf();
     int bridgeEnclosingMoveCf = bridge_enclosing_move<TwinCf>();
     bridge_check("bridge enclosing move CFlat value", bridgeEnclosingMoveCf, 7);
@@ -4062,8 +4417,8 @@ extern int main(int argc, char** argv)
     bridge_check("bridge enclosing move C++ value", bridgeEnclosingMoveCpp, 7);
     bridge_check("bridge enclosing move C++ ctor", cpptw.ctor_count(), 1);
     bridge_check("bridge enclosing move C++ copy", cpptw.copy_count(), 0);
-    bridge_check("bridge enclosing move C++ move", cpptw.move_count(), 0);
-    bridge_check("bridge enclosing move C++ dtor", cpptw.dtor_count(), 1);
+    bridge_check("bridge enclosing move C++ move", cpptw.move_count(), 1);
+    bridge_check("bridge enclosing move C++ dtor", cpptw.dtor_count(), 2);
     bridge_check("bridge enclosing move C++ live", cpptw.live_allocations(), 0);
 
     bridge_reset_cf();
@@ -4561,8 +4916,9 @@ extern int main(int argc, char** argv)
     }
     bridge_check("BV holder return C++ ctor", cpptw.ctor_count(), 1);
     bridge_check("BV holder return C++ copy", cpptw.copy_count(), 1);
-    bridge_check("BV holder return C++ move", cpptw.move_count(), 0);
-    bridge_check("BV holder return C++ dtor", cpptw.dtor_count(), 2);
+    // `return move value` move-constructs the return slot; the moved-from parameter is destroyed.
+    bridge_check("BV holder return C++ move", cpptw.move_count(), 1);
+    bridge_check("BV holder return C++ dtor", cpptw.dtor_count(), 3);
     bridge_check("BV holder return C++ live", cpptw.live_allocations(), 0);
 
     bridge_reset_cf();
@@ -4642,11 +4998,11 @@ extern int main(int argc, char** argv)
 
     cpptw.reset_counts();
     if (bridge_ternary_lvalue_cppfield(true) != 710000 + 7100 + 72) return 1962;
-    if (cpptw.copy_count() != 1 || cpptw.dtor_count() != 4
+    if (cpptw.copy_count() != 0 || cpptw.copy_assign_count() != 1 || cpptw.dtor_count() != 3
         || cpptw.live_allocations() != 0) return 1963;
     cpptw.reset_counts();
     if (bridge_ternary_lvalue_cppfield(false) != 720000 + 7100 + 72) return 1964;
-    if (cpptw.copy_count() != 1 || cpptw.dtor_count() != 4
+    if (cpptw.copy_count() != 0 || cpptw.copy_assign_count() != 1 || cpptw.dtor_count() != 3
         || cpptw.live_allocations() != 0) return 1965;
 
     cpptw.reset_counts();
@@ -4762,8 +5118,8 @@ extern int main(int argc, char** argv)
     }
     bridge_check("IFH return ctor", cpptw.ctor_count(), 1);
     bridge_check("IFH return copy", cpptw.copy_count(), 1);
-    bridge_check("IFH return move", cpptw.move_count(), 0);
-    bridge_check("IFH return dtor", cpptw.dtor_count(), 2);
+    bridge_check("IFH return move", cpptw.move_count(), 1);
+    bridge_check("IFH return dtor", cpptw.dtor_count(), 3);
     bridge_check("IFH return live", cpptw.live_allocations(), 0);
 
     cpptw.reset_counts();
@@ -5325,6 +5681,56 @@ extern int main(int argc, char** argv)
         bridge_check("plain field relocation default back", defaulted.values.back(), 9);
     }
     {
+        NoInitListRelocHolder implicit;
+        implicit.values.push_back(5);
+        bridge_check("plain field relocation no-init local", (int)implicit.values.size(), 1);
+    }
+    {
+        UserCtorListRelocHolder value = UserCtorListRelocHolder();
+        value.values.push_back(5);
+        bridge_check("plain field relocation user ctor", (int)value.values.size(), 1);
+        bridge_check("plain field relocation user ctor body", value.k, 4);
+    }
+    {
+        LazyDeletedFieldHolder value = { d = cppa.NoDef(3) };
+        bridge_check("deleted-default field explicit initializer", value.d.v, 3);
+    }
+    {
+        NoInitListRelocHolder brace = { k = 7 };
+        brace.values.push_back(5);
+        bridge_check("plain field relocation brace omitted field", (int)brace.values.size(), 1);
+    }
+    {
+        PlainNestedListRelocHolder nested;
+        nested.inner.values.push_back(5);
+        bridge_check("plain field relocation nested field", (int)nested.inner.values.size(), 1);
+    }
+    {
+        PlainArrayListRelocHolder array;
+        array.items[0].values.push_back(5);
+        array.items[1].values.push_back(9);
+        bridge_check("plain field relocation array fields",
+                     (int)array.items[0].values.size() + (int)array.items[1].values.size(), 2);
+    }
+    {
+        NoInitListRelocHolder[2] array;
+        array[0].values.push_back(5);
+        array[1].values.push_back(9);
+        bridge_check("plain field relocation local array",
+                     (int)array[0].values.size() + (int)array[1].values.size(), 2);
+    }
+    {
+        PlainGenericListRelocHolder<NoInitListRelocHolder> generic;
+        generic.value.values.push_back(5);
+        bridge_check("plain field relocation generic field", (int)generic.value.values.size(), 1);
+    }
+    {
+        NoInitListRelocHolder* allocated = new NoInitListRelocHolder();
+        allocated->values.push_back(5);
+        bridge_check("plain field relocation new constructor", (int)allocated->values.size(), 1);
+        delete allocated;
+    }
+    {
         PlainListRelocHolder returned = make_plain_list_reloc_holder();
         bridge_check("plain field relocation sret local",
                      returned.values.front() * 10 + (int)returned.values.size(), 52);
@@ -5352,6 +5758,17 @@ extern int main(int argc, char** argv)
                      implicit.values.front() * 10 + implicit.tracked.value() + implicit.tag, 61);
     }
     bridge_check("plain tracked relocation implicit counts", bridge_tracked_counts(), 1001);
+    cppi.reset_counts();
+    {
+        BridgeTrackedNoArgField value;
+        bridge_check("no-arg user ctor initialized C++ field", value.tracked.value(), 23);
+    }
+    bridge_check("no-arg user ctor C++ field destructor", cppi.dtor_count(), 1);
+    cppi.reset_counts();
+    {
+        BridgeTrackedNoArgTernaryField second;
+        bridge_check("no-arg user ctor ternary field takes the selected arm", second.tracked.value(), 2);
+    }
     cppi.reset_counts();
     {
         PlainTrackedRelocHolder defaulted = default;
@@ -5397,6 +5814,40 @@ extern int main(int argc, char** argv)
                      picked.values.front() * 10 + picked.tracked.value(), 64);
     }
     bridge_check("plain tracked relocation ternary return counts", bridge_tracked_counts(), 1001);
+    cppi.reset_counts();
+    {
+        PlainTrackedRelocHolder source = PlainTrackedRelocHolder();
+        source.values.push_back(5);
+        source.values.push_back(2);
+        PlainTrackedRelocHolder copied = source;
+        bridge_check("plain tracked copy-init value",
+                     copied.values.front() * 10 + (int)copied.values.size()
+                     + copied.tracked.value(), 56);
+    }
+    bridge_check("plain tracked copy-init counts", bridge_tracked_counts(), 1102);
+    cppi.reset_counts();
+    {
+        PlainTrackedRelocHolder source = PlainTrackedRelocHolder();
+        source.values.push_back(5);
+        source.values.push_back(2);
+        bridge_check("plain tracked by-value lvalue", read_plain_tracked(source), 11);
+    }
+    bridge_check("plain tracked by-value lvalue counts", bridge_tracked_counts(), 1102);
+    cppi.reset_counts();
+    bridge_check("plain tracked by-value prvalue",
+                 read_plain_tracked(make_plain_tracked_prvalue()), 11);
+    bridge_check("plain tracked by-value prvalue counts", bridge_tracked_counts(), 1001);
+    cppi.reset_counts();
+    {
+        PlainTrackedRelocHolder left = PlainTrackedRelocHolder();
+        PlainTrackedRelocHolder right = PlainTrackedRelocHolder();
+        left.values.push_back(3);
+        right.values.push_back(7);
+        bool chooseLeft = bridge_checks > 0;
+        PlainTrackedRelocHolder picked = chooseLeft ? left : right;
+        bridge_check("plain tracked named ternary value", picked.values.front(), 3);
+    }
+    bridge_check("plain tracked named ternary counts", bridge_tracked_counts(), 2103);
     cppi.reset_counts();
     {
         PlainLaterHolder viaGlobal = g_plain_later_fn(5);

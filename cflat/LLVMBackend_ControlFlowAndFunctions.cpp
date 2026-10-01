@@ -2937,6 +2937,18 @@ llvm::Function* LLVMBackend::CreateFunctionDefinition(const std::string& functio
         // Ensure the attribute is set even on pre-declared functions that skipped createFunctionProto.
         fn->addFnAttr(llvm::Attribute::NullPointerIsValid);
 
+        // A user C definition replaces the matching libc function for every call in this module.
+        // Keep LLVM's libcall simplifier from substituting the host library implementation.
+        if (external && !CurrentSourceIsCoreLibrary())
+        {
+            llvm::Triple triple = module->getTargetTriple().str().empty()
+                ? llvm::Triple(llvm::sys::getProcessTriple()) : llvm::Triple(module->getTargetTriple());
+            llvm::TargetLibraryInfoImpl tlii{ triple };
+            llvm::LibFunc libFunc;
+            if (tlii.getLibFunc(*fn, libFunc))
+                fn->addFnAttr(llvm::Attribute::NoBuiltin);
+        }
+
         // Apple's arm64 ABI requires x29 (the frame pointer) to form a valid linked list of
         // frame records for every non-leaf function; "non-leaf" matches Apple clang's own
         // default (leaf functions may still omit it). This also lets Darwin's backtrace()

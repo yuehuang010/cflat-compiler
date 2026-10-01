@@ -754,13 +754,23 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
                 }
             }
 
-            // Only a bare named LOCAL (never a parameter, which may alias the caller's object).
+            // A local or by-value parameter owns addressable storage. Parameters are moved too:
+            // the callee then destroys the moved-from parameter after filling the return slot.
             bool namedLocal = false;
             llvm::Value* localStorage = nullptr;
             if (!defaultValue && IsBareIdentifierText(retText))
             {
                 for (const auto& frame : std::ranges::reverse_view(compiler->stackNamedVariable))
                 {
+                    if (auto it = frame.functionArgument.find(retText);
+                        it != frame.functionArgument.end())
+                    {
+                        namedLocal = !it->second.TypeAndValue.Pointer
+                            && it->second.TypeAndValue.TypeName == returnTypeName
+                            && it->second.Storage != nullptr;
+                        localStorage = it->second.Storage;
+                        break;
+                    }
                     if (auto it = frame.namedVariable.find(retText); it != frame.namedVariable.end())
                     {
                         namedLocal = !it->second.TypeAndValue.Pointer
@@ -769,7 +779,6 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
                         localStorage = it->second.Storage;
                         break;
                     }
-                    if (frame.functionArgument.count(retText) != 0) break;
                 }
             }
             auto* structType = compiler->GetDataStructure(returnTypeName).StructType;
@@ -783,6 +792,40 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
                     return;
                 }
             }
+            if (!defaultValue && !namedLocal && structType != nullptr
+                && returnNV.Storage != nullptr && !returnNV.TypeAndValue.Pointer
+                && returnNV.TypeAndValue.TypeName == returnTypeName)
+            {
+                compiler->SetCurrentDebugLocation(errCtx->getStart()->getLine());
+                if (compiler->EmitLoweredMemberwiseCopy(returnTypeName, structType, cxxSretDest,
+                                                        returnNV.Storage,
+                                                        "into the return slot"))
+                {
+                    finishLoweredReturn();
+                    return;
+                }
+            }
+            // `return move x;`: the move zeroed x after loading it. Put the bytes back, move the
+            // C++ fields into the return slot, and leave x a live moved-from object for its owner.
+            if (!defaultValue && !namedLocal && structType != nullptr
+                && returnNV.Storage == nullptr && returnNV.IsExplicitMove
+                && !returnNV.TypeAndValue.Pointer
+                && returnNV.TypeAndValue.TypeName == returnTypeName)
+                if (auto* loaded = llvm::dyn_cast_or_null<llvm::LoadInst>(returnNV.Primary))
+                {
+                    auto* source = loaded->getPointerOperand();
+                    compiler->SetCurrentDebugLocation(errCtx->getStart()->getLine());
+                    compiler->builder->CreateStore(returnNV.Primary, source);
+                    const std::string movedName = compiler->FindVariableNameByStorage(source);
+                    if (!movedName.empty()) compiler->MarkVariableNotExplicitlyMovedNull(movedName);
+                    if (compiler->EmitLoweredMemberwiseMove(returnTypeName, structType,
+                                                            cxxSretDest, source,
+                                                            "into the return slot"))
+                    {
+                        finishLoweredReturn();
+                        return;
+                    }
+                }
             loweredValueReturn = true;
         }
 

@@ -3010,6 +3010,44 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
         lastCxxRetTemp_ = nullptr;
         lastCxxRetValue_ = nullptr;
         std::string functionName = ResolveQualifiedName(functionNameIn, forceRoot);
+        const bool inGlobalInitThunk = currentFunction != nullptr
+            && (currentFunction->getName().starts_with("__global")
+                || currentFunction->getName().starts_with("__cflat_global"));
+        if (!forceRoot && dataStructures.count(functionName) != 0
+            && (currentFunction == nullptr || currentFunction->getName() != functionName)
+            && !inGlobalInitThunk
+            && !IsCxxRecord(functionName))
+        {
+            // A CFlat constructor is the first point where an unavailable C++ member default
+            // becomes observable. The synthesized body was emitted at the type declaration and
+            // intentionally leaves such a member zeroed until this real call is requested.
+            for (const auto& field : GetDataStructure(functionName).StructFields)
+            {
+                if (field.Pointer || field.ConstArraySize != 0
+                    || field.BraceInitializer != nullptr
+                    || (field.Initializer != nullptr
+                        && field.Initializer->Default() == nullptr))
+                    continue;
+                auto* fieldType = GetType(field);
+                if (fieldType == nullptr || fieldType->isArrayTy()
+                    || !fieldType->isStructTy() || !IsCxxRecord(field.TypeName)
+                    || !(CxxElementNeedsDefaultConstruction(field.TypeName)
+                        || HasNonPublicCxxDefaultCtor(field.TypeName)))
+                    continue;
+                std::string bindError;
+                TryBindCxxImplicitDefaultCtor(field.TypeName, bindError);
+                if (!bindError.empty()) LogErrorMessage("{}", { bindError });
+                if (FindCxxDefaultCtor(field.TypeName) == nullptr)
+                {
+                    const auto* info = GetCxxClassInfo(field.TypeName);
+                    LogErrorMessage(
+                        "C++ class '{}' has no default constructor cflat can call{}",
+                        { DisplayCxxClassName(field.TypeName),
+                          info != nullptr && info->hasDeletedDefaultCtor
+                              ? " (it is deleted)" : "" });
+                }
+            }
+        }
         std::string shownFunctionName = displayName;
         // Set only when THIS call attempted an implicit-conversion wrapper that was refused.
         std::string implicitConversionRefusal;
@@ -3062,6 +3100,35 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                                 "defines independent state, or 'move' the value instead of copying it.",
                                 SpellType(*this, TypeAndValue{ .TypeName = copyType })));
                         return nullptr;
+                    }
+                    if (IsLoweredCFlatOnlyStruct(copyType))
+                    {
+                        auto* valueType = GetType(TypeAndValue{ .TypeName = copyType });
+                        llvm::Value* sourceSlot = arguments[0].Storage;
+                        if (sourceSlot == nullptr && arguments[0].Primary == lastLoweredRetValue_)
+                            sourceSlot = lastLoweredRetTemp_;
+                        if (sourceSlot == nullptr)
+                            if (auto* loaded = llvm::dyn_cast_or_null<llvm::LoadInst>(
+                                    arguments[0].Primary);
+                                loaded != nullptr && loaded->getType() == valueType)
+                                sourceSlot = loaded->getPointerOperand();
+                        if (sourceSlot == nullptr)
+                        {
+                            LogError(std::format(
+                                "cannot copy struct '{}' for synthesized copy operation: source has "
+                                "no address", copyType));
+                            return nullptr;
+                        }
+                        auto* resultSlot = AllocaAtEntry(valueType, nullptr, "lowered.copy");
+                        if (!EmitLoweredMemberwiseCopy(copyType, valueType, resultSlot, sourceSlot,
+                                                       "in synthesized copy"))
+                            return nullptr;
+                        lastCallReturnType = TypeAndValue{ copyType, "", false };
+                        auto* resultValue = builder->CreateLoad(valueType, resultSlot,
+                                                               "lowered.copy.value");
+                        lastLoweredRetTemp_ = resultSlot;
+                        lastLoweredRetValue_ = resultValue;
+                        return resultValue;
                     }
                     GetOrCreateMemberwiseCopy(copyType);
                 }
@@ -5000,7 +5067,14 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                         bool ternaryJoinNeedsRegistration = arg.Primary != nullptr
                             && llvm::isa<llvm::PHINode>(arg.Primary)
                             && !arg.TernaryTempAlreadyRegistered;
-                        RegisterBorrowedOwningStructTemp(arg, ternaryJoinNeedsRegistration);
+                        const bool loweredSretPassedByValue =
+                            IsLoweredCFlatOnlyStruct(candParamItr->TypeName)
+                            && arg.TypeAndValue.TypeName == candParamItr->TypeName
+                            && LoweredSretTempOf(arg.Primary,
+                                                 arg.Primary != nullptr ? arg.Primary->getType()
+                                                                        : nullptr) != nullptr;
+                        if (!loweredSretPassedByValue)
+                            RegisterBorrowedOwningStructTemp(arg, ternaryJoinNeedsRegistration);
                     }
                 }
                 else if (value->getType()->isIntegerTy(1))
@@ -5364,13 +5438,63 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                 const bool cxxObject = IsForeignNontrivialCxxClass(pn);
                 const bool cflatHolder = !cxxObject && HasForeignNontrivialCxxField(pn);
                 if (!cxxObject && !cflatHolder) continue;
+                if (cflatHolder && IsLoweredCFlatOnlyStruct(pn) && i < matched.size())
+                {
+                    auto* resultSlot = LoweredSretTempOf(matched[i].Primary,
+                                                         candidate.Recipe.paramSlots[i].structTy);
+                    if (resultSlot != nullptr)
+                    {
+                        // A CFlat sret result is already the storage for this by-value parameter.
+                        // C++17 prvalue elision binds it directly; the callee owns its lifetime.
+                        cxxIndirectArgAddrs.resize(candidate.Recipe.paramSlots.size(), nullptr);
+                        cxxIndirectArgAddrs[i] = resultSlot;
+                        if (matched[i].Primary == lastLoweredRetValue_)
+                        {
+                            lastLoweredRetTemp_ = nullptr;
+                            lastLoweredRetValue_ = nullptr;
+                        }
+                        continue;
+                    }
+                }
+                // `take(c ? a : b)` of a lowered struct: both arms are loads of addressable
+                // objects, so copy from a join of their addresses, not a relocated value.
+                if (cflatHolder && i < matched.size() && matched[i].Storage == nullptr)
+                    if (auto* phi = llvm::dyn_cast_or_null<llvm::PHINode>(matched[i].Primary);
+                        phi != nullptr && phi->getType() == candidate.Recipe.paramSlots[i].structTy)
+                    {
+                        bool allLoads = phi->getNumIncomingValues() > 0;
+                        for (unsigned k = 0; k < phi->getNumIncomingValues() && allLoads; ++k)
+                        {
+                            auto* load = llvm::dyn_cast<llvm::LoadInst>(phi->getIncomingValue(k));
+                            allLoads = load != nullptr && !IsProducedTempValue(load);
+                        }
+                        if (allLoads)
+                        {
+                            llvm::IRBuilder<> joinBuilder(phi->getParent(),
+                                phi->getParent()->getFirstInsertionPt());
+                            auto* addressJoin = joinBuilder.CreatePHI(builder->getPtrTy(),
+                                phi->getNumIncomingValues(), "lowered.arg.addr");
+                            for (unsigned k = 0; k < phi->getNumIncomingValues(); ++k)
+                                addressJoin->addIncoming(llvm::cast<llvm::LoadInst>(
+                                    phi->getIncomingValue(k))->getPointerOperand(),
+                                    phi->getIncomingBlock(k));
+                            matched[i].Storage = addressJoin;
+                        }
+                    }
                 if (i >= matched.size() || matched[i].Storage == nullptr)
                 {
-                    LogError(std::format(
-                        "cannot pass C++ class '{}' by value to parameter '{}' of '{}': the "
-                        "argument must be a variable, a field or another addressable object so "
-                        "its copy constructor can run", DisplayCxxClassName(pn),
-                        candidate.Parameters[i].VariableName, diagnosticFunctionName));
+                    if (cflatHolder)
+                        LogError(std::format(
+                            "cannot pass struct '{}' by value to parameter '{}' of '{}': the "
+                            "argument must be a variable, a field or another addressable object "
+                            "so the copy constructors of its C++ fields can run", pn,
+                            candidate.Parameters[i].VariableName, diagnosticFunctionName));
+                    else
+                        LogError(std::format(
+                            "cannot pass C++ class '{}' by value to parameter '{}' of '{}': the "
+                            "argument must be a variable, a field or another addressable object so "
+                            "its copy constructor can run", DisplayCxxClassName(pn),
+                            candidate.Parameters[i].VariableName, diagnosticFunctionName));
                     continue;
                 }
                 auto* structTy = candidate.Recipe.paramSlots[i].structTy;
@@ -7065,4 +7189,22 @@ std::string LLVMBackend::MovedUseSubject(const NamedVariable& nv) const
             }
         }
         return "";
+}
+
+/*
+ * The sret temporary holding a lowered CFlat struct call result, when `value` is that result:
+ * the most recent one, or any earlier result of the same full expression (a load from its own
+ * sret slot that is still a produced temporary). Null otherwise.
+ */
+llvm::AllocaInst* LLVMBackend::LoweredSretTempOf(llvm::Value* value, llvm::Type* type) const
+{
+        if (value == nullptr || type == nullptr) return nullptr;
+        llvm::AllocaInst* slot = nullptr;
+        if (value == lastLoweredRetValue_)
+            slot = llvm::dyn_cast_or_null<llvm::AllocaInst>(lastLoweredRetTemp_);
+        else if (auto* load = llvm::dyn_cast<llvm::LoadInst>(value);
+                 load != nullptr && IsProducedTempValue(value))
+            slot = llvm::dyn_cast<llvm::AllocaInst>(load->getPointerOperand());
+        if (slot == nullptr || slot->getAllocatedType() != type) return nullptr;
+        return slot;
 }

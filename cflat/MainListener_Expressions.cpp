@@ -1807,6 +1807,23 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                 // (which mishandles a detached pointer element as an owning value and over-frees).
                 bool slotMove = compiler->lastMovedFromContainerSlot;
                 compiler->lastMovedFromContainerSlot = false;
+                // A lowered struct element is destroyed in its own slot: the C++ fields are not
+                // trivially relocatable, so the bytes go back and the slot ends zeroed.
+                if (slotMove && rhsNV.Primary != nullptr
+                    && compiler->IsLoweredCFlatOnlyStruct(rhsNV.TypeAndValue.TypeName)
+                    && !rhsNV.TypeAndValue.Pointer)
+                    if (auto* load = llvm::dyn_cast<llvm::LoadInst>(rhsNV.Primary))
+                    {
+                        auto* elementSlot = load->getPointerOperand();
+                        compiler->builder->CreateStore(rhsNV.Primary, elementSlot);
+                        if (auto* dtor = compiler->GetOrCreateFullDestructor(
+                                rhsNV.TypeAndValue.TypeName))
+                            compiler->builder->CreateCall(dtor->getFunctionType(), dtor,
+                                                          { elementSlot });
+                        compiler->builder->CreateStore(
+                            llvm::Constant::getNullValue(rhsNV.Primary->getType()), elementSlot);
+                        return rhsNV.Primary;
+                    }
                 if (slotMove && rhsNV.Primary != nullptr && rhsNV.BaseType != nullptr)
                 {
                     LLVMBackend::NamedVariable slotNV;
@@ -5023,6 +5040,127 @@ llvm::Value* MainListener::ParseAssignmentExpression(
             // (no copy - copying would leak the old buffer the self-store never frees). `rejectCopied`
             // records whether it produced the copy, so the field-to-field block below does not copy again.
             bool rejectCopied = false;
+            // A lowered struct is never stored as a value: assignment runs operator= member-wise
+            // from the source ADDRESS; a non-copyable owner moves, a user copy() result moves in.
+            if (operatorText == "=" && right && right->getType()->isStructTy()
+                && !namedVar.TypeAndValue.Pointer && !rightNV.TypeAndValue.Pointer
+                && compiler->IsLoweredCFlatOnlyStruct(namedVar.TypeAndValue.TypeName)
+                && rightNV.TypeAndValue.TypeName == namedVar.TypeAndValue.TypeName)
+            {
+                const std::string& loweredType = namedVar.TypeAndValue.TypeName;
+                bool useMove = rightNV.TypeAndValue.IsMove || rightNV.IsExplicitMove;
+                bool fromTemp = false;
+                llvm::Value* source = rightNV.Storage;
+                if (source == nullptr && right == compiler->lastLoweredRetValue_
+                    && compiler->lastLoweredRetTemp_ != nullptr)
+                {
+                    source = compiler->lastLoweredRetTemp_;
+                    fromTemp = true;
+                }
+                // `move a` hands back the value loaded before the source was zeroed: restore the
+                // bytes, the moved-from source stays a live object destroyed at its scope exit.
+                bool restoredMoveSource = false;
+                if (source == nullptr)
+                    if (auto* loaded = llvm::dyn_cast_or_null<llvm::LoadInst>(right))
+                    {
+                        source = loaded->getPointerOperand();
+                        restoredMoveSource = rightNV.IsExplicitMove;
+                    }
+                if (source == nullptr)
+                {
+                    LogErrorContext(ctx, std::format(
+                        "cannot assign struct '{}': the source is not addressable, and its C++ "
+                        "fields must be assigned from their own storage", loweredType));
+                    return finishStore(right);
+                }
+                if (restoredMoveSource)
+                {
+                    compiler->builder->CreateStore(right, source);
+                    const std::string movedName = compiler->FindVariableNameByStorage(source);
+                    if (!movedName.empty()) compiler->MarkVariableNotExplicitlyMovedNull(movedName);
+                }
+                const std::string sourceName = rightNV.Storage != nullptr
+                    ? compiler->FindVariableNameByStorage(rightNV.Storage) : std::string();
+                if (!useMove && !fromTemp && !compiler->IsCopyableType(loweredType))
+                {
+                    if (RejectConsumeOfBorrowedByValueParamField(compiler, rightNV, ctx))
+                        return finishStore(right);
+                    useMove = true;
+                    if (!sourceName.empty() && rightNV.FieldName.empty())
+                        compiler->MarkVariableMoved(sourceName);
+                }
+                else if (!useMove && !fromTemp && compiler->HasCopyOverloadFor(loweredType))
+                {
+                    LLVMBackend::NamedVariable copySource;
+                    copySource.Storage = source;
+                    copySource.BaseType = right->getType();
+                    copySource.TypeAndValue.TypeName = loweredType;
+                    auto* copied = compiler->CreateOverloadedFunctionCall("copy", { copySource });
+                    if (copied == nullptr) return finishStore(right);
+                    if (copied != compiler->lastLoweredRetValue_
+                        || compiler->lastLoweredRetTemp_ == nullptr)
+                    {
+                        LogErrorContext(ctx, std::format(
+                            "cannot assign struct '{}': its copy() result has no storage to "
+                            "assign the C++ fields from", loweredType));
+                        return finishStore(right);
+                    }
+                    source = compiler->lastLoweredRetTemp_;
+                    fromTemp = true;
+                }
+                if (fromTemp) useMove = true;
+                compiler->SetCurrentDebugLocation(ctx->getStart()->getLine());
+                // A released destination (`_ = move a;`) holds destroyed C++ fields: operator=
+                // on them is use-after-destroy, so the value is CONSTRUCTED member-wise instead.
+                // A conditional release (released in one branch) decides at runtime by its drop
+                // flag, as the foreign C++ class assignment does.
+                auto* valueType = right->getType();
+                auto emitAssign = [&]() -> bool {
+                    return compiler->EmitLoweredMemberwiseAssign(loweredType, valueType,
+                        destination, source, useMove, "in assignment");
+                };
+                auto emitConstruct = [&]() -> bool {
+                    return useMove
+                        ? compiler->EmitLoweredMemberwiseMove(loweredType, valueType, destination,
+                                                              source, "in assignment")
+                        : compiler->EmitLoweredMemberwiseCopy(loweredType, valueType, destination,
+                                                              source, "in assignment");
+                };
+                bool emitted = true;
+                if (namedVar.ConditionalDropFlag != nullptr)
+                {
+                    auto* liveBlock = compiler->CreateBasicBlock("lowered.assign.live");
+                    auto* constructBlock = compiler->CreateBasicBlock("lowered.assign.construct");
+                    auto* doneBlock = compiler->CreateBasicBlock("lowered.assign.join");
+                    auto* live = compiler->builder->CreateLoad(
+                        compiler->builder->getInt1Ty(), namedVar.ConditionalDropFlag,
+                        "lowered.assign.livef");
+                    compiler->CreateConditionJump(live, liveBlock, constructBlock);
+                    compiler->SwitchToBlock(liveBlock);
+                    emitted = emitAssign();
+                    if (compiler->IsInsertBlockLive()) compiler->CreateJump(doneBlock);
+                    compiler->SwitchToBlock(constructBlock);
+                    emitted = emitConstruct() && emitted;
+                    if (compiler->IsInsertBlockLive()) compiler->CreateJump(doneBlock);
+                    compiler->SwitchToBlock(doneBlock);
+                }
+                else if (namedVar.ExplicitlyMovedNull)
+                    emitted = emitConstruct();
+                else
+                    emitted = emitAssign();
+                if (!emitted) return finishStore(right);
+                // A prvalue source is a temporary this statement owns: destroy it once moved from.
+                if (fromTemp)
+                    if (auto* dtor = compiler->GetOrCreateFullDestructor(loweredType))
+                        compiler->builder->CreateCall(dtor->getFunctionType(), dtor, { source });
+                if (!namedVar.CallerName.empty() && namedVar.FieldName.empty())
+                {
+                    compiler->MarkVariableUnmoved(namedVar.CallerName);
+                    // Clears the release and re-arms the drop flag: the destination is live again.
+                    compiler->MarkVariableNotExplicitlyMovedNull(namedVar.CallerName);
+                }
+                return finishStore(right);
+            }
             if (operatorText == "=" && destIsStructField
                 && RejectOwningValueCopyIntoField(rightNV, right, selfUniqueFieldStore, rejectCopied, ctx))
                 return finishStore(right);
@@ -7053,9 +7191,13 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
             if (temp == nullptr && armStorage != nullptr && declType != nullptr
                 && armValue != nullptr && armValue->getType() == declType)
             {
-                if (!compiler->EmitCxxCopyOrMoveConstruct(
+                const bool copied = compiler->IsLoweredCFlatOnlyStruct(cxxTernaryDeclType)
+                    ? compiler->EmitLoweredMemberwiseCopy(cxxTernaryDeclType, declType,
+                        cxxTernaryDeclDest, armStorage, "into a ternary declaration")
+                    : compiler->EmitCxxCopyOrMoveConstruct(
                         cxxTernaryDeclType, cxxTernaryDeclDest, armStorage,
-                        /*useMove*/ false, "into a ternary declaration"))
+                        /*useMove*/ false, "into a ternary declaration");
+                if (!copied)
                 {
                     cxxTernaryDeclFailed = true;
                     return;
@@ -16895,6 +17037,34 @@ llvm::Value* MainListener::EmitFieldDefaultFixedArrayBrace(
  * local declarator arm and the field-default arm; the walk is the one the `= default` arm and
  * the destruction path already use, so the traversals cannot drift.
  */
+/*
+ * Run the default constructor of one fixed-array element and store it in the slot. A lowered
+ * struct (a C++ field that is not trivially relocatable) is constructed in the slot itself through
+ * the sret destination, never stored as a relocated value.
+ */
+static llvm::Value* ConstructDefaultArrayElement(LLVMBackend* compiler, const std::string& typeName,
+                                                 llvm::Value* elemPtr, bool forceRoot)
+{
+        const bool armElemSret = compiler->IsLoweredCFlatOnlyStruct(typeName)
+            && compiler->ReturnsViaCxxSret(typeName);
+        if (armElemSret)
+        {
+            compiler->pendingCxxSretDest_ = elemPtr;
+            compiler->pendingCxxSretTypeName_ = typeName;
+            compiler->pendingCxxSretForFixedArray_ = true;
+        }
+        llvm::Value* elem = compiler->CreateOverloadedFunctionCall(typeName, {}, forceRoot);
+        const bool builtInPlace = armElemSret && compiler->pendingCxxSretDest_ == nullptr;
+        if (armElemSret)
+        {
+            compiler->pendingCxxSretDest_ = nullptr;
+            compiler->pendingCxxSretTypeName_.clear();
+            compiler->pendingCxxSretForFixedArray_ = false;
+        }
+        if (elem != nullptr && !builtInPlace) compiler->CreateAssignment(elem, elemPtr);
+        return elem;
+}
+
 void MainListener::EmitArrayValueInitSlots(
         llvm::Value* arrAlloc,
         llvm::StructType* elemTy,
@@ -16940,11 +17110,9 @@ void MainListener::EmitArrayValueInitSlots(
             [&](llvm::Value* elemPtr)
             {
                 llvm::Value* elem = compiler->GetFunction(tv.TypeName)
-                    ? compiler->CreateOverloadedFunctionCall(tv.TypeName, {}, forceRoot)
+                    ? ConstructDefaultArrayElement(compiler, tv.TypeName, elemPtr, forceRoot)
                     : nullptr;
-                if (elem != nullptr)
-                    compiler->CreateAssignment(elem, elemPtr);
-                else
+                if (elem == nullptr)
                     compiler->builder->CreateStore(llvm::Constant::getNullValue(elemTy), elemPtr);
                 // Built: the named overrides below may throw.
                 compiler->NoteUnwindPartial(LLVMBackend::UnwindPartialEntry::Kind::Slot, elemPtr,
@@ -17891,8 +18059,7 @@ void MainListener::EmitFixedArrayDefaultInit(llvm::Value* arrAlloc, const LLVMBa
                 arrAlloc, structData.StructType, n, tv.TypeName,
                 [&](llvm::Value* elemPtr)
                 {
-                    llvm::Value* elem = compiler->CreateOverloadedFunctionCall(tv.TypeName, {});
-                    compiler->CreateAssignment(elem, elemPtr);
+                    ConstructDefaultArrayElement(compiler, tv.TypeName, elemPtr, false);
                 });
             return;
         }
@@ -17927,8 +18094,7 @@ void MainListener::EmitFixedArrayDefaultInit(llvm::Value* arrAlloc, const LLVMBa
             arrAlloc, structData.StructType, n, tv.TypeName,
             [&](llvm::Value* elemPtr)
             {
-                llvm::Value* elem = compiler->CreateOverloadedFunctionCall(tv.TypeName, {});
-                compiler->CreateAssignment(elem, elemPtr);
+                ConstructDefaultArrayElement(compiler, tv.TypeName, elemPtr, false);
             });
     }
 
@@ -19079,7 +19245,22 @@ LLVMBackend::NamedVariable MainListener::ParseNewExpression(CFlatParser::NewExpr
                 }
             }
             newCallPostfix.Flush();
+            const bool armLoweredSret = compiler->IsLoweredCFlatOnlyStruct(typeName)
+                && compiler->ReturnsViaCxxSret(typeName);
+            if (armLoweredSret)
+            {
+                compiler->pendingCxxSretDest_ = typedPtr;
+                compiler->pendingCxxSretTypeName_ = typeName;
+                compiler->pendingCxxSretReturn_ = true;
+            }
             llvm::Value* structVal = compiler->CreateOverloadedFunctionCall(typeName, ctorArgs);
+            const bool builtInPlace = armLoweredSret && compiler->pendingCxxSretDest_ == nullptr;
+            if (armLoweredSret)
+            {
+                compiler->pendingCxxSretDest_ = nullptr;
+                compiler->pendingCxxSretTypeName_.clear();
+                compiler->pendingCxxSretReturn_ = false;
+            }
             newBlockScope.Release();
             // The constructed value is about to land in a HEAP block that outlives the statement.
             // No other escape site sees this store, so the ctor-launder leg is asked here.
@@ -19090,7 +19271,7 @@ LLVMBackend::NamedVariable MainListener::ParseNewExpression(CFlatParser::NewExpr
                 GuardOwningTempUniqueFieldEscape(
                     ctorNV, std::format("the heap object 'new {}' allocates", spellNewType()), ctx);
             }
-            if (structVal)
+            if (structVal && !builtInPlace)
                 compiler->builder->CreateStore(structVal, typedPtr);
         }
 

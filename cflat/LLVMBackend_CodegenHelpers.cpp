@@ -2047,6 +2047,55 @@ llvm::Function* LLVMBackend::GetOrCreateMemberwiseCopy(const std::string& typeNa
         auto* structTy = dsIt->second.StructType;
         if (structTy == nullptr) return nullptr;
 
+        // Refuse before creating IR when a C++ field has no usable copy constructor. The
+        // synthesized function cannot be completed after a field copy reports an error.
+        std::unordered_set<std::string> copyabilitySeen;
+        std::string failedClass;
+        std::string failedField;
+        std::function<bool(const std::string&, const std::string&)> canCopyField;
+        canCopyField = [&](const std::string& fieldType, const std::string& fieldPath) {
+            if (IsForeignNontrivialCxxClass(fieldType))
+            {
+                if (FindCxxCopyCtor(fieldType) != nullptr) return true;
+                const CxxClassInfo* info = GetCxxClassInfo(fieldType);
+                if (info != nullptr && info->hasTrivialCopyCtor && !info->hasDeletedCopyCtor)
+                    return true;
+                failedClass = fieldType;
+                failedField = fieldPath;
+                return false;
+            }
+            if (!copyabilitySeen.insert(fieldType).second) return true;
+            auto nested = dataStructures.find(fieldType);
+            if (nested == dataStructures.end()) return true;
+            for (const auto& field : nested->second.StructFields)
+            {
+                if (field.Pointer || field.ElemPointer || field.IsArrayView || field.IsSimd
+                    || field.IsBitfield || field.IsPadding)
+                    continue;
+                const std::string nestedPath = fieldPath.empty()
+                    ? field.VariableName : fieldPath + "." + field.VariableName;
+                if (!canCopyField(field.TypeName, nestedPath)) return false;
+            }
+            return true;
+        };
+        for (const auto& field : dsIt->second.StructFields)
+        {
+            if (field.Pointer || field.ElemPointer || field.IsArrayView || field.IsSimd
+                || field.IsBitfield || field.IsPadding)
+                continue;
+            if (!canCopyField(field.TypeName, field.VariableName))
+            {
+                const CxxClassInfo* info = GetCxxClassInfo(failedClass);
+                const bool deleted = info != nullptr && info->hasDeletedCopyCtor;
+                LogError(std::format(
+                    "cannot copy struct '{}' because field '{}' contains C++ class '{}' whose "
+                    "copy constructor is {}",
+                    typeName, failedField, DisplayCxxClassName(failedClass),
+                    deleted ? "deleted" : "not accessible from the imported header"));
+                return nullptr;
+            }
+        }
+
         // Signature: T copy(T self) - self by value (a borrow; not destructed), result by value.
         auto* fnTy = llvm::FunctionType::get(structTy, { structTy }, false);
         auto* fn = llvm::Function::Create(fnTy, llvm::Function::InternalLinkage,
@@ -2069,15 +2118,23 @@ llvm::Function* LLVMBackend::GetOrCreateMemberwiseCopy(const std::string& typeNa
         auto* entry = llvm::BasicBlock::Create(*context, "entry", fn);
         builder->SetInsertPoint(entry);
 
-        // result = self  (shallow copy of every field; managed fields are fixed up below)
+        // A struct holding a nontrivial C++ field starts from raw storage: no live C++ object
+        // representation is placed over a field before its copy constructor runs. Any other
+        // struct starts as the shallow `result = self` it always was, so the receiver-temp
+        // retention walk keeps its verdict for a by-value snapshot of a pointee (test_move).
         auto* resultSlot = builder->CreateAlloca(structTy, nullptr, "result");
-        builder->CreateStore(&*fn->arg_begin(), resultSlot);
-        llvm::Value* sourceSlot = nullptr;
+        if (HasForeignNontrivialCxxField(typeName))
+            builder->CreateStore(llvm::Constant::getNullValue(structTy), resultSlot);
+        else
+            builder->CreateStore(&*fn->arg_begin(), resultSlot);
+        auto* sourceSlot = builder->CreateAlloca(structTy, nullptr, "source");
+        builder->CreateStore(&*fn->arg_begin(), sourceSlot);
 
         // An unwind out of a field copy destroys the fields already deep-copied; the rest still
         // alias `self` and must not be touched.
         UnwindPartialScope copiedFields(*this);
-        // Deep-copy each managed value field, overwriting the aliased shallow handle.
+        // Copy fields into the fresh object; never place a live C++ object representation over
+        // a field before its copy constructor starts its lifetime.
         for (unsigned i = 0; i < dsIt->second.StructFields.size(); ++i)
         {
             const auto& f = dsIt->second.StructFields[i];
@@ -2086,43 +2143,60 @@ llvm::Function* LLVMBackend::GetOrCreateMemberwiseCopy(const std::string& typeNa
             {
                 if (IsForeignNontrivialCxxClass(f.TypeName))
                 {
-                    if (sourceSlot == nullptr)
-                    {
-                        sourceSlot = builder->CreateAlloca(structTy, nullptr, "source");
-                        builder->CreateStore(&*fn->arg_begin(), sourceSlot);
-                    }
                     auto* fieldPtr = CreateCxxFieldGEP(dsIt->second, resultSlot, i, "fld");
                     auto* sourceFieldPtr = CreateCxxFieldGEP(dsIt->second, sourceSlot, i, "fldsrc");
                     if (EmitCxxCopyOrMoveConstruct(f.TypeName, fieldPtr, sourceFieldPtr,
-                            /*useMove*/ false, "in synthesized struct copy"))
+                            /*useMove*/ false,
+                            std::format("in synthesized copy of struct '{}', field '{}'",
+                                        typeName, f.VariableName).c_str()))
                         NoteUnwindPartial(UnwindPartialEntry::Kind::Slot, fieldPtr, f.TypeName);
                 }
                 continue;
             }
-            if (f.Pointer || f.ElemPointer || f.IsArrayView || f.IsSimd || f.IsBitfield || f.IsPadding)
-                continue;                       // pointer/view/simd/bitfield/pad: shallow (pointee shared)
+            auto* fieldPtr = CreateCxxFieldGEP(dsIt->second, resultSlot, i, "fld");
+            auto* sourceFieldPtr = CreateCxxFieldGEP(dsIt->second, sourceSlot, i, "fldsrc");
+            auto* fieldTy = structTy->getElementType(element);
+            if (f.Pointer || f.ElemPointer || f.IsArrayView || f.IsSimd
+                || f.IsBitfield || f.IsPadding)
+            {
+                builder->CreateStore(builder->CreateLoad(fieldTy, sourceFieldPtr), fieldPtr);
+                continue;                       // pointer/view/simd/bitfield/pad: shallow
+            }
             if (f.ConstArraySize > 0)
             {
                 // Owning fixed-array value field: deep-copy every element so the copy is
                 // independent (FULLY-LIVE contract, in lockstep with the destructor).
-                if (!HasCopyOverloadFor(f.TypeName) && !IsOwningValueType(f.TypeName)
-                    && !IsForeignNontrivialCxxClass(f.TypeName))
-                    continue;                   // POD element array: the shallow copy is correct
                 llvm::Type* elemTy = nullptr;
                 uint64_t n = PeelFixedArrayType(structTy->getElementType(element), elemTy);
                 auto* base = CreateCxxFieldGEP(dsIt->second, resultSlot, i, "fldarr");
+                auto* sourceBase = CreateCxxFieldGEP(dsIt->second, sourceSlot, i, "fldarrsrc");
+                auto* arrayTy = llvm::cast<llvm::ArrayType>(fieldTy);
+                uint64_t arrayIndex = 0;
                 EmitArrayConstructionWalk(base, elemTy, n, f.TypeName, [&](llvm::Value* elemPtr) {
+                    llvm::Value* indices[] = { builder->getInt32(0),
+                        builder->getInt64(arrayIndex++) };
+                    auto* sourceElem = builder->CreateInBoundsGEP(arrayTy, sourceBase, indices);
                     if (IsForeignNontrivialCxxClass(f.TypeName))
                     {
-                        auto* sourceSlot = AllocaAtEntry(elemTy, nullptr, "fldarrsrc");
-                        builder->CreateStore(builder->CreateLoad(elemTy, elemPtr), sourceSlot);
-                        EmitCxxCopyOrMoveConstruct(f.TypeName, elemPtr, sourceSlot,
-                                                   /*useMove*/ false,
-                                                   "in synthesized struct copy");
+                        EmitCxxCopyOrMoveConstruct(f.TypeName, elemPtr, sourceElem,
+                            /*useMove*/ false,
+                            std::format("in synthesized copy of struct '{}', field '{}'",
+                                        typeName, f.VariableName).c_str());
+                        return;
+                    }
+                    if (IsLoweredCFlatOnlyStruct(f.TypeName))
+                    {
+                        EmitLoweredMemberwiseCopy(f.TypeName, elemTy, elemPtr, sourceElem,
+                                                  "in synthesized copy of array field");
+                        return;
+                    }
+                    if (!HasCopyOverloadFor(f.TypeName) && !IsOwningValueType(f.TypeName))
+                    {
+                        builder->CreateStore(builder->CreateLoad(elemTy, sourceElem), elemPtr);
                         return;
                     }
                     NamedVariable elemNV;
-                    elemNV.Storage  = elemPtr;
+                    elemNV.Storage  = sourceElem;
                     elemNV.BaseType = elemTy;
                     elemNV.TypeAndValue.TypeName = f.TypeName;
                     if (auto* copied = CreateOverloadedFunctionCall("copy", { elemNV }))
@@ -2132,22 +2206,32 @@ llvm::Function* LLVMBackend::GetOrCreateMemberwiseCopy(const std::string& typeNa
                 continue;
             }
             if (!HasCopyOverloadFor(f.TypeName) && !IsOwningValueType(f.TypeName)
-                && !IsForeignNontrivialCxxClass(f.TypeName))
+                && !IsForeignNontrivialCxxClass(f.TypeName)
+                && !IsLoweredCFlatOnlyStruct(f.TypeName))
+            {
+                builder->CreateStore(builder->CreateLoad(fieldTy, sourceFieldPtr), fieldPtr);
                 continue;                       // POD field: the shallow copy is already correct
-            auto* fieldPtr = CreateCxxFieldGEP(dsIt->second, resultSlot, i, "fld");
+            }
             if (IsForeignNontrivialCxxClass(f.TypeName))
             {
-                auto* sourceSlot = AllocaAtEntry(structTy->getElementType(element), nullptr, "fldsrc");
-                builder->CreateStore(
-                    builder->CreateLoad(structTy->getElementType(element), fieldPtr), sourceSlot);
-                EmitCxxCopyOrMoveConstruct(f.TypeName, fieldPtr, sourceSlot,
-                                           /*useMove*/ false, "in synthesized struct copy");
+                EmitCxxCopyOrMoveConstruct(f.TypeName, fieldPtr, sourceFieldPtr,
+                    /*useMove*/ false,
+                    std::format("in synthesized copy of struct '{}', field '{}'",
+                                typeName, f.VariableName).c_str());
+                NoteUnwindPartial(UnwindPartialEntry::Kind::Slot, fieldPtr, f.TypeName);
+                continue;
+            }
+            if (IsLoweredCFlatOnlyStruct(f.TypeName))
+            {
+                if (!EmitLoweredMemberwiseCopy(f.TypeName, fieldTy, fieldPtr, sourceFieldPtr,
+                                               "in synthesized copy of nested field"))
+                    continue;
                 NoteUnwindPartial(UnwindPartialEntry::Kind::Slot, fieldPtr, f.TypeName);
                 continue;
             }
             NamedVariable argNV;
-            argNV.Storage  = fieldPtr;
-            argNV.BaseType = structTy->getElementType(element);
+            argNV.Storage  = sourceFieldPtr;
+            argNV.BaseType = fieldTy;
             argNV.TypeAndValue.TypeName = f.TypeName;
             if (auto* copied = CreateOverloadedFunctionCall("copy", { argNV }))
             {

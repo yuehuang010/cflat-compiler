@@ -17,22 +17,8 @@ int pair_view<T>(T[] a, T[] b)
     return a[0] + b[0];
 }
 
-// A plain struct holding a non-trivially-relocatable C++ field: a prvalue into a by-value
-// parameter still needs an addressable source for the member-wise copy.
-struct ListHolderArg
-{
-    std.list<int> values = default;
-    int tag = 7;
-};
-ListHolderArg make_list_holder_arg() { return ListHolderArg(); }
-int use_list_holder_arg(ListHolderArg h) { return h.tag; }
-
 extern int main()
 {
-    expect_error("cannot pass C++ class 'ListHolderArg' by value to parameter 'h' of 'use_list_holder_arg': the argument must be a variable")
-    {
-        use_list_holder_arg(make_list_holder_arg());
-    }
     expect_error("contiguous view decay requires public data() and size(); data() must return exactly 'int*' or 'const int*'")
     {
         std.list<int> values = default;

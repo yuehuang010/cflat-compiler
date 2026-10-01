@@ -2481,6 +2481,7 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
 
     // C++ definitions Clang emitted for imported headers join the module BEFORE verification and
     // optimization, so they are optimized (and inlined) with the rest of the program.
+    if (!LinkCInlineDemandBodies()) return false;
     if (!LinkCxxCompanionModules()) return false;
     // The C++ bodies are in the module now: answer the `this`-escape gates left false.
     ResolveCxxThisEscapeGates();
@@ -4650,6 +4651,7 @@ void LLVMBackend::ResetForReanalysis()
     cxxProgramEhGuardAttempted_ = false;
     cxxImportGroups_.clear();
     tuParseCounts_.clear();
+    cInlineBodyRequests_.clear();
     cxxIncrementalGroups_.clear();
     cxxDemandGroups_.clear();
     cxxBodyChecks_.clear();

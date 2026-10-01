@@ -14,6 +14,13 @@
 
 namespace cppinl
 {
+    struct SharedConst
+    {
+        int value;
+        constexpr SharedConst(int v) : value(v) {}
+    };
+    constexpr SharedConst shared_const{37};
+
     inline int helper(int v) noexcept { return v * 3; }
     // Calls another inline function: proves the callee is emitted transitively, not just the
     // declaration cflat asked for by name.

@@ -294,6 +294,16 @@ import "list.cb";
 import "string.cb";
 import "tuple.cb";
 
+int g_userAtollCalls = 0;
+extern i64 atoll(const char* s) { g_userAtollCalls++; return 777; }
+bool userLibcAtollWins()
+{
+    g_userAtollCalls = 0;
+    string input = "42";
+    i64 value = input.toLong();
+    return value == 777 && g_userAtollCalls == 1;
+}
+
 // Unsigned-literal regression support: field defaults, a global, and an indirect callee.
 struct UDefaults { u64 wide = 4294967295u; double asDouble = 4294967295u; };
 UDefaults g_unsignedDefaults = default;
@@ -1033,7 +1043,7 @@ extern int main()
         && signednessPassed == 38 && autoNarrowPassed == 4 && joinAcceptPassed == 5
         && narrowPromoPassed == 46 && i128Passed == 29
         && reversedPassed == 3 && sizeofUnevalPassed == 67
-        && boolFpPassed == 20) ? 0 : 1;
+        && boolFpPassed == 20 && userLibcAtollWins()) ? 0 : 1;
 }
 
 // C integer promotion for equal-width sub-int operands, plus the two literal-unsignedness

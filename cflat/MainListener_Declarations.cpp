@@ -4703,10 +4703,14 @@ cxx_dtor_ready:
                     compiler->SetCurrentDebugLocation(line);
                     const bool implicitLastUse = IsLastUseOfForeignCxxParam(
                         compiler, assign, *srcNV);
-                    compiler->EmitCxxCopyOrMoveConstruct(typeName, slot, srcNV->Storage,
-                                                         implicitLastUse,
-                                                         std::format("into local '{}'", name).c_str(),
-                                                         declType.DiagnosticTypeName);
+                    if (!implicitLastUse && compiler->IsLoweredCFlatOnlyStruct(typeName))
+                        compiler->EmitLoweredMemberwiseCopy(typeName,
+                            compiler->GetType(LLVMBackend::TypeAndValue{ .TypeName = typeName }),
+                            slot, srcNV->Storage, std::format("into local '{}'", name).c_str());
+                    else
+                        compiler->EmitCxxCopyOrMoveConstruct(typeName, slot, srcNV->Storage,
+                            implicitLastUse, std::format("into local '{}'", name).c_str(),
+                            declType.DiagnosticTypeName);
                     if (implicitLastUse) compiler->MarkVariableMoved(srcText);
                     return true;
                 }
@@ -5406,6 +5410,67 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                 !global_scope && IsFunctionBodyDeclaration(declSpec));
             return ParseDeclarationSpecifiers(declSpec);
         }();
+        auto validateDefaultCxxFields = [&](const LLVMBackend::DeclTypeAndValue& value,
+                                            antlr4::ParserRuleContext* at,
+                                            CFlatParser::InitializerListContext* explicitFields = nullptr) {
+            if (global_scope || value.Pointer || value.ConstArraySize != 0
+                || compiler->IsCxxRecord(value.TypeName)
+                || compiler->GetFunction(value.TypeName) == nullptr)
+                return;
+            auto validateFields = [&](auto&& self, const std::string& structName,
+                                      CFlatParser::InitializerListContext* suppliedFields) -> void
+            {
+                const auto fields = compiler->GetDataStructure(structName).StructFields;
+                const auto supplied = suppliedFields != nullptr
+                    ? suppliedFields->fieldInit()
+                    : std::vector<CFlatParser::FieldInitContext*>();
+                for (size_t fieldIndex = 0; fieldIndex < fields.size(); ++fieldIndex)
+                {
+                    const auto& field = fields[fieldIndex];
+                    bool explicitlyInitialized = false;
+                    if (suppliedFields != nullptr)
+                    {
+                        for (auto* init : supplied)
+                            if (init->Identifier() != nullptr
+                                && init->Identifier()->getText() == field.VariableName)
+                                explicitlyInitialized = true;
+                        if (!explicitlyInitialized && !supplied.empty()
+                            && supplied.front()->Identifier() == nullptr
+                            && fieldIndex < supplied.size())
+                            explicitlyInitialized = true;
+                    }
+                    if (explicitlyInitialized || field.Pointer
+                        || FieldDefaultBraceList(field) != nullptr
+                        || (field.Initializer != nullptr
+                            && field.Initializer->Default() == nullptr))
+                        continue;
+                    if (compiler->IsCxxRecord(field.TypeName))
+                    {
+                        auto* fieldType = compiler->GetType(field);
+                        if (field.ConstArraySize != 0 || fieldType == nullptr
+                            || fieldType->isArrayTy() || !fieldType->isStructTy()
+                            || !(compiler->CxxElementNeedsDefaultConstruction(field.TypeName)
+                                || compiler->HasNonPublicCxxDefaultCtor(field.TypeName)))
+                            continue;
+                        std::string bindError;
+                        compiler->TryBindCxxImplicitDefaultCtor(field.TypeName, bindError);
+                        if (!bindError.empty()) LogErrorContext(at, bindError);
+                        if (compiler->FindCxxDefaultCtor(field.TypeName) == nullptr)
+                        {
+                            const auto* info = compiler->GetCxxClassInfo(field.TypeName);
+                            LogErrorContext(at, compiler->LocalizeMessage(
+                                "C++ class '{}' has no default constructor cflat can call{}",
+                                { compiler->DisplayCxxClassName(field.TypeName),
+                                  info != nullptr && info->hasDeletedDefaultCtor
+                                      ? " (it is deleted)" : "" }));
+                        }
+                    }
+                    else if (compiler->GetFunction(field.TypeName) != nullptr)
+                        self(self, field.TypeName, nullptr);
+                }
+            };
+            validateFields(validateFields, value.TypeName, explicitFields);
+        };
         if (DeclSpecHasConst(declSpec) && !typeAndValue.Pointer
             && compiler->IsCxxRecord(typeAndValue.TypeName))
             typeAndValue.IsCxxConstRef = true;
@@ -7230,6 +7295,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                     }
                     else if (initializer->Default() != nullptr)
                     {
+                        validateDefaultCxxFields(typeAndValue, initializer);
                         // `S[N] a = default;` must default-CONSTRUCT each element:
                         // GenerateDefaultValue hands back a zeroinitializer for the whole ARRAY
                         // type, skipping every field initializer the element declares.
@@ -7272,7 +7338,12 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                         // to match nothing, leaving 'right' null and the target never written
                         // ('int x = {}' read undef). The bare-brace arm below has always gated on
                         // the token, which is why 'T x {}' seeded correctly.
+                        compiler->lastLoweredRetTemp_ = nullptr;
+                        compiler->lastLoweredRetValue_ = nullptr;
+                        validateDefaultCxxFields(typeAndValue, initializer,
+                                                  initializer->initializerList());
                         right = GenerateDefaultValue(typeAndValue);
+                        adoptDefaultCxxRetTemp();
                     }
                 }
                 else if (barebraceInit)
@@ -7288,7 +7359,12 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                     // discarding the brace values as a bare declaration with no initializer would
                     // (silently at local scope; with a non-blocking "not initialized on the stack"
                     // note but still no real diagnostic at global scope).
+                    compiler->lastLoweredRetTemp_ = nullptr;
+                    compiler->lastLoweredRetValue_ = nullptr;
+                    validateDefaultCxxFields(typeAndValue, direct,
+                        barebraceList);
                     right = GenerateDefaultValue(typeAndValue);
+                    adoptDefaultCxxRetTemp();
                 }
 
                 if (globalInitTempFn != nullptr)
@@ -7345,6 +7421,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                         // note below is reserved for the cases that genuinely stay zeroed.
                         if (!global_scope && compiler->GetFunction(typeAndValue.TypeName))
                         {
+                            validateDefaultCxxFields(typeAndValue, direct);
                             compiler->lastLoweredRetTemp_ = nullptr;
                             right = compiler->CreateOverloadedFunctionCall(typeAndValue.TypeName, {});
                             adoptDefaultCxxRetTemp();
@@ -7960,6 +8037,26 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                         // null srcStorage). An INDIRECT lvalue source (field / deref / fixed-array
                         // element) takes the same decision - see srcIsIndirectOwningLvalue below.
                         bool didDeepCopyBorrowString = false;
+                        bool loweredCopyInitInPlace = false;
+                        // `T x = move y;` of a lowered struct: restore the bytes the move zeroed and
+                        // move-construct the C++ fields; y stays a live moved-from object.
+                        if (srcIsMove && srcStorage == nullptr && srcUnionFieldType == nullptr
+                            && right != nullptr && right->getType()->isStructTy()
+                            && srcInferredTypeName == typeAndValue.TypeName && !srcInferredPointer
+                            && compiler->IsLoweredCFlatOnlyStruct(typeAndValue.TypeName))
+                            if (auto* loaded = llvm::dyn_cast<llvm::LoadInst>(right))
+                            {
+                                auto* source = loaded->getPointerOperand();
+                                compiler->builder->CreateStore(right, source);
+                                const std::string movedName =
+                                    compiler->FindVariableNameByStorage(source);
+                                if (!movedName.empty())
+                                    compiler->MarkVariableNotExplicitlyMovedNull(movedName);
+                                loweredCopyInitInPlace = compiler->EmitLoweredMemberwiseMove(
+                                    typeAndValue.TypeName, right->getType(), alloc, source,
+                                    "in move initialization");
+                                if (!loweredCopyInitInPlace) return allocList;
+                            }
                         auto* srcInitGep = llvm::dyn_cast_or_null<llvm::GetElementPtrInst>(srcStorage);
                         bool srcIsNamedSlot = srcStorage != nullptr
                             && (llvm::isa<llvm::AllocaInst>(srcStorage)
@@ -8013,6 +8110,39 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                             }
                             else
                             {
+                                // Lowered aggregates still follow the ordinary owner decision:
+                                // a real copy() wins, unsafe synthesized copies are refused, and
+                                // non-copyable owners are moved member-wise.
+                                if (compiler->IsLoweredCFlatOnlyStruct(typeAndValue.TypeName)
+                                    && srcStorage != nullptr && srcUnionFieldType == nullptr)
+                                {
+                                    if (!compiler->IsCopyableType(typeAndValue.TypeName))
+                                    {
+                                        loweredCopyInitInPlace = compiler->EmitLoweredMemberwiseMove(
+                                            typeAndValue.TypeName, right->getType(), alloc, srcStorage,
+                                            "in move initialization");
+                                        if (!loweredCopyInitInPlace) return allocList;
+                                        if (srcIsNamedSlot) compiler->MarkVariableMoved(srcCallerName);
+                                    }
+                                    else if (compiler->HasCopyOverloadFor(typeAndValue.TypeName))
+                                    {
+                                        LLVMBackend::NamedVariable copySource;
+                                        copySource.Storage = srcStorage;
+                                        copySource.BaseType = right->getType();
+                                        copySource.TypeAndValue.TypeName = typeAndValue.TypeName;
+                                        right = compiler->CreateOverloadedFunctionCall("copy", { copySource });
+                                        if (right == nullptr) return allocList;
+                                    }
+                                    else
+                                    {
+                                        loweredCopyInitInPlace = compiler->EmitLoweredMemberwiseCopy(
+                                            typeAndValue.TypeName, right->getType(), alloc, srcStorage,
+                                            "in synthesized copy initialization");
+                                        if (!loweredCopyInitInPlace) return allocList;
+                                    }
+                                }
+                                else
+                                {
                                 // THE FLIP via the shared decision: a copyable owner COPIES (source
                                 // stays LIVE), a non-copyable owner MOVES. A Move here transfers a's
                                 // loaded {fields} into b (the CreateAssignment below), so ZERO a's
@@ -8046,6 +8176,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                 // moved-in local owns its buffer, so mark it owning.
                                 if (typeAndValue.TypeName == "string")
                                     compiler->GetOrCreateStackVariable(name).IsOwningString = true;
+                                }
                             }
                         }
                         // String BORROW bound to an owning local via a DIRECT read of an owning string
@@ -8255,7 +8386,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                             if (haveInitializerSourceNV)
                                 compiler->RejectImplicitIntegerPointeePointerConversion(
                                     initializerSourceNV.TypeAndValue, typeAndValue);
-                            auto* initStore = movedCxxReturn
+                            auto* initStore = (movedCxxReturn || loweredCopyInitInPlace)
                                 ? nullptr : compiler->CreateAssignment(right, alloc, srcIsUnsigned);
                             if (movedOwningStruct)
                             {
@@ -10226,6 +10357,96 @@ void MainListener::CopyWrittenCopyableParams(CFlatParser::FunctionDefinitionCont
     }
 }
 
+/*
+ * Construct a lowered struct (a C++ field that is not trivially relocatable) into raw storage from
+ * the source's ADDRESS, never as a bitwise relocation. A prvalue (sret temporary) or a move
+ * move-constructs; a move out of an element or field also destroys the moved-from source, since
+ * its container releases that storage without running destructors. A copy runs a user copy().
+ */
+bool MainListener::EmitLoweredValueIntoSlot(LLVMBackend* compiler, const std::string& typeName,
+        llvm::Value* slot, LLVMBackend::NamedVariable& sourceNV, llvm::Value* sourceValue,
+        antlr4::ParserRuleContext* ctx)
+{
+        auto* valueType = sourceValue->getType();
+        bool useMove = sourceNV.IsRvalue || sourceNV.IsExplicitMove || sourceNV.TypeAndValue.IsMove;
+        bool fromTemp = false;
+        bool movedDetached = false;
+        llvm::Value* source = sourceNV.Storage;
+        if (source == nullptr && sourceValue == compiler->lastLoweredRetValue_
+            && compiler->lastLoweredRetTemp_ != nullptr)
+        {
+            source = compiler->lastLoweredRetTemp_;
+            fromTemp = true;
+        }
+        if (source == nullptr)
+            if (auto* loaded = llvm::dyn_cast<llvm::LoadInst>(sourceValue))
+            {
+                source = loaded->getPointerOperand();
+                // `move x` zeroed the source after loading it: put the bytes back so the C++
+                // fields move out of their own storage.
+                if (sourceNV.IsExplicitMove || sourceNV.TypeAndValue.IsMove)
+                {
+                    compiler->builder->CreateStore(sourceValue, source);
+                    movedDetached = true;
+                }
+            }
+        if (source == nullptr)
+        {
+            LogErrorContext(ctx, std::format(
+                "cannot construct struct '{}' in place: the source is not addressable, and its C++ "
+                "fields must be copied or moved from their own storage", typeName));
+            return false;
+        }
+        if (!useMove && !fromTemp && !compiler->IsCopyableType(typeName))
+        {
+            useMove = true;
+            if (!sourceNV.CallerName.empty() && !sourceNV.IsElementAccess
+                && sourceNV.FieldName.empty())
+                compiler->MarkVariableMoved(sourceNV.CallerName);
+        }
+        else if (!useMove && !fromTemp && compiler->HasCopyOverloadFor(typeName))
+        {
+            LLVMBackend::NamedVariable copySource;
+            copySource.Storage = source;
+            copySource.BaseType = valueType;
+            copySource.TypeAndValue.TypeName = typeName;
+            auto* copied = compiler->CreateOverloadedFunctionCall("copy", { copySource });
+            if (copied == nullptr) return false;
+            if (copied != compiler->lastLoweredRetValue_ || compiler->lastLoweredRetTemp_ == nullptr)
+            {
+                LogErrorContext(ctx, std::format(
+                    "cannot construct struct '{}' in place: its copy() result has no storage to "
+                    "move the C++ fields from", typeName));
+                return false;
+            }
+            source = compiler->lastLoweredRetTemp_;
+            fromTemp = true;
+        }
+        if (fromTemp) useMove = true;
+        const bool built = useMove
+            ? compiler->EmitLoweredMemberwiseMove(typeName, valueType, slot, source,
+                                                  "into construct_at storage")
+            : compiler->EmitLoweredMemberwiseCopy(typeName, valueType, slot, source,
+                                                  "into construct_at storage");
+        if (!built) return false;
+        auto* dtor = compiler->GetOrCreateFullDestructor(typeName);
+        if (fromTemp)
+        {
+            if (dtor != nullptr) compiler->builder->CreateCall(dtor->getFunctionType(), dtor, { source });
+            return true;
+        }
+        if (!movedDetached) return true;
+        const std::string movedName = compiler->FindVariableNameByStorage(source);
+        if (!movedName.empty())
+        {
+            compiler->MarkVariableNotExplicitlyMovedNull(movedName);
+            return true;
+        }
+        if (dtor != nullptr) compiler->builder->CreateCall(dtor->getFunctionType(), dtor, { source });
+        compiler->builder->CreateStore(llvm::Constant::getNullValue(valueType), source);
+        return true;
+}
+
 llvm::Value* MainListener::EmitCopyableOwnerCopy(
         const LLVMBackend::NamedVariable& rightNV,
         llvm::Value* right,
@@ -10233,11 +10454,14 @@ llvm::Value* MainListener::EmitCopyableOwnerCopy(
         auto* compiler = Compiler(ctx);
         if (rightNV.TypeAndValue.TypeName == "string")
             return compiler->EmitOwnedStringDeepCopy(right);
-        // Pass the loaded by-value struct (Primary), not the source Storage: copy()/the memberwise
-        // synth take `self` BY VALUE. A fresh arg NV (value + type only, no CallerName) keeps
-        // overload resolution from being confused by the source's named-argument metadata.
+        // Lowered structs must retain the address of their live source object. Other value types
+        // keep the ordinary loaded-Primary copy path.
         LLVMBackend::NamedVariable srcNV;
-        srcNV.Primary  = right;
+        if (compiler->IsLoweredCFlatOnlyStruct(rightNV.TypeAndValue.TypeName)
+            && rightNV.Storage != nullptr)
+            srcNV.Storage = rightNV.Storage;
+        else
+            srcNV.Primary = right;
         srcNV.BaseType = right->getType();
         srcNV.TypeAndValue.TypeName = rightNV.TypeAndValue.TypeName;
         if (auto* copied = compiler->CreateOverloadedFunctionCall("copy", { srcNV }))

@@ -4270,6 +4270,7 @@ private:
     llvm::Value* GenerateDefaultValue(const LLVMBackend::DeclTypeAndValue& typeValue);
     bool EmitNontrivialCxxDefaultAt(llvm::Value* destination,
                                    const LLVMBackend::DeclTypeAndValue& typeValue);
+    bool HasUnavailableNestedCxxDefault(const std::string& typeName);
 
     // Constant value of a type's default construction, or nullptr when it is not constant.
     llvm::Constant* TryFoldGlobalDefaultConstruction(const LLVMBackend::DeclTypeAndValue& typeValue);
@@ -6491,6 +6492,11 @@ public:
         const LLVMBackend::TypeAndValue& selectedReturn,
         LLVMBackend::NamedVariable* assignmentResult,
         llvm::AllocaInst* slot = nullptr);
+
+    // Construct a lowered struct value into raw storage from its source address (construct_at).
+    bool EmitLoweredValueIntoSlot(LLVMBackend* compiler, const std::string& typeName,
+        llvm::Value* slot, LLVMBackend::NamedVariable& sourceNV, llvm::Value* sourceValue,
+        antlr4::ParserRuleContext* ctx);
 
     // Construct one foreign nontrivial C++ value into a fresh or replacement slot. This is
     // shared by scalar struct fields and fixed-array elements so their copy/move decisions agree.

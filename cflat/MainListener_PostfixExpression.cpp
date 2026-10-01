@@ -4004,6 +4004,22 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     ownedTempMark, "into construct_at storage", ctx);
                                 reviveDirectSlot();
                             }
+                            else if (!destType.Pointer
+                                && compiler->IsLoweredCFlatOnlyStruct(destType.TypeName)
+                                && sourceValue->getType()->isStructTy()
+                                && !sourceNV.TypeAndValue.Pointer
+                                && sourceNV.TypeAndValue.TypeName == destType.TypeName)
+                            {
+                                // A lowered struct is constructed in the slot from the source
+                                // ADDRESS: never a bitwise relocation of its C++ fields.
+                                if (!EmitLoweredValueIntoSlot(compiler, destType.TypeName,
+                                        slotValue, sourceNV, sourceValue, ctx))
+                                {
+                                    namedVar = {};
+                                    break;
+                                }
+                                reviveDirectSlot();
+                            }
                             else if (sourceValue->getType()->isStructTy()
                                 && (compiler->IsOwningValueType(destType.TypeName)
                                     || NamedVarIsString(sourceNV)))

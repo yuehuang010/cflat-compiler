@@ -427,6 +427,35 @@ namespace
         }
     };
 
+    struct IncrementalParseStateRestore
+    {
+        clang::Preprocessor& preprocessor;
+        clang::LangOptions& langOptions;
+        CountingDiagnosticConsumer& diagnostics;
+        bool incrementalExtensions;
+        std::function<void()> previousOnParseError;
+        bool restored = false;
+
+        IncrementalParseStateRestore(clang::Preprocessor& pp, clang::LangOptions& options,
+                                     CountingDiagnosticConsumer& consumer)
+            : preprocessor(pp), langOptions(options), diagnostics(consumer),
+              incrementalExtensions(options.IncrementalExtensions),
+              previousOnParseError(consumer.onParseError)
+        {
+        }
+
+        void Restore()
+        {
+            if (restored) return;
+            preprocessor.setTokenWatcher(nullptr);
+            diagnostics.onParseError = std::move(previousOnParseError);
+            langOptions.IncrementalExtensions = incrementalExtensions;
+            restored = true;
+        }
+
+        ~IncrementalParseStateRestore() { Restore(); }
+    };
+
     // Every header an #include named, and who named it. A header an include guard skips
     // still gets its edge, so a later chunk's includes reach what an earlier chunk parsed.
     struct IncludeGraph
@@ -1517,15 +1546,115 @@ std::unique_ptr<CxxIncrementalGroup> CxxIncrementalGroup::Create(
         }
         int headerBraceDepth = 0;
         const bool watchTokens = lazy.active || trackHeaderScope;
-        if (watchTokens)
+        IncrementalParseStateRestore parseState(pp, langOpts, diagnostics.consumer);
+        // Use standard parsing for namespace statements so they cannot leave Sema in a bad scope.
+        if (watchTokens || incrementalExtensions)
             pp.setTokenWatcher([&lazy, &pp, &headerBraceDepth, macroOut, trackHeaderScope,
+                                &langOpts, incrementalExtensions,
+                                namespaceBraceDepths = std::vector<int>{}, pendingNamespace = false,
+                                previousKind = clang::tok::unknown,
+                                expressionStatementDepth = -1, restoreAfterStatement = false,
                                 injectedHeaderClosers = false]
                                (const clang::Token& token) mutable {
                 if (lazy.active) lazy.Observe(token);
+                if (restoreAfterStatement)
+                {
+                    langOpts.IncrementalExtensions = incrementalExtensions;
+                    expressionStatementDepth = -1;
+                    restoreAfterStatement = false;
+                }
+                if (token.is(clang::tok::kw_namespace)) pendingNamespace = true;
+                if (token.is(clang::tok::l_brace))
+                {
+                    ++headerBraceDepth;
+                    if (pendingNamespace)
+                        namespaceBraceDepths.push_back(headerBraceDepth);
+                    if (pendingNamespace) pendingNamespace = false;
+                }
+                else if (token.is(clang::tok::r_brace))
+                {
+                    if (expressionStatementDepth == headerBraceDepth)
+                    {
+                        langOpts.IncrementalExtensions = incrementalExtensions;
+                        expressionStatementDepth = -1;
+                    }
+                    if (!namespaceBraceDepths.empty()
+                        && namespaceBraceDepths.back() == headerBraceDepth)
+                        namespaceBraceDepths.pop_back();
+                    --headerBraceDepth;
+                    if (expressionStatementDepth >= 0
+                        && headerBraceDepth <= expressionStatementDepth)
+                    {
+                        langOpts.IncrementalExtensions = incrementalExtensions;
+                        expressionStatementDepth = -1;
+                    }
+                }
+                else if (pendingNamespace
+                         && (token.is(clang::tok::semi) || token.is(clang::tok::equal)))
+                    pendingNamespace = false;
+                if (!namespaceBraceDepths.empty()
+                    && namespaceBraceDepths.back() == headerBraceDepth
+                    && expressionStatementDepth < 0
+                    && (previousKind == clang::tok::l_brace
+                        || previousKind == clang::tok::semi
+                        || previousKind == clang::tok::r_brace)
+                    && !pp.getSourceManager().isInSystemHeader(token.getLocation()))
+                {
+                    // System headers are well-formed C++; never toggle the extension inside them.
+                    bool expressionStart = token.is(clang::tok::numeric_constant)
+                        || token.is(clang::tok::string_literal)
+                        || token.is(clang::tok::char_constant)
+                        || token.is(clang::tok::plusplus)
+                        || token.is(clang::tok::minusminus)
+                        || token.is(clang::tok::l_paren)
+                        || token.is(clang::tok::exclaim)
+                        || token.is(clang::tok::tilde)
+                        || token.is(clang::tok::kw_true)
+                        || token.is(clang::tok::kw_false)
+                        || token.is(clang::tok::kw_nullptr)
+                        || token.is(clang::tok::kw_new)
+                        || token.is(clang::tok::kw_delete)
+                        || token.is(clang::tok::kw_throw)
+                        || token.is(clang::tok::kw_return)
+                        || token.is(clang::tok::kw_if)
+                        || token.is(clang::tok::kw_switch)
+                        || token.is(clang::tok::kw_for)
+                        || token.is(clang::tok::kw_while)
+                        || token.is(clang::tok::kw_do)
+                        || token.is(clang::tok::kw_try)
+                        || token.is(clang::tok::kw_goto);
+                    if (token.is(clang::tok::identifier) && token.getLocation().isFileID())
+                    {
+                        clang::SourceManager& sourceManager = pp.getSourceManager();
+                        const auto fileId = sourceManager.getFileID(token.getLocation());
+                        const auto buffer = sourceManager.getBufferData(fileId);
+                        const unsigned offset = sourceManager.getFileOffset(token.getLocation())
+                            + token.getLength();
+                        llvm::StringRef rest = buffer.drop_front(offset);
+                        while (!rest.empty()
+                               && (rest.front() == ' ' || rest.front() == '\t'
+                                   || rest.front() == '\r' || rest.front() == '\n'))
+                            rest = rest.drop_front();
+                        expressionStart = !rest.empty()
+                            && (rest.front() == '(' || rest.front() == '[' || rest.front() == '.'
+                                || rest.front() == '?' || rest.front() == '=' || rest.front() == '+'
+                                || rest.front() == '-'
+                                || rest.front() == '*' || rest.front() == '/' || rest.front() == '%'
+                                || rest.front() == '&' || rest.front() == '|'
+                                || rest.front() == '^');
+                    }
+                    if (expressionStart)
+                    {
+                        langOpts.IncrementalExtensions = false;
+                        expressionStatementDepth = headerBraceDepth;
+                    }
+                }
+                if (expressionStatementDepth == headerBraceDepth
+                    && token.is(clang::tok::semi))
+                    restoreAfterStatement = true;
+                previousKind = token.getKind();
                 if (!trackHeaderScope) return;
-                if (token.is(clang::tok::l_brace)) ++headerBraceDepth;
-                else if (token.is(clang::tok::r_brace)) --headerBraceDepth;
-                else if (!injectedHeaderClosers && headerBraceDepth != 0
+                if (!injectedHeaderClosers && headerBraceDepth != 0
                          && token.is(clang::tok::identifier)
                          && token.getIdentifierInfo() != nullptr
                          && token.getIdentifierInfo()->getName()
@@ -1555,12 +1684,10 @@ std::unique_ptr<CxxIncrementalGroup> CxxIncrementalGroup::Create(
             // non-incremental fallback never reaches a request parse; restored after Parse anyway.
             diagnostics.consumer.onParseError = [&] { langOpts.IncrementalExtensions = false; };
             auto parsed = impl->interpreter->Parse(headerSource);
-            diagnostics.consumer.onParseError = {};
-            langOpts.IncrementalExtensions = incrementalExtensions;
             return parsed;
         }();
+        parseState.Restore();
         if (stopMacroCollector) stopMacroCollector();
-        if (watchTokens) pp.setTokenWatcher(nullptr);
         if (lazy.active)
         {
             lazy.active = false;
@@ -2168,6 +2295,11 @@ bool CxxIncrementalGroup::ParseRequest(const cflat_cinterop::ExtractRequest& req
             merged.weakPromoteSymbols.insert(merged.weakPromoteSymbols.end(),
                                              out.weakPromoteSymbols.begin(),
                                              out.weakPromoteSymbols.end());
+            merged.weakPromotePerGroupSymbols.insert(merged.weakPromotePerGroupSymbols.end(),
+                out.weakPromotePerGroupSymbols.begin(), out.weakPromotePerGroupSymbols.end());
+            merged.localInlineAliases.insert(merged.localInlineAliases.end(),
+                                             out.localInlineAliases.begin(),
+                                             out.localInlineAliases.end());
             out = std::move(merged);
         }
     }

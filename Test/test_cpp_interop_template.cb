@@ -188,6 +188,8 @@ cppfop.FoldRef d5_return_temporary_fold(cppfop.FoldRef* a, cppfop.FoldRef* b,
 import cpp "library/cpp_interop_tpl.h";
 import cpp "library/cpp_interop_by_value.h";
 import cpp "library/cpp_interop_proxy.h";
+import cpp "library/cpp_interop_define_primary.h";
+import cpp "library/cpp_interop_define_special.h" define "CFLAT_DEFINE_SPECIAL";
 import cpp "vector";
 import cpp "tuple";
 import cpp "mutex";
@@ -524,6 +526,15 @@ extern int main()
     // One header-only pattern, two specializations. Nothing below exists as a symbol until
     // these declarations ask for it.
     cppt.box_int_reset();
+    {
+        cppd.Layout<int> primaryLayout = default;
+        primaryLayout.a = 13;
+        if (primaryLayout.a != 13) return 2638;
+        cppd.PointerLayout<int> primaryPointerLayout = default;
+        int pointedValue = 19;
+        primaryPointerLayout.a = &pointedValue;
+        if (*primaryPointerLayout.a != 19) return 2639;
+    }
     {
         cppt.Box<int> tplboxB = cppt.Box<int>(7);
         if (tplboxB.get() != 7)                      return 480;   // constructor taking T

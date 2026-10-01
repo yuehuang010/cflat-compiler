@@ -246,6 +246,8 @@ import cpp "library/cpp_interop_poly.cpp";
 // duplicate-definition (ODR merge) check.
 import cpp "library/cpp_interop_inline.h";
 import cpp "library/cpp_interop_inline_again.h";
+import cpp "library/cpp_inline_static_a.hpp";
+import cpp "library/cpp_inline_static_b.hpp";
 // The `T&` constructor-parameter checks lock a CFlat-owned std.mutex through std.lock_guard / std.unique_lock.
 import cpp "mutex";
 import cpp "library/cpp_interop_throw.h";
@@ -1357,6 +1359,12 @@ int W11OrderProbe(long x, int y) { return 1; }
 
 extern int main()
 {
+    if (cppinl.shared_const.value != 37) return 7890;
+    if (cpp_inline_static_a(0) != 10 || cpp_inline_static_b(0) != 20) return 7890;
+    if (cpp_inline_static_count_a() != 1 || cpp_inline_static_count_b() != 1) return 7890;
+    if (cpp_inline_const_table_a(2) != 3 || cpp_inline_const_table_b(2) != 9) return 7890;
+    // Same-named static f calling a different static g per header: never merged.
+    if (cpp_inline_static_fa(0) != 10 || cpp_inline_static_fb(0) != 20) return 7890;
     w1demand.Q<int> ctorBodyAccept = w1demand.Q<int>(2.5);
     if (ctorBodyAccept.v != 11) return 7890;
 
@@ -2674,6 +2682,9 @@ extern int main()
     // Inline free function, and one that calls another inline function: 5*3 + 5*3 = 30.
     if (cppinl.helper(5) != 15)                  return 460;
     if (cppinl.twice(5) != 30)                   return 461;
+    if (add3(1) != 4)                            return 478;
+    if (add4(1) != 5)                            return 479;
+    if (ADD5(1) != 6)                            return 480;
     // Static local inside an inline body: the guard variable and the slot are emitted too.
     if (cppinl.next_id() != 101)                 return 462;
     if (cppinl.next_id() != 102)                 return 463;

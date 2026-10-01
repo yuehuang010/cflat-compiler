@@ -312,4 +312,25 @@ namespace cpptw
         PrvalueTwinIterator begin() { return PrvalueTwinIterator(1, 3); }
         PrvalueTwinIterator end() { return PrvalueTwinIterator(3, 3); }
     };
+
+    // User copy constructor and destructor, clang's implicit copy assignment stays TRIVIAL (no
+    // operator= symbol exists): a CFlat struct holding one assigns the field by byte copy.
+    inline int& trivial_assign_copy_counter() { static int value = 0; return value; }
+    inline int& trivial_assign_dtor_counter() { static int value = 0; return value; }
+    inline int trivial_assign_copy_count() { return trivial_assign_copy_counter(); }
+    inline int trivial_assign_dtor_count() { return trivial_assign_dtor_counter(); }
+    class TrivialAssignTwin
+    {
+    public:
+        int field;
+        TrivialAssignTwin() : field(0) {}
+        explicit TrivialAssignTwin(int value) : field(value) {}
+        TrivialAssignTwin(const TrivialAssignTwin& other) : field(other.field)
+        {
+            ++trivial_assign_copy_counter();
+        }
+        ~TrivialAssignTwin() { ++trivial_assign_dtor_counter(); }
+        int value() const { return field; }
+        void set(int value) { field = value; }
+    };
 }

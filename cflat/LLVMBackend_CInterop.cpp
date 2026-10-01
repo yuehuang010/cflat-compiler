@@ -1,6 +1,8 @@
 #pragma warning(push)
 #pragma warning(disable: 4244 4267)
 #include <thread>
+#include <fstream>
+#include <iterator>
 #include <llvm/IR/IRBuilder.h>
 #include <llvm/IR/LLVMContext.h>
 #include <llvm/IR/Module.h>
@@ -13,6 +15,7 @@
 #include <llvm/Passes/PassBuilder.h>
 #include <llvm/Analysis/TargetLibraryInfo.h>
 #include <llvm/Transforms/Utils/Mem2Reg.h>
+#include <llvm/Transforms/Utils/Cloning.h>
 #include <llvm/Transforms/Scalar/SROA.h>
 #include <llvm/Transforms/InstCombine/InstCombine.h>
 #include <llvm/Transforms/Scalar/SimplifyCFG.h>
@@ -2512,6 +2515,15 @@ void LLVMBackend::RegisterCSignatures(const std::vector<CSigEntry>& sigs, const 
         std::unordered_map<std::string, std::string> stdFunctionClasses;
         for (const CSigEntry& e : *signatures)
         {
+            if (!e.isCxx && e.isInline && !e.name.empty() && !e.file.empty()
+                && !e.inlineHeaders.empty())
+            {
+                auto found = cInlineBodyRequests_.find(e.name);
+                if (found == cInlineBodyRequests_.end() || found->second.headers.empty())
+                    cInlineBodyRequests_[e.name] = CInlineBodyRequest{
+                        std::filesystem::path(e.file).lexically_normal().string(), e.name,
+                        e.inlineDefines, e.inlineHeaders, e.inlineHashFiles, e.isStaticInline};
+            }
             // CFlat [cpp] method helpers have C linkage but need their extracted free-function ABI.
             if (e.isCxx || e.name.starts_with("__cflat_ovr_")
                 || e.linkageName.starts_with("__cflat_ovr_")
@@ -3089,6 +3101,8 @@ bool LLVMBackend::MapRawSig(const cflat_cinterop::RawSig& r, CSigEntry& e)
         e.name     = r.name;
         e.linkageName = r.linkageName;
         e.isCxx = r.isCxx;
+        e.isInline = r.isInline;
+        e.isStaticInline = r.isStaticInline;
         e.abi   = r.abi;
         e.isNoexcept = r.isNoexcept;
         e.paramNames = r.paramNames;
@@ -4457,6 +4471,8 @@ void LLVMBackend::MapRawRecords(const cflat_cinterop::ExtractResult& raw, std::v
             rec.canonicalCtype = r.canonicalCtype;
             rec.hasTrivialDefaultCtor = r.hasTrivialDefaultCtor;
             rec.hasTrivialCopyCtor = r.hasTrivialCopyCtor;
+            rec.hasTrivialCopyAssign = r.hasTrivialCopyAssign;
+            rec.hasTrivialMoveAssign = r.hasTrivialMoveAssign;
             rec.hasTrivialDtor = r.hasTrivialDtor;
             rec.paramDestroyedInCallee = r.paramDestroyedInCallee;
             rec.hasDeletedDefaultCtor = r.hasDeletedDefaultCtor;
@@ -4597,6 +4613,8 @@ bool LLVMBackend::ExtractCHeaderClang(const std::vector<std::string>& headerPath
         if (cxxMode) cppInteropUsed_ = true;
         req.mainFileName   = cxxMode ? "cflat_hdr_stub.cpp" : "cflat_hdr_stub.c";
         req.source         = source;
+        req.cxxImportGroupKey = cxxMode && activeCxxRequestGroup_ != nullptr
+            ? CxxIncrementalGroupKey(*activeCxxRequestGroup_) : source;
         req.args           = cxxMode && activeCxxRequestGroup_ != nullptr
             ? BuildCxxRequestClangArgs(*activeCxxRequestGroup_)
             : BuildClangDriverArgs(primaryDir, extraDefines, /*errorRecovery*/ true, cxxMode);
@@ -4959,7 +4977,11 @@ bool LLVMBackend::ExtractCHeaderClang(const std::vector<std::string>& headerPath
                 if (requested && rs.isCxx && rs.abi.valid)
                     mappedRaw.bindRefusal.clear();
                 CSigEntry e;
-                if (MapRawSig(mappedRaw, e)) outSigs.push_back(std::move(e));
+                if (MapRawSig(mappedRaw, e))
+                {
+                    if (!e.isCxx && e.isInline) e.inlineDefines = extraDefines;
+                    outSigs.push_back(std::move(e));
+                }
             }
         }
 
@@ -6116,6 +6138,7 @@ bool LLVMBackend::ReplayCxxDemandChunks(const std::string& groupKey, std::string
             cflat_cinterop::ExtractRequest req;
             req.mainFileName = "cflat_cpp_demand_replay.cpp";
             req.cxxMode = true;
+            req.cxxImportGroupKey = CxxIncrementalGroupKey(groupIt->second);
             req.verbose = verbose;
             req.source = chunk.source;
             req.args = BuildCxxRequestClangArgs(groupIt->second);
@@ -6672,6 +6695,7 @@ std::string LLVMBackend::EnsureCxxRequestPch(const CxxRequestGroup& group,
                 req.mainFileName = "cflat_cpp_prologue.h";
                 req.source = includes;
                 req.cxxMode = true;
+                req.cxxImportGroupKey = CxxIncrementalGroupKey(group);
                 req.pchOutputPath = temp;
                 req.verbose = verbose;
                 req.args = pchArgs;
@@ -6710,6 +6734,7 @@ bool LLVMBackend::RunCxxTypeRequests(const CxxRequestGroup& group,
         cflat_cinterop::ExtractRequest req;
         req.mainFileName = "cflat_cpp_request.cpp";
         req.cxxMode = true;
+        req.cxxImportGroupKey = CxxIncrementalGroupKey(group);
         req.source = BuildCxxRequestIncludes(group) + prefixSource
                    + BuildCxxRequestMarkers(items, /*instantiateAll*/ !emitDefinitions)
                    + extraSource;
@@ -7023,6 +7048,8 @@ uint64_t LLVMBackend::CxxGroupHeaderHash(const CxxRequestGroup& group) const
         raw.canonicalCtype = cached.canonicalCtype;
         raw.hasTrivialDefaultCtor = cached.hasTrivialDefaultCtor;
         raw.hasTrivialCopyCtor = cached.hasTrivialCopyCtor;
+        raw.hasTrivialCopyAssign = cached.hasTrivialCopyAssign;
+        raw.hasTrivialMoveAssign = cached.hasTrivialMoveAssign;
         raw.hasTrivialDtor = cached.hasTrivialDtor;
         raw.paramDestroyedInCallee = cached.paramDestroyedInCallee;
         raw.hasDeletedDefaultCtor = cached.hasDeletedDefaultCtor;
@@ -8248,6 +8275,7 @@ bool LLVMBackend::RequestGeneratedCxxWrapperUncached(const CxxRequestGroup& grou
                                     / (wrapperName + ".cpp")).string();
                 req.source = BuildCxxRequestPrologue(group, {}, false) + wrapperSource;
                 req.cxxMode = true;
+                req.cxxImportGroupKey = CxxIncrementalGroupKey(group);
                 req.emitDefinitions = emit;
                 req.assumeInlineDefinitions = !emit;
                 req.skipFunctionBodies = false;
@@ -14145,6 +14173,20 @@ bool LLVMBackend::TryRequestCxxType(const std::string& baseName,
         if (!HasCxxImportGroup()) return false;
         if (typeArgs.empty() && GetGlobalVariableNV(cflatName).Storage != nullptr)
             return false;
+        if (!typeArgs.empty() && activeCxxRequestGroup_ == nullptr)
+        {
+            std::string cxxBase = baseName;
+            size_t pos = 0;
+            while ((pos = cxxBase.find('.', pos)) != std::string::npos)
+            { cxxBase.replace(pos, 1, "::"); pos += 2; }
+            if (auto owner = cxxTemplateOwnerGroup_.find(cxxBase);
+                owner != cxxTemplateOwnerGroup_.end()
+                && cxxCflatToCxxSpelling_.count(cflatName) != 0
+                && CxxTemplateDefineMismatch(cxxBase,
+                    cxxCflatToCxxSpelling_.at(cflatName),
+                    cflatName, owner->second, {}, error))
+                return false;
+        }
         // Bare names are C++ candidates only when a header published that global template name.
         const bool unqualifiedTemplateRequest = !typeArgs.empty()
             && baseName.find('.') == std::string::npos
@@ -14340,6 +14382,121 @@ bool LLVMBackend::DecodeCxxIncompleteTemplateError(const std::string& error,
         spelling = error.substr(marker.size(), split - marker.size());
         typeName = error.substr(split + 1);
         return !spelling.empty() && !typeName.empty();
+}
+
+bool LLVMBackend::CxxTemplateDefineMismatch(const std::string& cxxBase,
+                                           const std::string& spelling,
+                                           const std::string& cflatName,
+                                           size_t ownerGroup,
+                                           const std::vector<size_t>& deps,
+                                           std::string& error)
+{
+        if (ownerGroup >= cxxImportGroups_.size()) return false;
+        auto normalized = [](std::string name) {
+            size_t pos = 0;
+            while ((pos = name.find('.', pos)) != std::string::npos)
+            { name.replace(pos, 1, "::"); pos += 2; }
+            return name;
+        };
+        auto specializesName = [&](const CxxImportGroup& group) {
+            return std::any_of(group.specializedTemplates.begin(), group.specializedTemplates.end(),
+                [&](const std::string& entry) {
+                    const size_t first = entry.find('|');
+                    return normalized(entry.substr(0, first)) == cxxBase;
+                });
+        };
+        auto publishes = [&](const CxxImportGroup& group) {
+            return std::any_of(group.publishedNames.begin(), group.publishedNames.end(),
+                [&](const std::string& name) { return normalized(name) == cxxBase; });
+        };
+        const auto& owner = cxxImportGroups_[ownerGroup];
+        // Common path: no group with other defines, or nobody specializes this template.
+        if (std::none_of(cxxImportGroups_.begin(), cxxImportGroups_.end(),
+                [&](const CxxImportGroup& group) { return group.defines != owner.defines; })
+            || std::none_of(cxxImportGroups_.begin(), cxxImportGroups_.end(), specializesName))
+            return false;
+        bool ownerSpecialized = false;
+        size_t ownerLayoutGroup = ownerGroup;
+        for (size_t i = 0; i < cxxImportGroups_.size(); ++i)
+        {
+            if (cxxImportGroups_[i].defines != owner.defines || !publishes(cxxImportGroups_[i]))
+                continue;
+            if (specializesName(cxxImportGroups_[i]))
+            {
+                ownerSpecialized = true;
+                ownerLayoutGroup = i;
+                break;
+            }
+        }
+
+        auto describeGroup = [](const CxxImportGroup& group) {
+            std::string headers;
+            for (const std::string& header : group.headers)
+                headers += (headers.empty() ? "" : ", ") + std::filesystem::path(header).filename().string();
+            std::string defines;
+            for (const std::string& define : group.defines)
+                defines += (defines.empty() ? "" : ", ") + define;
+            return std::format("'{}' (defines: {})", headers.empty() ? "<unknown>" : headers,
+                               defines.empty() ? "none" : defines);
+        };
+
+        for (size_t i = 0; i < cxxImportGroups_.size(); ++i)
+        {
+            const auto& other = cxxImportGroups_[i];
+            if (other.defines == owner.defines || !publishes(other))
+                continue;
+            if (!ownerSpecialized && !specializesName(other)) continue;
+
+            auto requestLayout = [&](size_t primary, cflat_cinterop::RawRecord& record) {
+                std::vector<size_t> groupDeps = deps;
+                for (size_t group = 0; group < cxxImportGroups_.size(); ++group)
+                    if (cxxImportGroups_[group].defines == cxxImportGroups_[primary].defines
+                        && specializesName(cxxImportGroups_[group]))
+                        groupDeps.push_back(group);
+                CxxRequestGroup requestGroup = MakeCxxRequestGroup(primary, groupDeps);
+                CxxRequestItem item;
+                item.cflatName = cflatName;
+                item.cxxSpelling = spelling;
+                item.needDefinitions = false;
+                item.explicitInstantiation = false;
+                cflat_cinterop::ExtractResult raw;
+                std::string requestError;
+                if (requestGroup.headers.empty()
+                    || !RunCxxTypeRequests(requestGroup, { item }, {}, false, raw, requestError))
+                    return false;
+                auto found = std::find_if(raw.records.begin(), raw.records.end(),
+                    [&](const cflat_cinterop::RawRecord& candidate) {
+                        return candidate.name == cflatName;
+                    });
+                if (found == raw.records.end()) return false;
+                record = *found;
+                return true;
+            };
+            cflat_cinterop::RawRecord ownerRecord;
+            cflat_cinterop::RawRecord otherRecord;
+            if (!requestLayout(ownerLayoutGroup, ownerRecord) || !requestLayout(i, otherRecord))
+                continue;
+            auto sameLayout = [](const cflat_cinterop::RawRecord& left,
+                                 const cflat_cinterop::RawRecord& right) {
+                if (left.sizeBytes != right.sizeBytes || left.alignBytes != right.alignBytes
+                    || left.fields.size() != right.fields.size()) return false;
+                for (size_t field = 0; field < left.fields.size(); ++field)
+                    if (left.fields[field].offsetBytes != right.fields[field].offsetBytes
+                        || left.fields[field].sizeBytes != right.fields[field].sizeBytes
+                        || left.fields[field].alignBytes != right.fields[field].alignBytes
+                        || left.fields[field].bitOffset != right.fields[field].bitOffset
+                        || left.fields[field].ctype != right.fields[field].ctype)
+                        return false;
+                return true;
+            };
+            if (sameLayout(ownerRecord, otherRecord)) continue;
+            error = std::format("C++ template instantiation '{}' has different layouts across "
+                                "import groups {} and {}; using both violates the C++ ODR",
+                                spelling, describeGroup(cxxImportGroups_[ownerLayoutGroup]),
+                                describeGroup(other));
+            return true;
+        }
+        return false;
 }
 
 /*
@@ -14547,6 +14704,8 @@ bool LLVMBackend::RequestCxxTypeInOwningGroup(const std::string& cxxBase,
                 const bool specializesTemplate = std::any_of(
                     cxxImportGroups_[i].specializedTemplates.begin(),
                     cxxImportGroups_[i].specializedTemplates.end(), [&](std::string name) {
+                        if (size_t separator = name.find('|'); separator != std::string::npos)
+                            name.resize(separator);
                         size_t pos = 0;
                         while ((pos = name.find('.', pos)) != std::string::npos)
                         { name.replace(pos, 1, "::"); pos += 2; }
@@ -14555,6 +14714,9 @@ bool LLVMBackend::RequestCxxTypeInOwningGroup(const std::string& cxxBase,
                 if (specializesTemplate)
                     requestDeps.push_back(i);
             }
+            if (activeCxxRequestGroup_ == nullptr
+                && CxxTemplateDefineMismatch(cxxBase, spelling, cflatName, order[k], deps, error))
+                return false;
             CxxRequestGroup group = MakeCxxRequestGroup(order[k], requestDeps);
             if (group.headers.empty()) continue;
             llvm::TimeTraceScope groupScope("CxxRequestGroup", spelling + " -> " + group.label);
@@ -15040,8 +15202,16 @@ void LLVMBackend::CheckCxxNamespaceConflicts(const std::vector<CSigEntry>& sigs,
         }
         for (const auto& [alias, target] : classUsings)
             note(alias, { true, "alias", "class:" + target, "an alias of '" + target + "'", nullptr });
+        // A per-group static (__cflat_sv_<16 hex>_<mangled>) is the same declaration in every group.
+        auto globalIdentity = [](const std::string& linkage) {
+            constexpr std::string_view prefix = "__cflat_sv_";
+            constexpr size_t aliasLength = prefix.size() + 16 + 1;
+            if (linkage.size() > aliasLength && linkage.starts_with(prefix) && linkage[aliasLength - 1] == '_')
+                return linkage.substr(aliasLength);
+            return linkage;
+        };
         for (const CGlobalEntry& g : globals)
-            note(g.name, { false, "variable", g.linkageName, "a variable", nullptr });
+            note(g.name, { false, "variable", globalIdentity(g.linkageName), "a variable", nullptr });
         for (const CTypeAliasEntry& a : aliases)
         {
             if (!a.cxxSpecialization.empty() || a.isCxxAliasTemplate || a.target.empty()) continue;
@@ -17548,6 +17718,8 @@ void LLVMBackend::RegisterCxxClassMembers(const CRecordEntry& r, const std::stri
             }
             info.hasTrivialDefaultCtor = r.hasTrivialDefaultCtor;
             info.hasTrivialCopyCtor    = r.hasTrivialCopyCtor;
+            info.hasTrivialCopyAssign  = r.hasTrivialCopyAssign;
+            info.hasTrivialMoveAssign  = r.hasTrivialMoveAssign;
             info.hasTrivialDtor        = r.hasTrivialDtor;
             info.isTriviallyRelocatable = r.isTriviallyRelocatable;
             info.paramDestroyedInCallee = r.paramDestroyedInCallee;
@@ -20613,6 +20785,21 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
         }
         if (hit)
         {
+            if (!cppMode && std::ranges::any_of(hitSigs, [](const CSigEntry& sig) { return sig.isInline; }))
+            {
+                std::vector<std::string> hashFiles = hitDepPaths;
+                hashFiles.insert(hashFiles.end(), realPaths.begin(), realPaths.end());
+                std::sort(hashFiles.begin(), hashFiles.end());
+                hashFiles.erase(std::unique(hashFiles.begin(), hashFiles.end()), hashFiles.end());
+                auto sharedHashFiles = std::make_shared<const std::vector<std::string>>(std::move(hashFiles));
+                for (CSigEntry& sig : hitSigs)
+                    if (sig.isInline)
+                    {
+                        sig.inlineDefines = extraDefines;
+                        sig.inlineHeaders = realPaths;
+                        sig.inlineHashFiles = sharedHashFiles;
+                    }
+            }
             // A memory hit carries the storing analysis' mapped CFlat names; remap C++ signatures
             // on registration exactly like a disk hit does.
             for (CSigEntry& sig : hitSigs) sig.needsCxxRebind = sig.isCxx;
@@ -20768,6 +20955,23 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
                 }
                 else
                     { llvm::TimeTraceScope chrStep("CHR:RequestCxxSignatureTypes"); RequestCxxSignatureTypes(diskEntry.sigs); }
+                if (!cppMode && std::ranges::any_of(diskEntry.sigs,
+                                                    [](const CSigEntry& sig) { return sig.isInline; }))
+                {
+                    std::vector<std::string> hashFiles;
+                    for (const auto& dep : diskEntry.deps) hashFiles.push_back(dep.path);
+                    hashFiles.insert(hashFiles.end(), realPaths.begin(), realPaths.end());
+                    std::sort(hashFiles.begin(), hashFiles.end());
+                    hashFiles.erase(std::unique(hashFiles.begin(), hashFiles.end()), hashFiles.end());
+                    auto sharedHashFiles = std::make_shared<const std::vector<std::string>>(std::move(hashFiles));
+                    for (CSigEntry& sig : diskEntry.sigs)
+                        if (sig.isInline)
+                        {
+                            sig.inlineDefines = extraDefines;
+                            sig.inlineHeaders = realPaths;
+                            sig.inlineHashFiles = sharedHashFiles;
+                        }
+                }
                 { llvm::TimeTraceScope chrStep("CHR:RegisterCSignatures"); RegisterCSignatures(diskEntry.sigs, fileForLsp); }
                 { llvm::TimeTraceScope chrStep("CHR:RegisterCEnums"); RegisterCEnums(diskEntry.enums, fileForLsp, cppMode); }
                 { llvm::TimeTraceScope chrStep("CHR:RegisterCMacros"); RegisterCMacros(diskEntry.macros); }
@@ -20874,6 +21078,26 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
                     ReportUncompilableHeader(headerPaths, prereqMsg, cppMode);
                 }
                 return false;
+            }
+            // C inline demand inputs, computed once per group (never per signature, never C++:
+            // C++ inline bodies come from the companion module).
+            if (!cppMode && std::ranges::any_of(sigs, [](const CSigEntry& sig) { return sig.isInline; }))
+            {
+                std::vector<std::string> hashFiles = includes;
+                hashFiles.insert(hashFiles.end(), realPaths.begin(), realPaths.end());
+                std::erase_if(hashFiles, [](const std::string& path) {
+                    std::error_code ec;
+                    return !std::filesystem::is_regular_file(path, ec);
+                });
+                std::sort(hashFiles.begin(), hashFiles.end());
+                hashFiles.erase(std::unique(hashFiles.begin(), hashFiles.end()), hashFiles.end());
+                auto sharedHashFiles = std::make_shared<const std::vector<std::string>>(std::move(hashFiles));
+                for (auto& sig : sigs)
+                    if (sig.isInline)
+                    {
+                        sig.inlineHeaders = realPaths;
+                        sig.inlineHashFiles = sharedHashFiles;
+                    }
             }
         }
         if (cppMode) RememberCxxGroupReachableFiles(cxxGroupIndex, includes);
@@ -21044,6 +21268,232 @@ bool LLVMBackend::CxxConstantDefaultsFrom(const CxxClassInfo::Structor& st, size
                 return false;
         }
         return first < st.params.size();
+}
+
+bool LLVMBackend::LinkCInlineDemandBodies()
+{
+        /*
+         * A plain C99 inline the program calls follows clang for the target and opt level:
+         * MSVC C inline semantics emit the body (linkonce_odr); elsewhere clang -O0 emits nothing
+         * (an external definition must exist), clang -O1+ an available_externally copy. Either
+         * body becomes a private copy, so it links exactly as the inlined clang call would.
+         */
+        const bool msvcInline = module->getTargetTriple().isWindowsMSVCEnvironment();
+        std::set<std::string> processed;
+        std::set<std::string> directlyUsedPlainInline;
+        for (const auto& [name, request] : cInlineBodyRequests_)
+            if (!request.isStatic)
+                if (llvm::Function* function = module->getFunction(name);
+                    function != nullptr && !function->use_empty())
+                    directlyUsedPlainInline.insert(name);
+        const bool skipDirectPlainInline = !msvcInline && cOptLevel_ == 0;
+        while (true)
+        {
+            std::map<std::string, std::vector<CInlineBodyRequest>> byHeader;
+            for (const auto& [name, request] : cInlineBodyRequests_)
+            {
+                llvm::Function* function = module->getFunction(name);
+                if (processed.contains(name)
+                    || (skipDirectPlainInline && directlyUsedPlainInline.contains(name))
+                    || function == nullptr
+                    || !function->isDeclaration() || function->use_empty()) continue;
+                // Off MSVC a plain inline used only by address resolves to its external definition
+                // (C99, as clang), so it needs no body - and requesting one late would reparse.
+                if (!msvcInline && !request.isStatic
+                    && std::none_of(function->users().begin(), function->users().end(),
+                        [function](const llvm::User* user) {
+                            auto* call = llvm::dyn_cast<llvm::CallBase>(user);
+                            return call != nullptr && call->getCalledOperand() == function;
+                        }))
+                    continue;
+                std::string groupKey = request.header;
+                for (const auto& path : request.headers) groupKey += "\nH" + path;
+                for (const auto& define : request.defines) groupKey += "\nD" + define;
+                byHeader[groupKey].push_back(request);
+            }
+            if (byHeader.empty()) return true;
+
+            for (auto& [groupKey, functions] : byHeader)
+            {
+            (void)groupKey;
+            std::sort(functions.begin(), functions.end(), [](const auto& a, const auto& b) {
+                return a.name < b.name;
+            });
+            const std::string& header = functions.front().header;
+            const std::vector<std::string>& headers = functions.front().headers;
+            const std::string dir = std::filesystem::path(header).parent_path().string();
+            const std::vector<std::string>& extraDefines = functions.front().defines;
+            std::vector<std::string> args = BuildClangDriverArgs(dir, extraDefines, true, false);
+            uint64_t keyHash = 14695981039346656037ULL;
+            auto fold = [&keyHash](std::string_view value) {
+                for (unsigned char c : value) { keyHash ^= c; keyHash *= 1099511628211ULL; }
+                keyHash ^= '|'; keyHash *= 1099511628211ULL;
+            };
+            fold("c-inline-v9");
+            std::vector<std::string> hashFiles;
+            if (functions.front().hashFiles) hashFiles = *functions.front().hashFiles;
+            if (hashFiles.empty()) hashFiles.push_back(header);
+            for (const auto& path : hashFiles)
+            {
+                uint64_t contentHash = 0;
+                if (!HashFileFnv1a(path, contentHash))
+                {
+                    LogError("clang: cannot hash inline header dependency '" + path + "'");
+                    return false;
+                }
+                fold(path);
+                fold(std::to_string(contentHash));
+            }
+            for (const auto& arg : args) fold(arg);
+            std::vector<std::pair<std::string, bool>> wanted;
+            for (const auto& request : functions)
+            {
+                fold(request.name);
+                fold(request.isStatic ? "static" : "inline");
+                wanted.emplace_back(request.name, request.isStatic);
+            }
+
+            const std::string cacheDir = noCache_ ? std::string{} : GetCHeaderCacheDir();
+            std::string bitcode;
+            std::filesystem::path cachePath;
+            if (!cacheDir.empty())
+            {
+                cachePath = std::filesystem::path(cacheDir) / "c-inline"
+                    / (std::format("{:016x}.bc", keyHash));
+                std::ifstream in(cachePath, std::ios::binary);
+                if (in) bitcode.assign(std::istreambuf_iterator<char>(in), {});
+            }
+            if (bitcode.empty())
+            {
+                if (!CountTuParse("C inline bodies", groupKey, header, "demand body emission"))
+                    return false;
+                std::string error;
+                if (!cflat_cinterop::EmitCInlineBodies(args, headers, wanted, bitcode, error))
+                {
+                    if (!error.starts_with("clang: ")) error = "clang: " + error;
+                    LogError(error);
+                    return false;
+                }
+                if (!cachePath.empty())
+                {
+                    std::error_code ec;
+                    std::filesystem::create_directories(cachePath.parent_path(), ec);
+                    if (!ec)
+                    {
+                        std::ofstream out(cachePath, std::ios::binary | std::ios::trunc);
+                        if (out) out.write(bitcode.data(), static_cast<std::streamsize>(bitcode.size()));
+                    }
+                }
+            }
+            if (bitcode.empty())
+            {
+                LogError("clang: inline body compilation produced empty bitcode for '" + header + "'");
+                return false;
+            }
+            auto buffer = llvm::MemoryBuffer::getMemBufferCopy(bitcode, "cflat-c-inline-demand");
+            auto parsed = llvm::parseBitcodeFile(buffer->getMemBufferRef(), module->getContext());
+            if (!parsed)
+            {
+                LogError("clang: cannot read cached inline body bitcode for '" + header + "'");
+                return false;
+            }
+            (*parsed)->setDataLayout(module->getDataLayout());
+            std::map<std::string, std::string> localNames;
+            for (const auto& request : functions)
+            {
+                llvm::Function* body = (*parsed)->getFunction(request.name);
+                // No body (gnu_inline, not emitted): the program's declaration stays external.
+                if (body == nullptr || body->isDeclaration()) continue;
+                // An MSVC C inline (linkonce_odr, comdat) becomes a private copy like the rest:
+                // under its own name it collides on COFF with a strong or imported definition.
+                if (!request.isStatic && body->hasAvailableExternallyLinkage() && cOptLevel_ == 0
+                    && directlyUsedPlainInline.contains(request.name))
+                {
+                    body->deleteBody();
+                    continue;
+                }
+                uint64_t localHash = 14695981039346656037ULL;
+                for (unsigned char c : request.header)
+                    { localHash ^= c; localHash *= 1099511628211ULL; }
+                const std::string localName = std::format("__cflat_c_inline_{:016x}_{}",
+                    localHash, request.name);
+                // A plain inline is external: only direct calls take the private copy, its address
+                // stays the real symbol so it compares equal across TUs (C11 6.5.9). A static
+                // inline is this program's own copy, so every use moves.
+                auto isDirectCall = [](const llvm::Use& use) {
+                    const auto* call = llvm::dyn_cast<llvm::CallBase>(use.getUser());
+                    return call != nullptr && call->isCallee(&use);
+                };
+                auto redirect = [&](llvm::Function* from, llvm::Function* to) {
+                    if (request.isStatic) from->replaceAllUsesWith(to);
+                    else from->replaceUsesWithIf(to, isDirectCall);
+                };
+                bool programTakesAddress = false;
+                if (llvm::Function* declaration = module->getFunction(request.name))
+                {
+                    auto* localDeclaration = llvm::Function::Create(
+                        declaration->getFunctionType(), llvm::GlobalValue::ExternalLinkage,
+                        llvm::Twine(localName), module.get());
+                    localDeclaration->setCallingConv(declaration->getCallingConv());
+                    redirect(declaration, localDeclaration);
+                    if (declaration->use_empty() && declaration->isDeclaration())
+                        declaration->eraseFromParent();
+                    else programTakesAddress = !declaration->use_empty();
+                }
+                if (!request.isStatic)
+                {
+                    // Address uses inside the bodies bind the real symbol too.
+                    const bool msvcComdatBody = body->hasLinkOnceLinkage();
+                    auto* external = llvm::Function::Create(body->getFunctionType(),
+                        llvm::GlobalValue::ExternalLinkage, "", parsed->get());
+                    external->setCallingConv(body->getCallingConv());
+                    body->replaceUsesWithIf(external, [&](const llvm::Use& use) {
+                        return !isDirectCall(use);
+                    });
+                    body->setName(localName);
+                    if (external->use_empty() && !programTakesAddress)
+                        external->eraseFromParent();
+                    else if (!msvcComdatBody)
+                        external->setName(request.name);
+                    else
+                    {
+                        // MSVC C inline semantics: no TU holds an external definition, every TU
+                        // emits a linkonce_odr comdat copy and the linker keeps one, so the real
+                        // name stays that comdat body here too (clang-cl's shape) and the
+                        // address links and compares equal across TUs.
+                        llvm::ValueToValueMapTy valueMap;
+                        llvm::Function* comdatBody = llvm::CloneFunction(body, valueMap);
+                        external->replaceAllUsesWith(comdatBody);
+                        external->eraseFromParent();
+                        comdatBody->setName(request.name);
+                        comdatBody->setLinkage(llvm::GlobalValue::LinkOnceODRLinkage);
+                        comdatBody->setDLLStorageClass(llvm::GlobalValue::DefaultStorageClass);
+                        llvm::Comdat* comdat = (*parsed)->getOrInsertComdat(request.name);
+                        comdat->setSelectionKind(llvm::Comdat::Any);
+                        comdatBody->setComdat(comdat);
+                    }
+                }
+                body->setName(localName);
+                body->setLinkage(llvm::GlobalValue::ExternalLinkage);
+                body->setDLLStorageClass(llvm::GlobalValue::DefaultStorageClass);
+                body->setComdat(nullptr);
+                localNames.emplace(request.name, localName);
+            }
+            llvm::Linker linker(*module);
+            if (linker.linkInModule(std::move(*parsed)))
+            {
+                LogError("clang: cannot link inline bodies from '" + header + "'");
+                return false;
+            }
+            for (const auto& [name, localName] : localNames)
+            {
+                llvm::Function* body = module->getFunction(localName);
+                (void)name;
+                if (body != nullptr) body->setLinkage(llvm::GlobalValue::InternalLinkage);
+            }
+            for (const auto& request : functions) processed.insert(request.name);
+            }
+        }
 }
 
 llvm::Value* LLVMBackend::MaterializeCxxDefaultArgument(const cflat_cinterop::RawDefaultArg& def,
@@ -23033,6 +23483,282 @@ bool LLVMBackend::EmitLoweredMemberwiseMove(const std::string& typeName, llvm::T
         return true;
 }
 
+bool LLVMBackend::EmitLoweredMemberwiseCopy(const std::string& typeName, llvm::Type* valueType,
+                                            llvm::Value* dest, llvm::Value* src,
+                                            const char* context)
+{
+        if (dest == nullptr || src == nullptr || valueType == nullptr) return false;
+        if (IsForeignNontrivialCxxClass(typeName))
+            return EmitCxxCopyOrMoveConstruct(typeName, dest, src, false, context);
+        if (!IsLoweredCFlatOnlyStruct(typeName)) return false;
+        const auto data = GetDataStructure(typeName);
+        auto* structType = llvm::dyn_cast<llvm::StructType>(valueType);
+        if (structType == nullptr || data.StructType == nullptr) return false;
+
+        builder->CreateStore(llvm::Constant::getNullValue(valueType), dest);
+        UnwindPartialScope copiedFields(*this);
+        for (size_t i = 0; i < data.StructFields.size()
+             && i < structType->getNumElements(); ++i)
+        {
+            const auto& field = data.StructFields[i];
+            const unsigned element = CxxFieldElementIndex(data, i);
+            if (element == std::numeric_limits<unsigned>::max())
+            {
+                if (!IsForeignNontrivialCxxClass(field.TypeName)) continue;
+                auto* dstField = CreateCxxFieldGEP(data, dest, (unsigned)i);
+                auto* srcField = CreateCxxFieldGEP(data, src, (unsigned)i);
+                const std::string fieldContext = std::format(
+                    "in synthesized copy of struct '{}', field '{}'", typeName,
+                    field.VariableName);
+                if (!EmitCxxCopyOrMoveConstruct(field.TypeName, dstField, srcField, false,
+                                                fieldContext.c_str()))
+                    return false;
+                NoteUnwindPartial(UnwindPartialEntry::Kind::Slot, dstField, field.TypeName);
+                continue;
+            }
+
+            auto* fieldType = structType->getElementType(element);
+            auto* dstField = builder->CreateStructGEP(structType, dest, element);
+            auto* srcField = builder->CreateStructGEP(structType, src, element);
+            if (field.Pointer || field.ElemPointer || field.IsArrayView || field.IsSimd
+                || field.IsBitfield || field.IsPadding)
+            {
+                builder->CreateStore(builder->CreateLoad(fieldType, srcField), dstField);
+                continue;
+            }
+            if (field.ConstArraySize > 0)
+            {
+                auto* arrayType = llvm::dyn_cast<llvm::ArrayType>(fieldType);
+                if (arrayType == nullptr) return false;
+                auto* elemType = arrayType->getElementType();
+                for (uint64_t n = 0; n < arrayType->getNumElements(); ++n)
+                {
+                    UnwindPartialScope builtElements(*this);
+                    NoteUnwindArrayPrefix(dstField, elemType, builder->getInt64(n),
+                                          field.TypeName);
+                    llvm::Value* indices[] = { builder->getInt32(0), builder->getInt64(n) };
+                    auto* dstElem = builder->CreateInBoundsGEP(arrayType, dstField, indices);
+                    auto* srcElem = builder->CreateInBoundsGEP(arrayType, srcField, indices);
+                    const std::string fieldContext = std::format(
+                        "in synthesized copy of struct '{}', field '{}'", typeName,
+                        field.VariableName);
+                    if (IsForeignNontrivialCxxClass(field.TypeName))
+                    {
+                        if (!EmitCxxCopyOrMoveConstruct(field.TypeName, dstElem, srcElem,
+                                                         false, fieldContext.c_str()))
+                            return false;
+                    }
+                    else if (IsLoweredCFlatOnlyStruct(field.TypeName))
+                    {
+                        if (!EmitLoweredMemberwiseCopy(field.TypeName, elemType, dstElem,
+                                                       srcElem, fieldContext.c_str()))
+                            return false;
+                    }
+                    else if (HasCopyOverloadFor(field.TypeName)
+                             || IsOwningValueType(field.TypeName))
+                    {
+                        NamedVariable elem;
+                        elem.Storage = srcElem;
+                        elem.BaseType = elemType;
+                        elem.TypeAndValue.TypeName = field.TypeName;
+                        auto* copied = CreateOverloadedFunctionCall("copy", { elem });
+                        if (copied == nullptr) return false;
+                        builder->CreateStore(copied, dstElem);
+                    }
+                    else
+                        builder->CreateStore(builder->CreateLoad(elemType, srcElem), dstElem);
+                }
+                NoteUnwindArrayPrefix(dstField, elemType,
+                                      builder->getInt64(arrayType->getNumElements()),
+                                      field.TypeName);
+                continue;
+            }
+
+            const std::string fieldContext = std::format(
+                "in synthesized copy of struct '{}', field '{}'", typeName,
+                field.VariableName);
+            if (IsForeignNontrivialCxxClass(field.TypeName))
+            {
+                if (!EmitCxxCopyOrMoveConstruct(field.TypeName, dstField, srcField, false,
+                                                 fieldContext.c_str()))
+                    return false;
+                NoteUnwindPartial(UnwindPartialEntry::Kind::Slot, dstField, field.TypeName);
+            }
+            else if (IsLoweredCFlatOnlyStruct(field.TypeName))
+            {
+                if (!EmitLoweredMemberwiseCopy(field.TypeName, fieldType, dstField, srcField,
+                                               fieldContext.c_str()))
+                    return false;
+                NoteUnwindPartial(UnwindPartialEntry::Kind::Slot, dstField, field.TypeName);
+            }
+            else if (HasCopyOverloadFor(field.TypeName) || IsOwningValueType(field.TypeName))
+            {
+                NamedVariable source;
+                source.Storage = srcField;
+                source.BaseType = fieldType;
+                source.TypeAndValue.TypeName = field.TypeName;
+                auto* copied = CreateOverloadedFunctionCall("copy", { source });
+                if (copied == nullptr) return false;
+                builder->CreateStore(copied, dstField);
+                NoteUnwindPartial(UnwindPartialEntry::Kind::Slot, dstField, field.TypeName);
+            }
+            else
+                builder->CreateStore(builder->CreateLoad(fieldType, srcField), dstField);
+        }
+        copiedFields.Release();
+        return true;
+}
+
+/*
+ * Assignment into a live lowered struct, C++ style: each C++ field runs its own operator=, a
+ * nested lowered struct recurses, an owning CFlat value field drops its old value and takes a
+ * copy (or the moved value), plain fields copy bitwise. A struct with a user destructor or a
+ * `unique` field cannot be assigned field by field: the old value is destroyed and the new one
+ * constructed in place, skipped at runtime when the source is the destination itself.
+ */
+bool LLVMBackend::EmitLoweredMemberwiseAssign(const std::string& typeName, llvm::Type* valueType,
+        llvm::Value* dest, llvm::Value* src, bool useMove, const char* context)
+{
+        if (dest == nullptr || src == nullptr || valueType == nullptr) return false;
+        auto cxxAssign = [&](const std::string& cxxType, llvm::Value* dst, llvm::Value* from,
+                             const std::string& fieldName) -> bool {
+            EnsureCxxMemberProjected(cxxType, "operator=");
+            const CxxClassInfo* info = GetCxxClassInfo(cxxType);
+            const CxxClassInfo::Structor* op = nullptr;
+            if (info != nullptr)
+            {
+                const auto& overloads = useMove && !info->moveAssignOverloads.empty()
+                    ? info->moveAssignOverloads : info->copyAssignOverloads;
+                if (!overloads.empty()) op = &overloads.front();
+                if (op == nullptr)
+                {
+                    if (useMove && info->hasMoveAssign) op = &info->moveAssign;
+                    else if (info->hasCopyAssign) op = &info->copyAssign;
+                }
+            }
+            // Clang's implicit assignment is trivial and not deleted (no symbol): a byte copy,
+            // as EmitCxxCopyOrMoveConstruct byte-copies a trivial implicit copy constructor.
+            if (op == nullptr && info != nullptr
+                && (info->hasTrivialCopyAssign || (useMove && info->hasTrivialMoveAssign)))
+            {
+                auto* recordType = GetType(TypeAndValue{ .TypeName = cxxType });
+                if (recordType != nullptr && recordType->isSized())
+                {
+                    const auto& layout = module->getDataLayout();
+                    builder->CreateMemCpy(dst, layout.getABITypeAlign(recordType), from,
+                                          layout.getABITypeAlign(recordType),
+                                          layout.getTypeAllocSize(recordType));
+                    return true;
+                }
+            }
+            if (op == nullptr)
+            {
+                LogError(std::format("cannot {}-assign struct '{}': field '{}' of C++ class '{}' "
+                    "has no usable assignment operator", useMove ? "move" : "copy", typeName,
+                    fieldName, DisplayCxxClassName(cxxType)));
+                return false;
+            }
+            return EmitCxxStructorCall(cxxType, *op, dst, { from });
+        };
+        if (IsForeignNontrivialCxxClass(typeName)) return cxxAssign(typeName, dest, src, "");
+        auto* structType = llvm::dyn_cast<llvm::StructType>(valueType);
+        auto data = dataStructures.find(typeName);
+        if (structType == nullptr || data == dataStructures.end()) return false;
+        const auto& sd = data->second;
+
+        bool rebuild = sd.Destructor != nullptr;
+        for (const auto& field : sd.StructFields)
+            if (field.IsUnique && !field.IsAlias) rebuild = true;
+        if (rebuild)
+        {
+            auto* doRebuild = CreateBasicBlock("lowered.assign.rebuild");
+            auto* done = CreateBasicBlock("lowered.assign.done");
+            builder->CreateCondBr(builder->CreateICmpEQ(dest, src), done, doRebuild);
+            SwitchToBlock(doRebuild);
+            if (auto* dtor = GetOrCreateFullDestructor(typeName))
+                builder->CreateCall(dtor->getFunctionType(), dtor, { dest });
+            const bool built = useMove
+                ? EmitLoweredMemberwiseMove(typeName, valueType, dest, src, context)
+                : EmitLoweredMemberwiseCopy(typeName, valueType, dest, src, context);
+            if (!built) return false;
+            if (IsInsertBlockLive()) CreateJump(done);
+            SwitchToBlock(done);
+            return true;
+        }
+
+        // One slot of a field: a scalar field, or one element of a fixed-array field.
+        auto assignSlot = [&](const LLVMBackend::TypeAndValue& field, llvm::Type* slotType,
+                              llvm::Value* dst, llvm::Value* from) -> bool {
+            if (IsForeignNontrivialCxxClass(field.TypeName))
+                return cxxAssign(field.TypeName, dst, from, field.VariableName);
+            if (IsLoweredCFlatOnlyStruct(field.TypeName))
+                return EmitLoweredMemberwiseAssign(field.TypeName, slotType, dst, from, useMove,
+                                                   context);
+            llvm::Function* dtor = slotType->isStructTy() && IsDataStructure(field.TypeName)
+                ? GetOrCreateFullDestructor(field.TypeName) : nullptr;
+            if (dtor == nullptr)
+            {
+                builder->CreateStore(builder->CreateLoad(slotType, from), dst);
+                return true;
+            }
+            llvm::Value* value = nullptr;
+            if (useMove)
+            {
+                value = builder->CreateLoad(slotType, from);
+                builder->CreateStore(llvm::Constant::getNullValue(slotType), from);
+            }
+            else
+            {
+                NamedVariable source;
+                source.Storage = from;
+                source.BaseType = slotType;
+                source.TypeAndValue.TypeName = field.TypeName;
+                value = CreateOverloadedFunctionCall("copy", { source });
+                if (value == nullptr) return false;
+            }
+            builder->CreateCall(dtor->getFunctionType(), dtor, { dst });
+            builder->CreateStore(value, dst);
+            return true;
+        };
+
+        for (size_t i = 0; i < sd.StructFields.size(); ++i)
+        {
+            const auto& field = sd.StructFields[i];
+            const unsigned element = CxxFieldElementIndex(sd, (unsigned)i);
+            if (element == std::numeric_limits<unsigned>::max()
+                && !IsForeignNontrivialCxxClass(field.TypeName))
+                continue;
+            if (element != std::numeric_limits<unsigned>::max()
+                && element >= structType->getNumElements())
+                continue;
+            auto* fieldType = element == std::numeric_limits<unsigned>::max()
+                ? GetType(field) : structType->getElementType(element);
+            auto* dstField = CreateCxxFieldGEP(sd, dest, (unsigned)i);
+            auto* srcField = CreateCxxFieldGEP(sd, src, (unsigned)i);
+            if (field.Pointer || field.ElemPointer || field.IsArrayView || field.IsSimd
+                || field.IsBitfield || field.IsPadding || field.IsAlias)
+            {
+                builder->CreateStore(builder->CreateLoad(fieldType, srcField), dstField);
+                continue;
+            }
+            if (auto* arrayType = llvm::dyn_cast<llvm::ArrayType>(fieldType);
+                arrayType != nullptr && field.ConstArraySize > 0)
+            {
+                for (uint64_t n = 0; n < arrayType->getNumElements(); ++n)
+                {
+                    llvm::Value* indices[] = { builder->getInt32(0), builder->getInt64(n) };
+                    if (!assignSlot(field, arrayType->getElementType(),
+                                    builder->CreateInBoundsGEP(arrayType, dstField, indices),
+                                    builder->CreateInBoundsGEP(arrayType, srcField, indices)))
+                        return false;
+                }
+                continue;
+            }
+            if (!assignSlot(field, fieldType, dstField, srcField)) return false;
+        }
+        return true;
+}
+
 bool LLVMBackend::EmitCxxCopyOrMoveConstruct(const std::string& typeName, llvm::Value* dest,
                                              llvm::Value* src, bool useMove, const char* context,
                                              const std::string& displayTypeName)
@@ -23073,7 +23799,7 @@ bool LLVMBackend::EmitCxxCopyOrMoveConstruct(const std::string& typeName, llvm::
                     "relocatable, and member-wise {} of such a struct is not supported - "
                     "pass or hold it by pointer instead",
                     useMove ? "move" : "copy",
-                    displayTypeName.empty() ? DisplayCxxClassName(typeName) : displayTypeName, context,
+                    displayTypeName.empty() ? typeName : displayTypeName, context,
                     useMove ? "move" : "copy"));
                 return false;
             }
@@ -23099,6 +23825,25 @@ bool LLVMBackend::EmitCxxByValueParamConstruct(const std::string& typeName, llvm
         if (!HasForeignNontrivialCxxField(typeName)) return false;
         if (!useMove)
         {
+            if (IsLoweredCFlatOnlyStruct(typeName))
+            {
+                auto* valueType = GetType(TypeAndValue{ .TypeName = typeName });
+                if (!IsCopyableType(typeName))
+                    return EmitLoweredMemberwiseMove(typeName, valueType, dest, src,
+                                                     "into a by-value parameter");
+                if (HasCopyOverloadFor(typeName))
+                {
+                    NamedVariable source;
+                    source.Storage = src;
+                    source.BaseType = valueType;
+                    source.TypeAndValue.TypeName = typeName;
+                    auto* copied = CreateOverloadedFunctionCall("copy", { source });
+                    if (copied == nullptr) return false;
+                    builder->CreateStore(copied, dest);
+                    return true;
+                }
+                return EmitLoweredMemberwiseCopy(typeName, valueType, dest, src, context);
+            }
             auto* copyFn = GetOrCreateMemberwiseCopy(typeName);
             if (copyFn == nullptr) return false;
             auto* copied = builder->CreateCall(copyFn,
@@ -23107,6 +23852,10 @@ bool LLVMBackend::EmitCxxByValueParamConstruct(const std::string& typeName, llvm
             builder->CreateStore(copied, dest);
             return true;
         }
+
+        if (IsLoweredCFlatOnlyStruct(typeName))
+            return EmitLoweredMemberwiseMove(typeName,
+                GetType(TypeAndValue{ .TypeName = typeName }), dest, src, context);
 
         auto* holderTy = GetType(TypeAndValue{ .TypeName = typeName });
         builder->CreateStore(builder->CreateLoad(holderTy, src), dest);

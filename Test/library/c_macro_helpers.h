@@ -3,6 +3,14 @@
 void c_p2i_take_int(int* value);
 void c_p2i_take_long(long* value);
 void c_p2i_take_ulong(unsigned long* value);
+static inline int add3(int x) { return x + 3; }
+inline int add4(int x) { return x + 4; }
+#define ADD5(x) (add3(x) + 2)
+/* A plain inline the program never names: only a static inline body takes its address, so the
+   body is reached only transitively and must still bind the real symbol (C11 6.5.9). */
+typedef int (*cb_int_fn)(int);
+inline int add6(int x) { return x + 6; }
+static inline cb_int_fn c_inline_sget_add6(void) { return add6; }
 
 /* Plain C bitfield layouts checked by test_c_interop.cb. */
 struct CBF_Zero

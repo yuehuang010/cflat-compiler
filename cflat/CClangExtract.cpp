@@ -33,6 +33,7 @@
 #include "clang/Basic/TargetInfo.h"
 #include "clang/CodeGen/CGFunctionInfo.h"
 #include "clang/CodeGen/CodeGenABITypes.h"
+#include "clang/CodeGen/CodeGenAction.h"
 #include "clang/CodeGen/ModuleBuilder.h"
 #include "clang/Basic/DiagnosticOptions.h"
 #include "clang/Basic/SourceManager.h"
@@ -58,6 +59,11 @@
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Type.h"
+#include "llvm/IR/Verifier.h"
+#include "llvm/IR/IRBuilder.h"
+#include "clang/Frontend/MultiplexConsumer.h"
+#include "llvm/Transforms/Utils/ModuleUtils.h"
+#include "llvm/Transforms/Utils/Cloning.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/raw_ostream.h"
 
@@ -305,6 +311,120 @@ namespace cflat_cinterop
 
     namespace
     {
+        /*
+         * Program-facing key of a C++ static inline: its ODR hash folded with internal functions
+         * and variables its body reaches. The ODR hash records names, not which static each refers
+         * to, so their source locations and import group must also contribute.
+         */
+        uint64_t StaticInlineBodyKey(const clang::FunctionDecl* root,
+                                     const std::string& importGroupKey)
+        {
+            auto mixText = [](uint64_t& key, const std::string& text) {
+                for (unsigned char c : text)
+                    key = (key ^ c) * 1099511628211ULL;
+                key = (key ^ 0xffu) * 1099511628211ULL;
+            };
+            struct Visitor : clang::RecursiveASTVisitor<Visitor>
+            {
+                std::vector<const clang::FunctionDecl*>& queue;
+                uint64_t& key;
+                decltype(mixText)& mix;
+                Visitor(std::vector<const clang::FunctionDecl*>& q, uint64_t& k,
+                        decltype(mixText)& m) : queue(q), key(k), mix(m) {}
+                bool VisitDeclRefExpr(clang::DeclRefExpr* e)
+                {
+                    if (const auto* f = llvm::dyn_cast<clang::FunctionDecl>(e->getDecl()))
+                        if (!f->hasExternalFormalLinkage()) queue.push_back(f);
+                    if (const auto* v = llvm::dyn_cast<clang::VarDecl>(e->getDecl()))
+                        if (v->isFileVarDecl() && !v->hasExternalFormalLinkage())
+                        {
+                            clang::SourceManager& sm = v->getASTContext().getSourceManager();
+                            const clang::PresumedLoc loc = sm.getPresumedLoc(
+                                sm.getExpansionLoc(v->getLocation()));
+                            if (loc.isValid())
+                            {
+                                mix(key, loc.getFilename());
+                                key = (key ^ loc.getLine()) * 1099511628211ULL;
+                                key = (key ^ loc.getColumn()) * 1099511628211ULL;
+                            }
+                            mix(key, v->getNameAsString());
+                        }
+                    return true;
+                }
+            };
+            uint64_t key = 14695981039346656037ULL;
+            mixText(key, importGroupKey);
+            std::set<const clang::FunctionDecl*> seen;
+            std::vector<const clang::FunctionDecl*> queue{root};
+            while (!queue.empty())
+            {
+                const clang::FunctionDecl* fd = queue.back();
+                queue.pop_back();
+                if (fd->getDefinition() != nullptr) fd = fd->getDefinition();
+                if (!seen.insert(fd).second) continue;
+                const unsigned odr = const_cast<clang::FunctionDecl*>(fd)->getODRHash();
+                for (int shift = 0; shift < 32; shift += 8)
+                    key = (key ^ ((odr >> shift) & 0xffu)) * 1099511628211ULL;
+                if (fd->hasBody())
+                {
+                    Visitor visitor(queue, key, mixText);
+                    visitor.TraverseStmt(fd->getBody());
+                }
+            }
+            return key;
+        }
+
+        std::string StaticCxxGlobalAlias(const std::string& importGroupKey,
+                                         const std::string& linkageName)
+        {
+            uint64_t key = 14695981039346656037ULL;
+            for (unsigned char c : importGroupKey)
+                key = (key ^ c) * 1099511628211ULL;
+            return std::format("__cflat_sv_{:016x}_{}", key, linkageName);
+        }
+
+        // Rename a per-group static; a COFF comdat keyed by the old name moves with it (with its
+        // associative members), since a comdat needs a leader symbol of its own name.
+        void RenamePerGroupGlobal(llvm::GlobalVariable* gv, const std::string& newName)
+        {
+            llvm::Comdat* old = gv->getComdat();
+            const std::string oldName = gv->getName().str();
+            gv->setName(newName);
+            if (old == nullptr || old->getName() != oldName) return;
+            llvm::Module& mod = *gv->getParent();
+            llvm::Comdat* renamed = mod.getOrInsertComdat(gv->getName());
+            renamed->setSelectionKind(old->getSelectionKind());
+            for (llvm::GlobalObject& go : mod.global_objects())
+                if (go.getComdat() == old) go.setComdat(renamed);
+        }
+
+        // A bindable entry for an internal function: the body and its in-module callers keep the
+        // internal copy, so this companion's static is never merged with another module's.
+        void AddStaticInlineProgramThunk(llvm::Module& mod, llvm::Function* fn,
+                                         const std::string& programName)
+        {
+            if (fn == nullptr || fn->isDeclaration() || mod.getNamedValue(programName) != nullptr)
+                return;
+            auto* thunk = llvm::Function::Create(fn->getFunctionType(),
+                                                 llvm::GlobalValue::WeakODRLinkage,
+                                                 programName, &mod);
+            thunk->setCallingConv(fn->getCallingConv());
+            thunk->setAttributes(fn->getAttributes());
+            thunk->setVisibility(llvm::GlobalValue::DefaultVisibility);
+            // COFF: a weak_odr definition in two objects is a duplicate unless it is in a comdat
+            // (clang always pairs them there). Mach-O has no comdats and merges weak_odr itself.
+            if (mod.getTargetTriple().supportsCOMDAT())
+                thunk->setComdat(mod.getOrInsertComdat(programName));
+            llvm::IRBuilder<> builder(llvm::BasicBlock::Create(mod.getContext(), "entry", thunk));
+            std::vector<llvm::Value*> callArgs;
+            for (llvm::Argument& arg : thunk->args()) callArgs.push_back(&arg);
+            llvm::CallInst* call = builder.CreateCall(fn, callArgs);
+            call->setCallingConv(fn->getCallingConv());
+            call->setAttributes(fn->getAttributes());
+            if (thunk->getReturnType()->isVoidTy()) builder.CreateRetVoid();
+            else builder.CreateRet(call);
+        }
+
         const char kProbePrefix[] = "__cflat_macro_";
 
         std::string CanonicalSpelling(const ASTContext& ctx, QualType qt)
@@ -1445,9 +1565,13 @@ namespace cflat_cinterop
                 // M0-M3 expose free functions. Methods, constructors and operators need the
                 // class ABI/lifetime machinery from M4; friend operators are the exception because
                 // they are free functions despite being declared inside the class.
-                // Not externally linkable. The linkage test also catches the out-of-line
-                // `inline` REDECLARATION of a `static inline` header function (simdjson's logger).
-                if (fd->getStorageClass() == SC_Static || !fd->hasExternalFormalLinkage()) return true;
+                // C/C++ static inline helpers are callable through a per-module definition.
+                // Keep ordinary internal functions hidden; the demand path handles these bodies.
+                const bool inlineFunction = fd->isInlined() || fd->isInlineSpecified();
+                const bool internalInline = inlineFunction
+                    && (fd->getStorageClass() == SC_Static || !fd->hasExternalFormalLinkage());
+                if ((fd->getStorageClass() == SC_Static || !fd->hasExternalFormalLinkage())
+                    && !internalInline) return true;
                 if (st.req.definitionsOnly && !fd->isThisDeclarationADefinition()) return true;
                 if (st.req.cxxMode && fd->getType()->isDependentType()) return true;
                 std::string file; int line = 1, col = 0;
@@ -1467,6 +1591,9 @@ namespace cflat_cinterop
                 sig.retType = CanonicalSpelling(ctx, fd->getReturnType());
                 sig.variadic = fd->isVariadic();
                 sig.isCxx = st.req.cxxMode;
+                sig.isInline = inlineFunction;
+                sig.isStaticInline = internalInline
+                    && fd->getStorageClass() == SC_Static;
                 sig.isNoexcept = !st.req.cxxMode
                     || fd->getExceptionSpecType() == EST_BasicNoexcept
                     || fd->getExceptionSpecType() == EST_NoexceptTrue
@@ -1491,6 +1618,15 @@ namespace cflat_cinterop
                           "so cflat cannot call it";
                 if (st.req.cxxMode && !fd->isVariadic() && sig.bindRefusal.empty())
                     st.abiWork.emplace_back(st.out.sigs.size(), fd);
+                // A C++ static inline is internal to each companion module, like clang's per-TU
+                // copy. The program binds a thunk under a body-keyed name (StaticInlineBodyKey).
+                if (st.req.cxxMode && internalInline && !sig.linkageName.empty())
+                {
+                    std::string programName = std::format("__cflat_sl_{:016x}_{}",
+                        StaticInlineBodyKey(fd, st.req.cxxImportGroupKey), sig.linkageName);
+                    st.out.localInlineAliases.emplace_back(sig.linkageName, programName);
+                    sig.linkageName = std::move(programName);
+                }
                 st.out.sigs.push_back(std::move(sig));
                 return true;
             }
@@ -1999,6 +2135,10 @@ namespace cflat_cinterop
                 rec.isAbstract = cxx->isAbstract();
                 rec.hasTrivialDefaultCtor = cxx->hasTrivialDefaultConstructor();
                 rec.hasTrivialCopyCtor = cxx->hasTrivialCopyConstructor();
+                rec.hasTrivialCopyAssign = cxx->hasSimpleCopyAssignment()
+                                        && cxx->hasTrivialCopyAssignment();
+                rec.hasTrivialMoveAssign = cxx->hasSimpleMoveAssignment()
+                                        && cxx->hasTrivialMoveAssignment();
                 rec.hasTrivialDtor = !cxx->hasNonTrivialDestructor();
                 rec.paramDestroyedInCallee = cxx->isParamDestroyedInCallee();
                 rec.hasDefaultCtor = cxx->hasDefaultConstructor();
@@ -3596,10 +3736,22 @@ namespace cflat_cinterop
                         || def->getDeclContext()->isDependentContext())
                     { skipVar("its type or initializer is dependent"); return true; }
                     if (st.req.RecordsDefinitionDemand()) st.varEmitWork.push_back(def);
-                    g.linkageName = CxxLinkageName(ctx, vd);
+                    const std::string originalLinkage = CxxLinkageName(ctx, vd);
+                    const bool internalStorage = !vd->hasExternalFormalLinkage()
+                        || vd->getStorageClass() == SC_Static;
+                    // Each import group owns its internal storage, constants included: two
+                    // groups' headers may give the same static different values.
+                    g.linkageName = internalStorage
+                        ? StaticCxxGlobalAlias(st.req.cxxImportGroupKey, originalLinkage)
+                        : originalLinkage;
+                    if (internalStorage && st.req.demandPlan != nullptr)
+                        st.req.demandPlan->renamed[g.linkageName] = originalLinkage;
                     // An internal-linkage definition is invisible outside the companion module.
-                    if (!vd->hasExternalFormalLinkage() || vd->getStorageClass() == SC_Static)
-                        st.out.weakPromoteSymbols.push_back(g.linkageName);
+                    if (internalStorage)
+                    {
+                        st.out.weakPromoteSymbols.push_back(originalLinkage);
+                        st.out.weakPromotePerGroupSymbols.push_back(originalLinkage);
+                    }
                 }
                 else
                 {
@@ -4997,6 +5149,7 @@ namespace cflat_cinterop
             };
             // A live group records CodeGen work for its one demand pass instead of emitting now.
             CxxDemandPlan* const plan = st.req.demandPlan;
+            if (plan != nullptr) plan->cxxImportGroupKey = st.req.cxxImportGroupKey;
             auto hand = [&](Decl* d) {
                 if (plan != nullptr) plan->Add(d);
                 else cg.HandleTopLevelDecl(DeclGroupRef(d));
@@ -5571,6 +5724,11 @@ namespace cflat_cinterop
                 plan->weakPromoteSymbols.insert(plan->weakPromoteSymbols.end(),
                                                 st.out.weakPromoteSymbols.begin(),
                                                 st.out.weakPromoteSymbols.end());
+                plan->weakPromotePerGroupSymbols.insert(plan->weakPromotePerGroupSymbols.end(),
+                    st.out.weakPromotePerGroupSymbols.begin(),
+                    st.out.weakPromotePerGroupSymbols.end());
+                for (const auto& [mangled, programName] : st.out.localInlineAliases)
+                    plan->renamed[programName] = mangled;
                 ++plan->recordedChunks;
                 st.out.demandRecorded = true;
                 return;
@@ -5593,10 +5751,20 @@ namespace cflat_cinterop
             {
                 llvm::GlobalVariable* gv = mod->getGlobalVariable(sym, /*AllowInternal*/ true);
                 if (gv == nullptr || gv->isDeclaration()) continue;
-                if (!gv->hasLocalLinkage()) continue;
-                gv->setLinkage(llvm::GlobalValue::WeakODRLinkage);
+                const bool perGroup = std::find(st.out.weakPromotePerGroupSymbols.begin(),
+                              st.out.weakPromotePerGroupSymbols.end(), sym)
+                    != st.out.weakPromotePerGroupSymbols.end();
+                if (!gv->hasLocalLinkage() && !perGroup) continue;
+                if (perGroup)
+                    RenamePerGroupGlobal(gv, StaticCxxGlobalAlias(st.req.cxxImportGroupKey, sym));
+                if (gv->hasLocalLinkage())
+                    gv->setLinkage(llvm::GlobalValue::WeakODRLinkage);
                 gv->setVisibility(llvm::GlobalValue::DefaultVisibility);
             }
+            for (const auto& [mangled, programName] : st.out.localInlineAliases)
+                if (llvm::Function* fn = mod->getFunction(mangled);
+                    fn != nullptr && fn->hasLocalLinkage())
+                    AddStaticInlineProgramThunk(*mod, fn, programName);
 
             unsigned defs = 0;
             for (const llvm::Function& f : mod->functions())
@@ -5700,6 +5868,7 @@ namespace cflat_cinterop
             st.out.namespaceAliases.clear();
             st.out.classUsings.clear();
             st.out.weakPromoteSymbols.clear();
+            st.out.weakPromotePerGroupSymbols.clear();
 
             st.emittedProbes.clear();
             st.emittedGlobals.clear();
@@ -5968,6 +6137,18 @@ namespace cflat_cinterop
                 // erases the symbol, so a companion module ends up with NO symbol for a class
                 // whose destructor cflat binds by name. Emit the forwarding body instead.
                 invocationUP->getCodeGenOpts().CXXCtorDtorAliases = false;
+                // Clang derives __OPTIMIZE__ / __NO_INLINE__ from the CodeGen level, so restore the
+                // harvest's -O0 macro view by hand: headers branch on them (fortify, extern inlines).
+                if (req.emitReferencedInlineDefinitions)
+                {
+                    if (invocationUP->getCodeGenOpts().OptimizationLevel == 0)
+                    {
+                        invocationUP->getPreprocessorOpts().addMacroUndef("__OPTIMIZE__");
+                        invocationUP->getPreprocessorOpts().addMacroDef("__NO_INLINE__=1");
+                    }
+                    invocationUP->getCodeGenOpts().OptimizationLevel = 1;
+                    invocationUP->getCodeGenOpts().DisableLLVMPasses = true;
+                }
                 invocation.reset(invocationUP.release());
             }
 
@@ -6001,7 +6182,175 @@ namespace cflat_cinterop
             if (outTargetFacts) outTargetFacts->firstError = prereqConsumer->firstError;
             return true;
         }
+
+        // Emits C inline bodies and records the gnu_inline functions (by IR name) along the way.
+        class CInlineBodyAction : public clang::EmitLLVMOnlyAction
+        {
+        public:
+            using clang::EmitLLVMOnlyAction::EmitLLVMOnlyAction;
+            std::set<std::string> gnuInline;
+
+        protected:
+            std::unique_ptr<clang::ASTConsumer> CreateASTConsumer(clang::CompilerInstance& ci,
+                                                                  llvm::StringRef file) override
+            {
+                struct Collector : clang::ASTConsumer
+                {
+                    std::set<std::string>& names;
+                    explicit Collector(std::set<std::string>& n) : names(n) {}
+                    bool HandleTopLevelDecl(clang::DeclGroupRef group) override
+                    {
+                        for (clang::Decl* d : group)
+                            if (const auto* fd = llvm::dyn_cast<clang::FunctionDecl>(d))
+                                if (fd->hasAttr<clang::GNUInlineAttr>()
+                                    || (fd->getASTContext().getLangOpts().GNUInline
+                                        && fd->isInlineSpecified()))
+                                {
+                                    names.insert(fd->getNameAsString());
+                                    if (const auto* label = fd->getAttr<clang::AsmLabelAttr>())
+                                        names.insert(label->getLabel().str());
+                                }
+                        return true;
+                    }
+                };
+                std::vector<std::unique_ptr<clang::ASTConsumer>> consumers;
+                consumers.push_back(std::make_unique<Collector>(gnuInline));
+                consumers.push_back(clang::EmitLLVMOnlyAction::CreateASTConsumer(ci, file));
+                return std::make_unique<clang::MultiplexConsumer>(std::move(consumers));
+            }
+        };
+
+        std::string SanitizeCInlineKeepName(const std::string& name)
+        {
+            std::string out = "__cflat_keep_";
+            for (unsigned char c : name)
+                out += (std::isalnum(c) || c == '_') ? static_cast<char>(c) : '_';
+            return out;
+        }
     } // namespace
+
+    bool EmitCInlineBodies(const std::vector<std::string>& args,
+                           const std::vector<std::string>& headers,
+                           const std::vector<std::pair<std::string, bool>>& functions,
+                           std::string& bitcode, std::string& err)
+    {
+        bitcode.clear();
+        if (headers.empty() || functions.empty()) return true;
+        std::string source;
+        for (const auto& header : headers)
+        {
+            std::string path = header;
+            std::replace(path.begin(), path.end(), '\\', '/');
+            source += "#include \"" + path + "\"\n";
+        }
+        // No extern redeclaration: a plain inline gets exactly what clang emits for the target
+        // (available_externally on Darwin/Linux, linkonce_odr under MSVC C inline semantics).
+        for (const auto& [name, isStatic] : functions)
+            source += "__attribute__((used)) static void* " + SanitizeCInlineKeepName(name)
+                + " = (void*)&" + name + ";\n";
+
+        ExtractRequest req;
+        req.mainFileName = "cflat_c_inline_demand.c";
+        req.args = args;
+        req.args.push_back("-x");
+        req.args.push_back("c");
+        req.emitReferencedInlineDefinitions = true;
+        llvm::LLVMContext context;
+        CInlineBodyAction action(&context);
+        if (!RunAction(req, source, action, err))
+        {
+            if (!err.starts_with("clang: ")) err = "clang: " + err;
+            return false;
+        }
+        std::unique_ptr<llvm::Module> module = action.takeModule();
+        if (!module) { err = "clang: inline body compilation produced no LLVM module"; return false; }
+        for (const auto& [name, isStatic] : functions)
+        {
+            llvm::Function* function = module->getFunction(name);
+            if (isStatic && (function == nullptr || function->isDeclaration()))
+            {
+                err = "clang: inline body '" + name + "' was not emitted";
+                return false;
+            }
+            if (isStatic) function->setLinkage(llvm::GlobalValue::ExternalLinkage);
+        }
+        /*
+         * An available_externally body is an inlining copy of a definition that lives elsewhere.
+         * A gnu_inline one (glibc fortify wrappers) or one calling its own symbol (an asm-label
+         * redirect to the real function) must stay a declaration: a private copy would recurse.
+         * Requested plain inlines keep their linkage for the caller's per-opt-level choice;
+         * every other one (reached only from a demanded body) becomes this module's private copy.
+         * So does an MSVC C inline (linkonce_odr, discardable): its real name could collide on
+         * COFF with a strong or imported definition. weak / weak_odr keep name and linkage.
+         * Only direct calls take the private copy: an address use inside a demanded body (the
+         * body returns or compares the function) must bind the real symbol so it compares equal
+         * across TUs (C11 6.5.9) - the external definition in some other TU, or under MSVC C
+         * inline semantics clang-cl's own linkonce_odr comdat body kept under its name.
+         */
+        std::set<std::string> requested;
+        for (const auto& [name, isStatic] : functions) requested.insert(name);
+        auto isDirectCall = [](const llvm::Use& use) {
+            const auto* call = llvm::dyn_cast<llvm::CallBase>(use.getUser());
+            return call != nullptr && call->isCallee(&use);
+        };
+        auto privatize = [&](llvm::Function& function, bool keepComdatBody) {
+            bool addressUse = false;
+            for (const llvm::Use& use : function.uses())
+                if (!isDirectCall(use)) addressUse = true;
+            llvm::Function* copy = &function;
+            if (addressUse)
+            {
+                llvm::ValueToValueMapTy valueMap;
+                copy = llvm::CloneFunction(&function, valueMap);
+                copy->setName(function.getName() + ".cflat_call");
+                function.replaceUsesWithIf(copy, isDirectCall);
+                if (!keepComdatBody) function.deleteBody();
+            }
+            copy->setLinkage(llvm::GlobalValue::InternalLinkage);
+            copy->setDLLStorageClass(llvm::GlobalValue::DefaultStorageClass);
+            copy->setComdat(nullptr);
+        };
+        std::vector<llvm::Function*> bodies;
+        for (llvm::Function& function : module->functions())
+            if (!function.isDeclaration()) bodies.push_back(&function);
+        for (llvm::Function* function : bodies)
+        {
+            if (function->hasLinkOnceLinkage() && !requested.contains(function->getName().str()))
+            {
+                privatize(*function, true);
+                continue;
+            }
+            if (!function->hasAvailableExternallyLinkage()) continue;
+            bool selfCall = false;
+            for (const llvm::User* user : function->users())
+                if (const auto* inst = llvm::dyn_cast<llvm::Instruction>(user))
+                    if (inst->getFunction() == function) selfCall = true;
+            if (selfCall || action.gnuInline.contains(function->getName().str()))
+                function->deleteBody();
+            else if (!requested.contains(function->getName().str()))
+                privatize(*function, false);
+        }
+        for (const auto& [name, isStatic] : functions)
+            if (llvm::GlobalVariable* keep =
+                module->getGlobalVariable(SanitizeCInlineKeepName(name), true))
+                {
+                    llvm::removeFromUsedLists(*module, [keep](llvm::Constant* value) {
+                        return value->stripPointerCasts() == keep;
+                    });
+                    keep->eraseFromParent();
+                }
+        std::string verifyText;
+        llvm::raw_string_ostream verifyStream(verifyText);
+        if (llvm::verifyModule(*module, &verifyStream))
+        {
+            err = "clang: invalid inline body module: " + verifyStream.str();
+            return false;
+        }
+        llvm::raw_string_ostream stream(bitcode);
+        llvm::WriteBitcodeToFile(*module, stream);
+        stream.flush();
+        return true;
+    }
 
     std::function<void()> AttachCxxMacroPrepass(clang::Preprocessor& pp,
                                                 const ExtractRequest& req,
@@ -6501,13 +6850,27 @@ namespace cflat_cinterop
                 // __digits_base_10) is known only once that body exists.
                 for (const llvm::GlobalVariable& gv : mod->globals())
                 {
-                    if (!gv.isDeclaration() || !gv.hasName() || gv.use_empty()) continue;
+                    if (!gv.hasName() || gv.use_empty()) continue;
                     const auto* var = llvm::dyn_cast_or_null<VarDecl>(
                         cg->GetDeclForMangledName(gv.getName()));
                     const VarDecl* definition = var != nullptr ? var->getDefinition() : nullptr;
-                    if (definition == nullptr || definition->isInvalidDecl()
-                        || plan.declSeen.count(definition) != 0)
-                        continue;
+                    if (definition == nullptr || definition->isInvalidDecl()) continue;
+                    // A static reached only from a late-parsed inline body was not visited by
+                    // HarvestCxxNamespaceVar; still give its emitted storage this import group's name.
+                    if (var->getDeclContext()->isFileContext()
+                        && !var->hasExternalFormalLinkage())
+                    {
+                        const std::string symbol = gv.getName().str();
+                        if (std::find(plan.weakPromoteSymbols.begin(),
+                                      plan.weakPromoteSymbols.end(), symbol)
+                            == plan.weakPromoteSymbols.end())
+                            plan.weakPromoteSymbols.push_back(symbol);
+                        if (std::find(plan.weakPromotePerGroupSymbols.begin(),
+                                      plan.weakPromotePerGroupSymbols.end(), symbol)
+                            == plan.weakPromotePerGroupSymbols.end())
+                            plan.weakPromotePerGroupSymbols.push_back(symbol);
+                    }
+                    if (!gv.isDeclaration() || plan.declSeen.count(definition) != 0) continue;
                     plan.Add(const_cast<VarDecl*>(definition));
                     grew = true;
                 }
@@ -6518,8 +6881,15 @@ namespace cflat_cinterop
             for (const std::string& sym : plan.weakPromoteSymbols)
             {
                 llvm::GlobalVariable* gv = mod->getGlobalVariable(sym, /*AllowInternal*/ true);
-                if (gv == nullptr || gv->isDeclaration() || !gv->hasLocalLinkage()) continue;
-                gv->setLinkage(llvm::GlobalValue::WeakODRLinkage);
+                if (gv == nullptr || gv->isDeclaration()) continue;
+                const bool perGroup = std::find(plan.weakPromotePerGroupSymbols.begin(),
+                              plan.weakPromotePerGroupSymbols.end(), sym)
+                    != plan.weakPromotePerGroupSymbols.end();
+                if (!gv->hasLocalLinkage() && !perGroup) continue;
+                if (perGroup)
+                    RenamePerGroupGlobal(gv, StaticCxxGlobalAlias(plan.cxxImportGroupKey, sym));
+                if (gv->hasLocalLinkage())
+                    gv->setLinkage(llvm::GlobalValue::WeakODRLinkage);
                 gv->setVisibility(llvm::GlobalValue::DefaultVisibility);
             }
             for (const llvm::GlobalValue& gv : mod->global_values())
@@ -6536,7 +6906,14 @@ namespace cflat_cinterop
             for (const auto& [emitted, programName] : restore)
                 if (llvm::GlobalValue* gv = mod->getNamedValue(emitted);
                     gv != nullptr && mod->getNamedValue(programName) == nullptr)
-                    gv->setName(programName);
+                {
+                    // A static inline stays internal here; the program binds a thunk instead.
+                    if (auto* fn = llvm::dyn_cast<llvm::Function>(gv); fn != nullptr
+                        && !fn->isDeclaration() && fn->hasLocalLinkage())
+                        AddStaticInlineProgramThunk(*mod, fn, programName);
+                    else
+                        gv->setName(programName);
+                }
             {
                 llvm::TimeTraceScope serializeScope("CxxDemandSerialize");
                 llvm::raw_string_ostream os(bitcode);
