@@ -1332,6 +1332,23 @@ int W10KeepTernary(int value)
     bool choose = value > 0;
     return W10CflatKeep(choose ? new cppon.Esc(value) ?? empty : empty, value);
 }
+int W13KeepLate(int value)
+{
+    cppon.Esc* empty = nullptr;
+    return W13CflatLateKeep(empty ?? new cppon.Esc(value), value);
+}
+int W13KeepIndirect(int value)
+{
+    cppon.Esc* empty = nullptr;
+    Lambda<int(cppon.Esc*, int)> f = W10CflatKeep;
+    return f(empty ?? new cppon.Esc(value), value);
+}
+int W13CflatLateKeep(cppon.Esc* p, int value)
+{
+    w10CflatKept = p;
+    cppunw.thrower(value);
+    return p == nullptr ? -1 : p->v;
+}
 
 const cppi.CrReceiverValue w13ConstGlobal = default;
 const cppi.CrReceiverValue[2] w13ConstGlobalArray;
@@ -5853,6 +5870,22 @@ extern int main()
             || cppon.dtors() != 0) return 3683;
         delete w10CflatKept;
         if (cppon.live() != 0 || cppon.clsDel() != 1 || cppon.dtors() != 1) return 3683;
+        cppon.reset();
+        w10CflatKept = nullptr;
+        r = cppunw.guarded(W13KeepLate, 5);
+        if (r != -5 || w10CflatKept == nullptr || w10CflatKept->v != 5
+            || cppon.live() != 1 || cppon.clsNew() != 1 || cppon.clsDel() != 0
+            || cppon.dtors() != 0) return 3686;
+        delete w10CflatKept;
+        if (cppon.live() != 0 || cppon.clsDel() != 1 || cppon.dtors() != 1) return 3686;
+        cppon.reset();
+        w10CflatKept = nullptr;
+        r = cppunw.guarded(W13KeepIndirect, 5);
+        if (r != -5 || w10CflatKept == nullptr || w10CflatKept->v != 5
+            || cppon.live() != 1 || cppon.clsNew() != 1 || cppon.clsDel() != 0
+            || cppon.dtors() != 0) return 3687;
+        delete w10CflatKept;
+        if (cppon.live() != 0 || cppon.clsDel() != 1 || cppon.dtors() != 1) return 3687;
         cppon.reset();
         w10CflatKept = nullptr;
         r = cppunw.guarded(W10KeepTernary, 5);

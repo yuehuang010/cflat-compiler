@@ -120,6 +120,12 @@ void MainListener::ParseBlockItemList(CFlatParser::BlockItemListContext* ctx) {
             // free owned temps no named local or move param claimed (e.g. a chained concat's `a + b`).
             ProcessPlusPlus();
             compiler->FlushOwnedTemps();
+            // A guarded temp destructor may move insertion to its unconditional continuation block.
+            // Keep same-block alias rebind proofs aligned with that completed block item.
+            if (!compiler->stackNamedVariable.empty())
+                for (auto& [name, nv] : compiler->stackNamedVariable.back().namedVariable)
+                    if (nv.IsAliasBorrow)
+                        RecordAliasBorrowDeclBlock(compiler, nv);
         }
     }
 
@@ -596,8 +602,7 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
             && compiler->currentFunctionAbiRecipe.retSlot.kind == LLVMBackend::AbiSlot::SRetReturn
             && !compiler->currentFunctionReturnTV.Pointer
             && !compiler->currentFunctionReturnTV.IsAlias
-            && compiler->IsForeignNontrivialCxxReturnClass(
-                compiler->currentFunctionReturnTypeName);
+            && compiler->ReturnsViaCxxSret(compiler->currentFunctionReturnTypeName);
         llvm::Value* cxxSretDest = nullptr;
         if (cxxSretReturn && compiler->currentFunction != nullptr)
         {
@@ -614,7 +619,11 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
             compiler->pendingCxxSretTypeName_ = compiler->currentFunctionReturnTypeName;
             compiler->pendingCxxSretReturn_ = true;
         }
-        else if (cxxReturnTernary)
+        // A classified CFlat struct is not a C++ class: its ternary arms share one sret slot,
+        // retargeted to the return slot after the parse (below).
+        const bool loweredCflatReturn = cxxSretReturn
+            && !compiler->IsForeignNontrivialCxxReturnClass(compiler->currentFunctionReturnTypeName);
+        if (cxxReturnTernary && !loweredCflatReturn)
         {
             compiler->pendingCxxTernaryDeclDest_ = cxxSretDest;
             compiler->pendingCxxTernaryDeclTypeName_ = compiler->currentFunctionReturnTypeName;
@@ -624,6 +633,8 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
             // A temporary left by an EARLIER statement must not mark this operand movable.
             compiler->lastCxxRetTemp_ = nullptr;
             compiler->lastCxxRetValue_ = nullptr;
+            compiler->lastLoweredRetTemp_ = nullptr;
+            compiler->lastLoweredRetValue_ = nullptr;
         }
         if (assignExpr != nullptr)
             returnNV = ParseAssignmentExpressionNamed(assignExpr, ResultUse::ReturnOperand);
@@ -636,6 +647,35 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
             returnNV.TypeAndValue = compiler->currentFunctionReturnTV;
             if (!cxxSretReturn)
                 returnNV.Primary = GenerateDefaultValue(dtv);
+        }
+        auto* returnStorageGep = llvm::dyn_cast_or_null<llvm::GEPOperator>(returnNV.Storage);
+        const bool isNamedPointerSource = !returnNV.CallerName.empty()
+            && returnNV.CallerName != "this";
+        const bool returnIsPointerDeref = returnStorageGep == nullptr && isNamedPointerSource;
+        const bool returnIsPointerIndex = isNamedPointerSource
+            && returnNV.FieldName.empty() && returnNV.IsElementAccess && !returnNV.IsViewElement
+            && returnStorageGep != nullptr
+            && returnStorageGep->getNumIndices() == 1
+            && returnStorageGep->getSourceElementType()->isStructTy();
+        const bool returnReadsPointerPointee = returnIsPointerDeref || returnIsPointerIndex;
+        if (!defaultValue && assignExpr != nullptr
+            && returnNV.Storage != nullptr
+            && !compiler->currentFunctionReturnTV.IsAlias
+            && !returnNV.TypeAndValue.Pointer && !returnNV.TypeAndValue.IsMove
+            && returnNV.TypeAndValue.TypeName == compiler->currentFunctionReturnTypeName
+            && compiler->IsDataStructure(returnNV.TypeAndValue.TypeName)
+            && !compiler->IsCxxRecord(returnNV.TypeAndValue.TypeName)
+            && !compiler->IsForeignNontrivialCxxClass(returnNV.TypeAndValue.TypeName)
+            && compiler->IsOwningValueType(returnNV.TypeAndValue.TypeName)
+            // Field / fixed-array GEPs keep their copy-or-move arm below. A one-index GEP over a
+            // struct pointer is `a[0]`, which is still a borrowed pointer read to refuse here.
+            && returnReadsPointerPointee
+            && ReturnSourceIsIndirectOwningLvalue(returnNV, returnNV.Primary))
+        {
+            LogErrorContext(errCtx, std::format(
+                "cannot return owning struct '{}' through pointer; use 'return move {};' "
+                "to transfer it, or copy the value before returning",
+                SpellType(*compiler, returnNV.TypeAndValue), retText));
         }
         if (!defaultValue && compiler->currentFunctionReturnTV.TypeName == "string"
             && !compiler->currentFunctionReturnTV.Pointer
@@ -659,7 +699,94 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
         compiler->pendingInitAllocAlign = 0;  // one-shot
         lambdaExpectedType = {};
 
-        if (cxxSretReturn)
+        /*
+         * A classified CFlat struct (a C++ field that is not trivially relocatable) returns through
+         * sret. A call or `default` builds straight into the slot; a named local is moved field by
+         * field (C++ move constructors for the C++ fields) and still destroyed at its scope exit,
+         * like C++ without NRVO. Every other shape keeps the by-value path below, which stores
+         * the value into the slot (plan cflat-struct-nontrivial-cxx-fields phase 3).
+         */
+        bool loweredValueReturn = false;
+        if (cxxSretReturn
+            && !compiler->IsForeignNontrivialCxxReturnClass(compiler->currentFunctionReturnTypeName))
+        {
+            const std::string returnTypeName = compiler->currentFunctionReturnTypeName;
+            auto finishLoweredReturn = [&]() {
+                ProcessPlusPlus();
+                compiler->FlushOwnedTemps();
+                compiler->CreateReturnCall(nullptr);
+            };
+            if (cxxReturnCallConstructed || cxxReturnTernaryConstructed)
+            {
+                finishLoweredReturn();
+                return;
+            }
+            // The operand IS a classified call result (a ternary of calls shares one slot):
+            // the calls build straight into the return slot instead.
+            if (!defaultValue && returnNV.Primary != nullptr && returnNV.Storage == nullptr
+                && returnNV.Primary == compiler->lastLoweredRetValue_)
+                if (auto* temp = llvm::dyn_cast_or_null<llvm::AllocaInst>(
+                        compiler->lastLoweredRetTemp_);
+                    temp != nullptr && cxxSretDest != nullptr
+                    && temp->getAllocatedType() == returnNV.Primary->getType())
+                {
+                    temp->replaceAllUsesWith(cxxSretDest);
+                    temp->eraseFromParent();
+                    compiler->lastLoweredRetTemp_ = nullptr;
+                    compiler->lastLoweredRetValue_ = nullptr;
+                    finishLoweredReturn();
+                    return;
+                }
+            if (defaultValue)
+            {
+                LLVMBackend::DeclTypeAndValue dtv;
+                static_cast<LLVMBackend::TypeAndValue&>(dtv) = compiler->currentFunctionReturnTV;
+                compiler->pendingCxxSretDest_ = cxxSretDest;
+                compiler->pendingCxxSretTypeName_ = returnTypeName;
+                returnNV.Primary = GenerateDefaultValue(dtv);
+                const bool built = compiler->pendingCxxSretDest_ == nullptr;
+                compiler->pendingCxxSretDest_ = nullptr;
+                compiler->pendingCxxSretTypeName_.clear();
+                if (built)
+                {
+                    finishLoweredReturn();
+                    return;
+                }
+            }
+
+            // Only a bare named LOCAL (never a parameter, which may alias the caller's object).
+            bool namedLocal = false;
+            llvm::Value* localStorage = nullptr;
+            if (!defaultValue && IsBareIdentifierText(retText))
+            {
+                for (const auto& frame : std::ranges::reverse_view(compiler->stackNamedVariable))
+                {
+                    if (auto it = frame.namedVariable.find(retText); it != frame.namedVariable.end())
+                    {
+                        namedLocal = !it->second.TypeAndValue.Pointer
+                            && it->second.TypeAndValue.TypeName == returnTypeName
+                            && llvm::isa_and_nonnull<llvm::AllocaInst>(it->second.Storage);
+                        localStorage = it->second.Storage;
+                        break;
+                    }
+                    if (frame.functionArgument.count(retText) != 0) break;
+                }
+            }
+            auto* structType = compiler->GetDataStructure(returnTypeName).StructType;
+            if (namedLocal && structType != nullptr)
+            {
+                compiler->SetCurrentDebugLocation(errCtx->getStart()->getLine());
+                if (compiler->EmitLoweredMemberwiseMove(returnTypeName, structType, cxxSretDest,
+                                                        localStorage, "into the return slot"))
+                {
+                    finishLoweredReturn();
+                    return;
+                }
+            }
+            loweredValueReturn = true;
+        }
+
+        if (cxxSretReturn && !loweredValueReturn)
         {
             auto finishCxxSretReturn = [&]() {
                 ProcessPlusPlus();
@@ -1174,6 +1301,7 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
                 returnNV.TypeAndValue.Pointer = true;
                 returnNV.TypeAndValue.IsAlias = uniqueDest;
                 returnNV.IsAliasBorrow = false;
+                returnNV.IsAliasReturnBorrow = false;
                 returnNV.IsOwning = false;
             }
         }
@@ -2294,6 +2422,8 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
             compiler->FlushOwnedTempsSince(ptrMark, right, nullptr, preserveReturned);
             compiler->FlushConditionalPtrTempsSince(returnOwnedTempMark.Ptrs, preserveReturned, right);
         }
+        compiler->RejectImplicitIntegerPointeePointerConversion(
+            returnNV.TypeAndValue, compiler->currentFunctionReturnTV);
         compiler->CreateReturnCall(right, retStorage, interfaceReturnStructName,
                                    returnNV.TypeAndValue.IsUnsignedInteger() != -1);
     }
@@ -2525,7 +2655,7 @@ void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {
                     auto resultNV = ParseAssignmentExpressionNamed(assign, ResultUse::Discard);
                     if (bareExpr) DiagnoseDiscardedOwningReturn(assign, resultNV);
                     ProcessPlusPlus();
-                    RegisterDiscardedOwningStructTemp(resultNV);
+                    RegisterDiscardedOwningStructTemp(resultNV, bareExpr);
                     return;
                 }
                 ParseExpression(express);
@@ -2685,7 +2815,7 @@ void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {
                         auto nv = ParseAssignmentExpressionNamed(initAssign, ResultUse::Discard);
                         if (bareExpr) DiagnoseDiscardedOwningReturn(initAssign, nv);
                         ProcessPlusPlus();
-                        RegisterDiscardedOwningStructTemp(nv);
+                        RegisterDiscardedOwningStructTemp(nv, bareExpr);
                         compiler->FlushOwnedTemps();
                     }
 
@@ -2724,7 +2854,7 @@ void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {
                         auto nv = ParseAssignmentExpressionNamed(assign, ResultUse::Discard);
                         if (bareExpr) DiagnoseDiscardedOwningReturn(assign, nv);
                         ProcessPlusPlus();
-                        RegisterDiscardedOwningStructTemp(nv);
+                        RegisterDiscardedOwningStructTemp(nv, bareExpr);
                     }
                     // Flush HERE, not in the condition block: the increment block does not
                     // dominate the condition, so a temp registered here would never be freed.

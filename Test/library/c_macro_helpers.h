@@ -1,5 +1,9 @@
 #pragma once
 
+void c_p2i_take_int(int* value);
+void c_p2i_take_long(long* value);
+void c_p2i_take_ulong(unsigned long* value);
+
 /* Plain C bitfield layouts checked by test_c_interop.cb. */
 struct CBF_Zero
 {

@@ -42,6 +42,105 @@
 #include <set>
 #include <charconv>
 
+bool LLVMBackend::IsImplicitIntegerPointeePointerConversion(
+    const TypeAndValue& from, const TypeAndValue& to) const
+{
+    // Array-view destinations use their own element-compatibility diagnostic. A view or fixed
+    // array source decays only when the destination is an ordinary pointer.
+    if (to.IsArrayView) return false;
+    auto decayed = [](const TypeAndValue& value) {
+        TypeAndValue result = value;
+        if (result.IsArrayView || result.ConstArraySize > 0)
+        {
+            result.Pointer = true;
+            result.IsArrayView = false;
+            result.ConstArraySize = 0;
+            result.ConstInnerDimensions.clear();
+        }
+        return result;
+    };
+    const TypeAndValue fromPointer = decayed(from);
+    const TypeAndValue& toPointer = to;
+    if (!fromPointer.Pointer || !toPointer.Pointer
+        || fromPointer.IsCxxConstRef || toPointer.IsCxxConstRef
+        || fromPointer.IsRvalueRef || toPointer.IsRvalueRef
+        || fromPointer.IsCxxRefToPointer || toPointer.IsCxxRefToPointer)
+        return false;
+
+    auto resolvedPointee = [&](const TypeAndValue& value) {
+        std::string resolved = ResolveTypeAlias(value.TypeName);
+        std::string manglingAlias = ResolveManglingPointerAlias(resolved);
+        if (!manglingAlias.empty()) resolved = std::move(manglingAlias);
+        std::string backing = GetEnumBackingType(resolved);
+        return backing.empty() ? resolved : ResolveTypeAlias(backing);
+    };
+    const std::string fromBase = resolvedPointee(fromPointer);
+    const std::string toBase = resolvedPointee(toPointer);
+    // `long` is the target's C long: C headers bind it as the same-width iN, so the two match.
+    auto canonical = [](const std::string& name) {
+        if (name == "long") return CanonicalPrimitiveTypeName(longBits_ == 64 ? "i64" : "i32");
+        if (name == "ulong") return CanonicalPrimitiveTypeName(longBits_ == 64 ? "u64" : "u32");
+        return CanonicalPrimitiveTypeName(name);
+    };
+    if (fromBase.empty() || toBase.empty() || fromBase == "void" || toBase == "void"
+        || canonical(fromBase) == canonical(toBase))
+        return false;
+
+    // The pointee conversion applies only when both pointers have the same indirection depth.
+    if ((fromPointer.ElemPointer || fromPointer.PointerDepth >= 2)
+        != (toPointer.ElemPointer || toPointer.PointerDepth >= 2))
+        return false;
+
+    auto isInteger = [&](const std::string& name) {
+        if (name == "bool") return true;
+        TypeAndValue type;
+        type.TypeName = name;
+        return type.IsInteger() != -1 || type.IsUnsignedInteger() != -1;
+    };
+    if (!isInteger(fromBase) || !isInteger(toBase)) return false;
+
+    const bool charFamily = (fromBase == "char" && (toBase == "i8" || toBase == "u8"))
+        || (toBase == "char" && (fromBase == "i8" || fromBase == "u8"));
+    return !charFamily;
+}
+
+void LLVMBackend::RejectImplicitIntegerPointeePointerConversion(
+    const TypeAndValue& from, const TypeAndValue& to)
+{
+    if (!IsImplicitIntegerPointeePointerConversion(from, to)) return;
+    if (from.IsSimd || to.IsSimd) return;
+
+    auto decayed = [](const TypeAndValue& value) {
+        TypeAndValue result = value;
+        if (result.IsArrayView || result.ConstArraySize > 0)
+        {
+            result.Pointer = true;
+            result.IsArrayView = false;
+            result.ConstArraySize = 0;
+            result.ConstInnerDimensions.clear();
+        }
+        return result;
+    };
+    const TypeAndValue fromPointer = decayed(from);
+    const TypeAndValue& toPointer = to;
+
+    auto resolvedPointee = [&](const TypeAndValue& value) {
+        std::string resolved = ResolveTypeAlias(value.TypeName);
+        std::string manglingAlias = ResolveManglingPointerAlias(resolved);
+        if (!manglingAlias.empty()) resolved = std::move(manglingAlias);
+        std::string backing = GetEnumBackingType(resolved);
+        return backing.empty() ? resolved : ResolveTypeAlias(backing);
+    };
+    const std::string fromBase = resolvedPointee(fromPointer);
+    const std::string toBase = resolvedPointee(toPointer);
+    const bool fromDouble = fromPointer.ElemPointer || fromPointer.PointerDepth >= 2;
+    const bool toDouble = toPointer.ElemPointer || toPointer.PointerDepth >= 2;
+    const std::string fromType = fromBase + (fromDouble ? "**" : "*");
+    const std::string toType = toBase + (toDouble ? "**" : "*");
+    LogError(std::format("cannot convert '{}' to '{}' implicitly: the pointee types differ; "
+                         "use an explicit cast '({})p'", fromType, toType, toType));
+}
+
 #if defined(__APPLE__)
 // Step 3 (macOS self-contained link): harvest libSystem's exported symbols from
 // the live dyld shared cache to synthesize a linker stub, so -o needs no SDK.
@@ -1021,6 +1120,11 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                     // narrowing into it has no conversion and reached the module verifier.
                     if (ArgumentNarrowsParameter(arg, *varParamItr))
                         declaredParamRefuses = true;
+                    const auto& originalArgType = arg.HasOriginalArgumentType
+                        ? arg.OriginalArgumentType : arg.TypeAndValue;
+                    if (!candidate.IsCxx
+                        && IsImplicitIntegerPointeePointerConversion(originalArgType, *varParamItr))
+                        declaredParamRefuses = true;
                     if (candidate.IsCxx
                         && CxxRecordPointeeConstRelation(arg.TypeAndValue, *varParamItr)
                                == CxxPointeeConstRelation::Drops)
@@ -1715,6 +1819,24 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                 // an 'int' argument to the same parameter already got.
                 if (result >= 0 && ArgumentNarrowsParameter(arg, *candidateParamItr))
                     result = -1;
+
+                const auto& originalArgType = arg.HasOriginalArgumentType
+                    ? arg.OriginalArgumentType : arg.TypeAndValue;
+                if (!candidate.IsCxx
+                    && IsImplicitIntegerPointeePointerConversion(originalArgType,
+                                                                  *candidateParamItr))
+                    result = -1;
+                // `long*` vs the same-width `iN*` is accepted but never perfect, so an exactly
+                // spelled overload (f(long*) vs f(i64*)) still wins.
+                if (result == 0 && candidates.size() > 1 && originalArgType.Pointer
+                    && candidateParamItr->Pointer
+                    && CanonicalPrimitiveTypeName(ResolveTypeAlias(originalArgType.TypeName))
+                        != CanonicalPrimitiveTypeName(ResolveTypeAlias(candidateParamItr->TypeName))
+                    && (ResolveTypeAlias(originalArgType.TypeName) == "long"
+                        || ResolveTypeAlias(originalArgType.TypeName) == "ulong"
+                        || ResolveTypeAlias(candidateParamItr->TypeName) == "long"
+                        || ResolveTypeAlias(candidateParamItr->TypeName) == "ulong"))
+                    result = 1;
 
                 // Integer -> bool IS legal, and lowers through CoerceToBoolCondition. Implicit
                 // (1), never perfect, so an exactly-typed overload still wins.
@@ -3282,6 +3404,12 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
         CxxPreferredOverload cxxPreferred;
         auto [matched, candidate] = ComputeOverloadFunction(resolvedCandidate, &tiedCandidates,
                                                             &cxxPreferred);
+        // C ABI `extern` definition with a CFlat body: the callee destroys its owning by-value
+        // params, so every such param takes the argument over like a declared `move` param.
+        if (candidate.External && candidate.HasCFlatBody)
+            for (auto& param : candidate.Parameters)
+                if (CFlatExternOwnsByValueParam(param))
+                    param.IsMove = true;
 
         if (candidate.IsCxx && candidate.Function != nullptr && tiedCandidates.empty()
             && !cxxPreferred.set)
@@ -3727,6 +3855,22 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
             {
                 LogError(cxxDemandRefusalRelay_.second);
                 return nullptr;
+            }
+            if (candidates.size() == 1 && resolvedCandidate.size() == 1
+                && !resolvedCandidate.front().second.IsCxx)
+            {
+                const auto& [resolvedArgs, resolvedSym] = resolvedCandidate.front();
+                for (size_t i = 0; i < resolvedArgs.size()
+                     && i < resolvedSym.Parameters.size(); ++i)
+                {
+                    const auto& arg = resolvedArgs[i];
+                    const auto& from = arg.HasOriginalArgumentType
+                        ? arg.OriginalArgumentType : arg.TypeAndValue;
+                    if (IsImplicitIntegerPointeePointerConversion(
+                            from, resolvedSym.Parameters[i]))
+                        RejectImplicitIntegerPointeePointerConversion(
+                            from, resolvedSym.Parameters[i]);
+                }
             }
             std::string msg = std::format("no overload of '{}' matches the given arguments.\n", shownFunctionName);
 
@@ -4283,12 +4427,21 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
         {
             const auto& param = candidate.Parameters[i];
             const auto& source = arguments[i];
-            // Only the direct result of an alias-return call that copied a temp argument: which
-            // arg it names is a run-time choice, so a sink cannot know whether it owns it.
+            // An alias-return result may name a borrow or a temp at runtime, so an owning sink
+            // cannot determine whether it owns the selected value.
             std::string aliasCallee;
+            const std::string sourceBinding = !source.TypeAndValue.VariableName.empty()
+                ? source.TypeAndValue.VariableName : source.CallerName;
+            const auto* binding = FindLiveNamedVariable(sourceBinding);
+            bool sourceIsAlias = false;
+            if (binding != nullptr)
+                sourceIsAlias = binding->IsAliasBorrow && binding->IsAliasReturnBorrow;
+            else
+                sourceIsAlias = (source.IsAliasBorrow && source.IsAliasReturnBorrow)
+                    || IsAliasReturnResult(source.Primary, &aliasCallee);
             if (functionName != "operator=" && IsOwningValueType(param.TypeName)
                 && (OwningSinkConsumesConcrete(param) || param.IsMove)
-                && IsAliasReturnTempResult(source.Primary, &aliasCallee))
+                && sourceIsAlias)
             {
                 const std::string fallbackName = aliasCallee.empty() ? std::string("<expression>") : aliasCallee;
                 const std::string sourceName = !source.CallerName.empty() ? source.CallerName
@@ -5196,7 +5349,7 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
         const bool cxxClassReturn = candidate.Recipe.hasLowering
             && candidate.Recipe.retSlot.kind == AbiSlot::SRetReturn
             && !candidate.ReturnType.Pointer
-            && IsForeignNontrivialCxxReturnClass(candidate.ReturnType.TypeName);
+            && ReturnsViaCxxSret(candidate.ReturnType.TypeName);
         const bool cxxClassParam = std::any_of(candidate.Recipe.paramSlots.begin(),
             candidate.Recipe.paramSlots.end(), [&](const AbiSlot& slot) {
                 return slot.kind == AbiSlot::ByVal && slot.structTy != nullptr;
@@ -5355,6 +5508,7 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                 ? (llvm::Value*)CreateCallOrInvoke(candidate.Function->getFunctionType(),
                                                    cxxVirtualCallee, argList, calleeMayUnwind)
                 : CreateFunctionCall(candidate.Function, argList, calleeMayUnwind));
+        RecordOpaqueReturnCall(result, candidate.ReturnType.TypeName, functionName);
         unwindCallConsumedTemps_.clear();
         // Settle the copy slots of an alias-return call. When every possible source slot holds a
         // temporary, the result is one of them: it owns that value, and a slot the result does not
@@ -5398,8 +5552,15 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
         }
         if (cxxRetTemp != nullptr)
         {
-            RegisterOwnedStructTemp(cxxRetTemp, candidate.ReturnType.TypeName);
+            // A classified CFlat struct result keeps CFlat by-value ownership (the loaded value
+            // is the owned temporary, as before sret); only C++ class results own the slot.
+            if (!IsLoweredCFlatOnlyStruct(candidate.ReturnType.TypeName))
+                RegisterOwnedStructTemp(cxxRetTemp, candidate.ReturnType.TypeName);
             result = builder->CreateLoad(candidate.Recipe.retSlot.structTy, cxxRetTemp);
+            // The loaded value stands for the call result: a produced temporary, exactly like
+            // the by-value CallInst it replaces (discard and ownership checks key on that).
+            if (IsLoweredCFlatOnlyStruct(candidate.ReturnType.TypeName))
+                nullConditionalTempResults_.push_back(result);
         }
         if (candidate.Recipe.hasLowering
             && (candidate.IsCxx || cxxClassReturn)
@@ -5407,8 +5568,16 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
         {
             // Remembered for a declaration initialized by this call: the temp (sret) or null
             // when the ABI returned the object in registers (trivial for calls, a plain store).
-            lastCxxRetTemp_ = cxxRetTemp;
-            lastCxxRetValue_ = result;
+            if (!candidate.IsCxx && IsLoweredCFlatOnlyStruct(candidate.ReturnType.TypeName))
+            {
+                lastLoweredRetTemp_ = cxxRetTemp;
+                lastLoweredRetValue_ = result;
+            }
+            else
+            {
+                lastCxxRetTemp_ = cxxRetTemp;
+                lastCxxRetValue_ = result;
+            }
         }
 
         RegisterRawArrayCallResult(result, rawReturnCountSlot,
@@ -5593,7 +5762,7 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
         // Retire move temporaries and mark the source moved after the call.
         std::vector<TypeAndValue> transferParamsStorage;
         const auto* transferParams = &candidate.Parameters;
-        if (candidate.ReturnsAliasOfByValueParam && !candidate.ReturnsAlias)
+        if (candidate.ReturnsAliasOfByValueParam && !candidate.ReturnsAlias && !candidate.External)
         {
             transferParamsStorage = candidate.Parameters;
             transferParams = &transferParamsStorage;
@@ -5696,6 +5865,20 @@ bool LLVMBackend::RejectAliasParamFuncPtrBind(const std::string& functionName,
                   "alias " + SpellType(*this, p), SpellType(*this, p) + "*", "alias" });
             return true;
         }
+        // A C-linkage definition with a CFlat body destroys its owning by-value params, but only a
+        // direct call hands the argument over; an indirect call would leave the caller freeing it too.
+        if (sym.External && sym.HasCFlatBody)
+            for (const auto& p : sym.Parameters)
+            {
+                if (!CFlatExternOwnsByValueParam(p)) continue;
+                LogErrorMessage(
+                    "function '{}' cannot be used as a function pointer: its 'extern' definition "
+                    "owns and destroys its by-value parameter '{}' of type '{}', which only a direct "
+                    "call hands over. Declare the parameter '{}', or call '{}' directly",
+                    { SpellFunctionSymbol(*this, functionName), p.VariableName, SpellType(*this, p),
+                      "move " + SpellType(*this, p), SpellFunctionSymbol(*this, functionName) });
+                return true;
+            }
         return false;
     }
 

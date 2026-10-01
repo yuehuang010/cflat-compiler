@@ -4934,6 +4934,7 @@ struct TakTupleBox<T> { (T*, int) inner = default; };
 T takFirst<T>(T[] v) { return v[0]; }
 T takElem<T>(T*[] v) { return *v[0]; }
 T takDeref<T>(T* p) { return *p; }
+T takFixedDecay<T>(T* p) { return *p; }
 T takPick<T>(T a, T b) { return a; }
 
 bool testGnTypeArgKeySpace()
@@ -4995,6 +4996,7 @@ bool testGnTypeArgKeySpace()
     int* fromPtrView = takFirst(pview);
     result &= Test("tak_infer_from_view_of_pointers", *fromPtrView, 300);
     result &= Test("tak_infer_elem_star_param", takElem(pview), 300);
+    result &= Test("tak_infer_from_fixed_array_decay", takFixedDecay(plain), 300);
     int* headPtr = &one;
     result &= Test("tak_infer_from_pointer", takDeref(headPtr), 300);
     result &= Test("tak_infer_two_params_literal", takPick(two, 4), 2);

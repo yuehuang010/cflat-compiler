@@ -107,7 +107,7 @@ extern int main(int argc, char** argv)
     interlockedUnsigned.counter = 5;
     interlockedUnsigned.guard = 0x456789AB;
     total++; passed += Test("Interlocked unsigned compare exchange",
-        InterlockedCompareExchange(&interlockedUnsigned.counter, 9, 5) == 5
+        InterlockedCompareExchange((i32*)&interlockedUnsigned.counter, 9, 5) == 5
             && interlockedUnsigned.counter == 9 && interlockedUnsigned.guard == 0x456789AB, true);
 
     total++; passed += Test("InterlockedIncrement", InterlockedIncrement(&interlockedLONG.counter), 10);

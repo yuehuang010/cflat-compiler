@@ -184,12 +184,71 @@ expect_error("cannot store an 'alias' value 'aliasReturnProbePick' into an ownin
     }
 }
 
+expect_error("cannot store an 'alias' value 'aliasReturnProbePick' into an owning parameter") {
+    void aliasReturnNamedDirectSink()
+    {
+        AliasReturnProbe a = aliasReturnProbeMake(1);
+        AliasReturnProbe b = aliasReturnProbeMake(2);
+        aliasReturnProbeSink(aliasReturnProbePick(a, b, true));
+    }
+}
+
 expect_error("cannot store an 'alias' value") {
     void aliasReturnListSink()
     {
         AliasReturnProbe a = aliasReturnProbeMake(1);
         list<AliasReturnProbe> values;
         values.add(aliasReturnProbePick(a, aliasReturnProbeMake(3), true));
+    }
+}
+
+expect_error("cannot store an 'alias' value 'aliasReturnProbePick' into an owning parameter") {
+    void aliasReturnNamedListSink()
+    {
+        AliasReturnProbe a = aliasReturnProbeMake(1);
+        AliasReturnProbe b = aliasReturnProbeMake(2);
+        list<AliasReturnProbe> values;
+        values.add(aliasReturnProbePick(a, b, true));
+    }
+}
+
+expect_error("cannot store an 'alias' value 'aliasReturnProbePick' into an owning array element") {
+    void aliasReturnArrayTempStore()
+    {
+        AliasReturnProbe a = aliasReturnProbeMake(1);
+        AliasReturnProbe[2] values;
+        values[0] = aliasReturnProbePick(a, aliasReturnProbeMake(3), false);
+    }
+}
+
+expect_error("cannot store an 'alias' value 'aliasReturnProbePick' into an owning array element") {
+    void aliasReturnArrayNamedStore()
+    {
+        AliasReturnProbe a = aliasReturnProbeMake(1);
+        AliasReturnProbe b = aliasReturnProbeMake(2);
+        AliasReturnProbe[2] values;
+        values[0] = aliasReturnProbePick(a, b, true);
+    }
+}
+
+expect_error("cannot store an 'alias' value 'y' into an owning parameter") {
+    void aliasReturnChainedSink()
+    {
+        AliasReturnProbe a = aliasReturnProbeMake(1);
+        AliasReturnProbe x = aliasReturnProbePick(a, aliasReturnProbeMake(3), false);
+        AliasReturnProbe y = x;
+        aliasReturnProbeSink(y);
+    }
+}
+
+expect_error("cannot store an 'alias' value 'y'") {
+    void aliasReturnChainedListSink()
+    {
+        AliasReturnProbe a = aliasReturnProbeMake(1);
+        AliasReturnProbe x = aliasReturnProbePick(a, aliasReturnProbeMake(3), false);
+        AliasReturnProbe y = x;
+        list<AliasReturnProbe> values;
+        values.add(y);
     }
 }
 
@@ -205,5 +264,74 @@ expect_error("cannot store an 'alias' value 'pick' into an owning parameter") {
         AliasReturnProbe a = aliasReturnProbeMake(1);
         AliasReturnPicker p;
         aliasReturnProbeSink(p.pick(a, aliasReturnProbeMake(4)));
+    }
+}
+
+// A rebind on only one path leaves the alias borrow standing.
+expect_error("cannot store an 'alias' value 'x' into an owning parameter") {
+    void aliasReturnConditionalRebindSink(bool c)
+    {
+        AliasReturnProbe a = aliasReturnProbeMake(1);
+        AliasReturnProbe x = aliasReturnProbePick(a, aliasReturnProbeMake(3), false);
+        if (c) x = aliasReturnProbeMake(5);
+        aliasReturnProbeSink(x);
+    }
+}
+
+// A C-ABI `extern` definition owns its by-value param, so a named argument is moved into it.
+extern AliasReturnProbe aliasReturnExternPass(AliasReturnProbe w) { return w; }
+expect_error("use of moved variable 'a'") {
+    int aliasReturnExternNamedReadAfter()
+    {
+        AliasReturnProbe a = aliasReturnProbeMake(1);
+        AliasReturnProbe r = aliasReturnExternPass(a);
+        return r.get() + a.get();
+    }
+}
+
+// A named-only alias-return result bound to a local is still an alias: an owning sink refuses it.
+expect_error("cannot store an 'alias' value 'x' into an owning parameter") {
+    void aliasReturnNamedOnlySink()
+    {
+        AliasReturnProbe a = aliasReturnProbeMake(1);
+        AliasReturnProbe b = aliasReturnProbeMake(2);
+        AliasReturnProbe x = aliasReturnProbePick(a, b, true);
+        aliasReturnProbeSink(x);
+    }
+}
+
+// The `extern` definition destroys its owning by-value param, which only a direct call hands
+// over, so every function-value door is closed.
+extern int aliasReturnExternTake(AliasReturnProbe w) { return w.get(); }
+
+expect_error("cannot be used as a function pointer") {
+    void aliasReturnExternFnBind()
+    {
+        function<int(AliasReturnProbe)> fp = aliasReturnExternTake;
+    }
+}
+
+expect_error("cannot be used as a function pointer") {
+    int aliasReturnExternCallThru(function<int(AliasReturnProbe)> g) { return g(aliasReturnProbeMake(1)); }
+    int aliasReturnExternFnArg() { return aliasReturnExternCallThru(aliasReturnExternTake); }
+}
+
+expect_error("cannot be used as a function pointer") {
+    function<int(AliasReturnProbe)> aliasReturnExternFnReturn() { return aliasReturnExternTake; }
+}
+
+expect_error("cannot be used as a function pointer") {
+    struct AliasReturnExternHolder { function<int(AliasReturnProbe)> f = nullptr; };
+    void aliasReturnExternFnField()
+    {
+        AliasReturnExternHolder h;
+        h.f = aliasReturnExternTake;
+    }
+}
+
+expect_error("cannot be used as a function pointer") {
+    void aliasReturnExternLambdaBind()
+    {
+        Lambda<int(AliasReturnProbe)> lam = aliasReturnExternTake;
     }
 }

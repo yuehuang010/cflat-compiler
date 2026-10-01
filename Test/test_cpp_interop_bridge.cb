@@ -1,3 +1,4 @@
+// cflat-twin-args: -O2
 // C++-interop coverage: the CFlat BRIDGE. Everything here is CFlat code that C++ sees -
 // CFlat-defined [cpp] structs (plain, derived, generic), CFlat functions reached through
 // the reverse C++ ABI, and std::function handed a CFlat callable. New bridge work goes
@@ -128,6 +129,103 @@ import "unique.cb";
     std.list<int> values = default;
     override int forward(int x) { return x; }
 };
+
+struct PlainListRelocHolder
+{
+    std.list<int> values = default;
+};
+
+PlainListRelocHolder make_plain_list_reloc_holder()
+{
+    PlainListRelocHolder result = PlainListRelocHolder();
+    result.values.push_back(5);
+    result.values.push_back(2);
+    return result;
+}
+
+// A plain struct whose C++ fields are not trivially relocatable is built in place and returned
+// through sret: special-member counts match clang++ -std=c++20 (no NRVO for the named return).
+struct PlainTrackedRelocHolder
+{
+    std.list<int> values = default;
+    cppi.Tracked tracked = cppi.Tracked(4);
+    int tag = 7;
+};
+
+PlainTrackedRelocHolder make_plain_tracked_reloc_holder()
+{
+    PlainTrackedRelocHolder result = PlainTrackedRelocHolder();
+    result.values.push_back(5);
+    result.values.push_back(2);
+    return result;
+}
+
+PlainTrackedRelocHolder make_plain_tracked_prvalue()
+{
+    return PlainTrackedRelocHolder();
+}
+
+PlainTrackedRelocHolder make_plain_tracked_pick(bool first)
+{
+    return first ? make_plain_tracked_prvalue() : default;
+}
+
+int g_plain_tracked_udtor = 0;
+struct PlainTrackedUserDtor
+{
+    std.list<int> values = default;
+    cppi.Tracked tracked = cppi.Tracked(4);
+    ~PlainTrackedUserDtor() { g_plain_tracked_udtor = g_plain_tracked_udtor + 1; }
+};
+
+PlainTrackedUserDtor make_plain_tracked_user_dtor()
+{
+    return PlainTrackedUserDtor();
+}
+
+// The by-value type is completed after a function value and an interface already use it.
+PlainLaterHolder make_plain_later(int v);
+Lambda<PlainLaterHolder(int)> g_plain_later_fn = make_plain_later;
+interface PlainLaterIface { PlainLaterHolder get(); };
+// Calls emitted before the type completes (direct and through a function value, both invokes
+// under a cleanup scope) are rewritten to sret once it does.
+int plain_later_early(int n)
+{
+    string keep = "x";
+    Lambda<PlainLaterHolder(int)> fn = make_plain_later;
+    _ = make_plain_later(n);
+    _ = fn(n);
+    return n + (int)keep.length();
+}
+struct PlainLaterHolder
+{
+    int v = 0;
+    cppi.Tracked tracked = cppi.Tracked(1);
+};
+PlainLaterHolder make_plain_later(int v)
+{
+    PlainLaterHolder result;
+    result.v = v;
+    return result;
+}
+class PlainLaterImpl : PlainLaterIface
+{
+    PlainLaterHolder get() { return make_plain_later(9); }
+};
+
+int bridge_tracked_counts()
+{
+    return cppi.ctor_count() * 1000 + cppi.copy_count() * 100 + cppi.move_count() * 10
+        + cppi.dtor_count();
+}
+
+BridgeListRelocHolder make_bridge_list_reloc_holder()
+{
+    BridgeListRelocHolder result = BridgeListRelocHolder();
+    result.values.push_back(5);
+    result.values.push_back(2);
+    return result;
+}
 
 int proxyCppAssignValue = 0;
 [cpp] struct ProxyCppRecord
@@ -1855,11 +1953,32 @@ int bridge_tracked_range_balanced()
     return 1;
 }
 
+BridgeConditionalBox bridge_opaque_return(int value);
+
+void bridge_opaque_return_discard_direct(int value)
+{
+    _ = bridge_opaque_return(value);
+}
+
+void bridge_opaque_return_discard_indirect(int value)
+{
+    Lambda<BridgeConditionalBox(int)> make = bridge_opaque_return;
+    _ = make(value);
+}
+
 struct BridgeConditionalBox
 {
     int tag = 0;
     cpptw.Twin value = default;
 };
+
+BridgeConditionalBox bridge_opaque_return(int value)
+{
+    BridgeConditionalBox result = default;
+    result.tag = value;
+    result.value = cpptw.Twin(value);
+    return result;
+}
 
 struct BridgeConditionalOuter
 {
@@ -2338,6 +2457,13 @@ extern int main(int argc, char** argv)
     if const (__WINDOWS__) {
         return 0;
     }
+
+    cpptw.reset_counts();
+    bridge_opaque_return_discard_direct(31);
+    bridge_check("opaque early direct discard live", cpptw.live_allocations(), 0);
+    cpptw.reset_counts();
+    bridge_opaque_return_discard_indirect(32);
+    bridge_check("opaque early indirect discard live", cpptw.live_allocations(), 0);
 
     // Nontrivial C++ by-value parameters use constructors, not an aggregate bit copy.
     cpptw.reset_counts();
@@ -5156,6 +5282,7 @@ extern int main(int argc, char** argv)
         direct.values.push_back(9);
         bridge_check("field relocation direct construction",
                      direct.values.front() * 10 + (int)direct.values.size(), 52);
+        bridge_check("field relocation direct back", direct.values.back(), 9);
     }
     {
         BridgeListRelocHolder implicit;
@@ -5163,6 +5290,7 @@ extern int main(int argc, char** argv)
         implicit.values.push_back(9);
         bridge_check("field relocation implicit construction",
                      implicit.values.front() * 10 + (int)implicit.values.size(), 52);
+        bridge_check("field relocation implicit back", implicit.values.back(), 9);
     }
     {
         BridgeListRelocHolder defaulted = default;
@@ -5170,7 +5298,118 @@ extern int main(int argc, char** argv)
         defaulted.values.push_back(9);
         bridge_check("field relocation default construction",
                      defaulted.values.front() * 10 + (int)defaulted.values.size(), 52);
+        bridge_check("field relocation default back", defaulted.values.back(), 9);
     }
+    {
+        PlainListRelocHolder direct = PlainListRelocHolder();
+        direct.values.push_back(5);
+        direct.values.push_back(9);
+        bridge_check("plain field relocation direct construction",
+                     direct.values.front() * 10 + (int)direct.values.size(), 52);
+        bridge_check("plain field relocation direct back", direct.values.back(), 9);
+    }
+    {
+        PlainListRelocHolder implicit;
+        implicit.values.push_back(5);
+        implicit.values.push_back(9);
+        bridge_check("plain field relocation implicit construction",
+                     implicit.values.front() * 10 + (int)implicit.values.size(), 52);
+        bridge_check("plain field relocation implicit back", implicit.values.back(), 9);
+    }
+    {
+        PlainListRelocHolder defaulted = default;
+        defaulted.values.push_back(5);
+        defaulted.values.push_back(9);
+        bridge_check("plain field relocation default construction",
+                     defaulted.values.front() * 10 + (int)defaulted.values.size(), 52);
+        bridge_check("plain field relocation default back", defaulted.values.back(), 9);
+    }
+    {
+        PlainListRelocHolder returned = make_plain_list_reloc_holder();
+        bridge_check("plain field relocation sret local",
+                     returned.values.front() * 10 + (int)returned.values.size(), 52);
+        bridge_check("plain field relocation sret back", returned.values.back(), 2);
+    }
+    {
+        BridgeListRelocHolder returned = make_bridge_list_reloc_holder();
+        bridge_check("cpp field relocation sret local",
+                     returned.values.front() * 10 + (int)returned.values.size(), 52);
+        bridge_check("cpp field relocation sret back", returned.values.back(), 2);
+    }
+    cppi.reset_counts();
+    {
+        PlainTrackedRelocHolder direct = PlainTrackedRelocHolder();
+        direct.values.push_back(5);
+        bridge_check("plain tracked relocation direct value",
+                     direct.values.front() * 10 + direct.tracked.value() + direct.tag, 61);
+    }
+    bridge_check("plain tracked relocation direct counts", bridge_tracked_counts(), 1001);
+    cppi.reset_counts();
+    {
+        PlainTrackedRelocHolder implicit;
+        implicit.values.push_back(5);
+        bridge_check("plain tracked relocation implicit value",
+                     implicit.values.front() * 10 + implicit.tracked.value() + implicit.tag, 61);
+    }
+    bridge_check("plain tracked relocation implicit counts", bridge_tracked_counts(), 1001);
+    cppi.reset_counts();
+    {
+        PlainTrackedRelocHolder defaulted = default;
+        defaulted.values.push_back(5);
+        bridge_check("plain tracked relocation default value",
+                     defaulted.values.front() * 10 + defaulted.tracked.value() + defaulted.tag, 61);
+    }
+    bridge_check("plain tracked relocation default counts", bridge_tracked_counts(), 1001);
+    cppi.reset_counts();
+    {
+        PlainTrackedRelocHolder returned = make_plain_tracked_reloc_holder();
+        bridge_check("plain tracked relocation sret value",
+                     returned.values.front() * 10 + (int)returned.values.size()
+                     + returned.tracked.value(), 56);
+    }
+    bridge_check("plain tracked relocation sret counts", bridge_tracked_counts(), 1012);
+    cppi.reset_counts();
+    _ = make_plain_tracked_prvalue();
+    bridge_check("plain tracked relocation discard counts", bridge_tracked_counts(), 1001);
+    cppi.reset_counts();
+    _ = make_plain_tracked_reloc_holder();
+    bridge_check("plain tracked relocation discard named counts", bridge_tracked_counts(), 1012);
+    cppi.reset_counts();
+    g_plain_tracked_udtor = 0;
+    _ = make_plain_tracked_user_dtor();
+    bridge_check("plain tracked relocation discard user dtor",
+                 bridge_tracked_counts() * 10 + g_plain_tracked_udtor, 10011);
+    cppi.reset_counts();
+    {
+        bool pickFirst = bridge_checks > 0;
+        PlainTrackedRelocHolder joined = pickFirst ? make_plain_tracked_prvalue()
+                                                   : make_plain_tracked_prvalue();
+        joined.values.push_back(3);
+        bridge_check("plain tracked relocation ternary value",
+                     joined.values.front() * 10 + joined.tracked.value(), 34);
+    }
+    bridge_check("plain tracked relocation ternary counts", bridge_tracked_counts(), 1001);
+    cppi.reset_counts();
+    {
+        PlainTrackedRelocHolder picked = make_plain_tracked_pick(bridge_checks > 0);
+        picked.values.push_back(6);
+        bridge_check("plain tracked relocation ternary return value",
+                     picked.values.front() * 10 + picked.tracked.value(), 64);
+    }
+    bridge_check("plain tracked relocation ternary return counts", bridge_tracked_counts(), 1001);
+    cppi.reset_counts();
+    {
+        PlainLaterHolder viaGlobal = g_plain_later_fn(5);
+        PlainLaterImpl impl;
+        PlainLaterIface iface = impl;
+        PlainLaterHolder viaIface = iface.get();
+        bridge_check("plain tracked relocation later value",
+                     viaGlobal.v * 10 + viaIface.v + viaGlobal.tracked.value(), 60);
+    }
+    bridge_check("plain tracked relocation later counts", bridge_tracked_counts(), 2024);
+    cppi.reset_counts();
+    bridge_check("plain tracked relocation early call value", plain_later_early(3), 4);
+    bridge_check("plain tracked relocation early call ctors", cppi.ctor_count(), 2);
     if (bridge_passed - bridgeFieldRelocStartPassed != bridge_checks - bridgeFieldRelocStartChecks)
         return 3580;
     // ---- prvalue arguments to CFlat by-value C++ class parameters (3590-3599) -------------

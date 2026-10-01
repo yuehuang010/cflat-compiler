@@ -85,6 +85,15 @@ void useIt11() {
     b();
 }
 
+// A bare call whose owning struct return is still opaque when the body is parsed is still a
+// mandatory discard error once the later struct definition completes.
+expect_error("owning return value of 'makeOpaque' must not be discarded") {
+    OpaqueResult makeOpaque(int value);
+    void useOpaque() { makeOpaque(1); }
+    struct OpaqueResult { string value = "owned"; };
+    OpaqueResult makeOpaque(int value) { return default; }
+}
+
 // Indirect calls preserve the bound function's owning return metadata.
 expect_error("owning return value of 'f' must not be discarded") {
     class R10 { int id = default; };

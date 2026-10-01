@@ -505,6 +505,44 @@ bool testCapturePrimitives()
         delete p;
     }
 
+    // A by-value capture is its own mutable slot, independent of the outer and other closures.
+    {
+        int n = 0;
+        Lambda<int()> bump = () => { n = n + 1; return n; };
+        result &= Test("mutable int capture 1", bump(), 1);
+        result &= Test("mutable int capture 2", bump(), 2);
+        result &= Test("mutable int capture outer", n, 0);
+
+        Lambda<int()> clone = bump;
+        result &= Test("copied mutable capture a", bump(), 3);
+        result &= Test("copied mutable capture b", clone(), 3);
+        result &= Test("copied mutable capture a2", bump(), 4);
+
+        Lambda<int()> other = () => { n = n + 1; return n; };
+        result &= Test("independent int capture a", bump(), 5);
+        result &= Test("independent int capture b", other(), 1);
+        result &= Test("independent int capture a2", bump(), 6);
+    }
+
+    // double capture writes persist in the closure's own slot.
+    {
+        double d = 1.5;
+        Lambda<double()> next = () => { d = d + 0.25; return d; };
+        result &= Test("mutable double capture 1", (float)next(), 1.75f);
+        result &= Test("mutable double capture 2", (float)next(), 2.0f);
+        result &= Test("mutable double capture outer", (float)d, 1.5f);
+    }
+
+    // Rebinding a captured pointer persists, while the pointed-to storage stays shared.
+    {
+        int a = 10; int b = 20;
+        int* p = &a;
+        Lambda<int()> select = () => { int v = *p; p = &b; return v; };
+        result &= Test("mutable pointer capture 1", select(), 10);
+        result &= Test("mutable pointer capture 2", select(), 20);
+        result &= Test("mutable pointer capture outer", *p, 10);
+    }
+
     return result;
 }
 
@@ -646,27 +684,36 @@ bool testReturnCapturedOwningValue()
         result &= Test("returned buf not source",   r1.data() != s.data(),  true);
     }
 
-    // Capture SEMANTICS anchor - a by-value capture is a COPY: writes inside the lambda are
-    // invisible outside, and each call re-reads the env's own copy. This must not change.
+    // A local declared from a capture owns its own copy: rebinding the capture frees the env's
+    // old buffer, which the local must not share.
     {
-        string s = "xyz";
-        Lambda<int()> g = () => { s = "abcd"; return s.length(); };
-        result &= Test("mutated capture inner len", g(),        4);
-        result &= Test("mutated capture outer len", s.length(), 3);
-        result &= Test("mutated capture outer val", s,          "xyz");
-        result &= Test("mutated capture is per-call", g(),      4);
+        string s = "m";
+        Lambda<string()> g = () => { string t = s; s = s + "n"; return t; };
+        string a = g();
+        string b = g();
+        result &= Test("capture copied into local before rebind 1", a, "m");
+        result &= Test("capture copied into local before rebind 2", b, "mn");
+        result &= Test("capture rebind source intact",              s, "m");
     }
 
-    // Rebinding the unpacked capture to a fresh concatenation must restore its local cleanup.
-    // The capture still owns the original environment value, while each new result is owned by
-    // the lambda body and must not be left on the heap after the call returns.
+    // A by-value string capture owns one mutable copy; writes persist, but do not reach the source.
+    {
+        string s = "xyz";
+        Lambda<int()> g = () => { s = s + "!"; return s.length(); };
+        result &= Test("mutated capture inner len 1", g(),     4);
+        result &= Test("mutated capture inner len 2", g(),     5);
+        result &= Test("mutated capture outer len", s.length(), 3);
+        result &= Test("mutated capture outer val", s,          "xyz");
+    }
+
+    // Returned values are independent copies of the current environment slot.
     {
         string s = "xyz";
         Lambda<string()> g = () => { s = s + "!"; return s; };
         string r1 = g();
         string r2 = g();
         result &= Test("rebound capture value 1", r1, "xyz!");
-        result &= Test("rebound capture value 2", r2, "xyz!");
+        result &= Test("rebound capture value 2", r2, "xyz!!");
         result &= Test("rebound capture source intact", s, "xyz");
     }
 
@@ -1885,6 +1932,14 @@ bool testFunctionTypeAlias()
 
 using IntUnary = Lambda<int(int)>;
 
+struct MutableLambdaBox { Lambda<int()> next = default; };
+
+int callMutableLambdaTwice(Lambda<int()> f)
+{
+    f();
+    return f();
+}
+
 struct KeyMaker
 {
     Lambda<list<string>()> make = default;
@@ -1914,6 +1969,50 @@ bool testClosureGenericSigReturn()
     list<string> got3 = km.make();
     result &= Test("gap-b field count", got3.count(), 2);
     result &= Test("gap-b field[1]",    got3.get(1), "f2");
+
+    return result;
+}
+
+bool testMutableCaptureStorage()
+{
+    bool result = true;
+
+    // A captured value persists when the Lambda is stored in a field or passed by value.
+    {
+        int n = 0;
+        MutableLambdaBox box = default;
+        box.next = () => { n = n + 1; return n; };
+        result &= Test("mutable field capture 1", box.next(), 1);
+        result &= Test("mutable field capture 2", box.next(), 2);
+        result &= Test("mutable param capture", callMutableLambdaTwice(box.next), 4);
+        result &= Test("mutable field after param call", box.next(), 5);
+        result &= Test("mutable field outer", n, 0);
+    }
+
+    // Each runtime evaluation in the loop allocates a distinct environment.
+    {
+        int sum = 0;
+        for (int i = 0; i < 3; i++)
+        {
+            int n = i;
+            Lambda<int()> local = () => { n = n + 1; return n; };
+            sum = sum + local() * 10 + local();
+        }
+        result &= Test("fresh loop capture envs", sum, 69);
+    }
+
+    // The inner closure owns its own copy of the outer closure's captured slot.
+    {
+        int n = 0;
+        Lambda<Lambda<int()>()> outer = () => {
+            Lambda<int()> inner = () => { n = n + 1; return n; };
+            return inner;
+        };
+        Lambda<int()> inner = outer();
+        result &= Test("nested mutable capture 1", inner(), 1);
+        result &= Test("nested mutable capture 2", inner(), 2);
+        result &= Test("nested mutable capture outer", n, 0);
+    }
 
     return result;
 }
@@ -4892,6 +4991,7 @@ extern int main(int argc, char** argv)
 
     // Closure / generics monomorphization (gap a: closure as generic arg; gap b: generic in sig)
     total++; passed += testClosureGenericSigReturn()    ? 1 : 0;
+    total++; passed += testMutableCaptureStorage()       ? 1 : 0;
     total++; passed += testClosureListFat()             ? 1 : 0;
     total++; passed += testClosureListThin()            ? 1 : 0;
     total++; passed += testClosureListAliasUnify()      ? 1 : 0;

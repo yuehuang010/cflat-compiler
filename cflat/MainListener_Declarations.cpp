@@ -2045,9 +2045,20 @@ llvm::Value* MainListener::GenerateDefaultValue(const LLVMBackend::DeclTypeAndVa
                 const auto* ctor = compiler->FindCxxDefaultCtor(resolved.TypeName);
                 if (ctor != nullptr)
                 {
-                    auto* slot = compiler->AllocaAtEntry(llvmType, nullptr, "cxxfielddefault");
+                    // An armed destination (a field of an in-place aggregate) is constructed
+                    // directly: the C++ object never lives in a temporary that is bit-copied.
+                    const bool inPlace = compiler->pendingCxxSretDest_ != nullptr
+                        && compiler->pendingCxxSretTypeName_ == resolved.TypeName;
+                    llvm::Value* slot = inPlace ? compiler->pendingCxxSretDest_
+                        : compiler->AllocaAtEntry(llvmType, nullptr, "cxxfielddefault");
+                    if (inPlace)
+                    {
+                        compiler->pendingCxxSretDest_ = nullptr;
+                        compiler->pendingCxxSretTypeName_.clear();
+                    }
                     if (compiler->EmitCxxStructorCall(resolved.TypeName, *ctor, slot, {}))
-                        return compiler->CreateLoad(llvmType, slot);
+                        return inPlace ? nullptr : compiler->CreateLoad(llvmType, slot);
+                    if (inPlace) return nullptr;
                 }
                 std::string ambiguityError;
                 if (compiler->CxxDefaultCtorAmbiguityError(resolved.TypeName, ambiguityError))
@@ -3236,12 +3247,13 @@ void MainListener::ParseFunctionDefinition(CFlatParser::FunctionDefinitionContex
         // infer 'alias'; paths that disagree give the caller no answer at all, so reject.
         // Copyable returns are untouched - a copy duplicates no ownership.
         bool aliasOfByValueParam = false;
-        if (compiler->TypeOwnsUniquePointer(returnType.TypeName))
+        if (returnType.external) returnType.IsAlias = false;
+        if (!returnType.external && compiler->TypeOwnsUniquePointer(returnType.TypeName))
         {
             std::string borrowedParam;
             const std::string returnTypeSpelling = SpellType(*compiler, returnType);
             auto returnKind = ClassifyValueStructReturns(Compiler(), func, returnType, allParams, &borrowedParam);
-            if (returnKind == ValueStructReturnKind::Mixed)
+            if (returnKind == ValueStructReturnKind::Mixed && !returnType.external)
             {
                 LogErrorContext(func, std::format(
                     "function returns borrowed parameter '{}' on one path and an owned value on another, "
@@ -3254,11 +3266,18 @@ void MainListener::ParseFunctionDefinition(CFlatParser::FunctionDefinitionContex
             }
             if (returnKind == ValueStructReturnKind::AllBorrowedParam)
             {
-                returnType.IsAlias = true;
                 aliasOfByValueParam = true;
+                if (returnType.external)
+                {
+                    for (auto& param : allParams)
+                        if (!param.Pointer && param.TypeName == returnType.TypeName)
+                            param.IsReturnInferredSink = true;
+                }
+                else
+                    returnType.IsAlias = true;
             }
         }
-        if (returnType.IsAlias && !aliasOfByValueParam)
+        if (!returnType.external && returnType.IsAlias && !aliasOfByValueParam)
         {
             // A spelled `alias T f(T w) { return w; }` hands back a by-value param just the same.
             auto probe = returnType;
@@ -5604,6 +5623,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                 std::vector<LLVMBackend::TypeAndValue> allParams(declParams.begin(), declParams.end());
 
                 bool ellipsis = paramTypeList && paramTypeList->Ellipsis() != nullptr;
+                if (typeAndValue.external) typeAndValue.IsAlias = false;
                 // A declaration at namespace scope registers under its qualified name
                 // (os.windows.Sleep) so lookup is namespaced, but an extern keeps its
                 // bare linkage symbol (Sleep) - the import library only knows that name.
@@ -5620,6 +5640,37 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                     LogErrorContext(direct,
                         "construct_at is a compiler builtin and cannot be redeclared as a user function");
                     continue;
+                }
+                if (!typeAndValue.external && !typeAndValue.Pointer
+                    && !typeAndValue.IsMove && !typeAndValue.IsAlias)
+                {
+                    if (auto inferred = compiler->functionTable.find(declName);
+                        inferred != compiler->functionTable.end())
+                        for (const auto& sym : inferred->second)
+                        {
+                            if (!sym.ReturnsAliasOfByValueParam
+                                || sym.ReturnType.TypeName != typeAndValue.TypeName
+                                || sym.Parameters.size() != allParams.size()) continue;
+                            bool sameParams = true;
+                            for (size_t i = 0; i < allParams.size(); ++i)
+                                if (sym.Parameters[i].TypeName != allParams[i].TypeName
+                                    || sym.Parameters[i].Pointer != allParams[i].Pointer
+                                    || sym.Parameters[i].ElemPointer != allParams[i].ElemPointer
+                                    || sym.Parameters[i].IsMove != allParams[i].IsMove
+                                    || sym.Parameters[i].IsAlias != allParams[i].IsAlias
+                                    || sym.Parameters[i].IsAdopt != allParams[i].IsAdopt
+                                    || sym.Parameters[i].IsNullable != allParams[i].IsNullable)
+                                {
+                                    sameParams = false;
+                                    break;
+                                }
+                            if (!sameParams) continue;
+                            typeAndValue.IsAlias = true;
+                            for (size_t i = 0; i < allParams.size(); ++i)
+                                allParams[i].IsReturnInferredSink =
+                                    sym.Parameters[i].IsReturnInferredSink;
+                            break;
+                        }
                 }
                 /*
                  * Same reject as the function DEFINITION path (see ParseFunctionDefinition): a
@@ -5829,6 +5880,20 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                 llvm::Value* srcPrimary = nullptr;
                 // A direct auto initializer can adopt this sret slot as its local storage.
                 llvm::Value* srcCxxRetTemp = nullptr;
+                // The default construction of a classified struct (`T x;`, `T x = default;`)
+                // returned through sret: the local adopts that slot instead of a bitwise copy.
+                bool srcCxxRetTempFromDefault = false;
+                auto adoptDefaultCxxRetTemp = [&]() {
+                    if (!global_scope && right != nullptr && !typeAndValue.Pointer
+                        && typeAndValue.ConstArraySize == 0
+                        && compiler->lastLoweredRetTemp_ != nullptr
+                        && right == compiler->lastLoweredRetValue_
+                        && compiler->NeedsCxxLoweringType(typeAndValue.TypeName))
+                    {
+                        srcCxxRetTemp = compiler->lastLoweredRetTemp_;
+                        srcCxxRetTempFromDefault = true;
+                    }
+                };
                 bool srcIsMove = false;
                 bool coreUniqueImplicitDefault = false;
                 bool srcMovedFromSlot = false;
@@ -5855,6 +5920,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                 // The local shallow-aliases storage it does not own, so its scope-exit destructor
                 // must be suppressed (IsAliasBorrow) - otherwise it double-frees the source's buffer.
                 bool srcIsAlias = false;
+                bool srcIsAliasReturnBorrow = false;
                 // A non-pointer alias declaration is a reference binding. Keep the RHS slot instead
                 // of copying its loaded value into the declaration's temporary alloca.
                 llvm::Value* aliasStorage = nullptr;
@@ -6229,6 +6295,8 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                 // prior statement's (now a named local's storage) is stale.
                                 compiler->lastCxxRetTemp_ = nullptr;
                                 compiler->lastCxxRetValue_ = nullptr;
+                                compiler->lastLoweredRetTemp_ = nullptr;
+                                compiler->lastLoweredRetValue_ = nullptr;
                                 autoDeclTernaryInit_ = typeAndValue.TypeName == "auto"
                                     && !typeAndValue.Pointer && !global_scope
                                     && assignmentExpression->conditionalExpression() != nullptr
@@ -6238,20 +6306,32 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                 if (compiler->lastCxxRetTemp_ != nullptr
                                     && rightNV.Storage == compiler->lastCxxRetTemp_
                                     && !rightNV.TypeAndValue.Pointer
-                                    && compiler->IsForeignNontrivialCxxReturnClass(
+                                    && compiler->ReturnsViaCxxSret(
                                         rightNV.TypeAndValue.TypeName))
                                     srcCxxRetTemp = compiler->lastCxxRetTemp_;
+                                // A classified CFlat-only call result: the local adopts the
+                                // call's sret slot when the initializer IS that loaded value.
+                                else if (compiler->lastLoweredRetTemp_ != nullptr
+                                    && rightNV.Storage == nullptr && rightNV.Primary != nullptr
+                                    && rightNV.Primary == compiler->lastLoweredRetValue_
+                                    && !rightNV.TypeAndValue.Pointer
+                                    && compiler->IsLoweredCFlatOnlyStruct(
+                                        rightNV.TypeAndValue.TypeName))
+                                    srcCxxRetTemp = compiler->lastLoweredRetTemp_;
                                 // `auto x = T(args)`: the constructed temporary is adopted too.
                                 else if (typeAndValue.TypeName == "auto" && !global_scope
                                     && llvm::isa_and_nonnull<llvm::AllocaInst>(rightNV.Storage)
                                     && !rightNV.TypeAndValue.Pointer
-                                    && compiler->IsForeignNontrivialCxxReturnClass(
+                                    && compiler->ReturnsViaCxxSret(
                                         rightNV.TypeAndValue.TypeName)
                                     && compiler->IsOwnedTempValue(rightNV))
                                     srcCxxRetTemp = rightNV.Storage;
                                 ApplyCallResultBorrowProvenance(compiler, rightNV);
                                 initializerSourceNV = rightNV;
                                 haveInitializerSourceNV = true;
+                                if (global_scope)
+                                    compiler->RejectImplicitIntegerPointeePointerConversion(
+                                        rightNV.TypeAndValue, typeAndValue);
                                 // `auto x = <C++ class lvalue>` copy-constructs like `T x = ...`.
                                 if (!global_scope && typeAndValue.TypeName == "auto"
                                     && TryDeclareForeignCxxAutoLocal(direct, assignmentExpression,
@@ -6259,8 +6339,9 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                            DeclSpecHasConst(declSpec), name, line,
                                            allocList))
                                     continue;
-                                if (!global_scope && typeAndValue.IsAlias && !typeAndValue.Pointer
-                                    && rightNV.Storage != nullptr)
+                                if (!global_scope && !typeAndValue.Pointer
+                                    && rightNV.Storage != nullptr
+                                    && typeAndValue.IsAlias)
                                 {
                                     aliasStorage = rightNV.Storage;
                                     bindAliasReference = true;
@@ -6698,7 +6779,19 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                 }
                                 // Alias if the RHS is an `alias` call result OR a read of an
                                 // alias-borrow local (chained `Token t2 = t1;`) - both borrow.
-                                srcIsAlias = rightNV.TypeAndValue.IsAlias || rightNV.IsAliasBorrow;
+                                // A lambda's string capture lives in the env slot, which a later
+                                // rebind frees: a local copies it (below) instead of borrowing it.
+                                const bool srcIsClosureStringCapture = rightNV.IsClosureValueCapture
+                                    && NamedVarIsString(rightNV) && !rightNV.TypeAndValue.IsMove;
+                                srcIsAlias = (rightNV.TypeAndValue.IsAlias || rightNV.IsAliasBorrow)
+                                    && !srcIsClosureStringCapture;
+                                std::string aliasReturnCallee;
+                                // A call with only named arguments yields the result as Storage.
+                                srcIsAliasReturnBorrow = rightNV.IsAliasReturnBorrow
+                                    || compiler->IsAliasReturnResult(
+                                        rightNV.Primary, &aliasReturnCallee)
+                                    || compiler->IsAliasReturnResult(
+                                        rightNV.Storage, &aliasReturnCallee);
                                 srcCallerName = rightNV.CallerName;
                                 // Taint a string local initialized from an owning string FIELD
                                 // (`string t = b.name`) or from another already-tainted borrow
@@ -6707,7 +6800,8 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                 srcBorrowsOwnedString = NamedVarIsString(rightNV)
                                     && !rightNV.TypeAndValue.IsMove
                                     && ((!rightNV.FieldName.empty() && !rightNV.OwningStructName.empty())
-                                        || rightNV.BorrowsOwnedString);
+                                        || rightNV.BorrowsOwnedString
+                                        || srcIsClosureStringCapture);
                                 srcIsOwningArrayStringElem =
                                     IsOwningArrayStringElementRead(rightNV, right);
                                 srcIsRawHeapStringElem =
@@ -7165,7 +7259,9 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                         }
                         else
                         {
+                            compiler->lastLoweredRetTemp_ = nullptr;
                             right = GenerateDefaultValue(typeAndValue);
+                            adoptDefaultCxxRetTemp();
                         }
                     }
                     else if (initializer->LeftBrace() != nullptr)
@@ -7248,7 +7344,11 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                         // takes the constant value of that same construction when it has one; the
                         // note below is reserved for the cases that genuinely stay zeroed.
                         if (!global_scope && compiler->GetFunction(typeAndValue.TypeName))
+                        {
+                            compiler->lastLoweredRetTemp_ = nullptr;
                             right = compiler->CreateOverloadedFunctionCall(typeAndValue.TypeName, {});
+                            adoptDefaultCxxRetTemp();
+                        }
                         else if (global_scope)
                         {
                             right = TryFoldGlobalDefaultConstruction(typeAndValue);
@@ -7629,8 +7729,9 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                     auto alloc = compiler->CreateLocalVariable(typeAndValue, right ? right->getType() : nullptr, arraySize, line, typeAndValue.UserAlignValue);
                     const bool elideCxxReturn = srcCxxRetTemp != nullptr
                         && !typeAndValue.Pointer
-                        && srcInferredTypeName == typeAndValue.TypeName
-                        && compiler->IsForeignNontrivialCxxReturnClass(typeAndValue.TypeName);
+                        && (srcInferredTypeName == typeAndValue.TypeName
+                            || srcCxxRetTempFromDefault)
+                        && compiler->ReturnsViaCxxSret(typeAndValue.TypeName);
                     if (elideCxxReturn)
                     {
                         alloc = srcCxxRetTemp;
@@ -8148,9 +8249,12 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                     auto convertedNV = initializerSourceNV;
                                     if (compiler->ApplyCxxConversionOperator(
                                             convertedNV, typeAndValue, false))
-                                        right = convertedNV.Primary;
+                                    right = convertedNV.Primary;
                                 }
                             }
+                            if (haveInitializerSourceNV)
+                                compiler->RejectImplicitIntegerPointeePointerConversion(
+                                    initializerSourceNV.TypeAndValue, typeAndValue);
                             auto* initStore = movedCxxReturn
                                 ? nullptr : compiler->CreateAssignment(right, alloc, srcIsUnsigned);
                             if (movedOwningStruct)
@@ -8201,6 +8305,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                             const bool adoptedAliasReturnTemp =
                                 compiler->AdoptAliasReturnTemps(srcStorage, nv);
                             nv.IsAliasBorrow = true;
+                            nv.IsAliasReturnBorrow = srcIsAliasReturnBorrow || adoptedAliasReturnTemp;
                             if (!adoptedAliasReturnTemp)
                             {
                                 // The source may carry the owner's field path through an alias-return
@@ -9505,7 +9610,8 @@ void MainListener::CopyWrittenCopyableParams(CFlatParser::FunctionDefinitionCont
     // Owned string, not a view: callers cut it from a type text that is lambda-local.
     auto containerKind = [](const std::string& type) -> std::string {
         const auto base = MangledBase(type);
-        if (base == "list" || base == "dictionary" || base == "queue") return std::string(base);
+        if (base == "list" || base == "dictionary" || base == "queue" || base == "hashset")
+            return std::string(base);
         return {};
     };
     auto isContainerMutator = [](std::string_view kind, const std::string& method) {
@@ -9515,10 +9621,15 @@ void MainListener::CopyWrittenCopyableParams(CFlatParser::FunctionDefinitionCont
         static const std::unordered_set<std::string> dictionaryMutators = {
             "add", "clear", "remove", "set"
         };
-        static const std::unordered_set<std::string> queueMutators = { "dequeue", "enqueue", "free" };
+        static const std::unordered_set<std::string> queueMutators = { "dequeue", "enqueue" };
+        static const std::unordered_set<std::string> hashsetMutators = {
+            "add", "clear", "remove"
+        };
+        if (!method.empty() && method[0] == '_') return true;
         if (kind == "list") return listMutators.contains(method);
         if (kind == "dictionary") return dictionaryMutators.contains(method);
         if (kind == "queue") return queueMutators.contains(method);
+        if (kind == "hashset") return hashsetMutators.contains(method);
         return false;
     };
     auto splitPath = [](const std::string& text) {
@@ -9526,10 +9637,29 @@ void MainListener::CopyWrittenCopyableParams(CFlatParser::FunctionDefinitionCont
         size_t begin = 0;
         while (begin <= text.size())
         {
-            const size_t end = text.find('.', begin);
+            size_t end = text.find('.', begin);
+            const size_t arrow = text.find("->", begin);
+            if (arrow != std::string::npos && (end == std::string::npos || arrow < end)) end = arrow;
             path.push_back(text.substr(begin, end == std::string::npos ? std::string::npos : end - begin));
             if (end == std::string::npos) break;
-            begin = end + 1;
+            begin = text.compare(end, 2, "->") == 0 ? end + 2 : end + 1;
+        }
+        return path;
+    };
+    auto splitLvaluePath = [](const std::string& text) {
+        std::vector<std::string> path;
+        size_t pos = 0;
+        while (pos < text.size())
+        {
+            size_t end = text.find_first_of(".([", pos);
+            const size_t arrow = text.find("->", pos);
+            if (arrow != std::string::npos && (end == std::string::npos || arrow < end)) end = arrow;
+            path.push_back(text.substr(pos, end == std::string::npos
+                ? std::string::npos : end - pos));
+            if (end == std::string::npos) break;
+            if (text.compare(end, 2, "->") == 0) pos = end + 2;
+            else if (text[end] == '.') pos = end + 1;
+            else break;
         }
         return path;
     };
@@ -9560,8 +9690,16 @@ void MainListener::CopyWrittenCopyableParams(CFlatParser::FunctionDefinitionCont
         auto* primary = call->primaryExpression();
         const auto members = call->memberNameToken();
         std::vector<std::string> path;
-        if (primary == nullptr || members.empty() || call->argumentExpressionList().empty()) return path;
+        if (primary == nullptr || members.empty()) return path;
         outMethod = members.back()->getText();
+        auto memberIt = std::find(call->children.begin(), call->children.end(), members.back());
+        if (memberIt == call->children.end()) return path;
+        auto next = std::next(memberIt);
+        if (next != call->children.end()
+            && dynamic_cast<CFlatParser::GenericTypeParametersContext*>(*next) != nullptr)
+            ++next;
+        if (next == call->children.end() || (*next)->getText() != "(")
+            return path;
         path = splitPath(primary->getText());
         outRoot = path.front();
         for (size_t i = 0; i + 1 < members.size(); ++i) path.push_back(members[i]->getText());
@@ -9582,36 +9720,122 @@ void MainListener::CopyWrittenCopyableParams(CFlatParser::FunctionDefinitionCont
         bool result = false;
         // Every overload of the name counts (no overload resolution here): one mutating overload
         // makes the call a write - at worst one extra copy, never a missed one.
-        const std::vector<CFlatParser::FunctionDefinitionContext*>* overloads = nullptr;
-        if (auto bodies = compiler->gts.structMethodBodies.find(type);
-            bodies != compiler->gts.structMethodBodies.end())
-            if (auto fn = bodies->second.find(method); fn != bodies->second.end()) overloads = &fn->second;
+        std::vector<CFlatParser::FunctionDefinitionContext*> overloads;
+        const std::string genericMethodKey = GenericMethodTemplateKey(type, method);
+        if (!genericMethodKey.empty())
+            overloads.push_back(genericFunctionTemplates.at(genericMethodKey));
         auto isOwnMethod = [&](const std::string& name) {
             auto bodies = compiler->gts.structMethodBodies.find(type);
-            return bodies != compiler->gts.structMethodBodies.end() && bodies->second.contains(name);
+            return (bodies != compiler->gts.structMethodBodies.end() && bodies->second.contains(name))
+                || !GenericMethodTemplateKey(type, name).empty();
         };
-        for (auto* body : overloads != nullptr ? *overloads
-                 : std::vector<CFlatParser::FunctionDefinitionContext*>{})
+        if (auto bodies = compiler->gts.structMethodBodies.find(type);
+            bodies != compiler->gts.structMethodBodies.end())
+            if (auto fn = bodies->second.find(method); fn != bodies->second.end())
+                overloads.insert(overloads.end(), fn->second.begin(), fn->second.end());
+        for (auto* body : overloads)
         if (!result && body != nullptr && body->compoundStatement() != nullptr)
         {
+            std::unordered_set<std::string> thisAliases{ "this" };
             auto walk = [&](auto&& walkSelf, antlr4::tree::ParseTree* node) -> void {
                 if (node == nullptr || result) return;
+                if (auto* init = dynamic_cast<CFlatParser::InitDeclaratorContext*>(node))
+                {
+                    auto* direct = init->declarator() != nullptr ? init->declarator()->directDeclarator() : nullptr;
+                    auto* value = init->initializer() != nullptr ? init->initializer()->assignmentExpression() : nullptr;
+                    if (direct != nullptr && direct->Identifier() != nullptr && value != nullptr
+                        && thisAliases.contains(value->getText()))
+                        thisAliases.insert(direct->Identifier()->getText());
+                }
                 if (auto* asn = dynamic_cast<CFlatParser::AssignmentExpressionContext*>(node))
                 {
+                    if (asn->unaryExpression() != nullptr && asn->assignmentExpression() != nullptr)
+                    {
+                        const std::string dest = BareSourceText(asn->unaryExpression());
+                        const std::string source = asn->assignmentExpression()->getText();
+                        if (thisAliases.contains(source)) thisAliases.insert(dest);
+                    }
                     // `values = ...` in a method drops the container the caller still owns.
                     if (asn->unaryExpression() != nullptr && asn->assignmentExpression() != nullptr)
                     {
-                        auto dest = splitPath(BareSourceText(asn->unaryExpression()));
+                        const std::string destText = BareSourceText(asn->unaryExpression());
+                        auto dest = splitPath(destText);
                         if (!dest.empty() && dest.front() == "this") dest.erase(dest.begin());
                         if (!dest.empty() && !NameShadowedByEnclosingLocal(asn, dest.front())
                             && !containerAtFieldPath(type, dest).empty())
+                            result = true;
+                        if (!result && !destText.empty())
+                        {
+                            auto lvaluePath = splitLvaluePath(destText);
+                            if (!lvaluePath.empty() && lvaluePath.front() == "this")
+                                lvaluePath.erase(lvaluePath.begin());
+                            for (size_t count = lvaluePath.size(); count > 0; --count)
+                            {
+                                std::vector<std::string> prefix(lvaluePath.begin(),
+                                    lvaluePath.begin() + count);
+                                if (!containerAtFieldPath(type, prefix).empty())
+                                {
+                                    result = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    // A field address can escape through a return or a free/static call; the
+                    // classifier cannot inspect that destination, so treat it as a write.
+                }
+                if (auto* unary = dynamic_cast<CFlatParser::UnaryExpressionContext*>(node);
+                    unary != nullptr && FirstSourceChar(unary) == '&')
+                {
+                    std::string address = unary->getText();
+                    if (address.size() > 1 && address[0] == '&')
+                    {
+                        auto fields = splitLvaluePath(address.substr(1));
+                        if (!fields.empty() && thisAliases.contains(fields.front())) fields.erase(fields.begin());
+                        if (!fields.empty()
+                            && !containerAtFieldPath(type, fields).empty())
                             result = true;
                     }
                 }
                 if (auto* call = dynamic_cast<CFlatParser::PostfixExpressionContext*>(node))
                 {
+                    const std::string callText = call->getText();
+                    for (auto* args : call->argumentExpressionList())
+                        for (auto* arg : args->argumentNamedExpression())
+                            if (arg->assignmentExpression() != nullptr)
+                            {
+                                const std::string argText = arg->assignmentExpression()->getText();
+                                if (thisAliases.contains(argText)) result = true;
+                            }
+                    if (callText.find("->") != std::string::npos)
+                    {
+                        const std::string method = call->memberNameToken().empty()
+                            ? std::string() : call->memberNameToken().back()->getText();
+                        if (isContainerMutator("list", method)
+                            || isContainerMutator("dictionary", method)
+                            || isContainerMutator("queue", method)
+                            || isContainerMutator("hashset", method))
+                            result = true;
+                        else if (isOwnMethod(method) && self(self, type, {}, method, active))
+                            result = true;
+                    }
                     std::string root, name;
                     auto path = receiverPath(call, root, name);
+                    if (callText.find("()->") != std::string::npos
+                        && self(self, type, {}, name, active))
+                        result = true;
+                    if (!path.empty())
+                    {
+                        // `get()->mutate()` returns a pointer into this object. Follow the
+                        // getter body when the mutating call is chained from an own method.
+                        const size_t open = path.front().find('(');
+                        if (open != std::string::npos && self(self, type, {}, name, active))
+                        {
+                            const std::string getter = path.front().substr(0, open);
+                            if (isOwnMethod(getter) && self(self, type, {}, getter, active))
+                                result = true;
+                        }
+                    }
                     if (!path.empty())
                     {
                         if (root == "this") path.erase(path.begin());
@@ -9630,6 +9854,31 @@ void MainListener::CopyWrittenCopyableParams(CFlatParser::FunctionDefinitionCont
                             && self(self, type, {}, callee, active))
                             result = true;
                     }
+                    if (call->primaryExpression() != nullptr
+                        && call->primaryExpression()->genericIdentifier() != nullptr)
+                    {
+                        const std::string callee = call->primaryExpression()->genericIdentifier()
+                            ->Identifier()->getText();
+                        if (auto symbols = compiler->functionTable.find(callee);
+                            symbols != compiler->functionTable.end())
+                            for (const auto& symbol : symbols->second)
+                            {
+                                if (symbol.IsMethod) continue;
+                                // `helper()` in a method passes `this` implicitly as a leading Box*.
+                                if (!symbol.Parameters.empty() && symbol.Parameters.front().Pointer
+                                    && symbol.Parameters.front().TypeName == type)
+                                    result = true;
+                                const auto argumentLists = call->argumentExpressionList();
+                                if (argumentLists.empty()) continue;
+                                const auto args = argumentLists.front()->argumentNamedExpression();
+                                const size_t count = std::min(args.size(), symbol.Parameters.size());
+                                for (size_t i = 0; i < count; ++i)
+                                    if (symbol.Parameters[i].Pointer && symbol.Parameters[i].TypeName == type
+                                        && args[i]->assignmentExpression() != nullptr
+                                        && thisAliases.contains(args[i]->assignmentExpression()->getText()))
+                                        result = true;
+                            }
+                    }
                 }
                 for (auto* child : node->children) walkSelf(walkSelf, child);
             };
@@ -9640,19 +9889,108 @@ void MainListener::CopyWrittenCopyableParams(CFlatParser::FunctionDefinitionCont
         return result;
     };
     struct ContainerAlias { std::string root; std::string kind; size_t token; };
+    struct WholeParamAlias {
+        std::string root;
+        std::vector<std::string> path;
+        std::string pointeeType;
+        size_t token;
+    };
     std::unordered_map<std::string, ContainerAlias> containerAliases;
+    std::unordered_map<std::string, WholeParamAlias> wholeParamAliases;
+    auto resolveWholeParamAlias = [&](const std::string& target, size_t token,
+                                      WholeParamAlias& resolved) {
+        if (auto alias = wholeParamAliases.find(target); alias != wholeParamAliases.end()
+            && token > alias->second.token)
+        {
+            resolved = alias->second;
+            resolved.token = token;
+            return true;
+        }
+        auto path = splitLvaluePath(target);
+        if (path.empty()) return false;
+        if (auto alias = wholeParamAliases.find(path.front()); alias != wholeParamAliases.end()
+            && token > alias->second.token)
+        {
+            resolved = alias->second;
+            std::vector<std::string> suffix(std::next(path.begin()), path.end());
+            resolved.path.insert(resolved.path.end(), suffix.begin(), suffix.end());
+            resolved.pointeeType = typeAtFieldPath(alias->second.pointeeType, suffix);
+            resolved.token = token;
+            return !resolved.pointeeType.empty();
+        }
+        auto param = paramTypes.find(path.front());
+        if (param == paramTypes.end()) return false;
+        resolved.root = param->first;
+        path.erase(path.begin());
+        resolved.path = std::move(path);
+        resolved.pointeeType = typeAtFieldPath(param->second, resolved.path);
+        resolved.token = token;
+        return !resolved.pointeeType.empty();
+    };
     auto rememberContainerAlias = [&](const std::string& alias, const std::string& target,
                                       size_t token) {
-        auto path = splitPath(target);
-        if (path.size() < 2) return;
-        auto param = paramTypes.find(path.front());
-        if (param == paramTypes.end()) return;
-        path.erase(path.begin());
-        const auto kind = containerAtFieldPath(param->second, path);
-        if (!kind.empty()) containerAliases[alias] = { param->first, kind, token };
+        WholeParamAlias resolved;
+        if (resolveWholeParamAlias(target, token, resolved))
+        {
+            const auto kind = containerKind(resolved.pointeeType);
+            if (!kind.empty()) containerAliases[alias] = { resolved.root, kind, token };
+        }
+        else if (auto containerAlias = containerAliases.find(target);
+            containerAlias != containerAliases.end() && token > containerAlias->second.token)
+            containerAliases[alias] = { containerAlias->second.root,
+                containerAlias->second.kind, token };
+    };
+    std::unordered_map<std::string, std::pair<std::string, size_t>> addressAliases;
+    auto markContainerPath = [&](const std::string& expression, size_t token) {
+        auto path = splitLvaluePath(expression);
+        if (path.empty()) return std::string();
+        for (const auto& param : paramTypes)
+        {
+            if (path.front() != param.first) continue;
+            path.erase(path.begin());
+            if (path.empty() && !containerKind(param.second).empty()) return param.first;
+            for (size_t count = path.size(); count > 0; --count)
+                if (!containerAtFieldPath(param.second,
+                        std::vector<std::string>(path.begin(), path.begin() + count)).empty())
+                    return param.first;
+        }
+        if (auto alias = wholeParamAliases.find(path.front()); alias != wholeParamAliases.end()
+            && token > alias->second.token)
+        {
+            // pointeeType is the type at the END of alias.path, so only the suffix is matched.
+            std::vector<std::string> fields(std::next(path.begin()), path.end());
+            for (size_t count = fields.size(); count > 0; --count)
+                if (!containerAtFieldPath(alias->second.pointeeType,
+                        std::vector<std::string>(fields.begin(), fields.begin() + count)).empty())
+                    return alias->second.root;
+            if (fields.empty() && !containerKind(alias->second.pointeeType).empty())
+                return alias->second.root;
+        }
+        return std::string();
     };
     auto collectContainerMutationRoots = [&](auto&& self, antlr4::tree::ParseTree* node) -> void {
         if (node == nullptr) return;
+        if (auto* postfix = dynamic_cast<CFlatParser::PostfixExpressionContext*>(node))
+        {
+            bool increments = false;
+            for (auto* child : postfix->children)
+                if (child->getText() == "++" || child->getText() == "--") increments = true;
+            if (increments)
+            {
+                if (const std::string root = markContainerPath(postfix->getText(),
+                        (size_t)postfix->getStart()->getTokenIndex()); !root.empty())
+                    written.insert(root);
+                const auto path = splitLvaluePath(postfix->getText());
+                if (!path.empty())
+                    if (auto alias = addressAliases.find(path.front()); alias != addressAliases.end()
+                        && (size_t)postfix->getStart()->getTokenIndex() > alias->second.second)
+                        written.insert(alias->second.first);
+                for (const auto& [aliasName, alias] : addressAliases)
+                    if (postfix->getText().find("*" + aliasName) != std::string::npos
+                        && (size_t)postfix->getStart()->getTokenIndex() > alias.second)
+                        written.insert(alias.first);
+            }
+        }
         if (auto* init = dynamic_cast<CFlatParser::InitDeclaratorContext*>(node))
         {
             auto* direct = init->declarator() != nullptr ? init->declarator()->directDeclarator() : nullptr;
@@ -9660,9 +9998,26 @@ void MainListener::CopyWrittenCopyableParams(CFlatParser::FunctionDefinitionCont
             if (direct != nullptr && direct->Identifier() != nullptr && value != nullptr)
             {
                 const std::string source = value->getText();
-                if (source.size() > 1 && source[0] == '&')
-                    rememberContainerAlias(direct->Identifier()->getText(), source.substr(1),
+                if (!source.empty() && source[0] == '&')
+                {
+                    const std::string root = markContainerPath(source.substr(1),
                         (size_t)init->getStart()->getTokenIndex());
+                    if (!root.empty()) addressAliases[direct->Identifier()->getText()] = {
+                        root, (size_t)init->getStart()->getTokenIndex() };
+                }
+                else if (auto alias = addressAliases.find(source); alias != addressAliases.end()
+                    && (size_t)init->getStart()->getTokenIndex() > alias->second.second)
+                    addressAliases[direct->Identifier()->getText()] = {
+                        alias->second.first, (size_t)init->getStart()->getTokenIndex() };
+                const std::string target = !source.empty() && source[0] == '&'
+                    ? source.substr(1) : source;
+                WholeParamAlias resolved;
+                const size_t token = (size_t)init->getStart()->getTokenIndex();
+                if (resolveWholeParamAlias(target, token, resolved))
+                {
+                    wholeParamAliases[direct->Identifier()->getText()] = resolved;
+                    rememberContainerAlias(direct->Identifier()->getText(), target, token);
+                }
             }
         }
         if (auto* asn = dynamic_cast<CFlatParser::AssignmentExpressionContext*>(node))
@@ -9672,23 +10027,130 @@ void MainListener::CopyWrittenCopyableParams(CFlatParser::FunctionDefinitionCont
             if (dest != nullptr && value != nullptr)
             {
                 const std::string source = value->getText();
-                if (source.size() > 1 && source[0] == '&')
-                    rememberContainerAlias(BareSourceText(dest), source.substr(1),
-                        (size_t)asn->getStart()->getTokenIndex());
+                const std::string lhs = BareSourceText(dest);
+                const size_t token = (size_t)asn->getStart()->getTokenIndex();
+                if (!source.empty() && source[0] == '&')
+                    if (const std::string root = markContainerPath(source.substr(1), token); !root.empty())
+                    {
+                        if (lhs.find('.') != std::string::npos || lhs.find("->") != std::string::npos)
+                            written.insert(root);
+                        else addressAliases[lhs] = { root, token };
+                    }
+                if (!lhs.empty() && lhs[0] == '*')
+                    if (auto alias = addressAliases.find(lhs.substr(1));
+                        alias != addressAliases.end()
+                        && (size_t)asn->getStart()->getTokenIndex() > alias->second.second)
+                        written.insert(alias->second.first);
+                const auto lhsPath = splitLvaluePath(lhs);
+                if (!lhsPath.empty())
+                    if (auto alias = addressAliases.find(lhsPath.front());
+                        alias != addressAliases.end()
+                        && (size_t)asn->getStart()->getTokenIndex() > alias->second.second)
+                        written.insert(alias->second.first);
+                if (auto alias = addressAliases.find(source); alias != addressAliases.end()
+                    && token > alias->second.second)
+                {
+                    if (lhs.find('.') != std::string::npos || lhs.find("->") != std::string::npos)
+                        written.insert(alias->second.first);
+                    else addressAliases[lhs] = { alias->second.first, token };
+                }
+                const std::string target = !source.empty() && source[0] == '&'
+                    ? source.substr(1) : source;
+                WholeParamAlias resolved;
+                if (resolveWholeParamAlias(target, token, resolved))
+                {
+                    const std::string alias = BareSourceText(dest);
+                    if (!alias.empty()) wholeParamAliases[alias] = resolved;
+                    rememberContainerAlias(alias, target, token);
+                }
+                // Stores through list/dictionary indexing and reference-returning accessors
+                // mutate the caller's container even though the method itself is a getter.
+                for (const auto& [paramName, paramType] : paramTypes)
+                {
+                    std::string root = paramName;
+                    auto lhsPath = splitLvaluePath(lhs);
+                    std::vector<std::string> fields;
+                    if (!lhsPath.empty() && lhsPath.front() == paramName)
+                    {
+                        fields.assign(std::next(lhsPath.begin()), lhsPath.end());
+                    }
+                    else
+                    {
+                        for (const auto& [alias, value] : wholeParamAliases)
+                            if (value.root == paramName && !lhsPath.empty() && lhsPath.front() == alias
+                                && (lhsPath.size() > 1
+                                    || (lhs.find('[') != std::string::npos
+                                        && !containerKind(value.pointeeType).empty()))
+                                && (size_t)asn->getStart()->getTokenIndex() > value.token)
+                            {
+                                root = alias;
+                                fields = value.path;
+                                fields.insert(fields.end(), std::next(lhsPath.begin()), lhsPath.end());
+                                break;
+                            }
+                    }
+                    if (lhsPath.empty() || (lhsPath.front() != paramName && root == paramName)) continue;
+                    const bool isWholeAlias = root != paramName && wholeParamAliases.contains(root);
+                    if (!isWholeAlias && NameShadowedByEnclosingLocal(asn, root)) continue;
+                    if (fields.empty() && !containerKind(typeAtFieldPath(paramType, fields)).empty())
+                    {
+                        written.insert(paramName);
+                        continue;
+                    }
+                    for (size_t count = fields.size(); count > 0; --count)
+                    {
+                        std::vector<std::string> prefix(fields.begin(), fields.begin() + count);
+                        if (!containerAtFieldPath(paramType, prefix).empty())
+                        {
+                            written.insert(paramName);
+                            break;
+                        }
+                    }
+                }
             }
         }
         if (auto* call = dynamic_cast<CFlatParser::PostfixExpressionContext*>(node))
         {
+            const std::string callText = call->getText();
+            for (auto* args : call->argumentExpressionList())
+                for (auto* arg : args->argumentNamedExpression())
+                    if (arg->assignmentExpression() != nullptr)
+                    {
+                        const std::string argText = arg->assignmentExpression()->getText();
+                        if (!argText.empty() && argText[0] == '&')
+                            if (const std::string root = markContainerPath(argText.substr(1),
+                                    (size_t)call->getStart()->getTokenIndex()); !root.empty())
+                                written.insert(root);
+                        if (auto alias = addressAliases.find(argText); alias != addressAliases.end()
+                            && (size_t)call->getStart()->getTokenIndex() > alias->second.second)
+                            written.insert(alias->second.first);
+                    }
             std::string rootName, method;
             auto path = receiverPath(call, rootName, method);
+            if (callText.find("._") != std::string::npos)
+                for (const auto& param : paramTypes)
+                    if (callText.rfind(param.first + ".", 0) == 0
+                        && !NameShadowedByEnclosingLocal(call, param.first))
+                        written.insert(param.first);
             if (!path.empty())
             {
                 path.erase(path.begin());
+                auto alias = wholeParamAliases.find(rootName);
+                if (alias != wholeParamAliases.end()
+                    && (size_t)call->getStart()->getTokenIndex() > alias->second.token)
+                {
+                    std::unordered_set<std::string> active;
+                    if (callMutates(callMutates, alias->second.pointeeType, path, method, active))
+                        written.insert(alias->second.root);
+                }
                 if (auto param = paramTypes.find(rootName); param != paramTypes.end()
                     && !NameShadowedByEnclosingLocal(call, rootName))
                 {
                     std::unordered_set<std::string> active;
                     if (callMutates(callMutates, param->second, path, method, active))
+                        written.insert(rootName);
+                    if (callText.find("()->") != std::string::npos
+                        && callMutates(callMutates, param->second, {}, method, active))
                         written.insert(rootName);
                 }
                 if (auto alias = containerAliases.find(rootName); alias != containerAliases.end()
@@ -9716,6 +10178,29 @@ void MainListener::CopyWrittenCopyableParams(CFlatParser::FunctionDefinitionCont
     });
     if (hasByValueContainerParam)
         collectContainerMutationRoots(collectContainerMutationRoots, func->compoundStatement());
+    const std::string bodyText = func->compoundStatement()->getText();
+    for (const auto& p : params)
+    {
+        if (p.VariableName.empty()) continue;
+        size_t pos = bodyText.find(p.VariableName + ".");
+        while (pos != std::string::npos)
+        {
+            const size_t end = bodyText.find_first_of(";,}", pos);
+            const size_t internalCall = bodyText.find("._", pos);
+            if (internalCall != std::string::npos
+                && (end == std::string::npos || internalCall < end))
+            {
+                const size_t fieldsStart = pos + p.VariableName.size() + 1;
+                const auto fields = splitLvaluePath(bodyText.substr(fieldsStart, internalCall - fieldsStart));
+                if (!containerAtFieldPath(p.TypeName, fields).empty())
+                {
+                    written.insert(p.VariableName);
+                    break;
+                }
+            }
+            pos = bodyText.find(p.VariableName + ".", pos + p.VariableName.size() + 1);
+        }
+    }
     if (written.empty()) return;
     auto& args = compiler->stackNamedVariable.back().functionArgument;
     for (const auto& p : params)
@@ -9840,20 +10325,21 @@ bool MainListener::DestinationIsAliasBorrowLocal(LLVMBackend* compiler, llvm::Va
         return bind != nullptr && IsAliasBorrowLocalBinding(*bind) && bind->ConditionalDropFlag == nullptr;
     }
 
-void MainListener::RetireAliasBorrowOnRebind(LLVMBackend* compiler, llvm::Value* destination) {
+void MainListener::RetireAliasBorrowOnRebind(LLVMBackend* compiler, llvm::Value* destination,
+        llvm::BasicBlock* assignmentBlock) {
         if (compiler == nullptr || destination == nullptr || compiler->builder == nullptr) return;
-        auto* here = compiler->builder->GetInsertBlock();
-        if (here == nullptr) return;
+        if (assignmentBlock == nullptr) return;
         for (auto& frame : compiler->stackNamedVariable)
             for (auto& [varName, nv] : frame.namedVariable)
             {
                 if (nv.Storage != destination || !IsAliasBorrowLocalBinding(nv)) continue;
                 // Retire ONLY when this store sits in the block the binding was declared in: every
                 // path that reaches scope exit then ran it, so the local really owns what it holds.
-                if (nv.AliasBorrowDeclBlock != here
-                    || nv.AliasBorrowDeclFunction != here->getParent())
+                if (nv.AliasBorrowDeclBlock != assignmentBlock
+                    || nv.AliasBorrowDeclFunction != assignmentBlock->getParent())
                     return;
                 nv.IsAliasBorrow = false;
+                nv.IsAliasReturnBorrow = false;
                 nv.AliasBorrowDeclBlock = nullptr;
                 nv.AliasBorrowDeclFunction = nullptr;
                 return;
@@ -10203,12 +10689,14 @@ bool MainListener::RawHeapBaseIsNewArrayLocal(llvm::Value* gepBase) {
  * provenance - never on the GEP shape alone, since the WHOLE view field is also a single-index
  * GEP and must stay a borrow). Mirrors `IsOwningArrayStringElementRead`'s view-element arm, but
  * for an owning STRUCT return type instead of `string`, which has its own runtime owned bit and
- * its own arm above.
+ * its own arm above. Also admits a dereference of a pointer value and pointer-index element.
  */
 bool MainListener::ReturnSourceIsIndirectOwningLvalue(
-        const LLVMBackend::NamedVariable& nv, llvm::Value* value) {
+        const LLVMBackend::NamedVariable& nv, llvm::Value*) {
         auto* compiler = compilerLLVM;
-        if (value == nullptr || nv.Storage == nullptr) return false;
+        // The return's LLVM value is loaded later in EmitReturnExpression. Classify its source
+        // from storage/provenance here, even while NamedVariable::Primary is still null.
+        if (nv.Storage == nullptr) return false;
         if (nv.TypeAndValue.Pointer || nv.TypeAndValue.ElemPointer
             || nv.TypeAndValue.IsArrayView || nv.TypeAndValue.IsInterface
             || nv.TypeAndValue.IsInterfacePointer || nv.TypeAndValue.IsFunctionPointer)
@@ -10235,8 +10723,18 @@ bool MainListener::ReturnSourceIsIndirectOwningLvalue(
             return false;
         // A whole named local is `movableLocalReturn`'s job; only an indirect lvalue lands here.
         auto* gep = llvm::dyn_cast<llvm::GEPOperator>(nv.Storage);
-        if (gep == nullptr) return false;
+        if (gep == nullptr)
+        {
+            // `*p` records the pointee pointer in Storage; pointer fields such as `h->q` do too.
+            // Do not admit LLVM Arguments here: by-value aggregate params also use that shape.
+            return llvm::isa<llvm::LoadInst>(nv.Storage)
+                && nv.Storage->getType()->isPointerTy();
+        }
         if (!nv.FieldName.empty()) return true;
+        // `p[i]` is a one-index GEP over a struct pointer, unlike a field GEP (two indices).
+        if (nv.IsElementAccess && gep->getNumIndices() == 1
+            && gep->getSourceElementType()->isStructTy())
+            return true;
         // An IMPLICIT self-field read (`return b;` inside a method) carries no FieldName at all -
         // GetMemberVariable deliberately omits it - so admit by GEP SHAPE as the store arms do by
         // Storage alone: a two-index access into a struct (a field) or an array (an element).

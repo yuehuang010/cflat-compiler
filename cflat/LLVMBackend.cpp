@@ -4820,6 +4820,7 @@ void LLVMBackend::ResetForReanalysis()
     cxxImplicitConversionRefusal_.clear();
     cxxTriviallyCopyableRecords_.clear();
     cxxNontrivialRecords_.clear();
+    cxxTriviallyRelocatableRecords_.clear();
     cxxClasses_.clear();
     cxxRecordEntries_.clear();
     pendingCxxRecordProjections_.clear();
@@ -4854,6 +4855,10 @@ void LLVMBackend::ResetForReanalysis()
     pendingCxxTernaryDeclFailed_ = false;
     lastCxxRetTemp_ = nullptr;
     lastCxxRetValue_ = nullptr;
+    lastLoweredRetTemp_ = nullptr;
+    lastLoweredRetValue_ = nullptr;
+    opaqueReturnIndirectCalls_.clear();
+    opaqueReturnDiscardSites_.clear();
     // RegisterEncodedClosureType memoizes on this map but writes the encoded closure's backing
     // entries into dataStructures/functionTable, both just cleared. A survivor makes the next
     // file's registration early-return, leaving `Lambda<int(int)>` resolvable as an encoded name
@@ -7439,6 +7444,7 @@ bool LLVMBackend::SaveCoreBitcode(const std::string& cacheDir, const std::string
             so["name"]      = name;
             so["llvm_type"] = sd.StructType ? std::string(sd.StructType->getName()) : "";
             so["is_union"]  = sd.IsUnion;
+            so["needs_cxx_lowering"] = sd.NeedsCxxLowering;
             if (sd.CxxOffsetLayout)
             {
                 so["cxx_offset_layout"] = true;
@@ -8029,6 +8035,7 @@ bool LLVMBackend::LoadCoreBitcodeIfFresh(const std::string& cacheDir, const std:
                 sd.StructType = llvm::StructType::getTypeByName(*context, v->str());
             if (!sd.StructType) continue;
             if (auto v = so->getBoolean("is_union"))    sd.IsUnion = *v;
+            if (auto v = so->getBoolean("needs_cxx_lowering")) sd.NeedsCxxLowering = *v;
             if (auto v = so->getBoolean("cxx_offset_layout")) sd.CxxOffsetLayout = *v;
             if (auto* offsets = so->getArray("cxx_field_offsets"))
                 for (auto& offset : *offsets)

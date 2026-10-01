@@ -91,16 +91,35 @@ llvm::Value* MainListener::EmitAggregateFieldInitialization(
     const std::string& structName,
     llvm::StructType*& structType,
     std::vector<LLVMBackend::DeclTypeAndValue>& fields,
-    size_t fieldCount)
+    size_t fieldCount,
+    llvm::Value* destination)
 {
     auto* compiler = Compiler();
     std::vector<llvm::Value*> initializers;
     std::vector<char> initializerUnsigned;
+    std::vector<char> initializedInPlace;
+    // In-place construction: fields without an initializer read as 0, like the value seed below.
+    if (destination != nullptr)
+        compiler->builder->CreateStore(llvm::Constant::getNullValue(structType), destination);
     // A field initializer that unwinds destroys the fields already built.
     LLVMBackend::UnwindPartialScope partialFields(*compiler);
     for (size_t fieldIndex = 0; fieldIndex < fields.size() && fieldIndex < fieldCount; ++fieldIndex)
     {
         auto& field = fields[fieldIndex];
+        llvm::Value* fieldDestination = nullptr;
+        if (destination != nullptr && fieldIndex < structType->getNumElements())
+            fieldDestination = compiler->builder->CreateStructGEP(
+                structType, destination, (unsigned)fieldIndex, field.VariableName);
+        const bool armFieldSret = fieldDestination != nullptr && !field.Pointer
+            && !field.IsAlias && !field.IsArrayView && field.ConstArraySize == 0
+            && compiler->ReturnsViaCxxSret(field.TypeName);
+        if (armFieldSret)
+        {
+            compiler->pendingCxxSretDest_ = fieldDestination;
+            compiler->pendingCxxSretTypeName_ = field.TypeName;
+            compiler->pendingCxxSretReturn_ = true;
+            compiler->pendingCxxSretForFixedArray_ = true;
+        }
         llvm::Value* rvalue = nullptr;
         bool fieldSrcUnsigned = false;
         if (auto* braceList = FieldDefaultBraceList(field))
@@ -136,10 +155,24 @@ llvm::Value* MainListener::EmitAggregateFieldInitialization(
                 rvalue = GenerateDefaultValue(field);
             }
         }
+        const bool initializedDirectly = armFieldSret
+            && compiler->pendingCxxSretDest_ == nullptr;
+        if (armFieldSret)
+        {
+            compiler->pendingCxxSretDest_ = nullptr;
+            compiler->pendingCxxSretTypeName_.clear();
+            compiler->pendingCxxSretReturn_ = false;
+            compiler->pendingCxxSretForFixedArray_ = false;
+        }
         initializers.push_back(rvalue);
         initializerUnsigned.push_back(fieldSrcUnsigned ? 1 : 0);
-        compiler->NoteUnwindPartial(LLVMBackend::UnwindPartialEntry::Kind::Value, rvalue,
-                                    field.TypeName);
+        initializedInPlace.push_back(initializedDirectly ? 1 : 0);
+        if (initializedDirectly)
+            compiler->NoteUnwindPartial(LLVMBackend::UnwindPartialEntry::Kind::Slot,
+                                        fieldDestination, field.TypeName);
+        if (!initializedDirectly)
+            compiler->NoteUnwindPartial(LLVMBackend::UnwindPartialEntry::Kind::Value, rvalue,
+                                        field.TypeName);
     }
 
     llvm::Value* structValue = llvm::Constant::getNullValue(structType);
@@ -151,12 +184,45 @@ llvm::Value* MainListener::EmitAggregateFieldInitialization(
         llvm::Value* const firstPassValue = rvalue;
         auto* destType = structType->getTypeAtIndex(index);
         auto& field = fields[index];
+        if (destination != nullptr && initializedInPlace[index])
+            continue;
+        llvm::Value* fieldDestination = nullptr;
+        if (destination != nullptr)
+            fieldDestination = compiler->builder->CreateStructGEP(
+                structType, destination, index, field.VariableName);
         if (rvalue == nullptr && (destType->isStructTy() || destType->isArrayTy()))
         {
             if (destType->isArrayTy())
                 rvalue = GenerateDefaultValue(field);
             else if (compiler->GetFunction(field.TypeName))
+            {
+                const bool armFieldSret = fieldDestination != nullptr && !field.Pointer
+                    && !field.IsAlias && !field.IsArrayView
+                    && compiler->ReturnsViaCxxSret(field.TypeName);
+                if (armFieldSret)
+                {
+                    compiler->pendingCxxSretDest_ = fieldDestination;
+                    compiler->pendingCxxSretTypeName_ = field.TypeName;
+                    compiler->pendingCxxSretReturn_ = true;
+                    compiler->pendingCxxSretForFixedArray_ = true;
+                }
                 rvalue = compiler->CreateOverloadedFunctionCall(field.TypeName, {}, true);
+                const bool initializedDirectly = armFieldSret
+                    && compiler->pendingCxxSretDest_ == nullptr;
+                if (armFieldSret)
+                {
+                    compiler->pendingCxxSretDest_ = nullptr;
+                    compiler->pendingCxxSretTypeName_.clear();
+                    compiler->pendingCxxSretReturn_ = false;
+                    compiler->pendingCxxSretForFixedArray_ = false;
+                }
+                if (initializedDirectly)
+                {
+                    compiler->NoteUnwindPartial(LLVMBackend::UnwindPartialEntry::Kind::Slot,
+                                                fieldDestination, field.TypeName);
+                    continue;
+                }
+            }
             else
                 rvalue = llvm::Constant::getNullValue(destType);
         }
@@ -185,7 +251,10 @@ llvm::Value* MainListener::EmitAggregateFieldInitialization(
         }
         if (rvalue->getType() == destType)
         {
-            structValue = compiler->CreateInsertValue(structValue, rvalue, index);
+            if (destination != nullptr)
+                compiler->builder->CreateStore(rvalue, fieldDestination);
+            else
+                structValue = compiler->CreateInsertValue(structValue, rvalue, index);
             if (rvalue != firstPassValue)
                 compiler->NoteUnwindPartial(LLVMBackend::UnwindPartialEntry::Kind::Value, rvalue,
                                             field.TypeName);
@@ -1270,9 +1339,22 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
         {
             auto funcDef = compiler->CreateFunctionDefinition(structName, returnType, {});
 
+            const bool sretCtor = !isUnion && compiler->NeedsCxxLoweringType(structName)
+                && compiler->currentFunctionAbiRecipe.retSlot.kind
+                    == LLVMBackend::AbiSlot::SRetReturn;
             if (isUnion)
             {
                 EmitUnionDefaultConstructorBody(ctx, structName, structType, declList);
+            }
+            else if (sretCtor)
+            {
+                // A classified struct is built in the caller's sret slot, each C++ field
+                // constructed in place (plan cflat-struct-nontrivial-cxx-fields phase 2).
+                llvm::Value* sretDest = compiler->currentFunction->getArg(
+                    compiler->SRetArgIndex(compiler->currentFunctionAbiRecipe));
+                EmitAggregateFieldInitialization(structName, structType, declList, SIZE_MAX,
+                                                 sretDest);
+                compiler->CreateReturnCall(nullptr);
             }
             else
             {
@@ -4063,9 +4145,15 @@ void MainListener::ParseClassDefinition(CFlatParser::ClassDefinitionContext* ctx
 
             // The struct default ctor's field walk: a field initializer that unwinds destroys the
             // fields already built.
-            llvm::Value* structVal = EmitAggregateFieldInitialization(structName, structType, declList);
+            llvm::Value* sretDest = nullptr;
+            if (compiler->currentFunctionAbiRecipe.retSlot.kind
+                == LLVMBackend::AbiSlot::SRetReturn)
+                sretDest = compiler->currentFunction->getArg(
+                    compiler->SRetArgIndex(compiler->currentFunctionAbiRecipe));
+            llvm::Value* structVal = EmitAggregateFieldInitialization(
+                structName, structType, declList, SIZE_MAX, sretDest);
 
-            compiler->CreateReturnCall(structVal);
+            compiler->CreateReturnCall(sretDest != nullptr ? nullptr : structVal);
             compiler->CreateBlockBreak(nullptr, true);
         } // end if (!hasExplicitNoArgCtor)
 
@@ -4799,7 +4887,17 @@ void MainListener::EmitCppStructMoveThunk(antlr4::ParserRuleContext* ctx,
         {
             uint64_t fieldStart = 0;
             uint64_t fieldBytes = 0;
-            if (compiler->GetGeneratedCxxFieldBlock(structName, fieldStart, fieldBytes))
+            const bool memberwise = compiler->NeedsCxxLoweringType(structName);
+            if (memberwise
+                && compiler->GetGeneratedCxxFieldBlock(structName, fieldStart, fieldBytes))
+            {
+                // A C++ field that is not trivially relocatable is move-constructed, never
+                // bit-copied (plan cflat-struct-nontrivial-cxx-fields, rule A).
+                compiler->EmitLoweredMemberwiseMove(structName, structType, dst, src,
+                                                    "in the generated move constructor",
+                                                    fieldStart, fieldStart + fieldBytes);
+            }
+            else if (compiler->GetGeneratedCxxFieldBlock(structName, fieldStart, fieldBytes))
             {
                 auto* dstBytes = compiler->builder->CreateBitCast(
                     dst, llvm::PointerType::get(compiler->builder->getInt8Ty(), 0));
@@ -4876,8 +4974,17 @@ void MainListener::ParseConstructorDefinition(CFlatParser::FunctionDefinitionCon
         // Get the struct's LLVM type (without pointer)
         auto* structLLVMType = llvm::cast<llvm::StructType>(compiler->GetType(returnType, nullptr, false));
 
-        // Alloca the struct so we can GEP into fields via 'this'
-        auto* thisAlloca = compiler->AllocaAtEntry(structLLVMType, nullptr, structName + "__");
+        // Classified values are built in their caller-owned sret slot.
+        llvm::Value* thisAlloca = nullptr;
+        const bool cxxSretCtor = compiler->NeedsCxxLoweringType(structName)
+            && compiler->currentFunctionAbiRecipe.hasLowering
+            && compiler->currentFunctionAbiRecipe.retSlot.kind
+                == LLVMBackend::AbiSlot::SRetReturn;
+        if (cxxSretCtor && compiler->currentFunction != nullptr)
+            thisAlloca = compiler->currentFunction->getArg(
+                compiler->SRetArgIndex(compiler->currentFunctionAbiRecipe));
+        else
+            thisAlloca = compiler->AllocaAtEntry(structLLVMType, nullptr, structName + "__");
 
         // An unwind out of a field initializer destroys the fields already built; one out of
         // the body destroys every member but never runs the user ~T (construction never ended).
@@ -5008,9 +5115,14 @@ void MainListener::ParseConstructorDefinition(CFlatParser::FunctionDefinitionCon
         if (auto* blockItemList = func->compoundStatement()->blockItemList())
             ParseBlockItemList(blockItemList);
 
-        // Load and return the (possibly mutated) struct by value
-        auto* resultVal = compiler->CreateLoad(structLLVMType, thisAlloca);
-        compiler->CreateReturnCall(resultVal);
+        // Classified aggregates already occupy the caller's sret slot.
+        if (cxxSretCtor)
+            compiler->CreateReturnCall(nullptr);
+        else
+        {
+            auto* resultVal = compiler->CreateLoad(structLLVMType, thisAlloca);
+            compiler->CreateReturnCall(resultVal);
+        }
         compiler->CreateBlockBreak(nullptr, true);
         compiler->ClearCurrentSubprogram();
 

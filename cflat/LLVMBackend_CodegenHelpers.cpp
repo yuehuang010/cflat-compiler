@@ -61,6 +61,9 @@ void LLVMBackend::createFunctionBlock(llvm::Function* fn, const std::string& fri
         // with the outer DISubprogram trip the verifier (`!dbg attachment points at wrong subprogram`).
         builder->SetCurrentDebugLocation(llvm::DebugLoc());
         auto& stackState = stackNamedVariable.emplace_back();
+        const auto* functionSymbol = FindSymbolForFunction(fn);
+        const bool ownsCFlatExternParams = functionSymbol != nullptr
+            && functionSymbol->External && functionSymbol->HasCFlatBody;
 
         stackState.continueBlock = &fn->back();
         stackState.resumeBlock = &fn->back();
@@ -169,7 +172,9 @@ void LLVMBackend::createFunctionBlock(llvm::Function* fn, const std::string& fri
                     .BaseType = abiSlot->structTy,
                     .Primary = nullptr,
                     .Storage = incomingArg,
-                    .IsOwningStruct = (!IsForeignNontrivialCxxClass(itr_nameArg->TypeName)
+                    .IsOwningStruct = (ownsCFlatExternParams
+                        && CFlatExternOwnsByValueParam(*itr_nameArg))
+                        || (!IsForeignNontrivialCxxClass(itr_nameArg->TypeName)
                         && HasForeignNontrivialCxxField(itr_nameArg->TypeName))
                         || IsCxxParamDestroyedInCallee(itr_nameArg->TypeName),
                 };
@@ -306,6 +311,7 @@ void LLVMBackend::createFunctionBlock(llvm::Function* fn, const std::string& fri
                     && IsCoreUniqueType(itr_nameArg->TypeName);
                 if (!OwningSinkConsumesConcrete(*itr_nameArg) && !itr_nameArg->IsMove
                     && !itr_nameArg->IsAlias
+                    && !(ownsCFlatExternParams && CFlatExternOwnsByValueParam(*itr_nameArg))
                     && !coreUniqueValueParam
                     && IsOwningValueOrClosureType(itr_nameArg->TypeName))
                     namedVar.IsBorrowedOwningValue = true;
@@ -316,6 +322,8 @@ void LLVMBackend::createFunctionBlock(llvm::Function* fn, const std::string& fri
                 if ((OwningSinkConsumesConcrete(*itr_nameArg) || coreUniqueValueParam)
                     && IsOwningValueType(itr_nameArg->TypeName)
                     && !IsCopyableType(itr_nameArg->TypeName))
+                    namedVar.IsOwningStruct = true;
+                if (ownsCFlatExternParams && CFlatExternOwnsByValueParam(*itr_nameArg))
                     namedVar.IsOwningStruct = true;
                 RegisterFunctionArgument(itr_nameArg->VariableName, namedVar);
             }
@@ -1728,6 +1736,13 @@ bool LLVMBackend::HasNonTrivialDestructor(const std::string& typeName)
 bool LLVMBackend::IsOwningValueType(const std::string& typeName)
 {
         return HasTypeAnnotation(typeName, "unique") || HasNonTrivialDestructor(typeName);
+    }
+
+bool LLVMBackend::CFlatExternOwnsByValueParam(const TypeAndValue& p)
+{
+        if (p.Pointer || p.ElemPointer || p.IsInterface || p.IsInterfacePointer) return false;
+        if (p.IsArrayView || p.IsSimd || p.ConstArraySize > 0 || p.IsMove || p.IsAlias) return false;
+        return !IsForeignNontrivialCxxClass(p.TypeName) && IsOwningValueType(p.TypeName);
     }
 
 bool LLVMBackend::HasForeignNontrivialCxxField(const std::string& typeName) const

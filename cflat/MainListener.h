@@ -2529,7 +2529,7 @@ static ValueStructReturnKind ClassifyValueStructReturns(
 {
     if (func == nullptr || func->compoundStatement() == nullptr) return ValueStructReturnKind::NotApplicable;
     if (returnType.TypeName.empty() || returnType.Pointer || returnType.ElemPointer) return ValueStructReturnKind::NotApplicable;
-    if (returnType.IsMove || returnType.IsAlias || returnType.external) return ValueStructReturnKind::NotApplicable;
+    if (returnType.IsMove || returnType.IsAlias) return ValueStructReturnKind::NotApplicable;
 
     std::vector<CFlatParser::ExpressionContext*> returns;
     CollectOwnReturnExpressions(func->compoundStatement(), returns);
@@ -5326,7 +5326,8 @@ public:
      * stands and the new value LEAKS, which is the safe direction - the alternative destroys a
      * value the real owner still frees on the path that did not rebind.
      */
-    static void RetireAliasBorrowOnRebind(LLVMBackend* compiler, llvm::Value* destination);
+    static void RetireAliasBorrowOnRebind(LLVMBackend* compiler, llvm::Value* destination,
+                                         llvm::BasicBlock* assignmentBlock);
 
     /*
      * Same hazard as RejectAliasStoreIntoField with an owning LOCAL/GLOBAL destination (`other = k`)
@@ -5942,6 +5943,8 @@ public:
      */
     bool UnifyTernaryArmTypes(CFlatParser::ConditionalExpressionContext* ctx,
                               llvm::Value*& trueValue, llvm::Value*& falseValue,
+                              const LLVMBackend::TypedValue& trueShape,
+                              const LLVMBackend::TypedValue& falseShape,
                               const std::function<void()>& atTrue,
                               const std::function<void()>& atFalse,
                               size_t trueOccurrence, size_t falseOccurrence,
@@ -6602,7 +6605,8 @@ public:
         const std::string& structName,
         llvm::StructType*& structType,
         std::vector<LLVMBackend::DeclTypeAndValue>& fields,
-        size_t fieldCount = SIZE_MAX);
+        size_t fieldCount = SIZE_MAX,
+        llvm::Value* destination = nullptr);
 
     /*
      * The fixed-array arm of the above. The list is POSITIONAL, so the value has to be built
@@ -7170,6 +7174,7 @@ public:
 
     bool IsDefaultOnlyExpression(antlr4::ParserRuleContext* ctx) const;
     LLVMBackend::TypeAndValue InferTernaryArmType(llvm::Value* value);
+    LLVMBackend::TypeAndValue InferTernaryArmType(const LLVMBackend::TypedValue& value);
 
     // A discarded statement result (`makePlain(2);`) that is an unclaimed owning-struct rvalue
     // temp is claimed by nothing, so without this it leaks. Spill it and register for destruction
@@ -7178,7 +7183,7 @@ public:
     // rvalue-temp signal: a named local or a deref (`(*p)`) carries Storage and is freed by its own
     // scope dtor, so we must not double-free it here. `alias` borrows and string/closure values
     // (own runtime owned-bit + temp lists) are excluded.
-    void RegisterDiscardedOwningStructTemp(const LLVMBackend::NamedVariable& nv);
+    void RegisterDiscardedOwningStructTemp(const LLVMBackend::NamedVariable& nv, bool bare = false);
 
     // Mandatory-nodiscard: an owning RETURN value used as a bare discarded statement (or a bare
     // for-update) must be consumed, not dropped. Value identity picks out exactly the top-level

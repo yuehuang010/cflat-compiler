@@ -2794,10 +2794,12 @@ llvm::Value* LLVMBackend::CallInterfaceMethod(llvm::Value* ifacePtr, const std::
 
         lastCxxRetTemp_ = nullptr;
         lastCxxRetValue_ = nullptr;
+        lastLoweredRetTemp_ = nullptr;
+        lastLoweredRetValue_ = nullptr;
         const bool cxxSretReturn = !methodInfo->ReturnType.Pointer
             && !methodInfo->ReturnType.IsAlias
             && !methodInfo->ReturnType.IsArrayView
-            && IsForeignNontrivialCxxReturnClass(methodInfo->ReturnType.TypeName);
+            && ReturnsViaCxxSret(methodInfo->ReturnType.TypeName);
         std::vector<TypeAndValue> interfaceRecipeParams;
         TypeAndValue receiver;
         receiver.TypeName = ifaceName;
@@ -2824,8 +2826,14 @@ llvm::Value* LLVMBackend::CallInterfaceMethod(llvm::Value* ifacePtr, const std::
             {
                 const uint64_t align = module->getDataLayout().getABITypeAlign(structTy).value();
                 cxxSretDest = AllocaAtEntry(structTy, nullptr, "cxx.interface.rettemp", align);
-                RegisterOwnedStructTemp(cxxSretDest, methodInfo->ReturnType.TypeName);
-                lastCxxRetTemp_ = cxxSretDest;
+                // A lowered CFlat-only result keeps CFlat by-value ownership: not ledger-owned.
+                if (IsLoweredCFlatOnlyStruct(methodInfo->ReturnType.TypeName))
+                    lastLoweredRetTemp_ = cxxSretDest;
+                else
+                {
+                    RegisterOwnedStructTemp(cxxSretDest, methodInfo->ReturnType.TypeName);
+                    lastCxxRetTemp_ = cxxSretDest;
+                }
             }
         }
 
@@ -3044,7 +3052,13 @@ llvm::Value* LLVMBackend::CallInterfaceMethod(llvm::Value* ifacePtr, const std::
         if (cxxSretReturn)
         {
             resultValue = CreateLoad(cxxSretDest);
-            lastCxxRetValue_ = resultValue;
+            if (IsLoweredCFlatOnlyStruct(methodInfo->ReturnType.TypeName))
+            {
+                lastLoweredRetValue_ = resultValue;
+                nullConditionalTempResults_.push_back(resultValue);
+            }
+            else
+                lastCxxRetValue_ = resultValue;
         }
         RegisterRawArrayCallResult(callResult, rawReturnCountSlot,
                                    methodInfo->ReturnType.AllocAlignValue);

@@ -4442,6 +4442,7 @@ void LLVMBackend::MapRawRecords(const cflat_cinterop::ExtractResult& raw, std::v
             rec.isCxx = r.isCxx; rec.isPacked = r.isPacked;
             rec.specialMembersPending = r.specialMembersPending;
             rec.isTriviallyCopyable = r.isTriviallyCopyable;
+            rec.isTriviallyRelocatable = r.isTriviallyRelocatable;
             rec.sizeBytes = r.sizeBytes; rec.alignBytes = r.alignBytes;
             rec.isTrivial = r.isTrivial;
             rec.line = r.line ? r.line : 1; rec.col = r.col < 0 ? 0 : r.col;
@@ -7011,6 +7012,7 @@ uint64_t LLVMBackend::CxxGroupHeaderHash(const CxxRequestGroup& group) const
         raw.alignBytes = cached.alignBytes;
         raw.isTrivial = cached.isTrivial;
         raw.isTriviallyCopyable = cached.isTriviallyCopyable;
+        raw.isTriviallyRelocatable = cached.isTriviallyRelocatable;
         raw.isPolymorphic = cached.isPolymorphic;
         raw.hasBases = cached.hasBases;
         raw.hasVirtualBases = cached.hasVirtualBases;
@@ -15527,6 +15529,7 @@ void LLVMBackend::RegisterCxxRecordShell(const CRecordEntry& r, const std::strin
         if (dataStructures.find(r.name) == dataStructures.end())
             CreateStructType(r.name, {});
         cxxRecords_.insert(r.name);
+        if (r.isTriviallyRelocatable) cxxTriviallyRelocatableRecords_.insert(r.name);
         const bool stdValueRecord = r.name.starts_with("std.pair$")
                                   || r.name.starts_with("std.optional$")
                                   || r.name.starts_with("std.tuple$");
@@ -16701,6 +16704,7 @@ void LLVMBackend::RegisterCRecords(std::vector<CRecordEntry>& records, const std
             if (r.isCxx)
             {
                 cxxRecords_.insert(r.name);
+                if (r.isTriviallyRelocatable) cxxTriviallyRelocatableRecords_.insert(r.name);
                 const bool stdValueRecord = r.name.starts_with("std.pair$")
                                           || r.name.starts_with("std.optional$")
                                           || r.name.starts_with("std.tuple$");
@@ -17545,6 +17549,7 @@ void LLVMBackend::RegisterCxxClassMembers(const CRecordEntry& r, const std::stri
             info.hasTrivialDefaultCtor = r.hasTrivialDefaultCtor;
             info.hasTrivialCopyCtor    = r.hasTrivialCopyCtor;
             info.hasTrivialDtor        = r.hasTrivialDtor;
+            info.isTriviallyRelocatable = r.isTriviallyRelocatable;
             info.paramDestroyedInCallee = r.paramDestroyedInCallee;
             info.hasDeletedDefaultCtor = r.hasDeletedDefaultCtor;
             info.hasDeletedCopyCtor    = r.hasDeletedCopyCtor;
@@ -22968,6 +22973,66 @@ LLVMBackend::CxxConvertingCtorResult LLVMBackend::ConvertThroughCxxConvertingCto
         return CxxConvertingCtorResult::NotApplicable;
 }
 
+bool LLVMBackend::EmitLoweredMemberwiseMove(const std::string& typeName, llvm::Type* valueType,
+                                            llvm::Value* dest, llvm::Value* src,
+                                            const char* context, uint64_t skipBefore,
+                                            uint64_t skipAfter)
+{
+        if (auto* arrayType = llvm::dyn_cast<llvm::ArrayType>(valueType))
+        {
+            for (uint64_t i = 0; i < arrayType->getNumElements(); ++i)
+            {
+                auto* index = builder->getInt64(i);
+                auto* dstElem = builder->CreateInBoundsGEP(arrayType, dest,
+                                                           { builder->getInt32(0), index });
+                auto* srcElem = builder->CreateInBoundsGEP(arrayType, src,
+                                                           { builder->getInt32(0), index });
+                if (!EmitLoweredMemberwiseMove(typeName, arrayType->getElementType(), dstElem,
+                                               srcElem, context))
+                    return false;
+            }
+            return true;
+        }
+        const bool generated = generatedCxxRecords_.count(typeName) != 0;
+        const bool wholeWalk = skipBefore == 0 && skipAfter == UINT64_MAX;
+        if (!generated && IsForeignNontrivialCxxClass(typeName))
+            return EmitCxxCopyOrMoveConstruct(typeName, dest, src, true, context);
+        if (generated && wholeWalk)
+            return EmitCxxCopyOrMoveConstruct(typeName, dest, src, true, context);
+        if (valueType->isStructTy() && NeedsCxxLoweringType(typeName))
+        {
+            const auto data = GetDataStructure(typeName);
+            auto* structType = llvm::cast<llvm::StructType>(valueType);
+            const auto* layout = module->getDataLayout().getStructLayout(structType);
+            for (size_t i = 0; i < data.StructFields.size()
+                 && i < structType->getNumElements(); ++i)
+            {
+                const uint64_t offset = layout->getElementOffset((unsigned)i);
+                if (offset < skipBefore || offset >= skipAfter) continue;
+                const auto& field = data.StructFields[i];
+                auto* fieldType = structType->getElementType((unsigned)i);
+                auto* dstField = builder->CreateStructGEP(structType, dest, (unsigned)i);
+                auto* srcField = builder->CreateStructGEP(structType, src, (unsigned)i);
+                const bool memberwise = !field.Pointer && !field.ElemPointer && !field.IsArrayView;
+                if (memberwise)
+                {
+                    if (!EmitLoweredMemberwiseMove(field.TypeName, fieldType, dstField, srcField,
+                                                   context))
+                        return false;
+                    continue;
+                }
+                auto* value = builder->CreateLoad(fieldType, srcField);
+                builder->CreateStore(value, dstField);
+                builder->CreateStore(llvm::Constant::getNullValue(fieldType), srcField);
+            }
+            return true;
+        }
+        auto* value = builder->CreateLoad(valueType, src);
+        builder->CreateStore(value, dest);
+        builder->CreateStore(llvm::Constant::getNullValue(valueType), src);
+        return true;
+}
+
 bool LLVMBackend::EmitCxxCopyOrMoveConstruct(const std::string& typeName, llvm::Value* dest,
                                              llvm::Value* src, bool useMove, const char* context,
                                              const std::string& displayTypeName)
@@ -23000,6 +23065,18 @@ bool LLVMBackend::EmitCxxCopyOrMoveConstruct(const std::string& typeName, llvm::
         if (ctor == nullptr)
         {
             const CxxClassInfo* info = GetCxxClassInfo(typeName);
+            // A CFlat struct holding a nontrivial C++ field is not a C++ class: say so.
+            if (info == nullptr && dataStructures.contains(typeName))
+            {
+                LogError(std::format(
+                    "cannot {} struct '{}' {}: it holds a C++ field that is not trivially "
+                    "relocatable, and member-wise {} of such a struct is not supported - "
+                    "pass or hold it by pointer instead",
+                    useMove ? "move" : "copy",
+                    displayTypeName.empty() ? DisplayCxxClassName(typeName) : displayTypeName, context,
+                    useMove ? "move" : "copy"));
+                return false;
+            }
             const bool deleted = info != nullptr && info->hasDeletedCopyCtor;
             LogError(std::format(
                 "cannot {} C++ class '{}' {}: its {} constructor is {} - "

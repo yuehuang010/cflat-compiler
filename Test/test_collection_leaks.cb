@@ -80,6 +80,112 @@ void _growBareQueue(queue<int> values)
 {
     for (int i = 0; i < 100; i++) values.enqueue(i);
 }
+int _classifierCopyCount = 0;
+void _classifierGrowList(list<int>* values)
+{
+    for (int i = 0; i < 50; i++) values->add(i);
+}
+struct ClassifierBox
+{
+    list<int> xs = default;
+    dictionary<int, int> d = default;
+    hashset<int> hs = default;
+    queue<int> q = default;
+    void seed() { xs.add(7); d.add(1, 2); hs.add(7); q.enqueue(7); }
+    void late() { _classifierGrowList(&xs); }
+    list<int>* lp() { return &xs; }
+    void viaLp() { for (int i = 0; i < 50; i++) lp()->add(i); }
+    static void sput(list<int>* values, int v) { for (int i = 0; i < 50; i++) values->add(v); }
+    void viaStatic() { ClassifierBox.sput(&xs, 1); }
+    void viaHelper() { _classifierGrowList(&xs); }
+    void fill(int padding) { for (int i = 0; i < 40; i++) xs.add(padding); }
+    void put(int value) { for (int i = 0; i < 40; i++) xs.add(value); }
+    ClassifierBox* self() { return this; }
+    void viaThisAlias() { ClassifierBox* me = this; me->put(9); }
+    void viaFreeThis() { _classifierFillBox(); }
+    ClassifierBox copy()
+    {
+        _classifierCopyCount++;
+        ClassifierBox r = default;
+        for (int i = 0; i < xs.count(); i++) r.xs.add(xs[i]);
+        for (int i = 0; i < d.slotCount(); i++)
+            if (d.slotOccupied(i)) r.d.add(d.keyAt(i), d.valueAt(i));
+        list<int> items = hs.items();
+        for (int i = 0; i < items.count(); i++) r.hs.add(items[i]);
+        r.q = q.copy();
+        return move r;
+    }
+};
+struct ClassifierOuter { ClassifierBox inb = default; };
+void _classifierFillBox(ClassifierBox* box)
+{
+    for (int i = 0; i < 40; i++) box->xs.add(i);
+}
+void _classifierWholeAlias(ClassifierBox box)
+{
+    ClassifierBox* p = &box;
+    p->late();
+    p->xs.add(9);
+}
+void _classifierHashset(ClassifierBox box)
+{
+    for (int i = 0; i < 50; i++) box.hs.add(i);
+}
+void _classifierIndexStores(ClassifierBox box)
+{
+    box.xs[0] = 99;
+    box.d[1] = 77;
+}
+void _classifierRefStores(ClassifierBox box)
+{
+    box.xs.get(0) = 99;
+    box.d.get(1) = 77;
+    box.q.peek() = 88;
+}
+void _classifierReadOnly(ClassifierBox box)
+{
+    int count = box.xs.count() + box.d.count() + box.hs.count() + box.q.count();
+}
+void _classifierInternalGrow(ClassifierBox box) { box.xs._grow(); }
+void _classifierReturnedPointer(ClassifierBox box) { box.viaLp(); }
+void _classifierStaticEscape(ClassifierBox box) { box.viaStatic(); }
+void _classifierHelperEscape(ClassifierBox box) { box.viaHelper(); }
+void _classifierNameArgument(ClassifierBox box)
+{
+    int add = 9;
+    for (int i = 0; i < 40; i++) box.xs.add(add);
+}
+void _classifierDictNameArgument(ClassifierBox box)
+{
+    int k = 1; int offset = 9;
+    for (int i = 0; i < 40; i++) box.d.set(k, offset);
+}
+void _classifierMethodNameArgument(ClassifierBox box)
+{
+    box.fill(9);
+}
+void _classifierNestedPointerAlias(ClassifierOuter outer)
+{
+    ClassifierBox* p = &outer.inb;
+    for (int i = 0; i < 40; i++) p->xs.add(i);
+}
+void _classifierContainerAliasChain(ClassifierBox box)
+{
+    list<int>* p = &box.xs;
+    list<int>* q = p;
+    for (int i = 0; i < 40; i++) q->add(i);
+}
+void _classifierGetterMethodChain(ClassifierBox box) { box.self()->put(9); }
+void _classifierThisAlias(ClassifierBox box) { box.viaThisAlias(); }
+void _classifierFreeThis(ClassifierBox box) { box.viaFreeThis(); }
+struct ClassifierOuter { ClassifierBox inb = default; };
+void _classifierFieldAliasIncrement(ClassifierOuter o) { ClassifierBox* p = &o.inb; p->xs[0]++; }
+void _classifierAddressStore(ClassifierBox box)
+{
+    int* element = &box.xs[0];
+    *element = 99;
+}
+void _classifierPostfixStore(ClassifierBox box) { box.xs[0]++; }
 // Compound assignment through an operator overload replaces the LHS: the old owner must be
 // destructed exactly once, whatever lvalue form (local, field, element, deref) the LHS takes.
 struct DrainSum
@@ -530,6 +636,59 @@ struct RawResListBox
         values.add(move item);
     }
 };
+
+int g_writeClassifierCopies = 0;
+struct WriteClassifierBox
+{
+    list<int> values = default;
+    void appendMany<T>()
+    {
+        for (int i = 0; i < 40; i++) values.add(i + 10);
+    }
+    void appendThroughThis()
+    {
+        WriteClassifierBox* self = this;
+        appendWriteClassifierValues(0, self);
+    }
+    WriteClassifierBox copy()
+    {
+        g_writeClassifierCopies++;
+        WriteClassifierBox result = default;
+        for (int i = 0; i < values.count(); i++) result.values.add(values[i]);
+        return move result;
+    }
+};
+void appendWriteClassifierValues(int unused, WriteClassifierBox* box)
+{
+    for (int i = 0; i < 40; i++) box->values.add(i + 10);
+}
+void setWriteClassifierValue(int* value) { *value = 99; }
+void writeClassifierGenericMethod(WriteClassifierBox box) { box.appendMany<int>(); }
+void writeClassifierArrowAlias(WriteClassifierBox box)
+{
+    WriteClassifierBox* first = &box;
+    WriteClassifierBox* second = first;
+    list<int>* values = &second->values;
+    for (int i = 0; i < 40; i++) values->add(i + 10);
+}
+void writeClassifierAliasIndex(WriteClassifierBox box)
+{
+    WriteClassifierBox* alias = &box;
+    alias->values[0] = 99;
+}
+void writeClassifierAliasIncrement(WriteClassifierBox box)
+{
+    WriteClassifierBox* alias = &box;
+    alias->values[0]++;
+}
+void writeClassifierThisArgument(WriteClassifierBox box) { box.appendThroughThis(); }
+void writeClassifierElementAddress(WriteClassifierBox box)
+{
+    int* value = &box.values[0];
+    setWriteClassifierValue(value);
+}
+void writeClassifierDirectListIndex(list<int> values) { values[0] = 99; }
+void writeClassifierDirectListIncrement(list<int> values) { values[0]++; }
 void growByValueListField(RawResListBox box)
 {
     for (int i = 0; i < 8; i++)
@@ -760,6 +919,162 @@ extern int main()
         _growBareQueue(values);
         total++; passed += Test("bare by-value queue caller unchanged", values.count(), 1);
         total++; passed += Test("bare by-value queue caller value", values.peek(), 7);
+    }
+    _classifierCopyCount = 0;
+    {
+        ClassifierBox box = default;
+        box.seed();
+        _classifierWholeAlias(box);
+        total++; passed += Test("classifier whole pointer alias caller count", box.xs.count(), 1);
+        total++; passed += Test("classifier whole pointer alias caller value", box.xs[0], 7);
+        total++; passed += Test("classifier whole pointer alias copies", _classifierCopyCount, 1);
+    }
+    _classifierCopyCount = 0;
+    {
+        ClassifierBox box = default;
+        box.seed();
+        _classifierReturnedPointer(box);
+        total++; passed += Test("classifier returned field pointer caller count", box.xs.count(), 1);
+        total++; passed += Test("classifier returned field pointer caller value", box.xs[0], 7);
+        total++; passed += Test("classifier returned field pointer copies", _classifierCopyCount, 1);
+    }
+    _classifierCopyCount = 0;
+    {
+        ClassifierBox box = default;
+        box.seed();
+        _classifierStaticEscape(box);
+        total++; passed += Test("classifier static pointer escape caller count", box.xs.count(), 1);
+        total++; passed += Test("classifier static pointer escape copies", _classifierCopyCount, 1);
+    }
+    _classifierCopyCount = 0;
+    {
+        ClassifierBox box = default;
+        box.seed();
+        _classifierHelperEscape(box);
+        total++; passed += Test("classifier helper field escape caller count", box.xs.count(), 1);
+        total++; passed += Test("classifier helper field escape caller value", box.xs[0], 7);
+        total++; passed += Test("classifier helper field escape copies", _classifierCopyCount, 1);
+    }
+    _classifierCopyCount = 0;
+    {
+        ClassifierBox box = default; box.seed();
+        _classifierNameArgument(box);
+        total++; passed += Test("classifier D1 list caller value", box.xs[0], 7);
+        total++; passed += Test("classifier D1 list copies", _classifierCopyCount, 1);
+    }
+    _classifierCopyCount = 0;
+    {
+        ClassifierBox box = default; box.seed();
+        _classifierDictNameArgument(box);
+        total++; passed += Test("classifier D1 dict caller value", box.d.get(1), 2);
+        total++; passed += Test("classifier D1 dict copies", _classifierCopyCount, 1);
+    }
+    _classifierCopyCount = 0;
+    {
+        ClassifierBox box = default; box.seed();
+        _classifierMethodNameArgument(box);
+        total++; passed += Test("classifier D1 method caller value", box.xs[0], 7);
+        total++; passed += Test("classifier D1 method copies", _classifierCopyCount, 1);
+    }
+    _classifierCopyCount = 0;
+    {
+        ClassifierOuter outer = default; outer.inb.seed();
+        _classifierNestedPointerAlias(outer);
+        total++; passed += Test("classifier nested pointer alias caller value", outer.inb.xs[0], 7);
+        total++; passed += Test("classifier nested pointer alias copies", _classifierCopyCount, 1);
+    }
+    _classifierCopyCount = 0;
+    {
+        ClassifierBox box = default; box.seed();
+        _classifierContainerAliasChain(box);
+        total++; passed += Test("classifier container alias chain caller value", box.xs[0], 7);
+        total++; passed += Test("classifier container alias chain copies", _classifierCopyCount, 1);
+    }
+    _classifierCopyCount = 0;
+    {
+        ClassifierBox box = default; box.seed();
+        _classifierGetterMethodChain(box);
+        total++; passed += Test("classifier getter method chain caller value", box.xs[0], 7);
+        total++; passed += Test("classifier getter method chain copies", _classifierCopyCount, 1);
+    }
+    _classifierCopyCount = 0;
+    {
+        ClassifierBox box = default; box.seed();
+        _classifierThisAlias(box);
+        total++; passed += Test("classifier this alias caller value", box.xs[0], 7);
+        total++; passed += Test("classifier this alias copies", _classifierCopyCount, 1);
+    }
+    _classifierCopyCount = 0;
+    {
+        ClassifierBox box = default; box.seed();
+        _classifierFreeThis(box);
+        total++; passed += Test("classifier free this caller value", box.xs[0], 7);
+        total++; passed += Test("classifier free this copies", _classifierCopyCount, 1);
+    }
+    _classifierCopyCount = 0;
+    {
+        ClassifierOuter outer = default; outer.inb.seed();
+        _classifierFieldAliasIncrement(outer);
+        total++; passed += Test("classifier field alias increment caller value", outer.inb.xs[0], 7);
+        total++; passed += Test("classifier field alias increment copies", _classifierCopyCount, 1);
+    }
+    _classifierCopyCount = 0;
+    {
+        ClassifierBox box = default; box.seed();
+        _classifierAddressStore(box);
+        total++; passed += Test("classifier address store caller value", box.xs[0], 7);
+        total++; passed += Test("classifier address store copies", _classifierCopyCount, 1);
+    }
+    _classifierCopyCount = 0;
+    {
+        ClassifierBox box = default; box.seed();
+        _classifierPostfixStore(box);
+        total++; passed += Test("classifier postfix store caller value", box.xs[0], 7);
+        total++; passed += Test("classifier postfix store copies", _classifierCopyCount, 1);
+    }
+    _classifierCopyCount = 0;
+    {
+        ClassifierBox box = default;
+        box.seed();
+        _classifierHashset(box);
+        total++; passed += Test("classifier hashset caller count", box.hs.count(), 1);
+        total++; passed += Test("classifier hashset caller value", box.hs.contains(7) ? 1 : 0, 1);
+        total++; passed += Test("classifier hashset copies", _classifierCopyCount, 1);
+    }
+    _classifierCopyCount = 0;
+    {
+        ClassifierBox box = default;
+        box.seed();
+        _classifierIndexStores(box);
+        total++; passed += Test("classifier index stores list caller value", box.xs[0], 7);
+        total++; passed += Test("classifier index stores dictionary caller value", box.d.get(1), 2);
+        total++; passed += Test("classifier index stores copies", _classifierCopyCount, 1);
+    }
+    _classifierCopyCount = 0;
+    {
+        ClassifierBox box = default;
+        box.seed();
+        _classifierRefStores(box);
+        total++; passed += Test("classifier reference stores list caller value", box.xs[0], 7);
+        total++; passed += Test("classifier reference stores dictionary caller value", box.d.get(1), 2);
+        total++; passed += Test("classifier reference stores queue caller value", box.q.peek(), 7);
+        total++; passed += Test("classifier reference stores copies", _classifierCopyCount, 1);
+    }
+    _classifierCopyCount = 0;
+    {
+        ClassifierBox box = default;
+        box.seed();
+        _classifierInternalGrow(box);
+        total++; passed += Test("classifier internal mutator caller value", box.xs[0], 7);
+        total++; passed += Test("classifier internal mutator copies", _classifierCopyCount, 1);
+    }
+    _classifierCopyCount = 0;
+    {
+        ClassifierBox box = default;
+        box.seed();
+        _classifierReadOnly(box);
+        total++; passed += Test("classifier read-only caller count", box.xs.count(), 1);
+        total++; passed += Test("classifier read-only copies", _classifierCopyCount, 0);
     }
 
     // === Bug 1: string.split() parts are owned by the returned list ===
@@ -3436,6 +3751,57 @@ extern int main()
         }
         total++; passed += Test("byvalue lambda whole-write value", g_lambdaWriteValue, 3);
         total++; passed += Test("byvalue lambda whole-write frees once", g_rawNodeFreed, 2);
+    }
+    {
+        g_writeClassifierCopies = 0;
+        {
+            WriteClassifierBox box = default; box.values.add(5);
+            writeClassifierGenericMethod(box);
+            total++; passed += Test("byvalue generic method caller survives", box.values[0], 5);
+            total++; passed += Test("byvalue generic method copy count", g_writeClassifierCopies, 1);
+        }
+        g_writeClassifierCopies = 0;
+        {
+            WriteClassifierBox box = default; box.values.add(5);
+            writeClassifierArrowAlias(box);
+            total++; passed += Test("byvalue arrow alias caller survives", box.values[0], 5);
+            total++; passed += Test("byvalue arrow alias copy count", g_writeClassifierCopies, 1);
+        }
+        g_writeClassifierCopies = 0;
+        {
+            WriteClassifierBox box = default; box.values.add(5);
+            writeClassifierAliasIndex(box);
+            total++; passed += Test("byvalue whole alias index caller survives", box.values[0], 5);
+            total++; passed += Test("byvalue whole alias index copy count", g_writeClassifierCopies, 1);
+        }
+        g_writeClassifierCopies = 0;
+        {
+            WriteClassifierBox box = default; box.values.add(5);
+            writeClassifierAliasIncrement(box);
+            total++; passed += Test("byvalue alias increment caller survives", box.values[0], 5);
+            total++; passed += Test("byvalue alias increment copy count", g_writeClassifierCopies, 1);
+        }
+        g_writeClassifierCopies = 0;
+        {
+            WriteClassifierBox box = default; box.values.add(5);
+            writeClassifierThisArgument(box);
+            total++; passed += Test("byvalue this argument caller survives", box.values[0], 5);
+            total++; passed += Test("byvalue this argument copy count", g_writeClassifierCopies, 1);
+        }
+        g_writeClassifierCopies = 0;
+        {
+            WriteClassifierBox box = default; box.values.add(5);
+            writeClassifierElementAddress(box);
+            total++; passed += Test("byvalue element address caller survives", box.values[0], 5);
+            total++; passed += Test("byvalue element address copy count", g_writeClassifierCopies, 1);
+        }
+        {
+            list<int> values = default; values.add(5);
+            writeClassifierDirectListIndex(values);
+            total++; passed += Test("byvalue direct list index caller survives", values[0], 5);
+            writeClassifierDirectListIncrement(values);
+            total++; passed += Test("byvalue direct list increment caller survives", values[0], 5);
+        }
     }
 
     // === Increment 1: container<Lambda> dequeue-and-invoke-inline frees the returned env (bug d) ===

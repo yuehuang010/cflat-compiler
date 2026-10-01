@@ -391,6 +391,7 @@ namespace cflat_cinterop
         // by-value boundary as raw bytes; isTrivial additionally demands trivial default
         // construction, which the ABI does not care about.
         bool isTriviallyCopyable = false;
+        bool isTriviallyRelocatable = false;
         bool specialMembersPending = false;
         // M4 class surface. Every flag is Clang's own answer, never derived from the member list.
         bool isPolymorphic = false;         // has a virtual function or a virtual base

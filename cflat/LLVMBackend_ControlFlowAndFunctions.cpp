@@ -544,10 +544,12 @@ llvm::Value* LLVMBackend::CreateIndirectCall(const TypeAndValue& funcPtrType, ll
         auto* i8PtrTy = cflat_llvm::PointerTo(builder->getInt8Ty());
         lastCxxRetTemp_ = nullptr;
         lastCxxRetValue_ = nullptr;
+        lastLoweredRetTemp_ = nullptr;
+        lastLoweredRetValue_ = nullptr;
         auto prepareCxxSret = [&](const TypeAndValue& retTV)
             -> std::pair<llvm::Type*, llvm::Value*> {
             if (retTV.Pointer || retTV.IsAlias
-                || !IsForeignNontrivialCxxReturnClass(retTV.TypeName))
+                || !ReturnsViaCxxSret(retTV.TypeName))
                 return { nullptr, nullptr };
             auto* structTy = GetType(retTV);
             if (structTy == nullptr || !structTy->isStructTy()) return { nullptr, nullptr };
@@ -562,10 +564,39 @@ llvm::Value* LLVMBackend::CreateIndirectCall(const TypeAndValue& funcPtrType, ll
             {
                 const uint64_t align = module->getDataLayout().getABITypeAlign(structTy).value();
                 dest = AllocaAtEntry(structTy, nullptr, "cxx.indirect.rettemp", align);
-                RegisterOwnedStructTemp(dest, retTV.TypeName);
-                lastCxxRetTemp_ = dest;
+                // A classified CFlat-only result keeps by-value ownership (see the direct call).
+                if (IsLoweredCFlatOnlyStruct(retTV.TypeName))
+                    lastLoweredRetTemp_ = dest;
+                else
+                {
+                    RegisterOwnedStructTemp(dest, retTV.TypeName);
+                    lastCxxRetTemp_ = dest;
+                }
             }
             return { structTy, dest };
+        };
+        // A by-value return whose type is still opaque: revisit once it completes.
+        auto recordOpaqueReturn = [&](llvm::CallBase* call) {
+            if (call == nullptr || funcPtrType.FuncPtrReturnPointer
+                || funcPtrType.FuncPtrReturnAlias)
+                return;
+            if (auto* st = llvm::dyn_cast<llvm::StructType>(call->getType());
+                st != nullptr && st->isOpaque())
+            {
+                opaqueReturnIndirectCalls_.push_back(
+                    { llvm::WeakTrackingVH(call), funcPtrType.FuncPtrReturnTypeName });
+                RecordOpaqueReturnCall(call, funcPtrType.FuncPtrReturnTypeName,
+                                       funcPtrType.VariableName);
+            }
+        };
+        auto publishIndirectSretValue = [&](const TypeAndValue& retTV, llvm::Value* value) {
+            if (IsLoweredCFlatOnlyStruct(retTV.TypeName))
+            {
+                lastLoweredRetValue_ = value;
+                nullConditionalTempResults_.push_back(value);
+            }
+            else
+                lastCxxRetValue_ = value;
         };
         TypeAndValue cxxRecipeRet;
         std::vector<TypeAndValue> cxxRecipeParams;
@@ -702,6 +733,7 @@ llvm::Value* LLVMBackend::CreateIndirectCall(const TypeAndValue& funcPtrType, ll
                 abiArgs.push_back(rawReturnCountSlot);
             }
             lastCallReturnType = retTV;
+            PreserveRetainedJoinArmTempsBeforeCall(nullptr, abiArgs);
             auto* result = CreateCallOrInvoke(cFnTy, fnPtr, abiArgs, /*mayUnwind=*/true);
             // thin function<> = bare C pointer: the callee may be clang -O2 C code (see the helper).
             if (auto* callBase = llvm::dyn_cast_or_null<llvm::CallBase>(result))
@@ -713,7 +745,8 @@ llvm::Value* LLVMBackend::CreateIndirectCall(const TypeAndValue& funcPtrType, ll
             llvm::Value* value = cxxSretReturn
                 ? static_cast<llvm::Value*>(builder->CreateLoad(cxxSret.first, cxxSret.second))
                 : (retTy->isVoidTy() ? nullptr : result);
-            if (cxxSretReturn) lastCxxRetValue_ = value;
+            if (cxxSretReturn) publishIndirectSretValue(retTV, value);
+            recordOpaqueReturn(result);
             RegisterRawArrayCallResult(value, rawReturnCountSlot);
             return value;
         }
@@ -825,6 +858,7 @@ llvm::Value* LLVMBackend::CreateIndirectCall(const TypeAndValue& funcPtrType, ll
         }
 
         lastCallReturnType = retTV;
+        PreserveRetainedJoinArmTempsBeforeCall(nullptr, fullArgs);
         auto* result = CreateCallOrInvoke(invokerTy, fnPtr, fullArgs, /*mayUnwind=*/true);
         DropRetainedJoinArmPtrTemps(result);
         if (cxxSretRecipe.hasLowering)
@@ -832,7 +866,8 @@ llvm::Value* LLVMBackend::CreateIndirectCall(const TypeAndValue& funcPtrType, ll
         llvm::Value* value = cxxSretReturn
             ? static_cast<llvm::Value*>(builder->CreateLoad(cxxSret.first, cxxSret.second))
             : (retTy->isVoidTy() ? nullptr : result);
-        if (cxxSretReturn) lastCxxRetValue_ = value;
+        if (cxxSretReturn) publishIndirectSretValue(retTV, value);
+        recordOpaqueReturn(result);
         RegisterRawArrayCallResult(value, rawReturnCountSlot);
         return value;
     }
@@ -1390,7 +1425,7 @@ LLVMBackend::AbiRecipe LLVMBackend::ComputeCxxReturnAbiRecipe(
 {
         AbiRecipe recipe;
         const bool cxxReturn = !retType.Pointer && !retType.IsAlias
-            && IsForeignNontrivialCxxReturnClass(retType.TypeName);
+            && ReturnsViaCxxSret(retType.TypeName);
         bool cxxParam = false;
         for (const auto& param : params)
             if (!param.Pointer && !param.IsAlias
@@ -1941,16 +1976,199 @@ static bool IsImplicitEntryMain(const std::string& functionName,
  * Nothing here computes a layout: the signature is recomputed from the SAME completed
  * StructType the main pass built, and the provisional body-less declaration is replaced.
  */
+/*
+ * `r = f(a)` emitted with a by-value return becomes `f(sret slot, a); r = load slot`. An invoke
+ * keeps its destinations; the load goes at the head of its private continuation block.
+ */
+llvm::CallBase* LLVMBackend::RewriteCallToSret(llvm::CallBase* call, llvm::FunctionType* newType,
+                                               llvm::Value* callee, unsigned sretIndex,
+                                               llvm::Type* structTy, uint64_t align)
+{
+        auto* invoke = llvm::dyn_cast<llvm::InvokeInst>(call);
+        if (invoke != nullptr && invoke->getNormalDest()->getSinglePredecessor() == nullptr)
+            return nullptr;
+        auto* caller = call->getFunction();
+        llvm::IRBuilder<> entry(&caller->getEntryBlock(),
+                                caller->getEntryBlock().getFirstInsertionPt());
+        auto* slot = entry.CreateAlloca(structTy, nullptr, "sret.repair");
+        slot->setAlignment(llvm::Align(std::max<uint64_t>(1, align)));
+        std::vector<llvm::Value*> args(call->arg_begin(), call->arg_end());
+        args.insert(args.begin() + std::min<size_t>(sretIndex, args.size()), slot);
+        llvm::IRBuilder<> rb(call);
+        llvm::CallBase* fixed = invoke != nullptr
+            ? static_cast<llvm::CallBase*>(rb.CreateInvoke(newType, callee,
+                  invoke->getNormalDest(), invoke->getUnwindDest(), args))
+            : static_cast<llvm::CallBase*>(rb.CreateCall(newType, callee, args));
+        fixed->setCallingConv(call->getCallingConv());
+        fixed->addParamAttr(sretIndex, llvm::Attribute::getWithStructRetType(*context, structTy));
+        llvm::Value* value = nullptr;
+        if (invoke != nullptr)
+        {
+            llvm::IRBuilder<> lb(&*invoke->getNormalDest()->getFirstInsertionPt());
+            value = lb.CreateLoad(call->getType(), slot);
+        }
+        else
+            value = rb.CreateLoad(call->getType(), slot);
+        for (auto& site : opaqueReturnDiscardSites_)
+            if (static_cast<llvm::Value*>(site.call) == call)
+            {
+                site.call = fixed;
+                site.storage = slot;
+            }
+        call->replaceAllUsesWith(value);
+        call->eraseFromParent();
+        return fixed;
+    }
+
+void LLVMBackend::RecordOpaqueReturnCall(llvm::Value* value, const std::string& typeName,
+                                         const std::string& functionName)
+{
+        auto* call = llvm::dyn_cast_or_null<llvm::CallBase>(value);
+        auto* st = call == nullptr ? nullptr : llvm::dyn_cast<llvm::StructType>(call->getType());
+        if (st == nullptr || !st->isOpaque()) return;
+        for (const auto& site : opaqueReturnDiscardSites_)
+            if (static_cast<llvm::Value*>(site.call) == call) return;
+        opaqueReturnDiscardSites_.push_back(
+            { llvm::WeakTrackingVH(call), nullptr, typeName, functionName, false, false, false,
+              sourceFileName, currentLine, currentColumn });
+    }
+
+void LLVMBackend::MarkOpaqueReturnDiscard(llvm::Value* value, const std::string& functionName,
+                                          bool bare)
+{
+        std::vector<llvm::Value*> work{ value };
+        std::unordered_set<llvm::Value*> visited;
+        while (!work.empty())
+        {
+            llvm::Value* current = work.back();
+            work.pop_back();
+            if (current == nullptr || !visited.insert(current).second) continue;
+            for (auto& site : opaqueReturnDiscardSites_)
+                if (static_cast<llvm::Value*>(site.call) == current)
+                {
+                    site.discarded = true;
+                    site.bare = site.bare || bare;
+                    if (site.functionName.empty() || site.functionName == "<call>")
+                        site.functionName = functionName;
+                }
+            if (llvm::isa<llvm::CallBase>(current)) continue;
+            if (auto* user = llvm::dyn_cast<llvm::User>(current))
+                for (llvm::Value* operand : user->operand_values()) work.push_back(operand);
+        }
+    }
+
+void LLVMBackend::RepairOpaqueReturnDiscardSites()
+{
+        auto parked = std::move(opaqueReturnDiscardSites_);
+        opaqueReturnDiscardSites_.clear();
+        for (auto& site : parked)
+        {
+            auto* call = llvm::dyn_cast_or_null<llvm::CallBase>(
+                static_cast<llvm::Value*>(site.call));
+            if (call == nullptr) continue;
+            auto* structTy = llvm::dyn_cast<llvm::StructType>(GetType(
+                TypeAndValue{ .TypeName = site.typeName }));
+            if (structTy == nullptr || structTy->isOpaque())
+            {
+                opaqueReturnDiscardSites_.push_back(std::move(site));
+                continue;
+            }
+            if (!site.discarded || site.fixupFailed) continue;
+            // Complete and not owning: nothing to diagnose or destroy, drop the site.
+            if (!IsOwningValueType(site.typeName)) continue;
+            if (site.bare)
+            {
+                ReportingFileScope reportScope(this, site.file, site.line, site.column);
+                LogError(std::format(
+                    "owning return value of '{}' must not be discarded; bind it, move it, delete it, "
+                    "pass it on, or discard it explicitly with '_ ='",
+                    site.functionName.empty() ? "<call>" : site.functionName));
+                continue;
+            }
+
+            llvm::Value* storage = site.storage;
+            llvm::Value* result = nullptr;
+            if (storage == nullptr)
+            {
+                result = call;
+                auto* caller = call->getFunction();
+                llvm::IRBuilder<> entry(&caller->getEntryBlock(),
+                    caller->getEntryBlock().getFirstInsertionPt());
+                auto* alloca = entry.CreateAlloca(structTy, nullptr, "discarded.opaque.return");
+                alloca->setAlignment(module->getDataLayout().getABITypeAlign(structTy));
+                storage = alloca;
+            }
+            auto* dtor = GetOrCreateFullDestructor(site.typeName);
+            if (dtor == nullptr) continue;
+            llvm::IRBuilder<> cleanup(*context);
+            if (auto* invoke = llvm::dyn_cast<llvm::InvokeInst>(call))
+                cleanup.SetInsertPoint(invoke->getNormalDest(),
+                    invoke->getNormalDest()->getFirstInsertionPt());
+            else
+                cleanup.SetInsertPoint(call->getParent(), std::next(call->getIterator()));
+            if (call->getDebugLoc())
+                cleanup.SetCurrentDebugLocation(call->getDebugLoc());
+            else if (auto* subprogram = call->getFunction()->getSubprogram())
+                cleanup.SetCurrentDebugLocation(llvm::DILocation::get(
+                    *context, subprogram->getLine(), 0, subprogram));
+            if (result != nullptr) cleanup.CreateStore(result, storage);
+            cleanup.CreateCall(dtor->getFunctionType(), dtor, { storage });
+        }
+    }
+
+void LLVMBackend::RepairOpaqueReturnIndirectCalls()
+{
+        if (opaqueReturnIndirectCalls_.empty()) return;
+        auto parked = std::move(opaqueReturnIndirectCalls_);
+        opaqueReturnIndirectCalls_.clear();
+        for (auto& entry : parked)
+        {
+            auto* call = llvm::dyn_cast_or_null<llvm::CallBase>(
+                static_cast<llvm::Value*>(entry.call));
+            if (call == nullptr) continue;
+            auto* structTy = llvm::dyn_cast<llvm::StructType>(call->getType());
+            if (structTy == nullptr) continue;
+            if (structTy->isOpaque())
+            {
+                opaqueReturnIndirectCalls_.push_back(std::move(entry));
+                continue;
+            }
+            if (!ReturnsViaCxxSret(entry.typeName)) continue;   // completed trivially: as emitted
+            // The function value's invoker takes the slot first (see CreateIndirectCall).
+            std::vector<llvm::Type*> params = call->getFunctionType()->params();
+            params.insert(params.begin(), cflat_llvm::PointerTo(structTy));
+            auto* newType = llvm::FunctionType::get(builder->getVoidTy(), params, false);
+            const uint64_t align = module->getDataLayout().getABITypeAlign(structTy).value();
+            if (RewriteCallToSret(call, newType, call->getCalledOperand(), 0, structTy, align)
+                == nullptr)
+            {
+                for (auto& site : opaqueReturnDiscardSites_)
+                    if (static_cast<llvm::Value*>(site.call) == call) site.fixupFailed = true;
+                LogError(std::format(
+                    "a call through a function value returning '{}' was emitted before that type "
+                    "was complete, so its calling convention cannot be repaired. Define the type "
+                    "before the call.",
+                    SpellType(*this, TypeAndValue{ .TypeName = entry.typeName })));
+            }
+        }
+    }
+
 void LLVMBackend::FlushPendingFunctionDeclarations()
 {
-        if (flushingPendingDeclarations_ || pendingFunctionDeclarations_.empty()) return;
+        RepairOpaqueReturnIndirectCalls();
+        if (flushingPendingDeclarations_) return;
+        if (pendingFunctionDeclarations_.empty())
+        {
+            RepairOpaqueReturnDiscardSites();
+            return;
+        }
         flushingPendingDeclarations_ = true;
         auto parked = std::move(pendingFunctionDeclarations_);
         pendingFunctionDeclarations_.clear();
         for (auto& d : parked)
         {
             // Still incomplete: park it again, untouched.
-            if (FindIncompleteByValueAggregate(d.Arguments, d.External) != nullptr)
+            if (FindIncompleteByValueAggregate(d.ReturnType, d.Arguments, d.External) != nullptr)
             {
                 pendingFunctionDeclarations_.push_back(std::move(d));
                 continue;
@@ -1962,7 +2180,7 @@ void LLVMBackend::FlushPendingFunctionDeclarations()
             {
                 recipe = ComputeAbiRecipe(d.ReturnType, d.Arguments);
                 if (!d.ReturnType.Pointer && !d.ReturnType.IsAlias
-                    && IsForeignNontrivialCxxReturnClass(d.ReturnType.TypeName))
+                    && ReturnsViaCxxSret(d.ReturnType.TypeName))
                 {
                     auto cxxReturn = ComputeCxxReturnAbiRecipe(d.ReturnType, d.Arguments);
                     if (cxxReturn.retSlot.kind == AbiSlot::SRetReturn)
@@ -1989,8 +2207,45 @@ void LLVMBackend::FlushPendingFunctionDeclarations()
             if (provisional == nullptr || wanted == nullptr
                 || provisional->getFunctionType() == wanted)
                 continue;
-            if (FunctionHasDefinition(provisional) || !provisional->materialized_use_empty())
+            // Taking the address (`fp = f`) is ABI-neutral under opaque pointers. A direct call
+            // emitted against the provisional type is repaired only when the one change is a
+            // classified return turning into sret (the parameter list is otherwise identical).
+            std::vector<llvm::CallBase*> directCalls;
+            bool unrepairableCall = false;
+            auto markFixupFailed = [this](llvm::CallBase* call) {
+                for (auto& site : opaqueReturnDiscardSites_)
+                    if (static_cast<llvm::Value*>(site.call) == call) site.fixupFailed = true;
+            };
+            // A function-value shim (`fp = f`) forwards with the provisional signature; it is
+            // rebuilt against the repaired one below.
+            llvm::Function* oldShim = module->getFunction("__shim_" + d.MangledName);
+            const bool sretOnlyChange = useRecipe && cflatAbiLowering
+                && recipe.retSlot.kind == AbiSlot::SRetReturn
+                && wanted->getReturnType()->isVoidTy()
+                && wanted->getNumParams() == provisional->getFunctionType()->getNumParams() + 1
+                && !provisional->getFunctionType()->getReturnType()->isVoidTy();
+            for (auto* user : provisional->users())
+                if (auto* call = llvm::dyn_cast<llvm::CallBase>(user);
+                    call != nullptr && call->getCalledOperand() == provisional
+                    && (oldShim == nullptr || call->getFunction() != oldShim))
+                {
+                    const bool privateCont = !llvm::isa<llvm::InvokeInst>(call)
+                        || llvm::cast<llvm::InvokeInst>(call)->getNormalDest()
+                               ->getSinglePredecessor() != nullptr;
+                    if (!sretOnlyChange || !privateCont)
+                    {
+                        unrepairableCall = true;
+                        markFixupFailed(call);
+                    }
+                    else directCalls.push_back(call);
+                }
+            if (FunctionHasDefinition(provisional) || unrepairableCall)
             {
+                if (FunctionHasDefinition(provisional))
+                    for (auto* user : provisional->users())
+                        if (auto* call = llvm::dyn_cast<llvm::CallBase>(user);
+                            call != nullptr && call->getCalledOperand() == provisional)
+                            markFixupFailed(call);
                 LogError(std::format(
                     "'{}' was used before the by-value type in its signature was complete, so its "
                     "calling convention cannot be repaired. Define that type before the signature.",
@@ -2004,6 +2259,14 @@ void LLVMBackend::FlushPendingFunctionDeclarations()
             repaired->setCallingConv(conv);
             if (useRecipe)
                 ApplyAbiAttributes(repaired, recipe);
+            if (oldShim != nullptr)
+            {
+                oldShim->deleteBody();
+                oldShim->setName("__shim_" + d.MangledName + ".provisional");
+            }
+            for (auto* call : directCalls)
+                RewriteCallToSret(call, wanted, repaired, SRetArgIndex(recipe),
+                                  recipe.retSlot.structTy, recipe.retSlot.align);
             provisional->replaceAllUsesWith(repaired);
             provisional->eraseFromParent();
 
@@ -2015,8 +2278,14 @@ void LLVMBackend::FlushPendingFunctionDeclarations()
                         sym.Function = repaired;
                         sym.Recipe = recipe;
                     }
+            if (oldShim != nullptr)
+            {
+                oldShim->replaceAllUsesWith(GetOrCreateFunctionShim(repaired));
+                oldShim->eraseFromParent();
+            }
         }
         flushingPendingDeclarations_ = false;
+        RepairOpaqueReturnDiscardSites();
     }
 
 // Module end: nothing else will complete these aggregates. A provisional declaration that is
@@ -2030,7 +2299,7 @@ void LLVMBackend::ReportUnresolvedProvisionalDeclarations()
         {
             llvm::Function* fn = module ? module->getFunction(d.MangledName) : nullptr;
             if (fn == nullptr || (!FunctionHasDefinition(fn) && fn->materialized_use_empty())) continue;
-            auto* incomplete = FindIncompleteByValueAggregate(d.Arguments, d.External);
+            auto* incomplete = FindIncompleteByValueAggregate(d.ReturnType, d.Arguments, d.External);
             LogError(std::format(
                 "type '{}' is never completed, so '{}' cannot take it by value. "
                 "Define the type's body, or pass it by pointer.",
@@ -2047,7 +2316,7 @@ void LLVMBackend::CreateFunctionDeclaration(const std::string& functionName, con
         // by-value aggregate has no legal FunctionType yet, so the declaration is emitted with a
         // PROVISIONAL signature and re-derived by FlushPendingFunctionDeclarations once the main
         // pass sets the real body. Registration order in functionTable is unchanged.
-        bool provisional = FindIncompleteByValueAggregate(arguments, external) != nullptr;
+        bool provisional = FindIncompleteByValueAggregate(returnType, arguments, external) != nullptr;
 
         if (external)
         {
@@ -2078,7 +2347,7 @@ void LLVMBackend::CreateFunctionDeclaration(const std::string& functionName, con
         {
             recipe = ComputeAbiRecipe(returnType, arguments);
             if (!returnType.Pointer && !returnType.IsAlias
-                && IsForeignNontrivialCxxReturnClass(returnType.TypeName))
+                && ReturnsViaCxxSret(returnType.TypeName))
             {
                 auto cxxReturn = ComputeCxxReturnAbiRecipe(returnType, arguments);
                 if (cxxReturn.retSlot.kind == AbiSlot::SRetReturn)
@@ -2339,7 +2608,7 @@ llvm::Type* LLVMBackend::BuildThinFnPtrType(const TypeAndValue& tv) const
             paramTypes.push_back(cflat_llvm::PointerTo(builder->getInt64Ty()));
         llvm::Type* returnType = GetFunctionReturnABIType(retTV);
         if (!retTV.Pointer && !retTV.IsAlias && !retTV.IsArrayView
-            && IsForeignNontrivialCxxReturnClass(retTV.TypeName))
+            && ReturnsViaCxxSret(retTV.TypeName))
         {
             auto* structTy = GetType(retTV);
             if (structTy != nullptr && structTy->isStructTy())
@@ -2403,10 +2672,20 @@ llvm::Type* LLVMBackend::GetCCompatibleType(const TypeAndValue& tv) const
     }
 
 llvm::StructType* LLVMBackend::FindIncompleteByValueAggregate(
-        const std::vector<LLVMBackend::TypeAndValue>& arguments, bool externC)
+        const TypeAndValue& returnType, const std::vector<LLVMBackend::TypeAndValue>& arguments,
+        bool externC)
 {
-        // Mirrors the parameter type selection in GetFunctionType below: anything it wraps in a
-        // pointer is legal while opaque, so only the raw by-value shapes are inspected here.
+        // Mirror the type selection in GetFunctionType below, including the return type. While
+        // opaque, a return can be represented in LLVM, but its C++ ABI cannot be classified yet.
+        if (!returnType.Pointer && !returnType.IsAlias && !returnType.IsArrayView)
+        {
+            const std::string returnName = ResolveTypeAlias(returnType.TypeName);
+            auto found = dataStructures.find(returnName);
+            if (MangledBase(returnName) != "unique"
+                && found != dataStructures.end() && found->second.StructType != nullptr
+                && found->second.StructType->isOpaque())
+                return found->second.StructType;
+        }
         for (const LLVMBackend::TypeAndValue& arg : arguments)
         {
             if (!externC && ParameterIsAliasByPointer(arg)) continue;
@@ -2420,11 +2699,11 @@ llvm::FunctionType* LLVMBackend::GetFunctionType(const LLVMBackend::TypeAndValue
 {
         // Last line of defence: an opaque aggregate is not a valid LLVM argument type.
         // Report it instead of letting llvm::FunctionType::get assert.
-        llvm::StructType* incomplete = FindIncompleteByValueAggregate(arguments, externC);
+        llvm::StructType* incomplete = FindIncompleteByValueAggregate(returnType, arguments, externC);
         if (incomplete != nullptr && !allowIncomplete)
             LogError(std::format(
-                "type '{}' is incomplete here, so it cannot be passed by value. "
-                "Define its body before this signature, or pass it by pointer.",
+                "type '{}' is incomplete here, so it cannot be passed by value or returned. "
+                "Define its body before this signature, or use a pointer.",
                 SpellType(*this, TypeAndValue{ .TypeName = incomplete->getName().str() })));
 
         std::vector<llvm::Type*> types;
@@ -2563,7 +2842,7 @@ llvm::Function* LLVMBackend::CreateFunctionDefinition(const std::string& functio
         {
             recipe = ComputeAbiRecipe(returnType, arguments);
             if (!returnType.Pointer && !returnType.IsAlias
-                && IsForeignNontrivialCxxReturnClass(returnType.TypeName))
+                && ReturnsViaCxxSret(returnType.TypeName))
             {
                 auto cxxReturn = ComputeCxxReturnAbiRecipe(returnType, arguments);
                 if (cxxReturn.retSlot.kind == AbiSlot::SRetReturn)

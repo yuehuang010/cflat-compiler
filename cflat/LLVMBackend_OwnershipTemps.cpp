@@ -2189,7 +2189,6 @@ bool LLVMBackend::RegisterCxxOwningPtrArgsBeforeCall(const llvm::Function* calle
 void LLVMBackend::PreserveRetainedJoinArmTempsBeforeCall(const llvm::Function* callee,
                                                           llvm::ArrayRef<llvm::Value*> args)
     {
-        if (callee == nullptr || callee->isDeclaration()) return;
         for (unsigned i = 0; i < args.size(); ++i)
         {
             if (args[i] == nullptr || !args[i]->getType()->isPointerTy()
@@ -4403,9 +4402,23 @@ void LLVMBackend::RegisterAliasReturnTempSlot(llvm::Value* result, llvm::Value* 
         aliasReturnTempSlots_.push_back({ result, slot, std::move(ancestors), callee });
     }
 
-bool LLVMBackend::IsAliasReturnTempResult(llvm::Value* value, std::string* callee) const
+bool LLVMBackend::IsAliasReturnResult(llvm::Value* value, std::string* callee) const
 {
         if (value == nullptr) return false;
+        llvm::Value* through = nullptr;
+        if (auto* load = llvm::dyn_cast<llvm::LoadInst>(value)) through = load->getPointerOperand();
+        for (const auto& entry : aliasReturnTempSlots_)
+        {
+            if (entry.Result != value && entry.Result != through) continue;
+            if (callee != nullptr) *callee = entry.Callee;
+            return true;
+        }
+        return false;
+    }
+
+bool LLVMBackend::IsAliasReturnTempResult(llvm::Value* value, std::string* callee) const
+{
+        if (!IsAliasReturnResult(value, callee)) return false;
         llvm::Value* through = nullptr;
         if (auto* load = llvm::dyn_cast<llvm::LoadInst>(value)) through = load->getPointerOperand();
         auto isPendingTemp = [this](llvm::Value* slot) {
@@ -4415,12 +4428,9 @@ bool LLVMBackend::IsAliasReturnTempResult(llvm::Value* value, std::string* calle
         for (const auto& entry : aliasReturnTempSlots_)
         {
             if (entry.Result != value && entry.Result != through) continue;
-            bool pending = isPendingTemp(entry.Slot);
+            if (isPendingTemp(entry.Slot)) return true;
             for (auto* ancestor : entry.AncestorSlots)
-                pending = pending || isPendingTemp(ancestor);
-            if (!pending) continue;
-            if (callee != nullptr) *callee = entry.Callee;
-            return true;
+                if (isPendingTemp(ancestor)) return true;
         }
         return false;
     }

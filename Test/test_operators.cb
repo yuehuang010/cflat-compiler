@@ -1023,7 +1023,7 @@ extern int main()
     int boolFpPassed = boolToFloatingLegs();
     if (compoundResultOwnershipLegs() != 26) return 57;
     if (byValueParamOwnershipLegs() != 66) return 58;
-    if (byValueAliasTempLegs() != 46) return 59;
+    if (byValueAliasTempLegs() != 68) return 59;
     if (byValueAliasOperatorLegs() != 11) return 61;
     if (cppUnwindThroughHelperLegs() != 0) return 60;
 
@@ -2051,15 +2051,24 @@ Q baGen<Q>(Q w) { return w; }
 int baClobber(int k) { int[64] t = default; for (int i = 0; i < 64; i++) t[i] = k + i; return t[k]; }
 int baSeeAfterCall(alias BaU w) { int c = baClobber(3); return w.n + c - 6; }
 int baCtor = 0; int baDtor = 0;
+// Payload counters: a moved-from shell is destroyed too (baDtor counts it), so a leg that moves
+// checks baTMade == baTFreed for the payload and pins the exact shell count separately.
+int baTMade = 0; int baTFreed = 0;
 struct BaT
 {
     unique<int> u = default;
     BaT() { baCtor++; }
-    ~BaT() { baDtor++; }
+    ~BaT() { baDtor++; if (u.get() != nullptr) baTFreed++; }
     int val() { return u.get() == nullptr ? -1 : *u; }
 };
-BaT baTMk(int v) { BaT r; r.u = new int(v); return r; }
+BaT baTMk(int v) { BaT r; r.u = new int(v); baTMade++; return r; }
 BaT baTPass(BaT w) { return w; }
+BaT baTFresh(BaT w) { return baTMk(w.val()); }
+BaT baTProtoPass(BaT w);
+BaT baTProtoPass(BaT w) { return w; }
+extern BaT baTExternPass(BaT w) { return w; }
+extern BaT baTExternPair(BaT a, BaT b) { if (a.val() > 100) return a; return b; }
+void baTSink(move BaT w) { }
 int baTSee(alias BaT w) { return w.val(); }
 BaT baTRet() { return baTPass(baTMk(14)); }
 struct BaTHolder { BaT v = default; };
@@ -2163,6 +2172,33 @@ int byValueAliasTempLegs()
     { baTPass(baTMk(17)); }
     passed += Test("alias temp counted ctor/dtor", baCtor * 100 + baDtor, 3939);
     baCtor = 0; baDtor = 0;
+    { BaT x = baTProtoPass(baTMk(5)); BaT y = baTMk(77);
+        passed += Test("alias prototype inferred call", x.val() * 100 + y.val(), 577); }
+    passed += Test("alias prototype inferred counts", baCtor * 100 + baDtor, 202);
+    baCtor = 0; baDtor = 0; baTMade = 0; baTFreed = 0;
+    int externValue = 0;
+    { BaT x = baTExternPass(baTMk(5)); externValue = x.val(); }
+    passed += Test("extern by-value alias result", externValue, 5);
+    // The C-ABI callee owns its by-value param: the temp is handed over, the callee destroys the
+    // shell it returned from, the caller destroys x.
+    passed += Test("extern by-value alias ctor dtor", baCtor * 10 + baDtor, 12);
+    passed += Test("extern by-value alias payload", baTMade * 10 + baTFreed, 11);
+    baCtor = 0; baDtor = 0; baTMade = 0; baTFreed = 0;
+    { BaT r = baTExternPair(baTMk(5), baTMk(6)); passed += Test("extern two-param return value", r.val(), 6); }
+    passed += Test("extern two-param return ctor dtor", baCtor * 10 + baDtor, 23);
+    passed += Test("extern two-param return payload", baTMade * 10 + baTFreed, 22);
+    baCtor = 0; baDtor = 0; baTMade = 0; baTFreed = 0;
+    { BaT a = baTMk(21); BaT r = baTExternPass(a); passed += Test("extern named by-value arg", r.val(), 21); }
+    passed += Test("extern named by-value ctor dtor", baCtor * 10 + baDtor, 13);
+    passed += Test("extern named by-value payload", baTMade * 10 + baTFreed, 11);
+    baCtor = 0; baDtor = 0; baTMade = 0; baTFreed = 0;
+    { BaT a = baTMk(22); BaT r = baTExternPass(move a); passed += Test("extern moved by-value arg", r.val(), 22); }
+    passed += Test("extern moved by-value ctor dtor", baCtor * 10 + baDtor, 13);
+    passed += Test("extern moved by-value payload", baTMade * 10 + baTFreed, 11);
+    baCtor = 0; baDtor = 0; baTMade = 0; baTFreed = 0;
+    { BaT a = baTMk(23); BaT r = baTFresh(a); passed += Test("ordinary fresh named by-value arg", r.val() * 100 + a.val(), 2323); }
+    passed += Test("ordinary fresh named ctor dtor", baCtor, baDtor);
+    baCtor = 0; baDtor = 0;
     { BaT x = baTPick(baTMk(1), baTMk(2), true); BaT y = baTMk(77); passed += Test("alias temp two-source first", x.val() * 100 + y.val(), 177); }
     { BaT x = baTPick(baTMk(1), baTMk(2), false); BaT y = baTMk(78); passed += Test("alias temp two-source second", x.val() * 100 + y.val(), 278); }
     { bool c = true; BaT x = baTPass(c ? baTMk(3) : baTMk(4)); BaT y = baTMk(79); passed += Test("alias temp ternary argument", x.val() * 100 + y.val(), 379); }
@@ -2197,5 +2233,15 @@ int byValueAliasTempLegs()
     baCtor = 0; baDtor = 0;
     { BaT a = baTMk(1); BaT x = baTPick(a, baTMk(3), false); x = baTMk(5); passed += Test("alias temp reassign value", x.val() * 10 + a.val(), 51); }
     passed += Test("alias temp reassign balance", baCtor, baDtor);
+    baCtor = 0; baDtor = 0; baTMade = 0; baTFreed = 0;
+    { BaT a = baTMk(1); BaT x = baTPick(a, baTMk(3), false); x = baTMk(5); baTSink(x);
+        passed += Test("alias rebind then sink", a.val(), 1); }
+    passed += Test("alias rebind sink ctor dtor", baCtor * 10 + baDtor, 34);
+    passed += Test("alias rebind sink payload", baTMade * 10 + baTFreed, 33);
+    baCtor = 0; baDtor = 0; baTMade = 0; baTFreed = 0;
+    { BaT a = baTMk(1); BaT x = baTPick(a, baTMk(3), false); BaT y = x; y = baTMk(5); baTSink(y);
+        passed += Test("alias chain rebind then sink", a.val() * 10 + x.val(), 13); }
+    passed += Test("alias chain rebind sink ctor dtor", baCtor * 10 + baDtor, 34);
+    passed += Test("alias chain rebind sink payload", baTMade * 10 + baTFreed, 33);
     return passed;
 }

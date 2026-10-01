@@ -627,6 +627,7 @@ void ForwardRefScanner::ScanFunctionDefinition(CFlatParser::FunctionDefinitionCo
         }
 
         std::vector<LLVMBackend::TypeAndValue> allParams(params.begin(), params.end());
+        if (returnType.external) returnType.IsAlias = false;
 
         LLVMBackend::AliasScopeGuard functionAliasScope(compiler);
         ApplyOwningSinkInference(compiler, func, allParams);
@@ -645,14 +646,15 @@ void ForwardRefScanner::ScanFunctionDefinition(CFlatParser::FunctionDefinitionCo
         // free the result. The unique-ownership gate is applied when the queue is resolved.
         {
             std::string borrowedParam;
-            if (ClassifyValueStructReturns(compiler, func, returnType, allParams, &borrowedParam)
+            if (!returnType.external
+                && ClassifyValueStructReturns(compiler, func, returnType, allParams, &borrowedParam)
                 == ValueStructReturnKind::AllBorrowedParam)
                 compiler->QueueAliasReturnInference(name, returnType.TypeName, allParams);
             // A spelled `alias T f(T w) { return w; }`: mark it now so calls emitted before the
             // body still hand a temporary argument over (ReturnsAliasOfByValueParam).
             auto probe = returnType;
             probe.IsAlias = false;
-            if (returnType.IsAlias
+            if (!returnType.external && returnType.IsAlias
                 && ClassifyValueStructReturns(compiler, func, probe, allParams, &borrowedParam)
                     == ValueStructReturnKind::AllBorrowedParam)
                 if (auto it = compiler->functionTable.find(name); it != compiler->functionTable.end())

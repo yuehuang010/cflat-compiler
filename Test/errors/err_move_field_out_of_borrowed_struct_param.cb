@@ -186,6 +186,39 @@ expect_error("cannot consume field 'CrHolder.f' through borrowed parameter 'h'")
     void badCompoundAssign(CrHolder* h) { CrOwned x; x = (h->f += 2); }
 }
 
+// Returning an owning struct by value through a borrowed pointer would duplicate ownership.
+expect_error("cannot return owning struct 'CrOwned' through pointer") {
+    CrOwned badReturnDeref(CrOwned* o) { return *o; }
+}
+expect_error("cannot return owning struct 'CrOwned' through pointer") {
+    CrOwned badReturnDerefParen(CrOwned* o) { return ((*o)); }
+}
+expect_error("cannot return owning struct 'CrOwned' through pointer") {
+    CrOwned badReturnDerefLocal(CrOwned* o) { CrOwned* p = o; return *p; }
+}
+
+struct CrPointerHolder { CrOwned* q = nullptr; };
+expect_error("cannot return owning struct 'CrOwned' through pointer") {
+    CrOwned badReturnMemberPointerDeref(CrPointerHolder* h) { return *h->q; }
+}
+expect_error("cannot return owning struct 'CrOwned' through pointer") {
+    CrOwned badReturnPointerIndex(CrOwned* a) { return a[0]; }
+}
+
+expect_error("cannot return owning struct 'CrOwned' through pointer") {
+    T badGenericReturnDeref<T>(T* o) { return *o; }
+    CrOwned badGenericReturnCall(CrOwned* o) { return badGenericReturnDeref(o); }
+}
+
+// Explicit transfer remains legal; a POD struct read through a borrowed pointer is harmless.
+CrOwned goodReturnMoveDeref(CrOwned* o) { return move *o; }
+CrOwned goodReturnOwnedPointerDeref(move CrOwned* o) { return move *o; }
+// An owning pointer parameter dies with the frame, so a plain `*o` moves its pointee out.
+CrOwned goodReturnOwnedPointerImplicit(move CrOwned* o) { return *o; }
+CrOwned goodReturnMoveIndex(CrOwned* a) { return move a[0]; }
+struct CrPod { int value = 0; };
+CrPod goodReturnPodDeref(CrPod* o) { return *o; }
+
 expect_error("cannot consume field 'CrHolder.f' out of borrowed parameter 'h'") {
     void badCompoundByValue(CrHolder h) { CrOwned x = (h.f += 2); }
 }

@@ -1737,6 +1737,9 @@ llvm::StructType* LLVMBackend::CreateStructType(std::string name,
                 llvm::StructType* myStruct = llvm::StructType::create(types, name, isPacked);
                 dataStructures[name].StructType = myStruct;
                 dataStructures[name].StructFields = typeAndValues;
+                // Classified lazily by NeedsCxxLoweringType once the field graph is complete.
+                dataStructures[name].NeedsCxxLowering = false;
+                dataStructures[name].NeedsCxxLoweringKnown = false;
                 if (bitfields && !bitfields->empty())
                     dataStructures[name].Bitfields = *bitfields;
                 dataStructures[name].typeDescriptor = new llvm::GlobalVariable(
@@ -1755,6 +1758,8 @@ llvm::StructType* LLVMBackend::CreateStructType(std::string name,
             // existing struct;
             auto& structData = mystuct->second;
             structData.StructFields = typeAndValues;
+            structData.NeedsCxxLowering = false;
+            structData.NeedsCxxLoweringKnown = false;
             if (bitfields && !bitfields->empty())
                 structData.Bitfields = *bitfields;
             if (structData.StructType->isOpaque())

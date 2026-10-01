@@ -6676,6 +6676,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     // caller's block was terminated (e.g. return-block inline)
                                     if (!argValue) { Compiler(ctx)->EndCastOccurrence(savedCastOcc); break; }
                                     LLVMBackend::NamedVariable argVar;
+                                    argVar.OriginalArgumentType = argNV.TypeAndValue;
+                                    argVar.HasOriginalArgumentType = true;
 
                                     if (argName)
                                         argVar.TypeAndValue.VariableName = argName->getText();
@@ -8594,22 +8596,10 @@ LLVMBackend::NamedVariable MainListener::ParseLambdaExpression(CFlatParser::Lamb
                 }
                 else
                 {
-                    // Load copied value; store into a local alloca so the body can modify it.
+                    // Bind the captured name directly to its environment slot. The closure owns
+                    // this copy, so writes must remain visible to later invocations.
                     auto* capTy  = compiler->GetType(cap.TV);
-                    llvm::Value* capVal = compiler->builder->CreateLoad(capTy, fieldGEP, cap.Name + "_val");
-                    // The env owns the capture; this unpacked local only BORROWS it, so its
-                    // runtime OWNED bits must be clear - see the IsAliasBorrow note below, of
-                    // which this is the runtime half. Without it the local reads as a second
-                    // owner of the env's buffer, and every consumer that trusts the bit (a
-                    // `return` handing it to the caller, a rebind freeing the old value)
-                    // frees storage the env's cleanup fn frees again.
-                    if (isOwningCap(cap))
-                        capVal = cap.TV.TypeName == "string"
-                            ? compiler->ClearStringOwnedBit(capVal)
-                            : compiler->ClearStructOwnedBits(capVal, cap.TV.TypeName);
-                    auto* capAlloca = compiler->builder->CreateAlloca(capTy, nullptr, cap.Name);
-                    compiler->builder->CreateStore(capVal, capAlloca);
-                    captureNV.Storage = capAlloca;
+                    captureNV.Storage = fieldGEP;
                     captureNV.TypeAndValue = cap.TV;
                     captureNV.BaseType     = capTy;
                     // The ENV owns an owning-value capture (its cleanup fn frees it exactly once);
@@ -8707,7 +8697,7 @@ LLVMBackend::NamedVariable MainListener::ParseLambdaExpression(CFlatParser::Lamb
                                 lambdaName));
                         if (bareExpr) DiagnoseDiscardedOwningReturn(expr, resultNV);
                         ProcessPlusPlus();
-                        RegisterDiscardedOwningStructTemp(resultNV);
+                        RegisterDiscardedOwningStructTemp(resultNV, bareExpr);
                         compiler->FlushOwnedTemps();
                     }
                     else
@@ -9745,7 +9735,8 @@ llvm::Value* MainListener::ParseExpression(CFlatParser::ExpressionContext* ctx) 
         return nullptr;
     }
 
-void MainListener::RegisterDiscardedOwningStructTemp(const LLVMBackend::NamedVariable& nv) {
+void MainListener::RegisterDiscardedOwningStructTemp(const LLVMBackend::NamedVariable& nv, bool bare) {
+        Compiler()->MarkOpaqueReturnDiscard(nv.Primary, nv.CallerName, bare);
         const std::string& typeName = nv.TypeAndValue.TypeName;
         if (nv.Primary == nullptr || nv.Storage != nullptr || nv.BaseType == nullptr) return;
         if (typeName.empty()) return;
@@ -9768,6 +9759,22 @@ void MainListener::RegisterDiscardedOwningStructTemp(const LLVMBackend::NamedVar
 
         if (!compiler->IsOwningValueType(typeName)) return;
 
+        // A classified struct is destroyed in its own sret slot: a bitwise copy would relocate
+        // C++ fields that are not trivially relocatable.
+        if (compiler->IsLoweredCFlatOnlyStruct(typeName))
+        {
+            llvm::Value* slot = nullptr;
+            if (nv.Primary == compiler->lastLoweredRetValue_)
+                slot = compiler->lastLoweredRetTemp_;
+            else if (auto* load = llvm::dyn_cast<llvm::LoadInst>(nv.Primary))
+                slot = load->getPointerOperand();
+            if (llvm::isa_and_nonnull<llvm::AllocaInst>(slot))
+            {
+                compiler->RegisterOwnedStructTemp(slot, typeName);
+                return;
+            }
+        }
+
         auto* tempAlloca = compiler->AllocaAtEntry(nv.BaseType, nullptr, "discardtemp");
         compiler->builder->CreateStore(nv.Primary, tempAlloca);
         compiler->RegisterOwnedStructTemp(tempAlloca, typeName);
@@ -9775,6 +9782,7 @@ void MainListener::RegisterDiscardedOwningStructTemp(const LLVMBackend::NamedVar
 
 void MainListener::DiagnoseDiscardedOwningReturn(antlr4::ParserRuleContext* ctx, const LLVMBackend::NamedVariable& nv) {
         auto* compiler = Compiler(ctx);
+        compiler->MarkOpaqueReturnDiscard(nv.Primary, nv.CallerName, true);
         if (compiler->IsAliasTransferResult(nv.Primary)) return;
         std::string fnName;
         if (const std::string* fn = compiler->FindOwnedReturnTemp(nv.Primary))

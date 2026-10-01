@@ -388,6 +388,11 @@ LLVMBackend::TypeAndValue MainListener::ParseLiteralTypeAndValue(const std::stri
             type.TypeName = "u32";
         else if (std::get_if<uint64_t>(&constant) != nullptr)
             type.TypeName = "u64";
+        bool suffixedInteger = false;
+        const std::string suffixType = LLVMBackend::LiteralIdentityForOverload(
+            rawNumber, &suffixedInteger);
+        if (suffixedInteger && !suffixType.empty())
+            type.TypeName = suffixType;
         return type;
     }
 

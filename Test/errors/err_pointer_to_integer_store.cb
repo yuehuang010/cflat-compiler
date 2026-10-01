@@ -1,9 +1,29 @@
 // Every pointer-to-number store must name its explicit conversion.
 struct P2iField { long value = 0; };
 struct P2iDesignated { long value = 0; };
+struct P2iPointerField { int* value = nullptr; };
 enum P2iEnum : int { P2I_ZERO = 0, P2I_ONE = 1 };
 int p2iFunction() { return 1; }
 extern void* malloc(i64 size);
+import "c_macro_helpers.h";
+void p2iNativeTakeInt(int* value) {}
+void p2iSimdInt(simd<int,4>* value) {}
+void p2iSimdLong(simd<i64,4>* value) {}
+i64* p2iBetter(i64* value) { return value; }
+int* p2iBetter(int* value) { return value; }
+i64* p2iLongGlobal;
+int* p2iIntGlobal;
+bool* p2iBoolGlobal;
+i64 p2iGlobalWide;
+expect_error("cannot convert 'i64*' to 'int*' implicitly") {
+    int* p2iBadGlobal = &p2iGlobalWide;
+}
+expect_error("cannot convert 'i64*' to 'int*' implicitly") {
+    struct P2iBadFieldDefault { int* value = p2iLongGlobal; };
+}
+expect_error("cannot convert 'i64*' to 'int*' implicitly") {
+    int* p2iBadReturn() { return p2iLongGlobal; }
+}
 expect_error("a pointer is not a number") {
     struct P2iStringDefault { long value = "abc"; };
 }
@@ -13,6 +33,11 @@ expect_error("cannot return a value") {
 extern int main()
 {
     long n = 5; long* p = &n; long* q = &n;
+    int m = 6; int* ip = &m; i64 wn = 5; i64* wp = &wn;
+    int*[2] matchingPointerArray = { &m, &m };
+    expect_error("cannot convert 'i64*' to 'int*' implicitly") {
+        int*[2] badPointerArray = { &wn, &wn };
+    }
     expect_error("a pointer is not a number") { long x = p; }
     expect_error("a pointer is not a number") { long x = 0; x = p; }
     expect_error("a pointer is not a number") { long x = p + 1; }
@@ -35,8 +60,8 @@ extern int main()
     expect_error("a pointer is not a number") { long x = 0; x -= p; }
     expect_error("a pointer is not a number") { long x = 0; x |= p; }
     expect_error("a pointer is not a number") { bool c = true; long x = c ? p : q; }
-    expect_error("a pointer is not a number") { int* ip = &n; char x = ip; }
-    expect_error("a pointer is not a number") { int* ip = &n; double x = ip; }
+    expect_error("a pointer is not a number") { int* ip = (int*)&n; char x = ip; }
+    expect_error("a pointer is not a number") { int* ip = (int*)&n; double x = ip; }
     expect_error("a pointer is not a number") { P2iEnum x = p; }
     expect_error("a pointer is not a number") { function<int()>* fp = p2iFunction; long x = fp; }
     expect_error("a pointer is not a number") { int[1] a = {5}; int[] view = a; long x = view; }
@@ -51,6 +76,100 @@ extern int main()
     expect_error("a pointer is not a number") { u64 x = p; }
     expect_error("a pointer is not a number") { float x = p; }
     expect_error("no overload of") { p2iTakeLong(p); }
+    expect_error("cannot convert 'i64*' to 'int*' implicitly") {
+        int* bad = wp;
+    }
+    expect_error("cannot convert 'i64*' to 'int*' implicitly") {
+        int* bad = nullptr; bad = wp;
+    }
+    expect_error("cannot convert 'i64*' to 'int*' implicitly") {
+        p2iNativeTakeInt(wp);
+    }
+    expect_error("cannot convert 'i64*' to 'int*' implicitly") {
+        c_p2i_take_int(wp);
+    }
+    expect_error("cannot convert 'i64*' to 'int*' implicitly") {
+        bool c = true; int* bad = c ? wp : ip;
+    }
+    expect_error("cannot convert 'i64*' to 'int*' implicitly") {
+        int* bad = wp ?? ip;
+    }
+    expect_error("cannot convert 'i64*' to 'int*' implicitly") {
+        bool same = wp == ip;
+    }
+    expect_error("cannot convert 'bool*' to 'int*' implicitly") {
+        int* bad = p2iBoolGlobal;
+    }
+    expect_error("cannot convert 'int**' to 'u64**' implicitly") {
+        int** source = nullptr; u64** bad = source;
+    }
+    expect_error("cannot convert 'int*' to 'i64*' implicitly") {
+        bool c = true; i64 x = 1; int y = 2; int* bad = c ? &y : &x;
+    }
+    expect_error("cannot convert 'int*' to 'i64*' implicitly") {
+        bool c = true; i64 x = 1; int y = 2; int* bad = nullptr; bad = c ? &y : &x;
+    }
+    expect_error("cannot convert 'int*' to 'i64*' implicitly") {
+        i64 x = 1; int* ip = nullptr; int* bad = ip ?? &x;
+    }
+    expect_error("cannot convert 'int*' to 'i64*' implicitly") {
+        P2iPointerField s;
+        i64 x = 1; bool same = s.value == &x;
+    }
+    expect_error("no overload of") {
+        simd<int,4> value; p2iSimdLong(&value);
+    }
+    expect_error("no overload of") {
+        long* value = nullptr; long** source = &value; p2iNativeTakeInt(source);
+    }
+    expect_error("cannot convert 'i64*' to 'int*' implicitly") {
+        i64[2] wide = {1, 2}; i64[] view = wide; int* bad = view;
+    }
+    expect_error("cannot convert 'i64*' to 'int*' implicitly") {
+        i64[2] wide = {1, 2}; p2iNativeTakeInt(wide);
+    }
+    expect_error("cannot convert 'i64*' to 'int*' implicitly") {
+        i64[2] wide = {1, 2}; int* bad = wide;
+    }
+    expect_error("cannot convert 'i64*' to 'int*' implicitly") {
+        i64[2] wide = {1, 2}; i64[] view = wide; p2iNativeTakeInt(view);
+    }
+    expect_error("pointee types differ") {
+        bool c = true; int[2] small = {1, 2}; int[] view = small;
+        i64 wide = 3; int* bad = c ? view : &wide;
+    }
+    expect_error("pointee types differ") {
+        bool c = true; int[2] small = {1, 2}; int[] view = small;
+        i64 wide = 3; int* bad = c ? &wide : view;
+    }
+    expect_error("cannot convert 'i64*' to 'int*' implicitly") {
+        i64 wide = 3; P2iPointerField bad = {value = &wide};
+    }
+    simd<int,4> simdValue;
+    p2iSimdInt(&simdValue);
+    long cLong = 1; ulong cULong = 2;
+    c_p2i_take_long(&cLong);
+    c_p2i_take_ulong(&cULong);
+    p2iNativeTakeInt(ip);
+    p2iNativeTakeInt((int*)wp);
+    int* explicitPointer = (int*)wp;
+    int[2] sameArray = {1, 2};
+    int[] sameView = sameArray;
+    int* sameViewDecay = sameView;
+    int* sameArrayDecay = sameArray;
+    p2iNativeTakeInt(sameView);
+    i8* bytePointer = (i8*)&n;
+    char* charPointer = bytePointer;
+    charPointer = (char*)bytePointer;
+    i32* samePrimitive = ip;
+    p2iBetter(wp);
     return 0;
 }
 int p2iTakeLong(long value) { return (int)value; }
+
+// Global brace list of pointers: same pointee rule as a local one.
+expect_error("cannot convert 'i64*' to 'int*' implicitly") {
+    int*[2] p2iGlobalBadPtrs = { &p2iGlobalWide, &p2iGlobalWide };
+}
+int p2iGlobalInt = 3;
+int*[2] p2iGlobalGoodPtrs = { &p2iGlobalInt, &p2iGlobalInt };

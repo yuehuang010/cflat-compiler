@@ -604,6 +604,12 @@ std::string MainListener::TryInferAndInstantiateFromArgs(const std::string& func
                         argView = false;
                         argStars += 1;
                     }
+                    else if (!paramView && !argView && tv.ConstArraySize > 0 && paramStars > 0)
+                    {
+                        // A fixed array passed to 'T*' decays to a pointer to its element, just
+                        // like a view does; include that decay level before stripping T*.
+                        argStars += 1;
+                    }
                     if (argType.empty())
                     {
                         if (argStars < paramStars) break;

@@ -903,7 +903,7 @@ llvm::Function* LLVMBackend::GetOrCreateCAbiFunctionThunk(const FunctionSymbol& 
         std::vector<TypeAndValue> params;
         UnpackFuncPtrSignature(fpTV, ret, params);
         const bool cxxSretReturn = !ret.Pointer && !ret.IsAlias
-            && !ret.IsArrayView && IsForeignNontrivialCxxReturnClass(ret.TypeName);
+            && !ret.IsArrayView && ReturnsViaCxxSret(ret.TypeName);
         const AbiRecipe& recipe = symbol.Recipe;
         auto* naturalTy = cxxSretReturn
             ? BuildExternFunctionType(ret, params, false, recipe)
@@ -1031,7 +1031,7 @@ llvm::Function* LLVMBackend::GetOrCreateReverseAbiFunctionThunk(
         llvm::Value* sret = nullptr;
         const bool cxxSretReturn = plan.recipe.retSlot.kind == AbiSlot::SRetReturn
             && !plan.ret.Pointer && !plan.ret.IsAlias
-            && IsForeignNontrivialCxxReturnClass(plan.ret.TypeName);
+            && ReturnsViaCxxSret(plan.ret.TypeName);
         if (plan.recipe.retSlot.kind == AbiSlot::SRetReturn)
         {
             const unsigned sretIndex = SRetArgIndex(plan.recipe);
@@ -1177,7 +1177,7 @@ llvm::Value* LLVMBackend::WrapCFuncPtrAsFatStruct(llvm::Value* cFnPtrValue, cons
         retTV.IsAlias  = fpTV.FuncPtrReturnAlias;
         llvm::Type* returnType = GetType(retTV);
         if (!retTV.Pointer && !retTV.IsAlias
-            && IsForeignNontrivialCxxReturnClass(retTV.TypeName))
+            && ReturnsViaCxxSret(retTV.TypeName))
         {
             auto* structTy = GetType(retTV);
             if (structTy != nullptr && structTy->isStructTy())

@@ -765,7 +765,7 @@ function<int(int)> sign = (int x) => {
 };
 ```
 
-**Value capture** - primitives, pointer types, and `string` are copied into the closure at lambda creation time. A capturing lambda is a `Lambda<T>`. Subsequent changes to the outer variable do not affect the captured copy:
+**Value capture** - primitives, pointer types, and `string` are copied into the closure at lambda creation time. Writes to that captured copy persist across calls, while changes to the outer variable do not affect it and writes inside the lambda do not change the outer variable. A capturing lambda is a `Lambda<T>`:
 
 ```c
 int offset = 10;
@@ -3189,6 +3189,10 @@ double d   = 1e3;    // 1000.0
 **Default literal width.** A suffix-less literal is typed as the *smallest* type that
 holds its value exactly - the literal carries no width of its own, so context (the
 target type, an overload, an enclosing expression) can still widen it:
+
+The `L` suffix gives an integer literal the target C `long` type when it fits (32-bit
+on LLP64 and 64-bit on LP64); an `L` value too large for 32-bit `long` uses `i64`, and
+`LL` always gives it `i64`.
 
 - **Integers**: `5` is `i8`, `300` is `i16`, `100000` is `i32`, a value past `i32`
   is `i64`, and a value past `i64` (decimal, hex, or binary) is `i128`. Widening to a

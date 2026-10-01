@@ -2895,6 +2895,8 @@ namespace cflat_cinterop
                     rec.isTrivial = cxx->isTrivial();
                     rec.isTriviallyCopyable = cxx->isTriviallyCopyable()
                         && !cxx->hasNonTrivialDestructor() && !cxx->isPolymorphic();
+                    rec.isTriviallyRelocatable = st.ci != nullptr && st.ci->hasSema()
+                        && st.ci->getSema().IsCXXTriviallyRelocatableType(*cxx);
                     if (cxx->hasDefinition())
                     {
                         if (cxx->getDefinition()->isInvalidDecl())

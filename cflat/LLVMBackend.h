@@ -48,6 +48,8 @@
 #include "platform/PlatformCompat.h"
 #include "DiagnosticLocalization.h"
 
+std::string_view MangledBase(std::string_view mangled);
+
 // The one table of primitive words that name the SAME type (type identity and mangling). `uint`
 // stays: raw fixed-array element spellings reach TypeName without passing the parser canonicalizer.
 inline std::string CanonicalPrimitiveTypeName(std::string_view type)
@@ -1516,6 +1518,8 @@ public:
     {
     public:
         LLVMBackend::TypeAndValue TypeAndValue;
+        LLVMBackend::TypeAndValue OriginalArgumentType;
+        bool HasOriginalArgumentType = false;
         // Monotonic local declaration order used for lifetime checks and cleanup order.
         uint64_t DeclSequence = 0;
         llvm::Type* BaseType = nullptr;  // The type of the value, even if it is a pointer.
@@ -1685,6 +1689,7 @@ public:
         // CONSUMING param (sink/`move`/unique) or moving it out would launder ownership and double-free.
         bool IsBorrowedOwningValue = false;
         bool IsAliasBorrow = false;      // compile-time: local bound from an `alias` return - shallow-aliases storage it does not own, so its scope-exit destructor is suppressed
+        bool IsAliasReturnBorrow = false; // compile-time: alias borrow originated from an alias-return call
         // The block/function the borrow BINDING was created in. A rebind emitted in that same block
         // runs on every path that reaches scope exit, which is the only case the borrow may retire.
         llvm::BasicBlock* AliasBorrowDeclBlock = nullptr;
@@ -1873,9 +1878,10 @@ public:
         // the operator path reduces it to a raw llvm::Value and 0 means "not recorded".
         int          pointerDepth = 0;
         bool         elemPointer  = false;
-        // Declared source type name of the operand. Carried for C++ IDENTITY only (a `char`
-        // operand must not reach a C++ template as `signed char`); no other path reads it.
+        // Source spelling retained for C++ identity and operator reductions.
         std::string  sourceTypeName;
+        TypeAndValue sourceType;
+        bool hasSourceType = false;
         // TypeAndValue::IsCxxPointeeConst of a pointer operand, so a `?:` join keeps it.
         bool         cxxPointeeConst = false;
         // Source identity retained while operator reductions carry values without their NamedVariable.
@@ -1929,6 +1935,9 @@ public:
         // Bitfield side-table: field-name lookup checks this BEFORE StructFields.
         // StructFields has synthetic storage slots (`__bf0` etc.) that are not user-visible.
         std::vector<BitfieldInfo> Bitfields;
+        // Cached NeedsCxxLoweringType answer; Known is set once the field graph was complete.
+        bool NeedsCxxLowering = false;
+        bool NeedsCxxLoweringKnown = false;
     };
 
     struct ProgramData
@@ -3922,6 +3931,7 @@ private:
         bool hasTrivialDefaultCtor = false;
         bool hasTrivialCopyCtor = false;
         bool hasTrivialDtor = true;
+        bool isTriviallyRelocatable = false;
         bool paramDestroyedInCallee = false;   // MS ABI: the callee destroys a by-value param
         bool hasDeletedDefaultCtor = false;
         bool hasDeletedCopyCtor = false;
@@ -5156,6 +5166,7 @@ private:
                                      std::vector<llvm::Value*> ancestors = {}, const std::string& callee = {});
     bool AdoptAliasReturnTemps(llvm::Value* aliasStorage, NamedVariable& owner);
     bool IsAliasReturnTempResult(llvm::Value* value, std::string* callee = nullptr) const;
+    bool IsAliasReturnResult(llvm::Value* value, std::string* callee = nullptr) const;
 
     void UnregisterOwnedStructTemp(llvm::Value* value);
 
@@ -5489,6 +5500,9 @@ private:
 
     bool HasNonTrivialDestructor(const std::string& typeName);
     bool IsOwningValueType(const std::string& typeName);
+    // An `extern` definition with a CFlat body follows the C ABI: the callee owns (and destroys)
+    // each owning by-value param, so a call hands the argument over exactly like a `move` param.
+    bool CFlatExternOwnsByValueParam(const TypeAndValue& p);
     bool HasForeignNontrivialCxxField(const std::string& typeName) const;
 
     // True when the array-view element described by `elemField` owns nothing, so bit-copying it
@@ -6693,6 +6707,10 @@ public:
     void RegisterFunctionTypeAlias(const std::string& alias, const TypeAndValue& target);
 
     std::string ResolveTypeAlias(const std::string& name) const;
+    bool IsImplicitIntegerPointeePointerConversion(const TypeAndValue& from,
+                                                    const TypeAndValue& to) const;
+    void RejectImplicitIntegerPointeePointerConversion(const TypeAndValue& from,
+                                                        const TypeAndValue& to);
 
     // Look up a closure alias using the same innermost-namespace-first rules as named types.
     const TypeAndValue* FindFunctionTypeAlias(const std::string& name) const;
@@ -8507,6 +8525,7 @@ public:
         bool hasTrivialDefaultCtor = false;
         bool hasTrivialCopyCtor = false;
         bool hasTrivialDtor = true;
+        bool isTriviallyRelocatable = false;
         bool paramDestroyedInCallee = false;   // MS ABI: the callee destroys a by-value param
         bool hasDeletedDefaultCtor = false;
         bool hasDeletedCopyCtor = false;
@@ -8759,6 +8778,7 @@ public:
      * every lifetime site consults.
      */
     std::set<std::string> cxxNontrivialRecords_;
+    std::set<std::string> cxxTriviallyRelocatableRecords_;
     bool IsForeignNontrivialCxxClass(const std::string& typeName) const
     {
         if (pendingCxxRecordProjections_.count(typeName) != 0)
@@ -8768,6 +8788,53 @@ public:
     bool HasForeignNontrivialCxxFieldForAnalysis(const std::string& typeName) const
     {
         return HasForeignNontrivialCxxField(typeName);
+    }
+    // A CFlat struct (plain or [cpp]) holding, transitively, a C++ field clang does not call
+    // trivially relocatable. A [cpp] struct is judged by its own fields both before and after its
+    // C++ record is generated, so the answer never flips between prototype and body.
+    bool NeedsCxxLoweringType(const std::string& typeName) const
+    {
+        if (generatedCxxRecords_.count(typeName) == 0 && IsForeignNontrivialCxxClass(typeName))
+            return false;
+        auto found = dataStructures.find(typeName);
+        if (found == dataStructures.end()) return false;
+        if (found->second.NeedsCxxLowering || found->second.NeedsCxxLoweringKnown)
+            return found->second.NeedsCxxLowering;
+        // ForwardRefScanner registers opaque shells before it sees struct bodies. Do not cache
+        // a negative answer until the field list and its by-value dependencies are complete.
+        if (found->second.StructType == nullptr || found->second.StructType->isOpaque())
+            return false;
+        std::unordered_set<std::string> seen;
+        bool complete = true;
+        std::function<bool(const std::string&)> contains = [&](const std::string& name) {
+            if (generatedCxxRecords_.count(name) == 0 && IsForeignNontrivialCxxClass(name))
+                return cxxTriviallyRelocatableRecords_.count(name) == 0;
+            if (!seen.insert(name).second) return false;
+            auto nested = dataStructures.find(name);
+            if (nested == dataStructures.end()) return false;
+            if (nested->second.StructType == nullptr || nested->second.StructType->isOpaque())
+            {
+                complete = false;
+                return false;
+            }
+            for (const auto& field : nested->second.StructFields)
+            {
+                if (field.Pointer || field.ElemPointer || field.IsUnique
+                    || MangledBase(field.TypeName) == "unique"
+                    || field.IsArrayView || field.IsSimd
+                    || field.IsBitfield || field.IsPadding) continue;
+                if (contains(field.TypeName)) return true;
+            }
+            return false;
+        };
+        const bool needsLowering = contains(typeName);
+        if (complete)
+        {
+            auto& cached = const_cast<StructData&>(found->second);
+            cached.NeedsCxxLowering = needsLowering;
+            cached.NeedsCxxLoweringKnown = true;
+        }
+        return needsLowering;
     }
     bool IsCopyableTypeForAnalysis(const std::string& typeName) const
     {
@@ -8784,6 +8851,15 @@ public:
             && info != nullptr && info->hasDeletedCopyCtor;
         return (IsForeignNontrivialCxxClass(typeName) || returnNeedsSret)
             && generatedCxxRecords_.count(typeName) == 0;
+    }
+    // A classified struct that is CFlat-only (not a [cpp] or imported C++ record).
+    bool IsLoweredCFlatOnlyStruct(const std::string& typeName) const
+    {
+        return generatedCxxRecords_.count(typeName) == 0 && NeedsCxxLoweringType(typeName);
+    }
+    bool ReturnsViaCxxSret(const std::string& typeName) const
+    {
+        return IsForeignNontrivialCxxReturnClass(typeName) || NeedsCxxLoweringType(typeName);
     }
     // countCtorTemplates=false answers as if constructor templates were invisible, the surface
     // a class-typed implicit argument conversion still keys on.
@@ -9088,6 +9164,13 @@ public:
                                     const std::string& displayTypeName = {});
     bool EmitCxxByValueParamConstruct(const std::string& typeName, llvm::Value* dest,
                                       llvm::Value* src, bool useMove, const char* context);
+    // Move a classified value member-wise (plan cflat-struct-nontrivial-cxx-fields): C++ class
+    // members run their move constructor and stay destructible in `src`; every other member is
+    // relocated and nulled in `src`. Elements [skipBefore, skipAfter) bytes bound a top-level
+    // struct walk (a [cpp] struct's CFlat field block); 0/UINT64_MAX walks every member.
+    bool EmitLoweredMemberwiseMove(const std::string& typeName, llvm::Type* valueType,
+                                   llvm::Value* dest, llvm::Value* src, const char* context,
+                                   uint64_t skipBefore = 0, uint64_t skipAfter = UINT64_MAX);
     /*
      * Destination slot that a foreign nontrivial C++ result must be constructed INTO, armed by
      * the declaration site for the duration of one initializer and consumed by the first call
@@ -9111,6 +9194,40 @@ public:
     // stores the value when the ABI returned the object in registers.
     llvm::Value* lastCxxRetTemp_ = nullptr;
     llvm::Value* lastCxxRetValue_ = nullptr;
+    // The same pair for a classified CFlat-only struct result (NOT on the owned-temp list: the
+    // loaded value keeps CFlat by-value ownership). Read only by the declaration that adopts
+    // the slot as its storage; every other consumer sees a plain by-value result.
+    llvm::Value* lastLoweredRetTemp_ = nullptr;
+    llvm::Value* lastLoweredRetValue_ = nullptr;
+    // Indirect calls emitted while their by-value return type was still opaque; rewritten to
+    // sret once the type completes classified (the stored function value is the sret shim).
+    struct OpaqueReturnIndirectCall { llvm::WeakTrackingVH call; std::string typeName; };
+    std::vector<OpaqueReturnIndirectCall> opaqueReturnIndirectCalls_;
+    // Opaque by-value call results can be consumed before their type completes. Keep their
+    // eventual discard disposition so fixup can diagnose bare drops or destroy explicit drops.
+    struct OpaqueReturnDiscardSite
+    {
+        llvm::WeakTrackingVH call;
+        llvm::WeakTrackingVH storage;
+        std::string typeName;
+        std::string functionName;
+        bool discarded = false;
+        bool bare = false;
+        bool fixupFailed = false;
+        // Call position: a bare-discard error is raised at fixup but reported here.
+        std::string file;
+        size_t line = 0;
+        size_t column = 0;
+    };
+    std::vector<OpaqueReturnDiscardSite> opaqueReturnDiscardSites_;
+    void RecordOpaqueReturnCall(llvm::Value* call, const std::string& typeName,
+                                const std::string& functionName);
+    void MarkOpaqueReturnDiscard(llvm::Value* value, const std::string& functionName, bool bare);
+    void RepairOpaqueReturnDiscardSites();
+    llvm::CallBase* RewriteCallToSret(llvm::CallBase* call, llvm::FunctionType* newType,
+                                      llvm::Value* callee, unsigned sretIndex,
+                                      llvm::Type* structTy, uint64_t align);
+    void RepairOpaqueReturnIndirectCalls();
     // Imported C++ classes, keyed by the CFlat dotted type name.
     std::map<std::string, CxxClassInfo> cxxClasses_;
     std::unordered_map<std::string, std::string> cppStructBases_;
@@ -9249,10 +9366,11 @@ public:
     // scan and will re-derive the signature once the aggregate body exists; stay quiet.
     llvm::FunctionType* GetFunctionType(const LLVMBackend::TypeAndValue& returnType, const std::vector<LLVMBackend::TypeAndValue>& arguments, bool varargs = false, bool externC = false, bool allowIncomplete = false);
 
-    // First by-value PARAMETER whose LLVM type is a still-opaque struct, or nullptr. LLVM
-    // rejects an unsized argument type; an opaque RETURN type is legal and needs no stand-in.
+    // First by-value return or parameter whose LLVM type is still an opaque struct, or nullptr.
+    // Defer the signature until its body is known so ABI classification can inspect its fields.
     llvm::StructType* FindIncompleteByValueAggregate(
-        const std::vector<LLVMBackend::TypeAndValue>& arguments, bool externC);
+        const TypeAndValue& returnType, const std::vector<LLVMBackend::TypeAndValue>& arguments,
+        bool externC);
 
     // Re-derive the real signature of every provisional declaration whose aggregates now
     // have bodies, replacing the body-less provisional llvm::Function.
@@ -10975,7 +11093,8 @@ public:
     // 143: promoted aliases exclude bitfields, whose packed storage stays in their synthetic record.
     // 144: named C++ members of anonymous struct/union types get synthetic nested records.
     // 151: a body-refused constructor is a plain valid candidate again; wrappers re-resolve.
-    static constexpr int kCHeaderCacheVersion = 151;
+    // 152: records carry clang's standard trivially-relocatable answer ("tr").
+    static constexpr int kCHeaderCacheVersion = 152;
     static std::string CompilerBuildStamp();
     // THE switch for "the compiler build is part of cache entry validity": header/request
     // entries record and check "cstamp", and demand companion keys fold the stamp. OFF by

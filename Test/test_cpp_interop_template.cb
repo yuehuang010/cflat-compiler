@@ -3576,6 +3576,10 @@ extern int main()
         unsigned mmUnsigned = 3u;
         if (std.min(mmUnsigned, 5u) != 3u)                                 return 2628;
         long mmLong = 3L;
+        long long mmLongLong = 3LL;
+        if (sizeof(5L) != sizeof(long))                                   return 2640;
+        if (sizeof(5LL) != sizeof(i64))                                    return 2641;
+        if (std.min(mmLongLong, 5LL) != 3LL)                               return 2642;
         if (std.min(mmLong, 5L) != 3L)                                     return 2629;
 
         int mmOther = 4;

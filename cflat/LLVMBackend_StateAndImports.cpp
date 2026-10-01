@@ -2610,6 +2610,7 @@ nlohmann::json LLVMBackend::RecordToJson(const CRecordEntry& r, CCachePathTable*
         if (r.isPacked) j["pk"] = true;
         if (r.isTrivial) j["tv"] = true;
         if (r.isTriviallyCopyable) j["tc"] = true;
+        if (r.isTriviallyRelocatable) j["tr"] = true;
         if (r.specialMembersPending) j["smp"] = true;
         if (r.sizeBytes != 0)  j["sz"] = r.sizeBytes;
         if (r.alignBytes != 0) j["al"] = r.alignBytes;
@@ -2704,6 +2705,7 @@ LLVMBackend::CRecordEntry LLVMBackend::RecordFromJson(const SjVal& j, const CCac
         r.isPacked = j.value("pk", false);
         r.isTrivial = j.value("tv", false);
         r.isTriviallyCopyable = j.value("tc", false);
+        r.isTriviallyRelocatable = j.value("tr", false);
         r.specialMembersPending = j.value("smp", false);
         r.sizeBytes  = j.value("sz", (uint64_t)0);
         r.alignBytes = j.value("al", (uint64_t)0);

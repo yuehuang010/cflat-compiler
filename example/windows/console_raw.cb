@@ -28,7 +28,7 @@ extern int main()
 
     // If stdin is a pipe/file (e.g. running under a test harness), console-mode
     // calls fail - report and exit cleanly instead of hanging on input.
-    i32 oldMode = 0;
+    u32 oldMode = 0;
     if (GetConsoleMode(hin, &oldMode) == 0)
     {
         printf("stdin is not a console; nothing to do.\n");
@@ -36,7 +36,7 @@ extern int main()
     }
 
     // Raw mode: no line buffering, no automatic echo.
-    i32 rawMode = oldMode & ~(i32)(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT);
+    u32 rawMode = oldMode & ~(u32)(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT);
     SetConsoleMode(hin, rawMode);
 
     // Where is the cursor now? This is the header's struct, fields named
