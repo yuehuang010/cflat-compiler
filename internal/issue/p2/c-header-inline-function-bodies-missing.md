@@ -46,3 +46,10 @@ Attempt (W3b, 2026-09-30, no code change): the demand-body path is tied to C++ r
 imports wholesale would emit every inline (violates demand-only). Needs a design: route called
 C inline/static-inline functions through a demand request like C++ members (or a per-call clang
 body request). Report + pre-fix matrix: scratch/repro_keep/w3b/.
+
+## Ruling (maintainer, 2026-09-30)
+Follow clang: a C `inline` / `static inline` function the CFlat program calls gets its body compiled
+by clang (C mode, the import's own flags/defines) and emitted into the CFlat module as a local
+definition, exactly as clang emits an inline body into the TU that uses it. Demand-only: uncalled
+inline bodies are never compiled. This is the "C-side demand request" option above; build it on the
+existing clang request machinery rather than a separate C-only harvest.

@@ -16,3 +16,10 @@ that the program links together, or a documented rule that prevents the mismatch
 ## Direction
 Needs a ruling: diagnose (cheap: compare the specialization set per group at request time) vs
 merge define groups for specializations.
+
+## Ruling (maintainer, 2026-09-30)
+Diagnose. C++ itself treats this as an ODR violation with no diagnostic required (the linker keeps
+one copy silently), and define groups cannot be merged because they exist precisely because their
+defines conflict. CFlat sees every group, so at request time compare the specialization set of each
+template instantiation the program uses across the define groups it links together; on a mismatch
+emit one LogError at the CFlat use site naming the template, the two imports and their defines.

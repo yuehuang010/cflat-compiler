@@ -36,3 +36,11 @@ Phase 0 was evaluated on 2026-09-30 and deferred: instrumented gates found
 currently passing CFlat aggregates at every candidate operation site, while
 `HasForeignNontrivialCxxField` cannot distinguish those supported fields from
 the failing `std.list<int>` field. No refusal shape landed; phases 1-3 remain.
+
+## Ruling (maintainer, 2026-09-30)
+Skip the phase 0 hand-written predicate. Ask clang whether each field type is trivially relocatable
+(clang's own trait on the field type, e.g. `__builtin_is_cpp_trivially_relocatable` / trivially
+copyable + trivial move and destructor as the conservative fallback) and go straight to phases 1-3
+of internal/plan/cflat-struct-nontrivial-cxx-fields.md: construct in place, return via sret, move
+field by field with the C++ move constructor whenever clang says the field is not trivially
+relocatable. Movability itself is unchanged (an `[immovable]` attribute is a separate p4).
