@@ -110,6 +110,30 @@ class queue<T>
         return _data[_front];
     }
 
+    // Deep copy the live range. Element copies use the same rules as list<T>: values with a
+    // copy() are independent, borrows copy by identity, and unique/non-copyable owners reject.
+    move queue<T> copy()
+    {
+        if const (is_unique(T))
+        {
+            compile_error("cannot copy a queue of unique elements; copy the pointees explicitly, or use queue<T*> for a borrowing copy");
+            queue<T> none;
+            return none;
+        }
+        else
+        {
+            queue<T> result;
+            int i = 0;
+            while (i < _size)
+            {
+                if const (!is_copyable(T)) compile_error("cannot copy this queue: its element type owns a 'unique' pointer and has no 'copy()'; give the type a 'copy()' method, or 'move' the queue instead of copying it");
+                else                       result.enqueue(_data[_front + i]);
+                i++;
+            }
+            return result;
+        }
+    }
+
     // True when the queue has no elements.
     bool isEmpty()
     {

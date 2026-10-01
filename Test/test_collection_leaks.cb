@@ -58,6 +58,28 @@ struct LeakPair { string name = default; list<int> nums = default; };
 int _drainLive = 0;
 struct DrainRes  { int v = 0; DrainRes() { _drainLive++; } ~DrainRes() { _drainLive--; } };
 struct DrainCell { unique DrainRes* p = new DrainRes(); int tag = 0; };
+int _queueCopyLive = 0;
+struct QueueCopyTracked
+{
+    int value = 0;
+    QueueCopyTracked() { _queueCopyLive++; }
+    ~QueueCopyTracked() { _queueCopyLive--; }
+    QueueCopyTracked copy() { QueueCopyTracked r = default; r.value = value; return move r; }
+};
+struct QueueFieldLeakBox { queue<QueueCopyTracked> values = default; };
+void _growQueueField(QueueFieldLeakBox box)
+{
+    for (int i = 0; i < 100; i++)
+    {
+        QueueCopyTracked item = default;
+        item.value = i;
+        box.values.enqueue(item);
+    }
+}
+void _growBareQueue(queue<int> values)
+{
+    for (int i = 0; i < 100; i++) values.enqueue(i);
+}
 // Compound assignment through an operator overload replaces the LHS: the old owner must be
 // destructed exactly once, whatever lvalue form (local, field, element, deref) the LHS takes.
 struct DrainSum
@@ -461,6 +483,119 @@ void rowSink(LeakRow v)    { g_sinkRow = move v; }
 // temp) is consumed with NO `move` keyword, its env transferred into the slot (single owner).
 Lambda<int(int)> g_sinkFn = default;
 void fnSink(Lambda<int(int)> f) { g_sinkFn = move f; }
+Lambda<int()> returnByValueClosure(Lambda<int()> value) { return value; }
+int g_nestedUniqueCtors = 0;
+int g_nestedUniqueDtors = 0;
+struct NestedUniqueOwner
+{
+    int value = 0;
+    NestedUniqueOwner() { g_nestedUniqueCtors++; }
+    ~NestedUniqueOwner() { g_nestedUniqueDtors++; }
+};
+int takeNestedUnique(unique<NestedUniqueOwner> value) { return value->value; }
+unique<NestedUniqueOwner> passNestedUnique(unique<NestedUniqueOwner> value) { return move value; }
+int takeNestedUniqueInt(unique<int> value) { return *value; }
+unique<int> passNestedUniqueInt(unique<int> value) { return move value; }
+int conditionalNestedUniqueIf(bool selectFirst)
+{
+    unique<NestedUniqueOwner> first = new NestedUniqueOwner;
+    first->value = 9;
+    unique<NestedUniqueOwner> second = new NestedUniqueOwner;
+    second->value = 4;
+    int result = 0;
+    if (selectFirst) result = takeNestedUnique(first);
+    else result = takeNestedUnique(second);
+    return result;
+}
+int conditionalNestedUniqueTernary(bool selectFirst)
+{
+    unique<NestedUniqueOwner> first = new NestedUniqueOwner;
+    first->value = 9;
+    unique<NestedUniqueOwner> second = new NestedUniqueOwner;
+    second->value = 4;
+    return takeNestedUnique(selectFirst ? first : second);
+}
+RawResCopyable mkRawResCopyable(int n)
+{
+    RawResCopyable item = default;
+    item.node = new RawResNodeLeak(); item.node.v = n;
+    return move item;
+}
+struct RawResListBox
+{
+    list<RawResCopyable> values = default;
+    void putOne()
+    {
+        RawResCopyable item = mkRawResCopyable(50);
+        values.add(move item);
+    }
+};
+void growByValueListField(RawResListBox box)
+{
+    for (int i = 0; i < 8; i++)
+    {
+        RawResCopyable item = default;
+        item.node = new RawResNodeLeak(); item.node.v = i + 10;
+        box.values.add(move item);
+    }
+}
+void writeRawResThroughAlias(RawResCopyable value)
+{
+    RawResCopyable* p = &value;
+    RawResCopyable replacement = mkRawResCopyable(30);
+    *p = move replacement;
+}
+void writeRawResThroughReassignedAlias(RawResCopyable value)
+{
+    RawResCopyable* p = nullptr;
+    p = &value;
+    RawResCopyable replacement = mkRawResCopyable(31);
+    *p = move replacement;
+}
+void replaceRawResPointer(RawResCopyable* p)
+{
+    RawResCopyable replacement = mkRawResCopyable(32);
+    *p = move replacement;
+}
+void writeRawResThroughCall(RawResCopyable value) { replaceRawResPointer(&value); }
+
+struct NestedRawResListBox { RawResListBox inner = default; };
+struct RawResDictionaryBox { dictionary<int, RawResCopyable> values = default; };
+void growNestedByValueListField(NestedRawResListBox box)
+{
+    for (int i = 0; i < 8; i++)
+    {
+        RawResCopyable item = mkRawResCopyable(i + 40);
+        box.inner.values.add(move item);
+    }
+}
+void growByValueListFieldMethod(RawResListBox box)
+{
+    for (int i = 0; i < 8; i++) box.putOne();
+}
+void growByValueListFieldAddress(RawResListBox box)
+{
+    list<RawResCopyable>* p = &box.values;
+    for (int i = 0; i < 8; i++)
+    {
+        RawResCopyable item = mkRawResCopyable(i + 60);
+        p->add(move item);
+    }
+}
+void growByValueDictionaryField(RawResDictionaryBox box)
+{
+    for (int i = 4; i < 12; i++)
+    {
+        RawResCopyable item = mkRawResCopyable(i + 70);
+        box.values.set(i, move item);
+    }
+}
+int g_lambdaWriteValue = 0;
+void lambdaWriteSink(RawResLeak value)
+{
+    Lambda<void()> replace = () => { value = mkRawRes(3); g_lambdaWriteValue = value.node.v; };
+    replace();
+}
 // If-const laundering residual (internal/issue/borrow-launder-residual-if-const-body-move.md):
 // a generic method whose ONLY move of its by-value param sits inside a LIVE `if const` branch
 // must classify the param a move-sink for that instantiation (caller nulled, single owner), not a
@@ -602,6 +737,30 @@ extern int main()
 
     int passed = 0;
     int total = 0;
+
+    // A by-value queue field is copied only for its mutating method use. Growth past capacity
+    // stays isolated from the caller and every tracked element is destroyed once.
+    _queueCopyLive = 0;
+    {
+        QueueFieldLeakBox box = default;
+        {
+            QueueCopyTracked initial = default;
+            initial.value = 7;
+            box.values.enqueue(initial);
+        }
+        _growQueueField(box);
+        total++; passed += Test("by-value queue field caller unchanged", box.values.count(), 1);
+        total++; passed += Test("by-value queue field caller value", box.values.peek().value, 7);
+        total++; passed += Test("by-value queue field dtor balance in scope", _queueCopyLive, 1);
+    }
+    total++; passed += Test("by-value queue field dtor balance after scope", _queueCopyLive, 0);
+    {
+        queue<int> values = default;
+        values.enqueue(7);
+        _growBareQueue(values);
+        total++; passed += Test("bare by-value queue caller unchanged", values.count(), 1);
+        total++; passed += Test("bare by-value queue caller value", values.peek(), 7);
+    }
 
     // === Bug 1: string.split() parts are owned by the returned list ===
     // The list and all of its split-produced string elements must free on scope exit.
@@ -3123,6 +3282,40 @@ extern int main()
         Lambda<int(int)> emptyF = default;
         g_sinkFn = move emptyF;                // release the env the sink now owns
 
+        // The outer unique sink owns a nested pass-through result; only its callee frees it.
+        g_nestedUniqueCtors = 0;
+        g_nestedUniqueDtors = 0;
+        {
+            unique<NestedUniqueOwner> value = new NestedUniqueOwner;
+            value->value = 9;
+            total++; passed += Test("nested unique pass-through value", takeNestedUnique(passNestedUnique(value)), 9);
+        }
+        total++; passed += Test("nested unique pass-through ctor", g_nestedUniqueCtors, 1);
+        total++; passed += Test("nested unique pass-through dtor", g_nestedUniqueDtors, 1);
+        {
+            unique<int> value = new int(17);
+            total++; passed += Test("nested unique int pass-through value",
+                                    takeNestedUniqueInt(passNestedUniqueInt(move value)), 17);
+        }
+        g_nestedUniqueCtors = 0;
+        g_nestedUniqueDtors = 0;
+        total++; passed += Test("conditional unique if first value", conditionalNestedUniqueIf(true), 9);
+        total++; passed += Test("conditional unique if first cleanup", g_nestedUniqueDtors, 2);
+        total++; passed += Test("conditional unique if second value", conditionalNestedUniqueIf(false), 4);
+        total++; passed += Test("conditional unique if both cleanup", g_nestedUniqueDtors, 4);
+        total++; passed += Test("conditional unique ternary first value", conditionalNestedUniqueTernary(true), 9);
+        total++; passed += Test("conditional unique ternary first cleanup", g_nestedUniqueDtors, 6);
+        total++; passed += Test("conditional unique ternary second value", conditionalNestedUniqueTernary(false), 4);
+        total++; passed += Test("conditional unique ternary both cleanup", g_nestedUniqueDtors, 8);
+
+        {
+            int closureBase = 70;
+            Lambda<int()> source = () => closureBase;
+            Lambda<int()> result = returnByValueClosure(source);
+            total++; passed += Test("byvalue closure return keeps result", result(), 70);
+            total++; passed += Test("byvalue closure return keeps caller", source(), 70);
+        }
+
         // If-const live-branch sink: a generic method that moves its by-value owning param into a
         // local inside a LIVE `if const (!is_copyable(T))` branch consumes the caller's value (nulls
         // it, single owner). Previously the param read as a borrow -> caller + local double-freed.
@@ -3133,6 +3326,116 @@ extern int main()
             p.take(hv);                        // move-by-default via live if-const branch: hv consumed
         }
         total++; passed += Test("if-const live-branch sink frees once", g_shapeDtor, 1);
+    }
+
+    // A method call through an owning field mutates the copied parameter, not the caller's list.
+    {
+        g_rawNodeFreed = 0;
+        {
+            RawResListBox box = default;
+            for (int i = 0; i < 4; i++)
+            {
+                RawResCopyable item = default;
+                item.node = new RawResNodeLeak(); item.node.v = i + 1;
+                box.values.add(move item);
+            }
+            growByValueListField(box);
+            total++; passed += Test("byvalue nested list caller count survives growth", box.values.count(), 4);
+        }
+        total++; passed += Test("byvalue nested list all items freed once", g_rawNodeFreed, 16);
+    }
+    {
+        g_rawNodeFreed = 0;
+        {
+            NestedRawResListBox box = default;
+            for (int i = 0; i < 4; i++)
+            {
+                RawResCopyable item = mkRawResCopyable(i + 1);
+                box.inner.values.add(move item);
+            }
+            growNestedByValueListField(box);
+            total++; passed += Test("byvalue deeper nested list caller survives", box.inner.values.count(), 4);
+        }
+        total++; passed += Test("byvalue deeper nested list frees once", g_rawNodeFreed, 16);
+    }
+    {
+        g_rawNodeFreed = 0;
+        {
+            RawResListBox box = default;
+            for (int i = 0; i < 4; i++)
+            {
+                RawResCopyable item = mkRawResCopyable(i + 1);
+                box.values.add(move item);
+            }
+            growByValueListFieldMethod(box);
+            total++; passed += Test("byvalue container method caller survives", box.values.count(), 4);
+        }
+        total++; passed += Test("byvalue container method frees once", g_rawNodeFreed, 16);
+    }
+    {
+        g_rawNodeFreed = 0;
+        {
+            RawResListBox box = default;
+            for (int i = 0; i < 4; i++)
+            {
+                RawResCopyable item = mkRawResCopyable(i + 1);
+                box.values.add(move item);
+            }
+            growByValueListFieldAddress(box);
+            total++; passed += Test("byvalue container address caller survives", box.values.count(), 4);
+        }
+        total++; passed += Test("byvalue container address frees once", g_rawNodeFreed, 16);
+    }
+    {
+        g_rawNodeFreed = 0;
+        {
+            RawResDictionaryBox box = default;
+            for (int i = 0; i < 4; i++)
+            {
+                RawResCopyable item = mkRawResCopyable(i + 1);
+                box.values.set(i, move item);
+            }
+            growByValueDictionaryField(box);
+            total++; passed += Test("byvalue dictionary field caller survives", box.values.count(), 4);
+        }
+        total++; passed += Test("byvalue dictionary field frees once", g_rawNodeFreed, 16);
+    }
+    {
+        g_rawNodeFreed = 0;
+        {
+            RawResCopyable value = mkRawResCopyable(5);
+            writeRawResThroughAlias(value);
+            total++; passed += Test("byvalue address alias caller survives", value.node.v, 5);
+        }
+        total++; passed += Test("byvalue address alias frees once", g_rawNodeFreed, 3);
+    }
+    {
+        g_rawNodeFreed = 0;
+        {
+            RawResCopyable value = mkRawResCopyable(5);
+            writeRawResThroughReassignedAlias(value);
+            total++; passed += Test("byvalue reassigned alias caller survives", value.node.v, 5);
+        }
+        total++; passed += Test("byvalue reassigned alias frees once", g_rawNodeFreed, 3);
+    }
+    {
+        g_rawNodeFreed = 0;
+        {
+            RawResCopyable value = mkRawResCopyable(5);
+            writeRawResThroughCall(value);
+            total++; passed += Test("byvalue address call caller survives", value.node.v, 5);
+        }
+        total++; passed += Test("byvalue address call frees once", g_rawNodeFreed, 3);
+    }
+    {
+        g_rawNodeFreed = 0;
+        g_lambdaWriteValue = 0;
+        {
+            RawResLeak value = mkRawRes(2);
+            lambdaWriteSink(value);
+        }
+        total++; passed += Test("byvalue lambda whole-write value", g_lambdaWriteValue, 3);
+        total++; passed += Test("byvalue lambda whole-write frees once", g_rawNodeFreed, 2);
     }
 
     // === Increment 1: container<Lambda> dequeue-and-invoke-inline frees the returned env (bug d) ===

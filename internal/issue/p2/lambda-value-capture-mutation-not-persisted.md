@@ -59,3 +59,5 @@ reading/writing the env slot in place. Decide the semantics first (mutable env v
 write) - this needs a ruling, since it changes what `doc/LANGUAGE.md` promises.
 
 Main-session note 2026-09-16: repro confirmed on master 24b86c32 (prints 1 1 1). doc/LANGUAGE.md "Value capture" only says outer changes do not reach the copy; it is silent on whether writes to the copy persist across calls. Needs a ruling before the fix: (a) persist like C++ `mutable` (write the local back to env on exit / operate on env directly), or (b) reject assignment to a value-captured variable with a diagnostic. Either way the silent discard is the defect.
+
+RULING 2026-09-30 (maintainer): (a). A by-value capture is a copy the closure OWNS; writes persist across calls (C++ `mutable` / Rust FnMut behaviour). Non-trivial types are never implicitly copied into a closure (no by-value copy without an explicit copy()).

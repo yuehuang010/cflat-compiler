@@ -1252,6 +1252,34 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             LogErrorContext(ctx, "a void call result cannot be used as a chain receiver");
                         prevToken = tokenType;
                         nullConditionalPending = (tokenType == CFlatParser::QuestionDot);
+                        // A parenthesized pointer join carries its element name on the joined
+                        // LLVM value even when the expression wrapper has no NamedVariable type.
+                        if (namedVar.TypeAndValue.TypeName.empty() && namedVar.Primary != nullptr
+                            && namedVar.Primary->getType()->isPointerTy())
+                        {
+                            std::string elementType =
+                                Compiler(ctx)->FindValueElementTypeName(namedVar.Primary);
+                            if (elementType.empty())
+                                if (const auto* join = Compiler(ctx)->FindNullCoalesceJoin(namedVar.Primary))
+                                {
+                                    for (const auto& arm : join->Arms)
+                                    {
+                                        const auto armType = InferTernaryArmType(arm.Value);
+                                        if (!armType.Pointer || armType.TypeName.empty()) continue;
+                                        if (elementType.empty()) elementType = armType.TypeName;
+                                        else if (elementType != armType.TypeName)
+                                        {
+                                            elementType.clear();
+                                            break;
+                                        }
+                                    }
+                                }
+                            if (!elementType.empty())
+                            {
+                                namedVar.TypeAndValue.TypeName = elementType;
+                                namedVar.TypeAndValue.Pointer = true;
+                            }
+                        }
                         if (!namedVar.TypeAndValue.Pointer
                             && Compiler(ctx)->IsCoreUniqueType(namedVar.TypeAndValue.TypeName)
                             && namedVar.CallerName != "this")
@@ -3896,19 +3924,16 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             }
 
                             LLVMBackend::TypeAndValue destType = slotNV.TypeAndValue;
-                            // Address-of unwraps a unique holder to _p for normal pointers.
-                            // construct_at needs the parent slot, so recover it and preserve its type.
+                            // Address-of unwraps unique holders for normal pointers; use the
+                            // holder slot recorded by that unary operator for construction.
                             bool constructTargetIsCoreUnique = false;
-                            if (auto* slotGep = llvm::dyn_cast<llvm::GetElementPtrInst>(slotValue))
+                            if (slotNV.AddressedUniqueSlot != nullptr)
                             {
-                                auto* slotStruct = llvm::dyn_cast<llvm::StructType>(
-                                    slotGep->getSourceElementType());
-                                if (slotStruct != nullptr && slotStruct->hasName()
-                                    && compiler->IsCoreUniqueType(slotStruct->getName().str()))
+                                if (compiler->IsCoreUniqueType(slotNV.AddressedUniqueTypeName))
                                 {
                                     constructTargetIsCoreUnique = true;
-                                    slotValue = slotGep->getPointerOperand();
-                                    destType.TypeName = slotStruct->getName().str();
+                                    slotValue = slotNV.AddressedUniqueSlot;
+                                    destType.TypeName = slotNV.AddressedUniqueTypeName;
                                     destType.Pointer = false;
                                     destType.ElemPointer = false;
                                     destType.IsInterfacePointer = false;

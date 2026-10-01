@@ -13472,35 +13472,7 @@ LLVMBackend::TypeAndValue MainListener::ParseTypeName(CFlatParser::TypeNameConte
                 std::string baseName;
                 auto* genParams = GenericSpecOf(typeSpec, baseName);
                 if (auto* tupleSpec = typeSpec->tupleTypeSpecifier())
-                {
-                    std::vector<std::string> typeArgs;
-                    if (tupleSpec->tupleTypePackEntry() != nullptr)
-                    {
-                        auto* packEntry = tupleSpec->tupleTypePackEntry();
-                        PrimitiveTypeError packError;
-                        std::string packName = CanonicalTypeSpecifierText(
-                            packEntry->typeSpecifier(), packEntry->multiWordTypeSuffix(), false, &packError);
-                        if (HasPrimitiveTypeError(packError))
-                            LogErrorContext(packEntry, LocalizePrimitiveTypeError(compilerLLVM, packError));
-                        auto packIt = activePackSubstitutions.find(packName);
-                        if (packIt != activePackSubstitutions.end()) typeArgs = packIt->second;
-                        else typeArgs.push_back(compilerLLVM->ResolveTypeArgBaseName(packName));
-                    }
-                    else
-                    {
-                        for (auto* entry : tupleSpec->tupleTypeEntry())
-                        {
-                            PrimitiveTypeError argError;
-                            std::string argName = TupleEntryArgName(compilerLLVM, entry, &argError);
-                            if (HasPrimitiveTypeError(argError))
-                                LogErrorContext(entry, LocalizePrimitiveTypeError(compilerLLVM, argError));
-                            typeArgs.push_back(std::move(argName));
-                        }
-                    }
-                    typeValue.TypeName = MangledGenericName("tuple", typeArgs);
-                    tupleTypeArgs[typeValue.TypeName] = typeArgs;
-                    EnsureTupleInstantiated(typeValue.TypeName);
-                }
+                    typeValue.TypeName = ParseTupleTypeSpecifier(tupleSpec);
                 else if (auto* fpSpec = typeSpec->functionPointerSpecifier())
                 {
                     // Cast target `(function<R(Args)>)addr` / `(Lambda<...>)x`: build the
@@ -14246,6 +14218,8 @@ LLVMBackend::NamedVariable MainListener::ParseUnaryExpressionImpl(CFlatParser::U
                     && !namedVar.TypeAndValue.Pointer && namedVar.Storage != nullptr)
                 {
                     const auto& uniqueData = compiler->GetDataStructure(namedVar.TypeAndValue.TypeName);
+                    namedVar.AddressedUniqueSlot = namedVar.Storage;
+                    namedVar.AddressedUniqueTypeName = namedVar.TypeAndValue.TypeName;
                     for (size_t i = 0; i < uniqueData.StructFields.size(); i++)
                         if (uniqueData.StructFields[i].VariableName == "_p")
                         {
@@ -15039,9 +15013,44 @@ LLVMBackend::NamedVariable MainListener::ParseUnaryExpressionImpl(CFlatParser::U
         return {};
     }
 
+std::string MainListener::ParseTupleTypeSpecifier(
+    CFlatParser::TupleTypeSpecifierContext* tupleSpec) {
+        auto* compiler = Compiler(tupleSpec);
+        std::vector<std::string> typeArgs;
+        if (tupleSpec->tupleTypePackEntry() != nullptr)
+        {
+            auto* packEntry = tupleSpec->tupleTypePackEntry();
+            PrimitiveTypeError packError;
+            std::string packName = CanonicalTypeSpecifierText(
+                packEntry->typeSpecifier(), packEntry->multiWordTypeSuffix(), false, &packError);
+            if (HasPrimitiveTypeError(packError))
+                LogErrorContext(packEntry, LocalizePrimitiveTypeError(compiler, packError));
+            auto packIt = activePackSubstitutions.find(packName);
+            if (packIt != activePackSubstitutions.end()) typeArgs = packIt->second;
+            else typeArgs.push_back(compiler->ResolveTypeArgBaseName(packName));
+        }
+        else
+        {
+            for (auto* entry : tupleSpec->tupleTypeEntry())
+            {
+                PrimitiveTypeError argError;
+                std::string argName = TupleEntryArgName(compiler, entry, &argError);
+                if (HasPrimitiveTypeError(argError))
+                    LogErrorContext(entry, LocalizePrimitiveTypeError(compiler, argError));
+                typeArgs.push_back(std::move(argName));
+            }
+        }
+        std::string tupleName = MangledGenericName("tuple", typeArgs);
+        tupleTypeArgs[tupleName] = typeArgs;
+        EnsureTupleInstantiated(tupleName);
+        return tupleName;
+    }
+
 std::string MainListener::ParseTypeSpecifierName(
     CFlatParser::TypeSpecifierContext* ctx,
     CFlatParser::MultiWordTypeSuffixContext* suffix) {
+        if (auto* tupleSpec = ctx->tupleTypeSpecifier())
+            return ParseTupleTypeSpecifier(tupleSpec);
         std::string base;
         if (auto* genParams = GenericSpecOf(ctx, base))
         {

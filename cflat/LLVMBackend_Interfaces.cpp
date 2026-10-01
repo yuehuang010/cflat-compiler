@@ -1209,6 +1209,8 @@ llvm::Value* LLVMBackend::WrapCFuncPtrAsFatStruct(llvm::Value* cFnPtrValue, cons
 
 llvm::Value* LLVMBackend::MakeThinFnPtrValue(llvm::Value* fn, const TypeAndValue& fpTV)
 {
+        if (auto* function = llvm::dyn_cast_or_null<llvm::Function>(fn))
+            RecordAliasReturnAddressUse(function);
         if (auto* original = llvm::dyn_cast<llvm::Function>(fn))
         {
             std::vector<TypeAndValue> params;
@@ -1375,6 +1377,7 @@ llvm::Value* LLVMBackend::WidenThinToFat(llvm::Value* thinPtr)
 
 llvm::Value* LLVMBackend::WrapBareValueAsFatStruct(llvm::Function* original)
 {
+        RecordAliasReturnAddressUse(original);
         if (const auto* symbol = FindSymbolForFunction(original);
             symbol != nullptr && symbol->External && symbol->Recipe.hasLowering)
             original = GetOrCreateCAbiFunctionThunk(*symbol, FuncPtrSigOfSymbol(*symbol));
@@ -1889,6 +1892,11 @@ llvm::GlobalVariable* LLVMBackend::GetOrCreateVTable(const std::string& structNa
         auto& sd = dataStructures[structName];
         auto it = sd.VTables.find(ifaceName);
         if (it != sd.VTables.end()) return it->second;
+
+        if (const auto* methods = FindInterface(ifaceName))
+            for (const auto& method : *methods)
+                if (auto* impl = LookupInterfaceMethodImpl(structName, method))
+                    RecordAliasReturnAddressUse(impl, ifaceName);
 
         const auto* ifaceMethods = FindInterface(ifaceName);
         if (ifaceMethods == nullptr)

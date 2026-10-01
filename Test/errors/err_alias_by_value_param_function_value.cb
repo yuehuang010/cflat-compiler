@@ -4,7 +4,7 @@ struct AbvU { unique<int> u = default; int n = 0; };
 
 AbvU abvPass(AbvU w) { return w; }
 
-expect_error("cannot use 'abvPass' as a function value");
+expect_error("cannot use 'abvPass' as a function value: its 'alias' result can be its by-value parameter 'w'");
 
 extern int main()
 {

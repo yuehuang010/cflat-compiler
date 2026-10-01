@@ -2798,8 +2798,16 @@ inline bool NameShadowedByEnclosingLocal(antlr4::tree::ParseTree* use, const std
     };
     for (auto* parent = use->parent; parent != nullptr; parent = parent->parent)
     {
-        if (dynamic_cast<CFlatParser::LambdaExpressionContext*>(parent) != nullptr
-            || dynamic_cast<CFlatParser::FunctionDefinitionContext*>(parent) != nullptr)
+        if (auto* lambda = dynamic_cast<CFlatParser::LambdaExpressionContext*>(parent))
+        {
+            auto* params = lambda->lambdaParamList();
+            if (params != nullptr)
+                for (auto* param : params->lambdaParam())
+                    if (param->Identifier() != nullptr && param->Identifier()->getText() == name)
+                        return true;
+            continue;
+        }
+        if (dynamic_cast<CFlatParser::FunctionDefinitionContext*>(parent) != nullptr)
             break;
         if (auto* loop = dynamic_cast<CFlatParser::IterationStatementContext*>(parent))
         {
@@ -2902,7 +2910,6 @@ inline void CollectWholeNameStoreDestinations(antlr4::tree::ParseTree* node,
                                               std::unordered_set<std::string>& out)
 {
     if (node == nullptr) return;
-    if (AsRuleCtx<CFlatParser::LambdaExpressionContext>(node)) return;
     if (AsRuleCtx<CFlatParser::FunctionDefinitionContext>(node)) return;
     if (auto* asn = AsRuleCtx<CFlatParser::AssignmentExpressionContext>(node))
         if (asn->assignmentOperator() != nullptr && asn->unaryExpression() != nullptr)
@@ -2913,6 +2920,135 @@ inline void CollectWholeNameStoreDestinations(antlr4::tree::ParseTree* node,
         }
     for (auto* child : node->children)
         CollectWholeNameStoreDestinations(child, out);
+}
+
+// First character of a rule's source text without building the subtree string (getText()
+// concatenates token texts, so it starts with the first token's text).
+inline char FirstSourceChar(antlr4::ParserRuleContext* ctx)
+{
+    if (ctx == nullptr || ctx->getStart() == nullptr) return '\0';
+    const std::string first = ctx->getStart()->getText();
+    return first.empty() ? '\0' : first[0];
+}
+
+inline void CollectAddressAliasWholeNameStores(
+        antlr4::tree::ParseTree* body,
+        const std::vector<LLVMBackend::TypeAndValue>& params,
+        std::unordered_set<std::string>& writtenNames,
+        bool addressMayWrite = false)
+{
+    if (std::none_of(params.begin(), params.end(), [](const auto& p) { return !p.VariableName.empty(); }))
+        return;
+    struct AddressedParam { std::string name; size_t token; };
+    std::unordered_map<std::string, AddressedParam> pointerRoots;
+    auto collectAddressAliases = [&](auto&& self, antlr4::tree::ParseTree* node) -> void {
+        if (node == nullptr) return;
+        if (auto* init = dynamic_cast<CFlatParser::InitDeclaratorContext*>(node))
+        {
+            auto* direct = init->declarator() != nullptr ? init->declarator()->directDeclarator() : nullptr;
+            auto* value = init->initializer() != nullptr ? init->initializer()->assignmentExpression() : nullptr;
+            if (direct != nullptr && direct->Identifier() != nullptr && value != nullptr
+                && FirstSourceChar(value) == '&')
+            {
+                const std::string source = value->getText();
+                if (source.size() > 1 && source[0] == '&')
+                {
+                    const std::string target = source.substr(1);
+                    for (const auto& p : params)
+                        if (p.VariableName == target && !NameShadowedByEnclosingLocal(init, target))
+                            pointerRoots[direct->Identifier()->getText()] = {
+                                target, (size_t)init->getStart()->getTokenIndex() };
+                }
+            }
+        }
+        if (auto* asn = AsRuleCtx<CFlatParser::AssignmentExpressionContext>(node))
+        {
+            auto* dest = asn->unaryExpression();
+            auto* value = asn->assignmentExpression();
+            if (dest != nullptr && value != nullptr && FirstSourceChar(value) == '&')
+            {
+                const std::string source = value->getText();
+                if (source.size() > 1 && source[0] == '&')
+                {
+                    const std::string target = source.substr(1);
+                    const std::string alias = BareSourceText(dest);
+                    for (const auto& p : params)
+                        if (p.VariableName == target && !alias.empty()
+                            && !NameShadowedByEnclosingLocal(asn, target))
+                            pointerRoots[alias] = {
+                                target, (size_t)asn->getStart()->getTokenIndex() };
+                }
+            }
+        }
+        for (auto* child : node->children) self(self, child);
+    };
+    collectAddressAliases(collectAddressAliases, body);
+    auto collectDerefWrites = [&](auto&& self, antlr4::tree::ParseTree* node) -> void {
+        if (node == nullptr) return;
+        if (auto* asn = AsRuleCtx<CFlatParser::AssignmentExpressionContext>(node))
+        {
+            auto* dest = asn->unaryExpression();
+            if (dest != nullptr && FirstSourceChar(dest) == '*')
+            {
+                const std::string text = dest->getText();
+                if (text.size() > 1 && text[0] == '*')
+                    if (auto it = pointerRoots.find(text.substr(1)); it != pointerRoots.end()
+                        && (size_t)asn->getStart()->getTokenIndex() > it->second.token)
+                        writtenNames.insert(it->second.name);
+            }
+        }
+        for (auto* child : node->children) self(self, child);
+    };
+    collectDerefWrites(collectDerefWrites, body);
+    if (!addressMayWrite) return;
+    // `&param...` that is the whole source of a local pointer alias is tracked by the alias
+    // passes (deref stores above, container mutators in the caller); any other `&param...` use
+    // escapes to code this pass cannot see, so it counts as a write.
+    auto isAliasSource = [](CFlatParser::UnaryExpressionContext* unary) {
+        const std::string text = unary->getText();
+        for (auto* parent = unary->parent; parent != nullptr; parent = parent->parent)
+        {
+            if (parent->getText() != text) return false;
+            if (dynamic_cast<CFlatParser::InitializerContext*>(parent) != nullptr) return true;
+            if (auto* asn = dynamic_cast<CFlatParser::AssignmentExpressionContext*>(parent->parent))
+                if (asn->assignmentExpression() == parent) return true;
+        }
+        return false;
+    };
+    auto collectAddressedParams = [&](auto&& self, antlr4::tree::ParseTree* node) -> void {
+        if (node == nullptr) return;
+        if (auto* arg = dynamic_cast<CFlatParser::ArgumentNamedExpressionContext*>(node))
+        {
+            // A tracked alias handed to a callee may be written there.
+            std::string text = BareSourceText(arg);
+            if (!text.empty() && (text[0] == '*' || text[0] == '&')) text = text.substr(1);
+            if (auto it = pointerRoots.find(text); it != pointerRoots.end()
+                && (size_t)arg->getStart()->getTokenIndex() > it->second.token)
+                writtenNames.insert(it->second.name);
+        }
+        auto* unary = dynamic_cast<CFlatParser::UnaryExpressionContext*>(node);
+        if (unary != nullptr && FirstSourceChar(unary) == '&')
+        {
+            const std::string text = unary->getText();
+            if (!text.empty() && text[0] == '&' && !isAliasSource(unary))
+            {
+                for (const auto& p : params)
+                    if (!p.VariableName.empty()
+                        && text.size() > p.VariableName.size() + 1
+                        && text.compare(1, p.VariableName.size(), p.VariableName) == 0
+                        && (text[p.VariableName.size() + 1] == '.'
+                            || text[p.VariableName.size() + 1] == '>'
+                            || text[p.VariableName.size() + 1] == '[')
+                        && !NameShadowedByEnclosingLocal(unary, p.VariableName))
+                        writtenNames.insert(p.VariableName);
+                    else if (!p.VariableName.empty() && text == "&" + p.VariableName
+                        && !NameShadowedByEnclosingLocal(unary, p.VariableName))
+                        writtenNames.insert(p.VariableName);
+            }
+        }
+        for (auto* child : node->children) self(self, child);
+    };
+    collectAddressedParams(collectAddressedParams, body);
 }
 
 // A parameter shape that can carry an owning VALUE (a value struct or `string`). Excludes
@@ -2966,6 +3102,9 @@ inline void ApplyOwningSinkInferenceToBody(const LLVMBackend* compiler,
     std::unordered_set<std::string> writtenNames;
     CollectConsumedStoreNames(body, consumedNames, &wrappedConsumed, &returnedNames, &wrappedReturned,
                               &writtenNames);
+    CollectWholeNameStoreDestinations(body, writtenNames);
+
+    CollectAddressAliasWholeNameStores(body, allParams, writtenNames);
     for (auto& p : allParams)
     {
         if (p.VariableName.empty() || !ParamIsOwningSinkEligible(p)) continue;
@@ -3299,6 +3438,8 @@ void ScanInterfaceDefinition(CFlatParser::InterfaceDefinitionContext* ctx,
             }
             else
             {
+                if (func->genericTypeParameters() == nullptr && func->directDeclarator() != nullptr)
+                    compiler->gts.structMethodBodies[typeName][getFunctionName(func)].push_back(func);
                 ScanFunctionDefinition(func, typeName);
             }
         }
@@ -6269,6 +6410,7 @@ public:
 
     std::string ParseTypeSpecifierName(CFlatParser::TypeSpecifierContext* ctx,
                                        CFlatParser::MultiWordTypeSuffixContext* suffix = nullptr);
+    std::string ParseTupleTypeSpecifier(CFlatParser::TupleTypeSpecifierContext* ctx);
 
     // Resolves the struct type expected at a call-site field initializer argument.
     // Pass effectiveParamIdx >= 0 for positional args (already offset by implicit 'this').

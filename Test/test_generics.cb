@@ -2328,6 +2328,13 @@ bool testTupleTypeSyntax()
     result &= Test("tuple_type_float", t.item_1, 0.5f);
     result &= Test("tuple_type_size",  t.size(), 2);
 
+    (int, double)* allocated = new (int, double)();
+    allocated->item_0 = 29;
+    allocated->item_1 = 2.5;
+    result &= Test("tuple_new_type_int", allocated->item_0, 29);
+    result &= Test("tuple_new_type_double", allocated->item_1 == 2.5, true);
+    delete allocated;
+
     return result;
 }
 

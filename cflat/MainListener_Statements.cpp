@@ -1767,9 +1767,8 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
         // the caller a value whose always-run destructor frees a buffer the real owner
         // still holds. Allowed only when the function itself is declared `alias` (the
         // borrow passes through). `.copy()` makes an independent owned value. `string`
-        // and `__closure_fat_ptr` are excluded - they carry a runtime owned bit that
-        // already clears on a borrow return (the string-redesign borrow path), so the
-        // `alias` compile-time machinery is only for owning STRUCTS with no runtime bit.
+        // and closures carry a runtime owned bit that clears on borrow return. Bonded
+        // closures still need a return copy when the caller retains the source.
         // A borrow can only dangle when the caller could destruct it: a pointer (the
         // pointee is freed) or an owning value type (its destructor frees buffers the
         // real owner still holds). An alias of a primitive or a POD struct hands back a
@@ -1990,8 +1989,9 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
             && !returnNV.TypeAndValue.Pointer && !returnNV.TypeAndValue.IsMove
             && !returnNV.CallerName.empty()
             && returnNV.TypeAndValue.TypeName == compiler->currentFunctionReturnTypeName
-            && returnNV.TypeAndValue.TypeName != "__closure_fat_ptr"
-            && !compiler->IsEncodedClosureType(returnNV.TypeAndValue.TypeName)
+            && ((returnNV.TypeAndValue.TypeName != "__closure_fat_ptr"
+                 && !compiler->IsEncodedClosureType(returnNV.TypeAndValue.TypeName))
+                || !returnNV.IsBonded)
             && compiler->IsDataStructure(returnNV.TypeAndValue.TypeName)
             && compiler->IsOwningValueType(returnNV.TypeAndValue.TypeName)
             && compiler->IsCopyableType(returnNV.TypeAndValue.TypeName)

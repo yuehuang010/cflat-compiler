@@ -1061,6 +1061,18 @@ bool testChannelMultiProducer() {
     return result;
 }
 
+bool testChannelUnmatchedClose() {
+    bool result = true;
+    channel<int> ch;
+    ch.init(2);
+    ch.close_producer();
+    result &= Test("channel unmatched close marks closed", ch.is_closed(), true);
+    int value = 0;
+    result &= Test("channel unmatched close ends receive", ch.receive(&value), false);
+    ch.destroy();
+    return result;
+}
+
 // channel<T>::operator>> (pipe) + producer-refcount close protocol.
 // Borrow semantics: a >> b spawns a forwarder that drains a into b; when a's
 // last producer closes, the forwarder drains and closes b.
@@ -2085,6 +2097,7 @@ extern int main() {
     total++; passed += testChannelWrapAround()        ? 1 : 0;
     total++; passed += testChannelProducerConsumer()  ? 1 : 0;
     total++; passed += testChannelMultiProducer()     ? 1 : 0;
+    total++; passed += testChannelUnmatchedClose()     ? 1 : 0;
     total++; passed += testChannelPipeSingle()        ? 1 : 0;
     total++; passed += testChannelPipeChained()       ? 1 : 0;
     total++; passed += testChannelPipeEmpty()         ? 1 : 0;

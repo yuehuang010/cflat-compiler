@@ -29,3 +29,10 @@ clang++ -O2 (single TU and -flto) keeps the calls and prints `7 1 1 2`.
 Fix direction: mirror clang's declaration/call-site attribute pairing for every replaceable global
 allocation function CFlat calls (new, new[], aligned, sized delete forms), then recheck each leg
 against a clang++ -O2 oracle.
+
+RULING 2026-09-30 (maintainer), item 1: a USER program may define a function with a C library name (C linkage), even if it replaces the libc one; it must win at every -O level (mark it no-builtin, like clang -fno-builtin-<name>). Core itself must not define externally visible functions - see the core-exported-libc-definitions follow-up.
+
+Attempt (W5, 2026-09-30, item 2): marking global operator new/delete declarations `nobuiltin` and
+new/delete-expression call sites `builtin` + allocsize/noalias/nonnull/nounwind (clang's O0 IR
+shape) did NOT make the O2 probe match clang (`clang++ -O2` prints `Plain 14 1 1 3`, CFlat exits 3,
+allocation effects optimized away). Reverted; patch + matrix in scratch/repro_keep/w5/.

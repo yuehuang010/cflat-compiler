@@ -830,14 +830,27 @@ void LLVMBackend::CheckAliasReturnSlotAddressTaken()
                 if (param.empty()) continue;
                 for (auto* u : sym.Function->materialized_users())
                 {
-                    auto* call = llvm::dyn_cast<llvm::CallBase>(u);
-                    if (call != nullptr && call->getCalledOperand() == sym.Function) continue;
-                    const std::string shown = sym.SourceName.empty() ? name : sym.SourceName;
-                    LogErrorMessage(
-                        "cannot use '{}' as a function value: its 'alias' result can be its by-value "
-                        "parameter '{}', which only a direct call passes correctly. Call '{}' directly, "
-                        "or declare the parameter 'move' so the result is owned.", { shown, param, shown });
-                    break;
+                auto* call = llvm::dyn_cast<llvm::CallBase>(u);
+                if (call != nullptr && call->getCalledOperand() == sym.Function) continue;
+                const std::string shown = sym.SourceName.empty() ? name : sym.SourceName;
+                auto useIt = firstAliasReturnAddressUse_.find(sym.Function->getName().str());
+                if (useIt != firstAliasReturnAddressUse_.end())
+                {
+                    sourceFileName = useIt->second.File;
+                    SetSourceLocation(useIt->second.Line, useIt->second.Column);
+                }
+                if (useIt != firstAliasReturnAddressUse_.end()
+                    && !useIt->second.InterfaceName.empty())
+                    LogError(std::format(
+                        "cannot convert to interface '{}': method '{}' has an 'alias' result that can "
+                        "be its by-value parameter '{}', which an interface call cannot pass through "
+                        "the required caller-owned slot", useIt->second.InterfaceName, shown, param));
+                LogError(std::format(
+                    "cannot use '{}' as a function value: its 'alias' result can be its by-value "
+                    "parameter '{}', which a function value cannot pass through the required "
+                    "caller-owned slot. Call '{}' directly, or declare the parameter 'move' so the "
+                    "result is owned.", shown, param, shown));
+                break;
                 }
             }
     }

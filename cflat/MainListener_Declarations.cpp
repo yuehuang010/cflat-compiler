@@ -8155,15 +8155,20 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                             && typeAndValue.TypeName != "__closure_fat_ptr")
                         {
                             auto& nv = compiler->GetOrCreateStackVariable(name);
+                            const bool adoptedAliasReturnTemp =
+                                compiler->AdoptAliasReturnTemps(srcStorage, nv);
                             nv.IsAliasBorrow = true;
-                            // The source may carry the owner's field path through an alias-return
-                            // call. This local is a shallow copy with its own borrow identity, so
-                            // downstream field access must resolve the root against this binding.
-                            nv.FieldPathRoot.clear();
-                            nv.RootIsBorrowedByValueParam = false;
-                            nv.RootIsAliasBorrowLocal = false;
-                            nv.IsOwningString = false;
-                            nv.IsOwning = false;
+                            if (!adoptedAliasReturnTemp)
+                            {
+                                // The source may carry the owner's field path through an alias-return
+                                // call. This local is a shallow copy with its own borrow identity, so
+                                // downstream field access must resolve the root against this binding.
+                                nv.FieldPathRoot.clear();
+                                nv.RootIsBorrowedByValueParam = false;
+                                nv.RootIsAliasBorrowLocal = false;
+                                nv.IsOwningString = false;
+                                nv.IsOwning = false;
+                            }
                             RecordAliasBorrowDeclBlock(compiler, nv);
                         }
 
@@ -9440,8 +9445,234 @@ void MainListener::CopyWrittenCopyableParams(CFlatParser::FunctionDefinitionCont
     auto* compiler = compilerLLVM;
     if (func == nullptr || func->compoundStatement() == nullptr || compiler->stackNamedVariable.empty())
         return;
+    const bool hasCopyableOwningParam = std::any_of(params.begin(), params.end(), [&](const auto& p)
+    {
+        return !p.VariableName.empty() && !p.Pointer && !p.ElemPointer && !p.IsMove && !p.IsAlias
+            && compiler->IsDataStructure(p.TypeName) && compiler->IsOwningValueType(p.TypeName)
+            && compiler->IsCopyableType(p.TypeName)
+            && !compiler->IsForeignNontrivialCxxClass(p.TypeName);
+    });
+    if (!hasCopyableOwningParam) return;
     std::unordered_set<std::string> written;
     CollectWholeNameStoreDestinations(func->compoundStatement(), written);
+    CollectAddressAliasWholeNameStores(func->compoundStatement(), params, written, true);
+    std::unordered_map<std::string, std::string> paramTypes;
+    for (const auto& p : params)
+        if (!p.VariableName.empty()) paramTypes.emplace(p.VariableName, p.TypeName);
+    // Owned string, not a view: callers cut it from a type text that is lambda-local.
+    auto containerKind = [](const std::string& type) -> std::string {
+        const auto base = MangledBase(type);
+        if (base == "list" || base == "dictionary" || base == "queue") return std::string(base);
+        return {};
+    };
+    auto isContainerMutator = [](std::string_view kind, const std::string& method) {
+        static const std::unordered_set<std::string> listMutators = {
+            "add", "clear", "insert", "removeAt", "set", "sort", "take"
+        };
+        static const std::unordered_set<std::string> dictionaryMutators = {
+            "add", "clear", "remove", "set"
+        };
+        static const std::unordered_set<std::string> queueMutators = { "dequeue", "enqueue", "free" };
+        if (kind == "list") return listMutators.contains(method);
+        if (kind == "dictionary") return dictionaryMutators.contains(method);
+        if (kind == "queue") return queueMutators.contains(method);
+        return false;
+    };
+    auto splitPath = [](const std::string& text) {
+        std::vector<std::string> path;
+        size_t begin = 0;
+        while (begin <= text.size())
+        {
+            const size_t end = text.find('.', begin);
+            path.push_back(text.substr(begin, end == std::string::npos ? std::string::npos : end - begin));
+            if (end == std::string::npos) break;
+            begin = end + 1;
+        }
+        return path;
+    };
+    // Resolves a by-value field path from a root type; empty when a step is missing or a pointer.
+    auto typeAtFieldPath = [&](const std::string& rootType,
+                               const std::vector<std::string>& path) -> std::string {
+        std::string type = rootType;
+        for (const auto& fieldName : path)
+        {
+            if (!compiler->IsDataStructure(type)) return {};
+            const auto& fields = compiler->GetDataStructure(type).StructFields;
+            auto field = std::find_if(fields.begin(), fields.end(), [&](const auto& item) {
+                return item.VariableName == fieldName;
+            });
+            if (field == fields.end() || field->Pointer || field->ElemPointer) return {};
+            type = field->TypeName;
+        }
+        return type;
+    };
+    auto containerAtFieldPath = [&](const std::string& rootType,
+                                    const std::vector<std::string>& path) -> std::string {
+        return containerKind(typeAtFieldPath(rootType, path));
+    };
+    // Receiver path of `recv.a.b.method(...)`: the primary text plus every member but the last.
+    // Empty when the node is not a method call.
+    auto receiverPath = [&](CFlatParser::PostfixExpressionContext* call,
+                            std::string& outRoot, std::string& outMethod) -> std::vector<std::string> {
+        auto* primary = call->primaryExpression();
+        const auto members = call->memberNameToken();
+        std::vector<std::string> path;
+        if (primary == nullptr || members.empty() || call->argumentExpressionList().empty()) return path;
+        outMethod = members.back()->getText();
+        path = splitPath(primary->getText());
+        outRoot = path.front();
+        for (size_t i = 0; i + 1 < members.size(); ++i) path.push_back(members[i]->getText());
+        return path;
+    };
+    // A call on a path rooted at `rootType` mutates when it reaches a container mutator, or a
+    // user method (recorded by the pre-pass) whose body does so through its own fields.
+    std::unordered_map<std::string, bool> methodMutates;
+    auto callMutates = [&](auto&& self, const std::string& rootType, const std::vector<std::string>& path,
+                           const std::string& method, std::unordered_set<std::string>& active) -> bool {
+        const std::string type = typeAtFieldPath(rootType, path);
+        if (type.empty()) return false;
+        const auto kind = containerKind(type);
+        if (!kind.empty()) return isContainerMutator(kind, method);
+        const std::string key = type + "." + method;
+        if (auto memo = methodMutates.find(key); memo != methodMutates.end()) return memo->second;
+        if (!active.insert(key).second) return false;
+        bool result = false;
+        // Every overload of the name counts (no overload resolution here): one mutating overload
+        // makes the call a write - at worst one extra copy, never a missed one.
+        const std::vector<CFlatParser::FunctionDefinitionContext*>* overloads = nullptr;
+        if (auto bodies = compiler->gts.structMethodBodies.find(type);
+            bodies != compiler->gts.structMethodBodies.end())
+            if (auto fn = bodies->second.find(method); fn != bodies->second.end()) overloads = &fn->second;
+        auto isOwnMethod = [&](const std::string& name) {
+            auto bodies = compiler->gts.structMethodBodies.find(type);
+            return bodies != compiler->gts.structMethodBodies.end() && bodies->second.contains(name);
+        };
+        for (auto* body : overloads != nullptr ? *overloads
+                 : std::vector<CFlatParser::FunctionDefinitionContext*>{})
+        if (!result && body != nullptr && body->compoundStatement() != nullptr)
+        {
+            auto walk = [&](auto&& walkSelf, antlr4::tree::ParseTree* node) -> void {
+                if (node == nullptr || result) return;
+                if (auto* asn = dynamic_cast<CFlatParser::AssignmentExpressionContext*>(node))
+                {
+                    // `values = ...` in a method drops the container the caller still owns.
+                    if (asn->unaryExpression() != nullptr && asn->assignmentExpression() != nullptr)
+                    {
+                        auto dest = splitPath(BareSourceText(asn->unaryExpression()));
+                        if (!dest.empty() && dest.front() == "this") dest.erase(dest.begin());
+                        if (!dest.empty() && !NameShadowedByEnclosingLocal(asn, dest.front())
+                            && !containerAtFieldPath(type, dest).empty())
+                            result = true;
+                    }
+                }
+                if (auto* call = dynamic_cast<CFlatParser::PostfixExpressionContext*>(node))
+                {
+                    std::string root, name;
+                    auto path = receiverPath(call, root, name);
+                    if (!path.empty())
+                    {
+                        if (root == "this") path.erase(path.begin());
+                        if (path.empty() || (root != "this" && !NameShadowedByEnclosingLocal(call, root)))
+                            if (self(self, type, path, name, active)) result = true;
+                    }
+                    else if (call->memberNameToken().empty() && !call->argumentExpressionList().empty()
+                        && call->primaryExpression() != nullptr
+                        && call->primaryExpression()->genericIdentifier() != nullptr
+                        && call->primaryExpression()->genericIdentifier()->genericTypeParameters() == nullptr)
+                    {
+                        // Implicit-this call `put(i)` to a sibling method of the same struct.
+                        const std::string callee =
+                            call->primaryExpression()->genericIdentifier()->Identifier()->getText();
+                        if (isOwnMethod(callee) && !NameShadowedByEnclosingLocal(call, callee)
+                            && self(self, type, {}, callee, active))
+                            result = true;
+                    }
+                }
+                for (auto* child : node->children) walkSelf(walkSelf, child);
+            };
+            walk(walk, body->compoundStatement());
+        }
+        active.erase(key);
+        methodMutates[key] = result;
+        return result;
+    };
+    struct ContainerAlias { std::string root; std::string kind; size_t token; };
+    std::unordered_map<std::string, ContainerAlias> containerAliases;
+    auto rememberContainerAlias = [&](const std::string& alias, const std::string& target,
+                                      size_t token) {
+        auto path = splitPath(target);
+        if (path.size() < 2) return;
+        auto param = paramTypes.find(path.front());
+        if (param == paramTypes.end()) return;
+        path.erase(path.begin());
+        const auto kind = containerAtFieldPath(param->second, path);
+        if (!kind.empty()) containerAliases[alias] = { param->first, kind, token };
+    };
+    auto collectContainerMutationRoots = [&](auto&& self, antlr4::tree::ParseTree* node) -> void {
+        if (node == nullptr) return;
+        if (auto* init = dynamic_cast<CFlatParser::InitDeclaratorContext*>(node))
+        {
+            auto* direct = init->declarator() != nullptr ? init->declarator()->directDeclarator() : nullptr;
+            auto* value = init->initializer() != nullptr ? init->initializer()->assignmentExpression() : nullptr;
+            if (direct != nullptr && direct->Identifier() != nullptr && value != nullptr)
+            {
+                const std::string source = value->getText();
+                if (source.size() > 1 && source[0] == '&')
+                    rememberContainerAlias(direct->Identifier()->getText(), source.substr(1),
+                        (size_t)init->getStart()->getTokenIndex());
+            }
+        }
+        if (auto* asn = dynamic_cast<CFlatParser::AssignmentExpressionContext*>(node))
+        {
+            auto* dest = asn->unaryExpression();
+            auto* value = asn->assignmentExpression();
+            if (dest != nullptr && value != nullptr)
+            {
+                const std::string source = value->getText();
+                if (source.size() > 1 && source[0] == '&')
+                    rememberContainerAlias(BareSourceText(dest), source.substr(1),
+                        (size_t)asn->getStart()->getTokenIndex());
+            }
+        }
+        if (auto* call = dynamic_cast<CFlatParser::PostfixExpressionContext*>(node))
+        {
+            std::string rootName, method;
+            auto path = receiverPath(call, rootName, method);
+            if (!path.empty())
+            {
+                path.erase(path.begin());
+                if (auto param = paramTypes.find(rootName); param != paramTypes.end()
+                    && !NameShadowedByEnclosingLocal(call, rootName))
+                {
+                    std::unordered_set<std::string> active;
+                    if (callMutates(callMutates, param->second, path, method, active))
+                        written.insert(rootName);
+                }
+                if (auto alias = containerAliases.find(rootName); alias != containerAliases.end()
+                    && (size_t)call->getStart()->getTokenIndex() > alias->second.token
+                    && isContainerMutator(alias->second.kind, method))
+                    written.insert(alias->second.root);
+            }
+        }
+        for (auto* child : node->children) self(self, child);
+    };
+    auto containsContainerField = [&](auto&& self, const std::string& type,
+                                      std::unordered_set<std::string>& visited) -> bool {
+        if (!containerKind(type).empty()) return true;
+        if (!compiler->IsDataStructure(type) || !visited.insert(type).second) return false;
+        for (const auto& field : compiler->GetDataStructure(type).StructFields)
+            if (!field.Pointer && !field.ElemPointer
+                && self(self, field.TypeName, visited)) return true;
+        return false;
+    };
+    const bool hasByValueContainerParam = std::any_of(params.begin(), params.end(), [&](const auto& p) {
+        if (p.VariableName.empty() || p.Pointer || p.ElemPointer || p.IsMove || p.IsAlias
+            || !compiler->IsDataStructure(p.TypeName)) return false;
+        std::unordered_set<std::string> visited;
+        return containsContainerField(containsContainerField, p.TypeName, visited);
+    });
+    if (hasByValueContainerParam)
+        collectContainerMutationRoots(collectContainerMutationRoots, func->compoundStatement());
     if (written.empty()) return;
     auto& args = compiler->stackNamedVariable.back().functionArgument;
     for (const auto& p : params)
@@ -9561,7 +9792,9 @@ bool MainListener::DestinationIsAliasBorrowLocal(LLVMBackend* compiler, llvm::Va
         if (!llvm::isa<llvm::AllocaInst>(destination) && !llvm::isa<llvm::GlobalVariable>(destination))
             return false;
         const auto* bind = compiler->FindVariableByStorage(destination);
-        return bind != nullptr && IsAliasBorrowLocalBinding(*bind);
+        // A local that adopted an alias-return temp owns its old value iff its drop flag is set,
+        // so the flag-gated drop-old must run.
+        return bind != nullptr && IsAliasBorrowLocalBinding(*bind) && bind->ConditionalDropFlag == nullptr;
     }
 
 void MainListener::RetireAliasBorrowOnRebind(LLVMBackend* compiler, llvm::Value* destination) {

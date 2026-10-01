@@ -46,6 +46,17 @@ public:
                      size_t line, size_t charPositionInLine,
                      const std::string& msg, std::exception_ptr e) override
     {
+        if (!reservedKeywordPending_.empty())
+        {
+            bool reservedCascade = msg.find("cannot understand the code") != std::string::npos
+                && msg.find(reservedKeywordPending_) != std::string::npos;
+            reservedKeywordPending_.clear();
+            if (reservedCascade)
+            {
+                seenLines_.insert(static_cast<int>(line));
+                return;
+            }
+        }
         if (!seenLines_.insert(static_cast<int>(line)).second)
             return;
 
@@ -61,7 +72,7 @@ public:
         int sourceReservedCol = -1;
         std::string reservedSourceMessage;
         std::string reserved = reservedWordFromSource(line, charPositionInLine, sourceReservedCol,
-                                                       reservedSourceMessage);
+                                                       reservedSourceMessage, msg);
         if (sourceReservedCol >= 0)
             d.col = sourceReservedCol;
         if (msg.rfind(lexerPrefix, 0) == 0)
@@ -108,6 +119,7 @@ private:
     std::vector<std::string> sourceLines_;
     std::vector<ParseDiagnostic> diagnostics_;
     std::set<int> seenLines_;
+    std::string reservedKeywordPending_;
     std::function<std::string(std::string, std::vector<std::string>)> localizeMessage_;
 
     static bool isKnownReservedWord(const std::string& word)
@@ -118,7 +130,8 @@ private:
             "else", "enum", "extern", "false", "float", "for", "function", "goto", "if",
             "import", "in", "inline", "int", "interface", "is", "long", "move", "namespace",
             "nullptr", "register", "return", "short", "signed", "sizeof", "static", "struct",
-            "switch", "true", "typedef", "typeof", "union", "unsigned", "void", "volatile", "while"
+            "switch", "true", "typedef", "typeof", "union", "unsigned", "void", "volatile", "while",
+            "where"
         };
         for (const char* candidate : words)
             if (word == candidate) return true;
@@ -126,7 +139,7 @@ private:
     }
 
     std::string reservedWordFromSource(size_t line, size_t col, int& wordCol,
-                                       std::string& sourceMessage) const
+                                       std::string& sourceMessage, const std::string& parserMessage)
     {
         if (line == 0 || line > sourceLines_.size()) return {};
         const std::string& source = sourceLines_[line - 1];
@@ -139,15 +152,15 @@ private:
                 if (candidate == typeWord) return true;
             return false;
         };
-        std::string previousWord;
-        size_t previousEnd = 0;
-        // Only a declaration-shaped gap ("int class", "int* class") counts. A ',' or ')'
-        // between them means the keyword is a legal use ("(int)true", "int, move Buf b").
+        std::string previousTypeWord;
+        size_t previousTypeEnd = 0;
+        // Only a declaration-shaped gap counts; delimiters such as ',' or ')' break it.
         auto gapIsDeclarationLike = [&](size_t from, size_t to) {
             if (to <= from) return false;
             for (size_t k = from; k < to; ++k)
                 if (source[k] != ' ' && source[k] != '\t' && source[k] != '*'
-                    && source[k] != '&' && source[k] != '?')
+                    && source[k] != '&' && source[k] != '?' && source[k] != '['
+                    && source[k] != ']' && !std::isdigit(static_cast<unsigned char>(source[k])))
                     return false;
             return true;
         };
@@ -174,20 +187,24 @@ private:
                    && (std::isalnum(static_cast<unsigned char>(source[i])) || source[i] == '_'))
                 ++i;
             std::string word = source.substr(begin, i - begin);
-            if (isKnownReservedWord(word) && !isTypeWord(word) && isTypeWord(previousWord)
-                && gapIsDeclarationLike(previousEnd, begin))
+            if (isKnownReservedWord(word) && !isTypeWord(word) && !previousTypeWord.empty()
+                && gapIsDeclarationLike(previousTypeEnd, begin))
             {
                 wordCol = static_cast<int>(begin);
+                reservedKeywordPending_ = word;
                 std::vector<std::string> arguments{word};
                 sourceMessage = DiagnosticLocalization::FormatSourceTemplate(
-                    "'{}' is a reserved word in CFlat and cannot be used as an identifier",
-                    arguments);
+                    "'{}' is a reserved keyword and cannot be used as a name here",
+                    arguments) + "; " + humanizeMessage(parserMessage);
                 return localizeMessage_(
-                    "'{}' is a reserved word in CFlat and cannot be used as an identifier",
-                    arguments);
+                    "'{}' is a reserved keyword and cannot be used as a name here",
+                    arguments) + "; " + humanizeMessage(parserMessage);
             }
-            previousWord = word;
-            previousEnd = i;
+            if (isTypeWord(word))
+            {
+                previousTypeWord = word;
+                previousTypeEnd = i;
+            }
         }
         (void)col;
         return {};

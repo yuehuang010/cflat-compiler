@@ -114,7 +114,7 @@ class channel<T>
     // a blocked receive(T* out) returns false once the buffer is drained.
     void close_producer() {
         i64 remaining = __atomic_counter_decrement(&_producers);
-        if (remaining == (i64)0) {
+        if (remaining <= (i64)0) {
             __atomic_release_store_i64(&_closed, (i64)1);
         }
     }

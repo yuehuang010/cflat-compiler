@@ -2040,6 +2040,20 @@ void LLVMBackend::DropRetainedJoinArmPtrTemps(llvm::Value* callResult)
         const bool cxxDeclaration = callee != nullptr && callee->isDeclaration()
             && calleeSymbol != nullptr && calleeSymbol->IsCxx
             && callee->hasName() && !callee->isVarArg();
+        auto hasCallGate = [&](llvm::Value* value, unsigned argIndex) {
+            for (const auto& temp : pendingOwnedPtrTemps)
+            {
+                if (temp.Value != value || temp.ReleaseGate == nullptr) continue;
+                for (const auto& gate : cxxThisEscapeGates_)
+                {
+                    const auto* init = llvm::dyn_cast_or_null<llvm::StoreInst>(gate.Init);
+                    if (init != nullptr && init->getPointerOperand() == temp.ReleaseGate
+                        && gate.Callee == callee->getName() && gate.ArgIndex == argIndex)
+                        return true;
+                }
+            }
+            return false;
+        };
         for (unsigned i = 0; i < call->arg_size(); ++i)
         {
             llvm::Value* argVal = call->getArgOperand(i);
@@ -2055,7 +2069,11 @@ void LLVMBackend::DropRetainedJoinArmPtrTemps(llvm::Value* callResult)
                     pendingOwnedPtrTemps.begin(), pendingOwnedPtrTemps.end(),
                     [&](const PendingOwnedPtrTemp& p) { return p.Value == cur; });
                 if (cxxDeclaration && hasPendingTemp)
-                    RegisterCxxGatedOwningPtrArg(cur, *callee, i);
+                {
+                    // The pre-call walk already gave join arms this gate so the invoke's
+                    // exceptional pad sees it. Do not replace it with a later gate.
+                    if (!hasCallGate(cur, i)) RegisterCxxGatedOwningPtrArg(cur, *callee, i);
+                }
                 else
                     std::erase_if(pendingOwnedPtrTemps,
                         [&](const PendingOwnedPtrTemp& p) { return p.Value == cur; });
@@ -2112,15 +2130,100 @@ void LLVMBackend::RegisterCxxGatedOwningPtrArg(llvm::Value* argVal, const llvm::
     }
 
 bool LLVMBackend::RegisterCxxOwningPtrArgsBeforeCall(const llvm::Function* callee,
-                                                     llvm::ArrayRef<llvm::Value*> args)
+                                                     llvm::ArrayRef<llvm::Value*> args,
+                                                     bool mayUnwind)
 {
         // Same filter as the declaration branch of RegisterNonEscapingOwningPtrArgs; `args` must
         // map 1:1 onto the callee's parameters (a direct, non-lowered call).
         if (callee == nullptr || !callee->isDeclaration() || !callee->hasName() || callee->isVarArg())
             return false;
         for (unsigned i = 0; i < args.size(); ++i)
+        {
+            if (args[i] == nullptr || !args[i]->getType()->isPointerTy()) continue;
             RegisterCxxGatedOwningPtrArg(args[i], *callee, i);
+            if (!mayUnwind) continue;
+            bool hasJoin = llvm::isa<llvm::LoadInst>(args[i])
+                && FindNullCoalesceJoin(args[i]) != nullptr;
+            llvm::SmallVector<llvm::Value*, 8> joinCandidates;
+            if (auto* phi = llvm::dyn_cast<llvm::PHINode>(args[i]))
+                joinCandidates.append(phi->incoming_values().begin(), phi->incoming_values().end());
+            else if (auto* select = llvm::dyn_cast<llvm::SelectInst>(args[i]))
+            {
+                joinCandidates.push_back(select->getTrueValue());
+                joinCandidates.push_back(select->getFalseValue());
+            }
+            for (llvm::Value* candidate : joinCandidates)
+                if (llvm::isa<llvm::LoadInst>(candidate)
+                    && FindNullCoalesceJoin(candidate) != nullptr)
+                {
+                    hasJoin = true;
+                    break;
+                }
+            if (!hasJoin) continue;
+            llvm::SmallVector<std::pair<llvm::Value*, bool>, 8> work{ { args[i], false } };
+            llvm::SmallPtrSet<llvm::Value*, 16> seen;
+            while (!work.empty())
+            {
+                auto [value, isJoinArm] = work.pop_back_val();
+                if (value == nullptr || !seen.insert(value).second) continue;
+                if (const auto* join = FindNullCoalesceJoin(value))
+                    for (const auto& arm : join->Arms) work.push_back({ arm.Value, true });
+                else if (auto* phi = llvm::dyn_cast<llvm::PHINode>(value))
+                    for (llvm::Value* incoming : phi->incoming_values()) work.push_back({ incoming, isJoinArm });
+                else if (auto* select = llvm::dyn_cast<llvm::SelectInst>(value))
+                {
+                    work.push_back({ select->getTrueValue(), isJoinArm });
+                    work.push_back({ select->getFalseValue(), isJoinArm });
+                }
+                else if (isJoinArm && IsOwningPtrTempValue(value)
+                    && std::any_of(pendingOwnedPtrTemps.begin(), pendingOwnedPtrTemps.end(),
+                        [&](const PendingOwnedPtrTemp& temp) { return temp.Value == value; }))
+                {
+                    RegisterCxxGatedOwningPtrArg(value, *callee, i);
+                }
+            }
+        }
         return true;
+    }
+
+void LLVMBackend::PreserveRetainedJoinArmTempsBeforeCall(const llvm::Function* callee,
+                                                          llvm::ArrayRef<llvm::Value*> args)
+    {
+        if (callee == nullptr || callee->isDeclaration()) return;
+        for (unsigned i = 0; i < args.size(); ++i)
+        {
+            if (args[i] == nullptr || !args[i]->getType()->isPointerTy()
+                || !ParameterRetainsArgument(callee, i))
+                continue;
+            llvm::SmallVector<llvm::Value*, 8> work{ args[i] };
+            llvm::SmallPtrSet<llvm::Value*, 16> seen;
+            while (!work.empty())
+            {
+                llvm::Value* value = work.pop_back_val();
+                if (value == nullptr || !seen.insert(value).second) continue;
+                if (const auto* join = FindNullCoalesceJoin(value))
+                {
+                    for (const auto& arm : join->Arms) work.push_back(arm.Value);
+                }
+                else if (auto* phi = llvm::dyn_cast<llvm::PHINode>(value))
+                {
+                    for (llvm::Value* incoming : phi->incoming_values()) work.push_back(incoming);
+                }
+                else if (auto* select = llvm::dyn_cast<llvm::SelectInst>(value))
+                {
+                    work.push_back(select->getTrueValue());
+                    work.push_back(select->getFalseValue());
+                }
+                else if (IsOwningPtrTempValue(value)
+                    && std::any_of(pendingOwnedPtrTemps.begin(), pendingOwnedPtrTemps.end(),
+                        [&](const PendingOwnedPtrTemp& temp) { return temp.Value == value; }))
+                {
+                    if (std::find(unwindCallConsumedTemps_.begin(), unwindCallConsumedTemps_.end(), value)
+                        == unwindCallConsumedTemps_.end())
+                        unwindCallConsumedTemps_.push_back(value);
+                }
+            }
+        }
     }
 
 void LLVMBackend::ResolveCxxThisEscapeGates()
@@ -2425,8 +2528,7 @@ bool LLVMBackend::ClosureParameterMayEscape(const llvm::Function* fn, unsigned a
                 if (const auto* call = llvm::dyn_cast<llvm::CallBase>(inst))
                 {
                     const llvm::Function* callee = call->getCalledFunction();
-                    if (callee != nullptr
-                        && callee->getName().starts_with("__closure_fat_ptr.copy"))
+                    if (IsRegisteredClosureCopyFunction(callee))
                     {
                         work.push_back({call, false});
                         continue;
@@ -2995,6 +3097,13 @@ bool LLVMBackend::ValueMayReachReturn(const llvm::Value* root, int depth,
                         if (call->getArgOperand(i) == v)
                         {
                             passedTrackedValue = true;
+                            auto* closureType = GetClosureFatPtrType();
+                            if (closureType != nullptr && call->getType() == closureType
+                                && IsRegisteredClosureCopyFunction(callee))
+                            {
+                                if (visited.insert(call).second) work.push_back(call);
+                                break;
+                            }
                             if (ParameterMayReachReturn(callee, i, depth + 1))
                             {
                                 if (visited.insert(call).second) work.push_back(call);
@@ -3547,6 +3656,19 @@ const LLVMBackend::FunctionSymbol* LLVMBackend::FindSymbolForFunction(const llvm
             for (const auto& sym : entry.second)
                 if (sym.Function == fn) return &sym;
         return nullptr;
+    }
+
+bool LLVMBackend::IsRegisteredClosureCopyFunction(const llvm::Function* fn) const
+{
+        if (fn == nullptr) return false;
+        auto copyIt = functionTable.find("copy");
+        if (copyIt == functionTable.end()) return false;
+        for (const auto& symbol : copyIt->second)
+            if (symbol.Function == fn && symbol.ReturnType.TypeName == "__closure_fat_ptr"
+                && symbol.ReturnType.IsMove && symbol.Parameters.size() == 1
+                && symbol.Parameters[0].TypeName == "__closure_fat_ptr")
+                return true;
+        return false;
     }
 
 bool LLVMBackend::CalleeReturnsOwned(const llvm::Function* fn) const
@@ -4274,6 +4396,97 @@ void LLVMBackend::RegisterOwnedStructTemp(llvm::Value* alloca, const std::string
         pendingOwnedStructTemps.push_back({ alloca, typeName, builder->GetInsertBlock() });
     }
 
+void LLVMBackend::RegisterAliasReturnTempSlot(llvm::Value* result, llvm::Value* slot,
+                                               std::vector<llvm::Value*> ancestors, const std::string& callee)
+{
+        if (result == nullptr || slot == nullptr) return;
+        aliasReturnTempSlots_.push_back({ result, slot, std::move(ancestors), callee });
+    }
+
+bool LLVMBackend::IsAliasReturnTempResult(llvm::Value* value, std::string* callee) const
+{
+        if (value == nullptr) return false;
+        llvm::Value* through = nullptr;
+        if (auto* load = llvm::dyn_cast<llvm::LoadInst>(value)) through = load->getPointerOperand();
+        auto isPendingTemp = [this](llvm::Value* slot) {
+            return std::any_of(pendingOwnedStructTemps.begin(), pendingOwnedStructTemps.end(),
+                [slot](const PendingOwnedStructTemp& pending) { return pending.Alloca == slot; });
+        };
+        for (const auto& entry : aliasReturnTempSlots_)
+        {
+            if (entry.Result != value && entry.Result != through) continue;
+            bool pending = isPendingTemp(entry.Slot);
+            for (auto* ancestor : entry.AncestorSlots)
+                pending = pending || isPendingTemp(ancestor);
+            if (!pending) continue;
+            if (callee != nullptr) *callee = entry.Callee;
+            return true;
+        }
+        return false;
+    }
+
+bool LLVMBackend::AdoptAliasReturnTemps(llvm::Value* aliasStorage, NamedVariable& owner)
+{
+        if (aliasStorage == nullptr || owner.Storage == nullptr || builder == nullptr) return false;
+        std::vector<llvm::Value*> values{ aliasStorage };
+        for (size_t i = 0; i < values.size(); ++i)
+            if (auto* phi = llvm::dyn_cast<llvm::PHINode>(values[i]))
+                for (llvm::Value* incoming : phi->incoming_values())
+                    if (std::find(values.begin(), values.end(), incoming) == values.end())
+                        values.push_back(incoming);
+
+        llvm::Value* ownsSelectedTemp = builder->getInt1(false);
+        bool found = false;
+        for (const auto& entry : aliasReturnTempSlots_)
+        {
+            if (std::find(values.begin(), values.end(), entry.Result) == values.end()) continue;
+            auto* slot = entry.Slot;
+            auto temp = std::find_if(pendingOwnedStructTemps.begin(), pendingOwnedStructTemps.end(),
+                [slot](const PendingOwnedStructTemp& entry) { return entry.Alloca == slot; });
+            if (temp == pendingOwnedStructTemps.end() && entry.AncestorSlots.empty()) continue;
+            auto* selected = builder->CreateICmpEQ(aliasStorage, slot, "aliasret.temp.selected");
+            if (temp != pendingOwnedStructTemps.end())
+            {
+                ownsSelectedTemp = builder->CreateOr(ownsSelectedTemp, selected);
+                llvm::Value* live = temp->LiveFlag != nullptr
+                    ? static_cast<llvm::Value*>(builder->CreateLoad(
+                        builder->getInt1Ty(), temp->LiveFlag, "aliasret.temp.live"))
+                    : static_cast<llvm::Value*>(builder->getInt1(true));
+                auto* cleanup = builder->CreateAnd(live,
+                    builder->CreateICmpNE(aliasStorage, slot, "aliasret.temp.unselected"));
+                if (temp->LiveFlag == nullptr)
+                    temp->LiveFlag = AllocaAtEntry(builder->getInt1Ty(), nullptr, "aliasret.temp.owner");
+                builder->CreateStore(cleanup, temp->LiveFlag);
+            }
+            if (!entry.AncestorSlots.empty())
+                ownsSelectedTemp = builder->CreateOr(ownsSelectedTemp, selected);
+            for (auto* ancestorSlot : entry.AncestorSlots)
+            {
+                auto ancestor = std::find_if(pendingOwnedStructTemps.begin(), pendingOwnedStructTemps.end(),
+                    [ancestorSlot](const PendingOwnedStructTemp& pending) {
+                        return pending.Alloca == ancestorSlot;
+                    });
+                if (ancestor == pendingOwnedStructTemps.end()) continue;
+                llvm::Value* ancestorLive = ancestor->LiveFlag != nullptr
+                    ? static_cast<llvm::Value*>(builder->CreateLoad(
+                        builder->getInt1Ty(), ancestor->LiveFlag, "aliasret.ancestor.live"))
+                    : static_cast<llvm::Value*>(builder->getInt1(true));
+                auto* ancestorCleanup = builder->CreateAnd(ancestorLive,
+                    builder->CreateICmpNE(aliasStorage, slot, "aliasret.ancestor.unselected"));
+                if (ancestor->LiveFlag == nullptr)
+                    ancestor->LiveFlag = AllocaAtEntry(builder->getInt1Ty(), nullptr,
+                                                       "aliasret.ancestor.owner");
+                builder->CreateStore(ancestorCleanup, ancestor->LiveFlag);
+            }
+            found = true;
+        }
+        if (!found) return false;
+        owner.IsOwningStruct = true;
+        owner.ConditionalDropFlag = AllocaAtEntry(builder->getInt1Ty(), nullptr, "aliasret.local.owner");
+        builder->CreateStore(ownsSelectedTemp, owner.ConditionalDropFlag);
+        return true;
+    }
+
 void LLVMBackend::UnregisterOwnedStructTemp(llvm::Value* value)
 {
         if (value == nullptr) return;
@@ -4476,7 +4689,24 @@ void LLVMBackend::HoistOwnedPtrTempsForAddress(const OwnedTempMark& mark, llvm::
                 builder->SetInsertPoint(cflat_llvm::GetTerminatorOrNull(hoistTo));
                 builder->CreateStore(llvm::ConstantPointerNull::get(ptrTy), temp.ConditionalSlot);
             }
-            if (!wasHoisted) builder->CreateStore(temp.Value, temp.ConditionalSlot);
+            if (!wasHoisted)
+            {
+                auto* valueInst = llvm::dyn_cast<llvm::Instruction>(temp.Value);
+                if (auto* invoke = llvm::dyn_cast_or_null<llvm::InvokeInst>(valueInst))
+                {
+                    llvm::IRBuilderBase::InsertPointGuard guard(*builder);
+                    builder->SetInsertPoint(cflat_llvm::GetTerminatorOrNull(invoke->getNormalDest()));
+                    builder->CreateStore(temp.Value, temp.ConditionalSlot);
+                }
+                else if (valueInst != nullptr && valueInst->getParent() != builder->GetInsertBlock()
+                    && cflat_llvm::GetTerminatorOrNull(valueInst->getParent()) != nullptr)
+                {
+                    llvm::IRBuilderBase::InsertPointGuard guard(*builder);
+                    builder->SetInsertPoint(cflat_llvm::GetTerminatorOrNull(valueInst->getParent()));
+                    builder->CreateStore(temp.Value, temp.ConditionalSlot);
+                }
+                else builder->CreateStore(temp.Value, temp.ConditionalSlot);
+            }
             temp.Block = hoistTo;
             pendingOwnedPtrTemps[i] = temp;
             ++i;
@@ -4766,6 +4996,7 @@ void LLVMBackend::DiscardOwnedTempsSince(const OwnedTempMark& mark)
         movedOutPtrValues_.clear();
         movedBorrowedPtrValues_.clear();
         movedBorrowedThroughFieldValues_.clear();
+        aliasReturnTempSlots_.clear();
         aliasValues_.clear();
         aliasTransferResults_.clear();
         tempFieldValues_.clear();
@@ -4790,6 +5021,7 @@ LLVMBackend::DetectionLedgerSnapshot LLVMBackend::SnapshotDetectionLedgers() con
         snapshot.movedBorrowedThroughFieldValues_ = movedBorrowedThroughFieldValues_;
         snapshot.aliasValues_ = aliasValues_;
         snapshot.aliasTransferResults_ = aliasTransferResults_;
+        snapshot.aliasReturnTempSlots_ = aliasReturnTempSlots_;
         snapshot.tempFieldValues_ = tempFieldValues_;
         return snapshot;
 }
@@ -4812,6 +5044,7 @@ void LLVMBackend::RestoreDetectionLedgers(DetectionLedgerSnapshot snapshot)
         movedBorrowedThroughFieldValues_ = std::move(snapshot.movedBorrowedThroughFieldValues_);
         aliasValues_ = std::move(snapshot.aliasValues_);
         aliasTransferResults_ = std::move(snapshot.aliasTransferResults_);
+        aliasReturnTempSlots_ = std::move(snapshot.aliasReturnTempSlots_);
         tempFieldValues_ = std::move(snapshot.tempFieldValues_);
 }
 
@@ -4841,6 +5074,7 @@ void LLVMBackend::FlushOwnedTemps()
         // Reset the ambient occurrence for the next statement (see currentCastOccurrence_'s
         // comment) - a call-argument's bumped id must never survive past its own statement.
         currentCastOccurrence_ = 0;
+        aliasReturnTempSlots_.clear();
         // Same boundary destructs the owning temp, so its unique-field reads retire with it.
         owningTempUniqueFields_.clear();
         launderedTempUniqueFields_.clear();
@@ -5003,10 +5237,11 @@ void LLVMBackend::DropValue(const NamedVariable& namedVar)
             }
             // Non-string struct local: run the full destructor (user dtor + members).
             // Skip an `alias`-bound local - it borrows storage it does not own (double-free).
-            if (namedVar.IsAliasBorrow) return;
-            // A [unique] value is move-only. Its source is consumed completely, so do not run
-            // the user destructor a second time after an explicit or inferred whole-value move.
-            if (namedVar.IsMoved && HasTypeAnnotation(namedVar.TypeAndValue.TypeName, "unique")) return;
+            if (namedVar.IsAliasBorrow && namedVar.ConditionalDropFlag == nullptr) return;
+            // unique<T>'s destructor is null-safe after a move; keep it for a sibling left live
+            // on another branch even when merged moved-state marks this source as maybe moved.
+            if (namedVar.IsMoved && HasTypeAnnotation(namedVar.TypeAndValue.TypeName, "unique")
+                && !IsCoreUniqueType(namedVar.TypeAndValue.TypeName)) return;
             // A foreign nontrivial C++ local released explicitly (`_ = move x;`) already ran its
             // C++ destructor and had its storage zeroed - running it again is a double destruction.
             // A plain `move x` (into another slot or a by-value parameter) does NOT set this flag:
@@ -5036,7 +5271,7 @@ bool LLVMBackend::OwnsDroppableResource(const NamedVariable& namedVar) const
         if (it == dataStructures.end()) return false;
         if (namedVar.TypeAndValue.TypeName == "string")
             return !(namedVar.BorrowsOwnedString || namedVar.IsAliasBorrow);
-        if (namedVar.IsAliasBorrow) return false;
+        if (namedVar.IsAliasBorrow && namedVar.ConditionalDropFlag == nullptr) return false;
         if (namedVar.Storage == returnedStructDtorSkipAlloca) return false;
         if (namedVar.ExplicitlyMovedNull
             && (IsForeignNontrivialCxxClass(namedVar.TypeAndValue.TypeName)
@@ -5102,7 +5337,8 @@ void LLVMBackend::EmitDestructorsForScope(const StackState& frame)
                     && (IsForeignNontrivialCxxClass(namedVar.TypeAndValue.TypeName)
                         || HasForeignNontrivialCxxField(namedVar.TypeAndValue.TypeName)))
                     continue;
-                if (namedVar.IsMoved && HasTypeAnnotation(namedVar.TypeAndValue.TypeName, "unique"))
+                if (namedVar.IsMoved && HasTypeAnnotation(namedVar.TypeAndValue.TypeName, "unique")
+                    && !IsCoreUniqueType(namedVar.TypeAndValue.TypeName))
                     continue;
                 if (auto* dtor = GetOrCreateFullDestructor(namedVar.TypeAndValue.TypeName))
                     builder->CreateCall(dtor->getFunctionType(), dtor, { namedVar.Storage });

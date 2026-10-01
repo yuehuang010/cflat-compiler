@@ -4185,11 +4185,36 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
         }
 
         // convert parameter to vector of llvm::value*
+        for (size_t i = 0; i < arguments.size() && i < candidate.Parameters.size(); ++i)
+        {
+            const auto& param = candidate.Parameters[i];
+            const auto& source = arguments[i];
+            // Only the direct result of an alias-return call that copied a temp argument: which
+            // arg it names is a run-time choice, so a sink cannot know whether it owns it.
+            std::string aliasCallee;
+            if (functionName != "operator=" && IsOwningValueType(param.TypeName)
+                && (OwningSinkConsumesConcrete(param) || param.IsMove)
+                && IsAliasReturnTempResult(source.Primary, &aliasCallee))
+            {
+                const std::string fallbackName = aliasCallee.empty() ? std::string("<expression>") : aliasCallee;
+                const std::string sourceName = !source.CallerName.empty() ? source.CallerName
+                    : !source.TypeAndValue.VariableName.empty() ? source.TypeAndValue.VariableName : fallbackName;
+                LogErrorMessage(
+                    "cannot store an 'alias' value '{}' into an owning parameter; it borrows storage it does not own and would dangle. Use '.copy()' for an independent owned copy.",
+                    { sourceName });
+            }
+        }
         std::vector<llvm::Value*> argList;
         // A by-value param an 'alias' return can hand back is passed as a pointer to a caller-owned
         // copy slot (ParamIsAliasReturnSlot), so the result points into this frame. A slot holding
         // a temporary is that temporary's only owner; the post-call handoff settles who frees it.
-        struct AliasSlotArg { llvm::Value* Slot; std::string TypeName; bool Temp; };
+        struct AliasSlotArg
+        {
+            llvm::Value* Slot;
+            std::string TypeName;
+            bool Temp;
+            std::vector<llvm::Value*> AncestorSlots;
+        };
         std::vector<AliasSlotArg> aliasSlots;
         auto candParamItr = candidate.Parameters.begin();
         size_t argIndex = 0;
@@ -4661,14 +4686,38 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                     // AND this end-of-expr flush both free the temp -> double-free.
                     // A CONSUME-inferred sink of a copyable owner does NOT take ownership (its store
                     // is a copy), so an rvalue temp must still be registered for end-of-expr freeing.
-                    bool aliasReturnConsumes = aliasSlotParam
+                    const bool externByValueReturnParam = candidate.ReturnsAliasOfByValueParam
+                        && !candidate.ReturnsAlias
+                        && candParamItr->IsReturnInferredSink && !candParamItr->Pointer
+                        && !candParamItr->IsAlias && !candParamItr->IsMove
+                        && ResolveTypeAlias(candParamItr->TypeName)
+                            == ResolveTypeAlias(candidate.ReturnType.TypeName);
+                    bool aliasReturnConsumes = (aliasSlotParam || externByValueReturnParam)
                         && !IsCopyableType(candParamItr->TypeName);
                     bool paramTakesOwnership = candParamItr->IsMove || aliasReturnConsumes
+                        || (!candParamItr->Pointer && IsCoreUniqueType(candParamItr->TypeName))
                         || (OwningSinkConsumesConcrete(*candParamItr)
                             && (candParamItr->TypeName == "string" || IsOwningValueType(candParamItr->TypeName)));
                     if (aliasSlotParam)
                     {
                         const bool phiArg = arg.Primary != nullptr && llvm::isa<llvm::PHINode>(arg.Primary);
+                        std::vector<llvm::Value*> aliasAncestors;
+                        if (arg.Primary != nullptr)
+                            for (const auto& aliasTemp : aliasReturnTempSlots_)
+                            {
+                                auto* loaded = llvm::dyn_cast<llvm::LoadInst>(arg.Primary);
+                                const bool carriesAliasResult = aliasTemp.Result == arg.Primary
+                                    || (loaded != nullptr
+                                        && loaded->getPointerOperand() == aliasTemp.Result);
+                                if (carriesAliasResult)
+                                {
+                                    aliasAncestors.push_back(aliasTemp.Slot);
+                                    for (auto* ancestor : aliasTemp.AncestorSlots)
+                                        if (std::find(aliasAncestors.begin(), aliasAncestors.end(), ancestor)
+                                            == aliasAncestors.end())
+                                            aliasAncestors.push_back(ancestor);
+                                }
+                            }
                         bool temp = BorrowedOwningStructTempQualifies(
                             arg, phiArg && !arg.TernaryTempAlreadyRegistered);
                         // `f(c ? mk(1) : mk(2))`: each arm registered its own temp; the joined value
@@ -4677,7 +4726,8 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                             temp = AdoptTernaryArmStructTemps(llvm::cast<llvm::PHINode>(arg.Primary));
                         auto* slot = AllocaAtEntry(value->getType(), nullptr, "aliasslot");
                         builder->CreateStore(value, slot);
-                        aliasSlots.push_back({ slot, candParamItr->TypeName, temp });
+                        aliasSlots.push_back({ slot, candParamItr->TypeName, temp,
+                                               std::move(aliasAncestors) });
                         value = slot;
                     }
                     else if (!paramTakesOwnership)
@@ -5172,7 +5222,10 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
         // callee's gated owning-pointer args first (virtual dispatch has no body to prove).
         const bool cxxTempsRegisteredBeforeCall = candidate.IsCxx && !candidate.Recipe.hasLowering
             && cxxVirtualCallee == nullptr
-            && RegisterCxxOwningPtrArgsBeforeCall(candidate.Function, argList);
+            && RegisterCxxOwningPtrArgsBeforeCall(candidate.Function, argList, calleeMayUnwind);
+        if (!candidate.IsCxx && !candidate.Recipe.hasLowering && cxxVirtualCallee == nullptr
+            && calleeMayUnwind)
+            PreserveRetainedJoinArmTempsBeforeCall(candidate.Function, argList);
         if (IsVerbose() && functionName.find("operator") != std::string::npos)
         {
             const std::string selectedName = candidate.SourceName.empty()
@@ -5215,6 +5268,17 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                 aliasTransferResults_.push_back(owned);
                 result = owned;
                 resultIsAlias = false;
+            }
+            else if (candidate.ReturnsAliasOfByValueParam)
+            {
+                // A mixed named/temp call cannot statically know whether the alias result names
+                // a borrowed local or the temporary. Keep each temp in the full-expression
+                // ledger, so branch and loop paths destroy only slots created by that call.
+                for (const auto& s : aliasSlots)
+                {
+                    if (s.Temp) RegisterOwnedStructTemp(s.Slot, s.TypeName);
+                    RegisterAliasReturnTempSlot(result, s.Slot, s.AncestorSlots, shownFunctionName);
+                }
             }
             else
                 for (const auto& s : aliasSlots)
@@ -5415,7 +5479,18 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
         }
 
         // Retire move temporaries and mark the source moved after the call.
-        ApplyMoveParamTransfer(functionName, candidate.Parameters, matched, true,
+        std::vector<TypeAndValue> transferParamsStorage;
+        const auto* transferParams = &candidate.Parameters;
+        if (candidate.ReturnsAliasOfByValueParam && !candidate.ReturnsAlias)
+        {
+            transferParamsStorage = candidate.Parameters;
+            transferParams = &transferParamsStorage;
+            for (auto& param : transferParamsStorage)
+                if (param.IsReturnInferredSink && !param.Pointer
+                    && ResolveTypeAlias(param.TypeName) == ResolveTypeAlias(candidate.ReturnType.TypeName))
+                    param.IsReturnInferredSink = false;
+        }
+        ApplyMoveParamTransfer(functionName, *transferParams, matched, true,
                                candidate.IsMethod, false, candidate.IsCxx);
 
         // A temp's `unique` field handed to a PLAIN `T*` parameter. Runs AFTER the sink reject

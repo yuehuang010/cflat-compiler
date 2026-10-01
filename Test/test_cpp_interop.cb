@@ -1294,6 +1294,37 @@ cppi.MtNoCopy mtNoCopyReturn(cppi.MtNoCopy value)
 { return value; }
 long CtorExprReturn(long* p) { return cppcr.ExprConstRW(*p, p).v; }
 
+cppon.Esc* w10CflatKept = nullptr;
+int W10CflatKeep(cppon.Esc* p, int value)
+{
+    w10CflatKept = p;
+    cppunw.thrower(value);
+    return p == nullptr ? -1 : p->v;
+}
+int W10KeepDirect(int value) { return W10CflatKeep(new cppon.Esc(value), value); }
+int W10KeepCoalesceRight(int value)
+{
+    cppon.Esc* empty = nullptr;
+    return W10CflatKeep(empty ?? new cppon.Esc(value), value);
+}
+int W10KeepCoalesceLeft(int value)
+{
+    cppon.Esc* empty = nullptr;
+    return W10CflatKeep(new cppon.Esc(value) ?? empty, value);
+}
+int W10KeepNested(int value)
+{
+    cppon.Esc* empty = nullptr;
+    bool choose = value > 0;
+    return W10CflatKeep(empty ?? (choose ? new cppon.Esc(value) : empty), value);
+}
+int W10KeepTernary(int value)
+{
+    cppon.Esc* empty = nullptr;
+    bool choose = value > 0;
+    return W10CflatKeep(choose ? new cppon.Esc(value) ?? empty : empty, value);
+}
+
 extern int main()
 {
     cppanon.U anonUnion = default;
@@ -5668,6 +5699,50 @@ extern int main()
         cppunw.reset();
         r = cppunw.guarded(UnwDeclAfter, 5);   // 'late' is declared after the throw: untouched
         if (r != -5 || cppunw.live() != 0 || cppunw.dtors() != 1) return 3165;
+        // A retaining CFlat callee stores the pointer before it throws. Joined arms must follow
+        // the direct-new argument's unwind ownership and remain available to the caller.
+        cppon.reset();
+        w10CflatKept = nullptr;
+        r = cppunw.guarded(W10KeepDirect, 5);
+        if (r != -5 || w10CflatKept == nullptr || w10CflatKept->v != 5
+            || cppon.live() != 1 || cppon.clsNew() != 1 || cppon.clsDel() != 0
+            || cppon.dtors() != 0) return 3680;
+        delete w10CflatKept;
+        if (cppon.live() != 0 || cppon.clsDel() != 1 || cppon.dtors() != 1) return 3680;
+        cppon.reset();
+        w10CflatKept = nullptr;
+        r = cppunw.guarded(W10KeepCoalesceRight, 5);
+        if (r != -5 || w10CflatKept == nullptr || w10CflatKept->v != 5
+            || cppon.live() != 1 || cppon.clsNew() != 1 || cppon.clsDel() != 0
+            || cppon.dtors() != 0) return 3681;
+        delete w10CflatKept;
+        if (cppon.live() != 0 || cppon.clsDel() != 1 || cppon.dtors() != 1) return 3681;
+        cppon.reset();
+        w10CflatKept = nullptr;
+        r = cppunw.guarded(W10KeepCoalesceLeft, 5);
+        if (r != -5 || w10CflatKept == nullptr || w10CflatKept->v != 5
+            || cppon.live() != 1 || cppon.clsNew() != 1 || cppon.clsDel() != 0
+            || cppon.dtors() != 0) return 3682;
+        delete w10CflatKept;
+        if (cppon.live() != 0 || cppon.clsDel() != 1 || cppon.dtors() != 1) return 3682;
+        cppon.reset();
+        w10CflatKept = nullptr;
+        r = cppunw.guarded(W10KeepNested, 5);
+        if (r != -5 || w10CflatKept == nullptr || w10CflatKept->v != 5
+            || cppon.live() != 1 || cppon.clsNew() != 1 || cppon.clsDel() != 0
+            || cppon.dtors() != 0) return 3683;
+        delete w10CflatKept;
+        if (cppon.live() != 0 || cppon.clsDel() != 1 || cppon.dtors() != 1) return 3683;
+        cppon.reset();
+        w10CflatKept = nullptr;
+        r = cppunw.guarded(W10KeepTernary, 5);
+        if (r != -5 || w10CflatKept == nullptr || w10CflatKept->v != 5
+            || cppon.live() != 1 || cppon.clsNew() != 1 || cppon.clsDel() != 0
+            || cppon.dtors() != 0) return 3684;
+        delete w10CflatKept;
+        if (cppon.live() != 0 || cppon.clsDel() != 1 || cppon.dtors() != 1) return 3684;
+        cppon.reset();
+        w10CflatKept = nullptr;
         pftArgumentValue = 1;
         r = cppunw.guarded(PftStatement, 0);
         if (r != -1 || pftArgumentValue != 2) return 3652;
@@ -7899,6 +7974,14 @@ extern int main()
     // A C++ const-pointer borrow releases each owning join arm, matching the direct `new` path.
     cppon.reset();
     cppon.Esc* cppEscNull = nullptr;
+    cppon.reset();
+    cppon.Esc* cppArrowBase = new cppon.Esc(46);
+    int cppCoalesceArrow = (cppEscNull ?? cppArrowBase)->v;
+    if (cppCoalesceArrow != 46 || cppon.clsNew() != 1 || cppon.clsDel() != 0
+        || cppon.dtors() != 0 || cppon.live() != 1) return 3205;
+    delete cppArrowBase;
+    if (cppon.clsDel() != 1 || cppon.dtors() != 1 || cppon.live() != 0) return 3205;
+    cppon.reset();
     int cppBorrowLhs = cppon.escRead(new cppon.Esc(42) ?? cppEscNull);
     if (cppBorrowLhs != 42 || cppon.clsNew() != 1 || cppon.clsDel() != 1
         || cppon.dtors() != 1 || cppon.live() != 0) return 3646;
@@ -8853,6 +8936,38 @@ extern int main()
     }
     int opMoveRc = OpMoveNontrivialLegs();
     if (opMoveRc != 0) return opMoveRc;
+    // Joined temporaries match direct `new` when a retaining C++ call throws.
+    {
+        cppon.reset();
+        int w4R = cppunw.guarded(UnwKeepDirect, 41);
+        cppon.Esc* w4Kept = cppon.escTake();
+        if (w4R != -41 || w4Kept == nullptr || w4Kept->v != 41 || cppon.live() != 1 || cppon.dtors() != 0
+            || cppon.clsNew() != 1 || cppon.clsDel() != 0) return 3200;
+        delete w4Kept;
+        if (cppon.live() != 0 || cppon.dtors() != 1 || cppon.clsDel() != 1) return 3200;
+        cppon.reset();
+        w4R = cppunw.guarded(UnwKeepTernary, 42);
+        w4Kept = cppon.escTake();
+        if (w4R != -42 || w4Kept == nullptr || w4Kept->v != 42 || cppon.live() != 1 || cppon.dtors() != 0
+            || cppon.clsNew() != 1 || cppon.clsDel() != 0) return 3201;
+        delete w4Kept;
+        if (cppon.live() != 0 || cppon.dtors() != 1 || cppon.clsDel() != 1) return 3201;
+        cppon.reset();
+        w4R = cppunw.guarded(UnwKeepCoalesce, 43);
+        w4Kept = cppon.escTake();
+        if (w4R != -43 || w4Kept == nullptr || w4Kept->v != 43 || cppon.live() != 1 || cppon.dtors() != 0
+            || cppon.clsNew() != 1 || cppon.clsDel() != 0) return 3202;
+        delete w4Kept;
+        if (cppon.live() != 0 || cppon.dtors() != 1 || cppon.clsDel() != 1) return 3202;
+        cppon.reset();
+        w4R = W4NestedJoin(1);
+        if (w4R != 3 || cppon.live() != 0 || cppon.dtors() != 1
+            || cppon.clsNew() != 1 || cppon.clsDel() != 1) return 3203;
+        cppon.reset();
+        w4R = W4NestedJoin(0);
+        if (w4R != -1 || cppon.live() != 0 || cppon.dtors() != 0
+            || cppon.clsNew() != 0 || cppon.clsDel() != 0) return 3204;
+    }
     return 0;
 }
 
@@ -9104,4 +9219,23 @@ namespace unw_nsx
     {
         return cppunw.thrower(x);
     }
+}
+
+int UnwKeepDirect(int x) { return cppon.escThrowKeep(new cppon.Esc(x), x); }
+int UnwKeepTernary(int x)
+{
+    cppon.Esc* empty = nullptr;
+    return cppon.escThrowKeep(x > 0 ? new cppon.Esc(x) ?? empty : empty, x);
+}
+int UnwKeepCoalesce(int x)
+{
+    cppon.Esc* empty = nullptr;
+    return cppon.escThrowKeep(empty ?? new cppon.Esc(x), x);
+}
+
+int W4JoinRead(cppon.Esc* p) { return p == nullptr ? -1 : p->v; }
+int W4NestedJoin(int c)
+{
+    cppon.Esc* empty = nullptr;
+    return W4JoinRead(empty ?? (c > 0 ? new cppon.Esc(3) : empty));
 }

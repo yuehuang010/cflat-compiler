@@ -1851,6 +1851,14 @@ std::string LLVMBackend::AliasReturnSlotParamName(const TypeAndValue& ret,
         return {};
     }
 
+void LLVMBackend::RecordAliasReturnAddressUse(const llvm::Function* function,
+                                              const std::string& interfaceName)
+{
+        if (function == nullptr) return;
+        firstAliasReturnAddressUse_.try_emplace(function->getName().str(),
+            AliasReturnAddressUse{ sourceFileName, currentLine, currentColumn, interfaceName });
+}
+
 bool LLVMBackend::OwningSinkConsumesConcrete(const TypeAndValue& p)
 {
         if (!p.IsOwningSink) return false;

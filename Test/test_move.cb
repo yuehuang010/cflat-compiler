@@ -11890,7 +11890,10 @@ int testLibraryUnique()
     {
         list<unique<Resource>> items;
         items.add(unique<Resource>(new Resource()));
-        items.set(0, unique<Resource>(new Resource()));
+        Resource* replacement = new Resource();
+        replacement->id = 25;
+        items.set(0, unique<Resource>(replacement));
+        passed += Test("library_unique_list_set_value", items[0].get()->id, 25);
         passed += Test("library_unique_list_set_old_dtor", dtorCount, 1);
     }
     passed += Test("library_unique_list_set_total", dtorCount, 2);
@@ -12780,7 +12783,7 @@ extern int main()
     total += 9;
 
     passed += testLibraryUnique();
-    total += 48;
+    total += 49;
 
     passed += testDesugaredUniquePointerForms();
     total += 43;

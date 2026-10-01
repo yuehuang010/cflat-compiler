@@ -31,3 +31,8 @@ Neither option is selected in this issue.
 
 Design A, as C++ does it. Tracked in internal/plan/cflat-struct-nontrivial-cxx-fields.md; phase 0 there
 is the option-B refusal as a stopgap until the lowering lands.
+
+Phase 0 was evaluated on 2026-09-30 and deferred: instrumented gates found
+currently passing CFlat aggregates at every candidate operation site, while
+`HasForeignNontrivialCxxField` cannot distinguish those supported fields from
+the failing `std.list<int>` field. No refusal shape landed; phases 1-3 remain.

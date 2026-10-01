@@ -21,3 +21,5 @@ Fix direction (needs maintainer ruling on the surface; doc/LANGUAGE.md "Default 
 suffixed literal (MainListener_Utilities.cpp ParseNumberConstant/ParseLiteralTypeAndValue,
 MainListener.h ParseScannerIntegerLiteral, MainListener_Aggregates.cpp suffix list) and the literal ->
 C++ spelling path so both agree.
+
+RULING 2026-09-30 (maintainer): `L` is platform-specific - the target C `long` (32-bit on LLP64/Windows, 64-bit on LP64); `LL` is always i64. Literal typing and the C++ spelling path must agree.

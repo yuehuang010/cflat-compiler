@@ -15,7 +15,26 @@ Lambda<void()> escape() {
     return inc;
 }
 
+Lambda<void()> id(Lambda<void()> f) { return f; }
+Lambda<void()> gEscapedThroughIdentity = default;
+
+Lambda<void()> escapeThroughIdentityReturn() {
+    expect_error("bonded value whose source 'c' is not a 'bond' parameter");
+    Counter c;
+    Lambda<void()> inc = () => { c.value = c.value + 1; };
+    return id(inc);
+}
+
+void escapeThroughIdentityStore() {
+    expect_error("bonded value cannot be stored in a struct field or through a pointer");
+    Counter c;
+    Lambda<void()> inc = () => { c.value = c.value + 1; };
+    gEscapedThroughIdentity = id(inc);
+}
+
 extern int main() {
+    _ = escapeThroughIdentityReturn();
+    escapeThroughIdentityStore();
     return 0;
 }
 

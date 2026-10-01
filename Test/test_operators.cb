@@ -1021,7 +1021,7 @@ extern int main()
     int boolFpPassed = boolToFloatingLegs();
     if (compoundResultOwnershipLegs() != 26) return 57;
     if (byValueParamOwnershipLegs() != 66) return 58;
-    if (byValueAliasTempLegs() != 28) return 59;
+    if (byValueAliasTempLegs() != 46) return 59;
     if (byValueAliasOperatorLegs() != 11) return 61;
     if (cppUnwindThroughHelperLegs() != 0) return 60;
 
@@ -2062,6 +2062,7 @@ int baTSee(alias BaT w) { return w.val(); }
 BaT baTRet() { return baTPass(baTMk(14)); }
 struct BaTHolder { BaT v = default; };
 BaT baTPick(BaT a, BaT b, bool first) { if (first) return a; return b; }
+int baTEarlyRet(int k) { BaT a = baTMk(1); for (int i = 0; i < 10; i++) { if (baTSee(baTPick(a, baTMk(i), false)) == k) return i; } return -1; }
 alias BaT baTSpelled(BaT w) { return w; }
 BaT operator~(BaT w) { return w; }
 alias BaT operator!(BaT w) { return w; }
@@ -2165,5 +2166,34 @@ int byValueAliasTempLegs()
     { bool c = true; BaT x = baTPass(c ? baTMk(3) : baTMk(4)); BaT y = baTMk(79); passed += Test("alias temp ternary argument", x.val() * 100 + y.val(), 379); }
     { BaT x = baTSpelled(baTMk(15)); BaT y = baTMk(84); passed += Test("alias temp spelled alias", x.val() * 100 + y.val(), 1584); }
     passed += Test("alias temp multi-source ctor/dtor", baCtor * 100 + baDtor, 1010);
+    baCtor = 0; baDtor = 0;
+    { BaT a = baTMk(1); BaT x = baTPick(a, baTMk(3), false); BaT y = baTMk(77);
+        passed += Test("alias temp mixed named source", x.val() * 100 + y.val() + a.val(), 378); }
+    passed += Test("alias temp mixed named ctor/dtor", baCtor * 10 + baDtor, 33);
+    baCtor = 0; baDtor = 0;
+    { BaT a = baTMk(1); BaT x = baTPick(a, baTPick(a, baTMk(3), false), false);
+        passed += Test("alias temp nested mixed value", x.val() * 10 + a.val(), 31); }
+    passed += Test("alias temp nested mixed balance", baCtor, baDtor);
+    baCtor = 0; baDtor = 0;
+    { BaT a = baTMk(1); BaT x = true ? baTPick(a, baTMk(3), false) : baTPick(a, baTMk(4), false); passed += Test("alias temp ternary true value", x.val(), 3); }
+    passed += Test("alias temp ternary true balance", baCtor, baDtor);
+    baCtor = 0; baDtor = 0;
+    { BaT a = baTMk(1); BaT x = false ? baTPick(a, baTMk(3), false) : baTPick(a, baTMk(4), false); passed += Test("alias temp ternary false value", x.val(), 4); }
+    passed += Test("alias temp ternary false balance", baCtor, baDtor);
+    baCtor = 0; baDtor = 0;
+    { BaT a = baTMk(1); bool r = false && baTSee(baTPick(a, baTMk(3), false)) == 3; passed += Test("alias temp short circuit value", r, false); }
+    passed += Test("alias temp short circuit balance", baCtor, baDtor);
+    baCtor = 0; baDtor = 0;
+    { BaT a = baTMk(1); int sum = 0; for (int i = 0; i < 10; i++) sum += baTSee(baTPick(a, baTMk(i), false)); passed += Test("alias temp unbraced loop value", sum, 45); }
+    passed += Test("alias temp unbraced loop balance", baCtor, baDtor);
+    baCtor = 0; baDtor = 0;
+    { BaT a = baTMk(1); int i = 0; while (baTSee(baTPick(a, baTMk(i), false)) < 5) i++; passed += Test("alias temp while value", i, 5); }
+    passed += Test("alias temp while balance", baCtor, baDtor);
+    baCtor = 0; baDtor = 0;
+    passed += Test("alias temp early return value", baTEarlyRet(3), 3);
+    passed += Test("alias temp early return balance", baCtor, baDtor);
+    baCtor = 0; baDtor = 0;
+    { BaT a = baTMk(1); BaT x = baTPick(a, baTMk(3), false); x = baTMk(5); passed += Test("alias temp reassign value", x.val() * 10 + a.val(), 51); }
+    passed += Test("alias temp reassign balance", baCtor, baDtor);
     return passed;
 }

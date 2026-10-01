@@ -456,7 +456,7 @@ std::string MangleFunctionComponent(const LLVMBackend& compiler, std::string_vie
                                     bool pointer, int pointerDepth, bool alias = false)
 {
     LLVMBackend::TypeAndValue component;
-    component.TypeName = name.empty() ? "void" : std::string(name);
+    component.TypeName = name.empty() ? "void" : MangleTypeArgument(compiler, name);
     component.Pointer = pointer;
     component.ElemPointer = pointer && pointerDepth >= 2;
     component.PointerDepth = pointer ? std::max(pointerDepth, 1) : 0;

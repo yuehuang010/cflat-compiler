@@ -10,11 +10,14 @@ expect_error("found ';' but expected") {
 }
 expect_error("missing ';' at 'return'");
 void unnamedMoveParam(int, move Buf b) { int y = 1 return y; }
-expect_error("'class' is a reserved word in CFlat");
+expect_error("'class' is a reserved keyword and cannot be used as a name here");
 int reservedDecl() { int class = 3; return 0; }
-expect_error("'true' is a reserved word in CFlat");
+expect_error("'true' is a reserved keyword and cannot be used as a name here");
 struct ReservedField { int true; };
-expect_error("'default' is a reserved word in CFlat");
+expect_error("'default' is a reserved keyword and cannot be used as a name here");
 int reservedFor() { for (int default = 0; default < 1; default++) { } return 0; }
-expect_error("'if' is a reserved word in CFlat");
+expect_error("'if' is a reserved keyword and cannot be used as a name here");
 void reservedParam(int if) { return; }
+expect_error("'where' is a reserved keyword and cannot be used as a name here") {
+    int reservedWhere() { char[64] where = default; return 0; }
+}

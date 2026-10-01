@@ -195,6 +195,10 @@ struct GenericTemplateState
     ActiveInstantiationOrigin activeInstantiationOrigin;
 
     std::unordered_map<std::string, CFlatParser::StructDefinitionContext*>      genericStructTemplates;
+    // Non-generic struct/class method bodies by type name then method name (every overload),
+    // recorded by the pre-pass so copy-on-entry can classify a user method that mutates a field.
+    std::unordered_map<std::string, std::unordered_map<std::string,
+        std::vector<CFlatParser::FunctionDefinitionContext*>>>                  structMethodBodies;
     std::unordered_map<std::string, CFlatParser::ClassDefinitionContext*>       genericClassTemplates;
     std::unordered_map<std::string, std::vector<std::string>>                   genericStructTypeParams;
     // Parallel to the type-parameter vectors: empty means a TYPE parameter; otherwise this is
@@ -1517,6 +1521,8 @@ public:
         llvm::Type* BaseType = nullptr;  // The type of the value, even if it is a pointer.
         llvm::Value* Primary = nullptr;  // The value or result
         llvm::Value* Storage = nullptr;  // The container holding the value, used to load or store.
+        llvm::Value* AddressedUniqueSlot = nullptr;
+        std::string AddressedUniqueTypeName;
         llvm::Type* UnionFieldType = nullptr;  // When non-null: load/store this storage as this type (union field access).
         bool IsOwning = false;           // true for move parameters, new-allocated locals, and any owned pointer - freed on scope exit
         bool OwnsInterfaceBox = false;   // true when a plain interface local adopted an owned box
@@ -2320,6 +2326,14 @@ public:
     std::vector<UniqueFieldReadJoin> uniqueFieldReadJoins_;
     std::vector<llvm::Value*> aliasValues_;
     std::vector<llvm::Value*> aliasTransferResults_;
+    struct AliasReturnTempSlot
+    {
+        llvm::Value* Result;
+        llvm::Value* Slot;
+        std::vector<llvm::Value*> AncestorSlots;
+        std::string Callee; // user-facing name of the alias-return call, for diagnostics
+    };
+    std::vector<AliasReturnTempSlot> aliasReturnTempSlots_;
     std::vector<llvm::Value*> tempFieldValues_;
     std::unordered_map<const llvm::Value*, std::vector<std::string>> bondedValues_;
 
@@ -2918,6 +2932,14 @@ private:
     // Source location of the FIRST emitted call to each function, by mangled name. Lets an
     // end-of-module diagnostic (CheckPoisonedFunctionCalls) point at the real call site.
     std::unordered_map<std::string, std::pair<size_t, size_t>> firstCallLocation_;
+    struct AliasReturnAddressUse
+    {
+        std::string File;
+        size_t Line = 0;
+        size_t Column = 0;
+        std::string InterfaceName;
+    };
+    std::unordered_map<std::string, AliasReturnAddressUse> firstAliasReturnAddressUse_;
 
     /*
      * A call that handed a temp's `unique` field to a PLAIN `T*` parameter, recorded where the
@@ -4520,7 +4542,10 @@ private:
     // Pre-call form for a direct C++ call, so a landing pad of that very call already frees
     // the gated temp on unwind. False (nothing registered) when the callee does not qualify.
     bool RegisterCxxOwningPtrArgsBeforeCall(const llvm::Function* callee,
-                                            llvm::ArrayRef<llvm::Value*> args);
+                                            llvm::ArrayRef<llvm::Value*> args,
+                                            bool mayUnwind);
+    void PreserveRetainedJoinArmTempsBeforeCall(const llvm::Function* callee,
+                                                llvm::ArrayRef<llvm::Value*> args);
     void RegisterCxxGatedOwningPtrArg(llvm::Value* argVal, const llvm::Function& callee,
                                       unsigned argIndex);
 
@@ -4928,6 +4953,7 @@ private:
     // cflat-level facts about an emitted function, by llvm::Function identity. A miss answers the
     // conservative way for its caller (not owning / not `move`).
     const FunctionSymbol* FindSymbolForFunction(const llvm::Function* fn) const;
+    bool IsRegisteredClosureCopyFunction(const llvm::Function* fn) const;
 
     bool CalleeReturnsOwned(const llvm::Function* fn) const;
 
@@ -5123,6 +5149,11 @@ private:
     // the end of the current full expression. The dtor takes a T*, so no spill is needed at flush.
     void RegisterOwnedStructTemp(llvm::Value* alloca, const std::string& typeName);
 
+    void RegisterAliasReturnTempSlot(llvm::Value* result, llvm::Value* slot,
+                                     std::vector<llvm::Value*> ancestors = {}, const std::string& callee = {});
+    bool AdoptAliasReturnTemps(llvm::Value* aliasStorage, NamedVariable& owner);
+    bool IsAliasReturnTempResult(llvm::Value* value, std::string* callee = nullptr) const;
+
     void UnregisterOwnedStructTemp(llvm::Value* value);
 
     void FlushOwnedStructTemps();
@@ -5255,6 +5286,7 @@ private:
         decltype(movedBorrowedThroughFieldValues_) movedBorrowedThroughFieldValues_;
         decltype(aliasValues_) aliasValues_;
         decltype(aliasTransferResults_) aliasTransferResults_;
+        decltype(aliasReturnTempSlots_) aliasReturnTempSlots_;
         decltype(tempFieldValues_) tempFieldValues_;
     };
     DetectionLedgerSnapshot SnapshotDetectionLedgers() const;
@@ -5615,6 +5647,8 @@ private:
     // called directly: a function pointer, closure, thunk or vtable would call it with the plain
     // by-value ABI. Any other use of its address is refused.
     void CheckAliasReturnSlotAddressTaken();
+    void RecordAliasReturnAddressUse(const llvm::Function* function,
+                                    const std::string& interfaceName = {});
 
     // --cpp-strict-noexcept: refuse to bind a C++ declaration without a noexcept specification,
     // whether by call or by function pointer. By default such a call is allowed and unwinds
@@ -6571,6 +6605,7 @@ public:
         std::vector<UniqueFieldReadJoin> uniqueFieldReadJoins;
         std::vector<llvm::Value*> aliasValues;
         std::vector<llvm::Value*> aliasTransferResults;
+        std::vector<AliasReturnTempSlot> aliasReturnTempSlots;
         std::vector<llvm::Value*> tempFieldValues;
     };
 

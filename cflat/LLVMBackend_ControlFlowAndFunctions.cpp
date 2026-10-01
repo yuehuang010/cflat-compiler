@@ -203,6 +203,7 @@ LLVMBackend::BuilderState LLVMBackend::SaveBuilderState()
         s.uniqueFieldReadJoins = std::move(uniqueFieldReadJoins_);
         s.aliasValues = std::move(aliasValues_);
         s.aliasTransferResults = std::move(aliasTransferResults_);
+        s.aliasReturnTempSlots = std::move(aliasReturnTempSlots_);
         s.tempFieldValues = std::move(tempFieldValues_);
         // Mark the function we are leaving mid-body INCOMPLETE for the escape analysis
         // (see FunctionBodyIsComplete); RestoreBuilderState pops it back off.
@@ -237,6 +238,7 @@ LLVMBackend::BuilderState LLVMBackend::SaveBuilderState()
         uniqueFieldReadJoins_.clear();
         aliasValues_.clear();
         aliasTransferResults_.clear();
+        aliasReturnTempSlots_.clear();
         tempFieldValues_.clear();
         return s;
     }
@@ -289,6 +291,7 @@ void LLVMBackend::RestoreBuilderState(const BuilderState& state)
         uniqueFieldReadJoins_    = state.uniqueFieldReadJoins;
         aliasValues_             = state.aliasValues;
         aliasTransferResults_    = state.aliasTransferResults;
+        aliasReturnTempSlots_    = state.aliasReturnTempSlots;
         tempFieldValues_         = state.tempFieldValues;
     }
 

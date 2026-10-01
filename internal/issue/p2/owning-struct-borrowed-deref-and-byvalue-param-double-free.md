@@ -9,3 +9,5 @@ Summary: these were found by the A10 review (2026-09-28). All are on master. Pro
   (MainListener_Declarations.cpp ~9797) admits GEP storage only.
 The by-value param bullets landed in 059d1f42 (B13) and the moved compound read in A10; leftovers are in p2/byvalue-param-owning-leftovers-after-b13.md.
 Silent memory corruption, hence p2.
+
+RULING 2026-09-30 (maintainer): REFUSE `return *o` through a borrowed pointer, like `return h->f`; the error suggests `return move *o;` or `return o->copy();`. Inlining and RVO do not change legality. The sibling `Owned t = *o;` (silently moves today) is not covered - measure before ruling.

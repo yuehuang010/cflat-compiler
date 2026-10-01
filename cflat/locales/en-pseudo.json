@@ -64,6 +64,9 @@
       "c16",
       "c16"
     ],
+    "arg0isareservedkeywo...notbeusedasanamehere8eb9aa9365db701f": [
+      "class"
+    ],
     "arg0isareservedwordi...beusedasanidentifiera2a00aed272d893f": [
       "class"
     ],
@@ -447,6 +450,9 @@
     ],
     "cannotreturnthisvalu...rntypeoffunctionarg0e2e1290e116bcbfc": [
       "proxy_explicit_return"
+    ],
+    "cannotstoreanaliasva...independentownedcopy84aef4fa68ee66af": [
+      "aliasReturnProbePick"
     ],
     "cannotstoreathatjoin...ndependentownedvalue71d560cf28a01507": [
       "JoinBox",
@@ -1866,6 +1872,7 @@
     "arg0failedtoinstallp...sssymbolresolverarg1fc80b8f9f6712b7c": "{0}: failed to install process symbol resolver: {1}",
     "arg0isagenerictypety...xpectsarg1arg2egarg3a467eacbee1a674c": "'{0}' is a generic type; type arguments are required (expects {1}: {2}), e.g. {3}",
     "arg0isambiguousarg1n...sorrenamethevariable10b0bb33b930b563": "'({0})' is ambiguous: '{1}' names both a variable and a type; remove the parentheses or rename the variable",
+    "arg0isareservedkeywo...notbeusedasanamehere8eb9aa9365db701f": "'{0}' is a reserved keyword and cannot be used as a name here",
     "arg0isareservedwordi...beusedasanidentifiera2a00aed272d893f": "'{0}' is a reserved word in CFlat and cannot be used as an identifier",
     "arg0isneverused": "'{0}' is never used",
     "arg0msvclibdirectory...componentisinstalled740fffb28d2f2687": "{0}: MSVC lib directory not found, cannot locate the asan runtime (clang_rt.asan_dynamic). Ensure Visual Studio with the C++ AddressSanitizer component is installed.",
@@ -1966,6 +1973,7 @@
     "cannotreturntheheapa...rriesthecountinsteada0699340cd34f249": "cannot return the heap array {0} as '{1}': the element count is lost at the return - return 'array<{2}>' or 'move {3}[]' (which carries the count) instead",
     "cannotreturnthisvalu...ecabireturnaggregateaeb4fb26a401f892": "cannot return this value from extern function: it does not match the C ABI return aggregate",
     "cannotreturnthisvalu...rntypeoffunctionarg0e2e1290e116bcbfc": "cannot return this value: its type does not match the declared return type of function '{0}'",
+    "cannotstoreanaliasva...independentownedcopy84aef4fa68ee66af": "cannot store an 'alias' value '{0}' into an owning parameter; it borrows storage it does not own and would dangle. Use '.copy()' for an independent owned copy.",
     "cannotstoreathatjoin...ndependentownedvalue71d560cf28a01507": "cannot store a '?:' that joins two borrowed '{0}' arms into {1}; the destination's destructor would free a value its existing owner still frees. Assign each arm in its own branch, 'move' each arm into a fresh owned value, declare the function 'alias' to hand the borrow through, or write a 'copy()' method for '{2}' and copy the arm into an independent owned value.",
     "cannotstorenewarg0ni...heelementtypesdiffer50877848c28b7c8c": "cannot store 'new {0}[n]' into '{1}': the element types differ",
     "cannotusearg0asafunc...vesotheresultisownedc2a66f1a67947cad": "cannot use '{0}' as a function value: its 'alias' result can be its by-value parameter '{1}', which only a direct call passes correctly. Call '{2}' directly, or declare the parameter 'move' so the result is owned.",

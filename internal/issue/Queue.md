@@ -58,6 +58,9 @@ concurrent runs on the same function). Run ids are new for this regroup; old ids
 
 | Run | Branch | Issue(s) | Notes |
 |-----|--------|----------|-------|
+| W4 | fix/join-arm-temps | N2, N8 + 4 p3 | started 15:50 |
+| W3 | fix/c-inline-bodies-and-transitive-hang | N30 hang | r2 EOF-inject guard REJECTED (Windows + nested ns crash); IncrementalExtensions toggle fixes all probes but loses std::function; r3 brief ready (next slot) |
+| W7 | fix/byvalue-b13-leftovers | N1 (b13 leftovers) | e9963895; Windows green; review NOT CLEAN (B1 bonded closure escape via pass-through, S1, S2); r2 brief ready, launches on next free slot
 
 ## A - crashes, asserts, link failures
 
@@ -75,7 +78,7 @@ concurrent runs on the same function). Run ids are new for this regroup; old ids
 | B14 | p3/c-flexible-array-member-leftovers | move a->data (RULING: explicit move of a raw pointer) + 3 pre-existing P3 | OPEN (sizeof/alignof landed 118c2769) |
 | B16 | p3/cpp-operator-move-operand-leftovers | template U&&, elision, move into const&-only ruling | NEW 2026-09-28 (D8 report) |
 | B18 | p3/cpp-assignment-result-leftovers-after-b9 | extra copies (paren call arms, arr elem init) + bare scalar/nested ternary refusals + 3 unrelated | OPEN (P2 landed 1955bd95) |
-| B21b | p2/alias-return-byvalue-param-leftovers-after-b21 | mixed named+temp arg UAF, C-linkage definitions, refusal location, prototype link error, fn-value support (ruling) | NEW 2026-09-29 (B21 review) |
+| B21b | p2/alias-return-byvalue-param-leftovers-after-b21 | named alias into sink, array-element store, chained decl consume, C-linkage definitions, prototype link error, stale shallow copy | W12 landed mixed named+temp + fn-value message 2026-09-30; rest open |
 | G6 | p3/header-cache-residual-growth | in-version prune age rule (sigbase, dead request configs, cxxdemand) | NEW 2026-09-29 (split from G5) |
 | B2 | PARKED 2026-09-28 after 3 Codex rounds (scratch/b2_parked.patch): p3/cpp-string-literal-template-deduction-and-unspellable-char-args + p3/cpp-std-min-long-and-pointer-arguments-refused. Free-array issue closed (premise disproved, [over.ics.rank]/3.2.1). Restart from master on opus with the narrower design in the issue files | RequestCxxFunctionTemplate argument spelling (CxxStringLiteralSpelling, InferImplicitCxxArgumentType) | NEW. One mechanism: spell array / literal lvalues as `*reinterpret_cast<E (*)[N]>(p)` like the member path (e6c60220); give `long` arithmetic, `char*` and pointer-arithmetic rvalues a C++ spelling |
 | B2b | p2/l-suffix-incoherent-on-llp64 | literal `L` typing vs C++ `long` identity | NEW 2026-09-28 (Windows). Same family as B2 (long spelling); may need a ruling on what `5L` means on LLP64 - ask before starting |
@@ -191,28 +194,28 @@ B3, C1, B4, D1 all touch LLVMBackend_Overloads ctor/argument selection - run the
 A3 share the incremental action. G1 -> G2 -> G3 share the request-cache key. E1 touches
 RequestCxxBraceConstructor, which B2's template spelling calls into - not concurrent with B2.
 
-## Timebox plan (12 h work + 1 h cool-off)
+## Timebox 2026-09-30 - p2 burn-down (10 h: 13:48-23:48, extended +4 h at 16:21; land only from 22:15; handoff scratch/resume_2026-09-30.md)
 
-Caps: 3 codex + 2 claude agents, at most 3 implementers; the 2 extra slots are reviewers / advisors.
-Codex Luna is default (spiked CODEX_OK 2026-09-28). Torch tier only in the main session, -j 1. Fable
-advisor at 3 review rounds. Hours are from the box start.
+Caps: at most 3 implementers (Codex Luna default), 1 reviewer per batch (opus). Torch tier in the
+main session only, -j 1. Fable advisor at 3 review rounds. A lane that frees early pulls the next
+row of the same lane, then a Q filler.
 
-| Window | Lane 1 (Overloads / ctor) | Lane 2 (templates / operators / lifetime) | Lane 3 (infra / records / crash) |
-|--------|---------------------------|-------------------------------------------|----------------------------------|
-| h0 - h3 | C1 (rejections, full) | B2 (template arg spelling, full) | A1 (PushDeclContext; start the Debug build at h0) |
-| h2 - h5 | B4 then D1 (batch) | D2 (operators) | G1 (cache atomicity; main session runs the torch loop) |
-| h4 - h8 | B3 (pointer proof 2b) | B1 (const internally, opus-tier) | A2 (inherited members) |
-| h7 - h10 | P2 phase 0 or F1 | D3 (eigen_04) or E1 | A3 or G2 (batch) or C2 |
-| h10 - h12 | LAND ONLY: no new starts; finish review rounds, rebase, gate, ff-merge | | |
-| h12 - h13 | COOL-OFF: `buildci.sh --nightly` on final master, remove worktrees, remove landed Queue rows, resume notes, memory | | |
+**Windows = regression testing only.** Per landing batch the main session ships the rebased branch
+to felix-7950 as a git bundle, checks it out detached in a dedicated gate worktree
+(`C:\source\cflat-gate`, never `C:\source\MyCompiler`), runs `cmake_build.bat release` +
+`test.bat Release` + `test_example.bat`, and reports. No development or fixing on Windows.
 
-Prep done 2026-09-28: main x64/Release rebuilt at master 60effbe4; Codex spike OK; wave-1 briefs
-scratch/briefs/fixbox_common.md + fix_c1.md / fix_b2.md / fix_a1.md; launcher
-`scratch/briefs/launch_fix.sh <run> <branch>` (c1 fix/ctor-reject, b2 fix/tpl-arg-spell, a1
-fix/late-body-ctx); compile-time baseline scratch/libs_perf_master-60effbe4.log. Budget per landing
-~20-25 min of main-session time (gate + libs_perf), so land in batches, not one by one.
+| Run | Lane | Issues (p2 first) | Shared site | Size |
+|-----|------|-------------------|-------------|------|
+| W3 | 1 | p2/c-header-inline-function-bodies-missing, p2/cpp-import-transitive-syntax-error-hangs (N30) | CxxIncrementalGroup / C harvest | M+S |
+| W4 | 2 | p2/cpp-arm-temp-stored-then-throw-freed-on-unwind (N2), p3/mixed-ternary-bare-new-call-arg-leaks, p3/ternary-arm-address-into-new-temp-leaks-outside-calls, p3/coalesce-nested-ternary-arm-new-verifier-failure (N8), p3/null-safe-member-on-new-temp-leaks, p3/coalesce-result-arrow-member-undefined | FinishTernaryArm / DropRetainedJoinArmPtrTemps (E-type, opus review) | M+5xS |
+| W7 | 2 | p2/byvalue-param-owning-leftovers-after-b13 (N1), THEN p2/alias-return-byvalue-param-leftovers-after-b21 non-ruling items | by-value sink / alias-return ABI - one lane, sequential | L+M |
+| W8 | 3 | DEFERRED (ruling): phase 0 splash hits passing string/shared_ptr/twin fields at all 5 sites - needs relocatability predicate; P2 phase 0 for p2/cpp-struct-list-field-relocated-bitwise | CFlat aggregate lowering | S |
 
-Order within a lane is a default, not a contract: a lane that frees early pulls the next unblocked
-row from the same lane, then from H1 / C2 / F1 (cheap fillers). Rows that do not start move to the next
-box untouched. Main-session review cadence: batch ready branches into one reviewer round
-(feedback-batch-reviews-across-branches), one landing gate per batch.
+Waves: W1 W2 Q1 -> W3 W4 W5 -> W6 W7 W8. Last 2 h land only.
+
+Not in this box: p2/delete-borrow-via-named-local (interprocedural summary, L), p2/unique-field-heap-array-through-move-param (HELD), p2/deref-of-moved-pointer-guard-inside-callee (ruled 2026-07-25 not special-cased - close?), the join-ownership design (p3/owning-view-ternary-mixed-arm-flag + p3/runtime-null-coalesce-new-into-local-leaks), p3/consolidate-named-variable-borrow-provenance (refactor last).
+
+Rulings owed before their rows start: p2/l-suffix-incoherent-on-llp64 (what `5L` is on LLP64), p2/lambda-value-capture-mutation-not-persisted (persist like `mutable`, or reject the write), p2/o2-builtin-folding item 1 (is overriding a libc name supported at -O2), p2/owning-struct-borrowed-deref (`return *o`: refuse or move), p2/alias-return item 6 (type marker or refuse on address-taken).
+
+Windows gate baseline (master d1f0f988, 2026-09-30 14:10): build OK, test.bat Release all passed (80 s), test_example 94/4/42 - the 4 are SSH-env GUI failures (gallery accent, winui_app_demo, winui_demo, winui_gallery); only NEW failures block. Script scratch/win_gate.ps1 (ship `git bundle create x <branch> ^26b8647e`).

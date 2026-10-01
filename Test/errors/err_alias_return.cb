@@ -111,3 +111,99 @@ int aliasParamAcceptSet()
     AliasParamRow r;
     return a(r) + b(&r);
 }
+
+struct AliasReturnProbe
+{
+    unique<int> value = default;
+    int get() { return value.get() == nullptr ? 0 : *value; }
+};
+AliasReturnProbe aliasReturnProbeMake(int value)
+{
+    AliasReturnProbe result;
+    result.value = new int(value);
+    return result;
+}
+AliasReturnProbe aliasReturnProbePick(AliasReturnProbe a, AliasReturnProbe b, bool first)
+{
+    if (first) return a;
+    return b;
+}
+void aliasReturnProbeSink(move AliasReturnProbe value) { }
+
+expect_error("cannot return an 'alias' value 'x'") {
+    AliasReturnProbe aliasReturnLocalPickedNamed()
+    {
+        AliasReturnProbe a = aliasReturnProbeMake(1);
+        AliasReturnProbe x = aliasReturnProbePick(a, aliasReturnProbeMake(3), true);
+        return x;
+    }
+}
+
+expect_error("cannot return an 'alias' value 'x'") {
+    AliasReturnProbe aliasReturnLocalPickedTemp()
+    {
+        AliasReturnProbe a = aliasReturnProbeMake(1);
+        AliasReturnProbe x = aliasReturnProbePick(a, aliasReturnProbeMake(3), false);
+        return x;
+    }
+}
+
+expect_error("cannot 'move' the 'alias' value 'x'") {
+    void aliasReturnMovePickedNamed()
+    {
+        AliasReturnProbe a = aliasReturnProbeMake(1);
+        AliasReturnProbe x = aliasReturnProbePick(a, aliasReturnProbeMake(3), true);
+        aliasReturnProbeSink(move x);
+    }
+}
+
+expect_error("cannot 'move' the 'alias' value 'x'") {
+    void aliasReturnMovePickedTemp()
+    {
+        AliasReturnProbe a = aliasReturnProbeMake(1);
+        AliasReturnProbe x = aliasReturnProbePick(a, aliasReturnProbeMake(3), false);
+        aliasReturnProbeSink(move x);
+    }
+}
+
+expect_error("cannot store an 'alias' value 'x' into an owning variable") {
+    void aliasReturnStoreLocal()
+    {
+        AliasReturnProbe a = aliasReturnProbeMake(1);
+        AliasReturnProbe y = aliasReturnProbeMake(0);
+        AliasReturnProbe x = aliasReturnProbePick(a, aliasReturnProbeMake(3), true);
+        y = x;
+    }
+}
+
+expect_error("cannot store an 'alias' value 'aliasReturnProbePick' into an owning parameter") {
+    void aliasReturnDirectSink()
+    {
+        AliasReturnProbe a = aliasReturnProbeMake(1);
+        aliasReturnProbeSink(aliasReturnProbePick(a, aliasReturnProbeMake(3), true));
+    }
+}
+
+expect_error("cannot store an 'alias' value") {
+    void aliasReturnListSink()
+    {
+        AliasReturnProbe a = aliasReturnProbeMake(1);
+        list<AliasReturnProbe> values;
+        values.add(aliasReturnProbePick(a, aliasReturnProbeMake(3), true));
+    }
+}
+
+struct AliasReturnPicker
+{
+    int k = 0;
+    AliasReturnProbe pick(AliasReturnProbe a, AliasReturnProbe b) { if (k > 0) return a; return b; }
+};
+
+expect_error("cannot store an 'alias' value 'pick' into an owning parameter") {
+    void aliasReturnMethodSink()
+    {
+        AliasReturnProbe a = aliasReturnProbeMake(1);
+        AliasReturnPicker p;
+        aliasReturnProbeSink(p.pick(a, aliasReturnProbeMake(4)));
+    }
+}

@@ -5018,12 +5018,14 @@ void LLVMBackend::ResetForReanalysis()
     uniqueFieldReadJoins_.clear();
     aliasValues_.clear();
     aliasTransferResults_.clear();
+    aliasReturnTempSlots_.clear();
     tempFieldValues_.clear();
     bondedValues_.clear();
     // Keyed by llvm::Function*, which a rebuilt module invalidates.
     DropModuleEscapeMemo();
     poisonedFunctions.clear();
     firstCallLocation_.clear();
+    firstAliasReturnAddressUse_.clear();
     // Holds llvm::Function* into a module a rebuild invalidates.
     tempUniqueFieldArgs_.clear();
     coreUniqueGetterSource_.clear();
