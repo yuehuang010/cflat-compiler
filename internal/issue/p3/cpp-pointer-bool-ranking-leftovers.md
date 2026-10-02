@@ -60,3 +60,14 @@ CFlat-accepted calls when all ranked C++ choices are non-viable.
 
 Keep these cases separate from pointer-to-`void*` versus pointer-to-`bool` ranking. Add focused
 candidate-set and conversion-ranking probes before changing either path.
+
+## Review r3 leftovers (same as master, not regressions)
+
+- Multi-argument sets: an ill-formed candidate can still win. `s6(int*, int)` vs
+  `s6(bool, long)` called `(void*, 1)` picks 1 (clang picks 2). Same with `double*` -> `float*`,
+  `const void*`/`void*` rivals, string literal, member form; ctor form already right. Fix: a
+  candidate holding any non-viable argument loses to any candidate holding none.
+- `el(int*)` / `el(...)` with `void*` now picks the ellipsis like clang, then fails to link on the
+  inline C++ variadic emission gap (item 5 of `p3/cpp-overload-variadic-and-conversion-gaps`).
+- Width-mismatch branch sets the non-viable rank but falls through to `cxxViable = true`; the
+  other two sources leave it false. No pick changes; set false for consistency.

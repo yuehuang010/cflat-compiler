@@ -54,7 +54,10 @@ chain with `git merge-tree` / `commit-tree`, so nothing is checked out until `--
      - put independent topics first.
      Re-run each time; a dry run takes seconds. Two parts are acceptable, a scatter is not.
    - `dead end` / `tree mismatch` means stop and regroup. Never apply a plan that did not
-     report a clean dry run.
+     report a clean dry run. A dead end lists the pending commits (and their groups) it
+     depends on: move those into its group. Typical case: a code commit deletes an issue
+     file a queue commit created, so that queue commit (and the earlier `Queue.md` commits
+     it builds on) must join the code group.
    - Check the remap: `git diff master <new tip> | grep '^[-+]' | head`. Only hash text should
      change. Several references collapsing onto one grouped hash is expected.
 

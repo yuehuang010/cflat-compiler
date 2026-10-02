@@ -1,6 +1,6 @@
 # `p.get()` on std::unique_ptr<M> calls M::get through the pointer when M has a get() member
 
-Found by the ST8 review (2026-10-01), pre-existing on master 1dddd1b9. Repro kept in
+Found by the ST8 review (2026-10-01), pre-existing on master 1cfe8a3b. Repro kept in
 scratch/repro_keep/st8_preexisting/unique_null_collision.cb (rv.h: struct M has `int get()`).
 
 ```cflat

@@ -40,11 +40,41 @@ def pick(base, c):
     return MEMO[(base, c)]
 
 
+def patch_id(a, b):
+    d = git("diff", "-U0", "--binary", "--full-index", a, b).stdout
+    return out("patch-id", "--stable", inp=d) if d else ""
+
+
 def pick_uncached(base, c):
     r = git("merge-tree", "--write-tree", "--merge-base=" + c + "^", base, c, check=False)
     if r.returncode != 0:
         return None
-    return out("commit-tree", r.stdout.split()[0], "-p", base, "-m", "tmp " + c)
+    new = out("commit-tree", r.stdout.split()[0], "-p", base, "-m", "tmp " + c)
+    # A clean merge can still drop part of c (deleting a file base never had merges as
+    # "both deleted"), so the replay must reproduce c's exact change or it is a conflict.
+    if patch_id(base, new).split()[:1] != patch_id(c + "^", c).split()[:1]:
+        return None
+    return new
+
+
+def files(c):
+    return set(out("diff-tree", "--no-commit-id", "--name-only", "-r", c + "^", c).splitlines())
+
+
+def blockers(c, groups, rest, later=False):
+    """Commits in other groups that touch the files c touches: earlier ones still pending, or
+    (later=True) later ones already replayed ahead of c."""
+    mine = files(c)
+    hits = []
+    for g in groups:
+        if c in rest[id(g)]:
+            continue
+        for o in rest[id(g)]:
+            if (ORDER[o] > ORDER[c]) == later:
+                common = mine & files(o)
+                if common:
+                    hits.append("  %s [%s] %s" % (o[:8], g["title"][:40], ", ".join(sorted(common)[:3])))
+    return "\n".join(hits) or "  (none found: c conflicts with already emitted content)"
 
 
 def schedule(base, groups):
@@ -76,7 +106,8 @@ def schedule(base, groups):
                 best = (g, n, b)
         if best is None:
             first = min((c for g in body for c in rest[id(g)]), key=ORDER.get)
-            sys.exit("dead end: %s conflicts on every schedule; regroup it" % first[:8])
+            sys.exit("dead end: %s conflicts on every schedule; regroup it. It depends on:\n%s"
+                     % (first[:8], blockers(first, groups, rest)))
         g, n, base = best
         chunks.append((g, rest[id(g)][:n], base))
         rest[id(g)] = rest[id(g)][n:]
@@ -84,7 +115,9 @@ def schedule(base, groups):
         if g.get("bookkeeping"):
             n, b = prefix(base, g["commits"])
             if n != len(g["commits"]):
-                sys.exit("bookkeeping group conflicts at the end of the chain")
+                c = g["commits"][n]
+                sys.exit("bookkeeping commit %s conflicts at the end of the chain; later commits replayed ahead of it:\n%s"
+                         % (c[:8], blockers(c, groups, {id(x): x["commits"] for x in groups}, True)))
             chunks.append((g, g["commits"], b))
     total = {}
     for g, _, _ in chunks:

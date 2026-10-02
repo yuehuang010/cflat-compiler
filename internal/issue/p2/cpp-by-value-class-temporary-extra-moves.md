@@ -53,3 +53,7 @@ Owner prvalue (still refused with deleted-constructor). Both need the wrapper to
 prvalue's constructor ARGUMENTS and write `take(T(p0, ...))` itself; the caller currently emits the
 temporary's constructor call before the wrapper is requested, so the construction would have to be
 deferred (or re-derived from the argument expression, as `ForeignCxxConstructArgs` does for locals).
+
+Also (N67 review): a prvalue of a class with a DELETED move ctor (`r2.take(r2.DelMove(4))`) is refused
+on master and branch; clang accepts via guaranteed elision. Same root as above (wrapper must build the
+temporary itself).

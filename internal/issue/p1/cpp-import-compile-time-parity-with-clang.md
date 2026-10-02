@@ -214,6 +214,8 @@ Dropped, do not retry as-is (reports in scratch/repro_keep/<id>/):
 - D3 request prologue reuse: no gain.
 - D7 stage-1 request batching: the gain was truncated payloads.
 - D9 registration without special-member completion: breaks lifetime diagnostics.
+- PF4 (2026-10-02) deferring json_01's candidate-only requests (json_pointer<string> x1, pair<const string, json> x3, initializer_list<json_ref> x9): the first two come from member-signature projection, initializer_list also feeds conversion ranking; needs a signature-only candidate path (same N37 blocker as D4). Negative spike, no change (scratch/repro_keep/pf4).
+- PF5 (2026-10-02) torch_06/torch_07 1.13-1.14x: no case-specific CFlat phase; import + codegen match torch_05, the gap is 30-50 ms CFlat-codegen-to-backend plus run-to-run noise (torch_05 measured 1.01x then 1.09x). No change (scratch/repro_keep/pf5).
 D4 lazy declarations is shelved (see idea 2). D5 and F2 were profile-only.
 
 Remaining ideas, ranked:

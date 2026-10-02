@@ -1,6 +1,6 @@
 # Global C++ class variable initialized from a C++ call result crashes the compiler
 
-Found by the ST8 review (2026-10-01), pre-existing on master 1dddd1b9. Repro kept in
+Found by the ST8 review (2026-10-01), pre-existing on master 1cfe8a3b. Repro kept in
 scratch/repro_keep/st8_preexisting/ (rv.h + global_init.cb / global_auto.cb).
 
 ```cflat
