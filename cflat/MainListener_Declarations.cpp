@@ -553,7 +553,10 @@ std::string MainListener::EncodePlainFunctionTypeCodegen(
                 p.ResolvedTypeKey = SigComponentResolvedKey(p.TypeName);
                 sig.FuncPtrParams.push_back(p);
             }
-        return EncodeClosureFromSig(Compiler(fnSpec), sig);
+        std::string encoded = EncodeClosureFromSig(Compiler(fnSpec), sig);
+        encoded.replace(0, 3, "barefn");
+        Compiler(fnSpec)->RegisterEncodedClosureType(encoded, sig);
+        return encoded;
     }
 
 std::string MainListener::EncodeClosureFromSig(LLVMBackend* compiler, const LLVMBackend::TypeAndValue& sig) {
@@ -4156,31 +4159,57 @@ CFlatParser::ArgumentExpressionListContext* MainListener::ForeignCxxConstructArg
         if (Compiler(pf)->ResolveTypeAlias(callee) == typeName) return args[0];
         // A C++ CLASS TEMPLATE is REGISTERED under its mangled generic name, while the ctor call
         // is spelled with CFlat's angle syntax (`cppt.Box<int>(7)`). Re-mangle the spelling to
-        // compare identities. Nested angle arguments are left to the ordinary diagnostic.
+        // compare identities.
         if (auto lt = callee.find('<');
-            lt != std::string::npos && callee.size() > lt + 1 && callee.back() == '>'
-            && callee.find('<', lt + 1) == std::string::npos)
+            lt != std::string::npos && callee.size() > lt + 1 && callee.back() == '>')
         {
-            std::string base = callee.substr(0, lt);
+            auto* compiler = Compiler(pf);
+            const std::string base = callee.substr(0, lt);
             // `<>` on a plain class: leave it to the call path, which refuses it.
-            if (callee.size() == lt + 2
-                && !Compiler(pf)->IsCxxTemplateSpecializationOf(typeName, base))
+            if (callee.size() == lt + 2 && !compiler->IsCxxTemplateSpecializationOf(typeName, base))
                 return nullptr;
-            // Function-type arguments use the registered CFlat specialization identity.
-            if (base == MangledBase(typeName)) return args[0];
-            std::string inner = callee.substr(lt + 1, callee.size() - lt - 2);
-            std::vector<std::string> targs;
-            size_t start = 0;
-            while (start <= inner.size())
+            auto memberParams = pf->genericTypeParameters();
+            CFlatParser::GenericTypeParametersContext* params = !memberParams.empty()
+                ? memberParams.back() : nullptr;
+            if (params == nullptr && pf->primaryExpression() != nullptr
+                && pf->primaryExpression()->genericIdentifier() != nullptr)
+                params = pf->primaryExpression()->genericIdentifier()->genericTypeParameters();
+            if (params != nullptr && params->typeParameterList() != nullptr)
             {
-                size_t comma = inner.find(',', start);
-                std::string one = inner.substr(start, comma == std::string::npos
-                                                      ? std::string::npos : comma - start);
-                targs.push_back(one);
-                if (comma == std::string::npos) break;
-                start = comma + 1;
+                // Resolve each written argument as a type (nested ones included) and compare
+                // identities, so `T x = T(args)` is constructed in place like clang does.
+                std::vector<std::string> targs;
+                for (auto* entry : params->typeParameterList()->typeParameterEntry())
+                    targs.push_back(ResolveTypeArgEntry(entry));
+                const std::string written = MangleGenericInstance(*compiler, base, targs);
+                if (written == typeName) return args[0];
+                // Two CFlat spellings of ONE C++ specialization (a defaulted template argument
+                // omitted in one, written in the other) agree on clang's canonical spelling.
+                // Request the written spelling of the same template first (the initializer would
+                // request it next anyway): a second spelling of a known specialization registers as
+                // an alias of it.
+                if (base == MangledBase(typeName) && compiler->HasCxxImportGroup()
+                    && !compiler->IsCxxForeignTypeRegistered(written)
+                    && compiler->ResolveTypeAlias(written) == written)
+                {
+                    std::string ignored;   // reported by the initializer's own request
+                    compiler->TryRequestCxxType(base, targs, written, ignored);
+                }
+                if (compiler->ResolveTypeAlias(written) == typeName) return args[0];
+                const std::string writtenCanonical = compiler->CxxRecordCanonicalSpelling(
+                    compiler->ResolveTypeAlias(written));
+                const std::string declaredCanonical = compiler->CxxRecordCanonicalSpelling(typeName);
+                if (!writtenCanonical.empty() && writtenCanonical == declaredCanonical)
+                    return args[0];
+                // Another specialization of the same template (master behaviour, ruling 2026-10-02):
+                // build the declared type in place from the args. The ordinary path cannot reach a
+                // constrained converting ctor template (std.optional<i64> = std.optional<int>(3));
+                // the missing-converting-ctor refusal is a filed p2. Nested angle arguments keep
+                // the ordinary path, as on master.
+                if (callee.find('<', lt + 1) != std::string::npos) return nullptr;
             }
-            if (MangleGenericInstance(*Compiler(pf), base, targs) == typeName) return args[0];
+            // Identity not provable from registered records: the template name decides.
+            if (base == MangledBase(typeName)) return args[0];
         }
         // `using ns;` lets the class be named without its namespace, so the trailing component
         // of the registered dotted name is an equally valid spelling of the same type.

@@ -1228,6 +1228,12 @@ bool testCaptureNameCollidesWithFunction()
 // Regression: capturing a local T arr[N] by reference must store T* in the closure
 // (element pointer), not [N x T]*.  Wrong type caused GEP to stride by N*sizeof(T)
 // instead of sizeof(T), so arr[1], arr[2], etc. read from garbage addresses.
+int lamArrItemDtors = 0;
+struct LamArrItem { string text = default; ~LamArrItem() { lamArrItemDtors++; } };
+struct Pt { int x = 0; };
+int closureBufDtors = 0;
+struct Buf { int* p = nullptr; ~Buf() { closureBufDtors++; if (p != nullptr) delete p; } };
+
 bool testCaptureLocalArray()
 {
     bool result = true;
@@ -1247,6 +1253,57 @@ bool testCaptureLocalArray()
         i++;
     }
     result &= Test("capture array sum", acc.value, 60);
+
+    // Strings are captured by value. Copying the closure deep-copies each element;
+    // moving transfers the elements and leaves the source environment moved-from.
+    {
+        string[2] a = { "abcdefghijklmnopqrstuvwxyz0123456789ab", "second" };
+        Lambda<int(int)> f = (int i) => { return a[i].length(); };
+        Lambda<int(int)> g = f;
+        result &= Test("capture owning string array source", f(0), 38);
+        result &= Test("capture owning string array copy", g(0), 38);
+        Lambda<int(int)> h = move f;
+        result &= Test("capture owning string array move", h(0), 38);
+    }
+
+    // Struct arrays follow reference capture, including structs with owning fields.
+    lamArrItemDtors = 0;
+    {
+        LamArrItem[2] items = default;
+        items[0].text = "abcdefghijklmnopqrstuvwxyz0123456789ab";
+        items[1].text = "second";
+        Lambda<int(int)> f = (int i) => { return items[i].text.length(); };
+        Lambda<int(int)> g = f;
+        result &= Test("capture struct array source", f(0), 38);
+        result &= Test("capture struct array copy", g(0), 38);
+        Lambda<void()> mutate = () => { items[1].text = "changed"; };
+        mutate();
+        result &= Test("capture owning struct array write-through", items[1].text.length(), 7);
+        Lambda<int(int)> h = move f;
+        result &= Test("capture struct array move", h(0), 38);
+    }
+    result &= Test("capture struct array elements destroyed", lamArrItemDtors, 2);
+
+    // Trivial struct arrays stay by-reference, so writes made by a closure are visible outside.
+    {
+        Pt[2] a = default;
+        Lambda<void()> write = () => { a[0].x = 5; };
+        write();
+        a[1].x = 7;
+        Lambda<int()> read = () => { return a[1].x; };
+        result &= Test("capture trivial struct array write-through", a[0].x * 10 + read(), 57);
+    }
+
+    // A destructor-backed struct array with a raw pointer must remain borrowed by the closure.
+    closureBufDtors = 0;
+    int bufResult = 0;
+    {
+        Buf[2] b = default;
+        b[0].p = new int(4);
+        Lambda<int()> read = () => { return *b[0].p; };
+        bufResult = read() + read();
+    }
+    result &= Test("capture raw-pointer struct array cleanup", bufResult * 10 + closureBufDtors, 82);
 
     return result;
 }
@@ -2569,6 +2626,41 @@ int sigPick(function<int(int)> f)    { return 100 + f(5); }
 int sigPick(double d)                { return 200 + (int)d; }
 
 int add10FnPtr(int x)                { return x + 10; }
+
+int n65OverloadedDeleteCount = 0;
+void n65OverloadedDelete(int value) { n65OverloadedDeleteCount += 100; }
+void n65OverloadedDelete(move int* value)
+{
+    delete value;
+    n65OverloadedDeleteCount += 1;
+}
+function<void(int*)> n65GetOverloadedDelete()
+{
+    return n65OverloadedDelete;
+}
+int n65CallFunctionPointer(int* value, function<void(int*)> callback)
+{
+    callback(value);
+    return n65OverloadedDeleteCount;
+}
+
+bool testOverloadedFunctionPointerArgument()
+{
+    n65OverloadedDeleteCount = 0;
+    if (n65CallFunctionPointer(new int(1), n65OverloadedDelete) != 1)
+        return false;
+
+    n65OverloadedDeleteCount = 0;
+    function<void(int*)> callback = n65OverloadedDelete;
+    callback(new int(1));
+    if (n65OverloadedDeleteCount != 1)
+        return false;
+
+    n65OverloadedDeleteCount = 0;
+    function<void(int*)> returned = n65GetOverloadedDelete();
+    returned(new int(1));
+    return n65OverloadedDeleteCount == 1;
+}
 
 // Signature EQUIVALENCE across spellings. The compiler treats int/i32, long/i64 and any two
 // pointer types as one type, so a differing SPELLING is not evidence of a differing type and
@@ -5015,6 +5107,7 @@ extern int main(int argc, char** argv)
 
     // Function-pointer argument provenance / signature gating: legal spellings still bind
     total++; passed += testFuncPtrArgProvenanceAccepts()  ? 1 : 0;
+    total++; passed += testOverloadedFunctionPointerArgument() ? 1 : 0;
 
     // Accept set for the shape-mismatch gate (fix/shape-arg): array->pointer decay, an array
     // element (shape 0), nullptr into pointer/view, and two-arm shape ranking stay legal.

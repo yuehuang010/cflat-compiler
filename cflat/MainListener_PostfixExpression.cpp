@@ -8632,15 +8632,18 @@ LLVMBackend::NamedVariable MainListener::ParseLambdaExpression(CFlatParser::Lamb
         // A by-value capture of an owning value type is DEEP-COPIED into the env, which then OWNS
         // it (its cleanup fn frees it exactly once); the invoker's unpacked local only BORROWS it.
         // Both the deep-copy-at-store and the borrow-in-body decisions key off this one predicate.
-        // Only 'string' and a captured lambda reach here now (everything else is reference-captured
-        // above); the deep copy goes through the type's own copy(). A nested closure IS deep-copyable
+        // Strings, owning fixed arrays, and captured lambdas reach this path. A nested closure IS deep-copyable
         // via `__closure_fat_ptr.copy` (env clone), so its captured inner env has an independent
         // lifetime and does not dangle once the inner closure's scope closes; the invoker's unpacked
         // capture is marked IsAliasBorrow, which the indirect-call result path clears so the borrow
         // does not leak onto the closure's call results.
         auto isOwningCap = [&](const CaptureInfo& cap) -> bool {
             if (cap.ByReference || cap.IsThis) return false;
-            if (cap.TV.Pointer || cap.TV.ConstArraySize > 0) return false;
+            if (cap.TV.Pointer) return false;
+            if (cap.TV.ConstArraySize > 0)
+                return cap.TV.TypeName == "string"
+                    || (cap.TV.TypeName == "__closure_fat_ptr"
+                        && compiler->ClosureCaptureDeepCopyable(cap.TV.TypeName));
             if (cap.TV.TypeName == "string") return true;
             return compiler->ClosureCaptureDeepCopyable(cap.TV.TypeName);
         };
@@ -8719,12 +8722,40 @@ LLVMBackend::NamedVariable MainListener::ParseLambdaExpression(CFlatParser::Lamb
                 {
                     // Deep-copy the owning value into the env so it has independent lifetime
                     // (the cleanup fn frees this copy; the source keeps its own).
-                    LLVMBackend::NamedVariable srcNV;
-                    srcNV.Storage  = captures[i].OuterStorage;
-                    srcNV.BaseType = compiler->GetType(captures[i].TV);
-                    srcNV.TypeAndValue.TypeName = captures[i].TV.TypeName;
-                    if (auto* copied = compiler->CreateOverloadedFunctionCall("copy", { srcNV }))
-                        compiler->builder->CreateStore(copied, fieldGEP);
+                    if (captures[i].TV.ConstArraySize > 0)
+                    {
+                        llvm::Type* elemTy = nullptr;
+                        uint64_t count = compiler->PeelFixedArrayType(
+                            compiler->GetType(captures[i].TV), elemTy);
+                        auto* elemPtrTy = cflat_llvm::PointerTo(elemTy);
+                        auto* srcBase = compiler->builder->CreateBitCast(captures[i].OuterStorage,
+                            elemPtrTy, "closure.arr.src");
+                        auto* dstBase = compiler->builder->CreateBitCast(fieldGEP,
+                            elemPtrTy, "closure.arr.dst");
+                        for (uint64_t elem = 0; elem < count; ++elem)
+                        {
+                            auto* index = compiler->builder->getInt64(elem);
+                            auto* srcElem = compiler->builder->CreateInBoundsGEP(elemTy, srcBase,
+                                { index }, "closure.arr.src.elem");
+                            auto* dstElem = compiler->builder->CreateInBoundsGEP(elemTy, dstBase,
+                                { index }, "closure.arr.dst.elem");
+                            LLVMBackend::NamedVariable srcNV;
+                            srcNV.Storage = srcElem;
+                            srcNV.BaseType = elemTy;
+                            srcNV.TypeAndValue.TypeName = captures[i].TV.TypeName;
+                            if (auto* copied = compiler->CreateOverloadedFunctionCall("copy", { srcNV }))
+                                compiler->builder->CreateStore(copied, dstElem);
+                        }
+                    }
+                    else
+                    {
+                        LLVMBackend::NamedVariable srcNV;
+                        srcNV.Storage  = captures[i].OuterStorage;
+                        srcNV.BaseType = compiler->GetType(captures[i].TV);
+                        srcNV.TypeAndValue.TypeName = captures[i].TV.TypeName;
+                        if (auto* copied = compiler->CreateOverloadedFunctionCall("copy", { srcNV }))
+                            compiler->builder->CreateStore(copied, fieldGEP);
+                    }
                 }
                 else
                 {

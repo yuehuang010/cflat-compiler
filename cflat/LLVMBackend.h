@@ -6187,6 +6187,8 @@ private:
     std::string StdFunctionSpecializationForSpelling(const std::string& spelling,
                                                      std::string* requestError = nullptr);
     bool CxxSpellingForCflatType(const std::string& cflatType, std::string& out) const;
+    bool CxxTemplateArgSpellingForCflatType(const std::string& cflatType,
+                                             std::string& out) const;
 
     // The operand's DECLARED primitive name, for an argument whose machine type cannot recover
     // its C++ identity (i8 is `char` or `i8`, i32 is `int` or `wchar`, i64 is `long` or `i64`).
@@ -8751,6 +8753,13 @@ public:
         std::vector<Structor> moveAssignOverloads;
     };
     std::unordered_map<std::string, std::string> cxxConstructorBodyRefusals_;
+    // Clang's canonical spelling of a registered C++ record (`struct ns::C<int, void (*)(int *)>`);
+    // empty when the name is not a registered record. Equal spellings = one C++ type.
+    std::string CxxRecordCanonicalSpelling(const std::string& typeName) const
+    {
+        auto it = cxxRecordEntries_.find(typeName);
+        return it == cxxRecordEntries_.end() ? std::string() : it->second.canonicalCtype;
+    }
     const CxxClassInfo* GetCxxClassInfo(const std::string& typeName) const
     {
         if (pendingCxxRecordProjections_.count(typeName) != 0)
@@ -9892,6 +9901,10 @@ public:
      * EVERY overload of the name to be provably different, because one that could bind is a
      * legitimate reading of the call. An unregistered name proves nothing.
      */
+    // The overload of a named function whose signature binds a C++ function-pointer parameter;
+    // nullptr when the name is not a function or no overload matches. Selection and lowering share it.
+    const FunctionSymbol* NamedFunctionOverloadForFuncPtr(const std::string& functionName,
+                                                          const TypeAndValue& param) const;
     bool NamedFunctionProvablyMismatchesFuncPtr(const std::string& functionName,
         const TypeAndValue& param) const;
 
@@ -10022,9 +10035,11 @@ public:
      * where C++ provably accepts the binding whatever CFlat's own call rules say.
      */
     static constexpr int kCxxEllipsisRank = 4;
+    static constexpr int kCxxNonViableRank = 5;
     struct CxxConversionRank
     {
         int rank = -1;
+        bool boolConversion = false;
         std::string userFunction;
         int second = 0;
         bool cxxViable = false;
@@ -11359,7 +11374,8 @@ public:
     // 176: a C++ request prelude skips an include of a header the group already included
     //      (resolved file identity), so the extracted prelude roots differ.
     // 177: header content hashes are xxh3 instead of byte-loop FNV-1a.
-    static constexpr int kCHeaderCacheVersion = 177;
+    // 178: function<> template arguments use C++ function-pointer spelling.
+    static constexpr int kCHeaderCacheVersion = 178;
     static std::string CompilerBuildStamp();
     // THE switch for "the compiler build is part of cache entry validity": header/request
     // entries record and check "cstamp", and demand companion keys fold the stamp. OFF by

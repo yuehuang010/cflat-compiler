@@ -250,7 +250,8 @@ void ParseClosureCandidates(const LLVMBackend& compiler, std::string_view text,
     size_t baseEnd = text.find('$', start);
     std::string_view base = baseEnd == std::string_view::npos
         ? text.substr(start) : text.substr(start, baseEnd - start);
-    bool thin = base == "cfn";
+    bool thin = base == "cfn" || base == "barefn";
+    bool bareFunction = base == "barefn";
     if (!thin && base != "fatfn") return;
     if (baseEnd == std::string_view::npos) return;
 
@@ -306,6 +307,7 @@ void ParseClosureCandidates(const LLVMBackend& compiler, std::string_view text,
         closure.base = thin ? "function" : "Lambda";
         closure.closure = true;
         closure.thinClosure = thin;
+        closure.bareFunction = bareFunction;
         closure.args = std::move(partial.components);
         AddTypeCandidate(std::move(closure), partial.position, prefix, out);
     }
@@ -499,7 +501,8 @@ std::string PrintTypeSpelling(const LLVMBackend& compiler, const TypeSpelling& s
 {
     if (spelling.closure)
     {
-        std::string result = spelling.thinClosure ? "function<" : "Lambda<";
+        std::string result = spelling.bareFunction ? "" :
+            spelling.thinClosure ? "function<" : "Lambda<";
         if (!spelling.args.empty())
         {
             result += PrintTypeSpelling(compiler, spelling.args.front()) + "(";
@@ -509,10 +512,10 @@ std::string PrintTypeSpelling(const LLVMBackend& compiler, const TypeSpelling& s
                 if (spelling.args[i].move) result += "move ";
                 result += PrintTypeSpelling(compiler, spelling.args[i]);
             }
-            result += ")>";
+            result += spelling.bareFunction ? ")" : ")>";
         }
         else
-            result += ")>";
+            result += spelling.bareFunction ? ")" : ")>";
         result += std::string(std::max(spelling.pointerDepth, 0), '*');
         if (spelling.view) result += "[]";
         return result;
@@ -530,7 +533,9 @@ std::string PrintTypeSpelling(const LLVMBackend& compiler, const TypeSpelling& s
         && spelling.args.front().pointerDepth <= 0 && !spelling.args.front().view)
     {
         const std::string callable = PrintTypeSpelling(compiler, spelling.args.front());
-        result += callable.substr(std::string("function").size());
+        result += spelling.args.front().bareFunction
+            ? "<" + callable + ">"
+            : callable.substr(std::string("function").size());
     }
     else if (!spelling.args.empty())
     {
@@ -561,7 +566,8 @@ std::string RemangleTypeSpelling(const LLVMBackend& compiler, const TypeSpelling
             ? result + ".n" + spelling.base.substr(1) : result + "." + spelling.base;
     if (spelling.closure)
     {
-        result += spelling.thinClosure ? "cfn" : "fatfn";
+        result += spelling.bareFunction ? "barefn"
+            : spelling.thinClosure ? "cfn" : "fatfn";
         size_t parameterCount = spelling.args.empty() ? 0 : spelling.args.size() - 1;
         result += "$." + std::to_string(parameterCount);
         if (!spelling.args.empty())

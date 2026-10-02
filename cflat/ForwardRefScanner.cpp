@@ -1363,7 +1363,10 @@ std::string ForwardRefScanner::EncodePlainFunctionTypeScanner(
                 p.IsMove = param->Move() != nullptr;
                 sig.FuncPtrParams.push_back(p);
             }
-        return MainListener::EncodeClosureFromSig(compilerLLVM, sig);
+        std::string encoded = MainListener::EncodeClosureFromSig(compilerLLVM, sig);
+        encoded.replace(0, 3, "barefn");
+        compilerLLVM->RegisterEncodedClosureType(encoded, sig);
+        return encoded;
     }
 
 std::optional<int64_t> ForwardRefScanner::ScannerFoldIfConst(antlr4::tree::ParseTree* node) {

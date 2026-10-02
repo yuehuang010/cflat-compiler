@@ -18,6 +18,7 @@ struct TypeSpelling
     bool value = false;
     bool closure = false;
     bool thinClosure = false;
+    bool bareFunction = false;
     bool move = false;
     std::string encodedName;
 };

@@ -24,6 +24,9 @@
 
 namespace cppt
 {
+    using N65Fn = void (*)(int*);
+    inline void n65_call_overloaded_fn(int* value, N65Fn callback) { callback(value); }
+
     inline int constref_string_param(std::string *const &p)
     { return (int)p->size() * 10 + 5; }
 
@@ -964,6 +967,99 @@ namespace cppt
         return std::make_unique<Loader<Dataset, Sampler>>(
             std::move(dataset), Sampler(batch_count));
     }
+
+    // By-value class parameter counters (N67): constructions, copies, moves, destructions.
+    inline int pv_c = 0, pv_cp = 0, pv_mv = 0, pv_d = 0;
+    inline void pv_reset() { pv_c = pv_cp = pv_mv = pv_d = 0; }
+    template <class T, class F = void (*)(int*)>
+    struct PvCount
+    {
+        int value;
+        PvCount(int v) : value(v) { ++pv_c; }
+        PvCount(const PvCount& x) : value(x.value) { ++pv_cp; }
+        PvCount(PvCount&& x) : value(x.value) { ++pv_mv; }
+        ~PvCount() { ++pv_d; }
+    };
+    template <class T, class F>
+    int pv_take(PvCount<T, F> x) { return x.value; }
+}
+
+namespace ptrbool
+{
+    inline int vbool(void*) { return 30; }
+    inline int vbool(bool) { return 20; }
+    inline int tbool(int*) { return 40; }
+    inline int tbool(bool) { return 20; }
+    inline int all(int*) { return 40; }
+    inline int all(void*) { return 30; }
+    inline int all(bool) { return 20; }
+    template <class T> inline int templ(T*) { return 40; }
+    inline int templ(void*) { return 30; }
+    inline int templ(bool) { return 20; }
+    template <class T> inline int nilset(T*) { return 40; }
+    inline int nilset(void*) { return 30; }
+    inline int nilset(bool) { return 20; }
+    inline int nilset(std::nullptr_t) { return 10; }
+    inline int text(const char*) { return 50; }
+    inline int text(char*) { return 60; }
+    inline int text(bool) { return 20; }
+    inline int n2(std::nullptr_t) { return 5; }
+    inline int n2(bool) { return 3; }
+    inline int n2(void*) { return 2; }
+
+    struct Member
+    {
+        int v(void*) { return 30; }
+        int v(bool) { return 20; }
+        int t(int*) { return 40; }
+        int t(bool) { return 20; }
+        int n2(std::nullptr_t) { return 5; }
+        int n2(bool) { return 3; }
+        int n2(void*) { return 2; }
+    };
+    struct Ctor
+    {
+        int value;
+        Ctor(void*) : value(30) {}
+        Ctor(bool) : value(20) {}
+    };
+    struct TConstructor
+    {
+        int value;
+        TConstructor(int*) : value(40) {}
+        TConstructor(bool) : value(20) {}
+    };
+    struct MatrixMember
+    {
+        int pick(int*) { return 40; }
+        int pick(void*) { return 30; }
+        int pick(bool) { return 20; }
+        template <class T> int templ(T*) { return 40; }
+        int templ(void*) { return 30; }
+        int templ(bool) { return 20; }
+    };
+    struct MatrixCtor
+    {
+        int value;
+        MatrixCtor(int*) : value(40) {}
+        MatrixCtor(void*) : value(30) {}
+        MatrixCtor(bool) : value(20) {}
+        MatrixCtor(std::nullptr_t) : value(10) {}
+    };
+    struct TemplateCtor
+    {
+        int value;
+        template <class T> TemplateCtor(T*) : value(40) {}
+        TemplateCtor(void*) : value(30) {}
+        TemplateCtor(bool) : value(20) {}
+        TemplateCtor(std::nullptr_t) : value(10) {}
+    };
+}
+
+namespace td
+{
+    inline int sz(std::size_t*) { return 1; }
+    inline int sl(long*) { return 2; }
 }
 
 namespace cppi_crtp

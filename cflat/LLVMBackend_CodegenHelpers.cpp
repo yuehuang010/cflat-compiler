@@ -2416,7 +2416,19 @@ llvm::Function* LLVMBackend::GenerateClosureCaptureCleanup(const std::string& na
                     builder->CreateStore(moved, builder->CreateStructGEP(fieldTy, dstField, 1));
                     continue;
                 }
-                builder->CreateStore(llvm::Constant::getNullValue(fieldTy), srcField);
+                if (auto* arrayTy = llvm::dyn_cast<llvm::ArrayType>(fieldTy))
+                {
+                    llvm::Type* elemTy = nullptr;
+                    uint64_t count = PeelFixedArrayType(arrayTy, elemTy);
+                    auto* elems = builder->CreateBitCast(srcField, cflat_llvm::PointerTo(elemTy),
+                                                          "move.arr.elems");
+                    EmitFixedArrayElementWalk(*builder, elems, elemTy, count,
+                        [&](llvm::Value* elemPtr) {
+                            builder->CreateStore(llvm::Constant::getNullValue(elemTy), elemPtr);
+                        });
+                }
+                else
+                    builder->CreateStore(llvm::Constant::getNullValue(fieldTy), srcField);
             }
             builder->CreateRetVoid();
         }
@@ -2431,8 +2443,29 @@ llvm::Function* LLVMBackend::GenerateClosureCaptureCleanup(const std::string& na
             argNV.Storage  = builder->CreateStructGEP(capTy, srcCaps, idx);
             argNV.BaseType = capTy->getElementType(idx);
             argNV.TypeAndValue.TypeName = tn;
-            if (auto* copied = CreateOverloadedFunctionCall("copy", { argNV }))
-                builder->CreateStore(copied, builder->CreateStructGEP(capTy, dstCaps, idx));
+            auto* dstField = builder->CreateStructGEP(capTy, dstCaps, idx);
+            if (auto* arrayTy = llvm::dyn_cast<llvm::ArrayType>(argNV.BaseType))
+            {
+                llvm::Type* elemTy = nullptr;
+                uint64_t count = PeelFixedArrayType(arrayTy, elemTy);
+                auto* srcElems = builder->CreateBitCast(argNV.Storage,
+                    cflat_llvm::PointerTo(elemTy), "clone.arr.src");
+                auto* dstElems = builder->CreateBitCast(dstField,
+                    cflat_llvm::PointerTo(elemTy), "clone.arr.dst");
+                EmitFixedArrayElementWalk(*builder, srcElems, elemTy, count,
+                    [&](llvm::Value* srcElem, llvm::Value* index) {
+                        auto* dstElem = builder->CreateInBoundsGEP(elemTy, dstElems,
+                            { index }, "clone.arr.elem");
+                        NamedVariable elemNV;
+                        elemNV.Storage = srcElem;
+                        elemNV.BaseType = elemTy;
+                        elemNV.TypeAndValue.TypeName = tn;
+                        if (auto* copied = CreateOverloadedFunctionCall("copy", { elemNV }))
+                            builder->CreateStore(copied, dstElem);
+                    });
+            }
+            else if (auto* copied = CreateOverloadedFunctionCall("copy", { argNV }))
+                builder->CreateStore(copied, dstField);
         }
         builder->CreateRetVoid();
 
@@ -2441,7 +2474,10 @@ llvm::Function* LLVMBackend::GenerateClosureCaptureCleanup(const std::string& na
         for (const auto& [idx, tn] : owningFields)
         {
             auto* fldPtr = builder->CreateStructGEP(capTy, dstCaps, idx);
-            if (auto* dtor = GetOrCreateFullDestructor(tn))
+            if (llvm::isa<llvm::ArrayType>(capTy->getElementType(idx)))
+                EmitFullDestructorOverStorage(*builder, fldPtr, capTy->getElementType(idx),
+                    GetOrCreateFullDestructor(tn));
+            else if (auto* dtor = GetOrCreateFullDestructor(tn))
                 builder->CreateCall(dtor->getFunctionType(), dtor,
                     { builder->CreateBitCast(fldPtr, dtor->getArg(0)->getType()) });
         }

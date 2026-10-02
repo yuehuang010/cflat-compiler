@@ -1336,6 +1336,19 @@ llvm::Value* LLVMBackend::CoerceToFuncPtrReturn(llvm::Value* val, const TypeAndV
         const NamedVariable& returnNV)
 {
         bool valIsStruct = val->getType()->isStructTy();   // fat closure value
+        // A bare overloaded function already has a provisional first symbol in `val`. Select it
+        // against the declared return signature before applying function-pointer safety checks.
+        if (llvm::isa<llvm::Function>(val) && !returnNV.CallerName.empty())
+        {
+            auto overloads = functionTable.find(ResolveQualifiedName(returnNV.CallerName));
+            if (overloads != functionTable.end() && overloads->second.size() > 1)
+            {
+                int expectedCount = (int)retTV.FuncPtrParams.size();
+                if (auto* correctFn = GetFunctionForFuncPtr(returnNV.CallerName, expectedCount,
+                        &retTV.FuncPtrParams, &retTV))
+                    val = correctFn;
+            }
+        }
         // Same alias-param door as the declaration and argument sites: a named function whose
         // by-value `alias` param rides a reference ABI has no function-pointer spelling.
         if (auto* fnVal = llvm::dyn_cast<llvm::Function>(val))

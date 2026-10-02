@@ -211,6 +211,11 @@ llvm::Type* LLVMBackend::GetType(const LLVMBackend::TypeAndValue& typeAndValue, 
             llvm::Type* fnPtrType = typeAndValue.IsThinFnPtr()
                 ? BuildThinFnPtrType(typeAndValue)
                 : GetClosureFatPtrType();
+            // A C++ reference to a function-pointer object crosses as the address of that
+            // pointer. The ordinary function<> value remains the bare callback pointer.
+            if (typeAndValue.Pointer && typeAndValue.IsCxxRefToPointer
+                && (typeAndValue.IsAlias || typeAndValue.IsRvalueRef))
+                return llvm::PointerType::getUnqual(fnPtrType);
             // A 'function<T>[N]' (or 'Lambda<T>[N]') array needs the same outer array wrap
             // every other type gets; the bare scalar type under-sizes the alloca.
             uint64_t fnOuterDim = typeAndValue.ConstArraySize;
@@ -1128,6 +1133,17 @@ bool LLVMBackend::NamedFunctionProvablyMismatchesFuncPtr(const std::string& func
             if (!FuncPtrSignaturesProvablyDiffer(FuncPtrSigOfSymbol(sym), param))
                 return false;
         return true;
+    }
+
+const LLVMBackend::FunctionSymbol* LLVMBackend::NamedFunctionOverloadForFuncPtr(
+        const std::string& functionName, const TypeAndValue& param) const
+{
+        auto it = functionTable.find(ResolveQualifiedName(functionName));
+        if (it == functionTable.end()) return nullptr;
+        for (const auto& sym : it->second)
+            if (!sym.IsMethod && !FuncPtrSignaturesProvablyDiffer(FuncPtrSigOfSymbol(sym), param))
+                return &sym;
+        return nullptr;
     }
 
 bool LLVMBackend::NamedFunctionArgMismatches(const NamedVariable& arg, const TypeAndValue& param) const

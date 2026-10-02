@@ -28,6 +28,10 @@
       "tieLit",
       "tieLit(u8), tieLit(u16)"
     ],
+    "ambiguousoverloadofa...chesfunctiontypearg11fa395df3076d85e": [
+      "n65Ambiguous",
+      "void(void*)"
+    ],
     "arg0": [
       "uses virtual inheritance, which is not supported yet"
     ],
@@ -797,6 +801,10 @@
       "IClosureIntArg",
       "lam",
       ""
+    ],
+    "nooverloadofarg0matchesfunctiontypearg1": [
+      "n65NoMatch",
+      "void(double)"
     ],
     "nooverloadofinterfac...rgumentsexpectedarg3d19ec88ba7eb04a1": [
       "IOne",
@@ -1868,6 +1876,7 @@
     "alignmentmismatchmov...hthecorrectalignmenta5e59547dcfd5ec4": "alignment mismatch moving into the 'move' parameter of '{0}': the parameter is declared 'alignas(0, {1})' but the argument was allocated 'alignas(0, {2})'. The two must agree so the callee frees with the correct alignment.",
     "ambiguouscalltoarg0n...achelperthatpicksone1dc49999f19f6b0a": "ambiguous call to '{0}': no candidate ranks better than the others: {1}. They differ only in const, which a CFlat argument does not carry; call it through a C++ helper that picks one.",
     "ambiguouscalltoarg0n...parametertypeyoumean6524b093d1fa9da7": "ambiguous call to '{0}': no candidate ranks better than the others: {1}. Cast the argument to the parameter type you mean.",
+    "ambiguousoverloadofa...chesfunctiontypearg11fa395df3076d85e": "ambiguous overload of '{0}' matches function type '{1}'",
     "arg0": "{0}",
     "arg0arg1mustbearg2or...obeexecutedinprocess28e30d1abeb98a2b": "{0}: '{1}' must be '{2}' or '{3}' to be executed in-process.",
     "arg0arg1wasparsedarg...atcppmaxheaderparses31ffe58a2cba473a": "{0} '{1}' was parsed {2} times in one compile; the budget is {3} (--error-on-cpp-reparse or CFLAT_CPP_MAX_HEADER_PARSES)",
@@ -2095,6 +2104,7 @@
     "noarg0compilerdriver...dtolinktheexecutable11639c2d0b9f1811": "no {0} compiler driver found to link the executable.",
     "noarg0compilerdriver...pilenativesourcearg16740382ea0548b90": "no {0} compiler driver found - cannot compile native source '{1}'.",
     "nomethodofarg0arg1ma...hegivenargumentsarg2a415477190242074": "no method of '{0}.{1}' matches the given arguments{2}",
+    "nooverloadofarg0matchesfunctiontypearg1": "no overload of '{0}' matches function type '{1}'",
     "nooverloadofinterfac...rgumentsexpectedarg3d19ec88ba7eb04a1": "no overload of interface method '{0}.{1}' takes {2} argument(s); expected {3}",
     "noviablealternativeatinputarg0": "no viable alternative at input {0}",
     "overrideisonlyvalidi...acppstructwithacbasee727ca8dc9a88350": "'override' is only valid in a [cpp] struct with a C++ base",

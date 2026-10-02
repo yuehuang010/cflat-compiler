@@ -192,6 +192,7 @@ cppfop.FoldRef d5_return_temporary_fold(cppfop.FoldRef* a, cppfop.FoldRef* b,
 // instantiation path emitted the bodies. The libc++ checks need no fixture at all - the
 // libc++ headers are the fixture, reached by the SYSTEM header spelling below.
 import cpp "library/cpp_interop_tpl.h";
+import cpp "library/cpp_interop_unique_deleter.hpp";
 import cpp "library/cpp_interop_by_value.h";
 import cpp "library/cpp_interop_proxy.h";
 import cpp "library/cpp_interop_define_primary.h";
@@ -229,6 +230,13 @@ import cpp "library/cpp_interop_nest2.h";
 import cpp "library/cpp_interop_tmplctor.h";
 import cpp "library/cpp_interop_global_scope.h";
 import cpp "library/cpp_interop_global_collision.h";
+
+int s7DeleterCalls = 0;
+void s7DeleteInt(move int* p) { delete p; s7DeleterCalls += 1; }
+// An overload set: only the void(int*) member may become the deleter.
+void s7DeleteOverload(int x) { s7DeleterCalls += 100; }
+void s7DeleteOverload(move int* p, int z) { delete p; s7DeleterCalls += 1000; }
+void s7DeleteOverload(move int* p) { delete p; s7DeleterCalls += 1; }
 
 // Defaulted-argument default constructors (section 2701-2711): a field and a global of a class
 // whose only default constructor needs a C++ default argument cflat cannot pass.
@@ -499,6 +507,14 @@ cppt.arr.Nil cpptNilSource() { return nullptr; }
 int trrGeneric<T>(T v) { return cpptrr.bump(v); }
 long n63GatePointerArrive(cppt.dflt.Gate<>* gate) { return gate->arrive(); }
 
+int n65CppDeleteCount = 0;
+void n65CppDelete(int value) { n65CppDeleteCount += 100; }
+void n65CppDelete(move int* value)
+{
+    delete value;
+    n65CppDeleteCount += 1;
+}
+
 extern int main()
 {
     // Win64 keeps the existing SEH trampoline and does not emit the C++ guard, so the
@@ -506,6 +522,10 @@ extern int main()
     if const (__WINDOWS__) {
         return 0;
     }
+
+    n65CppDeleteCount = 0;
+    cppt.n65_call_overloaded_fn(new int(1), n65CppDelete);
+    if (n65CppDeleteCount != 1) return 1690;
 
     // ---- class-typed subscript indices ----------------------------------------------------------
     // Runs early and in its own scope on purpose: internal/issue/p2/cpp-shared-ptr-vector-
@@ -3506,6 +3526,76 @@ extern int main()
                 || cppt.arr.nil_direct(madeNil) != 1)                       return 2879;
             void* nilVoid = nilPtr;
             if (cppt.arr.nil_order(nilVoid) != 3 || cppt.arr.nil_order(nilPtr) != 2) return 2880;
+            // Pointer-to-bool is worse than identity and pointer-to-void conversions for C++ callees.
+            if (ptrbool.vbool(nilVoid) != 30 || ptrbool.vbool(nilPtr) != 30
+                || ptrbool.vbool(true) != 20) return 2881;
+            if (ptrbool.tbool(nilPtr) != 40 || ptrbool.tbool(&nilProbe) != 40
+                || ptrbool.tbool(true) != 20) return 2882;
+            if (ptrbool.all(nilPtr) != 40 || ptrbool.all(true) != 20) return 2883;
+            if (ptrbool.all(nilVoid) != 30) return 2891;
+            if (ptrbool.templ(nilPtr) != 40 || ptrbool.templ(true) != 20) return 2884;
+            if (ptrbool.templ(nilVoid) != 30) return 2892;
+            u64 sizeValue = 0;
+            u64* sizePointer = &sizeValue;
+            i64 longValue = 0;
+            i64* longPointer = &longValue;
+            if (td.sz(sizePointer) != 1 || td.sl(longPointer) != 2) return 2903;
+            char* mutableText = (char*)"n64";
+            if (ptrbool.text("n64") != 50 || ptrbool.text(mutableText) != 60
+                || ptrbool.vbool(mutableText) != 30 || ptrbool.vbool("n64") != 20) return 2887;
+            if (ptrbool.tbool(nilVoid) != 20 || ptrbool.tbool(mutableText) != 20
+                || ptrbool.tbool("n64") != 20 || ptrbool.tbool(nullptr) != 40
+                || ptrbool.tbool(stdNil) != 40) return 2901;
+            if (ptrbool.all(mutableText) != 30) return 2899;
+            if (ptrbool.all("n64") != 20) return 2900;
+            char nonNullChar = 'x';
+            char* nonNullCharPointer = &nonNullChar;
+            ptrbool.Member nullSetMember = default;
+            if (ptrbool.n2(nonNullCharPointer) != 2
+                || nullSetMember.n2(nonNullCharPointer) != 2) return 2904;
+            if (ptrbool.templ(mutableText) != 40 || ptrbool.templ("n64") != 40
+                || ptrbool.templ(nullptr) != 30 || ptrbool.templ(stdNil) != 30) return 2902;
+            expect_error("ptrbool.all(int*)") {
+                int ambiguousNull = ptrbool.all(nullptr);
+            }
+            if (ptrbool.nilset(nilPtr) != 40 || ptrbool.nilset(nilVoid) != 30
+                || ptrbool.nilset(&nilProbe) != 40 || ptrbool.nilset(mutableText) != 40
+                || ptrbool.nilset("n64") != 40 || ptrbool.nilset(nullptr) != 10
+                || ptrbool.nilset(stdNil) != 10 || ptrbool.nilset(true) != 20) return 2894;
+            ptrbool.Member pointerMember = default;
+            if (pointerMember.v(nilVoid) != 30 || pointerMember.v(nilPtr) != 30
+                || pointerMember.v(mutableText) != 30 || pointerMember.v("n64") != 20
+                || pointerMember.v(nullptr) != 30 || pointerMember.v(stdNil) != 30
+                || pointerMember.t(nilPtr) != 40 || pointerMember.t(&nilProbe) != 40
+                || pointerMember.t(nilVoid) != 20 || pointerMember.t(nullptr) != 40
+                || pointerMember.t(stdNil) != 40) return 2888;
+            ptrbool.Ctor pointerCtor = ptrbool.Ctor(nilVoid);
+            if (pointerCtor.value != 30) return 2889;
+            ptrbool.Ctor boolCtor = ptrbool.Ctor(true);
+            if (boolCtor.value != 20) return 2890;
+            ptrbool.TConstructor tPointerCtor = ptrbool.TConstructor(nilPtr);
+            ptrbool.TConstructor tExpressionCtor = ptrbool.TConstructor(&nilProbe);
+            if (tPointerCtor.value != 40 || tExpressionCtor.value != 40) return 2893;
+            ptrbool.MatrixMember matrixMember = default;
+            expect_error("pick(int*)") {
+                int ambiguousNull = matrixMember.pick(nullptr);
+            }
+            if (matrixMember.pick(nilPtr) != 40 || matrixMember.pick(nilVoid) != 30
+                || matrixMember.pick(&nilProbe) != 40 || matrixMember.pick(mutableText) != 30
+                || matrixMember.pick("n64") != 20 || matrixMember.pick(true) != 20) return 2895;
+            if (matrixMember.templ(nilPtr) != 40 || matrixMember.templ(nilVoid) != 30
+                || matrixMember.templ(&nilProbe) != 40 || matrixMember.templ(mutableText) != 40
+                || matrixMember.templ("n64") != 40 || matrixMember.templ(nullptr) != 30
+                || matrixMember.templ(stdNil) != 30 || matrixMember.templ(true) != 20) return 2896;
+            if (ptrbool.MatrixCtor(nilPtr).value != 40 || ptrbool.MatrixCtor(nilVoid).value != 30
+                || ptrbool.MatrixCtor(&nilProbe).value != 40 || ptrbool.MatrixCtor(mutableText).value != 30
+                || ptrbool.MatrixCtor("n64").value != 20 || ptrbool.MatrixCtor(nullptr).value != 10
+                || ptrbool.MatrixCtor(stdNil).value != 10 || ptrbool.MatrixCtor(true).value != 20) return 2897;
+            if (ptrbool.TemplateCtor(nilPtr).value != 40 || ptrbool.TemplateCtor(nilVoid).value != 30
+                || ptrbool.TemplateCtor(&nilProbe).value != 40 || ptrbool.TemplateCtor(mutableText).value != 40
+                || ptrbool.TemplateCtor("n64").value != 40 || ptrbool.TemplateCtor(nullptr).value != 10
+                || ptrbool.TemplateCtor(stdNil).value != 10
+                || ptrbool.TemplateCtor(true).value != 20) return 2898;
         }
         if (pf1u.run() != 7)                                                return 2881;
         if (cppt.arr.array_delete_count() != 5)                             return 2782;
@@ -3837,5 +3927,86 @@ extern int main()
         if (cppmsvc.run_seven() != 7)                                       return 2656;
     }
 
+    // A CFlat function signature is a C++ function-pointer template argument. A function
+    // rvalue selects D&&; a stored function-pointer lvalue binds const D&.
+    {
+        cppt.FnUniquePtr<int, function<void(int*)>> p =
+            cppt.FnUniquePtr<int, function<void(int*)>>(new int(10), s7DeleteInt);
+        if (*p != 10 || p.ctor_kind() != 2) return 2810;
+    }
+    if (s7DeleterCalls != 1) return 2811;
+    {
+        function<void(move int*)> deleter = s7DeleteInt;
+        cppt.FnUniquePtr<int, function<void(move int*)>> p =
+            cppt.FnUniquePtr<int, function<void(move int*)>>(new int(11), deleter);
+        if (*p != 11 || p.ctor_kind() != 1) return 2812;
+    }
+    if (s7DeleterCalls != 2) return 2813;
+    {
+        cppt.NoMoveFnUniquePtr<int, function<void(int*)>> p =
+            cppt.NoMoveFnUniquePtr<int, function<void(int*)>>(new int(12), s7DeleteInt);
+        if (*p != 12) return 2814;
+    }
+    if (s7DeleterCalls != 3) return 2815;
+    {
+        cppt.NoMoveFnUniquePtr<int, function<void(int*)>> p =
+            cppt.NoMoveFnUniquePtr<int, function<void(int*)>>(new int(13),
+                (move int* p) => { s7DeleteInt(p); });
+        if (*p != 13) return 2816;
+    }
+    if (s7DeleterCalls != 4) return 2817;
+    // `auto` adopts the constructed temporary too: one object, one deleter call.
+    {
+        auto p = cppt.NoMoveFnUniquePtr<int, function<void(int*)>>(new int(14), s7DeleteInt);
+        if (*p != 14) return 2819;
+    }
+    if (s7DeleterCalls != 5) return 2820;
+    // The constructor binds the overload whose signature matches D, and the callback is formed
+    // from that same overload (pre-fix it passed the first-declared, wrong-arity member).
+    {
+        cppt.NoMoveFnUniquePtr<int, function<void(int*)>> p =
+            cppt.NoMoveFnUniquePtr<int, function<void(int*)>>(new int(15), s7DeleteOverload);
+        if (*p != 15) return 2821;
+    }
+    if (s7DeleterCalls != 6) return 2822;
+    // The defaulted D omitted on one side and written on the other names ONE C++ type: it is
+    // constructed in place (pre-fix: temporary copied, then both destroyed - a double delete).
+    {
+        cppt.NoMoveFnUniquePtr<int> p =
+            cppt.NoMoveFnUniquePtr<int, function<void(int*)>>(new int(16), s7DeleteInt);
+        if (*p != 16) return 2823;
+    }
+    if (s7DeleterCalls != 7) return 2824;
+    // Another specialization of the same template initializes the declared one in place from
+    // the arguments (master behaviour): clang reaches optional's constrained converting ctor.
+    {
+        std.optional<i64> s7Opt = std.optional<int>(3);
+        if (!s7Opt.has_value() || s7Opt.value() != 3) return 2825;
+    }
+    // N67: a C++ class prvalue / named lvalue / move x at a by-value C++ class parameter. The
+    // prvalue is moved once (clang elides it completely: counts 1,0,0,1; remaining gap in
+    // internal/issue/p2/cpp-by-value-class-temporary-extra-moves.md); no copy, balanced lifetimes.
+    {
+        cppt.pv_reset();
+        if (cppt.pv_take<int, int>(cppt.PvCount<int, int>(7)) != 7) return 2830;
+        if (cppt.pv_c != 1 || cppt.pv_cp != 0 || cppt.pv_mv > 1) return 2831;
+        if (cppt.pv_d != cppt.pv_c + cppt.pv_mv) return 2832;
+        cppt.pv_reset();
+        {
+            cppt.PvCount<int, int> named = cppt.PvCount<int, int>(8);
+            if (cppt.pv_take<int, int>(named) != 8) return 2833;
+            if (cppt.pv_cp != 1 || cppt.pv_mv != 0) return 2834;
+        }
+        if (cppt.pv_d != 2) return 2835;
+        cppt.pv_reset();
+        {
+            cppt.PvCount<int, int> moved = cppt.PvCount<int, int>(9);
+            if (cppt.pv_take<int, int>(move moved) != 9) return 2836;
+            if (cppt.pv_cp != 0 || cppt.pv_mv != 1) return 2837;
+        }
+        if (cppt.pv_d != 2) return 2838;
+    }
+    if (cppt.FunctionTypeTag<int(int)>.arity()
+        + cppt.FunctionTypeTag<function<int(int)>>.arity() != 102) return 2818;
     return 0;
 }

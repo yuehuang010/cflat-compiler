@@ -704,6 +704,11 @@ std::vector<LLVMBackend::CxxConversionRank> LLVMBackend::RankCxxConversionSequen
             probe.TypeName = name;
             return probe.IsInteger();
         };
+        auto primitiveWidth = [&](const std::string& name) {
+            if (name == "float") return 32;
+            if (name == "double") return 64;
+            return integerBits(name);
+        };
         // Character types promote to their underlying type, not to `int`; leave them unjudged.
         auto arithmeticName = [&](const std::string& name) -> std::string {
             if (name == "bool" || name == "float" || name == "double") return name;
@@ -789,7 +794,7 @@ std::vector<LLVMBackend::CxxConversionRank> LLVMBackend::RankCxxConversionSequen
                 }
                 // A narrow string literal is `const char[N]`: `const char*` is its identity after
                 // array-to-pointer, and the deprecated drop to `char*` binds worse.
-                if (arg.IsStringLiteral && pt.TypeName.empty() && !pt.Pointer)
+                if (arg.IsStringLiteral)
                 {
                     if (param.TypeName == "char")
                     {
@@ -799,11 +804,58 @@ std::vector<LLVMBackend::CxxConversionRank> LLVMBackend::RankCxxConversionSequen
                         out.cxxViable = true;
                         out.from = "char";
                     }
+                    else if (param.TypeName == "void")
+                    {
+                        if (param.IsCxxNullptrT
+                            || CxxSpellingIsNullptrT(CxxReferenceParameterSpelling(candidate, i)))
+                        {
+                            out.rank = kCxxNonViableRank;
+                            out.from = "char";
+                            continue;
+                        }
+                        if (CxxReferenceParameterSpelling(candidate, i).rfind("const ", 0) == 0)
+                        {
+                            out.rank = 2;
+                            out.cxxViable = true;
+                            out.from = "char";
+                            out.toClass = "void";
+                        }
+                        else
+                        {
+                            out.rank = kCxxNonViableRank;
+                            out.from = "char";
+                        }
+                    }
+                    else
+                    {
+                        out.rank = kCxxNonViableRank;
+                        out.from = "char";
+                    }
                     continue;
                 }
                 // A primitive pointee is recorded only as the declared source name.
                 const std::string pointee = CanonicalPrimitiveTypeName(
                     !pt.TypeName.empty() ? pt.TypeName : arg.InferSourceTypeName);
+                if (pt.Pointer && !pt.ElemPointer && pt.PointerDepth == 1
+                    && pointee == "void" && param.TypeName == "void"
+                    && !param.IsCxxNullptrT
+                    && !CxxSpellingIsNullptrT(CxxReferenceParameterSpelling(candidate, i)))
+                {
+                    out.rank = 0;
+                    out.cvBase = "void";
+                    out.cv = CxxReferenceParameterSpelling(candidate, i).rfind("const ", 0) == 0 ? 1 : 0;
+                    out.cxxViable = true;
+                    out.from = "void";
+                    continue;
+                }
+                if (pt.Pointer && !pt.ElemPointer && pt.PointerDepth == 1
+                    && pointee == "void" && param.TypeName != "void"
+                    && !param.TypeName.empty() && !IsNullPointerConstantArgument(arg))
+                {
+                    out.rank = kCxxNonViableRank;
+                    out.from = "void";
+                    continue;
+                }
                 if (!pt.Pointer || pt.ElemPointer || pt.IsArrayView || pt.ConstArraySize > 0
                     || pt.IsFunctionPointer || pt.IsInterface || pt.PointerDepth > 1
                     || param.TypeName.empty() || pointee == "void"
@@ -834,8 +886,23 @@ std::vector<LLVMBackend::CxxConversionRank> LLVMBackend::RankCxxConversionSequen
                     out.cvBase = pointee;
                     out.cv = CxxReferenceParameterSpelling(candidate, i).rfind("const ", 0) == 0 ? 1 : 0;
                 }
+                else if (primitiveWidth(pointee) > 0 && primitiveWidth(param.TypeName) > 0
+                         && primitiveWidth(pointee) != primitiveWidth(param.TypeName))
+                {
+                    out.rank = kCxxNonViableRank;
+                    out.from = pointee;
+                }
                 else if (param.TypeName == "void")
+                {
+                    if (param.IsCxxNullptrT
+                        || CxxSpellingIsNullptrT(CxxReferenceParameterSpelling(candidate, i)))
+                    {
+                        out.rank = kCxxNonViableRank;
+                        out.from = pointee;
+                        continue;
+                    }
                     out.rank = 2;
+                }
                 else if (IsCxxRecord(pointee) && IsCxxRecord(param.TypeName)
                          && IsCxxBaseOf(param.TypeName, pointee))
                     out.rank = 2;
@@ -852,6 +919,20 @@ std::vector<LLVMBackend::CxxConversionRank> LLVMBackend::RankCxxConversionSequen
                 // C++ viability needs the recorded single level; CFlat's own match proved the rest.
                 out.cxxViable = pt.PointerDepth == 1;
                 out.from = pointee;
+                continue;
+            }
+            // Pointer-to-bool is a standard conversion, but [over.ics.rank] makes it worse
+            // than every other standard conversion sequence for the same argument.
+            if (candidate.IsCxx && !param.Pointer && !param.IsAlias && !param.IsRvalueRef
+                && param.TypeName == "bool" && !IsCxxNullTypedArgument(arg)
+                && !IsNullPointerConstantArgument(arg)
+                && (arg.TypeAndValue.Pointer || arg.TypeAndValue.ElemPointer
+                    || arg.TypeAndValue.IsFunctionPointer || arg.IsStringLiteral))
+            {
+                out.rank = 2;
+                out.boolConversion = true;
+                out.cxxViable = true;
+                out.from = arg.TypeAndValue.TypeName;
                 continue;
             }
             // A C++ reference parameter is an address-passed alias; only its referent is ranked.
@@ -1021,11 +1102,17 @@ int LLVMBackend::CompareCxxConversionRanks(const std::vector<CxxConversionRank>&
             }
             else if (x.rank < 0 || y.rank < 0)
                 return 2;
+            // Ranking-only markers for conversions C++ rejects. They lose even to ellipsis;
+            // finish() still lets CFlat's matcher decide when no viable C++ candidate wins.
+            else if (x.rank == kCxxNonViableRank || y.rank == kCxxNonViableRank)
+                order = x.rank == y.rank ? 0 : (x.rank == kCxxNonViableRank ? 1 : -1);
             // An ellipsis conversion is worse than every other sequence; two are equal.
             else if (x.rank == kCxxEllipsisRank || y.rank == kCxxEllipsisRank)
                 order = x.rank - y.rank;
             else if (x.rank < 3 || y.rank < 3)
-                order = x.rank != y.rank ? x.rank - y.rank : tieBreak(x, y);
+                order = x.rank != y.rank ? x.rank - y.rank
+                    : (x.boolConversion != y.boolConversion ? (x.boolConversion ? 1 : -1)
+                                                           : tieBreak(x, y));
             // Two sequences through the SAME conversion function rank by the second standard
             // conversion; different functions (or an ambiguous one) are indistinguishable.
             else if (!x.userFunction.empty() && x.userFunction == y.userFunction)
@@ -1948,8 +2035,14 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
 
                 // Integer -> bool IS legal, and lowers through CoerceToBoolCondition. Implicit
                 // (1), never perfect, so an exactly-typed overload still wins.
+                const bool cxxPointerToBool = candidate.IsCxx
+                    && !IsCxxNullTypedArgument(arg) && !IsNullPointerConstantArgument(arg)
+                    && !candidateParamItr->Pointer && !candidateParamItr->IsAlias
+                    && !candidateParamItr->IsRvalueRef && candidateParamItr->TypeName == "bool"
+                    && (arg.TypeAndValue.Pointer || arg.TypeAndValue.ElemPointer
+                        || arg.TypeAndValue.IsFunctionPointer || arg.IsStringLiteral);
                 if (!scopedEnumMismatch && result < 0
-                    && ArgumentConvertsToBoolParameter(arg, *candidateParamItr))
+                    && (ArgumentConvertsToBoolParameter(arg, *candidateParamItr) || cxxPointerToBool))
                 {
                     result = 1;
                     boolCoercions++;
@@ -2213,7 +2306,9 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
         const Ranked* ellipsisWinner = ellipsisRanked.empty() ? nullptr : &ellipsisRanked.back();
         auto fullyRanked = [](const std::vector<CxxConversionRank>& ranks) {
             return std::none_of(ranks.begin(), ranks.end(),
-                                [](const CxxConversionRank& r) { return r.rank == -1; });
+                                [](const CxxConversionRank& r) {
+                                    return r.rank == -1 || r.rank == kCxxNonViableRank;
+                                });
         };
         if (cxxRanking)
         {
@@ -4121,6 +4216,51 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                             from, resolvedSym.Parameters[i]);
                 }
             }
+            bool everyCandidateHasFnPtrMismatch = !candidates.empty();
+            std::string fnPtrMismatchName;
+            std::string fnPtrMismatchType;
+            for (const auto& c : candidates)
+            {
+                std::vector<std::string> names;
+                names.reserve(arguments.size());
+                for (const auto& arg : arguments)
+                    names.push_back(arg.TypeAndValue.VariableName);
+                auto binding = ComputeArgumentPositions(names, c.Parameters, c.Variadic);
+                if (!binding.Ok)
+                {
+                    everyCandidateHasFnPtrMismatch = false;
+                    break;
+                }
+                bool candidateHasFnPtrMismatch = false;
+                for (size_t argIndex = 0; argIndex < arguments.size(); ++argIndex)
+                {
+                    if (argIndex >= binding.PosMap.size() || binding.PosMap[argIndex] < 0) continue;
+                    size_t paramIndex = (size_t)binding.PosMap[argIndex];
+                    if (paramIndex >= c.Parameters.size()) continue;
+                    const auto& arg = arguments[argIndex];
+                    const auto& param = c.Parameters[paramIndex];
+                    auto namedFunction = functionTable.find(ResolveQualifiedName(arg.CallerName));
+                    bool overloadedNamedFunction = namedFunction != functionTable.end()
+                        && namedFunction->second.size() > 1;
+                    if (param.IsFunctionPointer && overloadedNamedFunction
+                        && NamedFunctionArgMismatches(arg, param))
+                    {
+                        candidateHasFnPtrMismatch = true;
+                        fnPtrMismatchName = arg.CallerName;
+                        fnPtrMismatchType = FuncPtrSpellingOf(param);
+                        break;
+                    }
+                }
+                if (!candidateHasFnPtrMismatch)
+                {
+                    everyCandidateHasFnPtrMismatch = false;
+                    break;
+                }
+            }
+            if (everyCandidateHasFnPtrMismatch)
+                LogErrorMessage("no overload of '{}' matches function type '{}'",
+                    { fnPtrMismatchName, fnPtrMismatchType });
+
             std::string msg = std::format("no overload of '{}' matches the given arguments.\n", shownFunctionName);
 
             // Recover a named-argument diagnostic only from candidates whose parameter names
@@ -4936,9 +5076,10 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                 builder->CreateStore(boolValue, temporary);
                 argList.push_back(temporary);
             }
-            else if (!inVariadicRange && candidate.IsCxx && arg.TypeAndValue.Pointer
+            else if (!inVariadicRange && candidate.IsCxx
+                     && (arg.TypeAndValue.Pointer || arg.IsStringLiteral)
                      && candParamItr->TypeName == "bool" && !candParamItr->Pointer
-                     && !candParamItr->IsAlias)
+                     && !candParamItr->IsAlias && !candParamItr->IsRvalueRef)
             {
                 llvm::Value* pointerValue = arg.Primary != nullptr
                     ? arg.Primary : LoadArgStorage(arg);
@@ -5078,13 +5219,6 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
             {
                 // function<T> parameter - dispatch depends on whether the callee is extern C.
                 llvm::Value* val = arg.Primary ? arg.Primary : LoadArgStorage(arg);
-                // A named function reaching a funcptr slot: same alias-param door as a declared
-                // `function<>` binding. The thin arm below never re-resolves, so check it here.
-                if (auto* fnVal = llvm::dyn_cast_or_null<llvm::Function>(val))
-                    if (const FunctionSymbol* fnSym = FindSymbolForFunction(fnVal))
-                        if (RejectAliasParamFuncPtrBind(
-                                arg.CallerName.empty() ? fnSym->UniqueName : arg.CallerName, *fnSym))
-                            return nullptr;
                 // Inspect the actual LLVM param type to distinguish fat struct vs C fn ptr.
                 unsigned llvmParamIndex = (unsigned)argList.size();
                 if (!candidate.External)
@@ -5094,6 +5228,29 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                         llvmParamIndex += ParameterCarriesRawArrayCount(candidate.Parameters[i]) ? 2u : 1u;
                 }
                 auto* llvmParamTy = candidate.Function->getFunctionType()->getParamType(llvmParamIndex);
+                // A bare overloaded name needs the destination signature before either the
+                // internal closure ABI or the external thin-pointer ABI lowers it.
+                if (!arg.CallerName.empty() && llvm::isa<llvm::Function>(val))
+                {
+                    auto overloads = functionTable.find(ResolveQualifiedName(arg.CallerName));
+                    if (overloads != functionTable.end() && overloads->second.size() > 1)
+                    {
+                        if (NamedFunctionOverloadForFuncPtr(arg.CallerName, *candParamItr) == nullptr)
+                            LogErrorMessage("no overload of '{}' matches function type '{}'",
+                                { arg.CallerName, FuncPtrSpellingOf(*candParamItr) });
+                        int expectedCount = (int)candParamItr->FuncPtrParams.size();
+                        if (auto* correctFn = GetFunctionForFuncPtr(arg.CallerName, expectedCount,
+                                &candParamItr->FuncPtrParams, &*candParamItr))
+                            val = correctFn;
+                    }
+                }
+                // Check the selected overload: arg.Primary can still be the wrong first
+                // overload and may have an alias ABI the destination overload does not.
+                if (auto* fnVal = llvm::dyn_cast_or_null<llvm::Function>(val))
+                    if (const FunctionSymbol* fnSym = FindSymbolForFunction(fnVal))
+                        if (RejectAliasParamFuncPtrBind(
+                                arg.CallerName.empty() ? fnSym->UniqueName : arg.CallerName, *fnSym))
+                            return nullptr;
                 if (llvmParamTy->isStructTy())
                 {
                     // Internal function<T>: provide a closure fat struct {i8*, i8*}.
@@ -5104,7 +5261,15 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                         if (!arg.CallerName.empty() && llvm::isa<llvm::Function>(val))
                         {
                             int expectedCount = (int)candParamItr->FuncPtrParams.size();
-                            if (auto* correctFn = GetFunctionForFuncPtr(arg.CallerName, expectedCount, &candParamItr->FuncPtrParams))
+                            auto overloads = functionTable.find(ResolveQualifiedName(arg.CallerName));
+                            if (overloads != functionTable.end() && overloads->second.size() > 1)
+                            {
+                                if (auto* correctFn = GetFunctionForFuncPtr(arg.CallerName, expectedCount,
+                                        &candParamItr->FuncPtrParams, &*candParamItr))
+                                    val = correctFn;
+                            }
+                            else if (auto* correctFn = GetFunctionForFuncPtr(arg.CallerName, expectedCount,
+                                         &candParamItr->FuncPtrParams))
                                 val = correctFn;
                             // Reject when no overload's IsMove flags match the destination signature.
                             if (!HasFunctionWithMoveFlags(arg.CallerName, candParamItr->FuncPtrParams))
@@ -6247,6 +6412,49 @@ llvm::Function* LLVMBackend::GetFunctionForFuncPtr(std::string functionName, int
             }
             else
             {
+                // A C import and its hand-written CFlat declaration can register the same
+                // underlying symbol twice; that is one callable, not an ambiguous overload.
+                std::vector<const FunctionSymbol*> distinct;
+                for (const auto* sym : bindable)
+                {
+                    bool duplicate = std::any_of(distinct.begin(), distinct.end(), [&](const auto* prior) {
+                        return (sym->Function != nullptr && sym->Function == prior->Function)
+                            || (sym->Function == nullptr && prior->Function == nullptr
+                                && sym->UniqueName == prior->UniqueName);
+                    });
+                    if (!duplicate) distinct.push_back(sym);
+                }
+                bindable = std::move(distinct);
+                if (bindable.size() > 1)
+                {
+                    auto signatureScore = [&](const FunctionSymbol* sym) {
+                        std::vector<FuncPtrComponent> actual, expected;
+                        if (!FuncPtrSignatureOf(FuncPtrSigOfSymbol(*sym), actual)
+                            || !FuncPtrSignatureOf(*destSig, expected)
+                            || actual.size() != expected.size())
+                            return std::numeric_limits<int>::max();
+                        int score = 0;
+                        for (size_t i = 0; i < actual.size(); ++i)
+                        {
+                            const auto& a = actual[i];
+                            const auto& b = expected[i];
+                            if (a.Known && b.Known
+                                && (a.Canon != b.Canon
+                                    || (a.PointerDepth > 0 && b.PointerDepth > 0
+                                        && a.PointerDepth != b.PointerDepth)
+                                    || (!a.StructKey.empty() && !b.StructKey.empty()
+                                        && a.StructKey != b.StructKey)))
+                                ++score;
+                        }
+                        return score;
+                    };
+                    int bestScore = std::numeric_limits<int>::max();
+                    for (const auto* sym : bindable)
+                        bestScore = std::min(bestScore, signatureScore(sym));
+                    std::erase_if(bindable, [&](const FunctionSymbol* sym) {
+                        return signatureScore(sym) != bestScore;
+                    });
+                }
                 viable = std::move(bindable);
             }
         }
@@ -6276,6 +6484,22 @@ llvm::Function* LLVMBackend::GetFunctionForFuncPtr(std::string functionName, int
                 if (sym.Parameters[i].IsMove != (*expectedParams)[i].IsMove) return false;
             return true;
         };
+
+        if (destSig != nullptr && !destSig->FuncPtrReturnTypeName.empty())
+        {
+            size_t matching = 0;
+            size_t sameArity = 0;
+            for (const auto* sym : overloads)
+            {
+                if (sym->IsMethod) continue;
+                if (expectedParamCount >= 0 && (int)sym->Parameters.size() != expectedParamCount) continue;
+                ++sameArity;
+                if (moveFlagsMatch(*sym)) ++matching;
+            }
+            if (matching > 1 || (matching == 0 && sameArity > 1))
+                LogErrorMessage("ambiguous overload of '{}' matches function type '{}'",
+                    { functionName, FuncPtrSpellingOf(*destSig) });
+        }
 
         // Pass 1: non-method, param count + move flags match.
         for (const auto* sym : overloads)

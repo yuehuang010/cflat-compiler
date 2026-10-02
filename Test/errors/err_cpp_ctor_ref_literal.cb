@@ -1,6 +1,10 @@
 // A C++ constructor parameter declared non-const `int&` cannot bind an integer LITERAL: the
 // literal has no address, so the reference would point at a temporary that dies at once.
 import cpp "cpp_interop_ctorref.h";
+import cpp "cpp_interop_unique_deleter.hpp";
+
+void CrDeleteWrongParam(int x) { }
+int CrDeleteWrongReturn(move int* p) { delete p; return 1; }
 
 extern int main()
 {
@@ -74,6 +78,16 @@ extern int main()
     // nullptr converts to a function pointer and to `int*` alike.
     expect_error("more than one constructor overload") {
         int v = cppcr.RkFnPtr(nullptr).chosen;
+    }
+    // A function name binds a C++ function-pointer deleter (`const D&` / `D&&`) only when its
+    // signature is D's; the in-place `T x = T(args)` route checks it as the temporary route does.
+    expect_error("C++ class 'cppt.NoMoveFnUniquePtr<int, function<void(int*)>>' has no constructor") {
+        cppt.NoMoveFnUniquePtr<int, function<void(int*)>> bad =
+            cppt.NoMoveFnUniquePtr<int, function<void(int*)>>(new int(1), CrDeleteWrongParam);
+    }
+    expect_error("C++ class 'cppt.NoMoveFnUniquePtr<int, function<void(int*)>>' has no constructor") {
+        cppt.NoMoveFnUniquePtr<int, function<void(int*)>> bad =
+            cppt.NoMoveFnUniquePtr<int, function<void(int*)>>(new int(2), CrDeleteWrongReturn);
     }
     return 0;
 }

@@ -1375,7 +1375,7 @@ int cbRunMakeBox()
 int stdfn_twice(int x) { return x * 2; }
 int stdfn_bumped = 0;
 void stdfn_bump() { stdfn_bumped = stdfn_bumped + 1; }
-int stdfn_len(alias std.string s) { return (int)s.size(); }
+int stdfn_len(std.string s) { return (int)s.size(); }
 
 // The CFlat std.function local dies with this frame; the handler C++ stored must survive it.
 void stdfn_install(alias cppfn.Holder h)
@@ -3546,6 +3546,11 @@ extern int main(int argc, char** argv)
     std.function<int(int)> capMovedCopy = capMoved;
     if (capMoved(1) != 37 || capMovedCopy(2) != 38) return 655;
     if (cppi.apply_fn(capMoved, 3) != 39)           return 656;
+    // A fixed array of owning captures crosses the std.function wrapper with an element-wise copy.
+    string[2] capArray = { "abcdefghijklmnopqrstuvwxyz0123456789ab", "second" };
+    Lambda<int(int)> capArrayLambda = (int i) => { return capArray[i].length(); };
+    std.function<int(int)> capArrayFunction = move capArrayLambda;
+    if (capArrayFunction(0) != 38)                  return 658;
     // `move` into a deduced F: the C++ copy owns its env, the drained local destroys nothing.
     Lambda<int(int)> capL2 = (int x) => { return x + capS.length(); };
     if (cppi.apply_copy(move capL2, 1) != 74)       return 657;

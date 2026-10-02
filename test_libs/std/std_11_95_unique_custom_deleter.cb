@@ -1,6 +1,5 @@
 // GUARDS: unique_ptr custom deleter specialization destroys its owned value
 // FROM: internal/plan/std-library-smoke-suite.md (C++11 coverage map)
-// DISABLED: internal/issue/p2/std-unique-ptr-custom-deleter.md
 import cpp "memory";
 int destroyed = 0;
 void destroy_int(move int* p) { delete p; destroyed = destroyed + 1; }

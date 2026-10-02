@@ -1,0 +1,17 @@
+void n65NoMatch(int value) {}
+void n65NoMatch(move int* value) { delete value; }
+void n65Ambiguous(move int* value) {}
+void n65Ambiguous(move double* value) {}
+void n65TakeDouble(function<void(double)> callback) {}
+void n65TakeVoidPointer(function<void(void*)> callback) {}
+
+extern int main()
+{
+    expect_error("no overload of 'n65NoMatch' matches function type 'void(double)'") {
+        n65TakeDouble(n65NoMatch);
+    }
+    expect_error("ambiguous overload of 'n65Ambiguous' matches function type 'void(void*)'") {
+        n65TakeVoidPointer(n65Ambiguous);
+    }
+    return 0;
+}

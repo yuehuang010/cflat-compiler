@@ -8,6 +8,8 @@
 // (bridge 620-628). Scoped blocks: each leg is armed alone.
 import cpp "cpp_interop_basic.h";
 import cpp "functional";
+import cpp "memory";
+import cpp "thread";
 
 struct CapturedBox { int v = default; };
 
@@ -36,10 +38,17 @@ extern int main()
     CapturedBox box = default;
     box.v = 4;
     unique<CapturedBox> owned = new CapturedBox();
+    int k = 3;
     // A named closure with an owning (string) capture: C++ would copy it - `move` hands it over.
     expect_error("a closure that may own non-trivial captures cannot be copied into C++ 'std.function<int(int)>' implicitly; pass 'move l'") {
         Lambda<int(int)> l = (int x) => { return x + s.length(); };
         std.function<int(int)> f = l;
+    }
+    // A function-pointer custom deleter is still a thin C++ target; a fat capturing closure
+    // cannot be copied into the deleter's const-reference or rvalue-reference parameter.
+    expect_error("a capturing closure cannot be passed to C++") {
+        std.unique_ptr<int, function<void(int*)>> p = std.unique_ptr<int, function<void(int*)>>(
+            new int(1), (move int* p) => { if (k > 0) delete p; });
     }
     // A struct value is reference-captured: the bonded closure must not reach a C++ parameter.
     expect_error("a closure that captures by reference ('box') cannot be passed to C++ 'cppi.apply_fn'") {
