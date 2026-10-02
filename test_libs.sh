@@ -89,9 +89,9 @@ run_case() {
   start=$(date +%s)
   local cmd_timeout=(); if command -v timeout >/dev/null 2>&1; then cmd_timeout=(timeout "$timeout_s"); elif command -v gtimeout >/dev/null 2>&1; then cmd_timeout=(gtimeout "$timeout_s"); fi
   if [ "$mode" = check ]; then
-    "${cmd_timeout[@]}" "$CFLAT" "$casefile" "${args[@]}" --check >"$case_dir/compile.log" 2>&1; rc=$?
+    ${cmd_timeout[@]+"${cmd_timeout[@]}"} "$CFLAT" "$casefile" ${args[@]+"${args[@]}"} --check >"$case_dir/compile.log" 2>&1; rc=$?
   else
-    "${cmd_timeout[@]}" "$CFLAT" "$casefile" "${args[@]}" -o "$case_dir/$name" >"$case_dir/compile.log" 2>&1; rc=$?
+    ${cmd_timeout[@]+"${cmd_timeout[@]}"} "$CFLAT" "$casefile" ${args[@]+"${args[@]}"} -o "$case_dir/$name" >"$case_dir/compile.log" 2>&1; rc=$?
     if [ "$rc" -eq 0 ]; then
       (cd "$case_dir" && env DYLD_LIBRARY_PATH="$root/${CFG_RUNPATH_MAC:-lib}${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}" "./$name" ${CFG_ARGS//@REPO@/$ROOT}) >"$case_dir/run.log" 2>&1; rc=$?
     fi

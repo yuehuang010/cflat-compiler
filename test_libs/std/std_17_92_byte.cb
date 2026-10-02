@@ -1,0 +1,12 @@
+// GUARDS: C++17 std::byte construction and conversion
+// FROM: internal/plan/std-library-smoke-suite.md (C++17 coverage map)
+// DISABLED: internal/issue/p2/std-byte-interop.md
+import cpp "cstddef";
+extern int main()
+{
+    std.byte value = std.byte(42);
+    int result = std.to_integer<int>(value);
+    if (result != 42) { printf("FAIL byte: got %d want 42\n", result); return 1; }
+    printf("PASS std_17_92_byte\n");
+    return 0;
+}

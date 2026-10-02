@@ -1,0 +1,14 @@
+// GUARDS: integer to_chars and from_chars round trip
+// FROM: internal/plan/std-library-smoke-suite.md (C++17 coverage map)
+// DISABLED: internal/issue/p2/std-charconv-char-buffer.md
+import cpp "charconv";
+extern int main()
+{
+    c8[16] buffer = {};
+    auto converted = std.to_chars(&buffer[0], &buffer[15], 1234);
+    int parsed = 0;
+    auto result = std.from_chars(&buffer[0], converted.ptr, parsed);
+    if (converted.ec != std.errc() || result.ec != std.errc() || parsed != 1234) { printf("FAIL charconv\n"); return 1; }
+    printf("PASS std_17_94_charconv\n");
+    return 0;
+}

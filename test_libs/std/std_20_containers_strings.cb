@@ -1,0 +1,54 @@
+// GUARDS: C++20 container contains/erase APIs, string prefixes, and three-way comparison rewrites
+// FROM: internal/plan/std-library-smoke-suite.md (C++20 coverage map)
+import cpp "map";
+import cpp "set";
+import cpp "unordered_set";
+import cpp "string";
+import cpp "string_view";
+import cpp "utility";
+import cpp "vector";
+import cpp "algorithm";
+import cpp "functional";
+bool is_four(int item) { return item == 4; }
+bool is_five(int item) { return item == 5; }
+extern int main()
+{
+    int failures = 0;
+    std.map<int, int> values = default;
+    values[1] = 10; values[2] = 20;
+    std.set<int> ordered = default;
+    ordered.insert(4);
+    ordered.insert(8);
+    std.unordered_set<int> hashed = default;
+    hashed.insert(5);
+    hashed.insert(9);
+    if (!values.contains(2) || !ordered.contains(8) || !hashed.contains(9)) { printf("FAIL contains\n"); failures |= 1; }
+    std.string text = std.string("prefix-middle-suffix");
+    std.string_view view = std.string_view("prefix-middle-suffix");
+    std.vector<int> erase_values = default;
+    erase_values.push_back(2);
+    erase_values.push_back(3);
+    int erased = std.erase(erase_values, 2);
+    if (erased != 1 || erase_values.size() != 1) { printf("FAIL erase: got %d size %d want 1 1\n", erased, (int)erase_values.size()); failures |= 2; }
+    std.set<int> eif_ordered = default;
+    eif_ordered.insert(4); eif_ordered.insert(8);
+    std.unordered_set<int> eif_hashed = default;
+    eif_hashed.insert(5); eif_hashed.insert(9);
+    int eif_o = std.erase_if(eif_ordered, std.function<bool(int)>(is_four));
+    int eif_h = std.erase_if(eif_hashed, std.function<bool(int)>(is_five));
+    if (eif_o != 1 || eif_h != 1 || eif_ordered.size() != 1 || eif_hashed.size() != 1 || eif_ordered.contains(4) || !eif_ordered.contains(8) || eif_hashed.contains(5) || !eif_hashed.contains(9)) { printf("FAIL erase_if: got %d %d want 1 1 and expected retained keys\n", eif_o, eif_h); failures |= 16; }
+    if (!text.starts_with("prefix") || !text.ends_with("suffix") || !view.starts_with("prefix") || !view.ends_with("suffix")) { printf("FAIL starts/ends_with\n"); failures |= 4; }
+    std.pair<int, int> p1 = std.pair<int, int>(1, 2);
+    std.pair<int, int> p2 = std.pair<int, int>(1, 3);
+    std.string sa = std.string("a");
+    std.string sb = std.string("b");
+    std.vector<int> va = default;
+    va.push_back(1);
+    va.push_back(2);
+    std.vector<int> vb = default;
+    vb.push_back(1);
+    vb.push_back(3);
+    if (!(p1 < p2) || !(sa < sb) || !(va < vb)) { printf("FAIL spaceship comparison rewrites\n"); failures |= 8; }
+    if (failures == 0) printf("PASS std_20_containers_strings\n");
+    return failures;
+}

@@ -1,0 +1,26 @@
+// GUARDS: C++11 ownership pointers, shared ownership, pair/tuple, and utility forwarding
+// FROM: internal/plan/std-library-smoke-suite.md (C++11 coverage map)
+import cpp "memory";
+import cpp "tuple";
+import cpp "utility";
+import cpp "vector";
+int plus_one(int x) { return x + 1; }
+extern int main()
+{
+    int failures = 0;
+    std.unique_ptr<int> p = std.unique_ptr<int>(new int(7));
+    std.vector<std.unique_ptr<int>> owners = default; owners.emplace_back(new int(8));
+    std.shared_ptr<int> shared = std.make_shared<int>(9);
+    std.weak_ptr<int> weak = shared;
+    if (*p != 7 || *owners[0] != 8 || shared.use_count() != 1 || *weak.lock() != 9)
+    { printf("FAIL smart pointers\n"); failures |= 1; }
+    std.pair<int, int> pr = std.make_pair(2, 3);
+    auto tup = std.make_tuple(4, 5);
+    int x = std.get<0>(tup); int y = std.get<1>(tup);
+    int a = 1; int b = 2; std.swap(a, b);
+    std.vector<int> forwarded = default; forwarded.emplace_back(std.forward<int>(plus_one(1)));
+    if (pr.first != 2 || pr.second != 3 || std.get<1>(tup) != 5 || x != 4 || y != 5 || a != 2 || b != 1 || forwarded[0] != 2)
+    { printf("FAIL utility values\n"); failures |= 2; }
+    if (failures == 0) printf("PASS std_11_memory_utility\n");
+    return failures;
+}

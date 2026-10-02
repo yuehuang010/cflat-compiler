@@ -1,0 +1,12 @@
+// GUARDS: C++20 std::numbers constants import and value access
+// FROM: internal/plan/std-library-smoke-suite.md (C++20 coverage map)
+// DISABLED: internal/issue/p3/cpp-namespace-inline-constexpr-variable-lookup.md
+import cpp "numbers";
+extern int main()
+{
+    int failures = 0;
+    double pi = std.numbers.pi;
+    if (!(pi > 3.14159 && pi < 3.14160)) { printf("FAIL pi: got %f want between 3.14159 and 3.14160\n", pi); failures |= 1; }
+    if (failures == 0) printf("PASS std_20_91_numbers_pi\n");
+    return failures;
+}

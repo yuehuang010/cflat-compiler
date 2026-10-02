@@ -1,0 +1,17 @@
+// GUARDS: C++20 jthread constructed from a bare CFlat function name
+// FROM: internal/plan/std-library-smoke-suite.md (C++20 coverage map)
+// DISABLED: internal/issue/p2/cpp-cflat-callable-to-deduced-template-param.md
+import cpp "thread";
+extern void stop_worker()
+{
+}
+extern int main()
+{
+    int failures = 0;
+    std.jthread worker = std.jthread(stop_worker);
+    worker.request_stop();
+    if (!worker.get_stop_token().stop_requested()) { printf("FAIL jthread stop request\n"); failures |= 1; }
+    worker.join();
+    if (failures == 0) printf("PASS std_20_97_jthread_stop_token\n");
+    return failures;
+}

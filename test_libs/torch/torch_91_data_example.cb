@@ -1,7 +1,6 @@
 // GUARDS: torch::data TensorDataset size and Example<Tensor, NoTarget> field access.
 // FROM: scratch/ladder/torch/t13.cb
 import cpp "torch/torch.h";
-extern int printf(const char* fmt, ...);
 int leg_t13()
 {
     int failures = 0;

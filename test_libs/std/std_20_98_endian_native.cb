@@ -1,0 +1,11 @@
+// GUARDS: C++20 std::endian::native value comparison
+// FROM: internal/plan/std-library-smoke-suite.md (C++20 coverage map)
+// DISABLED: internal/issue/p3/cpp-static-data-member-use-forms.md
+import cpp "bit";
+extern int main()
+{
+    int failures = 0;
+    if (std.endian.native != std.endian.little) { printf("FAIL endian native is not little\n"); failures |= 1; }
+    if (failures == 0) printf("PASS std_20_98_endian_native\n");
+    return failures;
+}

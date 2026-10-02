@@ -1,0 +1,11 @@
+// GUARDS: C++14 integer_sequence and make_index_sequence size
+// FROM: internal/plan/std-library-smoke-suite.md (C++14 coverage map)
+// DISABLED: internal/issue/p3/std-index-sequence-size.md
+import cpp "utility";
+extern int main()
+{
+    std.index_sequence<0, 1, 2> values = default;
+    if (values.size() != 3) { printf("FAIL index_sequence_size\n"); return 1; }
+    printf("PASS std_14_92_index_sequence_size\n");
+    return 0;
+}

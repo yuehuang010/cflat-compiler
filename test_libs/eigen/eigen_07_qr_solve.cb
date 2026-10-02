@@ -1,7 +1,6 @@
 // GUARDS: calling a member function template (QR solve) on a decomposition object
 // FROM: scratch/probe3/e09_solve.cb
 import cpp "Eigen/Dense";
-extern int printf(const char* fmt, ...);
 extern int main()
 {
     Eigen.Matrix2d a = default; a.setZero(); a(0, 0) = 2.0; a(1, 1) = 4.0;

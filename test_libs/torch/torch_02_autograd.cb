@@ -1,8 +1,6 @@
 // GUARDS: autograd gradients, optimizer-style updates, initialization and gradient clipping.
 // FROM: scratch/ladder/torch/t5.cb scratch/ladder/torch/t26.cb
 import cpp "torch/torch.h";
-extern int printf(const char* fmt, ...);
-
 int leg_t5()
 {
     i64[2] dims2 = {2, 3};

@@ -1,0 +1,42 @@
+// GUARDS: C++11 threads, mutexes, condition variables, atomics, promises, futures, and async
+// FROM: internal/plan/std-library-smoke-suite.md (C++11 coverage map)
+import cpp "atomic";
+import cpp "condition_variable";
+import cpp "future";
+import cpp "mutex";
+import cpp "thread";
+std.atomic<int> total = default;
+std.mutex gate = default;
+std.condition_variable cv = default;
+bool ready = false;
+void add_two() { total.fetch_add(2); }
+void add_three() { total.fetch_add(3); }
+int return_thirteen() { return 13; }
+void signal_ready()
+{
+    std.lock_guard<std.mutex> guard = std.lock_guard<std.mutex>(gate);
+    ready = true;
+    cv.notify_one();
+}
+extern int main()
+{
+    int failures = 0;
+    std.atomic<int> reset = default; total.store(0);
+    std.thread a = std.thread(std.function<void()>(add_two));
+    std.thread b = std.thread(std.function<void()>(add_three));
+    a.join(); b.join();
+    std.mutex m = default; int guarded = 0;
+    { std.lock_guard<std.mutex> guard = std.lock_guard<std.mutex>(m); guarded = 7; }
+    { std.unique_lock<std.mutex> guard = std.unique_lock<std.mutex>(m); guarded += 1; }
+    std.thread notifier = std.thread(std.function<void()>(signal_ready));
+    std.unique_lock<std.mutex> wait_lock = std.unique_lock<std.mutex>(gate);
+    while (!ready) cv.wait(wait_lock);
+    wait_lock.unlock(); notifier.join();
+    std.promise<int> p = default; std.future<int> f = p.get_future(); p.set_value(11);
+    auto async_result = std.async(std.function<int()>(return_thirteen));
+    int asyncv = async_result.get();
+    if (total.load() != 5 || guarded != 8 || !ready || f.get() != 11 || asyncv != 13)
+    { printf("FAIL concurrency\n"); failures |= 1; }
+    if (failures == 0) printf("PASS std_11_concurrency\n");
+    return failures;
+}

@@ -1,8 +1,6 @@
 // GUARDS: libtorch TensorDataset loaders, stacking transforms, iterator exhaustion, and batched training.
 // FROM: scratch/ladder/torch/t14.cb scratch/ladder/torch/t15.cb scratch/ladder/torch/t16.cb
 import cpp "torch/torch.h";
-extern int printf(const char* fmt, ...);
-
 int leg_t14()
 {
     i64[2] d = {4, 2};

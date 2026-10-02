@@ -1,7 +1,6 @@
 // GUARDS: fmt memory_buffer layout and format_to
 // FROM: scratch/probe3/f04_memory_buffer.cb
 import cpp "fmt/format.h";
-extern int printf(const char* fmt, ...);
 extern int main()
 {
     int failures = 0;

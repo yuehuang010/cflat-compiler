@@ -1,0 +1,17 @@
+// GUARDS: unique_ptr custom deleter specialization destroys its owned value
+// FROM: internal/plan/std-library-smoke-suite.md (C++11 coverage map)
+// DISABLED: internal/issue/p2/std-unique-ptr-custom-deleter.md
+import cpp "memory";
+int destroyed = 0;
+void destroy_int(move int* p) { delete p; destroyed = destroyed + 1; }
+extern int main()
+{
+    int failures = 0;
+    {
+        std.unique_ptr<int, function<void(int*)>> p = std.unique_ptr<int, function<void(int*)>>(new int(10), destroy_int);
+        if (*p != 10) { printf("FAIL custom deleter value\n"); failures |= 1; }
+    }
+    if (destroyed != 1) { printf("FAIL custom deleter count\n"); failures |= 2; }
+    if (failures == 0) printf("PASS std_11_95_unique_custom_deleter\n");
+    return failures;
+}

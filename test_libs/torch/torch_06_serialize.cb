@@ -1,8 +1,6 @@
 // GUARDS: libtorch tensor and module serialization, autograd state, initialization, and optimizer options.
 // FROM: scratch/ladder/torch/t8.cb scratch/ladder/torch/t18.cb scratch/ladder/torch/t21.cb
 import cpp "torch/torch.h";
-extern int printf(const char* fmt, ...);
-
 int leg_t8()
 {
     i64[2] dims = {2, 2};

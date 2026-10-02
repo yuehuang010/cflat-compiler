@@ -1,0 +1,24 @@
+// GUARDS: C++11 chrono, ratios, random engine, math, complex, limits, and type traits
+// FROM: internal/plan/std-library-smoke-suite.md (C++11 coverage map)
+import cpp "chrono";
+import cpp "cmath";
+import cpp "complex";
+import cpp "limits";
+import cpp "random";
+import cpp "ratio";
+import cpp "type_traits";
+extern int main()
+{
+    int failures = 0;
+    std.chrono.milliseconds ms = std.chrono.milliseconds(1500);
+    auto t0 = std.chrono.steady_clock.now(); auto t1 = std.chrono.steady_clock.now();
+    std.mt19937 rng = std.mt19937(5489u); unsigned long first = rng();
+    std.mt19937_64 rng64 = std.mt19937_64(5489u); u64 first64 = rng64();
+    std.complex<double> c = std.complex<double>(1.0, 2.0);
+    if (ms.count() != 1500 || !(t1 >= t0) || first != 3499211612UL || first64 != 14514284786278117030UL || std.ratio<1, 1000>.num != 1 || std.ratio<1, 1000>.den != 1000)
+    { printf("FAIL chrono/random/ratio\n"); failures |= 1; }
+    if (std.fma(2.0, 3.0, 4.0) != 10.0 || !std.isnan(std.numeric_limits<double>.quiet_NaN()) || std.round(2.4) != 2.0 || std.hypot(3.0, 4.0) != 5.0 || c.real() != 1.0 || c.imag() != 2.0 || !std.is_integral<int>.value || std.is_floating_point<int>.value)
+    { printf("FAIL math/complex/types\n"); failures |= 2; }
+    if (failures == 0) printf("PASS std_11_numeric_time_random\n");
+    return failures;
+}

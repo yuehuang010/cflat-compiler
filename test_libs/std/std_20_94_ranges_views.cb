@@ -1,0 +1,19 @@
+// GUARDS: C++20 iota/filter/transform/take views compose and run with CFlat callables
+// FROM: internal/plan/std-library-smoke-suite.md (C++20 coverage map)
+// DISABLED: internal/issue/p2/cpp-ranges-view-callable-argument-unspellable.md
+import cpp "ranges";
+import cpp "functional";
+bool is_even(int value) { return value % 2 == 0; }
+int triple(int value) { return value * 3; }
+extern int main()
+{
+    int failures = 0;
+    std.function<bool(int)> even_fn = std.function<bool(int)>(is_even);
+    std.function<int(int)> triple_fn = std.function<int(int)>(triple);
+    auto selected = std.views.iota(0, 8) | std.views.filter(even_fn) | std.views.transform(triple_fn) | std.views.take(2);
+    int sum = 0;
+    for (int value in selected) sum = sum + value;
+    if (sum != 6) { printf("FAIL composed views: got %d want 6\n", sum); failures |= 1; }
+    if (failures == 0) printf("PASS std_20_94_ranges_views\n");
+    return failures;
+}

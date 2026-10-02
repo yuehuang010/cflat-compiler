@@ -176,6 +176,33 @@ concurrent runs on the same function). Run ids are new for this regroup; old ids
 | N37 | p3/cpp-signature-registration-projects-records | Registration projects every record a signature names; -3.6% torch only by skipping projection, which breaks overload order (D4) | NEW 2026-09-30 perf |
 | N38 | p2/cpp-static-inline-member-failed-initializer-reads-zero | Static inline member whose initializer fails static_assert reads 0 silently (pre-existing, D8 review) | NEW 2026-09-30 perf |
 
+## std smoke suite gaps 2026-10-01 (test_libs/std DISABLED cases; group at the next queue build)
+
+Fixing a row removes the DISABLED marker of its case(s) in the same commit (`./test_libs.sh std --include-disabled` shows XPASS).
+
+| Run | Issue | DISABLED case | Summary |
+|---|---|---|---|
+| S1 | p2/std-cflat-lambda-to-std-function | std_11_92 | lambda cannot initialize std::function (no signature propagation); also blocks std.visit with a lambda |
+| S2 | p2/cpp-cflat-callable-to-deduced-template-param | std_20_93, std_20_97 | CFlat function<>/lambda/function name refused as a deduced C++ callable (erase_if, jthread); std.function wrapper works |
+| S3 | p2/cpp-ranges-view-callable-argument-unspellable | std_20_94 | views.filter/transform closure return type (__pipeable) not bindable |
+| S4 | p2/std-is-null-pointer-trait | std_14_93 | is_null_pointer<nullptr_t>::value reads false (wrong value) |
+| S5 | p2/std-utility-move-cannot-bind | std_11_94 | KEEP std::move (RULED 2026-10-01): T&& C++ call result as init/assign/return move source + specific diagnostics (std.move on a CFlat value -> suggest `move x`) |
+| S6 | p2/std-tie-cannot-bind | std_11_93 | std.tie wrapper cannot be registered |
+| S7 | p2/std-unique-ptr-custom-deleter | std_11_95 | unique_ptr<T, D> with a function-type deleter: invalid specialization |
+| S8 | p2/std-enable-shared-from-this-base | std_11_96 | CRTP base std.enable_shared_from_this<T> on a CFlat struct not a C++ class |
+| S9 | p2/std-chrono-duration-cast | std_11_91 | duration_cast<seconds>(...) parsed as a class type |
+| S10 | p2/std-byte-interop | std_17_92 | std.byte (enum class) cannot be named |
+| S11 | p2/std-not-fn-return-type | std_17_93 | not_fn return type (__not_fn_t) not bindable |
+| S12 | p2/std-charconv-char-buffer | std_17_94 | to_chars/from_chars: no matching overload for a char buffer |
+| S13 | p2/std-filesystem-directory-iterator | std_17_96 | directory_iterator not iterable from CFlat (bound to list<string> overload) |
+| S14 | p2/cpp-std-barrier-type-unavailable | std_20_96 | std.barrier (defaulted template arg) not found; `std.barrier<>` is a parse error |
+| S15 | p3/std-make-unique-array | std_14_91, std_20_92 | T[] template argument (make_unique<int[]>, make_shared<int[]>) has no spelling |
+| S16 | p3/std-index-sequence-size | std_14_92 | integer_sequence::size() static member unknown |
+| S17 | p3/std-filesystem-path-join | std_17_95 | path operator/ not found |
+| S18 | p3/cpp-namespace-inline-constexpr-variable-lookup | std_20_91 | std.numbers.pi (namespace inline constexpr variable) not found |
+| S19 | p3/cpp-std-format-to-n-unreachable | std_20_95 | format_to_n not bound (clang: no member) |
+| S20 | p3/cpp-static-data-member-use-forms (existing, appended) | std_20_98 | std.endian.native enumerator/static member not resolved |
+
 ## Ruled 2026-10-01 - ready to schedule (rulings recorded in each issue file)
 
 | Ruling | Issue | Work |

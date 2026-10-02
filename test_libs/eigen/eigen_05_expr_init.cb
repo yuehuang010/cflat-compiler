@@ -1,7 +1,6 @@
 // GUARDS: initializing an Eigen matrix from an expression result (implicit converting constructor)
 // FROM: scratch/probe3/e08_transpose_inverse.cb scratch/probe3/e10_block.cb
 import cpp "Eigen/Dense";
-extern int printf(const char* fmt, ...);
 extern int main()
 {
     int failures = 0;

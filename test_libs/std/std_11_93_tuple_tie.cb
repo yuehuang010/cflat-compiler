@@ -1,0 +1,13 @@
+// GUARDS: tuple tie assigns values through a tuple of references
+// FROM: internal/plan/std-library-smoke-suite.md (C++11 coverage map)
+// DISABLED: internal/issue/p2/std-tie-cannot-bind.md
+import cpp "tuple";
+extern int main()
+{
+    int failures = 0;
+    int x = 0; int y = 0; auto values = std.make_tuple(4, 5);
+    std.tie(x, y) = values;
+    if (x != 4 || y != 5) { printf("FAIL tuple tie\n"); failures |= 1; }
+    if (failures == 0) printf("PASS std_11_93_tuple_tie\n");
+    return failures;
+}

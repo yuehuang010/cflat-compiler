@@ -1,0 +1,18 @@
+// GUARDS: directory_iterator counts directory entries
+// FROM: internal/plan/std-library-smoke-suite.md (C++17 coverage map)
+// DISABLED: internal/issue/p2/std-filesystem-directory-iterator.md
+import cpp {"filesystem", "fstream"};
+extern int main()
+{
+    std.filesystem.path root = std.filesystem.path("std_17_directory_iterator_tmp");
+    std.filesystem.remove_all(root); std.filesystem.create_directory(root);
+    std.filesystem.path file = root; file.append("entry.txt");
+    std.ofstream out = std.ofstream(file); out << "entry"; out.close();
+    std.filesystem.directory_iterator entries = std.filesystem.directory_iterator(root);
+    int count = 0;
+    for (auto entry in entries) { count = count + 1; }
+    std.filesystem.remove_all(root);
+    if (count != 1) { printf("FAIL directory_iterator: got %d want 1\n", count); return 1; }
+    printf("PASS std_17_96_directory_iterator\n");
+    return 0;
+}

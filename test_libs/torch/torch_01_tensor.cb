@@ -1,8 +1,6 @@
 // GUARDS: tensor creation, arithmetic, reductions, shape operations, indexing and dtype binding.
 // FROM: scratch/ladder/torch/t1.cb scratch/ladder/torch/t2.cb scratch/ladder/torch/t3.cb scratch/ladder/torch/t10.cb scratch/ladder/torch/t20.cb scratch/ladder/torch/t27.cb
 import cpp "torch/torch.h";
-extern int printf(const char* fmt, ...);
-
 int leg_t1()
 {
     i64 dims = 3;

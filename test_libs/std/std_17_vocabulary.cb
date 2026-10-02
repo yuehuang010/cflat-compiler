@@ -1,0 +1,33 @@
+// GUARDS: C++17 optional, variant state and visit, any, and string_view APIs
+// FROM: internal/plan/std-library-smoke-suite.md (C++17 coverage map)
+import cpp {"any", "functional", "optional", "string", "string_view", "variant"};
+int plus_one(int x) { return x + 1; }
+extern int main()
+{
+    int failures = 0;
+    std.optional<int> o = default;
+    o.emplace(23);
+    int ov = o.value_or(0);
+    o.reset();
+    bool empty = !o.has_value();
+    std.variant<int> v = std.variant<int>(37);
+    i64 ix = v.index();
+    bool holds = std.holds_alternative<int>(v);
+    int* ptr = std.get_if<int>(&v);
+    std.function<int(int)> visitor = std.function<int(int)>(plus_one);
+    int visited = std.visit(visitor, v);
+    std.any av = std.any(41);
+    int anyv = std.any_cast<int>(av);
+    bool anyhas = av.has_value();
+    std.string_view sv = std.string_view("abcdef");
+    std.string_view sub = sv.substr(2, 3);
+    i64 pos = sv.find("cd");
+    sv.remove_prefix(1);
+    bool cmp = sv == std.string("bcdef");
+    if (ov != 23 || !empty) { printf("FAIL optional\n"); failures |= 1; }
+    if (ix != 0 || !holds || ptr == nullptr || *ptr != 37 || visited != 38) { printf("FAIL variant_state\n"); failures |= 2; }
+    if (anyv != 41 || !anyhas) { printf("FAIL any\n"); failures |= 8; }
+    if (sub != "cde" || pos != 2 || !cmp) { printf("FAIL string_view\n"); failures |= 16; }
+    if (failures == 0) printf("PASS std_17_vocabulary\n");
+    return failures;
+}

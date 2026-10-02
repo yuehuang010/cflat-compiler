@@ -1,0 +1,16 @@
+// GUARDS: C++11 system_error, error_code, and regex operations
+// FROM: internal/plan/std-library-smoke-suite.md (C++11 coverage map)
+import cpp "regex";
+import cpp "string";
+import cpp "system_error";
+extern int main()
+{
+    int failures = 0;
+    std.error_code ec = std.error_code(22, std.generic_category());
+    std.string text = std.string("ab12cd34"); std.regex digits = std.regex("[0-9]+");
+    if (ec.value() != 22) { printf("FAIL error_code value: got %d want 22\n", ec.value()); failures |= 1; }
+    if (!std.regex_search(text, digits) || !std.regex_match(std.string("123"), digits) || std.regex_replace(text, digits, "#") != std.string("ab#cd#"))
+    { printf("FAIL regex operations\n"); failures |= 2; }
+    if (failures == 0) printf("PASS std_11_errors_regex\n");
+    return failures;
+}

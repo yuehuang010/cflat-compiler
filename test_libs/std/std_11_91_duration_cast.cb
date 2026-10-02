@@ -1,0 +1,13 @@
+// GUARDS: chrono duration_cast across distinct duration periods
+// FROM: internal/plan/std-library-smoke-suite.md (C++11 coverage map)
+// DISABLED: internal/issue/p2/std-chrono-duration-cast.md
+import cpp "chrono";
+extern int main()
+{
+    int failures = 0;
+    std.chrono.milliseconds ms = std.chrono.milliseconds(1500);
+    std.chrono.seconds sec = std.chrono.duration_cast<std.chrono.seconds>(ms);
+    if (sec.count() != 1) { printf("FAIL duration_cast\n"); failures |= 1; }
+    if (failures == 0) printf("PASS std_11_91_duration_cast\n");
+    return failures;
+}

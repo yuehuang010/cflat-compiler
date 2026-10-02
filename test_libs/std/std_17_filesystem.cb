@@ -1,0 +1,25 @@
+// GUARDS: filesystem path decomposition, directory operations, file size, and removal
+// FROM: internal/plan/std-library-smoke-suite.md (C++17 coverage map)
+import cpp {"filesystem", "fstream", "string"};
+extern int main()
+{
+    int failures = 0;
+    std.filesystem.path root = std.filesystem.path("std_17_filesystem_tmp");
+    std.filesystem.remove_all(root);
+    std.filesystem.create_directory(root);
+    std.filesystem.path file = root;
+    file.append("sample.txt");
+    std.ofstream out = std.ofstream(file);
+    out << "abcde";
+    out.close();
+    std.string filename = file.filename().string();
+    std.string ext = file.extension().string();
+    std.filesystem.path parent = file.parent_path();
+    bool exists = std.filesystem.exists(file);
+    i64 size = std.filesystem.file_size(file);
+    i64 removed = std.filesystem.remove_all(root);
+    if (filename != "sample.txt" || ext != ".txt" || parent != root) { printf("FAIL path_decomposition\n"); failures |= 1; }
+    if (!exists || size != 5 || removed != 2) { printf("FAIL filesystem_ops\n"); failures |= 2; }
+    if (failures == 0) printf("PASS std_17_filesystem\n");
+    return failures;
+}

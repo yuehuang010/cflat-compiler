@@ -1,7 +1,6 @@
 // GUARDS: cross entropy, tensor data access, and an SGD training loop.
 // FROM: scratch/ladder/torch/t23.cb
 import cpp "torch/torch.h";
-extern int printf(const char* fmt, ...);
 int leg_t23()
 {
     int failures = 0;

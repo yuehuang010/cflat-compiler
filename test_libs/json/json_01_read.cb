@@ -1,7 +1,6 @@
 // GUARDS: JSON object and array reads, iteration, dump, and parse acceptance
 // FROM: scratch/probe3/j01_index_key.cb scratch/probe3/j02_at_contains.cb scratch/probe3/j04_push_back.cb scratch/probe3/j05_index_int.cb scratch/probe3/j06_get_string.cb scratch/probe3/j07_dump_indent.cb scratch/probe3/j08_iterate.cb scratch/probe3/j10_parse_error.cb
 import cpp "nlohmann/json.hpp";
-extern int printf(const char* fmt, ...);
 extern int main()
 {
     int failures = 0;

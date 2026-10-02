@@ -1,7 +1,6 @@
 // GUARDS: fmt compile-time format string binding
 // FROM: scratch/probe3/f02_format_consteval.cb
 import cpp "fmt/format.h";
-extern int printf(const char* fmt, ...);
 extern int main()
 {
     int failures = 0;

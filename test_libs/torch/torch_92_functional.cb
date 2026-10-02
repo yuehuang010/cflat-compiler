@@ -1,7 +1,6 @@
 // GUARDS: functional tensor operations, NoGradGuard, serialization, and tensor utilities.
 // FROM: scratch/ladder/torch/t17.cb
 import cpp "torch/torch.h";
-extern int printf(const char* fmt, ...);
 int leg_t17()
 {
     int failures = 0;

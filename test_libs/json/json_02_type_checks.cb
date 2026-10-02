@@ -1,7 +1,6 @@
 // GUARDS: nlohmann JSON value type predicates
 // FROM: scratch/probe3/j09_type_checks.cb
 import cpp "nlohmann/json.hpp";
-extern int printf(const char* fmt, ...);
 extern int main()
 {
     int failures = 0;

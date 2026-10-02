@@ -1,7 +1,6 @@
 // GUARDS: fmt runtime formatting, integer conversion, and print ABI
 // FROM: scratch/probe3/f01_format_runtime.cb scratch/probe3/f03_to_string.cb scratch/probe3/f06_print.cb
 import cpp "fmt/format.h";
-extern int printf(const char* fmt, ...);
 extern int main()
 {
     int failures = 0;

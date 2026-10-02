@@ -1,0 +1,16 @@
+// GUARDS: C++20 bounded format_to_n output and returned size
+// FROM: internal/plan/std-library-smoke-suite.md (C++20 coverage map)
+// DISABLED: internal/issue/p3/cpp-std-format-to-n-unreachable.md
+import cpp "format";
+import cpp "string";
+extern int main()
+{
+    int failures = 0;
+    char[16] output = default;
+    auto written = std.format_to_n(&output[0], (i64)15, "value={{}}", 42);
+    output[written.size] = 0;
+    std.string result = std.string(&output[0]);
+    if (result != "value=42" || written.size != 8) { printf("FAIL format_to_n: %s size %d\n", result.c_str(), (int)written.size); failures |= 1; }
+    if (failures == 0) printf("PASS std_20_95_format_to_n\n");
+    return failures;
+}

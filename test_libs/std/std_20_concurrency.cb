@@ -1,0 +1,34 @@
+// GUARDS: C++20 jthread + stop_token (via std::function), latch, counting semaphore, atomic_ref, and atomic wait/notify APIs
+// FROM: internal/plan/std-library-smoke-suite.md (C++20 coverage map)
+import cpp "latch";
+import cpp "semaphore";
+import cpp "atomic";
+import cpp "thread";
+import cpp "functional";
+void jthread_work() { }
+extern int main()
+{
+    int failures = 0;
+    std.latch gate = std.latch(1);
+    gate.count_down();
+    gate.wait();
+    if (!gate.try_wait()) { printf("FAIL latch completion\n"); failures |= 1; }
+    std.counting_semaphore<1> semaphore = std.counting_semaphore<1>(0);
+    semaphore.release();
+    if (!semaphore.try_acquire()) { printf("FAIL counting semaphore acquire\n"); failures |= 2; }
+    int raw = 10;
+    std.atomic_ref<int> reference = std.atomic_ref<int>(raw);
+    reference.fetch_add(5);
+    if (raw != 15) { printf("FAIL atomic_ref: got %d want 15\n", raw); failures |= 4; }
+    std.atomic<int> value = std.atomic<int>(0);
+    value.store(1);
+    value.wait(0);
+    value.notify_one();
+    if (value.load() != 1) { printf("FAIL atomic wait/notify: got %d want 1\n", value.load()); failures |= 8; }
+    std.jthread worker = std.jthread(std.function<void()>(jthread_work));
+    worker.request_stop();
+    if (!worker.get_stop_token().stop_requested()) { printf("FAIL jthread stop request\n"); failures |= 16; }
+    worker.join();
+    if (failures == 0) printf("PASS std_20_concurrency\n");
+    return failures;
+}

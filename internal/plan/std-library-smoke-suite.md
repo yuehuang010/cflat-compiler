@@ -1,6 +1,11 @@
 # C++ standard library in the test_libs smoke tier
 
-Status: PLAN 2026-10-01, not started.
+Status: BUILT 2026-10-01. 16 enabled cases + 22 DISABLED cases in test_libs/std/,
+tier 1 green (`./test_libs.sh`: PASS=28 FAIL=0 SKIP=6), std adds ~10 s cold at -j 4, warm ~0 s.
+Feature reach (coverage-map items): 149 enabled / 22 disabled of 171 = 87% (C++11 76/82 93%,
+C++14 12/15 80%, C++17 32/38 84%, C++20 29/36 81%). Gaps: Queue.md "std smoke suite gaps" S1-S20.
+Enabled legs pass CFlat callables to C++ templates as `std.function<...>(free_fn)`; native
+CFlat callables are the S1/S2 gaps.
 
 ## Goal (maintainer, 2026-10-01)
 
@@ -76,7 +81,7 @@ return), print the failing leg, return 0 only if all pass. `i64` for 64-bit temp
 | `std_11_algorithms_functional` | `<algorithm>`: `sort`, `stable_sort`, `find`/`find_if`, `count_if`, `all_of`/`any_of`/`none_of`, `copy_if`, `transform`, `minmax_element`, `is_sorted`, `lower_bound`, `unique`, `reverse`, `rotate`; `<numeric>`: `accumulate`, `iota`, `inner_product`; `<functional>`: `function` from a CFlat lambda and a free function, `less`/`greater`, `ref` |
 | `std_11_numeric_time_random` | `<chrono>` (durations, `duration_cast`, `steady_clock` monotonic), `<ratio>`, `<random>` (`mt19937` / `mt19937_64` raw output only), `<cmath>` (`fma`, `isnan`, `round`, `hypot`), `<complex>`, `<limits>`, `<type_traits>` constants |
 | `std_11_concurrency` | `thread` + `join`, `mutex`/`lock_guard`/`unique_lock`, `condition_variable` handshake, `atomic<int>` (`fetch_add` from N threads), `future`/`promise`/`async` (deterministic results only) |
-| `std_11_errors_regex` | `system_error`/`error_code`, `exception_ptr` via `current_exception`/`rethrow_exception` if CFlat can call it, `<regex>` match/search/replace on a fixed input. Regex is the heaviest header: move it to its own tier-2 case if it busts the time budget |
+| `std_11_errors_regex` | `system_error`/`error_code`, `<regex>` match/search/replace on a fixed input. Regex is the heaviest header: move it to its own tier-2 case if it busts the time budget |
 
 ### C++14
 
@@ -141,3 +146,5 @@ Queue.md rows for the filed issues and reviews every new issue file.
 C++11 through C++20 (RULED 2026-10-01). C++23 and later (`expected`, `print`, `flat_map`,
 `mdspan`, `ranges::to`) are a possible later extension; they would need a per-case compile-flag
 marker (`// CPPSTD: c++23`) in the runner.
+
+`exception_ptr` (`current_exception` / `rethrow_exception`) is out of scope: CFlat has no throw/catch to produce one (2026-10-01).

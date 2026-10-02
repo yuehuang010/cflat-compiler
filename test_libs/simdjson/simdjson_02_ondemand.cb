@@ -10,7 +10,6 @@ if const (__ARM64__) {
     using SjImplParser = simdjson.fallback.ondemand.parser;
     using SjImplDocument = simdjson.fallback.ondemand.document;
 }
-extern int printf(const char* fmt, ...);
 extern int main()
 {
     int failures = 0;

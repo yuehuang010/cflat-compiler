@@ -3,7 +3,6 @@
 // NOTE: explicit Matrix(...) wraps and (long) block arguments are workarounds; the natural forms
 //       are covered by eigen_05 and eigen_06. QR solve lives in eigen_07.
 import cpp "Eigen/Dense";
-extern int printf(const char* fmt, ...);
 extern int main()
 {
     int failures = 0;

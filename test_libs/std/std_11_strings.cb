@@ -1,0 +1,19 @@
+// GUARDS: C++11 strings and C character, memory, and fixed-width integer headers
+// FROM: internal/plan/std-library-smoke-suite.md (C++11 coverage map)
+import cpp "string";
+import cpp "cctype";
+import cpp "cstring";
+import cpp "cstdint";
+extern int main()
+{
+    int failures = 0;
+    std.string s = std.string("hello"); s.append(" world");
+    if (s.find("world") != 6 || s.substr(0, 5) != std.string("hello") || s.compare("hello world") != 0 || std.strcmp(s.c_str(), "hello world") != 0)
+    { printf("FAIL string methods\n"); failures |= 1; }
+    if (std.to_string(42) != std.string("42") || std.stoi("-12") != -12 || std.stol("123456") != 123456 || std.stod("2.5") != 2.5 || std.u16string(u"abc").size() != 3 || std.u32string(U"xy").size() != 2)
+    { printf("FAIL conversions/UTF strings\n"); failures |= 2; }
+    if (std.tolower('A') != 'a' || std.isalpha('z') == 0 || std.strlen("abc") != 3 || sizeof(i64) != 8)
+    { printf("FAIL C headers\n"); failures |= 4; }
+    if (failures == 0) printf("PASS std_11_strings\n");
+    return failures;
+}

@@ -2,7 +2,6 @@
 // FROM: scratch/ladder/torch/t4.cb scratch/ladder/torch/t27.cb (braced index form; torch_01 uses the
 //       explicit TensorIndex vector until the fix lands)
 import cpp "torch/torch.h";
-extern int printf(const char* fmt, ...);
 int leg_t4()
 {
     int failures = 0;

@@ -1,0 +1,13 @@
+// GUARDS: C++20 make_shared<T[]> allocation and array element access
+// FROM: internal/plan/std-library-smoke-suite.md (C++20 coverage map)
+// DISABLED: internal/issue/p3/std-make-unique-array.md
+import cpp "memory";
+extern int main()
+{
+    int failures = 0;
+    std.shared_ptr<int[]> values = std.make_shared<int[]>(3);
+    values[1] = 42;
+    if (values[1] != 42) { printf("FAIL make_shared array: got %d want 42\n", values[1]); failures |= 1; }
+    if (failures == 0) printf("PASS std_20_92_make_shared_array\n");
+    return failures;
+}

@@ -1,0 +1,12 @@
+// GUARDS: C++14 make_unique array overload
+// FROM: internal/plan/std-library-smoke-suite.md (C++14 coverage map)
+// DISABLED: internal/issue/p3/std-make-unique-array.md
+import cpp "memory";
+extern int main()
+{
+    auto values = std.make_unique<int[]>(2);
+    values[0] = 4; values[1] = 5;
+    if (values[0] != 4 || values[1] != 5) { printf("FAIL make_unique_array\n"); return 1; }
+    printf("PASS std_14_91_make_unique_array\n");
+    return 0;
+}

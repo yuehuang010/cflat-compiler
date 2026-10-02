@@ -1,0 +1,21 @@
+// GUARDS: C++20 std::erase_if with a CFlat native callable (function<> lambda) as the deduced predicate
+// FROM: internal/plan/std-library-smoke-suite.md (C++20 coverage map)
+// DISABLED: internal/issue/p2/cpp-cflat-callable-to-deduced-template-param.md
+import cpp "set";
+import cpp "unordered_set";
+import cpp "functional";
+extern int main()
+{
+    int failures = 0;
+    std.set<int> ordered = default;
+    ordered.insert(4); ordered.insert(8);
+    std.unordered_set<int> hashed = default;
+    hashed.insert(5); hashed.insert(9);
+    function<bool(int)> remove_four = (int item) => { return item == 4; };
+    function<bool(int)> remove_five = (int item) => { return item == 5; };
+    int ordered_erased = std.erase_if(ordered, remove_four);
+    int hashed_erased = std.erase_if(hashed, remove_five);
+    if (ordered_erased != 1 || hashed_erased != 1) { printf("FAIL erase_if: got %d %d want 1 1\n", ordered_erased, hashed_erased); failures |= 1; }
+    if (failures == 0) printf("PASS std_20_93_erase_if\n");
+    return failures;
+}

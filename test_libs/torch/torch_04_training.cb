@@ -1,7 +1,6 @@
 // GUARDS: libtorch training, Sequential registration, parameter naming, and manual module registration.
 // FROM: scratch/ladder/torch/t7.cb scratch/ladder/torch/t9.cb scratch/ladder/torch/t12.cb scratch/ladder/torch/t22.cb scratch/ladder/torch/t25.cb scratch/ladder/torch/t28.cb
 import cpp "torch/torch.h";
-extern int printf(const char* fmt, ...);
 extern int strcmp(const char* a, const char* b);
 
 int leg_t7()

@@ -1,0 +1,43 @@
+// GUARDS: C++14 utility, lookup, iterator, stream, mutex, and type-trait APIs
+// FROM: internal/plan/std-library-smoke-suite.md (C++14 coverage map)
+import cpp {"algorithm", "array", "iomanip", "map", "memory", "mutex", "shared_mutex", "sstream", "tuple", "type_traits", "utility"};
+extern int main()
+{
+    int failures = 0;
+    std.unique_ptr<int> p = std.make_unique<int>(17);
+    int old = std.exchange(*p, 19);
+    std.map<std.string, int, std.less<void>> m = default;
+    m.emplace("key", 31);
+    int hetero = m.find("key").second;
+    std.tuple<int, double> t = std.make_tuple(7, 2.5);
+    int by_type = std.get<int>(t);
+    std.array<int, 2> raw = default;
+    raw[0] = 4; raw[1] = 5;
+    auto cbegin_it = std.cbegin(raw);
+    int begin_value = *cbegin_it;
+    auto crbegin_it = std.crbegin(raw);
+    int reverse_value = *crbegin_it;
+    auto rbegin_it = std.rbegin(raw);
+    int free_reverse = *rbegin_it;
+    bool eq = std.equal(std.begin(raw), std.end(raw), std.begin(raw), std.end(raw));
+    auto mm = std.mismatch(std.begin(raw), std.end(raw), std.begin(raw), std.end(raw));
+    std.shared_timed_mutex mutex = default;
+    int locked = 0;
+    { std.shared_lock<std.shared_timed_mutex> guard = std.shared_lock<std.shared_timed_mutex>(mutex); locked = 1; }
+    std.stringstream ss = default;
+    ss << std.quoted("hello world");
+    std.string quoted;
+    ss >> std.quoted(quoted);
+    bool traits = !std.is_final<std.string>.value;
+    if (*p != 19) { printf("FAIL make_unique: got %d want 19\n", *p); failures |= 1; }
+    if (old != 17) { printf("FAIL exchange: got %d want 17\n", old); failures |= 4; }
+    if (hetero != 31) { printf("FAIL heterogeneous_find: got %d want 31\n", hetero); failures |= 16; }
+    if (by_type != 7) { printf("FAIL get_type: got %d want 7\n", by_type); failures |= 32; }
+    if (begin_value != 4 || reverse_value != 5 || free_reverse != 5) { printf("FAIL iterators\n"); failures |= 64; }
+    if (!eq || mm.first != std.end(raw) || mm.second != std.end(raw)) { printf("FAIL equal_mismatch\n"); failures |= 128; }
+    if (locked != 1) { printf("FAIL shared_lock\n"); failures |= 256; }
+    if (quoted != "hello world") { printf("FAIL quoted\n"); failures |= 512; }
+    if (!traits) { printf("FAIL is_final\n"); failures |= 1024; }
+    if (failures == 0) printf("PASS std_14_library\n");
+    return failures;
+}

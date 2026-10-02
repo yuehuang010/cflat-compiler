@@ -1,7 +1,6 @@
 // GUARDS: fmt runtime formatting with a CFlat string argument
 // FROM: scratch/probe3/f05_format_string_arg.cb
 import cpp "fmt/format.h";
-extern int printf(const char* fmt, ...);
 extern int main()
 {
     int failures = 0;

@@ -1,8 +1,6 @@
 // GUARDS: libtorch custom C++ module inheritance, shared submodules, and generic activation blocks.
 // FROM: scratch/ladder/torch/t29.cb scratch/ladder/torch/t30.cb scratch/ladder/torch/t31.cb
 import cpp "torch/torch.h";
-extern int printf(const char* fmt, ...);
-
 struct Net29 : torch.nn.Module
 {
     std.shared_ptr<torch.nn.LinearImpl> fc1 = default;

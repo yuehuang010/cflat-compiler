@@ -1,0 +1,10 @@
+// GUARDS: C++14 is_null_pointer specialization for nullptr_t
+// FROM: internal/plan/std-library-smoke-suite.md (C++14 coverage map)
+// DISABLED: internal/issue/p2/std-is-null-pointer-trait.md
+import cpp "type_traits";
+extern int main()
+{
+    if (!std.is_null_pointer<std.nullptr_t>.value) { printf("FAIL is_null_pointer\n"); return 1; }
+    printf("PASS std_14_93_is_null_pointer\n");
+    return 0;
+}

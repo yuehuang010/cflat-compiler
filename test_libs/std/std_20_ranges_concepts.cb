@@ -1,0 +1,23 @@
+// GUARDS: C++20 ranges sort/find algorithms and concept-constrained range APIs
+// FROM: internal/plan/std-library-smoke-suite.md (C++20 coverage map)
+import cpp "vector";
+import cpp "algorithm";
+import cpp "ranges";
+import cpp "concepts";
+extern int main()
+{
+    int failures = 0;
+    std.vector<int> values = default;
+    values.push_back(5);
+    values.push_back(1);
+    values.push_back(4);
+    values.push_back(2);
+    values.push_back(3);
+    std.ranges.sort(values);
+    auto found = std.ranges.find(values, 4);
+    if (values[0] != 1 || *found != 4) { printf("FAIL ranges sort/find\n"); failures |= 1; }
+    auto data = std.ranges.data(values);
+    if (data[1] != 2) { printf("FAIL constrained ranges::data: got %d want 2\n", data[1]); failures |= 2; }
+    if (failures == 0) printf("PASS std_20_ranges_concepts\n");
+    return failures;
+}

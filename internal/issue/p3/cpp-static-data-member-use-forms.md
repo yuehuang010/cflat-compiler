@@ -12,3 +12,5 @@ clang++ accepts both; CFlat refuses at compile time (no miscompile).
   'K'" (C++ allows `obj.K` for a static member).
 Repro header: `namespace sd { struct P { int x = 0; int y = 0; }; struct ClsLib { inline static P
 origin{8, 9}; }; struct OolInline { static int K; }; inline int OolInline::K = 17; }`.
+
+Also seen in `test_libs/std/std_20_98_endian_native.cb`: `std.endian.native` is not resolved as the C++ static data member of `std::endian`.

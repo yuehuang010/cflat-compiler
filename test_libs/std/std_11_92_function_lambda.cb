@@ -1,0 +1,12 @@
+// GUARDS: std::function constructed from a typed CFlat lambda
+// FROM: internal/plan/std-library-smoke-suite.md (C++11 coverage map)
+// DISABLED: internal/issue/p2/std-cflat-lambda-to-std-function.md
+import cpp "functional";
+extern int main()
+{
+    int failures = 0;
+    std.function<int(int)> f = (int x) => { return x + 3; };
+    if (f(4) != 7) { printf("FAIL std::function lambda\n"); failures |= 1; }
+    if (failures == 0) printf("PASS std_11_92_function_lambda\n");
+    return failures;
+}

@@ -1,7 +1,6 @@
 // GUARDS: Eigen fixed and dynamic vectors/matrices, dot, and norm
 // FROM: scratch/probe3/e01_fixed_ctor.cb scratch/probe3/e03_dynamic.cb scratch/probe3/e06_dot_norm.cb
 import cpp "Eigen/Dense";
-extern int printf(const char* fmt, ...);
 extern int main()
 {
     int failures = 0;

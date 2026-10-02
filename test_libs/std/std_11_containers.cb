@@ -1,0 +1,38 @@
+// GUARDS: C++11 containers, lookup, iteration, adaptors, and hash
+// FROM: internal/plan/std-library-smoke-suite.md (C++11 coverage map)
+import cpp "array";
+import cpp "deque";
+import cpp "forward_list";
+import cpp "list";
+import cpp "map";
+import cpp "queue";
+import cpp "set";
+import cpp "stack";
+import cpp "unordered_map";
+import cpp "unordered_set";
+import cpp "vector";
+import cpp "functional";
+extern int main()
+{
+    int failures = 0;
+    std.array<int, 2> a = default; a[0] = 4; a[1] = 5;
+    std.vector<int> v = std.vector<int>({1, 3});
+    v.reserve(8); v.emplace_back(5); v.insert(v.begin() + 1, 2); v.erase(v.begin() + 2);
+    if (a[1] != 5 || v.size() != 3 || v[0] != 1 || v[1] != 2 || v[2] != 5 || *v.begin() != 1)
+    { printf("FAIL array/vector/iteration\n"); failures |= 1; }
+    std.deque<int> d = default; d.push_back(2); d.push_back(4); d.push_front(1);
+    std.list<int> l = default; l.push_back(7); l.push_back(8); l.emplace_back(9);
+    std.forward_list<int> fl = default; fl.push_front(4); fl.push_front(3);
+    std.map<int, int> m = default; m[1] = 10; m.emplace(2, 20);
+    std.multimap<int, int> mm = default; mm.emplace(1, 4); mm.emplace(1, 5);
+    std.set<int> s = default; s.insert(3); s.insert(5); std.multiset<int> ms = default; ms.insert(2); ms.insert(2);
+    std.unordered_map<int, int> um = default; um[7] = 70;
+    std.unordered_set<int> us = default; us.insert(9);
+    std.stack<int> st = default; st.push(11);
+    std.queue<int> q = default; q.push(12);
+    std.priority_queue<int> pq = default; pq.push(13);
+    if (d.front() != 1 || l.back() != 9 || fl.front() != 3 || m[2] != 20 || mm.count(1) != 2 || s.count(5) != 1 || ms.count(2) != 2 || um[7] != 70 || us.count(9) != 1 || st.top() != 11 || q.front() != 12 || pq.top() != 13 || std.hash<int>()(42) != 42)
+    { printf("FAIL associative/adaptor/hash\n"); failures |= 2; }
+    if (failures == 0) printf("PASS std_11_containers\n");
+    return failures;
+}

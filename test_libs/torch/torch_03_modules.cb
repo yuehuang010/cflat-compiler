@@ -1,8 +1,6 @@
 // GUARDS: neural module holders, convolution, normalization, tuple returns and recurrent modules.
 // FROM: scratch/ladder/torch/t6.cb scratch/ladder/torch/t11.cb scratch/ladder/torch/t19.cb scratch/ladder/torch/t24.cb
 import cpp "torch/torch.h";
-extern int printf(const char* fmt, ...);
-
 int leg_t6()
 {
     float[6] data = {1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f};

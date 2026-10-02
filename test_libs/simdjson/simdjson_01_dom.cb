@@ -1,7 +1,6 @@
 // GUARDS: simdjson DOM parser and int64 result ABI
 // FROM: scratch/simdjson_spike/s1_i64.cb
 import cpp "simdjson.h";
-extern int printf(const char* fmt, ...);
 extern int main()
 {
     int failures = 0;
